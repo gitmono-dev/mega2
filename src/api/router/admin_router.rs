@@ -1,0 +1,92 @@
+//! Admin-related API endpoints.
+//!
+//! Provides endpoints for admin permission checks:
+//! - `GET /api/v1/admin/me` - Check if current user is admin
+//! - `GET /api/v1/admin/list` - List all admins (admin-only)
+//!
+//! # Auth Behavior
+//! - 401 Unauthorized: No valid session (handled by `LoginUser` extractor)
+//! - 403 Forbidden: Logged in but not admin (for `/list` endpoint)
+
+use axum::{Json, extract::State};
+use serde::Serialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
+
+use crate::{
+    api::{
+        MonoApiServiceState, api_common::group_permission::ensure_admin, api_doc::USER_TAG,
+        error::ApiError, oauth::model::LoginUser,
+    },
+    api_model::common::CommonResult,
+};
+
+#[derive(Serialize, ToSchema)]
+pub struct IsAdminResponse {
+    pub is_admin: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AdminListResponse {
+    pub admins: Vec<String>,
+}
+
+/// Build the admin router.
+pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
+    OpenApiRouter::new().nest(
+        "/admin",
+        OpenApiRouter::new()
+            .routes(routes!(is_admin_me))
+            .routes(routes!(admin_list)),
+    )
+}
+
+/// GET /api/v1/admin/me
+///
+/// Returns whether the current user is an admin.
+#[utoipa::path(
+    get,
+    path = "/me",
+    responses(
+        (status = 200, body = CommonResult<IsAdminResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    tag = USER_TAG
+)]
+async fn is_admin_me(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<IsAdminResponse>>, ApiError> {
+    let is_admin = state.monorepo().check_is_admin(&user.username).await?;
+
+    Ok(Json(CommonResult::success(Some(IsAdminResponse {
+        is_admin,
+    }))))
+}
+
+/// GET /api/v1/admin/list
+///
+/// Returns a list of all admin usernames.
+/// Only admins can access this endpoint.
+#[utoipa::path(
+    get,
+    path = "/list",
+    responses(
+        (status = 200, body = CommonResult<AdminListResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = USER_TAG
+)]
+async fn admin_list(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<AdminListResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+
+    let admins = state.monorepo().get_all_admins().await?;
+
+    Ok(Json(CommonResult::success(Some(AdminListResponse {
+        admins,
+    }))))
+}

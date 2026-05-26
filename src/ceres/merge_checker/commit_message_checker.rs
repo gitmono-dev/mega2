@@ -1,0 +1,40 @@
+use async_trait::async_trait;
+use serde_json::{Value, json};
+
+use crate::{
+    ceres::merge_checker::{CheckResult, CheckType, Checker, ConditionResult},
+    common::{errors::MegaError, utils::check_conventional_commits_message},
+    jupiter::model::cl_dto::ClInfoDto,
+};
+
+pub struct CommitMessageChecker;
+
+#[async_trait]
+impl Checker for CommitMessageChecker {
+    async fn run(&self, params: &Value) -> CheckResult {
+        let title = params["title"].as_str().unwrap_or_default();
+        let status = if check_conventional_commits_message(title) {
+            ConditionResult::PASSED
+        } else {
+            ConditionResult::FAILED
+        };
+        let message = if status == ConditionResult::PASSED {
+            "Commit message follows conventional commits".to_string()
+        } else {
+            "Commit message does not follow conventional commits. Please make sure your CL title follows the Conventional Commits specification.".to_string()
+        };
+
+        CheckResult {
+            check_type_code: CheckType::CommitMessage,
+            status,
+            message,
+        }
+    }
+
+    async fn build_params(&self, cl_info: &ClInfoDto) -> Result<Value, MegaError> {
+        let title = cl_info.title.clone();
+        Ok(json!({
+            "title": title,
+        }))
+    }
+}

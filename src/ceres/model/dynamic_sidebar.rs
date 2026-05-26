@@ -1,0 +1,70 @@
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::callisto::dynamic_sidebar;
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SidebarRes {
+    pub id: i32,
+    pub public_id: String,
+    pub label: String,
+    pub href: String,
+    pub visible: bool,
+    pub order_index: i32,
+}
+
+impl From<dynamic_sidebar::Model> for SidebarRes {
+    fn from(value: dynamic_sidebar::Model) -> Self {
+        Self {
+            id: value.id,
+            public_id: value.public_id,
+            label: value.label,
+            href: value.href,
+            visible: value.visible,
+            order_index: value.order_index,
+        }
+    }
+}
+
+pub type SidebarMenuListRes = Vec<SidebarRes>;
+
+#[derive(Clone, Debug, ToSchema, Serialize, Deserialize)]
+pub struct CreateSidebarPayload {
+    pub public_id: String,
+    pub label: String,
+    pub href: String,
+    pub visible: bool,
+    pub order_index: i32,
+}
+
+#[derive(Clone, Debug, ToSchema, Serialize, Deserialize)]
+pub struct UpdateSidebarPayload {
+    pub public_id: Option<String>,
+    pub label: Option<String>,
+    pub href: Option<String>,
+    pub visible: Option<bool>,
+    pub order_index: Option<i32>,
+}
+
+#[derive(Clone, Debug, ToSchema, Serialize, Deserialize)]
+pub struct SidebarSyncPayload {
+    pub id: Option<i32>,
+    pub public_id: String,
+    pub label: String,
+    pub href: String,
+    pub visible: bool,
+    pub order_index: i32,
+}
+
+impl From<SidebarSyncPayload> for crate::jupiter::model::sidebar_dto::SidebarSyncDto {
+    fn from(value: SidebarSyncPayload) -> Self {
+        Self {
+            id: value.id,
+            public_id: value.public_id,
+            label: value.label,
+            href: value.href,
+            visible: value.visible,
+            order_index: value.order_index,
+        }
+    }
+}

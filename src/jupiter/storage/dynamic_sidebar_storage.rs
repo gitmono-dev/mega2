@@ -1,0 +1,302 @@
+use std::{collections::HashSet, ops::Deref};
+
+use sea_orm::{
+    ActiveModelTrait,
+    ActiveValue::{NotSet, Set},
+    EntityTrait, PaginatorTrait, QueryOrder, TransactionTrait,
+};
+
+use crate::{
+    callisto::dynamic_sidebar,
+    common::{config::SidebarConfig, errors::MegaError},
+    jupiter::{
+        model::sidebar_dto::SidebarSyncDto,
+        storage::base_storage::{BaseStorage, StorageConnector},
+    },
+};
+
+#[derive(Clone)]
+pub struct DynamicSidebarStorage {
+    pub base: BaseStorage,
+}
+
+impl Deref for DynamicSidebarStorage {
+    type Target = BaseStorage;
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+impl DynamicSidebarStorage {
+    /// Initialize default sidebars from config if the table is empty.
+    /// This is idempotent: only inserts if no rows exist.
+    pub async fn init_default_sidebars(&self, config: &SidebarConfig) -> Result<(), MegaError> {
+        let count = dynamic_sidebar::Entity::find()
+            .count(self.get_connection())
+            .await?;
+        if count > 0 {
+            return Ok(());
+        }
+
+        let default_items = &config.default_items;
+
+        for item in default_items {
+            let active_model = dynamic_sidebar::ActiveModel {
+                public_id: Set(item.public_id.clone()),
+                label: Set(item.label.clone()),
+                href: Set(item.href.clone()),
+                visible: Set(item.visible),
+                order_index: Set(item.order_index),
+                ..Default::default()
+            };
+            active_model.insert(self.get_connection()).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_sidebar_by_id(
+        &self,
+        id: i32,
+    ) -> Result<Option<dynamic_sidebar::Model>, MegaError> {
+        let model = dynamic_sidebar::Entity::find_by_id(id)
+            .one(self.get_connection())
+            .await?;
+
+        Ok(model)
+    }
+
+    pub async fn get_sidebars(&self) -> Result<Vec<dynamic_sidebar::Model>, MegaError> {
+        let res = dynamic_sidebar::Entity::find()
+            .order_by_asc(dynamic_sidebar::Column::OrderIndex)
+            .all(self.get_connection())
+            .await?;
+        Ok(res)
+    }
+
+    pub async fn new_sidebar(
+        &self,
+        public_id: String,
+        label: String,
+        href: String,
+        visible: bool,
+        order_index: i32,
+    ) -> Result<dynamic_sidebar::Model, MegaError> {
+        let active_model = dynamic_sidebar::ActiveModel {
+            id: NotSet,
+            public_id: Set(public_id),
+            label: Set(label),
+            href: Set(href),
+            visible: Set(visible),
+            order_index: Set(order_index),
+        };
+
+        let res = active_model.insert(self.get_connection()).await?;
+        Ok(res)
+    }
+
+    pub async fn update_sidebar(
+        &self,
+        id: i32,
+        public_id: Option<String>,
+        label: Option<String>,
+        href: Option<String>,
+        visible: Option<bool>,
+        order_index: Option<i32>,
+    ) -> Result<dynamic_sidebar::Model, MegaError> {
+        let model = dynamic_sidebar::Entity::find_by_id(id)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("Sidebar with id `{id}` not found")))?;
+
+        let mut active_model: dynamic_sidebar::ActiveModel = model.into();
+
+        if let Some(public_id) = public_id {
+            active_model.public_id = Set(public_id);
+        }
+        if let Some(label) = label {
+            active_model.label = Set(label);
+        }
+        if let Some(href) = href {
+            active_model.href = Set(href);
+        }
+        if let Some(visible) = visible {
+            active_model.visible = Set(visible);
+        }
+        if let Some(order_index) = order_index {
+            active_model.order_index = Set(order_index);
+        }
+
+        let updated_model = active_model.update(self.get_connection()).await?;
+
+        Ok(updated_model)
+    }
+
+    pub async fn delete_sidebar(&self, id: i32) -> Result<dynamic_sidebar::Model, MegaError> {
+        let model = dynamic_sidebar::Entity::find_by_id(id)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("Sidebar with id `{id}` not found")))?;
+
+        let delete_result = dynamic_sidebar::Entity::delete_by_id(id)
+            .exec(self.get_connection())
+            .await
+            .map_err(|e| MegaError::Other(format!("Failed to delete sidebar: {e}")))?;
+
+        if delete_result.rows_affected == 0 {
+            return Err(MegaError::Other(format!(
+                "Sidebar with id `{id}` was not deleted"
+            )));
+        }
+
+        Ok(model)
+    }
+
+    /// Synchronize sidebar items by applying updates and inserts.
+    ///
+    /// This function does **not** perform full replacement.  
+    /// It assumes:
+    /// - The frontend sends the **complete list of sidebar items**.
+    /// - Existing items include a valid `id` and will be updated.
+    /// - New items have `id = None` and will be inserted.
+    /// - Deletions are handled separately by another API.
+    ///
+    /// Validation rules:
+    /// - `order_index` values in the incoming list must be unique.
+    ///
+    /// Transaction behavior:
+    /// - All updates and inserts happen inside a single transaction.  
+    /// - Any failure will roll back the entire operation.
+    pub async fn sync_sidebar(
+        &self,
+        items: Vec<SidebarSyncDto>,
+    ) -> Result<Vec<dynamic_sidebar::Model>, MegaError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Validate that order_index values in items are unique
+        validate_order_index_unique(&items).map_err(MegaError::Other)?;
+
+        // Begin a transaction
+        let txn = self.get_connection().begin().await?;
+
+        let mut res_models = Vec::with_capacity(items.len());
+
+        for item in items {
+            if let Some(id) = item.id {
+                // Update existing menu item
+                if let Some(model) = dynamic_sidebar::Entity::find_by_id(id).one(&txn).await? {
+                    let mut active_model: dynamic_sidebar::ActiveModel = model.into();
+
+                    active_model.public_id = Set(item.public_id);
+                    active_model.label = Set(item.label);
+                    active_model.href = Set(item.href);
+                    active_model.visible = Set(item.visible);
+                    active_model.order_index = Set(item.order_index);
+
+                    let updated = active_model.update(&txn).await?;
+                    res_models.push(updated);
+                } else {
+                    return Err(MegaError::Other(format!(
+                        "Sidebar with id `{id}` not found"
+                    )));
+                }
+            } else {
+                // Insert new menu item
+                let active_model = dynamic_sidebar::ActiveModel {
+                    id: NotSet,
+                    public_id: Set(item.public_id),
+                    label: Set(item.label),
+                    href: Set(item.href),
+                    visible: Set(item.visible),
+                    order_index: Set(item.order_index),
+                };
+                let inserted = active_model.insert(&txn).await?;
+                res_models.push(inserted);
+            }
+        }
+
+        // Commit the transaction
+        txn.commit().await?;
+
+        Ok(res_models)
+    }
+}
+
+fn validate_order_index_unique(items: &[SidebarSyncDto]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+
+    for item in items {
+        if !seen.insert(item.order_index) {
+            // If insert returns false, it means a duplicate order_index exists
+            return Err(format!("Duplicate order_index found: {}", item.order_index));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dto(id: Option<i32>, order: i32) -> SidebarSyncDto {
+        SidebarSyncDto {
+            id,
+            public_id: format!("id_{}", order),
+            label: "label".into(),
+            href: "/".into(),
+            visible: true,
+            order_index: order,
+        }
+    }
+
+    #[test]
+    fn test_validate_unique_order_index_ok() {
+        // All unique order indices
+        let items = vec![dto(Some(1), 0), dto(Some(2), 1), dto(Some(3), 2)];
+
+        let result = validate_order_index_unique(&items);
+
+        assert!(result.is_ok(), "Expected unique order indices to pass.");
+    }
+
+    #[test]
+    fn test_validate_unique_order_index_duplicate() {
+        // Contains duplicate order indices
+        let items = vec![dto(Some(1), 0), dto(Some(2), 1), dto(Some(3), 1)];
+
+        let result = validate_order_index_unique(&items);
+
+        assert!(
+            result.is_err(),
+            "Expected duplicate order indices to produce error."
+        );
+
+        assert!(
+            result.unwrap_err().contains("1"),
+            "Error message should contain the duplicate order index."
+        );
+    }
+
+    #[test]
+    fn test_validate_unique_order_index_empty() {
+        // Empty list should be valid
+        let items: Vec<SidebarSyncDto> = vec![];
+
+        let result = validate_order_index_unique(&items);
+
+        assert!(result.is_ok(), "Empty list should be considered valid.");
+    }
+
+    #[test]
+    fn test_validate_unique_order_index_single_item() {
+        // A single item is always valid
+        let items = vec![dto(Some(1), 10)];
+
+        let result = validate_order_index_unique(&items);
+
+        assert!(result.is_ok(), "Single item should always be valid.");
+    }
+}

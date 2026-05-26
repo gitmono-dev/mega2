@@ -1,0 +1,52 @@
+use std::sync::Arc;
+
+use crate::jupiter::redis::{ConnectionManager, init_connection};
+
+/// This is the main application context for the Mono application.
+/// It holds shared state and configuration for the application.
+/// Including database connections, configuration settings, encrypted vault functions, etc.
+#[derive(Clone)]
+pub struct AppContext {
+    /// The storage sub-context for the from jupiter abstract layer.
+    pub storage: crate::jupiter::storage::Storage,
+
+    /// The vault core for managing encrypted data.
+    pub vault: crate::vault::integration::vault_core::VaultCore,
+
+    /// The configuration settings for the application.
+    pub config: Arc<crate::common::config::Config>,
+
+    pub connection: ConnectionManager,
+}
+
+impl AppContext {
+    /// Creates a new application context with the given configuration.
+    pub async fn new(config: crate::common::config::Config) -> Self {
+        let config = Arc::new(config);
+
+        let storage = crate::jupiter::storage::Storage::new(config.clone())
+            .await
+            .expect("init monorepo storage err");
+        let connection = init_connection(&config.redis).await;
+
+        let storage_for_vault = storage.clone();
+        let vault = crate::vault::integration::vault_core::VaultCore::new(storage_for_vault).await;
+
+        storage
+            .mono_service
+            .init_monorepo(&config.monorepo)
+            .await
+            .expect("init monorepo failed");
+
+        Self {
+            storage,
+            vault,
+            config,
+            connection,
+        }
+    }
+
+    pub fn wrapped_context(&self) -> Arc<Self> {
+        Arc::new(self.clone())
+    }
+}

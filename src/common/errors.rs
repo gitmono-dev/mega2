@@ -1,223 +1,178 @@
-//! MonoEngine 错误处理模块
-//! 
-//! 该模块定义了 MonoEngine 项目的统一错误处理机制，
-//! 提供了错误类型定义、错误转换和错误处理的相关功能。
-//!
+use std::convert::Infallible;
 
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use cedar_policy::ParseErrors;
+use config::ConfigError;
+use git_internal::errors::GitError;
 use thiserror::Error;
-use anyhow::anyhow;
 
-/// MonoEngine 的主要错误类型
-/// 
-/// 该结构体封装了应用程序中可能出现的各种错误，
-/// 包含错误信息和对应的错误代码
+use crate::api_model::common::CommonResult;
+
+pub type MegaResult = Result<(), MegaError>;
+
 #[derive(Error, Debug)]
-pub struct MonoError {
-    /// 可选的错误信息，使用 anyhow::Error 提供丰富的错误上下文
-    pub error: Option<anyhow::Error>,
-    /// 错误代码，用于程序退出时的状态码
-    pub code: i32,
+pub enum MegaError {
+    #[error("config error: {0}")]
+    Config(#[from] ConfigError),
+    #[error("Redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("serialization error: {0}")]
+    EncodeError(#[from] rkyv::rancor::Error),
+    #[error("JSON serialization error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Database error: {0}")]
+    Db(#[from] sea_orm::DbErr),
+    #[error("PGP error: {0}")]
+    Pgp(#[from] Box<pgp::errors::Error>),
+    #[error("Clap error: {0}")]
+    Clap(#[from] clap::Error),
+    #[error("Generic error: {0}")]
+    Anyhow(#[from] anyhow::Error),
+    #[error("Git error: {0}")]
+    Git(#[from] GitError),
+    #[error("Buck API error: {0}")]
+    Buck(#[from] BuckError),
+    #[error("Not Found error: {0}")]
+    NotFound(String),
+    #[error("ObjStorage error: {0}")]
+    ObjStorage(String),
+    #[error("ObjStorage not found: {0}")]
+    ObjStorageNotFound(String),
+    #[error("ObjStorage inconsistent: {0}")]
+    ObjStorageInconsistent(String),
+    #[error("Monorepo root ref changed concurrently (attach should retry)")]
+    StaleMonorepoRootRef,
+    #[error("Other error: {0}")]
+    Other(String),
 }
 
-impl MonoError {
-    /// 创建一个新的 MonoError 实例
-    /// 
-    /// # 参数
-    /// 
-    /// * `error` - anyhow::Error 类型的错误信息
-    /// * `code` - 错误代码
-    /// 
-    /// # 返回值
-    /// 
-    /// 返回新创建的 MonoError 实例
-    pub fn new(error: anyhow::Error, code: i32) -> MonoError {
-        MonoError {
-            error: Some(error),
-            code,
-        }
-    }
-
-    /// 打印错误信息
-    ///
-    /// 之前该方法通过 panic! 终止程序，这会在仅需要输出错误时导致
-    /// 整个应用崩溃。改为输出到标准错误，调用者可自行决定后续处理。
+impl MegaError {
     pub fn print(&self) {
-        if let Some(err) = &self.error {
-            eprintln!("{}:{}", self.code, err);
-        }
+        eprintln!("{}", self);
     }
+}
 
-    /// 创建未知子命令错误
-    /// 
-    /// # 参数
-    /// 
-    /// * `cmd` - 未知的子命令名称
-    /// 
-    /// # 返回值
-    /// 
-    /// 返回包含未知子命令错误信息的 MonoError
-    pub fn _unknown_subcommand(cmd: impl AsRef<str>) -> MonoError {
-        MonoError {
-            error: anyhow!("Unknown subcommand: {}", cmd.as_ref()).into(),
-            code: 1,
-        }
+impl From<Infallible> for MegaError {
+    fn from(err: Infallible) -> MegaError {
+        match err {}
     }
+}
 
-    /// 创建带有自定义消息的错误
-    /// 
-    /// # 参数
-    /// 
-    /// * `msg` - 自定义错误消息
-    /// 
-    /// # 返回值
-    /// 
-    /// 返回包含自定义消息的 MonoError
-    pub fn _with_message(msg: impl AsRef<str>) -> MonoError {
-        MonoError {
-            error: anyhow!("Error Message: {}", msg.as_ref()).into(),
-            code: 0,
+impl From<ParseErrors> for MegaError {
+    fn from(err: ParseErrors) -> MegaError {
+        MegaError::Other(err.to_string())
+    }
+}
+
+impl From<MegaError> for GitError {
+    fn from(val: MegaError) -> Self {
+        match val {
+            MegaError::NotFound(msg) => GitError::CustomError(format!("[code:404] {msg}")),
+            MegaError::ObjStorageNotFound(msg) => {
+                GitError::CustomError(format!("[code:404] ObjStorage not found: {msg}"))
+            }
+            other => GitError::CustomError(other.to_string()),
         }
     }
 }
 
-/// 为 MonoError 实现 Display trait
-/// 
-/// 允许 MonoError 被格式化为字符串输出
-impl std::fmt::Display for MonoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.error.as_ref().unwrap())
+#[derive(Error, Debug)]
+pub enum GitLFSError {
+    #[error("Something went wrong in Git LFS: {0}")]
+    GeneralError(String),
+}
+
+#[derive(Debug, Error)]
+pub enum BuckError {
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
+    #[error("Session expired")]
+    SessionExpired,
+    #[error("File not in manifest: {0}")]
+    FileNotInManifest(String),
+    #[error("Rate limit exceeded")]
+    RateLimitExceeded,
+    #[error("File size exceeds limit: {0} > {1}")]
+    FileSizeExceedsLimit(u64, u64),
+    #[error("File already uploaded: {0}")]
+    FileAlreadyUploaded(String),
+    #[error("Hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+    #[error("Invalid session status: expected {expected:?}, got {actual:?}")]
+    InvalidSessionStatus { expected: String, actual: String },
+    #[error("Files not fully uploaded: {missing_count} files remaining")]
+    FilesNotFullyUploaded { missing_count: u32 },
+}
+
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    #[error("{0}")]
+    IO(#[from] std::io::Error),
+    #[error("Authentication failed: {0}")]
+    Deny(String),
+    #[error("Repository not found: {0}")]
+    NotFound(String),
+    #[error("PackFile too large: {0}")]
+    TooLarge(String),
+    #[error("Invalid Input: {0}")]
+    InvalidInput(String),
+    #[error("HTTP Push Has Been Disabled")]
+    Disabled,
+}
+
+impl From<MegaError> for ProtocolError {
+    fn from(err: MegaError) -> ProtocolError {
+        ProtocolError::InvalidInput(err.to_string())
     }
 }
 
-/// 从 anyhow::Error 转换为 MonoError
-/// 
-/// 默认错误代码为 101
-impl From<anyhow::Error> for MonoError {
-    fn from(err: anyhow::Error) -> MonoError {
-        MonoError::new(err, 101)
-    }
-}
+impl IntoResponse for ProtocolError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            ProtocolError::Deny(err) => (StatusCode::UNAUTHORIZED, err),
+            ProtocolError::TooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
+            ProtocolError::NotFound(err) => (StatusCode::NOT_FOUND, err),
+            ProtocolError::InvalidInput(err) => (StatusCode::BAD_REQUEST, err),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong".to_owned(),
+            ),
+        };
 
-/// 从 clap::Error 转换为 MonoError
-/// 
-/// 根据 clap 错误的类型设置相应的错误代码
-impl From<clap::Error> for MonoError {
-    fn from(err: clap::Error) -> MonoError {
-        let code = err.exit_code();
-        MonoError::new(err.into(), code)
+        (status, Json(CommonResult::<String>::failed(&message))).into_response()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::anyhow;
 
-    /// 测试 MonoError::new 方法
     #[test]
-    fn test_mono_error_new() {
-        let error = anyhow!("测试错误");
-        let mono_error = MonoError::new(error, 42);
-        
-        assert!(mono_error.error.is_some());
-        assert_eq!(mono_error.code, 42);
-        assert!(mono_error.to_string().contains("测试错误"));
+    fn converts_not_found_to_git_404_marker() {
+        let err: GitError = MegaError::NotFound("repo missing".to_owned()).into();
+
+        assert!(err.to_string().contains("[code:404] repo missing"));
     }
 
-    /// 测试 MonoError::unknown_subcommand 方法
     #[test]
-    fn test_unknown_subcommand() {
-        let mono_error = MonoError::_unknown_subcommand("invalid_cmd");
-        
-        assert!(mono_error.error.is_some());
-        assert_eq!(mono_error.code, 1);
-        assert!(mono_error.to_string().contains("Unknown subcommand: invalid_cmd"));
+    fn protocol_error_returns_expected_http_status() {
+        let response = ProtocolError::NotFound("repo missing".to_owned()).into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// 测试 MonoError::with_message 方法
     #[test]
-    fn test_with_message() {
-        let mono_error = MonoError::_with_message("自定义错误消息");
-        
-        assert!(mono_error.error.is_some());
-        assert_eq!(mono_error.code, 0);
-        assert!(mono_error.to_string().contains("Error Message: 自定义错误消息"));
-    }
-
-    /// 测试 Display trait 实现
-    #[test]
-    fn test_display() {
-        let error = anyhow!("显示测试");
-        let mono_error = MonoError::new(error, 1);
-        let display_string = format!("{}", mono_error);
-        
-        assert!(display_string.contains("显示测试"));
-    }
-
-    /// 测试从 anyhow::Error 的转换
-    #[test]
-    fn test_from_anyhow_error() {
-        let anyhow_error = anyhow!("anyhow 错误");
-        let mono_error: MonoError = anyhow_error.into();
-        
-        assert!(mono_error.error.is_some());
-        assert_eq!(mono_error.code, 101);
-        assert!(mono_error.to_string().contains("anyhow 错误"));
-    }
-
-    /// 测试从 clap::Error 的转换
-    #[test]
-    fn test_from_clap_error() {
-        use clap::{Arg, Command};
-        
-        // 创建一个简单的 clap 命令来生成错误
-        let cmd = Command::new("test")
-            .arg(Arg::new("required")
-                .required(true)
-                .help("必需参数"));
-        
-        // 尝试解析空参数列表，这会产生错误
-        let clap_error = cmd.try_get_matches_from(["test"]).unwrap_err();
-        let exit_code = clap_error.exit_code();
-        let mono_error: MonoError = clap_error.into();
-
-        assert!(mono_error.error.is_some());
-        // clap 错误的代码应该等于其 exit_code
-        assert_eq!(mono_error.code, exit_code);
-    }
-
-    /// 测试错误链
-    #[test]
-    fn test_error_chain() {
-        let root_cause = anyhow!("根本原因");
-        let wrapped_error = root_cause.context("包装错误");
-        let mono_error = MonoError::new(wrapped_error, 500);
-        
-        assert!(mono_error.error.is_some());
-        assert_eq!(mono_error.code, 500);
-        let error_string = mono_error.to_string();
-        assert!(error_string.contains("包装错误"));
-    }
-
-    /// 测试错误代码的不同值
-    #[test]
-    fn test_different_error_codes() {
-        let error1 = MonoError::_with_message("错误1");
-        let error2 = MonoError::_unknown_subcommand("cmd");
-        let error3 = MonoError::from(anyhow!("错误3"));
-
-        assert_eq!(error1.code, 0);
-        assert_eq!(error2.code, 1);
-        assert_eq!(error3.code, 101);
-    }
-
-    /// 确保 `print` 方法不会触发 panic
-    #[test]
-    fn test_print_does_not_panic() {
-        let error = MonoError::_with_message("打印测试");
-        let result = std::panic::catch_unwind(|| {
-            error.print();
-        });
-        assert!(result.is_ok());
+    fn print_does_not_panic() {
+        MegaError::Other("print smoke".to_owned()).print();
     }
 }
