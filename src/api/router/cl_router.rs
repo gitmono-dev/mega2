@@ -25,7 +25,6 @@ use crate::{
     },
     common::errors::MegaError,
     jupiter::service::{cl_service::CLService, webhook_service::WebhookEvent},
-    notification::triggers,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -498,19 +497,6 @@ async fn save_comment(
             conv_type,
         )
         .await?;
-    // Fire notification trigger
-    if let Err(e) = triggers::on_cl_comment_created(
-        &state.notification_stg(),
-        &state.cl_stg(),
-        &state.storage.reviewer_storage(),
-        &user.username,
-        &link,
-        &payload.content,
-    )
-    .await
-    {
-        tracing::warn!("failed to enqueue cl comment notifications: {e}");
-    }
 
     if let Ok(Some(cl_model)) = state.cl_stg().get_cl(&link).await {
         state

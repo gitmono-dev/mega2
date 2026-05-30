@@ -1,0 +1,716 @@
+# Chat Engine Migration
+
+本文档是把源 Rails 后端中的聊天能力迁入 `monoengine` 的执行规格。迁移后的代码、表、API、类型、配置和网关命名必须使用 `chat`、`channel`、`message` 等业务语义，不再使用源项目名称作为前缀或命名空间。
+
+## 命名决策
+
+本轮迁移采用产品语义命名：
+
+- 表名不加项目来源前缀，直接使用 `channels`、`channel_memberships`、`messages`、`attachments`、`reactions` 等名称。
+- Rust 模块使用 `src/chat/`。
+- Rust 类型使用 `ChatEngine`、`ChatCapability`、`ChatEntityKind`。
+- HTTP API 使用 `/api/v1/chat/...` 或 `/api/v1/channels/...`。
+- 网关、事件、trait 使用 `chat` 或 `channel` 命名，例如 `ChatEvents`、`channel-message-created`。
+- 迁移后的目标代码中不得出现源项目名称。
+
+允许出现源项目名称的地方仅限：历史说明、提交记录、一次性导入脚本的注释或外部源路径说明。生产运行时代码、数据库 schema、HTTP API、OpenAPI、配置项、指标和日志字段都不得使用源项目名称。
+
+## 目标范围
+
+本次只迁移一个产品面：**聊天频道**。
+
+- 每条 legacy `message_thread` 迁移为一个 `channel`。
+- 支持频道列表、频道详情、创建/更新/删除频道、消息列表、发送/编辑/删除消息、回复、附件、消息表情反应、成员变更、已读/未读状态。
+- 用户身份直接复用 `monoengine` 现有用户模型，聊天表使用 `username` 作为稳定引用。
+
+## 非目标范围
+
+以下功能不进入本轮迁移：
+
+- Auth：session、OAuth2、desktop/Figma sign-in、OTP、recovery code、用户偏好。
+- Organization：组织、邀请、加入申请、角色、SSO、计费、feature flag。
+- Project：项目空间、项目成员、项目 pin/bookmark/favorite/display preference。
+- Notes：协作文档、Yjs、文档权限、公开分享、timeline event。
+- Posts：feed、草稿/发布、评论、poll、tag、post views、feedback request、TLDR/resolution。
+- Notifications：通知中心、归档/已读、email digest、web-push、Slack 投递、scheduled notification。
+- Integrations：Slack、Linear、Figma、HMS、Cal.com、Zapier、GitHub、webhook。
+- Calls：call room、peer、recording、transcription、summary。
+- Data export：导出任务、审计、product log。
+- Styled text service：`markdown_to_html` 和 `html_to_slack` 独立服务。
+
+## 当前代码状态
+
+`monoengine` 已经有聊天引擎初始边界：
+
+- `src/chat/mod.rs`：Chat 引擎模块入口。
+- `src/chat/domain.rs`：`ChatCapability`、`ChatEntityKind`、`ChatEntityRef`、`ChatMigrationSlice`。
+- `src/chat/engine.rs`：`ChatEngine` 门面与迁移切片注册表。
+- `MIGRATION_SLICES` 当前只包含 `SharedFoundations` 和 `ChannelChat`。
+
+## 源系统事实
+
+核心 Rails 组件：
+
+- `api/app/models/message_thread.rb`
+- `api/app/models/message.rb`
+- `api/app/models/message_thread_membership.rb`
+- `api/app/models/message_thread_membership_update.rb`
+- `api/app/models/message_notification.rb`
+- `api/app/models/attachment.rb`
+- `api/app/models/reaction.rb`
+- `api/app/models/custom_reaction.rb`
+- `api/app/models/open_graph_link.rb`
+- `api/app/controllers/api/v1/message_threads_controller.rb`
+- `api/app/controllers/api/v1/message_threads/messages_controller.rb`
+- `api/app/controllers/api/v1/messages/reactions_controller.rb`
+- `api/app/controllers/api/v1/reactions_controller.rb`
+
+源数据库事实：
+
+- 源 schema 共 94 张表。
+- 本轮迁移范围内 9 张表。
+- 其余 85 张表不迁移。
+
+源 Rails 行为要点：
+
+- `MessageThread#index` 查询当前成员参与的非 project threads，按 `last_message_at desc, id desc` 排序。
+- `MessageThread#create` 创建 thread 和 memberships，可选创建首条 message。
+- `MessageThread#update` 只更新 `title` 和 `image_path`。
+- `MessageThread#destroy` 在 Rails 中 hard destroy；Rust 端统一改成 soft delete，写入 `discarded_at`。
+- `Messages#index` 从 thread 下拉消息，按 `id desc` 分页。
+- `Messages#create` 写 message、附件、reply_to，维护 thread 的 `latest_message_id` 和 `last_message_at`。
+- `Messages#update` 更新内容并广播 invalidate。
+- `Messages#destroy` soft delete message，如果删除的是 latest message，需要回算 channel latest message。
+- `Messages::Reactions#create` 在 message 上创建 reaction，并触发 message invalidate。
+
+## 目标架构
+
+模块边界：
+
+- SeaORM 实体放在 `src/callisto/`，文件名与表名一致，例如 `channel.rs`、`message.rs`、`attachment.rs`。如果与现有实体冲突，则优先使用更明确的业务名，例如 `chat_message.rs`，但表名仍不加来源前缀。
+- Storage 放在 `src/jupiter/storage/chat_storage.rs` 或按领域拆分为 `channel_storage.rs`、`message_storage.rs`、`attachment_storage.rs`。
+- 领域服务放在 `src/chat/service/`。
+- HTTP 路由放在 `src/api/router/chat_router.rs` 或 `channel_router.rs`。
+- DTO 放在 `src/api_model/chat/`，除非现有 `api_model` 模式要求平铺。
+- 迁移放在 `src/jupiter/migration/`，文件名使用 `create_chat_tables` 或 `create_channel_tables` 这类语义名称。
+
+调用方向：
+
+```text
+HTTP handler -> chat service -> typed storage -> callisto entity
+                      |
+                      +-> event adapter
+```
+
+禁止事项：
+
+- Handler 中禁止直接写 SeaORM 查询。
+- 目标表名、目标模块、目标 API 不得使用源项目名称前缀。
+- 不要保留指向已砍功能的外键列。
+- 不要引入 Rails 兼容的多组织、多项目抽象。
+
+## 架构决策表
+
+| 编号 | 决策 | 状态 | 执行规格 |
+|------|------|------|----------|
+| D1 | 授权 | 已接受 | 行级访问由 storage 查询强制 `JOIN channel_memberships`，端点级粗权限复用 monoengine 现有策略体系。 |
+| D2 | 异步任务 | 暂缓 | 第一版不建 chat jobs 表。链接预览和提及解析先同步执行或留空字段；确有异步需求时再按独立切片设计。 |
+| D3 | 实时分发 | 已接受 | 第一版实现内部事件广播 trait；是否兼容 Pusher 协议作为独立切片，不能阻塞 CRUD。 |
+| D4 | 附件上传 | 已接受 | 使用 object storage 预签名直传；确认接口写入 `attachments`。 |
+| D5 | public_id | 已接受 | 生成 12 字符 public ID，保持唯一索引；先保证稳定格式，不承诺复现 Rails 随机序列。 |
+| D6 | soft delete | 已接受 | 范围内可删除资源均保留 `discarded_at`，storage 默认过滤。 |
+| D7 | 搜索 | 不适用 | Search 不迁移。 |
+| D8 | 用户身份 | 已接受 | 所有用户引用转换为 `username`。不迁移源 `users` 表。 |
+| D9 | HTTP namespace | 已接受 | 新端点使用 `/api/v1/chat/...`；Rails 兼容路径只在明确客户端需要时加 feature gate。 |
+| D10 | 数据迁移 | 已接受 | 先全量导入范围内 9 表并做字段转换，再灰度切读写。 |
+
+## 目标 Capability
+
+### SharedFoundations
+
+职责：附件、表情、自定义表情、链接预览。
+
+目标文件：
+
+- `src/callisto/attachment.rs`
+- `src/callisto/reaction.rs`
+- `src/callisto/custom_reaction.rs`
+- `src/callisto/open_graph_link.rs`
+- `src/jupiter/storage/attachment_storage.rs`
+- `src/jupiter/storage/reaction_storage.rs`
+- `src/chat/service/shared.rs`
+
+### ChannelChat
+
+职责：聊天频道、成员、成员变更记录、消息、聊天内 message notification 状态。
+
+目标文件：
+
+- `src/callisto/channel.rs`
+- `src/callisto/channel_membership.rs`
+- `src/callisto/channel_membership_update.rs`
+- `src/callisto/message.rs`
+- `src/callisto/message_notification.rs`
+- `src/jupiter/storage/channel_storage.rs`
+- `src/jupiter/storage/message_storage.rs`
+- `src/chat/service/channel_chat.rs`
+
+## 目标 Schema
+
+所有表默认字段规则：
+
+- 主键使用 monoengine 现有 SeaORM 迁移惯例。
+- 保留 `public_id varchar(12)` 并加唯一索引，除非源表没有 public_id。
+- 时间字段使用项目现有 timestamp 类型惯例。
+- 可删除表保留 `discarded_at`。
+- 用户引用字段使用 `username`，不使用 `user_id`、`organization_membership_id`、`owner_id`、`sender_id`、`actor_id`。
+
+### `attachments`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `public_id` | 客户端可见 ID，唯一。 |
+| `file_path` | object storage key 或外链 URL。 |
+| `file_type` | MIME 或 link type。 |
+| `subject_type` | 第一版只允许 `Message`。 |
+| `subject_id` | 指向 `messages.id`。 |
+| `preview_file_path` | 可选预览资源。 |
+| `width` / `height` / `duration` | 媒体元数据。 |
+| `position` | 同一消息内附件排序。 |
+| `name` / `size` | 文件展示信息。 |
+| `gallery_id` | 保留，兼容多附件 gallery。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+删除字段：
+
+- `figma_file_id`
+- `remote_figma_node_id`
+- `remote_figma_node_type`
+- `remote_figma_node_name`
+- `figma_share_url`
+- `transcription_job_id`
+- `transcription_job_status`
+- `transcription_vtt`
+- `comments_count`
+- `imgix_video_file_path`
+- `no_video_track`
+
+索引：
+
+- unique `public_id`
+- `(subject_type, subject_id)`
+- `(subject_type, subject_id, position)` 可选，用于附件排序。
+
+### `reactions`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `public_id` | 客户端可见 ID，唯一。 |
+| `content` | unicode emoji。 |
+| `subject_type` | 第一版只允许 `Message`。 |
+| `subject_id` | 指向 `messages.id`。 |
+| `username` | 反应创建者。 |
+| `custom_reaction_id` | 可选自定义表情。 |
+| `discarded_at` | soft delete。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+索引：
+
+- unique `public_id`
+- `(subject_type, subject_id)`
+- unique `(subject_type, subject_id, username, content, custom_reaction_id, discarded_at)`，迁移时确认 Postgres 对 nullable unique 的语义是否满足需求；不满足则使用 partial unique index。
+
+### `custom_reactions`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `public_id` | 客户端可见 ID，唯一。 |
+| `name` | 表情名称。 |
+| `file_path` | 图片资源。 |
+| `file_type` | MIME。 |
+| `username` | 创建者。 |
+| `pack` | 源表保留字段。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+删除字段：
+
+- `organization_id`
+- `organization_membership_id`
+
+索引：
+
+- unique `public_id`
+- unique `lower(name)` 或应用层统一 lowercase 后 unique `name`。
+
+### `open_graph_links`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `url` | 链接 URL。 |
+| `title` | 展示标题。 |
+| `image_path` | 可选图片。 |
+| `favicon_path` | 可选 favicon。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+索引：
+
+- unique `url`，源表没有索引，Rust 端应加，避免重复抓取。
+
+### `channels`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `public_id` | 客户端可见 ID，唯一。 |
+| `title` | 可空频道标题。 |
+| `last_message_at` | 排序用。 |
+| `latest_message_id` | 可空，指向最新未删除消息。 |
+| `members_count` | 冗余计数。 |
+| `image_path` | 频道图。 |
+| `group` | 是否多人/群组。 |
+| `notification_forced_at` | 保留，若第一版不用则不暴露 API。 |
+| `owner_username` | 创建者。 |
+| `discarded_at` | soft delete。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+索引：
+
+- unique `public_id`
+- `last_message_at`
+- `latest_message_id`
+- `discarded_at`
+- `owner_username`
+
+### `channel_memberships`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `channel_id` | channel FK。 |
+| `username` | 成员身份。 |
+| `last_read_at` | 已读位置。 |
+| `manually_marked_unread_at` | 手动未读。 |
+| `notification_level` | 只作为聊天内偏好保留，不触发外部通知。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+索引：
+
+- unique `(channel_id, username)`
+- `username`
+- `last_read_at`
+- `manually_marked_unread_at`
+
+### `channel_membership_updates`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `channel_id` | channel FK。 |
+| `actor_username` | 操作者。 |
+| `added_usernames` | JSON array。 |
+| `removed_usernames` | JSON array。 |
+| `discarded_at` | soft delete。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+索引：
+
+- `channel_id`
+- `actor_username`
+- `discarded_at`
+
+### `messages`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `channel_id` | channel FK。 |
+| `sender_username` | 可空，系统消息时为空。 |
+| `content` | HTML/rich text 内容；允许空字符串但服务层要求内容或附件至少一个存在。 |
+| `public_id` | 客户端可见 ID，唯一。 |
+| `reply_to_id` | 可空，引用同表。 |
+| `unfurled_link` | 可选，第一版可保留但不自动生成。 |
+| `discarded_at` | soft delete。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+索引：
+
+- unique `public_id`
+- `channel_id`
+- `(channel_id, id)` 用于分页。
+- `sender_username`
+- `reply_to_id`
+- `discarded_at`
+
+### `message_notifications`
+
+保留字段：
+
+| 字段 | 说明 |
+|------|------|
+| `channel_membership_id` | channel membership FK。 |
+| `message_id` | message FK。 |
+| `created_at` / `updated_at` | 时间戳。 |
+
+用途限制：
+
+- 只表示聊天内“这条消息对这个成员有提醒语义”，例如 mention 或 reply。
+- 不得驱动 email、web-push、Slack 或系统通知中心。
+
+索引：
+
+- unique `(channel_membership_id, message_id)`
+- `message_id`
+
+## HTTP API
+
+第一版只提供绿地 API：`/api/v1/chat/...`。
+
+| 方法 | 路径 | 语义 |
+|------|------|------|
+| `GET` | `/api/v1/chat/channels` | 当前用户可见 channel 列表。 |
+| `POST` | `/api/v1/chat/channels` | 创建 channel，可选发送首条消息。 |
+| `GET` | `/api/v1/chat/channels/{channel_id}` | channel 详情。 |
+| `PATCH` | `/api/v1/chat/channels/{channel_id}` | 更新 `title` / `image_path`。 |
+| `DELETE` | `/api/v1/chat/channels/{channel_id}` | soft delete channel。 |
+| `GET` | `/api/v1/chat/channels/{channel_id}/messages` | 消息分页。 |
+| `POST` | `/api/v1/chat/channels/{channel_id}/messages` | 发送消息。 |
+| `PATCH` | `/api/v1/chat/channels/{channel_id}/messages/{message_id}` | 编辑消息。 |
+| `DELETE` | `/api/v1/chat/channels/{channel_id}/messages/{message_id}` | soft delete 消息。 |
+| `POST` | `/api/v1/chat/messages/{message_id}/reactions` | 创建 reaction。 |
+| `DELETE` | `/api/v1/chat/reactions/{reaction_id}` | soft delete reaction。 |
+| `POST` | `/api/v1/chat/attachments/presign` | 获取上传 URL。 |
+| `POST` | `/api/v1/chat/attachments` | 注册已上传附件。 |
+
+请求身份：
+
+- Handler 必须从 monoengine 现有 auth/session 机制拿到当前 `username`。
+- 所有 channel/message 读取必须在 storage 层校验 membership。
+- 发送消息时，如果当前用户不是 channel member，返回 404，减少资源枚举，并写进 API 测试。
+
+## 服务行为规格
+
+### 创建 channel
+
+输入：`title?`、`image_path?`、`member_usernames[]`、`group?`、`initial_message?`、`attachments[]?`。
+
+行为：
+
+- 自动把创建者加入 `member_usernames`。
+- 去重成员列表。
+- 创建 `channels`。
+- 为每个成员创建 `channel_memberships`。
+- 写一条 membership update，`actor_username` 为创建者。
+- 如果有 `initial_message` 或附件，调用发送消息服务。
+- 更新 `members_count`。
+
+验收：
+
+- 创建者永远是成员。
+- 同一个 channel 中成员唯一。
+- 首条消息创建后 `latest_message_id` 与 `last_message_at` 正确。
+
+### 发送消息
+
+输入：`channel_public_id`、`sender_username`、`content`、`reply_to_public_id?`、`attachments[]?`。
+
+行为：
+
+- 校验 sender 是 channel member。
+- 校验 `content` 非空或附件非空。
+- 如果有 `reply_to_public_id`，必须属于同一 channel。
+- 创建 message。
+- 创建附件并绑定到 message。
+- 更新 channel `latest_message_id` 和 `last_message_at`。
+- 根据 mention/reply 规则写 `message_notifications`，但不做外部投递。
+- 通过事件广播 trait 发出 `message_created`。
+
+验收：
+
+- 非成员不能发送。
+- reply_to 跨 channel 被拒绝。
+- 附件消息允许 content 为空。
+- latest message 始终指向最新未删除消息。
+
+### 编辑消息
+
+输入：`message_public_id`、`actor_username`、`content`。
+
+行为：
+
+- actor 必须是原 sender，或后续明确的管理员权限。
+- 更新 content。
+- 发出 `message_updated`。
+
+验收：
+
+- 非作者不能编辑。
+- soft-deleted message 不能编辑。
+
+### 删除消息
+
+输入：`message_public_id`、`actor_username`。
+
+行为：
+
+- actor 必须是原 sender，或后续明确的管理员权限。
+- 写入 `discarded_at`。
+- 如果删除的是 channel latest message，回算最新未删除消息。
+- 发出 `message_deleted`。
+
+验收：
+
+- 删除 latest message 后 channel 排序字段正确。
+- 删除非 latest message 不改变 latest pointer。
+
+### 已读/未读
+
+第一版可以只实现 storage 与内部服务，不暴露 API；如果前端需要，新增：
+
+| 方法 | 路径 | 语义 |
+|------|------|------|
+| `POST` | `/api/v1/chat/channels/{channel_id}/reads` | 标记当前用户已读。 |
+| `DELETE` | `/api/v1/chat/channels/{channel_id}/reads` | 手动标未读。 |
+
+验收：
+
+- mark read 设置当前 membership 的 `last_read_at`。
+- mark unread 设置 `manually_marked_unread_at`，并按 Rails 行为把 `last_read_at` 调到 latest message 之前。
+
+## 实时事件
+
+第一版只定义内部 trait，不要求 Pusher 兼容。
+
+```rust
+pub trait ChatEvents {
+    async fn message_created(&self, channel_public_id: &str, message_public_id: &str);
+    async fn message_updated(&self, channel_public_id: &str, message_public_id: &str);
+    async fn message_deleted(&self, channel_public_id: &str, message_public_id: &str);
+    async fn channel_updated(&self, channel_public_id: &str);
+}
+```
+
+默认实现可以是 no-op。WebSocket/Pusher 兼容网关作为后续切片，不得阻塞 CRUD 切片合入。
+
+## 数据迁移
+
+迁移输入：PlanetScale/MySQL 中范围内 9 张 legacy 表。
+
+迁移输出：monoengine 目标库中的 chat/channel 表。
+
+转换规则：
+
+- `message_threads` 导入为 `channels`。
+- `message_thread_memberships` 导入为 `channel_memberships`。
+- `message_thread_membership_updates` 导入为 `channel_membership_updates`。
+- `organization_membership_id`、`owner_id`、`sender_id`、`actor_id` 通过临时映射转换为 `username`。
+- `oauth_application_id`、`integration_id` 相关行如果代表 integration DM 或 app message，默认跳过，并输出计数报告。
+- `call_id` 非空的 message 默认跳过或转成系统文本，切片开工前二选一。推荐跳过并输出报告，因为 Calls 不迁移。
+- `system_shared_post_id` 非空的 message 默认跳过或转成系统文本，切片开工前二选一。推荐转成不可点击系统文本，避免聊天断层。
+- attachments 只迁移 `subject_type = 'Message'` 且 message 成功迁移的行。
+- reactions 只迁移 `subject_type = 'Message'` 且 message 成功迁移的行。
+- custom reactions 去掉 organization 维度后，若 name 冲突，保留最早创建的一条，其余写入冲突报告。
+
+迁移阶段：
+
+1. 建目标 schema。
+2. 导出范围内 9 张 legacy 表。
+3. 准备 `legacy_user_id -> username` 和 `legacy_organization_membership_id -> username` 映射。
+4. 运行转换导入脚本，产出成功数、跳过数、冲突数、错误样本。
+5. 对比 channel 数、message 数、attachment 数、reaction 数。
+6. 灰度切读 API。
+7. 灰度切写 API。
+8. 保留 Rails 回滚路径至少一个发布周期。
+
+阻塞条件：
+
+- 无法建立完整用户映射。
+- integration/call/post 派生消息比例高到产品不能接受跳过或降级。
+- public_id 冲突未处理。
+- latest pointer 校验失败。
+
+## 切片执行计划
+
+### Slice 0: 对齐边界
+
+目标：让代码元数据与本文一致。
+
+任务：
+
+- 确认 `ChatCapability` 只有 `SharedFoundations`、`ChannelChat`。
+- 确认 `ChatEntityKind` 只有 `Channel`、`Message`、`Attachment`、`Reaction`、`CustomReaction`、`OpenGraphLink`。
+- 确认目标代码和目标文档不使用源项目名称作为命名空间或前缀。
+- 更新 `MIGRATION_SLICES` 的 `rust_target`，目标使用 chat/channel 命名。
+
+验收：
+
+- `cargo +nightly fmt --all --check`
+- `cargo build`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+
+### Slice 1: Shared Foundations schema + storage
+
+目标：落地附件和 reaction 相关实体与基础 storage。
+
+任务：
+
+- 新增 4 张表的 SeaORM 实体与迁移。
+- 新增 attachment storage：创建、按 message 查询、排序。
+- 新增 reaction storage：创建、soft delete、按 message 聚合。
+- 新增 custom reaction storage：创建、按 name/public_id 查询。
+- 新增 open graph storage：按 URL upsert/query。
+
+验收：
+
+- 迁移测试覆盖 4 张表和关键索引。
+- storage 测试覆盖 create/query/soft delete/unique conflict。
+- 不引入外部网络调用。
+
+### Slice 2: Channel Chat schema + storage
+
+目标：落地 channel/message 相关实体与存储层访问控制。
+
+任务：
+
+- 新增 5 张表的 SeaORM 实体与迁移。
+- 新增 channel storage：list visible、find visible、create、update、soft delete。
+- 新增 membership storage：add/remove/list、mark read/unread。
+- 新增 message storage：page、create、update、soft delete、recompute latest。
+- 所有读取按 `username` 强制 membership join。
+
+验收：
+
+- 非成员无法读 channel。
+- 非成员无法读 messages。
+- latest message 回算测试通过。
+- soft-deleted channel/message 默认不可见。
+
+### Slice 3: Channel Chat service
+
+目标：把 Rails callback 行为显式化。
+
+任务：
+
+- 实现 `create_channel`。
+- 实现 `send_message`。
+- 实现 `update_message`。
+- 实现 `delete_message`。
+- 实现 `add_members` / `remove_members`。
+- 实现 message notification 内部状态写入。
+- 接入 no-op event broadcaster。
+
+验收：
+
+- 服务层集成测试覆盖创建 channel + 首条消息。
+- 服务层集成测试覆盖 reply、attachment、reaction。
+- 服务层集成测试覆盖成员变更记录。
+
+### Slice 4: HTTP API
+
+目标：暴露绿地 API。
+
+任务：
+
+- 新增 `chat_router` 并挂载到现有 API router。
+- 新增 request/response DTO。
+- 新增 OpenAPI 标注。
+- 接入当前用户 `username` 提取。
+- 把 service 错误映射成统一 API error。
+
+验收：
+
+- HTTP 测试覆盖所有第一版端点。
+- OpenAPI 构建通过。
+- API 不暴露数据库内部 ID，只暴露 public_id 和 username。
+
+### Slice 5: Attachment direct upload
+
+目标：支持附件预签名和注册。
+
+任务：
+
+- 实现 presign endpoint。
+- 实现 attachment confirmation endpoint。
+- 校验文件大小、mime、当前用户对目标 message/channel 的访问权限。
+
+验收：
+
+- 无权限用户不能给别人的 channel 注册附件。
+- 注册附件后消息查询能返回附件。
+- object storage 在测试中使用 fake/no-op adapter。
+
+### Slice 6: Data migration tooling
+
+目标：能从源 MySQL 导入目标表。
+
+任务：
+
+- 写导入脚本或一次性 CLI 子命令。
+- 实现用户映射输入。
+- 实现跳过/降级报告。
+- 实现校验报告。
+
+验收：
+
+- 可在脱敏 fixture 上完整导入。
+- 导入结果 idempotent 或明确要求空库导入。
+- 报告包含每张表输入数、输出数、跳过数、冲突数。
+
+## 测试策略
+
+必须覆盖：
+
+- 迁移测试：所有新表可在 SQLite 测试库中 migrate。
+- Storage 测试：权限过滤、soft delete、唯一约束、分页排序。
+- Service 测试：创建 channel、发送消息、编辑、删除、reply、附件、reaction、成员变更、latest message 回算。
+- HTTP 测试：端点状态码、响应 shape、错误映射。
+- 导入测试：用小型 fixture 覆盖用户映射、跳过 integration/call/post 派生消息、public_id 保留。
+
+测试命令：
+
+```bash
+cargo +nightly fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+source .env.test && cargo test --all
+```
+
+如果 `cargo test --all` 因既有长跑测试超时，切片 PR 至少必须运行并记录相关新测试的精确命令，并说明完整测试的超时点。
+
+## Review Checklist
+
+每个实现 PR 必须满足：
+
+- 目标代码、表、API、配置、指标和日志字段不使用源项目名称。
+- 没有迁移范围外的表或字段。
+- 表名使用业务语义，不加来源前缀。
+- 所有用户引用都是 `username`，没有新建源用户表。
+- 所有读取路径都校验 channel membership。
+- 所有 soft delete 表默认过滤 `discarded_at IS NULL`。
+- Handler 不直接调用 SeaORM。
+- API response 不泄露内部自增 ID。
+- 没有引入 Slack、Linear、Figma、HMS、OpenAI、Postmark、Pusher 依赖。
+- 新增测试覆盖当前切片 DoD。
+
+## Open Questions
+
+这些问题不阻塞 Slice 0-2，但必须在对应切片前确认：
+
+| 问题 | 最晚确认时间 | 默认方案 |
+|------|--------------|----------|
+| `call_id` 非空消息如何迁移 | Slice 6 前 | 跳过并报告。 |
+| `system_shared_post_id` 非空消息如何迁移 | Slice 6 前 | 转成系统文本。 |
+| message content 是否继续存 HTML | Slice 3 前 | 保持 HTML，避免前端渲染迁移。 |
+| API 对非成员返回 403 还是 404 | Slice 4 前 | 404，减少资源枚举。 |
+| 是否需要 Rails `/v1` 兼容路径 | Slice 4 前 | 不需要，先只做绿地路径。 |
+| 是否需要 Pusher 兼容 WebSocket | CRUD 上线后 | 独立切片评估。 |

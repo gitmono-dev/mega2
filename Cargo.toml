@@ -11,35 +11,31 @@ async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["macros", "json"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 base64 = "0.22.1"
-bs58 = "0.5.0"
+bs58 = "0.5.1"
 bytes = "1.11.1"
 cedar-policy = "4.11.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
-clap_derive = "4.6.1"
 config = "0.15.23"
 ctrlc = "3.5.2"
-dashmap = "6.2.1"
 directories = "6.0.0"
-dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
 envsubst = "0.2.1"
 futures = "0.3.32"
-futures-util = "0.3.32"
 git-internal = "0.7.4"
 hex = "0.4.3"
 hmac = "0.13"
-http = "1.4.0"
+http = "1.4.1"
 idgenerator = "2.0.0"
 indexmap = "2.14"
 itertools = "0.14.0"
 lazy_static = "1.5.0"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
 libvault-core = "0.1.0"
-mimalloc = "0.1.51"
+mimalloc = "0.1.52"
 object_store = { version = "0.13.2", features = ["cloud", "aws", "gcp"] }
 once_cell = "1.21.4"
-openssl = "0.10.79"
+openssl = "0.10.80"
 parse-display = "0.11.0"
 percent-encoding = "2.3"
 pgp = "0.19.0"
@@ -47,17 +43,17 @@ rand = { version = "0.10.1", features = ["thread_rng"] }
 rand08 = { package = "rand", version = "0.8.6" }
 redis = { version = "1.2.1", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
 regex = "1.12.3"
-reqwest = { version = "0.13.3", features = ["json", "stream", "blocking"] }
+reqwest = { version = "0.13.4", features = ["json", "stream", "blocking"] }
 ring = "0.17"
 rkyv = "0.8.16"
 rsa = "0.9.10"
-russh = "0.55.0"
+russh = "0.61.1"
 rustls = "0.23"
 sea-orm = { version = "1.1.20", features = ["sqlx-postgres", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "debug-print"] }
 sea-orm-migration = "1.1.20"
 secp256k1 = { version = "0.31.1", features = ["serde", "rand", "hashes"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_urlencoded = "0.7"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -67,7 +63,6 @@ thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["serde"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = "0.1.18"
-tokio-tungstenite = "0.29"
 tokio-util = "0.7.18"
 toml = "1.1.2"
 tower = "0.5.3"
@@ -76,7 +71,6 @@ tower-sessions = { version = "0.15", features = ["memory-store"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
-tungstenite = "0.29"
 url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["chrono", "axum_extras"] }
 utoipa-axum = "0.2.0"
@@ -87,9 +81,8 @@ uuid = { version = "1.23.1", features = ["v4"] }
 jemallocator = "0.5.4"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-qlean = "0.2.3"
+qlean = "0.3.0"
 
 [dev-dependencies]
 redis-test = { version = "1.0.3", features = ["aio"] }
-serial_test = "3.4.0"
 tempfile = "3.27.0"

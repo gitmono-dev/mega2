@@ -21,24 +21,18 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::super::notification::EmailDispatcher;
 use crate::{
     api::{
         MonoApiServiceState,
         api_doc::ApiDoc,
         api_router::{self},
         guard::cedar_guard::cedar_guard,
-        oauth::{
-            api_store::OAuthApiStore, campsite_store::CampsiteApiStore,
-            tinyship_store::TinyshipApiStore,
-        },
         router::lfs_router,
     },
     bellatrix::Bellatrix,
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::ProtocolError,
     context::AppContext,
-    email::{Mailer, NoopMailer, SmtpMailer},
     git_protocol::InfoRefsParams,
     jupiter::service::artifact_service::ArtifactService,
     saturn::entitystore::EntityStore,
@@ -116,30 +110,6 @@ fn spawn_cleanup_task(ctx: AppContext, token: CancellationToken) -> Option<JoinH
     }))
 }
 
-/// Spawns a background task to deliver pending email jobs
-fn spawn_email_dispatcher_task(ctx: AppContext, token: CancellationToken) -> JoinHandle<()> {
-    // Build a mailer (Default to NoopMailer if config missing or invalid)
-    let cfg = ctx.storage.config();
-    let mailer: Arc<dyn Mailer> = if let Some(mail_cfg) = &cfg.mail {
-        match SmtpMailer::new(mail_cfg) {
-            Ok(m) => Arc::new(m),
-            Err(e) => {
-                tracing::warn!("Failed to initialize SMTP mailer, falling back to noop: {e:?}");
-                Arc::new(NoopMailer)
-            }
-        }
-    } else {
-        Arc::new(NoopMailer)
-    };
-
-    let stg = ctx.storage.notification_storage();
-    let dispatcher = EmailDispatcher::new(stg, mailer);
-
-    tokio::spawn(async move {
-        dispatcher.run(token).await;
-    })
-}
-
 /// Background GC for `artifact_objects` with no manifest references (`docs/artifacts-protocol.md` §10.6).
 fn spawn_artifact_gc_task(ctx: AppContext, token: CancellationToken) -> Option<JoinHandle<()>> {
     let cfg = ctx.storage.config().artifacts_gc.clone();
@@ -206,7 +176,6 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
 
     let shutdown_token = CancellationToken::new();
     let cleanup_handle = spawn_cleanup_task(ctx.clone(), shutdown_token.clone());
-    let dispatcher_handle = spawn_email_dispatcher_task(ctx.clone(), shutdown_token.clone());
     let artifact_gc_handle = spawn_artifact_gc_task(ctx.clone(), shutdown_token.clone());
     let server_token = shutdown_token.clone();
 
@@ -245,7 +214,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
     tracing::info!("Broadcasting shutdown signal to all tasks...");
     shutdown_token.cancel();
 
-    let (cleanup_result, dispatcher_result, artifact_gc_result, server_result) = tokio::join!(
+    let (cleanup_result, artifact_gc_result, server_result) = tokio::join!(
         async {
             if let Some(handle) = cleanup_handle {
                 match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
@@ -271,25 +240,6 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
                 }
             } else {
                 Ok(())
-            }
-        },
-        async {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), dispatcher_handle).await
-            {
-                Ok(Ok(_)) => {
-                    tracing::info!("Email dispatcher task stopped successfully");
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Email dispatcher task panicked: {}", e);
-                    Err(())
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "Email dispatcher did not stop within 30s timeout. The task will be detached."
-                    );
-                    Err(())
-                }
             }
         },
         async {
@@ -328,13 +278,8 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
         }
     );
 
-    match (
-        cleanup_result,
-        dispatcher_result,
-        artifact_gc_result,
-        server_result,
-    ) {
-        (Ok(_), Ok(_), Ok(_), Ok(_)) => {
+    match (cleanup_result, artifact_gc_result, server_result) {
+        (Ok(_), Ok(_), Ok(_)) => {
             tracing::info!("Graceful shutdown completed successfully");
         }
         _ => {
@@ -374,9 +319,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
 ///   - POST       end of `Regex::new(r"/git-receive-pack$")`
 pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
     let storage = ctx.storage;
-    let config = storage.config();
 
-    let oauth_config = config.oauth.clone();
     let git_object_cache = Arc::new(GitObjectCache {
         connection: ctx.connection.clone(),
         prefix: "git-object-rkyv:v1".to_string(),
@@ -384,25 +327,20 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
 
     let api_state = MonoApiServiceState {
         storage: storage.clone(),
-        session_store: Some(match oauth_config.api_store_backend {
-            crate::common::config::OauthApiStoreBackend::Campsite => {
-                OAuthApiStore::Campsite(CampsiteApiStore::new(oauth_config.campsite_api_domain))
-            }
-            crate::common::config::OauthApiStoreBackend::Tinyship => {
-                OAuthApiStore::Tinyship(TinyshipApiStore::new(oauth_config.tinyship_api_domain))
-            }
-        }),
         listen_addr: format!("http://{host}:{port}"),
         entity_store: EntityStore::new(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
     };
 
-    let origins: Vec<HeaderValue> = oauth_config
-        .allowed_cors_origins
-        .into_iter()
-        .map(|x| x.trim().parse::<HeaderValue>().unwrap())
-        .collect();
+    let origins: Vec<HeaderValue> = vec![
+        "http://localhost",
+        "http://app.gitmega.com",
+        "http://app.gitmono.test",
+    ]
+    .into_iter()
+    .map(|x| x.parse::<HeaderValue>().unwrap())
+    .collect();
 
     // add RequestDecompressionLayer for handle gzip encode
     // add TraceLayer for log record

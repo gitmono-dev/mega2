@@ -87,8 +87,7 @@ pub async fn load_key(ctx: AppContext) -> PrivateKey {
         // `PrivateKey::random`. This matches the pattern used by russh's own tests
         // and avoids the `OsRng.unwrap_err()` dance that the new `TryRngCore`-only
         // `rand_core::OsRng` would otherwise force on us.
-        let mut rng = russh::keys::ssh_key::rand_core::OsRng;
-        let keys = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let keys = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let secret = serde_json::json!({
             "secret_key":
             *keys.to_openssh(LineEnding::CR).unwrap()

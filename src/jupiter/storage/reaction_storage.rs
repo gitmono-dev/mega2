@@ -1,0 +1,126 @@
+use std::ops::Deref;
+
+use chrono::Utc;
+use idgenerator::IdInstance;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+
+use crate::{
+    callisto::reactions,
+    common::errors::MegaError,
+    jupiter::storage::base_storage::{BaseStorage, StorageConnector},
+};
+
+#[derive(Clone)]
+pub struct ReactionStorage {
+    pub base: BaseStorage,
+}
+
+impl Deref for ReactionStorage {
+    type Target = BaseStorage;
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+impl ReactionStorage {
+    pub async fn create_reaction(
+        &self,
+        public_id: String,
+        content: Option<String>,
+        subject_type: String,
+        subject_id: i64,
+        username: String,
+        custom_reaction_id: Option<i64>,
+    ) -> Result<reactions::Model, MegaError> {
+        let now = Utc::now().naive_utc();
+        let active_model = reactions::ActiveModel {
+            id: Set(IdInstance::next_id()),
+            public_id: Set(public_id),
+            content: Set(content),
+            subject_type: Set(subject_type),
+            subject_id: Set(subject_id),
+            username: Set(username),
+            custom_reaction_id: Set(custom_reaction_id),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let model = active_model.insert(self.get_connection()).await?;
+        Ok(model)
+    }
+
+    pub async fn soft_delete_reaction(&self, public_id: &str) -> Result<(), MegaError> {
+        let now = Utc::now().naive_utc();
+
+        let model = reactions::Entity::find()
+            .filter(reactions::Column::PublicId.eq(public_id))
+            .one(self.get_connection())
+            .await?;
+
+        if let Some(model) = model {
+            let mut active_model: reactions::ActiveModel = model.into();
+            active_model.discarded_at = Set(Some(now));
+            active_model.update(self.get_connection()).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_reactions_by_subject(
+        &self,
+        subject_type: &str,
+        subject_id: i64,
+    ) -> Result<Vec<reactions::Model>, MegaError> {
+        let models = reactions::Entity::find()
+            .filter(reactions::Column::SubjectType.eq(subject_type))
+            .filter(reactions::Column::SubjectId.eq(subject_id))
+            .filter(reactions::Column::DiscardedAt.is_null())
+            .all(self.get_connection())
+            .await?;
+        Ok(models)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::callisto::entity_ext::generate_public_id;
+
+    #[tokio::test]
+    async fn test_reaction_creation_and_soft_delete() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
+        let reaction_storage = storage.reaction_storage();
+
+        let pub_id = generate_public_id();
+        let reaction = reaction_storage
+            .create_reaction(
+                pub_id.clone(),
+                Some("👍".to_string()),
+                "Message".to_string(),
+                123,
+                "alice".to_string(),
+                None,
+            )
+            .await
+            .expect("failed to create reaction");
+
+        assert_eq!(reaction.public_id, pub_id);
+
+        let results = reaction_storage
+            .get_reactions_by_subject("Message", 123)
+            .await
+            .expect("failed to query reactions");
+        assert_eq!(results.len(), 1);
+
+        reaction_storage
+            .soft_delete_reaction(&pub_id)
+            .await
+            .expect("failed to delete");
+
+        let results_after = reaction_storage
+            .get_reactions_by_subject("Message", 123)
+            .await
+            .expect("failed to query reactions");
+        assert_eq!(results_after.len(), 0);
+    }
+}

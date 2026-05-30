@@ -43,8 +43,8 @@ impl reactions::Model {
             content,
             subject_id,
             subject_type: subject_type.to_owned(),
-            organization_membership_id: None,
             username: username.to_owned(),
+            custom_reaction_id: None,
             discarded_at: None,
         }
     }

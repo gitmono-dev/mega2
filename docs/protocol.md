@@ -1,0 +1,630 @@
+# Git SSH/HTTP 协议兼容性分析与改进计划
+
+本文档分析 `monoengine` 当前 Git SSH/HTTP 协议实现与标准 Git 客户端的兼容性，记录已具备能力、主要缺口、风险点和分阶段改进计划。
+
+## 范围
+
+本文覆盖：
+
+- Git smart HTTP：`GET /info/refs?service=...`、`POST /git-upload-pack`、`POST /git-receive-pack`。
+- Git SSH：`git-upload-pack '<repo>'`、`git-receive-pack '<repo>'`、`git-lfs-authenticate`。
+- Git smart protocol 的 pkt-line、capability、side-band、upload-pack、receive-pack。
+- Git LFS 与 SSH hybrid LFS discovery 的兼容性。
+- 与标准 `git clone`、`git fetch`、`git push`、`git lfs` 客户端交互相关的认证、错误处理和测试建议。
+
+不覆盖普通 REST API、Web UI、内部 monorepo API 或对象存储协议。
+
+## 当前实现概览
+
+### HTTP 入口
+
+HTTP 服务在 `src/server/http_server.rs` 中注册 Git 协议入口：
+
+```text
+/{*path}
+  -> GET  */info/refs
+  -> POST */git-upload-pack
+  -> POST */git-receive-pack
+```
+
+核心分发函数是 `handle_smart_protocol`：
+
+- `GET .../info/refs` 调用 `git_protocol::http::git_info_refs`。
+- `POST .../git-upload-pack` 调用 `git_protocol::http::git_upload_pack`。
+- `POST .../git-receive-pack` 调用 `git_protocol::http::git_receive_pack`。
+- 其他路径返回 404 `Operation not supported`。
+
+HTTP Git 协议处理代码位于 `src/git_protocol/http.rs`。该模块负责：
+
+- 解析 `InfoRefsParams.service`。
+- 创建 `SmartSession`。
+- 读取 request body。
+- 调用共享 smart protocol 实现。
+- 设置 Git smart HTTP 所需的 `Content-Type` 和 `Cache-Control`。
+- 对 receive-pack 执行 Bearer token 或 Basic Auth token 认证。
+
+### SSH 入口
+
+SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/git_protocol/ssh.rs`。
+
+`src/server/ssh_server.rs` 负责：
+
+- 加载或生成 SSH host key，并保存到 vault 的 `ssh_server_key`。
+- 构造 `russh::server::Config`。
+- 构造 `ProtocolApiState`。
+- 运行 `SshServer`。
+
+`src/git_protocol/ssh.rs` 负责：
+
+- 处理 `exec_request`。
+- 支持 `git-upload-pack` 和 `git-receive-pack`。
+- 支持 `git-lfs-authenticate` hybrid LFS discovery。
+- 对 `git-lfs-transfer` 返回未实现。
+- 使用用户上传的 SSH public key fingerprint 进行认证。
+
+SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中的 smart protocol 实现。
+
+### SmartSession 与 repo handler
+
+`SmartSession` 定义在 `src/ceres/protocol/mod.rs`，核心字段包括：
+
+- `repo_path`
+- `service_type`：`UploadPack` 或 `ReceivePack`
+- `transport_protocol`：`Http` 或 `Ssh`
+- `auth`
+- `capabilities`
+
+`repo_handler_with_commands` 会根据 repo path 选择 repo handler：
+
+- 如果 path 位于 `config.monorepo.import_dir` 下，使用 `ImportRepo`。
+- 否则使用 `MonoRepo`。
+
+`ImportRepo` 和 `MonoRepo` 都实现 `RepoHandler`，提供 pack 生成、pack 解码、ref 更新、receive-pack finalize 等能力。
+
+### Smart protocol 实现
+
+核心实现位于 `src/ceres/protocol/smart.rs`：
+
+- `git_info_refs`：构造 ref advertisement。
+- `git_upload_pack`：解析 `want`、`have`、`done`，返回 ACK/NAK 与 pack stream。
+- `parse_receive_pack_commands`：解析 receive-pack ref update commands。
+- `git_receive_pack_stream`：解码 pack stream、保存对象、更新 refs、返回 report-status。
+- `build_side_band_format`：按 side-band / side-band-64k 包装 pack 数据。
+- `read_pkt_line` / `add_pkt_line_string`：pkt-line 编解码辅助。
+
+当前 advertise 的 capability：
+
+```text
+upload-pack:
+  multi_ack_detailed no-done include-tag side-band-64k ofs-delta agent=mega/0.1.0
+
+receive-pack:
+  report-status report-status-v2 delete-refs quiet atomic no-thin side-band-64k ofs-delta agent=mega/0.1.0
+```
+
+`Capability` enum 当前只解析部分 capability：
+
+```text
+multi_ack
+multi_ack_detailed
+no-done
+side-band
+side-band-64k
+report-status
+report-status-v2
+ofs-delta
+```
+
+## 当前兼容能力
+
+### 已支持的 HTTP smart protocol 基础链路
+
+当前实现已经覆盖 smart HTTP 的三类核心请求：
+
+- ref discovery：`GET /repo.git/info/refs?service=git-upload-pack`。
+- fetch/clone：`POST /repo.git/git-upload-pack`。
+- push：`POST /repo.git/git-receive-pack`。
+
+HTTP response 已设置：
+
+- `Content-Type: application/x-git-upload-pack-advertisement`
+- `Content-Type: application/x-git-receive-pack-advertisement`
+- `Content-Type: application/x-git-upload-pack-result`
+- `Content-Type: application/x-git-receive-pack-result`
+- `Cache-Control: no-cache, max-age=0, must-revalidate`
+
+### 已支持的 SSH smart protocol 基础链路
+
+当前 SSH 实现支持标准 Git SSH exec 命令：
+
+```text
+git-upload-pack '<repo>.git'
+git-receive-pack '<repo>.git'
+```
+
+认证采用 SSH public key fingerprint 匹配数据库中的用户 SSH key。认证成功后，`git-upload-pack` 和 `git-receive-pack` 复用 `SmartSession`。
+
+### 已支持基础 push/fetch 数据流
+
+fetch 侧：
+
+- 支持 `want`、`have`、`done`。
+- 支持无 `have` 时 full pack。
+- 支持有 `have` 时 incremental pack。
+- 支持 `multi_ack_detailed` 下的 `ACK ... common` 和 `ACK ... ready`。
+- 支持 side-band-64k 包装 pack data。
+
+push 侧：
+
+- 支持 receive-pack command 解析。
+- 支持 pack stream 解码。
+- 支持对象保存。
+- 支持 refs 更新。
+- 支持 `report-status` 风格的 `unpack ok` 与 per-ref status。
+- 支持 tag 和 branch 的基本更新路径。
+
+### 已支持 Git LFS HTTP discovery 兼容路径
+
+LFS router 同时暴露：
+
+- `/api/v1/lfs/...`
+- `/info/lfs/...`
+
+HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/info/lfs/...` 重写到 LFS runtime router。SSH 下 `git-lfs-authenticate` 会返回 HTTP LFS URL，让 Git LFS 客户端走 hybrid 模式。
+
+## 主要兼容性问题
+
+### HTTP info/refs 参数校验不符合规范且容易 panic
+
+`git_protocol::http::git_info_refs` 当前直接：
+
+```rust
+let service_name = params.service.unwrap();
+let service_type = service_name.parse::<ServiceType>().unwrap();
+```
+
+`handle_smart_protocol` 也直接：
+
+```rust
+let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
+```
+
+风险：
+
+- 缺少 `service` 会 panic。
+- 非法 service 会 panic。
+- query string 解析失败会 panic。
+- HTTP smart protocol 要求 `info/refs` 请求包含 `service=$servicename`，且不应接受额外 query 参数；当前没有严格校验。
+
+建议：
+
+- 缺少或非法 service 返回 400。
+- 不支持的 service 返回 403 或 400，并输出 Git 客户端可读错误。
+- 对额外 query 参数做显式策略：首版可 warning 并拒绝，或兼容接受但记录偏离规范。
+- 所有解析失败都返回 `ProtocolError`，不能 panic。
+
+### HTTP upload-pack 会一次性读取完整请求体
+
+`git_upload_pack` 当前通过 `try_fold(BytesMut::new())` 把整个 request body 读入内存。fetch 请求通常较小，但 protocol v0 negotiation 在复杂仓库和大量 `have` 场景下仍可能较大。
+
+建议：
+
+- 短期增加 body size 上限和错误处理，避免异常客户端导致内存放大。
+- 中期将 upload-pack negotiation 改为 streaming pkt-line reader，而不是一次性聚合 body。
+- 为 `read_pkt_line` 增加可诊断错误，避免 malformed pkt-line panic。
+
+### HTTP receive-pack 通过搜索 `PACK` 分割 commands 和 pack 数据不够稳健
+
+`git_receive_pack` 当前在 chunk 中搜索字节序列 `PACK`：
+
+```rust
+if let Some(pos) = search_subsequence(&chunk, b"PACK") {
+    chunk_buffer.extend_from_slice(&chunk[0..pos]);
+    let commands = pack_protocol.parse_receive_pack_commands(Bytes::copy_from_slice(&chunk_buffer));
+    let left_chunk_bytes = Bytes::copy_from_slice(&chunk[pos..]);
+    ...
+}
+```
+
+风险：
+
+- `PACK` 可能跨 chunk 边界出现。
+- command payload 或 capability 中理论上可能出现 `PACK` 字节序列，导致误切分。
+- 如果客户端只发送 ref delete command，没有 packfile，当前逻辑可能无法生成正确 report-status。
+- 正确边界应由 pkt-line command list 的 flush-pkt 决定，而不是搜索 magic bytes。
+
+建议：
+
+- 用 pkt-line reader 读取 receive-pack command list，直到 flush-pkt。
+- flush-pkt 后剩余字节才作为 pack stream。
+- 支持纯 delete refs 的无 pack receive-pack 请求。
+- 增加 malformed pkt-line、缺 flush-pkt、缺 packfile、pack magic 不合法的测试。
+
+### SSH exec command 解析过于脆弱
+
+`exec_request` 当前使用：
+
+```rust
+let command: Vec<_> = data.split(' ').collect();
+let path = command[1];
+let path = path.replace(".git", "").replace('\'', "");
+let service_type = ServiceType::from_str(command[0]).unwrap_or(ServiceType::UploadPack);
+```
+
+风险：
+
+- 空命令或缺 path 会 panic。
+- 路径包含空格会被错误切分。
+- `.replace(".git", "")` 会删除路径中所有 `.git`，而不是只去掉末尾 `.git`。
+- 不支持双引号、转义、`--` 等 shell quoting 变体。
+- 非法 command 默认变成 `UploadPack`，可能导致错误行为。
+
+建议：
+
+- 引入严格 SSH Git exec parser。
+- 只允许 `git-upload-pack`、`git-receive-pack`、`git-lfs-authenticate`、`git-lfs-transfer`。
+- repo path 只去除末尾 `.git`。
+- 支持单引号、双引号和未引用路径的最小兼容解析。
+- 非法命令返回 channel failure 和可读错误，不默认降级为 upload-pack。
+
+### SSH session 状态与 channel 绑定不够明确
+
+`SshServer` 在 handler 上保存：
+
+- `smart_protocol: Option<SmartSession>`
+- `data_combined: BytesMut`
+
+这些状态不是按 channel 明确绑定。虽然 `russh::server::Server::new_client` 会 clone handler，降低多连接共享风险，但一个 SSH connection 内多个 channel 或异常顺序仍可能互相影响。
+
+建议：
+
+- 将 per-channel state 放入 `HashMap<ChannelId, GitSshChannelState>`。
+- 每个 channel 单独保存 `SmartSession`、receive-pack buffer、service type。
+- `channel_eof` 只处理对应 channel 的状态。
+- 关闭 channel 时清理状态。
+
+### SSH upload-pack 可能把二进制 ACK/pack 数据当 UTF-8 发送
+
+`handle_upload_pack` 当前：
+
+```rust
+session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
+```
+
+`buf` 是 pkt-line bytes，虽然当前 ACK/NAK 文本大多是 UTF-8，但协议层应按 bytes 处理，不应经过 `String::from_utf8`。
+
+建议：
+
+- 所有 Git protocol payload 统一用 bytes 发送。
+- 删除协议二进制路径上的 UTF-8 假设。
+- `session.data` 调用只传 `Vec<u8>` 或 bytes，不做 String 转换。
+
+### capability advertisement 与实际实现不完全一致
+
+当前 advertise 包含一些未完整实现或解析不足的能力：
+
+- `include-tag` 被 advertise，但 `Capability` enum 不解析它，pack 生成是否按 include-tag 语义包含 tag target 需要进一步验证。
+- `delete-refs` 被 advertise，但 receive-pack 的纯删除无 pack 场景不稳健。
+- `atomic` 被 advertise，但 receive-pack ref 更新和 side effects 是否真正原子需要验证。
+- `quiet` 被 advertise，但当前没有显式处理 quiet 的 progress 抑制语义。
+- `no-thin` 被 advertise，但 pack 解码和 thin-pack 行为需要明确测试。
+- `report-status-v2` 被 advertise，但返回内容更接近 v1 `unpack ok` + per-ref status，未体现 v2 的完整语义。
+- `ofs-delta` 被 advertise，pack decode/encode 是否完整支持 OFS_DELTA 需要测试矩阵验证。
+
+建议：
+
+- 建立 capability truth table：advertise、parse、act-on、test 四列。
+- 没有行为支持和测试的 capability 先不要 advertise。
+- `atomic`、`report-status-v2`、`delete-refs` 优先补齐或移除 advertise。
+- 对 `object-format=sha1` 明确 advertise 或确认默认 SHA-1 兼容性。
+
+### pkt-line parser 缺少错误模型
+
+`read_pkt_line` 当前对 malformed input 使用 `unwrap` / panic：
+
+```rust
+let pkt_length = usize::from_str_radix(core::str::from_utf8(&pkt_length).unwrap(), 16)
+    .unwrap_or_else(|_| panic!(...));
+let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
+```
+
+风险：
+
+- 不足 4 字节会 panic。
+- 非 hex 长度会 panic。
+- length 小于 4 会 underflow。
+- length 大于剩余 buffer 会 panic。
+- 无法区分 flush-pkt、delim-pkt、response-end-pkt 等 pkt-line 形态。
+
+建议：
+
+- 定义 `PktLine` enum：`Data(Bytes)`、`Flush`、`Delim`、`ResponseEnd`。
+- parser 返回 `Result<PktLine, ProtocolError>`。
+- 对 length 边界和剩余 bytes 做显式校验。
+- HTTP 和 SSH 共用同一 streaming parser。
+
+### upload-pack negotiation 支持范围较窄
+
+当前只处理 `want`、`have`、`done`。标准 Git 客户端还可能发送或依赖：
+
+- `deepen`
+- `deepen-since`
+- `deepen-not`
+- `deepen-relative`
+- `filter`
+- `shallow`
+- `want-ref`
+- protocol v2 的 command/request 结构
+
+代码注释中提到 monorepo full pack 应配合 shallow clone，但当前 `git_upload_pack` 没有实际处理 `deepen`。这可能影响：
+
+- `git clone --depth=1`
+- partial clone
+- blobless clone
+- promisor remote
+- 大仓库 fetch 性能
+
+建议：
+
+- 短期明确只支持 smart protocol v0/v1 的基础 clone/fetch/push，并在文档和错误里说明不支持 protocol v2 / partial clone。
+- 中期实现 `deepen` 和 shallow response，至少让 `git clone --depth=1` 语义正确。
+- 长期评估 Git protocol v2，特别是 `ls-refs`、`fetch`、`server-option`、`filter`。
+
+### receive-pack 原子性与并发语义需要收敛
+
+当前 receive-pack 在 unpack 后更新 refs 和触发 side effects。代码里已有 monorepo/import 的 finalize 事务设计，但 advertised `atomic` 表示客户端可以期待“全部 ref 更新要么都成功，要么都失败”。
+
+风险：
+
+- tag 更新在循环中较早持久化，branch finalize 后续失败时是否能整体回滚需要确认。
+- monorepo attach、CL、conversation、build hook 等 side effects 与 ref update 的事务边界需要明确。
+- 并发 push 的锁粒度和 race 行为需要测试。
+
+建议：
+
+- 若不能保证 Git 意义上的 atomic，先不要 advertise `atomic`。
+- 建立 receive-pack transaction boundary 文档。
+- 对并发 push 同一 ref、非 fast-forward、删除 ref、tag update、mixed branch/tag push 建集成测试。
+
+### HTTP push 认证与 fetch 认证策略不一致
+
+当前 HTTP receive-pack 需要 Bearer 或 Basic Auth token。upload-pack 没有认证检查。SSH 侧通过 public key 认证后允许 upload-pack/receive-pack。
+
+这可能是有意设计，但需要明确策略：
+
+- public repo 是否允许匿名 clone/fetch。
+- private repo 是否需要 fetch 认证。
+- push 权限是否只验证“用户存在”，还是要验证 repo/path 权限。
+- SSH authenticated user 是否写入 `SmartSession.auth` 用于 commit binding。
+
+当前 HTTP receive-pack 会设置 `authenticated_user`，但 SSH publickey 认证后没有显式把 username 注入 `SmartSession.auth.authenticated_user`。这可能导致 SSH push 的 commit binding 变成 anonymous。
+
+建议：
+
+- 建立统一的 `ProtocolAuthContext`。
+- HTTP 和 SSH 都在进入 `SmartSession` 前完成认证与授权。
+- SSH auth_publickey 成功时保存 username，并传入 receive-pack session。
+- 明确 fetch 是否需要认证；如果需要，upload-pack 也要走相同 authz。
+
+### Git LFS SSH 仅支持 hybrid 模式
+
+SSH 中 `git-lfs-transfer` 返回 `not implemented yet`，`git-lfs-authenticate` 返回 HTTP LFS URL。这符合 Git LFS 可 fallback 的 hybrid 模式，但不是纯 SSH LFS transfer。
+
+建议：
+
+- 文档明确：当前支持 Git LFS hybrid SSH -> HTTP，不支持 pure SSH LFS transfer。
+- `git-lfs-transfer` 应返回明确的 unsupported/failure，而不是普通文本导致客户端误判。
+- `git-lfs-authenticate` 返回 body 应符合 Git LFS SSH adapter 预期，包括 href、header、expires_at，以及 upload/download operation 差异。
+- LFS HTTP endpoints 应补齐认证和 repo path 绑定，避免所有 repo 共用同一 `/info/lfs` 语义造成隔离问题。
+
+### 路由匹配过宽，容易吞掉非 Git 路径
+
+HTTP router 使用 `/{*path}` 捕获所有未匹配路径，然后按后缀判断 Git protocol。虽然目前放在 API/LFS router merge 后，但仍需要关注：
+
+- Git protocol 路径和 API 路径的优先级。
+- `/info/lfs` 路径与 `*/info/refs` 的冲突。
+- 404 response 是否符合普通 HTTP 与 Git 客户端预期。
+- root repo path 特例 `third-party.git` 的规则是否应放入更通用的 repo path validator。
+
+建议：
+
+- 抽出 `GitProtocolPath` parser，统一处理 repo path、`.git` suffix、service endpoint。
+- 路由层只做粗分发，路径语义在 parser 中测试。
+- 404/400/403/405 返回策略标准化。
+
+## 改进计划
+
+### 阶段 0：兼容性基线测试
+
+目标：在修改实现前建立可重复的真实 Git 客户端测试矩阵。
+
+建议新增测试脚本或集成测试覆盖：
+
+```text
+HTTP:
+  git ls-remote http://host/repo.git
+  git clone http://host/repo.git
+  git fetch
+  git push
+  git push --delete origin branch
+  git push --tags
+  git clone --depth=1
+
+SSH:
+  git ls-remote ssh://user@host:port/repo.git
+  git clone ssh://user@host:port/repo.git
+  git fetch
+  git push
+  git push --delete origin branch
+  git push --tags
+
+LFS:
+  git lfs install
+  git lfs track
+  git push with LFS object
+  git clone with LFS object
+  git lfs locks
+```
+
+每个用例记录：
+
+- Git 客户端版本。
+- transport：HTTP 或 SSH。
+- repo 类型：`ImportRepo` 或 `MonoRepo`。
+- auth 类型：anonymous、Bearer、Basic token、SSH key。
+- 预期状态码或 SSH exit status。
+- server log 中是否有 panic、敏感信息或 malformed pkt-line。
+
+验收标准：
+
+- 当前已支持能力有明确 passing/failing 表。
+- 每个后续阶段都能复用该矩阵防止回归。
+
+### 阶段 1：输入解析与错误模型止血
+
+目标：消除协议入口上的 panic，让非法客户端输入返回可诊断错误。
+
+工作项：
+
+1. `info/refs` query 解析改为 `Result`。
+2. 缺失或非法 `service` 返回 400。
+3. SSH exec command 解析改为显式 parser。
+4. 非法 SSH command 返回 channel failure，不默认 upload-pack。
+5. `read_pkt_line` 改为返回 `Result`。
+6. 所有协议二进制 payload 按 bytes 处理，不经过 UTF-8 String。
+
+验收标准：
+
+- malformed HTTP query 不 panic。
+- malformed SSH exec 不 panic。
+- malformed pkt-line 不 panic。
+- Git 客户端收到明确失败，而不是连接被异常关闭。
+
+### 阶段 2：统一 pkt-line / receive-pack streaming parser
+
+目标：用协议边界替代 `PACK` magic 搜索。
+
+工作项：
+
+1. 实现 streaming pkt-line reader。
+2. receive-pack 先读取 command list 到 flush-pkt。
+3. flush-pkt 后剩余 bytes 作为 pack stream。
+4. 支持无 pack 的 delete-only push。
+5. HTTP 和 SSH receive-pack 共用同一 parser。
+
+验收标准：
+
+- `PACK` 跨 chunk 不影响 push。
+- command payload 中出现 `PACK` 不误切分。
+- `git push --delete` 可正常返回 report-status。
+- malformed command list 返回协议错误。
+
+### 阶段 3：capability truth table 与 advertise 收敛
+
+目标：只 advertise 真正支持且有测试的 capability。
+
+工作项：
+
+1. 建立 capability truth table。
+2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`include-tag`、`delete-refs` 等能力。
+3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。
+4. 对 SHA-1 object format 做显式策略。
+
+验收标准：
+
+- advertise 的每个 capability 都有 parse/act-on/test 证据。
+- 标准 Git 客户端不会因为误导性 capability 进入未实现路径。
+
+### 阶段 4：认证与授权统一
+
+目标：HTTP 和 SSH 使用同一协议认证语义。
+
+工作项：
+
+1. 定义 `ProtocolAuthContext`。
+2. HTTP Bearer / Basic token 认证填充同一 context。
+3. SSH publickey 认证成功后保存 username，并传入 `SmartSession`。
+4. 明确 upload-pack 是否允许匿名访问。
+5. receive-pack 检查 repo/path 级 push 权限。
+6. commit binding 使用同一 authenticated actor。
+
+验收标准：
+
+- HTTP push 和 SSH push 都能绑定到正确用户。
+- private repo fetch 策略明确且有测试。
+- 未授权 push 返回 401/403 或 SSH failure，不进入 unpack。
+
+### 阶段 5：SSH per-channel state 与 LFS hybrid 加固
+
+目标：提高 SSH 多 channel 和 LFS 客户端兼容性。
+
+工作项：
+
+1. 引入 `GitSshChannelState`，按 `ChannelId` 保存状态。
+2. `channel_eof` 只处理当前 channel。
+3. `git-lfs-transfer` 返回规范 unsupported。
+4. `git-lfs-authenticate` 按 upload/download operation 返回准确 response。
+5. LFS HTTP endpoint 绑定 repo path 和认证上下文。
+
+验收标准：
+
+- 单 SSH connection 多 channel 不串状态。
+- Git LFS 客户端能稳定 fallback 到 HTTP LFS。
+- LFS object/lock 操作不会跨 repo 混淆。
+
+### 阶段 6：upload-pack 兼容性扩展
+
+目标：提高 clone/fetch 在大仓库和现代 Git 客户端下的兼容性。
+
+工作项：
+
+1. 实现 `deepen` / shallow clone 基础语义。
+2. 支持 `deepen-since`、`deepen-not` 或明确拒绝。
+3. 评估 protocol v2 的 `ls-refs` 和 `fetch`。
+4. 评估 partial clone filter：`blob:none`、tree filters。
+
+验收标准：
+
+- `git clone --depth=1` 行为正确。
+- 不支持的 modern feature 有明确错误或 fallback，不 silent misbehave。
+- 大仓库 fetch 不需要一次性读取大请求体。
+
+## 推荐优先级
+
+| 优先级 | 工作 | 原因 |
+| --- | --- | --- |
+| P0 | 建立真实 Git 客户端兼容性矩阵 | 后续改协议必须防回归 |
+| P0 | 修复 HTTP query、SSH exec、pkt-line parser 的 panic | 非法客户端输入不能打崩服务 |
+| P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 当前 push 分流逻辑不稳健 |
+| P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
+| P1 | SSH payload 全部按 bytes 发送 | Git 协议是二进制协议，不能假设 UTF-8 |
+| P1 | 统一 HTTP/SSH auth context | push 审计、commit binding、权限检查依赖此基础 |
+| P2 | SSH per-channel state | 提升 SSH server 正确性和并发安全 |
+| P2 | LFS hybrid response 加固 | 提升 Git LFS 客户端兼容性 |
+| P3 | shallow clone / protocol v2 / partial clone | 现代 Git 客户端和大仓库体验优化 |
+
+## 建议的文档化兼容声明
+
+在 README 或部署文档中，当前阶段建议明确声明：
+
+- 支持 Git smart HTTP 的基础 clone/fetch/push。
+- 支持 Git SSH 的基础 clone/fetch/push。
+- 支持 Git LFS HTTP endpoints，以及 SSH `git-lfs-authenticate` hybrid 模式。
+- 暂不支持 pure SSH LFS transfer。
+- 暂不承诺 Git protocol v2。
+- 暂不承诺 partial clone / blobless clone。
+- shallow clone 兼容性需要以测试矩阵结果为准。
+- advertise 的 capability 以实现和测试为准，未实现能力不应对外声明。
+
+## 下一步建议
+
+第一批 PR 建议控制在 P0：
+
+1. 新增真实 Git CLI smoke test 脚本或集成测试说明。
+2. `info/refs` query 解析返回 `Result`，非法输入返回 400。
+3. SSH exec command parser 独立成函数并加单元测试。
+4. `read_pkt_line` 返回 `Result` 并覆盖 malformed input。
+5. receive-pack 按 pkt-line flush 分界，不再搜索 `PACK`。
+6. SSH upload-pack 删除 UTF-8 转换，所有 payload 走 bytes。
+
+完成这些之后，再开始 capability 收敛、认证统一和 LFS 加固。

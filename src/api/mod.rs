@@ -7,7 +7,6 @@ use axum::extract::FromRef;
 use tower_sessions::MemoryStore;
 
 use crate::{
-    api::oauth::api_store::OAuthApiStore,
     bellatrix::Bellatrix,
     ceres::{
         api_service::{
@@ -17,12 +16,12 @@ use crate::{
         build_trigger::service::BuildTriggerService,
         protocol::repo::Repo,
     },
+    chat::service::{ChannelChatService, SharedChatService},
     common::errors::ProtocolError,
     jupiter::{
         service::webhook_service::WebhookService,
         storage::{
-            NotificationStorage, Storage, cl_storage::ClStorage,
-            conversation_storage::ConversationStorage,
+            Storage, cl_storage::ClStorage, conversation_storage::ConversationStorage,
             dynamic_sidebar_storage::DynamicSidebarStorage, gpg_storage::GpgStorage,
             issue_storage::IssueStorage, note_storage::NoteStorage, user_storage::UserStorage,
             webhook_storage::WebhookStorage,
@@ -43,7 +42,6 @@ pub mod router;
 pub struct MonoApiServiceState {
     pub storage: Storage,
     pub git_object_cache: Arc<GitObjectCache>,
-    pub session_store: Option<OAuthApiStore>,
     pub listen_addr: String,
     pub entity_store: EntityStore,
     pub bellatrix: Arc<Bellatrix>,
@@ -52,12 +50,6 @@ pub struct MonoApiServiceState {
 impl FromRef<MonoApiServiceState> for MemoryStore {
     fn from_ref(_: &MonoApiServiceState) -> Self {
         MemoryStore::default()
-    }
-}
-
-impl FromRef<MonoApiServiceState> for OAuthApiStore {
-    fn from_ref(state: &MonoApiServiceState) -> Self {
-        state.session_store.clone().unwrap()
     }
 }
 
@@ -112,10 +104,6 @@ impl MonoApiServiceState {
         self.storage.user_storage()
     }
 
-    fn notification_stg(&self) -> NotificationStorage {
-        self.storage.notification_storage()
-    }
-
     fn conv_stg(&self) -> ConversationStorage {
         self.storage.conversation_storage()
     }
@@ -142,6 +130,14 @@ impl MonoApiServiceState {
             self.git_object_cache.clone(),
             self.bellatrix.clone(),
         )
+    }
+
+    pub fn channel_chat_svc(&self) -> ChannelChatService {
+        ChannelChatService::from_storage(&self.storage)
+    }
+
+    pub fn shared_chat_svc(&self) -> SharedChatService {
+        SharedChatService::from_storage(&self.storage)
     }
 
     async fn api_handler(&self, path: &Path) -> Result<Box<dyn ApiHandler>, ProtocolError> {

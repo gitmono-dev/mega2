@@ -13,13 +13,13 @@ use axum::{
 };
 use axum_extra::{
     TypedHeader,
-    headers::{self, Authorization, authorization::Bearer},
+    headers::{Authorization, authorization::Bearer},
 };
 use http::request::Parts;
 use model::LoginUser;
 
 use crate::{
-    api::{MonoApiServiceState, oauth::api_store::OAuthApiStore},
+    api::MonoApiServiceState,
     callisto::{bot_tokens, bots},
     common::errors::MegaError,
     jupiter::storage::user_storage::UserStorage,
@@ -158,42 +158,19 @@ where
 
 impl<S> FromRequestParts<S> for SessionUser
 where
-    OAuthApiStore: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = AuthRedirect;
 
-    /// Reads the session cookie from the request and resolves [`LoginUser`] through the
-    /// configured [`OAuthApiStore`] (external auth API). Missing cookie, unknown session, or
-    /// API errors become [`AuthRedirect`] (401).
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let store = OAuthApiStore::from_ref(state);
-
-        // Cookie: external auth session (Campsite or Tinyship per `OAuthApiStore`).
-        let cookies = parts
-            .extract::<TypedHeader<headers::Cookie>>()
-            .await
-            .map_err(|e| {
-                tracing::debug!("SessionUser: failed to read Cookie header: {e}");
-                AuthRedirect
-            })?;
-
-        let session_cookie = cookies
-            .get(store.session_cookie_name())
-            .ok_or(AuthRedirect)?;
-
-        // Load user from external API
-        match store.load_user_from_api(session_cookie.to_string()).await {
-            Ok(Some(user)) => Ok(SessionUser(user)),
-            Ok(None) => {
-                tracing::debug!("SessionUser: invalid or expired session (external auth)");
-                Err(AuthRedirect)
-            }
-            Err(e) => {
-                tracing::warn!("SessionUser: error loading user from cookie session: {e:?}");
-                Err(AuthRedirect)
-            }
-        }
+    /// Reads the session cookie from the request and resolves [`LoginUser`].
+    /// In no-auth mode, this returns a mock administrator user.
+    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(SessionUser(LoginUser {
+            campsite_user_id: "admin".to_string(),
+            username: "admin".to_string(),
+            avatar_url: "".to_string(),
+            email: "admin@gitmono.test".to_string(),
+        }))
     }
 }
 
@@ -201,7 +178,6 @@ where
 // Use `AccessTokenUser` explicitly where bearer token auth is required.
 impl<S> FromRequestParts<S> for LoginUser
 where
-    OAuthApiStore: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = AuthRedirect;

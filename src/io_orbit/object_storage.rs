@@ -47,6 +47,8 @@ pub enum ObjectNamespace {
     Log,
     /// Artifact protocol objects (`docs/artifacts-protocol.md`), keyed by UUID string.
     Artifact,
+    /// Chat attachments.
+    Attachment,
 }
 
 impl ObjectNamespace {
@@ -56,6 +58,7 @@ impl ObjectNamespace {
             ObjectNamespace::Lfs => "lfs",
             ObjectNamespace::Log => "log",
             ObjectNamespace::Artifact => "artifact",
+            ObjectNamespace::Attachment => "attachment",
         }
     }
 }

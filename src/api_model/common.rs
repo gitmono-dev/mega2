@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 #[derive(PartialEq, Eq, Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct CommonResult<T> {
@@ -34,7 +34,7 @@ impl<T> CommonResult<T> {
     }
 }
 
-#[derive(Deserialize, ToSchema, Clone)]
+#[derive(Deserialize, IntoParams, ToSchema, Clone)]
 pub struct Pagination {
     pub page: u64,
     pub per_page: u64,

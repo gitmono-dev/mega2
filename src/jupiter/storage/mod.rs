@@ -1,9 +1,13 @@
 pub mod artifact_storage;
+pub mod attachment_storage;
 pub mod audit_storage;
 pub mod base_storage;
 pub mod bots_storage;
 pub mod buck_storage;
 pub mod build_trigger_storage;
+pub mod channel_membership_storage;
+pub mod channel_membership_update_storage;
+pub mod channel_storage;
 pub mod cl_reviewer_storage;
 pub mod cl_storage;
 pub mod cla_storage;
@@ -11,6 +15,7 @@ pub mod code_review_comment_storage;
 pub mod code_review_thread_storage;
 pub mod commit_binding_storage;
 pub mod conversation_storage;
+pub mod custom_reaction_storage;
 pub mod dynamic_sidebar_storage;
 pub mod git_db_storage;
 pub mod gpg_storage;
@@ -19,10 +24,11 @@ pub mod init;
 pub mod issue_storage;
 pub mod lfs_db_storage;
 pub mod merge_queue_storage;
+pub mod message_storage;
 pub mod mono_storage;
-pub mod notification_storage;
-pub use notification_storage::NotificationStorage;
 pub mod note_storage;
+pub mod open_graph_storage;
+pub mod reaction_storage;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
@@ -44,11 +50,15 @@ use crate::{
             mono_service::MonoService, webhook_service::WebhookService,
         },
         storage::{
+            attachment_storage::AttachmentStorage,
             audit_storage::AuditStorage,
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
             build_trigger_storage::BuildTriggerStorage,
+            channel_membership_storage::ChannelMembershipStorage,
+            channel_membership_update_storage::ChannelMembershipUpdateStorage,
+            channel_storage::ChannelStorage,
             cl_reviewer_storage::ClReviewerStorage,
             cl_storage::ClStorage,
             cla_storage::ClaStorage,
@@ -56,6 +66,7 @@ use crate::{
             code_review_thread_storage::CodeReviewThreadStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
+            custom_reaction_storage::CustomReactionStorage,
             dynamic_sidebar_storage::DynamicSidebarStorage,
             git_db_storage::GitDbStorage,
             gpg_storage::GpgStorage,
@@ -64,8 +75,11 @@ use crate::{
             issue_storage::IssueStorage,
             lfs_db_storage::LfsDbStorage,
             merge_queue_storage::MergeQueueStorage,
+            message_storage::MessageStorage,
             mono_storage::MonoStorage,
             note_storage::NoteStorage,
+            open_graph_storage::OpenGraphStorage,
+            reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
             webhook_storage::WebhookStorage,
@@ -98,13 +112,19 @@ pub struct AppService {
     pub bots_storage: BotsStorage,
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
-    pub notification_storage: NotificationStorage,
+    pub attachment_storage: AttachmentStorage,
+    pub reaction_storage: ReactionStorage,
+    pub custom_reaction_storage: CustomReactionStorage,
+    pub open_graph_storage: OpenGraphStorage,
+    pub channel_storage: ChannelStorage,
+    pub channel_membership_storage: ChannelMembershipStorage,
+    pub channel_membership_update_storage: ChannelMembershipUpdateStorage,
+    pub message_storage: MessageStorage,
 }
 
 impl AppService {
     fn mock() -> Arc<Self> {
         let mock = BaseStorage::mock();
-        let notification_storage = NotificationStorage::new(mock.connection.clone());
         // For tests and in-memory workflows we don't need a real persistent
         // object storage. Use a filesystem-backed storage rooted in the system
         // temp directory to provide a lightweight implementation.
@@ -129,10 +149,19 @@ impl AppService {
             code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
             code_review_thread_storage: CodeReviewThreadStorage { base: mock.clone() },
             build_trigger_storage: BuildTriggerStorage { base: mock.clone() },
-            notification_storage,
             bots_storage: BotsStorage { base: mock.clone() },
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
+            attachment_storage: AttachmentStorage { base: mock.clone() },
+            reaction_storage: ReactionStorage { base: mock.clone() },
+            custom_reaction_storage: CustomReactionStorage { base: mock.clone() },
+            open_graph_storage: OpenGraphStorage { base: mock.clone() },
+            channel_storage: ChannelStorage { base: mock.clone() },
+            channel_membership_storage: ChannelMembershipStorage { base: mock.clone() },
+            channel_membership_update_storage: ChannelMembershipUpdateStorage {
+                base: mock.clone(),
+            },
+            message_storage: MessageStorage { base: mock.clone() },
         })
     }
 }
@@ -159,7 +188,6 @@ impl Storage {
     pub async fn new(config: Arc<Config>) -> Result<Self, MegaError> {
         let connection = Arc::new(database_connection(&config.database).await);
         let base = BaseStorage::new(connection.clone());
-        let notification_storage = NotificationStorage::new(connection.clone());
 
         let mono_storage = MonoStorage { base: base.clone() };
         let git_db_storage = GitDbStorage { base: base.clone() };
@@ -195,6 +223,16 @@ impl Storage {
         let bots_storage = BotsStorage { base: base.clone() };
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
+        let attachment_storage = AttachmentStorage { base: base.clone() };
+        let reaction_storage = ReactionStorage { base: base.clone() };
+        let custom_reaction_storage = CustomReactionStorage { base: base.clone() };
+        let open_graph_storage = OpenGraphStorage { base: base.clone() };
+
+        let channel_storage = ChannelStorage { base: base.clone() };
+        let channel_membership_storage = ChannelMembershipStorage { base: base.clone() };
+        let channel_membership_update_storage =
+            ChannelMembershipUpdateStorage { base: base.clone() };
+        let message_storage = MessageStorage { base: base.clone() };
 
         let git_service = GitService {
             obj_storage: object_store.clone(),
@@ -252,7 +290,14 @@ impl Storage {
             bots_storage,
             webhook_storage: webhook_storage.clone(),
             audit_storage,
-            notification_storage,
+            attachment_storage,
+            reaction_storage,
+            custom_reaction_storage,
+            open_graph_storage,
+            channel_storage,
+            channel_membership_storage,
+            channel_membership_update_storage,
+            message_storage,
         };
         let merge_queue_service = MergeQueueService::new(base.clone());
         let artifact_service = ArtifactService::new(base.clone(), object_store.clone());
@@ -457,12 +502,40 @@ impl Storage {
         self.app_service.audit_storage.clone()
     }
 
-    pub fn bots_storage(&self) -> BotsStorage {
-        self.app_service.bots_storage.clone()
+    pub fn attachment_storage(&self) -> AttachmentStorage {
+        self.app_service.attachment_storage.clone()
     }
 
-    pub fn notification_storage(&self) -> NotificationStorage {
-        self.app_service.notification_storage.clone()
+    pub fn reaction_storage(&self) -> ReactionStorage {
+        self.app_service.reaction_storage.clone()
+    }
+
+    pub fn custom_reaction_storage(&self) -> CustomReactionStorage {
+        self.app_service.custom_reaction_storage.clone()
+    }
+
+    pub fn open_graph_storage(&self) -> OpenGraphStorage {
+        self.app_service.open_graph_storage.clone()
+    }
+
+    pub fn channel_storage(&self) -> ChannelStorage {
+        self.app_service.channel_storage.clone()
+    }
+
+    pub fn channel_membership_storage(&self) -> ChannelMembershipStorage {
+        self.app_service.channel_membership_storage.clone()
+    }
+
+    pub fn channel_membership_update_storage(&self) -> ChannelMembershipUpdateStorage {
+        self.app_service.channel_membership_update_storage.clone()
+    }
+
+    pub fn message_storage(&self) -> MessageStorage {
+        self.app_service.message_storage.clone()
+    }
+
+    pub fn bots_storage(&self) -> BotsStorage {
+        self.app_service.bots_storage.clone()
     }
 
     pub fn mock() -> Self {

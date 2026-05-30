@@ -16,10 +16,10 @@ use crate::{
         notes::note_router,
         router::{
             admin_router, artifacts_router, bot_router, buck_router, build_trigger_router,
-            cl_router, code_review_router, commit_router, conv_router, dynamic_sidebar_router,
-            gpg_router, group_router, issue_router, label_router, merge_queue_router,
-            permission_router, preview_router, repo_router, reviewer_router, tag_router,
-            user_router, webhook_router,
+            chat_router, cl_router, code_review_router, commit_router, conv_router,
+            dynamic_sidebar_router, gpg_router, group_router, issue_router, label_router,
+            merge_queue_router, permission_router, preview_router, repo_router, reviewer_router,
+            tag_router, user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -54,6 +54,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(build_trigger_router::routers())
         .merge(webhook_router::routers())
         .merge(bot_router::routers())
+        .merge(chat_router::routers())
 }
 
 /// Health Check

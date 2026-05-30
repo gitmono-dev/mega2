@@ -9,15 +9,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::{
     api::{MonoApiServiceState, api_doc::USER_TAG, error::ApiError, oauth::model::LoginUser},
     api_model::common::CommonResult,
-    ceres::model::{
-        notification::{
-            NotificationEventTypeInfo, UpdateUserNotificationConfig, UserNotificationConfig,
-            UserNotificationPreferenceItem,
-        },
-        user::{
-            AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken,
-            UpdateClaContentPayload,
-        },
+    ceres::model::user::{
+        AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken, UpdateClaContentPayload,
     },
     common::errors::MegaError,
 };
@@ -33,9 +26,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(generate_token))
             .routes(routes!(list_token))
             .routes(routes!(remove_token))
-            .routes(routes!(list_notification_types))
-            .routes(routes!(get_notification_config))
-            .routes(routes!(update_notification_config))
             .routes(routes!(get_cla_sign_status))
             .routes(routes!(change_sign_status))
             .routes(routes!(get_cla_content))
@@ -190,123 +180,12 @@ async fn list_token(
     Ok(Json(CommonResult::success(Some(res))))
 }
 
-/// List supported notification event types
-#[utoipa::path(
-    get,
-    path = "/notification/types",
-    responses((status = 200, body = CommonResult<Vec<NotificationEventTypeInfo>>)),
-    tag = USER_TAG
-)]
-async fn list_notification_types(
-    _user: LoginUser,
-    state: State<MonoApiServiceState>,
-) -> Result<Json<CommonResult<Vec<NotificationEventTypeInfo>>>, ApiError> {
-    let types = state
-        .notification_stg()
-        .list_event_types()
-        .await?
-        .into_iter()
-        .map(|t| NotificationEventTypeInfo {
-            code: t.code,
-            category: t.category,
-            description: t.description,
-            system_required: t.system_required,
-            default_enabled: t.default_enabled,
-        })
-        .collect();
-
-    Ok(Json(CommonResult::success(Some(types))))
-}
-
-/// Get current user's notification config
-#[utoipa::path(
-    get,
-    path = "/notification/config",
-    responses((status = 200, body = CommonResult<UserNotificationConfig>)),
-    tag = USER_TAG
-)]
-async fn get_notification_config(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-) -> Result<Json<CommonResult<UserNotificationConfig>>, ApiError> {
-    state
-        .notification_stg()
-        .upsert_user_settings(&user.username, &user.email)
-        .await?;
-
-    let settings = state
-        .notification_stg()
-        .get_user_settings(&user.username)
-        .await?
-        .ok_or_else(|| MegaError::Other("user settings missing".to_string()))?;
-
-    let prefs = state
-        .notification_stg()
-        .list_user_preferences(&user.username)
-        .await?
-        .into_iter()
-        .map(|p| UserNotificationPreferenceItem {
-            event_type_code: p.event_type_code,
-            enabled: p.enabled,
-        })
-        .collect();
-
-    Ok(Json(CommonResult::success(Some(UserNotificationConfig {
-        enabled: settings.enabled,
-        delivery_mode: settings.delivery_mode,
-        email: settings.email,
-        preferences: prefs,
-    }))))
-}
-
-/// Update current user's notification config
-#[utoipa::path(
-    put,
-    path = "/notification/config",
-    request_body = UpdateUserNotificationConfig,
-    responses((status = 200, body = CommonResult<String>)),
-    tag = USER_TAG
-)]
-async fn update_notification_config(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-    Json(payload): Json<UpdateUserNotificationConfig>,
-) -> Result<Json<CommonResult<String>>, ApiError> {
-    state
-        .notification_stg()
-        .upsert_user_settings(&user.username, &user.email)
-        .await?;
-
-    if let Some(enabled) = payload.enabled {
-        state
-            .notification_stg()
-            .set_global_enabled(&user.username, enabled)
-            .await?;
-    }
-    if let Some(mode) = payload.delivery_mode {
-        state
-            .notification_stg()
-            .set_delivery_mode(&user.username, &mode)
-            .await?;
-    }
-    if let Some(items) = payload.preferences {
-        for item in items {
-            state
-                .notification_stg()
-                .set_user_preference(&user.username, &item.event_type_code, item.enabled)
-                .await?;
-        }
-    }
-
-    Ok(Json(CommonResult::success(None)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_user_router_contains_notification_routes() {
+    fn test_user_router_creation() {
         let _router = routers();
     }
 }

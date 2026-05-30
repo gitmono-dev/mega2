@@ -97,6 +97,8 @@ mod m20260324_024559_add_notes;
 mod m20260324_033322_fix_migration;
 mod m20260327_034553_drop_legacy_tasks;
 mod m20260413_033315_create_artifact_tables;
+mod m20260529_013000_chat_foundations;
+mod m20260529_023000_channel_chat;
 mod runner;
 pub use runner::apply_migrations;
 
@@ -181,6 +183,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260324_033322_fix_migration::Migration),
             Box::new(m20260327_034553_drop_legacy_tasks::Migration),
             Box::new(m20260413_033315_create_artifact_tables::Migration),
+            Box::new(m20260529_013000_chat_foundations::Migration),
+            Box::new(m20260529_023000_channel_chat::Migration),
         ]
     }
 }

@@ -87,9 +87,6 @@ pub struct Config {
     pub lfs: LFSConfig,
     #[serde(default)]
     pub blame: BlameConfig,
-    // Not used in mega app
-    #[serde(default)]
-    pub oauth: OauthConfig,
     pub build: BuildConfig,
     pub redis: RedisConfig,
     #[serde(default)]
@@ -99,8 +96,6 @@ pub struct Config {
     pub orion_server: Option<OrionServerConfig>,
     #[serde(default)]
     pub sidebar: SidebarConfig,
-    #[serde(default)]
-    pub mail: Option<MailConfig>,
     /// Background GC for `artifact_objects` rows with no `artifact_set_files` references
     /// (`docs/artifacts-protocol.md` §10.6).
     #[serde(default)]
@@ -136,14 +131,12 @@ impl Config {
             pack: PackConfig::default(),
             lfs: LFSConfig::default(),
             blame: BlameConfig::default(),
-            oauth: OauthConfig::default(),
             build: BuildConfig::default(),
             redis: RedisConfig::default(),
             buck: None,
             object_storage: ObjectStorageConfig::default(),
             orion_server: None,
             sidebar: SidebarConfig::default(),
-            mail: None,
             artifacts_gc: ArtifactGcConfig::default(),
         }
     }
@@ -277,29 +270,6 @@ impl Default for LogConfig {
 }
 
 fn default_with_ansi() -> bool {
-    true
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct MailConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub smtp_host: String,
-    #[serde(default = "default_smtp_port")]
-    pub smtp_port: u16,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-    pub from: String,
-    #[serde(default = "default_starttls")]
-    pub starttls: bool,
-}
-
-fn default_smtp_port() -> u16 {
-    587
-}
-fn default_starttls() -> bool {
     true
 }
 
@@ -651,42 +621,6 @@ pub struct ObjectStorageConfig {
 
     /// Local filesystem storage configuration
     pub local: LocalConfig,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct OauthConfig {
-    pub campsite_api_domain: String,
-    pub tinyship_api_domain: String,
-    #[serde(default)]
-    pub api_store_backend: OauthApiStoreBackend,
-    pub allowed_cors_origins: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-#[derive(Default)]
-pub enum OauthApiStoreBackend {
-    #[default]
-    Campsite,
-    Tinyship,
-}
-
-impl Default for OauthConfig {
-    fn default() -> Self {
-        Self {
-            campsite_api_domain: "http://api.gitmono.test:3001".to_string(),
-            tinyship_api_domain: "https://libra.tools".to_string(),
-            api_store_backend: OauthApiStoreBackend::Campsite,
-            allowed_cors_origins: vec![
-                "http://localhost",
-                "http://app.gitmega.com",
-                "http://app.gitmono.test",
-            ]
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect(),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1139,30 +1073,5 @@ mod test {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_mail_config_deserialize() {
-        use serde::Deserialize;
-        #[derive(Deserialize)]
-        struct Wrapper {
-            mail: MailConfig,
-        }
-
-        let toml = r#"
-            [mail]
-            enabled = true
-            smtp_host = "smtp.example.com"
-            smtp_port = 587
-            from = "no-reply@example.com"
-            starttls = true
-        "#;
-
-        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
-        assert!(parsed.mail.enabled);
-        assert_eq!(parsed.mail.smtp_host, "smtp.example.com");
-        assert_eq!(parsed.mail.smtp_port, 587);
-        assert_eq!(parsed.mail.from, "no-reply@example.com");
-        assert!(parsed.mail.starttls);
     }
 }
