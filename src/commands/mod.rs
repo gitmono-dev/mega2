@@ -1,3 +1,4 @@
+pub mod chat_migrate;
 pub mod service;
 
 use clap::{ArgMatches, Command};
@@ -8,12 +9,13 @@ use crate::common::{
 };
 
 pub fn builtin() -> Vec<Command> {
-    vec![service::cli()]
+    vec![service::cli(), chat_migrate::cli()]
 }
 
 pub(crate) fn builtin_exec(cmd: &str) -> Option<fn(Config, &ArgMatches) -> MegaResult> {
     let f = match cmd {
         "service" => service::exec,
+        "chat-migrate" => chat_migrate::exec,
         _ => return None,
     };
 
@@ -35,6 +37,6 @@ mod tests {
             .map(|cmd| cmd.get_name().to_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["service"]);
+        assert_eq!(names, vec!["service", "chat-migrate"]);
     }
 }
