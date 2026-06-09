@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::time::{Duration, interval};
 use tracing::{info, warn};
 
-use crate::{email::Mailer, jupiter::storage::NotificationStorage};
+use crate::{jupiter::storage::notification_storage::NotificationStorage, mail::Mailer};
 
 pub struct EmailDispatcher {
     stg: NotificationStorage,
@@ -80,8 +80,8 @@ mod tests {
     use super::*;
     use crate::{
         callisto::{email_jobs, notification_event_types},
-        email::NoopMailer,
         jupiter::{migration::apply_migrations, tests::test_db_connection},
+        mail::NoopMailer,
     };
 
     #[tokio::test]

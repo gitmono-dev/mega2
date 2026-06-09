@@ -14,6 +14,8 @@ mod context;
 mod git_protocol;
 mod io_orbit;
 mod jupiter;
+mod mail;
+mod notification;
 mod saturn;
 mod server;
 #[allow(hidden_glob_reexports)]

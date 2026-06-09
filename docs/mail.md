@@ -1,0 +1,257 @@
+# Mail 实现方案分析
+
+本文档记录 `monoengine` 中一级 `mail` 模块（`src/mail/`）的设计、当前实现状态、与 Config / Vault / Notification 的集成方案、运行时注入与启动顺序约束，以及分阶段落地计划。
+
+本文档的编写要求、结构深度、分析维度、事实校准风格、阶段规划 rigor 与 `docs/config.md` 完全一致（包括现状速览表、硬约束列表、多维评估表、风险与前置 gate、实施检查清单等）。
+
+> **与 config 计划的强绑定**：`mail` 是 `docs/config.md` 反复强调的“第一批可迁移凭据”的**唯一合格载体**。只有先把 `mail` 补齐为真实、活跃、消费点晚于 `VaultCore` 的模块，才能在 config 阶段 5 真正落地 `SecretRef` + resolver。任何 mail 相关工作都必须严格遵守 config.md 中的引导循环约束（`Config → Storage(DB) → Vault`）、最小 bootstrap 要求、日志脱敏前置、fail-closed 等。
+
+## 事实校准（2026-06）
+
+> 本文档中的代码引用已对照当前 `src/`（包括本次激活变更）重新核对。特别注意以下与早期 monoengine 移植状态不一致的事实：
+
+1. **历史上 `mail` 不是一级模块，也未真正参与编译**。`src/email/mod.rs` 实现了完整的 `Mailer` trait、`NoopMailer`、`SmtpMailer`（基于 `lettre`），并引用了 `MailConfig`，但：
+   - `main.rs` 从未声明 `mod email;`（更不用说 `mod mail;`）。
+   - `src/common/config.rs` 中原本没有 `MailConfig` 结构体和 `mail: Option<MailConfig>` 字段。
+   - `config/config.toml` 末尾存在 `[mail]` 段（含 `enabled`/`smtp_host` 等 + 额外 `smtp_tls`/`tls` 字段），但因无强类型承接而被 serde 静默忽略。
+   - `src/notification/dispatcher.rs`（及其测试）直接 `use crate::email::...`，但因为模块树不包含 email/notification，实际无法编译/运行。
+
+2. **`MailConfig` 在本次变更前在 monoengine 的编译 Config 中不存在**。mega 项目（上游）中 `common::config::Config` 已有 `pub mail: Option<MailConfig>`（扁平结构：`enabled`、`smtp_host`、`smtp_port`、`username`、`password`、`from`、`starttls`），并在 `Config::mock` 等处正确处理。monoengine 的 Config 是其裁剪/演化版本，mail 字段被遗漏。
+
+3. **Notification 系统已部分移植，但未启动**。`src/notification/{dispatcher, triggers, mod}.rs` + callisto 中的 `email_jobs`、`notification_event_types`、`user_notification_settings`、`user_notification_preferences` 等实体存在，触发器逻辑（`on_cl_comment_created` 等，尊重用户偏好）已从 mega 移植，但因为 mail 模块缺失 + 没有在 `AppContext`/service 启动路径中构造 dispatcher + mailer，整个邮件通知能力处于“死代码但结构完整”状态。
+
+4. **Vault 约束对 mail 的决定性影响**：`password`（或未来的 `password_ref`）的真实值读取**必须**发生在 `VaultCore` 就绪之后。当前 `AppContext::new` 顺序为 `Storage::new (DB + object_storage + Buck 校验 panic 点) → init_connection(redis) → VaultCore::new`。因此 mailer 的**构造时机**是 mail 模块设计的核心约束（详见「运行时注入与晚绑定构造」）。
+
+5. **campsite / mega 功能参考**：
+   - mega（`mono/src/email` + `notification/` + callisto `email_jobs` + 触发器）提供了完整的 outbox 模式 + dispatcher 后台 tick + 事件驱动 enqueue（cl.comment.created 等）+ 用户通知设置过滤。
+   - campsite 主要作为用户/认证后端（`api_store_backend = "campsite"`），不直接提供 monoengine 的邮件发送能力，但其用户邮箱可作为邮件通知的收件人来源。
+   - monoengine 的 callisto 实体、NotificationStorage 方法（`enqueue_email_job`、`fetch_pending_jobs`、`should_send` 等）已与 mega 对齐。
+
+6. 行号与模块路径以本次变更后的代码为准。
+
+## 当前实现状态速览表（激活后，2026-06）
+
+| 能力 / 组件                  | 实现状态          | 关键事实与风险 |
+|-----------------------------|-------------------|---------------|
+| `MailConfig` 结构体 + 纳入 Config | **已激活**（本次变更） | 添加到 `src/common/config.rs`（`Option<MailConfig>`，`#[serde(default)]`），含默认值函数、反序列化测试。与 mega 结构兼容（扁平 + 额外 toml 字段被忽略）。`Config::mock` 已更新。 |
+| 一级 `mail` 模块 (`src/mail/`) | **已激活**（本次变更） | `mod mail;` 在 `main.rs` 声明。`src/mail/mod.rs` 包含 `Mailer` trait、`NoopMailer`、`SmtpMailer::new(&MailConfig)` + 构建消息 + 发送逻辑 + 单元测试。旧 `src/email/` 降级为纯 re-export shim。 |
+| Notification Dispatcher + 触发器集成 | **引用已修复**（本次变更） | `src/notification/dispatcher.rs` 及测试从 `crate::email` 改为 `crate::mail`。触发器（triggers.rs）使用 NotificationStorage enqueue 逻辑（事件类型、用户偏好过滤）已存在。 |
+| 后台 dispatcher 启动 | **未实现** | 目前没有在 `AppContext`、`commands/service/*` 或 http/ssh 服务器启动路径中构造 `EmailDispatcher` 并 spawn 其 `run` 任务。邮件作业会 enqueue 但不会被发送。 |
+| 晚于 Vault 的 mailer 构造 | **设计就绪，代码示例缺失** | `SmtpMailer::new` 本身是同步且轻量的，但调用方必须在 `VaultCore::new` 之后执行。目前 `AppContext::new` 仍把所有权过早固化。 |
+| SecretRef / `password_ref` 支持 | **仅规划** | 当前 `MailConfig.password: Option<String>` 为明文。必须等 config 阶段 5 的 resolver 基础设施 + mail 作为第一个真实消费者落地后，才能把 password 改为 `SecretRef`。 |
+| 多种后端（SES、SendGrid 等） | **未实现** | 仅 SMTP + Noop。mega 体系中也以 SMTP 为主，未来可扩展 provider。 |
+| 模板 / 富文本 / 附件 | **基础 HTML+Text** | `send_html(to, subject, html, text?)` 实现 alternative multipart。无高级模板引擎。 |
+| 与 user_notification_* / 事件类型 的完整联动 | **实体+存储+触发器骨架存在** | callisto 实体 + NotificationStorage 方法 + triggers（cl.comment 等）已移植自 mega，但缺少 dispatcher 常驻任务 + 实际 mailer 注入。 |
+| Profile / 热加载 / 集中校验对 mail 的支持 | **未实现** | 依赖 config 模块的 profile、reload、validate 能力（见 config.md 阶段 6/8）。 |
+| 测试与 CI 覆盖 | **单元测试存在** | mail 自身有构造/消息验证测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration）。缺少“真实 SMTP 不可用时的降级”、“SecretRef 解析失败”、“坏配置不 panic”等场景。 |
+
+**已知加载/启动/安全风险点（必须在相应阶段消除，与 config.md 风险点重叠）**：
+- mailer 在 Storage::new / AppContext 早期路径被构造（违反 vault 就绪顺序）。
+- `password` 出现在日志、错误、Debug、core_key 相关输出、CI 历史。
+- `config/config.toml` 中的示例密码（即使是 dev 的 localhost）。
+- Buck 校验等早期 panic 仍可能在 mail 启用前就中断启动。
+- Notification 事件/用户设置的 upsert 逻辑在触发器中（非幂等迁移）。
+
+## 总体设计
+
+一级 `mail` 模块的目标是成为系统**通知能力的第一等公民**，同时作为 config 计划中 SecretRef 落地的“试点消费者”。
+
+核心原则（直接继承自 config.md）：
+- **晚绑定构造**：真实带凭据的 mailer 绝不在 `Config::new`、Storage 初始化、Redis 连接、Vault 就绪之前被创建。
+- **Outbox 模式**：业务代码（触发器）只负责 `enqueue_email_job` 到 DB（`email_jobs` 表），由后台 `EmailDispatcher`（tick + claim + send + mark）负责投递。失败可重试。
+- **尊重用户偏好**：通过 `user_notification_settings` / `user_notification_preferences` + `should_send` 过滤。
+- **与 Config 管道深度集成**：`MailConfig` 走统一的 TOML + `MEGA_*` env + 占位符 +（未来）`SecretRef` 展开/解析。
+- **可观测与可诊断**：发送失败写 `error_message` + `retry_count`，不把明文密码或 secret 值写入任何日志/错误。
+
+### 主要组件关系
+
+```
+Config (含 mail: Option<MailConfig>)
+  |
+  v (late, post-Vault)
+SmtpMailer::new(...)  -->  Arc<dyn Mailer>
+  |
+  v
+EmailDispatcher (持有 NotificationStorage + mailer)
+  ^ tick (后台任务)
+  |
+NotificationStorage (enqueue / fetch_pending / mark / should_send)
+  |
+callisto::{email_jobs, notification_event_types, user_notification_* }
+  ^
+触发器 (on_cl_comment_created, 未来 on_issue_*, on_mr_* 等)
+  ^ 由 ceres / api 层在事件发生时调用
+```
+
+`NotificationStorage` 目前通过裸 DB 连接构造（`NotificationStorage::new(Arc<db>)`），可从 `Storage` 或 `AppContext` 派生访问（未来可暴露更干净的 API）。
+
+## 启动与注入链路（必须晚于 Vault）
+
+推荐的正确顺序（对齐 config.md 的 `VaultBootstrap` / FullAppContext 区分）：
+
+1. `Config::new`（只产出含 `mail` 明文或未来 `SecretRef` 的配置，不解析密码）。
+2. `Storage::new`（DB + object storage 等，**不构造 mailer**）。
+3. Redis init。
+4. `VaultCore::new`（vault 就绪）。
+5. （可选，最小 bootstrap 路径）`config secret ...` 相关命令在这里解析 mail 相关的 SecretRef 做检查。
+6. 真正服务启动路径：构造 `SmtpMailer::new(&config.mail ...)`（或通过 SecretResolver 填充后的配置），得到 `Arc<dyn Mailer>`。
+7. 构造 `EmailDispatcher::new(notif_stg, mailer)` 并 `tokio::spawn(dispatcher.run(shutdown))`。
+8. 业务触发器开始 enqueue。
+
+**严禁**在 `AppContext::new` 内部或 Storage 构造阶段调用 `SmtpMailer::new`（除非传的是 disabled 的配置或 Noop）。
+
+未来 SecretRef 版本：`Config` 仍只含 `SecretRef`，resolver 在步骤 6 之后异步/按需解析 `mail.password_ref`，再用解析后的值构造 `SmtpMailer`（或让 mail 模块内部持有一个 `SecretResolver` + 缓存的已解析凭据）。
+
+## 主要消费场景与触发器
+
+- **Change List 评论**（`EVENT_CL_COMMENT_CREATED`）：cl 作者 + 所有 reviewer（排除 actor），尊重 `should_send`。
+- 未来：Issue/PR 评论、合并、@提及、构建失败、buck 相关通知等（通过 `notification_event_types` 扩展）。
+- 直接 API / 后台任务 enqueue（绕过触发器）用于系统告警、用户邀请等。
+- `EmailDispatcher` 作为常驻后台任务处理 outbox，支持简单重试（`retry_count`、`next_retry_at`）。
+
+所有 enqueue 都经过 `NotificationStorage` 的方法，业务层不应直接操作 `email_jobs` 表。
+
+## 当前方案的优点（激活后）
+
+- mail 成为一级模块，边界清晰，易于扩展 provider。
+- 与 mega 功能对齐（outbox + dispatcher + 事件触发 + 用户偏好），复用 callisto 实体和存储逻辑。
+- 为 SecretRef 试点做好了结构准备（只要调用构造的时机正确）。
+- NoopMailer 使测试和“邮件未启用”场景零成本。
+- Config 集成后，支持 `MEGA_MAIL__ENABLED=true` 等 env 覆盖和 `${base_dir}` 风格复用（虽 mail 配置中路径较少）。
+
+## 现有 Vault / 引导约束（必须严格遵守）
+
+与 config.md 「现有 vault 能力与关键约束」完全一致：
+
+- mailer 构造**必须**晚于 VaultCore。
+- `config secret set mail.password ...` 等运维命令必须使用**最小 DB/Vault bootstrap**（不能初始化 Redis、对象存储、完整 Storage 服务、HTTP 监听）。
+- 在 `core_key.json` 加固完成前，mail password 进 vault 的收益仅限“不进 git/不进常规日志”。
+- 任何在 Storage::new 或 redis init 阶段“触达”密码的行为都是违规的（即使当前是空字符串）。
+
+因此，`MailConfig` 里的 `password` 在现阶段仍走明文（env / 部署 secret 注入推荐），只有在 resolver 就绪 + 构造点正确后才迁移为 `password_ref`。
+
+## Mail 模块的改进方案（一级模块 + SecretRef 就绪）
+
+### 总体原则（与 config.md 一致）
+
+- 拆分与迁移解耦（如果未来 mail 内部继续细分 provider）。
+- 区分引导/早期 vs 可迁移凭据：password 是典型**可迁移凭据**（消费点天然晚于 vault）。
+- secret 解析是 vault 就绪后的独立阶段，不在 Config 反序列化内。
+- `mail` 相关运维命令复用 config 的 `LoadMode` + 最小 bootstrap 能力。
+- Vault 加固是前置。
+- 基础配置与测试配置分离。
+
+### 建议目录结构（src/mail/ 作为一级模块）
+
+```
+src/mail/
+├── mod.rs            # 对外入口：trait Mailer、Noop、Smtp 工厂、re-export
+├── smtp.rs           # SmtpMailer 实现 + 传输构建
+├── noop.rs           # （或直接在 mod）
+├── providers/        # 未来：ses.rs、sendgrid.rs、console.rs 等
+│   └── mod.rs
+├── template.rs       # （可选）邮件模板渲染（HTML + text + 主题本地化）
+├── error.rs          # MailError（带脱敏的诊断信息）
+└── testing.rs        # MockMailer、capturing mailer 用于测试
+```
+
+`MailConfig` 短期仍放在 `common::config`（或随 config 模块拆分后搬到 `config/model.rs` 或 `mail/config.rs` 由主 Config 组合）。长期推荐让 mail 模块暴露自己的配置类型，主 Config 持有它。
+
+### SecretRef 迁移策略（对齐 config.md 阶段 5）
+
+1. 先完成本次激活（MailConfig 入 Config + 一级 mail 模块 + notification 引用修复 + 晚构造示例）。
+2. 在 config 的 resolver 基础设施就绪后，把 `MailConfig` 扩展为支持 `password`（明文，带 deprecation warning）与 `password_ref: Option<SecretRef>` 互斥。
+3. 提供 `MailConfig::resolve(&self, resolver: &dyn SecretResolver) -> Result<ResolvedMailCreds>` 或让 `SmtpMailer` 接受已解析的凭据。
+4. 消费端（dispatcher 启动点）在 vault 就绪后解析并构造。
+5. 完全迁移后移除明文 password 字段支持。
+
+同时更新 `config secret set/check` 支持 `mail.password` 路径（使用最小 bootstrap）。
+
+### 后台 Dispatcher 启动与生命周期
+
+- 在 `commands/service/http`（或 multi）等 FullAppContext 路径中，在 vault 之后、HTTP 监听之前，检查 `config.mail.as_ref().map(|m| m.enabled).unwrap_or(false)`。
+- 若启用：构造 mailer → 取 NotificationStorage → `EmailDispatcher::new(...)` → spawn task with shutdown token。
+- 优雅关闭：通过 CancellationToken 停止 tick。
+- 多实例注意：outbox + `try_claim_job` 提供基础互斥；生产可加分布式锁或单实例约束。
+
+### 多环境与 Profile
+
+继承 config 的 profile 机制：`config.mail` 里的 host/port 可被 profile 覆盖，`password_ref` 应包含 namespace（如 `vault://secret/config/prod/mail/password#value`）。
+
+### 可扩展性（Provider）
+
+`Mailer` trait 保持最小。未来 `MailService` 或工厂根据 `mail.provider`（或子表 `mail.smtp` / `mail.ses`）选择实现。Noop 始终可用作降级。
+
+## 推荐加载与构造流水线（mail 视角）
+
+```
+ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
+  -> ... (Storage, redis)
+  -> VaultCore
+  -> SecretResolver (如果 password_ref 存在)
+  -> 解析 mail 凭据（或直接用明文）
+  -> SmtpMailer::new(带真实 creds 的 MailConfig)
+  -> EmailDispatcher + spawn
+  -> 触发器可安全 enqueue
+```
+
+`config mail validate --resolve`（或复用 `config validate --resolve-secrets`）应能使用最小 bootstrap 检查 mail 配置是否可发送测试信。
+
+## 迁移步骤（分阶段，绑定 config 阶段）
+
+**阶段 0（已完成，本次 PR）**：激活一级 mail + MailConfig 入 Config + 修复 notification 引用 + 清理 shim。零行为变更（因为之前根本不可用）。
+
+**阶段 1**：在 service 启动路径中真正 late-construct mailer 并 spawn dispatcher（受 shutdown 管理）。补充基本集成测试（使用 Noop 或 test SMTP）。
+
+**阶段 2**：与 config SecretRef 基础设施联动。把 `MailConfig` 扩展为支持 `password_ref`，实现 resolver 解析路径。更新 `config secret set mail.password` 支持。第一个真实 `SecretRef` 消费端落地。
+
+**阶段 3**：Provider 扩展（至少一个额外后端）、模板系统、邮件作业管理 API（查询/重发/统计）、管理员可配置的退信/限流。
+
+**阶段 4**：Profile 感知的 mail 配置、热加载支持（仅无状态字段，如 from 地址、启用开关；凭据变更走 resolver 缓存失效）、更强的可观测（发送指标、链路追踪）。
+
+**阶段 5**：完整测试矩阵（坏 SMTP、解析失败、权限失败、大量 pending job 背压、用户偏好全关场景）、CI 中增加真实邮件发送干跑（或 mailpit 等 test container）、文档同步（README、部署指南）。
+
+贯穿：每次变更同步更新 `config/config.toml` 示例、`docs/mail.md`、`docs/config.md` 相关章节、notification 触发器新增事件时的文档。
+
+## 风险与约束
+
+- **构造时机是不可违反的硬约束**。违反即退回“早期依赖”，无法使用 SecretRef。
+- **outbox + claim 模型的并发与重试语义**需与业务仔细评审（重复发送风险 vs 丢失风险）。
+- **用户邮箱有效性**：不应在 monoengine 内部做硬校验；由触发器/入队时 best-effort，失败由 dispatcher 记录。
+- **大量邮件导致 DB 压力**：fetch 批次、claim、索引设计需关注（已有 `email_jobs` 表）。
+- **跨项目一致性**：与 mega 的 callisto 实体、NotificationStorage API、事件 code 命名保持兼容，避免分叉。
+- **campsite 用户源**：当 `api_store_backend = "campsite"` 时，收件人邮箱可能来自外部，发送前最好有“用户是否允许邮件”二次确认（已在 should_send 中）。
+- 其他与 config.md 相同：core_key 加固、日志脱敏、env 可见性、最小 bootstrap、测试配置隔离等。
+
+## 改进方案多维评估小结
+
+| 维度 | 评估结论 |
+| --- | --- |
+| **合理性** | 高。把 mail 作为一级模块 + 第一个 SecretRef 试点，完美承接 config.md 的引导循环分析和阶段 5 前置要求。outbox 模式在 mega 中已验证可行。 |
+| **可行性** | 高。lettre 已 vendored，实体和存储逻辑已存在，唯一难点是“晚构造 + 最小 bootstrap”在 CLI 和 AppContext 中的落地，需要与 config 的 LoadMode 改造协同。 |
+| **完整性** | 中高。覆盖了 trait、SMTP 实现、outbox、触发器骨架、与 Config/Vault 的集成点。补强项：多 provider、模板、作业管理 UI、热加载白名单、完整 dispatcher 生命周期管理。 |
+| **安全性** | 强（设计中）。明确把凭据构造推迟到 vault 之后、要求脱敏、与 SecretRef 对齐、Noop 安全降级。实现时必须把 vault_core 的泄露问题一起解决。 |
+| **功能正确性与接口兼容性** | 良好。Mailer trait 简单稳定；与 notification 的集成点（dispatcher 构造参数）清晰；与 callisto 实体对齐。shim 保证平滑过渡。 |
+| **数据流与控制流** | 正确。严格遵循 config.md 画的依赖顺序图。enqueue 只在触发器，send 只在 dispatcher tick，构造只在 post-vault。 |
+| **性能与效率** | 可接受。outbox 解耦了业务线程与 SMTP I/O；批次拉取 + claim 提供基础并发控制。未来可加并发发送 worker 池。 |
+| **可靠性与容错** | 改进空间大。当前有 retry_count/next_retry_at 字段，但 dispatcher 里重试策略较简单（tick 固定）。需补充死信、告警、指数退避等。claim 失败时的幂等性需保证。 |
+| **兼容性与互操作** | 良好。与 mega 共享实体和部分逻辑；Config 管道复用；未来 provider 扩展点清晰。 |
+| **可扩展性与可维护性** | 良好。一级模块 + trait + 目录规划（providers/）为扩展留了空间。和 config 模块的演进路径绑定良好。 |
+| **合规性与标准符合性** | 良好。outbox 模式、用户偏好尊重、SecretRef 路径、对日志脱敏的要求都符合现代邮件与凭据管理实践。 |
+
+## 小结
+
+通过本次激活（MailConfig 入 Config + `src/mail/` 成为一级模块 + notification 引用修复），monoengine 终于拥有了可编译、可测试、可作为“真实后置消费者”的 mail 能力。这直接满足了 `docs/config.md` 对阶段 5 的前置硬性要求。
+
+后续工作应严格按本计划 + config.md 的阶段划分进行：先完成 dispatcher 的真实 late 启动与生命周期管理，再与 SecretRef 基础设施联动把 password 作为第一个生产可用的 `SecretRef` 落地，最后持续扩展 provider、模板、可观测和运维能力。
+
+所有 mail 相关的实现、文档、测试、配置示例都必须与 config 模块的拆分、CLI LoadMode、最小 bootstrap、日志脱敏、core_key 加固等前置 gate 保持同步。任何试图在 Storage::new 或 AppContext 早期就构造带真实凭据 mailer 的尝试都必须被视为架构违规。
+
+实施前请完整阅读本档 + `docs/config.md` 的「事实校准」「当前实现状态速览表」「硬约束」「secret 解析的依赖顺序」和「实施前快速检查清单」。
+
+---
+
+**参考**：
+- mega 项目：`mono/src/email/mod.rs`、`mono/src/notification/{dispatcher,triggers}.rs`、common config 中的 `MailConfig`、jupiter callisto `email_jobs` 等实体及 NotificationStorage 实现。
+- campsite：作为用户源后端，为邮件通知提供潜在的收件人邮箱与偏好数据源。
+- monoengine 当前：`src/mail/mod.rs`（新）、`src/common/config.rs`（MailConfig）、`src/notification/dispatcher.rs`（已修复）、callisto 相关实体、`config/config.toml` 中的 `[mail]` 示例。

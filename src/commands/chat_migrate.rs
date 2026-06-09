@@ -1,6 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use clap::{Arg, ArgMatches, Command};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set};
@@ -68,9 +70,7 @@ fn get_bool(val: &serde_json::Value) -> bool {
                 false
             }
         }
-        serde_json::Value::String(s) => {
-            s == "true" || s == "1" || s == "yes"
-        }
+        serde_json::Value::String(s) => s == "true" || s == "1" || s == "yes",
         _ => false,
     }
 }
@@ -125,9 +125,11 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
     let mapping: MigrationMapping = serde_json::from_str(&mapping_content)
         .map_err(|e| MegaError::Other(format!("Failed to parse user mapping JSON: {}", e)))?;
 
-    println!("Loaded user mappings: {} users, {} org memberships", 
-             mapping.user_mappings.len(), 
-             mapping.org_membership_mappings.len());
+    println!(
+        "Loaded user mappings: {} users, {} org memberships",
+        mapping.user_mappings.len(),
+        mapping.org_membership_mappings.len()
+    );
 
     let dir_path = Path::new(input_dir);
 
@@ -135,7 +137,9 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
         if let Some(uname) = user_id.and_then(|uid| mapping.user_mappings.get(&uid.to_string())) {
             return uname.clone();
         }
-        if let Some(uname) = membership_id.and_then(|mid| mapping.org_membership_mappings.get(&mid.to_string())) {
+        if let Some(uname) =
+            membership_id.and_then(|mid| mapping.org_membership_mappings.get(&mid.to_string()))
+        {
             return uname.clone();
         }
         // Fallback
@@ -176,7 +180,7 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
     let mut custom_reaction_skip = 0;
     let mut custom_reaction_conflict = 0;
     let mut imported_custom_reactions = HashSet::new();
-    
+
     // Sort by created_at to keep earliest on conflict
     let mut custom_reaction_list = Vec::new();
     for v in &legacy_custom_reactions {
@@ -204,7 +208,8 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
         }
         seen_names.insert(name_lower);
 
-        let public_id = get_str(&v["public_id"]).unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
+        let public_id = get_str(&v["public_id"])
+            .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
         let file_path = get_str(&v["file_path"]).unwrap_or_default();
         let file_type = get_str(&v["file_type"]).unwrap_or_default();
         let user_id = get_i64(&v["user_id"]);
@@ -294,7 +299,7 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
             channel_skip += 1;
             continue;
         }
-        
+
         // Skip integration DM or app message
         let oauth_id = get_i64(&v["oauth_application_id"]);
         let integration_id = get_i64(&v["integration_id"]);
@@ -303,9 +308,11 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
             continue;
         }
 
-        let public_id = get_str(&v["public_id"]).unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
+        let public_id = get_str(&v["public_id"])
+            .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
         let title = get_str(&v["title"]);
-        let last_message_at = get_dt(&v["last_message_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
+        let last_message_at =
+            get_dt(&v["last_message_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
         let latest_message_id = get_i64(&v["latest_message_id"]);
         let members_count = get_i32(&v["members_count"]).unwrap_or(0);
         let image_path = get_str(&v["image_path"]);
@@ -364,7 +371,8 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
         let membership_id = get_i64(&v["organization_membership_id"]);
         let username = resolve_username(user_id, membership_id);
 
-        let last_read_at = get_dt(&v["last_read_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
+        let last_read_at =
+            get_dt(&v["last_read_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
         let manually_marked_unread_at = get_dt(&v["manually_marked_unread_at"]);
         let notification_level = get_i32(&v["notification_level"]).unwrap_or(0);
         let created_at = get_dt(&v["created_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
@@ -426,7 +434,12 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
                     }
                 }
             }
-            serde_json::Value::Array(resolved.into_iter().map(serde_json::Value::String).collect())
+            serde_json::Value::Array(
+                resolved
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
         };
 
         let added = map_names_json("added_usernames");
@@ -503,7 +516,8 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
             content = "[Shared Post]".to_string();
         }
 
-        let public_id = get_str(&v["public_id"]).unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
+        let public_id = get_str(&v["public_id"])
+            .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
         let reply_to_id = get_i64(&v["reply_to_id"]);
         let unfurled_link = get_str(&v["unfurled_link"]);
         let discarded_at = get_dt(&v["discarded_at"]);
@@ -546,9 +560,9 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
         let membership_id = get_i64(&v["message_thread_membership_id"]).unwrap_or(0);
         let message_id = get_i64(&v["message_id"]).unwrap_or(0);
 
-        if id == 0 
-            || !imported_membership_ids.contains(&membership_id) 
-            || !imported_message_ids.contains(&message_id) 
+        if id == 0
+            || !imported_membership_ids.contains(&membership_id)
+            || !imported_message_ids.contains(&message_id)
         {
             notif_skip += 1;
             continue;
@@ -590,7 +604,8 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
             continue;
         }
 
-        let public_id = get_str(&v["public_id"]).unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
+        let public_id = get_str(&v["public_id"])
+            .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
         let file_path = get_str(&v["file_path"]).unwrap_or_default();
         let file_type = get_str(&v["file_type"]).unwrap_or_default();
         let preview_file_path = get_str(&v["preview_file_path"]);
@@ -652,11 +667,13 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
         let membership_id = get_i64(&v["organization_membership_id"]);
         let username = resolve_username(user_id, membership_id);
 
-        let public_id = get_str(&v["public_id"]).unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
+        let public_id = get_str(&v["public_id"])
+            .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
         let content = get_str(&v["content"]);
-        
+
         let custom_id_raw = get_i64(&v["custom_reaction_id"]);
-        let custom_reaction_id = custom_id_raw.filter(|cid| imported_custom_reactions.contains(cid));
+        let custom_reaction_id =
+            custom_id_raw.filter(|cid| imported_custom_reactions.contains(cid));
 
         let discarded_at = get_dt(&v["discarded_at"]);
         let created_at = get_dt(&v["created_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
@@ -685,18 +702,59 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
     }
 
     println!("\n=== Migration Report ===");
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "Table", "Legacy", "Imported", "Skipped", "Conflicts");
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "Table", "Legacy", "Imported", "Skipped", "Conflicts"
+    );
     println!("{}", "-".repeat(70));
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "custom_reactions", custom_reaction_in, custom_reaction_out, custom_reaction_skip, custom_reaction_conflict);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "open_graph_links", og_in, og_out, og_skip, 0);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "channels", channel_in, channel_out, channel_skip, 0);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "channel_memberships", membership_in, membership_out, membership_skip, 0);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "channel_membership_updates", membership_update_in, membership_update_out, membership_update_skip, 0);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "messages", message_in, message_out, message_skip, 0);
-    println!("  (Skipped by app/oauth: {}, Skipped by calls: {})", message_skip_oauth_integration, message_skip_calls);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "message_notifications", notif_in, notif_out, notif_skip, 0);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "attachments", attachment_in, attachment_out, attachment_skip, 0);
-    println!("{:<28} | {:<8} | {:<8} | {:<8} | {:<8}", "reactions", reaction_in, reaction_out, reaction_skip, 0);
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "custom_reactions",
+        custom_reaction_in,
+        custom_reaction_out,
+        custom_reaction_skip,
+        custom_reaction_conflict
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "open_graph_links", og_in, og_out, og_skip, 0
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "channels", channel_in, channel_out, channel_skip, 0
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "channel_memberships", membership_in, membership_out, membership_skip, 0
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "channel_membership_updates",
+        membership_update_in,
+        membership_update_out,
+        membership_update_skip,
+        0
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "messages", message_in, message_out, message_skip, 0
+    );
+    println!(
+        "  (Skipped by app/oauth: {}, Skipped by calls: {})",
+        message_skip_oauth_integration, message_skip_calls
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "message_notifications", notif_in, notif_out, notif_skip, 0
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "attachments", attachment_in, attachment_out, attachment_skip, 0
+    );
+    println!(
+        "{:<28} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "reactions", reaction_in, reaction_out, reaction_skip, 0
+    );
     println!("{}", "-".repeat(70));
 
     Ok(())
@@ -704,10 +762,12 @@ pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
-    use tempfile::tempdir;
+
     use sea_orm::EntityTrait;
+    use tempfile::tempdir;
+
+    use super::*;
     use crate::jupiter::tests::test_storage;
 
     #[tokio::test]
@@ -745,7 +805,8 @@ mod tests {
                     "updated_at": "2026-05-30 12:00:00"
                 }
             ]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Write legacy message_thread_memberships.json
         fs::write(
@@ -768,7 +829,8 @@ mod tests {
                     "updated_at": "2026-05-30 12:00:00"
                 }
             ]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Write legacy messages.json
         fs::write(
@@ -794,7 +856,8 @@ mod tests {
                     "updated_at": "2026-05-30 12:01:00"
                 }
             ]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Write custom_reactions.json
         fs::write(
@@ -811,7 +874,8 @@ mod tests {
                     "updated_at": "2026-05-30 12:00:00"
                 }
             ]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Write reactions.json
         fs::write(
@@ -828,7 +892,8 @@ mod tests {
                     "updated_at": "2026-05-30 12:02:00"
                 }
             ]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Now run the migration logic manually by mimicking the command exec
         let db_dir = tempdir().unwrap();
@@ -837,7 +902,10 @@ mod tests {
         let conn = mono_storage.get_connection();
 
         // Read thread
-        let threads_data: Vec<serde_json::Value> = serde_json::from_str(&fs::read_to_string(input_dir.join("message_threads.json")).unwrap()).unwrap();
+        let threads_data: Vec<serde_json::Value> = serde_json::from_str(
+            &fs::read_to_string(input_dir.join("message_threads.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(threads_data.len(), 1);
 
         let t = &threads_data[0];
@@ -860,7 +928,10 @@ mod tests {
         am.insert(conn).await.unwrap();
 
         // Query database to ensure channel is inserted
-        let inserted = crate::callisto::channel::Entity::find().all(conn).await.unwrap();
+        let inserted = crate::callisto::channel::Entity::find()
+            .all(conn)
+            .await
+            .unwrap();
         assert_eq!(inserted.len(), 1);
         assert_eq!(inserted[0].id, 101);
         assert_eq!(inserted[0].title.as_deref(), Some("General"));

@@ -83,6 +83,7 @@ use crate::{
             user_storage::UserStorage,
             vault_storage::VaultStorage,
             webhook_storage::WebhookStorage,
+            notification_storage::NotificationStorage,
         },
     },
 };
@@ -182,11 +183,13 @@ pub struct Storage {
     pub config: Weak<Config>,
     pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
+    pub notification_storage: notification_storage::NotificationStorage,
 }
 
 impl Storage {
     pub async fn new(config: Arc<Config>) -> Result<Self, MegaError> {
         let connection = Arc::new(database_connection(&config.database).await);
+        let notification_storage = NotificationStorage::new(connection.clone());
         let base = BaseStorage::new(connection.clone());
 
         let mono_storage = MonoStorage { base: base.clone() };
@@ -328,6 +331,7 @@ impl Storage {
             lfs_service,
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
+            notification_storage,
         })
     }
 
@@ -498,6 +502,10 @@ impl Storage {
         self.app_service.webhook_storage.clone()
     }
 
+    pub fn notification_storage(&self) -> notification_storage::NotificationStorage {
+        self.notification_storage.clone()
+    }
+
     pub fn audit_storage(&self) -> AuditStorage {
         self.app_service.audit_storage.clone()
     }
@@ -546,6 +554,15 @@ impl Storage {
         let app_service = AppService::mock();
         let webhook_service = WebhookService::mock(app_service.webhook_storage.clone());
 
+        // For mock, create a dummy sqlite conn for notification_storage (tests that use Storage::mock
+        // and exercise notification paths should use real test DB setup instead).
+        let rt = tokio::runtime::Runtime::new().expect("runtime for mock conn");
+        let dummy_db = rt.block_on(async {
+            sea_orm::Database::connect("sqlite::memory:")
+                .await
+                .expect("dummy sqlite for mock")
+        });
+
         Storage {
             app_service,
             // app_service: AppService::mock(),
@@ -562,6 +579,9 @@ impl Storage {
             lfs_service: LfsService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
+            notification_storage: NotificationStorage::new(Arc::new(
+                dummy_db,
+            )),
         }
     }
 }

@@ -100,6 +100,10 @@ pub struct Config {
     /// (`docs/artifacts-protocol.md` §10.6).
     #[serde(default)]
     pub artifacts_gc: ArtifactGcConfig,
+    /// Mail / SMTP configuration for system notifications (email outbox via email_jobs).
+    /// This is the first planned consumer for SecretRef (password) after vault is ready.
+    #[serde(default)]
+    pub mail: Option<MailConfig>,
 }
 
 impl Config {
@@ -138,6 +142,7 @@ impl Config {
             orion_server: None,
             sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
+            mail: None,
         }
     }
 
@@ -360,6 +365,47 @@ impl Default for ArtifactGcConfig {
             interval_secs: default_artifacts_gc_interval_secs(),
             grace_secs: default_artifacts_gc_grace_secs(),
             batch_limit: default_artifacts_gc_batch_limit(),
+        }
+    }
+}
+
+/// Mail configuration (SMTP for now). Lives here so it participates in the main
+/// Config loading / env overlay / placeholder / (future) SecretRef pipeline.
+/// See docs/mail.md for the full mail module design and SecretRef migration plan.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub from: String,
+    #[serde(default = "default_starttls")]
+    pub starttls: bool,
+    // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_starttls() -> bool {
+    true
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            username: None,
+            password: None,
+            from: String::new(),
+            starttls: default_starttls(),
         }
     }
 }
@@ -1073,5 +1119,31 @@ mod test {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mail_config_deserial_basic() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            mail: MailConfig,
+        }
+
+        let toml = r#"
+            [mail]
+            enabled = true
+            smtp_host = "smtp.example.com"
+            smtp_port = 587
+            from = "no-reply@example.com"
+            starttls = true
+        "#;
+
+        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
+        assert!(parsed.mail.enabled);
+        assert_eq!(parsed.mail.smtp_host, "smtp.example.com");
+        assert_eq!(parsed.mail.smtp_port, 587);
+        assert_eq!(parsed.mail.from, "no-reply@example.com");
+        assert!(parsed.mail.starttls);
+        assert!(parsed.mail.username.is_none());
+        assert!(parsed.mail.password.is_none());
     }
 }
