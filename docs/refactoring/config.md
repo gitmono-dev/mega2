@@ -2,12 +2,16 @@
 
 本文档记录 `monoengine` 中 `Config` 的实现方案、加载链路、运行时注入方式、主要消费点与当前实现中的注意事项。
 
+> **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
+
+> **集成测试指引**：本计划的各阶段功能应通过 **`integration.md`** 中定义的集成测试场景进行端到端验证。特别是配置初始化、加载、验证和 CLI 工作流应在 Docker 环境中完整测试，以确保与 Vault、邮件、通知等下游模块的集成无误。
+
 > **事实校准（2026-06-09 复核）：** 本文档中的代码引用已对照当前 `src/` 重新核对。**⚠️ 自上一版「2026-06 校准」之后，代码已发生重大变化：`mail` 子系统已从"孤立/未编译"演进为"已编译、已接入 `Config`、已有 vault 之后的构造点"。** 早期草案与上一版校准中关于 mail 的多处结论已**反转**，后文据此重写。需特别注意以下事实：
 > 1. **`Config` 结构体当前含 15 个字段，新增了 `mail`。** 字段为 `base_dir`、`log`、`database`、`monorepo`、`pack`、`lfs`、`blame`、`build`、`redis`、`buck`、`object_storage`、`orion_server`、`sidebar`、`artifacts_gc`，以及 **`mail: Option<MailConfig>`（`#[serde(default)]`，`src/common/config.rs:106`）**（结构体声明在 `src/common/config.rs:81`）。`Config` 仍**不含** `oauth` 字段，也无 `OAuthConfig`。
-> 2. **`MailConfig` 现已完整定义并接入。** 结构体在 `src/common/config.rs:376`（`Default` 在 `:399-411`，含 `default_smtp_port`=587/`default_starttls`=true 辅助函数与反序列化单测 `config.rs:1124-1148`）。`Config.mail` 字段在 `:106`，`mail.password` 是真实的 `Option<String>`（`:385`）。`config/config.toml` 的 `[mail]` 段（`:269-276`，`enabled = true`）**已被消费**——不再是"静默忽略的死配置"（仅段内的 `smtp_tls`/`tls` 两个非 `MailConfig` 字段被 serde 丢弃）。真实实现位于一级模块 **`src/mail/mod.rs`（约 231 行，`SmtpMailer`/`Mailer`/`NoopMailer`，依赖 `lettre`）**，由 `src/main.rs:17` 的 `mod mail;` 接入编译；`src/email/mod.rs` 已退化为 **12 行 re-export shim**（`pub use crate::mail::{Mailer, NoopMailer, SmtpMailer};`）。**注意：激活用的是 `mod mail;`，并非早期草案规划的 `mod email;`。** 详见同目录 **`docs/mail.md`**（mail 子系统的权威文档）。
-> 3. **可迁移凭据集合不再为空：`mail.password` 是其第一个成员。** 它在 `Config` 中真实存在（`config.rs:385`），且其消费点（`SmtpMailer::new`）严格晚于 vault——`src/context/mod.rs:41-46` 在 `VaultCore::new`（`:33`）之后构造 `SmtpMailer`。因此"阶段 5 必须先新增一个合格的后置消费字段"这一前置工作**已基本落地**；剩余的是 SecretRef 基础设施 + 把 `mail.password` 由明文改为 `password_ref` + 把演示性的 `_late_mailer` 升级为真实 `EmailDispatcher`。由本项目 vault 管理的 secret 仍只有 `ssh_server_key`（不在 `Config` 结构体中）。
+> 2. **`MailConfig` 现已完整定义并接入。** 结构体在 `src/common/config.rs:376`（`Default` 在 `:399-411`，含 `default_smtp_port`=587/`default_starttls`=true 辅助函数与反序列化单测 `config.rs:1124-1148`）。`Config.mail` 字段在 `:106`，`mail.password` 是真实的 `Option<String>`（`:385`）。`config/config.toml` 的 `[mail]` 段（`:269-276`，`enabled = true`）**已被消费**——不再是"静默忽略的死配置"（仅段内的 `smtp_tls`/`tls` 两个非 `MailConfig` 字段被 serde 丢弃）。真实实现位于一级模块 **`src/mail/mod.rs`（约 231 行，`SmtpMailer`/`Mailer`/`NoopMailer`，依赖 `lettre`）**，由 `src/main.rs:17` 的 `mod mail;` 接入编译；`src/email/mod.rs` 已退化为 **12 行 re-export shim**（`pub use crate::mail::{Mailer, NoopMailer, SmtpMailer};`）。**注意：激活用的是 `mod mail;`，并非早期草案规划的 `mod email;`。** 详见同目录 **`mail.md`**（mail 子系统的权威文档）。
+> 3. **可迁移凭据集合不再为空：`mail.password` 是其第一个成员。** 它在 `Config` 中真实存在（`config.rs:385`），且其消费点（`SmtpMailer::new`）严格晚于 vault——`src/context/mod.rs:46-55` 在 `VaultCore::new`（`:39`）之后构造 `SmtpMailer` 并 spawn `EmailDispatcher`。因此"阶段 5 必须先新增一个合格的后置消费字段"这一前置工作**已落地**；剩余的是 SecretRef 基础设施 + 把 `mail.password` 由明文改为 `password_ref` + 把当前 `if let Ok(m)` 静默失败改为可诊断处理。由本项目 vault 管理的 secret 仍只有 `ssh_server_key`（不在 `Config` 结构体中）。
 > 4. **`mail.password` 当前是一处真实的明文凭据暴露面。** 虽然 `config/config.toml` 的 `[mail]` 样例**未**写入 `password`/`username`，但该字段为明文 `Option<String>`，`Config`/`MailConfig` 均派生 `Debug`、`MailConfig` 还派生 `Serialize`（`config.rs:375`），并在 lettre 边界以明文传入 `Credentials::new`（`mail/mod.rs:96`）。在 SecretRef 化之前，它与 vault root token、`core_key.json` 一样属于"当前已存在的明文暴露"，而非纯未来风险。
-> 5. **行号已按当前代码全面重核。** `config.rs` 现为 **1149 行**（早期草案约 1077 行），多数子配置结构体行号已位移（见「行号修正表」一节）。早期失效行号示例：`mail.password` 现在 `config.rs:385`（非 `:293`）、`Storage::new` 在 `src/jupiter/storage/mod.rs:188`（非 `mod.rs:159`）。
+> 5. **行号已按当前代码全面重核。** `config.rs` 现为 **1149 行**（早期草案约 1077 行），多数子配置结构体行号已位移（见「行号修正表」一节）。早期失效行号示例：`mail.password` 现在 `config.rs:385`（非 `:293`）、`Storage::new` 在 `src/jupiter/storage/mod.rs:190`（非 `mod.rs:159`）。
 
 > **本文档性质说明**：本文档同时承担“现状分析”和“改进设计方案”两种角色。**除“事实校准”和本节外，文档中大量内容描述的是规划中的目标状态**。需注意：`mail`/`MailConfig` 子系统与"vault 之后的 mailer 构造点"**已部分落地**（见事实校准 #2/#3 与「已落地的 mail/notification 子系统现状」一节），但**配置模块拆分（`src/config/`）、`config` 命令族、`SecretRef` + resolver、Profile、热加载、集中校验仍均未落地**。实施时请以代码实际状态为准，优先完成“现状 → 校准表 → 硬约束”三部分的阅读。
 
@@ -20,23 +24,23 @@
 | 占位符 `${base_dir}` 展开       | 已实现（有坑） | `variable_placeholder_substitute`（`config.rs:192`，体 `193-237`）做两次 `collect()` + `Rc<RefCell>` 遍历 + `envsubst`，内部**恰 10 处** `.unwrap()`（`:194,197,201,203,213,225,226,228,231,237`），任何坏模板都会 panic。 |
 | 配置文件定位（4 级回退 + 自动生成） | 已实现    | `mega_base()/etc/config.toml` 与默认生成逻辑存在，但 README 主要只提前三种；生成时会把 `base_dir` 渲染进去。 |
 | 运行时共享 (`Arc<Config>`)      | 已实现      | `AppContext` 持有；`Storage` 内部为 `Weak<Config>`，`config()` 调用 `.expect("Config has been dropped")` —— 这是热加载切换快照句柄时的潜在雷区。 |
-| `mail` / `MailConfig` / 邮件发送 | **已激活（mailer 构造为演示态）** | 真实实现在一级模块 `src/mail/mod.rs`（约 231 行，`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `config.rs:376`、`Config.mail` 字段在 `:106`、`[mail]` 段已被消费。`src/email/mod.rs` 退化为 12 行 re-export shim。`src/context/mod.rs:41-46` 在 vault 之后构造 `SmtpMailer`，但绑定为 `let _late_mailer`（未使用、`.ok()` 吞错），属演示而非真实接入。详见 `docs/mail.md`。 |
+| `mail` / `MailConfig` / 邮件发送 | **已激活并接入 dispatcher 启动点** | 真实实现在一级模块 `src/mail/mod.rs`（约 231 行，`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `config.rs:376`、`Config.mail` 字段在 `:106`、`[mail]` 段已被消费。`src/email/mod.rs` 退化为 12 行 re-export shim。`src/context/mod.rs:46-55` 在 vault 之后构造 `SmtpMailer` 并 spawn `EmailDispatcher`，但当前 `if let Ok(m)` 会静默吞掉构造失败。详见 `mail.md`。 |
 | `[oauth]` 段                   | **死配置**  | TOML 里有完整段（`config.toml:155`）+ env list key 注册（`config.rs:118`），但无强类型字段承接，serde 静默忽略。它是目前**唯一**被整段丢弃的孤立顶层段（`[mail]` 已被消费）。用户添加的未知顶层段同样被静默丢弃；段内未知 key（如 `[mail]` 中的 `smtp_tls`/`tls`）也被丢弃。 |
-| `src/notification/`（邮件 outbox / dispatcher） | **存在但未接入编译** | `src/notification/{dispatcher,triggers,mod}.rs`（`EmailDispatcher`、触发器）+ `callisto::email_jobs` outbox 实体已从 mega 移植，但 `main.rs` **无 `mod notification;`**，整个目录是新的孤立模块（唯一 `crate::notification` 引用在 `mail/mod.rs:18` 的文档注释里）。邮件作业可入队但无后台任务发送。 |
+| `src/notification/`（邮件 outbox / dispatcher） | **已接入编译并在 mail 启用时启动 dispatcher** | `src/notification/{dispatcher,triggers,mod}.rs`（`EmailDispatcher`、触发器）+ `callisto::email_jobs` outbox 实体已从 mega 移植；`main.rs:18` 已声明 `mod notification;`。`AppContext::new` 在 vault 之后、`init_monorepo` 之前创建 `EmailDispatcher` 并 `tokio::spawn`，但启动失败路径仍需要可诊断化和生命周期治理。 |
 | Vault 管理的 secret            | 仅 1 个     | 只有 `ssh_server_key`（不在 Config 里，由 server/ssh_server 直接读写）。 |
 | `core_key.json` + 自动解封     | 已实现（高风险） | 明文 JSON 存储 10-of-5 shares + root_token；缺失时直接 `delete_all()` + 重新 init 并 `println!` root token；解封路径使用 `assert!`；`log::debug!` 也会记录 token。 |
 | Profile / `config.<profile>.toml` | **未实现** | loader.rs 完全没有 profile 逻辑。 |
 | `monoengine config` 命令族      | **未实现** | 当前 CLI 模型是“先强制 `Config::new`，再 dispatch 子命令”。`config init/validate/secret` 等都不存在。 |
-| 集中配置校验                   | **局部存在** | 只有 `BuckConfig::validate()`，且在 `Storage::new:253` 失败即 `panic!`（tracing error + panic）。 |
+| 集中配置校验                   | **局部存在** | 只有 `BuckConfig::validate()`，且在 `Storage::new:253-263` 失败即 `panic!`（tracing error + panic）。 |
 | SecretRef + 运行期 resolver    | **仅草案**  | 本文档中的类型设计、路径映射（`vault://...` → `read_secret(name)` 避免 `secret/secret/...`）、缓存、轮转、互斥 `password`/`password_ref` 均未编码。 |
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
 - 占位符展开的 **10** 处 `unwrap`（`config.rs:192-237`）。
-- `Storage::new` 里的 Buck 校验 panic（校验调用 `storage/mod.rs:253`，`panic!` 在 `:259`）。
+- `Storage::new` 里的 Buck 校验 panic（校验调用 `storage/mod.rs:253`，`panic!` 在 `:262`）。
 - `Storage::config()` 的 `expect`（`storage/mod.rs:335`，`upgrade().expect("Config has been dropped")`）。
-- `AppContext::new` 的两处启动期 `expect`：`Storage::new(...).expect("init monorepo storage err")`（`context/mod.rs:29`）、`init_monorepo(...).expect("init monorepo failed")`（`:52`）。
-- `_late_mailer` 的 `SmtpMailer::new(...).ok()` **静默吞错**（`context/mod.rs:44`）——演示态可接受，真实接入时必须改为可诊断处理，避免邮件能力静默失效。
+- `AppContext::new` 的两处启动期 `expect`：`Storage::new(...).expect("init monorepo storage err")`（`context/mod.rs:33-35`）、`init_monorepo(...).expect("init monorepo failed")`（`:60-64`）。
+- mailer/dispatcher 构造使用 `if let Ok(m) = SmtpMailer::new(...)` **静默吞错**（`context/mod.rs:48`）——真实接入已发生，但失败仍不可诊断，需改为可观测的错误处理，避免邮件能力静默失效。
 - Vault 初始化/解封路径的多处 `println!`、`expect`、`assert!` + root token 泄露（`vault_core.rs:71/:83-86/:111/:114-117`）。
 - `mega_base()`（`config.rs:33`）/`mega_cache()`（`:65`）的早期 panic（`BaseDirs::new().unwrap()` 等）。
 - `DbConfig::default()`（`config.rs:298`）和 `config/config.toml`（`:28`）里的硬编码可预测凭据（`postgres://mega:mega@...`、`postgres://mono:mono@...`）。
@@ -44,20 +48,20 @@
 
 ## 已落地的 mail/notification 子系统现状（2026-06-09）
 
-本文早期版本把邮件能力整体当作"阶段 5 才新建的未来工作"。当前代码已不符这一描述，需单列现状，避免规划与实现脱节。**与本子系统相关的权威文档是同目录的 `docs/mail.md`**（含 mail 模块自己的事实校准、速览表、硬约束与分阶段计划）；本节只做与 `Config` 相关的接口性概述，细节以 `docs/mail.md` 为准。
+本文早期版本把邮件能力整体当作"阶段 5 才新建的未来工作"。当前代码已不符这一描述，需单列现状，避免规划与实现脱节。**与本子系统相关的权威文档是同目录的 `mail.md`**（含 mail 模块自己的事实校准、速览表、硬约束与分阶段计划）；本节只做与 `Config` 相关的接口性概述，细节以 `mail.md` 为准。
 
 **已编译且活跃：**
 - 一级模块 `src/mail/mod.rs`（约 231 行）：`Mailer` trait（`:40`）、`NoopMailer`（`:50`）、`SmtpMailer`（`:65`，含长生命周期 `AsyncSmtpTransport`，`:68/:102`，`Credentials::new` 在 `:96`），由 `src/main.rs:17` 的 `mod mail;` 接入。
 - `MailConfig`（`config.rs:376`，`#[serde(default)]` 经 `Config.mail` 字段 `:106` 进入统一加载管道）、`config/config.toml` 的 `[mail]` 段（`:269-276`）已被消费。
-- `src/context/mod.rs:41-46`：在 `VaultCore::new`（`:33`）之后从 `config.mail` 构造 `SmtpMailer`，**但绑定为 `let _late_mailer`、未被使用、错误经 `.ok()` 吞掉**——这是"类型/构造点已就位"的演示，而非真实接入的消费者。
+- `src/context/mod.rs:46-55`：在 `VaultCore::new`（`:39`）之后从 `config.mail` 构造 `SmtpMailer`，并创建 `EmailDispatcher` 后 `tokio::spawn(dispatcher.run(shutdown))`。当前问题是 `SmtpMailer::new` 失败会被 `if let Ok(m)` 静默忽略，仍需改为可诊断处理。
 - `src/email/mod.rs`：12 行 re-export shim（历史路径兼容），应作为有主、有移除阶段的过渡 shim 跟踪。
 
-**已存在但未接入编译（新的孤立债务）：**
-- `src/notification/{dispatcher,triggers,mod}.rs`：`EmailDispatcher`（`dispatcher.rs:18` 的 `run(self, shutdown)`，2 秒固定 `interval`、`fetch_pending_jobs(50)`、`:6` 导入 `crate::mail`）与事件触发器（`on_cl_comment_created` 等）已从 mega 移植。
-- `callisto::email_jobs` outbox 实体、`NotificationStorage`、对应 migration 均存在。
-- **但 `src/main.rs` 没有 `mod notification;`**，因此整个 `src/notification/` 目录当前不参与编译，是与早期 `email` 孤立问题结构相同的新债务。邮件作业可入队但**没有后台任务真正发送**。
+**已接入但仍需加固：**
+- `src/notification/{dispatcher,triggers,mod}.rs`：`EmailDispatcher`（`dispatcher.rs:18` 的 `run(self, shutdown)`，2 秒固定 `interval`、`fetch_pending_jobs(50)`、`:6` 导入 `crate::mail`）与事件触发器（`on_cl_comment_created` 等）已从 mega 移植，并经 `main.rs:18` 的 `mod notification;` 接入编译。
+- `callisto::email_jobs` outbox 实体、`NotificationStorage`、对应 migration 均存在；`AppContext::new` 当前在 vault 之后、`init_monorepo` 之前启动 dispatcher。
+- 仍需补齐：构造失败可诊断化、dispatcher 生命周期治理、退避/并发策略、以及触发器在业务路径中的完整调用。
 
-**结论（影响阶段 5 的重新基线）：** "先有真实的、晚于 vault 的消费者，再谈 SecretRef"这一原则的**前置功能工作已基本落地**（`MailConfig` + `Config.mail` + `mod mail;` + vault 之后的构造点）。阶段 5 的真实剩余工作收敛为：(a) 在 `main.rs` 声明 `mod notification;` 让 dispatcher 编译；(b) 把演示性的 `_late_mailer` 升级为真实构造并 `tokio::spawn(EmailDispatcher::run)`、把 `.ok()` 吞错改为可诊断处理；(c) 落地 `SecretRef` + resolver，把 `mail.password` 由明文改为 `password_ref`。
+**结论（影响阶段 5 的重新基线）：** "先有真实的、晚于 vault 的消费者，再谈 SecretRef"这一原则的**前置功能工作已落地**（`MailConfig` + `Config.mail` + `mod mail;` + `mod notification;` + vault 之后的 mailer/dispatcher 启动点）。阶段 5 的真实剩余工作收敛为：(a) 落地 `SecretRef` + resolver，把 `mail.password` 由明文改为 `password_ref`；(b) 把当前 `if let Ok(m)` 静默失败改为可诊断处理；(c) 完善 dispatcher 生命周期、退避/并发和业务触发器接入。
 
 ## 总体设计
 
@@ -173,7 +177,7 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 - Git pack / LFS：控制对象解码、上传、存储和传输行为。
 - 构建系统：配置 Orion 构建服务、触发器和构建产物管理。
 - Buck 上传：读取上传限制、清理策略和相关后台任务参数。
-- 邮件通知（已编译，mailer 构造为演示态）：一级模块 `src/mail/mod.rs` 提供 `SmtpMailer`/`NoopMailer`，`MailConfig` 已定义并接入 `Config`；`src/context/mod.rs:41-46` 已在 vault 之后从 `config.mail` 构造 `SmtpMailer`（但绑定为未使用的 `_late_mailer`）。作为可迁移凭据的目标消费点，剩余工作是把 `mail.password` 改为 `SecretRef` + 把演示构造升级为真实 `EmailDispatcher` 接入（见「已落地的 mail/notification 子系统现状」）。
+- 邮件通知（已编译，dispatcher 已在 mail 启用时启动）：一级模块 `src/mail/mod.rs` 提供 `SmtpMailer`/`NoopMailer`，`MailConfig` 已定义并接入 `Config`；`src/context/mod.rs:46-55` 已在 vault 之后从 `config.mail` 构造 `SmtpMailer` 并 spawn `EmailDispatcher`。作为可迁移凭据的目标消费点，剩余工作是把 `mail.password` 改为 `SecretRef`、把构造失败从静默忽略改为可诊断处理，并完善 dispatcher 生命周期（见「已落地的 mail/notification 子系统现状」）。
 - Artifact GC：控制构建产物垃圾回收策略。
 - Sidebar 默认数据：为 UI 侧边栏提供初始化种子配置。
 
@@ -181,14 +185,14 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 
 在评估哪些字段可以改为 `SecretRef` 时，不能只看配置结构，而必须精确追踪消费点在初始化链路中的位置：
 
-1. **`Storage::new`（`src/jupiter/storage/mod.rs:188`，签名 `async fn new(config: Arc<Config>)`）** 在 `AppContext::new` 中第 27–29 行被调用，它内部：
-   - 第 189 行 `database_connection(&config.database)` 建立数据库连接；
-   - 第 203 行 `ObjectStorageFactory::build(&config.object_storage)` 构造对象存储（S3/GCS/Local），因此 `object_storage.s3.access_key_id` / `secret_access_key` 在 vault 就绪前已被消费；
-   - 第 250–260 行 `buck_config.validate()` 若失败会直接 `panic!`（错误信息形如 “Invalid Buck configuration: … Service cannot start …”），这是当前配置校验侵入启动期的一个负面典型，后续应收敛到 `validate.rs` 的集中校验中。
+1. **`Storage::new`（`src/jupiter/storage/mod.rs:190`，签名 `async fn new(config: Arc<Config>)`）** 在 `AppContext::new` 中第 33–35 行被调用，它内部：
+   - 第 191 行 `database_connection(&config.database)` 建立数据库连接；
+   - 第 206 行 `ObjectStorageFactory::build(&config.object_storage)` 构造对象存储（S3/GCS/Local），因此 `object_storage.s3.access_key_id` / `secret_access_key` 在 vault 就绪前已被消费；
+   - 第 253–263 行 `buck_config.validate()` 若失败会直接 `panic!`（错误信息形如 “Invalid Buck configuration: … Service cannot start …”），这是当前配置校验侵入启动期的一个负面典型，后续应收敛到 `validate.rs` 的集中校验中。
    - 注意 `Storage` 以 `Weak<Config>` 持有配置，`Storage::config()`（`src/jupiter/storage/mod.rs:334`）通过 `upgrade().expect("Config has been dropped")` 返回 `Arc<Config>`——这是一个潜在 panic 点，热加载切换为快照句柄时需一并考虑。
-2. **`init_connection(&config.redis)`（`src/context/mod.rs:30`）** 在 `VaultCore::new` 之前执行，因此带密码的 `redis.url` 也属于早期运行时依赖。
-3. **`VaultCore::new(storage)`（`src/context/mod.rs:33`）** 之后才就绪，此后消费的配置字段才可纳入可迁移凭据。
-4. **SMTP mailer 已是 vault 之后的后置消费点（构造为演示态）。** 真实 `SmtpMailer::new(&MailConfig)` 实现位于 `src/mail/mod.rs:77`，模块经 `main.rs:17` 的 `mod mail;` 编译，`MailConfig` 已定义，`Config.mail` 字段已存在。`src/context/mod.rs:41-46` 在 `VaultCore::new`（`:33`）**之后**从 `config.mail` 构造 `SmtpMailer`，随后 `init_monorepo`（`:48-52`）也在 vault 之后执行。**因此 `mail.password` 已是一个"已存在且仅在 vault 之后消费"的字段——可迁移凭据集合的第一个合格成员**，无需再"先补齐"。当前构造绑定为未使用的 `_late_mailer`、错误经 `.ok()` 吞掉，剩余工作是把它升级为真实 `EmailDispatcher` 接入，并把 `mail.password` 改为 `SecretRef`。在 `VaultCore::new`（`:33`）与这些后置消费点之间，正是插入 secret resolver 的天然窗口。
+2. **`init_connection(&config.redis)`（`src/context/mod.rs:36`）** 在 `VaultCore::new` 之前执行，因此带密码的 `redis.url` 也属于早期运行时依赖。
+3. **`VaultCore::new(storage)`（`src/context/mod.rs:39`）** 之后才就绪，此后消费的配置字段才可纳入可迁移凭据。
+4. **SMTP mailer 与 EmailDispatcher 已是 vault 之后的后置消费点。** 真实 `SmtpMailer::new(&MailConfig)` 实现位于 `src/mail/mod.rs:77`，模块经 `main.rs:17` 的 `mod mail;` 编译，`MailConfig` 已定义，`Config.mail` 字段已存在。`src/context/mod.rs:46-55` 在 `VaultCore::new`（`:39`）**之后**从 `config.mail` 构造 `SmtpMailer`，再创建 `EmailDispatcher` 并 `tokio::spawn`；随后 `init_monorepo`（`:60-64`）也在 vault 之后执行。**因此 `mail.password` 已是一个"已存在且仅在 vault 之后消费"的字段——可迁移凭据集合的第一个合格成员**，无需再"先补齐"。当前剩余工作是把 `mail.password` 改为 `SecretRef`，并把 `SmtpMailer::new` 失败被 `if let Ok(m)` 静默忽略的问题改为可诊断错误。在 `VaultCore::new`（`:39`）与这些后置消费点之间，正是插入 secret resolver 的天然窗口。
 5. **`ssh_server_key`（`src/server/ssh_server.rs:78` 读取、`:99` 写入）** 已由 vault 管理，但属于 vault 内部 secret，不在 `Config` 结构体中。注意 `:78` 处当前对 `read_secret(...).unwrap()` 会在 secret 缺失/读取失败时 panic，加固时应一并改为可诊断错误。
 
 > 结论：任何在 `Storage::new` 或 `init_connection` 阶段消费的字段都不能直接改为 `SecretRef`，除非先重构初始化顺序。
@@ -196,7 +200,7 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 > 额外观察（来自当前代码）：
 > - `Storage::new` 内部在构造 buck 相关信号量**之前**就执行了 `buck_config.validate()` 并在失败时 panic（storage/mod.rs:253-260），这是“配置校验侵入启动关键路径”的典型。
 > - `ObjectStorageFactory::build` 在同一阶段被调用，因此 `object_storage.s3.access_key_id` / `secret_access_key`（即使当前为空字符串）在 vault 就绪前就已被“消费路径”触达。
-> - `context/mod.rs:30` 的 `init_connection(&config.redis)` 紧随 Storage 之后，仍在 `VaultCore::new` 之前。
+> - `context/mod.rs:36` 的 `init_connection(&config.redis)` 紧随 Storage 之后，仍在 `VaultCore::new` 之前。
 
 ## 当前方案的优点
 
@@ -325,7 +329,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 
 1. **引导配置（必须留在 TOML/env，永不进本项目 vault）。** 典型是 `database`（连接地址、用户名、密码）。`DbConfig::default()` 的 `db_url = "postgres://mega:mega@localhost:5432/mega"`（`src/common/config.rs:298`）把密码内嵌在连接串中；仓库内的 `config/config.toml` 则使用 `postgres://mono:mono@localhost:5432/mono`（`config/config.toml:28`），两处都是硬编码可预测凭据。由于 vault 存在数据库里、连库才能起 vault，**数据库密码无法作为 vault SecretRef**——这是不可破的引导循环。这类凭据应通过环境变量注入（如 `MEGA_DATABASE__DB_URL` 或拆分后的 `MEGA_DATABASE__PASSWORD`），由部署平台的 secret 机制（K8s Secret、CI secret store 等）保护，**而不是交给本项目的 vault**。
 2. **早期运行时依赖（当前也不能直接进 vault）。** 这类字段不是数据库引导项，但在 vault 就绪前或同一初始化阶段已经被消费。当前 `Storage::new` 在 `VaultCore::new` 之前构造对象存储，因此 `object_storage.s3.access_key_id`/`secret_access_key` 暂时不能直接改为 SecretRef；`AppContext::new` 在 vault 前连接 Redis，因此带密码的 `redis.url` 也应按引导/部署平台 secret 处理。若要让对象存储凭据进 vault，必须先把初始化顺序拆成“DB-only Storage -> Vault -> resolve object storage secrets -> 构造完整 Storage/服务”。
-3. **可迁移凭据（vault 就绪后才被使用，可改为 SecretRef）。** 这是“消费点晚于 vault 且不阻塞 `AppContext` 构造”的字段。**`mail.password`（`config.rs:385`）现在就是此类的第一个已存在成员**：其消费点 `SmtpMailer::new` 在 `context/mod.rs:41-46` 于 `VaultCore::new`（`:33`）之后运行。因此该类的第一项工作不再是"新增字段"，而是"**就地把现成字段从明文改为 `SecretRef`**"。⚠️ 在 SecretRef 化之前，`mail.password` 是一处真实的明文暴露：它可经 `Config`/`MailConfig` 的 `Debug`、`MailConfig` 的 `Serialize`（`config.rs:375`）输出，并在 lettre 边界以明文传入 `Credentials::new`（`mail/mod.rs:96`）——（当前 `config/config.toml` 的 `[mail]` 样例未写入密码，但字段已具备承载明文的能力）。未来新增 OAuth client secret、第三方 API key 等字段同理，只有确认其消费点晚于 vault 且不会阻塞 `AppContext` 构造，才可纳入此类。这些字段在配置文件中改为 `SecretRef`，真实值写入 vault，由消费端在运行期通过 resolver 读取。
+3. **可迁移凭据（vault 就绪后才被使用，可改为 SecretRef）。** 这是“消费点晚于 vault 且不阻塞 `AppContext` 构造”的字段。**`mail.password`（`config.rs:385`）现在就是此类的第一个已存在成员**：其消费点 `SmtpMailer::new` 在 `context/mod.rs:46-55` 于 `VaultCore::new`（`:39`）之后运行，并随后启动 `EmailDispatcher`。因此该类的第一项工作不再是"新增字段"，而是"**就地把现成字段从明文改为 `SecretRef`**"。⚠️ 在 SecretRef 化之前，`mail.password` 是一处真实的明文暴露：它可经 `Config`/`MailConfig` 的 `Debug`、`MailConfig` 的 `Serialize`（`config.rs:375`）输出，并在 lettre 边界以明文传入 `Credentials::new`（`mail/mod.rs:96`）——（当前 `config/config.toml` 的 `[mail]` 样例未写入密码，但字段已具备承载明文的能力）。未来新增 OAuth client secret、第三方 API key 等字段同理，只有确认其消费点晚于 vault 且不会阻塞 `AppContext` 构造，才可纳入此类。这些字段在配置文件中改为 `SecretRef`，真实值写入 vault，由消费端在运行期通过 resolver 读取。
 4. **非敏感运行参数。** 维持现状，明文留在 TOML。
 
 `Config` 反序列化阶段只构建强类型 `SecretRef`，校验阶段检查引用格式与必填性；**真实 secret 的读取发生在 `AppContext` 起来、vault 就绪之后**，由统一的 secret resolver 负责，并由 resolver 负责缓存、过期、脱敏日志和读取失败诊断。
@@ -342,7 +346,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 | `redis.url`（若含密码） | `AppContext::new` 中 vault 前 `init_connection` | 早期运行时依赖 | 走 env/部署平台 secret；所有日志与错误必须脱敏 |
 | `object_storage.s3.*` / `secret_access_key` | `Storage::new` 中 `ObjectStorageFactory::build`（vault 前） | 早期运行时依赖 | 先保持现状；若要入 vault，必须先把 Storage 拆成 DB-only → Vault → resolve secrets → 完整构造 |
 | `orion_server.db_url` 等 | Orion 作为独立服务使用 | 外部服务配置 | 由 Orion 自己或部署平台管理，monoengine 不应声称代管 |
-| `mail.password`（**已存在，明文**，`config.rs:385`） | `SmtpMailer::new`（`context/mod.rs:41-46`，vault 之后） | **可迁移凭据（第一个合格成员）** | 前置功能工作（`MailConfig` + `Config.mail` + `mod mail;` + vault 后构造）已落地；剩余=就地把 `password` 改 `password_ref` + 把 `_late_mailer` 演示升级为真实 `EmailDispatcher` 接入 |
+| `mail.password`（**已存在，明文**，`config.rs:385`） | `SmtpMailer::new`（`context/mod.rs:46-55`，vault 之后，随后启动 `EmailDispatcher`） | **可迁移凭据（第一个合格成员）** | 前置功能工作（`MailConfig` + `Config.mail` + `mod mail` + `mod notification` + vault 后构造）已落地；剩余=就地把 `password` 改 `password_ref` + 把 mailer 构造失败改为可诊断处理 |
 | `ssh_server_key`、PGP/Nostr 等现有 vault secret | 已由 vault 管理（vault 内部） | vault 内部 secret | 必须先完成 `core_key.json` 权限收紧、fail-closed、root token 脱敏、DR 演练，才能声称有实质安全收益 |
 
 #### SecretRef 类型设计草案
@@ -478,16 +482,17 @@ pub trait SecretResolver: Send + Sync {
 由于 `Config → Storage(DB) → Vault`，secret 解析必须排在 vault 就绪之后，并按消费端对 vault 的依赖排序。当前服务启动的真实顺序更精确地说是：
 
 ```text
-Config::new                        # context/mod.rs:24 起 AppContext::new
-  -> Storage::new(config)          # :27-29  建数据库连接、构造对象存储、初始化部分存储服务（.expect panic）
-  -> init_connection(redis)        # :30     连接 Redis
-  -> VaultCore::new(storage)       # :32-33  vault 才就绪
-  -> SmtpMailer::new(config.mail)  # :41-46  vault 之后的演示性 mailer（_late_mailer，未使用、.ok() 吞错）
-  -> init_monorepo(config.monorepo)# :48-52  vault 之后（.expect panic）
-  -> HTTP/SSH/后台任务等继续初始化
+Config::new                                  # context/mod.rs:30 起 AppContext::new
+  -> Storage::new(config)                    # :33-35  建数据库连接、构造对象存储、初始化部分存储服务（.expect panic）
+  -> init_connection(redis)                  # :36     连接 Redis
+  -> VaultCore::new(storage)                 # :38-39  vault 才就绪
+  -> SmtpMailer::new(config.mail)            # :46-49  vault 之后；失败当前被 if let Ok 静默忽略
+  -> EmailDispatcher::new(...) + spawn       # :50-55  mail 启用时启动后台 outbox dispatcher
+  -> init_monorepo(config.monorepo)          # :60-64  vault 之后（.expect panic）
+  -> HTTP/SSH/multi 服务分发                 # commands/service/mod.rs:33-36
 ```
 
-因此，当前 `Storage::new` 或 Redis 初始化阶段已经消费的任何 secret，都不能直接改为 vault SecretRef。只适合迁移在 vault 之后才初始化/使用的字段。**SMTP mailer 密码的两个前提（`mail`/`MailConfig` 已接入、mailer 构造晚于 vault）现已同时满足**（`MailConfig` 在 `config.rs:376`，mailer 在 `context/mod.rs:43` 于 `VaultCore::new` `:33` 之后构造），因此 `mail.password` 已正式属于这一类；剩余工作是把演示性的 `_late_mailer` 升级为真实 `EmailDispatcher` 接入，并把 `.ok()` 吞错改为可诊断处理。
+因此，当前 `Storage::new` 或 Redis 初始化阶段已经消费的任何 secret，都不能直接改为 vault SecretRef。只适合迁移在 vault 之后才初始化/使用的字段。**SMTP mailer 密码的前提（`mail`/`MailConfig` 已接入、`notification` 已编译、mailer 和 dispatcher 构造晚于 vault）现已满足**（`MailConfig` 在 `config.rs:376`，mailer 在 `context/mod.rs:48` 于 `VaultCore::new` `:39` 之后构造），因此 `mail.password` 已正式属于这一类；剩余工作是把 `mail.password` 改为 `password_ref`，并把构造失败静默忽略改为可诊断处理。
 
 这条顺序只适用于服务启动。对于 `config secret set/check`、`config validate --resolve-secrets` 这类运维命令，目标顺序不应复用完整 `AppContext`，而应是：
 
@@ -664,9 +669,14 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 ### 迁移步骤（分阶段）
 
-整体拆为多个阶段，每个阶段独立可编译、可回归、可单独评审合并。注意：只有纯移动和 re-export shim 可以承诺“零行为变更”；错误模型、校验规则、命令加载模型、vault bootstrap 和 SecretRef 迁移都会改变失败形态，必须单独评审。
+整体拆为多个阶段，每个阶段独立可编译、可回归、可单独评审合并。注意：只有纯移动和 re-export shim 可以承诺”零行为变更”；错误模型、校验规则、命令加载模型、vault bootstrap 和 SecretRef 迁移都会改变失败形态，必须单独评审。
 
-**阶段 0a — 纯结构拆分（保留兼容 shim，零行为变更）** — **工作量：S（约 1–2 天）**
+> **关键前置依赖说明（2026-06-14 更新）**：本阶段规划有两个不可避免的跨模块前置：
+> 1. **日志脱敏工具（redaction）**应作为独立前置工作优先完成，供 config、vault、mail、notification 等模块共享使用，特别是为 vault.md 的 P0 阶段 A 服务。
+> 2. **CLI 两阶段加载（LoadMode）的设计框架**需要 config + vault 团队协同完成，作为单一 source of truth。config.md 阶段 2 和 vault.md 阶段 D 都依赖这个共同设计，不应分别实施。
+> 3. **vault.md 阶段 B（最小 DB/Vault bootstrap）必须在 config.md 阶段 3 之前完成**，因为 config 阶段 3 直接依赖 bootstrap 拆分的结果。
+
+**阶段 0a — 纯结构拆分（保留兼容 shim，零行为变更）**
 
 1. 新建 `src/config/` 目录，将 `src/common/config.rs` 移动为 `src/config/mod.rs`，并把 `loader.rs`、`template.rs` 一并迁入 `src/config/`。
 2. 在 `src/main.rs` 新增顶层 `mod config;`（可见性按 shim 需要设置为 `pub(crate)` 或等价）；在 `src/common/mod.rs` 中将 `pub mod config;` 改为 wrapper/re-export shim，使 `crate::common::config::*` 在过渡期继续可用。**本阶段不改任何业务调用方路径。**
@@ -675,40 +685,46 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 > **验收标准**：按仓库要求执行 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all`；另跑 `cargo build`、`cargo build --tests` 做 sanity check。除 `src/config/`、`src/common/mod.rs`、`src/main.rs` 以及移动后模块内部必要 import 修正外，无业务调用方 import 路径变更。
 
-**阶段 0b — 错误模型、脱敏与保守校验** — **工作量：M（约 3–5 天）**
+**阶段 0b — 错误模型、脱敏与保守校验**
+
+> **与 vault.md 的强绑定（2026-06-14 更新）**：本阶段的脱敏工具（redaction）是 vault.md 阶段 A（P0）的前置依赖。vault 需要在日志中删除 root token、secret shares 等敏感信息，该能力应来自本阶段建立的统一工具。建议脱敏工具优先设计和实现，使其可供 config、vault、mail、notification 等模块共享复用。
 
 5. 新增 `error.rs`，把 `variable_placeholder_substitute` 等加载路径上的 `unwrap`/`expect`/`panic` 替换为可诊断错误；这会改变失败形态，不应并入 0a。
-6. 建立统一 redaction 工具，先覆盖数据库 URL、Redis URL、Vault root token、secret shares、对象存储 key 等现有日志/错误泄露点。
+6. **建立统一 redaction 工具**（优先级：高，可作为独立前置），位置建议为 `src/common/redaction.rs` 或 `src/config/redaction.rs`，先覆盖数据库 URL、Redis URL、Vault root token、secret shares、对象存储 key 等现有日志/错误泄露点。该工具应提供通用的字段脱敏接口，供 vault、mail、notification 等模块在日志、错误信息、Debug 输出中使用。
 7. 新增 `validate.rs`，先实现低风险、无争议的 hard error 校验（端口范围、必填字符串、明显非法枚举、Buck 限制等）；涉及部署兼容性的严格校验先以 warning 过渡。`password`/`password_ref` 互斥等规则只能在对应字段真实接入后加入。
 8. 补充测试覆盖校验失败、错误信息、脱敏输出和 warning/hard error 边界。
 
-> **验收标准**：配置损坏时启动不再 panic，而是输出包含配置文件路径、字段路径和修复建议的诊断信息；所有包含敏感数据的日志/错误信息经过 redaction；新增校验用例测试覆盖。
+> **验收标准**：配置损坏时启动不再 panic，而是输出包含配置文件路径、字段路径和修复建议的诊断信息；所有包含敏感数据的日志/错误信息经过 redaction；新增校验用例测试覆盖；redaction 工具可被外部模块导入使用。
 
-**阶段 1 — 消费端路径迁移 + 移除 shim** — **工作量：S（约 1 天）**
+**阶段 1 — 消费端路径迁移 + 移除 shim**
 
 9. 将所有 `crate::common::config::*`/`common::config::*` 改为 `crate::config::*`/`config::*`（约 12 个文件）。
 10. 构建确认无残留引用后，删除阶段 0a 的 re-export shim，并从 `common` 彻底移除配置承载职责。本阶段不改运行语义。
 
 > **验收标准**：全仓无 `common::config` 引用；按仓库要求执行格式、clippy、测试三项必过 gate，并保留 `cargo build`、`cargo build --tests` sanity check。
 
-**阶段 2 — CLI LoadMode + 非 Vault `config` 命令** — **工作量：M（约 4–6 天）**
+**阶段 2 — CLI LoadMode + 非 Vault `config` 命令**
 
-11. 改造 `cli::parse` 与命令注册：先解析子命令，再按命令声明的 `LoadMode` 选择加载层级（`None`、`ConfigPath`、`RawSources`、`ParsedConfig`、`VaultBootstrap`、`FullAppContext`）。
+> **与 vault.md 的协同设计（2026-06-14 更新）**：本阶段的 CLI 改造直接与 vault.md 阶段 D 相关。两个文档都计划实现 `LoadMode` 机制，但应作为**单一跨模块设计**而非分别实施。建议先由 config + vault 团队协同设计和定义 `LoadMode` 框架（如 `src/cli/load_mode.rs` 中的 enum），明确各模式的启动路径和依赖，再分别在两个文档的对应阶段使用这个共同框架。
+
+11. **先在 CLI 层支持两阶段加载和 `LoadMode`**（与 vault.md 阶段 D 协同完成）：改造 `cli::parse` 与命令注册，先解析子命令，再按命令声明的 `LoadMode` 选择加载层级（`None`、`ConfigPath`、`RawSources`、`ParsedConfig`、`VaultBootstrap`、`FullAppContext`）。该设计应在 config + vault 团队的协同下完成，确保所有依赖此框架的模块（config、vault、mail、notification）都能正确使用。
 12. 新增 `monoengine config init` 与不解析 secret 的 `config validate`，确保配置不存在或配置损坏时仍能给出诊断，而不是被 CLI 预加载拦截。
 13. 新增 `config secret ref` 的纯规则生成能力；不依赖 vault 的子命令不得隐式创建数据库或启动服务依赖。
 
-> **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例；`monoengine config validate` 能在坏配置时输出诊断而非 panic；`config secret ref` 可生成与 profile/命名空间一致的 `vault://secret/...#field` 引用；命令帮助文档完整。
+> **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例；`monoengine config validate` 能在坏配置时输出诊断而非 panic；`config secret ref` 可生成与 profile/命名空间一致的 `vault://secret/...#field` 引用；命令帮助文档完整；CLI `LoadMode` 框架已定义、文档齐全、所有命令均正确声明自己的 LoadMode 需求。
 
-**阶段 3 — 最小 DB/Vault bootstrap + core_key 加固** — **工作量：M/L（约 1 周）**
+**阶段 3 — 最小 DB/Vault bootstrap + core_key 加固**
 
-14. 拆出最小 DB/Vault bootstrap 能力，只建立数据库连接和 vault 所需 storage，不构造 Redis、对象存储、HTTP/SSH 服务、monorepo 初始化或后台任务。
-15. 将普通启动路径中的 `core_key.json` 缺失行为改为 fail-closed，不再自动 `delete_all()` 并重新初始化；破坏性 reset/init 必须由显式运维命令触发。
-16. 删除 vault 初始化路径中 root token、secret shares、完整 key 文件内容的所有输出；`VaultCore::new`/bootstrap 路径逐步改为返回 `Result`。
+> **与 vault.md 的依赖关系（2026-06-14 更新）**：本阶段的"最小 DB/Vault bootstrap 拆分"依赖 **vault.md 阶段 B（拆出最小 DB/Vault bootstrap seam）先完成**。vault B 主要负责改造 `JupiterBackend` 的依赖、拆分存储接口等，使得最小 bootstrap 在技术上可行；config 阶段 3 则依赖这些改造结果来实现自己的 bootstrap 能力。建议 vault B 与 config 3 的时间规划应同期或 vault B 稍早。
+
+14. 拆出最小 DB/Vault bootstrap 能力（依赖 vault.md 阶段 B 完成的拆分），只建立数据库连接和 vault 所需 storage，不构造 Redis、对象存储、HTTP/SSH 服务、monorepo 初始化或后台任务。
+15. 将普通启动路径中的 `core_key.json` 缺失行为改为 fail-closed，不再自动 `delete_all()` 并重新初始化；破坏性 reset/init 必须由显式运维命令触发。（注：此处与 vault.md 阶段 A 工作项 5 有设计协调需求，应确保两者对"fail-closed 判定依据"的理解一致。）
+16. 删除 vault 初始化路径中 root token、secret shares、完整 key 文件内容的所有输出；`VaultCore::new`/bootstrap 路径逐步改为返回 `Result`。（注：此处依赖阶段 0b 建立的脱敏工具。）
 17. 收紧 `core_key.json` 与父目录权限，补充备份恢复和非本地明文 key 文件的生产部署说明。
 
-> **验收标准**：`config validate --resolve-secrets` 的底层 bootstrap 不依赖 Redis/S3；`core_key.json` 缺失时不会清空 vault 数据；root token 不再进入 stdout/stderr/tracing；key 文件权限收紧（Unix `0600`，目录 `0700` 或等价）。
+> **验收标准**：`config validate --resolve-secrets` 的底层 bootstrap 不依赖 Redis/S3；`core_key.json` 缺失时不会清空 vault 数据；root token 不再进入 stdout/stderr/tracing；key 文件权限收紧（Unix `0600`，目录 `0700` 或等价）；最小 bootstrap 能力已独立可测，不依赖完整 AppContext。
 
-**阶段 4 — `config secret set/check` 命令** — **工作量：M（约 3–5 天）**
+**阶段 4 — `config secret set/check` 命令**
 
 18. 基于阶段 3 的最小 DB/Vault bootstrap 新增 `config secret set`、`config secret check`、`config validate --resolve-secrets`。
 19. `config secret set` 默认只接受 `--value-stdin` 或隐藏输入，写入后输出 `vault://secret/...#field` 引用；默认不修改 TOML 文件。
@@ -716,23 +732,23 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 > **验收标准**：`config secret set --value-stdin` 正确写入 vault 且不在日志、进程参数或错误信息中泄露；`config secret check` 能区分 vault 不可用、secret 缺失、字段缺失和权限失败；所有路径映射避免 `secret/secret/...`。
 
-**阶段 5 — SecretRef 基础设施 + 第一批可迁移凭据** — **工作量：M（约 3–5 天，原估 L 已因前置工作落地而下调）**
+**阶段 5 — SecretRef 基础设施 + 第一批可迁移凭据**
 
-> **重新基线（2026-06-09）**：本阶段原本的"前置子步骤"——定义 `MailConfig`、给 `Config` 加 `mail`、接入 mail 模块、在 vault 之后构造 `SmtpMailer`——**已基本落地**（`MailConfig` `config.rs:376`；`Config.mail` `:106`；`mod mail;` `main.rs:17`，注意是 `mail` 不是 `email`；vault 之后构造点 `context/mod.rs:41-46`）。因此本阶段不再以"新建消费字段"为起点，而以"SecretRef 基础设施 + 把现成 `mail.password` 迁移 + 把演示 mailer 升级为真实接入"为主。
+> **重新基线（2026-06-09）**：本阶段原本的"前置子步骤"——定义 `MailConfig`、给 `Config` 加 `mail`、接入 mail 模块、接入 notification 模块、在 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher`——**已落地**（`MailConfig` `config.rs:376`；`Config.mail` `:106`；`mod mail;` `main.rs:17`；`mod notification;` `main.rs:18`；vault 之后构造与启动点 `context/mod.rs:46-55`）。因此本阶段不再以"新建消费字段"为起点，而以"SecretRef 基础设施 + 把现成 `mail.password` 迁移 + 把 mailer/dispatcher 失败路径可诊断化"为主。
 
 21. 新增 `secret.rs`：定义 `SecretRef`、secret resolver trait，适配现有 `VaultCoreInterface`；resolver 接收已就绪的 vault 句柄，不在 `Config::new` 调用。
 22. 梳理并提交字段依赖表，明确每个字段是引导配置、早期运行时依赖、可迁移凭据还是非敏感参数（见上表，"可迁移凭据"一类现有一个成员 `mail.password`）。
-23. **（已基本完成，仅需收尾）真实后置消费者的接入。** 类型/模块/字段/构造点均已就位，剩余的收尾工作是：
-   - 在 `src/main.rs` 增加 `mod notification;`，让 `EmailDispatcher`/triggers/outbox（`src/notification/`，当前未编译）参与编译。
-   - 把 `context/mod.rs:41-46` 的演示性 `_late_mailer` 升级为真实构造，并 `tokio::spawn(EmailDispatcher::run(shutdown))`，把现有的 `.ok()` 吞错（`:44`）改为可诊断处理。
-   - （`MailConfig` 定义、`Config.mail` 字段、`mod mail;`、vault 之后的构造点——**已完成，无需再做**。）
+23. **（已完成接入，仍需加固）真实后置消费者的接入。** 类型/模块/字段/构造点和 dispatcher 启动点均已就位，剩余的收尾工作是：
+   - 把 `context/mod.rs:46-55` 中 `SmtpMailer::new` 失败被 `if let Ok(m)` 静默忽略的问题改为可诊断处理。
+   - 完善 `EmailDispatcher::run` 的生命周期、退避/并发策略和服务关闭协调。
+   - （`MailConfig` 定义、`Config.mail` 字段、`mod mail;`、`mod notification;`、vault 之后的 mailer/dispatcher 启动点——**已完成，无需再做**。）
 24. 把 `mail.password` 改为 `SecretRef`（迁移期允许 `password` 与 `password_ref` 互斥并存，检测到明文时输出 deprecation warning；两者同时存在为 hard error；`password_ref` 用 `Option` + `#[serde(default)]` 以不破坏现有 `password` 配置）。OAuth client secret 只有在真实 `OAuthConfig` schema 存在、消费点确认晚于 vault 后才能迁移；对象存储凭据只有在阶段 7 的初始化顺序重构完成后才能迁移。
 25. 对应消费端（邮件发送路径等）改为通过 resolver 读取，任何错误路径和日志**只**暴露脱敏引用；SMTP 发送失败的语义（hard error 还是降级到 NoopMailer）必须在配置或环境上明确表达，不应在生产环境静默降级导致邮件静默丢失。
 
-> **验收标准（已达成的基线已剔除）**：以下基线**已满足**，无需再作为验收项：`mail`/`MailConfig` 已定义并被 `Config` 反序列化、mail 模块已接入主 crate（经 `mod mail;`）、vault 就绪后会构造 `SmtpMailer`。本阶段真正待验收的开放项是：`mod notification;` 已接入、真实 `EmailDispatcher` 已 spawn（含有界 poll/并发/退避）、`_late_mailer` 的 `.ok()` 吞错已消除；`mail.password_ref` 可被 resolver 解析且邮件功能正常；resolver 缓存、evict、错误脱敏全部生效；任何 secret 读取失败不会 panic、不会把明文写入日志或错误链；字段依赖表作为正式文档提交。
+> **验收标准（已达成的基线已剔除）**：以下基线**已满足**，无需再作为验收项：`mail`/`MailConfig` 已定义并被 `Config` 反序列化、mail 模块已接入主 crate（经 `mod mail;`）、notification 模块已接入主 crate（经 `mod notification;`）、vault 就绪后会构造 `SmtpMailer` 并 spawn `EmailDispatcher`。本阶段真正待验收的开放项是：`SmtpMailer::new` 失败不再被静默忽略；dispatcher 有界 poll/并发/退避和关闭语义明确；`mail.password_ref` 可被 resolver 解析且邮件功能正常；resolver 缓存、evict、错误脱敏全部生效；任何 secret 读取失败不会 panic、不会把明文写入日志或错误链；字段依赖表作为正式文档提交。
 > **范围提示**：如果团队短期内不打算真正启用邮件通知，可只落地"SecretRef 基础设施 + resolver trait + 最小测试替身 + 字段分类表"，把"spawn 真实 dispatcher"推迟。但需注意：与早期版本不同，现在**已经存在**一个真实的后置消费字段（`mail.password`），所以 SecretRef 迁移有真实落点，不再是"无消费者的空转"。
 
-**阶段 6 — 基础样例配置、Profile 与测试配置分层 + CI** — **工作量：M（约 3–5 天）**
+**阶段 6 — 基础样例配置、Profile 与测试配置分层 + CI**
 
 26. 将 `config/config.toml` 改造为基础样例配置：移除真实敏感值、保留与当前 schema 对齐的本地默认值与初始化指引；只有当字段已经真实接入 `Config` 且确认属于可迁移凭据时，才加入对应 `SecretRef` 示例；纳入配置样例校验。
 27. 固定 Profile 文件命名、加载优先级、数组覆盖语义和 SecretRef namespace，并补充 profile 合并测试。
@@ -741,14 +757,14 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 > **验收标准**：`config/config.toml` 不含真实生产密码或可复用生产凭据；`cargo test --all` 不依赖仓库中的 `config/config.toml` 作为隐式共享状态；CI 新增配置校验任务且通过。
 
-**阶段 7 — 对象存储等早期依赖的后置初始化重构（可选）** — **工作量：L（约 1–2 周）**
+**阶段 7 — 对象存储等早期依赖的后置初始化重构（可选）**
 
 30. 如果要让对象存储凭据进入 vault，先把 `Storage::new` 拆为 DB-only storage、vault bootstrap、secret resolve、完整 storage/service 初始化。
 31. 重新梳理 Redis、对象存储、Orion 等字段依赖表，只有在确认消费点晚于 vault 且失败语义可接受后，才允许迁移为 SecretRef。
 
 > **验收标准**：S3/S3-compatible 凭据迁移前，服务启动链路中不再在 vault 前构造对象存储；缺少对象存储 secret 时返回可诊断错误，不影响 `config secret set/check` 对其他 secret 的操作。
 
-**阶段 8 — 受控热加载（独立变更）** — **工作量：L（约 2–3 周）**
+**阶段 8 — 受控热加载（独立变更）**
 
 32. 新增 `reload.rs`：监听配置文件变化，复用加载流水线构建候选配置，按字段白名单计算差异，向订阅组件发布变更，失败时保留旧配置继续生效。
 33. 将运行时注入从直接共享 `Arc<Config>` 调整为共享快照句柄（如 `Arc<ConfigHandle>`/`ArcSwap`）；逐点确认“取出 Arc 后跨 await 持有”的调用语义，新增依赖前评估必要性。注意 `Storage` 当前以 `Weak<Config>` 持有配置、`config()` 用 `expect` 解引用，切换快照句柄时需同步调整该访问路径。
@@ -760,6 +776,26 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 **贯穿全程**
 
 36. 每个阶段同步更新 `README`、`config/config.toml` 注释和本文档，确保加载优先级、模块路径、`config` 命令使用方式与引导顺序、消费端访问方式、环境变量规则、敏感配置存储边界和热加载限制与实现一致。
+
+### 前置依赖矩阵（2026-06-14 更新）
+
+本文档（config.md）与三个前置文档（vault.md、mail.md、notification.md）的依赖关系如下：
+
+| config 阶段 | 本阶段主要工作 | 对 vault 的依赖 | 对 mail 的依赖 | 对 notification 的依赖 |
+|-----------|------------|-------------|-----------|-----------------|
+| **0a** | 纯结构拆分 | 无 | 无 | 无 |
+| **0b** | redaction 工具 + 错误模型 | ← vault A 依赖此 | 支持后续日志脱敏 | 支持后续日志脱敏 |
+| **1** | 路径迁移 | 无 | 无 | 无 |
+| **2** | CLI LoadMode + config 命令 | ← 与 vault D 协同 | 无 | 无 |
+| **3** | 最小 bootstrap | ← vault B 完成后 | 支持后续运维 | 支持后续运维 |
+| **4** | secret set/check 命令 | 依赖 vault B 的拆分 | 开始支持 mail 的 secret | 支持 notification 的 secret |
+| **5** | SecretRef + resolver | 与 vault E 协同 | mail 作为第一消费者 → mail 2 | 后续支持 notification |
+
+**关键同步点：**
+1. 日志脱敏工具（config 0b）→ vault A、mail 1、notification 0
+2. CLI LoadMode 框架（config 2 与 vault D 协同）→ config 4、vault E
+3. 最小 bootstrap（vault B）→ config 3
+4. SecretRef 基础（config 5）→ mail 2 → notification 1-3
 
 ### 风险与约束
 
@@ -790,6 +826,26 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - **config init 不得生成可预测默认密码**：`DbConfig::default()` 和当前 `config/config.toml` 中的硬编码密码（`postgres://mega:mega@...`）应在 `config init` 生成结果中移除，改为强制用户通过环境变量、文件挂载 secret 或部署平台 secret 注入；数据库密码不能通过本项目 vault 注入。
 - **`orion_server.db_url` 是外部服务凭据**，不在 monoengine vault 管理范围内。若 Orion 自身需要 secret 管理，应由 Orion 独立解决，monoengine 只作为客户端通过部署平台 secret 注入其连接参数。
 
+### 必须先完成的前置工作（2026-06-14）
+
+在启动本计划的任何阶段之前，以下前置条件必须满足或明确规划：
+
+1. **日志脱敏工具（redaction 模块）**
+   - 位置建议：`src/common/redaction.rs` 或 `src/config/redaction.rs`
+   - 职责：提供统一的敏感信息脱敏接口（URL、token、key、shares 等）
+   - 需要的模块：config、vault、mail、notification
+   - **立即需要**（作为阶段 0b 的一部分，或独立前置）
+
+2. **CLI 两阶段加载（LoadMode）的共同设计框架**
+   - 位置建议：`src/cli/load_mode.rs`
+   - 职责：定义 LoadMode enum（`None`、`ConfigPath`、`RawSources`、`ParsedConfig`、`VaultBootstrap`、`FullAppContext`）、加载流程、依赖关系
+   - 所有者：config + vault 团队协同（不是分别设计）
+   - **需要在开始阶段 2 和 vault 阶段 D 前**完成协同设计
+
+3. **vault.md 与 config.md 的阶段协调**
+   - vault B（最小 bootstrap）应在 config 3 之前或同期完成
+   - 两个团队应明确交付时间表，避免后者因等待而延期
+
 ### 预期收益
 
 - 配置模块边界更清楚，新增配置域时只需扩展模型和校验，不必继续放大单文件。
@@ -812,7 +868,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 | **完整性** | **中（7/10）**。文档覆盖了加载链路、模块拆分、secret 分类、命令、测试分层、热加载等主要方面。**当前不足**：对“现状 vs 目标”的视觉区分仍不够强（虽有校准表）；对已存在的孤立 `email` 模块 + 死 `[mail]`/`[oauth]` 段的债务描述可更突出；对 `variable_placeholder_substitute` 的具体脆弱实现、`load_str` 与主路径的 list_parse 不一致、`mega_base` 自身的 panic 点等细节覆盖可更细；跨平台（非 Unix）权限与凭据注入的等价方案较弱。 |
 | **安全性** | **强（8.5/10）**。文档最优秀的部分之一。明确指出在 `core_key.json` 仍明文落盘、自动解封仍打印 root token、delete_all 仍为默认行为时，“搬进 vault”仅能提供“不进 git/不进普通日志”的有限收益，而不能提供对抗磁盘读取攻击者的保护。要求日志脱敏、stdin 写入、SecretString、fail-closed、DR 演练等均为正确方向。需在阶段 3 把 vault 代码里现有的 `println!` + `assert!` + `log::debug!` root token 作为必须消除项。 |
 | **功能正确性与接口兼容性** | **良好（8/10）**。校准段已修正多处行号失效、`mail`/`oauth` 不存在、`MailConfig` 未定义等问题；`SecretRef` 到 `read_secret(name)` 的路径映射（`write_api("secret/{name}")`）与 vault_core 实现一致。仍需注意：`config` 作为顶层模块名会与 `config` crate 冲突（当前代码用 `c::` 别名，已在文档中提及）；re-export shim 的移除时机必须在所有调用方迁移完成后统一进行。 |
-| **数据流与控制流正确性** | **正确（9/10）**。`AppContext::new`（context/mod.rs:27-33）中 `Storage::new → init_connection(redis) → VaultCore::new` 的实际顺序与文档描述完全一致。secret 只能在 vault 就绪后解析、运维命令（secret set/check）必须用最小 bootstrap 而非完整 AppContext 的结论均正确。 |
+| **数据流与控制流正确性** | **正确（9/10）**。`AppContext::new` 中 `Storage::new → init_connection(redis) → VaultCore::new → SmtpMailer/EmailDispatcher → init_monorepo` 的实际顺序与文档描述完全一致。secret 只能在 vault 就绪后解析、运维命令（secret set/check）必须用最小 bootstrap 而非完整 AppContext 的结论均正确。 |
 | **性能与效率** | **可接受（8/10）**。resolver 内存缓存 + TTL、`Arc` 只读共享均合理。`variable_placeholder_substitute` 的两次全树 collect + clone 在启动期可忽略，主要问题是其 panic 语义而非 CPU 成本。热加载白名单设计也避免了不必要的长连接重建。 |
 | **可靠性与容错性** | **改进潜力大（8/10）**。计划中的“消灭加载路径 panic、fail-closed、热加载失败回滚保留旧配置、错误带字段路径+修复建议”等均会显著提升。当前代码的若干 `panic!`/`expect`/`assert`（占位符、Buck 校验、Storage.config、vault 解封、mega_base 等）已被文档准确定位为必须在对应阶段消除的点。 |
 | **兼容性与互操作性** | **良好（8/10）**。serde `Option` + `#[serde(default)]`、废弃字段 WARN 过渡期、re-export shim、Profile 深合并（数组整体替换而非追加）的语义均已明确。需补充：未知顶层段的告警策略、`0600/0700` 在 Windows/macOS 下的等价实现（或明确“生产仅支持类 Unix”）、以及 `config/config.toml` 作为样例时应 `deny_unknown_fields` 或至少 warn。 |

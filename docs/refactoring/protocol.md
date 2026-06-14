@@ -1,6 +1,115 @@
-# Git SSH/HTTP 协议兼容性分析与改进计划
+# Git Protocol 兼容性改进计划
 
-本文档分析 `monoengine` 当前 Git SSH/HTTP 协议实现与标准 Git 客户端的兼容性，记录已具备能力、主要缺口、风险点和分阶段改进计划。
+本文档记录 `monoengine` 当前 Git SSH/HTTP 协议实现的现状分析、主要兼容性问题、风险点和分阶段改进计划，用于提升与标准 Git 客户端的兼容性。
+
+> **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
+
+> **与其他模块的依赖**：Git Protocol 改进与 config/vault 的认证统一相关。当 config.md 阶段 2（CLI LoadMode）完成后，可统一 HTTP/SSH 的认证上下文设计。集成测试参见 **`integration.md`**。
+
+## 事实校准（2026-06-14）
+
+> 本文档中的代码引用已对照当前 `src/` 重新核对。当前 Git protocol 实现处于基础阶段，具有完整的功能框架但多处缺乏错误处理和兼容性完善：
+
+1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
+
+2. **基础 fetch/push/clone 可工作**。当前能支持标准 Git 客户端的基本 clone、fetch、push 操作，但多处使用 `unwrap()` 和缺乏边界检查。
+
+3. **pkt-line 解析与 receive-pack 分流存在风险**。`read_pkt_line` 使用 `unwrap()` panic；receive-pack 通过搜索 `PACK` magic bytes 分界，可能跨 chunk 失败或被 payload 中的偶然 `PACK` 误触。
+
+4. **认证策略不一致**。HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH 通过 public key，但未统一 auth context。
+
+5. **Capability advertise 与实现不对齐**。多个 capability（atomic、report-status-v2、delete-refs）被 advertise 但未完整实现。
+
+6. **SSH 多 channel 状态管理不够细致**。per-connection 状态共享，不是 per-channel，可能在多 channel 场景下产生串联。
+
+## 当前实现状态速览表
+
+| 能力 / 组件 | 实现状态 | 关键事实与风险 |
+|-----------|--------|-------------|
+| HTTP GET /info/refs | 已实现（风险） | 直接 `unwrap()` query 参数，缺少 service 参数返回 panic；无 malformed query 处理。 |
+| HTTP POST upload-pack | 已实现（风险） | 一次性读取 request body 到内存；pkt-line 解析 `unwrap()` panic；不支持 streaming。 |
+| HTTP POST receive-pack | 已实现（风险） | 搜索 `PACK` 字节分界不稳健；跨 chunk 可能失败；无 flush-pkt 边界检查。 |
+| SSH git-upload-pack | 已实现（风险） | exec command 解析过于脆弱，路径包含空格时失败；非法命令默认变成 upload-pack。 |
+| SSH git-receive-pack | 已实现（风险） | 与 HTTP 共用不稳健的分流逻辑；session 状态全局共享。 |
+| SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
+| 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
+| Capability advertise | 实现但不完全 | advertise 包含 atomic、report-status-v2、delete-refs，但实现和测试不完整。 |
+| 错误处理 | 基础缺陷 | 多处 `unwrap()` 和 panic；malformed input 导致连接被异常关闭而非协议错误。 |
+
+## 硬约束与不可违反的原则
+
+1. **协议正确性优先**：Git smart protocol 是二进制协议，所有 payload 必须按 bytes 处理，不能假设 UTF-8 或文本。
+
+2. **客户端不能导致崩溃**：任何 malformed client input（非法 query、脆弱 exec、malformed pkt-line）都必须返回协议错误，不能 panic。
+
+3. **Capability 诚实**：只 advertise 已实现且有测试的能力。未实现的能力如 atomic、report-status-v2 应先完齐或从 advertise 中移除。
+
+4. **权限强制**：auth context 必须统一（HTTP Bearer/Basic + SSH key），并在 upload-pack/receive-pack 入口前完成。push 必须验证用户和权限。
+
+5. **pkt-line 协议边界**：receive-pack 的 command 和 pack 分界必须由 flush-pkt 决定，不能依赖 magic bytes 搜索。
+
+6. **兼容性声明**：不支持的功能（protocol v2、partial clone、shallow clone、pure SSH LFS）必须明确文档化，而不是静默失败。
+
+## 现状 vs 目标对比
+
+| 维度 | 当前状态 | 目标状态 | 关键差距 |
+|-----|--------|--------|--------|
+| 错误处理 | 多处 panic | 协议错误或断开，不能 panic | 需要 Result 化所有输入解析 |
+| pkt-line 实现 | `unwrap()` panic 散落 | 定义 `PktLine` enum 和 streaming parser | 需重构 parser 返回 Result |
+| receive-pack 分流 | 搜索 `PACK` magic | 按 pkt-line flush-pkt 边界 | 需重写分界逻辑 |
+| SSH exec 解析 | 脆弱（空格、拼接错） | 严格 parser，支持引号和转义 | 需独立 parser 函数和单测 |
+| SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 需引入 `GitSshChannelState` |
+| 认证统一 | HTTP/SSH 分离 | 统一 `ProtocolAuthContext` | 需与 config/vault auth 协同 |
+| Capability 诚实 | advertise 多于实现 | 仅 advertise 已实现能力 | 需 capability truth table |
+| 测试矩阵 | 无 | 真实 Git CLI smoke test | 需建立兼容性测试脚本 |
+
+## 前置依赖矩阵（2026-06-14）
+
+本文档与其他改进计划的依赖关系：
+
+| Git Protocol 的工作 | 对其他模块的依赖 | 依赖类型 | 关键同步点 |
+|------------|-----------|--------|---------|
+| **阶段 0：兼容性基线** | general.md | 框架 | 必须遵守结构规范 |
+| **阶段 1：panic 止血** | general.md | 框架 | 错误模型与 config 的 error.rs 对齐 |
+| **阶段 2-3：pkt-line/capability** | general.md | 框架 | 与整体错误处理框架一致 |
+| **阶段 4：auth 统一** | config.md | 前置 | 需先完成 config 阶段 2 的 CLI LoadMode |
+| **阶段 5-6：SSH/LFS 完善** | integration.md | 并行 | 集成测试可同步验证改进 |
+
+**注**：阶段 1-3 相对独立，可先完成基础止血。阶段 4 需与 config 协同，推荐在 config 阶段 2 之后。
+
+## 风险与约束
+
+- **二进制协议处理**：当前多处假设 UTF-8，需要完整的 bytes 化改造。如果改造不彻底，会在处理特殊 pack 数据或 binary diff 时出现隐蔽问题。
+
+- **receive-pack 事务边界**：当前 atomic 的声称不被测试覆盖，并发 push 的锁粒度不明确。如果不完整地实现事务，可能导致数据不一致。
+
+- **SSH 多 channel 状态**：state 在 handler 上全局保存，虽然 clone 降低共享风险，但一个 connection 内多个 channel 仍可能互相影响。
+
+- **Capability 误导**：advertise 未实现的 capability 会让 Git 客户端进入不支持的代码路径，产生隐蔽失败。必须建立 truth table 防止此类问题。
+
+- **兼容性测试缺失**：没有真实 Git CLI 的测试矩阵，无法防止 panic 或协议误差的回归。
+
+## 多维评估表
+
+| 维度 | 评估结论 |
+|-----|--------|
+| **合理性** | **高（8.5/10）**。当前代码框架完整，兼容性问题识别准确。阶段划分合理，从基础止血到兼容性扩展的路线清晰。 |
+| **可行性** | **中高（7.5/10）**。基础 panic 止血相对容易（Result 化输入解析）；pkt-line 和 receive-pack 分流需要较深的协议理解；SSH auth 统一需与 config 协同。 |
+| **完整性** | **中（7/10）**。6 个阶段覆盖主要问题，但 partial clone、protocol v2、shallow clone 等现代 Git 特性未涵盖。当前声称"仅 v0/v1"是合理的范围限制。 |
+| **安全性** | **中（7/10）**。panic 止血直接提升安全性；auth 统一防止权限泄露。但 per-channel state 和事务边界的改进是长期工作。 |
+| **可维护性** | **中（7/10）**。当前代码存在多个维护陷阱（magic bytes 搜索、全局 state、scattered panic）。改进后代码应更易维护，但短期工作量较大。 |
+
+## 小结
+
+Git Protocol 是 monoengine 的核心功能，但当前实现在错误处理、兼容性和细节上存在多个缺陷。建议优先完成阶段 0-1 的兼容性基线建立和 panic 止血，确保 malformed input 不导致崩溃。再依次完成阶段 2-3 的 pkt-line 和 receive-pack 改造，确保协议边界正确。阶段 4 的 auth 统一可与 config 模块协同完成，阶段 5-6 为长期改进。
+
+## 预期收益
+
+- **崩溃修复**：消除 panic 风险，malformed input 返回协议错误而非连接中断
+- **兼容性提升**：标准 Git 客户端在各场景下（clone、fetch、push、tags、delete）更稳定可靠
+- **可观测性改进**：清晰的错误模型和兼容性测试矩阵便于快速诊断和防止回归
+- **维护成本降低**：代码结构改进（streaming parser、per-channel state）降低后续改造成本
+- **扩展性增强**：为 partial clone、protocol v2 等未来功能预留设计空间
 
 ## 范围
 

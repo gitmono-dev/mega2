@@ -1,6 +1,106 @@
-# Chat Engine Migration
+# Chat 模块迁移与改进计划
 
-本文档是把源 Rails 后端中的聊天能力迁入 `monoengine` 的执行规格。迁移后的代码、表、API、类型、配置和网关命名必须使用 `chat`、`channel`、`message` 等业务语义，不再使用源项目名称作为前缀或命名空间。
+本文档记录 `monoengine` 中 Chat 引擎的现状分析、迁移规范、分阶段落地计划，用于把源 Rails 后端中的聊天能力完整迁入并完善。迁移后的代码、表、API、类型、配置和网关命名必须使用 `chat`、`channel`、`message` 等业务语义，不再使用源项目名称作为前缀或命名空间。
+
+> **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
+
+> **与其他模块的依赖**：Chat 模块的通知功能（message 提及/回复通知）将依赖 **`notification.md`** 的多渠道通知系统。Mail 模块完成后，可支持聊天通知的邮件投递。当前集成测试计划参见 **`integration.md`**。
+
+## 事实校准（2026-06-14）
+
+> 本文档中的代码引用已对照当前 `src/` 重新核对。当前 chat 模块处于初期边界定义阶段：
+
+1. **Chat 模块边界已定义**。`src/chat/mod.rs`、`src/chat/domain.rs`、`src/chat/engine.rs` 已建立初期框架，定义 `ChatCapability`、`ChatEntityKind`、`ChatEngine`。
+2. **Capability 划分已明确**。当前规划 `SharedFoundations`（附件、表情、链接预览）和 `ChannelChat`（频道、消息、成员）两个主要能力。
+3. **SeaORM 实体尚未落地**。`src/callisto/` 中暂无 chat 相关表模型；迁移脚本和存储层实现未开工。
+4. **HTTP Router 未接入**。`/api/v1/chat/` 路由尚未添加；需在现有 router 框架中新增 chat_router。
+5. **源系统代码仍在 Rails**。源 9 张表位于 PlanetScale/MySQL，数据迁移工具未开发。
+
+## 当前实现状态速览表
+
+| 能力 / 组件 | 实现状态 | 关键事实与风险 |
+|-----------|--------|-------------|
+| Chat 模块入口 | 仅框架 | `src/chat/mod.rs`、domain.rs、engine.rs 存在；`MIGRATION_SLICES` 尚未实装任何切片。 |
+| Shared Foundations（附件、表情） | 未实现 | SeaORM 实体未定义；storage 层未实现。 |
+| Channel Chat（频道、消息） | 未实现 | SeaORM 实体未定义；storage 层未实现；service 层未实现。 |
+| HTTP API | 未实现 | `/api/v1/chat/` router 不存在；DTO 不存在；OpenAPI 文档未生成。 |
+| 实时事件 | 未实现 | `ChatEvents` trait 未定义；broadcaster 不存在。 |
+| 数据迁移工具 | 未实现 | 源库导出、用户映射、导入脚本均未开发。 |
+| 权限控制 | 未实现 | storage 层 membership join 检查未实现。 |
+| 集成测试 | 未实现 | chat 相关的端到端测试场景未定义。 |
+
+## 硬约束与不可违反的原则
+
+1. **命名纯净**：生产代码、schema、API、配置、日志中不得出现源项目名称。允许的例外仅限：历史迁移脚本注释、git commit message、一次性工具输出。
+
+2. **用户身份统一**：所有用户引用转换为 `username`，不迁移源 `users` 表。不引入组织维度的多租户抽象。
+
+3. **权限强制**：storage 层所有 read/write 操作必须 JOIN `channel_memberships` 验证当前用户的成员身份。handler 层禁止直接调用 SeaORM。
+
+4. **Soft Delete 一致性**：所有可删除资源（channel、message、attachment 等）保留 `discarded_at`，storage 默认过滤 `discarded_at IS NULL`。
+
+5. **API 不泄露内部 ID**：HTTP response 只暴露 `public_id` 和 `username`，不暴露数据库自增 ID。
+
+6. **范围边界**：仅迁移聊天频道 CRUD、消息、附件、表情、reaction、成员管理。不包括 Auth、Org、Project、Notes、Posts、Notifications、Integrations、Calls、Data export 等。
+
+## 现状 vs 目标对比
+
+| 维度 | 当前状态 | 目标状态 | 关键差距 |
+|-----|--------|--------|--------|
+| 模块组织 | 框架占位 | 功能完整、可测试、可部署 | 需实装 6 个切片 |
+| 数据存储 | MySQL/PlanetScale | PostgreSQL/monoengine DB | 需迁移 9 张表与数据 |
+| 代码结构 | 仅 engine.rs | callisto entities + storage + service + API | 需按分层补齐 |
+| API | 不存在 | /api/v1/chat/* 12+ 端点 + OpenAPI | 需新增 HTTP router 与 handler |
+| 认证 | 无 | HTTP Bearer/Basic + SSH key | 需 protocol auth context |
+| 权限 | 无 | 成员身份强制检查 | 需 storage 层 JOIN 检查 |
+| 测试 | 无 | 单元测试 + 集成测试 + 数据迁移测试 | 需补齐测试矩阵 |
+
+## 前置依赖矩阵（2026-06-14）
+
+本文档与其他改进计划的依赖关系：
+
+| Chat 的工作 | 对其他模块的依赖 | 依赖类型 | 关键同步点 |
+|-----------|-------------|--------|---------|
+| **Slice 1-2：Schema + Storage** | general.md | 框架 | 必须遵守结构规范和评审标准 |
+| **Slice 3：Service** | mail.md（可选） | 后置 | 通知功能与 mail 的 password_ref 协同 |
+| **Slice 4-5：API + Upload** | config.md（可选） | 后置 | 若需要配置凭据，使用 config 的 SecretRef |
+| **Slice 6：数据迁移** | notification.md（可选） | 独立 | 迁移完成后可支持聊天通知 |
+
+**注**：Chat 的核心 CRUD 功能与其他模块独立，可先完成 Slice 0-5。Slice 6 数据迁移可与其他工作并行。
+
+## 风险与约束
+
+- **迁移数据一致性**：9 张表跨 MySQL 到 PostgreSQL，需要完整的用户映射和冲突检测。跳过 integration/call/post 派生消息会导致聊天断层。
+
+- **权限隔离**：storage 层如果不强制 membership 检查，会产生数据泄露风险。当前框架设计明确了这一点，但实施时必须在每个查询点验证。
+
+- **Soft Delete 查询复杂性**：大量查询需要默认过滤 `discarded_at IS NULL`，如果不在 storage 层统一处理，会导致遗漏和不一致。
+
+- **实时事件复杂性**：第一版 no-op 实现简单，但后续接入 WebSocket/Pusher 时需要重构。应在 Slice 3 设计好事件接口。
+
+- **API 认证一致性**：HTTP 和 SSH 认证上下文需与其他模块（如 vault、config 的 protocol auth）保持一致。
+
+## 多维评估表
+
+| 维度 | 评估结论 |
+|-----|--------|
+| **合理性** | **高（8.5/10）**。迁移范围清晰，功能边界明确，架构分层合理。关键约束（权限强制、命名纯净）直指常见陷阱。 |
+| **可行性** | **高（8/10）**。现有框架完整，SeaORM 模式已建立，storage + service + API 的分层路径清晰。数据迁移工具是最大变量，需提前设计和测试。 |
+| **完整性** | **中（7/10）**。6 个切片覆盖功能主干，但测试策略和监控策略相对薄弱。迁移完成后的灰度切、回滚路径需要补齐。 |
+| **安全性** | **中（7/10）**。权限模型和 soft delete 设计正确，但多个风险点（跨库迁移、事件时序、LFS hybrid）需要在各切片中逐一验证。 |
+| **可扩展性** | **中（7.5/10）**。当前架构支持后续的多渠道通知、webhook、搜索等扩展。但切片划分较松散，后续改造成本可能较高。 |
+
+## 小结
+
+Chat 模块是一个从零迁移的大型功能模块，涉及 9 张表、12+ API 端点、完整的权限模型和实时事件机制。当前框架已定义边界，但核心实装工作（schema、storage、service、API）尚未开工。建议优先完成 Slice 0-2 的 schema 和 storage 基础，确保权限强制和 soft delete 一致性，再进行 API 暴露和数据迁移。
+
+## 预期收益
+
+- **完整聊天能力**：支持频道、消息、附件、表情、reaction、成员管理的端到端用户体验
+- **数据一致性**：通过统一的 soft delete 和权限检查，确保数据隐私和完整性
+- **易于扩展**：清晰的分层架构（entity → storage → service → API）为后续多渠道通知、搜索、webhook 奠定基础
+- **可维护性**：明确的命名规范和 review checklist 降低后续维护成本
+- **可观测性**：统一的权限模型和事件机制便于审计和监控
 
 ## 命名决策
 

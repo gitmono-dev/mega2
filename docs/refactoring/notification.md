@@ -2,19 +2,23 @@
 
 本文档记录 `monoengine` 中一级 `notification` 模块（`src/notification/`）的设计、当前实现状态、与 Config / Mail / Vault / Storage / 业务触发器的集成方案、运行时注入与后台任务启动顺序约束，以及分阶段落地计划。
 
-本文档的编写要求、结构深度、分析维度、事实校准风格、阶段规划 rigor、多维评估表、硬约束列表、实施检查清单等与 `docs/config.md`（及配套的 `docs/mail.md`）完全一致。
+本文档的编写要求、结构深度、分析维度、事实校准风格、阶段规划 rigor、多维评估表、硬约束列表、实施检查清单等与 `config.md`（及配套的 `mail.md`）完全一致。
 
-> **与 config 和 mail 计划的强绑定**：Notification 是系统事件驱动用户通知的核心能力（目前主要通过 email 渠道）。它**严重依赖** mail 模块作为 email 投递后端（docs/mail.md 和 config.md 阶段 5 的第一个真实 SecretRef 消费者）。邮件通知的 dispatcher 构造时机必须晚于 VaultCore 和 mailer 就绪。Enqueue（触发器）可在 DB 可用后较早发生，但实际投递（尤其是带凭据的渠道）必须遵守 `Config → Storage(DB + object storage) → redis → VaultCore → (mail resolver) → 渠道构造 + dispatcher 启动` 的顺序。未来多渠道（in-app、slack 等）可能引入更多 vault secret。Notification 后台任务的启动属于 FullAppContext 路径，不能在 config secret 等最小 bootstrap 命令中被强制初始化。
+> **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
+
+> **与 config 和 mail 计划的强绑定**：Notification 是系统事件驱动用户通知的核心能力（目前主要通过 email 渠道）。它**严重依赖** mail 模块作为 email 投递后端（mail.md 和 config.md 阶段 5 的第一个真实 SecretRef 消费者）。邮件通知的 dispatcher 构造时机必须晚于 VaultCore 和 mailer 就绪。Enqueue（触发器）可在 DB 可用后较早发生，但实际投递（尤其是带凭据的渠道）必须遵守 `Config → Storage(DB + object storage) → redis → VaultCore → mail resolver/SMTP mailer → EmailDispatcher 启动 → init_monorepo → service dispatch` 的顺序。未来多渠道（in-app、slack 等）可能引入更多 vault secret。Notification 后台任务的启动属于 FullAppContext 路径，不能在 config secret 等最小 bootstrap 命令中被强制初始化。
+
+> **集成测试指引**：通知系统的各项功能（触发器、偏好查询、dispatcher 分发、多渠道投递）应通过 **`integration.md`** 中的 `test_notification_triggers` 场景进行端到端验证，确保邮件渠道与 mail 模块的集成正常。
 
 ## 事实校准（2026-06）
 
 > 本文档中的代码引用已对照当前 `src/` 重新核对。需特别注意以下与 mega 上游及早期移植草案不一致的事实，后文据此修正：
 
-1. **Notification 代码存在但未作为活动模块接入主 crate**。`src/notification/{mod.rs, dispatcher.rs, triggers.rs}` 已部分从 mega 移植：
+1. **Notification 代码已作为活动模块接入主 crate**。`src/notification/{mod.rs, dispatcher.rs, triggers.rs}` 已部分从 mega 移植：
    - `dispatcher.rs` 实现了 `EmailDispatcher`（依赖 `crate::mail::Mailer` + `NotificationStorage`，处理 `email_jobs` outbox，支持 claim、retry、mark sent/failed/skipped）。
    - `triggers.rs` 实现了 `on_cl_comment_created`（使用 NotificationStorage 进行 event type upsert、should_send 过滤、enqueue_email_job）。
    - `mod.rs` 简单 re-export `EmailDispatcher`。
-   - 但 `main.rs` **未声明 `mod notification;`**（与历史上的 email 模块状态类似）。因此 dispatcher 从未被 spawn，触发器也未被业务代码实际调用，整体处于“可编译的孤立/半孤立代码”状态。
+   - `main.rs:18` 已声明 `mod notification;`，`AppContext::new` 在 vault 之后、`init_monorepo` 之前构造 `EmailDispatcher` 并 `tokio::spawn`。触发器是否已被业务代码广泛调用仍需逐条接入。
 
 2. **核心存储逻辑放在 jupiter 层**。`src/jupiter/storage/notification_storage.rs` 实现了完整的 NotificationStorage（对 callisto 实体的 CRUD + 业务逻辑：upsert_user_settings、set_global_enabled、should_send（结合 system_required / default_enabled / user prefs）、enqueue_email_job、fetch_pending_jobs、try_claim_job、mark_* 等）。这与 mega 的 jupiter 实现几乎一致，但 notification 模块本身并未在此之上提供高层 Service 抽象。
 
@@ -25,7 +29,7 @@
    - `email_jobs`（outbox 表：username, to_email, event_type_code, subject, body_html/text, status, error_message, retry_count, next_retry_at, sent_at 等）。
    - 关系已定义（email_jobs 属于 event_types 等）。
 
-4. **当前仅 email 渠道，且依赖 mail 模块**。Dispatcher 硬依赖 `mail::Mailer`（`send_html`）。根据 `docs/config.md` 和 `docs/mail.md`，mail 本身需要先完成“一级模块 + MailConfig 入 Config + vault 就绪后构造”的激活，才能让 notification 的 email 渠道成为合格的后置消费者。config.md 明确把 mail.password 作为首批 SecretRef 的前提，而 notification 的 email 投递是 mail 的主要下游。
+4. **当前仅 email 渠道，且依赖 mail 模块**。Dispatcher 硬依赖 `mail::Mailer`（`send_html`）。根据 `config.md` 和 `mail.md`，mail 已完成“一级模块 + MailConfig 入 Config + vault 就绪后构造 + dispatcher 启动”的基础激活，因此 notification 的 email 渠道已经具备作为合格后置消费者的启动位置。config.md 明确把 mail.password 作为首批 SecretRef 的前提，而 notification 的 email 投递是 mail 的主要下游。
 
 5. **触发器和事件注册不完整**。仅 `EVENT_CL_COMMENT_CREATED` 有实现和测试（cl 作者 + reviewers，排除 actor，尊重 prefs）。mega 中有更多事件潜力（issue、pr、@mention、build 结果等），但 monoengine 业务层（ceres）尚未广泛调用这些触发器。事件类型目前靠触发器首次使用时 upsert（非迁移 seeding）。
 
@@ -33,7 +37,7 @@
 
 7. **Campsite 相关**：campsite 项目主要是 TS/Next.js monorepo（packages/ui、editor、config 等），包含一些前端通知 UI 组件（如 AvatarNotificationReasonClip）和 slack.ts 配置（可能用于外部通知渠道）。它主要作为用户/认证后端（campsite_api_domain、api_store_backend），为 notification 提供用户邮箱和身份数据，但核心事件驱动 + outbox + 偏好逻辑在 Rust 引擎侧（mega/monoengine 共享的 callisto + jupiter）。未来 slack 渠道可考虑从 campsite 的 slack 集成模式扩展。
 
-8. **启动与 Vault 约束**：与 config.md 完全一致。目前代码中没有任何地方在 `AppContext::new` 或 service 启动路径中构造 dispatcher + mailer。Enqueue 理论上可在 DB 就绪后发生（触发器只依赖 NotificationStorage），但投递必须在 vault + mail 之后。NotificationStorage 本身不持凭据，但 EmailDispatcher 持 mailer（其 password 未来是 SecretRef）。
+8. **启动与 Vault 约束**：与 config.md 完全一致。当前代码已经在 `AppContext::new` 中按 `Storage → Redis → VaultCore → SmtpMailer + EmailDispatcher spawn → init_monorepo` 的顺序启动 email dispatcher。Enqueue 理论上可在 DB 就绪后发生（触发器只依赖 NotificationStorage），但投递必须在 vault + mail 之后。NotificationStorage 本身不持凭据，但 EmailDispatcher 持 mailer（其 password 未来是 SecretRef）。
 
 9. 行号与模块路径以当前（读取时）代码为准。早期 mega 移植中的部分行号已更新。
 
@@ -41,14 +45,14 @@
 
 | 能力 / 组件                     | 实现状态          | 关键事实与风险 |
 |--------------------------------|-------------------|---------------|
-| `src/notification/` 作为一级模块 | 代码存在，**未激活** | 有 mod/dispatcher/triggers，但 main.rs 无 `mod notification;`，未被任何 service 启动或 API 路由引用。类似历史 email 孤立状态。 |
-| EmailDispatcher + outbox 处理   | 部分实现（引用已指向 mail） | 依赖 `mail::Mailer`，实现 claim/retry/mark 逻辑，tick 每 2s。测试使用 NoopMailer + test DB。但从未在运行时 spawn。 |
+| `src/notification/` 作为一级模块 | **已激活** | 有 mod/dispatcher/triggers，`main.rs:18` 已声明 `mod notification;`。触发器仍需继续接入业务关键路径和 API 表面。 |
+| EmailDispatcher + outbox 处理   | **运行时已 spawn（mail 启用时）** | 依赖 `mail::Mailer`，实现 claim/retry/mark 逻辑，tick 每 2s。`AppContext::new` 在 vault 之后构造并 spawn。当前缺口是构造失败静默忽略、退避/并发和生命周期治理。 |
 | 触发器（on_cl_comment_created 等） | 部分实现         | 实现了 CL 评论场景（作者+reviewers，prefs 过滤，enqueue）。有单元测试。其他事件（issue、build 等）缺失或仅在 mega 中有原型。 |
 | NotificationStorage（jupiter 层） | 已实现（完整）    | 位于 `src/jupiter/storage/notification_storage.rs`，封装所有实体访问 + should_send 业务逻辑 + email job 生命周期。被 triggers 和 dispatcher 直接使用。 |
 | Callisto 通知实体               | 已完整移植        | email_jobs、notification_event_types、user_notification_settings、user_notification_preferences（及关系）与 mega 一致。 |
 | 用户偏好与事件类型管理          | 存储层存在，API 表面缺失 | 支持 upsert、should_send、list prefs 等。缺少用户自助配置 API（mega 有 DTOs 和对应 handler）。事件类型靠首次使用 upsert。 |
-| 与 mail 模块的集成              | **已就绪（前提）** | Dispatcher 构造需要 post-vault 的 mailer（见 docs/mail.md 和 config.md 阶段 5）。当前 mail 激活后，类型上可链接，但时机未在启动路径中强制。 |
-| 后台任务启动与生命周期          | **未实现**        | 无 CancellationToken 管理、无在 AppContext/service http/ssh 之后 spawn dispatcher 的代码。 |
+| 与 mail 模块的集成              | **已就绪（前提）** | Dispatcher 构造需要 post-vault 的 mailer（见 mail.md 和 config.md 阶段 5）。当前 mail 激活后，类型上可链接，但时机未在启动路径中强制。 |
+| 后台任务启动与生命周期          | **已基础接入，需完善** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher。仍需完善 graceful shutdown 协调、失败诊断、退避和多实例语义。 |
 | 多渠道支持（email 之外）        | **仅规划**        | 当前只有 email 渠道（通过 mail）。in-app（可能复用 chat/message 系统）、webhook、slack（参考 campsite slack.ts）等均未设计。 |
 | SecretRef / 渠道凭据            | **仅规划**        | Email 渠道的 password 走 mail 的 SecretRef（config 阶段 5）。未来 slack token 等需类似 vault 集成。 |
 | API 模型与用户设置端点          | 部分（实体层），缺失（API 层） | callisto 实体完整；mega 的 ceres/model/notification.rs DTOs 未在 monoengine api 中实现。无 /user/notification/preferences 等端点。 |
@@ -57,7 +61,7 @@
 | 可靠性（重试、DLQ、可观测）     | 基础字段存在      | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 有简单重试，但无 DLQ、指标、tracing 上下文、死信处理。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛，与 config.md/mail.md 重叠）**：
-- Dispatcher / mailer 在 Storage::new 或 AppContext 早期（vault 前）被构造。
+- Dispatcher / mailer 若被移动到 Storage::new 或 `VaultCore::new` 之前，会违反 vault 顺序；当前代码位置正确，但需要防回归。
 - 邮件正文/收件人（PII）出现在日志或错误中。
 - 触发器在事件类型不存在时 upsert（竞态、迁移不一致风险）。
 - NotificationStorage 目前直接暴露 DB 连接，业务层可绕过偏好检查。
@@ -115,13 +119,13 @@ NotificationService / Coordinator (一级 notification 模块核心)
 2. `Storage::new`（DB 就绪，NotificationStorage 可构造，enqueue 理论上可用）。
 3. Redis。
 4. `VaultCore::new`。
-5. （如果 mail 启用）构造真实 `Mailer`（post-vault，按 docs/mail.md）。
-6. 构造 `EmailChannel`（或其他渠道） + `NotificationService`。
-7. Spawn `EmailDispatcher`（或多渠道协调器）的后台任务（带 shutdown token）。
+5. （如果 mail 启用）构造真实 `Mailer`（post-vault，按 mail.md）。
+6. 构造并 spawn 当前 `EmailDispatcher`；未来可替换为 `EmailChannel`（或其他渠道） + `NotificationService`。
+7. 执行 `init_monorepo`，随后进入 HTTP/SSH/multi 服务分发。
 8. 业务触发器现在可安全 enqueue；dispatcher 开始投递。
 
 **严禁**：
-- 在 Storage::new 或 AppContext 早期构造带真实 mailer 的 dispatcher。
+- 在 Storage::new 或 `VaultCore::new` 之前构造带真实 mailer 的 dispatcher。
 - 在 `config secret` 等最小 bootstrap 路径中启动完整 notification 任务（会拉起 mail 等）。
 
 对于仅 enqueue 的场景（触发器），只要 DB 可用即可；delivery 任务必须在 FullAppContext 路径的后期启动。
@@ -212,29 +216,36 @@ Config::new
   -> Storage (DB 就绪，enqueue 可用)
   -> ... redis
   -> VaultCore
-  -> (mail resolver + 构造真实 Mailer, per docs/mail.md)
-  -> NotificationService::new(storage, vec![EmailChannel::new(mailer), ...])
-  -> service.start(shutdown)
-  -> 触发器可 enqueue；dispatcher 投递
+  -> (mail resolver + 构造真实 Mailer, per mail.md)
+  -> EmailDispatcher::new(storage.notification_storage(), mailer) + spawn
+  -> init_monorepo
+  -> service dispatch；触发器可 enqueue；dispatcher 投递
 ```
 
 对于 `config validate --resolve-secrets` 等运维命令：可构造最小 Service（仅 DB + vault）来验证渠道配置可解析/可发送测试通知，而不启动真实 tick 任务。
 
-## 迁移步骤（分阶段，强绑定 config/mail 阶段）
+## 迁移步骤（分阶段，强绑定 config/mail/vault 阶段）
 
-**阶段 0（基础激活，与 mail 阶段 0/1 对齐）**：
-- 在 `main.rs` 声明 `mod notification;`。
-- 在 service 启动路径（http/ssh/multi）中，于 vault + mail 就绪后，构造 EmailChannel + NotificationService 并 spawn dispatcher（带 shutdown）。
-- 确保触发器在 ceres/api 业务关键路径中被调用（至少 CL 评论）。
-- 补充基本集成测试（Noop mailer + test DB）。
-- 验收：邮件通知作业能从 enqueue 到实际发送（或 Noop）完整走通；日志无凭据泄露。
+> **与 config/mail/vault 的强绑定（2026-06-14 更新）**：notification 的所有后续工作都依赖于前置模块的完成：
+> - **阶段 0/1** 需要 mail.md 的阶段 0/1 完成（已满足）+ config.md 阶段 0b 的脱敏工具（用于日志脱敏）
+> - **阶段 1** 与 mail.md 阶段 2 对齐（mail 的 password_ref 实现）
+> - **阶段 3** 需要 vault.md 阶段 A/B/C 至少完成（fail-closed、最小 bootstrap、接口收窄），以及 config.md 的脱敏工具
+> 不建议提前启动阶段 3，除非上述前置已经就绪。
 
-**阶段 1（渠道抽象与多渠道基础，与 mail SecretRef 阶段 2 对齐）**：
+**阶段 0（基础激活，与 mail 阶段 0/1 对齐，已部分完成）**：
+- `main.rs` 声明 `mod notification;` 已完成。
+- 在 service 启动路径中，于 vault + mail 就绪后 spawn `EmailDispatcher` 已完成。
+- 剩余：确保触发器在 ceres/api 业务关键路径中被调用（至少 CL 评论）。
+- 剩余：补充基本集成测试（Noop mailer + test DB）。
+- 剩余：依赖 config.md 阶段 0b 的脱敏工具，完善日志脱敏（避免 PII 泄露）
+- 剩余验收：邮件通知作业能从 enqueue 到实际发送（或 Noop）完整走通；日志无凭据泄露；mail 构造失败不再静默忽略。
+
+**阶段 1（渠道抽象与多渠道基础，与 mail 阶段 2 对齐）**：
 - 引入 `NotificationChannel` trait + `EmailChannel` 实现。
 - 重构 dispatcher 为多渠道协调器。
 - 实现至少一个额外渠道原型（in-app 或 console）。
 - 更新 NotificationService 以管理多渠道。
-- 验收：可配置多渠道；email 渠道开始支持 mail 的 `password_ref`（当 config resolver 就绪时）。
+- 验收：可配置多渠道；email 渠道开始支持 mail 的 `password_ref`（当 **config.md 阶段 5** 和 **mail.md 阶段 2** 都完成时）。
 
 **阶段 2（用户偏好 API 表面，完整移植 mega 能力）**：
 - 引入 `ceres/model/notification.rs` 风格的 API DTOs（带 utoipa）。
@@ -244,11 +255,12 @@ Config::new
 - 验收：用户可通过 API 管理自己的通知偏好；should_send 正确反映更新。
 
 **阶段 3（Vault SecretRef + 渠道凭据，安全加固）**：
-- Email 渠道完全迁移到 SecretRef（依赖 mail + config 阶段 5）。
+- Email 渠道完全迁移到 SecretRef（依赖 **mail.md 阶段 2** + **config.md 阶段 5**）。
 - 设计并实现需要 secret 的其他渠道（slack token 等）通过 resolver 注入。
-- 清理所有早期构造路径；强化日志脱敏（收件人、主题、正文在错误路径中受控）。
+- 清理所有早期构造路径；强化日志脱敏（收件人、主题、正文在错误路径中受控，依赖 **config.md 阶段 0b** 的脱敏工具）。
 - 与 config 的 `config secret set/check` 集成（支持 notification 相关 secret，如果有）。
-- 验收：所有渠道凭据仅在 vault 就绪后解析；core_key 加固已完成（作为前置）。
+- **前置**：本阶段不建议提前启动，必须等待 **vault.md 阶段 A/B/C 完成**（fail-closed 确保可靠、最小 bootstrap 支持运维命令、interface 收窄防止误用）
+- 验收：所有渠道凭据仅在 vault 就绪后解析；core_key 加固已完成（来自 vault.md 阶段 A）。
 
 **阶段 4（可靠性、扩展性、运维）**：
 - 改进重试策略（指数退避、DLQ 表或状态、告警集成）。
@@ -267,8 +279,26 @@ Config::new
 - 与 campsite slack 等外部集成深化。
 - 文档同步（README、部署指南、事件类型目录）。
 
+### 前置依赖矩阵（2026-06-14 更新）
+
+| notification 阶段 | 主要工作 | 对 config 的依赖 | 对 vault 的依赖 | 对 mail 的依赖 |
+|------------|--------|------------|-----------|-----------|
+| **0** (基础激活) | dispatcher 启动 | 依赖 config 0b 日志脱敏工具 | 无 | **mail 0/1** (已满足) |
+| **1** (渠道抽象) | NotificationChannel trait | 无 | 无 | **mail 2** (password_ref 时) |
+| **2** (API 表面) | 用户偏好 API | 依赖 config 的 validate 等 | 无 | mail 的完整能力 |
+| **3** (安全加固) | **Vault SecretRef + 多渠道凭据** | 依赖 config 0b/5 脱敏+resolver | **前置：vault A/B/C (fail-closed/bootstrap/interface)** | mail 2 (password_ref) |
+| **4-5** (可靠性 + 功能) | 重试、可观测、模板 | 依赖 config 的 profile + reload | 可选（如有额外 secret） | 无 |
+
+**关键前置依赖顺序：**
+1. **config.md 阶段 0b（日志脱敏工具）→ notification 阶段 0**：dispatcher 启动时需要脱敏能力
+2. **mail.md 阶段 2（password_ref）→ notification 阶段 1**：email 渠道支持 password_ref 需要 mail 完成迁移
+3. **vault.md 阶段 A/B/C → notification 阶段 3**：安全加固不能在 vault 加固前进行
+4. **config.md 阶段 5（resolver）→ mail 2 → notification 1-3**：整个 SecretRef 链路的依赖
+
+**不建议提前启动阶段 3**，除非上述所有前置已就绪。
+
 贯穿全程：
-- 每阶段更新 `docs/notification.md`、`docs/config.md`（mail 相关章节）、`docs/mail.md`。
+- 每阶段更新 `notification.md`、`config.md`（mail 相关章节）、`mail.md`。
 - 同步更新 callisto 迁移（如新增事件类型）、config/config.toml 示例（如有全局项）、测试辅助（testing.rs 风格的 mock notification）。
 - 保持与 mega 的 callisto 实体和 NotificationStorage API 兼容。
 
@@ -302,7 +332,7 @@ Config::new
 
 ## 小结
 
-Notification 是 monoengine 事件驱动用户体验的重要组成部分（评论、审查、构建反馈等）。当前代码从 mega 移植了核心 outbox + 偏好 + 存储逻辑，但处于“存在但未激活”的状态，且严重依赖一级 mail 模块的完成（作为 email 投递后端和首个 SecretRef 试点）。
+Notification 是 monoengine 事件驱动用户体验的重要组成部分（评论、审查、构建反馈等）。当前代码从 mega 移植了核心 outbox + 偏好 + 存储逻辑，已经接入主 crate 并在 mail 启用时启动 `EmailDispatcher`，但仍严重依赖一级 mail 模块的后续加固（作为 email 投递后端和首个 SecretRef 试点）。
 
 将 notification 真正建设为一级模块，核心是：
 - 确保模块在 main 中激活、提供高层 Service 抽象。
@@ -312,11 +342,11 @@ Notification 是 monoengine 事件驱动用户体验的重要组成部分（评�
 - 与 config 的 SecretRef、profile、热加载、校验能力对齐。
 - 把可靠性、可观测和未来渠道（in-app、slack 参考 campsite）作为后续阶段。
 
-所有 notification 相关工作都必须与 `docs/config.md` 的阶段（尤其是 mail 作为前置）、vault 加固、日志脱敏、最小 bootstrap 等 gate 保持同步。任何试图在 vault 就绪前构造带凭据投递器的尝试都必须被阻止。
+所有 notification 相关工作都必须与 `config.md` 的阶段（尤其是 mail 作为前置）、vault 加固、日志脱敏、最小 bootstrap 等 gate 保持同步。任何试图在 vault 就绪前构造带凭据投递器的尝试都必须被阻止。
 
 实施前请完整阅读：
-- 本文档 + `docs/config.md` 的「事实校准」「当前实现状态速览表」「硬约束」「secret 解析的依赖顺序」「实施前快速检查清单」。
-- `docs/mail.md`（email 渠道的具体设计与阶段）。
+- 本文档 + `config.md` 的「事实校准」「当前实现状态速览表」「硬约束」「secret 解析的依赖顺序」「实施前快速检查清单」。
+- `mail.md`（email 渠道的具体设计与阶段）。
 
 预期收益：可靠的多渠道通知、用户可控的偏好、与凭据管理（vault/SecretRef）的一致集成、易于扩展新事件和新渠道，同时保持与 mega 生态的兼容性。
 
@@ -325,7 +355,7 @@ Notification 是 monoengine 事件驱动用户体验的重要组成部分（评�
 **参考资料与对齐**：
 - mega 项目：`mono/src/notification/{dispatcher,triggers}.rs`、`jupiter/src/storage/notification_storage.rs`、`jupiter/callisto/src/{email_jobs,notification_event_types,user_notification_*.rs}`、`ceres/src/model/notification.rs`（API DTOs）、触发器在业务层的调用模式。
 - campsite 项目：用户源（邮箱、身份）、前端通知 UI 组件、slack 集成配置（作为未来 slack 渠道的参考模式）。
-- monoengine 当前（读取时）：`src/notification/*`（部分移植，未 mod 激活）、`src/jupiter/storage/notification_storage.rs`（完整）、`src/callisto/` 对应实体、`src/mail/`（作为 email 渠道前置，按 docs/mail.md 设计）。
-- 强依赖文档：`docs/config.md`（引导循环、SecretRef、mail 作为第一试点、CLI LoadMode、最小 bootstrap、vault 加固等全部前置）、`docs/mail.md`（email 渠道的 late 构造与 SecretRef 迁移计划）。
+- monoengine 当前（读取时）：`src/notification/*`（部分移植，已通过 `mod notification;` 激活）、`src/jupiter/storage/notification_storage.rs`（完整）、`src/callisto/` 对应实体、`src/mail/`（作为 email 渠道前置，按 mail.md 设计）。
+- 强依赖文档：`config.md`（引导循环、SecretRef、mail 作为第一试点、CLI LoadMode、最小 bootstrap、vault 加固等全部前置）、`mail.md`（email 渠道的 late 构造与 SecretRef 迁移计划）。
 
 本计划采用分阶段、可独立验证的策略，确保每一步都能通过仓库要求的格式、clippy、测试 gate，并与 config/mail 的演进保持一致。

@@ -1,6 +1,10 @@
 # Vault 模块现状与改进计划
 
-本文档记录 `monoengine` 当前 `vault` 模块的实现形态、主要风险、与配置系统的依赖关系，以及后续分阶段改进计划。本文与 `docs/config.md` 中关于敏感配置、`SecretRef`、最小 DB/Vault bootstrap 和 `core_key.json` 加固的约束保持一致。
+本文档记录 `monoengine` 当前 `vault` 模块的实现形态、主要风险、与配置系统的依赖关系，以及后续分阶段改进计划。本文与 `config.md` 中关于敏感配置、`SecretRef`、最小 DB/Vault bootstrap 和 `core_key.json` 加固的约束保持一致。
+
+> **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
+
+> **集成测试指引**：本计划的各阶段应通过 **`integration.md`** 中定义的集成测试进行端到端验证，特别是 Vault 初始化、Secret 存储与轮换、fail-closed 行为和最小 bootstrap 能力应在 Docker 环境中完整测试。
 
 ## 当前实现概览
 
@@ -9,7 +13,7 @@
 - `src/vault/integration/vault_core.rs`：封装 `libvault_core::RustyVault`，提供 `VaultCore` 和 `VaultCoreInterface`。
 - `src/vault/integration/jupiter_backend.rs`：将 RustyVault 的物理存储后端适配到 `jupiter` 数据库存储。
 - `src/jupiter/storage/vault_storage.rs`：通过 SeaORM 读写 `vault` 表，提供 `list_keys`、`load`、`save`、`delete`、`delete_all`。
-- `src/context/mod.rs`：在 `AppContext::new` 中构造 `Storage`、Redis 连接和 `VaultCore`。
+- `src/context/mod.rs`：在 `AppContext::new` 中构造 `Storage`、Redis 连接、`VaultCore`，随后在 vault 之后启动 mail/notification dispatcher。
 - `src/server/ssh_server.rs`：通过 vault 保存或读取 `ssh_server_key`。
 - `src/vault/pgp.rs`、`src/vault/nostr.rs`、`src/vault/pki.rs`：基于 `VaultCore` 扩展 PGP、Nostr、PKI 能力。
 
@@ -30,7 +34,9 @@ Config::new
   -> Storage::new(config)          # 建数据库连接、构造对象存储、初始化部分存储能力
   -> init_connection(redis)        # 连接 Redis
   -> VaultCore::new(storage)       # vault 此时才就绪
-  -> HTTP / SSH / 后台任务继续初始化
+  -> SmtpMailer + EmailDispatcher  # mail 启用时，vault 之后启动邮件 outbox dispatcher
+  -> init_monorepo
+  -> HTTP / SSH / multi 服务分发
 ```
 
 该顺序形成硬约束：
@@ -38,7 +44,7 @@ Config::new
 - `database.db_url` / 数据库密码属于引导配置，不能进入本项目 vault。
 - `redis.url` 当前在 vault 前被消费，暂时不能进入本项目 vault。
 - `object_storage.s3.access_key_id` / `secret_access_key` 当前在 `Storage::new` 中、vault 前被消费，暂时不能进入本项目 vault。
-- `mail.password` 的消费晚于 vault 就绪，是第一批较合理的可迁移凭据。
+- `mail.password` 的消费晚于 vault 就绪；当前在 `AppContext::new` 中构造 `SmtpMailer` 并启动 `EmailDispatcher`，是第一批较合理的可迁移凭据。
 - `config secret set/check`、`config validate --resolve-secrets` 不能复用完整 `AppContext`，必须使用最小 DB/Vault bootstrap。
 
 任何试图在 `Config::new` 中读取 vault secret 的方案都不可行，因为 `Config::new` 是同步加载阶段，且此时 vault 还没有就绪。
@@ -62,15 +68,16 @@ main()                                          src/main.rs:34
 【异步阶段 · #[tokio::main] 启动 runtime】       src/commands/service/mod.rs:24
 service::exec(config, args)
 └─ AppContext::new(config).await               src/context/mod.rs:24
-   ├─ Storage::new(config)                      src/context/mod.rs:27
-   │   ├─ database_connection(&database)        src/jupiter/storage/mod.rs:160  建 DB 连接池
-   │   ├─ ObjectStorageFactory::build(..)       src/jupiter/storage/mod.rs:175  ★ 对象存储（vault 前）
-   │   └─ init_default_sidebars(&sidebar)       src/jupiter/storage/mod.rs:189
-   ├─ init_connection(&config.redis)            src/context/mod.rs:30           ★ Redis（vault 前）
-   ├─ VaultCore::new(storage.clone())           src/context/mod.rs:33   ◀── vault 在此初始化
-   └─ mono_service.init_monorepo(&monorepo)     src/context/mod.rs:36           （vault 之后）
+   ├─ Storage::new(config)                      src/context/mod.rs:33
+   │   ├─ database_connection(&database)        src/jupiter/storage/mod.rs:191  建 DB 连接池
+   │   ├─ ObjectStorageFactory::build(..)       src/jupiter/storage/mod.rs:206  ★ 对象存储（vault 前）
+   │   └─ init_default_sidebars(&sidebar)       src/jupiter/storage/mod.rs:219-221
+   ├─ init_connection(&config.redis)            src/context/mod.rs:36           ★ Redis（vault 前）
+   ├─ VaultCore::new(storage.clone())           src/context/mod.rs:39   ◀── vault 在此初始化
+   ├─ SmtpMailer + EmailDispatcher spawn        src/context/mod.rs:46-55        （vault 之后，mail 启用时）
+   └─ mono_service.init_monorepo(&monorepo)     src/context/mod.rs:60-64        （vault 之后）
 └─ 分发 http::exec / ssh::exec / multi::exec    src/commands/service/mod.rs:34-36
-      └─（SSH 路径）读/生成 ssh_server_key       src/server/ssh_server.rs:78     ← 首个 vault 消费者
+      └─（SSH 路径）读/生成 ssh_server_key       src/server/ssh_server.rs:78     ← vault 后续消费者之一
 ```
 
 ### Vault 内部时序（`VaultCore::new` → `config`）
@@ -109,6 +116,7 @@ sequenceDiagram
     participant VC as VaultCore
     participant RV as RustyVault
     participant DB as vault 表 (JupiterBackend)
+    participant MAIL as Mail/Notification
     participant SRV as http/ssh 服务
 
     M->>CLI: parse(None)
@@ -136,6 +144,7 @@ sequenceDiagram
         VC->>RV: unseal(shares[i]) assert ok
     end
     VC-->>AC: VaultCore（vault 就绪）
+    AC->>MAIL: SmtpMailer::new + EmailDispatcher::new + spawn（mail 启用时）
     AC->>ST: mono_service.init_monorepo()（vault 之后）
     AC-->>SVC: AppContext
     SVC->>SRV: http::exec / ssh::exec / multi::exec
@@ -144,9 +153,9 @@ sequenceDiagram
 
 ### 时序中的关键事实
 
-- vault 就绪点是唯一的 `VaultCore::new`（`context/mod.rs:33`）；在它之前已消费 DB、对象存储（`Storage::new` 内 `:175`）、Redis（`:30`）——这正是“启动依赖顺序”把这三类判为引导 / 早期运行时依赖、不能直接改 `SecretRef` 的代码依据。
-- `mail.password` 的消费点（HTTP 服务启动后构造 SMTP mailer）晚于 vault，是第一批可迁移凭据。
-- `init_monorepo` 在 vault 之后、服务启动之前执行（`context/mod.rs:36`），简化版顺序图省略了这一步。
+- vault 就绪点是唯一的 `VaultCore::new`（`context/mod.rs:39`）；在它之前已消费 DB、对象存储（`Storage::new` 内 `:206`）、Redis（`:36`）——这正是“启动依赖顺序”把这三类判为引导 / 早期运行时依赖、不能直接改 `SecretRef` 的代码依据。
+- `mail.password` 的消费点（`SmtpMailer::new`，随后 `EmailDispatcher::new` + spawn）在 `context/mod.rs:46-55`，晚于 vault，是第一批可迁移凭据。当前失败路径仍会被 `if let Ok(m)` 静默忽略，需要后续可诊断化。
+- `init_monorepo` 在 mail/notification dispatcher 启动之后、服务分发之前执行（`context/mod.rs:60-64`）。
 - tracing subscriber 在 `cli.rs:44` 就已安装，早于 vault；因此 `VaultCore::config` 的 `println!`（:71/:83/:93/:103）与 `log::debug!(root_token)`（:114）会真的把 root token / 分片写进 stdout 与日志（详见“当前主要问题 · root token 明文输出”）。
 - 分支 A 的 `delete_all()`（:74）仅凭 `core_key.json` 不存在即触发，无法区分“全新空库首启”与“误删 key 但库内有数据”（详见“fail-closed 判定依据必须区分首次初始化与误删 key”）。
 
@@ -284,7 +293,7 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 - unseal 分片 rekey：`core_key.json` 疑似泄露后，在不丢数据的前提下重新生成分片与 root token。
 - 业务 secret 轮换（例如周期性更换 `mail.password`）。
 
-更关键的是，阶段 A 把 key 缺失改为 fail-closed 是正确的，但 fail-closed 的另一面是“缺少恢复路径就等于 key 丢失即永久数据丢失”。文档要求把 `core_key.json` 排除出镜像 / 日志 / 备份，却没有定义 key material 的安全托管位置与恢复流程。必须明确：分片 / root token 的安全备份位置（外部 secret manager、离线托管等）、恢复步骤，以及“DB 数据尚在但 key 丢失”时的 rekey / 恢复预案（见阶段 J）。这与 `docs/config.md` 中“Vault 加固是 SecretRef 生产化迁移硬前置”的约束一致。
+更关键的是，阶段 A 把 key 缺失改为 fail-closed 是正确的，但 fail-closed 的另一面是“缺少恢复路径就等于 key 丢失即永久数据丢失”。文档要求把 `core_key.json` 排除出镜像 / 日志 / 备份，却没有定义 key material 的安全托管位置与恢复流程。必须明确：分片 / root token 的安全备份位置（外部 secret manager、离线托管等）、恢复步骤，以及“DB 数据尚在但 key 丢失”时的 rekey / 恢复预案（见阶段 J）。这与 `config.md` 中“Vault 加固是 SecretRef 生产化迁移硬前置”的约束一致。
 
 ### fail-closed 判定依据必须区分首次初始化与误删 key
 
@@ -307,9 +316,98 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 | `redis.url` | `AppContext::new` 中 vault 前连接 Redis | 早期运行时依赖 | 暂时不能进本项目 vault；若含密码应走部署平台 secret 并脱敏日志 |
 | `object_storage.s3.*` | `Storage::new` 中 vault 前构造对象存储 | 早期运行时依赖 | 暂时不能进本项目 vault；需先重构初始化顺序 |
 | `orion_server.db_url` | Orion 相关配置 | 引导或独立服务配置 | 不默认纳入 monoengine vault；按 Orion 启动依赖单独判断 |
-| `mail.password` | HTTP 服务启动后构造 SMTP mailer | 可迁移凭据 | 第一批可改为 `SecretRef` |
+| `mail.password` | `AppContext::new` 中 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher` | 可迁移凭据 | 第一批可改为 `SecretRef`；构造失败需从静默忽略改为可诊断处理 |
 | `ssh_server_key` | SSH server 启动时读取或生成 | vault 内部 secret | 已由 vault 管理，但需要加固错误处理和 key 文件安全 |
 | PGP / Nostr key | `vault/pgp.rs`、`vault/nostr.rs` | vault 内部 secret | 已由 vault 管理，但需要清理 panic 与数据 shape 校验 |
+
+## 必须先完成的前置工作（2026-06-14）
+
+在启动本计划的任何阶段之前，以下前置条件必须满足或明确规划：
+
+### 1. 日志脱敏工具（redaction 模块）设计与实现
+
+**目标**：建立统一的敏感信息脱敏工具，供 config、vault、mail、notification 等模块共享使用。
+
+**位置建议**：`src/common/redaction.rs` 或 `src/config/redaction.rs`
+
+**职责范围**：
+- 脱敏 URL（移除密码和关键参数）
+  - 示例：`postgres://user:password@host:5432/db` → `postgres://***:***@host:5432/db`
+- 脱敏 token 和密钥
+  - 示例：`secret_abc123xyz` → `secret_***`
+- 脱敏 Vault 相关信息
+  - root token：完整隐藏
+  - secret shares：完整隐藏
+  - secret 值：完整隐藏（仅保留路径）
+- 脱敏配置相关信息
+  - 数据库 URL 中的密码
+  - Redis URL 中的密码
+  - 对象存储密钥
+
+**API 设计建议**：
+```rust
+pub trait Redactor {
+    /// 脱敏字符串（通用脱敏策略）
+    fn redact(&self, value: &str) -> String;
+    
+    /// 脱敏数据库 URL
+    fn redact_db_url(&self, url: &str) -> String;
+    
+    /// 脱敏 Redis URL
+    fn redact_redis_url(&self, url: &str) -> String;
+    
+    /// 脱敏密钥/token（假设是不可见字符或长字符串）
+    fn redact_secret(&self, value: &str) -> String;
+    
+    /// 脱敏 JSON（递归处理，隐藏 password、token、secret 等关键字段）
+    fn redact_json(&self, json_str: &str) -> String;
+}
+
+pub fn global_redactor() -> &'static dyn Redactor;
+```
+
+**在 vault 中的使用点**：
+- 阶段 A 中删除日志输出时：使用 `redactor.redact_secret(root_token)` 替代完整输出
+- 错误信息中：使用 `redactor.redact_json()` 处理 `CoreKey` 反序列化失败的错误信息
+- `VaultError` 的 `Display` 实现中：所有敏感字段都应经过脱敏
+
+**前置条件**：
+- **必须在 vault 阶段 A 开始前就绪**
+- 可作为**独立前置工作**先完成
+- 不被任何其他阶段阻塞
+
+**验收标准**：
+- 脱敏工具能被 config、vault、mail、notification 等模块导入使用
+- 单元测试覆盖所有脱敏类型
+- 脱敏后的输出不包含明文敏感信息（token、密码、shares 等）
+
+---
+
+### 2. CLI 两阶段加载框架（与 config 团队协同）
+
+**目标**：与 config.md 阶段 2 协同设计 `LoadMode` 框架，为两个模块都需要的 CLI 改造提供统一的设计。
+
+**设计范围**：
+- 定义 `LoadMode` enum（所有可能的加载级别）
+- 明确各模式的启动路径和依赖
+- 定义命令与加载模式的映射关系
+
+**期望产出**：
+- 共同设计文档或 RFC
+- `src/cli/load_mode.rs` 或等价的设计代码框架
+
+**前置条件**：
+- 阶段 D（P1）需要与 config 阶段 2 协同完成此设计
+- 不能分别实施，否则会出现不一致
+
+---
+
+### 3. 与 config.md 的进度协调
+
+**关键约束**：
+- **阶段 B（最小 bootstrap）应在 config 阶段 3 之前完成**，或至少同期进行
+- config 阶段 3 直接依赖 vault B 的改造结果
+- 两个团队应协商明确的交付顺序和时间表，避免 config 因等待 vault 而延期
 
 ## 改进原则
 
@@ -327,9 +425,16 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 
 ## 分阶段计划
 
+> **关键前置依赖声明（2026-06-14 更新）**：本计划中的所有阶段都依赖于以下跨模块前置：
+> 1. **日志脱敏工具（redaction，来自 config.md 阶段 0b）**：阶段 A 需要删除 root token 输出，必须依赖统一的脱敏工具。建议 config 的阶段 0b 或作为独立前置优先完成此工具，使其可供 vault、mail、notification 等模块使用。
+> 2. **CLI 两阶段加载框架（来自 config.md 与 vault 的协同设计）**：阶段 D 需要在 CLI 层实现 LoadMode，这应与 config.md 阶段 2 作为单一跨模块设计完成，而非分别实施。建议先由两个团队协同定义 `LoadMode` enum，再各自在对应阶段使用。
+> 3. **阶段 B（最小 bootstrap 拆分）必须在 config.md 阶段 3 之前或同期完成**，因为 config 直接依赖 vault B 的改造结果。
+
 ### 阶段 A：Vault 安全止血
 
 目标：在迁移任何配置 secret 前，消除最危险的泄露和数据丢失路径。
+
+> **前置依赖**：本阶段的工作项 1-2（删除 root token 输出）需要日志脱敏工具支持。建议 config.md 的脱敏工具或独立前置先完成，使该工具可供本阶段使用。
 
 工作项：
 
@@ -352,6 +457,8 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 ### 阶段 B：拆出最小 DB/Vault bootstrap seam
 
 目标：让 vault 运维命令不依赖完整 `AppContext`。
+
+> **与 config.md 的强绑定（2026-06-14 更新）**：本阶段的改造结果是 config.md 阶段 3 的直接依赖。config 需要基于本阶段拆出的最小 bootstrap 能力来实现 `config secret set/check` 等命令。因此本阶段应**在 config.md 阶段 3 之前完成，或至少同期进行**，以避免 config 因等待而延期。
 
 工作项：
 
@@ -389,9 +496,14 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 
 目标：为 `config secret` 命令提供正确启动模型。
 
+> **与 config.md 的协同设计（2026-06-14 更新）**：本阶段的工作项 1（在 CLI 层支持两阶段加载和 LoadMode）是与 config.md 阶段 2 的**跨模块协同改造**，而非独立实施。两个文档都发现了相同的需求，应作为单一设计完成。建议：
+> - 先由 config + vault 团队协同设计 `LoadMode` 框架（定义 enum、各模式的启动路径、依赖关系等），输出为共同文档或代码（如 `src/cli/load_mode.rs`）
+> - config.md 阶段 2 和 vault.md 阶段 D 都基于这个共同框架来实现各自的子命令
+> - 避免分别实施导致的设计不一致或集成冲突
+
 工作项：
 
-1. 先在 CLI 层支持两阶段加载和 `LoadMode`。
+1. **先在 CLI 层支持两阶段加载和 `LoadMode`**（与 config.md 阶段 2 协同完成）：在共同的 `LoadMode` 设计框架下，改造 CLI 分发逻辑以支持不同的启动模式。
 2. 新增不依赖 vault 的 `monoengine config secret ref`。
 3. 基于最小 DB/Vault bootstrap 新增 `config secret set`。
 4. 基于最小 DB/Vault bootstrap 新增 `config secret check`。
@@ -526,23 +638,41 @@ Config::new
 - 文档化的恢复 runbook 可在 key 丢失（数据在）场景下恢复访问或安全重置。
 - secret 轮换不需要重启全部依赖该 secret 的服务，或明确其重启要求。
 
+### 与其他文档的协调关系（2026-06-14 更新）
+
+| vault 阶段 | 主要工作 | 对 config 的依赖 | 对 mail 的依赖 | 对 notification 的依赖 |
+|----------|--------|------------|-----------|-----------------|
+| **A** (P0) | 安全止血 | ← config 0b 的脱敏工具 | 支持后续日志脱敏 | 支持后续日志脱敏 |
+| **B** (P1) | 最小 bootstrap 拆分 | → config 3 依赖此 | 无 | 无 |
+| **C** (P1) | 收窄 interface | 无 | 支持后续类型安全 | 支持后续类型安全 |
+| **D** (P1) | CLI LoadMode | ← 与 config 2 协同 | 支持后续运维 | 支持后续运维 |
+| **E** (P2) | SecretRef 迁移 | 与 config 5 协同 | mail 作为第一消费者 | 后续支持 |
+| **F-J** (P2-P4) | 增强与长期 | 部分依赖 config 的 validate 等 | 无 | 无 |
+
+**关键同步点：**
+1. **日志脱敏工具（来自 config 0b）→ vault A**：vault 的 P0 项无法在缺少脱敏工具时完成
+2. **vault B 完成 → config 3 依赖**：config 必须等待 vault 的 bootstrap 拆分
+3. **CLI LoadMode 框架（config 2 与 vault D 协同）**：两个文档需共同设计而非分别实施
+
 ## 推荐优先级
 
-| 优先级 | 工作 | 原因 |
-| --- | --- | --- |
-| P0 | 删除 root token 输出、初始化返回 `Result` / `VaultError`（不泄敏） | 迁移任何 secret 前的安全前置 |
-| P0 | 以“DB 是否已初始化”为准的 fail-closed，替换清库重建的行为和测试 | 旧行为会灾难性丢数据；纯文件判定又会误伤全新部署 |
-| P1 | 拆出最小 DB/Vault bootstrap seam | `config secret set/check` 的必要条件 |
-| P1 | 收窄 vault interface，隐藏 token 和 raw path | 降低误用和泄露风险 |
-| P1 | Secret 访问审计（阶段 H） | 集中凭据托管的审计基线 |
-| P1 | key 丢失 / 泄露的备份恢复 runbook（阶段 J 第 2–3 项） | fail-closed 必须配套恢复路径，否则 key 丢失即永久数据丢失 |
-| P2 | `config secret ref/set/check` | 形成标准运维入口 |
-| P2 | `SecretRef` + resolver + `mail.password_ref` | 第一批可迁移凭据 |
-| P2 | root token 退役与最小权限 policy（阶段 I） | 避免“全程 root”，符合 root token 生命周期 |
-| P3 | 清理 SSH/PGP/Nostr panic | 提升 vault 数据损坏时的可恢复性 |
-| P3 | key / 分片 rekey 与 secret 轮换（阶段 J 第 1、4 项） | 泄露后可恢复，不必清库重建 |
-| P4 | 对象存储后置初始化 | 只有 S3 凭据要进 vault 时才需要 |
-| P4 | 外部 KMS / transit auto-unseal | 缓解磁盘读取威胁，需部署侧支持 |
+| 优先级 | 工作 | 原因 | 前置 |
+| --- | --- | --- | --- |
+| **P0** | **建立日志脱敏工具**（可作为独立前置） | 阶段 A 的必要条件 | 无（独立） |
+| **P0** | 删除 root token 输出、初始化返回 `Result` / `VaultError`（不泄敏） | 迁移任何 secret 前的安全前置 | 脱敏工具 |
+| **P0** | 以”DB 是否已初始化”为准的 fail-closed，替换清库重建的行为和测试 | 旧行为会灾难性丢数据；纯文件判定又会误伤全新部署 | 无 |
+| **P1** | **设计 CLI LoadMode 框架**（与 config 团队协同） | 阶段 D 与 config 2 的必要条件 | 无（协同） |
+| **P1** | 拆出最小 DB/Vault bootstrap seam | `config secret set/check` 与 config 3 的必要条件；应在 config 3 之前或同期完成 | 无 |
+| **P1** | 收窄 vault interface，隐藏 token 和 raw path | 降低误用和泄露风险 | 无 |
+| **P1** | Secret 访问审计（阶段 H） | 集中凭据托管的审计基线 | 阶段 A/B/C |
+| **P1** | key 丢失 / 泄露的备份恢复 runbook（阶段 J 第 2–3 项） | fail-closed 必须配套恢复路径 | 阶段 A |
+| **P2** | `config secret ref/set/check` | 形成标准运维入口 | 阶段 B、D + config 3/4 |
+| **P2** | `SecretRef` + resolver + `mail.password_ref` | 第一批可迁移凭据 | 阶段 A/B/C/E + config 5 + mail 2 |
+| **P2** | root token 退役与最小权限 policy（阶段 I） | 避免”全程 root”，符合 root token 生命周期 | 阶段 A/B/C |
+| **P3** | 清理 SSH/PGP/Nostr panic | 提升 vault 数据损坏时的可恢复性 | 阶段 A/B |
+| **P3** | key / 分片 rekey 与 secret 轮换（阶段 J 第 1、4 项） | 泄露后可恢复，不必清库重建 | 阶段 A/B/E |
+| **P4** | 对象存储后置初始化 | 只有 S3 凭据要进 vault 时才需要 | 阶段 A/B + config 7 |
+| **P4** | 外部 KMS / transit auto-unseal | 缓解磁盘读取威胁，需部署侧支持 | 阶段 A/B/J |
 
 ## 架构 deepening 机会
 
