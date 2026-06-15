@@ -14,6 +14,21 @@
 > - **阶段 J（轮换/rekey）**：unseal 分片 rekey（`generate_unseal_keys()`，`core.rs:591`）与一次性解封（`unseal_once()`，`core.rs:534`）可用；但 **KEK 轮换无内建原语**（`init()` 后 KEK 不可变，无 `sys/rotate` 等价能力），需另立专项或暂不承诺。
 > - **PKI**：新 libvault 的 PKI 按证书类型分域（`tls`/`ssh`/`pgp`），调用路径已变（如 `pki/root/tls/generate/internal`、`pki/ca/tls/pem`），`src/vault/pki.rs` 已随迁移同步。
 
+> **落地可行性分析补充（2026-06-16）**：基于对当前代码（src/vault/integration/vault_core.rs、jupiter_backend.rs、context/mod.rs、ssh_server.rs、pgp.rs、nostr.rs、pki.rs 等）、libvault vendored 源码、其他 refactoring 文档以及 AGENTS.md 的核查，结论如下：
+>
+> - **vault-only 核心链路（A 止血子集、B、C、F）具备直接落地条件**。文档描述的缺陷（root token println+/log::debug+、delete_all on key miss、expect/assert/unwrap 于初始化、JupiterBackend 绑全量 Storage、VaultCoreInterface 暴露 token/raw api、消费端大量 unwrap/panic、reinitialize 测试固化危险行为）与磁盘上代码**完全一致**，无需等待任何尚不存在的 src/ 组件。
+> - **libvault 能力核查确认**：`RustyVault::inited()` / `core.load().inited()`、`unseal_once()`、`generate_unseal_keys()` 均可用；policy 与 token 原语（sys/policy/*、auth/token/create）开箱可达；`sys/audit` handler 存在但按修订说明为桩（handler 返回 Ok(None)）；PKI 域路径已在 pki.rs 中部分对齐。阶段 H 走 interface hook、I 编排内建、J 分片 rekey 的判断均成立。
+> - **跨模块阻塞判断准确**：`src/` 中不存在 redaction 模块、`LoadMode`、`SecretRef`/`resolver`、`config secret` 命令族，与文档"未实现"声明一致。因此 D/E/G 仍为真阻塞；A 核心止血（删除敏感输出 + fail-closed + 权限 + Result 化）可与 redaction 解耦立即推进。
+> - **实施面影响**：将 `VaultCore::new/config` 改为 `Result` 会要求 `AppContext::new` 调整（当前为 infallible + expect），并波及 `commands/service/*`、`chat_migrate.rs` 等调用点。这比"纯 vault 局部"略宽，建议在 A2 切片中显式纳入最小调用方适配，或先在 vault 内部做可失败初始化再由 context 决定上层策略。Storage::new 现已返回 `Result`，是正向进展（context 仍 expect）。
+> - **AGENTS.md 硬门禁**：任何后续代码变更（即使仅为本计划的 P0 子集）都必须在提交前通过：
+>   1. `cargo +nightly fmt --all --check`（无 diff）
+>   2. `cargo clippy --all-targets --all-features -- -D warnings`（0 warning/0 error）
+>   3. `source .env.test && cargo test --all`（0 失败）。若 `.env.test` 不存在，必须先询问环境提供者；不得静默回退到无 DB 的 `cargo test`。
+>   变更必须最小化、复用 `jupiter::tests::test_storage` / `test_db_connection` + `apply_migrations`，禁止新增 blanket `#[allow]`。
+> - **其他约束**：工作区为 Libra 格式，状态/差异检查用 `libra` 命令；集成测试按 `integration.md` 要求在 Docker 中覆盖 fail-closed、最小 bootstrap、初始化路径；备份恢复 runbook 必须与 fail-closed 配套（key 丢失场景）。
+>
+> 总体：**vault 本地 P0 止血与 P1 结构拆分在当前仓库状态下技术可行、依赖清晰、风险可控**；执行时严格按文档内"建议执行切片"与本分析的边界推进，即可避免被跨模块前置或 AGENTS 门禁阻塞。文档其余部分（阶段描述、验收、边界）经本次核查无需结构性调整，仅补充本小节与少量执行提示。
+
 ## 当前实现概览
 
 `vault` 模块位于 `src/vault/`，核心集成代码在 `src/vault/integration/`：
@@ -33,7 +48,7 @@
 
 因此，后续把可迁移凭据写入 vault 时，不需要重新发明 secret 存储能力。真正需要补齐的是安全加固、初始化语义、错误模型、最小 bootstrap、运维命令和配置侧的 `SecretRef` resolver。
 
-## 当前实现状态速览表（2026-06-15）
+## 当前实现状态速览表（2026-06-15；2026-06-16 核查确认状态未变）
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 | --- | --- | --- |
@@ -433,7 +448,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 - config 阶段 3 直接依赖 vault B 的改造结果
 - 两个团队应协商明确的交付顺序和时间表，避免 config 因等待 vault 而延期
 
-## 可执行性评估（2026-06-15 核查）
+## 可执行性评估（2026-06-15 核查；2026-06-16 补充验证通过，详见文首"落地可行性分析补充"）
 
 本节按"当前代码与依赖的实际状态"核查各阶段能否立即执行，仅调整可行性与排期，不改动代码。核查基于 monoengine 当前 `src/` 与仓库内 vendored `libvault`。
 
@@ -497,7 +512,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 为了避免一个 PR 同时触碰初始化语义、CLI、配置解析和业务消费端，建议按以下可回滚切片推进：
 
 1. **A1 直接止血**：删除 root token / 分片 / key 文件内容输出，避免新增脱敏依赖；只改初始化路径和对应测试。
-2. **A2 初始化语义**：`VaultCore::new/config` 返回 `Result`，fail-closed 以 DB 初始化状态为准，移除普通启动中的 `delete_all()` 数据丢失路径。
+2. **A2 初始化语义**：`VaultCore::new/config` 返回 `Result`，fail-closed 以 DB 初始化状态为准，移除普通启动中的 `delete_all()` 数据丢失路径。**注意**：此步需同步处理 `AppContext::new` 及直接调用点的错误传播（属于允许的最小波及，见"下一步建议"执行边界）。
 3. **A3 key material 权限**：Unix 权限 `0700`/`0600` 与权限断言测试；非 Unix 平台只验证不放宽现有行为。
 4. **B 最小 bootstrap**：拆 `JupiterBackend` 的 storage 边界，但不新增 `config secret` 命令。
 5. **C/H interface 与审计入口**：先隐藏 token/raw path，再挂审计 hook；审计目的地与 fail-open/fail-closed 策略须在实现前明确。
@@ -509,6 +524,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 - 不实现 `config secret set/check`，直到 `LoadMode` 与最小 bootstrap 都就绪。
 - 不把 DB、Redis、S3 凭据迁入本项目 vault，除非先完成对应启动顺序重排。
 - 不承诺 KEK 轮换，除非另立 libvault 数据重加密专项。
+- （2026-06-16 分析确认）首批落地切片**仅限 vault 相关文件 + 必要的 context/命令调用方最小适配**；严禁在 A1-A3 阶段混入 SecretRef、LoadMode、redaction 实现或 config 命令。所有代码变更必须先通过 AGENTS.md 三大门禁验证。
 
 ## 改进原则
 
@@ -866,21 +882,29 @@ Config::new
 
 ## 下一步建议
 
-第一批 PR 应只做 P0，范围控制在 vault 安全止血：
+**重要：本次任务仅完成文档分析与修订，未执行任何代码改动或验证命令。** 所有实现工作须由后续独立变更单独负责，并**必须**满足 AGENTS.md 全部要求。
+
+第一批 PR 应只做 P0，范围严格控制在 vault 安全止血（对应 A1+A2+A3 切片）：
 
 1. `VaultCore::new` / `VaultCore::config` 改为返回 `Result`，引入不泄敏的 `VaultError`。
 2. 删除 root token、分片、key 文件内容的所有输出（stdout / stderr / tracing）。
 3. fail-closed 以 `rvault…inited()` 为准：DB 已初始化但 key 缺失即失败、不清库；空 DB 无 key 仍可合法首次初始化。
 4. key 文件和目录创建时设置权限（目录 `0700`、`core_key.json` `0600`）。
 5. 把 `test_vault_reinitialize_after_file_loss` 改为：DB 已初始化时缺 key 不清空数据，并新增空 DB 首次初始化用例。
-6. 更新调用方（至少 `AppContext::new`、`ssh_server.rs`），让启动失败返回可诊断错误。
+6. 更新调用方（至少 `AppContext::new` 返回错误传播、`ssh_server.rs` 读取/生成失败处理），让启动失败返回可诊断错误。注意：此项会引入少量 context/commands 侧适配，属于 A2 允许的最小波及范围。
 
-**首批 PR 执行边界：**
+**首批 PR 执行边界（2026-06-16 分析更新）：**
 
-- 允许改动：`src/vault/integration/vault_core.rs`、相关 vault 单元测试、必要的 `AppContext::new` 返回错误传递、SSH 读取失败的最小适配。
-- 允许新增：局部 `VaultError` / `VaultResult`、权限设置辅助函数、只覆盖初始化语义的测试用例。
-- 暂不纳入：`config secret` 命令、`LoadMode`、`SecretRef` / resolver、mail password 迁移、对象存储初始化顺序重排、KEK 轮换。
-- 评审重点：启动日志和错误字符串不得含 root token / 分片；DB 已初始化但 key 缺失时不得调用 `delete_all()`；空 DB 首启仍可初始化；所有新增失败路径返回错误而不是 panic。
+- 允许改动：`src/vault/integration/vault_core.rs` 及其 tests、`src/vault/integration/jupiter_backend.rs`（若 B 同期小步）、`src/context/mod.rs`（最小错误传递）、`src/server/ssh_server.rs`（最小错误返回）、vault 其他消费端中仅初始化/读取路径的 panic 清理（F 可后续批次）。
+- 允许新增：局部 `VaultError` / `VaultResult`（建议放 `vault/integration/vault_core.rs` 内或 `src/vault/error.rs`）、Unix 权限辅助（cfg 守卫）、只覆盖初始化语义与 fail-closed 的测试用例。
+- **绝对禁止**（本阶段）：`config secret` 命令族、LoadMode、SecretRef / resolver 实现、mail password 迁移、对象存储初始化顺序重排、KEK 轮换、libvault 源码修改、redaction 模块。
+- 评审重点：启动日志和错误字符串**不得**含 root token / 分片 / 明文 secret；DB 已初始化但 key 缺失时**绝不**调用 `delete_all()`；空 DB 首启仍可成功初始化并写 key；所有新增失败路径返回错误而不是 panic；权限代码在非 Unix 平台不放宽行为。
+- **强制前置验证（AGENTS.md）**：实现 PR 在任何 push / review 前必须本地通过：
+  - `cargo +nightly fmt --all --check`（必须 clean，无 diff）
+  - `cargo clippy --all-targets --all-features -- -D warnings`（必须 0 warning、0 error；不得用 blanket allow 掩盖）
+  - `source .env.test && cargo test --all`（必须全部通过）。若当前环境缺少 `.env.test`，实现前必须向环境维护者索取；**严禁**省略此步骤或用无 DB 测试冒充。
+  - 额外：`cargo build` 与 `cargo build --tests` 应 0 error 0 warning（作为快速烟雾）。
+- 变更哲学：最小化、跟随现有模式（复用 jupiter tests 辅助、MegaError、tracing 日志而非 println、snake_case 文件等）。新增类型作用域尽量小。
 
 **Libra 工作区检查：**
 
@@ -889,3 +913,5 @@ Config::new
 - 提交或评审时只纳入本阶段允许范围内的文件；若工作区已有不相关改动，应保持原样并在 PR / 交付说明中标明未触碰。
 
 这一步完成前，不建议开始 `SecretRef`、`mail.password_ref` 或对象存储凭据迁移。备份恢复 runbook（P1）应与 fail-closed 同期或紧随其后落地——否则 fail-closed 会把“key 丢失”从“自动重建”变成“无法恢复”。审计（阶段 H）与 root token 退役（阶段 I）应在迁移更多生产凭据前完成，以满足 Vault 安全标准。
+
+**与本次任务的边界说明**：2026-06-16 的本次变更**仅修改了本规划文档**（插入可行性分析小节、更新日期/边界表述、强化 AGENTS 门禁与实施提示），**未改动任何 src/ 代码、Cargo.toml、测试或配置**。文档修订本身不触发构建/测试门禁，但为未来真实落地提供了经核查的执行依据。后续任何实际编码任务必须独立开启、独立评审、独立通过三大门禁。
