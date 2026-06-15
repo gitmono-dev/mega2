@@ -27,6 +27,7 @@ pub mod merge_queue_storage;
 pub mod message_storage;
 pub mod mono_storage;
 pub mod note_storage;
+pub mod notification_storage;
 pub mod open_graph_storage;
 pub mod reaction_storage;
 pub mod stg_common;
@@ -78,12 +79,12 @@ use crate::{
             message_storage::MessageStorage,
             mono_storage::MonoStorage,
             note_storage::NoteStorage,
+            notification_storage::NotificationStorage,
             open_graph_storage::OpenGraphStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
             webhook_storage::WebhookStorage,
-            notification_storage::NotificationStorage,
         },
     },
 };
@@ -579,9 +580,7 @@ impl Storage {
             lfs_service: LfsService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
-            notification_storage: NotificationStorage::new(Arc::new(
-                dummy_db,
-            )),
+            notification_storage: NotificationStorage::new(Arc::new(dummy_db)),
         }
     }
 }

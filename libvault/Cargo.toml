@@ -1,0 +1,108 @@
+[package]
+name = "libvault"
+version = "0.2.2"
+edition = "2024"
+authors = ["rk8s-dev team"]
+description = "the libvault is modified from RustyVault"
+repository = "https://github.com/rk8s-dev/rk8s/tree/main/project/libvault"
+build = "build.rs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+serde = { version = "1.0.228", features = ["derive", "rc", "alloc"] }
+serde_derive = "1.0.228"
+serde_json = "1.0.145"
+serde_bytes = "0.11.14"
+serde_yaml = "0.9.34"
+go-defer = "0.1.0"
+rand = "0.9.0"
+derivative = "2.2.0"
+enum-map = "2.6.1"
+strum = { version = "0.25.0", features = ["derive"] }
+strum_macros = "0.25.0"
+radix_trie = "0.2.1"
+lazy_static = "1.5.0"
+regex = "1.12.2"
+hcl-rs = "0.18.0"
+log = "0.4.28"
+hex = "0.4.3"
+humantime = "2.1.0"
+as-any = "0.3.1"
+pem = "3.0.0"
+chrono = { version = "0.4.42", features = ["serde"] }
+zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+bcrypt = "0.17.1"
+url = "2.5.7"
+ureq = { version = "2.10.0", features = ["json"] }
+reqwest = { version = "0.12.24", features = ["json", "rustls-tls"] }
+rustls = "0.23.16"
+rustls-pemfile = "2.1.0"
+webpki-roots = "0.26.3"
+glob = "0.3.1"
+base64 = { version = "0.22.1", features = ["alloc"] }
+ipnetwork = "0.17.0"
+blake2b_simd = "1.0"
+derive_more = "0.99.17"
+dashmap = "6.1.0"
+better_default = "1.0.5"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1.89"
+stretto = "0.8.0"
+priority-queue = "2.1.0"
+crossbeam-channel = "0.5"
+lockfile = "0.4.0"
+arc-swap = "1"
+blake3 = "1.8"
+itertools = "0.14.0"
+etcd-client = { version = "0.17", features = ["tls"], optional = true }
+tracing = "0.1.41"
+builder-pattern = "0.4.2"
+x509-parser = "0.18.0"
+rustls-webpki = "0.103.7"
+pgp = "0.19.0"
+ssh-key = { version = "0.6.7", features = ["std", "crypto"] }
+smallvec = "1.15.1"
+rand_chacha = "0.3.1"
+tonic = "0.14.2"
+openssl = { version = "0.10.73", optional = true }
+openssl-sys = { version = "0.9.109", optional = true }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "postgres", "macros", "migrate", "chrono", "uuid"], optional = true }
+tempfile = "3.20.0"
+
+[build-dependencies]
+toml = "0.8.19"
+
+[dev-dependencies]
+qlean = "0.2.2"
+
+[features]
+default = ["crypto_adaptor_openssl"]
+storage_xline = ["etcd-client"]
+storage_sqlite = ["sqlx/sqlite"]
+storage_pg = ["sqlx/postgres"]
+crypto_adaptor_openssl = ["dep:openssl", "dep:openssl-sys"]
+crypto_adaptor_tongsuo = ["dep:openssl", "dep:openssl-sys"]
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5.0"
+
+[dependencies.foreign-types]
+version = "0.3.2"
+
+[dependencies.libc]
+version = "0.2"
+
+[lints.clippy]
+result_large_err = "allow"
+ptr_arg = "allow"
+let_and_return = "allow"
+should_implement_trait = "allow"
+new_without_default = "allow"
+field_reassign_with_default = "allow"
+await_holding_lock = "allow"
+too_many_arguments = "allow"
+collapsible_match = "allow"
+large_enum_variant = "allow"
+unnecessary_map_or = "allow"

@@ -43,18 +43,17 @@ impl AppContext {
         // Spawns the EmailDispatcher background task (using existing outbox + claim logic).
         // The shutdown token is stored so services can coordinate graceful stop if needed.
         let notification_shutdown = CancellationToken::new();
-        if let Some(mail_cfg) = &config.mail {
-            if mail_cfg.enabled {
-                if let Ok(m) = crate::mail::SmtpMailer::new(mail_cfg) {
-                    let mailer: Arc<dyn crate::mail::Mailer> = Arc::new(m);
-                    let notif_stg = storage.notification_storage();
-                    let dispatcher = crate::notification::EmailDispatcher::new(notif_stg, mailer);
-                    let sd = notification_shutdown.clone();
-                    tokio::spawn(async move {
-                        dispatcher.run(sd).await;
-                    });
-                }
-            }
+        if let Some(mail_cfg) = &config.mail
+            && mail_cfg.enabled
+            && let Ok(m) = crate::mail::SmtpMailer::new(mail_cfg)
+        {
+            let mailer: Arc<dyn crate::mail::Mailer> = Arc::new(m);
+            let notif_stg = storage.notification_storage();
+            let dispatcher = crate::notification::EmailDispatcher::new(notif_stg, mailer);
+            let sd = notification_shutdown.clone();
+            tokio::spawn(async move {
+                dispatcher.run(sd).await;
+            });
         }
 
         storage

@@ -47,6 +47,7 @@ use crate::{
             message_storage::MessageStorage,
             mono_storage::MonoStorage,
             note_storage::NoteStorage,
+            notification_storage::NotificationStorage,
             open_graph_storage::OpenGraphStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
@@ -131,5 +132,6 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         lfs_service: LfsService::mock(),
         code_review_service: CodeReviewService::mock(),
         webhook_service,
+        notification_storage: NotificationStorage::new(connection.clone()),
     }
 }

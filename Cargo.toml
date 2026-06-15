@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -31,7 +31,7 @@ indexmap = "2.14"
 itertools = "0.14.0"
 lazy_static = "1.5.0"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
-libvault-core = "0.1.0"
+libvault = { path = "libvault" }
 mimalloc = "0.1.52"
 object_store = { version = "0.13.2", features = ["cloud", "aws", "gcp"] }
 once_cell = "1.21.4"
