@@ -28,7 +28,6 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    api_model::common::Pagination,
     bellatrix::Bellatrix,
     callisto::{
         entity_ext::generate_link,
@@ -46,6 +45,7 @@ use crate::{
         errors::MegaError,
         utils::{self, ZERO_ID},
     },
+    contract::api::common::Pagination,
     io_orbit::object_storage::MultiObjectByteStream,
     jupiter::{storage::Storage, utils::converter::FromMegaModel},
 };

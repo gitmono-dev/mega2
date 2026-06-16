@@ -5,7 +5,7 @@ use cedar_policy::{
 use itertools::Itertools;
 use thiserror::Error;
 
-use crate::saturn::{entitystore::EntityStore, util::SaturnEUid};
+use crate::contract::policy::{entitystore::EntityStore, util::SaturnEUid};
 
 pub struct CedarContext {
     pub entities: EntityStore,
@@ -43,7 +43,7 @@ pub enum SaturnContextError {
 #[allow(clippy::result_large_err)]
 impl CedarContext {
     pub fn from(entities: EntityStore, policy_content: &str) -> Result<Self, ContextError> {
-        let (schema, _) = Schema::from_cedarschema_str(include_str!("../mega.cedarschema"))?;
+        let (schema, _) = Schema::from_cedarschema_str(include_str!("mega.cedarschema"))?;
         let policies = policy_content.parse()?;
         let validator = Validator::new(schema.clone());
         let output = validator.validate(&policies, ValidationMode::default());
@@ -69,8 +69,8 @@ impl CedarContext {
     }
 
     pub fn new(entities: EntityStore) -> Result<Self, ContextError> {
-        let schema_content = include_str!("../mega.cedarschema");
-        let policy_content = include_str!("../mega_policies.cedar");
+        let schema_content = include_str!("mega.cedarschema");
+        let policy_content = include_str!("mega_policies.cedar");
         let (schema, _) = Schema::from_cedarschema_str(schema_content).unwrap();
         let policies = policy_content.parse()?;
         let validator = Validator::new(schema.clone());

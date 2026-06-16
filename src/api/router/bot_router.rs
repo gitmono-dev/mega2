@@ -14,8 +14,8 @@ use crate::{
         MonoApiServiceState, api_common::group_permission::ensure_admin, api_doc::BOT_TAG,
         error::ApiError, oauth::model::LoginUser,
     },
-    api_model::common::CommonResult,
     ceres::model::bots::{BotRes, ChangeInstallationStatus, InstallBotReq, InstallationTargetType},
+    contract::api::common::CommonResult,
 };
 
 /// Maximum allowed expires_in in seconds (10 years).

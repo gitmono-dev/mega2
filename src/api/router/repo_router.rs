@@ -5,8 +5,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::REPO_TAG, error::ApiError},
-    api_model::common::CommonResult,
     ceres::model::change_list::CloneRepoPayload,
+    contract::api::common::CommonResult,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

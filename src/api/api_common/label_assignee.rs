@@ -4,9 +4,9 @@ use axum::{Json, extract::State};
 
 use crate::{
     api::{MonoApiServiceState, error::ApiError, oauth::model::LoginUser},
-    api_model::common::CommonResult,
     callisto::sea_orm_active_enums::ConvTypeEnum,
     ceres::model::{change_list::AssigneeUpdatePayload, label::LabelUpdatePayload},
+    contract::api::common::CommonResult,
     jupiter::model::common::LabelAssigneeParams,
 };
 

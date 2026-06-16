@@ -10,7 +10,7 @@ use rand08::thread_rng;
 /// using asynchronous operations.
 use smallvec::smallvec;
 
-use crate::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
 
 const VAULT_KEY: &str = "pgp-signed-secret";
 

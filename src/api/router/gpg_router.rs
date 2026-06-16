@@ -3,9 +3,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::GPG_TAG, error::ApiError, oauth::model::LoginUser},
-    api_model::common::CommonResult,
     callisto::gpg_key::Model,
     ceres::model::gpg::{GpgKey, NewGpgRequest, RemoveGpgRequest},
+    contract::api::common::CommonResult,
 };
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(

@@ -5,8 +5,8 @@ use regex::Regex;
 
 use crate::{
     api::{MonoApiServiceState, error::ApiError, oauth::model::LoginUser},
-    api_model::common::CommonResult,
     callisto::sea_orm_active_enums::{ConvTypeEnum, ReferenceTypeEnum},
+    contract::api::common::CommonResult,
 };
 
 pub fn parse_data_id(comment: &str) -> HashSet<String> {

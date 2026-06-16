@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api_model::common::CommonPage;
+use crate::contract::api::common::CommonPage;
 
 #[derive(PartialEq, Eq, Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct TagInfo {

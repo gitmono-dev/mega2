@@ -7,11 +7,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::MERGE_QUEUE_TAG, error::ApiError},
-    api_model::common::CommonResult,
     ceres::model::merge_queue::{
         AddToQueueRequest, AddToQueueResponse, QueueItem, QueueListResponse, QueueStatsResponse,
         QueueStatus, QueueStatusResponse,
     },
+    contract::api::common::CommonResult,
 };
 
 /// Creates the merge queue router with all endpoints

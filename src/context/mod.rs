@@ -13,7 +13,7 @@ pub struct AppContext {
     pub storage: crate::jupiter::storage::Storage,
 
     /// The vault core for managing encrypted data.
-    pub vault: crate::vault::integration::vault_core::VaultCore,
+    pub vault: crate::contract::vault::integration::vault_core::VaultCore,
 
     /// The configuration settings for the application.
     pub config: Arc<crate::common::config::Config>,
@@ -36,7 +36,9 @@ impl AppContext {
         let connection = init_connection(&config.redis).await;
 
         let storage_for_vault = storage.clone();
-        let vault = crate::vault::integration::vault_core::VaultCore::new(storage_for_vault).await;
+        let vault =
+            crate::contract::vault::integration::vault_core::VaultCore::new(storage_for_vault)
+                .await;
 
         // Late (post-Vault) construction for mail + notification dispatcher (phase 0 per docs/notification.md).
         // Must be after VaultCore (and mail) per config.md bootstrap constraints and docs/mail.md.

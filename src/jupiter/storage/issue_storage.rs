@@ -7,12 +7,12 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{
         issue_cl_references, item_assignees, item_labels, label, mega_conversation, mega_issue,
         sea_orm_active_enums::ReferenceTypeEnum,
     },
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::{
         model::common::{ItemDetails, LabelAssigneeParams, ListParams},
         storage::{

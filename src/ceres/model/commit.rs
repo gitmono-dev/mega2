@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{api_model::common::CommonPage, ceres::model::change_list::DiffItemSchema};
+use crate::{ceres::model::change_list::DiffItemSchema, contract::api::common::CommonPage};
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone, Default)]
 #[serde(rename_all = "PascalCase")]

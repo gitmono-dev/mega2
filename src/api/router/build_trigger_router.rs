@@ -13,8 +13,8 @@ use crate::{
     api::{
         MonoApiServiceState, api_doc::BUILD_TRIGGER_TAG, error::ApiError, oauth::model::LoginUser,
     },
-    api_model::common::{CommonPage, CommonResult, PageParams},
     ceres::build_trigger::{CreateTriggerRequest, ListTriggersParams, TriggerResponse},
+    contract::api::common::{CommonPage, CommonResult, PageParams},
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

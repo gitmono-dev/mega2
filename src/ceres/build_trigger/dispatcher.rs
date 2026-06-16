@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-    api_model::buck2::{api::TaskBuildRequest, status::Status, types::ProjectRelativePath},
     bellatrix::Bellatrix,
     ceres::build_trigger::{BuildTrigger, BuildTriggerPayload},
     common::errors::MegaError,
+    contract::api::buck2::{api::TaskBuildRequest, status::Status, types::ProjectRelativePath},
     jupiter::storage::Storage,
 };
 
@@ -104,9 +104,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        api_model::buck2::ws::WSMessage,
         ceres::build_trigger::{BuildTriggerType, TriggerSource, WebEditPayload},
         common::config::BuildConfig,
+        contract::api::buck2::ws::WSMessage,
     };
 
     #[derive(Clone)]

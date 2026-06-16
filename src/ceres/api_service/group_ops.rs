@@ -1,11 +1,11 @@
 use crate::{
-    api_model::common::Pagination,
     callisto::{
         mega_group, mega_group_member, mega_resource_permission,
         sea_orm_active_enums::{PermissionEnum, ResourceTypeEnum},
     },
     ceres::api_service::mono_api_service::MonoApiService,
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::model::group_dto::{
         CreateGroupPayload, DeleteGroupStats, ResourcePermissionBinding, UpdateGroupPayload,
     },

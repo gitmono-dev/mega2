@@ -48,7 +48,8 @@ impl MonoApiService {
         }
 
         let store = self.load_admin_entity_store().await?;
-        let resolver = crate::saturn::admin_resolver::AdminResolver::from_entity_store(&store);
+        let resolver =
+            crate::contract::policy::admin_resolver::AdminResolver::from_entity_store(&store);
         let admins = resolver.admin_list();
 
         if let Err(e) = self.cache_admins(&admins).await {
@@ -74,7 +75,7 @@ impl MonoApiService {
     /// Load EntityStore from `/.mega_cedar.json`.
     async fn load_admin_entity_store(
         &self,
-    ) -> Result<crate::saturn::entitystore::EntityStore, MegaError> {
+    ) -> Result<crate::contract::policy::entitystore::EntityStore, MegaError> {
         let mono_storage = self.storage.mono_storage();
 
         let root_ref = mono_storage

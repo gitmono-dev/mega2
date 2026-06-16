@@ -13,9 +13,8 @@ use tokio::sync::Mutex;
 use crate::{
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     context::AppContext,
-    git_protocol::ssh::SshServer,
+    contract::{git_protocol::ssh::SshServer, vault::integration::vault_core::VaultCoreInterface},
     server::CommonHttpOptions,
-    vault::integration::vault_core::VaultCoreInterface,
 };
 
 #[derive(Args, Clone, Debug)]

@@ -1,6 +1,6 @@
 # Monoengine 改进计划文档索引
 
-本目录包含 monoengine 的改进计划文档体系。这些文档构成一个相互联系的系统，描述了配置管理、敏感凭据存储、邮件通知和用户通知的完整改进方案。
+本目录包含 monoengine 的改进计划文档体系。这些文档构成一个相互联系的系统，描述了 contract 边界、配置管理、敏感凭据存储、邮件通知和用户通知的完整改进方案。
 
 > **通用治理规范**：所有改进计划文档必须遵循 **`general.md`** 中定义的共同结构、约束、版本管理和评审标准。在执行改进时，请首先查阅 `general.md` 了解共同需求。
 
@@ -29,6 +29,16 @@
   - Profile、热加载、集中校验等高级特性
 - **关键前置**：日志脱敏工具、CLI LoadMode 框架设计
 - **阶段范围**：0a - 8（共 8 个阶段）
+
+### 1a. **refactoring/contract.md** — Contract 边界归并
+- **目标**：将 API 数据契约、Git 协议、Vault 与权限策略相关代码统一归入 `src/contract/`
+- **核心内容**：
+  - `api_model` → `contract::api`
+  - `git_protocol` → `contract::git_protocol`
+  - `vault` → `contract::vault`
+  - `saturn` + `api::guard` → `contract::policy`
+- **关键前置**：无；属于结构性路径迁移
+- **阶段范围**：0 - 2（结构归并、文档同步、常规门禁）
 
 ### 2. **refactoring/vault.md** — Vault 安全加固与凭据迁移
 - **目标**：加固 vault 安全（fail-closed、脱敏、权限等），为凭据迁移提供坚实基础
@@ -87,7 +97,7 @@
 
 1. **第一次接触本计划**？阅读 **general.md** 了解框架和规则
 2. **想了解总体执行计划**？阅读 **README.md** 的"执行顺序"部分
-3. **关心具体模块**？阅读对应的 **refactoring/config.md / refactoring/vault.md / refactoring/mail.md / refactoring/notification.md**
+3. **关心具体模块**？阅读对应的 **refactoring/contract.md / refactoring/config.md / refactoring/vault.md / refactoring/mail.md / refactoring/notification.md**
 4. **想验证功能**？查看 **refactoring/integration.md** 的集成测试场景
 
 ### 角色指南
@@ -95,6 +105,7 @@
 | 角色 | 首先阅读 | 然后关注 |
 |------|---------|--------|
 | **项目经理** | README.md、general.md | 优先级、依赖关系、风险清单 |
+| **工程师（contract）** | refactoring/contract.md、general.md | 模块边界、路径迁移、旧路径清理 |
 | **工程师（config）** | general.md、refactoring/config.md | 前置依赖、硬约束、验收标准 |
 | **工程师（vault）** | general.md、refactoring/vault.md | 与 config 的协同点、bootstrap 拆分 |
 | **QA/测试** | refactoring/integration.md、general.md | 集成测试场景、验收标准 |

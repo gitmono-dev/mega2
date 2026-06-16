@@ -26,16 +26,17 @@ use crate::{
         MonoApiServiceState,
         api_doc::ApiDoc,
         api_router::{self},
-        guard::cedar_guard::cedar_guard,
         router::lfs_router,
     },
     bellatrix::Bellatrix,
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::ProtocolError,
     context::AppContext,
-    git_protocol::InfoRefsParams,
+    contract::{
+        git_protocol::InfoRefsParams,
+        policy::{entitystore::EntityStore, guard::cedar_guard::cedar_guard},
+    },
     jupiter::service::artifact_service::ArtifactService,
-    saturn::entitystore::EntityStore,
     server::{CommonHttpOptions, trace_context},
 };
 
@@ -458,13 +459,13 @@ async fn handle_smart_protocol(
         let uri = req.uri();
         let query_str = uri.query().unwrap_or("");
         let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
-        crate::git_protocol::http::git_info_refs(&state, params, repo_path).await
+        crate::contract::git_protocol::http::git_info_refs(&state, params, repo_path).await
     } else if full_path.ends_with("/git-upload-pack") && req.method().eq(&Method::POST) {
         let repo_path = remove_git_suffix(full_path, "/git-upload-pack");
-        crate::git_protocol::http::git_upload_pack(&state, req, repo_path).await
+        crate::contract::git_protocol::http::git_upload_pack(&state, req, repo_path).await
     } else if full_path.ends_with("/git-receive-pack") && req.method().eq(&Method::POST) {
         let repo_path = remove_git_suffix(full_path, "/git-receive-pack");
-        crate::git_protocol::http::git_receive_pack(&state, req, repo_path).await
+        crate::contract::git_protocol::http::git_receive_pack(&state, req, repo_path).await
     } else {
         Ok(Response::builder()
             .status(404)

@@ -4,9 +4,9 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::build_triggers,
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
 

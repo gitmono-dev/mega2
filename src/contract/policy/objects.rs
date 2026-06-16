@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use cedar_policy::{Entity, RestrictedExpression};
 use serde::{Deserialize, Serialize};
 
-use crate::saturn::util::SaturnEUid;
+use crate::contract::policy::util::SaturnEUid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {

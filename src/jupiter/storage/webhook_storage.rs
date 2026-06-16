@@ -6,12 +6,12 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{
         mega_webhook, mega_webhook_delivery, mega_webhook_event_type,
         sea_orm_active_enums::WebhookEventTypeEnum,
     },
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
 
@@ -209,7 +209,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        api_model::common::Pagination,
+        contract::api::common::Pagination,
         jupiter::{
             migration::apply_migrations,
             tests::{test_db_connection, test_storage},

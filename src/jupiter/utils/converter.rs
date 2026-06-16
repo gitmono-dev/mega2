@@ -443,7 +443,8 @@ pub fn init_trees(
     }
 
     // Create global .mega_cedar.json in root directory
-    let entity_str = crate::saturn::entitystore::generate_entity(&mono_config.admin, "/").unwrap();
+    let entity_str =
+        crate::contract::policy::entitystore::generate_entity(&mono_config.admin, "/").unwrap();
     let cedar_blob = Blob::from_content(&entity_str);
     root_items.push(TreeItem {
         mode: TreeItemMode::Blob,

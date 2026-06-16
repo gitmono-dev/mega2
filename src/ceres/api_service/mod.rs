@@ -15,7 +15,6 @@ use git_internal::{
 };
 
 use crate::{
-    api_model::{common::Pagination, git::commit::LatestCommitInfo},
     ceres::{
         api_service::cache::GitObjectCache,
         model::{
@@ -29,6 +28,7 @@ use crate::{
         },
     },
     common::{config::BlameConfig, errors::MegaError},
+    contract::api::{common::Pagination, git::commit::LatestCommitInfo},
     jupiter::storage::Storage,
 };
 

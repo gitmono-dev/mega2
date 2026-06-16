@@ -17,9 +17,9 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{mega_blob, mega_cl, mega_commit, mega_refs, mega_tag, mega_tree},
     common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
+    contract::api::common::Pagination,
     jupiter::{
         storage::{
             base_storage::{BaseStorage, StorageConnector},

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 mod api;
-mod api_model;
 mod bellatrix;
 mod callisto;
 pub mod chat;
@@ -11,15 +10,12 @@ mod cli;
 mod commands;
 mod common;
 mod context;
-mod git_protocol;
+mod contract;
 mod io_orbit;
 mod jupiter;
 mod mail;
 mod notification;
-mod saturn;
 mod server;
-#[allow(hidden_glob_reexports)]
-mod vault;
 
 use crate::cli::parse;
 

@@ -72,7 +72,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
         mut member_usernames: Vec<String>,
         group: bool,
         initial_message: Option<String>,
-        attachments: Option<Vec<crate::api_model::chat::AttachmentConfirmReq>>,
+        attachments: Option<Vec<crate::contract::api::chat::AttachmentConfirmReq>>,
     ) -> Result<(channel::Model, Option<message::Model>), MegaError> {
         // Always include creator, dedup
         member_usernames.push(creator_username.clone());
@@ -154,7 +154,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
         sender_username: String,
         content: String,
         reply_to_public_id: Option<String>,
-        attachments: Option<Vec<crate::api_model::chat::AttachmentConfirmReq>>,
+        attachments: Option<Vec<crate::contract::api::chat::AttachmentConfirmReq>>,
     ) -> Result<message::Model, MegaError> {
         // Verify membership + channel exists (404 for non member per spec)
         let ch = self
@@ -198,7 +198,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
         sender: Option<String>,
         content: String,
         reply_to_id: Option<i64>,
-        attachments: Vec<crate::api_model::chat::AttachmentConfirmReq>,
+        attachments: Vec<crate::contract::api::chat::AttachmentConfirmReq>,
     ) -> Result<message::Model, MegaError> {
         let public_id = crate::callisto::entity_ext::generate_public_id();
 

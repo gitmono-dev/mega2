@@ -4,7 +4,7 @@ use cedar_policy::{Entities, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string_pretty};
 
-use crate::saturn::{
+use crate::contract::policy::{
     objects::{Issue, MergeRequest, Repo, User, UserGroup},
     util::SaturnEUid,
 };

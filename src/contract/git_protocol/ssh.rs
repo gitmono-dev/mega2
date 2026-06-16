@@ -19,7 +19,7 @@ use crate::{
             smart::{self},
         },
     },
-    git_protocol::http::search_subsequence,
+    contract::git_protocol::http::search_subsequence,
 };
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;

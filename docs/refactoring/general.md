@@ -12,6 +12,7 @@ docs/
 ├── README.md                ← 总索引与全景执行计划
 ├── integration.md           ← 集成测试：端到端验证框架
 ├── [模块改进计划文档]
+│   ├── contract.md          ← Contract 边界归并
 │   ├── config.md            ← Config 模块拆分与 SecretRef
 │   ├── vault.md             ← Vault 安全加固与凭据迁移
 │   ├── mail.md              ← Mail 模块完善与 SecretRef 消费
@@ -28,6 +29,7 @@ docs/
 | **general.md** | 基础框架 | 定义所有文档的共同规则、约束、治理标准 |
 | **README.md** | 总体协调 | 整体执行计划、依赖关系、优先级、里程碑 |
 | **integration.md** | 验证框架 | 端到端测试场景、Docker 环境、验收标准 |
+| **contract.md** | 边界归并 | API/Git/Vault/Policy 模块路径和边界约束 |
 | **config.md / vault.md / mail.md / notification.md** | 专项规划 | 各模块的现状分析、阶段规划、实施细节 |
 
 ## 所有文档的共同结构规范

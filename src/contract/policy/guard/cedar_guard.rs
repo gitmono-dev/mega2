@@ -16,7 +16,9 @@ use crate::{
         oauth::{BotIdentity, model::LoginUser},
     },
     common::errors::MegaError,
-    saturn::{ActionEnum, context::CedarContext, entitystore::EntityStore, util::SaturnEUid},
+    contract::policy::{
+        ActionEnum, context::CedarContext, entitystore::EntityStore, util::SaturnEUid,
+    },
 };
 
 // TODO: All users are temporary allowed during development stage

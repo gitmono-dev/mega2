@@ -28,7 +28,6 @@
 use std::sync::Arc;
 
 use crate::{
-    api_model::common::Pagination,
     bellatrix::Bellatrix,
     ceres::{
         api_service::cache::GitObjectCache,
@@ -42,6 +41,7 @@ use crate::{
         code_edit::utils as edit_utils,
     },
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::storage::Storage,
 };
 

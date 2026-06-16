@@ -12,9 +12,9 @@
 > - **阶段 I（root token 退役 / 最小权限）**：libvault 已原生提供 ACL policy（`modules/policy`，`sys/policy/{name}`）与非 root token（`modules/auth/token_store.rs`，`auth/token/create`），本阶段从"自建授权体系"改为"接入并编排内建能力"——可行性提升。
 > - **阶段 H（审计）**：libvault 的 `sys/audit` 仅为桩实现（handler 返回 `Ok(None)`，见 `modules/system/mod.rs:883-905`），审计须在收窄后的 `VaultCoreInterface` 上做 hook，**不能**依赖内建审计设备。
 > - **阶段 J（轮换/rekey）**：unseal 分片 rekey（`generate_unseal_keys()`，`core.rs:591`）与一次性解封（`unseal_once()`，`core.rs:534`）可用；但 **KEK 轮换无内建原语**（`init()` 后 KEK 不可变，无 `sys/rotate` 等价能力），需另立专项或暂不承诺。
-> - **PKI**：新 libvault 的 PKI 按证书类型分域（`tls`/`ssh`/`pgp`），调用路径已变（如 `pki/root/tls/generate/internal`、`pki/ca/tls/pem`），`src/vault/pki.rs` 已随迁移同步。
+> - **PKI**：新 libvault 的 PKI 按证书类型分域（`tls`/`ssh`/`pgp`），调用路径已变（如 `pki/root/tls/generate/internal`、`pki/ca/tls/pem`），`src/contract/vault/pki.rs` 已随迁移同步。
 
-> **落地可行性分析补充（2026-06-16）**：基于对当前代码（src/vault/integration/vault_core.rs、jupiter_backend.rs、context/mod.rs、ssh_server.rs、pgp.rs、nostr.rs、pki.rs 等）、libvault vendored 源码、其他 refactoring 文档以及 AGENTS.md 的核查，结论如下：
+> **落地可行性分析补充（2026-06-16）**：基于对当前代码（src/contract/vault/integration/vault_core.rs、jupiter_backend.rs、context/mod.rs、ssh_server.rs、pgp.rs、nostr.rs、pki.rs 等）、libvault vendored 源码、其他 refactoring 文档以及 AGENTS.md 的核查，结论如下：
 >
 > - **vault-only 核心链路（A 止血子集、B、C、F）具备直接落地条件**。文档描述的缺陷（root token println+/log::debug+、delete_all on key miss、expect/assert/unwrap 于初始化、JupiterBackend 绑全量 Storage、VaultCoreInterface 暴露 token/raw api、消费端大量 unwrap/panic、reinitialize 测试固化危险行为）与磁盘上代码**完全一致**，无需等待任何尚不存在的 src/ 组件。
 > - **libvault 能力核查确认**：`RustyVault::inited()` / `core.load().inited()`、`unseal_once()`、`generate_unseal_keys()` 均可用；policy 与 token 原语（sys/policy/*、auth/token/create）开箱可达；`sys/audit` handler 存在但按修订说明为桩（handler 返回 Ok(None)）；PKI 域路径已在 pki.rs 中部分对齐。阶段 H 走 interface hook、I 编排内建、J 分片 rekey 的判断均成立。
@@ -31,14 +31,14 @@
 
 ## 当前实现概览
 
-`vault` 模块位于 `src/vault/`，核心集成代码在 `src/vault/integration/`：
+`vault` 模块位于 `src/contract/vault/`，核心集成代码在 `src/contract/vault/integration/`：
 
-- `src/vault/integration/vault_core.rs`：封装 `libvault::RustyVault`（仓库内 vendored 的 path 依赖），提供 `VaultCore` 和 `VaultCoreInterface`。
-- `src/vault/integration/jupiter_backend.rs`：将 RustyVault 的物理存储后端适配到 `jupiter` 数据库存储。
+- `src/contract/vault/integration/vault_core.rs`：封装 `libvault::RustyVault`（仓库内 vendored 的 path 依赖），提供 `VaultCore` 和 `VaultCoreInterface`。
+- `src/contract/vault/integration/jupiter_backend.rs`：将 RustyVault 的物理存储后端适配到 `jupiter` 数据库存储。
 - `src/jupiter/storage/vault_storage.rs`：通过 SeaORM 读写 `vault` 表，提供 `list_keys`、`load`、`save`、`delete`、`delete_all`。
 - `src/context/mod.rs`：在 `AppContext::new` 中构造 `Storage`、Redis 连接、`VaultCore`，随后在 vault 之后启动 mail/notification dispatcher。
 - `src/server/ssh_server.rs`：通过 vault 保存或读取 `ssh_server_key`。
-- `src/vault/pgp.rs`、`src/vault/nostr.rs`、`src/vault/pki.rs`：基于 `VaultCore` 扩展 PGP、Nostr、PKI 能力。
+- `src/contract/vault/pgp.rs`、`src/contract/vault/nostr.rs`、`src/contract/vault/pki.rs`：基于 `VaultCore` 扩展 PGP、Nostr、PKI 能力。
 
 当前 vault 已经是可用的通用 KV secret store。`VaultCoreInterface` 提供：
 
@@ -119,7 +119,7 @@ service::exec(config, args)
 ### Vault 内部时序（`VaultCore::new` → `config`）
 
 ```text
-VaultCore::new(storage)                          src/vault/integration/vault_core.rs:52
+VaultCore::new(storage)                          src/contract/vault/integration/vault_core.rs:52
 ├─ dir = mega_base()/vault ; create_dir_all      :53,56   （expect；无权限收紧）
 └─ VaultCore::config(storage, key_path)          :60
    ├─ backend = JupiterBackend::new(storage)      :61   （RustyVault 物理后端 = DB 的 vault 表）
@@ -224,7 +224,7 @@ sequenceDiagram
 
 ### `core_key.json` 缺失会清空 vault
 
-`src/vault/integration/vault_core.rs` 当前在 key 文件不存在时会：
+`src/contract/vault/integration/vault_core.rs` 当前在 key 文件不存在时会：
 
 1. 打印清库重建提示。
 2. 调用 `vault_storage.delete_all()` 清空 vault 表。
@@ -306,8 +306,8 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 当前 SSH、PGP、Nostr 等调用点大量使用 `unwrap()` 和 `expect()`，并假设 secret JSON shape 永远正确。例如：
 
 - `src/server/ssh_server.rs` 读取 `ssh_server_key.secret_key`。
-- `src/vault/pgp.rs` 读取 `pgp-signed-secret.pub_key` / `sec_key`。
-- `src/vault/nostr.rs` 读取 `nostr_identity_key.nostr` / `secret_key`。
+- `src/contract/vault/pgp.rs` 读取 `pgp-signed-secret.pub_key` / `sec_key`。
+- `src/contract/vault/nostr.rs` 读取 `nostr_identity_key.nostr` / `secret_key`。
 
 当 vault 数据损坏、字段缺失或格式错误时，服务会 panic。迁移配置 secret 前，需要逐步把这些路径改为返回可诊断错误。
 
@@ -674,9 +674,9 @@ pub fn global_redactor() -> &'static dyn Redactor;
 优先处理：
 
 1. `src/server/ssh_server.rs`：SSH server key 读取、生成、写入失败返回错误。
-2. `src/vault/pgp.rs`：PGP key 读取、解析、保存、删除返回 `Result`。
-3. `src/vault/nostr.rs`：Nostr key 读取、生成、解析返回 `Result`。
-4. `src/vault/pki.rs`：PKI API 统一错误模型，避免新增 panic 风格路径。**注意（2026-06-15）**：新 libvault 的 PKI 已按证书类型分域，调用路径随迁移更新为 `pki/root/tls/generate/{internal|exported}`、`pki/roles/tls/{name}`、`pki/issue/tls/{role}`、`pki/ca/tls/pem` 等（旧 `pki/root/generate/...`、`pki/roles/...`、`pki/issue/...`、`pki/ca/pem` 已不再支持，会返回 "Logical backend path not supported"）；错误模型清理应基于新路径，且 `pki.rs` 文档注释中的 `libvault::modules::pki::*` 模块引用也已随之更新。
+2. `src/contract/vault/pgp.rs`：PGP key 读取、解析、保存、删除返回 `Result`。
+3. `src/contract/vault/nostr.rs`：Nostr key 读取、生成、解析返回 `Result`。
+4. `src/contract/vault/pki.rs`：PKI API 统一错误模型，避免新增 panic 风格路径。**注意（2026-06-15）**：新 libvault 的 PKI 已按证书类型分域，调用路径随迁移更新为 `pki/root/tls/generate/{internal|exported}`、`pki/roles/tls/{name}`、`pki/issue/tls/{role}`、`pki/ca/tls/pem` 等（旧 `pki/root/generate/...`、`pki/roles/...`、`pki/issue/...`、`pki/ca/pem` 已不再支持，会返回 "Logical backend path not supported"）；错误模型清理应基于新路径，且 `pki.rs` 文档注释中的 `libvault::modules::pki::*` 模块引用也已随之更新。
 
 验收标准：
 
@@ -813,9 +813,9 @@ Config::new
 
 涉及文件：
 
-- `src/vault/integration/vault_core.rs`
-- `src/vault/pgp.rs`
-- `src/vault/nostr.rs`
+- `src/contract/vault/integration/vault_core.rs`
+- `src/contract/vault/pgp.rs`
+- `src/contract/vault/nostr.rs`
 - `src/server/ssh_server.rs`
 
 问题：调用方需要知道 token、path、JSON shape、字段名和错误行为，interface 过宽且接近 implementation。
@@ -828,7 +828,7 @@ Config::new
 
 涉及文件：
 
-- `src/vault/integration/jupiter_backend.rs`
+- `src/contract/vault/integration/jupiter_backend.rs`
 - `src/jupiter/storage/vault_storage.rs`
 - `src/context/mod.rs`
 
@@ -843,7 +843,7 @@ Config::new
 涉及文件：
 
 - 未来 `src/config/secret.rs`
-- `src/vault/integration/vault_core.rs`
+- `src/contract/vault/integration/vault_core.rs`
 
 问题：`VaultCore` 管 secret 存储，`SecretRef` 管配置引用，两者语义不同。
 
@@ -869,8 +869,8 @@ Config::new
 
 涉及文件：
 
-- `src/vault/pgp.rs`
-- `src/vault/nostr.rs`
+- `src/contract/vault/pgp.rs`
+- `src/contract/vault/nostr.rs`
 - `src/server/ssh_server.rs`
 - `libvault/src/modules/pki`
 
@@ -895,8 +895,8 @@ Config::new
 
 **首批 PR 执行边界（2026-06-16 分析更新）：**
 
-- 允许改动：`src/vault/integration/vault_core.rs` 及其 tests、`src/vault/integration/jupiter_backend.rs`（若 B 同期小步）、`src/context/mod.rs`（最小错误传递）、`src/server/ssh_server.rs`（最小错误返回）、vault 其他消费端中仅初始化/读取路径的 panic 清理（F 可后续批次）。
-- 允许新增：局部 `VaultError` / `VaultResult`（建议放 `vault/integration/vault_core.rs` 内或 `src/vault/error.rs`）、Unix 权限辅助（cfg 守卫）、只覆盖初始化语义与 fail-closed 的测试用例。
+- 允许改动：`src/contract/vault/integration/vault_core.rs` 及其 tests、`src/contract/vault/integration/jupiter_backend.rs`（若 B 同期小步）、`src/context/mod.rs`（最小错误传递）、`src/server/ssh_server.rs`（最小错误返回）、vault 其他消费端中仅初始化/读取路径的 panic 清理（F 可后续批次）。
+- 允许新增：局部 `VaultError` / `VaultResult`（建议放 `vault/integration/vault_core.rs` 内或 `src/contract/vault/error.rs`）、Unix 权限辅助（cfg 守卫）、只覆盖初始化语义与 fail-closed 的测试用例。
 - **绝对禁止**（本阶段）：`config secret` 命令族、LoadMode、SecretRef / resolver 实现、mail password 迁移、对象存储初始化顺序重排、KEK 轮换、libvault 源码修改、redaction 模块。
 - 评审重点：启动日志和错误字符串**不得**含 root token / 分片 / 明文 secret；DB 已初始化但 key 缺失时**绝不**调用 `delete_all()`；空 DB 首启仍可成功初始化并写 key；所有新增失败路径返回错误而不是 panic；权限代码在非 Unix 平台不放宽行为。
 - **强制前置验证（AGENTS.md）**：实现 PR 在任何 push / review 前必须本地通过：

@@ -14,8 +14,8 @@ use crate::{
         error::ApiError,
         oauth::model::LoginUser,
     },
-    api_model::common::CommonResult,
     ceres::model::group::UserEffectivePermissionResponse,
+    contract::api::common::CommonResult,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

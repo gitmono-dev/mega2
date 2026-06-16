@@ -6,11 +6,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::SIDEBAR_TAG, error::ApiError},
-    api_model::common::CommonResult,
     ceres::model::dynamic_sidebar::{
         CreateSidebarPayload, SidebarMenuListRes, SidebarRes, SidebarSyncPayload,
         UpdateSidebarPayload,
     },
+    contract::api::common::CommonResult,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

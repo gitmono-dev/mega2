@@ -9,7 +9,6 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CODE_PREVIEW, error::ApiError},
-    api_model::{common::CommonResult, git::commit::LatestCommitInfo},
     ceres::model::{
         blame::{BlameQuery, BlameRequest, BlameResult},
         change_list::DiffItemSchema,
@@ -19,6 +18,7 @@ use crate::{
             TreeHashItem, TreeResponse,
         },
     },
+    contract::api::{common::CommonResult, git::commit::LatestCommitInfo},
 };
 
 async fn upsert_commit_binding(

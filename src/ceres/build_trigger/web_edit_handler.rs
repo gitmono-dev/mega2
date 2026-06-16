@@ -31,8 +31,8 @@ fn resolve_cl_link(context: &TriggerContext, now_millis: i64) -> String {
 }
 
 fn serialize_builds(
-    builds: &[crate::api_model::buck2::status::Status<
-        crate::api_model::buck2::types::ProjectRelativePath,
+    builds: &[crate::contract::api::buck2::status::Status<
+        crate::contract::api::buck2::types::ProjectRelativePath,
     >],
 ) -> Result<serde_json::Value, MegaError> {
     serde_json::to_value(builds)
@@ -88,8 +88,8 @@ impl TriggerHandler for WebEditHandler {
 mod tests {
     use super::*;
     use crate::{
-        api_model::buck2::{status::Status, types::ProjectRelativePath},
         ceres::build_trigger::{BuildTriggerType, TriggerSource},
+        contract::api::buck2::{status::Status, types::ProjectRelativePath},
     };
 
     #[test]

@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use thiserror::Error;
 use utoipa::ToSchema;
 
-pub use crate::api_model::buck2::types::ProjectRelativePath;
+pub use crate::contract::api::buck2::types::ProjectRelativePath;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
 pub enum Status<Path> {

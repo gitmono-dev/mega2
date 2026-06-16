@@ -18,6 +18,7 @@ use crate::{
     },
     chat::service::{ChannelChatService, SharedChatService},
     common::errors::ProtocolError,
+    contract::policy::entitystore::EntityStore,
     jupiter::{
         service::webhook_service::WebhookService,
         storage::{
@@ -27,13 +28,11 @@ use crate::{
             webhook_storage::WebhookStorage,
         },
     },
-    saturn::entitystore::EntityStore,
 };
 pub mod api_common;
 pub mod api_doc;
 pub mod api_router;
 pub mod error;
-pub mod guard;
 pub mod notes;
 pub mod oauth;
 pub mod router;

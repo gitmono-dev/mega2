@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-pub use crate::api_model::buck2::api::TaskBuildRequest;
+pub use crate::contract::api::buck2::api::TaskBuildRequest;
 
 /// Response from Orion task handler containing the assigned task ID.
 #[derive(Deserialize, Debug)]

@@ -11,8 +11,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::WEBHOOK_TAG, error::ApiError},
-    api_model::common::{CommonPage, CommonResult, Pagination},
     callisto::sea_orm_active_enums::WebhookEventTypeEnum,
+    contract::api::common::{CommonPage, CommonResult, Pagination},
     jupiter::{
         service::webhook_service::{encrypt_webhook_secret, validate_webhook_target_url},
         storage::webhook_storage::WebhookWithEventTypes,

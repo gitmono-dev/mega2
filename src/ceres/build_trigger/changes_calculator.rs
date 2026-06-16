@@ -5,7 +5,7 @@ use std::{
 
 use git_internal::hash::ObjectHash;
 
-pub use crate::api_model::buck2::{status::Status, types::ProjectRelativePath};
+pub use crate::contract::api::buck2::{status::Status, types::ProjectRelativePath};
 use crate::{
     ceres::{
         api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},

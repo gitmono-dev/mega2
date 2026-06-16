@@ -4,8 +4,8 @@ use std::{collections::HashSet, path::PathBuf};
 
 use crate::{
     common::errors::MegaError,
+    contract::policy::reviewer_parser::aggregate_reviewers,
     jupiter::storage::{base_storage::BaseStorage, cl_reviewer_storage::ClReviewerStorage},
-    saturn::reviewer_parser::aggregate_reviewers,
 };
 
 /// Convert a file path to its logical directory path for Cedar policy matching.

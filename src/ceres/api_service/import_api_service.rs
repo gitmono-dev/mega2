@@ -20,7 +20,6 @@ use git_internal::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{git_tag, import_refs},
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, history},
@@ -31,6 +30,7 @@ use crate::{
         protocol::repo::Repo,
     },
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::{storage::Storage, utils::converter::FromGitModel},
 };
 

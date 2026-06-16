@@ -3,6 +3,7 @@ use std::fmt::{self, Display};
 pub mod admin_resolver;
 pub mod context;
 pub mod entitystore;
+pub mod guard;
 mod objects;
 pub mod reviewer_parser;
 pub mod util;
@@ -75,7 +76,7 @@ mod test {
 
     use cedar_policy::{Authorizer, Context, Entities, PolicySet, Request};
 
-    use crate::saturn::{
+    use crate::contract::policy::{
         context::{CedarContext, SaturnContextError},
         entitystore::EntityStore,
         util::SaturnEUid,

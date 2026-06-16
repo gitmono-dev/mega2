@@ -6,7 +6,7 @@ use std::{
 use openssl::{asn1::Asn1Time, x509::X509};
 use serde_json::{Value, json};
 
-use crate::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
 
 // FIXME: A more official and robust ROLE name
 const ROLE: &str = "test-role";
@@ -186,8 +186,8 @@ mod tests_raw {
 
     use crate::{
         common::errors::MegaError,
+        contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
         jupiter::tests::test_storage,
-        vault::integration::vault_core::{VaultCore, VaultCoreInterface},
     };
 
     async fn test_read_api(

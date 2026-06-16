@@ -18,7 +18,7 @@ use crate::{
         MonoApiServiceState, api_common::group_permission::ensure_admin, api_doc::USER_TAG,
         error::ApiError, oauth::model::LoginUser,
     },
-    api_model::common::CommonResult,
+    contract::api::common::CommonResult,
 };
 
 #[derive(Serialize, ToSchema)]

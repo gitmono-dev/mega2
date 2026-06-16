@@ -9,7 +9,6 @@ use crate::{
         MonoApiServiceState, api_common, api_doc::ISSUE_TAG, error::ApiError,
         oauth::model::LoginUser,
     },
-    api_model::common::{CommonPage, CommonResult, PageParams},
     callisto::sea_orm_active_enums::ConvTypeEnum,
     ceres::model::{
         change_list::{AssigneeUpdatePayload, ListPayload},
@@ -17,6 +16,7 @@ use crate::{
         issue::{IssueDetailRes, IssueSuggestions, ItemRes, NewIssue, QueryPayload},
         label::LabelUpdatePayload,
     },
+    contract::api::common::{CommonPage, CommonResult, PageParams},
     jupiter::service::issue_service::IssueService,
 };
 

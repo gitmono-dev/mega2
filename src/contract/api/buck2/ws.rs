@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::api_model::buck2::{
+use crate::contract::api::buck2::{
     status::Status,
     types::{ProjectRelativePath, TaskPhase},
 };

@@ -15,13 +15,13 @@ use crate::{
         error::ApiError,
         oauth::model::LoginUser,
     },
-    api_model::common::{CommonPage, CommonResult, PageParams, Pagination},
     ceres::model::group::{
         AddMembersRequest, CreateGroupRequest, DeleteGroupResponse, DeletePermissionsResponse,
         EmptyListAdditional, GroupMemberResponse, GroupResponse, RemoveMemberResponse,
         ResourcePermissionResponse, SetPermissionsRequest, UpdateGroupRequest,
         UserEffectivePermissionResponse, UserGroupsResponse,
     },
+    contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
     jupiter::model::group_dto::{
         CreateGroupPayload, ResourcePermissionBinding, UpdateGroupPayload,
     },

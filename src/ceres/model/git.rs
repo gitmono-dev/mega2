@@ -7,7 +7,7 @@ use git_internal::internal::object::{
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::api_model::git::commit::LatestCommitInfo;
+use crate::contract::api::git::commit::LatestCommitInfo;
 
 #[derive(PartialEq, Eq, Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateEntryInfo {

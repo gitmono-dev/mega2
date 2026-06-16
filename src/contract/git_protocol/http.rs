@@ -19,7 +19,7 @@ use crate::{
         protocol::{PushUserInfo, ServiceType, SmartSession, TransportProtocol, smart},
     },
     common::errors::ProtocolError,
-    git_protocol::InfoRefsParams,
+    contract::git_protocol::InfoRefsParams,
 };
 
 // # Discovering Reference

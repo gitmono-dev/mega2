@@ -12,8 +12,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::BUCK_TAG, error::ApiError, oauth::model::LoginUser},
-    api_model::common::CommonResult,
     ceres::model::buck::*,
+    contract::api::common::CommonResult,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

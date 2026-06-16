@@ -138,12 +138,12 @@ HTTP 服务在 `src/server/http_server.rs` 中注册 Git 协议入口：
 
 核心分发函数是 `handle_smart_protocol`：
 
-- `GET .../info/refs` 调用 `git_protocol::http::git_info_refs`。
-- `POST .../git-upload-pack` 调用 `git_protocol::http::git_upload_pack`。
-- `POST .../git-receive-pack` 调用 `git_protocol::http::git_receive_pack`。
+- `GET .../info/refs` 调用 `contract::git_protocol::http::git_info_refs`。
+- `POST .../git-upload-pack` 调用 `contract::git_protocol::http::git_upload_pack`。
+- `POST .../git-receive-pack` 调用 `contract::git_protocol::http::git_receive_pack`。
 - 其他路径返回 404 `Operation not supported`。
 
-HTTP Git 协议处理代码位于 `src/git_protocol/http.rs`。该模块负责：
+HTTP Git 协议处理代码位于 `src/contract/git_protocol/http.rs`。该模块负责：
 
 - 解析 `InfoRefsParams.service`。
 - 创建 `SmartSession`。
@@ -154,7 +154,7 @@ HTTP Git 协议处理代码位于 `src/git_protocol/http.rs`。该模块负责�
 
 ### SSH 入口
 
-SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/git_protocol/ssh.rs`。
+SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/contract/git_protocol/ssh.rs`。
 
 `src/server/ssh_server.rs` 负责：
 
@@ -163,7 +163,7 @@ SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/git_protocol/ssh.rs`�
 - 构造 `ProtocolApiState`。
 - 运行 `SshServer`。
 
-`src/git_protocol/ssh.rs` 负责：
+`src/contract/git_protocol/ssh.rs` 负责：
 
 - 处理 `exec_request`。
 - 支持 `git-upload-pack` 和 `git-receive-pack`。
@@ -285,7 +285,7 @@ HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/i
 
 ### HTTP info/refs 参数校验不符合规范且容易 panic
 
-`git_protocol::http::git_info_refs` 当前直接：
+`contract::git_protocol::http::git_info_refs` 当前直接：
 
 ```rust
 let service_name = params.service.unwrap();

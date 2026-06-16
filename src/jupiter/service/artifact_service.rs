@@ -9,7 +9,9 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, TransactionTrait};
 use uuid::Uuid;
 
 use crate::{
-    api_model::artifacts::{
+    callisto::{artifact_objects, artifact_set_files, artifact_sets},
+    common::errors::MegaError,
+    contract::api::artifacts::{
         ARTIFACT_PRESIGN_URL_TTL_SECS, ArtifactActions, ArtifactBatchHints,
         ArtifactBatchObjectResponse, ArtifactBatchRequest, ArtifactBatchResponse,
         ArtifactCommitRequest, ArtifactCommitResponse, ArtifactDiscoveryResponse,
@@ -20,8 +22,6 @@ use crate::{
         DEFAULT_MAX_OBJECTS_PER_BATCH, DEFAULT_MULTIPART_THRESHOLD_BYTES, GetArtifactSetQuery,
         ListArtifactSetsQuery, ResolveArtifactFileQuery, build_artifact_discovery_response,
     },
-    callisto::{artifact_objects, artifact_set_files, artifact_sets},
-    common::errors::MegaError,
     io_orbit::{
         factory::MegaObjectStorageWrapper,
         object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},

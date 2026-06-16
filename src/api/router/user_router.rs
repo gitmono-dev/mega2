@@ -8,11 +8,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::USER_TAG, error::ApiError, oauth::model::LoginUser},
-    api_model::common::CommonResult,
     ceres::model::user::{
         AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken, UpdateClaContentPayload,
     },
     common::errors::MegaError,
+    contract::api::common::CommonResult,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

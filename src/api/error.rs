@@ -2,8 +2,8 @@ use axum::response::{IntoResponse, Json, Response};
 use http::StatusCode;
 
 use crate::{
-    api_model::common::CommonResult,
     common::errors::{BuckError, MegaError},
+    contract::api::common::CommonResult,
 };
 
 /// Parse [code:xxx] format from error message.

@@ -33,7 +33,7 @@ impl ProjectRelativePath {
     }
 
     /// ```
-    /// use crate::api_model::buck2::types::ProjectRelativePath;
+    /// use crate::contract::api::buck2::types::ProjectRelativePath;
     /// assert_eq!(
     ///     ProjectRelativePath::new("foo/bar.bzl").extension(),
     ///     Some("bzl")

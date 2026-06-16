@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::saturn::entitystore::EntityStore;
+use crate::contract::policy::entitystore::EntityStore;
 
 /// Resolver for admin permissions based on Cedar entity data.
 ///
@@ -49,7 +49,7 @@ impl AdminResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saturn::entitystore::generate_entity;
+    use crate::contract::policy::entitystore::generate_entity;
 
     #[test]
     fn test_admin_resolver_identifies_admin() {

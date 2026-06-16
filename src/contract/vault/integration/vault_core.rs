@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 use tracing::log;
 
 use crate::{
-    common::errors::MegaError, jupiter::storage::Storage,
-    vault::integration::jupiter_backend::JupiterBackend,
+    common::errors::MegaError, contract::vault::integration::jupiter_backend::JupiterBackend,
+    jupiter::storage::Storage,
 };
 
 const CORE_KEY_FILE: &str = "core_key.json"; // where the core key is stored, like `root_token`

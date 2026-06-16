@@ -16,10 +16,6 @@ use git_internal::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    api_model::{
-        common::{CommonPage, Pagination},
-        git::commit::LatestCommitInfo,
-    },
     ceres::{
         api_service::{ApiHandler, history, tree_ops},
         model::{
@@ -27,6 +23,10 @@ use crate::{
             commit::{CommitFilesChangedPage, CommitSummary, GpgStatus},
             git::{CommitBindingInfo, LatestCommitInfoWrapper},
         },
+    },
+    contract::api::{
+        common::{CommonPage, Pagination},
+        git::commit::LatestCommitInfo,
     },
     jupiter::redis::AsyncCommands,
 };

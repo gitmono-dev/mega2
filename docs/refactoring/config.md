@@ -215,7 +215,7 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 
 后文的“敏感数据 Vault 化”方案高度依赖现有 `vault` 模块的真实形态，因此先澄清现状，避免规划脱离实现：
 
-- **vault 已是可用的通用 secret store。** `src/vault/integration/vault_core.rs` 基于 `libvault_core`（RustyVault），已提供 `read_secret`/`write_secret`/`delete_secret`（按 `secret/<name>` 路径存取任意 KV）。因此“把凭据写入 vault”所需的 API **已经存在**，不必新建存储能力。
+- **vault 已是可用的通用 secret store。** `src/contract/vault/integration/vault_core.rs` 基于 `libvault_core`（RustyVault），已提供 `read_secret`/`write_secret`/`delete_secret`（按 `secret/<name>` 路径存取任意 KV）。因此“把凭据写入 vault”所需的 API **已经存在**，不必新建存储能力。
 - **vault 的存储后端就是数据库。** `VaultCore::new(ctx: Storage)` 通过 `JupiterBackend` 把 secret 存进数据库（`ctx.vault_storage()`）。这意味着 vault 必须先有可用的数据库连接才能启动。
 - **由此形成明确的依赖链：`Config → Storage(数据库) → Vault`。** `Config::new`（同步）先产出配置 → `Storage::new(Arc<Config>)` 用 `database` 连库 → `VaultCore::new(storage)` 起 vault。**vault 在 `AppContext::new` 阶段才就绪，晚于 `Config::new`。**
 - **vault 当前只存了一个 secret：`ssh_server_key`**（`src/server/ssh_server.rs:78` 读取、`:99` 写入）。把全系统凭据集中进来是一次能力跃迁，需配套引导、备份与解封密钥保护，详见风险约束。

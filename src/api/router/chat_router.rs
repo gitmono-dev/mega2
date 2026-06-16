@@ -10,7 +10,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CHAT_TAG, error::ApiError, oauth::model::LoginUser},
-    api_model::{
+    contract::api::{
         chat::{
             AttachmentConfirmReq, AttachmentPresignReq, AttachmentPresignRes, AttachmentResponse,
             ChannelResponse, CreateChannelReq, CreateReactionReq, MessageResponse,
@@ -99,7 +99,7 @@ async fn map_message_model(
         } else {
             None
         };
-        reactions.push(crate::api_model::chat::ReactionResponse {
+        reactions.push(crate::contract::api::chat::ReactionResponse {
             public_id: r.public_id,
             content: r.content,
             username: r.username,
@@ -484,7 +484,7 @@ async fn create_reaction(
         None
     };
 
-    let mapped = crate::api_model::chat::ReactionResponse {
+    let mapped = crate::contract::api::chat::ReactionResponse {
         public_id: rx.public_id,
         content: rx.content,
         username: rx.username,
@@ -699,7 +699,7 @@ mod tests {
         Some(MonoApiServiceState {
             storage: storage.clone(),
             listen_addr: "http://localhost:8000".to_string(),
-            entity_store: crate::saturn::entitystore::EntityStore::new(),
+            entity_store: crate::contract::policy::entitystore::EntityStore::new(),
             git_object_cache,
             bellatrix: Arc::new(crate::bellatrix::Bellatrix::new(
                 storage.config().build.clone(),

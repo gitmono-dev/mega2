@@ -13,8 +13,8 @@ use crate::{
         api_doc::TAG_MANAGE,
         error::{ApiError, map_ceres_error},
     },
-    api_model::common::{CommonResult, PageParams},
     ceres::model::tag::{CreateTagRequest, DeleteTagResponse, TagListResponse, TagResponse},
+    contract::api::common::{CommonResult, PageParams},
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

@@ -8,12 +8,12 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{
         git_blob, git_commit, git_repo, git_tag, git_tree, import_refs,
         sea_orm_active_enums::RefTypeEnum,
     },
     common::{errors::MegaError, utils::generate_id},
+    contract::api::common::Pagination,
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
 

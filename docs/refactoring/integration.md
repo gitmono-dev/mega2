@@ -13,6 +13,7 @@
 3. **邮件通知端到端** — 配置 → SMTP mailer 构造 → dispatcher 启动 → 发送邮件
 4. **多渠道通知** — 触发器 → NotificationStorage → dispatcher 分发 → 各渠道投递
 5. **CLI 两阶段加载** — `config init` → `config secret set` → `config validate --resolve-secrets` → 服务启动
+6. **Contract 边界 smoke check** — API DTO、Git protocol、Vault bootstrap、Policy guard 在 `contract::*` 新路径下保持行为不变
 
 ## 假设
 
@@ -357,16 +358,16 @@ jobs:
 
 ## 测试覆盖矩阵
 
-| 测试用例 | 配置 | Vault | 邮件 | 通知 | CLI | 热加载 | 脱敏 |
-|---------|------|-------|------|------|-----|-------|------|
-| `test_config_init_and_load` | ✓ | - | - | - | ✓ | - | ✓ |
-| `test_database_bootstrap` | ✓ | - | - | - | - | - | - |
-| `test_vault_bootstrap_and_secrets` | ✓ | ✓ | - | - | ✓ | - | ✓ |
-| `test_mail_dispatcher` | ✓ | ✓ | ✓ | - | - | - | ✓ |
-| `test_notification_triggers` | ✓ | ✓ | ✓ | ✓ | - | - | - |
-| `test_cli_workflow_complete` | ✓ | ✓ | ✓ | - | ✓ | - | ✓ |
-| `test_config_hot_reload` | ✓ | - | - | - | - | ✓ | - |
-| `test_error_diagnosis_and_redaction` | ✓ | ✓ | ✓ | - | ✓ | - | ✓ |
+| 测试用例 | Contract | 配置 | Vault | 邮件 | 通知 | CLI | 热加载 | 脱敏 |
+|---------|----------|------|-------|------|------|-----|-------|------|
+| `test_config_init_and_load` | - | ✓ | - | - | - | ✓ | - | ✓ |
+| `test_database_bootstrap` | - | ✓ | - | - | - | - | - | - |
+| `test_vault_bootstrap_and_secrets` | ✓ | ✓ | ✓ | - | - | ✓ | - | ✓ |
+| `test_mail_dispatcher` | - | ✓ | ✓ | ✓ | - | - | - | ✓ |
+| `test_notification_triggers` | - | ✓ | ✓ | ✓ | ✓ | - | - | - |
+| `test_cli_workflow_complete` | ✓ | ✓ | ✓ | ✓ | - | ✓ | - | ✓ |
+| `test_config_hot_reload` | - | ✓ | - | - | - | - | ✓ | - |
+| `test_error_diagnosis_and_redaction` | - | ✓ | ✓ | ✓ | - | ✓ | - | ✓ |
 
 ## 集成测试与改进计划的对应
 
@@ -375,6 +376,7 @@ jobs:
 | 计划阶段 | 集成测试覆盖 | 备注 |
 |---------|-----------|------|
 | config 0a/0b/1/2 | `test_config_init_and_load`、`test_error_diagnosis_and_redaction` | 配置初始化、验证、CLI 命令 |
+| contract 0-2 | `cargo check`、`test_vault_bootstrap_and_secrets`、Git/API smoke tests | 新模块路径下行为不变 |
 | config 3、vault B | `test_database_bootstrap` | DB bootstrap、fail-closed 行为 |
 | config 4、vault E | `test_vault_bootstrap_and_secrets`、`test_cli_workflow_complete` | Secret 读写、resolver、命令完整流程 |
 | config 5、mail 2 | `test_mail_dispatcher` | SecretRef、mailer 构造、dispatcher 启动 |

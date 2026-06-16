@@ -8,12 +8,12 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{
         check_result, item_assignees, label, mega_cl, mega_conversation, path_check_configs,
         sea_orm_active_enums::MergeStatusEnum,
     },
     common::errors::MegaError,
+    contract::api::common::Pagination,
     jupiter::{
         model::common::{ItemDetails, ListParams},
         storage::{

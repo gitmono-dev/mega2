@@ -12,7 +12,6 @@ use crate::{
         error::ApiError,
         oauth::model::LoginUser,
     },
-    api_model::common::{CommonPage, CommonResult, PageParams},
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     ceres::model::{
         change_list::{
@@ -24,6 +23,7 @@ use crate::{
         label::LabelUpdatePayload,
     },
     common::errors::MegaError,
+    contract::api::common::{CommonPage, CommonResult, PageParams},
     jupiter::service::{cl_service::CLService, webhook_service::WebhookEvent},
 };
 

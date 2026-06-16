@@ -64,7 +64,6 @@ use regex::Regex;
 use tracing::debug;
 
 use crate::{
-    api_model::common::Pagination,
     bellatrix::Bellatrix,
     callisto::{
         mega_cl, mega_refs, mega_tag, mega_tree,
@@ -98,6 +97,7 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
+    contract::api::common::Pagination,
     io_orbit::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
     jupiter::{
         service::buck_service::{

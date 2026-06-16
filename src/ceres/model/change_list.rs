@@ -6,12 +6,12 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    api_model::common::CommonPage,
     callisto::{check_result, sea_orm_active_enums::MergeStatusEnum},
     ceres::{
         merge_checker::{CheckType, ConditionResult},
         model::{conversation::ConversationItem, label::LabelItem},
     },
+    contract::api::common::CommonPage,
     jupiter::model::{cl_dto::CLDetails, common::ListParams},
 };
 

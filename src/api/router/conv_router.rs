@@ -6,8 +6,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CONV_TAG, error::ApiError, oauth::model::LoginUser},
-    api_model::common::CommonResult,
     ceres::model::conversation::{ContentPayload, ReactionRequest},
+    contract::api::common::CommonResult,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

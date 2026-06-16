@@ -191,7 +191,7 @@ Chat 模块是一个从零迁移的大型功能模块，涉及 9 张表、12+ AP
 - Storage 放在 `src/jupiter/storage/chat_storage.rs` 或按领域拆分为 `channel_storage.rs`、`message_storage.rs`、`attachment_storage.rs`。
 - 领域服务放在 `src/chat/service/`。
 - HTTP 路由放在 `src/api/router/chat_router.rs` 或 `channel_router.rs`。
-- DTO 放在 `src/api_model/chat/`，除非现有 `api_model` 模式要求平铺。
+- DTO 放在 `src/contract/api/chat/`，除非现有 `contract::api` 模式要求平铺。
 - 迁移放在 `src/jupiter/migration/`，文件名使用 `create_chat_tables` 或 `create_channel_tables` 这类语义名称。
 
 调用方向：

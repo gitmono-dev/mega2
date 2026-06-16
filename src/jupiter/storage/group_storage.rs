@@ -9,12 +9,12 @@ use sea_orm::{
 };
 
 use crate::{
-    api_model::common::Pagination,
     callisto::{
         mega_group, mega_group_member, mega_resource_permission,
         sea_orm_active_enums::ResourceTypeEnum,
     },
     common::{errors::MegaError, utils::generate_id},
+    contract::api::common::Pagination,
     jupiter::{
         model::group_dto::{
             CreateGroupPayload, DeleteGroupStats, ResourcePermissionBinding, UpdateGroupPayload,

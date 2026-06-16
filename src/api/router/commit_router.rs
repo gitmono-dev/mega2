@@ -9,13 +9,13 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CODE_PREVIEW, error::ApiError},
-    api_model::common::{CommonPage, CommonResult, PageParams, Pagination},
     ceres::model::{
         change_list::MuiTreeNode,
         commit::{
             CommitBindingResponse, CommitFilesChangedPage, CommitHistoryParams, CommitSummary,
         },
     },
+    contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
 };
 
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]

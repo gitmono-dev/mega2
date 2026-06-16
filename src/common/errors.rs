@@ -10,7 +10,7 @@ use config::ConfigError;
 use git_internal::errors::GitError;
 use thiserror::Error;
 
-use crate::api_model::common::CommonResult;
+use crate::contract::api::common::CommonResult;
 
 pub type MegaResult = Result<(), MegaError>;
 

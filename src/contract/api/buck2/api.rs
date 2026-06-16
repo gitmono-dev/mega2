@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api_model::buck2::{status::Status, types::ProjectRelativePath};
+use crate::contract::api::buck2::{status::Status, types::ProjectRelativePath};
 
 /// Parameters required to build a task.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]

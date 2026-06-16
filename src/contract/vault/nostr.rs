@@ -1,7 +1,7 @@
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use tracing::log;
 
-use crate::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
 
 const NOSTR_IDENTITY_KEY: &str = "nostr_identity_key";
 

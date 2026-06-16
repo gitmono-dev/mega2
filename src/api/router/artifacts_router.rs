@@ -15,7 +15,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::ARTIFACTS_TAG, error::ApiError},
-    api_model::artifacts::{
+    common::errors::MegaError,
+    contract::api::artifacts::{
         ARTIFACT_PRESIGN_URL_TTL_SECS, ArtifactBatchRequest, ArtifactBatchResponse,
         ArtifactCommitRequest, ArtifactCommitResponse, ArtifactDiscoveryResponse, ArtifactLink,
         ArtifactListSetsResponse, ArtifactObjectReadActions, ArtifactObjectReadResponse,
@@ -23,7 +24,6 @@ use crate::{
         DownloadArtifactObjectQuery, GetArtifactSetQuery, ListArtifactSetsQuery,
         ResolveArtifactFileQuery,
     },
-    common::errors::MegaError,
     jupiter::service::artifact_service::ArtifactService,
 };
 
