@@ -127,3 +127,17 @@ jobs:
           fi
           grep -F "secret ref must include a #field suffix" "${secret_ref_output}"
           grep -F "mail.password_ref" "${secret_ref_output}"
+
+          cat > "${config_dir}/config.bad-redis.toml" <<'EOF'
+          [redis]
+          url = "http://localhost:6379"
+          EOF
+
+          redis_output="${config_dir}/bad-redis.out"
+          if cargo run -- --config "${config_dir}/config.toml" --profile bad-redis config validate >"${redis_output}" 2>&1; then
+            cat "${redis_output}"
+            echo "bad Redis config unexpectedly validated"
+            exit 1
+          fi
+          grep -F "redis.url scheme" "${redis_output}"
+          grep -F "'redis' or 'rediss'" "${redis_output}"
