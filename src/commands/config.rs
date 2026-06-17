@@ -9,7 +9,8 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value};
 
 use crate::{
-    commands::{CommandContext, LoadMode, require_config, require_config_path},
+    cli::init_log,
+    commands::{CommandContext, LoadMode, require_config_path},
     common::errors::{MegaError, MegaResult},
     config::{
         Config,
@@ -129,7 +130,7 @@ pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
             Some(("set" | "check", _)) => LoadMode::VaultBootstrap,
             _ => LoadMode::ParsedConfig,
         },
-        Some(("validate", _)) => LoadMode::ParsedConfig,
+        Some(("validate", _)) => LoadMode::RawSources,
         _ => LoadMode::ParsedConfig,
     }
 }
@@ -140,12 +141,13 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some(("init", init_args)) => exec_init(ctx, init_args),
         Some(("secret", secret_args)) => exec_secret(ctx, secret_args).await,
         Some(("validate", validate_args)) => {
-            let config_path = ctx.config_path.clone();
+            let config_path = require_config_path(&ctx, "config validate")?;
             let config_profile_path = ctx.config_profile_path.clone();
-            let config = require_config(ctx, "config validate")?;
+            let config = load_config_for_validate(&config_path, config_profile_path.as_deref())?;
+            init_log(&config.log);
             validate_config(
                 &config,
-                config_path.as_deref(),
+                Some(&config_path),
                 config_profile_path.as_deref(),
                 validate_args.get_flag("resolve-secrets"),
             )
@@ -289,6 +291,14 @@ async fn validate_config(
     Ok(())
 }
 
+fn load_config_for_validate(path: &Path, profile_path: Option<&Path>) -> Result<Config, MegaError> {
+    let path = path.to_str().ok_or_else(|| {
+        MegaError::Other(format!("Config path contains invalid UTF-8: {:?}", path))
+    })?;
+
+    Config::new_with_profile(path, profile_path)
+}
+
 async fn bootstrap_vault(config: &Config) -> Result<VaultCore, MegaError> {
     VaultCore::from_database_config(&config.database, VaultCore::default_key_path())
         .await
@@ -376,6 +386,13 @@ mod tests {
         let matches = cli().try_get_matches_from(["config", "init"]).unwrap();
 
         assert_eq!(load_mode(&matches), LoadMode::None);
+    }
+
+    #[test]
+    fn config_validate_uses_raw_sources_load_mode() {
+        let matches = cli().try_get_matches_from(["config", "validate"]).unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::RawSources);
     }
 
     #[test]

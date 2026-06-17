@@ -9,7 +9,7 @@
 > **事实校准（2026-06-18 复核）：** 本文档已按 `vault.md` 的 2026-06-17 落地状态和当前 `src/` 重新校准。与早期草案相比，多个原本作为前置的能力已经完成，后续执行必须以本节和“当前实现状态速览表”为准，不要按旧阶段重复实现。需特别注意以下事实：
 > 1. **`Config` 已迁入顶层 `src/config/`，调用方已迁到 `crate::config`。** 阶段 1 的物理模块提升和阶段 3 的路径迁移已完成，`src/common/config.rs` shim 已移除；`model.rs` 已承接 `Config` 及各领域子配置结构体，`source.rs` 已承接 source 构建，`expand.rs` 已承接占位符展开函数；`error.rs` 已承接首批占位符诊断错误；`validate.rs` 已承接首批集中校验（database/log/lfs/build/redis/mail/Buck/object storage/orion_server）和 `config validate` 文件级、`MEGA_*` 环境变量覆盖项的未消费字段 warning。`Config` 当前含 `mail: Option<MailConfig>`，但仍不含 `oauth` 字段，也无 `OAuthConfig`；`[oauth]` 仍没有运行期消费者。
 > 2. **mail 已是真实后置消费者，且已接入 `password_ref`。** `MailConfig` 已包含兼容期 `password: Option<SecretString>` 与推荐的 `password_ref: Option<SecretRef>`，两者互斥；明文 `password` 路径会输出 deprecation warning，`SecretString` 的 Debug/Serialize 输出脱敏，明文只在 `SmtpMailer::new` 适配层显式暴露。`AppContext::new` 在 `VaultCore::new` 之后解析 `mail.password_ref`，再通过 `SmtpMailer::new_with_password` 构造 mailer。SMTP 构造失败现在返回可诊断错误，不再由 `if let Ok(...)` 静默吞掉。
-> 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config init`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config init` 走 `LoadMode::None`，只写安全配置骨架；`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`--profile` / `MEGA_PROFILE` 与 `src/config/testing.rs` 已完成首批。仍未实现的是 RawSources/source diagnostics 的完整语义，以及 `src/config/` 的热加载职责子模块。
+> 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config init`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config init` 走 `LoadMode::None`，只写安全配置骨架；`config validate` 走 `LoadMode::RawSources`，由 CLI 定位 base/profile 路径后在命令内解析配置，避免坏配置被子命令分发前预加载拦截；`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`--profile` / `MEGA_PROFILE` 与 `src/config/testing.rs` 已完成首批。仍未实现的是 RawSources/source diagnostics 的完整语义，以及 `src/config/` 的热加载职责子模块。
 > 4. **SecretRef 与 resolver 已实现首批。** `src/config/secret.rs` 定义 `SecretRef`、`SecretResolver`、`VaultSecretResolver`，支持 `vault://secret/<name>#<field>`、缓存 TTL、`evict`/`evict_all`，并拒绝 `secret/secret/...` 等错误路径。
 > 5. **Vault 生产化前置的核心子集已完成。** `VaultCore` 已 Result 化、key 缺失 fail-closed、不再因 `core_key.json` 缺失清空 vault 表；`core_key.json` 不再长期保存 root token，只保存 unseal shares 和限权 runtime tokens；root token / shares 不再输出到 stdout、stderr 或 tracing；key 目录和文件在 Unix 下收紧到 `0700` / `0600`；常规 secret 访问使用限权 token 并记录 `vault_audit` 事件。残余风险是：自动解封材料仍落在本地 key 文件中，磁盘读取攻击者仍可获得解封能力，仍需部署侧 KMS/secret manager 与备份恢复流程。
 > 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、profile 来源诊断、测试配置分层的全仓迁移、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。`config init`、Profile、基础样例凭据治理、raw TOML 未知字段 warning、`MEGA_*` 未消费/被忽略覆盖项 warning 和 testing helper 已有首批可执行入口，后续只需围绕模板治理、样例校验矩阵和完整 source diagnostics 继续收敛。
@@ -31,7 +31,7 @@
 | Vault 管理的 secret            | 已扩展     | 现有直接消费者包括 `ssh_server_key`、PGP、Nostr、PKI 以及首批配置 SecretRef（`mail.password_ref` → `secret/config/...`）。 |
 | `core_key.json` + 自动解封     | 已加固 | JSON 存储 unseal shares + 限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不 `delete_all()`；token/root/shares 不输出到日志。 |
 | Profile / `config.<profile>.toml` | **已实现首批** | 全局 `--profile <name>` 优先于 `MEGA_PROFILE`；profile 文件固定为基础配置同目录、同 stem 的 `.<profile>.toml`，例如 `config.toml` → `config.prod.toml`；基础配置后叠加 profile，再叠加 `MEGA_*` 环境变量。profile 名限制为 ASCII 字母/数字/`-`/`_`，指定但文件不存在会报错；`config validate` 会对 base/profile 文件分别输出 raw TOML warning；`config secret set/check` 仍走最小 DB/Vault bootstrap，但读取 profile 合并后的 DB 配置。完整 profile source diagnostics 仍待补。 |
-| `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现；`config validate` 已输出 raw TOML 和 `MEGA_*` 环境变量未消费/未知字段 warning；坏 env 类型会报出变量名、字段路径和期望类型，并脱敏原始值。完整 source diagnostics 仍未实现。 |
+| `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现；`config validate` 已切到 `LoadMode::RawSources` 并在命令内解析配置，已输出 raw TOML 和 `MEGA_*` 环境变量未消费/未知字段 warning；坏 env 类型会报出变量名、字段路径和期望类型，并脱敏原始值。完整 source diagnostics 仍未实现。 |
 | 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 的端口/URL/DB URL；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`；`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、raw TOML 任意未知字段和 `MEGA_*` 未消费/被忽略覆盖项输出 warning，且坏 env 类型错误已脱敏。profile 来源诊断和完整 source diagnostics 仍待补齐。 |
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
 | 测试配置辅助                   | **已实现首批** | `src/config/testing.rs` 已提供 `TestConfigBuilder`、`isolated_config()` 与 `TestSecretResolver`，可派生临时 base/cache/LFS/object storage 路径、接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景；尚未把全仓测试和 CI 配置矩阵迁移到该 helper。 |
@@ -92,8 +92,8 @@ src/main.rs
 ```text
 config secret ref                 # LoadMode::None，不读取配置、不连接 DB/Vault
 config secret set/check           # LoadMode::VaultBootstrap，只解析配置路径并走最小 DB/Vault bootstrap
-config validate                   # LoadMode::ParsedConfig，解析完整 Config
-config validate --resolve-secrets # ParsedConfig + 最小 DB/Vault bootstrap
+config validate                   # LoadMode::RawSources，命令内解析 Config 并输出 source diagnostics
+config validate --resolve-secrets # RawSources + 命令内解析 Config + 最小 DB/Vault bootstrap
 service / chat-migrate            # LoadMode::FullAppContext
 ```
 
@@ -552,19 +552,21 @@ CLI 执行模型也已调整为按命令声明加载层级。后续新增命令�
 ```rust
 enum LoadMode {
     None,
+    ConfigPath,
+    RawSources,
     ParsedConfig,
     VaultBootstrap,
     FullAppContext,
 }
 ```
 
-CLI 先解析全局参数和子命令，再根据命令声明的 `LoadMode` 执行对应加载。这样可以保证 `config init` 和 `config secret ref` 不读取配置，`config secret set/check` 只建立 DB/Vault 最小上下文，`service http` 才构造完整 `AppContext`。`config init` 已使用“不依赖配置解析”的加载模式，保证无配置或坏配置时也可运行。
+CLI 先解析全局参数和子命令，再根据命令声明的 `LoadMode` 执行对应加载。这样可以保证 `config init` 和 `config secret ref` 不读取配置，`config validate` 只由 CLI 定位 base/profile 路径并在命令内运行解析/校验流水线，`config secret set/check` 只建立 DB/Vault 最小上下文，`service http` 才构造完整 `AppContext`。`config init` 已使用“不依赖配置解析”的加载模式，保证无配置或坏配置时也可运行。
 
 | 命令类型 | 需要的加载层级 | 说明 |
 | --- | --- | --- |
 | `config init` | 只需要目标路径和模板 | 配置不存在或损坏时也必须可运行 |
-| `config validate` | 读取 source 并运行解析/校验流水线 | 需要能报告坏配置，而不是被 CLI 预加载拦截 |
-| `config validate --resolve-secrets` | 完整 `Config` + 最小 DB/Vault bootstrap | 用于检查 SecretRef 是否可读，不应初始化 Redis/S3/HTTP |
+| `config validate` | `RawSources` + 命令内解析/校验流水线 | 需要能报告坏配置，而不是被 CLI 预加载拦截 |
+| `config validate --resolve-secrets` | `RawSources` + 命令内解析 `Config` + 最小 DB/Vault bootstrap | 用于检查 SecretRef 是否可读，不应初始化 Redis/S3/HTTP |
 | `config secret ref` | SecretRef 命名规则 | 只生成引用，不应依赖 DB/vault |
 | `config secret set/check` | 完整 `Config` + 最小 DB/Vault bootstrap | 缺少 DB/vault 时输出前置步骤；不得构造完整 `AppContext` |
 | `service ...` | 完整 `Config` + `AppContext` | 保持现有服务启动语义 |
@@ -740,7 +742,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 15. 已完成首批：新增 `monoengine config init`，只操作配置文件和模板，不连接数据库或 vault，不接收或写入真实 secret；命令走 `LoadMode::None`，支持默认路径、全局 `--config`、`--output` 和 `--force`。
 16. 已完成首批：`config init` 生成安全默认骨架，不写入可预测生产密码；数据库、Redis、当前对象存储凭据只给 env/部署 secret 指引；对 `mail.password_ref` 生成 SecretRef 占位，并提示后续使用 `config secret set --value-stdin` 写入真实值。
-17. 已完成首批 raw TOML 与 `MEGA_*` diagnostics：坏 TOML 可由文件解析错误返回，未知字段、废弃字段、未知环境变量覆盖项、孤立 `oauth` 环境变量覆盖项和旧 mail TLS 环境变量覆盖项已在 `config validate` 中 warning，且 env warning 只输出变量名和映射字段路径，不输出变量值；坏环境变量类型已报出变量名、字段路径和期望类型，并脱敏原始值。继续补齐 `RawSources`/source diagnostics：profile 冲突、占位符错误来源、跨 source 覆盖关系、修复建议等应能在不构造完整 `AppContext` 的情况下报告。
+17. 已完成首批 raw TOML 与 `MEGA_*` diagnostics：`config validate` 已切到 `LoadMode::RawSources` 并在命令内解析配置，坏 TOML/坏 env 类型等不会被 CLI 子命令分发前预加载拦截；坏 TOML 可由文件解析错误返回，未知字段、废弃字段、未知环境变量覆盖项、孤立 `oauth` 环境变量覆盖项和旧 mail TLS 环境变量覆盖项已在 `config validate` 中 warning，且 env warning 只输出变量名和映射字段路径，不输出变量值；坏环境变量类型已报出变量名、字段路径和期望类型，并脱敏原始值。继续补齐 `RawSources`/source diagnostics：profile 冲突、占位符错误来源、跨 source 覆盖关系、修复建议等应能在不构造完整 `AppContext` 的情况下报告。
 18. 保持已实现的 `config secret ref/set/check` 行为：只允许 `mail.password` 等后置可迁移凭据，继续拒绝 database/redis/object storage 凭据。
 
 > **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例，且生成结果可解析、可校验、无明文密码字段；`config validate` 能在坏配置时输出诊断而非被预加载拦截；`config secret ref/set/check` 的既有测试继续通过。
@@ -801,7 +803,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - **Secret 轮转时的双凭据过渡开销**：两阶段凭据轮转可以降低切换中断风险，但 fallback 不应成为所有 secret 的默认行为。应将多版本读取能力封装在 `SecretResolver` 或专门适配层中，由消费端按外部系统语义决定是否回退。
 - **包装类型（SecretString）在网络传输与持久化中的误暴露**：尽管 `SecretString` 在 Rust 代码中能有效防止 `Debug` 泄露，但在将其序列化（如写入外部监控日志、通过 OpenAPI 接口返回、或者保存到临时数据库中）时，如果序列化库（如 `serde`）未正确配置，仍可能会提取其明文。必须在编译期实施 lints 或强制配置 `#[serde(skip_serialize)]` 规则。
 - **当前对象存储和 Redis 也是早期依赖。** `Storage::new` 会在 vault 就绪前构造对象存储，`AppContext::new` 会在 vault 就绪前连接 Redis；因此 S3 access key、带密码的 Redis URL 等字段不能直接按“可迁移凭据”处理，除非先重构初始化顺序。
-- **CLI 两阶段加载已是基线。** `config init` 已使用 `LoadMode::None`；后续新增 RawSources/source diagnostics、profile 或其它配置命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
+- **CLI 两阶段加载已是基线。** `config init` 已使用 `LoadMode::None`，`config validate` 已使用 `LoadMode::RawSources` 并在命令内解析配置以避免坏配置被预加载拦截；后续新增 source diagnostics、profile 或其它配置命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
 - **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction。剩余主要是外部服务 URL、对象存储 key、兼容期 `mail.password`、SecretRef URI，以及更多配置/source 诊断路径的统一 redaction。
 - **`core_key.json` 加固核心已完成，但部署侧托管仍是生产边界。** fail-closed、权限收紧、root token 脱敏/退役已落地；把更多凭据放入 vault 仍不抵御能读取 key 文件的攻击者，生产使用必须配套 KMS/secret manager、受控挂载、备份恢复和恢复演练。
 - **采用分阶段切换。** 顶层迁移和调用方路径迁移已完成；后续内部拆分、错误模型、初始化命令和热加载仍必须各自独立评审，不追求“单次变更内完成全部改造”。
@@ -887,7 +889,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 1. 已完成：顶层结构迁移，`src/config/{mod,model,source,expand,loader,template,secret}.rs` 成为主实现，源码调用方已迁到 `crate::config`，`common::config` shim 已删除。
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
 3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则、profile 来源诊断和完整 source diagnostics。
-4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；raw TOML、`MEGA_*` 未消费覆盖项 warning 和坏 env 类型脱敏错误已完成首批；继续补 RawSources/source diagnostics。
+4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning 和坏 env 类型脱敏错误已完成首批；继续补完整 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics 与坏 env 类型单测；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
 7. 独立阶段：受控热加载，白名单字段生效，候选失败时保留旧配置。
@@ -910,6 +912,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [x] 已在 `validate.rs`/`config validate` 中加入首批 raw TOML 未消费/未知字段告警，覆盖当前 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、任意未知字段、嵌套 table 和数组内 inline table。
 - [x] 已在 `validate.rs`/`config validate` 中加入首批 `MEGA_*` 未消费/被忽略覆盖项告警，覆盖未知 env 覆盖项、`MEGA_OAUTH__...`、`MEGA_MAIL__TLS`/`MEGA_MAIL__SMTP_TLS`，并避免输出 env 值。
 - [x] 已把坏环境变量类型包装为脱敏诊断，输出变量名、字段路径和期望类型，不输出原始 env 值。
+- [x] 已将 `config validate` 切到 `LoadMode::RawSources`，配置解析发生在命令内，坏配置不会在子命令分发前被预加载拦截。
 - [ ] 已计划同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
 - [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、Profile、热加载分别单独提交，`config init` 模板治理不与这些阶段混合。
 - [x] 已在 CI 中增加配置样例首批校验任务（基础 + 生成 + profile + env diagnostics + 坏 env 类型单测）；更多坏输入、完整 source diagnostics 和 SecretRef 失败矩阵仍待补。

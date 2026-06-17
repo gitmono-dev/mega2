@@ -117,7 +117,7 @@ fn install_ctrlc_handler() {
     });
 }
 
-fn init_log(config: &LogConfig) {
+pub(crate) fn init_log(config: &LogConfig) {
     let log_level = match config.level.as_str() {
         "trace" => tracing::Level::TRACE,
         "debug" => tracing::Level::DEBUG,
@@ -179,7 +179,42 @@ fn exec_subcommand(ctx: CommandContext, cmd: &str, args: &ArgMatches) -> MegaRes
 
 #[cfg(test)]
 mod tests {
+    use std::{ffi::OsString, sync::Mutex};
+
     use super::*;
+    use crate::config::template::config_init_template;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this test module serializes mutations of MEGA_* variables with ENV_LOCK
+            // and restores the previous value when the guard is dropped.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: see EnvVarGuard::set; this restores the serialized test mutation.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn cli_accepts_config_path() {
@@ -269,5 +304,24 @@ mod tests {
     #[test]
     fn parse_loads_config_without_subcommand() {
         parse(Some(vec!["--config", "config/config.toml"])).unwrap();
+    }
+
+    #[test]
+    fn config_validate_reports_bad_env_type_without_cli_preload() {
+        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let _print_std = EnvVarGuard::set("MEGA_LOG__PRINT_STD", "not_bool_secret");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("write config");
+        let config_path = config_path.to_string_lossy().to_string();
+
+        let err = parse(Some(vec!["--config", &config_path, "config", "validate"]))
+            .expect_err("bad env override should fail in config validate");
+        let message = err.to_string();
+
+        assert!(message.contains("MEGA_LOG__PRINT_STD"));
+        assert!(message.contains("log.print_std"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("not_bool_secret"));
     }
 }
