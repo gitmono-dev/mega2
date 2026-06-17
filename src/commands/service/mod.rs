@@ -6,6 +6,7 @@ use clap::{ArgMatches, Command};
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
+    cli::config_reload_log_subscriber,
     commands::{CommandContext, require_config},
     common::errors::{MegaError, MegaResult},
     config::reload::{ConfigHandle, ConfigReloadWatcher},
@@ -37,6 +38,9 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     };
 
     let context = AppContext::new(config).await?;
+    context
+        .config_handle
+        .subscribe(config_reload_log_subscriber())?;
     let reload_watcher = spawn_config_reload_watcher(
         context.config_handle.clone(),
         config_path,
@@ -145,7 +149,9 @@ async fn spawn_config_reload_watcher_with_interval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, reload::ConfigHandle, template::config_init_template};
+    use crate::config::{
+        Config, reload::ConfigHandle, template::config_init_template, testing::isolated_config,
+    };
 
     #[test]
     fn service_cli_contains_mega_service_subcommands() {
@@ -155,6 +161,32 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["http", "ssh", "multi"]);
+    }
+
+    #[test]
+    fn service_registers_log_reload_subscriber_for_config_handle() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.log.level = "info".to_string();
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_log_subscriber())
+            .expect("subscribe");
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.log.level = "debug".to_string();
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(report.applied_fields, vec!["log.level"]);
+        assert_eq!(handle.snapshot().expect("snapshot").log.level, "debug");
+
+        let mut restore = handle.snapshot().expect("snapshot").as_ref().clone();
+        restore.log.level = "info".to_string();
+        let restore_report = handle.reload(restore).expect("restore should succeed");
+
+        assert_eq!(restore_report.applied_fields, vec!["log.level"]);
+        assert_eq!(handle.snapshot().expect("snapshot").log.level, "info");
     }
 
     #[tokio::test]

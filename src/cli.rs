@@ -1,8 +1,22 @@
 //! Cli module is responsible for parsing command line arguments and executing the appropriate.
 
-use std::{env, path::PathBuf, sync::Once};
+use std::{
+    env,
+    path::PathBuf,
+    sync::{Arc, Once, OnceLock},
+};
 
 use clap::{Arg, ArgMatches, Command};
+use tracing_subscriber::{
+    filter::LevelFilter,
+    fmt::{
+        Layer as FmtLayer,
+        format::{DefaultFields, Format},
+        writer::BoxMakeWriter,
+    },
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::{
     commands::{CommandContext, LoadMode, builtin, builtin_exec, load_mode, unknown_subcommand},
@@ -11,10 +25,13 @@ use crate::{
         Config, LogConfig,
         loader::{ConfigInput, ConfigLoader, LoadedConfig},
         mega_cache,
+        reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
 };
 
 static CTRLC_HANDLER: Once = Once::new();
+type LogReloadFn = dyn Fn(&LogConfig) -> Result<(), MegaError> + Send + Sync + 'static;
+static LOG_RELOAD: OnceLock<Arc<LogReloadFn>> = OnceLock::new();
 
 pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
     let matches = match args {
@@ -118,33 +135,92 @@ fn install_ctrlc_handler() {
 }
 
 pub(crate) fn init_log(config: &LogConfig) {
-    let log_level = match config.level.as_str() {
-        "trace" => tracing::Level::TRACE,
-        "debug" => tracing::Level::DEBUG,
-        "info" => tracing::Level::INFO,
-        "warn" => tracing::Level::WARN,
-        "error" => tracing::Level::ERROR,
-        _ => tracing::Level::INFO,
-    };
+    let (filter_layer, filter_reload_handle) =
+        tracing_subscriber::reload::Layer::new(log_level_filter(config));
+    let (format_layer, format_reload_handle) =
+        tracing_subscriber::reload::Layer::new(log_format_layer(config));
+    let init_result = tracing_subscriber::registry()
+        .with(format_layer)
+        .with(filter_layer)
+        .try_init();
 
-    let file_appender = tracing_appender::rolling::hourly(mega_cache().join("logs"), "mono-logs");
-
-    let init_result = if config.print_std {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stdout)
-            .with_max_level(log_level)
-            .with_ansi(config.with_ansi)
-            .try_init()
+    if init_result.is_ok() {
+        let reload = Arc::new(move |config: &LogConfig| {
+            filter_reload_handle
+                .reload(log_level_filter(config))
+                .map_err(|error| {
+                    MegaError::Other(format!("failed to reload log level filter: {error}"))
+                })?;
+            format_reload_handle
+                .reload(log_format_layer(config))
+                .map_err(|error| {
+                    MegaError::Other(format!("failed to reload log format layer: {error}"))
+                })
+        });
+        let _ = LOG_RELOAD.set(reload);
     } else {
-        tracing_subscriber::fmt()
-            .with_writer(file_appender)
-            .with_max_level(log_level)
-            .with_ansi(config.with_ansi)
-            .try_init()
-    };
-
-    if init_result.is_err() {
         tracing::debug!("tracing subscriber was already initialized");
+    }
+}
+
+pub(crate) fn config_reload_log_subscriber() -> ConfigReloadSubscriber {
+    ConfigReloadSubscriber::new(
+        "log",
+        |next, report| reload_log_if_needed(&next.log, report),
+        |current, report| reload_log_if_needed(&current.log, report),
+    )
+}
+
+fn reload_log_if_needed(config: &LogConfig, report: &ConfigReloadReport) -> Result<(), MegaError> {
+    if !report
+        .applied_fields
+        .iter()
+        .any(|field| matches!(*field, "log.level" | "log.print_std" | "log.with_ansi"))
+    {
+        return Ok(());
+    }
+
+    reload_log(config)
+}
+
+fn reload_log(config: &LogConfig) -> Result<(), MegaError> {
+    if let Some(reload) = LOG_RELOAD.get() {
+        reload(config)
+    } else {
+        tracing::debug!(
+            "log reload requested before reloadable tracing subscriber was initialized"
+        );
+        Ok(())
+    }
+}
+
+fn log_format_layer(
+    config: &LogConfig,
+) -> FmtLayer<tracing_subscriber::Registry, DefaultFields, Format, BoxMakeWriter> {
+    tracing_subscriber::fmt::layer()
+        .with_writer(log_writer(config))
+        .with_ansi(config.with_ansi)
+}
+
+fn log_writer(config: &LogConfig) -> BoxMakeWriter {
+    if config.print_std {
+        BoxMakeWriter::new(std::io::stdout)
+    } else {
+        BoxMakeWriter::new(tracing_appender::rolling::hourly(
+            mega_cache().join("logs"),
+            "mono-logs",
+        ))
+    }
+}
+
+fn log_level_filter(config: &LogConfig) -> LevelFilter {
+    match config.level.as_str() {
+        "trace" => LevelFilter::TRACE,
+        "debug" => LevelFilter::DEBUG,
+        "info" => LevelFilter::INFO,
+        "warn" => LevelFilter::WARN,
+        "error" => LevelFilter::ERROR,
+        _ => LevelFilter::INFO,
     }
 }
 
