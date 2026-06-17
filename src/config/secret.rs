@@ -352,4 +352,30 @@ mod tests {
         assert_eq!(resolver.resolve(&secret_ref).await.unwrap(), "second");
         resolver.evict_all().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn vault_secret_resolver_reports_missing_secret_without_leaking_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let connection = Arc::new(test_db_connection(temp_dir.path()).await);
+        apply_migrations(&connection, true).await.unwrap();
+        let vault =
+            VaultCore::from_database_connection(connection, temp_dir.path().join("core_key.json"))
+                .await
+                .unwrap();
+
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/test/mail/missing-password#value").unwrap();
+        let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
+
+        let err = resolver
+            .resolve(&secret_ref)
+            .await
+            .expect_err("missing vault secret should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("secret not found"));
+        assert!(message.contains("vault://secret/***#***"));
+        assert!(!message.contains("config/test/mail/missing-password"));
+        assert!(!message.contains("#value"));
+    }
 }

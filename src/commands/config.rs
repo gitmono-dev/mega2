@@ -280,12 +280,25 @@ async fn validate_config(
 
     if let Some(mail_cfg) = &config.mail {
         mail_cfg.warn_plaintext_password_deprecated();
+    }
 
-        if resolve_secrets && let Some(secret_ref) = &mail_cfg.password_ref {
-            let vault = bootstrap_vault(config).await?;
-            let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
-            resolver.resolve(secret_ref).await?;
-        }
+    if resolve_secrets {
+        let vault = bootstrap_vault(config).await?;
+        let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
+        resolve_config_secrets(config, &resolver).await?;
+    }
+
+    Ok(())
+}
+
+async fn resolve_config_secrets<R>(config: &Config, resolver: &R) -> Result<(), MegaError>
+where
+    R: SecretResolver + ?Sized,
+{
+    if let Some(mail_cfg) = &config.mail
+        && let Some(secret_ref) = &mail_cfg.password_ref
+    {
+        resolver.resolve(secret_ref).await?;
     }
 
     Ok(())
@@ -361,7 +374,10 @@ fn read_secret_value_from_stdin() -> Result<String, MegaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::testing::env_lock;
+    use crate::config::{
+        MailConfig,
+        testing::{TestSecretResolver, env_lock},
+    };
 
     #[test]
     fn config_secret_ref_uses_no_config_load_mode() {
@@ -437,7 +453,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn validate_rejects_mail_password_and_password_ref_together() {
         let config = Config {
-            mail: Some(crate::config::MailConfig {
+            mail: Some(MailConfig {
                 enabled: false,
                 smtp_host: "smtp.example.com".to_string(),
                 smtp_port: 587,
@@ -456,5 +472,35 @@ mod tests {
             .await
             .expect_err("mutual exclusion should fail");
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref() {
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
+        let config = Config {
+            mail: Some(MailConfig {
+                enabled: false,
+                smtp_host: "smtp.example.com".to_string(),
+                smtp_port: 587,
+                username: None,
+                password: None,
+                password_ref: Some(secret_ref),
+                from: "no-reply@example.com".to_string(),
+                starttls: true,
+            }),
+            ..Config::mock()
+        };
+        let resolver = TestSecretResolver::new();
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("missing SecretRef should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("test secret not found"));
+        assert!(message.contains("vault://secret/***#***"));
+        assert!(!message.contains("config/test/mail/password"));
+        assert!(!message.contains("#value"));
     }
 }
