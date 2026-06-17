@@ -14,11 +14,14 @@ pub enum ConfigDiagnostic {
         stage: &'static str,
         source: ConfigError,
     },
-    #[error("failed to expand placeholder for `{key}`: {source}")]
-    PlaceholderSubstitute {
-        key: String,
-        source: envsubst::Error,
-    },
+    #[error(
+        "failed to expand placeholder from `{origin}` for `{key}`: value is redacted; ensure referenced placeholders resolve to plain strings without nested `${{...}}` or remove the placeholder"
+    )]
+    PlaceholderSubstitute { origin: String, key: String },
+    #[error(
+        "unresolved placeholder from `{origin}` for `{key}`: value is redacted; define the referenced placeholder before `{key}` or remove the placeholder"
+    )]
+    PlaceholderUnresolved { origin: String, key: String },
     #[error("failed to set expanded placeholder override for `{key}`: {source}")]
     PlaceholderSetOverride { key: String, source: ConfigError },
     #[error("failed to read placeholder value for `{key}` as string: {source}")]

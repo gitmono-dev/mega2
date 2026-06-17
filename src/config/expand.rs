@@ -38,12 +38,8 @@ pub(crate) fn variable_placeholder_substitute(
         // a copy
         if let ValueKind::String(str) = &v.kind {
             if envsubst::is_templated(str) {
-                let new_str = envsubst::substitute(str, &vars).map_err(|source| {
-                    ConfigDiagnostic::PlaceholderSubstitute {
-                        key: k.clone(),
-                        source,
-                    }
-                })?;
+                let origin = value_origin(&v);
+                let new_str = substitute_placeholder(&k, &origin, str, &vars)?;
                 v.kind = ValueKind::String(new_str.clone());
                 builder = builder.set_override(&k, v).map_err(|source| {
                     ConfigDiagnostic::PlaceholderSetOverride {
@@ -90,12 +86,8 @@ pub(crate) fn variable_placeholder_substitute(
                     source,
                 })?;
         if envsubst::is_templated(&str) {
-            let new_str = envsubst::substitute(&str, &vars).map_err(|source| {
-                ConfigDiagnostic::PlaceholderSubstitute {
-                    key: k.clone(),
-                    source,
-                }
-            })?;
+            let origin = value_origin(&v);
+            let new_str = substitute_placeholder(&k, &origin, &str, &vars)?;
             // println!("{}: {} -> {}", k, str, &new_str);
             v.kind = ValueKind::String(new_str.clone());
             builder = builder.set_override(&k, v).map_err(|source| {
@@ -116,6 +108,34 @@ pub(crate) fn variable_placeholder_substitute(
             source,
         })
         .map_err(ConfigError::from)
+}
+
+fn substitute_placeholder(
+    key: &str,
+    origin: &str,
+    template: &str,
+    vars: &HashMap<String, String>,
+) -> Result<String, ConfigError> {
+    let expanded = envsubst::substitute(template, vars).map_err(|_| {
+        ConfigDiagnostic::PlaceholderSubstitute {
+            origin: origin.to_string(),
+            key: key.to_string(),
+        }
+    })?;
+
+    if envsubst::is_templated(&expanded) {
+        return Err(ConfigDiagnostic::PlaceholderUnresolved {
+            origin: origin.to_string(),
+            key: key.to_string(),
+        }
+        .into());
+    }
+
+    Ok(expanded)
+}
+
+fn value_origin(value: &c::Value) -> String {
+    value.origin().unwrap_or("merged config").to_string()
 }
 
 /// visitor pattern: traverse each config & execute the closure `f`
@@ -154,6 +174,31 @@ mod tests {
         };
 
         let message = err.to_string();
-        assert!(message.contains("failed to expand placeholder for `log.path`"));
+        assert!(message.contains("unresolved placeholder"));
+        assert!(message.contains("base_dir"));
+        assert!(message.contains("value is redacted"));
+        assert!(message.contains("remove the placeholder"));
+        assert!(!message.contains("/tmp/${missing}"));
+    }
+
+    #[test]
+    fn placeholder_substitution_error_redacts_context_values() {
+        let builder = c::Config::builder()
+            .set_override("base_dir", "/tmp/private$value")
+            .expect("set base_dir")
+            .set_override("log.path", "${base_dir}")
+            .expect("set nested template");
+
+        let err = match variable_placeholder_substitute(builder) {
+            Ok(_) => panic!("placeholder expansion should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("failed to expand placeholder"));
+        assert!(message.contains("log.path"));
+        assert!(message.contains("value is redacted"));
+        assert!(message.contains("without nested `${...}`"));
+        assert!(!message.contains("/tmp/private$value"));
     }
 }

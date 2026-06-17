@@ -22,7 +22,7 @@
 |--------------------------------|-------------|----------------|
 | `Config` 结构体与领域子配置     | 已实现      | 当前对外入口为 `src/config/mod.rs`，模型定义已拆到 `src/config/model.rs`；全仓源码调用方已迁到 `crate::config`。强类型拆分合理；`#[serde(default)]` 已用于可选域（blame、buck、orion_server、sidebar、artifacts_gc）。 |
 | TOML 文件 + `MEGA_*` env 叠加   | 已实现      | `config` crate + `__` 分隔符；`Config::new`、`load_str` 与 `load_sources` 已复用同一套 `MEGA_*` 环境变量 source builder，包含 `oauth.allowed_cors_origins`、`monorepo.admin`、`monorepo.root_dirs` 的列表解析。Profile 来源叠加已完成首批。 |
-| 占位符 `${base_dir}` 展开       | 已实现并已初步诊断化 | `src/config/expand.rs::variable_placeholder_substitute` 做两次 `collect()` + `Rc<RefCell>` 遍历 + `envsubst`；原 **10** 处 `.unwrap()` 已改为返回 `ConfigError::Message`，错误包含占位符字段路径和阶段信息。 |
+| 占位符 `${base_dir}` 展开       | 已实现并已诊断化首批 | `src/config/expand.rs::variable_placeholder_substitute` 做两次 `collect()` + `Rc<RefCell>` 遍历 + `envsubst`；原 **10** 处 `.unwrap()` 已改为返回 `ConfigError::Message`，错误包含占位符字段路径、可用来源 origin、脱敏说明和修复建议。 |
 | 配置文件定位（4 级回退 + 自动生成） | 已实现    | `mega_base()/etc/config.toml` 与默认生成逻辑存在，但 README 主要只提前三种；生成时会把 `base_dir` 渲染进去。 |
 | 运行时共享 (`Arc<Config>`)      | 已实现      | `AppContext` 持有；`Storage` 内部为 `Weak<Config>`，`config()` 调用 `.expect("Config has been dropped")` —— 这是热加载切换快照句柄时的潜在雷区。 |
 | `mail` / `MailConfig` / 邮件发送 | **已激活并接入 dispatcher 启动点** | 真实实现在一级模块 `src/mail/mod.rs`（`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `src/config/model.rs`、`Config.mail` 字段已存在、`[mail]` 段已被消费。`src/email/mod.rs` 为 re-export shim。`AppContext::new` 在 vault 之后解析 `mail.password_ref`（如存在）并构造 `SmtpMailer`，构造失败现在返回可诊断错误。详见 `mail.md`。 |
@@ -39,7 +39,7 @@
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
-- `src/config/expand.rs::variable_placeholder_substitute` 已消除原 **10** 处 `unwrap`，但仍需在后续 source diagnostics 中补来源路径、原始值脱敏和修复建议。
+- `src/config/expand.rs::variable_placeholder_substitute` 已消除原 **10** 处 `unwrap`，并已对未解析/非法占位符值输出字段级脱敏错误和修复建议；仍需在后续完整 source diagnostics 中补更丰富的跨 source 覆盖关系。
 - `Storage::new` 里的 Buck 校验已从 `panic!` 改为返回 `MegaError`；仍需在后续把更多启动期配置校验提前到 `Config::validate()` / source diagnostics。
 - `Storage::config()` 的 `expect`（`storage/mod.rs:335`，`upgrade().expect("Config has been dropped")`）。
 - `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；剩余风险主要在 dispatcher 生命周期治理、失败退避和后台任务可观测性。
@@ -106,14 +106,14 @@ service / chat-migrate            # LoadMode::FullAppContext
 - `src/config/mod.rs`：对外导出配置 API，并保留 `Config::new` / `load_str` / `load_sources` 等加载编排入口。
 - `src/config/model.rs`：定义 `Config`、`VaultBootstrapConfig` 和各领域子配置结构体、默认值及现有模型方法。
 - `src/config/source.rs`：实现 TOML source 与 `MEGA_` 环境变量叠加。
-- `src/config/expand.rs`：实现 `${base_dir}` 等字符串占位符展开；首批失败路径已返回 `ConfigError`，后续 source diagnostics 仍需补来源与修复建议。
+- `src/config/expand.rs`：实现 `${base_dir}` 等字符串占位符展开；首批失败路径已返回 `ConfigError`，未解析/非法占位符值已输出来源、字段路径和修复建议，后续 source diagnostics 仍需补跨 source 覆盖关系。
 - `src/config/error.rs`：定义首批配置诊断错误（当前覆盖占位符展开）。
 - `src/context/mod.rs`：构建运行时上下文，将 `Arc<Config>` 注入系统，并在此构造 `VaultCore`（`src/context/mod.rs:33`）。
 - `src/jupiter/storage/mod.rs`：存储层保存对配置的弱引用，并向具体存储组件提供配置访问能力。
 
 > 注意：`Config::new` 是**同步**函数（`src/config/mod.rs`），且只依赖文件系统读取，不访问数据库或网络。这一事实对后文“敏感数据 Vault 化”的可行性有决定性影响，见下文「现有 vault 能力与关键约束」。
 >
-> 当前 `variable_placeholder_substitute` 实现仍做两次完整 `config.collect()` + builder clone + `Rc<RefCell>` 嵌套遍历；原直接 `.unwrap()` panic 的占位符错误已改为返回 `ConfigError`。后续仍需把错误来源、原始值脱敏和修复建议纳入完整 source diagnostics。
+> 当前 `variable_placeholder_substitute` 实现仍做两次完整 `config.collect()` + builder clone + `Rc<RefCell>` 嵌套遍历；原直接 `.unwrap()` panic 的占位符错误已改为返回 `ConfigError`，并已对未解析/非法占位符值输出脱敏诊断和修复建议。后续仍需把它纳入更完整的跨 source diagnostics。
 
 ## 配置文件定位优先级
 
@@ -140,7 +140,7 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 
 占位符替换主要用于让配置值引用基础目录等公共路径，例如 `${base_dir}`。该机制工作在字符串值上，适合路径类配置复用，但不适用于非字符串字段。
 
-> 实现痛点更新：占位符替换函数 `src/config/expand.rs::variable_placeholder_substitute` 原有密集 `.unwrap()`（`build()`、`substitute()`、`collect()`、`Rc::try_unwrap()`、`into_string()`、`set_override()` 等）已改为返回 `ConfigError::Message`，并新增单测覆盖坏占位符不 panic。`config validate` 已补首批 `MEGA_*` 未消费/被忽略覆盖项 warning，但剩余工作仍包括把占位符错误接入更完整的 source diagnostics（配置文件路径、字段来源、脱敏原始值、修复建议）。
+> 实现痛点更新：占位符替换函数 `src/config/expand.rs::variable_placeholder_substitute` 原有密集 `.unwrap()`（`build()`、`substitute()`、`collect()`、`Rc::try_unwrap()`、`into_string()`、`set_override()` 等）已改为返回 `ConfigError::Message`，并新增单测覆盖坏占位符不 panic、错误值不回显。`config validate` 已补首批 `MEGA_*` 未消费/被忽略覆盖项 warning；剩余工作是把占位符错误接入更完整的跨 source diagnostics。
 
 ## 强类型配置结构
 
@@ -302,7 +302,7 @@ src/config/
 - `model.rs`：只定义强类型配置模型和必要的默认值，不放文件读取、环境变量解析和运行时初始化逻辑。
 - `loader.rs`：继续负责配置文件定位优先级，包括 `--config`、`MEGA_CONFIG`、项目默认路径、`mega_base()/etc/config.toml` 和默认文件生成。
 - `source.rs`：封装 `config` crate 的 source 构建过程，明确 TOML 文件、`MEGA_` 环境变量、嵌套分隔符和列表字段解析规则。
-- `expand.rs`：集中处理占位符展开，定义支持哪些占位符、展开顺序、未知占位符的处理策略，以及是否允许递归展开；同时明确占位符只作用于字符串值，新增占位符前必须确认字段类型和替换顺序。`variable_placeholder_substitute` 的原 `.unwrap()` panic 已收敛为 `ConfigError`，后续仍需补来源诊断和脱敏。
+- `expand.rs`：集中处理占位符展开，定义支持哪些占位符、展开顺序、未知占位符的处理策略，以及是否允许递归展开；同时明确占位符只作用于字符串值，新增占位符前必须确认字段类型和替换顺序。`variable_placeholder_substitute` 的原 `.unwrap()` panic 已收敛为 `ConfigError`，未解析/非法占位符值已输出字段级脱敏诊断；后续仍需补完整跨 source 关系。
 - `secret.rs`：承接现有 `SecretRef` 引用类型与 `SecretResolver`/`VaultSecretResolver`，适配 `VaultCoreInterface`（`read_secret`/`write_secret`），并统一提供脱敏日志、错误信息和审计字段。服务运行时 resolver 接收一个已就绪的 vault 句柄（即 `AppContext` 中的 `VaultCore`），**不在 `Config::new` 阶段调用**；`config secret set/check` 已通过最小 DB/Vault bootstrap 获取 vault 句柄，拆分时必须保持这个边界。
 - `init.rs`：提供基础配置初始化能力，负责生成 `config/config.toml` 样例、派生本地目录、填充非敏感默认值、为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单；真实 secret 不在该阶段写入配置文件。
 - `testing.rs`：首批已提供面向自动化测试的 `TestConfigBuilder`、`isolated_config()` 和 `TestSecretResolver`，可派生隔离的 base/cache/LFS/object storage 路径，接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景。后续应继续把文件加载链路、Profile 合并和 CI 配置矩阵迁移到该 helper，避免测试直接复用或修改仓库中的基础配置文件。
@@ -682,7 +682,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 `Config::new`、`Config::load_str` 和 `Config::load_sources` 已共用同一套 `MEGA_*` source builder 与 env/list 解析规则，单测覆盖 `load_str`/`load_sources` 对 `MEGA_MONOREPO__ROOT_DIRS=a,b` 的列表解析。后续 Profile 合并引入新 source 时，仍必须沿用该统一 builder，避免测试路径与生产路径再次分叉。
 
-未知字段与废弃字段也应纳入流水线。Serde 默认可能忽略未知字段；当前 `config validate` 已在反序列化后读取 raw TOML 并基于当前 schema 白名单输出 key 级 warning，可覆盖拼错字段、孤立顶层段和兼容期废弃字段；同时已对 `MEGA_*` 环境变量覆盖项做首批键名级 warning，覆盖未知覆盖项、孤立 `oauth` 覆盖项和旧 mail TLS 覆盖项且不输出变量值。坏环境变量类型和 profile 类型冲突已包装为脱敏错误，包含来源、字段路径、期望类型和修复建议，不再打印原始值。后续还需要把相同诊断扩展到更丰富的跨 source 覆盖关系。新增字段必须提供 `serde(default)` 或 `Option<T>`，移除字段必须经历 warning 过渡期。
+未知字段与废弃字段也应纳入流水线。Serde 默认可能忽略未知字段；当前 `config validate` 已在反序列化后读取 raw TOML 并基于当前 schema 白名单输出 key 级 warning，可覆盖拼错字段、孤立顶层段和兼容期废弃字段；同时已对 `MEGA_*` 环境变量覆盖项做首批键名级 warning，覆盖未知覆盖项、孤立 `oauth` 覆盖项和旧 mail TLS 覆盖项且不输出变量值。坏环境变量类型、profile 类型冲突、未解析/非法占位符值已包装为脱敏错误，包含来源、字段路径、期望类型或修复建议，不再打印原始值。后续还需要把相同诊断扩展到更丰富的跨 source 覆盖关系。新增字段必须提供 `serde(default)` 或 `Option<T>`，移除字段必须经历 warning 过渡期。
 
 热加载（后续阶段）应复用同一条解析、展开、规范化和校验流水线，避免启动加载与运行期重载出现两套语义。运行期可以在 `reload.rs` 中维护 `ConfigHandle` 或类似包装，内部持有当前生效的 `Arc<Config>`，业务组件只读取稳定快照；当配置文件或受支持的配置源发生变化时，先构建候选 `Config`，再执行差异计算和白名单校验。只有日志级别、日志输出细节、部分功能开关、任务调度间隔、邮件通知开关等无须重建长生命周期连接的字段可以直接热更新；数据库、Redis、对象存储、监听地址端口、OAuth 客户端密钥等字段默认视为启动期配置，检测到变化时应记录告警并提示重启，而不是在运行期隐式重建。
 
@@ -723,7 +723,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 **阶段 2 — 错误模型、redaction/SecretString 与保守校验**
 
-8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；剩余加载路径（如 `mega_base`/`mega_cache`）上的 `unwrap`/`expect`/`panic` 仍需继续收敛。这会改变失败形态，不应并入纯移动阶段。
+8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；未解析/非法占位符值已脱敏并带修复建议；剩余加载路径（如 `mega_base`/`mega_cache`）上的 `unwrap`/`expect`/`panic` 仍需继续收敛。这会改变失败形态，不应并入纯移动阶段。
 9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出。仍需继续覆盖 SMTP 密码、对象存储 key、SecretRef URI 中可敏感的 path 片段、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
 10. 已完成首批：`mail.password` 明文兼容路径改为 `Option<SecretString>`，Debug/Serialize 输出脱敏；`config validate` 与服务启动路径会对明文 `mail.password` 输出 deprecation warning；`.expose_secret()` 集中在 `SmtpMailer::new` 适配层。后续仍需在 source diagnostics、样例配置和模板中继续推动迁移到 `mail.password_ref`。
 11. 已完成首批：新增 `src/config/validate.rs`，实现 `Config::validate()` 首批 hard error 校验，覆盖 `database.db_type`、`database.db_url` scheme、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password` / `mail.password_ref` 互斥、`mail.enabled` 时 `smtp_host` / `from` 必填、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 端口/URL/DB URL；`config validate` 已复用该入口，`Storage::new` 的 Buck 非法配置已改为返回 `MegaError`。后续集中校验主要随新增字段继续补规则。
@@ -742,7 +742,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 15. 已完成首批：新增 `monoengine config init`，只操作配置文件和模板，不连接数据库或 vault，不接收或写入真实 secret；命令走 `LoadMode::None`，支持默认路径、全局 `--config`、`--output` 和 `--force`。
 16. 已完成首批：`config init` 生成安全默认骨架，不写入可预测生产密码；数据库、Redis、当前对象存储凭据只给 env/部署 secret 指引；对 `mail.password_ref` 生成 SecretRef 占位，并提示后续使用 `config secret set --value-stdin` 写入真实值。
-17. 已完成首批 raw TOML 与 `MEGA_*` diagnostics：`config validate` 已切到 `LoadMode::RawSources` 并在命令内解析配置，坏 TOML/坏 env 类型等不会被 CLI 子命令分发前预加载拦截；坏 TOML 可由文件解析错误返回，未知字段、废弃字段、未知环境变量覆盖项、孤立 `oauth` 环境变量覆盖项和旧 mail TLS 环境变量覆盖项已在 `config validate` 中 warning，且 env warning 只输出变量名和映射字段路径，不输出变量值；坏环境变量类型和 profile 类型冲突已报出来源、字段路径、期望类型和修复建议，并脱敏原始值。继续补齐 `RawSources`/source diagnostics：占位符错误来源、跨 source 覆盖关系、更完整的 source-level 修复建议等应能在不构造完整 `AppContext` 的情况下报告。
+17. 已完成首批 raw TOML 与 `MEGA_*` diagnostics：`config validate` 已切到 `LoadMode::RawSources` 并在命令内解析配置，坏 TOML/坏 env 类型等不会被 CLI 子命令分发前预加载拦截；坏 TOML 可由文件解析错误返回，未知字段、废弃字段、未知环境变量覆盖项、孤立 `oauth` 环境变量覆盖项和旧 mail TLS 环境变量覆盖项已在 `config validate` 中 warning，且 env warning 只输出变量名和映射字段路径，不输出变量值；坏环境变量类型、profile 类型冲突和占位符展开错误已报出来源/字段路径和修复建议，并脱敏原始值。继续补齐 `RawSources`/source diagnostics：跨 source 覆盖关系、更完整的 source-level 修复建议等应能在不构造完整 `AppContext` 的情况下报告。
 18. 保持已实现的 `config secret ref/set/check` 行为：只允许 `mail.password` 等后置可迁移凭据，继续拒绝 database/redis/object storage 凭据。
 
 > **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例，且生成结果可解析、可校验、无明文密码字段；`config validate` 能在坏配置时输出诊断而非被预加载拦截；`config secret ref/set/check` 的既有测试继续通过。
@@ -888,7 +888,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 1. 已完成：顶层结构迁移，`src/config/{mod,model,source,expand,loader,template,secret}.rs` 成为主实现，源码调用方已迁到 `crate::config`，`common::config` shim 已删除。
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
-3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则、profile 来源诊断和完整 source diagnostics。
+3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning、坏 env/profile 类型脱敏错误和首批修复建议已完成；继续补完整 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics 与坏 env 类型单测；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
@@ -915,6 +915,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [x] 已将 `config validate` 切到 `LoadMode::RawSources`，配置解析发生在命令内，坏配置不会在子命令分发前被预加载拦截。
 - [x] 已给首批 raw/env 未消费 warning 和坏 env 类型错误补入移除/替代字段等修复建议。
 - [x] 已把 profile/TOML 类型错误包装为脱敏诊断，输出来源路径、字段路径和期望类型，不输出原始值。
+- [x] 已把未解析/非法占位符值包装为脱敏诊断，输出来源、字段路径和修复建议，不输出原始值。
 - [ ] 已计划同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
 - [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、Profile、热加载分别单独提交，`config init` 模板治理不与这些阶段混合。
 - [x] 已在 CI 中增加配置样例首批校验任务（基础 + 生成 + profile + env diagnostics + 坏 env/profile 类型单测）；更多坏输入、完整 source diagnostics 和 SecretRef 失败矩阵仍待补。
