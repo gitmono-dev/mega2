@@ -190,6 +190,17 @@ fn enrich_deserialize_error(error: ConfigError) -> ConfigError {
             expected,
         }
         .into(),
+        ConfigError::Type {
+            origin: Some(origin),
+            expected,
+            key: Some(key),
+            ..
+        } => ConfigDiagnostic::SourceType {
+            origin: origin.clone(),
+            key: key.clone(),
+            expected,
+        }
+        .into(),
         _ => error,
     }
 }
@@ -200,44 +211,15 @@ fn environment_variable_for_key(key: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use std::{ffi::OsString, path::Path, sync::Mutex};
+    use std::path::Path;
 
     use serde::Deserialize;
 
     use super::*;
-    use crate::config::template::config_init_template;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: config tests serialize mutations of MEGA_* variables with ENV_LOCK
-            // and restore the previous value when the guard is dropped.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: see EnvVarGuard::set; this restores the serialized test mutation.
-            unsafe {
-                if let Some(previous) = &self.previous {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    use crate::config::{
+        template::config_init_template,
+        testing::{EnvVarGuard, env_lock},
+    };
 
     fn check_file_permission(path: &Path) {
         let metadata = std::fs::metadata(path).expect("Failed to read metadata");
@@ -421,8 +403,8 @@ mod test {
 
     #[test]
     fn test_load_str_and_sources_parse_list_env_overrides() {
-        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let _root_dirs = EnvVarGuard::set("MEGA_MONOREPO__ROOT_DIRS", "alpha,beta");
+        let lock = env_lock();
+        let _root_dirs = EnvVarGuard::set(&lock, "MEGA_MONOREPO__ROOT_DIRS", "alpha,beta");
         let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
         let expected = vec!["alpha".to_string(), "beta".to_string()];
 
@@ -439,8 +421,8 @@ mod test {
 
     #[test]
     fn test_bad_environment_type_reports_variable_name_without_value() {
-        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let _print_std = EnvVarGuard::set("MEGA_LOG__PRINT_STD", "not_bool_secret");
+        let lock = env_lock();
+        let _print_std = EnvVarGuard::set(&lock, "MEGA_LOG__PRINT_STD", "not_bool_secret");
         let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
 
         let err = Config::load_str(&rendered).expect_err("bad bool env override should fail");
@@ -456,8 +438,8 @@ mod test {
 
     #[test]
     fn test_new_with_profile_merges_profile_before_env() {
-        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let _root_dirs = EnvVarGuard::set("MEGA_MONOREPO__ROOT_DIRS", "env-alpha,env-beta");
+        let lock = env_lock();
+        let _root_dirs = EnvVarGuard::set(&lock, "MEGA_MONOREPO__ROOT_DIRS", "env-alpha,env-beta");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         let profile_path = temp_dir.path().join("config.prod.toml");
@@ -489,7 +471,40 @@ mod test {
     }
 
     #[test]
+    fn test_profile_type_error_reports_profile_source_without_value() {
+        let _lock = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path()))
+            .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+                [log]
+                print_std = "not_bool_secret"
+            "#,
+        )
+        .expect("write profile config");
+
+        let err = Config::new_with_profile(
+            config_path.to_str().expect("utf-8 config path"),
+            Some(&profile_path),
+        )
+        .expect_err("profile type conflict should fail");
+        let message = err.to_string();
+
+        assert!(message.contains(profile_path.to_str().expect("utf-8 profile path")));
+        assert!(message.contains("log.print_std"));
+        assert!(message.contains("expected a boolean"));
+        assert!(message.contains("value is redacted"));
+        assert!(message.contains("remove the override"));
+        assert!(!message.contains("not_bool_secret"));
+    }
+
+    #[test]
     fn test_vault_bootstrap_loads_profile_database_override() {
+        let _lock = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         let profile_path = temp_dir.path().join("config.prod.toml");
@@ -529,6 +544,7 @@ mod test {
 
     #[test]
     fn test_vault_bootstrap_config_only_requires_database() {
+        let _lock = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         std::fs::write(

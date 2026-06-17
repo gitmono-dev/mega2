@@ -33,6 +33,14 @@ pub enum ConfigDiagnostic {
         key: String,
         expected: &'static str,
     },
+    #[error(
+        "invalid config value from `{origin}` for `{key}`: expected {expected}; value is redacted; set `{key}` to {expected} in `{origin}` or remove the override"
+    )]
+    SourceType {
+        origin: String,
+        key: String,
+        expected: &'static str,
+    },
 }
 
 impl From<ConfigDiagnostic> for ConfigError {

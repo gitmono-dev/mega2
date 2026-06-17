@@ -179,42 +179,11 @@ fn exec_subcommand(ctx: CommandContext, cmd: &str, args: &ArgMatches) -> MegaRes
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, sync::Mutex};
-
     use super::*;
-    use crate::config::template::config_init_template;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: this test module serializes mutations of MEGA_* variables with ENV_LOCK
-            // and restores the previous value when the guard is dropped.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: see EnvVarGuard::set; this restores the serialized test mutation.
-            unsafe {
-                if let Some(previous) = &self.previous {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    use crate::config::{
+        template::config_init_template,
+        testing::{EnvVarGuard, env_lock},
+    };
 
     #[test]
     fn cli_accepts_config_path() {
@@ -303,13 +272,14 @@ mod tests {
 
     #[test]
     fn parse_loads_config_without_subcommand() {
+        let _lock = env_lock();
         parse(Some(vec!["--config", "config/config.toml"])).unwrap();
     }
 
     #[test]
     fn config_validate_reports_bad_env_type_without_cli_preload() {
-        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let _print_std = EnvVarGuard::set("MEGA_LOG__PRINT_STD", "not_bool_secret");
+        let lock = env_lock();
+        let _print_std = EnvVarGuard::set(&lock, "MEGA_LOG__PRINT_STD", "not_bool_secret");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("write config");

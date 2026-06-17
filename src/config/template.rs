@@ -106,7 +106,7 @@ starttls = true
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, testing::env_lock};
 
     fn assert_no_predictable_credentials(rendered: &str) {
         for (username, password) in [("mono", "mono"), ("mega", "mega"), ("postgres", "postgres")] {
@@ -118,6 +118,7 @@ mod tests {
 
     #[test]
     fn config_init_template_parses_and_avoids_plaintext_credentials() {
+        let _lock = env_lock();
         let rendered = config_init_template(Path::new("/tmp/monoengine"));
 
         let config = Config::load_str(&rendered).expect("init template should parse");
@@ -129,6 +130,7 @@ mod tests {
 
     #[test]
     fn bundled_config_template_parses_and_avoids_plaintext_credentials() {
+        let _lock = env_lock();
         let rendered = default_config_template("monoengine").expect("default template");
 
         let config = Config::load_str(rendered).expect("bundled template should parse");

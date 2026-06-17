@@ -3,6 +3,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
+#[cfg(test)]
+use std::{
+    ffi::OsString,
+    sync::{Mutex, MutexGuard},
+};
 
 use async_trait::async_trait;
 use orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig};
@@ -20,6 +25,55 @@ pub const DEFAULT_TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const ENV_DATABASE_URL: &str = "MEGA_DATABASE__DB_URL";
 const ENV_REDIS_URL: &str = "MEGA_REDIS__URL";
 const ENV_MAIL_PASSWORD_REF: &str = "MEGA_MAIL__PASSWORD_REF";
+
+#[cfg(test)]
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub type EnvLockGuard = MutexGuard<'static, ()>;
+
+#[cfg(test)]
+pub fn env_lock() -> EnvLockGuard {
+    ENV_LOCK.lock().expect("env lock should not be poisoned")
+}
+
+#[cfg(test)]
+pub struct EnvVarGuard<'a> {
+    _lock: &'a EnvLockGuard,
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+#[cfg(test)]
+impl<'a> EnvVarGuard<'a> {
+    pub fn set(lock: &'a EnvLockGuard, key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: tests that mutate MEGA_* variables must hold the shared config env lock,
+        // and this guard restores the previous value before that lock is released.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            _lock: lock,
+            key,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: see EnvVarGuard::set; this restores the serialized test mutation.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TestConfigBuilder {

@@ -361,6 +361,7 @@ fn read_secret_value_from_stdin() -> Result<String, MegaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::testing::env_lock;
 
     #[test]
     fn config_secret_ref_uses_no_config_load_mode() {
@@ -397,6 +398,7 @@ mod tests {
 
     #[test]
     fn config_init_writes_safe_skeleton() {
+        let _lock = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
 
