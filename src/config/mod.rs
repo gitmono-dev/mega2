@@ -17,6 +17,7 @@ pub mod redaction;
 pub mod secret;
 mod source;
 pub mod template;
+pub mod testing;
 pub mod validate;
 
 use expand::variable_placeholder_substitute;

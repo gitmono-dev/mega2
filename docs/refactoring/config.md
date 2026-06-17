@@ -9,10 +9,10 @@
 > **事实校准（2026-06-18 复核）：** 本文档已按 `vault.md` 的 2026-06-17 落地状态和当前 `src/` 重新校准。与早期草案相比，多个原本作为前置的能力已经完成，后续执行必须以本节和“当前实现状态速览表”为准，不要按旧阶段重复实现。需特别注意以下事实：
 > 1. **`Config` 已迁入顶层 `src/config/`，调用方已迁到 `crate::config`。** 阶段 1 的物理模块提升和阶段 3 的路径迁移已完成，`src/common/config.rs` shim 已移除；`model.rs` 已承接 `Config` 及各领域子配置结构体，`source.rs` 已承接 source 构建，`expand.rs` 已承接占位符展开函数；`error.rs` 已承接首批占位符诊断错误；`validate.rs` 已承接首批集中校验（database/log/lfs/build/redis/mail/Buck/object storage/orion_server）和 `config validate` 文件级未消费字段 warning。`Config` 当前含 `mail: Option<MailConfig>`，但仍不含 `oauth` 字段，也无 `OAuthConfig`；`[oauth]` 仍没有运行期消费者。
 > 2. **mail 已是真实后置消费者，且已接入 `password_ref`。** `MailConfig` 已包含兼容期 `password: Option<SecretString>` 与推荐的 `password_ref: Option<SecretRef>`，两者互斥；明文 `password` 路径会输出 deprecation warning，`SecretString` 的 Debug/Serialize 输出脱敏，明文只在 `SmtpMailer::new` 适配层显式暴露。`AppContext::new` 在 `VaultCore::new` 之后解析 `mail.password_ref`，再通过 `SmtpMailer::new_with_password` 构造 mailer。SMTP 构造失败现在返回可诊断错误，不再由 `if let Ok(...)` 静默吞掉。
-> 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config init`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config init` 走 `LoadMode::None`，只写安全配置骨架；`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。仍未实现的是 Profile、RawSources/source diagnostics 的完整语义，以及 `src/config/` 的错误、校验、测试和热加载职责子模块。
+> 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config init`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config init` 走 `LoadMode::None`，只写安全配置骨架；`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`src/config/testing.rs` 已提供首批隔离测试配置 builder 与测试 secret resolver。仍未实现的是 Profile、RawSources/source diagnostics 的完整语义，以及 `src/config/` 的热加载职责子模块。
 > 4. **SecretRef 与 resolver 已实现首批。** `src/config/secret.rs` 定义 `SecretRef`、`SecretResolver`、`VaultSecretResolver`，支持 `vault://secret/<name>#<field>`、缓存 TTL、`evict`/`evict_all`，并拒绝 `secret/secret/...` 等错误路径。
 > 5. **Vault 生产化前置的核心子集已完成。** `VaultCore` 已 Result 化、key 缺失 fail-closed、不再因 `core_key.json` 缺失清空 vault 表；`core_key.json` 不再长期保存 root token，只保存 unseal shares 和限权 runtime tokens；root token / shares 不再输出到 stdout、stderr 或 tracing；key 目录和文件在 Unix 下收紧到 `0700` / `0600`；常规 secret 访问使用限权 token 并记录 `vault_audit` 事件。残余风险是：自动解封材料仍落在本地 key 文件中，磁盘读取攻击者仍可获得解封能力，仍需部署侧 KMS/secret manager 与备份恢复流程。
-> 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 testing/reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、Profile、环境变量/profile 来源诊断、样例/测试配置分层、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。`config init` 和 raw TOML 未知字段 warning 已有首批可执行入口，后续只需围绕模板治理、样例校验和完整 source diagnostics 继续收敛。
+> 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、Profile、环境变量/profile 来源诊断、样例/测试配置分层的全仓迁移、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。`config init`、raw TOML 未知字段 warning 和 testing helper 已有首批可执行入口，后续只需围绕模板治理、样例校验和完整 source diagnostics 继续收敛。
 
 > **本文档性质说明**：本文档同时承担“现状分析”和“改进设计方案”两种角色。早期章节中保留的架构解释仍有价值，但所有“未实现/前置/阶段”判断均以 2026-06-18 再基线为准。本文档的可执行入口已经从“先实现 Vault/LoadMode/SecretRef”切换为“在已完成这些能力的基础上，继续做 `src/config` 内部拆分、诊断/初始化/profile/测试分层/热加载”。
 
@@ -34,6 +34,7 @@
 | `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现；`config validate` 已输出 raw TOML 未消费/未知字段 warning。profile、完整 source diagnostics 仍未实现。 |
 | 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 的端口/URL/DB URL；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`；`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls` 和 raw TOML 任意未知字段输出 warning。环境变量/profile 来源诊断和完整 source diagnostics 仍待补齐。 |
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
+| 测试配置辅助                   | **已实现首批** | `src/config/testing.rs` 已提供 `TestConfigBuilder`、`isolated_config()` 与 `TestSecretResolver`，可派生临时 base/cache/LFS/object storage 路径、接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景；尚未把全仓测试和 CI 配置矩阵迁移到该 helper。 |
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
@@ -304,7 +305,7 @@ src/config/
 - `expand.rs`：集中处理占位符展开，定义支持哪些占位符、展开顺序、未知占位符的处理策略，以及是否允许递归展开；同时明确占位符只作用于字符串值，新增占位符前必须确认字段类型和替换顺序。`variable_placeholder_substitute` 的原 `.unwrap()` panic 已收敛为 `ConfigError`，后续仍需补来源诊断和脱敏。
 - `secret.rs`：承接现有 `SecretRef` 引用类型与 `SecretResolver`/`VaultSecretResolver`，适配 `VaultCoreInterface`（`read_secret`/`write_secret`），并统一提供脱敏日志、错误信息和审计字段。服务运行时 resolver 接收一个已就绪的 vault 句柄（即 `AppContext` 中的 `VaultCore`），**不在 `Config::new` 阶段调用**；`config secret set/check` 已通过最小 DB/Vault bootstrap 获取 vault 句柄，拆分时必须保持这个边界。
 - `init.rs`：提供基础配置初始化能力，负责生成 `config/config.toml` 样例、派生本地目录、填充非敏感默认值、为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单；真实 secret 不在该阶段写入配置文件。
-- `testing.rs`：在既有 `Config::mock()`/`load_str()`/`load_sources()` 之上，提供面向自动化测试的配置模板、临时目录替换、端口和外部依赖覆盖、secret resolver 测试替身、测试配置校验入口，以及与 `.env.test` 协作的辅助函数，避免测试直接复用或修改仓库中的基础配置文件。
+- `testing.rs`：首批已提供面向自动化测试的 `TestConfigBuilder`、`isolated_config()` 和 `TestSecretResolver`，可派生隔离的 base/cache/LFS/object storage 路径，接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景。后续应继续把文件加载链路、Profile 合并和 CI 配置矩阵迁移到该 helper，避免测试直接复用或修改仓库中的基础配置文件。
 - `validate.rs`：提供集中校验入口，按领域拆分校验函数，例如数据库连接串、监听端口、对象存储后端、路径可用性等，避免非法配置延迟到后续初始化阶段才暴露。首批 hard error 已覆盖**当前已存在字段**的无争议规则，例如 `database.db_type` 必须为 `postgres`、`database.db_url` scheme 必须为 `postgres`/`postgresql`、`log.level` 枚举、`lfs` 路径/URL、`build.orion_server`、`redis.url` scheme、Buck 并发/大小限制（吸收现有 `BuckConfig::validate()`）、object storage local/S3/S3-compatible/GCS 后端必填项、可选 `orion_server` 端口/URL/DB URL，以及 mail 的 `mail.enabled = true` 时 `smtp_host`/`from` 必填、`password`/`password_ref` 互斥；首批 raw TOML warning 已覆盖 `[oauth]`、`[mail].smtp_tls`/`[mail].tls` 和任意未知字段。剩余 diagnostics 重点是环境变量/profile 来源、脱敏原始值和修复建议。但涉及尚不存在字段的校验（OAuth 回调地址等）仍应等 `OAuthConfig` 真实落地后再写。
 - `reload.rs`（后续阶段）：实现受控热加载能力，负责监听配置来源变化、复用完整加载流水线生成新配置、计算允许热更新字段的差异、通知订阅组件应用变更，并在校验失败或组件应用失败时保留旧配置。
 - `error.rs`：提供配置专用错误，包含字段路径、失败原因，并逐步补配置文件路径、原始值脱敏和修复建议，再统一转换为现有 `ConfigError` / `MegaError`；配置加载路径上的剩余 `unwrap`、`expect` 和 `panic` 应继续收敛到该错误模型中。
@@ -646,7 +647,7 @@ config init                       # 不依赖 vault
 
 改造后建议将 `config/config.toml` 定位为基础样例配置，并满足以下约束：默认使用本地、无副作用、低依赖的配置值；所有路径通过 `${base_dir}` 或测试临时目录派生；对象存储默认使用 `local`；外部服务地址只作为示例或显式禁用；只有已真实接入 `Config`、且确认属于可迁移凭据的字段才改为 `SecretRef` 示例而非明文；仍属于引导配置或早期运行时依赖的敏感字段明确要求通过 `MEGA_*`、`.env.test` 或部署平台 secret 注入。该文件应纳入配置样例校验，保证它可以被解析、展开和通过基础校验，但不再要求它直接满足所有集成测试的外部依赖。
 
-自动化测试应采用独立的配置方案：单元测试优先通过 `testing.rs`（基于 `Config::mock()`/`load_str()`）构造内存配置或最小 TOML 片段；需要文件加载链路的测试使用临时目录生成测试配置文件，并显式传入 `--config` 或 `MEGA_CONFIG`；集成测试继续通过 `.env.test` 提供数据库、Redis、邮件等外部依赖端点，但 `.env.test` 只负责测试环境覆盖，不应修改仓库中的 `config/config.toml`。测试配置中的 `base_dir`、数据库名、对象存储根目录、日志目录和缓存目录都应隔离到测试临时目录，避免并发测试互相污染。
+自动化测试应采用独立的配置方案：单元测试优先通过 `testing.rs`（首批已有 `TestConfigBuilder`/`isolated_config()`）构造内存配置或最小 TOML 片段；需要文件加载链路的测试使用临时目录生成测试配置文件，并显式传入 `--config` 或 `MEGA_CONFIG`；集成测试继续通过 `.env.test` 提供数据库、Redis、邮件等外部依赖端点，但 `.env.test` 只负责测试环境覆盖，不应修改仓库中的 `config/config.toml`。测试配置中的 `base_dir`、数据库名、对象存储根目录、日志目录和缓存目录都应隔离到测试临时目录，避免并发测试互相污染。
 
 对于依赖敏感凭据的测试，不应在测试 TOML、`.env.test` 或日志中写入真实 API Key。配置模块应提供可注入的测试 secret resolver 或 vault 测试后端（现有 vault 测试已使用 `tempfile` + `test_storage` 构造隔离实例，可复用此模式），用固定的假 secret、过期 secret、缺失 secret 和权限失败场景覆盖消费端行为。热加载相关测试也应使用测试配置文件和临时 resolver：分别验证基础字段热更新成功、不可热更新字段只告警不生效、SecretRef 变更遵循白名单、候选配置校验失败时旧配置继续生效。
 
@@ -746,7 +747,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 19. 将 `config/config.toml` 改造为基础样例配置：移除真实生产密码或可复用生产凭据，保留与当前 schema 对齐的本地默认值与初始化指引；纳入配置样例校验。
 20. 固定 Profile 文件命名、加载优先级、数组覆盖语义和 SecretRef namespace，并补充 profile 合并测试。
-21. 新增 `testing.rs`（基于既有 `mock()`/`load_str()`/`load_sources()`），提供测试配置构造、临时目录派生、`.env.test` 覆盖合并、测试 secret resolver。
+21. 已完成首批：新增 `testing.rs`，提供 `TestConfigBuilder`、`isolated_config()`、`.env.test` 风格覆盖合并和 `TestSecretResolver`；后续继续把文件加载链路、Profile 合并结果和更多现有测试迁移到该 helper。
 22. 建立分层测试策略并接入 CI：单元测试用内存/最小 TOML，加载测试用临时文件，集成测试用 `.env.test` + `MEGA_CONFIG` 指向隔离配置；CI 覆盖基础样例、默认模板、`config init` 结果、profile 合并结果与测试配置生成结果。
 
 > **验收标准**：`config/config.toml` 不含真实生产密码或可复用生产凭据；`cargo test --all` 不依赖仓库中的 `config/config.toml` 作为隐式共享状态；CI 新增配置校验任务且通过。
@@ -885,7 +886,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
 3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`；首批 URL redaction、`SecretString` 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则、环境变量/profile 来源诊断和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；继续补 RawSources/source diagnostics。
-5. 样例/Profile/测试分层：把 `config/config.toml` 固定为基础样例，建立测试配置生成器、Profile 合并语义和 CI 配置校验矩阵。
+5. 样例/Profile/测试分层：测试配置生成器已完成首批；继续把 `config/config.toml` 固定为基础样例，建立 Profile 合并语义和 CI 配置校验矩阵。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
 7. 独立阶段：受控热加载，白名单字段生效，候选失败时保留旧配置。
 
