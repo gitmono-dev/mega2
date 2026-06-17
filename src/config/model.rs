@@ -117,7 +117,7 @@ impl Default for MonoConfig {
 
 /// Periodic garbage collection for repo artifact blobs (`artifact_objects`) per
 /// `docs/artifacts-protocol.md` §10.6 (unreferenced `oid` + optional `last_seen_at` grace).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactGcConfig {
     #[serde(default)]
     pub enable: bool,

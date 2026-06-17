@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     common::errors::MegaError,
-    config::{Config, LogConfig, MailConfig},
+    config::{ArtifactGcConfig, Config, LogConfig, MailConfig},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -128,6 +128,12 @@ impl ConfigHandle {
         let mut report = ConfigReloadReport::default();
 
         apply_log_changes(&current.log, &candidate.log, &mut next.log, &mut report);
+        apply_artifact_gc_changes(
+            &current.artifacts_gc,
+            &candidate.artifacts_gc,
+            &mut next.artifacts_gc,
+            &mut report,
+        );
         apply_mail_changes(&current.mail, &candidate.mail, &mut next.mail, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
@@ -377,6 +383,35 @@ fn apply_log_changes(
     }
 }
 
+fn apply_artifact_gc_changes(
+    current: &ArtifactGcConfig,
+    candidate: &ArtifactGcConfig,
+    next: &mut ArtifactGcConfig,
+    report: &mut ConfigReloadReport,
+) {
+    if !current.enable && candidate.enable {
+        collect_artifact_gc_restart_fields(current, candidate, report);
+        return;
+    }
+
+    if current.enable != candidate.enable {
+        next.enable = candidate.enable;
+        report.applied_fields.push("artifacts_gc.enable");
+    }
+    if current.interval_secs != candidate.interval_secs {
+        next.interval_secs = candidate.interval_secs;
+        report.applied_fields.push("artifacts_gc.interval_secs");
+    }
+    if current.grace_secs != candidate.grace_secs {
+        next.grace_secs = candidate.grace_secs;
+        report.applied_fields.push("artifacts_gc.grace_secs");
+    }
+    if current.batch_limit != candidate.batch_limit {
+        next.batch_limit = candidate.batch_limit;
+        report.applied_fields.push("artifacts_gc.batch_limit");
+    }
+}
+
 fn apply_mail_changes(
     current: &Option<MailConfig>,
     candidate: &Option<MailConfig>,
@@ -399,6 +434,31 @@ fn apply_mail_changes(
             }
             collect_mail_restart_fields(current, candidate, report);
         }
+    }
+}
+
+fn collect_artifact_gc_restart_fields(
+    current: &ArtifactGcConfig,
+    candidate: &ArtifactGcConfig,
+    report: &mut ConfigReloadReport,
+) {
+    if current.enable != candidate.enable {
+        report.restart_required_fields.push("artifacts_gc.enable");
+    }
+    if current.interval_secs != candidate.interval_secs {
+        report
+            .restart_required_fields
+            .push("artifacts_gc.interval_secs");
+    }
+    if current.grace_secs != candidate.grace_secs {
+        report
+            .restart_required_fields
+            .push("artifacts_gc.grace_secs");
+    }
+    if current.batch_limit != candidate.batch_limit {
+        report
+            .restart_required_fields
+            .push("artifacts_gc.batch_limit");
     }
 }
 
@@ -483,7 +543,8 @@ fn collect_mail_restart_fields(
 mod tests {
     use super::*;
     use crate::config::{
-        MailConfig, secret::SecretRef, template::config_init_template, testing::isolated_config,
+        ArtifactGcConfig, MailConfig, secret::SecretRef, template::config_init_template,
+        testing::isolated_config,
     };
 
     fn mail_config(enabled: bool) -> MailConfig {
@@ -548,6 +609,94 @@ mod tests {
         assert_eq!(
             snapshot.database.db_url,
             "postgres://localhost:5432/current"
+        );
+    }
+
+    #[test]
+    fn reload_applies_artifact_gc_runtime_fields() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.artifacts_gc = ArtifactGcConfig {
+            enable: true,
+            interval_secs: 3600,
+            grace_secs: 86_400,
+            batch_limit: 100,
+        };
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.artifacts_gc = ArtifactGcConfig {
+            enable: false,
+            interval_secs: 120,
+            grace_secs: 600,
+            batch_limit: 10,
+        };
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "artifacts_gc.enable",
+                "artifacts_gc.interval_secs",
+                "artifacts_gc.grace_secs",
+                "artifacts_gc.batch_limit"
+            ]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert_eq!(
+            snapshot.artifacts_gc,
+            ArtifactGcConfig {
+                enable: false,
+                interval_secs: 120,
+                grace_secs: 600,
+                batch_limit: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn reload_reports_artifact_gc_enable_requires_restart_without_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.artifacts_gc = ArtifactGcConfig {
+            enable: false,
+            interval_secs: 3600,
+            grace_secs: 86_400,
+            batch_limit: 100,
+        };
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.artifacts_gc = ArtifactGcConfig {
+            enable: true,
+            interval_secs: 120,
+            grace_secs: 600,
+            batch_limit: 10,
+        };
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec![
+                "artifacts_gc.enable",
+                "artifacts_gc.interval_secs",
+                "artifacts_gc.grace_secs",
+                "artifacts_gc.batch_limit"
+            ]
+        );
+        assert_eq!(
+            snapshot.artifacts_gc,
+            ArtifactGcConfig {
+                enable: false,
+                interval_secs: 3600,
+                grace_secs: 86_400,
+                batch_limit: 100,
+            }
         );
     }
 

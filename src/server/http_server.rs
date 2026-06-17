@@ -11,7 +11,7 @@ use axum::{
 };
 use http::{HeaderName, HeaderValue, Method};
 use time::Duration;
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, ServiceBuilder};
 use tower_http::{cors::CorsLayer, decompression::RequestDecompressionLayer, trace::TraceLayer};
@@ -30,6 +30,10 @@ use crate::{
     bellatrix::Bellatrix,
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::{MegaError, MegaResult, ProtocolError},
+    config::{
+        ArtifactGcConfig, Config,
+        reload::{ConfigReloadReport, ConfigReloadSubscriber},
+    },
     context::AppContext,
     contract::{
         git_protocol::InfoRefsParams,
@@ -38,6 +42,55 @@ use crate::{
     jupiter::service::artifact_service::ArtifactService,
     server::{CommonHttpOptions, trace_context},
 };
+
+#[derive(Debug, Clone)]
+struct ArtifactGcTaskControl {
+    sender: watch::Sender<ArtifactGcConfig>,
+}
+
+impl ArtifactGcTaskControl {
+    fn new(config: ArtifactGcConfig) -> Self {
+        let (sender, _) = watch::channel(config);
+        Self { sender }
+    }
+
+    fn current(&self) -> ArtifactGcConfig {
+        self.sender.borrow().clone()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<ArtifactGcConfig> {
+        self.sender.subscribe()
+    }
+
+    fn set_config(&self, config: ArtifactGcConfig) {
+        self.sender.send_replace(config);
+    }
+}
+
+fn config_reload_artifact_gc_subscriber(control: ArtifactGcTaskControl) -> ConfigReloadSubscriber {
+    let apply_control = control.clone();
+    ConfigReloadSubscriber::new(
+        "artifact_gc_task",
+        move |next, report| apply_artifact_gc_config(&apply_control, next, report),
+        move |current, report| apply_artifact_gc_config(&control, current, report),
+    )
+}
+
+fn apply_artifact_gc_config(
+    control: &ArtifactGcTaskControl,
+    config: &Config,
+    report: &ConfigReloadReport,
+) -> Result<(), MegaError> {
+    if report
+        .applied_fields
+        .iter()
+        .any(|field| field.starts_with("artifacts_gc."))
+    {
+        control.set_config(config.artifacts_gc.clone());
+    }
+
+    Ok(())
+}
 
 pub fn remove_git_suffix(full_path: &str, git_suffix: &str) -> PathBuf {
     PathBuf::from(full_path.replace(".git", "").replace(git_suffix, ""))
@@ -111,30 +164,69 @@ fn spawn_cleanup_task(ctx: AppContext, token: CancellationToken) -> Option<JoinH
 }
 
 /// Background GC for `artifact_objects` with no manifest references (`docs/artifacts-protocol.md` §10.6).
-fn spawn_artifact_gc_task(ctx: AppContext, token: CancellationToken) -> Option<JoinHandle<()>> {
+fn spawn_artifact_gc_task(
+    ctx: AppContext,
+    token: CancellationToken,
+) -> Result<Option<JoinHandle<()>>, MegaError> {
     let cfg = ctx.storage.config().artifacts_gc.clone();
     if !cfg.enable {
-        return None;
+        return Ok(None);
     }
 
-    let interval_secs = cfg.interval_secs.max(1);
-    let grace_secs = cfg.grace_secs;
-    let batch_limit = cfg.batch_limit.max(1);
+    let control = ArtifactGcTaskControl::new(cfg);
+    ctx.config_handle
+        .subscribe(config_reload_artifact_gc_subscriber(control.clone()))?;
+    let mut config_updates = control.subscribe();
     let service: ArtifactService = ctx.storage.artifact_service.clone();
 
-    Some(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    Ok(Some(tokio::spawn(async move {
+        let mut cfg = control.current();
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs.max(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut accepts_config_updates = true;
 
         tracing::info!(
-            "artifact_objects GC task started (interval={interval_secs}s, grace={grace_secs}s, batch_limit={batch_limit})"
+            interval_secs = cfg.interval_secs.max(1),
+            grace_secs = cfg.grace_secs,
+            batch_limit = cfg.batch_limit.max(1),
+            "artifact_objects GC task started"
         );
-
-        let grace = std::time::Duration::from_secs(grace_secs);
 
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
+                changed = config_updates.changed(), if accepts_config_updates => {
+                    match changed {
+                        Ok(()) => {
+                            let updated = config_updates.borrow().clone();
+                            let interval_changed =
+                                updated.interval_secs.max(1) != cfg.interval_secs.max(1);
+                            cfg = updated;
+                            if interval_changed {
+                                ticker = tokio::time::interval(std::time::Duration::from_secs(
+                                    cfg.interval_secs.max(1),
+                                ));
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            }
+                            tracing::info!(
+                                enabled = cfg.enable,
+                                interval_secs = cfg.interval_secs.max(1),
+                                grace_secs = cfg.grace_secs,
+                                batch_limit = cfg.batch_limit.max(1),
+                                "artifact_objects GC task config updated"
+                            );
+                        }
+                        Err(_) => {
+                            accepts_config_updates = false;
+                            tracing::warn!(
+                                "artifact_objects GC task config update channel closed; continuing with last config"
+                            );
+                        }
+                    }
+                }
+                _ = ticker.tick(), if cfg.enable => {
+                    let grace = std::time::Duration::from_secs(cfg.grace_secs);
+                    let batch_limit = cfg.batch_limit.max(1);
                     match service
                         .gc_unreferenced_artifact_objects_once(grace, batch_limit)
                         .await
@@ -161,7 +253,7 @@ fn spawn_artifact_gc_task(ctx: AppContext, token: CancellationToken) -> Option<J
         }
 
         tracing::info!("artifact_objects GC task stopped gracefully");
-    }))
+    })))
 }
 
 /// Returns a future that completes when the cancellation token is triggered.
@@ -185,7 +277,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
 
     let shutdown_token = CancellationToken::new();
     let cleanup_handle = spawn_cleanup_task(ctx.clone(), shutdown_token.clone());
-    let artifact_gc_handle = spawn_artifact_gc_task(ctx.clone(), shutdown_token.clone());
+    let artifact_gc_handle = spawn_artifact_gc_task(ctx.clone(), shutdown_token.clone())?;
     let server_token = shutdown_token.clone();
 
     let app = app(ctx, host.clone(), port).await;
@@ -485,6 +577,51 @@ mod tests {
     use http::Request;
 
     use super::*;
+    use crate::config::{ArtifactGcConfig, reload::ConfigHandle, testing::isolated_config};
+
+    #[test]
+    fn artifact_gc_subscriber_updates_control_from_reload() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.artifacts_gc = ArtifactGcConfig {
+            enable: true,
+            interval_secs: 3600,
+            grace_secs: 86_400,
+            batch_limit: 100,
+        };
+        let mut candidate = config.clone();
+        candidate.artifacts_gc = ArtifactGcConfig {
+            enable: true,
+            interval_secs: 120,
+            grace_secs: 600,
+            batch_limit: 10,
+        };
+        let control = ArtifactGcTaskControl::new(config.artifacts_gc.clone());
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_artifact_gc_subscriber(control.clone()))
+            .expect("subscribe");
+        let report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "artifacts_gc.interval_secs",
+                "artifacts_gc.grace_secs",
+                "artifacts_gc.batch_limit"
+            ]
+        );
+        assert_eq!(
+            control.current(),
+            ArtifactGcConfig {
+                enable: true,
+                interval_secs: 120,
+                grace_secs: 600,
+                batch_limit: 10,
+            }
+        );
+    }
 
     #[test]
     fn test_disallow_third_party_git_root_repo() {

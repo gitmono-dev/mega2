@@ -239,6 +239,8 @@ completed_retention_days = 7
 
 # Repo artifact blob GC (`artifact_objects` with no `artifact_set_files` references; see docs/artifacts-protocol.md §10.6).
 [artifacts_gc]
+# When the HTTP service starts with artifact GC enabled, interval/grace/batch changes
+# and switching this to false are hot-reloaded. Enabling it from false still needs restart.
 enable = false
 interval_secs = 3600
 grace_secs = 86400

@@ -128,7 +128,7 @@ Key sections (see `config/config.toml` for the full list):
 | `[redis]`          | Connection URL                                                          |
 | `[build]`          | Orion build server URL and trigger preheat depth                        |
 | `[buck]`           | Buck upload session limits and concurrency caps                         |
-| `[artifacts_gc]`   | Background GC for orphan repo artifact blobs                            |
+| `[artifacts_gc]`   | Background GC enable flag and schedule for orphan repo artifact blobs    |
 | `[mail]`           | SMTP enable flag, host / port / from address / STARTTLS, `password_ref`  |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
@@ -303,6 +303,10 @@ cargo test --test <name>
   `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`). Config reload
   can disable a running dispatcher via `mail.enabled = false`; re-enabling mail
   or changing SMTP settings still requires restart.
+- **Background maintenance** — HTTP service tasks clean expired Buck upload
+  sessions and unreferenced artifact blobs. A running artifact GC task hot-reloads
+  `artifacts_gc` interval/grace/batch settings and can be disabled without restart;
+  enabling it from off still requires restart.
 - **Vault** — `contract::vault::integration::vault_core::VaultCore` wraps
   the vendored `crate::vault` module with a `jupiter`‑backed storage adapter
   (`contract::vault::integration::jupiter_backend`), so secrets live in the
