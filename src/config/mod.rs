@@ -9,14 +9,16 @@ pub use orbit_api::factory::ObjectStorageConfig;
 
 use crate::common::errors::MegaError;
 
+mod expand;
 pub mod loader;
 mod model;
 pub mod secret;
 mod source;
 pub mod template;
 
+use expand::variable_placeholder_substitute;
 pub use model::*;
-use source::{config_from_path, variable_placeholder_substitute};
+use source::config_from_path;
 
 /// Retrieves the base directory path for Mega
 ///
