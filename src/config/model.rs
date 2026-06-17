@@ -530,7 +530,7 @@ impl Default for OrionServerConfig {
 }
 
 /// Buck upload API configuration
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BuckConfig {
     /// Session timeout in seconds (default: 3600 = 1 hour)
     #[serde(default = "default_session_timeout")]
@@ -664,6 +664,13 @@ impl BuckConfig {
             return Err(format!(
                 "session_timeout must be > 0, got {}",
                 self.session_timeout
+            ));
+        }
+
+        if self.cleanup_interval == 0 {
+            return Err(format!(
+                "cleanup_interval must be > 0, got {}",
+                self.cleanup_interval
             ));
         }
 

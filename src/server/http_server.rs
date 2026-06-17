@@ -31,7 +31,7 @@ use crate::{
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::{MegaError, MegaResult, ProtocolError},
     config::{
-        ArtifactGcConfig, Config,
+        ArtifactGcConfig, BuckConfig, Config,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     context::AppContext,
@@ -42,6 +42,82 @@ use crate::{
     jupiter::service::artifact_service::ArtifactService,
     server::{CommonHttpOptions, trace_context},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuckCleanupTaskConfig {
+    enabled: bool,
+    cleanup_interval: u64,
+    completed_retention_days: u32,
+}
+
+impl BuckCleanupTaskConfig {
+    fn from_config(config: &Config) -> Self {
+        Self::from_buck_config(config.buck.clone().unwrap_or_default())
+    }
+
+    fn from_buck_config(config: BuckConfig) -> Self {
+        Self {
+            enabled: config.enable_session_cleanup,
+            cleanup_interval: config.cleanup_interval,
+            completed_retention_days: config.completed_retention_days,
+        }
+    }
+
+    fn interval_secs(&self) -> u64 {
+        self.cleanup_interval.max(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BuckCleanupTaskControl {
+    sender: watch::Sender<BuckCleanupTaskConfig>,
+}
+
+impl BuckCleanupTaskControl {
+    fn new(config: BuckCleanupTaskConfig) -> Self {
+        let (sender, _) = watch::channel(config);
+        Self { sender }
+    }
+
+    fn current(&self) -> BuckCleanupTaskConfig {
+        self.sender.borrow().clone()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<BuckCleanupTaskConfig> {
+        self.sender.subscribe()
+    }
+
+    fn set_config(&self, config: BuckCleanupTaskConfig) {
+        self.sender.send_replace(config);
+    }
+}
+
+fn config_reload_buck_cleanup_subscriber(
+    control: BuckCleanupTaskControl,
+) -> ConfigReloadSubscriber {
+    let apply_control = control.clone();
+    ConfigReloadSubscriber::new(
+        "buck_cleanup_task",
+        move |next, report| apply_buck_cleanup_config(&apply_control, next, report),
+        move |current, report| apply_buck_cleanup_config(&control, current, report),
+    )
+}
+
+fn apply_buck_cleanup_config(
+    control: &BuckCleanupTaskControl,
+    config: &Config,
+    report: &ConfigReloadReport,
+) -> Result<(), MegaError> {
+    if report
+        .applied_fields
+        .iter()
+        .any(|field| field.starts_with("buck."))
+    {
+        control.set_config(BuckCleanupTaskConfig::from_config(config));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct ArtifactGcTaskControl {
@@ -106,34 +182,66 @@ fn is_disallowed_root_repo_path(full_path: &str) -> bool {
 /// Spawns a background task to clean up expired Buck upload sessions.
 ///
 /// Returns `None` if cleanup is disabled in configuration.
-fn spawn_cleanup_task(ctx: AppContext, token: CancellationToken) -> Option<JoinHandle<()>> {
-    let config = ctx.storage.config();
-    let buck_config = config.buck.clone().unwrap_or_default();
-
-    if !buck_config.enable_session_cleanup {
-        return None;
+fn spawn_cleanup_task(
+    ctx: AppContext,
+    token: CancellationToken,
+) -> Result<Option<JoinHandle<()>>, MegaError> {
+    let cfg = BuckCleanupTaskConfig::from_config(&ctx.storage.config());
+    if !cfg.enabled {
+        return Ok(None);
     }
 
+    let control = BuckCleanupTaskControl::new(cfg);
+    ctx.config_handle
+        .subscribe(config_reload_buck_cleanup_subscriber(control.clone()))?;
+    let mut config_updates = control.subscribe();
     let cleanup_storage = ctx.storage.clone();
-    let cleanup_interval = buck_config.cleanup_interval;
-    let retention_days = buck_config.completed_retention_days;
 
-    Some(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Ok(Some(tokio::spawn(async move {
+        let mut cfg = control.current();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs()));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut accepts_config_updates = true;
 
         tracing::info!(
-            "Buck upload session cleanup task started (interval: {}s, retention: {}d)",
-            cleanup_interval,
-            retention_days
+            interval_secs = cfg.interval_secs(),
+            completed_retention_days = cfg.completed_retention_days,
+            "Buck upload session cleanup task started"
         );
 
         loop {
             tokio::select! {
-                _ = interval.tick() => {
+                changed = config_updates.changed(), if accepts_config_updates => {
+                    match changed {
+                        Ok(()) => {
+                            let updated = config_updates.borrow().clone();
+                            let interval_changed = updated.interval_secs() != cfg.interval_secs();
+                            cfg = updated;
+                            if interval_changed {
+                                ticker = tokio::time::interval(std::time::Duration::from_secs(
+                                    cfg.interval_secs(),
+                                ));
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            }
+                            tracing::info!(
+                                enabled = cfg.enabled,
+                                interval_secs = cfg.interval_secs(),
+                                completed_retention_days = cfg.completed_retention_days,
+                                "Buck upload session cleanup task config updated"
+                            );
+                        }
+                        Err(_) => {
+                            accepts_config_updates = false;
+                            tracing::warn!(
+                                "Buck upload session cleanup task config update channel closed; continuing with last config"
+                            );
+                        }
+                    }
+                }
+                _ = ticker.tick(), if cfg.enabled => {
                     match cleanup_storage
                         .buck_storage()
-                        .delete_expired_sessions(retention_days)
+                        .delete_expired_sessions(cfg.completed_retention_days)
                         .await
                     {
                         Ok(count) => {
@@ -160,7 +268,7 @@ fn spawn_cleanup_task(ctx: AppContext, token: CancellationToken) -> Option<JoinH
         }
 
         tracing::info!("Buck upload cleanup task stopped gracefully");
-    }))
+    })))
 }
 
 /// Background GC for `artifact_objects` with no manifest references (`docs/artifacts-protocol.md` §10.6).
@@ -276,7 +384,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     let middleware = tower::util::MapRequestLayer::new(rewrite_lfs_request_uri::<Body>);
 
     let shutdown_token = CancellationToken::new();
-    let cleanup_handle = spawn_cleanup_task(ctx.clone(), shutdown_token.clone());
+    let cleanup_handle = spawn_cleanup_task(ctx.clone(), shutdown_token.clone())?;
     let artifact_gc_handle = spawn_artifact_gc_task(ctx.clone(), shutdown_token.clone())?;
     let server_token = shutdown_token.clone();
 
@@ -577,7 +685,52 @@ mod tests {
     use http::Request;
 
     use super::*;
-    use crate::config::{ArtifactGcConfig, reload::ConfigHandle, testing::isolated_config};
+    use crate::config::{
+        ArtifactGcConfig, BuckConfig, reload::ConfigHandle, testing::isolated_config,
+    };
+
+    #[test]
+    fn buck_cleanup_subscriber_updates_control_from_reload() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.buck = Some(BuckConfig {
+            enable_session_cleanup: true,
+            cleanup_interval: 300,
+            completed_retention_days: 7,
+            ..Default::default()
+        });
+        let mut candidate = config.clone();
+        candidate.buck = Some(BuckConfig {
+            enable_session_cleanup: false,
+            cleanup_interval: 60,
+            completed_retention_days: 1,
+            ..Default::default()
+        });
+        let control = BuckCleanupTaskControl::new(BuckCleanupTaskConfig::from_config(&config));
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_buck_cleanup_subscriber(control.clone()))
+            .expect("subscribe");
+        let report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "buck.enable_session_cleanup",
+                "buck.cleanup_interval",
+                "buck.completed_retention_days"
+            ]
+        );
+        assert_eq!(
+            control.current(),
+            BuckCleanupTaskConfig {
+                enabled: false,
+                cleanup_interval: 60,
+                completed_retention_days: 1,
+            }
+        );
+    }
 
     #[test]
     fn artifact_gc_subscriber_updates_control_from_reload() {

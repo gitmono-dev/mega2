@@ -379,6 +379,17 @@ mod test {
     }
 
     #[test]
+    fn test_buck_config_validate_cleanup_interval_zero() {
+        let config = BuckConfig {
+            cleanup_interval: 0,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cleanup_interval"));
+    }
+
+    #[test]
     fn test_buck_config_validate_valid_values() {
         let config = BuckConfig {
             upload_concurrency_limit: 100,

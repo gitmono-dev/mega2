@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     common::errors::MegaError,
-    config::{ArtifactGcConfig, Config, LogConfig, MailConfig},
+    config::{ArtifactGcConfig, BuckConfig, Config, LogConfig, MailConfig},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,6 +134,7 @@ impl ConfigHandle {
             &mut next.artifacts_gc,
             &mut report,
         );
+        apply_buck_changes(&current.buck, &candidate.buck, &mut next.buck, &mut report);
         apply_mail_changes(&current.mail, &candidate.mail, &mut next.mail, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
@@ -412,6 +413,46 @@ fn apply_artifact_gc_changes(
     }
 }
 
+fn apply_buck_changes(
+    current: &Option<BuckConfig>,
+    candidate: &Option<BuckConfig>,
+    next: &mut Option<BuckConfig>,
+    report: &mut ConfigReloadReport,
+) {
+    let current = current.clone().unwrap_or_default();
+    let candidate = candidate.clone().unwrap_or_default();
+
+    if !current.enable_session_cleanup && candidate.enable_session_cleanup {
+        collect_buck_cleanup_restart_fields(&current, &candidate, report);
+    } else {
+        apply_buck_cleanup_changes(&current, &candidate, next, report);
+    }
+    collect_buck_restart_fields(&current, &candidate, report);
+}
+
+fn apply_buck_cleanup_changes(
+    current: &BuckConfig,
+    candidate: &BuckConfig,
+    next: &mut Option<BuckConfig>,
+    report: &mut ConfigReloadReport,
+) {
+    if current.enable_session_cleanup != candidate.enable_session_cleanup {
+        next.get_or_insert_with(BuckConfig::default)
+            .enable_session_cleanup = candidate.enable_session_cleanup;
+        report.applied_fields.push("buck.enable_session_cleanup");
+    }
+    if current.cleanup_interval != candidate.cleanup_interval {
+        next.get_or_insert_with(BuckConfig::default)
+            .cleanup_interval = candidate.cleanup_interval;
+        report.applied_fields.push("buck.cleanup_interval");
+    }
+    if current.completed_retention_days != candidate.completed_retention_days {
+        next.get_or_insert_with(BuckConfig::default)
+            .completed_retention_days = candidate.completed_retention_days;
+        report.applied_fields.push("buck.completed_retention_days");
+    }
+}
+
 fn apply_mail_changes(
     current: &Option<MailConfig>,
     candidate: &Option<MailConfig>,
@@ -459,6 +500,62 @@ fn collect_artifact_gc_restart_fields(
         report
             .restart_required_fields
             .push("artifacts_gc.batch_limit");
+    }
+}
+
+fn collect_buck_cleanup_restart_fields(
+    current: &BuckConfig,
+    candidate: &BuckConfig,
+    report: &mut ConfigReloadReport,
+) {
+    if current.enable_session_cleanup != candidate.enable_session_cleanup {
+        report
+            .restart_required_fields
+            .push("buck.enable_session_cleanup");
+    }
+    if current.cleanup_interval != candidate.cleanup_interval {
+        report.restart_required_fields.push("buck.cleanup_interval");
+    }
+    if current.completed_retention_days != candidate.completed_retention_days {
+        report
+            .restart_required_fields
+            .push("buck.completed_retention_days");
+    }
+}
+
+fn collect_buck_restart_fields(
+    current: &BuckConfig,
+    candidate: &BuckConfig,
+    report: &mut ConfigReloadReport,
+) {
+    if current.session_timeout != candidate.session_timeout {
+        report.restart_required_fields.push("buck.session_timeout");
+    }
+    if current.max_file_size != candidate.max_file_size {
+        report.restart_required_fields.push("buck.max_file_size");
+    }
+    if current.max_files != candidate.max_files {
+        report.restart_required_fields.push("buck.max_files");
+    }
+    if current.max_concurrent_uploads != candidate.max_concurrent_uploads {
+        report
+            .restart_required_fields
+            .push("buck.max_concurrent_uploads");
+    }
+    if current.upload_concurrency_limit != candidate.upload_concurrency_limit {
+        report
+            .restart_required_fields
+            .push("buck.upload_concurrency_limit");
+    }
+    if current.large_file_concurrency_limit != candidate.large_file_concurrency_limit {
+        report
+            .restart_required_fields
+            .push("buck.large_file_concurrency_limit");
+    }
+    if current.large_file_threshold != candidate.large_file_threshold {
+        report
+            .restart_required_fields
+            .push("buck.large_file_threshold");
     }
 }
 
@@ -543,8 +640,8 @@ fn collect_mail_restart_fields(
 mod tests {
     use super::*;
     use crate::config::{
-        ArtifactGcConfig, MailConfig, secret::SecretRef, template::config_init_template,
-        testing::isolated_config,
+        ArtifactGcConfig, BuckConfig, MailConfig, secret::SecretRef,
+        template::config_init_template, testing::isolated_config,
     };
 
     fn mail_config(enabled: bool) -> MailConfig {
@@ -697,6 +794,112 @@ mod tests {
                 grace_secs: 86_400,
                 batch_limit: 100,
             }
+        );
+    }
+
+    #[test]
+    fn reload_applies_buck_cleanup_runtime_fields() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.buck = Some(BuckConfig {
+            enable_session_cleanup: true,
+            cleanup_interval: 300,
+            completed_retention_days: 7,
+            ..Default::default()
+        });
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.buck = Some(BuckConfig {
+            enable_session_cleanup: false,
+            cleanup_interval: 60,
+            completed_retention_days: 1,
+            ..Default::default()
+        });
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let buck = snapshot.buck.as_ref().expect("buck config");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "buck.enable_session_cleanup",
+                "buck.cleanup_interval",
+                "buck.completed_retention_days"
+            ]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert!(!buck.enable_session_cleanup);
+        assert_eq!(buck.cleanup_interval, 60);
+        assert_eq!(buck.completed_retention_days, 1);
+    }
+
+    #[test]
+    fn reload_reports_buck_cleanup_enable_requires_restart_without_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.buck = Some(BuckConfig {
+            enable_session_cleanup: false,
+            cleanup_interval: 300,
+            completed_retention_days: 7,
+            ..Default::default()
+        });
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.buck = Some(BuckConfig {
+            enable_session_cleanup: true,
+            cleanup_interval: 60,
+            completed_retention_days: 1,
+            ..Default::default()
+        });
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let buck = snapshot.buck.as_ref().expect("buck config");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec![
+                "buck.enable_session_cleanup",
+                "buck.cleanup_interval",
+                "buck.completed_retention_days"
+            ]
+        );
+        assert!(!buck.enable_session_cleanup);
+        assert_eq!(buck.cleanup_interval, 300);
+        assert_eq!(buck.completed_retention_days, 7);
+    }
+
+    #[test]
+    fn reload_reports_buck_upload_fields_as_restart_required() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.buck = Some(BuckConfig::default());
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.buck = Some(BuckConfig {
+            max_files: 10,
+            upload_concurrency_limit: 25,
+            ..Default::default()
+        });
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let buck = snapshot.buck.as_ref().expect("buck config");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec!["buck.max_files", "buck.upload_concurrency_limit"]
+        );
+        assert_eq!(buck.max_files, BuckConfig::default().max_files);
+        assert_eq!(
+            buck.upload_concurrency_limit,
+            BuckConfig::default().upload_concurrency_limit
         );
     }
 
