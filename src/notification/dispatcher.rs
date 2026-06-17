@@ -123,7 +123,7 @@ impl EmailDispatcher {
                 Err(e) => {
                     let _ = self
                         .stg
-                        .mark_job_failed_with_retry(job.id, &format!("{e:?}"))
+                        .mark_job_failed_with_retry(job.id, &e.to_string())
                         .await;
                 }
             }
@@ -147,6 +147,7 @@ fn apply_mail_enabled(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use tempfile::TempDir;
 
@@ -157,6 +158,21 @@ mod tests {
         jupiter::{migration::apply_migrations, tests::test_db_connection},
         mail::NoopMailer,
     };
+
+    struct FailingMailer;
+
+    #[async_trait]
+    impl Mailer for FailingMailer {
+        async fn send_html(
+            &self,
+            _to: &str,
+            _subject: &str,
+            _html: &str,
+            _text: Option<&str>,
+        ) -> Result<(), MegaError> {
+            Err(MegaError::Other("smtp unavailable".to_string()))
+        }
+    }
 
     #[tokio::test]
     async fn test_dispatcher_sends_pending_jobs() {
@@ -247,6 +263,51 @@ mod tests {
             "disabled dispatcher should leave job pending"
         );
         assert_eq!(jobs[0].status, "pending");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_requeues_failed_send_with_retry_backoff() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        stg.enqueue_email_job(
+            "alice",
+            "alice@example.com",
+            "cl.comment.created",
+            "Subject",
+            "<p>Body</p>",
+            Some("Body"),
+        )
+        .await
+        .unwrap();
+
+        let dispatcher = EmailDispatcher::new(stg.clone(), Arc::new(FailingMailer));
+        dispatcher.tick_once().await.unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "pending");
+        assert_eq!(jobs[0].retry_count, 1);
+        assert!(jobs[0].next_retry_at.is_some());
+        assert_eq!(
+            jobs[0].error_message.as_deref(),
+            Some("Other error: smtp unavailable")
+        );
     }
 
     #[test]

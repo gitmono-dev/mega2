@@ -27,7 +27,7 @@
 | 运行时共享 (`Arc<Config>`)      | 已实现并接入 reload handle 首批 | `AppContext` 保留初始 `Arc<Config>` 兼容字段，同时持有与 `Storage` 共享的 `ConfigHandle`；`Storage` 也持有 `ConfigHandle`，`storage.config()` 现在从 handle 获取当前快照，锁异常时回退初始 `Arc<Config>`，不再依赖 `Weak::upgrade().expect(...)`。仍需逐点确认跨 `await` 持有旧快照的语义，并补任务/邮件等其它热加载真实消费端订阅接入。 |
 | `mail` / `MailConfig` / 邮件发送 | **已激活并接入 dispatcher 启动点** | 真实实现在一级模块 `src/mail/mod.rs`（`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `src/config/model.rs`、`Config.mail` 字段已存在、`[mail]` 段已被消费。`src/email/mod.rs` 为 re-export shim。`AppContext::new` 在 vault 之后解析 `mail.password_ref`（如存在）并构造 `SmtpMailer`，构造失败现在返回可诊断错误。详见 `mail.md`。 |
 | `[oauth]` 段                   | **死配置，已在 validate 中告警**  | TOML 里有完整段（`config.toml:155`）+ env list key 注册（`src/config/source.rs`），但无强类型字段承接，也无运行期消费者。它是目前**唯一**被整段丢弃的孤立顶层段（`[mail]` 已被消费）。`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、raw TOML 中任意未知段/未知 key，以及 `MEGA_OAUTH__...`、`MEGA_MAIL__TLS`/`MEGA_MAIL__SMTP_TLS`、未知 `MEGA_*` 覆盖项输出 warning；常规服务加载仍不阻断。profile/env 来源图和覆盖关系已能显示，后续仍需补更完整 source-level 修复建议。 |
-| `src/notification/`（邮件 outbox / dispatcher） | **已接入编译并在 mail 启用时启动 dispatcher** | `src/notification/{dispatcher,triggers,mod}.rs`（`EmailDispatcher`、触发器）+ `callisto::email_jobs` outbox 实体已从 mega 移植；`main.rs:18` 已声明 `mod notification;`。`AppContext::new` 在 vault 之后、`init_monorepo` 之前创建 `EmailDispatcher` 并 `tokio::spawn`；剩余工作是生命周期治理、退避/并发策略和业务触发器接入。 |
+| `src/notification/`（邮件 outbox / dispatcher） | **已接入编译并在 mail 启用时启动 dispatcher** | `src/notification/{dispatcher,triggers,mod}.rs`（`EmailDispatcher`、触发器）+ `callisto::email_jobs` outbox 实体已从 mega 移植；`main.rs:18` 已声明 `mod notification;`。`AppContext::new` 在 vault 之后、`init_monorepo` 之前创建 `EmailDispatcher` 并 `tokio::spawn`；失败发送已具备首个有界 retry + dead-letter 机制；剩余工作是生命周期治理、并发策略、观测和更多业务触发器接入。 |
 | Vault 管理的 secret            | 已扩展     | 现有直接消费者包括 `ssh_server_key`、PGP、Nostr、PKI 以及首批配置 SecretRef（`mail.password_ref` → `secret/config/...`）。 |
 | `core_key.json` + 自动解封     | 已加固 | JSON 存储 unseal shares + 限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不 `delete_all()`；token/root/shares 不输出到日志。 |
 | Profile / `config.<profile>.toml` | **已实现首批** | 全局 `--profile <name>` 优先于 `MEGA_PROFILE`；profile 文件固定为基础配置同目录、同 stem 的 `.<profile>.toml`，例如 `config.toml` → `config.prod.toml`；基础配置后叠加 profile，再叠加 `MEGA_*` 环境变量。profile 名限制为 ASCII 字母/数字/`-`/`_`，指定但文件不存在会报错；`config validate` 会对 base/profile 文件分别输出 raw TOML warning，profile 类型冲突会报 profile 路径、字段路径、期望类型和脱敏建议；`config secret set/check` 仍走最小 DB/Vault bootstrap，但读取 profile 合并后的 DB 配置。完整 profile source diagnostics 仍待补。 |
@@ -42,7 +42,7 @@
 - `src/config/expand.rs::variable_placeholder_substitute` 已消除原 **10** 处 `unwrap`，并已对未解析/非法占位符值输出字段级脱敏错误和修复建议；仍需在后续完整 source diagnostics 中补更丰富的跨 source 覆盖关系。
 - `Storage::new` 里的 Buck 校验和 BuckService 构造失败已从 `panic!` / `expect` 改为返回 `MegaError`；数据库连接和 migration 失败也已从 `database_connection` 的 `expect` 改为经 `Storage::new` / Vault 最小 bootstrap 返回错误；仍需在后续把更多启动期配置校验提前到 `Config::validate()` / source diagnostics。
 - `Storage::config()` 已改为从 `Storage` 持有的共享 `ConfigHandle` 读取当前快照，锁异常时回退初始 `Arc<Config>`，不再存在 `Weak::upgrade().expect("Config has been dropped")` 的 panic 点；`AppContext` 也持有同一个 `ConfigHandle` 并提供 `config()` 快照方法。`ConfigReloadSubscriber` 已补首批订阅应用/失败回滚语义，`ConfigReloadWatcher` 已补 base/profile 文件轮询触发 reload 语义，`service` 命令已补 watcher 生命周期接线并注册日志 reload subscriber；邮件 dispatcher 已补 `mail.enabled = false` 的运行期关停 subscriber；HTTP Buck cleanup 和 artifact GC 任务已补调度参数热更新和运行期关停 subscriber。后续热加载仍需补邮件重新启用/重配等其它真实消费端订阅接入。
-- `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`（含数据库连接和 migration）、Redis 初始化、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；HTTP 服务监听地址解析/绑定失败也已从 `unwrap` 改为经 `service http` / `service multi` 返回错误。剩余风险主要在 dispatcher 生命周期治理、失败退避和后台任务可观测性。
+- `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`（含数据库连接和 migration）、Redis 初始化、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；HTTP 服务监听地址解析/绑定失败也已从 `unwrap` 改为经 `service http` / `service multi` 返回错误。邮件发送失败已具备有界 retry + dead-letter 基线；剩余风险主要在 dispatcher 生命周期治理、并发和后台任务可观测性。
 - `mail.password` 明文字段仍为兼容期入口；`SecretString` 防误打印、运行期 deprecation warning、source diagnostics warning、`--deny-warnings` 门禁和 CI smoke 已落地，后续继续按兼容期治理推动生产配置使用 `mail.password_ref`。
 - Vault 初始化/解封的旧泄露路径已清理；当前残余风险是自动解封材料仍落在 `core_key.json`，需要备份恢复和部署侧凭据注入/KMS 策略配套。
 - `mega_base()` / `mega_cache()`（`src/config/mod.rs`）的早期 `BaseDirs::new().unwrap()` / `to_str().unwrap()` 已移除；未设置 `MEGA_BASE_DIR` / `MEGA_CACHE_DIR` 且系统目录不可用时，会退回当前目录下 `.mega` / `.mega/cache`，后续完整 source diagnostics 可继续把 fallback 来源显式化。
@@ -61,9 +61,9 @@
 **已接入但仍需加固：**
 - `src/notification/{dispatcher,triggers,mod}.rs`：`EmailDispatcher`（`dispatcher.rs:18` 的 `run(self, shutdown)`，2 秒固定 `interval`、`fetch_pending_jobs(50)`、`:6` 导入 `crate::mail`）与事件触发器（`on_cl_comment_created` 等）已从 mega 移植，并经 `main.rs:18` 的 `mod notification;` 接入编译。
 - `callisto::email_jobs` outbox 实体、`NotificationStorage`、对应 migration 均存在；`AppContext::new` 当前在 vault 之后、`init_monorepo` 之前启动 dispatcher。
-- 仍需补齐：dispatcher 生命周期治理、退避/并发策略、以及触发器在业务路径中的完整调用。
+- 仍需补齐：dispatcher 生命周期治理、并发策略、观测，以及触发器在业务路径中的完整调用。
 
-**结论（影响后续执行基线）：** "先有真实的、晚于 vault 的消费者，再谈 SecretRef"这一原则的前置功能工作已落地，且 `mail.password_ref` 已成为首个真实 `SecretRef` 消费端。后续阶段不应再重复实现 resolver 或 mail 迁移；剩余工作是明文 `mail.password` 的兼容期收尾治理、dispatcher 生命周期/退避/并发、以及业务触发器接入。
+**结论（影响后续执行基线）：** "先有真实的、晚于 vault 的消费者，再谈 SecretRef"这一原则的前置功能工作已落地，且 `mail.password_ref` 已成为首个真实 `SecretRef` 消费端。后续阶段不应再重复实现 resolver 或 mail 迁移；剩余工作是明文 `mail.password` 的兼容期收尾治理、dispatcher 生命周期/并发/观测、以及业务触发器接入。
 
 ## 总体设计
 
@@ -195,7 +195,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 - Git pack / LFS：控制对象解码、上传、存储和传输行为。
 - 构建系统：配置 Orion 构建服务、触发器和构建产物管理。
 - Buck 上传：读取上传限制、清理策略和相关后台任务参数。
-- 邮件通知（已编译，dispatcher 已在 mail 启用时启动）：一级模块 `src/mail/mod.rs` 提供 `SmtpMailer`/`NoopMailer`，`MailConfig` 已定义并接入 `Config`；`src/context/mod.rs` 已在 vault 之后解析 `mail.password_ref`，再构造 `SmtpMailer` 并 spawn `EmailDispatcher`。作为首个配置侧 SecretRef 消费点，基础迁移已完成；明文 `mail.password` 的 deprecation warning、`SecretString` 包装和 source diagnostics 门禁已落地，剩余工作是兼容期收尾治理以及 dispatcher 生命周期/退避/并发（见「已落地的 mail/notification 子系统现状」）。
+- 邮件通知（已编译，dispatcher 已在 mail 启用时启动）：一级模块 `src/mail/mod.rs` 提供 `SmtpMailer`/`NoopMailer`，`MailConfig` 已定义并接入 `Config`；`src/context/mod.rs` 已在 vault 之后解析 `mail.password_ref`，再构造 `SmtpMailer` 并 spawn `EmailDispatcher`。作为首个配置侧 SecretRef 消费点，基础迁移已完成；明文 `mail.password` 的 deprecation warning、`SecretString` 包装和 source diagnostics 门禁已落地，发送失败的有界 retry + dead-letter 基线已落地，剩余工作是兼容期收尾治理以及 dispatcher 生命周期/并发/观测（见「已落地的 mail/notification 子系统现状」）。
 - Artifact GC：控制构建产物垃圾回收策略。
 - Sidebar 默认数据：为 UI 侧边栏提供初始化种子配置。
 
@@ -368,7 +368,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 | `redis.url`（若含密码） | `AppContext::new` 中 vault 前 `init_connection` | 早期运行时依赖 | 走 env/部署平台 secret；所有日志与错误必须脱敏 |
 | `object_storage.s3.*` / `secret_access_key` | `Storage::new` 中 `crate::jupiter::storage::object_storage::ObjectStorageFactory::build`（vault 前） | 早期运行时依赖 | 先保持现状；若要入 vault，必须先把 Storage 拆成 DB-only → Vault → resolve secrets → 完整构造 |
 | `orion_server.db_url` 等 | Orion 作为独立服务使用 | 外部服务配置 | 由 Orion 自己或部署平台管理，monoengine 不应声称代管 |
-| `mail.password_ref`（推荐）/ `mail.password`（兼容期明文） | `AppContext::new` 中 `VaultCore::new` 之后解析，再构造 `SmtpMailer` 和 `EmailDispatcher` | **可迁移凭据（已落地首个成员）** | `password_ref`、最小 resolver、互斥校验、mailer 错误传播、明文 deprecation warning、`SecretString` 防误打印、source diagnostics 和 `--deny-warnings` 门禁已落地；剩余=兼容期收尾治理、dispatcher 生命周期 |
+| `mail.password_ref`（推荐）/ `mail.password`（兼容期明文） | `AppContext::new` 中 `VaultCore::new` 之后解析，再构造 `SmtpMailer` 和 `EmailDispatcher` | **可迁移凭据（已落地首个成员）** | `password_ref`、最小 resolver、互斥校验、mailer 错误传播、明文 deprecation warning、`SecretString` 防误打印、source diagnostics、`--deny-warnings` 门禁和失败发送 dead-letter 基线已落地；剩余=兼容期收尾治理、dispatcher 生命周期/并发/观测 |
 | `ssh_server_key`、PGP/Nostr 等现有 vault secret | 已由 vault 管理（vault 内部） | vault 内部 secret | fail-closed、权限收紧、root token 脱敏/退役和主路径错误 Result 化已落地；剩余=部署侧 key material 托管、备份恢复和 KMS/secret manager 策略 |
 
 #### SecretRef 已实现形态与使用规则

@@ -9,6 +9,8 @@ use crate::callisto::{
     email_jobs, notification_event_types, user_notification_preferences, user_notification_settings,
 };
 
+pub const MAX_EMAIL_RETRY_ATTEMPTS: i32 = 5;
+
 #[derive(Clone)]
 pub struct NotificationStorage {
     db: Arc<DatabaseConnection>,
@@ -272,6 +274,7 @@ impl NotificationStorage {
 
             model.status = Set("sent".to_string());
             model.error_message = Set(None);
+            model.next_retry_at = Set(None);
             model.sent_at = Set(Some(now));
             model.updated_at = Set(now);
             model.update(self.db()).await?;
@@ -289,14 +292,17 @@ impl NotificationStorage {
 
             model.status = Set("skipped".to_string());
             model.error_message = Set(Some(reason.to_string()));
+            model.next_retry_at = Set(None);
             model.updated_at = Set(now);
             model.update(self.db()).await?;
         }
         Ok(())
     }
 
-    /// Mark a job as failed and schedule a retry
-    /// backoff: 30s, 60s, ... capped at 300s
+    /// Mark a job as failed and schedule a retry.
+    /// Backoff: 30s, 60s, ... capped at 300s.
+    /// Jobs that reach MAX_EMAIL_RETRY_ATTEMPTS are moved to failed status and
+    /// no longer returned by fetch_pending_jobs.
     pub async fn mark_job_failed_with_retry(
         &self,
         job_id: i64,
@@ -309,14 +315,19 @@ impl NotificationStorage {
             let mut model: email_jobs::ActiveModel = job.clone().into();
             let now = chrono::Utc::now().naive_utc();
             let retry = job.retry_count + 1;
-            let delay_secs = (retry as i64).min(10) * 30;
-            let next = now + chrono::Duration::seconds(delay_secs);
 
-            // Re-queue
-            model.status = Set("pending".to_string());
+            if retry >= MAX_EMAIL_RETRY_ATTEMPTS {
+                model.status = Set("failed".to_string());
+                model.next_retry_at = Set(None);
+            } else {
+                let delay_secs = (retry as i64).min(10) * 30;
+                let next = now + chrono::Duration::seconds(delay_secs);
+                model.status = Set("pending".to_string());
+                model.next_retry_at = Set(Some(next));
+            }
+
             model.error_message = Set(Some(error.to_string()));
             model.retry_count = Set(retry);
-            model.next_retry_at = Set(Some(next));
             model.updated_at = Set(now);
             model.update(self.db()).await?;
         }
@@ -428,7 +439,22 @@ mod tests {
 
         let job_id = jobs[0].id;
 
-        // Mark sent
+        storage
+            .mark_job_failed_with_retry(job_id, "temporary smtp failure")
+            .await
+            .unwrap();
+        let retried_job = crate::callisto::email_jobs::Entity::find_by_id(job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retried_job.next_retry_at.is_some());
+        assert_eq!(
+            retried_job.error_message.as_deref(),
+            Some("temporary smtp failure")
+        );
+
+        // Mark sent clears retry metadata from previous failures.
         storage.mark_job_sent(job_id).await.unwrap();
 
         let job = crate::callisto::email_jobs::Entity::find_by_id(job_id)
@@ -438,5 +464,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(job.status, "sent");
+        assert!(job.next_retry_at.is_none());
+        assert!(job.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn email_job_failure_retries_then_dead_letters() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job(
+                "alice",
+                "alice@test.com",
+                "test.event",
+                "Hello",
+                "<p>Hello</p>",
+                Some("Hello"),
+            )
+            .await
+            .unwrap();
+
+        let job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+
+        for retry in 1..MAX_EMAIL_RETRY_ATTEMPTS {
+            storage
+                .mark_job_failed_with_retry(job_id, "smtp unavailable")
+                .await
+                .unwrap();
+
+            let job = email_jobs::Entity::find_by_id(job_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, "pending");
+            assert_eq!(job.retry_count, retry);
+            assert!(job.next_retry_at.is_some());
+        }
+
+        storage
+            .mark_job_failed_with_retry(job_id, "smtp unavailable")
+            .await
+            .unwrap();
+
+        let job = email_jobs::Entity::find_by_id(job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.retry_count, MAX_EMAIL_RETRY_ATTEMPTS);
+        assert!(job.next_retry_at.is_none());
+        assert_eq!(job.error_message.as_deref(), Some("smtp unavailable"));
+        assert!(storage.fetch_pending_jobs(10).await.unwrap().is_empty());
     }
 }
