@@ -1,4 +1,5 @@
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use serde_json::{Map, Value};
 use tracing::log;
 
 use crate::{
@@ -57,17 +58,14 @@ impl VaultCore {
             None => {
                 log::debug!("Nostr ID not found in vault, generating new one...");
                 let (nostr, (secret_key, _)) = generate_nostr_id();
-                let data = serde_json::json!({
-                    "nostr": nostr,
-                    "secret_key": secret_key.display_secret().to_string(),
-                })
-                .as_object()
-                .unwrap()
-                .clone();
+                let secret_key = secret_key.display_secret().to_string();
+                let mut data = Map::new();
+                data.insert("nostr".to_string(), Value::String(nostr.clone()));
+                data.insert("secret_key".to_string(), Value::String(secret_key.clone()));
 
                 self.write_secret(NOSTR_IDENTITY_KEY, Some(data.clone()))
                     .await?;
-                Ok((nostr, secret_key.display_secret().to_string()))
+                Ok((nostr, secret_key))
             }
         }
     }

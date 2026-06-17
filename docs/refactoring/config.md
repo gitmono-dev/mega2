@@ -211,7 +211,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 2. **`init_connection(&config.redis)`（`src/context/mod.rs:36`）** 在 `VaultCore::new` 之前执行，因此带密码的 `redis.url` 也属于早期运行时依赖。
 3. **`VaultCore::new(storage)`（`src/context/mod.rs:39`）** 之后才就绪，此后消费的配置字段才可纳入可迁移凭据。
 4. **SMTP mailer 与 EmailDispatcher 已是 vault 之后的后置消费点，并已接入 SecretRef。** `src/context/mod.rs` 在 `VaultCore::new` 之后检查 `MailConfig` 的 `password` / `password_ref` 互斥关系；若配置了 `password_ref`，通过 `VaultSecretResolver` 解析后再调用 `SmtpMailer::new_with_password(...)`。SMTP 初始化失败会返回 `MegaError`，不再静默忽略。**因此 `mail.password_ref` 是当前已落地的第一个配置侧 SecretRef 消费点**；后续不应重复做 resolver/mail 接入，只需治理明文兼容路径和 dispatcher 生命周期。
-5. **`ssh_server_key`（`src/server/ssh_server.rs:78` 读取、`:99` 写入）** 已由 vault 管理，但属于 vault 内部 secret，不在 `Config` 结构体中。注意 `:78` 处当前对 `read_secret(...).unwrap()` 会在 secret 缺失/读取失败时 panic，加固时应一并改为可诊断错误。
+5. **`ssh_server_key`、PGP、Nostr** 已由 vault 管理，但属于 vault 内部 secret，不在 `Config` 结构体中。SSH server key 读取/生成/写入失败、PGP key 读取/解析/保存/删除、Nostr key 读取/生成/解析已改为返回可诊断错误；它们不改变配置侧 `SecretRef` 的边界。
 
 > 结论：任何在 `Storage::new` 或 `init_connection` 阶段消费的字段都不能直接改为 `SecretRef`，除非先重构初始化顺序。
 >
@@ -369,7 +369,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 | `object_storage.s3.*` / `secret_access_key` | `Storage::new` 中 `crate::jupiter::storage::object_storage::ObjectStorageFactory::build`（vault 前） | 早期运行时依赖 | 先保持现状；若要入 vault，必须先把 Storage 拆成 DB-only → Vault → resolve secrets → 完整构造 |
 | `orion_server.db_url` 等 | Orion 作为独立服务使用 | 外部服务配置 | 由 Orion 自己或部署平台管理，monoengine 不应声称代管 |
 | `mail.password_ref`（推荐）/ `mail.password`（兼容期明文） | `AppContext::new` 中 `VaultCore::new` 之后解析，再构造 `SmtpMailer` 和 `EmailDispatcher` | **可迁移凭据（已落地首个成员）** | `password_ref`、最小 resolver、互斥校验、mailer 错误传播、明文 deprecation warning 和 `SecretString` 防误打印已落地；剩余=source diagnostics、样例治理、dispatcher 生命周期 |
-| `ssh_server_key`、PGP/Nostr 等现有 vault secret | 已由 vault 管理（vault 内部） | vault 内部 secret | fail-closed、权限收紧、root token 脱敏/退役已落地；剩余=部署侧 key material 托管、备份恢复和 KMS/secret manager 策略 |
+| `ssh_server_key`、PGP/Nostr 等现有 vault secret | 已由 vault 管理（vault 内部） | vault 内部 secret | fail-closed、权限收紧、root token 脱敏/退役和主路径错误 Result 化已落地；剩余=部署侧 key material 托管、备份恢复和 KMS/secret manager 策略 |
 
 #### SecretRef 已实现形态与使用规则
 

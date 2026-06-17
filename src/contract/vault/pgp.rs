@@ -4,6 +4,7 @@ pub use pgp::composed::{
     SubkeyParamsBuilder,
 };
 use rand08::thread_rng;
+use serde_json::{Map, Value};
 /// This module provides functions for generating, loading, saving, and deleting PGP key pairs.
 ///
 /// It uses the `pgp` crate for key generation and management, and stores the keys in a vault
@@ -117,13 +118,9 @@ impl VaultCore {
         let sec_key = sec_key
             .to_armored_string(None.into())
             .map_err(|e| MegaError::Other(format!("failed to encode PGP secret key: {e}")))?;
-        let data = serde_json::json!({
-            "pub_key": pub_key,
-            "sec_key": sec_key,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
+        let mut data = Map::new();
+        data.insert("pub_key".to_string(), Value::String(pub_key));
+        data.insert("sec_key".to_string(), Value::String(sec_key));
         self.write_secret(VAULT_KEY, Some(data)).await
     }
 

@@ -310,13 +310,13 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 
 ### 消费端假设 vault 数据永远正确
 
-当前 SSH、PGP、Nostr 等调用点大量使用 `unwrap()` 和 `expect()`，并假设 secret JSON shape 永远正确。例如：
+早期 SSH、PGP、Nostr 等调用点大量使用 `unwrap()` 和 `expect()`，并假设 secret JSON shape 永远正确。例如：
 
 - `src/server/ssh_server.rs` 读取 `ssh_server_key.secret_key`。
 - `src/contract/vault/pgp.rs` 读取 `pgp-signed-secret.pub_key` / `sec_key`。
 - `src/contract/vault/nostr.rs` 读取 `nostr_identity_key.nostr` / `secret_key`。
 
-当 vault 数据损坏、字段缺失或格式错误时，服务会 panic。迁移配置 secret 前，需要逐步把这些路径改为返回可诊断错误。
+当前 SSH、PGP、Nostr 的读取/生成/保存主路径已改为返回可诊断错误；PGP/Nostr 保存路径也不再通过 `json().as_object().unwrap()` 构造 KV map。后续仍需继续清理 PKI 和其它调用点中的测试外 panic 风格路径。
 
 ### root token 永久留存，且应用全程以 root 身份操作
 
@@ -360,8 +360,8 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 | `object_storage.s3.*` | `Storage::new` 中 vault 前构造对象存储 | 早期运行时依赖 | 暂时不能进本项目 vault；需先重构初始化顺序 |
 | `orion_server.db_url` | Orion 相关配置 | 引导或独立服务配置 | 不默认纳入 monoengine vault；按 Orion 启动依赖单独判断 |
 | `mail.password` | `AppContext::new` 中 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher` | 可迁移凭据 | 第一批可改为 `SecretRef`；构造失败需从静默忽略改为可诊断处理 |
-| `ssh_server_key` | SSH server 启动时读取或生成 | vault 内部 secret | 已由 vault 管理，但需要加固错误处理和 key 文件安全 |
-| PGP / Nostr key | `vault/pgp.rs`、`vault/nostr.rs` | vault 内部 secret | 已由 vault 管理，但需要清理 panic 与数据 shape 校验 |
+| `ssh_server_key` | SSH server 启动时读取或生成 | vault 内部 secret | 已由 vault 管理；读取、生成和写入失败已返回可诊断错误；剩余重点是部署侧 key material 托管 |
+| PGP / Nostr key | `vault/pgp.rs`、`vault/nostr.rs` | vault 内部 secret | 已由 vault 管理；读取、解析、保存和删除主路径已返回 `Result`，缺字段/坏格式不再 panic |
 
 ## 跨模块协同前置（2026-06-16 修订）
 
@@ -680,9 +680,9 @@ pub fn global_redactor() -> &'static dyn Redactor;
 
 优先处理：
 
-1. `src/server/ssh_server.rs`：SSH server key 读取、生成、写入失败返回错误。
-2. `src/contract/vault/pgp.rs`：PGP key 读取、解析、保存、删除返回 `Result`。
-3. `src/contract/vault/nostr.rs`：Nostr key 读取、生成、解析返回 `Result`。
+1. 已完成：`src/server/ssh_server.rs` 的 SSH server key 读取、生成、写入失败返回错误。
+2. 已完成：`src/contract/vault/pgp.rs` 的 PGP key 读取、解析、保存、删除返回 `Result`。
+3. 已完成：`src/contract/vault/nostr.rs` 的 Nostr key 读取、生成、解析返回 `Result`。
 4. `src/contract/vault/pki.rs`：PKI API 统一错误模型，避免新增 panic 风格路径。**注意（2026-06-15）**：新 libvault 的 PKI 已按证书类型分域，调用路径随迁移更新为 `pki/root/tls/generate/{internal|exported}`、`pki/roles/tls/{name}`、`pki/issue/tls/{role}`、`pki/ca/tls/pem` 等（旧 `pki/root/generate/...`、`pki/roles/...`、`pki/issue/...`、`pki/ca/pem` 已不再支持，会返回 "Logical backend path not supported"）；错误模型清理应基于新路径，且 `pki.rs` 文档注释中的 `crate::vault::modules::pki::*` 模块引用也已随之更新。
 
 验收标准：
