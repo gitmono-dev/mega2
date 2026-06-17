@@ -1,7 +1,10 @@
 //! Configuration management for the Mono and Mega application
 //! This module provides functionality to load, parse, and manage configuration settings
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 pub use ::config as c;
 use c::{ConfigError, FileFormat, Source};
@@ -34,28 +37,17 @@ use source::{config_from_path, config_from_path_with_profile, mega_environment_s
 ///     - On Linux: `~/.local/share/mega`
 ///     - On Windows: `C:\Users\{UserName}\AppData\Local\mega`
 ///     - On macOS: `~/Library/Application Support/mega`
+/// 3. Falls back to `.mega` in the current directory if system paths are unavailable
 ///
 /// # Returns
 /// A PathBuf containing the base directory path
 ///
-/// # Panics
-/// Will panic if both conditions occur:
-/// - Environment variable is not set
-/// - System base directories cannot be determined
-///
 pub fn mega_base() -> PathBuf {
-    // Get the base directory from the environment variable or use the default
-    let base_dir = std::env::var("MEGA_BASE_DIR").unwrap_or_else(|_| {
-        let base_dirs = directories::BaseDirs::new().unwrap();
-        base_dirs
-            .data_local_dir()
-            .join("mega")
-            .to_str()
-            .unwrap()
-            .to_string()
-    });
-
-    PathBuf::from(base_dir)
+    resolve_mega_dir(
+        std::env::var_os("MEGA_BASE_DIR"),
+        directories::BaseDirs::new().map(|base_dirs| base_dirs.data_local_dir().join("mega")),
+        fallback_mega_base,
+    )
 }
 
 /// Retrieves the cache directory path for Mega
@@ -66,28 +58,39 @@ pub fn mega_base() -> PathBuf {
 ///     - On Linux: `~/.cache/mega`
 ///     - On Windows: `C:\Users\{username}\AppData\Local\Cache\mega`
 ///     - On macOS: `~/Library/Caches/mega`
+/// 3. Falls back to `.mega/cache` in the current directory if system paths are unavailable
 ///
 /// # Returns
 /// A PathBuf containing the cache directory path
 ///
-/// # Panics
-/// Will panic if both conditions occur:
-/// - Environment variable is not set
-/// - System cache directories cannot be determined
-///
 pub fn mega_cache() -> PathBuf {
-    // Get the cache directory from the environment variable or use the default
-    let cache_dir = std::env::var("MEGA_CACHE_DIR").unwrap_or_else(|_| {
-        let base_dirs = directories::BaseDirs::new().unwrap();
-        base_dirs
-            .cache_dir()
-            .join("mega")
-            .to_str()
-            .unwrap()
-            .to_string()
-    });
+    resolve_mega_dir(
+        std::env::var_os("MEGA_CACHE_DIR"),
+        directories::BaseDirs::new().map(|base_dirs| base_dirs.cache_dir().join("mega")),
+        fallback_mega_cache,
+    )
+}
 
-    PathBuf::from(cache_dir)
+fn resolve_mega_dir(
+    env_path: Option<OsString>,
+    system_path: Option<PathBuf>,
+    fallback_path: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if let Some(path) = env_path {
+        return PathBuf::from(path);
+    }
+
+    system_path.unwrap_or_else(fallback_path)
+}
+
+fn fallback_mega_base() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".mega")
+}
+
+fn fallback_mega_cache() -> PathBuf {
+    fallback_mega_base().join("cache")
 }
 
 impl Config {
@@ -231,7 +234,14 @@ mod test {
 
     #[test]
     fn test_mega_base() {
+        let lock = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let expected_base = temp_dir.path().join("base");
+        let expected_base_value = expected_base.to_string_lossy().into_owned();
+        let _base_guard = EnvVarGuard::set(&lock, "MEGA_BASE_DIR", &expected_base_value);
+
         let base_dir = mega_base();
+        assert_eq!(base_dir, expected_base);
         std::fs::create_dir_all(&base_dir).expect("Failed to create base directory");
         assert!(base_dir.exists(), "Mega base directory should exist");
         check_file_permission(&base_dir);
@@ -239,10 +249,35 @@ mod test {
 
     #[test]
     fn test_mega_cache() {
+        let lock = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let expected_cache = temp_dir.path().join("cache");
+        let expected_cache_value = expected_cache.to_string_lossy().into_owned();
+        let _cache_guard = EnvVarGuard::set(&lock, "MEGA_CACHE_DIR", &expected_cache_value);
+
         let cache_dir = mega_cache();
+        assert_eq!(cache_dir, expected_cache);
         std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
         assert!(cache_dir.exists(), "Mega cache directory should exist");
         check_file_permission(&cache_dir);
+    }
+
+    #[test]
+    fn mega_dir_resolution_prefers_env_path() {
+        let resolved = resolve_mega_dir(
+            Some(OsString::from("/tmp/from-env")),
+            Some(PathBuf::from("/tmp/from-system")),
+            || PathBuf::from("/tmp/from-fallback"),
+        );
+
+        assert_eq!(resolved, PathBuf::from("/tmp/from-env"));
+    }
+
+    #[test]
+    fn mega_dir_resolution_falls_back_when_system_dirs_are_unavailable() {
+        let resolved = resolve_mega_dir(None, None, || PathBuf::from("/tmp/from-fallback"));
+
+        assert_eq!(resolved, PathBuf::from("/tmp/from-fallback"));
     }
 
     #[test]

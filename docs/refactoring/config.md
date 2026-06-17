@@ -45,7 +45,7 @@
 - `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；剩余风险主要在 dispatcher 生命周期治理、失败退避和后台任务可观测性。
 - `mail.password` 明文字段仍为兼容期入口；首批 deprecation warning 与 `SecretString` 防误打印已落地，后续仍需在 source diagnostics 和样例/模板中继续推动生产配置使用 `mail.password_ref`。
 - Vault 初始化/解封的旧泄露路径已清理；当前残余风险是自动解封材料仍落在 `core_key.json`，需要备份恢复和部署侧凭据注入/KMS 策略配套。
-- `mega_base()` / `mega_cache()`（`src/config/mod.rs`）的早期 panic（`BaseDirs::new().unwrap()` 等）。
+- `mega_base()` / `mega_cache()`（`src/config/mod.rs`）的早期 `BaseDirs::new().unwrap()` / `to_str().unwrap()` 已移除；未设置 `MEGA_BASE_DIR` / `MEGA_CACHE_DIR` 且系统目录不可用时，会退回当前目录下 `.mega` / `.mega/cache`，后续完整 source diagnostics 可继续把 fallback 来源显式化。
 - `DbConfig::default()`、`OrionServerConfig` 默认值和 `config/config.toml` 的首批可预测 PostgreSQL userinfo 已清理；真实数据库凭据仍必须通过 `MEGA_*`、文件挂载 secret 或部署平台 secret 注入，不能进入本项目 vault。
 
 ## 已落地的 mail/notification 子系统现状（2026-06-09）
@@ -723,7 +723,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 **阶段 2 — 错误模型、redaction/SecretString 与保守校验**
 
-8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；未解析/非法占位符值已脱敏并带修复建议；剩余加载路径（如 `mega_base`/`mega_cache`）上的 `unwrap`/`expect`/`panic` 仍需继续收敛。这会改变失败形态，不应并入纯移动阶段。
+8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；未解析/非法占位符值已脱敏并带修复建议；`mega_base`/`mega_cache` 的早期目录解析 `unwrap` 已改为 env/system/fallback 的无 panic 路径。剩余加载路径上的 `expect`/`panic` 仍需继续收敛，这会改变失败形态，不应并入纯移动阶段。
 9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出。仍需继续覆盖 SMTP 密码、对象存储 key、SecretRef URI 中可敏感的 path 片段、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
 10. 已完成首批：`mail.password` 明文兼容路径改为 `Option<SecretString>`，Debug/Serialize 输出脱敏；`config validate` 与服务启动路径会对明文 `mail.password` 输出 deprecation warning；`.expose_secret()` 集中在 `SmtpMailer::new` 适配层。后续仍需在 source diagnostics、样例配置和模板中继续推动迁移到 `mail.password_ref`。
 11. 已完成首批：新增 `src/config/validate.rs`，实现 `Config::validate()` 首批 hard error 校验，覆盖 `database.db_type`、`database.db_url` scheme、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password` / `mail.password_ref` 互斥、`mail.enabled` 时 `smtp_host` / `from` 必填、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 端口/URL/DB URL；`config validate` 已复用该入口，`Storage::new` 的 Buck 非法配置已改为返回 `MegaError`。后续集中校验主要随新增字段继续补规则。
@@ -866,7 +866,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 | --- | --- |
 | **合理性** | **高（9/10）**。准确抓住 `Config(synchronous) → Storage(DB+ObjectStorage) → VaultCore` 这一不可打破的引导循环，正确导出四类字段划分（引导 / 早期运行时依赖 / 可迁移凭据 / 非敏感），并坚持“先有真实晚绑定消费者才能谈迁移”的原则。分阶段迁移策略与单二进制 + sea-orm + vendored `libvault` 的现实匹配良好。 |
 | **可行性** | **高（8.5/10）**。原本风险最高的 CLI LoadMode、最小 DB/Vault bootstrap、SecretRef 基础设施、mail 后置消费和 Vault fail-closed 已落地。后续主要是工程拆分、诊断、redaction、模板/Profile/测试分层与热加载，均可按阶段独立交付。 |
-| **完整性** | **较高（8/10）**。文档覆盖了加载链路、模块拆分、secret 分类、命令、测试分层、热加载等主要方面，并已把已完成基线与剩余工作分开。`load_str`/`load_sources` 与主路径的 list_parse 一致性已完成首批；仍需在实现阶段继续补：`mega_base` 自身 panic 点、跨平台凭据注入、完整 source diagnostics 等细节。 |
+| **完整性** | **较高（8/10）**。文档覆盖了加载链路、模块拆分、secret 分类、命令、测试分层、热加载等主要方面，并已把已完成基线与剩余工作分开。`load_str`/`load_sources` 与主路径的 list_parse 一致性已完成首批；`mega_base` / `mega_cache` 自身的早期目录解析 panic 已清理；仍需在实现阶段继续补跨平台凭据注入、完整 source diagnostics 等细节。 |
 | **安全性** | **强（8.5/10）**。Vault 旧泄露路径已完成核心清理，文档现在把剩余风险限定为配置 redaction、兼容期 `mail.password` 明文、部署侧 key material 托管与 DR 演练。该表述避免夸大“放入 vault”对磁盘读取攻击者的防护能力。 |
 | **功能正确性与接口兼容性** | **良好（8/10）**。`SecretRef` 到 `read_secret(name)` 的路径映射（`write_api("secret/{name}")`）与 vault_core 实现一致；`mail.password_ref`、互斥校验和 `config secret` 支持范围与当前代码一致。仍需注意：`config` 作为顶层模块名会与 `config` crate 冲突（当前代码用 `c::` 别名，已在文档中提及）；后续新增代码应避免重新引入 `common::config` 路径。 |
 | **数据流与控制流正确性** | **正确（9/10）**。`AppContext::new` 中 `Storage::new → init_connection(redis) → VaultCore::new → mail.password_ref resolve → SmtpMailer/EmailDispatcher → init_monorepo` 的实际顺序与文档描述一致。secret 只能在 vault 就绪后解析、运维命令（secret set/check）必须用最小 bootstrap 而非完整 AppContext 的结论均正确。 |
@@ -888,7 +888,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 1. 已完成：顶层结构迁移，`src/config/{mod,model,source,expand,loader,template,secret}.rs` 成为主实现，源码调用方已迁到 `crate::config`，`common::config` shim 已删除。
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
-3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则和完整 source diagnostics。
+3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；`mega_base` / `mega_cache` 的早期目录解析 `unwrap` 已移除；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `expect`/`panic`，补更多配置规则和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning、坏 env/profile 类型脱敏错误和首批修复建议已完成；继续补完整 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics 与坏 env 类型单测；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
