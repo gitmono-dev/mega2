@@ -68,6 +68,7 @@ jobs:
           cargo test config_validate_accepts_deny_warnings_flag -- --nocapture
           cargo test validate_config_denies_source_warnings_when_requested -- --nocapture
           cargo test validate_config_denies_deprecated_mail_password_source_without_leaking_value -- --nocapture
+          cargo test show_sources_lines_include_source_warnings_without_values -- --nocapture
           cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
           cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
           cargo test resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref -- --nocapture
@@ -172,3 +173,22 @@ jobs:
           grep -F "mail.password" "${mail_password_output}"
           grep -F "mail.password_ref" "${mail_password_output}"
           ! grep -F "plain-text-password" "${mail_password_output}"
+
+          cat > "${config_dir}/config.profile-source-warning.toml" <<'EOF'
+          [mail]
+          smtp_tls = false
+          EOF
+
+          profile_warning_output="${config_dir}/profile-source-warning.out"
+          cargo run -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --show-sources >"${profile_warning_output}" 2>&1
+          grep -F "source warning: file" "${profile_warning_output}"
+          grep -F "config.profile-source-warning.toml" "${profile_warning_output}"
+          grep -F "mail.smtp_tls" "${profile_warning_output}"
+          grep -F "mail.starttls" "${profile_warning_output}"
+
+          if cargo run -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --deny-warnings >"${profile_warning_output}" 2>&1; then
+            cat "${profile_warning_output}"
+            echo "profile source warning unexpectedly passed --deny-warnings"
+            exit 1
+          fi
+          grep -F "source diagnostics produced" "${profile_warning_output}"

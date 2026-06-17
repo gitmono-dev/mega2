@@ -16,7 +16,7 @@ use crate::{
         Config,
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
         template::config_init_template,
-        validate::collect_source_diagnostics,
+        validate::{ConfigSourceDiagnostics, collect_source_diagnostics},
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
 };
@@ -313,13 +313,37 @@ async fn validate_config(
     Ok(())
 }
 
-fn print_source_diagnostics(diagnostics: &crate::config::validate::ConfigSourceDiagnostics) {
+fn print_source_diagnostics(diagnostics: &ConfigSourceDiagnostics) {
+    for line in source_diagnostic_lines(diagnostics) {
+        println!("{line}");
+    }
+}
+
+fn source_diagnostic_lines(diagnostics: &ConfigSourceDiagnostics) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for warning in &diagnostics.file_warnings {
+        lines.push(format!(
+            "source warning: file {} field {}: {}",
+            warning.source_path.display(),
+            warning.field_path,
+            warning.message
+        ));
+    }
+    for warning in &diagnostics.environment_warnings {
+        lines.push(format!(
+            "source warning: environment variable {} maps to {}: {}",
+            warning.variable, warning.field_path, warning.message
+        ));
+    }
     for source_field in &diagnostics.source_fields {
-        println!("source field: {}", source_field.message);
+        lines.push(format!("source field: {}", source_field.message));
     }
     for source_override in &diagnostics.source_overrides {
-        println!("source override: {}", source_override.message);
+        lines.push(format!("source override: {}", source_override.message));
     }
+
+    lines
 }
 
 async fn resolve_config_secrets<R>(config: &Config, resolver: &R) -> Result<(), MegaError>
@@ -408,6 +432,7 @@ mod tests {
     use crate::config::{
         MailConfig,
         testing::{TestSecretResolver, env_lock},
+        validate::collect_source_diagnostics_from_keys,
     };
 
     #[test]
@@ -569,6 +594,55 @@ mod tests {
 
         assert!(message.contains("source diagnostics produced"));
         assert!(!message.contains("plain-text-password"));
+    }
+
+    #[test]
+    fn show_sources_lines_include_source_warnings_without_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [log]
+            level = "info"
+            "#,
+        )
+        .expect("write config source");
+        fs::write(
+            &profile_path,
+            format!(
+                r#"
+            [log]
+            level = "debug"
+
+            [mail]
+            {} = "plain-text-password"
+            "#,
+                "password"
+            ),
+        )
+        .expect("write profile source");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_MAIL__PASSWORD", "MEGA_UNKNOWN__VALUE"],
+        )
+        .expect("diagnostics should collect");
+        let output = source_diagnostic_lines(&diagnostics).join("\n");
+
+        assert!(output.contains("source warning: file"));
+        assert!(output.contains(&profile_path.display().to_string()));
+        assert!(output.contains("mail.password"));
+        assert!(output.contains("mail.password_ref"));
+        assert!(output.contains("source warning: environment variable MEGA_MAIL__PASSWORD"));
+        assert!(output.contains("source warning: environment variable MEGA_UNKNOWN__VALUE"));
+        assert!(output.contains("source field:"));
+        assert!(output.contains("source override:"));
+        assert!(!output.contains("plain-text-password"));
+        assert!(!output.contains("debug"));
+        assert!(!output.contains("info"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

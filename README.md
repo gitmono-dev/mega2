@@ -111,7 +111,9 @@ profile files, or your deployment secret mechanism.
 
 Use `monoengine config init` to generate a safe starter config, and
 `monoengine config validate` to check the selected base/profile/env merge
-without starting services.
+without starting services. Add `--show-sources` to print source warnings,
+field sources, and overrides without values; add `--deny-warnings` to fail on
+ignored or deprecated config fields.
 
 Key sections (see `config/config.toml` for the full list):
 
