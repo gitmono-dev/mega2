@@ -22,7 +22,7 @@ pub mod validate;
 
 use expand::variable_placeholder_substitute;
 pub use model::*;
-use source::config_from_path;
+use source::{config_from_path, mega_environment_source};
 
 /// Retrieves the base directory path for Mega
 ///
@@ -125,11 +125,7 @@ impl Config {
     pub fn load_str(content: &str) -> Result<Self, ConfigError> {
         let builder = c::Config::builder()
             .add_source(c::File::from_str(content, FileFormat::Toml))
-            .add_source(
-                c::Environment::with_prefix("mega")
-                    .prefix_separator("_")
-                    .separator("__"),
-            );
+            .add_source(mega_environment_source());
 
         let config = variable_placeholder_substitute(builder)?;
 
@@ -144,6 +140,7 @@ impl Config {
         for source in sources {
             builder = builder.add_source(*source);
         }
+        builder = builder.add_source(mega_environment_source());
 
         let config = variable_placeholder_substitute(builder)?;
 
@@ -157,11 +154,44 @@ impl Config {
 
 #[cfg(test)]
 mod test {
-    use std::path::Path;
+    use std::{ffi::OsString, path::Path, sync::Mutex};
 
     use serde::Deserialize;
 
     use super::*;
+    use crate::config::template::config_init_template;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: config tests serialize mutations of MEGA_* variables with ENV_LOCK
+            // and restore the previous value when the guard is dropped.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: see EnvVarGuard::set; this restores the serialized test mutation.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     fn check_file_permission(path: &Path) {
         let metadata = std::fs::metadata(path).expect("Failed to read metadata");
@@ -341,6 +371,24 @@ mod test {
             parsed.mail.password_ref.unwrap().as_uri(),
             "vault://secret/config/prod/mail/password#value"
         );
+    }
+
+    #[test]
+    fn test_load_str_and_sources_parse_list_env_overrides() {
+        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let _root_dirs = EnvVarGuard::set("MEGA_MONOREPO__ROOT_DIRS", "alpha,beta");
+        let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
+        let expected = vec!["alpha".to_string(), "beta".to_string()];
+
+        let config = Config::load_str(&rendered).expect("load_str should parse list env override");
+        assert_eq!(config.monorepo.root_dirs, expected);
+
+        let config = Config::load_sources(vec![Box::new(c::File::from_str(
+            &rendered,
+            FileFormat::Toml,
+        ))])
+        .expect("load_sources should parse list env override");
+        assert_eq!(config.monorepo.root_dirs, expected);
     }
 
     #[test]
