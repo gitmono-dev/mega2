@@ -75,7 +75,11 @@ impl SmtpMailer {
     /// future SecretRef resolver) is available. See docs/config.md "secret 解析的依赖顺序"
     /// and docs/mail.md for the bootstrap rules and migration to `password_ref`.
     pub fn new(cfg: &MailConfig) -> Result<Self, MegaError> {
-        Self::new_with_password(cfg, cfg.password.clone())
+        let password = cfg
+            .password
+            .as_ref()
+            .map(|password| password.expose_secret().to_string());
+        Self::new_with_password(cfg, password)
     }
 
     pub fn new_with_password(

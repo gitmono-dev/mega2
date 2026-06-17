@@ -49,21 +49,28 @@ impl AppContext {
         let notification_shutdown = CancellationToken::new();
         if let Some(mail_cfg) = &config.mail {
             mail_cfg.validate()?;
+            mail_cfg.warn_plaintext_password_deprecated();
 
             if mail_cfg.enabled {
-                let resolved_password = if let Some(secret_ref) = &mail_cfg.password_ref {
-                    let resolver =
-                        VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-                    Some(resolver.resolve(secret_ref).await?)
-                } else {
-                    mail_cfg.password.clone()
-                };
-                let mailer: Arc<dyn crate::mail::Mailer> = Arc::new(
-                    crate::mail::SmtpMailer::new_with_password(mail_cfg, resolved_password)
-                        .map_err(|e| {
+                let mailer: Arc<dyn crate::mail::Mailer> =
+                    if let Some(secret_ref) = &mail_cfg.password_ref {
+                        let resolver =
+                            VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
+                        let resolved_password = resolver.resolve(secret_ref).await?;
+                        Arc::new(
+                            crate::mail::SmtpMailer::new_with_password(
+                                mail_cfg,
+                                Some(resolved_password),
+                            )
+                            .map_err(|e| {
+                                MegaError::Other(format!("mail initialization failed: {e}"))
+                            })?,
+                        )
+                    } else {
+                        Arc::new(crate::mail::SmtpMailer::new(mail_cfg).map_err(|e| {
                             MegaError::Other(format!("mail initialization failed: {e}"))
-                        })?,
-                );
+                        })?)
+                    };
                 let notif_stg = storage.notification_storage();
                 let dispatcher = crate::notification::EmailDispatcher::new(notif_stg, mailer);
                 let sd = notification_shutdown.clone();

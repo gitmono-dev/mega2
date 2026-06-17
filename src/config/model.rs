@@ -166,7 +166,7 @@ pub struct MailConfig {
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<secret::SecretString>,
     #[serde(default)]
     pub password_ref: Option<secret::SecretRef>,
     pub from: String,

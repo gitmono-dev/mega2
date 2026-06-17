@@ -15,6 +15,46 @@ use crate::{
 };
 
 const SECRET_REF_PREFIX: &str = "vault://secret/";
+const REDACTED_SECRET: &str = "***";
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SecretString")
+            .field(&REDACTED_SECRET)
+            .finish()
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(REDACTED_SECRET)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self)
+    }
+}
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct SecretRef {
@@ -240,6 +280,22 @@ mod tests {
             .expect_err("secret/secret paths should be rejected");
 
         assert!(err.to_string().contains("invalid vault secret name"));
+    }
+
+    #[test]
+    fn secret_string_debug_and_serialize_are_redacted() {
+        let secret = SecretString::new("plain-text-password");
+
+        assert_eq!(secret.expose_secret(), "plain-text-password");
+        assert_eq!(format!("{secret:?}"), "SecretString(\"***\")");
+        assert_eq!(serde_json::to_string(&secret).unwrap(), "\"***\"");
+    }
+
+    #[test]
+    fn secret_string_deserializes_plaintext() {
+        let secret: SecretString = serde_json::from_str("\"plain-text-password\"").unwrap();
+
+        assert_eq!(secret.expose_secret(), "plain-text-password");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

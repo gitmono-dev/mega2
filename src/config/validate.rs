@@ -18,6 +18,15 @@ impl Config {
 }
 
 impl MailConfig {
+    pub fn warn_plaintext_password_deprecated(&self) {
+        if self.password.is_some() {
+            tracing::warn!(
+                field = "mail.password",
+                "mail.password is deprecated; use mail.password_ref for vault-backed SMTP credentials"
+            );
+        }
+    }
+
     pub fn validate(&self) -> Result<(), MegaError> {
         self.validate_secret_fields()?;
 
@@ -103,7 +112,7 @@ mod tests {
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
-            password: Some("plain".to_string()),
+            password: Some(crate::config::secret::SecretString::new("plain")),
             password_ref: Some(
                 SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
             ),

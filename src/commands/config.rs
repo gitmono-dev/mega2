@@ -184,13 +184,14 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 async fn validate_config(config: &Config, resolve_secrets: bool) -> Result<(), MegaError> {
     config.validate()?;
 
-    if resolve_secrets
-        && let Some(mail_cfg) = &config.mail
-        && let Some(secret_ref) = &mail_cfg.password_ref
-    {
-        let vault = bootstrap_vault(config).await?;
-        let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
-        resolver.resolve(secret_ref).await?;
+    if let Some(mail_cfg) = &config.mail {
+        mail_cfg.warn_plaintext_password_deprecated();
+
+        if resolve_secrets && let Some(secret_ref) = &mail_cfg.password_ref {
+            let vault = bootstrap_vault(config).await?;
+            let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
+            resolver.resolve(secret_ref).await?;
+        }
     }
 
     Ok(())
@@ -298,7 +299,7 @@ mod tests {
                 smtp_host: "smtp.example.com".to_string(),
                 smtp_port: 587,
                 username: None,
-                password: Some("plain".to_string()),
+                password: Some(crate::config::secret::SecretString::new("plain")),
                 password_ref: Some(
                     SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
                 ),
