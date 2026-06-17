@@ -1,7 +1,14 @@
 use std::{
     fmt,
-    path::Path,
+    io::ErrorKind,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
+    time::{Duration, SystemTime},
+};
+
+use tokio::{
+    sync::watch,
+    time::{MissedTickBehavior, interval},
 };
 
 use crate::{
@@ -158,6 +165,143 @@ impl ConfigHandle {
         })?;
 
         Ok(subscribers.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigReloadWatcher {
+    handle: ConfigHandle,
+    config_path: PathBuf,
+    profile_path: Option<PathBuf>,
+    poll_interval: Duration,
+    watched_files: Vec<WatchedConfigFile>,
+}
+
+impl ConfigReloadWatcher {
+    pub async fn new(
+        handle: ConfigHandle,
+        config_path: PathBuf,
+        profile_path: Option<PathBuf>,
+        poll_interval: Duration,
+    ) -> Result<Self, MegaError> {
+        if poll_interval.is_zero() {
+            return Err(MegaError::Other(
+                "config reload watcher poll interval must be greater than zero".to_string(),
+            ));
+        }
+
+        let watched_files = load_watched_files(&config_path, profile_path.as_deref()).await?;
+
+        Ok(Self {
+            handle,
+            config_path,
+            profile_path,
+            poll_interval,
+            watched_files,
+        })
+    }
+
+    pub async fn poll_once(&mut self) -> Result<Option<ConfigReloadReport>, MegaError> {
+        if !self.refresh_watched_files().await? {
+            return Ok(None);
+        }
+
+        self.handle
+            .reload_from_path(&self.config_path, self.profile_path.as_deref())
+            .map(Some)
+    }
+
+    pub async fn run_until_shutdown(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), MegaError> {
+        let mut ticker = interval(self.poll_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = ticker.tick() => {
+                    match self.poll_once().await {
+                        Ok(Some(report)) => {
+                            tracing::info!(
+                                applied_fields = ?report.applied_fields,
+                                restart_required_fields = ?report.restart_required_fields,
+                                "config reload watcher applied changed config"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "config reload watcher rejected changed config"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_watched_files(&mut self) -> Result<bool, MegaError> {
+        let mut changed = false;
+
+        for watched_file in &mut self.watched_files {
+            let signature = file_signature(&watched_file.path).await?;
+            if watched_file.signature != signature {
+                watched_file.signature = signature;
+                changed = true;
+            }
+        }
+
+        Ok(changed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchedConfigFile {
+    path: PathBuf,
+    signature: Option<FileSignature>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSignature {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+async fn load_watched_files(
+    config_path: &Path,
+    profile_path: Option<&Path>,
+) -> Result<Vec<WatchedConfigFile>, MegaError> {
+    let mut watched_files = Vec::with_capacity(if profile_path.is_some() { 2 } else { 1 });
+    watched_files.push(WatchedConfigFile {
+        path: config_path.to_path_buf(),
+        signature: file_signature(config_path).await?,
+    });
+
+    if let Some(profile_path) = profile_path {
+        watched_files.push(WatchedConfigFile {
+            path: profile_path.to_path_buf(),
+            signature: file_signature(profile_path).await?,
+        });
+    }
+
+    Ok(watched_files)
+}
+
+async fn file_signature(path: &Path) -> Result<Option<FileSignature>, MegaError> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(Some(FileSignature {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -594,5 +738,105 @@ mod tests {
         assert_eq!(report.restart_required_fields, vec!["database.db_url"]);
         assert_eq!(snapshot.log.level, "debug");
         assert_eq!(snapshot.database.db_url, original_db_url);
+    }
+
+    #[tokio::test]
+    async fn reload_watcher_reloads_when_profile_file_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("base config");
+
+        let initial = Config::new(config_path.to_str().expect("utf-8 config path"))
+            .expect("base config should load");
+        let handle = ConfigHandle::new(initial);
+        let mut watcher = ConfigReloadWatcher::new(
+            handle.clone(),
+            config_path,
+            Some(profile_path.clone()),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("watcher");
+
+        assert!(watcher.poll_once().await.expect("unchanged poll").is_none());
+
+        std::fs::write(&profile_path, "[log]\nlevel = \"debug\"\n").expect("profile config update");
+
+        let report = watcher
+            .poll_once()
+            .await
+            .expect("changed poll")
+            .expect("reload report");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert_eq!(report.applied_fields, vec!["log.level"]);
+        assert_eq!(snapshot.log.level, "debug");
+    }
+
+    #[tokio::test]
+    async fn reload_watcher_keeps_snapshot_after_invalid_profile_change() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("base config");
+
+        let initial = Config::new(config_path.to_str().expect("utf-8 config path"))
+            .expect("base config should load");
+        let original_level = initial.log.level.clone();
+        let handle = ConfigHandle::new(initial);
+        let mut watcher = ConfigReloadWatcher::new(
+            handle.clone(),
+            config_path,
+            Some(profile_path.clone()),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("watcher");
+
+        std::fs::write(&profile_path, "[log]\nlevel = \"verbose\"\n")
+            .expect("invalid profile config");
+        let error = watcher
+            .poll_once()
+            .await
+            .expect_err("invalid config should fail reload");
+        let snapshot = handle.snapshot().expect("snapshot after failed reload");
+
+        assert!(error.to_string().contains("log.level"));
+        assert_eq!(snapshot.log.level, original_level);
+
+        std::fs::write(&profile_path, "[log]\nlevel = \"debug\"\n").expect("valid profile config");
+        let report = watcher
+            .poll_once()
+            .await
+            .expect("fixed config should reload")
+            .expect("reload report");
+        let snapshot = handle.snapshot().expect("snapshot after fixed reload");
+
+        assert_eq!(report.applied_fields, vec!["log.level"]);
+        assert_eq!(snapshot.log.level, "debug");
+    }
+
+    #[tokio::test]
+    async fn reload_watcher_run_until_shutdown_stops_cleanly() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("base config");
+
+        let initial = Config::new(config_path.to_str().expect("utf-8 config path"))
+            .expect("base config should load");
+        let handle = ConfigHandle::new(initial);
+        let watcher =
+            ConfigReloadWatcher::new(handle, config_path, None, Duration::from_millis(10))
+                .await
+                .expect("watcher");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(watcher.run_until_shutdown(shutdown_rx));
+
+        shutdown_tx.send(true).expect("send shutdown");
+
+        run.await
+            .expect("watcher task should join")
+            .expect("watcher should stop");
     }
 }
