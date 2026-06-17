@@ -220,13 +220,8 @@ pub trait ApiHandler: Send + Sync {
     async fn delete_tag(&self, repo_path: Option<String>, name: String) -> Result<(), GitError>;
 
     /// Get blame configuration from storage config.
-    /// Returns default config if storage config is not available.
     fn get_blame_config(&self) -> BlameConfig {
-        self.get_context()
-            .config
-            .upgrade()
-            .map(|c| c.blame.clone())
-            .unwrap_or_default()
+        self.get_context().config().blame.clone()
     }
 
     /// Get blame information for a file

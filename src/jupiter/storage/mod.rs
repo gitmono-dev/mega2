@@ -36,7 +36,7 @@ pub mod user_storage;
 pub mod vault_storage;
 pub mod webhook_storage;
 
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::Arc;
 
 use sea_orm::DatabaseConnection;
 use tokio::sync::Semaphore;
@@ -184,7 +184,7 @@ pub struct Storage {
     pub import_service: ImportService,
     pub git_service: GitService,
     pub lfs_service: LfsService,
-    pub config: Weak<Config>,
+    pub config: Arc<Config>,
     pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
     pub notification_storage: notification_storage::NotificationStorage,
@@ -315,7 +315,7 @@ impl Storage {
         Ok(Storage {
             app_service: app_service.into(),
             cla_service: ClaService::new(base.clone()),
-            config: Arc::downgrade(&config),
+            config,
             issue_service: IssueService::new(base.clone()),
             cl_service: CLService::new(base.clone()),
             merge_queue_service,
@@ -332,7 +332,7 @@ impl Storage {
     }
 
     pub fn config(&self) -> Arc<Config> {
-        self.config.upgrade().expect("Config has been dropped")
+        Arc::clone(&self.config)
     }
 
     /// Get recommended concurrency limit for batch database operations.
@@ -543,9 +543,7 @@ impl Storage {
     }
 
     pub fn mock() -> Self {
-        // During test time, we don't need a AppContext,
-        // Put config in a leaked static variable thus the weak reference will always be valid.
-        static CONFIG: LazyLock<Arc<Config>> = LazyLock::new(|| Config::mock().into());
+        let config = Arc::new(Config::mock());
 
         let app_service = AppService::mock();
         let webhook_service = WebhookService::mock(app_service.webhook_storage.clone());
@@ -559,7 +557,7 @@ impl Storage {
             merge_queue_service: MergeQueueService::mock(),
             artifact_service: ArtifactService::mock(),
             buck_service: BuckService::mock(),
-            config: Arc::downgrade(&*CONFIG),
+            config,
             git_service: GitService::mock(),
             mono_service: MonoService::mock(),
             import_service: ImportService::mock(),

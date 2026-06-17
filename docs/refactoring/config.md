@@ -24,7 +24,7 @@
 | TOML 文件 + `MEGA_*` env 叠加   | 已实现      | `config` crate + `__` 分隔符；`Config::new`、`load_str` 与 `load_sources` 已复用同一套 `MEGA_*` 环境变量 source builder，包含 `oauth.allowed_cors_origins`、`monorepo.admin`、`monorepo.root_dirs` 的列表解析。Profile 来源叠加已完成首批。 |
 | 占位符 `${base_dir}` 展开       | 已实现并已诊断化首批 | `src/config/expand.rs::variable_placeholder_substitute` 做两次 `collect()` + `Rc<RefCell>` 遍历 + `envsubst`；原 **10** 处 `.unwrap()` 已改为返回 `ConfigError::Message`，错误包含占位符字段路径、可用来源 origin、脱敏说明和修复建议。 |
 | 配置文件定位（4 级回退 + 自动生成） | 已实现    | `mega_base()/etc/config.toml` 与默认生成逻辑存在，README 已同步完整加载优先级；生成时会把 `base_dir` 渲染进去。 |
-| 运行时共享 (`Arc<Config>`)      | 已实现      | `AppContext` 持有；`Storage` 内部为 `Weak<Config>`，`config()` 调用 `.expect("Config has been dropped")` —— 这是热加载切换快照句柄时的潜在雷区。 |
+| 运行时共享 (`Arc<Config>`)      | 已实现      | `AppContext` 持有；`Storage` 也直接持有 `Arc<Config>`，`config()` 返回当前快照克隆，不再依赖 `Weak::upgrade().expect(...)`。热加载阶段仍需引入独立快照句柄并逐点确认跨 `await` 持有旧快照的语义。 |
 | `mail` / `MailConfig` / 邮件发送 | **已激活并接入 dispatcher 启动点** | 真实实现在一级模块 `src/mail/mod.rs`（`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `src/config/model.rs`、`Config.mail` 字段已存在、`[mail]` 段已被消费。`src/email/mod.rs` 为 re-export shim。`AppContext::new` 在 vault 之后解析 `mail.password_ref`（如存在）并构造 `SmtpMailer`，构造失败现在返回可诊断错误。详见 `mail.md`。 |
 | `[oauth]` 段                   | **死配置，已在 validate 中告警**  | TOML 里有完整段（`config.toml:155`）+ env list key 注册（`src/config/source.rs`），但无强类型字段承接，也无运行期消费者。它是目前**唯一**被整段丢弃的孤立顶层段（`[mail]` 已被消费）。`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、raw TOML 中任意未知段/未知 key，以及 `MEGA_OAUTH__...`、`MEGA_MAIL__TLS`/`MEGA_MAIL__SMTP_TLS`、未知 `MEGA_*` 覆盖项输出 warning；常规服务加载仍不阻断。profile 合并后的来源诊断仍待完整 source diagnostics 覆盖。 |
 | `src/notification/`（邮件 outbox / dispatcher） | **已接入编译并在 mail 启用时启动 dispatcher** | `src/notification/{dispatcher,triggers,mod}.rs`（`EmailDispatcher`、触发器）+ `callisto::email_jobs` outbox 实体已从 mega 移植；`main.rs:18` 已声明 `mod notification;`。`AppContext::new` 在 vault 之后、`init_monorepo` 之前创建 `EmailDispatcher` 并 `tokio::spawn`；剩余工作是生命周期治理、退避/并发策略和业务触发器接入。 |
@@ -41,7 +41,7 @@
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
 - `src/config/expand.rs::variable_placeholder_substitute` 已消除原 **10** 处 `unwrap`，并已对未解析/非法占位符值输出字段级脱敏错误和修复建议；仍需在后续完整 source diagnostics 中补更丰富的跨 source 覆盖关系。
 - `Storage::new` 里的 Buck 校验已从 `panic!` 改为返回 `MegaError`；仍需在后续把更多启动期配置校验提前到 `Config::validate()` / source diagnostics。
-- `Storage::config()` 的 `expect`（`storage/mod.rs:335`，`upgrade().expect("Config has been dropped")`）。
+- `Storage::config()` 已改为从 `Storage` 持有的 `Arc<Config>` 克隆返回，不再存在 `Weak::upgrade().expect("Config has been dropped")` 的 panic 点；后续热加载仍需把共享入口升级为可替换的快照句柄。
 - `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；剩余风险主要在 dispatcher 生命周期治理、失败退避和后台任务可观测性。
 - `mail.password` 明文字段仍为兼容期入口；首批 deprecation warning 与 `SecretString` 防误打印已落地，后续仍需在 source diagnostics 和样例/模板中继续推动生产配置使用 `mail.password_ref`。
 - Vault 初始化/解封的旧泄露路径已清理；当前残余风险是自动解封材料仍落在 `core_key.json`，需要备份恢复和部署侧凭据注入/KMS 策略配套。
@@ -207,7 +207,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
    - 第 191 行 `database_connection(&config.database)` 建立数据库连接；
    - 第 206 行通过 `crate::jupiter::storage::object_storage::ObjectStorageFactory::build(&config.object_storage)` 构造对象存储（S3/GCS/Local），因此 `object_storage.s3.access_key_id` / `secret_access_key` 在 vault 就绪前已被消费；
    - Buck 配置校验已复用 `src/config/validate.rs`，失败时返回 `MegaError`，不再 `panic!`；后续还应继续把其它启动期配置错误提前到 `Config::validate()` / source diagnostics。
-   - 注意 `Storage` 以 `Weak<Config>` 持有配置，`Storage::config()`（`src/jupiter/storage/mod.rs:334`）通过 `upgrade().expect("Config has been dropped")` 返回 `Arc<Config>`——这是一个潜在 panic 点，热加载切换为快照句柄时需一并考虑。
+   - `Storage` 直接持有 `Arc<Config>`，`Storage::config()` 返回快照克隆；这已消除原 `Weak::upgrade().expect("Config has been dropped")` panic 点。热加载切换为可替换快照句柄时，仍需逐点确认“取出 Arc 后跨 await 持有”的旧快照语义。
 2. **`init_connection(&config.redis)`（`src/context/mod.rs:36`）** 在 `VaultCore::new` 之前执行，因此带密码的 `redis.url` 也属于早期运行时依赖。
 3. **`VaultCore::new(storage)`（`src/context/mod.rs:39`）** 之后才就绪，此后消费的配置字段才可纳入可迁移凭据。
 4. **SMTP mailer 与 EmailDispatcher 已是 vault 之后的后置消费点，并已接入 SecretRef。** `src/context/mod.rs` 在 `VaultCore::new` 之后检查 `MailConfig` 的 `password` / `password_ref` 互斥关系；若配置了 `password_ref`，通过 `VaultSecretResolver` 解析后再调用 `SmtpMailer::new_with_password(...)`。SMTP 初始化失败会返回 `MegaError`，不再静默忽略。**因此 `mail.password_ref` 是当前已落地的第一个配置侧 SecretRef 消费点**；后续不应重复做 resolver/mail 接入，只需治理明文兼容路径和 dispatcher 生命周期。
@@ -216,7 +216,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 > 结论：任何在 `Storage::new` 或 `init_connection` 阶段消费的字段都不能直接改为 `SecretRef`，除非先重构初始化顺序。
 >
 > 额外观察（来自当前代码）：
-> - `Storage::new` 内部在构造 buck 相关信号量**之前**就执行了 `buck_config.validate()` 并在失败时 panic（storage/mod.rs:253-260），这是“配置校验侵入启动关键路径”的典型。
+> - `Storage::new` 内部在构造 buck 相关信号量**之前**仍会执行 Buck 配置校验，但该路径已复用 `validate_buck_config` 并返回 `MegaError`，不再 panic。后续更值得继续收敛的是其它启动期依赖字段的 source diagnostics，而不是重复移动 Buck 校验。
 > - `crate::jupiter::storage::object_storage::ObjectStorageFactory::build` 在同一阶段被调用，因此 `object_storage.s3.access_key_id` / `secret_access_key`（即使当前为空字符串）在 vault 就绪前就已被“消费路径”触达。
 > - `context/mod.rs:36` 的 `init_connection(&config.redis)` 紧随 Storage 之后，仍在 `VaultCore::new` 之前。
 
@@ -768,7 +768,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 **阶段 7 — 受控热加载（独立变更）**
 
 26. 新增 `reload.rs`：监听配置文件变化，复用加载流水线构建候选配置，按字段白名单计算差异，向订阅组件发布变更，失败时保留旧配置继续生效。
-27. 将运行时注入从直接共享 `Arc<Config>` 调整为共享快照句柄（如 `Arc<ConfigHandle>`/`ArcSwap`）；逐点确认“取出 Arc 后跨 await 持有”的调用语义，新增依赖前评估必要性。注意 `Storage` 当前以 `Weak<Config>` 持有配置、`config()` 用 `expect` 解引用，切换快照句柄时需同步调整该访问路径。
+27. 将运行时注入从直接共享 `Arc<Config>` 调整为共享快照句柄（如 `Arc<ConfigHandle>`/`ArcSwap`）；逐点确认“取出 Arc 后跨 await 持有”的调用语义，新增依赖前评估必要性。`Storage::config()` 已无 `Weak::upgrade().expect(...)` panic，但当前仍返回不可替换的 `Arc<Config>` 快照，热加载阶段需同步升级该访问路径。
 28. 改造支持热加载的消费端订阅方式（日志、功能开关、任务调度、邮件通知等只订阅各自可热更新字段；不可热更新字段变化只告警提示重启）。
 29. 补充热加载测试：可热更新字段生效、不可热更新字段告警不生效、SecretRef 变更遵循白名单、候选校验失败回滚。
 
@@ -872,7 +872,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 | **功能正确性与接口兼容性** | **良好（8/10）**。`SecretRef` 到 `read_secret(name)` 的路径映射（`write_api("secret/{name}")`）与 vault_core 实现一致；`mail.password_ref`、互斥校验和 `config secret` 支持范围与当前代码一致。仍需注意：`config` 作为顶层模块名会与 `config` crate 冲突（当前代码用 `c::` 别名，已在文档中提及）；后续新增代码应避免重新引入 `common::config` 路径。 |
 | **数据流与控制流正确性** | **正确（9/10）**。`AppContext::new` 中 `Storage::new → init_connection(redis) → VaultCore::new → mail.password_ref resolve → SmtpMailer/EmailDispatcher → init_monorepo` 的实际顺序与文档描述一致。secret 只能在 vault 就绪后解析、运维命令（secret set/check）必须用最小 bootstrap 而非完整 AppContext 的结论均正确。 |
 | **性能与效率** | **可接受（8/10）**。resolver 内存缓存 + TTL、`Arc` 只读共享均合理。`variable_placeholder_substitute` 的两次全树 collect + clone 在启动期可忽略；其原 panic 语义已初步收敛，后续重点是诊断质量而非 CPU 成本。热加载白名单设计也避免了不必要的长连接重建。 |
-| **可靠性与容错性** | **改进潜力大（8/10）**。计划中的“消灭加载路径 panic、热加载失败回滚保留旧配置、错误带字段路径+修复建议”等均会显著提升。当前仍需重点处理 Buck 校验、Storage.config、mega_base 等 panic/expect 点，并补全 source diagnostics；Vault fail-closed 已完成，不再作为 config 阶段阻塞项。 |
+| **可靠性与容错性** | **改进潜力大（8/10）**。计划中的“消灭加载路径 panic、热加载失败回滚保留旧配置、错误带字段路径+修复建议”等均会显著提升。Buck 校验、`Storage::config()` 和 `mega_base` / `mega_cache` 的已知 panic/expect 点已完成首批收敛；当前仍需重点补全 source diagnostics、更多启动期配置校验和热加载失败回滚语义。Vault fail-closed 已完成，不再作为 config 阶段阻塞项。 |
 | **兼容性与互操作性** | **良好（8/10）**。serde `Option` + `#[serde(default)]`、废弃字段 WARN 过渡期、Profile 深合并（数组整体替换而非追加）的语义均已明确。需补充：未知顶层段的告警策略、`0600/0700` 在 Windows/macOS 下的等价实现（或明确“生产仅支持类 Unix”）、以及 `config/config.toml` 作为样例时应 `deny_unknown_fields` 或至少 warn。 |
 | **可扩展性与可维护性** | **良好（8.5/10）**。配置已从 `common` 提升为一级 `src/config/` 模块；继续按职责拆分为 model/loader/expand/secret/validate/testing/error 等小文件，是正确的长期方向。`Config` 成为基础设施后，新增领域只需扩展 model + 对应校验/展开规则即可。需注意继续坚持“先纯移动、再语义变更”的顺序。 |
 | **合规性与标准符合性** | **良好（8/10）**。推荐的 secrecy/zeroize、stdin 避免历史记录、CI 覆盖配置样例+坏输入矩阵、字段分类表作为变更依据等，均符合现代凭据管理最佳实践。引入新依赖（secrecy 等）前要求评估编译/二进制影响的约束是正确的。 |

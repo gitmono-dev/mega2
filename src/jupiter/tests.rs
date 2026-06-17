@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -145,10 +145,9 @@ async fn execute_postgres(db: &DatabaseConnection, sql: String) {
 }
 
 pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
-    static CONFIG: LazyLock<Arc<Config>> = LazyLock::new(|| Config::mock().into());
     let connection = test_db_connection(temp_dir.as_ref()).await;
     let connection = Arc::new(connection);
-    let config = CONFIG.clone();
+    let config = Arc::new(Config::mock());
     let base = BaseStorage::new(connection.clone());
 
     let svc = AppService {
@@ -197,7 +196,7 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         merge_queue_service: MergeQueueService::mock(),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
-        config: Arc::downgrade(&config),
+        config,
         git_service: GitService::mock(),
         mono_service: MonoService::mock(),
         import_service: ImportService::mock(),
