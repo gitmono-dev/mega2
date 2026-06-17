@@ -97,6 +97,8 @@ Resolution order:
 1. `--config <path>` CLI flag.
 2. `MEGA_CONFIG` environment variable.
 3. The bundled `config/config.toml`.
+4. `${mega_base}/etc/config.toml`.
+5. If no config exists, generate the default config and load it.
 
 When `--profile <name>` or `MEGA_PROFILE=<name>` is set, monoengine also
 loads `config.<name>.toml` next to the selected base config. CLI profile wins
@@ -106,6 +108,10 @@ then `MEGA_*` environment overrides.
 The bundled config is a local sample and does not embed reusable database
 passwords. Inject real bootstrap credentials through `MEGA_DATABASE__DB_URL`,
 profile files, or your deployment secret mechanism.
+
+Use `monoengine config init` to generate a safe starter config, and
+`monoengine config validate` to check the selected base/profile/env merge
+without starting services.
 
 Key sections (see `config/config.toml` for the full list):
 
@@ -118,12 +124,12 @@ Key sections (see `config/config.toml` for the full list):
 | `[pack]`           | Pack decode memory/disk budget and cache path                           |
 | `[lfs]`            | LFS HTTP/SSH endpoints and local storage path                           |
 | `[object_storage]` | `local` / `s3` / `s3compatible` / `gcs` backends                        |
-| `[oauth]`          | Campsite / Tinyship auth API integration                                |
+| `[oauth]`          | Legacy sample only; currently ignored until `OAuthConfig` exists        |
 | `[redis]`          | Connection URL                                                          |
 | `[build]`          | Orion build server URL and trigger preheat depth                        |
 | `[buck]`           | Buck upload session limits and concurrency caps                         |
 | `[artifacts_gc]`   | Background GC for orphan repo artifact blobs                            |
-| `[mail]`           | SMTP host / port / from address / TLS settings                          |
+| `[mail]`           | SMTP host / port / from address / STARTTLS and optional `password_ref`   |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
 ### Run

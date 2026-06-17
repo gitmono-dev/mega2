@@ -1,9 +1,19 @@
-# the directory where the data files is located, such as logs, database, etc.
+# Local sample config for monoengine.
+# Load order is: --config, MEGA_CONFIG, ./config/config.toml,
+# ${mega_base}/etc/config.toml, then generated default config.
+# Optional profiles use config.<profile>.toml next to the selected base config
+# and are merged before MEGA_* environment overrides.
+# Run `monoengine config validate` after editing; warnings identify ignored
+# compatibility fields without printing secret values.
+#
+# The directory where the data files is located, such as logs, database, etc.
 # can be overridden by environment variable `MEGA_BASE_DIR`
 # When using monobean, this option will be ignored, you should set it in monobean preference GUI.
 base_dir = "/tmp/.mono"
 
-# Filling the following environment variables with values you set
+# Fill deployment-specific values through MEGA_* environment variables,
+# profile files, or your deployment secret mechanism rather than committing
+# real credentials to this sample file.
 ## Logging Configuration
 [log]
 # log level, can be "trace", "debug", "info", "warn", "error"
@@ -134,7 +144,9 @@ bucket = "mega"
 access_key_id = ""
 
 # Secret access key corresponding to the access_key_id.
-# Keep this value secure and never commit it to version control.
+# Keep this value secure and never commit it to version control. Current
+# object storage bootstrap credentials are not resolved through monoengine
+# Vault SecretRef; inject them via env/profile/deployment secret instead.
 secret_access_key = ""
 
 
@@ -154,6 +166,8 @@ bucket = "gitmega"
 root_dir = "${base_dir}/objects"
 
 [oauth]
+# Legacy sample only: monoengine currently has no OAuthConfig consumer.
+# `config validate` warns that this section is ignored until OAuthConfig exists.
 # Used for call api from campsite server, for example: http://api.gitmono.test:3001
 campsite_api_domain = "http://api.gitmono.test:3001"
 
@@ -269,10 +283,14 @@ default_items = [
 ]
 
 [mail]
+# Prefer `password_ref = "vault://secret/config/<profile>/mail/password#value"`
+# for SMTP credentials. A plain `password` field remains only for compatibility
+# and is reported as a deprecation warning by `config validate`.
 enabled = true
 smtp_host = "localhost"
 smtp_port = 2525
 from = "no-reply@mega.local"
 starttls = false
+# Legacy compatibility keys below are ignored by MailConfig; use starttls.
 smtp_tls = false
 tls = false

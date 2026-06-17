@@ -23,7 +23,7 @@
 | `Config` 结构体与领域子配置     | 已实现      | 当前对外入口为 `src/config/mod.rs`，模型定义已拆到 `src/config/model.rs`；全仓源码调用方已迁到 `crate::config`。强类型拆分合理；`#[serde(default)]` 已用于可选域（blame、buck、orion_server、sidebar、artifacts_gc）。 |
 | TOML 文件 + `MEGA_*` env 叠加   | 已实现      | `config` crate + `__` 分隔符；`Config::new`、`load_str` 与 `load_sources` 已复用同一套 `MEGA_*` 环境变量 source builder，包含 `oauth.allowed_cors_origins`、`monorepo.admin`、`monorepo.root_dirs` 的列表解析。Profile 来源叠加已完成首批。 |
 | 占位符 `${base_dir}` 展开       | 已实现并已诊断化首批 | `src/config/expand.rs::variable_placeholder_substitute` 做两次 `collect()` + `Rc<RefCell>` 遍历 + `envsubst`；原 **10** 处 `.unwrap()` 已改为返回 `ConfigError::Message`，错误包含占位符字段路径、可用来源 origin、脱敏说明和修复建议。 |
-| 配置文件定位（4 级回退 + 自动生成） | 已实现    | `mega_base()/etc/config.toml` 与默认生成逻辑存在，但 README 主要只提前三种；生成时会把 `base_dir` 渲染进去。 |
+| 配置文件定位（4 级回退 + 自动生成） | 已实现    | `mega_base()/etc/config.toml` 与默认生成逻辑存在，README 已同步完整加载优先级；生成时会把 `base_dir` 渲染进去。 |
 | 运行时共享 (`Arc<Config>`)      | 已实现      | `AppContext` 持有；`Storage` 内部为 `Weak<Config>`，`config()` 调用 `.expect("Config has been dropped")` —— 这是热加载切换快照句柄时的潜在雷区。 |
 | `mail` / `MailConfig` / 邮件发送 | **已激活并接入 dispatcher 启动点** | 真实实现在一级模块 `src/mail/mod.rs`（`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `src/config/model.rs`、`Config.mail` 字段已存在、`[mail]` 段已被消费。`src/email/mod.rs` 为 re-export shim。`AppContext::new` 在 vault 之后解析 `mail.password_ref`（如存在）并构造 `SmtpMailer`，构造失败现在返回可诊断错误。详见 `mail.md`。 |
 | `[oauth]` 段                   | **死配置，已在 validate 中告警**  | TOML 里有完整段（`config.toml:155`）+ env list key 注册（`src/config/source.rs`），但无强类型字段承接，也无运行期消费者。它是目前**唯一**被整段丢弃的孤立顶层段（`[mail]` 已被消费）。`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、raw TOML 中任意未知段/未知 key，以及 `MEGA_OAUTH__...`、`MEGA_MAIL__TLS`/`MEGA_MAIL__SMTP_TLS`、未知 `MEGA_*` 覆盖项输出 warning；常规服务加载仍不阻断。profile 合并后的来源诊断仍待完整 source diagnostics 覆盖。 |
@@ -125,7 +125,7 @@ service / chat-migrate            # LoadMode::FullAppContext
 4. `mega_base()/etc/config.toml`。
 5. 如果上述路径均不可用，则生成默认配置文件后再加载。
 
-README 中主要描述了前三种常见方式；实现层面还包含 `mega_base()/etc/config.toml` 和自动生成默认配置的兜底逻辑。
+README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.toml` 和自动生成默认配置的兜底逻辑。
 
 ## 配置合并与反序列化
 
@@ -817,7 +817,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - 顶层模块名 `config` 与外部 `config` crate 同名，模块内部引用第三方 crate 时应使用清晰别名（现状已是 `c::`）或 `::config` 绝对路径，避免命名解析混淆。
 - 校验规则要分阶段落地，早期只加入确定无争议的规则；涉及部署兼容性的严格校验应先以文档说明或 warning 形式过渡。
 - 错误模型应与现有 `MegaResult` 协作，而不是在业务层引入另一套并行错误处理方式。
-- README 与实际加载优先级存在轻微差异，模块化改造完成后应同步补充 `mega_base()/etc/config.toml` 与默认配置生成逻辑。
+- README 已同步实际加载优先级，包括 `mega_base()/etc/config.toml` 与默认配置生成逻辑。
 - 拆分后仍应保持配置对象运行期只读共享，避免在业务流程中重新解析配置或隐式改变运行时语义。
 - **BuckConfig::validate() 的启动期 panic 已清理。** `src/config/validate.rs` 已吸收 Buck 校验，`Storage::new` 复用该入口并在非法配置时返回 `MegaError`；剩余工作是把更多启动期配置错误前移到 `Config::validate()` / source diagnostics，并补来源路径与修复建议。
 - **环境变量注入的可见性风险**：引导配置通过 `MEGA_*` 环境变量注入时，需意识到 `/proc/<pid>/environ`、systemd journal、容器 inspect 等场景的泄露风险。生产高敏感部署应优先使用文件挂载 secret，并通过占位符读取。
@@ -916,6 +916,6 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [x] 已给首批 raw/env 未消费 warning 和坏 env 类型错误补入移除/替代字段等修复建议。
 - [x] 已把 profile/TOML 类型错误包装为脱敏诊断，输出来源路径、字段路径和期望类型，不输出原始值。
 - [x] 已把未解析/非法占位符值包装为脱敏诊断，输出来源、字段路径和修复建议，不输出原始值。
-- [ ] 已计划同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
+- [x] 已同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
 - [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、Profile、热加载分别单独提交，`config init` 模板治理不与这些阶段混合。
 - [x] 已在 CI 中增加配置样例首批校验任务（基础 + 生成 + profile + env diagnostics + 坏 env/profile 类型单测）；更多坏输入、完整 source diagnostics 和 SecretRef 失败矩阵仍待补。
