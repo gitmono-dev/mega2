@@ -100,6 +100,28 @@ pub(crate) fn validate_database_config(db_config: &DbConfig) -> Result<(), MegaE
         )));
     }
 
+    if db_config.max_connection == 0 {
+        return Err(MegaError::Other(
+            "database.max_connection must be greater than 0".to_string(),
+        ));
+    }
+    if db_config.min_connection > db_config.max_connection {
+        return Err(MegaError::Other(format!(
+            "database.min_connection must be less than or equal to database.max_connection; got {} > {}",
+            db_config.min_connection, db_config.max_connection
+        )));
+    }
+    if db_config.acquire_timeout == 0 {
+        return Err(MegaError::Other(
+            "database.acquire_timeout must be greater than 0".to_string(),
+        ));
+    }
+    if db_config.connect_timeout == 0 {
+        return Err(MegaError::Other(
+            "database.connect_timeout must be greater than 0".to_string(),
+        ));
+    }
+
     let url = Url::parse(&db_config.db_url)
         .map_err(|e| MegaError::Other(format!("database.db_url must be a valid URL: {e}")))?;
     match url.scheme() {
@@ -597,6 +619,37 @@ mod tests {
             .expect_err("database URL scheme should fail");
 
         assert!(err.to_string().contains("database.db_url scheme"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_database_pool_settings() {
+        let mut config = Config::mock();
+        config.database.max_connection = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max connections should fail");
+        assert!(err.to_string().contains("database.max_connection"));
+
+        let mut config = Config::mock();
+        config.database.min_connection = config.database.max_connection + 1;
+        let err = config
+            .validate()
+            .expect_err("min connections above max should fail");
+        assert!(err.to_string().contains("database.min_connection"));
+
+        let mut config = Config::mock();
+        config.database.acquire_timeout = 0;
+        let err = config
+            .validate()
+            .expect_err("zero acquire timeout should fail");
+        assert!(err.to_string().contains("database.acquire_timeout"));
+
+        let mut config = Config::mock();
+        config.database.connect_timeout = 0;
+        let err = config
+            .validate()
+            .expect_err("zero connect timeout should fail");
+        assert!(err.to_string().contains("database.connect_timeout"));
     }
 
     #[test]
