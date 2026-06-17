@@ -87,3 +87,43 @@ jobs:
           root_dirs = ["profile-root"]
           EOF
           cargo run -- --config "${config_dir}/config.toml" --profile prod config validate
+
+      - name: Validate bad config diagnostics
+        working-directory: monoengine
+        run: |
+          set -euo pipefail
+
+          config_dir="${RUNNER_TEMP}/monoengine-bad-configs"
+          mkdir -p "${config_dir}"
+          cp config/config.toml "${config_dir}/config.toml"
+
+          cat > "${config_dir}/config.bad-placeholder.toml" <<'EOF'
+          base_dir = "/tmp/${missing_config_root}"
+          EOF
+
+          placeholder_output="${config_dir}/bad-placeholder.out"
+          if cargo run -- --config "${config_dir}/config.toml" --profile bad-placeholder config validate >"${placeholder_output}" 2>&1; then
+            cat "${placeholder_output}"
+            echo "bad placeholder config unexpectedly validated"
+            exit 1
+          fi
+          grep -F "unresolved placeholder" "${placeholder_output}"
+          grep -F "base_dir" "${placeholder_output}"
+          grep -F "value is redacted" "${placeholder_output}"
+
+          cat > "${config_dir}/config.bad-secret-ref.toml" <<'EOF'
+          [mail]
+          enabled = false
+          smtp_host = "smtp.example.com"
+          from = "no-reply@example.com"
+          password_ref = "vault://secret/config/test/mail/password"
+          EOF
+
+          secret_ref_output="${config_dir}/bad-secret-ref.out"
+          if cargo run -- --config "${config_dir}/config.toml" --profile bad-secret-ref config validate >"${secret_ref_output}" 2>&1; then
+            cat "${secret_ref_output}"
+            echo "bad SecretRef config unexpectedly validated"
+            exit 1
+          fi
+          grep -F "secret ref must include a #field suffix" "${secret_ref_output}"
+          grep -F "mail.password_ref" "${secret_ref_output}"

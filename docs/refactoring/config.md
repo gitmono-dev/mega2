@@ -35,7 +35,7 @@
 | 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 的端口/URL/DB URL；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`；`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、raw TOML 任意未知字段和 `MEGA_*` 未消费/被忽略覆盖项输出带修复建议的 warning，且 env/profile 类型错误已脱敏并带修复建议。更完整 source diagnostics 仍待补齐。 |
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
 | 测试配置辅助                   | **已实现首批** | `src/config/testing.rs` 已提供 `TestConfigBuilder`、`isolated_config()` 与 `TestSecretResolver`，可派生临时 base/cache/LFS/object storage 路径、接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景；尚未把全仓测试和 CI 配置矩阵迁移到该 helper。 |
-| CI 配置样例校验                | **已实现首批** | `.github/workflows/config-validation.yml` 已新增 sibling-aware 配置验证入口，会 checkout `monoengine` 与 `orbit`，运行格式检查、配置模板/loader/profile/env diagnostics 单测、坏 env/profile 类型脱敏单测、仓库基础样例 `config validate`、`config init` 生成结果校验和 profile merge CLI 校验。后续继续补更多坏输入、SecretRef 缺失/权限和完整 source diagnostics 场景。 |
+| CI 配置样例校验                | **已实现首批** | `.github/workflows/config-validation.yml` 已新增 sibling-aware 配置验证入口，会 checkout `monoengine` 与 `orbit`，运行格式检查、配置模板/loader/profile/env diagnostics 单测、坏 env/profile 类型脱敏单测、仓库基础样例 `config validate`、`config init` 生成结果校验、profile merge CLI 校验，以及坏占位符/坏 SecretRef URI 的 CLI 失败 smoke。后续继续补更多坏输入、SecretRef 真实缺失/权限和完整 source diagnostics 场景。 |
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
@@ -752,7 +752,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 19. 已完成首批：`config/config.toml` 与模型默认 PostgreSQL URL 已移除可预测 userinfo，保留与当前 schema 对齐的本地默认值和 env/部署 secret 注入指引，并新增仓库默认样例解析、校验和无可预测凭据测试；后续继续补 CI 配置校验矩阵。
 20. 已完成首批：固定 Profile 文件命名、加载优先级、数组覆盖语义和 SecretRef namespace，并补充 profile 合并、profile/env 覆盖顺序和最小 vault bootstrap 合并测试；后续继续补完整 profile source diagnostics 与 CI 矩阵。
 21. 已完成首批：新增 `testing.rs`，提供 `TestConfigBuilder`、`isolated_config()`、`.env.test` 风格覆盖合并和 `TestSecretResolver`；后续继续把文件加载链路、Profile 合并结果和更多现有测试迁移到该 helper。
-22. 已完成首批：新增 `.github/workflows/config-validation.yml`，在 CI 中覆盖基础样例、默认模板、`config init` 结果、profile 合并结果、`MEGA_*` 未消费覆盖项单测，以及坏 env/profile 类型脱敏单测；后续继续把 `.env.test` 隔离测试配置、更多坏输入矩阵和 SecretRef 失败场景纳入 CI。
+22. 已完成首批：新增 `.github/workflows/config-validation.yml`，在 CI 中覆盖基础样例、默认模板、`config init` 结果、profile 合并结果、`MEGA_*` 未消费覆盖项单测、坏 env/profile 类型脱敏单测，以及坏占位符/坏 SecretRef URI 的 CLI 失败 smoke；后续继续把 `.env.test` 隔离测试配置、更多坏输入矩阵和 SecretRef 真实缺失/权限场景纳入 CI。
 
 > **验收标准**：`config/config.toml` 不含真实生产密码或可复用生产凭据；`cargo test --all` 不依赖仓库中的 `config/config.toml` 作为隐式共享状态；CI 新增配置校验任务且通过。
 
@@ -890,7 +890,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
 3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；`mega_base` / `mega_cache` 的早期目录解析 `unwrap` 已移除；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `expect`/`panic`，补更多配置规则和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning、坏 env/profile 类型脱敏错误和首批修复建议已完成；继续补完整 RawSources/source diagnostics。
-5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics 与坏 env 类型单测；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
+5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics、坏 env/profile 类型单测，以及坏占位符/坏 SecretRef URI 的 CLI 失败 smoke；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
 7. 独立阶段：受控热加载，白名单字段生效，候选失败时保留旧配置。
 
@@ -918,4 +918,4 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [x] 已把未解析/非法占位符值包装为脱敏诊断，输出来源、字段路径和修复建议，不输出原始值。
 - [x] 已同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
 - [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、Profile、热加载分别单独提交，`config init` 模板治理不与这些阶段混合。
-- [x] 已在 CI 中增加配置样例首批校验任务（基础 + 生成 + profile + env diagnostics + 坏 env/profile 类型单测）；更多坏输入、完整 source diagnostics 和 SecretRef 失败矩阵仍待补。
+- [x] 已在 CI 中增加配置样例首批校验任务（基础 + 生成 + profile + env diagnostics + 坏 env/profile 类型单测 + 坏占位符/坏 SecretRef URI CLI smoke）；更多坏输入、完整 source diagnostics 和 SecretRef 真实缺失/权限矩阵仍待补。
