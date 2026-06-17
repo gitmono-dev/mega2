@@ -50,11 +50,19 @@ pub struct ConfigSourceOverride {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSourceField {
+    pub field_path: String,
+    pub source: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigSourceDiagnostics {
     pub file_warnings: Vec<FileConfigWarning>,
     pub environment_warnings: Vec<EnvironmentConfigWarning>,
     pub source_overrides: Vec<ConfigSourceOverride>,
+    pub source_fields: Vec<ConfigSourceField>,
 }
 
 impl ConfigSourceDiagnostics {
@@ -62,6 +70,7 @@ impl ConfigSourceDiagnostics {
         self.file_warnings.is_empty()
             && self.environment_warnings.is_empty()
             && self.source_overrides.is_empty()
+            && self.source_fields.is_empty()
     }
 
     pub fn has_warnings(&self) -> bool {
@@ -404,6 +413,7 @@ where
         file_warnings,
         environment_warnings: unconsumed_environment_fields_from_paths(&env_field_paths),
         source_overrides: source_overrides(&base_value, &profile_value, &env_field_paths),
+        source_fields: source_fields(&base_value, &profile_value, &env_field_paths),
     })
 }
 
@@ -542,6 +552,52 @@ fn source_overrides(
     overrides
 }
 
+fn source_fields(
+    base_value: &Option<(PathBuf, Value)>,
+    profile_value: &Option<(PathBuf, Value)>,
+    env_field_paths: &[(String, String)],
+) -> Vec<ConfigSourceField> {
+    let mut fields = Vec::new();
+
+    if let Some((base_path, _)) = base_value {
+        let source = file_source_label("base file", base_path);
+        fields.extend(
+            source_field_paths(base_value)
+                .into_iter()
+                .map(|field_path| source_field(&field_path, &source)),
+        );
+    }
+
+    if let Some((profile_path, _)) = profile_value {
+        let source = file_source_label("profile file", profile_path);
+        fields.extend(
+            source_field_paths(profile_value)
+                .into_iter()
+                .map(|field_path| source_field(&field_path, &source)),
+        );
+    }
+
+    fields.extend(env_field_paths.iter().filter_map(|(variable, field_path)| {
+        if environment_warning_for(variable, field_path).is_some() {
+            return None;
+        }
+
+        Some(source_field(
+            field_path,
+            &format!("environment variable {variable}"),
+        ))
+    }));
+
+    fields.sort_by(|left, right| {
+        left.field_path
+            .cmp(&right.field_path)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    fields
+        .dedup_by(|left, right| left.field_path == right.field_path && left.source == right.source);
+    fields
+}
+
 fn source_field_paths(source: &Option<(PathBuf, Value)>) -> BTreeSet<String> {
     let mut fields = BTreeSet::new();
     if let Some((_, value)) = source {
@@ -592,6 +648,14 @@ fn source_override(
         source: source.to_string(),
         overridden_source: overridden_source.to_string(),
         message: format!("{source} overrides {overridden_source} for {field_path}"),
+    }
+}
+
+fn source_field(field_path: &str, source: &str) -> ConfigSourceField {
+    ConfigSourceField {
+        field_path: field_path.to_string(),
+        source: source.to_string(),
+        message: format!("{field_path} is set by {source}"),
     }
 }
 
@@ -1319,6 +1383,83 @@ mod tests {
                 .iter()
                 .any(|warning| warning.variable == "MEGA_MAIL__TLS")
         );
+    }
+
+    #[test]
+    fn source_diagnostics_collects_field_source_graph_without_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [log]
+            level = "info"
+
+            [database]
+            db_url = "postgres://localhost:5432/base"
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r##"
+            [log]
+            level = "debug"
+
+            [mail]
+            password_ref = "vault://secret/config/prod/mail/password#value"
+            "##,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_LOG__LEVEL", "MEGA_UNKNOWN__VALUE"],
+        )
+        .expect("diagnostics should collect");
+        let source_fields = diagnostics
+            .source_fields
+            .iter()
+            .map(|source_field| source_field.message.as_str())
+            .collect::<Vec<_>>();
+        let source_text = source_fields.join("\n");
+
+        assert_eq!(diagnostics.source_fields.len(), 5);
+        assert!(source_fields.iter().any(|message| {
+            message.contains("log.level")
+                && message.contains("base file")
+                && message.contains(&config_path.display().to_string())
+        }));
+        assert!(source_fields.iter().any(|message| {
+            message.contains("log.level")
+                && message.contains("profile file")
+                && message.contains(&profile_path.display().to_string())
+        }));
+        assert!(source_fields.iter().any(|message| {
+            message.contains("mail.password_ref")
+                && message.contains("profile file")
+                && message.contains(&profile_path.display().to_string())
+        }));
+        assert!(source_fields.iter().any(|message| {
+            message.contains("log.level") && message.contains("MEGA_LOG__LEVEL")
+        }));
+        assert!(source_fields
+            .iter()
+            .any(|message| message.contains("database.db_url") && message.contains("base file")));
+        assert!(
+            diagnostics
+                .environment_warnings
+                .iter()
+                .any(|warning| warning.variable == "MEGA_UNKNOWN__VALUE")
+        );
+        assert!(!source_text.contains("postgres://localhost"));
+        assert!(!source_text.contains("debug"));
+        assert!(!source_text.contains("info"));
+        assert!(!source_text.contains("vault://secret/"));
+        assert!(!source_text.contains("config/prod/mail/password"));
+        assert!(!source_text.contains("#value"));
     }
 
     #[test]

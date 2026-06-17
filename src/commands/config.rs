@@ -71,7 +71,7 @@ pub fn cli() -> Command {
                     Arg::new("show-sources")
                         .long("show-sources")
                         .action(ArgAction::SetTrue)
-                        .help("Print base/profile/env source override diagnostics"),
+                        .help("Print base/profile/env source field and override diagnostics"),
                 ),
         )
 }
@@ -291,7 +291,7 @@ async fn validate_config(
     let diagnostics = collect_source_diagnostics(config_path, config_profile_path)?;
     diagnostics.emit_warnings();
     if show_sources {
-        print_source_overrides(&diagnostics);
+        print_source_diagnostics(&diagnostics);
     }
     if deny_warnings && diagnostics.has_warnings() {
         return Err(MegaError::Other(format!(
@@ -313,7 +313,10 @@ async fn validate_config(
     Ok(())
 }
 
-fn print_source_overrides(diagnostics: &crate::config::validate::ConfigSourceDiagnostics) {
+fn print_source_diagnostics(diagnostics: &crate::config::validate::ConfigSourceDiagnostics) {
+    for source_field in &diagnostics.source_fields {
+        println!("source field: {}", source_field.message);
+    }
     for source_override in &diagnostics.source_overrides {
         println!("source override: {}", source_override.message);
     }
