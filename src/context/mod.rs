@@ -35,7 +35,7 @@ impl AppContext {
         let config = Arc::new(config);
 
         let storage = crate::jupiter::storage::Storage::new(config.clone()).await?;
-        let connection = init_connection(&config.redis).await;
+        let connection = init_connection(&config.redis).await?;
 
         let storage_for_vault = storage.clone();
         let vault =
