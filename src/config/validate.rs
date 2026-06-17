@@ -41,6 +41,43 @@ pub struct EnvironmentConfigWarning {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigSourceDiagnostics {
+    pub file_warnings: Vec<FileConfigWarning>,
+    pub environment_warnings: Vec<EnvironmentConfigWarning>,
+}
+
+impl ConfigSourceDiagnostics {
+    pub fn is_empty(&self) -> bool {
+        self.file_warnings.is_empty() && self.environment_warnings.is_empty()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.file_warnings.len() + self.environment_warnings.len()
+    }
+
+    pub fn emit_warnings(&self) {
+        for warning in &self.file_warnings {
+            tracing::warn!(
+                path = %warning.source_path.display(),
+                field = %warning.field_path,
+                "{}",
+                warning.message
+            );
+        }
+
+        for warning in &self.environment_warnings {
+            tracing::warn!(
+                source = "env",
+                variable = %warning.variable,
+                field = %warning.field_path,
+                "{}",
+                warning.message
+            );
+        }
+    }
+}
+
 impl Config {
     pub fn validate(&self) -> Result<(), MegaError> {
         validate_log_config(&self.log)?;
@@ -276,14 +313,11 @@ fn validate_http_url(field_path: &str, value: &str) -> Result<(), MegaError> {
 }
 
 pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
-    for warning in known_unconsumed_file_fields(path)? {
-        tracing::warn!(
-            path = %warning.source_path.display(),
-            field = %warning.field_path,
-            "{}",
-            warning.message
-        );
+    ConfigSourceDiagnostics {
+        file_warnings: known_unconsumed_file_fields(path)?,
+        environment_warnings: Vec::new(),
     }
+    .emit_warnings();
 
     Ok(())
 }
@@ -308,17 +342,47 @@ pub fn known_unconsumed_file_fields(path: &Path) -> Result<Vec<FileConfigWarning
 }
 
 pub fn warn_unconsumed_environment_fields() {
-    let keys = std::env::vars_os().map(|(key, _)| key);
-
-    for warning in unconsumed_environment_fields_from_keys(keys) {
-        tracing::warn!(
-            source = "env",
-            variable = %warning.variable,
-            field = %warning.field_path,
-            "{}",
-            warning.message
-        );
+    ConfigSourceDiagnostics {
+        file_warnings: Vec::new(),
+        environment_warnings: unconsumed_environment_fields_from_keys(
+            std::env::vars_os().map(|(key, _)| key),
+        ),
     }
+    .emit_warnings();
+}
+
+pub fn collect_source_diagnostics(
+    config_path: Option<&Path>,
+    config_profile_path: Option<&Path>,
+) -> Result<ConfigSourceDiagnostics, MegaError> {
+    collect_source_diagnostics_from_keys(
+        config_path,
+        config_profile_path,
+        std::env::vars_os().map(|(key, _)| key),
+    )
+}
+
+pub fn collect_source_diagnostics_from_keys<I, K>(
+    config_path: Option<&Path>,
+    config_profile_path: Option<&Path>,
+    env_keys: I,
+) -> Result<ConfigSourceDiagnostics, MegaError>
+where
+    I: IntoIterator<Item = K>,
+    K: AsRef<OsStr>,
+{
+    let mut file_warnings = Vec::new();
+    if let Some(config_path) = config_path {
+        file_warnings.extend(known_unconsumed_file_fields(config_path)?);
+    }
+    if let Some(config_profile_path) = config_profile_path {
+        file_warnings.extend(known_unconsumed_file_fields(config_profile_path)?);
+    }
+
+    Ok(ConfigSourceDiagnostics {
+        file_warnings,
+        environment_warnings: unconsumed_environment_fields_from_keys(env_keys),
+    })
 }
 
 pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
@@ -978,6 +1042,56 @@ mod tests {
         }));
         assert!(warnings.iter().any(|warning| {
             warning.field_path == "database.typo" && warning.message.contains("not recognized")
+        }));
+    }
+
+    #[test]
+    fn source_diagnostics_collects_base_profile_and_env_warnings() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            unknown_root = true
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [mail]
+            smtp_tls = false
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            [
+                "MEGA_DATABASE__DB_URL",
+                "MEGA_UNKNOWN__VALUE",
+                "MEGA_MAIL__TLS",
+            ],
+        )
+        .expect("diagnostics should collect");
+
+        assert_eq!(diagnostics.file_warnings.len(), 2);
+        assert_eq!(diagnostics.environment_warnings.len(), 2);
+        assert_eq!(diagnostics.warning_count(), 4);
+        assert!(!diagnostics.is_empty());
+        assert!(diagnostics.file_warnings.iter().any(|warning| {
+            warning.source_path == config_path && warning.field_path == "unknown_root"
+        }));
+        assert!(diagnostics.file_warnings.iter().any(|warning| {
+            warning.source_path == profile_path && warning.field_path == "mail.smtp_tls"
+        }));
+        assert!(diagnostics.environment_warnings.iter().any(|warning| {
+            warning.variable == "MEGA_UNKNOWN__VALUE" && warning.field_path == "unknown.value"
+        }));
+        assert!(diagnostics.environment_warnings.iter().any(|warning| {
+            warning.variable == "MEGA_MAIL__TLS" && warning.field_path == "mail.tls"
         }));
     }
 

@@ -16,7 +16,7 @@ use crate::{
         Config,
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
         template::config_init_template,
-        validate::{warn_known_unconsumed_file_fields, warn_unconsumed_environment_fields},
+        validate::collect_source_diagnostics,
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
 };
@@ -53,12 +53,20 @@ pub fn cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("validate").about("Validate configuration").arg(
-                Arg::new("resolve-secrets")
-                    .long("resolve-secrets")
-                    .action(ArgAction::SetTrue)
-                    .help("Resolve configured SecretRef values through the minimal DB/Vault bootstrap"),
-            ),
+            Command::new("validate")
+                .about("Validate configuration")
+                .arg(
+                    Arg::new("resolve-secrets")
+                        .long("resolve-secrets")
+                        .action(ArgAction::SetTrue)
+                        .help("Resolve configured SecretRef values through the minimal DB/Vault bootstrap"),
+                )
+                .arg(
+                    Arg::new("deny-warnings")
+                        .long("deny-warnings")
+                        .action(ArgAction::SetTrue)
+                        .help("Fail validation when source diagnostics emit warnings"),
+                ),
         )
 }
 
@@ -150,6 +158,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                 Some(&config_path),
                 config_profile_path.as_deref(),
                 validate_args.get_flag("resolve-secrets"),
+                validate_args.get_flag("deny-warnings"),
             )
             .await?;
             println!("config valid");
@@ -268,15 +277,17 @@ async fn validate_config(
     config_path: Option<&Path>,
     config_profile_path: Option<&Path>,
     resolve_secrets: bool,
+    deny_warnings: bool,
 ) -> Result<(), MegaError> {
     config.validate()?;
-    if let Some(config_path) = config_path {
-        warn_known_unconsumed_file_fields(config_path)?;
+    let diagnostics = collect_source_diagnostics(config_path, config_profile_path)?;
+    diagnostics.emit_warnings();
+    if deny_warnings && !diagnostics.is_empty() {
+        return Err(MegaError::Other(format!(
+            "config source diagnostics produced {} warning(s); fix the warnings or rerun without --deny-warnings",
+            diagnostics.warning_count()
+        )));
     }
-    if let Some(config_profile_path) = config_profile_path {
-        warn_known_unconsumed_file_fields(config_profile_path)?;
-    }
-    warn_unconsumed_environment_fields();
 
     if let Some(mail_cfg) = &config.mail {
         mail_cfg.warn_plaintext_password_deprecated();
@@ -413,6 +424,19 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_accepts_deny_warnings_flag() {
+        let matches = cli()
+            .try_get_matches_from(["config", "validate", "--deny-warnings"])
+            .unwrap();
+        let Some(("validate", validate_args)) = matches.subcommand() else {
+            panic!("validate subcommand should parse");
+        };
+
+        assert_eq!(load_mode(&matches), LoadMode::RawSources);
+        assert!(validate_args.get_flag("deny-warnings"));
+    }
+
+    #[test]
     fn config_init_writes_safe_skeleton() {
         let _lock = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -468,10 +492,36 @@ mod tests {
             ..Config::mock()
         };
 
-        let err = validate_config(&config, None, None, false)
+        let err = validate_config(&config, None, None, false, false)
             .await
             .expect_err("mutual exclusion should fail");
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn validate_config_denies_source_warnings_when_requested() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [mail]
+            smtp_tls = false
+            "#,
+        )
+        .expect("write config source");
+        let config = Config::mock();
+
+        validate_config(&config, Some(&config_path), None, false, false)
+            .await
+            .expect("warnings should not fail by default");
+
+        let err = validate_config(&config, Some(&config_path), None, false, true)
+            .await
+            .expect_err("deny warnings should fail");
+
+        assert!(err.to_string().contains("source diagnostics produced"));
+        assert!(err.to_string().contains("--deny-warnings"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

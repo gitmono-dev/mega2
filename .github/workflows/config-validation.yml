@@ -56,9 +56,12 @@ jobs:
           cargo test placeholder_substitution_error_redacts_context_values -- --nocapture
           cargo test test_new_with_profile_merges_profile_before_env -- --nocapture
           cargo test config_init_template_has_no_unconsumed_fields -- --nocapture
+          cargo test source_diagnostics_collects_base_profile_and_env_warnings -- --nocapture
           cargo test unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys -- --nocapture
           cargo test test_bad_environment_type_reports_variable_name_without_value -- --nocapture
           cargo test config_validate_uses_raw_sources_load_mode -- --nocapture
+          cargo test config_validate_accepts_deny_warnings_flag -- --nocapture
+          cargo test validate_config_denies_source_warnings_when_requested -- --nocapture
           cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
           cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
           cargo test resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref -- --nocapture
@@ -73,6 +76,7 @@ jobs:
           config_path="${RUNNER_TEMP}/monoengine.generated.toml"
           cargo run -- config init --output "${config_path}" --force
           cargo run -- --config "${config_path}" config validate
+          cargo run -- --config "${config_path}" config validate --deny-warnings
 
       - name: Validate profile merge
         working-directory: monoengine
