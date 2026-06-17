@@ -66,6 +66,12 @@ pub fn cli() -> Command {
                         .long("deny-warnings")
                         .action(ArgAction::SetTrue)
                         .help("Fail validation when source diagnostics emit warnings"),
+                )
+                .arg(
+                    Arg::new("show-sources")
+                        .long("show-sources")
+                        .action(ArgAction::SetTrue)
+                        .help("Print base/profile/env source override diagnostics"),
                 ),
         )
 }
@@ -159,6 +165,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                 config_profile_path.as_deref(),
                 validate_args.get_flag("resolve-secrets"),
                 validate_args.get_flag("deny-warnings"),
+                validate_args.get_flag("show-sources"),
             )
             .await?;
             println!("config valid");
@@ -278,11 +285,15 @@ async fn validate_config(
     config_profile_path: Option<&Path>,
     resolve_secrets: bool,
     deny_warnings: bool,
+    show_sources: bool,
 ) -> Result<(), MegaError> {
     config.validate()?;
     let diagnostics = collect_source_diagnostics(config_path, config_profile_path)?;
     diagnostics.emit_warnings();
-    if deny_warnings && !diagnostics.is_empty() {
+    if show_sources {
+        print_source_overrides(&diagnostics);
+    }
+    if deny_warnings && diagnostics.has_warnings() {
         return Err(MegaError::Other(format!(
             "config source diagnostics produced {} warning(s); fix the warnings or rerun without --deny-warnings",
             diagnostics.warning_count()
@@ -300,6 +311,12 @@ async fn validate_config(
     }
 
     Ok(())
+}
+
+fn print_source_overrides(diagnostics: &crate::config::validate::ConfigSourceDiagnostics) {
+    for source_override in &diagnostics.source_overrides {
+        println!("source override: {}", source_override.message);
+    }
 }
 
 async fn resolve_config_secrets<R>(config: &Config, resolver: &R) -> Result<(), MegaError>
@@ -426,7 +443,7 @@ mod tests {
     #[test]
     fn config_validate_accepts_deny_warnings_flag() {
         let matches = cli()
-            .try_get_matches_from(["config", "validate", "--deny-warnings"])
+            .try_get_matches_from(["config", "validate", "--deny-warnings", "--show-sources"])
             .unwrap();
         let Some(("validate", validate_args)) = matches.subcommand() else {
             panic!("validate subcommand should parse");
@@ -434,6 +451,7 @@ mod tests {
 
         assert_eq!(load_mode(&matches), LoadMode::RawSources);
         assert!(validate_args.get_flag("deny-warnings"));
+        assert!(validate_args.get_flag("show-sources"));
     }
 
     #[test]
@@ -492,7 +510,7 @@ mod tests {
             ..Config::mock()
         };
 
-        let err = validate_config(&config, None, None, false, false)
+        let err = validate_config(&config, None, None, false, false, false)
             .await
             .expect_err("mutual exclusion should fail");
         assert!(err.to_string().contains("mutually exclusive"));
@@ -512,11 +530,11 @@ mod tests {
         .expect("write config source");
         let config = Config::mock();
 
-        validate_config(&config, Some(&config_path), None, false, false)
+        validate_config(&config, Some(&config_path), None, false, false, false)
             .await
             .expect("warnings should not fail by default");
 
-        let err = validate_config(&config, Some(&config_path), None, false, true)
+        let err = validate_config(&config, Some(&config_path), None, false, true, false)
             .await
             .expect_err("deny warnings should fail");
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
     path::{Path, PathBuf},
 };
@@ -41,15 +42,30 @@ pub struct EnvironmentConfigWarning {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSourceOverride {
+    pub field_path: String,
+    pub source: String,
+    pub overridden_source: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigSourceDiagnostics {
     pub file_warnings: Vec<FileConfigWarning>,
     pub environment_warnings: Vec<EnvironmentConfigWarning>,
+    pub source_overrides: Vec<ConfigSourceOverride>,
 }
 
 impl ConfigSourceDiagnostics {
     pub fn is_empty(&self) -> bool {
-        self.file_warnings.is_empty() && self.environment_warnings.is_empty()
+        self.file_warnings.is_empty()
+            && self.environment_warnings.is_empty()
+            && self.source_overrides.is_empty()
+    }
+
+    pub fn has_warnings(&self) -> bool {
+        !self.file_warnings.is_empty() || !self.environment_warnings.is_empty()
     }
 
     pub fn warning_count(&self) -> usize {
@@ -315,7 +331,7 @@ fn validate_http_url(field_path: &str, value: &str) -> Result<(), MegaError> {
 pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
     ConfigSourceDiagnostics {
         file_warnings: known_unconsumed_file_fields(path)?,
-        environment_warnings: Vec::new(),
+        ..Default::default()
     }
     .emit_warnings();
 
@@ -323,30 +339,16 @@ pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
 }
 
 pub fn known_unconsumed_file_fields(path: &Path) -> Result<Vec<FileConfigWarning>, MegaError> {
-    let content = std::fs::read_to_string(path)?;
-    let value = toml::from_str::<Value>(&content).map_err(|e| {
-        MegaError::Other(format!(
-            "failed to parse {} for config diagnostics: {e}",
-            path.display()
-        ))
-    })?;
-
-    Ok(known_unconsumed_fields(&value)
-        .into_iter()
-        .map(|warning| FileConfigWarning {
-            source_path: path.to_path_buf(),
-            field_path: warning.field_path,
-            message: warning.message,
-        })
-        .collect())
+    let value = read_toml_config_file(path)?;
+    Ok(known_unconsumed_file_fields_from_value(path, &value))
 }
 
 pub fn warn_unconsumed_environment_fields() {
     ConfigSourceDiagnostics {
-        file_warnings: Vec::new(),
         environment_warnings: unconsumed_environment_fields_from_keys(
             std::env::vars_os().map(|(key, _)| key),
         ),
+        ..Default::default()
     }
     .emit_warnings();
 }
@@ -371,18 +373,59 @@ where
     I: IntoIterator<Item = K>,
     K: AsRef<OsStr>,
 {
+    let base_value = if let Some(config_path) = config_path {
+        Some((
+            config_path.to_path_buf(),
+            read_toml_config_file(config_path)?,
+        ))
+    } else {
+        None
+    };
+    let profile_value = if let Some(config_profile_path) = config_profile_path {
+        Some((
+            config_profile_path.to_path_buf(),
+            read_toml_config_file(config_profile_path)?,
+        ))
+    } else {
+        None
+    };
+
     let mut file_warnings = Vec::new();
-    if let Some(config_path) = config_path {
-        file_warnings.extend(known_unconsumed_file_fields(config_path)?);
+    if let Some((path, value)) = &base_value {
+        file_warnings.extend(known_unconsumed_file_fields_from_value(path, value));
     }
-    if let Some(config_profile_path) = config_profile_path {
-        file_warnings.extend(known_unconsumed_file_fields(config_profile_path)?);
+    if let Some((path, value)) = &profile_value {
+        file_warnings.extend(known_unconsumed_file_fields_from_value(path, value));
     }
+
+    let env_field_paths = environment_field_paths_from_keys(env_keys);
 
     Ok(ConfigSourceDiagnostics {
         file_warnings,
-        environment_warnings: unconsumed_environment_fields_from_keys(env_keys),
+        environment_warnings: unconsumed_environment_fields_from_paths(&env_field_paths),
+        source_overrides: source_overrides(&base_value, &profile_value, &env_field_paths),
     })
+}
+
+fn read_toml_config_file(path: &Path) -> Result<Value, MegaError> {
+    let content = std::fs::read_to_string(path)?;
+    toml::from_str::<Value>(&content).map_err(|e| {
+        MegaError::Other(format!(
+            "failed to parse {} for config diagnostics: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn known_unconsumed_file_fields_from_value(path: &Path, value: &Value) -> Vec<FileConfigWarning> {
+    known_unconsumed_fields(value)
+        .into_iter()
+        .map(|warning| FileConfigWarning {
+            source_path: path.to_path_buf(),
+            field_path: warning.field_path,
+            message: warning.message,
+        })
+        .collect()
 }
 
 pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
@@ -422,17 +465,134 @@ where
     I: IntoIterator<Item = K>,
     K: AsRef<OsStr>,
 {
-    let mut warnings = keys
-        .into_iter()
+    unconsumed_environment_fields_from_paths(&environment_field_paths_from_keys(keys))
+}
+
+fn unconsumed_environment_fields_from_paths(
+    env_field_paths: &[(String, String)],
+) -> Vec<EnvironmentConfigWarning> {
+    let mut warnings = env_field_paths
+        .iter()
+        .filter_map(|(variable, field_path)| environment_warning_for(variable, field_path))
+        .collect::<Vec<_>>();
+    warnings.sort_by(|left, right| left.variable.cmp(&right.variable));
+    warnings
+}
+
+fn environment_field_paths_from_keys<I, K>(keys: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = K>,
+    K: AsRef<OsStr>,
+{
+    keys.into_iter()
         .filter_map(|key| {
             let variable = key.as_ref().to_str()?.to_string();
             let field_path = env_key_to_field_path(&variable)?;
-            environment_warning_for(&variable, &field_path)
+            Some((variable, field_path))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    warnings.sort_by(|left, right| left.variable.cmp(&right.variable));
-    warnings
+fn source_overrides(
+    base_value: &Option<(PathBuf, Value)>,
+    profile_value: &Option<(PathBuf, Value)>,
+    env_field_paths: &[(String, String)],
+) -> Vec<ConfigSourceOverride> {
+    let base_fields = source_field_paths(base_value);
+    let profile_fields = source_field_paths(profile_value);
+    let mut overrides = Vec::new();
+
+    if let (Some((base_path, _)), Some((profile_path, _))) = (base_value, profile_value) {
+        let source = file_source_label("profile file", profile_path);
+        let overridden_source = file_source_label("base file", base_path);
+        for field_path in profile_fields.intersection(&base_fields) {
+            overrides.push(source_override(field_path, &source, &overridden_source));
+        }
+    }
+
+    for (variable, field_path) in env_field_paths {
+        if environment_warning_for(variable, field_path).is_some() {
+            continue;
+        }
+
+        let overridden_source = if profile_fields.contains(field_path) {
+            profile_value
+                .as_ref()
+                .map(|(path, _)| file_source_label("profile file", path))
+        } else if base_fields.contains(field_path) {
+            base_value
+                .as_ref()
+                .map(|(path, _)| file_source_label("base file", path))
+        } else {
+            None
+        };
+
+        if let Some(overridden_source) = overridden_source {
+            let source = format!("environment variable {variable}");
+            overrides.push(source_override(field_path, &source, &overridden_source));
+        }
+    }
+
+    overrides.sort_by(|left, right| {
+        left.field_path
+            .cmp(&right.field_path)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.overridden_source.cmp(&right.overridden_source))
+    });
+    overrides
+}
+
+fn source_field_paths(source: &Option<(PathBuf, Value)>) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+    if let Some((_, value)) = source {
+        collect_value_field_paths("", value, &mut fields);
+    }
+    fields
+}
+
+fn collect_value_field_paths(prefix: &str, value: &Value, fields: &mut BTreeSet<String>) {
+    match value {
+        Value::Table(table) => {
+            for (field, child) in table {
+                collect_value_field_paths(&join_field_path(prefix, field), child, fields);
+            }
+        }
+        Value::Array(_) => {
+            if is_effective_source_field_path(prefix) {
+                fields.insert(prefix.to_string());
+            }
+        }
+        _ => {
+            if is_effective_source_field_path(prefix) {
+                fields.insert(prefix.to_string());
+            }
+        }
+    }
+}
+
+fn is_effective_source_field_path(field_path: &str) -> bool {
+    !field_path.is_empty()
+        && is_known_field_path(field_path)
+        && !matches!(field_path, "mail.smtp_tls" | "mail.tls")
+        && field_path != "oauth"
+        && !field_path.starts_with("oauth.")
+}
+
+fn file_source_label(kind: &str, path: &Path) -> String {
+    format!("{kind} {}", path.display())
+}
+
+fn source_override(
+    field_path: &str,
+    source: &str,
+    overridden_source: &str,
+) -> ConfigSourceOverride {
+    ConfigSourceOverride {
+        field_path: field_path.to_string(),
+        source: source.to_string(),
+        overridden_source: overridden_source.to_string(),
+        message: format!("{source} overrides {overridden_source} for {field_path}"),
+    }
 }
 
 fn env_key_to_field_path(variable: &str) -> Option<String> {
@@ -1080,6 +1240,7 @@ mod tests {
         assert_eq!(diagnostics.file_warnings.len(), 2);
         assert_eq!(diagnostics.environment_warnings.len(), 2);
         assert_eq!(diagnostics.warning_count(), 4);
+        assert!(diagnostics.has_warnings());
         assert!(!diagnostics.is_empty());
         assert!(diagnostics.file_warnings.iter().any(|warning| {
             warning.source_path == config_path && warning.field_path == "unknown_root"
@@ -1093,6 +1254,71 @@ mod tests {
         assert!(diagnostics.environment_warnings.iter().any(|warning| {
             warning.variable == "MEGA_MAIL__TLS" && warning.field_path == "mail.tls"
         }));
+    }
+
+    #[test]
+    fn source_diagnostics_collects_cross_source_overrides_without_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [log]
+            level = "info"
+
+            [database]
+            db_url = "postgres://localhost:5432/base"
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [log]
+            level = "debug"
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_LOG__LEVEL", "MEGA_DATABASE__DB_URL", "MEGA_MAIL__TLS"],
+        )
+        .expect("diagnostics should collect");
+        let overrides = diagnostics
+            .source_overrides
+            .iter()
+            .map(|source_override| source_override.message.as_str())
+            .collect::<Vec<_>>();
+        let override_text = overrides.join("\n");
+
+        assert_eq!(diagnostics.source_overrides.len(), 3);
+        assert!(overrides.iter().any(|message| {
+            message.contains("profile file")
+                && message.contains("base file")
+                && message.contains("log.level")
+        }));
+        assert!(overrides.iter().any(|message| {
+            message.contains("MEGA_LOG__LEVEL")
+                && message.contains("profile file")
+                && message.contains("log.level")
+        }));
+        assert!(overrides.iter().any(|message| {
+            message.contains("MEGA_DATABASE__DB_URL")
+                && message.contains("base file")
+                && message.contains("database.db_url")
+        }));
+        assert!(!override_text.contains("postgres://localhost"));
+        assert!(!override_text.contains("debug"));
+        assert!(!override_text.contains("info"));
+        assert!(
+            diagnostics
+                .environment_warnings
+                .iter()
+                .any(|warning| warning.variable == "MEGA_MAIL__TLS")
+        );
     }
 
     #[test]
