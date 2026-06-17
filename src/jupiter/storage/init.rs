@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::{
     common::errors::MegaError,
-    config::DbConfig,
+    config::{DbConfig, redaction::redact_url},
     jupiter::{migration::apply_migrations, utils::id_generator},
 };
 
@@ -47,7 +47,7 @@ fn validate_postgres_config(db_config: &DbConfig) -> Result<(), MegaError> {
 async fn postgres_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
     validate_postgres_config(db_config)?;
 
-    let db_url = db_config.db_url.to_owned();
+    let db_url = redact_url(&db_config.db_url);
     log::info!("Connecting to database: {db_url}");
 
     let opt = setup_option(db_config);

@@ -717,7 +717,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 **阶段 2 — 错误模型、redaction/SecretString 与保守校验**
 
 8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；剩余加载路径（如 `mega_base`/`mega_cache`）上的 `unwrap`/`expect`/`panic` 仍需继续收敛。这会改变失败形态，不应并入纯移动阶段。
-9. 建立统一 redaction 工具，位置建议为 `src/common/redaction.rs` 或 `src/config/redaction.rs`，先覆盖数据库 URL、Redis URL、SMTP 密码、对象存储 key、SecretRef URI 中可敏感的 path 片段等现有日志/错误泄露点。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
+9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出。仍需继续覆盖 SMTP 密码、对象存储 key、SecretRef URI 中可敏感的 path 片段、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
 10. 为 `mail.password` 明文兼容路径增加 deprecation warning，并用 `SecretString` 或最小自定义包装类型防止 Debug/Display 误打印；`.expose_secret()` 或等价明文提取点应集中在 mail 外部驱动适配层。
 11. 新增 `validate.rs`，先实现低风险、无争议的 hard error 校验（端口范围、必填字符串、明显非法枚举、Buck 限制等）；将 `mail.password` / `mail.password_ref` 互斥和 `mail.enabled` 时 `smtp_host` / `from` 必填纳入集中校验。
 12. 增加未知/未消费字段诊断，至少覆盖孤立 `[oauth]` 顶层段，以及 `[mail]` 中当前会被丢弃的 `smtp_tls`/`tls`。
@@ -797,7 +797,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - **包装类型（SecretString）在网络传输与持久化中的误暴露**：尽管 `SecretString` 在 Rust 代码中能有效防止 `Debug` 泄露，但在将其序列化（如写入外部监控日志、通过 OpenAPI 接口返回、或者保存到临时数据库中）时，如果序列化库（如 `serde`）未正确配置，仍可能会提取其明文。必须在编译期实施 lints 或强制配置 `#[serde(skip_serialize)]` 规则。
 - **当前对象存储和 Redis 也是早期依赖。** `Storage::new` 会在 vault 就绪前构造对象存储，`AppContext::new` 会在 vault 就绪前连接 Redis；因此 S3 access key、带密码的 Redis URL 等字段不能直接按“可迁移凭据”处理，除非先重构初始化顺序。
 - **CLI 两阶段加载已是基线。** 后续新增 `config init`、RawSources/source diagnostics 或 profile 命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
-- **日志与错误脱敏仍是下一阶段重点。** Vault root token/shares 的旧泄露路径已清理；剩余主要是数据库 URL、Redis URL、外部服务 URL、对象存储 key、兼容期 `mail.password` 和 SecretRef URI 的统一 redaction。
+- **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction。剩余主要是外部服务 URL、对象存储 key、兼容期 `mail.password`、SecretRef URI，以及更多配置/source 诊断路径的统一 redaction。
 - **`core_key.json` 加固核心已完成，但部署侧托管仍是生产边界。** fail-closed、权限收紧、root token 脱敏/退役已落地；把更多凭据放入 vault 仍不抵御能读取 key 文件的攻击者，生产使用必须配套 KMS/secret manager、受控挂载、备份恢复和恢复演练。
 - **采用分阶段切换。** 顶层迁移和调用方路径迁移已完成；后续内部拆分、错误模型、初始化命令和热加载仍必须各自独立评审，不追求“单次变更内完成全部改造”。
 - **热加载作为独立阶段，不与拆分/迁移捆绑。** 热加载只允许白名单字段运行期生效，不应隐式重建数据库、Redis、对象存储、HTTP 监听器等长生命周期资源；失败必须保留旧配置并输出来源、字段路径、失败原因和处理结果。

@@ -2,7 +2,7 @@ pub mod lock;
 
 pub use ::redis::{AsyncCommands, aio::ConnectionManager};
 
-use crate::config::RedisConfig;
+use crate::config::{RedisConfig, redaction::redact_url};
 
 /// Initializes a Redis multiplexed asynchronous connection from the given configuration.
 ///
@@ -16,5 +16,5 @@ pub async fn init_connection(config: &RedisConfig) -> ConnectionManager {
     let client = ::redis::Client::open(config.url.as_str()).expect("can't open redis url");
     ConnectionManager::new(client)
         .await
-        .unwrap_or_else(|_| panic!("Failed to connect to Redis at {}, please check your redis server is running and the url is correct", config.url))
+        .unwrap_or_else(|_| panic!("Failed to connect to Redis at {}, please check your redis server is running and the url is correct", redact_url(&config.url)))
 }
