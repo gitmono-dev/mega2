@@ -9,6 +9,7 @@ pub use orbit_api::factory::ObjectStorageConfig;
 
 use crate::common::errors::MegaError;
 
+pub mod error;
 mod expand;
 pub mod loader;
 mod model;
@@ -86,11 +87,11 @@ pub fn mega_cache() -> PathBuf {
 
 impl Config {
     pub fn new(path: &str) -> Result<Self, MegaError> {
-        Ok(Config::from_config(config_from_path(path))?)
+        Ok(Config::from_config(config_from_path(path)?)?)
     }
 
     pub fn load_vault_bootstrap(path: &str) -> Result<VaultBootstrapConfig, ConfigError> {
-        config_from_path(path).try_deserialize::<VaultBootstrapConfig>()
+        config_from_path(path)?.try_deserialize::<VaultBootstrapConfig>()
     }
 
     pub fn mock() -> Self {
@@ -122,7 +123,7 @@ impl Config {
                     .separator("__"),
             );
 
-        let config = variable_placeholder_substitute(builder);
+        let config = variable_placeholder_substitute(builder)?;
 
         Config::from_config(config)
     }
@@ -136,7 +137,7 @@ impl Config {
             builder = builder.add_source(*source);
         }
 
-        let config = variable_placeholder_substitute(builder);
+        let config = variable_placeholder_substitute(builder)?;
 
         Config::from_config(config)
     }
