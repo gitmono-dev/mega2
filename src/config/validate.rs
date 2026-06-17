@@ -125,13 +125,189 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
         }
     }
 
+    warnings.extend(unknown_fields(value));
+
     warnings
+}
+
+fn unknown_fields(value: &Value) -> Vec<ConfigWarning> {
+    let mut warnings = Vec::new();
+
+    if let Some(table) = value.as_table() {
+        collect_unknown_fields("", "", table, &mut warnings);
+    }
+
+    warnings
+}
+
+fn collect_unknown_fields(
+    schema_path: &str,
+    display_path: &str,
+    table: &toml::Table,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let Some(allowed_fields) = known_fields(schema_path) else {
+        return;
+    };
+
+    for (field, value) in table {
+        let schema_field_path = join_field_path(schema_path, field);
+        let display_field_path = join_field_path(display_path, field);
+
+        if !allowed_fields.contains(&field.as_str()) {
+            warnings.push(ConfigWarning {
+                field_path: display_field_path.clone(),
+                message: format!(
+                    "{display_field_path} is not recognized by Config and will be ignored"
+                ),
+            });
+            continue;
+        }
+
+        if known_fields(&schema_field_path).is_some() {
+            match value {
+                Value::Table(child_table) => collect_unknown_fields(
+                    &schema_field_path,
+                    &display_field_path,
+                    child_table,
+                    warnings,
+                ),
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        if let Some(item_table) = item.as_table() {
+                            collect_unknown_fields(
+                                &schema_field_path,
+                                &format!("{display_field_path}[{index}]"),
+                                item_table,
+                                warnings,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn join_field_path(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.to_string()
+    } else {
+        format!("{prefix}.{field}")
+    }
+}
+
+fn known_fields(path: &str) -> Option<&'static [&'static str]> {
+    match path {
+        "" => Some(&[
+            "base_dir",
+            "log",
+            "database",
+            "monorepo",
+            "build",
+            "pack",
+            "lfs",
+            "object_storage",
+            "oauth",
+            "blame",
+            "redis",
+            "buck",
+            "artifacts_gc",
+            "orion_server",
+            "sidebar",
+            "mail",
+        ]),
+        "log" => Some(&["level", "print_std", "with_ansi"]),
+        "database" => Some(&[
+            "db_type",
+            "db_path",
+            "db_url",
+            "max_connection",
+            "min_connection",
+            "acquire_timeout",
+            "connect_timeout",
+            "sqlx_logging",
+        ]),
+        "monorepo" => Some(&["import_dir", "admin", "root_dirs", "rename"]),
+        "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
+        "build" => Some(&[
+            "enable_build",
+            "orion_server",
+            "orion_preheat_shallow_depth",
+        ]),
+        "pack" => Some(&[
+            "pack_decode_mem_size",
+            "pack_decode_disk_size",
+            "pack_decode_cache_path",
+            "clean_cache_after_decode",
+            "channel_message_size",
+            "save_entry_concurrency",
+        ]),
+        "lfs" => Some(&["ssh", "local"]),
+        "lfs.ssh" => Some(&["http_url"]),
+        "lfs.local" => Some(&["lfs_file_path"]),
+        "object_storage" => Some(&["storage_type", "s3", "gcs", "local"]),
+        "object_storage.s3" => Some(&[
+            "region",
+            "bucket",
+            "access_key_id",
+            "secret_access_key",
+            "endpoint_url",
+        ]),
+        "object_storage.gcs" => Some(&["bucket"]),
+        "object_storage.local" => Some(&["root_dir"]),
+        "blame" => Some(&[
+            "max_lines_threshold",
+            "max_size_threshold",
+            "default_chunk_size",
+            "max_commits_in_memory",
+            "enable_caching",
+        ]),
+        "redis" => Some(&["url"]),
+        "buck" => Some(&[
+            "session_timeout",
+            "max_file_size",
+            "max_files",
+            "max_concurrent_uploads",
+            "upload_concurrency_limit",
+            "large_file_concurrency_limit",
+            "large_file_threshold",
+            "enable_session_cleanup",
+            "cleanup_interval",
+            "completed_retention_days",
+        ]),
+        "artifacts_gc" => Some(&["enable", "interval_secs", "grace_secs", "batch_limit"]),
+        "orion_server" => Some(&[
+            "logger_storage_mode",
+            "build_log_dir",
+            "log_stream_buffer",
+            "db_url",
+            "port",
+            "monobase_url",
+        ]),
+        "sidebar" => Some(&["default_items"]),
+        "sidebar.default_items" => Some(&["public_id", "label", "href", "visible", "order_index"]),
+        "mail" => Some(&[
+            "enabled",
+            "smtp_host",
+            "smtp_port",
+            "username",
+            "password",
+            "password_ref",
+            "from",
+            "starttls",
+            "smtp_tls",
+            "tls",
+        ]),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::secret::SecretRef;
+    use crate::config::{secret::SecretRef, template::config_init_template};
 
     #[test]
     fn config_validate_accepts_default_mock_config() {
@@ -238,5 +414,51 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(fields, vec!["oauth", "mail.smtp_tls", "mail.tls"]);
+    }
+
+    #[test]
+    fn known_unconsumed_fields_warns_for_unknown_fields() {
+        let value = toml::from_str::<Value>(
+            r#"
+            unknown_root = true
+
+            [database]
+            typo = true
+
+            [object_storage.s3]
+            unexpected = true
+
+            [mail]
+            smtp_tls = false
+            extra = true
+
+            [sidebar]
+            default_items = [
+                { public_id = "home", label = "Home", href = "/posts", visible = true, order_index = 0, icon = "home" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let warnings = known_unconsumed_fields(&value);
+        let fields = warnings
+            .iter()
+            .map(|warning| warning.field_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(fields.contains(&"mail.smtp_tls"));
+        assert!(fields.contains(&"unknown_root"));
+        assert!(fields.contains(&"database.typo"));
+        assert!(fields.contains(&"object_storage.s3.unexpected"));
+        assert!(fields.contains(&"mail.extra"));
+        assert!(fields.contains(&"sidebar.default_items[0].icon"));
+    }
+
+    #[test]
+    fn config_init_template_has_no_unconsumed_fields() {
+        let rendered = config_init_template(Path::new("/tmp/monoengine"));
+        let value = toml::from_str::<Value>(&rendered).unwrap();
+
+        assert!(known_unconsumed_fields(&value).is_empty());
     }
 }
