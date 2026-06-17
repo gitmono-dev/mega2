@@ -16,6 +16,6 @@ pub(crate) async fn exec(ctx: AppContext, args: &ArgMatches) -> MegaResult {
         .unwrap();
 
     tracing::info!("{server_matchers:#?}");
-    http_server::start_http(ctx, server_matchers).await;
+    http_server::start_http(ctx, server_matchers).await?;
     Ok(())
 }

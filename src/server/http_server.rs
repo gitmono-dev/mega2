@@ -1,6 +1,5 @@
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
-use anyhow::Result;
 use axum::{
     Router, ServiceExt,
     body::Body,
@@ -30,7 +29,7 @@ use crate::{
     },
     bellatrix::Bellatrix,
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
-    common::errors::ProtocolError,
+    common::errors::{MegaError, MegaResult, ProtocolError},
     context::AppContext,
     contract::{
         git_protocol::InfoRefsParams,
@@ -170,8 +169,17 @@ async fn shutdown_signal(token: CancellationToken) {
     token.cancelled().await;
 }
 
-pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
+pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     let CommonHttpOptions { host, port } = options.clone();
+    let server_url = format!("{host}:{port}");
+    let addr = SocketAddr::from_str(&server_url).map_err(|e| {
+        MegaError::Other(format!("invalid HTTP listen address `{server_url}`: {e}"))
+    })?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        MegaError::Other(format!(
+            "failed to bind HTTP listener at `{server_url}`: {e}"
+        ))
+    })?;
 
     let middleware = tower::util::MapRequestLayer::new(rewrite_lfs_request_uri::<Body>);
 
@@ -183,11 +191,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
     let app = app(ctx, host.clone(), port).await;
     let app_with_middleware = middleware.layer(app);
 
-    let server_url = format!("{host}:{port}");
-    let addr = SocketAddr::from_str(&server_url).unwrap();
-    tracing::info!("HTTP server started up!");
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tracing::info!(address = %addr, "HTTP server started up");
 
     let server_future = axum::serve(listener, app_with_middleware.into_make_service())
         .with_graceful_shutdown(shutdown_signal(server_token));
@@ -287,6 +291,8 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) {
             tracing::warn!("Graceful shutdown completed with some errors");
         }
     }
+
+    Ok(())
 }
 
 /// This is the main entry for the mono server.
@@ -447,7 +453,7 @@ fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
 async fn handle_smart_protocol(
     req: Request<Body>,
     state: Arc<ProtocolApiState>,
-) -> Result<Response, ProtocolError> {
+) -> std::result::Result<Response, ProtocolError> {
     let full_path = req.uri().path();
     if is_disallowed_root_repo_path(full_path) {
         return Err(ProtocolError::InvalidInput(

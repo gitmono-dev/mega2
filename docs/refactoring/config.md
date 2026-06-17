@@ -42,7 +42,7 @@
 - `src/config/expand.rs::variable_placeholder_substitute` 已消除原 **10** 处 `unwrap`，并已对未解析/非法占位符值输出字段级脱敏错误和修复建议；仍需在后续完整 source diagnostics 中补更丰富的跨 source 覆盖关系。
 - `Storage::new` 里的 Buck 校验和 BuckService 构造失败已从 `panic!` / `expect` 改为返回 `MegaError`；数据库连接和 migration 失败也已从 `database_connection` 的 `expect` 改为经 `Storage::new` / Vault 最小 bootstrap 返回错误；仍需在后续把更多启动期配置校验提前到 `Config::validate()` / source diagnostics。
 - `Storage::config()` 已改为从 `Storage` 持有的 `Arc<Config>` 克隆返回，不再存在 `Weak::upgrade().expect("Config has been dropped")` 的 panic 点；后续热加载仍需把共享入口升级为可替换的快照句柄。
-- `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`（含数据库连接和 migration）、Redis 初始化、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；剩余风险主要在 dispatcher 生命周期治理、失败退避和后台任务可观测性。
+- `AppContext::new` 当前已返回 `Result` 并传播 `Storage::new`（含数据库连接和 migration）、Redis 初始化、`VaultCore::new`、`init_monorepo` 与 mailer 初始化错误；HTTP 服务监听地址解析/绑定失败也已从 `unwrap` 改为经 `service http` / `service multi` 返回错误。剩余风险主要在 dispatcher 生命周期治理、失败退避和后台任务可观测性。
 - `mail.password` 明文字段仍为兼容期入口；首批 deprecation warning 与 `SecretString` 防误打印已落地，后续仍需在 source diagnostics 和样例/模板中继续推动生产配置使用 `mail.password_ref`。
 - Vault 初始化/解封的旧泄露路径已清理；当前残余风险是自动解封材料仍落在 `core_key.json`，需要备份恢复和部署侧凭据注入/KMS 策略配套。
 - `mega_base()` / `mega_cache()`（`src/config/mod.rs`）的早期 `BaseDirs::new().unwrap()` / `to_str().unwrap()` 已移除；未设置 `MEGA_BASE_DIR` / `MEGA_CACHE_DIR` 且系统目录不可用时，会退回当前目录下 `.mega` / `.mega/cache`，后续完整 source diagnostics 可继续把 fallback 来源显式化。
@@ -191,7 +191,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 - Redis 初始化：为缓存、队列和异步任务提供连接配置。
 - 对象存储初始化：根据配置选择本地、S3/S3 兼容或 GCS 后端。
 - Monorepo 初始化：提供仓库路径、导入目录、对象目录等核心路径。
-- HTTP 服务：读取监听地址、端口、CORS、Swagger/OpenAPI 等相关配置（OAuth 相关字段目前尚未进入 `Config` 强类型结构，见上节说明）。
+- HTTP 服务：读取监听地址、端口、CORS、Swagger/OpenAPI 等相关配置；监听地址解析/绑定失败会返回 `MegaError`，不再 `unwrap` 崩溃（OAuth 相关字段目前尚未进入 `Config` 强类型结构，见上节说明）。
 - Git pack / LFS：控制对象解码、上传、存储和传输行为。
 - 构建系统：配置 Orion 构建服务、触发器和构建产物管理。
 - Buck 上传：读取上传限制、清理策略和相关后台任务参数。
@@ -512,7 +512,7 @@ Config::new                                  # context/mod.rs:30 起 AppContext:
   -> SmtpMailer::new_with_password(...)      # 失败返回 MegaError
   -> EmailDispatcher::new(...) + spawn       # mail 启用时启动后台 outbox dispatcher
   -> init_monorepo(config.monorepo)          # vault 之后，失败返回错误
-  -> HTTP/SSH/multi 服务分发                 # commands/service/mod.rs:33-36
+  -> HTTP/SSH/multi 服务分发                 # HTTP 监听地址解析/绑定失败会返回错误
 ```
 
 因此，当前 `Storage::new` 或 Redis 初始化阶段已经消费的任何 secret，都不能直接改为 vault SecretRef。只适合迁移在 vault 之后才初始化/使用的字段。**SMTP mailer 密码的前提已满足，且 `mail.password_ref` 已接入**；剩余工作不是再做 resolver/mail 迁移，而是治理 `mail.password` 明文兼容路径、错误脱敏和 dispatcher 生命周期。
@@ -724,7 +724,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 **阶段 2 — 错误模型、redaction/SecretString 与保守校验**
 
-8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；未解析/非法占位符值已脱敏并带修复建议；`mega_base`/`mega_cache` 的早期目录解析 `unwrap` 已改为 env/system/fallback 的无 panic 路径；`database_connection` 的连接和 migration `expect`、Redis 初始化的 `expect`/`panic`、BuckService 构造 `expect` 已改为返回错误并由启动/bootstrap 调用方传播。剩余加载路径上的 `expect`/`panic` 仍需继续收敛，这会改变失败形态，不应并入纯移动阶段。
+8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；未解析/非法占位符值已脱敏并带修复建议；`mega_base`/`mega_cache` 的早期目录解析 `unwrap` 已改为 env/system/fallback 的无 panic 路径；`database_connection` 的连接和 migration `expect`、Redis 初始化的 `expect`/`panic`、BuckService 构造 `expect`、HTTP 监听地址解析/绑定 `unwrap` 已改为返回错误并由启动/bootstrap 调用方传播。剩余加载路径上的 `expect`/`panic` 仍需继续收敛，这会改变失败形态，不应并入纯移动阶段。
 9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出；`SecretRef` 的 `Debug` / `Display` 与 resolver 失败诊断默认输出 `vault://secret/***#***`，只有 `as_uri()` 这类显式 CLI 成功输出保留完整引用。仍需继续覆盖 SMTP 密码、对象存储 key、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
 10. 已完成首批：`mail.password` 明文兼容路径改为 `Option<SecretString>`，Debug/Serialize 输出脱敏；`config validate` 与服务启动路径会对明文 `mail.password` 输出 deprecation warning；`.expose_secret()` 集中在 `SmtpMailer::new` 适配层。后续仍需在 source diagnostics、样例配置和模板中继续推动迁移到 `mail.password_ref`。
 11. 已完成首批：新增 `src/config/validate.rs`，实现 `Config::validate()` 首批 hard error 校验，覆盖 `database.db_type`、`database.db_url` scheme、数据库连接池参数、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password` / `mail.password_ref` 互斥、`mail.enabled` 时 `smtp_host` / `from` 必填、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 端口/URL/DB URL；`config validate` 已复用该入口，`Storage::new` 的 Buck 非法配置已改为返回 `MegaError`。后续集中校验主要随新增字段继续补规则。
@@ -872,7 +872,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 | **功能正确性与接口兼容性** | **良好（8/10）**。`SecretRef` 到 `read_secret(name)` 的路径映射（`write_api("secret/{name}")`）与 vault_core 实现一致；`mail.password_ref`、互斥校验和 `config secret` 支持范围与当前代码一致。仍需注意：`config` 作为顶层模块名会与 `config` crate 冲突（当前代码用 `c::` 别名，已在文档中提及）；后续新增代码应避免重新引入 `common::config` 路径。 |
 | **数据流与控制流正确性** | **正确（9/10）**。`AppContext::new` 中 `Storage::new → init_connection(redis) → VaultCore::new → mail.password_ref resolve → SmtpMailer/EmailDispatcher → init_monorepo` 的实际顺序与文档描述一致。secret 只能在 vault 就绪后解析、运维命令（secret set/check）必须用最小 bootstrap 而非完整 AppContext 的结论均正确。 |
 | **性能与效率** | **可接受（8/10）**。resolver 内存缓存 + TTL、`Arc` 只读共享均合理。`variable_placeholder_substitute` 的两次全树 collect + clone 在启动期可忽略；其原 panic 语义已初步收敛，后续重点是诊断质量而非 CPU 成本。热加载白名单设计也避免了不必要的长连接重建。 |
-| **可靠性与容错性** | **改进潜力大（8/10）**。计划中的“消灭加载路径 panic、热加载失败回滚保留旧配置、错误带字段路径+修复建议”等均会显著提升。Buck 校验、BuckService 构造、`Storage::config()`、`mega_base` / `mega_cache`、数据库连接/migration 初始化以及 Redis 初始化的已知 panic/expect 点已完成首批收敛；当前仍需重点补全 source diagnostics、更多启动期配置校验和热加载失败回滚语义。Vault fail-closed 已完成，不再作为 config 阶段阻塞项。 |
+| **可靠性与容错性** | **改进潜力大（8/10）**。计划中的“消灭加载路径 panic、热加载失败回滚保留旧配置、错误带字段路径+修复建议”等均会显著提升。Buck 校验、BuckService 构造、`Storage::config()`、`mega_base` / `mega_cache`、数据库连接/migration 初始化、Redis 初始化以及 HTTP 监听地址解析/绑定的已知 panic/expect 点已完成首批收敛；当前仍需重点补全 source diagnostics、更多启动期配置校验和热加载失败回滚语义。Vault fail-closed 已完成，不再作为 config 阶段阻塞项。 |
 | **兼容性与互操作性** | **良好（8/10）**。serde `Option` + `#[serde(default)]`、废弃字段 WARN 过渡期、Profile 深合并（数组整体替换而非追加）的语义均已明确。需补充：未知顶层段的告警策略、`0600/0700` 在 Windows/macOS 下的等价实现（或明确“生产仅支持类 Unix”）、以及 `config/config.toml` 作为样例时应 `deny_unknown_fields` 或至少 warn。 |
 | **可扩展性与可维护性** | **良好（8.5/10）**。配置已从 `common` 提升为一级 `src/config/` 模块；继续按职责拆分为 model/loader/expand/secret/validate/testing/error 等小文件，是正确的长期方向。`Config` 成为基础设施后，新增领域只需扩展 model + 对应校验/展开规则即可。需注意继续坚持“先纯移动、再语义变更”的顺序。 |
 | **合规性与标准符合性** | **良好（8/10）**。推荐的 secrecy/zeroize、stdin 避免历史记录、CI 覆盖配置样例+坏输入矩阵、字段分类表作为变更依据等，均符合现代凭据管理最佳实践。引入新依赖（secrecy 等）前要求评估编译/二进制影响的约束是正确的。 |
@@ -889,7 +889,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 1. 已完成：顶层结构迁移，`src/config/{mod,model,source,expand,loader,template,secret}.rs` 成为主实现，源码调用方已迁到 `crate::config`，`common::config` shim 已删除。
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
-3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；`mega_base` / `mega_cache` 的早期目录解析 `unwrap` 已移除；数据库连接/migration 初始化、Redis 初始化和 BuckService 构造已改为返回错误；首批 URL redaction、`SecretString`、`SecretRef` 默认输出脱敏、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `expect`/`panic`，补更多配置规则和完整 source diagnostics。
+3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；`mega_base` / `mega_cache` 的早期目录解析 `unwrap` 已移除；数据库连接/migration 初始化、Redis 初始化、BuckService 构造和 HTTP 监听地址解析/绑定已改为返回错误；首批 URL redaction、`SecretString`、`SecretRef` 默认输出脱敏、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `expect`/`panic`，补更多配置规则和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning、坏 env/profile 类型脱敏错误和首批修复建议已完成；继续补完整 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics、坏 env/profile 类型单测，以及坏占位符/坏 SecretRef URI 的 CLI 失败 smoke；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
