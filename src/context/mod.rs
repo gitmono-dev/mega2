@@ -79,7 +79,17 @@ impl AppContext {
                         })?)
                     };
                 let notif_stg = storage.notification_storage();
-                let dispatcher = crate::notification::EmailDispatcher::new(notif_stg, mailer);
+                let dispatcher_control = crate::notification::EmailDispatcherControl::new(true);
+                config_handle.subscribe(
+                    crate::notification::config_reload_email_dispatcher_subscriber(
+                        dispatcher_control.clone(),
+                    ),
+                )?;
+                let dispatcher = crate::notification::EmailDispatcher::new_with_control(
+                    notif_stg,
+                    mailer,
+                    dispatcher_control,
+                );
                 let sd = notification_shutdown.clone();
                 tokio::spawn(async move {
                     dispatcher.run(sd).await;

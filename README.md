@@ -129,7 +129,7 @@ Key sections (see `config/config.toml` for the full list):
 | `[build]`          | Orion build server URL and trigger preheat depth                        |
 | `[buck]`           | Buck upload session limits and concurrency caps                         |
 | `[artifacts_gc]`   | Background GC for orphan repo artifact blobs                            |
-| `[mail]`           | SMTP host / port / from address / STARTTLS and optional `password_ref`   |
+| `[mail]`           | SMTP enable flag, host / port / from address / STARTTLS, `password_ref`  |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
 ### Run
@@ -300,7 +300,9 @@ cargo test --test <name>
 - **Notifications** — `notification::triggers` enqueues `email_jobs` rows in
   response to CL events; `notification::dispatcher::EmailDispatcher` polls
   that queue on a 2s tick, claims jobs atomically, and hands them to the
-  `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`).
+  `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`). Config reload
+  can disable a running dispatcher via `mail.enabled = false`; re-enabling mail
+  or changing SMTP settings still requires restart.
 - **Vault** — `contract::vault::integration::vault_core::VaultCore` wraps
   the vendored `crate::vault` module with a `jupiter`‑backed storage adapter
   (`contract::vault::integration::jupiter_backend`), so secrets live in the

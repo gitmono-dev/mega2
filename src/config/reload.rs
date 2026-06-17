@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     common::errors::MegaError,
-    config::{Config, LogConfig},
+    config::{Config, LogConfig, MailConfig},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -128,9 +128,9 @@ impl ConfigHandle {
         let mut report = ConfigReloadReport::default();
 
         apply_log_changes(&current.log, &candidate.log, &mut next.log, &mut report);
+        apply_mail_changes(&current.mail, &candidate.mail, &mut next.mail, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
-        collect_mail_restart_fields(&current, &candidate, &mut report);
 
         if report.applied() {
             let next = Arc::new(next);
@@ -377,6 +377,31 @@ fn apply_log_changes(
     }
 }
 
+fn apply_mail_changes(
+    current: &Option<MailConfig>,
+    candidate: &Option<MailConfig>,
+    next: &mut Option<MailConfig>,
+    report: &mut ConfigReloadReport,
+) {
+    match (current, candidate) {
+        (None, None) => {}
+        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("mail"),
+        (Some(current), Some(candidate)) => {
+            if current.enabled != candidate.enabled {
+                if current.enabled && !candidate.enabled {
+                    if let Some(next) = next {
+                        next.enabled = false;
+                    }
+                    report.applied_fields.push("mail.enabled");
+                } else {
+                    report.restart_required_fields.push("mail.enabled");
+                }
+            }
+            collect_mail_restart_fields(current, candidate, report);
+        }
+    }
+}
+
 fn collect_database_restart_fields(
     current: &Config,
     candidate: &Config,
@@ -427,39 +452,30 @@ fn collect_redis_restart_fields(
 }
 
 fn collect_mail_restart_fields(
-    current: &Config,
-    candidate: &Config,
+    current: &MailConfig,
+    candidate: &MailConfig,
     report: &mut ConfigReloadReport,
 ) {
-    match (&current.mail, &candidate.mail) {
-        (None, None) => {}
-        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("mail"),
-        (Some(current), Some(candidate)) => {
-            if current.enabled != candidate.enabled {
-                report.restart_required_fields.push("mail.enabled");
-            }
-            if current.smtp_host != candidate.smtp_host {
-                report.restart_required_fields.push("mail.smtp_host");
-            }
-            if current.smtp_port != candidate.smtp_port {
-                report.restart_required_fields.push("mail.smtp_port");
-            }
-            if current.username != candidate.username {
-                report.restart_required_fields.push("mail.username");
-            }
-            if current.password != candidate.password {
-                report.restart_required_fields.push("mail.password");
-            }
-            if current.password_ref != candidate.password_ref {
-                report.restart_required_fields.push("mail.password_ref");
-            }
-            if current.from != candidate.from {
-                report.restart_required_fields.push("mail.from");
-            }
-            if current.starttls != candidate.starttls {
-                report.restart_required_fields.push("mail.starttls");
-            }
-        }
+    if current.smtp_host != candidate.smtp_host {
+        report.restart_required_fields.push("mail.smtp_host");
+    }
+    if current.smtp_port != candidate.smtp_port {
+        report.restart_required_fields.push("mail.smtp_port");
+    }
+    if current.username != candidate.username {
+        report.restart_required_fields.push("mail.username");
+    }
+    if current.password != candidate.password {
+        report.restart_required_fields.push("mail.password");
+    }
+    if current.password_ref != candidate.password_ref {
+        report.restart_required_fields.push("mail.password_ref");
+    }
+    if current.from != candidate.from {
+        report.restart_required_fields.push("mail.from");
+    }
+    if current.starttls != candidate.starttls {
+        report.restart_required_fields.push("mail.starttls");
     }
 }
 
@@ -469,6 +485,19 @@ mod tests {
     use crate::config::{
         MailConfig, secret::SecretRef, template::config_init_template, testing::isolated_config,
     };
+
+    fn mail_config(enabled: bool) -> MailConfig {
+        MailConfig {
+            enabled,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("monoengine@example.com".to_string()),
+            password: None,
+            password_ref: None,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        }
+    }
 
     #[test]
     fn reload_applies_log_fields_and_preserves_restart_required_database_fields() {
@@ -520,6 +549,46 @@ mod tests {
             snapshot.database.db_url,
             "postgres://localhost:5432/current"
         );
+    }
+
+    #[test]
+    fn reload_applies_mail_disable_without_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(true));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.mail.as_mut().expect("mail config").enabled = false;
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert_eq!(report.applied_fields, vec!["mail.enabled"]);
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
+    }
+
+    #[test]
+    fn reload_reports_mail_enable_requires_restart_without_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(false));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.mail.as_mut().expect("mail config").enabled = true;
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(report.restart_required_fields, vec!["mail.enabled"]);
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
     }
 
     #[test]
@@ -671,14 +740,8 @@ mod tests {
             SecretRef::parse("vault://secret/config/test/mail/candidate#value").unwrap();
         let mut current = isolated_config(temp_dir.path().join("current"));
         current.mail = Some(MailConfig {
-            enabled: false,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: Some("monoengine@example.com".to_string()),
-            password: None,
             password_ref: Some(current_ref.clone()),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
+            ..mail_config(false)
         });
         let handle = ConfigHandle::new(current);
 
