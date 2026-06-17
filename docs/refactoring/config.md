@@ -35,6 +35,7 @@
 | 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 的端口/URL/DB URL；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`；`config validate` 已对 `[oauth]`、`[mail].smtp_tls`/`[mail].tls` 和 raw TOML 任意未知字段输出 warning。环境变量/profile 来源诊断和完整 source diagnostics 仍待补齐。 |
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
 | 测试配置辅助                   | **已实现首批** | `src/config/testing.rs` 已提供 `TestConfigBuilder`、`isolated_config()` 与 `TestSecretResolver`，可派生临时 base/cache/LFS/object storage 路径、接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景；尚未把全仓测试和 CI 配置矩阵迁移到该 helper。 |
+| CI 配置样例校验                | **已实现首批** | `.github/workflows/config-validation.yml` 已新增 sibling-aware 配置验证入口，会 checkout `monoengine` 与 `orbit`，运行格式检查、配置模板/loader/profile 单测、仓库基础样例 `config validate`、`config init` 生成结果校验和 profile merge CLI 校验。后续继续补坏输入、环境变量来源、SecretRef 缺失/权限和完整 source diagnostics 场景。 |
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
@@ -749,7 +750,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 19. 已完成首批：`config/config.toml` 与模型默认 PostgreSQL URL 已移除可预测 userinfo，保留与当前 schema 对齐的本地默认值和 env/部署 secret 注入指引，并新增仓库默认样例解析、校验和无可预测凭据测试；后续继续补 CI 配置校验矩阵。
 20. 已完成首批：固定 Profile 文件命名、加载优先级、数组覆盖语义和 SecretRef namespace，并补充 profile 合并、profile/env 覆盖顺序和最小 vault bootstrap 合并测试；后续继续补完整 profile source diagnostics 与 CI 矩阵。
 21. 已完成首批：新增 `testing.rs`，提供 `TestConfigBuilder`、`isolated_config()`、`.env.test` 风格覆盖合并和 `TestSecretResolver`；后续继续把文件加载链路、Profile 合并结果和更多现有测试迁移到该 helper。
-22. 建立分层测试策略并接入 CI：单元测试用内存/最小 TOML，加载测试用临时文件，集成测试用 `.env.test` + `MEGA_CONFIG` 指向隔离配置；CI 覆盖基础样例、默认模板、`config init` 结果、profile 合并结果与测试配置生成结果。
+22. 已完成首批：新增 `.github/workflows/config-validation.yml`，在 CI 中覆盖基础样例、默认模板、`config init` 结果和 profile 合并结果；后续继续把 `.env.test` 隔离测试配置、坏输入矩阵、环境变量来源和 SecretRef 失败场景纳入 CI。
 
 > **验收标准**：`config/config.toml` 不含真实生产密码或可复用生产凭据；`cargo test --all` 不依赖仓库中的 `config/config.toml` 作为隐式共享状态；CI 新增配置校验任务且通过。
 
@@ -887,7 +888,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
 3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则、环境变量/profile 来源诊断和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；继续补 RawSources/source diagnostics。
-5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义和基础样例凭据治理已完成首批；继续建立 CI 配置校验矩阵并迁移更多测试到隔离 helper。
+5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
 7. 独立阶段：受控热加载，白名单字段生效，候选失败时保留旧配置。
 
@@ -909,4 +910,4 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [x] 已在 `validate.rs`/`config validate` 中加入首批 raw TOML 未消费/未知字段告警，覆盖当前 `[oauth]`、`[mail].smtp_tls`/`[mail].tls`、任意未知字段、嵌套 table 和数组内 inline table。
 - [ ] 已计划同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
 - [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、Profile、热加载分别单独提交，`config init` 模板治理不与这些阶段混合。
-- [ ] 计划在 CI 中增加配置样例（基础 + 生成 + profile + 坏输入）校验任务。
+- [x] 已在 CI 中增加配置样例首批校验任务（基础 + 生成 + profile）；坏输入、env/source diagnostics 和 SecretRef 失败矩阵仍待补。

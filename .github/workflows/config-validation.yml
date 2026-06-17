@@ -1,0 +1,82 @@
+name: Config Validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/config-validation.yml"
+      - "config/**"
+      - "src/cli.rs"
+      - "src/commands/config.rs"
+      - "src/config/**"
+      - "docs/refactoring/config.md"
+      - "README.md"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/config-validation.yml"
+      - "config/**"
+      - "src/cli.rs"
+      - "src/commands/config.rs"
+      - "src/config/**"
+      - "docs/refactoring/config.md"
+      - "README.md"
+
+jobs:
+  validate-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout monoengine
+        uses: actions/checkout@v5
+        with:
+          path: monoengine
+
+      - name: Checkout orbit sibling
+        uses: actions/checkout@v5
+        with:
+          repository: gitmono-dev/orbit
+          path: orbit
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - name: Check formatting
+        working-directory: monoengine
+        run: cargo +nightly fmt --all --check
+
+      - name: Run config sample tests
+        working-directory: monoengine
+        run: |
+          cargo test config::template -- --nocapture
+          cargo test config::loader -- --nocapture
+          cargo test test_new_with_profile_merges_profile_before_env -- --nocapture
+          cargo test config_init_template_has_no_unconsumed_fields -- --nocapture
+
+      - name: Validate bundled config
+        working-directory: monoengine
+        run: cargo run -- --config config/config.toml config validate
+
+      - name: Validate generated config
+        working-directory: monoengine
+        run: |
+          config_path="${RUNNER_TEMP}/monoengine.generated.toml"
+          cargo run -- config init --output "${config_path}" --force
+          cargo run -- --config "${config_path}" config validate
+
+      - name: Validate profile merge
+        working-directory: monoengine
+        run: |
+          config_dir="${RUNNER_TEMP}/monoengine-profile"
+          mkdir -p "${config_dir}"
+          cp config/config.toml "${config_dir}/config.toml"
+          cat > "${config_dir}/config.prod.toml" <<'EOF'
+          [log]
+          level = "debug"
+
+          [monorepo]
+          root_dirs = ["profile-root"]
+          EOF
+          cargo run -- --config "${config_dir}/config.toml" --profile prod config validate
