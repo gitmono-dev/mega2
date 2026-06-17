@@ -1,6 +1,7 @@
 use std::{
+    fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -13,6 +14,7 @@ use crate::{
     config::{
         Config,
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
+        template::config_init_template,
         validate::warn_known_unconsumed_file_fields,
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
@@ -30,6 +32,24 @@ pub fn cli() -> Command {
                 .subcommand(secret_ref_cli())
                 .subcommand(secret_set_cli())
                 .subcommand(secret_check_cli()),
+        )
+        .subcommand(
+            Command::new("init")
+                .about("Create a safe starter configuration without reading config or vault")
+                .arg(
+                    Arg::new("output")
+                        .long("output")
+                        .short('o')
+                        .value_name("PATH")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .help("Output config path; defaults to --config or config/config.toml"),
+                )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Overwrite an existing config file"),
+                ),
         )
         .subcommand(
             Command::new("validate").about("Validate configuration").arg(
@@ -103,6 +123,7 @@ fn field_arg() -> Arg {
 
 pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
     match args.subcommand() {
+        Some(("init", _)) => LoadMode::None,
         Some(("secret", secret_args)) => match secret_args.subcommand() {
             Some(("ref", _)) => LoadMode::None,
             Some(("set" | "check", _)) => LoadMode::VaultBootstrap,
@@ -116,6 +137,7 @@ pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
 #[tokio::main]
 pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
+        Some(("init", init_args)) => exec_init(ctx, init_args),
         Some(("secret", secret_args)) => exec_secret(ctx, secret_args).await,
         Some(("validate", validate_args)) => {
             let config_path = ctx.config_path.clone();
@@ -134,6 +156,53 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         ))),
         None => Ok(()),
     }
+}
+
+fn exec_init(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    let output_path = init_output_path(&ctx, args);
+    let force = args.get_flag("force");
+    write_init_config(&output_path, force)?;
+
+    println!("created {}", output_path.display());
+    println!("next steps:");
+    println!(
+        "  printf '%s' \"$SMTP_PASSWORD\" | monoengine --config {} config secret set mail.password --vault-path config/prod/mail/password --field value --value-stdin",
+        output_path.display()
+    );
+    println!(
+        "  monoengine --config {} config validate --resolve-secrets",
+        output_path.display()
+    );
+
+    Ok(())
+}
+
+fn init_output_path(ctx: &CommandContext, args: &ArgMatches) -> PathBuf {
+    args.get_one::<PathBuf>("output")
+        .cloned()
+        .or_else(|| ctx.config_path.clone())
+        .unwrap_or_else(|| PathBuf::from("config/config.toml"))
+}
+
+fn write_init_config(output_path: &Path, force: bool) -> Result<(), MegaError> {
+    if output_path.exists() && !force {
+        return Err(MegaError::Other(format!(
+            "{} already exists; pass --force to overwrite",
+            output_path.display()
+        )));
+    }
+
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let base_dir = crate::config::mega_base();
+    let content = config_init_template(&base_dir);
+    fs::write(output_path, content)?;
+
+    Ok(())
 }
 
 async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
@@ -288,6 +357,35 @@ mod tests {
         };
 
         assert_eq!(load_mode(&matches), LoadMode::None);
+    }
+
+    #[test]
+    fn config_init_uses_no_config_load_mode() {
+        let matches = cli().try_get_matches_from(["config", "init"]).unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::None);
+    }
+
+    #[test]
+    fn config_init_writes_safe_skeleton() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        write_init_config(&config_path, false).expect("init config should write");
+        let content = fs::read_to_string(&config_path).expect("init config should be readable");
+        let config = Config::load_str(&content).expect("init config should parse");
+        config.validate().expect("init config should validate");
+
+        assert!(!content.contains("postgres://mono:mono@"));
+        assert!(!content.contains("postgres://mega:mega@"));
+        assert!(!content.contains("postgres://postgres:postgres@"));
+        assert!(!content.contains("password = "));
+        assert!(content.contains("password_ref = "));
+
+        let err = write_init_config(&config_path, false).expect_err("existing file should fail");
+        assert!(err.to_string().contains("--force"));
+
+        write_init_config(&config_path, true).expect("force should overwrite");
     }
 
     #[test]

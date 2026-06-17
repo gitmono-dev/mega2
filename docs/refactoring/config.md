@@ -9,10 +9,10 @@
 > **事实校准（2026-06-18 复核）：** 本文档已按 `vault.md` 的 2026-06-17 落地状态和当前 `src/` 重新校准。与早期草案相比，多个原本作为前置的能力已经完成，后续执行必须以本节和“当前实现状态速览表”为准，不要按旧阶段重复实现。需特别注意以下事实：
 > 1. **`Config` 已迁入顶层 `src/config/`，调用方已迁到 `crate::config`。** 阶段 1 的物理模块提升和阶段 3 的路径迁移已完成，`src/common/config.rs` shim 已移除；`model.rs` 已承接 `Config` 及各领域子配置结构体，`source.rs` 已承接 source 构建，`expand.rs` 已承接占位符展开函数；`error.rs` 已承接首批占位符诊断错误；`validate.rs` 已承接首批集中校验（database/mail/Buck）和 `config validate` 文件级未消费字段 warning。`Config` 当前含 `mail: Option<MailConfig>`，但仍不含 `oauth` 字段，也无 `OAuthConfig`；`[oauth]` 仍没有运行期消费者。
 > 2. **mail 已是真实后置消费者，且已接入 `password_ref`。** `MailConfig` 已包含兼容期 `password: Option<SecretString>` 与推荐的 `password_ref: Option<SecretRef>`，两者互斥；明文 `password` 路径会输出 deprecation warning，`SecretString` 的 Debug/Serialize 输出脱敏，明文只在 `SmtpMailer::new` 适配层显式暴露。`AppContext::new` 在 `VaultCore::new` 之后解析 `mail.password_ref`，再通过 `SmtpMailer::new_with_password` 构造 mailer。SMTP 构造失败现在返回可诊断错误，不再由 `if let Ok(...)` 静默吞掉。
-> 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。仍未实现的是 `config init`、Profile、RawSources/source diagnostics 的完整语义，以及 `src/config/` 的错误、校验、初始化、测试和热加载职责子模块。
+> 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config init`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config init` 走 `LoadMode::None`，只写安全配置骨架；`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。仍未实现的是 Profile、RawSources/source diagnostics 的完整语义，以及 `src/config/` 的错误、校验、测试和热加载职责子模块。
 > 4. **SecretRef 与 resolver 已实现首批。** `src/config/secret.rs` 定义 `SecretRef`、`SecretResolver`、`VaultSecretResolver`，支持 `vault://secret/<name>#<field>`、缓存 TTL、`evict`/`evict_all`，并拒绝 `secret/secret/...` 等错误路径。
 > 5. **Vault 生产化前置的核心子集已完成。** `VaultCore` 已 Result 化、key 缺失 fail-closed、不再因 `core_key.json` 缺失清空 vault 表；`core_key.json` 不再长期保存 root token，只保存 unseal shares 和限权 runtime tokens；root token / shares 不再输出到 stdout、stderr 或 tracing；key 目录和文件在 Unix 下收紧到 `0700` / `0600`；常规 secret 访问使用限权 token 并记录 `vault_audit` 事件。残余风险是：自动解封材料仍落在本地 key 文件中，磁盘读取攻击者仍可获得解封能力，仍需部署侧 KMS/secret manager 与备份恢复流程。
-> 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 testing/reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、`config init`、Profile、完整 source diagnostics/未知字段告警、样例/测试配置分层、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。
+> 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 testing/reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、Profile、完整 source diagnostics/未知字段告警、样例/测试配置分层、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。`config init` 已有首批可执行入口，后续只需围绕模板治理、样例校验和 source diagnostics 继续收敛。
 
 > **本文档性质说明**：本文档同时承担“现状分析”和“改进设计方案”两种角色。早期章节中保留的架构解释仍有价值，但所有“未实现/前置/阶段”判断均以 2026-06-18 再基线为准。本文档的可执行入口已经从“先实现 Vault/LoadMode/SecretRef”切换为“在已完成这些能力的基础上，继续做 `src/config` 内部拆分、诊断/初始化/profile/测试分层/热加载”。
 
@@ -31,7 +31,7 @@
 | Vault 管理的 secret            | 已扩展     | 现有直接消费者包括 `ssh_server_key`、PGP、Nostr、PKI 以及首批配置 SecretRef（`mail.password_ref` → `secret/config/...`）。 |
 | `core_key.json` + 自动解封     | 已加固 | JSON 存储 unseal shares + 限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不 `delete_all()`；token/root/shares 不输出到日志。 |
 | Profile / `config.<profile>.toml` | **未实现** | `src/config/loader.rs` 完全没有 profile 逻辑。 |
-| `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现；`config validate` 已输出首批未消费字段 warning。`config init`、profile、完整 source diagnostics 仍未实现。 |
+| `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现；`config validate` 已输出首批未消费字段 warning。profile、完整 source diagnostics 仍未实现。 |
 | 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项和 Buck 限制；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`；`config validate` 已对 `[oauth]` 和 `[mail].smtp_tls`/`[mail].tls` 输出 warning。端口范围、对象存储、任意未知字段和完整 source diagnostics 仍待补齐。 |
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
@@ -258,7 +258,7 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 3. **secret 解析是 vault 就绪后的独立异步阶段，不在 `Config::new` 内。** `Config::new` 同步且 vault 尚未就绪，无法在加载流水线内解析 secret。`Config::new` 只产出**未解析的 `SecretRef`**；服务运行时的真实值由 resolver 在 `AppContext` 中的 vault 就绪后、按消费端依赖顺序异步解析。
 4. **`config secret` 命令必须继续只使用最小 DB/Vault bootstrap。** 当前 `config secret set/check` 已按此原则实现：只建立 vault 所需的数据库能力和 `VaultStorage`，不初始化 Redis、对象存储、HTTP/SSH 服务或后台任务。后续新增 secret 命令或 `config init` 不能退回完整 `AppContext`。
 5. **Vault 加固核心子集已完成，但生产部署仍需恢复与托管策略。** fail-closed、权限收紧、root token 脱敏/退役和限权 token 已落地；后续 config 工作可以基于这些能力继续推进。剩余安全边界是本地自动解封 key material 的托管、备份恢复、KMS/secret manager 接入和演练。
-6. **CLI 两阶段加载模型已落地，后续需补齐 `config init` 和 source diagnostics。** 当前 `cli::parse` 已先解析子命令，再按 `LoadMode` 选择 `None`、`VaultBootstrap`、`ParsedConfig` 或 `FullAppContext`。`config init` 仍需在无配置/坏配置场景下可运行，`RawSources`/source diagnostics 仍需形成完整实现。
+6. **CLI 两阶段加载模型已落地，后续需补齐 source diagnostics。** 当前 `cli::parse` 已先解析子命令，再按 `LoadMode` 选择 `None`、`VaultBootstrap`、`ParsedConfig` 或 `FullAppContext`。`config init` 已按 `LoadMode::None` 实现，可在无配置/坏配置场景下生成安全骨架；`RawSources`/source diagnostics 仍需形成完整实现。
 
 ### 目标
 
@@ -266,9 +266,9 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 - 对外 API 已收敛到顶层 `crate::config::Config`、`crate::config::loader::ConfigLoader` 等路径；后续新增调用方应直接使用 `crate::config`，不得重新引入 `common::config` 兼容入口。
 - 为集中校验、错误诊断、占位符规则、环境变量规则测试提供完整实现；受控热加载作为**独立后续阶段**落地，不与拆分/迁移捆绑。
 - 将**可迁移凭据**与普通配置分离：这些字段在配置文件中只保存 `vault` 引用（`SecretRef`），真实值存储在 `vault` 模块中。**数据库凭据等引导配置不在此列**，继续随启动配置提供。
-- 分阶段完成消费端改造：先完成路径迁移，再补齐错误模型、source diagnostics、`config init`、Profile 与测试分层；已完成的 CLI LoadMode、SecretRef 和 `config secret` 能力不应在后续阶段重复实现。
+- 分阶段完成消费端改造：先完成路径迁移，再补齐错误模型、source diagnostics、Profile 与测试分层；已完成的 CLI LoadMode、SecretRef、`config secret` 和 `config init` 首批能力不应在后续阶段重复实现。
 - 明确 `config/config.toml` 的定位：它不应继续作为“全项目测试时顺手使用的运行配置”，而应演进为可提交、可校验、无真实 secret、适合本地开发和 CI 参考的基础样例配置；自动化测试应使用独立的测试配置生成与覆盖机制。
-- 在已落地的 `monoengine config secret ref/set/check` 与 `config validate --resolve-secrets` 基础上，补齐 `config init`、配置 source diagnostics、Profile 和样例校验；数据库密码、Redis URL、当前阶段的对象存储 key 等引导或早期依赖不通过本项目 vault 写入。
+- 在已落地的 `monoengine config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 基础上，补齐配置 source diagnostics、Profile 和样例校验；数据库密码、Redis URL、当前阶段的对象存储 key 等引导或早期依赖不通过本项目 vault 写入。
 - 将 README、`config/config.toml`、默认模板和配置实现保持同步，避免用户看到的加载优先级与实际行为不一致。
 
 ### 建议目录结构
@@ -294,7 +294,7 @@ src/config/
 
 其中 `mod.rs` 只承担编排和导出职责，例如对外暴露 `Config`、`ConfigLoader`、`ConfigError`，并隐藏内部的 `source`、`expand` 等实现细节。业务代码应改为通过 `crate::config::Config` 获取类型，使 `config` 成为与 `common`、`commands`、`context` 等并列的一级模块。
 
-消费端路径迁移已经完成，后续新增代码应直接引用 `crate::config::*`。接下来再分别补错误模型、source diagnostics、`config init`、Profile 与测试分层。CLI 加载模型、SecretRef/resolver 和 mail 消费端已是基线，拆分时应迁移既有实现而不是重写。任何新增 `SecretRef` 消费端都必须先通过依赖表确认其初始化晚于 vault。
+消费端路径迁移已经完成，后续新增代码应直接引用 `crate::config::*`。接下来再分别补错误模型、source diagnostics、Profile 与测试分层，并继续治理 `config init` 生成模板和样例校验。CLI 加载模型、SecretRef/resolver、`config init` 和 mail 消费端已是基线，拆分时应迁移既有实现而不是重写。任何新增 `SecretRef` 消费端都必须先通过依赖表确认其初始化晚于 vault。
 
 ### 模块职责划分
 
@@ -542,7 +542,7 @@ Config::new                         # 产出含未解析 SecretRef 的 Config
 
 ### `config` 命令与初始化流程
 
-为降低配置初始化和敏感数据写入的使用门槛，顶层 `config` 子命令族已经部分落地，入口在 `src/commands/config.rs` 并已注册到 `src/commands/mod.rs`。当前可用能力包括 `config validate`、`config validate --resolve-secrets`、`config secret ref`、`config secret set`、`config secret check`；尚缺 `config init`、完整 source diagnostics、Profile 与模板生成。
+为降低配置初始化和敏感数据写入的使用门槛，顶层 `config` 子命令族已经部分落地，入口在 `src/commands/config.rs` 并已注册到 `src/commands/mod.rs`。当前可用能力包括 `config init`、`config validate`、`config validate --resolve-secrets`、`config secret ref`、`config secret set`、`config secret check`；尚缺完整 source diagnostics、Profile 与样例/模板治理。
 
 CLI 执行模型也已调整为按命令声明加载层级。后续新增命令时，不要绕过 `LoadMode`，而应在命令注册层补齐对应加载模式：
 
@@ -555,7 +555,7 @@ enum LoadMode {
 }
 ```
 
-CLI 先解析全局参数和子命令，再根据命令声明的 `LoadMode` 执行对应加载。这样可以保证 `config secret ref` 不读取配置，`config secret set/check` 只建立 DB/Vault 最小上下文，`service http` 才构造完整 `AppContext`。新增 `config init` 时应使用“不依赖配置解析”的加载模式，保证无配置或坏配置时也可运行。
+CLI 先解析全局参数和子命令，再根据命令声明的 `LoadMode` 执行对应加载。这样可以保证 `config init` 和 `config secret ref` 不读取配置，`config secret set/check` 只建立 DB/Vault 最小上下文，`service http` 才构造完整 `AppContext`。`config init` 已使用“不依赖配置解析”的加载模式，保证无配置或坏配置时也可运行。
 
 | 命令类型 | 需要的加载层级 | 说明 |
 | --- | --- | --- |
@@ -574,14 +574,16 @@ monoengine config validate --resolve-secrets       # 已实现
 monoengine config secret ref mail.password ...     # 已实现
 monoengine config secret set mail.password ...     # 已实现，只支持 mail.password
 monoengine config secret check mail.password ...   # 已实现，只支持 mail.password
-monoengine config init                             # 待实现
+monoengine config init                             # 已实现，默认写入 --config 或 config/config.toml
+monoengine config init --output /path/config.toml  # 已实现，指定输出路径
+monoengine config init --force                     # 已实现，覆盖已有文件
 ```
 
-其中 `config init` 应作为下一批实现的初始化入口，负责生成配置骨架和敏感字段引用，但不写入真实敏感值；已实现的 `config secret set` 负责把真实敏感值写入 `vault`；`config secret check` 负责检查配置中的 `SecretRef` 是否可解析且具备权限；`config validate` 负责校验普通配置、字段语义和可选的 secret 解析链路。
+其中 `config init` 已作为初始化入口落地，负责生成配置骨架和敏感字段引用，但不写入真实敏感值；已实现的 `config secret set` 负责把真实敏感值写入 `vault`；`config secret check` 负责检查配置中的 `SecretRef` 是否可解析且具备权限；`config validate` 负责校验普通配置、字段语义和可选的 secret 解析链路。
 
 > **引导顺序约束（重要）：** `config secret set`/`check` 与 `validate --resolve-secrets` 都需要 vault，而 vault 需要可用的数据库。因此这些子命令必须先建立数据库连接、初始化/解封 vault，再读写 secret；在数据库尚未就绪的全新机器上**无法**直接执行 `secret set`。它们只能写入晚于 vault 消费的可迁移凭据，不能用于数据库密码、Redis URL 或当前阶段的对象存储 key。`config init` 与不带 `--resolve-secrets` 的 `config validate` 则只操作配置文件、不依赖 vault，可在裸机执行。命令实现应在缺少数据库/vault 时给出明确的前置步骤提示，而不是 panic，也不得为了访问 vault 构造完整 `AppContext`。
 
-`config init` 的职责应保持清晰：创建或检查 `config/config.toml`，写入基础样例配置，派生 `${base_dir}`、日志目录、缓存目录和本地对象存储目录，为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单。示例应尽量贴近当前 schema，**只为真实存在的字段生成占位引用**。
+`config init` 的职责应保持清晰：创建或检查目标配置文件（默认使用全局 `--config`，否则写入 `config/config.toml`；也可用 `--output` 指定路径），写入基础样例配置，派生 `${base_dir}`、日志目录、缓存目录和本地对象存储目录，为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单。默认不覆盖已有文件，只有显式传入 `--force` 才会覆盖。示例应尽量贴近当前 schema，**只为真实存在的字段生成占位引用**。
 
 > 注意：下面的 `[mail]` 示例对应 `MailConfig` 的字段形态（扁平结构：`enabled`/`smtp_host`/`smtp_port`/`username`/`password`/`password_ref`/`from`/`starttls`）。**该结构现已作为 `MailConfig` 接入 `Config`**，且 `password_ref` 已可由 resolver 解析，因此 `config init` 可以直接生成 `password_ref` 占位。两点提示：(1) 仓库样例用 `starttls = false`、端口 `2525` 关闭了 STARTTLS，仅适合本地开发，`config init` 生成生产骨架时应使用安全默认；(2) 样例里的 `smtp_tls`/`tls` 是 `MailConfig` 不识别的字段，会被 serde 丢弃，不应写入生成结果。
 
@@ -700,7 +702,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 **阶段 0 — 文档再基线与执行清单收敛（当前文档修订）**
 
 1. 删除或降级仍把 `LoadMode`、最小 bootstrap、`config secret`、SecretRef、`mail.password_ref`、Vault fail-closed 当作未实现前置的表述。
-2. 把后续计划聚焦到仍未落地的 config 工作：模块拆分、错误模型、redaction/SecretString、`config init`、Profile、source diagnostics、样例/测试配置分层、CI 校验和热加载。
+2. 把后续计划聚焦到仍未落地的 config 工作：模块拆分、错误模型、redaction/SecretString、Profile、source diagnostics、样例/测试配置分层、CI 校验和热加载；`config init` 只保留模板治理和样例校验的后续收敛项。
 3. 更新实施前检查清单，确保每个阶段先确认“已完成基线”，避免重复施工。
 
 > **验收标准**：本文档可以直接指导下一阶段实现；读者不会把已完成的 Vault/LoadMode/SecretRef 工作误判为阻塞项或待办项。
@@ -733,12 +735,12 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 **阶段 4 — `config init` 与 source diagnostics**
 
-15. 新增 `monoengine config init`，只操作配置文件和模板，不连接数据库或 vault，不接收或写入真实 secret。
-16. `config init` 生成安全默认骨架：不写入可预测生产密码；数据库、Redis、当前对象存储凭据只给 env/部署 secret 指引；对 `mail.password_ref` 可生成 SecretRef 占位。
+15. 已完成首批：新增 `monoengine config init`，只操作配置文件和模板，不连接数据库或 vault，不接收或写入真实 secret；命令走 `LoadMode::None`，支持默认路径、全局 `--config`、`--output` 和 `--force`。
+16. 已完成首批：`config init` 生成安全默认骨架，不写入可预测生产密码；数据库、Redis、当前对象存储凭据只给 env/部署 secret 指引；对 `mail.password_ref` 生成 SecretRef 占位，并提示后续使用 `config secret set --value-stdin` 写入真实值。
 17. 补齐 `RawSources`/source diagnostics：坏 TOML、坏环境变量类型、未知字段、废弃字段、占位符错误、profile 冲突等应能在不构造完整 `AppContext` 的情况下报告。
 18. 保持已实现的 `config secret ref/set/check` 行为：只允许 `mail.password` 等后置可迁移凭据，继续拒绝 database/redis/object storage 凭据。
 
-> **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例；`config validate` 能在坏配置时输出诊断而非被预加载拦截；`config secret ref/set/check` 的既有测试继续通过。
+> **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例，且生成结果可解析、可校验、无明文密码字段；`config validate` 能在坏配置时输出诊断而非被预加载拦截；`config secret ref/set/check` 的既有测试继续通过。
 
 **阶段 5 — 基础样例配置、Profile 与测试配置分层 + CI**
 
@@ -784,7 +786,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 | **7** | 热加载 | 复用 resolver 缓存/evict 能力 | 按白名单订阅 mail/notification 可热更新字段 |
 
 **关键同步点：**
-1. 已完成的 `LoadMode`/最小 bootstrap/SecretRef 是后续 `config init`、source diagnostics 和测试分层的可复用基础。
+1. 已完成的 `LoadMode`/最小 bootstrap/SecretRef 是 `config init`、后续 source diagnostics 和测试分层的可复用基础。
 2. redaction/SecretString 仍是 config 自身的安全补强项，但不再阻塞 vault fail-closed 或 `mail.password_ref` 首批接入。
 3. 对象存储凭据迁入 vault 仍是可选后续专项；在专项完成前，文档和样例都不得暗示 `object_storage.*` 可使用本项目 Vault `SecretRef`。
 
@@ -796,7 +798,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - **Secret 轮转时的双凭据过渡开销**：两阶段凭据轮转可以降低切换中断风险，但 fallback 不应成为所有 secret 的默认行为。应将多版本读取能力封装在 `SecretResolver` 或专门适配层中，由消费端按外部系统语义决定是否回退。
 - **包装类型（SecretString）在网络传输与持久化中的误暴露**：尽管 `SecretString` 在 Rust 代码中能有效防止 `Debug` 泄露，但在将其序列化（如写入外部监控日志、通过 OpenAPI 接口返回、或者保存到临时数据库中）时，如果序列化库（如 `serde`）未正确配置，仍可能会提取其明文。必须在编译期实施 lints 或强制配置 `#[serde(skip_serialize)]` 规则。
 - **当前对象存储和 Redis 也是早期依赖。** `Storage::new` 会在 vault 就绪前构造对象存储，`AppContext::new` 会在 vault 就绪前连接 Redis；因此 S3 access key、带密码的 Redis URL 等字段不能直接按“可迁移凭据”处理，除非先重构初始化顺序。
-- **CLI 两阶段加载已是基线。** 后续新增 `config init`、RawSources/source diagnostics 或 profile 命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
+- **CLI 两阶段加载已是基线。** `config init` 已使用 `LoadMode::None`；后续新增 RawSources/source diagnostics、profile 或其它配置命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
 - **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction。剩余主要是外部服务 URL、对象存储 key、兼容期 `mail.password`、SecretRef URI，以及更多配置/source 诊断路径的统一 redaction。
 - **`core_key.json` 加固核心已完成，但部署侧托管仍是生产边界。** fail-closed、权限收紧、root token 脱敏/退役已落地；把更多凭据放入 vault 仍不抵御能读取 key 文件的攻击者，生产使用必须配套 KMS/secret manager、受控挂载、备份恢复和恢复演练。
 - **采用分阶段切换。** 顶层迁移和调用方路径迁移已完成；后续内部拆分、错误模型、初始化命令和热加载仍必须各自独立评审，不追求“单次变更内完成全部改造”。
@@ -814,7 +816,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - 拆分后仍应保持配置对象运行期只读共享，避免在业务流程中重新解析配置或隐式改变运行时语义。
 - **BuckConfig::validate() 的启动期 panic 已清理。** `src/config/validate.rs` 已吸收 Buck 校验，`Storage::new` 复用该入口并在非法配置时返回 `MegaError`；剩余工作是把更多启动期配置错误前移到 `Config::validate()` / source diagnostics，并补来源路径与修复建议。
 - **环境变量注入的可见性风险**：引导配置通过 `MEGA_*` 环境变量注入时，需意识到 `/proc/<pid>/environ`、systemd journal、容器 inspect 等场景的泄露风险。生产高敏感部署应优先使用文件挂载 secret，并通过占位符读取。
-- **config init 不得生成可预测默认密码**：`DbConfig::default()` 和当前 `config/config.toml` 中的硬编码密码（`postgres://mega:mega@...`）应在 `config init` 生成结果中移除，改为强制用户通过环境变量、文件挂载 secret 或部署平台 secret 注入；数据库密码不能通过本项目 vault 注入。
+- **config init 不生成可预测默认密码**：`config init` 生成结果已移除 `DbConfig::default()` 和当前 `config/config.toml` 中的硬编码密码（如 `postgres://mega:mega@...`），改为提示用户通过环境变量、文件挂载 secret 或部署平台 secret 注入；数据库密码不能通过本项目 vault 注入。
 - **`orion_server.db_url` 是外部服务凭据**，不在 monoengine vault 管理范围内。若 Orion 自身需要 secret 管理，应由 Orion 独立解决，monoengine 只作为客户端通过部署平台 secret 注入其连接参数。
 
 ### 开始下一阶段前的执行前置（2026-06-18）
@@ -824,7 +826,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 1. **确认阶段边界**
    - 阶段 1/3 已完成顶层移动、调用方路径迁移和 shim 移除，未改变错误语义、加载语义或消费端行为。
    - 阶段 2 才引入错误模型、redaction、SecretString 和集中校验。
-   - 阶段 4 才新增 `config init` 和完整 source diagnostics。
+   - 阶段 4 已新增 `config init` 首批能力，剩余重点是完整 source diagnostics。
 
 2. **复用已完成基线**
    - 不重新设计 `LoadMode` / `CommandContext` / `config secret`。
@@ -882,7 +884,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 1. 已完成：顶层结构迁移，`src/config/{mod,model,source,expand,loader,template,secret}.rs` 成为主实现，源码调用方已迁到 `crate::config`，`common::config` shim 已删除。
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
 3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`；首批 URL redaction、`SecretString` 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补未知字段诊断、更多配置规则和完整 source diagnostics。
-4. 初始化与诊断：新增 `config init`，补 RawSources/source diagnostics，生成安全默认模板和 `mail.password_ref` 占位。
+4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；继续补 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：把 `config/config.toml` 固定为基础样例，建立测试配置生成器、Profile 合并语义和 CI 配置校验矩阵。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
 7. 独立阶段：受控热加载，白名单字段生效，候选失败时保留旧配置。
@@ -904,5 +906,5 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [ ] 如果涉及 `mail`，已把工作聚焦在明文兼容治理、SecretString/redaction、source diagnostics 或 dispatcher 生命周期。
 - [x] 已在 `validate.rs`/`config validate` 中加入首批未知字段告警，覆盖当前 `[oauth]`、`[mail].smtp_tls` 和 `[mail].tls`。
 - [ ] 已计划同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
-- [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、`config init`、Profile、热加载分别单独提交。
+- [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、Profile、热加载分别单独提交，`config init` 模板治理不与这些阶段混合。
 - [ ] 计划在 CI 中增加配置样例（基础 + 生成 + profile + 坏输入）校验任务。

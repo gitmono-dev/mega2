@@ -42,7 +42,10 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
 
     let mode = load_mode(cmd, subcommand_args).ok_or_else(|| unknown_subcommand(cmd))?;
     let ctx = match mode {
-        LoadMode::None => CommandContext::default(),
+        LoadMode::None => CommandContext {
+            config: None,
+            config_path: matches.get_one::<PathBuf>("config").cloned(),
+        },
         LoadMode::ConfigPath | LoadMode::RawSources | LoadMode::VaultBootstrap => {
             let loaded = load_config_path(&matches)?;
             CommandContext {
