@@ -284,8 +284,9 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     if value.get("oauth").is_some() {
         warnings.push(ConfigWarning {
             field_path: "oauth".to_string(),
-            message: "[oauth] is currently ignored because OAuthConfig is not implemented"
-                .to_string(),
+            message:
+                "[oauth] is currently ignored because OAuthConfig is not implemented; remove the section until OAuthConfig is implemented"
+                    .to_string(),
         });
     }
 
@@ -347,7 +348,7 @@ fn is_reserved_mega_env_var(variable: &str) -> bool {
 fn environment_warning_for(variable: &str, field_path: &str) -> Option<EnvironmentConfigWarning> {
     let message = if field_path == "oauth" || field_path.starts_with("oauth.") {
         format!(
-            "{variable} maps to {field_path}, but [oauth] is currently ignored because OAuthConfig is not implemented"
+            "{variable} maps to {field_path}, but [oauth] is currently ignored because OAuthConfig is not implemented; remove the variable until OAuthConfig is implemented"
         )
     } else if matches!(field_path, "mail.smtp_tls" | "mail.tls") {
         format!(
@@ -355,7 +356,7 @@ fn environment_warning_for(variable: &str, field_path: &str) -> Option<Environme
         )
     } else if !is_known_field_path(field_path) {
         format!(
-            "{variable} maps to {field_path}, which is not recognized by Config and will be ignored"
+            "{variable} maps to {field_path}, which is not recognized by Config and will be ignored; remove the variable or use a supported MEGA_* field path"
         )
     } else {
         return None;
@@ -416,7 +417,7 @@ fn collect_unknown_fields(
             warnings.push(ConfigWarning {
                 field_path: display_field_path.clone(),
                 message: format!(
-                    "{display_field_path} is not recognized by Config and will be ignored"
+                    "{display_field_path} is not recognized by Config and will be ignored; remove the field or add it to Config before relying on it"
                 ),
             });
             continue;
@@ -930,6 +931,11 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.message.contains("not recognized by Config"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("supported MEGA_* field path"))
         );
     }
 

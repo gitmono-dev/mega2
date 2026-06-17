@@ -450,6 +450,7 @@ mod test {
         assert!(message.contains("log.print_std"));
         assert!(message.contains("expected a boolean"));
         assert!(message.contains("value is redacted"));
+        assert!(message.contains("remove the override"));
         assert!(!message.contains("not_bool_secret"));
     }
 

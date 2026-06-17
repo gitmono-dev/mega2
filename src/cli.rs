@@ -322,6 +322,7 @@ mod tests {
         assert!(message.contains("MEGA_LOG__PRINT_STD"));
         assert!(message.contains("log.print_std"));
         assert!(message.contains("value is redacted"));
+        assert!(message.contains("remove the override"));
         assert!(!message.contains("not_bool_secret"));
     }
 }
