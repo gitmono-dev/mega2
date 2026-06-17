@@ -1,4 +1,7 @@
-use std::{ffi::OsStr, path::Path};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 use toml::Value;
@@ -20,6 +23,13 @@ const RESERVED_MEGA_ENV_VARS: &[&str] = &[
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
+    pub field_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileConfigWarning {
+    pub source_path: PathBuf,
     pub field_path: String,
     pub message: String,
 }
@@ -266,6 +276,19 @@ fn validate_http_url(field_path: &str, value: &str) -> Result<(), MegaError> {
 }
 
 pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
+    for warning in known_unconsumed_file_fields(path)? {
+        tracing::warn!(
+            path = %warning.source_path.display(),
+            field = %warning.field_path,
+            "{}",
+            warning.message
+        );
+    }
+
+    Ok(())
+}
+
+pub fn known_unconsumed_file_fields(path: &Path) -> Result<Vec<FileConfigWarning>, MegaError> {
     let content = std::fs::read_to_string(path)?;
     let value = toml::from_str::<Value>(&content).map_err(|e| {
         MegaError::Other(format!(
@@ -274,16 +297,14 @@ pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
         ))
     })?;
 
-    for warning in known_unconsumed_fields(&value) {
-        tracing::warn!(
-            path = %path.display(),
-            field = %warning.field_path,
-            "{}",
-            warning.message
-        );
-    }
-
-    Ok(())
+    Ok(known_unconsumed_fields(&value)
+        .into_iter()
+        .map(|warning| FileConfigWarning {
+            source_path: path.to_path_buf(),
+            field_path: warning.field_path,
+            message: warning.message,
+        })
+        .collect())
 }
 
 pub fn warn_unconsumed_environment_fields() {
@@ -925,6 +946,39 @@ mod tests {
         assert!(fields.contains(&"object_storage.s3.unexpected"));
         assert!(fields.contains(&"mail.extra"));
         assert!(fields.contains(&"sidebar.default_items[0].icon"));
+    }
+
+    #[test]
+    fn known_unconsumed_file_fields_include_source_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [mail]
+            smtp_tls = false
+
+            [database]
+            typo = true
+            "#,
+        )
+        .expect("write profile config");
+
+        let warnings =
+            known_unconsumed_file_fields(&profile_path).expect("profile diagnostics should parse");
+
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.source_path == profile_path)
+        );
+        assert!(warnings.iter().any(|warning| {
+            warning.field_path == "mail.smtp_tls" && warning.message.contains("mail.starttls")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.field_path == "database.typo" && warning.message.contains("not recognized")
+        }));
     }
 
     #[test]
