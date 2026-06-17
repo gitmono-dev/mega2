@@ -108,6 +108,14 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    fn assert_no_predictable_credentials(rendered: &str) {
+        for (username, password) in [("mono", "mono"), ("mega", "mega"), ("postgres", "postgres")] {
+            let db_url_userinfo = ["postgres://", username, ":", password, "@"].concat();
+            assert!(!rendered.contains(&db_url_userinfo));
+        }
+        assert!(!rendered.contains(&["password", " = "].concat()));
+    }
+
     #[test]
     fn config_init_template_parses_and_avoids_plaintext_credentials() {
         let rendered = config_init_template(Path::new("/tmp/monoengine"));
@@ -115,10 +123,17 @@ mod tests {
         let config = Config::load_str(&rendered).expect("init template should parse");
         config.validate().expect("init template should validate");
 
-        assert!(!rendered.contains("postgres://mono:mono@"));
-        assert!(!rendered.contains("postgres://mega:mega@"));
-        assert!(!rendered.contains("postgres://postgres:postgres@"));
-        assert!(!rendered.contains("password = "));
+        assert_no_predictable_credentials(&rendered);
         assert!(rendered.contains("password_ref = "));
+    }
+
+    #[test]
+    fn bundled_config_template_parses_and_avoids_plaintext_credentials() {
+        let rendered = default_config_template("monoengine").expect("default template");
+
+        let config = Config::load_str(rendered).expect("bundled template should parse");
+        config.validate().expect("bundled template should validate");
+
+        assert_no_predictable_credentials(rendered);
     }
 }

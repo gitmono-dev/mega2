@@ -79,7 +79,7 @@ impl Default for DbConfig {
         Self {
             db_type: String::from("postgres"),
             db_path: PathBuf::new(),
-            db_url: String::from("postgres://mega:mega@localhost:5432/mega"),
+            db_url: String::from("postgres://localhost:5432/mega"),
             max_connection: 16,
             min_connection: 8,
             acquire_timeout: 5,
@@ -509,7 +509,7 @@ fn default_log_stream_buffer() -> usize {
 }
 
 fn default_db_url() -> String {
-    "postgres://postgres:postgres@localhost/orion".to_string()
+    "postgres://localhost/orion".to_string()
 }
 
 fn default_port() -> u16 {

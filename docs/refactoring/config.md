@@ -12,7 +12,7 @@
 > 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config init`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config init` 走 `LoadMode::None`，只写安全配置骨架；`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`--profile` / `MEGA_PROFILE` 与 `src/config/testing.rs` 已完成首批。仍未实现的是 RawSources/source diagnostics 的完整语义，以及 `src/config/` 的热加载职责子模块。
 > 4. **SecretRef 与 resolver 已实现首批。** `src/config/secret.rs` 定义 `SecretRef`、`SecretResolver`、`VaultSecretResolver`，支持 `vault://secret/<name>#<field>`、缓存 TTL、`evict`/`evict_all`，并拒绝 `secret/secret/...` 等错误路径。
 > 5. **Vault 生产化前置的核心子集已完成。** `VaultCore` 已 Result 化、key 缺失 fail-closed、不再因 `core_key.json` 缺失清空 vault 表；`core_key.json` 不再长期保存 root token，只保存 unseal shares 和限权 runtime tokens；root token / shares 不再输出到 stdout、stderr 或 tracing；key 目录和文件在 Unix 下收紧到 `0700` / `0600`；常规 secret 访问使用限权 token 并记录 `vault_audit` 事件。残余风险是：自动解封材料仍落在本地 key 文件中，磁盘读取攻击者仍可获得解封能力，仍需部署侧 KMS/secret manager 与备份恢复流程。
-> 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、环境变量/profile 来源诊断、样例/测试配置分层的全仓迁移、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。`config init`、Profile、raw TOML 未知字段 warning 和 testing helper 已有首批可执行入口，后续只需围绕模板治理、样例校验和完整 source diagnostics 继续收敛。
+> 6. **当前真正未落地的 config 主线工作**：`src/config/` 继续拆出 reload 等职责、收敛剩余加载错误模型、扩展 redaction/SecretString 覆盖、环境变量/profile 来源诊断、测试配置分层的全仓迁移、CI 配置校验矩阵、受控热加载，以及可选的对象存储后置初始化重构。`config init`、Profile、基础样例凭据治理、raw TOML 未知字段 warning 和 testing helper 已有首批可执行入口，后续只需围绕模板治理、样例校验矩阵和完整 source diagnostics 继续收敛。
 
 > **本文档性质说明**：本文档同时承担“现状分析”和“改进设计方案”两种角色。早期章节中保留的架构解释仍有价值，但所有“未实现/前置/阶段”判断均以 2026-06-18 再基线为准。本文档的可执行入口已经从“先实现 Vault/LoadMode/SecretRef”切换为“在已完成这些能力的基础上，继续做 `src/config` 内部拆分、诊断/初始化/profile/测试分层/热加载”。
 
@@ -45,8 +45,7 @@
 - `mail.password` 明文字段仍为兼容期入口；首批 deprecation warning 与 `SecretString` 防误打印已落地，后续仍需在 source diagnostics 和样例/模板中继续推动生产配置使用 `mail.password_ref`。
 - Vault 初始化/解封的旧泄露路径已清理；当前残余风险是自动解封材料仍落在 `core_key.json`，需要备份恢复和部署侧凭据注入/KMS 策略配套。
 - `mega_base()` / `mega_cache()`（`src/config/mod.rs`）的早期 panic（`BaseDirs::new().unwrap()` 等）。
-- `DbConfig::default()`（`src/config/model.rs`）和 `config/config.toml`（`:28`）里的硬编码可预测凭据（`postgres://mega:mega@...`、`postgres://mono:mono@...`）。
-- Orion 自己也有一份 `postgres://postgres:postgres@...`（`config/config.toml:242`、`src/config/model.rs`）。
+- `DbConfig::default()`、`OrionServerConfig` 默认值和 `config/config.toml` 的首批可预测 PostgreSQL userinfo 已清理；真实数据库凭据仍必须通过 `MEGA_*`、文件挂载 secret 或部署平台 secret 注入，不能进入本项目 vault。
 
 ## 已落地的 mail/notification 子系统现状（2026-06-09）
 
@@ -148,7 +147,7 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 
 - `base_dir`：基础目录，`${base_dir}` 占位符的来源。
 - `log`：日志输出方式、级别、ANSI 颜色、文件滚动等（`LogConfig`）。
-- `database`：SeaORM 数据库连接配置（`DbConfig`；注意 `DbConfig::default()` 在 `db_url` 中内嵌了用户名/密码，见敏感数据章节）。
+- `database`：SeaORM 数据库连接配置（`DbConfig`；数据库凭据属于引导配置，不能进入本项目 vault，见敏感数据章节）。
 - `monorepo`：monorepo 根目录、导入目录和 Git 相关路径（`MonoConfig`）。
 - `pack`：Git pack 解码和对象处理相关参数（`PackConfig`）。
 - `lfs`：Git LFS 存储与传输相关配置（`LFSConfig`）。
@@ -349,7 +348,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 
 改造后应区分四类字段，而不是笼统地“把敏感数据搬进 vault”：
 
-1. **引导配置（必须留在 TOML/env，永不进本项目 vault）。** 典型是 `database`（连接地址、用户名、密码）。`DbConfig::default()` 的 `db_url = "postgres://mega:mega@localhost:5432/mega"`（`src/config/model.rs`）把密码内嵌在连接串中；仓库内的 `config/config.toml` 则使用 `postgres://mono:mono@localhost:5432/mono`（`config/config.toml:28`），两处都是硬编码可预测凭据。由于 vault 存在数据库里、连库才能起 vault，**数据库密码无法作为 vault SecretRef**——这是不可破的引导循环。这类凭据应通过环境变量注入（如 `MEGA_DATABASE__DB_URL` 或拆分后的 `MEGA_DATABASE__PASSWORD`），由部署平台的 secret 机制（K8s Secret、CI secret store 等）保护，**而不是交给本项目的 vault**。
+1. **引导配置（必须留在 TOML/env，永不进本项目 vault）。** 典型是 `database`（连接地址、用户名、密码）。当前 `DbConfig::default()` 与仓库基础样例 `config/config.toml` 已避免在默认 PostgreSQL URL 中嵌入可预测 userinfo，但这不改变边界：由于 vault 存在数据库里、连库才能起 vault，**数据库密码无法作为 vault SecretRef**——这是不可破的引导循环。这类凭据应通过环境变量注入（如 `MEGA_DATABASE__DB_URL` 或拆分后的数据库密码环境变量）、文件挂载 secret 或部署平台的 secret 机制（K8s Secret、CI secret store 等）保护，**而不是交给本项目的 vault**。
 2. **早期运行时依赖（当前也不能直接进 vault）。** 这类字段不是数据库引导项，但在 vault 就绪前或同一初始化阶段已经被消费。当前 `Storage::new` 在 `VaultCore::new` 之前构造对象存储，因此 `object_storage.s3.access_key_id`/`secret_access_key` 暂时不能直接改为 SecretRef；`AppContext::new` 在 vault 前连接 Redis，因此带密码的 `redis.url` 也应按引导/部署平台 secret 处理。若要让对象存储凭据进 vault，必须先把初始化顺序拆成“DB-only Storage -> Vault -> resolve object storage secrets -> 构造完整 Storage/服务”。
 3. **可迁移凭据（vault 就绪后才被使用，可改为 SecretRef）。** 这是“消费点晚于 vault 且不阻塞 `AppContext` 构造”的字段。**`mail.password_ref` 现在就是此类的第一个已落地成员**：`AppContext::new` 在 `VaultCore::new` 之后解析它，再把解析后的值交给 `SmtpMailer::new_with_password(...)`，随后启动 `EmailDispatcher`。明文 `mail.password` 仍作为兼容期入口存在，但已用 `SecretString` 包装并输出 deprecation warning；后续仍需补 source diagnostics 与样例治理，避免它经错误链或外部库边界泄露。未来新增 OAuth client secret、第三方 API key 等字段同理，只有确认其消费点晚于 vault 且不会阻塞 `AppContext` 构造，才可纳入此类。
 4. **非敏感运行参数。** 维持现状，明文留在 TOML。
@@ -487,7 +486,7 @@ Vault 加固核心子集已经完成：`core_key.json` 缺失时 fail-closed，�
 
 #### 安全前提：config init 默认密码处理
 
-当前 `DbConfig::default()` 和 `config/config.toml` 均包含硬编码密码（如 `postgres://mega:mega@...`）。`config init` 生成默认配置时必须避免生成可预测的默认密码：
+当前 `DbConfig::default()`、Orion 默认 DB URL、`config/config.toml` 和 `config init` 生成结果已完成首批可预测 PostgreSQL userinfo 清理。后续继续保持以下规则，避免默认配置重新写入可复用密码：
 
 - **数据库密码**：`config init` 不应在生成的 TOML 中写入默认密码；而是输出提示要求用户通过 `MEGA_DATABASE__DB_URL`、拆分后的数据库密码环境变量、文件挂载 secret 或部署平台 secret 机制注入。数据库密码**不得**通过 `config secret set` 写入本项目 vault。若必须提供本地开发默认值，应使用空字符串并在校验阶段报 `missing_database_url` 错误，或显式标注为仅本地开发可用。
 - **其他引导/早期凭据**：Redis URL、当前阶段的对象存储 key 等同样不在 `config init` 结果中预设真实凭据，也不能默认生成本项目 Vault SecretRef；只保留空字符串、示例占位符或部署平台 secret 注入说明。只有确认晚于 vault 消费且已真实接入 `Config` 的字段（例如已落地的 `mail.password_ref`）才可生成 `SecretRef` 占位符。
@@ -747,7 +746,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 **阶段 5 — 基础样例配置、Profile 与测试配置分层 + CI**
 
-19. 将 `config/config.toml` 改造为基础样例配置：移除真实生产密码或可复用生产凭据，保留与当前 schema 对齐的本地默认值与初始化指引；纳入配置样例校验。
+19. 已完成首批：`config/config.toml` 与模型默认 PostgreSQL URL 已移除可预测 userinfo，保留与当前 schema 对齐的本地默认值和 env/部署 secret 注入指引，并新增仓库默认样例解析、校验和无可预测凭据测试；后续继续补 CI 配置校验矩阵。
 20. 已完成首批：固定 Profile 文件命名、加载优先级、数组覆盖语义和 SecretRef namespace，并补充 profile 合并、profile/env 覆盖顺序和最小 vault bootstrap 合并测试；后续继续补完整 profile source diagnostics 与 CI 矩阵。
 21. 已完成首批：新增 `testing.rs`，提供 `TestConfigBuilder`、`isolated_config()`、`.env.test` 风格覆盖合并和 `TestSecretResolver`；后续继续把文件加载链路、Profile 合并结果和更多现有测试迁移到该 helper。
 22. 建立分层测试策略并接入 CI：单元测试用内存/最小 TOML，加载测试用临时文件，集成测试用 `.env.test` + `MEGA_CONFIG` 指向隔离配置；CI 覆盖基础样例、默认模板、`config init` 结果、profile 合并结果与测试配置生成结果。
@@ -819,7 +818,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - 拆分后仍应保持配置对象运行期只读共享，避免在业务流程中重新解析配置或隐式改变运行时语义。
 - **BuckConfig::validate() 的启动期 panic 已清理。** `src/config/validate.rs` 已吸收 Buck 校验，`Storage::new` 复用该入口并在非法配置时返回 `MegaError`；剩余工作是把更多启动期配置错误前移到 `Config::validate()` / source diagnostics，并补来源路径与修复建议。
 - **环境变量注入的可见性风险**：引导配置通过 `MEGA_*` 环境变量注入时，需意识到 `/proc/<pid>/environ`、systemd journal、容器 inspect 等场景的泄露风险。生产高敏感部署应优先使用文件挂载 secret，并通过占位符读取。
-- **config init 不生成可预测默认密码**：`config init` 生成结果已移除 `DbConfig::default()` 和当前 `config/config.toml` 中的硬编码密码（如 `postgres://mega:mega@...`），改为提示用户通过环境变量、文件挂载 secret 或部署平台 secret 注入；数据库密码不能通过本项目 vault 注入。
+- **默认配置不生成可预测默认密码**：`config init` 生成结果、`DbConfig::default()`、Orion 默认 DB URL 和当前 `config/config.toml` 已移除硬编码 PostgreSQL userinfo，改为提示用户通过环境变量、文件挂载 secret 或部署平台 secret 注入；数据库密码不能通过本项目 vault 注入。
 - **`orion_server.db_url` 是外部服务凭据**，不在 monoengine vault 管理范围内。若 Orion 自身需要 secret 管理，应由 Orion 独立解决，monoengine 只作为客户端通过部署平台 secret 注入其连接参数。
 
 ### 开始下一阶段前的执行前置（2026-06-18）
@@ -888,7 +887,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
 3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `unwrap`/`expect`，补更多配置规则、环境变量/profile 来源诊断和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；继续补 RawSources/source diagnostics。
-5. 样例/Profile/测试分层：测试配置生成器和 Profile 合并语义已完成首批；继续把 `config/config.toml` 固定为基础样例，并建立 CI 配置校验矩阵。
+5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义和基础样例凭据治理已完成首批；继续建立 CI 配置校验矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
 7. 独立阶段：受控热加载，白名单字段生效，候选失败时保留旧配置。
 

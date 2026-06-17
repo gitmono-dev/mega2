@@ -23,9 +23,11 @@ db_type = "postgres"
 # Deprecated compatibility field; ignored by PostgreSQL connections.
 db_path = ""
 
-# database connection url, set to "postgres://mono:mono@mono-pg:5432/mono" if you're using docker
-db_url = "postgres://mono:mono@localhost:5432/mono"
-#db_url = "postgres://mono:mono@127.0.0.1:5432/mono"
+# Database connection URL. This sample intentionally avoids embedding a
+# reusable password; inject credentials with MEGA_DATABASE__DB_URL or your
+# deployment secret mechanism when PostgreSQL requires auth.
+# Example for Docker without inline credentials: "postgres://mono-pg:5432/mono"
+db_url = "postgres://localhost:5432/mono"
 
 # Maximum number of database connections in the pool.
 # A good rule of thumb is to set this to ~2 × CPU cores.
@@ -237,8 +239,9 @@ port = 8004
 build_log_dir = "/tmp/megadir/buck2ctl"
 log_stream_buffer = 4096
 
-# Database configuration
-db_url = "postgres://postgres:postgres@localhost/orion"
+# Database configuration. Orion is an external service dependency; inject
+# credentials with deployment secrets or MEGA_ORION_SERVER__DB_URL.
+db_url = "postgres://localhost/orion"
 
 
 # Mono server base URL for file/blob API (file blob endpoint)

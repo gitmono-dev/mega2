@@ -103,6 +103,10 @@ loads `config.<name>.toml` next to the selected base config. CLI profile wins
 over `MEGA_PROFILE`, and the final merge order is base config, profile config,
 then `MEGA_*` environment overrides.
 
+The bundled config is a local sample and does not embed reusable database
+passwords. Inject real bootstrap credentials through `MEGA_DATABASE__DB_URL`,
+profile files, or your deployment secret mechanism.
+
 Key sections (see `config/config.toml` for the full list):
 
 | Section            | Purpose                                                                 |
