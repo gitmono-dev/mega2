@@ -158,7 +158,9 @@ impl VaultCore {
         db_config: &DbConfig,
         key_path: PathBuf,
     ) -> VaultResult<Self> {
-        let connection = database_connection(db_config).await;
+        let connection = database_connection(db_config)
+            .await
+            .map_err(|e| VaultError::DatabaseStorage(e.to_string()))?;
         Self::from_database_connection(Arc::new(connection), key_path).await
     }
 

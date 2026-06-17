@@ -59,6 +59,8 @@ pub enum VaultError {
     RustyVaultCreate(String),
     #[error("failed to inspect vault initialization state: {0}")]
     InitializationState(String),
+    #[error("failed to initialize vault database storage: {0}")]
+    DatabaseStorage(String),
     #[error("failed to initialize vault core: {0}")]
     Initialize(String),
     #[error("failed to unseal vault core: {0}")]

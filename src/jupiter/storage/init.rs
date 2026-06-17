@@ -12,17 +12,13 @@ use crate::{
 /// Create a PostgreSQL database connection.
 ///
 /// After a successful connection, applies any pending database migrations.
-pub async fn database_connection(db_config: &DbConfig) -> DatabaseConnection {
-    id_generator::set_up_options().unwrap();
+pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
+    id_generator::ensure_initialized();
 
-    let conn = postgres_connection(db_config)
-        .await
-        .expect("Cannot connect to PostgreSQL database");
-    apply_migrations(&conn, false)
-        .await
-        .expect("Failed to apply migrations");
+    let conn = postgres_connection(db_config).await?;
+    apply_migrations(&conn, false).await?;
 
-    conn
+    Ok(conn)
 }
 
 async fn postgres_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
@@ -67,5 +63,20 @@ pub mod test {
         config.db_type = "mysql".to_owned();
         config.db_url = "mysql://mono:mono@localhost:3306/mono_test".to_owned();
         assert!(validate_database_config(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn database_connection_returns_error_for_invalid_config() {
+        let config = DbConfig {
+            db_type: "mysql".to_owned(),
+            db_url: "mysql://localhost:3306/mono_test".to_owned(),
+            ..Default::default()
+        };
+
+        let err = database_connection(&config)
+            .await
+            .expect_err("invalid database config should fail before connecting");
+
+        assert!(err.to_string().contains("database.db_type"));
     }
 }

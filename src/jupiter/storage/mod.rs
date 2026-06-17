@@ -192,7 +192,7 @@ pub struct Storage {
 
 impl Storage {
     pub async fn new(config: Arc<Config>) -> Result<Self, MegaError> {
-        let connection = Arc::new(database_connection(&config.database).await);
+        let connection = Arc::new(database_connection(&config.database).await?);
         let notification_storage = NotificationStorage::new(connection.clone());
         let base = BaseStorage::new(connection.clone());
 
