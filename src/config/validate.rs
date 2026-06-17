@@ -4,7 +4,10 @@ use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 use toml::Value;
 use url::Url;
 
-use super::{BuckConfig, Config, DbConfig, MailConfig};
+use super::{
+    BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig, MailConfig, OrionServerConfig,
+    RedisConfig,
+};
 use crate::common::errors::MegaError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +18,11 @@ pub struct ConfigWarning {
 
 impl Config {
     pub fn validate(&self) -> Result<(), MegaError> {
+        validate_log_config(&self.log)?;
         validate_database_config(&self.database)?;
+        validate_lfs_config(&self.lfs)?;
+        validate_build_config(&self.build)?;
+        validate_redis_config(&self.redis)?;
         if let Some(mail_config) = &self.mail {
             mail_config.validate()?;
         }
@@ -23,6 +30,9 @@ impl Config {
             validate_buck_config(buck_config)?;
         }
         validate_object_storage_config(&self.object_storage)?;
+        if let Some(orion_server_config) = &self.orion_server {
+            validate_orion_server_config(orion_server_config)?;
+        }
 
         Ok(())
     }
@@ -58,6 +68,15 @@ impl MailConfig {
     }
 }
 
+pub(crate) fn validate_log_config(log_config: &LogConfig) -> Result<(), MegaError> {
+    match log_config.level.to_ascii_lowercase().as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => Ok(()),
+        level => Err(MegaError::Other(format!(
+            "log.level must be one of trace, debug, info, warn, error; got '{level}'"
+        ))),
+    }
+}
+
 pub(crate) fn validate_database_config(db_config: &DbConfig) -> Result<(), MegaError> {
     if db_config.db_type != "postgres" {
         return Err(MegaError::Other(format!(
@@ -72,6 +91,33 @@ pub(crate) fn validate_database_config(db_config: &DbConfig) -> Result<(), MegaE
         "postgres" | "postgresql" => Ok(()),
         scheme => Err(MegaError::Other(format!(
             "database.db_url scheme must be 'postgres' or 'postgresql', got '{scheme}'"
+        ))),
+    }
+}
+
+pub(crate) fn validate_lfs_config(lfs_config: &LFSConfig) -> Result<(), MegaError> {
+    require_non_empty_path("lfs.local.lfs_file_path", &lfs_config.local.lfs_file_path)?;
+    require_non_empty("lfs.ssh.http_url", &lfs_config.ssh.http_url)?;
+    validate_http_url("lfs.ssh.http_url", &lfs_config.ssh.http_url)
+}
+
+pub(crate) fn validate_build_config(build_config: &BuildConfig) -> Result<(), MegaError> {
+    if build_config.enable_build {
+        require_non_empty("build.orion_server", &build_config.orion_server)?;
+        validate_http_url("build.orion_server", &build_config.orion_server)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), MegaError> {
+    require_non_empty("redis.url", &redis_config.url)?;
+    let url = Url::parse(&redis_config.url)
+        .map_err(|e| MegaError::Other(format!("redis.url must be a valid URL: {e}")))?;
+    match url.scheme() {
+        "redis" | "rediss" => Ok(()),
+        scheme => Err(MegaError::Other(format!(
+            "redis.url scheme must be 'redis' or 'rediss', got '{scheme}'"
         ))),
     }
 }
@@ -116,8 +162,55 @@ fn validate_s3_config(
     Ok(())
 }
 
+pub(crate) fn validate_orion_server_config(
+    orion_server_config: &OrionServerConfig,
+) -> Result<(), MegaError> {
+    if orion_server_config.port == 0 {
+        return Err(MegaError::Other(
+            "orion_server.port must be between 1 and 65535".to_string(),
+        ));
+    }
+    require_non_empty(
+        "orion_server.logger_storage_mode",
+        &orion_server_config.logger_storage_mode,
+    )?;
+    require_non_empty(
+        "orion_server.build_log_dir",
+        &orion_server_config.build_log_dir,
+    )?;
+    require_non_empty("orion_server.db_url", &orion_server_config.db_url)?;
+
+    let db_url = Url::parse(&orion_server_config.db_url)
+        .map_err(|e| MegaError::Other(format!("orion_server.db_url must be a valid URL: {e}")))?;
+    match db_url.scheme() {
+        "postgres" | "postgresql" => {}
+        scheme => {
+            return Err(MegaError::Other(format!(
+                "orion_server.db_url scheme must be 'postgres' or 'postgresql', got '{scheme}'"
+            )));
+        }
+    }
+
+    require_non_empty(
+        "orion_server.monobase_url",
+        &orion_server_config.monobase_url,
+    )?;
+    validate_http_url(
+        "orion_server.monobase_url",
+        &orion_server_config.monobase_url,
+    )
+}
+
 fn require_non_empty(field_path: &str, value: &str) -> Result<(), MegaError> {
     if value.trim().is_empty() {
+        return Err(MegaError::Other(format!("{field_path} must not be empty")));
+    }
+
+    Ok(())
+}
+
+fn require_non_empty_path(field_path: &str, value: &Path) -> Result<(), MegaError> {
+    if value.as_os_str().is_empty() {
         return Err(MegaError::Other(format!("{field_path} must not be empty")));
     }
 
@@ -393,6 +486,65 @@ mod tests {
             .expect_err("database URL scheme should fail");
 
         assert!(err.to_string().contains("database.db_url scheme"));
+    }
+
+    #[test]
+    fn config_validate_rejects_unknown_log_level() {
+        let mut config = Config::mock();
+        config.log.level = "verbose".to_string();
+
+        let err = config.validate().expect_err("log level should fail");
+
+        assert!(err.to_string().contains("log.level"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_lfs_http_url() {
+        let mut config = Config::mock();
+        config.lfs.ssh.http_url = "ftp://localhost:8000".to_string();
+
+        let err = config.validate().expect_err("lfs url should fail");
+
+        assert!(err.to_string().contains("lfs.ssh.http_url"));
+    }
+
+    #[test]
+    fn config_validate_rejects_enabled_build_without_orion_url() {
+        let mut config = Config::mock();
+        config.build.enable_build = true;
+        config.build.orion_server = String::new();
+
+        let err = config
+            .validate()
+            .expect_err("enabled build without Orion URL should fail");
+
+        assert!(err.to_string().contains("build.orion_server"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_redis_url_scheme() {
+        let mut config = Config::mock();
+        config.redis.url = "http://localhost:6379".to_string();
+
+        let err = config.validate().expect_err("redis scheme should fail");
+
+        assert!(err.to_string().contains("redis.url scheme"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_orion_server_config() {
+        let mut config = Config::mock();
+        let orion_server = OrionServerConfig {
+            port: 0,
+            ..Default::default()
+        };
+        config.orion_server = Some(orion_server);
+
+        let err = config
+            .validate()
+            .expect_err("orion server port should fail");
+
+        assert!(err.to_string().contains("orion_server.port"));
     }
 
     #[test]
