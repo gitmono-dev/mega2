@@ -451,6 +451,15 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     }
 
     if let Some(mail) = value.get("mail").and_then(Value::as_table) {
+        if mail.contains_key("password") {
+            warnings.push(ConfigWarning {
+                field_path: "mail.password".to_string(),
+                message:
+                    "mail.password is deprecated; use mail.password_ref for vault-backed SMTP credentials"
+                        .to_string(),
+            });
+        }
+
         for field in ["smtp_tls", "tls"] {
             if mail.contains_key(field) {
                 warnings.push(ConfigWarning {
@@ -521,7 +530,7 @@ fn source_overrides(
     }
 
     for (variable, field_path) in env_field_paths {
-        if environment_warning_for(variable, field_path).is_some() {
+        if environment_field_is_ignored(field_path) || !is_known_field_path(field_path) {
             continue;
         }
 
@@ -578,7 +587,7 @@ fn source_fields(
     }
 
     fields.extend(env_field_paths.iter().filter_map(|(variable, field_path)| {
-        if environment_warning_for(variable, field_path).is_some() {
+        if environment_field_is_ignored(field_path) || !is_known_field_path(field_path) {
             return None;
         }
 
@@ -685,6 +694,10 @@ fn environment_warning_for(variable: &str, field_path: &str) -> Option<Environme
         format!(
             "{variable} maps to {field_path}, which is ignored by MailConfig; use MEGA_MAIL__STARTTLS for STARTTLS behavior"
         )
+    } else if field_path == "mail.password" {
+        format!(
+            "{variable} maps to {field_path}, which is deprecated; use MEGA_MAIL__PASSWORD_REF with a vault-backed SecretRef"
+        )
     } else if !is_known_field_path(field_path) {
         format!(
             "{variable} maps to {field_path}, which is not recognized by Config and will be ignored; remove the variable or use a supported MEGA_* field path"
@@ -698,6 +711,12 @@ fn environment_warning_for(variable: &str, field_path: &str) -> Option<Environme
         field_path: field_path.to_string(),
         message,
     })
+}
+
+fn environment_field_is_ignored(field_path: &str) -> bool {
+    field_path == "oauth"
+        || field_path.starts_with("oauth.")
+        || matches!(field_path, "mail.smtp_tls" | "mail.tls")
 }
 
 fn is_known_field_path(field_path: &str) -> bool {
@@ -1199,6 +1218,25 @@ mod tests {
     }
 
     #[test]
+    fn known_unconsumed_fields_warns_for_deprecated_mail_password_without_value() {
+        let content = format!(
+            r#"
+            [mail]
+            {} = "plain-text-password"
+            "#,
+            "password"
+        );
+        let value = toml::from_str::<Value>(&content).unwrap();
+
+        let warnings = known_unconsumed_fields(&value);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].field_path, "mail.password");
+        assert!(warnings[0].message.contains("mail.password_ref"));
+        assert!(!warnings[0].message.contains("plain-text-password"));
+    }
+
+    #[test]
     fn known_unconsumed_fields_warns_for_unknown_fields() {
         let value = toml::from_str::<Value>(
             r#"
@@ -1296,14 +1334,15 @@ mod tests {
             [
                 "MEGA_DATABASE__DB_URL",
                 "MEGA_UNKNOWN__VALUE",
+                "MEGA_MAIL__PASSWORD",
                 "MEGA_MAIL__TLS",
             ],
         )
         .expect("diagnostics should collect");
 
         assert_eq!(diagnostics.file_warnings.len(), 2);
-        assert_eq!(diagnostics.environment_warnings.len(), 2);
-        assert_eq!(diagnostics.warning_count(), 4);
+        assert_eq!(diagnostics.environment_warnings.len(), 3);
+        assert_eq!(diagnostics.warning_count(), 5);
         assert!(diagnostics.has_warnings());
         assert!(!diagnostics.is_empty());
         assert!(diagnostics.file_warnings.iter().any(|warning| {
@@ -1318,6 +1357,11 @@ mod tests {
         assert!(diagnostics.environment_warnings.iter().any(|warning| {
             warning.variable == "MEGA_MAIL__TLS" && warning.field_path == "mail.tls"
         }));
+        assert!(diagnostics.environment_warnings.iter().any(|warning| {
+            warning.variable == "MEGA_MAIL__PASSWORD"
+                && warning.field_path == "mail.password"
+                && warning.message.contains("MEGA_MAIL__PASSWORD_REF")
+        }));
     }
 
     #[test]
@@ -1327,13 +1371,19 @@ mod tests {
         let profile_path = temp_dir.path().join("config.prod.toml");
         std::fs::write(
             &config_path,
-            r#"
+            format!(
+                r#"
             [log]
             level = "info"
 
             [database]
             db_url = "postgres://localhost:5432/base"
+
+            [mail]
+            {} = "plain-text-password"
             "#,
+                "password"
+            ),
         )
         .expect("write base config");
         std::fs::write(
@@ -1348,7 +1398,12 @@ mod tests {
         let diagnostics = collect_source_diagnostics_from_keys(
             Some(&config_path),
             Some(&profile_path),
-            ["MEGA_LOG__LEVEL", "MEGA_DATABASE__DB_URL", "MEGA_MAIL__TLS"],
+            [
+                "MEGA_LOG__LEVEL",
+                "MEGA_DATABASE__DB_URL",
+                "MEGA_MAIL__PASSWORD",
+                "MEGA_MAIL__TLS",
+            ],
         )
         .expect("diagnostics should collect");
         let overrides = diagnostics
@@ -1358,7 +1413,7 @@ mod tests {
             .collect::<Vec<_>>();
         let override_text = overrides.join("\n");
 
-        assert_eq!(diagnostics.source_overrides.len(), 3);
+        assert_eq!(diagnostics.source_overrides.len(), 4);
         assert!(overrides.iter().any(|message| {
             message.contains("profile file")
                 && message.contains("base file")
@@ -1374,7 +1429,13 @@ mod tests {
                 && message.contains("base file")
                 && message.contains("database.db_url")
         }));
+        assert!(overrides.iter().any(|message| {
+            message.contains("MEGA_MAIL__PASSWORD")
+                && message.contains("base file")
+                && message.contains("mail.password")
+        }));
         assert!(!override_text.contains("postgres://localhost"));
+        assert!(!override_text.contains("plain-text-password"));
         assert!(!override_text.contains("debug"));
         assert!(!override_text.contains("info"));
         assert!(
@@ -1416,7 +1477,11 @@ mod tests {
         let diagnostics = collect_source_diagnostics_from_keys(
             Some(&config_path),
             Some(&profile_path),
-            ["MEGA_LOG__LEVEL", "MEGA_UNKNOWN__VALUE"],
+            [
+                "MEGA_LOG__LEVEL",
+                "MEGA_MAIL__PASSWORD",
+                "MEGA_UNKNOWN__VALUE",
+            ],
         )
         .expect("diagnostics should collect");
         let source_fields = diagnostics
@@ -1426,7 +1491,7 @@ mod tests {
             .collect::<Vec<_>>();
         let source_text = source_fields.join("\n");
 
-        assert_eq!(diagnostics.source_fields.len(), 5);
+        assert_eq!(diagnostics.source_fields.len(), 6);
         assert!(source_fields.iter().any(|message| {
             message.contains("log.level")
                 && message.contains("base file")
@@ -1449,6 +1514,12 @@ mod tests {
             .iter()
             .any(|message| message.contains("database.db_url") && message.contains("base file")));
         assert!(
+            source_fields
+                .iter()
+                .any(|message| message.contains("mail.password")
+                    && message.contains("MEGA_MAIL__PASSWORD"))
+        );
+        assert!(
             diagnostics
                 .environment_warnings
                 .iter()
@@ -1460,6 +1531,7 @@ mod tests {
         assert!(!source_text.contains("vault://secret/"));
         assert!(!source_text.contains("config/prod/mail/password"));
         assert!(!source_text.contains("#value"));
+        assert!(!source_text.contains("plain-text-password"));
     }
 
     #[test]
@@ -1475,6 +1547,7 @@ mod tests {
             "OTHER_VAR",
             "MEGA_UNKNOWN__VALUE",
             "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+            "MEGA_MAIL__PASSWORD",
             "MEGA_MAIL__TLS",
             "MEGA_MAIL__SMTP_TLS",
         ]);
@@ -1490,6 +1563,7 @@ mod tests {
         assert_eq!(
             variables,
             vec![
+                "MEGA_MAIL__PASSWORD",
                 "MEGA_MAIL__SMTP_TLS",
                 "MEGA_MAIL__TLS",
                 "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
@@ -1499,11 +1573,17 @@ mod tests {
         assert_eq!(
             fields,
             vec![
+                "mail.password",
                 "mail.smtp_tls",
                 "mail.tls",
                 "oauth.allowed_cors_origins",
                 "unknown.value",
             ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("MEGA_MAIL__PASSWORD_REF"))
         );
         assert!(
             warnings

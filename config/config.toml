@@ -289,7 +289,7 @@ default_items = [
 [mail]
 # Prefer `password_ref = "vault://secret/config/<profile>/mail/password#value"`
 # for SMTP credentials. A plain `password` field remains only for compatibility
-# and is reported as a deprecation warning by `config validate`.
+# and is reported by `config validate`; `--deny-warnings` treats it as failure.
 # When the service starts with mail enabled, switching this to false is hot-reloaded
 # and stops the dispatcher. Enabling mail or changing SMTP fields still needs restart.
 enabled = true

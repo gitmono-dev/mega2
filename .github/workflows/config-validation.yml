@@ -61,11 +61,13 @@ jobs:
           cargo test source_diagnostics_collects_base_profile_and_env_warnings -- --nocapture
           cargo test source_diagnostics_collects_cross_source_overrides_without_values -- --nocapture
           cargo test source_diagnostics_collects_field_source_graph_without_values -- --nocapture
+          cargo test known_unconsumed_fields_warns_for_deprecated_mail_password_without_value -- --nocapture
           cargo test unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys -- --nocapture
           cargo test test_bad_environment_type_reports_variable_name_without_value -- --nocapture
           cargo test config_validate_uses_raw_sources_load_mode -- --nocapture
           cargo test config_validate_accepts_deny_warnings_flag -- --nocapture
           cargo test validate_config_denies_source_warnings_when_requested -- --nocapture
+          cargo test validate_config_denies_deprecated_mail_password_source_without_leaking_value -- --nocapture
           cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
           cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
           cargo test resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref -- --nocapture
@@ -155,3 +157,18 @@ jobs:
           fi
           grep -F "redis.url scheme" "${redis_output}"
           grep -F "'redis' or 'rediss'" "${redis_output}"
+
+          {
+            printf '%s\n' '[mail]'
+            printf '%s = "plain-text-password"\n' 'password'
+          } > "${config_dir}/config.deprecated-mail-password.toml"
+
+          mail_password_output="${config_dir}/deprecated-mail-password.out"
+          if cargo run -- --config "${config_dir}/config.toml" --profile deprecated-mail-password config validate --deny-warnings >"${mail_password_output}" 2>&1; then
+            cat "${mail_password_output}"
+            echo "deprecated mail.password config unexpectedly passed --deny-warnings"
+            exit 1
+          fi
+          grep -F "mail.password" "${mail_password_output}"
+          grep -F "mail.password_ref" "${mail_password_output}"
+          ! grep -F "plain-text-password" "${mail_password_output}"

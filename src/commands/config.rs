@@ -546,6 +546,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn validate_config_denies_deprecated_mail_password_source_without_leaking_value() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+            [mail]
+            {} = "plain-text-password"
+            "#,
+                "password"
+            ),
+        )
+        .expect("write config source");
+        let config = Config::mock();
+
+        let err = validate_config(&config, Some(&config_path), None, false, true, false)
+            .await
+            .expect_err("deprecated mail password should fail under deny warnings");
+        let message = err.to_string();
+
+        assert!(message.contains("source diagnostics produced"));
+        assert!(!message.contains("plain-text-password"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref() {
         let secret_ref =
             SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
