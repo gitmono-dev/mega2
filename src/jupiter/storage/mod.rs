@@ -307,8 +307,7 @@ impl Storage {
             large_file_semaphore,
             buck_config,
             git_service.clone(),
-        )
-        .expect("failed to create BuckService");
+        )?;
 
         let webhook_service = WebhookService::new(webhook_storage.clone())?;
 

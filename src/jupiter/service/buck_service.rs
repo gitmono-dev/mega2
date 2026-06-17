@@ -977,13 +977,15 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::*;
-    use crate::jupiter::storage::base_storage::{BaseStorage, StorageConnector};
+    use crate::{
+        config::BuckConfig,
+        jupiter::storage::base_storage::{BaseStorage, StorageConnector},
+    };
 
-    fn create_test_service() -> BuckService {
+    fn try_create_test_service(buck_config: BuckConfig) -> Result<BuckService, MegaError> {
         let base = BaseStorage::mock();
         let upload_semaphore = Arc::new(Semaphore::new(10));
         let large_file_semaphore = Arc::new(Semaphore::new(5));
-        let buck_config = crate::config::BuckConfig::default();
         BuckService::new(
             base,
             CLService::new(BaseStorage::mock()),
@@ -992,7 +994,25 @@ mod tests {
             buck_config,
             GitService::mock(),
         )
-        .expect("Failed to create test BuckService")
+    }
+
+    fn create_test_service() -> BuckService {
+        try_create_test_service(BuckConfig::default()).expect("Failed to create test BuckService")
+    }
+
+    #[test]
+    fn test_new_returns_error_for_invalid_size_config() {
+        let buck_config = BuckConfig {
+            max_file_size: "not-a-size".to_string(),
+            ..BuckConfig::default()
+        };
+
+        let err = match try_create_test_service(buck_config) {
+            Ok(_) => panic!("invalid Buck max_file_size should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("Failed to parse max_file_size"));
     }
 
     // ============================================================================
