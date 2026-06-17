@@ -1,4 +1,4 @@
-use sea_orm::{DatabaseBackend, EnumIter, Iterable, sea_query::extension::postgres::Type};
+use sea_orm::{EnumIter, Iterable, sea_query::extension::postgres::Type};
 use sea_orm_migration::{prelude::*, schema::*};
 
 use crate::jupiter::migration::pk_bigint;
@@ -9,30 +9,23 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(Alias::new("permission_enum"))
+                    .values(PermissionEnum::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-        match backend {
-            DatabaseBackend::Postgres => {
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(Alias::new("permission_enum"))
-                            .values(PermissionEnum::iter())
-                            .to_owned(),
-                    )
-                    .await?;
-
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(Alias::new("resource_type_enum"))
-                            .values(ResourceTypeEnum::iter())
-                            .to_owned(),
-                    )
-                    .await?;
-            }
-            DatabaseBackend::MySql | DatabaseBackend::Sqlite => {}
-        }
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(Alias::new("resource_type_enum"))
+                    .values(ResourceTypeEnum::iter())
+                    .to_owned(),
+            )
+            .await?;
 
         manager
             .create_table(
@@ -169,18 +162,16 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(MegaGroup::Table).to_owned())
             .await?;
 
-        if manager.get_database_backend() == DatabaseBackend::Postgres {
-            manager
-                .drop_type(Type::drop().name(Alias::new("permission_enum")).to_owned())
-                .await?;
-            manager
-                .drop_type(
-                    Type::drop()
-                        .name(Alias::new("resource_type_enum"))
-                        .to_owned(),
-                )
-                .await?;
-        }
+        manager
+            .drop_type(Type::drop().name(Alias::new("permission_enum")).to_owned())
+            .await?;
+        manager
+            .drop_type(
+                Type::drop()
+                    .name(Alias::new("resource_type_enum"))
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }

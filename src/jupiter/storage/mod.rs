@@ -38,6 +38,7 @@ pub mod webhook_storage;
 
 use std::sync::{Arc, LazyLock, Weak};
 
+use sea_orm::DatabaseConnection;
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -556,15 +557,6 @@ impl Storage {
         let app_service = AppService::mock();
         let webhook_service = WebhookService::mock(app_service.webhook_storage.clone());
 
-        // For mock, create a dummy sqlite conn for notification_storage (tests that use Storage::mock
-        // and exercise notification paths should use real test DB setup instead).
-        let rt = tokio::runtime::Runtime::new().expect("runtime for mock conn");
-        let dummy_db = rt.block_on(async {
-            sea_orm::Database::connect("sqlite::memory:")
-                .await
-                .expect("dummy sqlite for mock")
-        });
-
         Storage {
             app_service,
             // app_service: AppService::mock(),
@@ -581,7 +573,7 @@ impl Storage {
             lfs_service: LfsService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
-            notification_storage: NotificationStorage::new(Arc::new(dummy_db)),
+            notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
         }
     }
 }

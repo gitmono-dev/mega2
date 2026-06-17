@@ -1,6 +1,4 @@
-//! This module includes storage backends for all SQL types. Currently supported: SQLite, PostgreSQL.
+//! This module includes SQL storage backends. Monoengine only supports PostgreSQL.
 
 #[cfg(any())]
 pub mod postgresql;
-#[cfg(any())]
-pub mod sqlite;

@@ -286,7 +286,7 @@ src/config/
 - `secret.rs`：定义 `SecretRef` 引用类型与 secret resolver trait，适配现有 `VaultCoreInterface`（`read_secret`/`write_secret`），并统一提供脱敏日志、错误信息和审计字段。服务运行时 resolver 接收一个已就绪的 vault 句柄（即 `AppContext` 中的 `VaultCore`），**不在 `Config::new` 阶段调用**；`config secret set/check` 则应通过最小 DB/Vault bootstrap 获取 vault 句柄，不能为了读写 secret 构造完整 `AppContext`。
 - `init.rs`：提供基础配置初始化能力，负责生成 `config/config.toml` 样例、派生本地目录、填充非敏感默认值、为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单；真实 secret 不在该阶段写入配置文件。
 - `testing.rs`：在既有 `Config::mock()`/`load_str()`/`load_sources()` 之上，提供面向自动化测试的配置模板、临时目录替换、端口和外部依赖覆盖、secret resolver 测试替身、测试配置校验入口，以及与 `.env.test` 协作的辅助函数，避免测试直接复用或修改仓库中的基础配置文件。
-- `validate.rs`：提供集中校验入口，按领域拆分校验函数，例如数据库连接串、监听端口、对象存储后端、路径可用性等，避免非法配置延迟到后续初始化阶段才暴露。首批 hard error 应只覆盖**当前已存在字段**的无争议规则，例如 `database.db_type` 与 `database.db_url` scheme 一致性、端口范围、必填字符串、对象存储后端与对应配置完整性、Buck 并发/大小限制（可吸收现有 `BuckConfig::validate()`，`config.rs:877`），以及“未知/未消费顶层段告警”（当前唯一整段孤立的是 `[oauth]`；`[mail]` 已被消费，但其段内 `smtp_tls`/`tls` 是被丢弃的未知 key，应纳入"已消费段内未知 key 告警"）；生产环境下 Postgres 自动 fallback 到 SQLite 应要求显式开关或至少高亮告警，避免误用本地 SQLite 启动。**由于 `MailConfig` 已真实存在，针对 mail 的校验（`mail.enabled = true` 时 `smtp_host`/`from` 必填、`password`/`password_ref` 互斥）现在即可加入；但涉及尚不存在字段的校验（OAuth 回调地址等）仍应等 `OAuthConfig` 真实落地后再写。**
+- `validate.rs`：提供集中校验入口，按领域拆分校验函数，例如数据库连接串、监听端口、对象存储后端、路径可用性等，避免非法配置延迟到后续初始化阶段才暴露。首批 hard error 应只覆盖**当前已存在字段**的无争议规则，例如 `database.db_type` 必须为 `postgres`、`database.db_url` scheme 必须为 `postgres`/`postgresql`、端口范围、必填字符串、对象存储后端与对应配置完整性、Buck 并发/大小限制（可吸收现有 `BuckConfig::validate()`，`config.rs:877`），以及“未知/未消费顶层段告警”（当前唯一整段孤立的是 `[oauth]`；`[mail]` 已被消费，但其段内 `smtp_tls`/`tls` 是被丢弃的未知 key，应纳入"已消费段内未知 key 告警"）。**由于 `MailConfig` 已真实存在，针对 mail 的校验（`mail.enabled = true` 时 `smtp_host`/`from` 必填、`password`/`password_ref` 互斥）现在即可加入；但涉及尚不存在字段的校验（OAuth 回调地址等）仍应等 `OAuthConfig` 真实落地后再写。**
 - `reload.rs`（后续阶段）：实现受控热加载能力，负责监听配置来源变化、复用完整加载流水线生成新配置、计算允许热更新字段的差异、通知订阅组件应用变更，并在校验失败或组件应用失败时保留旧配置。
 - `error.rs`：提供配置专用错误，包含配置文件路径、字段路径、原始值、失败原因和修复建议，再统一转换为现有 `MegaError`/`MegaResult`；配置加载路径上的 `unwrap`、`expect` 和 `panic` 应逐步收敛到该错误模型中。
 
@@ -634,7 +634,7 @@ config init                       # 不依赖 vault
 
 CI 中应增加专门的配置验证任务，至少覆盖三类输入：仓库基础样例 `config/config.toml`、默认模板生成结果、自动化测试生成的测试配置。验证内容包括 TOML 语法、环境变量覆盖、占位符展开、`SecretRef` 格式、集中校验、脱敏错误输出和消费端配置构造。这样可以把“配置能否作为测试输入使用”变成稳定的自动化检查，而不是依赖人工维护一份混合用途的基础配置。
 
-还应补充配置兼容性测试矩阵：坏 TOML、坏环境变量类型、未知占位符、profile 类型冲突、数组覆盖语义、未知/未消费顶层段告警、SecretRef 路径缺少 `#field`、vault key 缺失、secret 缺失、secret 字段缺失、权限失败、错误信息脱敏、生产环境 Postgres fallback SQLite 的告警或拒绝启动。`password` 与 `password_ref` 同时存在这类互斥测试，应在对应字段真实接入后再加入。
+还应补充配置兼容性测试矩阵：坏 TOML、坏环境变量类型、未知占位符、profile 类型冲突、数组覆盖语义、未知/未消费顶层段告警、SecretRef 路径缺少 `#field`、vault key 缺失、secret 缺失、secret 字段缺失、权限失败、错误信息脱敏、非 PostgreSQL 数据库配置被拒绝启动。`password` 与 `password_ref` 同时存在这类互斥测试，应在对应字段真实接入后再加入。
 
 ### 推荐加载流水线
 

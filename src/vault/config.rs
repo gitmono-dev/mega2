@@ -114,7 +114,7 @@ pub struct Storage {
     pub config: HashMap<String, Value>,
 }
 
-static STORAGE_TYPE_KEYWORDS: &[&str] = &["file", "mysql", "xline"];
+static STORAGE_TYPE_KEYWORDS: &[&str] = &["file", "xline"];
 
 fn default_bool_true() -> bool {
     true

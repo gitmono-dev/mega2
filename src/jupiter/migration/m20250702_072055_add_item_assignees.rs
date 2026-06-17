@@ -1,4 +1,3 @@
-use sea_orm::DatabaseBackend;
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -7,19 +6,10 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-
-        match backend {
-            DatabaseBackend::Postgres => {
-                manager
-                    .get_connection()
-                    .execute_unprepared(
-                        r#"ALTER TYPE conv_type_enum ADD VALUE IF NOT EXISTS 'assignee';"#,
-                    )
-                    .await?;
-            }
-            DatabaseBackend::Sqlite | DatabaseBackend::MySql => {}
-        }
+        manager
+            .get_connection()
+            .execute_unprepared(r#"ALTER TYPE conv_type_enum ADD VALUE IF NOT EXISTS 'assignee';"#)
+            .await?;
 
         manager
             .create_table(

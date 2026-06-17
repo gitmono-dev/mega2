@@ -23,7 +23,6 @@
 //!    - `DynamicSidebarStorage::bootstrap_sidebar` is responsible for checking if the table is empty and inserting defaults at runtime.
 //!    - This approach provides flexibility, maintains backward compatibility, and separates schema migrations from dynamic, configurable data.
 
-use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -32,15 +31,8 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-
-        match backend {
-            DatabaseBackend::Postgres => {
-                let sql = r#"DELETE FROM dynamic_sidebar;"#;
-                manager.get_connection().execute_unprepared(sql).await?;
-            }
-            DatabaseBackend::Sqlite | DatabaseBackend::MySql => {}
-        }
+        let sql = r#"DELETE FROM dynamic_sidebar;"#;
+        manager.get_connection().execute_unprepared(sql).await?;
 
         Ok(())
     }

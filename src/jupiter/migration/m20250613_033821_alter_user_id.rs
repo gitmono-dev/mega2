@@ -1,4 +1,4 @@
-use sea_orm_migration::{prelude::*, sea_orm::DatabaseBackend};
+use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -6,55 +6,47 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-
-        match backend {
-            DatabaseBackend::Postgres | DatabaseBackend::MySql => {
-                manager
-                    .alter_table(
-                        Table::alter()
-                            .table(MegaConversation::Table)
-                            .modify_column(
-                                ColumnDef::new(Alias::new("user_id"))
-                                    .string()
-                                    .not_null()
-                                    .to_owned(),
-                            )
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(MegaConversation::Table)
+                    .modify_column(
+                        ColumnDef::new(Alias::new("user_id"))
+                            .string()
+                            .not_null()
                             .to_owned(),
                     )
-                    .await?;
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .alter_table(
-                        Table::alter()
-                            .table(AccessToken::Table)
-                            .modify_column(
-                                ColumnDef::new(Alias::new("user_id"))
-                                    .string()
-                                    .not_null()
-                                    .to_owned(),
-                            )
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(AccessToken::Table)
+                    .modify_column(
+                        ColumnDef::new(Alias::new("user_id"))
+                            .string()
+                            .not_null()
                             .to_owned(),
                     )
-                    .await?;
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .alter_table(
-                        Table::alter()
-                            .table(SshKeys::Table)
-                            .modify_column(
-                                ColumnDef::new(Alias::new("user_id"))
-                                    .string()
-                                    .not_null()
-                                    .to_owned(),
-                            )
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SshKeys::Table)
+                    .modify_column(
+                        ColumnDef::new(Alias::new("user_id"))
+                            .string()
+                            .not_null()
                             .to_owned(),
                     )
-                    .await?;
-            }
-
-            DatabaseBackend::Sqlite => {}
-        }
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }

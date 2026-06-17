@@ -3,9 +3,9 @@
 // 设计目标：
 // 1. 通过 `CARGO_BIN_EXE_monoengine` 启动真实 CLI，验证用户实际执行命令时会走到的路径。
 // 2. 跟随 `docs/refactoring/integration.md` 的集成测试架构，使用 Docker Compose 提供的
-//    PostgreSQL/Redis/SMTP 捕获服务，而不是在测试里临时切回 SQLite。
+//    PostgreSQL/Redis/SMTP 捕获服务，而不是在测试里使用轻量本地数据库替身。
 // 3. 对每个需要数据库的测试创建独立 PostgreSQL 数据库，避免并发测试或失败重跑污染状态。
-// 4. 显式检查 SQLite fallback 没有发生，防止 PostgreSQL 配置错误时测试仍然“误通过”。
+// 4. 直接查询 PostgreSQL 验证数据落点，防止测试误连到非目标数据库。
 // 5. 所有 secret value 只通过 stdin 传给 CLI，并断言 stdout/stderr 不泄露明文。
 
 use std::{
@@ -48,7 +48,6 @@ struct VaultCliEnv {
     database: TestDatabase,
     bootstrap_config_path: PathBuf,
     full_config_path: PathBuf,
-    fallback_db_path: PathBuf,
     base_dir: PathBuf,
     cache_dir: PathBuf,
     object_root: PathBuf,
@@ -56,30 +55,25 @@ struct VaultCliEnv {
 
 impl VaultCliEnv {
     fn new() -> Self {
-        // TempDir 负责清理 MEGA_BASE_DIR、MEGA_CACHE_DIR、对象存储目录和 fallback sqlite 文件。
+        // TempDir 负责清理 MEGA_BASE_DIR、MEGA_CACHE_DIR 和对象存储目录。
         // TestDatabase 的 Drop 负责清理 PostgreSQL 临时数据库。
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
         let bootstrap_config_path = temp_dir.path().join("bootstrap-config.toml");
         let full_config_path = temp_dir.path().join("config.toml");
-        let fallback_db_path = temp_dir.path().join("fallback.sqlite");
         let base_dir = temp_dir.path().join("base");
         let cache_dir = temp_dir.path().join("cache");
         let object_root = temp_dir.path().join("objects");
 
         // 最小 bootstrap 配置只提供数据库字段。这样可以证明 secret set/check
         // 不依赖 Redis、对象存储、邮件或 HTTP service 的完整初始化链路。
-        //
-        // db_path 仍然写入一个临时 sqlite 路径，但它只作为“误 fallback 探针”：
-        // 正确情况下文件不会被创建；如果 PostgreSQL 连接失败后代码退回 SQLite，
-        // 后续 assert_no_sqlite_fallback 会让测试失败。
         fs::write(
             &bootstrap_config_path,
             format!(
                 r#"
                 [database]
                 db_type = "postgres"
-                db_path = "{}"
+                db_path = ""
                 db_url = "{}"
                 max_connection = 4
                 min_connection = 1
@@ -87,7 +81,6 @@ impl VaultCliEnv {
                 connect_timeout = 5
                 sqlx_logging = false
                 "#,
-                fallback_db_path.display(),
                 database.db_url
             ),
         )
@@ -103,7 +96,6 @@ impl VaultCliEnv {
             database,
             bootstrap_config_path,
             full_config_path,
-            fallback_db_path,
             base_dir,
             cache_dir,
             object_root,
@@ -127,7 +119,7 @@ impl VaultCliEnv {
             // 数据库配置通过环境变量覆盖，确保完整配置和最小配置都指向
             // 当前测试专属的 PostgreSQL 数据库。
             .env("MEGA_DATABASE__DB_TYPE", "postgres")
-            .env("MEGA_DATABASE__DB_PATH", &self.fallback_db_path)
+            .env("MEGA_DATABASE__DB_PATH", "")
             .env("MEGA_DATABASE__DB_URL", &self.database.db_url)
             .env("MEGA_DATABASE__MAX_CONNECTION", "4")
             .env("MEGA_DATABASE__MIN_CONNECTION", "1")
@@ -154,16 +146,6 @@ impl VaultCliEnv {
         // VaultCore 会在 MEGA_BASE_DIR 下生成 core key。检查这个文件能确认
         // 测试没有写入开发机默认 home/cache 位置。
         self.base_dir.join("vault").join("core_key.json")
-    }
-
-    fn assert_no_sqlite_fallback(&self) {
-        // monoengine 的数据库连接逻辑历史上存在 PostgreSQL 失败后 fallback 到 SQLite 的路径。
-        // 集成测试必须验证真实 PostgreSQL 架构，因此一旦 fallback sqlite 文件出现就直接失败。
-        assert!(
-            !self.fallback_db_path.exists(),
-            "PostgreSQL integration test unexpectedly fell back to SQLite at {}",
-            self.fallback_db_path.display()
-        );
     }
 }
 
@@ -299,10 +281,9 @@ fn config_secret_set_check_and_validate_resolve_secret() {
     // 写入命令只回显 SecretRef，不回显 secret value。
     assert_eq!(stdout.trim(), format!("stored {MAIL_PASSWORD_REF}"));
     assert_does_not_leak_secret(&stdout, &stderr);
-    env.assert_no_sqlite_fallback();
 
-    // 除了检查 SQLite fallback 文件不存在，还直接查询 PostgreSQL 的 vault 表。
-    // 这保证 secret set 的状态确实落在 compose PostgreSQL，而不是其他本地存储。
+    // 直接查询 PostgreSQL 的 vault 表，保证 secret set 的状态确实落在 compose
+    // PostgreSQL，而不是其他本地存储。
     assert_postgres_count_at_least(
         &env.database.db_url,
         "SELECT COUNT(*) AS count FROM vault",
@@ -329,7 +310,6 @@ fn config_secret_set_check_and_validate_resolve_secret() {
     let (stdout, stderr) = assert_success(&output);
     assert_eq!(stdout.trim(), format!("ok {MAIL_PASSWORD_REF}"));
     assert_does_not_leak_secret(&stdout, &stderr);
-    env.assert_no_sqlite_fallback();
 
     // validate 命令改用完整配置，覆盖真实配置加载、环境变量 overlay、
     // Vault SecretRef 解析和配置合法性检查的组合路径。
@@ -339,7 +319,6 @@ fn config_secret_set_check_and_validate_resolve_secret() {
     let (stdout, stderr) = assert_success(&output);
     assert_eq!(stdout.trim(), "config valid");
     assert_does_not_leak_secret(&stdout, &stderr);
-    env.assert_no_sqlite_fallback();
 }
 
 #[test]
@@ -361,7 +340,6 @@ fn config_validate_resolve_secrets_fails_when_secret_is_missing() {
         "unexpected stderr: {stderr}"
     );
     assert_does_not_leak_secret(&stdout, &stderr);
-    env.assert_no_sqlite_fallback();
 }
 
 #[test]

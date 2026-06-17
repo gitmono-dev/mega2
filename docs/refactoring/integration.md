@@ -45,7 +45,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | 功能正确性与接口兼容性 | `SecretRef` 与 mail.password 路径方向正确；`config init`、多渠道通知、热加载接口不兼容当前代码。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
 | 数据流与控制流正确性 | 原方案的主链路大体正确，但忽略 `Storage::new` 先构造对象存储、Redis 在 Vault 前初始化、mail 在 Vault 后构造的硬顺序。 | 明确启动顺序和每类测试允许触达的依赖。 |
 | 性能与效率 | 原方案每次可能重建容器、重跑 release build，成本高。 | 复用 compose stack，测试使用 dev/test binary，按测试隔离 DB/schema。 |
-| 可靠性与容错性 | 原方案依赖固定 sleep/默认端口，未处理 PostgreSQL fallback 到 SQLite。 | 使用 healthcheck + 主动探测，测试必须证明连接的是 PostgreSQL 而非 fallback。 |
+| 可靠性与容错性 | 原方案依赖固定 sleep/默认端口，且没有明确数据库连接目标。 | 使用 healthcheck + 主动探测，测试必须证明连接的是 PostgreSQL。 |
 | 兼容性与互操作性 | Docker Compose 方向可行，但默认端口易与开发机冲突；SMTP 捕获服务 API 与 TLS 配置需明确。 | 使用高位 host 端口，SMTP 测试关闭 STARTTLS，CI 以 Linux 为基线。 |
 | 可扩展性与可维护性 | 原文场景多但优先级不清，后续容易把未实现功能写成失败测试。 | 用 P0/P1/P2 gate 管理扩展，新增功能先更新矩阵再落测试。 |
 | 合规性与标准符合性 | 需要遵守仓库必跑 gate、GitHub Actions secret masking、测试数据清理。 | 增加执行 gate、mask、临时目录和日志保留规则。 |
@@ -59,7 +59,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | `config init` | 未实现 | P2，不能作为当前 gate |
 | Vault | 嵌入式 `VaultCore`，通过 DB + `core_key.json` 管理；无外部 Vault 服务 | P0 使用 DB 和临时 `MEGA_BASE_DIR` |
 | SecretRef | 已支持 `vault://secret/<name>#<field>`；当前仅 `mail.password` 可写入 monoengine Vault | P0 覆盖 `ref/set/check/validate --resolve-secrets` |
-| 数据库 | `database_connection()` 连接后自动执行 migrations；失败时可能 fallback SQLite | P0 必须检测真实连接到 Postgres |
+| 数据库 | `database_connection()` 只支持 PostgreSQL，连接后自动执行 migrations | P0 必须检测真实连接到 PostgreSQL |
 | Redis | `AppContext::new` 在 Vault 前初始化 Redis | P0 service smoke 需要 Redis 容器 |
 | 对象存储 | 通过 `jupiter::storage::object_storage::ObjectStorageFactory` 构造，测试可使用 local temp dir | P0 使用 local backend |
 | Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造 | P0/P1 覆盖 Mailpit 投递 |
@@ -76,7 +76,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 用途：
 - 解析、校验、SecretRef、resolver cache、storage 业务逻辑。
 - 允许直接访问 crate 内部模块。
-- 不依赖 Docker，优先使用 sqlite/tempdir/mock。
+- 纯逻辑测试不依赖 Docker；涉及数据库的测试使用 PostgreSQL 测试环境，优先通过独立数据库或 schema 隔离。
 
 ### 2. 模块集成测试（crate 内部）
 
@@ -157,7 +157,7 @@ networks:
 - `MEGA_BASE_DIR=<temp>/base`
 - `MEGA_CONFIG=<temp>/config.toml`
 - `object_storage.local.root_dir=<temp>/objects`
-- `database.db_path=<temp>/fallback.sqlite`，用于检测意外 fallback
+- `database.db_path=""`，保留兼容字段但不参与 PostgreSQL 连接
 - `log.print_std=true` 或日志输出到 `<temp>/logs`
 
 PostgreSQL 连接串必须指向高位端口：
@@ -172,7 +172,7 @@ connect_timeout = 5
 idle_timeout = 60
 sqlx_logging = false
 sqlx_logging_level = "warn"
-db_path = "/tmp/monoengine-it/fallback.sqlite"
+db_path = ""
 
 [redis]
 url = "redis://127.0.0.1:16379"
@@ -202,12 +202,10 @@ password_ref = "vault://secret/config/it/mail/password#value"
 - 黑盒测试如需断言表结构，只查询 migrations 后的真实表，如
   `email_jobs(username, to_email, event_type_code, subject, body_html, ...)`。
 
-必须增加一个 PostgreSQL 确认断言：如果 `database_connection()` fallback 到 SQLite，测试应失败。
-可通过以下方式之一确认：
+必须增加一个 PostgreSQL 确认断言，防止测试误连到非目标数据库。可通过以下方式之一确认：
 
-- 从日志中禁止出现 `Falling back to SQLite`。
 - 通过 PostgreSQL 连接查询 `SELECT current_database()` 并确认测试数据出现在该数据库。
-- 确认 fallback sqlite 文件不存在或为空。
+- 为每个测试创建独立 database/schema，并在断言时使用同一连接串查询目标表。
 
 ## P0：当前必须可执行的集成测试
 
@@ -301,7 +299,7 @@ SmtpMailer/EmailDispatcher -> init_monorepo -> HTTP`。
 - 数据库 migrations 已执行。
 - Redis 连接成功。
 - Mailer 初始化失败时进程应失败并给出可诊断错误，而不是静默禁用。
-- 日志中不应出现 `Falling back to SQLite`。
+- 日志中不应出现数据库连接到非 PostgreSQL 的记录。
 
 ### 5. 邮件 outbox 投递（`integration_mail_dispatcher_mailpit`）
 
@@ -559,15 +557,14 @@ docker compose -f docker-compose.test.yml logs redis
 docker compose -f docker-compose.test.yml logs mailpit
 ```
 
-### 意外 fallback 到 SQLite
+### 未连接到预期 PostgreSQL
 
 ```bash
-grep -R "Falling back to SQLite" <test-log-dir>
 psql 'postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it' \
   -c "select current_database(), count(*) from seaql_migrations"
 ```
 
-如果出现 fallback，优先检查：
+如果连接失败或数据不在预期数据库中，优先检查：
 - PostgreSQL healthcheck 是否通过。
 - `database.db_type` 是否为 `postgres`。
 - `database.db_url` 是否使用 `127.0.0.1:15432`。

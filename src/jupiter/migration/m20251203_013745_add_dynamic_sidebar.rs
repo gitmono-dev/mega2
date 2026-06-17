@@ -1,4 +1,3 @@
-use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -54,30 +53,23 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        let backend = manager.get_database_backend();
+        let sql = r#"
+            INSERT INTO dynamic_sidebar (public_id, label, href, visible, order_index) VALUES
+            ('home', 'Home', '/posts', true, 0),
+            ('inbox', 'Inbox', '/inbox', true, 1),
+            ('chat', 'Chat', '/chat', true, 2),
+            ('notes', 'Docs', '/notes', true, 3),
+            ('calls', 'Calls', '/calls', true, 4),
+            ('drafts', 'Drafts', '/drafts', true, 5),
+            ('code', 'Code', '/code', true, 6),
+            ('tags', 'Tags', '/code/tags', true, 7),
+            ('cl', 'Change List', '/cl', true, 8),
+            ('mq', 'Merge Queue', '/queue/main', true, 9),
+            ('issue', 'Issue', '/issue', true, 10),
+            ('rust', 'Rust', '/rust', true, 11);
+        "#;
 
-        match backend {
-            DatabaseBackend::Postgres => {
-                let sql = r#"
-                    INSERT INTO dynamic_sidebar (public_id, label, href, visible, order_index) VALUES
-                    ('home', 'Home', '/posts', true, 0),
-                    ('inbox', 'Inbox', '/inbox', true, 1),
-                    ('chat', 'Chat', '/chat', true, 2),
-                    ('notes', 'Docs', '/notes', true, 3),
-                    ('calls', 'Calls', '/calls', true, 4),
-                    ('drafts', 'Drafts', '/drafts', true, 5),
-                    ('code', 'Code', '/code', true, 6),
-                    ('tags', 'Tags', '/code/tags', true, 7),
-                    ('cl', 'Change List', '/cl', true, 8),
-                    ('mq', 'Merge Queue', '/queue/main', true, 9),
-                    ('issue', 'Issue', '/issue', true, 10),
-                    ('rust', 'Rust', '/rust', true, 11);
-                "#;
-
-                manager.get_connection().execute_unprepared(sql).await?;
-            }
-            DatabaseBackend::Sqlite | DatabaseBackend::MySql => {}
-        }
+        manager.get_connection().execute_unprepared(sql).await?;
 
         Ok(())
     }

@@ -55,13 +55,6 @@ mod tests {
             .await
             .expect("migrations should apply");
 
-        db.execute(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA foreign_keys = ON;",
-        ))
-        .await
-        .expect("enable sqlite foreign_keys");
-
         for table in [
             "notification_event_types",
             "user_notification_settings",
@@ -69,14 +62,18 @@ mod tests {
             "email_jobs",
         ] {
             let stmt = Statement::from_string(
-                DbBackend::Sqlite,
-                format!(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='{}' LIMIT 1;",
-                    table
-                ),
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
             );
-            let row = db.query_one(stmt).await.expect("query sqlite_master");
-            assert!(row.is_some(), "expected table '{table}' to exist");
+            let row = db
+                .query_one(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(table_name.is_some(), "expected table '{table}' to exist");
         }
 
         let now = chrono::Utc::now().naive_utc();

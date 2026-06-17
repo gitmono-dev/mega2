@@ -1,4 +1,4 @@
-use sea_orm::{DatabaseBackend, EnumIter, Iterable, sea_query::extension::postgres::Type};
+use sea_orm::{EnumIter, Iterable, sea_query::extension::postgres::Type};
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -8,74 +8,68 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // create bots related enum
-        let backend = manager.get_database_backend();
-        match backend {
-            DatabaseBackend::Postgres => {
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(BotStatusEnum)
-                            .values(BotStatus::iter())
-                            .to_owned(),
-                    )
-                    .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(BotStatusEnum)
+                    .values(BotStatus::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(PermissionScopeEnum)
-                            .values(PermissionScope::iter())
-                            .to_owned(),
-                    )
-                    .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(PermissionScopeEnum)
+                    .values(PermissionScope::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(InstallationTargetTypeEnum)
-                            .values(InstallationTargetType::iter())
-                            .to_owned(),
-                    )
-                    .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(InstallationTargetTypeEnum)
+                    .values(InstallationTargetType::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(InstallationBotStatusEnum)
-                            .values(InstallationBotStatus::iter())
-                            .to_owned(),
-                    )
-                    .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(InstallationBotStatusEnum)
+                    .values(InstallationBotStatus::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(TargetTypeEnum)
-                            .values(TargetType::iter())
-                            .to_owned(),
-                    )
-                    .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(TargetTypeEnum)
+                    .values(TargetType::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(ActorTypeEnum)
-                            .values(ActorType::iter())
-                            .to_owned(),
-                    )
-                    .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(ActorTypeEnum)
+                    .values(ActorType::iter())
+                    .to_owned(),
+            )
+            .await?;
 
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(AuditActionEnum)
-                            .values(AuditAction::iter())
-                            .to_owned(),
-                    )
-                    .await?;
-            }
-            DatabaseBackend::MySql | DatabaseBackend::Sqlite => {}
-        }
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(AuditActionEnum)
+                    .values(AuditAction::iter())
+                    .to_owned(),
+            )
+            .await?;
 
         // === Bots table ===
         manager

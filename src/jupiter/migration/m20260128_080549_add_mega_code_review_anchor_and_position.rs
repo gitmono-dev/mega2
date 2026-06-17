@@ -1,4 +1,4 @@
-use sea_orm::{DatabaseBackend, EnumIter, Iterable, sea_query::extension::postgres::Type};
+use sea_orm::{EnumIter, Iterable, sea_query::extension::postgres::Type};
 use sea_orm_migration::{prelude::*, schema::*};
 
 use crate::jupiter::migration::{m20260119_060233_add_mega_code_review::DiffSide, pk_bigint};
@@ -9,21 +9,14 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-
-        match backend {
-            DatabaseBackend::Postgres => {
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(PositionStatusEnum)
-                            .values(PositionStatus::iter())
-                            .to_owned(),
-                    )
-                    .await?;
-            }
-            DatabaseBackend::MySql | DatabaseBackend::Sqlite => {}
-        }
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(PositionStatusEnum)
+                    .values(PositionStatus::iter())
+                    .to_owned(),
+            )
+            .await?;
 
         // Remove code review thread table `DiffSide`, `LineNumber` and `FilePath`
         manager

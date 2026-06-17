@@ -491,14 +491,14 @@ impl SystemBackend {
                 .field(
                     "path",
                     FieldBuilder::new().field_type(FieldType::Str).description(
-                        r#"The name of the backend. Cannot be delimited. Example: "mysql""#,
+                        r#"The name of the backend. Cannot be delimited. Example: "file""#,
                     ),
                 )
                 .field(
                     "type",
                     FieldBuilder::new()
                         .field_type(FieldType::Str)
-                        .description(r#"The type of the backend. Example: "mysql""#),
+                        .description(r#"The type of the backend. Example: "file""#),
                 )
                 .field(
                     "description",

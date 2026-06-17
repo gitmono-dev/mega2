@@ -1,13 +1,19 @@
 use std::{
-    path::Path,
-    sync::{Arc, LazyLock},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement,
+};
 use tracing::log;
+use url::Url;
 
 use crate::{
-    common::config::Config,
+    common::config::{Config, DbConfig},
     jupiter::{
         migration::apply_migrations,
         service::{
@@ -57,19 +63,85 @@ use crate::{
     },
 };
 
-pub async fn test_db_connection(temp_dir: &Path) -> DatabaseConnection {
-    let db_url = format!("sqlite://{}/test.db", temp_dir.to_string_lossy());
-    std::fs::File::create(temp_dir.join("test.db")).expect("Failed to create test database file");
+const DEFAULT_TEST_DATABASE_URL: &str =
+    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+
+static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
+    let db_url = create_test_database_url().await;
 
     let mut opt = ConnectOptions::new(db_url);
-    opt.max_connections(5)
+    opt.max_connections(2)
         .min_connections(1)
         .sqlx_logging(true)
         .sqlx_logging_level(log::LevelFilter::Debug);
 
     Database::connect(opt)
         .await
-        .expect("Failed to connect to mock database")
+        .expect("Failed to connect to PostgreSQL test database")
+}
+
+pub async fn test_db_config(_temp_dir: &Path) -> DbConfig {
+    DbConfig {
+        db_type: "postgres".to_owned(),
+        db_path: PathBuf::new(),
+        db_url: create_test_database_url().await,
+        max_connection: 2,
+        min_connection: 1,
+        acquire_timeout: 5,
+        connect_timeout: 5,
+        sqlx_logging: false,
+    }
+}
+
+async fn create_test_database_url() -> String {
+    let admin_url =
+        std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.into());
+    assert_postgres_url(&admin_url);
+
+    let schema = format!(
+        "monoengine_test_{}_{}",
+        std::process::id(),
+        TEST_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let mut admin_opt = ConnectOptions::new(admin_url.clone());
+    admin_opt
+        .max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+
+    let admin = Database::connect(admin_opt).await.unwrap_or_else(|_| {
+        panic!(
+            "test PostgreSQL is not available; run `docker compose -f docker-compose.test.yml up -d` first"
+        )
+    });
+    execute_postgres(&admin, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    execute_postgres(&admin, format!("CREATE SCHEMA {schema}")).await;
+
+    database_url_with_search_path(&admin_url, &schema)
+}
+
+fn assert_postgres_url(db_url: &str) {
+    let url = Url::parse(db_url).expect("MEGA_DATABASE__DB_URL must be a valid PostgreSQL URL");
+    assert!(
+        matches!(url.scheme(), "postgres" | "postgresql"),
+        "MEGA_DATABASE__DB_URL must use postgres:// or postgresql://"
+    );
+}
+
+fn database_url_with_search_path(admin_url: &str, schema: &str) -> String {
+    let mut url = Url::parse(admin_url).expect("MEGA_DATABASE__DB_URL must be a valid URL");
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema},public"));
+    url.to_string()
+}
+
+async fn execute_postgres(db: &DatabaseConnection, sql: String) {
+    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+        .await
+        .expect("failed to prepare PostgreSQL test schema");
 }
 
 pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {

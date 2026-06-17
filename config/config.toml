@@ -17,12 +17,11 @@ with_ansi = true
 
 
 [database]
-# "sqlite" | "postgres"
-# "sqlite" will use `db_path` and ignore `db_url`
+# Only PostgreSQL is supported.
 db_type = "postgres"
 
-# used for sqlite
-db_path = "${base_dir}/mega.db"
+# Deprecated compatibility field; ignored by PostgreSQL connections.
+db_path = ""
 
 # database connection url, set to "postgres://mono:mono@mono-pg:5432/mono" if you're using docker
 db_url = "postgres://mono:mono@localhost:5432/mono"

@@ -909,12 +909,9 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
-    use crate::{
-        common::config::DbConfig,
-        jupiter::{
-            migration::apply_migrations,
-            tests::{test_db_connection, test_storage},
-        },
+    use crate::jupiter::{
+        migration::apply_migrations,
+        tests::{test_db_config, test_db_connection, test_storage},
     };
 
     async fn test_vault_storage(temp_dir: &Path) -> VaultStorage {
@@ -1027,18 +1024,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_vault_core_from_database_config_does_not_need_full_storage() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let db_path = temp_dir.path().join("bootstrap.db");
-        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
-        let db_config = DbConfig {
-            db_type: "sqlite".to_string(),
-            db_path,
-            db_url,
-            max_connection: 5,
-            min_connection: 1,
-            acquire_timeout: 5,
-            connect_timeout: 5,
-            sqlx_logging: false,
-        };
+        let db_config = test_db_config(temp_dir.path()).await;
         let key_path = temp_dir.path().join(CORE_KEY_FILE);
 
         let vault_core = VaultCore::from_database_config(&db_config, key_path)

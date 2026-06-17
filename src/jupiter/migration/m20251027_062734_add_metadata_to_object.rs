@@ -6,7 +6,7 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // Add columns to MegaBlob table one by one for SQLite compatibility
+        // Add columns to MegaBlob table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -63,7 +63,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to GitBlob table one by one for SQLite compatibility
+        // Add columns to GitBlob table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -120,7 +120,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to MegaCommit table one by one for SQLite compatibility
+        // Add columns to MegaCommit table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -149,7 +149,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to GitCommit table one by one for SQLite compatibility
+        // Add columns to GitCommit table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -178,7 +178,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to MegaTag table one by one for SQLite compatibility
+        // Add columns to MegaTag table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -207,7 +207,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to GitTag table one by one for SQLite compatibility
+        // Add columns to GitTag table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -236,7 +236,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to MegaTree table one by one for SQLite compatibility
+        // Add columns to MegaTree table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -265,7 +265,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Add columns to GitTree table one by one for SQLite compatibility
+        // Add columns to GitTree table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -297,7 +297,7 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // Drop columns from MegaBlob table one by one for SQLite compatibility
+        // Drop columns from MegaBlob table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -331,7 +331,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from MegaCommit table one by one for SQLite compatibility
+        // Drop columns from MegaCommit table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -349,7 +349,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from MegaTag table one by one for SQLite compatibility
+        // Drop columns from MegaTag table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -367,7 +367,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from MegaTree table one by one for SQLite compatibility
+        // Drop columns from MegaTree table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -385,7 +385,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from GitBlob table one by one for SQLite compatibility
+        // Drop columns from GitBlob table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -419,7 +419,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from GitCommit table one by one for SQLite compatibility
+        // Drop columns from GitCommit table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -437,7 +437,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from GitTag table one by one for SQLite compatibility
+        // Drop columns from GitTag table one by one.
         manager
             .alter_table(
                 Table::alter()
@@ -455,7 +455,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Drop columns from GitTree table one by one for SQLite compatibility
+        // Drop columns from GitTree table one by one.
         manager
             .alter_table(
                 Table::alter()

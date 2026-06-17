@@ -9,7 +9,7 @@
 //!
 //! So one example of a whole data path could be something like this:
 //!
-//! HTTP API -> some module (e.g. KV) -> barrier -> backend -> real storage (file, MySQL...)
+//! HTTP API -> some module (e.g. KV) -> barrier -> backend -> real storage (file...)
 //!
 //! Typical storage types may be direct file, databases, remote network filesystem and etc.
 //! Different storage types are all as sub-module of this module.
@@ -111,11 +111,6 @@ pub fn new_backend(t: &str, conf: &HashMap<String, Value>) -> Result<Arc<dyn Bac
         #[cfg(any())]
         "xline" => {
             let backend = xline::XlineBackend::new(conf)?;
-            Ok(Arc::new(backend))
-        }
-        #[cfg(any())]
-        "sqlite" => {
-            let backend = current_handle(sql::sqlite::SqliteBackend::new(conf))?;
             Ok(Arc::new(backend))
         }
         "mock" => Ok(Arc::new(physical::mock::MockBackend::new())),

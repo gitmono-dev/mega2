@@ -306,8 +306,8 @@ pub struct DbConfig {
 impl Default for DbConfig {
     fn default() -> Self {
         Self {
-            db_type: String::from("sqlite"),
-            db_path: mega_base().join("mega.db"),
+            db_type: String::from("postgres"),
+            db_path: PathBuf::new(),
             db_url: String::from("postgres://mega:mega@localhost:5432/mega"),
             max_connection: 16,
             min_connection: 8,
@@ -1162,9 +1162,9 @@ mod test {
                 base_dir = "/tmp/monoengine-test"
 
                 [database]
-                db_type = "sqlite"
-                db_path = "/tmp/monoengine-test/mono.db"
-                db_url = "sqlite:///tmp/monoengine-test/mono.db"
+                db_type = "postgres"
+                db_path = ""
+                db_url = "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it"
                 max_connection = 4
                 min_connection = 1
                 acquire_timeout = 5
@@ -1177,7 +1177,7 @@ mod test {
         let loaded = Config::load_vault_bootstrap(config_path.to_str().expect("utf-8 config path"))
             .expect("vault bootstrap config should parse without redis or object storage");
 
-        assert_eq!(loaded.database.db_type, "sqlite");
+        assert_eq!(loaded.database.db_type, "postgres");
         assert_eq!(loaded.database.max_connection, 4);
     }
 }

@@ -771,7 +771,7 @@ pub trait ChatEvents {
 
 必须覆盖：
 
-- 迁移测试：所有新表可在 SQLite 测试库中 migrate。
+- 迁移测试：所有新表可在 PostgreSQL 测试库中 migrate。
 - Storage 测试：权限过滤、soft delete、唯一约束、分页排序。
 - Service 测试：创建 channel、发送消息、编辑、删除、reply、附件、reaction、成员变更、latest message 回算。
 - HTTP 测试：端点状态码、响应 shape、错误映射。

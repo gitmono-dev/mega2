@@ -2,7 +2,7 @@ use extension::postgres::Type;
 use sea_orm_migration::{
     prelude::*,
     schema::*,
-    sea_orm::{DatabaseBackend, EnumIter, Iterable},
+    sea_orm::{EnumIter, Iterable},
 };
 
 use crate::jupiter::migration::pk_bigint;
@@ -13,21 +13,14 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-
-        match backend {
-            DatabaseBackend::Postgres => {
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(CheckTypeEnum)
-                            .values(CheckType::iter())
-                            .to_owned(),
-                    )
-                    .await?;
-            }
-            DatabaseBackend::MySql | DatabaseBackend::Sqlite => {}
-        }
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(CheckTypeEnum)
+                    .values(CheckType::iter())
+                    .to_owned(),
+            )
+            .await?;
 
         manager
             .create_table(

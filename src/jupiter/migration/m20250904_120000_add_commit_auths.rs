@@ -1,4 +1,3 @@
-use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -47,20 +46,12 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // set DB-side default for created_at depending on backend
-        let backend = manager.get_database_backend();
-        match backend {
-            DatabaseBackend::Postgres => {
-                // set default to now()
-                manager
-                    .get_connection()
-                    .execute_unprepared(
-                        r#"ALTER TABLE commit_auths ALTER COLUMN created_at SET DEFAULT now();"#,
-                    )
-                    .await?;
-            }
-            DatabaseBackend::Sqlite | DatabaseBackend::MySql => {}
-        }
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"ALTER TABLE commit_auths ALTER COLUMN created_at SET DEFAULT now();"#,
+            )
+            .await?;
 
         Ok(())
     }

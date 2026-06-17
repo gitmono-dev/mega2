@@ -81,7 +81,6 @@ mod m20260130_065535_refactor_orion_module;
 mod m20260208_012349_change_build_events;
 mod m20260209_064016_remove_default_dynamic_sidebar;
 mod m20260210_062050_create_target_state_history;
-mod m20260211_102158_add_username_to_mega_cl_sqlite;
 mod m20260216_013852_create_group_permission_tables;
 mod m20260224_142019_create_target_build_status;
 mod m20260224_230000_create_notification_center;
@@ -167,7 +166,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260208_012349_change_build_events::Migration),
             Box::new(m20260209_064016_remove_default_dynamic_sidebar::Migration),
             Box::new(m20260210_062050_create_target_state_history::Migration),
-            Box::new(m20260211_102158_add_username_to_mega_cl_sqlite::Migration),
             Box::new(m20260216_013852_create_group_permission_tables::Migration),
             Box::new(m20260224_142019_create_target_build_status::Migration),
             Box::new(m20260224_230000_create_notification_center::Migration),

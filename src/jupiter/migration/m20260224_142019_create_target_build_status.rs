@@ -1,4 +1,4 @@
-use sea_orm::{DatabaseBackend, EnumIter, Iterable, sea_query::extension::postgres::Type};
+use sea_orm::{EnumIter, Iterable, sea_query::extension::postgres::Type};
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -8,20 +8,14 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Create target build status enum
-        let backend = manager.get_database_backend();
-        match backend {
-            DatabaseBackend::Postgres => {
-                manager
-                    .create_type(
-                        Type::create()
-                            .as_enum(OrionTargetStatusEnum)
-                            .values(OrionTargetStatus::iter())
-                            .to_owned(),
-                    )
-                    .await?;
-            }
-            DatabaseBackend::MySql | DatabaseBackend::Sqlite => {}
-        }
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(OrionTargetStatusEnum)
+                    .values(OrionTargetStatus::iter())
+                    .to_owned(),
+            )
+            .await?;
 
         // Create target build status table
         manager

@@ -206,12 +206,6 @@ pub enum RvError {
     ErrStorageBackendLockFailed,
     #[error("Storage backend unlock failed.")]
     ErrStorageBackendUnlockFailed,
-    #[cfg(any())]
-    #[error("SQLite backend does not support absolute paths yet.")]
-    ErrSqliteBackendNotSupportAbsolute,
-    #[cfg(any())]
-    #[error("Sqlite disallowed fields: {}", .0)]
-    ErrSqliteDisallowedFields(String),
     #[error("Some IO error happened, {:?}", .source)]
     IO {
         #[from]
@@ -347,13 +341,6 @@ pub enum RvError {
     EtcdClientError {
         #[from]
         source: etcd_client::Error,
-    },
-
-    #[cfg(any())]
-    #[error("Some sqlite client error happened, {:?}", .source)]
-    SqliteClientError {
-        #[from]
-        source: sqlx::Error,
     },
 
     #[error(transparent)]

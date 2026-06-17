@@ -1,7 +1,4 @@
-use sea_orm_migration::{
-    prelude::*,
-    sea_orm::{DatabaseBackend, Statement},
-};
+use sea_orm_migration::{prelude::*, sea_orm::Statement};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -88,38 +85,32 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // 3. enforce not null + fk (skip SQLite: limited alter support)
-        match manager.get_database_backend() {
-            DatabaseBackend::Sqlite => Ok(()),
-            _ => {
-                manager
-                    .alter_table(
-                        Table::alter()
-                            .table(Builds::Table)
-                            .modify_column(ColumnDef::new(Builds::TargetId).uuid().not_null())
-                            .to_owned(),
-                    )
-                    .await?;
-                manager
-                    .alter_table(
-                        Table::alter()
-                            .table(Builds::Table)
-                            .drop_column(Builds::Target)
-                            .to_owned(),
-                    )
-                    .await?;
-                manager
-                    .create_foreign_key(
-                        ForeignKey::create()
-                            .name("fk_builds_target_id")
-                            .from(Builds::Table, Builds::TargetId)
-                            .to(Targets::Table, Targets::Id)
-                            .on_delete(ForeignKeyAction::Cascade)
-                            .to_owned(),
-                    )
-                    .await
-            }
-        }
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Builds::Table)
+                    .modify_column(ColumnDef::new(Builds::TargetId).uuid().not_null())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Builds::Table)
+                    .drop_column(Builds::Target)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_foreign_key(
+                ForeignKey::create()
+                    .name("fk_builds_target_id")
+                    .from(Builds::Table, Builds::TargetId)
+                    .to(Targets::Table, Targets::Id)
+                    .on_delete(ForeignKeyAction::Cascade)
+                    .to_owned(),
+            )
+            .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -149,20 +140,18 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Backfill builds.target from targets before dropping target_id
-        if manager.get_database_backend() != DatabaseBackend::Sqlite {
-            let backfill_stmt = Statement::from_string(
-                manager.get_database_backend(),
-                r#"
-                UPDATE builds b
-                SET target = t.target_path
-                FROM targets t
-                WHERE b.target_id = t.id
-                "#
-                .to_string(),
-            );
-            manager.get_connection().execute(backfill_stmt).await?;
-        }
+        // Backfill builds.target from targets before dropping target_id.
+        let backfill_stmt = Statement::from_string(
+            manager.get_database_backend(),
+            r#"
+            UPDATE builds b
+            SET target = t.target_path
+            FROM targets t
+            WHERE b.target_id = t.id
+            "#
+            .to_string(),
+        );
+        manager.get_connection().execute(backfill_stmt).await?;
 
         manager
             .alter_table(
