@@ -25,13 +25,13 @@
 >   2. `cargo clippy --all-targets --all-features -- -D warnings`（0 warning/0 error）
 >   3. `source .env.test && cargo test --all`（0 失败）。若 `.env.test` 不存在，必须先询问环境提供者；不得静默回退到无 DB 的 `cargo test`。
 >   变更必须最小化、复用 `jupiter::tests::test_storage` / `test_db_connection` + `apply_migrations`，禁止新增 blanket `#[allow]`。
-> - **其他约束**：工作区为 Libra 格式，状态/差异检查用 `libra` 命令；集成测试按 `integration.md` 要求在 Docker 中覆盖 fail-closed、最小 bootstrap、初始化路径；备份恢复 runbook 必须与 fail-closed 配套（key 丢失场景）。
+> - **其他约束**：工作区为 Libra 格式，状态/差异检查用 `libra` 命令；集成测试按 `integration.md` 要求在 Docker 中覆盖 fail-closed、最小 bootstrap、初始化路径；备份恢复运行手册必须与 fail-closed 配套（key 丢失场景）。
 >
 > 总体：**vault 本地 P0 止血与 P1 结构拆分在当前仓库状态下技术可行、依赖清晰、风险可控**；执行时严格按文档内"建议执行切片"与本分析的边界推进，即可避免被跨模块前置或 AGENTS 门禁阻塞。文档其余部分（阶段描述、验收、边界）经本次核查无需结构性调整，仅补充本小节与少量执行提示。
 
 > **落地状态更新（2026-06-17）**：本轮实现已完成阶段 A/B/C/D/E/F/H/I/J 的可交付子集，并明确阶段 G 的边界。
 >
-> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复 runbook。
+> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
 > - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。
 > - G：对象存储凭据未迁入本项目 vault，因此不做完整 Storage 后置初始化重排。当前边界是：`object_storage.*` 仍属于早期运行时依赖，不能配置为 `SecretRef`；`config secret set/check` 已不依赖对象存储可用。
@@ -759,13 +759,13 @@ Config::new
 目标：让泄露和 key 丢失可恢复，而非只能清库重建；为 fail-closed 配齐恢复路径。
 
 > **新架构修订（2026-06-15）**：本阶段的能力须区分"有内建原语"与"无内建原语"两类：
-> - **unseal 分片重新生成 ✅ 可做**：`generate_unseal_keys()`（`core.rs:591`，用当前 KEK 重新切分分片）可封装为运维能力并保证数据不丢；但它不会轮换 KEK，旧 Shamir 分片集合仍可能组合出同一个 KEK，不能作为完整泄露恢复手段。`unseal_once()`（`core.rs:534`）只会标记实际用于一次性解封的分片 deprecated，当前 10-of-5 自动解封形态下不能单独满足“旧 core_key 全部失效”的验收。详见 `vault_recovery_runbook.md`。
+> - **unseal 分片重新生成 ✅ 可做**：`generate_unseal_keys()`（`core.rs:591`，用当前 KEK 重新切分分片）可封装为运维能力并保证数据不丢；但它不会轮换 KEK，旧 Shamir 分片集合仍可能组合出同一个 KEK，不能作为完整泄露恢复手段。`unseal_once()`（`core.rs:534`）只会标记实际用于一次性解封的分片 deprecated，当前 10-of-5 自动解封形态下不能单独满足“旧 core_key 全部失效”的验收。详见下文“Vault 恢复运行手册”。
 > - **vault 加密 key（KEK）轮换 ❌ 无内建原语**：KEK 在 `init()` 后不可变，crate 未提供重加密屏障 / `sys/rotate` 等价能力。真正的 KEK 轮换需自建（密封 → 以新 KEK 重加密全部数据 → 重切分分片，本质等价于一次受控迁移，`Core::migrate()` 仅能搬运后端数据、不等于轮换），应**另立专项**；在该专项落地前本阶段不承诺 KEK 轮换，验收标准也不应包含它。
 
 工作项：
 
 1. 提供 unseal 分片 rekey 的运维命令（基于 `generate_unseal_keys()` / `unseal_once()`）。vault 加密 key（KEK）轮换因无内建原语，单列为后续专项，不在本阶段交付（见上）。
-2. 定义 key material（分片 / 恢复凭据）的安全托管与备份位置（外部 secret manager / 离线托管），写入运维 runbook（当前见 `docs/refactoring/vault_recovery_runbook.md`）。
+2. 定义密钥材料（分片 / 恢复凭据）的安全托管与备份位置（外部密钥管理系统 / 离线托管），写入下文“Vault 恢复运行手册”。
 3. 定义“DB 数据在、key 丢失”的恢复流程，以及疑似 `core_key.json` 泄露后的 rekey 流程。
 4. 为可迁移 secret（首批 `mail.password`）提供轮换支持。
 5.（可选，长期）评估外部 KMS / transit auto-unseal，替代本地落盘自动解封，缓解磁盘读取威胁。
@@ -773,8 +773,64 @@ Config::new
 验收标准：
 
 - 分片重新生成后新的 `core_key.json` 可解封且数据不丢；旧分片彻底失效需等待 KEK 轮换或外部 KMS / transit auto-unseal 专项。
-- 文档化的恢复 runbook 可在 key 丢失（数据在）场景下恢复访问或安全重置。
+- 文档化的恢复运行手册可在 key 丢失（数据在）场景下恢复访问或安全重置。
 - secret 轮换不需要重启全部依赖该 secret 的服务，或明确其重启要求。
+
+### Vault 恢复运行手册
+
+本运行手册记录阶段 A/J 加固后应遵循的 Vault 运维行为，重点覆盖 `core_key.json` 备份、恢复、显式重置、unseal 分片重新生成，以及 root token 恢复材料的边界。
+
+#### 适用范围
+
+- `core_key.json` 保存嵌入式 RustyVault 实例的本地自动解封密钥材料。
+- 数据库 `vault` 表保存加密后的 Vault 数据。
+- 当数据库已经初始化但 `core_key.json` 缺失时，服务启动必须故障关闭（fail-closed）；普通启动不得删除 `vault` 表数据。
+
+#### 正常备份
+
+1. 将 `mega_base()/vault/core_key.json` 备份到应用主机之外。
+2. 备份副本必须加密保存到外部密钥管理系统、离线加密介质，或等效的受限凭据系统中。
+3. 除非快照本身已加密并有访问控制，否则 `core_key.json` 必须排除在容器镜像、日志采集、源码控制、支持包和普通文件系统快照之外。
+4. Unix 环境下，保持 vault 目录权限为 `0700`，`core_key.json` 权限为 `0600`。
+
+#### DB 数据存在但 key 文件缺失时的恢复
+
+1. 停止 monoengine。
+2. 恢复与同一份数据库备份或当前在线数据库匹配的 `core_key.json`。
+3. 设置权限：
+
+   ```bash
+   chmod 700 "$(dirname "$CORE_KEY_PATH")"
+   chmod 600 "$CORE_KEY_PATH"
+   ```
+
+4. 启动 monoengine。
+5. 确认依赖 Vault 的消费者可以正常读取 secret。
+
+如果没有匹配的密钥材料，按当前嵌入式 RustyVault 设计，已加密的 Vault 数据无法恢复。不要期望服务启动后自动重新初始化；它必须故障关闭（fail-closed）。
+
+#### 不需要恢复旧数据时的显式重置
+
+仅当丢失所有 Vault secret 可以接受时，才允许使用本流程。
+
+1. 停止 monoengine。
+2. 备份数据库和任何现存的 `core_key.json`。
+3. 在受控维护流程中删除 `vault` 表数据，或重建数据库。
+4. 删除旧的 `core_key.json`。
+5. 启动 monoengine，使其针对未初始化的 vault store 执行首次初始化。
+6. 重新创建必要的 secret。
+
+普通服务启动绝不能隐式执行这个重置。
+
+#### 重新生成 unseal 分片
+
+`VaultCore::rekey_unseal_shares()` 调用 RustyVault 的 `generate_unseal_keys()`，并用当前 KEK 的新 Shamir 分片集合重写 `core_key.json`。该操作保留 Vault 数据，并由单元测试覆盖。
+
+当前限制：RustyVault 只是重新切分同一个 KEK。之前导出的 Shamir 分片集合仍可能恢复该 KEK，因此如果旧分片已经泄露，这不是完整的泄露恢复手段。要彻底使旧密钥材料失效，需要 KEK 轮换，或引入外部 KMS / transit auto-unseal 设计；这超出当前 vendored RustyVault 原语能力。
+
+#### Root token 处理
+
+Rust 应用接口不再向普通调用方暴露 root token，secret 操作通过收窄后的 secret interface 和审计 hook 执行。当前本地自动解封文件仍保存兼容与恢复所需的 root 恢复材料。要安全移除这部分材料，必须另行设计 root recovery token 或外部凭据托管机制；如果没有恢复路径就直接移除，未来维护可能变得不可执行。
 
 ### 与其他文档的协调关系（2026-06-15 更新）
 
@@ -807,7 +863,7 @@ Config::new
 | **P1** | Secret 访问审计（阶段 H） | 集中凭据托管的审计基线；只能走 interface hook | 阶段 A/B/C |
 | **P1** | 清理 SSH/PGP/Nostr panic | 提升 vault 数据损坏时的可恢复性，减少 SecretRef 迁移前的 crash 面 | 阶段 A/B/C |
 | **P1** | root token 退役与最小权限 policy（阶段 I） | 避免”全程 root”，符合 root token 生命周期 | 阶段 A/B/C/H |
-| **P1** | key 丢失 / 泄露的备份恢复 runbook（阶段 J 第 2–3 项） | fail-closed 必须配套恢复路径 | 阶段 A |
+| **P1** | key 丢失 / 泄露的备份恢复运行手册（阶段 J 第 2–3 项） | fail-closed 必须配套恢复路径 | 阶段 A |
 | **P1 协同** | 设计 CLI LoadMode 框架（与 config 协同） | 阶段 D 与 config 2 的必要条件 | 无（协同） |
 | **P2** | `config secret ref/set/check` | 形成标准运维入口 | 阶段 B、D + config 3/4 |
 | **P2** | `SecretRef` + resolver + `mail.password_ref` | 第一批可迁移凭据 | 阶段 A/B/C/H/I + config 5 + mail 2 |
@@ -921,6 +977,6 @@ Config::new
 - 核对文档或代码差异时使用 `libra diff -- <path>`，例如 `libra diff -- docs/refactoring/vault.md`。
 - 提交或评审时只纳入本阶段允许范围内的文件；若工作区已有不相关改动，应保持原样并在 PR / 交付说明中标明未触碰。
 
-这一步完成前，不建议开始 `SecretRef`、`mail.password_ref` 或对象存储凭据迁移。备份恢复 runbook（P1）应与 fail-closed 同期或紧随其后落地——否则 fail-closed 会把“key 丢失”从“自动重建”变成“无法恢复”。审计（阶段 H）与 root token 退役（阶段 I）应在迁移更多生产凭据前完成，以满足 Vault 安全标准。
+这一步完成前，不建议开始 `SecretRef`、`mail.password_ref` 或对象存储凭据迁移。备份恢复运行手册（P1）应与 fail-closed 同期或紧随其后落地——否则 fail-closed 会把“key 丢失”从“自动重建”变成“无法恢复”。审计（阶段 H）与 root token 退役（阶段 I）应在迁移更多生产凭据前完成，以满足 Vault 安全标准。
 
 **与本次任务的边界说明**：2026-06-16 的本次变更**仅修改了本规划文档**（插入可行性分析小节、更新日期/边界表述、强化 AGENTS 门禁与实施提示），**未改动任何 src/ 代码、Cargo.toml、测试或配置**。文档修订本身不触发构建/测试门禁，但为未来真实落地提供了经核查的执行依据。后续任何实际编码任务必须独立开启、独立评审、独立通过三大门禁。
