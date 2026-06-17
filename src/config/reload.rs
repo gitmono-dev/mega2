@@ -57,6 +57,8 @@ impl ConfigHandle {
 
         apply_log_changes(&current.log, &candidate.log, &mut next.log, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
+        collect_redis_restart_fields(&current, &candidate, &mut report);
+        collect_mail_restart_fields(&current, &candidate, &mut report);
 
         if report.applied() {
             *current = Arc::new(next);
@@ -125,10 +127,57 @@ fn collect_database_restart_fields(
     }
 }
 
+fn collect_redis_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.redis.url != candidate.redis.url {
+        report.restart_required_fields.push("redis.url");
+    }
+}
+
+fn collect_mail_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    match (&current.mail, &candidate.mail) {
+        (None, None) => {}
+        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("mail"),
+        (Some(current), Some(candidate)) => {
+            if current.enabled != candidate.enabled {
+                report.restart_required_fields.push("mail.enabled");
+            }
+            if current.smtp_host != candidate.smtp_host {
+                report.restart_required_fields.push("mail.smtp_host");
+            }
+            if current.smtp_port != candidate.smtp_port {
+                report.restart_required_fields.push("mail.smtp_port");
+            }
+            if current.username != candidate.username {
+                report.restart_required_fields.push("mail.username");
+            }
+            if current.password != candidate.password {
+                report.restart_required_fields.push("mail.password");
+            }
+            if current.password_ref != candidate.password_ref {
+                report.restart_required_fields.push("mail.password_ref");
+            }
+            if current.from != candidate.from {
+                report.restart_required_fields.push("mail.from");
+            }
+            if current.starttls != candidate.starttls {
+                report.restart_required_fields.push("mail.starttls");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::testing::isolated_config;
+    use crate::config::{MailConfig, secret::SecretRef, testing::isolated_config};
 
     #[test]
     fn reload_applies_log_fields_and_preserves_restart_required_database_fields() {
@@ -199,5 +248,48 @@ mod tests {
 
         assert!(err.to_string().contains("log.level"));
         assert_eq!(snapshot.log.level, "info");
+    }
+
+    #[test]
+    fn reload_reports_secret_ref_change_without_leaking_or_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let current_ref =
+            SecretRef::parse("vault://secret/config/test/mail/current#value").unwrap();
+        let candidate_ref =
+            SecretRef::parse("vault://secret/config/test/mail/candidate#value").unwrap();
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(MailConfig {
+            enabled: false,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("monoengine@example.com".to_string()),
+            password: None,
+            password_ref: Some(current_ref.clone()),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        });
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.mail.as_mut().expect("mail config").password_ref = Some(candidate_ref);
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let report_debug = format!("{report:?}");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(report.restart_required_fields, vec!["mail.password_ref"]);
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert_eq!(
+            snapshot
+                .mail
+                .as_ref()
+                .and_then(|mail| mail.password_ref.as_ref()),
+            Some(&current_ref)
+        );
+        assert!(!report_debug.contains("config/test/mail/current"));
+        assert!(!report_debug.contains("config/test/mail/candidate"));
+        assert!(!report_debug.contains("#value"));
     }
 }
