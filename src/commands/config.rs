@@ -15,7 +15,7 @@ use crate::{
         Config,
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
         template::config_init_template,
-        validate::warn_known_unconsumed_file_fields,
+        validate::{warn_known_unconsumed_file_fields, warn_unconsumed_environment_fields},
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
 };
@@ -274,6 +274,7 @@ async fn validate_config(
     if let Some(config_profile_path) = config_profile_path {
         warn_known_unconsumed_file_fields(config_profile_path)?;
     }
+    warn_unconsumed_environment_fields();
 
     if let Some(mail_cfg) = &config.mail {
         mail_cfg.warn_plaintext_password_deprecated();

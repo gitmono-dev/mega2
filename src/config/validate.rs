@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{ffi::OsStr, path::Path};
 
 use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 use toml::Value;
@@ -10,8 +10,23 @@ use super::{
 };
 use crate::common::errors::MegaError;
 
+const MEGA_ENV_PREFIX: &str = "MEGA_";
+const RESERVED_MEGA_ENV_VARS: &[&str] = &[
+    "MEGA_CONFIG",
+    "MEGA_PROFILE",
+    "MEGA_BASE_DIR",
+    "MEGA_CACHE_DIR",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
+    pub field_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentConfigWarning {
+    pub variable: String,
     pub field_path: String,
     pub message: String,
 }
@@ -249,6 +264,20 @@ pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
     Ok(())
 }
 
+pub fn warn_unconsumed_environment_fields() {
+    let keys = std::env::vars_os().map(|(key, _)| key);
+
+    for warning in unconsumed_environment_fields_from_keys(keys) {
+        tracing::warn!(
+            source = "env",
+            variable = %warning.variable,
+            field = %warning.field_path,
+            "{}",
+            warning.message
+        );
+    }
+}
+
 pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
 
@@ -276,6 +305,87 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     warnings.extend(unknown_fields(value));
 
     warnings
+}
+
+pub(crate) fn unconsumed_environment_fields_from_keys<I, K>(
+    keys: I,
+) -> Vec<EnvironmentConfigWarning>
+where
+    I: IntoIterator<Item = K>,
+    K: AsRef<OsStr>,
+{
+    let mut warnings = keys
+        .into_iter()
+        .filter_map(|key| {
+            let variable = key.as_ref().to_str()?.to_string();
+            let field_path = env_key_to_field_path(&variable)?;
+            environment_warning_for(&variable, &field_path)
+        })
+        .collect::<Vec<_>>();
+
+    warnings.sort_by(|left, right| left.variable.cmp(&right.variable));
+    warnings
+}
+
+fn env_key_to_field_path(variable: &str) -> Option<String> {
+    if !variable.starts_with(MEGA_ENV_PREFIX) || is_reserved_mega_env_var(variable) {
+        return None;
+    }
+
+    let suffix = variable.strip_prefix(MEGA_ENV_PREFIX)?;
+    if suffix.is_empty() {
+        return None;
+    }
+
+    Some(suffix.to_ascii_lowercase().replace("__", "."))
+}
+
+fn is_reserved_mega_env_var(variable: &str) -> bool {
+    RESERVED_MEGA_ENV_VARS.contains(&variable)
+}
+
+fn environment_warning_for(variable: &str, field_path: &str) -> Option<EnvironmentConfigWarning> {
+    let message = if field_path == "oauth" || field_path.starts_with("oauth.") {
+        format!(
+            "{variable} maps to {field_path}, but [oauth] is currently ignored because OAuthConfig is not implemented"
+        )
+    } else if matches!(field_path, "mail.smtp_tls" | "mail.tls") {
+        format!(
+            "{variable} maps to {field_path}, which is ignored by MailConfig; use MEGA_MAIL__STARTTLS for STARTTLS behavior"
+        )
+    } else if !is_known_field_path(field_path) {
+        format!(
+            "{variable} maps to {field_path}, which is not recognized by Config and will be ignored"
+        )
+    } else {
+        return None;
+    };
+
+    Some(EnvironmentConfigWarning {
+        variable: variable.to_string(),
+        field_path: field_path.to_string(),
+        message,
+    })
+}
+
+fn is_known_field_path(field_path: &str) -> bool {
+    let mut schema_path = String::new();
+    let mut parts = field_path.split('.').peekable();
+
+    while let Some(field) = parts.next() {
+        let Some(allowed_fields) = known_fields(&schema_path) else {
+            return false;
+        };
+        if !allowed_fields.contains(&field) {
+            return false;
+        }
+
+        if parts.peek().is_some() {
+            schema_path = join_field_path(&schema_path, field);
+        }
+    }
+
+    true
 }
 
 fn unknown_fields(value: &Value) -> Vec<ConfigWarning> {
@@ -761,6 +871,77 @@ mod tests {
         assert!(fields.contains(&"object_storage.s3.unexpected"));
         assert!(fields.contains(&"mail.extra"));
         assert!(fields.contains(&"sidebar.default_items[0].icon"));
+    }
+
+    #[test]
+    fn unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys() {
+        let warnings = unconsumed_environment_fields_from_keys([
+            "MEGA_DATABASE__DB_URL",
+            "MEGA_MONOREPO__ROOT_DIRS",
+            "MEGA_LOG__PRINT_STD",
+            "MEGA_CONFIG",
+            "MEGA_PROFILE",
+            "MEGA_BASE_DIR",
+            "MEGA_CACHE_DIR",
+            "OTHER_VAR",
+            "MEGA_UNKNOWN__VALUE",
+            "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+            "MEGA_MAIL__TLS",
+            "MEGA_MAIL__SMTP_TLS",
+        ]);
+        let variables = warnings
+            .iter()
+            .map(|warning| warning.variable.as_str())
+            .collect::<Vec<_>>();
+        let fields = warnings
+            .iter()
+            .map(|warning| warning.field_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            variables,
+            vec![
+                "MEGA_MAIL__SMTP_TLS",
+                "MEGA_MAIL__TLS",
+                "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+                "MEGA_UNKNOWN__VALUE",
+            ]
+        );
+        assert_eq!(
+            fields,
+            vec![
+                "mail.smtp_tls",
+                "mail.tls",
+                "oauth.allowed_cors_origins",
+                "unknown.value",
+            ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("MEGA_MAIL__STARTTLS"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("OAuthConfig"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("not recognized by Config"))
+        );
+    }
+
+    #[test]
+    fn known_config_field_path_accepts_nested_fields_and_rejects_orphans() {
+        assert!(is_known_field_path("database.db_url"));
+        assert!(is_known_field_path("object_storage.s3.access_key_id"));
+        assert!(is_known_field_path("sidebar.default_items.label"));
+        assert!(!is_known_field_path("database.db_url.extra"));
+        assert!(!is_known_field_path("database.typo"));
+        assert!(!is_known_field_path("unknown.value"));
+        assert!(!is_known_field_path("oauth.allowed_cors_origins"));
     }
 
     #[test]

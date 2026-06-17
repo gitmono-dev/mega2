@@ -54,6 +54,7 @@ jobs:
           cargo test config::loader -- --nocapture
           cargo test test_new_with_profile_merges_profile_before_env -- --nocapture
           cargo test config_init_template_has_no_unconsumed_fields -- --nocapture
+          cargo test unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys -- --nocapture
 
       - name: Validate bundled config
         working-directory: monoengine
