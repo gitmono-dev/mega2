@@ -25,6 +25,14 @@ pub enum ConfigDiagnostic {
     PlaceholderStringValue { key: String, source: ConfigError },
     #[error("failed to finalize placeholder expansion: shared traversal state still has owners")]
     PlaceholderTraversalState,
+    #[error(
+        "invalid environment variable `{variable}` for `{key}`: expected {expected}; value is redacted"
+    )]
+    EnvironmentType {
+        variable: String,
+        key: String,
+        expected: &'static str,
+    },
 }
 
 impl From<ConfigDiagnostic> for ConfigError {

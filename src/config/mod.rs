@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 pub use ::config as c;
 use c::{ConfigError, FileFormat, Source};
 pub use orbit_api::factory::ObjectStorageConfig;
+use serde::de::DeserializeOwned;
 
 use crate::common::errors::MegaError;
 
@@ -20,6 +21,7 @@ pub mod template;
 pub mod testing;
 pub mod validate;
 
+use error::ConfigDiagnostic;
 use expand::variable_placeholder_substitute;
 pub use model::*;
 use source::{config_from_path, config_from_path_with_profile, mega_environment_source};
@@ -101,14 +103,14 @@ impl Config {
     }
 
     pub fn load_vault_bootstrap(path: &str) -> Result<VaultBootstrapConfig, ConfigError> {
-        config_from_path(path)?.try_deserialize::<VaultBootstrapConfig>()
+        deserialize_with_diagnostics(config_from_path(path)?)
     }
 
     pub fn load_vault_bootstrap_with_profile(
         path: &str,
         profile_path: Option<&Path>,
     ) -> Result<VaultBootstrapConfig, ConfigError> {
-        config_from_path_with_profile(path, profile_path)?.try_deserialize::<VaultBootstrapConfig>()
+        deserialize_with_diagnostics(config_from_path_with_profile(path, profile_path)?)
     }
 
     pub fn mock() -> Self {
@@ -162,8 +164,38 @@ impl Config {
     }
 
     pub fn from_config(config: c::Config) -> Result<Self, ConfigError> {
-        config.try_deserialize::<Config>()
+        deserialize_with_diagnostics(config)
     }
+}
+
+fn deserialize_with_diagnostics<T>(config: c::Config) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned,
+{
+    config
+        .try_deserialize::<T>()
+        .map_err(enrich_deserialize_error)
+}
+
+fn enrich_deserialize_error(error: ConfigError) -> ConfigError {
+    match &error {
+        ConfigError::Type {
+            origin: Some(origin),
+            expected,
+            key: Some(key),
+            ..
+        } if origin == "the environment" => ConfigDiagnostic::EnvironmentType {
+            variable: environment_variable_for_key(key),
+            key: key.clone(),
+            expected,
+        }
+        .into(),
+        _ => error,
+    }
+}
+
+fn environment_variable_for_key(key: &str) -> String {
+    format!("MEGA_{}", key.to_ascii_uppercase().replace('.', "__"))
 }
 
 #[cfg(test)]
@@ -403,6 +435,22 @@ mod test {
         ))])
         .expect("load_sources should parse list env override");
         assert_eq!(config.monorepo.root_dirs, expected);
+    }
+
+    #[test]
+    fn test_bad_environment_type_reports_variable_name_without_value() {
+        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let _print_std = EnvVarGuard::set("MEGA_LOG__PRINT_STD", "not_bool_secret");
+        let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
+
+        let err = Config::load_str(&rendered).expect_err("bad bool env override should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("MEGA_LOG__PRINT_STD"));
+        assert!(message.contains("log.print_std"));
+        assert!(message.contains("expected a boolean"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("not_bool_secret"));
     }
 
     #[test]
