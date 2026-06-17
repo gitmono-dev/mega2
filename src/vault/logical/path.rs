@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt, future::Future, pin::Pin, sync::Arc};
 
 use super::{Backend, Field, Operation, field::IntoFieldArc, request::Request, response::Response};
-use crate::vault::{context::Context, errors::RvError};
+use crate::{common::errors::RvError, vault::context::Context};
 
 pub type PathOperationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<Response>, RvError>> + Send + 'a>>;

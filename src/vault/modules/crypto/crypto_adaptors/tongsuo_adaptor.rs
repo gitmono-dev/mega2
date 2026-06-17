@@ -5,9 +5,9 @@ use openssl::{
     symm::{Cipher, Crypter, Mode, decrypt, decrypt_aead, encrypt, encrypt_aead},
 };
 
-use crate::vault::{
-    errors::RvError,
-    modules::crypto::{
+use crate::{
+    common::errors::RvError,
+    vault::modules::crypto::{
         AEADCipher, AES, AESKeySize, BlockCipher, CipherMode, SM4, crypto_adaptors::common,
     },
 };

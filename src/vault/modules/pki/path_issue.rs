@@ -8,12 +8,14 @@ use serde_json::{Map, Value};
 use tracing::info;
 
 use super::{PkiBackend, PkiBackendInner, ssh_util, types};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    modules::{RequestExt, ResponseExt},
-    utils,
-    utils::cert,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        modules::{RequestExt, ResponseExt},
+        utils,
+        utils::cert,
+    },
 };
 
 impl PkiBackend {

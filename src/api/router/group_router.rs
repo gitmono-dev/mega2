@@ -12,7 +12,6 @@ use crate::{
             build_user_effective_permission_response, ensure_admin, resolve_resource_context,
         },
         api_doc::GROUP_PERMISSION_TAG,
-        error::ApiError,
         oauth::model::LoginUser,
     },
     ceres::model::group::{
@@ -21,6 +20,7 @@ use crate::{
         ResourcePermissionResponse, SetPermissionsRequest, UpdateGroupRequest,
         UserEffectivePermissionResponse, UserGroupsResponse,
     },
+    common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
     jupiter::model::group_dto::{
         CreateGroupPayload, ResourcePermissionBinding, UpdateGroupPayload,

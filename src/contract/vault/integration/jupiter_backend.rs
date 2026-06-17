@@ -4,12 +4,9 @@ use async_trait::async_trait;
 
 use crate::{
     callisto::vault,
-    common::errors::MegaError,
+    common::errors::{MegaError, RvError},
     jupiter::storage::vault_storage::VaultStorage,
-    vault::{
-        errors::RvError,
-        storage::{Backend, BackendEntry},
-    },
+    vault::storage::{Backend, BackendEntry},
 };
 
 pub struct JupiterBackend {

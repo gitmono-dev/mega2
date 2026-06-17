@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use strum::{Display, EnumString};
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug, EnumString, Display, Enum, Serialize, Deserialize)]
 pub enum FieldType {

@@ -11,7 +11,7 @@ use openssl::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::vault::{errors::RvError, utils::generate_uuid};
+use crate::{common::errors::RvError, vault::utils::generate_uuid};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KeyBundle {

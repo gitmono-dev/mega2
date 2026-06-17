@@ -25,84 +25,16 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::vault::{
-    modules::crypto::{AEADCipher, AES, AESKeySize, BlockCipher, CipherMode},
-    shamir::ShamirSecret,
-    utils::BHashSet,
+use crate::{
+    common::errors::SealBoxError,
+    vault::{
+        modules::crypto::{AEADCipher, AES, AESKeySize, BlockCipher, CipherMode},
+        shamir::ShamirSecret,
+        utils::BHashSet,
+    },
 };
-
-/// Error types that can occur during SealBox operations.
-///
-/// This enum provides a unified error type for all SealBox operations,
-/// including creation, sealing, unsealing, and data access operations.
-#[derive(Debug, Error)]
-pub enum SealBoxError {
-    /// The SealBox is currently sealed and data access is not allowed.
-    ///
-    /// This error occurs when trying to access data from a sealed SealBox.
-    /// The SealBox must be unsealed with sufficient shares before data can be accessed.
-    #[error("SealBox is sealed")]
-    Sealed,
-
-    /// The SealBox is not sealed when it should be.
-    ///
-    /// This error occurs when trying to perform operations that require
-    /// the SealBox to be in a sealed state, but it's currently unsealed.
-    #[error("SealBox is not sealed")]
-    NotSealed,
-
-    /// The SealBox is in the process of being unsealed but doesn't have enough shares yet.
-    ///
-    /// This error occurs when providing shares for unsealing, but the threshold
-    /// number of shares hasn't been reached yet. Continue providing shares until
-    /// the threshold is met.
-    #[error("SealBox is unsealing")]
-    Unsealing,
-
-    /// The decryption operation failed.
-    ///
-    /// This error occurs when the AES-GCM decryption process fails, typically
-    /// due to corrupted ciphertext, invalid authentication tag, or incorrect key.
-    #[error("Decryption failed")]
-    DecryptionFailed,
-
-    /// The unsealing operation failed due to insufficient or invalid shares.
-    ///
-    /// This error occurs when the Shamir secret sharing reconstruction fails,
-    /// typically due to insufficient shares, invalid shares, or corrupted share data.
-    #[error("Unsealing failed: insufficient or invalid shares")]
-    UnsealFailed,
-
-    /// The unsealing operation failed due to a deprecated share.
-    ///
-    /// This error occurs when the provided share has already been used to unseal the box.
-    #[error("Unsealing failed: deprecated share")]
-    UnsealKeyDeprecated,
-
-    /// The encryption operation failed.
-    ///
-    /// This error occurs when the AES-GCM encryption process fails, typically
-    /// due to issues with key generation, nonce generation, or encryption parameters.
-    #[error("Encryption failed")]
-    EncryptionFailed,
-
-    /// The Shamir secret splitting operation failed.
-    ///
-    /// This error occurs when creating shares from the master key fails,
-    /// typically due to invalid threshold or total shares parameters.
-    #[error("Shamir secret split failed")]
-    ShamirSecretSplitFailed,
-
-    /// The Shamir secret combining operation failed.
-    ///
-    /// This error occurs when reconstructing the master key from shares fails,
-    /// typically due to insufficient shares or corrupted share data.
-    #[error("Shamir secret combine failed")]
-    ShamirSecretCombineFailed,
-}
 
 /// A secure container that encrypts data and distributes the decryption key using Shamir's Secret Sharing.
 ///

@@ -10,10 +10,9 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{
-        MonoApiServiceState, api_doc::BUILD_TRIGGER_TAG, error::ApiError, oauth::model::LoginUser,
-    },
+    api::{MonoApiServiceState, api_doc::BUILD_TRIGGER_TAG, oauth::model::LoginUser},
     ceres::build_trigger::{CreateTriggerRequest, ListTriggersParams, TriggerResponse},
+    common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams},
 };
 

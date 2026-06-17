@@ -961,7 +961,7 @@ Rust 应用接口不再向普通调用方暴露 root token，secret 操作通过
 **首批 PR 执行边界（2026-06-16 分析更新）：**
 
 - 允许改动：`src/contract/vault/integration/vault_core.rs` 及其 tests、`src/contract/vault/integration/jupiter_backend.rs`（若 B 同期小步）、`src/context/mod.rs`（最小错误传递）、`src/server/ssh_server.rs`（最小错误返回）、vault 其他消费端中仅初始化/读取路径的 panic 清理（F 可后续批次）。
-- 允许新增：局部 `VaultError` / `VaultResult`（建议放 `vault/integration/vault_core.rs` 内或 `src/contract/vault/error.rs`）、Unix 权限辅助（cfg 守卫）、只覆盖初始化语义与 fail-closed 的测试用例。
+- 允许新增：集中定义在 `src/common/errors/` 的 `VaultError` / `VaultResult`、Unix 权限辅助（cfg 守卫）、只覆盖初始化语义与 fail-closed 的测试用例。
 - **绝对禁止**（本阶段）：`config secret` 命令族、LoadMode、SecretRef / resolver 实现、mail password 迁移、对象存储初始化顺序重排、KEK 轮换、libvault 源码修改、redaction 模块。
 - 评审重点：启动日志和错误字符串**不得**含 root token / 分片 / 明文 secret；DB 已初始化但 key 缺失时**绝不**调用 `delete_all()`；空 DB 首启仍可成功初始化并写 key；所有新增失败路径返回错误而不是 panic；权限代码在非 Unix 平台不放宽行为。
 - **强制前置验证（AGENTS.md）**：实现 PR 在任何 push / review 前必须本地通过：

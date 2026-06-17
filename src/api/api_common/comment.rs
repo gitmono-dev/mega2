@@ -4,8 +4,9 @@ use axum::{Json, extract::State};
 use regex::Regex;
 
 use crate::{
-    api::{MonoApiServiceState, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, oauth::model::LoginUser},
     callisto::sea_orm_active_enums::{ConvTypeEnum, ReferenceTypeEnum},
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

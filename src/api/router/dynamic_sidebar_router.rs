@@ -5,11 +5,12 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::SIDEBAR_TAG, error::ApiError},
+    api::{MonoApiServiceState, api_doc::SIDEBAR_TAG},
     ceres::model::dynamic_sidebar::{
         CreateSidebarPayload, SidebarMenuListRes, SidebarRes, SidebarSyncPayload,
         UpdateSidebarPayload,
     },
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

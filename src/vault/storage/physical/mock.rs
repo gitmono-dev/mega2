@@ -1,8 +1,8 @@
 use std::default::Default;
 
-use crate::vault::{
-    errors::RvError,
-    storage::{Backend, BackendEntry},
+use crate::{
+    common::errors::RvError,
+    vault::storage::{Backend, BackendEntry},
 };
 
 #[derive(Default)]

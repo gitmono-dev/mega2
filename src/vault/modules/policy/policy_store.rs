@@ -34,14 +34,16 @@ use super::{
     acl::{ACL, ACLResults},
     policy::SentinelPolicy,
 };
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    handler::AuthHandler,
-    logical::{Operation, Request, auth::PolicyResults},
-    router::Router,
-    rv_error_response_status, rv_error_string,
-    storage::{Storage, StorageEntry, barrier_view::BarrierView},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        handler::AuthHandler,
+        logical::{Operation, Request, auth::PolicyResults},
+        router::Router,
+        rv_error_response_status, rv_error_string,
+        storage::{Storage, StorageEntry, barrier_view::BarrierView},
+    },
 };
 
 // POLICY_ACL_SUB_PATH is the sub-path used for the policy store view. This is

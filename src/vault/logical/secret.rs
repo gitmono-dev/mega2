@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{Backend, Request, Response, lease::Lease};
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 type SecretOperationHandler = dyn for<'a> Fn(
         &'a dyn Backend,

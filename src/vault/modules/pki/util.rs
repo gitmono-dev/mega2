@@ -4,7 +4,10 @@ use humantime::{parse_duration, parse_rfc3339};
 use openssl::x509::X509NameBuilder;
 
 use super::path_roles::RoleEntry;
-use crate::vault::{errors::RvError, logical::Request, utils::cert::Certificate};
+use crate::{
+    common::errors::RvError,
+    vault::{logical::Request, utils::cert::Certificate},
+};
 
 pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60_u64);
 

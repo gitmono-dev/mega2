@@ -7,12 +7,14 @@ use better_default::Default;
 use serde_json::{Map, Value};
 
 use super::Module;
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    handler::AuthHandler,
-    logical::{Backend, Request, Response},
-    rv_error_response_status,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        handler::AuthHandler,
+        logical::{Backend, Request, Response},
+        rv_error_response_status,
+    },
 };
 
 #[allow(clippy::module_inception)]

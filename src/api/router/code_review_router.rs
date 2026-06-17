@@ -5,14 +5,12 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{
-        MonoApiServiceState, api_doc::CODE_REVIEW_TAG, error::ApiError, oauth::model::LoginUser,
-    },
+    api::{MonoApiServiceState, api_doc::CODE_REVIEW_TAG, oauth::model::LoginUser},
     ceres::model::code_review::{
         CodeReviewResponse, CommentReplyRequest, CommentReviewResponse, InitializeCommentRequest,
         ThreadReviewResponse, ThreadStatusResponse, UpdateCommentRequest,
     },
-    common::errors::MegaError,
+    common::errors::{ApiError, MegaError},
     contract::api::common::CommonResult,
 };
 

@@ -5,8 +5,9 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::CONV_TAG, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, api_doc::CONV_TAG, oauth::model::LoginUser},
     ceres::model::conversation::{ContentPayload, ReactionRequest},
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

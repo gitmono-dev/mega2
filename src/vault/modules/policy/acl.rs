@@ -28,11 +28,13 @@ use super::{
     Permissions, Policy, PolicyPathRules, PolicyType,
     policy::{Capability, to_granting_capabilities},
 };
-use crate::vault::{
-    errors::RvError,
-    logical::{Operation, Request, auth::PolicyInfo},
-    rv_error_string,
-    utils::string::ensure_no_leading_slash,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Operation, Request, auth::PolicyInfo},
+        rv_error_string,
+        utils::string::ensure_no_leading_slash,
+    },
 };
 
 /// Stores the results of an authentication check, including ACL and sentinel results.

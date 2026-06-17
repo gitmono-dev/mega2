@@ -21,24 +21,26 @@ use go_defer::defer;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::vault::{
-    config::MountEntryHMACLevel,
-    errors::RvError,
-    handler::{AuthHandler, HandlePhase, Handler},
-    logical::{Backend, Request, Response},
-    module_manager::ModuleManager,
-    modules::auth::AuthModule,
-    mount::{
-        CORE_MOUNT_CONFIG_PATH, LOGICAL_BARRIER_PREFIX, MountTable, MountsMonitor, MountsRouter,
-        SYSTEM_BARRIER_PREFIX,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        config::MountEntryHMACLevel,
+        handler::{AuthHandler, HandlePhase, Handler},
+        logical::{Backend, Request, Response},
+        module_manager::ModuleManager,
+        modules::auth::AuthModule,
+        mount::{
+            CORE_MOUNT_CONFIG_PATH, LOGICAL_BARRIER_PREFIX, MountTable, MountsMonitor,
+            MountsRouter, SYSTEM_BARRIER_PREFIX,
+        },
+        router::Router,
+        shamir::{SHAMIR_OVERHEAD, ShamirSecret},
+        storage::{
+            Backend as PhysicalBackend, BackendEntry as PhysicalBackendEntry,
+            barrier::SecurityBarrier, barrier_aes_gcm, barrier_view::BarrierView, physical,
+        },
+        utils::BHashSet,
     },
-    router::Router,
-    shamir::{SHAMIR_OVERHEAD, ShamirSecret},
-    storage::{
-        Backend as PhysicalBackend, BackendEntry as PhysicalBackendEntry, barrier::SecurityBarrier,
-        barrier_aes_gcm, barrier_view::BarrierView, physical,
-    },
-    utils::BHashSet,
 };
 
 pub type LogicalBackendNewFunc =

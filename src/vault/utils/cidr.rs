@@ -10,7 +10,7 @@ use std::{
 use ipnetwork::IpNetwork;
 
 use super::sock_addr::{SockAddr, SockAddrType, new_sock_addr};
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub fn is_ip_addr(addr: &dyn SockAddr) -> bool {
     (addr.sock_addr_type() as u8 & SockAddrType::IP as u8) != 0

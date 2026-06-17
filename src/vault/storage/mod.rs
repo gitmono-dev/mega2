@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub mod barrier;
 pub mod barrier_aes_gcm;

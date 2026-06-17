@@ -1,10 +1,12 @@
 use serde_json::{Value, json};
 
 use super::{PkiBackend, PkiBackendInner, field, util};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Operation, Path, Request, Response},
-    utils,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Operation, Path, Request, Response},
+        utils,
+    },
 };
 
 impl PkiBackend {

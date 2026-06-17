@@ -10,8 +10,9 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::WEBHOOK_TAG, error::ApiError},
+    api::{MonoApiServiceState, api_doc::WEBHOOK_TAG},
     callisto::sea_orm_active_enums::WebhookEventTypeEnum,
+    common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, Pagination},
     jupiter::{
         service::webhook_service::{encrypt_webhook_secret, validate_webhook_target_url},

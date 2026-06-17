@@ -9,7 +9,7 @@ use std::{
 use dashmap::DashMap;
 use tokio::task::JoinHandle;
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 #[derive(Default, Debug)]
 pub struct Context {

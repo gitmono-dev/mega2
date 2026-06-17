@@ -12,10 +12,9 @@ use once_cell::sync::Lazy;
 use crate::{
     api::{
         MonoApiServiceState,
-        error::ApiError,
         oauth::{BotIdentity, model::LoginUser},
     },
-    common::errors::MegaError,
+    common::errors::{ApiError, MegaError},
     contract::policy::{
         ActionEnum, context::CedarContext, entitystore::EntityStore, util::SaturnEUid,
     },

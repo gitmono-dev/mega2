@@ -16,8 +16,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::{
     api::{
         MonoApiServiceState, api_common::group_permission::ensure_admin, api_doc::USER_TAG,
-        error::ApiError, oauth::model::LoginUser,
+        oauth::model::LoginUser,
     },
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

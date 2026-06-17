@@ -7,7 +7,7 @@ use as_any::AsAny;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{ip_sock_addr::IpSockAddr, unix_sock_addr::UnixSockAddr};
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub trait CloneBox {
     fn clone_box(&self) -> Box<dyn SockAddr>;

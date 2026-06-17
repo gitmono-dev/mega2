@@ -34,7 +34,7 @@ use rustls::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeTuple};
 use serde_bytes::ByteBuf;
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 lazy_static! {
     static ref X509_DEFAULT: X509 = X509Builder::new().unwrap().build();

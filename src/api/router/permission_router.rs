@@ -11,10 +11,10 @@ use crate::{
             build_user_effective_permission_response, resolve_resource_context,
         },
         api_doc::GROUP_PERMISSION_TAG,
-        error::ApiError,
         oauth::model::LoginUser,
     },
     ceres::model::group::UserEffectivePermissionResponse,
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

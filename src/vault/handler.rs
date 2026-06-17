@@ -11,11 +11,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use derive_more::Display;
 
-use crate::vault::{
-    config::Config,
-    core::Core,
-    errors::RvError,
-    logical::{Auth, request::Request, response::Response},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        config::Config,
+        core::Core,
+        logical::{Auth, request::Request, response::Response},
+    },
 };
 
 #[async_trait]

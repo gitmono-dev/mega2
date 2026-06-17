@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-use crate::vault::{core::Core, errors::RvError, logical::Request};
+use crate::{
+    common::errors::RvError,
+    vault::{core::Core, logical::Request},
+};
 
 pub mod auth;
 pub mod credential;

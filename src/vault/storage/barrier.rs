@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 use super::Storage;
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub const BARRIER_INIT_PATH: &str = "barrier/init";
 

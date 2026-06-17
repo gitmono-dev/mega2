@@ -13,12 +13,14 @@ use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 use tracing::{info, warn};
 
 use super::{CertBackend, PgpCertBackend, PkiBackend, PkiBackendInner, types};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    modules::{RequestExt, ResponseExt},
-    storage::StorageEntry,
-    utils::key::{EncryptExtraData, KeyBundle},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        modules::{RequestExt, ResponseExt},
+        storage::StorageEntry,
+        utils::key::{EncryptExtraData, KeyBundle},
+    },
 };
 
 const PKI_CONFIG_KEY_PREFIX: &str = "config/key/";

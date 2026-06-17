@@ -7,7 +7,7 @@ use as_any::Downcast;
 use serde::{Deserialize, Serialize};
 
 use super::sock_addr::{SockAddr, SockAddrType};
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnixSockAddr {

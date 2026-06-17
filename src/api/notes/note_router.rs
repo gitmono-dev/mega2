@@ -5,11 +5,13 @@ use axum::{
 use serde_json::Value;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::api::{
-    MonoApiServiceState,
-    api_doc::SYNC_NOTES_STATE_TAG,
-    error::ApiError,
-    notes::model::{ShowResponse, UpdateRequest},
+use crate::{
+    api::{
+        MonoApiServiceState,
+        api_doc::SYNC_NOTES_STATE_TAG,
+        notes::model::{ShowResponse, UpdateRequest},
+    },
+    common::errors::ApiError,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

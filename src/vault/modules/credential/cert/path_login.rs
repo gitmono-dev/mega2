@@ -22,20 +22,22 @@ use openssl_sys::{
 use serde::{Deserialize, Serialize};
 
 use super::{CertBackend, CertBackendInner, CertEntry};
-use crate::vault::{
-    errors::RvError,
-    logical::{Auth, Backend, Field, FieldType, Operation, Path, Request, Response},
-    rv_error_response, rv_error_string,
-    utils::{
-        self,
-        cert::{
-            deserialize_vec_x509, has_x509_ext_key_usage, has_x509_ext_key_usage_flag, is_ca_cert,
-            serialize_vec_x509,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Auth, Backend, Field, FieldType, Operation, Path, Request, Response},
+        rv_error_response, rv_error_string,
+        utils::{
+            self,
+            cert::{
+                deserialize_vec_x509, has_x509_ext_key_usage, has_x509_ext_key_usage_flag,
+                is_ca_cert, serialize_vec_x509,
+            },
+            cidr::remote_addr_is_ok,
+            ocsp::{self, OcspConfig},
+            policy::equivalent_policies,
+            sock_addr::SockAddr,
         },
-        cidr::remote_addr_is_ok,
-        ocsp::{self, OcspConfig},
-        policy::equivalent_policies,
-        sock_addr::SockAddr,
     },
 };
 

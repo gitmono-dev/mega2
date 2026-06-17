@@ -24,24 +24,26 @@ use super::{
     AUTH_ROUTER_PREFIX,
     expiration::{DEFAULT_LEASE_DURATION_SECS, ExpirationManager, MAX_LEASE_DURATION_SECS},
 };
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    handler::{AuthHandler, HandlePhase, Handler},
-    logical::{
-        Auth, Backend, FieldBuilder, FieldType, Lease, LogicalBackend, Operation, PathBuilder,
-        Request, Response, lease::calculate_ttl,
-    },
-    modules::policy::policy_store::NON_ASSIGNABLE_POLICIES,
-    router::Router,
-    rv_error_response, rv_error_string,
-    storage::{Storage, StorageEntry},
-    utils::{
-        default_system_time, deserialize_duration, deserialize_system_time, generate_uuid,
-        is_str_subset,
-        policy::sanitize_policies,
-        serialize_duration, serialize_system_time, sha1,
-        token_util::{DEFAULT_LEASE_TTL, MAX_LEASE_TTL},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        handler::{AuthHandler, HandlePhase, Handler},
+        logical::{
+            Auth, Backend, FieldBuilder, FieldType, Lease, LogicalBackend, Operation, PathBuilder,
+            Request, Response, lease::calculate_ttl,
+        },
+        modules::policy::policy_store::NON_ASSIGNABLE_POLICIES,
+        router::Router,
+        rv_error_response, rv_error_string,
+        storage::{Storage, StorageEntry},
+        utils::{
+            default_system_time, deserialize_duration, deserialize_system_time, generate_uuid,
+            is_str_subset,
+            policy::sanitize_policies,
+            serialize_duration, serialize_system_time, sha1,
+            token_util::{DEFAULT_LEASE_TTL, MAX_LEASE_TTL},
+        },
     },
 };
 

@@ -5,9 +5,9 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::vault::{
-    errors::RvError,
-    logical::{Auth, secret::SecretData},
+use crate::{
+    common::errors::RvError,
+    vault::logical::{Auth, secret::SecretData},
 };
 
 lazy_static! {

@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use super::{CertBackend, CertBackendInner};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    storage::StorageEntry,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        storage::StorageEntry,
+    },
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

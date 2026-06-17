@@ -4,12 +4,14 @@ use better_default::Default;
 use serde_json::{Map, Value};
 
 use super::{Operation, Path};
-use crate::vault::{
-    context::Context,
-    errors::RvError,
-    handler::{HandlePhase, Handler},
-    logical::{auth::Auth, connection::Connection, secret::SecretData},
-    storage::{Storage, StorageEntry},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        context::Context,
+        handler::{HandlePhase, Handler},
+        logical::{auth::Auth, connection::Connection, secret::SecretData},
+        storage::{Storage, StorageEntry},
+    },
 };
 
 /// Represents a logical API request being processed by a backend.

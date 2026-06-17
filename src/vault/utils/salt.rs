@@ -11,9 +11,9 @@ use openssl::{
 };
 
 use super::generate_uuid;
-use crate::vault::{
-    errors::RvError,
-    storage::{Storage, StorageEntry},
+use crate::{
+    common::errors::RvError,
+    vault::storage::{Storage, StorageEntry},
 };
 
 static DEFAULT_LOCATION: &str = "salt";

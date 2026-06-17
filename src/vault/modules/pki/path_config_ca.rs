@@ -7,12 +7,14 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::{PkiBackend, PkiBackendInner, ssh_util, types};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    modules::{RequestExt, ResponseExt},
-    storage::StorageEntry,
-    utils::{cert, cert::CertBundle},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        modules::{RequestExt, ResponseExt},
+        storage::StorageEntry,
+        utils::{cert, cert::CertBundle},
+    },
 };
 
 const SSH_CA_BUNDLE_KEY: &str = "config/ca/ssh";

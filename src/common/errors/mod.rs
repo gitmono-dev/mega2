@@ -13,6 +13,15 @@ use thiserror::Error;
 
 use crate::contract::api::common::CommonResult;
 
+mod api;
+mod policy;
+mod vault;
+
+pub use api::ApiError;
+pub(crate) use api::map_ceres_error;
+pub use policy::{ContextError, SaturnContextError};
+pub use vault::{CryptoError, RvError, SealBoxError, VaultError, VaultResult};
+
 pub type MegaResult = Result<(), MegaError>;
 
 #[derive(Error, Debug)]
@@ -106,6 +115,22 @@ impl From<MegaError> for GitError {
 pub enum GitLFSError {
     #[error("Something went wrong in Git LFS: {0}")]
     GeneralError(String),
+}
+
+#[derive(Error, Debug)]
+pub enum StatusParseError {
+    #[error("Unexpected line format: {0}")]
+    UnexpectedFormat(String),
+    #[error("Unknown line prefix: {0}")]
+    UnknownPrefix(String),
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug)]
+pub enum DiffParseError {
+    InvalidHunkHeader(String),
+    InvalidRange(String),
+    InvalidNumber(String),
 }
 
 #[derive(Debug, Error)]

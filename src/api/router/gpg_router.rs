@@ -2,9 +2,10 @@ use axum::{Json, extract::State};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::GPG_TAG, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, api_doc::GPG_TAG, oauth::model::LoginUser},
     callisto::gpg_key::Model,
     ceres::model::gpg::{GpgKey, NewGpgRequest, RemoveGpgRequest},
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

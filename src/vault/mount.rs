@@ -26,13 +26,15 @@ use openssl::{
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use crate::vault::{
-    config::MountEntryHMACLevel,
-    core::{Core, LogicalBackendNewFunc},
-    errors::RvError,
-    router::Router,
-    storage::{Storage, StorageEntry, barrier::SecurityBarrier, barrier_view::BarrierView},
-    utils::{generate_uuid, is_protect_path},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        config::MountEntryHMACLevel,
+        core::{Core, LogicalBackendNewFunc},
+        router::Router,
+        storage::{Storage, StorageEntry, barrier::SecurityBarrier, barrier_view::BarrierView},
+        utils::{generate_uuid, is_protect_path},
+    },
 };
 
 pub const LOGICAL_BARRIER_PREFIX: &str = "logical/";

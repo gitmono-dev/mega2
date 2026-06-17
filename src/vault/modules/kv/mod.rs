@@ -8,15 +8,17 @@ use derive_more::Deref;
 use humantime::parse_duration;
 use serde_json::{Map, Value};
 
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    logical::{
-        Backend, FieldBuilder, FieldType, LogicalBackend, Operation, PathBuilder, PathOperation,
-        Request, Response, SecretBuilder,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        logical::{
+            Backend, FieldBuilder, FieldType, LogicalBackend, Operation, PathBuilder,
+            PathOperation, Request, Response, SecretBuilder,
+        },
+        modules::Module,
+        storage::StorageEntry,
     },
-    modules::Module,
-    storage::StorageEntry,
 };
 
 static KV_BACKEND_HELP: &str = r#"

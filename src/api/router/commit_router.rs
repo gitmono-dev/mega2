@@ -8,13 +8,14 @@ use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::CODE_PREVIEW, error::ApiError},
+    api::{MonoApiServiceState, api_doc::CODE_PREVIEW},
     ceres::model::{
         change_list::MuiTreeNode,
         commit::{
             CommitBindingResponse, CommitFilesChangedPage, CommitHistoryParams, CommitSummary,
         },
     },
+    common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
 };
 

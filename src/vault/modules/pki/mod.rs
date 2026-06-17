@@ -20,12 +20,14 @@ use x509_parser::{
     time::ASN1Time,
 };
 
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    logical::{Backend, LogicalBackend, Request, Response, SecretBuilder},
-    modules::Module,
-    storage::StorageEntry,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        logical::{Backend, LogicalBackend, Request, Response, SecretBuilder},
+        modules::Module,
+        storage::StorageEntry,
+    },
 };
 
 #[async_trait]

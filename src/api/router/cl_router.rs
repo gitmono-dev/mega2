@@ -9,7 +9,6 @@ use crate::{
         MonoApiServiceState,
         api_common::{self},
         api_doc::CL_TAG,
-        error::ApiError,
         oauth::model::LoginUser,
     },
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
@@ -22,7 +21,7 @@ use crate::{
         issue::ItemRes,
         label::LabelUpdatePayload,
     },
-    common::errors::MegaError,
+    common::errors::{ApiError, MegaError},
     contract::api::common::{CommonPage, CommonResult, PageParams},
     jupiter::service::{cl_service::CLService, webhook_service::WebhookEvent},
 };

@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 
+use crate::common::errors::DiffParseError;
+
 /// Represents a single hunk (continuous block of changes) in a unified diff.
 pub struct DiffHunk {
     /// The starting line number of this hunk in the original file (before changes).
@@ -11,14 +13,6 @@ pub struct DiffHunk {
     /// The number of lines this hunk covers in the new file.
     pub num_new: usize,
     pub lines: Vec<String>,
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug)]
-pub enum DiffParseError {
-    InvalidHunkHeader(String),
-    InvalidRange(String),
-    InvalidNumber(String),
 }
 
 pub fn hash(content: &str) -> String {

@@ -18,11 +18,13 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use derive_more::Deref;
 
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    logical::{Backend, LogicalBackend},
-    modules::{Module, auth::AuthModule},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        logical::{Backend, LogicalBackend},
+        modules::{Module, auth::AuthModule},
+    },
 };
 
 pub mod path_certs;

@@ -76,10 +76,9 @@ mod test {
 
     use cedar_policy::{Authorizer, Context, Entities, PolicySet, Request};
 
-    use crate::contract::policy::{
-        context::{CedarContext, SaturnContextError},
-        entitystore::EntityStore,
-        util::SaturnEUid,
+    use crate::{
+        common::errors::SaturnContextError,
+        contract::policy::{context::CedarContext, entitystore::EntityStore, util::SaturnEUid},
     };
 
     static INIT: Once = Once::new();

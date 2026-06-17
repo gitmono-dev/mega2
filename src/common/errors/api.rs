@@ -1,10 +1,10 @@
-use axum::response::{IntoResponse, Json, Response};
-use http::StatusCode;
-
-use crate::{
-    common::errors::{BuckError, MegaError},
-    contract::api::common::CommonResult,
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Json, Response},
 };
+
+use super::{BuckError, MegaError};
+use crate::contract::api::common::CommonResult;
 
 /// Parse [code:xxx] format from error message.
 /// Returns (status_code, clean_message) if found, None otherwise.

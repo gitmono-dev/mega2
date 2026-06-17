@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{CertBackend, CertBackendInner, path_config::Config};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    storage::StorageEntry,
-    utils::{deserialize_duration, serialize_duration},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        storage::StorageEntry,
+        utils::{deserialize_duration, serialize_duration},
+    },
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

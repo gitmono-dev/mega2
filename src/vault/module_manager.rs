@@ -12,10 +12,12 @@ use std::{any::Any, sync::Arc};
 
 use arc_swap::ArcSwap;
 
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    modules::{Module, system::SystemModule},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        modules::{Module, system::SystemModule},
+    },
 };
 
 /// Manages RustyVault modules' lifecycle and registry.

@@ -8,7 +8,7 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::CODE_PREVIEW, error::ApiError},
+    api::{MonoApiServiceState, api_doc::CODE_PREVIEW},
     ceres::model::{
         blame::{BlameQuery, BlameRequest, BlameResult},
         change_list::DiffItemSchema,
@@ -18,6 +18,7 @@ use crate::{
             TreeHashItem, TreeResponse,
         },
     },
+    common::errors::ApiError,
     contract::api::{common::CommonResult, git::commit::LatestCommitInfo},
 };
 

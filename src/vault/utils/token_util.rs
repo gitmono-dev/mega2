@@ -3,10 +3,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::vault::{
-    errors::RvError,
-    logical::{Auth, Field, FieldType, FieldsBuilder, Request, field::FieldTrait},
-    utils::{deserialize_duration, serialize_duration, sock_addr::SockAddrMarshaler},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Auth, Field, FieldType, FieldsBuilder, Request, field::FieldTrait},
+        utils::{deserialize_duration, serialize_duration, sock_addr::SockAddrMarshaler},
+    },
 };
 
 // 24h

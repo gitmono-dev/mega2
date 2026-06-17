@@ -12,9 +12,10 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::{
     api::{
         MonoApiServiceState, api_common::group_permission::ensure_admin, api_doc::BOT_TAG,
-        error::ApiError, oauth::model::LoginUser,
+        oauth::model::LoginUser,
     },
     ceres::model::bots::{BotRes, ChangeInstallationStatus, InstallBotReq, InstallationTargetType},
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

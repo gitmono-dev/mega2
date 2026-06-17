@@ -11,9 +11,9 @@ use std::{
 use lockfile::Lockfile;
 use serde_json::Value;
 
-use crate::vault::{
-    errors::RvError,
-    storage::{Backend, BackendEntry},
+use crate::{
+    common::errors::RvError,
+    vault::storage::{Backend, BackendEntry},
 };
 
 #[derive(Debug)]

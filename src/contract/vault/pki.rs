@@ -216,9 +216,8 @@ mod tests_raw {
     use serde_json::{Map, Value, json};
 
     use crate::{
-        contract::vault::integration::vault_core::{VaultCore, VaultResult},
-        jupiter::tests::test_storage,
-        vault::logical::Response,
+        common::errors::VaultResult, contract::vault::integration::vault_core::VaultCore,
+        jupiter::tests::test_storage, vault::logical::Response,
     };
 
     async fn test_read_api(

@@ -6,11 +6,15 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::{PkiBackend, PkiBackendInner, types, util::DEFAULT_MAX_TTL};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response, field::FieldTrait},
-    storage::StorageEntry,
-    utils::{deserialize_duration, serialize_duration},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{
+            Backend, Field, FieldType, Operation, Path, Request, Response, field::FieldTrait,
+        },
+        storage::StorageEntry,
+        utils::{deserialize_duration, serialize_duration},
+    },
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -2,12 +2,13 @@ use anyhow::anyhow;
 use http::StatusCode;
 
 use crate::{
-    api::{MonoApiServiceState, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, oauth::model::LoginUser},
     callisto::sea_orm_active_enums::ResourceTypeEnum,
     ceres::{
         api_service::group_ops::EffectiveResourcePermission,
         model::group::{PermissionValue, ResourceTypeValue, UserEffectivePermissionResponse},
     },
+    common::errors::ApiError,
 };
 
 pub async fn ensure_admin(state: &MonoApiServiceState, user: &LoginUser) -> Result<(), ApiError> {

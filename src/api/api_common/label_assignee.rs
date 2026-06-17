@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use axum::{Json, extract::State};
 
 use crate::{
-    api::{MonoApiServiceState, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, oauth::model::LoginUser},
     callisto::sea_orm_active_enums::ConvTypeEnum,
     ceres::model::{change_list::AssigneeUpdatePayload, label::LabelUpdatePayload},
+    common::errors::ApiError,
     contract::api::common::CommonResult,
     jupiter::model::common::LabelAssigneeParams,
 };

@@ -14,8 +14,8 @@ use percent_encoding::percent_decode_str;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::ARTIFACTS_TAG, error::ApiError},
-    common::errors::MegaError,
+    api::{MonoApiServiceState, api_doc::ARTIFACTS_TAG},
+    common::errors::{ApiError, MegaError},
     contract::api::artifacts::{
         ARTIFACT_PRESIGN_URL_TTL_SECS, ArtifactBatchRequest, ArtifactBatchResponse,
         ArtifactCommitRequest, ArtifactCommitResponse, ArtifactDiscoveryResponse, ArtifactLink,

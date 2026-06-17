@@ -3,11 +3,13 @@ use openssl::x509::X509;
 use super::{
     CertBackend, PgpCertBackend, PkiBackend, PkiBackendInner, SshCertBackend, TlsCertBackend, types,
 };
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    modules::ResponseExt,
-    utils::cert::CertBundle,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        modules::ResponseExt,
+        utils::cert::CertBundle,
+    },
 };
 
 impl PkiBackend {

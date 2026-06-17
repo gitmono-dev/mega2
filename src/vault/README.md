@@ -134,7 +134,7 @@ println!("Secret: {:?}", resp);
 | `login(path, data)` | Perform an auth login; stores returned client token for later calls. |
 | `set_token(token)` | Manually set the client token to be used for subsequent calls. |
 
-All async methods return `Result<_, crate::vault::errors::RvError>`.
+All async methods return `Result<_, crate::common::errors::RvError>`.
 
 ---
 

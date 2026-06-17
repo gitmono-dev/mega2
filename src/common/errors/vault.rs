@@ -1,14 +1,220 @@
-//! The `crate::vault::errors` module defines an enumeration of various error code, and implements
-//! neccessary traits against it.
+//! The `crate::common::errors::vault` module defines RustyVault error codes and implements
+//! necessary traits for them.
 //!
 //! The error code defined in this module are used widely in RustyVault.
 
 use std::{
     io,
+    path::PathBuf,
     sync::{PoisonError, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use thiserror::Error;
+
+use super::MegaError;
+
+pub type VaultResult<T> = Result<T, VaultError>;
+
+#[derive(Debug, Error)]
+pub enum VaultError {
+    #[error("failed to create vault directory at {path}: {source}")]
+    DirectoryCreate {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to restrict vault directory permissions at {path}: {source}")]
+    DirectoryPermissions {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(
+        "vault core key file is missing at {path}; restore key material or run an explicit reset"
+    )]
+    CoreKeyMissing { path: PathBuf },
+    #[error("vault core key file exists at {path}, but vault storage is not initialized")]
+    CoreKeyExistsWithoutInitializedStorage { path: PathBuf },
+    #[error("failed to read vault core key file at {path}: {source}")]
+    CoreKeyRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to parse vault core key file at {path}: {source}")]
+    CoreKeyDeserialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("failed to create vault core key file at {path}: {source}")]
+    CoreKeyWrite {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to serialize vault core key file at {path}: {source}")]
+    CoreKeySerialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("vault core key file contains {actual} shares, but {expected} are required")]
+    CoreKeyTooFewShares { expected: usize, actual: usize },
+    #[error("failed to create RustyVault instance: {0}")]
+    RustyVaultCreate(String),
+    #[error("failed to inspect vault initialization state: {0}")]
+    InitializationState(String),
+    #[error("failed to initialize vault core: {0}")]
+    Initialize(String),
+    #[error("failed to unseal vault core: {0}")]
+    Unseal(String),
+    #[error("failed to rekey vault unseal shares: {0}")]
+    Rekey(String),
+    #[error("vault root token is required to create missing runtime credentials")]
+    RootTokenRequiredForRuntimeCredentials,
+    #[error("failed to write vault runtime policy {policy}: {message}")]
+    RuntimePolicyWrite { policy: String, message: String },
+    #[error("failed to create vault runtime token for policy {policy}: {message}")]
+    RuntimeTokenCreate { policy: String, message: String },
+    #[error("vault runtime token response for policy {policy} did not include a client token")]
+    RuntimeTokenMissing { policy: String },
+    #[error("failed to ensure vault pki mount: {0}")]
+    PkiMount(String),
+    #[error("failed to revoke initialized vault root token")]
+    RootTokenRevoke,
+    #[error("invalid vault secret name")]
+    InvalidSecretName,
+    #[error("failed to read from vault API: {0}")]
+    ReadApi(String),
+    #[error("failed to write to vault API: {0}")]
+    WriteApi(String),
+    #[error("failed to delete from vault API: {0}")]
+    DeleteApi(String),
+}
+
+impl From<VaultError> for MegaError {
+    fn from(err: VaultError) -> Self {
+        MegaError::Other(err.to_string())
+    }
+}
+
+/// Error types that can occur during cryptographic operations.
+///
+/// This enum provides a unified error type for all cryptographic operations
+/// in the module, including encryption, decryption, serialization, and
+/// other crypto-related errors.
+#[derive(Debug, Error)]
+pub enum CryptoError {
+    /// A custom error with a descriptive message.
+    ///
+    /// Used for errors that don't fit into the other categories,
+    /// such as invalid input data or unsupported operations.
+    #[error("Crypto error: {0}")]
+    Custom(String),
+
+    /// An error that occurred during JSON serialization or deserialization.
+    ///
+    /// This error is automatically converted from `serde_json::Error`
+    /// and typically occurs when encrypting/decrypting data that
+    /// cannot be properly serialized or deserialized.
+    #[error("Some serde_json error happened, {:?}", .source)]
+    SerdeJson {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    /// An error that occurred during OpenSSL cryptographic operations.
+    ///
+    /// This error is automatically converted from `openssl::error::ErrorStack`
+    /// and typically occurs during encryption, decryption, or key generation
+    /// operations when the underlying OpenSSL library encounters an error.
+    #[error("Some openssl error happened, {:?}", .source)]
+    OpenSSL {
+        #[from]
+        source: openssl::error::ErrorStack,
+    },
+
+    /// An error that occurred in the RustyVault core system.
+    ///
+    /// This error is automatically converted from `RvError` and typically occurs
+    /// when the cryptographic operation interacts with other parts of the
+    /// RustyVault system.
+    #[error("Some RustyVault error happened, {:?}", .source)]
+    RvError { source: Box<RvError> },
+}
+
+impl From<RvError> for CryptoError {
+    fn from(source: RvError) -> Self {
+        Self::RvError {
+            source: Box::new(source),
+        }
+    }
+}
+
+/// Error types that can occur during SealBox operations.
+///
+/// This enum provides a unified error type for all SealBox operations,
+/// including creation, sealing, unsealing, and data access operations.
+#[derive(Debug, Error)]
+pub enum SealBoxError {
+    /// The SealBox is currently sealed and data access is not allowed.
+    ///
+    /// This error occurs when trying to access data from a sealed SealBox.
+    /// The SealBox must be unsealed with sufficient shares before data can be accessed.
+    #[error("SealBox is sealed")]
+    Sealed,
+
+    /// The SealBox is not sealed when it should be.
+    ///
+    /// This error occurs when trying to perform operations that require
+    /// the SealBox to be in a sealed state, but it's currently unsealed.
+    #[error("SealBox is not sealed")]
+    NotSealed,
+
+    /// The SealBox is in the process of being unsealed but doesn't have enough shares yet.
+    ///
+    /// This error occurs when providing shares for unsealing, but the threshold
+    /// number of shares hasn't been reached yet. Continue providing shares until
+    /// the threshold is met.
+    #[error("SealBox is unsealing")]
+    Unsealing,
+
+    /// The decryption operation failed.
+    ///
+    /// This error occurs when the AES-GCM decryption process fails, typically
+    /// due to corrupted ciphertext, invalid authentication tag, or incorrect key.
+    #[error("Decryption failed")]
+    DecryptionFailed,
+
+    /// The unsealing operation failed due to insufficient or invalid shares.
+    ///
+    /// This error occurs when the Shamir secret sharing reconstruction fails,
+    /// typically due to insufficient shares, invalid shares, or corrupted share data.
+    #[error("Unsealing failed: insufficient or invalid shares")]
+    UnsealFailed,
+
+    /// The unsealing operation failed due to a deprecated share.
+    ///
+    /// This error occurs when the provided share has already been used to unseal the box.
+    #[error("Unsealing failed: deprecated share")]
+    UnsealKeyDeprecated,
+
+    /// The encryption operation failed.
+    ///
+    /// This error occurs when the AES-GCM encryption process fails, typically
+    /// due to issues with key generation, nonce generation, or encryption parameters.
+    #[error("Encryption failed")]
+    EncryptionFailed,
+
+    /// The Shamir secret splitting operation failed.
+    ///
+    /// This error occurs when creating shares from the master key fails,
+    /// typically due to invalid threshold or total shares parameters.
+    #[error("Shamir secret split failed")]
+    ShamirSecretSplitFailed,
+
+    /// The Shamir secret combining operation failed.
+    ///
+    /// This error occurs when reconstructing the master key from shares fails,
+    /// typically due to insufficient shares or corrupted share data.
+    #[error("Shamir secret combine failed")]
+    ShamirSecretCombineFailed,
+}
 
 /// Centralized error enumeration for `RustyVault`.
 ///
@@ -277,10 +483,7 @@ pub enum RvError {
         source: bcrypt::BcryptError,
     },
     #[error("Some ureq error happened, {:?}", .source)]
-    UreqError {
-        #[from]
-        source: ureq::Error,
-    },
+    UreqError { source: Box<ureq::Error> },
     #[error("RwLock was poisoned (reading)")]
     ErrRwLockReadPoison,
     #[error("RwLock was poisoned (writing)")]
@@ -502,6 +705,14 @@ impl<T> From<PoisonError<RwLockReadGuard<'_, T>>> for RvError {
 impl From<rustls_pemfile::Error> for RvError {
     fn from(err: rustls_pemfile::Error) -> Self {
         RvError::RustlsPemFileError(err)
+    }
+}
+
+impl From<ureq::Error> for RvError {
+    fn from(source: ureq::Error) -> Self {
+        RvError::UreqError {
+            source: Box::new(source),
+        }
     }
 }
 

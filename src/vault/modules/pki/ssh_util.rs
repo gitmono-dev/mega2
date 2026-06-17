@@ -10,7 +10,7 @@ use openssl::{
 };
 use rand::RngExt;
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 /// SSH certificate type constants per PROTOCOL.certkeys.
 pub const SSH_CERT_TYPE_USER: u32 = 1;

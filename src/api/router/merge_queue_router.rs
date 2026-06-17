@@ -6,11 +6,12 @@ use serde_json::{Value, json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::MERGE_QUEUE_TAG, error::ApiError},
+    api::{MonoApiServiceState, api_doc::MERGE_QUEUE_TAG},
     ceres::model::merge_queue::{
         AddToQueueRequest, AddToQueueResponse, QueueItem, QueueListResponse, QueueStatsResponse,
         QueueStatus, QueueStatusResponse,
     },
+    common::errors::ApiError,
     contract::api::common::CommonResult,
 };
 

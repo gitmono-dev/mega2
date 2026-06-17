@@ -13,7 +13,7 @@ use openssl::hash::{Hasher, MessageDigest};
 use rand::{RngExt, rng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub mod cert;
 pub mod cidr;

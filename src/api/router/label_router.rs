@@ -5,8 +5,9 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::LABEL_TAG, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, api_doc::LABEL_TAG, oauth::model::LoginUser},
     ceres::model::label::{LabelItem, NewLabel},
+    common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams},
 };
 

@@ -1,8 +1,10 @@
 use super::{PkiBackend, PkiBackendInner, types};
-use crate::vault::{
-    errors::RvError,
-    logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
-    modules::RequestExt,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        logical::{Backend, Field, FieldType, Operation, Path, Request, Response},
+        modules::RequestExt,
+    },
 };
 
 impl PkiBackend {

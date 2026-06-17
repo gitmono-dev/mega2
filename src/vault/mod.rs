@@ -27,23 +27,24 @@ use arc_swap::ArcSwap;
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
-use crate::vault::{
-    config::Config,
-    core::Core,
-    errors::RvError,
-    logical::{Request, Response},
-    modules::{
-        auth::AuthModule, credential::cert::CertModule, kv::KvModule, pki::PkiModule,
-        policy::PolicyModule,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        config::Config,
+        core::Core,
+        logical::{Request, Response},
+        modules::{
+            auth::AuthModule, credential::cert::CertModule, kv::KvModule, pki::PkiModule,
+            policy::PolicyModule,
+        },
+        mount::MountsMonitor,
+        storage::Backend,
     },
-    mount::MountsMonitor,
-    storage::Backend,
 };
 
 pub mod config;
 pub mod context;
 pub mod core;
-pub mod errors;
 pub mod handler;
 pub mod logical;
 pub mod module_manager;

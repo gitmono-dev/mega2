@@ -7,11 +7,11 @@ use russh::keys::{HashAlg, parse_public_key_base64};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::USER_TAG, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, api_doc::USER_TAG, oauth::model::LoginUser},
     ceres::model::user::{
         AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken, UpdateClaContentPayload,
     },
-    common::errors::MegaError,
+    common::errors::{ApiError, MegaError},
     contract::api::common::CommonResult,
 };
 

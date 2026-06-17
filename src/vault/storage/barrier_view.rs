@@ -1,7 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use super::{Storage, StorageEntry, barrier::SecurityBarrier};
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub struct BarrierView {
     barrier: Arc<dyn SecurityBarrier>,

@@ -5,10 +5,7 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{
-        MonoApiServiceState, api_common, api_doc::ISSUE_TAG, error::ApiError,
-        oauth::model::LoginUser,
-    },
+    api::{MonoApiServiceState, api_common, api_doc::ISSUE_TAG, oauth::model::LoginUser},
     callisto::sea_orm_active_enums::ConvTypeEnum,
     ceres::model::{
         change_list::{AssigneeUpdatePayload, ListPayload},
@@ -16,6 +13,7 @@ use crate::{
         issue::{IssueDetailRes, IssueSuggestions, ItemRes, NewIssue, QueryPayload},
         label::LabelUpdatePayload,
     },
+    common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams},
     jupiter::service::issue_service::IssueService,
 };

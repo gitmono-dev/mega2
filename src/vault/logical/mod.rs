@@ -18,7 +18,7 @@ use enum_map::Enum;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
-use crate::vault::{context::Context, errors::RvError};
+use crate::{common::errors::RvError, vault::context::Context};
 
 pub mod auth;
 pub mod backend;

@@ -60,7 +60,7 @@ use crypto_adaptors::openssl_adaptor::AdaptorCTX;
 #[cfg(any())]
 use crypto_adaptors::tongsuo_adaptor::AdaptorCTX;
 
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 pub mod crypto_adaptors;
 

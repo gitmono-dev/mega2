@@ -9,21 +9,23 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Map, Value, from_value, json};
 
-use crate::vault::{
-    core::Core,
-    errors::RvError,
-    logical::{
-        Backend, FieldBuilder, FieldType, FieldsBuilder, LogicalBackend, Operation, PathBuilder,
-        Request, Response, field::FieldTrait,
+use crate::{
+    common::errors::RvError,
+    vault::{
+        core::Core,
+        logical::{
+            Backend, FieldBuilder, FieldType, FieldsBuilder, LogicalBackend, Operation,
+            PathBuilder, Request, Response, field::FieldTrait,
+        },
+        modules::{
+            Module,
+            auth::{AUTH_TABLE_TYPE, AuthModule},
+            policy::{PolicyModule, acl::ACL},
+        },
+        mount::{MOUNT_TABLE_TYPE, MountEntry},
+        rv_error_response_status,
+        storage::StorageEntry,
     },
-    modules::{
-        Module,
-        auth::{AUTH_TABLE_TYPE, AuthModule},
-        policy::{PolicyModule, acl::ACL},
-    },
-    mount::{MOUNT_TABLE_TYPE, MountEntry},
-    rv_error_response_status,
-    storage::StorageEntry,
 };
 
 static SYSTEM_BACKEND_HELP: &str = r#"

@@ -12,7 +12,6 @@ use crate::{
     api::{
         MonoApiServiceState,
         api_doc::SYSTEM_COMMON,
-        error::ApiError,
         notes::note_router,
         router::{
             admin_router, artifacts_router, bot_router, buck_router, build_trigger_router,
@@ -23,7 +22,7 @@ use crate::{
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
-    common::errors::MegaError,
+    common::errors::{ApiError, MegaError},
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {

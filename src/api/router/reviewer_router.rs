@@ -5,13 +5,13 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::CL_TAG, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, api_doc::CL_TAG, oauth::model::LoginUser},
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     ceres::model::change_list::{
         ChangeReviewStatePayload, ChangeReviewerStatePayload, ReviewerInfo, ReviewerPayload,
         ReviewersResponse,
     },
-    common::errors::MegaError,
+    common::errors::{ApiError, MegaError},
     contract::api::common::CommonResult,
 };
 

@@ -8,12 +8,9 @@ use axum::{
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{
-        MonoApiServiceState,
-        api_doc::TAG_MANAGE,
-        error::{ApiError, map_ceres_error},
-    },
+    api::{MonoApiServiceState, api_doc::TAG_MANAGE},
     ceres::model::tag::{CreateTagRequest, DeleteTagResponse, TagListResponse, TagResponse},
+    common::errors::{ApiError, map_ceres_error},
     contract::api::common::{CommonResult, PageParams},
 };
 

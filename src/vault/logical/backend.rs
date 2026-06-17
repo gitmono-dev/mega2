@@ -10,7 +10,7 @@ use super::{
     response::Response,
     secret::{Secret, SecretBuilder},
 };
-use crate::vault::{context::Context, errors::RvError};
+use crate::{common::errors::RvError, vault::context::Context};
 
 type BackendOperationHandler = dyn for<'a> Fn(
         &'a dyn Backend,

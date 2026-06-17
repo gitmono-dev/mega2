@@ -11,17 +11,19 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 
-use crate::vault::{
-    config::MountEntryHMACLevel,
-    core::{Core, LogicalBackendNewFunc},
-    errors::RvError,
-    handler::{AuthHandler, Handler},
-    logical::Backend,
-    modules::Module,
-    mount::{MountEntry, MountTable, MountsRouter},
-    rv_error_response_status,
-    storage::{barrier::SecurityBarrier, barrier_view::BarrierView},
-    utils::{generate_uuid, is_protect_path},
+use crate::{
+    common::errors::RvError,
+    vault::{
+        config::MountEntryHMACLevel,
+        core::{Core, LogicalBackendNewFunc},
+        handler::{AuthHandler, Handler},
+        logical::Backend,
+        modules::Module,
+        mount::{MountEntry, MountTable, MountsRouter},
+        rv_error_response_status,
+        storage::{barrier::SecurityBarrier, barrier_view::BarrierView},
+        utils::{generate_uuid, is_protect_path},
+    },
 };
 
 pub mod expiration;

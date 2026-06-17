@@ -1,43 +1,18 @@
 use cedar_policy::{
-    Authorizer, CedarSchemaError, Context, Decision, Diagnostics, ParseErrors, PolicySet,
-    PolicySetError, Request, Schema, SchemaError, ValidationMode, Validator,
+    Authorizer, Context, Decision, PolicySet, Request, Schema, ValidationMode, Validator,
 };
 use itertools::Itertools;
-use thiserror::Error;
 
-use crate::contract::policy::{entitystore::EntityStore, util::SaturnEUid};
+use crate::{
+    common::errors::{ContextError, SaturnContextError},
+    contract::policy::{entitystore::EntityStore, util::SaturnEUid},
+};
 
 pub struct CedarContext {
     pub entities: EntityStore,
     authorizer: Authorizer,
     policies: PolicySet,
     schema: Schema,
-}
-
-#[derive(Debug, Error)]
-pub enum ContextError {
-    #[error("{0}")]
-    IO(#[from] std::io::Error),
-    #[error("Error Parsing Json Schema: {0}")]
-    JsonSchema(#[from] SchemaError),
-    #[error("Error Parsing Human-readable Schema: {0}")]
-    CedarSchema(#[from] CedarSchemaError),
-    #[error("Error Parsing PolicySet: {0}")]
-    Policy(#[from] ParseErrors),
-    #[error("Error Processing PolicySet: {0}")]
-    PolicySet(#[from] PolicySetError),
-    #[error("Validation Failed: {0}")]
-    Validation(String),
-    #[error("Error Deserializing Json: {0}")]
-    Json(#[from] serde_json::Error),
-}
-
-#[derive(Debug, Error)]
-pub enum SaturnContextError {
-    #[error("Authorization Denied")]
-    AuthDenied(Diagnostics),
-    #[error("Error constructing authorization request: {0}")]
-    Request(String),
 }
 
 #[allow(clippy::result_large_err)]

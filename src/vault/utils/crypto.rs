@@ -26,58 +26,12 @@ use std::ops::DerefMut;
 use blake2b_simd::Params;
 use openssl::rand::rand_priv_bytes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::vault::modules::crypto::{AEADCipher, AES, AESKeySize, BlockCipher, CipherMode};
-
-/// Error types that can occur during cryptographic operations.
-///
-/// This enum provides a unified error type for all cryptographic operations
-/// in the module, including encryption, decryption, serialization, and
-/// other crypto-related errors.
-#[derive(Debug, Error)]
-pub enum CryptoError {
-    /// A custom error with a descriptive message.
-    ///
-    /// Used for errors that don't fit into the other categories,
-    /// such as invalid input data or unsupported operations.
-    #[error("Crypto error: {0}")]
-    Custom(String),
-
-    /// An error that occurred during JSON serialization or deserialization.
-    ///
-    /// This error is automatically converted from `serde_json::Error`
-    /// and typically occurs when encrypting/decrypting data that
-    /// cannot be properly serialized or deserialized.
-    #[error("Some serde_json error happened, {:?}", .source)]
-    SerdeJson {
-        #[from]
-        source: serde_json::Error,
-    },
-
-    /// An error that occurred during OpenSSL cryptographic operations.
-    ///
-    /// This error is automatically converted from `openssl::error::ErrorStack`
-    /// and typically occurs during encryption, decryption, or key generation
-    /// operations when the underlying OpenSSL library encounters an error.
-    #[error("Some openssl error happened, {:?}", .source)]
-    OpenSSL {
-        #[from]
-        source: openssl::error::ErrorStack,
-    },
-
-    /// An error that occurred in the RustyVault core system.
-    ///
-    /// This error is automatically converted from `crate::vault::errors::RvError`
-    /// and typically occurs when the cryptographic operation interacts
-    /// with other parts of the RustyVault system.
-    #[error("Some RustyVault error happened, {:?}", .source)]
-    RvError {
-        #[from]
-        source: crate::vault::errors::RvError,
-    },
-}
+use crate::{
+    common::errors::CryptoError,
+    vault::modules::crypto::{AEADCipher, AES, AESKeySize, BlockCipher, CipherMode},
+};
 
 type Result<T, E = CryptoError> = std::result::Result<T, E>;
 

@@ -21,7 +21,7 @@ use super::{
     Backend, BackendEntry, Storage, StorageEntry,
     barrier::{BARRIER_INIT_PATH, SecurityBarrier},
 };
-use crate::vault::errors::RvError;
+use crate::common::errors::RvError;
 
 const EPOCH_SIZE: usize = 4;
 const KEY_EPOCH: u8 = 1;

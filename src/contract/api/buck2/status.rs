@@ -11,9 +11,9 @@
 use std::{fs, path::Path};
 
 use anyhow::Context as _;
-use thiserror::Error;
 use utoipa::ToSchema;
 
+use crate::common::errors::StatusParseError;
 pub use crate::contract::api::buck2::types::ProjectRelativePath;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -21,14 +21,6 @@ pub enum Status<Path> {
     Modified(Path),
     Added(Path),
     Removed(Path),
-}
-
-#[derive(Error, Debug)]
-enum StatusParseError {
-    #[error("Unexpected line format: {0}")]
-    UnexpectedFormat(String),
-    #[error("Unknown line prefix: {0}")]
-    UnknownPrefix(String),
 }
 
 impl Status<ProjectRelativePath> {

@@ -10,7 +10,8 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::CHAT_TAG, error::ApiError, oauth::model::LoginUser},
+    api::{MonoApiServiceState, api_doc::CHAT_TAG, oauth::model::LoginUser},
+    common::errors::ApiError,
     contract::api::{
         chat::{
             AttachmentConfirmReq, AttachmentPresignReq, AttachmentPresignRes, AttachmentResponse,
