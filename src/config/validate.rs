@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 use toml::Value;
 use url::Url;
 
@@ -21,6 +22,7 @@ impl Config {
         if let Some(buck_config) = &self.buck {
             validate_buck_config(buck_config)?;
         }
+        validate_object_storage_config(&self.object_storage)?;
 
         Ok(())
     }
@@ -78,6 +80,59 @@ pub(crate) fn validate_buck_config(buck_config: &BuckConfig) -> Result<(), MegaE
     buck_config
         .validate()
         .map_err(|e| MegaError::Other(format!("Invalid Buck configuration: {e}")))
+}
+
+pub(crate) fn validate_object_storage_config(
+    object_storage: &ObjectStorageConfig,
+) -> Result<(), MegaError> {
+    match object_storage.storage_type {
+        ObjectStorageBackend::Local => require_non_empty(
+            "object_storage.local.root_dir",
+            &object_storage.local.root_dir,
+        ),
+        ObjectStorageBackend::S3 => validate_s3_config(object_storage, false),
+        ObjectStorageBackend::S3Compatible => validate_s3_config(object_storage, true),
+        ObjectStorageBackend::Gcs => {
+            require_non_empty("object_storage.gcs.bucket", &object_storage.gcs.bucket)
+        }
+    }
+}
+
+fn validate_s3_config(
+    object_storage: &ObjectStorageConfig,
+    require_endpoint: bool,
+) -> Result<(), MegaError> {
+    let s3 = &object_storage.s3;
+    require_non_empty("object_storage.s3.region", &s3.region)?;
+    require_non_empty("object_storage.s3.bucket", &s3.bucket)?;
+    require_non_empty("object_storage.s3.access_key_id", &s3.access_key_id)?;
+    require_non_empty("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
+
+    if require_endpoint {
+        require_non_empty("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
+        validate_http_url("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
+    }
+
+    Ok(())
+}
+
+fn require_non_empty(field_path: &str, value: &str) -> Result<(), MegaError> {
+    if value.trim().is_empty() {
+        return Err(MegaError::Other(format!("{field_path} must not be empty")));
+    }
+
+    Ok(())
+}
+
+fn validate_http_url(field_path: &str, value: &str) -> Result<(), MegaError> {
+    let url = Url::parse(value)
+        .map_err(|e| MegaError::Other(format!("{field_path} must be a valid URL: {e}")))?;
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => Err(MegaError::Other(format!(
+            "{field_path} scheme must be 'http' or 'https', got '{scheme}'"
+        ))),
+    }
 }
 
 pub fn warn_known_unconsumed_file_fields(path: &Path) -> Result<(), MegaError> {
@@ -306,6 +361,8 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(test)]
 mod tests {
+    use orbit_api::factory::{GcsConfig, LocalConfig, S3Config};
+
     use super::*;
     use crate::config::{secret::SecretRef, template::config_init_template};
 
@@ -390,6 +447,106 @@ mod tests {
 
         assert!(err.to_string().contains("Invalid Buck configuration"));
         assert!(err.to_string().contains("max_files"));
+    }
+
+    #[test]
+    fn config_validate_rejects_empty_local_object_storage_root() {
+        let mut config = Config::mock();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::Local,
+            local: LocalConfig {
+                root_dir: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("local object storage root should fail");
+
+        assert!(err.to_string().contains("object_storage.local.root_dir"));
+    }
+
+    #[test]
+    fn config_validate_rejects_incomplete_s3_object_storage() {
+        let mut config = Config::mock();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: String::new(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "secret".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("missing s3 bucket should fail");
+
+        assert!(err.to_string().contains("object_storage.s3.bucket"));
+    }
+
+    #[test]
+    fn config_validate_rejects_s3_compatible_without_endpoint() {
+        let mut config = Config::mock();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3Compatible,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "mono".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "secret".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("missing s3-compatible endpoint should fail");
+
+        assert!(err.to_string().contains("object_storage.s3.endpoint_url"));
+    }
+
+    #[test]
+    fn config_validate_accepts_complete_s3_compatible_object_storage() {
+        let mut config = Config::mock();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3Compatible,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "mono".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "secret".to_string(),
+                endpoint_url: "http://localhost:9000".to_string(),
+            },
+            ..Default::default()
+        };
+
+        config
+            .validate()
+            .expect("complete s3-compatible config should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_incomplete_gcs_object_storage() {
+        let mut config = Config::mock();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::Gcs,
+            gcs: GcsConfig {
+                bucket: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("missing gcs bucket should fail");
+
+        assert!(err.to_string().contains("object_storage.gcs.bucket"));
     }
 
     #[test]

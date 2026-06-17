@@ -108,7 +108,12 @@ impl Config {
             build: BuildConfig::default(),
             redis: RedisConfig::default(),
             buck: None,
-            object_storage: ObjectStorageConfig::default(),
+            object_storage: ObjectStorageConfig {
+                local: orbit_api::factory::LocalConfig {
+                    root_dir: mega_base().join("objects").to_string_lossy().to_string(),
+                },
+                ..Default::default()
+            },
             orion_server: None,
             sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
