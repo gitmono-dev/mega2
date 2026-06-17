@@ -3,10 +3,8 @@
 use clap::{ArgMatches, Command};
 
 use crate::{
-    common::{
-        config::Config,
-        errors::{MegaError, MegaResult},
-    },
+    commands::{CommandContext, require_config},
+    common::errors::{MegaError, MegaResult},
     context::AppContext,
 };
 
@@ -22,8 +20,9 @@ pub fn cli() -> Command {
 }
 
 #[tokio::main]
-pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
-    let context = AppContext::new(config).await;
+pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    let config = require_config(ctx, "service")?;
+    let context = AppContext::new(config).await?;
 
     let (cmd, subcommand_args) = match args.subcommand() {
         Some((cmd, args)) => (cmd, args),

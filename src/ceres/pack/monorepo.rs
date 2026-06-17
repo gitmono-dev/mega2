@@ -23,6 +23,7 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
+use orbit_api::object_storage::MultiObjectByteStream;
 use sea_orm::DatabaseTransaction;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,7 +47,6 @@ use crate::{
         utils::{self, ZERO_ID},
     },
     contract::api::common::Pagination,
-    io_orbit::object_storage::MultiObjectByteStream,
     jupiter::{storage::Storage, utils::converter::FromMegaModel},
 };
 

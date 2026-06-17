@@ -1,9 +1,7 @@
-use crate::{
-    io_orbit::factory::MegaObjectStorageWrapper,
-    jupiter::storage::{
-        base_storage::{BaseStorage, StorageConnector},
-        lfs_db_storage::LfsDbStorage,
-    },
+use crate::jupiter::storage::{
+    base_storage::{BaseStorage, StorageConnector},
+    lfs_db_storage::LfsDbStorage,
+    object_storage::{MegaObjectStorageWrapper, mock_object_storage},
 };
 
 #[derive(Clone)]
@@ -18,7 +16,7 @@ impl LfsService {
 
         Self {
             lfs_storage: LfsDbStorage { base: mock.clone() },
-            obj_storage: MegaObjectStorageWrapper::mock(),
+            obj_storage: mock_object_storage(),
         }
     }
 }

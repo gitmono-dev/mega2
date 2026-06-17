@@ -6,7 +6,7 @@ before submitting.
 
 ## Project Overview
 
-- **Name:** `monoengine` (a single Rust binary crate, see `Cargo.toml`).
+- **Name:** `monoengine` (a Rust binary crate, see `Cargo.toml`).
 - **Edition:** Rust 2024.
 - **Purpose:** Mono‑repo / Git hosting + service engine. Ports and extends
   several subsystems originally from the Mega project (notably `callisto`
@@ -29,10 +29,12 @@ before submitting.
 - **Auth / policy:** `cedar-policy` (schema in `src/mega.cedarschema`,
   policies in `src/mega_policies.cedar`).
 - **Crypto / TLS:** `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`,
-  `secp256k1`, `pgp`. Vault‑style PKI/secret engine via `libvault-core`
-  (`src/vault/`).
+  `secp256k1`, `pgp`. Vault‑style PKI/secret engine via the vendored
+  RustyVault module (`src/vault/`) and monoengine integration layer
+  (`src/contract/vault/`).
 - **Email:** `lettre` (rustls + tokio).
-- **Object storage:** `object_store` (aws + gcp features).
+- **Object storage:** `orbit-api` interface/config plus the sibling `../orbit`
+  implementation crate (local FS, S3/S3-compatible, GCS).
 - **Allocator:** `jemalloc` on non‑Windows, `mimalloc` on Windows
   (configured in `src/main.rs`).
 - **Logging:** `tracing` + `tracing-subscriber` + `tracing-appender`
@@ -104,7 +106,7 @@ without it.
 ## Project Layout
 
 ```
-Cargo.toml                # single-crate manifest
+Cargo.toml                # binary crate manifest; depends on sibling ../orbit/api
 config/config.toml        # default runtime config (TOML)
 src/
 ├── main.rs               # entry; declares all top-level modules
@@ -123,11 +125,13 @@ src/
 │   └── tests.rs          # `pub mod tests` (cfg(test)) — shared test helpers
 ├── notification/         # email notifications: dispatcher, triggers, storage
 ├── email/                # Mailer trait + impls (incl. NoopMailer)
-├── vault/                # PKI / KV / secret engine (libvault-core integration)
-│   └── integration/
-│       ├── jupiter_backend.rs
-│       └── vault_core.rs # VaultCore, VaultCoreInterface
-├── bellatrix/  ceres/  saturn/  io_orbit/  context/  git_protocol/
+├── vault/                # vendored RustyVault module used by VaultCore
+├── contract/
+│   └── vault/            # PKI / KV / secret engine integration layer
+│       └── integration/
+│           ├── jupiter_backend.rs
+│           └── vault_core.rs # VaultCore, VaultCoreInterface
+├── bellatrix/  ceres/  saturn/  context/  git_protocol/
 └── mega.cedarschema, mega_policies.cedar
 test/project/             # fixture data for integration tests
 target/                   # build artifacts (gitignored)
@@ -135,6 +139,10 @@ target/                   # build artifacts (gitignored)
 
 `pub use crate::callisto::*;` is re‑exported from `main.rs`; importing
 `callisto` entities elsewhere should use `crate::callisto::<table>` paths.
+Object storage public types remain available from `orbit_api::*`; monoengine's
+storage layer builds the concrete backend through
+`crate::jupiter::storage::object_storage::ObjectStorageFactory`, backed by the
+sibling `../orbit` implementation crate.
 
 ## Code Conventions
 
@@ -168,14 +176,16 @@ target/                   # build artifacts (gitignored)
    ```
    Forgetting these traits produces misleading errors such as
    `email_jobs::Entity is not an iterator`.
-2. **`VaultCore` path.** `src/vault/integration/mod.rs` does **not**
+2. **`VaultCore` path.** `src/contract/vault/integration/mod.rs` does **not**
    re‑export `VaultCore`. Import it directly from its submodule:
    ```rust
-   use crate::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+   use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
    ```
-3. **Glob re‑exports / `vault` module.** `mod vault;` in `main.rs` carries
-   `#[allow(hidden_glob_reexports)]` to silence a known interaction with
-   `pub use crate::callisto::*;`. Keep that attribute when reordering modules.
+3. **Glob re‑exports / top-level `vault` module.** `src/main.rs` declares a
+   vendored top-level `mod vault;`, which intentionally hides the `vault`
+   entity glob re-export from `pub use crate::callisto::*;`. Keep entity imports
+   explicit via `crate::callisto::vault`, and keep product integration imports
+   rooted under `crate::contract::vault`.
 4. **Crate‑level `dead_code` allow.** `#![allow(dead_code)]` in `main.rs`
    is intentional. If you add a new pub API item, you don't need to add
    per‑item allows; if you remove the crate‑level allow, expect ~70 warnings.

@@ -60,6 +60,7 @@ use git_internal::{
         },
     },
 };
+use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 use regex::Regex;
 use tracing::debug;
 
@@ -98,7 +99,6 @@ use crate::{
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
     contract::api::common::Pagination,
-    io_orbit::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
     jupiter::{
         service::buck_service::{
             CommitArtifacts, CompletePayload as SvcCompletePayload,
@@ -1425,7 +1425,8 @@ impl MonoApiService {
             .obj_storage
             .inner
             .get_stream(&key)
-            .await;
+            .await
+            .map_err(MegaError::from);
         let (mut stream, _meta) = match stream {
             Ok(result) => result,
             Err(MegaError::ObjStorageNotFound(_)) => return Ok(String::new()),
@@ -1459,12 +1460,13 @@ impl MonoApiService {
             ..Default::default()
         };
 
-        self.storage
+        Ok(self
+            .storage
             .git_service
             .obj_storage
             .inner
             .put_stream(&key, Box::pin(stream), meta)
-            .await
+            .await?)
     }
 
     pub async fn change_cla_sign_status(
@@ -4795,33 +4797,50 @@ fn test_parse_github_link() {
 async fn test_third_party_trait() {
     let url = "https://github.com/aidcheng/mega.git";
     let third_party_client = ThirdPartyClient::new(url);
+    let remote_timeout = std::time::Duration::from_secs(30);
 
-    let (_, refs) = match third_party_client.fetch_refs().await {
-        Ok(refs) => refs,
-        Err(err) => {
+    let (_, refs) =
+        match tokio::time::timeout(remote_timeout, third_party_client.fetch_refs()).await {
+            Ok(Ok(refs)) => refs,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    "Skipping test_third_party_trait because remote refs are unavailable: {}",
+                    err
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("Skipping test_third_party_trait because remote refs timed out");
+                return;
+            }
+        };
+
+    let res =
+        match tokio::time::timeout(remote_timeout, third_party_client.fetch_packs(&[refs])).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    "Skipping test_third_party_trait because pack fetch failed: {}",
+                    err
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("Skipping test_third_party_trait because pack fetch timed out");
+                return;
+            }
+        };
+
+    match tokio::time::timeout(remote_timeout, third_party_client.process_pack_stream(res)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
             tracing::warn!(
-                "Skipping test_third_party_trait because remote refs are unavailable: {}",
+                "Skipping test_third_party_trait because pack processing failed: {}",
                 err
             );
-            return;
         }
-    };
-
-    let res = match third_party_client.fetch_packs(&[refs]).await {
-        Ok(res) => res,
-        Err(err) => {
-            tracing::warn!(
-                "Skipping test_third_party_trait because pack fetch failed: {}",
-                err
-            );
-            return;
+        Err(_) => {
+            tracing::warn!("Skipping test_third_party_trait because pack processing timed out");
         }
-    };
-
-    if let Err(err) = third_party_client.process_pack_stream(res).await {
-        tracing::warn!(
-            "Skipping test_third_party_trait because pack processing failed: {}",
-            err
-        );
     }
 }

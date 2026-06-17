@@ -6,7 +6,7 @@ use std::{
 use openssl::{asn1::Asn1Time, x509::X509};
 use serde_json::{Value, json};
 
-use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+use crate::{common::errors::MegaError, contract::vault::integration::vault_core::VaultCore};
 
 // FIXME: A more official and robust ROLE name
 const ROLE: &str = "test-role";
@@ -14,11 +14,11 @@ const ROLE: &str = "test-role";
 #[allow(unused)]
 impl VaultCore {
     /// Initialize the Vault CA
-    async fn init_ca(&self) {
+    async fn init_ca(&self) -> Result<(), MegaError> {
         // err = not found
         if self.read_api("pki/ca/tls/pem").await.is_err() {
-            self.config_ca().await;
-            self.generate_root(false).await;
+            self.config_ca().await?;
+            self.generate_root(false).await?;
             self.config_role(json!({
                 "ttl": "60d",
                 "max_ttl": "365d",
@@ -30,27 +30,27 @@ impl VaultCore {
                 "organization": "OpenAtom-Mega",
                 "no_store": false,
             }))
-            .await;
+            .await?;
         }
+        Ok(())
     }
 
-    async fn config_ca(&self) {
+    async fn config_ca(&self) -> Result<(), MegaError> {
         // mount pki backend to path: pki/
         let mount_data = json!({
             "type": "pki",
         })
         .as_object()
-        .unwrap()
+        .ok_or_else(|| MegaError::Other("PKI mount data must be a JSON object".to_string()))?
         .clone();
 
-        self.write_api("sys/mounts/pki/", Some(mount_data))
-            .await
-            .expect("Failed to mount pki backend");
+        self.write_api("sys/mounts/pki/", Some(mount_data)).await?;
+        Ok(())
     }
 
     /// generate root cert, so that you can read from `pki/ca/tls/pem`
     /// - if `exported` is true, then the response will contain `private key`
-    async fn generate_root(&self, exported: bool) {
+    async fn generate_root(&self, exported: bool) -> Result<(), MegaError> {
         let key_type = "rsa";
         let key_bits = 4096;
         let common_name = "mega-ca";
@@ -62,7 +62,7 @@ impl VaultCore {
             "key_bits": key_bits,
         })
         .as_object()
-        .unwrap()
+        .ok_or_else(|| MegaError::Other("PKI root request must be a JSON object".to_string()))?
         .clone();
 
         self.write_api(
@@ -73,11 +73,11 @@ impl VaultCore {
             .as_str(),
             Some(req_data),
         )
-        .await
-        .expect("Failed to generate root cert");
+        .await?;
+        Ok(())
     }
 
-    /// - `data`: see [RoleEntry](libvault::modules::pki::path_roles)
+    /// - `data`: see [RoleEntry](crate::vault::modules::pki::path_roles)
     ///  - This function configures a role for issuing certificates.
     ///  - The `ROLE` constant is used as the role name.
     ///
@@ -98,37 +98,51 @@ impl VaultCore {
     ///     "no_store": false
     ///   }
     ///   ```
-    pub async fn config_role(&self, data: Value) {
+    pub async fn config_role(&self, data: Value) -> Result<(), MegaError> {
         let role_data = data
             .as_object()
-            .expect("`data` must be a JSON object")
+            .ok_or_else(|| MegaError::Other("PKI role data must be a JSON object".to_string()))?
             .clone();
 
         // config role
         self.write_api(format!("pki/roles/tls/{ROLE}"), Some(role_data))
-            .await
-            .expect("Failed to configure role");
+            .await?;
+        Ok(())
     }
 
     /// issue certificate
-    /// - `data`: see [issue_path](libvault::modules::pki::path_issue)
+    /// - `data`: see [issue_path](crate::vault::modules::pki::path_issue)
     /// - return: `(cert_pem, private_key)`
-    pub async fn issue_cert(&self, data: Value) -> (String, String) {
+    pub async fn issue_cert(&self, data: Value) -> Result<(String, String), MegaError> {
         // let dns_sans = ["test.com", "a.test.com", "b.test.com"];
         let issue_data = data
             .as_object()
-            .expect("`data` must be a JSON object")
+            .ok_or_else(|| MegaError::Other("PKI issue data must be a JSON object".to_string()))?
             .clone();
 
         // issue cert
-        let resp = self.write_api(format!("pki/issue/tls/{ROLE}"), Some(issue_data));
-        let resp_body = resp.await.unwrap();
-        let cert_data = resp_body.unwrap().data.unwrap();
+        let resp_body = self
+            .write_api(format!("pki/issue/tls/{ROLE}"), Some(issue_data))
+            .await?;
+        let cert_data = resp_body
+            .and_then(|response| response.data)
+            .ok_or_else(|| MegaError::Other("PKI issue response is missing data".to_string()))?;
+        let certificate = cert_data
+            .get("certificate")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                MegaError::Other("PKI issue response is missing certificate".to_string())
+            })?
+            .to_owned();
+        let private_key = cert_data
+            .get("private_key")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                MegaError::Other("PKI issue response is missing private_key".to_string())
+            })?
+            .to_owned();
 
-        (
-            cert_data["certificate"].as_str().unwrap().to_owned(), // TODO may add root cert (chain) in it
-            cert_data["private_key"].as_str().unwrap().to_owned(),
-        )
+        Ok((certificate, private_key))
     }
 
     /// Verify certificate: time & signature
@@ -137,37 +151,55 @@ impl VaultCore {
     ///
     /// # Returns
     /// - `true` if the certificate is valid, `false` otherwise.
-    pub async fn verify_cert(&self, cert_pem: &[u8]) -> bool {
-        let ca_cert = X509::from_pem(self.get_root_cert().await.as_ref()).unwrap();
+    pub async fn verify_cert(&self, cert_pem: &[u8]) -> Result<bool, MegaError> {
+        let root_cert = self.get_root_cert().await?;
+        let ca_cert = X509::from_pem(root_cert.as_bytes())
+            .map_err(|e| MegaError::Other(format!("failed to parse PKI root certificate: {e}")))?;
 
-        let cert = X509::from_pem(cert_pem).unwrap();
+        let cert = X509::from_pem(cert_pem)
+            .map_err(|e| MegaError::Other(format!("failed to parse certificate: {e}")))?;
         // verify time
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| MegaError::Other(format!("system time before UNIX epoch: {e}")))?
             .as_secs() as i64;
-        let now = Asn1Time::from_unix(now).unwrap();
+        let now = Asn1Time::from_unix(now)
+            .map_err(|e| MegaError::Other(format!("failed to construct ASN.1 time: {e}")))?;
         let not_before = cert.not_before();
         let not_after = cert.not_after();
         match now.compare(not_before) {
-            Ok(Ordering::Less) | Err(_) => return false,
+            Ok(Ordering::Less) | Err(_) => return Ok(false),
             _ => {}
         }
         match now.compare(not_after) {
-            Ok(Ordering::Greater) | Err(_) => return false,
+            Ok(Ordering::Greater) | Err(_) => return Ok(false),
             _ => {}
         }
 
         // verify signature
-        cert.verify(&ca_cert.public_key().unwrap()).unwrap()
+        let public_key = ca_cert
+            .public_key()
+            .map_err(|e| MegaError::Other(format!("failed to read PKI root public key: {e}")))?;
+        cert.verify(&public_key)
+            .map_err(|e| MegaError::Other(format!("failed to verify certificate: {e}")))
     }
 
     /// Get root certificate of CA
-    pub async fn get_root_cert(&self) -> String {
-        let resp_ca_pem = self.read_api("pki/ca/tls/pem").await.unwrap().unwrap();
-        let ca_data = resp_ca_pem.data.unwrap();
+    pub async fn get_root_cert(&self) -> Result<String, MegaError> {
+        let resp_ca_pem = self.read_api("pki/ca/tls/pem").await?.ok_or_else(|| {
+            MegaError::Other("PKI root certificate response is empty".to_string())
+        })?;
+        let ca_data = resp_ca_pem.data.ok_or_else(|| {
+            MegaError::Other("PKI root certificate response is missing data".to_string())
+        })?;
 
-        ca_data["certificate"].as_str().unwrap().to_owned()
+        ca_data
+            .get("certificate")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                MegaError::Other("PKI root certificate response is missing certificate".to_string())
+            })
     }
 }
 
@@ -180,21 +212,20 @@ mod tests_raw {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use libvault::logical::Response;
     use openssl::{asn1::Asn1Time, ec::EcKey, nid::Nid, pkey::PKey, rsa::Rsa, x509::X509};
     use serde_json::{Map, Value, json};
 
     use crate::{
-        common::errors::MegaError,
-        contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
+        contract::vault::integration::vault_core::{VaultCore, VaultResult},
         jupiter::tests::test_storage,
+        vault::logical::Response,
     };
 
     async fn test_read_api(
         core: &VaultCore,
         path: &str,
         is_ok: bool,
-    ) -> Result<Option<Response>, MegaError> {
+    ) -> VaultResult<Option<Response>> {
         let resp = core.read_api(path).await;
         assert_eq!(resp.is_ok(), is_ok);
         resp
@@ -205,9 +236,9 @@ mod tests_raw {
         path: &str,
         is_ok: bool,
         data: Option<Map<String, Value>>,
-    ) -> Result<Option<Response>, MegaError> {
+    ) -> VaultResult<Option<Response>> {
         let resp = core.write_api(path, data).await;
-        assert_eq!(resp.is_ok(), is_ok);
+        assert_eq!(resp.is_ok(), is_ok, "{path}: {resp:?}");
         resp
     }
 
@@ -444,7 +475,9 @@ mod tests_raw {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
         let key_path = temp_dir.path().join("key.json");
         let storage = test_storage(temp_dir.path()).await;
-        let vault_core = VaultCore::config(storage, key_path).await;
+        let vault_core = VaultCore::config(storage.vault_storage(), key_path)
+            .await
+            .expect("vault core should initialize");
 
         {
             println!("Initializing Vault CA...");

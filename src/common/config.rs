@@ -6,11 +6,13 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 use c::{ConfigError, FileFormat};
 pub use config as c;
 use config::{Source, ValueKind, builder::DefaultState};
+pub use orbit_api::factory::ObjectStorageConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::common::errors::MegaError;
 
 pub mod loader;
+pub mod secret;
 pub mod template;
 
 /// Retrieves the base directory path for Mega
@@ -108,22 +110,11 @@ pub struct Config {
 
 impl Config {
     pub fn new(path: &str) -> Result<Self, MegaError> {
-        let builder = c::Config::builder()
-            .add_source(c::File::new(path, FileFormat::Toml))
-            .add_source(
-                c::Environment::with_prefix("mega")
-                    .prefix_separator("_")
-                    .separator("__")
-                    .try_parsing(true)
-                    .with_list_parse_key("oauth.allowed_cors_origins")
-                    .with_list_parse_key("monorepo.admin")
-                    .with_list_parse_key("monorepo.root_dirs")
-                    .list_separator(","),
-            );
+        Ok(Config::from_config(config_from_path(path))?)
+    }
 
-        let config = variable_placeholder_substitute(builder);
-
-        Ok(Config::from_config(config)?)
+    pub fn load_vault_bootstrap(path: &str) -> Result<VaultBootstrapConfig, ConfigError> {
+        config_from_path(path).try_deserialize::<VaultBootstrapConfig>()
     }
 
     pub fn mock() -> Self {
@@ -177,6 +168,28 @@ impl Config {
     pub fn from_config(config: c::Config) -> Result<Self, ConfigError> {
         config.try_deserialize::<Config>()
     }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct VaultBootstrapConfig {
+    pub database: DbConfig,
+}
+
+fn config_from_path(path: &str) -> c::Config {
+    let builder = c::Config::builder()
+        .add_source(c::File::new(path, FileFormat::Toml))
+        .add_source(
+            c::Environment::with_prefix("mega")
+                .prefix_separator("_")
+                .separator("__")
+                .try_parsing(true)
+                .with_list_parse_key("oauth.allowed_cors_origins")
+                .with_list_parse_key("monorepo.admin")
+                .with_list_parse_key("monorepo.root_dirs")
+                .list_separator(","),
+        );
+
+    variable_placeholder_substitute(builder)
 }
 
 /// supports braces-delimited variables (i.e. ${foo}) in config.
@@ -383,6 +396,8 @@ pub struct MailConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub password_ref: Option<secret::SecretRef>,
     pub from: String,
     #[serde(default = "default_starttls")]
     pub starttls: bool,
@@ -404,9 +419,22 @@ impl Default for MailConfig {
             smtp_port: default_smtp_port(),
             username: None,
             password: None,
+            password_ref: None,
             from: String::new(),
             starttls: default_starttls(),
         }
+    }
+}
+
+impl MailConfig {
+    pub fn validate_secret_fields(&self) -> Result<(), MegaError> {
+        if self.password.is_some() && self.password_ref.is_some() {
+            return Err(MegaError::Other(
+                "mail.password and mail.password_ref are mutually exclusive".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -621,52 +649,6 @@ impl Default for LFSSshConfig {
             http_url: "http://localhost:8000".to_string(),
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct S3Config {
-    pub region: String,
-    pub bucket: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub endpoint_url: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-pub struct GcsConfig {
-    /// GCS bucket name
-    pub bucket: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-pub struct LocalConfig {
-    /// Root directory for object storage
-    pub root_dir: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ObjectStorageBackend {
-    S3,
-    S3Compatible,
-    Gcs,
-    #[default]
-    Local,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct ObjectStorageConfig {
-    /// Global backend for Git blobs, Git LFS, artifact protocol objects, and Orion cloud log segments (`mix` mode).
-    #[serde(default)]
-    pub storage_type: ObjectStorageBackend,
-    /// S3-compatible storage configuration
-    pub s3: S3Config,
-
-    /// Google Cloud Storage configuration
-    pub gcs: GcsConfig,
-
-    /// Local filesystem storage configuration
-    pub local: LocalConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1145,5 +1127,57 @@ mod test {
         assert!(parsed.mail.starttls);
         assert!(parsed.mail.username.is_none());
         assert!(parsed.mail.password.is_none());
+        assert!(parsed.mail.password_ref.is_none());
+    }
+
+    #[test]
+    fn test_mail_config_deserial_password_ref() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            mail: MailConfig,
+        }
+
+        let toml = r##"
+            [mail]
+            enabled = true
+            smtp_host = "smtp.example.com"
+            from = "no-reply@example.com"
+            password_ref = "vault://secret/config/prod/mail/password#value"
+        "##;
+
+        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
+        assert_eq!(
+            parsed.mail.password_ref.unwrap().as_uri(),
+            "vault://secret/config/prod/mail/password#value"
+        );
+    }
+
+    #[test]
+    fn test_vault_bootstrap_config_only_requires_database() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+                base_dir = "/tmp/monoengine-test"
+
+                [database]
+                db_type = "sqlite"
+                db_path = "/tmp/monoengine-test/mono.db"
+                db_url = "sqlite:///tmp/monoengine-test/mono.db"
+                max_connection = 4
+                min_connection = 1
+                acquire_timeout = 5
+                connect_timeout = 5
+                sqlx_logging = false
+            "#,
+        )
+        .expect("write config");
+
+        let loaded = Config::load_vault_bootstrap(config_path.to_str().expect("utf-8 config path"))
+            .expect("vault bootstrap config should parse without redis or object storage");
+
+        assert_eq!(loaded.database.db_type, "sqlite");
+        assert_eq!(loaded.database.max_connection, 4);
     }
 }

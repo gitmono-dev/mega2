@@ -4,6 +4,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use chrono::prelude::*;
 use futures::{Stream, StreamExt};
+use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 use rand::prelude::*;
 use reqwest::Method;
 
@@ -15,12 +16,9 @@ use crate::{
         UnlockRequest, VerifiableLockList, VerifiableLockRequest,
     },
     common::errors::{GitLFSError, MegaError},
-    io_orbit::{
-        factory::MegaObjectStorageWrapper,
-        object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
-    },
     jupiter::{
-        service::lfs_service::LfsService, storage::lfs_db_storage::LfsDbStorage,
+        service::lfs_service::LfsService,
+        storage::{lfs_db_storage::LfsDbStorage, object_storage::MegaObjectStorageWrapper},
         utils::into_obj_stream::IntoObjectStream,
     },
 };

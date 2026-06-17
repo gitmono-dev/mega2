@@ -8,6 +8,7 @@ use axum::{
 use cedar_policy::ParseErrors;
 use config::ConfigError;
 use git_internal::errors::GitError;
+use orbit_api::error::IoOrbitError;
 use thiserror::Error;
 
 use crate::contract::api::common::CommonResult;
@@ -67,6 +68,25 @@ impl From<Infallible> for MegaError {
 impl From<ParseErrors> for MegaError {
     fn from(err: ParseErrors) -> MegaError {
         MegaError::Other(err.to_string())
+    }
+}
+
+impl From<IoOrbitError> for MegaError {
+    fn from(err: IoOrbitError) -> Self {
+        let is_not_found = err.is_not_found();
+        match err {
+            IoOrbitError::ObjectStore { message, .. } if is_not_found => {
+                MegaError::ObjStorageNotFound(message)
+            }
+            IoOrbitError::ObjectStore { message, .. } => MegaError::ObjStorage(message),
+            IoOrbitError::Io(e) => MegaError::Io(e),
+            IoOrbitError::SerdeJson(e) => MegaError::SerdeJson(e),
+            IoOrbitError::TomlDe(e) => MegaError::Other(e.to_string()),
+            IoOrbitError::WriteManifestPreconditionFailed => {
+                MegaError::Other("write manifest precondition failed".to_string())
+            }
+            IoOrbitError::Other(e) => MegaError::Other(e),
+        }
     }
 }
 

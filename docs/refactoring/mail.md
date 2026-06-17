@@ -8,7 +8,7 @@
 
 > **与 config 计划的强绑定**：`mail` 是 `config.md` 反复强调的”第一批可迁移凭据”的**唯一合格载体**。当前 `mail` 已补齐为真实、活跃、消费点晚于 `VaultCore` 的模块，并在 `AppContext::new` 中于 vault 之后启动 `EmailDispatcher`；因此 config 阶段 5 可直接以 `mail.password` 为首个真实 `SecretRef` 落点。任何 mail 相关工作都必须严格遵守 config.md 中的引导循环约束（`Config → Storage(DB) → Vault`）、最小 bootstrap 要求、日志脱敏前置、fail-closed 等。
 
-> **集成测试指引**：邮件模块的各项功能（Mailer 启动、Dispatcher 后台处理、MailHog 验证、retry 机制）应通过 **`integration.md`** 中的 `test_mail_dispatcher` 和 `test_cli_workflow_complete` 场景进行端到端验证。
+> **集成测试指引**：邮件模块的各项功能（Mailer 启动、Dispatcher 后台处理、Mailpit 验证、retry 机制）应通过 **`integration.md`** 中的 `integration_mail_dispatcher_mailpit` 场景进行端到端验证。
 
 ## 事实校准（2026-06）
 

@@ -28,6 +28,7 @@ pub mod message_storage;
 pub mod mono_storage;
 pub mod note_storage;
 pub mod notification_storage;
+pub mod object_storage;
 pub mod open_graph_storage;
 pub mod reaction_storage;
 pub mod stg_common;
@@ -41,7 +42,6 @@ use tokio::sync::Semaphore;
 
 use crate::{
     common::{config::Config, errors::MegaError},
-    io_orbit::factory::ObjectStorageFactory,
     jupiter::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
@@ -80,6 +80,7 @@ use crate::{
             mono_storage::MonoStorage,
             note_storage::NoteStorage,
             notification_storage::NotificationStorage,
+            object_storage::ObjectStorageFactory,
             open_graph_storage::OpenGraphStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,

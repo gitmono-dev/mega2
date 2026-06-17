@@ -1,7 +1,10 @@
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use tracing::log;
 
-use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+use crate::{
+    common::errors::MegaError,
+    contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
+};
 
 const NOSTR_IDENTITY_KEY: &str = "nostr_identity_key";
 
@@ -28,16 +31,28 @@ impl VaultCore {
     /// Initialize the Nostr ID if it's not found.
     /// - return: `(Nostr ID, secret_key)`
     /// - You can get `Public Key` by just `base58::decode(nostr)`
-    pub async fn load_nostr_pair(&self) -> (String, String) {
-        match self
-            .read_secret(NOSTR_IDENTITY_KEY)
-            .await
-            .expect("Failed to read Nostr ID from vault")
-        {
+    pub async fn load_nostr_pair(&self) -> Result<(String, String), MegaError> {
+        match self.read_secret(NOSTR_IDENTITY_KEY).await? {
             Some(data) => {
-                let nostr = data["nostr"].as_str().unwrap().to_string();
-                let secret_key = data["secret_key"].as_str().unwrap().to_string();
-                (nostr, secret_key)
+                let nostr = data
+                    .get("nostr")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        MegaError::Other(format!(
+                            "Vault secret {NOSTR_IDENTITY_KEY} is missing nostr"
+                        ))
+                    })?
+                    .to_string();
+                let secret_key = data
+                    .get("secret_key")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        MegaError::Other(format!(
+                            "Vault secret {NOSTR_IDENTITY_KEY} is missing secret_key"
+                        ))
+                    })?
+                    .to_string();
+                Ok((nostr, secret_key))
             }
             None => {
                 log::debug!("Nostr ID not found in vault, generating new one...");
@@ -51,24 +66,27 @@ impl VaultCore {
                 .clone();
 
                 self.write_secret(NOSTR_IDENTITY_KEY, Some(data.clone()))
-                    .await
-                    .expect("Failed to write Nostr ID to vault");
-                (nostr, secret_key.display_secret().to_string())
+                    .await?;
+                Ok((nostr, secret_key.display_secret().to_string()))
             }
         }
     }
 
     /// Initialize the Nostr ID and return it along with the secret key.
-    pub async fn load_nostr_peerid(&self) -> String {
-        let (id, _sk) = self.load_nostr_pair().await;
-        id
+    pub async fn load_nostr_peerid(&self) -> Result<String, MegaError> {
+        let (id, _sk) = self.load_nostr_pair().await?;
+        Ok(id)
     }
 
     /// Initialize the Nostr ID and return it along with the secret key.
-    pub async fn load_nostr_secp_pair(&self) -> secp256k1::Keypair {
-        let (_, sk) = self.load_nostr_pair().await;
+    pub async fn load_nostr_secp_pair(&self) -> Result<secp256k1::Keypair, MegaError> {
+        let (_, sk) = self.load_nostr_pair().await?;
         let secp = secp256k1::Secp256k1::new();
-        secp256k1::Keypair::from_seckey_str(&secp, &sk).unwrap()
+        secp256k1::Keypair::from_seckey_str(&secp, &sk).map_err(|e| {
+            MegaError::Other(format!(
+                "Vault secret {NOSTR_IDENTITY_KEY} contains an invalid secret_key: {e}"
+            ))
+        })
     }
 }
 
@@ -89,8 +107,6 @@ mod tests {
     #[test]
     fn test_generate_nostr_id() {
         let (nostr, keypair) = generate_nostr_id();
-        println!("nostr: {nostr:?}");
-        println!("keypair: {keypair:?}");
         let secret_key = keypair.0;
         let public_key = keypair.1;
 

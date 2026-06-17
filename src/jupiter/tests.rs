@@ -8,7 +8,6 @@ use tracing::log;
 
 use crate::{
     common::config::Config,
-    io_orbit::factory::MegaObjectStorageWrapper,
     jupiter::{
         migration::apply_migrations,
         service::{
@@ -48,6 +47,7 @@ use crate::{
             mono_storage::MonoStorage,
             note_storage::NoteStorage,
             notification_storage::NotificationStorage,
+            object_storage::mock_object_storage,
             open_graph_storage::OpenGraphStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
@@ -123,7 +123,7 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         issue_service: IssueService::mock(),
         cl_service: CLService::mock(),
         merge_queue_service: MergeQueueService::mock(),
-        artifact_service: ArtifactService::new(base.clone(), MegaObjectStorageWrapper::mock()),
+        artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
         config: Arc::downgrade(&config),
         git_service: GitService::mock(),

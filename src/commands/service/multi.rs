@@ -59,10 +59,12 @@ pub(crate) async fn exec(ctx: AppContext, args: &ArgMatches) -> MegaResult {
         };
         tokio::spawn(async move { ssh_server::start_server(ctx, &ssh).await })
     } else {
-        tokio::spawn(async {})
+        tokio::spawn(async { Ok(()) })
     };
 
-    let _ = tokio::join!(http_server, ssh_server);
+    let (http_result, ssh_result) = tokio::join!(http_server, ssh_server);
+    http_result.map_err(|e| MegaError::Other(format!("HTTP server task failed to join: {e}")))?;
+    ssh_result.map_err(|e| MegaError::Other(format!("SSH server task failed to join: {e}")))??;
 
     Ok(())
 }

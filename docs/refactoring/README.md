@@ -82,7 +82,7 @@
   - 测试覆盖矩阵与改进计划的对应关系
   - CI/CD 集成示例（GitHub Actions）
   - 故障排查与调试指南
-- **关键依赖**：Docker、Docker Compose、PostgreSQL、Redis、MailHog
+- **关键依赖**：Docker、Docker Compose、PostgreSQL、Redis、Mailpit
 - **验收标准**：覆盖所有改进计划的关键路径，确保各模块集成无误
 
 ### 6. **其他文档**

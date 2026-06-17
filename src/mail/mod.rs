@@ -75,6 +75,15 @@ impl SmtpMailer {
     /// future SecretRef resolver) is available. See docs/config.md "secret 解析的依赖顺序"
     /// and docs/mail.md for the bootstrap rules and migration to `password_ref`.
     pub fn new(cfg: &MailConfig) -> Result<Self, MegaError> {
+        Self::new_with_password(cfg, cfg.password.clone())
+    }
+
+    pub fn new_with_password(
+        cfg: &MailConfig,
+        resolved_password: Option<String>,
+    ) -> Result<Self, MegaError> {
+        cfg.validate_secret_fields()?;
+
         if !cfg.enabled {
             return Ok(Self {
                 enabled: false,
@@ -92,7 +101,7 @@ impl SmtpMailer {
                 .port(cfg.smtp_port)
         };
 
-        if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
+        if let (Some(user), Some(pass)) = (&cfg.username, &resolved_password) {
             builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));
         }
 
@@ -181,6 +190,7 @@ mod tests {
             smtp_port: 587,
             username: None,
             password: None,
+            password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
         };
@@ -197,6 +207,7 @@ mod tests {
             smtp_port: 587,
             username: None,
             password: None,
+            password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
         };
@@ -218,6 +229,7 @@ mod tests {
             smtp_port: 587,
             username: None,
             password: None,
+            password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
         };

@@ -1,16 +1,16 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use git_internal::internal::object::blob::Blob;
+use orbit_api::object_storage::{
+    MultiObjectByteStream, ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace,
+};
 
 use crate::{
     common::{errors::MegaError, utils::is_full_hex_object_id},
-    io_orbit::{
-        factory::MegaObjectStorageWrapper,
-        object_storage::{
-            MultiObjectByteStream, ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace,
-        },
+    jupiter::{
+        storage::object_storage::{MegaObjectStorageWrapper, mock_object_storage},
+        utils::into_obj_stream::IntoObjectStream,
     },
-    jupiter::utils::into_obj_stream::IntoObjectStream,
 };
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub struct GitService {
 impl GitService {
     pub fn mock() -> Self {
         Self {
-            obj_storage: MegaObjectStorageWrapper::mock(),
+            obj_storage: mock_object_storage(),
         }
     }
 
@@ -49,7 +49,7 @@ impl GitService {
 
         Ok(if let Err(e) = res {
             tracing::debug!("Failed to upload blob {:?}: {:?}", key, e);
-            return Err(e);
+            return Err(e.into());
         } else {
             blob_id
         })
@@ -79,7 +79,7 @@ impl GitService {
 
         let _: () = if let Err(e) = res {
             tracing::debug!("Failed to upload blob {:?}: {:?}", key, e);
-            return Err(e);
+            return Err(e.into());
         };
         Ok(())
     }
@@ -153,6 +153,6 @@ impl GitService {
         &self,
         objects: MultiObjectByteStream<'_>,
     ) -> Result<(), MegaError> {
-        self.obj_storage.inner.put_many(objects, 16).await
+        Ok(self.obj_storage.inner.put_many(objects, 16).await?)
     }
 }

@@ -1,302 +1,387 @@
-# Monoengine 集成测试方案
+# Monoengine 集成测试方案（修订版）
 
-本文档描述 monoengine 的集成测试策略，基于 Docker 容器化环境，验证配置系统、Vault 安全、邮件通知、多渠道通知等核心模块的端到端功能。
+本文档定义 monoengine 的集成测试策略。它的目标不是替代单元测试，而是用接近生产的
+PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块数据流、控制流和错误
+边界是否正确。
 
-> **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
+> **治理规范**：本文档遵循 `../general.md` 中定义的统一结构、共同约束和执行标准。
+> 在审阅或执行本计划前，请先查阅 `general.md`。
 
-## 概述
+## 审查结论
 
-集成测试的目标是验证以下跨模块功能：
+原方案的方向合理：确实应该用容器化依赖验证 `Config -> Storage -> Redis -> Vault ->
+Mail -> Notification -> service` 这条链路。但原方案混淆了当前实现和未来目标，且存在几个
+会导致测试验证错误对象的关键问题：
 
-1. **配置加载与初始化链路** — `Config::new` → `Storage::new` → `VaultCore::new` → 服务启动
-2. **敏感凭据管理** — 数据库密码、Redis URL、邮件密码从文件/环境变量加载，进入 Vault，通过 SecretRef 解析
-3. **邮件通知端到端** — 配置 → SMTP mailer 构造 → dispatcher 启动 → 发送邮件
-4. **多渠道通知** — 触发器 → NotificationStorage → dispatcher 分发 → 各渠道投递
-5. **CLI 两阶段加载** — `config init` → `config secret set` → `config validate --resolve-secrets` → 服务启动
-6. **Contract 边界 smoke check** — API DTO、Git protocol、Vault bootstrap、Policy guard 在 `contract::*` 新路径下保持行为不变
+1. **Vault 模型不正确**：monoengine 当前使用嵌入式 `VaultCore` + 数据库存储，不依赖外部
+   HashiCorp Vault 服务；测试环境不应启动 `vault` 容器，也不应使用
+   `VAULT_DEV_ROOT_TOKEN_ID`。
+2. **数据库初始化方式不正确**：不能手写 `ci/sql/init-test-db.sql` 的 schema 子集。真实
+   schema 来自 `src/jupiter/migration/*`，`Storage::new` 会调用
+   `database_connection()` 并执行 pending migrations。手写 SQL 会绕过约束、索引、字段名和
+   迁移顺序，尤其会错误建出 `email_jobs.recipient` 这类当前实体并不存在的列。
+3. **CLI 能力分层不准确**：当前已有 `config secret ref/set/check` 和
+   `config validate [--resolve-secrets]`；`config init` 尚未实现。把 `config init` 放入当前
+   必跑路径会使方案不可执行。
+4. **功能边界过宽**：多渠道通知、热加载白名单、Slack/in-app 投递、用户通知 API 等仍是
+   规划能力。它们可以列为未来验收，但不能放进当前 P0 集成测试 gate。
+5. **二进制 crate 测试边界被忽略**：本仓库目前是 binary crate，没有 `src/lib.rs`。
+   `tests/integration_*.rs` 不能直接 `use crate::...` 导入内部模块。黑盒集成测试应通过
+   `CARGO_BIN_EXE_monoengine`/`std::process::Command` 调用 CLI 和 HTTP；需要内部模块访问的
+   “模块集成测试”应保留在 `src/**::tests`。
+6. **安全验收过早声明**：当前 `database_connection()` 会把完整 DB URL 写入日志，可能泄露
+   密码。脱敏测试应作为安全修复 gate，但在脱敏工具落地前不能声称已满足。
 
-## 假设
+因此，本修订版采用“**当前可执行 P0** + **P1/P2 扩展 gate**”的分层策略。
 
-- **开发机环境**：部署机或 CI 环境已安装 Docker 和 Docker Compose
-- **外部服务依赖**：通过容器网络部署 PostgreSQL、Redis、SMTP 服务（如 MailHog）、Vault（可选）
-- **配置隔离**：每个集成测试用例使用独立的临时配置目录与数据库/vault 快照
-- **可重复性**：测试应能在不同机器上重复运行，不依赖本地特定路径或凭据
-- **清理机制**：测试失败时仍应清理容器、临时文件和数据库状态，避免污染后续测试
+## 多维度评估
+
+| 维度 | 评估 | 文档修订决策 |
+| --- | --- | --- |
+| 合理性 | 中高。跨模块端到端测试方向正确，但原方案把外部 Vault 和手写 schema 当作真实依赖，偏离当前架构。 | 改为嵌入式 Vault、真实 migrations、真实启动顺序。 |
+| 可行性 | 原 P0 不可完全执行：`config init`、热加载、多渠道通知不存在；`tests/` 不能导入 binary crate 内部模块。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
+| 完整性 | 覆盖面广但缺少测试夹具、隔离、端口冲突、fallback 检测、超时与清理策略。 | 增加环境隔离、数据隔离、超时、清理和覆盖矩阵。 |
+| 安全性 | 原方案要求脱敏但没有指出当前 DB URL 泄露风险；外部 Vault root token 反而增加误导。 | 明确禁用外部 Vault 容器，secret 只经 stdin，日志脱敏作为 P1 gate。 |
+| 功能正确性与接口兼容性 | `SecretRef` 与 mail.password 路径方向正确；`config init`、多渠道通知、热加载接口不兼容当前代码。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
+| 数据流与控制流正确性 | 原方案的主链路大体正确，但忽略 `Storage::new` 先构造对象存储、Redis 在 Vault 前初始化、mail 在 Vault 后构造的硬顺序。 | 明确启动顺序和每类测试允许触达的依赖。 |
+| 性能与效率 | 原方案每次可能重建容器、重跑 release build，成本高。 | 复用 compose stack，测试使用 dev/test binary，按测试隔离 DB/schema。 |
+| 可靠性与容错性 | 原方案依赖固定 sleep/默认端口，未处理 PostgreSQL fallback 到 SQLite。 | 使用 healthcheck + 主动探测，测试必须证明连接的是 PostgreSQL 而非 fallback。 |
+| 兼容性与互操作性 | Docker Compose 方向可行，但默认端口易与开发机冲突；SMTP 捕获服务 API 与 TLS 配置需明确。 | 使用高位 host 端口，SMTP 测试关闭 STARTTLS，CI 以 Linux 为基线。 |
+| 可扩展性与可维护性 | 原文场景多但优先级不清，后续容易把未实现功能写成失败测试。 | 用 P0/P1/P2 gate 管理扩展，新增功能先更新矩阵再落测试。 |
+| 合规性与标准符合性 | 需要遵守仓库必跑 gate、GitHub Actions secret masking、测试数据清理。 | 增加执行 gate、mask、临时目录和日志保留规则。 |
+
+## 当前实现基线
+
+| 能力 | 当前状态 | 集成测试策略 |
+| --- | --- | --- |
+| 配置加载 | 已实现 `Config::new`、env overlay、`config validate` 基础校验 | P0 黑盒 CLI 测试 |
+| CLI 两阶段加载 | 已实现 `LoadMode`；`config secret ref` 不加载配置，`set/check` 走最小 DB/Vault bootstrap | P0 黑盒 CLI 测试 |
+| `config init` | 未实现 | P2，不能作为当前 gate |
+| Vault | 嵌入式 `VaultCore`，通过 DB + `core_key.json` 管理；无外部 Vault 服务 | P0 使用 DB 和临时 `MEGA_BASE_DIR` |
+| SecretRef | 已支持 `vault://secret/<name>#<field>`；当前仅 `mail.password` 可写入 monoengine Vault | P0 覆盖 `ref/set/check/validate --resolve-secrets` |
+| 数据库 | `database_connection()` 连接后自动执行 migrations；失败时可能 fallback SQLite | P0 必须检测真实连接到 Postgres |
+| Redis | `AppContext::new` 在 Vault 前初始化 Redis | P0 service smoke 需要 Redis 容器 |
+| 对象存储 | 通过 `jupiter::storage::object_storage::ObjectStorageFactory` 构造，测试可使用 local temp dir | P0 使用 local backend |
+| Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造 | P0/P1 覆盖 Mailpit 投递 |
+| Notification | email outbox、dispatcher、CL comment trigger 存在；用户-facing API 和多渠道缺失 | P1 模块集成 + service dispatcher 测试 |
+| 热加载 | 未实现 | P2，先文档化接口和白名单后再测 |
+| 日志脱敏 | 部分缺口存在，DB URL 当前有泄露风险 | P1 安全修复 gate |
+
+## 测试分层
+
+### 1. 单元测试（当前已有）
+
+位置：`src/**/*.rs` 中的 `#[cfg(test)] mod tests`。
+
+用途：
+- 解析、校验、SecretRef、resolver cache、storage 业务逻辑。
+- 允许直接访问 crate 内部模块。
+- 不依赖 Docker，优先使用 sqlite/tempdir/mock。
+
+### 2. 模块集成测试（crate 内部）
+
+位置：仍放在相关模块的 `#[cfg(test)]` 中，或后续在新增 `src/lib.rs` 后迁移到
+`tests/`。
+
+用途：
+- 需要调用 `crate::jupiter::migration::apply_migrations`、`NotificationStorage`、
+  `on_cl_comment_created` 等内部 API 的测试。
+- 可连接 Docker PostgreSQL，但必须由测试显式配置，不依赖开发机默认服务。
+
+### 3. 黑盒集成测试（进程级）
+
+位置：`tests/integration_*.rs`（新增时）。
+
+限制：
+- 由于 monoengine 目前是 binary crate，`tests/` 不能导入 `crate::...`。
+- 只能通过 `std::process::Command` 调用 `CARGO_BIN_EXE_monoengine`、HTTP API、SMTP/Mailpit
+  API、PostgreSQL/Redis 客户端协议进行断言。
+
+用途：
+- CLI 行为、启动顺序、HTTP smoke、secret 不回显、进程退出码。
+- 不验证内部函数细节。
 
 ## 测试环境架构
 
 ### 容器编排文件：`docker-compose.test.yml`
 
-```yaml
-version: '3.8'
+不要包含 Vault 容器。Vault 是 monoengine 进程内组件，状态来自数据库和测试用
+`MEGA_BASE_DIR` 下的 `core_key.json`。
 
+```yaml
 services:
-  # PostgreSQL — 元数据存储（配置、vault、通知）
   postgres:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: mono
       POSTGRES_PASSWORD: mono_test_password
-      POSTGRES_DB: monoengine
+      POSTGRES_DB: monoengine_it
     ports:
-      - "5432:5432"
+      - "127.0.0.1:15432:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "mono"]
+      test: ["CMD-SHELL", "pg_isready -U mono -d monoengine_it"]
       interval: 2s
       timeout: 5s
-      retries: 10
-    volumes:
-      # 挂载初始化脚本，建立必要的表（vault、notifications 等）
-      - ./ci/sql/init-test-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+      retries: 20
 
-  # Redis — 缓存与消息队列
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:16379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 5s
-      retries: 10
+      retries: 20
 
-  # SMTP 测试服务（MailHog）— 邮件截获与检查
-  mailhog:
-    image: mailhog/mailhog:latest
+  mailpit:
+    image: axllent/mailpit:v1.27
     ports:
-      - "1025:1025"  # SMTP port
-      - "8025:8025"  # Web UI
+      - "127.0.0.1:11025:1025"
+      - "127.0.0.1:18025:8025"
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8025"]
       interval: 2s
       timeout: 5s
-      retries: 10
-
-  # Vault（可选）— 敏感凭据存储
-  vault:
-    image: vault:1.15-alpine
-    environment:
-      VAULT_DEV_ROOT_TOKEN_ID: integration-test-root-token
-      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
-    ports:
-      - "8200:8200"
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8200/ui/"]
-      interval: 2s
-      timeout: 5s
-      retries: 10
-    cap_add:
-      - IPC_LOCK
+      retries: 20
 
 networks:
   default:
     name: monoengine-test-net
 ```
 
-### 初始化脚本：`ci/sql/init-test-db.sql`
+### 配置隔离
 
-```sql
--- Vault 表
-CREATE TABLE IF NOT EXISTS vault_core (
-    id BIGSERIAL PRIMARY KEY,
-    root_token_hash VARCHAR(255),
-    seal_status VARCHAR(50) DEFAULT 'Sealed',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+每个测试必须使用独立临时目录：
 
--- Notification 实体（callisto schema 的子集）
-CREATE TABLE IF NOT EXISTS user_notification_preferences (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    email_enabled BOOLEAN DEFAULT TRUE,
-    in_app_enabled BOOLEAN DEFAULT TRUE,
-    slack_enabled BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+- `MEGA_BASE_DIR=<temp>/base`
+- `MEGA_CONFIG=<temp>/config.toml`
+- `object_storage.local.root_dir=<temp>/objects`
+- `database.db_path=<temp>/fallback.sqlite`，用于检测意外 fallback
+- `log.print_std=true` 或日志输出到 `<temp>/logs`
 
-CREATE TABLE IF NOT EXISTS user_notification_settings (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    channel VARCHAR(50) NOT NULL,
-    setting_key VARCHAR(100) NOT NULL,
-    setting_value VARCHAR(255),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, channel, setting_key)
-);
+PostgreSQL 连接串必须指向高位端口：
 
-CREATE TABLE IF NOT EXISTS notification_events (
-    id BIGSERIAL PRIMARY KEY,
-    event_type VARCHAR(100) NOT NULL,
-    user_id BIGINT NOT NULL,
-    payload JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+```toml
+[database]
+db_type = "postgres"
+db_url = "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it"
+max_connection = 8
+min_connection = 1
+connect_timeout = 5
+idle_timeout = 60
+sqlx_logging = false
+sqlx_logging_level = "warn"
+db_path = "/tmp/monoengine-it/fallback.sqlite"
 
-CREATE TABLE IF NOT EXISTS email_jobs (
-    id BIGSERIAL PRIMARY KEY,
-    recipient VARCHAR(255) NOT NULL,
-    subject VARCHAR(255),
-    body TEXT,
-    status VARCHAR(50) DEFAULT 'pending',
-    retry_count INT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    sent_at TIMESTAMP
-);
+[redis]
+url = "redis://127.0.0.1:16379"
 
--- 索引
-CREATE INDEX idx_email_jobs_status ON email_jobs(status);
-CREATE INDEX idx_email_jobs_created ON email_jobs(created_at);
+[object_storage]
+storage_type = "local"
+
+[object_storage.local]
+root_dir = "/tmp/monoengine-it/objects"
+
+[mail]
+enabled = true
+smtp_host = "127.0.0.1"
+smtp_port = 11025
+from = "no-reply@example.test"
+starttls = false
+password_ref = "vault://secret/config/it/mail/password#value"
 ```
 
-## 测试场景与验收标准
+### 数据库初始化
 
-### 1. 配置初始化与加载（`test_config_init_and_load`）
+禁止手写 schema 初始化脚本。测试必须通过真实 migrations 建表：
 
-**步骤**：
-1. 使用 `monoengine config init` 在临时目录生成配置骨架
-2. 验证生成的 `config/config.toml` 包含必要字段（数据库、Redis、邮件）
-3. 验证生成的配置不包含硬编码密码或可复用凭据
-4. 运行 `monoengine config validate` 检查配置合法性
+- 进程级服务启动：`Storage::new` 会调用 `database_connection()`，并执行
+  `apply_migrations(&conn, false)`。
+- 内部模块测试：直接使用 `crate::jupiter::migration::apply_migrations`。
+- 黑盒测试如需断言表结构，只查询 migrations 后的真实表，如
+  `email_jobs(username, to_email, event_type_code, subject, body_html, ...)`。
 
-**验收标准**：
-- ✅ 配置文件成功生成
-- ✅ TOML 语法合法，可被反序列化
-- ✅ 所有必填字段都有占位符或部署指引
-- ✅ 不包含硬编码密码（如 `postgres://mega:mega@...`）
-- ✅ 校验输出正确列举所有错误（缺少数据库 URL、Redis URL 等）
+必须增加一个 PostgreSQL 确认断言：如果 `database_connection()` fallback 到 SQLite，测试应失败。
+可通过以下方式之一确认：
 
-### 2. 数据库连接与初始化（`test_database_bootstrap`）
+- 从日志中禁止出现 `Falling back to SQLite`。
+- 通过 PostgreSQL 连接查询 `SELECT current_database()` 并确认测试数据出现在该数据库。
+- 确认 fallback sqlite 文件不存在或为空。
 
-**步骤**：
-1. 通过环境变量 `MEGA_DATABASE__DB_URL` 注入 PostgreSQL 连接
-2. 启动 monoengine，验证 `Storage::new` 成功连接数据库
-3. 验证必要的表（vault_core、email_jobs、user_notification_* 等）已创建
-4. 检查运行时操作（如查询用户偏好）能正常进行
+## P0：当前必须可执行的集成测试
 
-**验收标准**：
-- ✅ 数据库连接成功
-- ✅ 初始化脚本执行完毕，表结构正确
-- ✅ 查询和 DML 操作正常
-- ✅ 连接失败时输出可诊断错误（不 panic）
+### 1. CLI secret 引用生成（`integration_cli_secret_ref`）
 
-### 3. Vault 初始化与 Secret 存储（`test_vault_bootstrap_and_secrets`）
+**目标**：验证不需要配置、不需要数据库、不需要 Vault 的纯引用生成。
 
 **步骤**：
-1. 启动 Vault 容器（开发模式）
-2. 运行 `monoengine config secret set mail.password --vault-path config/test/mail/password --field value --value-stdin`
-3. 验证 secret 成功写入 Vault
-4. 运行 `monoengine config secret check` 验证 secret 可读
-5. 验证 resolver 缓存与 evict 机制
+1. 执行：
+   ```bash
+   monoengine config secret ref mail.password --vault-path config/it/mail/password --field value
+   ```
+2. 捕获 stdout/stderr 和退出码。
 
 **验收标准**：
-- ✅ Secret 写入 Vault 成功（无明文输出）
-- ✅ Secret check 能检验 secret 存在、权限合法
-- ✅ 缓存命中率能被观测（日志、指标）
-- ✅ Evict 接口清除缓存后，下一次读取重新从 Vault 获取
+- 退出码为 0。
+- stdout 等于 `vault://secret/config/it/mail/password#value`。
+- 不读取 `MEGA_CONFIG`，即使配置文件不存在也成功。
+- `database.db_url`、secret value 等敏感内容不出现在输出中。
 
-### 4. SMTP Mailer 与邮件发送（`test_mail_dispatcher`）
+### 2. 最小 DB/Vault bootstrap（`integration_cli_secret_set_check`）
+
+**目标**：验证 `config secret set/check` 只依赖数据库和嵌入式 Vault，不初始化 Redis、
+object storage、mail 或 HTTP 服务。
 
 **步骤**：
-1. 配置 SMTP 指向 MailHog（端口 1025）
-2. 启动 monoengine，验证 `SmtpMailer::new` 成功，`EmailDispatcher` spawn
-3. 手动插入 email_jobs 记录或触发通知事件
-4. 通过 MailHog 的 HTTP API（端口 8025）检查邮件是否被接收
-5. 验证 dispatcher 的 retry 机制（连接失败时重试，成功后标记 sent_at）
+1. 启动 PostgreSQL。
+2. 写入只包含 `[database]` 的最小配置文件。
+3. 通过 stdin 写入 secret：
+   ```bash
+   printf '%s' 'smtp-test-password' \
+     | monoengine --config <temp>/config.toml \
+         config secret set mail.password \
+         --vault-path config/it/mail/password \
+         --field value \
+         --value-stdin
+   ```
+4. 执行：
+   ```bash
+   monoengine --config <temp>/config.toml \
+     config secret check mail.password \
+     --ref vault://secret/config/it/mail/password#value
+   ```
 
 **验收标准**：
-- ✅ Mailer 启动后不 panic，dispatcher 正常运行
-- ✅ 邮件能被 MailHog 接收（至少一个邮件出现在 `/api/v1/messages`）
-- ✅ Dispatcher 的 retry 逻辑生效（失败重试、成功更新状态）
-- ✅ 邮件失败时日志脱敏（不输出密码）
+- 两条命令均成功。
+- stdout 只包含 SecretRef 或 `ok ...`，不包含 `smtp-test-password`。
+- Redis 未启动时命令仍成功，证明没有走完整 `AppContext`。
+- 数据库存储中创建 Vault 所需数据，且 `core_key.json` 位于测试临时目录。
 
-### 5. 通知触发器与多渠道分发（`test_notification_triggers`）
+### 3. 配置验证与 secret 解析（`integration_config_validate_resolve_secrets`）
+
+**目标**：验证 `config validate --resolve-secrets` 通过最小 DB/Vault bootstrap 解析
+`mail.password_ref`。
 
 **步骤**：
-1. 创建用户记录并设置 notification preferences（启用邮件）
-2. 通过 API 触发通知事件（如评论创建）
-3. 验证 NotificationStorage 创建对应 email_job
-4. 验证 dispatcher 分发并通过邮件渠道投递
-5. 验证禁用渠道（如 Slack）的事件被跳过
+1. 使用完整测试配置，其中 `[mail] enabled=true` 且设置 `password_ref`。
+2. 先用 `config secret set` 写入对应 secret。
+3. 执行：
+   ```bash
+   monoengine --config <temp>/config.toml config validate --resolve-secrets
+   ```
+4. 删除或改错 secret 字段后再次执行。
 
 **验收标准**：
-- ✅ 事件触发后出现 email_job 记录
-- ✅ 邮件成功发送给用户
-- ✅ 已禁用的渠道不产生任何投递记录
-- ✅ 错误处理：缺少用户偏好时给出诊断错误（不 panic）
+- secret 存在时输出 `config valid`。
+- secret 缺失、字段缺失或 URI 非法时返回非 0，并给出可诊断错误。
+- 错误链不输出 secret 明文。
+- 当前仅支持 `mail.password`；尝试 `database.db_url`、`redis.url`、
+  `object_storage.s3.secret_access_key` 必须被拒绝。
 
-### 6. CLI 完整工作流（`test_cli_workflow_complete`）
+### 4. 服务启动 smoke（`integration_service_http_smoke`）
+
+**目标**：验证真实启动顺序：
+`Config -> Storage(DB+migrations+object storage) -> Redis -> VaultCore -> mail resolver ->
+SmtpMailer/EmailDispatcher -> init_monorepo -> HTTP`。
 
 **步骤**：
-1. 在裸机上执行 `config init`（无数据库，无 vault）
-2. 配置 `.env` 注入数据库凭据和 Redis URL
-3. 执行 `config validate`（只需配置文件合法）
-4. 启动 PostgreSQL 和 Vault 容器
-5. 执行 `config secret set mail.password --value-stdin`
-6. 执行 `config validate --resolve-secrets`（需要 vault 就绪）
-7. 启动服务 `monoengine service http`
-8. 验证服务绑定端口、接收请求
+1. 启动 PostgreSQL、Redis、Mailpit。
+2. 写入完整测试配置，object storage 使用 local temp dir，mail 使用 Mailpit。
+3. 先通过 `config secret set` 写入 `mail.password`。
+4. 启动：
+   ```bash
+   monoengine --config <temp>/config.toml service http --host 127.0.0.1 -p <free-port>
+   ```
+5. 等待端口可连接，调用一个稳定的健康/文档/smoke endpoint。
+6. 终止进程，确认退出过程不留下后台子进程。
 
 **验收标准**：
-- ✅ `config init` 在无依赖时成功生成配置
-- ✅ `config validate` 报告具体的配置错误（不 panic）
-- ✅ `config secret set` 正确写入 Vault，不在日志中泄露密码
-- ✅ `config validate --resolve-secrets` 验证 SecretRef 可解析
-- ✅ 服务成功启动，能处理请求
+- 服务成功绑定端口。
+- 数据库 migrations 已执行。
+- Redis 连接成功。
+- Mailer 初始化失败时进程应失败并给出可诊断错误，而不是静默禁用。
+- 日志中不应出现 `Falling back to SQLite`。
 
-### 7. 配置热加载与白名单（`test_config_hot_reload`）
+### 5. 邮件 outbox 投递（`integration_mail_dispatcher_mailpit`）
+
+**目标**：验证 service 启动后，`EmailDispatcher` 能从 `email_jobs` outbox 投递到 Mailpit。
 
 **步骤**：
-1. 启动服务
-2. 修改配置文件中的白名单字段（如日志级别）
-3. 发送 SIGHUP 或调用热加载 API
-4. 验证新配置生效，不需要重启
-5. 修改非白名单字段（如数据库 URL）
-6. 验证告警或拒绝加载，旧配置继续生效
+1. 启动服务。
+2. 通过 PostgreSQL 连接插入：
+   - `notification_event_types` 事件类型。
+   - 一条 `email_jobs(status='pending', to_email='alice@example.test', ...)`。
+3. 轮询 `http://127.0.0.1:18025/api/v1/messages`。
+4. 查询 `email_jobs` 状态。
 
 **验收标准**：
-- ✅ 白名单字段变更后立即生效
-- ✅ 非白名单字段变更被拒绝或告警
-- ✅ 热加载失败时旧配置继续生效，进程不中断
-- ✅ 日志记录变更源、字段路径和结果
+- Mailpit 收到邮件。
+- `email_jobs.status` 变为 `sent`，`sent_at` 非空。
+- 缺少收件人时 job 变为 `skipped`。
+- SMTP 临时失败时 job 进入 retry 状态，`retry_count` 增加，`next_retry_at` 有值。
 
-### 8. 错误诊断与脱敏（`test_error_diagnosis_and_redaction`）
+## P1：安全与业务链路扩展 gate
 
-**步骤**：
-1. 提供坏 TOML 配置，验证错误信息包含文件路径和字段路径
-2. 配置错误的数据库 URL，验证连接错误被脱敏（不泄露密码）
-3. 配置错误的 SMTP 密码，验证邮件发送失败不在日志中输出明文
-4. 缺少 vault root token，验证启动失败给出 fail-closed 错误
+### 6. 通知触发器到邮件（`integration_notification_trigger_to_mail`）
 
-**验收标准**：
-- ✅ 配置错误输出包含文件路径、行号、字段路径
-- ✅ 日志和错误信息不包含敏感值（使用 `[REDACTED]` 或 `***`）
-- ✅ 错误信息给出修复建议
-- ✅ Vault 缺失时明确提示初始化步骤，不自动清空数据
+当前没有用户-facing notification API，因此该测试不应伪造 HTTP 端点。可选实现方式：
 
-## 测试执行
+- **模块集成测试**：放在 `src/notification` 或 `src/jupiter/storage` 的测试模块内，使用真实
+  PostgreSQL，调用 `on_cl_comment_created`，再用 dispatcher 或 service 投递。
+- **黑盒服务测试**：通过数据库插入必要 CL/reviewer/user preference 数据，再触发现有真实业务
+  API。如果没有真实 API，本项保持 P1 待实现。
 
-### 快速本地测试
+验收范围只覆盖 email 渠道。Slack、webhook、in-app 属于 P2。
+
+### 7. 错误诊断与脱敏（`integration_error_redaction`）
+
+这是安全 gate，必须在统一 redaction 工具落地后启用。
+
+**应覆盖**：
+- 坏 TOML：错误包含配置路径和字段路径，不 panic。
+- 错误 DB URL：日志和 stderr 不包含密码。
+- 错误 Redis URL：日志和 stderr 不包含密码。
+- 错误 SMTP 密码：日志不包含明文。
+- Vault key 丢失：fail-closed，不清空 Vault 数据，不重新生成破坏性状态。
+
+**当前已知风险**：
+- `database_connection()` 目前会记录完整 `db_url`。在修复前，该测试应作为待办，而不是误标为已通过。
+
+## P2：未来能力 gate
+
+以下能力不属于当前可执行 gate。只有当对应功能实现并稳定后，才新增集成测试。
+
+| 能力 | 前置条件 | 验收方向 |
+| --- | --- | --- |
+| `config init` | CLI 真正新增 `config init` | 无 DB/Redis/Vault 时生成无真实 secret 的配置骨架 |
+| 热加载 | 明确 SIGHUP 或 HTTP API、白名单字段、失败回滚语义 | 白名单生效，非白名单拒绝，旧配置继续服务 |
+| 多渠道通知 | `NotificationChannel` trait、Slack/webhook/in-app outbox 与用户偏好 API | 每渠道独立投递、重试、禁用策略 |
+| 用户通知设置 API | DTO/router/权限策略实现 | 用户可查询/修改偏好，系统必发事件不可关闭 |
+| 对象存储 SecretRef | `Storage::new` 拆成 DB-only -> Vault -> resolve -> full storage | S3/GCS 凭据从 Vault 解析，最小 bootstrap 不依赖对象存储 |
+
+## 执行方式
+
+### 本地快速运行
 
 ```bash
-# 启动测试环境
-docker-compose -f docker-compose.test.yml up -d
+docker compose -f docker-compose.test.yml up -d
 
-# 等待所有服务就绪
-docker-compose -f docker-compose.test.yml exec postgres pg_isready -U mono
-docker-compose -f docker-compose.test.yml exec redis redis-cli ping
+docker compose -f docker-compose.test.yml exec postgres pg_isready -U mono -d monoengine_it
+docker compose -f docker-compose.test.yml exec redis redis-cli ping
+curl -fsS http://127.0.0.1:18025/api/v1/messages >/dev/null
 
-# 构建 monoengine
-cargo build --release
-
-# 执行集成测试
 source .env.test
-cargo test --test integration_tests -- --nocapture
+cargo test --test integration_cli -- --nocapture
+cargo test --test integration_service -- --nocapture --test-threads=1
 
-# 清理
-docker-compose -f docker-compose.test.yml down -v
+docker compose -f docker-compose.test.yml down -v
 ```
 
-### CI/CD 集成（GitHub Actions 示例）
+如果 `tests/` 目录尚未建立，先从 P0 的 CLI 黑盒测试开始。不要为了集成测试新增不必要依赖；
+首版可以只用 `std::process::Command`、`std::net::TcpStream`、`reqwest`、`sea-orm` 和现有依赖。
+
+### CI 示例
 
 ```yaml
 name: Integration Tests
@@ -306,147 +391,220 @@ on: [push, pull_request]
 jobs:
   integration:
     runs-on: ubuntu-latest
-    
+
     services:
       postgres:
         image: postgres:15-alpine
         env:
           POSTGRES_USER: mono
           POSTGRES_PASSWORD: mono_test_password
-          POSTGRES_DB: monoengine
+          POSTGRES_DB: monoengine_it
+        ports:
+          - 15432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U mono -d monoengine_it"
           --health-interval 2s
           --health-timeout 5s
-          --health-retries 10
-        ports:
-          - 5432:5432
-      
+          --health-retries 20
+
       redis:
         image: redis:7-alpine
+        ports:
+          - 16379:6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 2s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 20
+
+      mailpit:
+        image: axllent/mailpit:v1.27
         ports:
-          - 6379:6379
-      
-      mailhog:
-        image: mailhog/mailhog:latest
-        ports:
-          - 1025:1025
-          - 8025:8025
+          - 11025:1025
+          - 18025:8025
 
     steps:
-      - uses: actions/checkout@v3
-      
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
-      
-      - name: Run integration tests
-        env:
-          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@localhost:5432/monoengine
-          MEGA_REDIS__URL: redis://localhost:6379
-          MEGA_MAIL__ENABLED: "true"
-          MEGA_MAIL__SMTP_HOST: localhost
-          MEGA_MAIL__SMTP_PORT: "1025"
-          MEGA_MAIL__USERNAME: test@example.com
-          MEGA_MAIL__PASSWORD: test_password
+
+      - name: Mask integration secrets
         run: |
-          cargo test --test integration_tests --release -- --nocapture
+          echo "::add-mask::mono_test_password"
+          echo "::add-mask::smtp-test-password"
+
+      - name: Required checks
+        run: |
+          cargo +nightly fmt --all --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          source .env.test && cargo test --all
+
+      - name: Integration tests
+        env:
+          MEGA_DATABASE__DB_TYPE: postgres
+          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
+          MEGA_REDIS__URL: redis://127.0.0.1:16379
+        run: |
+          cargo test --test integration_cli -- --nocapture
+          cargo test --test integration_service -- --nocapture --test-threads=1
 ```
 
-## 测试覆盖矩阵
+## 数据流与控制流契约
 
-| 测试用例 | Contract | 配置 | Vault | 邮件 | 通知 | CLI | 热加载 | 脱敏 |
-|---------|----------|------|-------|------|------|-----|-------|------|
-| `test_config_init_and_load` | - | ✓ | - | - | - | ✓ | - | ✓ |
-| `test_database_bootstrap` | - | ✓ | - | - | - | - | - | - |
-| `test_vault_bootstrap_and_secrets` | ✓ | ✓ | ✓ | - | - | ✓ | - | ✓ |
-| `test_mail_dispatcher` | - | ✓ | ✓ | ✓ | - | - | - | ✓ |
-| `test_notification_triggers` | - | ✓ | ✓ | ✓ | ✓ | - | - | - |
-| `test_cli_workflow_complete` | ✓ | ✓ | ✓ | ✓ | - | ✓ | - | ✓ |
-| `test_config_hot_reload` | - | ✓ | - | - | - | - | ✓ | - |
-| `test_error_diagnosis_and_redaction` | - | ✓ | ✓ | ✓ | - | ✓ | - | ✓ |
+### CLI secret set/check
 
-## 集成测试与改进计划的对应
+```text
+args
+  -> LoadMode::VaultBootstrap
+  -> require_config_path
+  -> Config::load_vault_bootstrap(path)       # 只解析 database
+  -> VaultCore::from_database_config(...)
+  -> write_secret/read_secret("secret/<name>")
+  -> stdout: SecretRef 或 ok
+```
 
-集成测试的执行顺序与文档中的阶段规划对应：
+禁止触达：
+- Redis
+- object storage
+- full `Storage::new`
+- `AppContext::new`
+- SMTP/mail dispatcher
+- HTTP/SSH service
 
-| 计划阶段 | 集成测试覆盖 | 备注 |
-|---------|-----------|------|
-| config 0a/0b/1/2 | `test_config_init_and_load`、`test_error_diagnosis_and_redaction` | 配置初始化、验证、CLI 命令 |
-| contract 0-2 | `cargo check`、`test_vault_bootstrap_and_secrets`、Git/API smoke tests | 新模块路径下行为不变 |
-| config 3、vault B | `test_database_bootstrap` | DB bootstrap、fail-closed 行为 |
-| config 4、vault E | `test_vault_bootstrap_and_secrets`、`test_cli_workflow_complete` | Secret 读写、resolver、命令完整流程 |
-| config 5、mail 2 | `test_mail_dispatcher` | SecretRef、mailer 构造、dispatcher 启动 |
-| mail 3+、notification 1-3 | `test_notification_triggers` | 触发器、多渠道分发、偏好管理 |
-| config 8 | `test_config_hot_reload` | 热加载白名单、失败回滚 |
+### service http
 
-## 与现有测试的关系
+```text
+Config::new(path)
+  -> Storage::new(config)
+       -> database_connection(database)
+       -> apply_migrations(false)
+       -> ObjectStorageFactory::build(object_storage)
+  -> init_connection(redis)
+  -> VaultCore::new(storage.clone())
+  -> resolve mail.password_ref
+  -> SmtpMailer::new_with_password
+  -> EmailDispatcher::spawn
+  -> mono_service.init_monorepo
+  -> HTTP bind
+```
 
-- **单元测试**（`src/**/*.rs` 中的 `#[test]`）：测试单个函数和模块，不依赖外部服务
-- **加载测试**（`tests/load_*.rs`）：测试配置文件加载、占位符展开、反序列化，使用临时文件
-- **集成测试**（`tests/integration_*.rs`）：本文档定义的端到端测试，依赖 Docker 容器服务
-- **CI 配置校验**：GitHub Actions 验证基础样例配置、默认模板、生成结果
+测试断言必须与这条顺序一致。特别是：`mail.password_ref` 可以解析，因为 mail 在 Vault 后构造；
+数据库、Redis、对象存储凭据不能直接改为 monoengine Vault SecretRef，因为它们在 Vault 前或
+Vault bootstrap 过程中被消费。
+
+## 性能与可靠性规则
+
+- 复用一组 Docker 服务；不要每个测试重建容器。
+- 每个测试使用独立配置目录、对象存储目录和唯一数据前缀。
+- 涉及同一 PostgreSQL 数据库的黑盒测试默认串行运行，或为每个测试创建独立数据库/schema。
+- 等待服务就绪必须使用 healthcheck、端口探测或 HTTP 轮询；禁止固定 sleep 作为唯一同步机制。
+- 所有外部进程必须有超时和 cleanup。测试失败时保留日志目录，但必须停止子进程。
+- Mailpit 轮询应有上限，例如 10 秒内每 200ms 检查一次。
+- Dispatcher 测试应控制 pending job 数量，避免一次插入大量任务造成慢测。
+
+## 安全与合规规则
+
+- secret value 只能通过 stdin、临时文件权限受控的文件或 CI secret 注入；禁止命令行参数传明文。
+- CI 中使用 `::add-mask::` 或平台等价能力屏蔽测试密码。
+- 测试配置中的域名使用 `.test`，不要使用真实生产地址。
+- SMTP 测试可使用 `starttls=false`，但只允许指向本机 Mailpit。
+- 任何日志、stderr、panic 信息不得包含 DB/Redis URL 密码、SMTP 密码、Vault runtime token、
+  root token、secret share。
+- 测试生成的 `core_key.json` 必须位于临时目录；测试结束后删除。失败时可保留加密/脱敏日志，
+  不保留明文 secret。
+- Docker 镜像应固定主版本或具体 tag，避免 `latest` 漂移导致 CI 不稳定。
+
+## 覆盖矩阵
+
+| 测试用例 | 当前级别 | 配置 | DB/migrations | Redis | Vault | Mail | Notification | CLI | HTTP | 脱敏 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `integration_cli_secret_ref` | P0 | - | - | - | - | - | - | ✓ | - | ✓ |
+| `integration_cli_secret_set_check` | P0 | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
+| `integration_config_validate_resolve_secrets` | P0 | ✓ | ✓ | - | ✓ | ✓ | - | ✓ | - | ✓ |
+| `integration_service_http_smoke` | P0 | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分 |
+| `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分 |
+| `integration_notification_trigger_to_mail` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | 可选 | 部分 |
+| `integration_error_redaction` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
+| `integration_config_init` | P2 | ✓ | - | - | - | - | - | ✓ | - | ✓ |
+| `integration_config_hot_reload` | P2 | ✓ | - | - | - | - | - | - | ✓ | ✓ |
+| `integration_multichannel_notification` | P2 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
+
+## 实施路线图
+
+1. **Phase 0：测试基础设施**
+   - 新增 `docker-compose.test.yml`。
+   - 新增测试配置生成 helper（黑盒测试可在 `tests/common` 中只生成 TOML，不导入 crate）。
+   - 约定临时目录、端口、日志和 cleanup。
+2. **Phase 1：P0 CLI gate**
+   - `integration_cli_secret_ref`
+   - `integration_cli_secret_set_check`
+   - `integration_config_validate_resolve_secrets`
+3. **Phase 2：P0 service/mail gate**
+   - `integration_service_http_smoke`
+   - `integration_mail_dispatcher_mailpit`
+4. **Phase 3：P1 安全与通知 gate**
+   - 先修复 redaction 缺口。
+   - 再启用 `integration_error_redaction` 和 notification trigger 到 mail。
+5. **Phase 4：P2 未来能力 gate**
+   - `config init`、热加载、多渠道通知、对象存储 SecretRef 等功能落地后再加测试。
 
 ## 故障排查
 
-### 容器启动失败
+### 容器未就绪
 
 ```bash
-# 检查容器日志
-docker-compose -f docker-compose.test.yml logs postgres
-docker-compose -f docker-compose.test.yml logs redis
-docker-compose -f docker-compose.test.yml logs mailhog
-
-# 检查容器是否在运行
-docker-compose -f docker-compose.test.yml ps
-
-# 强制重建容器
-docker-compose -f docker-compose.test.yml down -v
-docker-compose -f docker-compose.test.yml up -d
+docker compose -f docker-compose.test.yml ps
+docker compose -f docker-compose.test.yml logs postgres
+docker compose -f docker-compose.test.yml logs redis
+docker compose -f docker-compose.test.yml logs mailpit
 ```
+
+### 意外 fallback 到 SQLite
+
+```bash
+grep -R "Falling back to SQLite" <test-log-dir>
+psql 'postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it' \
+  -c "select current_database(), count(*) from seaql_migrations"
+```
+
+如果出现 fallback，优先检查：
+- PostgreSQL healthcheck 是否通过。
+- `database.db_type` 是否为 `postgres`。
+- `database.db_url` 是否使用 `127.0.0.1:15432`。
+- 测试是否误用了默认 `config/config.toml`。
 
 ### 邮件未送达
 
 ```bash
-# 检查 MailHog API
-curl http://localhost:8025/api/v1/messages
-
-# 检查 SMTP 连接
-telnet localhost 1025
-
-# 检查 monoengine 日志中的脱敏输出
-grep -i "mail\|smtp\|redacted" monoengine.log
+curl -fsS http://127.0.0.1:18025/api/v1/messages
+psql "$MEGA_DATABASE__DB_URL" -c \
+  "select id,status,retry_count,error_message from email_jobs order by id desc limit 10"
 ```
 
-### 数据库连接失败
+检查：
+- `[mail] enabled = true`
+- `smtp_host = "127.0.0.1"`
+- `smtp_port = 11025`
+- `starttls = false`
+- `EmailDispatcher` 是否已随 service 启动
+
+### SecretRef 解析失败
 
 ```bash
-# 验证 PostgreSQL 健康
-docker-compose -f docker-compose.test.yml exec postgres pg_isready -U mono
-
-# 检查连接字符串
-echo $MEGA_DATABASE__DB_URL
-
-# 手动测试连接
-psql $MEGA_DATABASE__DB_URL -c "SELECT 1"
+monoengine --config <temp>/config.toml \
+  config secret check mail.password \
+  --ref vault://secret/config/it/mail/password#value
 ```
 
-## 实施路线图
-
-1. **Phase 1**（第 1 阶段）：建立基础环境（docker-compose.test.yml、初始化脚本）
-2. **Phase 2**（第 2 阶段）：实现配置与数据库测试（test_config_init_and_load、test_database_bootstrap）
-3. **Phase 3**（第 3 阶段）：实现 Vault 与 CLI 测试（test_vault_bootstrap_and_secrets、test_cli_workflow_complete）
-4. **Phase 4**（第 4 阶段）：实现邮件与通知测试（test_mail_dispatcher、test_notification_triggers）
-5. **Phase 5**（第 5 阶段）：实现高级测试（test_config_hot_reload、test_error_diagnosis_and_redaction）
-6. **Phase 6**（第 6 阶段）：CI/CD 集成与报告
+检查：
+- `mail.password` 是否用 `config secret set` 写入。
+- `password_ref` 是否缺少 `#field`。
+- `vault-path` 是否错误地带了 `secret/` 前缀。
+- 测试是否使用了不同的 `MEGA_BASE_DIR`，导致 `core_key.json` 不一致。
 
 ## 预期收益
 
-- **跨模块验证**：确保配置 → Vault → 邮件 → 通知 的完整链路正常
-- **端到端可靠性**：发现单元测试遗漏的集成问题（如 secret 缓存与轮换）
-- **部署信心**：在真实 Docker 环境下验证启动流程和故障恢复
-- **文档同步**：测试场景与改进计划的各个阶段对应，确保文档不脱节
-- **CI/CD 闭环**：自动化验证配置、CLI、secret、邮件等关键路径
+- 使用真实 migrations 和嵌入式 Vault，避免测试通过但生产 schema/启动链路失败。
+- 明确 binary crate 的黑盒测试边界，减少不可编译的 `tests/` 设计。
+- 把当前可落地 gate 与未来能力 gate 分离，让 CI 能先稳定覆盖关键路径。
+- 把 DB fallback、secret 泄露、service 启动顺序等高风险问题变成可观测、可诊断的测试目标。

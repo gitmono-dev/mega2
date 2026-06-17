@@ -9,10 +9,8 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set};
 use serde::Deserialize;
 
 use crate::{
-    common::{
-        config::Config,
-        errors::{MegaError, MegaResult},
-    },
+    commands::{CommandContext, require_config},
+    common::errors::{MegaError, MegaResult},
     context::AppContext,
     jupiter::storage::base_storage::StorageConnector,
 };
@@ -111,8 +109,9 @@ fn get_dt(val: &serde_json::Value) -> Option<chrono::NaiveDateTime> {
 }
 
 #[tokio::main]
-pub(crate) async fn exec(config: Config, args: &ArgMatches) -> MegaResult {
-    let context = AppContext::new(config).await;
+pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    let config = require_config(ctx, "chat-migrate")?;
+    let context = AppContext::new(config).await?;
     let mono_storage = context.storage.mono_storage();
     let conn = mono_storage.get_connection();
 

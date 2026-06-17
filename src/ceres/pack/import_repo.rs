@@ -21,6 +21,7 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
+use orbit_api::object_storage::MultiObjectByteStream;
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -35,7 +36,6 @@ use crate::{
         },
     },
     common::{errors::MegaError, utils::ZERO_ID},
-    io_orbit::object_storage::MultiObjectByteStream,
     jupiter::{
         redis::lock::RedLock,
         service::git_service::GitService,

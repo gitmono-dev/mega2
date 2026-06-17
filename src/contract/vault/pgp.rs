@@ -10,7 +10,10 @@ use rand08::thread_rng;
 /// using asynchronous operations.
 use smallvec::smallvec;
 
-use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
+use crate::{
+    common::errors::MegaError,
+    contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
+};
 
 const VAULT_KEY: &str = "pgp-signed-secret";
 
@@ -30,14 +33,14 @@ impl VaultCore {
         &self,
         params: SecretKeyParams,
         _passwd: Option<String>,
-    ) -> (SignedPublicKey, SignedSecretKey) {
+    ) -> Result<(SignedPublicKey, SignedSecretKey), MegaError> {
         let mut rng = thread_rng();
         let signed_key = params
             .generate(&mut rng)
-            .expect("failed to generate secret key, encrypted");
+            .map_err(|e| MegaError::Other(format!("failed to generate PGP secret key: {e}")))?;
         let signed_pub = signed_key.to_public_key();
 
-        (signed_pub, signed_key)
+        Ok((signed_pub, signed_key))
     }
 
     /// Loads the public key from the vault.
@@ -45,15 +48,26 @@ impl VaultCore {
     /// # Returns
     ///
     /// An `Option` containing the `SignedPublicKey` if the key is found in the vault, otherwise `None`.
-    pub async fn load_pub_key(&self) -> Option<SignedPublicKey> {
-        let key = self.read_secret(VAULT_KEY).await.unwrap();
+    pub async fn load_pub_key(&self) -> Result<Option<SignedPublicKey>, MegaError> {
+        let key = self.read_secret(VAULT_KEY).await?;
         if let Some(data) = key {
-            let key = data["pub_key"].as_str().unwrap();
-            let (key, _headers) = SignedPublicKey::from_string(key).expect("failed to parse key");
-            key.verify_bindings().expect("invalid key");
-            Some(key)
+            let key = data
+                .get("pub_key")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    MegaError::Other(format!("Vault secret {VAULT_KEY} is missing pub_key"))
+                })?;
+            let (key, _headers) = SignedPublicKey::from_string(key).map_err(|e| {
+                MegaError::Other(format!("failed to parse {VAULT_KEY}.pub_key: {e}"))
+            })?;
+            key.verify_bindings().map_err(|e| {
+                MegaError::Other(format!(
+                    "invalid PGP public key in {VAULT_KEY}.pub_key: {e}"
+                ))
+            })?;
+            Ok(Some(key))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -62,15 +76,26 @@ impl VaultCore {
     /// # Returns
     ///
     /// An `Option` containing the `SignedPublicKey` if the key is found in the vault, otherwise `None`.
-    pub async fn load_sec_key(&self) -> Option<SignedSecretKey> {
-        let key = self.read_secret(VAULT_KEY).await.unwrap();
+    pub async fn load_sec_key(&self) -> Result<Option<SignedSecretKey>, MegaError> {
+        let key = self.read_secret(VAULT_KEY).await?;
         if let Some(data) = key {
-            let key = data["sec_key"].as_str().unwrap();
-            let (key, _headers) = SignedSecretKey::from_string(key).expect("failed to parse key");
-            key.verify_bindings().expect("invalid key");
-            Some(key)
+            let key = data
+                .get("sec_key")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    MegaError::Other(format!("Vault secret {VAULT_KEY} is missing sec_key"))
+                })?;
+            let (key, _headers) = SignedSecretKey::from_string(key).map_err(|e| {
+                MegaError::Other(format!("failed to parse {VAULT_KEY}.sec_key: {e}"))
+            })?;
+            key.verify_bindings().map_err(|e| {
+                MegaError::Other(format!(
+                    "invalid PGP secret key in {VAULT_KEY}.sec_key: {e}"
+                ))
+            })?;
+            Ok(Some(key))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -81,12 +106,17 @@ impl VaultCore {
     /// *   `pub_key`: The armored string representation of the public key.
     /// *   `sec_key`: The armored string representation of the secret key.
     ///
-    /// # Panics
-    ///
-    /// When input is invalid.
-    pub async fn save_keys(&self, pub_key: SignedPublicKey, sec_key: SignedSecretKey) {
-        let pub_key = pub_key.to_armored_string(None.into()).unwrap();
-        let sec_key = sec_key.to_armored_string(None.into()).unwrap();
+    pub async fn save_keys(
+        &self,
+        pub_key: SignedPublicKey,
+        sec_key: SignedSecretKey,
+    ) -> Result<(), MegaError> {
+        let pub_key = pub_key
+            .to_armored_string(None.into())
+            .map_err(|e| MegaError::Other(format!("failed to encode PGP public key: {e}")))?;
+        let sec_key = sec_key
+            .to_armored_string(None.into())
+            .map_err(|e| MegaError::Other(format!("failed to encode PGP secret key: {e}")))?;
         let data = serde_json::json!({
             "pub_key": pub_key,
             "sec_key": sec_key,
@@ -94,18 +124,12 @@ impl VaultCore {
         .as_object()
         .unwrap()
         .clone();
-        self.write_secret(VAULT_KEY, Some(data))
-            .await
-            .unwrap_or_else(|e| {
-                panic!("Failed to write PGP keys: {e:?}");
-            });
+        self.write_secret(VAULT_KEY, Some(data)).await
     }
 
     /// Deletes the key pair from the vault.
-    pub async fn delete_keys(&self) {
-        self.delete_secret(VAULT_KEY).await.unwrap_or_else(|e| {
-            panic!("Failed to delete PGP keys: {e:?}");
-        });
+    pub async fn delete_keys(&self) -> Result<(), MegaError> {
+        self.delete_secret(VAULT_KEY).await
     }
 
     /// Creates a set of parameters for generating a PGP secret key.
@@ -122,7 +146,11 @@ impl VaultCore {
     /// # Returns
     ///
     /// A `SecretKeyParams` object configured with the specified parameters, ready for key generation.
-    pub fn params(key_type: KeyType, passwd: Option<String>, uid: &str) -> SecretKeyParams {
+    pub fn params(
+        key_type: KeyType,
+        passwd: Option<String>,
+        uid: &str,
+    ) -> Result<SecretKeyParams, MegaError> {
         let version = pgp::types::KeyVersion::V6;
 
         let mut key_params = SecretKeyParamsBuilder::default();
@@ -156,10 +184,12 @@ impl VaultCore {
                     .passphrase(passwd)
                     .can_encrypt(EncryptionCaps::All)
                     .build()
-                    .unwrap(),
+                    .map_err(|e| {
+                        MegaError::Other(format!("failed to build PGP subkey params: {e}"))
+                    })?,
             )
             .build()
-            .unwrap()
+            .map_err(|e| MegaError::Other(format!("failed to build PGP key params: {e}")))
     }
 }
 

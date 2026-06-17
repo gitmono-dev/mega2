@@ -1,8 +1,8 @@
 # monoengine
 
-> A Rust-based monorepo / Git hosting and service engine. Ports and extends several subsystems originally from the [Mega](https://github.com/web3infra-foundation/mega) project (notably the `callisto` ORM entities and the `jupiter` storage / migration layer) into a single, focused binary crate.
+> A Rust-based monorepo / Git hosting and service engine. Ports and extends several subsystems originally from the [Mega](https://github.com/web3infra-foundation/mega) project (notably the `callisto` ORM entities and the `jupiter` storage / migration layer) into a focused binary crate.
 
-`monoengine` is the backend engine that powers a monorepo platform: it speaks the Git wire protocols over HTTP(S) and SSH, persists Git objects and Git LFS blobs into a relational database plus pluggable object storage, exposes a REST/OpenAPI surface for higher‑level UI clients, and ships an embedded `libvault-core`‑based secret / PKI engine for signing and credential management.
+`monoengine` is the backend engine that powers a monorepo platform: it speaks the Git wire protocols over HTTP(S) and SSH, persists Git objects and Git LFS blobs into a relational database plus pluggable object storage, exposes a REST/OpenAPI surface for higher‑level UI clients, and ships an embedded vendored `libvault` secret / PKI engine for signing and credential management.
 
 ---
 
@@ -23,13 +23,15 @@
 - **OpenAPI + Swagger UI** — every HTTP route documented via `utoipa`, browsable
   out of the box.
 - **Pluggable storage** — `sea-orm` against PostgreSQL or SQLite for metadata;
-  `object_store` for blobs/LFS on **local FS, AWS S3, S3‑compatible (RustFS,
-  MinIO, …), or GCS**; `redis` for cache / queue.
+  `orbit-api` provides the shared object-storage traits/config, while `../orbit`
+  supplies the concrete `object_store` adapter for
+  blobs/LFS on **local FS, AWS S3, S3-compatible (RustFS, MinIO, ...), or GCS**;
+  `redis` for cache / queue.
 - **Email notifications** — async dispatcher backed by an `email_jobs` queue,
   SMTP via `lettre` (rustls + tokio), event triggers for CL comments etc.
 - **Embedded Vault** — PKI (root CA, role‑based cert issuance) and a KV / secret
-  engine via `libvault-core`, with a `jupiter` storage backend so the vault
-  lives in the same database.
+  engine via the vendored RustyVault module in `src/vault`, with a `jupiter`
+  storage backend so the vault lives in the same database.
 - **Cedar‑policy authorization** — schema (`src/mega.cedarschema`) and policies
   (`src/mega_policies.cedar`) shipped alongside the binary.
 - **Production allocators** — `jemalloc` on Unix, `mimalloc` on Windows.
@@ -49,10 +51,10 @@
 | API docs         | `utoipa` + `utoipa-swagger-ui`                                                |
 | ORM / DB         | `sea-orm` 1.1 (Postgres + SQLite, `runtime-tokio-rustls`) + `sea-orm-migration` |
 | Cache / queue    | `redis` (`aio`, `tokio-rustls-comp`, `connection-manager`)                    |
-| Object storage   | `object_store` (`aws`, `gcp`, local FS)                                       |
+| Object storage   | `orbit-api` interface + sibling `../orbit` `object_store` adapter             |
 | SSH              | `russh`                                                                       |
 | Auth / policy    | `cedar-policy`                                                                |
-| Vault / PKI      | `libvault-core`                                                               |
+| Vault / PKI      | vendored RustyVault module in `src/vault`                                     |
 | Crypto / TLS     | `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`, `secp256k1`, `pgp`       |
 | Email            | `lettre` (rustls + tokio)                                                     |
 | Logging          | `tracing`, `tracing-subscriber`, `tracing-appender`                           |
@@ -159,7 +161,7 @@ cargo run -- service http --help
 ## Project Layout
 
 ```
-Cargo.toml                # single-crate manifest
+Cargo.toml                # binary crate manifest; depends on sibling ../orbit/api
 config/config.toml        # default runtime config (TOML)
 rustfmt.toml              # nightly-only formatter options
 src/
@@ -183,11 +185,13 @@ src/
 ├── ceres/                # CL (Change List) logic, merge checks, build triggers
 ├── notification/         # email notification dispatcher + event triggers
 ├── email/                # Mailer trait + SMTP / Noop implementations
-├── vault/                # PKI + KV secret engine (libvault-core integration)
-│   └── integration/
-│       ├── jupiter_backend.rs
-│       └── vault_core.rs # VaultCore, VaultCoreInterface
-├── bellatrix/  saturn/  io_orbit/   # supporting subsystems ported from Mega
+├── vault/                # vendored RustyVault module
+├── contract/
+│   └── vault/            # PKI + KV secret engine integration layer
+│       └── integration/
+│           ├── jupiter_backend.rs
+│           └── vault_core.rs # VaultCore, VaultCoreInterface
+├── bellatrix/  saturn/   # supporting subsystems ported from Mega
 └── mega.cedarschema, mega_policies.cedar
 test/project/             # fixture data for integration tests
 target/                   # build artifacts (gitignored)
@@ -195,6 +199,10 @@ target/                   # build artifacts (gitignored)
 
 `pub use crate::callisto::*;` is re‑exported from `main.rs`; when importing
 entities elsewhere, prefer the explicit `crate::callisto::<table>` path.
+Object storage public types remain available from `orbit_api::*`; monoengine's
+storage layer builds the concrete backend through
+`crate::jupiter::storage::object_storage::ObjectStorageFactory`, backed by the
+sibling `../orbit` implementation crate.
 
 ---
 
@@ -278,10 +286,10 @@ cargo test --test <name>
   response to CL events; `notification::dispatcher::EmailDispatcher` polls
   that queue on a 2s tick, claims jobs atomically, and hands them to the
   `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`).
-- **Vault** — `vault::integration::vault_core::VaultCore` wraps
-  `libvault-core` with a `jupiter`‑backed storage adapter
-  (`integration::jupiter_backend`), so secrets live in the same Postgres /
-  SQLite database as everything else.
+- **Vault** — `contract::vault::integration::vault_core::VaultCore` wraps
+  the vendored `crate::vault` module with a `jupiter`‑backed storage adapter
+  (`contract::vault::integration::jupiter_backend`), so secrets live in the
+  same Postgres / SQLite database as everything else.
 
 ---
 

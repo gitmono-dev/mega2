@@ -4,6 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use orbit_api::object_storage::{ObjectKey, ObjectNamespace};
 use reqwest::Method;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -18,7 +19,6 @@ use crate::{
         },
         common::{CommonResult, Pagination},
     },
-    io_orbit::object_storage::{ObjectKey, ObjectNamespace},
     jupiter::storage::base_storage::StorageConnector,
 };
 

@@ -5,11 +5,11 @@ use std::{env, path::PathBuf, sync::Once};
 use clap::{Arg, ArgMatches, Command};
 
 use crate::{
-    commands::{builtin, builtin_exec, unknown_subcommand},
+    commands::{CommandContext, LoadMode, builtin, builtin_exec, load_mode, unknown_subcommand},
     common::{
         config::{
             Config, LogConfig,
-            loader::{ConfigInput, ConfigLoader},
+            loader::{ConfigInput, ConfigLoader, LoadedConfig},
             mega_cache,
         },
         errors::{MegaError, MegaResult},
@@ -27,12 +27,62 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
         None => cli().try_get_matches().unwrap_or_else(|e| e.exit()),
     };
 
+    let (cmd, subcommand_args) = match matches.subcommand() {
+        Some((cmd, args)) => (cmd, args),
+        _ => {
+            let (config, loaded) = load_config(&matches)?;
+            init_log(&config.log);
+            tracing::info!(
+                source = ?loaded.source,
+                path = %loaded.path.display(),
+                "config loaded"
+            );
+            install_ctrlc_handler();
+            return Ok(());
+        }
+    };
+
+    let mode = load_mode(cmd, subcommand_args).ok_or_else(|| unknown_subcommand(cmd))?;
+    let ctx = match mode {
+        LoadMode::None => CommandContext::default(),
+        LoadMode::ConfigPath | LoadMode::RawSources | LoadMode::VaultBootstrap => {
+            let loaded = load_config_path(&matches)?;
+            CommandContext {
+                config: None,
+                config_path: Some(loaded.path),
+            }
+        }
+        LoadMode::ParsedConfig | LoadMode::FullAppContext => {
+            let (config, loaded) = load_config(&matches)?;
+            init_log(&config.log);
+            tracing::info!(
+                source = ?loaded.source,
+                path = %loaded.path.display(),
+                "config loaded"
+            );
+            CommandContext {
+                config: Some(config),
+                config_path: Some(loaded.path),
+            }
+        }
+    };
+
+    install_ctrlc_handler();
+
+    exec_subcommand(ctx, cmd, subcommand_args)
+}
+
+fn load_config_path(matches: &ArgMatches) -> Result<LoadedConfig, MegaError> {
     let cli_path = matches.get_one::<PathBuf>("config").cloned();
     let input = ConfigInput {
         cli_path,
         env_path: std::env::var_os("MEGA_CONFIG").map(PathBuf::from),
     };
-    let loaded = ConfigLoader::new(input).load()?;
+    Ok(ConfigLoader::new(input).load()?)
+}
+
+fn load_config(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
+    let loaded = load_config_path(matches)?;
 
     let config = Config::new(loaded.path.to_str().ok_or_else(|| {
         MegaError::Other(format!(
@@ -41,14 +91,10 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
         ))
     })?)?;
 
-    init_log(&config.log);
+    Ok((config, loaded))
+}
 
-    tracing::info!(
-        source = ?loaded.source,
-        path = %loaded.path.display(),
-        "config loaded"
-    );
-
+fn install_ctrlc_handler() {
     CTRLC_HANDLER.call_once(|| {
         ctrlc::set_handler(move || {
             tracing::info!("Received Ctrl-C signal, exiting...");
@@ -56,13 +102,6 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
         })
         .unwrap();
     });
-
-    let (cmd, subcommand_args) = match matches.subcommand() {
-        Some((cmd, args)) => (cmd, args),
-        _ => return Ok(()),
-    };
-
-    exec_subcommand(config, cmd, subcommand_args)
 }
 
 fn init_log(config: &LogConfig) {
@@ -111,9 +150,9 @@ fn cli() -> Command {
         )
 }
 
-fn exec_subcommand(config: Config, cmd: &str, args: &ArgMatches) -> MegaResult {
+fn exec_subcommand(ctx: CommandContext, cmd: &str, args: &ArgMatches) -> MegaResult {
     if let Some(f) = builtin_exec(cmd) {
-        f(config, args)
+        f(ctx, args)
     } else {
         Err(unknown_subcommand(cmd))
     }
@@ -160,6 +199,32 @@ mod tests {
 
         assert_eq!(http_args.get_one::<String>("host").unwrap(), "0.0.0.0");
         assert_eq!(http_args.get_one::<u16>("port"), Some(&9000));
+    }
+
+    #[test]
+    fn cli_accepts_config_secret_ref() {
+        let matches = cli()
+            .no_binary_name(true)
+            .try_get_matches_from([
+                "config",
+                "secret",
+                "ref",
+                "mail.password",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+        let Some(("config", config_args)) = matches.subcommand() else {
+            panic!("config subcommand should parse");
+        };
+        let Some(("secret", secret_args)) = config_args.subcommand() else {
+            panic!("secret subcommand should parse");
+        };
+        let Some(("ref", ref_args)) = secret_args.subcommand() else {
+            panic!("secret ref subcommand should parse");
+        };
+
+        assert_eq!(ref_args.get_one::<String>("name").unwrap(), "mail.password");
     }
 
     #[test]

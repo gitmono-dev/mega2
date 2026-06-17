@@ -5,6 +5,7 @@ use std::{
 
 use chrono::Utc;
 use idgenerator::IdInstance;
+use orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, TransactionTrait};
 use uuid::Uuid;
 
@@ -22,14 +23,11 @@ use crate::{
         DEFAULT_MAX_OBJECTS_PER_BATCH, DEFAULT_MULTIPART_THRESHOLD_BYTES, GetArtifactSetQuery,
         ListArtifactSetsQuery, ResolveArtifactFileQuery, build_artifact_discovery_response,
     },
-    io_orbit::{
-        factory::MegaObjectStorageWrapper,
-        object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
-    },
     jupiter::{
         storage::{
             artifact_storage::{ArtifactSetsPageQuery, ArtifactStorage},
             base_storage::{BaseStorage, StorageConnector},
+            object_storage::{MegaObjectStorageWrapper, mock_object_storage},
         },
         utils::{id_generator, into_obj_stream::IntoObjectStream},
     },
@@ -60,7 +58,7 @@ impl ArtifactService {
     }
 
     pub fn mock() -> Self {
-        Self::new(BaseStorage::mock(), MegaObjectStorageWrapper::mock())
+        Self::new(BaseStorage::mock(), mock_object_storage())
     }
 
     /// §8.2 discovery: `transfers.*` reflects this process's object-store backend.
@@ -159,10 +157,11 @@ impl ArtifactService {
     ) -> Result<Option<String>, MegaError> {
         Self::validate_uuid_oid(oid)?;
         let key = Self::artifact_object_key(oid);
-        self.obj_storage
+        Ok(self
+            .obj_storage
             .inner
             .signed_url(&key, reqwest::Method::GET, expires_in)
-            .await
+            .await?)
     }
 
     pub async fn artifact_object_signed_put_url(
@@ -175,10 +174,11 @@ impl ArtifactService {
             return Ok(None);
         }
         let key = Self::artifact_object_key(oid);
-        self.obj_storage
+        Ok(self
+            .obj_storage
             .inner
             .signed_url(&key, reqwest::Method::PUT, expires_in)
-            .await
+            .await?)
     }
 
     pub async fn get_artifact_object_range_byte_stream(
@@ -852,7 +852,13 @@ impl ArtifactService {
             }
 
             let key = Self::artifact_object_key(&row.oid);
-            match self.obj_storage.inner.delete(&key).await {
+            match self
+                .obj_storage
+                .inner
+                .delete(&key)
+                .await
+                .map_err(MegaError::from)
+            {
                 Ok(()) => {}
                 Err(MegaError::ObjStorageNotFound(_)) => {
                     tracing::debug!(oid = %row.oid, "artifact GC: object absent in store; dropping DB row");

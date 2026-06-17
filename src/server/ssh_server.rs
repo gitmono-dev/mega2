@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
+    common::errors::{MegaError, MegaResult},
     context::AppContext,
     contract::{git_protocol::ssh::SshServer, vault::integration::vault_core::VaultCoreInterface},
     server::CommonHttpOptions,
@@ -33,9 +34,9 @@ pub struct SshCustom {
 }
 
 /// start an ssh server
-pub async fn start_server(ctx: AppContext, command: &SshOptions) {
+pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
     // we need to persist the key to prevent key expired after server restart.
-    let p_key = load_key(ctx.clone()).await;
+    let p_key = load_key(ctx.clone()).await?;
     let ru_config = russh::server::Config {
         auth_rejection_time: std::time::Duration::from_secs(3),
         keys: vec![p_key],
@@ -69,15 +70,29 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) {
         data_combined: BytesMut::new(),
     };
     let server_url = format!("{host}:{ssh_port}");
-    let addr = SocketAddr::from_str(&server_url).unwrap();
-    ssh_server.run_on_address(ru_config, addr).await.unwrap();
+    let addr = SocketAddr::from_str(&server_url)
+        .map_err(|e| MegaError::Other(format!("Invalid SSH listen address {server_url}: {e}")))?;
+    ssh_server
+        .run_on_address(ru_config, addr)
+        .await
+        .map_err(|e| MegaError::Other(format!("SSH server failed: {e}")))?;
+    Ok(())
 }
 
-pub async fn load_key(ctx: AppContext) -> PrivateKey {
-    let ssh_key = ctx.vault.read_secret("ssh_server_key").await.unwrap();
+pub async fn load_key(ctx: AppContext) -> Result<PrivateKey, MegaError> {
+    let ssh_key = ctx.vault.read_secret("ssh_server_key").await?;
     if let Some(ssh_key) = ssh_key {
-        let secret_key = ssh_key["secret_key"].as_str().unwrap();
-        PrivateKey::from_openssh(secret_key).unwrap()
+        let secret_key = ssh_key
+            .get("secret_key")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                MegaError::Other("Vault secret ssh_server_key is missing secret_key".to_string())
+            })?;
+        PrivateKey::from_openssh(secret_key).map_err(|e| {
+            MegaError::Other(format!(
+                "Vault secret ssh_server_key contains an invalid OpenSSH private key: {e}"
+            ))
+        })
     } else {
         // Generate a keypair if not present in the vault.
         //
@@ -86,20 +101,21 @@ pub async fn load_key(ctx: AppContext) -> PrivateKey {
         // `PrivateKey::random`. This matches the pattern used by russh's own tests
         // and avoids the `OsRng.unwrap_err()` dance that the new `TryRngCore`-only
         // `rand_core::OsRng` would otherwise force on us.
-        let keys = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let keys = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .map_err(|e| MegaError::Other(format!("Failed to generate SSH server key: {e}")))?;
+        let encoded_key = keys.to_openssh(LineEnding::CR).map_err(|e| {
+            MegaError::Other(format!("Failed to encode SSH server key as OpenSSH: {e}"))
+        })?;
         let secret = serde_json::json!({
-            "secret_key":
-            *keys.to_openssh(LineEnding::CR).unwrap()
+            "secret_key": encoded_key.as_str(),
         })
         .as_object()
-        .unwrap()
+        .ok_or_else(|| MegaError::Other("Failed to build SSH server key secret".to_string()))?
         .clone();
 
-        match ctx.vault.write_secret("ssh_server_key", Some(secret)).await {
-            Ok(_) => keys,
-            Err(e) => {
-                panic!("Failed to write SSH server key to vault: {e}");
-            }
-        }
+        ctx.vault
+            .write_secret("ssh_server_key", Some(secret))
+            .await?;
+        Ok(keys)
     }
 }

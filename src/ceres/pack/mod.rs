@@ -23,6 +23,7 @@ use git_internal::{
         pack::{Pack, entry::Entry},
     },
 };
+use orbit_api::object_storage::MultiObjectByteStream;
 use sysinfo::System;
 use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 use tokio_stream::wrappers::ReceiverStream;
@@ -34,7 +35,6 @@ use crate::{
         errors::{MegaError, ProtocolError},
         utils::ZERO_ID,
     },
-    io_orbit::object_storage::MultiObjectByteStream,
 };
 
 pub mod import_repo;
