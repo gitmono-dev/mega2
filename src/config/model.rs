@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::{ObjectStorageConfig, mega_base, mega_cache, secret};
 use crate::common::errors::MegaError;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub base_dir: PathBuf,
     pub log: LogConfig,
@@ -688,12 +688,12 @@ impl Default for BuckConfig {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct SidebarConfig {
     pub default_items: Vec<SidebarItem>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct SidebarItem {
     pub public_id: String,
     pub label: String,

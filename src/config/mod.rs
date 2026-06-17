@@ -18,6 +18,7 @@ mod expand;
 pub mod loader;
 mod model;
 pub mod redaction;
+pub mod reload;
 pub mod secret;
 mod source;
 pub mod template;
