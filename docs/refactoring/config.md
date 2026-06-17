@@ -451,6 +451,7 @@ pub trait SecretResolver: Send + Sync {
 - Redis 连接错误中的 URL 脱敏，不能在 panic 或错误信息中输出密码；
 - Vault root token、secret shares、完整 `core_key.json` 内容的旧输出路径已清理；后续新增日志必须继续沿用这个边界，不能把 token/shares/key material 写入 stdout、stderr、tracing 或错误链；
 - **`mail.password` 仍是兼容期入口，但已改为 `Option<SecretString>`**：`Debug` 与 `Serialize` 输出已脱敏，明文只在 SMTP 适配层显式暴露；仍需继续避免错误链、source diagnostics 或外部库边界回显真实密码；
+- **`SecretRef` 默认输出已脱敏**：`Debug` / `Display` 与 resolver 失败诊断输出 `vault://secret/***#***`；`config secret ref/set/check` 成功路径使用 `as_uri()` 显式回显完整引用，便于脚本接入；
 - 配置错误模型输出字段路径和失败原因即可，默认不输出原始敏感值；确需输出原始值时必须经过统一 redaction。
 
 #### 残余安全边界：`core_key.json` 自动解封材料
@@ -724,7 +725,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 **阶段 2 — 错误模型、redaction/SecretString 与保守校验**
 
 8. 已部分完成：新增 `error.rs`，并把 `variable_placeholder_substitute` 原 10 处 `unwrap` 替换为 `ConfigError` 诊断；未解析/非法占位符值已脱敏并带修复建议；`mega_base`/`mega_cache` 的早期目录解析 `unwrap` 已改为 env/system/fallback 的无 panic 路径。剩余加载路径上的 `expect`/`panic` 仍需继续收敛，这会改变失败形态，不应并入纯移动阶段。
-9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出。仍需继续覆盖 SMTP 密码、对象存储 key、SecretRef URI 中可敏感的 path 片段、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
+9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出；`SecretRef` 的 `Debug` / `Display` 与 resolver 失败诊断默认输出 `vault://secret/***#***`，只有 `as_uri()` 这类显式 CLI 成功输出保留完整引用。仍需继续覆盖 SMTP 密码、对象存储 key、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
 10. 已完成首批：`mail.password` 明文兼容路径改为 `Option<SecretString>`，Debug/Serialize 输出脱敏；`config validate` 与服务启动路径会对明文 `mail.password` 输出 deprecation warning；`.expose_secret()` 集中在 `SmtpMailer::new` 适配层。后续仍需在 source diagnostics、样例配置和模板中继续推动迁移到 `mail.password_ref`。
 11. 已完成首批：新增 `src/config/validate.rs`，实现 `Config::validate()` 首批 hard error 校验，覆盖 `database.db_type`、`database.db_url` scheme、`log.level`、`lfs` 路径/URL、`build.orion_server`、`redis.url`、`mail.password` / `mail.password_ref` 互斥、`mail.enabled` 时 `smtp_host` / `from` 必填、Buck 限制、object storage local/S3/S3-compatible/GCS 后端必填项，以及可选 `orion_server` 端口/URL/DB URL；`config validate` 已复用该入口，`Storage::new` 的 Buck 非法配置已改为返回 `MegaError`。后续集中校验主要随新增字段继续补规则。
 12. 已完成首批：`config validate` 读取原始 TOML，对孤立 `[oauth]` 顶层段、`[mail].smtp_tls` / `[mail].tls` 以及任意未知字段输出 warning，并覆盖嵌套 table 与数组内 inline table；同时会扫描 `MEGA_*` 环境变量名，对未知覆盖项、`MEGA_OAUTH__...`、`MEGA_MAIL__TLS` / `MEGA_MAIL__SMTP_TLS` 输出不含变量值的 warning，并忽略 `MEGA_CONFIG`、`MEGA_PROFILE`、`MEGA_BASE_DIR`、`MEGA_CACHE_DIR` 等加载器运行时变量。后续仍需扩展为完整 source diagnostics，覆盖 profile 合并后的来源路径、脱敏原始值、修复建议和可配置 error/warn 策略。
@@ -804,7 +805,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - **包装类型（SecretString）在网络传输与持久化中的误暴露**：尽管 `SecretString` 在 Rust 代码中能有效防止 `Debug` 泄露，但在将其序列化（如写入外部监控日志、通过 OpenAPI 接口返回、或者保存到临时数据库中）时，如果序列化库（如 `serde`）未正确配置，仍可能会提取其明文。必须在编译期实施 lints 或强制配置 `#[serde(skip_serialize)]` 规则。
 - **当前对象存储和 Redis 也是早期依赖。** `Storage::new` 会在 vault 就绪前构造对象存储，`AppContext::new` 会在 vault 就绪前连接 Redis；因此 S3 access key、带密码的 Redis URL 等字段不能直接按“可迁移凭据”处理，除非先重构初始化顺序。
 - **CLI 两阶段加载已是基线。** `config init` 已使用 `LoadMode::None`，`config validate` 已使用 `LoadMode::RawSources` 并在命令内解析配置以避免坏配置被预加载拦截；后续新增 source diagnostics、profile 或其它配置命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
-- **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction。剩余主要是外部服务 URL、对象存储 key、兼容期 `mail.password`、SecretRef URI，以及更多配置/source 诊断路径的统一 redaction。
+- **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction；`SecretRef` 默认格式化输出和 resolver 失败诊断已脱敏。剩余主要是外部服务 URL、对象存储 key、兼容期 `mail.password` 以及更多配置/source 诊断路径的统一 redaction。
 - **`core_key.json` 加固核心已完成，但部署侧托管仍是生产边界。** fail-closed、权限收紧、root token 脱敏/退役已落地；把更多凭据放入 vault 仍不抵御能读取 key 文件的攻击者，生产使用必须配套 KMS/secret manager、受控挂载、备份恢复和恢复演练。
 - **采用分阶段切换。** 顶层迁移和调用方路径迁移已完成；后续内部拆分、错误模型、初始化命令和热加载仍必须各自独立评审，不追求“单次变更内完成全部改造”。
 - **热加载作为独立阶段，不与拆分/迁移捆绑。** 热加载只允许白名单字段运行期生效，不应隐式重建数据库、Redis、对象存储、HTTP 监听器等长生命周期资源；失败必须保留旧配置并输出来源、字段路径、失败原因和处理结果。
@@ -888,7 +889,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 1. 已完成：顶层结构迁移，`src/config/{mod,model,source,expand,loader,template,secret}.rs` 成为主实现，源码调用方已迁到 `crate::config`，`common::config` shim 已删除。
 2. 内部职责拆分：`model.rs`、`source.rs` 和 `expand.rs` 已拆出；接下来进入错误模型、脱敏、集中校验等语义阶段。
-3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；`mega_base` / `mega_cache` 的早期目录解析 `unwrap` 已移除；首批 URL redaction、`SecretString`、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `expect`/`panic`，补更多配置规则和完整 source diagnostics。
+3. 错误模型、脱敏与校验：占位符展开的原 `unwrap` 已收敛为 `ConfigError`，未解析/非法占位符值已脱敏；`mega_base` / `mega_cache` 的早期目录解析 `unwrap` 已移除；首批 URL redaction、`SecretString`、`SecretRef` 默认输出脱敏、统一 `MEGA_*` source builder 和 `validate.rs` 已落地；继续收敛剩余加载路径 `expect`/`panic`，补更多配置规则和完整 source diagnostics。
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning、坏 env/profile 类型脱敏错误和首批修复建议已完成；继续补完整 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics、坏 env/profile 类型单测，以及坏占位符/坏 SecretRef URI 的 CLI 失败 smoke；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。

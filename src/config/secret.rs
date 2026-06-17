@@ -16,6 +16,7 @@ use crate::{
 
 const SECRET_REF_PREFIX: &str = "vault://secret/";
 const REDACTED_SECRET: &str = "***";
+const REDACTED_SECRET_REF: &str = "vault://secret/***#***";
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct SecretString(String);
@@ -104,6 +105,10 @@ impl SecretRef {
         &self.uri
     }
 
+    pub fn redacted(&self) -> &'static str {
+        REDACTED_SECRET_REF
+    }
+
     pub fn secret_name(&self) -> &str {
         &self.secret_name
     }
@@ -115,13 +120,13 @@ impl SecretRef {
 
 impl fmt::Debug for SecretRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("SecretRef").field(&self.uri).finish()
+        f.debug_tuple("SecretRef").field(&self.redacted()).finish()
     }
 }
 
 impl fmt::Display for SecretRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.uri)
+        f.write_str(self.redacted())
     }
 }
 
@@ -191,20 +196,18 @@ impl SecretResolver for VaultSecretResolver {
             .read_secret(secret_ref.secret_name())
             .await?
             .ok_or_else(|| {
-                MegaError::Other(format!("secret not found: {}", secret_ref.secret_name()))
+                MegaError::Other(format!("secret not found for {}", secret_ref.redacted()))
             })?;
         let value = secret.get(secret_ref.field()).ok_or_else(|| {
             MegaError::Other(format!(
-                "secret field not found: {}#{}",
-                secret_ref.secret_name(),
-                secret_ref.field()
+                "secret field not found for {}",
+                secret_ref.redacted()
             ))
         })?;
         let value = value.as_str().ok_or_else(|| {
             MegaError::Other(format!(
-                "secret field is not a string: {}#{}",
-                secret_ref.secret_name(),
-                secret_ref.field()
+                "secret field is not a string for {}",
+                secret_ref.redacted()
             ))
         })?;
         let value = value.to_string();
@@ -271,6 +274,23 @@ mod tests {
         assert_eq!(
             secret_ref.as_uri(),
             "vault://secret/config/prod/mail/password#value"
+        );
+    }
+
+    #[test]
+    fn secret_ref_debug_and_display_are_redacted() {
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/prod/mail/password#value").unwrap();
+
+        assert_eq!(
+            secret_ref.as_uri(),
+            "vault://secret/config/prod/mail/password#value"
+        );
+        assert_eq!(secret_ref.redacted(), "vault://secret/***#***");
+        assert_eq!(secret_ref.to_string(), "vault://secret/***#***");
+        assert_eq!(
+            format!("{secret_ref:?}"),
+            "SecretRef(\"vault://secret/***#***\")"
         );
     }
 

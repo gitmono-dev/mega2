@@ -333,10 +333,17 @@ fn config_validate_resolve_secrets_fails_when_secret_is_missing() {
     let (stdout, stderr) = assert_failure(&output);
 
     assert!(stdout.trim().is_empty(), "unexpected stdout: {stdout}");
-    // 错误信息可以暴露缺失的 secret 路径，因为它是定位问题所需的标识；
-    // 但不能暴露 secret 明文本身。
+    // 失败诊断保留 SecretRef 类型信息，但默认不暴露具体 vault path。
     assert!(
-        stderr.contains("secret not found: config/it/mail/password"),
+        stderr.contains("secret not found for vault://secret/***#***"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(MAIL_PASSWORD_PATH),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(MAIL_PASSWORD_REF),
         "unexpected stderr: {stderr}"
     );
     assert_does_not_leak_secret(&stdout, &stderr);
