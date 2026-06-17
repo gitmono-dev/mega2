@@ -45,12 +45,15 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
         LoadMode::None => CommandContext {
             config: None,
             config_path: matches.get_one::<PathBuf>("config").cloned(),
+            config_profile_path: None,
         },
         LoadMode::ConfigPath | LoadMode::RawSources | LoadMode::VaultBootstrap => {
             let loaded = load_config_path(&matches)?;
+            let config_profile_path = loaded.profile.map(|profile| profile.path);
             CommandContext {
                 config: None,
                 config_path: Some(loaded.path),
+                config_profile_path,
             }
         }
         LoadMode::ParsedConfig | LoadMode::FullAppContext => {
@@ -64,6 +67,7 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
             CommandContext {
                 config: Some(config),
                 config_path: Some(loaded.path),
+                config_profile_path: loaded.profile.map(|profile| profile.path),
             }
         }
     };
@@ -78,6 +82,8 @@ fn load_config_path(matches: &ArgMatches) -> Result<LoadedConfig, MegaError> {
     let input = ConfigInput {
         cli_path,
         env_path: std::env::var_os("MEGA_CONFIG").map(PathBuf::from),
+        cli_profile: matches.get_one::<String>("profile").cloned(),
+        env_profile: std::env::var("MEGA_PROFILE").ok(),
     };
     Ok(ConfigLoader::new(input).load()?)
 }
@@ -85,12 +91,18 @@ fn load_config_path(matches: &ArgMatches) -> Result<LoadedConfig, MegaError> {
 fn load_config(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
     let loaded = load_config_path(matches)?;
 
-    let config = Config::new(loaded.path.to_str().ok_or_else(|| {
-        MegaError::Other(format!(
-            "Config path contains invalid UTF-8: {:?}",
-            loaded.path
-        ))
-    })?)?;
+    let config = Config::new_with_profile(
+        loaded.path.to_str().ok_or_else(|| {
+            MegaError::Other(format!(
+                "Config path contains invalid UTF-8: {:?}",
+                loaded.path
+            ))
+        })?,
+        loaded
+            .profile
+            .as_ref()
+            .map(|profile| profile.path.as_path()),
+    )?;
 
     Ok((config, loaded))
 }
@@ -149,6 +161,12 @@ fn cli() -> Command {
                 .value_parser(clap::value_parser!(PathBuf))
                 .help("Sets a config file work directory"),
         )
+        .arg(
+            Arg::new("profile")
+                .long("profile")
+                .value_name("NAME")
+                .help("Loads config.<profile>.toml next to the selected config file"),
+        )
 }
 
 fn exec_subcommand(ctx: CommandContext, cmd: &str, args: &ArgMatches) -> MegaResult {
@@ -173,6 +191,26 @@ mod tests {
         assert_eq!(
             matches.get_one::<PathBuf>("config"),
             Some(&PathBuf::from("config/config.toml"))
+        );
+    }
+
+    #[test]
+    fn cli_accepts_profile() {
+        let matches = cli()
+            .no_binary_name(true)
+            .try_get_matches_from([
+                "--config",
+                "config/config.toml",
+                "--profile",
+                "prod",
+                "config",
+                "validate",
+            ])
+            .unwrap();
+
+        assert_eq!(
+            matches.get_one::<String>("profile").map(String::as_str),
+            Some("prod")
         );
     }
 

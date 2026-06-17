@@ -141,10 +141,12 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some(("secret", secret_args)) => exec_secret(ctx, secret_args).await,
         Some(("validate", validate_args)) => {
             let config_path = ctx.config_path.clone();
+            let config_profile_path = ctx.config_profile_path.clone();
             let config = require_config(ctx, "config validate")?;
             validate_config(
                 &config,
                 config_path.as_deref(),
+                config_profile_path.as_deref(),
                 validate_args.get_flag("resolve-secrets"),
             )
             .await?;
@@ -214,6 +216,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         }
         Some(("set", set_args)) => {
             let config_path = require_config_path(&ctx, "config secret set")?;
+            let config_profile_path = ctx.config_profile_path.as_deref();
             let name = set_args
                 .get_one::<String>("name")
                 .expect("required by clap");
@@ -221,7 +224,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             let secret_ref = secret_ref_from_args(set_args)?;
             let value = read_secret_value_from_stdin()?;
 
-            let vault = bootstrap_vault_from_path(&config_path).await?;
+            let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let mut data = Map::new();
             data.insert(secret_ref.field().to_string(), Value::String(value));
             vault
@@ -233,6 +236,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         }
         Some(("check", check_args)) => {
             let config_path = require_config_path(&ctx, "config secret check")?;
+            let config_profile_path = ctx.config_profile_path.as_deref();
             let name = check_args
                 .get_one::<String>("name")
                 .expect("required by clap");
@@ -243,7 +247,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                 secret_ref_from_args(check_args)?
             };
 
-            let vault = bootstrap_vault_from_path(&config_path).await?;
+            let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
             resolver.resolve(&secret_ref).await?;
 
@@ -260,11 +264,15 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 async fn validate_config(
     config: &Config,
     config_path: Option<&Path>,
+    config_profile_path: Option<&Path>,
     resolve_secrets: bool,
 ) -> Result<(), MegaError> {
     config.validate()?;
     if let Some(config_path) = config_path {
         warn_known_unconsumed_file_fields(config_path)?;
+    }
+    if let Some(config_profile_path) = config_profile_path {
+        warn_known_unconsumed_file_fields(config_profile_path)?;
     }
 
     if let Some(mail_cfg) = &config.mail {
@@ -286,11 +294,14 @@ async fn bootstrap_vault(config: &Config) -> Result<VaultCore, MegaError> {
         .map_err(MegaError::from)
 }
 
-async fn bootstrap_vault_from_path(path: &Path) -> Result<VaultCore, MegaError> {
+async fn bootstrap_vault_from_path(
+    path: &Path,
+    profile_path: Option<&Path>,
+) -> Result<VaultCore, MegaError> {
     let path = path.to_str().ok_or_else(|| {
         MegaError::Other(format!("Config path contains invalid UTF-8: {:?}", path))
     })?;
-    let config = Config::load_vault_bootstrap(path)?;
+    let config = Config::load_vault_bootstrap_with_profile(path, profile_path)?;
 
     VaultCore::from_database_config(&config.database, VaultCore::default_key_path())
         .await
@@ -421,7 +432,7 @@ mod tests {
             ..Config::mock()
         };
 
-        let err = validate_config(&config, None, false)
+        let err = validate_config(&config, None, None, false)
             .await
             .expect_err("mutual exclusion should fail");
         assert!(err.to_string().contains("mutually exclusive"));

@@ -1,7 +1,7 @@
 //! Configuration management for the Mono and Mega application
 //! This module provides functionality to load, parse, and manage configuration settings
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use ::config as c;
 use c::{ConfigError, FileFormat, Source};
@@ -22,7 +22,7 @@ pub mod validate;
 
 use expand::variable_placeholder_substitute;
 pub use model::*;
-use source::{config_from_path, mega_environment_source};
+use source::{config_from_path, config_from_path_with_profile, mega_environment_source};
 
 /// Retrieves the base directory path for Mega
 ///
@@ -93,8 +93,22 @@ impl Config {
         Ok(Config::from_config(config_from_path(path)?)?)
     }
 
+    pub fn new_with_profile(path: &str, profile_path: Option<&Path>) -> Result<Self, MegaError> {
+        Ok(Config::from_config(config_from_path_with_profile(
+            path,
+            profile_path,
+        )?)?)
+    }
+
     pub fn load_vault_bootstrap(path: &str) -> Result<VaultBootstrapConfig, ConfigError> {
         config_from_path(path)?.try_deserialize::<VaultBootstrapConfig>()
+    }
+
+    pub fn load_vault_bootstrap_with_profile(
+        path: &str,
+        profile_path: Option<&Path>,
+    ) -> Result<VaultBootstrapConfig, ConfigError> {
+        config_from_path_with_profile(path, profile_path)?.try_deserialize::<VaultBootstrapConfig>()
     }
 
     pub fn mock() -> Self {
@@ -389,6 +403,79 @@ mod test {
         ))])
         .expect("load_sources should parse list env override");
         assert_eq!(config.monorepo.root_dirs, expected);
+    }
+
+    #[test]
+    fn test_new_with_profile_merges_profile_before_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let _root_dirs = EnvVarGuard::set("MEGA_MONOREPO__ROOT_DIRS", "env-alpha,env-beta");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path()))
+            .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+                [log]
+                level = "debug"
+
+                [monorepo]
+                root_dirs = ["profile-root"]
+            "#,
+        )
+        .expect("write profile config");
+
+        let config = Config::new_with_profile(
+            config_path.to_str().expect("utf-8 config path"),
+            Some(&profile_path),
+        )
+        .expect("profile config should load");
+
+        assert_eq!(config.log.level, "debug");
+        assert_eq!(
+            config.monorepo.root_dirs,
+            vec!["env-alpha".to_string(), "env-beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_vault_bootstrap_loads_profile_database_override() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+                [database]
+                db_type = "postgres"
+                db_path = ""
+                db_url = "postgres://localhost:5432/base"
+                max_connection = 4
+                min_connection = 1
+                acquire_timeout = 5
+                connect_timeout = 5
+                sqlx_logging = false
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+                [database]
+                db_url = "postgres://localhost:5432/profile"
+            "#,
+        )
+        .expect("write profile config");
+
+        let loaded = Config::load_vault_bootstrap_with_profile(
+            config_path.to_str().expect("utf-8 config path"),
+            Some(&profile_path),
+        )
+        .expect("vault bootstrap profile should parse");
+
+        assert_eq!(loaded.database.db_url, "postgres://localhost:5432/profile");
+        assert_eq!(loaded.database.max_connection, 4);
     }
 
     #[test]

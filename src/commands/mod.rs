@@ -25,6 +25,7 @@ pub(crate) enum LoadMode {
 pub(crate) struct CommandContext {
     pub config: Option<Config>,
     pub config_path: Option<PathBuf>,
+    pub config_profile_path: Option<PathBuf>,
 }
 
 pub(crate) type CommandExec = fn(CommandContext, &ArgMatches) -> MegaResult;

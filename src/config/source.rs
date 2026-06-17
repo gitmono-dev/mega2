@@ -1,12 +1,31 @@
+use std::path::Path;
+
 use c::{ConfigError, FileFormat};
 
 use super::expand::variable_placeholder_substitute;
 use crate::config::c;
 
 pub(crate) fn config_from_path(path: &str) -> Result<c::Config, ConfigError> {
-    let builder = c::Config::builder()
-        .add_source(c::File::new(path, FileFormat::Toml))
-        .add_source(mega_environment_source());
+    config_from_path_with_profile(path, None)
+}
+
+pub(crate) fn config_from_path_with_profile(
+    path: &str,
+    profile_path: Option<&Path>,
+) -> Result<c::Config, ConfigError> {
+    let mut builder = c::Config::builder().add_source(c::File::new(path, FileFormat::Toml));
+
+    if let Some(profile_path) = profile_path {
+        let profile_path = profile_path.to_str().ok_or_else(|| {
+            ConfigError::Message(format!(
+                "profile config path contains invalid UTF-8: {:?}",
+                profile_path
+            ))
+        })?;
+        builder = builder.add_source(c::File::new(profile_path, FileFormat::Toml));
+    }
+
+    builder = builder.add_source(mega_environment_source());
 
     variable_placeholder_substitute(builder)
 }

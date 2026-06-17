@@ -98,6 +98,11 @@ Resolution order:
 2. `MEGA_CONFIG` environment variable.
 3. The bundled `config/config.toml`.
 
+When `--profile <name>` or `MEGA_PROFILE=<name>` is set, monoengine also
+loads `config.<name>.toml` next to the selected base config. CLI profile wins
+over `MEGA_PROFILE`, and the final merge order is base config, profile config,
+then `MEGA_*` environment overrides.
+
 Key sections (see `config/config.toml` for the full list):
 
 | Section            | Purpose                                                                 |
@@ -139,7 +144,7 @@ default sidebar / event types.
 ## CLI Overview
 
 ```
-monoengine [--config <file>] <SUBCOMMAND>
+monoengine [--config <file>] [--profile <name>] <SUBCOMMAND>
 ```
 
 | Subcommand              | What it does                                                       |
