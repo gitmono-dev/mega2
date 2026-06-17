@@ -13,6 +13,7 @@ use crate::{
     config::{
         Config,
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
+        validate::warn_known_unconsumed_file_fields,
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
 };
@@ -117,8 +118,14 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
         Some(("secret", secret_args)) => exec_secret(ctx, secret_args).await,
         Some(("validate", validate_args)) => {
+            let config_path = ctx.config_path.clone();
             let config = require_config(ctx, "config validate")?;
-            validate_config(&config, validate_args.get_flag("resolve-secrets")).await?;
+            validate_config(
+                &config,
+                config_path.as_deref(),
+                validate_args.get_flag("resolve-secrets"),
+            )
+            .await?;
             println!("config valid");
             Ok(())
         }
@@ -181,8 +188,15 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 }
 
-async fn validate_config(config: &Config, resolve_secrets: bool) -> Result<(), MegaError> {
+async fn validate_config(
+    config: &Config,
+    config_path: Option<&Path>,
+    resolve_secrets: bool,
+) -> Result<(), MegaError> {
     config.validate()?;
+    if let Some(config_path) = config_path {
+        warn_known_unconsumed_file_fields(config_path)?;
+    }
 
     if let Some(mail_cfg) = &config.mail {
         mail_cfg.warn_plaintext_password_deprecated();
@@ -309,7 +323,7 @@ mod tests {
             ..Config::mock()
         };
 
-        let err = validate_config(&config, false)
+        let err = validate_config(&config, None, false)
             .await
             .expect_err("mutual exclusion should fail");
         assert!(err.to_string().contains("mutually exclusive"));

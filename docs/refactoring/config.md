@@ -7,7 +7,7 @@
 > **集成测试指引**：本计划的各阶段功能应通过 **`integration.md`** 中定义的集成测试场景进行端到端验证。特别是配置初始化、加载、验证和 CLI 工作流应在 Docker 环境中完整测试，以确保与 Vault、邮件、通知等下游模块的集成无误。
 
 > **事实校准（2026-06-18 复核）：** 本文档已按 `vault.md` 的 2026-06-17 落地状态和当前 `src/` 重新校准。与早期草案相比，多个原本作为前置的能力已经完成，后续执行必须以本节和“当前实现状态速览表”为准，不要按旧阶段重复实现。需特别注意以下事实：
-> 1. **`Config` 已迁入顶层 `src/config/`，调用方已迁到 `crate::config`。** 阶段 1 的物理模块提升和阶段 3 的路径迁移已完成，`src/common/config.rs` shim 已移除；`model.rs` 已承接 `Config` 及各领域子配置结构体，`source.rs` 已承接 source 构建，`expand.rs` 已承接占位符展开函数；`error.rs` 已承接首批占位符诊断错误；`validate.rs` 已承接首批集中校验（database/mail/Buck）。`Config` 当前含 `mail: Option<MailConfig>`，但仍不含 `oauth` 字段，也无 `OAuthConfig`；`[oauth]` 仍是被 serde 静默丢弃的孤立顶层段。
+> 1. **`Config` 已迁入顶层 `src/config/`，调用方已迁到 `crate::config`。** 阶段 1 的物理模块提升和阶段 3 的路径迁移已完成，`src/common/config.rs` shim 已移除；`model.rs` 已承接 `Config` 及各领域子配置结构体，`source.rs` 已承接 source 构建，`expand.rs` 已承接占位符展开函数；`error.rs` 已承接首批占位符诊断错误；`validate.rs` 已承接首批集中校验（database/mail/Buck）和 `config validate` 文件级未消费字段 warning。`Config` 当前含 `mail: Option<MailConfig>`，但仍不含 `oauth` 字段，也无 `OAuthConfig`；`[oauth]` 仍没有运行期消费者。
 > 2. **mail 已是真实后置消费者，且已接入 `password_ref`。** `MailConfig` 已包含兼容期 `password: Option<SecretString>` 与推荐的 `password_ref: Option<SecretRef>`，两者互斥；明文 `password` 路径会输出 deprecation warning，`SecretString` 的 Debug/Serialize 输出脱敏，明文只在 `SmtpMailer::new` 适配层显式暴露。`AppContext::new` 在 `VaultCore::new` 之后解析 `mail.password_ref`，再通过 `SmtpMailer::new_with_password` 构造 mailer。SMTP 构造失败现在返回可诊断错误，不再由 `if let Ok(...)` 静默吞掉。
 > 3. **CLI LoadMode 与首批 `config` 命令已落地。** `commands::LoadMode`、`CommandContext`、按子命令选择加载层级的 `cli::parse`、`config secret ref/set/check`、`config validate --resolve-secrets` 均已实现。`config secret set/check` 走最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。仍未实现的是 `config init`、Profile、RawSources/source diagnostics 的完整语义，以及 `src/config/` 的错误、校验、初始化、测试和热加载职责子模块。
 > 4. **SecretRef 与 resolver 已实现首批。** `src/config/secret.rs` 定义 `SecretRef`、`SecretResolver`、`VaultSecretResolver`，支持 `vault://secret/<name>#<field>`、缓存 TTL、`evict`/`evict_all`，并拒绝 `secret/secret/...` 等错误路径。
@@ -26,13 +26,13 @@
 | 配置文件定位（4 级回退 + 自动生成） | 已实现    | `mega_base()/etc/config.toml` 与默认生成逻辑存在，但 README 主要只提前三种；生成时会把 `base_dir` 渲染进去。 |
 | 运行时共享 (`Arc<Config>`)      | 已实现      | `AppContext` 持有；`Storage` 内部为 `Weak<Config>`，`config()` 调用 `.expect("Config has been dropped")` —— 这是热加载切换快照句柄时的潜在雷区。 |
 | `mail` / `MailConfig` / 邮件发送 | **已激活并接入 dispatcher 启动点** | 真实实现在一级模块 `src/mail/mod.rs`（`SmtpMailer`/`Mailer`/`NoopMailer` + 单测，依赖 `lettre`），经 `src/main.rs:17` 的 `mod mail;` 编译；`MailConfig` 在 `src/config/model.rs`、`Config.mail` 字段已存在、`[mail]` 段已被消费。`src/email/mod.rs` 为 re-export shim。`AppContext::new` 在 vault 之后解析 `mail.password_ref`（如存在）并构造 `SmtpMailer`，构造失败现在返回可诊断错误。详见 `mail.md`。 |
-| `[oauth]` 段                   | **死配置**  | TOML 里有完整段（`config.toml:155`）+ env list key 注册（`src/config/source.rs`），但无强类型字段承接，serde 静默忽略。它是目前**唯一**被整段丢弃的孤立顶层段（`[mail]` 已被消费）。用户添加的未知顶层段同样被静默丢弃；段内未知 key（如 `[mail]` 中的 `smtp_tls`/`tls`）也被丢弃。 |
+| `[oauth]` 段                   | **死配置，已在 validate 中首批告警**  | TOML 里有完整段（`config.toml:155`）+ env list key 注册（`src/config/source.rs`），但无强类型字段承接，也无运行期消费者。它是目前**唯一**被整段丢弃的孤立顶层段（`[mail]` 已被消费）。`config validate` 已对 `[oauth]` 以及 `[mail].smtp_tls`/`[mail].tls` 输出 warning；常规服务加载仍不阻断。用户添加的其它未知段/未知 key 仍待完整 source diagnostics 覆盖。 |
 | `src/notification/`（邮件 outbox / dispatcher） | **已接入编译并在 mail 启用时启动 dispatcher** | `src/notification/{dispatcher,triggers,mod}.rs`（`EmailDispatcher`、触发器）+ `callisto::email_jobs` outbox 实体已从 mega 移植；`main.rs:18` 已声明 `mod notification;`。`AppContext::new` 在 vault 之后、`init_monorepo` 之前创建 `EmailDispatcher` 并 `tokio::spawn`；剩余工作是生命周期治理、退避/并发策略和业务触发器接入。 |
 | Vault 管理的 secret            | 已扩展     | 现有直接消费者包括 `ssh_server_key`、PGP、Nostr、PKI 以及首批配置 SecretRef（`mail.password_ref` → `secret/config/...`）。 |
 | `core_key.json` + 自动解封     | 已加固 | JSON 存储 unseal shares + 限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不 `delete_all()`；token/root/shares 不输出到日志。 |
 | Profile / `config.<profile>.toml` | **未实现** | `src/config/loader.rs` 完全没有 profile 逻辑。 |
-| `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现。`config init`、profile、完整 source diagnostics 仍未实现。 |
-| 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项和 Buck 限制；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`。未知字段/source diagnostics、端口范围和对象存储等更多规则仍待补齐。 |
+| `monoengine config` 命令族      | **部分实现** | CLI 已支持按命令 `LoadMode` 加载；`config secret ref/set/check` 与 `config validate --resolve-secrets` 已实现；`config validate` 已输出首批未消费字段 warning。`config init`、profile、完整 source diagnostics 仍未实现。 |
+| 集中配置校验                   | **部分实现** | `src/config/validate.rs` 已提供 `Config::validate()` 首批入口，覆盖 `database.db_type`/`database.db_url`、`mail.password`/`mail.password_ref` 互斥、`mail.enabled` 必填项和 Buck 限制；`Storage::new` 的 Buck 校验已改为返回 `MegaError`，不再 `panic!`；`config validate` 已对 `[oauth]` 和 `[mail].smtp_tls`/`[mail].tls` 输出 warning。端口范围、对象存储、任意未知字段和完整 source diagnostics 仍待补齐。 |
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
 | 受控热加载                     | **未实现**  | 配置加载后为静态只读快照。 |
 
@@ -162,10 +162,10 @@ README 中主要描述了前三种常见方式；实现层面还包含 `mega_bas
 - `mail`：SMTP 邮件通知配置，`Option<MailConfig>`。当前同时支持兼容期明文字段 `mail.password: Option<SecretString>` 与推荐字段 `mail.password_ref: Option<SecretRef>`，两者互斥；`password_ref` 是首个已落地的配置侧 SecretRef 消费点。
 
 > **字段现状（mail 已存在；oauth 仍缺失）：**
-> - **`mail` / `MailConfig`：已是 `Config` 字段且已定义。** `MailConfig` 在 `src/config/model.rs`（扁平结构 `enabled`/`smtp_host`/`smtp_port`/`username`/`password`/`password_ref`/`from`/`starttls`，端口/STARTTLS 默认值经 `default_smtp_port`/`default_starttls` 提供）。`config/config.toml` 的 `[mail]` 段（`:269-276`）**已被消费**（段内 `smtp_tls`/`tls` 属未知 key，被 serde 丢弃）。真实 `SmtpMailer::new_with_password(...)` 经 `AppContext::new` 在 Vault 就绪后调用，模块经 `main.rs:17` 的 `mod mail;` 编译（**不是** `mod email;`；`src/email/mod.rs` 仅为 re-export shim）。`mail.password_ref` 已落地并通过 `VaultSecretResolver` 解析；后续剩余工作是明文 `mail.password` 的兼容期治理、脱敏包装和 source diagnostics。
-> - **`oauth` / `OAuthConfig`：当前仍不是 `Config` 字段。** 仅在 env list-parse 中出现 `oauth.allowed_cors_origins`（`src/config/source.rs`），但由于没有对应字段，该 list key 当前也不映射到任何结构。`config/config.toml` 里的完整 `[oauth]` 段（`:155`，含 `campsite_api_domain`、`tinyship_api_domain`、`api_store_backend`、`allowed_cors_origins`）被整段静默忽略。涉及 OAuth 回调地址的校验、`[oauth.github]` 示例等，都必须在真实新增 `OAuthConfig` 之后再落地。
+> - **`mail` / `MailConfig`：已是 `Config` 字段且已定义。** `MailConfig` 在 `src/config/model.rs`（扁平结构 `enabled`/`smtp_host`/`smtp_port`/`username`/`password`/`password_ref`/`from`/`starttls`，端口/STARTTLS 默认值经 `default_smtp_port`/`default_starttls` 提供）。`config/config.toml` 的 `[mail]` 段（`:269-276`）**已被消费**；段内 `smtp_tls`/`tls` 属未知 key，`config validate` 已输出首批 warning。真实 `SmtpMailer::new_with_password(...)` 经 `AppContext::new` 在 Vault 就绪后调用，模块经 `main.rs:17` 的 `mod mail;` 编译（**不是** `mod email;`；`src/email/mod.rs` 仅为 re-export shim）。`mail.password_ref` 已落地并通过 `VaultSecretResolver` 解析；明文 `mail.password` 已完成首批兼容期治理。
+> - **`oauth` / `OAuthConfig`：当前仍不是 `Config` 字段。** 仅在 env list-parse 中出现 `oauth.allowed_cors_origins`（`src/config/source.rs`），但由于没有对应字段，该 list key 当前也不映射到任何结构。`config/config.toml` 里的完整 `[oauth]` 段（`:155`，含 `campsite_api_domain`、`tinyship_api_domain`、`api_store_backend`、`allowed_cors_origins`）没有运行期消费者；`config validate` 已对该段输出 warning。涉及 OAuth 回调地址的校验、`[oauth.github]` 示例等，都必须在真实新增 `OAuthConfig` 之后再落地。
 
-这种拆分方式让上层调用方可以只依赖自己需要的配置域。但需要注意：**`config/config.toml` 中存在未被任何强类型字段消费的内容：整段孤立的 `[oauth]`（当前唯一的整段孤立顶层段），以及已消费段内的未知 key（如 `[mail]` 中的 `smtp_tls`/`tls`，`config.toml:275-276`）；用户自行增加的未知段同样被静默忽略，配置文件与 Rust 结构之间并非严格一一对应。** 这既是当前的技术债务，也是安全/运维隐患（用户以为写了某段就生效了）。`validate.rs` 落地后应增加“未知/未消费顶层段告警”和“已消费段内未知 key 告警”（至少是 warn，可配置为 error），并考虑在模型上使用 `#[serde(deny_unknown_fields)]` 的白名单模式或后置 key 检查——注意 `MailConfig` 当前**未**使用 `deny_unknown_fields`，并保留“丢弃未知字段”的兼容注释，与该建议存在张力，需在落地时统一策略。见「推荐加载流水线」。
+这种拆分方式让上层调用方可以只依赖自己需要的配置域。但需要注意：**`config/config.toml` 中存在未被任何强类型字段消费的内容：整段孤立的 `[oauth]`（当前唯一的整段孤立顶层段），以及已消费段内的未知 key（如 `[mail]` 中的 `smtp_tls`/`tls`，`config.toml:275-276`）；用户自行增加的未知段同样会被忽略，配置文件与 Rust 结构之间并非严格一一对应。** 这既是当前的技术债务，也是安全/运维隐患（用户以为写了某段就生效了）。`config validate` 已对 `[oauth]`、`[mail].smtp_tls` 和 `[mail].tls` 输出首批 warning；后续仍需扩展为完整 source diagnostics，并考虑在模型上使用 `#[serde(deny_unknown_fields)]` 的白名单模式或后置 key 检查——注意 `MailConfig` 当前**未**使用 `deny_unknown_fields`，并保留“丢弃未知字段”的兼容注释，与该建议存在张力，需在落地时统一策略。见「推荐加载流水线」。
 
 `Config` 已提供若干测试/构造入口：`Config::mock()`、`Config::load_str()`、`Config::load_sources()`（`src/config/mod.rs`）。后续测试辅助应在这些既有入口之上扩展，而不是另起一套。
 
@@ -720,7 +720,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 9. 已完成首批：建立 `src/config/redaction.rs`，提供统一 URL redaction，并接入数据库连接日志与 Redis 连接失败信息，确保连接串中的 username/password 不进入这些高风险输出。仍需继续覆盖 SMTP 密码、对象存储 key、SecretRef URI 中可敏感的 path 片段、外部服务 URL，以及后续新增 source diagnostics 中的敏感值。Vault root token / shares 旧泄露路径已清理，不再作为本阶段前置。
 10. 已完成首批：`mail.password` 明文兼容路径改为 `Option<SecretString>`，Debug/Serialize 输出脱敏；`config validate` 与服务启动路径会对明文 `mail.password` 输出 deprecation warning；`.expose_secret()` 集中在 `SmtpMailer::new` 适配层。后续仍需在 source diagnostics、样例配置和模板中继续推动迁移到 `mail.password_ref`。
 11. 已部分完成：新增 `src/config/validate.rs`，实现 `Config::validate()` 首批 hard error 校验，覆盖 `database.db_type`、`database.db_url` scheme、`mail.password` / `mail.password_ref` 互斥、`mail.enabled` 时 `smtp_host` / `from` 必填，以及 Buck 限制；`config validate` 已复用该入口，`Storage::new` 的 Buck 非法配置已改为返回 `MegaError`。剩余端口范围、对象存储后端完整性、更多必填字符串、未知字段/source diagnostics 等仍需继续补齐。
-12. 增加未知/未消费字段诊断，至少覆盖孤立 `[oauth]` 顶层段，以及 `[mail]` 中当前会被丢弃的 `smtp_tls`/`tls`。
+12. 已完成首批：`config validate` 读取原始 TOML，对孤立 `[oauth]` 顶层段以及 `[mail].smtp_tls` / `[mail].tls` 输出 warning。后续仍需扩展为完整 source diagnostics，覆盖任意未知字段、环境变量来源、废弃字段、profile 合并后的来源路径和可配置 error/warn 策略。
 
 > **验收标准**：配置损坏时返回包含配置文件路径、字段路径和修复建议的诊断信息；敏感值不进入日志/错误/Debug；`BuckConfig::validate()` 不再在 `Storage::new` 中 panic；新增校验和 redaction 测试覆盖。
 
@@ -902,7 +902,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - [ ] 已确认本次阶段**不会**在 `Config::new` 内部调用 vault 或做异步 secret 解析。
 - [ ] 已确认不会重复实现 `LoadMode`、`config secret`、`SecretRef`、`mail.password_ref` 或 Vault fail-closed。
 - [ ] 如果涉及 `mail`，已把工作聚焦在明文兼容治理、SecretString/redaction、source diagnostics 或 dispatcher 生命周期。
-- [ ] 已计划在 `validate.rs`/source diagnostics 中加入未知字段告警（至少覆盖当前 `[oauth]`、`[mail].smtp_tls` 和 `[mail].tls`）。
+- [x] 已在 `validate.rs`/`config validate` 中加入首批未知字段告警，覆盖当前 `[oauth]`、`[mail].smtp_tls` 和 `[mail].tls`。
 - [ ] 已计划同步更新 `config/config.toml` 注释、README 加载优先级说明、以及本文档。
 - [ ] 已确认顶层移动与调用方路径迁移已完成；后续错误语义、`config init`、Profile、热加载分别单独提交。
 - [ ] 计划在 CI 中增加配置样例（基础 + 生成 + profile + 坏输入）校验任务。
