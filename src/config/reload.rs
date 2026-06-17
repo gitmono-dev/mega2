@@ -1,6 +1,7 @@
 use std::{
+    fmt,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use crate::{
@@ -24,9 +25,56 @@ impl ConfigReloadReport {
     }
 }
 
+type ConfigReloadCallback =
+    dyn Fn(&Config, &ConfigReloadReport) -> Result<(), MegaError> + Send + Sync + 'static;
+
+#[derive(Clone)]
+pub struct ConfigReloadSubscriber {
+    name: Arc<str>,
+    apply: Arc<ConfigReloadCallback>,
+    rollback: Arc<ConfigReloadCallback>,
+}
+
+impl ConfigReloadSubscriber {
+    pub fn new<N, A, R>(name: N, apply: A, rollback: R) -> Self
+    where
+        N: Into<String>,
+        A: Fn(&Config, &ConfigReloadReport) -> Result<(), MegaError> + Send + Sync + 'static,
+        R: Fn(&Config, &ConfigReloadReport) -> Result<(), MegaError> + Send + Sync + 'static,
+    {
+        Self {
+            name: Arc::from(name.into()),
+            apply: Arc::new(apply),
+            rollback: Arc::new(rollback),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn apply(&self, config: &Config, report: &ConfigReloadReport) -> Result<(), MegaError> {
+        (self.apply)(config, report)
+    }
+
+    fn rollback(&self, config: &Config, report: &ConfigReloadReport) -> Result<(), MegaError> {
+        (self.rollback)(config, report)
+    }
+}
+
+impl fmt::Debug for ConfigReloadSubscriber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigReloadSubscriber")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigHandle {
     current: Arc<RwLock<Arc<Config>>>,
+    subscribers: Arc<RwLock<Vec<ConfigReloadSubscriber>>>,
+    reload_lock: Arc<Mutex<()>>,
 }
 
 impl ConfigHandle {
@@ -37,6 +85,8 @@ impl ConfigHandle {
     pub fn from_arc(config: Arc<Config>) -> Self {
         Self {
             current: Arc::new(RwLock::new(config)),
+            subscribers: Arc::new(RwLock::new(Vec::new())),
+            reload_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -48,13 +98,25 @@ impl ConfigHandle {
         Ok(Arc::clone(&current))
     }
 
+    pub fn subscribe(&self, subscriber: ConfigReloadSubscriber) -> Result<(), MegaError> {
+        self.subscribers
+            .write()
+            .map_err(|_| {
+                MegaError::Other("config reload subscribers lock was poisoned".to_string())
+            })?
+            .push(subscriber);
+
+        Ok(())
+    }
+
     pub fn reload(&self, candidate: Config) -> Result<ConfigReloadReport, MegaError> {
+        let _reload_guard = self.reload_lock.lock().map_err(|_| {
+            MegaError::Other("config reload coordination lock was poisoned".to_string())
+        })?;
+
         candidate.validate()?;
 
-        let mut current = self
-            .current
-            .write()
-            .map_err(|_| MegaError::Other("config reload update lock was poisoned".to_string()))?;
+        let current = self.snapshot()?;
         let mut next = current.as_ref().clone();
         let mut report = ConfigReloadReport::default();
 
@@ -64,7 +126,14 @@ impl ConfigHandle {
         collect_mail_restart_fields(&current, &candidate, &mut report);
 
         if report.applied() {
-            *current = Arc::new(next);
+            let next = Arc::new(next);
+            let subscribers = self.reload_subscribers()?;
+            apply_subscribers(&subscribers, &current, &next, &report)?;
+
+            let mut current = self.current.write().map_err(|_| {
+                MegaError::Other("config reload update lock was poisoned".to_string())
+            })?;
+            *current = next;
         }
 
         Ok(report)
@@ -81,6 +150,66 @@ impl ConfigHandle {
         let candidate = Config::new_with_profile(path, profile_path)?;
 
         self.reload(candidate)
+    }
+
+    fn reload_subscribers(&self) -> Result<Vec<ConfigReloadSubscriber>, MegaError> {
+        let subscribers = self.subscribers.read().map_err(|_| {
+            MegaError::Other("config reload subscribers lock was poisoned".to_string())
+        })?;
+
+        Ok(subscribers.clone())
+    }
+}
+
+fn apply_subscribers(
+    subscribers: &[ConfigReloadSubscriber],
+    current: &Config,
+    next: &Config,
+    report: &ConfigReloadReport,
+) -> Result<(), MegaError> {
+    let mut applied = Vec::new();
+
+    for subscriber in subscribers {
+        if let Err(apply_error) = subscriber.apply(next, report) {
+            let rollback_error = rollback_subscribers(subscriber, &applied, current, report);
+            let mut message = format!(
+                "config reload subscriber '{}' failed: {apply_error}",
+                subscriber.name()
+            );
+            if let Some(rollback_error) = rollback_error {
+                message.push_str("; ");
+                message.push_str(&rollback_error);
+            }
+
+            return Err(MegaError::Other(message));
+        }
+        applied.push(subscriber.clone());
+    }
+
+    Ok(())
+}
+
+fn rollback_subscribers(
+    failed: &ConfigReloadSubscriber,
+    applied: &[ConfigReloadSubscriber],
+    current: &Config,
+    report: &ConfigReloadReport,
+) -> Option<String> {
+    let mut rollback_errors = Vec::new();
+
+    for subscriber in std::iter::once(failed).chain(applied.iter().rev()) {
+        if let Err(error) = subscriber.rollback(current, report) {
+            rollback_errors.push(format!(
+                "rollback for config reload subscriber '{}' failed: {error}",
+                subscriber.name()
+            ));
+        }
+    }
+
+    if rollback_errors.is_empty() {
+        None
+    } else {
+        Some(rollback_errors.join("; "))
     }
 }
 
@@ -266,6 +395,127 @@ mod tests {
 
         assert!(err.to_string().contains("log.level"));
         assert_eq!(snapshot.log.level, "info");
+    }
+
+    #[test]
+    fn reload_applies_subscribers_before_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.log.level = "info".to_string();
+        let handle = ConfigHandle::new(current);
+        let handle_for_subscriber = handle.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let apply_events = events.clone();
+        let rollback_events = events.clone();
+        handle
+            .subscribe(ConfigReloadSubscriber::new(
+                "log",
+                move |next, report| {
+                    let visible = handle_for_subscriber
+                        .snapshot()
+                        .expect("subscriber can read old snapshot");
+                    apply_events
+                        .lock()
+                        .expect("events")
+                        .push(format!("apply:{}:{}", next.log.level, visible.log.level));
+                    assert_eq!(report.applied_fields, vec!["log.level"]);
+                    Ok(())
+                },
+                move |current, _| {
+                    rollback_events
+                        .lock()
+                        .expect("events")
+                        .push(format!("rollback:{}", current.log.level));
+                    Ok(())
+                },
+            ))
+            .expect("subscribe");
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.log.level = "debug".to_string();
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let events = events.lock().expect("events").clone();
+
+        assert_eq!(report.applied_fields, vec!["log.level"]);
+        assert_eq!(snapshot.log.level, "debug");
+        assert_eq!(events, vec!["apply:debug:info"]);
+    }
+
+    #[test]
+    fn reload_rolls_back_subscribers_and_keeps_snapshot_when_apply_fails() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.log.level = "info".to_string();
+        let handle = ConfigHandle::new(current);
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let first_apply_events = events.clone();
+        let first_rollback_events = events.clone();
+        handle
+            .subscribe(ConfigReloadSubscriber::new(
+                "first",
+                move |next, _| {
+                    first_apply_events
+                        .lock()
+                        .expect("events")
+                        .push(format!("first apply {}", next.log.level));
+                    Ok(())
+                },
+                move |current, _| {
+                    first_rollback_events
+                        .lock()
+                        .expect("events")
+                        .push(format!("first rollback {}", current.log.level));
+                    Ok(())
+                },
+            ))
+            .expect("subscribe first");
+
+        let second_apply_events = events.clone();
+        let second_rollback_events = events.clone();
+        handle
+            .subscribe(ConfigReloadSubscriber::new(
+                "second",
+                move |next, _| {
+                    second_apply_events
+                        .lock()
+                        .expect("events")
+                        .push(format!("second apply {}", next.log.level));
+                    Err(MegaError::Other("simulated subscriber failure".to_string()))
+                },
+                move |current, _| {
+                    second_rollback_events
+                        .lock()
+                        .expect("events")
+                        .push(format!("second rollback {}", current.log.level));
+                    Ok(())
+                },
+            ))
+            .expect("subscribe second");
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.log.level = "debug".to_string();
+
+        let err = handle
+            .reload(candidate)
+            .expect_err("subscriber failure should fail reload");
+        let snapshot = handle.snapshot().expect("snapshot after failed reload");
+        let events = events.lock().expect("events").clone();
+
+        assert!(err.to_string().contains("second"));
+        assert!(err.to_string().contains("simulated subscriber failure"));
+        assert_eq!(snapshot.log.level, "info");
+        assert_eq!(
+            events,
+            vec![
+                "first apply debug",
+                "second apply debug",
+                "second rollback info",
+                "first rollback info"
+            ]
+        );
     }
 
     #[test]
