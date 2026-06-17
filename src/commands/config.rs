@@ -9,12 +9,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     commands::{CommandContext, LoadMode, require_config, require_config_path},
-    common::{
-        config::{
-            Config,
-            secret::{SecretRef, SecretResolver, VaultSecretResolver},
-        },
-        errors::{MegaError, MegaResult},
+    common::errors::{MegaError, MegaResult},
+    config::{
+        Config,
+        secret::{SecretRef, SecretResolver, VaultSecretResolver},
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
 };
@@ -307,7 +305,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn validate_rejects_mail_password_and_password_ref_together() {
         let config = Config {
-            mail: Some(crate::common::config::MailConfig {
+            mail: Some(crate::config::MailConfig {
                 enabled: false,
                 smtp_host: "smtp.example.com".to_string(),
                 smtp_port: 587,

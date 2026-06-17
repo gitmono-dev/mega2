@@ -10,10 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    common::{
-        config::{DbConfig, mega_base},
-        errors::{MegaError, VaultError, VaultResult},
-    },
+    common::errors::{MegaError, VaultError, VaultResult},
+    config::{DbConfig, mega_base},
     contract::vault::integration::jupiter_backend::JupiterBackend,
     jupiter::storage::{
         Storage,

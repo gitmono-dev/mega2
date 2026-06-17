@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use clap::{ArgMatches, Command};
 
-use crate::common::{
+use crate::{
+    common::errors::{MegaError, MegaResult},
     config::Config,
-    errors::{MegaError, MegaResult},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

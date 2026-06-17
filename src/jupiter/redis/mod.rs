@@ -2,7 +2,7 @@ pub mod lock;
 
 pub use ::redis::{AsyncCommands, aio::ConnectionManager};
 
-use crate::common::config::RedisConfig;
+use crate::config::RedisConfig;
 
 /// Initializes a Redis multiplexed asynchronous connection from the given configuration.
 ///

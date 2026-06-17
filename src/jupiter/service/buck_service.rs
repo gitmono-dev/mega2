@@ -13,10 +13,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     callisto::{buck_session, entity_ext::generate_link, mega_commit, mega_tree},
-    common::{
-        config::BuckConfig,
-        errors::{BuckError, MegaError},
-    },
+    common::errors::{BuckError, MegaError},
+    config::BuckConfig,
     jupiter::{
         service::{cl_service::CLService, git_service::GitService},
         storage::{
@@ -985,7 +983,7 @@ mod tests {
         let base = BaseStorage::mock();
         let upload_semaphore = Arc::new(Semaphore::new(10));
         let large_file_semaphore = Arc::new(Semaphore::new(5));
-        let buck_config = crate::common::config::BuckConfig::default();
+        let buck_config = crate::config::BuckConfig::default();
         BuckService::new(
             base,
             CLService::new(BaseStorage::mock()),

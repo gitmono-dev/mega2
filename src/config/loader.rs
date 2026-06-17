@@ -6,9 +6,9 @@ use std::{
 use anyhow::{Context, Result};
 use toml::Value;
 
-use crate::common::{
+use crate::{
+    common::utils::get_current_bin_name,
     config::{mega_base, template::default_config_template},
-    utils::get_current_bin_name,
 };
 
 #[derive(Debug, Clone, Copy)]

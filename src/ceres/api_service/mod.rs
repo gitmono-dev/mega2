@@ -27,7 +27,8 @@ use crate::{
             tag::TagInfo,
         },
     },
-    common::{config::BlameConfig, errors::MegaError},
+    common::errors::MegaError,
+    config::BlameConfig,
     contract::api::{common::Pagination, git::commit::LatestCommitInfo},
     jupiter::storage::Storage,
 };

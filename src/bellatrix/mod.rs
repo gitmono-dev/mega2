@@ -1,7 +1,7 @@
 pub mod orion_client;
 
 use crate::{
-    bellatrix::orion_client::OrionClient, common::config::BuildConfig,
+    bellatrix::orion_client::OrionClient, config::BuildConfig,
     contract::api::buck2::api::TaskBuildRequest,
 };
 

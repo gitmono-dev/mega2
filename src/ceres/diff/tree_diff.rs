@@ -7,7 +7,8 @@ use git_internal::hash::ObjectHash;
 
 use crate::{
     ceres::{diff::similarity::content_similarity_percent, model::change_list::ClDiffFile},
-    common::{config::RenameConfig, errors::MegaError},
+    common::errors::MegaError,
+    config::RenameConfig,
 };
 
 // Keep a small per-destination candidate set before the global greedy pass.
@@ -546,7 +547,7 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
     use super::{calculate_tree_diff_basic, calculate_tree_diff_with_blobs};
-    use crate::{ceres::model::change_list::ClDiffFile, common::config::RenameConfig};
+    use crate::{ceres::model::change_list::ClDiffFile, config::RenameConfig};
 
     fn hash(value: &str) -> git_internal::hash::ObjectHash {
         git_internal::hash::ObjectHash::from_str(value).unwrap()

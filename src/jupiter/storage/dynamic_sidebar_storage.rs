@@ -8,7 +8,8 @@ use sea_orm::{
 
 use crate::{
     callisto::dynamic_sidebar,
-    common::{config::SidebarConfig, errors::MegaError},
+    common::errors::MegaError,
+    config::SidebarConfig,
     jupiter::{
         model::sidebar_dto::SidebarSyncDto,
         storage::base_storage::{BaseStorage, StorageConnector},

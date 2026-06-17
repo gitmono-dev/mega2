@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     callisto::{mega_blob, mega_commit, mega_tag, mega_tree},
-    common::{config::MonoConfig, errors::MegaError},
+    common::errors::MegaError,
+    config::MonoConfig,
     jupiter::{
         service::git_service::GitService,
         storage::{

@@ -105,7 +105,7 @@ mod tests {
     use super::*;
     use crate::{
         ceres::build_trigger::{BuildTriggerType, TriggerSource, WebEditPayload},
-        common::config::BuildConfig,
+        config::BuildConfig,
         contract::api::buck2::ws::WSMessage,
     };
 

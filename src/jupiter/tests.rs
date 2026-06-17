@@ -13,7 +13,7 @@ use tracing::log;
 use url::Url;
 
 use crate::{
-    common::config::{Config, DbConfig},
+    config::{Config, DbConfig},
     jupiter::{
         migration::apply_migrations,
         service::{

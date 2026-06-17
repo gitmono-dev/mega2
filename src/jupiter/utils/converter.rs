@@ -22,10 +22,8 @@ use crate::{
         git_blob, git_commit, git_tag, git_tree, mega_blob, mega_commit, mega_refs, mega_tag,
         mega_tree,
     },
-    common::{
-        config::MonoConfig,
-        utils::{MEGA_BRANCH_NAME, generate_id},
-    },
+    common::utils::{MEGA_BRANCH_NAME, generate_id},
+    config::MonoConfig,
 };
 
 /// Helper function to convert commit model data to Commit object
@@ -919,7 +917,7 @@ mod test {
 
     use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 
-    use crate::{common::config::MonoConfig, jupiter::utils::converter::MegaModelConverter};
+    use crate::{config::MonoConfig, jupiter::utils::converter::MegaModelConverter};
 
     #[test]
     pub fn test_init_mega_dir() {

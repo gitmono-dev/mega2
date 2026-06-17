@@ -5,7 +5,8 @@ use tracing::log;
 use url::Url;
 
 use crate::{
-    common::{config::DbConfig, errors::MegaError},
+    common::errors::MegaError,
+    config::DbConfig,
     jupiter::{migration::apply_migrations, utils::id_generator},
 };
 

@@ -12,7 +12,7 @@
 //!   without pulling secrets into early bootstrap paths (Storage::new, redis init, etc.).
 //!
 //! Current status (see docs/mail.md for the full analysis and phased plan):
-//! - MailConfig lives in `crate::common::config` (will co-evolve with the config
+//! - MailConfig lives in `crate::config` (will co-evolve with the config
 //!   module split).
 //! - Only SMTP + Noop are implemented.
 //! - The background EmailDispatcher (in `crate::notification`) processes the
@@ -34,7 +34,7 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 
-use crate::common::{config::MailConfig, errors::MegaError};
+use crate::{common::errors::MegaError, config::MailConfig};
 
 #[async_trait]
 pub trait Mailer: Send + Sync {
@@ -180,7 +180,7 @@ impl Mailer for SmtpMailer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::config::MailConfig;
+    use crate::config::MailConfig;
 
     #[test]
     fn test_smtp_mailer_disabled_is_noop() {

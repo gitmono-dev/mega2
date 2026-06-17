@@ -9,6 +9,7 @@ mod ceres;
 mod cli;
 mod commands;
 mod common;
+pub mod config;
 mod context;
 mod contract;
 mod jupiter;

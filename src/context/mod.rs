@@ -3,10 +3,8 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::{
-        config::secret::{SecretResolver, VaultSecretResolver},
-        errors::MegaError,
-    },
+    common::errors::MegaError,
+    config::secret::{SecretResolver, VaultSecretResolver},
     jupiter::redis::{ConnectionManager, init_connection},
 };
 
@@ -22,7 +20,7 @@ pub struct AppContext {
     pub vault: crate::contract::vault::integration::vault_core::VaultCore,
 
     /// The configuration settings for the application.
-    pub config: Arc<crate::common::config::Config>,
+    pub config: Arc<crate::config::Config>,
 
     pub connection: ConnectionManager,
 
@@ -33,7 +31,7 @@ pub struct AppContext {
 
 impl AppContext {
     /// Creates a new application context with the given configuration.
-    pub async fn new(config: crate::common::config::Config) -> Result<Self, MegaError> {
+    pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
         let storage = crate::jupiter::storage::Storage::new(config.clone()).await?;

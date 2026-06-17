@@ -6,13 +6,11 @@ use clap::{Arg, ArgMatches, Command};
 
 use crate::{
     commands::{CommandContext, LoadMode, builtin, builtin_exec, load_mode, unknown_subcommand},
-    common::{
-        config::{
-            Config, LogConfig,
-            loader::{ConfigInput, ConfigLoader, LoadedConfig},
-            mega_cache,
-        },
-        errors::{MegaError, MegaResult},
+    common::errors::{MegaError, MegaResult},
+    config::{
+        Config, LogConfig,
+        loader::{ConfigInput, ConfigLoader, LoadedConfig},
+        mega_cache,
     },
 };
 

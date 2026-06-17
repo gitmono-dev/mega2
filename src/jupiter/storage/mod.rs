@@ -42,7 +42,8 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::Semaphore;
 
 use crate::{
-    common::{config::Config, errors::MegaError},
+    common::errors::MegaError,
+    config::Config,
     jupiter::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,

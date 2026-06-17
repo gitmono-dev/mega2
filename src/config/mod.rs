@@ -1,11 +1,10 @@
 //! Configuration management for the Mono and Mega application
 //! This module provides functionality to load, parse, and manage configuration settings
 
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+use std::path::PathBuf;
 
-use c::{ConfigError, FileFormat};
-pub use config as c;
-use config::{Source, ValueKind, builder::DefaultState};
+pub use ::config as c;
+use c::{ConfigError, FileFormat, Source};
 pub use orbit_api::factory::ObjectStorageConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -13,7 +12,10 @@ use crate::common::errors::MegaError;
 
 pub mod loader;
 pub mod secret;
+mod source;
 pub mod template;
+
+use source::{config_from_path, variable_placeholder_substitute};
 
 /// Retrieves the base directory path for Mega
 ///
@@ -173,99 +175,6 @@ impl Config {
 #[derive(Deserialize, Debug, Clone)]
 pub struct VaultBootstrapConfig {
     pub database: DbConfig,
-}
-
-fn config_from_path(path: &str) -> c::Config {
-    let builder = c::Config::builder()
-        .add_source(c::File::new(path, FileFormat::Toml))
-        .add_source(
-            c::Environment::with_prefix("mega")
-                .prefix_separator("_")
-                .separator("__")
-                .try_parsing(true)
-                .with_list_parse_key("oauth.allowed_cors_origins")
-                .with_list_parse_key("monorepo.admin")
-                .with_list_parse_key("monorepo.root_dirs")
-                .list_separator(","),
-        );
-
-    variable_placeholder_substitute(builder)
-}
-
-/// supports braces-delimited variables (i.e. ${foo}) in config.
-/// ### Example:
-/// ```toml
-/// base_dir = "/tmp/.mega"
-/// [log]
-/// level = "info"
-/// ```
-/// ### Limitations:
-/// - only support `String` type.
-/// - vars apply from up to down
-fn variable_placeholder_substitute(mut builder: c::ConfigBuilder<DefaultState>) -> c::Config {
-    // `Config::set` is deprecated, use `ConfigBuilder::set_override` instead
-    let config = builder.clone().build().unwrap(); // initial config
-    let mut vars = HashMap::new();
-    // top-level variables
-    for (k, mut v) in config.collect().unwrap() {
-        // a copy
-        if let ValueKind::String(str) = &v.kind {
-            if envsubst::is_templated(str) {
-                let new_str = envsubst::substitute(str, &vars).unwrap();
-                v.kind = ValueKind::String(new_str.clone());
-                builder = builder.set_override(&k, v).unwrap();
-                vars.insert(k, new_str);
-            } else {
-                vars.insert(k, str.clone());
-            }
-        }
-    }
-    // second-level or nested variables
-    // extract all config k-v
-    let map = Rc::new(RefCell::new(HashMap::new()));
-    for (k, v) in config.collect().unwrap() {
-        if let ValueKind::Table(_) = v.kind {
-            let map_c = map.clone();
-            traverse_config(&k, &v, &move |key: &str, value: &c::Value| {
-                if let ValueKind::String(_) = value.kind {
-                    map_c.borrow_mut().insert(key.to_string(), value.clone());
-                }
-            });
-        }
-    }
-
-    // do substitution: ${} -> real value
-    for (k, mut v) in Rc::try_unwrap(map).unwrap().into_inner() {
-        let mut str = v.clone().into_string().unwrap();
-        if envsubst::is_templated(&str) {
-            let new_str = envsubst::substitute(&str, &vars).unwrap();
-            // println!("{}: {} -> {}", k, str, &new_str);
-            v.kind = ValueKind::String(new_str.clone());
-            builder = builder.set_override(&k, v).unwrap();
-            str = new_str;
-        }
-        vars.insert(k, str);
-    }
-
-    builder.build().unwrap()
-}
-
-/// visitor pattern: traverse each config & execute the closure `f`
-fn traverse_config(key: &str, value: &c::Value, f: &impl Fn(&str, &c::Value)) {
-    match &value.kind {
-        ValueKind::Table(table) => {
-            for (k, v) in table.iter() {
-                // join keys by '.'
-                let new_key = if key.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{key}.{k}")
-                };
-                traverse_config(&new_key, v, f);
-            }
-        }
-        _ => f(key, value),
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -534,7 +443,7 @@ impl PackConfig {
     ///
     /// # Examples
     /// ```
-    /// use crate::common::config::PackConfig;
+    /// use crate::config::PackConfig;
     ///
     /// assert_eq!(PackConfig::get_size_from_str("1MB", || Ok(1 * 1000 * 1000)).unwrap(), 1 * 1000 * 1000);
     /// assert_eq!(PackConfig::get_size_from_str("2MiB", || Ok(2 * 1024 * 1024)).unwrap(), 2 * 1024 * 1024);
@@ -998,7 +907,7 @@ mod test {
 
     #[test]
     fn test_get_size_from_str() {
-        use crate::common::config::PackConfig;
+        use crate::config::PackConfig;
 
         assert_eq!(
             PackConfig::get_size_from_str("1MB", || Ok(1000 * 1000)).unwrap(),
