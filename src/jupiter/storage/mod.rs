@@ -43,7 +43,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     common::errors::MegaError,
-    config::{Config, validate::validate_buck_config},
+    config::{Config, reload::ConfigHandle, validate::validate_buck_config},
     jupiter::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
@@ -184,6 +184,7 @@ pub struct Storage {
     pub import_service: ImportService,
     pub git_service: GitService,
     pub lfs_service: LfsService,
+    pub config_handle: ConfigHandle,
     pub config: Arc<Config>,
     pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
@@ -192,6 +193,7 @@ pub struct Storage {
 
 impl Storage {
     pub async fn new(config: Arc<Config>) -> Result<Self, MegaError> {
+        let config_handle = ConfigHandle::from_arc(config.clone());
         let connection = Arc::new(database_connection(&config.database).await?);
         let notification_storage = NotificationStorage::new(connection.clone());
         let base = BaseStorage::new(connection.clone());
@@ -314,6 +316,7 @@ impl Storage {
         Ok(Storage {
             app_service: app_service.into(),
             cla_service: ClaService::new(base.clone()),
+            config_handle,
             config,
             issue_service: IssueService::new(base.clone()),
             cl_service: CLService::new(base.clone()),
@@ -330,8 +333,14 @@ impl Storage {
         })
     }
 
+    pub fn config_handle(&self) -> ConfigHandle {
+        self.config_handle.clone()
+    }
+
     pub fn config(&self) -> Arc<Config> {
-        Arc::clone(&self.config)
+        self.config_handle
+            .snapshot()
+            .unwrap_or_else(|_| Arc::clone(&self.config))
     }
 
     /// Get recommended concurrency limit for batch database operations.
@@ -556,6 +565,7 @@ impl Storage {
             merge_queue_service: MergeQueueService::mock(),
             artifact_service: ArtifactService::mock(),
             buck_service: BuckService::mock(),
+            config_handle: ConfigHandle::from_arc(config.clone()),
             config,
             git_service: GitService::mock(),
             mono_service: MonoService::mock(),
@@ -611,5 +621,17 @@ mod tests {
 
         // Should be 50% of 16 = 8
         assert_eq!(concurrency, 8);
+    }
+
+    #[test]
+    fn storage_config_reads_current_config_handle_snapshot() {
+        let storage = Storage::mock();
+        let handle = storage.config_handle();
+        let mut candidate = storage.config().as_ref().clone();
+        candidate.log.level = "debug".to_string();
+
+        handle.reload(candidate).expect("reload should apply");
+
+        assert_eq!(storage.config().log.level, "debug");
     }
 }

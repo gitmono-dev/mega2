@@ -13,7 +13,7 @@ use tracing::log;
 use url::Url;
 
 use crate::{
-    config::{Config, DbConfig},
+    config::{Config, DbConfig, reload::ConfigHandle},
     jupiter::{
         migration::apply_migrations,
         service::{
@@ -196,6 +196,7 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         merge_queue_service: MergeQueueService::mock(),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
+        config_handle: ConfigHandle::from_arc(config.clone()),
         config,
         git_service: GitService::mock(),
         mono_service: MonoService::mock(),

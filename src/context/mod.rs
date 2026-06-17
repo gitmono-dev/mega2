@@ -4,7 +4,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::errors::MegaError,
-    config::secret::{SecretResolver, VaultSecretResolver},
+    config::{
+        reload::ConfigHandle,
+        secret::{SecretResolver, VaultSecretResolver},
+    },
     jupiter::redis::{ConnectionManager, init_connection},
 };
 
@@ -22,6 +25,9 @@ pub struct AppContext {
     /// The configuration settings for the application.
     pub config: Arc<crate::config::Config>,
 
+    /// Reloadable configuration handle shared with storage.
+    pub config_handle: ConfigHandle,
+
     pub connection: ConnectionManager,
 
     /// Token to signal shutdown for notification background tasks (dispatcher etc.).
@@ -35,6 +41,7 @@ impl AppContext {
         let config = Arc::new(config);
 
         let storage = crate::jupiter::storage::Storage::new(config.clone()).await?;
+        let config_handle = storage.config_handle();
         let connection = init_connection(&config.redis).await?;
 
         let storage_for_vault = storage.clone();
@@ -86,9 +93,16 @@ impl AppContext {
             storage,
             vault,
             config,
+            config_handle,
             connection,
             notification_shutdown,
         })
+    }
+
+    pub fn config(&self) -> Arc<crate::config::Config> {
+        self.config_handle
+            .snapshot()
+            .unwrap_or_else(|_| Arc::clone(&self.config))
     }
 
     pub fn wrapped_context(&self) -> Arc<Self> {
