@@ -48,7 +48,7 @@ impl AppContext {
         // The shutdown token is stored so services can coordinate graceful stop if needed.
         let notification_shutdown = CancellationToken::new();
         if let Some(mail_cfg) = &config.mail {
-            mail_cfg.validate_secret_fields()?;
+            mail_cfg.validate()?;
 
             if mail_cfg.enabled {
                 let resolved_password = if let Some(secret_ref) = &mail_cfg.password_ref {

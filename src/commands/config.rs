@@ -182,27 +182,15 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 }
 
 async fn validate_config(config: &Config, resolve_secrets: bool) -> Result<(), MegaError> {
-    if let Some(mail_cfg) = &config.mail {
-        mail_cfg.validate_secret_fields()?;
+    config.validate()?;
 
-        if mail_cfg.enabled {
-            if mail_cfg.smtp_host.trim().is_empty() {
-                return Err(MegaError::Other(
-                    "mail.smtp_host is required when mail.enabled is true".to_string(),
-                ));
-            }
-            if mail_cfg.from.trim().is_empty() {
-                return Err(MegaError::Other(
-                    "mail.from is required when mail.enabled is true".to_string(),
-                ));
-            }
-        }
-
-        if resolve_secrets && let Some(secret_ref) = &mail_cfg.password_ref {
-            let vault = bootstrap_vault(config).await?;
-            let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
-            resolver.resolve(secret_ref).await?;
-        }
+    if resolve_secrets
+        && let Some(mail_cfg) = &config.mail
+        && let Some(secret_ref) = &mail_cfg.password_ref
+    {
+        let vault = bootstrap_vault(config).await?;
+        let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
+        resolver.resolve(secret_ref).await?;
     }
 
     Ok(())

@@ -2,11 +2,10 @@ use std::time::Duration;
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use tracing::log;
-use url::Url;
 
 use crate::{
     common::errors::MegaError,
-    config::{DbConfig, redaction::redact_url},
+    config::{DbConfig, redaction::redact_url, validate::validate_database_config},
     jupiter::{migration::apply_migrations, utils::id_generator},
 };
 
@@ -26,26 +25,8 @@ pub async fn database_connection(db_config: &DbConfig) -> DatabaseConnection {
     conn
 }
 
-fn validate_postgres_config(db_config: &DbConfig) -> Result<(), MegaError> {
-    if db_config.db_type != "postgres" {
-        return Err(MegaError::Other(format!(
-            "unsupported database type '{}'; monoengine only supports PostgreSQL",
-            db_config.db_type
-        )));
-    }
-
-    let url = Url::parse(&db_config.db_url)
-        .map_err(|e| MegaError::Other(format!("invalid PostgreSQL database URL: {e}")))?;
-    match url.scheme() {
-        "postgres" | "postgresql" => Ok(()),
-        scheme => Err(MegaError::Other(format!(
-            "unsupported database URL scheme '{scheme}'; monoengine only supports PostgreSQL"
-        ))),
-    }
-}
-
 async fn postgres_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
-    validate_postgres_config(db_config)?;
+    validate_database_config(db_config)?;
 
     let db_url = redact_url(&db_config.db_url);
     log::info!("Connecting to database: {db_url}");
@@ -78,13 +59,13 @@ pub mod test {
             db_url: "postgres://mono:mono@localhost:5432/mono_test".to_owned(),
             ..Default::default()
         };
-        validate_postgres_config(&config).expect("postgres config should be accepted");
+        validate_database_config(&config).expect("postgres config should be accepted");
 
         config.db_url = "postgresql://mono:mono@localhost:5432/mono_test".to_owned();
-        validate_postgres_config(&config).expect("postgresql config should be accepted");
+        validate_database_config(&config).expect("postgresql config should be accepted");
 
         config.db_type = "mysql".to_owned();
         config.db_url = "mysql://mono:mono@localhost:3306/mono_test".to_owned();
-        assert!(validate_postgres_config(&config).is_err());
+        assert!(validate_database_config(&config).is_err());
     }
 }

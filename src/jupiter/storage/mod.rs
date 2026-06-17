@@ -43,7 +43,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     common::errors::MegaError,
-    config::Config,
+    config::{Config, validate::validate_buck_config},
     jupiter::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
@@ -256,15 +256,7 @@ impl Storage {
 
         let buck_config = config.buck.clone().unwrap_or_default();
 
-        // Validate configuration
-        if let Err(e) = buck_config.validate() {
-            let error_msg = format!(
-                "Invalid Buck configuration: {}. Service cannot start with invalid configuration.",
-                e
-            );
-            tracing::error!("{}", error_msg);
-            panic!("{}", error_msg);
-        }
+        validate_buck_config(&buck_config)?;
 
         let upload_semaphore = Arc::new(Semaphore::new(
             buck_config.upload_concurrency_limit as usize,
