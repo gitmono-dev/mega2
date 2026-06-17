@@ -273,7 +273,12 @@ mod tests {
     #[test]
     fn parse_loads_config_without_subcommand() {
         let _lock = env_lock();
-        parse(Some(vec!["--config", "config/config.toml"])).unwrap();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("write config");
+        let config_path = config_path.to_string_lossy().to_string();
+
+        parse(Some(vec!["--config", &config_path])).unwrap();
     }
 
     #[test]
