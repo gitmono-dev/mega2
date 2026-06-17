@@ -36,7 +36,7 @@
 | SecretRef + 运行期 resolver    | **已实现首批**  | `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已编码；支持 `vault://secret/...#field`、缓存 TTL、`evict`/`evict_all`，并实现 `mail.password` / `mail.password_ref` 互斥。 |
 | 测试配置辅助                   | **已实现首批** | `src/config/testing.rs` 已提供 `TestConfigBuilder`、`isolated_config()` 与 `TestSecretResolver`，可派生临时 base/cache/LFS/object storage 路径、接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景；CLI `parse` 的无子命令加载单测已改用临时配置文件。尚未把全仓测试和 CI 配置矩阵迁移到该 helper。 |
 | CI 配置样例校验                | **已实现首批** | `.github/workflows/config-validation.yml` 已新增 sibling-aware 配置验证入口，会 checkout `monoengine` 与 `orbit`，运行格式检查、配置模板/loader/profile/env diagnostics 单测、坏 env/profile 类型脱敏单测、缺失 `mail.password_ref` 的命令层脱敏单测、仓库基础样例 `config validate`、`config init` 生成结果校验、profile merge CLI 校验，以及坏占位符、坏 SecretRef URI、坏 Redis URL scheme 的 CLI 失败 smoke；Vault resolver 也已有真实缺失 secret 脱敏单测。后续继续补更多坏输入、SecretRef 权限和完整 source diagnostics 场景。 |
-| 受控热加载                     | **已实现核心基础**  | `src/config/reload.rs` 已提供 `ConfigHandle`、候选 `Config::validate()`、日志字段白名单热更新、数据库/Redis/mail 字段需重启报告、SecretRef 变更不泄露不发布，以及失败保留旧快照单测；尚未接入运行时文件监听、订阅组件或 `AppContext`/`Storage` 访问路径。 |
+| 受控热加载                     | **已实现核心基础**  | `src/config/reload.rs` 已提供 `ConfigHandle`、`reload_from_path` 复用 base/profile 加载流水线构建候选配置、候选 `Config::validate()`、日志字段白名单热更新、数据库/Redis/mail 字段需重启报告、SecretRef 变更不泄露不发布，以及失败保留旧快照单测；尚未接入运行时文件监听、订阅组件或 `AppContext`/`Storage` 访问路径。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛）**：
 - `src/config/expand.rs::variable_placeholder_substitute` 已消除原 **10** 处 `unwrap`，并已对未解析/非法占位符值输出字段级脱敏错误和修复建议；仍需在后续完整 source diagnostics 中补更丰富的跨 source 覆盖关系。
@@ -307,7 +307,7 @@ src/config/
 - `init.rs`：提供基础配置初始化能力，负责生成 `config/config.toml` 样例、派生本地目录、填充非敏感默认值、为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单；真实 secret 不在该阶段写入配置文件。
 - `testing.rs`：首批已提供面向自动化测试的 `TestConfigBuilder`、`isolated_config()` 和 `TestSecretResolver`，可派生隔离的 base/cache/LFS/object storage 路径，接收 `.env.test` 风格的 DB/Redis/mail SecretRef 覆盖，并用内存 resolver 覆盖 secret 读取/缺失/evict 场景。后续应继续把文件加载链路、Profile 合并和 CI 配置矩阵迁移到该 helper，避免测试直接复用或修改仓库中的基础配置文件。
 - `validate.rs`：提供集中校验入口，按领域拆分校验函数，例如数据库连接串、连接池参数、监听端口、对象存储后端、路径可用性等，避免非法配置延迟到后续初始化阶段才暴露。首批 hard error 已覆盖**当前已存在字段**的无争议规则，例如 `database.db_type` 必须为 `postgres`、`database.db_url` scheme 必须为 `postgres`/`postgresql`、`database.max_connection > 0`、`database.min_connection <= database.max_connection`、数据库 acquire/connect timeout 非 0、`log.level` 枚举、`lfs` 路径/URL、`build.orion_server`、`redis.url` scheme、Buck 并发/大小限制（吸收现有 `BuckConfig::validate()`）、object storage local/S3/S3-compatible/GCS 后端必填项、可选 `orion_server` 端口/URL/DB URL，以及 mail 的 `mail.enabled = true` 时 `smtp_host`/`from` 必填、`password`/`password_ref` 互斥；首批 raw TOML warning 已覆盖 `[oauth]`、`[mail].smtp_tls`/`[mail].tls` 和任意未知字段。剩余 diagnostics 重点是环境变量/profile 来源、脱敏原始值和修复建议。但涉及尚不存在字段的校验（OAuth 回调地址等）仍应等 `OAuthConfig` 真实落地后再写。
-- `reload.rs`：首批已提供 `ConfigHandle`，负责维护 `Arc<Config>` 快照、对候选配置复用 `Config::validate()`、按白名单应用日志字段变更，报告数据库、Redis 和 mail 字段需重启，并在校验失败时保留旧配置；SecretRef 变更已覆盖不泄露、不发布旧快照语义。后续继续补监听配置来源、通知订阅组件应用变更，以及组件应用失败时的回滚语义。
+- `reload.rs`：首批已提供 `ConfigHandle`，负责维护 `Arc<Config>` 快照，`reload_from_path` 复用 base/profile 加载流水线构建候选配置，对候选配置复用 `Config::validate()`，按白名单应用日志字段变更，报告数据库、Redis 和 mail 字段需重启，并在校验失败时保留旧配置；SecretRef 变更已覆盖不泄露、不发布旧快照语义。后续继续补监听配置来源、通知订阅组件应用变更，以及组件应用失败时的回滚语义。
 - `error.rs`：提供配置专用错误，包含字段路径、失败原因，并逐步补配置文件路径、原始值脱敏和修复建议，再统一转换为现有 `ConfigError` / `MegaError`；配置加载路径上的剩余 `unwrap`、`expect` 和 `panic` 应继续收敛到该错误模型中。
 
 ### 多环境 Profile 与继承机制
@@ -685,7 +685,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 未知字段与废弃字段也应纳入流水线。Serde 默认可能忽略未知字段；当前 `config validate` 已在反序列化后读取 raw TOML 并基于当前 schema 白名单输出 key 级 warning，可覆盖拼错字段、孤立顶层段和兼容期废弃字段；同时已对 `MEGA_*` 环境变量覆盖项做首批键名级 warning，覆盖未知覆盖项、孤立 `oauth` 覆盖项和旧 mail TLS 覆盖项且不输出变量值。坏环境变量类型、profile 类型冲突、未解析/非法占位符值已包装为脱敏错误，包含来源、字段路径、期望类型或修复建议，不再打印原始值。后续还需要把相同诊断扩展到更丰富的跨 source 覆盖关系。新增字段必须提供 `serde(default)` 或 `Option<T>`，移除字段必须经历 warning 过渡期。
 
-热加载（后续阶段）应复用同一条解析、展开、规范化和校验流水线，避免启动加载与运行期重载出现两套语义。`reload.rs` 首批已维护 `ConfigHandle`，内部持有当前生效的 `Arc<Config>`，并支持候选配置校验、日志字段白名单更新、数据库/Redis/mail 字段需重启报告、SecretRef 变更不泄露不发布，以及失败保留旧快照；运行时接入后，业务组件应只读取稳定快照。当配置文件或受支持的配置源发生变化时，先构建候选 `Config`，再执行差异计算和白名单校验。只有日志级别、日志输出细节、部分功能开关、任务调度间隔、邮件通知开关等无须重建长生命周期连接的字段可以直接热更新；数据库、Redis、对象存储、监听地址端口、OAuth 客户端密钥等字段默认视为启动期配置，检测到变化时应记录告警并提示重启，而不是在运行期隐式重建。
+热加载（后续阶段）应复用同一条解析、展开、规范化和校验流水线，避免启动加载与运行期重载出现两套语义。`reload.rs` 首批已维护 `ConfigHandle`，内部持有当前生效的 `Arc<Config>`，并支持从 base/profile 路径构建候选配置、候选配置校验、日志字段白名单更新、数据库/Redis/mail 字段需重启报告、SecretRef 变更不泄露不发布，以及失败保留旧快照；运行时接入后，业务组件应只读取稳定快照。当配置文件或受支持的配置源发生变化时，先构建候选 `Config`，再执行差异计算和白名单校验。只有日志级别、日志输出细节、部分功能开关、任务调度间隔、邮件通知开关等无须重建长生命周期连接的字段可以直接热更新；数据库、Redis、对象存储、监听地址端口、OAuth 客户端密钥等字段默认视为启动期配置，检测到变化时应记录告警并提示重启，而不是在运行期隐式重建。
 
 热加载应用过程应具备原子性：候选配置解析、校验或组件回调任一阶段失败，都不能替换当前生效配置；组件回调成功后再发布新的 `Arc<Config>` 快照，并记录变更字段、来源和结果。订阅接口应按领域注册，例如日志系统订阅 `log` 可热更新字段，后台任务订阅对应调度配置，避免业务代码直接监听文件变化或自行重新解析配置。
 
@@ -767,10 +767,10 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 **阶段 7 — 受控热加载（独立变更）**
 
-26. 已完成首批：新增 `reload.rs`，提供 `ConfigHandle` 快照句柄，复用 `Config::validate()` 校验候选配置，按字段白名单应用 `log.level` / `log.print_std` / `log.with_ansi`，对数据库、Redis 和 mail 字段变化报告需重启，并覆盖失败时保留旧配置与 SecretRef 变更不泄露不发布。后续补监听配置文件变化、复用文件加载流水线构建候选配置，以及订阅组件应用/回滚。
+26. 已完成首批：新增 `reload.rs`，提供 `ConfigHandle` 快照句柄，`reload_from_path` 复用 base/profile 文件加载流水线构建候选配置，复用 `Config::validate()` 校验候选配置，按字段白名单应用 `log.level` / `log.print_std` / `log.with_ansi`，对数据库、Redis 和 mail 字段变化报告需重启，并覆盖失败时保留旧配置与 SecretRef 变更不泄露不发布。后续补监听配置文件变化，以及订阅组件应用/回滚。
 27. 将运行时注入从直接共享 `Arc<Config>` 调整为共享快照句柄（如 `Arc<ConfigHandle>`/`ArcSwap`）；逐点确认“取出 Arc 后跨 await 持有”的调用语义，新增依赖前评估必要性。`Storage::config()` 已无 `Weak::upgrade().expect(...)` panic，但当前仍返回不可替换的 `Arc<Config>` 快照，`ConfigHandle` 尚未接入该访问路径。
 28. 改造支持热加载的消费端订阅方式（日志、功能开关、任务调度、邮件通知等只订阅各自可热更新字段；不可热更新字段变化只告警提示重启）。
-29. 已完成首批核心测试：可热更新日志字段生效、数据库字段变化只报告需重启且不发布、SecretRef 变更遵循白名单且不泄露引用、候选校验失败保留旧快照。后续补文件监听和订阅组件应用失败回滚测试。
+29. 已完成首批核心测试：可热更新日志字段生效、base/profile 文件候选可加载、数据库字段变化只报告需重启且不发布、SecretRef 变更遵循白名单且不泄露引用、候选校验失败保留旧快照。后续补文件监听和订阅组件应用失败回滚测试。
 
 > **验收标准**：白名单字段（如 `log.level`）变更后无需重启即可生效；数据库地址变更只告警不重建连接；热加载失败时进程继续运行且保留旧配置；全量回归测试通过。
 
@@ -893,7 +893,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 4. 初始化与诊断：`config init` 首批已落地，已生成安全默认模板和 `mail.password_ref` 占位；`config validate` 已使用 `LoadMode::RawSources` 命令内解析，raw TOML、`MEGA_*` 未消费覆盖项 warning、文件级 source path 诊断、坏 env/profile 类型脱敏错误和首批修复建议已完成；继续补完整 RawSources/source diagnostics。
 5. 样例/Profile/测试分层：测试配置生成器、Profile 合并语义、基础样例凭据治理和 CI 配置验证入口已完成首批；CI 已纳入 env diagnostics、坏 env/profile 类型单测、缺失 `mail.password_ref` 命令层脱敏单测，以及坏占位符、坏 SecretRef URI、坏 Redis URL scheme 的 CLI 失败 smoke；真实 Vault resolver 已覆盖缺失 secret 脱敏；继续扩展 CI 坏输入矩阵并迁移更多测试到隔离 helper。
 6. 可选专项：只有在明确要让对象存储凭据进入 vault 时，才拆 `Storage::new` 为 DB-only → Vault → resolve secrets → full storage。
-7. 独立阶段：受控热加载核心句柄已落地，白名单日志字段可发布新快照，数据库/Redis/mail 字段变化只报告需重启，SecretRef 变更不泄露不发布，候选失败时保留旧配置；仍需运行时接入、文件监听和订阅组件。
+7. 独立阶段：受控热加载核心句柄已落地，可从 base/profile 文件路径构建候选配置，白名单日志字段可发布新快照，数据库/Redis/mail 字段变化只报告需重启，SecretRef 变更不泄露不发布，候选失败时保留旧配置；仍需运行时接入、文件监听和订阅组件。
 
 **硬约束**（任何实现偏离都必须重新评审）：
 - `Config → Storage(DB/object storage) → Redis → VaultCore` 的启动顺序决定了数据库、Redis、当前 object storage 凭据不能使用本项目 Vault SecretRef。

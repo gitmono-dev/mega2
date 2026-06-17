@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use crate::{
     common::errors::MegaError,
@@ -65,6 +68,19 @@ impl ConfigHandle {
         }
 
         Ok(report)
+    }
+
+    pub fn reload_from_path(
+        &self,
+        path: &Path,
+        profile_path: Option<&Path>,
+    ) -> Result<ConfigReloadReport, MegaError> {
+        let path = path.to_str().ok_or_else(|| {
+            MegaError::Other(format!("Config path contains invalid UTF-8: {:?}", path))
+        })?;
+        let candidate = Config::new_with_profile(path, profile_path)?;
+
+        self.reload(candidate)
     }
 }
 
@@ -177,7 +193,9 @@ fn collect_mail_restart_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MailConfig, secret::SecretRef, testing::isolated_config};
+    use crate::config::{
+        MailConfig, secret::SecretRef, template::config_init_template, testing::isolated_config,
+    };
 
     #[test]
     fn reload_applies_log_fields_and_preserves_restart_required_database_fields() {
@@ -291,5 +309,40 @@ mod tests {
         assert!(!report_debug.contains("config/test/mail/current"));
         assert!(!report_debug.contains("config/test/mail/candidate"));
         assert!(!report_debug.contains("#value"));
+    }
+
+    #[test]
+    fn reload_from_path_uses_profile_candidate_and_keeps_restart_required_fields() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path())).expect("base config");
+
+        let initial = Config::new(config_path.to_str().expect("utf-8 config path"))
+            .expect("base config should load");
+        let original_db_url = initial.database.db_url.clone();
+        let handle = ConfigHandle::new(initial);
+
+        std::fs::write(
+            &profile_path,
+            r#"
+            [log]
+            level = "debug"
+
+            [database]
+            db_url = "postgres://localhost:5432/restart-required"
+            "#,
+        )
+        .expect("profile config");
+
+        let report = handle
+            .reload_from_path(&config_path, Some(&profile_path))
+            .expect("reload from profile should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert_eq!(report.applied_fields, vec!["log.level"]);
+        assert_eq!(report.restart_required_fields, vec!["database.db_url"]);
+        assert_eq!(snapshot.log.level, "debug");
+        assert_eq!(snapshot.database.db_url, original_db_url);
     }
 }
