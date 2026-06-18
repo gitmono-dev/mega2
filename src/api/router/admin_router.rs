@@ -8,6 +8,8 @@
 //! - 401 Unauthorized: No valid session (handled by `LoginUser` extractor)
 //! - 403 Forbidden: Logged in but not admin (for `/list` endpoint)
 
+use std::collections::HashSet;
+
 use axum::{
     Json,
     extract::{Path, State},
@@ -33,6 +35,8 @@ use crate::{
         EmailJobRetryDisposition, EmailJobStats,
     },
 };
+
+const MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS: i64 = 3650;
 
 #[derive(Serialize, ToSchema)]
 pub struct IsAdminResponse {
@@ -82,6 +86,26 @@ pub struct EmailJobRetryResponse {
     pub job: EmailJobResponse,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EmailJobPruneRequest {
+    pub older_than_days: i64,
+    pub statuses: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailJobPruneResponse {
+    pub deleted: u64,
+    pub statuses: Vec<String>,
+    pub older_than: String,
+}
+
+#[derive(Debug, Clone)]
+struct EmailJobPruneInput {
+    older_than_days: i64,
+    older_than: chrono::NaiveDateTime,
+    statuses: Vec<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct NotificationEventTypeListResponse {
     pub event_types: Vec<NotificationEventTypeInfo>,
@@ -118,6 +142,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(list_email_jobs))
             .routes(routes!(email_job_stats))
             .routes(routes!(retry_failed_email_job))
+            .routes(routes!(prune_email_jobs))
             .routes(routes!(list_notification_event_types))
             .routes(routes!(update_notification_event_type)),
     )
@@ -282,6 +307,42 @@ async fn retry_failed_email_job(
     }
 }
 
+/// POST /api/v1/admin/email-jobs/prune
+///
+/// Deletes old terminal notification email outbox jobs. Only admins can access this endpoint.
+#[utoipa::path(
+    post,
+    path = "/email-jobs/prune",
+    request_body = EmailJobPruneRequest,
+    responses(
+        (status = 200, body = CommonResult<EmailJobPruneResponse>, content_type = "application/json"),
+        (status = 400, description = "Invalid prune request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn prune_email_jobs(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Json(payload): Json<EmailJobPruneRequest>,
+) -> Result<Json<CommonResult<EmailJobPruneResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let input = normalize_email_job_prune_request(payload)?;
+
+    let deleted = state
+        .storage
+        .notification_storage()
+        .prune_email_jobs(&input.statuses, input.older_than)
+        .await?;
+
+    Ok(Json(CommonResult::success(Some(EmailJobPruneResponse {
+        deleted,
+        statuses: input.statuses,
+        older_than: input.older_than.to_string(),
+    }))))
+}
+
 /// GET /api/v1/admin/notification-event-types
 ///
 /// Lists notification event types. Only admins can access this endpoint.
@@ -408,6 +469,62 @@ impl From<EmailJobStats> for EmailJobStatsResponse {
     }
 }
 
+fn normalize_email_job_prune_request(
+    input: EmailJobPruneRequest,
+) -> Result<EmailJobPruneInput, ApiError> {
+    if input.older_than_days < 1 || input.older_than_days > MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "older_than_days must be between 1 and {MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS}"
+        )));
+    }
+
+    let statuses = normalize_prunable_email_job_statuses(input.statuses)?;
+    let older_than = chrono::Utc::now().naive_utc() - chrono::Duration::days(input.older_than_days);
+
+    Ok(EmailJobPruneInput {
+        older_than_days: input.older_than_days,
+        older_than,
+        statuses,
+    })
+}
+
+fn normalize_prunable_email_job_statuses(
+    statuses: Option<Vec<String>>,
+) -> Result<Vec<String>, ApiError> {
+    let statuses = match statuses {
+        Some(statuses) if !statuses.is_empty() => statuses,
+        _ => vec![
+            EMAIL_JOB_STATUS_SENT.to_string(),
+            EMAIL_JOB_STATUS_SKIPPED.to_string(),
+        ],
+    };
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(statuses.len());
+
+    for status in statuses {
+        let status = status.trim().to_ascii_lowercase();
+        if !matches!(
+            status.as_str(),
+            EMAIL_JOB_STATUS_SENT | EMAIL_JOB_STATUS_SKIPPED
+        ) {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "email job prune status must be `{EMAIL_JOB_STATUS_SENT}` or `{EMAIL_JOB_STATUS_SKIPPED}`"
+            )));
+        }
+        if seen.insert(status.clone()) {
+            normalized.push(status);
+        }
+    }
+
+    if normalized.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "email job prune statuses must not be empty"
+        )));
+    }
+
+    Ok(normalized)
+}
+
 fn validate_notification_event_type_code(code: &str) -> Result<String, ApiError> {
     let code = code.trim();
     if code.is_empty() {
@@ -492,6 +609,70 @@ mod tests {
     #[test]
     fn test_admin_router_creation() {
         let _router = routers();
+    }
+
+    #[test]
+    fn normalize_email_job_prune_request_defaults_to_sent_and_skipped() {
+        let input = normalize_email_job_prune_request(EmailJobPruneRequest {
+            older_than_days: 30,
+            statuses: None,
+        })
+        .unwrap();
+
+        assert_eq!(input.older_than_days, 30);
+        assert_eq!(
+            input.statuses,
+            vec![
+                EMAIL_JOB_STATUS_SENT.to_string(),
+                EMAIL_JOB_STATUS_SKIPPED.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_email_job_prune_request_trims_and_deduplicates_statuses() {
+        let input = normalize_email_job_prune_request(EmailJobPruneRequest {
+            older_than_days: 7,
+            statuses: Some(vec![
+                " Sent ".to_string(),
+                "sent".to_string(),
+                " skipped ".to_string(),
+            ]),
+        })
+        .unwrap();
+
+        assert_eq!(
+            input.statuses,
+            vec![
+                EMAIL_JOB_STATUS_SENT.to_string(),
+                EMAIL_JOB_STATUS_SKIPPED.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_email_job_prune_request_rejects_unsafe_inputs() {
+        assert!(
+            normalize_email_job_prune_request(EmailJobPruneRequest {
+                older_than_days: 0,
+                statuses: None,
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_email_job_prune_request(EmailJobPruneRequest {
+                older_than_days: MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS + 1,
+                statuses: None,
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_email_job_prune_request(EmailJobPruneRequest {
+                older_than_days: 7,
+                statuses: Some(vec![EMAIL_JOB_STATUS_FAILED.to_string()]),
+            })
+            .is_err()
+        );
     }
 
     #[test]

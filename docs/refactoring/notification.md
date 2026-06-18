@@ -55,7 +55,7 @@
 | 后台任务启动与生命周期          | **已基础接入，需完善** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher。仍需完善 graceful shutdown 协调、失败诊断、退避和多实例语义。 |
 | 多渠道支持（email 之外）        | **仅规划**        | 当前只有 email 渠道（通过 mail）。in-app（可能复用 chat/message 系统）、webhook、slack（参考 campsite slack.ts）等均未设计。 |
 | SecretRef / 渠道凭据            | **仅规划**        | Email 渠道的 password 走 mail 的 SecretRef（config 阶段 5）。未来 slack token 等需类似 vault 集成。 |
-| API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry API 已落地，admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
+| API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry/prune API 已落地，admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
 | 与 Config / 全局设置            | 弱集成            | 目前偏好全在 DB per-user。Config 中无 notification 相关全局开关（未来可能有 rate limit、默认 delivery_mode 等）。 |
 | Profile / 热加载 / 集中校验     | **未实现**        | 依赖 config 模块能力。通知事件类型或全局模板可能需要校验。 |
 | 可靠性（重试、DLQ、可观测）     | 基线已加固        | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 已有可配置 retry、failed dead-letter、stale `sending` 恢复、可配置批次/并发限流和结构化汇总日志；admin API 可查询/统计/重排 failed job。仍缺指标、tracing 上下文、告警和真实多实例矩阵。 |
@@ -265,13 +265,13 @@ Config::new
 - 验收：所有渠道凭据仅在 vault 就绪后解析；core_key 加固已完成（来自 vault.md 阶段 A）。
 
 **阶段 4（可靠性、扩展性、运维）**：
-- 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job、列出和 upsert notification event types。
+- 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job、按保留期 prune 旧 `sent`/`skipped` 终态 job、列出和 upsert notification event types。
 - 已完成基础邮件模板与 registry：CL 评论通知通过 `MailTemplateRegistry` 渲染 subject/html/text，并继承 locale fallback 能力。
 - 改进重试策略（指数退避、告警集成）。
 - 添加可观测（发送成功率、延迟、按事件/用户指标；tracing span 携带 event/job id）。
 - 继续扩展模板化（用户级 locale 来源、外部/管理员可配置模板、更多事件模板）。
 - 实现 in-app 渠道（可能复用现有 message/notification 表或新建）。
-- 继续扩展后台任务监控与 admin 接口（清理旧 sent jobs、审计、必要时编辑/重投递安全边界）。
+- 继续扩展后台任务监控与 admin 接口（审计、必要时编辑/重投递安全边界）。
 - 验收：高负载下可靠投递；失败可诊断和手动干预。
 
 **阶段 5（与 config 高级能力对齐 + 长期维护）**：

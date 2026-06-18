@@ -552,6 +552,32 @@ impl NotificationStorage {
             .await
     }
 
+    pub async fn prune_email_jobs(
+        &self,
+        statuses: &[String],
+        older_than: chrono::NaiveDateTime,
+    ) -> Result<u64, sea_orm::DbErr> {
+        if statuses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut status_condition = Condition::any();
+        for status in statuses {
+            status_condition = status_condition.add(email_jobs::Column::Status.eq(status));
+        }
+
+        let res = email_jobs::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(status_condition)
+                    .add(email_jobs::Column::UpdatedAt.lt(older_than)),
+            )
+            .exec(self.db())
+            .await?;
+
+        Ok(res.rows_affected)
+    }
+
     pub async fn retry_failed_email_job(
         &self,
         job_id: i64,
@@ -1165,5 +1191,137 @@ mod tests {
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.failed, 0);
         assert_eq!(stats.sent, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_email_jobs_removes_only_old_selected_terminal_jobs() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let old_sent_id = enqueue_test_email_job(&storage, "old-sent").await;
+        storage.mark_job_sent(old_sent_id).await.unwrap();
+        make_email_job_old(&db, old_sent_id).await;
+
+        let old_skipped_id = enqueue_test_email_job(&storage, "old-skipped").await;
+        storage
+            .mark_job_skipped(old_skipped_id, "disabled")
+            .await
+            .unwrap();
+        make_email_job_old(&db, old_skipped_id).await;
+
+        let old_failed_id = enqueue_test_email_job(&storage, "old-failed").await;
+        for _ in 0..MAX_EMAIL_RETRY_ATTEMPTS {
+            storage
+                .mark_job_failed_with_retry(old_failed_id, "smtp unavailable")
+                .await
+                .unwrap();
+        }
+        make_email_job_old(&db, old_failed_id).await;
+
+        let old_pending_id = enqueue_test_email_job(&storage, "old-pending").await;
+        make_email_job_old(&db, old_pending_id).await;
+
+        let recent_sent_id = enqueue_test_email_job(&storage, "recent-sent").await;
+        storage.mark_job_sent(recent_sent_id).await.unwrap();
+
+        let deleted = storage
+            .prune_email_jobs(
+                &[
+                    EMAIL_JOB_STATUS_SENT.to_string(),
+                    EMAIL_JOB_STATUS_SKIPPED.to_string(),
+                ],
+                now - chrono::Duration::days(7),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(
+            email_jobs::Entity::find_by_id(old_sent_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            email_jobs::Entity::find_by_id(old_skipped_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            email_jobs::Entity::find_by_id(old_failed_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            email_jobs::Entity::find_by_id(old_pending_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            email_jobs::Entity::find_by_id(recent_sent_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    async fn enqueue_test_email_job(storage: &NotificationStorage, username: &str) -> i64 {
+        storage
+            .enqueue_email_job(
+                username,
+                &format!("{username}@test.com"),
+                "test.event",
+                "Hello",
+                "<p>Hello</p>",
+                Some("Hello"),
+            )
+            .await
+            .unwrap();
+
+        storage
+            .fetch_pending_jobs(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.username == username)
+            .unwrap()
+            .id
+    }
+
+    async fn make_email_job_old(db: &DatabaseConnection, job_id: i64) {
+        let job = email_jobs::Entity::find_by_id(job_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut model: email_jobs::ActiveModel = job.into();
+        model.updated_at = Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(30));
+        model.update(db).await.unwrap();
     }
 }
