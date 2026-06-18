@@ -64,6 +64,19 @@ jobs:
         working-directory: monoengine
         run: cargo +nightly fmt --all --check
 
+      - name: Start test PostgreSQL
+        working-directory: monoengine
+        run: |
+          docker compose -f docker-compose.test.yml up -d postgres
+          for attempt in {1..30}; do
+            if docker compose -f docker-compose.test.yml exec -T postgres pg_isready -U mono -d monoengine_it; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f docker-compose.test.yml logs postgres
+          exit 1
+
       - name: Run config sample tests
         working-directory: monoengine
         run: |
@@ -265,3 +278,8 @@ jobs:
             exit 1
           fi
           grep -F "source diagnostics produced" "${profile_warning_output}"
+
+      - name: Stop test services
+        if: always()
+        working-directory: monoengine
+        run: docker compose -f docker-compose.test.yml down -v
