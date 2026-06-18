@@ -10,8 +10,8 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
-    MailConfig, MonoConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig,
-    secret::SecretRef,
+    MailConfig, MailProvider, MonoConfig, OrionServerConfig, PackConfig, RedisConfig,
+    SidebarConfig, secret::SecretRef,
 };
 use crate::common::errors::MegaError;
 
@@ -146,8 +146,16 @@ impl MailConfig {
         if let Some(secret_ref) = &self.password_ref {
             validate_mail_password_secret_ref("mail.password_ref", secret_ref)?;
         }
+        if self.provider != MailProvider::Smtp
+            && (self.password.is_some() || self.password_ref.is_some())
+        {
+            return Err(MegaError::Other(
+                "mail.password and mail.password_ref are only supported when mail.provider is smtp"
+                    .to_string(),
+            ));
+        }
 
-        if self.enabled {
+        if self.enabled && self.provider == MailProvider::Smtp {
             if self.smtp_host.trim().is_empty() {
                 return Err(MegaError::Other(
                     "mail.smtp_host is required when mail.enabled is true".to_string(),
@@ -1132,6 +1140,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         "sidebar.default_items" => Some(&["public_id", "label", "href", "visible", "order_index"]),
         "mail" => Some(&[
             "enabled",
+            "provider",
             "smtp_host",
             "smtp_port",
             "username",
@@ -1385,6 +1394,7 @@ mod tests {
     fn mail_validate_rejects_password_and_password_ref_together() {
         let mail_config = MailConfig {
             enabled: false,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -1407,6 +1417,7 @@ mod tests {
     fn mail_validate_rejects_password_ref_outside_mail_namespace_without_leaking_ref() {
         let mail_config = MailConfig {
             enabled: false,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -1434,6 +1445,7 @@ mod tests {
     fn mail_validate_rejects_missing_enabled_smtp_host() {
         let mail_config = MailConfig {
             enabled: true,
+            provider: MailProvider::Smtp,
             smtp_host: String::new(),
             smtp_port: 587,
             username: None,
@@ -1446,6 +1458,48 @@ mod tests {
         let err = mail_config.validate().expect_err("smtp host should fail");
 
         assert!(err.to_string().contains("mail.smtp_host"));
+    }
+
+    #[test]
+    fn mail_validate_accepts_enabled_console_without_smtp_fields() {
+        let mail_config = MailConfig {
+            enabled: true,
+            provider: MailProvider::Console,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: String::new(),
+            starttls: true,
+        };
+
+        mail_config
+            .validate()
+            .expect("console provider should pass");
+    }
+
+    #[test]
+    fn mail_validate_rejects_console_provider_credentials() {
+        let mail_config = MailConfig {
+            enabled: true,
+            provider: MailProvider::Console,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: Some(
+                SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
+            ),
+            from: String::new(),
+            starttls: true,
+        };
+
+        let err = mail_config
+            .validate()
+            .expect_err("console provider must not accept smtp credentials");
+
+        assert!(err.to_string().contains("mail.provider is smtp"));
     }
 
     #[test]

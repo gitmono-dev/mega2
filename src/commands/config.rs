@@ -594,6 +594,7 @@ mod tests {
         let mut config = isolated_config(temp_dir.path().join("base"));
         config.mail = Some(MailConfig {
             enabled: false,
+            provider: crate::config::MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -742,6 +743,7 @@ mod tests {
         let mut config = isolated_config(temp_dir.path().join("base"));
         config.mail = Some(MailConfig {
             enabled: false,
+            provider: crate::config::MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -771,6 +773,7 @@ mod tests {
         let mut config = isolated_config(temp_dir.path().join("base"));
         config.mail = Some(MailConfig {
             enabled: false,
+            provider: crate::config::MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,

@@ -93,6 +93,7 @@ batch_limit = 100
 
 [mail]
 enabled = false
+provider = "smtp"
 smtp_host = "smtp.example.com"
 smtp_port = 587
 username = "monoengine@example.com"

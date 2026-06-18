@@ -183,6 +183,7 @@ impl TestConfigBuilder {
             artifacts_gc: ArtifactGcConfig::default(),
             mail: self.mail_password_ref.map(|password_ref| MailConfig {
                 enabled: false,
+                provider: crate::config::MailProvider::Smtp,
                 smtp_host: "smtp.example.com".to_string(),
                 smtp_port: 587,
                 username: Some("monoengine@example.com".to_string()),

@@ -153,13 +153,24 @@ impl Default for ArtifactGcConfig {
     }
 }
 
-/// Mail configuration (SMTP for now). Lives here so it participates in the main
-/// Config loading / env overlay / placeholder / (future) SecretRef pipeline.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MailProvider {
+    #[default]
+    Smtp,
+    Console,
+}
+
+/// Mail configuration. Lives here so it participates in the main Config loading
+/// / env overlay / placeholder / (future) SecretRef pipeline.
 /// See docs/mail.md for the full mail module design and SecretRef migration plan.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MailConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub provider: MailProvider,
+    #[serde(default)]
     pub smtp_host: String,
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
@@ -169,6 +180,7 @@ pub struct MailConfig {
     pub password: Option<secret::SecretString>,
     #[serde(default)]
     pub password_ref: Option<secret::SecretRef>,
+    #[serde(default)]
     pub from: String,
     #[serde(default = "default_starttls")]
     pub starttls: bool,
@@ -186,6 +198,7 @@ impl Default for MailConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: MailProvider::default(),
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             username: None,

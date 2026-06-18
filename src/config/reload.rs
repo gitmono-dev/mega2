@@ -874,6 +874,9 @@ fn collect_mail_restart_fields(
     candidate: &MailConfig,
     report: &mut ConfigReloadReport,
 ) {
+    if current.provider != candidate.provider {
+        report.restart_required_fields.push("mail.provider");
+    }
     if current.smtp_host != candidate.smtp_host {
         report.restart_required_fields.push("mail.smtp_host");
     }
@@ -901,7 +904,7 @@ fn collect_mail_restart_fields(
 mod tests {
     use super::*;
     use crate::config::{
-        ArtifactGcConfig, BuckConfig, MailConfig,
+        ArtifactGcConfig, BuckConfig, MailConfig, MailProvider,
         secret::{SecretRef, SecretString},
         template::config_init_template,
         testing::isolated_config,
@@ -910,6 +913,7 @@ mod tests {
     fn mail_config(enabled: bool) -> MailConfig {
         MailConfig {
             enabled,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: Some("monoengine@example.com".to_string()),
@@ -1263,6 +1267,29 @@ mod tests {
     }
 
     #[test]
+    fn reload_reports_mail_provider_change_requires_restart_without_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(true));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.mail.as_mut().expect("mail config").provider = MailProvider::Console;
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(report.restart_required_fields, vec!["mail.provider"]);
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert_eq!(
+            snapshot.mail.as_ref().expect("mail config").provider,
+            MailProvider::Smtp
+        );
+    }
+
+    #[test]
     fn reload_reports_mail_reconfiguration_requires_restart_without_leaking_or_publishing_snapshot()
     {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1271,6 +1298,7 @@ mod tests {
         let mut current = isolated_config(temp_dir.path().join("current"));
         current.mail = Some(MailConfig {
             enabled: true,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.current.example.com".to_string(),
             smtp_port: 587,
             username: Some("current-user".to_string()),
@@ -1284,6 +1312,7 @@ mod tests {
         let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
         candidate.mail = Some(MailConfig {
             enabled: true,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.candidate.example.com".to_string(),
             smtp_port: 465,
             username: Some("candidate-user".to_string()),

@@ -418,6 +418,7 @@ mod test {
 
         let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
         assert!(parsed.mail.enabled);
+        assert_eq!(parsed.mail.provider, MailProvider::Smtp);
         assert_eq!(parsed.mail.smtp_host, "smtp.example.com");
         assert_eq!(parsed.mail.smtp_port, 587);
         assert_eq!(parsed.mail.from, "no-reply@example.com");
@@ -425,6 +426,26 @@ mod test {
         assert!(parsed.mail.username.is_none());
         assert!(parsed.mail.password.is_none());
         assert!(parsed.mail.password_ref.is_none());
+    }
+
+    #[test]
+    fn test_mail_config_deserial_console_provider() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            mail: MailConfig,
+        }
+
+        let toml = r#"
+            [mail]
+            enabled = true
+            provider = "console"
+        "#;
+
+        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
+        assert_eq!(parsed.mail.provider, MailProvider::Console);
+        assert!(parsed.mail.smtp_host.is_empty());
+        assert!(parsed.mail.from.is_empty());
+        parsed.mail.validate().expect("console provider is valid");
     }
 
     #[test]

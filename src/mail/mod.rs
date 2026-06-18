@@ -14,7 +14,7 @@
 //! Current status (see docs/mail.md for the full analysis and phased plan):
 //! - MailConfig lives in `crate::config` (will co-evolve with the config
 //!   module split).
-//! - Only SMTP + Noop are implemented.
+//! - SMTP, console and Noop are implemented.
 //! - The background EmailDispatcher (in `crate::notification`) processes the
 //!   `email_jobs` outbox table using a `NotificationStorage`.
 //! - Triggers (e.g. on_cl_comment_created) enqueue jobs respecting user
@@ -27,6 +27,8 @@
 //! - Construction of SmtpMailer with real credentials must happen in post-vault
 //!   startup paths.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
@@ -34,7 +36,10 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 
-use crate::{common::errors::MegaError, config::MailConfig};
+use crate::{
+    common::errors::MegaError,
+    config::{MailConfig, MailProvider},
+};
 
 pub mod template;
 
@@ -60,6 +65,46 @@ impl Mailer for NoopMailer {
         _html: &str,
         _text: Option<&str>,
     ) -> Result<(), MegaError> {
+        Ok(())
+    }
+}
+
+pub struct ConsoleMailer {
+    enabled: bool,
+    from: String,
+}
+
+impl ConsoleMailer {
+    pub fn new(cfg: &MailConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            from: cfg.from.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl Mailer for ConsoleMailer {
+    async fn send_html(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: Option<&str>,
+    ) -> Result<(), MegaError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        tracing::info!(
+            from = %self.from,
+            to = %to,
+            subject = %subject,
+            html_len = html.len(),
+            text_len = text.map(str::len).unwrap_or_default(),
+            "console mailer accepted email"
+        );
+
         Ok(())
     }
 }
@@ -183,15 +228,43 @@ impl Mailer for SmtpMailer {
     }
 }
 
+pub fn mailer_from_config(
+    cfg: &MailConfig,
+    resolved_password: Option<String>,
+) -> Result<Arc<dyn Mailer>, MegaError> {
+    cfg.validate_secret_fields()?;
+
+    match cfg.provider {
+        MailProvider::Smtp => {
+            let password = if cfg.password_ref.is_some() {
+                Some(resolved_password.ok_or_else(|| {
+                    MegaError::Other(
+                        "mail.password_ref must be resolved before constructing smtp mailer"
+                            .to_string(),
+                    )
+                })?)
+            } else {
+                cfg.password
+                    .as_ref()
+                    .map(|password| password.expose_secret().to_string())
+            };
+
+            Ok(Arc::new(SmtpMailer::new_with_password(cfg, password)?))
+        }
+        MailProvider::Console => Ok(Arc::new(ConsoleMailer::new(cfg))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MailConfig;
+    use crate::config::{MailConfig, MailProvider};
 
     #[test]
     fn test_smtp_mailer_disabled_is_noop() {
         let cfg = MailConfig {
             enabled: false,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -209,6 +282,7 @@ mod tests {
     fn test_build_message_validates_addresses() {
         let cfg = MailConfig {
             enabled: false,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -231,6 +305,7 @@ mod tests {
     fn test_build_message_rejects_bad_to() {
         let cfg = MailConfig {
             enabled: false,
+            provider: MailProvider::Smtp,
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             username: None,
@@ -244,5 +319,22 @@ mod tests {
             .build_message("not-an-email", "Subj", "<p>Hi</p>", None)
             .expect_err("should fail");
         let _ = format!("{err:?}");
+    }
+
+    #[test]
+    fn test_mailer_from_config_builds_console_provider_without_smtp_fields() {
+        let cfg = MailConfig {
+            enabled: true,
+            provider: MailProvider::Console,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: String::new(),
+            starttls: true,
+        };
+
+        mailer_from_config(&cfg, None).expect("console mailer should build");
     }
 }
