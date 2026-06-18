@@ -9,6 +9,7 @@ on:
       - "src/commands/config.rs"
       - "src/config/**"
       - "docs/refactoring/config.md"
+      - "docs/refactoring/mail.md"
       - "README.md"
   push:
     branches:
@@ -20,6 +21,7 @@ on:
       - "src/commands/config.rs"
       - "src/config/**"
       - "docs/refactoring/config.md"
+      - "docs/refactoring/mail.md"
       - "README.md"
 
 jobs:
@@ -58,6 +60,9 @@ jobs:
           cargo test reload_rolls_back_subscribers_and_keeps_snapshot_when_apply_fails -- --nocapture
           cargo test test_new_with_profile_merges_profile_before_env -- --nocapture
           cargo test config_init_template_has_no_unconsumed_fields -- --nocapture
+          cargo test config_validate_rejects_invalid_pack_settings -- --nocapture
+          cargo test config_validate_rejects_invalid_blame_settings -- --nocapture
+          cargo test config_validate_rejects_invalid_artifact_gc_settings -- --nocapture
           cargo test source_diagnostics_collects_base_profile_and_env_warnings -- --nocapture
           cargo test source_diagnostics_collects_cross_source_overrides_without_values -- --nocapture
           cargo test source_diagnostics_collects_field_source_graph_without_values -- --nocapture

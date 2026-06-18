@@ -9,8 +9,8 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig, MailConfig, OrionServerConfig,
-    RedisConfig,
+    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
+    MailConfig, OrionServerConfig, PackConfig, RedisConfig,
 };
 use crate::common::errors::MegaError;
 
@@ -107,6 +107,8 @@ impl Config {
     pub fn validate(&self) -> Result<(), MegaError> {
         validate_log_config(&self.log)?;
         validate_database_config(&self.database)?;
+        validate_pack_config(&self.pack)?;
+        validate_blame_config(&self.blame)?;
         validate_lfs_config(&self.lfs)?;
         validate_build_config(&self.build)?;
         validate_redis_config(&self.redis)?;
@@ -120,6 +122,7 @@ impl Config {
         if let Some(orion_server_config) = &self.orion_server {
             validate_orion_server_config(orion_server_config)?;
         }
+        validate_artifact_gc_config(&self.artifacts_gc)?;
 
         Ok(())
     }
@@ -202,6 +205,49 @@ pub(crate) fn validate_database_config(db_config: &DbConfig) -> Result<(), MegaE
             "database.db_url scheme must be 'postgres' or 'postgresql', got '{scheme}'"
         ))),
     }
+}
+
+pub(crate) fn validate_pack_config(pack_config: &PackConfig) -> Result<(), MegaError> {
+    validate_size_string(
+        "pack.pack_decode_mem_size",
+        &pack_config.pack_decode_mem_size,
+    )?;
+    validate_size_string(
+        "pack.pack_decode_disk_size",
+        &pack_config.pack_decode_disk_size,
+    )?;
+    require_non_empty_path(
+        "pack.pack_decode_cache_path",
+        &pack_config.pack_decode_cache_path,
+    )?;
+    if pack_config.channel_message_size == 0 {
+        return Err(MegaError::Other(
+            "pack.channel_message_size must be greater than 0".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_blame_config(blame_config: &BlameConfig) -> Result<(), MegaError> {
+    if blame_config.max_lines_threshold == 0 {
+        return Err(MegaError::Other(
+            "blame.max_lines_threshold must be greater than 0".to_string(),
+        ));
+    }
+    validate_size_string("blame.max_size_threshold", &blame_config.max_size_threshold)?;
+    if blame_config.default_chunk_size == 0 {
+        return Err(MegaError::Other(
+            "blame.default_chunk_size must be greater than 0".to_string(),
+        ));
+    }
+    if blame_config.max_commits_in_memory == 0 {
+        return Err(MegaError::Other(
+            "blame.max_commits_in_memory must be greater than 0".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn validate_lfs_config(lfs_config: &LFSConfig) -> Result<(), MegaError> {
@@ -308,6 +354,35 @@ pub(crate) fn validate_orion_server_config(
         "orion_server.monobase_url",
         &orion_server_config.monobase_url,
     )
+}
+
+pub(crate) fn validate_artifact_gc_config(
+    artifact_gc_config: &ArtifactGcConfig,
+) -> Result<(), MegaError> {
+    if artifact_gc_config.interval_secs == 0 {
+        return Err(MegaError::Other(
+            "artifacts_gc.interval_secs must be greater than 0".to_string(),
+        ));
+    }
+    if artifact_gc_config.batch_limit == 0 {
+        return Err(MegaError::Other(
+            "artifacts_gc.batch_limit must be greater than 0".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_size_string(field_path: &str, value: &str) -> Result<(), MegaError> {
+    let bytes = PackConfig::get_size_from_str(value, || Ok(8 * 1024 * 1024 * 1024))
+        .map_err(|e| MegaError::Other(format!("{field_path} must be a valid size: {e}")))?;
+    if bytes == 0 {
+        return Err(MegaError::Other(format!(
+            "{field_path} must be greater than 0"
+        )));
+    }
+
+    Ok(())
 }
 
 fn require_non_empty(field_path: &str, value: &str) -> Result<(), MegaError> {
@@ -981,6 +1056,68 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_rejects_invalid_pack_settings() {
+        let mut config = Config::mock();
+        config.pack.pack_decode_mem_size = "definitely-not-a-size".to_string();
+        let err = config
+            .validate()
+            .expect_err("invalid pack decode memory size should fail");
+        assert!(err.to_string().contains("pack.pack_decode_mem_size"));
+
+        let mut config = Config::mock();
+        config.pack.pack_decode_disk_size = "0".to_string();
+        let err = config
+            .validate()
+            .expect_err("zero pack decode disk size should fail");
+        assert!(err.to_string().contains("pack.pack_decode_disk_size"));
+
+        let mut config = Config::mock();
+        config.pack.pack_decode_cache_path = PathBuf::new();
+        let err = config
+            .validate()
+            .expect_err("empty pack decode cache path should fail");
+        assert!(err.to_string().contains("pack.pack_decode_cache_path"));
+
+        let mut config = Config::mock();
+        config.pack.channel_message_size = 0;
+        let err = config
+            .validate()
+            .expect_err("zero pack channel message size should fail");
+        assert!(err.to_string().contains("pack.channel_message_size"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_blame_settings() {
+        let mut config = Config::mock();
+        config.blame.max_lines_threshold = 0;
+        let err = config
+            .validate()
+            .expect_err("zero blame line threshold should fail");
+        assert!(err.to_string().contains("blame.max_lines_threshold"));
+
+        let mut config = Config::mock();
+        config.blame.max_size_threshold = "not-a-size".to_string();
+        let err = config
+            .validate()
+            .expect_err("invalid blame size threshold should fail");
+        assert!(err.to_string().contains("blame.max_size_threshold"));
+
+        let mut config = Config::mock();
+        config.blame.default_chunk_size = 0;
+        let err = config
+            .validate()
+            .expect_err("zero blame chunk size should fail");
+        assert!(err.to_string().contains("blame.default_chunk_size"));
+
+        let mut config = Config::mock();
+        config.blame.max_commits_in_memory = 0;
+        let err = config
+            .validate()
+            .expect_err("zero blame commit limit should fail");
+        assert!(err.to_string().contains("blame.max_commits_in_memory"));
+    }
+
+    #[test]
     fn config_validate_rejects_unknown_log_level() {
         let mut config = Config::mock();
         config.log.level = "verbose".to_string();
@@ -1191,6 +1328,23 @@ mod tests {
             .expect_err("missing gcs bucket should fail");
 
         assert!(err.to_string().contains("object_storage.gcs.bucket"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_artifact_gc_settings() {
+        let mut config = Config::mock();
+        config.artifacts_gc.interval_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("zero artifact gc interval should fail");
+        assert!(err.to_string().contains("artifacts_gc.interval_secs"));
+
+        let mut config = Config::mock();
+        config.artifacts_gc.batch_limit = 0;
+        let err = config
+            .validate()
+            .expect_err("zero artifact gc batch limit should fail");
+        assert!(err.to_string().contains("artifacts_gc.batch_limit"));
     }
 
     #[test]
