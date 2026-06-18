@@ -28,7 +28,8 @@
   blobs/LFS on **local FS, AWS S3, S3-compatible (RustFS, MinIO, ...), or GCS**;
   `redis` for cache / queue.
 - **Email notifications** — async dispatcher backed by an `email_jobs` queue,
-  SMTP via `lettre` (rustls + tokio), event triggers for CL comments etc.
+  SMTP via `lettre` (rustls + tokio), event triggers for CL comments, and
+  admin-managed outbox attachment download/delete/retention cleanup.
 - **Embedded Vault** — PKI (root CA, role‑based cert issuance) and a KV / secret
   engine via the vendored RustyVault module in `src/vault`, with a `jupiter`
   storage backend so the vault lives in the same database.

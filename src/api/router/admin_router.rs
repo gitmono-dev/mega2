@@ -140,6 +140,8 @@ pub struct EmailJobAttachmentDeleteResponse {
 pub struct EmailJobAttachmentPruneRequest {
     pub older_than_days: i64,
     pub statuses: Option<Vec<String>>,
+    pub username: Option<String>,
+    pub event_type_code: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -174,6 +176,8 @@ struct EmailJobAttachmentPruneInput {
     older_than_days: i64,
     older_than: chrono::NaiveDateTime,
     statuses: Vec<String>,
+    username: Option<String>,
+    event_type_code: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -509,7 +513,12 @@ async fn prune_email_job_attachments(
     let deleted = state
         .storage
         .notification_storage()
-        .prune_email_job_attachments(&input.statuses, input.older_than)
+        .prune_email_job_attachments(
+            &input.statuses,
+            input.older_than,
+            input.username.as_deref(),
+            input.event_type_code.as_deref(),
+        )
         .await?;
 
     Ok(Json(CommonResult::success(Some(
@@ -775,6 +784,8 @@ fn normalize_email_job_attachment_prune_request(
         older_than_days: input.older_than_days,
         older_than,
         statuses,
+        username: trim_optional(input.username),
+        event_type_code: trim_optional(input.event_type_code),
     })
 }
 
@@ -996,10 +1007,14 @@ mod tests {
         let input = normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
             older_than_days: 30,
             statuses: None,
+            username: None,
+            event_type_code: None,
         })
         .unwrap();
 
         assert_eq!(input.older_than_days, 30);
+        assert_eq!(input.username, None);
+        assert_eq!(input.event_type_code, None);
         assert_eq!(
             input.statuses,
             vec![
@@ -1010,11 +1025,27 @@ mod tests {
     }
 
     #[test]
+    fn normalize_email_job_attachment_prune_request_trims_filters() {
+        let input = normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
+            older_than_days: 7,
+            statuses: Some(vec![EMAIL_JOB_STATUS_SENT.to_string()]),
+            username: Some(" alice ".to_string()),
+            event_type_code: Some(" cl.comment.created ".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(input.username.as_deref(), Some("alice"));
+        assert_eq!(input.event_type_code.as_deref(), Some("cl.comment.created"));
+    }
+
+    #[test]
     fn normalize_email_job_attachment_prune_request_rejects_unsafe_inputs() {
         assert!(
             normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
                 older_than_days: 0,
                 statuses: None,
+                username: None,
+                event_type_code: None,
             })
             .is_err()
         );
@@ -1022,6 +1053,8 @@ mod tests {
             normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
                 older_than_days: MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS + 1,
                 statuses: None,
+                username: None,
+                event_type_code: None,
             })
             .is_err()
         );
@@ -1029,6 +1062,8 @@ mod tests {
             normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
                 older_than_days: 7,
                 statuses: Some(vec![EMAIL_JOB_STATUS_FAILED.to_string()]),
+                username: None,
+                event_type_code: None,
             })
             .is_err()
         );

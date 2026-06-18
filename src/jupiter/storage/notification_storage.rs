@@ -549,6 +549,8 @@ impl NotificationStorage {
         &self,
         statuses: &[String],
         older_than: chrono::NaiveDateTime,
+        username: Option<&str>,
+        event_type_code: Option<&str>,
     ) -> Result<u64, sea_orm::DbErr> {
         if statuses.is_empty() {
             return Ok(0);
@@ -558,15 +560,21 @@ impl NotificationStorage {
         for status in statuses {
             status_condition = status_condition.add(email_jobs::Column::Status.eq(status));
         }
+        let mut job_condition = Condition::all()
+            .add(status_condition)
+            .add(email_jobs::Column::UpdatedAt.lt(older_than));
+        if let Some(username) = username {
+            job_condition = job_condition.add(email_jobs::Column::Username.eq(username));
+        }
+        if let Some(event_type_code) = event_type_code {
+            job_condition =
+                job_condition.add(email_jobs::Column::EventTypeCode.eq(event_type_code));
+        }
 
         let job_ids = email_jobs::Entity::find()
             .select_only()
             .column(email_jobs::Column::Id)
-            .filter(
-                Condition::all()
-                    .add(status_condition)
-                    .add(email_jobs::Column::UpdatedAt.lt(older_than)),
-            )
+            .filter(job_condition)
             .into_tuple::<i64>()
             .all(self.db())
             .await?;
@@ -1769,6 +1777,8 @@ mod tests {
                     EMAIL_JOB_STATUS_SKIPPED.to_string(),
                 ],
                 now - chrono::Duration::days(7),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1828,6 +1838,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prune_email_job_attachments_filters_by_username_and_event_type() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        for code in ["target.event", "other.event"] {
+            notification_event_types::ActiveModel {
+                code: Set(code.to_string()),
+                category: Set("test".to_string()),
+                description: Set("desc".to_string()),
+                system_required: Set(false),
+                default_enabled: Set(true),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let alice_target_id = enqueue_test_email_job_with_attachment_for_event(
+            &storage,
+            "alice",
+            "target.event",
+            "Alice target",
+        )
+        .await;
+        storage.mark_job_sent(alice_target_id).await.unwrap();
+        make_email_job_old(&db, alice_target_id).await;
+
+        let alice_other_id = enqueue_test_email_job_with_attachment_for_event(
+            &storage,
+            "alice",
+            "other.event",
+            "Alice other",
+        )
+        .await;
+        storage.mark_job_sent(alice_other_id).await.unwrap();
+        make_email_job_old(&db, alice_other_id).await;
+
+        let bob_target_id = enqueue_test_email_job_with_attachment_for_event(
+            &storage,
+            "bob",
+            "target.event",
+            "Bob target",
+        )
+        .await;
+        storage.mark_job_sent(bob_target_id).await.unwrap();
+        make_email_job_old(&db, bob_target_id).await;
+
+        let deleted = storage
+            .prune_email_job_attachments(
+                &[EMAIL_JOB_STATUS_SENT.to_string()],
+                now - chrono::Duration::days(7),
+                Some("alice"),
+                Some("target.event"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(
+            storage
+                .list_email_job_attachment_metadata(alice_target_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .list_email_job_attachment_metadata(alice_other_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .list_email_job_attachment_metadata(bob_target_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     async fn enqueue_test_email_job(storage: &NotificationStorage, username: &str) -> i64 {
         storage
             .enqueue_email_job(
@@ -1855,6 +1956,16 @@ mod tests {
         storage: &NotificationStorage,
         username: &str,
     ) -> i64 {
+        enqueue_test_email_job_with_attachment_for_event(storage, username, "test.event", "Hello")
+            .await
+    }
+
+    async fn enqueue_test_email_job_with_attachment_for_event(
+        storage: &NotificationStorage,
+        username: &str,
+        event_type_code: &str,
+        subject: &str,
+    ) -> i64 {
         let to_email = format!("{username}@test.com");
         let attachments = [EmailJobAttachment::new(
             format!("{username}.txt"),
@@ -1866,8 +1977,8 @@ mod tests {
             .enqueue_email_job_with_attachments(EmailJobEnqueue {
                 username,
                 to_email: &to_email,
-                event_type_code: "test.event",
-                subject: "Hello",
+                event_type_code,
+                subject,
                 body_html: "<p>Hello</p>",
                 body_text: Some("Hello"),
                 attachments: &attachments,
@@ -1880,7 +1991,11 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|job| job.username == username)
+            .find(|job| {
+                job.username == username
+                    && job.event_type_code == event_type_code
+                    && job.subject == subject
+            })
             .unwrap()
             .id
     }
