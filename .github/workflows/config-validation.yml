@@ -37,11 +37,22 @@ jobs:
         with:
           path: monoengine
 
+      - name: Validate orbit checkout token
+        env:
+          ORBIT_CHECKOUT_TOKEN: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
+        run: |
+          if [ -z "${ORBIT_CHECKOUT_TOKEN}" ]; then
+            echo "::error title=Missing ORBIT_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/orbit sibling repository. Add an Actions secret named ORBIT_CHECKOUT_TOKEN with read-only contents access to gitmono-dev/orbit."
+            exit 1
+          fi
+
       - name: Checkout orbit sibling
         uses: actions/checkout@v5
         with:
           repository: gitmono-dev/orbit
+          ref: main
           path: orbit
+          token: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
 
       - name: Install Rust toolchains
         run: |
