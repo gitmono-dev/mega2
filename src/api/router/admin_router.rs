@@ -23,7 +23,8 @@ use crate::{
         api_doc::{MAIL_TAG, USER_TAG},
         oauth::model::LoginUser,
     },
-    callisto::email_jobs,
+    callisto::{email_jobs, notification_event_types},
+    ceres::model::notification::NotificationEventTypeInfo,
     common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
     jupiter::storage::notification_storage::{
@@ -81,6 +82,32 @@ pub struct EmailJobRetryResponse {
     pub job: EmailJobResponse,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationEventTypeListResponse {
+    pub event_types: Vec<NotificationEventTypeInfo>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateNotificationEventTypeRequest {
+    pub category: String,
+    pub description: String,
+    pub system_required: bool,
+    pub default_enabled: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationEventTypeResponse {
+    pub event_type: NotificationEventTypeInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationEventTypeInput {
+    category: String,
+    description: String,
+    system_required: bool,
+    default_enabled: bool,
+}
+
 /// Build the admin router.
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(
@@ -90,7 +117,9 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(admin_list))
             .routes(routes!(list_email_jobs))
             .routes(routes!(email_job_stats))
-            .routes(routes!(retry_failed_email_job)),
+            .routes(routes!(retry_failed_email_job))
+            .routes(routes!(list_notification_event_types))
+            .routes(routes!(update_notification_event_type)),
     )
 }
 
@@ -253,6 +282,88 @@ async fn retry_failed_email_job(
     }
 }
 
+/// GET /api/v1/admin/notification-event-types
+///
+/// Lists notification event types. Only admins can access this endpoint.
+#[utoipa::path(
+    get,
+    path = "/notification-event-types",
+    responses(
+        (status = 200, body = CommonResult<NotificationEventTypeListResponse>, content_type = "application/json"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn list_notification_event_types(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<NotificationEventTypeListResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+
+    let event_types = state
+        .storage
+        .notification_storage()
+        .list_event_types()
+        .await?;
+
+    Ok(Json(CommonResult::success(Some(
+        NotificationEventTypeListResponse {
+            event_types: event_types
+                .into_iter()
+                .map(NotificationEventTypeInfo::from)
+                .collect(),
+        },
+    ))))
+}
+
+/// PUT /api/v1/admin/notification-event-types/{code}
+///
+/// Creates or updates a notification event type. Only admins can access this endpoint.
+#[utoipa::path(
+    put,
+    path = "/notification-event-types/{code}",
+    params(
+        ("code" = String, Path, description = "Notification event type code")
+    ),
+    request_body = UpdateNotificationEventTypeRequest,
+    responses(
+        (status = 200, body = CommonResult<NotificationEventTypeResponse>, content_type = "application/json"),
+        (status = 400, description = "Invalid notification event type payload"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn update_notification_event_type(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path(code): Path<String>,
+    Json(payload): Json<UpdateNotificationEventTypeRequest>,
+) -> Result<Json<CommonResult<NotificationEventTypeResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+
+    let code = validate_notification_event_type_code(&code)?;
+    let input = normalize_notification_event_type_input(payload)?;
+    let event_type = state
+        .storage
+        .notification_storage()
+        .upsert_event_type(
+            &code,
+            &input.category,
+            &input.description,
+            input.system_required,
+            input.default_enabled,
+        )
+        .await?;
+
+    Ok(Json(CommonResult::success(Some(
+        NotificationEventTypeResponse {
+            event_type: NotificationEventTypeInfo::from(event_type),
+        },
+    ))))
+}
+
 impl From<email_jobs::Model> for EmailJobResponse {
     fn from(value: email_jobs::Model) -> Self {
         Self {
@@ -272,6 +383,18 @@ impl From<email_jobs::Model> for EmailJobResponse {
     }
 }
 
+impl From<notification_event_types::Model> for NotificationEventTypeInfo {
+    fn from(value: notification_event_types::Model) -> Self {
+        Self {
+            code: value.code,
+            category: value.category,
+            description: value.description,
+            system_required: value.system_required,
+            default_enabled: value.default_enabled,
+        }
+    }
+}
+
 impl From<EmailJobStats> for EmailJobStatsResponse {
     fn from(value: EmailJobStats) -> Self {
         Self {
@@ -283,6 +406,41 @@ impl From<EmailJobStats> for EmailJobStatsResponse {
             skipped: value.skipped,
         }
     }
+}
+
+fn validate_notification_event_type_code(code: &str) -> Result<String, ApiError> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "notification event type code must not be empty"
+        )));
+    }
+    Ok(code.to_string())
+}
+
+fn normalize_notification_event_type_input(
+    input: UpdateNotificationEventTypeRequest,
+) -> Result<NotificationEventTypeInput, ApiError> {
+    let category = input.category.trim();
+    if category.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "notification event type category must not be empty"
+        )));
+    }
+
+    let description = input.description.trim();
+    if description.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "notification event type description must not be empty"
+        )));
+    }
+
+    Ok(NotificationEventTypeInput {
+        category: category.to_string(),
+        description: description.to_string(),
+        system_required: input.system_required,
+        default_enabled: input.default_enabled,
+    })
 }
 
 fn validate_email_job_pagination(pagination: &Pagination) -> Result<(), ApiError> {
@@ -325,4 +483,84 @@ fn trim_optional(value: Option<String>) -> Option<String> {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_admin_router_creation() {
+        let _router = routers();
+    }
+
+    #[test]
+    fn notification_event_type_info_maps_from_model() {
+        let now = chrono::Utc::now().naive_utc();
+        let response = NotificationEventTypeInfo::from(notification_event_types::Model {
+            code: "cl.comment.created".to_string(),
+            category: "cl".to_string(),
+            description: "New comment on a Change List".to_string(),
+            system_required: false,
+            default_enabled: true,
+            created_at: now,
+            updated_at: now,
+        });
+
+        assert_eq!(response.code, "cl.comment.created");
+        assert_eq!(response.category, "cl");
+        assert_eq!(response.description, "New comment on a Change List");
+        assert!(!response.system_required);
+        assert!(response.default_enabled);
+    }
+
+    #[test]
+    fn validate_notification_event_type_code_trims_and_rejects_blank_code() {
+        assert_eq!(
+            validate_notification_event_type_code(" cl.comment.created ").unwrap(),
+            "cl.comment.created"
+        );
+        assert!(validate_notification_event_type_code("  ").is_err());
+    }
+
+    #[test]
+    fn normalize_notification_event_type_input_trims_and_rejects_blank_fields() {
+        let normalized =
+            normalize_notification_event_type_input(UpdateNotificationEventTypeRequest {
+                category: " cl ".to_string(),
+                description: " New comment ".to_string(),
+                system_required: false,
+                default_enabled: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            normalized,
+            NotificationEventTypeInput {
+                category: "cl".to_string(),
+                description: "New comment".to_string(),
+                system_required: false,
+                default_enabled: true,
+            }
+        );
+
+        assert!(
+            normalize_notification_event_type_input(UpdateNotificationEventTypeRequest {
+                category: " ".to_string(),
+                description: "New comment".to_string(),
+                system_required: false,
+                default_enabled: true,
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_notification_event_type_input(UpdateNotificationEventTypeRequest {
+                category: "cl".to_string(),
+                description: " ".to_string(),
+                system_required: false,
+                default_enabled: true,
+            })
+            .is_err()
+        );
+    }
 }

@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use sea_orm::{ActiveModelTrait, Set};
-
 use crate::{
-    callisto::notification_event_types,
     common::errors::MegaError,
     jupiter::storage::{
         cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage,
@@ -40,25 +37,13 @@ const NOTIFICATION_MAIL_TEMPLATE_REGISTRY: MailTemplateRegistry<'static> =
 /// currently does not seed event types in migrations
 /// upsert the event type at first use.
 async fn ensure_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaError> {
-    if stg
-        .get_event_type(EVENT_CL_COMMENT_CREATED)
-        .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let now = chrono::Utc::now().naive_utc();
-    notification_event_types::ActiveModel {
-        code: Set(EVENT_CL_COMMENT_CREATED.to_owned()),
-        category: Set("cl".to_owned()),
-        description: Set("New comment on a Change List".to_owned()),
-        system_required: Set(false),
-        default_enabled: Set(true),
-        created_at: Set(now),
-        updated_at: Set(now),
-    }
-    .insert(stg.db())
+    stg.upsert_event_type(
+        EVENT_CL_COMMENT_CREATED,
+        "cl",
+        "New comment on a Change List",
+        false,
+        true,
+    )
     .await?;
 
     Ok(())
@@ -138,7 +123,7 @@ pub async fn on_cl_comment_created(
 mod tests {
     use std::sync::Arc;
 
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
     use tempfile::TempDir;
 
     use super::*;

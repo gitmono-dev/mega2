@@ -104,11 +104,12 @@ impl NotificationStorage {
         &self.db
     }
 
-    // Evnt types
+    // Event types
     pub async fn list_event_types(
         &self,
     ) -> Result<Vec<notification_event_types::Model>, sea_orm::DbErr> {
         notification_event_types::Entity::find()
+            .order_by_asc(notification_event_types::Column::Code)
             .all(self.db())
             .await
     }
@@ -121,6 +122,39 @@ impl NotificationStorage {
             .filter(notification_event_types::Column::Code.eq(code))
             .one(self.db())
             .await
+    }
+
+    pub async fn upsert_event_type(
+        &self,
+        code: &str,
+        category: &str,
+        description: &str,
+        system_required: bool,
+        default_enabled: bool,
+    ) -> Result<notification_event_types::Model, sea_orm::DbErr> {
+        let now = chrono::Utc::now().naive_utc();
+
+        if let Some(existing) = self.get_event_type(code).await? {
+            let mut model: notification_event_types::ActiveModel = existing.into();
+            model.category = Set(category.to_string());
+            model.description = Set(description.to_string());
+            model.system_required = Set(system_required);
+            model.default_enabled = Set(default_enabled);
+            model.updated_at = Set(now);
+            return model.update(self.db()).await;
+        }
+
+        notification_event_types::ActiveModel {
+            code: Set(code.to_string()),
+            category: Set(category.to_string()),
+            description: Set(description.to_string()),
+            system_required: Set(system_required),
+            default_enabled: Set(default_enabled),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(self.db())
+        .await
     }
 
     //User notification settings
@@ -557,6 +591,43 @@ mod tests {
         callisto::notification_event_types,
         jupiter::{migration::apply_migrations, tests::test_db_connection},
     };
+
+    #[tokio::test]
+    async fn upsert_event_type_inserts_and_updates_existing_row() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let inserted = storage
+            .upsert_event_type("test.event", "test", "First", false, true)
+            .await
+            .unwrap();
+
+        assert_eq!(inserted.code, "test.event");
+        assert_eq!(inserted.category, "test");
+        assert_eq!(inserted.description, "First");
+        assert!(!inserted.system_required);
+        assert!(inserted.default_enabled);
+
+        let updated = storage
+            .upsert_event_type("test.event", "updated", "Second", true, false)
+            .await
+            .unwrap();
+
+        assert_eq!(updated.code, "test.event");
+        assert_eq!(updated.category, "updated");
+        assert_eq!(updated.description, "Second");
+        assert!(updated.system_required);
+        assert!(!updated.default_enabled);
+        assert_eq!(updated.created_at, inserted.created_at);
+        assert!(updated.updated_at >= inserted.updated_at);
+
+        let event_types = storage.list_event_types().await.unwrap();
+        assert_eq!(event_types.len(), 1);
+        assert_eq!(event_types[0].code, "test.event");
+    }
 
     #[tokio::test]
     async fn test_should_send_logic() {
