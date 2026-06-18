@@ -543,18 +543,21 @@ mod tests {
 
     use async_trait::async_trait;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use serde_json::Value;
     use tempfile::TempDir;
+    use tokio::time::Instant;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
         callisto::{email_jobs, notification_event_types},
-        config::{reload::ConfigHandle, testing::isolated_config},
+        config::{MailProvider, reload::ConfigHandle, testing::isolated_config},
         jupiter::{
             migration::apply_migrations,
             storage::notification_storage::{EmailJobAttachment, EmailJobEnqueue},
             tests::test_db_connection,
         },
-        mail::NoopMailer,
+        mail::{NoopMailer, SmtpMailer},
     };
 
     struct FailingMailer;
@@ -721,6 +724,56 @@ mod tests {
         assert_eq!(attachments[0].filename, "report.txt");
         assert_eq!(attachments[0].content_type, "text/plain");
         assert_eq!(attachments[0].content, b"hello");
+    }
+
+    #[tokio::test]
+    async fn integration_mail_dispatcher_mailpit_sends_outbox_job() {
+        let mailpit_api_url = mailpit_api_url();
+        let mailpit_client = reqwest::Client::new();
+        assert_mailpit_available(&mailpit_client, &mailpit_api_url).await;
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        let subject = format!("Mailpit dispatcher integration {}", Uuid::new_v4());
+        stg.enqueue_email_job(
+            "alice",
+            "alice@example.test",
+            "cl.comment.created",
+            &subject,
+            "<p>Mailpit body</p>",
+            Some("Mailpit body"),
+        )
+        .await
+        .unwrap();
+
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: 11025,
+            from: "no-reply@example.test".to_string(),
+            starttls: false,
+            ..Default::default()
+        };
+        let mailer = SmtpMailer::new_with_password(&mail, None).unwrap();
+        let dispatcher = EmailDispatcher::new(stg.clone(), Arc::new(mailer));
+
+        dispatcher.tick_once().await.unwrap();
+
+        assert!(
+            wait_for_mailpit_subject(&mailpit_client, &mailpit_api_url, &subject).await,
+            "Mailpit did not receive message with subject `{subject}`"
+        );
+
+        let sent = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].status, EMAIL_JOB_STATUS_SENT);
+        assert!(sent[0].sent_at.is_some());
     }
 
     #[tokio::test]
@@ -1300,5 +1353,73 @@ mod tests {
             .into();
         job.updated_at = Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(10));
         job.update(db).await.unwrap();
+    }
+
+    fn mailpit_api_url() -> String {
+        std::env::var("MAILPIT_API_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18025".to_string())
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    async fn assert_mailpit_available(client: &reqwest::Client, api_url: &str) {
+        let response = client
+            .get(format!("{api_url}/api/v1/messages"))
+            .send()
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test Mailpit is not available at {api_url}; run `docker compose -f docker-compose.test.yml up -d mailpit` first: {err}"
+                )
+            });
+
+        assert!(
+            response.status().is_success(),
+            "test Mailpit at {api_url} returned {}",
+            response.status()
+        );
+    }
+
+    async fn wait_for_mailpit_subject(
+        client: &reqwest::Client,
+        api_url: &str,
+        subject: &str,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        loop {
+            if let Ok(response) = client
+                .get(format!("{api_url}/api/v1/messages"))
+                .send()
+                .await
+                && response.status().is_success()
+                && let Ok(payload) = response.json::<Value>().await
+                && mailpit_has_subject(&payload, subject)
+            {
+                return true;
+            }
+
+            if Instant::now() >= deadline {
+                return false;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn mailpit_has_subject(payload: &Value, subject: &str) -> bool {
+        payload
+            .get("messages")
+            .or_else(|| payload.get("Messages"))
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("Subject")
+                        .or_else(|| message.get("subject"))
+                        .and_then(Value::as_str)
+                        == Some(subject)
+                })
+            })
     }
 }

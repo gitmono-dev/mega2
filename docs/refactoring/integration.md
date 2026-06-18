@@ -62,7 +62,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | 数据库 | `database_connection()` 只支持 PostgreSQL，连接后自动执行 migrations | P0 必须检测真实连接到 PostgreSQL |
 | Redis | `AppContext::new` 在 Vault 前初始化 Redis | P0 service smoke 需要 Redis 容器 |
 | 对象存储 | 通过 `jupiter::storage::object_storage::ObjectStorageFactory` 构造，测试可使用 local temp dir | P0 使用 local backend |
-| Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造 | P0/P1 覆盖 Mailpit 投递 |
+| Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造；`integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖真实 SMTP/Mailpit 正路径 | P0/P1 扩展 Mailpit 故障矩阵 |
 | Notification | email outbox、dispatcher、CL comment trigger 存在；用户-facing API 和多渠道缺失 | P1 模块集成 + service dispatcher 测试 |
 | 热加载 | 未实现 | P2，先文档化接口和白名单后再测 |
 | 日志脱敏 | 部分缺口存在，DB URL 当前有泄露风险 | P1 安全修复 gate |
@@ -319,6 +319,8 @@ SmtpMailer/EmailDispatcher -> init_monorepo -> HTTP`。
 - 缺少收件人时 job 变为 `skipped`。
 - SMTP 临时失败时 job 进入 retry 状态，`retry_count` 增加，`next_retry_at` 有值。
 
+**当前落地状态**：`src/notification/dispatcher.rs::tests::integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖 outbox pending job 经真实 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at` 的正路径。缺少收件人和 SMTP 临时失败的状态转换已有 dispatcher fake mailer 模块测试覆盖；仍需补 Mailpit/SMTP 层面的故障矩阵。
+
 ## P1：安全与业务链路扩展 gate
 
 ### 6. 通知触发器到邮件（`integration_notification_trigger_to_mail`）
@@ -520,7 +522,7 @@ Vault bootstrap 过程中被消费。
 | `integration_cli_secret_set_check` | P0 | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
 | `integration_config_validate_resolve_secrets` | P0 | ✓ | ✓ | - | ✓ | ✓ | - | ✓ | - | ✓ |
 | `integration_service_http_smoke` | P0 | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分 |
-| `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分 |
+| `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分；真实 SMTP/Mailpit 正路径已落地 |
 | `integration_notification_trigger_to_mail` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | 可选 | 部分 |
 | `integration_error_redaction` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_config_init` | P2 | ✓ | - | - | - | - | - | ✓ | - | ✓ |
