@@ -34,6 +34,12 @@ pub struct LocalizedMailTemplate {
     template: MailTemplate,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalizedMailTemplateSource {
+    template: LocalizedMailTemplate,
+    source_path: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct MailTemplateRegistry {
     default_locale: String,
@@ -70,6 +76,18 @@ impl MailTemplate {
 
         Ok(())
     }
+
+    pub fn subject_template(&self) -> &str {
+        &self.subject
+    }
+
+    pub fn html_template(&self) -> &str {
+        &self.html
+    }
+
+    pub fn text_template(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
 }
 
 impl MailTemplateKey {
@@ -90,6 +108,39 @@ impl LocalizedMailTemplate {
             template,
         }
     }
+
+    pub fn key(&self) -> &MailTemplateKey {
+        &self.key
+    }
+
+    pub fn locale(&self) -> &str {
+        &self.locale
+    }
+
+    pub fn template(&self) -> &MailTemplate {
+        &self.template
+    }
+}
+
+impl LocalizedMailTemplateSource {
+    pub fn new(template: LocalizedMailTemplate, source_path: PathBuf) -> Self {
+        Self {
+            template,
+            source_path,
+        }
+    }
+
+    pub fn template(&self) -> &LocalizedMailTemplate {
+        &self.template
+    }
+
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn into_template(self) -> LocalizedMailTemplate {
+        self.template
+    }
 }
 
 impl MailTemplateRegistry {
@@ -105,6 +156,14 @@ impl MailTemplateRegistry {
         I: IntoIterator<Item = LocalizedMailTemplate>,
     {
         self.templates.extend(templates);
+    }
+
+    pub fn default_locale(&self) -> &str {
+        &self.default_locale
+    }
+
+    pub fn templates(&self) -> &[LocalizedMailTemplate] {
+        &self.templates
     }
 
     pub fn render(
@@ -211,6 +270,15 @@ impl MailTemplateFile {
 pub fn load_localized_templates_from_dir(
     template_dir: &Path,
 ) -> Result<Vec<LocalizedMailTemplate>, MegaError> {
+    Ok(load_localized_template_sources_from_dir(template_dir)?
+        .into_iter()
+        .map(LocalizedMailTemplateSource::into_template)
+        .collect())
+}
+
+pub fn load_localized_template_sources_from_dir(
+    template_dir: &Path,
+) -> Result<Vec<LocalizedMailTemplateSource>, MegaError> {
     let mut paths = mail_template_file_paths(template_dir)?;
     paths.sort();
 
@@ -240,7 +308,7 @@ pub fn load_localized_templates_from_dir(
                 "mail template directory contains duplicate key/locale entries",
             ));
         }
-        templates.push(template);
+        templates.push(LocalizedMailTemplateSource::new(template, path));
     }
 
     Ok(templates)
@@ -556,6 +624,28 @@ text = "Override {{name}}"
 
         assert_eq!(rendered.subject, "Override alice");
         assert_eq!(rendered.text.as_deref(), Some("Override alice"));
+    }
+
+    #[test]
+    fn load_localized_template_sources_from_dir_reports_source_paths() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let template_path = dir.path().join("cl-comment.toml");
+        fs::write(
+            &template_path,
+            r#"
+key = "test.event"
+locale = "en-US"
+subject = "Subject {{name}}"
+html = "<p>{{name}}</p>"
+"#,
+        )
+        .expect("write template");
+
+        let sources = load_localized_template_sources_from_dir(dir.path()).unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_path(), template_path.as_path());
+        assert_eq!(sources[0].template().key().as_str(), "test.event");
     }
 
     #[test]

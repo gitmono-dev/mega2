@@ -8,7 +8,7 @@
 //! - 401 Unauthorized: No valid session (handled by `LoginUser` extractor)
 //! - 403 Forbidden: Logged in but not admin (for `/list` endpoint)
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::{
     Json,
@@ -32,15 +32,25 @@ use crate::{
     callisto::{email_jobs, notification_event_types},
     ceres::model::notification::NotificationEventTypeInfo,
     common::errors::ApiError,
+    config::MailConfig,
     contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
     jupiter::storage::notification_storage::{
         EMAIL_JOB_STATUS_FAILED, EMAIL_JOB_STATUS_PENDING, EMAIL_JOB_STATUS_SENDING,
         EMAIL_JOB_STATUS_SENT, EMAIL_JOB_STATUS_SKIPPED, EmailJobAttachmentMetadata,
         EmailJobListFilter, EmailJobRetryDisposition, EmailJobStats,
     },
+    mail::template::{
+        LocalizedMailTemplate, MailTemplateKey, load_localized_template_sources_from_dir,
+    },
+    notification::triggers::{
+        default_notification_mail_template_registry,
+        notification_mail_template_registry_from_config,
+    },
 };
 
 const MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS: i64 = 3650;
+const MAIL_TEMPLATE_SOURCE_BUILT_IN: &str = "built-in";
+const MAIL_TEMPLATE_SOURCE_EXTERNAL: &str = "external";
 const CONTENT_DISPOSITION_VALUE_CHARS: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -198,12 +208,54 @@ pub struct NotificationEventTypeResponse {
     pub event_type: NotificationEventTypeInfo,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplateListResponse {
+    pub default_locale: String,
+    pub template_dir: Option<String>,
+    pub templates: Vec<MailTemplateAuditResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplateAuditResponse {
+    pub key: String,
+    pub locale: String,
+    pub source: String,
+    pub source_path: Option<String>,
+    pub subject_template: String,
+    pub html_template: String,
+    pub text_template: Option<String>,
+    pub overridden: bool,
+    pub overrides_builtin: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MailTemplatePreviewRequest {
+    pub key: String,
+    pub locale: Option<String>,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplatePreviewResponse {
+    pub subject: String,
+    pub html: String,
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NotificationEventTypeInput {
     category: String,
     description: String,
     system_required: bool,
     default_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailTemplatePreviewInput {
+    key: String,
+    locale: Option<String>,
+    variables: Vec<(String, String)>,
 }
 
 /// Build the admin router.
@@ -221,6 +273,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(prune_email_job_attachments))
             .routes(routes!(retry_failed_email_job))
             .routes(routes!(prune_email_jobs))
+            .routes(routes!(list_mail_templates))
+            .routes(routes!(preview_mail_template))
             .routes(routes!(list_notification_event_types))
             .routes(routes!(update_notification_event_type)),
     )
@@ -610,6 +664,57 @@ async fn prune_email_jobs(
     }))))
 }
 
+/// GET /api/v1/admin/mail-templates
+///
+/// Lists built-in and configured external mail templates. Only admins can access this endpoint.
+#[utoipa::path(
+    get,
+    path = "/mail-templates",
+    responses(
+        (status = 200, body = CommonResult<MailTemplateListResponse>, content_type = "application/json"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn list_mail_templates(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<MailTemplateListResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let mail_config = state.storage.config().mail.clone().unwrap_or_default();
+    let response = build_mail_template_list_response(&mail_config)?;
+
+    Ok(Json(CommonResult::success(Some(response))))
+}
+
+/// POST /api/v1/admin/mail-templates/preview
+///
+/// Renders a mail template with admin-supplied variables. Only admins can access this endpoint.
+#[utoipa::path(
+    post,
+    path = "/mail-templates/preview",
+    request_body = MailTemplatePreviewRequest,
+    responses(
+        (status = 200, body = CommonResult<MailTemplatePreviewResponse>, content_type = "application/json"),
+        (status = 400, description = "Invalid template preview request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn preview_mail_template(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Json(payload): Json<MailTemplatePreviewRequest>,
+) -> Result<Json<CommonResult<MailTemplatePreviewResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let mail_config = state.storage.config().mail.clone().unwrap_or_default();
+    let response = render_mail_template_preview(&mail_config, payload)?;
+
+    Ok(Json(CommonResult::success(Some(response))))
+}
+
 /// GET /api/v1/admin/notification-event-types
 ///
 /// Lists notification event types. Only admins can access this endpoint.
@@ -746,6 +851,166 @@ impl From<EmailJobStats> for EmailJobStatsResponse {
             failed: value.failed,
             skipped: value.skipped,
         }
+    }
+}
+
+fn build_mail_template_list_response(
+    mail_config: &MailConfig,
+) -> Result<MailTemplateListResponse, ApiError> {
+    let built_in_registry = default_notification_mail_template_registry();
+    let external_sources = match &mail_config.template_dir {
+        Some(template_dir) => {
+            load_localized_template_sources_from_dir(template_dir).map_err(ApiError::internal)?
+        }
+        None => Vec::new(),
+    };
+
+    let built_in_identities: HashSet<(String, String)> = built_in_registry
+        .templates()
+        .iter()
+        .map(mail_template_identity)
+        .collect();
+    let external_identities: HashSet<(String, String)> = external_sources
+        .iter()
+        .map(|source| mail_template_identity(source.template()))
+        .collect();
+
+    let mut templates =
+        Vec::with_capacity(built_in_registry.templates().len() + external_sources.len());
+    templates.extend(built_in_registry.templates().iter().map(|template| {
+        mail_template_audit_response(
+            template,
+            MAIL_TEMPLATE_SOURCE_BUILT_IN,
+            None,
+            external_identities.contains(&mail_template_identity(template)),
+            false,
+        )
+    }));
+    templates.extend(external_sources.iter().map(|source| {
+        let template = source.template();
+        mail_template_audit_response(
+            template,
+            MAIL_TEMPLATE_SOURCE_EXTERNAL,
+            Some(source.source_path().display().to_string()),
+            false,
+            built_in_identities.contains(&mail_template_identity(template)),
+        )
+    }));
+    templates.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then(left.locale.cmp(&right.locale))
+            .then(left.source.cmp(&right.source))
+    });
+
+    Ok(MailTemplateListResponse {
+        default_locale: mail_config.template_default_locale.clone(),
+        template_dir: mail_config
+            .template_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        templates,
+    })
+}
+
+fn mail_template_identity(template: &LocalizedMailTemplate) -> (String, String) {
+    (
+        template.key().as_str().to_string(),
+        template.locale().to_string(),
+    )
+}
+
+fn mail_template_audit_response(
+    template: &LocalizedMailTemplate,
+    source: &str,
+    source_path: Option<String>,
+    overridden: bool,
+    overrides_builtin: bool,
+) -> MailTemplateAuditResponse {
+    MailTemplateAuditResponse {
+        key: template.key().as_str().to_string(),
+        locale: template.locale().to_string(),
+        source: source.to_string(),
+        source_path,
+        subject_template: template.template().subject_template().to_string(),
+        html_template: template.template().html_template().to_string(),
+        text_template: template.template().text_template().map(str::to_string),
+        overridden,
+        overrides_builtin,
+    }
+}
+
+fn render_mail_template_preview(
+    mail_config: &MailConfig,
+    input: MailTemplatePreviewRequest,
+) -> Result<MailTemplatePreviewResponse, ApiError> {
+    let input = normalize_mail_template_preview_request(input)?;
+    let registry =
+        notification_mail_template_registry_from_config(mail_config).map_err(ApiError::internal)?;
+    let variables: Vec<(&str, &str)> = input
+        .variables
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let rendered = registry
+        .render(
+            &MailTemplateKey::new(input.key),
+            input.locale.as_deref(),
+            &variables,
+        )
+        .map_err(ApiError::bad_request)?;
+
+    Ok(MailTemplatePreviewResponse {
+        subject: rendered.subject,
+        html: rendered.html,
+        text: rendered.text,
+    })
+}
+
+fn normalize_mail_template_preview_request(
+    input: MailTemplatePreviewRequest,
+) -> Result<MailTemplatePreviewInput, ApiError> {
+    let key = normalize_mail_template_identifier("mail template key", &input.key)?;
+    let locale = trim_optional(input.locale)
+        .map(|locale| normalize_mail_template_identifier("mail template locale", &locale))
+        .transpose()?;
+    let mut seen_variables = HashSet::new();
+    let mut variables = Vec::with_capacity(input.variables.len());
+
+    for (name, value) in input.variables {
+        let name = normalize_mail_template_identifier("mail template variable", &name)?;
+        if !seen_variables.insert(name.clone()) {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "mail template variables contain duplicate `{name}` entries"
+            )));
+        }
+        variables.push((name, value));
+    }
+
+    Ok(MailTemplatePreviewInput {
+        key,
+        locale,
+        variables,
+    })
+}
+
+fn normalize_mail_template_identifier(field: &str, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "{field} must not be empty"
+        )));
+    }
+
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(ApiError::bad_request(anyhow::anyhow!(
+            "{field} contains unsupported characters"
+        )))
     }
 }
 
@@ -936,6 +1201,128 @@ mod tests {
     #[test]
     fn test_admin_router_creation() {
         let _router = routers();
+    }
+
+    #[test]
+    fn build_mail_template_list_response_marks_external_overrides() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let template_path = dir.path().join("cl-comment.toml");
+        std::fs::write(
+            &template_path,
+            r#"
+key = "cl.comment.created"
+locale = "en-US"
+subject = "Override {{actor_username}}"
+html = "<p>{{comment_text}}</p>"
+text = "{{actor_username}}: {{comment_text}}"
+"#,
+        )
+        .expect("write template");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+
+        let response = build_mail_template_list_response(&mail_config).unwrap();
+
+        assert_eq!(response.default_locale, "en-US");
+        assert_eq!(
+            response.template_dir.as_deref(),
+            Some(dir.path().display().to_string().as_str())
+        );
+        let built_in = response
+            .templates
+            .iter()
+            .find(|template| {
+                template.key == "cl.comment.created"
+                    && template.locale == "en-US"
+                    && template.source == MAIL_TEMPLATE_SOURCE_BUILT_IN
+            })
+            .expect("built-in template");
+        assert!(built_in.overridden);
+        assert!(!built_in.overrides_builtin);
+        assert_eq!(built_in.source_path, None);
+
+        let external = response
+            .templates
+            .iter()
+            .find(|template| {
+                template.key == "cl.comment.created"
+                    && template.locale == "en-US"
+                    && template.source == MAIL_TEMPLATE_SOURCE_EXTERNAL
+            })
+            .expect("external template");
+        assert!(!external.overridden);
+        assert!(external.overrides_builtin);
+        assert_eq!(external.subject_template, "Override {{actor_username}}");
+        assert_eq!(
+            external.source_path.as_deref(),
+            Some(template_path.display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn render_mail_template_preview_renders_external_template() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("custom.toml"),
+            r#"
+key = "custom.event"
+locale = "en-US"
+subject = "Hello {{name}}"
+html = "<p>{{name}}</p>"
+text = "Hello {{name}}"
+"#,
+        )
+        .expect("write template");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+        let response = render_mail_template_preview(
+            &mail_config,
+            MailTemplatePreviewRequest {
+                key: " custom.event ".to_string(),
+                locale: Some(" en-US ".to_string()),
+                variables: BTreeMap::from([(" name ".to_string(), "<Alice>".to_string())]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.subject, "Hello <Alice>");
+        assert_eq!(response.html, "<p>&lt;Alice&gt;</p>");
+        assert_eq!(response.text.as_deref(), Some("Hello <Alice>"));
+    }
+
+    #[test]
+    fn normalize_mail_template_preview_request_rejects_unsafe_inputs() {
+        assert!(
+            normalize_mail_template_preview_request(MailTemplatePreviewRequest {
+                key: " ".to_string(),
+                locale: None,
+                variables: BTreeMap::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_mail_template_preview_request(MailTemplatePreviewRequest {
+                key: "cl.comment.created".to_string(),
+                locale: Some("en/US".to_string()),
+                variables: BTreeMap::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_mail_template_preview_request(MailTemplatePreviewRequest {
+                key: "cl.comment.created".to_string(),
+                locale: None,
+                variables: BTreeMap::from([
+                    ("name".to_string(), "alice".to_string()),
+                    (" name ".to_string(), "bob".to_string()),
+                ]),
+            })
+            .is_err()
+        );
     }
 
     #[test]
