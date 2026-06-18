@@ -198,6 +198,37 @@ impl MailConfig {
                 "mail.retry_backoff_max_secs must be greater than or equal to mail.retry_backoff_base_secs".to_string(),
             ));
         }
+        if self.attachment_prune_interval_secs == 0 {
+            return Err(MegaError::Other(
+                "mail.attachment_prune_interval_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.attachment_retention_days == 0 {
+            return Err(MegaError::Other(
+                "mail.attachment_retention_days must be greater than 0".to_string(),
+            ));
+        }
+        if self.attachment_prune_statuses.is_empty() {
+            return Err(MegaError::Other(
+                "mail.attachment_prune_statuses must not be empty".to_string(),
+            ));
+        }
+
+        let mut statuses = BTreeSet::new();
+        for status in &self.attachment_prune_statuses {
+            let status = status.trim();
+            if !matches!(status, "sent" | "skipped") {
+                return Err(MegaError::Other(
+                    "mail.attachment_prune_statuses entries must be `sent` or `skipped`"
+                        .to_string(),
+                ));
+            }
+            if !statuses.insert(status) {
+                return Err(MegaError::Other(
+                    "mail.attachment_prune_statuses must not contain duplicates".to_string(),
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -1184,6 +1215,10 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "retry_max_attempts",
             "retry_backoff_base_secs",
             "retry_backoff_max_secs",
+            "attachment_prune_enabled",
+            "attachment_prune_interval_secs",
+            "attachment_retention_days",
+            "attachment_prune_statuses",
             "smtp_tls",
             "tls",
         ]),
@@ -1602,6 +1637,57 @@ mod tests {
             .validate()
             .expect_err("retry backoff max below base should fail");
         assert!(err.to_string().contains("mail.retry_backoff_max_secs"));
+    }
+
+    #[test]
+    fn mail_validate_rejects_invalid_attachment_prune_policy() {
+        let mail_config = MailConfig {
+            attachment_prune_interval_secs: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero attachment prune interval should fail");
+        assert!(
+            err.to_string()
+                .contains("mail.attachment_prune_interval_secs")
+        );
+
+        let mail_config = MailConfig {
+            attachment_retention_days: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero attachment retention should fail");
+        assert!(err.to_string().contains("mail.attachment_retention_days"));
+
+        let mail_config = MailConfig {
+            attachment_prune_statuses: Vec::new(),
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("empty attachment prune statuses should fail");
+        assert!(err.to_string().contains("mail.attachment_prune_statuses"));
+
+        let mail_config = MailConfig {
+            attachment_prune_statuses: vec!["failed".to_string()],
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("unsafe attachment prune status should fail");
+        assert!(err.to_string().contains("mail.attachment_prune_statuses"));
+
+        let mail_config = MailConfig {
+            attachment_prune_statuses: vec!["sent".to_string(), "sent".to_string()],
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("duplicate attachment prune status should fail");
+        assert!(err.to_string().contains("mail.attachment_prune_statuses"));
     }
 
     #[test]

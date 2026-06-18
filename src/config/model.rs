@@ -166,6 +166,8 @@ pub const DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT: usize = 8;
 pub const DEFAULT_MAIL_RETRY_MAX_ATTEMPTS: i32 = 5;
 pub const DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS: i64 = 30;
 pub const DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS: i64 = 300;
+pub const DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS: u64 = 3600;
+pub const DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS: u32 = 30;
 
 /// Mail configuration. Lives here so it participates in the main Config loading
 /// / env overlay / placeholder / (future) SecretRef pipeline.
@@ -200,6 +202,14 @@ pub struct MailConfig {
     pub retry_backoff_base_secs: i64,
     #[serde(default = "default_mail_retry_backoff_max_secs")]
     pub retry_backoff_max_secs: i64,
+    #[serde(default)]
+    pub attachment_prune_enabled: bool,
+    #[serde(default = "default_mail_attachment_prune_interval_secs")]
+    pub attachment_prune_interval_secs: u64,
+    #[serde(default = "default_mail_attachment_retention_days")]
+    pub attachment_retention_days: u32,
+    #[serde(default = "default_mail_attachment_prune_statuses")]
+    pub attachment_prune_statuses: Vec<String>,
     // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
 }
 
@@ -224,6 +234,15 @@ fn default_mail_retry_backoff_base_secs() -> i64 {
 fn default_mail_retry_backoff_max_secs() -> i64 {
     DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS
 }
+fn default_mail_attachment_prune_interval_secs() -> u64 {
+    DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS
+}
+fn default_mail_attachment_retention_days() -> u32 {
+    DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS
+}
+fn default_mail_attachment_prune_statuses() -> Vec<String> {
+    vec!["sent".to_string(), "skipped".to_string()]
+}
 
 impl Default for MailConfig {
     fn default() -> Self {
@@ -242,6 +261,10 @@ impl Default for MailConfig {
             retry_max_attempts: default_mail_retry_max_attempts(),
             retry_backoff_base_secs: default_mail_retry_backoff_base_secs(),
             retry_backoff_max_secs: default_mail_retry_backoff_max_secs(),
+            attachment_prune_enabled: false,
+            attachment_prune_interval_secs: default_mail_attachment_prune_interval_secs(),
+            attachment_retention_days: default_mail_attachment_retention_days(),
+            attachment_prune_statuses: default_mail_attachment_prune_statuses(),
         }
     }
 }

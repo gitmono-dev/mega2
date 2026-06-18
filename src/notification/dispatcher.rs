@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
@@ -13,13 +13,14 @@ use crate::{
     callisto::email_jobs,
     common::errors::MegaError,
     config::{
-        Config, DEFAULT_MAIL_DISPATCHER_BATCH_SIZE, DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT,
-        MailConfig,
+        Config, DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS,
+        DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS, DEFAULT_MAIL_DISPATCHER_BATCH_SIZE,
+        DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT, MailConfig,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     jupiter::storage::notification_storage::{
-        EMAIL_JOB_SEND_TIMEOUT_SECS, EmailJobFailureDisposition, EmailJobRetryPolicy,
-        NotificationStorage,
+        EMAIL_JOB_SEND_TIMEOUT_SECS, EMAIL_JOB_STATUS_SENT, EMAIL_JOB_STATUS_SKIPPED,
+        EmailJobFailureDisposition, EmailJobRetryPolicy, NotificationStorage,
     },
     mail::{MailAttachment, Mailer},
 };
@@ -58,6 +59,53 @@ impl Default for EmailDispatcherLimits {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailAttachmentPrunePolicy {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub retention_days: u32,
+    pub statuses: Vec<String>,
+}
+
+impl EmailAttachmentPrunePolicy {
+    pub fn new(
+        enabled: bool,
+        interval_secs: u64,
+        retention_days: u32,
+        statuses: Vec<String>,
+    ) -> Self {
+        Self {
+            enabled,
+            interval_secs,
+            retention_days,
+            statuses,
+        }
+    }
+
+    pub fn from_mail_config(config: &MailConfig) -> Self {
+        Self::new(
+            config.attachment_prune_enabled,
+            config.attachment_prune_interval_secs,
+            config.attachment_retention_days,
+            config.attachment_prune_statuses.clone(),
+        )
+    }
+}
+
+impl Default for EmailAttachmentPrunePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS,
+            retention_days: DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS,
+            statuses: vec![
+                EMAIL_JOB_STATUS_SENT.to_string(),
+                EMAIL_JOB_STATUS_SKIPPED.to_string(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmailDispatcherControl {
     enabled: Arc<AtomicBool>,
@@ -66,6 +114,10 @@ pub struct EmailDispatcherControl {
     retry_max_attempts: Arc<AtomicI32>,
     retry_backoff_base_secs: Arc<AtomicI64>,
     retry_backoff_max_secs: Arc<AtomicI64>,
+    attachment_prune_enabled: Arc<AtomicBool>,
+    attachment_prune_interval_secs: Arc<AtomicU64>,
+    attachment_retention_days: Arc<AtomicU64>,
+    attachment_prune_statuses: Arc<RwLock<Vec<String>>>,
 }
 
 impl EmailDispatcherControl {
@@ -78,17 +130,24 @@ impl EmailDispatcherControl {
             config.enabled,
             EmailDispatcherLimits::from_mail_config(config),
             retry_policy_from_mail_config(config),
+            EmailAttachmentPrunePolicy::from_mail_config(config),
         )
     }
 
     pub fn new_with_limits(enabled: bool, limits: EmailDispatcherLimits) -> Self {
-        Self::new_with_limits_and_retry_policy(enabled, limits, EmailJobRetryPolicy::default())
+        Self::new_with_limits_and_retry_policy(
+            enabled,
+            limits,
+            EmailJobRetryPolicy::default(),
+            EmailAttachmentPrunePolicy::default(),
+        )
     }
 
     pub fn new_with_limits_and_retry_policy(
         enabled: bool,
         limits: EmailDispatcherLimits,
         retry_policy: EmailJobRetryPolicy,
+        attachment_prune_policy: EmailAttachmentPrunePolicy,
     ) -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(enabled)),
@@ -97,6 +156,14 @@ impl EmailDispatcherControl {
             retry_max_attempts: Arc::new(AtomicI32::new(retry_policy.max_attempts)),
             retry_backoff_base_secs: Arc::new(AtomicI64::new(retry_policy.backoff_base_secs)),
             retry_backoff_max_secs: Arc::new(AtomicI64::new(retry_policy.backoff_max_secs)),
+            attachment_prune_enabled: Arc::new(AtomicBool::new(attachment_prune_policy.enabled)),
+            attachment_prune_interval_secs: Arc::new(AtomicU64::new(
+                attachment_prune_policy.interval_secs,
+            )),
+            attachment_retention_days: Arc::new(AtomicU64::new(
+                attachment_prune_policy.retention_days as u64,
+            )),
+            attachment_prune_statuses: Arc::new(RwLock::new(attachment_prune_policy.statuses)),
         }
     }
 
@@ -137,6 +204,34 @@ impl EmailDispatcherControl {
         self.retry_backoff_max_secs
             .store(retry_policy.backoff_max_secs, Ordering::Release);
     }
+
+    pub fn attachment_prune_policy(&self) -> EmailAttachmentPrunePolicy {
+        let statuses = self
+            .attachment_prune_statuses
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+
+        EmailAttachmentPrunePolicy {
+            enabled: self.attachment_prune_enabled.load(Ordering::Acquire),
+            interval_secs: self.attachment_prune_interval_secs.load(Ordering::Acquire),
+            retention_days: self.attachment_retention_days.load(Ordering::Acquire) as u32,
+            statuses,
+        }
+    }
+
+    pub fn set_attachment_prune_policy(&self, policy: EmailAttachmentPrunePolicy) {
+        self.attachment_prune_enabled
+            .store(policy.enabled, Ordering::Release);
+        self.attachment_prune_interval_secs
+            .store(policy.interval_secs, Ordering::Release);
+        self.attachment_retention_days
+            .store(policy.retention_days as u64, Ordering::Release);
+        match self.attachment_prune_statuses.write() {
+            Ok(mut statuses) => *statuses = policy.statuses,
+            Err(poisoned) => *poisoned.into_inner() = policy.statuses,
+        }
+    }
 }
 
 pub fn config_reload_email_dispatcher_subscriber(
@@ -154,6 +249,7 @@ pub struct EmailDispatcher {
     stg: NotificationStorage,
     mailer: Arc<dyn Mailer>,
     control: EmailDispatcherControl,
+    attachment_prune_last_run_epoch_secs: AtomicI64,
 }
 
 impl EmailDispatcher {
@@ -170,6 +266,7 @@ impl EmailDispatcher {
             stg,
             mailer,
             control,
+            attachment_prune_last_run_epoch_secs: AtomicI64::new(0),
         }
     }
 
@@ -208,11 +305,13 @@ impl EmailDispatcher {
             );
         }
 
+        let attachments_pruned = self.prune_attachments_if_due().await?;
         let limits = self.control.limits();
         let retry_policy = self.control.retry_policy();
         let jobs = self.stg.fetch_pending_jobs(limits.batch_size).await?;
         let mut stats = EmailDispatchTickStats {
             fetched: jobs.len(),
+            attachments_pruned,
             ..Default::default()
         };
 
@@ -255,17 +354,46 @@ impl EmailDispatcher {
                 retry_max_attempts = retry_policy.max_attempts,
                 retry_backoff_base_secs = retry_policy.backoff_base_secs,
                 retry_backoff_max_secs = retry_policy.backoff_max_secs,
+                attachments_pruned = stats.attachments_pruned,
                 "email dispatcher tick completed"
             );
         }
 
         Ok(())
     }
+
+    async fn prune_attachments_if_due(&self) -> Result<u64, sea_orm::DbErr> {
+        let policy = self.control.attachment_prune_policy();
+        if !policy.enabled {
+            return Ok(0);
+        }
+
+        let now = chrono::Utc::now();
+        let now_epoch_secs = now.timestamp();
+        let last_run = self
+            .attachment_prune_last_run_epoch_secs
+            .load(Ordering::Acquire);
+        let interval_secs = policy.interval_secs.min(i64::MAX as u64) as i64;
+        if last_run > 0 && now_epoch_secs.saturating_sub(last_run) < interval_secs {
+            return Ok(0);
+        }
+
+        let older_than = now.naive_utc() - chrono::Duration::days(policy.retention_days as i64);
+        let deleted = self
+            .stg
+            .prune_email_job_attachments(&policy.statuses, older_than, None, None)
+            .await?;
+        self.attachment_prune_last_run_epoch_secs
+            .store(now_epoch_secs, Ordering::Release);
+
+        Ok(deleted)
+    }
 }
 
 #[derive(Default)]
 struct EmailDispatchTickStats {
     fetched: usize,
+    attachments_pruned: u64,
     sent: usize,
     retry_scheduled: usize,
     dead_lettered: usize,
@@ -288,7 +416,7 @@ impl EmailDispatchTickStats {
     }
 
     fn should_log(&self) -> bool {
-        self.fetched > 0 || self.task_errors > 0
+        self.fetched > 0 || self.attachments_pruned > 0 || self.task_errors > 0
     }
 }
 
@@ -384,6 +512,18 @@ fn apply_mail_enabled(
     }) && let Some(mail) = &config.mail
     {
         control.set_retry_policy(retry_policy_from_mail_config(mail));
+    }
+    if report.applied_fields.iter().any(|field| {
+        matches!(
+            *field,
+            "mail.attachment_prune_enabled"
+                | "mail.attachment_prune_interval_secs"
+                | "mail.attachment_retention_days"
+                | "mail.attachment_prune_statuses"
+        )
+    }) && let Some(mail) = &config.mail
+    {
+        control.set_attachment_prune_policy(EmailAttachmentPrunePolicy::from_mail_config(mail));
     }
 
     Ok(())
@@ -581,6 +721,67 @@ mod tests {
         assert_eq!(attachments[0].filename, "report.txt");
         assert_eq!(attachments[0].content_type, "text/plain");
         assert_eq!(attachments[0].content, b"hello");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_prunes_old_terminal_attachments_by_policy() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        let old_sent_id =
+            enqueue_test_email_job_with_attachment(&stg, "old-sent", "Old sent").await;
+        stg.mark_job_sent(old_sent_id).await.unwrap();
+        make_email_job_old(&db, old_sent_id).await;
+
+        let recent_sent_id =
+            enqueue_test_email_job_with_attachment(&stg, "recent-sent", "Recent sent").await;
+        stg.mark_job_sent(recent_sent_id).await.unwrap();
+
+        let old_skipped_id =
+            enqueue_test_email_job_with_attachment(&stg, "old-skipped", "Old skipped").await;
+        stg.mark_job_skipped(old_skipped_id, "no recipient")
+            .await
+            .unwrap();
+        make_email_job_old(&db, old_skipped_id).await;
+
+        let mut mail = crate::config::MailConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        mail.attachment_prune_enabled = true;
+        mail.attachment_prune_interval_secs = 1;
+        mail.attachment_retention_days = 7;
+        mail.attachment_prune_statuses = vec![EMAIL_JOB_STATUS_SENT.to_string()];
+        let control = EmailDispatcherControl::from_mail_config(&mail);
+        let dispatcher =
+            EmailDispatcher::new_with_control(stg.clone(), Arc::new(NoopMailer), control);
+
+        dispatcher.tick_once().await.unwrap();
+
+        assert!(
+            stg.list_email_job_attachment_metadata(old_sent_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            stg.list_email_job_attachment_metadata(recent_sent_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            stg.list_email_job_attachment_metadata(old_skipped_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -865,6 +1066,7 @@ mod tests {
             true,
             EmailDispatcherLimits::default(),
             EmailJobRetryPolicy::new(1, 1, 1),
+            EmailAttachmentPrunePolicy::default(),
         );
         let dispatcher =
             EmailDispatcher::new_with_control(stg.clone(), Arc::new(FailingMailer), control);
@@ -993,5 +1195,110 @@ mod tests {
 
         assert_eq!(applied_report, report);
         assert_eq!(control.retry_policy(), EmailJobRetryPolicy::new(7, 15, 120));
+    }
+
+    #[test]
+    fn email_dispatcher_subscriber_updates_attachment_prune_policy_from_mail_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(crate::config::MailConfig {
+            enabled: true,
+            provider: crate::config::MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+            ..Default::default()
+        });
+        let control =
+            EmailDispatcherControl::from_mail_config(config.mail.as_ref().expect("mail config"));
+        let mut candidate = config.clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.attachment_prune_enabled = true;
+        mail.attachment_prune_interval_secs = 600;
+        mail.attachment_retention_days = 14;
+        mail.attachment_prune_statuses = vec![EMAIL_JOB_STATUS_SENT.to_string()];
+        let report = ConfigReloadReport {
+            applied_fields: vec![
+                "mail.attachment_prune_enabled",
+                "mail.attachment_prune_interval_secs",
+                "mail.attachment_retention_days",
+                "mail.attachment_prune_statuses",
+            ],
+            restart_required_fields: Vec::new(),
+        };
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_email_dispatcher_subscriber(control.clone()))
+            .expect("subscribe");
+        let applied_report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(applied_report, report);
+        assert_eq!(
+            control.attachment_prune_policy(),
+            EmailAttachmentPrunePolicy::new(true, 600, 14, vec![EMAIL_JOB_STATUS_SENT.to_string()])
+        );
+    }
+
+    async fn insert_test_event_type(db: &sea_orm::DatabaseConnection) {
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn enqueue_test_email_job_with_attachment(
+        stg: &NotificationStorage,
+        username: &str,
+        subject: &str,
+    ) -> i64 {
+        stg.enqueue_email_job_with_attachments(EmailJobEnqueue {
+            username,
+            to_email: &format!("{username}@example.com"),
+            event_type_code: "cl.comment.created",
+            subject,
+            body_html: "<p>Body</p>",
+            body_text: Some("Body"),
+            attachments: &[EmailJobAttachment::new(
+                format!("{username}.txt"),
+                "text/plain",
+                b"hello".to_vec(),
+            )],
+        })
+        .await
+        .unwrap();
+
+        email_jobs::Entity::find()
+            .all(stg.db())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.username == username && job.subject == subject)
+            .unwrap()
+            .id
+    }
+
+    async fn make_email_job_old(db: &sea_orm::DatabaseConnection, job_id: i64) {
+        let mut job: email_jobs::ActiveModel = email_jobs::Entity::find_by_id(job_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        job.updated_at = Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(10));
+        job.update(db).await.unwrap();
     }
 }

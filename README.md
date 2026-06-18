@@ -29,7 +29,7 @@
   `redis` for cache / queue.
 - **Email notifications** — async dispatcher backed by an `email_jobs` queue,
   SMTP via `lettre` (rustls + tokio), event triggers for CL comments, and
-  admin-managed outbox attachment download/delete/retention cleanup.
+  admin-managed plus configurable automatic outbox attachment cleanup.
 - **Embedded Vault** — PKI (root CA, role‑based cert issuance) and a KV / secret
   engine via the vendored RustyVault module in `src/vault`, with a `jupiter`
   storage backend so the vault lives in the same database.

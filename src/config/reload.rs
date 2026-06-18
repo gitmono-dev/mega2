@@ -505,6 +505,32 @@ fn apply_mail_changes(
                 }
                 report.applied_fields.push("mail.retry_backoff_max_secs");
             }
+            if current.attachment_prune_enabled != candidate.attachment_prune_enabled {
+                if let Some(next) = next {
+                    next.attachment_prune_enabled = candidate.attachment_prune_enabled;
+                }
+                report.applied_fields.push("mail.attachment_prune_enabled");
+            }
+            if current.attachment_prune_interval_secs != candidate.attachment_prune_interval_secs {
+                if let Some(next) = next {
+                    next.attachment_prune_interval_secs = candidate.attachment_prune_interval_secs;
+                }
+                report
+                    .applied_fields
+                    .push("mail.attachment_prune_interval_secs");
+            }
+            if current.attachment_retention_days != candidate.attachment_retention_days {
+                if let Some(next) = next {
+                    next.attachment_retention_days = candidate.attachment_retention_days;
+                }
+                report.applied_fields.push("mail.attachment_retention_days");
+            }
+            if current.attachment_prune_statuses != candidate.attachment_prune_statuses {
+                if let Some(next) = next {
+                    next.attachment_prune_statuses = candidate.attachment_prune_statuses.clone();
+                }
+                report.applied_fields.push("mail.attachment_prune_statuses");
+            }
             collect_mail_restart_fields(current, candidate, report);
         }
     }
@@ -1338,6 +1364,42 @@ mod tests {
         assert_eq!(mail.retry_max_attempts, 7);
         assert_eq!(mail.retry_backoff_base_secs, 15);
         assert_eq!(mail.retry_backoff_max_secs, 120);
+    }
+
+    #[test]
+    fn reload_applies_mail_attachment_prune_policy_without_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(true));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.attachment_prune_enabled = true;
+        mail.attachment_prune_interval_secs = 600;
+        mail.attachment_retention_days = 14;
+        mail.attachment_prune_statuses = vec!["sent".to_string()];
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let mail = snapshot.mail.as_ref().expect("mail config");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "mail.attachment_prune_enabled",
+                "mail.attachment_prune_interval_secs",
+                "mail.attachment_retention_days",
+                "mail.attachment_prune_statuses"
+            ]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert!(mail.attachment_prune_enabled);
+        assert_eq!(mail.attachment_prune_interval_secs, 600);
+        assert_eq!(mail.attachment_retention_days, 14);
+        assert_eq!(mail.attachment_prune_statuses, vec!["sent"]);
     }
 
     #[test]
