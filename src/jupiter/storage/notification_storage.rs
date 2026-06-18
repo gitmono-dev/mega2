@@ -860,13 +860,17 @@ impl NotificationStorage {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, Database, Set};
     use tokio::task::JoinSet;
 
     use super::*;
     use crate::{
         callisto::notification_event_types,
-        jupiter::{migration::apply_migrations, tests::test_db_connection},
+        jupiter::{
+            migration::apply_migrations,
+            storage::init::database_connection,
+            tests::{test_db_config, test_db_connection},
+        },
     };
 
     #[test]
@@ -1244,6 +1248,65 @@ mod tests {
         let mut claims = JoinSet::new();
         for _ in 0..16 {
             let storage = storage.clone();
+            claims.spawn(async move { storage.try_claim_job(job_id).await.unwrap() });
+        }
+
+        let mut successful_claims = 0;
+        while let Some(result) = claims.join_next().await {
+            if result.unwrap() {
+                successful_claims += 1;
+            }
+        }
+
+        assert_eq!(successful_claims, 1);
+        let job = email_jobs::Entity::find_by_id(job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "sending");
+        assert!(storage.fetch_pending_jobs(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_claim_across_independent_connections_only_allows_one_sender() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_config = test_db_config(temp_dir.path()).await;
+        let db = database_connection(&db_config).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job(
+                "alice",
+                "alice@test.com",
+                "test.event",
+                "Hello",
+                "<p>Hello</p>",
+                Some("Hello"),
+            )
+            .await
+            .unwrap();
+        let job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+
+        let mut claims = JoinSet::new();
+        for _ in 0..8 {
+            let db = Database::connect(db_config.db_url.clone()).await.unwrap();
+            let storage = NotificationStorage::new(Arc::new(db));
             claims.spawn(async move { storage.try_claim_job(job_id).await.unwrap() });
         }
 
