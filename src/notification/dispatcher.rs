@@ -827,6 +827,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_mail_dispatcher_smtp_skips_missing_recipient_without_retry() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        let subject = format!("SMTP missing recipient integration {}", Uuid::new_v4());
+        stg.enqueue_email_job(
+            "alice",
+            "",
+            "cl.comment.created",
+            &subject,
+            "<p>Missing recipient body</p>",
+            Some("Missing recipient body"),
+        )
+        .await
+        .unwrap();
+
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: 1,
+            from: "no-reply@example.test".to_string(),
+            starttls: false,
+            ..Default::default()
+        };
+        let mailer = SmtpMailer::new_with_password(&mail, None).unwrap();
+        let dispatcher = EmailDispatcher::new(stg.clone(), Arc::new(mailer));
+
+        dispatcher.tick_once().await.unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, EMAIL_JOB_STATUS_SKIPPED);
+        assert_eq!(jobs[0].retry_count, 0);
+        assert!(jobs[0].next_retry_at.is_none());
+        assert!(jobs[0].sent_at.is_none());
+        assert_eq!(
+            jobs[0].error_message.as_deref(),
+            Some("missing recipient email")
+        );
+    }
+
+    #[tokio::test]
     async fn integration_mail_dispatcher_smtp_failure_dead_letters_outbox_job() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
