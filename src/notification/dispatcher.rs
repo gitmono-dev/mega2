@@ -545,7 +545,11 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use serde_json::Value;
     use tempfile::TempDir;
-    use tokio::{io::AsyncWriteExt, net::TcpListener, time::Instant};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::TcpListener,
+        time::Instant,
+    };
     use uuid::Uuid;
 
     use super::*;
@@ -880,6 +884,63 @@ mod tests {
         let error_message = jobs[0].error_message.as_deref().unwrap_or_default();
         assert!(error_message.contains("smtp send error"));
         assert!(!error_message.contains(&credential_sentinel));
+    }
+
+    #[tokio::test]
+    async fn integration_mail_dispatcher_smtp_auth_rejection_retries_without_credential_leak() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        let subject = format!("SMTP auth rejection integration {}", Uuid::new_v4());
+        stg.enqueue_email_job(
+            "alice",
+            "alice@example.test",
+            "cl.comment.created",
+            &subject,
+            "<p>SMTP auth rejection body</p>",
+            Some("SMTP auth rejection body"),
+        )
+        .await
+        .unwrap();
+
+        let smtp_port = spawn_smtp_auth_rejection_server().await;
+        let credential_sentinel = "auth-leak-check-credential".to_string();
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port,
+            username: Some("smtp-user".to_string()),
+            from: "no-reply@example.test".to_string(),
+            starttls: false,
+            ..Default::default()
+        };
+        let mailer =
+            SmtpMailer::new_with_password(&mail, Some(credential_sentinel.clone())).unwrap();
+        let control = EmailDispatcherControl::new_with_limits_and_retry_policy(
+            true,
+            EmailDispatcherLimits::default(),
+            EmailJobRetryPolicy::new(3, 1, 1),
+            EmailAttachmentPrunePolicy::default(),
+        );
+        let dispatcher = EmailDispatcher::new_with_control(stg.clone(), Arc::new(mailer), control);
+
+        dispatcher.tick_once().await.unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "pending");
+        assert_eq!(jobs[0].retry_count, 1);
+        assert!(jobs[0].next_retry_at.is_some());
+        assert!(jobs[0].sent_at.is_none());
+        let error_message = jobs[0].error_message.as_deref().unwrap_or_default();
+        assert!(error_message.contains("smtp send error"));
+        assert!(!error_message.contains(&credential_sentinel));
+        assert!(!error_message.contains("smtp-user"));
     }
 
     #[tokio::test]
@@ -1639,6 +1700,44 @@ mod tests {
                 let _ = stream
                     .write_all(b"554 test smtp protocol rejection\r\n")
                     .await;
+            }
+        });
+        port
+    }
+
+    async fn spawn_smtp_auth_rejection_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let _ = writer.write_all(b"220 test smtp auth server\r\n").await;
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let bytes_read = reader.read_line(&mut line).await.unwrap_or_default();
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    let command = line.to_ascii_uppercase();
+                    if command.starts_with("EHLO") || command.starts_with("HELO") {
+                        let _ = writer
+                            .write_all(b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
+                            .await;
+                    } else if command.starts_with("AUTH") {
+                        let _ = writer
+                            .write_all(b"535 5.7.8 Authentication credentials invalid\r\n")
+                            .await;
+                    } else if command.starts_with("QUIT") {
+                        let _ = writer.write_all(b"221 Bye\r\n").await;
+                        break;
+                    } else {
+                        let _ = writer.write_all(b"250 OK\r\n").await;
+                    }
+                }
             }
         });
         port
