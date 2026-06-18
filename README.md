@@ -317,9 +317,10 @@ cargo test --test <name>
   changing SMTP settings still requires restart. Mail templates have built-in
   locale fallback and can be overridden at startup with TOML files from
   `mail.template_dir`; admins can audit built-in/external template sources and
-  preview rendering under `/admin/mail-templates`. Users can inspect and update
-  notification settings, preferred locale, and per-event preferences under
-  `/user/notification/preferences`; admins can manage notification event types
+  preview or upsert external TOML templates under `/admin/mail-templates`.
+  Users can inspect and update notification settings, preferred locale, and
+  per-event preferences under `/user/notification/preferences`; admins can
+  manage notification event types
   under `/admin/notification-event-types` and prune old terminal outbox jobs
   under `/admin/email-jobs/prune`; attachment audit metadata is available under
   `/admin/email-jobs/{id}/attachments`, and admins can explicitly download,

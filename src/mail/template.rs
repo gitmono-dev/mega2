@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::common::errors::MegaError;
 
@@ -67,7 +67,7 @@ impl MailTemplate {
         })
     }
 
-    fn validate_syntax(&self) -> Result<(), MegaError> {
+    pub fn validate_syntax(&self) -> Result<(), MegaError> {
         validate_template_syntax(&self.subject)?;
         validate_template_syntax(&self.html)?;
         if let Some(text) = &self.text {
@@ -220,7 +220,7 @@ impl MailTemplateRegistry {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MailTemplateFile {
     key: String,
@@ -265,6 +265,24 @@ impl MailTemplateFile {
             template,
         ))
     }
+}
+
+pub fn localized_template_to_toml(template: &LocalizedMailTemplate) -> Result<String, MegaError> {
+    let file = MailTemplateFile {
+        key: template.key().as_str().to_string(),
+        locale: template.locale().to_string(),
+        subject: template.template().subject_template().to_string(),
+        html: template.template().html_template().to_string(),
+        text: template.template().text_template().map(str::to_string),
+    };
+
+    toml::to_string_pretty(&file).map_err(|err| {
+        MegaError::Other(format!(
+            "failed to serialize mail template `{}` for locale `{}`: {err}",
+            template.key().as_str(),
+            template.locale()
+        ))
+    })
 }
 
 pub fn load_localized_templates_from_dir(
@@ -646,6 +664,25 @@ html = "<p>{{name}}</p>"
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source_path(), template_path.as_path());
         assert_eq!(sources[0].template().key().as_str(), "test.event");
+    }
+
+    #[test]
+    fn localized_template_to_toml_round_trips_through_loader() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let template = LocalizedMailTemplate::new(
+            MailTemplateKey::new("test.event"),
+            "en-US",
+            MailTemplate::new("Hello {{name}}", "<p>{{name}}</p>", Some("Hello {{name}}")),
+        );
+        fs::write(
+            dir.path().join("test-event.toml"),
+            localized_template_to_toml(&template).unwrap(),
+        )
+        .expect("write template");
+
+        let loaded = load_localized_templates_from_dir(dir.path()).unwrap();
+
+        assert_eq!(loaded, vec![template]);
     }
 
     #[test]

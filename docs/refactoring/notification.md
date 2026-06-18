@@ -33,7 +33,7 @@
 
 5. **触发器和事件注册不完整**。仅 `EVENT_CL_COMMENT_CREATED` 有实现和测试（cl 作者 + reviewers，排除 actor，尊重 prefs）。mega 中有更多事件潜力（issue、pr、@mention、build 结果等），但 monoengine 业务层（ceres）尚未广泛调用这些触发器。事件类型目前靠触发器首次使用时 upsert（非迁移 seeding）。
 
-6. **用户偏好 API 首批已落地；管理员邮件作业、模板与事件类型 API 首批已落地（与 mega 仍有差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 当前已有 admin-only 邮件作业 API，可查询 `email_jobs`、查看状态统计、将 `failed` job 重新排回 `pending`、清理旧终态 job，并查看、下载、删除或按保留期清理旧终态 job 的 outbox 附件（附件 prune 可按 `username` / `event_type_code` 收窄）；dispatcher 也可通过 `mail.attachment_prune_*` 自动清理旧终态附件；admin-only 模板 API 已支持审计内置/外部模板、覆盖关系、来源路径并按管理员提供变量预览渲染；admin-only 事件类型 API 已支持列出 `notification_event_types` 并按 code upsert category/description/system_required/default_enabled；用户自助 API 已提供 `GET /user/notification/preferences`（当前用户 settings + event preference effective 状态）、`PUT /user/notification/preferences`（更新 global enabled、delivery_mode、preferred_locale、批量 event preferences）和 `PUT /user/notification/preferences/{event_type_code}`（更新当前用户单个非 system-required event preference）。邮件模板 registry 已支持由 `mail.template_dir` 在启动期加载 TOML 覆盖项。仍缺更多业务触发器和更完整运维面。
+6. **用户偏好 API 首批已落地；管理员邮件作业、模板与事件类型 API 首批已落地（与 mega 仍有差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 当前已有 admin-only 邮件作业 API，可查询 `email_jobs`、查看状态统计、将 `failed` job 重新排回 `pending`、清理旧终态 job，并查看、下载、删除或按保留期清理旧终态 job 的 outbox 附件（附件 prune 可按 `username` / `event_type_code` 收窄）；dispatcher 也可通过 `mail.attachment_prune_*` 自动清理旧终态附件；admin-only 模板 API 已支持审计内置/外部模板、覆盖关系、来源路径，按管理员提供变量预览渲染，并向 `mail.template_dir` 持久化 upsert 外部 TOML 模板后热替换 registry；admin-only 事件类型 API 已支持列出 `notification_event_types` 并按 code upsert category/description/system_required/default_enabled；用户自助 API 已提供 `GET /user/notification/preferences`（当前用户 settings + event preference effective 状态）、`PUT /user/notification/preferences`（更新 global enabled、delivery_mode、preferred_locale、批量 event preferences）和 `PUT /user/notification/preferences/{event_type_code}`（更新当前用户单个非 system-required event preference）。邮件模板 registry 已支持由 `mail.template_dir` 在启动期加载 TOML 覆盖项。仍缺更多业务触发器和更完整运维面。
 
 7. **Campsite 相关**：campsite 项目主要是 TS/Next.js monorepo（packages/ui、editor、config 等），包含一些前端通知 UI 组件（如 AvatarNotificationReasonClip）和 slack.ts 配置（可能用于外部通知渠道）。它主要作为用户/认证后端（campsite_api_domain、api_store_backend），为 notification 提供用户邮箱和身份数据，但核心事件驱动 + outbox + 偏好逻辑在 Rust 引擎侧（mega/monoengine 共享的 callisto + jupiter）。未来 slack 渠道可考虑从 campsite 的 slack 集成模式扩展。
 
@@ -55,7 +55,7 @@
 | 后台任务启动与生命周期          | **已基础接入，需完善** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher。仍需完善 graceful shutdown 协调、失败诊断、退避和多实例语义。 |
 | 多渠道支持（email 之外）        | **仅规划**        | 当前只有 email 渠道（通过 mail）。in-app（可能复用 chat/message 系统）、webhook、slack（参考 campsite slack.ts）等均未设计。 |
 | SecretRef / 渠道凭据            | **仅规划**        | Email 渠道的 password 走 mail 的 SecretRef（config 阶段 5）。未来 slack token 等需类似 vault 集成。 |
-| API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry/prune/attachment metadata/download/delete/retention prune API 已落地，且附件 retention prune 可按 username/event type 收窄；dispatcher 已支持配置化自动附件保留清理；admin-only 模板 list/preview API 已落地，可审计内置/外部模板、来源路径和覆盖关系；admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
+| API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry/prune/attachment metadata/download/delete/retention prune API 已落地，且附件 retention prune 可按 username/event type 收窄；dispatcher 已支持配置化自动附件保留清理；admin-only 模板 list/preview/upsert API 已落地，可审计内置/外部模板、来源路径和覆盖关系，并持久化外部 TOML 覆盖项；admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
 | 与 Config / 全局设置            | 弱集成            | 目前偏好全在 DB per-user。Config 中无 notification 相关全局开关（未来可能有 rate limit、默认 delivery_mode 等）。 |
 | Profile / 热加载 / 集中校验     | **未实现**        | 依赖 config 模块能力。通知事件类型或全局模板可能需要校验。 |
 | 可靠性（重试、DLQ、可观测）     | 基线已加固        | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 已有可配置指数退避 retry、failed dead-letter、stale `sending` 恢复、可配置批次/并发限流、自动附件保留清理和结构化汇总日志；admin API 可查询/统计/重排 failed job，并查看、下载、删除或按保留期清理旧终态 job 的持久化附件，附件清理可按 username/event type 收窄。仍缺指标、tracing 上下文、告警和真实多实例矩阵。 |
@@ -266,10 +266,10 @@ Config::new
 
 **阶段 4（可靠性、扩展性、运维）**：
 - 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job、按保留期 prune 旧 `sent`/`skipped` 终态 job、查看/下载/删除附件、按保留期 prune 旧终态 job 附件（可按 username/event type 收窄），并已支持 dispatcher 配置化自动附件保留清理、列出和 upsert notification event types。
-- 已完成基础邮件模板与 registry：CL 评论通知通过 `MailTemplateRegistry` 按收件人 preferred_locale 渲染 subject/html/text，并继承 locale fallback 能力；admin-only 模板 list/preview API 已能审计覆盖关系并预览渲染。
+- 已完成基础邮件模板与 registry：CL 评论通知通过 `MailTemplateRegistry` 按收件人 preferred_locale 渲染 subject/html/text，并继承 locale fallback 能力；admin-only 模板 list/preview/upsert API 已能审计覆盖关系、预览渲染并持久化外部 TOML 覆盖项。
 - 改进重试策略（指数退避已完成；仍需告警集成）。
 - 添加可观测（发送成功率、延迟、按事件/用户指标；tracing span 携带 event/job id）。
-- 继续扩展模板化（管理端持久化编辑、更多事件模板）。
+- 继续扩展模板化（模板版本审计/回滚、更多事件模板）。
 - 实现 in-app 渠道（可能复用现有 message/notification 表或新建）。
 - 继续扩展后台任务监控与 admin 接口（审计、必要时编辑/重投递安全边界）。
 - 验收：高负载下可靠投递；失败可诊断和手动干预。

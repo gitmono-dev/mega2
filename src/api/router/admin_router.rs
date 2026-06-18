@@ -8,7 +8,11 @@
 //! - 401 Unauthorized: No valid session (handled by `LoginUser` extractor)
 //! - 403 Forbidden: Logged in but not admin (for `/list` endpoint)
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::{Path as FsPath, PathBuf},
+};
 
 use axum::{
     Json,
@@ -40,10 +44,11 @@ use crate::{
         EmailJobListFilter, EmailJobRetryDisposition, EmailJobStats,
     },
     mail::template::{
-        LocalizedMailTemplate, MailTemplateKey, load_localized_template_sources_from_dir,
+        LocalizedMailTemplate, MailTemplate, MailTemplateKey,
+        load_localized_template_sources_from_dir, localized_template_to_toml,
     },
     notification::triggers::{
-        default_notification_mail_template_registry,
+        configure_notification_mail_template_registry, default_notification_mail_template_registry,
         notification_mail_template_registry_from_config,
     },
 };
@@ -243,6 +248,20 @@ pub struct MailTemplatePreviewResponse {
     pub text: Option<String>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpsertMailTemplateRequest {
+    pub subject: String,
+    pub html: String,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplateUpsertResponse {
+    pub created: bool,
+    pub registry_reloaded: bool,
+    pub template: MailTemplateAuditResponse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NotificationEventTypeInput {
     category: String,
@@ -256,6 +275,11 @@ struct MailTemplatePreviewInput {
     key: String,
     locale: Option<String>,
     variables: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailTemplateUpsertInput {
+    template: LocalizedMailTemplate,
 }
 
 /// Build the admin router.
@@ -275,6 +299,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(prune_email_jobs))
             .routes(routes!(list_mail_templates))
             .routes(routes!(preview_mail_template))
+            .routes(routes!(upsert_mail_template))
             .routes(routes!(list_notification_event_types))
             .routes(routes!(update_notification_event_type)),
     )
@@ -715,6 +740,44 @@ async fn preview_mail_template(
     Ok(Json(CommonResult::success(Some(response))))
 }
 
+/// PUT /api/v1/admin/mail-templates/{key}/{locale}
+///
+/// Creates or updates an external mail template file under `mail.template_dir`.
+/// Only admins can access this endpoint.
+#[utoipa::path(
+    put,
+    path = "/mail-templates/{key}/{locale}",
+    params(
+        ("key" = String, Path, description = "Mail template key"),
+        ("locale" = String, Path, description = "Mail template locale")
+    ),
+    request_body = UpsertMailTemplateRequest,
+    responses(
+        (status = 200, body = CommonResult<MailTemplateUpsertResponse>, content_type = "application/json"),
+        (status = 400, description = "Invalid template update request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn upsert_mail_template(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path((key, locale)): Path<(String, String)>,
+    Json(payload): Json<UpsertMailTemplateRequest>,
+) -> Result<Json<CommonResult<MailTemplateUpsertResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let mail_config = state.storage.config().mail.clone().unwrap_or_default();
+    let mut response = upsert_mail_template_file(&mail_config, key, locale, payload)?;
+
+    let registry = notification_mail_template_registry_from_config(&mail_config)
+        .map_err(ApiError::internal)?;
+    configure_notification_mail_template_registry(registry).map_err(ApiError::internal)?;
+    response.registry_reloaded = true;
+
+    Ok(Json(CommonResult::success(Some(response))))
+}
+
 /// GET /api/v1/admin/notification-event-types
 ///
 /// Lists notification event types. Only admins can access this endpoint.
@@ -967,6 +1030,107 @@ fn render_mail_template_preview(
     })
 }
 
+fn upsert_mail_template_file(
+    mail_config: &MailConfig,
+    key: String,
+    locale: String,
+    payload: UpsertMailTemplateRequest,
+) -> Result<MailTemplateUpsertResponse, ApiError> {
+    let input = normalize_mail_template_upsert_request(key, locale, payload)?;
+    let template_dir = mail_template_dir(mail_config)?;
+    let built_in_identities: HashSet<(String, String)> =
+        default_notification_mail_template_registry()
+            .templates()
+            .iter()
+            .map(mail_template_identity)
+            .collect();
+    let (write_path, created) = resolve_mail_template_write_path(template_dir, &input.template)?;
+    write_localized_mail_template(&write_path, &input.template)?;
+
+    Ok(MailTemplateUpsertResponse {
+        created,
+        registry_reloaded: false,
+        template: mail_template_audit_response(
+            &input.template,
+            MAIL_TEMPLATE_SOURCE_EXTERNAL,
+            Some(write_path.display().to_string()),
+            false,
+            built_in_identities.contains(&mail_template_identity(&input.template)),
+        ),
+    })
+}
+
+fn mail_template_dir(mail_config: &MailConfig) -> Result<&FsPath, ApiError> {
+    mail_config.template_dir.as_deref().ok_or_else(|| {
+        ApiError::bad_request(anyhow::anyhow!(
+            "mail.template_dir must be configured before templates can be edited"
+        ))
+    })
+}
+
+fn resolve_mail_template_write_path(
+    template_dir: &FsPath,
+    template: &LocalizedMailTemplate,
+) -> Result<(PathBuf, bool), ApiError> {
+    if !template_dir.is_dir() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "mail.template_dir must point to an existing directory"
+        )));
+    }
+
+    let identity = mail_template_identity(template);
+    let existing_sources =
+        load_localized_template_sources_from_dir(template_dir).map_err(ApiError::internal)?;
+    if let Some(source) = existing_sources
+        .iter()
+        .find(|source| mail_template_identity(source.template()) == identity)
+    {
+        let path = source.source_path().to_path_buf();
+        validate_mail_template_write_path(template_dir, &path)?;
+        return Ok((path, false));
+    }
+
+    let filename = format!("{}__{}.toml", template.key().as_str(), template.locale());
+    let path = template_dir.join(filename);
+    if existing_sources
+        .iter()
+        .any(|source| source.source_path() == path)
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "derived mail template file is already used by another template"
+        )));
+    }
+    validate_mail_template_write_path(template_dir, &path)?;
+    Ok((path, true))
+}
+
+fn validate_mail_template_write_path(template_dir: &FsPath, path: &FsPath) -> Result<(), ApiError> {
+    if path.parent() != Some(template_dir) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "mail template path must stay inside mail.template_dir"
+        )));
+    }
+
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(ApiError::internal)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "mail template path must be a regular file"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn write_localized_mail_template(
+    path: &FsPath,
+    template: &LocalizedMailTemplate,
+) -> Result<(), ApiError> {
+    let contents = localized_template_to_toml(template).map_err(ApiError::internal)?;
+    fs::write(path, contents).map_err(ApiError::internal)
+}
+
 fn normalize_mail_template_preview_request(
     input: MailTemplatePreviewRequest,
 ) -> Result<MailTemplatePreviewInput, ApiError> {
@@ -991,6 +1155,32 @@ fn normalize_mail_template_preview_request(
         key,
         locale,
         variables,
+    })
+}
+
+fn normalize_mail_template_upsert_request(
+    key: String,
+    locale: String,
+    input: UpsertMailTemplateRequest,
+) -> Result<MailTemplateUpsertInput, ApiError> {
+    let key = normalize_mail_template_identifier("mail template key", &key)?;
+    let locale = normalize_mail_template_identifier("mail template locale", &locale)?;
+    if input.subject.trim().is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "mail template subject must not be empty"
+        )));
+    }
+    if input.html.trim().is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "mail template html must not be empty"
+        )));
+    }
+
+    let template = MailTemplate::new(input.subject, input.html, input.text.as_deref());
+    template.validate_syntax().map_err(ApiError::bad_request)?;
+
+    Ok(MailTemplateUpsertInput {
+        template: LocalizedMailTemplate::new(MailTemplateKey::new(key), locale, template),
     })
 }
 
@@ -1292,6 +1482,160 @@ text = "Hello {{name}}"
         assert_eq!(response.subject, "Hello <Alice>");
         assert_eq!(response.html, "<p>&lt;Alice&gt;</p>");
         assert_eq!(response.text.as_deref(), Some("Hello <Alice>"));
+    }
+
+    #[test]
+    fn upsert_mail_template_file_creates_external_override() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+
+        let response = upsert_mail_template_file(
+            &mail_config,
+            "cl.comment.created".to_string(),
+            "en-US".to_string(),
+            UpsertMailTemplateRequest {
+                subject: "Override {{actor_username}}".to_string(),
+                html: "<p>{{comment_text}}</p>".to_string(),
+                text: Some("{{actor_username}}: {{comment_text}}".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(response.created);
+        assert!(!response.registry_reloaded);
+        assert!(response.template.overrides_builtin);
+        let source_path = response.template.source_path.as_deref().unwrap();
+        assert!(std::path::Path::new(source_path).exists());
+
+        let registry = notification_mail_template_registry_from_config(&mail_config).unwrap();
+        let rendered = registry
+            .render(
+                &MailTemplateKey::new("cl.comment.created"),
+                Some("en-US"),
+                &[
+                    ("actor_username", "alice"),
+                    ("cl_link", "CL1"),
+                    ("comment_text", "<hello>"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(rendered.subject, "Override alice");
+        assert_eq!(rendered.html, "<p>&lt;hello&gt;</p>");
+        assert_eq!(rendered.text.as_deref(), Some("alice: <hello>"));
+    }
+
+    #[test]
+    fn upsert_mail_template_file_reuses_existing_external_source() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let template_path = dir.path().join("custom-name.toml");
+        std::fs::write(
+            &template_path,
+            r#"
+key = "custom.event"
+locale = "en-US"
+subject = "Old {{name}}"
+html = "<p>Old {{name}}</p>"
+"#,
+        )
+        .expect("write template");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+
+        let response = upsert_mail_template_file(
+            &mail_config,
+            "custom.event".to_string(),
+            "en-US".to_string(),
+            UpsertMailTemplateRequest {
+                subject: "New {{name}}".to_string(),
+                html: "<p>New {{name}}</p>".to_string(),
+                text: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!response.created);
+        assert_eq!(
+            response.template.source_path.as_deref(),
+            Some(template_path.display().to_string().as_str())
+        );
+        assert!(!dir.path().join("custom.event__en-US.toml").exists());
+        let updated = std::fs::read_to_string(&template_path).unwrap();
+        assert!(updated.contains("subject = \"New {{name}}\""));
+    }
+
+    #[test]
+    fn upsert_mail_template_file_rejects_unconfigured_dir_and_bad_syntax() {
+        assert!(
+            upsert_mail_template_file(
+                &MailConfig::default(),
+                "custom.event".to_string(),
+                "en-US".to_string(),
+                UpsertMailTemplateRequest {
+                    subject: "Subject".to_string(),
+                    html: "<p>Body</p>".to_string(),
+                    text: None,
+                },
+            )
+            .is_err()
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+        assert!(
+            upsert_mail_template_file(
+                &mail_config,
+                "custom.event".to_string(),
+                "en-US".to_string(),
+                UpsertMailTemplateRequest {
+                    subject: "Subject {{name".to_string(),
+                    html: "<p>{{name}}</p>".to_string(),
+                    text: None,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn upsert_mail_template_file_rejects_derived_path_collision() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("custom.event__en-US.toml"),
+            r#"
+key = "other.event"
+locale = "en-US"
+subject = "Other {{name}}"
+html = "<p>Other {{name}}</p>"
+"#,
+        )
+        .expect("write template");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+
+        assert!(
+            upsert_mail_template_file(
+                &mail_config,
+                "custom.event".to_string(),
+                "en-US".to_string(),
+                UpsertMailTemplateRequest {
+                    subject: "New {{name}}".to_string(),
+                    html: "<p>New {{name}}</p>".to_string(),
+                    text: None,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
