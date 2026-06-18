@@ -1045,6 +1045,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatcher_drains_high_water_queue_across_bounded_ticks() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        const TOTAL_JOBS: usize = 17;
+        const BATCH_SIZE: u64 = 4;
+
+        for idx in 0..TOTAL_JOBS {
+            stg.enqueue_email_job(
+                "alice",
+                &format!("alice+{idx}@example.com"),
+                "cl.comment.created",
+                "Subject",
+                "<p>Body</p>",
+                Some("Body"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let control = EmailDispatcherControl::new_with_limits(
+            true,
+            EmailDispatcherLimits::new(BATCH_SIZE, 2),
+        );
+        let dispatcher =
+            EmailDispatcher::new_with_control(stg.clone(), Arc::new(NoopMailer), control);
+
+        for tick in 1..=5 {
+            dispatcher.tick_once().await.unwrap();
+
+            let all_jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+            let sent = all_jobs.iter().filter(|job| job.status == "sent").count();
+            let pending = all_jobs
+                .iter()
+                .filter(|job| job.status == "pending")
+                .count();
+            let expected_sent = (tick * BATCH_SIZE as usize).min(TOTAL_JOBS);
+
+            assert_eq!(sent, expected_sent);
+            assert_eq!(pending, TOTAL_JOBS - expected_sent);
+        }
+    }
+
+    #[tokio::test]
     async fn dispatcher_skips_pending_jobs_when_disabled_by_control() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
