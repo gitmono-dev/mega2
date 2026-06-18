@@ -369,6 +369,14 @@ async fn shutdown_signal(token: CancellationToken) {
     token.cancelled().await;
 }
 
+fn broadcast_shutdown(
+    shutdown_token: &CancellationToken,
+    notification_shutdown: &CancellationToken,
+) {
+    shutdown_token.cancel();
+    notification_shutdown.cancel();
+}
+
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     let CommonHttpOptions { host, port } = options.clone();
     let server_url = format!("{host}:{port}");
@@ -386,6 +394,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     let shutdown_token = CancellationToken::new();
     let cleanup_handle = spawn_cleanup_task(ctx.clone(), shutdown_token.clone())?;
     let artifact_gc_handle = spawn_artifact_gc_task(ctx.clone(), shutdown_token.clone())?;
+    let notification_shutdown = ctx.notification_shutdown.clone();
     let server_token = shutdown_token.clone();
 
     let app = app(ctx, host.clone(), port).await;
@@ -417,7 +426,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     }
 
     tracing::info!("Broadcasting shutdown signal to all tasks...");
-    shutdown_token.cancel();
+    broadcast_shutdown(&shutdown_token, &notification_shutdown);
 
     let (cleanup_result, artifact_gc_result, server_result) = tokio::join!(
         async {
@@ -771,6 +780,17 @@ mod tests {
                 batch_limit: 10,
             }
         );
+    }
+
+    #[test]
+    fn broadcast_shutdown_cancels_notification_tasks() {
+        let shutdown_token = CancellationToken::new();
+        let notification_shutdown = CancellationToken::new();
+
+        broadcast_shutdown(&shutdown_token, &notification_shutdown);
+
+        assert!(shutdown_token.is_cancelled());
+        assert!(notification_shutdown.is_cancelled());
     }
 
     #[test]
