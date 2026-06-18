@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -202,6 +202,7 @@ pub fn isolated_config(base_dir: impl AsRef<Path>) -> Config {
 #[derive(Debug, Clone, Default)]
 pub struct TestSecretResolver {
     secrets: Arc<RwLock<HashMap<String, String>>>,
+    denied_refs: Arc<RwLock<HashSet<String>>>,
 }
 
 impl TestSecretResolver {
@@ -230,11 +231,36 @@ impl TestSecretResolver {
         secrets.insert(secret_ref.as_uri().to_string(), value.into());
         Ok(())
     }
+
+    pub fn with_denied_secret(self, secret_ref: &SecretRef) -> Result<Self, MegaError> {
+        self.deny_secret(secret_ref)?;
+        Ok(self)
+    }
+
+    pub fn deny_secret(&self, secret_ref: &SecretRef) -> Result<(), MegaError> {
+        let mut denied_refs = self
+            .denied_refs
+            .write()
+            .map_err(|_| MegaError::Other("test secret resolver lock was poisoned".to_string()))?;
+        denied_refs.insert(secret_ref.as_uri().to_string());
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl SecretResolver for TestSecretResolver {
     async fn resolve(&self, secret_ref: &SecretRef) -> Result<String, MegaError> {
+        let denied_refs = self
+            .denied_refs
+            .read()
+            .map_err(|_| MegaError::Other("test secret resolver lock was poisoned".to_string()))?;
+        if denied_refs.contains(secret_ref.as_uri()) {
+            return Err(MegaError::Other(format!(
+                "test secret access denied for {secret_ref}"
+            )));
+        }
+        drop(denied_refs);
+
         let secrets = self
             .secrets
             .read()
@@ -250,11 +276,17 @@ impl SecretResolver for TestSecretResolver {
         if let Ok(mut secrets) = self.secrets.write() {
             secrets.remove(secret_ref.as_uri());
         }
+        if let Ok(mut denied_refs) = self.denied_refs.write() {
+            denied_refs.remove(secret_ref.as_uri());
+        }
     }
 
     async fn evict_all(&self) {
         if let Ok(mut secrets) = self.secrets.write() {
             secrets.clear();
+        }
+        if let Ok(mut denied_refs) = self.denied_refs.write() {
+            denied_refs.clear();
         }
     }
 }
@@ -335,6 +367,32 @@ mod tests {
             .insert_secret(&secret_ref, "smtp-test-value")
             .expect("secret should insert again");
         resolver.evict_all().await;
+        assert!(resolver.resolve(&secret_ref).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_secret_resolver_denies_configured_refs_without_leaking_uri() {
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
+        let resolver = TestSecretResolver::new()
+            .with_secret(&secret_ref, "smtp-test-value")
+            .expect("secret should insert")
+            .with_denied_secret(&secret_ref)
+            .expect("secret should be denied");
+
+        let err = resolver
+            .resolve(&secret_ref)
+            .await
+            .expect_err("denied secret should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("test secret access denied"));
+        assert!(message.contains("vault://secret/***#***"));
+        assert!(!message.contains("config/test/mail/password"));
+        assert!(!message.contains("#value"));
+        assert!(!message.contains("smtp-test-value"));
+
+        resolver.evict(&secret_ref).await;
         assert!(resolver.resolve(&secret_ref).await.is_err());
     }
 }

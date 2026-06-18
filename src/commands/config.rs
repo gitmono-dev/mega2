@@ -675,4 +675,38 @@ mod tests {
         assert!(!message.contains("config/test/mail/password"));
         assert!(!message.contains("#value"));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_reports_permission_denied_without_leaking_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(MailConfig {
+            enabled: false,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: Some(secret_ref.clone()),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        });
+        let resolver = TestSecretResolver::new()
+            .with_secret(&secret_ref, "smtp-test-value")
+            .expect("secret should insert")
+            .with_denied_secret(&secret_ref)
+            .expect("secret should be denied");
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("denied SecretRef should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("test secret access denied"));
+        assert!(message.contains("vault://secret/***#***"));
+        assert!(!message.contains("config/test/mail/password"));
+        assert!(!message.contains("#value"));
+        assert!(!message.contains("smtp-test-value"));
+    }
 }
