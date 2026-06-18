@@ -57,6 +57,16 @@ impl AppContext {
         if let Some(mail_cfg) = &config.mail {
             mail_cfg.validate()?;
             mail_cfg.warn_plaintext_password_deprecated();
+            let mail_template_registry =
+                crate::notification::triggers::notification_mail_template_registry_from_config(
+                    mail_cfg,
+                )
+                .map_err(|e| {
+                    MegaError::Other(format!("mail template initialization failed: {e}"))
+                })?;
+            crate::notification::triggers::configure_notification_mail_template_registry(
+                mail_template_registry,
+            )?;
 
             if mail_cfg.enabled {
                 let resolved_password = if mail_cfg.provider == crate::config::MailProvider::Smtp

@@ -106,6 +106,9 @@ dispatcher_max_in_flight = 8
 retry_max_attempts = 5
 retry_backoff_base_secs = 30
 retry_backoff_max_secs = 300
+template_default_locale = "en-US"
+# Optional directory of TOML files with key/locale/subject/html/text fields.
+# template_dir = "{base_dir}/mail-templates"
 attachment_prune_enabled = false
 attachment_prune_interval_secs = 3600
 attachment_retention_days = 30

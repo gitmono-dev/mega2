@@ -229,6 +229,33 @@ impl MailConfig {
                 ));
             }
         }
+        if self.template_default_locale.trim().is_empty() {
+            return Err(MegaError::Other(
+                "mail.template_default_locale must not be empty".to_string(),
+            ));
+        }
+        if !self
+            .template_default_locale
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        {
+            return Err(MegaError::Other(
+                "mail.template_default_locale contains unsupported characters".to_string(),
+            ));
+        }
+        if let Some(template_dir) = &self.template_dir {
+            if template_dir.as_os_str().is_empty() {
+                return Err(MegaError::Other(
+                    "mail.template_dir must not be empty".to_string(),
+                ));
+            }
+            if !template_dir.is_dir() {
+                return Err(MegaError::Other(format!(
+                    "mail.template_dir must point to an existing directory: {}",
+                    template_dir.display()
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -1219,6 +1246,8 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "attachment_prune_interval_secs",
             "attachment_retention_days",
             "attachment_prune_statuses",
+            "template_default_locale",
+            "template_dir",
             "smtp_tls",
             "tls",
         ]),
@@ -1688,6 +1717,38 @@ mod tests {
             .validate()
             .expect_err("duplicate attachment prune status should fail");
         assert!(err.to_string().contains("mail.attachment_prune_statuses"));
+    }
+
+    #[test]
+    fn mail_validate_rejects_invalid_template_settings() {
+        let mail_config = MailConfig {
+            template_default_locale: String::new(),
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("empty template default locale should fail");
+        assert!(err.to_string().contains("mail.template_default_locale"));
+
+        let mail_config = MailConfig {
+            template_default_locale: "en US".to_string(),
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("unsupported template default locale should fail");
+        assert!(err.to_string().contains("mail.template_default_locale"));
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let missing_dir = temp_dir.path().join("missing");
+        let mail_config = MailConfig {
+            template_dir: Some(missing_dir),
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("missing template dir should fail");
+        assert!(err.to_string().contains("mail.template_dir"));
     }
 
     #[test]

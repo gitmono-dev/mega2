@@ -1,49 +1,93 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{LazyLock, RwLock},
+};
 
 use crate::{
     common::errors::MegaError,
+    config::MailConfig,
     jupiter::storage::{
         cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage,
         notification_storage::NotificationStorage,
     },
     mail::template::{
         DEFAULT_MAIL_LOCALE, LocalizedMailTemplate, MailTemplate, MailTemplateKey,
-        MailTemplateRegistry,
+        MailTemplateRegistry, load_localized_templates_from_dir,
     },
 };
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
 
-const CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY: MailTemplateKey =
-    MailTemplateKey::new(EVENT_CL_COMMENT_CREATED);
+static NOTIFICATION_MAIL_TEMPLATE_REGISTRY: LazyLock<RwLock<MailTemplateRegistry>> =
+    LazyLock::new(|| RwLock::new(default_notification_mail_template_registry()));
 
-const CL_COMMENT_CREATED_MAIL_TEMPLATE: MailTemplate<'static> = MailTemplate::new(
-    "New comment on CL {{cl_link}}",
-    "<p><b>{{actor_username}}</b> commented on <b>{{cl_link}}</b>:</p><p>{{comment_text}}</p>",
-    Some("{{actor_username}} commented on {{cl_link}}: {{comment_text}}"),
-);
+fn cl_comment_created_mail_template_key() -> MailTemplateKey {
+    MailTemplateKey::new(EVENT_CL_COMMENT_CREATED)
+}
 
-const CL_COMMENT_CREATED_MAIL_TEMPLATE_ZH_CN: MailTemplate<'static> = MailTemplate::new(
-    "CL {{cl_link}} 有新评论",
-    "<p><b>{{actor_username}}</b> 评论了 <b>{{cl_link}}</b>：</p><p>{{comment_text}}</p>",
-    Some("{{actor_username}} 评论了 {{cl_link}}：{{comment_text}}"),
-);
+pub fn default_notification_mail_template_registry() -> MailTemplateRegistry {
+    notification_mail_template_registry_with_default_locale(DEFAULT_MAIL_LOCALE)
+}
 
-const NOTIFICATION_MAIL_TEMPLATE_REGISTRY: MailTemplateRegistry<'static> =
+pub fn notification_mail_template_registry_from_config(
+    mail_config: &MailConfig,
+) -> Result<MailTemplateRegistry, MegaError> {
+    let mut registry = notification_mail_template_registry_with_default_locale(
+        &mail_config.template_default_locale,
+    );
+    if let Some(template_dir) = &mail_config.template_dir {
+        registry.append_templates(load_localized_templates_from_dir(template_dir)?);
+    }
+
+    Ok(registry)
+}
+
+pub fn configure_notification_mail_template_registry(
+    registry: MailTemplateRegistry,
+) -> Result<(), MegaError> {
+    let mut configured = NOTIFICATION_MAIL_TEMPLATE_REGISTRY.write().map_err(|_| {
+        MegaError::Other("notification mail template registry lock is poisoned".to_string())
+    })?;
+    *configured = registry;
+
+    Ok(())
+}
+
+fn current_notification_mail_template_registry() -> Result<MailTemplateRegistry, MegaError> {
+    let configured = NOTIFICATION_MAIL_TEMPLATE_REGISTRY.read().map_err(|_| {
+        MegaError::Other("notification mail template registry lock is poisoned".to_string())
+    })?;
+
+    Ok(configured.clone())
+}
+
+fn notification_mail_template_registry_with_default_locale(
+    default_locale: &str,
+) -> MailTemplateRegistry {
+    let key = cl_comment_created_mail_template_key();
     MailTemplateRegistry::new(
-        DEFAULT_MAIL_LOCALE,
-        &[
+        default_locale,
+        vec![
             LocalizedMailTemplate::new(
-                CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+                key.clone(),
                 DEFAULT_MAIL_LOCALE,
-                CL_COMMENT_CREATED_MAIL_TEMPLATE,
+                MailTemplate::new(
+                    "New comment on CL {{cl_link}}",
+                    "<p><b>{{actor_username}}</b> commented on <b>{{cl_link}}</b>:</p><p>{{comment_text}}</p>",
+                    Some("{{actor_username}} commented on {{cl_link}}: {{comment_text}}"),
+                ),
             ),
             LocalizedMailTemplate::new(
-                CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+                key,
                 "zh-CN",
-                CL_COMMENT_CREATED_MAIL_TEMPLATE_ZH_CN,
+                MailTemplate::new(
+                    "CL {{cl_link}} 有新评论",
+                    "<p><b>{{actor_username}}</b> 评论了 <b>{{cl_link}}</b>：</p><p>{{comment_text}}</p>",
+                    Some("{{actor_username}} 评论了 {{cl_link}}：{{comment_text}}"),
+                ),
             ),
         ],
-    );
+    )
+}
 
 /// Ensure the core event types exist in DB
 ///
@@ -73,6 +117,28 @@ pub async fn on_cl_comment_created(
     notif_stg: &NotificationStorage,
     cl_stg: &ClStorage,
     reviewer_stg: &ClReviewerStorage,
+    actor_username: &str,
+    cl_link: &str,
+    comment_text: &str,
+) -> Result<(), MegaError> {
+    let registry = current_notification_mail_template_registry()?;
+    on_cl_comment_created_with_registry(
+        notif_stg,
+        cl_stg,
+        reviewer_stg,
+        &registry,
+        actor_username,
+        cl_link,
+        comment_text,
+    )
+    .await
+}
+
+pub async fn on_cl_comment_created_with_registry(
+    notif_stg: &NotificationStorage,
+    cl_stg: &ClStorage,
+    reviewer_stg: &ClReviewerStorage,
+    mail_templates: &MailTemplateRegistry,
     actor_username: &str,
     cl_link: &str,
     comment_text: &str,
@@ -107,8 +173,8 @@ pub async fn on_cl_comment_created(
             None => continue,
         };
 
-        let mail = NOTIFICATION_MAIL_TEMPLATE_REGISTRY.render(
-            CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+        let mail = mail_templates.render(
+            &cl_comment_created_mail_template_key(),
             settings.preferred_locale.as_deref(),
             &[
                 ("actor_username", actor_username),
@@ -303,6 +369,85 @@ mod tests {
         assert_eq!(
             job.body_text.as_deref(),
             Some(r#"bob commented on CL-template: <script>alert("x")</script> & done"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_cl_comment_created_uses_supplied_mail_template_registry() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let base = BaseStorage::new(Arc::new(db.clone()));
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        let cl_stg = ClStorage { base: base.clone() };
+        let reviewer_stg = ClReviewerStorage { base: base.clone() };
+        let now = chrono::Utc::now().naive_utc();
+
+        mega_cl::ActiveModel {
+            id: Set(1),
+            link: Set("CL-custom-template".to_string()),
+            title: Set("t".to_string()),
+            merge_date: Set(None),
+            status: Set(crate::callisto::sea_orm_active_enums::MergeStatusEnum::Open),
+            path: Set("/".to_string()),
+            from_hash: Set("a".to_string()),
+            to_hash: Set("b".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            username: Set("alice".to_string()),
+            base_branch: Set("main".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        notif
+            .upsert_user_settings("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        let template_key = MailTemplateKey::new(EVENT_CL_COMMENT_CREATED);
+        let registry = MailTemplateRegistry::new(
+            DEFAULT_MAIL_LOCALE,
+            vec![LocalizedMailTemplate::new(
+                template_key,
+                DEFAULT_MAIL_LOCALE,
+                MailTemplate::new(
+                    "[custom] {{cl_link}}",
+                    "<section>{{comment_text}}</section>",
+                    Some("[custom] {{actor_username}}: {{comment_text}}"),
+                ),
+            )],
+        );
+
+        on_cl_comment_created_with_registry(
+            &notif,
+            &cl_stg,
+            &reviewer_stg,
+            &registry,
+            "bob",
+            "CL-custom-template",
+            "<b>ship it</b>",
+        )
+        .await
+        .unwrap();
+
+        let job = email_jobs::Entity::find()
+            .filter(email_jobs::Column::Username.eq("alice"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(job.subject, "[custom] CL-custom-template");
+        assert_eq!(
+            job.body_html,
+            "<section>&lt;b&gt;ship it&lt;/b&gt;</section>"
+        );
+        assert_eq!(
+            job.body_text.as_deref(),
+            Some("[custom] bob: <b>ship it</b>")
         );
     }
 

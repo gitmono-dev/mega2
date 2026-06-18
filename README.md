@@ -314,13 +314,15 @@ cargo test --test <name>
   `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`). Config reload
   can disable a running dispatcher via `mail.enabled = false` and hot-reload
   dispatcher batch/concurrency limits plus retry policy; re-enabling mail or
-  changing SMTP settings still requires restart. Users can inspect and update
-  notification settings, preferred locale, and per-event preferences under
-  `/user/notification/preferences`; admins can manage notification event
-  types under `/admin/notification-event-types` and prune old terminal outbox
-  jobs under `/admin/email-jobs/prune`; attachment audit metadata is available
-  under `/admin/email-jobs/{id}/attachments`, and admins can explicitly
-  download, delete, or prune old terminal-job persisted attachments under the
+  changing SMTP settings still requires restart. Mail templates have built-in
+  locale fallback and can be overridden at startup with TOML files from
+  `mail.template_dir`. Users can inspect and update notification settings,
+  preferred locale, and per-event preferences under
+  `/user/notification/preferences`; admins can manage notification event types
+  under `/admin/notification-event-types` and prune old terminal outbox jobs
+  under `/admin/email-jobs/prune`; attachment audit metadata is available under
+  `/admin/email-jobs/{id}/attachments`, and admins can explicitly download,
+  delete, or prune old terminal-job persisted attachments under the
   `/admin/email-jobs/.../attachments` management endpoints.
 - **Background maintenance** — HTTP service tasks clean expired Buck upload
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC

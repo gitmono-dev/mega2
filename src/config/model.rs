@@ -168,6 +168,7 @@ pub const DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS: i64 = 30;
 pub const DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS: i64 = 300;
 pub const DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS: u64 = 3600;
 pub const DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS: u32 = 30;
+pub const DEFAULT_MAIL_TEMPLATE_LOCALE: &str = "en-US";
 
 /// Mail configuration. Lives here so it participates in the main Config loading
 /// / env overlay / placeholder / (future) SecretRef pipeline.
@@ -210,6 +211,10 @@ pub struct MailConfig {
     pub attachment_retention_days: u32,
     #[serde(default = "default_mail_attachment_prune_statuses")]
     pub attachment_prune_statuses: Vec<String>,
+    #[serde(default = "default_mail_template_locale")]
+    pub template_default_locale: String,
+    #[serde(default)]
+    pub template_dir: Option<PathBuf>,
     // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
 }
 
@@ -243,6 +248,9 @@ fn default_mail_attachment_retention_days() -> u32 {
 fn default_mail_attachment_prune_statuses() -> Vec<String> {
     vec!["sent".to_string(), "skipped".to_string()]
 }
+fn default_mail_template_locale() -> String {
+    DEFAULT_MAIL_TEMPLATE_LOCALE.to_string()
+}
 
 impl Default for MailConfig {
     fn default() -> Self {
@@ -265,6 +273,8 @@ impl Default for MailConfig {
             attachment_prune_interval_secs: default_mail_attachment_prune_interval_secs(),
             attachment_retention_days: default_mail_attachment_retention_days(),
             attachment_prune_statuses: default_mail_attachment_prune_statuses(),
+            template_default_locale: default_mail_template_locale(),
+            template_dir: None,
         }
     }
 }

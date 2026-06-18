@@ -954,6 +954,14 @@ fn collect_mail_restart_fields(
     if current.starttls != candidate.starttls {
         report.restart_required_fields.push("mail.starttls");
     }
+    if current.template_default_locale != candidate.template_default_locale {
+        report
+            .restart_required_fields
+            .push("mail.template_default_locale");
+    }
+    if current.template_dir != candidate.template_dir {
+        report.restart_required_fields.push("mail.template_dir");
+    }
 }
 
 #[cfg(test)]
@@ -1443,6 +1451,35 @@ mod tests {
             snapshot.mail.as_ref().expect("mail config").provider,
             MailProvider::Smtp
         );
+    }
+
+    #[test]
+    fn reload_reports_mail_template_settings_require_restart_without_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let template_dir = temp_dir.path().join("templates");
+        std::fs::create_dir(&template_dir).expect("template dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(true));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.template_default_locale = "zh-CN".to_string();
+        mail.template_dir = Some(template_dir);
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let mail = snapshot.mail.as_ref().expect("mail config");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec!["mail.template_default_locale", "mail.template_dir"]
+        );
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert_eq!(mail.template_default_locale, "en-US");
+        assert_eq!(mail.template_dir, None);
     }
 
     #[test]

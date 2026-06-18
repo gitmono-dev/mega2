@@ -307,6 +307,11 @@ dispatcher_max_in_flight = 8
 retry_max_attempts = 5
 retry_backoff_base_secs = 30
 retry_backoff_max_secs = 300
+# Optional external notification mail templates. Template files are TOML documents
+# with key/locale/subject/html/text fields and override built-in templates by
+# matching key + locale.
+template_default_locale = "en-US"
+# template_dir = "${base_dir}/mail-templates"
 # Optional automatic cleanup for persisted outbox attachment content.
 # Runs inside the email dispatcher when enabled; interval/retention/statuses are hot-reloaded.
 attachment_prune_enabled = false
