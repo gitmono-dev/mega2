@@ -3,18 +3,27 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use tokio::time::{Duration, interval};
+use tokio::{
+    task::JoinSet,
+    time::{Duration, interval},
+};
 use tracing::{info, warn};
 
 use crate::{
+    callisto::email_jobs,
     common::errors::MegaError,
     config::{
         Config,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
-    jupiter::storage::notification_storage::NotificationStorage,
+    jupiter::storage::notification_storage::{
+        EMAIL_JOB_SEND_TIMEOUT_SECS, EmailJobFailureDisposition, NotificationStorage,
+    },
     mail::Mailer,
 };
+
+pub const EMAIL_DISPATCH_BATCH_SIZE: u64 = 50;
+pub const EMAIL_DISPATCH_MAX_IN_FLIGHT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct EmailDispatcherControl {
@@ -94,41 +103,145 @@ impl EmailDispatcher {
             return Ok(());
         }
 
-        let jobs = self.stg.fetch_pending_jobs(50).await?;
-        for job in jobs {
-            if job.to_email.trim().is_empty() {
-                let _ = self
-                    .stg
-                    .mark_job_skipped(job.id, "missing recipient email")
-                    .await;
-                continue;
-            }
-            if !self.stg.try_claim_job(job.id).await? {
-                continue;
-            }
-            let send_res = self
-                .mailer
-                .send_html(
-                    &job.to_email,
-                    &job.subject,
-                    &job.body_html,
-                    job.body_text.as_deref(),
-                )
-                .await;
+        let recovered = self
+            .stg
+            .requeue_stale_sending_jobs(chrono::Duration::seconds(EMAIL_JOB_SEND_TIMEOUT_SECS))
+            .await?;
+        if recovered > 0 {
+            warn!(
+                recovered,
+                send_timeout_secs = EMAIL_JOB_SEND_TIMEOUT_SECS,
+                "email dispatcher requeued stale sending jobs"
+            );
+        }
 
-            match send_res {
-                Ok(_) => {
-                    let _ = self.stg.mark_job_sent(job.id).await;
-                }
-                Err(e) => {
-                    let _ = self
-                        .stg
-                        .mark_job_failed_with_retry(job.id, &e.to_string())
-                        .await;
+        let jobs = self
+            .stg
+            .fetch_pending_jobs(EMAIL_DISPATCH_BATCH_SIZE)
+            .await?;
+        let mut stats = EmailDispatchTickStats {
+            fetched: jobs.len(),
+            ..Default::default()
+        };
+
+        for chunk in jobs.chunks(EMAIL_DISPATCH_MAX_IN_FLIGHT) {
+            let mut tasks = JoinSet::new();
+
+            for job in chunk.iter().cloned() {
+                let stg = self.stg.clone();
+                let mailer = Arc::clone(&self.mailer);
+                tasks.spawn(async move { process_email_job(stg, mailer, job).await });
+            }
+
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(Ok(outcome)) => stats.record(outcome),
+                    Ok(Err(e)) => {
+                        stats.task_errors += 1;
+                        warn!(error = %e, "email dispatcher job processing error");
+                    }
+                    Err(e) => {
+                        stats.task_errors += 1;
+                        warn!(error = %e, "email dispatcher job task failed");
+                    }
                 }
             }
         }
+
+        if stats.should_log() {
+            info!(
+                fetched = stats.fetched,
+                sent = stats.sent,
+                retry_scheduled = stats.retry_scheduled,
+                dead_lettered = stats.dead_lettered,
+                skipped = stats.skipped,
+                claim_missed = stats.claim_missed,
+                missing_after_failure = stats.missing_after_failure,
+                task_errors = stats.task_errors,
+                max_in_flight = EMAIL_DISPATCH_MAX_IN_FLIGHT,
+                "email dispatcher tick completed"
+            );
+        }
+
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EmailDispatchTickStats {
+    fetched: usize,
+    sent: usize,
+    retry_scheduled: usize,
+    dead_lettered: usize,
+    skipped: usize,
+    claim_missed: usize,
+    missing_after_failure: usize,
+    task_errors: usize,
+}
+
+impl EmailDispatchTickStats {
+    fn record(&mut self, outcome: EmailJobOutcome) {
+        match outcome {
+            EmailJobOutcome::Sent => self.sent += 1,
+            EmailJobOutcome::RetryScheduled => self.retry_scheduled += 1,
+            EmailJobOutcome::DeadLettered => self.dead_lettered += 1,
+            EmailJobOutcome::Skipped => self.skipped += 1,
+            EmailJobOutcome::ClaimMissed => self.claim_missed += 1,
+            EmailJobOutcome::MissingAfterFailure => self.missing_after_failure += 1,
+        }
+    }
+
+    fn should_log(&self) -> bool {
+        self.fetched > 0 || self.task_errors > 0
+    }
+}
+
+enum EmailJobOutcome {
+    Sent,
+    RetryScheduled,
+    DeadLettered,
+    Skipped,
+    ClaimMissed,
+    MissingAfterFailure,
+}
+
+async fn process_email_job(
+    stg: NotificationStorage,
+    mailer: Arc<dyn Mailer>,
+    job: email_jobs::Model,
+) -> Result<EmailJobOutcome, sea_orm::DbErr> {
+    if job.to_email.trim().is_empty() {
+        stg.mark_job_skipped(job.id, "missing recipient email")
+            .await?;
+        return Ok(EmailJobOutcome::Skipped);
+    }
+
+    if !stg.try_claim_job(job.id).await? {
+        return Ok(EmailJobOutcome::ClaimMissed);
+    }
+
+    let send_res = mailer
+        .send_html(
+            &job.to_email,
+            &job.subject,
+            &job.body_html,
+            job.body_text.as_deref(),
+        )
+        .await;
+
+    match send_res {
+        Ok(_) => {
+            stg.mark_job_sent(job.id).await?;
+            Ok(EmailJobOutcome::Sent)
+        }
+        Err(e) => match stg
+            .mark_job_failed_with_retry(job.id, &e.to_string())
+            .await?
+        {
+            EmailJobFailureDisposition::RetryScheduled => Ok(EmailJobOutcome::RetryScheduled),
+            EmailJobFailureDisposition::DeadLettered => Ok(EmailJobOutcome::DeadLettered),
+            EmailJobFailureDisposition::MissingJob => Ok(EmailJobOutcome::MissingAfterFailure),
+        },
     }
 }
 
@@ -147,6 +260,8 @@ fn apply_mail_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use async_trait::async_trait;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use tempfile::TempDir;
@@ -171,6 +286,28 @@ mod tests {
             _text: Option<&str>,
         ) -> Result<(), MegaError> {
             Err(MegaError::Other("smtp unavailable".to_string()))
+        }
+    }
+
+    struct TrackingMailer {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Mailer for TrackingMailer {
+        async fn send_html(
+            &self,
+            _to: &str,
+            _subject: &str,
+            _html: &str,
+            _text: Option<&str>,
+        ) -> Result<(), MegaError> {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -218,6 +355,112 @@ mod tests {
         let sent = email_jobs::Entity::find().all(&db).await.unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].status, "sent");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_processes_jobs_with_bounded_parallelism() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for idx in 0..(EMAIL_DISPATCH_MAX_IN_FLIGHT + 2) {
+            stg.enqueue_email_job(
+                "alice",
+                &format!("alice+{idx}@example.com"),
+                "cl.comment.created",
+                "Subject",
+                "<p>Body</p>",
+                Some("Body"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mailer = TrackingMailer {
+            in_flight,
+            max_in_flight: Arc::clone(&max_in_flight),
+        };
+        let dispatcher = EmailDispatcher::new(stg.clone(), Arc::new(mailer));
+        dispatcher.tick_once().await.unwrap();
+
+        let observed = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "dispatcher should process more than one email concurrently"
+        );
+        assert!(
+            observed <= EMAIL_DISPATCH_MAX_IN_FLIGHT,
+            "dispatcher exceeded max in-flight send limit"
+        );
+
+        let sent = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(sent.len(), EMAIL_DISPATCH_MAX_IN_FLIGHT + 2);
+        assert!(sent.iter().all(|job| job.status == "sent"));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_respects_batch_size_for_backpressure() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for idx in 0..(EMAIL_DISPATCH_BATCH_SIZE + 3) {
+            stg.enqueue_email_job(
+                "alice",
+                &format!("alice+{idx}@example.com"),
+                "cl.comment.created",
+                "Subject",
+                "<p>Body</p>",
+                Some("Body"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dispatcher = EmailDispatcher::new(stg.clone(), Arc::new(NoopMailer));
+        dispatcher.tick_once().await.unwrap();
+
+        let all_jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        let sent = all_jobs.iter().filter(|job| job.status == "sent").count();
+        let pending = all_jobs
+            .iter()
+            .filter(|job| job.status == "pending")
+            .count();
+
+        assert_eq!(sent, EMAIL_DISPATCH_BATCH_SIZE as usize);
+        assert_eq!(pending, 3);
     }
 
     #[tokio::test]

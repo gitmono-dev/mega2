@@ -10,7 +10,7 @@
 
 > **集成测试指引**：邮件模块的各项功能（Mailer 启动、Dispatcher 后台处理、Mailpit 验证、retry 机制）应通过 **`integration.md`** 中的 `integration_mail_dispatcher_mailpit` 场景进行端到端验证。
 
-## 事实校准（2026-06）
+## 事实校准（2026-06-18）
 
 > 本文档中的代码引用已对照当前 `src/` 重新核对。特别注意以下与早期 monoengine 移植状态不一致的事实：
 
@@ -22,7 +22,7 @@
 
 2. **`MailConfig` 当前已进入 monoengine 的编译 Config。** 结构位于 `src/config/model.rs`，字段包括 `enabled`、`smtp_host`、`smtp_port`、`username`、兼容期 `password`、推荐的 `password_ref`、`from`、`starttls`；`password` / `password_ref` 互斥，`mail.enabled = true` 时要求 `smtp_host` / `from` 非空。
 
-3. **Notification 系统已接入主 crate，并在 mail 启用时启动 dispatcher**。`src/notification/{dispatcher, triggers, mod}.rs` + callisto 中的 `email_jobs`、`notification_event_types`、`user_notification_settings`、`user_notification_preferences` 等实体存在，触发器逻辑（`on_cl_comment_created` 等，尊重用户偏好）已从 mega 移植；`main.rs:18` 已声明 `mod notification;`，`AppContext::new` 在 vault 之后构造 mailer、创建 `EmailDispatcher` 并 `tokio::spawn`。失败投递已有首个有界 retry + dead-letter 切片；当前仍需补齐并发、观测和更多业务触发器调用面。
+3. **Notification 系统已接入主 crate，并在 mail 启用时启动 dispatcher**。`src/notification/{dispatcher, triggers, mod}.rs` + callisto 中的 `email_jobs`、`notification_event_types`、`user_notification_settings`、`user_notification_preferences` 等实体存在，触发器逻辑（`on_cl_comment_created` 等，尊重用户偏好）已从 mega 移植；`main.rs:18` 已声明 `mod notification;`，`AppContext::new` 在 vault 之后构造 mailer、创建 `EmailDispatcher` 并 `tokio::spawn`。失败投递已有有界 retry + dead-letter，dispatcher tick 已具备固定上限并发发送、结构化汇总日志、stale `sending` job 恢复和批次背压测试；当前仍需补齐真实 SMTP/Mailpit、更多业务触发器调用面和管理面。
 
 4. **Vault 约束对 mail 的决定性影响**：`password_ref` 的真实值读取**必须**发生在 `VaultCore` 就绪之后。当前 `AppContext::new` 顺序为 `Storage::new (DB + object_storage + Buck 校验) → init_connection(redis) → VaultCore::new → 解析 mail.password_ref → SmtpMailer + EmailDispatcher spawn → init_monorepo`。因此 mailer 的**构造时机**是 mail 模块设计的核心约束（详见「运行时注入与晚绑定构造」）。
 
@@ -40,14 +40,14 @@
 | `MailConfig` 结构体 + 纳入 Config | **已激活** | 添加到 `src/config/model.rs`（`Option<MailConfig>`，`#[serde(default)]`），含默认值函数、反序列化测试、兼容期明文 `password` 与推荐 `password_ref`。与 mega 结构兼容（扁平 + 额外 toml 字段被忽略）。 |
 | 一级 `mail` 模块 (`src/mail/`) | **已激活** | `mod mail;` 在 `main.rs` 声明。`src/mail/mod.rs` 包含 `Mailer` trait、`NoopMailer`、`SmtpMailer::new_with_password(...)` + 构建消息 + 发送逻辑 + 单元测试。旧 `src/email/` 降级为纯 re-export shim。 |
 | Notification Dispatcher + 触发器集成 | **已接入编译** | `src/notification/dispatcher.rs` 及测试使用 `crate::mail`。触发器（triggers.rs）使用 NotificationStorage enqueue 逻辑（事件类型、用户偏好过滤）已存在；`main.rs:18` 已声明 `mod notification;`。 |
-| 后台 dispatcher 启动 | **已在 mail 启用时启动** | `AppContext::new` 在 `VaultCore::new` 之后构造 `SmtpMailer`、创建 `EmailDispatcher` 并 `tokio::spawn(dispatcher.run(shutdown))`。SMTP 构造失败现在返回可诊断错误；发送失败会按 backoff 重新排队，并在达到阈值后转为 `failed` dead-letter。当前缺口是并发策略和更完整观测。 |
+| 后台 dispatcher 启动 | **已在 mail 启用时启动** | `AppContext::new` 在 `VaultCore::new` 之后构造 `SmtpMailer`、创建 `EmailDispatcher` 并 `tokio::spawn(dispatcher.run(shutdown))`。SMTP 构造失败现在返回可诊断错误；发送失败会按 backoff 重新排队，并在达到阈值后转为 `failed` dead-letter。`EmailDispatcher` 当前每 tick 先恢复超过 `EMAIL_JOB_SEND_TIMEOUT_SECS = 900` 的 stale `sending` job，再拉取 `EMAIL_DISPATCH_BATCH_SIZE = 50` 条，并以 `EMAIL_DISPATCH_MAX_IN_FLIGHT = 8` 做有界并发发送，tick 结束输出 sent / retry / dead-letter / skipped / claim-missed 等结构化汇总。 |
 | 晚于 Vault 的 mailer 构造 | **已落地** | `SmtpMailer::new` 本身是同步且轻量的，当前调用点在 `context/mod.rs:46-55`，严格晚于 `VaultCore::new`。 |
 | SecretRef / `password_ref` 支持 | **已落地首批** | 当前 `MailConfig.password: Option<SecretString>` 仅为兼容期入口，`password_ref: Option<SecretRef>` 为推荐路径；两者互斥，且 `mail.password_ref` / `config secret mail.password` 只接受 `vault://secret/config/<profile>/mail/password#<field>` namespace。`AppContext::new` 在 vault 就绪后通过 resolver 解析 `password_ref` 并构造 SMTP mailer。 |
 | 多种后端（SES、SendGrid 等） | **未实现** | 仅 SMTP + Noop。mega 体系中也以 SMTP 为主，未来可扩展 provider。 |
 | 模板 / 富文本 / 附件 | **基础 HTML+Text** | `send_html(to, subject, html, text?)` 实现 alternative multipart。无高级模板引擎。 |
 | 与 user_notification_* / 事件类型 的完整联动 | **实体+存储+触发器骨架存在** | callisto 实体 + NotificationStorage 方法 + triggers（cl.comment 等）已移植自 mega，dispatcher 常驻任务、mailer 注入和失败 dead-letter 基线已接入；仍缺更多业务触发器调用面、更完整观测和管理面。 |
 | Profile / 热加载 / 集中校验对 mail 的支持 | **部分实现** | Profile、集中校验和 source warning 已接入 config 管线；热加载当前支持 `mail.enabled` true→false 关停 dispatcher。重新启用 mail、SMTP 参数和凭据变更仍要求重启或后续动态 mailer 重建设计，该边界已有 config reload restart-required 矩阵测试。 |
-| 测试与 CI 覆盖 | **部分实现** | mail 自身有构造/消息验证测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration）；已覆盖 `password_ref` 解析失败脱敏、坏配置不 panic、`mail.enabled` 关停热加载、SMTP 参数/凭据重配只报告需重启，以及失败发送的 retry/dead-letter 基线。仍缺真实 SMTP/Mailpit、背压和更完整死信矩阵。 |
+| 测试与 CI 覆盖 | **部分实现** | mail 自身有构造/消息验证测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration）；已覆盖 `password_ref` 解析失败脱敏、坏配置不 panic、`mail.enabled` 关停热加载、SMTP 参数/凭据重配只报告需重启、失败发送的 retry/dead-letter disposition、dispatcher 有界并发、单 tick 批次背压、stale `sending` 恢复，以及 storage-level 并发 claim 竞争。仍缺真实 SMTP/Mailpit、长时间高水位背压压测和真实多进程 claim 竞争矩阵。 |
 
 **已知加载/启动/安全风险点（必须在相应阶段消除，与 config.md 风险点重叠）**：
 - mailer 或 dispatcher 若被移动到 Storage::new / vault 前路径，会违反 vault 就绪顺序；当前代码位置正确，但需防止后续回归。
@@ -175,7 +175,7 @@ src/mail/
 - 在 `commands/service/http`（或 multi）等 FullAppContext 路径中，在 vault 之后、HTTP 监听之前，检查 `config.mail.as_ref().map(|m| m.enabled).unwrap_or(false)`。
 - 若启用：构造 mailer → 取 NotificationStorage → 注册 reload control → `EmailDispatcher::new_with_control(...)` → spawn task with shutdown token。
 - 优雅关闭：通过 CancellationToken 停止 tick。
-- 多实例注意：outbox + `try_claim_job` 提供基础互斥；生产可加分布式锁或单实例约束。
+- 多实例注意：outbox + `try_claim_job` 提供基础互斥，stale `sending` 恢复可处理 dispatcher 崩溃后遗留的发送中 job；生产仍可按部署形态增加分布式锁、单实例约束或更明确的租约字段。
 
 ### 多环境与 Profile
 
@@ -206,7 +206,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 **阶段 0（已完成）**：激活一级 mail + MailConfig 入 Config + 修复 notification 引用 + 清理 shim。
 
-**阶段 1（已接入，仍需加固）**：在 service 启动路径中 late-construct mailer 并 spawn dispatcher 已落地；构造失败静默忽略已改为可诊断错误；失败发送已具备首个有界 retry + dead-letter 机制。剩余是完善并发、观测和更完整集成测试（使用 Noop 或 test SMTP）。
+**阶段 1（已接入，基线已加固）**：在 service 启动路径中 late-construct mailer 并 spawn dispatcher 已落地；构造失败静默忽略已改为可诊断错误；失败发送已具备有界 retry + dead-letter disposition；dispatcher 已具备每 tick 有界并发发送、结构化汇总日志、stale `sending` 恢复、单 tick 批次背压测试和 storage-level 并发 claim 竞争测试。剩余是完善真实 SMTP/Mailpit 集成、长时间高水位背压验证和真实多进程 claim 竞争矩阵。
 
 **阶段 2（已完成首批）**：与 config SecretRef 基础设施联动。`MailConfig` 已支持 `password_ref`，resolver 解析路径已在 `AppContext::new` 中落地，`config secret set/check` 已支持 mail password 引用。剩余是继续治理兼容期明文 `password` 的退场策略。
 
@@ -221,7 +221,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 | mail 阶段 | 主要工作 | 对 config 的依赖 | 对 vault 的依赖 | 对 notification 的依赖 |
 |----------|--------|------------|-----------|-----------------|
 | **0** (已完成) | MailConfig + 一级模块 | `src/config/model.rs` 包含 MailConfig 字段 | 无 | 无 |
-| **1** (基本完成) | 晚构造 + dispatcher | 构造失败诊断已接入 config 脱敏错误路径 | 无 | 支持通知基础 |
+| **1** (基本完成) | 晚构造 + dispatcher + 并发/观测/恢复基线 | 构造失败诊断已接入 config 脱敏错误路径 | 无 | 支持通知基础，dispatcher 已有有界并发、retry/dead-letter disposition、stale sending 恢复和 claim 竞争测试 |
 | **2** (已完成首批) | password_ref 迁移 | SecretRef + resolver 已落地 | 支持通过 resolver 读取 | notification 可使用 password_ref |
 | **3-5** | Provider + 模板 + 可靠性 | 依赖 config 的 profile、validate、reload 后续增强 | 部分依赖 vault 的完整加固 | 支持后续功能扩展 |
 
@@ -234,7 +234,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 ## 风险与约束
 
 - **构造时机是不可违反的硬约束**。违反即退回“早期依赖”，无法使用 SecretRef。
-- **outbox + claim 模型的并发与重试语义**需与业务仔细评审（重复发送风险 vs 丢失风险）。
+- **outbox + claim 模型的并发与重试语义**需与业务仔细评审（重复发送风险 vs 丢失风险）。当前已用 `try_claim_job` 和 stale `sending` 恢复覆盖基础互斥与崩溃恢复，但真实多进程场景仍需 Mailpit/DB 黑盒矩阵验证。
 - **用户邮箱有效性**：不应在 monoengine 内部做硬校验；由触发器/入队时 best-effort，失败由 dispatcher 记录。
 - **大量邮件导致 DB 压力**：fetch 批次、claim、索引设计需关注（已有 `email_jobs` 表）。
 - **跨项目一致性**：与 mega 的 callisto 实体、NotificationStorage API、事件 code 命名保持兼容，避免分叉。
@@ -261,7 +261,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 通过已完成的激活与后续 config 联动（MailConfig 入 Config、`src/mail/` 成为一级模块、notification 引用修复、`password_ref` 解析和 dispatcher 启动接线），monoengine 已拥有可编译、可测试、可作为“真实后置消费者”的 mail 能力。
 
-后续工作应严格按本计划 + config.md 的阶段划分进行：继续完善 dispatcher 生命周期、并发、观测和更完整死信矩阵；如需支持运行期重新启用或 SMTP/凭据重配，必须先设计动态 mailer 重建与失败回滚语义；最后再持续扩展 provider、模板和运维能力。
+后续工作应严格按本计划 + config.md 的阶段划分进行：继续完善真实 SMTP/Mailpit 集成、长时间高水位背压、真实多进程 claim 竞争和管理面；如需支持运行期重新启用或 SMTP/凭据重配，必须先设计动态 mailer 重建与失败回滚语义；最后再持续扩展 provider、模板和运维能力。
 
 所有 mail 相关的实现、文档、测试、配置示例都必须与 config 模块的拆分、CLI LoadMode、最小 bootstrap、日志脱敏、core_key 加固等前置 gate 保持同步。任何试图在 Storage::new 或 `VaultCore::new` 之前构造带真实凭据 mailer 的尝试都必须被视为架构违规。
 

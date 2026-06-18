@@ -10,6 +10,15 @@ use crate::callisto::{
 };
 
 pub const MAX_EMAIL_RETRY_ATTEMPTS: i32 = 5;
+pub const EMAIL_JOB_SEND_TIMEOUT_SECS: i64 = 15 * 60;
+pub const EMAIL_JOB_STALE_SEND_ERROR: &str = "email send attempt timed out before completion";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailJobFailureDisposition {
+    RetryScheduled,
+    DeadLettered,
+    MissingJob,
+}
 
 #[derive(Clone)]
 pub struct NotificationStorage {
@@ -264,6 +273,26 @@ impl NotificationStorage {
         Ok(res.rows_affected == 1)
     }
 
+    pub async fn requeue_stale_sending_jobs(
+        &self,
+        stale_after: chrono::Duration,
+    ) -> Result<u64, sea_orm::DbErr> {
+        let now = chrono::Utc::now().naive_utc();
+        let stale_before = now - stale_after;
+        let res = email_jobs::Entity::update_many()
+            .col_expr(email_jobs::Column::Status, Expr::value("pending"))
+            .col_expr(
+                email_jobs::Column::ErrorMessage,
+                Expr::value(EMAIL_JOB_STALE_SEND_ERROR),
+            )
+            .col_expr(email_jobs::Column::UpdatedAt, Expr::value(now))
+            .filter(email_jobs::Column::Status.eq("sending"))
+            .filter(email_jobs::Column::UpdatedAt.lte(stale_before))
+            .exec(self.db())
+            .await?;
+        Ok(res.rows_affected)
+    }
+
     pub async fn mark_job_sent(&self, job_id: i64) -> Result<(), sea_orm::DbErr> {
         if let Some(job) = email_jobs::Entity::find_by_id(job_id)
             .one(self.db())
@@ -307,7 +336,7 @@ impl NotificationStorage {
         &self,
         job_id: i64,
         error: &str,
-    ) -> Result<(), sea_orm::DbErr> {
+    ) -> Result<EmailJobFailureDisposition, sea_orm::DbErr> {
         if let Some(job) = email_jobs::Entity::find_by_id(job_id)
             .one(self.db())
             .await?
@@ -316,32 +345,43 @@ impl NotificationStorage {
             let now = chrono::Utc::now().naive_utc();
             let retry = job.retry_count + 1;
 
-            if retry >= MAX_EMAIL_RETRY_ATTEMPTS {
+            let disposition = if retry >= MAX_EMAIL_RETRY_ATTEMPTS {
                 model.status = Set("failed".to_string());
                 model.next_retry_at = Set(None);
+                tracing::warn!(
+                    job_id,
+                    retry_count = retry,
+                    "email job moved to dead-letter status"
+                );
+                EmailJobFailureDisposition::DeadLettered
             } else {
                 let delay_secs = (retry as i64).min(10) * 30;
                 let next = now + chrono::Duration::seconds(delay_secs);
                 model.status = Set("pending".to_string());
                 model.next_retry_at = Set(Some(next));
-            }
+                EmailJobFailureDisposition::RetryScheduled
+            };
 
             model.error_message = Set(Some(error.to_string()));
             model.retry_count = Set(retry);
             model.updated_at = Set(now);
             model.update(self.db()).await?;
+            return Ok(disposition);
         }
-        Ok(())
+        Ok(EmailJobFailureDisposition::MissingJob)
     }
 
     pub async fn mark_job_failed(&self, job_id: i64, error: &str) -> Result<(), sea_orm::DbErr> {
-        self.mark_job_failed_with_retry(job_id, error).await
+        self.mark_job_failed_with_retry(job_id, error)
+            .await
+            .map(|_| ())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use sea_orm::{ActiveModelTrait, Set};
+    use tokio::task::JoinSet;
 
     use super::*;
     use crate::{
@@ -439,10 +479,11 @@ mod tests {
 
         let job_id = jobs[0].id;
 
-        storage
+        let disposition = storage
             .mark_job_failed_with_retry(job_id, "temporary smtp failure")
             .await
             .unwrap();
+        assert_eq!(disposition, EmailJobFailureDisposition::RetryScheduled);
         let retried_job = crate::callisto::email_jobs::Entity::find_by_id(job_id)
             .one(&db)
             .await
@@ -466,6 +507,157 @@ mod tests {
         assert_eq!(job.status, "sent");
         assert!(job.next_retry_at.is_none());
         assert!(job.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_claim_only_allows_one_sender() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job(
+                "alice",
+                "alice@test.com",
+                "test.event",
+                "Hello",
+                "<p>Hello</p>",
+                Some("Hello"),
+            )
+            .await
+            .unwrap();
+        let job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+
+        let mut claims = JoinSet::new();
+        for _ in 0..16 {
+            let storage = storage.clone();
+            claims.spawn(async move { storage.try_claim_job(job_id).await.unwrap() });
+        }
+
+        let mut successful_claims = 0;
+        while let Some(result) = claims.join_next().await {
+            if result.unwrap() {
+                successful_claims += 1;
+            }
+        }
+
+        assert_eq!(successful_claims, 1);
+        let job = email_jobs::Entity::find_by_id(job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "sending");
+        assert!(storage.fetch_pending_jobs(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_sending_jobs_are_requeued_but_fresh_claims_are_left_alone() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job(
+                "alice",
+                "alice@test.com",
+                "test.event",
+                "Stale",
+                "<p>Stale</p>",
+                Some("Stale"),
+            )
+            .await
+            .unwrap();
+        let stale_job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+        assert!(storage.try_claim_job(stale_job_id).await.unwrap());
+        let stale_job = email_jobs::Entity::find_by_id(stale_job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stale_model: email_jobs::ActiveModel = stale_job.into();
+        stale_model.updated_at = Set(chrono::Utc::now().naive_utc()
+            - chrono::Duration::seconds(EMAIL_JOB_SEND_TIMEOUT_SECS + 60));
+        stale_model.update(&db).await.unwrap();
+
+        storage
+            .enqueue_email_job(
+                "bob",
+                "bob@test.com",
+                "test.event",
+                "Fresh",
+                "<p>Fresh</p>",
+                Some("Fresh"),
+            )
+            .await
+            .unwrap();
+        let fresh_job_id = storage
+            .fetch_pending_jobs(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.username == "bob")
+            .unwrap()
+            .id;
+        assert!(storage.try_claim_job(fresh_job_id).await.unwrap());
+
+        let requeued = storage
+            .requeue_stale_sending_jobs(chrono::Duration::seconds(EMAIL_JOB_SEND_TIMEOUT_SECS))
+            .await
+            .unwrap();
+        assert_eq!(requeued, 1);
+
+        let stale_job = email_jobs::Entity::find_by_id(stale_job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_job.status, "pending");
+        assert_eq!(
+            stale_job.error_message.as_deref(),
+            Some(EMAIL_JOB_STALE_SEND_ERROR)
+        );
+
+        let fresh_job = email_jobs::Entity::find_by_id(fresh_job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh_job.status, "sending");
     }
 
     #[tokio::test]
@@ -506,10 +698,11 @@ mod tests {
         let job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
 
         for retry in 1..MAX_EMAIL_RETRY_ATTEMPTS {
-            storage
+            let disposition = storage
                 .mark_job_failed_with_retry(job_id, "smtp unavailable")
                 .await
                 .unwrap();
+            assert_eq!(disposition, EmailJobFailureDisposition::RetryScheduled);
 
             let job = email_jobs::Entity::find_by_id(job_id)
                 .one(&db)
@@ -521,10 +714,11 @@ mod tests {
             assert!(job.next_retry_at.is_some());
         }
 
-        storage
+        let disposition = storage
             .mark_job_failed_with_retry(job_id, "smtp unavailable")
             .await
             .unwrap();
+        assert_eq!(disposition, EmailJobFailureDisposition::DeadLettered);
 
         let job = email_jobs::Entity::find_by_id(job_id)
             .one(&db)
