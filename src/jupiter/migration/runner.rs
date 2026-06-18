@@ -25,8 +25,8 @@ mod tests {
     use super::*;
     use crate::{
         callisto::{
-            email_jobs, notification_event_types, user_notification_preferences,
-            user_notification_settings,
+            email_job_attachments, email_jobs, notification_event_types,
+            user_notification_preferences, user_notification_settings,
         },
         jupiter::tests::test_db_connection,
     };
@@ -60,6 +60,7 @@ mod tests {
             "user_notification_settings",
             "user_notification_preferences",
             "email_jobs",
+            "email_job_attachments",
         ] {
             let stmt = Statement::from_string(
                 DbBackend::Postgres,
@@ -126,7 +127,7 @@ mod tests {
         .await;
         assert!(res.is_err(), "expected FK violation for unknown event type");
 
-        email_jobs::ActiveModel {
+        let email_job = email_jobs::ActiveModel {
             id: Default::default(),
             username: Set("alice".to_owned()),
             to_email: Set("alice@example.com".to_owned()),
@@ -145,6 +146,18 @@ mod tests {
         .insert(&db)
         .await
         .expect("insert email job");
+
+        email_job_attachments::ActiveModel {
+            id: Default::default(),
+            email_job_id: Set(email_job.id),
+            filename: Set("report.txt".to_owned()),
+            content_type: Set("text/plain".to_owned()),
+            content: Set(b"hello".to_vec()),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("insert email job attachment");
 
         let res = email_jobs::ActiveModel {
             id: Default::default(),

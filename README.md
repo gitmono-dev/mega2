@@ -308,7 +308,8 @@ cargo test --test <name>
   `RequirementsState` (`MERGEABLE`/`UNMERGEABLE`).
 - **Notifications** — `notification::triggers` enqueues `email_jobs` rows in
   response to CL events; `notification::dispatcher::EmailDispatcher` polls
-  that queue on a 2s tick, claims jobs atomically, and hands them to the
+  that queue on a 2s tick, claims jobs atomically, loads persisted
+  `email_job_attachments`, and hands them to the
   `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`). Config reload
   can disable a running dispatcher via `mail.enabled = false` and hot-reload
   dispatcher batch/concurrency limits plus retry policy; re-enabling mail or

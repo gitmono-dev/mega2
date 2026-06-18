@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, sea_query::Expr,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait, sea_query::Expr,
 };
 
 use crate::{
     callisto::{
-        email_jobs, notification_event_types, user_notification_preferences,
+        email_job_attachments, email_jobs, notification_event_types, user_notification_preferences,
         user_notification_settings,
     },
     config::{
@@ -75,6 +75,52 @@ pub struct EmailJobListFilter {
     pub status: Option<String>,
     pub username: Option<String>,
     pub event_type_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailJobAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub content: Vec<u8>,
+}
+
+impl EmailJobAttachment {
+    pub fn new(
+        filename: impl Into<String>,
+        content_type: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            filename: filename.into(),
+            content_type: content_type.into(),
+            content: content.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EmailJobEnqueue<'a> {
+    pub username: &'a str,
+    pub to_email: &'a str,
+    pub event_type_code: &'a str,
+    pub subject: &'a str,
+    pub body_html: &'a str,
+    pub body_text: Option<&'a str>,
+    pub attachments: &'a [EmailJobAttachment],
+}
+
+fn validate_email_job_attachment(attachment: &EmailJobAttachment) -> Result<(), sea_orm::DbErr> {
+    if attachment.filename.trim().is_empty() {
+        return Err(sea_orm::DbErr::Custom(
+            "email attachment filename must not be empty".to_string(),
+        ));
+    }
+    if attachment.content_type.trim().is_empty() {
+        return Err(sea_orm::DbErr::Custom(
+            "email attachment content_type must not be empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -335,16 +381,33 @@ impl NotificationStorage {
         body_html: &str,
         body_text: Option<&str>,
     ) -> Result<(), sea_orm::DbErr> {
-        let now = chrono::Utc::now().naive_utc();
+        self.enqueue_email_job_with_attachments(EmailJobEnqueue {
+            username,
+            to_email,
+            event_type_code,
+            subject,
+            body_html,
+            body_text,
+            attachments: &[],
+        })
+        .await
+    }
 
-        email_jobs::ActiveModel {
+    pub async fn enqueue_email_job_with_attachments(
+        &self,
+        input: EmailJobEnqueue<'_>,
+    ) -> Result<(), sea_orm::DbErr> {
+        let now = chrono::Utc::now().naive_utc();
+        let txn = self.db().begin().await?;
+
+        let queued_job = email_jobs::ActiveModel {
             id: Default::default(),
-            username: Set(username.to_string()),
-            to_email: Set(to_email.to_string()),
-            event_type_code: Set(event_type_code.to_string()),
-            subject: Set(subject.to_string()),
-            body_html: Set(body_html.to_string()),
-            body_text: Set(body_text.map(|s| s.to_string())),
+            username: Set(input.username.to_string()),
+            to_email: Set(input.to_email.to_string()),
+            event_type_code: Set(input.event_type_code.to_string()),
+            subject: Set(input.subject.to_string()),
+            body_html: Set(input.body_html.to_string()),
+            body_text: Set(input.body_text.map(|s| s.to_string())),
             status: Set(EMAIL_JOB_STATUS_PENDING.to_string()),
             error_message: Set(None),
             retry_count: Set(0),
@@ -353,10 +416,46 @@ impl NotificationStorage {
             created_at: Set(now),
             updated_at: Set(now),
         }
-        .insert(self.db())
+        .insert(&txn)
         .await?;
 
+        for attachment in input.attachments {
+            validate_email_job_attachment(attachment)?;
+            email_job_attachments::ActiveModel {
+                id: Default::default(),
+                email_job_id: Set(queued_job.id),
+                filename: Set(attachment.filename.clone()),
+                content_type: Set(attachment.content_type.clone()),
+                content: Set(attachment.content.clone()),
+                created_at: Set(now),
+            }
+            .insert(&txn)
+            .await?;
+        }
+
+        txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn list_email_job_attachments(
+        &self,
+        job_id: i64,
+    ) -> Result<Vec<EmailJobAttachment>, sea_orm::DbErr> {
+        email_job_attachments::Entity::find()
+            .filter(email_job_attachments::Column::EmailJobId.eq(job_id))
+            .order_by_asc(email_job_attachments::Column::Id)
+            .all(self.db())
+            .await
+            .map(|attachments| {
+                attachments
+                    .into_iter()
+                    .map(|attachment| EmailJobAttachment {
+                        filename: attachment.filename,
+                        content_type: attachment.content_type,
+                        content: attachment.content,
+                    })
+                    .collect()
+            })
     }
 
     /// Fetch pending email jobs that are ready to be sent
@@ -853,6 +952,64 @@ mod tests {
         assert_eq!(job.status, "sent");
         assert!(job.next_retry_at.is_none());
         assert!(job.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_email_job_with_attachments_persists_attachments() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job_with_attachments(EmailJobEnqueue {
+                username: "alice",
+                to_email: "alice@test.com",
+                event_type_code: "test.event",
+                subject: "Hello",
+                body_html: "<p>Hello</p>",
+                body_text: Some("Hello"),
+                attachments: &[
+                    EmailJobAttachment::new("one.txt", "text/plain", b"one".to_vec()),
+                    EmailJobAttachment::new(
+                        "two.json",
+                        "application/json",
+                        br#"{"ok":true}"#.to_vec(),
+                    ),
+                ],
+            })
+            .await
+            .unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+
+        let attachments = storage
+            .list_email_job_attachments(jobs[0].id)
+            .await
+            .unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].filename, "one.txt");
+        assert_eq!(attachments[0].content_type, "text/plain");
+        assert_eq!(attachments[0].content, b"one");
+        assert_eq!(attachments[1].filename, "two.json");
+        assert_eq!(attachments[1].content_type, "application/json");
+        assert_eq!(attachments[1].content, br#"{"ok":true}"#);
     }
 
     #[tokio::test]

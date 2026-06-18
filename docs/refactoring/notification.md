@@ -324,7 +324,7 @@ Config::new
 | --- | --- |
 | **合理性** | 高。把 notification 提升为一级模块，抽象渠道，严格 late delivery，完美承接 config.md 的引导循环、mail 作为第一 SecretRef 试点，以及 mega 验证过的 outbox + prefs 模型。 |
 | **可行性** | 高。实体、存储逻辑、基本 dispatcher/triggers 代码已存在（从 mega 移植）。主要工作是模块化抽象、启动时机治理、API 表面补齐、与 mail/vault 的联动。受限于 mail 模块和 config 阶段的进度。 |
-| **完整性** | 中。当前覆盖 email outbox + 单个触发器 + 存储业务逻辑，并已有邮件作业管理 API、用户偏好 API 和事件类型管理 API 首批。补强项：多渠道抽象、port mega DTOs/in-app 渠道、可靠性增强、与 config 高级特性的集成（profile、hot reload、validate）。 |
+| **完整性** | 中。当前覆盖 email outbox + outbox 附件持久化 + 单个触发器 + 存储业务逻辑，并已有邮件作业管理 API、用户偏好 API 和事件类型管理 API 首批。补强项：多渠道抽象、port mega DTOs/in-app 渠道、可靠性增强、与 config 高级特性的集成（profile、hot reload、validate）。 |
 | **安全性** | 良好（设计中）。明确晚于 vault 构造、依赖 mail 的 SecretRef 路径、prefs 强制同意、PII 最小化、错误脱敏要求。实现时必须与 vault 加固和日志脱敏前置 gate 同步。 |
 | **功能正确性与接口兼容性** | 良好。Mailer trait + NotificationStorage API 清晰；与 callisto 实体对齐；与 mega 共享模型便于数据迁移。需确保新渠道 trait 不破坏现有 email 路径。 |
 | **数据流与控制流** | 正确。Enqueue（触发器 → Storage）可较早；Delivery（Service + 渠道 + dispatcher）必须 post-vault+mail。claim 提供基础保护。 |

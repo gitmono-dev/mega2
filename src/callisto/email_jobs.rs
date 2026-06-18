@@ -29,6 +29,8 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(has_many = "super::email_job_attachments::Entity")]
+    EmailJobAttachments,
     #[sea_orm(
         belongs_to = "super::notification_event_types::Entity",
         from = "Column::EventTypeCode",
@@ -37,6 +39,12 @@ pub enum Relation {
         on_delete = "Restrict"
     )]
     NotificationEventTypes,
+}
+
+impl Related<super::email_job_attachments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::EmailJobAttachments.def()
+    }
 }
 
 impl Related<super::notification_event_types::Entity> for Entity {

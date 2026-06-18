@@ -25,6 +25,7 @@ pub mod cla_sign_status;
 pub mod commit_auths;
 pub mod custom_reaction;
 pub mod dynamic_sidebar;
+pub mod email_job_attachments;
 pub mod email_jobs;
 pub mod entity_ext;
 pub mod git_blob;

@@ -21,7 +21,7 @@ use crate::{
         EMAIL_JOB_SEND_TIMEOUT_SECS, EmailJobFailureDisposition, EmailJobRetryPolicy,
         NotificationStorage,
     },
-    mail::Mailer,
+    mail::{MailAttachment, Mailer},
 };
 
 pub const EMAIL_DISPATCH_BATCH_SIZE: u64 = DEFAULT_MAIL_DISPATCHER_BATCH_SIZE;
@@ -317,12 +317,26 @@ async fn process_email_job(
         return Ok(EmailJobOutcome::ClaimMissed);
     }
 
+    let attachments = stg
+        .list_email_job_attachments(job.id)
+        .await?
+        .into_iter()
+        .map(|attachment| {
+            MailAttachment::new(
+                attachment.filename,
+                attachment.content_type,
+                attachment.content,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let send_res = mailer
-        .send_html(
+        .send_html_with_attachments(
             &job.to_email,
             &job.subject,
             &job.body_html,
             job.body_text.as_deref(),
+            &attachments,
         )
         .await;
 
@@ -385,7 +399,7 @@ fn retry_policy_from_mail_config(config: &MailConfig) -> EmailJobRetryPolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Mutex, atomic::AtomicUsize};
 
     use async_trait::async_trait;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
@@ -395,7 +409,11 @@ mod tests {
     use crate::{
         callisto::{email_jobs, notification_event_types},
         config::{reload::ConfigHandle, testing::isolated_config},
-        jupiter::{migration::apply_migrations, tests::test_db_connection},
+        jupiter::{
+            migration::apply_migrations,
+            storage::notification_storage::{EmailJobAttachment, EmailJobEnqueue},
+            tests::test_db_connection,
+        },
         mail::NoopMailer,
     };
 
@@ -432,6 +450,36 @@ mod tests {
             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(25)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingAttachmentMailer {
+        attachments: Arc<Mutex<Vec<MailAttachment>>>,
+    }
+
+    #[async_trait]
+    impl Mailer for CapturingAttachmentMailer {
+        async fn send_html(
+            &self,
+            _to: &str,
+            _subject: &str,
+            _html: &str,
+            _text: Option<&str>,
+        ) -> Result<(), MegaError> {
+            Ok(())
+        }
+
+        async fn send_html_with_attachments(
+            &self,
+            _to: &str,
+            _subject: &str,
+            _html: &str,
+            _text: Option<&str>,
+            attachments: &[MailAttachment],
+        ) -> Result<(), MegaError> {
+            *self.attachments.lock().unwrap() = attachments.to_vec();
             Ok(())
         }
     }
@@ -480,6 +528,59 @@ mod tests {
         let sent = email_jobs::Entity::find().all(&db).await.unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].status, "sent");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_sends_persisted_job_attachments() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        stg.enqueue_email_job_with_attachments(EmailJobEnqueue {
+            username: "alice",
+            to_email: "alice@example.com",
+            event_type_code: "cl.comment.created",
+            subject: "Subject",
+            body_html: "<p>Body</p>",
+            body_text: Some("Body"),
+            attachments: &[EmailJobAttachment::new(
+                "report.txt",
+                "text/plain",
+                b"hello".to_vec(),
+            )],
+        })
+        .await
+        .unwrap();
+
+        let mailer = CapturingAttachmentMailer::default();
+        let captured = Arc::clone(&mailer.attachments);
+        let dispatcher = EmailDispatcher::new(stg.clone(), Arc::new(mailer));
+        dispatcher.tick_once().await.unwrap();
+
+        let sent = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].status, "sent");
+
+        let attachments = captured.lock().unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "report.txt");
+        assert_eq!(attachments[0].content_type, "text/plain");
+        assert_eq!(attachments[0].content, b"hello");
     }
 
     #[tokio::test]
