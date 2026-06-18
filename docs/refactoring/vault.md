@@ -197,7 +197,7 @@ sequenceDiagram
 ### 时序中的关键事实
 
 - vault 就绪点是唯一的 `VaultCore::new`（`context/mod.rs:39`）；在它之前已消费 DB、对象存储（`Storage::new` 内 `:206`）、Redis（`:36`）——这正是“启动依赖顺序”把这三类判为引导 / 早期运行时依赖、不能直接改 `SecretRef` 的代码依据。
-- `mail.password` 的消费点（`SmtpMailer::new`，随后 `EmailDispatcher::new` + spawn）在 `context/mod.rs:46-55`，晚于 vault，是第一批可迁移凭据。当前失败路径仍会被 `if let Ok(m)` 静默忽略，需要后续可诊断化。
+- `mail.password` 的消费点（`SmtpMailer::new`，随后 `EmailDispatcher::new` + spawn）在 `context/mod.rs:46-55`，晚于 vault，是第一批可迁移凭据。当前失败路径已改为返回可诊断错误，不再由 `if let Ok(m)` 静默忽略。
 - `init_monorepo` 在 mail/notification dispatcher 启动之后、服务分发之前执行（`context/mod.rs:60-64`）。
 - tracing subscriber 在 `cli.rs:44` 就已安装，早于 vault；因此 `VaultCore::config` 的 `println!`（:71/:83/:93/:103）与 `log::debug!(root_token)`（:114）会真的把 root token / 分片写进 stdout 与日志（详见“当前主要问题 · root token 明文输出”）。
 - 分支 A 的 `delete_all()`（:74）仅凭 `core_key.json` 不存在即触发，无法区分“全新空库首启”与“误删 key 但库内有数据”（详见“fail-closed 判定依据必须区分首次初始化与误删 key”）。
@@ -359,7 +359,7 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 | `redis.url` | `AppContext::new` 中 vault 前连接 Redis | 早期运行时依赖 | 暂时不能进本项目 vault；若含密码应走部署平台 secret 并脱敏日志 |
 | `object_storage.s3.*` | `Storage::new` 中 vault 前构造对象存储 | 早期运行时依赖 | 暂时不能进本项目 vault；需先重构初始化顺序 |
 | `orion_server.db_url` | Orion 相关配置 | 引导或独立服务配置 | 不默认纳入 monoengine vault；按 Orion 启动依赖单独判断 |
-| `mail.password` | `AppContext::new` 中 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher` | 可迁移凭据 | 第一批可改为 `SecretRef`；构造失败需从静默忽略改为可诊断处理 |
+| `mail.password` | `AppContext::new` 中 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher` | 可迁移凭据 | 第一批已改为支持 `SecretRef`；构造失败已从静默忽略改为可诊断处理 |
 | `ssh_server_key` | SSH server 启动时读取或生成 | vault 内部 secret | 已由 vault 管理；读取、生成和写入失败已返回可诊断错误；剩余重点是部署侧 key material 托管 |
 | PGP / Nostr key | `vault/pgp.rs`、`vault/nostr.rs` | vault 内部 secret | 已由 vault 管理；读取、解析、保存和删除主路径已返回 `Result`，缺字段/坏格式不再 panic |
 

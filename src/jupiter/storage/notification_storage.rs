@@ -1,23 +1,56 @@
 use std::sync::Arc;
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, sea_query::Expr,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, sea_query::Expr,
 };
 
-use crate::callisto::{
-    email_jobs, notification_event_types, user_notification_preferences, user_notification_settings,
+use crate::{
+    callisto::{
+        email_jobs, notification_event_types, user_notification_preferences,
+        user_notification_settings,
+    },
+    contract::api::common::Pagination,
 };
 
 pub const MAX_EMAIL_RETRY_ATTEMPTS: i32 = 5;
 pub const EMAIL_JOB_SEND_TIMEOUT_SECS: i64 = 15 * 60;
 pub const EMAIL_JOB_STALE_SEND_ERROR: &str = "email send attempt timed out before completion";
+pub const EMAIL_JOB_STATUS_PENDING: &str = "pending";
+pub const EMAIL_JOB_STATUS_SENDING: &str = "sending";
+pub const EMAIL_JOB_STATUS_SENT: &str = "sent";
+pub const EMAIL_JOB_STATUS_FAILED: &str = "failed";
+pub const EMAIL_JOB_STATUS_SKIPPED: &str = "skipped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmailJobFailureDisposition {
     RetryScheduled,
     DeadLettered,
     MissingJob,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmailJobListFilter {
+    pub status: Option<String>,
+    pub username: Option<String>,
+    pub event_type_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmailJobStats {
+    pub total: u64,
+    pub pending: u64,
+    pub sending: u64,
+    pub sent: u64,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
+#[derive(Debug)]
+pub enum EmailJobRetryDisposition {
+    Queued(Box<email_jobs::Model>),
+    MissingJob,
+    NotRetryable { status: String },
 }
 
 #[derive(Clone)]
@@ -222,7 +255,7 @@ impl NotificationStorage {
             subject: Set(subject.to_string()),
             body_html: Set(body_html.to_string()),
             body_text: Set(body_text.map(|s| s.to_string())),
-            status: Set("pending".to_string()),
+            status: Set(EMAIL_JOB_STATUS_PENDING.to_string()),
             error_message: Set(None),
             retry_count: Set(0),
             next_retry_at: Set(None),
@@ -247,7 +280,7 @@ impl NotificationStorage {
         let now = chrono::Utc::now().naive_utc();
 
         email_jobs::Entity::find()
-            .filter(email_jobs::Column::Status.eq("pending"))
+            .filter(email_jobs::Column::Status.eq(EMAIL_JOB_STATUS_PENDING))
             .filter(
                 Condition::any()
                     .add(email_jobs::Column::NextRetryAt.is_null())
@@ -264,10 +297,13 @@ impl NotificationStorage {
     pub async fn try_claim_job(&self, job_id: i64) -> Result<bool, sea_orm::DbErr> {
         let now = chrono::Utc::now().naive_utc();
         let res = email_jobs::Entity::update_many()
-            .col_expr(email_jobs::Column::Status, Expr::value("sending"))
+            .col_expr(
+                email_jobs::Column::Status,
+                Expr::value(EMAIL_JOB_STATUS_SENDING),
+            )
             .col_expr(email_jobs::Column::UpdatedAt, Expr::value(now))
             .filter(email_jobs::Column::Id.eq(job_id))
-            .filter(email_jobs::Column::Status.eq("pending"))
+            .filter(email_jobs::Column::Status.eq(EMAIL_JOB_STATUS_PENDING))
             .exec(self.db())
             .await?;
         Ok(res.rows_affected == 1)
@@ -280,13 +316,16 @@ impl NotificationStorage {
         let now = chrono::Utc::now().naive_utc();
         let stale_before = now - stale_after;
         let res = email_jobs::Entity::update_many()
-            .col_expr(email_jobs::Column::Status, Expr::value("pending"))
+            .col_expr(
+                email_jobs::Column::Status,
+                Expr::value(EMAIL_JOB_STATUS_PENDING),
+            )
             .col_expr(
                 email_jobs::Column::ErrorMessage,
                 Expr::value(EMAIL_JOB_STALE_SEND_ERROR),
             )
             .col_expr(email_jobs::Column::UpdatedAt, Expr::value(now))
-            .filter(email_jobs::Column::Status.eq("sending"))
+            .filter(email_jobs::Column::Status.eq(EMAIL_JOB_STATUS_SENDING))
             .filter(email_jobs::Column::UpdatedAt.lte(stale_before))
             .exec(self.db())
             .await?;
@@ -301,7 +340,7 @@ impl NotificationStorage {
             let mut model: email_jobs::ActiveModel = job.into();
             let now = chrono::Utc::now().naive_utc();
 
-            model.status = Set("sent".to_string());
+            model.status = Set(EMAIL_JOB_STATUS_SENT.to_string());
             model.error_message = Set(None);
             model.next_retry_at = Set(None);
             model.sent_at = Set(Some(now));
@@ -319,7 +358,7 @@ impl NotificationStorage {
             let mut model: email_jobs::ActiveModel = job.into();
             let now = chrono::Utc::now().naive_utc();
 
-            model.status = Set("skipped".to_string());
+            model.status = Set(EMAIL_JOB_STATUS_SKIPPED.to_string());
             model.error_message = Set(Some(reason.to_string()));
             model.next_retry_at = Set(None);
             model.updated_at = Set(now);
@@ -346,7 +385,7 @@ impl NotificationStorage {
             let retry = job.retry_count + 1;
 
             let disposition = if retry >= MAX_EMAIL_RETRY_ATTEMPTS {
-                model.status = Set("failed".to_string());
+                model.status = Set(EMAIL_JOB_STATUS_FAILED.to_string());
                 model.next_retry_at = Set(None);
                 tracing::warn!(
                     job_id,
@@ -357,7 +396,7 @@ impl NotificationStorage {
             } else {
                 let delay_secs = (retry as i64).min(10) * 30;
                 let next = now + chrono::Duration::seconds(delay_secs);
-                model.status = Set("pending".to_string());
+                model.status = Set(EMAIL_JOB_STATUS_PENDING.to_string());
                 model.next_retry_at = Set(Some(next));
                 EmailJobFailureDisposition::RetryScheduled
             };
@@ -375,6 +414,88 @@ impl NotificationStorage {
         self.mark_job_failed_with_retry(job_id, error)
             .await
             .map(|_| ())
+    }
+
+    pub async fn list_email_jobs(
+        &self,
+        filter: EmailJobListFilter,
+        page: Pagination,
+    ) -> Result<(Vec<email_jobs::Model>, u64), sea_orm::DbErr> {
+        let mut condition = Condition::all();
+
+        if let Some(status) = filter.status {
+            condition = condition.add(email_jobs::Column::Status.eq(status));
+        }
+        if let Some(username) = filter.username {
+            condition = condition.add(email_jobs::Column::Username.eq(username));
+        }
+        if let Some(event_type_code) = filter.event_type_code {
+            condition = condition.add(email_jobs::Column::EventTypeCode.eq(event_type_code));
+        }
+
+        let paginator = email_jobs::Entity::find()
+            .filter(condition)
+            .order_by_desc(email_jobs::Column::CreatedAt)
+            .paginate(self.db(), page.per_page);
+        let total = paginator.num_items().await?;
+        let items = paginator.fetch_page(page.page.saturating_sub(1)).await?;
+        Ok((items, total))
+    }
+
+    pub async fn email_job_stats(&self) -> Result<EmailJobStats, sea_orm::DbErr> {
+        Ok(EmailJobStats {
+            total: email_jobs::Entity::find().count(self.db()).await?,
+            pending: self
+                .count_email_jobs_by_status(EMAIL_JOB_STATUS_PENDING)
+                .await?,
+            sending: self
+                .count_email_jobs_by_status(EMAIL_JOB_STATUS_SENDING)
+                .await?,
+            sent: self
+                .count_email_jobs_by_status(EMAIL_JOB_STATUS_SENT)
+                .await?,
+            failed: self
+                .count_email_jobs_by_status(EMAIL_JOB_STATUS_FAILED)
+                .await?,
+            skipped: self
+                .count_email_jobs_by_status(EMAIL_JOB_STATUS_SKIPPED)
+                .await?,
+        })
+    }
+
+    async fn count_email_jobs_by_status(&self, status: &str) -> Result<u64, sea_orm::DbErr> {
+        email_jobs::Entity::find()
+            .filter(email_jobs::Column::Status.eq(status))
+            .count(self.db())
+            .await
+    }
+
+    pub async fn retry_failed_email_job(
+        &self,
+        job_id: i64,
+    ) -> Result<EmailJobRetryDisposition, sea_orm::DbErr> {
+        let Some(job) = email_jobs::Entity::find_by_id(job_id)
+            .one(self.db())
+            .await?
+        else {
+            return Ok(EmailJobRetryDisposition::MissingJob);
+        };
+
+        if job.status != EMAIL_JOB_STATUS_FAILED {
+            return Ok(EmailJobRetryDisposition::NotRetryable { status: job.status });
+        }
+
+        let mut model: email_jobs::ActiveModel = job.into();
+        let now = chrono::Utc::now().naive_utc();
+        model.status = Set(EMAIL_JOB_STATUS_PENDING.to_string());
+        model.error_message = Set(None);
+        model.retry_count = Set(0);
+        model.next_retry_at = Set(None);
+        model.sent_at = Set(None);
+        model.updated_at = Set(now);
+
+        let queued = model.update(self.db()).await?;
+        Ok(EmailJobRetryDisposition::Queued(Box::new(queued)))
     }
 }
 
@@ -730,5 +851,127 @@ mod tests {
         assert!(job.next_retry_at.is_none());
         assert_eq!(job.error_message.as_deref(), Some("smtp unavailable"));
         assert!(storage.fetch_pending_jobs(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn email_job_management_lists_stats_and_retries_failed_jobs() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job(
+                "alice",
+                "alice@test.com",
+                "test.event",
+                "Failed",
+                "<p>Failed</p>",
+                Some("Failed"),
+            )
+            .await
+            .unwrap();
+        let failed_job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+
+        for _ in 0..MAX_EMAIL_RETRY_ATTEMPTS {
+            storage
+                .mark_job_failed_with_retry(failed_job_id, "smtp unavailable")
+                .await
+                .unwrap();
+        }
+
+        storage
+            .enqueue_email_job(
+                "bob",
+                "bob@test.com",
+                "test.event",
+                "Sent",
+                "<p>Sent</p>",
+                Some("Sent"),
+            )
+            .await
+            .unwrap();
+        let sent_job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+        storage.mark_job_sent(sent_job_id).await.unwrap();
+
+        let stats = storage.email_job_stats().await.unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.sent, 1);
+
+        let (failed_jobs, failed_total) = storage
+            .list_email_jobs(
+                EmailJobListFilter {
+                    status: Some(EMAIL_JOB_STATUS_FAILED.to_string()),
+                    ..Default::default()
+                },
+                Pagination {
+                    page: 1,
+                    per_page: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_total, 1);
+        assert_eq!(failed_jobs.len(), 1);
+        assert_eq!(failed_jobs[0].id, failed_job_id);
+
+        let (bob_jobs, bob_total) = storage
+            .list_email_jobs(
+                EmailJobListFilter {
+                    username: Some("bob".to_string()),
+                    ..Default::default()
+                },
+                Pagination {
+                    page: 1,
+                    per_page: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob_total, 1);
+        assert_eq!(bob_jobs[0].id, sent_job_id);
+
+        match storage.retry_failed_email_job(sent_job_id).await.unwrap() {
+            EmailJobRetryDisposition::NotRetryable { status } => {
+                assert_eq!(status, EMAIL_JOB_STATUS_SENT);
+            }
+            other => panic!("expected non-retryable sent job, got {other:?}"),
+        }
+
+        match storage.retry_failed_email_job(-1).await.unwrap() {
+            EmailJobRetryDisposition::MissingJob => {}
+            other => panic!("expected missing job, got {other:?}"),
+        }
+
+        let retried = storage.retry_failed_email_job(failed_job_id).await.unwrap();
+        let EmailJobRetryDisposition::Queued(job) = retried else {
+            panic!("expected failed job to be requeued, got {retried:?}");
+        };
+        assert_eq!(job.status, EMAIL_JOB_STATUS_PENDING);
+        assert_eq!(job.retry_count, 0);
+        assert!(job.error_message.is_none());
+        assert!(job.next_retry_at.is_none());
+
+        let stats = storage.email_job_stats().await.unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.sent, 1);
     }
 }

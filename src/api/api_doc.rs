@@ -15,6 +15,7 @@ pub const LABEL_TAG: &str = "Label Management";
 pub const CONV_TAG: &str = "Conversation and Comment";
 pub const SYNC_NOTES_STATE_TAG: &str = "sync-notes-state";
 pub const USER_TAG: &str = "User Management";
+pub const MAIL_TAG: &str = "Mail Management";
 pub const REPO_TAG: &str = "Repo creation and synchronisation";
 pub const MERGE_QUEUE_TAG: &str = "Merge Queue Management";
 pub const BUCK_TAG: &str = "Buck Upload API";

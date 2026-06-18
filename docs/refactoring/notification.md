@@ -15,7 +15,7 @@
 > 本文档中的代码引用已对照当前 `src/` 重新核对。需特别注意以下与 mega 上游及早期移植草案不一致的事实，后文据此修正：
 
 1. **Notification 代码已作为活动模块接入主 crate**。`src/notification/{mod.rs, dispatcher.rs, triggers.rs}` 已部分从 mega 移植：
-   - `dispatcher.rs` 实现了 `EmailDispatcher`（依赖 `crate::mail::Mailer` + `NotificationStorage`，处理 `email_jobs` outbox，支持 claim、retry、mark sent/failed/skipped）。
+   - `dispatcher.rs` 实现了 `EmailDispatcher`（依赖 `crate::mail::Mailer` + `NotificationStorage`，处理 `email_jobs` outbox，支持 claim、bounded retry、dead-letter、stale `sending` 恢复、mark sent/failed/skipped 和有界并发 tick）。
    - `triggers.rs` 实现了 `on_cl_comment_created`（使用 NotificationStorage 进行 event type upsert、should_send 过滤、enqueue_email_job）。
    - `mod.rs` 简单 re-export `EmailDispatcher`。
    - `main.rs:18` 已声明 `mod notification;`，`AppContext::new` 在 vault 之后、`init_monorepo` 之前构造 `EmailDispatcher` 并 `tokio::spawn`。触发器是否已被业务代码广泛调用仍需逐条接入。
@@ -33,7 +33,7 @@
 
 5. **触发器和事件注册不完整**。仅 `EVENT_CL_COMMENT_CREATED` 有实现和测试（cl 作者 + reviewers，排除 actor，尊重 prefs）。mega 中有更多事件潜力（issue、pr、@mention、build 结果等），但 monoengine 业务层（ceres）尚未广泛调用这些触发器。事件类型目前靠触发器首次使用时 upsert（非迁移 seeding）。
 
-6. **无用户-facing API 表面（与 mega 差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 的 `src/api/` 中目前未发现对应的 router/handler 实现（chat_migrate 中有 legacy message_notification 数据迁移，但非实时通知系统）。动态侧边栏等 UI 可能期望通知 badge，但后端能力不完整。
+6. **用户偏好 API 仍缺失；管理员邮件作业 API 首批已落地（与 mega 仍有差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 当前已有 admin-only 邮件作业 API，可查询 `email_jobs`、查看状态统计并将 `failed` job 重新排回 `pending`；但尚无用户自助偏好 router/handler（chat_migrate 中有 legacy message_notification 数据迁移，但非实时通知系统）。动态侧边栏等 UI 可能期望通知 badge，但后端能力不完整。
 
 7. **Campsite 相关**：campsite 项目主要是 TS/Next.js monorepo（packages/ui、editor、config 等），包含一些前端通知 UI 组件（如 AvatarNotificationReasonClip）和 slack.ts 配置（可能用于外部通知渠道）。它主要作为用户/认证后端（campsite_api_domain、api_store_backend），为 notification 提供用户邮箱和身份数据，但核心事件驱动 + outbox + 偏好逻辑在 Rust 引擎侧（mega/monoengine 共享的 callisto + jupiter）。未来 slack 渠道可考虑从 campsite 的 slack 集成模式扩展。
 
@@ -46,7 +46,7 @@
 | 能力 / 组件                     | 实现状态          | 关键事实与风险 |
 |--------------------------------|-------------------|---------------|
 | `src/notification/` 作为一级模块 | **已激活** | 有 mod/dispatcher/triggers，`main.rs:18` 已声明 `mod notification;`。触发器仍需继续接入业务关键路径和 API 表面。 |
-| EmailDispatcher + outbox 处理   | **运行时已 spawn（mail 启用时）** | 依赖 `mail::Mailer`，实现 claim/retry/mark 逻辑，tick 每 2s。`AppContext::new` 在 vault 之后构造并 spawn。当前缺口是构造失败静默忽略、退避/并发和生命周期治理。 |
+| EmailDispatcher + outbox 处理   | **运行时已 spawn（mail 启用时），基线已加固** | 依赖 `mail::Mailer`，实现 claim/retry/dead-letter/mark 逻辑，tick 每 2s。`AppContext::new` 在 vault 之后构造并 spawn；构造失败会返回可诊断错误。Dispatcher 已有有界并发、结构化 tick 汇总、stale `sending` 恢复和批次背压测试。当前缺口是真实 SMTP/Mailpit、多实例矩阵、更完整 lifecycle/metrics。 |
 | 触发器（on_cl_comment_created 等） | 部分实现         | 实现了 CL 评论场景（作者+reviewers，prefs 过滤，enqueue）。有单元测试。其他事件（issue、build 等）缺失或仅在 mega 中有原型。 |
 | NotificationStorage（jupiter 层） | 已实现（完整）    | 位于 `src/jupiter/storage/notification_storage.rs`，封装所有实体访问 + should_send 业务逻辑 + email job 生命周期。被 triggers 和 dispatcher 直接使用。 |
 | Callisto 通知实体               | 已完整移植        | email_jobs、notification_event_types、user_notification_settings、user_notification_preferences（及关系）与 mega 一致。 |
@@ -55,10 +55,10 @@
 | 后台任务启动与生命周期          | **已基础接入，需完善** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher。仍需完善 graceful shutdown 协调、失败诊断、退避和多实例语义。 |
 | 多渠道支持（email 之外）        | **仅规划**        | 当前只有 email 渠道（通过 mail）。in-app（可能复用 chat/message 系统）、webhook、slack（参考 campsite slack.ts）等均未设计。 |
 | SecretRef / 渠道凭据            | **仅规划**        | Email 渠道的 password 走 mail 的 SecretRef（config 阶段 5）。未来 slack token 等需类似 vault 集成。 |
-| API 模型与用户设置端点          | 部分（实体层），缺失（API 层） | callisto 实体完整；mega 的 ceres/model/notification.rs DTOs 未在 monoengine api 中实现。无 /user/notification/preferences 等端点。 |
+| API 模型与用户设置端点          | 部分（管理面首批，用户偏好缺失） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry API 已落地。mega 的 ceres/model/notification.rs 用户偏好 DTOs 未在 monoengine api 中实现，仍无 /user/notification/preferences 等端点。 |
 | 与 Config / 全局设置            | 弱集成            | 目前偏好全在 DB per-user。Config 中无 notification 相关全局开关（未来可能有 rate limit、默认 delivery_mode 等）。 |
 | Profile / 热加载 / 集中校验     | **未实现**        | 依赖 config 模块能力。通知事件类型或全局模板可能需要校验。 |
-| 可靠性（重试、DLQ、可观测）     | 基础字段存在      | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 有简单重试，但无 DLQ、指标、tracing 上下文、死信处理。 |
+| 可靠性（重试、DLQ、可观测）     | 基线已加固        | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 已有有界 retry、failed dead-letter、stale `sending` 恢复、有界并发和结构化汇总日志；admin API 可查询/统计/重排 failed job。仍缺指标、tracing 上下文、告警和真实多实例矩阵。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛，与 config.md/mail.md 重叠）**：
 - Dispatcher / mailer 若被移动到 Storage::new 或 `VaultCore::new` 之前，会违反 vault 顺序；当前代码位置正确，但需要防回归。
@@ -236,9 +236,9 @@ Config::new
 - `main.rs` 声明 `mod notification;` 已完成。
 - 在 service 启动路径中，于 vault + mail 就绪后 spawn `EmailDispatcher` 已完成。
 - 剩余：确保触发器在 ceres/api 业务关键路径中被调用（至少 CL 评论）。
-- 剩余：补充基本集成测试（Noop mailer + test DB）。
+- 已补充 Noop mailer + test DB 风格的 dispatcher/storage 基线测试；剩余是 Mailpit/真实 SMTP 与更长时间高水位矩阵。
 - 剩余：依赖 config.md 阶段 0b 的脱敏工具，完善日志脱敏（避免 PII 泄露）
-- 剩余验收：邮件通知作业能从 enqueue 到实际发送（或 Noop）完整走通；日志无凭据泄露；mail 构造失败不再静默忽略。
+- 剩余验收：邮件通知作业能从 enqueue 到真实 SMTP/Mailpit 完整走通；日志无凭据泄露；mail 构造失败保持可诊断。
 
 **阶段 1（渠道抽象与多渠道基础，与 mail 阶段 2 对齐）**：
 - 引入 `NotificationChannel` trait + `EmailChannel` 实现。
@@ -263,11 +263,12 @@ Config::new
 - 验收：所有渠道凭据仅在 vault 就绪后解析；core_key 加固已完成（来自 vault.md 阶段 A）。
 
 **阶段 4（可靠性、扩展性、运维）**：
-- 改进重试策略（指数退避、DLQ 表或状态、告警集成）。
+- 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job。
+- 改进重试策略（指数退避、告警集成）。
 - 添加可观测（发送成功率、延迟、按事件/用户指标；tracing span 携带 event/job id）。
 - 支持模板化（HTML/text 模板，i18n）。
 - 实现 in-app 渠道（可能复用现有 message/notification 表或新建）。
-- 后台任务监控与 admin 接口（查看 pending jobs、重发、统计）。
+- 继续扩展后台任务监控与 admin 接口（清理旧 sent jobs、审计、必要时编辑/重投递安全边界）。
 - 验收：高负载下可靠投递；失败可诊断和手动干预。
 
 **阶段 5（与 config 高级能力对齐 + 长期维护）**：
@@ -320,12 +321,12 @@ Config::new
 | --- | --- |
 | **合理性** | 高。把 notification 提升为一级模块，抽象渠道，严格 late delivery，完美承接 config.md 的引导循环、mail 作为第一 SecretRef 试点，以及 mega 验证过的 outbox + prefs 模型。 |
 | **可行性** | 高。实体、存储逻辑、基本 dispatcher/triggers 代码已存在（从 mega 移植）。主要工作是模块化抽象、启动时机治理、API 表面补齐、与 mail/vault 的联动。受限于 mail 模块和 config 阶段的进度。 |
-| **完整性** | 中。当前覆盖 email outbox + 单个触发器 + 存储业务逻辑。补强项：多渠道抽象、完整用户/管理 API（port mega DTOs）、in-app 渠道、可靠性增强、与 config 高级特性的集成（profile、hot reload、validate）。 |
+| **完整性** | 中。当前覆盖 email outbox + 单个触发器 + 存储业务逻辑，并已有邮件作业管理 API 基线。补强项：多渠道抽象、完整用户偏好 API（port mega DTOs）、in-app 渠道、可靠性增强、与 config 高级特性的集成（profile、hot reload、validate）。 |
 | **安全性** | 良好（设计中）。明确晚于 vault 构造、依赖 mail 的 SecretRef 路径、prefs 强制同意、PII 最小化、错误脱敏要求。实现时必须与 vault 加固和日志脱敏前置 gate 同步。 |
 | **功能正确性与接口兼容性** | 良好。Mailer trait + NotificationStorage API 清晰；与 callisto 实体对齐；与 mega 共享模型便于数据迁移。需确保新渠道 trait 不破坏现有 email 路径。 |
 | **数据流与控制流** | 正确。Enqueue（触发器 → Storage）可较早；Delivery（Service + 渠道 + dispatcher）必须 post-vault+mail。claim 提供基础保护。 |
 | **性能与效率** | 可接受。Outbox 解耦 I/O；批次 fetch + claim 控制并发。未来需关注大量 pending job 时的背压和 DB 负载。 |
-| **可靠性与容错** | 基础存在，需显著改进。字段支持 retry；但缺少 DLQ、告警、精确重试策略、分布式锁（多实例）。Dispatcher 失败不应导致通知永久丢失。 |
+| **可靠性与容错** | 基线已加固，仍需继续改进。字段支持 retry；dispatcher 已有 dead-letter、stale `sending` 恢复和 bounded concurrency，但仍缺告警、精确重试策略、分布式锁/租约（多实例）和真实 SMTP/Mailpit 矩阵。Dispatcher 失败不应导致通知永久丢失。 |
 | **兼容性与互操作** | 良好。与 mega 实体/存储兼容；campsite 作为用户源和潜在 slack 渠道提供方；Config 管道复用。 |
 | **可扩展性与可维护性** | 良好。一级模块 + 渠道 trait + Service 抽象为新增事件/渠道留出空间。把存储细节隐藏在 jupiter 后，notification 模块专注策略和协调。 |
 | **合规性与标准符合性** | 良好。Outbox + 用户同意模型、SecretRef 路径、对 PII 的处理要求，符合现代事件通知与隐私最佳实践。未来 slack 等外部渠道需额外合规评审。 |
