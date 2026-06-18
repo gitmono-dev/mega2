@@ -11,6 +11,7 @@ pub struct Model {
     pub email: String,
     pub enabled: bool,
     pub delivery_mode: String,
+    pub preferred_locale: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }

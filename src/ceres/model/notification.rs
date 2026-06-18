@@ -21,6 +21,7 @@ pub struct UserNotificationConfig {
     pub enabled: bool,
     pub delivery_mode: String,
     pub email: String,
+    pub preferred_locale: Option<String>,
     pub preferences: Vec<UserNotificationPreferenceItem>,
 }
 
@@ -28,5 +29,6 @@ pub struct UserNotificationConfig {
 pub struct UpdateUserNotificationConfig {
     pub enabled: Option<bool>,
     pub delivery_mode: Option<String>,
+    pub preferred_locale: Option<String>,
     pub preferences: Option<Vec<UserNotificationPreferenceItem>>,
 }

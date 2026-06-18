@@ -190,6 +190,7 @@ impl NotificationStorage {
                 email: Set(email.to_string()),
                 enabled: Set(true),
                 delivery_mode: Set("realtime".to_string()),
+                preferred_locale: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -197,6 +198,20 @@ impl NotificationStorage {
             .await?;
         }
 
+        Ok(())
+    }
+
+    pub async fn set_preferred_locale(
+        &self,
+        username: &str,
+        preferred_locale: Option<&str>,
+    ) -> Result<(), sea_orm::DbErr> {
+        if let Some(existing) = self.get_user_settings(username).await? {
+            let mut model: user_notification_settings::ActiveModel = existing.into();
+            model.preferred_locale = Set(preferred_locale.map(str::to_string));
+            model.updated_at = Set(chrono::Utc::now().naive_utc());
+            model.update(self.db()).await?;
+        }
         Ok(())
     }
 
@@ -711,6 +726,56 @@ mod tests {
             .unwrap();
 
         assert!(!storage.should_send("alice", "test.event").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_settings_preferred_locale_can_be_updated_and_cleared() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        storage
+            .upsert_user_settings("alice", "alice@test.com")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_user_settings("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .preferred_locale,
+            None
+        );
+
+        storage
+            .set_preferred_locale("alice", Some("zh-CN"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_user_settings("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .preferred_locale
+                .as_deref(),
+            Some("zh-CN")
+        );
+
+        storage.set_preferred_locale("alice", None).await.unwrap();
+        assert_eq!(
+            storage
+                .get_user_settings("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .preferred_locale,
+            None
+        );
     }
 
     #[tokio::test]

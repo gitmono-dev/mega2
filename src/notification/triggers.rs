@@ -22,14 +22,27 @@ const CL_COMMENT_CREATED_MAIL_TEMPLATE: MailTemplate<'static> = MailTemplate::ne
     Some("{{actor_username}} commented on {{cl_link}}: {{comment_text}}"),
 );
 
+const CL_COMMENT_CREATED_MAIL_TEMPLATE_ZH_CN: MailTemplate<'static> = MailTemplate::new(
+    "CL {{cl_link}} 有新评论",
+    "<p><b>{{actor_username}}</b> 评论了 <b>{{cl_link}}</b>：</p><p>{{comment_text}}</p>",
+    Some("{{actor_username}} 评论了 {{cl_link}}：{{comment_text}}"),
+);
+
 const NOTIFICATION_MAIL_TEMPLATE_REGISTRY: MailTemplateRegistry<'static> =
     MailTemplateRegistry::new(
         DEFAULT_MAIL_LOCALE,
-        &[LocalizedMailTemplate::new(
-            CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
-            DEFAULT_MAIL_LOCALE,
-            CL_COMMENT_CREATED_MAIL_TEMPLATE,
-        )],
+        &[
+            LocalizedMailTemplate::new(
+                CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+                DEFAULT_MAIL_LOCALE,
+                CL_COMMENT_CREATED_MAIL_TEMPLATE,
+            ),
+            LocalizedMailTemplate::new(
+                CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+                "zh-CN",
+                CL_COMMENT_CREATED_MAIL_TEMPLATE_ZH_CN,
+            ),
+        ],
     );
 
 /// Ensure the core event types exist in DB
@@ -80,16 +93,6 @@ pub async fn on_cl_comment_created(
     }
     recipients.remove(actor_username);
 
-    let mail = NOTIFICATION_MAIL_TEMPLATE_REGISTRY.render(
-        CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
-        None,
-        &[
-            ("actor_username", actor_username),
-            ("cl_link", cl_link),
-            ("comment_text", comment_text),
-        ],
-    )?;
-
     for username in recipients {
         // should_send returns false if user settings are missing or globally disabled
         if !notif_stg
@@ -103,6 +106,16 @@ pub async fn on_cl_comment_created(
             Some(s) => s,
             None => continue,
         };
+
+        let mail = NOTIFICATION_MAIL_TEMPLATE_REGISTRY.render(
+            CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+            settings.preferred_locale.as_deref(),
+            &[
+                ("actor_username", actor_username),
+                ("cl_link", cl_link),
+                ("comment_text", comment_text),
+            ],
+        )?;
 
         notif_stg
             .enqueue_email_job(
@@ -191,6 +204,10 @@ mod tests {
             .await
             .unwrap();
         notif
+            .set_preferred_locale("bob", Some("zh-CN"))
+            .await
+            .unwrap();
+        notif
             .upsert_user_settings("carol", "carol@example.com")
             .await
             .unwrap();
@@ -208,14 +225,20 @@ mod tests {
             .one(&db)
             .await
             .unwrap();
-        assert!(alice_job.is_some());
+        let alice_job = alice_job.unwrap();
+        assert_eq!(alice_job.subject, "New comment on CL CL1");
 
         let bob_job = email_jobs::Entity::find()
             .filter(email_jobs::Column::Username.eq("bob"))
             .one(&db)
             .await
             .unwrap();
-        assert!(bob_job.is_some());
+        let bob_job = bob_job.unwrap();
+        assert_eq!(bob_job.subject, "CL CL1 有新评论");
+        assert_eq!(
+            bob_job.body_text.as_deref(),
+            Some("carol 评论了 CL1：hello")
+        );
     }
 
     #[tokio::test]

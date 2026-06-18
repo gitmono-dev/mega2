@@ -313,7 +313,7 @@ cargo test --test <name>
   can disable a running dispatcher via `mail.enabled = false` and hot-reload
   dispatcher batch/concurrency limits plus retry policy; re-enabling mail or
   changing SMTP settings still requires restart. Users can inspect and update
-  notification settings and per-event preferences under
+  notification settings, preferred locale, and per-event preferences under
   `/user/notification/preferences`; admins can manage notification event
   types under `/admin/notification-event-types` and prune old terminal outbox
   jobs under `/admin/email-jobs/prune`.

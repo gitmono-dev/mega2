@@ -96,6 +96,7 @@ mod tests {
             email: Set("alice@example.com".to_owned()),
             enabled: Set(true),
             delivery_mode: Set("realtime".to_owned()),
+            preferred_locale: Set(Some("en-US".to_owned())),
             created_at: Set(now),
             updated_at: Set(now),
         }

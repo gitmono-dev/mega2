@@ -60,6 +60,7 @@ pub struct UserNotificationSettingsResponse {
     pub email: Option<String>,
     pub enabled: bool,
     pub delivery_mode: Option<String>,
+    pub preferred_locale: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -283,6 +284,10 @@ async fn update_notification_preferences(
         .delivery_mode
         .map(|delivery_mode| validate_notification_delivery_mode(&delivery_mode))
         .transpose()?;
+    let preferred_locale = payload
+        .preferred_locale
+        .map(|preferred_locale| normalize_notification_preferred_locale(&preferred_locale))
+        .transpose()?;
     let preferences = payload
         .preferences
         .map(normalize_notification_preferences)
@@ -308,6 +313,11 @@ async fn update_notification_preferences(
     if let Some(delivery_mode) = delivery_mode {
         notification_storage
             .set_delivery_mode(&user.username, &delivery_mode)
+            .await?;
+    }
+    if let Some(preferred_locale) = preferred_locale {
+        notification_storage
+            .set_preferred_locale(&user.username, preferred_locale.as_deref())
             .await?;
     }
     if let Some(preferences) = preferences {
@@ -495,6 +505,7 @@ fn build_notification_settings_response(
             email: Some(settings.email.clone()),
             enabled: settings.enabled,
             delivery_mode: Some(settings.delivery_mode.clone()),
+            preferred_locale: settings.preferred_locale.clone(),
             created_at: Some(settings.created_at.to_string()),
             updated_at: Some(settings.updated_at.to_string()),
         },
@@ -503,6 +514,7 @@ fn build_notification_settings_response(
             email: None,
             enabled: false,
             delivery_mode: None,
+            preferred_locale: None,
             created_at: None,
             updated_at: None,
         },
@@ -562,6 +574,25 @@ fn validate_notification_delivery_mode(delivery_mode: &str) -> Result<String, Ap
     }
 }
 
+fn normalize_notification_preferred_locale(locale: &str) -> Result<Option<String>, ApiError> {
+    let locale = locale.trim();
+    if locale.is_empty() {
+        return Ok(None);
+    }
+    if locale.len() > 32
+        || locale.starts_with('-')
+        || locale.ends_with('-')
+        || locale
+            .split('-')
+            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_alphanumeric()))
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "preferred_locale must be a BCP 47-like language tag up to 32 ASCII characters"
+        )));
+    }
+    Ok(Some(locale.to_string()))
+}
+
 fn normalize_notification_preferences(
     preferences: Vec<UserNotificationPreferenceItem>,
 ) -> Result<Vec<UserNotificationPreferenceItem>, ApiError> {
@@ -603,6 +634,7 @@ mod tests {
                 email: "alice@example.com".to_string(),
                 enabled: true,
                 delivery_mode: "realtime".to_string(),
+                preferred_locale: Some("zh-CN".to_string()),
                 created_at: now,
                 updated_at: now,
             }),
@@ -639,6 +671,7 @@ mod tests {
             response.settings.email.as_deref(),
             Some("alice@example.com")
         );
+        assert_eq!(response.settings.preferred_locale.as_deref(), Some("zh-CN"));
         assert_eq!(response.preferences.len(), 2);
         assert_eq!(response.preferences[0].event_type_code, "a.event");
         assert_eq!(response.preferences[0].explicit_enabled, None);
@@ -668,6 +701,7 @@ mod tests {
 
         assert!(!response.settings.enabled);
         assert_eq!(response.settings.email, None);
+        assert_eq!(response.settings.preferred_locale, None);
         assert!(!response.preferences[0].enabled);
     }
 
@@ -687,6 +721,19 @@ mod tests {
             "realtime"
         );
         assert!(validate_notification_delivery_mode("digest").is_err());
+    }
+
+    #[test]
+    fn normalize_notification_preferred_locale_trims_clears_and_validates() {
+        assert_eq!(
+            normalize_notification_preferred_locale(" zh-CN ")
+                .unwrap()
+                .as_deref(),
+            Some("zh-CN")
+        );
+        assert_eq!(normalize_notification_preferred_locale(" ").unwrap(), None);
+        assert!(normalize_notification_preferred_locale("-zh").is_err());
+        assert!(normalize_notification_preferred_locale("zh_CN").is_err());
     }
 
     #[test]
