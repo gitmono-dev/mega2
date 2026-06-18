@@ -9,8 +9,15 @@ use crate::{
         cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage,
         notification_storage::NotificationStorage,
     },
+    mail::template::MailTemplate,
 };
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
+
+const CL_COMMENT_CREATED_MAIL_TEMPLATE: MailTemplate<'static> = MailTemplate::new(
+    "New comment on CL {{cl_link}}",
+    "<p><b>{{actor_username}}</b> commented on <b>{{cl_link}}</b>:</p><p>{{comment_text}}</p>",
+    Some("{{actor_username}} commented on {{cl_link}}: {{comment_text}}"),
+);
 
 /// Ensure the core event types exist in DB
 ///
@@ -39,15 +46,6 @@ async fn ensure_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaE
     .await?;
 
     Ok(())
-}
-
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 /// Trigger: a new comment is created on a Change List
@@ -81,6 +79,12 @@ pub async fn on_cl_comment_created(
     }
     recipients.remove(actor_username);
 
+    let mail = CL_COMMENT_CREATED_MAIL_TEMPLATE.render(&[
+        ("actor_username", actor_username),
+        ("cl_link", cl_link),
+        ("comment_text", comment_text),
+    ])?;
+
     for username in recipients {
         // should_send returns false if user settings are missing or globally disabled
         if !notif_stg
@@ -95,26 +99,14 @@ pub async fn on_cl_comment_created(
             None => continue,
         };
 
-        let subject = format!("New comment on CL {}", cl_link);
-        let body_text = format!(
-            "{} commented on {}: {}",
-            actor_username, cl_link, comment_text
-        );
-        let body_html = format!(
-            "<p><b>{}</b> commented on <b>{}</b>:</p><p>{}</p>",
-            actor_username,
-            cl_link,
-            escape_html(comment_text)
-        );
-
         notif_stg
             .enqueue_email_job(
                 &username,
                 &settings.email,
                 EVENT_CL_COMMENT_CREATED,
-                &subject,
-                &body_html,
-                Some(&body_text),
+                &mail.subject,
+                &mail.html,
+                mail.text.as_deref(),
             )
             .await?;
     }
@@ -219,6 +211,71 @@ mod tests {
             .await
             .unwrap();
         assert!(bob_job.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_on_cl_comment_created_renders_mail_template_with_html_escaping() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let base = BaseStorage::new(Arc::new(db.clone()));
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        let cl_stg = ClStorage { base: base.clone() };
+        let reviewer_stg = ClReviewerStorage { base: base.clone() };
+        let now = chrono::Utc::now().naive_utc();
+
+        mega_cl::ActiveModel {
+            id: Set(1),
+            link: Set("CL-template".to_string()),
+            title: Set("t".to_string()),
+            merge_date: Set(None),
+            status: Set(crate::callisto::sea_orm_active_enums::MergeStatusEnum::Open),
+            path: Set("/".to_string()),
+            from_hash: Set("a".to_string()),
+            to_hash: Set("b".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            username: Set("alice".to_string()),
+            base_branch: Set("main".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        notif
+            .upsert_user_settings("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        on_cl_comment_created(
+            &notif,
+            &cl_stg,
+            &reviewer_stg,
+            "bob",
+            "CL-template",
+            r#"<script>alert("x")</script> & done"#,
+        )
+        .await
+        .unwrap();
+
+        let job = email_jobs::Entity::find()
+            .filter(email_jobs::Column::Username.eq("alice"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(job.subject, "New comment on CL CL-template");
+        assert!(
+            job.body_html
+                .contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; done")
+        );
+        assert!(!job.body_html.contains(r#"<script>alert("x")</script>"#));
+        assert_eq!(
+            job.body_text.as_deref(),
+            Some(r#"bob commented on CL-template: <script>alert("x")</script> & done"#)
+        );
     }
 
     #[tokio::test]

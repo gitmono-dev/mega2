@@ -47,7 +47,7 @@
 |--------------------------------|-------------------|---------------|
 | `src/notification/` 作为一级模块 | **已激活** | 有 mod/dispatcher/triggers，`main.rs:18` 已声明 `mod notification;`。触发器仍需继续接入业务关键路径和 API 表面。 |
 | EmailDispatcher + outbox 处理   | **运行时已 spawn（mail 启用时），基线已加固** | 依赖 `mail::Mailer`，实现 claim/retry/dead-letter/mark 逻辑，tick 每 2s。`AppContext::new` 在 vault 之后构造并 spawn；构造失败会返回可诊断错误。Dispatcher 已有有界并发、结构化 tick 汇总、stale `sending` 恢复和批次背压测试。当前缺口是真实 SMTP/Mailpit、多实例矩阵、更完整 lifecycle/metrics。 |
-| 触发器（on_cl_comment_created 等） | 部分实现         | 实现了 CL 评论场景（作者+reviewers，prefs 过滤，enqueue）。有单元测试。其他事件（issue、build 等）缺失或仅在 mega 中有原型。 |
+| 触发器（on_cl_comment_created 等） | 部分实现         | 实现了 CL 评论场景（作者+reviewers，prefs 过滤，enqueue），邮件内容通过 `mail::template::MailTemplate` 渲染并默认转义 HTML 变量。有单元测试。其他事件（issue、build 等）缺失或仅在 mega 中有原型。 |
 | NotificationStorage（jupiter 层） | 已实现（完整）    | 位于 `src/jupiter/storage/notification_storage.rs`，封装所有实体访问 + should_send 业务逻辑 + email job 生命周期。被 triggers 和 dispatcher 直接使用。 |
 | Callisto 通知实体               | 已完整移植        | email_jobs、notification_event_types、user_notification_settings、user_notification_preferences（及关系）与 mega 一致。 |
 | 用户偏好与事件类型管理          | 存储层存在，API 表面缺失 | 支持 upsert、should_send、list prefs 等。缺少用户自助配置 API（mega 有 DTOs 和对应 handler）。事件类型靠首次使用 upsert。 |
@@ -264,9 +264,10 @@ Config::new
 
 **阶段 4（可靠性、扩展性、运维）**：
 - 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job。
+- 已完成基础邮件模板：CL 评论通知通过 `MailTemplate` 渲染 subject/html/text。
 - 改进重试策略（指数退避、告警集成）。
 - 添加可观测（发送成功率、延迟、按事件/用户指标；tracing span 携带 event/job id）。
-- 支持模板化（HTML/text 模板，i18n）。
+- 继续扩展模板化（i18n、模板 registry、更多事件模板）。
 - 实现 in-app 渠道（可能复用现有 message/notification 表或新建）。
 - 继续扩展后台任务监控与 admin 接口（清理旧 sent jobs、审计、必要时编辑/重投递安全边界）。
 - 验收：高负载下可靠投递；失败可诊断和手动干预。

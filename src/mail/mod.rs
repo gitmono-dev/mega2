@@ -36,6 +36,8 @@ use lettre::{
 
 use crate::{common::errors::MegaError, config::MailConfig};
 
+pub mod template;
+
 #[async_trait]
 pub trait Mailer: Send + Sync {
     async fn send_html(
