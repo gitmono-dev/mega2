@@ -431,7 +431,7 @@ mod tests {
     use super::*;
     use crate::config::{
         MailConfig,
-        testing::{TestSecretResolver, env_lock},
+        testing::{TestSecretResolver, env_lock, isolated_config},
         validate::collect_source_diagnostics_from_keys,
     };
 
@@ -522,21 +522,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn validate_rejects_mail_password_and_password_ref_together() {
-        let config = Config {
-            mail: Some(MailConfig {
-                enabled: false,
-                smtp_host: "smtp.example.com".to_string(),
-                smtp_port: 587,
-                username: None,
-                password: Some(crate::config::secret::SecretString::new("plain")),
-                password_ref: Some(
-                    SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
-                ),
-                from: "no-reply@example.com".to_string(),
-                starttls: true,
-            }),
-            ..Config::mock()
-        };
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(MailConfig {
+            enabled: false,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: Some(crate::config::secret::SecretString::new("plain")),
+            password_ref: Some(
+                SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
+            ),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        });
 
         let err = validate_config(&config, None, None, false, false, false)
             .await
@@ -556,7 +555,7 @@ mod tests {
             "#,
         )
         .expect("write config source");
-        let config = Config::mock();
+        let config = isolated_config(temp_dir.path().join("base"));
 
         validate_config(&config, Some(&config_path), None, false, false, false)
             .await
@@ -585,7 +584,7 @@ mod tests {
             ),
         )
         .expect("write config source");
-        let config = Config::mock();
+        let config = isolated_config(temp_dir.path().join("base"));
 
         let err = validate_config(&config, Some(&config_path), None, false, true, false)
             .await
@@ -650,21 +649,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
         let secret_ref =
             SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
-        let config = Config {
-            mail: Some(MailConfig {
-                enabled: false,
-                smtp_host: "smtp.example.com".to_string(),
-                smtp_port: 587,
-                username: None,
-                password: None,
-                password_ref: Some(secret_ref),
-                from: "no-reply@example.com".to_string(),
-                starttls: true,
-            }),
-            ..Config::mock()
-        };
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(MailConfig {
+            enabled: false,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: Some(secret_ref),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        });
         let resolver = TestSecretResolver::new();
 
         let err = resolve_config_secrets(&config, &resolver)
