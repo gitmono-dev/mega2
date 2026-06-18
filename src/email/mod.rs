@@ -10,4 +10,4 @@
 //! with Config + future SecretRef (password), the notification outbox, and
 //! the phased plan.
 
-pub use crate::mail::{Mailer, NoopMailer, SmtpMailer};
+pub use crate::mail::{MailAttachment, Mailer, NoopMailer, SmtpMailer};

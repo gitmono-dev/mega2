@@ -32,7 +32,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{MultiPart, SinglePart, header::ContentType},
+    message::{Attachment, MultiPart, SinglePart, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
 
@@ -43,6 +43,27 @@ use crate::{
 
 pub mod template;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub content: Vec<u8>,
+}
+
+impl MailAttachment {
+    pub fn new(
+        filename: impl Into<String>,
+        content_type: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            filename: filename.into(),
+            content_type: content_type.into(),
+            content: content.into(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait Mailer: Send + Sync {
     async fn send_html(
@@ -52,6 +73,23 @@ pub trait Mailer: Send + Sync {
         html: &str,
         text: Option<&str>,
     ) -> Result<(), MegaError>;
+
+    async fn send_html_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: Option<&str>,
+        attachments: &[MailAttachment],
+    ) -> Result<(), MegaError> {
+        if attachments.is_empty() {
+            return self.send_html(to, subject, html, text).await;
+        }
+
+        Err(MegaError::Other(
+            "mailer implementation does not support attachments".to_string(),
+        ))
+    }
 }
 
 pub struct NoopMailer;
@@ -64,6 +102,17 @@ impl Mailer for NoopMailer {
         _subject: &str,
         _html: &str,
         _text: Option<&str>,
+    ) -> Result<(), MegaError> {
+        Ok(())
+    }
+
+    async fn send_html_with_attachments(
+        &self,
+        _to: &str,
+        _subject: &str,
+        _html: &str,
+        _text: Option<&str>,
+        _attachments: &[MailAttachment],
     ) -> Result<(), MegaError> {
         Ok(())
     }
@@ -103,6 +152,32 @@ impl Mailer for ConsoleMailer {
             html_len = html.len(),
             text_len = text.map(str::len).unwrap_or_default(),
             "console mailer accepted email"
+        );
+
+        Ok(())
+    }
+
+    async fn send_html_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: Option<&str>,
+        attachments: &[MailAttachment],
+    ) -> Result<(), MegaError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        tracing::info!(
+            from = %self.from,
+            to = %to,
+            subject = %subject,
+            html_len = html.len(),
+            text_len = text.map(str::len).unwrap_or_default(),
+            attachment_count = attachments.len(),
+            attachment_bytes = attachments.iter().map(|attachment| attachment.content.len()).sum::<usize>(),
+            "console mailer accepted email with attachments"
         );
 
         Ok(())
@@ -170,6 +245,17 @@ impl SmtpMailer {
         html: &str,
         text: Option<&str>,
     ) -> Result<Message, MegaError> {
+        self.build_message_with_attachments(to, subject, html, text, &[])
+    }
+
+    fn build_message_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: Option<&str>,
+        attachments: &[MailAttachment],
+    ) -> Result<Message, MegaError> {
         let from = self
             .from
             .parse()
@@ -178,19 +264,26 @@ impl SmtpMailer {
             .parse()
             .map_err(|e| MegaError::Other(format!("invalid to email: {e}")))?;
 
-        let html_part = SinglePart::builder()
-            .header(ContentType::TEXT_HTML)
-            .body(html.to_string());
-
-        let multipart = if let Some(text) = text {
-            let text_part = SinglePart::builder()
-                .header(ContentType::TEXT_PLAIN)
-                .body(text.to_string());
-            MultiPart::alternative()
-                .singlepart(text_part)
-                .singlepart(html_part)
+        let multipart = if attachments.is_empty() {
+            html_body_part(html, text)
         } else {
-            MultiPart::alternative().singlepart(html_part)
+            let mut multipart = MultiPart::mixed().multipart(html_body_part(html, text));
+            for attachment in attachments {
+                if attachment.filename.trim().is_empty() {
+                    return Err(MegaError::Other(
+                        "mail attachment filename must not be empty".to_string(),
+                    ));
+                }
+
+                let content_type = ContentType::parse(&attachment.content_type).map_err(|e| {
+                    MegaError::Other(format!("mail attachment content type is invalid: {e}"))
+                })?;
+                multipart = multipart.singlepart(
+                    Attachment::new(attachment.filename.clone())
+                        .body(attachment.content.clone(), content_type),
+                );
+            }
+            multipart
         };
 
         Message::builder()
@@ -199,6 +292,23 @@ impl SmtpMailer {
             .subject(subject)
             .multipart(multipart)
             .map_err(|e| MegaError::Other(format!("build email message error: {e}")))
+    }
+}
+
+fn html_body_part(html: &str, text: Option<&str>) -> MultiPart {
+    let html_part = SinglePart::builder()
+        .header(ContentType::TEXT_HTML)
+        .body(html.to_string());
+
+    if let Some(text) = text {
+        let text_part = SinglePart::builder()
+            .header(ContentType::TEXT_PLAIN)
+            .body(text.to_string());
+        MultiPart::alternative()
+            .singlepart(text_part)
+            .singlepart(html_part)
+    } else {
+        MultiPart::alternative().singlepart(html_part)
     }
 }
 
@@ -220,6 +330,30 @@ impl Mailer for SmtpMailer {
             .ok_or_else(|| MegaError::Other("smtp transport missing while enabled".to_string()))?;
 
         let msg = self.build_message(to, subject, html, text)?;
+        transport
+            .send(msg)
+            .await
+            .map(|_| ())
+            .map_err(|e| MegaError::Other(format!("smtp send error: {e}")))
+    }
+
+    async fn send_html_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: Option<&str>,
+        attachments: &[MailAttachment],
+    ) -> Result<(), MegaError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| MegaError::Other("smtp transport missing while enabled".to_string()))?;
+
+        let msg = self.build_message_with_attachments(to, subject, html, text, attachments)?;
         transport
             .send(msg)
             .await
@@ -319,6 +453,69 @@ mod tests {
             .build_message("not-an-email", "Subj", "<p>Hi</p>", None)
             .expect_err("should fail");
         let _ = format!("{err:?}");
+    }
+
+    #[test]
+    fn test_build_message_with_attachments_uses_mixed_multipart() {
+        let cfg = MailConfig {
+            enabled: false,
+            provider: MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        };
+        let mailer = SmtpMailer::new(&cfg).unwrap();
+        let attachment = MailAttachment::new("report.txt", "text/plain", "hello");
+
+        let msg = mailer
+            .build_message_with_attachments(
+                "user@example.com",
+                "Subj",
+                "<p>Hi</p>",
+                Some("Hi"),
+                &[attachment],
+            )
+            .expect("message should build");
+        let raw = String::from_utf8(msg.formatted()).expect("message should be utf8");
+
+        assert!(raw.contains("Content-Type: multipart/mixed;"));
+        assert!(raw.contains("Content-Type: multipart/alternative;"));
+        assert!(raw.contains("Content-Disposition: attachment; filename=\"report.txt\""));
+        assert!(raw.contains("Content-Type: text/plain"));
+        assert!(raw.contains("hello"));
+    }
+
+    #[test]
+    fn test_build_message_with_attachments_rejects_bad_content_type() {
+        let cfg = MailConfig {
+            enabled: false,
+            provider: MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        };
+        let mailer = SmtpMailer::new(&cfg).unwrap();
+        let attachment = MailAttachment::new("report.txt", "not a content type", "hello");
+
+        let err = mailer
+            .build_message_with_attachments(
+                "user@example.com",
+                "Subj",
+                "<p>Hi</p>",
+                None,
+                &[attachment],
+            )
+            .expect_err("content type should fail");
+
+        assert!(err.to_string().contains("content type"));
     }
 
     #[test]
