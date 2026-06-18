@@ -46,8 +46,8 @@
 | 多种后端（SES、SendGrid 等） | **未实现** | 仅 SMTP + Noop。mega 体系中也以 SMTP 为主，未来可扩展 provider。 |
 | 模板 / 富文本 / 附件 | **基础 HTML+Text** | `send_html(to, subject, html, text?)` 实现 alternative multipart。无高级模板引擎。 |
 | 与 user_notification_* / 事件类型 的完整联动 | **实体+存储+触发器骨架存在** | callisto 实体 + NotificationStorage 方法 + triggers（cl.comment 等）已移植自 mega，dispatcher 常驻任务、mailer 注入和失败 dead-letter 基线已接入；仍缺更多业务触发器调用面、更完整观测和管理面。 |
-| Profile / 热加载 / 集中校验对 mail 的支持 | **部分实现** | Profile、集中校验和 source warning 已接入 config 管线；热加载当前支持 `mail.enabled` true→false 关停 dispatcher。重新启用 mail、SMTP 参数和凭据变更仍要求重启或后续动态 mailer 重建设计。 |
-| 测试与 CI 覆盖 | **部分实现** | mail 自身有构造/消息验证测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration）；已覆盖 `password_ref` 解析失败脱敏、坏配置不 panic、`mail.enabled` 关停热加载，以及失败发送的 retry/dead-letter 基线。仍缺真实 SMTP/Mailpit、背压和更完整死信矩阵。 |
+| Profile / 热加载 / 集中校验对 mail 的支持 | **部分实现** | Profile、集中校验和 source warning 已接入 config 管线；热加载当前支持 `mail.enabled` true→false 关停 dispatcher。重新启用 mail、SMTP 参数和凭据变更仍要求重启或后续动态 mailer 重建设计，该边界已有 config reload restart-required 矩阵测试。 |
+| 测试与 CI 覆盖 | **部分实现** | mail 自身有构造/消息验证测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration）；已覆盖 `password_ref` 解析失败脱敏、坏配置不 panic、`mail.enabled` 关停热加载、SMTP 参数/凭据重配只报告需重启，以及失败发送的 retry/dead-letter 基线。仍缺真实 SMTP/Mailpit、背压和更完整死信矩阵。 |
 
 **已知加载/启动/安全风险点（必须在相应阶段消除，与 config.md 风险点重叠）**：
 - mailer 或 dispatcher 若被移动到 Storage::new / vault 前路径，会违反 vault 就绪顺序；当前代码位置正确，但需防止后续回归。
@@ -212,7 +212,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 **阶段 3**：Provider 扩展（至少一个额外后端）、模板系统、邮件作业管理 API（查询/重发/统计）、管理员可配置的退信/限流。
 
-**阶段 4**：Profile 感知的 mail 配置、热加载支持（当前已支持 `mail.enabled` true→false 关停 dispatcher；重新启用、from/SMTP/凭据变更仍需重启或后续动态 mailer 重建设计）、更强的可观测（发送指标、链路追踪）。
+**阶段 4**：Profile 感知的 mail 配置、热加载支持（当前已支持 `mail.enabled` true→false 关停 dispatcher；重新启用、from/SMTP/凭据变更仍需重启或后续动态 mailer 重建设计，且该重启边界已有 reload 测试覆盖）、更强的可观测（发送指标、链路追踪）。
 
 **阶段 5**：完整测试矩阵（坏 SMTP、解析失败、权限失败、大量 pending job 背压、用户偏好全关场景）、CI 中增加真实邮件发送干跑（或 mailpit 等 test container）、文档同步（README、部署指南）。
 
@@ -227,7 +227,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 **关键前置依赖：**
 - `password_ref` 首个消费端已经落地；后续不要重复实现 resolver/mail 接入。
-- 运行期重新启用或 SMTP/凭据重配仍缺动态 mailer 重建与失败回滚设计，应先在 config 热加载阶段明确字段边界。
+- 运行期重新启用或 SMTP/凭据重配已在 config 热加载阶段明确为需重启字段；若要改为热生效，仍缺动态 mailer 重建与失败回滚设计。
 
 贯穿：每次变更同步更新 `config/config.toml` 示例、`mail.md`、`config.md` 相关章节、notification 触发器新增事件时的文档。
 

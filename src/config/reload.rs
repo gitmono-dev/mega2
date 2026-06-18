@@ -640,8 +640,10 @@ fn collect_mail_restart_fields(
 mod tests {
     use super::*;
     use crate::config::{
-        ArtifactGcConfig, BuckConfig, MailConfig, secret::SecretRef,
-        template::config_init_template, testing::isolated_config,
+        ArtifactGcConfig, BuckConfig, MailConfig,
+        secret::{SecretRef, SecretString},
+        template::config_init_template,
+        testing::isolated_config,
     };
 
     fn mail_config(enabled: bool) -> MailConfig {
@@ -941,6 +943,76 @@ mod tests {
         assert!(!report.applied());
         assert!(report.requires_restart());
         assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
+    }
+
+    #[test]
+    fn reload_reports_mail_reconfiguration_requires_restart_without_leaking_or_publishing_snapshot()
+    {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let candidate_ref =
+            SecretRef::parse("vault://secret/config/test/mail/candidate#value").unwrap();
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(MailConfig {
+            enabled: true,
+            smtp_host: "smtp.current.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("current-user".to_string()),
+            password: Some(SecretString::new("current-password")),
+            password_ref: None,
+            from: "current@example.com".to_string(),
+            starttls: true,
+        });
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.mail = Some(MailConfig {
+            enabled: true,
+            smtp_host: "smtp.candidate.example.com".to_string(),
+            smtp_port: 465,
+            username: Some("candidate-user".to_string()),
+            password: None,
+            password_ref: Some(candidate_ref),
+            from: "candidate@example.com".to_string(),
+            starttls: false,
+        });
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let snapshot_mail = snapshot.mail.as_ref().expect("mail config");
+        let report_debug = format!("{report:?}");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec![
+                "mail.smtp_host",
+                "mail.smtp_port",
+                "mail.username",
+                "mail.password",
+                "mail.password_ref",
+                "mail.from",
+                "mail.starttls"
+            ]
+        );
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert_eq!(snapshot_mail.smtp_host, "smtp.current.example.com");
+        assert_eq!(snapshot_mail.smtp_port, 587);
+        assert_eq!(snapshot_mail.username.as_deref(), Some("current-user"));
+        assert_eq!(snapshot_mail.from, "current@example.com");
+        assert!(snapshot_mail.starttls);
+        assert_eq!(
+            snapshot_mail
+                .password
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("current-password")
+        );
+        assert!(snapshot_mail.password_ref.is_none());
+        assert!(!report_debug.contains("current-password"));
+        assert!(!report_debug.contains("candidate-user"));
+        assert!(!report_debug.contains("config/test/mail/candidate"));
+        assert!(!report_debug.contains("#value"));
     }
 
     #[test]
