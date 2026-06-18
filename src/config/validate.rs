@@ -10,7 +10,7 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
-    MailConfig, OrionServerConfig, PackConfig, RedisConfig,
+    MailConfig, MonoConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig,
 };
 use crate::common::errors::MegaError;
 
@@ -107,6 +107,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), MegaError> {
         validate_log_config(&self.log)?;
         validate_database_config(&self.database)?;
+        validate_monorepo_config(&self.monorepo)?;
         validate_pack_config(&self.pack)?;
         validate_blame_config(&self.blame)?;
         validate_lfs_config(&self.lfs)?;
@@ -122,6 +123,7 @@ impl Config {
         if let Some(orion_server_config) = &self.orion_server {
             validate_orion_server_config(orion_server_config)?;
         }
+        validate_sidebar_config(&self.sidebar)?;
         validate_artifact_gc_config(&self.artifacts_gc)?;
 
         Ok(())
@@ -205,6 +207,26 @@ pub(crate) fn validate_database_config(db_config: &DbConfig) -> Result<(), MegaE
             "database.db_url scheme must be 'postgres' or 'postgresql', got '{scheme}'"
         ))),
     }
+}
+
+pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), MegaError> {
+    require_non_empty_path("monorepo.import_dir", &mono_config.import_dir)?;
+    if mono_config.root_dirs.is_empty() {
+        return Err(MegaError::Other(
+            "monorepo.root_dirs must contain at least one root directory".to_string(),
+        ));
+    }
+    require_non_empty_list_entries("monorepo.root_dirs", &mono_config.root_dirs)?;
+    require_non_empty_list_entries("monorepo.admin", &mono_config.admin)?;
+
+    if mono_config.rename.similarity_threshold > 100 {
+        return Err(MegaError::Other(format!(
+            "monorepo.rename.similarity_threshold must be between 0 and 100; got {}",
+            mono_config.rename.similarity_threshold
+        )));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn validate_pack_config(pack_config: &PackConfig) -> Result<(), MegaError> {
@@ -373,6 +395,28 @@ pub(crate) fn validate_artifact_gc_config(
     Ok(())
 }
 
+pub(crate) fn validate_sidebar_config(sidebar_config: &SidebarConfig) -> Result<(), MegaError> {
+    let mut public_ids = BTreeSet::new();
+    for (index, item) in sidebar_config.default_items.iter().enumerate() {
+        let public_id_field = format!("sidebar.default_items[{index}].public_id");
+        require_non_empty(&public_id_field, &item.public_id)?;
+        if !public_ids.insert(item.public_id.clone()) {
+            return Err(MegaError::Other(format!(
+                "{public_id_field} must be unique; duplicate public_id '{}'",
+                item.public_id
+            )));
+        }
+
+        let label_field = format!("sidebar.default_items[{index}].label");
+        require_non_empty(&label_field, &item.label)?;
+
+        let href_field = format!("sidebar.default_items[{index}].href");
+        require_non_empty(&href_field, &item.href)?;
+    }
+
+    Ok(())
+}
+
 fn validate_size_string(field_path: &str, value: &str) -> Result<(), MegaError> {
     let bytes = PackConfig::get_size_from_str(value, || Ok(8 * 1024 * 1024 * 1024))
         .map_err(|e| MegaError::Other(format!("{field_path} must be a valid size: {e}")))?;
@@ -388,6 +432,18 @@ fn validate_size_string(field_path: &str, value: &str) -> Result<(), MegaError> 
 fn require_non_empty(field_path: &str, value: &str) -> Result<(), MegaError> {
     if value.trim().is_empty() {
         return Err(MegaError::Other(format!("{field_path} must not be empty")));
+    }
+
+    Ok(())
+}
+
+fn require_non_empty_list_entries(field_path: &str, values: &[String]) -> Result<(), MegaError> {
+    for (index, value) in values.iter().enumerate() {
+        if value.trim().is_empty() {
+            return Err(MegaError::Other(format!(
+                "{field_path}[{index}] must not be empty"
+            )));
+        }
     }
 
     Ok(())
@@ -1078,6 +1134,47 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_rejects_invalid_monorepo_settings() {
+        let mut config = Config::mock();
+        config.monorepo.import_dir = PathBuf::new();
+        let err = config
+            .validate()
+            .expect_err("empty monorepo import dir should fail");
+        assert!(err.to_string().contains("monorepo.import_dir"));
+
+        let mut config = Config::mock();
+        config.monorepo.root_dirs.clear();
+        let err = config
+            .validate()
+            .expect_err("empty monorepo root dirs should fail");
+        assert!(err.to_string().contains("monorepo.root_dirs"));
+
+        let mut config = Config::mock();
+        config.monorepo.root_dirs = vec!["".to_string()];
+        let err = config
+            .validate()
+            .expect_err("blank monorepo root dir should fail");
+        assert!(err.to_string().contains("monorepo.root_dirs[0]"));
+
+        let mut config = Config::mock();
+        config.monorepo.admin = vec!["".to_string()];
+        let err = config
+            .validate()
+            .expect_err("blank monorepo admin should fail");
+        assert!(err.to_string().contains("monorepo.admin[0]"));
+
+        let mut config = Config::mock();
+        config.monorepo.rename.similarity_threshold = 101;
+        let err = config
+            .validate()
+            .expect_err("rename similarity threshold above 100 should fail");
+        assert!(
+            err.to_string()
+                .contains("monorepo.rename.similarity_threshold")
+        );
+    }
+
+    #[test]
     fn config_validate_rejects_invalid_pack_settings() {
         let mut config = Config::mock();
         config.pack.pack_decode_mem_size = "definitely-not-a-size".to_string();
@@ -1367,6 +1464,45 @@ mod tests {
             .validate()
             .expect_err("zero artifact gc batch limit should fail");
         assert!(err.to_string().contains("artifacts_gc.batch_limit"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_sidebar_items() {
+        let mut config = Config::mock();
+        config.sidebar.default_items[0].public_id.clear();
+        let err = config
+            .validate()
+            .expect_err("blank sidebar public_id should fail");
+        assert!(
+            err.to_string()
+                .contains("sidebar.default_items[0].public_id")
+        );
+
+        let mut config = Config::mock();
+        config.sidebar.default_items[0].label.clear();
+        let err = config
+            .validate()
+            .expect_err("blank sidebar label should fail");
+        assert!(err.to_string().contains("sidebar.default_items[0].label"));
+
+        let mut config = Config::mock();
+        config.sidebar.default_items[0].href.clear();
+        let err = config
+            .validate()
+            .expect_err("blank sidebar href should fail");
+        assert!(err.to_string().contains("sidebar.default_items[0].href"));
+
+        let mut config = Config::mock();
+        let duplicate_id = config.sidebar.default_items[0].public_id.clone();
+        config.sidebar.default_items[1].public_id = duplicate_id;
+        let err = config
+            .validate()
+            .expect_err("duplicate sidebar public_id should fail");
+        assert!(
+            err.to_string()
+                .contains("sidebar.default_items[1].public_id")
+        );
+        assert!(err.to_string().contains("unique"));
     }
 
     #[test]
