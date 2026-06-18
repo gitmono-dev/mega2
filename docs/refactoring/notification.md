@@ -237,7 +237,7 @@ Config::new
 - 在 service 启动路径中，于 vault + mail 就绪后 spawn `EmailDispatcher` 已完成。
 - HTTP graceful shutdown 广播到 `notification_shutdown` 以取消 mail dispatcher 已完成。
 - 剩余：确保触发器在 ceres/api 业务关键路径中被调用（至少 CL 评论）。
-- 已补充 Noop mailer + test DB 风格的 dispatcher/storage 基线测试，并覆盖 dispatcher batch / max-in-flight、retry policy 配置生效、多 tick 高水位队列 drain、跨独立 DB connection pool 的 claim 竞争、真实 SMTP/Mailpit 正路径、真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露和缺失收件人 skip；剩余是更完整 Mailpit/SMTP 故障矩阵、更长时间压力形态高水位矩阵和真实多实例黑盒矩阵。
+- 已补充 Noop mailer + test DB 风格的 dispatcher/storage 基线测试，并覆盖 dispatcher batch / max-in-flight、retry policy 配置生效、多 tick 高水位队列 drain、跨独立 DB connection pool 的 claim 竞争、真实 SMTP/Mailpit 正路径、真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露、缺失收件人 skip，以及 CL 评论触发器全收件人显式关闭事件偏好时不 enqueue；剩余是更完整 Mailpit/SMTP 故障矩阵、更长时间压力形态高水位矩阵和真实多实例黑盒矩阵。
 - 剩余：依赖 config.md 阶段 0b 的脱敏工具，完善日志脱敏（避免 PII 泄露）
 - 剩余验收：Mailpit/SMTP 故障矩阵继续覆盖更多 TLS/STARTTLS 边界；日志无凭据泄露；mail 构造失败保持可诊断。
 
@@ -255,7 +255,7 @@ Config::new
 - 剩余：补齐更完整 mega DTO 兼容面、审计能力和业务触发器接入面。
 - 在 api/router 中注册对应路由（参考其他 router 模式）已完成首批。
 - 完善触发器覆盖更多事件（issue、pr、mention 等）。
-- 验收：用户可通过 API 管理自己的通知偏好；should_send 正确反映更新。
+- 验收：用户可通过 API 管理自己的通知偏好；should_send 正确反映更新；CL 评论触发器在全部收件人显式 opt-out 时不 enqueue。
 
 **阶段 3（Vault SecretRef + 渠道凭据，安全加固）**：
 - Email 渠道完全迁移到 SecretRef（依赖 **mail.md 阶段 2** + **config.md 阶段 5**）。

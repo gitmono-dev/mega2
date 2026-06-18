@@ -308,6 +308,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_on_cl_comment_created_skips_when_all_recipients_opt_out() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let base = BaseStorage::new(Arc::new(db.clone()));
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        let cl_stg = ClStorage { base: base.clone() };
+        let reviewer_stg = ClReviewerStorage { base: base.clone() };
+        let now = chrono::Utc::now().naive_utc();
+
+        mega_cl::ActiveModel {
+            id: Set(10),
+            link: Set("CL-opt-out".to_string()),
+            title: Set("t".to_string()),
+            merge_date: Set(None),
+            status: Set(crate::callisto::sea_orm_active_enums::MergeStatusEnum::Open),
+            path: Set("/".to_string()),
+            from_hash: Set("a".to_string()),
+            to_hash: Set("b".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            username: Set("alice".to_string()),
+            base_branch: Set("main".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for (id, username) in [(10, "bob"), (11, "carol")] {
+            mega_cl_reviewer::ActiveModel {
+                id: Set(id),
+                cl_link: Set("CL-opt-out".to_string()),
+                username: Set(username.to_string()),
+                approved: Set(false),
+                system_required: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        ensure_event_type_exists(&notif).await.unwrap();
+        for username in ["alice", "bob", "carol"] {
+            notif
+                .upsert_user_settings(username, &format!("{username}@example.com"))
+                .await
+                .unwrap();
+            notif
+                .set_user_preference(username, EVENT_CL_COMMENT_CREATED, false)
+                .await
+                .unwrap();
+        }
+
+        on_cl_comment_created(
+            &notif,
+            &cl_stg,
+            &reviewer_stg,
+            "dave",
+            "CL-opt-out",
+            "hello",
+        )
+        .await
+        .unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_on_cl_comment_created_renders_mail_template_with_html_escaping() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
