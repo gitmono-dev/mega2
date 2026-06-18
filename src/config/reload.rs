@@ -487,6 +487,24 @@ fn apply_mail_changes(
                 }
                 report.applied_fields.push("mail.dispatcher_max_in_flight");
             }
+            if current.retry_max_attempts != candidate.retry_max_attempts {
+                if let Some(next) = next {
+                    next.retry_max_attempts = candidate.retry_max_attempts;
+                }
+                report.applied_fields.push("mail.retry_max_attempts");
+            }
+            if current.retry_backoff_base_secs != candidate.retry_backoff_base_secs {
+                if let Some(next) = next {
+                    next.retry_backoff_base_secs = candidate.retry_backoff_base_secs;
+                }
+                report.applied_fields.push("mail.retry_backoff_base_secs");
+            }
+            if current.retry_backoff_max_secs != candidate.retry_backoff_max_secs {
+                if let Some(next) = next {
+                    next.retry_backoff_max_secs = candidate.retry_backoff_max_secs;
+                }
+                report.applied_fields.push("mail.retry_backoff_max_secs");
+            }
             collect_mail_restart_fields(current, candidate, report);
         }
     }
@@ -1287,6 +1305,39 @@ mod tests {
         assert!(!report.requires_restart());
         assert_eq!(mail.dispatcher_batch_size, 12);
         assert_eq!(mail.dispatcher_max_in_flight, 3);
+    }
+
+    #[test]
+    fn reload_applies_mail_retry_policy_without_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(true));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.retry_max_attempts = 7;
+        mail.retry_backoff_base_secs = 15;
+        mail.retry_backoff_max_secs = 120;
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let mail = snapshot.mail.as_ref().expect("mail config");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "mail.retry_max_attempts",
+                "mail.retry_backoff_base_secs",
+                "mail.retry_backoff_max_secs"
+            ]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert_eq!(mail.retry_max_attempts, 7);
+        assert_eq!(mail.retry_backoff_base_secs, 15);
+        assert_eq!(mail.retry_backoff_max_secs, 120);
     }
 
     #[test]

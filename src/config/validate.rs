@@ -178,6 +178,26 @@ impl MailConfig {
                 "mail.dispatcher_max_in_flight must be greater than 0".to_string(),
             ));
         }
+        if self.retry_max_attempts <= 0 {
+            return Err(MegaError::Other(
+                "mail.retry_max_attempts must be greater than 0".to_string(),
+            ));
+        }
+        if self.retry_backoff_base_secs <= 0 {
+            return Err(MegaError::Other(
+                "mail.retry_backoff_base_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.retry_backoff_max_secs <= 0 {
+            return Err(MegaError::Other(
+                "mail.retry_backoff_max_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.retry_backoff_max_secs < self.retry_backoff_base_secs {
+            return Err(MegaError::Other(
+                "mail.retry_backoff_max_secs must be greater than or equal to mail.retry_backoff_base_secs".to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -1161,6 +1181,9 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "starttls",
             "dispatcher_batch_size",
             "dispatcher_max_in_flight",
+            "retry_max_attempts",
+            "retry_backoff_base_secs",
+            "retry_backoff_max_secs",
             "smtp_tls",
             "tls",
         ]),
@@ -1539,6 +1562,46 @@ mod tests {
             .validate()
             .expect_err("zero max in-flight should fail");
         assert!(err.to_string().contains("mail.dispatcher_max_in_flight"));
+    }
+
+    #[test]
+    fn mail_validate_rejects_invalid_retry_policy() {
+        let mail_config = MailConfig {
+            retry_max_attempts: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero retry max attempts should fail");
+        assert!(err.to_string().contains("mail.retry_max_attempts"));
+
+        let mail_config = MailConfig {
+            retry_backoff_base_secs: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero retry backoff base should fail");
+        assert!(err.to_string().contains("mail.retry_backoff_base_secs"));
+
+        let mail_config = MailConfig {
+            retry_backoff_max_secs: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero retry backoff max should fail");
+        assert!(err.to_string().contains("mail.retry_backoff_max_secs"));
+
+        let mail_config = MailConfig {
+            retry_backoff_base_secs: 60,
+            retry_backoff_max_secs: 30,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("retry backoff max below base should fail");
+        assert!(err.to_string().contains("mail.retry_backoff_max_secs"));
     }
 
     #[test]

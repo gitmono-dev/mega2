@@ -163,6 +163,9 @@ pub enum MailProvider {
 
 pub const DEFAULT_MAIL_DISPATCHER_BATCH_SIZE: u64 = 50;
 pub const DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT: usize = 8;
+pub const DEFAULT_MAIL_RETRY_MAX_ATTEMPTS: i32 = 5;
+pub const DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS: i64 = 30;
+pub const DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS: i64 = 300;
 
 /// Mail configuration. Lives here so it participates in the main Config loading
 /// / env overlay / placeholder / (future) SecretRef pipeline.
@@ -191,6 +194,12 @@ pub struct MailConfig {
     pub dispatcher_batch_size: u64,
     #[serde(default = "default_mail_dispatcher_max_in_flight")]
     pub dispatcher_max_in_flight: usize,
+    #[serde(default = "default_mail_retry_max_attempts")]
+    pub retry_max_attempts: i32,
+    #[serde(default = "default_mail_retry_backoff_base_secs")]
+    pub retry_backoff_base_secs: i64,
+    #[serde(default = "default_mail_retry_backoff_max_secs")]
+    pub retry_backoff_max_secs: i64,
     // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
 }
 
@@ -205,6 +214,15 @@ fn default_mail_dispatcher_batch_size() -> u64 {
 }
 fn default_mail_dispatcher_max_in_flight() -> usize {
     DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT
+}
+fn default_mail_retry_max_attempts() -> i32 {
+    DEFAULT_MAIL_RETRY_MAX_ATTEMPTS
+}
+fn default_mail_retry_backoff_base_secs() -> i64 {
+    DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS
+}
+fn default_mail_retry_backoff_max_secs() -> i64 {
+    DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS
 }
 
 impl Default for MailConfig {
@@ -221,6 +239,9 @@ impl Default for MailConfig {
             starttls: default_starttls(),
             dispatcher_batch_size: default_mail_dispatcher_batch_size(),
             dispatcher_max_in_flight: default_mail_dispatcher_max_in_flight(),
+            retry_max_attempts: default_mail_retry_max_attempts(),
+            retry_backoff_base_secs: default_mail_retry_backoff_base_secs(),
+            retry_backoff_max_secs: default_mail_retry_backoff_max_secs(),
         }
     }
 }

@@ -10,10 +10,16 @@ use crate::{
         email_jobs, notification_event_types, user_notification_preferences,
         user_notification_settings,
     },
+    config::{
+        DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS, DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS,
+        DEFAULT_MAIL_RETRY_MAX_ATTEMPTS,
+    },
     contract::api::common::Pagination,
 };
 
-pub const MAX_EMAIL_RETRY_ATTEMPTS: i32 = 5;
+pub const MAX_EMAIL_RETRY_ATTEMPTS: i32 = DEFAULT_MAIL_RETRY_MAX_ATTEMPTS;
+pub const EMAIL_RETRY_BACKOFF_BASE_SECS: i64 = DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS;
+pub const EMAIL_RETRY_BACKOFF_MAX_SECS: i64 = DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS;
 pub const EMAIL_JOB_SEND_TIMEOUT_SECS: i64 = 15 * 60;
 pub const EMAIL_JOB_STALE_SEND_ERROR: &str = "email send attempt timed out before completion";
 pub const EMAIL_JOB_STATUS_PENDING: &str = "pending";
@@ -27,6 +33,37 @@ pub enum EmailJobFailureDisposition {
     RetryScheduled,
     DeadLettered,
     MissingJob,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmailJobRetryPolicy {
+    pub max_attempts: i32,
+    pub backoff_base_secs: i64,
+    pub backoff_max_secs: i64,
+}
+
+impl EmailJobRetryPolicy {
+    pub fn new(max_attempts: i32, backoff_base_secs: i64, backoff_max_secs: i64) -> Self {
+        Self {
+            max_attempts,
+            backoff_base_secs,
+            backoff_max_secs,
+        }
+    }
+
+    fn delay_secs(&self, retry_count: i32) -> i64 {
+        (i64::from(retry_count) * self.backoff_base_secs).min(self.backoff_max_secs)
+    }
+}
+
+impl Default for EmailJobRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: MAX_EMAIL_RETRY_ATTEMPTS,
+            backoff_base_secs: EMAIL_RETRY_BACKOFF_BASE_SECS,
+            backoff_max_secs: EMAIL_RETRY_BACKOFF_MAX_SECS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -368,13 +405,23 @@ impl NotificationStorage {
     }
 
     /// Mark a job as failed and schedule a retry.
-    /// Backoff: 30s, 60s, ... capped at 300s.
-    /// Jobs that reach MAX_EMAIL_RETRY_ATTEMPTS are moved to failed status and
+    /// Default backoff: 30s, 60s, ... capped at 300s.
+    /// Jobs that reach the configured retry attempt limit are moved to failed status and
     /// no longer returned by fetch_pending_jobs.
     pub async fn mark_job_failed_with_retry(
         &self,
         job_id: i64,
         error: &str,
+    ) -> Result<EmailJobFailureDisposition, sea_orm::DbErr> {
+        self.mark_job_failed_with_retry_policy(job_id, error, EmailJobRetryPolicy::default())
+            .await
+    }
+
+    pub async fn mark_job_failed_with_retry_policy(
+        &self,
+        job_id: i64,
+        error: &str,
+        retry_policy: EmailJobRetryPolicy,
     ) -> Result<EmailJobFailureDisposition, sea_orm::DbErr> {
         if let Some(job) = email_jobs::Entity::find_by_id(job_id)
             .one(self.db())
@@ -384,17 +431,18 @@ impl NotificationStorage {
             let now = chrono::Utc::now().naive_utc();
             let retry = job.retry_count + 1;
 
-            let disposition = if retry >= MAX_EMAIL_RETRY_ATTEMPTS {
+            let disposition = if retry >= retry_policy.max_attempts {
                 model.status = Set(EMAIL_JOB_STATUS_FAILED.to_string());
                 model.next_retry_at = Set(None);
                 tracing::warn!(
                     job_id,
                     retry_count = retry,
+                    max_retry_attempts = retry_policy.max_attempts,
                     "email job moved to dead-letter status"
                 );
                 EmailJobFailureDisposition::DeadLettered
             } else {
-                let delay_secs = (retry as i64).min(10) * 30;
+                let delay_secs = retry_policy.delay_secs(retry);
                 let next = now + chrono::Duration::seconds(delay_secs);
                 model.status = Set(EMAIL_JOB_STATUS_PENDING.to_string());
                 model.next_retry_at = Set(Some(next));
@@ -851,6 +899,79 @@ mod tests {
         assert!(job.next_retry_at.is_none());
         assert_eq!(job.error_message.as_deref(), Some("smtp unavailable"));
         assert!(storage.fetch_pending_jobs(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn email_job_failure_uses_configured_retry_policy() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        storage
+            .enqueue_email_job(
+                "alice",
+                "alice@test.com",
+                "test.event",
+                "Hello",
+                "<p>Hello</p>",
+                Some("Hello"),
+            )
+            .await
+            .unwrap();
+
+        let job_id = storage.fetch_pending_jobs(10).await.unwrap()[0].id;
+        let policy = EmailJobRetryPolicy::new(2, 5, 7);
+        let before_failure = chrono::Utc::now().naive_utc();
+
+        let disposition = storage
+            .mark_job_failed_with_retry_policy(job_id, "smtp unavailable", policy)
+            .await
+            .unwrap();
+        assert_eq!(disposition, EmailJobFailureDisposition::RetryScheduled);
+
+        let job = email_jobs::Entity::find_by_id(job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, EMAIL_JOB_STATUS_PENDING);
+        assert_eq!(job.retry_count, 1);
+        assert!(
+            job.next_retry_at.expect("retry should be scheduled")
+                >= before_failure + chrono::Duration::seconds(5)
+        );
+
+        let disposition = storage
+            .mark_job_failed_with_retry_policy(job_id, "smtp unavailable", policy)
+            .await
+            .unwrap();
+        assert_eq!(disposition, EmailJobFailureDisposition::DeadLettered);
+
+        let job = email_jobs::Entity::find_by_id(job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, EMAIL_JOB_STATUS_FAILED);
+        assert_eq!(job.retry_count, 2);
+        assert!(job.next_retry_at.is_none());
     }
 
     #[tokio::test]

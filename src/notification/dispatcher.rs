@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 use tokio::{
@@ -18,7 +18,8 @@ use crate::{
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     jupiter::storage::notification_storage::{
-        EMAIL_JOB_SEND_TIMEOUT_SECS, EmailJobFailureDisposition, NotificationStorage,
+        EMAIL_JOB_SEND_TIMEOUT_SECS, EmailJobFailureDisposition, EmailJobRetryPolicy,
+        NotificationStorage,
     },
     mail::Mailer,
 };
@@ -62,6 +63,9 @@ pub struct EmailDispatcherControl {
     enabled: Arc<AtomicBool>,
     batch_size: Arc<AtomicU64>,
     max_in_flight: Arc<AtomicUsize>,
+    retry_max_attempts: Arc<AtomicI32>,
+    retry_backoff_base_secs: Arc<AtomicI64>,
+    retry_backoff_max_secs: Arc<AtomicI64>,
 }
 
 impl EmailDispatcherControl {
@@ -70,17 +74,29 @@ impl EmailDispatcherControl {
     }
 
     pub fn from_mail_config(config: &MailConfig) -> Self {
-        Self::new_with_limits(
+        Self::new_with_limits_and_retry_policy(
             config.enabled,
             EmailDispatcherLimits::from_mail_config(config),
+            retry_policy_from_mail_config(config),
         )
     }
 
     pub fn new_with_limits(enabled: bool, limits: EmailDispatcherLimits) -> Self {
+        Self::new_with_limits_and_retry_policy(enabled, limits, EmailJobRetryPolicy::default())
+    }
+
+    pub fn new_with_limits_and_retry_policy(
+        enabled: bool,
+        limits: EmailDispatcherLimits,
+        retry_policy: EmailJobRetryPolicy,
+    ) -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(enabled)),
             batch_size: Arc::new(AtomicU64::new(limits.batch_size)),
             max_in_flight: Arc::new(AtomicUsize::new(limits.max_in_flight)),
+            retry_max_attempts: Arc::new(AtomicI32::new(retry_policy.max_attempts)),
+            retry_backoff_base_secs: Arc::new(AtomicI64::new(retry_policy.backoff_base_secs)),
+            retry_backoff_max_secs: Arc::new(AtomicI64::new(retry_policy.backoff_max_secs)),
         }
     }
 
@@ -103,6 +119,23 @@ impl EmailDispatcherControl {
         self.batch_size.store(limits.batch_size, Ordering::Release);
         self.max_in_flight
             .store(limits.max_in_flight, Ordering::Release);
+    }
+
+    pub fn retry_policy(&self) -> EmailJobRetryPolicy {
+        EmailJobRetryPolicy {
+            max_attempts: self.retry_max_attempts.load(Ordering::Acquire),
+            backoff_base_secs: self.retry_backoff_base_secs.load(Ordering::Acquire),
+            backoff_max_secs: self.retry_backoff_max_secs.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn set_retry_policy(&self, retry_policy: EmailJobRetryPolicy) {
+        self.retry_max_attempts
+            .store(retry_policy.max_attempts, Ordering::Release);
+        self.retry_backoff_base_secs
+            .store(retry_policy.backoff_base_secs, Ordering::Release);
+        self.retry_backoff_max_secs
+            .store(retry_policy.backoff_max_secs, Ordering::Release);
     }
 }
 
@@ -176,6 +209,7 @@ impl EmailDispatcher {
         }
 
         let limits = self.control.limits();
+        let retry_policy = self.control.retry_policy();
         let jobs = self.stg.fetch_pending_jobs(limits.batch_size).await?;
         let mut stats = EmailDispatchTickStats {
             fetched: jobs.len(),
@@ -188,7 +222,7 @@ impl EmailDispatcher {
             for job in chunk.iter().cloned() {
                 let stg = self.stg.clone();
                 let mailer = Arc::clone(&self.mailer);
-                tasks.spawn(async move { process_email_job(stg, mailer, job).await });
+                tasks.spawn(async move { process_email_job(stg, mailer, job, retry_policy).await });
             }
 
             while let Some(result) = tasks.join_next().await {
@@ -218,6 +252,9 @@ impl EmailDispatcher {
                 task_errors = stats.task_errors,
                 batch_size = limits.batch_size,
                 max_in_flight = limits.max_in_flight,
+                retry_max_attempts = retry_policy.max_attempts,
+                retry_backoff_base_secs = retry_policy.backoff_base_secs,
+                retry_backoff_max_secs = retry_policy.backoff_max_secs,
                 "email dispatcher tick completed"
             );
         }
@@ -268,6 +305,7 @@ async fn process_email_job(
     stg: NotificationStorage,
     mailer: Arc<dyn Mailer>,
     job: email_jobs::Model,
+    retry_policy: EmailJobRetryPolicy,
 ) -> Result<EmailJobOutcome, sea_orm::DbErr> {
     if job.to_email.trim().is_empty() {
         stg.mark_job_skipped(job.id, "missing recipient email")
@@ -294,7 +332,7 @@ async fn process_email_job(
             Ok(EmailJobOutcome::Sent)
         }
         Err(e) => match stg
-            .mark_job_failed_with_retry(job.id, &e.to_string())
+            .mark_job_failed_with_retry_policy(job.id, &e.to_string(), retry_policy)
             .await?
         {
             EmailJobFailureDisposition::RetryScheduled => Ok(EmailJobOutcome::RetryScheduled),
@@ -322,8 +360,27 @@ fn apply_mail_enabled(
     {
         control.set_limits(EmailDispatcherLimits::from_mail_config(mail));
     }
+    if report.applied_fields.iter().any(|field| {
+        matches!(
+            *field,
+            "mail.retry_max_attempts"
+                | "mail.retry_backoff_base_secs"
+                | "mail.retry_backoff_max_secs"
+        )
+    }) && let Some(mail) = &config.mail
+    {
+        control.set_retry_policy(retry_policy_from_mail_config(mail));
+    }
 
     Ok(())
+}
+
+fn retry_policy_from_mail_config(config: &MailConfig) -> EmailJobRetryPolicy {
+    EmailJobRetryPolicy::new(
+        config.retry_max_attempts,
+        config.retry_backoff_base_secs,
+        config.retry_backoff_max_secs,
+    )
 }
 
 #[cfg(test)]
@@ -672,6 +729,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dispatcher_uses_configured_retry_policy_for_dead_letter() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        stg.enqueue_email_job(
+            "alice",
+            "alice@example.com",
+            "cl.comment.created",
+            "Subject",
+            "<p>Body</p>",
+            Some("Body"),
+        )
+        .await
+        .unwrap();
+
+        let control = EmailDispatcherControl::new_with_limits_and_retry_policy(
+            true,
+            EmailDispatcherLimits::default(),
+            EmailJobRetryPolicy::new(1, 1, 1),
+        );
+        let dispatcher =
+            EmailDispatcher::new_with_control(stg.clone(), Arc::new(FailingMailer), control);
+        dispatcher.tick_once().await.unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "failed");
+        assert_eq!(jobs[0].retry_count, 1);
+        assert!(jobs[0].next_retry_at.is_none());
+    }
+
     #[test]
     fn email_dispatcher_subscriber_updates_control_from_mail_enabled() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -722,6 +826,7 @@ mod tests {
             starttls: true,
             dispatcher_batch_size: 50,
             dispatcher_max_in_flight: 8,
+            ..Default::default()
         });
         let control =
             EmailDispatcherControl::from_mail_config(config.mail.as_ref().expect("mail config"));
@@ -745,5 +850,47 @@ mod tests {
 
         assert_eq!(applied_report, report);
         assert_eq!(control.limits(), EmailDispatcherLimits::new(11, 4));
+    }
+
+    #[test]
+    fn email_dispatcher_subscriber_updates_retry_policy_from_mail_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(crate::config::MailConfig {
+            enabled: true,
+            provider: crate::config::MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+            ..Default::default()
+        });
+        let control =
+            EmailDispatcherControl::from_mail_config(config.mail.as_ref().expect("mail config"));
+        let mut candidate = config.clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.retry_max_attempts = 7;
+        mail.retry_backoff_base_secs = 15;
+        mail.retry_backoff_max_secs = 120;
+        let report = ConfigReloadReport {
+            applied_fields: vec![
+                "mail.retry_max_attempts",
+                "mail.retry_backoff_base_secs",
+                "mail.retry_backoff_max_secs",
+            ],
+            restart_required_fields: Vec::new(),
+        };
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_email_dispatcher_subscriber(control.clone()))
+            .expect("subscribe");
+        let applied_report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(applied_report, report);
+        assert_eq!(control.retry_policy(), EmailJobRetryPolicy::new(7, 15, 120));
     }
 }

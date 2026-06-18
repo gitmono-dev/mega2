@@ -103,6 +103,9 @@ from = "no-reply@example.com"
 starttls = true
 dispatcher_batch_size = 50
 dispatcher_max_in_flight = 8
+retry_max_attempts = 5
+retry_backoff_base_secs = 30
+retry_backoff_max_secs = 300
 "#
     )
 }
