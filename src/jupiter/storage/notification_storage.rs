@@ -98,6 +98,16 @@ impl EmailJobAttachment {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailJobAttachmentMetadata {
+    pub id: i64,
+    pub email_job_id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EmailJobEnqueue<'a> {
     pub username: &'a str,
@@ -437,6 +447,13 @@ impl NotificationStorage {
         Ok(())
     }
 
+    pub async fn get_email_job(
+        &self,
+        job_id: i64,
+    ) -> Result<Option<email_jobs::Model>, sea_orm::DbErr> {
+        email_jobs::Entity::find_by_id(job_id).one(self.db()).await
+    }
+
     pub async fn list_email_job_attachments(
         &self,
         job_id: i64,
@@ -453,6 +470,30 @@ impl NotificationStorage {
                         filename: attachment.filename,
                         content_type: attachment.content_type,
                         content: attachment.content,
+                    })
+                    .collect()
+            })
+    }
+
+    pub async fn list_email_job_attachment_metadata(
+        &self,
+        job_id: i64,
+    ) -> Result<Vec<EmailJobAttachmentMetadata>, sea_orm::DbErr> {
+        email_job_attachments::Entity::find()
+            .filter(email_job_attachments::Column::EmailJobId.eq(job_id))
+            .order_by_asc(email_job_attachments::Column::Id)
+            .all(self.db())
+            .await
+            .map(|attachments| {
+                attachments
+                    .into_iter()
+                    .map(|attachment| EmailJobAttachmentMetadata {
+                        id: attachment.id,
+                        email_job_id: attachment.email_job_id,
+                        filename: attachment.filename,
+                        content_type: attachment.content_type,
+                        size_bytes: attachment.content.len() as u64,
+                        created_at: attachment.created_at,
                     })
                     .collect()
             })
@@ -1010,6 +1051,21 @@ mod tests {
         assert_eq!(attachments[1].filename, "two.json");
         assert_eq!(attachments[1].content_type, "application/json");
         assert_eq!(attachments[1].content, br#"{"ok":true}"#);
+
+        let metadata = storage
+            .list_email_job_attachment_metadata(jobs[0].id)
+            .await
+            .unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].email_job_id, jobs[0].id);
+        assert_eq!(metadata[0].filename, "one.txt");
+        assert_eq!(metadata[0].content_type, "text/plain");
+        assert_eq!(metadata[0].size_bytes, 3);
+        assert!(metadata[0].id > 0);
+        assert!(metadata[0].created_at >= now);
+        assert_eq!(metadata[1].filename, "two.json");
+        assert_eq!(metadata[1].content_type, "application/json");
+        assert_eq!(metadata[1].size_bytes, br#"{"ok":true}"#.len() as u64);
     }
 
     #[tokio::test]

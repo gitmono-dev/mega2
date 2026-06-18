@@ -317,7 +317,9 @@ cargo test --test <name>
   notification settings, preferred locale, and per-event preferences under
   `/user/notification/preferences`; admins can manage notification event
   types under `/admin/notification-event-types` and prune old terminal outbox
-  jobs under `/admin/email-jobs/prune`.
+  jobs under `/admin/email-jobs/prune`; attachment audit metadata is available
+  under `/admin/email-jobs/{id}/attachments` without returning attachment
+  content.
 - **Background maintenance** — HTTP service tasks clean expired Buck upload
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
   tasks hot-reload schedule settings and can be disabled without restart;

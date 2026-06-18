@@ -31,8 +31,8 @@ use crate::{
     contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
     jupiter::storage::notification_storage::{
         EMAIL_JOB_STATUS_FAILED, EMAIL_JOB_STATUS_PENDING, EMAIL_JOB_STATUS_SENDING,
-        EMAIL_JOB_STATUS_SENT, EMAIL_JOB_STATUS_SKIPPED, EmailJobListFilter,
-        EmailJobRetryDisposition, EmailJobStats,
+        EMAIL_JOB_STATUS_SENT, EMAIL_JOB_STATUS_SKIPPED, EmailJobAttachmentMetadata,
+        EmailJobListFilter, EmailJobRetryDisposition, EmailJobStats,
     },
 };
 
@@ -84,6 +84,21 @@ pub struct EmailJobStatsResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EmailJobRetryResponse {
     pub job: EmailJobResponse,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailJobAttachmentResponse {
+    pub id: i64,
+    pub email_job_id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailJobAttachmentListResponse {
+    pub attachments: Vec<EmailJobAttachmentResponse>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -141,6 +156,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(admin_list))
             .routes(routes!(list_email_jobs))
             .routes(routes!(email_job_stats))
+            .routes(routes!(list_email_job_attachments))
             .routes(routes!(retry_failed_email_job))
             .routes(routes!(prune_email_jobs))
             .routes(routes!(list_notification_event_types))
@@ -261,6 +277,50 @@ async fn email_job_stats(
         .email_job_stats()
         .await?;
     Ok(Json(CommonResult::success(Some(stats.into()))))
+}
+
+/// GET /api/v1/admin/email-jobs/{id}/attachments
+///
+/// Lists persisted attachment metadata for a notification email outbox job.
+/// Only admins can access this endpoint. Attachment content is not returned.
+#[utoipa::path(
+    get,
+    path = "/email-jobs/{id}/attachments",
+    params(
+        ("id" = i64, Path, description = "Email job ID")
+    ),
+    responses(
+        (status = 200, body = CommonResult<EmailJobAttachmentListResponse>, content_type = "application/json"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+        (status = 404, description = "Email job not found"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn list_email_job_attachments(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path(id): Path<i64>,
+) -> Result<Json<CommonResult<EmailJobAttachmentListResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+
+    let notification_storage = state.storage.notification_storage();
+    if notification_storage.get_email_job(id).await?.is_none() {
+        return Err(ApiError::not_found(anyhow::anyhow!("email job not found")));
+    }
+
+    let attachments = notification_storage
+        .list_email_job_attachment_metadata(id)
+        .await?;
+
+    Ok(Json(CommonResult::success(Some(
+        EmailJobAttachmentListResponse {
+            attachments: attachments
+                .into_iter()
+                .map(EmailJobAttachmentResponse::from)
+                .collect(),
+        },
+    ))))
 }
 
 /// POST /api/v1/admin/email-jobs/{id}/retry
@@ -452,6 +512,19 @@ impl From<notification_event_types::Model> for NotificationEventTypeInfo {
             description: value.description,
             system_required: value.system_required,
             default_enabled: value.default_enabled,
+        }
+    }
+}
+
+impl From<EmailJobAttachmentMetadata> for EmailJobAttachmentResponse {
+    fn from(value: EmailJobAttachmentMetadata) -> Self {
+        Self {
+            id: value.id,
+            email_job_id: value.email_job_id,
+            filename: value.filename,
+            content_type: value.content_type,
+            size_bytes: value.size_bytes,
+            created_at: value.created_at.to_string(),
         }
     }
 }
@@ -693,6 +766,26 @@ mod tests {
         assert_eq!(response.description, "New comment on a Change List");
         assert!(!response.system_required);
         assert!(response.default_enabled);
+    }
+
+    #[test]
+    fn email_job_attachment_response_maps_metadata() {
+        let created_at = chrono::Utc::now().naive_utc();
+        let response = EmailJobAttachmentResponse::from(EmailJobAttachmentMetadata {
+            id: 42,
+            email_job_id: 7,
+            filename: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size_bytes: 1024,
+            created_at,
+        });
+
+        assert_eq!(response.id, 42);
+        assert_eq!(response.email_job_id, 7);
+        assert_eq!(response.filename, "report.pdf");
+        assert_eq!(response.content_type, "application/pdf");
+        assert_eq!(response.size_bytes, 1024);
+        assert_eq!(response.created_at, created_at.to_string());
     }
 
     #[test]
