@@ -11,6 +11,7 @@ use url::Url;
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
     MailConfig, MonoConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig,
+    secret::SecretRef,
 };
 use crate::common::errors::MegaError;
 
@@ -142,6 +143,9 @@ impl MailConfig {
 
     pub fn validate(&self) -> Result<(), MegaError> {
         self.validate_secret_fields()?;
+        if let Some(secret_ref) = &self.password_ref {
+            validate_mail_password_secret_ref("mail.password_ref", secret_ref)?;
+        }
 
         if self.enabled {
             if self.smtp_host.trim().is_empty() {
@@ -299,6 +303,30 @@ pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), Me
     }
 }
 
+pub(crate) fn validate_mail_password_secret_ref(
+    field_path: &str,
+    secret_ref: &SecretRef,
+) -> Result<(), MegaError> {
+    if is_mail_password_secret_name(secret_ref.secret_name()) {
+        return Ok(());
+    }
+
+    Err(MegaError::Other(format!(
+        "{field_path} must use a vault SecretRef under vault://secret/config/<profile>/mail/password#<field>; value is redacted"
+    )))
+}
+
+fn is_mail_password_secret_name(secret_name: &str) -> bool {
+    let Some(rest) = secret_name.strip_prefix("config/") else {
+        return false;
+    };
+    let Some(namespace) = rest.strip_suffix("/mail/password") else {
+        return false;
+    };
+
+    !namespace.is_empty()
+}
+
 pub(crate) fn validate_buck_config(buck_config: &BuckConfig) -> Result<(), MegaError> {
     buck_config
         .validate()
@@ -330,10 +358,22 @@ fn validate_s3_config(
     require_non_empty("object_storage.s3.bucket", &s3.bucket)?;
     require_non_empty("object_storage.s3.access_key_id", &s3.access_key_id)?;
     require_non_empty("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
+    reject_secret_ref_like_value("object_storage.s3.access_key_id", &s3.access_key_id)?;
+    reject_secret_ref_like_value("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
 
     if require_endpoint {
         require_non_empty("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
         validate_http_url("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
+    }
+
+    Ok(())
+}
+
+fn reject_secret_ref_like_value(field_path: &str, value: &str) -> Result<(), MegaError> {
+    if value.trim_start().starts_with("vault://") {
+        return Err(MegaError::Other(format!(
+            "{field_path} cannot use monoengine vault SecretRef; keep database, Redis, and object storage credentials in deployment/environment secrets. value is redacted"
+        )));
     }
 
     Ok(())
@@ -788,7 +828,8 @@ fn source_override(
         source: source.to_string(),
         overridden_source: overridden_source.to_string(),
         message: format!(
-            "{source} overrides {overridden_source} for {field_path}; suggested fix: if this override is unintended, {}; otherwise remove the duplicate lower-precedence setting from {overridden_source}",
+            "{source} overrides {overridden_source} for {field_path}; {}; suggested fix: if this override is unintended, {}; otherwise remove the duplicate lower-precedence setting from {overridden_source}",
+            source_override_note(field_path),
             remove_source_field_action(source, field_path)
         ),
     }
@@ -799,10 +840,49 @@ fn source_field(field_path: &str, source: &str) -> ConfigSourceField {
         field_path: field_path.to_string(),
         source: source.to_string(),
         message: format!(
-            "{field_path} is set by {source}; values are omitted. To change it, {}",
+            "{field_path} is set by {source}; {}. To change it, {}",
+            source_value_omission_note(field_path),
             change_source_field_action(source, field_path)
         ),
     }
+}
+
+fn source_value_omission_note(field_path: &str) -> &'static str {
+    if is_sensitive_source_field_path(field_path) {
+        return "sensitive values are omitted; keep real credentials in deployment/environment secrets or approved SecretRef fields";
+    }
+
+    "values are omitted"
+}
+
+fn source_override_note(field_path: &str) -> String {
+    let mut note = source_value_omission_note(field_path).to_string();
+    if is_array_source_field_path(field_path) {
+        note.push_str("; arrays replace lower-precedence values rather than append");
+    }
+
+    note
+}
+
+fn is_array_source_field_path(field_path: &str) -> bool {
+    matches!(
+        field_path,
+        "monorepo.admin" | "monorepo.root_dirs" | "sidebar.default_items"
+    )
+}
+
+fn is_sensitive_source_field_path(field_path: &str) -> bool {
+    matches!(
+        field_path,
+        "database.db_url"
+            | "redis.url"
+            | "orion_server.db_url"
+            | "object_storage.s3.access_key_id"
+            | "object_storage.s3.secret_access_key"
+            | "object_storage.s3.endpoint_url"
+            | "mail.password"
+            | "mail.password_ref"
+    )
 }
 
 fn remove_source_field_action(source: &str, field_path: &str) -> String {
@@ -1068,21 +1148,27 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(test)]
 mod tests {
-    use orbit_api::factory::{GcsConfig, LocalConfig, S3Config};
+    use orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
 
     use super::*;
-    use crate::config::{secret::SecretRef, template::config_init_template};
+    use crate::config::{
+        secret::SecretRef, template::config_init_template, testing::isolated_config,
+    };
+
+    fn valid_config() -> Config {
+        isolated_config(std::env::temp_dir().join("monoengine-config-validate-tests"))
+    }
 
     #[test]
-    fn config_validate_accepts_default_mock_config() {
-        Config::mock()
+    fn config_validate_accepts_default_isolated_test_config() {
+        valid_config()
             .validate()
-            .expect("mock config should validate");
+            .expect("isolated test config should validate");
     }
 
     #[test]
     fn config_validate_rejects_non_postgres_database_type() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.database.db_type = "mysql".to_string();
 
         let err = config.validate().expect_err("database type should fail");
@@ -1092,7 +1178,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_non_postgres_database_url_scheme() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.database.db_url = "mysql://mono:mono@localhost:3306/mono".to_string();
 
         let err = config
@@ -1104,28 +1190,28 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_database_pool_settings() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.database.max_connection = 0;
         let err = config
             .validate()
             .expect_err("zero max connections should fail");
         assert!(err.to_string().contains("database.max_connection"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.database.min_connection = config.database.max_connection + 1;
         let err = config
             .validate()
             .expect_err("min connections above max should fail");
         assert!(err.to_string().contains("database.min_connection"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.database.acquire_timeout = 0;
         let err = config
             .validate()
             .expect_err("zero acquire timeout should fail");
         assert!(err.to_string().contains("database.acquire_timeout"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.database.connect_timeout = 0;
         let err = config
             .validate()
@@ -1135,35 +1221,35 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_monorepo_settings() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.monorepo.import_dir = PathBuf::new();
         let err = config
             .validate()
             .expect_err("empty monorepo import dir should fail");
         assert!(err.to_string().contains("monorepo.import_dir"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.monorepo.root_dirs.clear();
         let err = config
             .validate()
             .expect_err("empty monorepo root dirs should fail");
         assert!(err.to_string().contains("monorepo.root_dirs"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.monorepo.root_dirs = vec!["".to_string()];
         let err = config
             .validate()
             .expect_err("blank monorepo root dir should fail");
         assert!(err.to_string().contains("monorepo.root_dirs[0]"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.monorepo.admin = vec!["".to_string()];
         let err = config
             .validate()
             .expect_err("blank monorepo admin should fail");
         assert!(err.to_string().contains("monorepo.admin[0]"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.monorepo.rename.similarity_threshold = 101;
         let err = config
             .validate()
@@ -1176,28 +1262,28 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_pack_settings() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.pack.pack_decode_mem_size = "definitely-not-a-size".to_string();
         let err = config
             .validate()
             .expect_err("invalid pack decode memory size should fail");
         assert!(err.to_string().contains("pack.pack_decode_mem_size"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.pack.pack_decode_disk_size = "0".to_string();
         let err = config
             .validate()
             .expect_err("zero pack decode disk size should fail");
         assert!(err.to_string().contains("pack.pack_decode_disk_size"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.pack.pack_decode_cache_path = PathBuf::new();
         let err = config
             .validate()
             .expect_err("empty pack decode cache path should fail");
         assert!(err.to_string().contains("pack.pack_decode_cache_path"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.pack.channel_message_size = 0;
         let err = config
             .validate()
@@ -1207,28 +1293,28 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_blame_settings() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.blame.max_lines_threshold = 0;
         let err = config
             .validate()
             .expect_err("zero blame line threshold should fail");
         assert!(err.to_string().contains("blame.max_lines_threshold"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.blame.max_size_threshold = "not-a-size".to_string();
         let err = config
             .validate()
             .expect_err("invalid blame size threshold should fail");
         assert!(err.to_string().contains("blame.max_size_threshold"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.blame.default_chunk_size = 0;
         let err = config
             .validate()
             .expect_err("zero blame chunk size should fail");
         assert!(err.to_string().contains("blame.default_chunk_size"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.blame.max_commits_in_memory = 0;
         let err = config
             .validate()
@@ -1238,7 +1324,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_unknown_log_level() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.log.level = "verbose".to_string();
 
         let err = config.validate().expect_err("log level should fail");
@@ -1248,7 +1334,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_lfs_http_url() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.lfs.ssh.http_url = "ftp://localhost:8000".to_string();
 
         let err = config.validate().expect_err("lfs url should fail");
@@ -1258,7 +1344,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_enabled_build_without_orion_url() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.build.enable_build = true;
         config.build.orion_server = String::new();
 
@@ -1271,7 +1357,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_redis_url_scheme() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.redis.url = "http://localhost:6379".to_string();
 
         let err = config.validate().expect_err("redis scheme should fail");
@@ -1281,7 +1367,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_orion_server_config() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         let orion_server = OrionServerConfig {
             port: 0,
             ..Default::default()
@@ -1318,6 +1404,33 @@ mod tests {
     }
 
     #[test]
+    fn mail_validate_rejects_password_ref_outside_mail_namespace_without_leaking_ref() {
+        let mail_config = MailConfig {
+            enabled: false,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: Some(
+                SecretRef::parse("vault://secret/config/prod/database/password#value").unwrap(),
+            ),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+        };
+
+        let err = mail_config
+            .validate()
+            .expect_err("wrong SecretRef namespace should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("mail.password_ref"));
+        assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("config/prod/database/password"));
+        assert!(!message.contains("#value"));
+    }
+
+    #[test]
     fn mail_validate_rejects_missing_enabled_smtp_host() {
         let mail_config = MailConfig {
             enabled: true,
@@ -1337,7 +1450,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_buck_config() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.buck = Some(BuckConfig {
             max_files: 0,
             ..Default::default()
@@ -1351,7 +1464,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_empty_local_object_storage_root() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::Local,
             local: LocalConfig {
@@ -1369,7 +1482,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_incomplete_s3_object_storage() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
@@ -1390,8 +1503,50 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref() {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: "vault://secret/config/prod/object-storage/access#value".to_string(),
+                secret_access_key: "secret".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("object storage SecretRef-like value should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("object_storage.s3.access_key_id"));
+        assert!(message.contains("deployment/environment secrets"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("config/prod/object-storage/access"));
+        assert!(!message.contains("#value"));
+
+        config.object_storage.s3.access_key_id = "key".to_string();
+        config.object_storage.s3.secret_access_key =
+            " vault://secret/config/prod/object-storage/secret#value".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("object storage SecretRef-like secret key should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("object_storage.s3.secret_access_key"));
+        assert!(message.contains("deployment/environment secrets"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("config/prod/object-storage/secret"));
+        assert!(!message.contains("#value"));
+    }
+
+    #[test]
     fn config_validate_rejects_s3_compatible_without_endpoint() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::S3Compatible,
             s3: S3Config {
@@ -1413,7 +1568,7 @@ mod tests {
 
     #[test]
     fn config_validate_accepts_complete_s3_compatible_object_storage() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::S3Compatible,
             s3: S3Config {
@@ -1433,7 +1588,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_incomplete_gcs_object_storage() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::Gcs,
             gcs: GcsConfig {
@@ -1451,14 +1606,14 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_artifact_gc_settings() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.artifacts_gc.interval_secs = 0;
         let err = config
             .validate()
             .expect_err("zero artifact gc interval should fail");
         assert!(err.to_string().contains("artifacts_gc.interval_secs"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.artifacts_gc.batch_limit = 0;
         let err = config
             .validate()
@@ -1468,7 +1623,7 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_invalid_sidebar_items() {
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.sidebar.default_items[0].public_id.clear();
         let err = config
             .validate()
@@ -1478,21 +1633,21 @@ mod tests {
                 .contains("sidebar.default_items[0].public_id")
         );
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.sidebar.default_items[0].label.clear();
         let err = config
             .validate()
             .expect_err("blank sidebar label should fail");
         assert!(err.to_string().contains("sidebar.default_items[0].label"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         config.sidebar.default_items[0].href.clear();
         let err = config
             .validate()
             .expect_err("blank sidebar href should fail");
         assert!(err.to_string().contains("sidebar.default_items[0].href"));
 
-        let mut config = Config::mock();
+        let mut config = valid_config();
         let duplicate_id = config.sidebar.default_items[0].public_id.clone();
         config.sidebar.default_items[1].public_id = duplicate_id;
         let err = config
@@ -1691,6 +1846,9 @@ mod tests {
             [database]
             db_url = "postgres://localhost:5432/base"
 
+            [monorepo]
+            root_dirs = ["base-root"]
+
             [mail]
             {} = "plain-text-password"
             "#,
@@ -1703,6 +1861,9 @@ mod tests {
             r#"
             [log]
             level = "debug"
+
+            [monorepo]
+            root_dirs = ["profile-root"]
             "#,
         )
         .expect("write profile config");
@@ -1725,11 +1886,17 @@ mod tests {
             .collect::<Vec<_>>();
         let override_text = overrides.join("\n");
 
-        assert_eq!(diagnostics.source_overrides.len(), 4);
+        assert_eq!(diagnostics.source_overrides.len(), 5);
         assert!(overrides.iter().any(|message| {
             message.contains("profile file")
                 && message.contains("base file")
                 && message.contains("log.level")
+        }));
+        assert!(overrides.iter().any(|message| {
+            message.contains("profile file")
+                && message.contains("base file")
+                && message.contains("monorepo.root_dirs")
+                && message.contains("arrays replace lower-precedence values rather than append")
         }));
         assert!(overrides.iter().any(|message| {
             message.contains("MEGA_LOG__LEVEL")
@@ -1747,6 +1914,8 @@ mod tests {
                 && message.contains("mail.password")
         }));
         assert!(override_text.contains("suggested fix"));
+        assert!(override_text.contains("sensitive values are omitted"));
+        assert!(override_text.contains("deployment/environment secrets"));
         assert!(override_text.contains("unset MEGA_LOG__LEVEL"));
         assert!(override_text.contains("remove log.level from profile file"));
         assert!(override_text.contains("duplicate lower-precedence setting"));
@@ -1754,6 +1923,8 @@ mod tests {
         assert!(!override_text.contains("plain-text-password"));
         assert!(!override_text.contains("debug"));
         assert!(!override_text.contains("info"));
+        assert!(!override_text.contains("base-root"));
+        assert!(!override_text.contains("profile-root"));
         assert!(
             diagnostics
                 .environment_warnings
@@ -1836,6 +2007,8 @@ mod tests {
                     && message.contains("MEGA_MAIL__PASSWORD"))
         );
         assert!(source_text.contains("values are omitted"));
+        assert!(source_text.contains("sensitive values are omitted"));
+        assert!(source_text.contains("deployment/environment secrets"));
         assert!(source_text.contains("use a higher-precedence profile/env override"));
         assert!(source_text.contains(
             "update MEGA_MAIL__PASSWORD or unset it to fall back to lower-precedence sources"

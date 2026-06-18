@@ -117,6 +117,7 @@ impl Config {
         deserialize_with_diagnostics(config_from_path_with_profile(path, profile_path)?)
     }
 
+    #[cfg(test)]
     pub fn mock() -> Self {
         Self {
             base_dir: PathBuf::new(),

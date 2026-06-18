@@ -487,6 +487,10 @@ const GENERIC_POLICY: RuntimePolicy = RuntimePolicy {
     name: "monoengine-generic",
     display_name: "monoengine-generic",
     hcl: r#"
+path "secret/config/*" {
+    capabilities = ["deny"]
+}
+
 path "secret/*" {
     capabilities = ["create", "read", "update", "delete", "list"]
 }
@@ -938,6 +942,68 @@ mod tests {
                 "Secret {name} should be deleted but still exists"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_config_secret_acl_is_not_granted_to_generic_token() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault_core = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize");
+
+        let config_secret_path = "config/prod/mail/password";
+        let config_vault_path = "secret/config/prod/mail/password";
+        let generic_secret_path = "generic/test_key";
+        let generic_vault_path = "secret/generic/test_key";
+        let secret_data = serde_json::json!({"value": "test"})
+            .as_object()
+            .expect("test secret should be an object")
+            .clone();
+
+        vault_core
+            .write_secret(config_secret_path, Some(secret_data.clone()))
+            .await
+            .expect("config token should write config secret");
+        vault_core
+            .write_secret(generic_secret_path, Some(secret_data))
+            .await
+            .expect("generic token should write generic secret");
+
+        vault_core
+            .rvault
+            .read(
+                Some(vault_core.runtime_tokens.config.clone()),
+                config_vault_path,
+            )
+            .await
+            .expect("config token should read config secret");
+        vault_core
+            .rvault
+            .read(
+                Some(vault_core.runtime_tokens.generic.clone()),
+                generic_vault_path,
+            )
+            .await
+            .expect("generic token should read generic secret");
+
+        vault_core
+            .rvault
+            .read(
+                Some(vault_core.runtime_tokens.generic.clone()),
+                config_vault_path,
+            )
+            .await
+            .expect_err("generic token must not read config secrets");
+        vault_core
+            .rvault
+            .read(
+                Some(vault_core.runtime_tokens.config.clone()),
+                generic_vault_path,
+            )
+            .await
+            .expect_err("config token must not read generic secrets");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

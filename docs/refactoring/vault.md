@@ -33,7 +33,7 @@
 >
 > - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
-> - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。
+> - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
 > - G：对象存储凭据未迁入本项目 vault，因此不做完整 Storage 后置初始化重排。当前边界是：`object_storage.*` 仍属于早期运行时依赖，不能配置为 `SecretRef`；`config secret set/check` 已不依赖对象存储可用。
 
 ## 当前实现概览
@@ -63,7 +63,7 @@
 | KV secret 读写删 | 已实现并收窄 | `read_secret` / `write_secret` / `delete_secret` 使用相对 `SecretName`，拒绝 `/`、`secret/`、空段和 `..`。 |
 | vault 物理后端 | 已拆边界 | `JupiterBackend` 依赖 `VaultBackendStorage`，生产由 `VaultStorage` 适配；可 DB-only 构造 `VaultCore`。 |
 | `core_key.json` 自动解封 | 已加固 | 只保存 unseal 分片和限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不清库。 |
-| root token 生命周期 | 已接入最小权限 | 初始化后安装 monoengine ACL policy、签发限权 token、撤销 root token；常规 secret 路径不持有 root token。 |
+| root token 生命周期 | 已接入最小权限 | 初始化后安装 monoengine ACL policy、签发限权 token、撤销 root token；常规 secret 路径不持有 root token；generic token 显式拒绝 `secret/config/*`，并有 config/generic token 隔离单测。 |
 | secret 访问审计 | 已接 hook | `VaultCoreInterface` read/write/delete 记录 `vault_audit` 事件，不包含 secret 值、root token 或分片。 |
 | 最小 DB/Vault bootstrap | 已实现 | `VaultCore::from_database_config/from_database_connection` 和 `config secret set/check` 只依赖数据库和 vault key。 |
 | `LoadMode` / `SecretRef` / resolver | 已实现 | CLI 按命令选择加载级别；`SecretRef`/resolver 支持 `mail.password_ref` 延迟解析和缓存/evict。 |

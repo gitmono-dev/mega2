@@ -16,7 +16,9 @@ use crate::{
         Config,
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
         template::config_init_template,
-        validate::{ConfigSourceDiagnostics, collect_source_diagnostics},
+        validate::{
+            ConfigSourceDiagnostics, collect_source_diagnostics, validate_mail_password_secret_ref,
+        },
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
 };
@@ -235,9 +237,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some(("set", set_args)) => {
             let config_path = require_config_path(&ctx, "config secret set")?;
             let config_profile_path = ctx.config_profile_path.as_deref();
-            let name = set_args
-                .get_one::<String>("name")
-                .expect("required by clap");
+            let name = required_string_arg(set_args, "name")?;
             ensure_supported_secret_field(name)?;
             let secret_ref = secret_ref_from_args(set_args)?;
             let value = read_secret_value_from_stdin()?;
@@ -255,12 +255,12 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some(("check", check_args)) => {
             let config_path = require_config_path(&ctx, "config secret check")?;
             let config_profile_path = ctx.config_profile_path.as_deref();
-            let name = check_args
-                .get_one::<String>("name")
-                .expect("required by clap");
+            let name = required_string_arg(check_args, "name")?;
             ensure_supported_secret_field(name)?;
             let secret_ref = if let Some(value) = check_args.get_one::<String>("ref") {
-                SecretRef::parse(value)?
+                let secret_ref = SecretRef::parse(value)?;
+                validate_mail_password_secret_ref(name, &secret_ref)?;
+                secret_ref
             } else {
                 secret_ref_from_args(check_args)?
             };
@@ -388,14 +388,24 @@ async fn bootstrap_vault_from_path(
 }
 
 fn secret_ref_from_args(args: &ArgMatches) -> Result<SecretRef, MegaError> {
-    let name = args.get_one::<String>("name").expect("required by clap");
+    let name = required_string_arg(args, "name")?;
     ensure_supported_secret_field(name)?;
     let vault_path = args
         .get_one::<String>("vault-path")
         .ok_or_else(|| MegaError::Other("--vault-path is required".to_string()))?;
-    let field = args.get_one::<String>("field").expect("defaulted by clap");
+    let field = required_string_arg(args, "field")?;
 
-    SecretRef::from_parts(vault_path, field)
+    let secret_ref = SecretRef::from_parts(vault_path, field)?;
+    validate_mail_password_secret_ref(name, &secret_ref)?;
+    Ok(secret_ref)
+}
+
+fn required_string_arg<'a>(args: &'a ArgMatches, name: &str) -> Result<&'a String, MegaError> {
+    args.get_one::<String>(name).ok_or_else(|| {
+        MegaError::Other(format!(
+            "internal CLI wiring error: missing `{name}` argument"
+        ))
+    })
 }
 
 fn ensure_supported_secret_field(name: &str) -> Result<(), MegaError> {
@@ -520,6 +530,64 @@ mod tests {
         assert!(err.to_string().contains("only mail.password"));
     }
 
+    #[test]
+    fn secret_ref_from_args_rejects_wrong_mail_namespace_without_leaking_path() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "mail.password",
+                "--vault-path",
+                "config/prod/database/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+
+        assert!(message.contains("mail.password"));
+        assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("config/prod/database/password"));
+    }
+
+    #[test]
+    fn config_secret_check_ref_rejects_wrong_mail_namespace_without_leaking_ref() {
+        let matches = cli()
+            .try_get_matches_from([
+                "config",
+                "secret",
+                "check",
+                "mail.password",
+                "--ref",
+                "vault://secret/config/prod/database/password#value",
+            ])
+            .unwrap();
+        let Some(("secret", secret_args)) = matches.subcommand() else {
+            panic!("secret subcommand should parse");
+        };
+        let Some(("check", check_args)) = secret_args.subcommand() else {
+            panic!("secret check subcommand should parse");
+        };
+        let name = check_args
+            .get_one::<String>("name")
+            .expect("required by clap");
+        let secret_ref = check_args
+            .get_one::<String>("ref")
+            .map(SecretRef::parse)
+            .expect("--ref should exist")
+            .expect("SecretRef should parse");
+
+        let err =
+            validate_mail_password_secret_ref(name, &secret_ref).expect_err("wrong namespace");
+        let message = err.to_string();
+
+        assert!(message.contains("mail.password"));
+        assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
+        assert!(message.contains("value is redacted"));
+        assert!(!message.contains("config/prod/database/password"));
+        assert!(!message.contains("#value"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn validate_rejects_mail_password_and_password_ref_together() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -605,6 +673,12 @@ mod tests {
             r#"
             [log]
             level = "info"
+
+            [database]
+            db_url = "postgres://localhost:5432/base"
+
+            [monorepo]
+            root_dirs = ["base-root"]
             "#,
         )
         .expect("write config source");
@@ -614,6 +688,9 @@ mod tests {
                 r#"
             [log]
             level = "debug"
+
+            [monorepo]
+            root_dirs = ["profile-root"]
 
             [mail]
             {} = "plain-text-password"
@@ -626,7 +703,11 @@ mod tests {
         let diagnostics = collect_source_diagnostics_from_keys(
             Some(&config_path),
             Some(&profile_path),
-            ["MEGA_MAIL__PASSWORD", "MEGA_UNKNOWN__VALUE"],
+            [
+                "MEGA_DATABASE__DB_URL",
+                "MEGA_MAIL__PASSWORD",
+                "MEGA_UNKNOWN__VALUE",
+            ],
         )
         .expect("diagnostics should collect");
         let output = source_diagnostic_lines(&diagnostics).join("\n");
@@ -641,10 +722,16 @@ mod tests {
         assert!(output.contains("source override:"));
         assert!(output.contains("suggested fix"));
         assert!(output.contains("values are omitted"));
+        assert!(output.contains("sensitive values are omitted"));
+        assert!(output.contains("deployment/environment secrets"));
+        assert!(output.contains("arrays replace lower-precedence values rather than append"));
         assert!(output.contains("unset MEGA_MAIL__PASSWORD"));
         assert!(!output.contains("plain-text-password"));
+        assert!(!output.contains("postgres://localhost"));
         assert!(!output.contains("debug"));
         assert!(!output.contains("info"));
+        assert!(!output.contains("base-root"));
+        assert!(!output.contains("profile-root"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

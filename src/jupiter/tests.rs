@@ -13,7 +13,7 @@ use tracing::log;
 use url::Url;
 
 use crate::{
-    config::{Config, DbConfig, reload::ConfigHandle},
+    config::{DbConfig, reload::ConfigHandle, testing::isolated_config},
     jupiter::{
         migration::apply_migrations,
         service::{
@@ -147,7 +147,7 @@ async fn execute_postgres(db: &DatabaseConnection, sql: String) {
 pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
     let connection = test_db_connection(temp_dir.as_ref()).await;
     let connection = Arc::new(connection);
-    let config = Arc::new(Config::mock());
+    let config = Arc::new(isolated_config(temp_dir.as_ref().join("config")));
     let base = BaseStorage::new(connection.clone());
 
     let svc = AppService {

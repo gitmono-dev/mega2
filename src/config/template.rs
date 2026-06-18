@@ -96,6 +96,7 @@ enabled = false
 smtp_host = "smtp.example.com"
 smtp_port = 587
 username = "monoengine@example.com"
+# Must stay under config/<profile>/mail/password for mail.password_ref.
 password_ref = "vault://secret/config/prod/mail/password#value"
 from = "no-reply@example.com"
 starttls = true

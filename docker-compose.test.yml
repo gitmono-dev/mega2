@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:15-alpine
+    shm_size: "1gb"
     environment:
       POSTGRES_USER: mono
       POSTGRES_PASSWORD: mono_test_password

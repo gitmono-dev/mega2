@@ -38,6 +38,7 @@ pub mod webhook_storage;
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use sea_orm::DatabaseConnection;
 use tokio::sync::Semaphore;
 
@@ -406,9 +407,13 @@ impl Storage {
                         MegaError::ObjStorageNotFound(friendly)
                     }
                     Ok(mut blobs) => {
-                        let blob = blobs.pop().expect(
-                            "blobs is guaranteed non-empty here due to match guard on previous arm",
-                        );
+                        let Some(blob) = blobs.pop() else {
+                            let friendly = format!(
+                                "[obj_missing_in_db_and_s3] Blob {hash} not found in both object storage and metadata (likely never written or invalid request)"
+                            );
+                            tracing::warn!("{}", friendly);
+                            return MegaError::ObjStorageNotFound(friendly);
+                        };
                         tracing::error!(
                             "[obj_missing_in_s3_but_has_meta] Object with hash {hash} missing in S3 but metadata exists in DB for blob_id {}; possible data loss or misconfiguration",
                             blob.blob_id,
@@ -550,8 +555,14 @@ impl Storage {
         self.app_service.bots_storage.clone()
     }
 
+    #[cfg(test)]
     pub fn mock() -> Self {
-        let config = Arc::new(Config::mock());
+        let mut config = crate::config::testing::isolated_config(
+            std::env::temp_dir().join("monoengine-storage-mock"),
+        );
+        config.database.max_connection = 16;
+        config.database.min_connection = 8;
+        let config = Arc::new(config);
 
         let app_service = AppService::mock();
         let webhook_service = WebhookService::mock(app_service.webhook_storage.clone());

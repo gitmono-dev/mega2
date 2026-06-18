@@ -8,8 +8,10 @@ on:
       - "src/cli.rs"
       - "src/commands/config.rs"
       - "src/config/**"
+      - "src/contract/vault/integration/vault_core.rs"
       - "docs/refactoring/config.md"
       - "docs/refactoring/mail.md"
+      - "docs/refactoring/vault.md"
       - "README.md"
   push:
     branches:
@@ -20,8 +22,10 @@ on:
       - "src/cli.rs"
       - "src/commands/config.rs"
       - "src/config/**"
+      - "src/contract/vault/integration/vault_core.rs"
       - "docs/refactoring/config.md"
       - "docs/refactoring/mail.md"
+      - "docs/refactoring/vault.md"
       - "README.md"
 
 jobs:
@@ -58,11 +62,13 @@ jobs:
           cargo test placeholder_substitution_error_redacts_context_values -- --nocapture
           cargo test reload_applies_subscribers_before_publishing_snapshot -- --nocapture
           cargo test reload_rolls_back_subscribers_and_keeps_snapshot_when_apply_fails -- --nocapture
+          cargo test reload_reports_static_consumer_fields_as_restart_required_without_publishing_snapshot -- --nocapture
           cargo test test_new_with_profile_merges_profile_before_env -- --nocapture
           cargo test config_init_template_has_no_unconsumed_fields -- --nocapture
           cargo test config_validate_rejects_invalid_monorepo_settings -- --nocapture
           cargo test config_validate_rejects_invalid_pack_settings -- --nocapture
           cargo test config_validate_rejects_invalid_blame_settings -- --nocapture
+          cargo test config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref -- --nocapture
           cargo test config_validate_rejects_invalid_sidebar_items -- --nocapture
           cargo test config_validate_rejects_invalid_artifact_gc_settings -- --nocapture
           cargo test source_diagnostics_collects_base_profile_and_env_warnings -- --nocapture
@@ -76,12 +82,15 @@ jobs:
           cargo test validate_config_denies_source_warnings_when_requested -- --nocapture
           cargo test validate_config_denies_deprecated_mail_password_source_without_leaking_value -- --nocapture
           cargo test show_sources_lines_include_source_warnings_without_values -- --nocapture
+          cargo test secret_ref_from_args_rejects_wrong_mail_namespace_without_leaking_path -- --nocapture
+          cargo test mail_validate_rejects_password_ref_outside_mail_namespace_without_leaking_ref -- --nocapture
           cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
           cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
           cargo test resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref -- --nocapture
           cargo test resolve_config_secrets_reports_permission_denied_without_leaking_ref -- --nocapture
           cargo test vault_secret_resolver_reports_missing_field_without_leaking_ref -- --nocapture
           cargo test vault_secret_resolver_reports_non_string_field_without_leaking_ref -- --nocapture
+          cargo test test_config_secret_acl_is_not_granted_to_generic_token -- --nocapture
 
       - name: Validate bundled config
         working-directory: monoengine
@@ -110,10 +119,18 @@ jobs:
           EOF
           cargo run -- --config "${config_dir}/config.toml" --profile prod config validate
           source_output="${config_dir}/source-diagnostics.out"
-          cargo run -- --config "${config_dir}/config.toml" --profile prod config validate --show-sources >"${source_output}" 2>&1
+          MEGA_DATABASE__DB_URL="postgres://ci.example.invalid:5432/ci" cargo run -- --config "${config_dir}/config.toml" --profile prod config validate --show-sources >"${source_output}" 2>&1
           grep -F "source field:" "${source_output}"
           grep -F "source override:" "${source_output}"
           grep -F "log.level" "${source_output}"
+          grep -F "database.db_url" "${source_output}"
+          grep -F "sensitive values are omitted" "${source_output}"
+          grep -F "deployment/environment secrets" "${source_output}"
+          grep -F "monorepo.root_dirs" "${source_output}"
+          grep -F "arrays replace lower-precedence values rather than append" "${source_output}"
+          ! grep -F "postgres://ci.example.invalid" "${source_output}"
+          ! grep -F "profile-root" "${source_output}"
+          ! grep -F "base-root" "${source_output}"
 
       - name: Validate bad config diagnostics
         working-directory: monoengine
@@ -170,6 +187,25 @@ jobs:
           fi
           grep -F "secret ref must include a #field suffix" "${secret_ref_output}"
           grep -F "mail.password_ref" "${secret_ref_output}"
+
+          cat > "${config_dir}/config.bad-secret-ref-namespace.toml" <<'EOF'
+          [mail]
+          enabled = false
+          smtp_host = "smtp.example.com"
+          from = "no-reply@example.com"
+          password_ref = "vault://secret/config/prod/database/password#value"
+          EOF
+
+          secret_ref_namespace_output="${config_dir}/bad-secret-ref-namespace.out"
+          if cargo run -- --config "${config_dir}/config.toml" --profile bad-secret-ref-namespace config validate >"${secret_ref_namespace_output}" 2>&1; then
+            cat "${secret_ref_namespace_output}"
+            echo "bad SecretRef namespace config unexpectedly validated"
+            exit 1
+          fi
+          grep -F "mail.password_ref" "${secret_ref_namespace_output}"
+          grep -F "vault://secret/config/<profile>/mail/password#<field>" "${secret_ref_namespace_output}"
+          grep -F "value is redacted" "${secret_ref_namespace_output}"
+          ! grep -F "config/prod/database/password" "${secret_ref_namespace_output}"
 
           cat > "${config_dir}/config.bad-redis.toml" <<'EOF'
           [redis]

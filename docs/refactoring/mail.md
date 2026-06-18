@@ -42,7 +42,7 @@
 | Notification Dispatcher + 触发器集成 | **已接入编译** | `src/notification/dispatcher.rs` 及测试使用 `crate::mail`。触发器（triggers.rs）使用 NotificationStorage enqueue 逻辑（事件类型、用户偏好过滤）已存在；`main.rs:18` 已声明 `mod notification;`。 |
 | 后台 dispatcher 启动 | **已在 mail 启用时启动** | `AppContext::new` 在 `VaultCore::new` 之后构造 `SmtpMailer`、创建 `EmailDispatcher` 并 `tokio::spawn(dispatcher.run(shutdown))`。SMTP 构造失败现在返回可诊断错误；发送失败会按 backoff 重新排队，并在达到阈值后转为 `failed` dead-letter。当前缺口是并发策略和更完整观测。 |
 | 晚于 Vault 的 mailer 构造 | **已落地** | `SmtpMailer::new` 本身是同步且轻量的，当前调用点在 `context/mod.rs:46-55`，严格晚于 `VaultCore::new`。 |
-| SecretRef / `password_ref` 支持 | **已落地首批** | 当前 `MailConfig.password: Option<SecretString>` 仅为兼容期入口，`password_ref: Option<SecretRef>` 为推荐路径；两者互斥。`AppContext::new` 在 vault 就绪后通过 resolver 解析 `password_ref` 并构造 SMTP mailer。 |
+| SecretRef / `password_ref` 支持 | **已落地首批** | 当前 `MailConfig.password: Option<SecretString>` 仅为兼容期入口，`password_ref: Option<SecretRef>` 为推荐路径；两者互斥，且 `mail.password_ref` / `config secret mail.password` 只接受 `vault://secret/config/<profile>/mail/password#<field>` namespace。`AppContext::new` 在 vault 就绪后通过 resolver 解析 `password_ref` 并构造 SMTP mailer。 |
 | 多种后端（SES、SendGrid 等） | **未实现** | 仅 SMTP + Noop。mega 体系中也以 SMTP 为主，未来可扩展 provider。 |
 | 模板 / 富文本 / 附件 | **基础 HTML+Text** | `send_html(to, subject, html, text?)` 实现 alternative multipart。无高级模板引擎。 |
 | 与 user_notification_* / 事件类型 的完整联动 | **实体+存储+触发器骨架存在** | callisto 实体 + NotificationStorage 方法 + triggers（cl.comment 等）已移植自 mega，dispatcher 常驻任务、mailer 注入和失败 dead-letter 基线已接入；仍缺更多业务触发器调用面、更完整观测和管理面。 |
@@ -168,7 +168,7 @@ src/mail/
 3. 已在消费端（dispatcher 启动点）于 vault 就绪后解析 `password_ref` 并构造 `SmtpMailer`。
 4. 剩余工作是给明文 `password` 制定退场节奏，并补充运行期重配时的 resolver 缓存失效/失败回滚设计。
 
-`config secret set/check` 已支持 `mail.password` 路径（使用最小 bootstrap）。
+`config secret set/check` 已支持 `mail.password` 路径（使用最小 bootstrap），并拒绝不在 `config/<profile>/mail/password` namespace 下的引用。
 
 ### 后台 Dispatcher 启动与生命周期
 
@@ -179,7 +179,7 @@ src/mail/
 
 ### 多环境与 Profile
 
-继承 config 的 profile 机制：`config.mail` 里的 host/port 可被 profile 覆盖，`password_ref` 应包含 namespace（如 `vault://secret/config/prod/mail/password#value`）。
+继承 config 的 profile 机制：`config.mail` 里的 host/port 可被 profile 覆盖，`password_ref` 必须包含受控 namespace（如 `vault://secret/config/prod/mail/password#value`）。
 
 ### 可扩展性（Provider）
 

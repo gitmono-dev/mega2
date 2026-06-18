@@ -541,13 +541,10 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
     };
 
     let origins: Vec<HeaderValue> = vec![
-        "http://localhost",
-        "http://app.gitmega.com",
-        "http://app.gitmono.test",
-    ]
-    .into_iter()
-    .map(|x| x.parse::<HeaderValue>().unwrap())
-    .collect();
+        HeaderValue::from_static("http://localhost"),
+        HeaderValue::from_static("http://app.gitmega.com"),
+        HeaderValue::from_static("http://app.gitmono.test"),
+    ];
 
     // add RequestDecompressionLayer for handle gzip encode
     // add TraceLayer for log record

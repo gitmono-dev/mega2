@@ -147,6 +147,7 @@ access_key_id = ""
 # Keep this value secure and never commit it to version control. Current
 # object storage bootstrap credentials are not resolved through monoengine
 # Vault SecretRef; inject them via env/profile/deployment secret instead.
+# `config validate` rejects vault:// values in access_key_id/secret_access_key.
 secret_access_key = ""
 
 
@@ -288,8 +289,10 @@ default_items = [
 
 [mail]
 # Prefer `password_ref = "vault://secret/config/<profile>/mail/password#value"`
-# for SMTP credentials. A plain `password` field remains only for compatibility
-# and is reported by `config validate`; `--deny-warnings` treats it as failure.
+# for SMTP credentials. `config validate` and `config secret` reject other
+# monoengine Vault namespaces for mail.password_ref. A plain `password` field
+# remains only for compatibility and is reported by `config validate`;
+# `--deny-warnings` treats it as failure.
 # When the service starts with mail enabled, switching this to false is hot-reloaded
 # and stops the dispatcher. Enabling mail or changing SMTP fields still needs restart.
 enabled = true

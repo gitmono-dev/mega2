@@ -1,6 +1,7 @@
 use std::{
     fmt,
     io::ErrorKind,
+    mem,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime},
@@ -138,6 +139,7 @@ impl ConfigHandle {
         apply_mail_changes(&current.mail, &candidate.mail, &mut next.mail, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
+        collect_static_restart_fields(&current, &candidate, &mut report);
 
         if report.applied() {
             let next = Arc::new(next);
@@ -608,6 +610,265 @@ fn collect_redis_restart_fields(
     }
 }
 
+fn collect_static_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.base_dir != candidate.base_dir {
+        report.restart_required_fields.push("base_dir");
+    }
+
+    collect_monorepo_restart_fields(current, candidate, report);
+    collect_pack_restart_fields(current, candidate, report);
+    collect_lfs_restart_fields(current, candidate, report);
+    collect_blame_restart_fields(current, candidate, report);
+    collect_build_restart_fields(current, candidate, report);
+    collect_object_storage_restart_fields(current, candidate, report);
+    collect_orion_server_restart_fields(current, candidate, report);
+    collect_sidebar_restart_fields(current, candidate, report);
+}
+
+fn collect_monorepo_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.monorepo.import_dir != candidate.monorepo.import_dir {
+        report.restart_required_fields.push("monorepo.import_dir");
+    }
+    if current.monorepo.admin != candidate.monorepo.admin {
+        report.restart_required_fields.push("monorepo.admin");
+    }
+    if current.monorepo.root_dirs != candidate.monorepo.root_dirs {
+        report.restart_required_fields.push("monorepo.root_dirs");
+    }
+    if current.monorepo.rename.similarity_threshold
+        != candidate.monorepo.rename.similarity_threshold
+    {
+        report
+            .restart_required_fields
+            .push("monorepo.rename.similarity_threshold");
+    }
+    if current.monorepo.rename.rename_limit != candidate.monorepo.rename.rename_limit {
+        report
+            .restart_required_fields
+            .push("monorepo.rename.rename_limit");
+    }
+}
+
+fn collect_pack_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.pack.pack_decode_mem_size != candidate.pack.pack_decode_mem_size {
+        report
+            .restart_required_fields
+            .push("pack.pack_decode_mem_size");
+    }
+    if current.pack.pack_decode_disk_size != candidate.pack.pack_decode_disk_size {
+        report
+            .restart_required_fields
+            .push("pack.pack_decode_disk_size");
+    }
+    if current.pack.pack_decode_cache_path != candidate.pack.pack_decode_cache_path {
+        report
+            .restart_required_fields
+            .push("pack.pack_decode_cache_path");
+    }
+    if current.pack.clean_cache_after_decode != candidate.pack.clean_cache_after_decode {
+        report
+            .restart_required_fields
+            .push("pack.clean_cache_after_decode");
+    }
+    if current.pack.channel_message_size != candidate.pack.channel_message_size {
+        report
+            .restart_required_fields
+            .push("pack.channel_message_size");
+    }
+    if current.pack.save_entry_concurrency != candidate.pack.save_entry_concurrency {
+        report
+            .restart_required_fields
+            .push("pack.save_entry_concurrency");
+    }
+}
+
+fn collect_lfs_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.lfs.local.lfs_file_path != candidate.lfs.local.lfs_file_path {
+        report
+            .restart_required_fields
+            .push("lfs.local.lfs_file_path");
+    }
+    if current.lfs.ssh.http_url != candidate.lfs.ssh.http_url {
+        report.restart_required_fields.push("lfs.ssh.http_url");
+    }
+}
+
+fn collect_blame_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.blame.max_lines_threshold != candidate.blame.max_lines_threshold {
+        report
+            .restart_required_fields
+            .push("blame.max_lines_threshold");
+    }
+    if current.blame.max_size_threshold != candidate.blame.max_size_threshold {
+        report
+            .restart_required_fields
+            .push("blame.max_size_threshold");
+    }
+    if current.blame.default_chunk_size != candidate.blame.default_chunk_size {
+        report
+            .restart_required_fields
+            .push("blame.default_chunk_size");
+    }
+    if current.blame.max_commits_in_memory != candidate.blame.max_commits_in_memory {
+        report
+            .restart_required_fields
+            .push("blame.max_commits_in_memory");
+    }
+    if current.blame.enable_caching != candidate.blame.enable_caching {
+        report.restart_required_fields.push("blame.enable_caching");
+    }
+}
+
+fn collect_build_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.build.enable_build != candidate.build.enable_build {
+        report.restart_required_fields.push("build.enable_build");
+    }
+    if current.build.orion_server != candidate.build.orion_server {
+        report.restart_required_fields.push("build.orion_server");
+    }
+    if current.build.orion_preheat_shallow_depth != candidate.build.orion_preheat_shallow_depth {
+        report
+            .restart_required_fields
+            .push("build.orion_preheat_shallow_depth");
+    }
+}
+
+fn collect_object_storage_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if mem::discriminant(&current.object_storage.storage_type)
+        != mem::discriminant(&candidate.object_storage.storage_type)
+    {
+        report
+            .restart_required_fields
+            .push("object_storage.storage_type");
+    }
+    if current.object_storage.local.root_dir != candidate.object_storage.local.root_dir {
+        report
+            .restart_required_fields
+            .push("object_storage.local.root_dir");
+    }
+    if current.object_storage.s3.region != candidate.object_storage.s3.region {
+        report
+            .restart_required_fields
+            .push("object_storage.s3.region");
+    }
+    if current.object_storage.s3.bucket != candidate.object_storage.s3.bucket {
+        report
+            .restart_required_fields
+            .push("object_storage.s3.bucket");
+    }
+    if current.object_storage.s3.access_key_id != candidate.object_storage.s3.access_key_id {
+        report
+            .restart_required_fields
+            .push("object_storage.s3.access_key_id");
+    }
+    if current.object_storage.s3.secret_access_key != candidate.object_storage.s3.secret_access_key
+    {
+        report
+            .restart_required_fields
+            .push("object_storage.s3.secret_access_key");
+    }
+    if current.object_storage.s3.endpoint_url != candidate.object_storage.s3.endpoint_url {
+        report
+            .restart_required_fields
+            .push("object_storage.s3.endpoint_url");
+    }
+    if current.object_storage.gcs.bucket != candidate.object_storage.gcs.bucket {
+        report
+            .restart_required_fields
+            .push("object_storage.gcs.bucket");
+    }
+}
+
+fn collect_orion_server_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    match (&current.orion_server, &candidate.orion_server) {
+        (None, None) => {}
+        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("orion_server"),
+        (Some(current), Some(candidate)) => {
+            if current.logger_storage_mode != candidate.logger_storage_mode {
+                report
+                    .restart_required_fields
+                    .push("orion_server.logger_storage_mode");
+            }
+            if current.build_log_dir != candidate.build_log_dir {
+                report
+                    .restart_required_fields
+                    .push("orion_server.build_log_dir");
+            }
+            if current.log_stream_buffer != candidate.log_stream_buffer {
+                report
+                    .restart_required_fields
+                    .push("orion_server.log_stream_buffer");
+            }
+            if current.db_url != candidate.db_url {
+                report.restart_required_fields.push("orion_server.db_url");
+            }
+            if current.port != candidate.port {
+                report.restart_required_fields.push("orion_server.port");
+            }
+            if current.monobase_url != candidate.monobase_url {
+                report
+                    .restart_required_fields
+                    .push("orion_server.monobase_url");
+            }
+        }
+    }
+}
+
+fn collect_sidebar_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    let current_items = &current.sidebar.default_items;
+    let candidate_items = &candidate.sidebar.default_items;
+    if current_items.len() != candidate_items.len()
+        || current_items
+            .iter()
+            .zip(candidate_items)
+            .any(|(current, candidate)| {
+                current.public_id != candidate.public_id
+                    || current.label != candidate.label
+                    || current.href != candidate.href
+                    || current.visible != candidate.visible
+                    || current.order_index != candidate.order_index
+            })
+    {
+        report.restart_required_fields.push("sidebar.default_items");
+    }
+}
+
 fn collect_mail_restart_fields(
     current: &MailConfig,
     candidate: &MailConfig,
@@ -709,6 +970,62 @@ mod tests {
             snapshot.database.db_url,
             "postgres://localhost:5432/current"
         );
+    }
+
+    #[test]
+    fn reload_reports_static_consumer_fields_as_restart_required_without_publishing_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.blame.enable_caching = true;
+        let current_object_root = current.object_storage.local.root_dir.clone();
+        let current_lfs_path = current.lfs.local.lfs_file_path.clone();
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.monorepo.root_dirs = vec!["changed-root".to_string()];
+        candidate.pack.channel_message_size = 2_000_000;
+        candidate.lfs.local.lfs_file_path = temp_dir.path().join("candidate-lfs");
+        candidate.blame.enable_caching = false;
+        candidate.build.orion_preheat_shallow_depth = 8;
+        candidate.object_storage.local.root_dir = temp_dir
+            .path()
+            .join("candidate-objects")
+            .to_string_lossy()
+            .to_string();
+        candidate.object_storage.s3.secret_access_key = "candidate-secret-access-key".to_string();
+        candidate.object_storage.gcs.bucket = "candidate-gcs-bucket".to_string();
+        candidate.orion_server = Some(Default::default());
+        candidate.sidebar.default_items[0].label = "Changed".to_string();
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let report_debug = format!("{report:?}");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec![
+                "monorepo.root_dirs",
+                "pack.channel_message_size",
+                "lfs.local.lfs_file_path",
+                "blame.enable_caching",
+                "build.orion_preheat_shallow_depth",
+                "object_storage.local.root_dir",
+                "object_storage.s3.secret_access_key",
+                "object_storage.gcs.bucket",
+                "orion_server",
+                "sidebar.default_items",
+            ]
+        );
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert_eq!(snapshot.object_storage.local.root_dir, current_object_root);
+        assert_eq!(snapshot.lfs.local.lfs_file_path, current_lfs_path);
+        assert!(snapshot.orion_server.is_none());
+        assert_ne!(snapshot.sidebar.default_items[0].label, "Changed");
+        assert!(!report_debug.contains("candidate-secret-access-key"));
+        assert!(!report_debug.contains("candidate-gcs-bucket"));
+        assert!(!report_debug.contains("candidate-objects"));
     }
 
     #[test]
@@ -950,7 +1267,7 @@ mod tests {
     {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let candidate_ref =
-            SecretRef::parse("vault://secret/config/test/mail/candidate#value").unwrap();
+            SecretRef::parse("vault://secret/config/candidate/mail/password#value").unwrap();
         let mut current = isolated_config(temp_dir.path().join("current"));
         current.mail = Some(MailConfig {
             enabled: true,
@@ -1011,7 +1328,7 @@ mod tests {
         assert!(snapshot_mail.password_ref.is_none());
         assert!(!report_debug.contains("current-password"));
         assert!(!report_debug.contains("candidate-user"));
-        assert!(!report_debug.contains("config/test/mail/candidate"));
+        assert!(!report_debug.contains("config/candidate/mail/password"));
         assert!(!report_debug.contains("#value"));
     }
 
@@ -1159,9 +1476,9 @@ mod tests {
     fn reload_reports_secret_ref_change_without_leaking_or_publishing_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let current_ref =
-            SecretRef::parse("vault://secret/config/test/mail/current#value").unwrap();
+            SecretRef::parse("vault://secret/config/current/mail/password#value").unwrap();
         let candidate_ref =
-            SecretRef::parse("vault://secret/config/test/mail/candidate#value").unwrap();
+            SecretRef::parse("vault://secret/config/candidate/mail/password#value").unwrap();
         let mut current = isolated_config(temp_dir.path().join("current"));
         current.mail = Some(MailConfig {
             password_ref: Some(current_ref.clone()),
@@ -1187,8 +1504,8 @@ mod tests {
                 .and_then(|mail| mail.password_ref.as_ref()),
             Some(&current_ref)
         );
-        assert!(!report_debug.contains("config/test/mail/current"));
-        assert!(!report_debug.contains("config/test/mail/candidate"));
+        assert!(!report_debug.contains("config/current/mail/password"));
+        assert!(!report_debug.contains("config/candidate/mail/password"));
         assert!(!report_debug.contains("#value"));
     }
 

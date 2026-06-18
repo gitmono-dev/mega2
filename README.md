@@ -134,6 +134,13 @@ Key sections (see `config/config.toml` for the full list):
 | `[mail]`           | SMTP enable flag, host / port / from address / STARTTLS, `password_ref`  |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
+`mail.password_ref` is currently the only config-backed monoengine Vault
+SecretRef. It must use `vault://secret/config/<profile>/mail/password#<field>`;
+database, Redis, and object storage credentials remain deployment/env secrets.
+`config validate` rejects SecretRef-like `object_storage.s3.access_key_id` and
+`object_storage.s3.secret_access_key` values instead of treating them as
+monoengine Vault-managed credentials.
+
 ### Run
 
 ```bash
@@ -309,6 +316,11 @@ cargo test --test <name>
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
   tasks hot-reload schedule settings and can be disabled without restart;
   enabling either task from off still requires restart.
+- **Config reload boundaries** — log settings, mail disable, and running
+  maintenance schedules are the hot-reload surface. Static consumers such as
+  database, Redis, object storage, LFS, build/orion, sidebar, pack, blame, and
+  monorepo layout changes are reported as restart-required and do not publish a
+  candidate snapshot.
 - **Vault** — `contract::vault::integration::vault_core::VaultCore` wraps
   the vendored `crate::vault` module with a `jupiter`‑backed storage adapter
   (`contract::vault::integration::jupiter_backend`), so secrets live in the
