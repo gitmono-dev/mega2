@@ -827,6 +827,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_mail_dispatcher_smtp_failure_dead_letters_outbox_job() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        let subject = format!("SMTP dead-letter integration {}", Uuid::new_v4());
+        stg.enqueue_email_job(
+            "alice",
+            "alice@example.test",
+            "cl.comment.created",
+            &subject,
+            "<p>SMTP dead-letter body</p>",
+            Some("SMTP dead-letter body"),
+        )
+        .await
+        .unwrap();
+
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: 1,
+            from: "no-reply@example.test".to_string(),
+            starttls: false,
+            ..Default::default()
+        };
+        let mailer = SmtpMailer::new_with_password(&mail, None).unwrap();
+        let control = EmailDispatcherControl::new_with_limits_and_retry_policy(
+            true,
+            EmailDispatcherLimits::default(),
+            EmailJobRetryPolicy::new(1, 1, 1),
+            EmailAttachmentPrunePolicy::default(),
+        );
+        let dispatcher = EmailDispatcher::new_with_control(stg.clone(), Arc::new(mailer), control);
+
+        dispatcher.tick_once().await.unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "failed");
+        assert_eq!(jobs[0].retry_count, 1);
+        assert!(jobs[0].next_retry_at.is_none());
+        assert!(jobs[0].sent_at.is_none());
+        assert!(jobs[0].error_message.is_some());
+    }
+
+    #[tokio::test]
     async fn dispatcher_prunes_old_terminal_attachments_by_policy() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
