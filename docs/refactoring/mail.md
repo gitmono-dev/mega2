@@ -40,7 +40,7 @@
 | `MailConfig` 结构体 + 纳入 Config | **已激活** | 添加到 `src/config/model.rs`（`Option<MailConfig>`，`#[serde(default)]`），含默认值函数、`MailProvider`（`smtp` / `console`）、反序列化测试、兼容期明文 `password` 与推荐 `password_ref`。与 mega 结构兼容（扁平 + 额外 toml 字段被忽略）。 |
 | 一级 `mail` 模块 (`src/mail/`) | **已激活** | `mod mail;` 在 `main.rs` 声明。`src/mail/mod.rs` 包含 `Mailer` trait、`NoopMailer`、`ConsoleMailer`、`SmtpMailer::new_with_password(...)`、`mailer_from_config(...)` + 构建消息 + 发送逻辑 + 单元测试。旧 `src/email/` 降级为纯 re-export shim。 |
 | Notification Dispatcher + 触发器集成 | **已接入编译** | `src/notification/dispatcher.rs` 及测试使用 `crate::mail`。触发器（triggers.rs）使用 NotificationStorage enqueue 逻辑（事件类型、用户偏好过滤）已存在；`main.rs:18` 已声明 `mod notification;`。 |
-| 后台 dispatcher 启动 | **已在 mail 启用时启动** | `AppContext::new` 在 `VaultCore::new` 之后通过 `mailer_from_config` 构造 provider mailer、创建 `EmailDispatcher` 并 `tokio::spawn(dispatcher.run(shutdown))`。SMTP 构造失败现在返回可诊断错误；发送失败会按 `mail.retry_backoff_base_secs` / `mail.retry_backoff_max_secs` 重新排队，并在达到 `mail.retry_max_attempts` 后转为 `failed` dead-letter，默认仍为 5 次、30s 基础 backoff、300s 上限。`EmailDispatcher` 当前每 tick 先恢复超过 `EMAIL_JOB_SEND_TIMEOUT_SECS = 900` 的 stale `sending` job，再按 `mail.dispatcher_batch_size` 拉取 pending job，并以 `mail.dispatcher_max_in_flight` 做有界并发发送；默认仍为 50 / 8，tick 结束输出 sent / retry / dead-letter / skipped / claim-missed / batch_size / max_in_flight / retry policy 等结构化汇总。 |
+| 后台 dispatcher 启动 | **已在 mail 启用时启动** | `AppContext::new` 在 `VaultCore::new` 之后通过 `mailer_from_config` 构造 provider mailer、创建 `EmailDispatcher` 并 `tokio::spawn(dispatcher.run(shutdown))`。SMTP 构造失败现在返回可诊断错误；发送失败会按 `mail.retry_backoff_base_secs` 指数退避并受 `mail.retry_backoff_max_secs` 截断后重新排队，在达到 `mail.retry_max_attempts` 后转为 `failed` dead-letter，默认仍为 5 次、30s 基础 backoff、300s 上限。`EmailDispatcher` 当前每 tick 先恢复超过 `EMAIL_JOB_SEND_TIMEOUT_SECS = 900` 的 stale `sending` job，再按 `mail.dispatcher_batch_size` 拉取 pending job，并以 `mail.dispatcher_max_in_flight` 做有界并发发送；默认仍为 50 / 8，tick 结束输出 sent / retry / dead-letter / skipped / claim-missed / batch_size / max_in_flight / retry policy 等结构化汇总。 |
 | 晚于 Vault 的 mailer 构造 | **已落地** | `SmtpMailer::new` / `mailer_from_config` 本身是同步且轻量的，当前调用点在 `context/mod.rs:46-55`，严格晚于 `VaultCore::new`。 |
 | SecretRef / `password_ref` 支持 | **已落地首批** | 当前 `MailConfig.password: Option<SecretString>` 仅为兼容期入口，`password_ref: Option<SecretRef>` 为推荐路径；两者互斥且仅适用于 `provider = "smtp"`，且 `mail.password_ref` / `config secret mail.password` 只接受 `vault://secret/config/<profile>/mail/password#<field>` namespace。`AppContext::new` 在 vault 就绪后通过 resolver 解析 SMTP `password_ref` 并构造 SMTP mailer。 |
 | 多种后端（SES、SendGrid 等） | **首批本地 provider 已实现** | 已支持 `provider = "smtp"` 与 `provider = "console"`；console provider 用于本地/dev/CI 干跑，只记录收件人、主题和正文长度，不使用 SMTP 凭据。仍无 SES、SendGrid 等真实第三方 provider。 |
@@ -206,7 +206,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 **阶段 0（已完成）**：激活一级 mail + MailConfig 入 Config + 修复 notification 引用 + 清理 shim。
 
-**阶段 1（已接入，基线已加固）**：在 service 启动路径中 late-construct mailer 并 spawn dispatcher 已落地；构造失败静默忽略已改为可诊断错误；失败发送已具备可配置 retry + dead-letter disposition；dispatcher 已具备每 tick 可配置批次/并发限流、结构化汇总日志、stale `sending` 恢复、单 tick 批次背压测试和 storage-level 并发 claim 竞争测试。剩余是完善真实 SMTP/Mailpit 集成、长时间高水位背压验证和真实多进程 claim 竞争矩阵。
+**阶段 1（已接入，基线已加固）**：在 service 启动路径中 late-construct mailer 并 spawn dispatcher 已落地；构造失败静默忽略已改为可诊断错误；失败发送已具备可配置 retry + dead-letter disposition，并按 base/max 配置执行指数退避；dispatcher 已具备每 tick 可配置批次/并发限流、结构化汇总日志、stale `sending` 恢复、单 tick 批次背压测试和 storage-level 并发 claim 竞争测试。剩余是完善真实 SMTP/Mailpit 集成、长时间高水位背压验证和真实多进程 claim 竞争矩阵。
 
 **阶段 2（已完成首批）**：与 config SecretRef 基础设施联动。`MailConfig` 已支持 `password_ref`，resolver 解析路径已在 `AppContext::new` 中落地，`config secret set/check` 已支持 mail password 引用。剩余是继续治理兼容期明文 `password` 的退场策略。
 
@@ -252,7 +252,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 | **功能正确性与接口兼容性** | 良好。Mailer trait 简单稳定；与 notification 的集成点（dispatcher 构造参数）清晰；与 callisto 实体对齐。shim 保证平滑过渡。 |
 | **数据流与控制流** | 正确。严格遵循 config.md 画的依赖顺序图。enqueue 只在触发器，send 只在 dispatcher tick，构造只在 post-vault。 |
 | **性能与效率** | 可接受。outbox 解耦了业务线程与 SMTP I/O；批次拉取 + claim 提供基础并发控制。未来可加并发发送 worker 池。 |
-| **可靠性与容错** | 改进空间大。当前有 retry_count/next_retry_at 字段，失败发送已按可配置 backoff 重排并在达到配置阈值后进入 failed dead-letter。仍需补充告警、指数退避、更完整观测和多实例策略。claim 失败时的幂等性需继续保证。 |
+| **可靠性与容错** | 改进空间大。当前有 retry_count/next_retry_at 字段，失败发送已按可配置指数退避重排并在达到配置阈值后进入 failed dead-letter。仍需补充告警、更完整观测和多实例策略。claim 失败时的幂等性需继续保证。 |
 | **兼容性与互操作** | 良好。与 mega 共享实体和部分逻辑；Config 管道复用；未来 provider 扩展点清晰。 |
 | **可扩展性与可维护性** | 良好。一级模块 + trait + 目录规划（providers/）为扩展留了空间。和 config 模块的演进路径绑定良好。 |
 | **合规性与标准符合性** | 良好。outbox 模式、用户偏好尊重、SecretRef 路径、对日志脱敏的要求都符合现代邮件与凭据管理实践。 |

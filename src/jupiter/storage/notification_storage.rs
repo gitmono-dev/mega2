@@ -52,7 +52,11 @@ impl EmailJobRetryPolicy {
     }
 
     fn delay_secs(&self, retry_count: i32) -> i64 {
-        (i64::from(retry_count) * self.backoff_base_secs).min(self.backoff_max_secs)
+        let retry_index = retry_count.saturating_sub(1).max(0) as u32;
+        let multiplier = 1_i64.checked_shl(retry_index).unwrap_or(i64::MAX);
+        self.backoff_base_secs
+            .saturating_mul(multiplier)
+            .min(self.backoff_max_secs)
     }
 }
 
@@ -439,7 +443,7 @@ impl NotificationStorage {
     }
 
     /// Mark a job as failed and schedule a retry.
-    /// Default backoff: 30s, 60s, ... capped at 300s.
+    /// Default backoff: 30s, 60s, 120s, ... capped at 300s.
     /// Jobs that reach the configured retry attempt limit are moved to failed status and
     /// no longer returned by fetch_pending_jobs.
     pub async fn mark_job_failed_with_retry(
@@ -617,6 +621,17 @@ mod tests {
         callisto::notification_event_types,
         jupiter::{migration::apply_migrations, tests::test_db_connection},
     };
+
+    #[test]
+    fn retry_policy_uses_exponential_backoff_capped_at_max() {
+        let policy = EmailJobRetryPolicy::new(5, 5, 18);
+
+        assert_eq!(policy.delay_secs(0), 5);
+        assert_eq!(policy.delay_secs(1), 5);
+        assert_eq!(policy.delay_secs(2), 10);
+        assert_eq!(policy.delay_secs(3), 18);
+        assert_eq!(policy.delay_secs(30), 18);
+    }
 
     #[tokio::test]
     async fn upsert_event_type_inserts_and_updates_existing_row() {
