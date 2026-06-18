@@ -77,6 +77,8 @@ jobs:
           cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
           cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
           cargo test resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref -- --nocapture
+          cargo test vault_secret_resolver_reports_missing_field_without_leaking_ref -- --nocapture
+          cargo test vault_secret_resolver_reports_non_string_field_without_leaking_ref -- --nocapture
 
       - name: Validate bundled config
         working-directory: monoengine
