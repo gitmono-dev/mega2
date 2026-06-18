@@ -9,15 +9,31 @@ use crate::{
         cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage,
         notification_storage::NotificationStorage,
     },
-    mail::template::MailTemplate,
+    mail::template::{
+        DEFAULT_MAIL_LOCALE, LocalizedMailTemplate, MailTemplate, MailTemplateKey,
+        MailTemplateRegistry,
+    },
 };
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
+
+const CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY: MailTemplateKey =
+    MailTemplateKey::new(EVENT_CL_COMMENT_CREATED);
 
 const CL_COMMENT_CREATED_MAIL_TEMPLATE: MailTemplate<'static> = MailTemplate::new(
     "New comment on CL {{cl_link}}",
     "<p><b>{{actor_username}}</b> commented on <b>{{cl_link}}</b>:</p><p>{{comment_text}}</p>",
     Some("{{actor_username}} commented on {{cl_link}}: {{comment_text}}"),
 );
+
+const NOTIFICATION_MAIL_TEMPLATE_REGISTRY: MailTemplateRegistry<'static> =
+    MailTemplateRegistry::new(
+        DEFAULT_MAIL_LOCALE,
+        &[LocalizedMailTemplate::new(
+            CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+            DEFAULT_MAIL_LOCALE,
+            CL_COMMENT_CREATED_MAIL_TEMPLATE,
+        )],
+    );
 
 /// Ensure the core event types exist in DB
 ///
@@ -79,11 +95,15 @@ pub async fn on_cl_comment_created(
     }
     recipients.remove(actor_username);
 
-    let mail = CL_COMMENT_CREATED_MAIL_TEMPLATE.render(&[
-        ("actor_username", actor_username),
-        ("cl_link", cl_link),
-        ("comment_text", comment_text),
-    ])?;
+    let mail = NOTIFICATION_MAIL_TEMPLATE_REGISTRY.render(
+        CL_COMMENT_CREATED_MAIL_TEMPLATE_KEY,
+        None,
+        &[
+            ("actor_username", actor_username),
+            ("cl_link", cl_link),
+            ("comment_text", comment_text),
+        ],
+    )?;
 
     for username in recipients {
         // should_send returns false if user settings are missing or globally disabled

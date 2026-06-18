@@ -1,5 +1,7 @@
 use crate::common::errors::MegaError;
 
+pub const DEFAULT_MAIL_LOCALE: &str = "en-US";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MailTemplate<'a> {
     subject: &'a str,
@@ -12,6 +14,22 @@ pub struct RenderedMail {
     pub subject: String,
     pub html: String,
     pub text: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MailTemplateKey(&'static str);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalizedMailTemplate<'a> {
+    key: MailTemplateKey,
+    locale: &'a str,
+    template: MailTemplate<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MailTemplateRegistry<'a> {
+    default_locale: &'a str,
+    templates: &'a [LocalizedMailTemplate<'a>],
 }
 
 impl<'a> MailTemplate<'a> {
@@ -32,6 +50,87 @@ impl<'a> MailTemplate<'a> {
                 .map(|text| render_template(text, vars, ValueEscaping::Raw))
                 .transpose()?,
         })
+    }
+}
+
+impl MailTemplateKey {
+    pub const fn new(key: &'static str) -> Self {
+        Self(key)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl<'a> LocalizedMailTemplate<'a> {
+    pub const fn new(key: MailTemplateKey, locale: &'a str, template: MailTemplate<'a>) -> Self {
+        Self {
+            key,
+            locale,
+            template,
+        }
+    }
+}
+
+impl<'a> MailTemplateRegistry<'a> {
+    pub const fn new(default_locale: &'a str, templates: &'a [LocalizedMailTemplate<'a>]) -> Self {
+        Self {
+            default_locale,
+            templates,
+        }
+    }
+
+    pub fn render(
+        &self,
+        key: MailTemplateKey,
+        locale: Option<&str>,
+        vars: &[(&str, &str)],
+    ) -> Result<RenderedMail, MegaError> {
+        let template = self
+            .template_for(key, locale)
+            .ok_or_else(|| self.missing_template_error(key, locale))?;
+
+        template.render(vars)
+    }
+
+    pub fn template_for(
+        &self,
+        key: MailTemplateKey,
+        locale: Option<&str>,
+    ) -> Option<MailTemplate<'a>> {
+        let requested_locale = locale
+            .map(str::trim)
+            .filter(|locale| !locale.is_empty())
+            .unwrap_or(self.default_locale);
+
+        self.find_exact(key, requested_locale)
+            .or_else(|| {
+                requested_locale
+                    .split_once('-')
+                    .and_then(|(language, _)| self.find_exact(key, language))
+            })
+            .or_else(|| self.find_exact(key, self.default_locale))
+    }
+
+    fn find_exact(&self, key: MailTemplateKey, locale: &str) -> Option<MailTemplate<'a>> {
+        self.templates
+            .iter()
+            .find(|template| template.key == key && template.locale == locale)
+            .map(|template| template.template)
+    }
+
+    fn missing_template_error(&self, key: MailTemplateKey, locale: Option<&str>) -> MegaError {
+        let requested_locale = locale
+            .map(str::trim)
+            .filter(|locale| !locale.is_empty())
+            .unwrap_or(self.default_locale);
+
+        MegaError::Other(format!(
+            "mail template `{}` is missing for locale `{requested_locale}` with default locale `{}`",
+            key.as_str(),
+            self.default_locale
+        ))
     }
 }
 
@@ -158,5 +257,83 @@ mod tests {
         let template = MailTemplate::new("hello {{name", "{{name}}", None);
         let error = template.render(&[("name", "alice")]).unwrap_err();
         assert!(error.to_string().contains("unclosed variable"));
+    }
+
+    #[test]
+    fn mail_template_registry_renders_requested_locale() {
+        const KEY: MailTemplateKey = MailTemplateKey::new("test.event");
+        const REGISTRY: MailTemplateRegistry<'static> = MailTemplateRegistry::new(
+            DEFAULT_MAIL_LOCALE,
+            &[
+                LocalizedMailTemplate::new(
+                    KEY,
+                    DEFAULT_MAIL_LOCALE,
+                    MailTemplate::new("Hello {{name}}", "<p>Hello {{name}}</p>", None),
+                ),
+                LocalizedMailTemplate::new(
+                    KEY,
+                    "zh-CN",
+                    MailTemplate::new("Ni hao {{name}}", "<p>Ni hao {{name}}</p>", None),
+                ),
+            ],
+        );
+
+        let rendered = REGISTRY
+            .render(KEY, Some("zh-CN"), &[("name", "alice")])
+            .unwrap();
+
+        assert_eq!(rendered.subject, "Ni hao alice");
+    }
+
+    #[test]
+    fn mail_template_registry_falls_back_to_language_then_default_locale() {
+        const KEY: MailTemplateKey = MailTemplateKey::new("test.event");
+        const REGISTRY: MailTemplateRegistry<'static> = MailTemplateRegistry::new(
+            DEFAULT_MAIL_LOCALE,
+            &[
+                LocalizedMailTemplate::new(
+                    KEY,
+                    DEFAULT_MAIL_LOCALE,
+                    MailTemplate::new("Hello {{name}}", "<p>Hello {{name}}</p>", None),
+                ),
+                LocalizedMailTemplate::new(
+                    KEY,
+                    "fr",
+                    MailTemplate::new("Bonjour {{name}}", "<p>Bonjour {{name}}</p>", None),
+                ),
+            ],
+        );
+
+        let language = REGISTRY
+            .render(KEY, Some("fr-CA"), &[("name", "alice")])
+            .unwrap();
+        let default = REGISTRY
+            .render(KEY, Some("de-DE"), &[("name", "alice")])
+            .unwrap();
+
+        assert_eq!(language.subject, "Bonjour alice");
+        assert_eq!(default.subject, "Hello alice");
+    }
+
+    #[test]
+    fn mail_template_registry_missing_template_error_does_not_include_values() {
+        const KEY: MailTemplateKey = MailTemplateKey::new("test.event");
+        const MISSING_KEY: MailTemplateKey = MailTemplateKey::new("missing.event");
+        const REGISTRY: MailTemplateRegistry<'static> = MailTemplateRegistry::new(
+            DEFAULT_MAIL_LOCALE,
+            &[LocalizedMailTemplate::new(
+                KEY,
+                DEFAULT_MAIL_LOCALE,
+                MailTemplate::new("Hello {{name}}", "<p>Hello {{name}}</p>", None),
+            )],
+        );
+
+        let error = REGISTRY
+            .render(MISSING_KEY, Some("en-US"), &[("name", "sensitive-value")])
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("missing.event"));
+        assert!(!message.contains("sensitive-value"));
     }
 }
