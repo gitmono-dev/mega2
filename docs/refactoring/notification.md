@@ -33,7 +33,7 @@
 
 5. **触发器和事件注册不完整**。仅 `EVENT_CL_COMMENT_CREATED` 有实现和测试（cl 作者 + reviewers，排除 actor，尊重 prefs）。mega 中有更多事件潜力（issue、pr、@mention、build 结果等），但 monoengine 业务层（ceres）尚未广泛调用这些触发器。事件类型目前靠触发器首次使用时 upsert（非迁移 seeding）。
 
-6. **用户偏好 API 首批已落地；管理员邮件作业与事件类型 API 首批已落地（与 mega 仍有差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 当前已有 admin-only 邮件作业 API，可查询 `email_jobs`、查看状态统计、将 `failed` job 重新排回 `pending`、清理旧终态 job，并查看 outbox 附件 metadata（不返回附件内容）；admin-only 事件类型 API 已支持列出 `notification_event_types` 并按 code upsert category/description/system_required/default_enabled；用户自助 API 已提供 `GET /user/notification/preferences`（当前用户 settings + event preference effective 状态）、`PUT /user/notification/preferences`（更新 global enabled、delivery_mode、preferred_locale、批量 event preferences）和 `PUT /user/notification/preferences/{event_type_code}`（更新当前用户单个非 system-required event preference）。仍缺更多业务触发器和更完整运维面。
+6. **用户偏好 API 首批已落地；管理员邮件作业与事件类型 API 首批已落地（与 mega 仍有差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 当前已有 admin-only 邮件作业 API，可查询 `email_jobs`、查看状态统计、将 `failed` job 重新排回 `pending`、清理旧终态 job，并查看/删除 outbox 附件（不返回附件内容）；admin-only 事件类型 API 已支持列出 `notification_event_types` 并按 code upsert category/description/system_required/default_enabled；用户自助 API 已提供 `GET /user/notification/preferences`（当前用户 settings + event preference effective 状态）、`PUT /user/notification/preferences`（更新 global enabled、delivery_mode、preferred_locale、批量 event preferences）和 `PUT /user/notification/preferences/{event_type_code}`（更新当前用户单个非 system-required event preference）。仍缺更多业务触发器和更完整运维面。
 
 7. **Campsite 相关**：campsite 项目主要是 TS/Next.js monorepo（packages/ui、editor、config 等），包含一些前端通知 UI 组件（如 AvatarNotificationReasonClip）和 slack.ts 配置（可能用于外部通知渠道）。它主要作为用户/认证后端（campsite_api_domain、api_store_backend），为 notification 提供用户邮箱和身份数据，但核心事件驱动 + outbox + 偏好逻辑在 Rust 引擎侧（mega/monoengine 共享的 callisto + jupiter）。未来 slack 渠道可考虑从 campsite 的 slack 集成模式扩展。
 
@@ -55,10 +55,10 @@
 | 后台任务启动与生命周期          | **已基础接入，需完善** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher。仍需完善 graceful shutdown 协调、失败诊断、退避和多实例语义。 |
 | 多渠道支持（email 之外）        | **仅规划**        | 当前只有 email 渠道（通过 mail）。in-app（可能复用 chat/message 系统）、webhook、slack（参考 campsite slack.ts）等均未设计。 |
 | SecretRef / 渠道凭据            | **仅规划**        | Email 渠道的 password 走 mail 的 SecretRef（config 阶段 5）。未来 slack token 等需类似 vault 集成。 |
-| API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry/prune/attachment metadata API 已落地，admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
+| API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry/prune/attachment metadata/delete API 已落地，admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
 | 与 Config / 全局设置            | 弱集成            | 目前偏好全在 DB per-user。Config 中无 notification 相关全局开关（未来可能有 rate limit、默认 delivery_mode 等）。 |
 | Profile / 热加载 / 集中校验     | **未实现**        | 依赖 config 模块能力。通知事件类型或全局模板可能需要校验。 |
-| 可靠性（重试、DLQ、可观测）     | 基线已加固        | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 已有可配置指数退避 retry、failed dead-letter、stale `sending` 恢复、可配置批次/并发限流和结构化汇总日志；admin API 可查询/统计/重排 failed job，并查看持久化附件 metadata。仍缺指标、tracing 上下文、告警和真实多实例矩阵。 |
+| 可靠性（重试、DLQ、可观测）     | 基线已加固        | email_jobs 有 retry_count/next_retry_at/status/error_message。Dispatcher 已有可配置指数退避 retry、failed dead-letter、stale `sending` 恢复、可配置批次/并发限流和结构化汇总日志；admin API 可查询/统计/重排 failed job，并查看/删除持久化附件。仍缺指标、tracing 上下文、告警和真实多实例矩阵。 |
 
 **启动/加载关键路径上的已知危险点（各阶段必须收敛，与 config.md/mail.md 重叠）**：
 - Dispatcher / mailer 若被移动到 Storage::new 或 `VaultCore::new` 之前，会违反 vault 顺序；当前代码位置正确，但需要防回归。
@@ -265,7 +265,7 @@ Config::new
 - 验收：所有渠道凭据仅在 vault 就绪后解析；core_key 加固已完成（来自 vault.md 阶段 A）。
 
 **阶段 4（可靠性、扩展性、运维）**：
-- 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job、按保留期 prune 旧 `sent`/`skipped` 终态 job、查看附件 metadata、列出和 upsert notification event types。
+- 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job、按保留期 prune 旧 `sent`/`skipped` 终态 job、查看/删除附件、列出和 upsert notification event types。
 - 已完成基础邮件模板与 registry：CL 评论通知通过 `MailTemplateRegistry` 按收件人 preferred_locale 渲染 subject/html/text，并继承 locale fallback 能力。
 - 改进重试策略（指数退避已完成；仍需告警集成）。
 - 添加可观测（发送成功率、延迟、按事件/用户指标；tracing span 携带 event/job id）。
@@ -324,7 +324,7 @@ Config::new
 | --- | --- |
 | **合理性** | 高。把 notification 提升为一级模块，抽象渠道，严格 late delivery，完美承接 config.md 的引导循环、mail 作为第一 SecretRef 试点，以及 mega 验证过的 outbox + prefs 模型。 |
 | **可行性** | 高。实体、存储逻辑、基本 dispatcher/triggers 代码已存在（从 mega 移植）。主要工作是模块化抽象、启动时机治理、API 表面补齐、与 mail/vault 的联动。受限于 mail 模块和 config 阶段的进度。 |
-| **完整性** | 中。当前覆盖 email outbox + outbox 附件持久化 + 附件 metadata 审计 + 单个触发器 + 存储业务逻辑，并已有邮件作业管理 API、用户偏好 API 和事件类型管理 API 首批。补强项：多渠道抽象、port mega DTOs/in-app 渠道、可靠性增强、与 config 高级特性的集成（profile、hot reload、validate）。 |
+| **完整性** | 中。当前覆盖 email outbox + outbox 附件持久化 + 附件 metadata/删除治理 + 单个触发器 + 存储业务逻辑，并已有邮件作业管理 API、用户偏好 API 和事件类型管理 API 首批。补强项：多渠道抽象、port mega DTOs/in-app 渠道、可靠性增强、与 config 高级特性的集成（profile、hot reload、validate）。 |
 | **安全性** | 良好（设计中）。明确晚于 vault 构造、依赖 mail 的 SecretRef 路径、prefs 强制同意、PII 最小化、错误脱敏要求。实现时必须与 vault 加固和日志脱敏前置 gate 同步。 |
 | **功能正确性与接口兼容性** | 良好。Mailer trait + NotificationStorage API 清晰；与 callisto 实体对齐；与 mega 共享模型便于数据迁移。需确保新渠道 trait 不破坏现有 email 路径。 |
 | **数据流与控制流** | 正确。Enqueue（触发器 → Storage）可较早；Delivery（Service + 渠道 + dispatcher）必须 post-vault+mail。claim 提供基础保护。 |
@@ -342,7 +342,7 @@ Notification 是 monoengine 事件驱动用户体验的重要组成部分（评�
 - 确保模块在 main 中激活、提供高层 Service 抽象。
 - 严格遵守 bootstrap 顺序（enqueue 早、delivery 晚于 vault + mail）。
 - 渠道抽象化，支持从 email 向多渠道演进。
-- 继续补齐通知管理 API 表面（首批已支持当前用户 settings、global enabled、delivery_mode、preferred_locale、event preference 查询/更新，admin event type list/upsert，以及 email job 附件 metadata 审计；仍需更完整审计和业务接入面）。
+- 继续补齐通知管理 API 表面（首批已支持当前用户 settings、global enabled、delivery_mode、preferred_locale、event preference 查询/更新，admin event type list/upsert，以及 email job 附件 metadata/删除治理；仍需更完整审计和业务接入面）。
 - 与 config 的 SecretRef、profile、热加载、校验能力对齐。
 - 把可靠性、可观测和未来渠道（in-app、slack 参考 campsite）作为后续阶段。
 

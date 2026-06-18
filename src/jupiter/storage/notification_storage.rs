@@ -499,6 +499,20 @@ impl NotificationStorage {
             })
     }
 
+    pub async fn delete_email_job_attachment(
+        &self,
+        job_id: i64,
+        attachment_id: i64,
+    ) -> Result<bool, sea_orm::DbErr> {
+        let res = email_job_attachments::Entity::delete_many()
+            .filter(email_job_attachments::Column::EmailJobId.eq(job_id))
+            .filter(email_job_attachments::Column::Id.eq(attachment_id))
+            .exec(self.db())
+            .await?;
+
+        Ok(res.rows_affected > 0)
+    }
+
     /// Fetch pending email jobs that are ready to be sent
     /// Jobs are eligible when:
     /// - status == "pending"
@@ -1066,6 +1080,33 @@ mod tests {
         assert_eq!(metadata[1].filename, "two.json");
         assert_eq!(metadata[1].content_type, "application/json");
         assert_eq!(metadata[1].size_bytes, br#"{"ok":true}"#.len() as u64);
+
+        assert!(
+            storage
+                .delete_email_job_attachment(jobs[0].id, metadata[0].id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .delete_email_job_attachment(jobs[0].id, metadata[0].id)
+                .await
+                .unwrap()
+        );
+
+        let remaining_metadata = storage
+            .list_email_job_attachment_metadata(jobs[0].id)
+            .await
+            .unwrap();
+        assert_eq!(remaining_metadata.len(), 1);
+        assert_eq!(remaining_metadata[0].filename, "two.json");
+
+        let remaining_attachments = storage
+            .list_email_job_attachments(jobs[0].id)
+            .await
+            .unwrap();
+        assert_eq!(remaining_attachments.len(), 1);
+        assert_eq!(remaining_attachments[0].content, br#"{"ok":true}"#);
     }
 
     #[tokio::test]

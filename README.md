@@ -318,8 +318,8 @@ cargo test --test <name>
   `/user/notification/preferences`; admins can manage notification event
   types under `/admin/notification-event-types` and prune old terminal outbox
   jobs under `/admin/email-jobs/prune`; attachment audit metadata is available
-  under `/admin/email-jobs/{id}/attachments` without returning attachment
-  content.
+  under `/admin/email-jobs/{id}/attachments`, and admins can delete persisted
+  attachments without returning attachment content.
 - **Background maintenance** — HTTP service tasks clean expired Buck upload
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
   tasks hot-reload schedule settings and can be disabled without restart;

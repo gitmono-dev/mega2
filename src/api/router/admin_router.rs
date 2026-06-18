@@ -101,6 +101,13 @@ pub struct EmailJobAttachmentListResponse {
     pub attachments: Vec<EmailJobAttachmentResponse>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailJobAttachmentDeleteResponse {
+    pub id: i64,
+    pub email_job_id: i64,
+    pub deleted: bool,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct EmailJobPruneRequest {
     pub older_than_days: i64,
@@ -157,6 +164,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(list_email_jobs))
             .routes(routes!(email_job_stats))
             .routes(routes!(list_email_job_attachments))
+            .routes(routes!(delete_email_job_attachment))
             .routes(routes!(retry_failed_email_job))
             .routes(routes!(prune_email_jobs))
             .routes(routes!(list_notification_event_types))
@@ -319,6 +327,55 @@ async fn list_email_job_attachments(
                 .into_iter()
                 .map(EmailJobAttachmentResponse::from)
                 .collect(),
+        },
+    ))))
+}
+
+/// DELETE /api/v1/admin/email-jobs/{job_id}/attachments/{attachment_id}
+///
+/// Deletes a persisted attachment from a notification email outbox job.
+/// Only admins can access this endpoint.
+#[utoipa::path(
+    delete,
+    path = "/email-jobs/{job_id}/attachments/{attachment_id}",
+    params(
+        ("job_id" = i64, Path, description = "Email job ID"),
+        ("attachment_id" = i64, Path, description = "Email job attachment ID")
+    ),
+    responses(
+        (status = 200, body = CommonResult<EmailJobAttachmentDeleteResponse>, content_type = "application/json"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+        (status = 404, description = "Email job or attachment not found"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn delete_email_job_attachment(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path((job_id, attachment_id)): Path<(i64, i64)>,
+) -> Result<Json<CommonResult<EmailJobAttachmentDeleteResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+
+    let notification_storage = state.storage.notification_storage();
+    if notification_storage.get_email_job(job_id).await?.is_none() {
+        return Err(ApiError::not_found(anyhow::anyhow!("email job not found")));
+    }
+
+    if !notification_storage
+        .delete_email_job_attachment(job_id, attachment_id)
+        .await?
+    {
+        return Err(ApiError::not_found(anyhow::anyhow!(
+            "email job attachment not found"
+        )));
+    }
+
+    Ok(Json(CommonResult::success(Some(
+        EmailJobAttachmentDeleteResponse {
+            id: attachment_id,
+            email_job_id: job_id,
+            deleted: true,
         },
     ))))
 }

@@ -58,7 +58,7 @@
   - Mail 模块的激活与现状（阶段 0/1 已完成）
   - Dispatcher 的生命周期管理
   - password 改为 password_ref 的迁移策略
-  - 多 provider 扩展、模板系统、附件 metadata 审计、可靠性增强
+  - 多 provider 扩展、模板系统、附件 metadata/删除治理、可靠性增强
 - **关键前置**：config 阶段 5 的 SecretRef + resolver 实现
 - **阶段范围**：0 - 5（共 6 个阶段，0/1 已完成）
 
@@ -68,7 +68,7 @@
   - Notification 模块现状（阶段 0 部分完成）
   - 渠道抽象（EmailChannel、InAppChannel、SlackChannel 等）
   - 用户偏好 API 表面（port mega DTOs）
-  - 邮件作业与附件 metadata 管理面
+  - 邮件作业与附件 metadata/删除管理面
   - Vault SecretRef 与多渠道凭据管理
   - 可靠性、可观测与模板系统
 - **关键前置**：mail 模块的完整实现、vault 的加固完成
