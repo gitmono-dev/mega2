@@ -12,8 +12,12 @@ use std::collections::HashSet;
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
+    http::{StatusCode, header},
+    response::Response,
 };
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -37,6 +41,30 @@ use crate::{
 };
 
 const MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS: i64 = 3650;
+const CONTENT_DISPOSITION_VALUE_CHARS: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'{')
+    .add(b'}');
 
 #[derive(Serialize, ToSchema)]
 pub struct IsAdminResponse {
@@ -184,6 +212,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(list_email_jobs))
             .routes(routes!(email_job_stats))
             .routes(routes!(list_email_job_attachments))
+            .routes(routes!(download_email_job_attachment))
             .routes(routes!(delete_email_job_attachment))
             .routes(routes!(prune_email_job_attachments))
             .routes(routes!(retry_failed_email_job))
@@ -350,6 +379,58 @@ async fn list_email_job_attachments(
                 .collect(),
         },
     ))))
+}
+
+/// GET /api/v1/admin/email-jobs/{job_id}/attachments/{attachment_id}/content
+///
+/// Downloads persisted attachment content for a notification email outbox job.
+/// Only admins can access this endpoint.
+#[utoipa::path(
+    get,
+    path = "/email-jobs/{job_id}/attachments/{attachment_id}/content",
+    params(
+        ("job_id" = i64, Path, description = "Email job ID"),
+        ("attachment_id" = i64, Path, description = "Email job attachment ID")
+    ),
+    responses(
+        (status = 200, description = "Email job attachment content", content_type = "application/octet-stream"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+        (status = 404, description = "Email job or attachment not found"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn download_email_job_attachment(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path((job_id, attachment_id)): Path<(i64, i64)>,
+) -> Result<Response, ApiError> {
+    ensure_admin(&state, &user).await?;
+
+    let notification_storage = state.storage.notification_storage();
+    if notification_storage.get_email_job(job_id).await?.is_none() {
+        return Err(ApiError::not_found(anyhow::anyhow!("email job not found")));
+    }
+
+    let Some(attachment) = notification_storage
+        .get_email_job_attachment_content(job_id, attachment_id)
+        .await?
+    else {
+        return Err(ApiError::not_found(anyhow::anyhow!(
+            "email job attachment not found"
+        )));
+    };
+
+    let content_length = attachment.content.len().to_string();
+    let content_disposition = email_attachment_content_disposition(&attachment.filename);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, attachment.content_type)
+        .header(header::CONTENT_LENGTH, content_length)
+        .header(header::CONTENT_DISPOSITION, content_disposition)
+        .body(Body::from(attachment.content))
+        .map_err(ApiError::internal)
 }
 
 /// DELETE /api/v1/admin/email-jobs/{job_id}/attachments/{attachment_id}
@@ -811,6 +892,32 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn email_attachment_content_disposition(filename: &str) -> String {
+    let fallback = sanitize_content_disposition_filename(filename);
+    let encoded = utf8_percent_encode(filename, CONTENT_DISPOSITION_VALUE_CHARS);
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+fn sanitize_content_disposition_filename(filename: &str) -> String {
+    let sanitized: String = filename
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_graphic() && !matches!(ch, '"' | '\\' | ';') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "attachment".to_string()
+    } else {
+        sanitized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +1072,17 @@ mod tests {
         assert_eq!(response.content_type, "application/pdf");
         assert_eq!(response.size_bytes, 1024);
         assert_eq!(response.created_at, created_at.to_string());
+    }
+
+    #[test]
+    fn email_attachment_content_disposition_sanitizes_and_encodes_filename() {
+        let disposition = email_attachment_content_disposition(" 报告\";\r\n.txt ");
+
+        assert!(disposition.starts_with("attachment; filename="));
+        assert!(disposition.contains("filename=\"______.txt\""));
+        assert!(disposition.contains("filename*=UTF-8''%20%E6%8A%A5%E5%91%8A"));
+        assert!(!disposition.contains('\r'));
+        assert!(!disposition.contains('\n'));
     }
 
     #[test]

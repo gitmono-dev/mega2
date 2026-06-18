@@ -108,6 +108,16 @@ pub struct EmailJobAttachmentMetadata {
     pub created_at: chrono::NaiveDateTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailJobAttachmentContent {
+    pub id: i64,
+    pub email_job_id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub content: Vec<u8>,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EmailJobEnqueue<'a> {
     pub username: &'a str,
@@ -496,6 +506,28 @@ impl NotificationStorage {
                         created_at: attachment.created_at,
                     })
                     .collect()
+            })
+    }
+
+    pub async fn get_email_job_attachment_content(
+        &self,
+        job_id: i64,
+        attachment_id: i64,
+    ) -> Result<Option<EmailJobAttachmentContent>, sea_orm::DbErr> {
+        email_job_attachments::Entity::find()
+            .filter(email_job_attachments::Column::EmailJobId.eq(job_id))
+            .filter(email_job_attachments::Column::Id.eq(attachment_id))
+            .one(self.db())
+            .await
+            .map(|attachment| {
+                attachment.map(|attachment| EmailJobAttachmentContent {
+                    id: attachment.id,
+                    email_job_id: attachment.email_job_id,
+                    filename: attachment.filename,
+                    content_type: attachment.content_type,
+                    content: attachment.content,
+                    created_at: attachment.created_at,
+                })
             })
     }
 
@@ -1118,6 +1150,24 @@ mod tests {
         assert_eq!(metadata[1].filename, "two.json");
         assert_eq!(metadata[1].content_type, "application/json");
         assert_eq!(metadata[1].size_bytes, br#"{"ok":true}"#.len() as u64);
+
+        let attachment_content = storage
+            .get_email_job_attachment_content(jobs[0].id, metadata[1].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attachment_content.id, metadata[1].id);
+        assert_eq!(attachment_content.email_job_id, jobs[0].id);
+        assert_eq!(attachment_content.filename, "two.json");
+        assert_eq!(attachment_content.content_type, "application/json");
+        assert_eq!(attachment_content.content, br#"{"ok":true}"#);
+        assert!(
+            storage
+                .get_email_job_attachment_content(jobs[0].id + 1, metadata[1].id)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         assert!(
             storage
