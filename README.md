@@ -313,7 +313,8 @@ cargo test --test <name>
   can disable a running dispatcher via `mail.enabled = false` and hot-reload
   dispatcher batch/concurrency limits plus retry policy; re-enabling mail or
   changing SMTP settings still requires restart. Users can inspect and update
-  per-event notification preferences under `/user/notification/preferences`.
+  notification settings and per-event preferences under
+  `/user/notification/preferences`.
 - **Background maintenance** — HTTP service tasks clean expired Buck upload
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
   tasks hot-reload schedule settings and can be disabled without restart;

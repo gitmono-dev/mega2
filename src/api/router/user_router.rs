@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
@@ -19,12 +19,19 @@ use crate::{
     callisto::{
         notification_event_types, user_notification_preferences, user_notification_settings,
     },
-    ceres::model::user::{
-        AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken, UpdateClaContentPayload,
+    ceres::model::{
+        notification::{UpdateUserNotificationConfig, UserNotificationPreferenceItem},
+        user::{
+            AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken,
+            UpdateClaContentPayload,
+        },
     },
     common::errors::{ApiError, MegaError},
     contract::api::common::CommonResult,
+    jupiter::storage::notification_storage::NotificationStorage,
 };
+
+const NOTIFICATION_DELIVERY_MODE_REALTIME: &str = "realtime";
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(
@@ -42,6 +49,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(get_cla_content))
             .routes(routes!(update_cla_content))
             .routes(routes!(list_notification_preferences))
+            .routes(routes!(update_notification_preferences))
             .routes(routes!(update_notification_preference)),
     )
 }
@@ -246,16 +254,76 @@ async fn list_notification_preferences(
     State(state): State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<UserNotificationPreferencesResponse>>, ApiError> {
     let notification_storage = state.storage.notification_storage();
-    let settings = notification_storage
-        .get_user_settings(&user.username)
-        .await?;
-    let event_types = notification_storage.list_event_types().await?;
-    let preferences = notification_storage
-        .list_user_preferences(&user.username)
-        .await?;
 
     Ok(Json(CommonResult::success(Some(
-        build_notification_preferences_response(&user.username, settings, event_types, preferences),
+        load_notification_preferences_response(&notification_storage, &user.username).await?,
+    ))))
+}
+
+/// Update current user's notification settings and preferences
+#[utoipa::path(
+    put,
+    path = "/notification/preferences",
+    request_body = UpdateUserNotificationConfig,
+    responses(
+        (status = 200, body = CommonResult<UserNotificationPreferencesResponse>, content_type = "application/json"),
+        (status = 400, description = "Invalid notification settings or preferences"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Notification event type not found"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn update_notification_preferences(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Json(payload): Json<UpdateUserNotificationConfig>,
+) -> Result<Json<CommonResult<UserNotificationPreferencesResponse>>, ApiError> {
+    let notification_storage = state.storage.notification_storage();
+    let delivery_mode = payload
+        .delivery_mode
+        .map(|delivery_mode| validate_notification_delivery_mode(&delivery_mode))
+        .transpose()?;
+    let preferences = payload
+        .preferences
+        .map(normalize_notification_preferences)
+        .transpose()?;
+
+    if let Some(preferences) = &preferences {
+        for preference in preferences {
+            ensure_preference_event_type_is_mutable(
+                &notification_storage,
+                &preference.event_type_code,
+            )
+            .await?;
+        }
+    }
+
+    ensure_user_notification_settings(&notification_storage, &user).await?;
+
+    if let Some(enabled) = payload.enabled {
+        notification_storage
+            .set_global_enabled(&user.username, enabled)
+            .await?;
+    }
+    if let Some(delivery_mode) = delivery_mode {
+        notification_storage
+            .set_delivery_mode(&user.username, &delivery_mode)
+            .await?;
+    }
+    if let Some(preferences) = preferences {
+        for preference in preferences {
+            notification_storage
+                .set_user_preference(
+                    &user.username,
+                    &preference.event_type_code,
+                    preference.enabled,
+                )
+                .await?;
+        }
+    }
+
+    Ok(Json(CommonResult::success(Some(
+        load_notification_preferences_response(&notification_storage, &user.username).await?,
     ))))
 }
 
@@ -294,14 +362,7 @@ async fn update_notification_preference(
         )));
     }
 
-    let settings = notification_storage
-        .get_user_settings(&user.username)
-        .await?
-        .ok_or_else(|| {
-            ApiError::bad_request(anyhow::anyhow!(
-                "notification settings are not configured for current user"
-            ))
-        })?;
+    let settings = ensure_user_notification_settings(&notification_storage, &user).await?;
 
     notification_storage
         .set_user_preference(&user.username, &event_type_code, payload.enabled)
@@ -322,6 +383,81 @@ async fn update_notification_preference(
             ),
         },
     ))))
+}
+
+async fn load_notification_preferences_response(
+    notification_storage: &NotificationStorage,
+    username: &str,
+) -> Result<UserNotificationPreferencesResponse, ApiError> {
+    let settings = notification_storage.get_user_settings(username).await?;
+    let event_types = notification_storage.list_event_types().await?;
+    let preferences = notification_storage.list_user_preferences(username).await?;
+
+    Ok(build_notification_preferences_response(
+        username,
+        settings,
+        event_types,
+        preferences,
+    ))
+}
+
+async fn ensure_user_notification_settings(
+    notification_storage: &NotificationStorage,
+    user: &LoginUser,
+) -> Result<user_notification_settings::Model, ApiError> {
+    if let Some(settings) = notification_storage
+        .get_user_settings(&user.username)
+        .await?
+    {
+        let email = user.email.trim();
+        if !email.is_empty() && email != settings.email {
+            notification_storage
+                .upsert_user_settings(&user.username, email)
+                .await?;
+            return notification_storage
+                .get_user_settings(&user.username)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::internal(anyhow::anyhow!("notification settings were not persisted"))
+                });
+        }
+        return Ok(settings);
+    }
+
+    let email = user.email.trim();
+    if email.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "notification email is not configured for current user"
+        )));
+    }
+
+    notification_storage
+        .upsert_user_settings(&user.username, email)
+        .await?;
+    notification_storage
+        .get_user_settings(&user.username)
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!("notification settings were not persisted"))
+        })
+}
+
+async fn ensure_preference_event_type_is_mutable(
+    notification_storage: &NotificationStorage,
+    event_type_code: &str,
+) -> Result<notification_event_types::Model, ApiError> {
+    let event_type = notification_storage
+        .get_event_type(event_type_code)
+        .await?
+        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("notification event type not found")))?;
+
+    if event_type.system_required {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "system-required notification preferences cannot be changed"
+        )));
+    }
+
+    Ok(event_type)
 }
 
 fn build_notification_preferences_response(
@@ -413,6 +549,39 @@ fn validate_notification_event_type_code(event_type_code: &str) -> Result<String
         )));
     }
     Ok(event_type_code.to_string())
+}
+
+fn validate_notification_delivery_mode(delivery_mode: &str) -> Result<String, ApiError> {
+    let delivery_mode = delivery_mode.trim().to_ascii_lowercase();
+    if delivery_mode == NOTIFICATION_DELIVERY_MODE_REALTIME {
+        Ok(delivery_mode)
+    } else {
+        Err(ApiError::bad_request(anyhow::anyhow!(
+            "delivery_mode must be `{NOTIFICATION_DELIVERY_MODE_REALTIME}`"
+        )))
+    }
+}
+
+fn normalize_notification_preferences(
+    preferences: Vec<UserNotificationPreferenceItem>,
+) -> Result<Vec<UserNotificationPreferenceItem>, ApiError> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(preferences.len());
+
+    for preference in preferences {
+        let event_type_code = validate_notification_event_type_code(&preference.event_type_code)?;
+        if !seen.insert(event_type_code.clone()) {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "duplicate notification preference for event type `{event_type_code}`"
+            )));
+        }
+        normalized.push(UserNotificationPreferenceItem {
+            event_type_code,
+            enabled: preference.enabled,
+        });
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -508,6 +677,41 @@ mod tests {
         assert_eq!(
             validate_notification_event_type_code(" cl.comment.created ").unwrap(),
             "cl.comment.created"
+        );
+    }
+
+    #[test]
+    fn validate_notification_delivery_mode_accepts_realtime_only() {
+        assert_eq!(
+            validate_notification_delivery_mode(" Realtime ").unwrap(),
+            "realtime"
+        );
+        assert!(validate_notification_delivery_mode("digest").is_err());
+    }
+
+    #[test]
+    fn normalize_notification_preferences_trims_and_rejects_duplicates() {
+        let preferences =
+            normalize_notification_preferences(vec![UserNotificationPreferenceItem {
+                event_type_code: " cl.comment.created ".to_string(),
+                enabled: true,
+            }])
+            .unwrap();
+        assert_eq!(preferences[0].event_type_code, "cl.comment.created");
+        assert!(preferences[0].enabled);
+
+        assert!(
+            normalize_notification_preferences(vec![
+                UserNotificationPreferenceItem {
+                    event_type_code: "cl.comment.created".to_string(),
+                    enabled: true,
+                },
+                UserNotificationPreferenceItem {
+                    event_type_code: " cl.comment.created ".to_string(),
+                    enabled: false,
+                },
+            ])
+            .is_err()
         );
     }
 }
