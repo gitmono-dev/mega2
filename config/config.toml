@@ -294,13 +294,16 @@ default_items = [
 # remains only for compatibility and is reported by `config validate`;
 # `--deny-warnings` treats it as failure.
 # When the service starts with mail enabled, switching this to false is hot-reloaded
-# and stops the dispatcher. Enabling mail or changing SMTP fields still needs restart.
+# and stops the dispatcher. The dispatcher limits below are also hot-reloaded.
+# Enabling mail or changing SMTP fields still needs restart.
 enabled = true
 provider = "smtp"
 smtp_host = "localhost"
 smtp_port = 2525
 from = "no-reply@mega.local"
 starttls = false
+dispatcher_batch_size = 50
+dispatcher_max_in_flight = 8
 # Legacy compatibility keys below are ignored by MailConfig; use starttls.
 smtp_tls = false
 tls = false

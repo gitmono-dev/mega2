@@ -101,6 +101,8 @@ username = "monoengine@example.com"
 password_ref = "vault://secret/config/prod/mail/password#value"
 from = "no-reply@example.com"
 starttls = true
+dispatcher_batch_size = 50
+dispatcher_max_in_flight = 8
 "#
     )
 }

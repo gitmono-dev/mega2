@@ -475,6 +475,18 @@ fn apply_mail_changes(
                     report.restart_required_fields.push("mail.enabled");
                 }
             }
+            if current.dispatcher_batch_size != candidate.dispatcher_batch_size {
+                if let Some(next) = next {
+                    next.dispatcher_batch_size = candidate.dispatcher_batch_size;
+                }
+                report.applied_fields.push("mail.dispatcher_batch_size");
+            }
+            if current.dispatcher_max_in_flight != candidate.dispatcher_max_in_flight {
+                if let Some(next) = next {
+                    next.dispatcher_max_in_flight = candidate.dispatcher_max_in_flight;
+                }
+                report.applied_fields.push("mail.dispatcher_max_in_flight");
+            }
             collect_mail_restart_fields(current, candidate, report);
         }
     }
@@ -921,6 +933,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         }
     }
 
@@ -1247,6 +1260,36 @@ mod tests {
     }
 
     #[test]
+    fn reload_applies_mail_dispatcher_limits_without_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.mail = Some(mail_config(true));
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.dispatcher_batch_size = 12;
+        mail.dispatcher_max_in_flight = 3;
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+        let mail = snapshot.mail.as_ref().expect("mail config");
+
+        assert_eq!(
+            report.applied_fields,
+            vec![
+                "mail.dispatcher_batch_size",
+                "mail.dispatcher_max_in_flight"
+            ]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert_eq!(mail.dispatcher_batch_size, 12);
+        assert_eq!(mail.dispatcher_max_in_flight, 3);
+    }
+
+    #[test]
     fn reload_reports_mail_enable_requires_restart_without_publishing_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut current = isolated_config(temp_dir.path().join("current"));
@@ -1306,6 +1349,7 @@ mod tests {
             password_ref: None,
             from: "current@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         });
         let handle = ConfigHandle::new(current);
 
@@ -1320,6 +1364,7 @@ mod tests {
             password_ref: Some(candidate_ref),
             from: "candidate@example.com".to_string(),
             starttls: false,
+            ..Default::default()
         });
 
         let report = handle.reload(candidate).expect("reload should succeed");

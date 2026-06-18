@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use tokio::{
@@ -13,7 +13,8 @@ use crate::{
     callisto::email_jobs,
     common::errors::MegaError,
     config::{
-        Config,
+        Config, DEFAULT_MAIL_DISPATCHER_BATCH_SIZE, DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT,
+        MailConfig,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     jupiter::storage::notification_storage::{
@@ -22,18 +23,64 @@ use crate::{
     mail::Mailer,
 };
 
-pub const EMAIL_DISPATCH_BATCH_SIZE: u64 = 50;
-pub const EMAIL_DISPATCH_MAX_IN_FLIGHT: usize = 8;
+pub const EMAIL_DISPATCH_BATCH_SIZE: u64 = DEFAULT_MAIL_DISPATCHER_BATCH_SIZE;
+pub const EMAIL_DISPATCH_MAX_IN_FLIGHT: usize = DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmailDispatcherLimits {
+    pub batch_size: u64,
+    pub max_in_flight: usize,
+}
+
+impl EmailDispatcherLimits {
+    pub fn new(batch_size: u64, max_in_flight: usize) -> Self {
+        Self {
+            batch_size,
+            max_in_flight,
+        }
+    }
+
+    pub fn from_mail_config(config: &MailConfig) -> Self {
+        Self::new(
+            config.dispatcher_batch_size,
+            config.dispatcher_max_in_flight,
+        )
+    }
+}
+
+impl Default for EmailDispatcherLimits {
+    fn default() -> Self {
+        Self {
+            batch_size: EMAIL_DISPATCH_BATCH_SIZE,
+            max_in_flight: EMAIL_DISPATCH_MAX_IN_FLIGHT,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EmailDispatcherControl {
     enabled: Arc<AtomicBool>,
+    batch_size: Arc<AtomicU64>,
+    max_in_flight: Arc<AtomicUsize>,
 }
 
 impl EmailDispatcherControl {
     pub fn new(enabled: bool) -> Self {
+        Self::new_with_limits(enabled, EmailDispatcherLimits::default())
+    }
+
+    pub fn from_mail_config(config: &MailConfig) -> Self {
+        Self::new_with_limits(
+            config.enabled,
+            EmailDispatcherLimits::from_mail_config(config),
+        )
+    }
+
+    pub fn new_with_limits(enabled: bool, limits: EmailDispatcherLimits) -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(enabled)),
+            batch_size: Arc::new(AtomicU64::new(limits.batch_size)),
+            max_in_flight: Arc::new(AtomicUsize::new(limits.max_in_flight)),
         }
     }
 
@@ -43,6 +90,19 @@ impl EmailDispatcherControl {
 
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn limits(&self) -> EmailDispatcherLimits {
+        EmailDispatcherLimits {
+            batch_size: self.batch_size.load(Ordering::Acquire),
+            max_in_flight: self.max_in_flight.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn set_limits(&self, limits: EmailDispatcherLimits) {
+        self.batch_size.store(limits.batch_size, Ordering::Release);
+        self.max_in_flight
+            .store(limits.max_in_flight, Ordering::Release);
     }
 }
 
@@ -115,16 +175,14 @@ impl EmailDispatcher {
             );
         }
 
-        let jobs = self
-            .stg
-            .fetch_pending_jobs(EMAIL_DISPATCH_BATCH_SIZE)
-            .await?;
+        let limits = self.control.limits();
+        let jobs = self.stg.fetch_pending_jobs(limits.batch_size).await?;
         let mut stats = EmailDispatchTickStats {
             fetched: jobs.len(),
             ..Default::default()
         };
 
-        for chunk in jobs.chunks(EMAIL_DISPATCH_MAX_IN_FLIGHT) {
+        for chunk in jobs.chunks(limits.max_in_flight) {
             let mut tasks = JoinSet::new();
 
             for job in chunk.iter().cloned() {
@@ -158,7 +216,8 @@ impl EmailDispatcher {
                 claim_missed = stats.claim_missed,
                 missing_after_failure = stats.missing_after_failure,
                 task_errors = stats.task_errors,
-                max_in_flight = EMAIL_DISPATCH_MAX_IN_FLIGHT,
+                batch_size = limits.batch_size,
+                max_in_flight = limits.max_in_flight,
                 "email dispatcher tick completed"
             );
         }
@@ -253,6 +312,15 @@ fn apply_mail_enabled(
     if report.applied_fields.contains(&"mail.enabled") {
         let enabled = config.mail.as_ref().is_some_and(|mail| mail.enabled);
         control.set_enabled(enabled);
+    }
+    if report.applied_fields.iter().any(|field| {
+        matches!(
+            *field,
+            "mail.dispatcher_batch_size" | "mail.dispatcher_max_in_flight"
+        )
+    }) && let Some(mail) = &config.mail
+    {
+        control.set_limits(EmailDispatcherLimits::from_mail_config(mail));
     }
 
     Ok(())
@@ -464,6 +532,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatcher_respects_configured_batch_size_for_backpressure() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for idx in 0..5 {
+            stg.enqueue_email_job(
+                "alice",
+                &format!("alice+{idx}@example.com"),
+                "cl.comment.created",
+                "Subject",
+                "<p>Body</p>",
+                Some("Body"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let control =
+            EmailDispatcherControl::new_with_limits(true, EmailDispatcherLimits::new(2, 1));
+        let dispatcher =
+            EmailDispatcher::new_with_control(stg.clone(), Arc::new(NoopMailer), control);
+        dispatcher.tick_once().await.unwrap();
+
+        let all_jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        let sent = all_jobs.iter().filter(|job| job.status == "sent").count();
+        let pending = all_jobs
+            .iter()
+            .filter(|job| job.status == "pending")
+            .count();
+
+        assert_eq!(sent, 2);
+        assert_eq!(pending, 3);
+    }
+
+    #[tokio::test]
     async fn dispatcher_skips_pending_jobs_when_disabled_by_control() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
@@ -567,6 +686,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         });
         let mut candidate = config.clone();
         candidate.mail.as_mut().expect("mail config").enabled = false;
@@ -584,5 +704,46 @@ mod tests {
 
         assert_eq!(applied_report, report);
         assert!(!control.enabled());
+    }
+
+    #[test]
+    fn email_dispatcher_subscriber_updates_control_limits_from_mail_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(crate::config::MailConfig {
+            enabled: true,
+            provider: crate::config::MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: None,
+            password: None,
+            password_ref: None,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+            dispatcher_batch_size: 50,
+            dispatcher_max_in_flight: 8,
+        });
+        let control =
+            EmailDispatcherControl::from_mail_config(config.mail.as_ref().expect("mail config"));
+        let mut candidate = config.clone();
+        let mail = candidate.mail.as_mut().expect("mail config");
+        mail.dispatcher_batch_size = 11;
+        mail.dispatcher_max_in_flight = 4;
+        let report = ConfigReloadReport {
+            applied_fields: vec![
+                "mail.dispatcher_batch_size",
+                "mail.dispatcher_max_in_flight",
+            ],
+            restart_required_fields: Vec::new(),
+        };
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_email_dispatcher_subscriber(control.clone()))
+            .expect("subscribe");
+        let applied_report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(applied_report, report);
+        assert_eq!(control.limits(), EmailDispatcherLimits::new(11, 4));
     }
 }

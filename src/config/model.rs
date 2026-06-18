@@ -161,6 +161,9 @@ pub enum MailProvider {
     Console,
 }
 
+pub const DEFAULT_MAIL_DISPATCHER_BATCH_SIZE: u64 = 50;
+pub const DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT: usize = 8;
+
 /// Mail configuration. Lives here so it participates in the main Config loading
 /// / env overlay / placeholder / (future) SecretRef pipeline.
 /// See docs/mail.md for the full mail module design and SecretRef migration plan.
@@ -184,6 +187,10 @@ pub struct MailConfig {
     pub from: String,
     #[serde(default = "default_starttls")]
     pub starttls: bool,
+    #[serde(default = "default_mail_dispatcher_batch_size")]
+    pub dispatcher_batch_size: u64,
+    #[serde(default = "default_mail_dispatcher_max_in_flight")]
+    pub dispatcher_max_in_flight: usize,
     // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
 }
 
@@ -192,6 +199,12 @@ fn default_smtp_port() -> u16 {
 }
 fn default_starttls() -> bool {
     true
+}
+fn default_mail_dispatcher_batch_size() -> u64 {
+    DEFAULT_MAIL_DISPATCHER_BATCH_SIZE
+}
+fn default_mail_dispatcher_max_in_flight() -> usize {
+    DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT
 }
 
 impl Default for MailConfig {
@@ -206,6 +219,8 @@ impl Default for MailConfig {
             password_ref: None,
             from: String::new(),
             starttls: default_starttls(),
+            dispatcher_batch_size: default_mail_dispatcher_batch_size(),
+            dispatcher_max_in_flight: default_mail_dispatcher_max_in_flight(),
         }
     }
 }

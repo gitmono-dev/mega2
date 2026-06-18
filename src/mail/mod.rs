@@ -406,6 +406,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
 
         let mailer = SmtpMailer::new(&cfg).expect("create mailer");
@@ -424,6 +425,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
         let mailer = SmtpMailer::new(&cfg).unwrap();
 
@@ -447,6 +449,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
         let mailer = SmtpMailer::new(&cfg).unwrap();
         let err = mailer
@@ -467,6 +470,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
         let mailer = SmtpMailer::new(&cfg).unwrap();
         let attachment = MailAttachment::new("report.txt", "text/plain", "hello");
@@ -501,6 +505,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
         let mailer = SmtpMailer::new(&cfg).unwrap();
         let attachment = MailAttachment::new("report.txt", "not a content type", "hello");
@@ -530,6 +535,7 @@ mod tests {
             password_ref: None,
             from: String::new(),
             starttls: true,
+            ..Default::default()
         };
 
         mailer_from_config(&cfg, None).expect("console mailer should build");

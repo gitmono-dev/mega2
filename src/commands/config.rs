@@ -604,6 +604,7 @@ mod tests {
             ),
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         });
 
         let err = validate_config(&config, None, None, false, false, false)
@@ -751,6 +752,7 @@ mod tests {
             password_ref: Some(secret_ref),
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         });
         let resolver = TestSecretResolver::new();
 
@@ -781,6 +783,7 @@ mod tests {
             password_ref: Some(secret_ref.clone()),
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         });
         let resolver = TestSecretResolver::new()
             .with_secret(&secret_ref, "smtp-test-value")

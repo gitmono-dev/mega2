@@ -73,7 +73,8 @@ impl AppContext {
                         MegaError::Other(format!("mail initialization failed: {e}"))
                     })?;
                 let notif_stg = storage.notification_storage();
-                let dispatcher_control = crate::notification::EmailDispatcherControl::new(true);
+                let dispatcher_control =
+                    crate::notification::EmailDispatcherControl::from_mail_config(mail_cfg);
                 config_handle.subscribe(
                     crate::notification::config_reload_email_dispatcher_subscriber(
                         dispatcher_control.clone(),

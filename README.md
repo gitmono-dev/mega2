@@ -131,7 +131,7 @@ Key sections (see `config/config.toml` for the full list):
 | `[build]`          | Orion build server URL and trigger preheat depth                        |
 | `[buck]`           | Buck upload session limits, cleanup schedule, and concurrency caps       |
 | `[artifacts_gc]`   | Background GC enable flag and schedule for orphan repo artifact blobs    |
-| `[mail]`           | SMTP enable flag, host / port / from address / STARTTLS, `password_ref`  |
+| `[mail]`           | SMTP settings, `password_ref`, dispatcher batch and concurrency limits    |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
 `mail.password_ref` is currently the only config-backed monoengine Vault
@@ -310,8 +310,9 @@ cargo test --test <name>
   response to CL events; `notification::dispatcher::EmailDispatcher` polls
   that queue on a 2s tick, claims jobs atomically, and hands them to the
   `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`). Config reload
-  can disable a running dispatcher via `mail.enabled = false`; re-enabling mail
-  or changing SMTP settings still requires restart.
+  can disable a running dispatcher via `mail.enabled = false` and hot-reload
+  dispatcher batch/concurrency limits; re-enabling mail or changing SMTP
+  settings still requires restart.
 - **Background maintenance** — HTTP service tasks clean expired Buck upload
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
   tasks hot-reload schedule settings and can be disabled without restart;

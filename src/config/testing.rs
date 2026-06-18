@@ -191,6 +191,7 @@ impl TestConfigBuilder {
                 password_ref: Some(password_ref),
                 from: "no-reply@example.com".to_string(),
                 starttls: true,
+                ..Default::default()
             }),
         }
     }

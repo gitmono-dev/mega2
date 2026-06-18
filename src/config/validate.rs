@@ -168,6 +168,17 @@ impl MailConfig {
             }
         }
 
+        if self.dispatcher_batch_size == 0 {
+            return Err(MegaError::Other(
+                "mail.dispatcher_batch_size must be greater than 0".to_string(),
+            ));
+        }
+        if self.dispatcher_max_in_flight == 0 {
+            return Err(MegaError::Other(
+                "mail.dispatcher_max_in_flight must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -1148,6 +1159,8 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "password_ref",
             "from",
             "starttls",
+            "dispatcher_batch_size",
+            "dispatcher_max_in_flight",
             "smtp_tls",
             "tls",
         ]),
@@ -1404,6 +1417,7 @@ mod tests {
             ),
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
 
         let err = mail_config
@@ -1427,6 +1441,7 @@ mod tests {
             ),
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
 
         let err = mail_config
@@ -1453,6 +1468,7 @@ mod tests {
             password_ref: None,
             from: "no-reply@example.com".to_string(),
             starttls: true,
+            ..Default::default()
         };
 
         let err = mail_config.validate().expect_err("smtp host should fail");
@@ -1472,6 +1488,7 @@ mod tests {
             password_ref: None,
             from: String::new(),
             starttls: true,
+            ..Default::default()
         };
 
         mail_config
@@ -1493,6 +1510,7 @@ mod tests {
             ),
             from: String::new(),
             starttls: true,
+            ..Default::default()
         };
 
         let err = mail_config
@@ -1500,6 +1518,27 @@ mod tests {
             .expect_err("console provider must not accept smtp credentials");
 
         assert!(err.to_string().contains("mail.provider is smtp"));
+    }
+
+    #[test]
+    fn mail_validate_rejects_zero_dispatcher_limits() {
+        let mail_config = MailConfig {
+            dispatcher_batch_size: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero batch size should fail");
+        assert!(err.to_string().contains("mail.dispatcher_batch_size"));
+
+        let mail_config = MailConfig {
+            dispatcher_max_in_flight: 0,
+            ..Default::default()
+        };
+        let err = mail_config
+            .validate()
+            .expect_err("zero max in-flight should fail");
+        assert!(err.to_string().contains("mail.dispatcher_max_in_flight"));
     }
 
     #[test]
