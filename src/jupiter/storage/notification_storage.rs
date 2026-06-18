@@ -513,6 +513,44 @@ impl NotificationStorage {
         Ok(res.rows_affected > 0)
     }
 
+    pub async fn prune_email_job_attachments(
+        &self,
+        statuses: &[String],
+        older_than: chrono::NaiveDateTime,
+    ) -> Result<u64, sea_orm::DbErr> {
+        if statuses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut status_condition = Condition::any();
+        for status in statuses {
+            status_condition = status_condition.add(email_jobs::Column::Status.eq(status));
+        }
+
+        let job_ids = email_jobs::Entity::find()
+            .select_only()
+            .column(email_jobs::Column::Id)
+            .filter(
+                Condition::all()
+                    .add(status_condition)
+                    .add(email_jobs::Column::UpdatedAt.lt(older_than)),
+            )
+            .into_tuple::<i64>()
+            .all(self.db())
+            .await?;
+
+        if job_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let res = email_job_attachments::Entity::delete_many()
+            .filter(email_job_attachments::Column::EmailJobId.is_in(job_ids))
+            .exec(self.db())
+            .await?;
+
+        Ok(res.rows_affected)
+    }
+
     /// Fetch pending email jobs that are ready to be sent
     /// Jobs are eligible when:
     /// - status == "pending"
@@ -1625,6 +1663,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prune_email_job_attachments_removes_only_old_selected_terminal_attachments() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+
+        notification_event_types::ActiveModel {
+            code: Set("test.event".to_string()),
+            category: Set("test".to_string()),
+            description: Set("desc".to_string()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let old_sent_id = enqueue_test_email_job_with_attachment(&storage, "old-sent").await;
+        storage.mark_job_sent(old_sent_id).await.unwrap();
+        make_email_job_old(&db, old_sent_id).await;
+
+        let old_skipped_id = enqueue_test_email_job_with_attachment(&storage, "old-skipped").await;
+        storage
+            .mark_job_skipped(old_skipped_id, "disabled")
+            .await
+            .unwrap();
+        make_email_job_old(&db, old_skipped_id).await;
+
+        let old_failed_id = enqueue_test_email_job_with_attachment(&storage, "old-failed").await;
+        for _ in 0..MAX_EMAIL_RETRY_ATTEMPTS {
+            storage
+                .mark_job_failed_with_retry(old_failed_id, "smtp unavailable")
+                .await
+                .unwrap();
+        }
+        make_email_job_old(&db, old_failed_id).await;
+
+        let old_pending_id = enqueue_test_email_job_with_attachment(&storage, "old-pending").await;
+        make_email_job_old(&db, old_pending_id).await;
+
+        let recent_sent_id = enqueue_test_email_job_with_attachment(&storage, "recent-sent").await;
+        storage.mark_job_sent(recent_sent_id).await.unwrap();
+
+        let deleted = storage
+            .prune_email_job_attachments(
+                &[
+                    EMAIL_JOB_STATUS_SENT.to_string(),
+                    EMAIL_JOB_STATUS_SKIPPED.to_string(),
+                ],
+                now - chrono::Duration::days(7),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(
+            storage
+                .list_email_job_attachment_metadata(old_sent_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_email_job_attachment_metadata(old_skipped_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .list_email_job_attachment_metadata(old_failed_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .list_email_job_attachment_metadata(old_pending_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .list_email_job_attachment_metadata(recent_sent_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            email_jobs::Entity::find_by_id(old_sent_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            email_jobs::Entity::find_by_id(old_skipped_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     async fn enqueue_test_email_job(storage: &NotificationStorage, username: &str) -> i64 {
         storage
             .enqueue_email_job(
@@ -1635,6 +1788,40 @@ mod tests {
                 "<p>Hello</p>",
                 Some("Hello"),
             )
+            .await
+            .unwrap();
+
+        storage
+            .fetch_pending_jobs(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.username == username)
+            .unwrap()
+            .id
+    }
+
+    async fn enqueue_test_email_job_with_attachment(
+        storage: &NotificationStorage,
+        username: &str,
+    ) -> i64 {
+        let to_email = format!("{username}@test.com");
+        let attachments = [EmailJobAttachment::new(
+            format!("{username}.txt"),
+            "text/plain",
+            username.as_bytes().to_vec(),
+        )];
+
+        storage
+            .enqueue_email_job_with_attachments(EmailJobEnqueue {
+                username,
+                to_email: &to_email,
+                event_type_code: "test.event",
+                subject: "Hello",
+                body_html: "<p>Hello</p>",
+                body_text: Some("Hello"),
+                attachments: &attachments,
+            })
             .await
             .unwrap();
 

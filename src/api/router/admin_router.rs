@@ -109,6 +109,19 @@ pub struct EmailJobAttachmentDeleteResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct EmailJobAttachmentPruneRequest {
+    pub older_than_days: i64,
+    pub statuses: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailJobAttachmentPruneResponse {
+    pub deleted: u64,
+    pub statuses: Vec<String>,
+    pub older_than: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct EmailJobPruneRequest {
     pub older_than_days: i64,
     pub statuses: Option<Vec<String>>,
@@ -123,6 +136,13 @@ pub struct EmailJobPruneResponse {
 
 #[derive(Debug, Clone)]
 struct EmailJobPruneInput {
+    older_than_days: i64,
+    older_than: chrono::NaiveDateTime,
+    statuses: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EmailJobAttachmentPruneInput {
     older_than_days: i64,
     older_than: chrono::NaiveDateTime,
     statuses: Vec<String>,
@@ -165,6 +185,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(email_job_stats))
             .routes(routes!(list_email_job_attachments))
             .routes(routes!(delete_email_job_attachment))
+            .routes(routes!(prune_email_job_attachments))
             .routes(routes!(retry_failed_email_job))
             .routes(routes!(prune_email_jobs))
             .routes(routes!(list_notification_event_types))
@@ -376,6 +397,45 @@ async fn delete_email_job_attachment(
             id: attachment_id,
             email_job_id: job_id,
             deleted: true,
+        },
+    ))))
+}
+
+/// POST /api/v1/admin/email-jobs/attachments/prune
+///
+/// Deletes persisted attachments for old terminal notification email outbox jobs.
+/// Only admins can access this endpoint. Email job records are retained.
+#[utoipa::path(
+    post,
+    path = "/email-jobs/attachments/prune",
+    request_body = EmailJobAttachmentPruneRequest,
+    responses(
+        (status = 200, body = CommonResult<EmailJobAttachmentPruneResponse>, content_type = "application/json"),
+        (status = 400, description = "Invalid attachment prune request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn prune_email_job_attachments(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Json(payload): Json<EmailJobAttachmentPruneRequest>,
+) -> Result<Json<CommonResult<EmailJobAttachmentPruneResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let input = normalize_email_job_attachment_prune_request(payload)?;
+
+    let deleted = state
+        .storage
+        .notification_storage()
+        .prune_email_job_attachments(&input.statuses, input.older_than)
+        .await?;
+
+    Ok(Json(CommonResult::success(Some(
+        EmailJobAttachmentPruneResponse {
+            deleted,
+            statuses: input.statuses,
+            older_than: input.older_than.to_string(),
         },
     ))))
 }
@@ -618,6 +678,25 @@ fn normalize_email_job_prune_request(
     })
 }
 
+fn normalize_email_job_attachment_prune_request(
+    input: EmailJobAttachmentPruneRequest,
+) -> Result<EmailJobAttachmentPruneInput, ApiError> {
+    if input.older_than_days < 1 || input.older_than_days > MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "older_than_days must be between 1 and {MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS}"
+        )));
+    }
+
+    let statuses = normalize_prunable_email_job_statuses(input.statuses)?;
+    let older_than = chrono::Utc::now().naive_utc() - chrono::Duration::days(input.older_than_days);
+
+    Ok(EmailJobAttachmentPruneInput {
+        older_than_days: input.older_than_days,
+        older_than,
+        statuses,
+    })
+}
+
 fn normalize_prunable_email_job_statuses(
     statuses: Option<Vec<String>>,
 ) -> Result<Vec<String>, ApiError> {
@@ -798,6 +877,49 @@ mod tests {
         );
         assert!(
             normalize_email_job_prune_request(EmailJobPruneRequest {
+                older_than_days: 7,
+                statuses: Some(vec![EMAIL_JOB_STATUS_FAILED.to_string()]),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_email_job_attachment_prune_request_defaults_to_sent_and_skipped() {
+        let input = normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
+            older_than_days: 30,
+            statuses: None,
+        })
+        .unwrap();
+
+        assert_eq!(input.older_than_days, 30);
+        assert_eq!(
+            input.statuses,
+            vec![
+                EMAIL_JOB_STATUS_SENT.to_string(),
+                EMAIL_JOB_STATUS_SKIPPED.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_email_job_attachment_prune_request_rejects_unsafe_inputs() {
+        assert!(
+            normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
+                older_than_days: 0,
+                statuses: None,
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
+                older_than_days: MAX_EMAIL_JOB_PRUNE_RETENTION_DAYS + 1,
+                statuses: None,
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_email_job_attachment_prune_request(EmailJobAttachmentPruneRequest {
                 older_than_days: 7,
                 statuses: Some(vec![EMAIL_JOB_STATUS_FAILED.to_string()]),
             })
