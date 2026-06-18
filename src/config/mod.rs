@@ -550,6 +550,42 @@ mod test {
     }
 
     #[test]
+    fn test_profile_toml_parse_error_redacts_source_line() {
+        let _lock = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(&config_path, config_init_template(temp_dir.path()))
+            .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"
+                [mail]
+                {} = "{}{}
+            "#,
+                "password", "plain-text", "-password"
+            ),
+        )
+        .expect("write invalid profile config");
+
+        let err = Config::new_with_profile(
+            config_path.to_str().expect("utf-8 config path"),
+            Some(&profile_path),
+        )
+        .expect_err("bad profile TOML should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("TOML parse error"));
+        assert!(message.contains(profile_path.to_str().expect("utf-8 profile path")));
+        assert!(message.contains("value is redacted"));
+        assert!(message.contains("config source line redacted"));
+        let redacted_key_with_assignment = format!("{} =", "password");
+        assert!(!message.contains("plain-text-password"));
+        assert!(!message.contains(&redacted_key_with_assignment));
+    }
+
+    #[test]
     fn test_vault_bootstrap_loads_profile_database_override() {
         let _lock = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");

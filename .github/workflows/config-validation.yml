@@ -124,6 +124,22 @@ jobs:
           mkdir -p "${config_dir}"
           cp config/config.toml "${config_dir}/config.toml"
 
+          {
+            printf '%s\n' '[mail]'
+            printf '%s = "%s%s\n' 'password' 'plain-text' '-password'
+          } > "${config_dir}/config.bad-toml.toml"
+
+          bad_toml_output="${config_dir}/bad-toml.out"
+          if cargo run -- --config "${config_dir}/config.toml" --profile bad-toml config validate >"${bad_toml_output}" 2>&1; then
+            cat "${bad_toml_output}"
+            echo "bad TOML config unexpectedly validated"
+            exit 1
+          fi
+          grep -F "TOML parse error" "${bad_toml_output}"
+          grep -F "config.bad-toml.toml" "${bad_toml_output}"
+          grep -F "value is redacted" "${bad_toml_output}"
+          ! grep -F "plain-text-password" "${bad_toml_output}"
+
           cat > "${config_dir}/config.bad-placeholder.toml" <<'EOF'
           base_dir = "/tmp/${missing_config_root}"
           EOF
