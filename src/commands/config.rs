@@ -640,6 +640,9 @@ mod tests {
         assert!(output.contains("source warning: environment variable MEGA_UNKNOWN__VALUE"));
         assert!(output.contains("source field:"));
         assert!(output.contains("source override:"));
+        assert!(output.contains("suggested fix"));
+        assert!(output.contains("values are omitted"));
+        assert!(output.contains("unset MEGA_MAIL__PASSWORD"));
         assert!(!output.contains("plain-text-password"));
         assert!(!output.contains("debug"));
         assert!(!output.contains("info"));

@@ -731,7 +731,10 @@ fn source_override(
         field_path: field_path.to_string(),
         source: source.to_string(),
         overridden_source: overridden_source.to_string(),
-        message: format!("{source} overrides {overridden_source} for {field_path}"),
+        message: format!(
+            "{source} overrides {overridden_source} for {field_path}; suggested fix: if this override is unintended, {}; otherwise remove the duplicate lower-precedence setting from {overridden_source}",
+            remove_source_field_action(source, field_path)
+        ),
     }
 }
 
@@ -739,8 +742,27 @@ fn source_field(field_path: &str, source: &str) -> ConfigSourceField {
     ConfigSourceField {
         field_path: field_path.to_string(),
         source: source.to_string(),
-        message: format!("{field_path} is set by {source}"),
+        message: format!(
+            "{field_path} is set by {source}; values are omitted. To change it, {}",
+            change_source_field_action(source, field_path)
+        ),
     }
+}
+
+fn remove_source_field_action(source: &str, field_path: &str) -> String {
+    if let Some(variable) = source.strip_prefix("environment variable ") {
+        return format!("unset {variable}");
+    }
+
+    format!("remove {field_path} from {source}")
+}
+
+fn change_source_field_action(source: &str, field_path: &str) -> String {
+    if let Some(variable) = source.strip_prefix("environment variable ") {
+        return format!("update {variable} or unset it to fall back to lower-precedence sources");
+    }
+
+    format!("edit {field_path} in {source} or use a higher-precedence profile/env override")
 }
 
 fn env_key_to_field_path(variable: &str) -> Option<String> {
@@ -1588,6 +1610,10 @@ mod tests {
                 && message.contains("base file")
                 && message.contains("mail.password")
         }));
+        assert!(override_text.contains("suggested fix"));
+        assert!(override_text.contains("unset MEGA_LOG__LEVEL"));
+        assert!(override_text.contains("remove log.level from profile file"));
+        assert!(override_text.contains("duplicate lower-precedence setting"));
         assert!(!override_text.contains("postgres://localhost"));
         assert!(!override_text.contains("plain-text-password"));
         assert!(!override_text.contains("debug"));
@@ -1673,6 +1699,11 @@ mod tests {
                 .any(|message| message.contains("mail.password")
                     && message.contains("MEGA_MAIL__PASSWORD"))
         );
+        assert!(source_text.contains("values are omitted"));
+        assert!(source_text.contains("use a higher-precedence profile/env override"));
+        assert!(source_text.contains(
+            "update MEGA_MAIL__PASSWORD or unset it to fall back to lower-precedence sources"
+        ));
         assert!(
             diagnostics
                 .environment_warnings
