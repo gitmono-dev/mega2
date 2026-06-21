@@ -16,7 +16,8 @@ docs/
 │   ├── config.md            ← Config 模块拆分与 SecretRef
 │   ├── vault.md             ← Vault 安全加固与凭据迁移
 │   ├── mail.md              ← Mail 模块完善与 SecretRef 消费
-│   └── notification.md       ← Notification 多渠道系统
+│   ├── notification.md       ← Notification 多渠道系统
+│   └── orbit.md             ← Orbit 依赖重构（项目引用 → API 依赖）
 └── [文档范围外]
     ├── chat.md
     └── protocol.md
@@ -31,6 +32,7 @@ docs/
 | **integration.md** | 验证框架 | 端到端测试场景、Docker 环境、验收标准 |
 | **contract.md** | 边界归并 | API/Git/Vault/Policy 模块路径和边界约束 |
 | **config.md / vault.md / mail.md / notification.md** | 专项规划 | 各模块的现状分析、阶段规划、实施细节 |
+| **orbit.md** | 依赖治理 | 把对 orbit 实现 crate 的 path 引用重构为只依赖 orbit-api 契约 |
 
 ## 所有文档的共同结构规范
 
@@ -508,6 +510,7 @@ docs/
 - **vault.md**：A, B, C, D, E, F, G, H, I, J（共 10 个阶段）
 - **mail.md**：0, 1, 2, 3, 4, 5（共 6 个阶段，其中 0 和 1 已完成）
 - **notification.md**：0, 1, 2, 3, 4, 5（共 6 个阶段）
+- **orbit.md**：0, 1, 2, 3（共 4 个阶段，其中阶段 3 为决策门）
 
 ### 优先级定义
 
@@ -519,9 +522,9 @@ docs/
 
 ## 最后一次更新
 
-- **日期**：2026-06-14
-- **内容**：首版发布，定义所有改进文档的共同治理规范
-- **适用文档**：README.md、config.md、vault.md、mail.md、notification.md、integration.md
+- **日期**：2026-06-14（2026-06-19 增补 orbit.md 登记）
+- **内容**：首版发布，定义所有改进文档的共同治理规范；2026-06-19 新增 orbit.md（orbit 依赖重构）并登记到分层结构、角色定义与阶段编号约定
+- **适用文档**：README.md、config.md、vault.md、mail.md、notification.md、integration.md、orbit.md
 
 ---
 

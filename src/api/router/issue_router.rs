@@ -204,6 +204,24 @@ async fn save_comment(
             ConvTypeEnum::Comment,
         )
         .await?;
+
+    // Best-effort issue-comment notification to the issue author (outbox;
+    // delivered by the background dispatcher). A failure must not fail the
+    // comment request. See docs/notification.md phase 0/4.
+    let notif_stg = state.storage.notification_storage();
+    let issue_stg = state.storage.issue_storage();
+    if let Err(e) = crate::notification::triggers::on_issue_comment_created(
+        &notif_stg,
+        &issue_stg,
+        &user.username,
+        &link,
+        &payload.content,
+    )
+    .await
+    {
+        tracing::warn!(issue = %link, error = %e, "failed to enqueue issue comment notifications");
+    }
+
     api_common::comment::check_comment_ref(user, state, &payload.content, &link).await
 }
 

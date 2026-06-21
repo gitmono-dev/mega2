@@ -32,6 +32,11 @@ pub struct Config {
     /// This is the first planned consumer for SecretRef (password) after vault is ready.
     #[serde(default)]
     pub mail: Option<MailConfig>,
+    /// Global notification subsystem settings (kill switch, defaults). Per-user
+    /// preferences still live in the DB; this is the global layer
+    /// (docs/notification.md phase 5).
+    #[serde(default)]
+    pub notification: Option<NotificationConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -288,6 +293,46 @@ impl MailConfig {
         }
 
         Ok(())
+    }
+}
+
+pub const DEFAULT_NOTIFICATION_DELIVERY_MODE: &str = "email";
+pub const NOTIFICATION_DELIVERY_MODES: &[&str] = &["email"];
+
+/// Global notification subsystem configuration.
+///
+/// This is the global layer above per-user DB preferences (docs/notification.md
+/// phase 5): a global kill switch plus defaults applied when a user has no
+/// explicit setting. `enabled` is hot-reloadable (gates the dispatcher); the
+/// defaults are read at consumption time.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NotificationConfig {
+    /// Global kill switch. When false the dispatcher is gated off regardless of
+    /// `mail.enabled`. Hot-reloadable.
+    #[serde(default = "default_notification_enabled")]
+    pub enabled: bool,
+    /// Default delivery mode for users without an explicit setting.
+    #[serde(default = "default_notification_delivery_mode")]
+    pub default_delivery_mode: String,
+    /// Default locale for rendered notifications when a user has none.
+    #[serde(default = "default_mail_template_locale")]
+    pub default_locale: String,
+}
+
+fn default_notification_enabled() -> bool {
+    true
+}
+fn default_notification_delivery_mode() -> String {
+    DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string()
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_notification_enabled(),
+            default_delivery_mode: default_notification_delivery_mode(),
+            default_locale: default_mail_template_locale(),
+        }
     }
 }
 

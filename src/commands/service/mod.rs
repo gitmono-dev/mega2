@@ -37,7 +37,10 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         _ => return Ok(()),
     };
 
-    let context = AppContext::new(config).await?;
+    let object_store =
+        crate::jupiter::storage::object_storage::build_object_storage(&config.object_storage)
+            .await?;
+    let context = AppContext::new(config, object_store).await?;
     context
         .config_handle
         .subscribe(config_reload_log_subscriber())?;

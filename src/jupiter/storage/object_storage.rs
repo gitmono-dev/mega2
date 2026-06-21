@@ -1,11 +1,10 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-pub use orbit::factory::ObjectStorageFactory;
 pub use orbit_api::factory::MegaObjectStorageWrapper;
 use orbit_api::{
     error::{IoOrbitError, OrbitResult},
@@ -13,6 +12,48 @@ use orbit_api::{
     object_storage::{MegaObjectStorage, ObjectByteStream, ObjectKey, ObjectMeta},
 };
 use reqwest::Method;
+
+use crate::{common::errors::MegaError, config::ObjectStorageConfig};
+
+/// Abstraction for constructing the concrete object-storage backend from config.
+///
+/// monoengine's core depends only on this trait plus `orbit-api` types; the
+/// concrete implementation (backed by the heavy `orbit` crate that pulls
+/// `object_store` + cloud SDKs) is registered by the binary at startup via
+/// [`set_object_storage_provider`]. This is the seam that lets the core be
+/// refactored to an API-only dependency on `orbit-api`. See
+/// `docs/refactoring/orbit.md`.
+#[async_trait::async_trait]
+pub trait ObjectStorageProvider: Send + Sync {
+    async fn build(&self, cfg: &ObjectStorageConfig)
+    -> Result<MegaObjectStorageWrapper, MegaError>;
+}
+
+static OBJECT_STORAGE_PROVIDER: OnceLock<Arc<dyn ObjectStorageProvider>> = OnceLock::new();
+
+/// Register the process-wide object-storage provider. The binary (composition
+/// root) calls this once at startup, before any `service` / `chat-migrate`
+/// command builds an `AppContext`. Subsequent calls are ignored.
+pub fn set_object_storage_provider(provider: Arc<dyn ObjectStorageProvider>) {
+    let _ = OBJECT_STORAGE_PROVIDER.set(provider);
+}
+
+/// Build object storage for `cfg` via the registered provider.
+///
+/// Returns a diagnostic error if no provider has been registered (a binary
+/// wiring bug — the binary must call [`set_object_storage_provider`]).
+pub async fn build_object_storage(
+    cfg: &ObjectStorageConfig,
+) -> Result<MegaObjectStorageWrapper, MegaError> {
+    let provider = OBJECT_STORAGE_PROVIDER.get().ok_or_else(|| {
+        MegaError::Other(
+            "object storage provider not registered; the binary must call \
+             set_object_storage_provider() at startup"
+                .to_string(),
+        )
+    })?;
+    provider.build(cfg).await
+}
 
 #[derive(Default)]
 struct InMemoryObjectStorage {

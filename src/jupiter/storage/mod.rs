@@ -83,7 +83,7 @@ use crate::{
             mono_storage::MonoStorage,
             note_storage::NoteStorage,
             notification_storage::NotificationStorage,
-            object_storage::ObjectStorageFactory,
+            object_storage::MegaObjectStorageWrapper,
             open_graph_storage::OpenGraphStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
@@ -193,7 +193,10 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub async fn new(config: Arc<Config>) -> Result<Self, MegaError> {
+    pub async fn new(
+        config: Arc<Config>,
+        object_store: MegaObjectStorageWrapper,
+    ) -> Result<Self, MegaError> {
         let config_handle = ConfigHandle::from_arc(config.clone());
         let connection = Arc::new(database_connection(&config.database).await?);
         let notification_storage = NotificationStorage::new(connection.clone());
@@ -210,7 +213,9 @@ impl Storage {
         let issue_storage = IssueStorage { base: base.clone() };
         let vault_storage = VaultStorage { base: base.clone() };
         let conversation_storage = ConversationStorage { base: base.clone() };
-        let object_store = ObjectStorageFactory::build(&config.object_storage).await?;
+        // `object_store` is injected by the caller (built via the registered
+        // `ObjectStorageProvider`), so this crate no longer references the heavy
+        // `orbit` implementation crate. See docs/refactoring/orbit.md.
         let lfs_service = LfsService {
             lfs_storage: lfs_db_storage.clone(),
             obj_storage: object_store.clone(),

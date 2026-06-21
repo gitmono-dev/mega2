@@ -4,7 +4,7 @@ pub use ::redis::{AsyncCommands, aio::ConnectionManager};
 
 use crate::{
     common::errors::MegaError,
-    config::{RedisConfig, redaction::redact_url, validate::validate_redis_config},
+    config::{RedisConfig, redaction::redact_redis_url, validate::validate_redis_config},
 };
 
 /// Initializes a Redis multiplexed asynchronous connection from the given configuration.
@@ -21,7 +21,7 @@ pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, 
         tracing::debug!("rustls crypto provider was already installed before Redis initialization");
     }
 
-    let redis_url = redact_url(&config.url);
+    let redis_url = redact_redis_url(&config.url);
     let client = ::redis::Client::open(config.url.as_str())
         .map_err(|e| MegaError::Other(format!("failed to open Redis URL {redis_url}: {e}")))?;
     ConnectionManager::new(client)

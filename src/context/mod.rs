@@ -37,10 +37,13 @@ pub struct AppContext {
 
 impl AppContext {
     /// Creates a new application context with the given configuration.
-    pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
+    pub async fn new(
+        config: crate::config::Config,
+        object_store: crate::jupiter::storage::object_storage::MegaObjectStorageWrapper,
+    ) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
-        let storage = crate::jupiter::storage::Storage::new(config.clone()).await?;
+        let storage = crate::jupiter::storage::Storage::new(config.clone(), object_store).await?;
         let config_handle = storage.config_handle();
         let connection = init_connection(&config.redis).await?;
 
@@ -67,6 +70,10 @@ impl AppContext {
             crate::notification::triggers::configure_notification_mail_template_registry(
                 mail_template_registry,
             )?;
+            // Hot-reload the mail template registry when mail.template_* change
+            // (sync, file-only rebuild; docs/mail.md phase 4).
+            config_handle
+                .subscribe(crate::notification::config_reload_mail_template_subscriber())?;
 
             if mail_cfg.enabled {
                 let resolved_password = if mail_cfg.provider == crate::config::MailProvider::Smtp
@@ -83,21 +90,34 @@ impl AppContext {
                         MegaError::Other(format!("mail initialization failed: {e}"))
                     })?;
                 let notif_stg = storage.notification_storage();
-                let dispatcher_control =
-                    crate::notification::EmailDispatcherControl::from_mail_config(mail_cfg);
+                let service = crate::notification::NotificationService::from_mail_config(
+                    notif_stg, mailer, mail_cfg,
+                );
+                // Honor the global notification kill switch at startup; the
+                // dispatcher still spawns so a later reload can re-enable it.
+                let notification_globally_enabled = config
+                    .notification
+                    .as_ref()
+                    .map(|notification| notification.enabled)
+                    .unwrap_or(true);
+                if !notification_globally_enabled {
+                    service.control().set_enabled(false);
+                }
                 config_handle.subscribe(
                     crate::notification::config_reload_email_dispatcher_subscriber(
-                        dispatcher_control.clone(),
+                        service.control(),
                     ),
                 )?;
-                let dispatcher = crate::notification::EmailDispatcher::new_with_control(
-                    notif_stg,
-                    mailer,
-                    dispatcher_control,
-                );
+                // Hot-rebuild the SMTP mailer when connection/credential fields
+                // change (async rebuild re-resolves password_ref post-vault;
+                // docs/mail.md phase 4).
+                config_handle.subscribe(crate::notification::config_reload_mailer_subscriber(
+                    service.email_mailer_handle(),
+                    vault.clone(),
+                ))?;
                 let sd = notification_shutdown.clone();
                 tokio::spawn(async move {
-                    dispatcher.run(sd).await;
+                    service.start(sd).await;
                 });
             }
         }

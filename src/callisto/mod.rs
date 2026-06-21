@@ -78,6 +78,7 @@ pub mod sea_orm_active_enums;
 pub mod ssh_keys;
 pub mod target_build_status;
 pub mod target_state_histories;
+pub mod user_inbox_notifications;
 pub mod user_notification_preferences;
 pub mod user_notification_settings;
 pub mod vault;

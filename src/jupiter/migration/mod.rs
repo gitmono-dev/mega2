@@ -100,6 +100,7 @@ mod m20260529_013000_chat_foundations;
 mod m20260529_023000_channel_chat;
 mod m20260618_063000_add_preferred_locale_to_notification_settings;
 mod m20260618_064500_create_email_job_attachments;
+mod m20260619_120000_create_user_inbox_notifications;
 mod runner;
 pub use runner::apply_migrations;
 
@@ -187,6 +188,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260529_023000_channel_chat::Migration),
             Box::new(m20260618_063000_add_preferred_locale_to_notification_settings::Migration),
             Box::new(m20260618_064500_create_email_job_attachments::Migration),
+            Box::new(m20260619_120000_create_user_inbox_notifications::Migration),
         ]
     }
 }

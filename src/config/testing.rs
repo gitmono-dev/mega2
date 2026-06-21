@@ -193,6 +193,7 @@ impl TestConfigBuilder {
                 starttls: true,
                 ..Default::default()
             }),
+            notification: None,
         }
     }
 }

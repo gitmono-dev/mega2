@@ -335,6 +335,21 @@ impl VaultCore {
         replace_core_key(key_path.as_ref(), &updated_key)
     }
 
+    /// Emit one audit record per secret access (vault.md stage H).
+    ///
+    /// Records `operation` (write/read/list/delete), the `secret_name` (the
+    /// logical path, never the secret value) and the `outcome`
+    /// (success/miss/failure) to the `vault_audit` tracing target.
+    ///
+    /// **Failure policy: fail-open (intentional).** Auditing uses `tracing`,
+    /// whose emission is infallible and cannot itself error, so a secret
+    /// operation is never blocked or failed by the audit step. This is a
+    /// deliberate availability-over-non-repudiation choice: a missing audit
+    /// sink must not deny legitimate secret access at runtime. The secret value
+    /// is hashed/omitted by construction here (only the name and outcome are
+    /// recorded), so this target carries no plaintext, root token or shares. A
+    /// fail-closed, durable audit sink would require a configurable destination
+    /// and is out of scope for this hook; see vault.md stage H.
     fn audit_secret_access(
         &self,
         operation: SecretAuditOperation,

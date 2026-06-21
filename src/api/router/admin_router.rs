@@ -259,7 +259,33 @@ pub struct UpsertMailTemplateRequest {
 pub struct MailTemplateUpsertResponse {
     pub created: bool,
     pub registry_reloaded: bool,
+    /// Version number under which the previous content (if any) was archived.
+    pub archived_version: Option<u32>,
     pub template: MailTemplateAuditResponse,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplateVersionInfo {
+    pub version: u32,
+    pub subject: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplateHistoryResponse {
+    pub key: String,
+    pub locale: String,
+    pub versions: Vec<MailTemplateVersionInfo>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MailTemplateRollbackResponse {
+    pub key: String,
+    pub locale: String,
+    pub restored_version: u32,
+    /// Version under which the content being replaced was archived.
+    pub archived_version: Option<u32>,
+    pub registry_reloaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +326,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(list_mail_templates))
             .routes(routes!(preview_mail_template))
             .routes(routes!(upsert_mail_template))
+            .routes(routes!(list_mail_template_history))
+            .routes(routes!(rollback_mail_template))
             .routes(routes!(list_notification_event_types))
             .routes(routes!(update_notification_event_type)),
     )
@@ -778,6 +806,98 @@ async fn upsert_mail_template(
     Ok(Json(CommonResult::success(Some(response))))
 }
 
+/// GET /api/v1/admin/mail-templates/{key}/{locale}/history
+///
+/// Lists archived versions of an external mail template (newest version number
+/// last). Only admins can access this endpoint.
+#[utoipa::path(
+    get,
+    path = "/mail-templates/{key}/{locale}/history",
+    responses(
+        (status = 200, body = CommonResult<MailTemplateHistoryResponse>, content_type = "application/json"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn list_mail_template_history(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path((key, locale)): Path<(String, String)>,
+) -> Result<Json<CommonResult<MailTemplateHistoryResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let key = normalize_mail_template_identifier("mail template key", &key)?;
+    let locale = normalize_mail_template_identifier("mail template locale", &locale)?;
+    let mail_config = state.storage.config().mail.clone().unwrap_or_default();
+    let template_dir = mail_template_dir(&mail_config)?;
+    let versions = list_mail_template_versions(template_dir, &key, &locale)?;
+
+    Ok(Json(CommonResult::success(Some(
+        MailTemplateHistoryResponse {
+            key,
+            locale,
+            versions,
+        },
+    ))))
+}
+
+/// POST /api/v1/admin/mail-templates/{key}/{locale}/history/{version}/rollback
+///
+/// Restores an archived version of an external mail template as the current
+/// template, archiving the content being replaced, and hot-reloads the registry.
+/// Only admins can access this endpoint.
+#[utoipa::path(
+    post,
+    path = "/mail-templates/{key}/{locale}/history/{version}/rollback",
+    responses(
+        (status = 200, body = CommonResult<MailTemplateRollbackResponse>, content_type = "application/json"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - not admin"),
+    ),
+    tag = MAIL_TAG
+)]
+async fn rollback_mail_template(
+    user: LoginUser,
+    State(state): State<MonoApiServiceState>,
+    Path((key, locale, version)): Path<(String, String, u32)>,
+) -> Result<Json<CommonResult<MailTemplateRollbackResponse>>, ApiError> {
+    ensure_admin(&state, &user).await?;
+    let key = normalize_mail_template_identifier("mail template key", &key)?;
+    let locale = normalize_mail_template_identifier("mail template locale", &locale)?;
+    let mail_config = state.storage.config().mail.clone().unwrap_or_default();
+    let template_dir = mail_template_dir(&mail_config)?;
+
+    let snapshot_path =
+        mail_template_history_dir(template_dir, &key, &locale).join(format!("{version:04}.toml"));
+    if !snapshot_path.is_file() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "mail template version {version} not found for {key}/{locale}"
+        )));
+    }
+    let snapshot = fs::read_to_string(&snapshot_path).map_err(ApiError::internal)?;
+
+    let current_path = current_mail_template_path(template_dir, &key, &locale)?;
+    validate_mail_template_write_path(template_dir, &current_path)?;
+    // Archive whatever is current before replacing it, so rollback is itself reversible.
+    let archived_version =
+        archive_existing_mail_template(template_dir, &current_path, &key, &locale)?;
+    fs::write(&current_path, snapshot).map_err(ApiError::internal)?;
+
+    let registry = notification_mail_template_registry_from_config(&mail_config)
+        .map_err(ApiError::internal)?;
+    configure_notification_mail_template_registry(registry).map_err(ApiError::internal)?;
+
+    Ok(Json(CommonResult::success(Some(
+        MailTemplateRollbackResponse {
+            key,
+            locale,
+            restored_version: version,
+            archived_version,
+            registry_reloaded: true,
+        },
+    ))))
+}
+
 /// GET /api/v1/admin/notification-event-types
 ///
 /// Lists notification event types. Only admins can access this endpoint.
@@ -1045,11 +1165,19 @@ fn upsert_mail_template_file(
             .map(mail_template_identity)
             .collect();
     let (write_path, created) = resolve_mail_template_write_path(template_dir, &input.template)?;
+    // Archive the existing content before overwriting so it can be rolled back.
+    let archived_version = archive_existing_mail_template(
+        template_dir,
+        &write_path,
+        input.template.key().as_str(),
+        input.template.locale(),
+    )?;
     write_localized_mail_template(&write_path, &input.template)?;
 
     Ok(MailTemplateUpsertResponse {
         created,
         registry_reloaded: false,
+        archived_version,
         template: mail_template_audit_response(
             &input.template,
             MAIL_TEMPLATE_SOURCE_EXTERNAL,
@@ -1058,6 +1186,114 @@ fn upsert_mail_template_file(
             built_in_identities.contains(&mail_template_identity(&input.template)),
         ),
     })
+}
+
+/// History directory for a template's archived versions:
+/// `{template_dir}/.history/{key}__{locale}/`. The loader only reads top-level
+/// `*.toml` files, so this hidden subdir is never picked up as a live template.
+fn mail_template_history_dir(template_dir: &FsPath, key: &str, locale: &str) -> PathBuf {
+    template_dir
+        .join(".history")
+        .join(format!("{key}__{locale}"))
+}
+
+fn next_mail_template_version(history_dir: &FsPath) -> Result<u32, ApiError> {
+    let mut max = 0u32;
+    if history_dir.is_dir() {
+        for entry in fs::read_dir(history_dir).map_err(ApiError::internal)? {
+            let entry = entry.map_err(ApiError::internal)?;
+            if let Some(version) = entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u32>().ok())
+            {
+                max = max.max(version);
+            }
+        }
+    }
+    Ok(max + 1)
+}
+
+/// Archive the current content of `write_path` (if it exists) into the template's
+/// history dir. Returns the version number assigned, or `None` if there was no
+/// prior file to archive.
+fn archive_existing_mail_template(
+    template_dir: &FsPath,
+    write_path: &FsPath,
+    key: &str,
+    locale: &str,
+) -> Result<Option<u32>, ApiError> {
+    if !write_path.is_file() {
+        return Ok(None);
+    }
+    let current = fs::read_to_string(write_path).map_err(ApiError::internal)?;
+    let history_dir = mail_template_history_dir(template_dir, key, locale);
+    fs::create_dir_all(&history_dir).map_err(ApiError::internal)?;
+    let version = next_mail_template_version(&history_dir)?;
+    let snapshot_path = history_dir.join(format!("{version:04}.toml"));
+    fs::write(&snapshot_path, current).map_err(ApiError::internal)?;
+    Ok(Some(version))
+}
+
+fn list_mail_template_versions(
+    template_dir: &FsPath,
+    key: &str,
+    locale: &str,
+) -> Result<Vec<MailTemplateVersionInfo>, ApiError> {
+    let history_dir = mail_template_history_dir(template_dir, key, locale);
+    let mut versions = Vec::new();
+    if history_dir.is_dir() {
+        for entry in fs::read_dir(&history_dir).map_err(ApiError::internal)? {
+            let entry = entry.map_err(ApiError::internal)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(version) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let content = fs::read_to_string(&path).map_err(ApiError::internal)?;
+            let subject = toml::from_str::<toml::Value>(&content)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("subject")
+                        .and_then(|subject| subject.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            versions.push(MailTemplateVersionInfo {
+                version,
+                subject,
+                bytes: content.len() as u64,
+            });
+        }
+    }
+    versions.sort_by_key(|info| info.version);
+    Ok(versions)
+}
+
+/// Resolve the current on-disk path for a `{key}/{locale}` external template:
+/// an existing source file if one matches, otherwise the derived path.
+fn current_mail_template_path(
+    template_dir: &FsPath,
+    key: &str,
+    locale: &str,
+) -> Result<PathBuf, ApiError> {
+    let sources =
+        load_localized_template_sources_from_dir(template_dir).map_err(ApiError::internal)?;
+    for source in &sources {
+        let template = source.template();
+        if template.key().as_str() == key && template.locale() == locale {
+            return Ok(source.source_path().to_path_buf());
+        }
+    }
+    Ok(template_dir.join(format!("{key}__{locale}.toml")))
 }
 
 fn mail_template_dir(mail_config: &MailConfig) -> Result<&FsPath, ApiError> {
@@ -1526,6 +1762,91 @@ text = "Hello {{name}}"
         assert_eq!(rendered.subject, "Override alice");
         assert_eq!(rendered.html, "<p>&lt;hello&gt;</p>");
         assert_eq!(rendered.text.as_deref(), Some("alice: <hello>"));
+    }
+
+    #[test]
+    fn mail_template_versions_archive_on_overwrite_and_support_rollback() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mail_config = MailConfig {
+            template_dir: Some(dir.path().to_path_buf()),
+            ..MailConfig::default()
+        };
+        let template_dir = dir.path();
+
+        // v1: first write creates the file, nothing to archive.
+        let r1 = upsert_mail_template_file(
+            &mail_config,
+            "cl.comment.created".to_string(),
+            "en-US".to_string(),
+            UpsertMailTemplateRequest {
+                subject: "V1 {{actor_username}}".to_string(),
+                html: "<p>v1</p>".to_string(),
+                text: None,
+            },
+        )
+        .unwrap();
+        assert!(r1.created);
+        assert_eq!(r1.archived_version, None);
+
+        // v2: overwrite archives the prior content as version 1.
+        let r2 = upsert_mail_template_file(
+            &mail_config,
+            "cl.comment.created".to_string(),
+            "en-US".to_string(),
+            UpsertMailTemplateRequest {
+                subject: "V2 {{actor_username}}".to_string(),
+                html: "<p>v2</p>".to_string(),
+                text: None,
+            },
+        )
+        .unwrap();
+        assert!(!r2.created);
+        assert_eq!(r2.archived_version, Some(1));
+
+        let versions =
+            list_mail_template_versions(template_dir, "cl.comment.created", "en-US").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, 1);
+        assert!(versions[0].subject.contains("V1"));
+
+        // Roll back to version 1 (the steps rollback_mail_template performs after auth).
+        let snapshot_path = mail_template_history_dir(template_dir, "cl.comment.created", "en-US")
+            .join("0001.toml");
+        let snapshot = std::fs::read_to_string(&snapshot_path).unwrap();
+        let current_path =
+            current_mail_template_path(template_dir, "cl.comment.created", "en-US").unwrap();
+        let archived = archive_existing_mail_template(
+            template_dir,
+            &current_path,
+            "cl.comment.created",
+            "en-US",
+        )
+        .unwrap();
+        assert_eq!(archived, Some(2), "the current v2 is archived as version 2");
+        std::fs::write(&current_path, snapshot).unwrap();
+
+        // The registry now renders the restored v1 subject.
+        let registry = notification_mail_template_registry_from_config(&mail_config).unwrap();
+        let rendered = registry
+            .render(
+                &MailTemplateKey::new("cl.comment.created"),
+                Some("en-US"),
+                &[
+                    ("actor_username", "alice"),
+                    ("cl_link", "CL1"),
+                    ("comment_text", "x"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rendered.subject, "V1 alice");
+
+        let versions =
+            list_mail_template_versions(template_dir, "cl.comment.created", "en-US").unwrap();
+        assert_eq!(
+            versions.len(),
+            2,
+            "rollback archived the replaced content too"
+        );
     }
 
     #[test]

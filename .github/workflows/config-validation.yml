@@ -64,18 +64,16 @@ jobs:
         working-directory: monoengine
         run: cargo +nightly fmt --all --check
 
-      - name: Start test PostgreSQL
+      - name: Mask test secrets in logs
+        run: |
+          echo "::add-mask::mono_test_password"
+          echo "::add-mask::smtp-test-password"
+
+      - name: Start test services (PostgreSQL, Redis, Mailpit)
         working-directory: monoengine
         run: |
-          docker compose -f docker-compose.test.yml up -d postgres
-          for attempt in {1..30}; do
-            if docker compose -f docker-compose.test.yml exec -T postgres pg_isready -U mono -d monoengine_it; then
-              exit 0
-            fi
-            sleep 2
-          done
-          docker compose -f docker-compose.test.yml logs postgres
-          exit 1
+          docker compose -f docker-compose.test.yml up -d --wait
+          docker compose -f docker-compose.test.yml ps
 
       - name: Run config sample tests
         working-directory: monoengine
@@ -118,15 +116,15 @@ jobs:
 
       - name: Validate bundled config
         working-directory: monoengine
-        run: cargo run -- --config config/config.toml config validate
+        run: cargo run -p monoengine -- --config config/config.toml config validate
 
       - name: Validate generated config
         working-directory: monoengine
         run: |
           config_path="${RUNNER_TEMP}/monoengine.generated.toml"
-          cargo run -- config init --output "${config_path}" --force
-          cargo run -- --config "${config_path}" config validate
-          cargo run -- --config "${config_path}" config validate --deny-warnings
+          cargo run -p monoengine -- config init --output "${config_path}" --force
+          cargo run -p monoengine -- --config "${config_path}" config validate
+          cargo run -p monoengine -- --config "${config_path}" config validate --deny-warnings
 
       - name: Validate profile merge
         working-directory: monoengine
@@ -141,9 +139,9 @@ jobs:
           [monorepo]
           root_dirs = ["profile-root"]
           EOF
-          cargo run -- --config "${config_dir}/config.toml" --profile prod config validate
+          cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile prod config validate
           source_output="${config_dir}/source-diagnostics.out"
-          MEGA_DATABASE__DB_URL="postgres://ci.example.invalid:5432/ci" cargo run -- --config "${config_dir}/config.toml" --profile prod config validate --show-sources >"${source_output}" 2>&1
+          MEGA_DATABASE__DB_URL="postgres://ci.example.invalid:5432/ci" cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile prod config validate --show-sources >"${source_output}" 2>&1
           grep -F "source field:" "${source_output}"
           grep -F "source override:" "${source_output}"
           grep -F "log.level" "${source_output}"
@@ -171,7 +169,7 @@ jobs:
           } > "${config_dir}/config.bad-toml.toml"
 
           bad_toml_output="${config_dir}/bad-toml.out"
-          if cargo run -- --config "${config_dir}/config.toml" --profile bad-toml config validate >"${bad_toml_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile bad-toml config validate >"${bad_toml_output}" 2>&1; then
             cat "${bad_toml_output}"
             echo "bad TOML config unexpectedly validated"
             exit 1
@@ -186,7 +184,7 @@ jobs:
           EOF
 
           placeholder_output="${config_dir}/bad-placeholder.out"
-          if cargo run -- --config "${config_dir}/config.toml" --profile bad-placeholder config validate >"${placeholder_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile bad-placeholder config validate >"${placeholder_output}" 2>&1; then
             cat "${placeholder_output}"
             echo "bad placeholder config unexpectedly validated"
             exit 1
@@ -204,7 +202,7 @@ jobs:
           EOF
 
           secret_ref_output="${config_dir}/bad-secret-ref.out"
-          if cargo run -- --config "${config_dir}/config.toml" --profile bad-secret-ref config validate >"${secret_ref_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile bad-secret-ref config validate >"${secret_ref_output}" 2>&1; then
             cat "${secret_ref_output}"
             echo "bad SecretRef config unexpectedly validated"
             exit 1
@@ -221,7 +219,7 @@ jobs:
           EOF
 
           secret_ref_namespace_output="${config_dir}/bad-secret-ref-namespace.out"
-          if cargo run -- --config "${config_dir}/config.toml" --profile bad-secret-ref-namespace config validate >"${secret_ref_namespace_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile bad-secret-ref-namespace config validate >"${secret_ref_namespace_output}" 2>&1; then
             cat "${secret_ref_namespace_output}"
             echo "bad SecretRef namespace config unexpectedly validated"
             exit 1
@@ -237,7 +235,7 @@ jobs:
           EOF
 
           redis_output="${config_dir}/bad-redis.out"
-          if cargo run -- --config "${config_dir}/config.toml" --profile bad-redis config validate >"${redis_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile bad-redis config validate >"${redis_output}" 2>&1; then
             cat "${redis_output}"
             echo "bad Redis config unexpectedly validated"
             exit 1
@@ -251,7 +249,7 @@ jobs:
           } > "${config_dir}/config.deprecated-mail-password.toml"
 
           mail_password_output="${config_dir}/deprecated-mail-password.out"
-          if cargo run -- --config "${config_dir}/config.toml" --profile deprecated-mail-password config validate --deny-warnings >"${mail_password_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile deprecated-mail-password config validate --deny-warnings >"${mail_password_output}" 2>&1; then
             cat "${mail_password_output}"
             echo "deprecated mail.password config unexpectedly passed --deny-warnings"
             exit 1
@@ -266,18 +264,35 @@ jobs:
           EOF
 
           profile_warning_output="${config_dir}/profile-source-warning.out"
-          cargo run -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --show-sources >"${profile_warning_output}" 2>&1
+          cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --show-sources >"${profile_warning_output}" 2>&1
           grep -F "source warning: file" "${profile_warning_output}"
           grep -F "config.profile-source-warning.toml" "${profile_warning_output}"
           grep -F "mail.smtp_tls" "${profile_warning_output}"
           grep -F "mail.starttls" "${profile_warning_output}"
 
-          if cargo run -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --deny-warnings >"${profile_warning_output}" 2>&1; then
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --deny-warnings >"${profile_warning_output}" 2>&1; then
             cat "${profile_warning_output}"
             echo "profile source warning unexpectedly passed --deny-warnings"
             exit 1
           fi
           grep -F "source diagnostics produced" "${profile_warning_output}"
+
+      - name: Run integration tests (vault CLI + mail/notification dispatcher)
+        working-directory: monoengine
+        env:
+          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
+          MEGA_REDIS__URL: redis://127.0.0.1:16379
+          MAILPIT_API_URL: http://127.0.0.1:18025
+        run: |
+          # Black-box CLI integration tests (config secret ref/set/check, validate).
+          # The integration test lives in the `monoengine` binary crate (bin/tests/).
+          cargo test -p monoengine --test integration_vault -- --test-threads=1
+          # Mail/notification dispatcher delivery against the real Mailpit + Postgres,
+          # plus the NotificationService end-to-end delivery and the CL-comment
+          # trigger enqueue/render path. These live in the monoengine-core library.
+          cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher'
+          cargo test -p monoengine-core 'notification::service::tests'
+          cargo test -p monoengine-core 'notification::triggers::tests'
 
       - name: Stop test services
         if: always()

@@ -7,8 +7,8 @@ use sea_orm::{
 
 use crate::{
     callisto::{
-        email_job_attachments, email_jobs, notification_event_types, user_notification_preferences,
-        user_notification_settings,
+        email_job_attachments, email_jobs, notification_event_types, user_inbox_notifications,
+        user_notification_preferences, user_notification_settings,
     },
     config::{
         DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS, DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS,
@@ -172,6 +172,47 @@ impl NotificationStorage {
 
     pub fn db(&self) -> &DatabaseConnection {
         &self.db
+    }
+
+    // In-app (inbox) notifications
+
+    /// Persist an in-app notification row for a user (in-app delivery channel).
+    pub async fn create_inbox_notification(
+        &self,
+        username: &str,
+        event_type_code: &str,
+        subject: &str,
+        body_html: &str,
+        body_text: Option<&str>,
+    ) -> Result<(), sea_orm::DbErr> {
+        user_inbox_notifications::ActiveModel {
+            username: Set(username.to_string()),
+            event_type_code: Set(event_type_code.to_string()),
+            subject: Set(subject.to_string()),
+            body_html: Set(body_html.to_string()),
+            body_text: Set(body_text.map(str::to_string)),
+            read: Set(false),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(self.db())
+        .await?;
+
+        Ok(())
+    }
+
+    /// List a user's in-app notifications, newest first.
+    pub async fn list_inbox_notifications(
+        &self,
+        username: &str,
+        limit: u64,
+    ) -> Result<Vec<user_inbox_notifications::Model>, sea_orm::DbErr> {
+        user_inbox_notifications::Entity::find()
+            .filter(user_inbox_notifications::Column::Username.eq(username))
+            .order_by_desc(user_inbox_notifications::Column::Id)
+            .limit(limit)
+            .all(self.db())
+            .await
     }
 
     // Event types

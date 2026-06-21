@@ -14,7 +14,10 @@ use tokio::{
 
 use crate::{
     common::errors::MegaError,
-    config::{ArtifactGcConfig, BuckConfig, Config, LogConfig, MailConfig},
+    config::{
+        ArtifactGcConfig, BuckConfig, Config, DEFAULT_MAIL_TEMPLATE_LOCALE,
+        DEFAULT_NOTIFICATION_DELIVERY_MODE, LogConfig, MailConfig, NotificationConfig,
+    },
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -137,6 +140,12 @@ impl ConfigHandle {
         );
         apply_buck_changes(&current.buck, &candidate.buck, &mut next.buck, &mut report);
         apply_mail_changes(&current.mail, &candidate.mail, &mut next.mail, &mut report);
+        apply_notification_changes(
+            &current.notification,
+            &candidate.notification,
+            &mut next.notification,
+            &mut report,
+        );
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
         collect_static_restart_fields(&current, &candidate, &mut report);
@@ -531,9 +540,129 @@ fn apply_mail_changes(
                 }
                 report.applied_fields.push("mail.attachment_prune_statuses");
             }
-            collect_mail_restart_fields(current, candidate, report);
+            // Template settings are hot-reloadable: the registry is rebuilt from
+            // files by `config_reload_mail_template_subscriber` (no vault needed),
+            // fail-closed on a bad template_dir (docs/mail.md phase 4).
+            if current.template_default_locale != candidate.template_default_locale {
+                if let Some(next) = next {
+                    next.template_default_locale
+                        .clone_from(&candidate.template_default_locale);
+                }
+                report.applied_fields.push("mail.template_default_locale");
+            }
+            if current.template_dir != candidate.template_dir {
+                if let Some(next) = next {
+                    next.template_dir.clone_from(&candidate.template_dir);
+                }
+                report.applied_fields.push("mail.template_dir");
+            }
+            // SMTP connection / credential / provider fields are hot-reloadable:
+            // `config_reload_mailer_subscriber` rebuilds the mailer asynchronously
+            // (re-resolving password_ref post-vault) and swaps it in, keeping the
+            // previous mailer on failure (docs/mail.md phase 4).
+            if current.provider != candidate.provider {
+                if let Some(next) = next {
+                    next.provider = candidate.provider;
+                }
+                report.applied_fields.push("mail.provider");
+            }
+            if current.smtp_host != candidate.smtp_host {
+                if let Some(next) = next {
+                    next.smtp_host.clone_from(&candidate.smtp_host);
+                }
+                report.applied_fields.push("mail.smtp_host");
+            }
+            if current.smtp_port != candidate.smtp_port {
+                if let Some(next) = next {
+                    next.smtp_port = candidate.smtp_port;
+                }
+                report.applied_fields.push("mail.smtp_port");
+            }
+            if current.username != candidate.username {
+                if let Some(next) = next {
+                    next.username.clone_from(&candidate.username);
+                }
+                report.applied_fields.push("mail.username");
+            }
+            if current.password != candidate.password {
+                if let Some(next) = next {
+                    next.password = candidate.password.clone();
+                }
+                report.applied_fields.push("mail.password");
+            }
+            if current.password_ref != candidate.password_ref {
+                if let Some(next) = next {
+                    next.password_ref = candidate.password_ref.clone();
+                }
+                report.applied_fields.push("mail.password_ref");
+            }
+            if current.from != candidate.from {
+                if let Some(next) = next {
+                    next.from.clone_from(&candidate.from);
+                }
+                report.applied_fields.push("mail.from");
+            }
+            if current.starttls != candidate.starttls {
+                if let Some(next) = next {
+                    next.starttls = candidate.starttls;
+                }
+                report.applied_fields.push("mail.starttls");
+            }
         }
     }
+}
+
+/// All `notification.*` fields are runtime-consumed (the `enabled` gate is read
+/// live by the dispatcher subscriber; the defaults are read at consumption
+/// time), so every change is applied — none is restart-required.
+fn apply_notification_changes(
+    current: &Option<NotificationConfig>,
+    candidate: &Option<NotificationConfig>,
+    next: &mut Option<NotificationConfig>,
+    report: &mut ConfigReloadReport,
+) {
+    if current == candidate {
+        return;
+    }
+
+    let current_enabled = notification_enabled(current);
+    let candidate_enabled = notification_enabled(candidate);
+    let current_mode = notification_delivery_mode(current);
+    let candidate_mode = notification_delivery_mode(candidate);
+    let current_locale = notification_default_locale(current);
+    let candidate_locale = notification_default_locale(candidate);
+
+    *next = candidate.clone();
+
+    if current_enabled != candidate_enabled {
+        report.applied_fields.push("notification.enabled");
+    }
+    if current_mode != candidate_mode {
+        report
+            .applied_fields
+            .push("notification.default_delivery_mode");
+    }
+    if current_locale != candidate_locale {
+        report.applied_fields.push("notification.default_locale");
+    }
+}
+
+fn notification_enabled(config: &Option<NotificationConfig>) -> bool {
+    config.as_ref().map(|c| c.enabled).unwrap_or(true)
+}
+
+fn notification_delivery_mode(config: &Option<NotificationConfig>) -> String {
+    config
+        .as_ref()
+        .map(|c| c.default_delivery_mode.clone())
+        .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string())
+}
+
+fn notification_default_locale(config: &Option<NotificationConfig>) -> String {
+    config
+        .as_ref()
+        .map(|c| c.default_locale.clone())
+        .unwrap_or_else(|| DEFAULT_MAIL_TEMPLATE_LOCALE.to_string())
 }
 
 fn collect_artifact_gc_restart_fields(
@@ -922,45 +1051,6 @@ fn collect_sidebar_restart_fields(
             })
     {
         report.restart_required_fields.push("sidebar.default_items");
-    }
-}
-
-fn collect_mail_restart_fields(
-    current: &MailConfig,
-    candidate: &MailConfig,
-    report: &mut ConfigReloadReport,
-) {
-    if current.provider != candidate.provider {
-        report.restart_required_fields.push("mail.provider");
-    }
-    if current.smtp_host != candidate.smtp_host {
-        report.restart_required_fields.push("mail.smtp_host");
-    }
-    if current.smtp_port != candidate.smtp_port {
-        report.restart_required_fields.push("mail.smtp_port");
-    }
-    if current.username != candidate.username {
-        report.restart_required_fields.push("mail.username");
-    }
-    if current.password != candidate.password {
-        report.restart_required_fields.push("mail.password");
-    }
-    if current.password_ref != candidate.password_ref {
-        report.restart_required_fields.push("mail.password_ref");
-    }
-    if current.from != candidate.from {
-        report.restart_required_fields.push("mail.from");
-    }
-    if current.starttls != candidate.starttls {
-        report.restart_required_fields.push("mail.starttls");
-    }
-    if current.template_default_locale != candidate.template_default_locale {
-        report
-            .restart_required_fields
-            .push("mail.template_default_locale");
-    }
-    if current.template_dir != candidate.template_dir {
-        report.restart_required_fields.push("mail.template_dir");
     }
 }
 
@@ -1438,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_reports_mail_provider_change_requires_restart_without_publishing_snapshot() {
+    fn reload_applies_mail_provider_change_and_publishes_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut current = isolated_config(temp_dir.path().join("current"));
         current.mail = Some(mail_config(true));
@@ -1450,18 +1540,19 @@ mod tests {
         let report = handle.reload(candidate).expect("reload should succeed");
         let snapshot = handle.snapshot().expect("snapshot after reload");
 
-        assert!(report.applied_fields.is_empty());
-        assert_eq!(report.restart_required_fields, vec!["mail.provider"]);
-        assert!(!report.applied());
-        assert!(report.requires_restart());
+        // Provider change is hot-applied (mailer rebuilt asynchronously).
+        assert!(report.applied_fields.contains(&"mail.provider"));
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
         assert_eq!(
             snapshot.mail.as_ref().expect("mail config").provider,
-            MailProvider::Smtp
+            MailProvider::Console
         );
     }
 
     #[test]
-    fn reload_reports_mail_template_settings_require_restart_without_publishing_snapshot() {
+    fn reload_applies_mail_template_settings_and_publishes_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let template_dir = temp_dir.path().join("templates");
         std::fs::create_dir(&template_dir).expect("template dir");
@@ -1472,26 +1563,28 @@ mod tests {
         let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
         let mail = candidate.mail.as_mut().expect("mail config");
         mail.template_default_locale = "zh-CN".to_string();
-        mail.template_dir = Some(template_dir);
+        mail.template_dir = Some(template_dir.clone());
 
         let report = handle.reload(candidate).expect("reload should succeed");
         let snapshot = handle.snapshot().expect("snapshot after reload");
         let mail = snapshot.mail.as_ref().expect("mail config");
 
-        assert!(report.applied_fields.is_empty());
-        assert_eq!(
-            report.restart_required_fields,
-            vec!["mail.template_default_locale", "mail.template_dir"]
+        // Template settings are hot-reloadable (registry rebuild from files,
+        // no vault); the new values are published to the snapshot.
+        assert!(
+            report
+                .applied_fields
+                .contains(&"mail.template_default_locale")
         );
-        assert!(!report.applied());
-        assert!(report.requires_restart());
-        assert_eq!(mail.template_default_locale, "en-US");
-        assert_eq!(mail.template_dir, None);
+        assert!(report.applied_fields.contains(&"mail.template_dir"));
+        assert!(!report.requires_restart());
+        assert!(report.applied());
+        assert_eq!(mail.template_default_locale, "zh-CN");
+        assert_eq!(mail.template_dir, Some(template_dir));
     }
 
     #[test]
-    fn reload_reports_mail_reconfiguration_requires_restart_without_leaking_or_publishing_snapshot()
-    {
+    fn reload_applies_mail_reconfiguration_and_publishes_snapshot_without_leaking_secrets() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let candidate_ref =
             SecretRef::parse("vault://secret/config/candidate/mail/password#value").unwrap();
@@ -1529,34 +1622,34 @@ mod tests {
         let snapshot_mail = snapshot.mail.as_ref().expect("mail config");
         let report_debug = format!("{report:?}");
 
-        assert!(report.applied_fields.is_empty());
-        assert_eq!(
-            report.restart_required_fields,
-            vec![
-                "mail.smtp_host",
-                "mail.smtp_port",
-                "mail.username",
-                "mail.password",
-                "mail.password_ref",
-                "mail.from",
-                "mail.starttls"
-            ]
-        );
-        assert!(!report.applied());
-        assert!(report.requires_restart());
-        assert_eq!(snapshot_mail.smtp_host, "smtp.current.example.com");
-        assert_eq!(snapshot_mail.smtp_port, 587);
-        assert_eq!(snapshot_mail.username.as_deref(), Some("current-user"));
-        assert_eq!(snapshot_mail.from, "current@example.com");
-        assert!(snapshot_mail.starttls);
-        assert_eq!(
-            snapshot_mail
-                .password
-                .as_ref()
-                .map(SecretString::expose_secret),
-            Some("current-password")
-        );
-        assert!(snapshot_mail.password_ref.is_none());
+        // SMTP connection/credential fields are now hot-applied (mailer rebuilt
+        // asynchronously by config_reload_mailer_subscriber).
+        assert!(report.restart_required_fields.is_empty());
+        for field in [
+            "mail.smtp_host",
+            "mail.smtp_port",
+            "mail.username",
+            "mail.password",
+            "mail.password_ref",
+            "mail.from",
+            "mail.starttls",
+        ] {
+            assert!(
+                report.applied_fields.contains(&field),
+                "{field} should be applied"
+            );
+        }
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        // The candidate values are published to the snapshot.
+        assert_eq!(snapshot_mail.smtp_host, "smtp.candidate.example.com");
+        assert_eq!(snapshot_mail.smtp_port, 465);
+        assert_eq!(snapshot_mail.username.as_deref(), Some("candidate-user"));
+        assert_eq!(snapshot_mail.from, "candidate@example.com");
+        assert!(!snapshot_mail.starttls);
+        assert!(snapshot_mail.password.is_none());
+        assert!(snapshot_mail.password_ref.is_some());
+        // The reload report carries only field names, never secret values.
         assert!(!report_debug.contains("current-password"));
         assert!(!report_debug.contains("candidate-user"));
         assert!(!report_debug.contains("config/candidate/mail/password"));
@@ -1704,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_reports_secret_ref_change_without_leaking_or_publishing_snapshot() {
+    fn reload_applies_secret_ref_change_and_publishes_without_leaking() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let current_ref =
             SecretRef::parse("vault://secret/config/current/mail/password#value").unwrap();
@@ -1718,22 +1811,24 @@ mod tests {
         let handle = ConfigHandle::new(current);
 
         let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.mail.as_mut().expect("mail config").password_ref = Some(candidate_ref);
+        candidate.mail.as_mut().expect("mail config").password_ref = Some(candidate_ref.clone());
 
         let report = handle.reload(candidate).expect("reload should succeed");
         let snapshot = handle.snapshot().expect("snapshot after reload");
         let report_debug = format!("{report:?}");
 
-        assert!(report.applied_fields.is_empty());
-        assert_eq!(report.restart_required_fields, vec!["mail.password_ref"]);
-        assert!(!report.applied());
-        assert!(report.requires_restart());
+        // password_ref change is hot-applied: the async mailer rebuild re-resolves
+        // it through vault. The new ref is published; only the field name is in
+        // the report, never the ref path or `#value`.
+        assert!(report.applied_fields.contains(&"mail.password_ref"));
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
         assert_eq!(
             snapshot
                 .mail
                 .as_ref()
                 .and_then(|mail| mail.password_ref.as_ref()),
-            Some(&current_ref)
+            Some(&candidate_ref)
         );
         assert!(!report_debug.contains("config/current/mail/password"));
         assert!(!report_debug.contains("config/candidate/mail/password"));

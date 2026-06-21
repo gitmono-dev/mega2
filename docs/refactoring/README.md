@@ -74,6 +74,17 @@
 - **关键前置**：mail 模块的完整实现、vault 的加固完成
 - **阶段范围**：0 - 5（共 6 个阶段）
 
+### 4a. **refactoring/orbit.md** — Orbit 依赖重构（项目引用 → API 依赖）
+- **目标**：把 monoengine 对 orbit **实现 crate** 的 `path` 项目引用，重构为只依赖 `orbit-api`（纯 API/契约 crate），把唯一的具体构造点通过依赖注入下沉到组合根 / 瘦二进制边界
+- **核心内容**：
+  - 唯一实现 crate 触点定位（`Storage::new` 中的 `ObjectStorageFactory::build`）与 18 处已是 `orbit_api` 的引用
+  - 注入 `MegaObjectStorageWrapper` 值的两段式策略（seam 隔离 + lib/bin 拆分）
+  - 单一二进制 crate 形态对"真正移除重量级依赖"的约束（需阶段 3 拆 `monoengine-core`）
+  - 待决策项：是否拆 crate、impl 落点、注入形态、orbit-api 是否发布
+- **关键前置**：无（结构性依赖治理）；与 config（ObjectStorageConfig 来源）、vault（启动顺序）协同
+- **阶段范围**：0 - 3（共 4 个阶段）
+- **状态（2026-06-19）**：✅ 已完整实现。已拆为 `monoengine-core`（lib，仅 `orbit-api`）+ `monoengine`（bin，注入 `orbit` 实现）；`cargo tree -p monoengine-core` 无 `object_store`/云 SDK。唯一开放项：是否发布 `orbit-api` 为带版本依赖
+
 ### 5. **refactoring/integration.md** — 集成测试策略与执行方案
 
 - **目标**：建立基于 Docker 容器的集成测试框架，验证配置、Vault、邮件、通知等核心模块的端到端功能
@@ -380,6 +391,6 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 
 ## 📝 最后一次更新
 
-- **日期**：2026-06-14
-- **更新内容**：新增前置依赖说明、清晰的执行顺序、跨模块协调点
-- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md、refactoring/notification.md
+- **日期**：2026-06-14（2026-06-19 新增 refactoring/orbit.md）
+- **更新内容**：新增前置依赖说明、清晰的执行顺序、跨模块协调点；2026-06-19 新增 orbit 依赖重构计划（项目引用 → API 依赖）
+- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md、refactoring/notification.md、refactoring/orbit.md

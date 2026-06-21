@@ -5,7 +5,7 @@ use tracing::log;
 
 use crate::{
     common::errors::MegaError,
-    config::{DbConfig, redaction::redact_url, validate::validate_database_config},
+    config::{DbConfig, redaction::redact_db_url, validate::validate_database_config},
     jupiter::{migration::apply_migrations, utils::id_generator},
 };
 
@@ -24,7 +24,7 @@ pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnect
 async fn postgres_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
     validate_database_config(db_config)?;
 
-    let db_url = redact_url(&db_config.db_url);
+    let db_url = redact_db_url(&db_config.db_url);
     log::info!("Connecting to database: {db_url}");
 
     let opt = setup_option(db_config);

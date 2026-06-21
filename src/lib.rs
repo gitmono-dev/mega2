@@ -1,5 +1,14 @@
 #![allow(dead_code)]
 
+//! `monoengine-core` — the monoengine library.
+//!
+//! This crate contains all of monoengine's logic and depends only on the
+//! `orbit-api` contract crate for object storage (traits + config + wrapper).
+//! The concrete object-storage implementation (the heavy `orbit` crate that
+//! pulls `object_store` + cloud SDKs) is injected by the thin `monoengine`
+//! binary via [`set_object_storage_provider`] at startup. See
+//! `docs/refactoring/orbit.md`.
+
 mod api;
 mod bellatrix;
 mod callisto;
@@ -37,22 +46,9 @@ mod server;
 )]
 mod vault;
 
-use crate::cli::parse;
-
-#[cfg(not(target_os = "windows"))]
-#[global_allocator]
-static GLOBAL_ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
-#[cfg(target_os = "windows")]
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-fn main() {
-    let result = parse(None);
-
-    // If there was an error, print it
-    if let Err(e) = result {
-        e.print();
-        std::process::exit(1);
-    }
-}
+// Public entry points for the thin `monoengine` binary (composition root). The
+// binary registers an `ObjectStorageProvider` (backed by the `orbit` impl
+// crate) via `set_object_storage_provider`, then dispatches the CLI via `parse`.
+pub use cli::parse;
+pub use common::errors::MegaError;
+pub use jupiter::storage::object_storage::{ObjectStorageProvider, set_object_storage_provider};

@@ -34,6 +34,7 @@ pub fn cli() -> Command {
                 .subcommand_required(true)
                 .subcommand(secret_ref_cli())
                 .subcommand(secret_set_cli())
+                .subcommand(secret_rotate_cli())
                 .subcommand(secret_check_cli()),
         )
         .subcommand(
@@ -101,6 +102,21 @@ fn secret_set_cli() -> Command {
         )
 }
 
+fn secret_rotate_cli() -> Command {
+    Command::new("rotate")
+        .about("Rotate a supported config secret in vault by overwriting its value")
+        .arg(secret_name_arg())
+        .arg(vault_path_arg())
+        .arg(field_arg())
+        .arg(
+            Arg::new("value-stdin")
+                .long("value-stdin")
+                .action(ArgAction::SetTrue)
+                .required(true)
+                .help("Read the new secret value from stdin"),
+        )
+}
+
 fn secret_check_cli() -> Command {
     Command::new("check")
         .about("Check that a supported config secret exists in vault")
@@ -143,7 +159,7 @@ pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
         Some(("init", _)) => LoadMode::None,
         Some(("secret", secret_args)) => match secret_args.subcommand() {
             Some(("ref", _)) => LoadMode::None,
-            Some(("set" | "check", _)) => LoadMode::VaultBootstrap,
+            Some(("set" | "rotate" | "check", _)) => LoadMode::VaultBootstrap,
             _ => LoadMode::ParsedConfig,
         },
         Some(("validate", _)) => LoadMode::RawSources,
@@ -250,6 +266,29 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                 .await?;
 
             println!("stored {}", secret_ref.as_uri());
+            Ok(())
+        }
+        Some(("rotate", rotate_args)) => {
+            let config_path = require_config_path(&ctx, "config secret rotate")?;
+            let config_profile_path = ctx.config_profile_path.as_deref();
+            let name = required_string_arg(rotate_args, "name")?;
+            ensure_supported_secret_field(name)?;
+            let secret_ref = secret_ref_from_args(rotate_args)?;
+            let value = read_secret_value_from_stdin()?;
+
+            let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
+            let mut data = Map::new();
+            data.insert(secret_ref.field().to_string(), Value::String(value));
+            vault
+                .write_secret(secret_ref.secret_name(), Some(data))
+                .await?;
+
+            println!("rotated {}", secret_ref.as_uri());
+            // The mailer resolves mail.password_ref once at AppContext startup, so a
+            // running service keeps using the previous value until it is restarted.
+            println!(
+                "note: restart running services that consume this secret so they re-resolve it; new resolves and `config validate --resolve-secrets` use the rotated value immediately"
+            );
             Ok(())
         }
         Some(("check", check_args)) => {
@@ -469,6 +508,42 @@ mod tests {
         let matches = cli().try_get_matches_from(["config", "init"]).unwrap();
 
         assert_eq!(load_mode(&matches), LoadMode::None);
+    }
+
+    #[test]
+    fn config_secret_rotate_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from([
+                "config",
+                "secret",
+                "rotate",
+                "mail.password",
+                "--vault-path",
+                "config/prod/mail/password",
+                "--value-stdin",
+            ])
+            .unwrap();
+        let Some(("secret", _)) = matches.subcommand() else {
+            panic!("secret subcommand should parse");
+        };
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_secret_rotate_rejects_unsupported_field() {
+        let matches = secret_rotate_cli()
+            .try_get_matches_from([
+                "rotate",
+                "database.password",
+                "--vault-path",
+                "config/prod/database/password",
+                "--value-stdin",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
+        assert!(err.to_string().contains("only mail.password"));
     }
 
     #[test]

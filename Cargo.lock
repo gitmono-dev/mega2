@@ -3975,7 +3975,23 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.1.2"
+version = "0.1.6"
+dependencies = [
+ "async-trait",
+ "jemallocator",
+ "mimalloc",
+ "monoengine-core",
+ "orbit",
+ "orbit-api",
+ "sea-orm",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "monoengine-core"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4020,17 +4036,14 @@ dependencies = [
  "indexmap 2.14.0",
  "ipnetwork",
  "itertools 0.14.0",
- "jemallocator",
  "lazy_static",
  "lettre",
  "libc",
  "lockfile",
  "log",
- "mimalloc",
  "once_cell",
  "openssl",
  "openssl-sys",
- "orbit",
  "orbit-api",
  "parse-display",
  "pem",

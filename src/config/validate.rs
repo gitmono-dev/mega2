@@ -10,8 +10,8 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
-    MailConfig, MailProvider, MonoConfig, OrionServerConfig, PackConfig, RedisConfig,
-    SidebarConfig, secret::SecretRef,
+    MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
+    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, secret::SecretRef,
 };
 use crate::common::errors::MegaError;
 
@@ -126,9 +126,28 @@ impl Config {
         }
         validate_sidebar_config(&self.sidebar)?;
         validate_artifact_gc_config(&self.artifacts_gc)?;
+        if let Some(notification_config) = &self.notification {
+            validate_notification_config(notification_config)?;
+        }
 
         Ok(())
     }
+}
+
+fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
+    if !NOTIFICATION_DELIVERY_MODES.contains(&config.default_delivery_mode.as_str()) {
+        return Err(MegaError::Other(format!(
+            "notification.default_delivery_mode `{}` is not supported; expected one of {:?}",
+            config.default_delivery_mode, NOTIFICATION_DELIVERY_MODES
+        )));
+    }
+    if config.default_locale.trim().is_empty() {
+        return Err(MegaError::Other(
+            "notification.default_locale must not be empty".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 impl MailConfig {
@@ -1283,6 +1302,49 @@ mod tests {
         let err = config.validate().expect_err("database type should fail");
 
         assert!(err.to_string().contains("database.db_type"));
+    }
+
+    #[test]
+    fn config_validate_accepts_default_notification_config() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig::default());
+
+        config
+            .validate()
+            .expect("default notification config should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_unsupported_notification_delivery_mode() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            default_delivery_mode: "carrier-pigeon".to_string(),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("unsupported delivery mode should fail");
+
+        assert!(
+            err.to_string()
+                .contains("notification.default_delivery_mode")
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_empty_notification_locale() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            default_locale: "   ".to_string(),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("empty notification locale should fail");
+
+        assert!(err.to_string().contains("notification.default_locale"));
     }
 
     #[test]

@@ -497,6 +497,25 @@ async fn save_comment(
         )
         .await?;
 
+    // Enqueue notification emails for the CL author + reviewers (outbox; the
+    // background dispatcher delivers them). Best-effort: a notification failure
+    // must not fail the comment request. See docs/notification.md phase 0.
+    let notif_stg = state.storage.notification_storage();
+    let cl_stg = state.cl_stg();
+    let reviewer_stg = state.storage.reviewer_storage();
+    if let Err(e) = crate::notification::triggers::on_cl_comment_created(
+        &notif_stg,
+        &cl_stg,
+        &reviewer_stg,
+        &user.username,
+        &link,
+        &payload.content,
+    )
+    .await
+    {
+        tracing::warn!(cl = %link, error = %e, "failed to enqueue CL comment notifications");
+    }
+
     if let Ok(Some(cl_model)) = state.cl_stg().get_cl(&link).await {
         state
             .webhook_svc()

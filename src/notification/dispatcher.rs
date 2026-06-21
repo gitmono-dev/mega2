@@ -16,6 +16,7 @@ use crate::{
         Config, DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS,
         DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS, DEFAULT_MAIL_DISPATCHER_BATCH_SIZE,
         DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT, MailConfig,
+        redaction::global_redactor,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     jupiter::storage::notification_storage::{
@@ -23,6 +24,10 @@ use crate::{
         EmailJobFailureDisposition, EmailJobRetryPolicy, NotificationStorage,
     },
     mail::{MailAttachment, Mailer},
+    notification::{
+        channels::{EmailChannel, NotificationChannel, OutboundMessage},
+        redact::redact_email,
+    },
 };
 
 pub const EMAIL_DISPATCH_BATCH_SIZE: u64 = DEFAULT_MAIL_DISPATCHER_BATCH_SIZE;
@@ -247,7 +252,10 @@ pub fn config_reload_email_dispatcher_subscriber(
 
 pub struct EmailDispatcher {
     stg: NotificationStorage,
-    mailer: Arc<dyn Mailer>,
+    channel: Arc<dyn NotificationChannel>,
+    /// Secondary channels (e.g. in-app inbox) the dispatcher fans each delivered
+    /// notification out to, best-effort, after the primary (email) send succeeds.
+    secondary_channels: Vec<Arc<dyn NotificationChannel>>,
     control: EmailDispatcherControl,
     attachment_prune_last_run_epoch_secs: AtomicI64,
 }
@@ -262,9 +270,33 @@ impl EmailDispatcher {
         mailer: Arc<dyn Mailer>,
         control: EmailDispatcherControl,
     ) -> Self {
+        Self::new_with_channel(stg, Arc::new(EmailChannel::new(mailer)), control)
+    }
+
+    /// Construct the dispatcher with an explicit delivery [`NotificationChannel`]
+    /// instead of wrapping a raw [`Mailer`]. Used by
+    /// [`NotificationService`](crate::notification::service::NotificationService)
+    /// to drive the email outbox through the channel abstraction.
+    pub fn new_with_channel(
+        stg: NotificationStorage,
+        channel: Arc<dyn NotificationChannel>,
+        control: EmailDispatcherControl,
+    ) -> Self {
+        Self::new_with_channels(stg, channel, Vec::new(), control)
+    }
+
+    /// Construct the dispatcher with a primary channel plus secondary channels
+    /// the dispatcher fans out to (best-effort) after the primary send succeeds.
+    pub fn new_with_channels(
+        stg: NotificationStorage,
+        channel: Arc<dyn NotificationChannel>,
+        secondary_channels: Vec<Arc<dyn NotificationChannel>>,
+        control: EmailDispatcherControl,
+    ) -> Self {
         Self {
             stg,
-            mailer,
+            channel,
+            secondary_channels,
             control,
             attachment_prune_last_run_epoch_secs: AtomicI64::new(0),
         }
@@ -281,7 +313,7 @@ impl EmailDispatcher {
                 }
                 _ = tick.tick() => {
                     if let Err(e) = self.tick_once().await {
-                        warn!("email dispatcher tick error: {e}");
+                        warn!("email dispatcher tick error: {}", global_redactor().redact(&e.to_string()));
                     }
                 }
             }
@@ -320,8 +352,11 @@ impl EmailDispatcher {
 
             for job in chunk.iter().cloned() {
                 let stg = self.stg.clone();
-                let mailer = Arc::clone(&self.mailer);
-                tasks.spawn(async move { process_email_job(stg, mailer, job, retry_policy).await });
+                let channel = Arc::clone(&self.channel);
+                let secondaries = self.secondary_channels.clone();
+                tasks.spawn(async move {
+                    process_email_job(stg, channel, secondaries, job, retry_policy).await
+                });
             }
 
             while let Some(result) = tasks.join_next().await {
@@ -329,11 +364,17 @@ impl EmailDispatcher {
                     Ok(Ok(outcome)) => stats.record(outcome),
                     Ok(Err(e)) => {
                         stats.task_errors += 1;
-                        warn!(error = %e, "email dispatcher job processing error");
+                        warn!(
+                            error = %global_redactor().redact(&e.to_string()),
+                            "email dispatcher job processing error"
+                        );
                     }
                     Err(e) => {
                         stats.task_errors += 1;
-                        warn!(error = %e, "email dispatcher job task failed");
+                        warn!(
+                            error = %global_redactor().redact(&e.to_string()),
+                            "email dispatcher job task failed"
+                        );
                     }
                 }
             }
@@ -429,9 +470,24 @@ enum EmailJobOutcome {
     MissingAfterFailure,
 }
 
+/// Process a single outbox job through the resolved delivery channel.
+///
+/// The span carries the job id, event type, channel name and a **redacted**
+/// recipient so delivery is traceable without leaking PII (docs/notification.md
+/// phase 0). The full recipient address is never logged.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        job_id = job.id,
+        event_type = %job.event_type_code,
+        channel = channel.name(),
+        recipient = %redact_email(&job.to_email),
+    )
+)]
 async fn process_email_job(
     stg: NotificationStorage,
-    mailer: Arc<dyn Mailer>,
+    channel: Arc<dyn NotificationChannel>,
+    secondary_channels: Vec<Arc<dyn NotificationChannel>>,
     job: email_jobs::Model,
     retry_policy: EmailJobRetryPolicy,
 ) -> Result<EmailJobOutcome, sea_orm::DbErr> {
@@ -458,19 +514,32 @@ async fn process_email_job(
         })
         .collect::<Vec<_>>();
 
-    let send_res = mailer
-        .send_html_with_attachments(
-            &job.to_email,
-            &job.subject,
-            &job.body_html,
-            job.body_text.as_deref(),
-            &attachments,
-        )
-        .await;
+    let message = OutboundMessage {
+        username: &job.username,
+        event_type_code: &job.event_type_code,
+        to: &job.to_email,
+        subject: &job.subject,
+        body_html: &job.body_html,
+        body_text: job.body_text.as_deref(),
+        attachments: &attachments,
+    };
+    let send_res = channel.deliver(&message).await;
 
     match send_res {
         Ok(_) => {
             stg.mark_job_sent(job.id).await?;
+            // Fan out to secondary channels (e.g. in-app inbox). Best-effort:
+            // a secondary failure is logged but does not change the job status
+            // (the email — the primary, retried channel — already succeeded).
+            for secondary in &secondary_channels {
+                if let Err(e) = secondary.deliver(&message).await {
+                    warn!(
+                        channel = secondary.name(),
+                        error = %global_redactor().redact(&e.to_string()),
+                        "secondary notification channel delivery failed"
+                    );
+                }
+            }
             Ok(EmailJobOutcome::Sent)
         }
         Err(e) => match stg
@@ -478,7 +547,19 @@ async fn process_email_job(
             .await?
         {
             EmailJobFailureDisposition::RetryScheduled => Ok(EmailJobOutcome::RetryScheduled),
-            EmailJobFailureDisposition::DeadLettered => Ok(EmailJobOutcome::DeadLettered),
+            EmailJobFailureDisposition::DeadLettered => {
+                // Alert hook for ops: a notification exhausted its retries and was
+                // dead-lettered (docs/notification.md phase 4). The span already
+                // carries job_id / event_type / channel / redacted recipient; the
+                // raw error (which may contain PII) is persisted to the outbox row,
+                // not emitted here.
+                warn!(
+                    target: "notification_alert",
+                    retry_count = job.retry_count,
+                    "email notification dead-lettered after exhausting retries"
+                );
+                Ok(EmailJobOutcome::DeadLettered)
+            }
             EmailJobFailureDisposition::MissingJob => Ok(EmailJobOutcome::MissingAfterFailure),
         },
     }
@@ -489,9 +570,18 @@ fn apply_mail_enabled(
     config: &Config,
     report: &ConfigReloadReport,
 ) -> Result<(), MegaError> {
-    if report.applied_fields.contains(&"mail.enabled") {
-        let enabled = config.mail.as_ref().is_some_and(|mail| mail.enabled);
-        control.set_enabled(enabled);
+    if report.applied_fields.contains(&"mail.enabled")
+        || report.applied_fields.contains(&"notification.enabled")
+    {
+        // The dispatcher is enabled only when mail is enabled AND the global
+        // notification kill switch is on (docs/notification.md phase 5).
+        let mail_enabled = config.mail.as_ref().is_some_and(|mail| mail.enabled);
+        let notification_enabled = config
+            .notification
+            .as_ref()
+            .map(|notification| notification.enabled)
+            .unwrap_or(true);
+        control.set_enabled(mail_enabled && notification_enabled);
     }
     if report.applied_fields.iter().any(|field| {
         matches!(
@@ -1534,6 +1624,48 @@ mod tests {
 
         assert_eq!(applied_report, report);
         assert!(!control.enabled());
+    }
+
+    #[test]
+    fn email_dispatcher_subscriber_gates_on_global_notification_kill_switch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.mail = Some(crate::config::MailConfig {
+            enabled: true,
+            provider: crate::config::MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+            ..Default::default()
+        });
+        config.notification = Some(crate::config::NotificationConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let mut candidate = config.clone();
+        candidate
+            .notification
+            .as_mut()
+            .expect("notification config")
+            .enabled = false;
+        let report = ConfigReloadReport {
+            applied_fields: vec!["notification.enabled"],
+            restart_required_fields: Vec::new(),
+        };
+        let control = EmailDispatcherControl::new(true);
+        let handle = ConfigHandle::new(config);
+
+        handle
+            .subscribe(config_reload_email_dispatcher_subscriber(control.clone()))
+            .expect("subscribe");
+        let applied_report = handle.reload(candidate).expect("reload should succeed");
+
+        assert_eq!(applied_report, report);
+        assert!(
+            !control.enabled(),
+            "global notification kill switch should gate the dispatcher off"
+        );
     }
 
     #[test]

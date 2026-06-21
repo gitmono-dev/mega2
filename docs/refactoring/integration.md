@@ -372,11 +372,18 @@ docker compose -f docker-compose.test.yml exec redis redis-cli ping
 curl -fsS http://127.0.0.1:18025/api/v1/messages >/dev/null
 
 source .env.test
-cargo test --test integration_cli -- --nocapture
-cargo test --test integration_service -- --nocapture --test-threads=1
+# CLI 黑盒集成测试（config secret ref/set/check、validate）位于 tests/integration_vault.rs：
+cargo test --test integration_vault -- --nocapture --test-threads=1
+# 邮件/通知 dispatcher 端到端（真实 Mailpit + Postgres）、NotificationService 投递、
+# CL 评论触发器 enqueue/render，位于 crate 内集成测试：
+cargo test --bin monoengine 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
+cargo test --bin monoengine 'notification::service::tests' -- --nocapture
+cargo test --bin monoengine 'notification::triggers::tests' -- --nocapture
 
 docker compose -f docker-compose.test.yml down -v
 ```
+
+> **测试文件命名说明（2026-06-19）**：P0 CLI 黑盒场景（`integration_cli_secret_*`）实现在 `tests/integration_vault.rs`（沿用既有 `VaultCliEnv`/`isolated_command` 辅助），并非独立的 `tests/integration_cli.rs`。服务级邮件投递与触发器端到端校验以 crate 内集成测试形式存在（`notification::service`、`notification::dispatcher::integration_mail_dispatcher_*`、`notification::triggers`），对真实 Postgres/Mailpit 实跑，已接入 `.github/workflows/config-validation.yml` 的「Run integration tests」步骤（含 redis/mailpit 启动与 `::add-mask::` 凭据脱敏）。
 
 如果 `tests/` 目录尚未建立，先从 P0 的 CLI 黑盒测试开始。不要为了集成测试新增不必要依赖；
 首版可以只用 `std::process::Command`、`std::net::TcpStream`、`reqwest`、`sea-orm` 和现有依赖。
@@ -444,10 +451,15 @@ jobs:
           MEGA_DATABASE__DB_TYPE: postgres
           MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
           MEGA_REDIS__URL: redis://127.0.0.1:16379
+          MAILPIT_API_URL: http://127.0.0.1:18025
         run: |
-          cargo test --test integration_cli -- --nocapture
-          cargo test --test integration_service -- --nocapture --test-threads=1
+          cargo test --test integration_vault -- --nocapture --test-threads=1
+          cargo test --bin monoengine 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
+          cargo test --bin monoengine 'notification::service::tests' -- --nocapture
+          cargo test --bin monoengine 'notification::triggers::tests' -- --nocapture
 ```
+
+> 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
 
 ## 数据流与控制流契约
 

@@ -41,6 +41,24 @@ pub async fn check_comment_ref(
                 ConvTypeEnum::Mention,
             )
             .await?;
+
+        // Best-effort: notify the referenced item's author (mention/reference).
+        // A failure must not fail the comment request. See docs/notification.md.
+        let notif_stg = state.storage.notification_storage();
+        let cl_stg = state.storage.cl_storage();
+        let issue_stg = state.storage.issue_storage();
+        if let Err(e) = crate::notification::triggers::on_item_referenced(
+            &notif_stg,
+            &cl_stg,
+            &issue_stg,
+            &username,
+            source_link,
+            &ref_link,
+        )
+        .await
+        {
+            tracing::warn!(referenced = %ref_link, error = %e, "failed to enqueue reference notification");
+        }
     }
 
     Ok(Json(CommonResult::success(None)))

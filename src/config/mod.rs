@@ -140,6 +140,7 @@ impl Config {
             sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
             mail: None,
+            notification: None,
         }
     }
 
