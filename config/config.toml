@@ -295,7 +295,10 @@ default_items = [
 # `--deny-warnings` treats it as failure.
 # When the service starts with mail enabled, switching this to false is hot-reloaded
 # and stops the dispatcher. The dispatcher limits below are also hot-reloaded.
-# Enabling mail or changing SMTP fields still needs restart.
+# Provider/SMTP/credential/template fields are hot-reloaded too: the SMTP mailer
+# is rebuilt asynchronously (re-resolving password_ref, keeping the old mailer on
+# failure) and the template registry is rebuilt synchronously. Only re-enabling
+# mail (false -> true), or adding/removing the whole [mail] section, needs a restart.
 enabled = true
 provider = "smtp"
 smtp_host = "localhost"
