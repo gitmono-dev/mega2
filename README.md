@@ -196,9 +196,8 @@ src/
 ├── common/               # config loader, error types (MegaError/MegaResult), utils
 ├── context/              # AppContext: shared state (DB, storages, services)
 ├── api/                  # axum HTTP API surface (routes / handlers)
-├── api_model/            # request/response DTOs (utoipa schemas)
+├── config/               # config module: model / loader / SecretRef / reload
 ├── server/               # HTTP / SSH server bootstrap
-├── git_protocol/         # smart-HTTP and SSH Git wire protocol glue
 ├── callisto/             # sea-orm entity models (one file per table)
 ├── jupiter/              # storage / service / migration / redis / utils
 │   ├── storage/          # *Storage structs (BaseStorage + per-domain)
@@ -208,15 +207,17 @@ src/
 │   ├── utils/            # diff / reanchor / misc utilities
 │   └── tests.rs          # shared test helpers (cfg(test))
 ├── ceres/                # CL (Change List) logic, merge checks, build triggers
+├── mail/                 # first-class mail module: Mailer trait + provider factory
 ├── notification/         # email notification dispatcher + event triggers
-├── email/                # Mailer trait + SMTP / Noop implementations
-├── vault/                # vendored RustyVault module
-├── contract/
+├── email/                # legacy Mailer re-export shim (now re-exports crate::mail)
+├── vault/                # vendored RustyVault module (crate::vault)
+├── contract/             # API / Git / Vault / Policy data & boundary contracts
+│   ├── api/              # request/response DTOs (utoipa schemas; was api_model)
+│   ├── git_protocol/     # smart-HTTP and SSH Git wire protocol glue
+│   ├── policy/           # cedar policy guard + reviewer/admin resolution (was saturn + api::guard)
 │   └── vault/            # PKI + KV secret engine integration layer
-│       └── integration/
-│           ├── jupiter_backend.rs
-│           └── vault_core.rs # VaultCore, VaultCoreInterface
-├── bellatrix/  saturn/   # supporting subsystems ported from Mega
+│       └── integration/  # VaultCore, VaultCoreInterface, jupiter_backend
+├── bellatrix/            # supporting subsystem ported from Mega
 └── mega.cedarschema, mega_policies.cedar
 test/project/             # fixture data for integration tests
 target/                   # build artifacts (gitignored)

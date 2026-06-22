@@ -151,7 +151,7 @@ mod tests {
     use super::*;
 
     /// Comprehensive test for reviewer_parser module
-    /// Run with: cargo test -p saturn test_reviewer_parser_comprehensive -- --nocapture
+    /// Run with: cargo test test_reviewer_parser_comprehensive -- --nocapture
     #[test]
     fn test_reviewer_parser_comprehensive() {
         println!("\n{}", "=".repeat(70));
@@ -332,7 +332,7 @@ permit(action == "code:review", principal, resource)
     }
 
     /// Test edge cases in policy parsing
-    /// Run with: cargo test -p saturn test_policy_parsing_edge_cases -- --nocapture
+    /// Run with: cargo test test_policy_parsing_edge_cases -- --nocapture
     #[test]
     fn test_policy_parsing_edge_cases() {
         println!("\n{}", "=".repeat(70));
@@ -419,7 +419,7 @@ permit(action == "code:review", principal, resource)
     }
 
     /// Test the complete flow: policy loading -> parsing -> reviewer assignment
-    /// Run with: cargo test -p saturn test_complete_reviewer_flow -- --nocapture
+    /// Run with: cargo test test_complete_reviewer_flow -- --nocapture
     #[test]
     fn test_complete_reviewer_flow() {
         println!("\n{}", "=".repeat(70));
