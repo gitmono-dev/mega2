@@ -1175,6 +1175,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "orion_server",
             "sidebar",
             "mail",
+            "notification",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1270,6 +1271,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "smtp_tls",
             "tls",
         ]),
+        "notification" => Some(&["enabled", "default_delivery_mode", "default_locale"]),
         _ => None,
     }
 }
@@ -2471,10 +2473,45 @@ mod tests {
         assert!(is_known_field_path("database.db_url"));
         assert!(is_known_field_path("object_storage.s3.access_key_id"));
         assert!(is_known_field_path("sidebar.default_items.label"));
+        assert!(is_known_field_path("notification.enabled"));
+        assert!(is_known_field_path("notification.default_delivery_mode"));
+        assert!(is_known_field_path("notification.default_locale"));
         assert!(!is_known_field_path("database.db_url.extra"));
         assert!(!is_known_field_path("database.typo"));
         assert!(!is_known_field_path("unknown.value"));
         assert!(!is_known_field_path("oauth.allowed_cors_origins"));
+        assert!(!is_known_field_path("notification.typo"));
+    }
+
+    #[test]
+    fn notification_section_is_recognized_and_validates_fields() {
+        let value = toml::from_str::<Value>(
+            r#"
+            [notification]
+            enabled = true
+            default_delivery_mode = "email"
+            default_locale = "en"
+            typo = true
+            "#,
+        )
+        .unwrap();
+
+        let fields = known_unconsumed_fields(&value)
+            .into_iter()
+            .map(|warning| warning.field_path)
+            .collect::<Vec<_>>();
+
+        // A valid [notification] section must not be flagged as unknown ...
+        assert!(!fields.iter().any(|f| f == "notification"));
+        assert!(!fields.iter().any(|f| f == "notification.enabled"));
+        assert!(
+            !fields
+                .iter()
+                .any(|f| f == "notification.default_delivery_mode")
+        );
+        assert!(!fields.iter().any(|f| f == "notification.default_locale"));
+        // ... but an unknown field inside it still is.
+        assert!(fields.iter().any(|f| f == "notification.typo"));
     }
 
     #[test]

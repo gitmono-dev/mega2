@@ -321,3 +321,13 @@ attachment_prune_statuses = ["sent", "skipped"]
 # Legacy compatibility keys below are ignored by MailConfig; use starttls.
 smtp_tls = false
 tls = false
+
+[notification]
+# Global notification kill switch. When false the email dispatcher is gated off
+# regardless of `mail.enabled`. Hot-reloaded (toggling this does not need a restart).
+enabled = true
+# Defaults applied for users that have no explicit notification setting yet.
+# `default_delivery_mode` currently supports only "email" (validated by `config validate`).
+default_delivery_mode = "email"
+# Default locale for rendered notifications when a user has none.
+default_locale = "en-US"

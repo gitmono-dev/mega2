@@ -289,7 +289,7 @@ Config::new
 
 **阶段 5（与 config 高级能力对齐 + 长期维护，已完成首批全局配置/校验/热加载，2026-06-19）**：
 - ✅ **全局通知配置**：新增 `NotificationConfig`（`src/config/model.rs`：`enabled` 全局 kill switch、`default_delivery_mode`、`default_locale`），`Config.notification: Option<NotificationConfig>` 已接入统一加载/profile/env 管道（`#[serde(default)]`）。
-- ✅ **集中校验**：`validate_notification_config`（`src/config/validate.rs`）校验 `default_delivery_mode` 属于受支持集合、`default_locale` 非空，已接入 `Config::validate()`。
+- ✅ **集中校验**：`validate_notification_config`（`src/config/validate.rs`）校验 `default_delivery_mode` 属于受支持集合、`default_locale` 非空，已接入 `Config::validate()`。`notification` 段及其字段（`enabled`/`default_delivery_mode`/`default_locale`）也已登记进 `known_fields` 白名单，因此合法的 `[notification]` 配置不再被未知段告警误报（回归测试 `notification_section_is_recognized_and_validates_fields`）。`config/config.toml` 附带 `[notification]` 示例段。
 - ✅ **受控热加载（全局开关）**：`notification.enabled` / `default_delivery_mode` / `default_locale` 均为运行期热应用（`apply_notification_changes`，`src/config/reload.rs`）；`notification.enabled` 作为全局 kill switch 与 `mail.enabled` 取与门控 dispatcher（`apply_mail_enabled` 已读取两者），启动期与 reload 期都生效。单测 `email_dispatcher_subscriber_gates_on_global_notification_kill_switch` + `config_validate_*_notification_*`。
 - ✅ **测试矩阵补充**：prefs 全关不 enqueue、claim 并发、SMTP 故障矩阵、Mailpit 正路径、全局 kill switch 门控、模板热加载等已覆盖；渠道失败降级与 SecretRef 解析失败的多渠道用例随 in-app 渠道落地补齐。
 - ✅ **CI 覆盖**：`.github/workflows/config-validation.yml` 已新增 redis/mailpit 启动、`::add-mask::` 凭据脱敏与 dispatcher/triggers/service 集成测试步骤（见 integration.md）。
