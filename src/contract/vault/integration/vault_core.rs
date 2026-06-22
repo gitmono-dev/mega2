@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     common::errors::{MegaError, VaultError, VaultResult},
-    config::{DbConfig, mega_base},
+    config::{DbConfig, VaultAuditConfig, mega_base},
     contract::vault::integration::jupiter_backend::JupiterBackend,
     jupiter::storage::{
         Storage,
@@ -84,6 +84,7 @@ pub struct VaultCore {
     rvault: Arc<RustyVault>,
     key: Arc<CoreKey>,
     runtime_tokens: Arc<RuntimeTokens>,
+    audit: VaultAuditConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -256,7 +257,17 @@ impl VaultCore {
             rvault,
             key,
             runtime_tokens,
+            audit: VaultAuditConfig::default(),
         })
+    }
+
+    /// Override the secret-access audit settings (default: enabled, fail-open to
+    /// the `vault_audit` tracing target). The composition root passes
+    /// `config.vault.audit` here so audit is operator-configurable (vault.md
+    /// stage H).
+    pub fn with_audit_config(mut self, audit: VaultAuditConfig) -> Self {
+        self.audit = audit;
+        self
     }
 
     fn token(&self) -> &str {
@@ -341,21 +352,28 @@ impl VaultCore {
     /// logical path, never the secret value) and the `outcome`
     /// (success/miss/failure) to the `vault_audit` tracing target.
     ///
+    /// **Configurable, default on.** Auditing is gated by
+    /// [`VaultAuditConfig::enabled`] (default `true`); a deployment may opt out
+    /// via `config.vault.audit.enabled = false`, in which case no record is
+    /// emitted. The destination is the `vault_audit` tracing target; a
+    /// configurable durable/alternate sink is deferred (vault.md stage H).
+    ///
     /// **Failure policy: fail-open (intentional).** Auditing uses `tracing`,
     /// whose emission is infallible and cannot itself error, so a secret
     /// operation is never blocked or failed by the audit step. This is a
     /// deliberate availability-over-non-repudiation choice: a missing audit
     /// sink must not deny legitimate secret access at runtime. The secret value
     /// is hashed/omitted by construction here (only the name and outcome are
-    /// recorded), so this target carries no plaintext, root token or shares. A
-    /// fail-closed, durable audit sink would require a configurable destination
-    /// and is out of scope for this hook; see vault.md stage H.
+    /// recorded), so this target carries no plaintext, root token or shares.
     fn audit_secret_access(
         &self,
         operation: SecretAuditOperation,
         name: SecretName<'_>,
         outcome: &'static str,
     ) {
+        if !self.audit.enabled {
+            return;
+        }
         tracing::info!(
             target: "vault_audit",
             operation = operation.as_str(),
@@ -957,6 +975,43 @@ mod tests {
                 "Secret {name} should be deleted but still exists"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_audit_config_is_configurable_and_defaults_enabled() {
+        // Stage H: secret-access audit is configurable and defaults to enabled.
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault_core = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize");
+        assert!(
+            vault_core.audit.enabled,
+            "vault secret-access audit must default to enabled (stage H: default on)"
+        );
+
+        // Opting out via config must not break secret operations (fail-open).
+        let vault_core = vault_core.with_audit_config(VaultAuditConfig { enabled: false });
+        assert!(!vault_core.audit.enabled);
+
+        let value = serde_json::json!({ "data": "v" })
+            .as_object()
+            .unwrap()
+            .clone();
+        vault_core
+            .write_secret("audit_off_key", Some(value.clone()))
+            .await
+            .expect("write should succeed with audit disabled");
+        let read = vault_core
+            .read_secret("audit_off_key")
+            .await
+            .expect("read should succeed with audit disabled")
+            .expect("secret should exist");
+        assert_eq!(
+            read, value,
+            "audit toggle must not affect secret round-trip"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

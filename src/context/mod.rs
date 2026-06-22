@@ -48,9 +48,15 @@ impl AppContext {
         let connection = init_connection(&config.redis).await?;
 
         let storage_for_vault = storage.clone();
+        let vault_audit = config
+            .vault
+            .as_ref()
+            .map(|vault| vault.audit)
+            .unwrap_or_default();
         let vault =
             crate::contract::vault::integration::vault_core::VaultCore::new(storage_for_vault)
-                .await?;
+                .await?
+                .with_audit_config(vault_audit);
 
         // Late (post-Vault) construction for mail + notification dispatcher (phase 0 per docs/notification.md).
         // Must be after VaultCore (and mail) per config.md bootstrap constraints and docs/mail.md.

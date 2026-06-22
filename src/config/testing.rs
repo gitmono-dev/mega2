@@ -194,6 +194,7 @@ impl TestConfigBuilder {
                 ..Default::default()
             }),
             notification: None,
+            vault: None,
         }
     }
 }

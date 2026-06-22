@@ -1176,6 +1176,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "sidebar",
             "mail",
             "notification",
+            "vault",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1272,6 +1273,8 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "tls",
         ]),
         "notification" => Some(&["enabled", "default_delivery_mode", "default_locale"]),
+        "vault" => Some(&["audit"]),
+        "vault.audit" => Some(&["enabled"]),
         _ => None,
     }
 }
@@ -2512,6 +2515,30 @@ mod tests {
         assert!(!fields.iter().any(|f| f == "notification.default_locale"));
         // ... but an unknown field inside it still is.
         assert!(fields.iter().any(|f| f == "notification.typo"));
+    }
+
+    #[test]
+    fn vault_audit_section_is_recognized_and_validates_fields() {
+        let value = toml::from_str::<Value>(
+            r#"
+            [vault.audit]
+            enabled = true
+            typo = true
+            "#,
+        )
+        .unwrap();
+
+        let fields = known_unconsumed_fields(&value)
+            .into_iter()
+            .map(|warning| warning.field_path)
+            .collect::<Vec<_>>();
+
+        // A valid [vault.audit] section and its `enabled` field must not be flagged ...
+        assert!(!fields.iter().any(|f| f == "vault"));
+        assert!(!fields.iter().any(|f| f == "vault.audit"));
+        assert!(!fields.iter().any(|f| f == "vault.audit.enabled"));
+        // ... but an unknown field inside it still is.
+        assert!(fields.iter().any(|f| f == "vault.audit.typo"));
     }
 
     #[test]

@@ -141,6 +141,7 @@ impl Config {
             artifacts_gc: ArtifactGcConfig::default(),
             mail: None,
             notification: None,
+            vault: None,
         }
     }
 

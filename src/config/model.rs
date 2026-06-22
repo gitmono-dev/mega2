@@ -37,6 +37,11 @@ pub struct Config {
     /// (docs/notification.md phase 5).
     #[serde(default)]
     pub notification: Option<NotificationConfig>,
+    /// Vault runtime settings (e.g. secret-access audit). Bootstrap material
+    /// (unseal shares / runtime tokens) lives in the `core_key.json` key file,
+    /// not here (docs/vault.md stage H).
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -332,6 +337,40 @@ impl Default for NotificationConfig {
             enabled: default_notification_enabled(),
             default_delivery_mode: default_notification_delivery_mode(),
             default_locale: default_mail_template_locale(),
+        }
+    }
+}
+
+/// Vault runtime settings (docs/vault.md stage H). Currently scopes the
+/// secret-access audit; bootstrap material is not configured here.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultConfig {
+    #[serde(default)]
+    pub audit: VaultAuditConfig,
+}
+
+/// Secret-access audit settings (docs/vault.md stage H).
+///
+/// `enabled` defaults to on, so deployments audit by default; setting it false
+/// opts out of emitting per-access records. The audit destination is the
+/// `vault_audit` `tracing` target; a configurable durable/alternate sink is
+/// deferred (vault.md stage H). The write-failure policy is fail-open: the
+/// `tracing` sink is infallible, so a secret operation is never blocked or
+/// failed by the audit step (availability-over-non-repudiation).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultAuditConfig {
+    #[serde(default = "default_vault_audit_enabled")]
+    pub enabled: bool,
+}
+
+fn default_vault_audit_enabled() -> bool {
+    true
+}
+
+impl Default for VaultAuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_vault_audit_enabled(),
         }
     }
 }

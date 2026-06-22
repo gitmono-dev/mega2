@@ -29,9 +29,9 @@
 >
 > 总体：**vault 本地 P0 止血与 P1 结构拆分在当前仓库状态下技术可行、依赖清晰、风险可控**；执行时严格按文档内"建议执行切片"与本分析的边界推进，即可避免被跨模块前置或 AGENTS 门禁阻塞。文档其余部分（阶段描述、验收、边界）经本次核查无需结构性调整，仅补充本小节与少量执行提示。
 
-> **落地状态更新（2026-06-17；2026-06-19 补 H 审计策略与 J secret 轮换命令）**：本轮实现已完成阶段 A/B/C/D/E/F/H/I/J 的可交付子集，并明确阶段 G 的边界。
+> **落地状态更新（2026-06-17；2026-06-19 补 H 审计策略与 J secret 轮换命令；2026-06-23 补 H 审计配置化）**：本轮实现已完成阶段 A/B/C/D/E/F/H/I/J 的可交付子集，并明确阶段 G 的边界。
 >
-> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。**（2026-06-19）H：`audit_secret_access` 已 doc-comment 显式记录 fail-open 失败策略；J：新增 `config secret rotate` 覆写可迁移 secret（首批 `mail.password`）并显式提示运行中 service 需重启 re-resolve。**
+> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。**（2026-06-19）H：`audit_secret_access` 已 doc-comment 显式记录 fail-open 失败策略；J：新增 `config secret rotate` 覆写可迁移 secret（首批 `mail.password`）并显式提示运行中 service 需重启 re-resolve。（2026-06-23）H：审计已配置化——`config.vault.audit.enabled`（默认开启）经 `VaultCore::with_audit_config` 注入，满足“审计目的地可配置，默认开启”验收的 enable/default-on 维度；可配置持久化 sink 仍为后续。**
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
 > - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
 > - G：对象存储凭据未迁入本项目 vault，因此不做完整 Storage 后置初始化重排。当前边界是：`object_storage.*` 仍属于早期运行时依赖，不能配置为 `SecretRef`；`config secret set/check` 已不依赖对象存储可用。
@@ -64,7 +64,7 @@
 | vault 物理后端 | 已拆边界 | `JupiterBackend` 依赖 `VaultBackendStorage`，生产由 `VaultStorage` 适配；可 DB-only 构造 `VaultCore`。 |
 | `core_key.json` 自动解封 | 已加固 | 只保存 unseal 分片和限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不清库。 |
 | root token 生命周期 | 已接入最小权限 | 初始化后安装 monoengine ACL policy、签发限权 token、撤销 root token；常规 secret 路径不持有 root token；generic token 显式拒绝 `secret/config/*`，并有 config/generic token 隔离单测。 |
-| secret 访问审计 | 已接 hook，失败策略已记录 | `VaultCoreInterface` read/write/delete 记录 `vault_audit` 事件，不包含 secret 值、root token 或分片；`audit_secret_access` 已 doc-comment 显式记录 fail-open 策略（审计经 infallible 的 `tracing`，绝不阻断 secret 操作）。可配置/可 fail-closed 的持久 sink 仍为后续。 |
+| secret 访问审计 | 已接 hook，可配置且默认开启，失败策略已记录 | `VaultCoreInterface` read/write/delete 记录 `vault_audit` 事件，不包含 secret 值、root token 或分片；`audit_secret_access` 已 doc-comment 显式记录 fail-open 策略（审计经 infallible 的 `tracing`，绝不阻断 secret 操作）；`config.vault.audit.enabled`（默认 `true`，经 `VaultCore::with_audit_config` 注入）可显式 opt-out。可配置的持久化/异地 sink 与随之而来的可选 fail-closed 写入策略仍为后续（tracing target 受静态字面量约束）。 |
 | 最小 DB/Vault bootstrap | 已实现 | `VaultCore::from_database_config/from_database_connection` 和 `config secret set/check` 只依赖数据库和 vault key。 |
 | `LoadMode` / `SecretRef` / resolver | 已实现 | CLI 按命令选择加载级别；`SecretRef`/resolver 支持 `mail.password_ref` 延迟解析和缓存/evict。 |
 
@@ -729,13 +729,15 @@ Config::new
 3. 审计记录对 secret 值做哈希或省略，绝不落明文；root token、分片不进入审计。
 4. 显式决定并记录审计写入失败的策略（fail-open 还是 fail-closed）。
 
-> **已完成首批（2026-06-19）**：第 4 项已落地——`VaultCore::audit_secret_access`（`src/contract/vault/integration/vault_core.rs`）已补 doc-comment 显式记录**fail-open**策略及其理由：审计经 `tracing`（infallible）发出，secret 操作绝不因审计步骤被阻断/失败，这是可用性优先于不可否认性的刻意选择；该 target 仅记录 name + outcome，天然不含明文/root token/分片。可配置、可 fail-closed 的持久化审计 sink 仍属本阶段后续（需引入可配置目的地）。
+> **已完成首批（2026-06-19）**：第 4 项已落地——`VaultCore::audit_secret_access`（`src/contract/vault/integration/vault_core.rs`）已补 doc-comment 显式记录**fail-open**策略及其理由：审计经 `tracing`（infallible）发出，secret 操作绝不因审计步骤被阻断/失败，这是可用性优先于不可否认性的刻意选择；该 target 仅记录 name + outcome，天然不含明文/root token/分片。
+>
+> **配置化首批（2026-06-23）**：审计现在**可配置且默认开启**。新增 `config.vault.audit.enabled`（`VaultAuditConfig`，默认 `true`）；组合根 `AppContext::new` 经 `VaultCore::with_audit_config(config.vault.audit)` 注入，`audit_secret_access` 在 `enabled = false` 时跳过发出（运维可显式 opt-out）。`config validate` 已登记 `vault` / `vault.audit` 白名单，`config/config.toml` 附带 `[vault.audit]` 示例，单测 `test_audit_config_is_configurable_and_defaults_enabled`（默认开启 + 关闭后 secret 读写不受影响）与 `vault_audit_section_is_recognized_and_validates_fields` 覆盖。**仍属后续**：可配置的持久化/异地审计 sink（当前目的地固定为 `vault_audit` tracing target，因 `tracing` 宏 target 必须是静态字面量）及随之而来的可选 fail-closed 写入策略。
 
 验收标准：
 
 - 每次 secret 访问产生一条不含明文的审计记录。
 - 审计记录包含足以定位调用方与 secret name 的字段。
-- 审计目的地可配置，默认开启。
+- 审计目的地可配置，默认开启。（已落地：`config.vault.audit.enabled` 默认开启、可 opt-out；持久化/异地 sink 仍为后续。）
 
 ### 阶段 I：root token 退役与最小权限 policy
 

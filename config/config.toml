@@ -334,3 +334,12 @@ enabled = true
 default_delivery_mode = "email"
 # Default locale for rendered notifications when a user has none.
 default_locale = "en-US"
+
+[vault.audit]
+# Secret-access auditing (docs/vault.md stage H). When enabled (the default),
+# VaultCore emits one record per secret read/write/delete to the `vault_audit`
+# tracing target with the operation, logical secret name and outcome only
+# (never the secret value). Set to false to opt out. The write-failure policy
+# is fail-open (the tracing sink is infallible, so auditing never blocks a
+# secret operation); a configurable durable/alternate sink is deferred.
+enabled = true
