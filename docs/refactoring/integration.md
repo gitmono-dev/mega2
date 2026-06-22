@@ -304,6 +304,15 @@ SmtpMailer/EmailDispatcher -> init_monorepo -> HTTP`。
 - Mailer 初始化失败时进程应失败并给出可诊断错误，而不是静默禁用。
 - 日志中不应出现数据库连接到非 PostgreSQL 的记录。
 
+**当前落地状态**：`bin/tests/integration_vault.rs` 已落地两个进程级用例。
+`integration_service_http_smoke` 先用 `config secret set` 写入 `mail.password`，再在空闲端口启动真实
+`service http`：用裸 HTTP/1.1 探活后命中 `/api/openapi.json`（断言 200），查询测试库
+`seaql_migrations` 证明 migrations 已执行（同时证明确实连接 PostgreSQL），用 SIGINT 触发 CLI 的
+ctrl-c handler 优雅退出（退出码 0、不留后台子进程），并断言日志不出现 `sqlite`、不泄露 mail secret。
+`integration_service_http_fails_when_mailer_secret_missing` 在不写入 secret 时启动服务，验证启动期
+mail resolver fail-closed：进程非 0 退出、给出脱敏的 “secret not found” 诊断（不泄露 vault path/ref/明文）、
+且 HTTP 端口从不绑定。两个用例复用既有 Docker Compose PostgreSQL/Redis/Mailpit 测试环境。
+
 ### 5. 邮件 outbox 投递（`integration_mail_dispatcher_mailpit`）
 
 **目标**：验证 service 启动后，`EmailDispatcher` 能从 `email_jobs` outbox 投递到 Mailpit。
@@ -536,7 +545,7 @@ Vault bootstrap 过程中被消费。
 | `integration_cli_secret_ref` | P0 | - | - | - | - | - | - | ✓ | - | ✓ |
 | `integration_cli_secret_set_check` | P0 | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
 | `integration_config_validate_resolve_secrets` | P0 | ✓ | ✓ | - | ✓ | ✓ | - | ✓ | - | ✓ |
-| `integration_service_http_smoke` | P0 | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分 |
+| `integration_service_http_smoke` | P0 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分；真实 SMTP/Mailpit 正路径与 SMTP transport 失败 retry 已落地 |
 | `integration_notification_trigger_to_mail` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | 可选 | 部分 |
 | `integration_error_redaction` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |

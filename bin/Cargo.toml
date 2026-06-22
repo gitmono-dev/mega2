@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 
 # The thin composition-root binary. It depends on `monoengine-core` (which only
@@ -29,6 +29,9 @@ mimalloc = "0.1.52"
 # drive the real CLI via CARGO_BIN_EXE_monoengine and talk to the docker test
 # PostgreSQL directly. See docs/refactoring/integration.md.
 [dev-dependencies]
+# `libc` is only used by the service-startup smoke test to deliver SIGINT for a
+# graceful-shutdown assertion; it is already in the dependency tree via the core.
+libc = "0.2"
 sea-orm = { version = "1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["rt", "net", "time"] }

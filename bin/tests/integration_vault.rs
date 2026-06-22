@@ -1,4 +1,4 @@
-// 本文件是 Vault 相关的进程级黑盒集成测试。
+// 本文件是进程级黑盒集成测试，覆盖 Vault 运维命令以及 `service http` 启动 smoke。
 //
 // 设计目标：
 // 1. 通过 `CARGO_BIN_EXE_monoengine` 启动真实 CLI，验证用户实际执行命令时会走到的路径。
@@ -7,13 +7,18 @@
 // 3. 对每个需要数据库的测试创建独立 PostgreSQL 数据库，避免并发测试或失败重跑污染状态。
 // 4. 直接查询 PostgreSQL 验证数据落点，防止测试误连到非目标数据库。
 // 5. 所有 secret value 只通过 stdin 传给 CLI，并断言 stdout/stderr 不泄露明文。
+// 6. 服务启动 smoke（integration.md 场景 4）用空闲端口启动真实 `service http`，用裸 HTTP/1.1
+//    请求探活，再用 SIGINT 验证可诊断的优雅退出与 fail-closed 行为。
 
 use std::{
     fs,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
+    thread::sleep,
+    time::{Duration, Instant},
 };
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
@@ -529,4 +534,307 @@ fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
         .build()
         .expect("tokio runtime")
         .block_on(future)
+}
+
+// ===== service http 启动 smoke（integration.md 场景 4）=====
+
+#[test]
+fn integration_service_http_smoke() {
+    // 验证真实启动顺序 Config -> Storage(DB+migrations) -> Redis -> VaultCore ->
+    // mail resolver -> SmtpMailer/EmailDispatcher -> init_monorepo -> HTTP。
+    let env = VaultCliEnv::new();
+
+    // 先写入 mail.password，让启动期的 SMTP mailer SecretRef 解析成功。
+    seed_mail_password(&env);
+
+    let port = reserve_free_port();
+    let stdout_path = env.temp_dir.path().join("service.out");
+    let stderr_path = env.temp_dir.path().join("service.err");
+
+    let mut command = env.full_config_command();
+    // 把日志输出到 stdout，便于 smoke 断言检查启动日志且不泄露 secret。
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+
+    // 端口必须在超时前可连接（服务成功绑定）；若子进程提前退出则带日志报错。
+    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+
+    // 命中一个稳定、无需鉴权的文档 endpoint，证明 router 已在服务请求。
+    let response = http_get(port, "/api/openapi.json");
+    let status_line = response.lines().next().unwrap_or_default().to_string();
+    assert!(
+        status_line.contains(" 200"),
+        "smoke endpoint did not return 200; status line: {status_line:?}\nlogs:\n{}",
+        read_log(&stdout_path),
+    );
+
+    // migrations 已在本测试专属 PostgreSQL 库执行（也证明确实连接到 PostgreSQL）。
+    assert_postgres_count_at_least(
+        &env.database.db_url,
+        "SELECT COUNT(*) AS count FROM seaql_migrations",
+        1,
+    );
+
+    // 通过 SIGINT 优雅退出；CLI 的 ctrl-c handler 以 0 退出，且不留下后台子进程。
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+
+    // 日志中不应出现连接到非 PostgreSQL 后端的记录，也不应泄露 mail secret。
+    let logs = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
+    assert!(
+        !logs.to_ascii_lowercase().contains("sqlite"),
+        "logs unexpectedly mention a non-PostgreSQL backend:\n{logs}"
+    );
+    assert_does_not_leak_secret(&logs, "");
+}
+
+#[test]
+fn integration_service_http_fails_when_mailer_secret_missing() {
+    // mail 已启用且声明 password_ref，但从不写入 secret。启动期 mail resolver 必须
+    // fail-closed：进程以非 0 退出并给出脱敏诊断，且从不绑定 HTTP 端口（而非静默禁用）。
+    let env = VaultCliEnv::new();
+    let port = reserve_free_port();
+    let stdout_path = env.temp_dir.path().join("service.out");
+    let stderr_path = env.temp_dir.path().join("service.err");
+
+    let mut command = env.full_config_command();
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    // 在等待退出的整个过程中持续探测端口：startup 必须在绑定 HTTP 之前 fail-closed。
+    let status = service
+        .wait_for_exit_without_binding(port, Duration::from_secs(90))
+        .expect("service must exit when the mail secret is missing");
+
+    assert!(
+        !status.success(),
+        "mailer initialization failure must fail the process, not silently disable mail"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "HTTP port must not be bound after a fail-closed exit"
+    );
+
+    let stderr = read_log(&stderr_path);
+    assert!(
+        stderr.contains("secret not found"),
+        "expected a missing-secret diagnostic; stderr:\n{stderr}"
+    );
+    // 诊断不得泄露具体 vault path / ref / 明文。
+    assert!(
+        !stderr.contains(MAIL_PASSWORD_PATH) && !stderr.contains(MAIL_PASSWORD_REF),
+        "diagnostic leaked the vault path/ref:\n{stderr}"
+    );
+    assert_does_not_leak_secret("", &stderr);
+}
+
+fn seed_mail_password(env: &VaultCliEnv) {
+    // 复用 secret-set 正路径：通过 stdin 把 mail.password 写入测试专属 Vault。
+    let mut set = env.bootstrap_command();
+    set.args([
+        "config",
+        "secret",
+        "set",
+        "mail.password",
+        "--vault-path",
+        MAIL_PASSWORD_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set, SECRET_VALUE);
+    assert_success(&output);
+}
+
+fn create_log_file(path: &Path) -> fs::File {
+    fs::File::create(path).expect("create service log file")
+}
+
+fn read_log(path: &Path) -> String {
+    // 子进程的 ctrl-c handler 用 process::exit 退出，可能未 flush 用户态缓冲，
+    // 因此这里尽力读取已落盘的内容；缺失的尾部日志不作为硬断言依据。
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+fn reserve_free_port() -> u16 {
+    // 绑定临时端口拿到端口号后立即释放，交给随后启动的 service 复用。
+    // 单机集成测试里这个短暂的复用窗口可以接受。
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve free port");
+    listener.local_addr().expect("listener local addr").port()
+}
+
+fn http_get(port: u16, path: &str) -> String {
+    // 极简 HTTP/1.1 客户端，避免给 bin 测试 crate 引入 HTTP 客户端依赖；
+    // `Connection: close` 让我们可以读到 EOF。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                // 一旦连上就给 I/O 设定超时：避免端点挂起导致 read_to_string 永久阻塞，
+                // 那样测试不会 panic，ServiceProcess::drop 也不会运行，从而泄露子进程。
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(15)))
+                    .expect("set write timeout");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .expect("set read timeout");
+                let request = format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(request.as_bytes())
+                    .expect("write http request");
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .expect("read http response within timeout");
+                return response;
+            }
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    panic!("failed to GET {path} on port {port}: {err}");
+                }
+                sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+// 受控的服务子进程包装：保证测试无论成功失败都不会泄露后台进程。
+struct ServiceProcess {
+    child: Child,
+    reaped: bool,
+}
+
+impl ServiceProcess {
+    fn spawn(mut command: Command) -> Self {
+        let child = command.spawn().expect("spawn monoengine service");
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn wait_until_listening(
+        &mut self,
+        port: u16,
+        timeout: Duration,
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            // 子进程在绑定端口前退出，说明启动失败。
+            if let Some(status) = self.child.try_wait().expect("poll service") {
+                self.reaped = true;
+                panic!(
+                    "service exited before binding port {port} (status {status})\nstdout:\n{}\nstderr:\n{}",
+                    read_log(stdout_path),
+                    read_log(stderr_path),
+                );
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "service did not bind port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                    read_log(stdout_path),
+                    read_log(stderr_path),
+                );
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll service") {
+                self.reaped = true;
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+
+    // 与 wait_for_exit 相同，但在等待退出的整个窗口内持续探测端口：一旦端口可连接就立即
+    // 失败。这样才能证明 fail-closed 启动“从不绑定”HTTP，而不仅是退出后未绑定。
+    fn wait_for_exit_without_binding(
+        &mut self,
+        port: u16,
+        timeout: Duration,
+    ) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                panic!(
+                    "service bound port {port} but was expected to fail closed before binding HTTP"
+                );
+            }
+            if let Some(status) = self.child.try_wait().expect("poll service") {
+                self.reaped = true;
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn shutdown_via_sigint(&mut self, timeout: Duration) -> ExitStatus {
+        // SAFETY: 向运行中的子进程发送 SIGINT；CLI 安装的 ctrl-c handler 会干净退出。
+        let pid = self.child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+        self.wait_for_exit(timeout).unwrap_or_else(|| {
+            // 兜底升级到 SIGKILL，确保测试永远不泄露子进程。
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+            panic!("service did not exit within {timeout:?} after SIGINT");
+        })
+    }
+}
+
+impl Drop for ServiceProcess {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
