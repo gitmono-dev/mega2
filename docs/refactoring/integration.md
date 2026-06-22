@@ -346,6 +346,13 @@ mail resolver fail-closed：进程非 0 退出、给出脱敏的 “secret not f
 
 验收范围只覆盖 email 渠道。Slack、webhook、in-app 属于 P2。
 
+**当前落地状态**：已按"模块集成测试"方式落地
+`src/notification/dispatcher.rs::tests::integration_notification_trigger_to_mail_delivers_via_mailpit`。
+该用例在真实 PostgreSQL 上插入 CL（author=alice）并写入用户 settings，以 actor=carol 调用
+`on_cl_comment_created`，断言触发器恰好为 author 入队一封 `email_jobs`；随后用真实 `SmtpMailer`
+执行 `EmailDispatcher::tick_once()` 投递到 Mailpit，并断言触发器生成的主题（用唯一 CL link 隔离）被
+Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit 不可达时与其它 Mailpit 用例一致优雅跳过。
+
 ### 7. 错误诊断与脱敏（`integration_error_redaction`）
 
 这是安全 gate，必须在统一 redaction 工具落地后启用。
@@ -547,7 +554,7 @@ Vault bootstrap 过程中被消费。
 | `integration_config_validate_resolve_secrets` | P0 | ✓ | ✓ | - | ✓ | ✓ | - | ✓ | - | ✓ |
 | `integration_service_http_smoke` | P0 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分；真实 SMTP/Mailpit 正路径与 SMTP transport 失败 retry 已落地 |
-| `integration_notification_trigger_to_mail` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | 可选 | 部分 |
+| `integration_notification_trigger_to_mail` | P1 已落地（模块集成形态） | - | ✓ | - | - | ✓ | ✓ | - | - | - |
 | `integration_error_redaction` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_config_init` | P2 | ✓ | - | - | - | - | - | ✓ | - | ✓ |
 | `integration_config_hot_reload` | P2 | ✓ | - | - | - | - | - | - | ✓ | ✓ |

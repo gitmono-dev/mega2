@@ -644,14 +644,22 @@ mod tests {
 
     use super::*;
     use crate::{
-        callisto::{email_jobs, notification_event_types},
+        callisto::{
+            email_jobs, mega_cl, notification_event_types, sea_orm_active_enums::MergeStatusEnum,
+        },
         config::{MailProvider, reload::ConfigHandle, testing::isolated_config},
         jupiter::{
             migration::apply_migrations,
-            storage::notification_storage::{EmailJobAttachment, EmailJobEnqueue},
+            storage::{
+                base_storage::{BaseStorage, StorageConnector},
+                cl_reviewer_storage::ClReviewerStorage,
+                cl_storage::ClStorage,
+                notification_storage::{EmailJobAttachment, EmailJobEnqueue},
+            },
             tests::test_db_connection,
         },
         mail::{NoopMailer, SmtpMailer},
+        notification::triggers::on_cl_comment_created,
     };
 
     struct FailingMailer;
@@ -867,6 +875,101 @@ mod tests {
         assert!(
             wait_for_mailpit_subject(&mailpit_client, &mailpit_api_url, &subject).await,
             "Mailpit did not receive message with subject `{subject}`"
+        );
+
+        let sent = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].status, EMAIL_JOB_STATUS_SENT);
+        assert!(sent[0].sent_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn integration_notification_trigger_to_mail_delivers_via_mailpit() {
+        // 端到端链路（integration.md 场景 6）：CL 评论触发器 on_cl_comment_created 入队
+        // email_jobs（outbox），EmailDispatcher 再用真实 SmtpMailer 把它投递到 Mailpit。
+        let mailpit_api_url = mailpit_api_url();
+        let mailpit_client = reqwest::Client::new();
+        if !mailpit_available(&mailpit_client, &mailpit_api_url).await {
+            eprintln!(
+                "skipping integration_notification_trigger_to_mail_delivers_via_mailpit: test Mailpit unavailable at {mailpit_api_url}; start it with `docker compose -f docker-compose.test.yml up -d mailpit`"
+            );
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let base = BaseStorage::new(Arc::new(db.clone()));
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        let cl_stg = ClStorage { base: base.clone() };
+        let reviewer_stg = ClReviewerStorage { base: base.clone() };
+
+        // 唯一 CL link 让本次 run 的主题在共享 Mailpit 中可被唯一定位。
+        let cl_link = format!("CL-{}", Uuid::new_v4());
+        let now = chrono::Utc::now().naive_utc();
+        mega_cl::ActiveModel {
+            id: Set(1),
+            link: Set(cl_link.clone()),
+            title: Set("t".to_string()),
+            merge_date: Set(None),
+            status: Set(MergeStatusEnum::Open),
+            path: Set("/".to_string()),
+            from_hash: Set("a".to_string()),
+            to_hash: Set("b".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            username: Set("alice".to_string()),
+            base_branch: Set("main".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        // author alice 有 settings -> 当 actor 是 carol 时应被通知；无 reviewer -> 仅一封。
+        notif
+            .upsert_user_settings("alice", "alice@example.test")
+            .await
+            .unwrap();
+
+        on_cl_comment_created(
+            &notif,
+            &cl_stg,
+            &reviewer_stg,
+            "carol",
+            &cl_link,
+            "hello from trigger",
+        )
+        .await
+        .unwrap();
+
+        // 触发器应为 author 入队恰好一封 email job。
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "trigger should enqueue exactly one job for the CL author"
+        );
+
+        // 用真实 SmtpMailer 把 outbox job 投递到 Mailpit。
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: 11025,
+            from: "no-reply@example.test".to_string(),
+            starttls: false,
+            ..Default::default()
+        };
+        let mailer = SmtpMailer::new_with_password(&mail, None).unwrap();
+        let dispatcher = EmailDispatcher::new(notif.clone(), Arc::new(mailer));
+        dispatcher.tick_once().await.unwrap();
+
+        // 触发器生成的主题应被 Mailpit 收到，且 job 终态为 sent。
+        let subject = format!("New comment on CL {cl_link}");
+        assert!(
+            wait_for_mailpit_subject(&mailpit_client, &mailpit_api_url, &subject).await,
+            "Mailpit did not receive trigger-generated message `{subject}`"
         );
 
         let sent = email_jobs::Entity::find().all(&db).await.unwrap();
