@@ -654,6 +654,115 @@ fn integration_service_http_fails_when_mailer_secret_missing() {
     assert_does_not_leak_secret("", &stderr);
 }
 
+// ===== 错误诊断脱敏 gate（integration.md 场景 7）=====
+
+#[test]
+fn integration_error_redaction_does_not_leak_db_password() {
+    // 用带哨兵密码、拒绝连接端口的坏 DB URL 启动 service：进程必须 fail-closed，
+    // 且日志与 stderr 都不得包含明文密码（DB 连接日志经 redact_db_url 脱敏，
+    // 连接错误经 stderr 输出）。这是 integration.md 场景 7 中 DB URL 脱敏 bullet 的活进程门禁。
+    const DB_SENTINEL: &str = "s3ntineldbpw";
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let base_dir = temp_dir.path().join("base");
+    let cache_dir = temp_dir.path().join("cache");
+    let object_root = temp_dir.path().join("objects");
+    let config_path = temp_dir.path().join("config.toml");
+    fs::write(&config_path, include_str!("../../config/config.toml")).expect("write config");
+
+    let port = reserve_free_port();
+    let stdout_path = temp_dir.path().join("service.out");
+    let stderr_path = temp_dir.path().join("service.err");
+    // 端口 1 几乎必然拒绝连接，确保 DB 连接快速失败。
+    let bad_db_url = format!("postgres://mono:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
+
+    let mut command = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
+    command.arg("--config").arg(&config_path);
+    command
+        .env("MEGA_DATABASE__DB_TYPE", "postgres")
+        .env("MEGA_DATABASE__DB_PATH", "")
+        .env("MEGA_DATABASE__DB_URL", &bad_db_url)
+        .env("MEGA_DATABASE__CONNECT_TIMEOUT", "3")
+        .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "3")
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .env("MEGA_LOG__WITH_ANSI", "false")
+        .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+        .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &object_root)
+        // mail 在 DB 之后才初始化；关掉它让失败点确定落在 DB 连接。
+        .env("MEGA_MAIL__ENABLED", "false")
+        .args([
+            "service",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+        ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    let status = service
+        .wait_for_exit(Duration::from_secs(60))
+        .expect("service must exit when the database is unreachable");
+    assert!(
+        !status.success(),
+        "service must fail closed on an unreachable database"
+    );
+
+    let logs = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
+    assert!(
+        !logs.contains(DB_SENTINEL),
+        "database password leaked into logs/stderr:\n{logs}"
+    );
+}
+
+#[test]
+fn integration_error_redaction_does_not_leak_redis_password() {
+    // 好 DB + 带哨兵密码的坏 Redis URL 启动 service：DB/migrations 成功后 Redis 连接失败，
+    // 进程必须 fail-closed，且日志与 stderr 都不得包含 Redis 明文密码
+    // （redis init 的错误经 redact_redis_url 脱敏）。
+    const REDIS_SENTINEL: &str = "s3ntinelredispw";
+
+    let env = VaultCliEnv::new();
+    let port = reserve_free_port();
+    let stdout_path = env.temp_dir.path().join("service.out");
+    let stderr_path = env.temp_dir.path().join("service.err");
+    let bad_redis_url = format!("redis://:{REDIS_SENTINEL}@127.0.0.1:1");
+
+    let mut command = env.full_config_command();
+    command
+        .env("MEGA_REDIS__URL", &bad_redis_url)
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .args([
+            "service",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+        ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    let status = service
+        .wait_for_exit(Duration::from_secs(90))
+        .expect("service must exit when Redis is unreachable");
+    assert!(
+        !status.success(),
+        "service must fail closed on an unreachable Redis"
+    );
+
+    let logs = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
+    assert!(
+        !logs.contains(REDIS_SENTINEL),
+        "redis password leaked into logs/stderr:\n{logs}"
+    );
+}
+
 fn seed_mail_password(env: &VaultCliEnv) {
     // 复用 secret-set 正路径：通过 stdin 把 mail.password 写入测试专属 Vault。
     let mut set = env.bootstrap_command();

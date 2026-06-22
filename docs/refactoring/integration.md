@@ -20,9 +20,9 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
    schema 来自 `src/jupiter/migration/*`，`Storage::new` 会调用
    `database_connection()` 并执行 pending migrations。手写 SQL 会绕过约束、索引、字段名和
    迁移顺序，尤其会错误建出 `email_jobs.recipient` 这类当前实体并不存在的列。
-3. **CLI 能力分层不准确**：当前已有 `config secret ref/set/check` 和
-   `config validate [--resolve-secrets]`；`config init` 尚未实现。把 `config init` 放入当前
-   必跑路径会使方案不可执行。
+3. **CLI 能力分层**：当前已有 `config secret ref/set/check/rotate`、
+   `config validate [--resolve-secrets]` 以及 `config init`（`config init` 已实现并由
+   `config-validation.yml` 的 CI 步骤覆盖）。专门的 `integration_config_init` 黑盒用例仍未单列。
 4. **功能边界过宽**：多渠道通知、热加载白名单、Slack/in-app 投递、用户通知 API 等仍是
    规划能力。它们可以列为未来验收，但不能放进当前 P0 集成测试 gate。
 5. **二进制 crate 测试边界**：本仓库为 Cargo workspace——库 crate `monoengine-core`
@@ -32,8 +32,9 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
    `cargo test -p monoengine --test <name>` 运行（默认成员是 `monoengine-core` 库）；
    需要内部模块访问的“模块集成测试”保留在 `src/**::tests`（随 `monoengine-core` 编译，
    可直接 `use crate::...`）。
-6. **安全验收过早声明**：当前 `database_connection()` 会把完整 DB URL 写入日志，可能泄露
-   密码。脱敏测试应作为安全修复 gate，但在脱敏工具落地前不能声称已满足。
+6. **安全验收过早声明**：脱敏工具（`src/config/redaction.rs`）已落地——`database_connection()`
+   现用 `redact_db_url` 记录脱敏连接串，Redis init 错误用 `redact_redis_url` 包装，因此场景 7 的
+   脱敏 gate 已可声称满足并已有活进程门禁覆盖 DB/Redis 凭据不泄露。
 
 因此，本修订版采用“**当前可执行 P0** + **P1/P2 扩展 gate**”的分层策略。
 
@@ -44,7 +45,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | 合理性 | 中高。跨模块端到端测试方向正确，但原方案把外部 Vault 和手写 schema 当作真实依赖，偏离当前架构。 | 改为嵌入式 Vault、真实 migrations、真实启动顺序。 |
 | 可行性 | 原 P0 的部分设想（多渠道通知、对象存储 SecretRef）仍待补；workspace 拆分后黑盒测试位于 `bin/tests/`（`monoengine` bin crate，不导入内部模块），模块集成测试在 `monoengine-core` 内可 `use crate::`。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
 | 完整性 | 覆盖面广但缺少测试夹具、隔离、端口冲突、fallback 检测、超时与清理策略。 | 增加环境隔离、数据隔离、超时、清理和覆盖矩阵。 |
-| 安全性 | 原方案要求脱敏但没有指出当前 DB URL 泄露风险；外部 Vault root token 反而增加误导。 | 明确禁用外部 Vault 容器，secret 只经 stdin，日志脱敏作为 P1 gate。 |
+| 安全性 | 原方案要求脱敏但未指出彼时 DB URL 的泄露风险；外部 Vault root token 反而增加误导。 | 明确禁用外部 Vault 容器，secret 只经 stdin；日志脱敏 P1 gate 已落地（DB/Redis 连接串脱敏 + 活进程门禁）。 |
 | 功能正确性与接口兼容性 | `SecretRef` 与 mail.password 路径方向正确；`config init`、多渠道通知、热加载接口不兼容当前代码。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
 | 数据流与控制流正确性 | 原方案的主链路大体正确，但忽略 `Storage::new` 先构造对象存储、Redis 在 Vault 前初始化、mail 在 Vault 后构造的硬顺序。 | 明确启动顺序和每类测试允许触达的依赖。 |
 | 性能与效率 | 原方案每次可能重建容器、重跑 release build，成本高。 | 复用 compose stack，测试使用 dev/test binary，按测试隔离 DB/schema。 |
@@ -59,7 +60,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | --- | --- | --- |
 | 配置加载 | 已实现 `Config::new`、env overlay、`config validate` 基础校验 | P0 黑盒 CLI 测试 |
 | CLI 两阶段加载 | 已实现 `LoadMode`；`config secret ref` 不加载配置，`set/check` 走最小 DB/Vault bootstrap | P0 黑盒 CLI 测试 |
-| `config init` | 未实现 | P2，不能作为当前 gate |
+| `config init` | 已实现（生成安全骨架配置，由 `config-validation.yml` CI 覆盖） | P2 专门黑盒用例仍未单列 |
 | Vault | 嵌入式 `VaultCore`，通过 DB + `core_key.json` 管理；无外部 Vault 服务 | P0 使用 DB 和临时 `MEGA_BASE_DIR` |
 | SecretRef | 已支持 `vault://secret/<name>#<field>`；当前仅 `mail.password` 可写入 monoengine Vault | P0 覆盖 `ref/set/check/validate --resolve-secrets` |
 | 数据库 | `database_connection()` 只支持 PostgreSQL，连接后自动执行 migrations | P0 必须检测真实连接到 PostgreSQL |
@@ -67,8 +68,8 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | 对象存储 | 通过 `jupiter::storage::object_storage::ObjectStorageFactory` 构造，测试可使用 local temp dir | P0 使用 local backend |
 | Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造；`integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖真实 SMTP/Mailpit 正路径，`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖 SMTP transport 失败 retry | P0/P1 扩展 Mailpit/SMTP 故障矩阵 |
 | Notification | email outbox、dispatcher、CL comment trigger 存在；用户-facing API 和多渠道缺失 | P1 模块集成 + service dispatcher 测试 |
-| 热加载 | 未实现 | P2，先文档化接口和白名单后再测 |
-| 日志脱敏 | 部分缺口存在，DB URL 当前有泄露风险 | P1 安全修复 gate |
+| 热加载 | 已实现（`config::reload` 的 `ConfigHandle`/白名单应用/`ConfigReloadWatcher` + 日志/mail dispatcher/template/mailer 订阅者，单测充分） | P2 专门黑盒 `integration_config_hot_reload` 仍未单列 |
+| 日志脱敏 | 已落地：DB/Redis 连接串经 `redact_db_url`/`redact_redis_url` 脱敏，活进程门禁断言凭据不泄露 | P1 gate 已满足；可继续收拢成单一命名 gate |
 
 ## 测试分层
 
@@ -355,7 +356,8 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 
 ### 7. 错误诊断与脱敏（`integration_error_redaction`）
 
-这是安全 gate，必须在统一 redaction 工具落地后启用。
+这是安全 gate。统一 redaction 工具（`src/config/redaction.rs`）已落地并接入 DB/Redis/通知错误链路，
+因此该 gate 已可启用。
 
 **应覆盖**：
 - 坏 TOML：错误包含配置路径和字段路径，不 panic。
@@ -364,8 +366,15 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 - 错误 SMTP 密码：日志不包含明文。
 - Vault key 丢失：fail-closed，不清空 Vault 数据，不重新生成破坏性状态。
 
-**当前已知风险**：
-- `database_connection()` 目前会记录完整 `db_url`。在修复前，该测试应作为待办，而不是误标为已通过。
+**当前落地状态**：统一 redaction 工具已落地——`database_connection()`（`src/jupiter/storage/init.rs`）
+现在用 `redact_db_url` 记录脱敏后的连接串，`init_connection()`（`src/jupiter/redis/mod.rs`）的错误用
+`redact_redis_url` 包装。活进程门禁已落地：`bin/tests/integration_vault.rs::integration_error_redaction_does_not_leak_db_password`
+用坏 DB URL（哨兵密码）启动 `service http`，断言进程 fail-closed 且日志/stderr 不含明文密码；
+`integration_error_redaction_does_not_leak_redis_password` 用好 DB + 坏 Redis URL 验证 Redis 凭据不泄露。
+坏 TOML/字段路径诊断由 `config-validation.yml` 的 CI 步骤与 `src/config` 单测覆盖；SMTP 密码不入日志由
+`src/notification/dispatcher.rs` 的多个凭据不泄露用例覆盖；Vault key 丢失 fail-closed 由
+`vault_core.rs::tests::test_vault_fails_closed_after_key_file_loss` 覆盖。仍可补齐的是把上述分散覆盖
+收拢成单一命名 gate，以及更完整的 stderr/日志组合断言矩阵。
 
 ## P2：未来能力 gate
 
@@ -555,7 +564,7 @@ Vault bootstrap 过程中被消费。
 | `integration_service_http_smoke` | P0 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分；真实 SMTP/Mailpit 正路径与 SMTP transport 失败 retry 已落地 |
 | `integration_notification_trigger_to_mail` | P1 已落地（模块集成形态） | - | ✓ | - | - | ✓ | ✓ | - | - | - |
-| `integration_error_redaction` | P1 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
+| `integration_error_redaction` | P1 DB/Redis 活门禁已落地，余项分散覆盖 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_config_init` | P2 | ✓ | - | - | - | - | - | ✓ | - | ✓ |
 | `integration_config_hot_reload` | P2 | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | P2 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
