@@ -331,7 +331,7 @@ mail resolver fail-closed：进程非 0 退出、给出脱敏的 “secret not f
 - 缺少收件人时 job 变为 `skipped`。
 - SMTP 临时失败时 job 进入 retry 状态，`retry_count` 增加，`next_retry_at` 有值。
 
-**当前落地状态**：`src/notification/dispatcher.rs::tests::integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖 outbox pending job 经真实 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at` 的正路径；`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖真实 SMTP transport 连接失败后 job 回到 `pending`、`retry_count` 增加且写入 `next_retry_at`。缺少收件人的状态转换已有 dispatcher 模块测试覆盖；仍需补 Mailpit/SMTP 层面的更多故障矩阵。
+**当前落地状态**：`src/notification/dispatcher.rs::tests::integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖 outbox pending job 经真实 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at` 的正路径；`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖真实 SMTP transport 连接失败后 job 回到 `pending`、`retry_count` 增加且写入 `next_retry_at`。缺少收件人的状态转换已有 dispatcher 模块测试覆盖；仍需补 Mailpit/SMTP 层面的更多故障矩阵。该 Mailpit 正路径用例已改为在 `MAILPIT_API_URL` 不可达时优雅跳过（`eprintln` 提示后 `return`，不再 `panic!`），未启动测试栈时不会让整个测试二进制失败。
 
 ## P1：安全与业务链路扩展 gate
 

@@ -227,7 +227,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 - **退信告警 hook**：job 进入 dead-letter 时发出 `target: "notification_alert"` 的 warn 事件，供 ops 告警接入（不输出原始错误/收件人 PII）。
 - ✅ **动态 mailer 重建（已落地，2026-06-19）**：`mail.provider` / `smtp_host` / `smtp_port` / `username` / `password` / `password_ref` / `from` / `starttls` 已从"需重启"改为运行期热应用。`EmailChannel` 现持 `MailerHandle = Arc<ArcSwap<MailerSlot>>`，每次发送读取当前 mailer；`config_reload_mailer_subscriber`（`src/notification/service.rs`）在这些字段变更时**异步**重建 mailer——通过 `tokio::runtime::Handle::try_current()` 从同步 reload 订阅者 spawn 一个 task，在 vault 就绪态 re-resolve `password_ref`（`VaultSecretResolver`）→ `mailer_from_config` → `handle.store(...)` 热替换；重建失败保留旧 mailer（fail-safe），无运行时则记录需重启。`EmailChannel` 热替换机制有单测 `email_channel_hot_swaps_mailer_via_handle`，reload 行为有 `reload_applies_mail_reconfiguration_and_publishes_snapshot_without_leaking_secrets` / `reload_applies_secret_ref_change_and_publishes_without_leaking`（断言已 applied、快照已发布、report 仅含字段名不泄露 secret）。注意：`mail.enabled` false→true 重新启用仍需重启（启动期 mail 关闭时不 spawn dispatcher）。
 
-**阶段 5**：完整测试矩阵（坏 SMTP 已覆盖连接失败、dead-letter、协议拒绝、认证拒绝、权限/relay 拒绝和缺失收件人 skip；用户偏好全关场景已覆盖 CL 评论触发器全收件人 opt-out 不 enqueue；仍需解析失败、大量 pending job 背压）、在已有 Mailpit 正路径基线之上扩展 CI 中真实邮件发送干跑与故障矩阵、文档同步（README、部署指南）。
+**阶段 5**：完整测试矩阵（坏 SMTP 已覆盖连接失败、dead-letter、协议拒绝、认证拒绝、权限/relay 拒绝和缺失收件人 skip；用户偏好全关场景已覆盖 CL 评论触发器全收件人 opt-out 不 enqueue；仍需解析失败、大量 pending job 背压）、在已有 Mailpit 正路径基线之上扩展 CI 中真实邮件发送干跑与故障矩阵、文档同步（README、部署指南）。Mailpit 正路径测试 `integration_mail_dispatcher_mailpit_sends_outbox_job` 已改为在 Mailpit 不可达时优雅跳过（探测 `MAILPIT_API_URL` 失败即 `eprintln` 提示并 `return`，不再 `panic!`），因此未启动 docker compose 测试栈时不会让整个测试二进制失败；Mailpit 在位时仍完整执行投递断言。
 
 ### 前置依赖矩阵（2026-06-14 更新）
 
