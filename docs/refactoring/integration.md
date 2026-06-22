@@ -25,10 +25,13 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
    必跑路径会使方案不可执行。
 4. **功能边界过宽**：多渠道通知、热加载白名单、Slack/in-app 投递、用户通知 API 等仍是
    规划能力。它们可以列为未来验收，但不能放进当前 P0 集成测试 gate。
-5. **二进制 crate 测试边界被忽略**：本仓库目前是 binary crate，没有 `src/lib.rs`。
-   `tests/integration_*.rs` 不能直接 `use crate::...` 导入内部模块。黑盒集成测试应通过
-   `CARGO_BIN_EXE_monoengine`/`std::process::Command` 调用 CLI 和 HTTP；需要内部模块访问的
-   “模块集成测试”应保留在 `src/**::tests`。
+5. **二进制 crate 测试边界**：本仓库为 Cargo workspace——库 crate `monoengine-core`
+   （`src/lib.rs`）+ 瘦二进制 crate `monoengine`（`bin/src/main.rs`，见 `orbit.md`）。
+   黑盒集成测试位于 `bin/tests/integration_*.rs`，通过
+   `CARGO_BIN_EXE_monoengine`/`std::process::Command` 调用 CLI 和 HTTP，必须用
+   `cargo test -p monoengine --test <name>` 运行（默认成员是 `monoengine-core` 库）；
+   需要内部模块访问的“模块集成测试”保留在 `src/**::tests`（随 `monoengine-core` 编译，
+   可直接 `use crate::...`）。
 6. **安全验收过早声明**：当前 `database_connection()` 会把完整 DB URL 写入日志，可能泄露
    密码。脱敏测试应作为安全修复 gate，但在脱敏工具落地前不能声称已满足。
 
@@ -39,7 +42,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | 维度 | 评估 | 文档修订决策 |
 | --- | --- | --- |
 | 合理性 | 中高。跨模块端到端测试方向正确，但原方案把外部 Vault 和手写 schema 当作真实依赖，偏离当前架构。 | 改为嵌入式 Vault、真实 migrations、真实启动顺序。 |
-| 可行性 | 原 P0 不可完全执行：`config init`、热加载、多渠道通知不存在；`tests/` 不能导入 binary crate 内部模块。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
+| 可行性 | 原 P0 的部分设想（多渠道通知、对象存储 SecretRef）仍待补；workspace 拆分后黑盒测试位于 `bin/tests/`（`monoengine` bin crate，不导入内部模块），模块集成测试在 `monoengine-core` 内可 `use crate::`。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
 | 完整性 | 覆盖面广但缺少测试夹具、隔离、端口冲突、fallback 检测、超时与清理策略。 | 增加环境隔离、数据隔离、超时、清理和覆盖矩阵。 |
 | 安全性 | 原方案要求脱敏但没有指出当前 DB URL 泄露风险；外部 Vault root token 反而增加误导。 | 明确禁用外部 Vault 容器，secret 只经 stdin，日志脱敏作为 P1 gate。 |
 | 功能正确性与接口兼容性 | `SecretRef` 与 mail.password 路径方向正确；`config init`、多渠道通知、热加载接口不兼容当前代码。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
@@ -80,8 +83,8 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 
 ### 2. 模块集成测试（crate 内部）
 
-位置：仍放在相关模块的 `#[cfg(test)]` 中，或后续在新增 `src/lib.rs` 后迁移到
-`tests/`。
+位置：放在相关模块的 `#[cfg(test)]` 中（随 `monoengine-core` 库编译，可直接
+`use crate::...`）。
 
 用途：
 - 需要调用 `crate::jupiter::migration::apply_migrations`、`NotificationStorage`、
@@ -90,10 +93,10 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 
 ### 3. 黑盒集成测试（进程级）
 
-位置：`tests/integration_*.rs`（新增时）。
+位置：`bin/tests/integration_*.rs`（属于 `monoengine` 二进制 crate）。
 
 限制：
-- 由于 monoengine 目前是 binary crate，`tests/` 不能导入 `crate::...`。
+- 黑盒测试通过 `CARGO_BIN_EXE_monoengine` 拉起真实二进制，不导入 `crate::...`。
 - 只能通过 `std::process::Command` 调用 `CARGO_BIN_EXE_monoengine`、HTTP API、SMTP/Mailpit
   API、PostgreSQL/Redis 客户端协议进行断言。
 
@@ -372,20 +375,20 @@ docker compose -f docker-compose.test.yml exec redis redis-cli ping
 curl -fsS http://127.0.0.1:18025/api/v1/messages >/dev/null
 
 source .env.test
-# CLI 黑盒集成测试（config secret ref/set/check、validate）位于 tests/integration_vault.rs：
-cargo test --test integration_vault -- --nocapture --test-threads=1
+# CLI 黑盒集成测试（config secret ref/set/check、validate）位于 bin/tests/integration_vault.rs：
+cargo test -p monoengine --test integration_vault -- --nocapture --test-threads=1
 # 邮件/通知 dispatcher 端到端（真实 Mailpit + Postgres）、NotificationService 投递、
 # CL 评论触发器 enqueue/render，位于 crate 内集成测试：
-cargo test --bin monoengine 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
-cargo test --bin monoengine 'notification::service::tests' -- --nocapture
-cargo test --bin monoengine 'notification::triggers::tests' -- --nocapture
+cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
+cargo test -p monoengine-core 'notification::service::tests' -- --nocapture
+cargo test -p monoengine-core 'notification::triggers::tests' -- --nocapture
 
 docker compose -f docker-compose.test.yml down -v
 ```
 
-> **测试文件命名说明（2026-06-19）**：P0 CLI 黑盒场景（`integration_cli_secret_*`）实现在 `tests/integration_vault.rs`（沿用既有 `VaultCliEnv`/`isolated_command` 辅助），并非独立的 `tests/integration_cli.rs`。服务级邮件投递与触发器端到端校验以 crate 内集成测试形式存在（`notification::service`、`notification::dispatcher::integration_mail_dispatcher_*`、`notification::triggers`），对真实 Postgres/Mailpit 实跑，已接入 `.github/workflows/config-validation.yml` 的「Run integration tests」步骤（含 redis/mailpit 启动与 `::add-mask::` 凭据脱敏）。
+> **测试文件命名说明（2026-06-19；2026-06-22 更新：workspace 拆分后该文件随 `bin/` 一并丢失，已从历史恢复到 `bin/tests/integration_vault.rs` 并修复 CI 引用）**：P0 CLI 黑盒场景（`integration_cli_secret_*`，函数名 `config_secret_*`）实现在 `bin/tests/integration_vault.rs`（沿用既有 `VaultCliEnv`/`isolated_command` 辅助），并非独立的 `tests/integration_cli.rs`；workspace 拆分后该文件随 `monoengine` 二进制 crate 编译，用 `cargo test -p monoengine --test integration_vault` 运行。服务级邮件投递与触发器端到端校验以 crate 内集成测试形式存在（`notification::service`、`notification::dispatcher::integration_mail_dispatcher_*`、`notification::triggers`），对真实 Postgres/Mailpit 实跑，已接入 `.github/workflows/config-validation.yml` 的「Run integration tests」步骤（含 redis/mailpit 启动与 `::add-mask::` 凭据脱敏）。
 
-如果 `tests/` 目录尚未建立，先从 P0 的 CLI 黑盒测试开始。不要为了集成测试新增不必要依赖；
+P0 的 CLI 黑盒测试已位于 `bin/tests/integration_vault.rs`；新增黑盒测试放在 `bin/tests/` 下。不要为了集成测试新增不必要依赖；
 首版可以只用 `std::process::Command`、`std::net::TcpStream`、`reqwest`、`sea-orm` 和现有依赖。
 
 ### CI 示例
@@ -453,10 +456,10 @@ jobs:
           MEGA_REDIS__URL: redis://127.0.0.1:16379
           MAILPIT_API_URL: http://127.0.0.1:18025
         run: |
-          cargo test --test integration_vault -- --nocapture --test-threads=1
-          cargo test --bin monoengine 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
-          cargo test --bin monoengine 'notification::service::tests' -- --nocapture
-          cargo test --bin monoengine 'notification::triggers::tests' -- --nocapture
+          cargo test -p monoengine --test integration_vault -- --nocapture --test-threads=1
+          cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
+          cargo test -p monoengine-core 'notification::service::tests' -- --nocapture
+          cargo test -p monoengine-core 'notification::triggers::tests' -- --nocapture
 ```
 
 > 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
@@ -545,7 +548,7 @@ Vault bootstrap 过程中被消费。
 
 1. **Phase 0：测试基础设施**
    - 新增 `docker-compose.test.yml`。
-   - 新增测试配置生成 helper（黑盒测试可在 `tests/common` 中只生成 TOML，不导入 crate）。
+   - 新增测试配置生成 helper（黑盒测试可在 `bin/tests/common` 中只生成 TOML，不导入 crate）。
    - 约定临时目录、端口、日志和 cleanup。
 2. **Phase 1：P0 CLI gate**
    - `integration_cli_secret_ref`
@@ -616,6 +619,6 @@ monoengine --config <temp>/config.toml \
 ## 预期收益
 
 - 使用真实 migrations 和嵌入式 Vault，避免测试通过但生产 schema/启动链路失败。
-- 明确 binary crate 的黑盒测试边界，减少不可编译的 `tests/` 设计。
+- 明确 workspace（`monoengine-core` lib + `monoengine` bin）的黑盒测试边界：`bin/tests/` 走进程级 CLI/HTTP，模块集成测试在 `monoengine-core` 内。
 - 把当前可落地 gate 与未来能力 gate 分离，让 CI 能先稳定覆盖关键路径。
 - 把 DB fallback、secret 泄露、service 启动顺序等高风险问题变成可观测、可诊断的测试目标。
