@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "jemallocator",
@@ -3983,15 +3983,11 @@ dependencies = [
  "monoengine-core",
  "orbit",
  "orbit-api",
- "sea-orm",
- "tempfile",
- "tokio",
- "url",
 ]
 
 [[package]]
 name = "monoengine-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -1,0 +1,26 @@
+[package]
+name = "monoengine"
+version = "0.1.7"
+edition = "2024"
+
+# The thin composition-root binary. It depends on `monoengine-core` (which only
+# knows the `orbit-api` contract) plus the heavy `orbit` implementation crate,
+# and is the single place that names `orbit::` to build object storage. The
+# global allocators are a binary concern and live here. See
+# `docs/refactoring/orbit.md`.
+
+[[bin]]
+name = "monoengine"
+path = "src/main.rs"
+
+[dependencies]
+monoengine-core = { path = ".." }
+orbit = { path = "../../orbit" }
+orbit-api = { path = "../../orbit/api" }
+async-trait = "0.1.89"
+
+[target.'cfg(not(windows))'.dependencies]
+jemallocator = "0.5.4"
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = "0.1.52"
