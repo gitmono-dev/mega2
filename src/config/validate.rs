@@ -764,6 +764,82 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     warnings
 }
 
+/// Reject any field that is not in the `known_fields` whitelist, returning a
+/// hard error instead of a warning. This is the strict counterpart to
+/// `unknown_fields` and is applied during config loading so that typos and
+/// obsolete keys fail fast instead of being silently dropped by serde.
+///
+/// The legacy `[oauth]` section is intentionally skipped: it is already
+/// reported as a warning by `known_unconsumed_fields` and will be addressed
+/// by implementing or removing OAuthConfig in a follow-up task.
+pub fn reject_unknown_fields(value: &Value) -> Result<(), MegaError> {
+    let mut errors = Vec::new();
+
+    if let Some(table) = value.as_table() {
+        collect_unknown_field_errors("", "", table, &mut errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(MegaError::Other(format!(
+            "config contains unrecognized fields: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+fn collect_unknown_field_errors(
+    schema_path: &str,
+    display_path: &str,
+    table: &toml::Table,
+    errors: &mut Vec<String>,
+) {
+    let Some(allowed_fields) = known_fields(schema_path) else {
+        return;
+    };
+
+    for (field, value) in table {
+        // Skip the legacy `[oauth]` section entirely; it is handled as a
+        // dedicated warning by `known_unconsumed_fields`.
+        if schema_path.is_empty() && field == "oauth" {
+            continue;
+        }
+
+        let schema_field_path = join_field_path(schema_path, field);
+        let display_field_path = join_field_path(display_path, field);
+
+        if !allowed_fields.contains(&field.as_str()) {
+            errors.push(format!("{display_field_path} is not recognized by Config"));
+            continue;
+        }
+
+        if known_fields(&schema_field_path).is_some() {
+            match value {
+                Value::Table(child_table) => collect_unknown_field_errors(
+                    &schema_field_path,
+                    &display_field_path,
+                    child_table,
+                    errors,
+                ),
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        if let Some(item_table) = item.as_table() {
+                            collect_unknown_field_errors(
+                                &schema_field_path,
+                                &format!("{display_field_path}[{index}]"),
+                                item_table,
+                                errors,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 pub(crate) fn unconsumed_environment_fields_from_keys<I, K>(
     keys: I,
 ) -> Vec<EnvironmentConfigWarning>
@@ -2547,5 +2623,83 @@ mod tests {
         let value = toml::from_str::<Value>(&rendered).unwrap();
 
         assert!(known_unconsumed_fields(&value).is_empty());
+    }
+
+    #[test]
+    fn reject_unknown_fields_accepts_known_config() {
+        let value = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+
+            [log]
+            level = "info"
+            print_std = true
+
+            [database]
+            db_type = "postgres"
+            db_url = "postgres://localhost:5432/mono"
+
+            [mail]
+            enabled = true
+            smtp_host = "localhost"
+            from = "no-reply@example.com"
+
+            [notification]
+            enabled = true
+            default_delivery_mode = "email"
+            "#,
+        )
+        .unwrap();
+
+        assert!(reject_unknown_fields(&value).is_ok());
+    }
+
+    #[test]
+    fn reject_unknown_fields_rejects_typo_fields() {
+        let value = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+            unknown_root = true
+
+            [database]
+            db_url = "postgres://localhost:5432/mono"
+            typo = true
+
+            [object_storage.s3]
+            unexpected = true
+
+            [sidebar]
+            default_items = [
+                { public_id = "home", label = "Home", href = "/posts", order_index = 0, icon = "x" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let err = reject_unknown_fields(&value).expect_err("should reject unknown fields");
+        let message = err.to_string();
+        assert!(message.contains("unknown_root"));
+        assert!(message.contains("database.typo"));
+        assert!(message.contains("object_storage.s3.unexpected"));
+        assert!(message.contains("sidebar.default_items[0].icon"));
+    }
+
+    #[test]
+    fn reject_unknown_fields_allows_legacy_oauth_section() {
+        let value = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+
+            [oauth]
+            campsite_api_domain = "http://example.test"
+            allowed_cors_origins = ["http://example.test"]
+            "#,
+        )
+        .unwrap();
+
+        // The legacy [oauth] section is skipped by the strict check; it remains
+        // a warning from `known_unconsumed_fields` until OAuthConfig is
+        // implemented or the section is removed.
+        assert!(reject_unknown_fields(&value).is_ok());
     }
 }

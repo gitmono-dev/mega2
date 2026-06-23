@@ -146,6 +146,14 @@ impl Config {
     }
 
     pub fn load_str(content: &str) -> Result<Self, ConfigError> {
+        // Enforce the strict unknown-field whitelist when the content parses;
+        // let the `config` crate produce the original, redacted parse error
+        // when it does not.
+        if let Ok(value) = toml::from_str::<toml::Value>(content) {
+            validate::reject_unknown_fields(&value)
+                .map_err(|e| ConfigError::Message(e.to_string()))?;
+        }
+
         let builder = c::Config::builder()
             .add_source(c::File::from_str(content, FileFormat::Toml))
             .add_source(mega_environment_source());
@@ -539,6 +547,24 @@ mod test {
             config.monorepo.root_dirs,
             vec!["env-alpha".to_string(), "env-beta".to_string()]
         );
+    }
+
+    #[test]
+    fn test_load_str_rejects_unknown_fields() {
+        let content = r#"
+            base_dir = "/tmp"
+            unknown_root = true
+
+            [database]
+            db_type = "postgres"
+            db_url = "postgres://localhost:5432/mono"
+            typo = true
+        "#;
+
+        let err = Config::load_str(content).expect_err("unknown fields should fail");
+        let message = err.to_string();
+        assert!(message.contains("unknown_root"));
+        assert!(message.contains("database.typo"));
     }
 
     #[test]
