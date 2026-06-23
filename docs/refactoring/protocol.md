@@ -24,7 +24,7 @@
 > - HTTP / SSH receive-pack 不再搜索 `PACK` 字节序列，而是复用 `SmartSession::split_receive_pack_request` 按 pkt-line command list 的 flush-pkt 分割 commands 与 pack bytes。
 > - 新增单元测试覆盖 capability 中出现 `PACK` 不误切分，以及缺少 flush-pkt 返回 `ProtocolError::InvalidInput`。
 > - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义与 SSH per-channel state 仍为后续。
-> - 仍未完成：SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
+> - 仍未完成：SSH 多 channel state 仍未改为 per-channel；capability advertise 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
 >
 > **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
 
@@ -36,7 +36,7 @@
 
 4. **认证策略不一致**。HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH 通过 public key，但未统一 auth context。
 
-5. **Capability advertise 与实现不对齐**。多个 capability（atomic、report-status-v2、delete-refs）被 advertise 但未完整实现。
+5. **Capability advertise 已完成首批保守收敛**。receive-pack 不再 advertise 未验证的 atomic、report-status-v2、delete-refs、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag。后续仍需为剩余 side-band/ofs-delta 等能力补完整 truth table 和真实 Git CLI 矩阵。
 
 6. **SSH 多 channel 状态管理不够细致**。per-connection 状态共享，不是 per-channel，可能在多 channel 场景下产生串联。
 
@@ -51,7 +51,7 @@
 | SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
-| Capability advertise | 实现但不完全 | advertise 包含 atomic、report-status-v2、delete-refs，但实现和测试不完整。 |
+| Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
 | 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input 与 malformed SSH exec 已改为协议错误/channel failure；stream chunk、repo handler 等路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
@@ -438,7 +438,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
-- `atomic`、`report-status-v2`、`delete-refs` 优先补齐或移除 advertise。
+- 已完成首批：`atomic`、`report-status-v2`、`delete-refs`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；后续若补齐行为和测试再重新声明。
 - 对 `object-format=sha1` 明确 advertise 或确认默认 SHA-1 兼容性。
 
 ### pkt-line parser 缺少错误模型

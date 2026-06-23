@@ -30,16 +30,22 @@ const NUL: char = '\0';
 pub const PKT_LINE_END_MARKER: &[u8; 4] = b"0000";
 
 // see https://git-scm.com/docs/protocol-capabilities
-// The atomic, report-status, report-status-v2, delete-refs, quiet,
-// and push-cert capabilities are sent and recognized by the receive-pack (push to server) process.
-const RECEIVE_CAP_LIST: &str = "report-status report-status-v2 delete-refs quiet atomic no-thin ";
+// Only advertise capabilities that are parsed, acted on, and covered by tests.
+const RECEIVE_CAP_LIST: &str = "report-status ";
 
 // The ofs-delta and side-band-64k capabilities are sent and recognized by both upload-pack and receive-pack protocols.
 // The agent and session-id capabilities may optionally be sent in both protocols.
 const COMMON_CAP_LIST: &str = "side-band-64k ofs-delta agent=mega/0.1.0";
 
 // All other capabilities are only recognized by the upload-pack (fetch from server) process.
-const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done include-tag ";
+const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done ";
+
+fn advertised_capabilities(service_type: ServiceType) -> String {
+    match service_type {
+        ServiceType::UploadPack => format!("{UPLOAD_CAP_LIST}{COMMON_CAP_LIST}"),
+        ServiceType::ReceivePack => format!("{RECEIVE_CAP_LIST}{COMMON_CAP_LIST}"),
+    }
+}
 
 impl SmartSession {
     /// # Retrieves the information about Git references (refs) for the specified service type.
@@ -77,10 +83,7 @@ impl SmartSession {
         } else {
             "HEAD"
         };
-        let cap_list = match service_type {
-            ServiceType::UploadPack => format!("{UPLOAD_CAP_LIST}{COMMON_CAP_LIST}"),
-            ServiceType::ReceivePack => format!("{RECEIVE_CAP_LIST}{COMMON_CAP_LIST}"),
-        };
+        let cap_list = advertised_capabilities(service_type);
         let pkt_line = format!("{head_hash}{SP}{name}{NUL}{cap_list}{LF}");
         let mut ref_list = vec![pkt_line];
 
@@ -657,8 +660,8 @@ pub mod test {
             Capability, ServiceType, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
             smart::{
-                PKT_LINE_END_MARKER, add_pkt_line_string, read_pkt_line, read_until_white_space,
-                try_read_pkt_line,
+                PKT_LINE_END_MARKER, add_pkt_line_string, advertised_capabilities, read_pkt_line,
+                read_until_white_space, try_read_pkt_line,
             },
         },
         common::errors::ProtocolError,
@@ -812,6 +815,33 @@ pub mod test {
             mock.capabilities,
             std::collections::HashSet::from([Capability::ReportStatusv2, Capability::SideBand64k])
         );
+    }
+
+    #[test]
+    pub fn receive_pack_advertises_only_supported_baseline_capabilities() {
+        let caps = advertised_capabilities(ServiceType::ReceivePack);
+        let tokens = caps.split_whitespace().collect::<Vec<_>>();
+
+        assert!(tokens.contains(&"report-status"));
+        assert!(tokens.contains(&"side-band-64k"));
+        assert!(tokens.contains(&"ofs-delta"));
+        assert!(tokens.contains(&"agent=mega/0.1.0"));
+        assert!(!tokens.contains(&"report-status-v2"));
+        assert!(!tokens.contains(&"delete-refs"));
+        assert!(!tokens.contains(&"quiet"));
+        assert!(!tokens.contains(&"atomic"));
+        assert!(!tokens.contains(&"no-thin"));
+    }
+
+    #[test]
+    pub fn upload_pack_does_not_advertise_unimplemented_include_tag() {
+        let caps = advertised_capabilities(ServiceType::UploadPack);
+        let tokens = caps.split_whitespace().collect::<Vec<_>>();
+
+        assert!(tokens.contains(&"multi_ack_detailed"));
+        assert!(tokens.contains(&"no-done"));
+        assert!(tokens.contains(&"side-band-64k"));
+        assert!(!tokens.contains(&"include-tag"));
     }
 
     async fn git_push_with_retry(repo_path: &std::path::Path) -> anyhow::Result<()> {
