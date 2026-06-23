@@ -202,6 +202,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
     ) -> Result<message::Model, MegaError> {
         let public_id = crate::callisto::entity_ext::generate_public_id();
 
+        let sender_username = sender.clone();
         let msg = self
             .message_storage
             .create_message(ch.id, sender, content, public_id.clone(), reply_to_id)
@@ -229,10 +230,21 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .set_latest_message(ch.id, Some(msg.id), msg.created_at)
             .await?;
 
-        // Internal notification for reply (stub: only if reply_to)
-        if let Some(_rid) = reply_to_id {
-            // In full impl: find memberships that should be notified (reply + mentions)
-            // For v1 we skip writing message_notifications rows unless needed for read state.
+        if let Some(reply_message_id) = reply_to_id
+            && let Some(reply_message) = self
+                .message_storage
+                .get_message_by_id(reply_message_id)
+                .await?
+            && let Some(recipient) = reply_message.sender_username
+            && sender_username.as_deref() != Some(recipient.as_str())
+            && let Some(membership) = self
+                .membership_storage
+                .get_membership(ch.id, &recipient)
+                .await?
+        {
+            self.message_storage
+                .create_message_notification(membership.id, msg.id)
+                .await?;
         }
 
         // Event
@@ -490,6 +502,22 @@ mod tests {
             .expect("send reply");
 
         assert_eq!(reply.reply_to_id, Some(first.id));
+        let alice_membership = svc
+            .membership_storage
+            .get_membership(ch.id, "alice")
+            .await
+            .expect("query alice membership")
+            .expect("alice membership");
+        let reply_notifications = svc
+            .message_storage
+            .get_message_notifications_by_message_id(reply.id)
+            .await
+            .expect("query reply notifications");
+        assert_eq!(reply_notifications.len(), 1);
+        assert_eq!(
+            reply_notifications[0].channel_membership_id,
+            alice_membership.id
+        );
 
         // Non-member cannot send (404)
         let not_member = svc

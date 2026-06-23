@@ -8,7 +8,7 @@ use sea_orm::{
 };
 
 use crate::{
-    callisto::{channel, message},
+    callisto::{channel, message, message_notification},
     common::errors::MegaError,
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
@@ -88,6 +88,35 @@ impl MessageStorage {
             .one(self.get_connection())
             .await?;
         Ok(model)
+    }
+
+    pub async fn create_message_notification(
+        &self,
+        channel_membership_id: i64,
+        message_id: i64,
+    ) -> Result<message_notification::Model, MegaError> {
+        let now = Utc::now().naive_utc();
+        let active_model = message_notification::ActiveModel {
+            id: Set(IdInstance::next_id()),
+            channel_membership_id: Set(channel_membership_id),
+            message_id: Set(message_id),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        let model = active_model.insert(self.get_connection()).await?;
+        Ok(model)
+    }
+
+    pub async fn get_message_notifications_by_message_id(
+        &self,
+        message_id: i64,
+    ) -> Result<Vec<message_notification::Model>, MegaError> {
+        let models = message_notification::Entity::find()
+            .filter(message_notification::Column::MessageId.eq(message_id))
+            .order_by_asc(message_notification::Column::Id)
+            .all(self.get_connection())
+            .await?;
+        Ok(models)
     }
 
     /// Update message content (actor check is service responsibility).
