@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::{Arg, ArgMatches, Command};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, PaginatorTrait};
 use serde::Deserialize;
 
 use crate::{
@@ -117,6 +117,21 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let context = AppContext::new(config, object_store).await?;
     let mono_storage = context.storage.mono_storage();
     let conn = mono_storage.get_connection();
+
+    // Empty-DB guard: refuse to run if chat tables already contain data.
+    // The migration inserts with explicit legacy IDs and is not idempotent;
+    // re-running on a non-empty database would cause primary-key conflicts.
+    let existing_channels = crate::callisto::channel::Entity::find()
+        .count(conn)
+        .await
+        .unwrap_or(0);
+    if existing_channels > 0 {
+        return Err(MegaError::Other(format!(
+            "Refusing to migrate: target database already has {existing_channels} channel(s). \
+             The migration requires an empty database (it inserts with explicit legacy IDs and \
+             is not idempotent). Please truncate chat tables before re-running."
+        )));
+    }
 
     let input_dir = args.get_one::<String>("input-dir").unwrap();
     let mapping_file = args.get_one::<String>("user-mapping").unwrap();
@@ -760,6 +775,69 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     );
     println!("{}", "-".repeat(70));
 
+    // Verification: query actual DB row counts and compare with imported counts.
+    println!("\n=== Verification (DB actual vs imported) ===");
+    let db_counts = vec![
+        (
+            "custom_reactions",
+            custom_reaction_out,
+            crate::callisto::custom_reaction::Entity::find()
+                .count(conn)
+                .await
+                .unwrap_or(0),
+        ),
+        (
+            "channels",
+            channel_out,
+            crate::callisto::channel::Entity::find()
+                .count(conn)
+                .await
+                .unwrap_or(0),
+        ),
+        (
+            "messages",
+            message_out,
+            crate::callisto::message::Entity::find()
+                .count(conn)
+                .await
+                .unwrap_or(0),
+        ),
+        (
+            "attachments",
+            attachment_out,
+            crate::callisto::attachment::Entity::find()
+                .count(conn)
+                .await
+                .unwrap_or(0),
+        ),
+        (
+            "reactions",
+            reaction_out,
+            crate::callisto::reactions::Entity::find()
+                .count(conn)
+                .await
+                .unwrap_or(0),
+        ),
+    ];
+    let mut discrepancies = 0;
+    for (table, imported, actual) in &db_counts {
+        let status = if imported == actual { "OK" } else { "MISMATCH" };
+        if imported != actual {
+            discrepancies += 1;
+        }
+        println!(
+            "{:<28} | imported={:<8} | db_actual={:<8} | {}",
+            table, imported, actual, status
+        );
+    }
+    if discrepancies > 0 {
+        println!(
+            "\nWARNING: {discrepancies} table(s) have count mismatches. Review the migration output for errors."
+        );
+    } else {
+        println!("\nAll verified table counts match imported counts.");
+    }
+
     Ok(())
 }
 
@@ -938,5 +1016,40 @@ mod tests {
         assert_eq!(inserted.len(), 1);
         assert_eq!(inserted[0].id, 101);
         assert_eq!(inserted[0].title.as_deref(), Some("General"));
+    }
+
+    #[tokio::test]
+    async fn empty_db_guard_detects_existing_data() {
+        let temp = tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono_storage = storage.mono_storage();
+        let conn = mono_storage.get_connection();
+
+        // Fresh DB: no channels — guard should pass (count == 0).
+        let count = crate::callisto::channel::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "fresh DB should have zero channels");
+
+        // Insert a channel — guard should now detect existing data.
+        let now = chrono::Utc::now().naive_utc();
+        let am = crate::callisto::channel::ActiveModel {
+            id: Set(1),
+            public_id: Set("guardch0001".to_string()),
+            title: Set(Some("Test".to_string())),
+            last_message_at: Set(now),
+            owner_username: Set("alice".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        am.insert(conn).await.unwrap();
+
+        let count = crate::callisto::channel::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert!(count > 0, "guard should detect existing channel data");
     }
 }
