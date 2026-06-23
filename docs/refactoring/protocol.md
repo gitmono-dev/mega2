@@ -25,6 +25,8 @@
 > - 新增单元测试覆盖 capability 中出现 `PACK` 不误切分，以及缺少 flush-pkt 返回 `ProtocolError::InvalidInput`。
 > - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义与 SSH per-channel state 仍为后续。
 > - 仍未完成：SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
+>
+> **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -45,7 +47,7 @@
 | HTTP GET /info/refs | 已实现（首批止血） | `service` 缺失或非法已返回 `ProtocolError::InvalidInput`；仍需补更完整 smart HTTP query 兼容性矩阵。 |
 | HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
 | HTTP POST receive-pack | 已实现（首批止血） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；仍需 streaming parser、delete-only push 和更完整真实 Git CLI 矩阵。 |
-| SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；后续仍需 per-channel state。 |
+| SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；后续仍需 per-channel state。 |
 | SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
@@ -746,6 +748,6 @@ LFS:
 3. SSH exec command parser 独立成函数并加单元测试。
 4. `read_pkt_line` 返回 `Result` 并覆盖 malformed input。
 5. 已完成首批：receive-pack 按 pkt-line flush 分界，不再搜索 `PACK`。
-6. SSH upload-pack 删除 UTF-8 转换，所有 payload 走 bytes。
+6. 已完成首批：SSH upload-pack 初始响应删除 UTF-8 转换，payload 按 bytes 写回 channel。
 
 完成这些之后，再开始 capability 收敛、认证统一和 LFS 加固。

@@ -347,9 +347,7 @@ impl SshServer {
             .unwrap();
 
         tracing::info!("buf is {:?}", buf);
-        session
-            .data(channel, String::from_utf8(buf.to_vec()).unwrap())
-            .unwrap();
+        session.data(channel, buf.to_vec()).unwrap();
 
         while let Some(chunk) = send_pack_data.next().await {
             let mut reader = chunk.as_slice();
