@@ -636,6 +636,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             name: Set(name),
             size: Set(size),
             gallery_id: Set(gallery_id),
+            discarded_at: Set(None),
             created_at: Set(created_at),
             updated_at: Set(updated_at),
         };

@@ -4,6 +4,7 @@ use chrono::Utc;
 use idgenerator::IdInstance;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+    sea_query::Expr,
 };
 
 use crate::{
@@ -66,10 +67,23 @@ impl AttachmentStorage {
         let models = attachment::Entity::find()
             .filter(attachment::Column::SubjectType.eq(subject_type))
             .filter(attachment::Column::SubjectId.eq(subject_id))
+            .filter(attachment::Column::DiscardedAt.is_null())
             .order_by_asc(attachment::Column::Position)
             .all(self.get_connection())
             .await?;
         Ok(models)
+    }
+
+    pub async fn soft_delete_attachment(&self, public_id: &str) -> Result<(), MegaError> {
+        let now = Utc::now().naive_utc();
+        attachment::Entity::update_many()
+            .filter(attachment::Column::PublicId.eq(public_id))
+            .filter(attachment::Column::DiscardedAt.is_null())
+            .col_expr(attachment::Column::DiscardedAt, Expr::value(now))
+            .col_expr(attachment::Column::UpdatedAt, Expr::value(now))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
     }
 }
 
@@ -108,5 +122,62 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].public_id, pub_id);
+    }
+
+    #[tokio::test]
+    async fn test_attachment_soft_delete_filters_deleted() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
+        let attachment_storage = storage.attachment_storage();
+
+        let pub_id1 = generate_public_id();
+        let pub_id2 = generate_public_id();
+        attachment_storage
+            .create_attachment(
+                pub_id1.clone(),
+                "path/1".to_string(),
+                "image/png".to_string(),
+                "Message".to_string(),
+                200,
+                "a.png".to_string(),
+                10,
+                1,
+            )
+            .await
+            .expect("create 1");
+        attachment_storage
+            .create_attachment(
+                pub_id2.clone(),
+                "path/2".to_string(),
+                "image/png".to_string(),
+                "Message".to_string(),
+                200,
+                "b.png".to_string(),
+                20,
+                2,
+            )
+            .await
+            .expect("create 2");
+
+        // Both visible initially.
+        let results = attachment_storage
+            .get_attachments_by_subject("Message", 200)
+            .await
+            .expect("query before delete");
+        assert_eq!(results.len(), 2);
+
+        // Soft-delete the first.
+        attachment_storage
+            .soft_delete_attachment(&pub_id1)
+            .await
+            .expect("soft delete");
+
+        // Only the second remains visible.
+        let results = attachment_storage
+            .get_attachments_by_subject("Message", 200)
+            .await
+            .expect("query after delete");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].public_id, pub_id2);
     }
 }

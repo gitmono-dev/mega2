@@ -19,6 +19,7 @@ pub struct Model {
     pub name: String,
     pub size: i64,
     pub gallery_id: Option<i64>,
+    pub discarded_at: Option<DateTime>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
