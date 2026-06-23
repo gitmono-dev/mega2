@@ -28,7 +28,10 @@ use crate::{
         router::lfs_router,
     },
     bellatrix::Bellatrix,
-    ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
+    ceres::{
+        api_service::{cache::GitObjectCache, state::ProtocolApiState},
+        protocol::ServiceType,
+    },
     common::errors::{MegaError, MegaResult, ProtocolError},
     config::{
         ArtifactGcConfig, BuckConfig, Config,
@@ -656,6 +659,18 @@ fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
     req
 }
 
+fn parse_info_refs_params(query_str: &str) -> std::result::Result<InfoRefsParams, ProtocolError> {
+    let params: InfoRefsParams = serde_urlencoded::from_str(query_str).map_err(|err| {
+        ProtocolError::InvalidInput(format!("invalid info/refs query parameters: {err}"))
+    })?;
+    let service = params
+        .service
+        .as_deref()
+        .ok_or_else(|| ProtocolError::InvalidInput("missing service parameter".to_owned()))?;
+    ServiceType::from_str(service).map_err(|err| ProtocolError::InvalidInput(err.to_string()))?;
+    Ok(params)
+}
+
 async fn handle_smart_protocol(
     req: Request<Body>,
     state: Arc<ProtocolApiState>,
@@ -670,7 +685,7 @@ async fn handle_smart_protocol(
         let repo_path = remove_git_suffix(full_path, "/info/refs");
         let uri = req.uri();
         let query_str = uri.query().unwrap_or("");
-        let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
+        let params = parse_info_refs_params(query_str)?;
         crate::contract::git_protocol::http::git_info_refs(&state, params, repo_path).await
     } else if full_path.ends_with("/git-upload-pack") && req.method().eq(&Method::POST) {
         let repo_path = remove_git_suffix(full_path, "/git-upload-pack");
@@ -803,6 +818,14 @@ mod tests {
             "/third-party/test.git/info/refs"
         ));
         assert!(!is_disallowed_root_repo_path("/project.git/info/refs"));
+    }
+
+    #[test]
+    fn malformed_info_refs_query_returns_protocol_error() {
+        let err =
+            parse_info_refs_params("service=git-status").expect_err("bad service should fail");
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
     }
 
     #[test]

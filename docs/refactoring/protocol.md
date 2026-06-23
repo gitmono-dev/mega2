@@ -11,7 +11,7 @@
 > 本文档中的代码引用已对照当前 `src/` 重新核对。当前 Git protocol 实现处于基础阶段，具有完整的功能框架但多处缺乏错误处理和兼容性完善：
 >
 > **2026-06-23 更新**：已完成首批 malformed input panic 止血：
-> - HTTP `info/refs` 的 `service` query 参数缺失或非法时，不再 `unwrap()` panic，而是返回 `ProtocolError::InvalidInput`。
+> - HTTP `info/refs` 的 query 反序列化错误以及 `service` 参数缺失或非法时，不再 `unwrap()` panic，而是返回 `ProtocolError::InvalidInput`。
 > - smart protocol pkt-line 读取新增 `try_read_pkt_line`，对非十六进制 header、短 header、长度小于 header、payload 不完整等输入返回 `ProtocolError::InvalidInput`，并补单元测试；upload-pack 与 receive-pack 命令解析已改用该可失败 parser。
 > - upload-pack 的 `want` / `have` object id 长度和 UTF-8 解析已改为协议错误；receive-pack 命令解析会传播 pkt-line/capability 解析错误。SSH receive-pack 遇到非法 command pkt-line 时记录告警并返回 error 文本，不再在该点 panic。
 >
@@ -301,26 +301,25 @@ HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/i
 
 ## 主要兼容性问题
 
-### HTTP info/refs 参数校验不符合规范且容易 panic
+### HTTP info/refs 参数校验（首批已止血）
 
-`contract::git_protocol::http::git_info_refs` 当前直接：
+`handle_smart_protocol` 当前通过 `parse_info_refs_params` 解析并校验 query，反序列化失败、缺失 `service` 或非法 `service` 都返回 `ProtocolError::InvalidInput`；`contract::git_protocol::http::git_info_refs` 仍保留同类防御性校验。旧实现曾直接：
 
 ```rust
 let service_name = params.service.unwrap();
 let service_type = service_name.parse::<ServiceType>().unwrap();
-```
-
-`handle_smart_protocol` 也直接：
-
-```rust
 let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
 ```
 
-风险：
+已处理风险：
 
-- 缺少 `service` 会 panic。
-- 非法 service 会 panic。
-- query string 解析失败会 panic。
+- query 反序列化错误会返回 400，不再 panic。
+- 缺少 `service` 会返回 400，不再 panic。
+- 非法 service 会返回 400，不再 panic。
+
+仍待后续：
+
+- 更完整 smart HTTP query 兼容性矩阵和真实 Git CLI 覆盖。
 - HTTP smart protocol 要求 `info/refs` 请求包含 `service=$servicename`，且不应接受额外 query 参数；当前没有严格校验。
 
 建议：
