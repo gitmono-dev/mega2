@@ -405,13 +405,13 @@ async fn send_message(
 )]
 async fn edit_message(
     user: LoginUser,
-    Path((_channel_id, message_id)): Path<(String, String)>,
+    Path((channel_id, message_id)): Path<(String, String)>,
     state: State<MonoApiServiceState>,
     Json(payload): Json<UpdateMessageReq>,
 ) -> Result<Json<CommonResult<MessageResponse>>, ApiError> {
     let msg = state
         .channel_chat_svc()
-        .update_message(&message_id, &user.username, payload.content)
+        .update_message(&channel_id, &message_id, &user.username, payload.content)
         .await?;
 
     let mapped = map_message_model(msg, &state).await?;
@@ -433,12 +433,12 @@ async fn edit_message(
 )]
 async fn delete_message(
     user: LoginUser,
-    Path((_channel_id, message_id)): Path<(String, String)>,
+    Path((channel_id, message_id)): Path<(String, String)>,
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state
         .channel_chat_svc()
-        .delete_message(&message_id, &user.username)
+        .delete_message(&channel_id, &message_id, &user.username)
         .await?;
 
     Ok(Json(CommonResult::success(None)))
@@ -747,6 +747,22 @@ mod tests {
         assert_eq!(ch.title.as_deref(), Some("General Channel"));
         assert_eq!(ch.owner_username, "alice");
 
+        let other_res = create_channel(
+            alice.clone(),
+            State(state.clone()),
+            Json(CreateChannelReq {
+                title: Some("Other Channel".to_string()),
+                image_path: None,
+                member_usernames: vec!["bob".to_string()],
+                group: true,
+                initial_message: None,
+            }),
+        )
+        .await
+        .expect("failed to create second channel")
+        .0;
+        let other_ch = other_res.data.unwrap();
+
         // 2. List visible channels for alice
         let list_res = list_channels(alice.clone(), State(state.clone()))
             .await
@@ -838,6 +854,17 @@ mod tests {
         let edit_req = UpdateMessageReq {
             content: "Hello from Bob (Edited)".to_string(),
         };
+        let wrong_channel_edit = edit_message(
+            bob.clone(),
+            Path((other_ch.public_id.clone(), sent_msg.public_id.clone())),
+            State(state.clone()),
+            Json(UpdateMessageReq {
+                content: "wrong channel edit".to_string(),
+            }),
+        )
+        .await;
+        assert!(wrong_channel_edit.is_err());
+
         let edited_msg = edit_message(
             bob.clone(),
             Path((ch.public_id.clone(), sent_msg.public_id.clone())),
@@ -948,6 +975,14 @@ mod tests {
         assert!(unread_res.req_result);
 
         // 12. Soft delete message
+        let wrong_channel_delete = delete_message(
+            bob.clone(),
+            Path((other_ch.public_id, sent_msg.public_id.clone())),
+            State(state.clone()),
+        )
+        .await;
+        assert!(wrong_channel_delete.is_err());
+
         let del_msg_res = delete_message(
             bob.clone(),
             Path((ch.public_id.clone(), sent_msg.public_id.clone())),

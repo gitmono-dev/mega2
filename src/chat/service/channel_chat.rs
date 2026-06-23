@@ -243,19 +243,14 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
 
     pub async fn update_message(
         &self,
+        channel_public_id: &str,
         message_public_id: &str,
         actor_username: &str,
         content: String,
     ) -> Result<message::Model, MegaError> {
-        let msg = self
-            .message_storage
-            .get_message_by_public_id(message_public_id)
-            .await?
-            .ok_or_else(|| MegaError::NotFound(format!("Message {message_public_id} not found")))?;
-
-        if msg.discarded_at.is_some() {
-            return Err(MegaError::Other("cannot edit deleted message".into()));
-        }
+        let (msg, ch) = self
+            .message_for_channel_actor(message_public_id, channel_public_id, actor_username)
+            .await?;
 
         // Actor must be original sender (future: + admin)
         if msg.sender_username.as_deref() != Some(actor_username) {
@@ -268,10 +263,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .await?;
 
         self.events
-            .message_updated(
-                &self.channel_public_id_for_message(msg.channel_id).await?,
-                message_public_id,
-            )
+            .message_updated(&ch.public_id, message_public_id)
             .await;
 
         Ok(updated)
@@ -279,14 +271,13 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
 
     pub async fn delete_message(
         &self,
+        channel_public_id: &str,
         message_public_id: &str,
         actor_username: &str,
     ) -> Result<(), MegaError> {
-        let msg = self
-            .message_storage
-            .get_message_by_public_id(message_public_id)
-            .await?
-            .ok_or_else(|| MegaError::NotFound(format!("Message {message_public_id} not found")))?;
+        let (msg, ch) = self
+            .message_for_channel_actor(message_public_id, channel_public_id, actor_username)
+            .await?;
 
         if msg.sender_username.as_deref() != Some(actor_username) {
             return Err(MegaError::Other("only sender can delete".into()));
@@ -311,9 +302,8 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
                 .await?;
         }
 
-        let ch_pub = self.channel_public_id_for_message(channel_id).await?;
         self.events
-            .message_deleted(&ch_pub, message_public_id)
+            .message_deleted(&ch.public_id, message_public_id)
             .await;
 
         Ok(())
@@ -430,13 +420,28 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
         self.membership_storage.mark_unread(ch.id, username).await
     }
 
-    async fn channel_public_id_for_message(&self, channel_id: i64) -> Result<String, MegaError> {
+    async fn message_for_channel_actor(
+        &self,
+        message_public_id: &str,
+        channel_public_id: &str,
+        actor_username: &str,
+    ) -> Result<(message::Model, channel::Model), MegaError> {
+        let msg = self
+            .message_storage
+            .get_message_by_public_id(message_public_id)
+            .await?
+            .ok_or_else(|| MegaError::NotFound(format!("Message {message_public_id} not found")))?;
         let ch = self
             .channel_storage
-            .get_channel_by_id(channel_id)
+            .get_channel_by_public_id(channel_public_id, actor_username)
             .await?
-            .ok_or_else(|| MegaError::NotFound("channel missing for message".into()))?;
-        Ok(ch.public_id)
+            .ok_or_else(|| MegaError::NotFound(format!("Message {message_public_id} not found")))?;
+        if msg.channel_id != ch.id {
+            return Err(MegaError::NotFound(format!(
+                "Message {message_public_id} not found"
+            )));
+        }
+        Ok((msg, ch))
     }
 }
 
@@ -499,7 +504,20 @@ mod tests {
         assert!(matches!(not_member, Err(MegaError::NotFound(_))));
 
         // Delete the latest (reply) -> should recompute to first
-        svc.delete_message(&reply.public_id, "bob")
+        svc.remove_members(&ch.public_id, "alice", vec!["bob".to_string()])
+            .await
+            .expect("remove bob");
+
+        let removed_member_delete = svc
+            .delete_message(&ch.public_id, &reply.public_id, "bob")
+            .await;
+        assert!(matches!(removed_member_delete, Err(MegaError::NotFound(_))));
+
+        svc.add_members(&ch.public_id, "alice", vec!["bob".to_string()])
+            .await
+            .expect("re-add bob");
+
+        svc.delete_message(&ch.public_id, &reply.public_id, "bob")
             .await
             .expect("delete reply");
 
@@ -512,7 +530,7 @@ mod tests {
         assert_eq!(after.latest_message_id, Some(first.id));
 
         // Delete the last remaining -> latest becomes null
-        svc.delete_message(&first.public_id, "alice")
+        svc.delete_message(&ch.public_id, &first.public_id, "alice")
             .await
             .expect("delete first");
 

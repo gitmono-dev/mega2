@@ -6,28 +6,28 @@
 
 > **与其他模块的依赖**：Chat 模块的通知功能（message 提及/回复通知）将依赖 **`notification.md`** 的多渠道通知系统。Mail 模块完成后，可支持聊天通知的邮件投递。当前集成测试计划参见 **`integration.md`**。
 
-## 事实校准（2026-06-14）
+## 事实校准（2026-06-23）
 
-> 本文档中的代码引用已对照当前 `src/` 重新核对。当前 chat 模块处于初期边界定义阶段：
+> 本文档中的代码引用已对照当前 `src/` 重新核对。早期“仅框架/未实现”的描述已经过期，当前 chat 模块已有可用的 CRUD 主干：
 
-1. **Chat 模块边界已定义**。`src/chat/mod.rs`、`src/chat/domain.rs`、`src/chat/engine.rs` 已建立初期框架，定义 `ChatCapability`、`ChatEntityKind`、`ChatEngine`。
-2. **Capability 划分已明确**。当前规划 `SharedFoundations`（附件、表情、链接预览）和 `ChannelChat`（频道、消息、成员）两个主要能力。
-3. **SeaORM 实体尚未落地**。`src/callisto/` 中暂无 chat 相关表模型；迁移脚本和存储层实现未开工。
-4. **HTTP Router 未接入**。`/api/v1/chat/` 路由尚未添加；需在现有 router 框架中新增 chat_router。
-5. **源系统代码仍在 Rails**。源 9 张表位于 PlanetScale/MySQL，数据迁移工具未开发。
+1. **Chat 模块边界和服务层已落地**。`src/chat/mod.rs`、`src/chat/domain.rs`、`src/chat/engine.rs`、`src/chat/service/{shared,channel_chat}.rs` 存在，`SharedFoundations` 与 `ChannelChat` 两个 capability 已有 storage/service 主路径。
+2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
+3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
+4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息。
+5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、message notification 内部状态写入、实时事件 broadcaster（当前 no-op）、更完整附件校验、完整真实 HTTP 黑盒矩阵和聊天提及/回复通知。
 
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
-| Chat 模块入口 | 仅框架 | `src/chat/mod.rs`、domain.rs、engine.rs 存在；`MIGRATION_SLICES` 尚未实装任何切片。 |
-| Shared Foundations（附件、表情） | 未实现 | SeaORM 实体未定义；storage 层未实现。 |
-| Channel Chat（频道、消息） | 未实现 | SeaORM 实体未定义；storage 层未实现；service 层未实现。 |
-| HTTP API | 未实现 | `/api/v1/chat/` router 不存在；DTO 不存在；OpenAPI 文档未生成。 |
-| 实时事件 | 未实现 | `ChatEvents` trait 未定义；broadcaster 不存在。 |
-| 数据迁移工具 | 未实现 | 源库导出、用户映射、导入脚本均未开发。 |
-| 权限控制 | 未实现 | storage 层 membership join 检查未实现。 |
-| 集成测试 | 未实现 | chat 相关的端到端测试场景未定义。 |
+| Chat 模块入口 | 已实现主干 | `src/chat/` 下已有 domain/engine/service；仍需继续清理文档中的旧 slice 叙述。 |
+| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；仍缺更完整附件类型/大小策略和链接预览抓取。 |
+| Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；message notification 内部状态仍未写入。 |
+| HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
+| 实时事件 | 基础接口 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；真实 broadcaster/WebSocket/Pusher 兼容仍未实现。 |
+| 数据迁移工具 | 初步 CLI | `src/commands/chat_migrate.rs` 存在；仍需真实源库导入、用户映射、校验报告和脱敏 fixture 覆盖。 |
+| 权限控制 | 首批实现并加固 | 多数 channel/message 路径已校验 membership；2026-06-23 已补 message edit/delete 的 channel path + current membership guard。仍需持续把 handler 内直接 SeaORM 查询迁回 storage/service。 |
+| 集成测试 | 部分实现 | service/router 生命周期测试存在；router 测试在 Redis 不可用时会 skip，需要补更稳定的无 Redis 黑盒覆盖。 |
 
 ## 硬约束与不可违反的原则
 
@@ -92,7 +92,7 @@
 
 ## 小结
 
-Chat 模块是一个从零迁移的大型功能模块，涉及 9 张表、12+ API 端点、完整的权限模型和实时事件机制。当前框架已定义边界，但核心实装工作（schema、storage、service、API）尚未开工。建议优先完成 Slice 0-2 的 schema 和 storage 基础，确保权限强制和 soft delete 一致性，再进行 API 暴露和数据迁移。
+Chat 模块是一个从零迁移的大型功能模块，涉及 9 张表、12+ API 端点、完整的权限模型和实时事件机制。当前 schema、storage、service 和绿地 HTTP API 主干已经落地；下一步重点不再是“从零开始”，而是补齐权限一致性、真实 HTTP/迁移测试、message notification、实时事件和数据迁移闭环。
 
 ## 预期收益
 
@@ -659,17 +659,18 @@ pub trait ChatEvents {
 - `cargo build`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 
-### Slice 1: Shared Foundations schema + storage
+### Slice 1: Shared Foundations schema + storage（主干已落地）
 
 目标：落地附件和 reaction 相关实体与基础 storage。
 
 任务：
 
-- 新增 4 张表的 SeaORM 实体与迁移。
-- 新增 attachment storage：创建、按 message 查询、排序。
-- 新增 reaction storage：创建、soft delete、按 message 聚合。
-- 新增 custom reaction storage：创建、按 name/public_id 查询。
-- 新增 open graph storage：按 URL upsert/query。
+- 已完成主干：新增 4 张表的 SeaORM 实体与迁移。
+- 已完成主干：新增 attachment storage：创建、按 message 查询、排序。
+- 已完成主干：新增 reaction storage：创建、soft delete、按 message 聚合。
+- 已完成主干：新增 custom reaction storage：创建、按 name/public_id 查询。
+- 已完成主干：新增 open graph storage：按 URL upsert/query。
+- 剩余：补完整唯一约束冲突矩阵、附件软删除策略和链接预览抓取/缓存行为。
 
 验收：
 
@@ -677,17 +678,18 @@ pub trait ChatEvents {
 - storage 测试覆盖 create/query/soft delete/unique conflict。
 - 不引入外部网络调用。
 
-### Slice 2: Channel Chat schema + storage
+### Slice 2: Channel Chat schema + storage（主干已落地）
 
 目标：落地 channel/message 相关实体与存储层访问控制。
 
 任务：
 
-- 新增 5 张表的 SeaORM 实体与迁移。
-- 新增 channel storage：list visible、find visible、create、update、soft delete。
-- 新增 membership storage：add/remove/list、mark read/unread。
-- 新增 message storage：page、create、update、soft delete、recompute latest。
-- 所有读取按 `username` 强制 membership join。
+- 已完成主干：新增 5 张表的 SeaORM 实体与迁移。
+- 已完成主干：新增 channel storage：list visible、find visible、create、update、soft delete。
+- 已完成主干：新增 membership storage：add/remove/list、mark read/unread。
+- 已完成主干：新增 message storage：page、create、update、soft delete、recompute latest。
+- 已完成首批：channel/message 读取按 `username` 强制 membership join；2026-06-23 已补 message edit/delete 的 path channel + current membership guard。
+- 剩余：继续减少 handler 内直接 SeaORM 查询，补稳定的 storage 级权限回归测试矩阵。
 
 验收：
 
@@ -696,19 +698,19 @@ pub trait ChatEvents {
 - latest message 回算测试通过。
 - soft-deleted channel/message 默认不可见。
 
-### Slice 3: Channel Chat service
+### Slice 3: Channel Chat service（主干已落地）
 
 目标：把 Rails callback 行为显式化。
 
 任务：
 
-- 实现 `create_channel`。
-- 实现 `send_message`。
-- 实现 `update_message`。
-- 实现 `delete_message`。
-- 实现 `add_members` / `remove_members`。
-- 实现 message notification 内部状态写入。
-- 接入 no-op event broadcaster。
+- 已完成主干：实现 `create_channel`。
+- 已完成主干：实现 `send_message`。
+- 已完成主干：实现 `update_message`。
+- 已完成主干：实现 `delete_message`。
+- 已完成主干：实现 `add_members` / `remove_members`。
+- 未完成：实现 message notification 内部状态写入。
+- 已完成基础接口：接入 no-op event broadcaster；真实 broadcaster 仍为后续。
 
 验收：
 
@@ -716,17 +718,18 @@ pub trait ChatEvents {
 - 服务层集成测试覆盖 reply、attachment、reaction。
 - 服务层集成测试覆盖成员变更记录。
 
-### Slice 4: HTTP API
+### Slice 4: HTTP API（主干已落地）
 
 目标：暴露绿地 API。
 
 任务：
 
-- 新增 `chat_router` 并挂载到现有 API router。
-- 新增 request/response DTO。
-- 新增 OpenAPI 标注。
-- 接入当前用户 `username` 提取。
-- 把 service 错误映射成统一 API error。
+- 已完成主干：新增 `chat_router` 并挂载到现有 API router。
+- 已完成主干：新增 request/response DTO。
+- 已完成主干：新增 OpenAPI 标注。
+- 已完成主干：接入当前用户 `username` 提取。
+- 已完成主干：把 service 错误映射成统一 API error。
+- 剩余：补真实 HTTP 黑盒矩阵、稳定无 Redis router 测试，以及是否暴露成员管理 HTTP 端点的产品决策。
 
 验收：
 
@@ -734,15 +737,16 @@ pub trait ChatEvents {
 - OpenAPI 构建通过。
 - API 不暴露数据库内部 ID，只暴露 public_id 和 username。
 
-### Slice 5: Attachment direct upload
+### Slice 5: Attachment direct upload（基础已落地）
 
 目标：支持附件预签名和注册。
 
 任务：
 
-- 实现 presign endpoint。
-- 实现 attachment confirmation endpoint。
-- 校验文件大小、mime、当前用户对目标 message/channel 的访问权限。
+- 已完成基础：实现 presign endpoint。
+- 已完成基础：实现 attachment confirmation endpoint。
+- 部分完成：校验当前用户对目标 message/channel 的访问权限。
+- 剩余：校验文件大小、mime、object key 归属和更完整 object storage fake/no-op 测试。
 
 验收：
 
@@ -795,7 +799,7 @@ source .env.test && cargo test --all
 - 没有迁移范围外的表或字段。
 - 表名使用业务语义，不加来源前缀。
 - 所有用户引用都是 `username`，没有新建源用户表。
-- 所有读取路径都校验 channel membership。
+- 所有读取和写入路径都校验 channel membership；message edit/delete 必须同时校验 path 中的 channel public_id 与 message 实际 channel 一致。
 - 所有 soft delete 表默认过滤 `discarded_at IS NULL`。
 - Handler 不直接调用 SeaORM。
 - API response 不泄露内部自增 ID。
