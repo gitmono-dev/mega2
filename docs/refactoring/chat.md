@@ -13,7 +13,7 @@
 1. **Chat 模块边界和服务层已落地**。`src/chat/mod.rs`、`src/chat/domain.rs`、`src/chat/engine.rs`、`src/chat/service/{shared,channel_chat}.rs` 存在，`SharedFoundations` 与 `ChannelChat` 两个 capability 已有 storage/service 主路径。
 2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
 3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
-4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息。
+4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息；同日 `chat_router` 的 message/custom-reaction 映射读取已下沉到 storage helper，减少 handler 直接 SeaORM 查询。
 5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、message notification 内部状态写入、实时事件 broadcaster（当前 no-op）、更完整附件校验、完整真实 HTTP 黑盒矩阵和聊天提及/回复通知。
 
 ## 当前实现状态速览表
@@ -26,7 +26,7 @@
 | HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
 | 实时事件 | 基础接口 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；真实 broadcaster/WebSocket/Pusher 兼容仍未实现。 |
 | 数据迁移工具 | 初步 CLI | `src/commands/chat_migrate.rs` 存在；仍需真实源库导入、用户映射、校验报告和脱敏 fixture 覆盖。 |
-| 权限控制 | 首批实现并加固 | 多数 channel/message 路径已校验 membership；2026-06-23 已补 message edit/delete 的 channel path + current membership guard。仍需持续把 handler 内直接 SeaORM 查询迁回 storage/service。 |
+| 权限控制 | 首批实现并加固 | 多数 channel/message 路径已校验 membership；2026-06-23 已补 message edit/delete 的 channel path + current membership guard，并移除 `chat_router` response mapping 中对 message/custom-reaction 的直接 SeaORM 查询。仍需持续把其他 handler 内直接 SeaORM 查询迁回 storage/service。 |
 | 集成测试 | 部分实现 | service/router 生命周期测试存在；router 测试在 Redis 不可用时会 skip，需要补更稳定的无 Redis 黑盒覆盖。 |
 
 ## 硬约束与不可违反的原则
@@ -689,7 +689,8 @@ pub trait ChatEvents {
 - 已完成主干：新增 membership storage：add/remove/list、mark read/unread。
 - 已完成主干：新增 message storage：page、create、update、soft delete、recompute latest。
 - 已完成首批：channel/message 读取按 `username` 强制 membership join；2026-06-23 已补 message edit/delete 的 path channel + current membership guard。
-- 剩余：继续减少 handler 内直接 SeaORM 查询，补稳定的 storage 级权限回归测试矩阵。
+- 已完成首批：`chat_router` response mapping 中的 message/custom-reaction 读取已迁回 storage helper。
+- 剩余：继续减少其他 handler 内直接 SeaORM 查询，补稳定的 storage 级权限回归测试矩阵。
 
 验收：
 

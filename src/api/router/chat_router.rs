@@ -6,7 +6,6 @@ use axum::{
 };
 use orbit_api::object_storage::{ObjectKey, ObjectNamespace};
 use reqwest::Method;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -20,7 +19,6 @@ use crate::{
         },
         common::{CommonResult, Pagination},
     },
-    jupiter::storage::base_storage::StorageConnector,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -49,12 +47,11 @@ async fn map_channel_model(
     ch: crate::callisto::channel::Model,
     state: &MonoApiServiceState,
 ) -> Result<ChannelResponse, ApiError> {
-    let storage = state.storage.channel_storage();
-    let conn = storage.get_connection();
     let latest_message_public_id = if let Some(mid) = ch.latest_message_id {
-        let m = crate::callisto::message::Entity::find()
-            .filter(crate::callisto::message::Column::Id.eq(mid))
-            .one(conn)
+        let m = state
+            .storage
+            .message_storage()
+            .get_message_by_id(mid)
             .await?;
         m.map(|msg| msg.public_id)
     } else {
@@ -79,9 +76,6 @@ async fn map_message_model(
     msg: crate::callisto::message::Model,
     state: &MonoApiServiceState,
 ) -> Result<MessageResponse, ApiError> {
-    let storage = state.storage.channel_storage();
-    let conn = storage.get_connection();
-
     // 1. Get reactions
     let rx_models = state
         .storage
@@ -92,9 +86,10 @@ async fn map_message_model(
     let mut reactions = Vec::new();
     for r in rx_models {
         let custom_reaction_public_id = if let Some(crid) = r.custom_reaction_id {
-            let cr = crate::callisto::custom_reaction::Entity::find()
-                .filter(crate::callisto::custom_reaction::Column::Id.eq(crid))
-                .one(conn)
+            let cr = state
+                .storage
+                .custom_reaction_storage()
+                .get_custom_reaction_by_id(crid)
                 .await?;
             cr.map(|c| c.public_id)
         } else {
@@ -140,9 +135,10 @@ async fn map_message_model(
 
     // 4. Find reply_to_public_id
     let reply_to_public_id = if let Some(rtid) = msg.reply_to_id {
-        let rt = crate::callisto::message::Entity::find()
-            .filter(crate::callisto::message::Column::Id.eq(rtid))
-            .one(conn)
+        let rt = state
+            .storage
+            .message_storage()
+            .get_message_by_id(rtid)
             .await?;
         rt.map(|m| m.public_id)
     } else {
@@ -475,10 +471,10 @@ async fn create_reaction(
 
     // Map custom_reaction_public_id
     let custom_reaction_public_id = if let Some(crid) = rx.custom_reaction_id {
-        let storage = state.storage.channel_storage();
-        let cr = crate::callisto::custom_reaction::Entity::find()
-            .filter(crate::callisto::custom_reaction::Column::Id.eq(crid))
-            .one(storage.get_connection())
+        let cr = state
+            .storage
+            .custom_reaction_storage()
+            .get_custom_reaction_by_id(crid)
             .await?;
         cr.map(|c| c.public_id)
     } else {

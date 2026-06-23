@@ -81,6 +81,15 @@ impl MessageStorage {
         Ok(model)
     }
 
+    pub async fn get_message_by_id(&self, id: i64) -> Result<Option<message::Model>, MegaError> {
+        let model = message::Entity::find()
+            .filter(message::Column::Id.eq(id))
+            .filter(message::Column::DiscardedAt.is_null())
+            .one(self.get_connection())
+            .await?;
+        Ok(model)
+    }
+
     /// Update message content (actor check is service responsibility).
     pub async fn update_message_content(
         &self,

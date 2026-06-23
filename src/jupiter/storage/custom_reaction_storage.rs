@@ -68,6 +68,17 @@ impl CustomReactionStorage {
             .await?;
         Ok(model)
     }
+
+    pub async fn get_custom_reaction_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<custom_reaction::Model>, MegaError> {
+        let model = custom_reaction::Entity::find()
+            .filter(custom_reaction::Column::Id.eq(id))
+            .one(self.get_connection())
+            .await?;
+        Ok(model)
+    }
 }
 
 #[cfg(test)]
