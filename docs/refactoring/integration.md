@@ -379,11 +379,11 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 
 ## P2：未来能力 gate
 
-以下能力不属于当前可执行 gate。只有当对应功能实现并稳定后，才新增集成测试。
+`config init` 黑盒用例已落地；其余能力不属于当前可执行 gate，只有当对应功能实现并稳定后，才新增集成测试。
 
 | 能力 | 前置条件 | 验收方向 |
 | --- | --- | --- |
-| `config init` | CLI 真正新增 `config init` | 无 DB/Redis/Vault 时生成无真实 secret 的配置骨架 |
+| `config init` | 已落地（黑盒） | 无 DB/Redis/Vault 时生成无真实 secret 的配置骨架；`bin/tests/integration_vault.rs::integration_config_init_creates_safe_skeleton_and_validates` 覆盖 |
 | 热加载 | 明确 SIGHUP 或 HTTP API、白名单字段、失败回滚语义 | 白名单生效，非白名单拒绝，旧配置继续服务 |
 | 多渠道通知 | `NotificationChannel` trait、Slack/webhook/in-app outbox 与用户偏好 API | 每渠道独立投递、重试、禁用策略 |
 | 用户通知设置 API | DTO/router/权限策略实现 | 用户可查询/修改偏好，系统必发事件不可关闭 |
@@ -566,7 +566,7 @@ Vault bootstrap 过程中被消费。
 | `integration_mail_dispatcher_mailpit` | P0/P1 | ✓ | ✓ | ✓ | ✓ | ✓ | outbox | - | 可选 | 部分；真实 SMTP/Mailpit 正路径与 SMTP transport 失败 retry 已落地 |
 | `integration_notification_trigger_to_mail` | P1 已落地（模块集成形态） | - | ✓ | - | - | ✓ | ✓ | - | - | - |
 | `integration_error_redaction` | P1 DB/Redis 活门禁已落地，余项分散覆盖 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
-| `integration_config_init` | P2 | ✓ | - | - | - | - | - | ✓ | - | ✓ |
+| `integration_config_init` | P2 已落地（黑盒） | ✓ | - | - | - | - | - | ✓ | - | ✓ |
 | `integration_config_hot_reload` | P2 | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | P2 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
 

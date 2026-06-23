@@ -825,6 +825,88 @@ password = "{TOML_SENTINEL}
     );
 }
 
+// ===== P2 未来能力 gate：config init 黑盒用例 =====
+
+#[test]
+fn integration_config_init_creates_safe_skeleton_and_validates() {
+    // `config init` 不应读取任何配置、不应连接数据库/Vault/Redis，只生成一份安全骨架配置。
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let base_dir = temp_dir.path().join("base");
+    let cache_dir = temp_dir.path().join("cache");
+    let output_path = temp_dir.path().join("init-config.toml");
+
+    let mut init = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
+    init.args([
+        "config",
+        "init",
+        "--output",
+        output_path.to_str().expect("utf-8 output path"),
+    ]);
+
+    let output = run(init);
+    let (stdout, stderr) = assert_success(&output);
+
+    assert!(
+        output_path.exists(),
+        "config init should create the output file"
+    );
+    assert!(
+        stdout.contains(&output_path.to_string_lossy().to_string()),
+        "stdout should mention created path: {stdout}"
+    );
+    assert!(stderr.trim().is_empty(), "unexpected stderr: {stderr}");
+
+    let content = fs::read_to_string(&output_path).expect("read init config");
+    // 骨架配置使用 password_ref 而非明文 password，且不包含可复用的生产凭据。
+    assert!(
+        content.contains("password_ref = "),
+        "init config should use password_ref"
+    );
+    assert!(
+        !content.contains("password = "),
+        "init config should not contain plaintext password ="
+    );
+    assert!(
+        !content.contains("postgres://mono:"),
+        "init config should not embed predictable postgres credentials"
+    );
+
+    // 生成的配置应能通过 config validate（不解析 secret），证明骨架本身是合法的。
+    let mut validate = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
+    validate
+        .arg("--config")
+        .arg(&output_path)
+        .args(["config", "validate"]);
+    let output = run(validate);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), "config valid");
+    assert!(stderr.trim().is_empty(), "unexpected stderr: {stderr}");
+
+    // 不带 --force 再次写入同一文件应失败。
+    let mut init_again = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
+    init_again.args([
+        "config",
+        "init",
+        "--output",
+        output_path.to_str().expect("utf-8 output path"),
+    ]);
+    let output = run(init_again);
+    assert_failure(&output);
+
+    // --force 应覆盖。
+    let mut init_force = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
+    init_force.args([
+        "config",
+        "init",
+        "--output",
+        output_path.to_str().expect("utf-8 output path"),
+        "--force",
+    ]);
+    let output = run(init_force);
+    assert_success(&output);
+    assert!(output_path.exists(), "force overwrite should keep the file");
+}
+
 fn seed_mail_password(env: &VaultCliEnv) {
     // 复用 secret-set 正路径：通过 stdin 把 mail.password 写入测试专属 Vault。
     let mut set = env.bootstrap_command();
