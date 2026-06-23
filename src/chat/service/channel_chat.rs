@@ -84,9 +84,18 @@ impl ChannelChatService<NoopChatEvents> {
 }
 
 impl<E: ChatEvents + 'static> ChannelChatService<E> {
-    pub fn with_events(mut self, events: Arc<E>) -> Self {
-        self.events = events;
-        self
+    pub fn with_events<NextE: ChatEvents + 'static>(
+        self,
+        events: Arc<NextE>,
+    ) -> ChannelChatService<NextE> {
+        ChannelChatService {
+            channel_storage: self.channel_storage,
+            membership_storage: self.membership_storage,
+            membership_update_storage: self.membership_update_storage,
+            message_storage: self.message_storage,
+            attachment_storage: self.attachment_storage,
+            events,
+        }
     }
 
     /// Create a channel.
@@ -470,7 +479,11 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .get_channel_by_public_id(channel_public_id, username)
             .await?
             .ok_or_else(|| MegaError::NotFound("channel not found or no access".into()))?;
-        self.membership_storage.mark_unread(ch.id, username).await
+        // Only adjust last_read_at when there is an actual latest message.
+        let latest_at = ch.latest_message_id.map(|_| ch.last_message_at);
+        self.membership_storage
+            .mark_unread(ch.id, username, latest_at)
+            .await
     }
 
     async fn message_for_channel_actor(
@@ -501,7 +514,10 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jupiter::tests::test_storage;
+    use crate::{
+        chat::domain::{ChatEvent, InMemoryChatEvents},
+        jupiter::tests::test_storage,
+    };
 
     #[tokio::test]
     async fn test_create_channel_and_send_message_and_delete_latest() {
@@ -636,6 +652,62 @@ mod tests {
         assert!(final_ch.latest_message_id.is_none());
     }
 
+    #[tokio::test]
+    async fn mark_unread_adjusts_last_read_at_before_latest_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let svc = ChannelChatService::from_storage(&storage);
+
+        let (ch, first_msg) = svc
+            .create_channel(
+                Some("Unread Test".to_string()),
+                None,
+                "alice".to_string(),
+                vec![],
+                true,
+                Some("hello".to_string()),
+                None,
+            )
+            .await
+            .expect("create channel");
+        let _ = first_msg.expect("initial message");
+
+        // Mark read first to establish a known last_read_at.
+        svc.mark_read(&ch.public_id, "alice")
+            .await
+            .expect("mark read");
+
+        let before = svc
+            .membership_storage
+            .get_membership(ch.id, "alice")
+            .await
+            .expect("query membership")
+            .expect("alice membership");
+
+        // Mark unread — should move last_read_at before the latest message.
+        svc.mark_unread(&ch.public_id, "alice")
+            .await
+            .expect("mark unread");
+
+        let after = svc
+            .membership_storage
+            .get_membership(ch.id, "alice")
+            .await
+            .expect("query membership")
+            .expect("alice membership");
+
+        assert!(after.manually_marked_unread_at.is_some());
+        // last_read_at must have moved backward (before the latest message).
+        assert!(
+            after.last_read_at < before.last_read_at,
+            "last_read_at should be before the latest message after mark_unread"
+        );
+        assert!(
+            after.last_read_at < ch.last_message_at,
+            "last_read_at should be before channel's last_message_at"
+        );
+    }
+
     #[test]
     fn extracts_mentions_on_token_boundaries() {
         let mentions = extract_mentioned_usernames("hi @alice, email a@b no @bob-smith @carol.dev");
@@ -644,6 +716,74 @@ mod tests {
         assert!(mentions.contains("bob-smith"));
         assert!(mentions.contains("carol.dev"));
         assert!(!mentions.contains("b"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_chat_events_broadcasts_service_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let events = Arc::new(InMemoryChatEvents::default());
+        let mut receiver = events.subscribe();
+        let svc = ChannelChatService::from_storage(&storage).with_events(events);
+
+        let (ch, first_msg) = svc
+            .create_channel(
+                Some("Events".to_string()),
+                None,
+                "alice".to_string(),
+                vec!["bob".to_string()],
+                true,
+                Some("hello".to_string()),
+                None,
+            )
+            .await
+            .expect("create channel");
+        let first_msg = first_msg.expect("initial message");
+
+        assert_eq!(
+            receiver.recv().await.expect("message created event"),
+            ChatEvent::MessageCreated {
+                channel_public_id: ch.public_id.clone(),
+                message_public_id: first_msg.public_id.clone(),
+            }
+        );
+
+        svc.update_message(
+            &ch.public_id,
+            &first_msg.public_id,
+            "alice",
+            "edited".to_string(),
+        )
+        .await
+        .expect("update message");
+        assert_eq!(
+            receiver.recv().await.expect("message updated event"),
+            ChatEvent::MessageUpdated {
+                channel_public_id: ch.public_id.clone(),
+                message_public_id: first_msg.public_id.clone(),
+            }
+        );
+
+        svc.delete_message(&ch.public_id, &first_msg.public_id, "alice")
+            .await
+            .expect("delete message");
+        assert_eq!(
+            receiver.recv().await.expect("message deleted event"),
+            ChatEvent::MessageDeleted {
+                channel_public_id: ch.public_id.clone(),
+                message_public_id: first_msg.public_id,
+            }
+        );
+
+        svc.add_members(&ch.public_id, "alice", vec!["carol".to_string()])
+            .await
+            .expect("add member");
+        assert_eq!(
+            receiver.recv().await.expect("channel updated event"),
+            ChatEvent::ChannelUpdated {
+                channel_public_id: ch.public_id,
+            }
+        );
     }
 }
 

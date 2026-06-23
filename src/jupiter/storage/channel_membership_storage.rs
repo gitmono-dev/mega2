@@ -67,20 +67,33 @@ impl ChannelMembershipStorage {
         Ok(())
     }
 
-    pub async fn mark_unread(&self, channel_id: i64, username: &str) -> Result<(), MegaError> {
+    pub async fn mark_unread(
+        &self,
+        channel_id: i64,
+        username: &str,
+        latest_message_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<(), MegaError> {
         let now = Utc::now().naive_utc();
-        // Per spec: set manually_marked_unread_at, move last_read_at before latest message (simplified: use epoch or provided)
-        // For full impl, service will pass appropriate timestamp; here set flag and leave last_read for caller logic or use now as placeholder.
-        channel_membership::Entity::update_many()
+        // Per spec: set manually_marked_unread_at AND move last_read_at before the
+        // latest message so the channel appears unread (Rails-compatible behavior).
+        let mut update = channel_membership::Entity::update_many()
             .filter(channel_membership::Column::ChannelId.eq(channel_id))
             .filter(channel_membership::Column::Username.eq(username))
             .col_expr(
                 channel_membership::Column::ManuallyMarkedUnreadAt,
                 Expr::value(now),
             )
-            .col_expr(channel_membership::Column::UpdatedAt, Expr::value(now))
-            .exec(self.get_connection())
-            .await?;
+            .col_expr(channel_membership::Column::UpdatedAt, Expr::value(now));
+
+        if let Some(latest_at) = latest_message_at {
+            let unread_before = latest_at - chrono::Duration::seconds(1);
+            update = update.col_expr(
+                channel_membership::Column::LastReadAt,
+                Expr::value(unread_before),
+            );
+        }
+
+        update.exec(self.get_connection()).await?;
         Ok(())
     }
 

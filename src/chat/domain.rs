@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChatEntityKind {
@@ -80,6 +81,25 @@ pub trait ChatEvents: Send + Sync {
     async fn channel_updated(&self, channel_public_id: &str);
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ChatEvent {
+    MessageCreated {
+        channel_public_id: String,
+        message_public_id: String,
+    },
+    MessageUpdated {
+        channel_public_id: String,
+        message_public_id: String,
+    },
+    MessageDeleted {
+        channel_public_id: String,
+        message_public_id: String,
+    },
+    ChannelUpdated {
+        channel_public_id: String,
+    },
+}
+
 /// No-op default implementation.
 #[derive(Clone, Default)]
 pub struct NoopChatEvents;
@@ -90,4 +110,60 @@ impl ChatEvents for NoopChatEvents {
     async fn message_updated(&self, _channel_public_id: &str, _message_public_id: &str) {}
     async fn message_deleted(&self, _channel_public_id: &str, _message_public_id: &str) {}
     async fn channel_updated(&self, _channel_public_id: &str) {}
+}
+
+#[derive(Clone)]
+pub struct InMemoryChatEvents {
+    sender: broadcast::Sender<ChatEvent>,
+}
+
+impl Default for InMemoryChatEvents {
+    fn default() -> Self {
+        Self::new(128)
+    }
+}
+
+impl InMemoryChatEvents {
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity.max(1));
+        Self { sender }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ChatEvent> {
+        self.sender.subscribe()
+    }
+
+    fn publish(&self, event: ChatEvent) {
+        let _ = self.sender.send(event);
+    }
+}
+
+#[async_trait]
+impl ChatEvents for InMemoryChatEvents {
+    async fn message_created(&self, channel_public_id: &str, message_public_id: &str) {
+        self.publish(ChatEvent::MessageCreated {
+            channel_public_id: channel_public_id.to_owned(),
+            message_public_id: message_public_id.to_owned(),
+        });
+    }
+
+    async fn message_updated(&self, channel_public_id: &str, message_public_id: &str) {
+        self.publish(ChatEvent::MessageUpdated {
+            channel_public_id: channel_public_id.to_owned(),
+            message_public_id: message_public_id.to_owned(),
+        });
+    }
+
+    async fn message_deleted(&self, channel_public_id: &str, message_public_id: &str) {
+        self.publish(ChatEvent::MessageDeleted {
+            channel_public_id: channel_public_id.to_owned(),
+            message_public_id: message_public_id.to_owned(),
+        });
+    }
+
+    async fn channel_updated(&self, channel_public_id: &str) {
+        self.publish(ChatEvent::ChannelUpdated {
+            channel_public_id: channel_public_id.to_owned(),
+        });
+    }
 }

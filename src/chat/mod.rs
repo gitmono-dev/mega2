@@ -9,6 +9,7 @@ pub mod engine;
 pub mod service;
 
 pub use domain::{
-    ChatCapability, ChatEntityKind, ChatEntityRef, ChatEvents, ChatMigrationSlice, NoopChatEvents,
+    ChatCapability, ChatEntityKind, ChatEntityRef, ChatEvent, ChatEvents, ChatMigrationSlice,
+    InMemoryChatEvents, NoopChatEvents,
 };
 pub use engine::ChatEngine;

@@ -14,7 +14,7 @@
 2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
 3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
 4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息；同日 `chat_router` 的 message/custom-reaction 映射读取已下沉到 storage helper，减少 handler 直接 SeaORM 查询。
-5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、实时事件 broadcaster（当前 no-op）、完整真实 HTTP 黑盒矩阵和外部通知投递。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；后续仍需按产品策略补更完整 MIME allowlist 与存储对象归属校验。
+5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、WebSocket/Pusher 兼容网关、完整真实 HTTP 黑盒矩阵和外部通知投递。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；后续仍需按产品策略补更完整 MIME allowlist 与存储对象归属校验。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
 
 ## 当前实现状态速览表
 
@@ -24,7 +24,7 @@
 | Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验；仍缺产品级 MIME allowlist、对象归属复核和链接预览抓取。 |
 | Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入，rich-text mention 解析和外部投递仍未实现。 |
 | HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
-| 实时事件 | 基础接口 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；真实 broadcaster/WebSocket/Pusher 兼容仍未实现。 |
+| 实时事件 | 进程内 broadcaster 已实现 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；`InMemoryChatEvents` 已提供 tokio broadcast 订阅能力并覆盖 service mutation 事件。WebSocket/Pusher 兼容网关仍未实现。 |
 | 数据迁移工具 | 初步 CLI | `src/commands/chat_migrate.rs` 存在；仍需真实源库导入、用户映射、校验报告和脱敏 fixture 覆盖。 |
 | 权限控制 | 首批实现并加固 | 多数 channel/message 路径已校验 membership；2026-06-23 已补 message edit/delete 的 channel path + current membership guard，并移除 `chat_router` response mapping 中对 message/custom-reaction 的直接 SeaORM 查询。仍需持续把其他 handler 内直接 SeaORM 查询迁回 storage/service。 |
 | 集成测试 | 部分实现 | service/router 生命周期测试存在；router 测试在 Redis 不可用时会 skip，需要补更稳定的无 Redis 黑盒覆盖。 |
@@ -76,7 +76,7 @@
 
 - **Soft Delete 查询复杂性**：大量查询需要默认过滤 `discarded_at IS NULL`，如果不在 storage 层统一处理，会导致遗漏和不一致。
 
-- **实时事件复杂性**：第一版 no-op 实现简单，但后续接入 WebSocket/Pusher 时需要重构。应在 Slice 3 设计好事件接口。
+- **实时事件复杂性**：当前已有 no-op 默认实现和进程内 broadcast hub，但后续接入 WebSocket/Pusher 时仍需要网关层适配。事件接口应继续保持稳定。
 
 - **API 认证一致性**：HTTP 和 SSH 认证上下文需与其他模块（如 vault、config 的 protocol auth）保持一致。
 
@@ -601,7 +601,7 @@ pub trait ChatEvents {
 }
 ```
 
-默认实现可以是 no-op。WebSocket/Pusher 兼容网关作为后续切片，不得阻塞 CRUD 切片合入。
+默认实现可以是 no-op。当前已提供 `InMemoryChatEvents` 进程内 broadcast hub，供测试和后续网关消费；WebSocket/Pusher 兼容网关作为后续切片，不得阻塞 CRUD 切片合入。
 
 ## 数据迁移
 
@@ -710,8 +710,8 @@ pub trait ChatEvents {
 - 已完成主干：实现 `update_message`。
 - 已完成主干：实现 `delete_message`。
 - 已完成主干：实现 `add_members` / `remove_members`。
-- 未完成：实现 message notification 内部状态写入。
-- 已完成基础接口：接入 no-op event broadcaster；真实 broadcaster 仍为后续。
+- 已完成首批：实现 reply 与 `@username` mention 的 message notification 内部状态写入。
+- 已完成首批：接入 no-op 默认 event broadcaster，并新增进程内 `InMemoryChatEvents` broadcaster；WebSocket/Pusher 兼容网关仍为后续。
 
 验收：
 
