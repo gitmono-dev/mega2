@@ -14,14 +14,14 @@
 2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
 3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
 4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息；同日 `chat_router` 的 message/custom-reaction 映射读取已下沉到 storage helper，减少 handler 直接 SeaORM 查询。
-5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、message notification 内部状态写入、实时事件 broadcaster（当前 no-op）、更完整附件校验、完整真实 HTTP 黑盒矩阵和聊天提及/回复通知。
+5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、message notification 内部状态写入、实时事件 broadcaster（当前 no-op）、完整真实 HTTP 黑盒矩阵和聊天提及/回复通知。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；后续仍需按产品策略补更完整 MIME allowlist 与存储对象归属校验。
 
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
 | Chat 模块入口 | 已实现主干 | `src/chat/` 下已有 domain/engine/service；仍需继续清理文档中的旧 slice 叙述。 |
-| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；仍缺更完整附件类型/大小策略和链接预览抓取。 |
+| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验；仍缺产品级 MIME allowlist、对象归属复核和链接预览抓取。 |
 | Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；message notification 内部状态仍未写入。 |
 | HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
 | 实时事件 | 基础接口 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；真实 broadcaster/WebSocket/Pusher 兼容仍未实现。 |
@@ -746,8 +746,9 @@ pub trait ChatEvents {
 
 - 已完成基础：实现 presign endpoint。
 - 已完成基础：实现 attachment confirmation endpoint。
-- 部分完成：校验当前用户对目标 message/channel 的访问权限。
-- 剩余：校验文件大小、mime、object key 归属和更完整 object storage fake/no-op 测试。
+- 已完成首批：校验当前用户对目标 message/channel 的访问权限。
+- 已完成首批：校验文件名不含路径分隔/控制字符、文件大小为正且不超过 100MiB、MIME 形态包含 `/`、confirm file_path 必须是 `chat/attachments/` object key 且无 traversal 段。
+- 剩余：产品级 MIME allowlist、已上传对象归属/存在性复核和更完整 object storage fake/no-op 测试。
 
 验收：
 

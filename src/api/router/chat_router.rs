@@ -21,6 +21,11 @@ use crate::{
     },
 };
 
+const CHAT_ATTACHMENT_MAX_FILE_SIZE: i64 = 100 * 1024 * 1024;
+const CHAT_ATTACHMENT_MAX_FILE_NAME_LEN: usize = 255;
+const CHAT_ATTACHMENT_MAX_FILE_TYPE_LEN: usize = 128;
+const CHAT_ATTACHMENT_KEY_PREFIX: &str = "chat/attachments/";
+
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(
         "/chat",
@@ -41,6 +46,62 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(mark_channel_read))
             .routes(routes!(mark_channel_unread)),
     )
+}
+
+fn validate_chat_attachment_metadata(
+    file_name: &str,
+    file_type: &str,
+    file_size: i64,
+) -> Result<(String, String), ApiError> {
+    let file_name = file_name.trim();
+    if file_name.is_empty()
+        || file_name.len() > CHAT_ATTACHMENT_MAX_FILE_NAME_LEN
+        || file_name == "."
+        || file_name == ".."
+        || file_name
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid attachment file_name"
+        )));
+    }
+
+    let file_type = file_type.trim();
+    if file_type.is_empty()
+        || file_type.len() > CHAT_ATTACHMENT_MAX_FILE_TYPE_LEN
+        || !file_type.contains('/')
+        || file_type.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid attachment file_type"
+        )));
+    }
+
+    if !(1..=CHAT_ATTACHMENT_MAX_FILE_SIZE).contains(&file_size) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "attachment file_size must be between 1 and {} bytes",
+            CHAT_ATTACHMENT_MAX_FILE_SIZE
+        )));
+    }
+
+    Ok((file_name.to_owned(), file_type.to_owned()))
+}
+
+fn validate_chat_attachment_file_path(file_path: &str) -> Result<(), ApiError> {
+    if file_path.is_empty()
+        || file_path.len() > 1024
+        || !file_path.starts_with(CHAT_ATTACHMENT_KEY_PREFIX)
+        || file_path.chars().any(|ch| ch == '\\' || ch.is_control())
+        || file_path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid attachment file_path"
+        )));
+    }
+    Ok(())
 }
 
 async fn map_channel_model(
@@ -531,6 +592,12 @@ async fn presign_attachment(
     state: State<MonoApiServiceState>,
     Json(payload): Json<AttachmentPresignReq>,
 ) -> Result<Json<CommonResult<AttachmentPresignRes>>, ApiError> {
+    let (file_name, _) = validate_chat_attachment_metadata(
+        &payload.file_name,
+        &payload.file_type,
+        payload.file_size,
+    )?;
+
     // 1. Verify membership
     let _ = state
         .channel_chat_svc()
@@ -543,7 +610,7 @@ async fn presign_attachment(
     let uuid_str = uuid::Uuid::new_v4().to_string();
     let file_key = format!(
         "chat/attachments/{}/{}_{}",
-        payload.channel_public_id, uuid_str, payload.file_name
+        payload.channel_public_id, uuid_str, file_name
     );
 
     let key = ObjectKey {
@@ -584,6 +651,13 @@ async fn confirm_attachment(
     state: State<MonoApiServiceState>,
     Json(payload): Json<AttachmentConfirmReq>,
 ) -> Result<Json<CommonResult<AttachmentResponse>>, ApiError> {
+    let (file_name, file_type) = validate_chat_attachment_metadata(
+        &payload.file_name,
+        &payload.file_type,
+        payload.file_size,
+    )?;
+    validate_chat_attachment_file_path(&payload.file_path)?;
+
     // Check if there are other attachments on the message to determine position
     let msg = state
         .channel_chat_svc()
@@ -605,8 +679,8 @@ async fn confirm_attachment(
             &message_id,
             &user.username,
             payload.file_path,
-            payload.file_type,
-            payload.file_name,
+            file_type,
+            file_name,
             payload.file_size,
             position,
         )
@@ -680,6 +754,26 @@ mod tests {
 
     use super::*;
     use crate::{api::oauth::model::LoginUser, jupiter::tests::test_storage};
+
+    #[test]
+    fn chat_attachment_metadata_rejects_unsafe_inputs() {
+        assert!(validate_chat_attachment_metadata("../x.txt", "text/plain", 1).is_err());
+        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 0).is_err());
+        assert!(validate_chat_attachment_metadata("x.txt", "not-a-mime", 1).is_err());
+        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 1).is_ok());
+    }
+
+    #[test]
+    fn chat_attachment_file_path_requires_chat_attachment_key() {
+        assert!(
+            validate_chat_attachment_file_path("chat/attachments/channel/uuid_report.txt").is_ok()
+        );
+        assert!(validate_chat_attachment_file_path("../report.txt").is_err());
+        assert!(
+            validate_chat_attachment_file_path("chat/attachments/channel/../report.txt").is_err()
+        );
+        assert!(validate_chat_attachment_file_path("other/attachments/report.txt").is_err());
+    }
 
     async fn setup_test_state(temp_dir: &std::path::Path) -> Option<MonoApiServiceState> {
         let storage = test_storage(temp_dir).await;
