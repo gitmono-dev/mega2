@@ -1,7 +1,7 @@
 use core::fmt;
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -120,6 +120,11 @@ impl FromStr for Capability {
     }
 }
 
+fn repo_path_to_str(path: &Path) -> Result<&str, ProtocolError> {
+    path.to_str()
+        .ok_or_else(|| ProtocolError::InvalidInput("repository path is not valid UTF-8".to_owned()))
+}
+
 pub enum SideBind {
     // sideband 1 will contain packfile data,
     PackfileData,
@@ -170,8 +175,8 @@ impl SmartSession {
 
         if self.repo_path.starts_with(import_dir.clone()) {
             let storage = state.storage.git_db_storage();
-            let path_str = self.repo_path.to_str().unwrap();
-            let model = storage.find_git_repo_exact_match(path_str).await.unwrap();
+            let path_str = repo_path_to_str(&self.repo_path)?;
+            let model = storage.find_git_repo_exact_match(path_str).await?;
             let repo = if let Some(repo) = model {
                 repo.into()
             } else {
@@ -181,7 +186,7 @@ impl SmartSession {
                     }
                     ServiceType::ReceivePack => {
                         let repo = Repo::new(self.repo_path.clone(), false);
-                        storage.save_git_repo(repo.clone().into()).await.unwrap();
+                        storage.save_git_repo(repo.clone().into()).await?;
                         repo
                     }
                 }
@@ -231,4 +236,24 @@ impl SmartSession {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_path_to_str_rejects_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        let err = repo_path_to_str(&path).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn repo_path_to_str_accepts_utf8_paths() {
+        let path = PathBuf::from("/tmp/repo.git");
+
+        assert_eq!(repo_path_to_str(&path).unwrap(), "/tmp/repo.git");
+    }
+}

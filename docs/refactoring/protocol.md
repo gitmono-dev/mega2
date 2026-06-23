@@ -52,7 +52,7 @@
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
-| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input 与 malformed SSH exec 已改为协议错误/channel failure；stream chunk、repo handler 等路径仍有 `unwrap()`/panic 待收敛。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；stream chunk 与更多 repo handler 内部路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
 
