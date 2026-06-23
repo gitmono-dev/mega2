@@ -14,7 +14,12 @@
 > - HTTP `info/refs` 的 `service` query 参数缺失或非法时，不再 `unwrap()` panic，而是返回 `ProtocolError::InvalidInput`。
 > - smart protocol pkt-line 读取新增 `try_read_pkt_line`，对非十六进制 header、短 header、长度小于 header、payload 不完整等输入返回 `ProtocolError::InvalidInput`，并补单元测试；upload-pack 与 receive-pack 命令解析已改用该可失败 parser。
 > - upload-pack 的 `want` / `have` object id 长度和 UTF-8 解析已改为协议错误；receive-pack 命令解析会传播 pkt-line/capability 解析错误。SSH receive-pack 遇到非法 command pkt-line 时记录告警并返回 error 文本，不再在该点 panic。
-> - 仍未完成：receive-pack 仍以搜索 `PACK` magic bytes 分界，SSH exec parser 仍较脆弱，SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
+>
+> **2026-06-23 更新 2**：已完成 SSH exec parser 止血：
+> - `exec_request` 不再用 `split(' ')` 和 `command[1]` 直接索引；新增独立 parser，支持单引号、双引号、反斜杠转义和包含空格的 repo path。
+> - 只允许 `git-upload-pack`、`git-receive-pack`、`git-lfs-authenticate`、`git-lfs-transfer`；未知命令、缺 path、引号未闭合或参数数目错误会返回 channel failure 和可读错误，不再默认降级为 upload-pack。
+> - repo path 只去除末尾 `.git`，不再删除路径中间的 `.git`。
+> - 仍未完成：receive-pack 仍以搜索 `PACK` magic bytes 分界，SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -35,12 +40,12 @@
 | HTTP GET /info/refs | 已实现（首批止血） | `service` 缺失或非法已返回 `ProtocolError::InvalidInput`；仍需补更完整 smart HTTP query 兼容性矩阵。 |
 | HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
 | HTTP POST receive-pack | 已实现（风险） | command pkt-line malformed input 已返回协议错误；但仍搜索 `PACK` 字节分界，不按 flush-pkt 边界，跨 chunk 可能失败。 |
-| SSH git-upload-pack | 已实现（风险） | exec command 解析过于脆弱，路径包含空格时失败；非法命令默认变成 upload-pack。 |
+| SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；后续仍需 per-channel state。 |
 | SSH git-receive-pack | 已实现（风险） | 与 HTTP 共用不稳健的分流逻辑；session 状态全局共享。 |
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 实现但不完全 | advertise 包含 atomic、report-status-v2、delete-refs，但实现和测试不完整。 |
-| 错误处理 | 首批止血 | `info/refs` service 参数与 smart pkt-line malformed input 已改为协议错误；其余 SSH exec、stream chunk、repo handler 等路径仍有 `unwrap()`/panic 待收敛。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input 与 malformed SSH exec 已改为协议错误/channel failure；stream chunk、repo handler 等路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
 
@@ -357,7 +362,7 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
 
 ### SSH exec command 解析过于脆弱
 
-`exec_request` 当前使用：
+`exec_request` 早期使用：
 
 ```rust
 let command: Vec<_> = data.split(' ').collect();
@@ -366,21 +371,18 @@ let path = path.replace(".git", "").replace('\'', "");
 let service_type = ServiceType::from_str(command[0]).unwrap_or(ServiceType::UploadPack);
 ```
 
-风险：
+这一路径已在 2026-06-23 的首批止血中替换为独立 parser。当前 parser 已覆盖以下风险：
 
 - 空命令或缺 path 会 panic。
 - 路径包含空格会被错误切分。
 - `.replace(".git", "")` 会删除路径中所有 `.git`，而不是只去掉末尾 `.git`。
-- 不支持双引号、转义、`--` 等 shell quoting 变体。
+- 不支持单引号、双引号和反斜杠转义。
 - 非法 command 默认变成 `UploadPack`，可能导致错误行为。
 
-建议：
+仍待后续处理：
 
-- 引入严格 SSH Git exec parser。
-- 只允许 `git-upload-pack`、`git-receive-pack`、`git-lfs-authenticate`、`git-lfs-transfer`。
-- repo path 只去除末尾 `.git`。
-- 支持单引号、双引号和未引用路径的最小兼容解析。
-- 非法命令返回 channel failure 和可读错误，不默认降级为 upload-pack。
+- 更完整的 shell 兼容性（如 `--`、复杂转义规则）如果标准客户端需要，再按兼容性测试补充。
+- 将已解析的 exec state 与 SSH channel 绑定，避免一个 connection 内多个 channel 共享 `smart_protocol` / `data_combined`。
 
 ### SSH session 状态与 channel 绑定不够明确
 

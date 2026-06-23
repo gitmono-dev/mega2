@@ -24,6 +24,20 @@ use crate::{
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
 
+#[derive(Debug, PartialEq)]
+enum SshExecKind {
+    Git(ServiceType),
+    LfsAuthenticate,
+    LfsTransfer,
+}
+
+#[derive(Debug, PartialEq)]
+struct SshExecRequest {
+    kind: SshExecKind,
+    repo_path: PathBuf,
+    lfs_operation: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct SshServer {
     pub clients: Arc<Mutex<ClientMap>>,
@@ -81,29 +95,46 @@ impl server::Handler for SshServer {
         // Push: git-receive-pack '/path/to/repo.git'
         // Pull: git-upload-pack '/path/to/repo.git'
         // LFS HTTP Authenticate: git-lfs-authenticate '/path/to/repo.git' download/upload
-        let command: Vec<_> = data.split(' ').collect();
-        let path = command[1];
-        let path = path.replace(".git", "").replace('\'', "");
-        let service_type = ServiceType::from_str(command[0]).unwrap_or(ServiceType::UploadPack);
-        let smart_protocol =
-            SmartSession::new(PathBuf::from(&path), service_type, TransportProtocol::Ssh);
-        match command[0] {
-            "git-upload-pack" | "git-receive-pack" => {
+        let exec = match parse_ssh_exec_request(&data) {
+            Ok(exec) => exec,
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid SSH git exec request");
+                session.data(channel, format!("error: {err}\n").into_bytes())?;
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
+
+        match exec.kind {
+            SshExecKind::Git(service_type) => {
+                let smart_protocol =
+                    SmartSession::new(exec.repo_path, service_type, TransportProtocol::Ssh);
                 // TODO handler ProtocolError
-                let res = smart_protocol.git_info_refs(&self.state).await.unwrap();
+                let res = smart_protocol.git_info_refs(&self.state).await?;
                 self.smart_protocol = Some(smart_protocol);
                 session.data(channel, res.to_vec())?;
                 session.channel_success(channel)?;
             }
             //Note that currently mega does not support pure ssh to transfer files, still relay on the https server.
             //see https://github.com/git-lfs/git-lfs/blob/main/docs/proposals/ssh_adapter.md for more details about pure ssh file transfer.
-            "git-lfs-transfer" => {
+            SshExecKind::LfsTransfer => {
+                tracing::debug!(
+                    repo_path = %exec.repo_path.display(),
+                    operation = ?exec.lfs_operation,
+                    "git-lfs-transfer requested"
+                );
                 session.data(channel, "not implemented yet".as_bytes().to_vec())?;
+                session.channel_failure(channel)?;
             }
             // When connecting over SSH, the first attempt will be made to use
             // `git-lfs-transfer`, the pure SSH protocol, and if it fails, Git LFS will fall
             // back to the hybrid protocol using `git-lfs-authenticate`.
-            "git-lfs-authenticate" => {
+            SshExecKind::LfsAuthenticate => {
+                tracing::debug!(
+                    repo_path = %exec.repo_path.display(),
+                    operation = ?exec.lfs_operation,
+                    "git-lfs-authenticate requested"
+                );
                 let mut header = HashMap::new();
                 let config = self.state.storage.config();
                 header.insert("Accept".to_string(), "application/vnd.git-lfs".to_string());
@@ -118,7 +149,6 @@ impl server::Handler for SshServer {
                 };
                 session.data(channel, serde_json::to_vec(&link).unwrap())?;
             }
-            command => tracing::error!("Not Supported command! {}", command),
         }
         Ok(())
     }
@@ -196,6 +226,120 @@ impl server::Handler for SshServer {
     }
 }
 
+fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
+    let args = split_ssh_exec_args(input)?;
+    let Some(command) = args.first().map(String::as_str) else {
+        return Err("missing SSH exec command".to_owned());
+    };
+
+    match command {
+        "git-upload-pack" | "git-receive-pack" => {
+            if args.len() != 2 {
+                return Err(format!("{command} requires exactly one repository path"));
+            }
+            let service_type = ServiceType::from_str(command).map_err(|err| err.to_string())?;
+            Ok(SshExecRequest {
+                kind: SshExecKind::Git(service_type),
+                repo_path: normalize_ssh_repo_path(&args[1])?,
+                lfs_operation: None,
+            })
+        }
+        "git-lfs-authenticate" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(
+                    "git-lfs-authenticate requires a repository path and optional operation"
+                        .to_owned(),
+                );
+            }
+            Ok(SshExecRequest {
+                kind: SshExecKind::LfsAuthenticate,
+                repo_path: normalize_ssh_repo_path(&args[1])?,
+                lfs_operation: args.get(2).cloned(),
+            })
+        }
+        "git-lfs-transfer" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(
+                    "git-lfs-transfer requires a repository path and optional operation".to_owned(),
+                );
+            }
+            Ok(SshExecRequest {
+                kind: SshExecKind::LfsTransfer,
+                repo_path: normalize_ssh_repo_path(&args[1])?,
+                lfs_operation: args.get(2).cloned(),
+            })
+        }
+        _ => Err(format!("unsupported SSH git command: {command}")),
+    }
+}
+
+fn normalize_ssh_repo_path(raw: &str) -> Result<PathBuf, String> {
+    if raw.is_empty() {
+        return Err("repository path is empty".to_owned());
+    }
+    Ok(PathBuf::from(raw.strip_suffix(".git").unwrap_or(raw)))
+}
+
+fn split_ssh_exec_args(input: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut in_arg = false;
+
+    for ch in input.trim().chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            in_arg = true;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            in_arg = true;
+            continue;
+        }
+
+        match quote {
+            Some(q) if ch == q => {
+                quote = None;
+                in_arg = true;
+            }
+            Some(_) => {
+                current.push(ch);
+                in_arg = true;
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                in_arg = true;
+            }
+            None if ch.is_ascii_whitespace() => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                in_arg = true;
+            }
+        }
+    }
+
+    if escaped {
+        return Err("dangling escape in SSH exec command".to_owned());
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in SSH exec command".to_owned());
+    }
+    if in_arg {
+        args.push(current);
+    }
+
+    Ok(args)
+}
+
 impl SshServer {
     async fn handle_upload_pack(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) {
         let smart_protocol = self.smart_protocol.as_mut().unwrap();
@@ -261,5 +405,59 @@ impl SshServer {
 
         tracing::info!("report status: {:?}", report_status);
         session.data(channel, report_status.to_vec()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_git_exec_accepts_quoted_repo_path_with_spaces() {
+        let parsed = parse_ssh_exec_request("git-upload-pack '/srv/git/project repo.git'").unwrap();
+
+        assert_eq!(parsed.kind, SshExecKind::Git(ServiceType::UploadPack));
+        assert_eq!(parsed.repo_path, PathBuf::from("/srv/git/project repo"));
+        assert_eq!(parsed.lfs_operation, None);
+    }
+
+    #[test]
+    fn parse_git_exec_strips_only_trailing_git_suffix() {
+        let parsed = parse_ssh_exec_request("git-receive-pack '/srv/git.git/project.git'").unwrap();
+
+        assert_eq!(parsed.kind, SshExecKind::Git(ServiceType::ReceivePack));
+        assert_eq!(parsed.repo_path, PathBuf::from("/srv/git.git/project"));
+    }
+
+    #[test]
+    fn parse_lfs_authenticate_keeps_operation() {
+        let parsed =
+            parse_ssh_exec_request("git-lfs-authenticate \"/srv/git/project.git\" download")
+                .unwrap();
+
+        assert_eq!(parsed.kind, SshExecKind::LfsAuthenticate);
+        assert_eq!(parsed.repo_path, PathBuf::from("/srv/git/project"));
+        assert_eq!(parsed.lfs_operation.as_deref(), Some("download"));
+    }
+
+    #[test]
+    fn parse_git_exec_rejects_missing_path() {
+        let err = parse_ssh_exec_request("git-upload-pack").unwrap_err();
+
+        assert!(err.contains("requires exactly one repository path"));
+    }
+
+    #[test]
+    fn parse_git_exec_rejects_unsupported_command_without_fallback() {
+        let err = parse_ssh_exec_request("git-upload-archive '/srv/git/project.git'").unwrap_err();
+
+        assert!(err.contains("unsupported SSH git command"));
+    }
+
+    #[test]
+    fn parse_git_exec_rejects_unterminated_quote() {
+        let err = parse_ssh_exec_request("git-upload-pack '/srv/git/project.git").unwrap_err();
+
+        assert!(err.contains("unterminated quote"));
     }
 }
