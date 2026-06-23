@@ -985,9 +985,20 @@ fn collect_value_field_paths(prefix: &str, value: &Value, fields: &mut BTreeSet<
                 collect_value_field_paths(&join_field_path(prefix, field), child, fields);
             }
         }
-        Value::Array(_) => {
+        Value::Array(items) => {
             if is_effective_source_field_path(prefix) {
                 fields.insert(prefix.to_string());
+            }
+            for (index, item) in items.iter().enumerate() {
+                if let Value::Table(item_table) = item {
+                    for (field, child) in item_table {
+                        collect_value_field_paths(
+                            &format!("{prefix}[{index}].{field}"),
+                            child,
+                            fields,
+                        );
+                    }
+                }
             }
         }
         _ => {
@@ -1060,7 +1071,9 @@ fn is_array_source_field_path(field_path: &str) -> bool {
     matches!(
         field_path,
         "monorepo.admin" | "monorepo.root_dirs" | "sidebar.default_items"
-    )
+    ) || field_path.starts_with("monorepo.admin[")
+        || field_path.starts_with("monorepo.root_dirs[")
+        || field_path.starts_with("sidebar.default_items[")
 }
 
 fn is_sensitive_source_field_path(field_path: &str) -> bool {
@@ -1149,6 +1162,9 @@ fn is_known_field_path(field_path: &str) -> bool {
     let mut parts = field_path.split('.').peekable();
 
     while let Some(field) = parts.next() {
+        // Strip array indices like `default_items[0]` down to `default_items`
+        // so that per-element source diagnostics can be schema-checked.
+        let field = field.split('[').next().unwrap_or(field);
         let Some(allowed_fields) = known_fields(&schema_path) else {
             return false;
         };
@@ -2472,6 +2488,71 @@ mod tests {
         assert!(!source_text.contains("config/prod/mail/password"));
         assert!(!source_text.contains("#value"));
         assert!(!source_text.contains("plain-text-password"));
+    }
+
+    #[test]
+    fn source_diagnostics_collects_array_element_field_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [sidebar]
+            default_items = [
+                { public_id = "home", label = "Home", href = "/posts", visible = true, order_index = 0 },
+            ]
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [sidebar]
+            default_items = [
+                { public_id = "home", label = "Home", href = "/prod", visible = true, order_index = 0 },
+                { public_id = "chat", label = "Chat", href = "/chat", visible = true, order_index = 1 },
+            ]
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys::<_, &str>(
+            Some(&config_path),
+            Some(&profile_path),
+            [],
+        )
+        .expect("diagnostics should collect");
+
+        let fields = diagnostics
+            .source_fields
+            .iter()
+            .map(|source_field| source_field.field_path.as_str())
+            .collect::<Vec<_>>();
+        let overrides = diagnostics
+            .source_overrides
+            .iter()
+            .map(|source_override| source_override.field_path.as_str())
+            .collect::<Vec<_>>();
+
+        // Per-element paths are now reported in addition to the whole-array path.
+        assert!(fields.contains(&"sidebar.default_items[0].public_id"));
+        assert!(fields.contains(&"sidebar.default_items[0].label"));
+        assert!(fields.contains(&"sidebar.default_items[0].href"));
+        assert!(fields.contains(&"sidebar.default_items[1].public_id"));
+        assert!(fields.contains(&"sidebar.default_items[1].href"));
+        assert!(fields.contains(&"sidebar.default_items"));
+
+        // The first element's href is overridden by the profile.
+        assert!(overrides.contains(&"sidebar.default_items[0].href"));
+
+        // Array-replace note applies to element paths too.
+        assert!(diagnostics.source_overrides.iter().any(|source_override| {
+            source_override.field_path == "sidebar.default_items[0].href"
+                && source_override
+                    .message
+                    .contains("arrays replace lower-precedence values rather than append")
+        }));
     }
 
     #[test]
