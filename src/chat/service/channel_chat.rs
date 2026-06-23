@@ -7,7 +7,7 @@
 //! - add/remove members with update record + count adjust
 //! - mark read/unread (delegates to storage, unread sets flag)
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     callisto::{channel, message},
@@ -20,6 +20,38 @@ use crate::{
         channel_storage::ChannelStorage, message_storage::MessageStorage,
     },
 };
+
+fn is_mention_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+fn extract_mentioned_usernames(content: &str) -> HashSet<String> {
+    let bytes = content.as_bytes();
+    let mut mentions = HashSet::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'@' || (cursor > 0 && is_mention_char(bytes[cursor.saturating_sub(1)]))
+        {
+            cursor += 1;
+            continue;
+        }
+
+        let start = cursor + 1;
+        let mut end = start;
+        while end < bytes.len() && is_mention_char(bytes[end]) {
+            end += 1;
+        }
+        if end > start
+            && let Ok(username) = std::str::from_utf8(&bytes[start..end])
+        {
+            mentions.insert(username.to_owned());
+        }
+        cursor = end.max(cursor + 1);
+    }
+
+    mentions
+}
 
 /// Service facade for channel-based chat (the main capability in this migration).
 #[derive(Clone)]
@@ -230,6 +262,11 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .set_latest_message(ch.id, Some(msg.id), msg.created_at)
             .await?;
 
+        let mut notification_recipients = extract_mentioned_usernames(&msg.content);
+        if let Some(sender) = &sender_username {
+            notification_recipients.remove(sender);
+        }
+
         if let Some(reply_message_id) = reply_to_id
             && let Some(reply_message) = self
                 .message_storage
@@ -237,14 +274,18 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
                 .await?
             && let Some(recipient) = reply_message.sender_username
             && sender_username.as_deref() != Some(recipient.as_str())
-            && let Some(membership) = self
-                .membership_storage
-                .get_membership(ch.id, &recipient)
-                .await?
         {
-            self.message_storage
-                .create_message_notification(membership.id, msg.id)
-                .await?;
+            notification_recipients.insert(recipient);
+        }
+
+        if !notification_recipients.is_empty() {
+            for membership in self.membership_storage.list_members(ch.id).await? {
+                if notification_recipients.contains(&membership.username) {
+                    self.message_storage
+                        .create_message_notification(membership.id, msg.id)
+                        .await?;
+                }
+            }
         }
 
         // Event
@@ -519,6 +560,30 @@ mod tests {
             alice_membership.id
         );
 
+        let mention = svc
+            .send_message(
+                &ch.public_id,
+                "bob".to_string(),
+                "ping @alice @bob @charlie".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("send mention");
+        let mention_notifications = svc
+            .message_storage
+            .get_message_notifications_by_message_id(mention.id)
+            .await
+            .expect("query mention notifications");
+        assert_eq!(mention_notifications.len(), 1);
+        assert_eq!(
+            mention_notifications[0].channel_membership_id,
+            alice_membership.id
+        );
+        svc.delete_message(&ch.public_id, &mention.public_id, "bob")
+            .await
+            .expect("delete mention");
+
         // Non-member cannot send (404)
         let not_member = svc
             .send_message(
@@ -569,6 +634,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(final_ch.latest_message_id.is_none());
+    }
+
+    #[test]
+    fn extracts_mentions_on_token_boundaries() {
+        let mentions = extract_mentioned_usernames("hi @alice, email a@b no @bob-smith @carol.dev");
+
+        assert!(mentions.contains("alice"));
+        assert!(mentions.contains("bob-smith"));
+        assert!(mentions.contains("carol.dev"));
+        assert!(!mentions.contains("b"));
     }
 }
 
