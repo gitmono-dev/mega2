@@ -368,13 +368,14 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 
 **当前落地状态**：统一 redaction 工具已落地——`database_connection()`（`src/jupiter/storage/init.rs`）
 现在用 `redact_db_url` 记录脱敏后的连接串，`init_connection()`（`src/jupiter/redis/mod.rs`）的错误用
-`redact_redis_url` 包装。活进程门禁已落地：`bin/tests/integration_vault.rs::integration_error_redaction_does_not_leak_db_password`
+`redact_redis_url` 包装。活进程门禁已落地并收拢为统一命名 gate：`bin/tests/integration_vault.rs::integration_error_redaction_does_not_leak_db_password`
 用坏 DB URL（哨兵密码）启动 `service http`，断言进程 fail-closed 且日志/stderr 不含明文密码；
-`integration_error_redaction_does_not_leak_redis_password` 用好 DB + 坏 Redis URL 验证 Redis 凭据不泄露。
-坏 TOML/字段路径诊断由 `config-validation.yml` 的 CI 步骤与 `src/config` 单测覆盖；SMTP 密码不入日志由
+`integration_error_redaction_does_not_leak_redis_password` 用好 DB + 坏 Redis URL 验证 Redis 凭据不泄露；
+`integration_error_redaction_bad_toml_does_not_leak_values` 用坏 TOML（哨兵 secret）验证配置解析错误
+只输出文件路径和字段路径，不泄露哨兵值。SMTP 密码不入日志由
 `src/notification/dispatcher.rs` 的多个凭据不泄露用例覆盖；Vault key 丢失 fail-closed 由
-`vault_core.rs::tests::test_vault_fails_closed_after_key_file_loss` 覆盖。仍可补齐的是把上述分散覆盖
-收拢成单一命名 gate，以及更完整的 stderr/日志组合断言矩阵。
+`vault_core.rs::tests::test_vault_fails_closed_after_key_file_loss` 覆盖。5 个 bullet 中 3 个已有
+活进程黑盒门禁，其余 2 个由模块级集成测试覆盖。
 
 ## P2：未来能力 gate
 

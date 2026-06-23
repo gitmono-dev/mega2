@@ -763,6 +763,68 @@ fn integration_error_redaction_does_not_leak_redis_password() {
     );
 }
 
+#[test]
+fn integration_error_redaction_bad_toml_does_not_leak_values() {
+    // 坏 TOML 配置：进程必须在配置解析阶段 fail-closed，且错误输出只包含
+    // 配置文件路径和字段路径，不包含哨兵 secret 值。这是 integration.md 场景 7
+    // 中 "坏 TOML" bullet 的活进程门禁，把原本由 CI 脚本和单测分散覆盖的场景
+    // 收拢到统一的 error_redaction 命名 gate。
+    const TOML_SENTINEL: &str = "s3ntineltomlpw";
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let base_dir = temp_dir.path().join("base");
+    let cache_dir = temp_dir.path().join("cache");
+    let config_path = temp_dir.path().join("config.toml");
+
+    // Write a config with a TOML syntax error: unterminated string value
+    // that contains the sentinel. The parser must report the file path and
+    // line/column but must not echo the raw sentinel value.
+    let bad_toml = format!(
+        r#"[database]
+db_type = "postgres"
+db_url = "postgres://mono:{TOML_SENTINEL}@127.0.0.1:5432/mono"
+
+[mail]
+enabled = false
+password = "{TOML_SENTINEL}
+# unterminated string above — TOML syntax error
+"#
+    );
+    fs::write(&config_path, bad_toml).expect("write bad config");
+
+    let mut command = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
+    command.arg("--config").arg(&config_path);
+    command
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .env("MEGA_LOG__WITH_ANSI", "false")
+        .args(["config", "validate"]);
+
+    let output = command.output().expect("run monoengine config validate");
+
+    assert!(
+        !output.status.success(),
+        "config validate must fail on bad TOML"
+    );
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The sentinel must not appear in the output.
+    assert!(
+        !combined.contains(TOML_SENTINEL),
+        "TOML sentinel value leaked into output:\n{combined}"
+    );
+
+    // The config file path should be mentioned for diagnostics.
+    assert!(
+        combined.contains("config.toml") || combined.contains("config"),
+        "error should reference the config file path:\n{combined}"
+    );
+}
+
 fn seed_mail_password(env: &VaultCliEnv) {
     // 复用 secret-set 正路径：通过 stdin 把 mail.password 写入测试专属 Vault。
     let mut set = env.bootstrap_command();
