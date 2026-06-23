@@ -21,8 +21,8 @@
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
 | Chat 模块入口 | 已实现主干 | `src/chat/` 下已有 domain/engine/service；仍需继续清理文档中的旧 slice 叙述。 |
-| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验；仍缺产品级 MIME allowlist、对象归属复核和链接预览抓取。 |
-| Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入，rich-text mention 解析和外部投递仍未实现。 |
+| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验；custom_reactions 已补 `lower(name)` 唯一索引和应用层 lowercase；reactions 已改为 `WHERE discarded_at IS NULL` 部分唯一索引；仍缺产品级 MIME allowlist、对象归属复核和链接预览抓取。 |
+| Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入，rich-text mention 解析和外部投递仍未实现；channels/channel_memberships/channel_membership_updates/messages/message_notifications 的完整索引集和 `message_notifications` 唯一约束已补齐。 |
 | HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
 | 实时事件 | 进程内 broadcaster 已实现 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；`InMemoryChatEvents` 已提供 tokio broadcast 订阅能力并覆盖 service mutation 事件。WebSocket/Pusher 兼容网关仍未实现。 |
 | 数据迁移工具 | 初步 CLI | `src/commands/chat_migrate.rs` 存在；仍需真实源库导入、用户映射、校验报告和脱敏 fixture 覆盖。 |

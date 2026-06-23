@@ -35,7 +35,7 @@ impl CustomReactionStorage {
         let active_model = custom_reaction::ActiveModel {
             id: Set(IdInstance::next_id()),
             public_id: Set(public_id),
-            name: Set(name),
+            name: Set(name.to_lowercase()),
             file_path: Set(file_path),
             file_type: Set(file_type),
             username: Set(username),
@@ -52,7 +52,7 @@ impl CustomReactionStorage {
         name: &str,
     ) -> Result<Option<custom_reaction::Model>, MegaError> {
         let model = custom_reaction::Entity::find()
-            .filter(custom_reaction::Column::Name.eq(name))
+            .filter(custom_reaction::Column::Name.eq(name.to_lowercase()))
             .one(self.get_connection())
             .await?;
         Ok(model)
