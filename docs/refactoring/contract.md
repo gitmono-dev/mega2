@@ -24,6 +24,8 @@
 | `contract::vault` | 已激活 | 承载 VaultCore 与消费端 helper；安全加固阶段仍按 `vault.md` 推进。 |
 | `contract::policy` | 已激活 | 承载 Cedar context/entitystore/reviewer parser/admin resolver/API guard。 |
 | 旧路径兼容层 | 未实现 | 本次迁移明确不提供 re-export，调用方必须使用新路径。 |
+| 阶段 1 文档同步 | 已完成（2026-06-23） | `docs/refactoring` 内旧源码路径仅出现在历史映射/说明段落；`protocol.md` 与 `vault.md` 路径已同步。 |
+| 阶段 2 常规门禁 | 已完成（2026-06-23） | `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全部通过。 |
 
 ## 硬约束与不可违反的原则
 
@@ -64,15 +66,15 @@
 > **验收标准**：
 > - `docs/refactoring` 中旧源码路径仅允许出现在明确的历史路径映射段落。
 
-**阶段 2 — 常规门禁**
+**阶段 2 — 常规门禁（已完成，2026-06-23）**
 
 1. 运行格式、clippy、测试三道门禁。
 2. 若发现路径迁移引出的 warning，优先修正代码，不添加 blanket allow。
 
 > **验收标准**：
-> - `cargo +nightly fmt --all --check`
-> - `cargo clippy --all-targets --all-features -- -D warnings`
-> - `source .env.test && cargo test --all`
+> - `cargo +nightly fmt --all --check` ✅ 通过
+> - `cargo clippy --all-targets --all-features -- -D warnings` ✅ 通过
+> - `source .env.test && cargo test --all` ✅ 通过（集成测试 9 + 单元测试 561）
 
 ## 前置依赖矩阵
 
