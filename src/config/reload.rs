@@ -475,14 +475,10 @@ fn apply_mail_changes(
         (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("mail"),
         (Some(current), Some(candidate)) => {
             if current.enabled != candidate.enabled {
-                if current.enabled && !candidate.enabled {
-                    if let Some(next) = next {
-                        next.enabled = false;
-                    }
-                    report.applied_fields.push("mail.enabled");
-                } else {
-                    report.restart_required_fields.push("mail.enabled");
+                if let Some(next) = next {
+                    next.enabled = candidate.enabled;
                 }
+                report.applied_fields.push("mail.enabled");
             }
             if current.dispatcher_batch_size != candidate.dispatcher_batch_size {
                 if let Some(next) = next {
@@ -1508,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_reports_mail_enable_requires_restart_without_publishing_snapshot() {
+    fn reload_applies_mail_enable_without_restart() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut current = isolated_config(temp_dir.path().join("current"));
         current.mail = Some(mail_config(false));
@@ -1520,11 +1516,11 @@ mod tests {
         let report = handle.reload(candidate).expect("reload should succeed");
         let snapshot = handle.snapshot().expect("snapshot after reload");
 
-        assert!(report.applied_fields.is_empty());
-        assert_eq!(report.restart_required_fields, vec!["mail.enabled"]);
-        assert!(!report.applied());
-        assert!(report.requires_restart());
-        assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
+        assert_eq!(report.applied_fields, vec!["mail.enabled"]);
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert!(snapshot.mail.as_ref().expect("mail config").enabled);
     }
 
     #[test]

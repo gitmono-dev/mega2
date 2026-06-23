@@ -135,6 +135,7 @@ impl NotificationService {
 
 /// Mail fields whose change requires rebuilding the SMTP mailer at runtime.
 const MAILER_REBUILD_FIELDS: &[&str] = &[
+    "mail.enabled",
     "mail.provider",
     "mail.smtp_host",
     "mail.smtp_port",
@@ -184,6 +185,11 @@ fn apply_mailer_rebuild(
     let Some(mail) = config.mail.clone() else {
         return Ok(());
     };
+    if !mail.enabled {
+        // A disabled mail section uses the NoopMailer installed at startup. Do
+        // not rebuild (and possibly fail) while mail is off.
+        return Ok(());
+    }
 
     let handle = Arc::clone(mailer_handle);
     let vault = vault.clone();
@@ -286,6 +292,54 @@ mod tests {
         assert_eq!(service.channels().len(), 2);
         assert!(service.channel_for("email").is_some());
         assert!(service.channel_for("in_app").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn mailer_rebuild_subscriber_swaps_noop_when_mail_re_enabled() {
+        use arc_swap::ArcSwap;
+
+        use crate::{
+            config::{MailProvider, testing::isolated_config},
+            jupiter::tests::test_storage,
+            mail::NoopMailer,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = test_storage(temp_dir.path()).await;
+        let key_path = temp_dir.path().join("core_key.json");
+        let vault = VaultCore::config(storage.vault_storage(), key_path)
+            .await
+            .expect("vault should initialize");
+        let handle: MailerHandle =
+            Arc::new(ArcSwap::from_pointee(MailerSlot(Arc::new(NoopMailer))));
+        let original = handle.load().0.clone();
+
+        let mut config = isolated_config(temp_dir.path().join("cfg"));
+        config.mail = Some(MailConfig {
+            enabled: true,
+            provider: MailProvider::Console,
+            ..Default::default()
+        });
+        let mut report = ConfigReloadReport::default();
+        report.applied_fields.push("mail.enabled");
+
+        apply_mailer_rebuild(&handle, &vault, &config, &report).expect("apply should succeed");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let swapped = loop {
+            let current = handle.load().0.clone();
+            if !Arc::ptr_eq(&current, &original) {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            swapped,
+            "NoopMailer should be replaced after mail is re-enabled"
+        );
     }
 
     #[tokio::test]

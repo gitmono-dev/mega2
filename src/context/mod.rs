@@ -81,7 +81,12 @@ impl AppContext {
             config_handle
                 .subscribe(crate::notification::config_reload_mail_template_subscriber())?;
 
-            if mail_cfg.enabled {
+            // Always construct the notification service when mail is configured,
+            // even if mail.enabled is false at startup. The dispatcher runs with
+            // control.enabled=false and a NoopMailer, so a later reload that sets
+            // mail.enabled=true can re-enable mail without a process restart
+            // (docs/mail.md phase 4: runtime re-enable).
+            let mailer_for_startup: Arc<dyn crate::mail::Mailer> = if mail_cfg.enabled {
                 let resolved_password = if mail_cfg.provider == crate::config::MailProvider::Smtp
                     && let Some(secret_ref) = &mail_cfg.password_ref
                 {
@@ -91,41 +96,41 @@ impl AppContext {
                 } else {
                     None
                 };
-                let mailer: Arc<dyn crate::mail::Mailer> =
-                    crate::mail::mailer_from_config(mail_cfg, resolved_password).map_err(|e| {
-                        MegaError::Other(format!("mail initialization failed: {e}"))
-                    })?;
-                let notif_stg = storage.notification_storage();
-                let service = crate::notification::NotificationService::from_mail_config(
-                    notif_stg, mailer, mail_cfg,
-                );
-                // Honor the global notification kill switch at startup; the
-                // dispatcher still spawns so a later reload can re-enable it.
-                let notification_globally_enabled = config
-                    .notification
-                    .as_ref()
-                    .map(|notification| notification.enabled)
-                    .unwrap_or(true);
-                if !notification_globally_enabled {
-                    service.control().set_enabled(false);
-                }
-                config_handle.subscribe(
-                    crate::notification::config_reload_email_dispatcher_subscriber(
-                        service.control(),
-                    ),
-                )?;
-                // Hot-rebuild the SMTP mailer when connection/credential fields
-                // change (async rebuild re-resolves password_ref post-vault;
-                // docs/mail.md phase 4).
-                config_handle.subscribe(crate::notification::config_reload_mailer_subscriber(
-                    service.email_mailer_handle(),
-                    vault.clone(),
-                ))?;
-                let sd = notification_shutdown.clone();
-                tokio::spawn(async move {
-                    service.start(sd).await;
-                });
-            }
+                crate::mail::mailer_from_config(mail_cfg, resolved_password)
+                    .map_err(|e| MegaError::Other(format!("mail initialization failed: {e}")))?
+            } else {
+                Arc::new(crate::mail::NoopMailer)
+            };
+            let notif_stg = storage.notification_storage();
+            let service = crate::notification::NotificationService::from_mail_config(
+                notif_stg,
+                mailer_for_startup,
+                mail_cfg,
+            );
+            // Honor the global notification kill switch at startup; a later
+            // reload can re-enable both mail and notifications without restart.
+            let notification_globally_enabled = config
+                .notification
+                .as_ref()
+                .map(|notification| notification.enabled)
+                .unwrap_or(true);
+            service
+                .control()
+                .set_enabled(mail_cfg.enabled && notification_globally_enabled);
+            config_handle.subscribe(
+                crate::notification::config_reload_email_dispatcher_subscriber(service.control()),
+            )?;
+            // Hot-rebuild the SMTP mailer when connection/credential fields
+            // change, or when mail is re-enabled at runtime (async rebuild
+            // re-resolves password_ref post-vault; docs/mail.md phase 4).
+            config_handle.subscribe(crate::notification::config_reload_mailer_subscriber(
+                service.email_mailer_handle(),
+                vault.clone(),
+            ))?;
+            let sd = notification_shutdown.clone();
+            tokio::spawn(async move {
+                service.start(sd).await;
+            });
         }
 
         storage.mono_service.init_monorepo(&config.monorepo).await?;
