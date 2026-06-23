@@ -140,6 +140,27 @@ impl SharedChatService {
             return Err(MegaError::Other("Only reaction owner can delete".into()));
         }
 
+        // Verify the caller is still a current member of the channel that owns
+        // the reacted message. A removed member must not be able to mutate
+        // reactions even if they originally created them.
+        if reaction.subject_type == "Message"
+            && let Some(msg) = self
+                .message_storage
+                .get_message_by_id(reaction.subject_id)
+                .await?
+        {
+            let mem = self
+                .membership_storage
+                .get_membership(msg.channel_id, username)
+                .await?;
+            if mem.is_none() {
+                return Err(MegaError::NotFound(format!(
+                    "Reaction {} not found",
+                    reaction_public_id
+                )));
+            }
+        }
+
         self.reaction_storage
             .soft_delete_reaction(reaction_public_id)
             .await?;
@@ -193,5 +214,68 @@ impl SharedChatService {
             .await?;
 
         Ok(att)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{chat::service::channel_chat::ChannelChatService, jupiter::tests::test_storage};
+
+    #[tokio::test]
+    async fn delete_reaction_rejects_removed_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+
+        let channel_svc = ChannelChatService::from_storage(&storage);
+        let shared_svc = SharedChatService::from_storage(&storage);
+
+        // alice creates a channel with bob as a member and sends a message.
+        let (ch, first_msg) = channel_svc
+            .create_channel(
+                Some("Reaction Test".to_string()),
+                None,
+                "alice".to_string(),
+                vec!["bob".to_string()],
+                true,
+                Some("hello".to_string()),
+                None,
+            )
+            .await
+            .expect("create channel");
+        let msg = first_msg.expect("initial message");
+
+        // bob reacts to alice's message.
+        let reaction = shared_svc
+            .create_reaction(
+                &msg.public_id,
+                "bob".to_string(),
+                Some("+1".to_string()),
+                None,
+            )
+            .await
+            .expect("create reaction");
+
+        // alice removes bob from the channel.
+        channel_svc
+            .remove_members(&ch.public_id, "alice", vec!["bob".to_string()])
+            .await
+            .expect("remove bob");
+
+        // bob tries to delete his reaction — must be rejected (NotFound).
+        let result = shared_svc.delete_reaction(&reaction.public_id, "bob").await;
+        assert!(
+            matches!(result, Err(MegaError::NotFound(_))),
+            "removed member should not be able to delete reaction"
+        );
+
+        // alice (still a member) cannot delete bob's reaction (not owner).
+        let result = shared_svc
+            .delete_reaction(&reaction.public_id, "alice")
+            .await;
+        assert!(
+            matches!(result, Err(MegaError::Other(_))),
+            "non-owner member should not be able to delete reaction"
+        );
     }
 }
