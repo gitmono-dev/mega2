@@ -56,7 +56,7 @@
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
-| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；response builder / in-memory reader、更多 repo handler 内部路径仍有 `unwrap()`/panic 待收敛。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23）；response builder / in-memory reader、`repo.rs` path 转换等剩余路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
 
@@ -661,6 +661,25 @@ LFS:
 
 - advertise 的每个 capability 都有 parse/act-on/test 证据。
 - 标准 Git 客户端不会因为误导性 capability 进入未实现路径。
+
+#### Capability Truth Table（2026-06-23 建立）
+
+| Capability | Advertised? | Parsed? | Acted On? | Tested? | 说明 |
+|---|---|---|---|---|---|
+| `report-status` | ✅ receive-pack | ✅ | ✅ 生成 `unpack ok` + per-ref status | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` | 基础 report-status v1 语义 |
+| `side-band-64k` | ✅ both | ✅ | ✅ `build_side_band_format` | ✅ 侧带构造有单测 | pack data 通过 side-band 传输 |
+| `ofs-delta` | ✅ both | ✅ | ⚠️ 识别但未完整验证 OFS_DELTA 编解码 | ❌ 需补完整 OFS_DELTA truth table | pack encode/decode 需测试矩阵 |
+| `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
+| `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
+| `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
+| `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
+| `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
+| `delete-refs` | ❌ 已移除 | ❌ | ❌ | N/A | delete-only push 不稳健，已从 advertise 移除 |
+| `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
+| `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
+| `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
+
+残余风险：`ofs-delta` 被 advertise 但 OFS_DELTA 编解码未完整测试；后续需补 truth table 覆盖或暂时移除。
 
 ### 阶段 4：认证与授权统一
 

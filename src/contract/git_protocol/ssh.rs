@@ -158,13 +158,22 @@ impl server::Handler for SshServer {
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
 
         tracing::info!("auth_publickey: {} / {}", user, fingerprint);
-        let res = self
+        let res = match self
             .state
             .storage
             .user_storage()
             .search_ssh_key_finger(&fingerprint)
             .await
-            .unwrap();
+        {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!(error = %e, "SSH key DB lookup failed");
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                });
+            }
+        };
         if !res.is_empty() {
             tracing::info!("Client public key verified successfully!");
             Ok(Auth::Accept)
@@ -183,7 +192,10 @@ impl server::Handler for SshServer {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let smart_protocol = self.smart_protocol.as_mut().unwrap();
+        let Some(smart_protocol) = self.smart_protocol.as_mut() else {
+            tracing::warn!("data received before exec request initialized smart protocol");
+            return Ok(());
+        };
         tracing::info!(
             "receiving data length:{}",
             // String::from_utf8_lossy(data),
@@ -339,36 +351,52 @@ fn split_ssh_exec_args(input: &str) -> Result<Vec<String>, String> {
 
 impl SshServer {
     async fn handle_upload_pack(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) {
-        let smart_protocol = self.smart_protocol.as_mut().unwrap();
-
-        let (mut send_pack_data, buf) = smart_protocol
+        let Some(smart_protocol) = self.smart_protocol.as_mut() else {
+            tracing::warn!("upload-pack handler called without smart protocol");
+            return;
+        };
+        let (mut send_pack_data, buf) = match smart_protocol
             .git_upload_pack(&self.state, &mut Bytes::copy_from_slice(data))
             .await
-            .unwrap();
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!(error = %e, "upload-pack protocol error");
+                let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                return;
+            }
+        };
 
         tracing::info!("buf is {:?}", buf);
-        session.data(channel, buf.to_vec()).unwrap();
+        let _ = session.data(channel, buf.to_vec());
 
         while let Some(chunk) = send_pack_data.next().await {
             let mut reader = chunk.as_slice();
             loop {
                 let mut temp = BytesMut::new();
                 temp.reserve(65500);
-                let length = reader.read_buf(&mut temp).await.unwrap();
+                let length = match reader.read_buf(&mut temp).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = %e, "read error in upload-pack stream");
+                        break;
+                    }
+                };
                 if length == 0 {
                     break;
                 }
                 let bytes_out = smart_protocol.build_side_band_format(temp, length);
-                session.data(channel, bytes_out.to_vec()).unwrap();
+                let _ = session.data(channel, bytes_out.to_vec());
             }
         }
-        session
-            .data(channel, smart::PKT_LINE_END_MARKER.to_vec())
-            .unwrap();
+        let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
     }
 
     async fn handle_receive_pack(&mut self, channel: ChannelId, session: &mut Session) {
-        let smart_protocol = self.smart_protocol.as_mut().unwrap();
+        let Some(smart_protocol) = self.smart_protocol.as_mut() else {
+            tracing::warn!("receive-pack handler called without smart protocol");
+            return;
+        };
         let data = self.data_combined.split().freeze();
         let (commands, pack_bytes) = match smart_protocol.split_receive_pack_request(data) {
             Ok(split) => split,
@@ -379,13 +407,20 @@ impl SshServer {
             }
         };
         let pack_stream = stream::once(async { Ok(pack_bytes) });
-        let report_status = smart_protocol
+        let report_status = match smart_protocol
             .git_receive_pack_stream(&self.state, commands, Box::pin(pack_stream))
             .await
-            .unwrap();
+        {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::error!(error = %e, "receive-pack protocol error");
+                let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                return;
+            }
+        };
 
         tracing::info!("report status: {:?}", report_status);
-        session.data(channel, report_status.to_vec()).unwrap();
+        let _ = session.data(channel, report_status.to_vec());
     }
 }
 
