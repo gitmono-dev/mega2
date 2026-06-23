@@ -27,6 +27,8 @@
 > - 仍未完成：SSH 多 channel state 仍未改为 per-channel；capability advertise 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
 >
 > **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
+>
+> **2026-06-23 更新 5**：HTTP upload-pack request body 聚合不再对 body stream 错误 `unwrap()`，已与 receive-pack 统一经 `ProtocolError::InvalidInput` 返回。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -52,7 +54,7 @@
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
-| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；stream chunk 与更多 repo handler 内部路径仍有 `unwrap()`/panic 待收敛。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；response builder / in-memory reader、更多 repo handler 内部路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
 
@@ -331,11 +333,11 @@ let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
 
 ### HTTP upload-pack 会一次性读取完整请求体
 
-`git_upload_pack` 当前通过 `try_fold(BytesMut::new())` 把整个 request body 读入内存。fetch 请求通常较小，但 protocol v0 negotiation 在复杂仓库和大量 `have` 场景下仍可能较大。
+`git_upload_pack` 当前通过 `try_fold(BytesMut::new())` 把整个 request body 读入内存。fetch 请求通常较小，但 protocol v0 negotiation 在复杂仓库和大量 `have` 场景下仍可能较大。body stream 读取错误已统一映射为 `ProtocolError::InvalidInput`，不再 panic。
 
 建议：
 
-- 短期增加 body size 上限和错误处理，避免异常客户端导致内存放大。
+- 短期增加 body size 上限，避免异常客户端导致内存放大。
 - 中期将 upload-pack negotiation 改为 streaming pkt-line reader，而不是一次性聚合 body。
 - 为 `read_pkt_line` 增加可诊断错误，避免 malformed pkt-line panic。
 

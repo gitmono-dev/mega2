@@ -110,6 +110,18 @@ async fn git_receive_pack_auth(
     Ok(true)
 }
 
+async fn collect_body_data(body: Body, operation: &str) -> Result<BytesMut, ProtocolError> {
+    body.into_data_stream()
+        .try_fold(BytesMut::new(), |mut acc, chunk| async move {
+            acc.extend_from_slice(&chunk);
+            Ok(acc)
+        })
+        .await
+        .map_err(|err| {
+            ProtocolError::InvalidInput(format!("failed to read {operation} body: {err}"))
+        })
+}
+
 /// # Handles a Git upload pack request and prepares the response.
 ///
 /// The function takes a `req` parameter representing the HTTP request received and a `pack_protocol`
@@ -137,15 +149,7 @@ pub async fn git_upload_pack(
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol =
         SmartSession::new(repo_path, ServiceType::UploadPack, TransportProtocol::Http);
-    let upload_request: BytesMut = req
-        .into_body()
-        .into_data_stream()
-        .try_fold(BytesMut::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await
-        .unwrap();
+    let upload_request = collect_body_data(req.into_body(), "upload-pack").await?;
     tracing::debug!("Receive bytes: <-------- {:?}", upload_request);
     let (mut send_pack_data, protocol_buf) = pack_protocol
         .git_upload_pack(state, &mut upload_request.freeze())
@@ -207,17 +211,7 @@ pub async fn git_receive_pack(
     if !git_receive_pack_auth(state, &mut pack_protocol, req.headers()).await? {
         return auth_failed();
     }
-    let receive_request: BytesMut = req
-        .into_body()
-        .into_data_stream()
-        .try_fold(BytesMut::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await
-        .map_err(|err| {
-            ProtocolError::InvalidInput(format!("failed to read receive-pack body: {err}"))
-        })?;
+    let receive_request = collect_body_data(req.into_body(), "receive-pack").await?;
 
     let (commands, pack_bytes) =
         pack_protocol.split_receive_pack_request(receive_request.freeze())?;
@@ -251,4 +245,20 @@ fn add_default_header<T>(content_type: String, mut response: Response<T>) -> Res
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_body_data_maps_stream_errors_to_protocol_error() {
+        let body = Body::from_stream(stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::other("boom"))
+        }));
+
+        let err = collect_body_data(body, "upload-pack")
+            .await
+            .expect_err("body stream error should be mapped");
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("failed to read upload-pack body"));
+    }
+}
