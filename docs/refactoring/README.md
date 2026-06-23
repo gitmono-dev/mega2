@@ -391,6 +391,6 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 
 ## 📝 最后一次更新
 
-- **日期**：2026-06-14（2026-06-19 新增 refactoring/orbit.md）
-- **更新内容**：新增前置依赖说明、清晰的执行顺序、跨模块协调点；2026-06-19 新增 orbit 依赖重构计划（项目引用 → API 依赖）
-- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md、refactoring/notification.md、refactoring/orbit.md
+- **日期**：2026-06-14（2026-06-19 新增 refactoring/orbit.md；2026-06-23 完成全部在 Scope 内的改进计划并发布 v0.1.49）
+- **更新内容**：新增前置依赖说明、清晰的执行顺序、跨模块协调点；2026-06-19 新增 orbit 依赖重构计划（项目引用 → API 依赖）；2026-06-23 完成 contract/config/vault/mail/notification/integration 全部在 Scope 内的可交付改进，对应版本 v0.1.42 - v0.1.49。
+- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/contract.md
