@@ -1,23 +1,25 @@
 //! Channel abstraction for the notification subsystem.
 //!
 //! [`NotificationChannel`] decouples the delivery mechanism (email today; in-app
-//! inbox, and slack / webhook in future) from the outbox-driven dispatcher.
-//! The `email_jobs` outbox routes to [`EmailChannel`] (primary, retried); the
-//! [`NotificationService`](crate::notification::service::NotificationService)
-//! coordinator registers secondary channels (e.g. [`InAppChannel`]) that the
-//! dispatcher fans each delivered notification out to.
+//! inbox, console dry-run, and slack / webhook in future) from the outbox-driven
+//! dispatcher. The `email_jobs` outbox routes to [`EmailChannel`] (primary, retried);
+//! the [`NotificationService`](crate::notification::service::NotificationService)
+//! coordinator registers secondary channels (e.g. [`InAppChannel`], [`ConsoleChannel`])
+//! that the dispatcher fans each delivered notification out to.
 //!
 //! This is docs/notification.md phase 1/4: a provider-agnostic channel trait
-//! plus a non-email channel ([`InAppChannel`]) proving the abstraction is not
-//! email-specific.
+//! plus non-email channels ([`InAppChannel`], [`ConsoleChannel`]) proving the
+//! abstraction is not email-specific.
 
 use async_trait::async_trait;
 
 use crate::{common::errors::MegaError, mail::MailAttachment};
 
+mod console;
 mod email;
 mod inapp;
 
+pub use console::ConsoleChannel;
 pub use email::{EmailChannel, MailerHandle, MailerSlot};
 pub use inapp::InAppChannel;
 
@@ -25,6 +27,8 @@ pub use inapp::InAppChannel;
 pub const CHANNEL_EMAIL: &str = "email";
 /// Stable identifier for the in-app (inbox) channel.
 pub const CHANNEL_IN_APP: &str = "in_app";
+/// Stable identifier for the console (dry-run) channel.
+pub const CHANNEL_CONSOLE: &str = "console";
 
 /// A channel-agnostic outbound notification message.
 ///

@@ -25,7 +25,10 @@ use crate::{
     jupiter::storage::notification_storage::NotificationStorage,
     mail::{Mailer, mailer_from_config},
     notification::{
-        channels::{EmailChannel, InAppChannel, MailerHandle, MailerSlot, NotificationChannel},
+        channels::{
+            ConsoleChannel, EmailChannel, InAppChannel, MailerHandle, MailerSlot,
+            NotificationChannel,
+        },
         dispatcher::{EmailDispatcher, EmailDispatcherControl},
     },
 };
@@ -109,6 +112,12 @@ impl NotificationService {
             .iter()
             .find(|channel| channel.name() == channel_name)
             .map(Arc::clone)
+    }
+
+    /// Create a [`ConsoleChannel`] as an extra channel for dev/CI dry-run
+    /// delivery. The channel logs a redacted summary without actually sending.
+    pub fn console_channel() -> Arc<dyn NotificationChannel> {
+        Arc::new(ConsoleChannel::new())
     }
 
     /// Start the background delivery loop(s). Consumes `self`; runs until
@@ -234,6 +243,7 @@ mod tests {
         callisto::{email_jobs, notification_event_types},
         jupiter::{migration::apply_migrations, tests::test_db_connection},
         mail::NoopMailer,
+        notification::channels::ConsoleChannel,
     };
 
     #[tokio::test]
@@ -244,17 +254,19 @@ mod tests {
 
         let stg = NotificationStorage::new(Arc::new(db));
         let inbox: Arc<dyn NotificationChannel> = Arc::new(InAppChannel::new(stg.clone()));
+        let console: Arc<dyn NotificationChannel> = Arc::new(ConsoleChannel::new());
         let service = NotificationService::new(
             stg,
             Arc::new(NoopMailer),
             EmailDispatcherControl::new(true),
-            vec![inbox],
+            vec![inbox, console],
         );
 
-        assert_eq!(service.channels().len(), 2);
+        assert_eq!(service.channels().len(), 3);
         assert_eq!(service.channels()[0].name(), "email");
         assert!(service.channel_for("email").is_some());
         assert!(service.channel_for("in_app").is_some());
+        assert!(service.channel_for("console").is_some());
         assert!(service.channel_for("slack").is_none());
     }
 

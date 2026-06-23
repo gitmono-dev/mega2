@@ -255,10 +255,10 @@ Config::new
 - ✅ 引入 `NotificationChannel` trait + `OutboundMessage`（`src/notification/channels/mod.rs`）+ `EmailChannel`（`channels/email.rs`，包裹 `mail::Mailer` + email_jobs outbox 投递）。
 - ✅ 重构 dispatcher 通过 `NotificationChannel` 抽象投递：`EmailDispatcher` 现持有 `Arc<dyn NotificationChannel>`（`new`/`new_with_control` 仍接收 `Arc<dyn Mailer>` 并包成 `EmailChannel`，保持既有 API/测试兼容；新增 `new_with_channel`），`process_email_job` 经 `channel.deliver(&OutboundMessage)` 投递。
 - ✅ 额外渠道原型：`ConsoleChannel`（`channels/console.rs`，脱敏 dry-run 投递），证明抽象与具体 provider 无关。
-- ✅ 引入 `NotificationService`（`src/notification/service.rs`）作为多渠道协调器：持有 `NotificationStorage` + `Vec<Arc<dyn NotificationChannel>>`（email + console 原型）+ `EmailDispatcherControl`，`start(shutdown)` 驱动 email outbox dispatcher，`channels()`/`channel_for(name)`/`control()` 暴露注册表与控制句柄。`AppContext::new` 已改为构造 `NotificationService::from_mail_config` 并 `start`，reload subscriber 仍经 `service.control()` 注册。
+- ✅ 引入 `NotificationService`（`src/notification/service.rs`）作为多渠道协调器：持有 `NotificationStorage` + `Vec<Arc<dyn NotificationChannel>>`（默认 email + in-app；console dry-run 可作为 extra channel 注册）+ `EmailDispatcherControl`，`start(shutdown)` 驱动 email outbox dispatcher 并 fan-out 到 secondary channels，`channels()`/`channel_for(name)`/`control()` 暴露注册表与控制句柄。`AppContext::new` 已改为构造 `NotificationService::from_mail_config` 并 `start`，reload subscriber 仍经 `service.control()` 注册。
 - email 渠道的 `password_ref` 支持已由 config 阶段 5 + mail 阶段 2 落地（resolver 在 `AppContext::new` 中解析）。
 - 验收：渠道注册表可容纳多渠道并按名解析（`service_registers_email_and_extra_channels`）；email outbox 经渠道抽象端到端投递并随 shutdown 停止（`service_start_delivers_email_outbox_then_stops_on_shutdown`，对 Postgres 实跑）。
-- 剩余：email_jobs outbox 目前为 email-only，console 渠道已注册但 idle（路由 seam 已就位）；真实多 outbox/渠道列路由、in-app 持久化渠道与 slack/webhook 凭据渠道仍为后续阶段（阶段 3/4）。
+- 剩余：email_jobs outbox 目前为 email-only；in-app 持久化渠道已作为 secondary channel 注册并在 email 主投递成功后 fan-out，console dry-run 原型可作为 extra channel 注册；真实多 outbox/渠道列路由与 slack/webhook 凭据渠道仍为后续阶段（阶段 3/4）。
 
 **阶段 2（用户偏好 API 表面，完整移植 mega 能力）**：
 - 已完成首批 API DTOs（带 utoipa）：当前用户 notification settings response、event preference response、update request/response，并复用 `UpdateUserNotificationConfig` 作为批量更新请求；admin 事件类型管理复用 `NotificationEventTypeInfo`。
