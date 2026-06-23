@@ -19,6 +19,7 @@ use crate::{
     },
 };
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
+pub const EVENT_CL_MERGED: &str = "cl.merged";
 pub const EVENT_ISSUE_COMMENT_CREATED: &str = "issue.comment.created";
 pub const EVENT_ITEM_REFERENCED: &str = "item.referenced";
 
@@ -27,6 +28,10 @@ static NOTIFICATION_MAIL_TEMPLATE_REGISTRY: LazyLock<RwLock<MailTemplateRegistry
 
 fn cl_comment_created_mail_template_key() -> MailTemplateKey {
     MailTemplateKey::new(EVENT_CL_COMMENT_CREATED)
+}
+
+fn cl_merged_mail_template_key() -> MailTemplateKey {
+    MailTemplateKey::new(EVENT_CL_MERGED)
 }
 
 fn issue_comment_created_mail_template_key() -> MailTemplateKey {
@@ -115,6 +120,7 @@ fn notification_mail_template_registry_with_default_locale(
     default_locale: &str,
 ) -> MailTemplateRegistry {
     let key = cl_comment_created_mail_template_key();
+    let merged_key = cl_merged_mail_template_key();
     let issue_key = issue_comment_created_mail_template_key();
     let reference_key = item_referenced_mail_template_key();
     MailTemplateRegistry::new(
@@ -136,6 +142,24 @@ fn notification_mail_template_registry_with_default_locale(
                     "CL {{cl_link}} 有新评论",
                     "<p><b>{{actor_username}}</b> 评论了 <b>{{cl_link}}</b>：</p><p>{{comment_text}}</p>",
                     Some("{{actor_username}} 评论了 {{cl_link}}：{{comment_text}}"),
+                ),
+            ),
+            LocalizedMailTemplate::new(
+                merged_key.clone(),
+                DEFAULT_MAIL_LOCALE,
+                MailTemplate::new(
+                    "CL {{cl_link}} was merged",
+                    "<p><b>{{actor_username}}</b> merged <b>{{cl_link}}</b> ({{cl_title}}).</p>",
+                    Some("{{actor_username}} merged {{cl_link}} ({{cl_title}})"),
+                ),
+            ),
+            LocalizedMailTemplate::new(
+                merged_key,
+                "zh-CN",
+                MailTemplate::new(
+                    "CL {{cl_link}} 已合并",
+                    "<p><b>{{actor_username}}</b> 合并了 <b>{{cl_link}}</b>（{{cl_title}}）。</p>",
+                    Some("{{actor_username}} 合并了 {{cl_link}}（{{cl_title}}）"),
                 ),
             ),
             LocalizedMailTemplate::new(
@@ -191,6 +215,13 @@ async fn ensure_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaE
         true,
     )
     .await?;
+
+    Ok(())
+}
+
+async fn ensure_cl_merged_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaError> {
+    stg.upsert_event_type(EVENT_CL_MERGED, "cl", "Change List was merged", false, true)
+        .await?;
 
     Ok(())
 }
@@ -309,6 +340,71 @@ pub async fn on_cl_comment_created_with_registry(
             )
             .await?;
     }
+
+    Ok(())
+}
+
+/// Trigger: a Change List is merged.
+///
+/// Notifies the CL author (excluding the merger), respecting user preferences
+/// via `should_send`, and enqueues an email job for the background dispatcher.
+pub async fn on_cl_merged(
+    notif_stg: &NotificationStorage,
+    cl_stg: &ClStorage,
+    actor_username: &str,
+    cl_link: &str,
+) -> Result<(), MegaError> {
+    let registry = current_notification_mail_template_registry()?;
+    on_cl_merged_with_registry(notif_stg, cl_stg, &registry, actor_username, cl_link).await
+}
+
+pub async fn on_cl_merged_with_registry(
+    notif_stg: &NotificationStorage,
+    cl_stg: &ClStorage,
+    mail_templates: &MailTemplateRegistry,
+    actor_username: &str,
+    cl_link: &str,
+) -> Result<(), MegaError> {
+    ensure_cl_merged_event_type_exists(notif_stg).await?;
+
+    let cl = cl_stg
+        .get_cl(cl_link)
+        .await?
+        .ok_or_else(|| MegaError::NotFound(format!("CL {cl_link} not found")))?;
+
+    if cl.username == actor_username {
+        return Ok(());
+    }
+
+    if !notif_stg.should_send(&cl.username, EVENT_CL_MERGED).await? {
+        return Ok(());
+    }
+
+    let settings = match notif_stg.get_user_settings(&cl.username).await? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let mail = mail_templates.render(
+        &cl_merged_mail_template_key(),
+        settings.preferred_locale.as_deref(),
+        &[
+            ("actor_username", actor_username),
+            ("cl_link", cl_link),
+            ("cl_title", &cl.title),
+        ],
+    )?;
+
+    notif_stg
+        .enqueue_email_job(
+            &cl.username,
+            &settings.email,
+            EVENT_CL_MERGED,
+            &mail.subject,
+            &mail.html,
+            mail.text.as_deref(),
+        )
+        .await?;
 
     Ok(())
 }
@@ -591,6 +687,63 @@ mod tests {
             jobs_after.len(),
             1,
             "actor should not be notified of own comment"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_cl_merged_enqueues_job_for_author_excluding_merger() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let base = BaseStorage::new(Arc::new(db.clone()));
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        let cl_stg = ClStorage { base: base.clone() };
+
+        let now = chrono::Utc::now().naive_utc();
+        mega_cl::ActiveModel {
+            id: Set(1),
+            link: Set("CL-MERGED".to_string()),
+            title: Set("My CL".to_string()),
+            merge_date: Set(None),
+            status: Set(crate::callisto::sea_orm_active_enums::MergeStatusEnum::Open),
+            path: Set("/".to_string()),
+            from_hash: Set("a".to_string()),
+            to_hash: Set("b".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            username: Set("alice".to_string()),
+            base_branch: Set("main".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        notif
+            .upsert_user_settings("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        // bob merges alice's CL.
+        on_cl_merged(&notif, &cl_stg, "bob", "CL-MERGED")
+            .await
+            .unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1, "CL author should be notified of merge");
+        assert_eq!(jobs[0].username, "alice");
+        assert_eq!(jobs[0].event_type_code, "cl.merged");
+        assert!(jobs[0].subject.contains("CL-MERGED"));
+
+        // The author merging their own CL does not notify themselves.
+        on_cl_merged(&notif, &cl_stg, "alice", "CL-MERGED")
+            .await
+            .unwrap();
+        let jobs_after = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(
+            jobs_after.len(),
+            1,
+            "author merging own CL should not be notified"
         );
     }
 

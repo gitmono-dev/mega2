@@ -178,6 +178,22 @@ async fn merge(
         state
             .webhook_svc()
             .dispatch(WebhookEvent::ClMerged, &updated_model);
+
+        // Best-effort CL-merged notification to the CL author (outbox; delivered
+        // by the background dispatcher). A failure must not fail the merge
+        // request. See docs/notification.md phase 0.
+        let notif_stg = state.storage.notification_storage();
+        let cl_stg = state.cl_stg();
+        if let Err(e) =
+            crate::notification::triggers::on_cl_merged(&notif_stg, &cl_stg, &user.username, &link)
+                .await
+        {
+            tracing::warn!(
+                error = %e,
+                cl_link = %link,
+                "failed to enqueue CL merged notification"
+            );
+        }
     }
     Ok(Json(CommonResult::success(None)))
 }
