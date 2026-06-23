@@ -106,7 +106,7 @@ impl SmartSession {
 
         let mut read_first_line = false;
         loop {
-            let (bytes_take, pkt_line) = read_pkt_line(upload_request);
+            let (bytes_take, pkt_line) = try_read_pkt_line(upload_request)?;
             // read 0000 to continue and read empty str to break
             if bytes_take == 0 {
                 if upload_request.is_empty() {
@@ -116,14 +116,33 @@ impl SmartSession {
                 }
             }
             let dst = pkt_line.to_vec();
+            if dst.len() < 4 {
+                return Err(ProtocolError::InvalidInput(
+                    "pkt-line command is shorter than 4 bytes".to_owned(),
+                ));
+            }
             let commands = &dst[0..4];
 
             match commands {
                 b"want" => {
-                    want.insert(String::from_utf8(dst[5..45].to_vec()).unwrap());
+                    if dst.len() < 45 {
+                        return Err(ProtocolError::InvalidInput(
+                            "want command is missing object id".to_owned(),
+                        ));
+                    }
+                    want.insert(String::from_utf8(dst[5..45].to_vec()).map_err(|_| {
+                        ProtocolError::InvalidInput("want object id is not valid UTF-8".to_owned())
+                    })?);
                 }
                 b"have" => {
-                    have.insert(String::from_utf8(dst[5..45].to_vec()).unwrap());
+                    if dst.len() < 45 {
+                        return Err(ProtocolError::InvalidInput(
+                            "have command is missing object id".to_owned(),
+                        ));
+                    }
+                    have.insert(String::from_utf8(dst[5..45].to_vec()).map_err(|_| {
+                        ProtocolError::InvalidInput("have object id is not valid UTF-8".to_owned())
+                    })?);
                 }
                 b"done" => break,
                 other => {
@@ -135,7 +154,12 @@ impl SmartSession {
                 }
             };
             if !read_first_line {
-                self.parse_capabilities(core::str::from_utf8(&dst[46..]).unwrap());
+                if dst.len() > 46 {
+                    let caps = core::str::from_utf8(&dst[46..]).map_err(|_| {
+                        ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
+                    })?;
+                    self.parse_capabilities(caps);
+                }
                 read_first_line = true;
             }
         }
@@ -200,13 +224,19 @@ impl SmartSession {
         Ok((pack_data, protocol_buf))
     }
 
-    pub fn parse_receive_pack_commands(&mut self, mut protocol_bytes: Bytes) -> Vec<RefCommand> {
+    pub fn parse_receive_pack_commands(
+        &mut self,
+        mut protocol_bytes: Bytes,
+    ) -> Result<Vec<RefCommand>, ProtocolError> {
         let mut commands: Vec<RefCommand> = Vec::new();
         while !protocol_bytes.is_empty() {
-            let (bytes_take, mut pkt_line) = read_pkt_line(&mut protocol_bytes);
+            let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
             if bytes_take != 0 {
                 let command = Self::parse_ref_command(&mut pkt_line);
-                self.parse_capabilities(core::str::from_utf8(&pkt_line).unwrap());
+                let caps = core::str::from_utf8(&pkt_line).map_err(|_| {
+                    ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
+                })?;
+                self.parse_capabilities(caps);
                 tracing::debug!(
                     "parse ref_command: {:?}, with caps:{:?}",
                     command,
@@ -215,7 +245,7 @@ impl SmartSession {
                 commands.push(command);
             }
         }
-        commands
+        Ok(commands)
     }
 
     pub async fn git_receive_pack_stream(
@@ -491,7 +521,7 @@ fn read_until_white_space(bytes: &mut Bytes) -> String {
         }
         buf.push(c);
     }
-    String::from_utf8(buf).unwrap()
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 pub fn add_pkt_line_string(pkt_line_stream: &mut BytesMut, buf_str: String) {
@@ -532,20 +562,55 @@ pub fn add_pkt_line_string(pkt_line_stream: &mut BytesMut, buf_str: String) {
 /// assert_eq!(line, Bytes::from_static(b"example"));
 /// ```
 pub fn read_pkt_line(bytes: &mut Bytes) -> (usize, Bytes) {
+    try_read_pkt_line(bytes).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "invalid pkt-line");
+        bytes.clear();
+        (0, Bytes::new())
+    })
+}
+
+pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), ProtocolError> {
     if bytes.is_empty() {
-        return (0, Bytes::new());
+        return Ok((0, Bytes::new()));
     }
-    let pkt_length = bytes.copy_to_bytes(4);
-    let pkt_length = usize::from_str_radix(core::str::from_utf8(&pkt_length).unwrap(), 16)
-        .unwrap_or_else(|_| panic!("{pkt_length:?} is not a valid digit?"));
+    if bytes.len() < 4 {
+        return Err(ProtocolError::InvalidInput(
+            "pkt-line length header is incomplete".to_owned(),
+        ));
+    }
+    let pkt_length_bytes = &bytes[..4];
+    if !pkt_length_bytes.iter().all(u8::is_ascii_hexdigit) {
+        return Err(ProtocolError::InvalidInput(
+            "pkt-line length header is not hexadecimal".to_owned(),
+        ));
+    }
+    let pkt_length = usize::from_str_radix(
+        core::str::from_utf8(pkt_length_bytes).map_err(|_| {
+            ProtocolError::InvalidInput("pkt-line length header is invalid".to_owned())
+        })?,
+        16,
+    )
+    .map_err(|_| ProtocolError::InvalidInput("pkt-line length header is invalid".to_owned()))?;
     if pkt_length == 0 {
-        return (0, Bytes::new());
+        bytes.advance(4);
+        return Ok((0, Bytes::new()));
     }
+    if pkt_length < 4 {
+        return Err(ProtocolError::InvalidInput(
+            "pkt-line length is smaller than header".to_owned(),
+        ));
+    }
+    if bytes.len() < pkt_length {
+        return Err(ProtocolError::InvalidInput(
+            "pkt-line payload is incomplete".to_owned(),
+        ));
+    }
+    bytes.advance(4);
     // this operation will change the original bytes
     let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
     tracing::debug!("pkt line: {:?}", pkt_line);
 
-    (pkt_length, pkt_line)
+    Ok((pkt_length, pkt_line))
 }
 
 #[cfg(test)]
@@ -562,8 +627,11 @@ pub mod test {
         ceres::protocol::{
             Capability, ServiceType, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
-            smart::{add_pkt_line_string, read_pkt_line, read_until_white_space},
+            smart::{
+                add_pkt_line_string, read_pkt_line, read_until_white_space, try_read_pkt_line,
+            },
         },
+        common::errors::ProtocolError,
     };
 
     #[test]
@@ -572,6 +640,24 @@ pub mod test {
         let (pkt_length, pkt_line) = read_pkt_line(&mut bytes);
         assert_eq!(pkt_length, 30);
         assert_eq!(&pkt_line[..], b"# service=git-upload-pack\n");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_non_hex_header() {
+        let mut bytes = Bytes::from_static(b"zzzzwant");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert_eq!(&bytes[..], b"zzzzwant");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_incomplete_payload() {
+        let mut bytes = Bytes::from_static(b"000babc");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert_eq!(&bytes[..], b"000babc");
     }
 
     #[test]

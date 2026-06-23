@@ -9,6 +9,12 @@
 ## 事实校准（2026-06-14）
 
 > 本文档中的代码引用已对照当前 `src/` 重新核对。当前 Git protocol 实现处于基础阶段，具有完整的功能框架但多处缺乏错误处理和兼容性完善：
+>
+> **2026-06-23 更新**：已完成首批 malformed input panic 止血：
+> - HTTP `info/refs` 的 `service` query 参数缺失或非法时，不再 `unwrap()` panic，而是返回 `ProtocolError::InvalidInput`。
+> - smart protocol pkt-line 读取新增 `try_read_pkt_line`，对非十六进制 header、短 header、长度小于 header、payload 不完整等输入返回 `ProtocolError::InvalidInput`，并补单元测试；upload-pack 与 receive-pack 命令解析已改用该可失败 parser。
+> - upload-pack 的 `want` / `have` object id 长度和 UTF-8 解析已改为协议错误；receive-pack 命令解析会传播 pkt-line/capability 解析错误。SSH receive-pack 遇到非法 command pkt-line 时记录告警并返回 error 文本，不再在该点 panic。
+> - 仍未完成：receive-pack 仍以搜索 `PACK` magic bytes 分界，SSH exec parser 仍较脆弱，SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -26,15 +32,15 @@
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
-| HTTP GET /info/refs | 已实现（风险） | 直接 `unwrap()` query 参数，缺少 service 参数返回 panic；无 malformed query 处理。 |
-| HTTP POST upload-pack | 已实现（风险） | 一次性读取 request body 到内存；pkt-line 解析 `unwrap()` panic；不支持 streaming。 |
-| HTTP POST receive-pack | 已实现（风险） | 搜索 `PACK` 字节分界不稳健；跨 chunk 可能失败；无 flush-pkt 边界检查。 |
+| HTTP GET /info/refs | 已实现（首批止血） | `service` 缺失或非法已返回 `ProtocolError::InvalidInput`；仍需补更完整 smart HTTP query 兼容性矩阵。 |
+| HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
+| HTTP POST receive-pack | 已实现（风险） | command pkt-line malformed input 已返回协议错误；但仍搜索 `PACK` 字节分界，不按 flush-pkt 边界，跨 chunk 可能失败。 |
 | SSH git-upload-pack | 已实现（风险） | exec command 解析过于脆弱，路径包含空格时失败；非法命令默认变成 upload-pack。 |
 | SSH git-receive-pack | 已实现（风险） | 与 HTTP 共用不稳健的分流逻辑；session 状态全局共享。 |
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 实现但不完全 | advertise 包含 atomic、report-status-v2、delete-refs，但实现和测试不完整。 |
-| 错误处理 | 基础缺陷 | 多处 `unwrap()` 和 panic；malformed input 导致连接被异常关闭而非协议错误。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数与 smart pkt-line malformed input 已改为协议错误；其余 SSH exec、stream chunk、repo handler 等路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
 

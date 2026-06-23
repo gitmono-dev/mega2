@@ -238,8 +238,16 @@ impl SshServer {
             let chunk = chunk.unwrap();
 
             if let Some(pos) = search_subsequence(&chunk, b"PACK") {
-                let commands = smart_protocol
-                    .parse_receive_pack_commands(Bytes::copy_from_slice(&chunk[..pos]));
+                let commands = match smart_protocol
+                    .parse_receive_pack_commands(Bytes::copy_from_slice(&chunk[..pos]))
+                {
+                    Ok(commands) => commands,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "invalid receive-pack command pkt-line");
+                        let _ = session.data(channel, format!("error: {err}\n").into_bytes());
+                        return;
+                    }
+                };
                 let remaining_bytes = Bytes::copy_from_slice(&chunk[pos..]);
                 let remaining_stream =
                     stream::once(async { Ok(remaining_bytes) }).chain(data_stream);
