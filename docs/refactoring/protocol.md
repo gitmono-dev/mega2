@@ -29,6 +29,8 @@
 > **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
 >
 > **2026-06-23 更新 5**：HTTP upload-pack request body 聚合不再对 body stream 错误 `unwrap()`，已与 receive-pack 统一经 `ProtocolError::InvalidInput` 返回。
+>
+> **2026-06-23 更新 6**：HTTP `info/refs` query 已按 smart HTTP 规范收紧为 exactly one `service=...` 参数，额外参数和重复 `service` 均返回 `ProtocolError::InvalidInput`。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -46,7 +48,7 @@
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
-| HTTP GET /info/refs | 已实现（首批止血） | `service` 缺失或非法已返回 `ProtocolError::InvalidInput`；仍需补更完整 smart HTTP query 兼容性矩阵。 |
+| HTTP GET /info/refs | 已实现（首批止血） | query 已要求 exactly one `service=...`，缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；仍需补真实 Git CLI 兼容性矩阵。 |
 | HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
 | HTTP POST receive-pack | 已实现（首批止血） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；仍需 streaming parser、delete-only push 和更完整真实 Git CLI 矩阵。 |
 | SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；后续仍需 per-channel state。 |
@@ -305,7 +307,7 @@ HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/i
 
 ### HTTP info/refs 参数校验（首批已止血）
 
-`handle_smart_protocol` 当前通过 `parse_info_refs_params` 解析并校验 query，反序列化失败、缺失 `service` 或非法 `service` 都返回 `ProtocolError::InvalidInput`；`contract::git_protocol::http::git_info_refs` 仍保留同类防御性校验。旧实现曾直接：
+`handle_smart_protocol` 当前通过 `parse_info_refs_params` 解析并校验 query，反序列化失败、缺失/重复/非法 `service` 或存在额外 query 参数都返回 `ProtocolError::InvalidInput`；`contract::git_protocol::http::git_info_refs` 仍保留同类防御性校验。旧实现曾直接：
 
 ```rust
 let service_name = params.service.unwrap();
@@ -317,18 +319,19 @@ let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
 
 - query 反序列化错误会返回 400，不再 panic。
 - 缺少 `service` 会返回 400，不再 panic。
+- 重复 `service` 或额外 query 参数会返回 400。
 - 非法 service 会返回 400，不再 panic。
 
 仍待后续：
 
 - 更完整 smart HTTP query 兼容性矩阵和真实 Git CLI 覆盖。
-- HTTP smart protocol 要求 `info/refs` 请求包含 `service=$servicename`，且不应接受额外 query 参数；当前没有严格校验。
+- 按真实 Git CLI 矩阵确认是否需要对非标准客户端提供兼容模式。
 
 建议：
 
-- 缺少或非法 service 返回 400。
+- 缺失、重复、额外参数或非法 `service` 返回 400。
 - 不支持的 service 返回 403 或 400，并输出 Git 客户端可读错误。
-- 对额外 query 参数做显式策略：首版可 warning 并拒绝，或兼容接受但记录偏离规范。
+- 对额外 query 参数做显式策略：首版已选择拒绝；如未来需要兼容非标准客户端，应先补矩阵并记录偏离规范。
 - 所有解析失败都返回 `ProtocolError`，不能 panic。
 
 ### HTTP upload-pack 会一次性读取完整请求体
@@ -611,7 +614,7 @@ LFS:
 工作项：
 
 1. `info/refs` query 解析改为 `Result`。
-2. 缺失或非法 `service` 返回 400。
+2. 缺失、重复、额外参数或非法 `service` 返回 400。
 3. SSH exec command 解析改为显式 parser。
 4. 非法 SSH command 返回 channel failure，不默认 upload-pack。
 5. `read_pkt_line` 改为返回 `Result`。

@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tower::{Layer, ServiceBuilder};
 use tower_http::{cors::CorsLayer, decompression::RequestDecompressionLayer, trace::TraceLayer};
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
+use url::form_urlencoded;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
@@ -660,6 +661,22 @@ fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
 }
 
 fn parse_info_refs_params(query_str: &str) -> std::result::Result<InfoRefsParams, ProtocolError> {
+    let mut service_count = 0;
+    for (key, _) in form_urlencoded::parse(query_str.as_bytes()) {
+        if key == "service" {
+            service_count += 1;
+        } else {
+            return Err(ProtocolError::InvalidInput(format!(
+                "unsupported info/refs query parameter: {key}"
+            )));
+        }
+    }
+    if service_count > 1 {
+        return Err(ProtocolError::InvalidInput(
+            "duplicate service parameter".to_owned(),
+        ));
+    }
+
     let params: InfoRefsParams = serde_urlencoded::from_str(query_str).map_err(|err| {
         ProtocolError::InvalidInput(format!("invalid info/refs query parameters: {err}"))
     })?;
@@ -826,6 +843,17 @@ mod tests {
             parse_info_refs_params("service=git-status").expect_err("bad service should fail");
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn info_refs_query_rejects_extra_and_duplicate_parameters() {
+        let extra = parse_info_refs_params("service=git-upload-pack&foo=bar")
+            .expect_err("extra query parameter should fail");
+        let duplicate = parse_info_refs_params("service=git-upload-pack&service=git-receive-pack")
+            .expect_err("duplicate service parameter should fail");
+
+        assert!(matches!(extra, ProtocolError::InvalidInput(_)));
+        assert!(matches!(duplicate, ProtocolError::InvalidInput(_)));
     }
 
     #[test]
