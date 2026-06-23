@@ -232,20 +232,49 @@ impl SmartSession {
         while !protocol_bytes.is_empty() {
             let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
             if bytes_take != 0 {
-                let command = Self::parse_ref_command(&mut pkt_line);
-                let caps = core::str::from_utf8(&pkt_line).map_err(|_| {
-                    ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
-                })?;
-                self.parse_capabilities(caps);
-                tracing::debug!(
-                    "parse ref_command: {:?}, with caps:{:?}",
-                    command,
-                    self.capabilities
-                );
+                let command = self.parse_receive_pack_command_line(&mut pkt_line)?;
                 commands.push(command);
             }
         }
         Ok(commands)
+    }
+
+    pub fn split_receive_pack_request(
+        &mut self,
+        mut protocol_bytes: Bytes,
+    ) -> Result<(Vec<RefCommand>, Bytes), ProtocolError> {
+        let mut commands: Vec<RefCommand> = Vec::new();
+
+        while !protocol_bytes.is_empty() {
+            let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
+            if bytes_take == 0 {
+                return Ok((commands, protocol_bytes));
+            }
+
+            let command = self.parse_receive_pack_command_line(&mut pkt_line)?;
+            commands.push(command);
+        }
+
+        Err(ProtocolError::InvalidInput(
+            "receive-pack command list missing flush-pkt".to_owned(),
+        ))
+    }
+
+    fn parse_receive_pack_command_line(
+        &mut self,
+        pkt_line: &mut Bytes,
+    ) -> Result<RefCommand, ProtocolError> {
+        let command = Self::parse_ref_command(pkt_line);
+        let caps = core::str::from_utf8(pkt_line).map_err(|_| {
+            ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
+        })?;
+        self.parse_capabilities(caps);
+        tracing::debug!(
+            "parse ref_command: {:?}, with caps:{:?}",
+            command,
+            self.capabilities
+        );
+        Ok(command)
     }
 
     pub async fn git_receive_pack_stream(
@@ -628,7 +657,8 @@ pub mod test {
             Capability, ServiceType, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
             smart::{
-                add_pkt_line_string, read_pkt_line, read_until_white_space, try_read_pkt_line,
+                PKT_LINE_END_MARKER, add_pkt_line_string, read_pkt_line, read_until_white_space,
+                try_read_pkt_line,
             },
         },
         common::errors::ProtocolError,
@@ -722,6 +752,52 @@ pub mod test {
             default_branch: false,
         };
         assert_eq!(result, command);
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_uses_flush_not_pack_magic() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "0000000000000000000000000000000000000000 27dd8d4cf39f3868c6eee38b601bc9e9939304f5 refs/heads/main\0report-status agent=PACK-test\n".to_owned(),
+        );
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+        request.extend_from_slice(b"PACKpayload");
+
+        let (commands, pack_bytes) = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap();
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].ref_name, "refs/heads/main");
+        assert_eq!(&pack_bytes[..], b"PACKpayload");
+        assert!(session.capabilities.contains(&Capability::ReportStatus));
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_requires_flush_pkt() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "0000000000000000000000000000000000000000 27dd8d4cf39f3868c6eee38b601bc9e9939304f5 refs/heads/main\0report-status\n".to_owned(),
+        );
+
+        let err = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("missing flush-pkt"));
     }
 
     #[test]

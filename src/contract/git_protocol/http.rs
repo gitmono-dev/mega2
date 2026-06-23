@@ -207,30 +207,25 @@ pub async fn git_receive_pack(
     if !git_receive_pack_auth(state, &mut pack_protocol, req.headers()).await? {
         return auth_failed();
     }
-    // Convert the request body into a data stream.
-    let mut data_stream = req.into_body().into_data_stream();
-    let mut report_status = Bytes::new();
+    let receive_request: BytesMut = req
+        .into_body()
+        .into_data_stream()
+        .try_fold(BytesMut::new(), |mut acc, chunk| async move {
+            acc.extend_from_slice(&chunk);
+            Ok(acc)
+        })
+        .await
+        .map_err(|err| {
+            ProtocolError::InvalidInput(format!("failed to read receive-pack body: {err}"))
+        })?;
 
-    let mut chunk_buffer = BytesMut::new(); // Used to cache the data of chunks before the PACK subsequence is found.
-    // Process the data stream to handle the Git receive-pack protocol.
-    while let Some(chunk) = data_stream.next().await {
-        let chunk = chunk.unwrap();
-        // Process the data up to the "PACK" subsequence.
-        if let Some(pos) = search_subsequence(&chunk, b"PACK") {
-            chunk_buffer.extend_from_slice(&chunk[0..pos]);
-            let commands =
-                pack_protocol.parse_receive_pack_commands(Bytes::copy_from_slice(&chunk_buffer))?;
-            // Create a new stream from the remaining bytes and the rest of the data stream.
-            let left_chunk_bytes = Bytes::copy_from_slice(&chunk[pos..]);
-            let pack_stream = stream::once(async { Ok(left_chunk_bytes) }).chain(data_stream);
-            report_status = pack_protocol
-                .git_receive_pack_stream(state, commands, Box::pin(pack_stream))
-                .await?;
-            break;
-        } else {
-            chunk_buffer.extend_from_slice(&chunk);
-        }
-    }
+    let (commands, pack_bytes) =
+        pack_protocol.split_receive_pack_request(receive_request.freeze())?;
+    let pack_stream = stream::once(async { Ok(pack_bytes) });
+    let report_status = pack_protocol
+        .git_receive_pack_stream(state, commands, Box::pin(pack_stream))
+        .await?;
+
     tracing::info!("report status:{:?}", report_status);
     let response = Response::builder().body(Body::from(report_status)).unwrap();
     let response = add_default_header(
@@ -238,11 +233,6 @@ pub async fn git_receive_pack(
         response,
     );
     Ok(response)
-}
-
-// Function to find the subsequence in a slice
-pub fn search_subsequence(chunk: &[u8], search: &[u8]) -> Option<usize> {
-    chunk.windows(search.len()).position(|s| s == search)
 }
 
 /// # Build Response headers for Smart Server.

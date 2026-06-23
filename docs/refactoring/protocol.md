@@ -19,13 +19,18 @@
 > - `exec_request` 不再用 `split(' ')` 和 `command[1]` 直接索引；新增独立 parser，支持单引号、双引号、反斜杠转义和包含空格的 repo path。
 > - 只允许 `git-upload-pack`、`git-receive-pack`、`git-lfs-authenticate`、`git-lfs-transfer`；未知命令、缺 path、引号未闭合或参数数目错误会返回 channel failure 和可读错误，不再默认降级为 upload-pack。
 > - repo path 只去除末尾 `.git`，不再删除路径中间的 `.git`。
-> - 仍未完成：receive-pack 仍以搜索 `PACK` magic bytes 分界，SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
+>
+> **2026-06-23 更新 3**：已完成 receive-pack `PACK` magic 分界止血：
+> - HTTP / SSH receive-pack 不再搜索 `PACK` 字节序列，而是复用 `SmartSession::split_receive_pack_request` 按 pkt-line command list 的 flush-pkt 分割 commands 与 pack bytes。
+> - 新增单元测试覆盖 capability 中出现 `PACK` 不误切分，以及缺少 flush-pkt 返回 `ProtocolError::InvalidInput`。
+> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义与 SSH per-channel state 仍为后续。
+> - 仍未完成：SSH 多 channel state 仍未改为 per-channel，capability advertise 仍未完全收敛。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
 2. **基础 fetch/push/clone 可工作**。当前能支持标准 Git 客户端的基本 clone、fetch、push 操作，但多处使用 `unwrap()` 和缺乏边界检查。
 
-3. **pkt-line 解析与 receive-pack 分流存在风险**。`read_pkt_line` 使用 `unwrap()` panic；receive-pack 通过搜索 `PACK` magic bytes 分界，可能跨 chunk 失败或被 payload 中的偶然 `PACK` 误触。
+3. **pkt-line 解析与 receive-pack 分流已完成首批止血。** `read_pkt_line` 的可失败版本已落地，HTTP/SSH receive-pack 已按 flush-pkt 分割 commands 与 pack bytes，不再搜索 `PACK` magic；残余风险是当前实现仍缓冲完整 body / channel 数据，尚未实现真正 streaming pkt-line reader 和 delete-only push 语义验证。
 
 4. **认证策略不一致**。HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH 通过 public key，但未统一 auth context。
 
@@ -39,9 +44,9 @@
 |-----------|--------|-------------|
 | HTTP GET /info/refs | 已实现（首批止血） | `service` 缺失或非法已返回 `ProtocolError::InvalidInput`；仍需补更完整 smart HTTP query 兼容性矩阵。 |
 | HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
-| HTTP POST receive-pack | 已实现（风险） | command pkt-line malformed input 已返回协议错误；但仍搜索 `PACK` 字节分界，不按 flush-pkt 边界，跨 chunk 可能失败。 |
+| HTTP POST receive-pack | 已实现（首批止血） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；仍需 streaming parser、delete-only push 和更完整真实 Git CLI 矩阵。 |
 | SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；后续仍需 per-channel state。 |
-| SSH git-receive-pack | 已实现（风险） | 与 HTTP 共用不稳健的分流逻辑；session 状态全局共享。 |
+| SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
 | SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 实现但不完全 | advertise 包含 atomic、report-status-v2、delete-refs，但实现和测试不完整。 |
@@ -67,7 +72,7 @@
 |-----|--------|--------|--------|
 | 错误处理 | 多处 panic | 协议错误或断开，不能 panic | 需要 Result 化所有输入解析 |
 | pkt-line 实现 | `unwrap()` panic 散落 | 定义 `PktLine` enum 和 streaming parser | 需重构 parser 返回 Result |
-| receive-pack 分流 | 搜索 `PACK` magic | 按 pkt-line flush-pkt 边界 | 需重写分界逻辑 |
+| receive-pack 分流 | 已按 flush-pkt 分割，仍缓冲完整 body/channel | streaming pkt-line reader + delete-only push 验证 | 中等 |
 | SSH exec 解析 | 脆弱（空格、拼接错） | 严格 parser，支持引号和转义 | 需独立 parser 函数和单测 |
 | SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 需引入 `GitSshChannelState` |
 | 认证统一 | HTTP/SSH 分离 | 统一 `ProtocolAuthContext` | 需与 config/vault auth 协同 |
@@ -108,7 +113,7 @@
 | **可行性** | **中高（7.5/10）**。基础 panic 止血相对容易（Result 化输入解析）；pkt-line 和 receive-pack 分流需要较深的协议理解；SSH auth 统一需与 config 协同。 |
 | **完整性** | **中（7/10）**。6 个阶段覆盖主要问题，但 partial clone、protocol v2、shallow clone 等现代 Git 特性未涵盖。当前声称"仅 v0/v1"是合理的范围限制。 |
 | **安全性** | **中（7/10）**。panic 止血直接提升安全性；auth 统一防止权限泄露。但 per-channel state 和事务边界的改进是长期工作。 |
-| **可维护性** | **中（7/10）**。当前代码存在多个维护陷阱（magic bytes 搜索、全局 state、scattered panic）。改进后代码应更易维护，但短期工作量较大。 |
+| **可维护性** | **中（7/10）**。首批已移除 magic bytes 搜索和部分 scattered panic，但全局 SSH channel state、剩余 `unwrap()` 和 streaming parser 缺口仍是维护陷阱。改进后代码应更易维护，但短期工作量较大。 |
 
 ## 小结
 
@@ -333,9 +338,9 @@ let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
 - 中期将 upload-pack negotiation 改为 streaming pkt-line reader，而不是一次性聚合 body。
 - 为 `read_pkt_line` 增加可诊断错误，避免 malformed pkt-line panic。
 
-### HTTP receive-pack 通过搜索 `PACK` 分割 commands 和 pack 数据不够稳健
+### HTTP / SSH receive-pack 分割 commands 和 pack 数据
 
-`git_receive_pack` 当前在 chunk 中搜索字节序列 `PACK`：
+早期 `git_receive_pack` 在 chunk 中搜索字节序列 `PACK`：
 
 ```rust
 if let Some(pos) = search_subsequence(&chunk, b"PACK") {
@@ -346,19 +351,18 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
 }
 ```
 
-风险：
+这一路径已在 2026-06-23 的首批止血中替换为 `SmartSession::split_receive_pack_request`：
 
-- `PACK` 可能跨 chunk 边界出现。
-- command payload 或 capability 中理论上可能出现 `PACK` 字节序列，导致误切分。
-- 如果客户端只发送 ref delete command，没有 packfile，当前逻辑可能无法生成正确 report-status。
-- 正确边界应由 pkt-line command list 的 flush-pkt 决定，而不是搜索 magic bytes。
+- HTTP receive-pack 先聚合 request body，再按 pkt-line command list 的 flush-pkt 分割 commands 与 pack bytes。
+- SSH receive-pack 对已缓冲的 channel 数据使用同一 splitter。
+- capability 或 command payload 中出现 `PACK` 不再影响分割。
+- 缺失 flush-pkt 会返回 `ProtocolError::InvalidInput`。
 
-建议：
+仍待后续处理：
 
-- 用 pkt-line reader 读取 receive-pack command list，直到 flush-pkt。
-- flush-pkt 后剩余字节才作为 pack stream。
+- 将当前完整 body / channel 数据缓冲改为 streaming pkt-line reader。
 - 支持纯 delete refs 的无 pack receive-pack 请求。
-- 增加 malformed pkt-line、缺 flush-pkt、缺 packfile、pack magic 不合法的测试。
+- 增加缺 packfile、pack magic 不合法和真实 Git CLI push/delete 矩阵。
 
 ### SSH exec command 解析过于脆弱
 
@@ -623,16 +627,16 @@ LFS:
 
 工作项：
 
-1. 实现 streaming pkt-line reader。
-2. receive-pack 先读取 command list 到 flush-pkt。
-3. flush-pkt 后剩余 bytes 作为 pack stream。
+1. 已完成首批：receive-pack 先读取 command list 到 flush-pkt。
+2. 已完成首批：flush-pkt 后剩余 bytes 作为 pack stream。
+3. 后续：实现 streaming pkt-line reader，避免完整 body / channel 数据缓冲。
 4. 支持无 pack 的 delete-only push。
-5. HTTP 和 SSH receive-pack 共用同一 parser。
+5. 已完成首批：HTTP 和 SSH receive-pack 共用同一 parser。
 
 验收标准：
 
-- `PACK` 跨 chunk 不影响 push。
-- command payload 中出现 `PACK` 不误切分。
+- 已覆盖：command payload / capability 中出现 `PACK` 不误切分。
+- 待覆盖：`PACK` 跨 chunk 不影响 push（需要 streaming parser 或真实 Git CLI 矩阵）。
 - `git push --delete` 可正常返回 report-status。
 - malformed command list 返回协议错误。
 
@@ -712,7 +716,7 @@ LFS:
 | --- | --- | --- |
 | P0 | 建立真实 Git 客户端兼容性矩阵 | 后续改协议必须防回归 |
 | P0 | 修复 HTTP query、SSH exec、pkt-line parser 的 panic | 非法客户端输入不能打崩服务 |
-| P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 当前 push 分流逻辑不稳健 |
+| P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；后续补 streaming parser 与 delete-only push 矩阵 |
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
 | P1 | SSH payload 全部按 bytes 发送 | Git 协议是二进制协议，不能假设 UTF-8 |
 | P1 | 统一 HTTP/SSH auth context | push 审计、commit binding、权限检查依赖此基础 |
@@ -741,7 +745,7 @@ LFS:
 2. `info/refs` query 解析返回 `Result`，非法输入返回 400。
 3. SSH exec command parser 独立成函数并加单元测试。
 4. `read_pkt_line` 返回 `Result` 并覆盖 malformed input。
-5. receive-pack 按 pkt-line flush 分界，不再搜索 `PACK`。
+5. 已完成首批：receive-pack 按 pkt-line flush 分界，不再搜索 `PACK`。
 6. SSH upload-pack 删除 UTF-8 转换，所有 payload 走 bytes。
 
 完成这些之后，再开始 capability 收敛、认证统一和 LFS 加固。

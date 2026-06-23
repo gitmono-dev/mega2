@@ -10,16 +10,13 @@ use russh::{
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
-use crate::{
-    ceres::{
-        api_service::state::ProtocolApiState,
-        lfs::lfs_structs::Link,
-        protocol::{
-            ServiceType, SmartSession, TransportProtocol,
-            smart::{self},
-        },
+use crate::ceres::{
+    api_service::state::ProtocolApiState,
+    lfs::lfs_structs::Link,
+    protocol::{
+        ServiceType, SmartSession, TransportProtocol,
+        smart::{self},
     },
-    contract::git_protocol::http::search_subsequence,
 };
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
@@ -375,33 +372,19 @@ impl SshServer {
     async fn handle_receive_pack(&mut self, channel: ChannelId, session: &mut Session) {
         let smart_protocol = self.smart_protocol.as_mut().unwrap();
         let data = self.data_combined.split().freeze();
-        let mut data_stream = Box::pin(stream::once(async move { Ok(data) }));
-        let mut report_status = Bytes::new();
-
-        while let Some(chunk) = data_stream.next().await {
-            let chunk = chunk.unwrap();
-
-            if let Some(pos) = search_subsequence(&chunk, b"PACK") {
-                let commands = match smart_protocol
-                    .parse_receive_pack_commands(Bytes::copy_from_slice(&chunk[..pos]))
-                {
-                    Ok(commands) => commands,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "invalid receive-pack command pkt-line");
-                        let _ = session.data(channel, format!("error: {err}\n").into_bytes());
-                        return;
-                    }
-                };
-                let remaining_bytes = Bytes::copy_from_slice(&chunk[pos..]);
-                let remaining_stream =
-                    stream::once(async { Ok(remaining_bytes) }).chain(data_stream);
-                report_status = smart_protocol
-                    .git_receive_pack_stream(&self.state, commands, Box::pin(remaining_stream))
-                    .await
-                    .unwrap();
-                break;
+        let (commands, pack_bytes) = match smart_protocol.split_receive_pack_request(data) {
+            Ok(split) => split,
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid receive-pack request");
+                let _ = session.data(channel, format!("error: {err}\n").into_bytes());
+                return;
             }
-        }
+        };
+        let pack_stream = stream::once(async { Ok(pack_bytes) });
+        let report_status = smart_protocol
+            .git_receive_pack_stream(&self.state, commands, Box::pin(pack_stream))
+            .await
+            .unwrap();
 
         tracing::info!("report status: {:?}", report_status);
         session.data(channel, report_status.to_vec()).unwrap();
