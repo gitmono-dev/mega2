@@ -173,6 +173,49 @@ impl VaultCore {
         Self::config(VaultStorage { base }, key_path).await
     }
 
+    /// Reset an initialized vault: delete all vault storage rows, move the
+    /// existing `core_key.json` to a timestamped backup, and re-initialize from
+    /// scratch. This is the explicit operator-initiated reset companion to the
+    /// fail-closed behaviour in `config`; it must only be used when data loss is
+    /// acceptable (vault.md stage A.6).
+    pub async fn reset(
+        db_config: &DbConfig,
+        key_path: PathBuf,
+    ) -> VaultResult<(Self, Option<PathBuf>)> {
+        let connection = database_connection(db_config)
+            .await
+            .map_err(|e| VaultError::DatabaseStorage(e.to_string()))?;
+        let connection = Arc::new(connection);
+
+        // Wipe the vault storage table first so that the next `config` call sees
+        // an uninitialized backend.
+        let vault_storage = VaultStorage {
+            base: BaseStorage::new(connection.clone()),
+        };
+        vault_storage
+            .delete_all()
+            .await
+            .map_err(|e| VaultError::Reset(e.to_string()))?;
+
+        // Backup the old core key material rather than destroying it outright.
+        let backup_path = if key_path.exists() {
+            let backup_path = key_path.with_extension(format!(
+                "json.bak.{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            fs::rename(&key_path, &backup_path).map_err(|source| VaultError::CoreKeyWrite {
+                path: backup_path.clone(),
+                source,
+            })?;
+            Some(backup_path)
+        } else {
+            None
+        };
+
+        let vault = Self::from_database_connection(connection, key_path).await?;
+        Ok((vault, backup_path))
+    }
+
     pub async fn config(vault_storage: VaultStorage, key_path: PathBuf) -> VaultResult<Self> {
         if let Some(dir) = key_path.parent() {
             prepare_key_dir(dir)?;
@@ -1087,6 +1130,57 @@ mod tests {
             .expect("vault core should initialize from DB-only bootstrap");
 
         assert!(vault_core.rvault.core.load().inited().await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_vault_reset_wipes_storage_and_backups_key_file() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+
+        let vault_core = VaultCore::from_database_config(&db_config, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        let secret_data = serde_json::json!({"value": "reset-me"})
+            .as_object()
+            .unwrap()
+            .clone();
+        vault_core
+            .write_secret("reset_test_key", Some(secret_data))
+            .await
+            .expect("secret write should succeed");
+
+        let old_token = vault_core.token().to_string();
+        let (reset_vault, backup_path) = VaultCore::reset(&db_config, key_path.clone())
+            .await
+            .expect("vault reset should succeed");
+
+        assert!(
+            reset_vault.rvault.core.load().inited().await.unwrap(),
+            "vault should be initialized after reset"
+        );
+        assert_ne!(
+            reset_vault.token(),
+            old_token,
+            "reset should produce new runtime tokens"
+        );
+        assert!(
+            key_path.exists(),
+            "new core key file should be written after reset"
+        );
+        assert!(
+            backup_path.is_some() && backup_path.as_ref().unwrap().exists(),
+            "previous core key should be backed up"
+        );
+        let read_after_reset = reset_vault
+            .read_secret("reset_test_key")
+            .await
+            .expect("read should succeed after reset");
+        assert!(
+            read_after_reset.is_none(),
+            "secret written before reset should be gone"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

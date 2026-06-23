@@ -38,6 +38,12 @@ pub fn cli() -> Command {
                 .subcommand(secret_check_cli()),
         )
         .subcommand(
+            Command::new("vault")
+                .about("Manage the monoengine vault")
+                .subcommand_required(true)
+                .subcommand(vault_reset_cli()),
+        )
+        .subcommand(
             Command::new("init")
                 .about("Create a safe starter configuration without reading config or vault")
                 .arg(
@@ -132,6 +138,25 @@ fn secret_check_cli() -> Command {
         .arg(field_arg())
 }
 
+fn vault_reset_cli() -> Command {
+    Command::new("reset")
+        .about("Reset the vault: delete all vault storage rows, back up core_key.json, and re-initialize")
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm this destructive operation (required)"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
 fn secret_name_arg() -> Arg {
     Arg::new("name")
         .value_name("CONFIG_FIELD")
@@ -162,6 +187,7 @@ pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
             Some(("set" | "rotate" | "check", _)) => LoadMode::VaultBootstrap,
             _ => LoadMode::ParsedConfig,
         },
+        Some(("vault", _)) => LoadMode::VaultBootstrap,
         Some(("validate", _)) => LoadMode::RawSources,
         _ => LoadMode::ParsedConfig,
     }
@@ -172,6 +198,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
         Some(("init", init_args)) => exec_init(ctx, init_args),
         Some(("secret", secret_args)) => exec_secret(ctx, secret_args).await,
+        Some(("vault", vault_args)) => exec_vault(ctx, vault_args).await,
         Some(("validate", validate_args)) => {
             let config_path = require_config_path(&ctx, "config validate")?;
             let config_profile_path = ctx.config_profile_path.clone();
@@ -240,6 +267,52 @@ fn write_init_config(output_path: &Path, force: bool) -> Result<(), MegaError> {
     let content = config_init_template(&base_dir);
     fs::write(output_path, content)?;
 
+    Ok(())
+}
+
+async fn exec_vault(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    match args.subcommand() {
+        Some(("reset", reset_args)) => exec_vault_reset(ctx, reset_args).await,
+        Some((cmd, _)) => Err(MegaError::Other(format!(
+            "Unknown config vault subcommand: {cmd}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+async fn exec_vault_reset(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    if !args.get_flag("force") {
+        return Err(MegaError::Other(
+            "config vault reset is destructive; pass --force to confirm".to_string(),
+        ));
+    }
+
+    let config_path = require_config_path(&ctx, "config vault reset")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    let config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let (_vault, backup_path) = VaultCore::reset(&config.database, key_path)
+        .await
+        .map_err(MegaError::from)?;
+
+    if let Some(backup_path) = backup_path {
+        println!(
+            "vault reset complete; previous core key backed up to {}",
+            backup_path.display()
+        );
+    } else {
+        println!("vault reset complete; no previous core key was present");
+    }
     Ok(())
 }
 
@@ -528,6 +601,30 @@ mod tests {
         };
 
         assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_reset_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "reset", "--force"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_reset_requires_force() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "reset", "--force"])
+            .unwrap();
+        let Some(("vault", vault_args)) = matches.subcommand() else {
+            panic!("vault subcommand should parse");
+        };
+        let Some(("reset", reset_args)) = vault_args.subcommand() else {
+            panic!("reset subcommand should parse");
+        };
+
+        assert!(reset_args.get_flag("force"));
     }
 
     #[test]

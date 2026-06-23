@@ -29,9 +29,9 @@
 >
 > 总体：**vault 本地 P0 止血与 P1 结构拆分在当前仓库状态下技术可行、依赖清晰、风险可控**；执行时严格按文档内"建议执行切片"与本分析的边界推进，即可避免被跨模块前置或 AGENTS 门禁阻塞。文档其余部分（阶段描述、验收、边界）经本次核查无需结构性调整，仅补充本小节与少量执行提示。
 
-> **落地状态更新（2026-06-17；2026-06-19 补 H 审计策略与 J secret 轮换命令；2026-06-23 补 H 审计配置化）**：本轮实现已完成阶段 A/B/C/D/E/F/H/I/J 的可交付子集，并明确阶段 G 的边界。
+> **落地状态更新（2026-06-17；2026-06-19 补 H 审计策略与 J secret 轮换命令；2026-06-23 补 H 审计配置化；2026-06-23 补 A6 显式 reset 命令）**：本轮实现已完成阶段 A/B/C/D/E/F/H/I/J 的可交付子集，并明确阶段 G 的边界。
 >
-> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。**（2026-06-19）H：`audit_secret_access` 已 doc-comment 显式记录 fail-open 失败策略；J：新增 `config secret rotate` 覆写可迁移 secret（首批 `mail.password`）并显式提示运行中 service 需重启 re-resolve。（2026-06-23）H：审计已配置化——`config.vault.audit.enabled`（默认开启）经 `VaultCore::with_audit_config` 注入，满足“审计目的地可配置，默认开启”验收的 enable/default-on 维度；可配置持久化 sink 仍为后续。**
+> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。**（2026-06-19）H：`audit_secret_access` 已 doc-comment 显式记录 fail-open 失败策略；J：新增 `config secret rotate` 覆写可迁移 secret（首批 `mail.password`）并显式提示运行中 service 需重启 re-resolve。（2026-06-23）H：审计已配置化——`config.vault.audit.enabled`（默认开启）经 `VaultCore::with_audit_config` 注入，满足“审计目的地可配置，默认开启”验收的 enable/default-on 维度；可配置持久化 sink 仍为后续。（2026-06-23）A6：新增 `config vault reset --force` 显式运维命令，删除 vault 表全部数据、将 `core_key.json` 按时间戳备份后重新初始化，普通启动不再隐式触发清库。**
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
 > - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
 > - G：对象存储凭据未迁入本项目 vault，因此不做完整 Storage 后置初始化重排。当前边界是：`object_storage.*` 仍属于早期运行时依赖，不能配置为 `SecretRef`；`config secret set/check` 已不依赖对象存储可用。
@@ -55,6 +55,8 @@
 
 因此，后续把可迁移凭据写入 vault 时，不需要重新发明 secret 存储能力。真正需要补齐的是安全加固、初始化语义、错误模型、最小 bootstrap、运维命令和配置侧的 `SecretRef` resolver。
 
+新增运维命令：`config vault reset --force` 调用 `VaultCore::reset()`，先删除 `vault` 表全部数据，再将已有的 `core_key.json` 备份为带时间戳的 `.json.bak.<timestamp>`，最后重新初始化 RustyVault 并签发新的限权 token。该命令是破坏性操作，必须通过 `--force` 显式确认，普通启动和服务启动不再隐式触发清库。
+
 ## 当前实现状态速览表（2026-06-17）
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
@@ -63,6 +65,7 @@
 | KV secret 读写删 | 已实现并收窄 | `read_secret` / `write_secret` / `delete_secret` 使用相对 `SecretName`，拒绝 `/`、`secret/`、空段和 `..`。 |
 | vault 物理后端 | 已拆边界 | `JupiterBackend` 依赖 `VaultBackendStorage`，生产由 `VaultStorage` 适配；可 DB-only 构造 `VaultCore`。 |
 | `core_key.json` 自动解封 | 已加固 | 只保存 unseal 分片和限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不清库。 |
+| 显式 vault reset 命令 | 已实现 | `config vault reset --force` 删除 `vault` 表、备份 `core_key.json`、重新初始化；普通启动不再隐式清库。 |
 | root token 生命周期 | 已接入最小权限 | 初始化后安装 monoengine ACL policy、签发限权 token、撤销 root token；常规 secret 路径不持有 root token；generic token 显式拒绝 `secret/config/*`，并有 config/generic token 隔离单测。 |
 | secret 访问审计 | 已接 hook，可配置且默认开启，失败策略已记录 | `VaultCoreInterface` read/write/delete 记录 `vault_audit` 事件，不包含 secret 值、root token 或分片；`audit_secret_access` 已 doc-comment 显式记录 fail-open 策略（审计经 infallible 的 `tracing`，绝不阻断 secret 操作）；`config.vault.audit.enabled`（默认 `true`，经 `VaultCore::with_audit_config` 注入）可显式 opt-out。可配置的持久化/异地 sink 与随之而来的可选 fail-closed 写入策略仍为后续（tracing target 受静态字面量约束）。 |
 | 最小 DB/Vault bootstrap | 已实现 | `VaultCore::from_database_config/from_database_connection` 和 `config secret set/check` 只依赖数据库和 vault key。 |

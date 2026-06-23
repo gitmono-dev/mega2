@@ -79,6 +79,8 @@ pub enum VaultError {
     PkiMount(String),
     #[error("failed to revoke initialized vault root token")]
     RootTokenRevoke,
+    #[error("failed to reset vault storage: {0}")]
+    Reset(String),
     #[error("invalid vault secret name")]
     InvalidSecretName,
     #[error("failed to read from vault API: {0}")]
