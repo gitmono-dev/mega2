@@ -649,7 +649,7 @@ pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), ProtocolEr
 pub mod test {
     use std::{process::Command, time::Duration};
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
     use futures::future;
     use tempfile::TempDir;
     use tokio::{task, time::sleep};
@@ -842,6 +842,66 @@ pub mod test {
         assert!(tokens.contains(&"no-done"));
         assert!(tokens.contains(&"side-band-64k"));
         assert!(!tokens.contains(&"include-tag"));
+    }
+
+    #[test]
+    pub fn build_side_band_format_wraps_payload_when_side_band_64k_enabled() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        session.capabilities.insert(Capability::SideBand64k);
+
+        let payload = BytesMut::from(&b"unpack ok\n"[..]);
+        let length = payload.len();
+        let framed = session.build_side_band_format(payload.clone(), length);
+
+        let expected_total = 4 + 1 + payload.len();
+        let header = format!("{expected_total:04x}");
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(header.as_bytes());
+        expected.put_u8(0x01);
+        expected.extend_from_slice(&payload);
+        assert_eq!(&framed[..], &expected[..]);
+    }
+
+    #[test]
+    pub fn build_side_band_format_passthrough_when_capability_absent() {
+        let session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+
+        let payload = BytesMut::from(&b"unpack ok\n"[..]);
+        let framed = session.build_side_band_format(payload.clone(), payload.len());
+        assert_eq!(&framed[..], &payload[..]);
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_ofs_delta() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("report-status ofs-delta side-band-64k");
+        assert!(session.capabilities.contains(&Capability::OfsDelta));
+        assert!(session.capabilities.contains(&Capability::ReportStatus));
+        assert!(session.capabilities.contains(&Capability::SideBand64k));
+    }
+
+    #[test]
+    pub fn advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format() {
+        for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+            let caps = advertised_capabilities(service);
+            let tokens = caps.split_whitespace().collect::<Vec<_>>();
+            assert!(
+                !tokens.iter().any(|t| t.starts_with("object-format")),
+                "object-format must not be advertised for a SHA-1-only server ({service:?}): {caps}"
+            );
+        }
     }
 
     async fn git_push_with_retry(repo_path: &std::path::Path) -> anyhow::Result<()> {

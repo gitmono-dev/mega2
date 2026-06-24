@@ -37,6 +37,8 @@
 > **2026-06-24 更新 2**：SSH LFS exec parser 已收紧 `git-lfs-authenticate` / `git-lfs-transfer` 参数语义，operation 从 optional 改为必填且仅允许 `upload` / `download`；缺失或未知 operation 返回 channel failure，不再接受模糊请求。
 >
 > **2026-06-24 更新 3**：SSH `git-lfs-authenticate` 响应序列化已移除 `serde_json::to_vec(...).unwrap()`，改为错误传播；成功写回 hybrid LFS JSON response 后显式发送 channel success。
+>
+> **2026-06-24 更新 4**：capability truth table 阶段 3 收尾——为 `side-band-64k` 补充 `build_side_band_format` 专用单测（含启用/未启用两条路径）；为 `ofs-delta` 补充 advertise/parse 单测并明确其 OFS_DELTA pack 编解码由 `git-internal` crate 实现（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧仅覆盖 advertise/parse；对 SHA-1 object format 落地显式策略——协议允许 SHA-1 默认时省略 `object-format`，monoengine 策略是对 SHA-1-only repo 不 advertise `object-format`，由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -46,7 +48,7 @@
 
 4. **认证策略不一致**。HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH 通过 public key，但未统一 auth context。
 
-5. **Capability advertise 已完成首批保守收敛**。receive-pack 不再 advertise 未验证的 atomic、report-status-v2、delete-refs、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag。后续仍需为剩余 side-band/ofs-delta 等能力补完整 truth table 和真实 Git CLI 矩阵。
+5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 不再 advertise 未验证的 atomic、report-status-v2、delete-refs、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；后续仅剩真实 Git CLI 兼容性矩阵。
 
 6. **SSH 多 channel 状态管理不够细致**。per-connection 状态共享，不是 per-channel，可能在多 channel 场景下产生串联。
 
@@ -61,7 +63,7 @@
 | SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
-| Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
+| Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略。仅剩真实 Git CLI 兼容性矩阵。 |
 | 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；response builder / in-memory reader、`repo.rs` path 转换等剩余路径仍有 `unwrap()`/panic 待收敛。 |
 
 ## 硬约束与不可违反的原则
@@ -233,10 +235,10 @@ SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中�
 
 ```text
 upload-pack:
-  multi_ack_detailed no-done include-tag side-band-64k ofs-delta agent=mega/0.1.0
+  multi_ack_detailed no-done side-band-64k ofs-delta agent=mega/0.1.0
 
 receive-pack:
-  report-status report-status-v2 delete-refs quiet atomic no-thin side-band-64k ofs-delta agent=mega/0.1.0
+  report-status side-band-64k ofs-delta agent=mega/0.1.0
 ```
 
 `Capability` enum 当前只解析部分 capability：
@@ -432,24 +434,24 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 - 删除协议二进制路径上的 UTF-8 假设。
 - `session.data` 调用只传 `Vec<u8>` 或 bytes，不做 String 转换。
 
-### capability advertisement 与实际实现不完全一致
+### capability advertisement 与实际实现已对齐
 
-当前 advertise 包含一些未完整实现或解析不足的能力：
+历史风险：曾 advertise 一些未完整实现或解析不足的能力。当前状态（均已解决）：
 
-- `include-tag` 被 advertise，但 `Capability` enum 不解析它，pack 生成是否按 include-tag 语义包含 tag target 需要进一步验证。
-- `delete-refs` 被 advertise，但 receive-pack 的纯删除无 pack 场景不稳健。
-- `atomic` 被 advertise，但 receive-pack ref 更新和 side effects 是否真正原子需要验证。
-- `quiet` 被 advertise，但当前没有显式处理 quiet 的 progress 抑制语义。
-- `no-thin` 被 advertise，但 pack 解码和 thin-pack 行为需要明确测试。
-- `report-status-v2` 被 advertise，但返回内容更接近 v1 `unpack ok` + per-ref status，未体现 v2 的完整语义。
-- `ofs-delta` 被 advertise，pack decode/encode 是否完整支持 OFS_DELTA 需要测试矩阵验证。
+- `include-tag`：已从 upload-pack advertise 移除（pack 生成未按 include-tag 语义验证）。
+- `delete-refs`：已从 advertise 移除（receive-pack 纯删除无 pack 场景不稳健）。
+- `atomic`：已从 advertise 移除（未实现原子 ref 更新）。
+- `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
+- `no-thin`：已从 advertise 移除（thin-pack 行为未明确测试）。
+- `report-status-v2`：已从 advertise 移除（未实现 v2 完整语义）。
+- `ofs-delta`：仍 advertise；OFS_DELTA pack 编解码由 `git-internal` crate 实现并自测（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧覆盖 advertise/parse（`parse_capabilities_recognizes_ofs_delta`）。
 
 建议：
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
 - 已完成首批：`atomic`、`report-status-v2`、`delete-refs`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；后续若补齐行为和测试再重新声明。
-- 对 `object-format=sha1` 明确 advertise 或确认默认 SHA-1 兼容性。
+- ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 ### pkt-line parser 缺少错误模型
 
@@ -661,7 +663,7 @@ LFS:
 1. 建立 capability truth table。
 2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`include-tag`、`delete-refs` 等能力。
 3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。
-4. 对 SHA-1 object format 做显式策略。
+4. ✅ 对 SHA-1 object format 做显式策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 验收标准：
 
@@ -673,8 +675,8 @@ LFS:
 | Capability | Advertised? | Parsed? | Acted On? | Tested? | 说明 |
 |---|---|---|---|---|---|
 | `report-status` | ✅ receive-pack | ✅ | ✅ 生成 `unpack ok` + per-ref status | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` | 基础 report-status v1 语义 |
-| `side-band-64k` | ✅ both | ✅ | ✅ `build_side_band_format` | ✅ 侧带构造有单测 | pack data 通过 side-band 传输 |
-| `ofs-delta` | ✅ both | ✅ | ⚠️ 识别但未完整验证 OFS_DELTA 编解码 | ❌ 需补完整 OFS_DELTA truth table | pack encode/decode 需测试矩阵 |
+| `side-band-64k` | ✅ both | ✅ | ✅ `build_side_band_format` | ✅ `build_side_band_format_wraps_payload_when_side_band_64k_enabled` + `build_side_band_format_passthrough_when_capability_absent` | pack data 通过 side-band 传输 |
+| `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；monoengine 侧仅覆盖 advertise/parse |
 | `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
@@ -684,8 +686,9 @@ LFS:
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
+| `object-format` | ❌ 不 advertise | N/A | N/A | ✅ `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` | 显式策略：SHA-1 为协议默认，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise） |
 
-残余风险：`ofs-delta` 被 advertise 但 OFS_DELTA 编解码未完整测试；后续需补 truth table 覆盖或暂时移除。
+残余风险：`ofs-delta` 的 pack 编解码由 `git-internal` crate 实现并自测，monoengine 侧已覆盖 advertise/parse；如需端到端 OFS_DELTA pack 矩阵可在 `git-internal` 侧补足。
 
 ### 阶段 4：认证与授权统一
 
