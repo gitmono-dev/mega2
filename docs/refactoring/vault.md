@@ -99,6 +99,8 @@ Config::new
 
 ## Vault 初始化时序（按代码核实）
 
+> **事实校准（2026-06-24）**：本节为阶段 A 加固前的代码级分析快照，其中描述的“key 缺失即 `delete_all` 清库”、“`println!`/`log::debug!` 输出 root token”、“`assert!` 触发 unseal”等行为**已在阶段 A 消除**（见本文件顶部“落地状态更新”与阶段 A 工作项）。当前 `VaultCore::config` fail-closed、不再输出 root token、普通启动不再隐式清库。本节保留以记录历史决策脉络，新的实现以代码与阶段 A 描述为准。
+
 本节是上面“启动依赖顺序”的代码级展开，所有步骤都标注了文件与行号，供实现与评审核对。启动分为两个阶段：**同步阶段**（尚未创建 tokio runtime，vault 不可能就绪）与**异步阶段**（`service::exec` 的 `#[tokio::main]` 启动 runtime 之后）。
 
 ### 进程入口到 vault 就绪

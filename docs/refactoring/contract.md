@@ -74,7 +74,7 @@
 > **验收标准**：
 > - `cargo +nightly fmt --all --check` ✅ 通过
 > - `cargo clippy --all-targets --all-features -- -D warnings` ✅ 通过
-> - `source .env.test && cargo test --all` ✅ 通过（集成测试 9 + 单元测试 561）
+> - `source .env.test && cargo test --all` ✅ 通过（集成测试 10 + 单元测试 584）
 
 ## 前置依赖矩阵
 

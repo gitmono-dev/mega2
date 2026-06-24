@@ -65,7 +65,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | SecretRef | 已支持 `vault://secret/<name>#<field>`；当前仅 `mail.password` 可写入 monoengine Vault | P0 覆盖 `ref/set/check/validate --resolve-secrets` |
 | 数据库 | `database_connection()` 只支持 PostgreSQL，连接后自动执行 migrations | P0 必须检测真实连接到 PostgreSQL |
 | Redis | `AppContext::new` 在 Vault 前初始化 Redis | P0 service smoke 需要 Redis 容器 |
-| 对象存储 | 通过 `jupiter::storage::object_storage::ObjectStorageFactory` 构造，测试可使用 local temp dir | P0 使用 local backend |
+| 对象存储 | 通过 `jupiter::storage::object_storage::build_object_storage` 构造（由 composition root 注入 `Storage::new`），测试可使用 local temp dir | P0 使用 local backend |
 | Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造；`integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖真实 SMTP/Mailpit 正路径，`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖 SMTP transport 失败 retry | P0/P1 扩展 Mailpit/SMTP 故障矩阵 |
 | Notification | email outbox、dispatcher、CL comment trigger 存在；用户-facing API 和多渠道缺失 | P1 模块集成 + service dispatcher 测试 |
 | 热加载 | 已实现（`config::reload` 的 `ConfigHandle`/白名单应用/`ConfigReloadWatcher` + 日志/mail dispatcher/template/mailer 订阅者，单测充分） | P2 专门黑盒 `integration_config_hot_reload` 仍未单列 |
@@ -332,7 +332,7 @@ mail resolver fail-closed：进程非 0 退出、给出脱敏的 “secret not f
 - 缺少收件人时 job 变为 `skipped`。
 - SMTP 临时失败时 job 进入 retry 状态，`retry_count` 增加，`next_retry_at` 有值。
 
-**当前落地状态**：`src/notification/dispatcher.rs::tests::integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖 outbox pending job 经真实 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at` 的正路径；`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖真实 SMTP transport 连接失败后 job 回到 `pending`、`retry_count` 增加且写入 `next_retry_at`。缺少收件人的状态转换已有 dispatcher 模块测试覆盖；仍需补 Mailpit/SMTP 层面的更多故障矩阵。该 Mailpit 正路径用例已改为在 `MAILPIT_API_URL` 不可达时优雅跳过（`eprintln` 提示后 `return`，不再 `panic!`），未启动测试栈时不会让整个测试二进制失败。
+**当前落地状态**：`src/notification/dispatcher.rs::tests::integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖 outbox pending job 经真实 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at` 的正路径；`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖真实 SMTP transport 连接失败后 job 回到 `pending`、`retry_count` 增加且写入 `next_retry_at`。缺少收件人的状态转换已有 dispatcher 模块测试覆盖；Mailpit/SMTP 故障矩阵已扩展到 7 个集成用例（正路径投递、SMTP 连接失败 retry、协议拒绝 retry、认证拒绝 retry、relay 拒绝 retry、dead-letter、missing-recipient skip），均不泄露凭据。该 Mailpit 正路径用例已改为在 `MAILPIT_API_URL` 不可达时优雅跳过（`eprintln` 提示后 `return`，不再 `panic!`），未启动测试栈时不会让整个测试二进制失败。
 
 ## P1：安全与业务链路扩展 gate
 
@@ -516,15 +516,15 @@ args
 
 ```text
 Config::new(path)
-  -> Storage::new(config)
+  -> build_object_storage(object_storage)   // caller (composition root) constructs the backend
+  -> Storage::new(config, object_store)
        -> database_connection(database)
        -> apply_migrations(false)
-       -> ObjectStorageFactory::build(object_storage)
   -> init_connection(redis)
   -> VaultCore::new(storage.clone())
   -> resolve mail.password_ref
-  -> SmtpMailer::new_with_password
-  -> EmailDispatcher::spawn
+  -> mailer_from_config
+  -> tokio::spawn(NotificationService::start)
   -> mono_service.init_monorepo
   -> HTTP bind
 ```

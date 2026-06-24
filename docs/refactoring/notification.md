@@ -27,7 +27,7 @@
    - `dispatcher.rs` 实现了 `EmailDispatcher`（依赖 `crate::mail::Mailer` + `NotificationStorage`，处理 `email_jobs` outbox，支持 claim、可配置 retry/dead-letter、stale `sending` 恢复、mark sent/failed/skipped 和可配置批次/并发 tick）。
    - `triggers.rs` 实现了 `on_cl_comment_created`（使用 NotificationStorage 进行 event type upsert、should_send 过滤、enqueue_email_job）。
    - `mod.rs` 声明 `channels`/`dispatcher`/`redact`/`service`/`triggers` 子模块，并 re-export `NotificationService` 与 `config_reload_email_dispatcher_subscriber`。
-   - `main.rs:18` 已声明 `mod notification;`，`AppContext::new` 在 vault 之后、`init_monorepo` 之前构造 `NotificationService` 并 `start`（内部 `tokio::spawn` 的 `EmailDispatcher`）。CL 评论触发器已接入 `cl_router::save_comment`；其他事件触发器仍需逐条接入。
+   - `lib.rs:26` 已声明 `mod notification;`，`AppContext::new` 在 vault 之后、`init_monorepo` 之前构造 `NotificationService` 并 `start`（内部 `tokio::spawn` 的 `EmailDispatcher`）。CL 评论触发器已接入 `cl_router::save_comment`；其他事件触发器仍需逐条接入。
 
 2. **核心存储逻辑放在 jupiter 层**。`src/jupiter/storage/notification_storage.rs` 实现了完整的 NotificationStorage（对 callisto 实体的 CRUD + 业务逻辑：upsert_user_settings、set_global_enabled、should_send（结合 system_required / default_enabled / user prefs）、enqueue_email_job、fetch_pending_jobs、try_claim_job、mark_* 等）。这与 mega 的 jupiter 实现几乎一致，但 notification 模块本身并未在此之上提供高层 Service 抽象。
 
@@ -54,7 +54,7 @@
 
 | 能力 / 组件                     | 实现状态          | 关键事实与风险 |
 |--------------------------------|-------------------|---------------|
-| `src/notification/` 作为一级模块 | **已激活，含渠道抽象与协调器** | 有 mod/dispatcher/triggers/redact + `channels/`（`NotificationChannel`/`EmailChannel`/`ConsoleChannel`）+ `service.rs`（`NotificationService`），`main.rs:18` 已声明 `mod notification;`。CL 评论触发器已接入生产路径（`cl_router::save_comment`）；其他事件（issue/PR/mention/build）仍待接入。 |
+| `src/notification/` 作为一级模块 | **已激活，含渠道抽象与协调器** | 有 mod/dispatcher/triggers/redact + `channels/`（`NotificationChannel`/`EmailChannel`/`ConsoleChannel`）+ `service.rs`（`NotificationService`），`lib.rs:26` 已声明 `mod notification;`。CL 评论触发器已接入生产路径（`cl_router::save_comment`）；其他事件（issue/PR/mention/build）仍待接入。 |
 | EmailDispatcher + outbox 处理   | **运行时已 spawn（mail 启用时），基线已加固** | 依赖 `mail::Mailer`，实现 claim/retry/dead-letter/mark 逻辑，tick 每 2s。`AppContext::new` 在 vault 之后构造并 spawn；构造失败会返回可诊断错误。Dispatcher 已有可配置批次/并发限流、可配置指数退避 retry/dead-letter 策略、结构化 tick 汇总、stale `sending` 恢复、HTTP graceful shutdown 取消、单 tick 与多 tick 高水位背压测试、跨独立 DB connection pool 的 claim 竞争基线、真实 SMTP/Mailpit 正路径测试，以及真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露、权限/relay 拒绝 retry/凭据不泄露和缺失收件人 skip 测试。当前缺口是更完整 Mailpit/SMTP 故障矩阵、多实例黑盒矩阵、更完整 failure diagnostics/metrics。 |
 | 触发器（on_cl_comment_created 等） | 部分实现，CL 评论/合并、issue 评论、item 引用已接入生产 | 实现了 CL 评论场景（作者+reviewers，prefs 过滤，enqueue）、CL 合并场景（作者，排除合并者，prefs 过滤，enqueue）、issue 评论场景（作者，排除 actor，prefs 过滤，enqueue）和 item 引用场景（被引用项作者，排除 actor，prefs 过滤，enqueue）。邮件内容通过 `mail::template::MailTemplateRegistry` 按收件人的 `user_notification_settings.preferred_locale` 渲染并默认转义 HTML 变量，registry 已支持 locale fallback 和启动期 TOML 模板覆盖，且 CL 评论/合并、issue 评论、item 引用均有 en-US/zh-CN 模板与单元测试。**`on_cl_comment_created` 已由 `cl_router::save_comment`、`on_cl_merged` 已由 `cl_router::merge`、`on_issue_comment_created` 已由 `issue_router::save_comment` 在事件持久化后调用（best-effort，失败仅告警），outbox 有真实生产者。** 其他事件（PR、build 等）缺失或仅在 mega 中有原型。 |
 | NotificationStorage（jupiter 层） | 已实现（完整）    | 位于 `src/jupiter/storage/notification_storage.rs`，封装所有实体访问 + should_send 业务逻辑 + email job 生命周期。被 triggers 和 dispatcher 直接使用。 |
@@ -173,7 +173,7 @@ NotificationService / Coordinator (一级 notification 模块核心)
 
 ### 总体原则
 
-- 提升为一级模块（已在 `src/notification/` 目录，但需确保在 main.rs 声明、提供干净公共 API、与 AppContext 良好集成）。
+- 提升为一级模块（已在 `src/notification/` 目录，已在 `lib.rs` 声明、提供干净公共 API、与 AppContext 良好集成）。
 - 渠道抽象（当前 email 硬编码，需 trait 化）。
 - 依赖注入晚绑定（mailer 等在 vault 后提供）。
 - Outbox 泛化（email_jobs 是 email 特定；未来可有 unified notifications 表 + per-channel delivery jobs，或保持 email_jobs 专用 + 其他渠道独立 outbox）。
@@ -242,7 +242,7 @@ Config::new
 > 不建议提前启动阶段 3，除非上述前置已经就绪。
 
 **阶段 0（基础激活，与 mail 阶段 0/1 对齐，已完成首批关键路径接入）**：
-- `main.rs` 声明 `mod notification;` 已完成。
+- `lib.rs` 声明 `mod notification;` 已完成。
 - 在 service 启动路径中，于 vault + mail 就绪后 spawn delivery 任务已完成（现经 `NotificationService::start`，见阶段 1）。
 - HTTP graceful shutdown 广播到 `notification_shutdown` 以取消 mail dispatcher 已完成。
 - **已完成（2026-06-19；2026-06-23 补 CL 合并触发器）**：触发器已接入真实业务关键路径。`src/api/router/cl_router.rs::save_comment` 在 `add_conversation` 成功后调用 `crate::notification::triggers::on_cl_comment_created`，`cl_router::merge` 在 CL 成功合并后调用 `crate::notification::triggers::on_cl_merged`（best-effort，失败仅 `tracing::warn!` 不阻断原请求），outbox 自此有真实生产者，不再仅由测试 enqueue。
