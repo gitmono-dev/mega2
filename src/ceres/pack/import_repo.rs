@@ -449,9 +449,29 @@ impl ImportRepo {
             .lock()
             .expect("command_list lock poisoned")
             .clone();
+        if !commands_snapshot
+            .iter()
+            .any(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
+        {
+            let txn = self.storage.begin_db_transaction().await?;
+            let git_db = self.storage.git_db_storage();
+            for cmd in &commands_snapshot {
+                if cmd.ref_type != RefTypeEnum::Branch {
+                    continue;
+                }
+                if let CommandType::Delete = cmd.command_type {
+                    git_db
+                        .remove_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &txn)
+                        .await?;
+                }
+            }
+            txn.commit().await.map_err(MegaError::Db)?;
+            return Ok(());
+        }
+
         let commit_id = match commands_snapshot
             .iter()
-            .find(|c| c.ref_type == RefTypeEnum::Branch)
+            .find(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
         {
             Some(cmd) => cmd.new_id.clone(),
             None => return Ok(()),
@@ -713,7 +733,22 @@ async fn process_objects(
 
 #[cfg(test)]
 mod test {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
+
+    use sea_orm::TransactionTrait;
+
+    use crate::{
+        callisto::{import_refs, sea_orm_active_enums::RefTypeEnum},
+        jupiter::{
+            migration::apply_migrations,
+            storage::{
+                base_storage::{BaseStorage, StorageConnector},
+                git_db_storage::GitDbStorage,
+            },
+            tests::test_db_connection,
+        },
+    };
+
     #[test]
     pub fn test_recurse_tree() {
         let path = PathBuf::from("/third-party/crates/tokio/tokio-console");
@@ -721,5 +756,38 @@ mod test {
         for path in ancestors.into_iter() {
             println!("{path:?}");
         }
+    }
+
+    #[tokio::test]
+    pub async fn delete_only_branch_ref_persistence_removes_ref_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let db = Arc::new(db);
+        let base = BaseStorage::new(db.clone());
+        let git_db = GitDbStorage { base: base.clone() };
+        let repo_id = 1i64;
+
+        let seed = import_refs::Model {
+            id: 1,
+            repo_id,
+            ref_name: String::from("refs/heads/main"),
+            ref_git_id: String::from("27dd8d4cf39f3868c6eee38b601bc9e9939304f5"),
+            ref_type: RefTypeEnum::Branch,
+            default_branch: true,
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        };
+        git_db.save_ref(repo_id, seed).await.unwrap();
+        assert_eq!(git_db.get_ref(repo_id).await.unwrap().len(), 1);
+
+        let txn = db.begin().await.unwrap();
+        git_db
+            .remove_ref_in_txn(repo_id, "refs/heads/main", &txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        assert!(git_db.get_ref(repo_id).await.unwrap().is_empty());
     }
 }

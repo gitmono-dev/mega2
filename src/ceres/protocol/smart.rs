@@ -15,7 +15,7 @@ use crate::{
         api_service::state::ProtocolApiState,
         protocol::{
             Capability, ServiceType, SideBind, SmartSession, TransportProtocol, ZERO_ID,
-            import_refs::RefCommand,
+            import_refs::{CommandType, RefCommand},
         },
     },
     common::errors::ProtocolError,
@@ -263,6 +263,13 @@ impl SmartSession {
         ))
     }
 
+    fn is_delete_only_push(commands: &[RefCommand]) -> bool {
+        !commands.is_empty()
+            && commands
+                .iter()
+                .all(|c| c.command_type == CommandType::Delete)
+    }
+
     fn parse_receive_pack_command_line(
         &mut self,
         pkt_line: &mut Bytes,
@@ -297,24 +304,32 @@ impl SmartSession {
             .await?;
         let is_monorepo = repo_handler.is_monorepo();
         //1. unpack progress
-        let t_unpack = Instant::now();
-        let receiver = repo_handler
-            .unpack_stream(&state.storage.config().pack, data_stream)
-            .await?;
-        timings_ms.insert(
-            "unpack_stream_ms".to_string(),
-            t_unpack.elapsed().as_millis(),
-        );
+        let delete_only = Self::is_delete_only_push(&commands);
+        let unpack_result = if delete_only {
+            timings_ms.insert("unpack_stream_ms".to_string(), 0);
+            timings_ms.insert("receiver_handler_ms".to_string(), 0);
+            Ok(())
+        } else {
+            let t_unpack = Instant::now();
+            let receiver = repo_handler
+                .unpack_stream(&state.storage.config().pack, data_stream)
+                .await?;
+            timings_ms.insert(
+                "unpack_stream_ms".to_string(),
+                t_unpack.elapsed().as_millis(),
+            );
 
-        let t_receiver = Instant::now();
-        let unpack_result = repo_handler
-            .clone()
-            .receiver_handler(receiver.0, receiver.1)
-            .await;
-        timings_ms.insert(
-            "receiver_handler_ms".to_string(),
-            t_receiver.elapsed().as_millis(),
-        );
+            let t_receiver = Instant::now();
+            let res = repo_handler
+                .clone()
+                .receiver_handler(receiver.0, receiver.1)
+                .await;
+            timings_ms.insert(
+                "receiver_handler_ms".to_string(),
+                t_receiver.elapsed().as_millis(),
+            );
+            res
+        };
 
         // write "unpack ok\n to report"
         add_pkt_line_string(&mut report_status, "unpack ok\n".to_owned());
@@ -924,6 +939,40 @@ pub mod test {
             Some("alice")
         );
         assert_eq!(session.auth.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    pub fn is_delete_only_push_detects_pure_delete_vs_mixed() {
+        fn delete_cmd() -> RefCommand {
+            RefCommand {
+                ref_name: String::from("refs/heads/old"),
+                old_id: String::from("27dd8d4cf39f3868c6eee38b601bc9e9939304f5"),
+                new_id: String::from("0000000000000000000000000000000000000000"),
+                status: String::from("ok"),
+                error_msg: String::new(),
+                command_type: CommandType::Delete,
+                ref_type: RefTypeEnum::Branch,
+                default_branch: false,
+            }
+        }
+        let create = RefCommand {
+            ref_name: String::from("refs/heads/new"),
+            old_id: String::from("0000000000000000000000000000000000000000"),
+            new_id: String::from("27dd8d4cf39f3868c6eee38b601bc9e9939304f5"),
+            status: String::from("ok"),
+            error_msg: String::new(),
+            command_type: CommandType::Create,
+            ref_type: RefTypeEnum::Branch,
+            default_branch: false,
+        };
+
+        assert!(SmartSession::is_delete_only_push(&[delete_cmd()]));
+        assert!(SmartSession::is_delete_only_push(&[
+            delete_cmd(),
+            delete_cmd()
+        ]));
+        assert!(!SmartSession::is_delete_only_push(&[delete_cmd(), create]));
+        assert!(!SmartSession::is_delete_only_push(&[]));
     }
 
     async fn git_push_with_retry(repo_path: &std::path::Path) -> anyhow::Result<()> {
