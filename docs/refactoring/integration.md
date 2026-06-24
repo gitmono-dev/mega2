@@ -574,7 +574,7 @@ Vault bootstrap 过程中被消费。
 
 1. **Phase 0：测试基础设施**
    - 新增 `docker-compose.test.yml`。
-   - 新增测试配置生成 helper（黑盒测试可在 `bin/tests/common` 中只生成 TOML，不导入 crate）。
+   - ✅ 新增测试配置生成 helper（黑盒测试在 `bin/tests/common/mod.rs` 中只生成 TOML，不导入 crate）：`write_bootstrap_config` / `write_full_config`，被 `bin/tests/integration_vault.rs::VaultCliEnv` 复用。
    - 约定临时目录、端口、日志和 cleanup。
 2. **Phase 1：P0 CLI gate**
    - `integration_cli_secret_ref`

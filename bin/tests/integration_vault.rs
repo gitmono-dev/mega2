@@ -10,6 +10,8 @@
 // 6. 服务启动 smoke（integration.md 场景 4）用空闲端口启动真实 `service http`，用裸 HTTP/1.1
 //    请求探活，再用 SIGINT 验证可诊断的优雅退出与 fail-closed 行为。
 
+mod common;
+
 use std::{
     fs,
     io::{ErrorKind, Read, Write},
@@ -72,29 +74,11 @@ impl VaultCliEnv {
 
         // 最小 bootstrap 配置只提供数据库字段。这样可以证明 secret set/check
         // 不依赖 Redis、对象存储、邮件或 HTTP service 的完整初始化链路。
-        fs::write(
-            &bootstrap_config_path,
-            format!(
-                r#"
-                [database]
-                db_type = "postgres"
-                db_path = ""
-                db_url = "{}"
-                max_connection = 4
-                min_connection = 1
-                acquire_timeout = 5
-                connect_timeout = 5
-                sqlx_logging = false
-                "#,
-                database.db_url
-            ),
-        )
-        .expect("write bootstrap config");
+        common::write_bootstrap_config(&bootstrap_config_path, &database.db_url);
 
         // 完整配置从仓库默认配置复制出来，再由 command_with_config 注入环境变量覆盖。
         // 这样既验证真实配置结构可加载，也避免测试修改仓库里的 config/config.toml。
-        fs::write(&full_config_path, include_str!("../../config/config.toml"))
-            .expect("write full config");
+        common::write_full_config(&full_config_path);
 
         Self {
             temp_dir,
