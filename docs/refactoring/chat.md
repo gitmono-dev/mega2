@@ -323,6 +323,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 - unique `public_id`
 - `(subject_type, subject_id)`
 - unique `(subject_type, subject_id, username, content, custom_reaction_id, discarded_at)`，迁移时确认 Postgres 对 nullable unique 的语义是否满足需求；不满足则使用 partial unique index。
+  - **已核实（2026-06-24）**：当前 `idx-reactions-unique-active` 是 `WHERE discarded_at IS NULL` 的 partial unique index，但因其包含 nullable 列（`content` / `custom_reaction_id`），Postgres 默认把 NULL 视为互不相同，实际不会对标准 emoji（`custom_reaction_id` NULL）或 custom reaction（`content` NULL）去重。若要真正去重，需改用 `NULLS NOT DISTINCT`（Postgres 15+）重建索引——属后续 chat 专项，暂不在本次范围。
 
 ### `custom_reactions`
 
@@ -675,7 +676,7 @@ pub trait ChatEvents {
 验收：
 
 - 迁移测试覆盖 4 张表和关键索引。
-- storage 测试覆盖 create/query/soft delete/unique conflict。
+- ✅ storage 测试覆盖 create/query/soft delete/unique conflict（`custom_reaction_storage::test_custom_reaction_rejects_duplicate_lowercase_name` 覆盖 `lower(name)` 唯一冲突；reactions 部分唯一索引因 Postgres 对 nullable 列的 NULL-distinct 语义实际不强制去重，见下方约束说明）。
 - 不引入外部网络调用。
 
 ### Slice 2: Channel Chat schema + storage（主干已落地）
