@@ -21,6 +21,9 @@ use crate::ceres::{
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
 
+const LFS_TRANSFER_UNSUPPORTED_ERROR: &str =
+    "git-lfs-transfer is not supported; use git-lfs-authenticate HTTP fallback\n";
+
 #[derive(Debug, PartialEq)]
 enum SshExecKind {
     Git(ServiceType),
@@ -120,7 +123,11 @@ impl server::Handler for SshServer {
                     operation = ?exec.lfs_operation,
                     "git-lfs-transfer requested"
                 );
-                session.data(channel, "not implemented yet".as_bytes().to_vec())?;
+                session.extended_data(
+                    channel,
+                    1,
+                    LFS_TRANSFER_UNSUPPORTED_ERROR.as_bytes().to_vec(),
+                )?;
                 session.channel_failure(channel)?;
             }
             // When connecting over SSH, the first attempt will be made to use
@@ -454,6 +461,12 @@ mod tests {
         assert_eq!(parsed.kind, SshExecKind::LfsAuthenticate);
         assert_eq!(parsed.repo_path, PathBuf::from("/srv/git/project"));
         assert_eq!(parsed.lfs_operation.as_deref(), Some("download"));
+    }
+
+    #[test]
+    fn lfs_transfer_unsupported_error_is_stderr_friendly() {
+        assert!(LFS_TRANSFER_UNSUPPORTED_ERROR.starts_with("git-lfs-transfer is not supported"));
+        assert!(LFS_TRANSFER_UNSUPPORTED_ERROR.ends_with('\n'));
     }
 
     #[test]

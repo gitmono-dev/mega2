@@ -31,6 +31,8 @@
 > **2026-06-23 更新 5**：HTTP upload-pack request body 聚合不再对 body stream 错误 `unwrap()`，已与 receive-pack 统一经 `ProtocolError::InvalidInput` 返回。
 >
 > **2026-06-23 更新 6**：HTTP `info/refs` query 已按 smart HTTP 规范收紧为 exactly one `service=...` 参数，额外参数和重复 `service` 均返回 `ProtocolError::InvalidInput`。
+>
+> **2026-06-24 更新**：SSH `git-lfs-transfer` pure SSH 路径已从普通占位文本 `not implemented yet` 改为通过 SSH stderr extended-data 返回明确 unsupported 错误，并继续返回 channel failure，明确声明不支持 pure SSH LFS transfer、引导客户端使用 `git-lfs-authenticate` 的 HTTP fallback。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -53,7 +55,7 @@
 | HTTP POST receive-pack | 已实现（首批止血） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；仍需 streaming parser、delete-only push 和更完整真实 Git CLI 矩阵。 |
 | SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；后续仍需 per-channel state。 |
 | SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
-| SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
+| SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
 | Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
 | 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23）；response builder / in-memory reader、`repo.rs` path 转换等剩余路径仍有 `unwrap()`/panic 待收敛。 |
@@ -190,7 +192,7 @@ SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/contract/git_protocol
 - 处理 `exec_request`。
 - 支持 `git-upload-pack` 和 `git-receive-pack`。
 - 支持 `git-lfs-authenticate` hybrid LFS discovery。
-- 对 `git-lfs-transfer` 返回未实现。
+- 对 `git-lfs-transfer` 返回明确 unsupported failure。
 - 使用用户上传的 SSH public key fingerprint 进行认证。
 
 SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中的 smart protocol 实现。
@@ -535,7 +537,7 @@ let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
 
 ### Git LFS SSH 仅支持 hybrid 模式
 
-SSH 中 `git-lfs-transfer` 返回 `not implemented yet`，`git-lfs-authenticate` 返回 HTTP LFS URL。这符合 Git LFS 可 fallback 的 hybrid 模式，但不是纯 SSH LFS transfer。
+SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authenticate` 返回 HTTP LFS URL。这符合 Git LFS 可 fallback 的 hybrid 模式，但不是纯 SSH LFS transfer。
 
 建议：
 
@@ -708,7 +710,7 @@ LFS:
 
 1. 引入 `GitSshChannelState`，按 `ChannelId` 保存状态。
 2. `channel_eof` 只处理当前 channel。
-3. `git-lfs-transfer` 返回规范 unsupported。
+3. ✅ `git-lfs-transfer` 通过 SSH stderr extended-data 返回规范 unsupported 错误，并通过 channel failure 触发客户端 fallback。
 4. `git-lfs-authenticate` 按 upload/download operation 返回准确 response。
 5. LFS HTTP endpoint 绑定 repo path 和认证上下文。
 
