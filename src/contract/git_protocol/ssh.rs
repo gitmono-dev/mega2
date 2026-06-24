@@ -261,28 +261,29 @@ fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
             })
         }
         "git-lfs-authenticate" => {
-            if !(2..=3).contains(&args.len()) {
+            if args.len() != 3 {
                 return Err(
-                    "git-lfs-authenticate requires a repository path and optional operation"
+                    "git-lfs-authenticate requires a repository path and upload/download operation"
                         .to_owned(),
                 );
             }
             Ok(SshExecRequest {
                 kind: SshExecKind::LfsAuthenticate,
                 repo_path: normalize_ssh_repo_path(&args[1])?,
-                lfs_operation: args.get(2).cloned(),
+                lfs_operation: Some(parse_lfs_operation(&args[2])?),
             })
         }
         "git-lfs-transfer" => {
-            if !(2..=3).contains(&args.len()) {
+            if args.len() != 3 {
                 return Err(
-                    "git-lfs-transfer requires a repository path and optional operation".to_owned(),
+                    "git-lfs-transfer requires a repository path and upload/download operation"
+                        .to_owned(),
                 );
             }
             Ok(SshExecRequest {
                 kind: SshExecKind::LfsTransfer,
                 repo_path: normalize_ssh_repo_path(&args[1])?,
-                lfs_operation: args.get(2).cloned(),
+                lfs_operation: Some(parse_lfs_operation(&args[2])?),
             })
         }
         _ => Err(format!("unsupported SSH git command: {command}")),
@@ -294,6 +295,15 @@ fn normalize_ssh_repo_path(raw: &str) -> Result<PathBuf, String> {
         return Err("repository path is empty".to_owned());
     }
     Ok(PathBuf::from(raw.strip_suffix(".git").unwrap_or(raw)))
+}
+
+fn parse_lfs_operation(raw: &str) -> Result<String, String> {
+    match raw {
+        "upload" | "download" => Ok(raw.to_owned()),
+        _ => Err(format!(
+            "unsupported Git LFS SSH operation: {raw}; expected upload or download"
+        )),
+    }
 }
 
 fn split_ssh_exec_args(input: &str) -> Result<Vec<String>, String> {
@@ -461,6 +471,17 @@ mod tests {
         assert_eq!(parsed.kind, SshExecKind::LfsAuthenticate);
         assert_eq!(parsed.repo_path, PathBuf::from("/srv/git/project"));
         assert_eq!(parsed.lfs_operation.as_deref(), Some("download"));
+    }
+
+    #[test]
+    fn parse_lfs_exec_rejects_missing_or_unknown_operation() {
+        let missing =
+            parse_ssh_exec_request("git-lfs-authenticate \"/srv/git/project.git\"").unwrap_err();
+        assert!(missing.contains("upload/download operation"));
+
+        let unknown =
+            parse_ssh_exec_request("git-lfs-transfer \"/srv/git/project.git\" verify").unwrap_err();
+        assert!(unknown.contains("expected upload or download"));
     }
 
     #[test]
