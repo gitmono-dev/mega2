@@ -92,7 +92,13 @@ impl AppContext {
                 {
                     let resolver =
                         VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-                    Some(resolver.resolve(secret_ref).await?)
+                    Some(
+                        crate::contract::vault::integration::vault_core::with_audit_caller(
+                            "startup:mail-password",
+                            resolver.resolve(secret_ref),
+                        )
+                        .await?,
+                    )
                 } else {
                     None
                 };

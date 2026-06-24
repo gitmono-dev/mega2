@@ -25,6 +25,31 @@ use crate::{
 const CORE_KEY_FILE: &str = "core_key.json";
 const SECRET_MOUNT: &str = "secret";
 
+tokio::task_local! {
+    /// Optional caller identity for `vault_audit` records (vault.md stage H "who").
+    /// Entry points wrap secret operations in [`with_audit_caller`]; unset falls
+    /// back to `"unknown"`.
+    static AUDIT_CALLER: Option<String>;
+}
+
+/// Run `future` with `caller` attributed to every `vault_audit` record emitted
+/// by secret operations on the current task. Non-invasive alternative to
+/// threading a caller parameter through every `VaultCoreInterface` call site.
+pub async fn with_audit_caller<F, R>(caller: &str, future: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    AUDIT_CALLER.scope(Some(caller.to_string()), future).await
+}
+
+fn current_audit_caller() -> String {
+    AUDIT_CALLER
+        .try_with(|c| c.clone())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CoreKey {
     secret_shares: Vec<Vec<u8>>,
@@ -417,11 +442,13 @@ impl VaultCore {
         if !self.audit.enabled {
             return;
         }
+        let caller = current_audit_caller();
         tracing::info!(
             target: "vault_audit",
             operation = operation.as_str(),
             secret_name = name.as_str(),
             outcome,
+            caller = %caller,
             "vault secret access"
         );
     }
@@ -919,6 +946,15 @@ mod tests {
         VaultStorage {
             base: BaseStorage::new(connection),
         }
+    }
+
+    #[tokio::test]
+    async fn with_audit_caller_scopes_caller_identity() {
+        assert_eq!(current_audit_caller(), "unknown");
+        let caller =
+            with_audit_caller("cli:config-secret-set", async { current_audit_caller() }).await;
+        assert_eq!(caller, "cli:config-secret-set");
+        assert_eq!(current_audit_caller(), "unknown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

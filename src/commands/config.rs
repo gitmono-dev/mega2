@@ -20,7 +20,7 @@ use crate::{
             ConfigSourceDiagnostics, collect_source_diagnostics, validate_mail_password_secret_ref,
         },
     },
-    contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
+    contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface, with_audit_caller},
 };
 
 const MAIL_PASSWORD_FIELD: &str = "mail.password";
@@ -334,9 +334,11 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let mut data = Map::new();
             data.insert(secret_ref.field().to_string(), Value::String(value));
-            vault
-                .write_secret(secret_ref.secret_name(), Some(data))
-                .await?;
+            with_audit_caller(
+                "cli:config-secret-set",
+                vault.write_secret(secret_ref.secret_name(), Some(data)),
+            )
+            .await?;
 
             println!("stored {}", secret_ref.as_uri());
             Ok(())
@@ -352,9 +354,11 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let mut data = Map::new();
             data.insert(secret_ref.field().to_string(), Value::String(value));
-            vault
-                .write_secret(secret_ref.secret_name(), Some(data))
-                .await?;
+            with_audit_caller(
+                "cli:config-secret-rotate",
+                vault.write_secret(secret_ref.secret_name(), Some(data)),
+            )
+            .await?;
 
             println!("rotated {}", secret_ref.as_uri());
             // The mailer resolves mail.password_ref once at AppContext startup, so a
@@ -379,7 +383,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
-            resolver.resolve(&secret_ref).await?;
+            with_audit_caller("cli:config-secret-check", resolver.resolve(&secret_ref)).await?;
 
             println!("ok {}", secret_ref.as_uri());
             Ok(())
@@ -465,7 +469,7 @@ where
     if let Some(mail_cfg) = &config.mail
         && let Some(secret_ref) = &mail_cfg.password_ref
     {
-        resolver.resolve(secret_ref).await?;
+        with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
     }
 
     Ok(())

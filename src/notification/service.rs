@@ -228,7 +228,13 @@ async fn rebuild_mailer(
         && let Some(secret_ref) = &mail.password_ref
     {
         let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-        Some(resolver.resolve(secret_ref).await?)
+        Some(
+            crate::contract::vault::integration::vault_core::with_audit_caller(
+                "reload:mail-password",
+                resolver.resolve(secret_ref),
+            )
+            .await?,
+        )
     } else {
         None
     };
