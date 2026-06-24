@@ -165,6 +165,11 @@ impl SmartSession {
         }
     }
 
+    pub fn set_authenticated_user(&mut self, username: String) {
+        self.auth.username = Some(username.clone());
+        self.auth.authenticated_user = Some(PushUserInfo { username });
+    }
+
     pub async fn repo_handler_with_commands(
         &self,
         state: &ProtocolApiState,

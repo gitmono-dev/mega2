@@ -45,6 +45,7 @@ pub struct SshServer {
     pub smart_protocol: Option<SmartSession>,
     pub state: ProtocolApiState,
     pub data_combined: BytesMut,
+    pub authenticated_user: Option<String>,
 }
 
 impl server::Server for SshServer {
@@ -107,8 +108,11 @@ impl server::Handler for SshServer {
 
         match exec.kind {
             SshExecKind::Git(service_type) => {
-                let smart_protocol =
+                let mut smart_protocol =
                     SmartSession::new(exec.repo_path, service_type, TransportProtocol::Ssh);
+                if let Some(username) = self.authenticated_user.clone() {
+                    smart_protocol.set_authenticated_user(username);
+                }
                 // TODO handler ProtocolError
                 let res = smart_protocol.git_info_refs(&self.state).await?;
                 self.smart_protocol = Some(smart_protocol);
@@ -184,8 +188,18 @@ impl server::Handler for SshServer {
             }
         };
         if !res.is_empty() {
-            tracing::info!("Client public key verified successfully!");
-            Ok(Auth::Accept)
+            let username = &res[0].username;
+            if res.iter().all(|m| m.username == *username) {
+                tracing::info!("Client public key verified successfully!");
+                self.authenticated_user = Some(username.clone());
+                Ok(Auth::Accept)
+            } else {
+                tracing::warn!("SSH key fingerprint matches multiple distinct users; rejecting");
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
         } else {
             tracing::warn!("Client public key verification failed!");
             Ok(Auth::Reject {

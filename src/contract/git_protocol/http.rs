@@ -16,7 +16,7 @@ use crate::{
     api::oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
     ceres::{
         api_service::state::ProtocolApiState,
-        protocol::{PushUserInfo, ServiceType, SmartSession, TransportProtocol, smart},
+        protocol::{ServiceType, SmartSession, TransportProtocol, smart},
     },
     common::errors::ProtocolError,
     contract::git_protocol::InfoRefsParams,
@@ -104,9 +104,7 @@ async fn git_receive_pack_auth(
         return Ok(false);
     };
 
-    let username = user.username;
-    pack_protocol.auth.username = Some(username.clone());
-    pack_protocol.auth.authenticated_user = Some(PushUserInfo { username });
+    pack_protocol.set_authenticated_user(user.username);
     Ok(true)
 }
 

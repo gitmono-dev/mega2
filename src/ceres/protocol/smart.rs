@@ -904,6 +904,28 @@ pub mod test {
         }
     }
 
+    #[test]
+    pub fn set_authenticated_user_populates_auth_context_for_commit_binding() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Ssh,
+        );
+        assert!(session.auth.authenticated_user.is_none());
+
+        session.set_authenticated_user("alice".to_string());
+
+        assert_eq!(
+            session
+                .auth
+                .authenticated_user
+                .as_ref()
+                .map(|u| u.username.as_str()),
+            Some("alice")
+        );
+        assert_eq!(session.auth.username.as_deref(), Some("alice"));
+    }
+
     async fn git_push_with_retry(repo_path: &std::path::Path) -> anyhow::Result<()> {
         let max_retries = 5;
 

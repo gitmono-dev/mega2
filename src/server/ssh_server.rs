@@ -68,6 +68,7 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
         id: 0,
         smart_protocol: None,
         data_combined: BytesMut::new(),
+        authenticated_user: None,
     };
     let server_url = format!("{host}:{ssh_port}");
     let addr = SocketAddr::from_str(&server_url)
