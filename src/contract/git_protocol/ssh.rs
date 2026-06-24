@@ -151,7 +151,9 @@ impl server::Handler for SshServer {
                         expire_time.to_rfc3339()
                     },
                 };
-                session.data(channel, serde_json::to_vec(&link).unwrap())?;
+                let response = serde_json::to_vec(&link).map_err(anyhow::Error::from)?;
+                session.data(channel, response)?;
+                session.channel_success(channel)?;
             }
         }
         Ok(())
