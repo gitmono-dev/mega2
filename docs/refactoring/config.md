@@ -810,7 +810,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - **包装类型（SecretString）在网络传输与持久化中的误暴露**：尽管 `SecretString` 在 Rust 代码中能有效防止 `Debug` 泄露，但在将其序列化（如写入外部监控日志、通过 OpenAPI 接口返回、或者保存到临时数据库中）时，如果序列化库（如 `serde`）未正确配置，仍可能会提取其明文。必须在编译期实施 lints 或强制配置 `#[serde(skip_serialize)]` 规则。
 - **当前对象存储和 Redis 也是早期依赖。** `Storage::new` 会在 vault 就绪前构造对象存储，`AppContext::new` 会在 vault 就绪前连接 Redis；因此 S3 access key、带密码的 Redis URL 等字段不能直接按“可迁移凭据”处理，除非先重构初始化顺序。
 - **CLI 两阶段加载已是基线。** `config init` 已使用 `LoadMode::None`，`config validate` 已使用 `LoadMode::RawSources` 并在命令内解析配置以避免坏配置被预加载拦截；后续新增 source diagnostics、profile 或其它配置命令时，必须继续通过 `LoadMode` 声明加载层级；不能退回“子命令分发前总是完整 `Config::new`”的模式。
-- **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction；`SecretRef` 默认格式化输出和 resolver 失败诊断已脱敏；`mail.password` source diagnostics 不输出原始值。剩余主要是外部服务 URL、对象存储 key 以及更多配置/source 诊断路径的统一 redaction。
+- **日志与错误脱敏已完成首批高风险落点，仍需继续收敛。** Vault root token/shares 的旧泄露路径已清理；数据库连接日志和 Redis 连接失败信息已接入统一 URL redaction；`SecretRef` 默认格式化输出和 resolver 失败诊断已脱敏；`mail.password` source diagnostics 不输出原始值。新增 `redact_secret_value`（对象存储 key / SMTP 密码等原始凭据掩码）与 `redact_object_storage_endpoint`（S3/外部服务 endpoint URL userinfo 脱敏），并在 `build_object_storage` 失败路径对 orbit 错误做统一 redaction 并记录 redacted endpoint/access key 诊断。剩余主要是更多配置/source 诊断路径的统一 redaction 收敛。
 - **`core_key.json` 加固核心已完成，但部署侧托管仍是生产边界。** fail-closed、权限收紧、root token 脱敏/退役已落地；把更多凭据放入 vault 仍不抵御能读取 key 文件的攻击者，生产使用必须配套 KMS/secret manager、受控挂载、备份恢复和恢复演练。
 - **采用分阶段切换。** 顶层迁移和调用方路径迁移已完成；后续内部拆分、错误模型、初始化命令和热加载仍必须各自独立评审，不追求“单次变更内完成全部改造”。
 - **热加载作为独立阶段，不与拆分/迁移捆绑。** 热加载只允许白名单字段运行期生效，不应隐式重建数据库、Redis、对象存储、HTTP 监听器等长生命周期资源；失败必须保留旧配置并输出来源、字段路径、失败原因和处理结果。
