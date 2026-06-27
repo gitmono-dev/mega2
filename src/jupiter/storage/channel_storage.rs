@@ -30,6 +30,7 @@ impl ChannelStorage {
         &self,
         public_id: String,
         title: Option<String>,
+        image_path: Option<String>,
         owner_username: String,
         group: bool,
     ) -> Result<channel::Model, MegaError> {
@@ -38,6 +39,7 @@ impl ChannelStorage {
             id: Set(IdInstance::next_id()),
             public_id: Set(public_id),
             title: Set(title),
+            image_path: Set(image_path),
             last_message_at: Set(now),
             owner_username: Set(owner_username),
             group: Set(group),

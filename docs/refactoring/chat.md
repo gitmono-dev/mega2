@@ -510,7 +510,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 
 - 自动把创建者加入 `member_usernames`。
 - 去重成员列表。
-- 创建 `channels`。
+- 创建 `channels`，并把可选的 `image_path` 持久化到 `channels.image_path`（创建时即写入，无需事后再 `PATCH`）。
 - 为每个成员创建 `channel_memberships`。
 - 写一条 membership update，`actor_username` 为创建者。
 - 如果有 `initial_message` 或附件，调用发送消息服务。
@@ -521,6 +521,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 - 创建者永远是成员。
 - 同一个 channel 中成员唯一。
 - 首条消息创建后 `latest_message_id` 与 `last_message_at` 正确。
+- 传入 `image_path` 时，创建出的 channel 的 `image_path` 与输入一致（由 `channel_chat::create_channel` 单测 `assert_eq!(ch.image_path, ...)` 覆盖）。
 
 ### 发送消息
 

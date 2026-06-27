@@ -108,7 +108,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
     pub async fn create_channel(
         &self,
         title: Option<String>,
-        _image_path: Option<String>,
+        image_path: Option<String>,
         creator_username: String,
         mut member_usernames: Vec<String>,
         group: bool,
@@ -128,6 +128,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .create_channel(
                 public_id.clone(),
                 title.clone(),
+                image_path.clone(),
                 creator_username.clone(),
                 group,
             )
@@ -527,11 +528,11 @@ mod tests {
         // Note: test_storage applies migrations
         let svc = ChannelChatService::from_storage(&storage);
 
-        // Create with initial message
+        // Create with initial message and an image path
         let (ch, first_msg) = svc
             .create_channel(
                 Some("Test Channel".to_string()),
-                None,
+                Some("avatars/test-channel.png".to_string()),
                 "alice".to_string(),
                 vec!["bob".to_string()],
                 true,
@@ -542,6 +543,8 @@ mod tests {
             .expect("create channel");
 
         assert_eq!(ch.owner_username, "alice");
+        // image_path must be persisted at creation time, not silently dropped.
+        assert_eq!(ch.image_path.as_deref(), Some("avatars/test-channel.png"));
         assert!(first_msg.is_some());
         let first = first_msg.unwrap();
         assert_eq!(first.content, "hello world");
