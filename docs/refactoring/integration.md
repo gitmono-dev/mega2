@@ -23,8 +23,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 3. **CLI 能力分层**：当前已有 `config secret ref/set/check/rotate`、
    `config validate [--resolve-secrets]` 以及 `config init`（`config init` 已实现并由
    `config-validation.yml` 的 CI 步骤覆盖）。专门的 `integration_config_init` 黑盒用例仍未单列。
-4. **功能边界过宽**：多渠道通知、热加载白名单、Slack/in-app 投递、用户通知 API 等仍是
-   规划能力。它们可以列为未来验收，但不能放进当前 P0 集成测试 gate。
+4. **功能边界过宽**（原始分析；部分已落地）：多渠道通知与 Slack/webhook/in-app 投递**已落地**（`NotificationChannel` 抽象 + dispatcher 扇出，2026-06-27 已补模块集成测试，见下表「可行性」行），热加载白名单与用户通知 API 接口亦已实现（单测充分）；其专门的黑盒进程 gate 仍可作为后续 P2 单列，但不放进当前 P0 集成测试 gate。
 5. **二进制 crate 测试边界**：本仓库为 Cargo workspace——库 crate `monoengine-core`
    （`src/lib.rs`）+ 瘦二进制 crate `monoengine`（`bin/src/main.rs`，见 `orbit.md`）。
    黑盒集成测试位于 `bin/tests/integration_*.rs`，通过
@@ -43,10 +42,10 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | 维度 | 评估 | 文档修订决策 |
 | --- | --- | --- |
 | 合理性 | 中高。跨模块端到端测试方向正确，但原方案把外部 Vault 和手写 schema 当作真实依赖，偏离当前架构。 | 改为嵌入式 Vault、真实 migrations、真实启动顺序。 |
-| 可行性 | 原 P0 的部分设想（多渠道通知、对象存储 SecretRef）仍待补；workspace 拆分后黑盒测试位于 `bin/tests/`（`monoengine` bin crate，不导入内部模块），模块集成测试在 `monoengine-core` 内可 `use crate::`。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
+| 可行性 | **（2026-06-27）多渠道通知与对象存储 SecretRef 已补模块集成测试**：`src/notification/service.rs::tests::service_start_fans_out_delivery_to_webhook_channel` 用本地 axum server 验证 `WebhookChannel` 作为 secondary 渠道在 email 主投递成功后收到 dispatcher 扇出（Slack 渠道为同一 `NotificationChannel` 抽象的 webhook 变体）；`src/context/mod.rs::tests` 验证 `object_storage.s3` 凭据的 `vault://` SecretRef 在 post-vault 解析（字面量透传 / 单&双 ref / 缺失报错不 panic）。workspace 拆分后黑盒测试位于 `bin/tests/`（`monoengine` bin crate，不导入内部模块），模块集成测试在 `monoengine-core` 内可 `use crate::`。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
 | 完整性 | 覆盖面广但缺少测试夹具、隔离、端口冲突、fallback 检测、超时与清理策略。 | 增加环境隔离、数据隔离、超时、清理和覆盖矩阵。 |
 | 安全性 | 原方案要求脱敏但未指出彼时 DB URL 的泄露风险；外部 Vault root token 反而增加误导。 | 明确禁用外部 Vault 容器，secret 只经 stdin；日志脱敏 P1 gate 已落地（DB/Redis 连接串脱敏 + 活进程门禁）。 |
-| 功能正确性与接口兼容性 | `SecretRef` 与 mail.password 路径方向正确；`config init`、多渠道通知、热加载接口不兼容当前代码。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
+| 功能正确性与接口兼容性 | `SecretRef`、mail.password、**多渠道通知（Slack/webhook 渠道 + dispatcher 扇出，2026-06-27 已落地并补模块集成测试）** 与对象存储 SecretRef 路径均已对接当前代码；`config init` 黑盒用例与热加载黑盒用例（接口已实现，单测充分）仍可作为后续 P2 gate 单列。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
 | 数据流与控制流正确性 | 原方案的主链路大体正确，但忽略 `Storage::new` 先构造对象存储、Redis 在 Vault 前初始化、mail 在 Vault 后构造的硬顺序。 | 明确启动顺序和每类测试允许触达的依赖。 |
 | 性能与效率 | 原方案每次可能重建容器、重跑 release build，成本高。 | 复用 compose stack，测试使用 dev/test binary，按测试隔离 DB/schema。 |
 | 可靠性与容错性 | 原方案依赖固定 sleep/默认端口，且没有明确数据库连接目标。 | 使用 healthcheck + 主动探测，测试必须证明连接的是 PostgreSQL。 |
@@ -67,7 +66,7 @@ Mail -> Notification -> service` 这条链路。但原方案混淆了当前实�
 | Redis | `AppContext::new` 在 Vault 前初始化 Redis | P0 service smoke 需要 Redis 容器 |
 | 对象存储 | 通过 `jupiter::storage::object_storage::build_object_storage` 构造（由 composition root 注入 `Storage::new`），测试可使用 local temp dir | P0 使用 local backend |
 | Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造；`integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖真实 SMTP/Mailpit 正路径，`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖 SMTP transport 失败 retry | P0/P1 扩展 Mailpit/SMTP 故障矩阵 |
-| Notification | email outbox、dispatcher、CL comment trigger 存在；用户-facing API 和多渠道缺失 | P1 模块集成 + service dispatcher 测试 |
+| Notification | email outbox、dispatcher、CL comment trigger、**用户-facing 偏好 API 与多渠道（Slack/webhook/in-app + dispatcher 扇出）均已实现**（2026-06-27 已补模块集成测试） | P1 模块集成 + service dispatcher 测试 |
 | 热加载 | 已实现（`config::reload` 的 `ConfigHandle`/白名单应用/`ConfigReloadWatcher` + 日志/mail dispatcher/template/mailer 订阅者，单测充分） | P2 专门黑盒 `integration_config_hot_reload` 仍未单列 |
 | 日志脱敏 | 已落地：DB/Redis 连接串经 `redact_db_url`/`redact_redis_url` 脱敏，活进程门禁断言凭据不泄露 | P1 gate 已满足；可继续收拢成单一命名 gate |
 
@@ -345,7 +344,7 @@ mail resolver fail-closed：进程非 0 退出、给出脱敏的 “secret not f
 - **黑盒服务测试**：通过数据库插入必要 CL/reviewer/user preference 数据，再触发现有真实业务
   API。如果没有真实 API，本项保持 P1 待实现。
 
-验收范围只覆盖 email 渠道。Slack、webhook、in-app 属于 P2。
+本场景（场景 5 邮件 outbox 投递）的验收范围聚焦 email 渠道；Slack/webhook/in-app 渠道已实现并由 `service_start_fans_out_delivery_to_webhook_channel`（webhook 扇出）与 in-app/服务端到端单测覆盖，其专门的进程级黑盒 gate 仍属 P2。
 
 **当前落地状态**：已按"模块集成测试"方式落地
 `src/notification/dispatcher.rs::tests::integration_notification_trigger_to_mail_delivers_via_mailpit`。
@@ -587,7 +586,7 @@ Vault bootstrap 过程中被消费。
    - 先修复 redaction 缺口。
    - 再启用 `integration_error_redaction` 和 notification trigger 到 mail。
 5. **Phase 4：P2 未来能力 gate**
-   - `config init`、热加载、多渠道通知、对象存储 SecretRef 等功能落地后再加测试。
+   - 多渠道通知与对象存储 SecretRef 已落地并补模块集成测试（见上）；`config init`、热加载的专门黑盒进程用例（接口已实现、单测充分）仍可作为后续 P2 gate 单列。
 
 ## 故障排查
 

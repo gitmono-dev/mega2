@@ -467,4 +467,114 @@ mod tests {
         assert_eq!(inbox.len(), 1, "in-app channel should persist an inbox row");
         assert_eq!(inbox[0].event_type_code, "cl.comment.created");
     }
+
+    /// Multichannel fan-out (docs/integration.md): a registered WebhookChannel
+    /// receives each notification the dispatcher delivers, after the email
+    /// (primary) send succeeds — the end-to-end proof that the phase-3 secret
+    /// channels integrate with the live dispatcher, not just in isolation.
+    #[tokio::test]
+    async fn service_start_fans_out_delivery_to_webhook_channel() {
+        use std::sync::Mutex as StdMutex;
+
+        use axum::{Router, routing::post};
+
+        use crate::notification::channels::WebhookChannel;
+
+        let received: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/hook",
+                post(
+                    |axum::extract::State(state): axum::extract::State<
+                        Arc<StdMutex<Vec<serde_json::Value>>>,
+                    >,
+                     body: axum::body::Bytes| async move {
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                            state.lock().unwrap().push(value);
+                        }
+                        "ok"
+                    },
+                ),
+            )
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{addr}/hook");
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        let now = chrono::Utc::now().naive_utc();
+        notification_event_types::ActiveModel {
+            code: Set("cl.comment.created".into()),
+            category: Set("cl".into()),
+            description: Set("New comment".into()),
+            system_required: Set(false),
+            default_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        stg.enqueue_email_job(
+            "bob",
+            "bob@example.com",
+            "cl.comment.created",
+            "Webhook Subject",
+            "<p>Body</p>",
+            Some("Body"),
+        )
+        .await
+        .unwrap();
+
+        let webhook: Arc<dyn NotificationChannel> =
+            Arc::new(WebhookChannel::new(url, None).expect("build webhook channel"));
+        let service = NotificationService::from_mail_config_with_extra_channels(
+            stg.clone(),
+            Arc::new(NoopMailer),
+            &crate::config::MailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            vec![webhook],
+        );
+        // Registration order: email, in_app, webhook.
+        assert!(service.channel_for("webhook").is_some());
+
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { service.start(shutdown).await }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let delivered = loop {
+            if !received.lock().unwrap().is_empty() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        shutdown.cancel();
+        handle.await.unwrap();
+        server.abort();
+
+        assert!(
+            delivered,
+            "webhook channel should receive the fan-out delivery"
+        );
+        let payloads = received.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["username"], "bob");
+        assert_eq!(payloads[0]["event_type"], "cl.comment.created");
+        assert_eq!(payloads[0]["subject"], "Webhook Subject");
+        assert_eq!(payloads[0]["body_html"], "<p>Body</p>");
+        assert_eq!(payloads[0]["body_text"], "Body");
+    }
 }
