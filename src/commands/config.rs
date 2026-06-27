@@ -41,7 +41,8 @@ pub fn cli() -> Command {
             Command::new("vault")
                 .about("Manage the monoengine vault")
                 .subcommand_required(true)
-                .subcommand(vault_reset_cli()),
+                .subcommand(vault_reset_cli())
+                .subcommand(vault_rekey_cli()),
         )
         .subcommand(
             Command::new("init")
@@ -147,6 +148,25 @@ fn vault_reset_cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .required(true)
                 .help("Confirm this destructive operation (required)"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
+fn vault_rekey_cli() -> Command {
+    Command::new("rekey")
+        .about("Regenerate and persist a fresh unseal share set for the current vault key")
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm this operation (required)"),
         )
         .arg(
             Arg::new("key-path")
@@ -273,6 +293,7 @@ fn write_init_config(output_path: &Path, force: bool) -> Result<(), MegaError> {
 async fn exec_vault(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
         Some(("reset", reset_args)) => exec_vault_reset(ctx, reset_args).await,
+        Some(("rekey", rekey_args)) => exec_vault_rekey(ctx, rekey_args).await,
         Some((cmd, _)) => Err(MegaError::Other(format!(
             "Unknown config vault subcommand: {cmd}"
         ))),
@@ -313,6 +334,49 @@ async fn exec_vault_reset(ctx: CommandContext, args: &ArgMatches) -> MegaResult 
     } else {
         println!("vault reset complete; no previous core key was present");
     }
+    Ok(())
+}
+
+async fn exec_vault_rekey(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    if !args.get_flag("force") {
+        return Err(MegaError::Other(
+            "config vault rekey regenerates unseal shares; pass --force to confirm".to_string(),
+        ));
+    }
+
+    let config_path = require_config_path(&ctx, "config vault rekey")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    let config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let vault = VaultCore::from_database_config(&config.database, key_path.clone())
+        .await
+        .map_err(MegaError::from)?;
+    vault
+        .rekey_unseal_shares(&key_path)
+        .await
+        .map_err(MegaError::from)?;
+
+    println!(
+        "vault rekey complete; fresh unseal shares written to {}",
+        key_path.display()
+    );
+    // The vendored libvault primitive re-splits the current KEK; it does not
+    // rotate the encryption key, so previously exported share sets for this key
+    // still unseal the vault. Be explicit so operators do not assume the old
+    // shares were invalidated.
+    println!(
+        "note: this re-splits the current encryption key; previously exported share sets for this key still unseal the vault. A full KEK rotation is required to invalidate old shares."
+    );
     Ok(())
 }
 
@@ -629,6 +693,50 @@ mod tests {
         };
 
         assert!(reset_args.get_flag("force"));
+    }
+
+    #[test]
+    fn config_vault_rekey_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "rekey", "--force"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_rekey_requires_force() {
+        // `--force` is a required flag, so omitting it must fail to parse.
+        let err = cli()
+            .try_get_matches_from(["config", "vault", "rekey"])
+            .expect_err("rekey without --force should not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn config_vault_rekey_accepts_key_path() {
+        let matches = cli()
+            .try_get_matches_from([
+                "config",
+                "vault",
+                "rekey",
+                "--force",
+                "--key-path",
+                "/tmp/core_key.json",
+            ])
+            .unwrap();
+        let Some(("vault", vault_args)) = matches.subcommand() else {
+            panic!("vault subcommand should parse");
+        };
+        let Some(("rekey", rekey_args)) = vault_args.subcommand() else {
+            panic!("rekey subcommand should parse");
+        };
+
+        assert!(rekey_args.get_flag("force"));
+        assert_eq!(
+            rekey_args.get_one::<PathBuf>("key-path"),
+            Some(&PathBuf::from("/tmp/core_key.json"))
+        );
     }
 
     #[test]
