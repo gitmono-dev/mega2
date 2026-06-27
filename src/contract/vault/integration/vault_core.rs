@@ -987,6 +987,145 @@ mod tests {
         );
     }
 
+    /// vault.md Phase A acceptance: the root token, unseal shares and secret
+    /// plaintext must never reach the logs (vault.md:226, 260). This is the
+    /// regression guard for the historical `log::debug!("root token: …")` leak
+    /// removed in Phase A. It captures the `tracing` events emitted by the
+    /// VaultCore integration on the init task thread across a fresh init, a
+    /// secret write/read and an explicit reset, then asserts that none of the
+    /// recoverable secret material (unseal shares — in compact JSON, pretty JSON
+    /// and Debug forms — and the limited runtime tokens), the written secret
+    /// value, or a root-token reference appears in it.
+    ///
+    /// Scope is `tracing` on this task thread (see the capture comment below for
+    /// the deliberately uncovered channels: stdout/stderr, the `log::` facade and
+    /// vault-internal background OS threads).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn vault_lifecycle_never_logs_root_token_shares_or_secret_values() {
+        use std::{io::Write, sync::Mutex};
+
+        // A `MakeWriter` that appends every emitted log line to a shared buffer.
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(buffer.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        // Capture scope: a thread-local subscriber records `tracing` events
+        // emitted on THIS task thread. The VaultCore integration's own logging
+        // (init/unseal/revoke/audit in this file) runs inline on this thread and
+        // is therefore captured. Known, deliberate gaps NOT covered by this unit
+        // guard: (a) `stdout`/`stderr` from any `println!`/`eprintln!`; (b) the
+        // `log::` crate facade (no `tracing-log` bridge is installed here); and
+        // (c) events emitted on vault-internal background OS threads (e.g. the
+        // lease-expiration timer in `src/vault/modules/auth/expiration.rs`, which
+        // spawns its own thread + runtime). Closing those would require a global
+        // subscriber (which races with other tests' `try_init`) or process-level
+        // fd capture, out of scope for this test.
+        let _capture = tracing::subscriber::set_default(subscriber);
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let sentinel = "do-not-log-this-vault-secret-7f3a9c";
+
+        let vault = VaultCore::from_database_config(&db_config, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+        let mut secret = Map::new();
+        secret.insert("value".to_string(), Value::String(sentinel.to_string()));
+        vault
+            .write_secret("ssh_server_key", Some(secret))
+            .await
+            .expect("write secret");
+        vault
+            .read_secret("ssh_server_key")
+            .await
+            .expect("read secret");
+        drop(vault);
+
+        let (reset_vault, _backup) = VaultCore::reset(&db_config, key_path.clone())
+            .await
+            .expect("vault reset should succeed");
+        drop(reset_vault);
+
+        let logs = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+            .expect("captured logs are valid utf-8");
+        assert!(
+            !logs.is_empty(),
+            "expected the subscriber to capture some vault tracing output"
+        );
+
+        // Secret plaintext must never appear (it is encrypted at rest and never logged).
+        assert!(
+            !logs.contains(sentinel),
+            "secret plaintext leaked into logs"
+        );
+        // No root-token reference (the historical Phase-A leak format).
+        assert!(
+            !logs.to_lowercase().contains("root token") && !logs.contains("root_token"),
+            "a root token reference leaked into logs"
+        );
+
+        // The persisted key file holds the unseal shares + limited runtime tokens
+        // that must likewise never be logged.
+        let core_key: Value =
+            serde_json::from_str(&std::fs::read_to_string(&key_path).expect("read core key file"))
+                .expect("core key file is valid json");
+        for field in ["ssh", "pgp", "nostr", "pki", "config", "generic"] {
+            if let Some(token) = core_key["runtime_tokens"][field].as_str()
+                && !token.is_empty()
+            {
+                assert!(
+                    !logs.contains(token),
+                    "runtime token `{field}` leaked into logs"
+                );
+            }
+        }
+        let shares = core_key["secret_shares"]
+            .as_array()
+            .expect("persisted core key should contain unseal shares");
+        assert!(!shares.is_empty(), "expected unseal shares to be persisted");
+        for share in shares {
+            let bytes: Vec<u8> =
+                serde_json::from_value(share.clone()).expect("share is a byte array");
+            // Guard the accidental leak formats a share could take: the compact
+            // JSON array, the pretty JSON array (the form `persist_core_key` uses
+            // via `serde_json::to_writer_pretty`), and the Rust `Debug` rendering
+            // of the byte slice.
+            let json = serde_json::to_string(share).expect("share json");
+            let pretty = serde_json::to_string_pretty(share).expect("share pretty json");
+            let debug = format!("{bytes:?}");
+            for (form, rendered) in [("json", &json), ("pretty json", &pretty), ("debug", &debug)] {
+                assert!(
+                    !logs.contains(rendered),
+                    "an unseal share leaked into logs ({form} form)"
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_vault_api() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
