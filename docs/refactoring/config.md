@@ -716,7 +716,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 - `SecretRef`、`SecretResolver`、`VaultSecretResolver` 已落地。
 - `mail.password_ref` 已落地，且 `mail.password` / `mail.password_ref` 互斥。
 - Vault fail-closed、root token 脱敏/退役、key 权限、runtime tokens、secret 访问审计 hook 已落地。
-- 对象存储凭据不迁入本项目 vault 的边界已明确；`object_storage.*` 仍属于早期运行时依赖。
+- 对象存储凭据**（2026-06-27）已可走 vault SecretRef**：`AppContext::new` 经 DB-only vault bootstrap + `resolve_object_storage_secrets` 在建对象存储前解析 `object_storage.s3.access_key_id`/`secret_access_key` 中的 `vault://` SecretRef（字面量原样透传）。详见 vault.md 阶段 G / config.md 阶段 6。
 
 **阶段 0 — 文档再基线与执行清单收敛（当前文档修订）**
 
@@ -770,13 +770,13 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 > **验收标准**：`config/config.toml` 不含真实生产密码或可复用生产凭据；`cargo test --all` 不依赖仓库中的 `config/config.toml` 作为隐式共享状态；CI 新增配置校验任务且通过。
 
-**阶段 6 — 对象存储等早期依赖的后置初始化重构（可选）**
+**阶段 6 — 对象存储等早期依赖的后置初始化重构（已落地 2026-06-27）**
 
-23. 仅当明确要让对象存储凭据进入 vault 时，才执行本阶段；否则保持当前边界：`object_storage.*` 来自 TOML/env/部署平台 secret，不能配置为本项目 Vault `SecretRef`。
-24. 若执行本阶段，先把 `Storage::new` 拆为 DB-only storage、vault bootstrap、secret resolve、完整 storage/service 初始化。
-25. 重新梳理 Redis、对象存储、Orion 等字段依赖表，只有在确认消费点晚于 vault 且失败语义可接受后，才允许迁移为 SecretRef。
+23. ✅ **已落地**：`object_storage.s3.access_key_id`/`secret_access_key` 现可配置为 `vault://` SecretRef。
+24. ✅ 采用更低风险的等效方案：未拆 `Storage::new` 本身，而是在 `AppContext::new` 用 **DB-only `VaultCore::from_database_connection` bootstrap**（只需一个共享 DB 连接，不需要完整 `Storage`，从而打破“vault↔storage↔对象存储凭据”的循环）→ `resolve_object_storage_secrets` 解析对象存储凭据中的 SecretRef → `build_object_storage` → `Storage::new_with_connection`（复用同一连接）。字面量凭据原样透传，env/IAM 部署不受影响。
+25. 其它早期字段（Redis、Orion 等）暂未迁移为 SecretRef；如需迁移，沿用同一 post-vault 解析模式并确认失败语义可接受。
 
-> **验收标准**：S3/S3-compatible 凭据迁移前，服务启动链路中不再在 vault 前构造对象存储；缺少对象存储 secret 时返回可诊断错误，不影响 `config secret set/check` 对其他 secret 的操作。
+> **验收标准**：✅ 服务启动链路中对象存储在 vault 就绪后构造；SecretRef 解析失败返回可诊断错误（不泄露值），不影响 `config secret set/check` 对其他 secret 的操作；字面量凭据路径行为不变。单测 `src/context/mod.rs::tests` 覆盖字面量透传与 SecretRef 解析。
 
 **阶段 7 — 受控热加载（独立变更）**
 

@@ -5,9 +5,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     common::errors::MegaError,
     config::{
+        ObjectStorageConfig,
         reload::ConfigHandle,
-        secret::{SecretResolver, VaultSecretResolver},
+        secret::{SecretRef, SecretResolver, VaultSecretResolver},
     },
+    contract::vault::integration::vault_core::{VaultCore, with_audit_caller},
     jupiter::redis::{ConnectionManager, init_connection},
 };
 
@@ -37,26 +39,53 @@ pub struct AppContext {
 
 impl AppContext {
     /// Creates a new application context with the given configuration.
-    pub async fn new(
-        config: crate::config::Config,
-        object_store: crate::jupiter::storage::object_storage::MegaObjectStorageWrapper,
-    ) -> Result<Self, MegaError> {
+    ///
+    /// Staged bootstrap (config.md stage 6 / vault.md stage G): the DB connection
+    /// is built once and shared by a DB-only `VaultCore` bootstrap and the full
+    /// `Storage`. Building vault before the object store lets object-storage
+    /// credentials supplied as vault `SecretRef`s
+    /// (`object_storage.s3.access_key_id` / `secret_access_key` = `vault://…`) be
+    /// resolved before the object store is constructed. The concrete object store
+    /// is built here through the binary-registered `ObjectStorageProvider`, so the
+    /// callers no longer pre-build and inject it.
+    pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
-        let storage = crate::jupiter::storage::Storage::new(config.clone(), object_store).await?;
-        let config_handle = storage.config_handle();
-        let connection = init_connection(&config.redis).await?;
+        // One DB connection, shared by the bootstrap vault and the full storage.
+        let db_connection =
+            Arc::new(crate::jupiter::storage::init::database_connection(&config.database).await?);
 
-        let storage_for_vault = storage.clone();
+        // Vault first (DB-only bootstrap), so SecretRef object-storage credentials
+        // can be resolved before the object store is built.
         let vault_audit = config
             .vault
             .as_ref()
             .map(|vault| vault.audit.clone())
             .unwrap_or_default();
         let vault =
-            crate::contract::vault::integration::vault_core::VaultCore::new(storage_for_vault)
-                .await?
-                .with_audit_config(vault_audit);
+            crate::contract::vault::integration::vault_core::VaultCore::from_database_connection(
+                db_connection.clone(),
+                crate::contract::vault::integration::vault_core::VaultCore::default_key_path(),
+            )
+            .await?
+            .with_audit_config(vault_audit);
+
+        // Resolve any `vault://` SecretRef object-storage credentials post-vault,
+        // then build the concrete object store from the resolved config.
+        let object_storage_config =
+            resolve_object_storage_secrets(&config.object_storage, &vault).await?;
+        let object_store =
+            crate::jupiter::storage::object_storage::build_object_storage(&object_storage_config)
+                .await?;
+
+        let storage = crate::jupiter::storage::Storage::new_with_connection(
+            config.clone(),
+            db_connection,
+            object_store,
+        )
+        .await?;
+        let config_handle = storage.config_handle();
+        let connection = init_connection(&config.redis).await?;
 
         // Late (post-Vault) construction for mail + notification dispatcher (phase 0 per docs/notification.md).
         // Must be after VaultCore (and mail) per config.md bootstrap constraints and docs/mail.md.
@@ -221,5 +250,189 @@ impl AppContext {
 
     pub fn wrapped_context(&self) -> Arc<Self> {
         Arc::new(self.clone())
+    }
+}
+
+/// True if `value` is a `vault://` SecretRef URI rather than a literal credential.
+fn is_secret_ref_value(value: &str) -> bool {
+    value.starts_with("vault://")
+}
+
+/// Resolve a credential that may be either a literal value or a `vault://`
+/// SecretRef URI. Literals are returned unchanged; SecretRef URIs are resolved
+/// through the vault resolver (post-vault).
+async fn resolve_credential(
+    value: &str,
+    resolver: &VaultSecretResolver,
+    caller: &str,
+) -> Result<String, MegaError> {
+    if is_secret_ref_value(value) {
+        let secret_ref = SecretRef::parse(value)?;
+        with_audit_caller(caller, resolver.resolve(&secret_ref)).await
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// Resolve any `vault://` SecretRef object-storage credentials
+/// (`object_storage.s3.access_key_id` / `secret_access_key`) against the
+/// already-bootstrapped vault, returning a config with literal credentials ready
+/// for `build_object_storage`. Literal credentials are passed through unchanged,
+/// so deployments that keep S3 creds in env/IAM are unaffected (config.md stage 6
+/// / vault.md stage G).
+async fn resolve_object_storage_secrets(
+    config: &ObjectStorageConfig,
+    vault: &VaultCore,
+) -> Result<ObjectStorageConfig, MegaError> {
+    if !is_secret_ref_value(&config.s3.access_key_id)
+        && !is_secret_ref_value(&config.s3.secret_access_key)
+    {
+        return Ok(config.clone());
+    }
+
+    let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
+    let mut resolved = config.clone();
+    resolved.s3.access_key_id = resolve_credential(
+        &config.s3.access_key_id,
+        &resolver,
+        "startup:object-storage-access-key",
+    )
+    .await?;
+    resolved.s3.secret_access_key = resolve_credential(
+        &config.s3.secret_access_key,
+        &resolver,
+        "startup:object-storage-secret-key",
+    )
+    .await?;
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, Value};
+
+    use super::*;
+    use crate::{
+        contract::vault::integration::vault_core::VaultCoreInterface, jupiter::tests::test_storage,
+    };
+
+    #[test]
+    fn is_secret_ref_value_detects_vault_uri() {
+        assert!(is_secret_ref_value(
+            "vault://secret/config/prod/object_storage/access_key#value"
+        ));
+        assert!(!is_secret_ref_value("AKIAEXAMPLE"));
+        assert!(!is_secret_ref_value(""));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_object_storage_secrets_passes_through_literal_credentials() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut config = ObjectStorageConfig::default();
+        config.s3.access_key_id = "AKIA-literal".to_string();
+        config.s3.secret_access_key = "literal-secret".to_string();
+
+        let resolved = resolve_object_storage_secrets(&config, &vault)
+            .await
+            .expect("literal credentials resolve");
+        assert_eq!(resolved.s3.access_key_id, "AKIA-literal");
+        assert_eq!(resolved.s3.secret_access_key, "literal-secret");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_object_storage_secrets_resolves_vault_secret_refs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut access = Map::new();
+        access.insert(
+            "value".to_string(),
+            Value::String("AKIA-from-vault".to_string()),
+        );
+        vault
+            .write_secret("config/test/object_storage/access_key", Some(access))
+            .await
+            .expect("write access key secret");
+
+        let mut config = ObjectStorageConfig::default();
+        config.s3.access_key_id =
+            "vault://secret/config/test/object_storage/access_key#value".to_string();
+        // Mixed: the secret access key stays a literal.
+        config.s3.secret_access_key = "literal-secret".to_string();
+
+        let resolved = resolve_object_storage_secrets(&config, &vault)
+            .await
+            .expect("secret-ref credentials resolve");
+        assert_eq!(resolved.s3.access_key_id, "AKIA-from-vault");
+        assert_eq!(resolved.s3.secret_access_key, "literal-secret");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_object_storage_secrets_resolves_both_credential_refs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        for (name, value) in [
+            ("config/test/object_storage/access_key", "AKIA-both"),
+            ("config/test/object_storage/secret_key", "SECRET-both"),
+        ] {
+            let mut data = Map::new();
+            data.insert("value".to_string(), Value::String(value.to_string()));
+            vault.write_secret(name, Some(data)).await.expect("write");
+        }
+
+        let mut config = ObjectStorageConfig::default();
+        config.s3.access_key_id =
+            "vault://secret/config/test/object_storage/access_key#value".to_string();
+        config.s3.secret_access_key =
+            "vault://secret/config/test/object_storage/secret_key#value".to_string();
+
+        let resolved = resolve_object_storage_secrets(&config, &vault)
+            .await
+            .expect("both secret refs resolve");
+        assert_eq!(resolved.s3.access_key_id, "AKIA-both");
+        assert_eq!(resolved.s3.secret_access_key, "SECRET-both");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_object_storage_secrets_errors_on_missing_secret_without_panicking() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut config = ObjectStorageConfig::default();
+        config.s3.access_key_id =
+            "vault://secret/config/test/object_storage/missing#value".to_string();
+        config.s3.secret_access_key = "literal".to_string();
+
+        // A missing secret must fail (Result), not panic, so startup surfaces a
+        // diagnostic instead of crashing.
+        let result = resolve_object_storage_secrets(&config, &vault).await;
+        assert!(result.is_err(), "missing object-storage secret must error");
     }
 }

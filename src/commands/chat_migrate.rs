@@ -111,10 +111,7 @@ fn get_dt(val: &serde_json::Value) -> Option<chrono::NaiveDateTime> {
 #[tokio::main]
 pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let config = require_config(ctx, "chat-migrate")?;
-    let object_store =
-        crate::jupiter::storage::object_storage::build_object_storage(&config.object_storage)
-            .await?;
-    let context = AppContext::new(config, object_store).await?;
+    let context = AppContext::new(config).await?;
     let mono_storage = context.storage.mono_storage();
     let conn = mono_storage.get_connection();
 

@@ -37,7 +37,7 @@
 > - **（2026-06-27）A：补齐“root token/分片/secret 明文不得进入日志”验收（vault.md:226/260）的自动化守卫。新增 `vault_lifecycle_never_logs_root_token_shares_or_secret_values` 回归测试（`src/contract/vault/integration/vault_core.rs`）：用线程局部 `tracing` subscriber 捕获 VaultCore 集成在 init → write_secret → read_secret → reset 全流程于初始化任务线程上发出的 `tracing` 事件，断言写入的 secret 明文、已持久化的 unseal 分片（compact JSON / pretty JSON / Debug 三种形态，pretty 对应 `persist_core_key` 的 `to_writer_pretty`）、限权 runtime token 与任何 root-token 字样均不出现；并以变更测试（mutation test）确认注入泄露时该用例会失败。此前阶段 A 仅有 `core_key.json` 不含 `root_token` 的持久化断言，无日志侧守卫。**该单测的覆盖边界（刻意留白、已在测试注释标注）：仅捕获本任务线程上的 `tracing` 事件，不覆盖 stdout/stderr 的 `println!`/`eprintln!`、`log::` facade（未装 `tracing-log` 桥）以及 vault 内部后台 OS 线程（如 `src/vault/modules/auth/expiration.rs` 的租约过期定时线程）上发出的事件——彻底覆盖需全局 subscriber（与其它测试 `try_init` 竞争）或进程级 fd 捕获，超出本单测范围。**
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
 > - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
-> - G：对象存储凭据未迁入本项目 vault，因此不做完整 Storage 后置初始化重排。当前边界是：`object_storage.*` 仍属于早期运行时依赖，不能配置为 `SecretRef`；`config secret set/check` 已不依赖对象存储可用。
+> - G：**（2026-06-27）已落地分阶段 bootstrap，对象存储凭据可走 SecretRef。** `AppContext::new` 现只建一次 DB 连接，先用它做 **DB-only `VaultCore` bootstrap**（`from_database_connection`，不依赖完整 `Storage`，打破“vault 需要 Storage、Storage 需要对象存储、对象存储凭据需要 vault”的循环），再解析 `object_storage.s3.access_key_id`/`secret_access_key` 中的 `vault://` SecretRef，最后用解析后的配置 `build_object_storage` 并经 `Storage::new_with_connection`（复用同一连接）建完整 storage。`Storage::new` 本身未拆——通过 DB-only vault bootstrap 达成等效分阶段。字面量凭据原样透传（env/IAM 部署不受影响）。`config secret set/check` 仍不依赖对象存储可用。
 
 ## 当前实现概览
 
@@ -706,7 +706,9 @@ pub fn global_redactor() -> &'static dyn Redactor;
 
 目标：只有在确实需要让对象存储凭据进入 vault 时，才重构完整初始化顺序。
 
-> **2026-06-17 当前决策**：本轮不迁移 `object_storage.*` 凭据，因此不执行完整初始化顺序重排。对象存储仍在 `Storage::new` 中、vault 就绪前构造，继续归类为早期运行时依赖；其凭据必须来自 TOML/env/部署平台 secret，而不是本项目 Vault `SecretRef`。本阶段已完成的可验收部分是：`config secret set/check` 对 `mail.password` 等后置 secret 使用 DB-only/Vault-only bootstrap，不依赖对象存储可用。
+> **2026-06-17 当前决策**：本轮不迁移 `object_storage.*` 凭据……（历史决策，见下）
+>
+> **2026-06-27 落地**：已实现分阶段 bootstrap，`object_storage.s3.access_key_id`/`secret_access_key` 现可配置为 `vault://` SecretRef。`AppContext::new`（`src/context/mod.rs`）只建一次 DB 连接，先做 **DB-only `VaultCore::from_database_connection` bootstrap**（不需要完整 `Storage`），再经 `resolve_object_storage_secrets` 解析对象存储凭据中的 SecretRef，最后用解析结果 `build_object_storage` 并 `Storage::new_with_connection`（复用同一 DB 连接，不额外建连接池）。这避免了对 `Storage::new` 本身的高风险拆分：DB-only vault bootstrap 已足以打破循环依赖。字面量凭据原样透传，env/IAM 部署不受影响。单测见 `src/context/mod.rs::tests`（字面量透传 + SecretRef 解析）。
 
 目标链路：
 
