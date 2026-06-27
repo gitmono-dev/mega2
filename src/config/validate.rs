@@ -2986,6 +2986,79 @@ mod tests {
         }));
     }
 
+    /// Canonical "complete cross-source/profile matrix" lock-in: a single field
+    /// present in ALL THREE sources (base file, profile file, and a `MEGA_*` env
+    /// override) must be attributed in the source-field graph at every source AND
+    /// produce the full override chain (profile overrides base, env overrides
+    /// profile), with no values leaked (config.md stage 4 source diagnostics).
+    #[test]
+    fn source_diagnostics_full_cross_source_matrix_for_single_field() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        // Distinctive sentinel values so the no-leak assertion cannot false-match
+        // (source diagnostics read raw TOML and never validate the value).
+        std::fs::write(
+            &config_path,
+            r#"
+            [log]
+            level = "base-sentinel-value"
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [log]
+            level = "profile-sentinel-value"
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_LOG__LEVEL"],
+        )
+        .expect("diagnostics should collect");
+
+        // Source-field graph: log.level attributed at base, profile, AND env.
+        let field_messages = diagnostics
+            .source_fields
+            .iter()
+            .filter(|field| field.field_path == "log.level")
+            .map(|field| field.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(field_messages.iter().any(|m| m.contains("base file")));
+        assert!(field_messages.iter().any(|m| m.contains("profile file")));
+        assert!(field_messages.iter().any(|m| m.contains("MEGA_LOG__LEVEL")));
+
+        // Override chain: profile overrides base, env overrides profile.
+        let override_messages = diagnostics
+            .source_overrides
+            .iter()
+            .filter(|over| over.field_path == "log.level")
+            .map(|over| over.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(override_messages.iter().any(|m| {
+            m.contains("profile file") && m.contains("base file") && !m.contains("environment")
+        }));
+        assert!(
+            override_messages
+                .iter()
+                .any(|m| m.contains("MEGA_LOG__LEVEL") && m.contains("profile file"))
+        );
+
+        // No raw values leak anywhere in the diagnostics.
+        let all_text = format!(
+            "{}\n{}",
+            field_messages.join("\n"),
+            override_messages.join("\n")
+        );
+        assert!(!all_text.contains("base-sentinel-value"));
+        assert!(!all_text.contains("profile-sentinel-value"));
+    }
+
     #[test]
     fn unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys() {
         let warnings = unconsumed_environment_fields_from_keys([
