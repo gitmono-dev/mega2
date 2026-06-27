@@ -637,7 +637,11 @@ mod test {
 
     #[test]
     fn test_vault_bootstrap_loads_profile_database_override() {
-        let _lock = env_lock();
+        let lock = env_lock();
+        // Isolate from any ambient MEGA_DATABASE__DB_URL (e.g. set by .env.test),
+        // which would otherwise override the profile via the env source layer and
+        // defeat the file/profile-precedence assertion below.
+        let _db_url_guard = EnvVarGuard::remove(&lock, "MEGA_DATABASE__DB_URL");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         let profile_path = temp_dir.path().join("config.prod.toml");

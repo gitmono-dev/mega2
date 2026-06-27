@@ -1057,7 +1057,7 @@ mod tests {
         ArtifactGcConfig, BuckConfig, MailConfig, MailProvider,
         secret::{SecretRef, SecretString},
         template::config_init_template,
-        testing::{env_lock, isolated_config},
+        testing::{EnvVarGuard, env_lock, isolated_config},
     };
 
     fn mail_config(enabled: bool) -> MailConfig {
@@ -1833,7 +1833,12 @@ mod tests {
 
     #[test]
     fn reload_from_path_uses_profile_candidate_and_keeps_restart_required_fields() {
-        let _lock = env_lock();
+        let lock = env_lock();
+        // Isolate from any ambient MEGA_DATABASE__DB_URL (e.g. set by .env.test):
+        // it would override both the base and the profile db_url via the env
+        // source layer, so no db_url change would be detected and the
+        // restart-required assertion below would see an empty list.
+        let _db_url_guard = EnvVarGuard::remove(&lock, "MEGA_DATABASE__DB_URL");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         let profile_path = temp_dir.path().join("config.prod.toml");
