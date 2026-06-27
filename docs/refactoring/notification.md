@@ -270,12 +270,13 @@ Config::new
 - 验收：用户可通过 API 管理自己的通知偏好；should_send 正确反映更新；CL 评论/合并触发器在全部收件人显式 opt-out 时不 enqueue。
 
 **阶段 3（Vault SecretRef + 渠道凭据，安全加固）**：
-- Email 渠道完全迁移到 SecretRef（依赖 **mail.md 阶段 2** + **config.md 阶段 5**）。
-- 设计并实现需要 secret 的其他渠道（slack token 等）通过 resolver 注入。
-- 清理所有早期构造路径；强化日志脱敏（收件人、主题、正文在错误路径中受控，依赖 **config.md 阶段 0b** 的脱敏工具）。
-- 与 config 的 `config secret set/check` 集成（支持 notification 相关 secret，如果有）。
+- ✅ Email 渠道完全迁移到 SecretRef（依赖 **mail.md 阶段 2** + **config.md 阶段 5**）：`mail.password_ref` 经 `VaultSecretResolver` 在 `AppContext::new` post-vault 解析。
+- ✅ **设计并实现需要 secret 的其他渠道（slack token 等）通过 resolver 注入（2026-06-27）**：新增 `SlackChannel`（`src/notification/channels/slack.rs`，POST Slack incoming-webhook URL；URL 本身即凭据，按 `SecretRef` 存储、post-vault 解析、绝不入日志）与通用 `WebhookChannel`（`src/notification/channels/webhook.rs`，POST JSON，可选 `Authorization: Bearer <token>`，token 走 `SecretRef`）。两者实现 `NotificationChannel`，在 `AppContext::new` vault 就绪后由 `VaultSecretResolver` 解析凭据并经 `NotificationService::from_mail_config_with_extra_channels` 注册为 secondary 渠道，dispatcher 在 email 主投递成功后扇出。错误与日志只含粗粒度传输类别/HTTP 状态码，绝不回显 URL（slack URL 含 secret）或 token；redirect 一律拒绝（`Policy::none()`）。配置：`[notification.slack]`（`enabled`/`webhook_url_ref`）与 `[notification.webhook]`（`enabled`/`url`/`token_ref`），已接入 `Config::validate()` 与 `known_fields` 白名单。
+- ✅ 清理所有早期构造路径；强化日志脱敏（收件人、主题、正文在错误路径中受控，依赖 **config.md 阶段 0b** 的脱敏工具）。
+- ✅ **与 config 的 `config secret set/check` 集成（支持 notification 相关 secret）**：notification 渠道凭据走与 `mail.password_ref` 相同的 `vault://secret/config/<profile>/notification/...#<field>` 命名空间，`validate_notification_secret_ref` 强制 namespace（`notification/slack/webhook_url`、`notification/webhook/token`），可由 `config secret set/check`（最小 DB/Vault bootstrap）写入/校验，错误不泄露 SecretRef 值。
 - **前置**：本阶段不建议提前启动，必须等待 **vault.md 阶段 A/B/C 完成**（fail-closed 确保可靠、最小 bootstrap 支持运维命令、interface 收窄防止误用）
-- 验收：所有渠道凭据仅在 vault 就绪后解析；core_key 加固已完成（来自 vault.md 阶段 A）。
+- 验收：✅ 所有渠道凭据仅在 vault 就绪后解析（startup `with_audit_caller("startup:notification-slack"/"startup:notification-webhook")`）；core_key 加固已完成（来自 vault.md 阶段 A）。
+- 剩余/未来：渠道凭据/URL 的运行期热加载（当前在启动期解析与构造，与 in-app 渠道一致；变更需重启），以及与 campsite slack 的更深集成（富文本 blocks 等）。
 
 **阶段 4（可靠性、扩展性、运维）**：
 - 已完成首批管理 API：查看 jobs、状态统计、手动 retry failed job、按保留期 prune 旧 `sent`/`skipped` 终态 job、查看/下载/删除附件、按保留期 prune 旧终态 job 附件（可按 username/event type 收窄），并已支持 dispatcher 配置化自动附件保留清理、列出和 upsert notification event types。

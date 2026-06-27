@@ -322,6 +322,43 @@ pub struct NotificationConfig {
     /// Default locale for rendered notifications when a user has none.
     #[serde(default = "default_mail_template_locale")]
     pub default_locale: String,
+    /// Optional Slack incoming-webhook channel (docs/notification.md phase 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<SlackConfig>,
+    /// Optional generic outbound webhook channel (docs/notification.md phase 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookConfig>,
+}
+
+/// Slack incoming-webhook delivery channel (docs/notification.md phase 3).
+///
+/// A Slack incoming-webhook URL embeds a secret token in its path, so the URL
+/// itself is the credential and is supplied as a [`secret::SecretRef`] resolved
+/// from vault after startup — never stored in plaintext config.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct SlackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// SecretRef to the Slack incoming-webhook URL (the URL is the credential).
+    /// Required when `enabled` is true; namespace
+    /// `vault://secret/config/<profile>/notification/slack/webhook_url#<field>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url_ref: Option<secret::SecretRef>,
+}
+
+/// Generic outbound webhook delivery channel (docs/notification.md phase 3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebhookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Destination URL. Operator-trusted, non-secret (unlike a Slack webhook
+    /// URL); required when `enabled` is true.
+    #[serde(default)]
+    pub url: String,
+    /// Optional bearer token SecretRef sent as `Authorization: Bearer <token>`;
+    /// namespace `vault://secret/config/<profile>/notification/webhook/token#<field>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<secret::SecretRef>,
 }
 
 fn default_notification_enabled() -> bool {
@@ -337,6 +374,8 @@ impl Default for NotificationConfig {
             enabled: default_notification_enabled(),
             default_delivery_mode: default_notification_delivery_mode(),
             default_locale: default_mail_template_locale(),
+            slack: None,
+            webhook: None,
         }
     }
 }

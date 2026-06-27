@@ -76,12 +76,29 @@ impl NotificationService {
         mailer: Arc<dyn Mailer>,
         mail: &MailConfig,
     ) -> Self {
+        Self::from_mail_config_with_extra_channels(stg, mailer, mail, Vec::new())
+    }
+
+    /// Like [`from_mail_config`](Self::from_mail_config) but also registers
+    /// caller-supplied secondary channels (e.g. Slack / webhook built post-vault
+    /// with resolved `SecretRef` credentials, docs/notification.md phase 3). The
+    /// in-app inbox channel is always registered first among the secondaries, so
+    /// the final routing order is `email, in_app, <extra...>`.
+    pub fn from_mail_config_with_extra_channels(
+        stg: NotificationStorage,
+        mailer: Arc<dyn Mailer>,
+        mail: &MailConfig,
+        extra_channels: Vec<Arc<dyn NotificationChannel>>,
+    ) -> Self {
         let inbox: Arc<dyn NotificationChannel> = Arc::new(InAppChannel::new(stg.clone()));
+        let mut channels = Vec::with_capacity(extra_channels.len() + 1);
+        channels.push(inbox);
+        channels.extend(extra_channels);
         Self::new(
             stg,
             mailer,
             EmailDispatcherControl::from_mail_config(mail),
-            vec![inbox],
+            channels,
         )
     }
 
@@ -280,6 +297,38 @@ mod tests {
         assert!(service.channel_for("in_app").is_some());
         assert!(service.channel_for("console").is_some());
         assert!(service.channel_for("slack").is_none());
+    }
+
+    #[tokio::test]
+    async fn from_mail_config_with_extra_channels_registers_slack_and_webhook() {
+        use crate::notification::channels::{SlackChannel, WebhookChannel};
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db));
+        let slack: Arc<dyn NotificationChannel> = Arc::new(
+            SlackChannel::new(crate::config::secret::SecretString::new(
+                "http://127.0.0.1:1/services/secret",
+            ))
+            .unwrap(),
+        );
+        let webhook: Arc<dyn NotificationChannel> =
+            Arc::new(WebhookChannel::new("http://127.0.0.1:1/hook".to_string(), None).unwrap());
+        let service = NotificationService::from_mail_config_with_extra_channels(
+            stg,
+            Arc::new(NoopMailer),
+            &crate::config::MailConfig::default(),
+            vec![slack, webhook],
+        );
+
+        // Order: email, in_app, then the extras.
+        assert_eq!(service.channels().len(), 4);
+        assert_eq!(service.channels()[0].name(), "email");
+        assert_eq!(service.channels()[1].name(), "in_app");
+        assert!(service.channel_for("slack").is_some());
+        assert!(service.channel_for("webhook").is_some());
     }
 
     #[tokio::test]

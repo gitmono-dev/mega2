@@ -17,13 +17,54 @@ use crate::{
         secret::{SecretRef, SecretResolver, VaultSecretResolver},
         template::config_init_template,
         validate::{
-            ConfigSourceDiagnostics, collect_source_diagnostics, validate_mail_password_secret_ref,
+            ConfigSourceDiagnostics, collect_source_diagnostics, validate_config_secret_ref,
         },
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface, with_audit_caller},
 };
 
 const MAIL_PASSWORD_FIELD: &str = "mail.password";
+
+/// Config-managed secret fields that may be stored in the monoengine vault, with
+/// the vault namespace suffix each must use (`config/<profile>/<suffix>`). Only
+/// these fields are accepted by `config secret set/check/rotate/ref`. Database,
+/// Redis and object-storage credentials are intentionally excluded — they are
+/// bootstrap dependencies that must stay in deployment/environment secrets.
+const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
+    (MAIL_PASSWORD_FIELD, "mail/password"),
+    (
+        "notification.slack.webhook_url",
+        "notification/slack/webhook_url",
+    ),
+    ("notification.webhook.token", "notification/webhook/token"),
+];
+
+/// Look up the required vault namespace suffix for a supported secret field.
+fn supported_secret_suffix(name: &str) -> Option<&'static str> {
+    SUPPORTED_SECRET_FIELDS
+        .iter()
+        .find(|(field, _)| *field == name)
+        .map(|(_, suffix)| *suffix)
+}
+
+/// Validate that `secret_ref` uses the namespace required for the named field.
+fn validate_secret_field_ref(name: &str, secret_ref: &SecretRef) -> Result<(), MegaError> {
+    match supported_secret_suffix(name) {
+        Some(suffix) => validate_config_secret_ref(name, secret_ref, suffix),
+        None => Err(unsupported_secret_field_error(name)),
+    }
+}
+
+fn unsupported_secret_field_error(name: &str) -> MegaError {
+    let supported = SUPPORTED_SECRET_FIELDS
+        .iter()
+        .map(|(field, _)| *field)
+        .collect::<Vec<_>>()
+        .join(", ");
+    MegaError::Other(format!(
+        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database, Redis, and object storage credentials must stay in deployment/environment secrets."
+    ))
+}
 
 pub fn cli() -> Command {
     Command::new("config")
@@ -181,7 +222,9 @@ fn secret_name_arg() -> Arg {
     Arg::new("name")
         .value_name("CONFIG_FIELD")
         .required(true)
-        .help("Supported config secret field, currently mail.password")
+        .help(
+            "Supported config secret field: mail.password, notification.slack.webhook_url, notification.webhook.token",
+        )
 }
 
 fn vault_path_arg() -> Arg {
@@ -439,7 +482,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             ensure_supported_secret_field(name)?;
             let secret_ref = if let Some(value) = check_args.get_one::<String>("ref") {
                 let secret_ref = SecretRef::parse(value)?;
-                validate_mail_password_secret_ref(name, &secret_ref)?;
+                validate_secret_field_ref(name, &secret_ref)?;
                 secret_ref
             } else {
                 secret_ref_from_args(check_args)?
@@ -536,6 +579,21 @@ where
         with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
     }
 
+    if let Some(notification_cfg) = &config.notification {
+        if let Some(slack) = &notification_cfg.slack
+            && slack.enabled
+            && let Some(secret_ref) = &slack.webhook_url_ref
+        {
+            with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
+        }
+        if let Some(webhook) = &notification_cfg.webhook
+            && webhook.enabled
+            && let Some(secret_ref) = &webhook.token_ref
+        {
+            with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -576,7 +634,7 @@ fn secret_ref_from_args(args: &ArgMatches) -> Result<SecretRef, MegaError> {
     let field = required_string_arg(args, "field")?;
 
     let secret_ref = SecretRef::from_parts(vault_path, field)?;
-    validate_mail_password_secret_ref(name, &secret_ref)?;
+    validate_secret_field_ref(name, &secret_ref)?;
     Ok(secret_ref)
 }
 
@@ -589,13 +647,11 @@ fn required_string_arg<'a>(args: &'a ArgMatches, name: &str) -> Result<&'a Strin
 }
 
 fn ensure_supported_secret_field(name: &str) -> Result<(), MegaError> {
-    if name == MAIL_PASSWORD_FIELD {
+    if supported_secret_suffix(name).is_some() {
         return Ok(());
     }
 
-    Err(MegaError::Other(format!(
-        "{name} cannot be stored in monoengine vault; only {MAIL_PASSWORD_FIELD} is currently supported. Database, Redis, and object storage credentials must stay in deployment/environment secrets."
-    )))
+    Err(unsupported_secret_field_error(name))
 }
 
 fn read_secret_value_from_stdin() -> Result<String, MegaError> {
@@ -752,7 +808,9 @@ mod tests {
             .unwrap();
 
         let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
-        assert!(err.to_string().contains("only mail.password"));
+        let message = err.to_string();
+        assert!(message.contains("cannot be stored in monoengine vault"));
+        assert!(message.contains("supported fields are"));
     }
 
     #[test]
@@ -811,7 +869,46 @@ mod tests {
             .unwrap();
 
         let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
-        assert!(err.to_string().contains("only mail.password"));
+        let message = err.to_string();
+        assert!(message.contains("cannot be stored in monoengine vault"));
+        assert!(message.contains("supported fields are"));
+    }
+
+    #[test]
+    fn secret_ref_from_args_accepts_notification_slack_webhook_url_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "notification.slack.webhook_url",
+                "--vault-path",
+                "config/prod/notification/slack/webhook_url",
+            ])
+            .unwrap();
+
+        let secret_ref =
+            secret_ref_from_args(&matches).expect("slack webhook_url ref should be accepted");
+        assert_eq!(
+            secret_ref.secret_name(),
+            "config/prod/notification/slack/webhook_url"
+        );
+    }
+
+    #[test]
+    fn secret_ref_from_args_rejects_notification_secret_outside_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "notification.webhook.token",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+        assert!(message.contains("notification.webhook.token"));
+        assert!(message.contains("notification/webhook/token"));
+        assert!(!message.contains("config/prod/mail/password"));
     }
 
     #[test]
@@ -861,8 +958,7 @@ mod tests {
             .expect("--ref should exist")
             .expect("SecretRef should parse");
 
-        let err =
-            validate_mail_password_secret_ref(name, &secret_ref).expect_err("wrong namespace");
+        let err = validate_secret_field_ref(name, &secret_ref).expect_err("wrong namespace");
         let message = err.to_string();
 
         assert!(message.contains("mail.password"));

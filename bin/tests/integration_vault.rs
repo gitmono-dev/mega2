@@ -362,7 +362,8 @@ fn config_secret_ref_rejects_bootstrap_secret_fields() {
 
     assert!(stdout.trim().is_empty(), "unexpected stdout: {stdout}");
     assert!(
-        stderr.contains("only mail.password"),
+        stderr.contains("cannot be stored in monoengine vault")
+            && stderr.contains("supported fields are"),
         "unexpected stderr: {stderr}"
     );
 }

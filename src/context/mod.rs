@@ -108,11 +108,73 @@ impl AppContext {
                 Arc::new(crate::mail::NoopMailer)
             };
             let notif_stg = storage.notification_storage();
-            let service = crate::notification::NotificationService::from_mail_config(
-                notif_stg,
-                mailer_for_startup,
-                mail_cfg,
-            );
+            // Build secret-bearing secondary channels (Slack / generic webhook)
+            // post-vault, resolving their credentials through the vault resolver
+            // (docs/notification.md phase 3: channel credentials are resolved only
+            // after vault is ready).
+            let mut extra_channels: Vec<
+                Arc<dyn crate::notification::channels::NotificationChannel>,
+            > = Vec::new();
+            if let Some(notification_cfg) = config.notification.as_ref() {
+                // Enforce the notification SecretRef namespace (and required
+                // fields) on the real startup path before resolving any channel
+                // credential, so a config cannot point a channel ref at an
+                // unrelated vault path (the per-validator allowlist must not be
+                // bypassable at runtime, only enforced by manual `config validate`).
+                crate::config::validate::validate_notification_config(notification_cfg)?;
+                let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
+                if let Some(slack) = notification_cfg
+                    .slack
+                    .as_ref()
+                    .filter(|slack| slack.enabled)
+                {
+                    let Some(url_ref) = &slack.webhook_url_ref else {
+                        return Err(MegaError::Other(
+                            "notification.slack.enabled is true but notification.slack.webhook_url_ref is missing".to_string(),
+                        ));
+                    };
+                    let url = crate::contract::vault::integration::vault_core::with_audit_caller(
+                        "startup:notification-slack",
+                        resolver.resolve(url_ref),
+                    )
+                    .await?;
+                    extra_channels.push(Arc::new(
+                        crate::notification::channels::SlackChannel::new(
+                            crate::config::secret::SecretString::new(url),
+                        )?,
+                    ));
+                }
+                if let Some(webhook) = notification_cfg
+                    .webhook
+                    .as_ref()
+                    .filter(|webhook| webhook.enabled)
+                {
+                    let token = if let Some(token_ref) = &webhook.token_ref {
+                        Some(crate::config::secret::SecretString::new(
+                            crate::contract::vault::integration::vault_core::with_audit_caller(
+                                "startup:notification-webhook",
+                                resolver.resolve(token_ref),
+                            )
+                            .await?,
+                        ))
+                    } else {
+                        None
+                    };
+                    extra_channels.push(Arc::new(
+                        crate::notification::channels::WebhookChannel::new(
+                            webhook.url.clone(),
+                            token,
+                        )?,
+                    ));
+                }
+            }
+            let service =
+                crate::notification::NotificationService::from_mail_config_with_extra_channels(
+                    notif_stg,
+                    mailer_for_startup,
+                    mail_cfg,
+                    extra_channels,
+                );
             // Honor the global notification kill switch at startup; a later
             // reload can re-enable both mail and notifications without restart.
             let notification_globally_enabled = config

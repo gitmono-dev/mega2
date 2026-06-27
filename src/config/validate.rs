@@ -134,7 +134,7 @@ impl Config {
     }
 }
 
-fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
+pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
     if !NOTIFICATION_DELIVERY_MODES.contains(&config.default_delivery_mode.as_str()) {
         return Err(MegaError::Other(format!(
             "notification.default_delivery_mode `{}` is not supported; expected one of {:?}",
@@ -147,7 +147,72 @@ fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaE
         ));
     }
 
+    if let Some(slack) = &config.slack
+        && slack.enabled
+    {
+        let Some(secret_ref) = &slack.webhook_url_ref else {
+            return Err(MegaError::Other(
+                "notification.slack.webhook_url_ref is required when notification.slack.enabled is true".to_string(),
+            ));
+        };
+        validate_config_secret_ref(
+            "notification.slack.webhook_url_ref",
+            secret_ref,
+            "notification/slack/webhook_url",
+        )?;
+    }
+
+    if let Some(webhook) = &config.webhook
+        && webhook.enabled
+    {
+        if webhook.url.trim().is_empty() {
+            return Err(MegaError::Other(
+                "notification.webhook.url must not be empty when notification.webhook.enabled is true".to_string(),
+            ));
+        }
+        if let Some(secret_ref) = &webhook.token_ref {
+            validate_config_secret_ref(
+                "notification.webhook.token_ref",
+                secret_ref,
+                "notification/webhook/token",
+            )?;
+        }
+    }
+
     Ok(())
+}
+
+/// Validate that a config-managed `SecretRef` lives under the expected
+/// `config/<profile>/<suffix>` namespace (used for `mail.password` and the
+/// notification channel credentials). The SecretRef value is never logged.
+pub(crate) fn validate_config_secret_ref(
+    field_path: &str,
+    secret_ref: &SecretRef,
+    suffix: &str,
+) -> Result<(), MegaError> {
+    if is_config_secret_under(secret_ref.secret_name(), suffix) {
+        return Ok(());
+    }
+
+    Err(MegaError::Other(format!(
+        "{field_path} must use a vault SecretRef under vault://secret/config/<profile>/{suffix}#<field>; value is redacted"
+    )))
+}
+
+/// True when `secret_name` is exactly `config/<profile>/<suffix>` with a single
+/// non-empty `<profile>` segment (no extra path components between `config/` and
+/// the suffix), so a ref cannot point at an unrelated nested vault path.
+fn is_config_secret_under(secret_name: &str, suffix: &str) -> bool {
+    let Some(rest) = secret_name.strip_prefix("config/") else {
+        return false;
+    };
+    let trimmed_suffix = format!("/{suffix}");
+    let Some(profile) = rest.strip_suffix(&trimmed_suffix) else {
+        return false;
+    };
+
+    // Exactly one profile segment: non-empty and containing no further '/'.
+    !profile.is_empty() && !profile.contains('/')
 }
 
 impl MailConfig {
@@ -423,24 +488,7 @@ pub(crate) fn validate_mail_password_secret_ref(
     field_path: &str,
     secret_ref: &SecretRef,
 ) -> Result<(), MegaError> {
-    if is_mail_password_secret_name(secret_ref.secret_name()) {
-        return Ok(());
-    }
-
-    Err(MegaError::Other(format!(
-        "{field_path} must use a vault SecretRef under vault://secret/config/<profile>/mail/password#<field>; value is redacted"
-    )))
-}
-
-fn is_mail_password_secret_name(secret_name: &str) -> bool {
-    let Some(rest) = secret_name.strip_prefix("config/") else {
-        return false;
-    };
-    let Some(namespace) = rest.strip_suffix("/mail/password") else {
-        return false;
-    };
-
-    !namespace.is_empty()
+    validate_config_secret_ref(field_path, secret_ref, "mail/password")
 }
 
 pub(crate) fn validate_buck_config(buck_config: &BuckConfig) -> Result<(), MegaError> {
@@ -1364,7 +1412,15 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "smtp_tls",
             "tls",
         ]),
-        "notification" => Some(&["enabled", "default_delivery_mode", "default_locale"]),
+        "notification" => Some(&[
+            "enabled",
+            "default_delivery_mode",
+            "default_locale",
+            "slack",
+            "webhook",
+        ]),
+        "notification.slack" => Some(&["enabled", "webhook_url_ref"]),
+        "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
         "vault.audit" => Some(&["enabled"]),
         _ => None,
@@ -1442,6 +1498,113 @@ mod tests {
             .expect_err("empty notification locale should fail");
 
         assert!(err.to_string().contains("notification.default_locale"));
+    }
+
+    #[test]
+    fn config_validate_rejects_enabled_slack_without_webhook_url_ref() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            slack: Some(crate::config::SlackConfig {
+                enabled: true,
+                webhook_url_ref: None,
+            }),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("enabled slack without webhook_url_ref should fail");
+        assert!(
+            err.to_string()
+                .contains("notification.slack.webhook_url_ref")
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_slack_secret_ref_outside_namespace_without_leaking_ref() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            slack: Some(crate::config::SlackConfig {
+                enabled: true,
+                webhook_url_ref: Some(
+                    crate::config::secret::SecretRef::parse(
+                        "vault://secret/config/prod/mail/password#value",
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("slack secret ref outside namespace should fail");
+        let message = err.to_string();
+        assert!(message.contains("notification.slack.webhook_url_ref"));
+        assert!(message.contains("notification/slack/webhook_url"));
+        // The SecretRef value must not leak.
+        assert!(!message.contains("config/prod/mail/password"));
+    }
+
+    #[test]
+    fn config_validate_accepts_enabled_slack_with_correct_namespace() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            slack: Some(crate::config::SlackConfig {
+                enabled: true,
+                webhook_url_ref: Some(
+                    crate::config::secret::SecretRef::parse(
+                        "vault://secret/config/prod/notification/slack/webhook_url#value",
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("slack with correct namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_enabled_webhook_without_url() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            webhook: Some(crate::config::WebhookConfig {
+                enabled: true,
+                url: "   ".to_string(),
+                token_ref: None,
+            }),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("enabled webhook without url should fail");
+        assert!(err.to_string().contains("notification.webhook.url"));
+    }
+
+    #[test]
+    fn config_validate_accepts_webhook_with_token_ref_in_namespace() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            webhook: Some(crate::config::WebhookConfig {
+                enabled: true,
+                url: "https://hooks.example.com/notify".to_string(),
+                token_ref: Some(
+                    crate::config::secret::SecretRef::parse(
+                        "vault://secret/config/prod/notification/webhook/token#value",
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("webhook with correct namespace should validate");
     }
 
     #[test]

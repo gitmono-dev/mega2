@@ -335,6 +335,22 @@ default_delivery_mode = "email"
 # Default locale for rendered notifications when a user has none.
 default_locale = "en-US"
 
+# Optional Slack incoming-webhook channel (docs/notification.md phase 3). The
+# Slack webhook URL embeds a secret token in its path, so it is supplied as a
+# vault SecretRef (the URL is the credential) and resolved only after vault is
+# ready. Set the secret with: config secret set notification/slack/webhook_url
+# [notification.slack]
+# enabled = true
+# webhook_url_ref = "vault://secret/config/<profile>/notification/slack/webhook_url#value"
+
+# Optional generic outbound webhook channel (docs/notification.md phase 3). The
+# URL is operator-trusted (non-secret); an optional bearer token is a SecretRef
+# sent as `Authorization: Bearer <token>`.
+# [notification.webhook]
+# enabled = true
+# url = "https://hooks.example.com/notify"
+# token_ref = "vault://secret/config/<profile>/notification/webhook/token#value"
+
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),
 # VaultCore emits one record per secret read/write/delete to the `vault_audit`
