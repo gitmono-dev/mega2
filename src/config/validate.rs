@@ -11,7 +11,8 @@ use url::Url;
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
     MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
-    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, secret::SecretRef,
+    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    secret::SecretRef,
 };
 use crate::common::errors::MegaError;
 
@@ -129,9 +130,37 @@ impl Config {
         if let Some(notification_config) = &self.notification {
             validate_notification_config(notification_config)?;
         }
+        if let Some(vault_config) = &self.vault {
+            validate_vault_config(vault_config)?;
+        }
 
         Ok(())
     }
+}
+
+/// Validate `[vault]` settings (docs/vault.md stage H): the audit sink must be a
+/// supported value, and a `file` sink requires a non-empty `file_path`.
+pub(crate) fn validate_vault_config(config: &VaultConfig) -> Result<(), MegaError> {
+    let audit = &config.audit;
+    if !VAULT_AUDIT_SINKS.contains(&audit.sink.as_str()) {
+        return Err(MegaError::Other(format!(
+            "vault.audit.sink `{}` is not supported; expected one of {:?}",
+            audit.sink, VAULT_AUDIT_SINKS
+        )));
+    }
+    if audit.sink == "file"
+        && audit
+            .file_path
+            .as_ref()
+            .map(|path| path.as_os_str().is_empty())
+            .unwrap_or(true)
+    {
+        return Err(MegaError::Other(
+            "vault.audit.file_path is required (and must be non-empty) when vault.audit.sink is \"file\""
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
@@ -1422,7 +1451,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         "notification.slack" => Some(&["enabled", "webhook_url_ref"]),
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
-        "vault.audit" => Some(&["enabled"]),
+        "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
         _ => None,
     }
 }
@@ -1605,6 +1634,58 @@ mod tests {
         config
             .validate()
             .expect("webhook with correct namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_unsupported_vault_audit_sink() {
+        let mut config = valid_config();
+        config.vault = Some(crate::config::VaultConfig {
+            audit: crate::config::VaultAuditConfig {
+                sink: "syslog".to_string(),
+                ..Default::default()
+            },
+        });
+
+        let err = config
+            .validate()
+            .expect_err("unsupported vault audit sink should fail");
+        assert!(err.to_string().contains("vault.audit.sink"));
+    }
+
+    #[test]
+    fn config_validate_rejects_file_audit_sink_without_path() {
+        let mut config = valid_config();
+        config.vault = Some(crate::config::VaultConfig {
+            audit: crate::config::VaultAuditConfig {
+                sink: "file".to_string(),
+                file_path: None,
+                ..Default::default()
+            },
+        });
+
+        let err = config
+            .validate()
+            .expect_err("file audit sink without path should fail");
+        assert!(err.to_string().contains("vault.audit.file_path"));
+    }
+
+    #[test]
+    fn config_validate_accepts_file_audit_sink_with_path() {
+        let mut config = valid_config();
+        config.vault = Some(crate::config::VaultConfig {
+            audit: crate::config::VaultAuditConfig {
+                sink: "file".to_string(),
+                file_path: Some(std::path::PathBuf::from(
+                    "/var/log/monoengine/vault-audit.jsonl",
+                )),
+                fail_closed: true,
+                ..Default::default()
+            },
+        });
+
+        config
+            .validate()
+            .expect("file audit sink with a path should validate");
     }
 
     #[test]

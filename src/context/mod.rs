@@ -51,7 +51,7 @@ impl AppContext {
         let vault_audit = config
             .vault
             .as_ref()
-            .map(|vault| vault.audit)
+            .map(|vault| vault.audit.clone())
             .unwrap_or_default();
         let vault =
             crate::contract::vault::integration::vault_core::VaultCore::new(storage_for_vault)

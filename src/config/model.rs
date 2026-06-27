@@ -388,28 +388,50 @@ pub struct VaultConfig {
     pub audit: VaultAuditConfig,
 }
 
+/// Supported vault audit sinks (docs/vault.md stage H).
+pub const VAULT_AUDIT_SINKS: &[&str] = &["tracing", "file"];
+
 /// Secret-access audit settings (docs/vault.md stage H).
 ///
 /// `enabled` defaults to on, so deployments audit by default; setting it false
-/// opts out of emitting per-access records. The audit destination is the
-/// `vault_audit` `tracing` target; a configurable durable/alternate sink is
-/// deferred (vault.md stage H). The write-failure policy is fail-open: the
-/// `tracing` sink is infallible, so a secret operation is never blocked or
-/// failed by the audit step (availability-over-non-repudiation).
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+/// opts out of emitting per-access records. `sink` selects the destination:
+/// `"tracing"` (default; the infallible `vault_audit` tracing target) or
+/// `"file"` (a durable append-only JSONL log at `file_path`, fsync'd per record).
+/// `fail_closed` makes a failed audit-record write fail the secret operation
+/// (non-repudiation over availability); it only matters for fallible sinks
+/// (`file`) — the `tracing` sink never fails. Audit records carry the operation,
+/// logical secret name, outcome and caller only — never the secret value.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct VaultAuditConfig {
     #[serde(default = "default_vault_audit_enabled")]
     pub enabled: bool,
+    /// `"tracing"` (default) or `"file"`.
+    #[serde(default = "default_vault_audit_sink")]
+    pub sink: String,
+    /// Durable append-only JSONL audit log path; required when `sink = "file"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<PathBuf>,
+    /// Fail the secret operation if the audit record cannot be written
+    /// (default `false` = fail-open).
+    #[serde(default)]
+    pub fail_closed: bool,
 }
 
 fn default_vault_audit_enabled() -> bool {
     true
 }
 
+fn default_vault_audit_sink() -> String {
+    "tracing".to_string()
+}
+
 impl Default for VaultAuditConfig {
     fn default() -> Self {
         Self {
             enabled: default_vault_audit_enabled(),
+            sink: default_vault_audit_sink(),
+            file_path: None,
+            fail_closed: false,
         }
     }
 }

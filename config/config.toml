@@ -353,9 +353,17 @@ default_locale = "en-US"
 
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),
-# VaultCore emits one record per secret read/write/delete to the `vault_audit`
-# tracing target with the operation, logical secret name and outcome only
-# (never the secret value). Set to false to opt out. The write-failure policy
-# is fail-open (the tracing sink is infallible, so auditing never blocks a
-# secret operation); a configurable durable/alternate sink is deferred.
+# VaultCore emits one record per secret read/write/delete with the operation,
+# logical secret name, outcome and caller only (never the secret value). Set to
+# false to opt out.
 enabled = true
+# Audit sink: "tracing" (default; the `vault_audit` tracing target, infallible)
+# or "file" (a durable append-only JSONL log, fsync'd per record, for
+# non-repudiation independent of the process log pipeline).
+sink = "tracing"
+# Required when sink = "file": the durable audit log path.
+# file_path = "/var/log/monoengine/vault-audit.jsonl"
+# When true (and sink is fallible, e.g. "file"), a failed audit-record write
+# fails the secret operation (non-repudiation over availability). Default false
+# (fail-open: a sink write failure is logged but does not block secret access).
+fail_closed = false

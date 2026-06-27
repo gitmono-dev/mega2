@@ -417,41 +417,105 @@ impl VaultCore {
     /// Emit one audit record per secret access (vault.md stage H).
     ///
     /// Records `operation` (write/read/list/delete), the `secret_name` (the
-    /// logical path, never the secret value) and the `outcome`
-    /// (success/miss/failure) to the `vault_audit` tracing target.
+    /// logical path, never the secret value), the `outcome` (success/miss/failure)
+    /// and the `caller` to the configured audit sink.
     ///
     /// **Configurable, default on.** Auditing is gated by
-    /// [`VaultAuditConfig::enabled`] (default `true`); a deployment may opt out
-    /// via `config.vault.audit.enabled = false`, in which case no record is
-    /// emitted. The destination is the `vault_audit` tracing target; a
-    /// configurable durable/alternate sink is deferred (vault.md stage H).
+    /// [`VaultAuditConfig::enabled`] (default `true`). The sink
+    /// ([`VaultAuditConfig::sink`]) is `"tracing"` by default (the infallible
+    /// `vault_audit` tracing target) or `"file"` — a durable append-only JSONL
+    /// log at `file_path`, fsync'd per record, for non-repudiation independent of
+    /// the process log pipeline (vault.md stage H).
     ///
-    /// **Failure policy: fail-open (intentional).** Auditing uses `tracing`,
-    /// whose emission is infallible and cannot itself error, so a secret
-    /// operation is never blocked or failed by the audit step. This is a
-    /// deliberate availability-over-non-repudiation choice: a missing audit
-    /// sink must not deny legitimate secret access at runtime. The secret value
-    /// is hashed/omitted by construction here (only the name and outcome are
-    /// recorded), so this target carries no plaintext, root token or shares.
+    /// **Failure policy.** The `tracing` sink is infallible. For a fallible sink
+    /// (`file`), [`VaultAuditConfig::fail_closed`] selects the behaviour on a
+    /// write error: fail-open (default) logs a warning and lets the secret
+    /// operation proceed (availability over non-repudiation); fail-closed returns
+    /// an error so the caller fails the operation. The secret value is omitted by
+    /// construction (only name/operation/outcome/caller are recorded), so neither
+    /// sink ever carries plaintext, root token or shares.
     fn audit_secret_access(
         &self,
         operation: SecretAuditOperation,
         name: SecretName<'_>,
         outcome: &'static str,
-    ) {
+    ) -> Result<(), MegaError> {
         if !self.audit.enabled {
-            return;
+            return Ok(());
         }
         let caller = current_audit_caller();
-        tracing::info!(
-            target: "vault_audit",
-            operation = operation.as_str(),
-            secret_name = name.as_str(),
-            outcome,
-            caller = %caller,
-            "vault secret access"
-        );
+        match self.audit.sink.as_str() {
+            "file" => {
+                let Some(path) = self.audit.file_path.as_ref() else {
+                    // Validation rejects this config, but guard defensively.
+                    if self.audit.fail_closed {
+                        return Err(MegaError::Other(
+                            "vault audit sink is \"file\" but no file_path is configured (fail-closed)"
+                                .to_string(),
+                        ));
+                    }
+                    tracing::warn!(
+                        target: "vault_audit",
+                        "vault audit sink is \"file\" but no file_path is configured; skipping record (fail-open)"
+                    );
+                    return Ok(());
+                };
+                let record = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "operation": operation.as_str(),
+                    "secret_name": name.as_str(),
+                    "outcome": outcome,
+                    "caller": caller,
+                });
+                if let Err(error) = append_audit_record(path, &record) {
+                    if self.audit.fail_closed {
+                        return Err(MegaError::Other(format!(
+                            "vault audit record write failed (fail-closed): {error}"
+                        )));
+                    }
+                    tracing::warn!(
+                        target: "vault_audit",
+                        error = %error,
+                        "vault audit file write failed; continuing (fail-open)"
+                    );
+                }
+                Ok(())
+            }
+            _ => {
+                tracing::info!(
+                    target: "vault_audit",
+                    operation = operation.as_str(),
+                    secret_name = name.as_str(),
+                    outcome,
+                    caller = %caller,
+                    "vault secret access"
+                );
+                Ok(())
+            }
+        }
     }
+}
+
+/// Append one JSON audit record as a line to `path`, creating it if needed and
+/// fsync'ing the file for durability. `O_APPEND` (via `append(true)`) gives an
+/// atomic seek+write for these small records on Linux regular files, so
+/// concurrent secret operations do not need an explicit lock to avoid
+/// interleaving. Note: `sync_all` fsyncs the file but not the parent directory,
+/// so a crash immediately after the very first creation could lose the new file
+/// entry — an accepted tradeoff for an append-only audit log.
+fn append_audit_record(path: &Path, record: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut line = serde_json::to_string(record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[async_trait]
@@ -469,12 +533,15 @@ impl VaultCoreInterface for VaultCore {
             .write(Some(token), path, data)
             .await
             .map_err(|e| VaultError::WriteApi(e.to_string()));
-        self.audit_secret_access(
+        let audit = self.audit_secret_access(
             SecretAuditOperation::Write,
             name,
             if result.is_ok() { "success" } else { "failure" },
         );
+        // The operation's own error takes precedence; a fail-closed audit error
+        // is only surfaced when the operation otherwise succeeded.
         result?;
+        audit?;
         Ok(())
     }
 
@@ -487,7 +554,7 @@ impl VaultCoreInterface for VaultCore {
             .read(token.into(), &path)
             .await
             .map_err(|e| VaultError::ReadApi(e.to_string()));
-        self.audit_secret_access(
+        let audit = self.audit_secret_access(
             SecretAuditOperation::Read,
             name,
             match &result {
@@ -497,6 +564,7 @@ impl VaultCoreInterface for VaultCore {
             },
         );
         let resp = result?;
+        audit?;
 
         Ok(resp.and_then(|r| r.data))
     }
@@ -510,12 +578,13 @@ impl VaultCoreInterface for VaultCore {
             .delete(Some(token), path, None)
             .await
             .map_err(|e| VaultError::DeleteApi(e.to_string()));
-        self.audit_secret_access(
+        let audit = self.audit_secret_access(
             SecretAuditOperation::Delete,
             name,
             if result.is_ok() { "success" } else { "failure" },
         );
         result?;
+        audit?;
         Ok(())
     }
 }
@@ -1210,7 +1279,10 @@ mod tests {
         );
 
         // Opting out via config must not break secret operations (fail-open).
-        let vault_core = vault_core.with_audit_config(VaultAuditConfig { enabled: false });
+        let vault_core = vault_core.with_audit_config(VaultAuditConfig {
+            enabled: false,
+            ..Default::default()
+        });
         assert!(!vault_core.audit.enabled);
 
         let value = serde_json::json!({ "data": "v" })
@@ -1230,6 +1302,107 @@ mod tests {
             read, value,
             "audit toggle must not affect secret round-trip"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_file_sink_writes_jsonl_records_without_secret_value() {
+        // Stage H: the durable "file" audit sink appends one JSONL record per
+        // secret access, carrying operation/secret_name/outcome/caller only.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let audit_path = temp_dir.path().join("vault-audit.jsonl");
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize")
+            .with_audit_config(VaultAuditConfig {
+                enabled: true,
+                sink: "file".to_string(),
+                file_path: Some(audit_path.clone()),
+                fail_closed: true,
+            });
+
+        let mut data = Map::new();
+        data.insert(
+            "value".to_string(),
+            Value::String("super-secret-audit-value".to_string()),
+        );
+        vault
+            .write_secret("ssh_server_key", Some(data))
+            .await
+            .expect("write should succeed");
+        vault
+            .read_secret("ssh_server_key")
+            .await
+            .expect("read should succeed");
+
+        let contents = std::fs::read_to_string(&audit_path).expect("audit file should exist");
+        let mut operations = Vec::new();
+        for line in contents.lines() {
+            let record: Value = serde_json::from_str(line).expect("each line is a JSON record");
+            assert_eq!(record["secret_name"], "ssh_server_key");
+            assert!(record.get("caller").is_some());
+            assert!(record.get("ts").is_some());
+            operations.push(record["operation"].as_str().unwrap().to_string());
+        }
+        assert!(operations.iter().any(|op| op == "write"));
+        assert!(operations.iter().any(|op| op == "read"));
+        // The secret value must never appear in the audit log.
+        assert!(
+            !contents.contains("super-secret-audit-value"),
+            "audit log must not contain the secret value"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_file_sink_fail_closed_fails_operation_when_unwritable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        // A path under a non-existent directory cannot be created, so the append fails.
+        let audit_path = temp_dir.path().join("missing-dir").join("audit.jsonl");
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize")
+            .with_audit_config(VaultAuditConfig {
+                enabled: true,
+                sink: "file".to_string(),
+                file_path: Some(audit_path),
+                fail_closed: true,
+            });
+
+        let mut data = Map::new();
+        data.insert("value".to_string(), Value::String("v".to_string()));
+        let err = vault
+            .write_secret("ssh_server_key", Some(data))
+            .await
+            .expect_err("fail-closed audit write failure should fail the operation");
+        assert!(err.to_string().contains("audit record write failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_file_sink_fail_open_allows_operation_when_unwritable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let audit_path = temp_dir.path().join("missing-dir").join("audit.jsonl");
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize")
+            .with_audit_config(VaultAuditConfig {
+                enabled: true,
+                sink: "file".to_string(),
+                file_path: Some(audit_path),
+                fail_closed: false,
+            });
+
+        let mut data = Map::new();
+        data.insert("value".to_string(), Value::String("v".to_string()));
+        // Fail-open: the audit write fails but the secret operation still succeeds.
+        vault
+            .write_secret("ssh_server_key", Some(data))
+            .await
+            .expect("fail-open audit failure must not block the operation");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
