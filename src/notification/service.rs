@@ -212,20 +212,7 @@ fn apply_mailer_rebuild(
     let vault = vault.clone();
     match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
-            runtime.spawn(async move {
-                match rebuild_mailer(&vault, &mail).await {
-                    Ok(mailer) => {
-                        handle.store(Arc::new(MailerSlot(mailer)));
-                        info!("mail mailer hot-rebuilt after config reload");
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %global_redactor().redact(&e.to_string()),
-                            "mail mailer rebuild failed; keeping the previous mailer"
-                        );
-                    }
-                }
-            });
+            runtime.spawn(rebuild_and_swap_mailer(handle, vault, mail));
         }
         Err(_) => {
             warn!(
@@ -235,6 +222,25 @@ fn apply_mailer_rebuild(
     }
 
     Ok(())
+}
+
+/// Rebuild the SMTP mailer and hot-swap it into `handle`, keeping the previously
+/// installed mailer on failure (fail-safe). Extracted from the task spawned by
+/// [`apply_mailer_rebuild`] so the success/failure outcomes are directly
+/// awaitable in tests instead of only being observable through a detached task.
+async fn rebuild_and_swap_mailer(handle: MailerHandle, vault: VaultCore, mail: MailConfig) {
+    match rebuild_mailer(&vault, &mail).await {
+        Ok(mailer) => {
+            handle.store(Arc::new(MailerSlot(mailer)));
+            info!("mail mailer hot-rebuilt after config reload");
+        }
+        Err(e) => {
+            warn!(
+                error = %global_redactor().redact(&e.to_string()),
+                "mail mailer rebuild failed; keeping the previous mailer"
+            );
+        }
+    }
 }
 
 async fn rebuild_mailer(
@@ -394,6 +400,80 @@ mod tests {
         assert!(
             swapped,
             "NoopMailer should be replaced after mail is re-enabled"
+        );
+    }
+
+    /// docs/mail.md phase 5 ("仍需解析失败"): a hot mailer rebuild whose
+    /// `mail.password_ref` cannot be resolved from the vault must fail *safely* —
+    /// the resolution error is returned (never panicking), it carries only the
+    /// redacted SecretRef (no path/field/value leak), and `apply_mailer_rebuild`
+    /// keeps the previously installed mailer instead of swapping in a half-built
+    /// one. This is the failure counterpart to
+    /// `mailer_rebuild_subscriber_swaps_noop_when_mail_re_enabled`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn mailer_rebuild_fails_safely_and_redacts_when_password_ref_unresolvable() {
+        use arc_swap::ArcSwap;
+
+        use crate::{
+            config::{MailProvider, secret::SecretRef},
+            jupiter::tests::test_storage,
+            mail::NoopMailer,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = test_storage(temp_dir.path()).await;
+        let key_path = temp_dir.path().join("core_key.json");
+        let vault = VaultCore::config(storage.vault_storage(), key_path)
+            .await
+            .expect("vault should initialize");
+
+        // SMTP mail whose password_ref points at a vault path that holds no
+        // secret, so re-resolution during the rebuild fails.
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("apikey".to_string()),
+            password: None,
+            password_ref: Some(secret_ref),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+            ..Default::default()
+        };
+
+        // The rebuild surfaces an Err (not a panic), and neither the raw nor the
+        // redacted error leaks the SecretRef path/field.
+        let err = match rebuild_mailer(&vault, &mail).await {
+            Ok(_) => panic!("an unresolvable password_ref must fail the rebuild"),
+            Err(e) => e,
+        };
+        let raw = err.to_string();
+        let redacted = global_redactor().redact(&raw);
+        for needle in ["config/test/mail/password", "#value"] {
+            assert!(!raw.contains(needle), "raw rebuild error leaked `{needle}`");
+            assert!(
+                !redacted.contains(needle),
+                "redacted rebuild error leaked `{needle}`"
+            );
+        }
+
+        // End-to-end fail-safe: the swap body that apply_mailer_rebuild spawns
+        // must keep the previously installed mailer when the rebuild fails.
+        // Awaiting it directly drives the failure branch to a deterministic
+        // completion (no detached task to race against), proving the branch ran
+        // and that it never swapped in a half-built mailer.
+        let handle: MailerHandle =
+            Arc::new(ArcSwap::from_pointee(MailerSlot(Arc::new(NoopMailer))));
+        let original = handle.load().0.clone();
+
+        rebuild_and_swap_mailer(handle.clone(), vault.clone(), mail).await;
+
+        assert!(
+            Arc::ptr_eq(&handle.load().0, &original),
+            "a failed rebuild must keep the previous mailer"
         );
     }
 
