@@ -42,6 +42,9 @@ pub struct Config {
     /// not here (docs/vault.md stage H).
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// OAuth / browser-facing HTTP settings (currently the CORS allow-list).
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -386,6 +389,22 @@ impl Default for NotificationConfig {
 pub struct VaultConfig {
     #[serde(default)]
     pub audit: VaultAuditConfig,
+}
+
+/// OAuth / browser-facing HTTP settings.
+///
+/// Currently the strongly-typed home for the HTTP CORS allow-list consumed by
+/// the API server's `CorsLayer`. `allowed_cors_origins` accepts the `MEGA_*`
+/// list-env override (`source.rs` registers `oauth.allowed_cors_origins` as a
+/// list-parse key); when empty the server falls back to its built-in default
+/// origins.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct OAuthConfig {
+    /// Browser origins allowed by CORS (e.g. `https://app.example.com`). Each
+    /// entry must be a valid HTTP header value; an empty list keeps the server's
+    /// built-in defaults.
+    #[serde(default)]
+    pub allowed_cors_origins: Vec<String>,
 }
 
 /// Supported vault audit sinks (docs/vault.md stage H).

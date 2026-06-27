@@ -508,6 +508,45 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     Ok(())
 }
 
+/// Built-in development CORS origins used when `oauth.allowed_cors_origins` is
+/// unset or empty.
+const DEFAULT_CORS_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "http://app.gitmega.com",
+    "http://app.gitmono.test",
+];
+
+/// Build the CORS allow-origin list: the configured `oauth.allowed_cors_origins`
+/// when non-empty (invalid entries skipped with a warning), otherwise the
+/// built-in development defaults. An empty/absent config never widens CORS (it
+/// falls back to the defaults, not to allow-all). Configured entries are
+/// validated up-front by `validate_oauth_config`, so the runtime skip is a
+/// defensive belt-and-suspenders.
+fn cors_allow_origins(oauth: Option<&crate::config::OAuthConfig>) -> Vec<HeaderValue> {
+    let configured = oauth
+        .map(|oauth| oauth.allowed_cors_origins.as_slice())
+        .unwrap_or(&[]);
+    if configured.is_empty() {
+        return DEFAULT_CORS_ORIGINS
+            .iter()
+            .map(|origin| HeaderValue::from_static(origin))
+            .collect();
+    }
+    configured
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::warn!(
+                    origin = %origin,
+                    "ignoring invalid oauth.allowed_cors_origins entry"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// This is the main entry for the mono server.
 /// It is responsible for creating the main router and setting up the necessary middleware.
 ///
@@ -553,11 +592,8 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
     };
 
-    let origins: Vec<HeaderValue> = vec![
-        HeaderValue::from_static("http://localhost"),
-        HeaderValue::from_static("http://app.gitmega.com"),
-        HeaderValue::from_static("http://app.gitmono.test"),
-    ];
+    let app_config = storage.config();
+    let origins: Vec<HeaderValue> = cors_allow_origins(app_config.oauth.as_ref());
 
     // add RequestDecompressionLayer for handle gzip encode
     // add TraceLayer for log record
@@ -723,6 +759,57 @@ mod tests {
     use http::Request;
 
     use super::*;
+
+    #[test]
+    fn cors_origins_fall_back_to_defaults_when_unset() {
+        let origins = cors_allow_origins(None);
+        assert_eq!(origins.len(), DEFAULT_CORS_ORIGINS.len());
+        assert!(origins.contains(&HeaderValue::from_static("http://localhost")));
+    }
+
+    #[test]
+    fn cors_origins_fall_back_to_defaults_when_empty() {
+        let oauth = crate::config::OAuthConfig {
+            allowed_cors_origins: vec![],
+        };
+        let origins = cors_allow_origins(Some(&oauth));
+        assert_eq!(origins.len(), DEFAULT_CORS_ORIGINS.len());
+    }
+
+    #[test]
+    fn cors_origins_use_configured_values() {
+        let oauth = crate::config::OAuthConfig {
+            allowed_cors_origins: vec![
+                "https://app.example.com".to_string(),
+                "http://localhost:3000".to_string(),
+            ],
+        };
+        let origins = cors_allow_origins(Some(&oauth));
+        assert_eq!(
+            origins,
+            vec![
+                HeaderValue::from_static("https://app.example.com"),
+                HeaderValue::from_static("http://localhost:3000"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cors_origins_skip_invalid_configured_entries() {
+        // A control char makes HeaderValue::from_str fail; it is skipped, not
+        // turned into an allow-all.
+        let oauth = crate::config::OAuthConfig {
+            allowed_cors_origins: vec![
+                "https://ok.example.com".to_string(),
+                "bad\norigin".to_string(),
+            ],
+        };
+        let origins = cors_allow_origins(Some(&oauth));
+        assert_eq!(
+            origins,
+            vec![HeaderValue::from_static("https://ok.example.com")]
+        );
+    }
     use crate::config::{
         ArtifactGcConfig, BuckConfig, reload::ConfigHandle, testing::isolated_config,
     };

@@ -11,8 +11,8 @@ use url::Url;
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
     MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
-    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
-    secret::SecretRef,
+    OAuthConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS,
+    VaultConfig, secret::SecretRef,
 };
 use crate::common::errors::MegaError;
 
@@ -133,9 +133,63 @@ impl Config {
         if let Some(vault_config) = &self.vault {
             validate_vault_config(vault_config)?;
         }
+        if let Some(oauth_config) = &self.oauth {
+            validate_oauth_config(oauth_config)?;
+        }
 
         Ok(())
     }
+}
+
+/// Validate `[oauth]` settings: each CORS origin must be a browser Origin of the
+/// form `scheme://host[:port]` (http/https, no path/query/fragment) that also
+/// parses as an HTTP header value — i.e. exactly what the server's `CorsLayer`
+/// accepts at runtime, so a configured origin can never pass validation yet be
+/// silently dropped by the CORS layer.
+pub(crate) fn validate_oauth_config(config: &OAuthConfig) -> Result<(), MegaError> {
+    for origin in &config.allowed_cors_origins {
+        validate_cors_origin(origin)?;
+    }
+    Ok(())
+}
+
+fn validate_cors_origin(origin: &str) -> Result<(), MegaError> {
+    if origin.trim().is_empty() {
+        return Err(MegaError::Other(
+            "oauth.allowed_cors_origins must not contain empty entries".to_string(),
+        ));
+    }
+    // A real Origin cannot contain whitespace (HTTP header values technically
+    // permit spaces/tabs, so reject them explicitly).
+    if origin.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must not contain whitespace or control characters"
+        )));
+    }
+    // Must be usable as the `Access-Control-Allow-Origin` header value the CORS
+    // layer builds at runtime (`HeaderValue::from_str`), which rejects non-ASCII.
+    if http::HeaderValue::from_str(origin).is_err() {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` is not a valid HTTP header value"
+        )));
+    }
+    // Must be a `scheme://host[:port]` origin: http/https, no path/query/fragment.
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must be a scheme://host origin"
+        )));
+    };
+    if scheme != "http" && scheme != "https" {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must use the http or https scheme"
+        )));
+    }
+    if rest.is_empty() || rest.contains(['/', '?', '#']) {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must not contain a path, query, or fragment (use scheme://host[:port])"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate `[vault]` settings (docs/vault.md stage H): the audit sink must be a
@@ -805,13 +859,23 @@ fn known_unconsumed_file_fields_from_value(path: &Path, value: &Value) -> Vec<Fi
 pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
 
-    if value.get("oauth").is_some() {
-        warnings.push(ConfigWarning {
-            field_path: "oauth".to_string(),
-            message:
-                "[oauth] is currently ignored because OAuthConfig is not implemented; remove the section until OAuthConfig is implemented"
-                    .to_string(),
-        });
+    // `oauth.allowed_cors_origins` is now consumed by OAuthConfig; the remaining
+    // legacy keys are still ignored (no consumer yet), so warn per-key.
+    if let Some(oauth) = value.get("oauth").and_then(Value::as_table) {
+        for field in [
+            "campsite_api_domain",
+            "tinyship_api_domain",
+            "api_store_backend",
+        ] {
+            if oauth.contains_key(field) {
+                warnings.push(ConfigWarning {
+                    field_path: format!("oauth.{field}"),
+                    message: format!(
+                        "oauth.{field} is currently ignored (no consumer yet); only oauth.allowed_cors_origins is consumed"
+                    ),
+                });
+            }
+        }
     }
 
     if let Some(mail) = value.get("mail").and_then(Value::as_table) {
@@ -846,9 +910,10 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
 /// `unknown_fields` and is applied during config loading so that typos and
 /// obsolete keys fail fast instead of being silently dropped by serde.
 ///
-/// The legacy `[oauth]` section is intentionally skipped: it is already
-/// reported as a warning by `known_unconsumed_fields` and will be addressed
-/// by implementing or removing OAuthConfig in a follow-up task.
+/// `[oauth]` is now a recognized section (`OAuthConfig`): `allowed_cors_origins`
+/// is consumed, while the legacy keys (`campsite_api_domain`,
+/// `tinyship_api_domain`, `api_store_backend`) are whitelisted-but-ignored, so
+/// the section is validated like any other rather than skipped.
 pub fn reject_unknown_fields(value: &Value) -> Result<(), MegaError> {
     let mut errors = Vec::new();
 
@@ -877,12 +942,6 @@ fn collect_unknown_field_errors(
     };
 
     for (field, value) in table {
-        // Skip the legacy `[oauth]` section entirely; it is handled as a
-        // dedicated warning by `known_unconsumed_fields`.
-        if schema_path.is_empty() && field == "oauth" {
-            continue;
-        }
-
         let schema_field_path = join_field_path(schema_path, field);
         let display_field_path = join_field_path(display_path, field);
 
@@ -1091,7 +1150,11 @@ fn is_effective_source_field_path(field_path: &str) -> bool {
         && is_known_field_path(field_path)
         && !matches!(field_path, "mail.smtp_tls" | "mail.tls")
         && field_path != "oauth"
-        && !field_path.starts_with("oauth.")
+        // oauth.allowed_cors_origins is consumed; the legacy oauth keys are not.
+        && !matches!(
+            field_path,
+            "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
+        )
 }
 
 fn file_source_label(kind: &str, path: &Path) -> String {
@@ -1201,9 +1264,12 @@ fn is_reserved_mega_env_var(variable: &str) -> bool {
 }
 
 fn environment_warning_for(variable: &str, field_path: &str) -> Option<EnvironmentConfigWarning> {
-    let message = if field_path == "oauth" || field_path.starts_with("oauth.") {
+    let message = if matches!(
+        field_path,
+        "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
+    ) {
         format!(
-            "{variable} maps to {field_path}, but [oauth] is currently ignored because OAuthConfig is not implemented; remove the variable until OAuthConfig is implemented"
+            "{variable} maps to {field_path}, which is currently ignored (no consumer yet); only oauth.allowed_cors_origins is consumed"
         )
     } else if matches!(field_path, "mail.smtp_tls" | "mail.tls") {
         format!(
@@ -1229,9 +1295,11 @@ fn environment_warning_for(variable: &str, field_path: &str) -> Option<Environme
 }
 
 fn environment_field_is_ignored(field_path: &str) -> bool {
-    field_path == "oauth"
-        || field_path.starts_with("oauth.")
-        || matches!(field_path, "mail.smtp_tls" | "mail.tls")
+    // oauth.allowed_cors_origins is consumed; only the legacy oauth keys are ignored.
+    matches!(
+        field_path,
+        "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
+    ) || matches!(field_path, "mail.smtp_tls" | "mail.tls")
 }
 
 fn is_known_field_path(field_path: &str) -> bool {
@@ -1346,6 +1414,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "mail",
             "notification",
             "vault",
+            "oauth",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1452,6 +1521,16 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
         "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
+        // `allowed_cors_origins` is the only strongly-typed/consumed key
+        // (OAuthConfig). The remaining keys are legacy compatibility fields:
+        // whitelisted so the sample config loads, but ignored at deserialize time
+        // until a real consumer exists.
+        "oauth" => Some(&[
+            "allowed_cors_origins",
+            "campsite_api_domain",
+            "tinyship_api_domain",
+            "api_store_backend",
+        ]),
         _ => None,
     }
 }
@@ -1686,6 +1765,107 @@ mod tests {
         config
             .validate()
             .expect("file audit sink with a path should validate");
+    }
+
+    #[test]
+    fn config_validate_accepts_oauth_cors_origins() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec![
+                "http://localhost:3000".to_string(),
+                "https://app.example.com".to_string(),
+            ],
+        });
+
+        config
+            .validate()
+            .expect("valid oauth cors origins should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_whitespace() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["http://has space.example.com".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin with whitespace should fail");
+        assert!(err.to_string().contains("oauth.allowed_cors_origins"));
+    }
+
+    #[test]
+    fn config_validate_rejects_empty_oauth_origin() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["  ".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("empty oauth origin should fail");
+        assert!(err.to_string().contains("oauth.allowed_cors_origins"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_path() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["https://app.example.com/callback".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin with a path should fail");
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_non_http_scheme() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["ftp://app.example.com".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin with non-http scheme should fail");
+        assert!(err.to_string().contains("scheme"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_query_or_fragment() {
+        for bad in [
+            "https://app.example.com?x=1",
+            "https://app.example.com#frag",
+        ] {
+            let mut config = valid_config();
+            config.oauth = Some(crate::config::OAuthConfig {
+                allowed_cors_origins: vec![bad.to_string()],
+            });
+            let err = config
+                .validate()
+                .expect_err("oauth origin with query/fragment should fail")
+                .to_string();
+            assert!(
+                err.contains("path, query, or fragment"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_without_scheme() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["app.example.com".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin without scheme should fail");
+        assert!(err.to_string().contains("scheme://host"));
     }
 
     #[test]
@@ -2367,11 +2547,12 @@ mod tests {
     }
 
     #[test]
-    fn known_unconsumed_fields_warns_for_oauth_and_legacy_mail_tls_keys() {
+    fn known_unconsumed_fields_warns_for_legacy_oauth_and_mail_tls_keys() {
         let value = toml::from_str::<Value>(
             r#"
             [oauth]
-            enabled = true
+            allowed_cors_origins = ["http://app.example.com"]
+            campsite_api_domain = "http://api.example.com"
 
             [mail]
             smtp_tls = false
@@ -2387,7 +2568,13 @@ mod tests {
             .map(|warning| warning.field_path.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(fields, vec!["oauth", "mail.smtp_tls", "mail.tls"]);
+        // allowed_cors_origins is now consumed (no warning); the legacy oauth key
+        // and the ignored mail TLS keys still warn.
+        assert!(fields.contains(&"oauth.campsite_api_domain"));
+        assert!(fields.contains(&"mail.smtp_tls"));
+        assert!(fields.contains(&"mail.tls"));
+        assert!(!fields.contains(&"oauth.allowed_cors_origins"));
+        assert!(!fields.contains(&"oauth"));
     }
 
     #[test]
@@ -2811,7 +2998,10 @@ mod tests {
             "MEGA_CACHE_DIR",
             "OTHER_VAR",
             "MEGA_UNKNOWN__VALUE",
+            // Consumed now -> must NOT warn.
             "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+            // Legacy, still ignored -> warns.
+            "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
             "MEGA_MAIL__PASSWORD",
             "MEGA_MAIL__TLS",
             "MEGA_MAIL__SMTP_TLS",
@@ -2831,7 +3021,7 @@ mod tests {
                 "MEGA_MAIL__PASSWORD",
                 "MEGA_MAIL__SMTP_TLS",
                 "MEGA_MAIL__TLS",
-                "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+                "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
                 "MEGA_UNKNOWN__VALUE",
             ]
         );
@@ -2841,10 +3031,12 @@ mod tests {
                 "mail.password",
                 "mail.smtp_tls",
                 "mail.tls",
-                "oauth.allowed_cors_origins",
+                "oauth.campsite_api_domain",
                 "unknown.value",
             ]
         );
+        // The consumed CORS origins env var produces no warning.
+        assert!(!variables.contains(&"MEGA_OAUTH__ALLOWED_CORS_ORIGINS"));
         assert!(
             warnings
                 .iter()
@@ -2858,7 +3050,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.message.contains("OAuthConfig"))
+                .any(|warning| warning.message.contains("no consumer yet"))
         );
         assert!(
             warnings
@@ -2883,7 +3075,7 @@ mod tests {
         assert!(!is_known_field_path("database.db_url.extra"));
         assert!(!is_known_field_path("database.typo"));
         assert!(!is_known_field_path("unknown.value"));
-        assert!(!is_known_field_path("oauth.allowed_cors_origins"));
+        assert!(is_known_field_path("oauth.allowed_cors_origins"));
         assert!(!is_known_field_path("notification.typo"));
     }
 
@@ -3010,8 +3202,10 @@ mod tests {
     }
 
     #[test]
-    fn reject_unknown_fields_allows_legacy_oauth_section() {
-        let value = toml::from_str::<Value>(
+    fn reject_unknown_fields_allows_known_oauth_keys_but_rejects_unknown_ones() {
+        // `[oauth]` is now a recognized section: allowed_cors_origins (consumed)
+        // plus the whitelisted legacy keys pass the strict check.
+        let ok = toml::from_str::<Value>(
             r#"
             base_dir = "/tmp"
 
@@ -3021,10 +3215,19 @@ mod tests {
             "#,
         )
         .unwrap();
+        assert!(reject_unknown_fields(&ok).is_ok());
 
-        // The legacy [oauth] section is skipped by the strict check; it remains
-        // a warning from `known_unconsumed_fields` until OAuthConfig is
-        // implemented or the section is removed.
-        assert!(reject_unknown_fields(&value).is_ok());
+        // A truly unknown key under [oauth] is a hard error now that the section
+        // is validated like any other.
+        let bad = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+
+            [oauth]
+            totally_unknown_key = "x"
+            "#,
+        )
+        .unwrap();
+        assert!(reject_unknown_fields(&bad).is_err());
     }
 }

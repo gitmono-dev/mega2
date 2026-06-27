@@ -142,6 +142,7 @@ impl Config {
             mail: None,
             notification: None,
             vault: None,
+            oauth: None,
         }
     }
 

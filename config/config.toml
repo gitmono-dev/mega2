@@ -167,24 +167,24 @@ bucket = "gitmega"
 root_dir = "${base_dir}/objects"
 
 [oauth]
-# Legacy sample only: monoengine currently has no OAuthConfig consumer.
-# `config validate` warns that this section is ignored until OAuthConfig exists.
-# Used for call api from campsite server, for example: http://api.gitmono.test:3001
-campsite_api_domain = "http://api.gitmono.test:3001"
-
-# Used for call api from tinyship server, for example: https://libra.tools
-tinyship_api_domain = "https://libra.tools"
-
-# Which auth API to use when loading users (campsite or tinyship)
-api_store_backend = "campsite"
-
-
-# allowed cors origins
+# `allowed_cors_origins` is consumed by the HTTP API's CORS layer (OAuthConfig).
+# When non-empty it is the CORS allow-list; when empty the server falls back to
+# its built-in development defaults. Also overridable via
+# MEGA_OAUTH__ALLOWED_CORS_ORIGINS as a comma-separated list. Each entry must be
+# a valid HTTP header value (no whitespace/control characters).
 allowed_cors_origins = [
     "http://local.gitmega.com",
     "https://app.gitmega.com",
     "http://app.gitmono.test",
 ]
+
+# Legacy keys kept for compatibility but NOT yet strongly-typed/consumed by
+# OAuthConfig (they are tolerated by config validation and ignored at load until
+# a real consumer exists). Used historically for the external auth API stores.
+campsite_api_domain = "http://api.gitmono.test:3001"
+tinyship_api_domain = "https://libra.tools"
+# Which auth API to use when loading users (campsite or tinyship)
+api_store_backend = "campsite"
 
 [blame]
 # Configuration for blame functionality and large file handling
