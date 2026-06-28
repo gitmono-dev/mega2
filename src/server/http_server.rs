@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::{
     Router, ServiceExt,
@@ -170,17 +170,6 @@ fn apply_artifact_gc_config(
     }
 
     Ok(())
-}
-
-pub fn remove_git_suffix(full_path: &str, git_suffix: &str) -> PathBuf {
-    PathBuf::from(full_path.replace(".git", "").replace(git_suffix, ""))
-}
-
-fn is_disallowed_root_repo_path(full_path: &str) -> bool {
-    matches!(
-        full_path.trim_start_matches('/').split('/').next(),
-        Some("third-party.git")
-    )
 }
 
 /// Spawns a background task to clean up expired Buck upload sessions.
@@ -728,29 +717,25 @@ async fn handle_smart_protocol(
     req: Request<Body>,
     state: Arc<ProtocolApiState>,
 ) -> std::result::Result<Response, ProtocolError> {
-    let full_path = req.uri().path();
-    if is_disallowed_root_repo_path(full_path) {
-        return Err(ProtocolError::InvalidInput(
-            "Repository third-party.git is not supported".to_string(),
-        ));
-    }
-    if full_path.ends_with("/info/refs") && req.method().eq(&Method::GET) {
-        let repo_path = remove_git_suffix(full_path, "/info/refs");
-        let uri = req.uri();
-        let query_str = uri.query().unwrap_or("");
-        let params = parse_info_refs_params(query_str)?;
-        crate::contract::git_protocol::http::git_info_refs(&state, params, repo_path).await
-    } else if full_path.ends_with("/git-upload-pack") && req.method().eq(&Method::POST) {
-        let repo_path = remove_git_suffix(full_path, "/git-upload-pack");
-        crate::contract::git_protocol::http::git_upload_pack(&state, req, repo_path).await
-    } else if full_path.ends_with("/git-receive-pack") && req.method().eq(&Method::POST) {
-        let repo_path = remove_git_suffix(full_path, "/git-receive-pack");
-        crate::contract::git_protocol::http::git_receive_pack(&state, req, repo_path).await
-    } else {
-        Ok(Response::builder()
-            .status(404)
-            .body(Body::from("Operation not supported"))
-            .unwrap())
+    let parsed = crate::contract::git_protocol::path::parse_git_protocol_path(
+        req.method(),
+        req.uri().path(),
+    )?;
+
+    match parsed.endpoint {
+        crate::contract::git_protocol::path::GitProtocolEndpoint::InfoRefs => {
+            let params = parse_info_refs_params(req.uri().query().unwrap_or(""))?;
+            crate::contract::git_protocol::http::git_info_refs(&state, params, parsed.repo_path)
+                .await
+        }
+        crate::contract::git_protocol::path::GitProtocolEndpoint::UploadPack => {
+            crate::contract::git_protocol::http::git_upload_pack(&state, req, parsed.repo_path)
+                .await
+        }
+        crate::contract::git_protocol::path::GitProtocolEndpoint::ReceivePack => {
+            crate::contract::git_protocol::http::git_receive_pack(&state, req, parsed.repo_path)
+                .await
+        }
     }
 }
 
@@ -910,18 +895,6 @@ mod tests {
 
         assert!(shutdown_token.is_cancelled());
         assert!(notification_shutdown.is_cancelled());
-    }
-
-    #[test]
-    fn test_disallow_third_party_git_root_repo() {
-        assert!(is_disallowed_root_repo_path("/third-party.git/info/refs"));
-        assert!(is_disallowed_root_repo_path(
-            "/third-party.git/git-receive-pack"
-        ));
-        assert!(!is_disallowed_root_repo_path(
-            "/third-party/test.git/info/refs"
-        ));
-        assert!(!is_disallowed_root_repo_path("/project.git/info/refs"));
     }
 
     #[test]

@@ -68,7 +68,7 @@
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 部分实现（认证已统一） | HTTP receive-pack 有 Bearer/Basic token 认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 仍匿名；receive-pack 未做 repo/path 级 push 权限校验。 |
 | Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略。仅剩真实 Git CLI 兼容性矩阵。 |
-| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；**2026-06-28 更新**：`Repo::new` 的非 UTF-8 path/file_name `unwrap()` 已改为 `ProtocolError::InvalidInput`，`SmartSession::git_upload_pack` 中 `full_pack`/`incremental_pack` 的 `unwrap()` 已映射为协议错误。response builder / in-memory reader 等剩余 `unwrap()` 仍待收敛。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；**2026-06-28 更新**：`Repo::new` 的非 UTF-8 path/file_name `unwrap()` 已改为 `ProtocolError::InvalidInput`，`SmartSession::git_upload_pack` 中 `full_pack`/`incremental_pack` 的 `unwrap()` 已映射为协议错误；**2026-06-28 更新 2**：HTTP Git 路由已抽出 `GitProtocolPath` parser，移除内联 `.git` 替换与 404 `unwrap()`。response builder / in-memory reader 等剩余 `unwrap()` 仍待收敛。 |
 
 ## 硬约束与不可违反的原则
 
@@ -552,14 +552,9 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 ### 路由匹配过宽，容易吞掉非 Git 路径
 
-HTTP router 使用 `/{*path}` 捕获所有未匹配路径，然后按后缀判断 Git protocol。虽然目前放在 API/LFS router merge 后，但仍需要关注：
+**2026-06-28 更新**：已抽出 `GitProtocolPath` parser（`src/contract/git_protocol/path.rs`），统一处理 repo path、仅去除末尾 `.git` suffix、service endpoint 与 HTTP 方法校验，并保留 `third-party.git` root repo 禁用规则。`src/server/http_server.rs::handle_smart_protocol` 不再内联后缀判断和 404 `unwrap()`，而是直接调用 parser。剩余工作：404/400/403/405 返回策略可随认证统一进一步标准化。
 
-- Git protocol 路径和 API 路径的优先级。
-- `/info/lfs` 路径与 `*/info/refs` 的冲突。
-- 404 response 是否符合普通 HTTP 与 Git 客户端预期。
-- root repo path 特例 `third-party.git` 的规则是否应放入更通用的 repo path validator。
-
-建议：
+历史建议（已落地）：
 
 - 抽出 `GitProtocolPath` parser，统一处理 repo path、`.git` suffix、service endpoint。
 - 路由层只做粗分发，路径语义在 parser 中测试。

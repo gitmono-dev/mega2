@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 pub mod http;
+pub mod path;
 pub mod ssh;
 
 #[derive(Deserialize, Debug)]
