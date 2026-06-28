@@ -305,7 +305,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 - 将**可迁移凭据**与普通配置分离：这些字段在配置文件中只保存 `vault` 引用（`SecretRef`），真实值存储在 `vault` 模块中。**数据库凭据等引导配置不在此列**，继续随启动配置提供。
 - 分阶段完成消费端改造：先完成路径迁移，再补齐错误模型、source diagnostics、Profile 与测试分层；已完成的 CLI LoadMode、SecretRef、`config secret` 和 `config init` 首批能力不应在后续阶段重复实现。
 - 明确 `config/config.toml` 的定位：它不应继续作为“全项目测试时顺手使用的运行配置”，而应演进为可提交、可校验、无真实 secret、适合本地开发和 CI 参考的基础样例配置；自动化测试应使用独立的测试配置生成与覆盖机制。
-- 在已落地的 `monoengine config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 基础上，补齐配置 source diagnostics、Profile 和样例校验；数据库密码、Redis URL、当前阶段的对象存储 key 等引导或早期依赖不通过本项目 vault 写入。
+- 在已落地的 `monoengine config init`、`config secret ref/set/check` 与 `config validate --resolve-secrets` 基础上，补齐配置 source diagnostics、Profile 和样例校验；**数据库密码仍不能通过本项目 vault 写入**（引导循环），Redis URL 与对象存储 S3 凭据已支持 `vault://` SecretRef。
 - 将 README、`config/config.toml`、默认模板和配置实现保持同步，避免用户看到的加载优先级与实际行为不一致。
 
 ### 建议目录结构
@@ -632,7 +632,7 @@ monoengine config init --force                     # 已实现，覆盖已有文
 
 其中 `config init` 已作为初始化入口落地，负责生成配置骨架和敏感字段引用，但不写入真实敏感值；已实现的 `config secret set` 负责把真实敏感值写入 `vault`；`config secret check` 负责检查配置中的 `SecretRef` 是否可解析且具备权限；`config validate` 负责校验普通配置、字段语义和可选的 secret 解析链路。
 
-> **引导顺序约束（重要）：** `config secret set`/`check` 与 `validate --resolve-secrets` 都需要 vault，而 vault 需要可用的数据库。因此这些子命令必须先建立数据库连接、初始化/解封 vault，再读写 secret；在数据库尚未就绪的全新机器上**无法**直接执行 `secret set`。它们只能写入晚于 vault 消费的可迁移凭据，不能用于数据库密码、Redis URL 或当前阶段的对象存储 key。`config init` 与不带 `--resolve-secrets` 的 `config validate` 则只操作配置文件、不依赖 vault，可在裸机执行。命令实现应在缺少数据库/vault 时给出明确的前置步骤提示，而不是 panic，也不得为了访问 vault 构造完整 `AppContext`。
+> **引导顺序约束（重要）：** `config secret set`/`check` 与 `validate --resolve-secrets` 都需要 vault，而 vault 需要可用的数据库。因此这些子命令必须先建立数据库连接、初始化/解封 vault，再读写 secret；在数据库尚未就绪的全新机器上**无法**直接执行 `secret set`。它们只能写入晚于 vault 消费的可迁移凭据，**数据库密码仍不能写入**（不可破的引导循环），Redis URL 与对象存储 S3 凭据已支持 `vault://` SecretRef。`config init` 与不带 `--resolve-secrets` 的 `config validate` 则只操作配置文件、不依赖 vault，可在裸机执行。命令实现应在缺少数据库/vault 时给出明确的前置步骤提示，而不是 panic，也不得为了访问 vault 构造完整 `AppContext`。
 
 `config init` 的职责应保持清晰：创建或检查目标配置文件（默认使用全局 `--config`，否则写入 `config/config.toml`；也可用 `--output` 指定路径），写入基础样例配置，派生 `${base_dir}`、日志目录、缓存目录和本地对象存储目录，为可迁移凭据生成 `SecretRef` 占位引用，并输出后续需要执行的 `config secret set` 命令清单。默认不覆盖已有文件，只有显式传入 `--force` 才会覆盖。示例应尽量贴近当前 schema，**只为真实存在的字段生成占位引用**。
 

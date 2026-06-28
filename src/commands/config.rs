@@ -506,7 +506,11 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
-            with_audit_caller("cli:config-secret-check", resolver.resolve(&secret_ref)).await?;
+            let resolved =
+                with_audit_caller("cli:config-secret-check", resolver.resolve(&secret_ref)).await?;
+            if name == "redis.url" {
+                validate_redis_url_literal("redis.url", &resolved)?;
+            }
 
             println!("ok {}", secret_ref.as_uri());
             Ok(())
