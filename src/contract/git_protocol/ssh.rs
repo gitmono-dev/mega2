@@ -161,8 +161,8 @@ impl server::Handler for SshServer {
                     href: config.lfs.ssh.http_url.clone(),
                     header,
                     expires_at: {
-                        let expire_time: DateTime<Utc> =
-                            Utc::now() + Duration::try_seconds(86400).unwrap();
+                        // 86400 seconds is well within the range of a `chrono::Duration`.
+                        let expire_time: DateTime<Utc> = Utc::now() + Duration::seconds(86400);
                         expire_time.to_rfc3339()
                     },
                 };
@@ -257,17 +257,11 @@ impl server::Handler for SshServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.get_mut(&channel)
+        if let Some(mut state) = self.channels.remove(&channel)
             && state.smart_protocol.service_type == ServiceType::ReceivePack
         {
-            // `handle_receive_pack` needs `&mut state` and `&self.state`. Remove the
-            // state from the map first so we can pass both borrows without holding
-            // the `channels` map borrowed across the await point.
-            let mut state = self.channels.remove(&channel).expect("state just found");
             let api_state = &self.state;
             handle_receive_pack(&mut state, api_state, channel, session).await;
-        } else {
-            self.channels.remove(&channel);
         }
 
         {
