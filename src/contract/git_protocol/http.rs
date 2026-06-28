@@ -108,9 +108,20 @@ async fn git_receive_pack_auth(
     Ok(true)
 }
 
+/// Maximum body size accepted for Git HTTP upload-pack / receive-pack requests.
+/// This bounds memory consumption on the server and prevents unbounded buffering
+/// of malformed or malicious requests. Pushes larger than this must use chunked
+/// or other transfer mechanisms not implemented here.
+const GIT_HTTP_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
 async fn collect_body_data(body: Body, operation: &str) -> Result<BytesMut, ProtocolError> {
     body.into_data_stream()
         .try_fold(BytesMut::new(), |mut acc, chunk| async move {
+            if acc.len() + chunk.len() > GIT_HTTP_MAX_BODY_BYTES {
+                return Err(axum::Error::new(std::io::Error::other(format!(
+                    "{operation} body exceeds maximum allowed size of {GIT_HTTP_MAX_BODY_BYTES} bytes"
+                ))));
+            }
             acc.extend_from_slice(&chunk);
             Ok(acc)
         })
@@ -258,5 +269,18 @@ mod tests {
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert!(err.to_string().contains("failed to read upload-pack body"));
+    }
+
+    #[tokio::test]
+    async fn collect_body_data_rejects_oversized_bodies() {
+        let chunk = Bytes::from(vec![0u8; GIT_HTTP_MAX_BODY_BYTES + 1]);
+        let body = Body::from(chunk);
+
+        let err = collect_body_data(body, "upload-pack")
+            .await
+            .expect_err("oversized body should be rejected");
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("exceeds maximum allowed size"));
     }
 }

@@ -352,7 +352,7 @@ let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
 
 建议：
 
-- 短期增加 body size 上限，避免异常客户端导致内存放大。
+- ✅ 已增加 body size 上限（`GIT_HTTP_MAX_BODY_BYTES = 512 MiB`，`collect_body_data` 拒绝超限 body，2026-06-28）。
 - 中期将 upload-pack negotiation 改为 streaming pkt-line reader，而不是一次性聚合 body。
 - 为 `read_pkt_line` 增加可诊断错误，避免 malformed pkt-line panic。
 
