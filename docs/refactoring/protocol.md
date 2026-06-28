@@ -23,8 +23,8 @@
 > **2026-06-23 更新 3**：已完成 receive-pack `PACK` magic 分界止血：
 > - HTTP / SSH receive-pack 不再搜索 `PACK` 字节序列，而是复用 `SmartSession::split_receive_pack_request` 按 pkt-line command list 的 flush-pkt 分割 commands 与 pack bytes。
 > - 新增单元测试覆盖 capability 中出现 `PACK` 不误切分，以及缺少 flush-pkt 返回 `ProtocolError::InvalidInput`。
-> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义与 SSH per-channel state 仍为后续。
-> - 仍未完成：SSH 多 channel state 仍未改为 per-channel；capability advertise 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
+> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义仍为后续。
+> - **2026-06-28 更新**：SSH per-channel state 已实现。`SshServer` 不再维护连接级 `smart_protocol` / `data_combined`，而是按 `ChannelId` 维护独立的 `GitSshChannelState`，每个 channel 拥有独立的 `SmartSession` 与 receive-pack 缓冲区。`capability advertise` 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
 >
 > **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
 >
@@ -63,8 +63,8 @@
 | HTTP GET /info/refs | 已实现（首批止血） | query 已要求 exactly one `service=...`，缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；仍需补真实 Git CLI 兼容性矩阵。 |
 | HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
 | HTTP POST receive-pack | 已实现（delete-only 已支持） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；delete-only push 已支持（跳过 unpack）；仍需 streaming parser 和更完整真实 Git CLI 矩阵。 |
-| SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；后续仍需 per-channel state。 |
-| SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
+| SSH git-upload-pack | 已实现（per-channel state） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区。 |
+| SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 部分实现（认证已统一） | HTTP receive-pack 有 Bearer/Basic token 认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 仍匿名；receive-pack 未做 repo/path 级 push 权限校验。 |
 | Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略。仅剩真实 Git CLI 兼容性矩阵。 |
@@ -92,7 +92,7 @@
 | pkt-line 实现 | `unwrap()` panic 散落 | 定义 `PktLine` enum 和 streaming parser | 需重构 parser 返回 Result |
 | receive-pack 分流 | 已按 flush-pkt 分割，仍缓冲完整 body/channel | streaming pkt-line reader + delete-only push 验证 | 中等 |
 | SSH exec 解析 | 脆弱（空格、拼接错） | 严格 parser，支持引号和转义 | 需独立 parser 函数和单测 |
-| SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 需引入 `GitSshChannelState` |
+| SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 已引入 `GitSshChannelState`（2026-06-28） |
 | 认证统一 | HTTP/SSH 分离 | 统一 `ProtocolAuthContext` | 需与 config/vault auth 协同 |
 | Capability 诚实 | advertise 多于实现 | 仅 advertise 已实现能力 | 需 capability truth table |
 | 测试矩阵 | 无 | 真实 Git CLI smoke test | 需建立兼容性测试脚本 |
@@ -131,7 +131,7 @@
 | **可行性** | **中高（7.5/10）**。基础 panic 止血相对容易（Result 化输入解析）；pkt-line 和 receive-pack 分流需要较深的协议理解；SSH auth 统一需与 config 协同。 |
 | **完整性** | **中（7/10）**。6 个阶段覆盖主要问题，但 partial clone、protocol v2、shallow clone 等现代 Git 特性未涵盖。当前声称"仅 v0/v1"是合理的范围限制。 |
 | **安全性** | **中（7/10）**。panic 止血直接提升安全性；auth 统一防止权限泄露。但 per-channel state 和事务边界的改进是长期工作。 |
-| **可维护性** | **中（7/10）**。首批已移除 magic bytes 搜索和部分 scattered panic，但全局 SSH channel state、剩余 `unwrap()` 和 streaming parser 缺口仍是维护陷阱。改进后代码应更易维护，但短期工作量较大。 |
+| **可维护性** | **中（7/10）**。首批已移除 magic bytes 搜索和部分 scattered panic；SSH channel state 已改为 per-channel 字典。剩余 `unwrap()` 和 streaming parser 缺口仍是维护陷阱。改进后代码应更易维护，但短期工作量较大。 |
 
 ## 小结
 
@@ -404,22 +404,16 @@ let service_type = ServiceType::from_str(command[0]).unwrap_or(ServiceType::Uplo
 仍待后续处理：
 
 - 更完整的 shell 兼容性（如 `--`、复杂转义规则）如果标准客户端需要，再按兼容性测试补充。
-- 将已解析的 exec state 与 SSH channel 绑定，避免一个 connection 内多个 channel 共享 `smart_protocol` / `data_combined`。
+- ✅ 将已解析的 exec state 与 SSH channel 绑定，避免一个 connection 内多个 channel 共享 `smart_protocol` / `data_combined`（2026-06-28 已实现）。
 
-### SSH session 状态与 channel 绑定不够明确
+### SSH session 状态与 channel 绑定
 
-`SshServer` 在 handler 上保存：
+`SshServer` 原在 handler 上保存连接级 `smart_protocol: Option<SmartSession>` 与 `data_combined: BytesMut`，一个 SSH connection 内多个 channel 会共享这些状态。2026-06-28 已改为：
 
-- `smart_protocol: Option<SmartSession>`
-- `data_combined: BytesMut`
-
-这些状态不是按 channel 明确绑定。虽然 `russh::server::Server::new_client` 会 clone handler，降低多连接共享风险，但一个 SSH connection 内多个 channel 或异常顺序仍可能互相影响。
-
-建议：
-
-- 将 per-channel state 放入 `HashMap<ChannelId, GitSshChannelState>`。
-- 每个 channel 单独保存 `SmartSession`、receive-pack buffer、service type。
-- `channel_eof` 只处理对应 channel 的状态。
+- `SshServer` 维护 `channels: HashMap<ChannelId, GitSshChannelState>`。
+- `GitSshChannelState` 每个 channel 单独保存 `SmartSession`、receive-pack buffer、service type。
+- `data` 只读写当前 `ChannelId` 的状态。
+- `channel_eof` 只处理对应 channel 的状态，处理完后从 map 移除。
 - 关闭 channel 时清理状态。
 
 ### SSH upload-pack 可能把二进制 ACK/pack 数据当 UTF-8 发送
@@ -727,7 +721,7 @@ LFS:
 
 验收标准：
 
-- 单 SSH connection 多 channel 不串状态。
+- ✅ 单 SSH connection 多 channel 不串状态（`SshServer` 已按 `ChannelId` 隔离 `GitSshChannelState`）。
 - Git LFS 客户端能稳定 fallback 到 HTTP LFS。
 - LFS object/lock 操作不会跨 repo 混淆。
 
@@ -758,7 +752,7 @@ LFS:
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
 | P1 | SSH payload 全部按 bytes 发送 | Git 协议是二进制协议，不能假设 UTF-8 |
 | P1 | 统一 HTTP/SSH auth context | push 审计、commit binding、权限检查依赖此基础 |
-| P2 | SSH per-channel state | 提升 SSH server 正确性和并发安全 |
+| P2 | SSH per-channel state | ✅ 已实现（2026-06-28）：`SshServer` 按 `ChannelId` 维护独立 `GitSshChannelState` |
 | P2 | LFS hybrid response 加固 | 提升 Git LFS 客户端兼容性 |
 | P3 | shallow clone / protocol v2 / partial clone | 现代 Git 客户端和大仓库体验优化 |
 

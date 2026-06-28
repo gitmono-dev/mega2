@@ -42,10 +42,15 @@ struct SshExecRequest {
 pub struct SshServer {
     pub clients: Arc<Mutex<ClientMap>>,
     pub id: usize,
-    pub smart_protocol: Option<SmartSession>,
+    pub channels: HashMap<ChannelId, GitSshChannelState>,
     pub state: ProtocolApiState,
-    pub data_combined: BytesMut,
     pub authenticated_user: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct GitSshChannelState {
+    pub smart_protocol: SmartSession,
+    pub data_combined: BytesMut,
 }
 
 impl server::Server for SshServer {
@@ -115,7 +120,13 @@ impl server::Handler for SshServer {
                 }
                 // TODO handler ProtocolError
                 let res = smart_protocol.git_info_refs(&self.state).await?;
-                self.smart_protocol = Some(smart_protocol);
+                self.channels.insert(
+                    channel,
+                    GitSshChannelState {
+                        smart_protocol,
+                        data_combined: BytesMut::new(),
+                    },
+                );
                 session.data(channel, res.to_vec())?;
                 session.channel_success(channel)?;
             }
@@ -215,22 +226,26 @@ impl server::Handler for SshServer {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(smart_protocol) = self.smart_protocol.as_mut() else {
-            tracing::warn!("data received before exec request initialized smart protocol");
+        let Some(state) = self.channels.get_mut(&channel) else {
+            tracing::warn!(
+                channel = ?channel,
+                "data received before exec request initialized smart protocol"
+            );
             return Ok(());
         };
         tracing::info!(
+            channel = ?channel,
             "receiving data length:{}",
-            // String::from_utf8_lossy(data),
             data.len()
         );
-        let service_type = smart_protocol.service_type;
+        let service_type = state.smart_protocol.service_type;
         match service_type {
             ServiceType::UploadPack => {
-                self.handle_upload_pack(channel, data, session).await;
+                let api_state = &self.state;
+                handle_upload_pack(state, api_state, channel, data, session).await;
             }
             ServiceType::ReceivePack => {
-                self.data_combined.extend_from_slice(data);
+                state.data_combined.extend_from_slice(data);
             }
         };
         session.channel_success(channel)?;
@@ -242,11 +257,18 @@ impl server::Handler for SshServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(smart_protocol) = self.smart_protocol.as_mut()
-            && smart_protocol.service_type == ServiceType::ReceivePack
+        if let Some(state) = self.channels.get_mut(&channel)
+            && state.smart_protocol.service_type == ServiceType::ReceivePack
         {
-            self.handle_receive_pack(channel, session).await;
-        };
+            // `handle_receive_pack` needs `&mut state` and `&self.state`. Remove the
+            // state from the map first so we can pass both borrows without holding
+            // the `channels` map borrowed across the await point.
+            let mut state = self.channels.remove(&channel).expect("state just found");
+            let api_state = &self.state;
+            handle_receive_pack(&mut state, api_state, channel, session).await;
+        } else {
+            self.channels.remove(&channel);
+        }
 
         {
             let mut clients = self.clients.lock().await;
@@ -382,79 +404,82 @@ fn split_ssh_exec_args(input: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-impl SshServer {
-    async fn handle_upload_pack(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) {
-        let Some(smart_protocol) = self.smart_protocol.as_mut() else {
-            tracing::warn!("upload-pack handler called without smart protocol");
+async fn handle_upload_pack(
+    state: &mut GitSshChannelState,
+    api_state: &ProtocolApiState,
+    channel: ChannelId,
+    data: &[u8],
+    session: &mut Session,
+) {
+    let smart_protocol = &mut state.smart_protocol;
+    let (mut send_pack_data, buf) = match smart_protocol
+        .git_upload_pack(api_state, &mut Bytes::copy_from_slice(data))
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(error = %e, "upload-pack protocol error");
+            let _ = session.data(channel, format!("error: {e}\n").into_bytes());
             return;
-        };
-        let (mut send_pack_data, buf) = match smart_protocol
-            .git_upload_pack(&self.state, &mut Bytes::copy_from_slice(data))
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::error!(error = %e, "upload-pack protocol error");
-                let _ = session.data(channel, format!("error: {e}\n").into_bytes());
-                return;
-            }
-        };
+        }
+    };
 
-        tracing::info!("buf is {:?}", buf);
-        let _ = session.data(channel, buf.to_vec());
+    tracing::info!("buf is {:?}", buf);
+    let _ = session.data(channel, buf.to_vec());
 
-        while let Some(chunk) = send_pack_data.next().await {
-            let mut reader = chunk.as_slice();
-            loop {
-                let mut temp = BytesMut::new();
-                temp.reserve(65500);
-                let length = match reader.read_buf(&mut temp).await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!(error = %e, "read error in upload-pack stream");
-                        break;
-                    }
-                };
-                if length == 0 {
+    while let Some(chunk) = send_pack_data.next().await {
+        let mut reader = chunk.as_slice();
+        loop {
+            let mut temp = BytesMut::new();
+            temp.reserve(65500);
+            let length = match reader.read_buf(&mut temp).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, "read error in upload-pack stream");
                     break;
                 }
-                let bytes_out = smart_protocol.build_side_band_format(temp, length);
-                let _ = session.data(channel, bytes_out.to_vec());
+            };
+            if length == 0 {
+                break;
             }
+            let bytes_out = smart_protocol.build_side_band_format(temp, length);
+            let _ = session.data(channel, bytes_out.to_vec());
         }
-        let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
     }
+    let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
+}
 
-    async fn handle_receive_pack(&mut self, channel: ChannelId, session: &mut Session) {
-        let Some(smart_protocol) = self.smart_protocol.as_mut() else {
-            tracing::warn!("receive-pack handler called without smart protocol");
+async fn handle_receive_pack(
+    state: &mut GitSshChannelState,
+    api_state: &ProtocolApiState,
+    channel: ChannelId,
+    session: &mut Session,
+) {
+    let smart_protocol = &mut state.smart_protocol;
+    let data = state.data_combined.split().freeze();
+    let (commands, pack_bytes) = match smart_protocol.split_receive_pack_request(data) {
+        Ok(split) => split,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid receive-pack request");
+            let _ = session.data(channel, format!("error: {err}\n").into_bytes());
             return;
-        };
-        let data = self.data_combined.split().freeze();
-        let (commands, pack_bytes) = match smart_protocol.split_receive_pack_request(data) {
-            Ok(split) => split,
-            Err(err) => {
-                tracing::warn!(error = %err, "invalid receive-pack request");
-                let _ = session.data(channel, format!("error: {err}\n").into_bytes());
-                return;
-            }
-        };
-        let pack_stream = stream::once(async { Ok(pack_bytes) });
-        let report_status = match smart_protocol
-            .git_receive_pack_stream(&self.state, commands, Box::pin(pack_stream))
-            .await
-        {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::error!(error = %e, "receive-pack protocol error");
-                let _ = session.data(channel, format!("error: {e}\n").into_bytes());
-                return;
-            }
-        };
+        }
+    };
+    let pack_stream = stream::once(async { Ok(pack_bytes) });
+    let report_status = match smart_protocol
+        .git_receive_pack_stream(api_state, commands, Box::pin(pack_stream))
+        .await
+    {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::error!(error = %e, "receive-pack protocol error");
+            let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+            return;
+        }
+    };
 
-        tracing::info!("report status: {:?}", report_status);
-        let _ = session.data(channel, report_status.to_vec());
-    }
+    tracing::info!("report status: {:?}", report_status);
+    let _ = session.data(channel, report_status.to_vec());
 }
 
 #[cfg(test)]
@@ -525,5 +550,31 @@ mod tests {
         let err = parse_ssh_exec_request("git-upload-pack '/srv/git/project.git").unwrap_err();
 
         assert!(err.contains("unterminated quote"));
+    }
+
+    #[test]
+    fn per_channel_receive_pack_buffers_are_isolated() {
+        let mut channel_a = GitSshChannelState {
+            smart_protocol: SmartSession::new(
+                PathBuf::from("/a"),
+                ServiceType::ReceivePack,
+                TransportProtocol::Ssh,
+            ),
+            data_combined: BytesMut::new(),
+        };
+        let mut channel_b = GitSshChannelState {
+            smart_protocol: SmartSession::new(
+                PathBuf::from("/b"),
+                ServiceType::ReceivePack,
+                TransportProtocol::Ssh,
+            ),
+            data_combined: BytesMut::new(),
+        };
+
+        channel_a.data_combined.extend_from_slice(b"payload-a");
+        channel_b.data_combined.extend_from_slice(b"payload-b");
+
+        assert_eq!(&channel_a.data_combined[..], b"payload-a");
+        assert_eq!(&channel_b.data_combined[..], b"payload-b");
     }
 }

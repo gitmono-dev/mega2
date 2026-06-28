@@ -1,6 +1,5 @@
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 
-use bytes::BytesMut;
 use clap::Args;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use russh::{
@@ -66,8 +65,7 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
         clients: Arc::new(Mutex::new(HashMap::new())),
         state,
         id: 0,
-        smart_protocol: None,
-        data_combined: BytesMut::new(),
+        channels: HashMap::new(),
         authenticated_user: None,
     };
     let server_url = format!("{host}:{ssh_port}");
