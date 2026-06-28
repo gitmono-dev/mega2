@@ -45,8 +45,8 @@ pub async fn git_info_refs(
         content_type,
         Response::builder()
             .body(Body::from(pkt_line_stream.freeze()))
-            .unwrap(),
-    );
+            .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?,
+    )?;
     Ok(response)
 }
 
@@ -58,7 +58,7 @@ fn auth_failed() -> Result<Response<Body>, ProtocolError> {
             HeaderValue::from_static("Basic realm=\"Mega\", Bearer realm=\"Mega\""),
         )
         .body(Body::empty())
-        .unwrap();
+        .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?;
     Ok(resp)
 }
 
@@ -186,7 +186,13 @@ pub async fn git_upload_pack(
             loop {
                 let mut temp = BytesMut::new();
                 temp.reserve(65500);
-                let length = reader.read_buf(&mut temp).await.unwrap();
+                let length = match reader.read_buf(&mut temp).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = %e, "read error in upload-pack sideband stream");
+                        break;
+                    }
+                };
                 if length == 0 {
                     break;
                 }
@@ -203,8 +209,8 @@ pub async fn git_upload_pack(
         String::from("application/x-git-upload-pack-result"),
         Response::builder()
             .body(Body::from_stream(body_stream))
-            .unwrap(),
-    );
+            .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?,
+    )?;
     Ok(response)
 }
 
@@ -243,27 +249,34 @@ pub async fn git_receive_pack(
         .await?;
 
     tracing::info!("report status:{:?}", report_status);
-    let response = Response::builder().body(Body::from(report_status)).unwrap();
+    let response = Response::builder()
+        .body(Body::from(report_status))
+        .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?;
     let response = add_default_header(
         String::from("application/x-git-receive-pack-result"),
         response,
-    );
+    )?;
     Ok(response)
 }
 
 /// # Build Response headers for Smart Server.
 /// Clients MUST NOT reuse or revalidate a cached response.
 /// Servers MUST include sufficient Cache-Control headers to prevent caching of the response.
-fn add_default_header<T>(content_type: String, mut response: Response<T>) -> Response<T> {
+fn add_default_header<T>(
+    content_type: String,
+    mut response: Response<T>,
+) -> Result<Response<T>, ProtocolError> {
     response.headers_mut().insert(
         "Content-Type",
-        HeaderValue::from_str(&content_type).unwrap(),
+        HeaderValue::from_str(&content_type).map_err(|e| {
+            ProtocolError::InvalidInput(format!("invalid content-type header: {e}"))
+        })?,
     );
     response.headers_mut().insert(
         "Cache-Control",
         HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
     );
-    response
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -312,5 +325,22 @@ mod tests {
         .expect("body within limit should be accepted");
 
         assert_eq!(data.len(), 1024);
+    }
+
+    #[test]
+    fn auth_failed_returns_401_response() {
+        let resp = auth_failed().unwrap();
+
+        assert_eq!(resp.status(), 401);
+        assert!(resp.headers().get(http::header::WWW_AUTHENTICATE).is_some());
+    }
+
+    #[test]
+    fn add_default_header_rejects_invalid_content_type() {
+        let response = Response::builder().body(()).unwrap();
+        let err = add_default_header("bad\ncontent-type".to_string(), response).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("invalid content-type header"));
     }
 }
