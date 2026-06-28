@@ -105,7 +105,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | 多渠道扇出 | `service_start_fans_out_delivery_to_webhook_channel` 模块集成测试已落地 | 专门的进程级黑盒 gate（P2）仍可后续单列 | 中等 |
 | 错误诊断与脱敏 | `integration_error_redaction_does_not_leak_db_password`/`..._redis_password`/`..._bad_toml_does_not_leak_values` 活进程门禁已落地 | 可继续收拢成单一命名 gate | 中等 |
 | 热加载黑盒 | 功能实现 + 单测充分；黑盒 `integration_config_hot_reload` 未单列 | P2：明确 SIGHUP/HTTP 触发后补黑盒 gate | 中等 |
-| 对象存储 SecretRef | 启动路径解析有模块测试（透传/双 ref/缺失报错）；validate/CLI/`--resolve-secrets` 已与 S3 凭据对齐 | P2：S3/GCS 凭据的进程级黑盒 gate（local backend 之外） | 复杂 |
+| 对象存储 SecretRef | 启动路径解析有模块测试（透传/双 ref/缺失报错）；validate/CLI/`--resolve-secrets` 已与 S3 凭据对齐；P2 进程级黑盒 gate `config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs` 已落地，覆盖 `config secret set/check` 与 `config validate --resolve-secrets` 对 S3 凭据的端到端解析（不依赖真实 S3 服务端） | P2：GCS 凭据/真实 S3 后端进程级 gate 仍为后续 | 复杂 |
 | 覆盖矩阵 | 覆盖矩阵表已维护，P0/P1 gate 稳定 | 新功能先更新矩阵再落测试 | 简单 |
 
 ## 测试分层
@@ -626,6 +626,7 @@ bootstrap 后，`config validate`/CLI 未对齐）。
 | `integration_notification_trigger_to_mail` | P1 已落地（模块集成形态） | - | ✓ | - | - | ✓ | ✓ | - | - | - |
 | `integration_error_redaction` | P1 DB/Redis 活门禁已落地，余项分散覆盖 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_config_init` | P2 已落地（黑盒） | ✓ | - | - | - | - | - | ✓ | - | ✓ |
+| `integration_object_storage_s3_secret_ref` | P2 已落地（黑盒） | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
 | `integration_config_hot_reload` | P2 | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | P2 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
 

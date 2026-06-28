@@ -398,8 +398,10 @@ mod tests {
             .await
             .expect("write access key secret");
 
-        let mut config = ObjectStorageConfig::default();
-        config.storage_type = orbit_api::factory::ObjectStorageBackend::S3;
+        let mut config = ObjectStorageConfig {
+            storage_type: orbit_api::factory::ObjectStorageBackend::S3,
+            ..Default::default()
+        };
         config.s3.access_key_id =
             "vault://secret/config/test/object_storage/access_key_id#value".to_string();
         // Mixed: the secret access key stays a literal.
@@ -435,8 +437,10 @@ mod tests {
             vault.write_secret(name, Some(data)).await.expect("write");
         }
 
-        let mut config = ObjectStorageConfig::default();
-        config.storage_type = orbit_api::factory::ObjectStorageBackend::S3;
+        let mut config = ObjectStorageConfig {
+            storage_type: orbit_api::factory::ObjectStorageBackend::S3,
+            ..Default::default()
+        };
         config.s3.access_key_id =
             "vault://secret/config/test/object_storage/access_key_id#value".to_string();
         config.s3.secret_access_key =
@@ -460,8 +464,10 @@ mod tests {
         .await
         .expect("vault init");
 
-        let mut config = ObjectStorageConfig::default();
-        config.storage_type = orbit_api::factory::ObjectStorageBackend::S3;
+        let mut config = ObjectStorageConfig {
+            storage_type: orbit_api::factory::ObjectStorageBackend::S3,
+            ..Default::default()
+        };
         config.s3.access_key_id =
             "vault://secret/config/test/object_storage/missing#value".to_string();
         config.s3.secret_access_key = "literal".to_string();

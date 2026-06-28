@@ -26,12 +26,22 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-// 这些常量模拟当前 P0 集成测试中唯一允许写入 Vault 的配置项：
-// `mail.password`。数据库、Redis、对象存储等 bootstrap 阶段就要消费的
-// 配置不能依赖 monoengine 自己的 Vault，否则会形成启动环。
+// 这些常量模拟当前 P0/P2 集成测试中允许写入 Vault 的配置项：
+// `mail.password` 与 `object_storage.s3.access_key_id` / `secret_access_key`。
+// 数据库、Redis 等 bootstrap 阶段就要消费的配置不能依赖 monoengine 自己的 Vault，
+// 否则会形成启动环。
 const MAIL_PASSWORD_PATH: &str = "config/it/mail/password";
 const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
 const SECRET_VALUE: &str = "smtp-test-password";
+
+const OBJECT_STORAGE_ACCESS_KEY_PATH: &str = "config/it/object_storage/access_key_id";
+const OBJECT_STORAGE_SECRET_KEY_PATH: &str = "config/it/object_storage/secret_access_key";
+const OBJECT_STORAGE_ACCESS_KEY_REF: &str =
+    "vault://secret/config/it/object_storage/access_key_id#value";
+const OBJECT_STORAGE_SECRET_KEY_REF: &str =
+    "vault://secret/config/it/object_storage/secret_access_key#value";
+const S3_ACCESS_KEY_VALUE: &str = "AKIA-test-access-key";
+const S3_SECRET_KEY_VALUE: &str = "wJalrXUtnFEMI/test/secret/key/EXAMPLE";
 
 // 默认连接信息与 `docker-compose.test.yml`、`.env.test.example` 保持一致。
 // 如果 CI 或开发机需要改端口，可以通过 `.env.test` 中的环境变量覆盖。
@@ -365,6 +375,141 @@ fn config_secret_ref_rejects_bootstrap_secret_fields() {
         stderr.contains("cannot be stored in monoengine vault")
             && stderr.contains("supported fields are"),
         "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs() {
+    // P2 对象存储 S3 凭据的进程级黑盒 gate：
+    // 1. `config secret set` 把 access_key_id / secret_access_key 写入 Vault。
+    // 2. `config secret check` 验证两个 SecretRef 可读。
+    // 3. `config validate --resolve-secrets` 在 S3 后端配置下解析它们。
+    // 该测试不依赖真实 S3/GCS 服务端，只验证 Vault SecretRef 在 validate/CLI 链路
+    // 中的解析与 namespace 对齐（与 `docs/refactoring/integration.md` 中 P2 gate 对应）。
+    let env = VaultCliEnv::new();
+
+    // 先写入 mail password，因为完整配置默认启用 mail 并声明了 password_ref。
+    let mut set_mail = env.bootstrap_command();
+    set_mail.args([
+        "config",
+        "secret",
+        "set",
+        "mail.password",
+        "--vault-path",
+        MAIL_PASSWORD_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set_mail, SECRET_VALUE);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), format!("stored {MAIL_PASSWORD_REF}"));
+    assert_does_not_leak_secret(&stdout, &stderr);
+
+    let mut set_access = env.bootstrap_command();
+    set_access.args([
+        "config",
+        "secret",
+        "set",
+        "object_storage.s3.access_key_id",
+        "--vault-path",
+        OBJECT_STORAGE_ACCESS_KEY_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set_access, S3_ACCESS_KEY_VALUE);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(
+        stdout.trim(),
+        format!("stored {OBJECT_STORAGE_ACCESS_KEY_REF}")
+    );
+    assert!(
+        !stdout.contains(S3_ACCESS_KEY_VALUE) && !stderr.contains(S3_ACCESS_KEY_VALUE),
+        "stdout/stderr leaked S3 access key"
+    );
+
+    let mut set_secret = env.bootstrap_command();
+    set_secret.args([
+        "config",
+        "secret",
+        "set",
+        "object_storage.s3.secret_access_key",
+        "--vault-path",
+        OBJECT_STORAGE_SECRET_KEY_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set_secret, S3_SECRET_KEY_VALUE);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(
+        stdout.trim(),
+        format!("stored {OBJECT_STORAGE_SECRET_KEY_REF}")
+    );
+    assert!(
+        !stdout.contains(S3_SECRET_KEY_VALUE) && !stderr.contains(S3_SECRET_KEY_VALUE),
+        "stdout/stderr leaked S3 secret key"
+    );
+
+    let mut check_access = env.bootstrap_command();
+    check_access.args([
+        "config",
+        "secret",
+        "check",
+        "object_storage.s3.access_key_id",
+        "--ref",
+        OBJECT_STORAGE_ACCESS_KEY_REF,
+    ]);
+    let output = run(check_access);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), format!("ok {OBJECT_STORAGE_ACCESS_KEY_REF}"));
+    assert!(
+        !stdout.contains(S3_ACCESS_KEY_VALUE) && !stderr.contains(S3_ACCESS_KEY_VALUE),
+        "check leaked S3 access key"
+    );
+
+    let mut check_secret = env.bootstrap_command();
+    check_secret.args([
+        "config",
+        "secret",
+        "check",
+        "object_storage.s3.secret_access_key",
+        "--ref",
+        OBJECT_STORAGE_SECRET_KEY_REF,
+    ]);
+    let output = run(check_secret);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), format!("ok {OBJECT_STORAGE_SECRET_KEY_REF}"));
+    assert!(
+        !stdout.contains(S3_SECRET_KEY_VALUE) && !stderr.contains(S3_SECRET_KEY_VALUE),
+        "check leaked S3 secret key"
+    );
+
+    // 完整配置路径：把对象存储切到 S3，并用 Vault SecretRef 填充 S3 凭据。
+    let mut validate = env.full_config_command();
+    validate
+        .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3")
+        .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
+        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "monoengine-test")
+        .env(
+            "MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID",
+            OBJECT_STORAGE_ACCESS_KEY_REF,
+        )
+        .env(
+            "MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY",
+            OBJECT_STORAGE_SECRET_KEY_REF,
+        );
+    validate.args(["config", "validate", "--resolve-secrets"]);
+    let output = run(validate);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), "config valid");
+    assert!(
+        !stdout.contains(S3_ACCESS_KEY_VALUE)
+            && !stderr.contains(S3_ACCESS_KEY_VALUE)
+            && !stdout.contains(S3_SECRET_KEY_VALUE)
+            && !stderr.contains(S3_SECRET_KEY_VALUE),
+        "validate leaked S3 credentials"
     );
 }
 
