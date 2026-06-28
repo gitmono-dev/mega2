@@ -8,7 +8,7 @@ use crate::{
         ObjectStorageConfig,
         reload::ConfigHandle,
         secret::{SecretRef, SecretResolver, VaultSecretResolver, is_secret_ref_value},
-        validate::validate_config_secret_ref,
+        validate::{validate_config_secret_ref, validate_redis_url_literal},
     },
     contract::vault::integration::vault_core::{VaultCore, with_audit_caller},
     jupiter::redis::{ConnectionManager, init_connection},
@@ -362,6 +362,7 @@ async fn resolve_redis_url_secret(
     let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
     let mut resolved = config.clone();
     resolved.url = resolve_credential(&config.url, &resolver, "startup:redis-url").await?;
+    validate_redis_url_literal("redis.url", &resolved.url)?;
     Ok(resolved)
 }
 
@@ -585,5 +586,39 @@ mod tests {
             result.is_err(),
             "redis.url secret ref outside redis/url namespace must fail"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_redis_url_secret_rejects_malformed_resolved_url() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut data = Map::new();
+        data.insert(
+            "value".to_string(),
+            Value::String("http://not-a-redis-url:6379".to_string()),
+        );
+        vault
+            .write_secret("config/test/redis/url", Some(data))
+            .await
+            .expect("write redis url secret");
+
+        let config = crate::config::RedisConfig {
+            url: "vault://secret/config/test/redis/url#value".to_string(),
+        };
+        let result = resolve_redis_url_secret(&config, &vault).await;
+        assert!(
+            result.is_err(),
+            "resolved redis.url with non-redis scheme must fail"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("redis.url scheme"));
+        assert!(!message.contains("http://not-a-redis-url:6379"));
     }
 }

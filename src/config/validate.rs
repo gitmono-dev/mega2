@@ -564,12 +564,20 @@ pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), Me
         validate_config_secret_ref("redis.url", &secret_ref, "redis/url")?;
         return Ok(());
     }
-    let url = Url::parse(&redis_config.url)
-        .map_err(|e| MegaError::Other(format!("redis.url must be a valid URL: {e}")))?;
-    match url.scheme() {
+    validate_redis_url_literal("redis.url", &redis_config.url)
+}
+
+/// Validate that a resolved `redis.url` value is a literal `redis://` / `rediss://`
+/// URL. This is used after a `vault://` SecretRef has been resolved so that a
+/// malformed or accidentally nested SecretRef value fails with a redacted,
+/// diagnostic error before reaching the Redis client.
+pub(crate) fn validate_redis_url_literal(field_path: &str, url: &str) -> Result<(), MegaError> {
+    let parsed = Url::parse(url)
+        .map_err(|e| MegaError::Other(format!("{field_path} must be a valid URL: {e}")))?;
+    match parsed.scheme() {
         "redis" | "rediss" => Ok(()),
         scheme => Err(MegaError::Other(format!(
-            "redis.url scheme must be 'redis' or 'rediss', got '{scheme}'"
+            "{field_path} scheme must be 'redis' or 'rediss', got '{scheme}'"
         ))),
     }
 }

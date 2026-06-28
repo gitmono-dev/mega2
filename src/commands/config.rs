@@ -18,6 +18,7 @@ use crate::{
         template::config_init_template,
         validate::{
             ConfigSourceDiagnostics, collect_source_diagnostics, validate_config_secret_ref,
+            validate_redis_url_literal,
         },
     },
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface, with_audit_caller},
@@ -234,7 +235,7 @@ fn secret_name_arg() -> Arg {
         .value_name("CONFIG_FIELD")
         .required(true)
         .help(
-            "Supported config secret field: mail.password, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
+            "Supported config secret field: mail.password, redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
         )
 }
 
@@ -612,7 +613,9 @@ where
     let redis_url_trimmed = config.redis.url.trim_start();
     if is_secret_ref_value(redis_url_trimmed) {
         let secret_ref = SecretRef::parse(redis_url_trimmed)?;
-        with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        let resolved =
+            with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        validate_redis_url_literal("redis.url", &resolved)?;
     }
 
     if matches!(
@@ -1357,5 +1360,26 @@ mod tests {
         assert!(message.contains("test secret not found"));
         assert!(!message.contains("config/test/redis/url"));
         assert!(!message.contains("#value"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_rejects_malformed_resolved_redis_url() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&redis_url_ref, "http://not-a-redis-url:6379")
+            .expect("redis url secret should insert");
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("resolved redis.url with non-redis scheme should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("redis.url scheme"));
+        assert!(!message.contains("http://not-a-redis-url:6379"));
     }
 }
