@@ -7,10 +7,9 @@ use axum::{
 };
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use http::header::AUTHORIZATION;
 use tokio::io::AsyncReadExt;
-use tokio_stream::StreamExt;
 
 use crate::{
     api::oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
@@ -115,20 +114,34 @@ async fn git_receive_pack_auth(
 const GIT_HTTP_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 async fn collect_body_data(body: Body, operation: &str) -> Result<BytesMut, ProtocolError> {
-    body.into_data_stream()
-        .try_fold(BytesMut::new(), |mut acc, chunk| async move {
-            if acc.len() + chunk.len() > GIT_HTTP_MAX_BODY_BYTES {
-                return Err(axum::Error::new(std::io::Error::other(format!(
-                    "{operation} body exceeds maximum allowed size of {GIT_HTTP_MAX_BODY_BYTES} bytes"
-                ))));
+    collect_body_data_with_limit(body, operation, GIT_HTTP_MAX_BODY_BYTES).await
+}
+
+async fn collect_body_data_with_limit(
+    body: Body,
+    operation: &str,
+    max_bytes: usize,
+) -> Result<BytesMut, ProtocolError> {
+    let mut stream = body.into_data_stream();
+    let mut acc = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if acc.len() + chunk.len() > max_bytes {
+                    return Err(ProtocolError::TooLarge(format!(
+                        "{operation} body exceeds maximum allowed size of {max_bytes} bytes"
+                    )));
+                }
+                acc.extend_from_slice(&chunk);
             }
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await
-        .map_err(|err| {
-            ProtocolError::InvalidInput(format!("failed to read {operation} body: {err}"))
-        })
+            Err(err) => {
+                return Err(ProtocolError::InvalidInput(format!(
+                    "failed to read {operation} body: {err}"
+                )));
+            }
+        }
+    }
+    Ok(acc)
 }
 
 /// # Handles a Git upload pack request and prepares the response.
@@ -273,14 +286,31 @@ mod tests {
 
     #[tokio::test]
     async fn collect_body_data_rejects_oversized_bodies() {
-        let chunk = Bytes::from(vec![0u8; GIT_HTTP_MAX_BODY_BYTES + 1]);
-        let body = Body::from(chunk);
+        let err = collect_body_data_with_limit(
+            Body::from(Bytes::from(vec![0u8; 1025])),
+            "upload-pack",
+            1024,
+        )
+        .await
+        .expect_err("oversized body should be rejected");
 
-        let err = collect_body_data(body, "upload-pack")
-            .await
-            .expect_err("oversized body should be rejected");
+        assert!(matches!(err, ProtocolError::TooLarge(_)));
+        assert!(
+            err.to_string()
+                .contains("exceeds maximum allowed size of 1024 bytes")
+        );
+    }
 
-        assert!(matches!(err, ProtocolError::InvalidInput(_)));
-        assert!(err.to_string().contains("exceeds maximum allowed size"));
+    #[tokio::test]
+    async fn collect_body_data_accepts_bodies_within_limit() {
+        let data = collect_body_data_with_limit(
+            Body::from(Bytes::from(vec![0u8; 1024])),
+            "upload-pack",
+            1024,
+        )
+        .await
+        .expect("body within limit should be accepted");
+
+        assert_eq!(data.len(), 1024);
     }
 }
