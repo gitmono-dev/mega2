@@ -487,7 +487,7 @@ jobs:
           cargo test -p monoengine-core 'notification::triggers::tests' -- --nocapture
 ```
 
-> 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
+> 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Check formatting」步骤跑 `cargo +nightly fmt --all --check`、「Lint」步骤跑 `cargo clippy --all-targets --all-features -- -D warnings`（与本示例及 general.md 第 297/310 行强制的 clippy 验收门禁对齐；stable 工具链以 `--component clippy` 安装），「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
 
 ## 数据流与控制流契约
 
