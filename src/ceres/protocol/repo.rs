@@ -60,8 +60,6 @@ impl From<Repo> for git_repo::Model {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::ffi::OsStringExt;
-
     use super::*;
 
     #[test]
@@ -74,7 +72,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn repo_new_rejects_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+
         let path = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
         let err = Repo::new(path, false).unwrap_err();
 
