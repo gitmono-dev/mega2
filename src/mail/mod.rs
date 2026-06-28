@@ -42,6 +42,7 @@ use crate::{
 };
 
 pub mod template;
+pub mod testing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailAttachment {
