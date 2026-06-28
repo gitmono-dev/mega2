@@ -190,7 +190,7 @@ impl SmartSession {
                         return Err(ProtocolError::NotFound("Repository not found.".to_owned()));
                     }
                     ServiceType::ReceivePack => {
-                        let repo = Repo::new(self.repo_path.clone(), false);
+                        let repo = Repo::new(self.repo_path.clone(), false)?;
                         storage.save_git_repo(repo.clone().into()).await?;
                         repo
                     }

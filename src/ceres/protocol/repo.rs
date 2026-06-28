@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::{callisto::git_repo, common::utils::generate_id};
+use crate::{
+    callisto::git_repo,
+    common::{errors::ProtocolError, utils::generate_id},
+};
 
 /// The `repo` struct maintains the relationship between `repo_id` and `repo_path`.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -12,13 +15,23 @@ pub struct Repo {
 }
 
 impl Repo {
-    pub fn new(path: PathBuf, is_monorepo: bool) -> Self {
-        Self {
+    pub fn new(path: PathBuf, is_monorepo: bool) -> Result<Self, ProtocolError> {
+        let repo_path = path.to_str().map(String::from).ok_or_else(|| {
+            ProtocolError::InvalidInput("repository path is not valid UTF-8".to_owned())
+        })?;
+        let repo_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(String::from)
+            .ok_or_else(|| {
+                ProtocolError::InvalidInput("repository path has no valid name".to_owned())
+            })?;
+        Ok(Self {
             repo_id: generate_id(),
-            repo_path: path.to_str().unwrap().to_owned(),
-            repo_name: path.file_name().unwrap().to_str().unwrap().to_owned(),
+            repo_path,
+            repo_name,
             is_monorepo,
-        }
+        })
     }
 }
 
@@ -42,5 +55,38 @@ impl From<Repo> for git_repo::Model {
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::*;
+
+    #[test]
+    fn repo_new_accepts_valid_utf8_path() {
+        let repo = Repo::new(PathBuf::from("/srv/git/project.git"), false).unwrap();
+
+        assert_eq!(repo.repo_path, "/srv/git/project.git");
+        assert_eq!(repo.repo_name, "project.git");
+        assert!(!repo.is_monorepo);
+    }
+
+    #[test]
+    fn repo_new_rejects_non_utf8_path() {
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        let err = Repo::new(path, false).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn repo_new_rejects_path_without_file_name() {
+        let err = Repo::new(PathBuf::from("/"), false).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("no valid name"));
     }
 }

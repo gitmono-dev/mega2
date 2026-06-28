@@ -181,7 +181,10 @@ impl SmartSession {
         let have: Vec<String> = have.into_iter().collect();
 
         if have.is_empty() {
-            pack_data = repo_handler.full_pack(want).await.unwrap();
+            pack_data = repo_handler
+                .full_pack(want)
+                .await
+                .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?;
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
             if self.capabilities.contains(&Capability::MultiAckDetailed) {
@@ -200,7 +203,9 @@ impl SmartSession {
                 pack_data = repo_handler
                     .incremental_pack(want.clone(), have)
                     .await
-                    .unwrap();
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
+                    })?;
 
                 if last_common_commit.is_empty() {
                     //send NAK if missing common commit
