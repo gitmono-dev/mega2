@@ -573,11 +573,11 @@ pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), Me
 /// diagnostic error before reaching the Redis client.
 pub(crate) fn validate_redis_url_literal(field_path: &str, url: &str) -> Result<(), MegaError> {
     let parsed = Url::parse(url)
-        .map_err(|e| MegaError::Other(format!("{field_path} must be a valid URL: {e}")))?;
+        .map_err(|_| MegaError::Other(format!("{field_path} must be a valid URL")))?;
     match parsed.scheme() {
         "redis" | "rediss" => Ok(()),
-        scheme => Err(MegaError::Other(format!(
-            "{field_path} scheme must be 'redis' or 'rediss', got '{scheme}'"
+        _ => Err(MegaError::Other(format!(
+            "{field_path} scheme must be 'redis' or 'rediss'"
         ))),
     }
 }

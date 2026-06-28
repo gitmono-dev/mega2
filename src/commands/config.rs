@@ -1386,4 +1386,26 @@ mod tests {
         assert!(message.contains("redis.url scheme"));
         assert!(!message.contains("http://not-a-redis-url:6379"));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_redacted_error_does_not_leak_secret_like_scheme() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&redis_url_ref, "mysecret://sensitive-host:6379")
+            .expect("redis url secret should insert");
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("resolved redis.url with secret-like scheme should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("redis.url scheme"));
+        assert!(!message.contains("mysecret"));
+        assert!(!message.contains("sensitive-host"));
+    }
 }

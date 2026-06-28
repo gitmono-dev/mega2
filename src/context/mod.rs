@@ -621,4 +621,39 @@ mod tests {
         assert!(message.contains("redis.url scheme"));
         assert!(!message.contains("http://not-a-redis-url:6379"));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_redis_url_secret_redacted_error_does_not_leak_secret_like_scheme() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut data = Map::new();
+        data.insert(
+            "value".to_string(),
+            Value::String("mysecret://sensitive-host:6379".to_string()),
+        );
+        vault
+            .write_secret("config/test/redis/url", Some(data))
+            .await
+            .expect("write redis url secret");
+
+        let config = crate::config::RedisConfig {
+            url: "vault://secret/config/test/redis/url#value".to_string(),
+        };
+        let result = resolve_redis_url_secret(&config, &vault).await;
+        assert!(
+            result.is_err(),
+            "resolved redis.url with secret-like scheme must fail"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("redis.url scheme"));
+        assert!(!message.contains("mysecret"));
+        assert!(!message.contains("sensitive-host"));
+    }
 }
