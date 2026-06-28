@@ -125,9 +125,9 @@ callisto::{email_jobs, notification_event_types, user_notification_* }
 - NoopMailer 使测试和“邮件未启用”场景零成本。
 - Config 集成后，支持 `MEGA_MAIL__ENABLED=true` 等 env 覆盖和 `${base_dir}` 风格复用（虽 mail 配置中路径较少）。
 
-## 现有 Vault / 引导约束（必须严格遵守）
+## 硬约束与不可违反的原则
 
-与 config.md 「现有 vault 能力与关键约束」完全一致：
+与 config.md 「现有 vault 能力与关键约束」完全一致；以下约束为硬边界，任何实现偏离都必须重新评审：
 
 - mailer 构造**必须**晚于 VaultCore。
 - `config secret set mail.password ...` 等运维命令必须使用**最小 DB/Vault bootstrap**（不能初始化 Redis、对象存储、完整 Storage 服务、HTTP 监听）。
@@ -135,6 +135,19 @@ callisto::{email_jobs, notification_event_types, user_notification_* }
 - 任何在 Storage::new 或 redis init 阶段“触达”密码的行为都是违规的（即使当前是空字符串）。
 
 因此，`MailConfig` 里的 `password` 只作为兼容期入口保留；生产配置应使用 `password_ref`，并由 vault 就绪后的 resolver 路径解析。
+
+## 现状与目标对比
+
+| 维度 | 当前状态 | 目标状态 | 实现难度 |
+|-----|--------|--------|--------|
+| 架构基础 | 一级模块激活，outbox + dispatcher 框架完成，与 Config/Vault 接线就绪 | 强化多实例协调（分布式锁/租约）；完全遵循 config 热加载管道 | 中等 |
+| 密钥管理 | `password_ref` 作为首个 SecretRef 消费端已落地，兼容期明文 `password` 保留 | 明文 `password` 完全退场，vault 加固后升级凭据隐藏等级 | 中等 |
+| Provider 支持 | SMTP + console 已完成；SES/SendGrid 可通过 SMTP relay 使用 | 必要时增加原生 HTTP API provider | 复杂 |
+| 模板与国际化 | registry + TOML 覆盖 + 多 locale + admin 审计/预览/upsert/history/rollback 已落地 | 按租户/事件类型预设；高阶模板继承与默认值机制 | 复杂 |
+| 附件管理 | multipart 构造、持久化、管理 API、清理策略、dispatcher 自动保留已落地 | 优化长期存储成本；副本与跨域备份策略 | 中等 |
+| 可靠性测试 | 基础正路径 + SMTP 失败场景（连接/认证/权限）+ retry/dead-letter 已覆盖 | CI 长期压力验证；真实多进程黑盒 claim 竞争矩阵 | 复杂 |
+| 运维与诊断 | 结构化日志 + 脱敏 + job 管理 API + 退信告警已落地 | 完整 metrics + OpenTelemetry + ops 告警集成 | 中等 |
+| 热加载与灵活性 | `mail.enabled`/provider/SMTP 参数/凭据/`template_*` 已支持运行期调整 | 所有配置项零停机应用；失败自动 rollback | 中等 |
 
 ## Mail 模块的改进方案（一级模块 + SecretRef 就绪）
 
@@ -202,7 +215,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 `config mail validate --resolve`（或复用 `config validate --resolve-secrets`）应能使用最小 bootstrap 检查 mail 配置是否可发送测试信。
 
-## 迁移步骤（分阶段，绑定 config 阶段）
+## 迁移步骤（分阶段）
 
 > **与 config.md 的强绑定（2026-06-18 更新）**：mail 的后续工作仍依赖 config 的热加载、profile 和 diagnostics 演进。原先阻塞 mail 的构造失败诊断、`SecretRef` + resolver 基础设施和 `password_ref` 首个消费端已经完成首批落地。
 
@@ -229,7 +242,7 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 **阶段 5**：完整测试矩阵（坏 SMTP 已覆盖连接失败、dead-letter、协议拒绝、认证拒绝、权限/relay 拒绝和缺失收件人 skip；用户偏好全关场景已覆盖 CL 评论触发器全收件人 opt-out 不 enqueue；热加载 mailer 重建在 `password_ref` 解析失败时已覆盖 fail-safe 保留旧 mailer 且错误脱敏；仍需大量 pending job 背压压测）、在已有 Mailpit 正路径基线之上扩展 CI 中真实邮件发送干跑与故障矩阵、文档同步（README、部署指南）。Mailpit 正路径测试 `integration_mail_dispatcher_mailpit_sends_outbox_job` 已改为在 Mailpit 不可达时优雅跳过（探测 `MAILPIT_API_URL` 失败即 `eprintln` 提示并 `return`，不再 `panic!`），因此未启动 docker compose 测试栈时不会让整个测试二进制失败；Mailpit 在位时仍完整执行投递断言。
 
-### 前置依赖矩阵（2026-06-14 更新）
+## 前置依赖矩阵
 
 | mail 阶段 | 主要工作 | 对 config 的依赖 | 对 vault 的依赖 | 对 notification 的依赖 |
 |----------|--------|------------|-----------|-----------------|
@@ -279,6 +292,14 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 所有 mail 相关的实现、文档、测试、配置示例都必须与 config 模块的拆分、CLI LoadMode、最小 bootstrap、日志脱敏、core_key 加固等前置 gate 保持同步。任何试图在 Storage::new 或 `VaultCore::new` 之前构造带真实凭据 mailer 的尝试都必须被视为架构违规。
 
 实施前请完整阅读本档 + `config.md` 的「事实校准」「当前实现状态速览表」「硬约束」「secret 解析的依赖顺序」和「实施前快速检查清单」。
+
+## 预期收益
+
+- **邮件投递链路完整闭合**：从 Config 解析、Vault 解析凭据、Dispatcher 启动到消费侧 enqueue 全链路打通，作为首个 SecretRef 消费端验证了架构顺序与最小 bootstrap 要求（见 `AppContext::new` 链路及 config.md 依赖顺序）。
+- **业务与 I/O 解耦**：outbox 模式把 enqueue 与发送解耦；失败自动重试（指数退避）且有界（可配置次数 + dead-letter）；dispatcher 每 tick 输出结构化计数（sent/retry/dead-letter/skipped），降低邮件丢失与业务阻塞的风险。
+- **用户体验与隐私保护**：邮件偏好过滤、按 recipient locale 驱动多语言渲染；在已覆盖路径上通过错误脱敏与凭据隐藏避免日志/诊断信息泄露（见 `global_redactor` 与 fail-closed 设计及对应脱敏测试）。
+- **运行期灵活性**：`mail.enabled`/provider/SMTP 参数/凭据/`template_*` 可零停机热加载；mailer 重建失败自动保留旧 mailer（fail-safe），支持 `mail.enabled` false→true 运行时重启用（见第 4 阶段 2026-06-23 落地）。
+- **可维护性与扩展性**：与 mega 共享实体与 API（callisto + NotificationStorage）；provider 抽象为后续扩展（HTTP API provider）预留空间；与 config/vault 协同计划明确，降低后续维护成本（见阶段 3-5 与前置依赖矩阵）。
 
 ---
 
