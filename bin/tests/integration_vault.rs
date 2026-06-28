@@ -952,13 +952,12 @@ fn integration_multichannel_notification() {
     let slack_url = format!("http://127.0.0.1:{}/slack", recorder.addr.port());
     let webhook_url = format!("http://127.0.0.1:{}/webhook", recorder.addr.port());
 
-    if !is_mailpit_available() {
-        eprintln!(
-            "skipping integration_multichannel_notification: Mailpit unavailable at {}",
-            mailpit_api_url()
-        );
-        return;
-    }
+    assert!(
+        is_mailpit_available(),
+        "integration_multichannel_notification requires Mailpit at {}; \
+         start the docker compose test stack or set MAILPIT_API_URL/MAILPIT_SMTP_HOST/MAILPIT_SMTP_PORT",
+        mailpit_api_url()
+    );
 
     let env = VaultCliEnv::new();
     seed_mail_password(&env);
@@ -991,8 +990,8 @@ token_ref = "{NOTIFICATION_WEBHOOK_TOKEN_REF}"
         .env("MEGA_PROFILE", "it")
         .env("MEGA_MAIL__ENABLED", "true")
         .env("MEGA_MAIL__PROVIDER", "smtp")
-        .env("MEGA_MAIL__SMTP_HOST", "127.0.0.1")
-        .env("MEGA_MAIL__SMTP_PORT", "11025")
+        .env("MEGA_MAIL__SMTP_HOST", mailpit_smtp_host())
+        .env("MEGA_MAIL__SMTP_PORT", mailpit_smtp_port().to_string())
         .env("MEGA_MAIL__FROM", "no-reply@example.test")
         .env("MEGA_MAIL__STARTTLS", "false")
         .env("MEGA_LOG__PRINT_STD", "true")
@@ -1437,11 +1436,15 @@ fn reserve_free_port() -> u16 {
 }
 
 fn http_get(port: u16, path: &str) -> String {
+    http_get_host("127.0.0.1", port, path)
+}
+
+fn http_get_host(host: &str, port: u16, path: &str) -> String {
     // 极简 HTTP/1.1 客户端，避免给 bin 测试 crate 引入 HTTP 客户端依赖；
     // `Connection: close` 让我们可以读到 EOF。
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
+        match TcpStream::connect((host, port)) {
             Ok(mut stream) => {
                 // 一旦连上就给 I/O 设定超时：避免端点挂起导致 read_to_string 永久阻塞，
                 // 那样测试不会 panic，ServiceProcess::drop 也不会运行，从而泄露子进程。
@@ -1452,7 +1455,7 @@ fn http_get(port: u16, path: &str) -> String {
                     .set_read_timeout(Some(Duration::from_secs(15)))
                     .expect("set read timeout");
                 let request = format!(
-                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                    "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
                 );
                 stream
                     .write_all(request.as_bytes())
@@ -1465,7 +1468,7 @@ fn http_get(port: u16, path: &str) -> String {
             }
             Err(err) => {
                 if Instant::now() >= deadline {
-                    panic!("failed to GET {path} on port {port}: {err}");
+                    panic!("failed to GET {path} on {host}:{port}: {err}");
                 }
                 sleep(Duration::from_millis(200));
             }
@@ -1495,16 +1498,28 @@ fn mailpit_api_url() -> String {
         .to_string()
 }
 
-fn is_mailpit_available() -> bool {
-    let port = url::Url::parse(&mailpit_api_url())
+fn mailpit_api_socket_addr() -> Option<SocketAddr> {
+    let url = url::Url::parse(&mailpit_api_url()).ok()?;
+    url.socket_addrs(|| Some(80))
         .ok()
-        .and_then(|u| u.port())
-        .unwrap_or(18025);
-    TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_secs(2),
-    )
-    .is_ok()
+        .and_then(|addrs| addrs.into_iter().next())
+}
+
+fn mailpit_smtp_host() -> String {
+    std::env::var("MAILPIT_SMTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn mailpit_smtp_port() -> u16 {
+    std::env::var("MAILPIT_SMTP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11025)
+}
+
+fn is_mailpit_available() -> bool {
+    mailpit_api_socket_addr()
+        .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
+        .unwrap_or(false)
 }
 
 fn wait_for_mailpit_subject(subject: &str, timeout: Duration) -> bool {
@@ -1524,11 +1539,10 @@ fn wait_for_mailpit_subject(subject: &str, timeout: Duration) -> bool {
 }
 
 fn mailpit_messages(api_url: &str) -> Option<Value> {
-    let port = url::Url::parse(api_url)
-        .ok()
-        .and_then(|u| u.port())
-        .unwrap_or(18025);
-    let response = http_get(port, "/api/v1/messages");
+    let url = url::Url::parse(api_url).ok()?;
+    let host = url.host_str()?.to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+    let response = http_get_host(&host, port, "/api/v1/messages");
     let body = http_response_body(&response);
     serde_json::from_str(&body).ok()
 }
@@ -1660,6 +1674,10 @@ impl Drop for HttpRecorder {
 
 fn read_http_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
     stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
     let mut reader = BufReader::new(stream);
     let mut path = String::new();
     let mut headers = Vec::new();
