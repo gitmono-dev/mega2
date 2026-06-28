@@ -278,6 +278,23 @@ impl server::Handler for SshServer {
         session.close(channel)?;
         Ok(())
     }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // A channel may be closed without a preceding EOF (e.g. aborted by the
+        // client). Ensure any accumulated per-channel state and the client entry
+        // are dropped so receive-pack buffers cannot leak across the connection.
+        self.channels.remove(&channel);
+        {
+            let mut clients = self.clients.lock().await;
+            clients.remove(&(self.id, channel));
+        }
+        let _ = session.close(channel);
+        Ok(())
+    }
 }
 
 fn parse_ssh_exec_request(input: &str) -> Result<SshExecRequest, String> {
