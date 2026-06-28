@@ -73,7 +73,7 @@ fn unsupported_secret_field_error(name: &str) -> MegaError {
         .collect::<Vec<_>>()
         .join(", ");
     MegaError::Other(format!(
-        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database and Redis credentials must stay in deployment/environment secrets."
+        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database credentials must stay in deployment/environment secrets."
     ))
 }
 
@@ -607,6 +607,12 @@ where
         {
             with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
         }
+    }
+
+    let redis_url_trimmed = config.redis.url.trim_start();
+    if is_secret_ref_value(redis_url_trimmed) {
+        let secret_ref = SecretRef::parse(redis_url_trimmed)?;
+        with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
     }
 
     if matches!(
@@ -1314,5 +1320,42 @@ mod tests {
         resolve_config_secrets(&config, &resolver)
             .await
             .expect("object storage S3 SecretRefs should resolve");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_resolves_redis_url_secret_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&redis_url_ref, "redis://vault-backed:6379")
+            .expect("redis url secret should insert");
+
+        resolve_config_secrets(&config, &resolver)
+            .await
+            .expect("redis.url SecretRef should resolve");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_reports_missing_redis_url_ref_without_leaking_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new();
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("missing redis.url SecretRef should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("test secret not found"));
+        assert!(!message.contains("config/test/redis/url"));
+        assert!(!message.contains("#value"));
     }
 }
