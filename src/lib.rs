@@ -22,7 +22,7 @@ pub mod config;
 mod context;
 mod contract;
 mod jupiter;
-mod mail;
+pub mod mail;
 mod notification;
 mod server;
 // The vendored RustyVault code intentionally keeps its upstream style and
