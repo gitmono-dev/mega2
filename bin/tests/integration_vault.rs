@@ -14,16 +14,20 @@ mod common;
 
 use std::{
     fs,
-    io::{ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
-    thread::sleep,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread::{self, sleep},
     time::{Duration, Instant},
 };
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+use serde_json::Value;
 use tempfile::TempDir;
 
 // 这些常量模拟当前 P0/P2 集成测试中允许写入 Vault 的配置项：
@@ -42,6 +46,13 @@ const OBJECT_STORAGE_SECRET_KEY_REF: &str =
     "vault://secret/config/it/object_storage/secret_access_key#value";
 const S3_ACCESS_KEY_VALUE: &str = "AKIA-test-access-key";
 const S3_SECRET_KEY_VALUE: &str = "wJalrXUtnFEMI/test/secret/key/EXAMPLE";
+
+const NOTIFICATION_SLACK_WEBHOOK_URL_PATH: &str = "config/it/notification/slack/webhook_url";
+const NOTIFICATION_WEBHOOK_TOKEN_PATH: &str = "config/it/notification/webhook/token";
+const NOTIFICATION_SLACK_WEBHOOK_URL_REF: &str =
+    "vault://secret/config/it/notification/slack/webhook_url#value";
+const NOTIFICATION_WEBHOOK_TOKEN_REF: &str =
+    "vault://secret/config/it/notification/webhook/token#value";
 
 // 默认连接信息与 `docker-compose.test.yml`、`.env.test.example` 保持一致。
 // 如果 CI 或开发机需要改端口，可以通过 `.env.test` 中的环境变量覆盖。
@@ -932,6 +943,157 @@ import_dir = "/tmp/hot-reload-restart-required"
     );
 }
 
+#[test]
+fn integration_multichannel_notification() {
+    // integration.md P2 多渠道通知黑盒 gate：启动真实 service http，配置 mail + slack +
+    // webhook，通过直接写入 email_jobs outbox 触发 dispatcher，验证 email（Mailpit）、
+    // in-app（user_inbox_notifications）、Slack 与 webhook 均收到扇出。
+    let recorder = HttpRecorder::spawn();
+    let slack_url = format!("http://127.0.0.1:{}/slack", recorder.addr.port());
+    let webhook_url = format!("http://127.0.0.1:{}/webhook", recorder.addr.port());
+
+    if !is_mailpit_available() {
+        eprintln!(
+            "skipping integration_multichannel_notification: Mailpit unavailable at {}",
+            mailpit_api_url()
+        );
+        return;
+    }
+
+    let env = VaultCliEnv::new();
+    seed_mail_password(&env);
+    seed_notification_secrets(&env, &slack_url, "test-webhook-token");
+
+    // 用 profile 文件提供 notification 渠道配置（config crate 的 env overlay 对可选嵌套
+    // 结构支持不稳定，profile TOML 更可靠）。
+    env.write_profile(
+        "it",
+        &format!(
+            r#"
+[notification.slack]
+enabled = true
+webhook_url_ref = "{NOTIFICATION_SLACK_WEBHOOK_URL_REF}"
+
+[notification.webhook]
+enabled = true
+url = "{webhook_url}"
+token_ref = "{NOTIFICATION_WEBHOOK_TOKEN_REF}"
+"#
+        ),
+    );
+
+    let port = reserve_free_port();
+    let stdout_path = env.temp_dir.path().join("service.out");
+    let stderr_path = env.temp_dir.path().join("service.err");
+
+    let mut command = env.full_config_command();
+    command
+        .env("MEGA_PROFILE", "it")
+        .env("MEGA_MAIL__ENABLED", "true")
+        .env("MEGA_MAIL__PROVIDER", "smtp")
+        .env("MEGA_MAIL__SMTP_HOST", "127.0.0.1")
+        .env("MEGA_MAIL__SMTP_PORT", "11025")
+        .env("MEGA_MAIL__FROM", "no-reply@example.test")
+        .env("MEGA_MAIL__STARTTLS", "false")
+        .env("MEGA_LOG__PRINT_STD", "true")
+        .args([
+            "service",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+        ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+
+    // 直接往 outbox 写入 pending job，触发 dispatcher 的真实多渠道扇出。
+    let subject = format!(
+        "multichannel-test-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    );
+    let db_url = &env.database.db_url;
+    execute_sql(
+        db_url,
+        "INSERT INTO notification_event_types \
+         (code, category, description, system_required, default_enabled, created_at, updated_at) \
+         VALUES ('cl.comment.created', 'cl', 'comment', false, true, now(), now()) \
+         ON CONFLICT (code) DO NOTHING;",
+    );
+    execute_sql(
+        db_url,
+        &format!(
+            "INSERT INTO email_jobs \
+             (username, to_email, event_type_code, subject, body_html, body_text, status, \
+              error_message, retry_count, next_retry_at, sent_at, created_at, updated_at) \
+             VALUES ('multichannel-user', 'multichannel-user@example.test', 'cl.comment.created', \
+             '{subject}', '<p>multichannel body</p>', 'multichannel body', 'pending', NULL, 0, \
+             NULL, NULL, now(), now());"
+        ),
+    );
+
+    let logs = || {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            read_log(&stdout_path),
+            read_log(&stderr_path)
+        )
+    };
+
+    assert!(
+        wait_for_mailpit_subject(&subject, Duration::from_secs(30)),
+        "Mailpit should receive the email notification; {}",
+        logs()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = recorder.records();
+        let has_slack = records
+            .iter()
+            .any(|req| req.path == "/slack" && req.body.contains("\"text\""));
+        let has_webhook = records
+            .iter()
+            .any(|req| req.path == "/webhook" && req.body.contains("\"username\""));
+        let webhook_auth_ok = records.iter().any(|req| {
+            req.path == "/webhook"
+                && req
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "authorization" && v.contains("Bearer test-webhook-token"))
+        });
+        if has_slack && has_webhook && webhook_auth_ok {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for slack/webhook fan-out; recorder received {} requests; {}",
+                records.len(),
+                logs()
+            );
+        }
+        sleep(Duration::from_millis(200));
+    }
+
+    assert_postgres_count_at_least(
+        db_url,
+        "SELECT count(*) FROM user_inbox_notifications WHERE username = 'multichannel-user'",
+        1,
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path)
+    );
+}
+
 // ===== 错误诊断脱敏 gate（integration.md 场景 7）=====
 
 #[test]
@@ -1203,6 +1365,40 @@ fn seed_mail_password(env: &VaultCliEnv) {
     assert_success(&output);
 }
 
+fn seed_notification_secrets(env: &VaultCliEnv, slack_url: &str, webhook_token: &str) {
+    // 通过最小 DB/Vault bootstrap 写入 notification 渠道凭据，模拟运维人员先 set secret
+    // 再启动 service 的真实流程；凭据值只经 stdin 传入，不泄露到命令行或日志。
+    let mut set_slack = env.bootstrap_command();
+    set_slack.args([
+        "config",
+        "secret",
+        "set",
+        "notification.slack.webhook_url",
+        "--vault-path",
+        NOTIFICATION_SLACK_WEBHOOK_URL_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set_slack, slack_url);
+    assert_success(&output);
+
+    let mut set_token = env.bootstrap_command();
+    set_token.args([
+        "config",
+        "secret",
+        "set",
+        "notification.webhook.token",
+        "--vault-path",
+        NOTIFICATION_WEBHOOK_TOKEN_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set_token, webhook_token);
+    assert_success(&output);
+}
+
 fn create_log_file(path: &Path) -> fs::File {
     fs::File::create(path).expect("create service log file")
 }
@@ -1275,6 +1471,237 @@ fn http_get(port: u16, path: &str) -> String {
             }
         }
     }
+}
+
+fn execute_sql(db_url: &str, sql: &str) {
+    // 黑盒测试通过原始 SQL 直接操作 PostgreSQL，避免引入内部实体类型。
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|_| panic!("failed to connect to integration PostgreSQL database"));
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("failed to execute SQL: {sql}"));
+    });
+}
+
+fn mailpit_api_url() -> String {
+    std::env::var("MAILPIT_API_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:18025".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn is_mailpit_available() -> bool {
+    let port = url::Url::parse(&mailpit_api_url())
+        .ok()
+        .and_then(|u| u.port())
+        .unwrap_or(18025);
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(2),
+    )
+    .is_ok()
+}
+
+fn wait_for_mailpit_subject(subject: &str, timeout: Duration) -> bool {
+    let api_url = mailpit_api_url();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(payload) = mailpit_messages(&api_url) {
+            if mailpit_has_subject(&payload, subject) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(200));
+    }
+}
+
+fn mailpit_messages(api_url: &str) -> Option<Value> {
+    let port = url::Url::parse(api_url)
+        .ok()
+        .and_then(|u| u.port())
+        .unwrap_or(18025);
+    let response = http_get(port, "/api/v1/messages");
+    let body = http_response_body(&response);
+    serde_json::from_str(&body).ok()
+}
+
+fn mailpit_has_subject(payload: &Value, subject: &str) -> bool {
+    payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("Subject")
+                    .or_else(|| message.get("subject"))
+                    .and_then(Value::as_str)
+                    == Some(subject)
+            })
+        })
+}
+
+fn http_response_body(response: &str) -> String {
+    let mut parts = response.splitn(2, "\r\n\r\n");
+    let headers = parts.next().unwrap_or("").to_lowercase();
+    let body = parts.next().unwrap_or("");
+    if headers.contains("transfer-encoding: chunked") {
+        decode_chunked(body)
+    } else {
+        body.to_string()
+    }
+}
+
+fn decode_chunked(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut line_end = i;
+        while line_end + 1 < bytes.len()
+            && !(bytes[line_end] == b'\r' && bytes[line_end + 1] == b'\n')
+        {
+            line_end += 1;
+        }
+        if line_end + 1 >= bytes.len() {
+            break;
+        }
+        let size_str = std::str::from_utf8(&bytes[i..line_end]).unwrap_or("");
+        let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+        i = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if i + size > bytes.len() {
+            break;
+        }
+        output.extend_from_slice(&bytes[i..i + size]);
+        i += size;
+        if i + 1 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
+            i += 2;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    path: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+/// 轻量 HTTP 记录器：在测试线程里启动一个 TCP 监听器，记录收到的请求体与头部，
+/// 用于捕获 slack/webhook 渠道的扇出 POST，而不引入 axum/reqwest 等重型依赖。
+struct HttpRecorder {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    records: Arc<Mutex<Vec<RecordedRequest>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HttpRecorder {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind HTTP recorder");
+        let addr = listener.local_addr().expect("recorder local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let stop_t = stop.clone();
+        let records_t = records.clone();
+        let handle = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("recorder nonblocking");
+            while !stop_t.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Some(req) = read_http_request(&mut stream) {
+                            records_t.lock().unwrap().push(req);
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        );
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        Self {
+            addr,
+            stop,
+            records,
+            handle: Some(handle),
+        }
+    }
+
+    fn records(&self) -> Vec<RecordedRequest> {
+        self.records.lock().unwrap().clone()
+    }
+}
+
+impl Drop for HttpRecorder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.join().ok();
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
+    stream.set_nonblocking(false).ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut path = String::new();
+    let mut headers = Vec::new();
+    let mut first = true;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        if first {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                path = parts[1].to_string();
+            }
+            first = false;
+        } else if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_lowercase(), v.trim().to_string()));
+        }
+    }
+    let content_length = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).ok()?;
+    }
+    Some(RecordedRequest {
+        path,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
 }
 
 // 受控的服务子进程包装：保证测试无论成功失败都不会泄露后台进程。
