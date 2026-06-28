@@ -15,7 +15,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 2. **Docker 测试栈已就位**：`docker-compose.test.yml` 定义 PostgreSQL 15（`postgres:15-alpine`，host 端口 15432）、Redis 7（`redis:7-alpine`，16379）、Mailpit（`axllent/mailpit:v1.27`，11025/18025）；使用高位 host 端口避免冲突；无外部 Vault 容器（嵌入式 `VaultCore`）。
 3. **P0 黑盒 CLI/HTTP 门禁已落地**（`bin/tests/integration_vault.rs`）：`config_secret_ref_does_not_load_config`、`config_secret_set_check_and_validate_resolve_secret`、`config_validate_resolve_secrets_fails_when_secret_is_missing`、`config_secret_ref_rejects_bootstrap_secret_fields`、`integration_service_http_smoke`、`integration_service_http_fails_when_mailer_secret_missing`、`integration_config_init_creates_safe_skeleton_and_validates`。
 4. **P1 脱敏与端到端门禁已落地**：脱敏工具 `src/config/redaction.rs` 已实现；活进程门禁 `integration_error_redaction_does_not_leak_db_password`/`..._redis_password`/`..._bad_toml_does_not_leak_values`（`bin/tests/`）断言凭据不泄露；邮件 outbox→Mailpit 端到端由 `integration_mail_dispatcher_mailpit_sends_outbox_job`（`src/notification/dispatcher.rs`）覆盖；CL 评论触发器→enqueue/render 由 `test_on_cl_comment_created_*`（`src/notification/triggers.rs`）覆盖。
-5. **多渠道通知与对象存储已落地（2026-06-27）**：`NotificationChannel` 抽象支持 slack/webhook/in-app；webhook 扇出由 `service_start_fans_out_delivery_to_webhook_channel`（`src/notification/service.rs`）覆盖；对象存储 `vault://` SecretRef 在 post-vault 启动路径解析（`src/context/mod.rs`，validate/CLI 未对齐）。
+5. **多渠道通知与对象存储已落地（2026-06-27/2026-06-28）**：`NotificationChannel` 抽象支持 slack/webhook/in-app；webhook 扇出由 `service_start_fans_out_delivery_to_webhook_channel`（`src/notification/service.rs`）覆盖；对象存储 `vault://` SecretRef 在 post-vault 启动路径解析（`src/context/mod.rs`），并在 `config validate` / `config secret set/check` / `config validate --resolve-secrets` 中对齐（`src/config/validate.rs`、`src/commands/config.rs`）。
 6. **CI 门禁**：`.github/workflows/config-validation.yml` 运行 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、配置校验单测与 `cargo test -p monoengine --test integration_vault`、`monoengine-core` 的 `notification::{dispatcher,service,triggers}` 集成测试（启动 postgres+redis+mailpit、`::add-mask::` 凭据脱敏）。
 
 ## 审查结论
@@ -72,7 +72,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | CLI 两阶段加载 | 已实现 `LoadMode`；`config secret ref` 不加载配置，`set/check` 走最小 DB/Vault bootstrap | P0 黑盒 CLI 测试 |
 | `config init` | 已实现（生成安全骨架配置，由 `config-validation.yml` CI 覆盖） | 黑盒用例 `integration_config_init_creates_safe_skeleton_and_validates` 已落地 |
 | Vault | 嵌入式 `VaultCore`，通过 DB + `core_key.json` 管理；无外部 Vault 服务 | P0 使用 DB 和临时 `MEGA_BASE_DIR` |
-| SecretRef | 已支持 `vault://secret/<name>#<field>`；`config secret` 可写入 `mail.password`、`notification.slack.webhook_url`、`notification.webhook.token`（见 `SUPPORTED_SECRET_FIELDS`）；对象存储 `vault://` 仅启动路径解析（validate/CLI 未对齐） | P0 覆盖 `ref/set/check/validate --resolve-secrets` |
+| SecretRef | 已支持 `vault://secret/<name>#<field>`；`config secret` 可写入 `mail.password`、`notification.slack.webhook_url`、`notification.webhook.token`、`object_storage.s3.access_key_id`、`object_storage.s3.secret_access_key`（见 `SUPPORTED_SECRET_FIELDS`）；对象存储 `vault://` 在启动路径、`config validate`、`config secret set/check`、`--resolve-secrets` 中均已对齐 | P0 覆盖 `ref/set/check/validate --resolve-secrets` 与对象存储 S3 凭据 |
 | 数据库 | `database_connection()` 只支持 PostgreSQL，连接后自动执行 migrations | P0 必须检测真实连接到 PostgreSQL |
 | Redis | `AppContext::new` 在 Vault/对象存储/Storage 之后初始化 Redis | P0 service smoke 需要 Redis 容器 |
 | 对象存储 | 通过 `jupiter::storage::object_storage::build_object_storage` 构造（由 composition root 注入 `Storage::new`），测试可使用 local temp dir | P0 使用 local backend |
@@ -105,7 +105,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | 多渠道扇出 | `service_start_fans_out_delivery_to_webhook_channel` 模块集成测试已落地 | 专门的进程级黑盒 gate（P2）仍可后续单列 | 中等 |
 | 错误诊断与脱敏 | `integration_error_redaction_does_not_leak_db_password`/`..._redis_password`/`..._bad_toml_does_not_leak_values` 活进程门禁已落地 | 可继续收拢成单一命名 gate | 中等 |
 | 热加载黑盒 | 功能实现 + 单测充分；黑盒 `integration_config_hot_reload` 未单列 | P2：明确 SIGHUP/HTTP 触发后补黑盒 gate | 中等 |
-| 对象存储 SecretRef | 启动路径解析有模块测试（透传/双 ref/缺失报错） | P2：S3/GCS 凭据的黑盒 gate + validate/CLI 对齐 | 复杂 |
+| 对象存储 SecretRef | 启动路径解析有模块测试（透传/双 ref/缺失报错）；validate/CLI/`--resolve-secrets` 已与 S3 凭据对齐 | P2：S3/GCS 凭据的进程级黑盒 gate（local backend 之外） | 复杂 |
 | 覆盖矩阵 | 覆盖矩阵表已维护，P0/P1 gate 稳定 | 新功能先更新矩阵再落测试 | 简单 |
 
 ## 测试分层

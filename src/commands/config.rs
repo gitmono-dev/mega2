@@ -14,7 +14,7 @@ use crate::{
     common::errors::{MegaError, MegaResult},
     config::{
         Config,
-        secret::{SecretRef, SecretResolver, VaultSecretResolver},
+        secret::{SecretRef, SecretResolver, VaultSecretResolver, is_secret_ref_value},
         template::config_init_template,
         validate::{
             ConfigSourceDiagnostics, collect_source_diagnostics, validate_config_secret_ref,
@@ -27,9 +27,10 @@ const MAIL_PASSWORD_FIELD: &str = "mail.password";
 
 /// Config-managed secret fields that may be stored in the monoengine vault, with
 /// the vault namespace suffix each must use (`config/<profile>/<suffix>`). Only
-/// these fields are accepted by `config secret set/check/rotate/ref`. Database,
-/// Redis and object-storage credentials are intentionally excluded — they are
-/// bootstrap dependencies that must stay in deployment/environment secrets.
+/// these fields are accepted by `config secret set/check/rotate/ref`. Database
+/// and Redis credentials remain intentionally excluded — they are bootstrap
+/// dependencies that must stay in deployment/environment secrets. Object-storage
+/// S3 credentials may now be vault-backed and are resolved post-vault bootstrap.
 const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
     (MAIL_PASSWORD_FIELD, "mail/password"),
     (
@@ -37,6 +38,14 @@ const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
         "notification/slack/webhook_url",
     ),
     ("notification.webhook.token", "notification/webhook/token"),
+    (
+        "object_storage.s3.access_key_id",
+        "object_storage/access_key_id",
+    ),
+    (
+        "object_storage.s3.secret_access_key",
+        "object_storage/secret_access_key",
+    ),
 ];
 
 /// Look up the required vault namespace suffix for a supported secret field.
@@ -62,7 +71,7 @@ fn unsupported_secret_field_error(name: &str) -> MegaError {
         .collect::<Vec<_>>()
         .join(", ");
     MegaError::Other(format!(
-        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database, Redis, and object storage credentials must stay in deployment/environment secrets."
+        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database and Redis credentials must stay in deployment/environment secrets."
     ))
 }
 
@@ -223,7 +232,7 @@ fn secret_name_arg() -> Arg {
         .value_name("CONFIG_FIELD")
         .required(true)
         .help(
-            "Supported config secret field: mail.password, notification.slack.webhook_url, notification.webhook.token",
+            "Supported config secret field: mail.password, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
         )
 }
 
@@ -295,6 +304,10 @@ fn exec_init(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     println!("next steps:");
     println!(
         "  printf '%s' \"$SMTP_PASSWORD\" | monoengine --config {} config secret set mail.password --vault-path config/prod/mail/password --field value --value-stdin",
+        output_path.display()
+    );
+    println!(
+        "  printf '%s' \"$S3_ACCESS_KEY\" | monoengine --config {} config secret set object_storage.s3.access_key_id --vault-path config/prod/object_storage/access_key_id --field value --value-stdin",
         output_path.display()
     );
     println!(
@@ -594,6 +607,23 @@ where
         }
     }
 
+    if matches!(
+        config.object_storage.storage_type,
+        orbit_api::factory::ObjectStorageBackend::S3
+            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+    ) {
+        let access_key_id_trimmed = config.object_storage.s3.access_key_id.trim_start();
+        if is_secret_ref_value(access_key_id_trimmed) {
+            let secret_ref = SecretRef::parse(access_key_id_trimmed)?;
+            with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        }
+        let secret_access_key_trimmed = config.object_storage.s3.secret_access_key.trim_start();
+        if is_secret_ref_value(secret_access_key_trimmed) {
+            let secret_ref = SecretRef::parse(secret_access_key_trimmed)?;
+            with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -674,6 +704,8 @@ fn read_secret_value_from_stdin() -> Result<String, MegaError> {
 
 #[cfg(test)]
 mod tests {
+    use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config};
+
     use super::*;
     use crate::config::{
         MailConfig,
@@ -932,6 +964,43 @@ mod tests {
     }
 
     #[test]
+    fn secret_ref_from_args_accepts_object_storage_access_key_id_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "object_storage.s3.access_key_id",
+                "--vault-path",
+                "config/prod/object_storage/access_key_id",
+            ])
+            .unwrap();
+
+        let secret_ref = secret_ref_from_args(&matches)
+            .expect("object storage access key ref should be accepted");
+        assert_eq!(
+            secret_ref.secret_name(),
+            "config/prod/object_storage/access_key_id"
+        );
+    }
+
+    #[test]
+    fn secret_ref_from_args_rejects_object_storage_secret_access_key_outside_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "object_storage.s3.secret_access_key",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+        assert!(message.contains("object_storage.s3.secret_access_key"));
+        assert!(message.contains("object_storage/secret_access_key"));
+        assert!(!message.contains("config/prod/mail/password"));
+    }
+
+    #[test]
     fn config_secret_check_ref_rejects_wrong_mail_namespace_without_leaking_ref() {
         let matches = cli()
             .try_get_matches_from([
@@ -1181,5 +1250,39 @@ mod tests {
         assert!(!message.contains("config/test/mail/password"));
         assert!(!message.contains("#value"));
         assert!(!message.contains("smtp-test-value"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_resolves_object_storage_s3_secret_refs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let access_key_ref =
+            SecretRef::parse("vault://secret/config/test/object_storage/access_key_id#value")
+                .unwrap();
+        let secret_key_ref =
+            SecretRef::parse("vault://secret/config/test/object_storage/secret_access_key#value")
+                .unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: access_key_ref.as_uri().to_string(),
+                secret_access_key: secret_key_ref.as_uri().to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&access_key_ref, "AKIA-test")
+            .expect("access key should insert")
+            .with_secret(&secret_key_ref, "secret-test")
+            .expect("secret key should insert");
+
+        resolve_config_secrets(&config, &resolver)
+            .await
+            .expect("object storage S3 SecretRefs should resolve");
     }
 }

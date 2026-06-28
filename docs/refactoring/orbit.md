@@ -37,7 +37,7 @@
 | `orbit-api` crate | **API-only，未改动** | 仅 trait/config/wrapper；无 `object_store`/云 SDK/`tokio`。本次重构**未触碰 orbit-api**（采用"注入值"而非新增 factory trait）。 |
 | 构造抽象（factory） | ✅ **已落地：`ObjectStorageProvider` trait（在 core）** | `src/jupiter/storage/object_storage.rs` 定义 `ObjectStorageProvider` + 进程级注册表 `set_object_storage_provider` / `build_object_storage`；bin 提供 `OrbitObjectStorageProvider` 实现。 |
 | 消费端（Lfs/Git/Artifact 服务） | **未改动（trait-only）** | 仍只持 `MegaObjectStorageWrapper`、只调 `.inner` trait 方法。 |
-| 组合根 | ✅ **已倒置** | `Storage::new(config, object_store)` / `AppContext::new(config, object_store)` 接收注入值；`service`/`chat-migrate` exec 经 provider 构造；最终 `orbit` 调用在 `bin` main。 |
+| 组合根 | ✅ **已倒置** | `Storage::new(config, object_store)` / `Storage::new_with_connection(config, connection, object_store)` 接收注入值；`AppContext::new(config)` 在内部经 `ObjectStorageProvider` 注册表构造对象存储（DB-only vault bootstrap 后解析 `vault://` SecretRef），再注入 `Storage::new_with_connection`；最终 `orbit` 调用在 `bin` main。 |
 | mock / 测试路径 | **未改动（纯 orbit-api）** | `mock_object_storage()` 仍在 core 内用 `orbit-api` 构造；`Storage::new`/`AppContext::new` 无测试调用方，注入值改造零测试破坏。 |
 | 重量级传递依赖 | ✅ **已从 core 编译移除** | `object_store {cloud,aws,gcp}` + AWS/GCP SDK 现仅在 `bin` 的编译图（`cargo tree -p monoengine-core` 的 `object_store` 计数 = 0；`bin` = 1）。 |
 
@@ -51,7 +51,7 @@
 1. **运行期对象存储行为零变更。** 同一 `orbit::factory::ObjectStorageFactory::build(&config.object_storage)` 必须仍对 4 种后端（S3/S3Compatible/Gcs/Local）运行，**只移动调用位置，不改变构造逻辑与时机**。理由：对象存储是 git/LFS/artifact 数据面，任何行为漂移都是数据风险。
 2. **`orbit-api` 必须保持 API-only。** 不得向 `orbit-api` 引入 `object_store`、云 SDK 或 `tokio`。理由：一旦 API crate 携带重实现，"依赖 API 即轻量"的前提失效，重构失去意义。
 3. **注入类型必须是 `orbit-api` 的 `MegaObjectStorageWrapper`（`Arc<dyn MegaObjectStorageWithLog>`）。** 不得把具体 `ObjectStoreAdapter` / `BackendStore`（`orbit/src/adapter.rs`）泄露进 core。理由：core 一旦命名具体实现类型，就重新耦合实现 crate。
-4. **启动顺序约束不变（与 vault.md 一致）：** `Config(synchronous) → Storage(DB + object storage) → redis → VaultCore → mail/notification`。对象存储必须在 `Storage::new` 期间（vault 之前）就绪。
+4. **启动顺序约束（与 vault.md 一致）：** `Config(synchronous) → database_connection() → DB-only VaultCore bootstrap → resolve object storage SecretRef → build_object_storage → Storage::new_with_connection → redis → mail/notification`。对象存储凭据在 vault 就绪后解析，随后构造对象存储并注入 `Storage::new_with_connection`。
 5. **测试 / mock 路径不得依赖 orbit 实现 crate。** `mock_object_storage()` / `Storage::mock` / `ArtifactService::mock` 必须只用 `orbit-api` 构造（现状已满足，重构后须保持）。
 6. **消费端代码不改。** 18 处 `orbit_api::` 引用（跨 13 文件）保持不动；本重构只动"构造与注入"的少数位置，不动"使用"。
 
@@ -71,8 +71,8 @@
 > **总体策略：两段式。** "阶段 1–2 = seam 清理（仍保留 `orbit` 依赖）"是**强制前置**且使阶段 3 变成机械操作；"阶段 3 = 拆出 `monoengine-core` lib"才**真正**从 core 编译移除重量级依赖。**推荐做法：注入"已构造好的值"`MegaObjectStorageWrapper`，而非注入 factory——因为构造产物本就是 `orbit-api` trait object，无需给 `orbit-api` 增加 factory trait，API 面最小。**
 
 > **✅ 已落地实现说明（2026-06-19）。** 实际实现综合了"注入值"与"进程级 provider 注册表"：
-> - `Storage::new` / `AppContext::new` 接收注入的 `MegaObjectStorageWrapper` **值**（构造点上移，零测试破坏——二者均无测试调用方）。
-> - 因 config 在 core 的 `cli::parse` 内解析、`service`/`chat-migrate` 两个 exec（在 core 内）才知道 config，故无法在 bin 侧预先构造值；改为在 core 定义 `ObjectStorageProvider` trait + 进程级注册表（`set_object_storage_provider` / `build_object_storage`，`src/jupiter/storage/object_storage.rs`），bin 在 `main` 启动时注册 `OrbitObjectStorageProvider`，两个 exec 经 `build_object_storage(&config.object_storage)` 构造后注入。
+> - `Storage::new` / `Storage::new_with_connection` 接收注入的 `MegaObjectStorageWrapper` **值**；`AppContext::new(config)` 在内部先解析 `vault://` SecretRef，再经 `ObjectStorageProvider` 注册表构造对象存储并注入 `Storage::new_with_connection`。
+> - 因 config 在 core 的 `cli::parse` 内解析、`service`/`chat-migrate` 两个 exec（在 core 内）才知道 config，故无法在 bin 侧预先构造值；改为在 core 定义 `ObjectStorageProvider` trait + 进程级注册表（`set_object_storage_provider` / `build_object_storage`，`src/jupiter/storage/object_storage.rs`），bin 在 `main` 启动时注册 `OrbitObjectStorageProvider`，`AppContext::new` 调用 `build_object_storage(&config.object_storage)` 构造后注入 `Storage`。
 > - 选择该注册表而非"穿 `CommandContext`"是为零破坏 `cli::parse` 的大量测试调用方；选择"注入值 + 注册表"而非"给 orbit-api 加 factory trait"是为保持 orbit-api 零改动、API 面最小（硬约束 #2）。
 > - `orbit::factory::ObjectStorageFactory::build` 的唯一调用点位于 `bin/src/main.rs`（composition root）。
 
@@ -91,8 +91,8 @@
 **阶段 1 — 把 `object_store` 作为注入参数穿过 `Storage::new` / `AppContext::new`**
 
 5. `Storage::new(config: Arc<Config>)`（`mod.rs:196`）改为 `Storage::new(config: Arc<Config>, object_store: MegaObjectStorageWrapper)`；删除 `:213` 的 `let object_store = ObjectStorageFactory::build(...).await?;`，在 `:216`/`:248`/`:305` 直接用参数。
-6. `AppContext::new(config)`（`context/mod.rs:40`）改为 `AppContext::new(config, object_store: MegaObjectStorageWrapper)`，在 `:43` 转发给 `Storage::new`；保持 `Config → Storage(DB+对象存储) → redis → VaultCore` 顺序。
-7. 更新 2 个调用方（`commands/service/mod.rs:40`、`commands/chat_migrate.rs:114`）：先构造 `object_store` 再传入（构造位置见阶段 2）。
+6. `AppContext::new(config)`（`context/mod.rs:51`）在内部先执行 DB-only `VaultCore` bootstrap，再调用 `resolve_object_storage_secrets` 与 `build_object_storage` 构造对象存储，最后通过 `Storage::new_with_connection` 注入；保持 `Config → database_connection() → VaultCore → object storage → Storage → redis → mail/notification` 顺序。
+7. `commands/service/mod.rs:40` 与 `commands/chat_migrate.rs` 的调用方仍直接传入 `config`，对象存储构造留在 `AppContext::new` 内部（由进程级 `ObjectStorageProvider` 注册表实现）。
 8. `Storage::mock`/测试构造点改为传入 `mock_object_storage()`（已是 orbit-api 构造）。
 
 > **验收标准**：
@@ -170,7 +170,7 @@
 2. ✅ **拆分后 orbit 实现依赖落在哪里？** —— **直接放进 `monoengine` 瘦二进制 crate**（`bin/`），未单列 adapter crate。`OrbitObjectStorageProvider` 即在 `bin/src/main.rs`。若日后有第二个二进制需复用，可再抽出 `orbit-bootstrap` adapter crate（增量改动）。
 3. ✅ **注入形态：** —— **注入"已构造好的值" + 进程级 `ObjectStorageProvider` 注册表**（见上"已落地实现说明"）。**未**给 `orbit-api` 增加 factory trait，orbit-api 零改动。
 4. ⬜ **`orbit-api` 来源：** —— **仍为 path 依赖**（`monoengine-core` → `../orbit/api`，`bin` → `../../orbit` + `../../orbit/api`）。是否发布 `orbit-api` 到 registry / 内部 git 以获得真正的跨仓库构建隔离，**仍为开放决策**（与本次模块/依赖卫生正交，可后续单独推进）。
-5. ✅ **`chat_migrate` 二进制路径：** —— **已一致更新**。`commands/service/mod.rs` 与 `commands/chat_migrate.rs` 两个 `AppContext::new` 调用方均改为先 `build_object_storage(&config.object_storage)` 再注入，构造同一真实对象存储。
+5. ✅ **`chat_migrate` 二进制路径：** —— **已一致更新**。`commands/service/mod.rs:40` 与 `commands/chat_migrate.rs:114` 均直接调用 `AppContext::new(config)`；对象存储构造留在 `AppContext::new` 内部，通过同一 `ObjectStorageProvider` 注册表构造，保证 `service` 与 `chat-migrate` 使用一致的真实对象存储。
 
 ## 小结
 

@@ -7,7 +7,8 @@ use crate::{
     config::{
         ObjectStorageConfig,
         reload::ConfigHandle,
-        secret::{SecretRef, SecretResolver, VaultSecretResolver},
+        secret::{SecretRef, SecretResolver, VaultSecretResolver, is_secret_ref_value},
+        validate::validate_config_secret_ref,
     },
     contract::vault::integration::vault_core::{VaultCore, with_audit_caller},
     jupiter::redis::{ConnectionManager, init_connection},
@@ -253,21 +254,18 @@ impl AppContext {
     }
 }
 
-/// True if `value` is a `vault://` SecretRef URI rather than a literal credential.
-fn is_secret_ref_value(value: &str) -> bool {
-    value.starts_with("vault://")
-}
-
 /// Resolve a credential that may be either a literal value or a `vault://`
 /// SecretRef URI. Literals are returned unchanged; SecretRef URIs are resolved
-/// through the vault resolver (post-vault).
+/// through the vault resolver (post-vault). Leading whitespace is ignored when
+/// deciding whether the value is a SecretRef, matching `config validate`.
 async fn resolve_credential(
     value: &str,
     resolver: &VaultSecretResolver,
     caller: &str,
 ) -> Result<String, MegaError> {
-    if is_secret_ref_value(value) {
-        let secret_ref = SecretRef::parse(value)?;
+    let trimmed = value.trim_start();
+    if is_secret_ref_value(trimmed) {
+        let secret_ref = SecretRef::parse(trimmed)?;
         with_audit_caller(caller, resolver.resolve(&secret_ref)).await
     } else {
         Ok(value.to_string())
@@ -284,10 +282,42 @@ async fn resolve_object_storage_secrets(
     config: &ObjectStorageConfig,
     vault: &VaultCore,
 ) -> Result<ObjectStorageConfig, MegaError> {
-    if !is_secret_ref_value(&config.s3.access_key_id)
-        && !is_secret_ref_value(&config.s3.secret_access_key)
-    {
+    // Object-storage vault refs are only meaningful for S3/S3-compatible
+    // backends; Local/GCS configs do not consume the `s3.*` fields.
+    let s3_like = matches!(
+        config.storage_type,
+        orbit_api::factory::ObjectStorageBackend::S3
+            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+    );
+    if !s3_like {
         return Ok(config.clone());
+    }
+
+    let access_key_id_trimmed = config.s3.access_key_id.trim_start();
+    let secret_access_key_trimmed = config.s3.secret_access_key.trim_start();
+    let access_key_id_is_ref = is_secret_ref_value(access_key_id_trimmed);
+    let secret_access_key_is_ref = is_secret_ref_value(secret_access_key_trimmed);
+    if !access_key_id_is_ref && !secret_access_key_is_ref {
+        return Ok(config.clone());
+    }
+
+    // Enforce the same namespace as `config validate` so a config cannot point
+    // an object-storage credential at an unrelated vault path at runtime.
+    if access_key_id_is_ref {
+        let secret_ref = SecretRef::parse(access_key_id_trimmed)?;
+        validate_config_secret_ref(
+            "object_storage.s3.access_key_id",
+            &secret_ref,
+            "object_storage/access_key_id",
+        )?;
+    }
+    if secret_access_key_is_ref {
+        let secret_ref = SecretRef::parse(secret_access_key_trimmed)?;
+        validate_config_secret_ref(
+            "object_storage.s3.secret_access_key",
+            &secret_ref,
+            "object_storage/secret_access_key",
+        )?;
     }
 
     let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
@@ -319,7 +349,7 @@ mod tests {
     #[test]
     fn is_secret_ref_value_detects_vault_uri() {
         assert!(is_secret_ref_value(
-            "vault://secret/config/prod/object_storage/access_key#value"
+            "vault://secret/config/prod/object_storage/access_key_id#value"
         ));
         assert!(!is_secret_ref_value("AKIAEXAMPLE"));
         assert!(!is_secret_ref_value(""));
@@ -364,13 +394,14 @@ mod tests {
             Value::String("AKIA-from-vault".to_string()),
         );
         vault
-            .write_secret("config/test/object_storage/access_key", Some(access))
+            .write_secret("config/test/object_storage/access_key_id", Some(access))
             .await
             .expect("write access key secret");
 
         let mut config = ObjectStorageConfig::default();
+        config.storage_type = orbit_api::factory::ObjectStorageBackend::S3;
         config.s3.access_key_id =
-            "vault://secret/config/test/object_storage/access_key#value".to_string();
+            "vault://secret/config/test/object_storage/access_key_id#value".to_string();
         // Mixed: the secret access key stays a literal.
         config.s3.secret_access_key = "literal-secret".to_string();
 
@@ -393,8 +424,11 @@ mod tests {
         .expect("vault init");
 
         for (name, value) in [
-            ("config/test/object_storage/access_key", "AKIA-both"),
-            ("config/test/object_storage/secret_key", "SECRET-both"),
+            ("config/test/object_storage/access_key_id", "AKIA-both"),
+            (
+                "config/test/object_storage/secret_access_key",
+                "SECRET-both",
+            ),
         ] {
             let mut data = Map::new();
             data.insert("value".to_string(), Value::String(value.to_string()));
@@ -402,10 +436,11 @@ mod tests {
         }
 
         let mut config = ObjectStorageConfig::default();
+        config.storage_type = orbit_api::factory::ObjectStorageBackend::S3;
         config.s3.access_key_id =
-            "vault://secret/config/test/object_storage/access_key#value".to_string();
+            "vault://secret/config/test/object_storage/access_key_id#value".to_string();
         config.s3.secret_access_key =
-            "vault://secret/config/test/object_storage/secret_key#value".to_string();
+            "vault://secret/config/test/object_storage/secret_access_key#value".to_string();
 
         let resolved = resolve_object_storage_secrets(&config, &vault)
             .await
@@ -426,6 +461,7 @@ mod tests {
         .expect("vault init");
 
         let mut config = ObjectStorageConfig::default();
+        config.storage_type = orbit_api::factory::ObjectStorageBackend::S3;
         config.s3.access_key_id =
             "vault://secret/config/test/object_storage/missing#value".to_string();
         config.s3.secret_access_key = "literal".to_string();

@@ -41,7 +41,7 @@
 > - **（2026-06-27）A：补齐“root token/分片/secret 明文不得进入日志”验收（vault.md:226/260）的自动化守卫。新增 `vault_lifecycle_never_logs_root_token_shares_or_secret_values` 回归测试（`src/contract/vault/integration/vault_core.rs`）：用线程局部 `tracing` subscriber 捕获 VaultCore 集成在 init → write_secret → read_secret → reset 全流程于初始化任务线程上发出的 `tracing` 事件，断言写入的 secret 明文、已持久化的 unseal 分片（compact JSON / pretty JSON / Debug 三种形态，pretty 对应 `persist_core_key` 的 `to_writer_pretty`）、限权 runtime token 与任何 root-token 字样均不出现；并以变更测试（mutation test）确认注入泄露时该用例会失败。此前阶段 A 仅有 `core_key.json` 不含 `root_token` 的持久化断言，无日志侧守卫。**该单测的覆盖边界（刻意留白、已在测试注释标注）：仅捕获本任务线程上的 `tracing` 事件，不覆盖 stdout/stderr 的 `println!`/`eprintln!`、`log::` facade（未装 `tracing-log` 桥）以及 vault 内部后台 OS 线程（如 `src/vault/modules/auth/expiration.rs` 的租约过期定时线程）上发出的事件——彻底覆盖需全局 subscriber（与其它测试 `try_init` 竞争）或进程级 fd 捕获，超出本单测范围。**
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
 > - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
-> - G：**（2026-06-27）已落地分阶段 bootstrap，对象存储凭据可走 SecretRef。** `AppContext::new` 现只建一次 DB 连接，先用它做 **DB-only `VaultCore` bootstrap**（`from_database_connection`，不依赖完整 `Storage`，打破“vault 需要 Storage、Storage 需要对象存储、对象存储凭据需要 vault”的循环），再解析 `object_storage.s3.access_key_id`/`secret_access_key` 中的 `vault://` SecretRef，最后用解析后的配置 `build_object_storage` 并经 `Storage::new_with_connection`（复用同一连接）建完整 storage。`Storage::new` 本身未拆——通过 DB-only vault bootstrap 达成等效分阶段。字面量凭据原样透传（env/IAM 部署不受影响）。`config secret set/check` 仍不依赖对象存储可用。
+> - G：**（2026-06-27）已落地分阶段 bootstrap，对象存储凭据可走 SecretRef；（2026-06-28）validate/CLI 已对齐。** `AppContext::new` 现只建一次 DB 连接，先用它做 **DB-only `VaultCore` bootstrap**（`from_database_connection`，不依赖完整 `Storage`，打破“vault 需要 Storage、Storage 需要对象存储、对象存储凭据需要 vault”的循环），再解析 `object_storage.s3.access_key_id`/`secret_access_key` 中的 `vault://` SecretRef，最后用解析后的配置 `build_object_storage` 并经 `Storage::new_with_connection`（复用同一连接）建完整 storage。`Storage::new` 本身未拆——通过 DB-only vault bootstrap 达成等效分阶段。字面量凭据原样透传（env/IAM 部署不受影响）。`config validate` 与 `config secret set/check` 现已接受合法 namespace 的 object_storage SecretRef，`config validate --resolve-secrets` 也会解析它们。
 
 ## 当前实现概览
 
@@ -112,10 +112,13 @@
 
 ```text
 Config::new
-  -> Storage::new(config)          # 建数据库连接、构造对象存储、初始化部分存储能力
-  -> init_connection(redis)        # 连接 Redis
-  -> VaultCore::new(storage)       # vault 此时才就绪
-  -> SmtpMailer + EmailDispatcher  # mail 启用时，vault 之后启动邮件 outbox dispatcher
+  -> database_connection()                                    # 建数据库连接
+  -> VaultCore::from_database_connection(db, key_path)        # DB-only vault 初始化
+  -> resolve_object_storage_secrets(object_storage, vault)    # 解析对象存储 vault:// SecretRef
+  -> build_object_storage(resolved_config)                    # 构造对象存储后端
+  -> Storage::new_with_connection(config, db, object_store)   # 复用同一连接建完整 Storage
+  -> init_connection(redis)                                   # 连接 Redis
+  -> SmtpMailer + EmailDispatcher                             # mail 启用时，vault 之后启动
   -> init_monorepo
   -> HTTP / SSH / multi 服务分发
 ```
@@ -123,8 +126,8 @@ Config::new
 该顺序形成硬约束：
 
 - `database.db_url` / 数据库密码属于引导配置，不能进入本项目 vault。
-- `redis.url` 当前在 vault 前被消费，暂时不能进入本项目 vault。
-- `object_storage.s3.access_key_id` / `secret_access_key` 当前在 `Storage::new` 中、vault 前被消费，暂时不能进入本项目 vault。
+- `object_storage.s3.access_key_id` / `secret_access_key` 在 DB-only vault bootstrap 后解析，已支持 `vault://` SecretRef；namespace 为 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../object_storage/secret_access_key#<field>`，且已在 `config validate` / `config secret set/check` / `--resolve-secrets` 中对齐。
+- `redis.url` 在 vault 就绪后连接，因此从启动顺序上已具备迁移条件；当前仍读取明文配置，是否迁移到 vault 由后续计划决定。
 - `mail.password` 的消费晚于 vault 就绪；当前在 `AppContext::new` 中构造 `SmtpMailer` 并启动 `EmailDispatcher`，是第一批较合理的可迁移凭据。
 - `config secret set/check`、`config validate --resolve-secrets` 不能复用完整 `AppContext`，必须使用最小 DB/Vault bootstrap。
 
@@ -151,14 +154,14 @@ main()                                          src/main.rs:34
 【异步阶段 · #[tokio::main] 启动 runtime】       src/commands/service/mod.rs:24
 service::exec(config, args)
 └─ AppContext::new(config).await               src/context/mod.rs:24
-   ├─ Storage::new(config)                      src/context/mod.rs:33
-   │   ├─ database_connection(&database)        src/jupiter/storage/mod.rs:191  建 DB 连接池
-   │   ├─ crate::jupiter::storage::object_storage::ObjectStorageFactory::build(..)  src/jupiter/storage/mod.rs:206  ★ 对象存储（vault 前）
-   │   └─ init_default_sidebars(&sidebar)       src/jupiter/storage/mod.rs:219-221
-   ├─ init_connection(&config.redis)            src/context/mod.rs:36           ★ Redis（vault 前）
-   ├─ VaultCore::new(storage.clone())           src/context/mod.rs:39   ◀── vault 在此初始化
-   ├─ SmtpMailer + EmailDispatcher spawn        src/context/mod.rs:46-55        （vault 之后，mail 启用时）
-   └─ mono_service.init_monorepo(&monorepo)     src/context/mod.rs:60-64        （vault 之后）
+   ├─ database_connection(&database)            src/context/mod.rs:56           建 DB 连接
+   ├─ VaultCore::from_database_connection(..)   src/context/mod.rs:60-71  ◀── DB-only vault 在此初始化
+   ├─ resolve_object_storage_secrets(..)        src/context/mod.rs:75-76        vault 后解析对象存储 SecretRef
+   ├─ build_object_storage(..)                  src/context/mod.rs:77-78        ★ 对象存储（vault 后）
+   ├─ Storage::new_with_connection(..)          src/context/mod.rs:79           复用同一连接建完整 Storage
+   ├─ init_connection(&config.redis)            src/context/mod.rs:80-81        Redis（vault 后）
+   ├─ SmtpMailer + NotificationService spawn    src/context/mod.rs:82-230       （vault 之后，mail 启用时）
+   └─ mono_service.init_monorepo(&monorepo)     src/context/mod.rs:231-232      （vault 之后）
 └─ 分发 http::exec / ssh::exec / multi::exec    src/commands/service/mod.rs:34-36
       └─（SSH 路径）读/生成 ssh_server_key       src/server/ssh_server.rs:78     ← vault 后续消费者之一
 ```
@@ -194,11 +197,13 @@ sequenceDiagram
     participant CLI as cli::parse (同步)
     participant SVC as service::exec #[tokio::main]
     participant AC as AppContext::new
-    participant ST as Storage::new
-    participant RDS as Redis
+    participant DB as Database
     participant VC as VaultCore
     participant RV as RustyVault
-    participant DB as vault 表 (JupiterBackend)
+    participant VDB as vault 表 (JupiterBackend)
+    participant OBJ as ObjectStorage
+    participant ST as Storage::new_with_connection
+    participant RDS as Redis
     participant MAIL as Mail/Notification
     participant SRV as http/ssh 服务
 
@@ -207,12 +212,12 @@ sequenceDiagram
     CLI->>CLI: init_log() ★ tracing 安装
     CLI->>SVC: exec_subcommand → service::exec（runtime 启动）
     SVC->>AC: AppContext::new(config).await
-    AC->>ST: Storage::new(config)
-    ST->>DB: database_connection() 建 DB 连接池
-    ST->>ST: crate::jupiter::storage::object_storage::ObjectStorageFactory::build() ★对象存储(vault 前)
-    ST->>ST: init_default_sidebars()
-    AC->>RDS: init_connection(redis) ★Redis(vault 前)
-    AC->>VC: VaultCore::new(storage.clone()) ◀ vault 开始初始化
+    AC->>DB: database_connection() 建 DB 连接
+    AC->>VC: VaultCore::from_database_connection(db, key_path) ◀ DB-only vault 初始化
+    AC->>VC: resolve_object_storage_secrets(config.object_storage, vault) 解析 vault://
+    AC->>OBJ: build_object_storage(resolved_config)
+    AC->>ST: Storage::new_with_connection(config, db, object_store)
+    AC->>RDS: init_connection(redis)
     VC->>VC: create_dir_all(base/vault)
     VC->>RV: RustyVault::new(JupiterBackend)
     alt core_key.json 不存在（首启/丢失）
@@ -236,9 +241,9 @@ sequenceDiagram
 
 ### 时序中的关键事实
 
-- vault 就绪点是唯一的 `VaultCore::new`（`context/mod.rs:39`）；在它之前已消费 DB、对象存储（`Storage::new` 内 `:206`）、Redis（`:36`）——这正是“启动依赖顺序”把这三类判为引导 / 早期运行时依赖、不能直接改 `SecretRef` 的代码依据。
-- `mail.password` 的消费点（`SmtpMailer::new`，随后 `EmailDispatcher::new` + spawn）在 `context/mod.rs:46-55`，晚于 vault，是第一批可迁移凭据。当前失败路径已改为返回可诊断错误，不再由 `if let Ok(m)` 静默忽略。
-- `init_monorepo` 在 mail/notification dispatcher 启动之后、服务分发之前执行（`context/mod.rs:60-64`）。
+- vault 就绪点是唯一的 `VaultCore::from_database_connection`（`context/mod.rs:60-71`）。在它之前只消费 DB 连接；对象存储凭据在 vault 就绪后通过 `resolve_object_storage_secrets`（`context/mod.rs:75-76`）解析，对象存储（`build_object_storage`，`context/mod.rs:77-79`）与完整 `Storage::new_with_connection`（`:81-86`）、Redis（`:88`）均位于 vault 之后。
+- `mail.password` 的消费点（`mailer_from_config` + `NotificationService::from_mail_config_with_extra_channels` + `tokio::spawn(service.start)`）在 `context/mod.rs:95-231`，晚于 vault，是第一批可迁移凭据。当前失败路径返回可诊断错误，不再静默忽略。
+- `init_monorepo` 在 mail/notification dispatcher 启动之后、服务分发之前执行（`context/mod.rs:233`）。
 - tracing subscriber 在 `cli.rs:44` 就已安装，早于 vault；因此 `VaultCore::config` 的 `println!`（:71/:83/:93/:103）与 `log::debug!(root_token)`（:114）会真的把 root token / 分片写进 stdout 与日志（详见“当前主要问题 · root token 明文输出”）。
 - 分支 A 的 `delete_all()`（:74）仅凭 `core_key.json` 不存在即触发，无法区分“全新空库首启”与“误删 key 但库内有数据”（详见“fail-closed 判定依据必须区分首次初始化与误删 key”）。
 

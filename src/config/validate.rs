@@ -605,8 +605,16 @@ fn validate_s3_config(
     require_non_empty("object_storage.s3.bucket", &s3.bucket)?;
     require_non_empty("object_storage.s3.access_key_id", &s3.access_key_id)?;
     require_non_empty("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
-    reject_secret_ref_like_value("object_storage.s3.access_key_id", &s3.access_key_id)?;
-    reject_secret_ref_like_value("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
+    validate_object_storage_secret_ref(
+        "object_storage.s3.access_key_id",
+        &s3.access_key_id,
+        "object_storage/access_key_id",
+    )?;
+    validate_object_storage_secret_ref(
+        "object_storage.s3.secret_access_key",
+        &s3.secret_access_key,
+        "object_storage/secret_access_key",
+    )?;
 
     if require_endpoint {
         require_non_empty("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
@@ -616,14 +624,23 @@ fn validate_s3_config(
     Ok(())
 }
 
-fn reject_secret_ref_like_value(field_path: &str, value: &str) -> Result<(), MegaError> {
-    if value.trim_start().starts_with("vault://") {
-        return Err(MegaError::Other(format!(
-            "{field_path} cannot use monoengine vault SecretRef; keep database, Redis, and object storage credentials in deployment/environment secrets. value is redacted"
-        )));
+/// Validate that an object-storage credential field is either a literal value or
+/// a well-formed `vault://` SecretRef under the required namespace. Literal
+/// values are passed through unchanged; vault refs are validated for format and
+/// namespace so that `config validate` aligns with the runtime resolution path
+/// (`context::resolve_object_storage_secrets`).
+fn validate_object_storage_secret_ref(
+    field_path: &str,
+    value: &str,
+    suffix: &str,
+) -> Result<(), MegaError> {
+    let trimmed = value.trim_start();
+    if !trimmed.starts_with("vault://") {
+        return Ok(());
     }
 
-    Ok(())
+    let secret_ref = SecretRef::parse(trimmed)?;
+    validate_config_secret_ref(field_path, &secret_ref, suffix)
 }
 
 pub(crate) fn validate_orion_server_config(
@@ -2389,7 +2406,29 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref() {
+    fn config_validate_accepts_object_storage_secret_refs_under_required_namespace() {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: "vault://secret/config/prod/object_storage/access_key_id#value"
+                    .to_string(),
+                secret_access_key:
+                    "vault://secret/config/prod/object_storage/secret_access_key#value".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        config
+            .validate()
+            .expect("object storage SecretRefs under required namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_object_storage_secret_refs_outside_required_namespace() {
         let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::S3,
@@ -2405,28 +2444,38 @@ mod tests {
 
         let err = config
             .validate()
-            .expect_err("object storage SecretRef-like value should fail");
+            .expect_err("object storage SecretRef outside required namespace should fail");
         let message = err.to_string();
 
         assert!(message.contains("object_storage.s3.access_key_id"));
-        assert!(message.contains("deployment/environment secrets"));
         assert!(message.contains("value is redacted"));
         assert!(!message.contains("config/prod/object-storage/access"));
         assert!(!message.contains("#value"));
+    }
 
-        config.object_storage.s3.access_key_id = "key".to_string();
-        config.object_storage.s3.secret_access_key =
-            " vault://secret/config/prod/object-storage/secret#value".to_string();
+    #[test]
+    fn config_validate_rejects_object_storage_secret_access_key_outside_required_namespace() {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: "AKIA-example".to_string(),
+                secret_access_key: "vault://secret/config/prod/mail/password#value".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
 
         let err = config
             .validate()
-            .expect_err("object storage SecretRef-like secret key should fail");
+            .expect_err("object storage secret access key outside required namespace should fail");
         let message = err.to_string();
 
         assert!(message.contains("object_storage.s3.secret_access_key"));
-        assert!(message.contains("deployment/environment secrets"));
         assert!(message.contains("value is redacted"));
-        assert!(!message.contains("config/prod/object-storage/secret"));
+        assert!(!message.contains("config/prod/mail/password"));
         assert!(!message.contains("#value"));
     }
 
