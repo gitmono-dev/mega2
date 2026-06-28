@@ -12,7 +12,8 @@ use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
     MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
     OAuthConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS,
-    VaultConfig, secret::SecretRef,
+    VaultConfig,
+    secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
 
@@ -557,6 +558,12 @@ pub(crate) fn validate_build_config(build_config: &BuildConfig) -> Result<(), Me
 
 pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), MegaError> {
     require_non_empty("redis.url", &redis_config.url)?;
+    let trimmed = redis_config.url.trim_start();
+    if is_secret_ref_value(trimmed) {
+        let secret_ref = SecretRef::parse(trimmed)?;
+        validate_config_secret_ref("redis.url", &secret_ref, "redis/url")?;
+        return Ok(());
+    }
     let url = Url::parse(&redis_config.url)
         .map_err(|e| MegaError::Other(format!("redis.url must be a valid URL: {e}")))?;
     match url.scheme() {
@@ -2074,6 +2081,29 @@ mod tests {
         let err = config.validate().expect_err("redis scheme should fail");
 
         assert!(err.to_string().contains("redis.url scheme"));
+    }
+
+    #[test]
+    fn config_validate_accepts_redis_url_secret_ref_in_namespace() {
+        let mut config = valid_config();
+        config.redis.url = "vault://secret/config/test/redis/url#value".to_string();
+
+        config
+            .validate()
+            .expect("redis.url secret ref in namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_redis_url_secret_ref_outside_namespace() {
+        let mut config = valid_config();
+        config.redis.url = "vault://secret/config/test/mail/password#value".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("redis.url secret ref outside redis/url namespace should fail");
+
+        assert!(err.to_string().contains("redis.url"));
+        assert!(err.to_string().contains("redis/url"));
     }
 
     #[test]

@@ -86,7 +86,12 @@ impl AppContext {
         )
         .await?;
         let config_handle = storage.config_handle();
-        let connection = init_connection(&config.redis).await?;
+
+        // Resolve any `vault://` SecretRef in `redis.url` post-vault, then build
+        // the shared Redis connection from the resolved config
+        // (docs/refactoring/integration.md: redis.url SecretRef support).
+        let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
+        let connection = init_connection(&redis_config).await?;
 
         // Late (post-Vault) construction for mail + notification dispatcher (phase 0 per docs/notification.md).
         // Must be after VaultCore (and mail) per config.md bootstrap constraints and docs/mail.md.
@@ -337,6 +342,29 @@ async fn resolve_object_storage_secrets(
     Ok(resolved)
 }
 
+/// Resolve a `vault://` SecretRef in `redis.url` against the already-bootstrapped
+/// vault, returning a config with a literal URL ready for `init_connection`.
+/// Literal URLs are passed through unchanged so deployments that keep the Redis
+/// URL in env/IAM are unaffected.
+async fn resolve_redis_url_secret(
+    config: &crate::config::RedisConfig,
+    vault: &VaultCore,
+) -> Result<crate::config::RedisConfig, MegaError> {
+    let trimmed = config.url.trim_start();
+    if !is_secret_ref_value(trimmed) {
+        return Ok(config.clone());
+    }
+    // Enforce the same namespace as `config validate` so a config cannot point
+    // the Redis URL at an unrelated vault path at runtime.
+    let secret_ref = SecretRef::parse(trimmed)?;
+    validate_config_secret_ref("redis.url", &secret_ref, "redis/url")?;
+
+    let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
+    let mut resolved = config.clone();
+    resolved.url = resolve_credential(&config.url, &resolver, "startup:redis-url").await?;
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, Value};
@@ -476,5 +504,86 @@ mod tests {
         // diagnostic instead of crashing.
         let result = resolve_object_storage_secrets(&config, &vault).await;
         assert!(result.is_err(), "missing object-storage secret must error");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_redis_url_secret_passes_through_literal_url() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let config = crate::config::RedisConfig {
+            url: "redis://127.0.0.1:6379".to_string(),
+        };
+        let resolved = resolve_redis_url_secret(&config, &vault)
+            .await
+            .expect("literal redis url resolves");
+        assert_eq!(resolved.url, "redis://127.0.0.1:6379");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_redis_url_secret_resolves_vault_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut data = Map::new();
+        data.insert(
+            "value".to_string(),
+            Value::String("redis://vault-backed:6379".to_string()),
+        );
+        vault
+            .write_secret("config/test/redis/url", Some(data))
+            .await
+            .expect("write redis url secret");
+
+        let config = crate::config::RedisConfig {
+            url: "vault://secret/config/test/redis/url#value".to_string(),
+        };
+        let resolved = resolve_redis_url_secret(&config, &vault)
+            .await
+            .expect("redis url secret ref resolves");
+        assert_eq!(resolved.url, "redis://vault-backed:6379");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_redis_url_secret_rejects_wrong_namespace() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(
+            storage.vault_storage(),
+            temp_dir.path().join("core_key.json"),
+        )
+        .await
+        .expect("vault init");
+
+        let mut data = Map::new();
+        data.insert(
+            "value".to_string(),
+            Value::String("redis://wrong-namespace:6379".to_string()),
+        );
+        vault
+            .write_secret("config/test/mail/password", Some(data))
+            .await
+            .expect("write unrelated secret");
+
+        let config = crate::config::RedisConfig {
+            url: "vault://secret/config/test/mail/password#value".to_string(),
+        };
+        let result = resolve_redis_url_secret(&config, &vault).await;
+        assert!(
+            result.is_err(),
+            "redis.url secret ref outside redis/url namespace must fail"
+        );
     }
 }

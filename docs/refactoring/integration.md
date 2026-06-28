@@ -568,9 +568,11 @@ AppContext::new(config):
 ```
 
 测试断言必须与这条顺序一致。特别是：`mail.password_ref` 可以解析，因为 mail 在 Vault 后构造；
-数据库凭据在 Vault bootstrap 过程中被消费、Redis URL 在 Vault 后但未接入 SecretRef，二者不能改为
-monoengine Vault SecretRef；对象存储凭据已可在启动路径解析 `vault://` SecretRef（DB-only vault
-bootstrap 后，`config validate`/CLI 未对齐）。
+数据库凭据在 Vault bootstrap 过程中被消费，不能改为 monoengine Vault SecretRef；**Redis URL 已在
+Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
+`vault://secret/config/<profile>/redis/url#<field>`，且 `config validate`/CLI/`--resolve-secrets`
+已对齐**；对象存储凭据已可在启动路径解析 `vault://` SecretRef（DB-only vault bootstrap 后，
+`config validate`/CLI 已对齐）。
 
 ## 性能与可靠性规则
 

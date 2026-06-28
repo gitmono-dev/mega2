@@ -55,10 +55,10 @@
 
 本文档中以下约束是硬边界，任何实现偏离都必须重新评审：
 
-1. **引导循环决定数据库凭据无法使用本项目 Vault SecretRef。** 数据库凭据用于 DB-only `VaultCore` bootstrap，在 vault 就绪前已被消费，无法反过来从 vault 解析——这是不可破的引导循环，必须通过环境变量、文件挂载 secret 或部署平台 secret 机制注入。Redis URL 同样走 TOML/env（尚未接入 SecretRef）。对象存储 S3 凭据在 DB-only vault bootstrap 后已可走 `vault://` SecretRef：`AppContext::new` 的 `resolve_object_storage_secrets` 在 vault 就绪后解析 `object_storage.s3.access_key_id` / `secret_access_key` 中的 `vault://` SecretRef（vault.md/orbit.md 阶段 G），字面量凭据原样透传；`config validate` 与 `config secret set/check` 现已接受合法 namespace 下的 object_storage SecretRef，`config validate --resolve-secrets` 也会解析它们。
+1. **引导循环决定数据库凭据无法使用本项目 Vault SecretRef。** 数据库凭据用于 DB-only `VaultCore` bootstrap，在 vault 就绪前已被消费，无法反过来从 vault 解析——这是不可破的引导循环，必须通过环境变量、文件挂载 secret 或部署平台 secret 机制注入。**（2026-06-28 更新）Redis URL 已在 vault 就绪后接入 SecretRef**：`AppContext::new` 的 `resolve_redis_url_secret` 解析 `redis.url` 中的 `vault://` SecretRef（合法 namespace 为 `vault://secret/config/<profile>/redis/url#<field>`），字面量 URL 原样透传；`config validate` 与 `config secret set/check` 现已接受并校验合法 namespace 下的 `redis.url` SecretRef。对象存储 S3 凭据在 DB-only vault bootstrap 后已可走 `vault://` SecretRef：`AppContext::new` 的 `resolve_object_storage_secrets` 在 vault 就绪后解析 `object_storage.s3.access_key_id` / `secret_access_key` 中的 `vault://` SecretRef（vault.md/orbit.md 阶段 G），字面量凭据原样透传；`config validate` 与 `config secret set/check` 现已接受合法 namespace 下的 object_storage SecretRef，`config validate --resolve-secrets` 也会解析它们。
 2. **`Config::new` 不能做异步 secret 解析；真实 secret 只能在 vault 就绪后解析。** `Config::new` 是同步函数且只依赖文件系统读取，无法访问数据库或网络。secret 解析必须排在 `AppContext` 中的 vault 就绪之后，由独立的 resolver 负责。
 3. **`config secret set/check` 和 `config validate --resolve-secrets` 必须继续使用最小 DB/Vault bootstrap，不能依赖 Redis、S3、HTTP 服务或完整 `AppContext`。** 这确保运维命令不被无关前置依赖阻塞，可在裸机初始化中执行。缺少数据库/vault 时必须给出明确前置步骤提示，不得 panic。
-4. **新增 SecretRef 消费端前必须先证明其消费点晚于 vault。** 已落地并经 `config validate`/`--resolve-secrets` 支持的配置侧 SecretRef 消费端包括 `mail.password_ref`、`notification.slack.webhook_url_ref`/`notification.webhook.token_ref`，以及对象存储 `object_storage.s3.access_key_id`/`secret_access_key`（2026-06-28 已对齐 validate/CLI/`--resolve-secrets`）；这些 SecretRef 字段在 source diagnostics 输出中均已作为敏感字段回退处理（含 `notification.slack.webhook_url_ref` 与 `notification.webhook.token_ref`，2026-06-28）。任何新增消费端都必须通过依赖表确认其初始化晚于 vault，不能违反启动顺序。
+4. **新增 SecretRef 消费端前必须先证明其消费点晚于 vault。** 已落地并经 `config validate`/`--resolve-secrets` 支持的配置侧 SecretRef 消费端包括 `mail.password_ref`、`redis.url`、`notification.slack.webhook_url_ref`/`notification.webhook.token_ref`，以及对象存储 `object_storage.s3.access_key_id`/`secret_access_key`（2026-06-28 已对齐 validate/CLI/`--resolve-secrets`）；这些 SecretRef 字段在 source diagnostics 输出中均已作为敏感字段回退处理（含 `notification.slack.webhook_url_ref` 与 `notification.webhook.token_ref`，2026-06-28）。任何新增消费端都必须通过依赖表确认其初始化晚于 vault，不能违反启动顺序。
 5. **Vault fail-closed、root token 脱敏/退役和 key 权限已完成；生产静态保护仍取决于部署侧 key material 托管。** 把更多凭据放入 vault 不抵御能读取 key 文件的攻击者；生产高敏感部署必须配套 KMS/secret manager、受控挂载、备份恢复和恢复演练。
 6. **拆分、错误模型、`config init`、Profile/测试分层、对象存储重构和热加载必须分阶段评审，每个源码阶段都要通过 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings` 和 `source .env.test && cargo test --all` 三项 gate。** 不追求单次变更内完成全部改造；每个阶段独立可评审、可回归。
 7. **热加载只允许白名单字段运行期生效，不应隐式重建长生命周期资源。** 数据库、Redis、对象存储、HTTP 监听器等基础服务字段变化只告警提示重启，不在运行期重建；失败必须保留旧配置并输出诊断。
@@ -273,12 +273,12 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 - **vault 的存储后端就是数据库。** `VaultCore::new(ctx: Storage)` 通过 `JupiterBackend` 把 secret 存进数据库（`ctx.vault_storage()`）。这意味着 vault 必须先有可用的数据库连接才能启动。
 - **由此形成明确的依赖链：`Config → Storage(数据库) → Vault`。** `Config::new`（同步）先产出配置 → `Storage::new(Arc<Config>)` 用 `database` 连库 → `VaultCore::new(storage)` 起 vault。vault 在 `AppContext::new` 阶段才就绪，晚于 `Config::new`。
 - **最小 DB/Vault bootstrap 已可用。** `VaultCore::from_database_config/from_database_connection` 与 `Config::load_vault_bootstrap` 已支持只依赖数据库配置启动 vault；数据库连接或 migration 失败会映射为可诊断的 vault bootstrap 错误；`config secret set/check` 和 `config validate --resolve-secrets` 不依赖 Redis、对象存储、HTTP/SSH 服务、monorepo 初始化或完整 `AppContext`。
-- **配置侧 SecretRef 已有首批落点。** 现有直接消费者包括 `ssh_server_key`、PGP、Nostr、PKI，以及首批配置 SecretRef：`mail.password_ref` → `secret/config/...`；对象存储 `object_storage.s3.access_key_id` / `secret_access_key` 也已支持 `vault://` SecretRef，并在 validate、CLI 和 `--resolve-secrets` 中对齐。`database`、`redis` 仍属于引导/早期依赖，不能使用本项目 vault 的 SecretRef。
+- **配置侧 SecretRef 已有首批落点。** 现有直接消费者包括 `ssh_server_key`、PGP、Nostr、PKI，以及首批配置 SecretRef：`mail.password_ref` → `secret/config/...`；**`redis.url` 已支持 `vault://` SecretRef（2026-06-28）**，并在启动路径、validate、CLI 和 `--resolve-secrets` 中对齐；对象存储 `object_storage.s3.access_key_id` / `secret_access_key` 也已支持 `vault://` SecretRef，并在 validate、CLI 和 `--resolve-secrets` 中对齐。`database` 仍属于引导依赖，不能使用本项目 vault 的 SecretRef。
 - **`core_key.json` 已从“危险自动重建”改为 fail-closed。** 当 DB 中 vault storage 已初始化但 key 文件缺失时，`VaultCore` 返回 `CoreKeyMissing`，不会 `delete_all()` 清空 vault 表；初始化路径不再输出 root token、secret shares 或完整 key 文件内容。Unix 下 key 目录和文件权限已收紧到 `0700` / `0600`。
 - **root token 已退出常规运行路径。** 初始化后会安装运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token；常规 secret 读写使用限权 token，并在 `VaultCoreInterface` 入口记录 `vault_audit` 元数据。
 - **残余安全边界仍需明确。** 自动解封模式下，unseal shares 仍落在本地 `core_key.json`。这降低了“进入普通配置/日志/仓库”的风险，但不抵御能读取部署机 key 文件的攻击者；生产部署仍需要外部 secret manager/KMS、受控挂载、备份恢复和恢复演练。
 
-这些安全/引导事实直接约束了下文方案的边界：配置模块可以继续基于已完成的 vault/bootstrap/SecretRef 能力推进；数据库、Redis 凭据仍不得改成本项目 vault SecretRef，而对象存储凭据在初始化顺序重构（DB-only vault bootstrap，阶段 6/G）后已可在启动路径与 validate/CLI 路径完整解析 `vault://` SecretRef。
+这些安全/引导事实直接约束了下文方案的边界：配置模块可以继续基于已完成的 vault/bootstrap/SecretRef 能力推进；数据库凭据仍不得改成本项目 vault SecretRef，而 Redis URL、对象存储凭据在初始化顺序重构（DB-only vault bootstrap，阶段 6/G）后已可在启动路径与 validate/CLI 路径完整解析 `vault://` SecretRef。
 
 ## Config 单独成模块的改进方案
 
@@ -291,7 +291,7 @@ README 已同步描述完整加载优先级，包括 `mega_base()/etc/config.tom
 考虑到配置模块规模以及上文揭示的 vault 引导/安全约束，本计划采用**分阶段、可独立验证**的策略，而不是一次性大爆炸切换。以下原则贯穿全程：
 
 1. **拆分与迁移解耦。** 顶层模块迁移和调用方路径迁移已分别完成；后续内部拆分仍应保持同样原则：一次只移动一个职责边界，确保每一步可编译、可回归，不把错误模型、`config init`、Profile 或热加载混进纯移动变更。
-2. **区分“引导配置 / 早期运行时依赖”与“可迁移凭据”。** 数据库连接（以及 vault 自身启动所依赖的一切）属于**引导配置**，必须留在 TOML/环境变量中（明文或由 env 注入），**永远不能成为 vault SecretRef**——因为 vault 存在数据库里，连库才能起 vault。Redis URL 当前在 vault 就绪后才连接，但尚未接入 SecretRef，仍按引导/部署平台 secret 处理。对象存储凭据原属早期运行时依赖，初始化顺序已重构（DB-only vault bootstrap，阶段 6/G），启动路径、`config validate`、`config secret set/check`、`config validate --resolve-secrets` 均已支持其 `vault://` SecretRef（2026-06-28 对齐）。只有在 vault 就绪后才被使用的凭据（例如邮件发送器密码、notification slack/webhook 凭据、对象存储 S3 凭据，以及未来新增且确认为后置消费的 OAuth/第三方服务 secret）才是“可迁移凭据”。
+2. **区分“引导配置 / 早期运行时依赖”与“可迁移凭据”。** 数据库连接（以及 vault 自身启动所依赖的一切）属于**引导配置**，必须留在 TOML/环境变量中（明文或由 env 注入），**永远不能成为 vault SecretRef**——因为 vault 存在数据库里，连库才能起 vault。Redis URL 原属早期运行时依赖，初始化顺序已重构（DB-only vault bootstrap，阶段 6/G），**`redis.url` 已支持 `vault://` SecretRef（2026-06-28）**，启动路径、`config validate`、`config secret set/check`、`config validate --resolve-secrets` 均已对齐。对象存储凭据同理。只有在 vault 就绪后才被使用的凭据（例如邮件发送器密码、notification slack/webhook 凭据、Redis URL、对象存储 S3 凭据，以及未来新增且确认为后置消费的 OAuth/第三方服务 secret）才是“可迁移凭据”。
 3. **secret 解析是 vault 就绪后的独立异步阶段，不在 `Config::new` 内。** `Config::new` 同步且 vault 尚未就绪，无法在加载流水线内解析 secret。`Config::new` 只产出**未解析的 `SecretRef`**；服务运行时的真实值由 resolver 在 `AppContext` 中的 vault 就绪后、按消费端依赖顺序异步解析。
 4. **`config secret` 命令必须继续只使用最小 DB/Vault bootstrap。** 当前 `config secret set/check` 已按此原则实现：只建立 vault 所需的数据库能力和 `VaultStorage`，不初始化 Redis、对象存储、HTTP/SSH 服务或后台任务。后续新增 secret 命令或 `config init` 不能退回完整 `AppContext`。
 5. **Vault 加固核心子集已完成，但生产部署仍需恢复与托管策略。** fail-closed、权限收紧、root token 脱敏/退役和限权 token 已落地；后续 config 工作可以基于这些能力继续推进。剩余安全边界是本地自动解封 key material 的托管、备份恢复、KMS/secret manager 接入和演练。
@@ -386,7 +386,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 改造后应区分四类字段，而不是笼统地“把敏感数据搬进 vault”：
 
 1. **引导配置（必须留在 TOML/env，永不进本项目 vault）。** 典型是 `database`（连接地址、用户名、密码）。当前 `DbConfig::default()` 与仓库基础样例 `config/config.toml` 已避免在默认 PostgreSQL URL 中嵌入可预测 userinfo，但这不改变边界：由于 vault 存在数据库里、连库才能起 vault，**数据库密码无法作为 vault SecretRef**——这是不可破的引导循环。这类凭据应通过环境变量注入（如 `MEGA_DATABASE__DB_URL` 或拆分后的数据库密码环境变量）、文件挂载 secret 或部署平台的 secret 机制（K8s Secret、CI secret store 等）保护，**而不是交给本项目的 vault**。
-2. **早期运行时依赖。** 这类字段不是数据库引导项，但在 vault 就绪前或同一初始化阶段已经被消费。**（2026-06-27 更新）** 初始化顺序已重构：`AppContext::new` 先做 DB-only `VaultCore` bootstrap，再 `resolve_object_storage_secrets` 解析对象存储 `vault://` SecretRef，最后构造完整 Storage，因此 `object_storage.s3.access_key_id`/`secret_access_key` 已可在启动路径走 SecretRef（字面量原样透传）；`config validate`、`config secret set/check` 和 `config validate --resolve-secrets` 现已接受并解析合法 namespace 下的对象存储 SecretRef（2026-06-28）。`AppContext::new` 在对象存储之后才连接 Redis，因此带密码的 `redis.url` 仍按引导/部署平台 secret 处理（未接入 SecretRef）。
+2. **早期运行时依赖。** 这类字段不是数据库引导项，但在 vault 就绪前或同一初始化阶段已经被消费。**（2026-06-27 更新）** 初始化顺序已重构：`AppContext::new` 先做 DB-only `VaultCore` bootstrap，再 `resolve_object_storage_secrets` 解析对象存储 `vault://` SecretRef，最后构造完整 Storage，因此 `object_storage.s3.access_key_id`/`secret_access_key` 已可在启动路径走 SecretRef（字面量原样透传）；`config validate`、`config secret set/check` 和 `config validate --resolve-secrets` 现已接受并解析合法 namespace 下的对象存储 SecretRef（2026-06-28）。**（2026-06-28 更新）** `AppContext::new` 在对象存储之后才连接 Redis，且 `resolve_redis_url_secret` 会在 vault 就绪后解析 `redis.url` 中的 `vault://` SecretRef（合法 namespace 为 `vault://secret/config/<profile>/redis/url#<field>`），字面量 URL 原样透传；`config validate`、`config secret set/check` 和 `config validate --resolve-secrets` 现已对齐。
 3. **可迁移凭据（vault 就绪后才被使用，可改为 SecretRef）。** 这是“消费点晚于 vault 且不阻塞 `AppContext` 构造”的字段。**`mail.password_ref` 现在就是此类的第一个已落地成员**：`AppContext::new` 在 `VaultCore::new` 之后仅为 SMTP provider 解析它，再把解析后的值交给 `mailer_from_config(...)`，随后启动 `EmailDispatcher`。明文 `mail.password` 仍作为兼容期入口存在，但已用 `SecretString` 包装，运行期和 source diagnostics 均输出 deprecation warning，且 `--deny-warnings` 可在 CI/发布前阻断；后续仍需按版本兼容策略推动样例和生产配置完成迁移。未来新增 OAuth client secret、第三方 API key 等字段同理，只有确认其消费点晚于 vault 且不会阻塞 `AppContext` 构造，才可纳入此类。
 4. **非敏感运行参数。** 维持现状，明文留在 TOML。
 
@@ -401,7 +401,7 @@ Profile 机制需要先固定以下语义，避免“配置能合并但含义不
 | 字段 | 当前消费点 | 分类 | 迁移结论 |
 | --- | --- | --- | --- |
 | `database.db_url` / 拆分后的数据库密码 | `Storage::new` 建库连接（最早） | 引导配置（硬循环） | **永远**只能走 TOML/env/部署平台 secret，不进本项目 vault |
-| `redis.url`（若含密码） | `AppContext::new` 中 vault 前 `init_connection` | 早期运行时依赖 | 走 env/部署平台 secret；所有日志与错误必须脱敏 |
+| `redis.url`（若含密码） | `AppContext::new` 中 vault 后 `resolve_redis_url_secret` → `init_connection` | 早期运行时依赖（已支持 vault SecretRef） | 已支持 `vault://secret/config/<profile>/redis/url#<field>`；`config validate`/`config secret set/check`/`--resolve-secrets` 已对齐；字面量 URL 原样透传；所有日志与错误必须脱敏 |
 | `object_storage.s3.access_key_id` / `secret_access_key` | `AppContext::new` 中 DB-only vault bootstrap 后 `resolve_object_storage_secrets` → `build_object_storage` | 早期运行时依赖（已支持 vault SecretRef） | 已支持 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../secret_access_key#<field>`；`config validate`/`config secret set/check`/`--resolve-secrets` 已对齐；字面量凭据原样透传 |
 | `orion_server.db_url` 等 | Orion 作为独立服务使用 | 外部服务配置 | 由 Orion 自己或部署平台管理，monoengine 不应声称代管 |
 | `mail.password_ref`（推荐）/ `mail.password`（兼容期明文） | `AppContext::new` 中 `VaultCore::new` 之后仅为 SMTP provider 解析，再构造 provider mailer 和 `EmailDispatcher` | **可迁移凭据（已落地首个成员）** | `provider`、`password_ref`、最小 resolver、互斥校验、mailer 错误传播、明文 deprecation warning、`SecretString` 防误打印、source diagnostics、`--deny-warnings` 门禁、失败发送可配置 dead-letter/retry、可配置有界并发、stale `sending` 恢复和作业管理 API 基线已落地；剩余=兼容期收尾治理、真实 SMTP/Mailpit、多实例矩阵和更完整 metrics/lifecycle |
@@ -790,7 +790,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 15. 已完成首批：新增 `monoengine config init`，只操作配置文件和模板，不连接数据库或 vault，不接收或写入真实 secret；命令走 `LoadMode::None`，支持默认路径、全局 `--config`、`--output` 和 `--force`。
 16. 已完成首批：`config init` 生成安全默认骨架，不写入可预测生产密码；数据库、Redis 凭据只给 env/部署 secret 指引；对象存储 S3 凭据已支持 `vault://` SecretRef，但 `config init` 默认不为其生成 SecretRef 占位（避免把 bootstrap 类依赖默认为 vault），需要时运维人员可手动写入 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../secret_access_key#<field>`；对 `mail.password_ref` 生成 SecretRef 占位，并提示后续使用 `config secret set --value-stdin` 写入真实值。
 17. 已完成首批 raw TOML 与 `MEGA_*` diagnostics：`config validate` 已切到 `LoadMode::RawSources` 并在命令内解析配置，坏 TOML/坏 env 类型等不会被 CLI 子命令分发前预加载拦截；坏 TOML 可由文件解析错误返回且会脱敏源行，未知字段、废弃字段、未知环境变量覆盖项、孤立 `oauth` 环境变量覆盖项和旧 mail TLS 环境变量覆盖项已在 `config validate` 中 warning，且 env warning 只输出变量名和映射字段路径，不输出变量值；文件级 warning 现在保留可测试 source path，能区分 base/profile 文件来源；base/profile/env warning 已可汇总，`--deny-warnings` 可把这些 warning 作为命令失败；`--show-sources` 可显式输出 base/profile/env warning、字段来源图和 profile/env 覆盖 base/profile 的字段路径与来源，且不输出原始值；坏环境变量类型、profile 类型冲突和占位符展开错误已报出来源/字段路径和修复建议，并脱敏原始值；source field/source override 已补首批可操作修复建议（编辑/移除具体 source、unset env、清理低优先级重复项）、敏感字段 value-omission 提示和数组字段 replace-not-append 提示。**（2026-06-27）跨 base/profile/env 的完整 source diagnostics 矩阵已落地**（覆盖链 + 每字段来源图 + 数组元素 + 各源 warning，`source_diagnostics_*` 单测锁定，含 canonical 单字段三源矩阵用例），且在不构造完整 `AppContext` 的情况下报告；仅更多坏输入场景为增量补充。
-18. 保持已实现的 `config secret ref/set/check` 行为：允许后置可迁移凭据（`mail.password`、`notification.slack.webhook_url`、`notification.webhook.token`、`object_storage.s3.access_key_id`、`object_storage.s3.secret_access_key`，见 `SUPPORTED_SECRET_FIELDS`），继续拒绝 database/redis 引导凭据；写入/检查路径必须位于受控 `config/<profile>/...` namespace（如 `config/<profile>/mail/password` 或 `config/<profile>/object_storage/access_key_id`），错误诊断不回显实际 vault path。
+18. 保持已实现的 `config secret ref/set/check` 行为：允许后置可迁移凭据（`mail.password`、`redis.url`、`notification.slack.webhook_url`、`notification.webhook.token`、`object_storage.s3.access_key_id`、`object_storage.s3.secret_access_key`，见 `SUPPORTED_SECRET_FIELDS`），继续拒绝 database 引导凭据；写入/检查路径必须位于受控 `config/<profile>/...` namespace（如 `config/<profile>/mail/password`、`config/<profile>/redis/url` 或 `config/<profile>/object_storage/access_key_id`），错误诊断不回显实际 vault path。
 
 > **验收标准**：`monoengine config init` 可在无配置目录下运行并生成样例，且生成结果可解析、可校验、无明文密码字段；`config validate` 能在坏配置时输出诊断而非被预加载拦截；`config secret ref/set/check` 的既有测试继续通过。
 
@@ -807,7 +807,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 
 23. ✅ **已落地**：`object_storage.s3.access_key_id`/`secret_access_key` 现可配置为 `vault://` SecretRef。
 24. ✅ 采用更低风险的等效方案：未拆 `Storage::new` 本身，而是在 `AppContext::new` 用 **DB-only `VaultCore::from_database_connection` bootstrap**（只需一个共享 DB 连接，不需要完整 `Storage`，从而打破“vault↔storage↔对象存储凭据”的循环）→ `resolve_object_storage_secrets` 解析对象存储凭据中的 SecretRef → `build_object_storage` → `Storage::new_with_connection`（复用同一连接）。字面量凭据原样透传，env/IAM 部署不受影响。
-25. 其它早期字段（Redis、Orion 等）暂未迁移为 SecretRef；如需迁移，沿用同一 post-vault 解析模式并确认失败语义可接受。
+25. ✅ **已落地（2026-06-28）**：`redis.url` 现可配置为 `vault://` SecretRef，由 `AppContext::new` 中的 `resolve_redis_url_secret` 在 vault 就绪后解析；`config validate`/`config secret set/check`/`--resolve-secrets` 已对齐合法 namespace `vault://secret/config/<profile>/redis/url#<field>`。其它早期字段（Orion 等）暂未迁移为 SecretRef；如需迁移，沿用同一 post-vault 解析模式并确认失败语义可接受。
 
 > **验收标准**：✅ 服务启动链路中对象存储在 vault 就绪后构造；SecretRef 解析失败返回可诊断错误（不泄露值），不影响 `config secret set/check` 对其他 secret 的操作；字面量凭据路径行为不变。单测 `src/context/mod.rs::tests` 覆盖字面量透传与 SecretRef 解析。
 
@@ -886,8 +886,8 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
    - 不把 Vault fail-closed、root token 脱敏、runtime token、audit hook 当作待办前置。
 
 3. **确认敏感字段边界**
-   - 当前经 `config validate`/`--resolve-secrets` 支持的配置侧 Vault SecretRef 包括 `mail.password_ref`、`notification.slack.webhook_url_ref`/`notification.webhook.token_ref`，以及对象存储 `object_storage.s3.access_key_id`/`secret_access_key`（2026-06-28 已对齐 validate/CLI/`--resolve-secrets`）；`config secret set/check` 支持 `mail.password`、`notification.slack.webhook_url`、`notification.webhook.token`、`object_storage.s3.access_key_id`、`object_storage.s3.secret_access_key`（见 `SUPPORTED_SECRET_FIELDS`）。`config validate --show-sources` 与 source diagnostics 已把上述 SecretRef 字段（含 `notification.*_ref`）作为敏感字段处理，诊断输出中不回显其实际 Vault 路径。
-   - database、redis 凭据继续走 TOML/env/部署平台 secret；对象存储 S3 凭据已支持 `vault://` SecretRef，合法 namespace 为 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../object_storage/secret_access_key#<field>`，字面量凭据原样透传。
+   - 当前经 `config validate`/`--resolve-secrets` 支持的配置侧 Vault SecretRef 包括 `mail.password_ref`、`redis.url`、`notification.slack.webhook_url_ref`/`notification.webhook.token_ref`，以及对象存储 `object_storage.s3.access_key_id`/`secret_access_key`（2026-06-28 已对齐 validate/CLI/`--resolve-secrets`）；`config secret set/check` 支持 `mail.password`、`redis.url`、`notification.slack.webhook_url`、`notification.webhook.token`、`object_storage.s3.access_key_id`、`object_storage.s3.secret_access_key`（见 `SUPPORTED_SECRET_FIELDS`）。`config validate --show-sources` 与 source diagnostics 已把上述 SecretRef 字段（含 `notification.*_ref`）作为敏感字段处理，诊断输出中不回显其实际 Vault 路径。
+   - database 凭据继续走 TOML/env/部署平台 secret；**Redis URL 已支持 `vault://` SecretRef，合法 namespace 为 `vault://secret/config/<profile>/redis/url#<field>`，字面量 URL 原样透传**；对象存储 S3 凭据已支持 `vault://` SecretRef，合法 namespace 为 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../object_storage/secret_access_key#<field>`，字面量凭据原样透传。
    - 对象存储的初始化顺序重构（`AppContext::new` 的 DB-only vault bootstrap）已落地，启动路径、`config validate`、`config secret set/check`、`config validate --resolve-secrets` 均已支持 object_storage 的 `vault://` SecretRef。
 
 4. **确认验证环境**
@@ -946,7 +946,7 @@ secret 真实值的解析是后续独立异步阶段，发生在 `AppContext`/va
 ### 实施前快速检查清单（建议每个阶段开始前核对）
 
 - [x] 已完整阅读“事实校准” + “当前实现状态速览表” + “硬约束”三部分。
-- [x] 已确认本次阶段**不会**尝试把数据库/Redis/当前 object storage 凭据做成 SecretRef。
+- [x] 已确认本次阶段**不会**尝试把数据库凭据做成 SecretRef；Redis URL 与 object storage 凭据已支持 `vault://` SecretRef。
 - [x] 已确认本次阶段**不会**在 `Config::new` 内部调用 vault 或做异步 secret 解析。
 - [x] 已确认不会重复实现 `LoadMode`、`config secret`、`SecretRef`、`mail.password_ref` 或 Vault fail-closed。
 - [x] 如果涉及 `mail`，已把工作聚焦在明文兼容治理、SecretString/redaction、source diagnostics 或 dispatcher 生命周期。

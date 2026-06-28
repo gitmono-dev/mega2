@@ -127,7 +127,7 @@ Config::new
 
 - `database.db_url` / 数据库密码属于引导配置，不能进入本项目 vault。
 - `object_storage.s3.access_key_id` / `secret_access_key` 在 DB-only vault bootstrap 后解析，已支持 `vault://` SecretRef；namespace 为 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../object_storage/secret_access_key#<field>`，且已在 `config validate` / `config secret set/check` / `--resolve-secrets` 中对齐。
-- `redis.url` 在 vault 就绪后连接，因此从启动顺序上已具备迁移条件；当前仍读取明文配置，是否迁移到 vault 由后续计划决定。
+- `redis.url` 在 vault 就绪后连接，因此从启动顺序上已具备迁移条件；**已支持 `vault://` SecretRef（2026-06-28）**，由 `AppContext::new` 中的 `resolve_redis_url_secret` 解析，合法 namespace 为 `vault://secret/config/<profile>/redis/url#<field>`，且已在 `config validate` / `config secret set/check` / `--resolve-secrets` 中对齐；字面量 URL 原样透传。
 - `mail.password` 的消费晚于 vault 就绪；当前在 `AppContext::new` 中构造 `SmtpMailer` 并启动 `EmailDispatcher`，是第一批较合理的可迁移凭据。
 - `config secret set/check`、`config validate --resolve-secrets` 不能复用完整 `AppContext`，必须使用最小 DB/Vault bootstrap。
 
@@ -401,8 +401,8 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 | 字段 | 当前消费点 | 分类 | 迁移结论 |
 | --- | --- | --- | --- |
 | `database.db_url` / 数据库密码 | `Storage::new` 建库连接 | 引导配置 | 不能进本项目 vault；通过 TOML/env/部署平台 secret 提供 |
-| `redis.url` | `AppContext::new` 中 vault 前连接 Redis | 早期运行时依赖 | 暂时不能进本项目 vault；若含密码应走部署平台 secret 并脱敏日志 |
-| `object_storage.s3.*` | `Storage::new` 中 vault 前构造对象存储 | 早期运行时依赖 | 暂时不能进本项目 vault；需先重构初始化顺序 |
+| `redis.url` | `AppContext::new` 中 vault 后 `resolve_redis_url_secret` → `init_connection` | 早期运行时依赖 | **已支持 `vault://` SecretRef（2026-06-28）**；合法 namespace 为 `vault://secret/config/<profile>/redis/url#<field>`；字面量 URL 原样透传，含密码时日志必须脱敏 |
+| `object_storage.s3.*` | `AppContext::new` 中 DB-only vault bootstrap 后 `resolve_object_storage_secrets` → `build_object_storage` | 早期运行时依赖 | **已支持 `vault://` SecretRef**；合法 namespace 为 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../secret_access_key#<field>`；字面量凭据原样透传 |
 | `orion_server.db_url` | Orion 相关配置 | 引导或独立服务配置 | 不默认纳入 monoengine vault；按 Orion 启动依赖单独判断 |
 | `mail.password` | `AppContext::new` 中 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher` | 可迁移凭据 | 第一批已改为支持 `SecretRef`；构造失败已从静默忽略改为可诊断处理 |
 | `ssh_server_key` | SSH server 启动时读取或生成 | vault 内部 secret | 已由 vault 管理；读取、生成和写入失败已返回可诊断错误；剩余重点是部署侧 key material 托管 |

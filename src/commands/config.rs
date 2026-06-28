@@ -28,9 +28,10 @@ const MAIL_PASSWORD_FIELD: &str = "mail.password";
 /// Config-managed secret fields that may be stored in the monoengine vault, with
 /// the vault namespace suffix each must use (`config/<profile>/<suffix>`). Only
 /// these fields are accepted by `config secret set/check/rotate/ref`. Database
-/// and Redis credentials remain intentionally excluded — they are bootstrap
-/// dependencies that must stay in deployment/environment secrets. Object-storage
-/// S3 credentials may now be vault-backed and are resolved post-vault bootstrap.
+/// credentials remain intentionally excluded — they are a bootstrap dependency
+/// that must stay in deployment/environment secrets. Redis URLs and
+/// object-storage S3 credentials may now be vault-backed and are resolved
+/// post-vault bootstrap.
 const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
     (MAIL_PASSWORD_FIELD, "mail/password"),
     (
@@ -38,6 +39,7 @@ const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
         "notification/slack/webhook_url",
     ),
     ("notification.webhook.token", "notification/webhook/token"),
+    ("redis.url", "redis/url"),
     (
         "object_storage.s3.access_key_id",
         "object_storage/access_key_id",
@@ -961,6 +963,34 @@ mod tests {
         assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
         assert!(message.contains("value is redacted"));
         assert!(!message.contains("config/prod/database/password"));
+    }
+
+    #[test]
+    fn secret_ref_from_args_accepts_redis_url_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from(["ref", "redis.url", "--vault-path", "config/prod/redis/url"])
+            .unwrap();
+
+        let secret_ref = secret_ref_from_args(&matches).expect("redis.url ref should be accepted");
+        assert_eq!(secret_ref.secret_name(), "config/prod/redis/url");
+    }
+
+    #[test]
+    fn secret_ref_from_args_rejects_redis_url_outside_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "redis.url",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+        assert!(message.contains("redis.url"));
+        assert!(message.contains("redis/url"));
+        assert!(!message.contains("config/prod/mail/password"));
     }
 
     #[test]
