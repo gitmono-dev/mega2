@@ -62,8 +62,8 @@
 | 用户偏好与事件类型管理          | 存储层存在，用户 API + admin 事件类型 API 首批落地 | 支持 upsert、should_send、list prefs 等。用户自助 API 已支持查询当前用户 settings/event prefs/effective 状态，并更新 global enabled、delivery_mode、preferred_locale、批量或单个 event preference；admin-only 事件类型 API 已支持 list/upsert。仍缺更完整 mega DTO 兼容面和审计能力。触发器仍会在首次使用时 upsert 核心事件类型。 |
 | 与 mail 模块的集成              | **已就绪（前提）** | Dispatcher 构造需要 post-vault 的 mailer（见 mail.md 和 config.md 阶段 5）。当前 mail 激活后，类型上可链接，但时机未在启动路径中强制。 |
 | 后台任务启动与生命周期          | **已基础接入，HTTP 关停已协调** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher；HTTP server 的 graceful shutdown 广播会同时取消该 token。仍需完善 dispatcher 任务失败诊断、退避和多实例语义。 |
-| 多渠道支持（email 之外）        | **抽象 + in-app 持久化渠道已落地** | `NotificationChannel` trait + `EmailChannel`（主，含 `ArcSwap` 动态 mailer 热替换）+ `InAppChannel`（写 `user_inbox_notifications`）+ `NotificationService` 协调器已落地。dispatcher 在 email 主投递成功后扇出到 secondary 渠道（in-app）。webhook、slack（参考 campsite slack.ts）渠道仍为后续。 |
-| SecretRef / 渠道凭据            | **仅规划**        | Email 渠道的 password 走 mail 的 SecretRef（config 阶段 5）。未来 slack token 等需类似 vault 集成。 |
+| 多渠道支持（email 之外）        | **已实现** | `NotificationChannel` trait + `EmailChannel`（主，含 `ArcSwap` 动态 mailer 热替换）+ `InAppChannel`（写 `user_inbox_notifications`）+ `SlackChannel`（webhook URL 经 SecretRef 解析）+ `WebhookChannel`（可选 `token_ref`，如配置则经 SecretRef 解析）（`src/notification/channels/{slack,webhook}.rs`）+ `NotificationService` 协调器已落地。注：secondary 渠道当前随 `[mail]` 段在 `AppContext::new` 中构造，因此需要配置 `[mail]`；slack/webhook 在此前提下再按各自 `enabled` 开关、于 vault 就绪后构造。dispatcher 在 email 主投递成功后扇出到 secondary 渠道（in-app/slack/webhook），webhook 扇出有 `service_start_fans_out_delivery_to_webhook_channel` 端到端单测。 |
+| SecretRef / 渠道凭据            | **已实现**        | Email 渠道的 vault 托管 SMTP 凭据走 mail 的 `password_ref`（兼容期明文 `mail.password` 仍支持但已弃用）；`notification.slack.webhook_url_ref`（slack 启用时必填）与可选的 `notification.webhook.token_ref`（如配置）经 `VaultSecretResolver` 在 vault 就绪后解析（`src/context/mod.rs`，含 `with_audit_caller` 注入），实现配置与秘密分离。Slack/Webhook 渠道凭据当前在启动期解析、运行期热加载为后续；Email 的 `mail.password_ref` 已支持在 mailer 热重建时重新解析（见 mail.md 阶段 4）。 |
 | API 模型与用户设置端点          | 部分（管理面 + 用户偏好首批） | callisto 实体完整；admin-only 邮件作业 list/stats/failed retry/prune/attachment metadata/download/delete/retention prune API 已落地，且附件 retention prune 可按 username/event type 收窄；dispatcher 已支持配置化自动附件保留清理；admin-only 模板 list/preview/upsert API 已落地，可审计内置/外部模板、来源路径和覆盖关系，并持久化外部 TOML 覆盖项；admin-only 事件类型 list/upsert API 已落地。用户端 `/user/notification/preferences` 首批已支持列表、settings 更新、批量 preference 更新和单 event 更新；仍缺更完整 mega DTO 兼容面与审计/批量运维控制。 |
 | 与 Config / 全局设置            | **已接入全局层** | per-user 偏好仍在 DB；`Config.notification`（`NotificationConfig`：全局 `enabled` kill switch、`default_delivery_mode`、`default_locale`）已接入加载/校验/热加载。`notification.enabled` 与 `mail.enabled` 取与门控 dispatcher。rate limit 等更多全局项为后续。 |
 | Profile / 热加载 / 集中校验     | **未实现**        | 依赖 config 模块能力。通知事件类型或全局模板可能需要校验。 |
@@ -87,7 +87,7 @@
 - **用户同意优先**：通过 user_notification_settings（全局 enabled + delivery_mode + email + preferred_locale）和 user_notification_preferences（per-event override） + `should_send` 实现。system_required 事件可强制。
 - **渠道抽象**：当前 EmailDispatcher 硬绑定 mail。未来需 `NotificationChannel` trait（send(notification)），由多渠道 dispatcher 协调。
 - **事件注册与扩展**：notification_event_types 作为 registry。触发器负责 ensure + enqueue；新事件类型应通过 API 或迁移注册。
-- **与 Config/Vault/Mail 深度集成**：通知配置（若有全局项）走 Config 管道；渠道凭据（email password 经由 mail，未来 slack token 等）走 SecretRef + resolver；构造点必须 post-vault。
+- **与 Config/Vault/Mail 深度集成**：通知配置（全局项）走 Config 管道；渠道凭据（email password 经由 mail，slack/webhook 经各自 SecretRef）走 SecretRef + resolver；构造点必须 post-vault。
 - **可观测与诊断**：投递结果写回 jobs 表；错误脱敏（不泄露邮箱内容到不必要日志）；支持 tracing。
 
 ### 主要组件关系（设计目标）
@@ -158,16 +158,27 @@ NotificationService / Coordinator (一级 notification 模块核心)
 - 与 callisto 实体共享（mega/monoengine 可互操作数据）。
 - Email 渠道已结构化对接一级 mail 模块（为 SecretRef 试点做好准备）。
 
-## 现有约束与 Vault / 引导问题（必须显式承接）
+## 硬约束与不可违反的原则
 
-直接继承 config.md 和 mail.md 的硬约束：
+直接继承 config.md 和 mail.md 的硬约束；以下为硬边界，任何实现偏离都必须重新评审：
 
-- **投递渠道的凭据消费点必须晚于 vault**。Email 依赖 mail.password（未来 SecretRef）；未来 slack/push 渠道很可能需要 token/key，必须走相同 resolver 路径。
+- **投递渠道的凭据消费点必须晚于 vault**。Email 的 vault 托管 SMTP 凭据走 `mail.password_ref`（兼容期明文 `mail.password` 仍支持但已弃用），slack/webhook 走各自的 SecretRef（`slack.webhook_url_ref` 必填、`webhook.token_ref` 可选，均已落地），都必须经相同的 vault resolver 路径并在 vault 就绪后解析；新增需要 token/key 的渠道同样适用。
 - **config secret 家族命令** 必须用最小 DB/Vault bootstrap 操作 notification 相关 secret（如果有），不能初始化完整 dispatcher 或 mailer。
 - **PII 与同意**：to_email、body 包含用户数据；必须通过 prefs 尊重 enabled 状态；发送前最好有额外审计。
 - **当前 NotificationStorage 直接暴露 DB**：业务层可 bypass prefs（触发器目前做了正确检查，但不是强制）。
 - **事件类型一致性**：跨部署的 event code 必须稳定；upsert 策略在并发/迁移时有风险。
 - **与 mail 模块的强依赖**：mail 未就绪（或未 late 构造），email 通知就无法投递。config.md 阶段 5 的 mail 工作是 notification email 渠道的前置。
+
+## 现状与目标对比
+
+| 维度 | 当前状态 | 目标状态 | 实现难度 |
+|-----|--------|--------|--------|
+| **模块化与组织** | `notification/` 一级模块 + `NotificationService` 协调层已落地，存储逻辑下沉到 jupiter | 进一步收窄 `NotificationStorage` 直接暴露 DB 的面，强制 prefs 检查 | 中等 |
+| **渠道实现** | email/in-app/slack/webhook 多渠道经 `NotificationChannel` trait 落地，dispatcher 扇出 secondary 渠道 | 按需扩展更多渠道（如移动推送）、Slack 富文本 block | 中等 |
+| **依赖注入与启动时序** | Service 接收已构造 mailer + post-vault 解析的 slack/webhook 凭据，启动顺序显式（enqueue 早、delivery 晚于 vault+mail） | 渠道凭据运行期热加载（当前重启生效） | 中等 |
+| **用户偏好与 API** | 用户端 settings/preference 查询/更新首批 + admin 事件类型/邮件作业/模板/附件治理 API 已落地 | 更完整 mega DTO 兼容面、批量运维与审计控制 | 中等 |
+| **安全与凭据管理** | email `password_ref` + `slack.webhook_url_ref` + `webhook.token_ref` 均走 SecretRef + `VaultSecretResolver`，post-vault 晚绑定 | 渠道凭据热加载；更细的 PII 脱敏与发送前审计 | 复杂 |
+| **可靠性与可观测性** | outbox + 指数退避 retry + dead-letter（含 `notification_alert` 告警）+ claim 竞争防护 + 脱敏日志已落地 | 分布式多实例故障矩阵、prometheus 风格指标导出、profile 级默认事件/渠道差异化 | 复杂 |
 
 ## Notification 模块的改进方案（一级模块化 + 多渠道 + 可靠投递）
 
@@ -233,7 +244,7 @@ Config::new
 
 对于 `config validate --resolve-secrets` 等运维命令：可构造最小 Service（仅 DB + vault）来验证渠道配置可解析/可发送测试通知，而不启动真实 tick 任务。
 
-## 迁移步骤（分阶段，强绑定 config/mail/vault 阶段）
+## 迁移步骤（分阶段）
 
 > **与 config/mail/vault 的强绑定（2026-06-14 更新）**：notification 的所有后续工作都依赖于前置模块的完成：
 > - **阶段 0/1** 需要 mail.md 的阶段 0/1 完成（已满足）+ config.md 阶段 0b 的脱敏工具（用于日志脱敏）
@@ -258,7 +269,7 @@ Config::new
 - ✅ 引入 `NotificationService`（`src/notification/service.rs`）作为多渠道协调器：持有 `NotificationStorage` + `Vec<Arc<dyn NotificationChannel>>`（默认 email + in-app；console dry-run 可作为 extra channel 注册）+ `EmailDispatcherControl`，`start(shutdown)` 驱动 email outbox dispatcher 并 fan-out 到 secondary channels，`channels()`/`channel_for(name)`/`control()` 暴露注册表与控制句柄。`AppContext::new` 已改为构造 `NotificationService::from_mail_config` 并 `start`，reload subscriber 仍经 `service.control()` 注册。
 - email 渠道的 `password_ref` 支持已由 config 阶段 5 + mail 阶段 2 落地（resolver 在 `AppContext::new` 中解析）。
 - 验收：渠道注册表可容纳多渠道并按名解析（`service_registers_email_and_extra_channels`）；email outbox 经渠道抽象端到端投递并随 shutdown 停止（`service_start_delivers_email_outbox_then_stops_on_shutdown`，对 Postgres 实跑）。
-- 剩余：email_jobs outbox 目前为 email-only；in-app 持久化渠道已作为 secondary channel 注册并在 email 主投递成功后 fan-out，console dry-run 原型可作为 extra channel 注册；真实多 outbox/渠道列路由与 slack/webhook 凭据渠道仍为后续阶段（阶段 3/4）。
+- 剩余：email_jobs outbox 目前为 email-only；in-app 持久化渠道已作为 secondary channel 注册并在 email 主投递成功后 fan-out，console dry-run 原型可作为 extra channel 注册；slack/webhook 凭据渠道已落地（post-vault 经 SecretRef 解析后注册并参与 fan-out）；真实多 outbox/渠道列路由仍为后续阶段。
 
 **阶段 2（用户偏好 API 表面，完整移植 mega 能力）**：
 - 已完成首批 API DTOs（带 utoipa）：当前用户 notification settings response、event preference response、update request/response，并复用 `UpdateUserNotificationConfig` 作为批量更新请求；admin 事件类型管理复用 `NotificationEventTypeInfo`。
@@ -296,7 +307,7 @@ Config::new
 - ✅ **CI 覆盖**：`.github/workflows/config-validation.yml` 已新增 redis/mailpit 启动、`::add-mask::` 凭据脱敏与 dispatcher/triggers/service 集成测试步骤（见 integration.md）。
 - 剩余：Profile 级默认事件/渠道差异化、凭据变更走 resolver 失效（依赖动态 mailer 重建，见 mail 阶段 4 残留）、与 campsite slack 等外部集成深化、README/部署指南/事件类型目录文档同步。
 
-### 前置依赖矩阵（2026-06-14 更新）
+## 前置依赖矩阵
 
 | notification 阶段 | 主要工作 | 对 config 的依赖 | 对 vault 的依赖 | 对 mail 的依赖 |
 |------------|--------|------------|-----------|-----------|
@@ -365,13 +376,20 @@ Notification 是 monoengine 事件驱动用户体验的重要组成部分（评�
 - 本文档 + `config.md` 的「事实校准」「当前实现状态速览表」「硬约束」「secret 解析的依赖顺序」「实施前快速检查清单」。
 - `mail.md`（email 渠道的具体设计与阶段）。
 
-预期收益：可靠的多渠道通知、用户可控的偏好、与凭据管理（vault/SecretRef）的一致集成、易于扩展新事件和新渠道，同时保持与 mega 生态的兼容性。
+## 预期收益
+
+- **可靠的多渠道通知**：email/in-app/slack/webhook 多渠道经统一 `NotificationChannel` 抽象投递，outbox + 指数退避 retry + dead-letter（含 `notification_alert` 告警）降低通知丢失风险。
+- **用户可控的通知偏好**：用户自助 API 支持 global enabled、delivery mode、preferred locale 与 per-event override；触发器按 prefs 过滤收件人，尊重用户同意。
+- **统一的渠道凭据管理**：email `password_ref`、`slack.webhook_url_ref`、`webhook.token_ref` 均走 Vault SecretRef + resolver，在 vault 就绪后晚绑定，实现配置与秘密分离。
+- **清晰的模块化与扩展边界**：一级 `NotificationService` 协调层 + `NotificationChannel` trait，使新增事件、渠道与集成的改造面可控。
+- **可观测与诊断**：日志脱敏降低 PII/凭据泄露风险、dead-letter 告警、storage 级 claim 竞争防护，并有端到端扇出测试覆盖。
+- **与 mega 生态兼容**：实体模型、存储 API 与用户偏好逻辑（`should_send`）与 mega 共享，便于后续多引擎互操作与平滑迁移。
 
 ---
 
 **参考资料与对齐**：
 - mega 项目：`mono/src/notification/{dispatcher,triggers}.rs`、`jupiter/src/storage/notification_storage.rs`、`jupiter/callisto/src/{email_jobs,notification_event_types,user_notification_*.rs}`、`ceres/src/model/notification.rs`（API DTOs）、触发器在业务层的调用模式。
-- campsite 项目：用户源（邮箱、身份）、前端通知 UI 组件、slack 集成配置（作为未来 slack 渠道的参考模式）。
+- campsite 项目：用户源（邮箱、身份）、前端通知 UI 组件、slack 集成配置（作为 slack 渠道富文本/集成模式增强的参考）。
 - monoengine 当前（读取时）：`src/notification/*`（部分移植，已通过 `mod notification;` 激活）、`src/jupiter/storage/notification_storage.rs`（完整）、`src/callisto/` 对应实体、`src/mail/`（作为 email 渠道前置，按 mail.md 设计）。
 - 强依赖文档：`config.md`（引导循环、SecretRef、mail 作为第一试点、CLI LoadMode、最小 bootstrap、vault 加固等全部前置）、`mail.md`（email 渠道的 late 构造与 SecretRef 迁移计划）。
 
