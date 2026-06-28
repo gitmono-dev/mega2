@@ -8,6 +8,10 @@
 
 > **仓库格式说明（2026-06-16）**：当前工作副本由 **Libra** 管理，不是传统 `.git` 工作树。执行、评审或核对本计划时，应使用 `libra status`、`libra diff -- <path>`、`libra add` 等 Libra 命令检查工作区状态与差异；不要把 `git status` / `git diff` 失败误判为“不是仓库”。本文中“Git 协议 / Git 托管 / 不进入 git”描述的是 monoengine 的业务域和兼容目标，不代表当前开发工作区必须由 Git 管理。
 
+## 事实校准（2026-06-27）
+
+> 本文档中的代码引用已对照当前 `src/`（含 `src/contract/vault/integration/`、`src/vault` vendored 源码、`src/context/mod.rs`、`src/commands`）重新核对。以下校准说明（依赖迁移、落地可行性、落地状态更新）按时间顺序记录与早期草案不一致的事实，后续执行以本节、下方「当前实现状态速览表」和「硬约束与不可违反的原则」为准，不要按旧阶段重复实现。
+
 > **依赖迁移修订（2026-06-15，2026-06-17 路径与模块更新）**：`libvault-core`（crates.io `0.1.0`）已替换为仓库内 vendored 的 RustyVault 源码模块（`src/vault/` 目录，作为 monoengine 顶层 module 编译，不再作为独立 path dependency）。新依赖的能力面与旧版不同，本文相关阶段已据此核查与修订，主要影响：
 > - **阶段 I（root token 退役 / 最小权限）**：libvault 已原生提供 ACL policy（`modules/policy`，`sys/policy/{name}`）与非 root token（`modules/auth/token_store.rs`，`auth/token/create`），本阶段从"自建授权体系"改为"接入并编排内建能力"——可行性提升。
 > - **阶段 H（审计）**：libvault 的 `sys/audit` 仅为桩实现（handler 返回 `Ok(None)`，见 `modules/system/mod.rs:883-905`），审计须在收窄后的 `VaultCoreInterface` 上做 hook，**不能**依赖内建审计设备。
@@ -74,6 +78,33 @@
 | secret 访问审计 | 已接 hook，可配置且默认开启，失败策略已记录，含 caller 身份 | `VaultCoreInterface` read/write/delete 记录 `vault_audit` 事件（含 `operation`、`secret_name`、`outcome`、`caller`），不包含 secret 值、root token 或分片；`audit_secret_access` 已 doc-comment 显式记录 fail-open 策略（审计经 infallible 的 `tracing`，绝不阻断 secret 操作）；caller 身份经 `tokio::task_local!`（`with_audit_caller`）由入口点注入（`config secret set/check/rotate`、`config validate --resolve-secrets`、startup/reload 的 `mail.password_ref` 解析），未注入时为 `"unknown"`；`config.vault.audit.enabled`（默认 `true`，经 `VaultCore::with_audit_config` 注入）可显式 opt-out。**（2026-06-27）可配置审计 sink 已落地**：`config.vault.audit.sink` 支持 `tracing`（默认，infallible）与 `file`（`file_path` 指定的持久化 append-only JSONL，每条 `sync_all` fsync，独立于进程日志管道），并新增 `config.vault.audit.fail_closed`：当可失败 sink（`file`）写入失败时，`true` 让 secret 操作随之失败（non-repudiation over availability），默认 `false`（fail-open，仅告警不阻断）。`audit_secret_access` 已返回 `Result`，read/write/delete 在操作本身成功时才把 fail-closed 审计错误上抛。文件记录只含 `ts`/`operation`/`secret_name`/`outcome`/`caller`，绝不含 secret 值。 |
 | 最小 DB/Vault bootstrap | 已实现 | `VaultCore::from_database_config/from_database_connection` 和 `config secret set/check` 只依赖数据库和 vault key。 |
 | `LoadMode` / `SecretRef` / resolver | 已实现 | CLI 按命令选择加载级别；`SecretRef`/resolver 支持 `mail.password_ref` 延迟解析和缓存/evict。 |
+
+## 硬约束与不可违反的原则
+
+本文档中以下约束是硬边界，任何实现偏离都必须重新评审：
+
+1. **fail-closed 以 `inited()` 为准，绝不在 key 缺失时清库。** DB 已初始化但 `core_key.json` 缺失时必须返回错误（`VaultError::CoreKeyMissing`，见 `vault_core.rs`），绝不调用 `delete_all()`——否则会静默销毁全部已存 secret；空 DB 无 key 仍允许首次初始化。
+2. **root token、unseal 分片、secret 明文绝不被主动写入日志/输出。** 这些材料一旦泄露即等于 vault 失守；`core_key.json` 只持久化 unseal 分片与限权 runtime token，不再长期保存 root token（初始化后即撤销）。`vault_lifecycle_never_logs_root_token_shares_or_secret_values` 回归测试在初始化任务线程的 `tracing` 路径上守卫这一点；stdout/`log::` facade/vault 后台线程的捕获留白见「风险与约束」。
+3. **常规 secret 访问必须使用限权 token，不得使用 root token。** 初始化时安装 ACL policy 并签发 ssh/pgp/nostr/pki/config/generic 限权 token；config token 与 generic token 必须 ACL 隔离（config token 不能读 generic secret，反之亦然），有矩阵测试。
+4. **vault 运维命令必须使用最小 DB/Vault bootstrap。** `config secret set/check`、`config vault reset/rekey` 只依赖数据库与 vault key 操作 secret；`config validate --resolve-secrets` 会解析并校验完整配置（含 Redis、对象存储等字段的校验规则）并经 vault 解析 secret。三者都**不得初始化** Redis 连接、对象存储后端、完整 `Storage` 或 HTTP 服务（不构造完整 `AppContext`）；缺数据库/vault 时给出明确前置提示而非 panic。
+5. **自动解封材料是静态保护边界，不能用“放进 vault”替代部署侧托管。** 自动解封所需的 unseal 分片仍落在本地 `core_key.json`，能读取该文件的攻击者即可解封。生产高敏感部署必须配套 KMS/secret manager、受控挂载（Unix `0700`/`0600`）、备份恢复与恢复演练；备份恢复运行手册必须与 fail-closed 配套（否则 key 丢失从“自动重建”变成“无法恢复”）。
+6. **KEK 轮换无 libvault 内建原语，不在本计划承诺。** `init()` 后 KEK 不可变；unseal 分片 rekey（`rekey_unseal_shares`）可用，但彻底使旧分片失效需 KEK 轮换，须另立专项。
+7. **任何源码阶段都必须通过三项 gate。** `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全绿方可交付；禁止 blanket `#[allow]` 掩盖。
+
+## 现状与目标对比
+
+| 维度 | 当前状态 | 目标状态 | 实现难度 |
+|-----|--------|--------|--------|
+| 错误模型 | `VaultCore::new/config` 已 Result 化，消费端（context/ssh/pgp/nostr/pki）错误传播 | 持续保持无 panic 初始化路径 | 中等 |
+| fail-closed | DB inited 但 key 缺失返回错误、绝不清库；空 DB 可首次初始化 | 配套备份恢复运行手册，覆盖 key 丢失场景 | 中等 |
+| 敏感输出脱敏 | root token/分片/secret 明文不进 `tracing` 日志，有回归测试守卫 | 扩展捕获边界（stdout/`log::` facade/后台线程）需全局 subscriber 或 fd 捕获 | 复杂 |
+| 物理后端边界 | `JupiterBackend` 依赖 `VaultBackendStorage` trait，可 DB-only 构造 | 维持窄接口，避免重新耦合完整 `Storage` | 简单 |
+| 接口收窄 | `read/write/delete_secret` 用校验过的 `SecretName`，raw/token API 已 `pub(in crate::contract::vault)` 收窄 | 持续防止 raw API 外泄 | 简单 |
+| 最小 bootstrap | `from_database_config/connection` + `config secret/vault` 命令已落地 | 维持运维命令不依赖完整 `AppContext` | 简单 |
+| 权限与 root token | 初始化签发限权 token、撤销 root；config/generic ACL 隔离有矩阵测试 | 保持迁移更多生产凭据前 root 已退役 | 中等 |
+| 审计 | read/write/delete 记录 `vault_audit`（operation/secret_name/outcome/caller），sink 支持 tracing/file，可 `fail_closed`，默认开启 | 远程/HTTP sink 为后续 | 中等 |
+| SecretRef 消费 | `mail.password_ref`、notification slack/webhook、对象存储凭据 SecretRef 已落地，post-vault 解析 | 渠道凭据运行期热加载（mail 已支持，slack/webhook 为后续） | 中等 |
+| 轮换与 rekey | `config vault rekey` 重写 unseal 分片；`config secret rotate` 覆写可迁移 secret | KEK 轮换需专项（无 libvault 原语） | 复杂 |
 
 ## 启动依赖顺序
 
@@ -558,7 +589,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 10. secret 访问可审计：read/write/delete 留下不含明文的审计记录。
 11. 每个阶段都应独立可编译、可测试、可回滚。
 
-## 分阶段计划
+## 迁移步骤（分阶段）
 
 > **阶段依赖声明（2026-06-15 修订）**：本计划不再把所有阶段统一挂到同一组跨模块前置上。执行时按以下边界处理：
 > 1. **vault-only 阶段**：A 核心、B、C、F 可在当前仓库直接执行；H、I 在 C 之后执行；这些工作不等待 redaction、`LoadMode` 或 `SecretRef`。
@@ -871,6 +902,22 @@ Rust 应用接口不再向普通调用方暴露 root token，secret 操作通过
 3. **CLI LoadMode 框架（config 2 与 vault D 协同）**：两个文档需共同设计而非分别实施。
 4. **config 5 + mail 2 → vault E**：`SecretRef` 和 `mail.password_ref` 必须等 resolver 与 mail 侧消费形态就绪后再落地。
 
+## 前置依赖矩阵
+
+本文档各阶段与其他文档/能力的依赖关系如下（详见上文「跨模块协同前置」）：
+
+| 本文档的工作 | 对其他文档的依赖 | 类型 | 关键同步点 |
+|-----------|-------------|-----|---------|
+| A 安全止血（Result 化、fail-closed、权限、敏感不输出） | 无（vault-only，可立即推进） | 前置 | 删除敏感输出不依赖 redaction 模块 |
+| A 脱敏（需保留输出时） | config.md redaction（`src/config/redaction.rs`） | 协同 | redaction 已落地，供需要保留的 URL 日志使用 |
+| B 最小 bootstrap | 无（vault-only） | 前置 | config 阶段 3 的最小 bootstrap 直接复用本能力 |
+| C 接口收窄 | 无（vault-only） | 前置 | H 审计 hook 接在收窄后的 interface 上 |
+| D/E CLI 与 SecretRef | config.md LoadMode、SecretRef/resolver | 后置 | 与 config 阶段 2/5 共用 LoadMode，mail 作为首个消费者 |
+| G 对象存储凭据 SecretRef | config.md 对象存储后置初始化 | 协同 | DB-only vault bootstrap 后解析对象存储 SecretRef（启动路径，validate/CLI 未对齐） |
+| H 审计 | 收窄后的 `VaultCoreInterface`（C） | 后置 | 走 interface hook，不依赖 libvault 桩审计设备 |
+| I root token 退役 | libvault ACL policy / token（内建） | 前置 | 编排内建能力，迁移更多凭据前完成 |
+| J 轮换/rekey | libvault unseal rekey（内建） | 部分 | 分片 rekey 可用；KEK 轮换无内建原语，须另立专项 |
+
 ## 推荐优先级
 
 | 优先级 | 工作 | 原因 | 前置 |
@@ -1001,3 +1048,47 @@ Rust 应用接口不再向普通调用方暴露 root token，secret 操作通过
 这一步完成前，不建议开始 `SecretRef`、`mail.password_ref` 或对象存储凭据迁移。备份恢复运行手册（P1）应与 fail-closed 同期或紧随其后落地——否则 fail-closed 会把“key 丢失”从“自动重建”变成“无法恢复”。审计（阶段 H）与 root token 退役（阶段 I）应在迁移更多生产凭据前完成，以满足 Vault 安全标准。
 
 **与本次任务的边界说明**：2026-06-16 的本次变更**仅修改了本规划文档**（插入可行性分析小节、更新日期/边界表述、强化 AGENTS 门禁与实施提示），**未改动任何 src/ 代码、Cargo.toml、测试或配置**。文档修订本身不触发构建/测试门禁，但为未来真实落地提供了经核查的执行依据。后续任何实际编码任务必须独立开启、独立评审、独立通过三大门禁。
+
+## 风险与约束
+
+- **风险：自动解封材料落盘。** unseal 分片存于本地 `core_key.json`，磁盘读取攻击者可解封。
+  - 影响：vault 静态机密性取决于文件系统访问控制，而非密码学保险箱。
+  - 缓解措施：Unix `0700`/`0600` 权限、部署侧 KMS/受控挂载、备份恢复与恢复演练。
+- **风险：fail-closed 使 key 丢失不可自动恢复。** key 缺失时不再清库重建。
+  - 影响：缺少备份时 key 丢失等于数据不可解。
+  - 缓解措施：备份恢复运行手册必须与 fail-closed 同期落地。
+- **风险：日志脱敏守卫存在已知留白。** 回归测试只捕获本任务线程的 `tracing` 事件。
+  - 影响：stdout/`log::` facade/vault 后台 OS 线程上的潜在泄露不被该单测覆盖。
+  - 缓解措施：评审时人工核对新增日志点；如需彻底覆盖再引入全局 subscriber/fd 捕获。
+- **约束：KEK 轮换无 libvault 内建原语。**
+  - 理由：`init()` 后 KEK 不可变，无 `sys/rotate` 等价能力。
+  - 影响：彻底使旧 unseal 分片失效需另立 KEK 轮换专项；本计划只承诺分片 rekey。
+- **约束：审计 fail-open 为默认。**
+  - 理由：审计经 infallible 的 `tracing` 不阻断 secret 操作（可用性优先）。
+  - 影响：需要 non-repudiation 的部署应显式设 `config.vault.audit.fail_closed = true`（仅对 `file` sink 生效）。
+
+## 改进方案多维评估小结
+
+| 维度 | 评估结论 |
+|-----|--------|
+| **合理性** | **高（9/10）**。准确区分 vault-only 止血队列（A/B/C/F）与跨 config 队列（D/E/G），避免把可立即落地的安全止血误判为被 redaction/LoadMode 阻塞。当前不足：早期文档口径需持续收敛。 |
+| **可行性** | **中高（7.5/10）**。P0/P1 加固已落地，剩余主要为工程化与运维面。改进方向：远程审计 sink 与 KEK 轮换专项评估。 |
+| **完整性** | **较高（8/10）**。覆盖初始化语义、fail-closed、权限、审计、最小 bootstrap、SecretRef、轮换。不足：备份恢复演练与跨平台权限等价机制仍需补。 |
+| **安全性** | **强（8.5/10）**。root token 退役、限权 token、ACL 隔离、敏感不输出、审计可 `fail_closed` 均已落地。残余风险限定为静态解封材料与部署侧托管。 |
+| **功能正确性** | **良好（8.5/10）**。`SecretName` 校验、fail-closed 判定以 `inited()` 为准、限权 token ACL 隔离均有测试。当前不足：跨平台权限语义待补。 |
+| **可靠性与容错性** | **良好（8/10）**。错误传播替代 panic、审计 fail-open/closed 可选、reset/rekey 显式运维命令。改进方向：多实例并发与恢复演练。 |
+| **兼容性** | **良好（8/10）**。vendored libvault 能力面已核查，PKI 域路径已对齐；KEK 轮换缺内建原语已显式声明。 |
+| **可维护性与可扩展性** | **良好（8.5/10）**。`VaultCore`/`VaultCoreInterface` 边界清晰，审计/SecretRef/命令可独立扩展。 |
+
+## 小结
+
+`monoengine` 的 vault 模块已从“可用但有安全缺口”的 KV store 加固为 fail-closed、限权、可审计、可最小 bootstrap 的 secret 后端：`VaultCore` Result 化、key 缺失不清库、root token 退役、限权 token ACL 隔离、敏感材料不进 `tracing` 日志、审计可配置（tracing/file、可 `fail_closed`、含 caller）、`SecretRef` resolver 支撑 mail/notification/对象存储凭据 post-vault 解析，并提供 `config vault reset/rekey`、`config secret set/check/rotate` 运维命令。唯一明确不承诺的是 KEK 轮换（无 libvault 内建原语，须另立专项）。
+
+## 预期收益
+
+- **安全止血闭环**：root token/分片/secret 明文不再主动写入 `tracing` 日志（初始化任务线程有回归测试守卫，捕获边界留白见「风险与约束」），DB inited 但 key 缺失 fail-closed 不再静默清库。
+- **最小权限与隔离**：常规 secret 访问用限权 token，config/generic ACL 隔离有矩阵测试，降低单点凭据失守的爆炸半径。
+- **可审计性**：read/write/delete 记录 `vault_audit`（含 caller），sink 可选 tracing/file，可按需 `fail_closed`，满足 non-repudiation 取舍。
+- **最小 bootstrap 运维**：vault 运维命令不依赖完整 `AppContext`，可在裸机/初始化阶段执行。
+- **SecretRef 基础设施就位**：mail/notification/对象存储凭据可走 vault SecretRef，在 vault 就绪后解析，配置与秘密分离。
+- **可恢复的轮换路径**：unseal 分片 rekey 与可迁移 secret rotate 有显式命令；KEK 轮换边界已明确，避免过度承诺。
