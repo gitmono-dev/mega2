@@ -841,6 +841,14 @@ print_std = true
     );
 
     // 1. 白名单字段变更（log.level）应热生效并输出 reload report。
+    // 先在 info 级别触发一条本会在 debug 输出的日志，确认它当前不存在，避免假阳性。
+    let _ = http_get(port, "/trigger-debug/info/lfs/objects/123");
+    let logs_before = read_log(&stdout_path);
+    assert!(
+        !logs_before.contains("rewrite: old uri"),
+        "info level should suppress debug logs before reload; logs:\n{logs_before}"
+    );
+
     env.write_profile(
         "it",
         r#"
@@ -858,14 +866,13 @@ print_std = true
         logs.contains("\"log.level\""),
         "reload report should list log.level in applied_fields; logs:\n{logs}"
     );
-    let status_line = http_get(port, "/api/openapi.json")
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
+
+    // 通过触发 rewrite_lfs_request_uri 的 debug 日志，证明 level filter 确实已重新加载。
+    let _ = http_get(port, "/trigger-debug/info/lfs/objects/123");
+    let logs_after = wait_for_log_marker(&stdout_path, "rewrite: old uri", Duration::from_secs(15));
     assert!(
-        status_line.contains(" 200"),
-        "service should still respond after whitelisted reload; status: {status_line:?}"
+        logs_after.contains(" DEBUG "),
+        "reloaded level should emit DEBUG lines; logs:\n{logs_after}"
     );
 
     // 2. 非白名单字段变更应被标记为 restart-required，旧配置继续服务。
@@ -889,14 +896,15 @@ import_dir = "/tmp/hot-reload-restart-required"
         logs.contains("restart_required_fields"),
         "reload report should include restart_required_fields; logs:\n{logs}"
     );
-    let status_line = http_get(port, "/api/openapi.json")
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    // 用依赖 monorepo.import_dir 的路由证明旧配置仍在服务：旧 import_dir 为 /third-party，
+    // 请求路径不在其下，因此应返回 true；若 restart-required 值被错误热应用则会返回 false。
+    let clone_response = http_get(
+        port,
+        "/api/v1/tree/path-can-clone?path=/tmp/hot-reload-restart-required/foo",
+    );
     assert!(
-        status_line.contains(" 200"),
-        "service should continue serving old config when restart is required; status: {status_line:?}"
+        clone_response.contains("\"data\":true"),
+        "service should continue using old import_dir when restart is required; response:\n{clone_response}"
     );
 
     // 3. 非法 TOML 应被 watcher 拒绝，服务继续运行。
