@@ -849,11 +849,10 @@ level = "debug"
 print_std = true
 "#,
     );
-    sleep(Duration::from_secs(7));
-    let logs = read_log(&stdout_path);
-    assert!(
-        logs.contains("config reload watcher applied changed config"),
-        "whitelisted log.level change should be applied; logs:\n{logs}"
+    let logs = wait_for_log_marker(
+        &stdout_path,
+        "config reload watcher applied changed config",
+        Duration::from_secs(15),
     );
     assert!(
         logs.contains("\"log.level\""),
@@ -881,15 +880,14 @@ print_std = true
 import_dir = "/tmp/hot-reload-restart-required"
 "#,
     );
-    sleep(Duration::from_secs(7));
-    let logs = read_log(&stdout_path);
-    assert!(
-        logs.contains("restart_required_fields"),
-        "restart-required change should be reported; logs:\n{logs}"
+    let logs = wait_for_log_marker(
+        &stdout_path,
+        "\"monorepo.import_dir\"",
+        Duration::from_secs(15),
     );
     assert!(
-        logs.contains("\"monorepo.import_dir\""),
-        "reload report should list monorepo.import_dir as restart-required; logs:\n{logs}"
+        logs.contains("restart_required_fields"),
+        "reload report should include restart_required_fields; logs:\n{logs}"
     );
     let status_line = http_get(port, "/api/openapi.json")
         .lines()
@@ -903,11 +901,10 @@ import_dir = "/tmp/hot-reload-restart-required"
 
     // 3. 非法 TOML 应被 watcher 拒绝，服务继续运行。
     env.write_profile("it", "this is not valid TOML [[");
-    sleep(Duration::from_secs(7));
-    let logs = read_log(&stdout_path);
-    assert!(
-        logs.contains("config reload watcher rejected changed config"),
-        "invalid profile should be rejected; logs:\n{logs}"
+    let _logs = wait_for_log_marker(
+        &stdout_path,
+        "config reload watcher rejected changed config",
+        Duration::from_secs(15),
     );
     let status_line = http_get(port, "/api/openapi.json")
         .lines()
@@ -1208,6 +1205,24 @@ fn read_log(path: &Path) -> String {
     fs::read(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
+}
+
+fn wait_for_log_marker(path: &Path, marker: &str, timeout: Duration) -> String {
+    // 轮询日志文件直到出现指定标记，避免固定 sleep 在 CI 负载下超时或等待过久。
+    let deadline = Instant::now() + timeout;
+    loop {
+        let logs = read_log(path);
+        if logs.contains(marker) {
+            return logs;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for log marker {marker:?} in {path}\nlogs:\n{logs}",
+                path = path.display()
+            );
+        }
+        sleep(Duration::from_millis(200));
+    }
 }
 
 fn reserve_free_port() -> u16 {
