@@ -95,7 +95,7 @@ pub fn parse_git_protocol_path(
         });
     }
 
-    Err(ProtocolError::InvalidInput(
+    Err(ProtocolError::NotFound(
         "Operation not supported".to_string(),
     ))
 }
@@ -165,8 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_unknown_endpoint() {
+    fn parse_rejects_unknown_endpoint_as_not_found() {
         let err = parse_git_protocol_path(&Method::GET, "/project.git/git-status").unwrap_err();
+        assert!(matches!(err, ProtocolError::NotFound(_)));
         assert!(err.to_string().contains("Operation not supported"));
     }
 
