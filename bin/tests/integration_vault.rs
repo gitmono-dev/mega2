@@ -146,6 +146,18 @@ impl VaultCliEnv {
         // 测试没有写入开发机默认 home/cache 位置。
         self.base_dir.join("vault").join("core_key.json")
     }
+
+    fn write_profile(&self, name: &str, content: &str) -> PathBuf {
+        // 按照 ConfigLoader 的约定，profile 文件位于基础配置同目录、同 stem 的
+        // `.<profile>.toml`，例如 `config.toml` → `config.it.toml`。
+        let path = self
+            .full_config_path
+            .parent()
+            .expect("config path has parent")
+            .join(format!("config.{}.toml", name));
+        fs::write(&path, content).expect("write profile config");
+        path
+    }
 }
 
 // PostgreSQL 测试数据库的 RAII 包装。
@@ -782,6 +794,137 @@ fn integration_service_http_fails_when_mailer_secret_missing() {
         "diagnostic leaked the vault path/ref:\n{stderr}"
     );
     assert_does_not_leak_secret("", &stderr);
+}
+
+#[test]
+fn integration_config_hot_reload() {
+    // integration.md P2 热加载黑盒 gate：在运行的 `service http` 上通过修改 profile
+    // 文件触发 config reload watcher，验证白名单字段热生效、非白名单字段仅报告需
+    // 重启且旧配置继续服务、坏 TOML 被拒绝且服务不中断。
+    let env = VaultCliEnv::new();
+    env.write_profile(
+        "it",
+        r#"
+[log]
+level = "info"
+print_std = true
+"#,
+    );
+    seed_mail_password(&env);
+
+    let port = reserve_free_port();
+    let stdout_path = env.temp_dir.path().join("service.out");
+    let stderr_path = env.temp_dir.path().join("service.err");
+
+    let mut command = env.full_config_command();
+    command.env("MEGA_PROFILE", "it");
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+
+    let initial_logs = read_log(&stdout_path);
+    assert!(
+        initial_logs.contains("config reload watcher started"),
+        "watcher should start and log to stdout; logs:\n{initial_logs}"
+    );
+
+    // 1. 白名单字段变更（log.level）应热生效并输出 reload report。
+    env.write_profile(
+        "it",
+        r#"
+[log]
+level = "debug"
+print_std = true
+"#,
+    );
+    sleep(Duration::from_secs(7));
+    let logs = read_log(&stdout_path);
+    assert!(
+        logs.contains("config reload watcher applied changed config"),
+        "whitelisted log.level change should be applied; logs:\n{logs}"
+    );
+    assert!(
+        logs.contains("\"log.level\""),
+        "reload report should list log.level in applied_fields; logs:\n{logs}"
+    );
+    let status_line = http_get(port, "/api/openapi.json")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        status_line.contains(" 200"),
+        "service should still respond after whitelisted reload; status: {status_line:?}"
+    );
+
+    // 2. 非白名单字段变更应被标记为 restart-required，旧配置继续服务。
+    env.write_profile(
+        "it",
+        r#"
+[log]
+level = "debug"
+print_std = true
+
+[monorepo]
+import_dir = "/tmp/hot-reload-restart-required"
+"#,
+    );
+    sleep(Duration::from_secs(7));
+    let logs = read_log(&stdout_path);
+    assert!(
+        logs.contains("restart_required_fields"),
+        "restart-required change should be reported; logs:\n{logs}"
+    );
+    assert!(
+        logs.contains("\"monorepo.import_dir\""),
+        "reload report should list monorepo.import_dir as restart-required; logs:\n{logs}"
+    );
+    let status_line = http_get(port, "/api/openapi.json")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        status_line.contains(" 200"),
+        "service should continue serving old config when restart is required; status: {status_line:?}"
+    );
+
+    // 3. 非法 TOML 应被 watcher 拒绝，服务继续运行。
+    env.write_profile("it", "this is not valid TOML [[");
+    sleep(Duration::from_secs(7));
+    let logs = read_log(&stdout_path);
+    assert!(
+        logs.contains("config reload watcher rejected changed config"),
+        "invalid profile should be rejected; logs:\n{logs}"
+    );
+    let status_line = http_get(port, "/api/openapi.json")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        status_line.contains(" 200"),
+        "service should continue serving after rejected invalid profile; status: {status_line:?}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path)
+    );
 }
 
 // ===== 错误诊断脱敏 gate（integration.md 场景 7）=====

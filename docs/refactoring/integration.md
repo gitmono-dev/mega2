@@ -78,7 +78,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | 对象存储 | 通过 `jupiter::storage::object_storage::build_object_storage` 构造（由 composition root 注入 `Storage::new`），测试可使用 local temp dir | P0 使用 local backend |
 | Mail | `mail.password_ref` 已可在 Vault 后解析；`SmtpMailer` 在 `AppContext::new` 中构造；`integration_mail_dispatcher_mailpit_sends_outbox_job` 已覆盖真实 SMTP/Mailpit 正路径，`integration_mail_dispatcher_smtp_failure_retries_outbox_job` 已覆盖 SMTP transport 失败 retry | P0/P1 扩展 Mailpit/SMTP 故障矩阵 |
 | Notification | email outbox、dispatcher、CL comment trigger、**用户-facing 偏好 API 与多渠道（Slack/webhook/in-app + dispatcher 扇出）均已实现**（2026-06-27 已补模块集成测试） | P1 模块集成 + service dispatcher 测试 |
-| 热加载 | 已实现（`config::reload` 的 `ConfigHandle`/白名单应用/`ConfigReloadWatcher` + 日志/mail dispatcher/template/mailer 订阅者，单测充分） | P2 专门黑盒 `integration_config_hot_reload` 仍未单列 |
+| 热加载 | 已实现（`config::reload` 的 `ConfigHandle`/白名单应用/`ConfigReloadWatcher` + 日志/mail dispatcher/template/mailer 订阅者，单测充分） | **（2026-06-28）P2 专门黑盒 `integration_config_hot_reload` 已落地**：基于 base/profile 文件 watcher 触发，验证白名单字段（`log.level`）热生效、非白名单字段（`monorepo.import_dir`）仅报告 restart-required 且旧配置继续服务、非法 TOML 被拒绝且服务不中断 |
 | 日志脱敏 | 已落地：DB/Redis 连接串经 `redact_db_url`/`redact_redis_url` 脱敏，活进程门禁断言凭据不泄露 | P1 gate 已满足；可继续收拢成单一命名 gate |
 
 ## 硬约束与不可违反的原则
@@ -104,7 +104,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | 通知触发器→邮件 | `test_on_cl_comment_created_*`（enqueue/render/opt-out）已覆盖 | 维持触发器到 outbox 的端到端断言 | 中等 |
 | 多渠道扇出 | `service_start_fans_out_delivery_to_webhook_channel` 模块集成测试已落地 | 专门的进程级黑盒 gate（P2）仍可后续单列 | 中等 |
 | 错误诊断与脱敏 | `integration_error_redaction_does_not_leak_db_password`/`..._redis_password`/`..._bad_toml_does_not_leak_values` 活进程门禁已落地 | 可继续收拢成单一命名 gate | 中等 |
-| 热加载黑盒 | 功能实现 + 单测充分；黑盒 `integration_config_hot_reload` 未单列 | P2：明确 SIGHUP/HTTP 触发后补黑盒 gate | 中等 |
+| 热加载黑盒 | **（2026-06-28）P2 黑盒 `integration_config_hot_reload` 已落地**：基于 base/profile 文件 watcher 触发，覆盖白名单热生效、restart-required 继续服务、坏 TOML 拒绝回退 | P2：GCS 凭据/真实 S3 后端进程级 gate 仍为后续 | 中等 |
 | 对象存储 SecretRef | 启动路径解析有模块测试（透传/双 ref/缺失报错）；validate/CLI/`--resolve-secrets` 已与 S3 凭据对齐；P2 进程级黑盒 gate `config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs` 已落地，覆盖 `config secret set/check` 与 `config validate --resolve-secrets` 对 S3 凭据的端到端解析（不依赖真实 S3 服务端） | P2：GCS 凭据/真实 S3 后端进程级 gate 仍为后续 | 复杂 |
 | 覆盖矩阵 | 覆盖矩阵表已维护，P0/P1 gate 稳定 | 新功能先更新矩阵再落测试 | 简单 |
 
@@ -627,7 +627,7 @@ bootstrap 后，`config validate`/CLI 未对齐）。
 | `integration_error_redaction` | P1 DB/Redis 活门禁已落地，余项分散覆盖 | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
 | `integration_config_init` | P2 已落地（黑盒） | ✓ | - | - | - | - | - | ✓ | - | ✓ |
 | `integration_object_storage_s3_secret_ref` | P2 已落地（黑盒） | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
-| `integration_config_hot_reload` | P2 | ✓ | - | - | - | - | - | - | ✓ | ✓ |
+| `integration_config_hot_reload` | **P2 已落地（2026-06-28）** | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | P2 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
 
 ## 迁移步骤（分阶段）
@@ -647,7 +647,7 @@ bootstrap 后，`config validate`/CLI 未对齐）。
    - 先修复 redaction 缺口。
    - 再启用 `integration_error_redaction` 和 notification trigger 到 mail。
 5. **Phase 4：P2 未来能力 gate**
-   - 多渠道通知与对象存储 SecretRef 已落地并补模块集成测试（见上）；`config init` 专门黑盒进程用例已落地（`integration_config_init_creates_safe_skeleton_and_validates`），热加载的专门黑盒进程用例（接口已实现、单测充分）仍可作为后续 P2 gate 单列。
+   - 多渠道通知与对象存储 SecretRef 已落地并补模块集成测试（见上）；`config init` 专门黑盒进程用例已落地（`integration_config_init_creates_safe_skeleton_and_validates`）；**热加载专门黑盒进程用例 `integration_config_hot_reload` 已落地（2026-06-28）**，基于 base/profile 文件 watcher 触发，验证白名单热生效、restart-required 旧配置继续服务、坏 TOML 拒绝回退。
 
 ## 前置依赖矩阵
 
