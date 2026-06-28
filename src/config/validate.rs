@@ -1244,6 +1244,8 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.endpoint_url"
             | "mail.password"
             | "mail.password_ref"
+            | "notification.slack.webhook_url_ref"
+            | "notification.webhook.token_ref"
     )
 }
 
@@ -2968,6 +2970,91 @@ mod tests {
         assert!(!source_text.contains("config/prod/mail/password"));
         assert!(!source_text.contains("#value"));
         assert!(!source_text.contains("plain-text-password"));
+    }
+
+    #[test]
+    fn source_diagnostics_redacts_notification_secret_ref_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [notification.slack]
+            enabled = true
+            webhook_url_ref = "vault://secret/config/base/notification/slack/webhook_url#value"
+
+            [notification.webhook]
+            enabled = true
+            url = "https://hooks.example.test/webhook"
+            token_ref = "vault://secret/config/base/notification/webhook/token#value"
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [notification.slack]
+            webhook_url_ref = "vault://secret/config/prod/notification/slack/webhook_url#value"
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_NOTIFICATION__SLACK__WEBHOOK_URL_REF"],
+        )
+        .expect("diagnostics should collect");
+        let source_fields = diagnostics
+            .source_fields
+            .iter()
+            .map(|source_field| source_field.message.as_str())
+            .collect::<Vec<_>>();
+        let source_text = source_fields.join("\n");
+        let overrides = diagnostics
+            .source_overrides
+            .iter()
+            .map(|source_override| source_override.message.as_str())
+            .collect::<Vec<_>>();
+        let override_text = overrides.join("\n");
+
+        assert!(
+            source_fields.iter().any(|message| {
+                message.contains("notification.slack.webhook_url_ref")
+                    && message.contains("base file")
+            }),
+            "missing slack webhook_url_ref base field: {source_text}"
+        );
+        assert!(
+            source_fields.iter().any(|message| {
+                message.contains("notification.webhook.token_ref") && message.contains("base file")
+            }),
+            "missing webhook token_ref base field: {source_text}"
+        );
+        assert!(
+            override_text.contains("notification.slack.webhook_url_ref")
+                && override_text.contains("profile file")
+                && override_text.contains("base file"),
+            "missing slack webhook_url_ref override: {override_text}"
+        );
+        assert!(
+            source_text.contains("sensitive values are omitted"),
+            "notification SecretRef fields should be marked sensitive: {source_text}"
+        );
+        assert!(
+            !source_text.contains("vault://secret/"),
+            "source diagnostics leaked notification SecretRef URI: {source_text}"
+        );
+        assert!(
+            !source_text.contains("config/prod/notification/slack/webhook_url"),
+            "source diagnostics leaked notification vault path: {source_text}"
+        );
+        assert!(
+            !source_text.contains("config/base/notification/webhook/token"),
+            "source diagnostics leaked notification webhook token path: {source_text}"
+        );
+        assert!(!source_text.contains("#value"));
     }
 
     #[test]
