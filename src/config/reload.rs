@@ -15,7 +15,7 @@ use tokio::{
 use crate::{
     common::errors::MegaError,
     config::{
-        ArtifactGcConfig, BuckConfig, Config, DEFAULT_MAIL_TEMPLATE_LOCALE,
+        ArtifactGcConfig, BuckConfig, ChatConfig, Config, DEFAULT_MAIL_TEMPLATE_LOCALE,
         DEFAULT_NOTIFICATION_DELIVERY_MODE, LogConfig, MailConfig, NotificationConfig,
     },
 };
@@ -146,6 +146,7 @@ impl ConfigHandle {
             &mut next.notification,
             &mut report,
         );
+        apply_chat_changes(&current.chat, &candidate.chat, &mut next.chat, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
         collect_static_restart_fields(&current, &candidate, &mut report);
@@ -677,6 +678,36 @@ fn notification_default_locale(config: &Option<NotificationConfig>) -> String {
         .as_ref()
         .map(|c| c.default_locale.clone())
         .unwrap_or_else(|| DEFAULT_MAIL_TEMPLATE_LOCALE.to_string())
+}
+
+/// `chat.attachment_allowed_mime_types` is read live by the attachment handlers,
+/// so changes can be hot-applied without a restart.
+fn apply_chat_changes(
+    current: &Option<ChatConfig>,
+    candidate: &Option<ChatConfig>,
+    next: &mut Option<ChatConfig>,
+    report: &mut ConfigReloadReport,
+) {
+    if current == candidate {
+        return;
+    }
+
+    let current_list = chat_mime_allowlist(current);
+    let candidate_list = chat_mime_allowlist(candidate);
+    *next = candidate.clone();
+
+    if current_list != candidate_list {
+        report
+            .applied_fields
+            .push("chat.attachment_allowed_mime_types");
+    }
+}
+
+fn chat_mime_allowlist(config: &Option<ChatConfig>) -> Vec<String> {
+    config
+        .as_ref()
+        .map(|c| c.attachment_allowed_mime_types.clone())
+        .unwrap_or_default()
 }
 
 fn collect_artifact_gc_restart_fields(
@@ -1420,6 +1451,41 @@ mod tests {
         assert!(report.applied());
         assert!(!report.requires_restart());
         assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
+    }
+
+    #[test]
+    fn reload_applies_chat_mime_allowlist_without_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.chat = Some(ChatConfig::default());
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate
+            .chat
+            .as_mut()
+            .expect("chat config")
+            .attachment_allowed_mime_types =
+            vec!["image/*".to_string(), "application/pdf".to_string()];
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert_eq!(
+            report.applied_fields,
+            vec!["chat.attachment_allowed_mime_types"]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert_eq!(
+            snapshot
+                .chat
+                .as_ref()
+                .expect("chat config")
+                .attachment_allowed_mime_types,
+            vec!["image/*".to_string(), "application/pdf".to_string()]
+        );
     }
 
     #[test]

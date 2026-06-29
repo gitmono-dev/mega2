@@ -70,9 +70,12 @@ fn validate_chat_attachment_metadata(
     }
 
     let file_type = file_type.trim();
+    let mime_parts: Vec<&str> = file_type.split('/').collect();
     if file_type.is_empty()
         || file_type.len() > CHAT_ATTACHMENT_MAX_FILE_TYPE_LEN
-        || !file_type.contains('/')
+        || mime_parts.len() != 2
+        || mime_parts[0].is_empty()
+        || mime_parts[1].is_empty()
         || file_type.chars().any(char::is_control)
     {
         return Err(ApiError::bad_request(anyhow::anyhow!(
@@ -881,6 +884,20 @@ mod tests {
         assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 0, &[]).is_err());
         assert!(validate_chat_attachment_metadata("x.txt", "not-a-mime", 1, &[]).is_err());
         assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 1, &[]).is_ok());
+        // Malformed MIME strings must be rejected even when an allowlist is present.
+        assert!(
+            validate_chat_attachment_metadata("x.png", "image/", 1, &["image/*".to_string()])
+                .is_err()
+        );
+        assert!(
+            validate_chat_attachment_metadata(
+                "x.png",
+                "image/png/extra",
+                1,
+                &["image/*".to_string()]
+            )
+            .is_err()
+        );
     }
 
     #[test]
