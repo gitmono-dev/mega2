@@ -301,16 +301,24 @@ async fn ensure_cl_merged_event_type_exists(stg: &NotificationStorage) -> Result
 }
 
 async fn ensure_issue_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaError> {
-    stg.upsert_event_type(
-        EVENT_ISSUE_COMMENT_CREATED,
-        "issue",
-        "New comment on an Issue",
-        false,
-        true,
-    )
-    .await?;
-    stg.upsert_event_type(EVENT_ISSUE_CLOSED, "issue", "Issue was closed", false, true)
+    if stg
+        .get_event_type(EVENT_ISSUE_COMMENT_CREATED)
+        .await?
+        .is_none()
+    {
+        stg.upsert_event_type(
+            EVENT_ISSUE_COMMENT_CREATED,
+            "issue",
+            "New comment on an Issue",
+            false,
+            true,
+        )
         .await?;
+    }
+    if stg.get_event_type(EVENT_ISSUE_CLOSED).await?.is_none() {
+        stg.upsert_event_type(EVENT_ISSUE_CLOSED, "issue", "Issue was closed", false, true)
+            .await?;
+    }
 
     Ok(())
 }

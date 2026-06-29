@@ -197,13 +197,19 @@ impl IssueStorage {
         Ok(())
     }
 
-    pub async fn close_issue(&self, link: &str) -> Result<(), MegaError> {
-        if let Some(model) = self.get_issue(link).await.unwrap() {
+    pub async fn close_issue(&self, link: &str) -> Result<Option<mega_issue::Model>, MegaError> {
+        if let Some(model) = self.get_issue(link).await? {
+            if model.status == "closed" {
+                return Ok(None);
+            }
             let mut issue = model.into_active_model();
             issue.status = Set("closed".to_owned());
-            issue.update(self.get_connection()).await.unwrap();
-        };
-        Ok(())
+            issue.closed_at = Set(Some(chrono::Utc::now().naive_utc()));
+            let updated = issue.update(self.get_connection()).await?;
+            Ok(Some(updated))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn reopen_issue(&self, link: &str) -> Result<(), MegaError> {
@@ -384,5 +390,56 @@ impl IssueStorage {
             .await?;
 
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sea_orm::{ActiveModelTrait, Set};
+
+    use crate::{
+        callisto::mega_issue,
+        jupiter::{
+            migration::apply_migrations,
+            storage::{
+                base_storage::{BaseStorage, StorageConnector},
+                issue_storage::IssueStorage,
+            },
+            tests::test_db_connection,
+        },
+    };
+
+    #[tokio::test]
+    async fn close_issue_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let storage = IssueStorage {
+            base: BaseStorage::new(Arc::new(db.clone())),
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+        mega_issue::ActiveModel {
+            id: Set(1),
+            link: Set("ISSUE1".to_string()),
+            title: Set("T".to_string()),
+            status: Set("open".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            author: Set("alice".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let first = storage.close_issue("ISSUE1").await.unwrap();
+        assert!(first.is_some(), "first close should transition the issue");
+
+        let second = storage.close_issue("ISSUE1").await.unwrap();
+        assert!(second.is_none(), "second close should report no transition");
     }
 }

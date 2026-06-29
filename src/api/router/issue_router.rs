@@ -134,17 +134,18 @@ async fn close_issue(
     Path(link): Path<String>,
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
-    state.issue_stg().close_issue(&link).await?;
+    let closed = state.issue_stg().close_issue(&link).await?;
 
-    // Notify the issue author that their issue was closed. Errors are logged
-    // but do not block the close response.
-    if let Err(e) = on_issue_closed(
-        &state.storage.notification_storage(),
-        &state.issue_stg(),
-        &user.username,
-        &link,
-    )
-    .await
+    // Notify the issue author only when the issue actually transitioned from
+    // open to closed. Errors are logged but do not block the close response.
+    if closed.is_some()
+        && let Err(e) = on_issue_closed(
+            &state.storage.notification_storage(),
+            &state.issue_stg(),
+            &user.username,
+            &link,
+        )
+        .await
     {
         tracing::warn!(error = %e, issue_link = %link, "failed to enqueue issue closed notification");
     }
