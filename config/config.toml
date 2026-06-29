@@ -360,6 +360,8 @@ attachment_allowed_mime_types = []
 open_graph_fetch_enabled = true
 # Network timeout in milliseconds for a single Open Graph fetch attempt.
 open_graph_fetch_timeout_ms = 5000
+# Allow fetches against localhost/private IPs. Keep false in production.
+open_graph_allow_private_networks = false
 
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),

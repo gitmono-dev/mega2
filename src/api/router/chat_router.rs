@@ -138,6 +138,22 @@ fn validate_chat_attachment_file_path(file_path: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn extract_urls(content: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for token in content.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'' | '>'
+            )
+        });
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            urls.push(trimmed.to_string());
+        }
+    }
+    urls
+}
+
 async fn map_channel_model(
     ch: crate::callisto::channel::Model,
     state: &MonoApiServiceState,
@@ -548,6 +564,26 @@ async fn send_message(
                     reply_to = %reply_to_public_id,
                     "failed to look up reply-to message; skipping reply notification"
                 );
+            }
+        }
+    }
+
+    // Refresh Open Graph previews for any URLs in the message content. Failures
+    // are logged but do not block the send response.
+    let chat_cfg = state.storage.config().chat.clone().unwrap_or_default();
+    if chat_cfg.open_graph_fetch_enabled {
+        for url in extract_urls(&payload.content) {
+            if let Err(e) = state
+                .shared_chat_svc()
+                .fetch_or_refresh_open_graph_link(
+                    &url,
+                    true,
+                    chat_cfg.open_graph_fetch_timeout_ms,
+                    chat_cfg.open_graph_allow_private_networks,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, url = %url, "failed to refresh open graph link");
             }
         }
     }
@@ -1370,5 +1406,16 @@ mod tests {
         .expect("failed to delete channel")
         .0;
         assert!(del_ch_res.req_result);
+    }
+
+    #[test]
+    fn extract_urls_finds_http_and_https_tokens() {
+        let content = "Check out https://example.com/page, and http://test.org?q=1. Also \
+            https://else.where/path.";
+        let urls = extract_urls(content);
+        assert_eq!(urls.len(), 3);
+        assert!(urls.contains(&"https://example.com/page".to_string()));
+        assert!(urls.contains(&"http://test.org?q=1".to_string()));
+        assert!(urls.contains(&"https://else.where/path".to_string()));
     }
 }

@@ -445,6 +445,10 @@ pub struct ChatConfig {
     /// Defaults to 5000 ms.
     #[serde(default = "default_open_graph_fetch_timeout_ms")]
     pub open_graph_fetch_timeout_ms: u64,
+    /// Allow Open Graph fetches against localhost/private IPs. Intended for
+    /// tests and isolated development; defaults to false in production.
+    #[serde(default)]
+    pub open_graph_allow_private_networks: bool,
 }
 
 fn default_open_graph_fetch_enabled() -> bool {
@@ -461,6 +465,7 @@ impl Default for ChatConfig {
             attachment_allowed_mime_types: Vec::new(),
             open_graph_fetch_enabled: default_open_graph_fetch_enabled(),
             open_graph_fetch_timeout_ms: default_open_graph_fetch_timeout_ms(),
+            open_graph_allow_private_networks: false,
         }
     }
 }

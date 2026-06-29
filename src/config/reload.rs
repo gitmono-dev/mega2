@@ -713,6 +713,17 @@ fn apply_chat_changes(
             .applied_fields
             .push("chat.open_graph_fetch_timeout_ms");
     }
+    if current
+        .as_ref()
+        .map(|c| c.open_graph_allow_private_networks)
+        != candidate
+            .as_ref()
+            .map(|c| c.open_graph_allow_private_networks)
+    {
+        report
+            .applied_fields
+            .push("chat.open_graph_allow_private_networks");
+    }
 }
 
 fn chat_mime_allowlist(config: &Option<ChatConfig>) -> Vec<String> {

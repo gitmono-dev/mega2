@@ -1531,6 +1531,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "attachment_allowed_mime_types",
             "open_graph_fetch_enabled",
             "open_graph_fetch_timeout_ms",
+            "open_graph_allow_private_networks",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[

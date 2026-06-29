@@ -1,7 +1,10 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{net::IpAddr, sync::LazyLock, time::Duration};
 
+use bytes::BytesMut;
 use chrono::Utc;
+use futures::TryStreamExt;
 use regex::Regex;
+use reqwest::redirect::Policy;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::{
@@ -229,6 +232,7 @@ impl SharedChatService {
         url: &str,
         fetch_enabled: bool,
         timeout_ms: u64,
+        allow_private_networks: bool,
     ) -> Result<Option<open_graph_link::Model>, MegaError> {
         let cached = self
             .open_graph_storage
@@ -245,8 +249,11 @@ impl SharedChatService {
         if !fetch_enabled {
             return Ok(cached);
         }
+        if !allow_private_networks {
+            validate_preview_url(url, false)?;
+        }
 
-        let fetched = match fetch_open_graph(url, timeout_ms).await {
+        let fetched = match fetch_open_graph(url, timeout_ms, allow_private_networks).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(url = %url, error = %e, "failed to fetch open graph link");
@@ -273,24 +280,27 @@ struct FetchedOpenGraph {
     favicon: Option<String>,
 }
 
-async fn fetch_open_graph(url: &str, timeout_ms: u64) -> Result<FetchedOpenGraph, MegaError> {
+async fn fetch_open_graph(
+    url: &str,
+    timeout_ms: u64,
+    allow_private_networks: bool,
+) -> Result<FetchedOpenGraph, MegaError> {
+    let parsed = validate_preview_url(url, allow_private_networks)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
+        .redirect(Policy::none())
         .user_agent("monoengine-open-graph/1.0")
         .build()
         .map_err(|e| MegaError::Other(format!("failed to build http client: {e}")))?;
 
-    let body = client
-        .get(url)
+    let response = client
+        .get(parsed)
         .send()
         .await
-        .map_err(|e| MegaError::Other(format!("open graph fetch failed: {e}")))?
-        .text()
-        .await
-        .map_err(|e| MegaError::Other(format!("open graph fetch body read failed: {e}")))?;
+        .map_err(|e| MegaError::Other(format!("open graph fetch failed: {e}")))?;
 
-    // Avoid parsing multi-megabyte pages for a handful of meta tags.
-    let body: String = body.chars().take(1_000_000).collect();
+    const MAX_BODY_BYTES: usize = 1_000_000;
+    let body = read_response_body_limited(response, MAX_BODY_BYTES).await?;
 
     let title = extract_meta_property(&body, "og:title").or_else(|| extract_title_tag(&body));
     let image = extract_meta_property(&body, "og:image");
@@ -301,6 +311,98 @@ async fn fetch_open_graph(url: &str, timeout_ms: u64) -> Result<FetchedOpenGraph
         image,
         favicon,
     })
+}
+
+fn validate_preview_url(
+    url: &str,
+    allow_private_networks: bool,
+) -> Result<reqwest::Url, MegaError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| MegaError::Other(format!("invalid open graph URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(MegaError::Other(
+            "only http/https URLs are allowed for open graph previews".to_string(),
+        ));
+    }
+
+    if !allow_private_networks {
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| MegaError::Other("open graph URL has no host".to_string()))?;
+        if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+            return Err(MegaError::Other(
+                "localhost URLs are not allowed for open graph previews".to_string(),
+            ));
+        }
+        if let Ok(ip) = host.parse::<IpAddr>()
+            && !is_public_ip(ip)
+        {
+            return Err(MegaError::Other(
+                "non-public IP URLs are not allowed for open graph previews".to_string(),
+            ));
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 10/8, 172.16/12, 192.168/16
+            if octets[0] == 10
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+            {
+                return false;
+            }
+            // 127/8, 169.254/16, 224/4, 0/8, 255/8, 100.64/10, 198.18/15, 192.0.2/24, ...
+            !(v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation())
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00) // unique local (fc00::/7)
+        }
+    }
+}
+
+async fn read_response_body_limited(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<String, MegaError> {
+    if let Some(len) = response.content_length()
+        && len > limit as u64
+    {
+        return Err(MegaError::Other(
+            "open graph response body exceeds size limit".to_string(),
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|e| MegaError::Other(format!("open graph response stream error: {e}")))?
+    {
+        if buf.len() + chunk.len() > limit {
+            return Err(MegaError::Other(
+                "open graph response body exceeds size limit".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn extract_meta_property(html: &str, property: &str) -> Option<String> {
@@ -460,7 +562,7 @@ mod tests {
         let shared_svc = SharedChatService::from_storage(&storage);
 
         let preview = shared_svc
-            .fetch_or_refresh_open_graph_link(&url, true, 5000)
+            .fetch_or_refresh_open_graph_link(&url, true, 5000, true)
             .await
             .expect("fetch should succeed")
             .expect("preview should be returned");
@@ -476,7 +578,7 @@ mod tests {
 
         // A second fetch should return the cached row without fetching again.
         let cached = shared_svc
-            .fetch_or_refresh_open_graph_link(&url, true, 5000)
+            .fetch_or_refresh_open_graph_link(&url, true, 5000, true)
             .await
             .expect("cached fetch should succeed")
             .expect("cached preview should exist");
@@ -494,7 +596,7 @@ mod tests {
         let shared_svc = SharedChatService::from_storage(&storage);
 
         let none = shared_svc
-            .fetch_or_refresh_open_graph_link(&url, false, 5000)
+            .fetch_or_refresh_open_graph_link(&url, false, 5000, true)
             .await
             .expect("fetch should succeed");
         assert!(none.is_none());
@@ -506,10 +608,22 @@ mod tests {
             .await
             .expect("upsert");
         let cached = shared_svc
-            .fetch_or_refresh_open_graph_link(&url, false, 5000)
+            .fetch_or_refresh_open_graph_link(&url, false, 5000, true)
             .await
             .expect("fetch should succeed")
             .expect("cached entry should be returned");
         assert_eq!(cached.title, "Cached");
+    }
+
+    #[tokio::test]
+    async fn fetch_open_graph_rejects_private_urls_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let shared_svc = SharedChatService::from_storage(&storage);
+
+        let result = shared_svc
+            .fetch_or_refresh_open_graph_link("http://127.0.0.1:8080/", true, 5000, false)
+            .await;
+        assert!(result.is_err());
     }
 }
