@@ -53,6 +53,7 @@ fn validate_chat_attachment_metadata(
     file_name: &str,
     file_type: &str,
     file_size: i64,
+    allowed_mime_types: &[String],
 ) -> Result<(String, String), ApiError> {
     let file_name = file_name.trim();
     if file_name.is_empty()
@@ -86,7 +87,33 @@ fn validate_chat_attachment_metadata(
         )));
     }
 
+    if !allowed_mime_types.is_empty() && !is_mime_type_allowed(file_type, allowed_mime_types) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "attachment file_type `{file_type}` is not in the configured allowlist"
+        )));
+    }
+
     Ok((file_name.to_owned(), file_type.to_owned()))
+}
+
+/// Returns true if `file_type` matches one of the configured allowlist patterns.
+/// Exact entries match only themselves; wildcard entries (`type/*`) match any
+/// subtype of that top-level type. An empty allowlist accepts everything.
+fn is_mime_type_allowed(file_type: &str, allowed_mime_types: &[String]) -> bool {
+    let (top, _subtype) = file_type.split_once('/').unwrap_or((file_type, ""));
+    allowed_mime_types.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        if pattern == file_type {
+            return true;
+        }
+        if let Some((p_top, p_sub)) = pattern.split_once('/')
+            && p_top == top
+            && p_sub == "*"
+        {
+            return true;
+        }
+        false
+    })
 }
 
 fn validate_chat_attachment_file_path(file_path: &str) -> Result<(), ApiError> {
@@ -669,10 +696,18 @@ async fn presign_attachment(
     state: State<MonoApiServiceState>,
     Json(payload): Json<AttachmentPresignReq>,
 ) -> Result<Json<CommonResult<AttachmentPresignRes>>, ApiError> {
+    let allowed_mime_types = state
+        .storage
+        .config()
+        .chat
+        .as_ref()
+        .map(|c| c.attachment_allowed_mime_types.clone())
+        .unwrap_or_default();
     let (file_name, _) = validate_chat_attachment_metadata(
         &payload.file_name,
         &payload.file_type,
         payload.file_size,
+        &allowed_mime_types,
     )?;
 
     // 1. Verify membership
@@ -728,10 +763,18 @@ async fn confirm_attachment(
     state: State<MonoApiServiceState>,
     Json(payload): Json<AttachmentConfirmReq>,
 ) -> Result<Json<CommonResult<AttachmentResponse>>, ApiError> {
+    let allowed_mime_types = state
+        .storage
+        .config()
+        .chat
+        .as_ref()
+        .map(|c| c.attachment_allowed_mime_types.clone())
+        .unwrap_or_default();
     let (file_name, file_type) = validate_chat_attachment_metadata(
         &payload.file_name,
         &payload.file_type,
         payload.file_size,
+        &allowed_mime_types,
     )?;
     validate_chat_attachment_file_path(&payload.file_path)?;
 
@@ -834,10 +877,25 @@ mod tests {
 
     #[test]
     fn chat_attachment_metadata_rejects_unsafe_inputs() {
-        assert!(validate_chat_attachment_metadata("../x.txt", "text/plain", 1).is_err());
-        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 0).is_err());
-        assert!(validate_chat_attachment_metadata("x.txt", "not-a-mime", 1).is_err());
-        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 1).is_ok());
+        assert!(validate_chat_attachment_metadata("../x.txt", "text/plain", 1, &[]).is_err());
+        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 0, &[]).is_err());
+        assert!(validate_chat_attachment_metadata("x.txt", "not-a-mime", 1, &[]).is_err());
+        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 1, &[]).is_ok());
+    }
+
+    #[test]
+    fn chat_attachment_metadata_enforces_mime_allowlist() {
+        let allowlist = vec!["image/*".to_string(), "application/pdf".to_string()];
+        assert!(validate_chat_attachment_metadata("x.png", "image/png", 1, &allowlist).is_ok());
+        assert!(validate_chat_attachment_metadata("x.jpg", "image/jpeg", 1, &allowlist).is_ok());
+        assert!(
+            validate_chat_attachment_metadata("x.pdf", "application/pdf", 1, &allowlist).is_ok()
+        );
+        assert!(validate_chat_attachment_metadata("x.txt", "text/plain", 1, &allowlist).is_err());
+        assert!(
+            validate_chat_attachment_metadata("x.exe", "application/x-msdownload", 1, &allowlist)
+                .is_err()
+        );
     }
 
     #[test]

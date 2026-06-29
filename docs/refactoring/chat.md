@@ -14,14 +14,14 @@
 2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
 3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
 4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息；同日 `chat_router` 的 message/custom-reaction 映射读取已下沉到 storage helper，减少 handler 直接 SeaORM 查询。
-5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、WebSocket/Pusher 兼容网关、完整真实 HTTP 黑盒矩阵和外部通知投递。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；后续仍需按产品策略补更完整 MIME allowlist 与存储对象归属校验。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
+5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、WebSocket/Pusher 兼容网关、完整真实 HTTP 黑盒矩阵和外部通知投递。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；**2026-06-29 更新：产品级 MIME allowlist 已落地**——`[chat]` 配置新增 `attachment_allowed_mime_types`，支持精确类型（`image/png`）与子类型通配（`image/*`），并在 presign/confirm 两阶段校验；存储对象归属复核仍为后续。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
 
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
 | Chat 模块入口 | 已实现主干 | `src/chat/` 下已有 domain/engine/service；仍需继续清理文档中的旧 slice 叙述。 |
-| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验；custom_reactions 已补 `lower(name)` 唯一索引和应用层 lowercase；reactions 已改为 `WHERE discarded_at IS NULL` 部分唯一索引；attachment 已补 `discarded_at` 软删除（满足硬约束 #4）；仍缺产品级 MIME allowlist、对象归属复核和链接预览抓取。 |
+| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验，并新增 `Config.chat.attachment_allowed_mime_types` 产品级 MIME allowlist（支持精确类型与子类型通配，空列表保持向后兼容）；custom_reactions 已补 `lower(name)` 唯一索引和应用层 lowercase；reactions 已改为 `WHERE discarded_at IS NULL` 部分唯一索引；attachment 已补 `discarded_at` 软删除（满足硬约束 #4）；仍缺对象归属复核和链接预览抓取。 |
 | Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入；**2026-06-29 更新**：`@username` mention 的外部邮件投递已接入 `send_message` HTTP 路径，通过 `notification::triggers::on_chat_mention_created` 按用户偏好入队 `chat.mention.created` email job。**2026-06-29 更新（二）**：reply 的外部邮件投递也已接入，通过 `notification::triggers::on_chat_reply_created` 向被回复消息的作者入队 `chat.reply.created` email job。rich-text mention 更复杂语义（如 markdown/HTML 解析、非 ASCII handle）仍为后续。channels/channel_memberships/channel_membership_updates/messages/message_notifications 的完整索引集和 `message_notifications` 唯一约束已补齐。 |
 | HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
 | 实时事件 | 进程内 broadcaster 已实现 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；`InMemoryChatEvents` 已提供 tokio broadcast 订阅能力并覆盖 service mutation 事件。WebSocket/Pusher 兼容网关仍未实现。 |
@@ -750,7 +750,8 @@ pub trait ChatEvents {
 - 已完成基础：实现 attachment confirmation endpoint。
 - 已完成首批：校验当前用户对目标 message/channel 的访问权限。
 - 已完成首批：校验文件名不含路径分隔/控制字符、文件大小为正且不超过 100MiB、MIME 形态包含 `/`、confirm file_path 必须是 `chat/attachments/` object key 且无 traversal 段。
-- 剩余：产品级 MIME allowlist、已上传对象归属/存在性复核和更完整 object storage fake/no-op 测试。
+- 已完成：产品级 MIME allowlist（`[chat].attachment_allowed_mime_types`，支持精确类型 `image/png` 与子类型通配 `image/*`，空列表保持向后兼容），在 presign/confirm 两阶段校验。
+- 剩余：已上传对象归属/存在性复核和更完整 object storage fake/no-op 测试。
 
 验收：
 

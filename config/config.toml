@@ -351,6 +351,12 @@ default_locale = "en-US"
 # url = "https://hooks.example.com/notify"
 # token_ref = "vault://secret/config/<profile>/notification/webhook/token#value"
 
+[chat]
+# Optional product-level MIME allowlist for chat attachments. An empty list
+# accepts all syntactically valid MIME types (backwards compatible). Entries
+# may be exact types (`image/png`) or wildcards (`image/*`).
+attachment_allowed_mime_types = []
+
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),
 # VaultCore emits one record per secret read/write/delete with the operation,

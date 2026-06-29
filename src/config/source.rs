@@ -55,5 +55,6 @@ pub(crate) fn mega_environment_source() -> c::Environment {
         .with_list_parse_key("oauth.allowed_cors_origins")
         .with_list_parse_key("monorepo.admin")
         .with_list_parse_key("monorepo.root_dirs")
+        .with_list_parse_key("chat.attachment_allowed_mime_types")
         .list_separator(",")
 }

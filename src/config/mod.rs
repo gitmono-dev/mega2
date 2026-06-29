@@ -143,6 +143,7 @@ impl Config {
             notification: None,
             vault: None,
             oauth: None,
+            chat: None,
         }
     }
 

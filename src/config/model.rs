@@ -45,6 +45,9 @@ pub struct Config {
     /// OAuth / browser-facing HTTP settings (currently the CORS allow-list).
     #[serde(default)]
     pub oauth: Option<OAuthConfig>,
+    /// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
+    #[serde(default)]
+    pub chat: Option<ChatConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -423,6 +426,17 @@ pub struct OAuthConfig {
     /// built-in defaults.
     #[serde(default)]
     pub allowed_cors_origins: Vec<String>,
+}
+
+/// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatConfig {
+    /// Optional product-level MIME allowlist for chat attachments. When empty or
+    /// absent, all syntactically valid MIME types are accepted (backwards
+    /// compatible). Entries may be exact types (`image/png`) or wildcards
+    /// (`image/*`); invalid patterns are rejected by `Config::validate`.
+    #[serde(default)]
+    pub attachment_allowed_mime_types: Vec<String>,
 }
 
 /// Supported vault audit sinks (docs/vault.md stage H).

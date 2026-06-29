@@ -222,6 +222,7 @@ impl TestConfigBuilder {
             notification: None,
             vault: None,
             oauth: None,
+            chat: None,
         }
     }
 }

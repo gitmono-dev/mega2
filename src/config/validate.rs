@@ -9,10 +9,10 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
-    MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
-    OAuthConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS,
-    VaultConfig,
+    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, ChatConfig, Config, DbConfig,
+    LFSConfig, LogConfig, MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES,
+    NotificationConfig, OAuthConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig,
+    VAULT_AUDIT_SINKS, VaultConfig,
     secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
@@ -137,6 +137,9 @@ impl Config {
         if let Some(oauth_config) = &self.oauth {
             validate_oauth_config(oauth_config)?;
         }
+        if let Some(chat_config) = &self.chat {
+            validate_chat_config(chat_config)?;
+        }
 
         Ok(())
     }
@@ -150,6 +153,42 @@ impl Config {
 pub(crate) fn validate_oauth_config(config: &OAuthConfig) -> Result<(), MegaError> {
     for origin in &config.allowed_cors_origins {
         validate_cors_origin(origin)?;
+    }
+    Ok(())
+}
+
+/// Validate `[chat]` settings: each MIME allowlist entry must be a non-empty
+/// type/subtype pattern without control characters. Wildcards are allowed only
+/// for the subtype (`image/*`), matching the runtime check in
+/// `validate_chat_attachment_metadata`.
+pub(crate) fn validate_chat_config(config: &ChatConfig) -> Result<(), MegaError> {
+    for pattern in &config.attachment_allowed_mime_types {
+        validate_mime_allowlist_pattern(pattern)?;
+    }
+    Ok(())
+}
+
+fn validate_mime_allowlist_pattern(pattern: &str) -> Result<(), MegaError> {
+    if pattern.trim().is_empty() {
+        return Err(MegaError::Other(
+            "chat.attachment_allowed_mime_types must not contain empty entries".to_string(),
+        ));
+    }
+    if pattern.chars().any(|c| c.is_control()) {
+        return Err(MegaError::Other(format!(
+            "chat.attachment_allowed_mime_types entry `{pattern}` must not contain control characters"
+        )));
+    }
+    let parts: Vec<&str> = pattern.split('/').collect();
+    if parts.len() != 2
+        || parts[0].trim().is_empty()
+        || parts[1].trim().is_empty()
+        || parts[0].contains('*')
+        || parts[1].contains('*') && parts[1] != "*"
+    {
+        return Err(MegaError::Other(format!(
+            "chat.attachment_allowed_mime_types entry `{pattern}` must be a MIME type (`type/subtype`) or wildcard (`type/*`)"
+        )));
     }
     Ok(())
 }
@@ -1481,7 +1520,9 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "notification",
             "vault",
             "oauth",
+            "chat",
         ]),
+        "chat" => Some(&["attachment_allowed_mime_types"]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
             "db_type",
@@ -1639,6 +1680,48 @@ mod tests {
         config
             .validate()
             .expect("default notification config should validate");
+    }
+
+    #[test]
+    fn config_validate_accepts_default_chat_config() {
+        let mut config = valid_config();
+        config.chat = Some(crate::config::ChatConfig::default());
+
+        config
+            .validate()
+            .expect("default chat config should validate");
+    }
+
+    #[test]
+    fn config_validate_accepts_chat_mime_wildcards() {
+        let mut config = valid_config();
+        config.chat = Some(crate::config::ChatConfig {
+            attachment_allowed_mime_types: vec![
+                "image/*".to_string(),
+                "application/pdf".to_string(),
+            ],
+        });
+
+        config
+            .validate()
+            .expect("wildcard MIME allowlist should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_chat_mime_patterns() {
+        let mut config = valid_config();
+        config.chat = Some(crate::config::ChatConfig {
+            attachment_allowed_mime_types: vec!["*/*".to_string(), "bad".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("invalid MIME patterns should fail");
+
+        assert!(
+            err.to_string()
+                .contains("chat.attachment_allowed_mime_types")
+        );
     }
 
     #[test]
