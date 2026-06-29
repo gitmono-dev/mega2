@@ -1008,6 +1008,29 @@ mod tests {
         })
     }
 
+    async fn put_attachment_object(state: &MonoApiServiceState, key: &str, size: i64) {
+        let object_key = ObjectKey {
+            namespace: ObjectNamespace::Attachment,
+            key: key.to_string(),
+        };
+        let data: Vec<Result<Bytes, io::Error>> = vec![Ok(Bytes::from_static(b"attachment-bytes"))];
+        state
+            .storage
+            .git_service
+            .obj_storage
+            .inner
+            .put_stream(
+                &object_key,
+                Box::pin(stream::iter(data)),
+                ObjectMeta {
+                    size,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to put attachment object");
+    }
+
     #[tokio::test]
     async fn test_chat_router_handlers_lifecycle() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -1249,6 +1272,11 @@ mod tests {
         .await;
         assert!(missing_object_confirm.is_err());
 
+        // Seed the correct object so the following negative tests fail for
+        // authorization/channel-binding reasons, not because the object is
+        // missing.
+        put_attachment_object(&state, &presign_res.file_path, 16).await;
+
         // A non-member must not be able to probe attachment state.
         let non_member_confirm = confirm_attachment(
             charlie.clone(),
@@ -1265,6 +1293,7 @@ mod tests {
             presign_res
                 .file_path
                 .replacen(&ch.public_id, &other_ch.public_id, 1);
+        put_attachment_object(&state, &wrong_channel_path, 16).await;
         let wrong_channel_confirm = confirm_attachment(
             alice.clone(),
             Query(sent_msg.public_id.clone()),
@@ -1276,28 +1305,6 @@ mod tests {
         )
         .await;
         assert!(wrong_channel_confirm.is_err());
-
-        // Upload the object so the confirmation can verify ownership/existence.
-        let object_key = ObjectKey {
-            namespace: ObjectNamespace::Attachment,
-            key: presign_res.file_path.clone(),
-        };
-        let data: Vec<Result<Bytes, io::Error>> = vec![Ok(Bytes::from_static(b"attachment-bytes"))];
-        state
-            .storage
-            .git_service
-            .obj_storage
-            .inner
-            .put_stream(
-                &object_key,
-                Box::pin(stream::iter(data)),
-                ObjectMeta {
-                    size: 16,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("failed to put attachment object");
 
         // 10. Confirm/register attachment
         let confirmed_att = confirm_attachment(
