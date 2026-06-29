@@ -28,7 +28,7 @@ const REQUIRED_LEGACY_EXPORTS: [&str; 9] = [
 ];
 
 #[derive(Deserialize, Debug)]
-struct MigrationMapping {
+pub(crate) struct MigrationMapping {
     user_mappings: HashMap<String, String>,
     org_membership_mappings: HashMap<String, String>,
 }
@@ -333,6 +333,52 @@ fn validate_chat_migration_mappings(
     Ok(())
 }
 
+pub(crate) struct MigrationInput {
+    pub mapping: MigrationMapping,
+    pub custom_reactions: Vec<serde_json::Value>,
+    pub open_graph_links: Vec<serde_json::Value>,
+    pub threads: Vec<serde_json::Value>,
+    pub memberships: Vec<serde_json::Value>,
+    pub membership_updates: Vec<serde_json::Value>,
+    pub messages: Vec<serde_json::Value>,
+    pub notifications: Vec<serde_json::Value>,
+    pub attachments: Vec<serde_json::Value>,
+    pub reactions: Vec<serde_json::Value>,
+}
+
+pub(crate) struct MigrationReport {
+    pub custom_reaction_in: usize,
+    pub custom_reaction_out: usize,
+    pub custom_reaction_skip: usize,
+    pub custom_reaction_conflict: usize,
+    pub og_in: usize,
+    pub og_out: usize,
+    pub og_skip: usize,
+    pub channel_in: usize,
+    pub channel_out: usize,
+    pub channel_skip: usize,
+    pub membership_in: usize,
+    pub membership_out: usize,
+    pub membership_skip: usize,
+    pub membership_update_in: usize,
+    pub membership_update_out: usize,
+    pub membership_update_skip: usize,
+    pub message_in: usize,
+    pub message_out: usize,
+    pub message_skip: usize,
+    pub message_skip_oauth_integration: usize,
+    pub message_skip_calls: usize,
+    pub notif_in: usize,
+    pub notif_out: usize,
+    pub notif_skip: usize,
+    pub attachment_in: usize,
+    pub attachment_out: usize,
+    pub attachment_skip: usize,
+    pub reaction_in: usize,
+    pub reaction_out: usize,
+    pub reaction_skip: usize,
+}
+
 #[tokio::main]
 pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let config = require_config(ctx, "chat-migrate")?;
@@ -342,8 +388,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let dir_path = Path::new(input_dir);
     validate_legacy_export_set(dir_path)?;
 
-    // 1. Read user mapping. Do this before AppContext startup so malformed
-    // migration inputs fail before connecting to long-lived services.
     let mapping_content = fs::read_to_string(mapping_file)
         .map_err(|e| MegaError::Other(format!("Failed to read user mapping file: {}", e)))?;
     let mapping: MigrationMapping = serde_json::from_str(&mapping_content)
@@ -372,9 +416,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mono_storage = context.storage.mono_storage();
     let conn = mono_storage.get_connection();
 
-    // Empty-DB guard: refuse to run if chat tables already contain data.
-    // The migration inserts with explicit legacy IDs and is not idempotent;
-    // re-running on a non-empty database would cause primary-key conflicts.
     let existing_channels = crate::callisto::channel::Entity::find()
         .count(conn)
         .await
@@ -393,6 +434,37 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         mapping.org_membership_mappings.len()
     );
 
+    let input = MigrationInput {
+        mapping,
+        custom_reactions: legacy_custom_reactions,
+        open_graph_links: legacy_og,
+        threads: legacy_threads,
+        memberships: legacy_memberships,
+        membership_updates: legacy_updates,
+        messages: legacy_messages,
+        notifications: legacy_notifs,
+        attachments: legacy_attachments,
+        reactions: legacy_reactions,
+    };
+
+    run_migration(conn, &input).await
+}
+
+pub(crate) async fn run_migration(
+    conn: &sea_orm::DatabaseConnection,
+    input: &MigrationInput,
+) -> MegaResult {
+    let mapping = &input.mapping;
+    let legacy_custom_reactions = &input.custom_reactions;
+    let legacy_og = &input.open_graph_links;
+    let legacy_threads = &input.threads;
+    let legacy_memberships = &input.memberships;
+    let legacy_updates = &input.membership_updates;
+    let legacy_messages = &input.messages;
+    let legacy_notifs = &input.notifications;
+    let legacy_attachments = &input.attachments;
+    let legacy_reactions = &input.reactions;
+
     println!("\n=== Starting Migration ===");
 
     // 1. custom_reactions
@@ -404,7 +476,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
     // Sort by created_at to keep earliest on conflict
     let mut custom_reaction_list = Vec::new();
-    for v in &legacy_custom_reactions {
+    for v in legacy_custom_reactions {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let created_at = get_dt(&v["created_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
         custom_reaction_list.push((id, created_at, v));
@@ -435,7 +507,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         let file_type = get_str(&v["file_type"]).unwrap_or_default();
         let user_id = get_i64(&v["user_id"]);
         let username = resolve_username(
-            &mapping,
+            mapping,
             user_id,
             None,
             &format!("custom_reactions[{id}].user_id"),
@@ -473,7 +545,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut og_skip = 0;
 
     let mut seen_urls = HashSet::new();
-    for v in &legacy_og {
+    for v in legacy_og {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let url = get_str(&v["url"]).unwrap_or_default();
         if id == 0 || url.is_empty() {
@@ -517,7 +589,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut channel_skip = 0;
     let mut imported_channel_ids = HashSet::new();
 
-    for v in &legacy_threads {
+    for v in legacy_threads {
         let id = get_i64(&v["id"]).unwrap_or(0);
         if id == 0 {
             channel_skip += 1;
@@ -544,7 +616,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         let notification_forced_at = get_dt(&v["notification_forced_at"]);
         let owner_id = get_i64(&v["owner_id"]);
         let owner_username = resolve_username(
-            &mapping,
+            mapping,
             owner_id,
             None,
             &format!("message_threads[{id}].owner_id"),
@@ -587,7 +659,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut membership_skip = 0;
     let mut imported_membership_ids = HashSet::new();
 
-    for v in &legacy_memberships {
+    for v in legacy_memberships {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let channel_id = get_i64(&v["message_thread_id"]).unwrap_or(0);
         if id == 0 || !imported_channel_ids.contains(&channel_id) {
@@ -598,7 +670,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         let user_id = get_i64(&v["user_id"]);
         let membership_id = get_i64(&v["organization_membership_id"]);
         let username = resolve_username(
-            &mapping,
+            mapping,
             user_id,
             membership_id,
             &format!("message_thread_memberships[{id}]"),
@@ -639,7 +711,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut membership_update_out = 0;
     let mut membership_update_skip = 0;
 
-    for v in &legacy_updates {
+    for v in legacy_updates {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let channel_id = get_i64(&v["message_thread_id"]).unwrap_or(0);
         if id == 0 || !imported_channel_ids.contains(&channel_id) {
@@ -649,7 +721,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
         let actor_id = get_i64(&v["actor_id"]);
         let actor_username = resolve_username(
-            &mapping,
+            mapping,
             actor_id,
             None,
             &format!("message_thread_membership_updates[{id}].actor_id"),
@@ -662,7 +734,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                 for item in arr {
                     if let Some(id_val) = item.as_i64() {
                         resolved.push(resolve_username(
-                            &mapping,
+                            mapping,
                             Some(id_val),
                             None,
                             &format!("message_thread_membership_updates[{id}].{field}"),
@@ -670,7 +742,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                     } else if let Some(str_val) = item.as_str() {
                         if let Ok(id_val) = str_val.parse::<i64>() {
                             resolved.push(resolve_username(
-                                &mapping,
+                                mapping,
                                 Some(id_val),
                                 None,
                                 &format!("message_thread_membership_updates[{id}].{field}"),
@@ -723,7 +795,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut message_skip_calls = 0;
     let mut imported_message_ids = HashSet::new();
 
-    for v in &legacy_messages {
+    for v in legacy_messages {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let channel_id = get_i64(&v["message_thread_id"]).unwrap_or(0);
         if id == 0 || !imported_channel_ids.contains(&channel_id) {
@@ -751,7 +823,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         let sender_id = get_i64(&v["sender_id"]);
         let sender_username = if sender_id.is_some() {
             Some(resolve_username(
-                &mapping,
+                mapping,
                 sender_id,
                 None,
                 &format!("messages[{id}].sender_id"),
@@ -805,7 +877,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut notif_out = 0;
     let mut notif_skip = 0;
 
-    for v in &legacy_notifs {
+    for v in legacy_notifs {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let membership_id = get_i64(&v["message_thread_membership_id"]).unwrap_or(0);
         let message_id = get_i64(&v["message_id"]).unwrap_or(0);
@@ -843,7 +915,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut attachment_out = 0;
     let mut attachment_skip = 0;
 
-    for v in &legacy_attachments {
+    for v in legacy_attachments {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let subject_type = get_str(&v["subject_type"]).unwrap_or_default();
         let subject_id = get_i64(&v["subject_id"]).unwrap_or(0);
@@ -902,7 +974,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let mut reaction_out = 0;
     let mut reaction_skip = 0;
 
-    for v in &legacy_reactions {
+    for v in legacy_reactions {
         let id = get_i64(&v["id"]).unwrap_or(0);
         let subject_type = get_str(&v["subject_type"]).unwrap_or_default();
         let subject_id = get_i64(&v["subject_id"]).unwrap_or(0);
@@ -914,12 +986,8 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
         let user_id = get_i64(&v["user_id"]);
         let membership_id = get_i64(&v["organization_membership_id"]);
-        let username = resolve_username(
-            &mapping,
-            user_id,
-            membership_id,
-            &format!("reactions[{id}]"),
-        )?;
+        let username =
+            resolve_username(mapping, user_id, membership_id, &format!("reactions[{id}]"))?;
 
         let public_id = get_str(&v["public_id"])
             .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
@@ -1099,8 +1167,6 @@ mod tests {
         let input_dir = temp.path().join("exports");
         fs::create_dir(&input_dir).unwrap();
 
-        // Write user mappings
-        let mapping_file = temp.path().join("mapping.json");
         let mapping_content = r#"{
             "user_mappings": {
                 "1": "alice",
@@ -1111,9 +1177,8 @@ mod tests {
                 "11": "bob"
             }
         }"#;
-        fs::write(&mapping_file, mapping_content).unwrap();
+        fs::write(temp.path().join("mapping.json"), mapping_content).unwrap();
 
-        // Write legacy message_threads.json
         fs::write(
             input_dir.join("message_threads.json"),
             r#"[
@@ -1131,7 +1196,6 @@ mod tests {
         )
         .unwrap();
 
-        // Write legacy message_thread_memberships.json
         fs::write(
             input_dir.join("message_thread_memberships.json"),
             r#"[
@@ -1155,7 +1219,6 @@ mod tests {
         )
         .unwrap();
 
-        // Write legacy messages.json
         fs::write(
             input_dir.join("messages.json"),
             r#"[
@@ -1182,7 +1245,6 @@ mod tests {
         )
         .unwrap();
 
-        // Write custom_reactions.json
         fs::write(
             input_dir.join("custom_reactions.json"),
             r#"[
@@ -1200,7 +1262,6 @@ mod tests {
         )
         .unwrap();
 
-        // Write reactions.json
         fs::write(
             input_dir.join("reactions.json"),
             r#"[
@@ -1218,13 +1279,11 @@ mod tests {
         )
         .unwrap();
 
-        // Now run the migration logic manually by mimicking the command exec
         let db_dir = tempdir().unwrap();
         let storage = test_storage(db_dir.path()).await;
         let mono_storage = storage.mono_storage();
         let conn = mono_storage.get_connection();
 
-        // Read thread
         let threads_data: Vec<serde_json::Value> = serde_json::from_str(
             &fs::read_to_string(input_dir.join("message_threads.json")).unwrap(),
         )
@@ -1250,7 +1309,6 @@ mod tests {
         };
         am.insert(conn).await.unwrap();
 
-        // Query database to ensure channel is inserted
         let inserted = crate::callisto::channel::Entity::find()
             .all(conn)
             .await
@@ -1258,6 +1316,661 @@ mod tests {
         assert_eq!(inserted.len(), 1);
         assert_eq!(inserted[0].id, 101);
         assert_eq!(inserted[0].title.as_deref(), Some("General"));
+    }
+
+    #[tokio::test]
+    async fn test_migration_e2e_full_fixture() {
+        let temp = tempdir().unwrap();
+        let input_dir = temp.path().join("exports");
+        fs::create_dir(&input_dir).unwrap();
+
+        let mapping = MigrationMapping {
+            user_mappings: HashMap::from([
+                ("1".to_string(), "alice".to_string()),
+                ("2".to_string(), "bob".to_string()),
+                ("3".to_string(), "carol".to_string()),
+                ("4".to_string(), "dave".to_string()),
+            ]),
+            org_membership_mappings: HashMap::from([
+                ("10".to_string(), "alice".to_string()),
+                ("11".to_string(), "bob".to_string()),
+            ]),
+        };
+
+        let legacy_custom_reactions = vec![
+            serde_json::json!({
+                "id": 401,
+                "public_id": "cr401xxxxxxx",
+                "name": "rocket",
+                "file_path": "path/to/rocket.png",
+                "file_type": "image/png",
+                "user_id": 1,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 402,
+                "public_id": "cr402xxxxxxx",
+                "name": "Rocket",
+                "file_path": "path/to/rocket2.png",
+                "file_type": "image/png",
+                "user_id": 2,
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 403,
+                "public_id": "cr403xxxxxxx",
+                "name": "thumbsup",
+                "file_path": "path/to/thumbsup.png",
+                "file_type": "image/png",
+                "user_id": 3,
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+        ];
+
+        let legacy_og = vec![
+            serde_json::json!({
+                "id": 601,
+                "url": "https://example.com/article",
+                "title": "Example Article",
+                "image_path": "path/to/og_image.png",
+                "favicon_path": "path/to/favicon.ico",
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 602,
+                "url": "https://example.com/article",
+                "title": "Duplicate URL",
+                "image_path": null,
+                "favicon_path": null,
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+        ];
+
+        let legacy_threads = vec![
+            serde_json::json!({
+                "id": 101,
+                "public_id": "thread101xxx",
+                "title": "General",
+                "last_message_at": "2026-05-30 12:00:00",
+                "latest_message_id": 303,
+                "members_count": 3,
+                "image_path": null,
+                "group": true,
+                "owner_id": 1,
+                "discarded_at": null,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 102,
+                "public_id": "thread102xxx",
+                "title": "DM alice-bob",
+                "last_message_at": "2026-05-30 12:01:00",
+                "owner_id": 1,
+                "group": false,
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 103,
+                "public_id": "thread103xxx",
+                "title": "Integration DM",
+                "last_message_at": "2026-05-30 12:02:00",
+                "owner_id": 1,
+                "group": false,
+                "integration_id": 42,
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+            serde_json::json!({
+                "id": 104,
+                "public_id": "thread104xxx",
+                "title": "OAuth App Thread",
+                "last_message_at": "2026-05-30 12:03:00",
+                "owner_id": 1,
+                "group": false,
+                "oauth_application_id": 7,
+                "created_at": "2026-05-30 12:03:00",
+                "updated_at": "2026-05-30 12:03:00"
+            }),
+        ];
+
+        let legacy_memberships = vec![
+            serde_json::json!({
+                "id": 201,
+                "message_thread_id": 101,
+                "user_id": 1,
+                "last_read_at": "2026-05-30 12:00:00",
+                "notification_level": 1,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 202,
+                "message_thread_id": 101,
+                "user_id": 2,
+                "last_read_at": "2026-05-30 12:00:00",
+                "notification_level": 0,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 203,
+                "message_thread_id": 101,
+                "user_id": 3,
+                "last_read_at": "2026-05-30 12:00:00",
+                "notification_level": 0,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 204,
+                "message_thread_id": 102,
+                "user_id": 1,
+                "last_read_at": "2026-05-30 12:01:00",
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 205,
+                "message_thread_id": 102,
+                "user_id": 2,
+                "last_read_at": "2026-05-30 12:01:00",
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 206,
+                "message_thread_id": 103,
+                "user_id": 1,
+                "last_read_at": "2026-05-30 12:02:00",
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+            serde_json::json!({
+                "id": 207,
+                "message_thread_id": 104,
+                "user_id": 1,
+                "last_read_at": "2026-05-30 12:03:00",
+                "created_at": "2026-05-30 12:03:00",
+                "updated_at": "2026-05-30 12:03:00"
+            }),
+        ];
+
+        let legacy_updates = vec![
+            serde_json::json!({
+                "id": 701,
+                "message_thread_id": 101,
+                "actor_id": 1,
+                "added_usernames": [2, 3],
+                "removed_usernames": [],
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 702,
+                "message_thread_id": 101,
+                "actor_id": 1,
+                "added_usernames": [],
+                "removed_usernames": [3],
+                "created_at": "2026-05-30 12:05:00",
+                "updated_at": "2026-05-30 12:05:00"
+            }),
+            serde_json::json!({
+                "id": 703,
+                "message_thread_id": 103,
+                "actor_id": 1,
+                "added_usernames": [2],
+                "removed_usernames": [],
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+        ];
+
+        let legacy_messages = vec![
+            serde_json::json!({
+                "id": 301,
+                "message_thread_id": 101,
+                "sender_id": 1,
+                "content": "Hello everyone!",
+                "public_id": "msg301xxxxxx",
+                "reply_to_id": null,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 302,
+                "message_thread_id": 101,
+                "sender_id": 2,
+                "content": "Hi alice!",
+                "public_id": "msg302xxxxxx",
+                "reply_to_id": 301,
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 303,
+                "message_thread_id": 101,
+                "sender_id": 3,
+                "content": "Hey folks",
+                "public_id": "msg303xxxxxx",
+                "reply_to_id": null,
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+            serde_json::json!({
+                "id": 304,
+                "message_thread_id": 101,
+                "sender_id": 1,
+                "content": "Shared a post",
+                "public_id": "msg304xxxxxx",
+                "system_shared_post_id": 99,
+                "created_at": "2026-05-30 12:03:00",
+                "updated_at": "2026-05-30 12:03:00"
+            }),
+            serde_json::json!({
+                "id": 305,
+                "message_thread_id": 101,
+                "sender_id": 1,
+                "content": "Call started",
+                "public_id": "msg305xxxxxx",
+                "call_id": 55,
+                "created_at": "2026-05-30 12:04:00",
+                "updated_at": "2026-05-30 12:04:00"
+            }),
+            serde_json::json!({
+                "id": 306,
+                "message_thread_id": 101,
+                "sender_id": 1,
+                "content": "Integration message",
+                "public_id": "msg306xxxxxx",
+                "integration_id": 42,
+                "created_at": "2026-05-30 12:05:00",
+                "updated_at": "2026-05-30 12:05:00"
+            }),
+            serde_json::json!({
+                "id": 307,
+                "message_thread_id": 102,
+                "sender_id": 1,
+                "content": "DM from alice",
+                "public_id": "msg307xxxxxx",
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 308,
+                "message_thread_id": 102,
+                "sender_id": 2,
+                "content": "DM from bob",
+                "public_id": "msg308xxxxxx",
+                "reply_to_id": 307,
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+            serde_json::json!({
+                "id": 309,
+                "message_thread_id": 103,
+                "sender_id": 1,
+                "content": "Integration DM message",
+                "public_id": "msg309xxxxxx",
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+            serde_json::json!({
+                "id": 310,
+                "message_thread_id": 104,
+                "sender_id": 1,
+                "content": "OAuth app message",
+                "public_id": "msg310xxxxxx",
+                "created_at": "2026-05-30 12:03:00",
+                "updated_at": "2026-05-30 12:03:00"
+            }),
+        ];
+
+        let legacy_notifs = vec![
+            serde_json::json!({
+                "id": 801,
+                "message_thread_membership_id": 201,
+                "message_id": 302,
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 802,
+                "message_thread_membership_id": 202,
+                "message_id": 301,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 803,
+                "message_thread_membership_id": 206,
+                "message_id": 309,
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+        ];
+
+        let legacy_attachments = vec![
+            serde_json::json!({
+                "id": 901,
+                "public_id": "att901xxxxxx",
+                "file_path": "chat/attachments/file1.png",
+                "file_type": "image/png",
+                "subject_type": "Message",
+                "subject_id": 301,
+                "preview_file_path": "chat/attachments/file1_thumb.png",
+                "width": 800,
+                "height": 600,
+                "duration": null,
+                "position": 1,
+                "name": "screenshot.png",
+                "size": 102400,
+                "gallery_id": null,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+            serde_json::json!({
+                "id": 902,
+                "public_id": "att902xxxxxx",
+                "file_path": "chat/attachments/file2.jpg",
+                "file_type": "image/jpeg",
+                "subject_type": "Message",
+                "subject_id": 302,
+                "preview_file_path": null,
+                "width": 1024,
+                "height": 768,
+                "duration": null,
+                "position": 1,
+                "name": "photo.jpg",
+                "size": 204800,
+                "gallery_id": 1,
+                "created_at": "2026-05-30 12:01:00",
+                "updated_at": "2026-05-30 12:01:00"
+            }),
+            serde_json::json!({
+                "id": 903,
+                "public_id": "att903xxxxxx",
+                "file_path": "chat/attachments/file3.pdf",
+                "file_type": "application/pdf",
+                "subject_type": "Message",
+                "subject_id": 305,
+                "preview_file_path": null,
+                "width": null,
+                "height": null,
+                "duration": null,
+                "position": 1,
+                "name": "doc.pdf",
+                "size": 51200,
+                "gallery_id": null,
+                "created_at": "2026-05-30 12:04:00",
+                "updated_at": "2026-05-30 12:04:00"
+            }),
+            serde_json::json!({
+                "id": 904,
+                "public_id": "att904xxxxxx",
+                "file_path": "chat/attachments/file4.png",
+                "file_type": "image/png",
+                "subject_type": "Post",
+                "subject_id": 999,
+                "preview_file_path": null,
+                "width": 100,
+                "height": 100,
+                "duration": null,
+                "position": 1,
+                "name": "post_attachment.png",
+                "size": 1024,
+                "gallery_id": null,
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+        ];
+
+        let legacy_reactions = vec![
+            serde_json::json!({
+                "id": 501,
+                "public_id": "rx501xxxxxxx",
+                "subject_type": "Message",
+                "subject_id": 301,
+                "user_id": 2,
+                "content": "🎉",
+                "created_at": "2026-05-30 12:02:00",
+                "updated_at": "2026-05-30 12:02:00"
+            }),
+            serde_json::json!({
+                "id": 502,
+                "public_id": "rx502xxxxxxx",
+                "subject_type": "Message",
+                "subject_id": 301,
+                "user_id": 3,
+                "content": "👍",
+                "created_at": "2026-05-30 12:03:00",
+                "updated_at": "2026-05-30 12:03:00"
+            }),
+            serde_json::json!({
+                "id": 503,
+                "public_id": "rx503xxxxxxx",
+                "subject_type": "Message",
+                "subject_id": 302,
+                "user_id": 1,
+                "content": null,
+                "custom_reaction_id": 401,
+                "created_at": "2026-05-30 12:04:00",
+                "updated_at": "2026-05-30 12:04:00"
+            }),
+            serde_json::json!({
+                "id": 504,
+                "public_id": "rx504xxxxxxx",
+                "subject_type": "Message",
+                "subject_id": 305,
+                "user_id": 2,
+                "content": "🔥",
+                "created_at": "2026-05-30 12:05:00",
+                "updated_at": "2026-05-30 12:05:00"
+            }),
+            serde_json::json!({
+                "id": 505,
+                "public_id": "rx505xxxxxxx",
+                "subject_type": "Post",
+                "subject_id": 999,
+                "user_id": 1,
+                "content": "❤️",
+                "created_at": "2026-05-30 12:00:00",
+                "updated_at": "2026-05-30 12:00:00"
+            }),
+        ];
+
+        let input = MigrationInput {
+            mapping,
+            custom_reactions: legacy_custom_reactions,
+            open_graph_links: legacy_og,
+            threads: legacy_threads,
+            memberships: legacy_memberships,
+            membership_updates: legacy_updates,
+            messages: legacy_messages,
+            notifications: legacy_notifs,
+            attachments: legacy_attachments,
+            reactions: legacy_reactions,
+        };
+
+        let db_dir = tempdir().unwrap();
+        let storage = test_storage(db_dir.path()).await;
+        let mono_storage = storage.mono_storage();
+        let conn = mono_storage.get_connection();
+
+        run_migration(conn, &input).await.unwrap();
+
+        let db_custom_reactions = crate::callisto::custom_reaction::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_custom_reactions, 2,
+            "custom_reactions: rocket (401) imported, Rocket (402) skipped as lowercase conflict, thumbsup (403) imported"
+        );
+
+        let db_og = crate::callisto::open_graph_link::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_og, 1,
+            "open_graph_links: first URL imported, duplicate URL skipped"
+        );
+
+        let db_channels = crate::callisto::channel::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_channels, 2,
+            "channels: 101 (General) and 102 (DM) imported, 103 (integration) and 104 (oauth) skipped"
+        );
+
+        let db_memberships = crate::callisto::channel_membership::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_memberships, 5,
+            "memberships: 201-205 imported (channels 101+102), 206-207 skipped (channels 103+104)"
+        );
+
+        let db_updates = crate::callisto::channel_membership_update::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_updates, 2,
+            "membership_updates: 701+702 imported (channel 101), 703 skipped (channel 103)"
+        );
+
+        let db_messages = crate::callisto::message::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_messages, 6,
+            "messages: 301-304 imported (channel 101), 307-308 imported (channel 102), 305 (call) skipped, 306 (integration) skipped, 309-310 skipped (channels 103+104)"
+        );
+
+        let db_notifs = crate::callisto::message_notification::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_notifs, 2,
+            "message_notifications: 801+802 imported (valid membership+message), 803 skipped (membership 206 not imported)"
+        );
+
+        let db_attachments = crate::callisto::attachment::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_attachments, 2,
+            "attachments: 901+902 imported (subject_type=Message, subject_id in imported messages), 903 skipped (subject_id 305 not imported), 904 skipped (subject_type=Post)"
+        );
+
+        let db_reactions = crate::callisto::reactions::Entity::find()
+            .count(conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            db_reactions, 3,
+            "reactions: 501+502+503 imported (subject_type=Message, subject_id in imported messages), 504 skipped (subject_id 305 not imported), 505 skipped (subject_type=Post)"
+        );
+
+        let channel_101 = crate::callisto::channel::Entity::find_by_id(101)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("channel 101 should exist");
+        assert_eq!(channel_101.owner_username, "alice");
+        assert_eq!(channel_101.title.as_deref(), Some("General"));
+
+        let channel_102 = crate::callisto::channel::Entity::find_by_id(102)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("channel 102 should exist");
+        assert_eq!(channel_102.owner_username, "alice");
+        assert_eq!(channel_102.title.as_deref(), Some("DM alice-bob"));
+
+        let msg_304 = crate::callisto::message::Entity::find_by_id(304)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("message 304 should exist");
+        assert_eq!(msg_304.content, "[Shared Post]");
+
+        let msg_301 = crate::callisto::message::Entity::find_by_id(301)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("message 301 should exist");
+        assert_eq!(msg_301.sender_username, Some("alice".to_string()));
+
+        let msg_302 = crate::callisto::message::Entity::find_by_id(302)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("message 302 should exist");
+        assert_eq!(msg_302.reply_to_id, Some(301));
+
+        let cr_401 = crate::callisto::custom_reaction::Entity::find_by_id(401)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("custom_reaction 401 should exist");
+        assert_eq!(cr_401.username, "alice");
+        assert_eq!(cr_401.name, "rocket");
+
+        let cr_403 = crate::callisto::custom_reaction::Entity::find_by_id(403)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("custom_reaction 403 should exist");
+        assert_eq!(cr_403.username, "carol");
+        assert_eq!(cr_403.name, "thumbsup");
+
+        let rx_503 = crate::callisto::reactions::Entity::find_by_id(503)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("reaction 503 should exist");
+        assert_eq!(rx_503.custom_reaction_id, Some(401));
+        assert_eq!(rx_503.username, "alice");
+
+        let att_901 = crate::callisto::attachment::Entity::find_by_id(901)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("attachment 901 should exist");
+        assert_eq!(att_901.subject_id, 301);
+        assert_eq!(att_901.name, "screenshot.png");
+        assert_eq!(att_901.size, 102400);
+
+        let notif_801 = crate::callisto::message_notification::Entity::find_by_id(801)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("notification 801 should exist");
+        assert_eq!(notif_801.message_id, 302);
+        assert_eq!(notif_801.channel_membership_id, 201);
+
+        let update_701 = crate::callisto::channel_membership_update::Entity::find_by_id(701)
+            .one(conn)
+            .await
+            .unwrap()
+            .expect("update 701 should exist");
+        assert_eq!(update_701.actor_username, "alice");
+        assert_eq!(update_701.channel_id, 101);
     }
 
     #[tokio::test]
