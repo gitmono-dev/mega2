@@ -576,7 +576,8 @@ impl VaultCore {
         }
         #[cfg(not(unix))]
         {
-            let rollback_path = key_path.with_extension("json.restore-bak");
+            let rollback_path =
+                key_path.with_extension(format!("json.restore-bak.{}", std::process::id()));
             let rollback_created = if key_path.exists() {
                 fs::rename(key_path, &rollback_path).map_err(|source| {
                     VaultError::CoreKeyWrite {
