@@ -1093,6 +1093,51 @@ token_ref = "{NOTIFICATION_WEBHOOK_TOKEN_REF}"
     );
 }
 
+// ===== 真实 S3-compatible 对象存储后端 gate（integration.md P2）=====
+
+#[test]
+fn integration_object_storage_s3_compatible_smoke() {
+    // 启动真实 Minio 服务后，通过 `debug storage-smoke` 对 S3-compatible 后端
+    // 执行 put/get/delete  round-trip，验证对象存储后端在 post-vault 启动路径
+    // 正确解析 endpoint、bucket、credential 并完成真实 I/O。
+    let minio_endpoint = "http://127.0.0.1:19000";
+    let minio_available = std::net::TcpStream::connect("127.0.0.1:19000").is_ok();
+    if !minio_available {
+        eprintln!(
+            "integration_object_storage_s3_compatible_smoke requires Minio at {}; \
+             run `docker compose -f docker-compose.test.yml up -d minio` first, skipping",
+            minio_endpoint
+        );
+        return;
+    }
+
+    let env = VaultCliEnv::new();
+    let mut command = env.full_config_command();
+    command
+        // 关闭 mail，避免本测试依赖 mail password vault secret。
+        .env("MEGA_MAIL__ENABLED", "false")
+        // 覆盖为 S3-compatible（Minio）配置。
+        .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible")
+        .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
+        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "testbucket")
+        .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", minio_endpoint)
+        .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "minioadmin")
+        .env("MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY", "minioadmin");
+
+    command.args([
+        "debug",
+        "storage-smoke",
+        "--key",
+        "it-s3-smoke/test-object.bin",
+    ]);
+    let output = run(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "debug storage-smoke should succeed against Minio; stderr: {stderr}"
+    );
+}
+
 // ===== 错误诊断脱敏 gate（integration.md 场景 7）=====
 
 #[test]
