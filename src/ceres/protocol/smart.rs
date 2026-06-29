@@ -109,16 +109,22 @@ impl SmartSession {
 
         let mut read_first_line = false;
         loop {
-            let (bytes_take, pkt_line) = try_read_pkt_line(upload_request)?;
-            // read 0000 to continue and read empty str to break
-            if bytes_take == 0 {
-                if upload_request.is_empty() {
-                    break;
-                } else {
-                    continue;
+            let pkt_line = try_read_pkt_line(upload_request)?;
+            let dst = match pkt_line {
+                PktLine::Flush => {
+                    if upload_request.is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
                 }
-            }
-            let dst = pkt_line.to_vec();
+                PktLine::Data(data) => data.to_vec(),
+                _ => {
+                    return Err(ProtocolError::InvalidInput(
+                        "unexpected pkt-line type in upload-pack".to_owned(),
+                    ));
+                }
+            };
             if dst.len() < 4 {
                 return Err(ProtocolError::InvalidInput(
                     "pkt-line command is shorter than 4 bytes".to_owned(),
@@ -238,9 +244,9 @@ impl SmartSession {
     ) -> Result<Vec<RefCommand>, ProtocolError> {
         let mut commands: Vec<RefCommand> = Vec::new();
         while !protocol_bytes.is_empty() {
-            let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
-            if bytes_take != 0 {
-                let command = self.parse_receive_pack_command_line(&mut pkt_line)?;
+            let pkt_line = try_read_pkt_line(&mut protocol_bytes)?;
+            if let PktLine::Data(mut data) = pkt_line {
+                let command = self.parse_receive_pack_command_line(&mut data)?;
                 commands.push(command);
             }
         }
@@ -254,13 +260,21 @@ impl SmartSession {
         let mut commands: Vec<RefCommand> = Vec::new();
 
         while !protocol_bytes.is_empty() {
-            let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
-            if bytes_take == 0 {
-                return Ok((commands, protocol_bytes));
+            let pkt_line = try_read_pkt_line(&mut protocol_bytes)?;
+            match pkt_line {
+                PktLine::Flush => {
+                    return Ok((commands, protocol_bytes));
+                }
+                PktLine::Data(mut data) => {
+                    let command = self.parse_receive_pack_command_line(&mut data)?;
+                    commands.push(command);
+                }
+                _ => {
+                    return Err(ProtocolError::InvalidInput(
+                        "unexpected pkt-line type in receive-pack".to_owned(),
+                    ));
+                }
             }
-
-            let command = self.parse_receive_pack_command_line(&mut pkt_line)?;
-            commands.push(command);
         }
 
         Err(ProtocolError::InvalidInput(
@@ -581,49 +595,20 @@ pub fn add_pkt_line_string(pkt_line_stream: &mut BytesMut, buf_str: String) {
     pkt_line_stream.put(Bytes::from(format!("{buf_str_length:04x}")));
     pkt_line_stream.put(buf_str.as_bytes());
 }
-/// Read a single pkt-format line from the `bytes` buffer and return the line length and line bytes.
-///
-/// If the `bytes` buffer is empty, indicating no more data is available, the function returns a line length of 0 and an empty `Bytes` object.
-///
-/// The pkt-format line consists of a 4-byte length field followed by the line content. The length field specifies the total length of the line, including the length field itself. The line content is returned as a `Bytes` object.
-///
-/// The function first reads the 4-byte length field from the `bytes` buffer. The length value is then parsed as a hexadecimal string and converted into a `usize` value.
-///
-/// If the resulting line length is 0, indicating an empty line, the function returns a line length of 0 and an empty `Bytes` object.
-///
-/// If the line length is non-zero, the function extracts the line content from the `bytes` buffer. The extracted line content is returned as a `Bytes` object.
-/// Note that this operation modifies the `bytes` buffer, consuming the bytes up to the end of the line.
-///
-/// # Arguments
-///
-/// * `bytes` - A mutable reference to a `Bytes` object representing the buffer containing pkt-format data.
-///
-/// # Returns
-///
-/// A tuple `(usize, Bytes)` representing the line length and line bytes respectively. If there is no more data available in the `bytes` buffer, the line length is 0 and an empty `Bytes` object is returned.
-///
-/// # Examples
-///
-/// ```
-/// use bytes::Bytes;
-/// use crate::ceres::protocol::smart::read_pkt_line;
-///
-/// let mut bytes = Bytes::from_static(b"000Bexample");
-/// let (length, line) = read_pkt_line(&mut bytes);
-/// assert_eq!(length, 11);
-/// assert_eq!(line, Bytes::from_static(b"example"));
-/// ```
-pub fn read_pkt_line(bytes: &mut Bytes) -> (usize, Bytes) {
-    try_read_pkt_line(bytes).unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "invalid pkt-line");
-        bytes.clear();
-        (0, Bytes::new())
-    })
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PktLine {
+    Data(Bytes),
+    Flush,
+    Delim,
+    ResponseEnd,
 }
 
-pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), ProtocolError> {
+pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<PktLine, ProtocolError> {
     if bytes.is_empty() {
-        return Ok((0, Bytes::new()));
+        return Err(ProtocolError::InvalidInput(
+            "no pkt-line data available".to_owned(),
+        ));
     }
     if bytes.len() < 4 {
         return Err(ProtocolError::InvalidInput(
@@ -643,26 +628,38 @@ pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), ProtocolEr
         16,
     )
     .map_err(|_| ProtocolError::InvalidInput("pkt-line length header is invalid".to_owned()))?;
-    if pkt_length == 0 {
-        bytes.advance(4);
-        return Ok((0, Bytes::new()));
-    }
-    if pkt_length < 4 {
-        return Err(ProtocolError::InvalidInput(
-            "pkt-line length is smaller than header".to_owned(),
-        ));
-    }
-    if bytes.len() < pkt_length {
-        return Err(ProtocolError::InvalidInput(
-            "pkt-line payload is incomplete".to_owned(),
-        ));
-    }
-    bytes.advance(4);
-    // this operation will change the original bytes
-    let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
-    tracing::debug!("pkt line: {:?}", pkt_line);
 
-    Ok((pkt_length, pkt_line))
+    match pkt_length {
+        0 => {
+            bytes.advance(4);
+            Ok(PktLine::Flush)
+        }
+        1 => {
+            bytes.advance(4);
+            Ok(PktLine::Delim)
+        }
+        2 => {
+            bytes.advance(4);
+            Ok(PktLine::ResponseEnd)
+        }
+        3 => Err(ProtocolError::InvalidInput(
+            "pkt-line length 0x0003 is reserved".to_owned(),
+        )),
+        n if n < 4 => Err(ProtocolError::InvalidInput(
+            "pkt-line length is smaller than header".to_owned(),
+        )),
+        n => {
+            if bytes.len() < n {
+                return Err(ProtocolError::InvalidInput(
+                    "pkt-line payload is incomplete".to_owned(),
+                ));
+            }
+            bytes.advance(4);
+            let pkt_line = bytes.copy_to_bytes(n - 4);
+            tracing::debug!("pkt line: {:?}", pkt_line);
+            Ok(PktLine::Data(pkt_line))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -680,7 +677,7 @@ pub mod test {
             Capability, ServiceType, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
             smart::{
-                PKT_LINE_END_MARKER, add_pkt_line_string, advertised_capabilities, read_pkt_line,
+                PKT_LINE_END_MARKER, PktLine, add_pkt_line_string, advertised_capabilities,
                 read_until_white_space, try_read_pkt_line,
             },
         },
@@ -690,9 +687,11 @@ pub mod test {
     #[test]
     pub fn test_read_pkt_line() {
         let mut bytes = Bytes::from_static(b"001e# service=git-upload-pack\n");
-        let (pkt_length, pkt_line) = read_pkt_line(&mut bytes);
-        assert_eq!(pkt_length, 30);
-        assert_eq!(&pkt_line[..], b"# service=git-upload-pack\n");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(
+            pkt_line,
+            PktLine::Data(Bytes::from_static(b"# service=git-upload-pack\n"))
+        );
     }
 
     #[test]
@@ -711,6 +710,51 @@ pub mod test {
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert_eq!(&bytes[..], b"000babc");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_flush() {
+        let mut bytes = Bytes::from_static(b"0000trailing");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::Flush);
+        assert_eq!(&bytes[..], b"trailing");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_delim() {
+        let mut bytes = Bytes::from_static(b"0001trailing");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::Delim);
+        assert_eq!(&bytes[..], b"trailing");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_response_end() {
+        let mut bytes = Bytes::from_static(b"0002trailing");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::ResponseEnd);
+        assert_eq!(&bytes[..], b"trailing");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_reserved_length_3() {
+        let mut bytes = Bytes::from_static(b"0003");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_empty_input() {
+        let mut bytes = Bytes::new();
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_data() {
+        let mut bytes = Bytes::from_static(b"000Bexample");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::Data(Bytes::from_static(b"example")));
     }
 
     #[test]
