@@ -73,11 +73,12 @@ jobs:
           echo "::add-mask::mono_test_password"
           echo "::add-mask::smtp-test-password"
 
-      - name: Start test services (PostgreSQL, Redis, Mailpit)
+      - name: Start test services (PostgreSQL, Redis, Mailpit, Minio)
         working-directory: monoengine
         run: |
           docker compose -f docker-compose.test.yml up -d --wait
           docker compose -f docker-compose.test.yml ps
+          docker compose -f docker-compose.test.yml --profile init run --rm minio-init
 
       - name: Run config sample tests
         working-directory: monoengine

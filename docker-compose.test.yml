@@ -50,8 +50,12 @@ services:
       timeout: 5s
       retries: 20
 
+  # One-shot bucket initialization. Not part of the default `up -d --wait` set
+  # because `--wait` requires selected services to stay running/healthy; run it
+  # explicitly with `docker compose -f docker-compose.test.yml --profile init run --rm minio-init`.
   minio-init:
     image: minio/mc:latest
+    profiles: ["init"]
     depends_on:
       minio:
         condition: service_healthy

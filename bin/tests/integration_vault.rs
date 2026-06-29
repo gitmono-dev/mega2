@@ -1105,7 +1105,9 @@ fn integration_object_storage_s3_compatible_smoke() {
     if !minio_available {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires Minio at {}; \
-             run `docker compose -f docker-compose.test.yml up -d minio` first, skipping",
+             run `docker compose -f docker-compose.test.yml up -d --wait` \
+             and `docker compose -f docker-compose.test.yml --profile init run --rm minio-init` \
+             first, skipping",
             minio_endpoint
         );
         return;

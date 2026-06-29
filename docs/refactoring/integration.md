@@ -433,7 +433,9 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 ### 本地快速运行
 
 ```bash
-docker compose -f docker-compose.test.yml up -d
+docker compose -f docker-compose.test.yml up -d --wait
+# 初始化 Minio 测试 bucket（one-shot 服务，不纳入默认 --wait 集合）：
+docker compose -f docker-compose.test.yml --profile init run --rm minio-init
 
 docker compose -f docker-compose.test.yml exec postgres pg_isready -U mono -d monoengine_it
 docker compose -f docker-compose.test.yml exec redis redis-cli ping
@@ -527,7 +529,7 @@ jobs:
           cargo test -p monoengine-core 'notification::triggers::tests' -- --nocapture
 ```
 
-> 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Check formatting」步骤跑 `cargo +nightly fmt --all --check`、「Lint」步骤跑 `cargo clippy --all-targets --all-features -- -D warnings`（与本示例及 general.md 第 297/310 行强制的 clippy 验收门禁对齐；stable 工具链以 `--component clippy` 安装），「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
+> 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Check formatting」步骤跑 `cargo +nightly fmt --all --check`、「Lint」步骤跑 `cargo clippy --all-targets --all-features -- -D warnings`（与本示例及 general.md 第 297/310 行强制的 clippy 验收门禁对齐；stable 工具链以 `--component clippy` 安装），「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit+minio 并随后以 `--profile init run --rm minio-init` 初始化 bucket，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
 
 ## 数据流与控制流契约
 
