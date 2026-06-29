@@ -465,7 +465,7 @@ async fn send_message(
     let mention_enqueued = if mentioned.is_empty() {
         std::collections::HashSet::new()
     } else {
-        match crate::notification::triggers::on_chat_mention_created(
+        crate::notification::triggers::on_chat_mention_created(
             &state.storage.notification_storage(),
             &user.username,
             &channel_id,
@@ -473,13 +473,10 @@ async fn send_message(
             &mentioned,
         )
         .await
-        {
-            Ok(enqueued) => enqueued,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to enqueue chat mention notification");
-                std::collections::HashSet::new()
-            }
-        }
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to enqueue chat mention notifications");
+            std::collections::HashSet::new()
+        })
     };
 
     if let Some(reply_to_public_id) = &payload.reply_to_public_id {

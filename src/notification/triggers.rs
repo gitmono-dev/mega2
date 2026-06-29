@@ -708,7 +708,7 @@ pub async fn on_chat_mention_created_with_registry(
             None => continue,
         };
 
-        let mail = mail_templates.render(
+        let mail = match mail_templates.render(
             &chat_mention_created_mail_template_key(),
             settings.preferred_locale.as_deref(),
             &[
@@ -716,9 +716,19 @@ pub async fn on_chat_mention_created_with_registry(
                 ("channel_name", channel_name),
                 ("message_text", message_text),
             ],
-        )?;
+        ) {
+            Ok(mail) => mail,
+            Err(e) => {
+                tracing::warn!(
+                    username = %username,
+                    error = %e,
+                    "failed to render chat mention email; skipping recipient"
+                );
+                continue;
+            }
+        };
 
-        notif_stg
+        if let Err(e) = notif_stg
             .enqueue_email_job(
                 username,
                 &settings.email,
@@ -727,7 +737,15 @@ pub async fn on_chat_mention_created_with_registry(
                 &mail.html,
                 mail.text.as_deref(),
             )
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                username = %username,
+                error = %e,
+                "failed to enqueue chat mention email; skipping recipient"
+            );
+            continue;
+        }
         enqueued.insert(username.clone());
     }
 
