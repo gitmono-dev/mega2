@@ -70,6 +70,7 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
         state,
         id: 0,
         channels: HashMap::new(),
+        v2_channels: HashMap::new(),
         authenticated_user: None,
     };
     let server_url = format!("{host}:{ssh_port}");

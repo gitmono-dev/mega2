@@ -17,6 +17,7 @@ use crate::{
         protocol::{
             ServiceType, SmartSession, TransportProtocol,
             smart::{self},
+            v2,
         },
     },
     contract::git_protocol::{check_push_permission, check_upload_pack_access},
@@ -46,6 +47,7 @@ pub struct SshServer {
     pub clients: Arc<Mutex<ClientMap>>,
     pub id: usize,
     pub channels: HashMap<ChannelId, GitSshChannelState>,
+    pub v2_channels: HashMap<ChannelId, bool>,
     pub state: ProtocolApiState,
     pub authenticated_user: Option<String>,
 }
@@ -79,6 +81,19 @@ impl server::Handler for SshServer {
             clients.insert((self.id, channel.id()), channel);
         }
         Ok(true)
+    }
+
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if variable_name == "GIT_PROTOCOL" && variable_value == "version=2" {
+            self.v2_channels.insert(channel, true);
+        }
+        Ok(())
     }
 
     /// # Executes a request on the SSH server.
@@ -138,17 +153,31 @@ impl server::Handler for SshServer {
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
-                // TODO handler ProtocolError
-                let res = smart_protocol.git_info_refs(&self.state).await?;
-                self.channels.insert(
-                    channel,
-                    GitSshChannelState {
-                        smart_protocol,
-                        data_combined: BytesMut::new(),
-                    },
-                );
-                session.data(channel, res.to_vec())?;
-                session.channel_success(channel)?;
+
+                let is_v2 = self.v2_channels.get(&channel).copied().unwrap_or(false);
+                if is_v2 && service_type == ServiceType::UploadPack {
+                    let v2_adv = v2::build_v2_capability_advertisement();
+                    self.channels.insert(
+                        channel,
+                        GitSshChannelState {
+                            smart_protocol,
+                            data_combined: BytesMut::new(),
+                        },
+                    );
+                    session.data(channel, v2_adv.to_vec())?;
+                    session.channel_success(channel)?;
+                } else {
+                    let res = smart_protocol.git_info_refs(&self.state).await?;
+                    self.channels.insert(
+                        channel,
+                        GitSshChannelState {
+                            smart_protocol,
+                            data_combined: BytesMut::new(),
+                        },
+                    );
+                    session.data(channel, res.to_vec())?;
+                    session.channel_success(channel)?;
+                }
             }
             //Note that currently mega does not support pure ssh to transfer files, still relay on the https server.
             //see https://github.com/git-lfs/git-lfs/blob/main/docs/proposals/ssh_adapter.md for more details about pure ssh file transfer.
@@ -442,10 +471,14 @@ async fn handle_upload_pack(
     data: &[u8],
     session: &mut Session,
 ) {
+    let mut body = Bytes::copy_from_slice(data);
+    if v2::is_v2_upload_pack_request(&mut body) {
+        handle_v2_upload_pack_ssh(state, api_state, channel, &mut body, session).await;
+        return;
+    }
+
     let smart_protocol = &mut state.smart_protocol;
-    let (mut send_pack_data, buf) = match smart_protocol
-        .git_upload_pack(api_state, &mut Bytes::copy_from_slice(data))
-        .await
+    let (mut send_pack_data, buf) = match smart_protocol.git_upload_pack(api_state, &mut body).await
     {
         Ok(result) => result,
         Err(e) => {
@@ -478,6 +511,62 @@ async fn handle_upload_pack(
         }
     }
     let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
+}
+
+async fn handle_v2_upload_pack_ssh(
+    state: &mut GitSshChannelState,
+    api_state: &ProtocolApiState,
+    channel: ChannelId,
+    body: &mut Bytes,
+    session: &mut Session,
+) {
+    let (command, _caps) = match v2::parse_v2_command(body) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            tracing::error!(error = %e, "v2 command parse error");
+            let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+            return;
+        }
+    };
+
+    match command.as_str() {
+        "ls-refs" => {
+            let refs = match v2::handle_v2_ls_refs(&state.smart_protocol, api_state, body).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "v2 ls-refs error");
+                    let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                    return;
+                }
+            };
+            let _ = session.data(channel, refs.to_vec());
+        }
+        "fetch" => {
+            let (mut send_pack_data, protocol_buf) =
+                match v2::handle_v2_fetch(&mut state.smart_protocol, api_state, body).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::error!(error = %e, "v2 fetch error");
+                        let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                        return;
+                    }
+                };
+
+            let _ = session.data(channel, protocol_buf.to_vec());
+
+            while let Some(chunk) = send_pack_data.next().await {
+                let _ = session.data(channel, chunk);
+            }
+            let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
+        }
+        other => {
+            tracing::warn!(command = %other, "unsupported v2 command");
+            let _ = session.data(
+                channel,
+                format!("error: unsupported v2 command: {other}\n").into_bytes(),
+            );
+        }
+    }
 }
 
 async fn handle_receive_pack(

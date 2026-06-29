@@ -250,6 +250,21 @@ pub fn parse_v2_command(request: &mut Bytes) -> Result<(String, BytesMut), Proto
     Ok((command, capabilities))
 }
 
+pub fn is_v2_upload_pack_request(body: &mut Bytes) -> bool {
+    if body.len() < 4 {
+        return false;
+    }
+    let peek = body.clone();
+    let mut peek = peek;
+    match try_read_pkt_line(&mut peek) {
+        Ok(PktLine::Data(data)) => {
+            let line = String::from_utf8_lossy(&data);
+            line.starts_with("command=")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

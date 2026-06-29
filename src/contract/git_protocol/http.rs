@@ -211,7 +211,7 @@ pub async fn git_upload_pack(
     tracing::debug!("Receive bytes: <-------- {:?}", upload_request);
 
     let mut body = upload_request.freeze();
-    if is_v2_upload_pack_request(&mut body) {
+    if v2::is_v2_upload_pack_request(&mut body) {
         return handle_v2_upload_pack(state, &mut pack_protocol, &mut body).await;
     }
 
@@ -251,21 +251,6 @@ pub async fn git_upload_pack(
             .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?,
     )?;
     Ok(response)
-}
-
-fn is_v2_upload_pack_request(body: &mut Bytes) -> bool {
-    if body.len() < 4 {
-        return false;
-    }
-    let peek = body.clone();
-    let mut peek = peek;
-    match smart::try_read_pkt_line(&mut peek) {
-        Ok(smart::PktLine::Data(data)) => {
-            let line = String::from_utf8_lossy(&data);
-            line.starts_with("command=")
-        }
-        _ => false,
-    }
 }
 
 async fn handle_v2_upload_pack(
