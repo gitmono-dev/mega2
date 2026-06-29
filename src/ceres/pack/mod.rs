@@ -230,6 +230,15 @@ pub trait RepoHandler: Send + Sync + 'static {
         Ok((stream, Vec::new()))
     }
 
+    async fn filtered_pack(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        _filter_spec: &str,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.incremental_pack(want, have).await
+    }
+
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError>;
 
     async fn get_blobs_by_hashes(
@@ -409,4 +418,63 @@ pub trait RepoHandler: Send + Sync + 'static {
     }
 
     async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError>;
+
+    async fn traverse_trees_only(
+        &self,
+        tree: Tree,
+        exist_objs: &mut HashSet<String>,
+        sender: Option<&tokio::sync::mpsc::Sender<MetaAttached<Entry, EntryMeta>>>,
+    ) -> Result<(), MegaError> {
+        let mut search_tree_ids = vec![];
+
+        for item in &tree.tree_items {
+            let hash = item.id.to_string();
+            if exist_objs.insert(hash.clone()) && item.mode == TreeItemMode::Tree {
+                search_tree_ids.push(hash);
+            }
+        }
+
+        let trees = self.get_trees_by_hashes(search_tree_ids).await?;
+        for t in trees {
+            self.traverse_trees_only(t, exist_objs, sender).await?;
+        }
+
+        if let Some(sender) = sender {
+            sender
+                .send(MetaAttached {
+                    inner: tree.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        Ok(())
+    }
+
+    async fn traverse_trees_only_for_count(
+        &self,
+        tree: Tree,
+        exist_objs: &HashSet<String>,
+        counted_obj: &mut HashSet<String>,
+        obj_num: &AtomicUsize,
+    ) {
+        let mut search_tree_ids = vec![];
+
+        for item in &tree.tree_items {
+            let hash = item.id.to_string();
+            if !exist_objs.contains(&hash)
+                && counted_obj.insert(hash.clone())
+                && item.mode == TreeItemMode::Tree
+            {
+                search_tree_ids.push(hash);
+            }
+        }
+
+        let trees = self.get_trees_by_hashes(search_tree_ids).await.unwrap();
+        for t in trees {
+            self.traverse_trees_only_for_count(t, exist_objs, counted_obj, obj_num)
+                .await;
+        }
+        obj_num.fetch_add(1, Ordering::SeqCst);
+    }
 }

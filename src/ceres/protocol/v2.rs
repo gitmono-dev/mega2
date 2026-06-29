@@ -17,7 +17,7 @@ use crate::{
 const V2_CAPABILITIES: &[&str] = &[
     "agent=mega/0.1.0",
     "ls-refs",
-    "fetch=shallow",
+    "fetch=shallow filter",
     "server-option",
     "object-format=sha1",
 ];
@@ -124,6 +124,7 @@ pub async fn handle_v2_fetch(
     let mut deepen_depth: Option<u32> = None;
     let mut deepen_relative = false;
     let mut done = false;
+    let mut filter_spec: Option<String> = None;
 
     loop {
         let pkt_line = try_read_pkt_line(request)?;
@@ -153,6 +154,8 @@ pub async fn handle_v2_fetch(
                     return Err(ProtocolError::InvalidInput(
                         "deepen-since and deepen-not are not supported".to_owned(),
                     ));
+                } else if let Some(spec) = line.strip_prefix("filter ") {
+                    filter_spec = Some(spec.to_owned());
                 }
             }
             PktLine::ResponseEnd => break,
@@ -175,7 +178,14 @@ pub async fn handle_v2_fetch(
     let mut protocol_buf = BytesMut::new();
     let mut shallow_commits: Vec<String> = Vec::new();
 
-    let pack_data = if have.is_empty() {
+    let pack_data = if let Some(ref spec) = filter_spec {
+        repo_handler
+            .filtered_pack(want.clone(), have.clone(), spec)
+            .await
+            .map_err(|e| {
+                ProtocolError::InvalidInput(format!("filtered pack generation failed: {e}"))
+            })?
+    } else if have.is_empty() {
         if let Some(depth) = deepen_depth {
             let (stream, shallows) = repo_handler
                 .shallow_pack(want, depth, deepen_relative)

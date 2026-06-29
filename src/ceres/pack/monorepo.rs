@@ -330,6 +330,115 @@ impl RepoHandler for MonoRepo {
         Ok((ReceiverStream::new(stream_rx), shallow_commits))
     }
 
+    async fn filtered_pack(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        filter_spec: &str,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        if filter_spec != "blob:none" {
+            return Err(GitError::CustomError(format!(
+                "unsupported filter spec: {filter_spec}"
+            )));
+        }
+
+        let mut want_clone = want.clone();
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.mono_storage();
+        let obj_num = AtomicUsize::new(0);
+
+        let mut exist_objs = HashSet::new();
+
+        let mut want_commits: Vec<Commit> = storage
+            .get_commits_by_hashes(&want_clone)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(Commit::from_mega_model)
+            .collect();
+        let mut traversal_list: Vec<Commit> = want_commits.clone();
+
+        while let Some(temp) = traversal_list.pop() {
+            for p_commit_id in temp.parent_commit_ids {
+                let p_commit_id = p_commit_id.to_string();
+
+                if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
+                    let parent: Commit = Commit::from_mega_model(
+                        storage
+                            .get_commit_by_hash(&p_commit_id)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    want_commits.push(parent.clone());
+                    want_clone.push(p_commit_id);
+                    traversal_list.push(parent);
+                }
+            }
+        }
+
+        let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
+        let want_trees: HashMap<ObjectHash, Tree> = storage
+            .get_trees_by_hashes(want_tree_ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                (
+                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    Tree::from_mega_model(m),
+                )
+            })
+            .collect();
+
+        obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
+
+        let have_commits = storage.get_commits_by_hashes(&have).await.unwrap();
+        let have_trees = storage
+            .get_trees_by_hashes(have_commits.iter().map(|x| x.tree.clone()).collect())
+            .await
+            .unwrap();
+        for have_tree in have_trees {
+            self.traverse(Tree::from_mega_model(have_tree), &mut exist_objs, None)
+                .await?;
+        }
+
+        let mut counted_obj = HashSet::new();
+        for c in want_commits.clone() {
+            self.traverse_trees_only_for_count(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &exist_objs,
+                &mut counted_obj,
+                &obj_num,
+            )
+            .await;
+        }
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        encoder.encode_async(entry_rx).await.unwrap();
+
+        for c in want_commits {
+            self.traverse_trees_only(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &mut exist_objs,
+                Some(&entry_tx),
+            )
+            .await?;
+            entry_tx
+                .send(MetaAttached {
+                    inner: c.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(entry_tx);
+
+        Ok(ReceiverStream::new(stream_rx))
+    }
+
     async fn incremental_pack(
         &self,
         want: Vec<String>,
