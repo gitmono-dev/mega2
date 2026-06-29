@@ -579,16 +579,23 @@ impl VaultCore {
             use std::sync::atomic::{AtomicU64, Ordering};
 
             /// Per-process monotonic counter for restore rollback file names.
-            /// Combined with the process ID, this guarantees that two restore
-            /// calls never share a rollback path.
             static ROLLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-            let rollback_suffix = format!(
-                "json.restore-bak.{}.{}",
-                std::process::id(),
-                ROLLBACK_COUNTER.fetch_add(1, Ordering::SeqCst)
-            );
-            let rollback_path = key_path.with_extension(rollback_suffix);
+            // Allocate a rollback path that does not already exist. This loop
+            // guards against stale rollback files left by earlier processes that
+            // happened to reuse the same PID, making the restore truly
+            // collision-proof on non-Unix platforms.
+            let rollback_path = loop {
+                let suffix = format!(
+                    "json.restore-bak.{}.{}",
+                    std::process::id(),
+                    ROLLBACK_COUNTER.fetch_add(1, Ordering::SeqCst)
+                );
+                let candidate = key_path.with_extension(suffix);
+                if !candidate.exists() {
+                    break candidate;
+                }
+            };
             let rollback_created = if key_path.exists() {
                 fs::rename(key_path, &rollback_path).map_err(|source| {
                     VaultError::CoreKeyWrite {
