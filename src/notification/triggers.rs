@@ -660,13 +660,14 @@ pub async fn on_item_referenced_with_registry(
 ///
 /// Notifies each mentioned user (excluding the actor), respecting user
 /// preferences and enqueuing an email job for the background dispatcher.
+/// Returns the set of usernames for whom an email job was actually enqueued.
 pub async fn on_chat_mention_created(
     notif_stg: &NotificationStorage,
     actor_username: &str,
     channel_name: &str,
     message_text: &str,
     mentioned_usernames: &[String],
-) -> Result<(), MegaError> {
+) -> Result<HashSet<String>, MegaError> {
     let registry = current_notification_mail_template_registry()?;
     on_chat_mention_created_with_registry(
         notif_stg,
@@ -686,9 +687,10 @@ pub async fn on_chat_mention_created_with_registry(
     channel_name: &str,
     message_text: &str,
     mentioned_usernames: &[String],
-) -> Result<(), MegaError> {
+) -> Result<HashSet<String>, MegaError> {
     ensure_chat_mention_event_type_exists(notif_stg).await?;
 
+    let mut enqueued = HashSet::new();
     for username in mentioned_usernames {
         if username == actor_username {
             continue;
@@ -726,9 +728,10 @@ pub async fn on_chat_mention_created_with_registry(
                 mail.text.as_deref(),
             )
             .await?;
+        enqueued.insert(username.clone());
     }
 
-    Ok(())
+    Ok(enqueued)
 }
 
 /// Trigger: a user receives a reply to their chat message.

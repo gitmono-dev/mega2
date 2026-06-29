@@ -462,8 +462,10 @@ async fn send_message(
         .into_iter()
         .filter(|name| member_names.contains(name))
         .collect();
-    if !mentioned.is_empty()
-        && let Err(e) = crate::notification::triggers::on_chat_mention_created(
+    let mention_enqueued = if mentioned.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        match crate::notification::triggers::on_chat_mention_created(
             &state.storage.notification_storage(),
             &user.username,
             &channel_id,
@@ -471,9 +473,14 @@ async fn send_message(
             &mentioned,
         )
         .await
-    {
-        tracing::warn!(error = %e, "failed to enqueue chat mention notification");
-    }
+        {
+            Ok(enqueued) => enqueued,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to enqueue chat mention notification");
+                std::collections::HashSet::new()
+            }
+        }
+    };
 
     if let Some(reply_to_public_id) = &payload.reply_to_public_id {
         match state
@@ -486,7 +493,7 @@ async fn send_message(
                 if let Some(parent_author) = parent.sender_username
                     && parent_author != user.username
                     && member_names.contains(&parent_author)
-                    && !mentioned.contains(&parent_author)
+                    && !mention_enqueued.contains(&parent_author)
                     && let Err(e) = crate::notification::triggers::on_chat_reply_created(
                         &state.storage.notification_storage(),
                         &user.username,
