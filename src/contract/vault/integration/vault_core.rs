@@ -577,20 +577,27 @@ impl VaultCore {
         #[cfg(not(unix))]
         {
             let rollback_path = key_path.with_extension("json.restore-bak");
-            if key_path.exists() {
+            let rollback_created = if key_path.exists() {
                 fs::rename(key_path, &rollback_path).map_err(|source| {
                     VaultError::CoreKeyWrite {
                         path: key_path.to_path_buf(),
                         source,
                     }
                 })?;
-            }
+                true
+            } else {
+                false
+            };
             match fs::rename(&tmp_path, key_path) {
                 Ok(()) => {
-                    let _ = fs::remove_file(&rollback_path);
+                    if rollback_created {
+                        let _ = fs::remove_file(&rollback_path);
+                    }
                 }
                 Err(source) => {
-                    let _ = fs::rename(&rollback_path, key_path);
+                    if rollback_created {
+                        let _ = fs::rename(&rollback_path, key_path);
+                    }
                     return Err(VaultError::CoreKeyWrite {
                         path: key_path.to_path_buf(),
                         source,
