@@ -1,7 +1,11 @@
+use std::{sync::LazyLock, time::Duration};
+
+use chrono::Utc;
+use regex::Regex;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::{
-    callisto::{attachment, reactions},
+    callisto::{attachment, open_graph_link, reactions},
     common::errors::MegaError,
     jupiter::storage::{
         attachment_storage::AttachmentStorage, base_storage::StorageConnector,
@@ -215,10 +219,157 @@ impl SharedChatService {
 
         Ok(att)
     }
+
+    /// Fetch an Open Graph preview for `url` and cache it in
+    /// `open_graph_links`. If a fresh cached entry exists, return it without
+    /// making a network request. If fetching is disabled by configuration,
+    /// return any existing cached entry (stale or not) or `None`.
+    pub async fn fetch_or_refresh_open_graph_link(
+        &self,
+        url: &str,
+        fetch_enabled: bool,
+        timeout_ms: u64,
+    ) -> Result<Option<open_graph_link::Model>, MegaError> {
+        let cached = self
+            .open_graph_storage
+            .get_open_graph_link_by_url(url)
+            .await?;
+        let now = Utc::now().naive_utc();
+        let is_fresh = cached.as_ref().is_some_and(|c| {
+            let age = now.signed_duration_since(c.updated_at);
+            age < OPEN_GRAPH_CACHE_TTL
+        });
+        if is_fresh {
+            return Ok(cached);
+        }
+        if !fetch_enabled {
+            return Ok(cached);
+        }
+
+        let fetched = match fetch_open_graph(url, timeout_ms).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(url = %url, error = %e, "failed to fetch open graph link");
+                return Ok(cached);
+            }
+        };
+
+        let title = fetched.title.unwrap_or_default();
+        let image_path = fetched.image.and_then(|h| resolve_url(url, &h));
+        let favicon_path = fetched.favicon.and_then(|h| resolve_url(url, &h));
+        let model = self
+            .open_graph_storage
+            .upsert_open_graph_link(url.to_string(), title, image_path, favicon_path)
+            .await?;
+        Ok(Some(model))
+    }
 }
+
+const OPEN_GRAPH_CACHE_TTL: chrono::Duration = chrono::Duration::hours(24);
+
+struct FetchedOpenGraph {
+    title: Option<String>,
+    image: Option<String>,
+    favicon: Option<String>,
+}
+
+async fn fetch_open_graph(url: &str, timeout_ms: u64) -> Result<FetchedOpenGraph, MegaError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .user_agent("monoengine-open-graph/1.0")
+        .build()
+        .map_err(|e| MegaError::Other(format!("failed to build http client: {e}")))?;
+
+    let body = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| MegaError::Other(format!("open graph fetch failed: {e}")))?
+        .text()
+        .await
+        .map_err(|e| MegaError::Other(format!("open graph fetch body read failed: {e}")))?;
+
+    // Avoid parsing multi-megabyte pages for a handful of meta tags.
+    let body: String = body.chars().take(1_000_000).collect();
+
+    let title = extract_meta_property(&body, "og:title").or_else(|| extract_title_tag(&body));
+    let image = extract_meta_property(&body, "og:image");
+    let favicon = extract_link_rel(&body, "icon");
+
+    Ok(FetchedOpenGraph {
+        title,
+        image,
+        favicon,
+    })
+}
+
+fn extract_meta_property(html: &str, property: &str) -> Option<String> {
+    for caps in META_PROPERTY_FIRST.captures_iter(html) {
+        if caps[1].eq_ignore_ascii_case(property) {
+            return Some(caps[2].to_string());
+        }
+    }
+    for caps in META_CONTENT_FIRST.captures_iter(html) {
+        if caps[2].eq_ignore_ascii_case(property) {
+            return Some(caps[1].to_string());
+        }
+    }
+    None
+}
+
+fn extract_link_rel(html: &str, rel: &str) -> Option<String> {
+    for caps in LINK_REL_FIRST.captures_iter(html) {
+        if caps[1].to_lowercase().contains(rel) {
+            return Some(caps[2].to_string());
+        }
+    }
+    for caps in LINK_HREF_FIRST.captures_iter(html) {
+        if caps[2].to_lowercase().contains(rel) {
+            return Some(caps[1].to_string());
+        }
+    }
+    None
+}
+
+fn extract_title_tag(html: &str) -> Option<String> {
+    TITLE_TAG
+        .captures(html)
+        .map(|caps| caps[1].trim().to_string())
+}
+
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    let base_url = reqwest::Url::parse(base).ok()?;
+    base_url.join(href).ok().map(|u| u.to_string())
+}
+
+static META_PROPERTY_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<meta\s+[^>]*property=["']([^"']+)["'][^>]*content=["']([^"']*)["'][^>]*>"#)
+        .unwrap()
+});
+static META_CONTENT_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<meta\s+[^>]*content=["']([^"']*)["'][^>]*property=["']([^"']+)["'][^>]*>"#)
+        .unwrap()
+});
+static LINK_REL_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<link\s+[^>]*rel=["']([^"']+)["'][^>]*href=["']([^"']*)["'][^>]*>"#).unwrap()
+});
+static LINK_HREF_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<link\s+[^>]*href=["']([^"']*)["'][^>]*rel=["']([^"']+)["'][^>]*>"#).unwrap()
+});
+static TITLE_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)<title>([^<]*)</title>"#).unwrap());
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use axum::{Router, response::Html, routing::get};
+    use tokio::net::TcpListener;
+
     use super::*;
     use crate::{chat::service::channel_chat::ChannelChatService, jupiter::tests::test_storage};
 
@@ -277,5 +428,88 @@ mod tests {
             matches!(result, Err(MegaError::Other(_))),
             "non-owner member should not be able to delete reaction"
         );
+    }
+
+    async fn start_og_server(body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().route("/", get(move || async move { Html(body) }));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve failed");
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_open_graph_link_parses_and_caches_preview() {
+        let body = r#"<!doctype html>
+<html>
+<head>
+<title>Page Title</title>
+<meta property="og:title" content="OG Title">
+<meta property="og:image" content="/image.png">
+<link rel="icon" href="/favicon.ico">
+</head>
+<body>hi</body>
+</html>"#;
+        let addr = start_og_server(body).await;
+        let url = format!("http://{}/", addr);
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let shared_svc = SharedChatService::from_storage(&storage);
+
+        let preview = shared_svc
+            .fetch_or_refresh_open_graph_link(&url, true, 5000)
+            .await
+            .expect("fetch should succeed")
+            .expect("preview should be returned");
+        assert_eq!(preview.title, "OG Title");
+        assert_eq!(
+            preview.image_path,
+            Some(format!("http://{}/image.png", addr))
+        );
+        assert_eq!(
+            preview.favicon_path,
+            Some(format!("http://{}/favicon.ico", addr))
+        );
+
+        // A second fetch should return the cached row without fetching again.
+        let cached = shared_svc
+            .fetch_or_refresh_open_graph_link(&url, true, 5000)
+            .await
+            .expect("cached fetch should succeed")
+            .expect("cached preview should exist");
+        assert_eq!(cached.id, preview.id);
+    }
+
+    #[tokio::test]
+    async fn fetch_open_graph_disabled_returns_cached_or_none() {
+        let body = r#"<html><head><title>T</title></head><body></body></html>"#;
+        let addr = start_og_server(body).await;
+        let url = format!("http://{}/", addr);
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let shared_svc = SharedChatService::from_storage(&storage);
+
+        let none = shared_svc
+            .fetch_or_refresh_open_graph_link(&url, false, 5000)
+            .await
+            .expect("fetch should succeed");
+        assert!(none.is_none());
+
+        // Pre-seed the cache and confirm disabled mode still returns it.
+        shared_svc
+            .open_graph_storage
+            .upsert_open_graph_link(url.clone(), "Cached".to_string(), None, None)
+            .await
+            .expect("upsert");
+        let cached = shared_svc
+            .fetch_or_refresh_open_graph_link(&url, false, 5000)
+            .await
+            .expect("fetch should succeed")
+            .expect("cached entry should be returned");
+        assert_eq!(cached.title, "Cached");
     }
 }

@@ -701,6 +701,18 @@ fn apply_chat_changes(
             .applied_fields
             .push("chat.attachment_allowed_mime_types");
     }
+    if current.as_ref().map(|c| c.open_graph_fetch_enabled)
+        != candidate.as_ref().map(|c| c.open_graph_fetch_enabled)
+    {
+        report.applied_fields.push("chat.open_graph_fetch_enabled");
+    }
+    if current.as_ref().map(|c| c.open_graph_fetch_timeout_ms)
+        != candidate.as_ref().map(|c| c.open_graph_fetch_timeout_ms)
+    {
+        report
+            .applied_fields
+            .push("chat.open_graph_fetch_timeout_ms");
+    }
 }
 
 fn chat_mime_allowlist(config: &Option<ChatConfig>) -> Vec<String> {

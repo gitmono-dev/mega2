@@ -165,6 +165,11 @@ pub(crate) fn validate_chat_config(config: &ChatConfig) -> Result<(), MegaError>
     for pattern in &config.attachment_allowed_mime_types {
         validate_mime_allowlist_pattern(pattern)?;
     }
+    if config.open_graph_fetch_timeout_ms == 0 {
+        return Err(MegaError::Other(
+            "chat.open_graph_fetch_timeout_ms must be greater than 0".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1522,7 +1527,11 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "oauth",
             "chat",
         ]),
-        "chat" => Some(&["attachment_allowed_mime_types"]),
+        "chat" => Some(&[
+            "attachment_allowed_mime_types",
+            "open_graph_fetch_enabled",
+            "open_graph_fetch_timeout_ms",
+        ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
             "db_type",
@@ -1700,6 +1709,7 @@ mod tests {
                 "image/*".to_string(),
                 "application/pdf".to_string(),
             ],
+            ..Default::default()
         });
 
         config
@@ -1712,6 +1722,7 @@ mod tests {
         let mut config = valid_config();
         config.chat = Some(crate::config::ChatConfig {
             attachment_allowed_mime_types: vec!["*/*".to_string(), "bad".to_string()],
+            ..Default::default()
         });
 
         let err = config

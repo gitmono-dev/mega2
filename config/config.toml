@@ -356,6 +356,10 @@ default_locale = "en-US"
 # accepts all syntactically valid MIME types (backwards compatible). Entries
 # may be exact types (`image/png`) or wildcards (`image/*`).
 attachment_allowed_mime_types = []
+# Whether to fetch and cache Open Graph previews for URLs seen in messages.
+open_graph_fetch_enabled = true
+# Network timeout in milliseconds for a single Open Graph fetch attempt.
+open_graph_fetch_timeout_ms = 5000
 
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),

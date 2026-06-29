@@ -429,7 +429,7 @@ pub struct OAuthConfig {
 }
 
 /// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ChatConfig {
     /// Optional product-level MIME allowlist for chat attachments. When empty or
     /// absent, all syntactically valid MIME types are accepted (backwards
@@ -437,6 +437,32 @@ pub struct ChatConfig {
     /// (`image/*`); invalid patterns are rejected by `Config::validate`.
     #[serde(default)]
     pub attachment_allowed_mime_types: Vec<String>,
+    /// Whether to fetch and cache Open Graph link previews for URLs seen in
+    /// messages. Defaults to true.
+    #[serde(default = "default_open_graph_fetch_enabled")]
+    pub open_graph_fetch_enabled: bool,
+    /// Network timeout in milliseconds for a single Open Graph fetch attempt.
+    /// Defaults to 5000 ms.
+    #[serde(default = "default_open_graph_fetch_timeout_ms")]
+    pub open_graph_fetch_timeout_ms: u64,
+}
+
+fn default_open_graph_fetch_enabled() -> bool {
+    true
+}
+
+fn default_open_graph_fetch_timeout_ms() -> u64 {
+    5000
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            attachment_allowed_mime_types: Vec::new(),
+            open_graph_fetch_enabled: default_open_graph_fetch_enabled(),
+            open_graph_fetch_timeout_ms: default_open_graph_fetch_timeout_ms(),
+        }
+    }
 }
 
 /// Supported vault audit sinks (docs/vault.md stage H).
