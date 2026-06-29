@@ -438,7 +438,7 @@ async fn send_message(
             &channel_id,
             user.username.clone(),
             payload.content.clone(),
-            payload.reply_to_public_id,
+            payload.reply_to_public_id.clone(),
             payload.attachments,
         )
         .await?;
@@ -479,6 +479,43 @@ async fn send_message(
         .await
     {
         tracing::warn!(error = %e, "failed to enqueue chat mention notification");
+    }
+
+    if let Some(reply_to_public_id) = &payload.reply_to_public_id {
+        match state
+            .storage
+            .message_storage()
+            .get_message_by_public_id(reply_to_public_id)
+            .await
+        {
+            Ok(Some(parent)) => {
+                if let Some(parent_author) = parent.sender_username
+                    && let Err(e) = crate::notification::triggers::on_chat_reply_created(
+                        &state.storage.notification_storage(),
+                        &user.username,
+                        &channel_id,
+                        &payload.content,
+                        &parent_author,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to enqueue chat reply notification");
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    reply_to = %reply_to_public_id,
+                    "reply-to message not found; skipping reply notification"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    reply_to = %reply_to_public_id,
+                    "failed to look up reply-to message; skipping reply notification"
+                );
+            }
+        }
     }
 
     let mapped = map_message_model(msg, &state).await?;

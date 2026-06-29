@@ -23,6 +23,7 @@ pub const EVENT_CL_MERGED: &str = "cl.merged";
 pub const EVENT_ISSUE_COMMENT_CREATED: &str = "issue.comment.created";
 pub const EVENT_ITEM_REFERENCED: &str = "item.referenced";
 pub const EVENT_CHAT_MENTION_CREATED: &str = "chat.mention.created";
+pub const EVENT_CHAT_REPLY_CREATED: &str = "chat.reply.created";
 
 static NOTIFICATION_MAIL_TEMPLATE_REGISTRY: LazyLock<RwLock<MailTemplateRegistry>> =
     LazyLock::new(|| RwLock::new(default_notification_mail_template_registry()));
@@ -45,6 +46,10 @@ fn item_referenced_mail_template_key() -> MailTemplateKey {
 
 fn chat_mention_created_mail_template_key() -> MailTemplateKey {
     MailTemplateKey::new(EVENT_CHAT_MENTION_CREATED)
+}
+
+fn chat_reply_created_mail_template_key() -> MailTemplateKey {
+    MailTemplateKey::new(EVENT_CHAT_REPLY_CREATED)
 }
 
 pub fn default_notification_mail_template_registry() -> MailTemplateRegistry {
@@ -129,6 +134,7 @@ fn notification_mail_template_registry_with_default_locale(
     let issue_key = issue_comment_created_mail_template_key();
     let reference_key = item_referenced_mail_template_key();
     let chat_mention_key = chat_mention_created_mail_template_key();
+    let chat_reply_key = chat_reply_created_mail_template_key();
     MailTemplateRegistry::new(
         default_locale,
         vec![
@@ -222,6 +228,26 @@ fn notification_mail_template_registry_with_default_locale(
                     Some("{{actor_username}} 在 {{channel_name}} 提到了你：{{message_text}}"),
                 ),
             ),
+            LocalizedMailTemplate::new(
+                chat_reply_key.clone(),
+                DEFAULT_MAIL_LOCALE,
+                MailTemplate::new(
+                    "{{actor_username}} replied to your message in {{channel_name}}",
+                    "<p><b>{{actor_username}}</b> replied to your message in <b>{{channel_name}}</b>:</p><p>{{message_text}}</p>",
+                    Some(
+                        "{{actor_username}} replied to your message in {{channel_name}}: {{message_text}}",
+                    ),
+                ),
+            ),
+            LocalizedMailTemplate::new(
+                chat_reply_key,
+                "zh-CN",
+                MailTemplate::new(
+                    "{{actor_username}} 在 {{channel_name}} 回复了你的消息",
+                    "<p><b>{{actor_username}}</b> 在 <b>{{channel_name}}</b> 回复了你的消息：</p><p>{{message_text}}</p>",
+                    Some("{{actor_username}} 在 {{channel_name}} 回复了你的消息：{{message_text}}"),
+                ),
+            ),
         ],
     )
 }
@@ -281,6 +307,19 @@ async fn ensure_chat_mention_event_type_exists(stg: &NotificationStorage) -> Res
         EVENT_CHAT_MENTION_CREATED,
         "chat",
         "You were mentioned in a chat message",
+        false,
+        true,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn ensure_chat_reply_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaError> {
+    stg.upsert_event_type(
+        EVENT_CHAT_REPLY_CREATED,
+        "chat",
+        "Your message received a reply",
         false,
         true,
     )
@@ -692,6 +731,79 @@ pub async fn on_chat_mention_created_with_registry(
     Ok(())
 }
 
+/// Trigger: a user receives a reply to their chat message.
+///
+/// Notifies the author of the parent message (excluding the actor), respecting
+/// user preferences and enqueuing an email job for the background dispatcher.
+pub async fn on_chat_reply_created(
+    notif_stg: &NotificationStorage,
+    actor_username: &str,
+    channel_name: &str,
+    message_text: &str,
+    parent_author: &str,
+) -> Result<(), MegaError> {
+    let registry = current_notification_mail_template_registry()?;
+    on_chat_reply_created_with_registry(
+        notif_stg,
+        &registry,
+        actor_username,
+        channel_name,
+        message_text,
+        parent_author,
+    )
+    .await
+}
+
+pub async fn on_chat_reply_created_with_registry(
+    notif_stg: &NotificationStorage,
+    mail_templates: &MailTemplateRegistry,
+    actor_username: &str,
+    channel_name: &str,
+    message_text: &str,
+    parent_author: &str,
+) -> Result<(), MegaError> {
+    if parent_author == actor_username {
+        return Ok(());
+    }
+
+    ensure_chat_reply_event_type_exists(notif_stg).await?;
+
+    if !notif_stg
+        .should_send(parent_author, EVENT_CHAT_REPLY_CREATED)
+        .await?
+    {
+        return Ok(());
+    }
+
+    let settings = match notif_stg.get_user_settings(parent_author).await? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let mail = mail_templates.render(
+        &chat_reply_created_mail_template_key(),
+        settings.preferred_locale.as_deref(),
+        &[
+            ("actor_username", actor_username),
+            ("channel_name", channel_name),
+            ("message_text", message_text),
+        ],
+    )?;
+
+    notif_stg
+        .enqueue_email_job(
+            parent_author,
+            &settings.email,
+            EVENT_CHAT_REPLY_CREATED,
+            &mail.subject,
+            &mail.html,
+            mail.text.as_deref(),
+        )
+        .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -845,6 +957,40 @@ mod tests {
             jobs_after.len(),
             1,
             "actor should not be notified of self-mention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_chat_reply_created_enqueues_job_for_parent_author() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        notif
+            .upsert_user_settings("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        on_chat_reply_created(&notif, "bob", "general", "thanks for the context", "alice")
+            .await
+            .unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1, "parent message author should be notified");
+        assert_eq!(jobs[0].username, "alice");
+        assert_eq!(jobs[0].event_type_code, "chat.reply.created");
+        assert!(jobs[0].subject.contains("replied"));
+
+        // The actor replying to their own message should not enqueue a job.
+        on_chat_reply_created(&notif, "alice", "general", "self reply", "alice")
+            .await
+            .unwrap();
+        let jobs_after = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(
+            jobs_after.len(),
+            1,
+            "actor should not be notified of own reply"
         );
     }
 
