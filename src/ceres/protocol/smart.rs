@@ -38,7 +38,7 @@ const RECEIVE_CAP_LIST: &str = "report-status ";
 const COMMON_CAP_LIST: &str = "side-band-64k ofs-delta agent=mega/0.1.0";
 
 // All other capabilities are only recognized by the upload-pack (fetch from server) process.
-const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done ";
+const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done shallow ";
 
 fn advertised_capabilities(service_type: ServiceType) -> String {
     match service_type {
@@ -1026,6 +1026,44 @@ pub mod test {
             Some("alice")
         );
         assert_eq!(session.auth.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    pub fn upload_pack_advertises_shallow_capability() {
+        let caps = advertised_capabilities(ServiceType::UploadPack);
+        let tokens = caps.split_whitespace().collect::<Vec<_>>();
+        assert!(tokens.contains(&"shallow"));
+    }
+
+    #[test]
+    pub fn receive_pack_does_not_advertise_shallow() {
+        let caps = advertised_capabilities(ServiceType::ReceivePack);
+        let tokens = caps.split_whitespace().collect::<Vec<_>>();
+        assert!(!tokens.contains(&"shallow"));
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_shallow() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("shallow multi_ack_detailed");
+        assert!(session.capabilities.contains(&Capability::Shallow));
+        assert!(session.capabilities.contains(&Capability::MultiAckDetailed));
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_deepen_since_and_deepen_not() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("deepen-since deepen-not");
+        assert!(session.capabilities.contains(&Capability::DeepenSince));
+        assert!(session.capabilities.contains(&Capability::DeepenNot));
     }
 
     #[test]

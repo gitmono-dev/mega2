@@ -98,6 +98,7 @@ pub enum Capability {
     OfsDelta,
     DeepenSince,
     DeepenNot,
+    Shallow,
 }
 
 impl FromStr for Capability {
@@ -115,6 +116,7 @@ impl FromStr for Capability {
             "no-done" => Ok(Capability::NoDone),
             "deepen-since" => Ok(Capability::DeepenSince),
             "deepen-not" => Ok(Capability::DeepenNot),
+            "shallow" => Ok(Capability::Shallow),
             _ => Err(()),
         }
     }
