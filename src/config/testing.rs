@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig};
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuildConfig, Config, DbConfig, LFSConfig, LFSLocalConfig,
-    LFSSshConfig, LogConfig, MailConfig, MonoConfig, PackConfig, RedisConfig, SidebarConfig,
+    ArtifactGcConfig, BlameConfig, BuildConfig, Config, DbConfig, GitConfig, LFSConfig,
+    LFSLocalConfig, LFSSshConfig, LogConfig, MailConfig, MonoConfig, PackConfig, RedisConfig,
+    SidebarConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -223,6 +224,7 @@ impl TestConfigBuilder {
             vault: None,
             oauth: None,
             chat: None,
+            git: GitConfig::default(),
         }
     }
 }

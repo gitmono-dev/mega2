@@ -18,7 +18,7 @@ use crate::{
         protocol::{ServiceType, SmartSession, TransportProtocol, smart},
     },
     common::errors::ProtocolError,
-    contract::git_protocol::{InfoRefsParams, check_push_permission},
+    contract::git_protocol::{InfoRefsParams, check_push_permission, check_upload_pack_access},
 };
 
 // # Discovering Reference
@@ -31,13 +31,23 @@ pub async fn git_info_refs(
     state: &ProtocolApiState,
     params: InfoRefsParams,
     repo_path: std::path::PathBuf,
+    headers: &http::HeaderMap,
 ) -> Result<Response<Body>, ProtocolError> {
     let service_name = params
         .service
         .ok_or_else(|| ProtocolError::InvalidInput("missing service parameter".to_owned()))?;
     let service_type = ServiceType::from_str(&service_name)
         .map_err(|err| ProtocolError::InvalidInput(err.to_string()))?;
-    let session = SmartSession::new(repo_path, service_type, TransportProtocol::Http);
+    let mut session = SmartSession::new(repo_path, service_type, TransportProtocol::Http);
+    if service_type == ServiceType::UploadPack {
+        let _ = git_http_auth(state, &mut session, headers).await?;
+        if check_upload_pack_access(&state.storage.config().git, &session.auth)
+            .await
+            .is_err()
+        {
+            return auth_failed();
+        }
+    }
     let pkt_line_stream = session.git_info_refs(state).await?;
 
     let content_type = format!("application/x-{service_name}-advertisement");
@@ -78,7 +88,9 @@ fn basic_auth_password_from_authorization_value(value: &str) -> Option<String> {
 
 /// Uses [`crate::api::oauth::login_user_from_mono_access_token`] (same as [`crate::api::oauth::AccessTokenUser`]).
 /// Supports both Bearer tokens and Basic Auth (with token as password).
-async fn git_receive_pack_auth(
+/// Returns `Ok(true)` if a valid token was found and the user was authenticated,
+/// `Ok(false)` if no auth header was present, and `Err` on lookup failures.
+async fn git_http_auth(
     state: &ProtocolApiState,
     pack_protocol: &mut SmartSession,
     headers: &http::HeaderMap,
@@ -171,6 +183,8 @@ pub async fn git_upload_pack(
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol =
         SmartSession::new(repo_path, ServiceType::UploadPack, TransportProtocol::Http);
+    let _ = git_http_auth(state, &mut pack_protocol, req.headers()).await?;
+    check_upload_pack_access(&state.storage.config().git, &pack_protocol.auth).await?;
     let upload_request = collect_body_data(req.into_body(), "upload-pack").await?;
     tracing::debug!("Receive bytes: <-------- {:?}", upload_request);
     let (mut send_pack_data, protocol_buf) = pack_protocol
@@ -236,7 +250,7 @@ pub async fn git_receive_pack(
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol =
         SmartSession::new(repo_path, ServiceType::ReceivePack, TransportProtocol::Http);
-    if !git_receive_pack_auth(state, &mut pack_protocol, req.headers()).await? {
+    if !git_http_auth(state, &mut pack_protocol, req.headers()).await? {
         return auth_failed();
     }
     check_push_permission(state, &pack_protocol.auth, &pack_protocol.repo_path).await?;

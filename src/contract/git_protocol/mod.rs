@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::{
     ceres::{api_service::state::ProtocolApiState, protocol::AuthContext},
     common::errors::ProtocolError,
+    config::GitConfig,
     contract::policy::{context::CedarContext, util::SaturnEUid},
 };
 
@@ -17,6 +18,21 @@ pub mod ssh;
 pub struct InfoRefsParams {
     pub service: Option<String>,
     pub refspec: Option<String>,
+}
+
+pub async fn check_upload_pack_access(
+    git_config: &GitConfig,
+    auth: &AuthContext,
+) -> Result<(), ProtocolError> {
+    if git_config.anonymous_access {
+        return Ok(());
+    }
+    if auth.username.is_none() {
+        return Err(ProtocolError::Forbidden(
+            "anonymous clone/fetch is disabled; authentication required".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn check_push_permission(
@@ -63,4 +79,59 @@ pub async fn check_push_permission(
         .map_err(|e| ProtocolError::Forbidden(format!("push permission denied: {e}")))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ceres::protocol::PushUserInfo;
+
+    #[tokio::test]
+    async fn anonymous_access_allowed_by_default() {
+        let git_config = GitConfig {
+            anonymous_access: true,
+        };
+        let auth = AuthContext {
+            username: None,
+            authenticated_user: None,
+        };
+        check_upload_pack_access(&git_config, &auth)
+            .await
+            .expect("anonymous access should be allowed when config permits it");
+    }
+
+    #[tokio::test]
+    async fn anonymous_access_denied_when_disabled_and_no_auth() {
+        let git_config = GitConfig {
+            anonymous_access: false,
+        };
+        let auth = AuthContext {
+            username: None,
+            authenticated_user: None,
+        };
+        let err = check_upload_pack_access(&git_config, &auth)
+            .await
+            .expect_err("anonymous access should be denied when config forbids it");
+        assert!(matches!(err, ProtocolError::Forbidden(_)));
+        assert!(
+            err.to_string()
+                .contains("anonymous clone/fetch is disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_access_allowed_when_anonymous_disabled() {
+        let git_config = GitConfig {
+            anonymous_access: false,
+        };
+        let auth = AuthContext {
+            username: Some("alice".to_string()),
+            authenticated_user: Some(PushUserInfo {
+                username: "alice".to_string(),
+            }),
+        };
+        check_upload_pack_access(&git_config, &auth)
+            .await
+            .expect("authenticated user should be allowed when anonymous access is disabled");
+    }
 }

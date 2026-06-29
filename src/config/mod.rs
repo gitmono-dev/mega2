@@ -144,6 +144,7 @@ impl Config {
             vault: None,
             oauth: None,
             chat: None,
+            git: GitConfig::default(),
         }
     }
 

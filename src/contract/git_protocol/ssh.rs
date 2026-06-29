@@ -19,7 +19,7 @@ use crate::{
             smart::{self},
         },
     },
-    contract::git_protocol::check_push_permission,
+    contract::git_protocol::{check_push_permission, check_upload_pack_access},
 };
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
@@ -126,6 +126,14 @@ impl server::Handler for SshServer {
                         &self.state,
                         &smart_protocol.auth,
                         &smart_protocol.repo_path,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                if service_type == ServiceType::UploadPack {
+                    check_upload_pack_access(
+                        &self.state.storage.config().git,
+                        &smart_protocol.auth,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -725,8 +725,13 @@ async fn handle_smart_protocol(
     match parsed.endpoint {
         crate::contract::git_protocol::path::GitProtocolEndpoint::InfoRefs => {
             let params = parse_info_refs_params(req.uri().query().unwrap_or(""))?;
-            crate::contract::git_protocol::http::git_info_refs(&state, params, parsed.repo_path)
-                .await
+            crate::contract::git_protocol::http::git_info_refs(
+                &state,
+                params,
+                parsed.repo_path,
+                req.headers(),
+            )
+            .await
         }
         crate::contract::git_protocol::path::GitProtocolEndpoint::UploadPack => {
             crate::contract::git_protocol::http::git_upload_pack(&state, req, parsed.repo_path)

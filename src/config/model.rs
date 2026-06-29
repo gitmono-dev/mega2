@@ -48,6 +48,9 @@ pub struct Config {
     /// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
     #[serde(default)]
     pub chat: Option<ChatConfig>,
+    /// Git protocol settings (docs/refactoring/protocol.md Stage 4).
+    #[serde(default)]
+    pub git: GitConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1051,4 +1054,30 @@ impl Default for SidebarConfig {
 
 fn default_visible() -> bool {
     true
+}
+
+/// Git protocol settings (docs/refactoring/protocol.md Stage 4).
+///
+/// Controls whether anonymous (unauthenticated) clients may clone/fetch
+/// repositories via upload-pack. When `anonymous_access` is `false`, every
+/// upload-pack request must carry a valid Bearer or Basic token (HTTP) or
+/// an authenticated SSH key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GitConfig {
+    /// Allow anonymous (unauthenticated) clone/fetch via upload-pack.
+    /// Defaults to `true` (backwards compatible).
+    #[serde(default = "default_git_anonymous_access")]
+    pub anonymous_access: bool,
+}
+
+fn default_git_anonymous_access() -> bool {
+    true
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            anonymous_access: default_git_anonymous_access(),
+        }
+    }
 }
