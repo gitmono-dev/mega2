@@ -68,6 +68,10 @@ impl ApiError {
         Self::with_status(StatusCode::NOT_FOUND, err)
     }
 
+    pub fn forbidden(err: impl Into<anyhow::Error>) -> Self {
+        Self::with_status(StatusCode::FORBIDDEN, err)
+    }
+
     pub fn internal(err: impl Into<anyhow::Error>) -> Self {
         Self::with_status(StatusCode::INTERNAL_SERVER_ERROR, err)
     }

@@ -14,9 +14,10 @@ use crate::{
     common::errors::ApiError,
     contract::api::{
         chat::{
-            AttachmentConfirmReq, AttachmentPresignReq, AttachmentPresignRes, AttachmentResponse,
-            ChannelResponse, CreateChannelReq, CreateReactionReq, MessageResponse,
-            ReactionResponse, SendMessageReq, UpdateChannelReq, UpdateMessageReq,
+            AddChannelMembersReq, AttachmentConfirmReq, AttachmentPresignReq, AttachmentPresignRes,
+            AttachmentResponse, ChannelMemberResponse, ChannelResponse, CreateChannelReq,
+            CreateReactionReq, MessageResponse, ReactionResponse, SendMessageReq, UpdateChannelReq,
+            UpdateMessageReq,
         },
         common::{CommonResult, Pagination},
     },
@@ -45,7 +46,10 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(presign_attachment))
             .routes(routes!(confirm_attachment))
             .routes(routes!(mark_channel_read))
-            .routes(routes!(mark_channel_unread)),
+            .routes(routes!(mark_channel_unread))
+            .routes(routes!(list_channel_members))
+            .routes(routes!(add_channel_members))
+            .routes(routes!(remove_channel_member)),
     )
 }
 
@@ -961,6 +965,128 @@ async fn mark_channel_unread(
     Ok(Json(CommonResult::success(None)))
 }
 
+/// List members of a channel.
+#[utoipa::path(
+    get,
+    path = "/chat/channels/{channel_id}/members",
+    params(
+        ("channel_id" = String, Path, description = "Public ID of the channel"),
+    ),
+    responses(
+        (status = 200, body = CommonResult<Vec<ChannelMemberResponse>>, content_type = "application/json")
+    ),
+    tag = CHAT_TAG
+)]
+async fn list_channel_members(
+    user: LoginUser,
+    Path(channel_id): Path<String>,
+    state: State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<Vec<ChannelMemberResponse>>>, ApiError> {
+    let ch = state
+        .storage
+        .channel_storage()
+        .get_channel_by_public_id(&channel_id, &user.username)
+        .await?
+        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("Channel not found")))?;
+
+    let members = state
+        .storage
+        .channel_membership_storage()
+        .list_members(ch.id)
+        .await?;
+
+    let responses: Vec<ChannelMemberResponse> = members
+        .into_iter()
+        .map(|m| ChannelMemberResponse {
+            username: m.username,
+            last_read_at: m.last_read_at.to_string(),
+            notification_level: m.notification_level,
+            joined_at: m.created_at.to_string(),
+        })
+        .collect();
+
+    Ok(Json(CommonResult::success(Some(responses))))
+}
+
+/// Add members to a channel (owner only).
+#[utoipa::path(
+    post,
+    path = "/chat/channels/{channel_id}/members",
+    params(
+        ("channel_id" = String, Path, description = "Public ID of the channel"),
+    ),
+    request_body = AddChannelMembersReq,
+    responses(
+        (status = 200, body = CommonResult<String>, content_type = "application/json")
+    ),
+    tag = CHAT_TAG
+)]
+async fn add_channel_members(
+    user: LoginUser,
+    Path(channel_id): Path<String>,
+    state: State<MonoApiServiceState>,
+    Json(payload): Json<AddChannelMembersReq>,
+) -> Result<Json<CommonResult<String>>, ApiError> {
+    let ch = state
+        .storage
+        .channel_storage()
+        .get_channel_by_public_id(&channel_id, &user.username)
+        .await?
+        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("Channel not found")))?;
+
+    if ch.owner_username != user.username {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "only the channel owner can add members"
+        )));
+    }
+
+    state
+        .channel_chat_svc()
+        .add_members(&channel_id, &user.username, payload.usernames)
+        .await?;
+
+    Ok(Json(CommonResult::success(None)))
+}
+
+/// Remove a member from a channel (owner only).
+#[utoipa::path(
+    delete,
+    path = "/chat/channels/{channel_id}/members/{username}",
+    params(
+        ("channel_id" = String, Path, description = "Public ID of the channel"),
+        ("username" = String, Path, description = "Username of the member to remove"),
+    ),
+    responses(
+        (status = 200, body = CommonResult<String>, content_type = "application/json")
+    ),
+    tag = CHAT_TAG
+)]
+async fn remove_channel_member(
+    user: LoginUser,
+    Path((channel_id, member_username)): Path<(String, String)>,
+    state: State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<String>>, ApiError> {
+    let ch = state
+        .storage
+        .channel_storage()
+        .get_channel_by_public_id(&channel_id, &user.username)
+        .await?
+        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("Channel not found")))?;
+
+    if ch.owner_username != user.username {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "only the channel owner can remove members"
+        )));
+    }
+
+    state
+        .channel_chat_svc()
+        .remove_members(&channel_id, &user.username, vec![member_username])
+        .await?;
+
+    Ok(Json(CommonResult::success(None)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io, sync::Arc};
@@ -1122,6 +1248,104 @@ mod tests {
         .0;
         let other_ch = other_res.data.unwrap();
 
+        // 1b. Channel member management endpoints
+        let members_res = list_channel_members(
+            alice.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+        )
+        .await
+        .expect("failed to list members")
+        .0;
+        let members = members_res.data.unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|m| m.username == "alice"));
+        assert!(members.iter().any(|m| m.username == "bob"));
+
+        // Non-member cannot list members.
+        let charlie = LoginUser {
+            campsite_user_id: "user-charlie".to_string(),
+            username: "charlie".to_string(),
+            avatar_url: "".to_string(),
+            email: "charlie@example.com".to_string(),
+        };
+        let non_member_list = list_channel_members(
+            charlie.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+        )
+        .await;
+        assert!(non_member_list.is_err());
+
+        // Non-owner cannot add members.
+        let bob_add = add_channel_members(
+            bob.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+            Json(AddChannelMembersReq {
+                usernames: vec!["charlie".to_string()],
+            }),
+        )
+        .await;
+        assert!(bob_add.is_err());
+
+        // Owner adds charlie.
+        let add_res = add_channel_members(
+            alice.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+            Json(AddChannelMembersReq {
+                usernames: vec!["charlie".to_string()],
+            }),
+        )
+        .await
+        .expect("failed to add charlie")
+        .0;
+        assert!(add_res.req_result);
+
+        let members_after_add = list_channel_members(
+            alice.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+        )
+        .await
+        .expect("failed to list members after add")
+        .0
+        .data
+        .unwrap();
+        assert!(members_after_add.iter().any(|m| m.username == "charlie"));
+
+        // Owner removes bob.
+        let remove_res = remove_channel_member(
+            alice.clone(),
+            Path((ch.public_id.clone(), "bob".to_string())),
+            State(state.clone()),
+        )
+        .await
+        .expect("failed to remove bob")
+        .0;
+        assert!(remove_res.req_result);
+        let members_after_remove = list_channel_members(
+            alice.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+        )
+        .await
+        .expect("failed to list members after remove")
+        .0
+        .data
+        .unwrap();
+        assert!(!members_after_remove.iter().any(|m| m.username == "bob"));
+
+        // Removed member can no longer list members.
+        let removed_list = list_channel_members(
+            bob.clone(),
+            Path(ch.public_id.clone()),
+            State(state.clone()),
+        )
+        .await;
+        assert!(removed_list.is_err());
+
         // 2. List visible channels for alice
         let list_res = list_channels(alice.clone(), State(state.clone()))
             .await
@@ -1130,12 +1354,6 @@ mod tests {
         assert_eq!(list_res.data.unwrap().len(), 1);
 
         // List for non-member (e.g. charlie) should be empty
-        let charlie = LoginUser {
-            campsite_user_id: "user-charlie".to_string(),
-            username: "charlie".to_string(),
-            avatar_url: "".to_string(),
-            email: "charlie@example.com".to_string(),
-        };
         let list_res_charlie = list_channels(charlie.clone(), State(state.clone()))
             .await
             .expect("failed to list channels for charlie")

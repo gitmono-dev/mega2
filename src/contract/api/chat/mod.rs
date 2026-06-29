@@ -101,3 +101,16 @@ pub struct AttachmentConfirmReq {
     pub file_name: String,
     pub file_size: i64,
 }
+
+#[derive(Deserialize, ToSchema, Clone, Debug)]
+pub struct AddChannelMembersReq {
+    pub usernames: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema, Clone, Debug)]
+pub struct ChannelMemberResponse {
+    pub username: String,
+    pub last_read_at: String,
+    pub notification_level: i32,
+    pub joined_at: String,
+}
