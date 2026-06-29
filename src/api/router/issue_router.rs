@@ -16,6 +16,7 @@ use crate::{
     common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams},
     jupiter::service::issue_service::IssueService,
+    notification::triggers::on_issue_closed,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -134,6 +135,20 @@ async fn close_issue(
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state.issue_stg().close_issue(&link).await?;
+
+    // Notify the issue author that their issue was closed. Errors are logged
+    // but do not block the close response.
+    if let Err(e) = on_issue_closed(
+        &state.storage.notification_storage(),
+        &state.issue_stg(),
+        &user.username,
+        &link,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, issue_link = %link, "failed to enqueue issue closed notification");
+    }
+
     state
         .conv_stg()
         .add_conversation(

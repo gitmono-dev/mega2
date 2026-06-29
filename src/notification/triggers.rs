@@ -21,6 +21,7 @@ use crate::{
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
 pub const EVENT_CL_MERGED: &str = "cl.merged";
 pub const EVENT_ISSUE_COMMENT_CREATED: &str = "issue.comment.created";
+pub const EVENT_ISSUE_CLOSED: &str = "issue.closed";
 pub const EVENT_ITEM_REFERENCED: &str = "item.referenced";
 pub const EVENT_CHAT_MENTION_CREATED: &str = "chat.mention.created";
 pub const EVENT_CHAT_REPLY_CREATED: &str = "chat.reply.created";
@@ -38,6 +39,10 @@ fn cl_merged_mail_template_key() -> MailTemplateKey {
 
 fn issue_comment_created_mail_template_key() -> MailTemplateKey {
     MailTemplateKey::new(EVENT_ISSUE_COMMENT_CREATED)
+}
+
+fn issue_closed_mail_template_key() -> MailTemplateKey {
+    MailTemplateKey::new(EVENT_ISSUE_CLOSED)
 }
 
 fn item_referenced_mail_template_key() -> MailTemplateKey {
@@ -132,6 +137,7 @@ fn notification_mail_template_registry_with_default_locale(
     let key = cl_comment_created_mail_template_key();
     let merged_key = cl_merged_mail_template_key();
     let issue_key = issue_comment_created_mail_template_key();
+    let issue_closed_key = issue_closed_mail_template_key();
     let reference_key = item_referenced_mail_template_key();
     let chat_mention_key = chat_mention_created_mail_template_key();
     let chat_reply_key = chat_reply_created_mail_template_key();
@@ -190,6 +196,24 @@ fn notification_mail_template_registry_with_default_locale(
                     "议题 {{issue_title}} 有新评论",
                     "<p><b>{{actor_username}}</b> 评论了议题 <b>{{issue_title}}</b>：</p><p>{{comment_text}}</p>",
                     Some("{{actor_username}} 评论了议题 {{issue_title}}：{{comment_text}}"),
+                ),
+            ),
+            LocalizedMailTemplate::new(
+                issue_closed_key.clone(),
+                DEFAULT_MAIL_LOCALE,
+                MailTemplate::new(
+                    "Issue {{issue_title}} was closed",
+                    "<p><b>{{actor_username}}</b> closed issue <b>{{issue_title}}</b>.</p>",
+                    Some("{{actor_username}} closed issue {{issue_title}}"),
+                ),
+            ),
+            LocalizedMailTemplate::new(
+                issue_closed_key,
+                "zh-CN",
+                MailTemplate::new(
+                    "议题 {{issue_title}} 已关闭",
+                    "<p><b>{{actor_username}}</b> 关闭了议题 <b>{{issue_title}}</b>。</p>",
+                    Some("{{actor_username}} 关闭了议题 {{issue_title}}"),
                 ),
             ),
             LocalizedMailTemplate::new(
@@ -285,6 +309,8 @@ async fn ensure_issue_event_type_exists(stg: &NotificationStorage) -> Result<(),
         true,
     )
     .await?;
+    stg.upsert_event_type(EVENT_ISSUE_CLOSED, "issue", "Issue was closed", false, true)
+        .await?;
 
     Ok(())
 }
@@ -558,6 +584,73 @@ pub async fn on_issue_comment_created_with_registry(
                 &username,
                 &settings.email,
                 EVENT_ISSUE_COMMENT_CREATED,
+                &mail.subject,
+                &mail.html,
+                mail.text.as_deref(),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Trigger: an issue was closed.
+///
+/// Notifies the issue author (excluding the actor who closed it), respecting
+/// user preferences.
+pub async fn on_issue_closed(
+    notif_stg: &NotificationStorage,
+    issue_stg: &IssueStorage,
+    actor_username: &str,
+    issue_link: &str,
+) -> Result<(), MegaError> {
+    let registry = current_notification_mail_template_registry()?;
+    on_issue_closed_with_registry(notif_stg, issue_stg, &registry, actor_username, issue_link).await
+}
+
+pub async fn on_issue_closed_with_registry(
+    notif_stg: &NotificationStorage,
+    issue_stg: &IssueStorage,
+    mail_templates: &MailTemplateRegistry,
+    actor_username: &str,
+    issue_link: &str,
+) -> Result<(), MegaError> {
+    ensure_issue_event_type_exists(notif_stg).await?;
+
+    let issue = issue_stg
+        .get_issue(issue_link)
+        .await?
+        .ok_or_else(|| MegaError::NotFound(format!("Issue {issue_link} not found")))?;
+
+    let mut recipients: HashSet<String> = HashSet::new();
+    recipients.insert(issue.author);
+    recipients.remove(actor_username);
+
+    for username in recipients {
+        if !notif_stg.should_send(&username, EVENT_ISSUE_CLOSED).await? {
+            continue;
+        }
+
+        let settings = match notif_stg.get_user_settings(&username).await? {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let mail = mail_templates.render(
+            &issue_closed_mail_template_key(),
+            settings.preferred_locale.as_deref(),
+            &[
+                ("actor_username", actor_username),
+                ("issue_link", issue_link),
+                ("issue_title", &issue.title),
+            ],
+        )?;
+
+        notif_stg
+            .enqueue_email_job(
+                &username,
+                &settings.email,
+                EVENT_ISSUE_CLOSED,
                 &mail.subject,
                 &mail.html,
                 mail.text.as_deref(),
@@ -932,6 +1025,59 @@ mod tests {
             jobs_after.len(),
             1,
             "actor should not be notified of own comment"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_issue_closed_enqueues_job_for_issue_author() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let base = BaseStorage::new(Arc::new(db.clone()));
+        let notif = NotificationStorage::new(Arc::new(db.clone()));
+        let issue_stg = IssueStorage { base: base.clone() };
+
+        let now = chrono::Utc::now().naive_utc();
+        mega_issue::ActiveModel {
+            id: Set(1),
+            link: Set("ISSUE1".to_string()),
+            title: Set("My Issue".to_string()),
+            status: Set("open".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            author: Set("alice".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        notif
+            .upsert_user_settings("alice", "alice@example.com")
+            .await
+            .unwrap();
+
+        // bob closes alice's issue.
+        on_issue_closed(&notif, &issue_stg, "bob", "ISSUE1")
+            .await
+            .unwrap();
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1, "issue author should be notified");
+        assert_eq!(jobs[0].username, "alice");
+        assert_eq!(jobs[0].event_type_code, "issue.closed");
+        assert!(jobs[0].subject.contains("My Issue"));
+
+        // The actor (alice) closing her own issue does not notify herself.
+        on_issue_closed(&notif, &issue_stg, "alice", "ISSUE1")
+            .await
+            .unwrap();
+        let jobs_after = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(
+            jobs_after.len(),
+            1,
+            "actor should not be notified of own close"
         );
     }
 
