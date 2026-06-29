@@ -161,6 +161,178 @@ fn read_legacy_json(input_dir: &Path, filename: &str) -> Result<Vec<serde_json::
     })
 }
 
+fn resolve_username(
+    mapping: &MigrationMapping,
+    user_id: Option<i64>,
+    membership_id: Option<i64>,
+    context: &str,
+) -> Result<String, MegaError> {
+    if let Some(uname) = user_id.and_then(|uid| mapping.user_mappings.get(&uid.to_string())) {
+        return Ok(uname.clone());
+    }
+    if let Some(uname) =
+        membership_id.and_then(|mid| mapping.org_membership_mappings.get(&mid.to_string()))
+    {
+        return Ok(uname.clone());
+    }
+
+    let id_description = match (user_id, membership_id) {
+        (Some(uid), Some(mid)) => format!("user_id={uid} or organization_membership_id={mid}"),
+        (Some(uid), None) => format!("user_id={uid}"),
+        (None, Some(mid)) => format!("organization_membership_id={mid}"),
+        (None, None) => "missing user_id and organization_membership_id".to_string(),
+    };
+    Err(MegaError::Other(format!(
+        "Missing chat migration user mapping for {id_description} at {context}"
+    )))
+}
+
+fn validate_chat_migration_mappings(
+    mapping: &MigrationMapping,
+    custom_reactions: &[serde_json::Value],
+    threads: &[serde_json::Value],
+    memberships: &[serde_json::Value],
+    membership_updates: &[serde_json::Value],
+    messages: &[serde_json::Value],
+    reactions: &[serde_json::Value],
+) -> MegaResult {
+    let imported_channel_ids: HashSet<i64> = threads
+        .iter()
+        .filter_map(|v| {
+            let id = get_i64(&v["id"]).unwrap_or(0);
+            let oauth_id = get_i64(&v["oauth_application_id"]);
+            let integration_id = get_i64(&v["integration_id"]);
+            (id != 0 && oauth_id.is_none() && integration_id.is_none()).then_some(id)
+        })
+        .collect();
+    let imported_message_ids: HashSet<i64> = messages
+        .iter()
+        .filter_map(|v| {
+            let id = get_i64(&v["id"]).unwrap_or(0);
+            let channel_id = get_i64(&v["message_thread_id"]).unwrap_or(0);
+            let oauth_id = get_i64(&v["oauth_application_id"]);
+            let integration_id = get_i64(&v["integration_id"]);
+            let call_id = get_i64(&v["call_id"]);
+            (id != 0
+                && imported_channel_ids.contains(&channel_id)
+                && oauth_id.is_none()
+                && integration_id.is_none()
+                && call_id.is_none())
+            .then_some(id)
+        })
+        .collect();
+
+    for v in custom_reactions {
+        let id = get_i64(&v["id"]).unwrap_or(0);
+        let name = get_str(&v["name"]).unwrap_or_default();
+        if id == 0 || name.is_empty() {
+            continue;
+        }
+        resolve_username(
+            mapping,
+            get_i64(&v["user_id"]),
+            None,
+            &format!("custom_reactions[{id}].user_id"),
+        )?;
+    }
+
+    for v in threads {
+        let id = get_i64(&v["id"]).unwrap_or(0);
+        if !imported_channel_ids.contains(&id) {
+            continue;
+        }
+        resolve_username(
+            mapping,
+            get_i64(&v["owner_id"]),
+            None,
+            &format!("message_threads[{id}].owner_id"),
+        )?;
+    }
+
+    for v in memberships {
+        let id = get_i64(&v["id"]).unwrap_or(0);
+        let channel_id = get_i64(&v["message_thread_id"]).unwrap_or(0);
+        if id == 0 || !imported_channel_ids.contains(&channel_id) {
+            continue;
+        }
+        resolve_username(
+            mapping,
+            get_i64(&v["user_id"]),
+            get_i64(&v["organization_membership_id"]),
+            &format!("message_thread_memberships[{id}]"),
+        )?;
+    }
+
+    for v in membership_updates {
+        let id = get_i64(&v["id"]).unwrap_or(0);
+        let channel_id = get_i64(&v["message_thread_id"]).unwrap_or(0);
+        if id == 0 || !imported_channel_ids.contains(&channel_id) {
+            continue;
+        }
+        resolve_username(
+            mapping,
+            get_i64(&v["actor_id"]),
+            None,
+            &format!("message_thread_membership_updates[{id}].actor_id"),
+        )?;
+        for field in ["added_usernames", "removed_usernames"] {
+            if let Some(arr) = v[field].as_array() {
+                for item in arr {
+                    if let Some(user_id) = item.as_i64() {
+                        resolve_username(
+                            mapping,
+                            Some(user_id),
+                            None,
+                            &format!("message_thread_membership_updates[{id}].{field}"),
+                        )?;
+                    } else if let Some(str_val) = item.as_str()
+                        && let Ok(user_id) = str_val.parse::<i64>()
+                    {
+                        resolve_username(
+                            mapping,
+                            Some(user_id),
+                            None,
+                            &format!("message_thread_membership_updates[{id}].{field}"),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    for v in messages {
+        let id = get_i64(&v["id"]).unwrap_or(0);
+        if !imported_message_ids.contains(&id) {
+            continue;
+        }
+        if let Some(sender_id) = get_i64(&v["sender_id"]) {
+            resolve_username(
+                mapping,
+                Some(sender_id),
+                None,
+                &format!("messages[{id}].sender_id"),
+            )?;
+        }
+    }
+
+    for v in reactions {
+        let id = get_i64(&v["id"]).unwrap_or(0);
+        let subject_type = get_str(&v["subject_type"]).unwrap_or_default();
+        let subject_id = get_i64(&v["subject_id"]).unwrap_or(0);
+        if id == 0 || subject_type != "Message" || !imported_message_ids.contains(&subject_id) {
+            continue;
+        }
+        resolve_username(
+            mapping,
+            get_i64(&v["user_id"]),
+            get_i64(&v["organization_membership_id"]),
+            &format!("reactions[{id}]"),
+        )?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let config = require_config(ctx, "chat-migrate")?;
@@ -176,6 +348,25 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         .map_err(|e| MegaError::Other(format!("Failed to read user mapping file: {}", e)))?;
     let mapping: MigrationMapping = serde_json::from_str(&mapping_content)
         .map_err(|e| MegaError::Other(format!("Failed to parse user mapping JSON: {}", e)))?;
+
+    let legacy_custom_reactions = read_legacy_json(dir_path, "custom_reactions.json")?;
+    let legacy_og = read_legacy_json(dir_path, "open_graph_links.json")?;
+    let legacy_threads = read_legacy_json(dir_path, "message_threads.json")?;
+    let legacy_memberships = read_legacy_json(dir_path, "message_thread_memberships.json")?;
+    let legacy_updates = read_legacy_json(dir_path, "message_thread_membership_updates.json")?;
+    let legacy_messages = read_legacy_json(dir_path, "messages.json")?;
+    let legacy_notifs = read_legacy_json(dir_path, "message_notifications.json")?;
+    let legacy_attachments = read_legacy_json(dir_path, "attachments.json")?;
+    let legacy_reactions = read_legacy_json(dir_path, "reactions.json")?;
+    validate_chat_migration_mappings(
+        &mapping,
+        &legacy_custom_reactions,
+        &legacy_threads,
+        &legacy_memberships,
+        &legacy_updates,
+        &legacy_messages,
+        &legacy_reactions,
+    )?;
 
     let context = AppContext::new(config).await?;
     let mono_storage = context.storage.mono_storage();
@@ -202,29 +393,9 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         mapping.org_membership_mappings.len()
     );
 
-    let resolve_username = |user_id: Option<i64>, membership_id: Option<i64>| -> String {
-        if let Some(uname) = user_id.and_then(|uid| mapping.user_mappings.get(&uid.to_string())) {
-            return uname.clone();
-        }
-        if let Some(uname) =
-            membership_id.and_then(|mid| mapping.org_membership_mappings.get(&mid.to_string()))
-        {
-            return uname.clone();
-        }
-        // Fallback
-        if let Some(uid) = user_id {
-            format!("user_{}", uid)
-        } else if let Some(mid) = membership_id {
-            format!("member_{}", mid)
-        } else {
-            "unknown_user".to_string()
-        }
-    };
-
     println!("\n=== Starting Migration ===");
 
     // 1. custom_reactions
-    let legacy_custom_reactions = read_legacy_json(dir_path, "custom_reactions.json")?;
     let custom_reaction_in = legacy_custom_reactions.len();
     let mut custom_reaction_out = 0;
     let mut custom_reaction_skip = 0;
@@ -263,7 +434,12 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         let file_path = get_str(&v["file_path"]).unwrap_or_default();
         let file_type = get_str(&v["file_type"]).unwrap_or_default();
         let user_id = get_i64(&v["user_id"]);
-        let username = resolve_username(user_id, None);
+        let username = resolve_username(
+            &mapping,
+            user_id,
+            None,
+            &format!("custom_reactions[{id}].user_id"),
+        )?;
         let pack = get_str(&v["pack"]);
         let updated_at = get_dt(&v["updated_at"]).unwrap_or(created_at);
 
@@ -292,7 +468,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 2. open_graph_links
-    let legacy_og = read_legacy_json(dir_path, "open_graph_links.json")?;
     let og_in = legacy_og.len();
     let mut og_out = 0;
     let mut og_skip = 0;
@@ -337,7 +512,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 3. channels (from message_threads)
-    let legacy_threads = read_legacy_json(dir_path, "message_threads.json")?;
     let channel_in = legacy_threads.len();
     let mut channel_out = 0;
     let mut channel_skip = 0;
@@ -369,7 +543,12 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         let group = get_bool(&v["group"]);
         let notification_forced_at = get_dt(&v["notification_forced_at"]);
         let owner_id = get_i64(&v["owner_id"]);
-        let owner_username = resolve_username(owner_id, None);
+        let owner_username = resolve_username(
+            &mapping,
+            owner_id,
+            None,
+            &format!("message_threads[{id}].owner_id"),
+        )?;
         let discarded_at = get_dt(&v["discarded_at"]);
         let created_at = get_dt(&v["created_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
         let updated_at = get_dt(&v["updated_at"]).unwrap_or(created_at);
@@ -403,7 +582,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 4. channel_memberships (from message_thread_memberships)
-    let legacy_memberships = read_legacy_json(dir_path, "message_thread_memberships.json")?;
     let membership_in = legacy_memberships.len();
     let mut membership_out = 0;
     let mut membership_skip = 0;
@@ -419,7 +597,12 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
         let user_id = get_i64(&v["user_id"]);
         let membership_id = get_i64(&v["organization_membership_id"]);
-        let username = resolve_username(user_id, membership_id);
+        let username = resolve_username(
+            &mapping,
+            user_id,
+            membership_id,
+            &format!("message_thread_memberships[{id}]"),
+        )?;
 
         let last_read_at =
             get_dt(&v["last_read_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
@@ -452,7 +635,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 5. channel_membership_updates (from message_thread_membership_updates)
-    let legacy_updates = read_legacy_json(dir_path, "message_thread_membership_updates.json")?;
     let membership_update_in = legacy_updates.len();
     let mut membership_update_out = 0;
     let mut membership_update_skip = 0;
@@ -466,34 +648,49 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         }
 
         let actor_id = get_i64(&v["actor_id"]);
-        let actor_username = resolve_username(actor_id, None);
+        let actor_username = resolve_username(
+            &mapping,
+            actor_id,
+            None,
+            &format!("message_thread_membership_updates[{id}].actor_id"),
+        )?;
 
         // Map added/removed usernames
-        let map_names_json = |field: &str| -> serde_json::Value {
+        let map_names_json = |field: &str| -> Result<serde_json::Value, MegaError> {
             let mut resolved = Vec::new();
             if let Some(arr) = v[field].as_array() {
                 for item in arr {
                     if let Some(id_val) = item.as_i64() {
-                        resolved.push(resolve_username(Some(id_val), None));
+                        resolved.push(resolve_username(
+                            &mapping,
+                            Some(id_val),
+                            None,
+                            &format!("message_thread_membership_updates[{id}].{field}"),
+                        )?);
                     } else if let Some(str_val) = item.as_str() {
                         if let Ok(id_val) = str_val.parse::<i64>() {
-                            resolved.push(resolve_username(Some(id_val), None));
+                            resolved.push(resolve_username(
+                                &mapping,
+                                Some(id_val),
+                                None,
+                                &format!("message_thread_membership_updates[{id}].{field}"),
+                            )?);
                         } else {
                             resolved.push(str_val.to_string());
                         }
                     }
                 }
             }
-            serde_json::Value::Array(
+            Ok(serde_json::Value::Array(
                 resolved
                     .into_iter()
                     .map(serde_json::Value::String)
                     .collect(),
-            )
+            ))
         };
 
-        let added = map_names_json("added_usernames");
-        let removed = map_names_json("removed_usernames");
+        let added = map_names_json("added_usernames")?;
+        let removed = map_names_json("removed_usernames")?;
         let discarded_at = get_dt(&v["discarded_at"]);
         let created_at = get_dt(&v["created_at"]).unwrap_or_else(|| chrono::Utc::now().naive_utc());
         let updated_at = get_dt(&v["updated_at"]).unwrap_or(created_at);
@@ -519,7 +716,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 6. messages
-    let legacy_messages = read_legacy_json(dir_path, "messages.json")?;
     let message_in = legacy_messages.len();
     let mut message_out = 0;
     let mut message_skip = 0;
@@ -554,7 +750,12 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
         let sender_id = get_i64(&v["sender_id"]);
         let sender_username = if sender_id.is_some() {
-            Some(resolve_username(sender_id, None))
+            Some(resolve_username(
+                &mapping,
+                sender_id,
+                None,
+                &format!("messages[{id}].sender_id"),
+            )?)
         } else {
             None
         };
@@ -600,7 +801,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 7. message_notifications
-    let legacy_notifs = read_legacy_json(dir_path, "message_notifications.json")?;
     let notif_in = legacy_notifs.len();
     let mut notif_out = 0;
     let mut notif_skip = 0;
@@ -639,7 +839,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 8. attachments
-    let legacy_attachments = read_legacy_json(dir_path, "attachments.json")?;
     let attachment_in = legacy_attachments.len();
     let mut attachment_out = 0;
     let mut attachment_skip = 0;
@@ -699,7 +898,6 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 9. reactions
-    let legacy_reactions = read_legacy_json(dir_path, "reactions.json")?;
     let reaction_in = legacy_reactions.len();
     let mut reaction_out = 0;
     let mut reaction_skip = 0;
@@ -716,7 +914,12 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
         let user_id = get_i64(&v["user_id"]);
         let membership_id = get_i64(&v["organization_membership_id"]);
-        let username = resolve_username(user_id, membership_id);
+        let username = resolve_username(
+            &mapping,
+            user_id,
+            membership_id,
+            &format!("reactions[{id}]"),
+        )?;
 
         let public_id = get_str(&v["public_id"])
             .unwrap_or_else(crate::callisto::entity_ext::generate_public_id);
@@ -1130,5 +1333,96 @@ mod tests {
                 && err.to_string().contains("as a JSON array"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_username_rejects_unmapped_user_id() {
+        let mapping = MigrationMapping {
+            user_mappings: HashMap::from([("1".to_string(), "alice".to_string())]),
+            org_membership_mappings: HashMap::new(),
+        };
+
+        let err = resolve_username(&mapping, Some(2), None, "messages[301].sender_id").unwrap_err();
+        assert!(
+            err.to_string().contains("user_id=2")
+                && err.to_string().contains("messages[301].sender_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_username_uses_org_membership_mapping_when_user_mapping_absent() {
+        let mapping = MigrationMapping {
+            user_mappings: HashMap::new(),
+            org_membership_mappings: HashMap::from([("10".to_string(), "alice".to_string())]),
+        };
+
+        let username = resolve_username(&mapping, None, Some(10), "memberships[201]").unwrap();
+        assert_eq!(username, "alice");
+    }
+
+    #[test]
+    fn validate_chat_migration_mappings_rejects_unmapped_update_member_id() {
+        let mapping = MigrationMapping {
+            user_mappings: HashMap::from([("1".to_string(), "alice".to_string())]),
+            org_membership_mappings: HashMap::new(),
+        };
+        let membership_updates = vec![serde_json::json!({
+            "id": 701,
+            "message_thread_id": 101,
+            "actor_id": 1,
+            "added_usernames": ["2"]
+        })];
+        let threads = vec![serde_json::json!({
+            "id": 101,
+            "owner_id": 1
+        })];
+
+        let err = validate_chat_migration_mappings(
+            &mapping,
+            &[],
+            &threads,
+            &[],
+            &membership_updates,
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("user_id=2")
+                && err
+                    .to_string()
+                    .contains("message_thread_membership_updates[701].added_usernames"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_chat_migration_mappings_ignores_rows_outside_import_scope() {
+        let mapping = MigrationMapping {
+            user_mappings: HashMap::from([("1".to_string(), "alice".to_string())]),
+            org_membership_mappings: HashMap::new(),
+        };
+        let skipped_threads = vec![serde_json::json!({
+            "id": 101,
+            "owner_id": 999,
+            "oauth_application_id": 42
+        })];
+        let skipped_messages = vec![serde_json::json!({
+            "id": 301,
+            "message_thread_id": 101,
+            "sender_id": 999
+        })];
+
+        validate_chat_migration_mappings(
+            &mapping,
+            &[],
+            &skipped_threads,
+            &[],
+            &[],
+            &skipped_messages,
+            &[],
+        )
+        .unwrap();
     }
 }
