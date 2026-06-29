@@ -354,6 +354,18 @@ impl MailConfig {
                     parsed.scheme()
                 )));
             }
+            for (name, value) in &self.http_headers {
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    MegaError::Other(format!(
+                        "mail.http_headers key '{name}' is not a valid HTTP header name: {e}"
+                    ))
+                })?;
+                reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                    MegaError::Other(format!(
+                        "mail.http_headers value for '{name}' is not a valid HTTP header value: {e}"
+                    ))
+                })?;
+            }
         }
 
         if self.dispatcher_batch_size == 0 {
