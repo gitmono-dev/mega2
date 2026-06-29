@@ -1079,6 +1079,12 @@ async fn remove_channel_member(
         )));
     }
 
+    if member_username == ch.owner_username {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "channel owner cannot be removed"
+        )));
+    }
+
     state
         .channel_chat_svc()
         .remove_members(&channel_id, &user.username, vec![member_username])
@@ -1269,6 +1275,12 @@ mod tests {
             avatar_url: "".to_string(),
             email: "charlie@example.com".to_string(),
         };
+        let dave = LoginUser {
+            campsite_user_id: "user-dave".to_string(),
+            username: "dave".to_string(),
+            avatar_url: "".to_string(),
+            email: "dave@example.com".to_string(),
+        };
         let non_member_list = list_channel_members(
             charlie.clone(),
             Path(ch.public_id.clone()),
@@ -1289,17 +1301,17 @@ mod tests {
         .await;
         assert!(bob_add.is_err());
 
-        // Owner adds charlie.
+        // Owner adds dave.
         let add_res = add_channel_members(
             alice.clone(),
             Path(ch.public_id.clone()),
             State(state.clone()),
             Json(AddChannelMembersReq {
-                usernames: vec!["charlie".to_string()],
+                usernames: vec!["dave".to_string()],
             }),
         )
         .await
-        .expect("failed to add charlie")
+        .expect("failed to add dave")
         .0;
         assert!(add_res.req_result);
 
@@ -1313,16 +1325,25 @@ mod tests {
         .0
         .data
         .unwrap();
-        assert!(members_after_add.iter().any(|m| m.username == "charlie"));
+        assert!(members_after_add.iter().any(|m| m.username == "dave"));
 
-        // Owner removes bob.
+        // Owner cannot remove themselves.
+        let self_remove = remove_channel_member(
+            alice.clone(),
+            Path((ch.public_id.clone(), "alice".to_string())),
+            State(state.clone()),
+        )
+        .await;
+        assert!(self_remove.is_err());
+
+        // Owner removes dave; bob is preserved for the later message flow.
         let remove_res = remove_channel_member(
             alice.clone(),
-            Path((ch.public_id.clone(), "bob".to_string())),
+            Path((ch.public_id.clone(), "dave".to_string())),
             State(state.clone()),
         )
         .await
-        .expect("failed to remove bob")
+        .expect("failed to remove dave")
         .0;
         assert!(remove_res.req_result);
         let members_after_remove = list_channel_members(
@@ -1335,11 +1356,11 @@ mod tests {
         .0
         .data
         .unwrap();
-        assert!(!members_after_remove.iter().any(|m| m.username == "bob"));
+        assert!(!members_after_remove.iter().any(|m| m.username == "dave"));
 
         // Removed member can no longer list members.
         let removed_list = list_channel_members(
-            bob.clone(),
+            dave.clone(),
             Path(ch.public_id.clone()),
             State(state.clone()),
         )
