@@ -14,7 +14,7 @@
 2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
 3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
 4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息；同日 `chat_router` 的 message/custom-reaction 映射读取已下沉到 storage helper，减少 handler 直接 SeaORM 查询。
-5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、WebSocket/Pusher 兼容网关、完整真实 HTTP 黑盒矩阵和外部通知投递。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；**2026-06-29 更新：产品级 MIME allowlist 已落地**——`[chat]` 配置新增 `attachment_allowed_mime_types`，支持精确类型（`image/png`）与子类型通配（`image/*`），并在 presign/confirm 两阶段校验；**2026-06-29 更新（二）：已上传对象存在性复核已落地**——`confirm_attachment` 端点在注册附件前调用 object storage 校验 `Attachment` 命名空间下目标对象是否存在，不存在则返回 400；**2026-06-29 更新（三）：链接预览抓取/缓存行为已落地**——`send_message` HTTP 路径在消息发送后会从 content 中提取 http/https URL，调用 `SharedChatService::fetch_or_refresh_open_graph_link` 按 URL 读取本地缓存，过期时通过 HTTP 拉取并解析 `og:title`/`og:image`/favicon，写回 `open_graph_links`；配置 `chat.open_graph_fetch_enabled`/`open_graph_fetch_timeout_ms` 支持热加载。抓取默认禁用重定向、限制响应体大小，并拒绝 localhost/私有 IP（测试/隔离环境可通过 `chat.open_graph_allow_private_networks` 开启）。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
+5. **仍未完成**：WebSocket/Pusher 兼容网关、完整真实 HTTP 黑盒矩阵。数据迁移工具已有真实 JSON export 导入主路径、空库守卫、导入/跳过/冲突报告与 DB 实际计数校验；**2026-06-29 更新（四）：迁移输入完整性校验已落地**——`chat-migrate` 在启动 `AppContext` 前要求 9 个 legacy export 文件全部存在，且每个文件必须是合法 JSON array，缺失或损坏输入会直接失败，不再静默当作空表导入。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；**2026-06-29 更新：产品级 MIME allowlist 已落地**——`[chat]` 配置新增 `attachment_allowed_mime_types`，支持精确类型（`image/png`）与子类型通配（`image/*`），并在 presign/confirm 两阶段校验；**2026-06-29 更新（二）：已上传对象存在性复核已落地**——`confirm_attachment` 端点在注册附件前调用 object storage 校验 `Attachment` 命名空间下目标对象是否存在，不存在则返回 400；**2026-06-29 更新（三）：链接预览抓取/缓存行为已落地**——`send_message` HTTP 路径在消息发送后会从 content 中提取 http/https URL，调用 `SharedChatService::fetch_or_refresh_open_graph_link` 按 URL 读取本地缓存，过期时通过 HTTP 拉取并解析 `og:title`/`og:image`/favicon，写回 `open_graph_links`；配置 `chat.open_graph_fetch_enabled`/`open_graph_fetch_timeout_ms` 支持热加载。抓取默认禁用重定向、限制响应体大小，并拒绝 localhost/私有 IP（测试/隔离环境可通过 `chat.open_graph_allow_private_networks` 开启）。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
 
 ## 当前实现状态速览表
 
@@ -25,7 +25,7 @@
 | Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入；**2026-06-29 更新**：`@username` mention 的外部邮件投递已接入 `send_message` HTTP 路径，通过 `notification::triggers::on_chat_mention_created` 按用户偏好入队 `chat.mention.created` email job。**2026-06-29 更新（二）**：reply 的外部邮件投递也已接入，通过 `notification::triggers::on_chat_reply_created` 向被回复消息的作者入队 `chat.reply.created` email job。rich-text mention 更复杂语义（如 markdown/HTML 解析、非 ASCII handle）仍为后续。channels/channel_memberships/channel_membership_updates/messages/message_notifications 的完整索引集和 `message_notifications` 唯一约束已补齐。 |
 | HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；**成员管理 HTTP 端点已暴露（owner 可添加/移除成员，成员可列成员，2026-06-29 落地）**；仍缺真实 HTTP 黑盒矩阵、稳定无 Redis router 测试，以及更完整错误码兼容性。 |
 | 实时事件 | 进程内 broadcaster 已实现 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；`InMemoryChatEvents` 已提供 tokio broadcast 订阅能力并覆盖 service mutation 事件。WebSocket/Pusher 兼容网关仍未实现。 |
-| 数据迁移工具 | 初步 CLI | `src/commands/chat_migrate.rs` 存在；已补空库守卫（拒绝在已有 channel 数据的库上运行）和验证报告（对比导入计数与 DB 实际计数）；仍需真实源库脱敏 fixture 和更完整端到端 exec 测试。 |
+| 数据迁移工具 | 部分实现 | `src/commands/chat_migrate.rs` 存在；已补空库守卫（拒绝在已有 channel 数据的库上运行）、9 个 legacy export 文件完整性校验、JSON array 格式校验和验证报告（对比导入计数与 DB 实际计数）；仍需真实源库脱敏 fixture 和更完整端到端 exec 测试。 |
 | 权限控制 | 首批实现并加固 | 多数 channel/message 路径已校验 membership；2026-06-23 已补 message edit/delete 的 channel path + current membership guard，并移除 `chat_router` response mapping 中对 message/custom-reaction 的直接 SeaORM 查询；同日 `delete_reaction` 已补 current membership guard，被移除成员不能再删除自己的旧 reaction。仍需持续把其他 handler 内直接 SeaORM 查询迁回 storage/service。 |
 | 集成测试 | 部分实现 | service/router 生命周期测试存在；router 测试在 Redis 不可用时会 skip，需要补更稳定的无 Redis 黑盒覆盖。 |
 
@@ -767,10 +767,12 @@ pub trait ChatEvents {
 
 任务：
 
-- 写导入脚本或一次性 CLI 子命令。
-- 实现用户映射输入。
-- 实现跳过/降级报告。
-- 实现校验报告。
+- 已完成：一次性 CLI 子命令 `chat-migrate`。
+- 已完成：用户映射 JSON 输入。
+- 已完成：9 个 legacy export 文件完整性校验与 JSON array 格式校验。
+- 已完成：跳过/降级报告。
+- 已完成：校验报告（导入计数与 DB 实际计数对比）。
+- 剩余：真实源库脱敏 fixture 和完整端到端 exec 测试。
 
 验收：
 

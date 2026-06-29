@@ -15,6 +15,18 @@ use crate::{
     jupiter::storage::base_storage::StorageConnector,
 };
 
+const REQUIRED_LEGACY_EXPORTS: [&str; 9] = [
+    "attachments.json",
+    "custom_reactions.json",
+    "message_notifications.json",
+    "message_thread_membership_updates.json",
+    "message_thread_memberships.json",
+    "message_threads.json",
+    "messages.json",
+    "open_graph_links.json",
+    "reactions.json",
+];
+
 #[derive(Deserialize, Debug)]
 struct MigrationMapping {
     user_mappings: HashMap<String, String>,
@@ -108,9 +120,63 @@ fn get_dt(val: &serde_json::Value) -> Option<chrono::NaiveDateTime> {
     }
 }
 
+fn validate_legacy_export_set(input_dir: &Path) -> MegaResult {
+    if !input_dir.is_dir() {
+        return Err(MegaError::Other(format!(
+            "Legacy chat export input path is not a directory: {}",
+            input_dir.display()
+        )));
+    }
+
+    let missing: Vec<_> = REQUIRED_LEGACY_EXPORTS
+        .iter()
+        .filter(|filename| !input_dir.join(filename).is_file())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(MegaError::Other(format!(
+            "Legacy chat export is incomplete: missing required file(s): {}",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn read_legacy_json(input_dir: &Path, filename: &str) -> Result<Vec<serde_json::Value>, MegaError> {
+    let path = input_dir.join(filename);
+    let content = fs::read_to_string(&path).map_err(|e| {
+        MegaError::Other(format!(
+            "Failed to read legacy chat export {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    serde_json::from_str::<Vec<serde_json::Value>>(&content).map_err(|e| {
+        MegaError::Other(format!(
+            "Failed to parse legacy chat export {} as a JSON array: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
 #[tokio::main]
 pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let config = require_config(ctx, "chat-migrate")?;
+
+    let input_dir = args.get_one::<String>("input-dir").unwrap();
+    let mapping_file = args.get_one::<String>("user-mapping").unwrap();
+    let dir_path = Path::new(input_dir);
+    validate_legacy_export_set(dir_path)?;
+
+    // 1. Read user mapping. Do this before AppContext startup so malformed
+    // migration inputs fail before connecting to long-lived services.
+    let mapping_content = fs::read_to_string(mapping_file)
+        .map_err(|e| MegaError::Other(format!("Failed to read user mapping file: {}", e)))?;
+    let mapping: MigrationMapping = serde_json::from_str(&mapping_content)
+        .map_err(|e| MegaError::Other(format!("Failed to parse user mapping JSON: {}", e)))?;
+
     let context = AppContext::new(config).await?;
     let mono_storage = context.storage.mono_storage();
     let conn = mono_storage.get_connection();
@@ -130,22 +196,11 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         )));
     }
 
-    let input_dir = args.get_one::<String>("input-dir").unwrap();
-    let mapping_file = args.get_one::<String>("user-mapping").unwrap();
-
-    // 1. Read user mapping
-    let mapping_content = fs::read_to_string(mapping_file)
-        .map_err(|e| MegaError::Other(format!("Failed to read user mapping file: {}", e)))?;
-    let mapping: MigrationMapping = serde_json::from_str(&mapping_content)
-        .map_err(|e| MegaError::Other(format!("Failed to parse user mapping JSON: {}", e)))?;
-
     println!(
         "Loaded user mappings: {} users, {} org memberships",
         mapping.user_mappings.len(),
         mapping.org_membership_mappings.len()
     );
-
-    let dir_path = Path::new(input_dir);
 
     let resolve_username = |user_id: Option<i64>, membership_id: Option<i64>| -> String {
         if let Some(uname) = user_id.and_then(|uid| mapping.user_mappings.get(&uid.to_string())) {
@@ -166,29 +221,10 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         }
     };
 
-    let read_json = |filename: &str| -> Vec<serde_json::Value> {
-        let p = dir_path.join(filename);
-        if !p.exists() {
-            println!("Warning: file {} does not exist", filename);
-            return Vec::new();
-        }
-        let content = match fs::read_to_string(&p) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("Error reading {}: {}", filename, e);
-                return Vec::new();
-            }
-        };
-        serde_json::from_str(&content).unwrap_or_else(|e| {
-            println!("Error parsing {}: {}", filename, e);
-            Vec::new()
-        })
-    };
-
     println!("\n=== Starting Migration ===");
 
     // 1. custom_reactions
-    let legacy_custom_reactions = read_json("custom_reactions.json");
+    let legacy_custom_reactions = read_legacy_json(dir_path, "custom_reactions.json")?;
     let custom_reaction_in = legacy_custom_reactions.len();
     let mut custom_reaction_out = 0;
     let mut custom_reaction_skip = 0;
@@ -256,7 +292,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 2. open_graph_links
-    let legacy_og = read_json("open_graph_links.json");
+    let legacy_og = read_legacy_json(dir_path, "open_graph_links.json")?;
     let og_in = legacy_og.len();
     let mut og_out = 0;
     let mut og_skip = 0;
@@ -301,7 +337,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 3. channels (from message_threads)
-    let legacy_threads = read_json("message_threads.json");
+    let legacy_threads = read_legacy_json(dir_path, "message_threads.json")?;
     let channel_in = legacy_threads.len();
     let mut channel_out = 0;
     let mut channel_skip = 0;
@@ -367,7 +403,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 4. channel_memberships (from message_thread_memberships)
-    let legacy_memberships = read_json("message_thread_memberships.json");
+    let legacy_memberships = read_legacy_json(dir_path, "message_thread_memberships.json")?;
     let membership_in = legacy_memberships.len();
     let mut membership_out = 0;
     let mut membership_skip = 0;
@@ -416,7 +452,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 5. channel_membership_updates (from message_thread_membership_updates)
-    let legacy_updates = read_json("message_thread_membership_updates.json");
+    let legacy_updates = read_legacy_json(dir_path, "message_thread_membership_updates.json")?;
     let membership_update_in = legacy_updates.len();
     let mut membership_update_out = 0;
     let mut membership_update_skip = 0;
@@ -483,7 +519,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 6. messages
-    let legacy_messages = read_json("messages.json");
+    let legacy_messages = read_legacy_json(dir_path, "messages.json")?;
     let message_in = legacy_messages.len();
     let mut message_out = 0;
     let mut message_skip = 0;
@@ -564,7 +600,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 7. message_notifications
-    let legacy_notifs = read_json("message_notifications.json");
+    let legacy_notifs = read_legacy_json(dir_path, "message_notifications.json")?;
     let notif_in = legacy_notifs.len();
     let mut notif_out = 0;
     let mut notif_skip = 0;
@@ -603,7 +639,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 8. attachments
-    let legacy_attachments = read_json("attachments.json");
+    let legacy_attachments = read_legacy_json(dir_path, "attachments.json")?;
     let attachment_in = legacy_attachments.len();
     let mut attachment_out = 0;
     let mut attachment_skip = 0;
@@ -663,7 +699,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     }
 
     // 9. reactions
-    let legacy_reactions = read_json("reactions.json");
+    let legacy_reactions = read_legacy_json(dir_path, "reactions.json")?;
     let reaction_in = legacy_reactions.len();
     let mut reaction_out = 0;
     let mut reaction_skip = 0;
@@ -847,6 +883,12 @@ mod tests {
 
     use super::*;
     use crate::jupiter::tests::test_storage;
+
+    fn write_empty_required_exports(input_dir: &Path) {
+        for filename in REQUIRED_LEGACY_EXPORTS {
+            fs::write(input_dir.join(filename), "[]").unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn test_migration_lifecycle() {
@@ -1048,5 +1090,45 @@ mod tests {
             .await
             .unwrap();
         assert!(count > 0, "guard should detect existing channel data");
+    }
+
+    #[test]
+    fn validate_legacy_export_set_requires_all_nine_files() {
+        let temp = tempdir().unwrap();
+        let input_dir = temp.path().join("exports");
+        fs::create_dir(&input_dir).unwrap();
+        write_empty_required_exports(&input_dir);
+        fs::remove_file(input_dir.join("messages.json")).unwrap();
+
+        let err = validate_legacy_export_set(&input_dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing required file(s): messages.json"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_legacy_export_set_accepts_complete_empty_export() {
+        let temp = tempdir().unwrap();
+        let input_dir = temp.path().join("exports");
+        fs::create_dir(&input_dir).unwrap();
+        write_empty_required_exports(&input_dir);
+
+        validate_legacy_export_set(&input_dir).unwrap();
+    }
+
+    #[test]
+    fn read_legacy_json_rejects_non_array_export() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("messages.json"), r#"{"id": 1}"#).unwrap();
+
+        let err = read_legacy_json(temp.path(), "messages.json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to parse legacy chat export")
+                && err.to_string().contains("as a JSON array"),
+            "unexpected error: {err}"
+        );
     }
 }
