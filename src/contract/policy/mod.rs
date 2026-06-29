@@ -15,7 +15,7 @@ pub enum ActionEnum {
     ViewRepo,
     // PullRepo,
     // ForkRepo,
-    // PushRepo,
+    PushRepo,
     // OpenIssue,
     // ** Maintainer
     CreateMergeRequest,
@@ -36,6 +36,7 @@ impl Display for ActionEnum {
         let s = match self {
             ActionEnum::UnprotectedRequest => "unprotectedRequest",
             ActionEnum::ViewRepo => "viewRepo",
+            ActionEnum::PushRepo => "pushRepo",
             ActionEnum::CreateMergeRequest => "createMergeRequest",
             ActionEnum::EditIssue => "editIssue",
             ActionEnum::EditMergeRequest => "editMergeRequest",
@@ -55,6 +56,7 @@ impl From<&str> for ActionEnum {
     fn from(s: &str) -> Self {
         match s {
             "viewRepo" => ActionEnum::ViewRepo,
+            "pushRepo" => ActionEnum::PushRepo,
             "createMergeRequest" => ActionEnum::CreateMergeRequest,
             "editIssue" => ActionEnum::EditIssue,
             "editMergeRequest" => ActionEnum::EditMergeRequest,

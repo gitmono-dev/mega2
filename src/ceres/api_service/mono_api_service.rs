@@ -98,7 +98,7 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
-    contract::api::common::Pagination,
+    contract::{api::common::Pagination, policy::entitystore::EntityStore},
     jupiter::{
         service::buck_service::{
             CommitArtifacts, CompletePayload as SvcCompletePayload,
@@ -3142,6 +3142,7 @@ impl MonoApiService {
         let state = ProtocolApiState {
             storage: self.storage.clone(),
             git_object_cache: self.git_object_cache.clone(),
+            entity_store: EntityStore::new(),
         };
         let bytes = protocol
             .git_receive_pack_stream(

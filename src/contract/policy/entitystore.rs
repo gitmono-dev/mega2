@@ -52,6 +52,14 @@ impl EntityStore {
         self.user_groups.extend(other.user_groups);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+            && self.repos.is_empty()
+            && self.merge_requests.is_empty()
+            && self.issues.is_empty()
+            && self.user_groups.is_empty()
+    }
+
     pub fn extract_admin_usernames(&self) -> HashSet<String> {
         const ADMIN_GROUP: &str = "UserGroup::\"admin\"";
 

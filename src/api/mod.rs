@@ -77,6 +77,7 @@ impl FromRef<MonoApiServiceState> for ProtocolApiState {
         ProtocolApiState {
             storage: state.storage.clone(),
             git_object_cache: state.git_object_cache.clone(),
+            entity_store: state.entity_store.clone(),
         }
     }
 }

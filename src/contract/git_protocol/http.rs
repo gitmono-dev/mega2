@@ -18,7 +18,7 @@ use crate::{
         protocol::{ServiceType, SmartSession, TransportProtocol, smart},
     },
     common::errors::ProtocolError,
-    contract::git_protocol::InfoRefsParams,
+    contract::git_protocol::{InfoRefsParams, check_push_permission},
 };
 
 // # Discovering Reference
@@ -239,6 +239,7 @@ pub async fn git_receive_pack(
     if !git_receive_pack_auth(state, &mut pack_protocol, req.headers()).await? {
         return auth_failed();
     }
+    check_push_permission(state, &pack_protocol.auth, &pack_protocol.repo_path).await?;
     let receive_request = collect_body_data(req.into_body(), "receive-pack").await?;
 
     let (commands, pack_bytes) =

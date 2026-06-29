@@ -10,13 +10,16 @@ use russh::{
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
-use crate::ceres::{
-    api_service::state::ProtocolApiState,
-    lfs::lfs_structs::Link,
-    protocol::{
-        ServiceType, SmartSession, TransportProtocol,
-        smart::{self},
+use crate::{
+    ceres::{
+        api_service::state::ProtocolApiState,
+        lfs::lfs_structs::Link,
+        protocol::{
+            ServiceType, SmartSession, TransportProtocol,
+            smart::{self},
+        },
     },
+    contract::git_protocol::check_push_permission,
 };
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
@@ -117,6 +120,15 @@ impl server::Handler for SshServer {
                     SmartSession::new(exec.repo_path, service_type, TransportProtocol::Ssh);
                 if let Some(username) = self.authenticated_user.clone() {
                     smart_protocol.set_authenticated_user(username);
+                }
+                if service_type == ServiceType::ReceivePack {
+                    check_push_permission(
+                        &self.state,
+                        &smart_protocol.auth,
+                        &smart_protocol.repo_path,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
                 // TODO handler ProtocolError
                 let res = smart_protocol.git_info_refs(&self.state).await?;
