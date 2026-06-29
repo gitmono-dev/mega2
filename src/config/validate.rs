@@ -336,6 +336,26 @@ impl MailConfig {
             }
         }
 
+        if self.enabled && self.provider == MailProvider::Http {
+            let url = self
+                .http_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    MegaError::Other(
+                        "mail.http_url is required when mail.provider is http".to_string(),
+                    )
+                })?;
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|e| MegaError::Other(format!("mail.http_url is not a valid URL: {e}")))?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                return Err(MegaError::Other(format!(
+                    "mail.http_url scheme must be http or https, got {}",
+                    parsed.scheme()
+                )));
+            }
+        }
+
         if self.dispatcher_batch_size == 0 {
             return Err(MegaError::Other(
                 "mail.dispatcher_batch_size must be greater than 0".to_string(),

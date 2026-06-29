@@ -604,6 +604,24 @@ fn apply_mail_changes(
                 }
                 report.applied_fields.push("mail.starttls");
             }
+            if current.http_url != candidate.http_url {
+                if let Some(next) = next {
+                    next.http_url.clone_from(&candidate.http_url);
+                }
+                report.applied_fields.push("mail.http_url");
+            }
+            if current.http_headers != candidate.http_headers {
+                if let Some(next) = next {
+                    next.http_headers.clone_from(&candidate.http_headers);
+                }
+                report.applied_fields.push("mail.http_headers");
+            }
+            if current.http_timeout_secs != candidate.http_timeout_secs {
+                if let Some(next) = next {
+                    next.http_timeout_secs = candidate.http_timeout_secs;
+                }
+                report.applied_fields.push("mail.http_timeout_secs");
+            }
         }
     }
 }

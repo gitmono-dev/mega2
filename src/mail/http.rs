@@ -53,6 +53,15 @@ impl HttpMailer {
             })?
             .to_owned();
 
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|e| MegaError::Other(format!("mail.http_url is not a valid URL: {e}")))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(MegaError::Other(format!(
+                "mail.http_url scheme must be http or https, got {}",
+                parsed.scheme()
+            )));
+        }
+
         let timeout = Duration::from_secs(cfg.http_timeout_secs.max(1));
         let client = reqwest::Client::builder()
             .timeout(timeout)

@@ -161,6 +161,9 @@ const MAILER_REBUILD_FIELDS: &[&str] = &[
     "mail.password_ref",
     "mail.from",
     "mail.starttls",
+    "mail.http_url",
+    "mail.http_headers",
+    "mail.http_timeout_secs",
 ];
 
 /// Config-reload subscriber that hot-rebuilds the SMTP mailer when connection /
