@@ -54,16 +54,16 @@
 
 5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 不再 advertise 未验证的 atomic、report-status-v2、delete-refs、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；后续仅剩真实 Git CLI 兼容性矩阵。
 
-6. **SSH 多 channel 状态管理不够细致**。per-connection 状态共享，不是 per-channel，可能在多 channel 场景下产生串联。
+6. **SSH 多 channel 状态已隔离，并已支持 protocol v2。** `SshServer` 按 `ChannelId` 保存独立 `GitSshChannelState`；SSH client 通过 `GIT_PROTOCOL=version=2` 请求 v2 时，server 返回 v2 capability advertisement，并在 upload-pack data 阶段分发 `ls-refs` / `fetch` command。
 
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
-| HTTP GET /info/refs | 已实现（首批止血） | query 已要求 exactly one `service=...`，缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；仍需补真实 Git CLI 兼容性矩阵。 |
-| HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
+| HTTP GET /info/refs | 已实现（含 protocol v2 advertisement） | query 已要求 exactly one `service=...`；缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；`Git-Protocol: version=2` 会返回 v2 capabilities；仍需补真实 Git CLI 兼容性矩阵。 |
+| HTTP POST upload-pack | 已实现（含 shallow / v2 fetch / blob:none） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；protocol v1 支持 `deepen`/`deepen-relative`，v2 支持 `ls-refs`、`fetch`、`deepen`、`filter blob:none`；仍不支持 streaming request parser。 |
 | HTTP POST receive-pack | 已实现（delete-only 已支持） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；delete-only push 已支持（跳过 unpack）；仍需 streaming parser 和更完整真实 Git CLI 矩阵。 |
-| SSH git-upload-pack | 已实现（per-channel state） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区。 |
+| SSH git-upload-pack | 已实现（per-channel state + protocol v2） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区；`GIT_PROTOCOL=version=2` 可启用 v2 `ls-refs` / `fetch`。 |
 | SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
 | 权限与认证 | 部分实现（认证已统一） | HTTP receive-pack 有 Bearer/Basic token 认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 仍匿名；receive-pack 未做 repo/path 级 push 权限校验。 |
@@ -82,7 +82,7 @@
 
 5. **pkt-line 协议边界**：receive-pack 的 command 和 pack 分界必须由 flush-pkt 决定，不能依赖 magic bytes 搜索。
 
-6. **兼容性声明**：不支持的功能（protocol v2、partial clone、shallow clone、pure SSH LFS）必须明确文档化，而不是静默失败。
+6. **兼容性声明**：已实现的现代能力（protocol v2、shallow clone、`filter blob:none`）必须明确范围；未实现的功能（tree filters、完整 promisor remote、pure SSH LFS）必须明确文档化，而不是静默失败。
 
 ## 现状 vs 目标对比
 
@@ -129,7 +129,7 @@
 |-----|--------|
 | **合理性** | **高（8.5/10）**。当前代码框架完整，兼容性问题识别准确。阶段划分合理，从基础止血到兼容性扩展的路线清晰。 |
 | **可行性** | **中高（7.5/10）**。基础 panic 止血相对容易（Result 化输入解析）；pkt-line 和 receive-pack 分流需要较深的协议理解；SSH auth 统一需与 config 协同。 |
-| **完整性** | **中（7/10）**。6 个阶段覆盖主要问题，但 partial clone、protocol v2、shallow clone 等现代 Git 特性未涵盖。当前声称"仅 v0/v1"是合理的范围限制。 |
+| **完整性** | **中高（7.5/10）**。6 个阶段覆盖主要问题，且已补齐 shallow clone、protocol v2 `ls-refs` / `fetch`、`filter blob:none` 等现代 Git 基础能力。仍缺真实 Git CLI 矩阵、streaming pkt-line reader、tree filters 和完整 promisor remote 语义。 |
 | **安全性** | **中（7/10）**。panic 止血直接提升安全性；auth 统一防止权限泄露。但 per-channel state 和事务边界的改进是长期工作。 |
 | **可维护性** | **中（7/10）**。首批已移除 magic bytes 搜索和部分 scattered panic；SSH channel state 已改为 per-channel 字典。剩余 `unwrap()` 和 streaming parser 缺口仍是维护陷阱。改进后代码应更易维护，但短期工作量较大。 |
 
@@ -143,7 +143,7 @@ Git Protocol 是 monoengine 的核心功能，但当前实现在错误处理、�
 - **兼容性提升**：标准 Git 客户端在各场景下（clone、fetch、push、tags、delete）更稳定可靠
 - **可观测性改进**：清晰的错误模型和兼容性测试矩阵便于快速诊断和防止回归
 - **维护成本降低**：代码结构改进（streaming parser、per-channel state）降低后续改造成本
-- **扩展性增强**：为 partial clone、protocol v2 等未来功能预留设计空间
+- **扩展性增强**：shallow clone、protocol v2 和 `filter blob:none` 已落地，为后续 tree filters、promisor remote 和 streaming parser 继续预留设计空间
 
 ## 范围
 
@@ -239,10 +239,13 @@ SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中�
 
 ```text
 upload-pack:
-  multi_ack_detailed no-done side-band-64k ofs-delta agent=mega/0.1.0
+  multi_ack_detailed no-done side-band-64k ofs-delta shallow agent=mega/0.1.0
 
 receive-pack:
   report-status side-band-64k ofs-delta agent=mega/0.1.0
+
+protocol v2 upload-pack:
+  agent=mega/0.1.0 ls-refs fetch=shallow filter server-option object-format=sha1
 ```
 
 `Capability` enum 当前只解析部分 capability：
@@ -256,6 +259,7 @@ side-band-64k
 report-status
 report-status-v2
 ofs-delta
+shallow
 ```
 
 ## 当前兼容能力
@@ -296,6 +300,9 @@ fetch 侧：
 - 支持有 `have` 时 incremental pack。
 - 支持 `multi_ack_detailed` 下的 `ACK ... common` 和 `ACK ... ready`。
 - 支持 side-band-64k 包装 pack data。
+- 支持 `deepen` / `deepen-relative` shallow fetch，并 advertise `shallow` capability。
+- 支持 protocol v2 `ls-refs` / `fetch`（HTTP 通过 `Git-Protocol: version=2`，SSH 通过 `GIT_PROTOCOL=version=2`）。
+- 支持 protocol v2 partial clone `filter blob:none`；tree filter 仍未承诺完整语义。
 
 push 侧：
 
@@ -476,32 +483,27 @@ let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
 - 对 length 边界和剩余 bytes 做显式校验。
 - HTTP 和 SSH 共用同一 streaming parser。
 
-### upload-pack negotiation 支持范围较窄
+### upload-pack negotiation 已支持 shallow / protocol v2 / blob:none
 
-当前只处理 `want`、`have`、`done`。标准 Git 客户端还可能发送或依赖：
+早期实现只处理 `want`、`have`、`done`。当前已补齐现代客户端常用的部分扩展：
 
-- `deepen`
-- `deepen-since`
-- `deepen-not`
-- `deepen-relative`
-- `filter`
-- `shallow`
-- `want-ref`
-- protocol v2 的 command/request 结构
+- protocol v1 upload-pack 解析 `deepen` / `deepen-relative`，并返回 `shallow` response。
+- `deepen-since` / `deepen-not` 会明确返回 `ProtocolError::InvalidInput`，不 silent misbehave。
+- HTTP 和 SSH 均支持 protocol v2 capability advertisement、`ls-refs` 和 `fetch`。
+- protocol v2 `fetch` 支持 `filter blob:none`，pack 只发送 commits + trees，不发送 blob objects。
 
-代码注释中提到 monorepo full pack 应配合 shallow clone，但当前 `git_upload_pack` 没有实际处理 `deepen`。这可能影响：
+仍需后续确认或扩展：
 
-- `git clone --depth=1`
-- partial clone
-- blobless clone
 - promisor remote
+- tree filters（如 `tree:<depth>`）
+- `want-ref`
 - 大仓库 fetch 性能
 
 建议：
 
-- 短期明确只支持 smart protocol v0/v1 的基础 clone/fetch/push，并在文档和错误里说明不支持 protocol v2 / partial clone。
-- 中期实现 `deepen` 和 shallow response，至少让 `git clone --depth=1` 语义正确。
-- 长期评估 Git protocol v2，特别是 `ls-refs`、`fetch`、`server-option`、`filter`。
+- 用真实 Git CLI 矩阵验证 `git clone --depth=1`、HTTP/SSH v2 fetch、`git clone --filter=blob:none` 的端到端行为。
+- 对未实现 filter spec（例如 tree filters）继续返回明确协议错误或 fallback，不 advertise 超出实现范围的语义。
+- 中期将 upload-pack negotiation 改为 streaming pkt-line reader，减少大仓库 fetch 的 request body 聚合风险。
 
 ### receive-pack 原子性与并发语义需要收敛
 
@@ -672,6 +674,9 @@ LFS:
 | `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；monoengine 侧仅覆盖 advertise/parse |
 | `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
+| `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
+| `ls-refs` | ✅ protocol v2 | ✅ | ✅ 处理 `ref-prefix`、`symrefs`、`peel` | ✅ v2 capability / command parse 单测 | protocol v2 refs discovery |
+| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none` | ✅ v2 command parse 单测 + pack generation gates | v2 fetch；`filter blob:none` 只发送 commit/tree objects |
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
@@ -679,7 +684,7 @@ LFS:
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
-| `object-format` | ❌ 不 advertise | N/A | N/A | ✅ `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` | 显式策略：SHA-1 为协议默认，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise） |
+| `object-format` | ❌ protocol v1；✅ protocol v2 `object-format=sha1` | ✅ v2 capability advertisement | N/A | ✅ v1 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` + v2 capability 单测 | v1 保持 SHA-1 默认不 advertise；v2 capability list 显式声明 `sha1` |
 
 残余风险：`ofs-delta` 的 pack 编解码由 `git-internal` crate 实现并自测，monoengine 侧已覆盖 advertise/parse；如需端到端 OFS_DELTA pack 矩阵可在 `git-internal` 侧补足。
 
@@ -726,16 +731,16 @@ LFS:
 
 工作项：
 
-1. 实现 `deepen` / shallow clone 基础语义。
-2. 支持 `deepen-since`、`deepen-not` 或明确拒绝。
-3. 评估 protocol v2 的 `ls-refs` 和 `fetch`。
-4. 评估 partial clone filter：`blob:none`、tree filters。
+1. ✅ 实现 `deepen` / shallow clone 基础语义：upload-pack 解析 `deepen` / `deepen-relative`，`MonoRepo::shallow_pack` 做 depth-limited traversal，并返回 `shallow` pkt-lines。
+2. ✅ 支持 `deepen-since`、`deepen-not` 或明确拒绝：当前明确返回 `ProtocolError::InvalidInput`。
+3. ✅ 评估并实现 protocol v2 的 `ls-refs` 和 `fetch`：HTTP 通过 `Git-Protocol` header，SSH 通过 `GIT_PROTOCOL` env request。
+4. ✅ 评估 partial clone filter：已实现 protocol v2 `filter blob:none`；tree filters 暂未实现完整语义，后续需按真实 Git CLI 矩阵决定是否扩展。
 
 验收标准：
 
 - `git clone --depth=1` 行为正确。
 - 不支持的 modern feature 有明确错误或 fallback，不 silent misbehave。
-- 大仓库 fetch 不需要一次性读取大请求体。
+- 大仓库 fetch 不需要一次性读取大请求体（仍待 streaming pkt-line reader 完成）。
 
 ## 推荐优先级
 
@@ -749,19 +754,18 @@ LFS:
 | P1 | 统一 HTTP/SSH auth context | push 审计、commit binding、权限检查依赖此基础 |
 | P2 | SSH per-channel state | ✅ 已实现（2026-06-28）：`SshServer` 按 `ChannelId` 维护独立 `GitSshChannelState` |
 | P2 | LFS hybrid response 加固 | 提升 Git LFS 客户端兼容性 |
-| P3 | shallow clone / protocol v2 / partial clone | 现代 Git 客户端和大仓库体验优化 |
+| P3 | tree filters / promisor remote / streaming upload-pack parser | 进一步优化现代 Git 客户端和大仓库体验；shallow clone、protocol v2、`filter blob:none` 已完成基础支持 |
 
 ## 建议的文档化兼容声明
 
 在 README 或部署文档中，当前阶段建议明确声明：
 
-- 支持 Git smart HTTP 的基础 clone/fetch/push。
-- 支持 Git SSH 的基础 clone/fetch/push。
+- 支持 Git smart HTTP 的基础 clone/fetch/push，以及 protocol v2 `ls-refs` / `fetch`。
+- 支持 Git SSH 的基础 clone/fetch/push，以及通过 `GIT_PROTOCOL=version=2` 启用 protocol v2 `ls-refs` / `fetch`。
 - 支持 Git LFS HTTP endpoints，以及 SSH `git-lfs-authenticate` hybrid 模式。
 - 暂不支持 pure SSH LFS transfer。
-- 暂不承诺 Git protocol v2。
-- 暂不承诺 partial clone / blobless clone。
-- shallow clone 兼容性需要以测试矩阵结果为准。
+- 支持 shallow fetch/clone 基础语义（`deepen` / `deepen-relative`）；兼容性仍需要真实 Git CLI 矩阵确认。
+- 支持 protocol v2 partial clone `filter blob:none`；暂不承诺 tree filters 或完整 promisor remote 语义。
 - advertise 的 capability 以实现和测试为准，未实现能力不应对外声明。
 
 ## 下一步建议
