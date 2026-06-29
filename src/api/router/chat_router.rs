@@ -784,6 +784,24 @@ async fn confirm_attachment(
     )?;
     validate_chat_attachment_file_path(&payload.file_path)?;
 
+    // Verify the uploaded object actually exists before registering it.
+    let object_key = ObjectKey {
+        namespace: ObjectNamespace::Attachment,
+        key: payload.file_path.clone(),
+    };
+    let object_exists = state
+        .storage
+        .git_service
+        .obj_storage
+        .inner
+        .exists(&object_key)
+        .await?;
+    if !object_exists {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "attachment object not found"
+        )));
+    }
+
     // Check if there are other attachments on the message to determine position
     let msg = state
         .channel_chat_svc()
@@ -876,7 +894,11 @@ async fn mark_channel_unread(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io, sync::Arc};
+
+    use bytes::Bytes;
+    use futures::stream;
+    use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 
     use super::*;
     use crate::{api::oauth::model::LoginUser, jupiter::tests::test_storage};
@@ -1178,13 +1200,45 @@ mod tests {
         assert!(!presign_res.upload_url.is_empty());
         assert!(presign_res.file_path.contains("test.pdf"));
 
-        // 10. Confirm/register attachment
+        // Confirm without uploading the object should fail.
         let confirm_req = AttachmentConfirmReq {
-            file_path: presign_res.file_path,
+            file_path: presign_res.file_path.clone(),
             file_type: "application/pdf".to_string(),
             file_name: "test.pdf".to_string(),
             file_size: 1000,
         };
+        let missing_object_confirm = confirm_attachment(
+            alice.clone(),
+            Query(sent_msg.public_id.clone()),
+            State(state.clone()),
+            Json(confirm_req.clone()),
+        )
+        .await;
+        assert!(missing_object_confirm.is_err());
+
+        // Upload the object so the confirmation can verify ownership/existence.
+        let object_key = ObjectKey {
+            namespace: ObjectNamespace::Attachment,
+            key: presign_res.file_path.clone(),
+        };
+        let data: Vec<Result<Bytes, io::Error>> = vec![Ok(Bytes::from_static(b"attachment-bytes"))];
+        state
+            .storage
+            .git_service
+            .obj_storage
+            .inner
+            .put_stream(
+                &object_key,
+                Box::pin(stream::iter(data)),
+                ObjectMeta {
+                    size: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to put attachment object");
+
+        // 10. Confirm/register attachment
         let confirmed_att = confirm_attachment(
             alice.clone(),
             Query(sent_msg.public_id.clone()),
