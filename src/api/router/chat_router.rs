@@ -784,6 +784,26 @@ async fn confirm_attachment(
     )?;
     validate_chat_attachment_file_path(&payload.file_path)?;
 
+    // Verify the target message exists and the caller is a current member of its
+    // channel before probing object storage. This ordering prevents an
+    // authorization side-channel that would distinguish existing objects from
+    // missing objects for non-members.
+    let msg = state
+        .channel_chat_svc()
+        .message_storage
+        .get_message_by_public_id(&message_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("Message not found")))?;
+    let is_member = state
+        .storage
+        .channel_membership_storage()
+        .get_membership(msg.channel_id, &user.username)
+        .await?
+        .is_some();
+    if !is_member {
+        return Err(ApiError::not_found(anyhow::anyhow!("Message not found")));
+    }
+
     // Verify the uploaded object actually exists before registering it.
     let object_key = ObjectKey {
         namespace: ObjectNamespace::Attachment,
@@ -801,14 +821,6 @@ async fn confirm_attachment(
             "attachment object not found"
         )));
     }
-
-    // Check if there are other attachments on the message to determine position
-    let msg = state
-        .channel_chat_svc()
-        .message_storage
-        .get_message_by_public_id(&message_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("Message not found")))?;
 
     let existing = state
         .storage
