@@ -465,7 +465,14 @@ impl VaultCore {
             )?;
         }
 
-        let meta_path = output_path.with_extension("meta.json");
+        let meta_filename = format!(
+            "{}.meta.json",
+            output_path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        );
+        let meta_path = output_path.with_file_name(meta_filename);
         let meta = serde_json::json!({
             "version": 1,
             "source_key_path": key_path.to_string_lossy(),
@@ -555,16 +562,42 @@ impl VaultCore {
             return Err(e);
         }
 
-        if key_path.exists() {
-            fs::remove_file(key_path).map_err(|source| VaultError::CoreKeyWrite {
+        // Install the verified temp key without deleting the existing key first.
+        // On Unix, rename atomically replaces the destination. Elsewhere, move the
+        // existing key to a rollback backup first, then install the temp key, and
+        // only delete the rollback after the replace succeeds. If the replace fails,
+        // the rollback is restored so a failed restore does not cause key loss.
+        #[cfg(unix)]
+        {
+            fs::rename(&tmp_path, key_path).map_err(|source| VaultError::CoreKeyWrite {
                 path: key_path.to_path_buf(),
                 source,
             })?;
         }
-        fs::rename(&tmp_path, key_path).map_err(|source| VaultError::CoreKeyWrite {
-            path: key_path.to_path_buf(),
-            source,
-        })?;
+        #[cfg(not(unix))]
+        {
+            let rollback_path = key_path.with_extension("json.restore-bak");
+            if key_path.exists() {
+                fs::rename(key_path, &rollback_path).map_err(|source| {
+                    VaultError::CoreKeyWrite {
+                        path: key_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+            }
+            match fs::rename(&tmp_path, key_path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&rollback_path);
+                }
+                Err(source) => {
+                    let _ = fs::rename(&rollback_path, key_path);
+                    return Err(VaultError::CoreKeyWrite {
+                        path: key_path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
 
         Ok(key_path.to_path_buf())
     }
@@ -1814,7 +1847,14 @@ mod tests {
 
         assert!(backed_up_path.starts_with(&backup_dir));
         assert!(backed_up_path.exists(), "backup key file should exist");
-        let meta_path = backed_up_path.with_extension("meta.json");
+        let meta_filename = format!(
+            "{}.meta.json",
+            backed_up_path
+                .file_name()
+                .expect("backup path should have a file name")
+                .to_string_lossy()
+        );
+        let meta_path = backed_up_path.with_file_name(meta_filename);
         assert!(meta_path.exists(), "backup meta file should exist");
 
         let original = std::fs::read_to_string(&key_path).expect("original key should be readable");
