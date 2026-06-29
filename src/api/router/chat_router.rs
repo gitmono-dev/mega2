@@ -804,6 +804,27 @@ async fn confirm_attachment(
         return Err(ApiError::not_found(anyhow::anyhow!("Message not found")));
     }
 
+    // Bind the attachment key to the message's channel. The presign endpoint
+    // stores objects under `chat/attachments/<channel_public_id>/...`; a caller
+    // who is a member of some other channel must not be able to probe keys
+    // outside their channel by swapping the file_path.
+    let channel = state
+        .storage
+        .channel_storage()
+        .get_channel_by_id(msg.channel_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(anyhow::anyhow!("Message not found")))?;
+    let key_channel = payload
+        .file_path
+        .strip_prefix("chat/attachments/")
+        .and_then(|s| s.split('/').next())
+        .ok_or_else(|| ApiError::bad_request(anyhow::anyhow!("invalid attachment file_path")))?;
+    if key_channel != channel.public_id {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "attachment file_path does not belong to the message channel"
+        )));
+    }
+
     // Verify the uploaded object actually exists before registering it.
     let object_key = ObjectKey {
         namespace: ObjectNamespace::Attachment,
