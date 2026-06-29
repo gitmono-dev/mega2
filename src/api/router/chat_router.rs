@@ -443,9 +443,31 @@ async fn send_message(
         )
         .await?;
 
-    let mentioned: Vec<String> = extract_mentioned_usernames(&payload.content)
+    let mut mentioned: Vec<String> = extract_mentioned_usernames(&payload.content)
         .into_iter()
         .collect();
+    if !mentioned.is_empty() {
+        match state
+            .storage
+            .channel_membership_storage()
+            .list_members(msg.channel_id)
+            .await
+        {
+            Ok(members) => {
+                let member_names: std::collections::HashSet<String> =
+                    members.into_iter().map(|m| m.username).collect();
+                mentioned.retain(|name| member_names.contains(name));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    channel_id = %channel_id,
+                    "failed to list channel members; skipping mention notifications"
+                );
+                mentioned.clear();
+            }
+        }
+    }
     if !mentioned.is_empty()
         && let Err(e) = crate::notification::triggers::on_chat_mention_created(
             &state.storage.notification_storage(),
