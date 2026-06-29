@@ -15,7 +15,7 @@ use crate::{
     api::oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
     ceres::{
         api_service::state::ProtocolApiState,
-        protocol::{ServiceType, SmartSession, TransportProtocol, smart},
+        protocol::{ServiceType, SmartSession, TransportProtocol, smart, v2},
     },
     common::errors::ProtocolError,
     contract::git_protocol::{InfoRefsParams, check_push_permission, check_upload_pack_access},
@@ -27,6 +27,14 @@ use crate::{
 // The request MUST contain exactly one query parameter, service=$servicename,
 // where $servicename MUST be the service name the client wishes to contact to complete the operation.
 // The request MUST NOT contain additional query parameters.
+fn is_v2_request(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("Git-Protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("version=2"))
+        .unwrap_or(false)
+}
+
 pub async fn git_info_refs(
     state: &ProtocolApiState,
     params: InfoRefsParams,
@@ -48,6 +56,20 @@ pub async fn git_info_refs(
             return auth_failed();
         }
     }
+
+    if is_v2_request(headers) && service_type == ServiceType::UploadPack {
+        let pkt_line_stream = v2::build_v2_capability_advertisement();
+        let response = add_default_header(
+            format!("application/x-{service_name}-advertisement"),
+            Response::builder()
+                .body(Body::from(pkt_line_stream.freeze()))
+                .map_err(|e| {
+                    ProtocolError::InvalidInput(format!("failed to build response: {e}"))
+                })?,
+        )?;
+        return Ok(response);
+    }
+
     let pkt_line_stream = session.git_info_refs(state).await?;
 
     let content_type = format!("application/x-{service_name}-advertisement");
@@ -187,14 +209,18 @@ pub async fn git_upload_pack(
     check_upload_pack_access(&state.storage.config().git, &pack_protocol.auth).await?;
     let upload_request = collect_body_data(req.into_body(), "upload-pack").await?;
     tracing::debug!("Receive bytes: <-------- {:?}", upload_request);
-    let (mut send_pack_data, protocol_buf) = pack_protocol
-        .git_upload_pack(state, &mut upload_request.freeze())
-        .await?;
+
+    let mut body = upload_request.freeze();
+    if is_v2_upload_pack_request(&mut body) {
+        return handle_v2_upload_pack(state, &mut pack_protocol, &mut body).await;
+    }
+
+    let (mut send_pack_data, protocol_buf) =
+        pack_protocol.git_upload_pack(state, &mut body).await?;
 
     let body_stream = async_stream::stream! {
         tracing::info!("send ack/nak message buf: --------> {:?}", &protocol_buf);
         yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
-        // send packdata with sideband64k
         while let Some(chunk) = send_pack_data.next().await {
             let mut reader = chunk.as_slice();
             loop {
@@ -211,7 +237,6 @@ pub async fn git_upload_pack(
                     break;
                 }
                 let bytes_out = pack_protocol.build_side_band_format(temp, length);
-                // tracing::info!("send pack file: length: {:?}", bytes_out.len());
                 yield Ok::<_, Infallible>(bytes_out.freeze());
             }
         }
@@ -226,6 +251,69 @@ pub async fn git_upload_pack(
             .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?,
     )?;
     Ok(response)
+}
+
+fn is_v2_upload_pack_request(body: &mut Bytes) -> bool {
+    if body.len() < 4 {
+        return false;
+    }
+    let peek = body.clone();
+    let mut peek = peek;
+    match smart::try_read_pkt_line(&mut peek) {
+        Ok(smart::PktLine::Data(data)) => {
+            let line = String::from_utf8_lossy(&data);
+            line.starts_with("command=")
+        }
+        _ => false,
+    }
+}
+
+async fn handle_v2_upload_pack(
+    state: &ProtocolApiState,
+    session: &mut SmartSession,
+    body: &mut Bytes,
+) -> Result<Response<Body>, ProtocolError> {
+    let (command, _caps) = v2::parse_v2_command(body)?;
+
+    match command.as_str() {
+        "ls-refs" => {
+            let refs = v2::handle_v2_ls_refs(session, state, body).await?;
+            let response = add_default_header(
+                String::from("application/x-git-upload-pack-result"),
+                Response::builder()
+                    .body(Body::from(refs.freeze()))
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("failed to build response: {e}"))
+                    })?,
+            )?;
+            Ok(response)
+        }
+        "fetch" => {
+            let (mut send_pack_data, protocol_buf) =
+                v2::handle_v2_fetch(session, state, body).await?;
+
+            let body_stream = async_stream::stream! {
+                yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
+                while let Some(chunk) = send_pack_data.next().await {
+                    yield Ok::<_, Infallible>(Bytes::from(chunk));
+                }
+                let bytes_out = Bytes::from_static(smart::PKT_LINE_END_MARKER);
+                yield Ok::<_, Infallible>(bytes_out);
+            };
+            let response = add_default_header(
+                String::from("application/x-git-upload-pack-result"),
+                Response::builder()
+                    .body(Body::from_stream(body_stream))
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("failed to build response: {e}"))
+                    })?,
+            )?;
+            Ok(response)
+        }
+        other => Err(ProtocolError::InvalidInput(format!(
+            "unsupported v2 command: {other}"
+        ))),
+    }
 }
 
 /// Handles the Git receive-pack protocol for receiving and processing data from a client.

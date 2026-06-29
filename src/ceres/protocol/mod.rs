@@ -27,6 +27,7 @@ use crate::{
 pub mod import_refs;
 pub mod repo;
 pub mod smart;
+pub mod v2;
 
 #[derive(Clone, Debug)]
 pub struct PushUserInfo {
