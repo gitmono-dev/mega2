@@ -1249,6 +1249,34 @@ mod tests {
         .await;
         assert!(missing_object_confirm.is_err());
 
+        // A non-member must not be able to probe attachment state.
+        let non_member_confirm = confirm_attachment(
+            charlie.clone(),
+            Query(sent_msg.public_id.clone()),
+            State(state.clone()),
+            Json(confirm_req.clone()),
+        )
+        .await;
+        assert!(non_member_confirm.is_err());
+
+        // A member must not confirm an attachment whose object key belongs to a
+        // different channel, even if they are a member of both.
+        let wrong_channel_path =
+            presign_res
+                .file_path
+                .replacen(&ch.public_id, &other_ch.public_id, 1);
+        let wrong_channel_confirm = confirm_attachment(
+            alice.clone(),
+            Query(sent_msg.public_id.clone()),
+            State(state.clone()),
+            Json(AttachmentConfirmReq {
+                file_path: wrong_channel_path,
+                ..confirm_req.clone()
+            }),
+        )
+        .await;
+        assert!(wrong_channel_confirm.is_err());
+
         // Upload the object so the confirmation can verify ownership/existence.
         let object_key = ObjectKey {
             namespace: ObjectNamespace::Attachment,

@@ -752,7 +752,7 @@ pub trait ChatEvents {
 - 已完成首批：校验文件名不含路径分隔/控制字符、文件大小为正且不超过 100MiB、MIME 形态包含 `/`、confirm file_path 必须是 `chat/attachments/` object key 且无 traversal 段。
 - 已完成：产品级 MIME allowlist（`[chat].attachment_allowed_mime_types`，支持精确类型 `image/png` 与子类型通配 `image/*`，空列表保持向后兼容），在 presign/confirm 两阶段校验。
 - 已完成：已上传对象存在性复核，`confirm_attachment` 注册前校验 object storage 中目标对象是否存在。
-- 剩余：更完整 object storage fake/no-op 测试。
+- 已完成：更完整 object storage fake/no-op 测试覆盖，包括缺失对象、非成员访问、跨 channel object-key 替换三种失败路径。
 
 验收：
 
