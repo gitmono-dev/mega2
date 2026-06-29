@@ -197,19 +197,17 @@ impl IssueStorage {
         Ok(())
     }
 
-    pub async fn close_issue(&self, link: &str) -> Result<Option<mega_issue::Model>, MegaError> {
-        if let Some(model) = self.get_issue(link).await? {
-            if model.status == "closed" {
-                return Ok(None);
-            }
-            let mut issue = model.into_active_model();
-            issue.status = Set("closed".to_owned());
-            issue.closed_at = Set(Some(chrono::Utc::now().naive_utc()));
-            let updated = issue.update(self.get_connection()).await?;
-            Ok(Some(updated))
-        } else {
-            Ok(None)
-        }
+    pub async fn close_issue(&self, link: &str) -> Result<bool, MegaError> {
+        let now = chrono::Utc::now().naive_utc();
+        let result = mega_issue::Entity::update_many()
+            .col_expr(mega_issue::Column::Status, Expr::value("closed"))
+            .col_expr(mega_issue::Column::ClosedAt, Expr::value(Some(now)))
+            .col_expr(mega_issue::Column::UpdatedAt, Expr::value(now))
+            .filter(mega_issue::Column::Link.eq(link))
+            .filter(mega_issue::Column::Status.ne("closed"))
+            .exec(self.get_connection())
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn reopen_issue(&self, link: &str) -> Result<(), MegaError> {
@@ -437,9 +435,9 @@ mod tests {
         .unwrap();
 
         let first = storage.close_issue("ISSUE1").await.unwrap();
-        assert!(first.is_some(), "first close should transition the issue");
+        assert!(first, "first close should transition the issue");
 
         let second = storage.close_issue("ISSUE1").await.unwrap();
-        assert!(second.is_none(), "second close should report no transition");
+        assert!(!second, "second close should report no transition");
     }
 }

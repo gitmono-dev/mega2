@@ -138,7 +138,7 @@ async fn close_issue(
 
     // Notify the issue author only when the issue actually transitioned from
     // open to closed. Errors are logged but do not block the close response.
-    if closed.is_some()
+    if closed
         && let Err(e) = on_issue_closed(
             &state.storage.notification_storage(),
             &state.issue_stg(),
