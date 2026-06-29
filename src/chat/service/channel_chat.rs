@@ -25,7 +25,7 @@ fn is_mention_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
 }
 
-fn extract_mentioned_usernames(content: &str) -> HashSet<String> {
+pub(crate) fn extract_mentioned_usernames(content: &str) -> HashSet<String> {
     let bytes = content.as_bytes();
     let mut mentions = HashSet::new();
     let mut cursor = 0;

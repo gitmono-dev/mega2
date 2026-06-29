@@ -10,6 +10,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CHAT_TAG, oauth::model::LoginUser},
+    chat::service::channel_chat::extract_mentioned_usernames,
     common::errors::ApiError,
     contract::api::{
         chat::{
@@ -435,12 +436,28 @@ async fn send_message(
         .channel_chat_svc()
         .send_message(
             &channel_id,
-            user.username,
-            payload.content,
+            user.username.clone(),
+            payload.content.clone(),
             payload.reply_to_public_id,
             payload.attachments,
         )
         .await?;
+
+    let mentioned: Vec<String> = extract_mentioned_usernames(&payload.content)
+        .into_iter()
+        .collect();
+    if !mentioned.is_empty()
+        && let Err(e) = crate::notification::triggers::on_chat_mention_created(
+            &state.storage.notification_storage(),
+            &user.username,
+            &channel_id,
+            &payload.content,
+            &mentioned,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to enqueue chat mention notification");
+    }
 
     let mapped = map_message_model(msg, &state).await?;
     Ok(Json(CommonResult::success(Some(mapped))))
