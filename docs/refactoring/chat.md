@@ -673,12 +673,12 @@ pub trait ChatEvents {
 - 已完成主干：新增 custom reaction storage：创建、按 name/public_id 查询。
 - 已完成主干：新增 open graph storage：按 URL upsert/query。
 - 已完成：链接预览抓取/缓存行为，`SharedChatService::fetch_or_refresh_open_graph_link` 按 URL 缓存并刷新 Open Graph 数据。
-- 剩余：补完整唯一约束冲突矩阵和附件软删除策略的端到端覆盖。
+- 已完成：附件 `public_id` 唯一冲突矩阵测试、按 subject 批量软删除，以及消息删除时级联软删除其附件的端到端覆盖。
 
 验收：
 
 - 迁移测试覆盖 4 张表和关键索引。
-- ✅ storage 测试覆盖 create/query/soft delete/unique conflict（`custom_reaction_storage::test_custom_reaction_rejects_duplicate_lowercase_name` 覆盖 `lower(name)` 唯一冲突；reactions 部分唯一索引因 Postgres 对 nullable 列的 NULL-distinct 语义实际不强制去重，见下方约束说明）。
+- ✅ storage 测试覆盖 create/query/soft delete/unique conflict（`custom_reaction_storage::test_custom_reaction_rejects_duplicate_lowercase_name` 覆盖 `lower(name)` 唯一冲突；`attachment_storage::test_duplicate_public_id_is_rejected` 覆盖 `public_id` 唯一冲突；`attachment_storage::test_soft_delete_attachments_for_subject` 与 `channel_chat::test_delete_message_soft_deletes_attachments` 覆盖按 subject 批量软删除与消息删除级联软删除；reactions 部分唯一索引因 Postgres 对 nullable 列的 NULL-distinct 语义实际不强制去重，见下方约束说明）。
 - 不引入外部网络调用。
 
 ### Slice 2: Channel Chat schema + storage（主干已落地）

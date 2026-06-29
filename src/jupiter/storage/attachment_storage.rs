@@ -85,6 +85,23 @@ impl AttachmentStorage {
             .await?;
         Ok(())
     }
+
+    pub async fn soft_delete_attachments_for_subject(
+        &self,
+        subject_type: &str,
+        subject_id: i64,
+    ) -> Result<u64, MegaError> {
+        let now = Utc::now().naive_utc();
+        let result = attachment::Entity::update_many()
+            .filter(attachment::Column::SubjectType.eq(subject_type))
+            .filter(attachment::Column::SubjectId.eq(subject_id))
+            .filter(attachment::Column::DiscardedAt.is_null())
+            .col_expr(attachment::Column::DiscardedAt, Expr::value(now))
+            .col_expr(attachment::Column::UpdatedAt, Expr::value(now))
+            .exec(self.get_connection())
+            .await?;
+        Ok(result.rows_affected)
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +196,89 @@ mod tests {
             .expect("query after delete");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].public_id, pub_id2);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_public_id_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
+        let attachment_storage = storage.attachment_storage();
+
+        let pub_id = generate_public_id();
+        attachment_storage
+            .create_attachment(
+                pub_id.clone(),
+                "path/1".to_string(),
+                "image/png".to_string(),
+                "Message".to_string(),
+                300,
+                "a.png".to_string(),
+                10,
+                1,
+            )
+            .await
+            .expect("first create");
+
+        let err = attachment_storage
+            .create_attachment(
+                pub_id,
+                "path/2".to_string(),
+                "image/png".to_string(),
+                "Message".to_string(),
+                300,
+                "b.png".to_string(),
+                20,
+                2,
+            )
+            .await;
+        assert!(err.is_err(), "duplicate public_id should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_soft_delete_attachments_for_subject() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
+        let attachment_storage = storage.attachment_storage();
+
+        let pub_id1 = generate_public_id();
+        let pub_id2 = generate_public_id();
+        attachment_storage
+            .create_attachment(
+                pub_id1.clone(),
+                "path/1".to_string(),
+                "image/png".to_string(),
+                "Message".to_string(),
+                400,
+                "a.png".to_string(),
+                10,
+                1,
+            )
+            .await
+            .expect("create 1");
+        attachment_storage
+            .create_attachment(
+                pub_id2.clone(),
+                "path/2".to_string(),
+                "image/png".to_string(),
+                "Message".to_string(),
+                400,
+                "b.png".to_string(),
+                20,
+                2,
+            )
+            .await
+            .expect("create 2");
+
+        let affected = attachment_storage
+            .soft_delete_attachments_for_subject("Message", 400)
+            .await
+            .expect("soft delete for subject");
+        assert_eq!(affected, 2);
+
+        let results = attachment_storage
+            .get_attachments_by_subject("Message", 400)
+            .await
+            .expect("query after subject delete");
+        assert!(results.is_empty());
     }
 }

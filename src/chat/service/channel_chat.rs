@@ -359,6 +359,10 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .soft_delete_message(message_public_id)
             .await?;
 
+        self.attachment_storage
+            .soft_delete_attachments_for_subject("Message", msg.id)
+            .await?;
+
         if was_latest {
             self.message_storage
                 .recompute_latest_for_channel(channel_id)
@@ -787,6 +791,60 @@ mod tests {
                 channel_public_id: ch.public_id,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_message_soft_deletes_attachments() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let svc = ChannelChatService::from_storage(&storage);
+
+        let (ch, _) = svc
+            .create_channel(
+                Some("Test Channel".to_string()),
+                None,
+                "alice".to_string(),
+                vec!["bob".to_string()],
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create channel");
+
+        let msg = svc
+            .send_message(
+                &ch.public_id,
+                "alice".to_string(),
+                "see attached".to_string(),
+                None,
+                Some(vec![crate::contract::api::chat::AttachmentConfirmReq {
+                    file_path: "chat/attachments/xxx/file.png".to_string(),
+                    file_type: "image/png".to_string(),
+                    file_name: "file.png".to_string(),
+                    file_size: 1024,
+                }]),
+            )
+            .await
+            .expect("send message with attachment");
+
+        let attachments_before = svc
+            .attachment_storage
+            .get_attachments_by_subject("Message", msg.id)
+            .await
+            .expect("query attachments before delete");
+        assert_eq!(attachments_before.len(), 1);
+
+        svc.delete_message(&ch.public_id, &msg.public_id, "alice")
+            .await
+            .expect("delete message");
+
+        let attachments_after = svc
+            .attachment_storage
+            .get_attachments_by_subject("Message", msg.id)
+            .await
+            .expect("query attachments after delete");
+        assert!(attachments_after.is_empty());
     }
 }
 
