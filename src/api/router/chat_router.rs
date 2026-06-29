@@ -70,14 +70,17 @@ fn validate_chat_attachment_metadata(
     }
 
     let file_type = file_type.trim();
-    let mime_parts: Vec<&str> = file_type.split('/').collect();
     if file_type.is_empty()
         || file_type.len() > CHAT_ATTACHMENT_MAX_FILE_TYPE_LEN
-        || mime_parts.len() != 2
-        || mime_parts[0].is_empty()
-        || mime_parts[1].is_empty()
         || file_type.chars().any(char::is_control)
     {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid attachment file_type"
+        )));
+    }
+
+    let mime_parts: Vec<&str> = file_type.split('/').collect();
+    if mime_parts.len() != 2 || mime_parts[0].is_empty() || mime_parts[1].is_empty() {
         return Err(ApiError::bad_request(anyhow::anyhow!(
             "invalid attachment file_type"
         )));
