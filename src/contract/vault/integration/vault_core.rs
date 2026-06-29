@@ -414,6 +414,161 @@ impl VaultCore {
         replace_core_key(key_path.as_ref(), &updated_key)
     }
 
+    /// Backup `key_path` to `destination`.
+    ///
+    /// If `destination` is a directory, a file named `core_key.json.<timestamp>`
+    /// is created inside it. The copied key is given `0600` permissions on Unix
+    /// and a sibling `.meta.json` file records the source path and backup time.
+    pub fn backup_key(
+        key_path: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> VaultResult<PathBuf> {
+        let key_path = key_path.as_ref();
+        let destination = destination.as_ref();
+
+        if !key_path.exists() {
+            return Err(VaultError::CoreKeyMissing {
+                path: key_path.to_path_buf(),
+            });
+        }
+
+        let output_path = if destination.is_dir() {
+            destination.join(format!(
+                "core_key.json.{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ))
+        } else {
+            destination.to_path_buf()
+        };
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| VaultError::CoreKeyWrite {
+                path: output_path.clone(),
+                source,
+            })?;
+        }
+
+        fs::copy(key_path, &output_path).map_err(|source| VaultError::CoreKeyWrite {
+            path: output_path.clone(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| VaultError::CoreKeyWrite {
+                    path: output_path.clone(),
+                    source,
+                },
+            )?;
+        }
+
+        let meta_path = output_path.with_extension("meta.json");
+        let meta = serde_json::json!({
+            "version": 1,
+            "source_key_path": key_path.to_string_lossy(),
+            "backed_up_at": chrono::Utc::now().to_rfc3339(),
+            "key_file": output_path.file_name().map(|n| n.to_string_lossy()),
+        });
+        let meta_file =
+            fs::File::create(&meta_path).map_err(|source| VaultError::CoreKeyWrite {
+                path: meta_path.clone(),
+                source,
+            })?;
+        serde_json::to_writer_pretty(meta_file, &meta).map_err(|source| {
+            VaultError::CoreKeySerialize {
+                path: meta_path.clone(),
+                source,
+            }
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&meta_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| VaultError::CoreKeyWrite {
+                    path: meta_path.clone(),
+                    source,
+                },
+            )?;
+        }
+
+        Ok(output_path)
+    }
+
+    /// Restore a backed-up key file to `key_path` and verify it unlocks the vault.
+    ///
+    /// The restore is performed atomically: `source` is copied to a temporary file
+    /// next to `key_path`, verified with `VaultCore::from_database_config`, and
+    /// then renamed into place. This avoids leaving a non-functional `core_key.json`
+    /// if the backup is corrupt or does not match the current database.
+    pub async fn restore_key(
+        source: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        db_config: &DbConfig,
+    ) -> VaultResult<PathBuf> {
+        let source = source.as_ref();
+        let key_path = key_path.as_ref();
+
+        if !source.exists() {
+            return Err(VaultError::CoreKeyRead {
+                path: source.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "backup source does not exist",
+                ),
+            });
+        }
+
+        let tmp_path = key_path.with_extension("restore-tmp");
+        if let Some(parent) = tmp_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| VaultError::CoreKeyWrite {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        }
+
+        fs::copy(source, &tmp_path).map_err(|source| VaultError::CoreKeyWrite {
+            path: tmp_path.clone(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| VaultError::CoreKeyWrite {
+                    path: tmp_path.clone(),
+                    source,
+                },
+            )?;
+        }
+
+        // Verify the restored key actually unlocks the vault before activating it.
+        let verify_result = VaultCore::from_database_config(db_config, tmp_path.clone()).await;
+        if let Err(e) = verify_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if key_path.exists() {
+            fs::remove_file(key_path).map_err(|source| VaultError::CoreKeyWrite {
+                path: key_path.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::rename(&tmp_path, key_path).map_err(|source| VaultError::CoreKeyWrite {
+            path: key_path.to_path_buf(),
+            source,
+        })?;
+
+        Ok(key_path.to_path_buf())
+    }
+
     /// Emit one audit record per secret access (vault.md stage H).
     ///
     /// Records `operation` (write/read/list/delete), the `secret_name` (the
@@ -1006,6 +1161,7 @@ mod tests {
     use super::*;
     use crate::jupiter::{
         migration::apply_migrations,
+        storage::base_storage::BaseStorage,
         tests::{test_db_config, test_db_connection, test_storage},
     };
 
@@ -1069,7 +1225,7 @@ mod tests {
     /// Scope is `tracing` on this task thread (see the capture comment below for
     /// the deliberately uncovered channels: stdout/stderr, the `log::` facade and
     /// vault-internal background OS threads).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn vault_lifecycle_never_logs_root_token_shares_or_secret_values() {
         use std::{io::Write, sync::Mutex};
 
@@ -1641,5 +1797,134 @@ mod tests {
 
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_backup_key_creates_key_and_meta_file() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let _vault_core = VaultCore::config(vault_storage, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        let backup_dir = temp_dir.path().join("backups");
+        let backed_up_path =
+            VaultCore::backup_key(&key_path, &backup_dir).expect("backup should succeed");
+
+        assert!(backed_up_path.starts_with(&backup_dir));
+        assert!(backed_up_path.exists(), "backup key file should exist");
+        let meta_path = backed_up_path.with_extension("meta.json");
+        assert!(meta_path.exists(), "backup meta file should exist");
+
+        let original = std::fs::read_to_string(&key_path).expect("original key should be readable");
+        let copy = std::fs::read_to_string(&backed_up_path).expect("backup key should be readable");
+        assert_eq!(
+            original, copy,
+            "backup should be an exact copy of the key file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backed_up_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "backup key file should be readable only by owner"
+            );
+        }
+    }
+
+    async fn vault_storage_for_config(db_config: &DbConfig) -> VaultStorage {
+        use sea_orm::{ConnectOptions, Database};
+
+        let mut opt = ConnectOptions::new(db_config.db_url.clone());
+        opt.max_connections(2).min_connections(1);
+        let connection = Database::connect(opt)
+            .await
+            .expect("Failed to connect to test database");
+        let connection = Arc::new(connection);
+        apply_migrations(&connection, true).await.unwrap();
+        VaultStorage {
+            base: BaseStorage::new(connection),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_restore_key_verifies_and_replaces_key_file() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = vault_storage_for_config(&db_config).await;
+        let vault_core = VaultCore::config(vault_storage, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        let secret_data = serde_json::json!({"value": "test"})
+            .as_object()
+            .unwrap()
+            .clone();
+        vault_core
+            .write_secret("restore_test_key", Some(secret_data.clone()))
+            .await
+            .expect("secret write should succeed");
+
+        let backup_file = temp_dir.path().join("core_key.json.bak");
+        VaultCore::backup_key(&key_path, &backup_file).expect("backup should succeed");
+
+        // Simulate key file loss.
+        std::fs::remove_file(&key_path).expect("key file should be removable");
+
+        let restored_path = VaultCore::restore_key(&backup_file, &key_path, &db_config)
+            .await
+            .expect("restore should succeed");
+        assert_eq!(restored_path, key_path);
+        assert!(key_path.exists(), "restored key file should exist");
+
+        let reopened = VaultCore::from_database_config(&db_config, key_path.clone())
+            .await
+            .expect("restored key should unlock the vault");
+        let read_back = reopened
+            .read_secret("restore_test_key")
+            .await
+            .expect("secret read should succeed")
+            .expect("secret should still exist after restore");
+        assert_eq!(read_back, secret_data);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_restore_key_rejects_backup_that_does_not_unlock_vault() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = vault_storage_for_config(&db_config).await;
+        VaultCore::config(vault_storage, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        // Create an unrelated vault whose key cannot unlock the first vault's storage.
+        let other_temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let other_key_path = other_temp_dir.path().join(CORE_KEY_FILE);
+        let other_vault_storage = test_vault_storage(other_temp_dir.path()).await;
+        VaultCore::config(other_vault_storage, other_key_path.clone())
+            .await
+            .expect("other vault core should initialize");
+
+        let err = VaultCore::restore_key(&other_key_path, &key_path, &db_config)
+            .await
+            .expect_err("restore with a mismatched key should fail");
+        assert!(
+            err.to_string().contains("unseal") || err.to_string().contains("core key"),
+            "error should relate to unseal/key verification: {err}"
+        );
+        // Original key file must remain untouched.
+        assert!(
+            key_path.exists(),
+            "original key file should not be removed on failed restore"
+        );
     }
 }

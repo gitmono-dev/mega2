@@ -35,7 +35,7 @@
 
 > **落地状态更新（2026-06-17；2026-06-19 补 H 审计策略与 J secret 轮换命令；2026-06-23 补 H 审计配置化；2026-06-23 补 A6 显式 reset 命令）**：本轮实现已完成阶段 A/B/C/D/E/F/H/I/J 的可交付子集，并明确阶段 G 的边界。
 >
-> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。**（2026-06-19）H：`audit_secret_access` 已 doc-comment 显式记录 fail-open 失败策略；J：新增 `config secret rotate` 覆写可迁移 secret（首批 `mail.password`）并显式提示运行中 service 需重启 re-resolve。（2026-06-23）H：审计已配置化——`config.vault.audit.enabled`（默认开启）经 `VaultCore::with_audit_config` 注入，满足“审计目的地可配置，默认开启”验收的 enable/default-on 维度；可配置持久化 sink 仍为后续。（2026-06-23）A6：新增 `config vault reset --force` 显式运维命令，删除 vault 表全部数据、将 `core_key.json` 按时间戳备份后重新初始化，普通启动不再隐式触发清库。（2026-06-27）J：新增 `config vault rekey --force [--key-path]` 运维命令，封装既有 `VaultCore::rekey_unseal_shares()` 重写 unseal 分片（保留数据），补齐阶段 J 第 1 项“提供 unseal 分片 rekey 的运维命令”；KEK 轮换仍为后续专项。**
+> - A/B/C/F/H/J：`VaultCore` 已 Result 化、fail-closed、移除 key 缺失清库路径、收窄 raw API、增加 `SecretName` 校验、Unix key 权限、DB-only bootstrap、interface 审计 hook、消费端错误传播、unseal share rekey 和恢复运行手册。**（2026-06-19）H：`audit_secret_access` 已 doc-comment 显式记录 fail-open 失败策略；J：新增 `config secret rotate` 覆写可迁移 secret（首批 `mail.password`）并显式提示运行中 service 需重启 re-resolve。（2026-06-23）H：审计已配置化——`config.vault.audit.enabled`（默认开启）经 `VaultCore::with_audit_config` 注入，满足“审计目的地可配置，默认开启”验收的 enable/default-on 维度；可配置持久化 sink 仍为后续。（2026-06-23）A6：新增 `config vault reset --force` 显式运维命令，删除 vault 表全部数据、将 `core_key.json` 按时间戳备份后重新初始化，普通启动不再隐式触发清库。（2026-06-27）J：新增 `config vault rekey --force [--key-path]` 运维命令，封装既有 `VaultCore::rekey_unseal_shares()` 重写 unseal 分片（保留数据），补齐阶段 J 第 1 项“提供 unseal 分片 rekey 的运维命令”。**（2026-06-28）J/A：新增 `config vault backup <DESTINATION> [--key-path <PATH>]` 与 `config vault restore <SOURCE> --force [--key-path <PATH>]` 运维命令，分别把 `core_key.json` 复制到安全位置（附带 `.meta.json`、设置 `0600` 权限）和从备份原子恢复并验证备份 key 能解封当前数据库，补齐阶段 J 第 2–3 项“key 丢失/泄露的备份恢复运行手册”的可执行入口；KEK 轮换仍为后续专项。**
 >
 > - **（2026-06-24）H：审计记录补 caller 身份（“谁”）。新增 `tokio::task_local!` `AUDIT_CALLER` 与 `with_audit_caller`；`audit_secret_access` 在 `vault_audit` 事件中记录 `caller`（未注入时为 `unknown`）；`config secret set/check/rotate`、`config validate --resolve-secrets`、startup/reload 的 `mail.password_ref` 解析入口已注入对应 caller。由 `with_audit_caller_scopes_caller_identity` 锁定。**
 > - **（2026-06-27）A：补齐“root token/分片/secret 明文不得进入日志”验收（vault.md:226/260）的自动化守卫。新增 `vault_lifecycle_never_logs_root_token_shares_or_secret_values` 回归测试（`src/contract/vault/integration/vault_core.rs`）：用线程局部 `tracing` subscriber 捕获 VaultCore 集成在 init → write_secret → read_secret → reset 全流程于初始化任务线程上发出的 `tracing` 事件，断言写入的 secret 明文、已持久化的 unseal 分片（compact JSON / pretty JSON / Debug 三种形态，pretty 对应 `persist_core_key` 的 `to_writer_pretty`）、限权 runtime token 与任何 root-token 字样均不出现；并以变更测试（mutation test）确认注入泄露时该用例会失败。此前阶段 A 仅有 `core_key.json` 不含 `root_token` 的持久化断言，无日志侧守卫。**该单测的覆盖边界（刻意留白、已在测试注释标注）：仅捕获本任务线程上的 `tracing` 事件，不覆盖 stdout/stderr 的 `println!`/`eprintln!`、`log::` facade（未装 `tracing-log` 桥）以及 vault 内部后台 OS 线程（如 `src/vault/modules/auth/expiration.rs` 的租约过期定时线程）上发出的事件——彻底覆盖需全局 subscriber（与其它测试 `try_init` 竞争）或进程级 fd 捕获，超出本单测范围。**
@@ -62,7 +62,7 @@
 
 因此，后续把可迁移凭据写入 vault 时，不需要重新发明 secret 存储能力。真正需要补齐的是安全加固、初始化语义、错误模型、最小 bootstrap、运维命令和配置侧的 `SecretRef` resolver。
 
-新增运维命令：`config vault reset --force` 调用 `VaultCore::reset()`，先删除 `vault` 表全部数据，再将已有的 `core_key.json` 备份为带时间戳的 `.json.bak.<timestamp>`，最后重新初始化 RustyVault 并签发新的限权 token。该命令是破坏性操作，必须通过 `--force` 显式确认，普通启动和服务启动不再隐式触发清库。
+新增运维命令：`config vault reset --force` 调用 `VaultCore::reset()`，先删除 `vault` 表全部数据，再将已有的 `core_key.json` 备份为带时间戳的 `.json.bak.<timestamp>`，最后重新初始化 RustyVault 并签发新的限权 token。该命令是破坏性操作，必须通过 `--force` 显式确认，普通启动和服务启动不再隐式触发清库。`config vault backup <DESTINATION> [--key-path <PATH>]` 与 `config vault restore <SOURCE> --force [--key-path <PATH>]` 已补齐 key material 备份/恢复路径：backup 复制 `core_key.json` 到目标位置并写入 `.meta.json` 元数据；restore 在临时文件上验证备份 key 能解封当前数据库后原子替换 `core_key.json`，避免 key 丢失场景下无法恢复。
 
 ## 当前实现状态速览表（2026-06-17）
 
@@ -86,7 +86,7 @@
 1. **fail-closed 以 `inited()` 为准，绝不在 key 缺失时清库。** DB 已初始化但 `core_key.json` 缺失时必须返回错误（`VaultError::CoreKeyMissing`，见 `vault_core.rs`），绝不调用 `delete_all()`——否则会静默销毁全部已存 secret；空 DB 无 key 仍允许首次初始化。
 2. **root token、unseal 分片、secret 明文绝不被主动写入日志/输出。** 这些材料一旦泄露即等于 vault 失守；`core_key.json` 只持久化 unseal 分片与限权 runtime token，不再长期保存 root token（初始化后即撤销）。`vault_lifecycle_never_logs_root_token_shares_or_secret_values` 回归测试在初始化任务线程的 `tracing` 路径上守卫这一点；stdout/`log::` facade/vault 后台线程的捕获留白见「风险与约束」。
 3. **常规 secret 访问必须使用限权 token，不得使用 root token。** 初始化时安装 ACL policy 并签发 ssh/pgp/nostr/pki/config/generic 限权 token；config token 与 generic token 必须 ACL 隔离（config token 不能读 generic secret，反之亦然），有矩阵测试。
-4. **vault 运维命令必须使用最小 DB/Vault bootstrap。** `config secret set/check`、`config vault reset/rekey` 只依赖数据库与 vault key 操作 secret；`config validate --resolve-secrets` 会解析并校验完整配置（含 Redis、对象存储等字段的校验规则）并经 vault 解析 secret。三者都**不得初始化** Redis 连接、对象存储后端、完整 `Storage` 或 HTTP 服务（不构造完整 `AppContext`）；缺数据库/vault 时给出明确前置提示而非 panic。
+4. **vault 运维命令必须使用最小 DB/Vault bootstrap。** `config secret set/check`、`config vault reset/rekey/backup/restore` 只依赖数据库与 vault key 操作 secret；`config validate --resolve-secrets` 会解析并校验完整配置（含 Redis、对象存储等字段的校验规则）并经 vault 解析 secret。它们都**不得初始化** Redis 连接、对象存储后端、完整 `Storage` 或 HTTP 服务（不构造完整 `AppContext`）；缺数据库/vault 时给出明确前置提示而非 panic。
 5. **自动解封材料是静态保护边界，不能用“放进 vault”替代部署侧托管。** 自动解封所需的 unseal 分片仍落在本地 `core_key.json`，能读取该文件的攻击者即可解封。生产高敏感部署必须配套 KMS/secret manager、受控挂载（Unix `0700`/`0600`）、备份恢复与恢复演练；备份恢复运行手册必须与 fail-closed 配套（否则 key 丢失从“自动重建”变成“无法恢复”）。
 6. **KEK 轮换无 libvault 内建原语，不在本计划承诺。** `init()` 后 KEK 不可变；unseal 分片 rekey（`rekey_unseal_shares`）可用，但彻底使旧分片失效需 KEK 轮换，须另立专项。
 7. **任何源码阶段都必须通过三项 gate。** `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 全绿方可交付；禁止 blanket `#[allow]` 掩盖。
@@ -96,7 +96,7 @@
 | 维度 | 当前状态 | 目标状态 | 实现难度 |
 |-----|--------|--------|--------|
 | 错误模型 | `VaultCore::new/config` 已 Result 化，消费端（context/ssh/pgp/nostr/pki）错误传播 | 持续保持无 panic 初始化路径 | 中等 |
-| fail-closed | DB inited 但 key 缺失返回错误、绝不清库；空 DB 可首次初始化 | 配套备份恢复运行手册，覆盖 key 丢失场景 | 中等 |
+| fail-closed | DB inited 但 key 缺失返回错误、绝不清库；空 DB 可首次初始化 | 已配套 `config vault backup/restore` 运维命令与恢复运行手册，覆盖 key 丢失场景 | 中等 |
 | 敏感输出脱敏 | root token/分片/secret 明文不进 `tracing` 日志，有回归测试守卫 | 扩展捕获边界（stdout/`log::` facade/后台线程）需全局 subscriber 或 fd 捕获 | 复杂 |
 | 物理后端边界 | `JupiterBackend` 依赖 `VaultBackendStorage` trait，可 DB-only 构造 | 维持窄接口，避免重新耦合完整 `Storage` | 简单 |
 | 接口收窄 | `read/write/delete_secret` 用校验过的 `SecretName`，raw/token API 已 `pub(in crate::contract::vault)` 收窄 | 持续防止 raw API 外泄 | 简单 |
@@ -818,19 +818,21 @@ Config::new
 工作项：
 
 1. ✅ 提供 unseal 分片 rekey 的运维命令（基于 `generate_unseal_keys()` / `unseal_once()`）——已落地 `config vault rekey --force [--key-path]`（见下文“重新生成 unseal 分片”与“已完成（2026-06-27）”）。vault 加密 key（KEK）轮换因无内建原语，单列为后续专项，不在本阶段交付（见上）。
-2. 定义密钥材料（分片 / 恢复凭据）的安全托管与备份位置（外部密钥管理系统 / 离线托管），写入下文“Vault 恢复运行手册”。
-3. 定义“DB 数据在、key 丢失”的恢复流程，以及疑似 `core_key.json` 泄露后的 rekey 流程。
+2. ✅ 定义密钥材料（分片 / 恢复凭据）的安全托管与备份位置（外部密钥管理系统 / 离线托管），写入下文“Vault 恢复运行手册”。可执行入口已落地：`config vault backup <DESTINATION> [--key-path <PATH>]` 把 `core_key.json` 复制到目标位置并生成 `.meta.json` 元数据；备份文件在 Unix 下权限设为 `0600`。
+3. ✅ 定义“DB 数据在、key 丢失”的恢复流程，以及疑似 `core_key.json` 泄露后的 rekey 流程。可执行入口已落地：`config vault restore <SOURCE> --force [--key-path <PATH>]` 先将备份复制到临时文件，调用 `VaultCore::from_database_config` 验证该 key 能解封当前数据库，再原子替换 `core_key.json`；若验证失败则保留原 key 文件不变。疑似泄露后应先用 `config vault rekey` 重写分片，再视风险决定是否重建 vault。
 4. 为可迁移 secret（首批 `mail.password`）提供轮换支持。
 5.（可选，长期）评估外部 KMS / transit auto-unseal，替代本地落盘自动解封，缓解磁盘读取威胁。
 
 > **已完成首批（2026-06-19）**：第 4 项已落地——新增 `monoengine config secret rotate <field> --vault-path ... --field ... --value-stdin`（`src/commands/config.rs`），经最小 DB/Vault bootstrap 覆写可迁移 secret（首批 `mail.password`），复用 `set` 的 namespace 校验与脱敏，并**显式打印重启要求**：运行中的 service 在 `AppContext::new` 一次性解析 `mail.password_ref`，因此需重启才能 re-resolve；`config validate --resolve-secrets` 与后续新 resolve 立即使用轮换值。这满足"明确其重启要求"的验收口径。运行期热生效（动态 mailer 重建）仍属 mail 阶段 4。
 
 > **已完成（2026-06-27）**：第 1 项已落地——新增 `monoengine config secret rotate` 之外的 vault 运维命令 `monoengine --config <path> config vault rekey --force [--key-path <PATH>]`（`src/commands/config.rs` 的 `exec_vault_rekey` + `vault_rekey_cli`）。该命令经最小 DB/Vault bootstrap（`LoadMode::VaultBootstrap`）打开当前 vault 并调用既有原语 `VaultCore::rekey_unseal_shares()` 重写 `core_key.json` 的 Shamir 分片，保留数据；`--force` 必填、`--key-path` 可覆盖 key 位置；成功后显式打印“旧分片仍可解封本 vault、彻底失效需 KEK 轮换”的限制。新增 CLI 解析/load-mode 单测（`config_vault_rekey_uses_vault_bootstrap_load_mode`、`config_vault_rekey_requires_force`、`config_vault_rekey_accepts_key_path`）。这把此前“仅库内方法 + 单测、无运维命令”补齐为“有运维命令”，满足第 1 项的运维命令验收口径。
+>
+> **已完成（2026-06-28）**：第 2–3 项已落地——新增 `config vault backup <DESTINATION> [--key-path <PATH>]` 与 `config vault restore <SOURCE> --force [--key-path <PATH>]` 运维命令（`src/commands/config.rs` 的 `exec_vault_backup` / `exec_vault_restore` + `vault_backup_cli` / `vault_restore_cli`；核心实现为 `VaultCore::backup_key` / `VaultCore::restore_key`）。两个命令均走 `LoadMode::VaultBootstrap`，`--key-path` 可覆盖默认 `core_key.json` 位置；`restore` 必须 `--force` 确认。backup 将 key 文件复制到目标位置并写入 `.meta.json`（记录来源路径与备份时间），Unix 权限 `0600`；restore 先把备份复制到 `core_key.json.restore-tmp`，用 `VaultCore::from_database_config` 验证能解封当前数据库，再原子替换原 key 文件，验证失败时保留原 key 文件并返回错误。新增 CLI 解析/load-mode 单测（`config_vault_backup_uses_vault_bootstrap_load_mode`、`config_vault_backup_accepts_key_path`、`config_vault_restore_uses_vault_bootstrap_load_mode`、`config_vault_restore_requires_force`）与核心功能单测（`test_backup_key_creates_key_and_meta_file`、`test_restore_key_verifies_and_replaces_key_file`、`test_restore_key_rejects_backup_that_does_not_unlock_vault`）。
 
 验收标准：
 
 - ✅ 分片重新生成后新的 `core_key.json` 可解封且数据不丢——已由 `config vault rekey` 运维命令封装 `VaultCore::rekey_unseal_shares()` 提供（2026-06-27）；旧分片彻底失效需等待 KEK 轮换或外部 KMS / transit auto-unseal 专项。
-- 文档化的恢复运行手册可在 key 丢失（数据在）场景下恢复访问或安全重置。
+- ✅ 文档化的恢复运行手册可在 key 丢失（数据在）场景下恢复访问或安全重置——已由 `config vault backup/restore` 运维命令与运行手册配套落地（2026-06-28）。
 - secret 轮换不需要重启全部依赖该 secret 的服务，或明确其重启要求。✅ 已通过 `config secret rotate` + 显式重启提示满足"明确重启要求"分支（2026-06-19）。
 
 ### Vault 恢复运行手册
@@ -845,16 +847,30 @@ Config::new
 
 #### 正常备份
 
-1. 将 `mega_base()/vault/core_key.json` 备份到应用主机之外。
-2. 备份副本必须加密保存到外部密钥管理系统、离线加密介质，或等效的受限凭据系统中。
-3. 除非快照本身已加密并有访问控制，否则 `core_key.json` 必须排除在容器镜像、日志采集、源码控制、支持包和普通文件系统快照之外。
-4. Unix 环境下，保持 vault 目录权限为 `0700`，`core_key.json` 权限为 `0600`。
+1. 使用运维命令将 `core_key.json` 备份到安全位置：
+
+   ```bash
+   monoengine --config <path> config vault backup /secure/backup/path/vault-key.bak
+   ```
+
+   该命令会复制 `mega_base()/vault/core_key.json` 到目标位置，并在同目录生成 `.meta.json` 元数据文件，记录来源路径和备份时间。若目标路径是目录，命令会自动生成带时间戳的文件名。备份文件在 Unix 下会被强制设为 `0600` 权限。
+
+2. 将备份副本加密保存到应用主机之外的外部密钥管理系统、离线加密介质，或等效的受限凭据系统中。
+3. 除非快照本身已加密并有访问控制，否则 `core_key.json` 及其备份必须排除在容器镜像、日志采集、源码控制、支持包和普通文件系统快照之外。
+4. Unix 环境下，保持 vault 目录权限为 `0700`，`core_key.json` 与备份文件权限为 `0600`。
 
 #### DB 数据存在但 key 文件缺失时的恢复
 
 1. 停止 monoengine。
-2. 恢复与同一份数据库备份或当前在线数据库匹配的 `core_key.json`。
-3. 设置权限：
+2. 使用恢复命令将验证过的备份 key 原子替换到 `core_key.json`：
+
+   ```bash
+   monoengine --config <path> config vault restore /secure/backup/path/vault-key.bak --force
+   ```
+
+   该命令会先把备份复制到临时文件，调用 `VaultCore::from_database_config` 验证该 key 能解封当前数据库，再替换 `core_key.json`；如果验证失败（备份与当前数据库不匹配或备份损坏），原 key 文件保持不变，命令返回错误。
+
+3. 手动设置权限（restore 已在 Unix 下将新 key 文件设为 `0600`，仍需确认目录为 `0700`）：
 
    ```bash
    chmod 700 "$(dirname "$CORE_KEY_PATH")"

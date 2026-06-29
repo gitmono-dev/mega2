@@ -95,7 +95,9 @@ pub fn cli() -> Command {
                 .about("Manage the monoengine vault")
                 .subcommand_required(true)
                 .subcommand(vault_reset_cli())
-                .subcommand(vault_rekey_cli()),
+                .subcommand(vault_rekey_cli())
+                .subcommand(vault_backup_cli())
+                .subcommand(vault_restore_cli()),
         )
         .subcommand(
             Command::new("init")
@@ -230,6 +232,51 @@ fn vault_rekey_cli() -> Command {
         )
 }
 
+fn vault_backup_cli() -> Command {
+    Command::new("backup")
+        .about("Back up the vault core key file to a safe location")
+        .arg(
+            Arg::new("destination")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Destination file or directory for the backed-up core key"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
+fn vault_restore_cli() -> Command {
+    Command::new("restore")
+        .about("Restore the vault core key file from a backup and verify it unlocks the vault")
+        .arg(
+            Arg::new("source")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Backup core key file to restore"),
+        )
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm overwriting an existing core_key.json (required)"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
 fn secret_name_arg() -> Arg {
     Arg::new("name")
         .value_name("CONFIG_FIELD")
@@ -353,6 +400,8 @@ async fn exec_vault(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
         Some(("reset", reset_args)) => exec_vault_reset(ctx, reset_args).await,
         Some(("rekey", rekey_args)) => exec_vault_rekey(ctx, rekey_args).await,
+        Some(("backup", backup_args)) => exec_vault_backup(ctx, backup_args).await,
+        Some(("restore", restore_args)) => exec_vault_restore(ctx, restore_args).await,
         Some((cmd, _)) => Err(MegaError::Other(format!(
             "Unknown config vault subcommand: {cmd}"
         ))),
@@ -435,6 +484,73 @@ async fn exec_vault_rekey(ctx: CommandContext, args: &ArgMatches) -> MegaResult 
     // shares were invalidated.
     println!(
         "note: this re-splits the current encryption key; previously exported share sets for this key still unseal the vault. A full KEK rotation is required to invalidate old shares."
+    );
+    Ok(())
+}
+
+async fn exec_vault_backup(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    let config_path = require_config_path(&ctx, "config vault backup")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let destination = args
+        .get_one::<PathBuf>("destination")
+        .cloned()
+        .expect("destination is required");
+
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    // Loading config lets us validate the path/profile even though backup only
+    // needs the key file on disk.
+    let _config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let backup_path = VaultCore::backup_key(&key_path, &destination).map_err(MegaError::from)?;
+    println!(
+        "vault core key backed up to {} (metadata at {}.meta.json)",
+        backup_path.display(),
+        backup_path.display()
+    );
+    Ok(())
+}
+
+async fn exec_vault_restore(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    if !args.get_flag("force") {
+        return Err(MegaError::Other(
+            "config vault restore overwrites core_key.json; pass --force to confirm".to_string(),
+        ));
+    }
+
+    let config_path = require_config_path(&ctx, "config vault restore")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let source = args
+        .get_one::<PathBuf>("source")
+        .cloned()
+        .expect("source is required");
+
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    let config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let restored_path = VaultCore::restore_key(&source, &key_path, &config.database)
+        .await
+        .map_err(MegaError::from)?;
+    println!(
+        "vault core key restored to {}; the backup successfully unlocked the vault",
+        restored_path.display()
     );
     Ok(())
 }
@@ -840,6 +956,61 @@ mod tests {
             rekey_args.get_one::<PathBuf>("key-path"),
             Some(&PathBuf::from("/tmp/core_key.json"))
         );
+    }
+
+    #[test]
+    fn config_vault_backup_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "backup", "/tmp/vault-backup"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_backup_accepts_key_path() {
+        let matches = cli()
+            .try_get_matches_from([
+                "config",
+                "vault",
+                "backup",
+                "/tmp/vault-backup",
+                "--key-path",
+                "/tmp/core_key.json",
+            ])
+            .unwrap();
+        let Some(("vault", vault_args)) = matches.subcommand() else {
+            panic!("vault subcommand should parse");
+        };
+        let Some(("backup", backup_args)) = vault_args.subcommand() else {
+            panic!("backup subcommand should parse");
+        };
+
+        assert_eq!(
+            backup_args.get_one::<PathBuf>("destination"),
+            Some(&PathBuf::from("/tmp/vault-backup"))
+        );
+        assert_eq!(
+            backup_args.get_one::<PathBuf>("key-path"),
+            Some(&PathBuf::from("/tmp/core_key.json"))
+        );
+    }
+
+    #[test]
+    fn config_vault_restore_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "restore", "/tmp/vault-backup", "--force"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_restore_requires_force() {
+        let err = cli()
+            .try_get_matches_from(["config", "vault", "restore", "/tmp/vault-backup"])
+            .expect_err("restore without --force should not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
