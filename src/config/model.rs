@@ -172,6 +172,7 @@ pub enum MailProvider {
     #[default]
     Smtp,
     Console,
+    Http,
 }
 
 pub const DEFAULT_MAIL_DISPATCHER_BATCH_SIZE: u64 = 50;
@@ -228,7 +229,21 @@ pub struct MailConfig {
     pub template_default_locale: String,
     #[serde(default)]
     pub template_dir: Option<PathBuf>,
+    /// URL for the `Http` mail provider. The provider POSTs a JSON payload to
+    /// this endpoint. Required when `provider = "http"`.
+    #[serde(default)]
+    pub http_url: Option<String>,
+    /// Extra headers to send with HTTP provider requests (e.g. `Authorization`).
+    #[serde(default)]
+    pub http_headers: std::collections::HashMap<String, String>,
+    /// Request timeout for the HTTP provider.
+    #[serde(default = "default_http_timeout_secs")]
+    pub http_timeout_secs: u64,
     // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
 }
 
 fn default_smtp_port() -> u16 {
@@ -288,6 +303,9 @@ impl Default for MailConfig {
             attachment_prune_statuses: default_mail_attachment_prune_statuses(),
             template_default_locale: default_mail_template_locale(),
             template_dir: None,
+            http_url: None,
+            http_headers: std::collections::HashMap::new(),
+            http_timeout_secs: default_http_timeout_secs(),
         }
     }
 }
