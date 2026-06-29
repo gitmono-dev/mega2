@@ -220,6 +220,16 @@ pub trait RepoHandler: Send + Sync + 'static {
         have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError>;
 
+    async fn shallow_pack(
+        &self,
+        want: Vec<String>,
+        _depth: u32,
+        _deepen_relative: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        let stream = self.full_pack(want).await?;
+        Ok((stream, Vec::new()))
+    }
+
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError>;
 
     async fn get_blobs_by_hashes(

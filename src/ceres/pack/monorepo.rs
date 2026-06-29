@@ -228,9 +228,106 @@ impl RepoHandler for MonoRepo {
         Ok(())
     }
 
-    // monorepo full pack should follow the shallow clone command 'git clone --depth=1'
     async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         self.incremental_pack(want, Vec::new()).await
+    }
+
+    async fn shallow_pack(
+        &self,
+        want: Vec<String>,
+        depth: u32,
+        _deepen_relative: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.mono_storage();
+        let obj_num = AtomicUsize::new(0);
+
+        let mut exist_objs = HashSet::new();
+
+        let want_commits: Vec<Commit> = storage
+            .get_commits_by_hashes(&want)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(Commit::from_mega_model)
+            .collect();
+
+        let mut shallow_commits: Vec<String> = Vec::new();
+        let mut visited: HashSet<String> = want.iter().cloned().collect();
+        let mut current_level: Vec<Commit> = want_commits.clone();
+        let mut all_commits: Vec<Commit> = want_commits.clone();
+
+        for level in 0..depth {
+            let mut next_level: Vec<Commit> = Vec::new();
+            for commit in &current_level {
+                for p_commit_id in &commit.parent_commit_ids {
+                    let p_id = p_commit_id.to_string();
+                    if visited.insert(p_id.clone())
+                        && let Some(model) = storage.get_commit_by_hash(&p_id).await.unwrap()
+                    {
+                        let parent = Commit::from_mega_model(model);
+                        if level + 1 == depth {
+                            shallow_commits.push(p_id);
+                        } else {
+                            next_level.push(parent.clone());
+                        }
+                        all_commits.push(parent);
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        let want_tree_ids = all_commits.iter().map(|c| c.tree_id.to_string()).collect();
+        let want_trees: HashMap<ObjectHash, Tree> = storage
+            .get_trees_by_hashes(want_tree_ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                (
+                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    Tree::from_mega_model(m),
+                )
+            })
+            .collect();
+
+        obj_num.fetch_add(all_commits.len(), Ordering::SeqCst);
+
+        let mut counted_obj = HashSet::new();
+        for c in &all_commits {
+            self.traverse_for_count(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &exist_objs,
+                &mut counted_obj,
+                &obj_num,
+            )
+            .await;
+        }
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        encoder.encode_async(entry_rx).await.unwrap();
+
+        for c in all_commits {
+            self.traverse(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &mut exist_objs,
+                Some(&entry_tx),
+            )
+            .await?;
+            entry_tx
+                .send(MetaAttached {
+                    inner: c.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(entry_tx);
+
+        Ok((ReceiverStream::new(stream_rx), shallow_commits))
     }
 
     async fn incremental_pack(

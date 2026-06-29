@@ -106,6 +106,9 @@ impl SmartSession {
         let mut want: HashSet<String> = HashSet::new();
         let mut have: HashSet<String> = HashSet::new();
         let mut last_common_commit = String::new();
+        let mut deepen_depth: Option<u32> = None;
+        let mut deepen_relative = false;
+        let mut shallow_commits: Vec<String> = Vec::new();
 
         let mut read_first_line = false;
         loop {
@@ -154,6 +157,34 @@ impl SmartSession {
                     })?);
                 }
                 b"done" => break,
+                b"deep" => {
+                    let payload = &dst[4..];
+                    if payload.starts_with(b"en ") {
+                        let depth_str = core::str::from_utf8(&payload[3..])
+                            .map_err(|_| {
+                                ProtocolError::InvalidInput(
+                                    "deepen depth is not valid UTF-8".to_owned(),
+                                )
+                            })?
+                            .trim();
+                        deepen_depth = Some(depth_str.parse::<u32>().map_err(|_| {
+                            ProtocolError::InvalidInput(format!(
+                                "invalid deepen depth: {depth_str}"
+                            ))
+                        })?);
+                    } else if payload.starts_with(b"en-relative") {
+                        deepen_relative = true;
+                    } else if payload.starts_with(b"en-since") || payload.starts_with(b"en-not") {
+                        return Err(ProtocolError::InvalidInput(
+                            "deepen-since and deepen-not are not supported".to_owned(),
+                        ));
+                    } else {
+                        tracing::warn!(
+                            "unknown deepen variant: {:?}",
+                            String::from_utf8_lossy(payload)
+                        );
+                    }
+                }
                 other => {
                     tracing::error!(
                         "unsupported command: {:?}",
@@ -174,9 +205,10 @@ impl SmartSession {
         }
 
         tracing::info!(
-            "want commands: {:?}\n have commands: {:?}\n caps:{:?}",
+            "want commands: {:?}\n have commands: {:?}\n deepen: {:?}\n caps:{:?}",
             want,
             have,
+            deepen_depth,
             self.capabilities
         );
 
@@ -187,17 +219,23 @@ impl SmartSession {
         let have: Vec<String> = have.into_iter().collect();
 
         if have.is_empty() {
-            pack_data = repo_handler
-                .full_pack(want)
-                .await
-                .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?;
+            if let Some(depth) = deepen_depth {
+                let (stream, shallows) = repo_handler
+                    .shallow_pack(want, depth, deepen_relative)
+                    .await
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("shallow pack generation failed: {e}"))
+                    })?;
+                pack_data = stream;
+                shallow_commits = shallows;
+            } else {
+                pack_data = repo_handler.full_pack(want).await.map_err(|e| {
+                    ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
+                })?;
+            }
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
             if self.capabilities.contains(&Capability::MultiAckDetailed) {
-                // multi_ack_detailed mode, the server will differentiate the ACKs where it is signaling that
-                // it is ready to send data with ACK obj-id ready lines,
-                // and signals the identified common commits with ACK obj-id common lines
-
                 for hash in &have {
                     if repo_handler.check_commit_exist(hash).await {
                         add_pkt_line_string(&mut protocol_buf, format!("ACK {hash} common\n"));
@@ -214,27 +252,27 @@ impl SmartSession {
                     })?;
 
                 if last_common_commit.is_empty() {
-                    //send NAK if missing common commit
                     add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
-                    // need to handle rebase option, still need pack data when has no common commit
                     return Ok((pack_data, protocol_buf));
                 }
 
                 for hash in want {
                     if self.capabilities.contains(&Capability::NoDone) {
-                        // If multi_ack_detailed and no-done are both present, then the sender is free to immediately send a pack
-                        // following its first "ACK obj-id ready" message.
                         add_pkt_line_string(&mut protocol_buf, format!("ACK {hash} ready\n"));
                     }
                 }
             } else {
                 tracing::error!("capability unsupported");
-                // init a empty receiverstream
                 let (_, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
                 pack_data = ReceiverStream::new(rx);
             }
             add_pkt_line_string(&mut protocol_buf, format!("ACK {last_common_commit} \n"));
         }
+
+        for shallow in &shallow_commits {
+            add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
+        }
+
         Ok((pack_data, protocol_buf))
     }
 
