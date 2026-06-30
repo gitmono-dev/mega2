@@ -11,6 +11,7 @@ Required environment:
 Optional environment:
   MONOENGINE_SSH_REPO_URL     SSH repo URL, e.g. ssh://git@127.0.0.1:2222/group/repo.git
   MONOENGINE_GIT_SMOKE_PUSH   Set to 1 to run opt-in HTTP/SSH push/delete smoke
+  MONOENGINE_GIT_SMOKE_LFS    Set to 1 to run opt-in HTTP LFS push/clone smoke
   MONOENGINE_GIT_SMOKE_WORKDIR  Existing directory for temporary clones
   MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones after the run
 
@@ -152,6 +153,50 @@ push_tag_smoke() {
   fi
 }
 
+lfs_smoke_http() {
+  local src="$ROOT_DIR/lfs-src"
+  local clone_dir="$ROOT_DIR/lfs-clone"
+  local branch="monoengine-smoke-lfs-$(date +%s)-$$"
+  local rc=0
+  local cleanup_status=0
+
+  git lfs version >/dev/null 2>&1 || {
+    echo "git-lfs is required for MONOENGINE_GIT_SMOKE_LFS=1" >&2
+    return 1
+  }
+
+  rm -rf "$src" "$clone_dir"
+  mkdir -p "$src" || return
+  git -C "$src" init >/dev/null || return
+  git -C "$src" config user.name "Monoengine Smoke" || return
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
+  git -C "$src" lfs install --local >/dev/null || return
+  git -C "$src" lfs track "*.bin" >/dev/null || return
+  printf 'monoengine git lfs smoke %s\n' "$branch" >"$src/smoke-lfs.bin"
+  git -C "$src" add .gitattributes smoke-lfs.bin || return
+  git -C "$src" commit -m "monoengine git lfs smoke" >/dev/null || return
+  git -C "$src" remote add origin "$MONOENGINE_HTTP_REPO_URL" || return
+  git -C "$src" push origin "HEAD:refs/heads/$branch" || return
+
+  GIT_LFS_SKIP_SMUDGE=1 git_case clone --branch "$branch" "$MONOENGINE_HTTP_REPO_URL" "$clone_dir" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    git -C "$clone_dir" lfs pull || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]] && ! cmp -s "$src/smoke-lfs.bin" "$clone_dir/smoke-lfs.bin"; then
+    echo "LFS round-trip content mismatch" >&2
+    rc=1
+  fi
+
+  git -C "$src" push origin ":refs/heads/$branch" || cleanup_status=$?
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    echo "failed to delete remote LFS smoke branch refs/heads/$branch" >&2
+    if [[ "$rc" -eq 0 ]]; then
+      rc="$cleanup_status"
+    fi
+  fi
+  return "$rc"
+}
+
 run_case "HTTP ls-remote" git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
 run_case "HTTP clone" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
 run_case "HTTP fetch" fetch_case "$ROOT_DIR/http-clone"
@@ -173,12 +218,18 @@ fi
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP push and delete branch" push_branch_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
   run_case "HTTP push and delete tag" push_tag_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
+  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
+    run_case "HTTP LFS push and clone" lfs_smoke_http
+  fi
   if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
     run_case "SSH push and delete branch" push_branch_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
     run_case "SSH push and delete tag" push_tag_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
   fi
 else
   echo "SKIP: HTTP/SSH push-delete branch and tag (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
+  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
+    echo "SKIP: HTTP LFS push/clone also requires MONOENGINE_GIT_SMOKE_PUSH=1"
+  fi
 fi
 
 echo "git protocol smoke summary: $PASS_COUNT passed, $FAIL_COUNT failed"
