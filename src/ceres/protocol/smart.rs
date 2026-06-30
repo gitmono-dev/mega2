@@ -762,6 +762,15 @@ pub mod test {
     }
 
     #[test]
+    pub fn try_read_pkt_line_rejects_incomplete_header_without_consuming() {
+        let mut bytes = Bytes::from_static(b"00f");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert_eq!(&bytes[..], b"00f");
+    }
+
+    #[test]
     pub fn try_read_pkt_line_rejects_incomplete_payload() {
         let mut bytes = Bytes::from_static(b"000babc");
         let err = try_read_pkt_line(&mut bytes).unwrap_err();

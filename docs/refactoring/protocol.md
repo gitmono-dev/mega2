@@ -470,30 +470,26 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 - 已完成首批：`atomic`、`report-status-v2`、`delete-refs`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；后续若补齐行为和测试再重新声明。
 - ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
-### pkt-line parser 缺少错误模型
+### pkt-line parser 错误模型已收敛，streaming reader 仍待后续
 
-`read_pkt_line` 当前对 malformed input 使用 `unwrap` / panic：
+`src/ceres/protocol/smart.rs::try_read_pkt_line` 已定义 `PktLine` enum：
+`Data(Bytes)`、`Flush`、`Delim`、`ResponseEnd`，并返回
+`Result<PktLine, ProtocolError>`。Malformed input 不再通过 `unwrap` / panic
+处理，而是显式返回 `ProtocolError::InvalidInput`，且失败时不消费输入
+buffer。
 
-```rust
-let pkt_length = usize::from_str_radix(core::str::from_utf8(&pkt_length).unwrap(), 16)
-    .unwrap_or_else(|_| panic!(...));
-let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
-```
+已覆盖的边界：
 
-风险：
+- 空输入或不足 4 字节的 length header。
+- 非 hex length header。
+- reserved length `0003`。
+- length 大于剩余 buffer。
+- `0000` flush-pkt、`0001` delim-pkt、`0002` response-end-pkt。
 
-- 不足 4 字节会 panic。
-- 非 hex 长度会 panic。
-- length 小于 4 会 underflow。
-- length 大于剩余 buffer 会 panic。
-- 无法区分 flush-pkt、delim-pkt、response-end-pkt 等 pkt-line 形态。
+仍待后续：
 
-建议：
-
-- 定义 `PktLine` enum：`Data(Bytes)`、`Flush`、`Delim`、`ResponseEnd`。
-- parser 返回 `Result<PktLine, ProtocolError>`。
-- 对 length 边界和剩余 bytes 做显式校验。
-- HTTP 和 SSH 共用同一 streaming parser。
+- HTTP 和 SSH 当前仍先完整缓冲 request/channel 数据，再复用该 parser 解析。
+  后续需要抽出真正的 streaming pkt-line reader，避免大请求完整驻留内存。
 
 ### upload-pack negotiation 已支持 shallow / protocol v2 / blob:none
 
