@@ -45,7 +45,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode, header::CONTENT_TYPE},
     response::Response,
 };
 use futures::TryStreamExt;
@@ -121,11 +121,20 @@ fn map_lfs_error<E: ToString>(err: E) -> (StatusCode, String) {
 
 fn lfs_error_response(code: StatusCode, msg: String) -> Response<Body> {
     let error_body = serde_json::json!({ "message": msg }).to_string();
-    Response::builder()
-        .status(code)
-        .header("Content-Type", LFS_CONTENT_TYPE)
-        .body(Body::from(error_body))
-        .unwrap()
+    lfs_response(code, LFS_CONTENT_TYPE, Body::from(error_body))
+}
+
+fn lfs_json_response(code: StatusCode, body: String) -> Response<Body> {
+    lfs_response(code, LFS_CONTENT_TYPE, Body::from(body))
+}
+
+fn lfs_response(code: StatusCode, content_type: &'static str, body: Body) -> Response<Body> {
+    let mut response = Response::new(body);
+    *response.status_mut() = code;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 /// List LFS locks
@@ -157,19 +166,11 @@ pub async fn list_locks(
     match result {
         Ok(lock_list) => {
             let body = serde_json::to_string(&lock_list).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
-            let error_body = serde_json::json!({ "message": msg }).to_string();
-            Ok(Response::builder()
-                .status(code)
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(error_body))
-                .unwrap())
+            Ok(lfs_error_response(code, msg))
         }
     }
 }
@@ -198,10 +199,7 @@ pub async fn list_locks_for_verification(
     match result {
         Ok(lock_list) => {
             let body = serde_json::to_string(&lock_list).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -238,11 +236,7 @@ pub async fn create_lock(
                 message: "".to_string(),
             };
             let body = serde_json::to_string(&lock_response).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .status(StatusCode::CREATED)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::CREATED, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -284,10 +278,7 @@ pub async fn delete_lock(
                 message: "".to_string(),
             };
             let body = serde_json::to_string(&unlock_response).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -323,10 +314,7 @@ pub async fn lfs_process_batch(
     match result {
         Ok(res) => {
             let body = serde_json::to_string(&res).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -360,10 +348,11 @@ pub async fn lfs_download_object(
 ) -> Result<Response, (StatusCode, String)> {
     let result = handler::lfs_download_object(state.storage.lfs_service.clone(), oid.clone()).await;
     match result {
-        Ok(byte_stream) => Ok(Response::builder()
-            .header("Content-Type", LFS_STREAM_CONTENT_TYPE)
-            .body(Body::from_stream(byte_stream))
-            .unwrap()),
+        Ok(byte_stream) => Ok(lfs_response(
+            StatusCode::OK,
+            LFS_STREAM_CONTENT_TYPE,
+            Body::from_stream(byte_stream),
+        )),
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
             Ok(lfs_error_response(code, msg))
@@ -409,14 +398,16 @@ pub async fn lfs_upload_object(
             Ok(acc)
         })
         .await
-        .unwrap();
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read LFS object request body: {e}"),
+            )
+        })?;
 
     let result = handler::lfs_upload_object(&state.storage.lfs_service, &req_obj, body_bytes).await;
     match result {
-        Ok(_) => Ok(Response::builder()
-            .header("Content-Type", LFS_CONTENT_TYPE)
-            .body(Body::empty())
-            .unwrap()),
+        Ok(_) => Ok(lfs_json_response(StatusCode::OK, String::new())),
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
             Ok(lfs_error_response(code, msg))
