@@ -66,7 +66,7 @@ pub fn parse_git_protocol_path(
             )));
         }
         return Ok(GitProtocolPath {
-            repo_path: strip_trailing_git_suffix(prefix),
+            repo_path: normalize_repo_path(prefix),
             endpoint: GitProtocolEndpoint::InfoRefs,
         });
     }
@@ -78,7 +78,7 @@ pub fn parse_git_protocol_path(
             )));
         }
         return Ok(GitProtocolPath {
-            repo_path: strip_trailing_git_suffix(prefix),
+            repo_path: normalize_repo_path(prefix),
             endpoint: GitProtocolEndpoint::UploadPack,
         });
     }
@@ -90,7 +90,7 @@ pub fn parse_git_protocol_path(
             )));
         }
         return Ok(GitProtocolPath {
-            repo_path: strip_trailing_git_suffix(prefix),
+            repo_path: normalize_repo_path(prefix),
             endpoint: GitProtocolEndpoint::ReceivePack,
         });
     }
@@ -100,14 +100,20 @@ pub fn parse_git_protocol_path(
     ))
 }
 
-/// Strips a single trailing `.git` suffix from a path string.
-fn strip_trailing_git_suffix(path: &str) -> PathBuf {
+/// Strips a single trailing `.git` suffix from a path string and normalizes
+/// the root repo path to `/`.  An empty prefix (e.g. from `GET /info/refs`)
+/// maps to `/` so that the monorepo root's refs are correctly resolved.
+fn normalize_repo_path(path: &str) -> PathBuf {
     let stripped = path
         .rsplit_once(".git")
         .filter(|(_, after)| after.is_empty())
         .map(|(before, _)| before)
         .unwrap_or(path);
-    PathBuf::from(stripped)
+    if stripped.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(stripped)
+    }
 }
 
 /// The legacy `third-party.git` root repo is reserved and must not be served.
@@ -172,18 +178,21 @@ mod tests {
     }
 
     #[test]
-    fn strip_trailing_git_suffix_leaves_non_trailing_segment() {
+    fn normalize_repo_path_leaves_non_trailing_segment() {
         assert_eq!(
-            strip_trailing_git_suffix("/foo.git/bar.git"),
+            normalize_repo_path("/foo.git/bar.git"),
             PathBuf::from("/foo.git/bar")
         );
         assert_eq!(
-            strip_trailing_git_suffix("/foo/bar.git"),
+            normalize_repo_path("/foo/bar.git"),
             PathBuf::from("/foo/bar")
         );
-        assert_eq!(
-            strip_trailing_git_suffix("/foo/bar"),
-            PathBuf::from("/foo/bar")
-        );
+        assert_eq!(normalize_repo_path("/foo/bar"), PathBuf::from("/foo/bar"));
+    }
+
+    #[test]
+    fn normalize_repo_path_maps_empty_to_root() {
+        assert_eq!(normalize_repo_path(""), PathBuf::from("/"));
+        assert_eq!(normalize_repo_path("/"), PathBuf::from("/"));
     }
 }

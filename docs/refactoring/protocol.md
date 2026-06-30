@@ -582,6 +582,10 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 monoengine HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MONOENGINE_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH branch/tag push/delete 通过 `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用，避免默认修改远端 refs。
 
+**（2026-06-30）CI 自动化回归 gate 已落地**：`.github/workflows/git-protocol-smoke.yml` 会在 PR 和 main push 时自动启动 PostgreSQL/Redis 测试服务、构建 release 二进制、启动 `service http`、等待就绪后对 monorepo 根路径执行 `scripts/git_protocol_smoke.sh` 的只读 HTTP 矩阵（ls-remote/clone/fetch/protocol v2 fetch/shallow clone/blob:none）。push/delete/LFS 场景仍需手动通过 `MONOENGINE_GIT_SMOKE_PUSH=1` 启用，因为它们需要访问令牌。
+
+**（2026-06-30）CI 自动化回归 gate 已落地**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的只读 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone）。push/delete/LFS 用例仍为手动 opt-in（`MONOENGINE_GIT_SMOKE_PUSH=1`），因为 push 需要有效的用户 access token。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
+
 建议脚本或后续集成测试覆盖：
 
 ```text
@@ -768,7 +772,7 @@ LFS:
 
 | 优先级 | 工作 | 原因 |
 | --- | --- | --- |
-| P0 | 建立真实 Git 客户端兼容性矩阵 | 后续改协议必须防回归 |
+| P0 | 建立真实 Git 客户端兼容性矩阵 | ✅ **已落地（2026-06-30）**：`scripts/git_protocol_smoke.sh` + `.github/workflows/git-protocol-smoke.yml` CI 自动化回归 gate，覆盖只读 HTTP 场景（ls-remote/clone/fetch/v2 fetch/shallow/blob:none） |
 | P0 | 修复 HTTP query、SSH exec、pkt-line parser 的 panic | 非法客户端输入不能打崩服务 |
 | P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；后续补 streaming parser 与 delete-only push 矩阵 |
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
