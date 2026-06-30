@@ -249,7 +249,10 @@ impl RepoHandler for ImportRepo {
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
         let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
-        encoder.encode_async(entry_rx).await.unwrap();
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
 
         for c in want_commits {
             self.traverse(
@@ -264,7 +267,7 @@ impl RepoHandler for ImportRepo {
                     meta: EntryMeta::new(),
                 })
                 .await
-                .unwrap();
+                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
         }
         drop(entry_tx);
 
