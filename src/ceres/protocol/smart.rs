@@ -1024,6 +1024,21 @@ pub mod test {
     }
 
     #[test]
+    pub fn parse_capabilities_recognizes_shallow_depth_extensions() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("shallow deepen-since deepen-not multi_ack_detailed");
+
+        assert!(session.capabilities.contains(&Capability::Shallow));
+        assert!(session.capabilities.contains(&Capability::DeepenSince));
+        assert!(session.capabilities.contains(&Capability::DeepenNot));
+        assert!(session.capabilities.contains(&Capability::MultiAckDetailed));
+    }
+
+    #[test]
     pub fn advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format() {
         for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
             let caps = advertised_capabilities(service);

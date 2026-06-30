@@ -271,6 +271,8 @@ side-band-64k
 report-status
 report-status-v2
 ofs-delta
+deepen-since
+deepen-not
 shallow
 ```
 
