@@ -186,6 +186,9 @@ lfs_smoke_http() {
     echo "LFS round-trip content mismatch" >&2
     rc=1
   fi
+  if [[ "$rc" -eq 0 ]]; then
+    git -C "$clone_dir" lfs locks || rc=$?
+  fi
 
   git -C "$src" push origin ":refs/heads/$branch" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
