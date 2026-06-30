@@ -10,7 +10,7 @@ Required environment:
 
 Optional environment:
   MONOENGINE_SSH_REPO_URL     SSH repo URL, e.g. ssh://git@127.0.0.1:2222/group/repo.git
-  MONOENGINE_GIT_SMOKE_PUSH   Set to 1 to run opt-in push/delete smoke against HTTP URL
+  MONOENGINE_GIT_SMOKE_PUSH   Set to 1 to run opt-in HTTP/SSH push/delete smoke
   MONOENGINE_GIT_SMOKE_WORKDIR  Existing directory for temporary clones
   MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones after the run
 
@@ -98,8 +98,10 @@ clone_protocol_v2_blobless() {
   git -C "$dest" fsck --no-dangling >/dev/null || return
 }
 
-push_smoke_http() {
-  local src="$ROOT_DIR/push-src"
+push_branch_smoke() {
+  local remote_url="$1"
+  local label="$2"
+  local src="$ROOT_DIR/push-$label-src"
   local branch="monoengine-smoke-$(date +%s)-$$"
   local cleanup_status=0
   rm -rf "$src"
@@ -110,7 +112,7 @@ push_smoke_http() {
   printf 'monoengine git smoke %s\n' "$branch" >"$src/smoke.txt"
   git -C "$src" add smoke.txt || return
   git -C "$src" commit -m "monoengine git smoke" >/dev/null || return
-  git -C "$src" remote add origin "$MONOENGINE_HTTP_REPO_URL" || return
+  git -C "$src" remote add origin "$remote_url" || return
   git -C "$src" push origin "HEAD:refs/heads/$branch" || return
   git -C "$src" push origin ":refs/heads/$branch" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
@@ -119,8 +121,10 @@ push_smoke_http() {
   fi
 }
 
-push_tag_smoke_http() {
-  local src="$ROOT_DIR/push-tag-src"
+push_tag_smoke() {
+  local remote_url="$1"
+  local label="$2"
+  local src="$ROOT_DIR/push-$label-tag-src"
   local tag="monoengine-smoke-tag-$(date +%s)-$$"
   local cleanup_status=0
   rm -rf "$src"
@@ -132,7 +136,7 @@ push_tag_smoke_http() {
   git -C "$src" add smoke-tag.txt || return
   git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return
   git -C "$src" tag "$tag" || return
-  git -C "$src" remote add origin "$MONOENGINE_HTTP_REPO_URL" || return
+  git -C "$src" remote add origin "$remote_url" || return
   git -C "$src" push origin "refs/tags/$tag" || return
   git -C "$src" push origin ":refs/tags/$tag" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
@@ -156,10 +160,14 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
 fi
 
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
-  run_case "HTTP push and delete branch" push_smoke_http
-  run_case "HTTP push and delete tag" push_tag_smoke_http
+  run_case "HTTP push and delete branch" push_branch_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
+  run_case "HTTP push and delete tag" push_tag_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
+  if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
+    run_case "SSH push and delete branch" push_branch_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
+    run_case "SSH push and delete tag" push_tag_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
+  fi
 else
-  echo "SKIP: HTTP push/delete branch and tag (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
+  echo "SKIP: HTTP/SSH push-delete branch and tag (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
 fi
 
 echo "git protocol smoke summary: $PASS_COUNT passed, $FAIL_COUNT failed"
