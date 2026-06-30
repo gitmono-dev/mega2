@@ -14,11 +14,14 @@ use crate::{
     common::errors::ProtocolError,
 };
 
+// Only advertise v2 capabilities that are parsed, acted on, and covered by
+// tests. `server-option` is intentionally omitted: the parsed capabilities
+// from `parse_v2_command` are not inspected, so advertising it would mislead
+// clients into sending server options that are silently ignored.
 const V2_CAPABILITIES: &[&str] = &[
     "agent=mega/0.1.0",
     "ls-refs",
     "fetch=shallow filter",
-    "server-option",
     "object-format=sha1",
 ];
 
@@ -172,6 +175,37 @@ pub async fn handle_v2_fetch(
         .repo_handler_with_commands(state, Vec::new())
         .await?;
 
+    // Capability honesty: `fetch=shallow filter` is advertised globally, but
+    // only MonoRepo genuinely implements shallow/filter pack generation.
+    // ImportRepo's default trait implementations silently fall back to
+    // full/incremental packs, which would mislead clients. Return an explicit
+    // protocol error instead of silently producing a wrong pack.
+    if filter_spec.is_some() && !repo_handler.supports_filtered_fetch() {
+        return Err(ProtocolError::InvalidInput(
+            "filter is not supported for this repository".to_owned(),
+        ));
+    }
+    if deepen_depth.is_some() && !repo_handler.supports_shallow_fetch() {
+        return Err(ProtocolError::InvalidInput(
+            "shallow fetch is not supported for this repository".to_owned(),
+        ));
+    }
+    // Combined filtered + shallow fetch is not implemented: `filtered_pack`
+    // ignores `deepen` and would silently produce a non-shallow pack.
+    if filter_spec.is_some() && deepen_depth.is_some() {
+        return Err(ProtocolError::InvalidInput(
+            "combined filter and shallow fetch is not supported".to_owned(),
+        ));
+    }
+    // Shallow incremental fetch (deepen with non-empty have) is not
+    // implemented: the incremental path ignores `deepen` and would silently
+    // produce a full-depth incremental pack.
+    if deepen_depth.is_some() && !have.is_empty() {
+        return Err(ProtocolError::InvalidInput(
+            "shallow incremental fetch is not supported".to_owned(),
+        ));
+    }
+
     let want: Vec<String> = want.into_iter().collect();
     let have: Vec<String> = have.into_iter().collect();
 
@@ -287,9 +321,14 @@ mod tests {
         assert!(adv_str.contains("agent=mega/0.1.0"));
         assert!(adv_str.contains("ls-refs"));
         assert!(adv_str.contains("fetch=shallow"));
-        assert!(adv_str.contains("server-option"));
         assert!(adv_str.contains("object-format=sha1"));
         assert!(adv_str.ends_with("0000"));
+        // server-option is intentionally not advertised: parsed v2 capabilities
+        // are not inspected, so advertising it would mislead clients.
+        assert!(
+            !adv_str.contains("server-option"),
+            "server-option must not be advertised: {adv_str}"
+        );
     }
 
     #[test]

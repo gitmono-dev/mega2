@@ -232,6 +232,10 @@ impl RepoHandler for MonoRepo {
         self.incremental_pack(want, Vec::new()).await
     }
 
+    fn supports_shallow_fetch(&self) -> bool {
+        true
+    }
+
     async fn shallow_pack(
         &self,
         want: Vec<String>,
@@ -331,6 +335,10 @@ impl RepoHandler for MonoRepo {
         drop(entry_tx);
 
         Ok((ReceiverStream::new(stream_rx), shallow_commits))
+    }
+
+    fn supports_filtered_fetch(&self) -> bool {
+        true
     }
 
     async fn filtered_pack(

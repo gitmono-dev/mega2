@@ -218,6 +218,26 @@ impl SmartSession {
         let want: Vec<String> = want.into_iter().collect();
         let have: Vec<String> = have.into_iter().collect();
 
+        // Capability honesty: `shallow` is advertised for upload-pack, but
+        // only MonoRepo genuinely implements depth-limited pack generation.
+        // ImportRepo's default trait `shallow_pack` silently falls back to
+        // `full_pack`, which would mislead clients into thinking they got a
+        // shallow clone. Return an explicit protocol error instead.
+        if deepen_depth.is_some() && !repo_handler.supports_shallow_fetch() {
+            return Err(ProtocolError::InvalidInput(
+                "shallow fetch is not supported for this repository".to_owned(),
+            ));
+        }
+        // Shallow incremental fetch (deepen + non-empty have) is not
+        // implemented: the code would fall through to `incremental_pack`
+        // without applying depth or emitting `shallow` lines, silently
+        // producing a non-shallow pack. Reject this combination explicitly.
+        if deepen_depth.is_some() && !have.is_empty() {
+            return Err(ProtocolError::InvalidInput(
+                "shallow fetch with non-empty have is not supported".to_owned(),
+            ));
+        }
+
         if have.is_empty() {
             if let Some(depth) = deepen_depth {
                 let (stream, shallows) = repo_handler

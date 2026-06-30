@@ -257,7 +257,7 @@ receive-pack:
   report-status side-band-64k ofs-delta agent=mega/0.1.0
 
 protocol v2 upload-pack:
-  agent=mega/0.1.0 ls-refs fetch=shallow filter server-option object-format=sha1
+  agent=mega/0.1.0 ls-refs fetch=shallow filter object-format=sha1
 ```
 
 `Capability` enum 当前只解析部分 capability：
@@ -697,7 +697,7 @@ LFS:
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
 | `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
 | `ls-refs` | ✅ protocol v2 | ✅ | ✅ 处理 `ref-prefix`、`symrefs`、`peel` | ✅ v2 capability / command parse 单测 | protocol v2 refs discovery |
-| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none` | ✅ v2 command parse 单测 + pack generation gates | v2 fetch；`filter blob:none` 只发送 commit/tree objects |
+| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none`；**（2026-06-30）非 MonoRepo handler 现在对 shallow/filter 请求返回明确协议错误而非静默 fallback** | ✅ v2 command parse 单测 + pack generation gates + capability honesty 单测 | v2 fetch；`filter blob:none` 只发送 commit/tree objects；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控 |
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
@@ -705,6 +705,7 @@ LFS:
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
+| `server-option` | ❌ 已移除 (v2) | ✅ | ❌ | ✅ `v2_capability_advertisement_does_not_advertise_server_option` | v2 parsed capabilities 未被 inspect/act-on，advertise 会误导客户端；2026-06-30 从 v2 advertise 移除 |
 | `object-format` | ❌ protocol v1；✅ protocol v2 `object-format=sha1` | ✅ v2 capability advertisement | N/A | ✅ v1 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` + v2 capability 单测 | v1 保持 SHA-1 默认不 advertise；v2 capability list 显式声明 `sha1` |
 
 残余风险：`ofs-delta` 的 pack 编解码由 `git-internal` crate 实现并自测，monoengine 侧已覆盖 advertise/parse；如需端到端 OFS_DELTA pack 矩阵可在 `git-internal` 侧补足。

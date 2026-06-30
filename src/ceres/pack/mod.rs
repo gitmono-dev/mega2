@@ -230,6 +230,14 @@ pub trait RepoHandler: Send + Sync + 'static {
         Ok((stream, Vec::new()))
     }
 
+    /// Whether this handler implements depth-limited (`deepen`) shallow fetch.
+    /// The default trait `shallow_pack` silently falls back to `full_pack`,
+    /// so the default here is `false`. Handlers that provide a real shallow
+    /// traversal must override both this and `shallow_pack`.
+    fn supports_shallow_fetch(&self) -> bool {
+        false
+    }
+
     async fn filtered_pack(
         &self,
         want: Vec<String>,
@@ -237,6 +245,15 @@ pub trait RepoHandler: Send + Sync + 'static {
         _filter_spec: &str,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         self.incremental_pack(want, have).await
+    }
+
+    /// Whether this handler implements `filter` partial clone (e.g. `blob:none`).
+    /// The default trait `filtered_pack` silently falls back to
+    /// `incremental_pack`, so the default here is `false`. Handlers that
+    /// provide real filter semantics must override both this and
+    /// `filtered_pack`.
+    fn supports_filtered_fetch(&self) -> bool {
+        false
     }
 
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError>;
