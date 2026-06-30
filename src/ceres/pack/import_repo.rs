@@ -244,7 +244,7 @@ impl RepoHandler for ImportRepo {
                 &mut counted_obj,
                 &obj_num,
             )
-            .await;
+            .await?;
         }
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);

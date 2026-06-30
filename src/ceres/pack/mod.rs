@@ -308,7 +308,7 @@ pub trait RepoHandler: Send + Sync + 'static {
         exist_objs: &HashSet<String>,
         counted_obj: &mut HashSet<String>,
         obj_num: &AtomicUsize,
-    ) {
+    ) -> Result<(), MegaError> {
         let mut search_tree_ids = vec![];
         let mut search_blob_ids = vec![];
         for item in &tree.tree_items {
@@ -322,12 +322,13 @@ pub trait RepoHandler: Send + Sync + 'static {
             }
         }
         obj_num.fetch_add(search_blob_ids.len(), Ordering::SeqCst);
-        let trees = self.get_trees_by_hashes(search_tree_ids).await.unwrap();
+        let trees = self.get_trees_by_hashes(search_tree_ids).await?;
         for t in trees {
             self.traverse_for_count(t, exist_objs, counted_obj, obj_num)
-                .await;
+                .await?;
         }
         obj_num.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Traverse a tree structure asynchronously.
@@ -457,7 +458,7 @@ pub trait RepoHandler: Send + Sync + 'static {
         exist_objs: &HashSet<String>,
         counted_obj: &mut HashSet<String>,
         obj_num: &AtomicUsize,
-    ) {
+    ) -> Result<(), MegaError> {
         let mut search_tree_ids = vec![];
 
         for item in &tree.tree_items {
@@ -470,11 +471,12 @@ pub trait RepoHandler: Send + Sync + 'static {
             }
         }
 
-        let trees = self.get_trees_by_hashes(search_tree_ids).await.unwrap();
+        let trees = self.get_trees_by_hashes(search_tree_ids).await?;
         for t in trees {
             self.traverse_trees_only_for_count(t, exist_objs, counted_obj, obj_num)
-                .await;
+                .await?;
         }
         obj_num.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }

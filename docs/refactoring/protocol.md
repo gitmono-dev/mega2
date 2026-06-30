@@ -47,6 +47,8 @@
 > **2026-06-30 更新**：LFS lock / metadata storage 路径完成 panic 止血。`LfsDbStorage` 的 object/lock CRUD 不再 unwrap SeaORM 结果，而是返回 `MegaError`；`ceres::lfs::handler` 的 lock list/create/delete 路径不再 unwrap lock JSON、limit parse 或 DB 结果，统一映射为 `GitLFSError`。`Link::new` 的 86400 秒过期时间也改为 infallible chrono 构造。
 >
 > **2026-06-30 更新 2**：LFS router response/body 路径完成 panic 止血。`api::router::lfs_router` 不再通过 `Response::builder().body(...).unwrap()` 构造静态 LFS JSON/stream responses，改为 `Response::new` + 静态 header；upload object request body 聚合错误也从 `unwrap()` 改为 400 错误返回。
+>
+> **2026-06-30 更新 3**：pack traversal count helper 完成首批 panic 止血。`RepoHandler::traverse_for_count` 与 `traverse_trees_only_for_count` 不再 unwrap tree lookup 结果，改为返回 `Result<(), MegaError>` 并由 monorepo/import pack 生成路径向上传播错误。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
