@@ -258,7 +258,7 @@ Config::new
 - HTTP graceful shutdown 广播到 `notification_shutdown` 以取消 mail dispatcher 已完成。
 - **已完成（2026-06-19；2026-06-23 补 CL 合并触发器）**：触发器已接入真实业务关键路径。`src/api/router/cl_router.rs::save_comment` 在 `add_conversation` 成功后调用 `crate::notification::triggers::on_cl_comment_created`，`cl_router::merge` 在 CL 成功合并后调用 `crate::notification::triggers::on_cl_merged`（best-effort，失败仅 `tracing::warn!` 不阻断原请求），outbox 自此有真实生产者，不再仅由测试 enqueue。
 - **已完成（2026-06-19）：dispatcher 投递路径 PII 脱敏。** `process_email_job` 现包裹 `#[tracing::instrument]` span，携带 job id / event type / channel 与**脱敏后**收件人（`redact_email`，见 `src/notification/redact.rs`），错误/诊断路径不再输出完整收件人地址。
-- 已补充 Noop mailer + test DB 风格的 dispatcher/storage 基线测试，并覆盖 dispatcher batch / max-in-flight、retry policy 配置生效、多 tick 高水位队列 drain、跨独立 DB connection pool 的 claim 竞争、真实 SMTP/Mailpit 正路径、真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露、权限/relay 拒绝 retry/凭据不泄露、缺失收件人 skip，以及 CL 评论触发器全收件人显式关闭事件偏好时不 enqueue；剩余是更完整 Mailpit/SMTP 故障矩阵、更长时间压力形态高水位矩阵和真实多实例黑盒矩阵。
+- 已补充 Noop mailer + test DB 风格的 dispatcher/storage 基线测试，并覆盖 dispatcher batch / max-in-flight、retry policy 配置生效、多 tick 高水位队列 drain（125 个 pending job 在 batch=20/max_in_flight=5 下跨 tick 有界排空）、跨独立 DB connection pool 的 claim 竞争、真实 SMTP/Mailpit 正路径、真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露、权限/relay 拒绝 retry/凭据不泄露、缺失收件人 skip，以及 CL 评论触发器全收件人显式关闭事件偏好时不 enqueue；剩余是更完整 Mailpit/SMTP 故障矩阵、更长时间压力形态高水位矩阵和真实多实例黑盒矩阵。
 - 剩余：依赖 config.md 阶段 0b 的脱敏工具，完善日志脱敏（避免 PII 泄露）
 - 剩余验收：Mailpit/SMTP 故障矩阵继续覆盖更多 TLS/STARTTLS 边界；日志无凭据泄露；mail 构造失败保持可诊断。
 

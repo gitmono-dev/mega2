@@ -100,7 +100,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | CLI secret 黑盒门禁 | `config_secret_ref_does_not_load_config`/`config_secret_set_check_and_validate_resolve_secret`/`config_validate_resolve_secrets_fails_when_secret_is_missing`/`config_secret_ref_rejects_bootstrap_secret_fields` 已落地 | 维持作为稳定 P0 gate | 简单 |
 | 服务 HTTP 启动链路 | `integration_service_http_smoke` + `integration_service_http_fails_when_mailer_secret_missing` 已落地 | 维持启动顺序与 fail-closed 断言 | 简单 |
 | `config init` 黑盒 | `integration_config_init_creates_safe_skeleton_and_validates` 已落地（CI 亦覆盖） | 持续随模板演进 | 简单 |
-| 邮件投递与故障矩阵 | `integration_mail_dispatcher_mailpit_sends_outbox_job` + 多个 SMTP 失败/dead-letter/skip 用例已落地（模块集成测试） | 扩展长时压力与更完整故障矩阵（mail.md 阶段 5，部分 deferred） | 中等 |
+| 邮件投递与故障矩阵 | `integration_mail_dispatcher_mailpit_sends_outbox_job` + 多个 SMTP 失败/dead-letter/skip 用例已落地（模块集成测试）；模块级 pending job 背压回归已覆盖 125 个 job 跨 tick 有界排空 | 扩展长时 soak/黑盒压力与更完整故障矩阵（mail.md 阶段 5，部分 deferred） | 中等 |
 | 通知触发器→邮件 | `test_on_cl_comment_created_*`（enqueue/render/opt-out）已覆盖 | 维持触发器到 outbox 的端到端断言 | 中等 |
 | 多渠道扇出 | `service_start_fans_out_delivery_to_webhook_channel` 模块集成测试已落地；**（2026-06-28）P2 黑盒 `integration_multichannel_notification` 已落地**：启动真实 `service http`，配置 mail + slack + webhook，通过直接写入 `email_jobs` outbox 触发 dispatcher，验证 email（Mailpit）、in-app（`user_inbox_notifications`）、Slack 与 webhook 均收到扇出 | 维持作为 P2 gate | 中等 |
 | 错误诊断与脱敏 | `integration_error_redaction_does_not_leak_db_password`/`..._redis_password`/`..._bad_toml_does_not_leak_values` 活进程门禁已落地 | 可继续收拢成单一命名 gate | 中等 |

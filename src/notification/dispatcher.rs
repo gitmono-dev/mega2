@@ -1471,8 +1471,9 @@ mod tests {
         let stg = NotificationStorage::new(Arc::new(db.clone()));
         insert_test_event_type(&db).await;
 
-        const TOTAL_JOBS: usize = 17;
-        const BATCH_SIZE: u64 = 4;
+        const TOTAL_JOBS: usize = 125;
+        const BATCH_SIZE: u64 = 20;
+        const MAX_IN_FLIGHT: usize = 5;
 
         for idx in 0..TOTAL_JOBS {
             stg.enqueue_email_job(
@@ -1489,12 +1490,13 @@ mod tests {
 
         let control = EmailDispatcherControl::new_with_limits(
             true,
-            EmailDispatcherLimits::new(BATCH_SIZE, 2),
+            EmailDispatcherLimits::new(BATCH_SIZE, MAX_IN_FLIGHT),
         );
         let dispatcher =
             EmailDispatcher::new_with_control(stg.clone(), Arc::new(NoopMailer), control);
 
-        for tick in 1..=5 {
+        let total_ticks = TOTAL_JOBS.div_ceil(BATCH_SIZE as usize);
+        for tick in 1..=total_ticks {
             dispatcher.tick_once().await.unwrap();
 
             let all_jobs = email_jobs::Entity::find().all(&db).await.unwrap();
