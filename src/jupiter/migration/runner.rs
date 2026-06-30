@@ -19,7 +19,7 @@ pub async fn apply_migrations(db: &DatabaseConnection, refresh: bool) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement};
     use sea_orm_migration::prelude::MigratorTrait;
 
     use super::*;
@@ -79,10 +79,23 @@ mod tests {
 
         let now = chrono::Utc::now().naive_utc();
 
+        // After migration seeding, `cl.comment.created` already exists in
+        // notification_event_types. Verify it is present rather than inserting
+        // a duplicate (which would violate the primary key).
+        let seeded = notification_event_types::Entity::find_by_id("cl.comment.created")
+            .one(&db)
+            .await
+            .expect("query seeded event type");
+        assert!(
+            seeded.is_some(),
+            "cl.comment.created should be seeded by migration"
+        );
+
+        // Insert a non-seeded event type for FK-probe tests below.
         notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".to_owned()),
-            category: Set("cl".to_owned()),
-            description: Set("New comment on a CL".to_owned()),
+            code: Set("custom.event".to_owned()),
+            category: Set("custom".to_owned()),
+            description: Set("Custom test event".to_owned()),
             system_required: Set(false),
             default_enabled: Set(true),
             created_at: Set(now),
@@ -90,7 +103,7 @@ mod tests {
         }
         .insert(&db)
         .await
-        .expect("insert event type");
+        .expect("insert custom event type");
 
         user_notification_settings::ActiveModel {
             username: Set("alice".to_owned()),

@@ -271,14 +271,14 @@ async fn rebuild_mailer(
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use sea_orm::EntityTrait;
     use tempfile::TempDir;
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{
-        callisto::{email_jobs, notification_event_types},
+        callisto::email_jobs,
         jupiter::{migration::apply_migrations, tests::test_db_connection},
         mail::NoopMailer,
         notification::channels::ConsoleChannel,
@@ -487,19 +487,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
         stg.enqueue_email_job(
             "alice",
             "alice@example.com",
@@ -589,19 +579,9 @@ mod tests {
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
         stg.enqueue_email_job(
             "bob",
             "bob@example.com",

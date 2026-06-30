@@ -958,8 +958,8 @@ mod tests {
         assert!(updated.updated_at >= inserted.updated_at);
 
         let event_types = storage.list_event_types().await.unwrap();
-        assert_eq!(event_types.len(), 1);
-        assert_eq!(event_types[0].code, "test.event");
+        assert_eq!(event_types.len(), 8); // 7 seeded + 1 test
+        assert!(event_types.iter().any(|et| et.code == "test.event"));
     }
 
     #[tokio::test]
