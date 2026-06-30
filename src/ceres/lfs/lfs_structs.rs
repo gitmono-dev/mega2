@@ -153,7 +153,7 @@ impl Link {
             href: href.to_string(),
             header,
             expires_at: {
-                let expire_time: DateTime<Utc> = Utc::now() + Duration::try_seconds(86400).unwrap();
+                let expire_time: DateTime<Utc> = Utc::now() + Duration::seconds(86400);
                 expire_time.to_rfc3339()
             },
         }

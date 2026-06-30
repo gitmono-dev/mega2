@@ -199,7 +199,7 @@ pub async fn lfs_process_batch(
                     db_storage
                         .new_lfs_object(meta.clone().into())
                         .await
-                        .unwrap();
+                        .map_err(|e| lfs_storage_error("create LFS object metadata", e))?;
                     meta
                 } else {
                     response_objects.push(ResponseObject::failed_with_err(
@@ -348,6 +348,10 @@ pub async fn lfs_download_object(
     }
 }
 
+fn lfs_storage_error(context: &str, error: impl std::fmt::Display) -> GitLFSError {
+    GitLFSError::GeneralError(format!("{context}: {error}"))
+}
+
 async fn lfs_get_filtered_locks(
     storage: LfsDbStorage,
     refspec: &str,
@@ -355,7 +359,7 @@ async fn lfs_get_filtered_locks(
     cursor: &str,
     limit: &str,
 ) -> Result<(Vec<Lock>, String), GitLFSError> {
-    let mut locks = (lfs_get_locks(storage, refspec).await).unwrap_or_default();
+    let mut locks = lfs_get_locks(storage, refspec).await?;
 
     tracing::debug!("Locks retrieved: {:?}", locks);
 
@@ -393,7 +397,9 @@ async fn lfs_get_filtered_locks(
 
     let mut next = "".to_string();
     if !limit.is_empty() {
-        let mut size = limit.parse::<i64>().unwrap();
+        let mut size = limit
+            .parse::<i64>()
+            .map_err(|e| lfs_storage_error("parse LFS lock limit", e))?;
         size = min(size, locks.len() as i64);
 
         if size + 1 < locks.len() as i64 {
@@ -406,14 +412,18 @@ async fn lfs_get_filtered_locks(
 }
 
 async fn lfs_get_locks(storage: LfsDbStorage, refspec: &str) -> Result<Vec<Lock>, GitLFSError> {
-    let result = storage.get_lock_by_id(refspec).await.unwrap();
+    let result = storage
+        .get_lock_by_id(refspec)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS lock row", e))?;
     match result {
         Some(val) => {
             let data = val.data;
-            let locks: Vec<Lock> = serde_json::from_str(&data).unwrap();
+            let locks: Vec<Lock> = serde_json::from_str(&data)
+                .map_err(|e| lfs_storage_error("parse LFS lock data", e))?;
             Ok(locks)
         }
-        None => Err(GitLFSError::GeneralError("".to_string())),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -422,14 +432,18 @@ async fn lfs_add_lock(
     repo: &str,
     locks: Vec<Lock>,
 ) -> Result<(), GitLFSError> {
-    let result = storage.get_lock_by_id(repo).await.unwrap();
+    let result = storage
+        .get_lock_by_id(repo)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS lock row", e))?;
 
     match result {
         // Update
         Some(val) => {
             let d = val.data.to_owned();
             let mut locks_from_data = if !d.is_empty() {
-                let locks_from_data: Vec<Lock> = serde_json::from_str(&d).unwrap();
+                let locks_from_data: Vec<Lock> = serde_json::from_str(&d)
+                    .map_err(|e| lfs_storage_error("parse LFS lock data", e))?;
                 locks_from_data
             } else {
                 vec![]
@@ -442,16 +456,17 @@ async fn lfs_add_lock(
                     .partial_cmp(&b.locked_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let d = serde_json::to_string(&locks_from_data).unwrap();
+            let d = serde_json::to_string(&locks_from_data)
+                .map_err(|e| lfs_storage_error("serialize LFS lock data", e))?;
 
             // must turn into `ActiveModel` before modify, or update failed.
             // let mut val = val.into_active_model();
             // val.data = Set(d);
-            let res = storage.update_lock(val, &d).await;
-            match res.is_ok() {
-                true => Ok(()),
-                false => Err(GitLFSError::GeneralError("".to_string())),
-            }
+            storage
+                .update_lock(val, &d)
+                .await
+                .map_err(|e| lfs_storage_error("update LFS lock row", e))?;
+            Ok(())
         }
         // Insert
         None => {
@@ -461,17 +476,18 @@ async fn lfs_add_lock(
                     .partial_cmp(&b.locked_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let data = serde_json::to_string(&locks).unwrap();
+            let data = serde_json::to_string(&locks)
+                .map_err(|e| lfs_storage_error("serialize LFS lock data", e))?;
             let lock_to = lfs_locks::Model {
                 id: repo.to_owned(),
                 data: data.to_owned(),
             };
 
-            let res = storage.new_lock(lock_to).await;
-            match res.is_ok() {
-                true => Ok(()),
-                false => Err(GitLFSError::GeneralError("".to_string())),
-            }
+            storage
+                .new_lock(lock_to)
+                .await
+                .map_err(|e| lfs_storage_error("create LFS lock row", e))?;
+            Ok(())
         }
     }
 }
@@ -480,7 +496,11 @@ async fn lfs_get_meta(
     storage: &LfsDbStorage,
     oid: &str,
 ) -> Result<Option<MetaObject>, GitLFSError> {
-    Ok(storage.get_lfs_object(oid).await.unwrap().map(|m| m.into()))
+    Ok(storage
+        .get_lfs_object(oid)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS object metadata", e))?
+        .map(|m| m.into()))
 }
 
 async fn lfs_delete_meta(
@@ -556,13 +576,17 @@ async fn delete_lock(
     id: &str,
     force: bool,
 ) -> Result<Lock, GitLFSError> {
-    let result = storage.get_lock_by_id(repo).await.unwrap();
+    let result = storage
+        .get_lock_by_id(repo)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS lock row", e))?;
     match result {
         // Exist, then delete.
         Some(val) => {
             let d = val.data.to_owned();
             let locks_from_data = if !d.is_empty() {
-                let locks_from_data: Vec<Lock> = serde_json::from_str(&d).unwrap();
+                let locks_from_data: Vec<Lock> = serde_json::from_str(&d)
+                    .map_err(|e| lfs_storage_error("parse LFS lock data", e))?;
                 locks_from_data
             } else {
                 vec![]
@@ -603,17 +627,21 @@ async fn delete_lock(
 
             // No locks remains, delete the repo from database.
             if new_locks.is_empty() {
-                storage.delete_lock_by_id(repo.to_owned()).await;
+                storage
+                    .delete_lock_by_id(repo.to_owned())
+                    .await
+                    .map_err(|e| lfs_storage_error("delete LFS lock row", e))?;
                 return Ok(lock_to_delete);
             }
 
             // Update remaining locks.
-            let data = serde_json::to_string(&new_locks).unwrap();
-            let res = storage.update_lock(val, &data).await;
-            match res.is_ok() {
-                true => Ok(lock_to_delete),
-                false => Err(GitLFSError::GeneralError("".to_string())),
-            }
+            let data = serde_json::to_string(&new_locks)
+                .map_err(|e| lfs_storage_error("serialize LFS lock data", e))?;
+            storage
+                .update_lock(val, &data)
+                .await
+                .map_err(|e| lfs_storage_error("update LFS lock row", e))?;
+            Ok(lock_to_delete)
         }
         // Not exist, error.
         None => Err(GitLFSError::GeneralError("".to_string())),
