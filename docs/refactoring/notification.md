@@ -40,7 +40,7 @@
 
 4. **当前仅 email 渠道，且依赖 mail 模块**。Dispatcher 硬依赖 `mail::Mailer`（`send_html`）。根据 `config.md` 和 `mail.md`，mail 已完成“一级模块 + MailConfig 入 Config + vault 就绪后构造 + dispatcher 启动”的基础激活，因此 notification 的 email 渠道已经具备作为合格后置消费者的启动位置。config.md 明确把 mail.password 作为首批 SecretRef 的前提，而 notification 的 email 投递是 mail 的主要下游。
 
-5. **触发器和事件注册不完整**。已实现 `EVENT_CL_COMMENT_CREATED`（cl 作者 + reviewers，排除 actor，尊重 prefs）、`EVENT_CL_MERGED`（cl 作者，排除合并者，尊重 prefs）、`EVENT_ISSUE_COMMENT_CREATED`（issue 作者，排除 actor，尊重 prefs）、**`EVENT_ISSUE_CLOSED`（issue 作者，排除关闭者，尊重 prefs，2026-06-29 落地）**、`EVENT_ITEM_REFERENCED`（被引用项作者，排除 actor，尊重 prefs）、**`EVENT_CHAT_MENTION_CREATED`（chat `@username` mention，排除 actor，尊重 prefs，2026-06-29 落地）** 和 **`EVENT_CHAT_REPLY_CREATED`（chat 消息回复，向被回复消息作者通知，排除 actor，尊重 prefs，2026-06-29 落地）**。mega 中还有更多事件潜力（pr、build 结果等），但 monoengine 业务层（ceres）尚未广泛调用这些触发器。事件类型目前靠触发器首次使用时 upsert（非迁移 seeding）。
+5. **触发器和事件注册不完整**。已实现 `EVENT_CL_COMMENT_CREATED`（cl 作者 + reviewers，排除 actor，尊重 prefs）、`EVENT_CL_MERGED`（cl 作者，排除合并者，尊重 prefs）、`EVENT_ISSUE_COMMENT_CREATED`（issue 作者，排除 actor，尊重 prefs）、**`EVENT_ISSUE_CLOSED`（issue 作者，排除关闭者，尊重 prefs，2026-06-29 落地）**、`EVENT_ITEM_REFERENCED`（被引用项作者，排除 actor，尊重 prefs）、**`EVENT_CHAT_MENTION_CREATED`（chat `@username` mention，排除 actor，尊重 prefs，2026-06-29 落地）** 和 **`EVENT_CHAT_REPLY_CREATED`（chat 消息回复，向被回复消息作者通知，排除 actor，尊重 prefs，2026-06-29 落地）**。mega 中还有更多事件潜力（pr、build 结果等），但 monoengine 业务层（ceres）尚未广泛调用这些触发器。核心事件类型已由 migration `m20260630_000000_seed_notification_event_types` 在启动迁移期 seed；触发器中的 upsert 仅作为幂等 fallback。
 
 6. **用户偏好 API 首批已落地；管理员邮件作业、模板与事件类型 API 首批已落地（与 mega 仍有差异）**。mega 的 `ceres/src/model/notification.rs` 定义了 `NotificationEventTypeInfo`、`UserNotificationConfig`、`UpdateUserNotificationConfig` 等 DTO（带 utoipa），用于用户管理通知偏好。monoengine 当前已有 admin-only 邮件作业 API，可查询 `email_jobs`、查看状态统计、将 `failed` job 重新排回 `pending`、清理旧终态 job，并查看、下载、删除或按保留期清理旧终态 job 的 outbox 附件（附件 prune 可按 `username` / `event_type_code` 收窄）；dispatcher 也可通过 `mail.attachment_prune_*` 自动清理旧终态附件；admin-only 模板 API 已支持审计内置/外部模板、覆盖关系、来源路径，按管理员提供变量预览渲染，向 `mail.template_dir` 持久化 upsert 外部 TOML 模板后热替换 registry，并通过 `.history` 归档和 history/rollback 端点支持版本审计与回滚；admin-only 事件类型 API 已支持列出 `notification_event_types` 并按 code upsert category/description/system_required/default_enabled；用户自助 API 已提供 `GET /user/notification/preferences`（当前用户 settings + event preference effective 状态）、`PUT /user/notification/preferences`（更新 global enabled、delivery_mode、preferred_locale、批量 event preferences）和 `PUT /user/notification/preferences/{event_type_code}`（更新当前用户单个非 system-required event preference）。邮件模板 registry 已支持由 `mail.template_dir` 在启动期加载 TOML 覆盖项。仍缺更多业务触发器和更完整运维面。
 
@@ -59,7 +59,7 @@
 | 触发器（on_cl_comment_created 等） | 部分实现，CL 评论/合并、issue 评论/关闭、item 引用已接入生产 | 实现了 CL 评论场景（作者+reviewers，prefs 过滤，enqueue）、CL 合并场景（作者，排除合并者，prefs 过滤，enqueue）、issue 评论场景（作者，排除 actor，prefs 过滤，enqueue）、**issue 关闭场景（作者，排除关闭者，prefs 过滤，enqueue，2026-06-29 落地）** 和 item 引用场景（被引用项作者，排除 actor，prefs 过滤，enqueue）。邮件内容通过 `mail::template::MailTemplateRegistry` 按收件人的 `user_notification_settings.preferred_locale` 渲染并默认转义 HTML 变量，registry 已支持 locale fallback 和启动期 TOML 模板覆盖，且 CL 评论/合并、issue 评论/关闭、item 引用均有 en-US/zh-CN 模板与单元测试。**`on_cl_comment_created` 已由 `cl_router::save_comment`、`on_cl_merged` 已由 `cl_router::merge`、`on_issue_comment_created` 已由 `issue_router::save_comment`、`on_issue_closed` 已由 `issue_router::close_issue` 在事件持久化后调用（best-effort，失败仅告警），outbox 有真实生产者。** 其他事件（PR、build 等）缺失或仅在 mega 中有原型。 |
 | NotificationStorage（jupiter 层） | 已实现（完整）    | 位于 `src/jupiter/storage/notification_storage.rs`，封装所有实体访问 + should_send 业务逻辑 + email job 生命周期。被 triggers 和 dispatcher 直接使用。 |
 | Callisto 通知实体               | 已完整移植        | email_jobs、notification_event_types、user_notification_settings、user_notification_preferences（及关系）与 mega 一致。 |
-| 用户偏好与事件类型管理          | 存储层存在，用户 API + admin 事件类型 API 首批落地 | 支持 upsert、should_send、list prefs 等。用户自助 API 已支持查询当前用户 settings/event prefs/effective 状态，并更新 global enabled、delivery_mode、preferred_locale、批量或单个 event preference；admin-only 事件类型 API 已支持 list/upsert。仍缺更完整 mega DTO 兼容面和审计能力。触发器仍会在首次使用时 upsert 核心事件类型。 |
+| 用户偏好与事件类型管理          | 存储层存在，用户 API + admin 事件类型 API 首批落地 | 支持 upsert、should_send、list prefs 等。用户自助 API 已支持查询当前用户 settings/event prefs/effective 状态，并更新 global enabled、delivery_mode、preferred_locale、批量或单个 event preference；admin-only 事件类型 API 已支持 list/upsert。核心事件类型已由 migration seeding 覆盖，触发器 upsert 保留为 fallback。仍缺更完整 mega DTO 兼容面和审计能力。 |
 | 与 mail 模块的集成              | **已就绪（前提）** | Dispatcher 构造需要 post-vault 的 mailer（见 mail.md 和 config.md 阶段 5）。当前 mail 激活后，类型上可链接，但时机未在启动路径中强制。 |
 | 后台任务启动与生命周期          | **已基础接入，HTTP 关停已协调** | `AppContext` 持有 `notification_shutdown: CancellationToken`，并在 mail 启用时 spawn dispatcher；HTTP server 的 graceful shutdown 广播会同时取消该 token。仍需完善 dispatcher 任务失败诊断、退避和多实例语义。 |
 | 多渠道支持（email 之外）        | **已实现** | `NotificationChannel` trait + `EmailChannel`（主，含 `ArcSwap` 动态 mailer 热替换）+ `InAppChannel`（写 `user_inbox_notifications`）+ `SlackChannel`（webhook URL 经 SecretRef 解析）+ `WebhookChannel`（可选 `token_ref`，如配置则经 SecretRef 解析）（`src/notification/channels/{slack,webhook}.rs`）+ `NotificationService` 协调器已落地。注：secondary 渠道当前随 `[mail]` 段在 `AppContext::new` 中构造，因此需要配置 `[mail]`；slack/webhook 在此前提下再按各自 `enabled` 开关、于 vault 就绪后构造。dispatcher 在 email 主投递成功后扇出到 secondary 渠道（in-app/slack/webhook），webhook 扇出有 `service_start_fans_out_delivery_to_webhook_channel` 端到端单测。 |
@@ -72,7 +72,7 @@
 **启动/加载关键路径上的已知危险点（各阶段必须收敛，与 config.md/mail.md 重叠）**：
 - Dispatcher / mailer 若被移动到 Storage::new 或 `VaultCore::new` 之前，会违反 vault 顺序；当前代码位置正确，但需要防回归。
 - 邮件正文/收件人（PII）出现在日志或错误中。
-- 触发器在事件类型不存在时 upsert（竞态、迁移不一致风险）。
+- 核心事件类型由 migration seeding 提供；触发器 upsert 仅作 fallback，新增事件仍需保持 migration/API registry 与触发器常量一致。
 - NotificationStorage 目前直接暴露 DB 连接，业务层可绕过偏好检查。
 - 未来渠道 secret（非 email）若提前加载，会违反 vault 就绪顺序。
 - chat_migrate 等遗留路径处理旧 message_notification，与新 email_jobs 模型并存。
@@ -86,7 +86,7 @@
 - **Outbox + At-least-once（尽力一次）**：email_jobs 作为可靠投递的 outbox；claim 提供基础并发保护；失败可重试但需幂等。
 - **用户同意优先**：通过 user_notification_settings（全局 enabled + delivery_mode + email + preferred_locale）和 user_notification_preferences（per-event override） + `should_send` 实现。system_required 事件可强制。
 - **渠道抽象**：当前 EmailDispatcher 硬绑定 mail。未来需 `NotificationChannel` trait（send(notification)），由多渠道 dispatcher 协调。
-- **事件注册与扩展**：notification_event_types 作为 registry。触发器负责 ensure + enqueue；新事件类型应通过 API 或迁移注册。
+- **事件注册与扩展**：notification_event_types 作为 registry。核心事件类型通过迁移注册，触发器负责 enqueue 并保留 ensure fallback；新事件类型应通过 API 或迁移注册。
 - **与 Config/Vault/Mail 深度集成**：通知配置（全局项）走 Config 管道；渠道凭据（email password 经由 mail，slack/webhook 经各自 SecretRef）走 SecretRef + resolver；构造点必须 post-vault。
 - **可观测与诊断**：投递结果写回 jobs 表；错误脱敏（不泄露邮箱内容到不必要日志）；支持 tracing。
 
@@ -166,7 +166,7 @@ NotificationService / Coordinator (一级 notification 模块核心)
 - **config secret 家族命令** 必须用最小 DB/Vault bootstrap 操作 notification 相关 secret（如果有），不能初始化完整 dispatcher 或 mailer。
 - **PII 与同意**：to_email、body 包含用户数据；必须通过 prefs 尊重 enabled 状态；发送前最好有额外审计。
 - **当前 NotificationStorage 直接暴露 DB**：业务层可 bypass prefs（触发器目前做了正确检查，但不是强制）。
-- **事件类型一致性**：跨部署的 event code 必须稳定；upsert 策略在并发/迁移时有风险。
+- **事件类型一致性**：跨部署的 event code 必须稳定；核心事件类型已由迁移 seed，新增事件仍需同步 migration/API registry、触发器常量和模板 key。
 - **与 mail 模块的强依赖**：mail 未就绪（或未 late 构造），email 通知就无法投递。config.md 阶段 5 的 mail 工作是 notification email 渠道的前置。
 
 ## 现状与目标对比

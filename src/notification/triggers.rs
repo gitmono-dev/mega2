@@ -276,10 +276,10 @@ fn notification_mail_template_registry_with_default_locale(
     )
 }
 
-/// Ensure the core event types exist in DB
+/// Ensure the core event types exist in DB.
 ///
-/// currently does not seed event types in migrations
-/// upsert the event type at first use.
+/// Migrations seed these rows on normal startup; trigger-time upserts remain as
+/// an idempotent fallback for partially migrated or externally prepared DBs.
 async fn ensure_event_type_exists(stg: &NotificationStorage) -> Result<(), MegaError> {
     stg.upsert_event_type(
         EVENT_CL_COMMENT_CREATED,

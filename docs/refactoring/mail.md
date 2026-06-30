@@ -55,7 +55,7 @@
 - mailer 或 dispatcher 若被移动到 Storage::new / vault 前路径，会违反 vault 就绪顺序；当前代码位置正确，但需防止后续回归。
 - 兼容期明文 `password` 若由用户配置，仍需避免进入日志、错误、Debug 或 CI 输出。
 - `config/config.toml` 必须保持只给 `password_ref` 占位，不写入示例明文密码。
-- Notification 事件/用户设置的 upsert 逻辑在触发器中（非幂等迁移）。
+- Notification 核心事件类型已迁移到 migration-time seeding；触发器 upsert 仅保留为幂等 fallback，新增事件仍需同步 migration/API registry、触发器常量和模板 key。
 
 ## 总体设计
 

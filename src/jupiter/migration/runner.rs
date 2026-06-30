@@ -29,6 +29,11 @@ mod tests {
             user_notification_preferences, user_notification_settings,
         },
         jupiter::tests::test_db_connection,
+        notification::triggers::{
+            EVENT_CHAT_MENTION_CREATED, EVENT_CHAT_REPLY_CREATED, EVENT_CL_COMMENT_CREATED,
+            EVENT_CL_MERGED, EVENT_ISSUE_CLOSED, EVENT_ISSUE_COMMENT_CREATED,
+            EVENT_ITEM_REFERENCED,
+        },
     };
 
     #[tokio::test]
@@ -79,17 +84,26 @@ mod tests {
 
         let now = chrono::Utc::now().naive_utc();
 
-        // After migration seeding, `cl.comment.created` already exists in
-        // notification_event_types. Verify it is present rather than inserting
-        // a duplicate (which would violate the primary key).
-        let seeded = notification_event_types::Entity::find_by_id("cl.comment.created")
-            .one(&db)
-            .await
-            .expect("query seeded event type");
-        assert!(
-            seeded.is_some(),
-            "cl.comment.created should be seeded by migration"
-        );
+        // Core event types are seeded by migrations. Verify every trigger
+        // constant is present so trigger-time upserts remain only a fallback.
+        for event_type_code in [
+            EVENT_CL_COMMENT_CREATED,
+            EVENT_CL_MERGED,
+            EVENT_ISSUE_COMMENT_CREATED,
+            EVENT_ISSUE_CLOSED,
+            EVENT_ITEM_REFERENCED,
+            EVENT_CHAT_MENTION_CREATED,
+            EVENT_CHAT_REPLY_CREATED,
+        ] {
+            let seeded = notification_event_types::Entity::find_by_id(event_type_code)
+                .one(&db)
+                .await
+                .expect("query seeded event type");
+            assert!(
+                seeded.is_some(),
+                "{event_type_code} should be seeded by migration"
+            );
+        }
 
         // Insert a non-seeded event type for FK-probe tests below.
         notification_event_types::ActiveModel {
