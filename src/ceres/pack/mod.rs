@@ -23,7 +23,7 @@ use git_internal::{
         pack::{Pack, entry::Entry},
     },
 };
-use orbit_api::object_storage::MultiObjectByteStream;
+use orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 use sysinfo::System;
 use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 use tokio_stream::wrappers::ReceiverStream;
@@ -394,7 +394,7 @@ pub trait RepoHandler: Send + Sync + 'static {
                             meta: ext_data.to_owned(),
                         })
                         .await
-                        .unwrap();
+                        .map_err(|e| IoOrbitError::Other(format!("pack entry send failed: {e}")))?;
 
                     Ok(())
                 })
@@ -413,7 +413,7 @@ pub trait RepoHandler: Send + Sync + 'static {
                     meta: EntryMeta::new(),
                 })
                 .await
-                .unwrap();
+                .map_err(|e| MegaError::Other(format!("pack tree entry send failed: {e}")))?;
         }
         Ok(())
     }
@@ -447,7 +447,7 @@ pub trait RepoHandler: Send + Sync + 'static {
                     meta: EntryMeta::new(),
                 })
                 .await
-                .unwrap();
+                .map_err(|e| MegaError::Other(format!("pack tree entry send failed: {e}")))?;
         }
         Ok(())
     }
