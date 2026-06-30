@@ -396,12 +396,13 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
 - SSH receive-pack 对已缓冲的 channel 数据使用同一 splitter。
 - capability 或 command payload 中出现 `PACK` 不再影响分割。
 - 缺失 flush-pkt 会返回 `ProtocolError::InvalidInput`。
+- 纯 delete refs 的无 pack receive-pack 请求已支持，splitter 会在 flush-pkt
+  后返回空 pack payload，并由 `is_delete_only_push` 跳过 unpack。
 
 仍待后续处理：
 
 - 将当前完整 body / channel 数据缓冲改为 streaming pkt-line reader。
-- 支持纯 delete refs 的无 pack receive-pack 请求。
-- 增加缺 packfile、pack magic 不合法和真实 Git CLI push/delete 矩阵。
+- 增加非 delete push 缺 packfile、pack magic 不合法和真实 Git CLI push/delete 矩阵。
 
 ### SSH exec command 解析过于脆弱
 

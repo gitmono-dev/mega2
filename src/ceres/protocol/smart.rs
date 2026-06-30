@@ -935,6 +935,32 @@ pub mod test {
     }
 
     #[test]
+    pub fn split_receive_pack_request_accepts_delete_only_without_pack_payload() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "27dd8d4cf39f3868c6eee38b601bc9e9939304f5 0000000000000000000000000000000000000000 refs/heads/old\0report-status\n"
+                .to_owned(),
+        );
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+
+        let (commands, pack_bytes) = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap();
+
+        assert!(pack_bytes.is_empty());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].ref_name, "refs/heads/old");
+        assert_eq!(commands[0].command_type, CommandType::Delete);
+        assert!(SmartSession::is_delete_only_push(&commands));
+    }
+
+    #[test]
     pub fn test_parse_capabilities() {
         let mut mock = SmartSession::new(
             std::path::PathBuf::new(),
