@@ -82,11 +82,12 @@ clone_case() {
   git -C "$dest" fsck --no-dangling >/dev/null || return
 }
 
-clone_protocol_v2_blobless_http() {
-  local dest="$ROOT_DIR/http-blobless"
-  local log="$ROOT_DIR/http-blobless.stderr"
+clone_protocol_v2_blobless() {
+  local url="$1"
+  local dest="$2"
+  local log="$3"
   rm -rf "$dest"
-  if ! git_case -c protocol.version=2 clone --filter=blob:none "$MONOENGINE_HTTP_REPO_URL" "$dest" 2>"$log"; then
+  if ! git_case -c protocol.version=2 clone --filter=blob:none "$url" "$dest" 2>"$log"; then
     cat "$log" >&2
     return 1
   fi
@@ -122,12 +123,14 @@ run_case "HTTP ls-remote" git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
 run_case "HTTP clone" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
 run_case "HTTP shallow clone depth=1" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-shallow" --depth=1
 run_case "HTTP protocol v2 ls-remote" git_case -c protocol.version=2 ls-remote "$MONOENGINE_HTTP_REPO_URL"
-run_case "HTTP protocol v2 blob:none clone" clone_protocol_v2_blobless_http
+run_case "HTTP protocol v2 blob:none clone" clone_protocol_v2_blobless "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-blobless" "$ROOT_DIR/http-blobless.stderr"
 
 if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH ls-remote" git_case ls-remote "$MONOENGINE_SSH_REPO_URL"
   run_case "SSH clone" clone_case "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-clone"
+  run_case "SSH shallow clone depth=1" clone_case "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-shallow" --depth=1
   run_case "SSH protocol v2 ls-remote" git_case -c protocol.version=2 ls-remote "$MONOENGINE_SSH_REPO_URL"
+  run_case "SSH protocol v2 blob:none clone" clone_protocol_v2_blobless "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-blobless" "$ROOT_DIR/ssh-blobless.stderr"
 fi
 
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
