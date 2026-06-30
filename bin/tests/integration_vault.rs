@@ -31,9 +31,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 // 这些常量模拟当前 P0/P2 集成测试中允许写入 Vault 的配置项：
-// `mail.password` 与 `object_storage.s3.access_key_id` / `secret_access_key`。
-// 数据库、Redis 等 bootstrap 阶段就要消费的配置不能依赖 monoengine 自己的 Vault，
-// 否则会形成启动环。
+// `mail.password`、`redis.url` 与 `object_storage.s3.access_key_id` / `secret_access_key`。
+// 数据库凭据在 bootstrap 阶段就要消费，不能依赖 monoengine 自己的 Vault，
+// 否则会形成启动环；Redis URL 在 Vault 就绪后连接，可用 SecretRef 覆盖。
 const MAIL_PASSWORD_PATH: &str = "config/it/mail/password";
 const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
 const SECRET_VALUE: &str = "smtp-test-password";
@@ -46,6 +46,9 @@ const OBJECT_STORAGE_SECRET_KEY_REF: &str =
     "vault://secret/config/it/object_storage/secret_access_key#value";
 const S3_ACCESS_KEY_VALUE: &str = "AKIA-test-access-key";
 const S3_SECRET_KEY_VALUE: &str = "wJalrXUtnFEMI/test/secret/key/EXAMPLE";
+
+const REDIS_URL_PATH: &str = "config/it/redis/url";
+const REDIS_URL_REF: &str = "vault://secret/config/it/redis/url#value";
 
 const NOTIFICATION_SLACK_WEBHOOK_URL_PATH: &str = "config/it/notification/slack/webhook_url";
 const NOTIFICATION_WEBHOOK_TOKEN_PATH: &str = "config/it/notification/webhook/token";
@@ -536,6 +539,64 @@ fn config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs() 
     );
 }
 
+#[test]
+fn config_secret_set_check_and_validate_resolve_redis_url_secret_ref() {
+    // Redis is resolved after DB-only Vault bootstrap and before connecting to Redis,
+    // so it is a valid SecretRef consumer even though database credentials are not.
+    let env = VaultCliEnv::new();
+
+    seed_mail_password(&env);
+
+    let redis_url = integration_redis_url();
+    let mut set = env.bootstrap_command();
+    set.args([
+        "config",
+        "secret",
+        "set",
+        "redis.url",
+        "--vault-path",
+        REDIS_URL_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set, &redis_url);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), format!("stored {REDIS_URL_REF}"));
+    assert!(
+        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
+        "stdout/stderr leaked Redis URL"
+    );
+
+    let mut check = env.bootstrap_command();
+    check.args([
+        "config",
+        "secret",
+        "check",
+        "redis.url",
+        "--ref",
+        REDIS_URL_REF,
+    ]);
+    let output = run(check);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), format!("ok {REDIS_URL_REF}"));
+    assert!(
+        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
+        "check leaked Redis URL"
+    );
+
+    let mut validate = env.full_config_command();
+    validate.env("MEGA_REDIS__URL", REDIS_URL_REF);
+    validate.args(["config", "validate", "--resolve-secrets"]);
+    let output = run(validate);
+    let (stdout, stderr) = assert_success(&output);
+    assert_eq!(stdout.trim(), "config valid");
+    assert!(
+        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
+        "validate leaked Redis URL"
+    );
+}
+
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
     // 进程级测试需要尽量隔离外部环境，避免开发机上的 MEGA_* 变量影响结果。
     let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
@@ -635,8 +696,8 @@ fn integration_postgres_url() -> String {
 }
 
 fn integration_redis_url() -> String {
-    // 当前 Vault CLI 测试的 bootstrap 路径不应连接 Redis。
-    // 仍提供默认值，是为了完整配置 validate 路径能按集成环境架构解析配置。
+    // Vault CLI bootstrap commands should not connect to Redis. Full-config validation
+    // may still validate or resolve redis.url, including the post-vault SecretRef path.
     std::env::var("MEGA_REDIS__URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.to_string())
 }
 
@@ -1341,6 +1402,10 @@ fn integration_config_init_creates_safe_skeleton_and_validates() {
         "stdout should mention created path: {stdout}"
     );
     assert!(stderr.trim().is_empty(), "unexpected stderr: {stderr}");
+    assert!(
+        stdout.contains("config secret set object_storage.s3.secret_access_key"),
+        "stdout should include S3 secret key setup guidance: {stdout}"
+    );
 
     let content = fs::read_to_string(&output_path).expect("read init config");
     // 骨架配置使用 password_ref 而非明文 password，且不包含可复用的生产凭据。

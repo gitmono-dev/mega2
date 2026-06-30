@@ -361,6 +361,10 @@ fn exec_init(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         output_path.display()
     );
     println!(
+        "  printf '%s' \"$S3_SECRET_KEY\" | monoengine --config {} config secret set object_storage.s3.secret_access_key --vault-path config/prod/object_storage/secret_access_key --field value --value-stdin",
+        output_path.display()
+    );
+    println!(
         "  monoengine --config {} config validate --resolve-secrets",
         output_path.display()
     );
