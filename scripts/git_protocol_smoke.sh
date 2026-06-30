@@ -119,6 +119,28 @@ push_smoke_http() {
   fi
 }
 
+push_tag_smoke_http() {
+  local src="$ROOT_DIR/push-tag-src"
+  local tag="monoengine-smoke-tag-$(date +%s)-$$"
+  local cleanup_status=0
+  rm -rf "$src"
+  mkdir -p "$src" || return
+  git -C "$src" init >/dev/null || return
+  git -C "$src" config user.name "Monoengine Smoke" || return
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
+  printf 'monoengine git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
+  git -C "$src" add smoke-tag.txt || return
+  git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return
+  git -C "$src" tag "$tag" || return
+  git -C "$src" remote add origin "$MONOENGINE_HTTP_REPO_URL" || return
+  git -C "$src" push origin "refs/tags/$tag" || return
+  git -C "$src" push origin ":refs/tags/$tag" || cleanup_status=$?
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    echo "failed to delete remote smoke tag refs/tags/$tag" >&2
+    return "$cleanup_status"
+  fi
+}
+
 run_case "HTTP ls-remote" git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
 run_case "HTTP clone" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
 run_case "HTTP shallow clone depth=1" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-shallow" --depth=1
@@ -135,8 +157,9 @@ fi
 
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP push and delete branch" push_smoke_http
+  run_case "HTTP push and delete tag" push_tag_smoke_http
 else
-  echo "SKIP: HTTP push and delete branch (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
+  echo "SKIP: HTTP push/delete branch and tag (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
 fi
 
 echo "git protocol smoke summary: $PASS_COUNT passed, $FAIL_COUNT failed"
