@@ -321,6 +321,11 @@ impl SmartSession {
             let pkt_line = try_read_pkt_line(&mut protocol_bytes)?;
             match pkt_line {
                 PktLine::Flush => {
+                    if protocol_bytes.is_empty() && !Self::is_delete_only_push(&commands) {
+                        return Err(ProtocolError::InvalidInput(
+                            "receive-pack request missing pack payload".to_owned(),
+                        ));
+                    }
                     return Ok((commands, protocol_bytes));
                 }
                 PktLine::Data(mut data) => {
@@ -958,6 +963,29 @@ pub mod test {
         assert_eq!(commands[0].ref_name, "refs/heads/old");
         assert_eq!(commands[0].command_type, CommandType::Delete);
         assert!(SmartSession::is_delete_only_push(&commands));
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_rejects_non_delete_without_pack_payload() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "0000000000000000000000000000000000000000 27dd8d4cf39f3868c6eee38b601bc9e9939304f5 refs/heads/main\0report-status\n"
+                .to_owned(),
+        );
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+
+        let err = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("missing pack payload"));
     }
 
     #[test]
