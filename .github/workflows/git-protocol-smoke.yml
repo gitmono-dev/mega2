@@ -114,8 +114,10 @@ jobs:
           echo "::add-mask::${smoke_git_token}"
           psql "${MEGA_DATABASE__DB_URL}" \
             -v ON_ERROR_STOP=1 \
-            -v token="${smoke_git_token}" \
-            -c "INSERT INTO access_token (id, username, token, created_at) VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now())"
+            -v token="${smoke_git_token}" <<'SQL'
+          INSERT INTO access_token (id, username, token, created_at)
+          VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now());
+          SQL
 
           echo "SMOKE_CONFIG_PATH=${smoke_dir}/config.toml" >> "$GITHUB_ENV"
           echo "SMOKE_BASE_DIR=${smoke_dir}/base" >> "$GITHUB_ENV"
