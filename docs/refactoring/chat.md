@@ -734,7 +734,8 @@ pub trait ChatEvents {
 - 已完成主干：新增 OpenAPI 标注。
 - 已完成主干：接入当前用户 `username` 提取。
 - 已完成主干：把 service 错误映射成统一 API error。
-- 剩余：补真实 HTTP 黑盒矩阵、稳定无 Redis router 测试。
+- ✅ 稳定无 Redis router 测试已落地：`chat_router::test_chat_router_handlers_lifecycle` 现在通过 `ChatApiState` 只注入 chat handler 实际需要的 `Storage` / `listen_addr`，不再为了构造 `MonoApiServiceState` 连接 Redis，也不再在 Redis 不可用时跳过。
+- 剩余：补真实 HTTP 黑盒矩阵。
 
 验收：
 

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{FromRef, Path, Query, State},
 };
 use orbit_api::object_storage::{ObjectKey, ObjectNamespace};
 use reqwest::Method;
@@ -10,7 +10,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CHAT_TAG, oauth::model::LoginUser},
-    chat::service::channel_chat::extract_mentioned_usernames,
+    chat::service::{
+        ChannelChatService, SharedChatService, channel_chat::extract_mentioned_usernames,
+    },
     common::errors::ApiError,
     contract::api::{
         chat::{
@@ -21,6 +23,7 @@ use crate::{
         },
         common::{CommonResult, Pagination},
     },
+    jupiter::storage::Storage,
 };
 
 const CHAT_ATTACHMENT_MAX_FILE_SIZE: i64 = 100 * 1024 * 1024;
@@ -51,6 +54,31 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(add_channel_members))
             .routes(routes!(remove_channel_member)),
     )
+}
+
+#[derive(Clone)]
+struct ChatApiState {
+    storage: Storage,
+    listen_addr: String,
+}
+
+impl FromRef<MonoApiServiceState> for ChatApiState {
+    fn from_ref(state: &MonoApiServiceState) -> Self {
+        Self {
+            storage: state.storage.clone(),
+            listen_addr: state.listen_addr.clone(),
+        }
+    }
+}
+
+impl ChatApiState {
+    fn channel_chat_svc(&self) -> ChannelChatService {
+        ChannelChatService::from_storage(&self.storage)
+    }
+
+    fn shared_chat_svc(&self) -> SharedChatService {
+        SharedChatService::from_storage(&self.storage)
+    }
 }
 
 fn validate_chat_attachment_metadata(
@@ -160,7 +188,7 @@ fn extract_urls(content: &str) -> Vec<String> {
 
 async fn map_channel_model(
     ch: crate::callisto::channel::Model,
-    state: &MonoApiServiceState,
+    state: &ChatApiState,
 ) -> Result<ChannelResponse, ApiError> {
     let latest_message_public_id = if let Some(mid) = ch.latest_message_id {
         let m = state
@@ -189,7 +217,7 @@ async fn map_channel_model(
 
 async fn map_message_model(
     msg: crate::callisto::message::Model,
-    state: &MonoApiServiceState,
+    state: &ChatApiState,
 ) -> Result<MessageResponse, ApiError> {
     // 1. Get reactions
     let rx_models = state
@@ -285,7 +313,7 @@ async fn map_message_model(
 )]
 async fn list_channels(
     user: LoginUser,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<Vec<ChannelResponse>>>, ApiError> {
     let channels = state
         .channel_chat_svc()
@@ -313,7 +341,7 @@ async fn list_channels(
 )]
 async fn create_channel(
     user: LoginUser,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<CreateChannelReq>,
 ) -> Result<Json<CommonResult<ChannelResponse>>, ApiError> {
     let (ch, _) = state
@@ -348,7 +376,7 @@ async fn create_channel(
 async fn get_channel_detail(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<ChannelResponse>>, ApiError> {
     let ch = state
         .channel_chat_svc()
@@ -377,7 +405,7 @@ async fn get_channel_detail(
 async fn update_channel(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<UpdateChannelReq>,
 ) -> Result<Json<CommonResult<ChannelResponse>>, ApiError> {
     let ch = state
@@ -410,7 +438,7 @@ async fn update_channel(
 async fn delete_channel(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state
         .channel_chat_svc()
@@ -438,7 +466,7 @@ async fn list_messages(
     user: LoginUser,
     Path(channel_id): Path<String>,
     Query(pagination): Query<Pagination>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<Vec<MessageResponse>>>, ApiError> {
     // 1. Verify membership
     let ch = state
@@ -482,7 +510,7 @@ async fn list_messages(
 async fn send_message(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<SendMessageReq>,
 ) -> Result<Json<CommonResult<MessageResponse>>, ApiError> {
     let msg = state
@@ -613,7 +641,7 @@ async fn send_message(
 async fn edit_message(
     user: LoginUser,
     Path((channel_id, message_id)): Path<(String, String)>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<UpdateMessageReq>,
 ) -> Result<Json<CommonResult<MessageResponse>>, ApiError> {
     let msg = state
@@ -641,7 +669,7 @@ async fn edit_message(
 async fn delete_message(
     user: LoginUser,
     Path((channel_id, message_id)): Path<(String, String)>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state
         .channel_chat_svc()
@@ -667,7 +695,7 @@ async fn delete_message(
 async fn create_reaction(
     user: LoginUser,
     Path(message_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<CreateReactionReq>,
 ) -> Result<Json<CommonResult<ReactionResponse>>, ApiError> {
     let rx = state
@@ -717,7 +745,7 @@ async fn create_reaction(
 async fn delete_reaction(
     user: LoginUser,
     Path(reaction_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state
         .shared_chat_svc()
@@ -739,7 +767,7 @@ async fn delete_reaction(
 )]
 async fn presign_attachment(
     user: LoginUser,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<AttachmentPresignReq>,
 ) -> Result<Json<CommonResult<AttachmentPresignRes>>, ApiError> {
     let allowed_mime_types = state
@@ -806,7 +834,7 @@ async fn presign_attachment(
 async fn confirm_attachment(
     user: LoginUser,
     Query(message_id): Query<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<AttachmentConfirmReq>,
 ) -> Result<Json<CommonResult<AttachmentResponse>>, ApiError> {
     let allowed_mime_types = state
@@ -930,7 +958,7 @@ async fn confirm_attachment(
 async fn mark_channel_read(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state
         .channel_chat_svc()
@@ -955,7 +983,7 @@ async fn mark_channel_read(
 async fn mark_channel_unread(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     state
         .channel_chat_svc()
@@ -980,7 +1008,7 @@ async fn mark_channel_unread(
 async fn list_channel_members(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<Vec<ChannelMemberResponse>>>, ApiError> {
     let ch = state
         .storage
@@ -1024,7 +1052,7 @@ async fn list_channel_members(
 async fn add_channel_members(
     user: LoginUser,
     Path(channel_id): Path<String>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
     Json(payload): Json<AddChannelMembersReq>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     let ch = state
@@ -1064,7 +1092,7 @@ async fn add_channel_members(
 async fn remove_channel_member(
     user: LoginUser,
     Path((channel_id, member_username)): Path<(String, String)>,
-    state: State<MonoApiServiceState>,
+    state: State<ChatApiState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     let ch = state
         .storage
@@ -1095,7 +1123,7 @@ async fn remove_channel_member(
 
 #[cfg(test)]
 mod tests {
-    use std::{io, sync::Arc};
+    use std::io;
 
     use bytes::Bytes;
     use futures::stream;
@@ -1153,30 +1181,16 @@ mod tests {
         assert!(validate_chat_attachment_file_path("other/attachments/report.txt").is_err());
     }
 
-    async fn setup_test_state(temp_dir: &std::path::Path) -> Option<MonoApiServiceState> {
+    async fn setup_test_state(temp_dir: &std::path::Path) -> ChatApiState {
         let storage = test_storage(temp_dir).await;
-        let redis_url = &storage.config().redis.url;
-        let client = ::redis::Client::open(redis_url.as_str()).ok()?;
-        let redis_conn = crate::jupiter::redis::ConnectionManager::new(client)
-            .await
-            .ok()?;
 
-        let git_object_cache = Arc::new(crate::ceres::api_service::cache::GitObjectCache {
-            connection: redis_conn,
-            prefix: "git-object-rkyv:v1".to_string(),
-        });
-        Some(MonoApiServiceState {
+        ChatApiState {
             storage: storage.clone(),
             listen_addr: "http://localhost:8000".to_string(),
-            entity_store: crate::contract::policy::entitystore::EntityStore::new(),
-            git_object_cache,
-            bellatrix: Arc::new(crate::bellatrix::Bellatrix::new(
-                storage.config().build.clone(),
-            )),
-        })
+        }
     }
 
-    async fn put_attachment_object(state: &MonoApiServiceState, key: &str, size: i64) {
+    async fn put_attachment_object(state: &ChatApiState, key: &str, size: i64) {
         let object_key = ObjectKey {
             namespace: ObjectNamespace::Attachment,
             key: key.to_string(),
@@ -1202,10 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_router_handlers_lifecycle() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let Some(state) = setup_test_state(temp_dir.path()).await else {
-            println!("Skipping chat_router integration tests because Redis is not available.");
-            return;
-        };
+        let state = setup_test_state(temp_dir.path()).await;
 
         let alice = LoginUser {
             campsite_user_id: "user-alice".to_string(),
@@ -1372,7 +1383,18 @@ mod tests {
             .await
             .expect("failed to list channels")
             .0;
-        assert_eq!(list_res.data.unwrap().len(), 1);
+        let alice_channels = list_res.data.unwrap();
+        assert_eq!(alice_channels.len(), 2);
+        assert!(
+            alice_channels
+                .iter()
+                .any(|channel| channel.public_id == ch.public_id)
+        );
+        assert!(
+            alice_channels
+                .iter()
+                .any(|channel| channel.public_id == other_ch.public_id)
+        );
 
         // List for non-member (e.g. charlie) should be empty
         let list_res_charlie = list_channels(charlie.clone(), State(state.clone()))
