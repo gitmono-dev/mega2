@@ -3,7 +3,7 @@ members = ["bin"]
 
 [package]
 name = "monoengine-core"
-version = "0.1.156"
+version = "0.1.157"
 edition = "2024"
 
 [lib]
@@ -15,7 +15,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 arc-swap = "1"
 as-any = "0.3.1"
 async-recursion = "1.1.1"
@@ -34,7 +34,7 @@ bytes = "1.11.1"
 cedar-policy = "4.11.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
-config = "0.15.23"
+config = "0.15.25"
 crossbeam-channel = "0.5"
 ctrlc = "3.5.2"
 dashmap = "6.1.0"
@@ -46,7 +46,7 @@ enum-map = "2.6.1"
 envsubst = "0.2.1"
 foreign-types = "0.3.2"
 futures = "0.3.32"
-git-internal = "0.7.4"
+git-internal = "0.8.0"
 glob = "0.3.1"
 go-defer = "0.1.0"
 hcl-rs = "0.18.0"
@@ -57,7 +57,7 @@ humantime = "2.1.0"
 idgenerator = "2.0.0"
 indexmap = "2.14"
 ipnetwork = "0.17.0"
-itertools = "0.14.0"
+itertools = "0.15.0"
 lazy_static = "1.5.0"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
 libc = "0.2"
@@ -74,13 +74,13 @@ openssl-sys = "0.9.109"
 parse-display = "0.11.0"
 percent-encoding = "2.3"
 pem = "3.0.0"
-pgp = "0.19.0"
+pgp = "0.20.0"
 priority-queue = "2.1.0"
 radix_trie = "0.2.1"
 rand = { version = "0.10.1", features = ["thread_rng"] }
 rand08 = { package = "rand", version = "0.8.6" }
 rand_chacha = "0.3.1"
-redis = { version = "1.2.1", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
+redis = { version = "1.3.0", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
 regex = "1.12.3"
 reqwest = { version = "0.13.4", features = ["json", "stream", "blocking"] }
 ring = "0.17"
@@ -122,7 +122,7 @@ url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["chrono", "axum_extras"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
-uuid = { version = "1.23.1", features = ["v4"] }
+uuid = { version = "1.23.4", features = ["v4"] }
 x509-parser = "0.18.0"
 zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
 

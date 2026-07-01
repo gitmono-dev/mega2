@@ -400,11 +400,13 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
   后返回空 pack payload，并由 `is_delete_only_push` 跳过 unpack。
 - 非 delete receive-pack 请求在 flush-pkt 后缺失 pack payload 会返回
   `ProtocolError::InvalidInput`。
+- 非 delete receive-pack 请求的 pack payload 不以 `PACK` magic 开头时会返回
+  `ProtocolError::InvalidInput`。
 
 仍待后续处理：
 
 - 将当前完整 body / channel 数据缓冲改为 streaming pkt-line reader。
-- 增加非 delete push pack magic 不合法和真实 Git CLI push/delete 矩阵。
+- 增加真实 Git CLI push/delete 矩阵。
 
 ### SSH exec command 解析过于脆弱
 
