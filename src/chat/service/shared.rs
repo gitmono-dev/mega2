@@ -5,13 +5,12 @@ use chrono::Utc;
 use futures::TryStreamExt;
 use regex::Regex;
 use reqwest::redirect::Policy;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::{
     callisto::{attachment, open_graph_link, reactions},
     common::errors::MegaError,
     jupiter::storage::{
-        attachment_storage::AttachmentStorage, base_storage::StorageConnector,
+        attachment_storage::AttachmentStorage,
         channel_membership_storage::ChannelMembershipStorage,
         custom_reaction_storage::CustomReactionStorage, message_storage::MessageStorage,
         open_graph_storage::OpenGraphStorage, reaction_storage::ReactionStorage,
@@ -134,10 +133,9 @@ impl SharedChatService {
         reaction_public_id: &str,
         username: &str,
     ) -> Result<(), MegaError> {
-        let reaction = reactions::Entity::find()
-            .filter(reactions::Column::PublicId.eq(reaction_public_id))
-            .filter(reactions::Column::DiscardedAt.is_null())
-            .one(self.reaction_storage.get_connection())
+        let reaction = self
+            .reaction_storage
+            .get_active_reaction_by_public_id(reaction_public_id)
             .await?
             .ok_or_else(|| {
                 MegaError::NotFound(format!("Reaction {} not found", reaction_public_id))

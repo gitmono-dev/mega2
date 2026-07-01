@@ -193,3 +193,103 @@ impl ChannelStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{callisto::entity_ext::generate_public_id, jupiter::tests::test_storage};
+
+    #[tokio::test]
+    async fn channel_visibility_is_membership_scoped() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let channel_storage = storage.channel_storage();
+        let membership_storage = storage.channel_membership_storage();
+
+        let channel = channel_storage
+            .create_channel(
+                generate_public_id(),
+                Some("members only".to_string()),
+                None,
+                "alice".to_string(),
+                true,
+            )
+            .await
+            .expect("create channel");
+        membership_storage
+            .add_member(channel.id, "alice".to_string())
+            .await
+            .expect("add alice");
+
+        let alice_channels = channel_storage
+            .list_visible_channels("alice")
+            .await
+            .expect("list alice channels");
+        assert_eq!(alice_channels.len(), 1);
+        assert_eq!(alice_channels[0].id, channel.id);
+
+        let bob_channels = channel_storage
+            .list_visible_channels("bob")
+            .await
+            .expect("list bob channels");
+        assert!(bob_channels.is_empty());
+
+        let bob_lookup = channel_storage
+            .get_channel_by_public_id(&channel.public_id, "bob")
+            .await
+            .expect("bob lookup");
+        assert!(bob_lookup.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_update_and_delete_require_visible_membership() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let channel_storage = storage.channel_storage();
+        let membership_storage = storage.channel_membership_storage();
+
+        let channel = channel_storage
+            .create_channel(
+                generate_public_id(),
+                Some("editable".to_string()),
+                None,
+                "alice".to_string(),
+                true,
+            )
+            .await
+            .expect("create channel");
+        membership_storage
+            .add_member(channel.id, "alice".to_string())
+            .await
+            .expect("add alice");
+
+        let bob_update = channel_storage
+            .update_channel(&channel.public_id, "bob", Some("nope".to_string()), None)
+            .await;
+        assert!(
+            bob_update.is_err(),
+            "non-member update should not find the channel"
+        );
+
+        let updated = channel_storage
+            .update_channel(
+                &channel.public_id,
+                "alice",
+                Some("updated".to_string()),
+                None,
+            )
+            .await
+            .expect("member update");
+        assert_eq!(updated.title.as_deref(), Some("updated"));
+
+        channel_storage
+            .soft_delete_channel(&channel.public_id, "alice")
+            .await
+            .expect("member soft delete");
+
+        let deleted_lookup = channel_storage
+            .get_channel_by_public_id(&channel.public_id, "alice")
+            .await
+            .expect("lookup deleted channel");
+        assert!(deleted_lookup.is_none());
+    }
+}

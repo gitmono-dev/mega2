@@ -323,7 +323,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 - unique `public_id`
 - `(subject_type, subject_id)`
 - unique `(subject_type, subject_id, username, content, custom_reaction_id, discarded_at)`，迁移时确认 Postgres 对 nullable unique 的语义是否满足需求；不满足则使用 partial unique index。
-  - **已核实（2026-06-24）**：当前 `idx-reactions-unique-active` 是 `WHERE discarded_at IS NULL` 的 partial unique index，但因其包含 nullable 列（`content` / `custom_reaction_id`），Postgres 默认把 NULL 视为互不相同，实际不会对标准 emoji（`custom_reaction_id` NULL）或 custom reaction（`content` NULL）去重。若要真正去重，需改用 `NULLS NOT DISTINCT`（Postgres 15+）重建索引——属后续 chat 专项，暂不在本次范围。
+  - **已完成（2026-07-01）**：新增 `m20260701_000000_fix_reaction_unique_nulls`，使用 `NULLS NOT DISTINCT` 重建 `idx-reactions-unique-active`，避免 nullable 列导致标准 emoji（`custom_reaction_id` NULL）和 custom reaction（`content` NULL）重复绕过唯一约束；storage 回归测试覆盖标准 emoji/custom reaction 重复冲突和 soft delete 后可重建。
 
 ### `custom_reactions`
 
@@ -678,7 +678,7 @@ pub trait ChatEvents {
 验收：
 
 - 迁移测试覆盖 4 张表和关键索引。
-- ✅ storage 测试覆盖 create/query/soft delete/unique conflict（`custom_reaction_storage::test_custom_reaction_rejects_duplicate_lowercase_name` 覆盖 `lower(name)` 唯一冲突；`attachment_storage::test_duplicate_public_id_is_rejected` 覆盖 `public_id` 唯一冲突；`attachment_storage::test_soft_delete_attachments_for_subject` 与 `channel_chat::test_delete_message_soft_deletes_attachments` 覆盖按 subject 批量软删除与消息删除级联软删除；reactions 部分唯一索引因 Postgres 对 nullable 列的 NULL-distinct 语义实际不强制去重，见下方约束说明）。
+- ✅ storage 测试覆盖 create/query/soft delete/unique conflict（`custom_reaction_storage::test_custom_reaction_rejects_duplicate_lowercase_name` 覆盖 `lower(name)` 唯一冲突；`attachment_storage::test_duplicate_public_id_is_rejected` 覆盖 `public_id` 唯一冲突；`attachment_storage::test_soft_delete_attachments_for_subject` 与 `channel_chat::test_delete_message_soft_deletes_attachments` 覆盖按 subject 批量软删除与消息删除级联软删除；`reaction_storage::test_duplicate_active_standard_reaction_is_rejected`、`reaction_storage::test_duplicate_active_custom_reaction_is_rejected` 与 `reaction_storage::test_soft_deleted_standard_reaction_can_be_recreated` 覆盖 reactions active 唯一索引的 nullable 列语义与 partial index 行为）。
 - 不引入外部网络调用。
 
 ### Slice 2: Channel Chat schema + storage（主干已落地）
@@ -693,7 +693,8 @@ pub trait ChatEvents {
 - 已完成主干：新增 message storage：page、create、update、soft delete、recompute latest。
 - 已完成首批：channel/message 读取按 `username` 强制 membership join；2026-06-23 已补 message edit/delete 的 path channel + current membership guard。
 - 已完成首批：`chat_router` response mapping 中的 message/custom-reaction 读取已迁回 storage helper。
-- 剩余：继续减少其他 handler 内直接 SeaORM 查询，补稳定的 storage 级权限回归测试矩阵。
+- ✅ runtime chat handler/service 路径已收敛到 storage 调用：HTTP/router 与 `src/chat/service/` 当前无直接 SeaORM 查询；`SharedChatService::delete_reaction` 的 active reaction lookup 已迁入 `ReactionStorage::get_active_reaction_by_public_id`，并由 `delete_reaction_rejects_removed_member` 与 reaction storage 测试覆盖。`commands/chat_migrate.rs` 仍保留 bulk import/校验型直接 SeaORM 写入，不计入 runtime handler/storage 边界。
+- ✅ storage 级权限回归测试补强：`channel_storage::channel_visibility_is_membership_scoped` 覆盖成员/非成员 list 与 public_id lookup 可见性；`channel_storage::channel_update_and_delete_require_visible_membership` 覆盖非成员 update 拒绝、成员 update 成功与 soft-delete 后不可见。
 
 验收：
 
