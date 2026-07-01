@@ -74,6 +74,17 @@ git_case() {
   git -c advice.detachedHead=false "$@"
 }
 
+lfs_http_url() {
+  local remote_url="${MONOENGINE_HTTP_REPO_URL%/}"
+  printf '%s/info/lfs\n' "$remote_url"
+}
+
+configure_lfs_http_remote() {
+  local repo_dir="$1"
+  git -C "$repo_dir" config lfs.url "$(lfs_http_url)" || return
+  git -C "$repo_dir" config lfs.locksverify false || return
+}
+
 clone_case() {
   local url="$1"
   local dest="$2"
@@ -182,6 +193,7 @@ lfs_smoke_http() {
   git -C "$src" config user.name "Monoengine Smoke" || return
   git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
   git -C "$src" lfs install --local >/dev/null || return
+  configure_lfs_http_remote "$src" || return
   git -C "$src" lfs track "*.bin" >/dev/null || return
   printf 'monoengine git lfs smoke %s\n' "$branch" >"$src/smoke-lfs.bin"
   git -C "$src" add .gitattributes smoke-lfs.bin || return
@@ -200,6 +212,9 @@ lfs_smoke_http() {
   fi
   if [[ "$rc" -eq 0 ]]; then
     git -C "$clone_dir" checkout lfs-smoke >/dev/null || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    configure_lfs_http_remote "$clone_dir" || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     git -C "$clone_dir" lfs pull || rc=$?
