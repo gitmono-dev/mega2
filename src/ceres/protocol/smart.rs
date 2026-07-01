@@ -825,7 +825,23 @@ pub mod test {
     pub fn try_read_pkt_line_rejects_reserved_length_3() {
         let mut bytes = Bytes::from_static(b"0003");
         let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("reserved"));
+        assert_eq!(&bytes[..], b"0003");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_length_smaller_than_header() {
+        let mut bytes = Bytes::from_static(b"0003want");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(
+            err.to_string().contains("reserved")
+                || err.to_string().contains("smaller than header")
+        );
+        assert_eq!(&bytes[..], b"0003want");
     }
 
     #[test]

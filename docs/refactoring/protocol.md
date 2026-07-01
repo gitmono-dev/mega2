@@ -54,9 +54,7 @@
 >
 > **2026-06-30 更新 5**：monorepo pack generation 的 encoder startup 与 commit entry send 完成 panic 止血。`MonoRepo::{shallow_pack, filtered_pack, incremental_pack}` 不再 unwrap `PackEncoder::encode_async` 或 commit entry channel send failure，统一映射为 `MegaError` / `GitError` 向上传播。
 >
-> **2026-06-30 更新 6**：import repo pack generation 的 encoder startup 与 commit entry send 完成同类 panic 止血。`ImportRepo::incremental_pack` 不再 unwrap `PackEncoder::encode_async` 或 commit entry channel send failure，统一映射为 `MegaError` / `GitError` 向上传播。
->
-> **2026-07-01 更新**：receive-pack splitter 继续加固空命令列表场景。`SmartSession::split_receive_pack_request` 在 flush-pkt 后若 commands 为空（例如仅有 `0000` 后直接跟 `PACK` payload）会返回 `ProtocolError::InvalidInput`，避免无命令的 receive-pack 请求进入后续 ref 处理；由 `split_receive_pack_request_rejects_empty_command_list` 锁定。
+> **2026-07-01 更新 2**：`try_read_pkt_line` 的 pkt-line parser 错误模型继续收敛。新增回归测试覆盖 reserved length `0003`、length 小于 header（如 `0002want`）的精确错误诊断与不消费输入行为，以及非十六进制 header、短 header、payload 不完整的既有测试；由 `try_read_pkt_line_rejects_reserved_length_3`、`try_read_pkt_line_rejects_length_smaller_than_header`、`try_read_pkt_line_rejects_non_hex_header`、`try_read_pkt_line_rejects_incomplete_header_without_consuming`、`try_read_pkt_line_rejects_incomplete_payload` 共同锁定。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -493,7 +491,7 @@ buffer。
 
 - 空输入或不足 4 字节的 length header。
 - 非 hex length header。
-- reserved length `0003`。
+- reserved length `0003` 与 length 小于 header 的场景。
 - length 大于剩余 buffer。
 - `0000` flush-pkt、`0001` delim-pkt、`0002` response-end-pkt。
 
