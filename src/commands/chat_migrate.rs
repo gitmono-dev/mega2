@@ -1147,18 +1147,486 @@ pub(crate) async fn run_migration(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use sea_orm::EntityTrait;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::jupiter::tests::test_storage;
+    use crate::{
+        config::testing::{EnvVarGuard, TestConfigBuilder, env_lock},
+        jupiter::{
+            storage::{
+                init::database_connection,
+                object_storage::{
+                    MegaObjectStorageWrapper, ObjectStorageProvider, mock_object_storage,
+                    set_object_storage_provider,
+                },
+            },
+            tests::{test_db_config, test_storage},
+        },
+    };
+
+    struct TestObjectStorageProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStorageProvider for TestObjectStorageProvider {
+        async fn build(
+            &self,
+            _cfg: &crate::config::ObjectStorageConfig,
+        ) -> Result<MegaObjectStorageWrapper, MegaError> {
+            Ok(mock_object_storage())
+        }
+    }
+
+    fn ensure_test_object_storage_provider() {
+        set_object_storage_provider(Arc::new(TestObjectStorageProvider));
+    }
 
     fn write_empty_required_exports(input_dir: &Path) {
         for filename in REQUIRED_LEGACY_EXPORTS {
             fs::write(input_dir.join(filename), "[]").unwrap();
         }
+    }
+
+    fn write_sanitized_legacy_export_fixture(input_dir: &Path, mapping_file: &Path) {
+        fs::write(
+            mapping_file,
+            r#"{
+                "user_mappings": {
+                    "1": "alice",
+                    "2": "bob"
+                },
+                "org_membership_mappings": {
+                    "11": "bob"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("custom_reactions.json"),
+            r#"[
+                {
+                    "id": 4001,
+                    "public_id": "cr4001xxxxxx",
+                    "name": "wave",
+                    "file_path": "chat/custom-reactions/wave.png",
+                    "file_type": "image/png",
+                    "user_id": 1,
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("open_graph_links.json"),
+            r#"[
+                {
+                    "id": 6001,
+                    "url": "https://example.invalid/sanitized-chat-export",
+                    "title": "Sanitized Export",
+                    "image_path": "chat/open-graph/image.png",
+                    "favicon_path": "chat/open-graph/favicon.ico",
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("message_threads.json"),
+            r#"[
+                {
+                    "id": 1001,
+                    "public_id": "thread1001xx",
+                    "title": "Sanitized General",
+                    "last_message_at": "2026-05-30 12:03:00",
+                    "latest_message_id": 3003,
+                    "members_count": 2,
+                    "image_path": null,
+                    "group": true,
+                    "owner_id": 1,
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:03:00"
+                },
+                {
+                    "id": 1002,
+                    "public_id": "thread1002xx",
+                    "title": "Integration Thread",
+                    "last_message_at": "2026-05-30 12:04:00",
+                    "owner_id": 1,
+                    "integration_id": 42,
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("message_thread_memberships.json"),
+            r#"[
+                {
+                    "id": 2001,
+                    "message_thread_id": 1001,
+                    "user_id": 1,
+                    "last_read_at": "2026-05-30 12:00:00",
+                    "notification_level": 1,
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                },
+                {
+                    "id": 2002,
+                    "message_thread_id": 1001,
+                    "organization_membership_id": 11,
+                    "last_read_at": "2026-05-30 12:00:00",
+                    "notification_level": 0,
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                },
+                {
+                    "id": 2003,
+                    "message_thread_id": 1002,
+                    "user_id": 1,
+                    "last_read_at": "2026-05-30 12:04:00",
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("message_thread_membership_updates.json"),
+            r#"[
+                {
+                    "id": 7001,
+                    "message_thread_id": 1001,
+                    "actor_id": 1,
+                    "added_usernames": [2],
+                    "removed_usernames": ["1"],
+                    "created_at": "2026-05-30 12:02:00",
+                    "updated_at": "2026-05-30 12:02:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("messages.json"),
+            r#"[
+                {
+                    "id": 3001,
+                    "message_thread_id": 1001,
+                    "sender_id": 1,
+                    "content": "Hello from sanitized export",
+                    "public_id": "msg3001xxxxx",
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                },
+                {
+                    "id": 3002,
+                    "message_thread_id": 1001,
+                    "sender_id": 2,
+                    "content": "Reply from mapped user",
+                    "public_id": "msg3002xxxxx",
+                    "reply_to_id": 3001,
+                    "created_at": "2026-05-30 12:01:00",
+                    "updated_at": "2026-05-30 12:01:00"
+                },
+                {
+                    "id": 3003,
+                    "message_thread_id": 1001,
+                    "sender_id": 1,
+                    "content": "Shared a source post",
+                    "public_id": "msg3003xxxxx",
+                    "system_shared_post_id": 99,
+                    "created_at": "2026-05-30 12:03:00",
+                    "updated_at": "2026-05-30 12:03:00"
+                },
+                {
+                    "id": 3004,
+                    "message_thread_id": 1001,
+                    "sender_id": 1,
+                    "content": "Call system message",
+                    "public_id": "msg3004xxxxx",
+                    "call_id": 55,
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                },
+                {
+                    "id": 3005,
+                    "message_thread_id": 1002,
+                    "sender_id": 1,
+                    "content": "Integration thread message",
+                    "public_id": "msg3005xxxxx",
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("message_notifications.json"),
+            r#"[
+                {
+                    "id": 8001,
+                    "message_thread_membership_id": 2001,
+                    "message_id": 3002,
+                    "created_at": "2026-05-30 12:01:00",
+                    "updated_at": "2026-05-30 12:01:00"
+                },
+                {
+                    "id": 8002,
+                    "message_thread_membership_id": 2003,
+                    "message_id": 3005,
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("attachments.json"),
+            r#"[
+                {
+                    "id": 9001,
+                    "public_id": "att9001xxxxx",
+                    "file_path": "chat/attachments/sanitized.png",
+                    "file_type": "image/png",
+                    "subject_type": "Message",
+                    "subject_id": 3001,
+                    "preview_file_path": null,
+                    "width": 800,
+                    "height": 600,
+                    "duration": null,
+                    "position": 1,
+                    "name": "sanitized.png",
+                    "size": 102400,
+                    "gallery_id": null,
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                },
+                {
+                    "id": 9002,
+                    "public_id": "att9002xxxxx",
+                    "file_path": "chat/attachments/post.png",
+                    "file_type": "image/png",
+                    "subject_type": "Post",
+                    "subject_id": 999,
+                    "name": "post.png",
+                    "size": 1024,
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                },
+                {
+                    "id": 9003,
+                    "public_id": "att9003xxxxx",
+                    "file_path": "chat/attachments/call.png",
+                    "file_type": "image/png",
+                    "subject_type": "Message",
+                    "subject_id": 3004,
+                    "name": "call.png",
+                    "size": 1024,
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+
+        fs::write(
+            input_dir.join("reactions.json"),
+            r#"[
+                {
+                    "id": 5001,
+                    "public_id": "rx5001xxxxxx",
+                    "subject_type": "Message",
+                    "subject_id": 3001,
+                    "user_id": 2,
+                    "content": "clap",
+                    "created_at": "2026-05-30 12:02:00",
+                    "updated_at": "2026-05-30 12:02:00"
+                },
+                {
+                    "id": 5002,
+                    "public_id": "rx5002xxxxxx",
+                    "subject_type": "Message",
+                    "subject_id": 3002,
+                    "organization_membership_id": 11,
+                    "content": null,
+                    "custom_reaction_id": 4001,
+                    "created_at": "2026-05-30 12:03:00",
+                    "updated_at": "2026-05-30 12:03:00"
+                },
+                {
+                    "id": 5003,
+                    "public_id": "rx5003xxxxxx",
+                    "subject_type": "Post",
+                    "subject_id": 999,
+                    "user_id": 1,
+                    "content": "heart",
+                    "created_at": "2026-05-30 12:00:00",
+                    "updated_at": "2026-05-30 12:00:00"
+                },
+                {
+                    "id": 5004,
+                    "public_id": "rx5004xxxxxx",
+                    "subject_type": "Message",
+                    "subject_id": 3004,
+                    "user_id": 2,
+                    "content": "fire",
+                    "created_at": "2026-05-30 12:04:00",
+                    "updated_at": "2026-05-30 12:04:00"
+                }
+            ]"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn chat_migrate_exec_imports_sanitized_legacy_export_fixture() {
+        let temp = tempdir().unwrap();
+        let input_dir = temp.path().join("exports");
+        fs::create_dir(&input_dir).unwrap();
+        let mapping_file = temp.path().join("mapping.json");
+        write_sanitized_legacy_export_fixture(&input_dir, &mapping_file);
+
+        let lock = env_lock();
+        let base_dir = temp.path().join("mega-base");
+        let cache_dir = temp.path().join("mega-cache");
+        let _base_guard = EnvVarGuard::set(
+            &lock,
+            "MEGA_BASE_DIR",
+            base_dir.to_str().expect("utf-8 base dir"),
+        );
+        let _cache_guard = EnvVarGuard::set(
+            &lock,
+            "MEGA_CACHE_DIR",
+            cache_dir.to_str().expect("utf-8 cache dir"),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db_config = runtime.block_on(test_db_config(temp.path()));
+        drop(runtime);
+
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let config = TestConfigBuilder::new(temp.path().join("config"))
+            .database_url(db_config.db_url)
+            .redis_url(redis_url)
+            .build();
+        let query_config = config.clone();
+        ensure_test_object_storage_provider();
+
+        let args = cli()
+            .try_get_matches_from([
+                "chat-migrate",
+                "--input-dir",
+                input_dir.to_str().expect("utf-8 input dir"),
+                "--user-mapping",
+                mapping_file.to_str().expect("utf-8 mapping file"),
+            ])
+            .unwrap();
+
+        exec(
+            CommandContext {
+                config: Some(config),
+                ..Default::default()
+            },
+            &args,
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let conn = database_connection(&query_config.database).await.unwrap();
+
+            assert_eq!(
+                crate::callisto::custom_reaction::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                crate::callisto::open_graph_link::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                crate::callisto::channel::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                crate::callisto::channel_membership::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                crate::callisto::channel_membership_update::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                crate::callisto::message::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                crate::callisto::message_notification::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                crate::callisto::attachment::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                crate::callisto::reactions::Entity::find()
+                    .count(&conn)
+                    .await
+                    .unwrap(),
+                2
+            );
+
+            let shared_post = crate::callisto::message::Entity::find_by_id(3003)
+                .one(&conn)
+                .await
+                .unwrap()
+                .expect("shared-post message should import");
+            assert_eq!(shared_post.content, "[Shared Post]");
+
+            let reaction = crate::callisto::reactions::Entity::find_by_id(5002)
+                .one(&conn)
+                .await
+                .unwrap()
+                .expect("org-membership reaction should import");
+            assert_eq!(reaction.username, "bob");
+            assert_eq!(reaction.custom_reaction_id, Some(4001));
+        });
     }
 
     #[tokio::test]
