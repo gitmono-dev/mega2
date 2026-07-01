@@ -86,7 +86,7 @@
 | SSH git-upload-pack | 已实现（per-channel state + protocol v2） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区；`GIT_PROTOCOL=version=2` 可启用 v2 `ls-refs` / `fetch`。 |
 | SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
-| 权限与认证 | 部分实现（认证已统一） | HTTP receive-pack 有 Bearer/Basic token 认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 仍匿名；receive-pack 未做 repo/path 级 push 权限校验。 |
+| 权限与认证 | 已统一（读写策略化） | HTTP receive-pack 有 Bearer/Basic token 认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 匿名访问已策略化：`check_upload_pack_access` 按 `git.anonymous_access`（默认 `true`）放行匿名 clone/fetch，关闭时无 token 返回 `Forbidden`（3 个单测覆盖），HTTP（`http.rs:53/217`）与 SSH（`ssh.rs:149`）共用。receive-pack 通过 `check_push_permission` 走 Cedar `pushRepo` 授权：未认证 push 直接 `Forbidden`（不进入 unpack），已认证时按 `state.entity_store` 策略裁决（策略库为空则放行），HTTP（`http.rs:64/355`）与 SSH（`ssh.rs:140`）共用。更细粒度 repo/path ACL 与基于策略的 push-deny 协议层单测待后续。 |
 | Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`；v2 移除 `server-option`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控非 MonoRepo handler。**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖**。 |
 | 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；**2026-06-28 更新**：`Repo::new` 的非 UTF-8 path/file_name `unwrap()` 已改为 `ProtocolError::InvalidInput`，`SmartSession::git_upload_pack` 中 `full_pack`/`incremental_pack` 的 `unwrap()` 已映射为协议错误；**2026-06-28 更新 2**：HTTP Git 路由已抽出 `GitProtocolPath` parser，移除内联 `.git` 替换与 404 `unwrap()`；**2026-06-28 更新 3**：`contract/git_protocol/http.rs` 中 response builder、`HeaderValue::from_str`、upload-pack sideband `read_buf` 的 `unwrap()` 已收敛；**2026-06-28 更新 4**：`contract/git_protocol/ssh.rs` 中 LFS `Duration::try_seconds(...).unwrap()` 与 `channel_eof` 的 `expect("state just found")` 已移除。Protocol 当前范围内剩余 `unwrap()` 已基本收敛；vault/legacy 路径与数据迁移工具不在本次范围。 |
 
@@ -113,7 +113,7 @@
 | receive-pack 分流 | 已按 flush-pkt 分割，仍缓冲完整 body/channel | streaming pkt-line reader + delete-only push 验证 | 中等 |
 | SSH exec 解析 | 脆弱（空格、拼接错） | 严格 parser，支持引号和转义 | 需独立 parser 函数和单测 |
 | SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 已引入 `GitSshChannelState`（2026-06-28） |
-| 认证统一 | HTTP/SSH 分离 | 统一 `ProtocolAuthContext` | 需与 config/vault auth 协同 |
+| 认证统一 | ✅ HTTP/SSH 共用 `check_upload_pack_access` / `check_push_permission` | 统一入口鉴权 + 匿名策略 + push 授权 | upload-pack 匿名可配置、receive-pack Cedar `pushRepo` 授权已落地；更细 repo/path ACL 与 push-deny 协议层单测待后续 |
 | Capability 诚实 | advertise 多于实现 | 仅 advertise 已实现能力 | 需 capability truth table |
 | 测试矩阵 | 无 | 真实 Git CLI smoke test | 需建立兼容性测试脚本 |
 
@@ -736,15 +736,15 @@ LFS:
 1. ✅ 定义协议认证上下文：`SmartSession.auth: AuthContext`（`username` + `authenticated_user: PushUserInfo`），HTTP 与 SSH 共用。
 2. ✅ HTTP Bearer / Basic token 认证填充同一 context（`git_receive_pack_auth` → `SmartSession::set_authenticated_user`）。
 3. ✅ SSH publickey 认证成功后保存 username（`SshServer.authenticated_user`），exec 阶段传入 `SmartSession`（`set_authenticated_user`），commit binding 不再匿名。
-4. 明确 upload-pack 是否允许匿名访问。
-5. receive-pack 检查 repo/path 级 push 权限。
+4. ✅ 明确 upload-pack 是否允许匿名访问：`check_upload_pack_access(git_config, auth)` 按 `git.anonymous_access`（默认 `true`，向后兼容）放行匿名 clone/fetch，关闭时无 token 返回 `ProtocolError::Forbidden`；HTTP `info/refs` upload 分支（`http.rs:53`）、`git_upload_pack`（`http.rs:217`）与 SSH（`ssh.rs:149`）共用，`mod.rs` 3 个单测锁定 allow/deny/authenticated。
+5. 🔶 receive-pack 检查 repo/path 级 push 权限：`check_push_permission(state, auth, repo_path)` 未认证（无 `username`）直接 `Forbidden`，已认证时对 `Repository(repo_path)` 走 Cedar `pushRepo` 授权（`state.entity_store` 非空时按策略裁决，为空则放行）；HTTP receive-pack 两处（`http.rs:64/355`）与 SSH（`ssh.rs:140`）均在 unpack 前调用。更细粒度的 repo/path ACL 与基于策略的 push-deny 协议层单测待后续。
 6. ✅ commit binding 使用同一 authenticated actor（`bind_commit_to_user` 读取 `auth.authenticated_user`，HTTP/SSH 路径统一）。
 
 验收标准：
 
-- HTTP push 和 SSH push 都能绑定到正确用户。
-- private repo fetch 策略明确且有测试。
-- 未授权 push 返回 401/403 或 SSH failure，不进入 unpack。
+- ✅ HTTP push 和 SSH push 都能绑定到正确用户。
+- 🔶 private repo fetch 策略明确且有测试：`check_upload_pack_access` 的匿名/关闭策略已有 3 个单测；`anonymous_access=false` 的端到端矩阵待补。
+- 🔶 未授权（未认证）push 返回 `Forbidden`，不进入 unpack（`check_push_permission` 在 unpack 前拒绝无 token 请求）；基于策略的 push-deny 协议层单测待后续。
 
 ### 阶段 5：SSH per-channel state 与 LFS hybrid 加固
 
@@ -791,7 +791,7 @@ LFS:
 | P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；HTTP branch/tag push+delete 已进入 CI；SSH push/delete 仍为手动 opt-in；后续补 streaming parser |
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
 | P1 | SSH payload 全部按 bytes 发送 | Git 协议是二进制协议，不能假设 UTF-8 |
-| P1 | 统一 HTTP/SSH auth context | push 审计、commit binding、权限检查依赖此基础 |
+| P1 | 统一 HTTP/SSH auth context | ✅ 已落地：HTTP/SSH 共用 `check_upload_pack_access`（匿名策略，可配置）+ `check_push_permission`（Cedar `pushRepo` 授权）；commit binding 绑定 authenticated actor。更细 repo/path ACL 与 push-deny 协议层单测待后续 |
 | P2 | SSH per-channel state | ✅ 已实现（2026-06-28）：`SshServer` 按 `ChannelId` 维护独立 `GitSshChannelState` |
 | P2 | LFS hybrid response 加固 | 提升 Git LFS 客户端兼容性 |
 | P3 | tree filters / promisor remote / streaming upload-pack parser | 进一步优化现代 Git 客户端和大仓库体验；shallow clone、protocol v2、`filter blob:none` 已完成基础支持 |
