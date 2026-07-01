@@ -16,6 +16,8 @@ on:
       - "scripts/git_protocol_smoke.sh"
       - "src/ceres/protocol/**"
       - "src/contract/git_protocol/**"
+      - "src/ceres/lfs/**"
+      - "src/api/router/lfs_router.rs"
       - "src/server/http_server.rs"
       - "docs/refactoring/protocol.md"
   push:
@@ -26,6 +28,8 @@ on:
       - "scripts/git_protocol_smoke.sh"
       - "src/ceres/protocol/**"
       - "src/contract/git_protocol/**"
+      - "src/ceres/lfs/**"
+      - "src/api/router/lfs_router.rs"
       - "src/server/http_server.rs"
       - "docs/refactoring/protocol.md"
 
