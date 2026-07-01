@@ -5,10 +5,9 @@ name: Git Protocol Smoke
 # CLI against a running `service http` instance, covering ls-remote, clone,
 # fetch, protocol v2 fetch, shallow clone, and blob:none partial clone.
 #
-# Only read-only cases are run (no push/delete/LFS) because push requires a
-# valid access token that is not trivially available in CI without a full
-# user-management flow.  The opt-in push/LFS cases remain available for
-# manual execution via `MONOENGINE_GIT_SMOKE_PUSH=1`.
+# CI seeds a one-off Mono access token directly into the smoke database and
+# runs the HTTP push/delete branch+tag matrix with Basic Auth.  LFS remains
+# manual because it needs git-lfs on the runner and a larger object round trip.
 
 on:
   pull_request:
@@ -111,8 +110,16 @@ jobs:
                 --vault-path config/smoke/mail/password \
                 --field value --value-stdin
 
+          smoke_git_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::${smoke_git_token}"
+          psql "${MEGA_DATABASE__DB_URL}" \
+            -v ON_ERROR_STOP=1 \
+            -v token="${smoke_git_token}" \
+            -c "INSERT INTO access_token (id, username, token, created_at) VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now())"
+
           echo "SMOKE_CONFIG_PATH=${smoke_dir}/config.toml" >> "$GITHUB_ENV"
           echo "SMOKE_BASE_DIR=${smoke_dir}/base" >> "$GITHUB_ENV"
+          echo "SMOKE_GIT_TOKEN=${smoke_git_token}" >> "$GITHUB_ENV"
 
       - name: Start service http
         working-directory: monoengine
@@ -146,14 +153,15 @@ jobs:
           done
           echo "service http is ready"
 
-      - name: Run git protocol smoke (read-only HTTP)
+      - name: Run git protocol smoke (HTTP)
         working-directory: monoengine
         run: |
           set -euo pipefail
           # The monorepo root "/" is initialized by init_monorepo during
-          # service startup and has refs/heads/main.  With anonymous_access
-          # enabled (default), read-only clone/fetch works without auth.
-          MONOENGINE_HTTP_REPO_URL="http://127.0.0.1:9000/" \
+          # service startup and has refs/heads/main.  Push/delete uses the
+          # one-off access token seeded into the smoke database above.
+          MONOENGINE_HTTP_REPO_URL="http://ci-smoke:${SMOKE_GIT_TOKEN}@127.0.0.1:9000/" \
+          MONOENGINE_GIT_SMOKE_PUSH=1 \
             bash scripts/git_protocol_smoke.sh
 
       - name: Stop service http
