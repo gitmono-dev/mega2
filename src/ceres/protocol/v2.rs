@@ -27,6 +27,7 @@ const V2_CAPABILITIES: &[&str] = &[
 
 pub fn build_v2_capability_advertisement() -> BytesMut {
     let mut buf = BytesMut::new();
+    add_pkt_line_string(&mut buf, "version 2\n".to_owned());
     for cap in V2_CAPABILITIES {
         add_pkt_line_string(&mut buf, format!("{cap}\n"));
     }
@@ -318,6 +319,7 @@ mod tests {
         let adv = build_v2_capability_advertisement();
         let adv_str = String::from_utf8_lossy(&adv);
 
+        assert!(adv_str.starts_with("000eversion 2\n"));
         assert!(adv_str.contains("agent=mega/0.1.0"));
         assert!(adv_str.contains("ls-refs"));
         assert!(adv_str.contains("fetch=shallow"));
