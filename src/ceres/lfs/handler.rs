@@ -23,8 +23,22 @@ use crate::{
     },
 };
 
+/// Namespaces an LFS lock row key by repository so that identical ref names in
+/// different repositories do not share a lock bucket. The `\u{1f}` (unit
+/// separator) cannot appear in a Git ref name, keeping the composite key
+/// unambiguous. An empty `repo` (non repo-scoped mount, e.g. `/api/v1/lfs`)
+/// preserves the legacy bare-ref key for backward compatibility.
+fn scoped_lock_ref(repo: &str, refspec: &str) -> String {
+    if repo.is_empty() {
+        refspec.to_owned()
+    } else {
+        format!("{repo}\u{1f}{refspec}")
+    }
+}
+
 pub async fn lfs_retrieve_lock(
     storage: LfsDbStorage,
+    repo: &str,
     query: LockListQuery,
 ) -> Result<LockList, GitLFSError> {
     let mut lock_list = LockList {
@@ -33,7 +47,7 @@ pub async fn lfs_retrieve_lock(
     };
     match lfs_get_filtered_locks(
         storage,
-        &query.refspec,
+        &scoped_lock_ref(repo, &query.refspec),
         &query.path,
         &query.cursor,
         &query.limit,
@@ -53,6 +67,7 @@ pub async fn lfs_retrieve_lock(
 
 pub async fn lfs_verify_lock(
     storage: LfsDbStorage,
+    repo: &str,
     req: VerifiableLockRequest,
 ) -> Result<VerifiableLockList, MegaError> {
     let mut limit = req.limit.unwrap_or(0);
@@ -61,7 +76,7 @@ pub async fn lfs_verify_lock(
     }
     let res = lfs_get_filtered_locks(
         storage,
-        &req.refs.name,
+        &scoped_lock_ref(repo, &req.refs.name),
         "",
         &req.cursor.clone().unwrap_or("".to_string()).to_string(),
         &limit.to_string(),
@@ -90,15 +105,14 @@ pub async fn lfs_verify_lock(
     Ok(lock_list)
 }
 
-pub async fn lfs_create_lock(storage: LfsDbStorage, req: LockRequest) -> Result<Lock, GitLFSError> {
-    let res = lfs_get_filtered_locks(
-        storage.clone(),
-        &req.refs.name,
-        &req.path.to_string(),
-        "",
-        "1",
-    )
-    .await;
+pub async fn lfs_create_lock(
+    storage: LfsDbStorage,
+    repo: &str,
+    req: LockRequest,
+) -> Result<Lock, GitLFSError> {
+    let lock_ref = scoped_lock_ref(repo, &req.refs.name);
+    let res =
+        lfs_get_filtered_locks(storage.clone(), &lock_ref, &req.path.to_string(), "", "1").await;
 
     match res {
         Ok((locks, _)) => {
@@ -130,7 +144,7 @@ pub async fn lfs_create_lock(storage: LfsDbStorage, req: LockRequest) -> Result<
         },
     };
 
-    match lfs_add_lock(storage.clone(), &req.refs.name, vec![lock.clone()]).await {
+    match lfs_add_lock(storage.clone(), &lock_ref, vec![lock.clone()]).await {
         Ok(_) => Ok(lock),
         Err(_) => Err(GitLFSError::GeneralError(
             "Failed when adding locks!".to_string(),
@@ -140,6 +154,7 @@ pub async fn lfs_create_lock(storage: LfsDbStorage, req: LockRequest) -> Result<
 
 pub async fn lfs_delete_lock(
     storage: LfsDbStorage,
+    repo: &str,
     id: &str,
     unlock_request: UnlockRequest,
 ) -> Result<Lock, GitLFSError> {
@@ -148,7 +163,7 @@ pub async fn lfs_delete_lock(
     }
     let res = delete_lock(
         storage,
-        &unlock_request.refs.name,
+        &scoped_lock_ref(repo, &unlock_request.refs.name),
         None,
         id,
         unlock_request.force.unwrap_or(false),
@@ -652,6 +667,67 @@ async fn delete_lock(
 mod tests {
     use super::*;
     use crate::ceres::lfs::lfs_structs::{Action, Ref, ResCondition, ResponseObject};
+
+    #[tokio::test]
+    async fn locks_are_namespaced_by_repository() {
+        use crate::ceres::lfs::lfs_structs::{LockListQuery, LockRequest};
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let lfs = storage.lfs_db_storage();
+
+        let mk_lock_req = || LockRequest {
+            path: "assets/model.bin".to_string(),
+            refs: Ref {
+                name: "refs/heads/main".to_string(),
+            },
+        };
+        let list_query = |refspec: &str| LockListQuery {
+            path: String::new(),
+            id: String::new(),
+            cursor: String::new(),
+            limit: String::new(),
+            refspec: refspec.to_string(),
+        };
+
+        // Lock created under repo A.
+        lfs_create_lock(lfs.clone(), "/org/repo-a.git", mk_lock_req())
+            .await
+            .expect("create lock in repo A");
+
+        // Visible under repo A + same ref.
+        let a = lfs_retrieve_lock(
+            lfs.clone(),
+            "/org/repo-a.git",
+            list_query("refs/heads/main"),
+        )
+        .await
+        .expect("list repo A");
+        assert_eq!(a.locks.len(), 1);
+        assert_eq!(a.locks[0].path, "assets/model.bin");
+
+        // The identical ref name in a different repo must not see repo A's lock...
+        let b = lfs_retrieve_lock(
+            lfs.clone(),
+            "/org/repo-b.git",
+            list_query("refs/heads/main"),
+        )
+        .await
+        .expect("list repo B");
+        assert!(b.locks.is_empty());
+
+        // ...and locking the same path/ref there must not collide with repo A.
+        lfs_create_lock(lfs.clone(), "/org/repo-b.git", mk_lock_req())
+            .await
+            .expect("create lock in repo B without cross-repo collision");
+
+        // The empty repo (legacy /api/v1/lfs mount) uses the bare ref key and
+        // stays isolated from the repo-scoped rows above.
+        let legacy = lfs_retrieve_lock(lfs.clone(), "", list_query("refs/heads/main"))
+            .await
+            .expect("list legacy mount");
+        assert!(legacy.locks.is_empty());
+    }
 
     #[test]
     fn response_object_download_existing() {

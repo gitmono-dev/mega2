@@ -655,33 +655,44 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
 }
 
 fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
-    let full_path = req.uri().path();
+    // Capture the repository path prefix (the segment before `/info/lfs/`)
+    // before it is stripped for routing, so LFS handlers can namespace locks
+    // per repository. Empty when the request carries no repo prefix.
+    let (repo_prefix, rewrite_target) = {
+        let full_path = req.uri().path();
+        match full_path.rfind("/info/lfs/") {
+            Some(pos) => {
+                let lfs_subpath = &full_path[pos..];
+                let target = if let Some(query) = req.uri().query() {
+                    format!("{lfs_subpath}?{query}")
+                } else {
+                    lfs_subpath.to_owned()
+                };
+                (full_path[..pos].to_owned(), Some(target))
+            }
+            None => (String::new(), None),
+        }
+    };
 
-    if let Some(pos) = full_path.rfind("/info/lfs/") {
-        let lfs_subpath = &full_path[pos..];
+    req.extensions_mut()
+        .insert(lfs_router::LfsRepoContext(repo_prefix));
 
-        let new_path_and_query = if let Some(query) = req.uri().query() {
-            format!("{}?{}", lfs_subpath, query)
-        } else {
-            lfs_subpath.to_owned()
-        };
-
-        let new_uri = match Uri::builder().path_and_query(&new_path_and_query).build() {
-            Ok(uri) => uri,
+    if let Some(new_path_and_query) = rewrite_target {
+        match Uri::builder().path_and_query(&new_path_and_query).build() {
+            Ok(uri) => {
+                tracing::debug!("rewrite: old uri {:?}", req.uri());
+                *req.uri_mut() = uri;
+                tracing::debug!("rewrite: new uri {:?}", req.uri());
+            }
             Err(e) => {
+                // Leave the URI unchanged and let downstream handlers deal with it.
                 tracing::warn!(
                     "Failed to rewrite LFS URI: {}, error: {}",
                     new_path_and_query,
                     e
                 );
-                // Return the request unchanged, let downstream handlers deal with it
-                return req;
             }
-        };
-
-        tracing::debug!("rewrite: old uri {:?}", req.uri());
-        *req.uri_mut() = new_uri;
-        tracing::debug!("rewrite: new uri {:?}", req.uri());
+        }
     }
     req
 }

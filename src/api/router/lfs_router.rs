@@ -42,7 +42,7 @@
 //! Ensure proper authentication and authorization mechanisms are implemented
 //! when using these handlers in a web application to prevent unauthorized access.
 use axum::{
-    Json,
+    Extension, Json,
     body::Body,
     extract::{Path, Query, State},
     http::{
@@ -74,6 +74,23 @@ use crate::{
 
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 const LFS_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// The repository path prefix of an LFS request (the segment before
+/// `/info/lfs/`), captured by `rewrite_lfs_request_uri` before that prefix is
+/// stripped for routing. Empty when the request did not carry a repo prefix
+/// (e.g. the internal `/api/v1/lfs` mount). Used to namespace LFS locks per
+/// repository so identical ref names in different repos do not collide.
+#[derive(Clone, Debug, Default)]
+pub struct LfsRepoContext(pub String);
+
+/// Resolves the repo path prefix from the optional request extension. The
+/// extension is inserted by `rewrite_lfs_request_uri` for every request served
+/// through the HTTP server, but the extractor is optional so that handlers
+/// reached without that layer (e.g. direct tests of `app()`) degrade to the
+/// empty repo (legacy bare-ref lock key) instead of returning `500`.
+fn lfs_repo_path(ctx: Option<Extension<LfsRepoContext>>) -> String {
+    ctx.map(|Extension(c)| c.0).unwrap_or_default()
+}
 
 pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
@@ -252,14 +269,16 @@ async fn enforce_lfs_access(
 )]
 pub async fn list_locks(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
     headers: HeaderMap,
     Query(query): Query<LockListQuery>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
         return Ok(resp);
     }
+    let repo = lfs_repo_path(repo);
     let result: Result<LockList, GitLFSError> =
-        handler::lfs_retrieve_lock(state.storage.lfs_db_storage(), query).await;
+        handler::lfs_retrieve_lock(state.storage.lfs_db_storage(), &repo, query).await;
     match result {
         Ok(lock_list) => {
             let body = serde_json::to_string(&lock_list).unwrap_or_default();
@@ -290,13 +309,15 @@ pub async fn list_locks(
 )]
 pub async fn list_locks_for_verification(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
     headers: HeaderMap,
     Json(json): Json<VerifiableLockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
         return Ok(resp);
     }
-    let result = handler::lfs_verify_lock(state.storage.lfs_db_storage(), json).await;
+    let repo = lfs_repo_path(repo);
+    let result = handler::lfs_verify_lock(state.storage.lfs_db_storage(), &repo, json).await;
     match result {
         Ok(lock_list) => {
             let body = serde_json::to_string(&lock_list).unwrap_or_default();
@@ -327,13 +348,15 @@ pub async fn list_locks_for_verification(
 )]
 pub async fn create_lock(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
     headers: HeaderMap,
     Json(json): Json<LockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
         return Ok(resp);
     }
-    let result = handler::lfs_create_lock(state.storage.lfs_db_storage(), json).await;
+    let repo = lfs_repo_path(repo);
+    let result = handler::lfs_create_lock(state.storage.lfs_db_storage(), &repo, json).await;
     match result {
         Ok(lock) => {
             let lock_response = LockResponse {
@@ -372,13 +395,15 @@ pub async fn create_lock(
 pub async fn delete_lock(
     state: State<MonoApiServiceState>,
     Path(id): Path<String>,
+    repo: Option<Extension<LfsRepoContext>>,
     headers: HeaderMap,
     Json(json): Json<UnlockRequest>,
 ) -> Result<Response, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
         return Ok(resp);
     }
-    let result = handler::lfs_delete_lock(state.storage.lfs_db_storage(), &id, json).await;
+    let repo = lfs_repo_path(repo);
+    let result = handler::lfs_delete_lock(state.storage.lfs_db_storage(), &repo, &id, json).await;
 
     match result {
         Ok(lock) => {

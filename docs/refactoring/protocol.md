@@ -756,14 +756,14 @@ LFS:
 2. `channel_eof` 只处理当前 channel。
 3. ✅ `git-lfs-transfer` 通过 SSH stderr extended-data 返回规范 unsupported 错误，并通过 channel failure 触发客户端 fallback。
 4. ✅ `git-lfs-authenticate` / `git-lfs-transfer` 已校验 upload/download operation；`git-lfs-authenticate` 仍返回同一 HTTP LFS endpoint，后续如需按 operation 拆分 header/URL 再补。
-5. 🔶 LFS HTTP endpoint 认证上下文已接入；repo path 绑定与跨 repo lock 隔离仍待后续。HTTP LFS object/lock 端点原先完全匿名（未套 `cedar_guard`），现按与 Git smart-protocol 同一套 token 认证语义收敛（`src/api/router/lfs_router.rs`）：读操作（`objects/batch` 的 `download`、object `GET`、lock `list`/`verify`）遵循 `git.anonymous_access`（默认 `true`，与 upload-pack 一致，匿名 clone/pull 不受影响），写操作（`objects/batch` 的 `upload`、object `PUT`、lock `create`/`unlock`）始终要求有效 mono access token（Bearer 或 Basic 密码位，与 receive-pack 一致），未认证写返回带 `WWW-Authenticate` 的 `401`。纯策略函数 `lfs_access_allowed` 与 `enforce_lfs_access` 收敛决策，`lfs_router` 单测锁定策略矩阵、token 解析与 401 challenge。**repo path 绑定（`rewrite_lfs_request_uri` 当前会丢弃 `/info/lfs` 之前的 repo 前缀）与 lock 的跨 repo 物理隔离仍为后续切片。**
+5. ✅ LFS HTTP endpoint 已绑定认证上下文与 repo path。HTTP LFS object/lock 端点原先完全匿名（未套 `cedar_guard`），现按与 Git smart-protocol 同一套 token 认证语义收敛（`src/api/router/lfs_router.rs`）：读操作（`objects/batch` 的 `download`、object `GET`、lock `list`/`verify`）遵循 `git.anonymous_access`（默认 `true`，与 upload-pack 一致，匿名 clone/pull 不受影响），写操作（`objects/batch` 的 `upload`、object `PUT`、lock `create`/`unlock`）始终要求有效 mono access token（Bearer 或 Basic 密码位，与 receive-pack 一致），未认证写返回带 `WWW-Authenticate` 的 `401`。纯策略函数 `lfs_access_allowed` 与 `enforce_lfs_access` 收敛决策，`lfs_router` 单测锁定策略矩阵、token 解析与 401 challenge。**repo path 绑定**：`rewrite_lfs_request_uri` 在剥离 `/info/lfs` 前缀前先把 repo 前缀存入 `LfsRepoContext` 请求扩展，lock 端点据此把锁行 key 命名空间化为 `{repo}\u{1f}{ref}`（`scoped_lock_ref`），使不同 repo 下同名 ref 的锁不再共用一行；object 由 OID 内容寻址，天然跨 repo 安全，无需隔离。空 repo（`/api/v1/lfs` 内部挂载）回退到裸 ref key 保持向后兼容。
 
 验收标准：
 
 - ✅ 单 SSH connection 多 channel 不串状态（`SshServer` 已按 `ChannelId` 隔离 `GitSshChannelState`）。
 - Git LFS 客户端能稳定 fallback 到 HTTP LFS。
 - ✅ 未认证的 LFS 写操作（upload / lock create-unlock）返回 401，不再匿名可写；读操作遵循 `anonymous_access` 策略（由 `lfs_access_policy_matrix` 锁定）。
-- LFS object/lock 操作不会跨 repo 混淆（repo path 绑定后补齐）。
+- ✅ LFS lock 操作不会跨 repo 混淆：锁行 key 按 repo 命名空间化（由 `locks_are_namespaced_by_repository` 锁定）；object 内容寻址（OID）天然跨 repo 安全。
 
 ### 阶段 6：upload-pack 兼容性扩展
 
