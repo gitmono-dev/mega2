@@ -113,14 +113,13 @@ push_branch_smoke() {
   local branch="monoengine-smoke-$(date +%s)-$$"
   local cleanup_status=0
   rm -rf "$src"
-  mkdir -p "$src" || return
-  git -C "$src" init >/dev/null || return
+  git_case clone "$remote_url" "$src" >/dev/null || return
+  git -C "$src" checkout -b "$branch" >/dev/null || return
   git -C "$src" config user.name "Monoengine Smoke" || return
   git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
   printf 'monoengine git smoke %s\n' "$branch" >"$src/smoke.txt"
   git -C "$src" add smoke.txt || return
   git -C "$src" commit -m "monoengine git smoke" >/dev/null || return
-  git -C "$src" remote add origin "$remote_url" || return
   git -C "$src" push origin "HEAD:refs/heads/$branch" || return
   git -C "$src" push origin ":refs/heads/$branch" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
@@ -136,15 +135,13 @@ push_tag_smoke() {
   local tag="monoengine-smoke-tag-$(date +%s)-$$"
   local cleanup_status=0
   rm -rf "$src"
-  mkdir -p "$src" || return
-  git -C "$src" init >/dev/null || return
+  git_case clone "$remote_url" "$src" >/dev/null || return
   git -C "$src" config user.name "Monoengine Smoke" || return
   git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
   printf 'monoengine git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
   git -C "$src" add smoke-tag.txt || return
   git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return
   git -C "$src" tag "$tag" || return
-  git -C "$src" remote add origin "$remote_url" || return
   git -C "$src" push origin "refs/tags/$tag" || return
   git -C "$src" push origin ":refs/tags/$tag" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then

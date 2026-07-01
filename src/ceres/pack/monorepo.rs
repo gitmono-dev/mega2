@@ -618,9 +618,15 @@ impl RepoHandler for MonoRepo {
     }
 
     async fn update_refs(&self, refs: &RefCommand) -> Result<(), GitError> {
-        self.apply_cl_mega_ref_for_push_command(refs, None)
-            .await
-            .map_err(GitError::from)
+        if refs.ref_type == RefTypeEnum::Tag {
+            self.apply_tag_mega_ref_for_push_command(refs)
+                .await
+                .map_err(GitError::from)
+        } else {
+            self.apply_cl_mega_ref_for_push_command(refs, None)
+                .await
+                .map_err(GitError::from)
+        }
     }
 
     async fn check_commit_exist(&self, hash: &str) -> bool {
@@ -818,12 +824,12 @@ impl MonoRepo {
     ) -> Result<(), MegaError> {
         let storage = self.storage.mono_storage();
         let current_commit = self.current_commit.read().await;
-        let cl_link = self.fetch_or_new_cl_link().await?;
-        let ref_name = utils::cl_ref_name(&cl_link);
-
         let Some(c) = &*current_commit else {
             return Ok(());
         };
+        let from_hash = Self::effective_from_hash(&self.from_hash, c)?;
+        let cl_link = self.fetch_or_new_cl_link(&from_hash).await?;
+        let ref_name = utils::cl_ref_name(&cl_link);
 
         let existing = match txn {
             Some(t) => storage.get_ref_by_name_in_txn(&ref_name, t).await?,
@@ -847,18 +853,65 @@ impl MonoRepo {
         Ok(())
     }
 
+    async fn apply_tag_mega_ref_for_push_command(&self, cmd: &RefCommand) -> Result<(), MegaError> {
+        let storage = self.storage.mono_storage();
+        let existing = storage.get_ref_by_name(&cmd.ref_name).await?;
+        if cmd.new_id == ZERO_ID {
+            if let Some(existing) = existing {
+                storage.remove_ref(existing).await?;
+            }
+            return Ok(());
+        }
+
+        let Some(commit) = storage.get_commit_by_hash(&cmd.new_id).await? else {
+            return Err(MegaError::Other(format!(
+                "Target commit '{}' not found for tag '{}'",
+                cmd.new_id, cmd.ref_name
+            )));
+        };
+
+        if let Some(mut tag_ref) = existing {
+            tag_ref.ref_commit_hash = cmd.new_id.clone();
+            tag_ref.ref_tree_hash = commit.tree;
+            storage.update_ref(tag_ref, None).await?;
+        } else {
+            let new_ref = mega_refs::Model::new(
+                &self.path,
+                cmd.ref_name.clone(),
+                cmd.new_id.clone(),
+                commit.tree,
+                false,
+            );
+            storage.save_refs(new_ref, None).await?;
+        }
+        Ok(())
+    }
+
     /// CL / conversations / build / code-review hooks after branch `mega_refs` are committed.
     async fn run_mono_post_push_pipeline(&self) -> Result<(), MegaError> {
+        let cmds = self
+            .command_list
+            .lock()
+            .expect("command_list lock poisoned")
+            .clone();
+        if !cmds.iter().any(|cmd| cmd.ref_type == RefTypeEnum::Branch) {
+            return Ok(());
+        }
+        let current_commit = self.current_commit.read().await;
+        let Some(current_commit) = &*current_commit else {
+            return Ok(());
+        };
+        let from_hash = Self::effective_from_hash(&self.from_hash, current_commit)?;
         let username = self.username();
         let mono_api_service = self.into();
         let editor = OnpushCodeEdit::from(
             self.path.to_str().unwrap(),
             &self.base_branch,
-            &self.from_hash,
+            &from_hash,
             &mono_api_service,
         );
         let cl = editor
-            .update_or_create_cl(&self.storage, &self.from_hash, &self.to_hash, &username)
+            .update_or_create_cl(&self.storage, &from_hash, &self.to_hash, &username)
             .await?;
         self.traverses_tree_and_update_filepath().await?;
         if self.bellatrix.enable_build() {
@@ -951,7 +1004,20 @@ impl MonoRepo {
 
         Ok(())
     }
-    async fn fetch_or_new_cl_link(&self) -> Result<String, MegaError> {
+    fn effective_from_hash(from_hash: &str, current_commit: &Commit) -> Result<String, MegaError> {
+        if from_hash != ZERO_ID {
+            return Ok(from_hash.to_owned());
+        }
+        current_commit
+            .parent_commit_ids
+            .first()
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                MegaError::Other("Can not init directory under monorepo directory!".to_string())
+            })
+    }
+
+    async fn fetch_or_new_cl_link(&self, from_hash: &str) -> Result<String, MegaError> {
         let storage = self.storage.cl_storage();
         let path_str = self.path.to_str().unwrap();
         let cl_link = match storage
@@ -960,7 +1026,7 @@ impl MonoRepo {
         {
             Some(cl) => cl.link.clone(),
             None => {
-                if self.from_hash == "0".repeat(40) {
+                if from_hash == ZERO_ID {
                     return Err(MegaError::Other(
                         "Can not init directory under monorepo directory!".to_string(),
                     ));
@@ -1136,5 +1202,73 @@ impl MonoRepo {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            commit::Commit,
+            signature::{Signature, SignatureType},
+        },
+    };
+
+    use super::MonoRepo;
+    use crate::common::utils::ZERO_ID;
+
+    fn test_signature(signature_type: SignatureType) -> Signature {
+        Signature::new(
+            signature_type,
+            "Monoengine Test".to_string(),
+            "monoengine-test@example.invalid".to_string(),
+        )
+    }
+
+    fn test_commit(parent_commit_ids: Vec<ObjectHash>) -> Commit {
+        let tree_id = ObjectHash::from_str("27dd8d4cf39f3868c6eee38b601bc9e9939304f5").unwrap();
+        Commit::new(
+            test_signature(SignatureType::Author),
+            test_signature(SignatureType::Committer),
+            tree_id,
+            parent_commit_ids,
+            "test commit",
+        )
+    }
+
+    #[test]
+    fn effective_from_hash_keeps_existing_ref_old_id() {
+        let old_id = "119bc457cb05b52dfb0d6b14f66d9a8a52d09e25";
+        let parent = ObjectHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let commit = test_commit(vec![parent]);
+
+        let effective = MonoRepo::effective_from_hash(old_id, &commit).unwrap();
+
+        assert_eq!(effective, old_id);
+    }
+
+    #[test]
+    fn effective_from_hash_uses_first_parent_for_new_branch_push() {
+        let parent = ObjectHash::from_str("119bc457cb05b52dfb0d6b14f66d9a8a52d09e25").unwrap();
+        let commit = test_commit(vec![parent]);
+
+        let effective = MonoRepo::effective_from_hash(ZERO_ID, &commit).unwrap();
+
+        assert_eq!(effective, parent.to_string());
+    }
+
+    #[test]
+    fn effective_from_hash_rejects_orphan_new_branch_push() {
+        let commit = test_commit(Vec::new());
+
+        let err = MonoRepo::effective_from_hash(ZERO_ID, &commit).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Can not init directory under monorepo directory")
+        );
     }
 }
