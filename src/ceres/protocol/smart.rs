@@ -321,6 +321,11 @@ impl SmartSession {
             let pkt_line = try_read_pkt_line(&mut protocol_bytes)?;
             match pkt_line {
                 PktLine::Flush => {
+                    if commands.is_empty() {
+                        return Err(ProtocolError::InvalidInput(
+                            "receive-pack request contains no commands".to_owned(),
+                        ));
+                    }
                     if !Self::is_delete_only_push(&commands) {
                         if protocol_bytes.is_empty() {
                             return Err(ProtocolError::InvalidInput(
@@ -1018,6 +1023,25 @@ pub mod test {
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert!(err.to_string().contains("does not start with PACK"));
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_rejects_empty_command_list() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+        request.extend_from_slice(b"PACKpayload");
+
+        let err = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("no commands"));
     }
 
     #[test]

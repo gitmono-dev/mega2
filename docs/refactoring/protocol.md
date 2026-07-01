@@ -6,7 +6,7 @@
 
 > **与其他模块的依赖**：Git Protocol 改进与 config/vault 的认证统一相关。当 config.md 阶段 2（CLI LoadMode）完成后，可统一 HTTP/SSH 的认证上下文设计。集成测试参见 **`integration.md`**。
 
-## 事实校准（2026-06-14）
+## 事实校准（2026-06-14，更新 2026-07-01）
 
 > 本文档中的代码引用已对照当前 `src/` 重新核对。当前 Git protocol 实现处于基础阶段，具有完整的功能框架但多处缺乏错误处理和兼容性完善：
 >
@@ -23,7 +23,7 @@
 > **2026-06-23 更新 3**：已完成 receive-pack `PACK` magic 分界止血：
 > - HTTP / SSH receive-pack 不再搜索 `PACK` 字节序列，而是复用 `SmartSession::split_receive_pack_request` 按 pkt-line command list 的 flush-pkt 分割 commands 与 pack bytes。
 > - 新增单元测试覆盖 capability 中出现 `PACK` 不误切分，以及缺少 flush-pkt 返回 `ProtocolError::InvalidInput`。
-> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义仍为后续。
+> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader 仍为后续，delete-only push 语义与空命令列表校验已加固。
 > - **2026-06-28 更新**：SSH per-channel state 已实现。`SshServer` 不再维护连接级 `smart_protocol` / `data_combined`，而是按 `ChannelId` 维护独立的 `GitSshChannelState`，每个 channel 拥有独立的 `SmartSession` 与 receive-pack 缓冲区。`capability advertise` 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
 >
 > **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
@@ -55,6 +55,8 @@
 > **2026-06-30 更新 5**：monorepo pack generation 的 encoder startup 与 commit entry send 完成 panic 止血。`MonoRepo::{shallow_pack, filtered_pack, incremental_pack}` 不再 unwrap `PackEncoder::encode_async` 或 commit entry channel send failure，统一映射为 `MegaError` / `GitError` 向上传播。
 >
 > **2026-06-30 更新 6**：import repo pack generation 的 encoder startup 与 commit entry send 完成同类 panic 止血。`ImportRepo::incremental_pack` 不再 unwrap `PackEncoder::encode_async` 或 commit entry channel send failure，统一映射为 `MegaError` / `GitError` 向上传播。
+>
+> **2026-07-01 更新**：receive-pack splitter 继续加固空命令列表场景。`SmartSession::split_receive_pack_request` 在 flush-pkt 后若 commands 为空（例如仅有 `0000` 后直接跟 `PACK` payload）会返回 `ProtocolError::InvalidInput`，避免无命令的 receive-pack 请求进入后续 ref 处理；由 `split_receive_pack_request_rejects_empty_command_list` 锁定。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -74,7 +76,7 @@
 |-----------|--------|-------------|
 | HTTP GET /info/refs | 已实现（含 protocol v2 advertisement） | query 已要求 exactly one `service=...`；缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；`Git-Protocol: version=2` 会返回 v2 capabilities；**真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖（2026-06-30）**。 |
 | HTTP POST upload-pack | 已实现（含 shallow / v2 fetch / blob:none） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；protocol v1 支持 `deepen`/`deepen-relative`，v2 支持 `ls-refs`、`fetch`、`deepen`、`filter blob:none`；仍不支持 streaming request parser。 |
-| HTTP POST receive-pack | 已实现（delete-only 已支持） | command pkt-line malformed input 与非 delete 缺失 pack payload 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；delete-only push 已支持（跳过 unpack）；仍需 streaming parser 和更完整真实 Git CLI 矩阵。 |
+| HTTP POST receive-pack | 已实现（delete-only 已支持） | command pkt-line malformed input、非 delete 缺失 pack payload、空命令列表与无效 `PACK` magic 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；delete-only push 已支持（跳过 unpack）；仍需 streaming parser 和更完整真实 Git CLI 矩阵。 |
 | SSH git-upload-pack | 已实现（per-channel state + protocol v2） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区；`GIT_PROTOCOL=version=2` 可启用 v2 `ls-refs` / `fetch`。 |
 | SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
@@ -402,6 +404,8 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
   `ProtocolError::InvalidInput`。
 - 非 delete receive-pack 请求的 pack payload 不以 `PACK` magic 开头时会返回
   `ProtocolError::InvalidInput`。
+- flush-pkt 前没有任何 command pkt-line（空命令列表）的 receive-pack 请求会返回
+  `ProtocolError::InvalidInput`，避免无命令请求进入 ref 处理。
 
 仍待后续处理：
 
@@ -668,13 +672,15 @@ LFS:
 2. 已完成首批：flush-pkt 后剩余 bytes 作为 pack stream。
 3. 后续：实现 streaming pkt-line reader，避免完整 body / channel 数据缓冲。
 4. ✅ 支持无 pack 的 delete-only push：`SmartSession::is_delete_only_push` 检测全部为 delete 的 command list，`git_receive_pack_stream` 跳过 `unpack_stream`/`receiver_handler`，`unpack_result` 视为 Ok，直接进入 ref 处理与 report-status。
-5. 已完成首批：HTTP 和 SSH receive-pack 共用同一 parser。
+5. ✅ 空命令列表校验：splitter 在 flush-pkt 前无 command 时返回 `ProtocolError::InvalidInput`，避免无命令请求进入 ref 处理。
+6. 已完成首批：HTTP 和 SSH receive-pack 共用同一 parser。
 
 验收标准：
 
 - 已覆盖：command payload / capability 中出现 `PACK` 不误切分。
 - 待覆盖：`PACK` 跨 chunk 不影响 push（需要 streaming parser 或真实 Git CLI 矩阵）。
 - ✅ `git push --delete` 可正常返回 report-status（delete-only 跳过 unpack，由 `is_delete_only_push_detects_pure_delete_vs_mixed` 锁定）。
+- ✅ 空命令列表返回协议错误（由 `split_receive_pack_request_rejects_empty_command_list` 锁定）。
 - malformed command list 返回协议错误。
 
 ### 阶段 3：capability truth table 与 advertise 收敛
