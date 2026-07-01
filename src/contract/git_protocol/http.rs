@@ -278,9 +278,27 @@ async fn handle_v2_upload_pack(
                 v2::handle_v2_fetch(session, state, body).await?;
 
             let body_stream = async_stream::stream! {
+                let mut protocol_buf = protocol_buf;
+                v2::add_packfile_section_header(&mut protocol_buf);
                 yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
                 while let Some(chunk) = send_pack_data.next().await {
-                    yield Ok::<_, Infallible>(Bytes::from(chunk));
+                    let mut reader = chunk.as_slice();
+                    loop {
+                        let mut temp = BytesMut::new();
+                        temp.reserve(65500);
+                        let length = match reader.read_buf(&mut temp).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::error!(error = %e, "read error in v2 upload-pack sideband stream");
+                                break;
+                            }
+                        };
+                        if length == 0 {
+                            break;
+                        }
+                        let bytes_out = v2::build_packfile_data_packet(temp, length);
+                        yield Ok::<_, Infallible>(bytes_out.freeze());
+                    }
                 }
                 let bytes_out = Bytes::from_static(smart::PKT_LINE_END_MARKER);
                 yield Ok::<_, Infallible>(bytes_out);

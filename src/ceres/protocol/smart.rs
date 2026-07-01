@@ -28,6 +28,7 @@ pub const SP: char = ' ';
 const NUL: char = '\0';
 
 pub const PKT_LINE_END_MARKER: &[u8; 4] = b"0000";
+pub const PKT_LINE_DELIMITER: &[u8; 4] = b"0001";
 
 // see https://git-scm.com/docs/protocol-capabilities
 // Only advertise capabilities that are parsed, acted on, and covered by tests.
@@ -838,8 +839,7 @@ pub mod test {
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert!(
-            err.to_string().contains("reserved")
-                || err.to_string().contains("smaller than header")
+            err.to_string().contains("reserved") || err.to_string().contains("smaller than header")
         );
         assert_eq!(&bytes[..], b"0003want");
     }

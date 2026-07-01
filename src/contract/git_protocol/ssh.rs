@@ -552,10 +552,28 @@ async fn handle_v2_upload_pack_ssh(
                     }
                 };
 
+            let mut protocol_buf = protocol_buf;
+            v2::add_packfile_section_header(&mut protocol_buf);
             let _ = session.data(channel, protocol_buf.to_vec());
 
             while let Some(chunk) = send_pack_data.next().await {
-                let _ = session.data(channel, chunk);
+                let mut reader = chunk.as_slice();
+                loop {
+                    let mut temp = BytesMut::new();
+                    temp.reserve(65500);
+                    let length = match reader.read_buf(&mut temp).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::error!(error = %e, "read error in v2 upload-pack stream");
+                            break;
+                        }
+                    };
+                    if length == 0 {
+                        break;
+                    }
+                    let bytes_out = v2::build_packfile_data_packet(temp, length);
+                    let _ = session.data(channel, bytes_out.to_vec());
+                }
             }
             let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
         }

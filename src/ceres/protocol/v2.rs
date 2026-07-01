@@ -257,11 +257,34 @@ pub async fn handle_v2_fetch(
             .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?
     };
 
-    for shallow in &shallow_commits {
-        add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
-    }
+    add_shallow_info_section(&mut protocol_buf, &shallow_commits);
 
     Ok((pack_data, protocol_buf))
+}
+
+pub fn add_shallow_info_section(buf: &mut BytesMut, shallow_commits: &[String]) {
+    if shallow_commits.is_empty() {
+        return;
+    }
+
+    add_pkt_line_string(buf, "shallow-info\n".to_owned());
+    for shallow in shallow_commits {
+        add_pkt_line_string(buf, format!("shallow {shallow}\n"));
+    }
+    buf.put(Bytes::from_static(smart::PKT_LINE_DELIMITER));
+}
+
+pub fn add_packfile_section_header(buf: &mut BytesMut) {
+    add_pkt_line_string(buf, "packfile\n".to_owned());
+}
+
+pub fn build_packfile_data_packet(from_bytes: BytesMut, length: usize) -> BytesMut {
+    let mut to_bytes = BytesMut::new();
+    let length = length + 5;
+    to_bytes.put(Bytes::from(format!("{length:04x}")));
+    to_bytes.put_u8(crate::ceres::protocol::SideBind::PackfileData.value());
+    to_bytes.put(from_bytes);
+    to_bytes
 }
 
 pub fn parse_v2_command(request: &mut Bytes) -> Result<(String, BytesMut), ProtocolError> {
@@ -362,5 +385,36 @@ mod tests {
 
         let err = parse_v2_command(&mut buf.freeze()).unwrap_err();
         assert!(err.to_string().contains("missing command"));
+    }
+
+    #[test]
+    fn add_packfile_section_header_writes_pkt_line_header() {
+        let mut buf = BytesMut::new();
+        add_packfile_section_header(&mut buf);
+
+        assert_eq!(&buf[..], b"000dpackfile\n");
+    }
+
+    #[test]
+    fn add_shallow_info_section_writes_header_entries_and_delim() {
+        let mut buf = BytesMut::new();
+        add_shallow_info_section(&mut buf, &["1234567890abcdef".to_owned()]);
+
+        assert_eq!(
+            &buf[..],
+            b"0011shallow-info\n001dshallow 1234567890abcdef\n0001"
+        );
+    }
+
+    #[test]
+    fn build_packfile_data_packet_wraps_pack_bytes_in_sideband_packet() {
+        let payload = BytesMut::from(&b"PACKpayload"[..]);
+        let packet = build_packfile_data_packet(payload.clone(), payload.len());
+
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(b"0010");
+        expected.put_u8(1);
+        expected.extend_from_slice(&payload);
+        assert_eq!(&packet[..], &expected[..]);
     }
 }

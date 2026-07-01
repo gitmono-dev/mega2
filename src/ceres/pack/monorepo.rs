@@ -11,19 +11,20 @@ use std::{
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use git_internal::{
     errors::GitError,
     hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
-            ObjectTrait, commit::Commit, signature::Signature, tree::Tree, types::ObjectType,
+            ObjectTrait, blob::Blob, commit::Commit, signature::Signature, tree::Tree,
+            types::ObjectType,
         },
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
-use orbit_api::object_storage::MultiObjectByteStream;
+use orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 use sea_orm::DatabaseTransaction;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -367,6 +368,9 @@ impl RepoHandler for MonoRepo {
             .into_iter()
             .map(Commit::from_mega_model)
             .collect();
+        if want_commits.is_empty() {
+            return self.direct_object_pack(want).await;
+        }
         let mut traversal_list: Vec<Commit> = want_commits.clone();
 
         while let Some(temp) = traversal_list.pop() {
@@ -472,6 +476,9 @@ impl RepoHandler for MonoRepo {
             .into_iter()
             .map(Commit::from_mega_model)
             .collect();
+        if want_commits.is_empty() {
+            return self.direct_object_pack(want).await;
+        }
         let mut traversal_list: Vec<Commit> = want_commits.clone();
 
         // traverse commit's all parents to find the commit that client does not have
@@ -689,6 +696,104 @@ impl RepoHandler for MonoRepo {
 }
 
 impl MonoRepo {
+    async fn direct_object_pack(
+        &self,
+        want: Vec<String>,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.mono_storage();
+
+        let tree_models = storage
+            .get_trees_by_hashes(want.clone())
+            .await
+            .map_err(|e| GitError::CustomError(format!("tree lookup failed: {e}")))?;
+        let blob_models = storage
+            .get_mega_blobs_by_hashes(want)
+            .await
+            .map_err(|e| GitError::CustomError(format!("blob lookup failed: {e}")))?;
+
+        let obj_num = tree_models.len() + blob_models.len();
+        if obj_num == 0 {
+            return Err(GitError::CustomError(
+                "requested objects were not found".to_owned(),
+            ));
+        }
+
+        let blob_hashes = blob_models
+            .iter()
+            .map(|blob| blob.blob_id.clone())
+            .collect::<Vec<_>>();
+        let blob_meta = blob_models
+            .into_iter()
+            .map(|blob| {
+                (
+                    blob.blob_id.clone(),
+                    EntryMeta {
+                        pack_id: Some(blob.pack_id.clone()),
+                        pack_offset: Some(blob.pack_offset as usize),
+                        file_path: Some(blob.file_path.clone()),
+                        is_delta: Some(blob.is_delta_in_pack),
+                        crc32: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new(obj_num, 0, stream_tx);
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| GitError::CustomError(format!("pack encode failed: {e}")))?;
+
+        for tree_model in tree_models {
+            entry_tx
+                .send(MetaAttached {
+                    inner: Tree::from_mega_model(tree_model).into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| GitError::CustomError(format!("pack tree entry send failed: {e}")))?;
+        }
+
+        let default_meta = EntryMeta::default();
+        let blobs = self.storage.git_service.get_objects_stream(blob_hashes);
+        blobs
+            .try_for_each_concurrent(16, |(_, stream, _)| {
+                let entry_tx = entry_tx.clone();
+                let blob_meta = &blob_meta;
+                let default_meta = &default_meta;
+                async move {
+                    let data = stream
+                        .try_fold(Vec::new(), |mut acc, bytes| async move {
+                            acc.extend_from_slice(&bytes);
+                            Ok(acc)
+                        })
+                        .await?;
+                    let blob = Blob::from_content_bytes(data);
+                    let meta = blob_meta
+                        .get(&blob.id.to_string())
+                        .unwrap_or(default_meta)
+                        .to_owned();
+                    entry_tx
+                        .send(MetaAttached {
+                            inner: blob.into(),
+                            meta,
+                        })
+                        .await
+                        .map_err(|e| IoOrbitError::Other(format!("pack entry send failed: {e}")))?;
+
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| GitError::CustomError(format!("blob stream failed: {e}")))?;
+        drop(entry_tx);
+
+        Ok(ReceiverStream::new(stream_rx))
+    }
+
     /// All branch commands update CL `mega_refs` in **one** DB transaction (same idea as import’s single-txn metadata commit).
     async fn persist_mono_branch_cl_mega_refs_transaction(&self) -> Result<(), MegaError> {
         let cmds = self
