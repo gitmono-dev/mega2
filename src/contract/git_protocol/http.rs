@@ -47,13 +47,21 @@ pub async fn git_info_refs(
     let service_type = ServiceType::from_str(&service_name)
         .map_err(|err| ProtocolError::InvalidInput(err.to_string()))?;
     let mut session = SmartSession::new(repo_path, service_type, TransportProtocol::Http);
-    if service_type == ServiceType::UploadPack {
-        let _ = git_http_auth(state, &mut session, headers).await?;
-        if check_upload_pack_access(&state.storage.config().git, &session.auth)
-            .await
-            .is_err()
-        {
-            return auth_failed();
+    match service_type {
+        ServiceType::UploadPack => {
+            let _ = git_http_auth(state, &mut session, headers).await?;
+            if check_upload_pack_access(&state.storage.config().git, &session.auth)
+                .await
+                .is_err()
+            {
+                return auth_failed();
+            }
+        }
+        ServiceType::ReceivePack => {
+            if !git_http_auth(state, &mut session, headers).await? {
+                return auth_failed();
+            }
+            check_push_permission(state, &session.auth, &session.repo_path).await?;
         }
     }
 
