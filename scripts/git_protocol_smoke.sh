@@ -206,15 +206,21 @@ lfs_smoke_http() {
     return 1
   fi
 
-  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$MONOENGINE_HTTP_REPO_URL" "$clone_dir" || rc=$?
+  git_case init "$clone_dir" >/dev/null || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    git -C "$clone_dir" remote add origin "$MONOENGINE_HTTP_REPO_URL" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    git -C "$clone_dir" lfs install --local >/dev/null || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    configure_lfs_http_remote "$clone_dir" || rc=$?
+  fi
   if [[ "$rc" -eq 0 ]]; then
     git_case -C "$clone_dir" fetch origin "$delete_ref:refs/heads/lfs-smoke" || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
-    git -C "$clone_dir" checkout lfs-smoke >/dev/null || rc=$?
-  fi
-  if [[ "$rc" -eq 0 ]]; then
-    configure_lfs_http_remote "$clone_dir" || rc=$?
+    GIT_LFS_SKIP_SMUDGE=1 git -C "$clone_dir" checkout lfs-smoke >/dev/null || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     git -C "$clone_dir" lfs pull || rc=$?
