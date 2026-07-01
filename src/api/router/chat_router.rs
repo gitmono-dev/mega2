@@ -1,19 +1,30 @@
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{
     Json,
-    extract::{FromRef, Path, Query, State},
+    extract::{
+        FromRef, Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    response::Response,
+    routing::get,
 };
+use futures::{SinkExt, StreamExt};
 use orbit_api::object_storage::{ObjectKey, ObjectNamespace};
 use reqwest::Method;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::broadcast;
 use utoipa::IntoParams;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::CHAT_TAG, oauth::model::LoginUser},
-    chat::service::{
-        ChannelChatService, SharedChatService, channel_chat::extract_mentioned_usernames,
+    chat::{
+        domain::{ChatEvent, InMemoryChatEvents},
+        service::{
+            ChannelChatService, SharedChatService, channel_chat::extract_mentioned_usernames,
+        },
     },
     common::errors::ApiError,
     contract::api::{
@@ -32,16 +43,38 @@ const CHAT_ATTACHMENT_MAX_FILE_SIZE: i64 = 100 * 1024 * 1024;
 const CHAT_ATTACHMENT_MAX_FILE_NAME_LEN: usize = 255;
 const CHAT_ATTACHMENT_MAX_FILE_TYPE_LEN: usize = 128;
 const CHAT_ATTACHMENT_KEY_PREFIX: &str = "chat/attachments/";
+const CHAT_PUSHER_CHANNEL_PREFIX: &str = "private-chat-channel-";
+const PUSHER_EVENT_SUBSCRIBE: &str = "pusher:subscribe";
+const PUSHER_EVENT_SUBSCRIPTION_SUCCEEDED: &str = "pusher_internal:subscription_succeeded";
+const PUSHER_EVENT_CONNECTION_ESTABLISHED: &str = "pusher:connection_established";
+const PUSHER_EVENT_ERROR: &str = "pusher:error";
+const PUSHER_EVENT_PING: &str = "pusher:ping";
+const PUSHER_EVENT_PONG: &str = "pusher:pong";
 
 #[derive(Deserialize, IntoParams)]
 struct AttachmentConfirmQuery {
     message_id: String,
 }
 
+#[derive(Deserialize)]
+struct PusherClientMessage {
+    event: String,
+    data: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct PusherServerMessage<'a> {
+    event: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<&'a str>,
+    data: String,
+}
+
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(
         "/chat",
         OpenApiRouter::new()
+            .route("/events", get(chat_events_ws))
             .routes(routes!(list_channels, create_channel))
             .routes(routes!(get_channel_detail, update_channel, delete_channel))
             .routes(routes!(list_messages, send_message))
@@ -60,6 +93,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
 struct ChatApiState {
     storage: Storage,
     listen_addr: String,
+    events: Arc<InMemoryChatEvents>,
 }
 
 impl FromRef<MonoApiServiceState> for ChatApiState {
@@ -67,18 +101,246 @@ impl FromRef<MonoApiServiceState> for ChatApiState {
         Self {
             storage: state.storage.clone(),
             listen_addr: state.listen_addr.clone(),
+            events: state.chat_events.clone(),
         }
     }
 }
 
 impl ChatApiState {
-    fn channel_chat_svc(&self) -> ChannelChatService {
-        ChannelChatService::from_storage(&self.storage)
+    fn channel_chat_svc(&self) -> ChannelChatService<InMemoryChatEvents> {
+        ChannelChatService::from_storage(&self.storage).with_events(self.events.clone())
     }
 
     fn shared_chat_svc(&self) -> SharedChatService {
         SharedChatService::from_storage(&self.storage)
     }
+}
+
+fn pusher_chat_channel(channel_public_id: &str) -> String {
+    format!("{CHAT_PUSHER_CHANNEL_PREFIX}{channel_public_id}")
+}
+
+fn parse_pusher_subscription(text: &str) -> Option<String> {
+    let payload: PusherClientMessage = serde_json::from_str(text).ok()?;
+    if payload.event != PUSHER_EVENT_SUBSCRIBE {
+        return None;
+    }
+
+    let data = payload.data?;
+    let channel = match data {
+        Value::Object(map) => map.get("channel")?.as_str()?.to_owned(),
+        Value::String(raw) => {
+            let parsed: Value = serde_json::from_str(&raw).ok()?;
+            parsed.get("channel")?.as_str()?.to_owned()
+        }
+        _ => return None,
+    };
+
+    channel
+        .strip_prefix(CHAT_PUSHER_CHANNEL_PREFIX)
+        .map(str::to_owned)
+}
+
+fn chat_event_channel_public_id(event: &ChatEvent) -> &str {
+    match event {
+        ChatEvent::MessageCreated {
+            channel_public_id, ..
+        }
+        | ChatEvent::MessageUpdated {
+            channel_public_id, ..
+        }
+        | ChatEvent::MessageDeleted {
+            channel_public_id, ..
+        }
+        | ChatEvent::ChannelUpdated { channel_public_id } => channel_public_id,
+    }
+}
+
+fn chat_event_pusher_name(event: &ChatEvent) -> &'static str {
+    match event {
+        ChatEvent::MessageCreated { .. } => "channel-message-created",
+        ChatEvent::MessageUpdated { .. } => "channel-message-updated",
+        ChatEvent::MessageDeleted { .. } => "channel-message-deleted",
+        ChatEvent::ChannelUpdated { .. } => "channel-updated",
+    }
+}
+
+fn chat_event_payload(event: &ChatEvent) -> Value {
+    match event {
+        ChatEvent::MessageCreated {
+            channel_public_id,
+            message_public_id,
+        }
+        | ChatEvent::MessageUpdated {
+            channel_public_id,
+            message_public_id,
+        }
+        | ChatEvent::MessageDeleted {
+            channel_public_id,
+            message_public_id,
+        } => json!({
+            "channel_public_id": channel_public_id,
+            "message_public_id": message_public_id,
+        }),
+        ChatEvent::ChannelUpdated { channel_public_id } => json!({
+            "channel_public_id": channel_public_id,
+        }),
+    }
+}
+
+fn pusher_envelope(event: &str, channel: Option<&str>, data: Value) -> String {
+    let envelope = PusherServerMessage {
+        event,
+        channel,
+        data: data.to_string(),
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(serialized) => serialized,
+        Err(_) => r#"{"event":"pusher:error","data":"{\"message\":\"serialization failed\"}"}"#
+            .to_string(),
+    }
+}
+
+fn pusher_envelope_for_chat_event(event: &ChatEvent) -> String {
+    let channel_public_id = chat_event_channel_public_id(event);
+    let channel = pusher_chat_channel(channel_public_id);
+    pusher_envelope(
+        chat_event_pusher_name(event),
+        Some(&channel),
+        chat_event_payload(event),
+    )
+}
+
+async fn user_can_subscribe_channel(
+    state: &ChatApiState,
+    username: &str,
+    channel_public_id: &str,
+) -> bool {
+    state
+        .storage
+        .channel_storage()
+        .get_channel_by_public_id(channel_public_id, username)
+        .await
+        .map(|ch| ch.is_some())
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                username = %username,
+                channel_public_id = %channel_public_id,
+                "failed to check chat event subscription"
+            );
+            false
+        })
+}
+
+async fn send_ws_text(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    text: String,
+) -> bool {
+    sender.send(Message::Text(text.into())).await.is_ok()
+}
+
+async fn handle_chat_events_socket(socket: WebSocket, user: LoginUser, state: ChatApiState) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut events = state.events.subscribe();
+    let mut subscribed_channels = HashSet::new();
+
+    let connected = pusher_envelope(
+        PUSHER_EVENT_CONNECTION_ESTABLISHED,
+        None,
+        json!({
+            "socket_id": crate::callisto::entity_ext::generate_public_id(),
+            "activity_timeout": 120,
+        }),
+    );
+    if !send_ws_text(&mut sender, connected).await {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            maybe_msg = receiver.next() => {
+                let Some(Ok(msg)) = maybe_msg else {
+                    break;
+                };
+                match msg {
+                    Message::Text(text) => {
+                        if serde_json::from_str::<PusherClientMessage>(&text)
+                            .map(|payload| payload.event == PUSHER_EVENT_PING)
+                            .unwrap_or(false)
+                        {
+                            if !send_ws_text(
+                                &mut sender,
+                                pusher_envelope(PUSHER_EVENT_PONG, None, json!({})),
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        } else if let Some(channel_public_id) = parse_pusher_subscription(&text)
+                            && user_can_subscribe_channel(&state, &user.username, &channel_public_id).await
+                        {
+                            subscribed_channels.insert(channel_public_id.clone());
+                            let channel = pusher_chat_channel(&channel_public_id);
+                            let ack = pusher_envelope(
+                                PUSHER_EVENT_SUBSCRIPTION_SUCCEEDED,
+                                Some(&channel),
+                                json!({}),
+                            );
+                            if !send_ws_text(&mut sender, ack).await {
+                                break;
+                            }
+                        } else if !send_ws_text(
+                            &mut sender,
+                            pusher_envelope(
+                                PUSHER_EVENT_ERROR,
+                                None,
+                                json!({ "message": "subscription rejected" }),
+                            ),
+                        ).await {
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Binary(_) | Message::Pong(_) => {}
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        let channel_public_id = chat_event_channel_public_id(&event);
+                        if !subscribed_channels.contains(channel_public_id) {
+                            continue;
+                        }
+                        if !user_can_subscribe_channel(&state, &user.username, channel_public_id).await {
+                            subscribed_channels.remove(channel_public_id);
+                            continue;
+                        }
+                        if !send_ws_text(&mut sender, pusher_envelope_for_chat_event(&event)).await {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "chat websocket event receiver lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn chat_events_ws(
+    user: LoginUser,
+    state: State<ChatApiState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_chat_events_socket(socket, user, state.0))
 }
 
 fn validate_chat_attachment_metadata(
@@ -1198,6 +1460,7 @@ mod tests {
         ChatApiState {
             storage: storage.clone(),
             listen_addr: "http://localhost:8000".to_string(),
+            events: Arc::new(InMemoryChatEvents::default()),
         }
     }
 
@@ -1227,8 +1490,11 @@ mod tests {
             .expect("failed to put attachment object");
     }
 
-    async fn setup_chat_http_server(temp_dir: &std::path::Path) -> (String, Storage) {
+    async fn setup_chat_http_server(
+        temp_dir: &std::path::Path,
+    ) -> (String, Storage, Arc<InMemoryChatEvents>) {
         let storage = test_storage(temp_dir).await;
+        let chat_events = Arc::new(InMemoryChatEvents::default());
         let redis_url = std::env::var("MEGA_REDIS__URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
         let redis_conn = init_connection(&RedisConfig { url: redis_url })
@@ -1244,6 +1510,7 @@ mod tests {
             entity_store: EntityStore::new(),
             git_object_cache,
             bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+            chat_events: chat_events.clone(),
         };
         let api_routes: Router = api_router::routers().with_state(api_state).into();
         let app = Router::new().nest("/api/v1", api_routes);
@@ -1257,7 +1524,7 @@ mod tests {
                 .expect("chat HTTP test server failed");
         });
 
-        (format!("http://{addr}/api/v1"), storage)
+        (format!("http://{addr}/api/v1"), storage, chat_events)
     }
 
     async fn expect_common_data(response: reqwest::Response) -> Value {
@@ -1285,10 +1552,51 @@ mod tests {
         assert!(status.is_client_error(), "status={status}, body={body}");
     }
 
+    #[test]
+    fn parse_pusher_subscription_accepts_object_and_string_data() {
+        assert_eq!(
+            parse_pusher_subscription(
+                r#"{"event":"pusher:subscribe","data":{"channel":"private-chat-channel-chan_123"}}"#,
+            )
+            .as_deref(),
+            Some("chan_123")
+        );
+        assert_eq!(
+            parse_pusher_subscription(
+                r#"{"event":"pusher:subscribe","data":"{\"channel\":\"private-chat-channel-chan_456\"}"}"#,
+            )
+            .as_deref(),
+            Some("chan_456")
+        );
+        assert_eq!(
+            parse_pusher_subscription(
+                r#"{"event":"pusher:subscribe","data":{"channel":"presence-other"}}"#,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pusher_envelope_for_chat_event_uses_chat_channel_and_payload() {
+        let envelope = pusher_envelope_for_chat_event(&ChatEvent::MessageCreated {
+            channel_public_id: "chan_123".to_string(),
+            message_public_id: "msg_123".to_string(),
+        });
+        let parsed: Value = serde_json::from_str(&envelope).expect("pusher envelope JSON");
+
+        assert_eq!(parsed["event"], "channel-message-created");
+        assert_eq!(parsed["channel"], "private-chat-channel-chan_123");
+        let data: Value =
+            serde_json::from_str(parsed["data"].as_str().unwrap()).expect("pusher data JSON");
+        assert_eq!(data["channel_public_id"], "chan_123");
+        assert_eq!(data["message_public_id"], "msg_123");
+    }
+
     #[tokio::test]
     async fn chat_http_black_box_lifecycle_matrix() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let (base_url, storage) = setup_chat_http_server(temp_dir.path()).await;
+        let (base_url, storage, chat_events) = setup_chat_http_server(temp_dir.path()).await;
+        let mut event_rx = chat_events.subscribe();
         let client = reqwest::Client::new();
 
         let channel = expect_common_data(
@@ -1310,6 +1618,18 @@ mod tests {
         assert_eq!(channel["owner_username"], "admin");
         assert!(channel.get("id").is_none(), "channel must not expose DB id");
         let channel_id = channel["public_id"].as_str().unwrap().to_string();
+        let initial_message_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("initial message event should be published")
+                .expect("initial message event channel should be open");
+        assert!(matches!(
+            initial_message_event,
+            ChatEvent::MessageCreated {
+                channel_public_id,
+                ..
+            } if channel_public_id == channel_id
+        ));
 
         let channels = expect_common_data(
             client

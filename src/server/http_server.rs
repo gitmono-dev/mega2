@@ -579,6 +579,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
         entity_store: EntityStore::new(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+        chat_events: Arc::new(crate::chat::domain::InMemoryChatEvents::default()),
     };
 
     let app_config = storage.config();
