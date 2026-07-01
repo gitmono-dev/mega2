@@ -41,7 +41,7 @@ use crate::{
         code_edit::{on_push::OnpushCodeEdit, utils::get_changed_files},
         model::change_list::ClDiffFile,
         pack::RepoHandler,
-        protocol::import_refs::{RefCommand, Refs},
+        protocol::import_refs::{CommandType, RefCommand, Refs},
     },
     common::{
         errors::MegaError,
@@ -823,6 +823,17 @@ impl MonoRepo {
         txn: Option<&DatabaseTransaction>,
     ) -> Result<(), MegaError> {
         let storage = self.storage.mono_storage();
+        if cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID {
+            let existing = match txn {
+                Some(t) => storage.get_ref_by_name_in_txn(&cmd.ref_name, t).await?,
+                None => storage.get_ref_by_name(&cmd.ref_name).await?,
+            };
+            if let Some(existing) = existing {
+                storage.remove_ref(existing).await?;
+            }
+            return Ok(());
+        }
+
         let current_commit = self.current_commit.read().await;
         let Some(c) = &*current_commit else {
             return Ok(());

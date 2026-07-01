@@ -66,7 +66,7 @@
 
 4. **认证上下文已统一（HTTP/SSH）。** HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，commit binding 绑定到 authenticated actor。receive-pack 尚未做 repo/path 级 push 权限校验。
 
-5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 不再 advertise 未验证的 atomic、report-status-v2、delete-refs、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。
+5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP branch/tag delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。
 
 6. **SSH 多 channel 状态已隔离，并已支持 protocol v2。** `SshServer` 按 `ChannelId` 保存独立 `GitSshChannelState`；SSH client 通过 `GIT_PROTOCOL=version=2` 请求 v2 时，server 返回 v2 capability advertisement，并在 upload-pack data 阶段分发 `ls-refs` / `fetch` command。
 
@@ -467,7 +467,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 历史风险：曾 advertise 一些未完整实现或解析不足的能力。当前状态（均已解决）：
 
 - `include-tag`：已从 upload-pack advertise 移除（pack 生成未按 include-tag 语义验证）。
-- `delete-refs`：已从 advertise 移除（HTTP smoke 已覆盖 branch/tag delete，但完整 delete capability 语义和 SSH 矩阵仍需补齐后再声明）。
+- `delete-refs`：已重新 advertise（HTTP smoke 覆盖 branch/tag delete；SSH delete 矩阵仍待补齐）。
 - `atomic`：已从 advertise 移除（未实现原子 ref 更新）。
 - `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
 - `no-thin`：已从 advertise 移除（thin-pack 行为未明确测试）。
@@ -478,7 +478,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
-- 已完成首批：`atomic`、`report-status-v2`、`delete-refs`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；后续若补齐行为和测试再重新声明。
+- 已完成首批：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP branch/tag delete smoke 覆盖后重新声明。
 - ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 ### pkt-line parser 错误模型已收敛，streaming reader 仍待后续
@@ -712,7 +712,7 @@ LFS:
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
-| `delete-refs` | ❌ 已移除 | ❌ | ❌ | N/A | HTTP smoke 已覆盖 branch/tag delete；完整 delete capability 语义和 SSH 矩阵仍未补齐，暂不 advertise |
+| `delete-refs` | ✅ 已声明 | ✅ HTTP branch/tag delete smoke | ❌ | N/A | HTTP smoke 已覆盖 branch/tag delete；SSH delete 矩阵仍未补齐 |
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |

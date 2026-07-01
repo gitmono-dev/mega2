@@ -111,8 +111,12 @@ push_branch_smoke() {
   local label="$2"
   local src="$ROOT_DIR/push-$label-src"
   local branch="monoengine-smoke-$(date +%s)-$$"
+  local before_refs="$ROOT_DIR/push-$label-cl-before"
+  local after_refs="$ROOT_DIR/push-$label-cl-after"
+  local delete_ref=""
   local cleanup_status=0
   rm -rf "$src"
+  git_case ls-remote "$remote_url" "refs/cl/*" | awk '{print $2}' | sort >"$before_refs" || return
   git_case clone "$remote_url" "$src" >/dev/null || return
   git -C "$src" checkout -b "$branch" >/dev/null || return
   git -C "$src" config user.name "Monoengine Smoke" || return
@@ -120,10 +124,16 @@ push_branch_smoke() {
   printf 'monoengine git smoke %s\n' "$branch" >"$src/smoke.txt"
   git -C "$src" add smoke.txt || return
   git -C "$src" commit -m "monoengine git smoke" >/dev/null || return
-  git -C "$src" push origin "HEAD:refs/heads/$branch" || return
-  git -C "$src" push origin ":refs/heads/$branch" || cleanup_status=$?
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/$branch" || return
+  git_case ls-remote "$remote_url" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
+  delete_ref="$(comm -13 "$before_refs" "$after_refs" | head -n1)"
+  if [[ -z "$delete_ref" ]]; then
+    echo "failed to find CL ref created by branch push" >&2
+    return 1
+  fi
+  git -C "$src" push origin ":$delete_ref" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
-    echo "failed to delete remote smoke branch refs/heads/$branch" >&2
+    echo "failed to delete remote smoke branch CL ref $delete_ref" >&2
     return "$cleanup_status"
   fi
 }
@@ -142,7 +152,7 @@ push_tag_smoke() {
   git -C "$src" add smoke-tag.txt || return
   git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return
   git -C "$src" tag "$tag" || return
-  git -C "$src" push origin "refs/tags/$tag" || return
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag" || return
   git -C "$src" push origin ":refs/tags/$tag" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
     echo "failed to delete remote smoke tag refs/tags/$tag" >&2

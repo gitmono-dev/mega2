@@ -32,7 +32,7 @@ pub const PKT_LINE_DELIMITER: &[u8; 4] = b"0001";
 
 // see https://git-scm.com/docs/protocol-capabilities
 // Only advertise capabilities that are parsed, acted on, and covered by tests.
-const RECEIVE_CAP_LIST: &str = "report-status ";
+const RECEIVE_CAP_LIST: &str = "report-status delete-refs ";
 
 // The ofs-delta and side-band-64k capabilities are sent and recognized by both upload-pack and receive-pack protocols.
 // The agent and session-id capabilities may optionally be sent in both protocols.
@@ -1083,8 +1083,8 @@ pub mod test {
         assert!(tokens.contains(&"side-band-64k"));
         assert!(tokens.contains(&"ofs-delta"));
         assert!(tokens.contains(&"agent=mega/0.1.0"));
+        assert!(tokens.contains(&"delete-refs"));
         assert!(!tokens.contains(&"report-status-v2"));
-        assert!(!tokens.contains(&"delete-refs"));
         assert!(!tokens.contains(&"quiet"));
         assert!(!tokens.contains(&"atomic"));
         assert!(!tokens.contains(&"no-thin"));
