@@ -54,6 +54,7 @@ pub struct CreateChannelReq {
     pub member_usernames: Vec<String>,
     pub group: bool,
     pub initial_message: Option<String>,
+    pub attachments: Option<Vec<AttachmentConfirmReq>>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]

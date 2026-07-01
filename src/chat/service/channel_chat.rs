@@ -153,22 +153,22 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .increment_members_count(ch.id, member_usernames.len() as i32)
             .await;
 
-        // Optional initial message
-        let first_msg = if let Some(content) = initial_message {
-            if !content.trim().is_empty() {
-                Some(
-                    self.send_message_inner(
-                        &ch,
-                        Some(creator_username.clone()),
-                        content,
-                        None,
-                        attachments.unwrap_or_default(),
-                    )
-                    .await?,
+        // Optional initial message: send when there is non-empty content OR
+        // attachments (spec: 如果有 initial_message 或附件，调用发送消息服务).
+        // Attachment-only channels create a first message with empty content.
+        let content = initial_message.unwrap_or_default();
+        let attachments = attachments.unwrap_or_default();
+        let first_msg = if !content.trim().is_empty() || !attachments.is_empty() {
+            Some(
+                self.send_message_inner(
+                    &ch,
+                    Some(creator_username.clone()),
+                    content,
+                    None,
+                    attachments,
                 )
-            } else {
-                None
-            }
+                .await?,
+            )
         } else {
             None
         };
@@ -657,6 +657,64 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(final_ch.latest_message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_channel_with_attachments_only_creates_first_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let svc = ChannelChatService::from_storage(&storage);
+
+        // Spec (chat.md 创建 channel): send a first message when initial_message OR
+        // attachments are supplied. Attachment-only create must not silently drop the file.
+        let (ch, first_msg) = svc
+            .create_channel(
+                Some("Files".to_string()),
+                None,
+                "alice".to_string(),
+                vec!["bob".to_string()],
+                true,
+                None,
+                Some(vec![crate::contract::api::chat::AttachmentConfirmReq {
+                    file_path: "chat/attachments/report.pdf".to_string(),
+                    file_type: "application/pdf".to_string(),
+                    file_name: "report.pdf".to_string(),
+                    file_size: 1024,
+                }]),
+            )
+            .await
+            .expect("create channel with attachment");
+
+        let first = first_msg.expect("attachment-only channel must create a first message");
+        assert!(
+            first.content.trim().is_empty(),
+            "attachment-only message has empty content"
+        );
+        assert_eq!(ch.latest_message_id, Some(first.id));
+
+        let attachments = svc
+            .attachment_storage
+            .get_attachments_by_subject("Message", first.id)
+            .await
+            .expect("query attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "report.pdf");
+        assert_eq!(attachments[0].file_path, "chat/attachments/report.pdf");
+
+        // Neither content nor attachments -> no first message.
+        let (_ch2, no_msg) = svc
+            .create_channel(
+                Some("Empty".to_string()),
+                None,
+                "alice".to_string(),
+                vec![],
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create empty channel");
+        assert!(no_msg.is_none());
     }
 
     #[tokio::test]

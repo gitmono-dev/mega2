@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.1.159"
+version = "0.1.160"
 edition = "2024"
 
 # The thin composition-root binary. It depends on `monoengine-core` (which only
@@ -15,8 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 monoengine-core = { path = ".." }
-orbit = { path = "../../orbit" }
-orbit-api = { path = "../../orbit/api" }
+orbit = { path = "../../orbit/crates/orbit" }
+orbit-api = { path = "../../orbit/crates/orbit-api" }
 async-trait = "0.1.89"
 
 [target.'cfg(not(windows))'.dependencies]

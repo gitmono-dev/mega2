@@ -615,7 +615,7 @@ async fn create_channel(
             payload.member_usernames,
             payload.group,
             payload.initial_message,
-            None,
+            payload.attachments,
         )
         .await?;
 
@@ -1880,6 +1880,7 @@ mod tests {
             member_usernames: vec!["bob".to_string()],
             group: true,
             initial_message: Some("Welcome to General!".to_string()),
+            attachments: None,
         };
         let res = create_channel(alice.clone(), State(state.clone()), Json(req))
             .await
@@ -1899,6 +1900,7 @@ mod tests {
                 member_usernames: vec!["bob".to_string()],
                 group: true,
                 initial_message: None,
+                attachments: None,
             }),
         )
         .await
