@@ -164,6 +164,9 @@ lfs_smoke_http() {
   local src="$ROOT_DIR/lfs-src"
   local clone_dir="$ROOT_DIR/lfs-clone"
   local branch="monoengine-smoke-lfs-$(date +%s)-$$"
+  local before_refs="$ROOT_DIR/lfs-cl-before"
+  local after_refs="$ROOT_DIR/lfs-cl-after"
+  local delete_ref=""
   local rc=0
   local cleanup_status=0
 
@@ -173,8 +176,9 @@ lfs_smoke_http() {
   }
 
   rm -rf "$src" "$clone_dir"
-  mkdir -p "$src" || return
-  git -C "$src" init >/dev/null || return
+  git_case ls-remote "$MONOENGINE_HTTP_REPO_URL" "refs/cl/*" | awk '{print $2}' | sort >"$before_refs" || return
+  git_case clone "$MONOENGINE_HTTP_REPO_URL" "$src" >/dev/null || return
+  git -C "$src" checkout -b "$branch" >/dev/null || return
   git -C "$src" config user.name "Monoengine Smoke" || return
   git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
   git -C "$src" lfs install --local >/dev/null || return
@@ -182,10 +186,21 @@ lfs_smoke_http() {
   printf 'monoengine git lfs smoke %s\n' "$branch" >"$src/smoke-lfs.bin"
   git -C "$src" add .gitattributes smoke-lfs.bin || return
   git -C "$src" commit -m "monoengine git lfs smoke" >/dev/null || return
-  git -C "$src" remote add origin "$MONOENGINE_HTTP_REPO_URL" || return
-  git -C "$src" push origin "HEAD:refs/heads/$branch" || return
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/$branch" || return
+  git_case ls-remote "$MONOENGINE_HTTP_REPO_URL" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
+  delete_ref="$(comm -13 "$before_refs" "$after_refs" | head -n1)"
+  if [[ -z "$delete_ref" ]]; then
+    echo "failed to find CL ref created by LFS branch push" >&2
+    return 1
+  fi
 
-  GIT_LFS_SKIP_SMUDGE=1 git_case clone --branch "$branch" "$MONOENGINE_HTTP_REPO_URL" "$clone_dir" || rc=$?
+  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$MONOENGINE_HTTP_REPO_URL" "$clone_dir" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    git_case -C "$clone_dir" fetch origin "$delete_ref:refs/heads/lfs-smoke" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    git -C "$clone_dir" checkout lfs-smoke >/dev/null || rc=$?
+  fi
   if [[ "$rc" -eq 0 ]]; then
     git -C "$clone_dir" lfs pull || rc=$?
   fi
@@ -197,9 +212,9 @@ lfs_smoke_http() {
     git -C "$clone_dir" lfs locks || rc=$?
   fi
 
-  git -C "$src" push origin ":refs/heads/$branch" || cleanup_status=$?
+  git -C "$src" push origin ":$delete_ref" || cleanup_status=$?
   if [[ "$cleanup_status" -ne 0 ]]; then
-    echo "failed to delete remote LFS smoke branch refs/heads/$branch" >&2
+    echo "failed to delete remote LFS smoke CL ref $delete_ref" >&2
     if [[ "$rc" -eq 0 ]]; then
       rc="$cleanup_status"
     fi
