@@ -6,6 +6,8 @@ use axum::{
 };
 use orbit_api::object_storage::{ObjectKey, ObjectNamespace};
 use reqwest::Method;
+use serde::Deserialize;
+use utoipa::IntoParams;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
@@ -31,27 +33,25 @@ const CHAT_ATTACHMENT_MAX_FILE_NAME_LEN: usize = 255;
 const CHAT_ATTACHMENT_MAX_FILE_TYPE_LEN: usize = 128;
 const CHAT_ATTACHMENT_KEY_PREFIX: &str = "chat/attachments/";
 
+#[derive(Deserialize, IntoParams)]
+struct AttachmentConfirmQuery {
+    message_id: String,
+}
+
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(
         "/chat",
         OpenApiRouter::new()
-            .routes(routes!(list_channels))
-            .routes(routes!(create_channel))
-            .routes(routes!(get_channel_detail))
-            .routes(routes!(update_channel))
-            .routes(routes!(delete_channel))
-            .routes(routes!(list_messages))
-            .routes(routes!(send_message))
-            .routes(routes!(edit_message))
-            .routes(routes!(delete_message))
+            .routes(routes!(list_channels, create_channel))
+            .routes(routes!(get_channel_detail, update_channel, delete_channel))
+            .routes(routes!(list_messages, send_message))
+            .routes(routes!(edit_message, delete_message))
             .routes(routes!(create_reaction))
             .routes(routes!(delete_reaction))
             .routes(routes!(presign_attachment))
             .routes(routes!(confirm_attachment))
-            .routes(routes!(mark_channel_read))
-            .routes(routes!(mark_channel_unread))
-            .routes(routes!(list_channel_members))
-            .routes(routes!(add_channel_members))
+            .routes(routes!(mark_channel_read, mark_channel_unread))
+            .routes(routes!(list_channel_members, add_channel_members))
             .routes(routes!(remove_channel_member)),
     )
 }
@@ -305,7 +305,7 @@ async fn map_message_model(
 /// Visible channels
 #[utoipa::path(
     get,
-    path = "/chat/channels",
+    path = "/channels",
     responses(
         (status = 200, body = CommonResult<Vec<ChannelResponse>>, content_type = "application/json")
     ),
@@ -332,7 +332,7 @@ async fn list_channels(
 /// Create channel
 #[utoipa::path(
     post,
-    path = "/chat/channels",
+    path = "/channels",
     request_body = CreateChannelReq,
     responses(
         (status = 200, body = CommonResult<ChannelResponse>, content_type = "application/json")
@@ -364,7 +364,7 @@ async fn create_channel(
 /// Get channel details
 #[utoipa::path(
     get,
-    path = "/chat/channels/{channel_id}",
+    path = "/channels/{channel_id}",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -392,7 +392,7 @@ async fn get_channel_detail(
 /// Update channel
 #[utoipa::path(
     patch,
-    path = "/chat/channels/{channel_id}",
+    path = "/channels/{channel_id}",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -426,7 +426,7 @@ async fn update_channel(
 /// Soft delete channel
 #[utoipa::path(
     delete,
-    path = "/chat/channels/{channel_id}",
+    path = "/channels/{channel_id}",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -452,7 +452,7 @@ async fn delete_channel(
 /// Message list
 #[utoipa::path(
     get,
-    path = "/chat/channels/{channel_id}/messages",
+    path = "/channels/{channel_id}/messages",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
         Pagination,
@@ -497,7 +497,7 @@ async fn list_messages(
 /// Send message
 #[utoipa::path(
     post,
-    path = "/chat/channels/{channel_id}/messages",
+    path = "/channels/{channel_id}/messages",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -627,7 +627,7 @@ async fn send_message(
 /// Edit message
 #[utoipa::path(
     patch,
-    path = "/chat/channels/{channel_id}/messages/{message_id}",
+    path = "/channels/{channel_id}/messages/{message_id}",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
         ("message_id" = String, Path, description = "Public ID of the message"),
@@ -656,7 +656,7 @@ async fn edit_message(
 /// Soft delete message
 #[utoipa::path(
     delete,
-    path = "/chat/channels/{channel_id}/messages/{message_id}",
+    path = "/channels/{channel_id}/messages/{message_id}",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
         ("message_id" = String, Path, description = "Public ID of the message"),
@@ -682,7 +682,7 @@ async fn delete_message(
 /// Create reaction
 #[utoipa::path(
     post,
-    path = "/chat/messages/{message_id}/reactions",
+    path = "/messages/{message_id}/reactions",
     params(
         ("message_id" = String, Path, description = "Public ID of the message"),
     ),
@@ -733,7 +733,7 @@ async fn create_reaction(
 /// Delete reaction
 #[utoipa::path(
     delete,
-    path = "/chat/reactions/{reaction_id}",
+    path = "/reactions/{reaction_id}",
     params(
         ("reaction_id" = String, Path, description = "Public ID of the reaction"),
     ),
@@ -758,7 +758,7 @@ async fn delete_reaction(
 /// Presign upload URL
 #[utoipa::path(
     post,
-    path = "/chat/attachments/presign",
+    path = "/attachments/presign",
     request_body = AttachmentPresignReq,
     responses(
         (status = 200, body = CommonResult<AttachmentPresignRes>, content_type = "application/json")
@@ -821,7 +821,7 @@ async fn presign_attachment(
 /// Confirm attachment upload on an existing message
 #[utoipa::path(
     post,
-    path = "/chat/attachments",
+    path = "/attachments",
     params(
         ("message_id" = String, Query, description = "Public ID of the message"),
     ),
@@ -833,10 +833,11 @@ async fn presign_attachment(
 )]
 async fn confirm_attachment(
     user: LoginUser,
-    Query(message_id): Query<String>,
+    Query(query): Query<AttachmentConfirmQuery>,
     state: State<ChatApiState>,
     Json(payload): Json<AttachmentConfirmReq>,
 ) -> Result<Json<CommonResult<AttachmentResponse>>, ApiError> {
+    let message_id = query.message_id;
     let allowed_mime_types = state
         .storage
         .config()
@@ -946,7 +947,7 @@ async fn confirm_attachment(
 /// Mark channel read
 #[utoipa::path(
     post,
-    path = "/chat/channels/{channel_id}/reads",
+    path = "/channels/{channel_id}/reads",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -971,7 +972,7 @@ async fn mark_channel_read(
 /// Mark channel unread
 #[utoipa::path(
     delete,
-    path = "/chat/channels/{channel_id}/reads",
+    path = "/channels/{channel_id}/reads",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -996,7 +997,7 @@ async fn mark_channel_unread(
 /// List members of a channel.
 #[utoipa::path(
     get,
-    path = "/chat/channels/{channel_id}/members",
+    path = "/channels/{channel_id}/members",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -1039,7 +1040,7 @@ async fn list_channel_members(
 /// Add members to a channel (owner only).
 #[utoipa::path(
     post,
-    path = "/chat/channels/{channel_id}/members",
+    path = "/channels/{channel_id}/members",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
     ),
@@ -1079,7 +1080,7 @@ async fn add_channel_members(
 /// Remove a member from a channel (owner only).
 #[utoipa::path(
     delete,
-    path = "/chat/channels/{channel_id}/members/{username}",
+    path = "/channels/{channel_id}/members/{username}",
     params(
         ("channel_id" = String, Path, description = "Public ID of the channel"),
         ("username" = String, Path, description = "Username of the member to remove"),
@@ -1123,14 +1124,24 @@ async fn remove_channel_member(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{io, net::SocketAddr, sync::Arc};
 
+    use axum::Router;
     use bytes::Bytes;
     use futures::stream;
     use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
 
     use super::*;
-    use crate::{api::oauth::model::LoginUser, jupiter::tests::test_storage};
+    use crate::{
+        api::{MonoApiServiceState, api_router, oauth::model::LoginUser},
+        bellatrix::Bellatrix,
+        ceres::api_service::cache::GitObjectCache,
+        config::RedisConfig,
+        contract::{api::common::CommonResult, policy::entitystore::EntityStore},
+        jupiter::{redis::init_connection, storage::Storage, tests::test_storage},
+    };
 
     #[test]
     fn chat_attachment_metadata_rejects_unsafe_inputs() {
@@ -1191,13 +1202,16 @@ mod tests {
     }
 
     async fn put_attachment_object(state: &ChatApiState, key: &str, size: i64) {
+        put_attachment_object_in_storage(&state.storage, key, size).await;
+    }
+
+    async fn put_attachment_object_in_storage(storage: &Storage, key: &str, size: i64) {
         let object_key = ObjectKey {
             namespace: ObjectNamespace::Attachment,
             key: key.to_string(),
         };
         let data: Vec<Result<Bytes, io::Error>> = vec![Ok(Bytes::from_static(b"attachment-bytes"))];
-        state
-            .storage
+        storage
             .git_service
             .obj_storage
             .inner
@@ -1211,6 +1225,313 @@ mod tests {
             )
             .await
             .expect("failed to put attachment object");
+    }
+
+    async fn setup_chat_http_server(temp_dir: &std::path::Path) -> (String, Storage) {
+        let storage = test_storage(temp_dir).await;
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let redis_conn = init_connection(&RedisConfig { url: redis_url })
+            .await
+            .expect("test Redis should be available for HTTP black-box test");
+        let git_object_cache = Arc::new(GitObjectCache {
+            connection: redis_conn,
+            prefix: "git-object-rkyv:v1:test".to_string(),
+        });
+        let api_state = MonoApiServiceState {
+            storage: storage.clone(),
+            listen_addr: "http://127.0.0.1:0".to_string(),
+            entity_store: EntityStore::new(),
+            git_object_cache,
+            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+        };
+        let api_routes: Router = api_router::routers().with_state(api_state).into();
+        let app = Router::new().nest("/api/v1", api_routes);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chat HTTP test listener");
+        let addr: SocketAddr = listener.local_addr().expect("chat HTTP test addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("chat HTTP test server failed");
+        });
+
+        (format!("http://{addr}/api/v1"), storage)
+    }
+
+    async fn expect_common_data(response: reqwest::Response) -> Value {
+        let status = response.status();
+        let body = response.text().await.expect("read response body");
+        assert!(status.is_success(), "status={status}, body={body}");
+        let parsed: CommonResult<Value> =
+            serde_json::from_str(&body).expect("response should be CommonResult JSON");
+        assert!(parsed.req_result, "body={body}");
+        parsed.data.expect("success response should include data")
+    }
+
+    async fn expect_common_ok(response: reqwest::Response) {
+        let status = response.status();
+        let body = response.text().await.expect("read response body");
+        assert!(status.is_success(), "status={status}, body={body}");
+        let parsed: CommonResult<Value> =
+            serde_json::from_str(&body).expect("response should be CommonResult JSON");
+        assert!(parsed.req_result, "body={body}");
+    }
+
+    async fn expect_client_error(response: reqwest::Response) {
+        let status = response.status();
+        let body = response.text().await.expect("read response body");
+        assert!(status.is_client_error(), "status={status}, body={body}");
+    }
+
+    #[tokio::test]
+    async fn chat_http_black_box_lifecycle_matrix() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let (base_url, storage) = setup_chat_http_server(temp_dir.path()).await;
+        let client = reqwest::Client::new();
+
+        let channel = expect_common_data(
+            client
+                .post(format!("{base_url}/chat/channels"))
+                .json(&json!({
+                    "title": "HTTP General",
+                    "image_path": null,
+                    "member_usernames": ["bob"],
+                    "group": true,
+                    "initial_message": "Welcome over HTTP"
+                }))
+                .send()
+                .await
+                .expect("create channel request"),
+        )
+        .await;
+        assert_eq!(channel["title"], "HTTP General");
+        assert_eq!(channel["owner_username"], "admin");
+        assert!(channel.get("id").is_none(), "channel must not expose DB id");
+        let channel_id = channel["public_id"].as_str().unwrap().to_string();
+
+        let channels = expect_common_data(
+            client
+                .get(format!("{base_url}/chat/channels"))
+                .send()
+                .await
+                .expect("list channels request"),
+        )
+        .await;
+        assert_eq!(channels.as_array().unwrap().len(), 1);
+
+        let detail = expect_common_data(
+            client
+                .get(format!("{base_url}/chat/channels/{channel_id}"))
+                .send()
+                .await
+                .expect("channel detail request"),
+        )
+        .await;
+        assert_eq!(detail["public_id"], channel_id);
+
+        let updated = expect_common_data(
+            client
+                .patch(format!("{base_url}/chat/channels/{channel_id}"))
+                .json(&json!({
+                    "title": "HTTP General Renamed",
+                    "image_path": "chat/channel.png"
+                }))
+                .send()
+                .await
+                .expect("update channel request"),
+        )
+        .await;
+        assert_eq!(updated["title"], "HTTP General Renamed");
+
+        let message = expect_common_data(
+            client
+                .post(format!("{base_url}/chat/channels/{channel_id}/messages"))
+                .json(&json!({
+                    "content": "hello from HTTP",
+                    "reply_to_public_id": null,
+                    "attachments": null
+                }))
+                .send()
+                .await
+                .expect("send message request"),
+        )
+        .await;
+        assert_eq!(message["sender_username"], "admin");
+        assert!(message.get("id").is_none(), "message must not expose DB id");
+        let message_id = message["public_id"].as_str().unwrap().to_string();
+
+        let messages = expect_common_data(
+            client
+                .get(format!(
+                    "{base_url}/chat/channels/{channel_id}/messages?page=1&per_page=10"
+                ))
+                .send()
+                .await
+                .expect("list messages request"),
+        )
+        .await;
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+
+        let edited = expect_common_data(
+            client
+                .patch(format!(
+                    "{base_url}/chat/channels/{channel_id}/messages/{message_id}"
+                ))
+                .json(&json!({ "content": "hello from HTTP, edited" }))
+                .send()
+                .await
+                .expect("edit message request"),
+        )
+        .await;
+        assert_eq!(edited["content"], "hello from HTTP, edited");
+
+        let reaction = expect_common_data(
+            client
+                .post(format!("{base_url}/chat/messages/{message_id}/reactions"))
+                .json(&json!({
+                    "content": "clap",
+                    "custom_reaction_public_id": null
+                }))
+                .send()
+                .await
+                .expect("create reaction request"),
+        )
+        .await;
+        assert_eq!(reaction["username"], "admin");
+        let reaction_id = reaction["public_id"].as_str().unwrap().to_string();
+
+        expect_common_ok(
+            client
+                .delete(format!("{base_url}/chat/reactions/{reaction_id}"))
+                .send()
+                .await
+                .expect("delete reaction request"),
+        )
+        .await;
+
+        expect_common_ok(
+            client
+                .post(format!("{base_url}/chat/channels/{channel_id}/members"))
+                .json(&json!({ "usernames": ["carol"] }))
+                .send()
+                .await
+                .expect("add members request"),
+        )
+        .await;
+        let members = expect_common_data(
+            client
+                .get(format!("{base_url}/chat/channels/{channel_id}/members"))
+                .send()
+                .await
+                .expect("list members request"),
+        )
+        .await;
+        assert!(
+            members
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member["username"] == "carol")
+        );
+        expect_common_ok(
+            client
+                .delete(format!(
+                    "{base_url}/chat/channels/{channel_id}/members/carol"
+                ))
+                .send()
+                .await
+                .expect("remove member request"),
+        )
+        .await;
+
+        expect_common_ok(
+            client
+                .post(format!("{base_url}/chat/channels/{channel_id}/reads"))
+                .send()
+                .await
+                .expect("mark read request"),
+        )
+        .await;
+        expect_common_ok(
+            client
+                .delete(format!("{base_url}/chat/channels/{channel_id}/reads"))
+                .send()
+                .await
+                .expect("mark unread request"),
+        )
+        .await;
+
+        let presign = expect_common_data(
+            client
+                .post(format!("{base_url}/chat/attachments/presign"))
+                .json(&json!({
+                    "file_name": "http.txt",
+                    "file_size": 16,
+                    "file_type": "text/plain",
+                    "channel_public_id": channel_id
+                }))
+                .send()
+                .await
+                .expect("presign attachment request"),
+        )
+        .await;
+        let file_path = presign["file_path"].as_str().unwrap().to_string();
+        expect_client_error(
+            client
+                .post(format!(
+                    "{base_url}/chat/attachments?message_id={message_id}"
+                ))
+                .json(&json!({
+                    "file_path": file_path,
+                    "file_type": "text/plain",
+                    "file_name": "http.txt",
+                    "file_size": 16
+                }))
+                .send()
+                .await
+                .expect("confirm missing attachment request"),
+        )
+        .await;
+
+        put_attachment_object_in_storage(&storage, &file_path, 16).await;
+        let attachment = expect_common_data(
+            client
+                .post(format!(
+                    "{base_url}/chat/attachments?message_id={message_id}"
+                ))
+                .json(&json!({
+                    "file_path": file_path,
+                    "file_type": "text/plain",
+                    "file_name": "http.txt",
+                    "file_size": 16
+                }))
+                .send()
+                .await
+                .expect("confirm attachment request"),
+        )
+        .await;
+        assert_eq!(attachment["name"], "http.txt");
+
+        expect_common_ok(
+            client
+                .delete(format!(
+                    "{base_url}/chat/channels/{channel_id}/messages/{message_id}"
+                ))
+                .send()
+                .await
+                .expect("delete message request"),
+        )
+        .await;
+        expect_common_ok(
+            client
+                .delete(format!("{base_url}/chat/channels/{channel_id}"))
+                .send()
+                .await
+                .expect("delete channel request"),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1562,7 +1883,9 @@ mod tests {
         };
         let missing_object_confirm = confirm_attachment(
             alice.clone(),
-            Query(sent_msg.public_id.clone()),
+            Query(AttachmentConfirmQuery {
+                message_id: sent_msg.public_id.clone(),
+            }),
             State(state.clone()),
             Json(confirm_req.clone()),
         )
@@ -1577,7 +1900,9 @@ mod tests {
         // A non-member must not be able to probe attachment state.
         let non_member_confirm = confirm_attachment(
             charlie.clone(),
-            Query(sent_msg.public_id.clone()),
+            Query(AttachmentConfirmQuery {
+                message_id: sent_msg.public_id.clone(),
+            }),
             State(state.clone()),
             Json(confirm_req.clone()),
         )
@@ -1593,7 +1918,9 @@ mod tests {
         put_attachment_object(&state, &wrong_channel_path, 16).await;
         let wrong_channel_confirm = confirm_attachment(
             alice.clone(),
-            Query(sent_msg.public_id.clone()),
+            Query(AttachmentConfirmQuery {
+                message_id: sent_msg.public_id.clone(),
+            }),
             State(state.clone()),
             Json(AttachmentConfirmReq {
                 file_path: wrong_channel_path,
@@ -1606,7 +1933,9 @@ mod tests {
         // 10. Confirm/register attachment
         let confirmed_att = confirm_attachment(
             alice.clone(),
-            Query(sent_msg.public_id.clone()),
+            Query(AttachmentConfirmQuery {
+                message_id: sent_msg.public_id.clone(),
+            }),
             State(state.clone()),
             Json(confirm_req),
         )
