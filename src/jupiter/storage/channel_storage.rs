@@ -4,7 +4,7 @@ use chrono::Utc;
 use idgenerator::IdInstance;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, JoinType, QueryFilter,
-    QuerySelect, RelationTrait, sea_query::Expr,
+    QueryOrder, QuerySelect, RelationTrait, sea_query::Expr,
 };
 
 use crate::{
@@ -62,6 +62,10 @@ impl ChannelStorage {
             )
             .filter(channel_membership::Column::Username.eq(username))
             .filter(channel::Column::DiscardedAt.is_null())
+            // Most-recently-active channels first (source MessageThread#index order:
+            // last_message_at desc, id desc). id is the deterministic tie-breaker.
+            .order_by_desc(channel::Column::LastMessageAt)
+            .order_by_desc(channel::Column::Id)
             .all(self.get_connection())
             .await?;
         Ok(models)
@@ -238,6 +242,74 @@ mod tests {
             .await
             .expect("bob lookup");
         assert!(bob_lookup.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_visible_channels_orders_by_last_message_then_id_desc() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = test_storage(temp_dir.path()).await;
+        let channel_storage = storage.channel_storage();
+        let membership_storage = storage.channel_membership_storage();
+
+        // Four channels for alice; creation order fixes ascending ids.
+        let mut ids = Vec::new();
+        for title in ["a", "b", "c", "d"] {
+            let ch = channel_storage
+                .create_channel(
+                    generate_public_id(),
+                    Some(title.to_string()),
+                    None,
+                    "alice".to_string(),
+                    true,
+                )
+                .await
+                .expect("create channel");
+            membership_storage
+                .add_member(ch.id, "alice".to_string())
+                .await
+                .expect("add alice");
+            ids.push(ch.id);
+        }
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+
+        let base = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp")
+            .naive_utc();
+        let t_old = base;
+        let t_mid = base + chrono::Duration::seconds(10);
+        let t_new = base + chrono::Duration::seconds(20);
+
+        // a -> mid, b -> new, c -> old, d -> new (ties with b at the newest instant).
+        channel_storage
+            .set_latest_message(a, None, t_mid)
+            .await
+            .expect("set a");
+        channel_storage
+            .set_latest_message(b, None, t_new)
+            .await
+            .expect("set b");
+        channel_storage
+            .set_latest_message(c, None, t_old)
+            .await
+            .expect("set c");
+        channel_storage
+            .set_latest_message(d, None, t_new)
+            .await
+            .expect("set d");
+
+        let listed: Vec<i64> = channel_storage
+            .list_visible_channels("alice")
+            .await
+            .expect("list channels")
+            .into_iter()
+            .map(|ch| ch.id)
+            .collect();
+
+        // Expected: last_message_at DESC, then id DESC. The newest instant holds
+        // {b, d}, which must come first ordered by id DESC, then mid (a), then old (c).
+        let mut newest = [b, d];
+        newest.sort_by(|x, y| y.cmp(x));
+        assert_eq!(listed, vec![newest[0], newest[1], a, c]);
     }
 
     #[tokio::test]
