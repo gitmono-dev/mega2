@@ -7,6 +7,7 @@ use futures::{Stream, StreamExt};
 use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 use rand::prelude::*;
 use reqwest::Method;
+use sha2::{Digest, Sha256};
 
 use crate::{
     callisto::lfs_locks,
@@ -292,6 +293,37 @@ pub async fn lfs_upload_object(
     } else {
         return Err(GitLFSError::GeneralError(String::from("Not found ")));
     };
+
+    // Content-addressed immutability. The raw transfer PUT is a capability URL
+    // issued by the auth-gated batch endpoint and is not itself per-request
+    // authenticated, so verify the uploaded bytes actually address the claimed
+    // OID (LFS uses sha256) and match the registered size. This makes objects
+    // immutable by content: an unauthenticated PUT can only (re)store the exact
+    // bytes that hash to the OID — it cannot corrupt or spoof an existing one.
+    if body_bytes.len() as i64 != meta.size {
+        return Err(GitLFSError::GeneralError(format!(
+            "Invalid LFS upload: size {} does not match registered size {} for oid {}",
+            body_bytes.len(),
+            meta.size,
+            meta.oid
+        )));
+    }
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(&body_bytes);
+        hex::encode(hasher.finalize())
+    };
+    if digest != meta.oid {
+        return Err(GitLFSError::GeneralError(format!(
+            "Invalid LFS upload: content hash {digest} does not match oid {}",
+            meta.oid
+        )));
+    }
+    // Objects are immutable by OID; if it is already stored, a matching upload
+    // is a no-op and must not overwrite the existing blob.
+    if lfs_object_exists(&service.obj_storage, &meta.oid).await {
+        return Ok(());
+    }
 
     let key = lfs_object_key(&meta.oid);
     let size = meta.size;
@@ -727,6 +759,63 @@ mod tests {
             .await
             .expect("list legacy mount");
         assert!(legacy.locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lfs_upload_rejects_content_not_matching_oid() {
+        use crate::jupiter::storage::object_storage::mock_object_storage;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let service = LfsService {
+            lfs_storage: storage.lfs_db_storage(),
+            obj_storage: mock_object_storage(),
+        };
+
+        // Register metadata as an `upload` batch would, for the true sha256 of
+        // the content and its exact size.
+        let content = b"monoengine lfs content".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let oid = hex::encode(hasher.finalize());
+        service
+            .lfs_storage
+            .new_lfs_object(
+                MetaObject {
+                    oid: oid.clone(),
+                    size: content.len() as i64,
+                    exist: false,
+                }
+                .into(),
+            )
+            .await
+            .expect("register lfs metadata");
+
+        // Tampered bytes (same length, different hash) are rejected before any
+        // object-storage write, so an unauthenticated PUT cannot corrupt the OID.
+        let mut tampered = content.clone();
+        tampered[0] ^= 0xff;
+        let req = RequestObject {
+            oid: oid.clone(),
+            size: content.len() as i64,
+            ..Default::default()
+        };
+        let err = lfs_upload_object(&service, &req, tampered)
+            .await
+            .expect_err("content not matching oid must be rejected");
+        assert!(
+            err.to_string().contains("does not match oid"),
+            "unexpected error: {err}"
+        );
+
+        // A size mismatch is likewise rejected.
+        let err2 = lfs_upload_object(&service, &req, vec![0u8; 5])
+            .await
+            .expect_err("size mismatch must be rejected");
+        assert!(
+            err2.to_string().contains("does not match registered size"),
+            "unexpected error: {err2}"
+        );
     }
 
     #[test]

@@ -756,13 +756,13 @@ LFS:
 2. `channel_eof` 只处理当前 channel。
 3. ✅ `git-lfs-transfer` 通过 SSH stderr extended-data 返回规范 unsupported 错误，并通过 channel failure 触发客户端 fallback。
 4. ✅ `git-lfs-authenticate` / `git-lfs-transfer` 已校验 upload/download operation；`git-lfs-authenticate` 仍返回同一 HTTP LFS endpoint，后续如需按 operation 拆分 header/URL 再补。
-5. ✅ LFS HTTP endpoint 已绑定认证上下文与 repo path。HTTP LFS object/lock 端点原先完全匿名（未套 `cedar_guard`），现按与 Git smart-protocol 同一套 token 认证语义收敛（`src/api/router/lfs_router.rs`）：读操作（`objects/batch` 的 `download`、object `GET`、lock `list`/`verify`）遵循 `git.anonymous_access`（默认 `true`，与 upload-pack 一致，匿名 clone/pull 不受影响），写操作（`objects/batch` 的 `upload`、object `PUT`、lock `create`/`unlock`）始终要求有效 mono access token（Bearer 或 Basic 密码位，与 receive-pack 一致），未认证写返回带 `WWW-Authenticate` 的 `401`。纯策略函数 `lfs_access_allowed` 与 `enforce_lfs_access` 收敛决策，`lfs_router` 单测锁定策略矩阵、token 解析与 401 challenge。**repo path 绑定**：`rewrite_lfs_request_uri` 在剥离 `/info/lfs` 前缀前先把 repo 前缀存入 `LfsRepoContext` 请求扩展，lock 端点据此把锁行 key 命名空间化为 `{repo}\u{1f}{ref}`（`scoped_lock_ref`），使不同 repo 下同名 ref 的锁不再共用一行；object 由 OID 内容寻址，天然跨 repo 安全，无需隔离。空 repo（`/api/v1/lfs` 内部挂载）回退到裸 ref key 保持向后兼容。
+5. ✅ LFS HTTP endpoint 已绑定认证上下文与 repo path。HTTP LFS 端点原先完全匿名（未套 `cedar_guard`）。**认证模型以 batch 端点为授权闸门**（`src/api/router/lfs_router.rs`）：`objects/batch` 按 `operation` 分流——`download` 为读、`upload` 为写；读遵循 `git.anonymous_access`（默认 `true`，与 upload-pack 一致，匿名 clone/pull 不受影响），写要求有效 mono access token（Bearer 或 Basic 密码位，与 receive-pack 一致），未认证写返回带 `WWW-Authenticate` 的 `401`。lock `create`/`unlock` 为写、`list`/`verify` 为读，同样按此策略。纯策略函数 `lfs_access_allowed` 与 `enforce_lfs_access` 收敛决策，`lfs_router` 单测锁定策略矩阵、token 解析与 401 challenge。**object 传输端点（`PUT`/`GET /objects/{oid}`）是 batch 下发的能力 URL，不再逐请求鉴权**：git-lfs 不会稳定地对 transfer 请求附带凭据（会导致上传 `PUT` 在 body 传输中途收到 `401` 而 broken pipe）。上传安全性由两层保证：(1) `lfs_upload_object`（handler）要求对象必须已由 `upload` batch 注册 metadata（否则 `Not found`），而 `upload` batch 走写鉴权闸门；(2) **内容寻址不可变**——`lfs_upload_object` 校验上传字节的 `sha256` 等于所声明的 OID 且大小等于注册 size，并对已存在对象跳过写入，因此即便匿名直连 `PUT` 也只能（重复）存入恰好哈希到该 OID 的字节，无法篡改或伪造对象。raw `GET` 为匿名（内容寻址能力 URL，绕过 `anonymous_access`）；OID 为 sha256 内容哈希，知道它即隐含已有该内容的引用。**repo path 绑定**：`rewrite_lfs_request_uri` 在剥离 `/info/lfs` 前缀前先把 repo 前缀存入 `LfsRepoContext` 请求扩展，lock 端点据此把锁行 key 命名空间化为 `{repo}\u{1f}{ref}`（`scoped_lock_ref`），使不同 repo 下同名 ref 的锁不再共用一行；object 由 OID 内容寻址，天然跨 repo 安全，无需隔离。空 repo（`/api/v1/lfs` 内部挂载）回退到裸 ref key 保持向后兼容。
 
 验收标准：
 
 - ✅ 单 SSH connection 多 channel 不串状态（`SshServer` 已按 `ChannelId` 隔离 `GitSshChannelState`）。
-- Git LFS 客户端能稳定 fallback 到 HTTP LFS。
-- ✅ 未认证的 LFS 写操作（upload / lock create-unlock）返回 401，不再匿名可写；读操作遵循 `anonymous_access` 策略（由 `lfs_access_policy_matrix` 锁定）。
+- ✅ Git LFS 客户端能稳定完成 HTTP LFS push/clone（object 传输不逐请求鉴权，避免 transfer `PUT` 因中途 `401` broken pipe；由 CI `git-protocol-smoke` 的 LFS round-trip 覆盖）。
+- ✅ 未认证的 LFS 写操作（`objects/batch operation=upload`、lock create-unlock）返回 401，不再匿名可写；读操作遵循 `anonymous_access` 策略（由 `lfs_access_policy_matrix` 锁定）。匿名直连 object `PUT` 因缺少 batch 注册的 metadata 返回 `Not found`；即便针对已注册 OID，也因 `sha256`/size 校验与「已存在则跳过」而无法篡改或伪造。
 - ✅ LFS lock 操作不会跨 repo 混淆：锁行 key 按 repo 命名空间化（由 `locks_are_namespaced_by_repository` 锁定）；object 内容寻址（OID）天然跨 repo 安全。
 
 ### 阶段 6：upload-pack 兼容性扩展

@@ -490,11 +490,11 @@ pub async fn lfs_process_batch(
 pub async fn lfs_download_object(
     state: State<MonoApiServiceState>,
     Path(oid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
-        return Ok(resp);
-    }
+    // Raw object transfer is a capability URL issued by the (auth-gated) batch
+    // endpoint, which is the LFS authorization point; git-lfs does not reliably
+    // attach credentials to the transfer request, so this endpoint is not
+    // re-authenticated here. See `lfs_process_batch` for the read/write gate.
     let result = handler::lfs_download_object(state.storage.lfs_service.clone(), oid.clone()).await;
     match result {
         Ok(byte_stream) => Ok(lfs_response(
@@ -533,9 +533,14 @@ pub async fn lfs_upload_object(
     Path(oid): Path<String>,
     req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    if let Err(resp) = enforce_lfs_access(&state, req.headers(), LfsAccess::Write).await {
-        return Ok(resp);
-    }
+    // Raw object upload is a capability URL issued by the (auth-gated) batch
+    // endpoint: `lfs_process_batch` requires a write token for `operation:
+    // upload` and registers the object metadata, and `lfs_upload_object`
+    // (handler) rejects any oid without that prior registration ("Not found").
+    // So an anonymous upload is impossible without first passing the batch gate.
+    // This endpoint is therefore not re-authenticated here — git-lfs does not
+    // reliably attach credentials to the transfer PUT, and returning 401
+    // mid-body would break the push with a broken pipe.
     let req_obj = RequestObject {
         oid,
         ..Default::default()
