@@ -6,8 +6,8 @@ name: Git Protocol Smoke
 # fetch, protocol v2 fetch, shallow clone, and blob:none partial clone.
 #
 # CI seeds a one-off Mono access token directly into the smoke database and
-# runs the HTTP push/delete branch+tag matrix with Basic Auth.  LFS remains
-# manual because it needs git-lfs on the runner and a larger object round trip.
+# runs the HTTP push/delete branch+tag and LFS round-trip matrices with Basic
+# Auth.
 
 on:
   pull_request:
@@ -61,9 +61,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Install git
+      - name: Install git and git-lfs
         run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
           git --version
+          git lfs version
           git config --global user.email "ci@example.invalid"
           git config --global user.name "CI Smoke"
 
@@ -164,6 +167,7 @@ jobs:
           # one-off access token seeded into the smoke database above.
           MONOENGINE_HTTP_REPO_URL="http://ci-smoke:${SMOKE_GIT_TOKEN}@127.0.0.1:9000/" \
           MONOENGINE_GIT_SMOKE_PUSH=1 \
+          MONOENGINE_GIT_SMOKE_LFS=1 \
             bash scripts/git_protocol_smoke.sh
 
       - name: Stop service http

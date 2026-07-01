@@ -56,9 +56,9 @@
 >
 > **2026-07-01 更新 2**：`try_read_pkt_line` 的 pkt-line parser 错误模型继续收敛。新增回归测试覆盖 reserved length `0003`、length 小于 header（如 `0002want`）的精确错误诊断与不消费输入行为，以及非十六进制 header、短 header、payload 不完整的既有测试；由 `try_read_pkt_line_rejects_reserved_length_3`、`try_read_pkt_line_rejects_length_smaller_than_header`、`try_read_pkt_line_rejects_non_hex_header`、`try_read_pkt_line_rejects_incomplete_header_without_consuming`、`try_read_pkt_line_rejects_incomplete_payload` 共同锁定。
 >
-> **2026-07-01 更新 3**：真实 Git CLI CI 矩阵确认覆盖 HTTP 只读路径（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone、blob:none partial clone）。**2026-07-01 更新 4**：HTTP branch/tag push+delete 已重新进入 CI 必跑 gate；workflow 在 smoke DB 中生成并 mask 一次性 `access_token`，通过 Basic Auth URL 运行 `scripts/git_protocol_smoke.sh` 的 `MONOENGINE_GIT_SMOKE_PUSH=1` 分支。为支持真实新分支 push，monorepo receive-pack 会在 old-id 为零但新提交带 parent 时以首个 parent 作为 CL base；孤儿提交初始化仍拒绝。LFS round-trip 仍保留为手动 opt-in。
+> **2026-07-01 更新 3**：真实 Git CLI CI 矩阵确认覆盖 HTTP 只读路径（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone、blob:none partial clone）。**2026-07-01 更新 4**：HTTP branch/tag push+delete 已重新进入 CI 必跑 gate；workflow 在 smoke DB 中生成并 mask 一次性 `access_token`，通过 Basic Auth URL 运行 `scripts/git_protocol_smoke.sh` 的 `MONOENGINE_GIT_SMOKE_PUSH=1` 分支。为支持真实新分支 push，monorepo receive-pack 会在 old-id 为零但新提交带 parent 时以首个 parent 作为 CL base；孤儿提交初始化仍拒绝。
 
-> **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。该用例仍需 `MONOENGINE_GIT_SMOKE_LFS=1` 和本机 `git-lfs`，尚未进入默认 CI gate。
+> **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MONOENGINE_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -412,7 +412,7 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
 仍待后续处理：
 
 - 将当前完整 body / channel 数据缓冲改为 streaming pkt-line reader。
-- HTTP branch/tag push+delete 已纳入真实 Git CLI CI 矩阵；SSH push/delete 与 LFS round-trip 仍为手动 opt-in。
+- HTTP branch/tag push+delete 与 LFS round-trip 已纳入真实 Git CLI CI 矩阵；SSH push/delete 仍为手动 opt-in。
 
 ### SSH exec command 解析过于脆弱
 
@@ -589,9 +589,9 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 目标：在修改实现前建立可重复的真实 Git 客户端测试矩阵。
 
-已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 monoengine HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MONOENGINE_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH branch/tag push/delete 通过 `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交并对实际生成的 `refs/cl/*` 做 clone/fetch 与清理，避免默认修改远端 refs 且不依赖孤儿初始化。CI 当前自动启用 HTTP read-only 矩阵与 HTTP branch/tag push+delete，SSH push/delete 与 LFS round-trip 仍保留为手动 opt-in。
+已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 monoengine HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MONOENGINE_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH branch/tag push/delete 通过 `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交并对实际生成的 `refs/cl/*` 做 clone/fetch 与清理，避免默认修改远端 refs 且不依赖孤儿初始化。CI 当前自动启用 HTTP read-only 矩阵、HTTP branch/tag push+delete 和 HTTP LFS round-trip；SSH push/delete 仍保留为手动 opt-in。
 
-**（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 push/delete）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、branch push/delete、tag push/delete）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证。LFS round-trip 仍为手动 opt-in（`MONOENGINE_GIT_SMOKE_LFS=1`），因为它还需要 runner 安装 `git-lfs`。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
+**（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 push/delete 与 LFS round-trip）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、branch push/delete、tag push/delete、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MONOENGINE_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
 
 建议脚本或后续集成测试覆盖：
 
@@ -781,7 +781,7 @@ LFS:
 
 | 优先级 | 工作 | 原因 |
 | --- | --- | --- |
-| P0 | 建立真实 Git 客户端兼容性矩阵 | ✅ **已落地并扩展（2026-07-01）**：`scripts/git_protocol_smoke.sh` + `.github/workflows/git-protocol-smoke.yml` CI 自动化回归 gate，覆盖 HTTP read-only 场景（ls-remote/clone/fetch/v2 fetch/shallow/blob:none）以及 HTTP branch/tag push+delete；SSH push/delete 与 LFS round-trip 保留为脚本手动 opt-in |
+| P0 | 建立真实 Git 客户端兼容性矩阵 | ✅ **已落地并扩展（2026-07-01）**：`scripts/git_protocol_smoke.sh` + `.github/workflows/git-protocol-smoke.yml` CI 自动化回归 gate，覆盖 HTTP read-only 场景（ls-remote/clone/fetch/v2 fetch/shallow/blob:none）、HTTP branch/tag push+delete 以及 HTTP LFS push/clone/pull/locks-list；SSH push/delete 保留为脚本手动 opt-in |
 | P0 | 修复 HTTP query、SSH exec、pkt-line parser 的 panic | 非法客户端输入不能打崩服务 |
 | P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；HTTP branch/tag push+delete 已进入 CI；SSH push/delete 仍为手动 opt-in；后续补 streaming parser |
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
