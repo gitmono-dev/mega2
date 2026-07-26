@@ -1,0 +1,776 @@
+# monoengine 长期移植规划（Mega → monoengine 完全移植）
+
+## 文档职责与维护协议
+
+本文是 monoengine 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/run/media/eli/data/gitmono/mega`）的 Rust 后端能力完整移植到 monoengine**，并在移植过程中保留 monoengine 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/run/media/eli/data/gitmono/campsite`）承载，monoengine 的前端与账户系统是 website 仓库（`/run/media/eli/data/gitmono/website`）`monoengine` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
+
+本文的持续事实来源有两类：
+
+- **Mega 目标项目源码**（移植来源与契约基线，不是竞品或外部参照）：以 pinned revision 的 checkout 为准，逐 crate 审计移植状态；浮动 `main` 不作为规范。
+- **monoengine 当前 checkout**：已完成移植的事实以当前代码、测试和 `docs/refactoring/` 重构文档为准，历史计划或对 Mega 目标项目的历史描述只作为线索。
+
+状态定义如下：
+
+| 状态 | 含义 |
+|---|---|
+| 候选 | 有移植线索，但 monoengine 缺口、架构适配或证据尚不足 |
+| 已验证 | 已同时核对 Mega 目标项目源码与 monoengine 当前源码/测试，确认缺口真实存在 |
+| 已排期 | 已有按日期计划覆盖该 PT 的明确范围，并从本文链接 |
+| 实施中 | 该 PT 已有已合入切片，长期完成判据仍未全部满足 |
+| 已实现 | 当前可发布版本中的代码、测试、用户/兼容文档共同证明完成判据已满足 |
+| 已替代 | 原移植需求仍有效，但由另一 PT 或更合适的机制承接 |
+| 不采纳 | 经审计确认不适合 monoengine（或明确属于范围外资产），保留编号与理由 |
+
+只有当前 checkout 的代码、测试、兼容性与用户文档，以及可发布版本证据共同成立时，PT 才能标记"已实现"。日期计划写完、Mega 目标项目已有该能力、存在 schema 或文档声明都不构成实现证明。PT 编号一经引用不重编号；详细章节不承担排序，唯一排序入口是"长期功能总览"。
+
+## 本次 Mega 源码审计快照
+
+审计时间：**2026-07-27**。审计方式：使用 libra 分别核对两个仓库的当前 checkout 与工作区状态（两仓库均由 libra 管理，不得用 git 命令误判）。
+
+- Mega 目标项目：`main` @ `d2b6d1c314ab750a06fd96cff85559cd685907ea`（2026-07-26，`release: update Orion to scorpiofs 0.3.0 (#2157)`）。
+- monoengine：`main` @ `562122c2590f6a344a0419a4147766766922a9b4`，版本 v0.1.50；最后一次 Mega 同步分析（v0.1.50 提交说明）基于 Mega `#2129`。**Mega 已推进到 `#2157`，已移植模块存在待核对的漂移窗口。**
+- monoengine 工作区：`docs/plan/`（本文件族）为未跟踪文件；`docs/refactoring/notification.md`、`docs/sync/mega-2026-06-24.md` 有已跟踪改动，均属本次文档变更集，无无关改动。
+- 关联前端与账户系统（PT-12 事实基线，2026-07-27 核对）：campsite（`/run/media/eli/data/gitmono/campsite`，Rails 应用，Mega 前端 moon 的账户/后端配对）；website（`/run/media/eli/data/gitmono/website`，libra 管理）`monoengine` 分支 @ `afcd69af1992a1707e46254635a9df054761ad88`（2026-07-15），其 `apps/next-app`（Next.js）是 monoengine 的前端与账户系统。
+
+Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）：
+
+| Mega 资产 | 职责 | 移植状态 | monoengine 对应 | 证据入口 |
+|---|---|---|---|---|
+| `mono` | 主二进制：CLI、service(http/ssh/multi)、HTTP API 全套路由、bootstrap、server、git_protocol、email、notification、orion_build_dispatch | 已移植（高度重构） | `src/cli.rs` + `bin/`、`src/commands/`、`src/server/`、`src/api/`、`src/context/`、`src/contract/git_protocol/`、`src/mail/`、`src/notification/`、`src/bellatrix/` | 各 crate `src/` 顶层结构对照 |
+| `ceres` | monorepo 领域库：application、bus、diff、infra、lfs、merge_checker、model、transport | 部分移植 | `src/ceres/`（api_service/build_trigger/code_edit/diff/lfs/merge_checker/model/pack/protocol）；application/artifact→`src/jupiter/service/artifact_service.rs`、application/buck→`buck_service.rs`、application/webhook→`webhook_service.rs`、application/notification→`src/notification/` | **`ceres/bus`、`ceres/infra` 未作为模块移植（PT-05）** |
+| `jupiter` | 存储层：model、redis、service、storage、tests、utils | 已移植 | `src/jupiter/` | 同名目录结构 |
+| `jupiter/callisto` | sea-orm 实体 | 已移植 | `src/callisto/` | 同名目录结构 |
+| `jupiter-migrate` | sea-orm 迁移 | 已移植 | `src/jupiter/migration/` | 同名目录结构 |
+| `common` | config、enums、errors、utils | 已移植（config 大幅扩展） | `src/common/`；`common/config` 提升为一级 `src/config/` | `docs/refactoring/config.md` |
+| `saturn` | Cedar 策略/授权 | 已移植 | `src/contract/policy/`（并吸入 mono 的 `api/guard/`） | `docs/refactoring/contract.md` |
+| `vault` | RustyVault 集成 | 已移植（vendored + 加固） | `src/vault/` + `src/contract/vault/` | `docs/refactoring/vault.md` |
+| `api-model` | API DTO | 已移植 | `src/contract/api/` | `docs/refactoring/contract.md` |
+| `io-orbit` | 对象存储 | 已移植（拆分为独立 crate） | sibling `../orbit` + `orbit-api`，经 `src/jupiter/storage/object_storage.rs` 注入 | `docs/refactoring/orbit.md` |
+| `clients/orion-client` | orion-server HTTP 客户端 | 部分移植 | `src/bellatrix/`（仅 build dispatch 路径） | 完整 API 面未核对（PT-08） |
+| `clients/orion-scheduler-client` | orion-scheduler HTTP 客户端 | **未移植** | 无 | PT-08 |
+| `orion` | 构建执行 agent（antares、buck_controller、disk、repo、ws、api） | **未移植** | 无 | PT-07 |
+| `orion-server` | 构建任务服务端（api、buck2、log、model、repository、scheduler、service、server） | **未移植** | 无（仅保留消费侧 `buck_router`/`artifacts_router`/`build_trigger_router` API 面） | PT-06 |
+| `orion-scheduler` | QEMU VM 弹性调度（vm_manager、vm_cleanup、keep_alive、orion_deployer、webhook） | **未移植** | 无 | PT-08 |
+| `moon` | Web 前端（pnpm + turbo，Next.js） | 范围外 | 无（引擎只移植 Rust 后端） | 见"不进入本长期移植计划的 Mega 资产" |
+| `tests/` | Git 协议/对象层集成测试夹具（data、diff、objects、refs、scripts） | **未移植** | monoengine 有 `test/project/` 与 `bin/tests/`，协议级夹具未系统移植 | PT-04 |
+| `scripts/`、`docker/` | 运维/部署辅助（crates-sync、init_mega、demo、deployment） | 未移植 | 无 | 是否移植需单独决策，见"不进入"章节 |
+
+最近审计记录最多保留 12 次；超过上限后把更早记录压缩为 revision 集合与结论，不保留逐 crate 对照日志。
+
+| 审计日期 | Mega revision | monoengine 基线 | 路线图结论 |
+|---|---|---|---|
+| 2026-07-27 | `d2b6d1c3`（#2157） | v0.1.50（`562122c2`，同步分析基于 #2129） | 首版：确认 orion 三件套、ceres/bus+infra、协议测试夹具为主要缺口；已移植模块存在 #2129→#2157 漂移窗口；集成测试基建（PT-01）排为下一个执行任务，Mega 基线追平（PT-02）紧随其后 |
+
+**本次结论：PT-01（集成测试基建扩展与统一）是下一个执行任务；orion 三件套是最大整体缺口。**
+
+## 规划原则
+
+以下原则适用于 PT-01 至 PT-12：
+
+1. **忠实移植优先于重新设计。** 默认保留 Mega 的 wire 行为、DB schema、API 契约和错误语义；架构性偏离必须是已决 ADR 并记录在案（如 contract 归并、config 提升、workspace 拆分），不得在执行中临时发明。
+2. **monoengine 的架构改进不回退。** workspace（`monoengine-core` + thin `bin`）、`src/contract/` 边界归并、一级 `src/config/`、`src/mail/`、vendored Vault、orbit provider 注入、对象存储构造时机等已交付改进，不因"与 Mega 不一致"而改回。
+3. **移植前必须 pin 并核对 Mega revision。** 每个日期计划开工前用 libra 记录 Mega 实际 checkout revision，逐文件刷新源码锚点；不得把浮动 `main`、历史同步报告或本文快照当作当前事实。
+4. **先追平、后扩展。** 已移植模块的 Mega 基线漂移（PT-02）优先于在其上叠加新能力；在漂移窗口上实施新 PT 前，必须先确认相关模块的 Mega 变更已被吸收或明确排除。
+5. **三门验收是硬门禁。** 每个任务至少通过 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test ...` 指定用例；`cargo build [--tests]` 保持 0 错误 0 警告。
+6. **机器接口与文档同步。** 涉及公开命令、配置项、DB schema、HTTP API、错误码或存储格式的移植，必须同步 OpenAPI schema、配置示例、错误码文档和测试，并遵守 `AGENTS.md` 的实体/迁移/子命令登记流程。
+7. **安全边界 fail-closed。** Vault、SecretRef、认证授权、协议输入解析的安全语义不得因移植而弱化；Mega 目标项目的宽松默认不自动成为 monoengine 的默认。
+8. **不重复建设事实源。** Mega 侧能力若已被 monoengine 以更强形态覆盖（如 notification、config、mail），不回流旧实现；只补缺口，不重复移植。
+9. **测试随代码移植。** 移植功能必须携带或重建其测试；禁止手写 schema SQL，必须走真实 migration；集成测试沿用 docker-compose 测试栈与 `bin/tests/` 黑盒分层。
+10. **计划状态必须据代码更新。** 每次审计重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
+11. **双前端一致性。** Mega 前端体系是 moon + campsite，monoengine 前端与账户系统是 website `monoengine` 分支的 `apps/next-app`；monoengine 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。
+
+## 当前基础
+
+以下事实已在 2026-07-27 以当前 monoengine checkout（v0.1.50，`562122c2`）的源码、测试与 `docs/refactoring/` 文档复核；历史计划不作为实现证据：
+
+| 基础能力 | 当前事实 | 长期规划中的用途 |
+|---|---|---|
+| callisto 实体 + jupiter storage/migration/redis | 已从 Mega 移植并持续对齐（最后同步基于 Mega #2129） | 所有 PT 的数据层基础 |
+| `src/config/` 一级配置体系 | LoadMode、SecretRef/resolver、`config` 命令族、集中校验、Profile、测试分层、受控热加载已交付（`docs/refactoring/config.md`） | PT-10 的起点；所有服务的配置承载 |
+| `src/contract/` 边界归并 | api/git_protocol/policy/vault 四域归并完成，旧路径无兼容层（`docs/refactoring/contract.md`） | 新移植模块的落点规范 |
+| Vault（vendored RustyVault + 集成层） | A–J 阶段可交付子集完成：fail-closed、DB-only bootstrap、root token 退役、rekey、审计 hook（`docs/refactoring/vault.md`） | PT-11 的起点；凭据类 PT 的前置 |
+| `src/mail/` + `src/notification/` | outbox、dispatcher、多渠道框架、用户偏好、admin API、模板管理、热加载已交付，超出 Mega 对应实现 | PT-09 的起点 |
+| orbit 对象存储（provider 注入） | core 只依赖 `orbit-api`，重量级 SDK 仅留在 bin 编译图（`docs/refactoring/orbit.md`） | LFS/artifact/构建产物的存储承载 |
+| Git smart HTTP/SSH 协议 | `info/refs` 严格化、fallible pkt-line parser、SSH exec parser、receive-pack 分割、capability truth table 首批止血完成（`docs/refactoring/protocol.md`） | PT-03/PT-04 的起点 |
+| bellatrix（orion-client 部分移植） | build dispatch 路径可用，替代 Mega mono 的 `orion_build_dispatch.rs` | PT-06/PT-07/PT-08 的客户端侧基础 |
+| chat 模块（源：campsite Rails，非 Mega） | Slice 0–5 主干完成（9 表、storage、service、router、附件、事件 hub、`chat-migrate` CLI；`docs/refactoring/chat.md`） | 独立改进计划治理，不占 PT 编号 |
+| 集成测试基建 | docker-compose 测试栈（postgres/redis/mailpit）、`bin/tests/integration_vault.rs` 黑盒、错误脱敏活进程门禁、CI `config-validation.yml` | 全部 PT 的验收承载；拓扑扩展与统一由 PT-01 承接 |
+
+## 长期功能总览
+
+| ID | 能力 | 优先级 | 状态 | 当前判断 | Mega 证据（revision `d2b6d1c3`） | 已关联日期计划 | 最近验证 |
+|---|---|---:|---|---|---|---|---|
+| PT-01 | 集成测试基建扩展与统一 | P0 | 已排期（**下一个执行任务**） | 测试栈与黑盒分层只覆盖 config/vault/mail/notification；真实 Git CLI 矩阵、orion ws、多实例竞争、热加载黑盒无承载 | `mega/tests/`（对照）、`docs/refactoring/integration.md` P2 清单 | [`plan-20260727.md`](plan-20260727.md)（IT-01..IT-07） | 2026-07-27 |
+| PT-02 | 已移植模块 Mega 基线追平与持续同步 | P0 | 已验证 | monoengine 同步基线停在 Mega #2129，Mega 已到 #2157；callisto/jupiter/ceres/mono 对应面需逐模块核对漂移 | Mega log #2130–#2157 | 无 | 2026-07-27 |
+| PT-03 | Git 协议兼容性与 LFS 收尾 | P0 | 实施中 | 首批 panic 止血与 capability truth table 已交付；streaming parser、per-channel state、统一 ProtocolAuthContext、delete-push 矩阵等缺失 | `mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` | 无 | 2026-07-27 |
+| PT-04 | Git 协议集成测试夹具与真实 CLI 兼容矩阵 | P0 | 已验证 | `test/project/` 与 `bin/tests/` 不覆盖 Mega 协议级夹具；真实 Git CLI smoke 矩阵未建立 | `mega/tests/{data,diff,objects,refs,scripts}` | 无 | 2026-07-27 |
+| PT-05 | ceres/bus 事件总线与 infra 基础设施归位 | P1 | 已验证 | `TransportRuntime`/`TransportEvent`/`ApplicationEventHandler` 未移植；cache 已并入 api_service，pack_decode/pack_stream 逻辑散落 | `mega/ceres/src/bus/`、`mega/ceres/src/infra/` | 无 | 2026-07-27 |
+| PT-06 | Orion Server 构建控制面移植 | P1 | 已验证 | 整体缺失；monoengine 仅保留消费侧 API 面（buck/artifacts/build_trigger router）与 bellatrix 客户端 | `mega/orion-server/`、`mega/mono/src/api` 的 orion_runner_router | 无 | 2026-07-27 |
+| PT-07 | Orion 构建执行 Agent 移植 | P1 | 已验证 | runner（ws 客户端、buck_controller、disk/repo 管理）整体缺失 | `mega/orion/` | 无 | 2026-07-27 |
+| PT-08 | Orion Scheduler、VM 弹性调度与客户端 API 面补齐 | P2 | 已验证 | scheduler 与 orion-scheduler-client 未移植；bellatrix 仅覆盖 build dispatch，完整 OrionBuildClient API 面未核对 | `mega/orion-scheduler/`、`mega/clients/` | 无 | 2026-07-27 |
+| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | 多渠道框架已超 Mega；webhook/slack 渠道、build 完成触发器、明文 `mail.password` 退场、多实例黑盒矩阵缺失 | `mega/mono/src/notification/`、campsite slack 参考 | 无 | 2026-07-27 |
+| PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储/Redis SecretRef（阶段 6 可选项）、`[oauth]` 落地或清理、热加载消费端扩展、source diagnostics 矩阵缺失 | `mega/common/src/config`（基线对照） | 无 | 2026-07-27 |
+| PT-11 | Vault 安全工程收尾 | P2 | 实施中 | KEK 轮换、审计持久化 sink、root recovery 材料外置、格式版本策略缺失 | `mega/vault/`（基线对照） | 无 | 2026-07-27 |
+| PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | 双前端体系角色与 pinned revision 已确认；apps/next-app 与 moon 的功能差异未逐项审计，一致性追平机制未建立 | website `monoengine` 分支 `afcd69af` 的 `apps/next-app`、`mega/moon/`、campsite | 无 | 2026-07-27 |
+
+## 工程安全基线
+
+以下项目不新增 PT 编号，而是全部移植与收尾工作进入实施和发布前必须持续满足的工程门禁。完成状态必须由代码、回归测试和故障注入证明，不能仅以文档或人工约定关闭。
+
+| ID | 修复主题 | 优先级 | 当前判断 | 阻断范围 |
+|---|---|---:|---|---|
+| SB-01 | 消除生产路径残余 panic/unwrap | P1 | 协议 response builder、`repo.rs` 路径转换、config 残余加载路径等仍有未收敛点 | 协议、API、配置加载、全部服务可靠性 |
+| SB-02 | 凭据与 secret 边界持续收敛 | P1 | 明文 `mail.password` 兼容期未退场；redaction 覆盖面、resolver 缓存失效语义未闭合 | mail、vault、对象存储、通知渠道 |
+| SB-03 | 测试门禁、Docker 测试栈与 CI 可信度 | P1/P2 | 三道门禁与 docker-compose 栈运行良好；真实 Git CLI 矩阵、多实例竞争矩阵未建立 | CI 稳定性、回归可信度与全部 PT 的验收承载 |
+
+### SB-01：消除生产路径残余 panic/unwrap
+
+#### 当前风险
+
+- `src/contract/git_protocol/` 与 `src/ceres/protocol/` 的 response builder、in-memory reader、`repo.rs` 路径转换等仍有 `docs/refactoring/protocol.md` 记录的残余 `unwrap()`。
+- 配置加载路径上仍有 `docs/refactoring/config.md` 记录的残余 `expect`/`panic` 待继续收敛。
+- 移植新模块时若直接复制 Mega 目标项目的 `unwrap()`/`expect()`/`panic!()`，会扩大风险面。
+
+#### 修复要求
+
+- 生产代码不得新增未解释的 `unwrap()`、`expect()` 或 `panic!()`；确属不可失败逻辑必须有 `// INVARIANT:` 注释并在任务验收中说明（`docs/plan/plan-template.md` 使用规则）。
+- 协议输入一律走 fallible parser；网络字节不得触发 panic、整数下溢或越界切片。
+- 移植任务交付前对移植面运行 panic 审查，Mega 侧的 panic 点必须 Result 化后落地。
+
+#### 完成判据
+
+- protocol.md、config.md 记录的残余清单全部关闭或有最小范围豁免与可验证 invariant。
+- 故障注入（malformed pkt-line、坏 TOML、损坏 HEAD、失效路径）均产生稳定、可操作的错误而不终止进程。
+
+### SB-02：凭据与 secret 边界持续收敛
+
+#### 当前风险
+
+- 明文 `mail.password` 仍在兼容期，样例与生产配置未完成向 `password_ref` 的迁移治理。
+- redaction/SecretString 覆盖面（SMTP 密码、对象存储 key、外部服务 URL）未完全扩展。
+- 凭据变更时 resolver 缓存失效语义（`evict`/`evict_all` 的调用点）未逐点确认。
+
+#### 修复要求
+
+- 新移植的凭据消费端一律先落 SecretRef，不新增明文凭据配置项。
+- 错误与日志路径的脱敏测试随功能同步交付（沿用 `integration_error_redaction` 模式）。
+- 引导循环硬约束继续成立：数据库凭据永远不能是 vault SecretRef；对象存储/Redis 进 vault 之前必须完成 PT-10 的后置初始化。
+
+#### 完成判据
+
+- 明文 `mail.password` 有明确退场里程碑；secret 缺失时服务 fail-closed 且错误不回显值。
+- 活进程脱敏门禁覆盖 DB、Redis、SMTP、对象存储四类凭据。
+
+### SB-03：测试门禁、Docker 测试栈与 CI 可信度
+
+#### 当前风险
+
+- 三道门禁与 docker-compose 测试栈（postgres:15、redis:7、mailpit）运行良好，但真实 Git CLI 兼容矩阵、多进程 outbox claim 竞争矩阵、热加载黑盒用例未建立。
+- 移植 orion 三件套将引入 ws、VM、构建产物等新基础设施，测试栈不扩展则验收无承载。
+
+#### 修复要求
+
+- 新增基础设施组件必须先定义测试双层（模块集成 + `bin/tests/` 黑盒）与 docker-compose 拓扑，再落地实现。
+- 禁止手写 schema SQL；必须断言连接的是 PostgreSQL；镜像固定 tag；secret 只经 stdin。
+
+#### 完成判据
+
+- PT-04 的真实 CLI 矩阵、PT-09 的多实例矩阵、PT-06/07 的 ws/构建链路基线用例进入 CI 可运行形态（基建承载由 PT-01 交付）。
+
+## PT-01：集成测试基建扩展与统一
+
+### 移植问题
+
+当前集成测试基建（docker-compose 测试栈 postgres:15/redis:7/mailpit、`bin/tests/` 黑盒、模块集成测试、CI `config-validation.yml`）只覆盖 config/vault/mail/notification 链路。后续 PT 将引入真实 Git CLI 协议矩阵、orion ws 服务、多实例 outbox 竞争、热加载黑盒等新形态负载，现有拓扑与 harness 无承载；不先统一基建，每个 PT 会各自发明测试脚手架，重复、不可比且无法进入 CI。
+
+### 目标范围
+
+- 统一测试双层规范（模块集成测试 + `bin/tests/` 黑盒）与 fixture 生命周期管理，新组件按规范接入。
+- docker-compose 测试栈拓扑扩展机制：新增服务（Git CLI runner、orion-server、fake webhook receiver 等）有标准登记方式；固定端口、固定镜像 tag、secret 只经 stdin 的纪律不变。
+- 交付真实 Git CLI smoke 最小矩阵（HTTP 通道 clone/push），作为拓扑扩展的示范负载。
+- 热加载黑盒用例、多实例 outbox claim 竞争基线用例进入 CI 可运行形态。
+- `docs/refactoring/integration.md` 的 P2 清单逐项落地或书面关闭。
+
+### 非目标
+
+- 不追求覆盖率数字；本 PT 只为后续 PT 提供验收承载。
+- 不重写既有测试；只扩展拓扑与规范。
+- Git 协议专项矩阵的完整用例面与 Mega `tests/` 夹具的审计移植属 PT-04。
+
+### 完成判据
+
+- 新服务接入测试栈有标准流程，并以 Git CLI runner 为示范落地。
+- HTTP 通道真实 Git CLI 最小矩阵、热加载黑盒、多实例竞争基线用例 CI 绿。
+- integration.md P2 清单全部有"落地 / 关闭（含理由）"结论。
+
+### 审计证据、真实缺口与提升条件
+
+- **monoengine 现状证据**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`.github/workflows/config-validation.yml` 已复核；`docs/refactoring/integration.md` P2 清单（热加载黑盒、多渠道、对象存储 SecretRef 场景）未落地。
+- **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 monoengine 无承载。
+- **最小可验证第一阶段**：docker-compose 增加 Git CLI runner 服务 + HTTP clone/push 最小矩阵进 CI。
+- **风险与边界**：测试栈膨胀会拖慢 CI；新服务必须可选启用，本地单元测试路径不受影响。
+
+### 依赖与顺序
+
+PT-01 不依赖其他 PT，是全部后续 PT 的验收承载：PT-04（协议矩阵）、PT-06/PT-07（orion 链路）、PT-09（多实例矩阵）的验收依赖本 PT 的拓扑扩展。
+
+---
+
+## PT-02：已移植模块 Mega 基线追平与持续同步
+
+### 移植问题
+
+monoengine 的 callisto、jupiter、ceres、mono 对应面最后系统同步基于 Mega `#2129`（v0.1.50 同步分析报告），Mega 已推进到 `#2157`。在漂移窗口上直接实施 PT-03 至 PT-08，会把"移植缺口"与"Mega 新变更"混在一起，导致锚点失效和重复劳动。
+
+### 目标范围
+
+- 用 libra 核对 Mega `#2130..#2157` 的全部提交，按模块分类：callisto 实体、jupiter storage/migration、ceres、mono API/命令、vault、saturn、api-model、clients。
+- 对每个已移植模块给出"吸收 / 明确排除（含理由）/ 转 PT-xx 承接"的三选一结论。
+- 建立持续同步机制：每次审计记录 Mega revision 与漂移结论，写回本文"审计快照"章节。
+- 漂移追平不得引入与 monoengine 架构改进冲突的回流（原则 2、8）。
+
+### 非目标
+
+- 不追赶 Mega 的发布节奏；只追平与已移植模块相关的变更。
+- 不在本 PT 内实施 orion 三件套等新模块移植（属 PT-06/07/08）。
+- 不处理 moon、scripts、docker 等非 Rust 资产。
+
+### 完成判据
+
+- Mega `#2130..#2157` 每个提交都有书面归类结论；被吸收的变更已合入并通过三门验收。
+- callisto 实体与 migration 与 Mega 当前 schema 一致，或差异有书面豁免理由。
+- 本文"审计快照"更新到吸收完成时的 Mega revision，并注明下一次核对基线。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`main` @ `d2b6d1c3`（#2157，`release: update Orion to scorpiofs 0.3.0`）；#2130–#2157 区间内容未在 monoengine 侧归类。
+- **monoengine 现状证据**：v0.1.50 提交说明明确"Read-only analysis of upstream mega (HEAD #2129)"；此后无同步记录。
+- **最小可验证第一阶段**：先产出逐提交归类表（纯审计，不改代码），再按模块分批吸收；第一批只处理 callisto/jupiter（数据层漂移风险最高）。
+- **风险与边界**：漂移追平期间若发现 Mega 侧重构与 monoengine 架构决策冲突，停下来记 ADR，不做静默折中。
+
+### 依赖与顺序
+
+PT-02 不依赖其他 PT，是 PT-03、PT-05、PT-06 实施前的推荐前置（在漂移窗口上开工的 PT 必须先自行完成相关模块的局部追平）。
+
+---
+
+## PT-03：Git 协议兼容性与 LFS 收尾
+
+### 移植问题
+
+Git smart HTTP/SSH 协议已完成首批 panic 止血（`info/refs` 严格化、fallible pkt-line parser、SSH exec parser、receive-pack 按 flush-pkt 分割、capability truth table），但 `docs/refactoring/protocol.md` 记录的核心能力缺口仍在：协议路径仍缓冲完整 body/channel、SSH 无 per-channel state、认证上下文未统一、delete-push 与 LFS 边界未加固。
+
+### 目标范围
+
+- streaming pkt-line reader：HTTP/SSH 协议路径不再缓冲完整 body/channel。
+- SSH per-channel state（`GitSshChannelState`），通道生命周期与会话状态显式建模。
+- 统一 `ProtocolAuthContext`：SSH publickey 成功必须注入 username，消除 commit binding 变 anonymous 的路径。
+- delete-only push 语义与 `git push --delete` 矩阵；LFS hybrid 响应加固与 repo path 绑定。
+- `ofs-delta` 编解码完整验证；capability truth table 收敛：advertise/parse/act-on/test 四列一致后方可重新声明 `atomic` 等能力。
+- 残余 `unwrap()` 收敛（与 SB-01 联动）。
+
+### 非目标
+
+- 不承诺 protocol v2、`deepen`/shallow clone、partial clone、pure SSH LFS（protocol.md 阶段 6，P3 另行决策）。
+- 不为了对齐 Mega 而重新声明未实现且未测试的 capability。
+
+### 完成判据
+
+- capability truth table 无 ⚠️/❌ 项，或每项有书面豁免；大 payload 在受限内存下 streaming 处理。
+- SSH publickey 认证后所有协议操作的 commit binding 携带正确身份，有回归测试。
+- `git push --delete`、LFS hybrid、并发 receive-pack 的故障注入矩阵通过。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` 为移植基线；monoengine 已在正确性上局部超过 Mega（capability 诚实化），不回退。
+- **monoengine 现状证据**：`src/contract/git_protocol/{http,ssh}.rs`、`src/ceres/protocol/smart.rs` 的止血切片已合入；protocol.md 阶段 3–6 未完成。
+- **最小可验证第一阶段**：统一 `ProtocolAuthContext` + delete-push 矩阵（行为正确性优先），再做 streaming 重构（性能与内存）。
+- **风险与边界**：streaming 重构改变热路径内存模型，必须带基准与回退方案；依赖 PT-04 的 CLI 矩阵做防回归。
+
+### 依赖与顺序
+
+PT-03 的行为类切片可先行；streaming 与 capability 重新声明应在 PT-04 的真实 CLI 矩阵落地后进行。开工前完成 PT-02 对 git_protocol/ceres 相关提交的局部追平。
+
+---
+
+## PT-04：Git 协议集成测试夹具与真实 CLI 兼容矩阵
+
+### 移植问题
+
+Mega `tests/` 提供协议/对象层集成测试夹具（`data/`、`diff/`、`objects/`、`refs/`、`scripts/`），monoengine 未系统移植；`test/project/` 与 `bin/tests/` 不覆盖该层。没有真实 Git CLI 兼容矩阵，PT-03 的每个协议改动都缺乏防回归网。
+
+### 目标范围
+
+- 审计 Mega `tests/` 夹具的内容、许可与生成方式，决定移植、重建或替代。
+- 建立真实 Git CLI smoke 矩阵：HTTP/SSH/LFS 三通道的 clone/fetch/push/delete 用例（protocol.md 已列出建议清单）。
+- 矩阵进入 CI 可运行形态（沿用 docker-compose 测试栈纪律：固定端口、固定 tag、无手写 schema）。
+
+### 非目标
+
+- 不追求 Git 官方测试套件级覆盖率（属另一量级的兼容治理）。
+- 不把夹具数据直接复制进仓库而不核对其许可与体积。
+
+### 完成判据
+
+- 真实 Git CLI 对 monoengine 服务完成 HTTP/SSH/LFS 三通道正路径与关键故障路径用例，CI 绿。
+- 夹具或重建数据有来源记录；新增协议能力必须同步矩阵用例（门禁化）。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/tests/{data,diff,objects,refs,scripts}` 存在且被 Mega 测试使用。
+- **monoengine 现状证据**：`test/project/` 为业务集成测试夹具，`bin/tests/` 为黑盒进程测试；协议层无对应物。
+- **最小可验证第一阶段**：HTTP 通道最小矩阵已由 PT-01 以 Git CLI runner 示范落地；本 PT 在其上补全 SSH/LFS 通道与故障路径。
+- **风险与边界**：SSH 通道矩阵依赖测试栈提供 sshd；LFS 依赖对象存储后端，优先 local FS 后端。
+
+### 依赖与顺序
+
+PT-04 紧随 PT-01 启动（拓扑与最小矩阵承载来自 PT-01），其完整矩阵是 PT-03 后续切片的验收承载；与 PT-02 无冲突，可并行。
+
+---
+
+## PT-05：ceres/bus 事件总线与 infra 基础设施归位
+
+### 移植问题
+
+Mega `ceres/src/bus/`（`TransportRuntime`、`TransportEvent`、`ApplicationEventHandler`）与 `ceres/src/infra/`（cache、pack_decode、pack_stream）未作为模块移植。cache 已并入 `src/ceres/api_service/cache.rs`，pack 相关逻辑散落在 `src/ceres/pack/` 与 `src/ceres/protocol/smart.rs`。orion 构建链路（PT-06/07）与 build 完成触发器（PT-09）在 Mega 中均经过事件总线通信，缺失总线会迫使后续 PT 发明临时通道。
+
+### 目标范围
+
+- 审计 `ceres/bus` 在 Mega 中的全部生产者/消费者，判定 monoengine 需要的事件面（构建触发、构建完成、传输事件）。
+- 决定归位形态：按 `src/contract/` 边界规范落入合适模块，或论证后明确不移植（状态转"不采纳"并记录理由）。
+- `infra` 的 pack_decode/pack_stream 逻辑归位：消除散落重复，落点符合现有 ceres 模块划分。
+
+### 非目标
+
+- 不引入 Mega 未使用的通用事件框架；只移植有真实消费者的事件面。
+- 不在本 PT 内接入 orion（消费者接入属 PT-06/07/09）。
+
+### 完成判据
+
+- 事件总线归位（或书面不采纳结论）合入；生产者/消费者清单与 Mega 侧一一对应或有豁免。
+- pack_decode/pack_stream 无散落重复实现；三门验收通过。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/ceres/src/bus/`、`mega/ceres/src/infra/` 目录与引用图。
+- **monoengine 现状证据**：`src/ceres/` 模块清单无 bus/infra；`build_trigger` 已存在但事件通道缺失。
+- **最小可验证第一阶段**：纯审计——画出 Mega 侧事件生产者/消费者图，给出归位 ADR；代码落地放第二阶段。
+- **风险与边界**：事件总线是 PT-06 通信形态的前置决策，拖延会阻塞构建链路设计。
+
+### 依赖与顺序
+
+PT-05 的审计结论（采用 bus 与否）是 PT-06 的前置；开工前完成 PT-02 对 ceres 相关提交的局部追平。
+
+---
+
+## PT-06：Orion Server 构建控制面移植
+
+### 移植问题
+
+Mega `orion-server`（api、buck2、log、model、repository、scheduler、service、server）是构建任务控制面：接收 TaskBuildRequest、调度任务、收集日志、管理产物。monoengine 只有消费侧——`buck_router`/`artifacts_router`/`build_trigger_router` API 面与 bellatrix 客户端——构建任务无处投递。这是"mega 完全移植"最大的整体缺口之一。
+
+### 目标范围
+
+- 移植 orion-server 的 HTTP API、任务模型、调度、日志收集与产物管理，落点遵循 `src/contract/` 与 jupiter 分层规范。
+- 移植 mono 侧 `orion_runner_router`（runner 上报/注册接口），补齐 `src/api/router/` 缺失面。
+- 实体/迁移按 `AGENTS.md` 流程进入 `src/callisto/` 与 `src/jupiter/migration/`；DB schema 与 Mega 对齐或书面豁免。
+- 与 bellatrix（客户端侧）完成端到端联通：dispatch → server 接收 → 状态可查。
+
+### 非目标
+
+- 不移植 runner 执行逻辑（PT-07）与 VM 调度（PT-08）。
+- 不改变 monoengine 既有 buck/artifacts API 的公开契约（除非书面 ADR）。
+
+### 完成判据
+
+- bellatrix dispatch 的构建任务在 orion-server 侧可接收、可调度、可查询状态与日志。
+- docker-compose 测试栈扩展出 orion-server 拓扑（拓扑机制来自 PT-01），`bin/tests/` 黑盒用例覆盖 dispatch→接收正路径。
+- OpenAPI schema、错误码文档、迁移同步；三门验收通过。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/orion-server/` 完整 crate；`mega/mono/src/api` 的 orion_runner_router；`mega/clients/orion-client` 的完整 API 面。
+- **monoengine 现状证据**：`src/bellatrix/` 仅 build dispatch 路径；API state 无 orion-server 相关字段；`src/api/router/` 无 orion_runner_router。
+- **最小可验证第一阶段**：任务模型 + 接收 API + 内存/DB 调度最小环，bellatrix 正路径联通；日志与产物管理第二阶段。
+- **风险与边界**：通信形态（直发 HTTP vs 事件总线）必须先等 PT-05 结论；schema 对齐需 PT-02 先行。
+
+### 依赖与顺序
+
+依赖 PT-05（通信形态决策）与 PT-02（ceres/callisto 追平）；验收拓扑依赖 PT-01；是 PT-07 的前置。
+
+---
+
+## PT-07：Orion 构建执行 Agent 移植
+
+### 移植问题
+
+Mega `orion` 是跑在构建机上的执行 agent：经 ws 与 orion-server 通信，执行 buck2 构建（`buck_controller`）、管理磁盘与 repo 缓存。monoengine 完全缺失 runner 侧，构建链路即使有 server 也无法执行。
+
+### 目标范围
+
+- 移植 orion agent 的 ws 客户端、任务接收、 buck_controller、disk/repo 缓存管理。
+- 与 PT-06 的 server 完成 ws 协议联通：注册、接任务、上报状态与日志。
+- runner 侧配置进入 `src/config/` 体系（LoadMode、校验、脱敏纪律不变）。
+
+### 非目标
+
+- 不移植 QEMU/VM 弹性承载（PT-08）；runner 先以常驻进程形态交付。
+- 不实现 Mega 也没有的新调度策略。
+
+### 完成判据
+
+- 端到端：bellatrix dispatch → orion-server → orion agent 执行（可用 fake/stub buck2）→ 状态与日志回传可查。
+- ws 断连重连、任务抢占、磁盘水位等故障注入用例通过；三门验收通过。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/orion/src/{ws,buck_controller,disk,repo,api}`。
+- **monoengine 现状证据**：无任何 runner 对应物。
+- **最小可验证第一阶段**：ws 注册 + 接收任务 + stub 执行 + 状态回传，buck_controller 第二阶段接入真实 buck2。
+- **风险与边界**：buck2 依赖与构建机环境差异大，stub 先行可避免环境阻塞；ws 协议契约以 PT-06 落地为准。
+
+### 依赖与顺序
+
+依赖 PT-06（server 与 ws 契约）；是 PT-08 的前置。
+
+---
+
+## PT-08：Orion Scheduler、VM 弹性调度与客户端 API 面补齐
+
+### 移植问题
+
+Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion_deployer）与 `clients/orion-scheduler-client` 未移植；bellatrix 也只覆盖 build dispatch，`OrionBuildClient` 完整 API 面未核对。构建链路最后一段（弹性承载与完整客户端契约）缺失。
+
+### 目标范围
+
+- 核对并补齐 `OrionBuildClient` 完整 API 面（对照 `mega/clients/orion-client`）。
+- 移植 orion-scheduler-client；评估并决定 orion-scheduler（QEMU VM 池）的移植或书面不采纳（运维环境依赖重）。
+- 若移植 scheduler：VM 生命周期、webhook、keep_alive/cleanup 进入 monoengine 模块体系与配置体系。
+
+### 非目标
+
+- 不承诺与特定虚拟化平台绑定的新能力；超出 Mega 的调度智能化不在范围内。
+- 若决策不移植 QEMU 层，必须用等价的 runner 供给方案（如静态 runner 池文档）闭合构建链路，不留隐性缺口。
+
+### 完成判据
+
+- bellatrix/客户端 API 面与 Mega 对齐（或有书面豁免清单）。
+- scheduler 移植或"不采纳 + 替代供给方案"结论合入；采纳则 webhook 触发建 VM、keep_alive、cleanup 的故障注入用例通过。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/orion-scheduler/`、`mega/clients/orion-scheduler-client/`、`mega/clients/orion-client/`。
+- **monoengine 现状证据**：`src/bellatrix/` 部分覆盖；API state 已移除 orion_scheduler_client 字段（移植时需重新引入）。
+- **最小可验证第一阶段**：客户端 API 面核对与补齐（纯客户端，无基础设施依赖）。
+- **风险与边界**：QEMU 依赖具体运维环境，移植决策必须显式，不能默认顺延。
+
+### 依赖与顺序
+
+客户端补齐可与 PT-06 并行；scheduler 移植依赖 PT-07（先有可承载的 runner）。
+
+---
+
+## PT-09：通知与邮件能力对齐收尾
+
+### 移植问题
+
+`src/notification/` 与 `src/mail/` 已在多渠道框架、用户偏好、admin API、热加载上超过 Mega 对应实现，但 `docs/refactoring/notification.md`、`mail.md` 记录的收尾缺口仍在：webhook/slack 渠道未落地、build 完成触发器无接入点、明文 `mail.password` 未退场、多实例黑盒矩阵缺失。
+
+### 目标范围
+
+- webhook/slack 渠道与相应 vault secret（渠道凭据一律 SecretRef，SB-02）。
+- build 完成触发器：接入点依赖 PT-05/PT-06 的事件面，先有事件后接触发器。
+- 明文 `mail.password` 退场治理：样例与生产配置迁移到 `password_ref`，设明确里程碑。
+- 多实例 outbox claim 竞争、背压、重复发送/丢失边界的黑盒矩阵。
+
+### 非目标
+
+- 不回流 Mega 的旧 notification 实现（原则 8）。
+- 非必要不新增原生 HTTP provider（SES/SendGrid 继续走 SMTP relay）。
+
+### 完成判据
+
+- webhook/slack 渠道端到端送达（测试栈 fake receiver），凭据不落明文。
+- 明文 password 配置路径移除或有书面兼容窗口与截止日期；多实例矩阵 CI 绿。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/mono/src/notification/` 为基线对照；slack 渠道参考 campsite `slack.ts`。
+- **monoengine 现状证据**：`src/notification/`（`channels/`、`dispatcher.rs`、`service.rs`、`triggers.rs`、`redact.rs`）与 `src/mail/` 现状已复核（notification.md/mail.md 事实校准）。
+- **最小可验证第一阶段**：webhook 渠道（无外部依赖，fake receiver 可测）。
+- **风险与边界**：build 触发器不得绕过事件面临时硬编码进 PT-06。
+
+### 依赖与顺序
+
+webhook/slack 渠道与明文退场可立即启动；build 完成触发器依赖 PT-05（事件面）与 PT-06（构建事件源）；多实例矩阵的测试栈承载依赖 PT-01。
+
+---
+
+## PT-10：配置体系与 SecretRef 收尾
+
+### 移植问题
+
+`src/config/` 已大幅超越 Mega `common/config`，但 `docs/refactoring/config.md` 记录的收尾缺口仍在：对象存储/Redis 凭据进 vault 需要后置初始化重构（阶段 6 可选项）、`[oauth]` 段是死配置、热加载消费端与 source diagnostics 矩阵未补齐。
+
+### 目标范围
+
+- 对象存储后置初始化重构（阶段 6）：完成后 `object_storage.*` 可配为 SecretRef；Redis 凭据路径同期评估。
+- `[oauth]` 段：`OAuthConfig` 真实落地（含消费者）或整段清理，二选一，不留死配置。
+- 热加载：更多真实消费端订阅接入，"取出 Arc 后跨 await 持有"语义逐点确认。
+- 完整 profile/跨 source diagnostics 矩阵；残余 `expect`/`panic` 收敛（SB-01 联动）。
+
+### 非目标
+
+- 不改变引导循环硬约束（DB 凭据永远不进 vault）。
+- 不在本 PT 内做配置格式换代（TOML 保持）。
+
+### 完成判据
+
+- 对象存储凭据可经 SecretRef 配置且启动顺序不破；`[oauth]` 不再是无消费者死配置。
+- 热加载订阅清单与回滚语义有测试覆盖；diagnostics 矩阵进入 CI。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/common/src/config` 为基线对照（monoengine 已是超集）。
+- **monoengine 现状证据**：`src/config/{loader,secret,reload,validate,redaction,testing}.rs` 现状已复核（config.md 事实校准）。
+- **最小可验证第一阶段**：`[oauth]` 决策（落地或清理）——范围小、决策明确。
+- **风险与边界**：阶段 6 触及启动顺序（对象存储构造时机与 vault 的先后），必须保持与 vault.md/config.md 硬约束一致。
+
+### 依赖与顺序
+
+各切片相互独立，可与 PT-02..PT-08 并行；对象存储 SecretRef 落地前，相关凭据维持现状（SB-02 约束）。
+
+---
+
+## PT-11：Vault 安全工程收尾
+
+### 移植问题
+
+Vault 集成层 A–J 阶段可交付子集已完成，但 `docs/refactoring/vault.md` 记录的工程收尾仍在：KEK 轮换无内建原语、审计只有 interface hook 无可配置持久化 sink、root 恢复材料仍在本地 key 文件、core_key.json 与 vault 表无格式版本策略。
+
+### 目标范围
+
+- KEK 轮换专项：`init()` 后 KEK 可变，旧 unseal 分片彻底失效路径闭合。
+- 审计：可配置持久化/异地 sink 与可选 fail-closed 写入策略。
+- root recovery：root 恢复材料外置（root recovery token 或外部托管）与本地 key 文件的安全移除路径。
+- `core_key.json` 与 vault 表的格式版本/兼容迁移策略落地。
+- 可选评估：PKI 原生 ssh/pgp 证书替代 KV 裸私钥存储（单独立项后承接）。
+
+### 非目标
+
+- 部署侧交付（KMS、systemd `LoadCredential`、K8s Secret volume、备份演练）属运维职责，不进本 PT 代码范围。
+- 不改变威胁模型声明：自动解封的 Shamir 分片不防护磁盘读取攻击者，不夸大安全收益。
+
+### 完成判据
+
+- KEK 轮换后旧分片不可再解封，有故障注入与恢复手册同步。
+- 审计 sink 配置化，fail-closed 策略有测试；root 恢复材料可外置且本地移除路径有演练记录。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/vault/` 为移植基线对照（monoengine 已 vendored 并加固，超出 Mega）。
+- **monoengine 现状证据**：`src/vault/`、`src/contract/vault/integration/vault_core.rs` 现状已复核（vault.md 事实校准）。
+- **最小可验证第一阶段**：格式版本策略（低风险、纯工程）；KEK 轮换需专项设计后承接。
+- **风险与边界**：KEK 轮换触碰 seal 核心，必须配恢复手册与故障注入，不得赶工。
+
+### 依赖与顺序
+
+各切片相互独立，可与其他 PT 并行；PT-09 新渠道凭据依赖本 PT 既有 SecretRef 能力（已满足）。
+
+---
+
+## PT-12：前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite）
+
+### 移植问题
+
+monoengine 的后端能力（CL、issue、评审、通知、chat、构建等）必须有前端与账户系统承载。Mega 目标项目的前端体系是 moon（Next.js）+ campsite（Rails，账户/后端配对）；monoengine 的对应物是 website 仓库 `monoengine` 分支的 `apps/next-app`。两套前端体系独立演进会产生双向漂移：monoengine 新增或变更的 API/账户行为在 `apps/next-app` 无承载，或 `apps/next-app` 缺少 moon 已有功能，用户侧表现为两侧产品能力不一致。
+
+### 目标范围
+
+- 建立双前端功能对照基线：`apps/next-app`（website `monoengine` 分支 pinned revision）与 `mega/moon/` + campsite 的功能清单与差异表，每项差异给出"追平 / 书面豁免（含理由）"结论。
+- 一致性门禁化：monoengine 每个涉及公开 API、账户、认证行为的 PT/日期计划，任务卡必须包含前端影响评估（apps/next-app 是否需要联动改动）。
+- 账户系统语义对齐：认证、用户、组织、权限相关行为与 campsite 的语义对照，差异书面化。
+- 追平机制：差异追平按功能域拆分进入日期计划；前端代码演进在 website 仓库进行，monoengine 侧只维护契约（OpenAPI/DTO）与对照表。
+
+### 非目标
+
+- 不把 moon 或 `apps/next-app` 的代码移植进 monoengine 仓库；前端在各自仓库演进。
+- 不统一两侧技术栈与 UI 实现；一致性指功能语义与用户可见能力，不是像素级一致。
+- 不在本 PT 内实现具体前端功能；追平功能各自进入日期计划。
+
+### 完成判据
+
+- 功能对照表建立并写回本仓 `docs/`（含 pinned revision 与核对日期），后续审计可持续刷新。
+- 账户/认证语义差异全部书面化，无未记录的隐性行为差异。
+- 原则 11 的门禁生效：抽查若干涉及公开行为的日期计划，其任务卡均含前端影响评估。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：`mega/moon/`（Next.js 主前端）；campsite（`/run/media/eli/data/gitmono/campsite`，Rails：`api/`、`apps/`）为 moon 的账户/后端配对。
+- **monoengine 现状证据**：website（libra 管理）`monoengine` 分支 @ `afcd69af1992a1707e46254635a9df054761ad88`（2026-07-15），`apps/next-app`（Next.js：`app/`、`components/`、`lib/`、`middleware.ts`）为当前前端与账户系统；功能对照表不存在。
+- **最小可验证第一阶段**：纯审计——产出 apps/next-app ↔ moon+campsite 功能对照表与账户语义差异清单（不改代码），据此把 PT-12 从"候选"提升为"已验证"并排期首批追平切片。
+- **风险与边界**：对照表一旦落后即失效，必须随每次审计刷新；前端改动跨仓库，联动发布顺序（先后端兼容窗口、后前端切换）必须在各日期计划中显式声明。
+
+### 依赖与顺序
+
+PT-12 无硬前置，审计切片可立即启动；API 面追平（PT-02）与 orion API（PT-06）落地时会扩大前端一致性面，相关功能对照须随之刷新。
+
+---
+
+## 实施顺序
+
+十一个移植项按四个阶段推进。阶段之间是架构依赖，不要求前一阶段全部结束才开始下一阶段的设计，但不得绕过前置决策直接实施高风险切片。
+
+### 下一个执行任务：PT-01 集成测试基建扩展与统一（2026-07-27 排定）
+
+PT-01 是当前排定的下一个执行任务：测试栈拓扑扩展机制与真实 Git CLI 最小矩阵先行，为全部后续 PT 提供验收承载。它与 SB-01..SB-03 不互相阻塞（与 SB-03 同源互补），可并行推进。
+
+### 阶段零：工程安全基线
+
+1. SB-01 收敛 protocol/config 记录的残余 panic 清单，并把"移植不引入新 panic"门禁化。
+2. SB-02 启动明文 `mail.password` 退场治理与 redaction 覆盖扩展。
+3. SB-03 配合 PT-01 落地测试栈拓扑扩展规范。
+
+### 阶段一：基建、同步与协议基线
+
+1. PT-01 完成测试基建扩展与 Git CLI 最小矩阵。
+2. PT-02 完成基线追平与持续同步机制。
+3. PT-04 交付真实 Git CLI 完整矩阵并进入 CI。
+4. PT-03 完成 auth 统一与 delete-push 矩阵，再做 streaming 与 capability 收敛。
+
+阶段完成后，测试基建可承载全部后续 PT，monoengine 与 Mega 的已移植模块重新对齐，协议层有防回归网。
+
+### 阶段二：事件面与构建链路
+
+1. PT-05 完成 bus/infra 审计与归位决策。
+2. PT-06 交付 orion-server 最小环并与 bellatrix 联通。
+3. PT-07 交付 orion agent（stub buck2 先行）与端到端链路。
+
+阶段完成后，构建链路从 dispatch 到执行全通。
+
+### 阶段三：弹性调度与客户端补齐
+
+1. PT-08 完成客户端 API 面补齐与 scheduler 移植/替代决策。
+
+### 阶段四：收尾类（可与阶段一至三并行）
+
+1. PT-09 webhook/slack 渠道与明文退场（build 触发器等阶段二事件面）。
+2. PT-10 `[oauth]` 决策、对象存储 SecretRef、热加载扩展。
+3. PT-11 格式版本策略、KEK 轮换、审计 sink、root recovery。
+
+### 持续轨道：前端与账户系统一致性
+
+PT-12 不独占阶段，贯穿各阶段推进：首个动作是双前端功能对照审计（纯审计，可与阶段一并行），随后按功能域把追平切片排入日期计划；每个涉及公开 API/账户行为的 PT 在实施时必须通过原则 11 的前端影响评估。
+
+## 依赖图
+
+```mermaid
+flowchart TD
+    PT01[PT-01 集成测试基建]
+    PT02[PT-02 Mega 基线追平]
+    PT03[PT-03 协议兼容收尾]
+    PT04[PT-04 协议测试矩阵]
+    PT05[PT-05 ceres bus/infra 归位]
+    PT06[PT-06 Orion Server]
+    PT07[PT-07 Orion Agent]
+    PT08[PT-08 Scheduler 与客户端]
+    PT09[PT-09 通知邮件收尾]
+    PT10[PT-10 配置 SecretRef 收尾]
+    PT11[PT-11 Vault 安全收尾]
+    PT12[PT-12 前端与账户一致性]
+
+    PT01 --> PT04
+    PT01 --> PT06
+    PT01 --> PT09
+    PT02 --> PT03
+    PT02 --> PT05
+    PT02 --> PT06
+    PT02 --> PT12
+    PT04 --> PT03
+    PT05 --> PT06
+    PT06 --> PT07
+    PT07 --> PT08
+    PT05 --> PT09
+    PT06 --> PT09
+    PT06 --> PT12
+    PT11 --> PT09
+```
+
+## 跨功能验收门禁
+
+任何 PT 进入实施时，除具体功能验收外，还必须满足以下共同门禁：
+
+### 数据正确性
+
+- 所有 DB schema 变更走 `src/jupiter/migration/` 真实迁移，禁止手写 schema SQL；实体/存储/迁移三处同步（`AGENTS.md` 流程）。
+- 与 Mega 共享的 schema 保持对齐，差异必须有书面豁免。
+- crash window、并发 claim、重复请求与 idempotency 有故障注入测试。
+
+### 安全与隐私
+
+- 协议与网络输入一律 fallible parser；客户端输入不得导致进程崩溃。
+- 凭据一律 SecretRef/SecretString；错误、日志、配置回显执行 redaction 并有活进程脱敏门禁。
+- Vault 相关操作 fail-closed；key 丢失不自动重建，必须配恢复手册。
+- 认证上下文（SSH publickey → commit binding）不得匿名降级。
+
+### 机器接口
+
+- HTTP API 变更同步 OpenAPI（utoipa）与 `src/contract/api/` DTO；新错误码同步 `docs/errors.md`。
+- CLI 子命令按 `AGENTS.md` 流程注册（`builtin()`/`builtin_exec()`）并补解析测试。
+- 列表类接口有分页、limit 和资源上限。
+
+### 兼容与迁移
+
+- 与 Mega 的 wire 行为、API 契约、DB schema 默认保持一致；偏离必须有 ADR。
+- capability advertise 诚实：未实现且未测试的能力不声明。
+- 配置变更遵守集中校验与热加载白名单纪律；破坏性配置变更需兼容窗口。
+
+### 性能
+
+- 协议热路径（pack 传输、LFS）不因移植退化为全量缓冲；streaming 改造带基准。
+- 对象存储、大附件、构建日志采用 streaming/chunking，避免无界内存加载。
+- 通知 outbox 的批次/并发限流默认值不因新渠道退化。
+
+## 不进入本长期移植计划的 Mega 资产
+
+以下 Mega 资产经审计不进入 PT-01 至 PT-12，需要时另行单独决策：
+
+- **`moon/` Web 前端**（pnpm + turbo + Next.js）：非 Rust 资产，代码不移植进 monoengine 仓库；monoengine 的前端与账户系统由 website `monoengine` 分支 `apps/next-app` 承载，两个前端体系的功能一致性义务由 PT-12 治理。
+- **`scripts/`**（crates-sync、init_mega、demo、import-buck2-deps、webhook_receiver.py）：运维/开发辅助脚本，按 monoengine 实际需要逐个评估，不做整体移植。
+- **`docker/`**（demo、deployment）：部署形态与 monoengine 的 docker-compose 测试栈是不同层次；部署资产按运维需求单独决策。
+- **`BUCK`、`ci/`、`LICENSE-*`**：构建定义与 CI 形态已按 monoengine 自身体系（Cargo workspace、`.github/workflows/`）建立，不回移植。
+- **chat 迁移剩余工作**（Slice 6 数据迁移闭环、实时网关等）：源系统是 campsite Rails 而非 Mega，由 `docs/refactoring/chat.md` 独立改进计划治理，不占 PT 编号。
+
+## 日期计划索引
+
+日期计划只承接明确切片；它完成后仍须回到本表按 PT 完成判据复核。
+
+| 日期计划 | 对应 PT | 当前状态 | 范围与长期剩余缺口 |
+|---|---|---|---|
+| [`plan-20260727.md`](plan-20260727.md) | PT-01 | 已排期 | IT-01..IT-07：测试双层规范、git-cli runner 拓扑、HTTP clone/push 最小矩阵、CI 接入、热加载黑盒、多实例 claim 竞争、P2 清单收口；不覆盖 SSH/LFS 矩阵（PT-04）、真多进程黑盒（PT-09） |
+
+## 已替代 / 不采纳 / 已实现摘要
+
+### 已替代
+
+- 当前无 PT 被替代。若未来合并移植项，保留原 ID，并在此记录替代 PT 与理由。
+
+### 不采纳
+
+- **不把 moon 前端代码列为移植项。** 非 Rust 资产，monoengine 仓库不承载前端代码；monoengine 前端为 website `apps/next-app`，两个前端体系的功能一致性由 PT-12 治理（见"不进入"章节与 PT-12）。
+- **不回流 Mega 的旧 notification/email/config 实现。** monoengine 对应模块已是功能超集（`docs/refactoring/{notification,mail,config}.md`），只补缺口不重复移植（原则 8）。
+- **不把"与 Mega 目录结构一致"作为目标。** monoengine 的 contract 归并、config 提升、workspace 拆分是已决架构改进，不因结构差异回退（原则 2）。
+
+### 已实现
+
+- 当前无 PT-01..PT-11 满足全部完成判据。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、mail、notification、orbit、协议止血、bellatrix、chat 主干）已在"当前基础"据实记录，不因部分能力成熟而提前关闭任何 PT。
+
+## 路线图维护
+
+- 每次审计先用 libra 核对 Mega 与 monoengine 的实际 checkout revision 和工作区状态；dirty 或核对失败必须按实际 revision 记录，不把未核对的版本描述为最新。
+- 每季度、重大架构变更或日期计划完成后，重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
+- PT 编号一经被执行计划或 issue 引用，不重新编号；废弃项使用"已替代"或"不采纳"，并记录替代项、理由和证据。
+- 新候选移植项必须同时给出 Mega revision/path、monoengine 代码/测试缺口、价值、风险、依赖和最小可验证切入点。
+- 某项进入日期计划时，仅更新总览状态、链接和剩余长期缺口；详细章节不复制 owner、日期或任务列表。
+- 移植完成只以当前可发布代码、测试、兼容/用户文档和迁移证据为准；本文文字、日期计划完成声明或 checkbox 不是完成证明。
+- Mega 是移植目标与契约基线：接口、数据模型、安全边界和兼容策略默认与 Mega 对齐；任何偏离（含既有架构改进之外的新偏离）必须经 monoengine 自身 RFC/ADR 显式决策并记录。

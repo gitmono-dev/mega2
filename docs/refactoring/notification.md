@@ -12,7 +12,7 @@
 
 ## 事实校准（2026-06，更新 2026-06-19）
 
-> 本文档中的代码引用已对照当前 `src/` 重新核对。需特别注意以下与 mega 上游及早期移植草案不一致的事实，后文据此修正：
+> 本文档中的代码引用已对照当前 `src/` 重新核对。需特别注意以下与 mega 目标项目当前源码及早期移植草案不一致的事实，后文据此修正：
 >
 > **2026-06-19 更新**：本轮落地覆盖阶段 0/1/4/5 的多项可交付：
 > - **阶段 1 渠道抽象与协调器**：新增 `src/notification/channels/{mod,email,console}.rs`（`NotificationChannel` trait + `EmailChannel` + `ConsoleChannel`）、`src/notification/service.rs`（`NotificationService` 协调器）与 `src/notification/redact.rs`（`redact_email`）。`EmailDispatcher` 现经 `NotificationChannel` 抽象投递，`AppContext::new` 改用 `NotificationService::from_mail_config(...).start(shutdown)`。
