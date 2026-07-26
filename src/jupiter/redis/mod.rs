@@ -4,7 +4,10 @@ pub use ::redis::{AsyncCommands, aio::ConnectionManager};
 
 use crate::{
     common::errors::MegaError,
-    config::{RedisConfig, redaction::redact_redis_url, validate::validate_redis_config},
+    config::{
+        RedisConfig, redaction::redact_redis_url, secret::is_secret_ref_value,
+        validate::validate_redis_config,
+    },
 };
 
 /// Initializes a Redis multiplexed asynchronous connection from the given configuration.
@@ -13,6 +16,12 @@ use crate::{
 /// * `config` - Redis configuration including the connection URL
 pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, MegaError> {
     validate_redis_config(config)?;
+
+    if is_secret_ref_value(config.url.trim_start()) {
+        return Err(MegaError::Other(
+            "redis.url contains an unresolved vault:// SecretRef; it must be resolved before initializing the Redis connection".to_string(),
+        ));
+    }
 
     if rustls::crypto::ring::default_provider()
         .install_default()
@@ -44,5 +53,21 @@ mod tests {
             .expect_err("invalid Redis URL scheme should fail before connecting");
 
         assert!(err.to_string().contains("redis.url scheme"));
+    }
+
+    #[tokio::test]
+    async fn init_connection_rejects_unresolved_secret_ref_without_leaking_path() {
+        let config = RedisConfig {
+            url: "vault://secret/config/test/redis/url#value".to_string(),
+        };
+
+        let err = init_connection(&config)
+            .await
+            .expect_err("unresolved redis.url SecretRef should fail before opening client");
+        let message = err.to_string();
+
+        assert!(message.contains("unresolved vault:// SecretRef"));
+        assert!(!message.contains("config/test/redis/url"));
+        assert!(!message.contains("#value"));
     }
 }

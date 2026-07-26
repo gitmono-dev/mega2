@@ -11,19 +11,20 @@ use std::{
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use git_internal::{
     errors::GitError,
     hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
-            ObjectTrait, commit::Commit, signature::Signature, tree::Tree, types::ObjectType,
+            ObjectTrait, blob::Blob, commit::Commit, signature::Signature, tree::Tree,
+            types::ObjectType,
         },
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
-use orbit_api::object_storage::MultiObjectByteStream;
+use orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 use sea_orm::DatabaseTransaction;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,7 +41,7 @@ use crate::{
         code_edit::{on_push::OnpushCodeEdit, utils::get_changed_files},
         model::change_list::ClDiffFile,
         pack::RepoHandler,
-        protocol::import_refs::{RefCommand, Refs},
+        protocol::import_refs::{CommandType, RefCommand, Refs},
     },
     common::{
         errors::MegaError,
@@ -228,9 +229,232 @@ impl RepoHandler for MonoRepo {
         Ok(())
     }
 
-    // monorepo full pack should follow the shallow clone command 'git clone --depth=1'
     async fn full_pack(&self, want: Vec<String>) -> Result<ReceiverStream<Vec<u8>>, GitError> {
         self.incremental_pack(want, Vec::new()).await
+    }
+
+    fn supports_shallow_fetch(&self) -> bool {
+        true
+    }
+
+    async fn shallow_pack(
+        &self,
+        want: Vec<String>,
+        depth: u32,
+        _deepen_relative: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.mono_storage();
+        let obj_num = AtomicUsize::new(0);
+
+        let mut exist_objs = HashSet::new();
+
+        let want_commits: Vec<Commit> = storage
+            .get_commits_by_hashes(&want)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(Commit::from_mega_model)
+            .collect();
+
+        let mut shallow_commits: Vec<String> = Vec::new();
+        let mut visited: HashSet<String> = want.iter().cloned().collect();
+        let mut current_level: Vec<Commit> = want_commits.clone();
+        let mut all_commits: Vec<Commit> = want_commits.clone();
+
+        for level in 0..depth {
+            let mut next_level: Vec<Commit> = Vec::new();
+            for commit in &current_level {
+                for p_commit_id in &commit.parent_commit_ids {
+                    let p_id = p_commit_id.to_string();
+                    if visited.insert(p_id.clone())
+                        && let Some(model) = storage.get_commit_by_hash(&p_id).await.unwrap()
+                    {
+                        let parent = Commit::from_mega_model(model);
+                        if level + 1 == depth {
+                            shallow_commits.push(p_id);
+                        } else {
+                            next_level.push(parent.clone());
+                        }
+                        all_commits.push(parent);
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        let want_tree_ids = all_commits.iter().map(|c| c.tree_id.to_string()).collect();
+        let want_trees: HashMap<ObjectHash, Tree> = storage
+            .get_trees_by_hashes(want_tree_ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                (
+                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    Tree::from_mega_model(m),
+                )
+            })
+            .collect();
+
+        obj_num.fetch_add(all_commits.len(), Ordering::SeqCst);
+
+        let mut counted_obj = HashSet::new();
+        for c in &all_commits {
+            self.traverse_for_count(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &exist_objs,
+                &mut counted_obj,
+                &obj_num,
+            )
+            .await?;
+        }
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+
+        for c in all_commits {
+            self.traverse(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &mut exist_objs,
+                Some(&entry_tx),
+            )
+            .await?;
+            entry_tx
+                .send(MetaAttached {
+                    inner: c.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
+        }
+        drop(entry_tx);
+
+        Ok((ReceiverStream::new(stream_rx), shallow_commits))
+    }
+
+    fn supports_filtered_fetch(&self) -> bool {
+        true
+    }
+
+    async fn filtered_pack(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        filter_spec: &str,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        if filter_spec != "blob:none" {
+            return Err(GitError::CustomError(format!(
+                "unsupported filter spec: {filter_spec}"
+            )));
+        }
+
+        let mut want_clone = want.clone();
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.mono_storage();
+        let obj_num = AtomicUsize::new(0);
+
+        let mut exist_objs = HashSet::new();
+
+        let mut want_commits: Vec<Commit> = storage
+            .get_commits_by_hashes(&want_clone)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(Commit::from_mega_model)
+            .collect();
+        if want_commits.is_empty() {
+            return self.direct_object_pack(want).await;
+        }
+        let mut traversal_list: Vec<Commit> = want_commits.clone();
+
+        while let Some(temp) = traversal_list.pop() {
+            for p_commit_id in temp.parent_commit_ids {
+                let p_commit_id = p_commit_id.to_string();
+
+                if !have.contains(&p_commit_id) && !want_clone.contains(&p_commit_id) {
+                    let parent: Commit = Commit::from_mega_model(
+                        storage
+                            .get_commit_by_hash(&p_commit_id)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    want_commits.push(parent.clone());
+                    want_clone.push(p_commit_id);
+                    traversal_list.push(parent);
+                }
+            }
+        }
+
+        let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
+        let want_trees: HashMap<ObjectHash, Tree> = storage
+            .get_trees_by_hashes(want_tree_ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                (
+                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    Tree::from_mega_model(m),
+                )
+            })
+            .collect();
+
+        obj_num.fetch_add(want_commits.len(), Ordering::SeqCst);
+
+        let have_commits = storage.get_commits_by_hashes(&have).await.unwrap();
+        let have_trees = storage
+            .get_trees_by_hashes(have_commits.iter().map(|x| x.tree.clone()).collect())
+            .await
+            .unwrap();
+        for have_tree in have_trees {
+            self.traverse(Tree::from_mega_model(have_tree), &mut exist_objs, None)
+                .await?;
+        }
+
+        let mut counted_obj = HashSet::new();
+        for c in want_commits.clone() {
+            self.traverse_trees_only_for_count(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &exist_objs,
+                &mut counted_obj,
+                &obj_num,
+            )
+            .await?;
+        }
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
+
+        for c in want_commits {
+            self.traverse_trees_only(
+                want_trees.get(&c.tree_id).unwrap().clone(),
+                &mut exist_objs,
+                Some(&entry_tx),
+            )
+            .await?;
+            entry_tx
+                .send(MetaAttached {
+                    inner: c.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
+        }
+        drop(entry_tx);
+
+        Ok(ReceiverStream::new(stream_rx))
     }
 
     async fn incremental_pack(
@@ -252,6 +476,9 @@ impl RepoHandler for MonoRepo {
             .into_iter()
             .map(Commit::from_mega_model)
             .collect();
+        if want_commits.is_empty() {
+            return self.direct_object_pack(want).await;
+        }
         let mut traversal_list: Vec<Commit> = want_commits.clone();
 
         // traverse commit's all parents to find the commit that client does not have
@@ -309,12 +536,15 @@ impl RepoHandler for MonoRepo {
                 &mut counted_obj,
                 &obj_num,
             )
-            .await;
+            .await?;
         }
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
         let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
-        encoder.encode_async(entry_rx).await.unwrap();
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
         // todo: For now, send metadata only for blob objects.
         for c in want_commits {
             self.traverse(
@@ -329,7 +559,7 @@ impl RepoHandler for MonoRepo {
                     meta: EntryMeta::new(),
                 })
                 .await
-                .unwrap();
+                .map_err(|e| MegaError::Other(format!("pack commit entry send failed: {e}")))?;
         }
         drop(entry_tx);
 
@@ -388,9 +618,15 @@ impl RepoHandler for MonoRepo {
     }
 
     async fn update_refs(&self, refs: &RefCommand) -> Result<(), GitError> {
-        self.apply_cl_mega_ref_for_push_command(refs, None)
-            .await
-            .map_err(GitError::from)
+        if refs.ref_type == RefTypeEnum::Tag {
+            self.apply_tag_mega_ref_for_push_command(refs)
+                .await
+                .map_err(GitError::from)
+        } else {
+            self.apply_cl_mega_ref_for_push_command(refs, None)
+                .await
+                .map_err(GitError::from)
+        }
     }
 
     async fn check_commit_exist(&self, hash: &str) -> bool {
@@ -466,6 +702,104 @@ impl RepoHandler for MonoRepo {
 }
 
 impl MonoRepo {
+    async fn direct_object_pack(
+        &self,
+        want: Vec<String>,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        let pack_config = &self.storage.config().pack;
+        let storage = self.storage.mono_storage();
+
+        let tree_models = storage
+            .get_trees_by_hashes(want.clone())
+            .await
+            .map_err(|e| GitError::CustomError(format!("tree lookup failed: {e}")))?;
+        let blob_models = storage
+            .get_mega_blobs_by_hashes(want)
+            .await
+            .map_err(|e| GitError::CustomError(format!("blob lookup failed: {e}")))?;
+
+        let obj_num = tree_models.len() + blob_models.len();
+        if obj_num == 0 {
+            return Err(GitError::CustomError(
+                "requested objects were not found".to_owned(),
+            ));
+        }
+
+        let blob_hashes = blob_models
+            .iter()
+            .map(|blob| blob.blob_id.clone())
+            .collect::<Vec<_>>();
+        let blob_meta = blob_models
+            .into_iter()
+            .map(|blob| {
+                (
+                    blob.blob_id.clone(),
+                    EntryMeta {
+                        pack_id: Some(blob.pack_id.clone()),
+                        pack_offset: Some(blob.pack_offset as usize),
+                        file_path: Some(blob.file_path.clone()),
+                        is_delta: Some(blob.is_delta_in_pack),
+                        crc32: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
+        let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
+        let encoder = PackEncoder::new(obj_num, 0, stream_tx);
+        encoder
+            .encode_async(entry_rx)
+            .await
+            .map_err(|e| GitError::CustomError(format!("pack encode failed: {e}")))?;
+
+        for tree_model in tree_models {
+            entry_tx
+                .send(MetaAttached {
+                    inner: Tree::from_mega_model(tree_model).into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| GitError::CustomError(format!("pack tree entry send failed: {e}")))?;
+        }
+
+        let default_meta = EntryMeta::default();
+        let blobs = self.storage.git_service.get_objects_stream(blob_hashes);
+        blobs
+            .try_for_each_concurrent(16, |(_, stream, _)| {
+                let entry_tx = entry_tx.clone();
+                let blob_meta = &blob_meta;
+                let default_meta = &default_meta;
+                async move {
+                    let data = stream
+                        .try_fold(Vec::new(), |mut acc, bytes| async move {
+                            acc.extend_from_slice(&bytes);
+                            Ok(acc)
+                        })
+                        .await?;
+                    let blob = Blob::from_content_bytes(data);
+                    let meta = blob_meta
+                        .get(&blob.id.to_string())
+                        .unwrap_or(default_meta)
+                        .to_owned();
+                    entry_tx
+                        .send(MetaAttached {
+                            inner: blob.into(),
+                            meta,
+                        })
+                        .await
+                        .map_err(|e| IoOrbitError::Other(format!("pack entry send failed: {e}")))?;
+
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| GitError::CustomError(format!("blob stream failed: {e}")))?;
+        drop(entry_tx);
+
+        Ok(ReceiverStream::new(stream_rx))
+    }
+
     /// All branch commands update CL `mega_refs` in **one** DB transaction (same idea as import’s single-txn metadata commit).
     async fn persist_mono_branch_cl_mega_refs_transaction(&self) -> Result<(), MegaError> {
         let cmds = self
@@ -489,13 +823,24 @@ impl MonoRepo {
         txn: Option<&DatabaseTransaction>,
     ) -> Result<(), MegaError> {
         let storage = self.storage.mono_storage();
-        let current_commit = self.current_commit.read().await;
-        let cl_link = self.fetch_or_new_cl_link().await?;
-        let ref_name = utils::cl_ref_name(&cl_link);
+        if cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID {
+            let existing = match txn {
+                Some(t) => storage.get_ref_by_name_in_txn(&cmd.ref_name, t).await?,
+                None => storage.get_ref_by_name(&cmd.ref_name).await?,
+            };
+            if let Some(existing) = existing {
+                storage.remove_ref(existing).await?;
+            }
+            return Ok(());
+        }
 
+        let current_commit = self.current_commit.read().await;
         let Some(c) = &*current_commit else {
             return Ok(());
         };
+        let from_hash = Self::effective_from_hash(&self.from_hash, c)?;
+        let cl_link = self.fetch_or_new_cl_link(&from_hash).await?;
+        let ref_name = utils::cl_ref_name(&cl_link);
 
         let existing = match txn {
             Some(t) => storage.get_ref_by_name_in_txn(&ref_name, t).await?,
@@ -519,18 +864,65 @@ impl MonoRepo {
         Ok(())
     }
 
+    async fn apply_tag_mega_ref_for_push_command(&self, cmd: &RefCommand) -> Result<(), MegaError> {
+        let storage = self.storage.mono_storage();
+        let existing = storage.get_ref_by_name(&cmd.ref_name).await?;
+        if cmd.new_id == ZERO_ID {
+            if let Some(existing) = existing {
+                storage.remove_ref(existing).await?;
+            }
+            return Ok(());
+        }
+
+        let Some(commit) = storage.get_commit_by_hash(&cmd.new_id).await? else {
+            return Err(MegaError::Other(format!(
+                "Target commit '{}' not found for tag '{}'",
+                cmd.new_id, cmd.ref_name
+            )));
+        };
+
+        if let Some(mut tag_ref) = existing {
+            tag_ref.ref_commit_hash = cmd.new_id.clone();
+            tag_ref.ref_tree_hash = commit.tree;
+            storage.update_ref(tag_ref, None).await?;
+        } else {
+            let new_ref = mega_refs::Model::new(
+                &self.path,
+                cmd.ref_name.clone(),
+                cmd.new_id.clone(),
+                commit.tree,
+                false,
+            );
+            storage.save_refs(new_ref, None).await?;
+        }
+        Ok(())
+    }
+
     /// CL / conversations / build / code-review hooks after branch `mega_refs` are committed.
     async fn run_mono_post_push_pipeline(&self) -> Result<(), MegaError> {
+        let cmds = self
+            .command_list
+            .lock()
+            .expect("command_list lock poisoned")
+            .clone();
+        if !cmds.iter().any(|cmd| cmd.ref_type == RefTypeEnum::Branch) {
+            return Ok(());
+        }
+        let current_commit = self.current_commit.read().await;
+        let Some(current_commit) = &*current_commit else {
+            return Ok(());
+        };
+        let from_hash = Self::effective_from_hash(&self.from_hash, current_commit)?;
         let username = self.username();
         let mono_api_service = self.into();
         let editor = OnpushCodeEdit::from(
             self.path.to_str().unwrap(),
             &self.base_branch,
-            &self.from_hash,
+            &from_hash,
             &mono_api_service,
         );
         let cl = editor
-            .update_or_create_cl(&self.storage, &self.from_hash, &self.to_hash, &username)
+            .update_or_create_cl(&self.storage, &from_hash, &self.to_hash, &username)
             .await?;
         self.traverses_tree_and_update_filepath().await?;
         if self.bellatrix.enable_build() {
@@ -623,7 +1015,20 @@ impl MonoRepo {
 
         Ok(())
     }
-    async fn fetch_or_new_cl_link(&self) -> Result<String, MegaError> {
+    fn effective_from_hash(from_hash: &str, current_commit: &Commit) -> Result<String, MegaError> {
+        if from_hash != ZERO_ID {
+            return Ok(from_hash.to_owned());
+        }
+        current_commit
+            .parent_commit_ids
+            .first()
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                MegaError::Other("Can not init directory under monorepo directory!".to_string())
+            })
+    }
+
+    async fn fetch_or_new_cl_link(&self, from_hash: &str) -> Result<String, MegaError> {
         let storage = self.storage.cl_storage();
         let path_str = self.path.to_str().unwrap();
         let cl_link = match storage
@@ -632,7 +1037,7 @@ impl MonoRepo {
         {
             Some(cl) => cl.link.clone(),
             None => {
-                if self.from_hash == "0".repeat(40) {
+                if from_hash == ZERO_ID {
                     return Err(MegaError::Other(
                         "Can not init directory under monorepo directory!".to_string(),
                     ));
@@ -808,5 +1213,73 @@ impl MonoRepo {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            commit::Commit,
+            signature::{Signature, SignatureType},
+        },
+    };
+
+    use super::MonoRepo;
+    use crate::common::utils::ZERO_ID;
+
+    fn test_signature(signature_type: SignatureType) -> Signature {
+        Signature::new(
+            signature_type,
+            "Monoengine Test".to_string(),
+            "monoengine-test@example.invalid".to_string(),
+        )
+    }
+
+    fn test_commit(parent_commit_ids: Vec<ObjectHash>) -> Commit {
+        let tree_id = ObjectHash::from_str("27dd8d4cf39f3868c6eee38b601bc9e9939304f5").unwrap();
+        Commit::new(
+            test_signature(SignatureType::Author),
+            test_signature(SignatureType::Committer),
+            tree_id,
+            parent_commit_ids,
+            "test commit",
+        )
+    }
+
+    #[test]
+    fn effective_from_hash_keeps_existing_ref_old_id() {
+        let old_id = "119bc457cb05b52dfb0d6b14f66d9a8a52d09e25";
+        let parent = ObjectHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let commit = test_commit(vec![parent]);
+
+        let effective = MonoRepo::effective_from_hash(old_id, &commit).unwrap();
+
+        assert_eq!(effective, old_id);
+    }
+
+    #[test]
+    fn effective_from_hash_uses_first_parent_for_new_branch_push() {
+        let parent = ObjectHash::from_str("119bc457cb05b52dfb0d6b14f66d9a8a52d09e25").unwrap();
+        let commit = test_commit(vec![parent]);
+
+        let effective = MonoRepo::effective_from_hash(ZERO_ID, &commit).unwrap();
+
+        assert_eq!(effective, parent.to_string());
+    }
+
+    #[test]
+    fn effective_from_hash_rejects_orphan_new_branch_push() {
+        let commit = test_commit(Vec::new());
+
+        let err = MonoRepo::effective_from_hash(ZERO_ID, &commit).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Can not init directory under monorepo directory")
+        );
     }
 }

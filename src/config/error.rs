@@ -29,6 +29,20 @@ pub enum ConfigDiagnostic {
         source: ConfigError,
     },
     PlaceholderTraversalState,
+    FilePlaceholderRead {
+        origin: String,
+        key: String,
+        path: String,
+        reason: String,
+    },
+    FilePlaceholderUnterminated {
+        origin: String,
+        key: String,
+    },
+    FilePlaceholderMixed {
+        origin: String,
+        key: String,
+    },
     EnvironmentType {
         variable: String,
         key: String,
@@ -75,6 +89,23 @@ impl fmt::Display for ConfigDiagnostic {
             Self::PlaceholderTraversalState => write!(
                 f,
                 "failed to finalize placeholder expansion: shared traversal state still has owners"
+            ),
+            Self::FilePlaceholderRead {
+                origin,
+                key,
+                path,
+                reason,
+            } => write!(
+                f,
+                "failed to read file-mounted secret for `{key}` from `{origin}` (`${{file:{path}}}`): {reason}; the file content is never logged; ensure the path exists and is readable, then retry"
+            ),
+            Self::FilePlaceholderUnterminated { origin, key } => write!(
+                f,
+                "unterminated `${{file:...}}` placeholder from `{origin}` for `{key}`: the path is redacted; add the closing `}}` or remove the placeholder"
+            ),
+            Self::FilePlaceholderMixed { origin, key } => write!(
+                f,
+                "value from `{origin}` for `{key}` mixes a `${{file:...}}` secret with other `${{...}}` placeholders (including nesting `${{...}}` inside the file path): this is unsupported because the file content must not be re-expanded and the file path is not variable-expanded; use `${{file:/literal/path}}` as the entire value of a dedicated field"
             ),
             Self::EnvironmentType {
                 variable,

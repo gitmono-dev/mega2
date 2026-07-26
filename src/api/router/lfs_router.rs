@@ -42,22 +42,30 @@
 //! Ensure proper authentication and authorization mechanisms are implemented
 //! when using these handlers in a web application to prevent unauthorized access.
 use axum::{
-    Json,
+    Extension, Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{Request, StatusCode},
+    http::{
+        HeaderMap, HeaderValue, Request, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+    },
     response::Response,
 };
+use base64::Engine;
 use futures::TryStreamExt;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::LFS_TAG},
+    api::{
+        MonoApiServiceState,
+        api_doc::LFS_TAG,
+        oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
+    },
     ceres::lfs::{
         handler,
         lfs_structs::{
             BatchRequest, BatchResponse, LockList, LockListQuery, LockRequest, LockResponse,
-            RequestObject, UnlockRequest, UnlockResponse, VerifiableLockList,
+            Operation, RequestObject, UnlockRequest, UnlockResponse, VerifiableLockList,
             VerifiableLockRequest,
         },
     },
@@ -66,6 +74,23 @@ use crate::{
 
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 const LFS_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// The repository path prefix of an LFS request (the segment before
+/// `/info/lfs/`), captured by `rewrite_lfs_request_uri` before that prefix is
+/// stripped for routing. Empty when the request did not carry a repo prefix
+/// (e.g. the internal `/api/v1/lfs` mount). Used to namespace LFS locks per
+/// repository so identical ref names in different repos do not collide.
+#[derive(Clone, Debug, Default)]
+pub struct LfsRepoContext(pub String);
+
+/// Resolves the repo path prefix from the optional request extension. The
+/// extension is inserted by `rewrite_lfs_request_uri` for every request served
+/// through the HTTP server, but the extractor is optional so that handlers
+/// reached without that layer (e.g. direct tests of `app()`) degrade to the
+/// empty repo (legacy bare-ref lock key) instead of returning `500`.
+fn lfs_repo_path(ctx: Option<Extension<LfsRepoContext>>) -> String {
+    ctx.map(|Extension(c)| c.0).unwrap_or_default()
+}
 
 pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
@@ -121,11 +146,105 @@ fn map_lfs_error<E: ToString>(err: E) -> (StatusCode, String) {
 
 fn lfs_error_response(code: StatusCode, msg: String) -> Response<Body> {
     let error_body = serde_json::json!({ "message": msg }).to_string();
-    Response::builder()
-        .status(code)
-        .header("Content-Type", LFS_CONTENT_TYPE)
-        .body(Body::from(error_body))
-        .unwrap()
+    lfs_response(code, LFS_CONTENT_TYPE, Body::from(error_body))
+}
+
+fn lfs_json_response(code: StatusCode, body: String) -> Response<Body> {
+    lfs_response(code, LFS_CONTENT_TYPE, Body::from(body))
+}
+
+fn lfs_response(code: StatusCode, content_type: &'static str, body: Body) -> Response<Body> {
+    let mut response = Response::new(body);
+    *response.status_mut() = code;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+}
+
+/// LFS operation category for access control: reads (download / lock listing)
+/// vs writes (upload / lock create / unlock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LfsAccess {
+    Read,
+    Write,
+}
+
+/// Pure LFS access-control policy, mirroring the Git smart-protocol model:
+/// reads follow `git.anonymous_access` (like upload-pack/fetch), writes always
+/// require an authenticated caller (like receive-pack/push).
+fn lfs_access_allowed(access: LfsAccess, anonymous_access: bool, authenticated: bool) -> bool {
+    match access {
+        LfsAccess::Read => anonymous_access || authenticated,
+        LfsAccess::Write => authenticated,
+    }
+}
+
+/// Extracts the mono access token from an `Authorization` header, supporting
+/// both `Bearer <token>` and HTTP Basic auth (token in the password field) —
+/// the same credential shapes accepted by the Git smart-HTTP transport that
+/// git-lfs reuses for the hybrid LFS API.
+fn lfs_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    if let Some(bearer) = bearer_token_from_authorization_value(value) {
+        return Some(bearer.to_owned());
+    }
+    let stripped = value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(stripped.trim())
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    // Basic auth is "username:password"; the token lives in the password field.
+    decoded.split(':').nth(1).map(str::to_owned)
+}
+
+/// Resolves the authenticated username from the request credentials, or `None`
+/// when no valid token is presented.
+async fn lfs_authenticated_user(
+    state: &MonoApiServiceState,
+    headers: &HeaderMap,
+) -> Option<String> {
+    let token = lfs_token_from_headers(headers)?;
+    match login_user_from_mono_access_token(&state.storage.user_storage(), &token).await {
+        Ok(Some(user)) => Some(user.username),
+        _ => None,
+    }
+}
+
+/// Builds a `401` LFS response that asks the client to retry with credentials.
+fn lfs_auth_challenge() -> Response<Body> {
+    let mut response = lfs_error_response(
+        StatusCode::UNAUTHORIZED,
+        "authentication required".to_owned(),
+    );
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"Mega\", Bearer realm=\"Mega\""),
+    );
+    response
+}
+
+/// Enforces the LFS access policy for the given operation, returning a ready
+/// `401` challenge response when the caller is not permitted.
+async fn enforce_lfs_access(
+    state: &MonoApiServiceState,
+    headers: &HeaderMap,
+    access: LfsAccess,
+) -> Result<(), Response<Body>> {
+    let anonymous_access = state.storage.config().git.anonymous_access;
+    // Only resolve the (DB-backed) token when it can actually affect the outcome.
+    let authenticated = if access == LfsAccess::Read && anonymous_access {
+        false
+    } else {
+        lfs_authenticated_user(state, headers).await.is_some()
+    };
+    if lfs_access_allowed(access, anonymous_access, authenticated) {
+        Ok(())
+    } else {
+        Err(lfs_auth_challenge())
+    }
 }
 
 /// List LFS locks
@@ -150,26 +269,24 @@ fn lfs_error_response(code: StatusCode, msg: String) -> Response<Body> {
 )]
 pub async fn list_locks(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
+    headers: HeaderMap,
     Query(query): Query<LockListQuery>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
+        return Ok(resp);
+    }
+    let repo = lfs_repo_path(repo);
     let result: Result<LockList, GitLFSError> =
-        handler::lfs_retrieve_lock(state.storage.lfs_db_storage(), query).await;
+        handler::lfs_retrieve_lock(state.storage.lfs_db_storage(), &repo, query).await;
     match result {
         Ok(lock_list) => {
             let body = serde_json::to_string(&lock_list).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
-            let error_body = serde_json::json!({ "message": msg }).to_string();
-            Ok(Response::builder()
-                .status(code)
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(error_body))
-                .unwrap())
+            Ok(lfs_error_response(code, msg))
         }
     }
 }
@@ -192,16 +309,19 @@ pub async fn list_locks(
 )]
 pub async fn list_locks_for_verification(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
+    headers: HeaderMap,
     Json(json): Json<VerifiableLockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let result = handler::lfs_verify_lock(state.storage.lfs_db_storage(), json).await;
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
+        return Ok(resp);
+    }
+    let repo = lfs_repo_path(repo);
+    let result = handler::lfs_verify_lock(state.storage.lfs_db_storage(), &repo, json).await;
     match result {
         Ok(lock_list) => {
             let body = serde_json::to_string(&lock_list).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -228,9 +348,15 @@ pub async fn list_locks_for_verification(
 )]
 pub async fn create_lock(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
+    headers: HeaderMap,
     Json(json): Json<LockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let result = handler::lfs_create_lock(state.storage.lfs_db_storage(), json).await;
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
+        return Ok(resp);
+    }
+    let repo = lfs_repo_path(repo);
+    let result = handler::lfs_create_lock(state.storage.lfs_db_storage(), &repo, json).await;
     match result {
         Ok(lock) => {
             let lock_response = LockResponse {
@@ -238,11 +364,7 @@ pub async fn create_lock(
                 message: "".to_string(),
             };
             let body = serde_json::to_string(&lock_response).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .status(StatusCode::CREATED)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::CREATED, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -273,9 +395,15 @@ pub async fn create_lock(
 pub async fn delete_lock(
     state: State<MonoApiServiceState>,
     Path(id): Path<String>,
+    repo: Option<Extension<LfsRepoContext>>,
+    headers: HeaderMap,
     Json(json): Json<UnlockRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    let result = handler::lfs_delete_lock(state.storage.lfs_db_storage(), &id, json).await;
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
+        return Ok(resp);
+    }
+    let repo = lfs_repo_path(repo);
+    let result = handler::lfs_delete_lock(state.storage.lfs_db_storage(), &repo, &id, json).await;
 
     match result {
         Ok(lock) => {
@@ -284,10 +412,7 @@ pub async fn delete_lock(
                 message: "".to_string(),
             };
             let body = serde_json::to_string(&unlock_response).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -315,18 +440,26 @@ pub async fn delete_lock(
 )]
 pub async fn lfs_process_batch(
     state: State<MonoApiServiceState>,
+    headers: HeaderMap,
     Json(json): Json<BatchRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    // Batch is a single endpoint for both directions; the requested operation
+    // decides whether it is a read (download) or a write (upload).
+    let access = if json.operation == Operation::Upload {
+        LfsAccess::Write
+    } else {
+        LfsAccess::Read
+    };
+    if let Err(resp) = enforce_lfs_access(&state, &headers, access).await {
+        return Ok(resp);
+    }
     let result =
         handler::lfs_process_batch(&state.storage.lfs_service, json, &state.listen_addr).await;
 
     match result {
         Ok(res) => {
             let body = serde_json::to_string(&res).unwrap_or_default();
-            Ok(Response::builder()
-                .header("Content-Type", LFS_CONTENT_TYPE)
-                .body(Body::from(body))
-                .unwrap())
+            Ok(lfs_json_response(StatusCode::OK, body))
         }
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
@@ -358,12 +491,17 @@ pub async fn lfs_download_object(
     state: State<MonoApiServiceState>,
     Path(oid): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
+    // Raw object transfer is a capability URL issued by the (auth-gated) batch
+    // endpoint, which is the LFS authorization point; git-lfs does not reliably
+    // attach credentials to the transfer request, so this endpoint is not
+    // re-authenticated here. See `lfs_process_batch` for the read/write gate.
     let result = handler::lfs_download_object(state.storage.lfs_service.clone(), oid.clone()).await;
     match result {
-        Ok(byte_stream) => Ok(Response::builder()
-            .header("Content-Type", LFS_STREAM_CONTENT_TYPE)
-            .body(Body::from_stream(byte_stream))
-            .unwrap()),
+        Ok(byte_stream) => Ok(lfs_response(
+            StatusCode::OK,
+            LFS_STREAM_CONTENT_TYPE,
+            Body::from_stream(byte_stream),
+        )),
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
             Ok(lfs_error_response(code, msg))
@@ -395,6 +533,14 @@ pub async fn lfs_upload_object(
     Path(oid): Path<String>,
     req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    // Raw object upload is a capability URL issued by the (auth-gated) batch
+    // endpoint: `lfs_process_batch` requires a write token for `operation:
+    // upload` and registers the object metadata, and `lfs_upload_object`
+    // (handler) rejects any oid without that prior registration ("Not found").
+    // So an anonymous upload is impossible without first passing the batch gate.
+    // This endpoint is therefore not re-authenticated here — git-lfs does not
+    // reliably attach credentials to the transfer PUT, and returning 401
+    // mid-body would break the push with a broken pipe.
     let req_obj = RequestObject {
         oid,
         ..Default::default()
@@ -409,14 +555,16 @@ pub async fn lfs_upload_object(
             Ok(acc)
         })
         .await
-        .unwrap();
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read LFS object request body: {e}"),
+            )
+        })?;
 
     let result = handler::lfs_upload_object(&state.storage.lfs_service, &req_obj, body_bytes).await;
     match result {
-        Ok(_) => Ok(Response::builder()
-            .header("Content-Type", LFS_CONTENT_TYPE)
-            .body(Body::empty())
-            .unwrap()),
+        Ok(_) => Ok(lfs_json_response(StatusCode::OK, String::new())),
         Err(err) => {
             let (code, msg) = map_lfs_error(err);
             Ok(lfs_error_response(code, msg))
@@ -431,6 +579,54 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::*;
+
+    #[test]
+    fn lfs_access_policy_matrix() {
+        // Reads mirror upload-pack: allowed when anonymous access is enabled,
+        // or when the caller is authenticated.
+        assert!(lfs_access_allowed(LfsAccess::Read, true, false));
+        assert!(lfs_access_allowed(LfsAccess::Read, true, true));
+        assert!(!lfs_access_allowed(LfsAccess::Read, false, false));
+        assert!(lfs_access_allowed(LfsAccess::Read, false, true));
+        // Writes mirror receive-pack: always require authentication, regardless
+        // of the anonymous-access flag.
+        assert!(!lfs_access_allowed(LfsAccess::Write, true, false));
+        assert!(lfs_access_allowed(LfsAccess::Write, true, true));
+        assert!(!lfs_access_allowed(LfsAccess::Write, false, false));
+        assert!(lfs_access_allowed(LfsAccess::Write, false, true));
+    }
+
+    #[test]
+    fn lfs_token_from_headers_parses_bearer_and_basic() {
+        let mut bearer = HeaderMap::new();
+        bearer.insert(AUTHORIZATION, HeaderValue::from_static("Bearer tok-123"));
+        assert_eq!(lfs_token_from_headers(&bearer).as_deref(), Some("tok-123"));
+
+        let mut basic = HeaderMap::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("git:tok-basic");
+        basic.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+        );
+        assert_eq!(lfs_token_from_headers(&basic).as_deref(), Some("tok-basic"));
+
+        // Missing header yields no token.
+        assert_eq!(lfs_token_from_headers(&HeaderMap::new()), None);
+        // Malformed Basic payload yields no token instead of panicking.
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic not-base64!!"),
+        );
+        assert_eq!(lfs_token_from_headers(&malformed), None);
+    }
+
+    #[test]
+    fn lfs_auth_challenge_is_401_with_www_authenticate() {
+        let resp = lfs_auth_challenge();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE));
+    }
 
     #[test]
     fn test_map_lfs_error_not_found() {

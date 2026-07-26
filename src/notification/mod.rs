@@ -2,6 +2,7 @@ pub mod channels;
 pub mod dispatcher;
 pub mod redact;
 pub mod service;
+pub mod testing;
 pub mod triggers;
 
 pub use dispatcher::config_reload_email_dispatcher_subscriber;

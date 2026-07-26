@@ -629,7 +629,7 @@ fn retry_policy_from_mail_config(config: &MailConfig) -> EmailJobRetryPolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, atomic::AtomicUsize};
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
 
     use async_trait::async_trait;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
@@ -644,9 +644,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        callisto::{
-            email_jobs, mega_cl, notification_event_types, sea_orm_active_enums::MergeStatusEnum,
-        },
+        callisto::{email_jobs, mega_cl, sea_orm_active_enums::MergeStatusEnum},
         config::{MailProvider, reload::ConfigHandle, testing::isolated_config},
         jupiter::{
             migration::apply_migrations,
@@ -736,21 +734,11 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
 
         // ensure event type exists
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
 
         // enqueue a job
         stg.enqueue_email_job(
@@ -782,19 +770,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
 
         stg.enqueue_email_job_with_attachments(EmailJobEnqueue {
             username: "alice",
@@ -1364,19 +1342,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
 
         for idx in 0..(EMAIL_DISPATCH_MAX_IN_FLIGHT + 2) {
             stg.enqueue_email_job(
@@ -1422,19 +1390,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
 
         for idx in 0..(EMAIL_DISPATCH_BATCH_SIZE + 3) {
             stg.enqueue_email_job(
@@ -1470,19 +1428,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
 
         for idx in 0..5 {
             stg.enqueue_email_job(
@@ -1523,8 +1471,9 @@ mod tests {
         let stg = NotificationStorage::new(Arc::new(db.clone()));
         insert_test_event_type(&db).await;
 
-        const TOTAL_JOBS: usize = 17;
-        const BATCH_SIZE: u64 = 4;
+        const TOTAL_JOBS: usize = 125;
+        const BATCH_SIZE: u64 = 20;
+        const MAX_IN_FLIGHT: usize = 5;
 
         for idx in 0..TOTAL_JOBS {
             stg.enqueue_email_job(
@@ -1541,12 +1490,13 @@ mod tests {
 
         let control = EmailDispatcherControl::new_with_limits(
             true,
-            EmailDispatcherLimits::new(BATCH_SIZE, 2),
+            EmailDispatcherLimits::new(BATCH_SIZE, MAX_IN_FLIGHT),
         );
         let dispatcher =
             EmailDispatcher::new_with_control(stg.clone(), Arc::new(NoopMailer), control);
 
-        for tick in 1..=5 {
+        let total_ticks = TOTAL_JOBS.div_ceil(BATCH_SIZE as usize);
+        for tick in 1..=total_ticks {
             dispatcher.tick_once().await.unwrap();
 
             let all_jobs = email_jobs::Entity::find().all(&db).await.unwrap();
@@ -1569,19 +1519,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
         stg.enqueue_email_job(
             "alice",
             "alice@example.com",
@@ -1614,19 +1554,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
         stg.enqueue_email_job(
             "alice",
             "alice@example.com",
@@ -1659,19 +1589,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
         stg.enqueue_email_job(
             "alice",
             "alice@example.com",
@@ -1908,19 +1828,10 @@ mod tests {
     }
 
     async fn insert_test_event_type(db: &sea_orm::DatabaseConnection) {
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(db)
-        .await
-        .unwrap();
+        NotificationStorage::new(Arc::new(db.clone()))
+            .upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
     }
 
     async fn enqueue_test_email_job_with_attachment(

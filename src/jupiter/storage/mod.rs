@@ -38,7 +38,6 @@ pub mod webhook_storage;
 
 use std::sync::Arc;
 
-#[cfg(test)]
 use sea_orm::DatabaseConnection;
 use tokio::sync::Semaphore;
 
@@ -197,8 +196,21 @@ impl Storage {
         config: Arc<Config>,
         object_store: MegaObjectStorageWrapper,
     ) -> Result<Self, MegaError> {
-        let config_handle = ConfigHandle::from_arc(config.clone());
         let connection = Arc::new(database_connection(&config.database).await?);
+        Self::new_with_connection(config, connection, object_store).await
+    }
+
+    /// Build storage over an existing DB connection. Used by `AppContext::new`,
+    /// which builds the connection once and shares it with the DB-only vault
+    /// bootstrap, so object-storage credentials supplied as vault `SecretRef`s
+    /// can be resolved before the object store is constructed (config.md stage 6
+    /// / vault.md stage G).
+    pub async fn new_with_connection(
+        config: Arc<Config>,
+        connection: Arc<DatabaseConnection>,
+        object_store: MegaObjectStorageWrapper,
+    ) -> Result<Self, MegaError> {
+        let config_handle = ConfigHandle::from_arc(config.clone());
         let notification_storage = NotificationStorage::new(connection.clone());
         let base = BaseStorage::new(connection.clone());
 

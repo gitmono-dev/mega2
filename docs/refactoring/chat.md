@@ -14,20 +14,20 @@
 2. **SeaORM 实体与迁移已落地**。`attachments`、`custom_reactions`、`open_graph_links`、`channels`、`channel_memberships`、`channel_membership_updates`、`messages`、`message_notifications` 等实体/迁移存在；`reactions` 复用并扩展既有表。
 3. **HTTP Router 已接入**。`src/api/router/chat_router.rs` 已在 `src/api/api_router.rs` merge，提供 channel CRUD、message CRUD、reaction、attachment presign/confirm、read/unread 端点并带 OpenAPI 标注。
 4. **权限主干已实现并在本轮收紧**。channel list/detail/message list/send/reaction/attachment 等路径会校验 membership；2026-06-23 新增 message edit/delete 的 channel path 校验和当前 membership 校验，避免只凭 sender ownership 跨 channel path 或被移除成员继续写旧消息；同日 `chat_router` 的 message/custom-reaction 映射读取已下沉到 storage helper，减少 handler 直接 SeaORM 查询。
-5. **仍未完成**：外部数据迁移工具的真实源库导入/校验、WebSocket/Pusher 兼容网关、完整真实 HTTP 黑盒矩阵和外部通知投递。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；后续仍需按产品策略补更完整 MIME allowlist 与存储对象归属校验。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
+5. **仍未完成**：更完整 rich-text mention 语义和更完整错误码兼容性仍属于后续。数据迁移工具已有真实 JSON export 导入主路径、空库守卫、导入/跳过/冲突报告与 DB 实际计数校验；**2026-06-29 更新（四）：迁移输入完整性校验已落地**——`chat-migrate` 在启动 `AppContext` 前要求 9 个 legacy export 文件全部存在，且每个文件必须是合法 JSON array，缺失或损坏输入会直接失败，不再静默当作空表导入；**2026-06-29 更新（五）：完整用户映射校验已落地**——导入前会校验源数据中出现的 `user_id` / `organization_membership_id` / owner / actor / sender / reaction 创建者都能映射到目标 `username`，缺失映射会 fail-fast，不再生成 `user_<id>`、`member_<id>` 或 `unknown_user` 占位身份；**2026-07-01 更新：脱敏 legacy export fixture 的完整 `exec` 覆盖已落地**——`chat_migrate_exec_imports_sanitized_legacy_export_fixture` 生成 9 个脱敏 JSON export 文件和 user mapping 文件，直接调用 `chat-migrate` 的 `exec(CommandContext, ArgMatches)`，覆盖文件读取、输入校验、`AppContext` 初始化、空库导入、跳过规则、DB 计数断言和报告输出；**2026-07-01 更新（二）：真实 HTTP 黑盒矩阵已落地**——`chat_http_black_box_lifecycle_matrix` 启动真实 axum router，通过 `reqwest` 覆盖 channel CRUD、message CRUD、reaction、成员管理、read/unread、attachment presign/confirm 成功与缺失对象失败，并断言响应不暴露内部 `id`；**2026-07-01 更新（三）：WebSocket/Pusher 风格事件网关首批已落地**——`/api/v1/chat/events` 使用 axum WebSocket upgrade，支持 `pusher:connection_established`、`pusher:ping`/`pusher:pong`、`pusher:subscribe` 到 `private-chat-channel-<channel_public_id>`，并在发送事件前按当前用户 channel membership 过滤；HTTP mutation 已注入共享 `InMemoryChatEvents`，真实 HTTP 黑盒测试验证创建 channel 的初始消息会发布事件。message notification 内部状态已完成首批 reply 与 `@username` mention 写入；更完整 rich-text mention 语义仍属于后续。附件 presign/confirm 已有首批 file name/type/size/object-key 校验；**2026-06-29 更新：产品级 MIME allowlist 已落地**——`[chat]` 配置新增 `attachment_allowed_mime_types`，支持精确类型（`image/png`）与子类型通配（`image/*`），并在 presign/confirm 两阶段校验；**2026-06-29 更新（二）：已上传对象存在性复核已落地**——`confirm_attachment` 端点在注册附件前调用 object storage 校验 `Attachment` 命名空间下目标对象是否存在，不存在则返回 400；**2026-06-29 更新（三）：链接预览抓取/缓存行为已落地**——`send_message` HTTP 路径在消息发送后会从 content 中提取 http/https URL，调用 `SharedChatService::fetch_or_refresh_open_graph_link` 按 URL 读取本地缓存，过期时通过 HTTP 拉取并解析 `og:title`/`og:image`/favicon，写回 `open_graph_links`；配置 `chat.open_graph_fetch_enabled`/`open_graph_fetch_timeout_ms` 支持热加载。抓取默认禁用重定向、限制响应体大小，并拒绝 localhost/私有 IP（测试/隔离环境可通过 `chat.open_graph_allow_private_networks` 开启）。实时事件已有 `NoopChatEvents` 默认实现和 `InMemoryChatEvents` 进程内 broadcast hub，可供测试与后续网关消费。mark unread 已按验收标准把 `last_read_at` 调到 latest message 之前（2026-06-23 补齐）。
 
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
 | Chat 模块入口 | 已实现主干 | `src/chat/` 下已有 domain/engine/service；仍需继续清理文档中的旧 slice 叙述。 |
-| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验；custom_reactions 已补 `lower(name)` 唯一索引和应用层 lowercase；reactions 已改为 `WHERE discarded_at IS NULL` 部分唯一索引；attachment 已补 `discarded_at` 软删除（满足硬约束 #4）；仍缺产品级 MIME allowlist、对象归属复核和链接预览抓取。 |
-| Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入，rich-text mention 解析和外部投递仍未实现；channels/channel_memberships/channel_membership_updates/messages/message_notifications 的完整索引集和 `message_notifications` 唯一约束已补齐。 |
-| HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；仍缺真实 HTTP 黑盒矩阵、成员管理 HTTP 端点是否暴露的产品决策，以及更完整错误码兼容性。 |
-| 实时事件 | 进程内 broadcaster 已实现 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；`InMemoryChatEvents` 已提供 tokio broadcast 订阅能力并覆盖 service mutation 事件。WebSocket/Pusher 兼容网关仍未实现。 |
-| 数据迁移工具 | 初步 CLI | `src/commands/chat_migrate.rs` 存在；已补空库守卫（拒绝在已有 channel 数据的库上运行）和验证报告（对比导入计数与 DB 实际计数）；仍需真实源库脱敏 fixture 和更完整端到端 exec 测试。 |
+| Shared Foundations（附件、表情） | 部分实现 | attachment/reaction/custom reaction/open graph 的实体、迁移、storage 与 service 主路径已落地；附件 presign/confirm 已补 file name/type/size/object-key 首批校验，并新增 `Config.chat.attachment_allowed_mime_types` 产品级 MIME allowlist（支持精确类型与子类型通配，空列表保持向后兼容）；custom_reactions 已补 `lower(name)` 唯一索引和应用层 lowercase；reactions 已改为 `WHERE discarded_at IS NULL` 部分唯一索引；attachment 已补 `discarded_at` 软删除（满足硬约束 #4）；**2026-06-29 更新：已上传附件对象存在性复核已落地**，`confirm_attachment` 注册前会校验 object storage 中目标对象是否存在；**2026-06-29 更新（三）：链接预览抓取/缓存行为已落地**——`send_message` HTTP 路径会提取消息中的 http/https URL，调用 `SharedChatService::fetch_or_refresh_open_graph_link` 按 URL 读取本地缓存，过期时通过 HTTP 拉取 HTML，解析 `og:title`/`og:image`/favicon 后写回 `open_graph_links`；支持 `chat.open_graph_fetch_enabled`/`open_graph_fetch_timeout_ms` 配置并在热加载时生效；默认禁用重定向、限制响应体大小、拒绝 localhost/私有 IP，测试/隔离环境可通过 `chat.open_graph_allow_private_networks` 开启。 |
+| Channel Chat（频道、消息） | 部分实现 | channel/message/membership 实体、迁移、storage、service 已落地；create/send/edit/delete/read/unread/member service 主路径可用；reply 与 `@username` mention message notification 内部状态已写入；**2026-06-29 更新**：`@username` mention 的外部邮件投递已接入 `send_message` HTTP 路径，通过 `notification::triggers::on_chat_mention_created` 按用户偏好入队 `chat.mention.created` email job。**2026-06-29 更新（二）**：reply 的外部邮件投递也已接入，通过 `notification::triggers::on_chat_reply_created` 向被回复消息的作者入队 `chat.reply.created` email job。rich-text mention 更复杂语义（如 markdown/HTML 解析、非 ASCII handle）仍为后续。channels/channel_memberships/channel_membership_updates/messages/message_notifications 的完整索引集和 `message_notifications` 唯一约束已补齐。 |
+| HTTP API | 部分实现 | `chat_router` 已挂载，DTO/OpenAPI 标注存在；**成员管理 HTTP 端点已暴露（owner 可添加/移除成员，成员可列成员，2026-06-29 落地）**；稳定无 Redis router 测试已落地；真实 HTTP 黑盒矩阵已落地；仍缺更完整错误码兼容性。 |
+| 实时事件 | WebSocket/Pusher 风格网关首批已实现 | `ChatEvents`/`NoopChatEvents` 已定义并由 service 调用；`InMemoryChatEvents` 已提供 tokio broadcast 订阅能力并覆盖 service mutation 事件；`/api/v1/chat/events` 首批 WebSocket 网关已落地，支持 Pusher 风格连接、心跳、订阅 ack 和按 membership 过滤后的 chat mutation event 转发。 |
+| 数据迁移工具 | 已实现主干 | `src/commands/chat_migrate.rs` 存在；已补空库守卫（拒绝在已有 channel 数据的库上运行）、9 个 legacy export 文件完整性校验、JSON array 格式校验、完整用户/组织成员映射 fail-fast 校验和验证报告（对比导入计数与 DB 实际计数）；已新增脱敏 legacy export fixture 的完整 `exec` 测试，覆盖 9 个 JSON 文件和 mapping 文件读取、`AppContext` 初始化、导入/跳过规则、DB 计数与报告输出。 |
 | 权限控制 | 首批实现并加固 | 多数 channel/message 路径已校验 membership；2026-06-23 已补 message edit/delete 的 channel path + current membership guard，并移除 `chat_router` response mapping 中对 message/custom-reaction 的直接 SeaORM 查询；同日 `delete_reaction` 已补 current membership guard，被移除成员不能再删除自己的旧 reaction。仍需持续把其他 handler 内直接 SeaORM 查询迁回 storage/service。 |
-| 集成测试 | 部分实现 | service/router 生命周期测试存在；router 测试在 Redis 不可用时会 skip，需要补更稳定的无 Redis 黑盒覆盖。 |
+| 集成测试 | 部分实现 | service/router 生命周期测试存在；router 生命周期测试已通过 `ChatApiState` 去除 Redis 依赖，不再在 Redis 不可用时 skip；真实 HTTP 黑盒矩阵已落地。 |
 
 ## 硬约束与不可违反的原则
 
@@ -76,7 +76,7 @@
 
 - **Soft Delete 查询复杂性**：大量查询需要默认过滤 `discarded_at IS NULL`，如果不在 storage 层统一处理，会导致遗漏和不一致。
 
-- **实时事件复杂性**：当前已有 no-op 默认实现和进程内 broadcast hub，但后续接入 WebSocket/Pusher 时仍需要网关层适配。事件接口应继续保持稳定。
+- **实时事件复杂性**：当前已有 no-op 默认实现、进程内 broadcast hub 和首批 WebSocket/Pusher 风格网关；后续若需要完整 Pusher 私有频道签名、presence channel 或前端 SDK 兼容细节，应作为网关扩展继续保持事件接口稳定。
 
 - **API 认证一致性**：HTTP 和 SSH 认证上下文需与其他模块（如 vault、config 的 protocol auth）保持一致。
 
@@ -323,6 +323,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 - unique `public_id`
 - `(subject_type, subject_id)`
 - unique `(subject_type, subject_id, username, content, custom_reaction_id, discarded_at)`，迁移时确认 Postgres 对 nullable unique 的语义是否满足需求；不满足则使用 partial unique index。
+  - **已完成（2026-07-01）**：新增 `m20260701_000000_fix_reaction_unique_nulls`，使用 `NULLS NOT DISTINCT` 重建 `idx-reactions-unique-active`，避免 nullable 列导致标准 emoji（`custom_reaction_id` NULL）和 custom reaction（`content` NULL）重复绕过唯一约束；storage 回归测试覆盖标准 emoji/custom reaction 重复冲突和 soft delete 后可重建。
 
 ### `custom_reactions`
 
@@ -509,7 +510,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 
 - 自动把创建者加入 `member_usernames`。
 - 去重成员列表。
-- 创建 `channels`。
+- 创建 `channels`，并把可选的 `image_path` 持久化到 `channels.image_path`（创建时即写入，无需事后再 `PATCH`）。
 - 为每个成员创建 `channel_memberships`。
 - 写一条 membership update，`actor_username` 为创建者。
 - 如果有 `initial_message` 或附件，调用发送消息服务。
@@ -520,6 +521,7 @@ HTTP handler -> chat service -> typed storage -> callisto entity
 - 创建者永远是成员。
 - 同一个 channel 中成员唯一。
 - 首条消息创建后 `latest_message_id` 与 `last_message_at` 正确。
+- 传入 `image_path` 时，创建出的 channel 的 `image_path` 与输入一致（由 `channel_chat::create_channel` 单测 `assert_eq!(ch.image_path, ...)` 覆盖）。
 
 ### 发送消息
 
@@ -601,7 +603,7 @@ pub trait ChatEvents {
 }
 ```
 
-默认实现可以是 no-op。当前已提供 `InMemoryChatEvents` 进程内 broadcast hub，供测试和后续网关消费；WebSocket/Pusher 兼容网关作为后续切片，不得阻塞 CRUD 切片合入。
+默认实现可以是 no-op。当前已提供 `InMemoryChatEvents` 进程内 broadcast hub，且 HTTP API state 已注入共享 hub；`/api/v1/chat/events` 首批 WebSocket 网关会消费该 hub 并输出 Pusher 风格事件 envelope。完整 Pusher 私有频道签名、presence channel 和前端 SDK 兼容细节可作为后续网关扩展，不再阻塞 CRUD 切片合入。
 
 ## 数据迁移
 
@@ -670,12 +672,13 @@ pub trait ChatEvents {
 - 已完成主干：新增 reaction storage：创建、soft delete、按 message 聚合。
 - 已完成主干：新增 custom reaction storage：创建、按 name/public_id 查询。
 - 已完成主干：新增 open graph storage：按 URL upsert/query。
-- 剩余：补完整唯一约束冲突矩阵、附件软删除策略和链接预览抓取/缓存行为。
+- 已完成：链接预览抓取/缓存行为，`SharedChatService::fetch_or_refresh_open_graph_link` 按 URL 缓存并刷新 Open Graph 数据。
+- 已完成：附件 `public_id` 唯一冲突矩阵测试、按 subject 批量软删除，以及消息删除时级联软删除其附件的端到端覆盖。
 
 验收：
 
 - 迁移测试覆盖 4 张表和关键索引。
-- storage 测试覆盖 create/query/soft delete/unique conflict。
+- ✅ storage 测试覆盖 create/query/soft delete/unique conflict（`custom_reaction_storage::test_custom_reaction_rejects_duplicate_lowercase_name` 覆盖 `lower(name)` 唯一冲突；`attachment_storage::test_duplicate_public_id_is_rejected` 覆盖 `public_id` 唯一冲突；`attachment_storage::test_soft_delete_attachments_for_subject` 与 `channel_chat::test_delete_message_soft_deletes_attachments` 覆盖按 subject 批量软删除与消息删除级联软删除；`reaction_storage::test_duplicate_active_standard_reaction_is_rejected`、`reaction_storage::test_duplicate_active_custom_reaction_is_rejected` 与 `reaction_storage::test_soft_deleted_standard_reaction_can_be_recreated` 覆盖 reactions active 唯一索引的 nullable 列语义与 partial index 行为）。
 - 不引入外部网络调用。
 
 ### Slice 2: Channel Chat schema + storage（主干已落地）
@@ -690,7 +693,8 @@ pub trait ChatEvents {
 - 已完成主干：新增 message storage：page、create、update、soft delete、recompute latest。
 - 已完成首批：channel/message 读取按 `username` 强制 membership join；2026-06-23 已补 message edit/delete 的 path channel + current membership guard。
 - 已完成首批：`chat_router` response mapping 中的 message/custom-reaction 读取已迁回 storage helper。
-- 剩余：继续减少其他 handler 内直接 SeaORM 查询，补稳定的 storage 级权限回归测试矩阵。
+- ✅ runtime chat handler/service 路径已收敛到 storage 调用：HTTP/router 与 `src/chat/service/` 当前无直接 SeaORM 查询；`SharedChatService::delete_reaction` 的 active reaction lookup 已迁入 `ReactionStorage::get_active_reaction_by_public_id`，并由 `delete_reaction_rejects_removed_member` 与 reaction storage 测试覆盖。`commands/chat_migrate.rs` 仍保留 bulk import/校验型直接 SeaORM 写入，不计入 runtime handler/storage 边界。
+- ✅ storage 级权限回归测试补强：`channel_storage::channel_visibility_is_membership_scoped` 覆盖成员/非成员 list 与 public_id lookup 可见性；`channel_storage::channel_update_and_delete_require_visible_membership` 覆盖非成员 update 拒绝、成员 update 成功与 soft-delete 后不可见。
 
 验收：
 
@@ -711,7 +715,7 @@ pub trait ChatEvents {
 - 已完成主干：实现 `delete_message`。
 - 已完成主干：实现 `add_members` / `remove_members`。
 - 已完成首批：实现 reply 与 `@username` mention 的 message notification 内部状态写入。
-- 已完成首批：接入 no-op 默认 event broadcaster，并新增进程内 `InMemoryChatEvents` broadcaster；WebSocket/Pusher 兼容网关仍为后续。
+- 已完成首批：接入 no-op 默认 event broadcaster，并新增进程内 `InMemoryChatEvents` broadcaster；WebSocket/Pusher 风格事件网关首批已落地，HTTP mutation 会向共享 hub 发布事件，`/api/v1/chat/events` 负责订阅和 membership 过滤转发。
 
 验收：
 
@@ -730,7 +734,8 @@ pub trait ChatEvents {
 - 已完成主干：新增 OpenAPI 标注。
 - 已完成主干：接入当前用户 `username` 提取。
 - 已完成主干：把 service 错误映射成统一 API error。
-- 剩余：补真实 HTTP 黑盒矩阵、稳定无 Redis router 测试，以及是否暴露成员管理 HTTP 端点的产品决策。
+- ✅ 稳定无 Redis router 测试已落地：`chat_router::test_chat_router_handlers_lifecycle` 现在通过 `ChatApiState` 只注入 chat handler 实际需要的 `Storage` / `listen_addr`，不再为了构造 `MonoApiServiceState` 连接 Redis，也不再在 Redis 不可用时跳过。
+- ✅ 真实 HTTP 黑盒矩阵已落地：`chat_http_black_box_lifecycle_matrix` 启动真实 axum router 并通过 `reqwest` 覆盖第一版 chat 端点主生命周期。
 
 验收：
 
@@ -748,7 +753,9 @@ pub trait ChatEvents {
 - 已完成基础：实现 attachment confirmation endpoint。
 - 已完成首批：校验当前用户对目标 message/channel 的访问权限。
 - 已完成首批：校验文件名不含路径分隔/控制字符、文件大小为正且不超过 100MiB、MIME 形态包含 `/`、confirm file_path 必须是 `chat/attachments/` object key 且无 traversal 段。
-- 剩余：产品级 MIME allowlist、已上传对象归属/存在性复核和更完整 object storage fake/no-op 测试。
+- 已完成：产品级 MIME allowlist（`[chat].attachment_allowed_mime_types`，支持精确类型 `image/png` 与子类型通配 `image/*`，空列表保持向后兼容），在 presign/confirm 两阶段校验。
+- 已完成：已上传对象存在性复核，`confirm_attachment` 注册前校验 object storage 中目标对象是否存在。
+- 已完成：更完整 object storage fake/no-op 测试覆盖，包括缺失对象、非成员访问、跨 channel object-key 替换三种失败路径。
 
 验收：
 
@@ -762,10 +769,13 @@ pub trait ChatEvents {
 
 任务：
 
-- 写导入脚本或一次性 CLI 子命令。
-- 实现用户映射输入。
-- 实现跳过/降级报告。
-- 实现校验报告。
+- 已完成：一次性 CLI 子命令 `chat-migrate`。
+- 已完成：用户映射 JSON 输入。
+- 已完成：9 个 legacy export 文件完整性校验与 JSON array 格式校验。
+- 已完成：完整用户/组织成员映射校验，缺失映射 fail-fast。
+- 已完成：跳过/降级报告。
+- 已完成：校验报告（导入计数与 DB 实际计数对比）。
+- 已完成：脱敏 legacy export fixture 和完整端到端 `exec` 测试（`chat_migrate_exec_imports_sanitized_legacy_export_fixture`）。
 
 验收：
 
@@ -819,4 +829,4 @@ source .env.test && cargo test --all
 | message content 是否继续存 HTML | Slice 3 前 | 保持 HTML，避免前端渲染迁移。 |
 | API 对非成员返回 403 还是 404 | Slice 4 前 | 404，减少资源枚举。 |
 | 是否需要 Rails `/v1` 兼容路径 | Slice 4 前 | 不需要，先只做绿地路径。 |
-| 是否需要 Pusher 兼容 WebSocket | CRUD 上线后 | 独立切片评估。 |
+| 是否需要 Pusher 兼容 WebSocket | 已完成首批 | 已落地 Pusher 风格 WebSocket envelope；完整 SDK 私有频道签名/presence 兼容可按前端需要继续扩展。 |

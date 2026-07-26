@@ -25,6 +25,31 @@ use crate::{
 const CORE_KEY_FILE: &str = "core_key.json";
 const SECRET_MOUNT: &str = "secret";
 
+tokio::task_local! {
+    /// Optional caller identity for `vault_audit` records (vault.md stage H "who").
+    /// Entry points wrap secret operations in [`with_audit_caller`]; unset falls
+    /// back to `"unknown"`.
+    static AUDIT_CALLER: Option<String>;
+}
+
+/// Run `future` with `caller` attributed to every `vault_audit` record emitted
+/// by secret operations on the current task. Non-invasive alternative to
+/// threading a caller parameter through every `VaultCoreInterface` call site.
+pub async fn with_audit_caller<F, R>(caller: &str, future: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    AUDIT_CALLER.scope(Some(caller.to_string()), future).await
+}
+
+fn current_audit_caller() -> String {
+    AUDIT_CALLER
+        .try_with(|c| c.clone())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CoreKey {
     secret_shares: Vec<Vec<u8>>,
@@ -389,42 +414,322 @@ impl VaultCore {
         replace_core_key(key_path.as_ref(), &updated_key)
     }
 
+    /// Backup `key_path` to `destination`.
+    ///
+    /// If `destination` is a directory, a file named `core_key.json.<timestamp>`
+    /// is created inside it. The copied key is given `0600` permissions on Unix
+    /// and a sibling `.meta.json` file records the source path and backup time.
+    pub fn backup_key(
+        key_path: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> VaultResult<PathBuf> {
+        let key_path = key_path.as_ref();
+        let destination = destination.as_ref();
+
+        if !key_path.exists() {
+            return Err(VaultError::CoreKeyMissing {
+                path: key_path.to_path_buf(),
+            });
+        }
+
+        let output_path = if destination.is_dir() {
+            destination.join(format!(
+                "core_key.json.{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ))
+        } else {
+            destination.to_path_buf()
+        };
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| VaultError::CoreKeyWrite {
+                path: output_path.clone(),
+                source,
+            })?;
+        }
+
+        fs::copy(key_path, &output_path).map_err(|source| VaultError::CoreKeyWrite {
+            path: output_path.clone(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| VaultError::CoreKeyWrite {
+                    path: output_path.clone(),
+                    source,
+                },
+            )?;
+        }
+
+        let meta_filename = format!(
+            "{}.meta.json",
+            output_path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        );
+        let meta_path = output_path.with_file_name(meta_filename);
+        let meta = serde_json::json!({
+            "version": 1,
+            "source_key_path": key_path.to_string_lossy(),
+            "backed_up_at": chrono::Utc::now().to_rfc3339(),
+            "key_file": output_path.file_name().map(|n| n.to_string_lossy()),
+        });
+        let meta_file =
+            fs::File::create(&meta_path).map_err(|source| VaultError::CoreKeyWrite {
+                path: meta_path.clone(),
+                source,
+            })?;
+        serde_json::to_writer_pretty(meta_file, &meta).map_err(|source| {
+            VaultError::CoreKeySerialize {
+                path: meta_path.clone(),
+                source,
+            }
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&meta_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| VaultError::CoreKeyWrite {
+                    path: meta_path.clone(),
+                    source,
+                },
+            )?;
+        }
+
+        Ok(output_path)
+    }
+
+    /// Restore a backed-up key file to `key_path` and verify it unlocks the vault.
+    ///
+    /// The restore is performed atomically: `source` is copied to a temporary file
+    /// next to `key_path`, verified with `VaultCore::from_database_config`, and
+    /// then renamed into place. This avoids leaving a non-functional `core_key.json`
+    /// if the backup is corrupt or does not match the current database.
+    pub async fn restore_key(
+        source: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        db_config: &DbConfig,
+    ) -> VaultResult<PathBuf> {
+        let source = source.as_ref();
+        let key_path = key_path.as_ref();
+
+        if !source.exists() {
+            return Err(VaultError::CoreKeyRead {
+                path: source.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "backup source does not exist",
+                ),
+            });
+        }
+
+        let tmp_path = key_path.with_extension("restore-tmp");
+        if let Some(parent) = tmp_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| VaultError::CoreKeyWrite {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        }
+
+        fs::copy(source, &tmp_path).map_err(|source| VaultError::CoreKeyWrite {
+            path: tmp_path.clone(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| VaultError::CoreKeyWrite {
+                    path: tmp_path.clone(),
+                    source,
+                },
+            )?;
+        }
+
+        // Verify the restored key actually unlocks the vault before activating it.
+        let verify_result = VaultCore::from_database_config(db_config, tmp_path.clone()).await;
+        if let Err(e) = verify_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        // Install the verified temp key without deleting the existing key first.
+        // On Unix, rename atomically replaces the destination. Elsewhere, move the
+        // existing key to a rollback backup first, then install the temp key, and
+        // only delete the rollback after the replace succeeds. If the replace fails,
+        // the rollback is restored so a failed restore does not cause key loss.
+        #[cfg(unix)]
+        {
+            fs::rename(&tmp_path, key_path).map_err(|source| VaultError::CoreKeyWrite {
+                path: key_path.to_path_buf(),
+                source,
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            /// Per-process monotonic counter for restore rollback file names.
+            static ROLLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            // Allocate a rollback path that does not already exist. This loop
+            // guards against stale rollback files left by earlier processes that
+            // happened to reuse the same PID, making the restore truly
+            // collision-proof on non-Unix platforms.
+            let rollback_path = loop {
+                let suffix = format!(
+                    "json.restore-bak.{}.{}",
+                    std::process::id(),
+                    ROLLBACK_COUNTER.fetch_add(1, Ordering::SeqCst)
+                );
+                let candidate = key_path.with_extension(suffix);
+                if !candidate.exists() {
+                    break candidate;
+                }
+            };
+            let rollback_created = if key_path.exists() {
+                fs::rename(key_path, &rollback_path).map_err(|source| {
+                    VaultError::CoreKeyWrite {
+                        path: key_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+                true
+            } else {
+                false
+            };
+            match fs::rename(&tmp_path, key_path) {
+                Ok(()) => {
+                    if rollback_created {
+                        let _ = fs::remove_file(&rollback_path);
+                    }
+                }
+                Err(source) => {
+                    if rollback_created {
+                        let _ = fs::rename(&rollback_path, key_path);
+                    }
+                    return Err(VaultError::CoreKeyWrite {
+                        path: key_path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
+
+        Ok(key_path.to_path_buf())
+    }
+
     /// Emit one audit record per secret access (vault.md stage H).
     ///
     /// Records `operation` (write/read/list/delete), the `secret_name` (the
-    /// logical path, never the secret value) and the `outcome`
-    /// (success/miss/failure) to the `vault_audit` tracing target.
+    /// logical path, never the secret value), the `outcome` (success/miss/failure)
+    /// and the `caller` to the configured audit sink.
     ///
     /// **Configurable, default on.** Auditing is gated by
-    /// [`VaultAuditConfig::enabled`] (default `true`); a deployment may opt out
-    /// via `config.vault.audit.enabled = false`, in which case no record is
-    /// emitted. The destination is the `vault_audit` tracing target; a
-    /// configurable durable/alternate sink is deferred (vault.md stage H).
+    /// [`VaultAuditConfig::enabled`] (default `true`). The sink
+    /// ([`VaultAuditConfig::sink`]) is `"tracing"` by default (the infallible
+    /// `vault_audit` tracing target) or `"file"` — a durable append-only JSONL
+    /// log at `file_path`, fsync'd per record, for non-repudiation independent of
+    /// the process log pipeline (vault.md stage H).
     ///
-    /// **Failure policy: fail-open (intentional).** Auditing uses `tracing`,
-    /// whose emission is infallible and cannot itself error, so a secret
-    /// operation is never blocked or failed by the audit step. This is a
-    /// deliberate availability-over-non-repudiation choice: a missing audit
-    /// sink must not deny legitimate secret access at runtime. The secret value
-    /// is hashed/omitted by construction here (only the name and outcome are
-    /// recorded), so this target carries no plaintext, root token or shares.
+    /// **Failure policy.** The `tracing` sink is infallible. For a fallible sink
+    /// (`file`), [`VaultAuditConfig::fail_closed`] selects the behaviour on a
+    /// write error: fail-open (default) logs a warning and lets the secret
+    /// operation proceed (availability over non-repudiation); fail-closed returns
+    /// an error so the caller fails the operation. The secret value is omitted by
+    /// construction (only name/operation/outcome/caller are recorded), so neither
+    /// sink ever carries plaintext, root token or shares.
     fn audit_secret_access(
         &self,
         operation: SecretAuditOperation,
         name: SecretName<'_>,
         outcome: &'static str,
-    ) {
+    ) -> Result<(), MegaError> {
         if !self.audit.enabled {
-            return;
+            return Ok(());
         }
-        tracing::info!(
-            target: "vault_audit",
-            operation = operation.as_str(),
-            secret_name = name.as_str(),
-            outcome,
-            "vault secret access"
-        );
+        let caller = current_audit_caller();
+        match self.audit.sink.as_str() {
+            "file" => {
+                let Some(path) = self.audit.file_path.as_ref() else {
+                    // Validation rejects this config, but guard defensively.
+                    if self.audit.fail_closed {
+                        return Err(MegaError::Other(
+                            "vault audit sink is \"file\" but no file_path is configured (fail-closed)"
+                                .to_string(),
+                        ));
+                    }
+                    tracing::warn!(
+                        target: "vault_audit",
+                        "vault audit sink is \"file\" but no file_path is configured; skipping record (fail-open)"
+                    );
+                    return Ok(());
+                };
+                let record = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "operation": operation.as_str(),
+                    "secret_name": name.as_str(),
+                    "outcome": outcome,
+                    "caller": caller,
+                });
+                if let Err(error) = append_audit_record(path, &record) {
+                    if self.audit.fail_closed {
+                        return Err(MegaError::Other(format!(
+                            "vault audit record write failed (fail-closed): {error}"
+                        )));
+                    }
+                    tracing::warn!(
+                        target: "vault_audit",
+                        error = %error,
+                        "vault audit file write failed; continuing (fail-open)"
+                    );
+                }
+                Ok(())
+            }
+            _ => {
+                tracing::info!(
+                    target: "vault_audit",
+                    operation = operation.as_str(),
+                    secret_name = name.as_str(),
+                    outcome,
+                    caller = %caller,
+                    "vault secret access"
+                );
+                Ok(())
+            }
+        }
     }
+}
+
+/// Append one JSON audit record as a line to `path`, creating it if needed and
+/// fsync'ing the file for durability. `O_APPEND` (via `append(true)`) gives an
+/// atomic seek+write for these small records on Linux regular files, so
+/// concurrent secret operations do not need an explicit lock to avoid
+/// interleaving. Note: `sync_all` fsyncs the file but not the parent directory,
+/// so a crash immediately after the very first creation could lose the new file
+/// entry — an accepted tradeoff for an append-only audit log.
+fn append_audit_record(path: &Path, record: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut line = serde_json::to_string(record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[async_trait]
@@ -442,12 +747,15 @@ impl VaultCoreInterface for VaultCore {
             .write(Some(token), path, data)
             .await
             .map_err(|e| VaultError::WriteApi(e.to_string()));
-        self.audit_secret_access(
+        let audit = self.audit_secret_access(
             SecretAuditOperation::Write,
             name,
             if result.is_ok() { "success" } else { "failure" },
         );
+        // The operation's own error takes precedence; a fail-closed audit error
+        // is only surfaced when the operation otherwise succeeded.
         result?;
+        audit?;
         Ok(())
     }
 
@@ -460,7 +768,7 @@ impl VaultCoreInterface for VaultCore {
             .read(token.into(), &path)
             .await
             .map_err(|e| VaultError::ReadApi(e.to_string()));
-        self.audit_secret_access(
+        let audit = self.audit_secret_access(
             SecretAuditOperation::Read,
             name,
             match &result {
@@ -470,6 +778,7 @@ impl VaultCoreInterface for VaultCore {
             },
         );
         let resp = result?;
+        audit?;
 
         Ok(resp.and_then(|r| r.data))
     }
@@ -483,12 +792,13 @@ impl VaultCoreInterface for VaultCore {
             .delete(Some(token), path, None)
             .await
             .map_err(|e| VaultError::DeleteApi(e.to_string()));
-        self.audit_secret_access(
+        let audit = self.audit_secret_access(
             SecretAuditOperation::Delete,
             name,
             if result.is_ok() { "success" } else { "failure" },
         );
         result?;
+        audit?;
         Ok(())
     }
 }
@@ -910,6 +1220,7 @@ mod tests {
     use super::*;
     use crate::jupiter::{
         migration::apply_migrations,
+        storage::base_storage::BaseStorage,
         tests::{test_db_config, test_db_connection, test_storage},
     };
 
@@ -919,6 +1230,15 @@ mod tests {
         VaultStorage {
             base: BaseStorage::new(connection),
         }
+    }
+
+    #[tokio::test]
+    async fn with_audit_caller_scopes_caller_identity() {
+        assert_eq!(current_audit_caller(), "unknown");
+        let caller =
+            with_audit_caller("cli:config-secret-set", async { current_audit_caller() }).await;
+        assert_eq!(caller, "cli:config-secret-set");
+        assert_eq!(current_audit_caller(), "unknown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -949,6 +1269,145 @@ mod tests {
             persisted_key.contains("runtime_tokens"),
             "persisted core key should retain limited runtime tokens"
         );
+    }
+
+    /// vault.md Phase A acceptance: the root token, unseal shares and secret
+    /// plaintext must never reach the logs (vault.md:226, 260). This is the
+    /// regression guard for the historical `log::debug!("root token: …")` leak
+    /// removed in Phase A. It captures the `tracing` events emitted by the
+    /// VaultCore integration on the init task thread across a fresh init, a
+    /// secret write/read and an explicit reset, then asserts that none of the
+    /// recoverable secret material (unseal shares — in compact JSON, pretty JSON
+    /// and Debug forms — and the limited runtime tokens), the written secret
+    /// value, or a root-token reference appears in it.
+    ///
+    /// Scope is `tracing` on this task thread (see the capture comment below for
+    /// the deliberately uncovered channels: stdout/stderr, the `log::` facade and
+    /// vault-internal background OS threads).
+    #[tokio::test]
+    async fn vault_lifecycle_never_logs_root_token_shares_or_secret_values() {
+        use std::{io::Write, sync::Mutex};
+
+        // A `MakeWriter` that appends every emitted log line to a shared buffer.
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(buffer.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        // Capture scope: a thread-local subscriber records `tracing` events
+        // emitted on THIS task thread. The VaultCore integration's own logging
+        // (init/unseal/revoke/audit in this file) runs inline on this thread and
+        // is therefore captured. Known, deliberate gaps NOT covered by this unit
+        // guard: (a) `stdout`/`stderr` from any `println!`/`eprintln!`; (b) the
+        // `log::` crate facade (no `tracing-log` bridge is installed here); and
+        // (c) events emitted on vault-internal background OS threads (e.g. the
+        // lease-expiration timer in `src/vault/modules/auth/expiration.rs`, which
+        // spawns its own thread + runtime). Closing those would require a global
+        // subscriber (which races with other tests' `try_init`) or process-level
+        // fd capture, out of scope for this test.
+        let _capture = tracing::subscriber::set_default(subscriber);
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let sentinel = "do-not-log-this-vault-secret-7f3a9c";
+
+        let vault = VaultCore::from_database_config(&db_config, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+        let mut secret = Map::new();
+        secret.insert("value".to_string(), Value::String(sentinel.to_string()));
+        vault
+            .write_secret("ssh_server_key", Some(secret))
+            .await
+            .expect("write secret");
+        vault
+            .read_secret("ssh_server_key")
+            .await
+            .expect("read secret");
+        drop(vault);
+
+        let (reset_vault, _backup) = VaultCore::reset(&db_config, key_path.clone())
+            .await
+            .expect("vault reset should succeed");
+        drop(reset_vault);
+
+        let logs = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+            .expect("captured logs are valid utf-8");
+        assert!(
+            !logs.is_empty(),
+            "expected the subscriber to capture some vault tracing output"
+        );
+
+        // Secret plaintext must never appear (it is encrypted at rest and never logged).
+        assert!(
+            !logs.contains(sentinel),
+            "secret plaintext leaked into logs"
+        );
+        // No root-token reference (the historical Phase-A leak format).
+        assert!(
+            !logs.to_lowercase().contains("root token") && !logs.contains("root_token"),
+            "a root token reference leaked into logs"
+        );
+
+        // The persisted key file holds the unseal shares + limited runtime tokens
+        // that must likewise never be logged.
+        let core_key: Value =
+            serde_json::from_str(&std::fs::read_to_string(&key_path).expect("read core key file"))
+                .expect("core key file is valid json");
+        for field in ["ssh", "pgp", "nostr", "pki", "config", "generic"] {
+            if let Some(token) = core_key["runtime_tokens"][field].as_str()
+                && !token.is_empty()
+            {
+                assert!(
+                    !logs.contains(token),
+                    "runtime token `{field}` leaked into logs"
+                );
+            }
+        }
+        let shares = core_key["secret_shares"]
+            .as_array()
+            .expect("persisted core key should contain unseal shares");
+        assert!(!shares.is_empty(), "expected unseal shares to be persisted");
+        for share in shares {
+            let bytes: Vec<u8> =
+                serde_json::from_value(share.clone()).expect("share is a byte array");
+            // Guard the accidental leak formats a share could take: the compact
+            // JSON array, the pretty JSON array (the form `persist_core_key` uses
+            // via `serde_json::to_writer_pretty`), and the Rust `Debug` rendering
+            // of the byte slice.
+            let json = serde_json::to_string(share).expect("share json");
+            let pretty = serde_json::to_string_pretty(share).expect("share pretty json");
+            let debug = format!("{bytes:?}");
+            for (form, rendered) in [("json", &json), ("pretty json", &pretty), ("debug", &debug)] {
+                assert!(
+                    !logs.contains(rendered),
+                    "an unseal share leaked into logs ({form} form)"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1035,7 +1494,10 @@ mod tests {
         );
 
         // Opting out via config must not break secret operations (fail-open).
-        let vault_core = vault_core.with_audit_config(VaultAuditConfig { enabled: false });
+        let vault_core = vault_core.with_audit_config(VaultAuditConfig {
+            enabled: false,
+            ..Default::default()
+        });
         assert!(!vault_core.audit.enabled);
 
         let value = serde_json::json!({ "data": "v" })
@@ -1055,6 +1517,107 @@ mod tests {
             read, value,
             "audit toggle must not affect secret round-trip"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_file_sink_writes_jsonl_records_without_secret_value() {
+        // Stage H: the durable "file" audit sink appends one JSONL record per
+        // secret access, carrying operation/secret_name/outcome/caller only.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let audit_path = temp_dir.path().join("vault-audit.jsonl");
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize")
+            .with_audit_config(VaultAuditConfig {
+                enabled: true,
+                sink: "file".to_string(),
+                file_path: Some(audit_path.clone()),
+                fail_closed: true,
+            });
+
+        let mut data = Map::new();
+        data.insert(
+            "value".to_string(),
+            Value::String("super-secret-audit-value".to_string()),
+        );
+        vault
+            .write_secret("ssh_server_key", Some(data))
+            .await
+            .expect("write should succeed");
+        vault
+            .read_secret("ssh_server_key")
+            .await
+            .expect("read should succeed");
+
+        let contents = std::fs::read_to_string(&audit_path).expect("audit file should exist");
+        let mut operations = Vec::new();
+        for line in contents.lines() {
+            let record: Value = serde_json::from_str(line).expect("each line is a JSON record");
+            assert_eq!(record["secret_name"], "ssh_server_key");
+            assert!(record.get("caller").is_some());
+            assert!(record.get("ts").is_some());
+            operations.push(record["operation"].as_str().unwrap().to_string());
+        }
+        assert!(operations.iter().any(|op| op == "write"));
+        assert!(operations.iter().any(|op| op == "read"));
+        // The secret value must never appear in the audit log.
+        assert!(
+            !contents.contains("super-secret-audit-value"),
+            "audit log must not contain the secret value"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_file_sink_fail_closed_fails_operation_when_unwritable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        // A path under a non-existent directory cannot be created, so the append fails.
+        let audit_path = temp_dir.path().join("missing-dir").join("audit.jsonl");
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize")
+            .with_audit_config(VaultAuditConfig {
+                enabled: true,
+                sink: "file".to_string(),
+                file_path: Some(audit_path),
+                fail_closed: true,
+            });
+
+        let mut data = Map::new();
+        data.insert("value".to_string(), Value::String("v".to_string()));
+        let err = vault
+            .write_secret("ssh_server_key", Some(data))
+            .await
+            .expect_err("fail-closed audit write failure should fail the operation");
+        assert!(err.to_string().contains("audit record write failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_file_sink_fail_open_allows_operation_when_unwritable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let audit_path = temp_dir.path().join("missing-dir").join("audit.jsonl");
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let vault = VaultCore::config(vault_storage, key_path)
+            .await
+            .expect("vault core should initialize")
+            .with_audit_config(VaultAuditConfig {
+                enabled: true,
+                sink: "file".to_string(),
+                file_path: Some(audit_path),
+                fail_closed: false,
+            });
+
+        let mut data = Map::new();
+        data.insert("value".to_string(), Value::String("v".to_string()));
+        // Fail-open: the audit write fails but the secret operation still succeeds.
+        vault
+            .write_secret("ssh_server_key", Some(data))
+            .await
+            .expect("fail-open audit failure must not block the operation");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1293,5 +1856,141 @@ mod tests {
 
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_backup_key_creates_key_and_meta_file() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = test_vault_storage(temp_dir.path()).await;
+        let _vault_core = VaultCore::config(vault_storage, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        let backup_dir = temp_dir.path().join("backups");
+        let backed_up_path =
+            VaultCore::backup_key(&key_path, &backup_dir).expect("backup should succeed");
+
+        assert!(backed_up_path.starts_with(&backup_dir));
+        assert!(backed_up_path.exists(), "backup key file should exist");
+        let meta_filename = format!(
+            "{}.meta.json",
+            backed_up_path
+                .file_name()
+                .expect("backup path should have a file name")
+                .to_string_lossy()
+        );
+        let meta_path = backed_up_path.with_file_name(meta_filename);
+        assert!(meta_path.exists(), "backup meta file should exist");
+
+        let original = std::fs::read_to_string(&key_path).expect("original key should be readable");
+        let copy = std::fs::read_to_string(&backed_up_path).expect("backup key should be readable");
+        assert_eq!(
+            original, copy,
+            "backup should be an exact copy of the key file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backed_up_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "backup key file should be readable only by owner"
+            );
+        }
+    }
+
+    async fn vault_storage_for_config(db_config: &DbConfig) -> VaultStorage {
+        use sea_orm::{ConnectOptions, Database};
+
+        let mut opt = ConnectOptions::new(db_config.db_url.clone());
+        opt.max_connections(2).min_connections(1);
+        let connection = Database::connect(opt)
+            .await
+            .expect("Failed to connect to test database");
+        let connection = Arc::new(connection);
+        apply_migrations(&connection, true).await.unwrap();
+        VaultStorage {
+            base: BaseStorage::new(connection),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_restore_key_verifies_and_replaces_key_file() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = vault_storage_for_config(&db_config).await;
+        let vault_core = VaultCore::config(vault_storage, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        let secret_data = serde_json::json!({"value": "test"})
+            .as_object()
+            .unwrap()
+            .clone();
+        vault_core
+            .write_secret("restore_test_key", Some(secret_data.clone()))
+            .await
+            .expect("secret write should succeed");
+
+        let backup_file = temp_dir.path().join("core_key.json.bak");
+        VaultCore::backup_key(&key_path, &backup_file).expect("backup should succeed");
+
+        // Simulate key file loss.
+        std::fs::remove_file(&key_path).expect("key file should be removable");
+
+        let restored_path = VaultCore::restore_key(&backup_file, &key_path, &db_config)
+            .await
+            .expect("restore should succeed");
+        assert_eq!(restored_path, key_path);
+        assert!(key_path.exists(), "restored key file should exist");
+
+        let reopened = VaultCore::from_database_config(&db_config, key_path.clone())
+            .await
+            .expect("restored key should unlock the vault");
+        let read_back = reopened
+            .read_secret("restore_test_key")
+            .await
+            .expect("secret read should succeed")
+            .expect("secret should still exist after restore");
+        assert_eq!(read_back, secret_data);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_restore_key_rejects_backup_that_does_not_unlock_vault() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let db_config = test_db_config(temp_dir.path()).await;
+        let key_path = temp_dir.path().join(CORE_KEY_FILE);
+        let vault_storage = vault_storage_for_config(&db_config).await;
+        VaultCore::config(vault_storage, key_path.clone())
+            .await
+            .expect("vault core should initialize");
+
+        // Create an unrelated vault whose key cannot unlock the first vault's storage.
+        let other_temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let other_key_path = other_temp_dir.path().join(CORE_KEY_FILE);
+        let other_vault_storage = test_vault_storage(other_temp_dir.path()).await;
+        VaultCore::config(other_vault_storage, other_key_path.clone())
+            .await
+            .expect("other vault core should initialize");
+
+        let err = VaultCore::restore_key(&other_key_path, &key_path, &db_config)
+            .await
+            .expect_err("restore with a mismatched key should fail");
+        assert!(
+            err.to_string().contains("unseal") || err.to_string().contains("core key"),
+            "error should relate to unseal/key verification: {err}"
+        );
+        // Original key file must remain untouched.
+        assert!(
+            key_path.exists(),
+            "original key file should not be removed on failed restore"
+        );
     }
 }

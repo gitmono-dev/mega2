@@ -27,6 +27,7 @@ use crate::{
 pub mod import_refs;
 pub mod repo;
 pub mod smart;
+pub mod v2;
 
 #[derive(Clone, Debug)]
 pub struct PushUserInfo {
@@ -98,6 +99,7 @@ pub enum Capability {
     OfsDelta,
     DeepenSince,
     DeepenNot,
+    Shallow,
 }
 
 impl FromStr for Capability {
@@ -115,6 +117,7 @@ impl FromStr for Capability {
             "no-done" => Ok(Capability::NoDone),
             "deepen-since" => Ok(Capability::DeepenSince),
             "deepen-not" => Ok(Capability::DeepenNot),
+            "shallow" => Ok(Capability::Shallow),
             _ => Err(()),
         }
     }
@@ -165,6 +168,11 @@ impl SmartSession {
         }
     }
 
+    pub fn set_authenticated_user(&mut self, username: String) {
+        self.auth.username = Some(username.clone());
+        self.auth.authenticated_user = Some(PushUserInfo { username });
+    }
+
     pub async fn repo_handler_with_commands(
         &self,
         state: &ProtocolApiState,
@@ -185,7 +193,7 @@ impl SmartSession {
                         return Err(ProtocolError::NotFound("Repository not found.".to_owned()));
                     }
                     ServiceType::ReceivePack => {
-                        let repo = Repo::new(self.repo_path.clone(), false);
+                        let repo = Repo::new(self.repo_path.clone(), false)?;
                         storage.save_git_repo(repo.clone().into()).await?;
                         repo
                     }

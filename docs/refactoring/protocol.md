@@ -6,7 +6,7 @@
 
 > **与其他模块的依赖**：Git Protocol 改进与 config/vault 的认证统一相关。当 config.md 阶段 2（CLI LoadMode）完成后，可统一 HTTP/SSH 的认证上下文设计。集成测试参见 **`integration.md`**。
 
-## 事实校准（2026-06-14）
+## 事实校准（2026-06-14，更新 2026-07-01）
 
 > 本文档中的代码引用已对照当前 `src/` 重新核对。当前 Git protocol 实现处于基础阶段，具有完整的功能框架但多处缺乏错误处理和兼容性完善：
 >
@@ -23,40 +23,72 @@
 > **2026-06-23 更新 3**：已完成 receive-pack `PACK` magic 分界止血：
 > - HTTP / SSH receive-pack 不再搜索 `PACK` 字节序列，而是复用 `SmartSession::split_receive_pack_request` 按 pkt-line command list 的 flush-pkt 分割 commands 与 pack bytes。
 > - 新增单元测试覆盖 capability 中出现 `PACK` 不误切分，以及缺少 flush-pkt 返回 `ProtocolError::InvalidInput`。
-> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader、delete-only push 语义与 SSH per-channel state 仍为后续。
-> - 仍未完成：SSH 多 channel state 仍未改为 per-channel；capability advertise 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
+> - 当前实现仍是完整 body / channel 数据缓冲后再 split；更完整的 streaming pkt-line reader 仍为后续，delete-only push 语义与空命令列表校验已加固。
+> - **2026-06-28 更新**：SSH per-channel state 已实现。`SshServer` 不再维护连接级 `smart_protocol` / `data_combined`，而是按 `ChannelId` 维护独立的 `GitSshChannelState`，每个 channel 拥有独立的 `SmartSession` 与 receive-pack 缓冲区。`capability advertise` 已完成首批保守收敛，后续仍需完整 truth table 覆盖。
 >
 > **2026-06-23 更新 4**：SSH upload-pack 初始响应已删除 `String::from_utf8(...).unwrap()`，改为直接按 bytes 写回 channel；Git 协议 payload 不再在该路径上被 UTF-8 假设约束。
 >
 > **2026-06-23 更新 5**：HTTP upload-pack request body 聚合不再对 body stream 错误 `unwrap()`，已与 receive-pack 统一经 `ProtocolError::InvalidInput` 返回。
 >
 > **2026-06-23 更新 6**：HTTP `info/refs` query 已按 smart HTTP 规范收紧为 exactly one `service=...` 参数，额外参数和重复 `service` 均返回 `ProtocolError::InvalidInput`。
+>
+> **2026-06-24 更新**：SSH `git-lfs-transfer` pure SSH 路径已从普通占位文本 `not implemented yet` 改为通过 SSH stderr extended-data 返回明确 unsupported 错误，并继续返回 channel failure，明确声明不支持 pure SSH LFS transfer、引导客户端使用 `git-lfs-authenticate` 的 HTTP fallback。
+>
+> **2026-06-24 更新 2**：SSH LFS exec parser 已收紧 `git-lfs-authenticate` / `git-lfs-transfer` 参数语义，operation 从 optional 改为必填且仅允许 `upload` / `download`；缺失或未知 operation 返回 channel failure，不再接受模糊请求。
+>
+> **2026-06-24 更新 3**：SSH `git-lfs-authenticate` 响应序列化已移除 `serde_json::to_vec(...).unwrap()`，改为错误传播；成功写回 hybrid LFS JSON response 后显式发送 channel success。
+>
+> **2026-06-24 更新 4**：capability truth table 阶段 3 收尾——为 `side-band-64k` 补充 `build_side_band_format` 专用单测（含启用/未启用两条路径）；为 `ofs-delta` 补充 advertise/parse 单测并明确其 OFS_DELTA pack 编解码由 `git-internal` crate 实现（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧仅覆盖 advertise/parse；对 SHA-1 object format 落地显式策略——协议允许 SHA-1 默认时省略 `object-format`，monoengine 策略是对 SHA-1-only repo 不 advertise `object-format`，由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
+>
+> **2026-06-24 更新 5**：阶段 4 认证上下文统一收口（工作项 1/2/3/6）。新增 `SmartSession::set_authenticated_user`；SSH `auth_publickey` 成功后将 key owner username 存入 `SshServer.authenticated_user`，exec 阶段注入 `SmartSession.auth`；HTTP receive-pack 改用同一 helper。SSH push 的 commit binding 不再匿名。残余：upload-pack 匿名策略、receive-pack repo/path 级 push 权限（工作项 4/5）。
+>
+> **2026-06-24 更新 6**：阶段 2 delete-only push 落地（工作项 4）。新增 `SmartSession::is_delete_only_push`；`git_receive_pack_stream` 检测到全 delete command list 时跳过 `unpack_stream`/`receiver_handler`，`unpack_result` 视为 Ok，直接处理 ref 删除并返回 report-status。由 `is_delete_only_push_detects_pure_delete_vs_mixed` 锁定。
+>
+> **2026-06-30 更新**：LFS lock / metadata storage 路径完成 panic 止血。`LfsDbStorage` 的 object/lock CRUD 不再 unwrap SeaORM 结果，而是返回 `MegaError`；`ceres::lfs::handler` 的 lock list/create/delete 路径不再 unwrap lock JSON、limit parse 或 DB 结果，统一映射为 `GitLFSError`。`Link::new` 的 86400 秒过期时间也改为 infallible chrono 构造。
+>
+> **2026-06-30 更新 2**：LFS router response/body 路径完成 panic 止血。`api::router::lfs_router` 不再通过 `Response::builder().body(...).unwrap()` 构造静态 LFS JSON/stream responses，改为 `Response::new` + 静态 header；upload object request body 聚合错误也从 `unwrap()` 改为 400 错误返回。
+>
+> **2026-06-30 更新 3**：pack traversal count helper 完成首批 panic 止血。`RepoHandler::traverse_for_count` 与 `traverse_trees_only_for_count` 不再 unwrap tree lookup 结果，改为返回 `Result<(), MegaError>` 并由 monorepo/import pack 生成路径向上传播错误。
+>
+> **2026-06-30 更新 4**：pack traversal entry send 完成首批 panic 止血。`RepoHandler::traverse` 与 `traverse_trees_only` 不再 unwrap pack encoder channel send 结果，blob/tree entry send failure 会作为 storage/protocol error 向上传播。
+>
+> **2026-06-30 更新 5**：monorepo pack generation 的 encoder startup 与 commit entry send 完成 panic 止血。`MonoRepo::{shallow_pack, filtered_pack, incremental_pack}` 不再 unwrap `PackEncoder::encode_async` 或 commit entry channel send failure，统一映射为 `MegaError` / `GitError` 向上传播。
+>
+> **2026-07-01 更新 2**：`try_read_pkt_line` 的 pkt-line parser 错误模型继续收敛。新增回归测试覆盖 reserved length `0003`、length 小于 header（如 `0002want`）的精确错误诊断与不消费输入行为，以及非十六进制 header、短 header、payload 不完整的既有测试；由 `try_read_pkt_line_rejects_reserved_length_3`、`try_read_pkt_line_rejects_length_smaller_than_header`、`try_read_pkt_line_rejects_non_hex_header`、`try_read_pkt_line_rejects_incomplete_header_without_consuming`、`try_read_pkt_line_rejects_incomplete_payload` 共同锁定。
+>
+> **2026-07-01 更新 3**：真实 Git CLI CI 矩阵确认覆盖 HTTP 只读路径（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone、blob:none partial clone）。**2026-07-01 更新 4**：HTTP branch/tag push+delete 已重新进入 CI 必跑 gate；workflow 在 smoke DB 中生成并 mask 一次性 `access_token`，通过 Basic Auth URL 运行 `scripts/git_protocol_smoke.sh` 的 `MONOENGINE_GIT_SMOKE_PUSH=1` 分支。为支持真实新分支 push，monorepo receive-pack 会在 old-id 为零但新提交带 parent 时以首个 parent 作为 CL base；孤儿提交初始化仍拒绝。
 
-1. **HTTP 和 SSH 双协议支持已就位**。`git_protocol/http.rs` 和 `git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
+> **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MONOENGINE_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
+>
+> **2026-07-01 更新 7**：首轮 LFS CI gate 暴露 Git LFS 对 monorepo 根路径 remote `http://host/` 的默认 discovery 派生问题：客户端会拼出 `http://host.git/info/lfs` 并导致端口解析失败。`lfs_smoke_http` 现在对源仓库和验证 clone 显式配置 `lfs.url=<remote>/info/lfs`，并关闭 locks verify 探测，避免根路径 URL 被 Git LFS 自动追加 `.git`。
+>
+> **2026-07-01 更新 8**：第二轮 LFS CI gate 暴露普通 `git clone` 在临时 LFS push 后会先拉取 remote 全量 refs，并可在 upload-pack 阶段因临时 CL ref 状态返回 HTTP 400。`lfs_smoke_http` 的验证端现在改为空仓库 `git init`，只 fetch 本次创建的 `refs/cl/*` 到本地 `lfs-smoke` 分支，再执行 checkout、`git lfs pull` 和 locks-list；CI 验证聚焦在目标 CL ref 的 LFS round-trip，不再依赖全量 clone。
+
+1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
 2. **基础 fetch/push/clone 可工作**。当前能支持标准 Git 客户端的基本 clone、fetch、push 操作，但多处使用 `unwrap()` 和缺乏边界检查。
 
-3. **pkt-line 解析与 receive-pack 分流已完成首批止血。** `read_pkt_line` 的可失败版本已落地，HTTP/SSH receive-pack 已按 flush-pkt 分割 commands 与 pack bytes，不再搜索 `PACK` magic；残余风险是当前实现仍缓冲完整 body / channel 数据，尚未实现真正 streaming pkt-line reader 和 delete-only push 语义验证。
+3. **pkt-line 解析与 receive-pack 分流已完成首批止血。** `read_pkt_line` 的可失败版本已落地，HTTP/SSH receive-pack 已按 flush-pkt 分割 commands 与 pack bytes，不再搜索 `PACK` magic；delete-only push（全 delete）已支持（跳过 unpack）；残余风险是当前实现仍缓冲完整 body / channel 数据，尚未实现真正 streaming pkt-line reader。
 
-4. **认证策略不一致**。HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH 通过 public key，但未统一 auth context。
+4. **认证上下文已统一（HTTP/SSH）。** HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，commit binding 绑定到 authenticated actor。receive-pack 尚未做 repo/path 级 push 权限校验。
 
-5. **Capability advertise 已完成首批保守收敛**。receive-pack 不再 advertise 未验证的 atomic、report-status-v2、delete-refs、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag。后续仍需为剩余 side-band/ofs-delta 等能力补完整 truth table 和真实 Git CLI 矩阵。
+5. **Capability advertise 已完成保守收敛与 truth table 覆盖**。receive-pack 重新 advertise 已由 HTTP branch/tag delete smoke 覆盖的 `delete-refs`，但不再 advertise 未验证的 atomic、report-status-v2、quiet、no-thin；upload-pack 不再 advertise 未实现的 include-tag；v2 不再 advertise 未 act-on 的 `server-option`。`side-band-64k`/`ofs-delta` 已补 advertise/parse 单测（ofs-delta pack decode 委托 `git-internal`），`object-format` 落地 SHA-1 默认策略；**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 `.github/workflows/git-protocol-smoke.yml` 在 CI 中自动化执行**。
 
-6. **SSH 多 channel 状态管理不够细致**。per-connection 状态共享，不是 per-channel，可能在多 channel 场景下产生串联。
+6. **SSH 多 channel 状态已隔离，并已支持 protocol v2。** `SshServer` 按 `ChannelId` 保存独立 `GitSshChannelState`；SSH client 通过 `GIT_PROTOCOL=version=2` 请求 v2 时，server 返回 v2 capability advertisement，并在 upload-pack data 阶段分发 `ls-refs` / `fetch` command。
 
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
 |-----------|--------|-------------|
-| HTTP GET /info/refs | 已实现（首批止血） | query 已要求 exactly one `service=...`，缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；仍需补真实 Git CLI 兼容性矩阵。 |
-| HTTP POST upload-pack | 已实现（首批止血） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；仍不支持 streaming。 |
-| HTTP POST receive-pack | 已实现（首批止血） | command pkt-line malformed input 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；仍需 streaming parser、delete-only push 和更完整真实 Git CLI 矩阵。 |
-| SSH git-upload-pack | 已实现（首批止血） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送，不再 UTF-8 unwrap；后续仍需 per-channel state。 |
-| SSH git-receive-pack | 已实现（首批止血） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；session 状态仍为 connection-level，尚未 per-channel 化。 |
-| SSH git-lfs-authenticate | 已实现（基础） | 支持 hybrid 模式，返回 HTTP LFS URL；不支持纯 SSH LFS transfer。 |
-| 权限与认证 | 部分实现 | HTTP receive-pack 有认证，HTTP upload-pack 无；SSH 用 public key 但未注入 auth context。 |
-| Capability advertise | 首批保守收敛 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`。仍需完整 truth table 和真实 Git CLI 矩阵。 |
-| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23）；response builder / in-memory reader、`repo.rs` path 转换等剩余路径仍有 `unwrap()`/panic 待收敛。 |
+| HTTP GET /info/refs | 已实现（含 protocol v2 advertisement） | query 已要求 exactly one `service=...`；缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；`Git-Protocol: version=2` 会返回 v2 capabilities；**真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖（2026-06-30）**。 |
+| HTTP POST upload-pack | 已实现（含 shallow / v2 fetch / blob:none） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；protocol v1 支持 `deepen`/`deepen-relative`，v2 支持 `ls-refs`、`fetch`、`deepen`、`filter blob:none`；仍不支持 streaming request parser。 |
+| HTTP POST receive-pack | 已实现（delete-only 与 HTTP push smoke 已纳入 CI） | command pkt-line malformed input、非 delete 缺失 pack payload、空命令列表与无效 `PACK` magic 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；delete-only push 已支持（跳过 unpack）；HTTP branch/tag push+delete 已进入 Git CLI smoke CI gate；仍需 streaming parser。 |
+| SSH git-upload-pack | 已实现（per-channel state + protocol v2） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区；`GIT_PROTOCOL=version=2` 可启用 v2 `ls-refs` / `fetch`。 |
+| SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
+| SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |
+| 权限与认证 | 已统一（读写策略化） | HTTP receive-pack 有 Bearer/Basic token 认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，HTTP/SSH commit binding 均绑定到 authenticated actor（`set_authenticated_user`）。upload-pack 匿名访问已策略化：`check_upload_pack_access` 按 `git.anonymous_access`（默认 `true`）放行匿名 clone/fetch，关闭时无 token 返回 `Forbidden`（3 个单测覆盖），HTTP（`http.rs:53/217`）与 SSH（`ssh.rs:149`）共用。receive-pack 通过 `check_push_permission` 走 Cedar `pushRepo` 授权：未认证 push 直接 `Forbidden`（不进入 unpack），已认证时按 `state.entity_store` 策略裁决（策略库为空则放行），HTTP（`http.rs:64/355`）与 SSH（`ssh.rs:140`）共用。更细粒度 repo/path ACL 与基于策略的 push-deny 协议层单测待后续。 |
+| Capability advertise | 保守收敛 + truth table 已建立 | receive-pack 仅 advertise `report-status` + common 能力；upload-pack 移除 `include-tag`；v2 移除 `server-option`。`side-band-64k`/`ofs-delta` 已覆盖 advertise/parse（ofs-delta pack decode 委托 `git-internal`）；`object-format` 落地 SHA-1 默认策略；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控非 MonoRepo handler。**（2026-06-30）真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖**。 |
+| 错误处理 | 首批止血 | `info/refs` service 参数、smart pkt-line malformed input、HTTP upload/receive request body stream 错误、malformed SSH exec 与 import repo handler 的 repo path/DB lookup 已改为协议错误/channel failure；SSH `data`/`handle_upload_pack`/`handle_receive_pack` 中的 `smart_protocol.unwrap()`、protocol error `.unwrap()`、`session.data().unwrap()`、`git-lfs-authenticate` response serialization `.unwrap()` 和 `auth_publickey` DB 查询 `.unwrap()` 已改为可诊断错误/best-effort 发送（2026-06-23/24）；**2026-06-28 更新**：`Repo::new` 的非 UTF-8 path/file_name `unwrap()` 已改为 `ProtocolError::InvalidInput`，`SmartSession::git_upload_pack` 中 `full_pack`/`incremental_pack` 的 `unwrap()` 已映射为协议错误；**2026-06-28 更新 2**：HTTP Git 路由已抽出 `GitProtocolPath` parser，移除内联 `.git` 替换与 404 `unwrap()`；**2026-06-28 更新 3**：`contract/git_protocol/http.rs` 中 response builder、`HeaderValue::from_str`、upload-pack sideband `read_buf` 的 `unwrap()` 已收敛；**2026-06-28 更新 4**：`contract/git_protocol/ssh.rs` 中 LFS `Duration::try_seconds(...).unwrap()` 与 `channel_eof` 的 `expect("state just found")` 已移除。Protocol 当前范围内剩余 `unwrap()` 已基本收敛；vault/legacy 路径与数据迁移工具不在本次范围。 |
 
 ## 硬约束与不可违反的原则
 
@@ -70,7 +102,7 @@
 
 5. **pkt-line 协议边界**：receive-pack 的 command 和 pack 分界必须由 flush-pkt 决定，不能依赖 magic bytes 搜索。
 
-6. **兼容性声明**：不支持的功能（protocol v2、partial clone、shallow clone、pure SSH LFS）必须明确文档化，而不是静默失败。
+6. **兼容性声明**：已实现的现代能力（protocol v2、shallow clone、`filter blob:none`）必须明确范围；未实现的功能（tree filters、完整 promisor remote、pure SSH LFS）必须明确文档化，而不是静默失败。
 
 ## 现状 vs 目标对比
 
@@ -80,8 +112,8 @@
 | pkt-line 实现 | `unwrap()` panic 散落 | 定义 `PktLine` enum 和 streaming parser | 需重构 parser 返回 Result |
 | receive-pack 分流 | 已按 flush-pkt 分割，仍缓冲完整 body/channel | streaming pkt-line reader + delete-only push 验证 | 中等 |
 | SSH exec 解析 | 脆弱（空格、拼接错） | 严格 parser，支持引号和转义 | 需独立 parser 函数和单测 |
-| SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 需引入 `GitSshChannelState` |
-| 认证统一 | HTTP/SSH 分离 | 统一 `ProtocolAuthContext` | 需与 config/vault auth 协同 |
+| SSH 多 channel | 全局 session 状态 | per-channel state dictionary | 已引入 `GitSshChannelState`（2026-06-28） |
+| 认证统一 | ✅ HTTP/SSH 共用 `check_upload_pack_access` / `check_push_permission` | 统一入口鉴权 + 匿名策略 + push 授权 | upload-pack 匿名可配置、receive-pack Cedar `pushRepo` 授权已落地；更细 repo/path ACL 与 push-deny 协议层单测待后续 |
 | Capability 诚实 | advertise 多于实现 | 仅 advertise 已实现能力 | 需 capability truth table |
 | 测试矩阵 | 无 | 真实 Git CLI smoke test | 需建立兼容性测试脚本 |
 
@@ -117,9 +149,9 @@
 |-----|--------|
 | **合理性** | **高（8.5/10）**。当前代码框架完整，兼容性问题识别准确。阶段划分合理，从基础止血到兼容性扩展的路线清晰。 |
 | **可行性** | **中高（7.5/10）**。基础 panic 止血相对容易（Result 化输入解析）；pkt-line 和 receive-pack 分流需要较深的协议理解；SSH auth 统一需与 config 协同。 |
-| **完整性** | **中（7/10）**。6 个阶段覆盖主要问题，但 partial clone、protocol v2、shallow clone 等现代 Git 特性未涵盖。当前声称"仅 v0/v1"是合理的范围限制。 |
+| **完整性** | **中高（7.5/10）**。6 个阶段覆盖主要问题，且已补齐 shallow clone、protocol v2 `ls-refs` / `fetch`、`filter blob:none` 等现代 Git 基础能力。仍缺真实 Git CLI 矩阵、streaming pkt-line reader、tree filters 和完整 promisor remote 语义。 |
 | **安全性** | **中（7/10）**。panic 止血直接提升安全性；auth 统一防止权限泄露。但 per-channel state 和事务边界的改进是长期工作。 |
-| **可维护性** | **中（7/10）**。首批已移除 magic bytes 搜索和部分 scattered panic，但全局 SSH channel state、剩余 `unwrap()` 和 streaming parser 缺口仍是维护陷阱。改进后代码应更易维护，但短期工作量较大。 |
+| **可维护性** | **中（7/10）**。首批已移除 magic bytes 搜索和部分 scattered panic；SSH channel state 已改为 per-channel 字典。剩余 `unwrap()` 和 streaming parser 缺口仍是维护陷阱。改进后代码应更易维护，但短期工作量较大。 |
 
 ## 小结
 
@@ -131,7 +163,7 @@ Git Protocol 是 monoengine 的核心功能，但当前实现在错误处理、�
 - **兼容性提升**：标准 Git 客户端在各场景下（clone、fetch、push、tags、delete）更稳定可靠
 - **可观测性改进**：清晰的错误模型和兼容性测试矩阵便于快速诊断和防止回归
 - **维护成本降低**：代码结构改进（streaming parser、per-channel state）降低后续改造成本
-- **扩展性增强**：为 partial clone、protocol v2 等未来功能预留设计空间
+- **扩展性增强**：shallow clone、protocol v2 和 `filter blob:none` 已落地，为后续 tree filters、promisor remote 和 streaming parser 继续预留设计空间
 
 ## 范围
 
@@ -190,7 +222,7 @@ SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/contract/git_protocol
 - 处理 `exec_request`。
 - 支持 `git-upload-pack` 和 `git-receive-pack`。
 - 支持 `git-lfs-authenticate` hybrid LFS discovery。
-- 对 `git-lfs-transfer` 返回未实现。
+- 对 `git-lfs-transfer` 返回明确 unsupported failure。
 - 使用用户上传的 SSH public key fingerprint 进行认证。
 
 SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中的 smart protocol 实现。
@@ -227,10 +259,13 @@ SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中�
 
 ```text
 upload-pack:
-  multi_ack_detailed no-done include-tag side-band-64k ofs-delta agent=mega/0.1.0
+  multi_ack_detailed no-done side-band-64k ofs-delta shallow agent=mega/0.1.0
 
 receive-pack:
-  report-status report-status-v2 delete-refs quiet atomic no-thin side-band-64k ofs-delta agent=mega/0.1.0
+  report-status side-band-64k ofs-delta agent=mega/0.1.0
+
+protocol v2 upload-pack:
+  agent=mega/0.1.0 ls-refs fetch=shallow filter object-format=sha1
 ```
 
 `Capability` enum 当前只解析部分 capability：
@@ -244,6 +279,9 @@ side-band-64k
 report-status
 report-status-v2
 ofs-delta
+deepen-since
+deepen-not
+shallow
 ```
 
 ## 当前兼容能力
@@ -284,6 +322,9 @@ fetch 侧：
 - 支持有 `have` 时 incremental pack。
 - 支持 `multi_ack_detailed` 下的 `ACK ... common` 和 `ACK ... ready`。
 - 支持 side-band-64k 包装 pack data。
+- 支持 `deepen` / `deepen-relative` shallow fetch，并 advertise `shallow` capability。
+- 支持 protocol v2 `ls-refs` / `fetch`（HTTP 通过 `Git-Protocol: version=2`，SSH 通过 `GIT_PROTOCOL=version=2`）。
+- 支持 protocol v2 partial clone `filter blob:none`；tree filter 仍未承诺完整语义。
 
 push 侧：
 
@@ -340,7 +381,7 @@ let params: InfoRefsParams = serde_urlencoded::from_str(query_str).unwrap();
 
 建议：
 
-- 短期增加 body size 上限，避免异常客户端导致内存放大。
+- ✅ 已增加 body size 上限（`GIT_HTTP_MAX_BODY_BYTES = 512 MiB`，`collect_body_data` 拒绝超限 body，2026-06-28）。
 - 中期将 upload-pack negotiation 改为 streaming pkt-line reader，而不是一次性聚合 body。
 - 为 `read_pkt_line` 增加可诊断错误，避免 malformed pkt-line panic。
 
@@ -363,12 +404,19 @@ if let Some(pos) = search_subsequence(&chunk, b"PACK") {
 - SSH receive-pack 对已缓冲的 channel 数据使用同一 splitter。
 - capability 或 command payload 中出现 `PACK` 不再影响分割。
 - 缺失 flush-pkt 会返回 `ProtocolError::InvalidInput`。
+- 纯 delete refs 的无 pack receive-pack 请求已支持，splitter 会在 flush-pkt
+  后返回空 pack payload，并由 `is_delete_only_push` 跳过 unpack。
+- 非 delete receive-pack 请求在 flush-pkt 后缺失 pack payload 会返回
+  `ProtocolError::InvalidInput`。
+- 非 delete receive-pack 请求的 pack payload 不以 `PACK` magic 开头时会返回
+  `ProtocolError::InvalidInput`。
+- flush-pkt 前没有任何 command pkt-line（空命令列表）的 receive-pack 请求会返回
+  `ProtocolError::InvalidInput`，避免无命令请求进入 ref 处理。
 
 仍待后续处理：
 
 - 将当前完整 body / channel 数据缓冲改为 streaming pkt-line reader。
-- 支持纯 delete refs 的无 pack receive-pack 请求。
-- 增加缺 packfile、pack magic 不合法和真实 Git CLI push/delete 矩阵。
+- HTTP branch/tag push+delete 与 LFS round-trip 已纳入真实 Git CLI CI 矩阵；SSH push/delete 仍为手动 opt-in。
 
 ### SSH exec command 解析过于脆弱
 
@@ -392,22 +440,16 @@ let service_type = ServiceType::from_str(command[0]).unwrap_or(ServiceType::Uplo
 仍待后续处理：
 
 - 更完整的 shell 兼容性（如 `--`、复杂转义规则）如果标准客户端需要，再按兼容性测试补充。
-- 将已解析的 exec state 与 SSH channel 绑定，避免一个 connection 内多个 channel 共享 `smart_protocol` / `data_combined`。
+- ✅ 将已解析的 exec state 与 SSH channel 绑定，避免一个 connection 内多个 channel 共享 `smart_protocol` / `data_combined`（2026-06-28 已实现）。
 
-### SSH session 状态与 channel 绑定不够明确
+### SSH session 状态与 channel 绑定
 
-`SshServer` 在 handler 上保存：
+`SshServer` 原在 handler 上保存连接级 `smart_protocol: Option<SmartSession>` 与 `data_combined: BytesMut`，一个 SSH connection 内多个 channel 会共享这些状态。2026-06-28 已改为：
 
-- `smart_protocol: Option<SmartSession>`
-- `data_combined: BytesMut`
-
-这些状态不是按 channel 明确绑定。虽然 `russh::server::Server::new_client` 会 clone handler，降低多连接共享风险，但一个 SSH connection 内多个 channel 或异常顺序仍可能互相影响。
-
-建议：
-
-- 将 per-channel state 放入 `HashMap<ChannelId, GitSshChannelState>`。
-- 每个 channel 单独保存 `SmartSession`、receive-pack buffer、service type。
-- `channel_eof` 只处理对应 channel 的状态。
+- `SshServer` 维护 `channels: HashMap<ChannelId, GitSshChannelState>`。
+- `GitSshChannelState` 每个 channel 单独保存 `SmartSession`、receive-pack buffer、service type。
+- `data` 只读写当前 `ChannelId` 的状态。
+- `channel_eof` 只处理对应 channel 的状态，处理完后从 map 移除。
 - 关闭 channel 时清理状态。
 
 ### SSH upload-pack 可能把二进制 ACK/pack 数据当 UTF-8 发送
@@ -426,76 +468,67 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 - 删除协议二进制路径上的 UTF-8 假设。
 - `session.data` 调用只传 `Vec<u8>` 或 bytes，不做 String 转换。
 
-### capability advertisement 与实际实现不完全一致
+### capability advertisement 与实际实现已对齐
 
-当前 advertise 包含一些未完整实现或解析不足的能力：
+历史风险：曾 advertise 一些未完整实现或解析不足的能力。当前状态（均已解决）：
 
-- `include-tag` 被 advertise，但 `Capability` enum 不解析它，pack 生成是否按 include-tag 语义包含 tag target 需要进一步验证。
-- `delete-refs` 被 advertise，但 receive-pack 的纯删除无 pack 场景不稳健。
-- `atomic` 被 advertise，但 receive-pack ref 更新和 side effects 是否真正原子需要验证。
-- `quiet` 被 advertise，但当前没有显式处理 quiet 的 progress 抑制语义。
-- `no-thin` 被 advertise，但 pack 解码和 thin-pack 行为需要明确测试。
-- `report-status-v2` 被 advertise，但返回内容更接近 v1 `unpack ok` + per-ref status，未体现 v2 的完整语义。
-- `ofs-delta` 被 advertise，pack decode/encode 是否完整支持 OFS_DELTA 需要测试矩阵验证。
+- `include-tag`：已从 upload-pack advertise 移除（pack 生成未按 include-tag 语义验证）。
+- `delete-refs`：已重新 advertise（HTTP smoke 覆盖 branch/tag delete；SSH delete 矩阵仍待补齐）。
+- `atomic`：已从 advertise 移除（未实现原子 ref 更新）。
+- `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
+- `no-thin`：已从 advertise 移除（thin-pack 行为未明确测试）。
+- `report-status-v2`：已从 advertise 移除（未实现 v2 完整语义）。
+- `ofs-delta`：仍 advertise；OFS_DELTA pack 编解码由 `git-internal` crate 实现并自测（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧覆盖 advertise/parse（`parse_capabilities_recognizes_ofs_delta`）。
 
 建议：
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
-- 已完成首批：`atomic`、`report-status-v2`、`delete-refs`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；后续若补齐行为和测试再重新声明。
-- 对 `object-format=sha1` 明确 advertise 或确认默认 SHA-1 兼容性。
+- 已完成首批：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP branch/tag delete smoke 覆盖后重新声明。
+- ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
-### pkt-line parser 缺少错误模型
+### pkt-line parser 错误模型已收敛，streaming reader 仍待后续
 
-`read_pkt_line` 当前对 malformed input 使用 `unwrap` / panic：
+`src/ceres/protocol/smart.rs::try_read_pkt_line` 已定义 `PktLine` enum：
+`Data(Bytes)`、`Flush`、`Delim`、`ResponseEnd`，并返回
+`Result<PktLine, ProtocolError>`。Malformed input 不再通过 `unwrap` / panic
+处理，而是显式返回 `ProtocolError::InvalidInput`，且失败时不消费输入
+buffer。
 
-```rust
-let pkt_length = usize::from_str_radix(core::str::from_utf8(&pkt_length).unwrap(), 16)
-    .unwrap_or_else(|_| panic!(...));
-let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
-```
+已覆盖的边界：
 
-风险：
+- 空输入或不足 4 字节的 length header。
+- 非 hex length header。
+- reserved length `0003` 与 length 小于 header 的场景。
+- length 大于剩余 buffer。
+- `0000` flush-pkt、`0001` delim-pkt、`0002` response-end-pkt。
 
-- 不足 4 字节会 panic。
-- 非 hex 长度会 panic。
-- length 小于 4 会 underflow。
-- length 大于剩余 buffer 会 panic。
-- 无法区分 flush-pkt、delim-pkt、response-end-pkt 等 pkt-line 形态。
+仍待后续：
 
-建议：
+- HTTP 和 SSH 当前仍先完整缓冲 request/channel 数据，再复用该 parser 解析。
+  后续需要抽出真正的 streaming pkt-line reader，避免大请求完整驻留内存。
 
-- 定义 `PktLine` enum：`Data(Bytes)`、`Flush`、`Delim`、`ResponseEnd`。
-- parser 返回 `Result<PktLine, ProtocolError>`。
-- 对 length 边界和剩余 bytes 做显式校验。
-- HTTP 和 SSH 共用同一 streaming parser。
+### upload-pack negotiation 已支持 shallow / protocol v2 / blob:none
 
-### upload-pack negotiation 支持范围较窄
+早期实现只处理 `want`、`have`、`done`。当前已补齐现代客户端常用的部分扩展：
 
-当前只处理 `want`、`have`、`done`。标准 Git 客户端还可能发送或依赖：
+- protocol v1 upload-pack 解析 `deepen` / `deepen-relative`，并返回 `shallow` response。
+- `deepen-since` / `deepen-not` 会明确返回 `ProtocolError::InvalidInput`，不 silent misbehave。
+- HTTP 和 SSH 均支持 protocol v2 capability advertisement、`ls-refs` 和 `fetch`。
+- protocol v2 `fetch` 支持 `filter blob:none`，pack 只发送 commits + trees，不发送 blob objects。
 
-- `deepen`
-- `deepen-since`
-- `deepen-not`
-- `deepen-relative`
-- `filter`
-- `shallow`
-- `want-ref`
-- protocol v2 的 command/request 结构
+仍需后续确认或扩展：
 
-代码注释中提到 monorepo full pack 应配合 shallow clone，但当前 `git_upload_pack` 没有实际处理 `deepen`。这可能影响：
-
-- `git clone --depth=1`
-- partial clone
-- blobless clone
 - promisor remote
+- tree filters（如 `tree:<depth>`）
+- `want-ref`
 - 大仓库 fetch 性能
 
 建议：
 
-- 短期明确只支持 smart protocol v0/v1 的基础 clone/fetch/push，并在文档和错误里说明不支持 protocol v2 / partial clone。
-- 中期实现 `deepen` 和 shallow response，至少让 `git clone --depth=1` 语义正确。
-- 长期评估 Git protocol v2，特别是 `ls-refs`、`fetch`、`server-option`、`filter`。
+- 用真实 Git CLI 矩阵验证 `git clone --depth=1`、HTTP/SSH v2 fetch、`git clone --filter=blob:none` 的端到端行为。
+- 对未实现 filter spec（例如 tree filters）继续返回明确协议错误或 fallback，不 advertise 超出实现范围的语义。
+- 中期将 upload-pack negotiation 改为 streaming pkt-line reader，减少大仓库 fetch 的 request body 聚合风险。
 
 ### receive-pack 原子性与并发语义需要收敛
 
@@ -535,7 +568,7 @@ let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
 
 ### Git LFS SSH 仅支持 hybrid 模式
 
-SSH 中 `git-lfs-transfer` 返回 `not implemented yet`，`git-lfs-authenticate` 返回 HTTP LFS URL。这符合 Git LFS 可 fallback 的 hybrid 模式，但不是纯 SSH LFS transfer。
+SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authenticate` 返回 HTTP LFS URL。这符合 Git LFS 可 fallback 的 hybrid 模式，但不是纯 SSH LFS transfer。
 
 建议：
 
@@ -546,14 +579,9 @@ SSH 中 `git-lfs-transfer` 返回 `not implemented yet`，`git-lfs-authenticate`
 
 ### 路由匹配过宽，容易吞掉非 Git 路径
 
-HTTP router 使用 `/{*path}` 捕获所有未匹配路径，然后按后缀判断 Git protocol。虽然目前放在 API/LFS router merge 后，但仍需要关注：
+**2026-06-28 更新**：已抽出 `GitProtocolPath` parser（`src/contract/git_protocol/path.rs`），统一处理 repo path、仅去除末尾 `.git` suffix、service endpoint 与 HTTP 方法校验，并保留 `third-party.git` root repo 禁用规则。`src/server/http_server.rs::handle_smart_protocol` 不再内联后缀判断和 404 `unwrap()`，而是直接调用 parser。剩余工作：404/400/403/405 返回策略可随认证统一进一步标准化。
 
-- Git protocol 路径和 API 路径的优先级。
-- `/info/lfs` 路径与 `*/info/refs` 的冲突。
-- 404 response 是否符合普通 HTTP 与 Git 客户端预期。
-- root repo path 特例 `third-party.git` 的规则是否应放入更通用的 repo path validator。
-
-建议：
+历史建议（已落地）：
 
 - 抽出 `GitProtocolPath` parser，统一处理 repo path、`.git` suffix、service endpoint。
 - 路由层只做粗分发，路径语义在 parser 中测试。
@@ -565,32 +593,43 @@ HTTP router 使用 `/{*path}` 捕获所有未匹配路径，然后按后缀判�
 
 目标：在修改实现前建立可重复的真实 Git 客户端测试矩阵。
 
-建议新增测试脚本或集成测试覆盖：
+已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 monoengine HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MONOENGINE_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH branch/tag push/delete 通过 `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交、显式配置 `<remote>/info/lfs` endpoint，并对实际生成的 `refs/cl/*` 做定向 fetch、checkout、LFS pull 与清理，避免默认修改远端 refs、不依赖孤儿初始化、全量 clone 或 Git LFS 对根路径 remote 的默认 URL discovery。CI 当前自动启用 HTTP read-only 矩阵、HTTP branch/tag push+delete 和 HTTP LFS round-trip；SSH push/delete 仍保留为手动 opt-in。
+
+**（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 push/delete 与 LFS round-trip）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、branch push/delete、tag push/delete、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MONOENGINE_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
+
+建议脚本或后续集成测试覆盖：
 
 ```text
 HTTP:
   git ls-remote http://host/repo.git
   git clone http://host/repo.git
   git fetch
-  git push
-  git push --delete origin branch
-  git push --tags
+  git -c protocol.version=2 fetch
+  git push（`MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
+  git push --delete origin branch（`MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
+  git push --tags（`MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
   git clone --depth=1
+  git -c protocol.version=2 ls-remote
+  git -c protocol.version=2 clone --filter=blob:none
 
 SSH:
   git ls-remote ssh://user@host:port/repo.git
   git clone ssh://user@host:port/repo.git
+  git clone --depth=1 ssh://user@host:port/repo.git
+  git -c protocol.version=2 ls-remote ssh://user@host:port/repo.git
+  git -c protocol.version=2 clone --filter=blob:none ssh://user@host:port/repo.git
   git fetch
-  git push
-  git push --delete origin branch
-  git push --tags
+  git -c protocol.version=2 fetch
+  git push（`MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
+  git push --delete origin branch（`MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
+  git push --tags（`MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
 
 LFS:
   git lfs install
   git lfs track
-  git push with LFS object
-  git clone with LFS object
-  git lfs locks
+  git push with LFS object（`MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
+  git clone with LFS object（`MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
+  git lfs locks（`MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 时启用，只读 list）
 ```
 
 每个用例记录：
@@ -636,14 +675,16 @@ LFS:
 1. 已完成首批：receive-pack 先读取 command list 到 flush-pkt。
 2. 已完成首批：flush-pkt 后剩余 bytes 作为 pack stream。
 3. 后续：实现 streaming pkt-line reader，避免完整 body / channel 数据缓冲。
-4. 支持无 pack 的 delete-only push。
-5. 已完成首批：HTTP 和 SSH receive-pack 共用同一 parser。
+4. ✅ 支持无 pack 的 delete-only push：`SmartSession::is_delete_only_push` 检测全部为 delete 的 command list，`git_receive_pack_stream` 跳过 `unpack_stream`/`receiver_handler`，`unpack_result` 视为 Ok，直接进入 ref 处理与 report-status。
+5. ✅ 空命令列表校验：splitter 在 flush-pkt 前无 command 时返回 `ProtocolError::InvalidInput`，避免无命令请求进入 ref 处理。
+6. 已完成首批：HTTP 和 SSH receive-pack 共用同一 parser。
 
 验收标准：
 
 - 已覆盖：command payload / capability 中出现 `PACK` 不误切分。
 - 待覆盖：`PACK` 跨 chunk 不影响 push（需要 streaming parser 或真实 Git CLI 矩阵）。
-- `git push --delete` 可正常返回 report-status。
+- ✅ `git push --delete` 可正常返回 report-status（delete-only 跳过 unpack，由 `is_delete_only_push_detects_pure_delete_vs_mixed` 锁定）。
+- ✅ 空命令列表返回协议错误（由 `split_receive_pack_request_rejects_empty_command_list` 锁定）。
 - malformed command list 返回协议错误。
 
 ### 阶段 3：capability truth table 与 advertise 收敛
@@ -655,7 +696,7 @@ LFS:
 1. 建立 capability truth table。
 2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`include-tag`、`delete-refs` 等能力。
 3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。
-4. 对 SHA-1 object format 做显式策略。
+4. ✅ 对 SHA-1 object format 做显式策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 验收标准：
 
@@ -667,19 +708,24 @@ LFS:
 | Capability | Advertised? | Parsed? | Acted On? | Tested? | 说明 |
 |---|---|---|---|---|---|
 | `report-status` | ✅ receive-pack | ✅ | ✅ 生成 `unpack ok` + per-ref status | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` | 基础 report-status v1 语义 |
-| `side-band-64k` | ✅ both | ✅ | ✅ `build_side_band_format` | ✅ 侧带构造有单测 | pack data 通过 side-band 传输 |
-| `ofs-delta` | ✅ both | ✅ | ⚠️ 识别但未完整验证 OFS_DELTA 编解码 | ❌ 需补完整 OFS_DELTA truth table | pack encode/decode 需测试矩阵 |
+| `side-band-64k` | ✅ both | ✅ | ✅ `build_side_band_format` | ✅ `build_side_band_format_wraps_payload_when_side_band_64k_enabled` + `build_side_band_format_passthrough_when_capability_absent` | pack data 通过 side-band 传输 |
+| `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；monoengine 侧仅覆盖 advertise/parse |
 | `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
+| `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
+| `ls-refs` | ✅ protocol v2 | ✅ | ✅ 处理 `ref-prefix`、`symrefs`、`peel` | ✅ v2 capability / command parse 单测 | protocol v2 refs discovery |
+| `fetch=shallow filter` | ✅ protocol v2 | ✅ | ✅ v2 fetch 支持 `want`/`have`/`done`、`deepen`、`filter blob:none`；**（2026-06-30）非 MonoRepo handler 现在对 shallow/filter 请求返回明确协议错误而非静默 fallback** | ✅ v2 command parse 单测 + pack generation gates + capability honesty 单测 | v2 fetch；`filter blob:none` 只发送 commit/tree objects；`RepoHandler::supports_shallow_fetch`/`supports_filtered_fetch` 门控 |
 | `agent=mega/0.1.0` | ✅ both | ❌ | ❌ | ❌ | 信息性，不影响协议行为 |
 | `atomic` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现原子 ref 更新，已从 advertise 移除 |
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
-| `delete-refs` | ❌ 已移除 | ❌ | ❌ | N/A | delete-only push 不稳健，已从 advertise 移除 |
+| `delete-refs` | ✅ 已声明 | ✅ HTTP branch/tag delete smoke | ❌ | N/A | HTTP smoke 已覆盖 branch/tag delete；SSH delete 矩阵仍未补齐 |
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
 | `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
+| `server-option` | ❌ 已移除 (v2) | ✅ | ❌ | ✅ `v2_capability_advertisement_does_not_advertise_server_option` | v2 parsed capabilities 未被 inspect/act-on，advertise 会误导客户端；2026-06-30 从 v2 advertise 移除 |
+| `object-format` | ❌ protocol v1；✅ protocol v2 `object-format=sha1` | ✅ v2 capability advertisement | N/A | ✅ v1 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` + v2 capability 单测 | v1 保持 SHA-1 默认不 advertise；v2 capability list 显式声明 `sha1` |
 
-残余风险：`ofs-delta` 被 advertise 但 OFS_DELTA 编解码未完整测试；后续需补 truth table 覆盖或暂时移除。
+残余风险：`ofs-delta` 的 pack 编解码由 `git-internal` crate 实现并自测，monoengine 侧已覆盖 advertise/parse；如需端到端 OFS_DELTA pack 矩阵可在 `git-internal` 侧补足。
 
 ### 阶段 4：认证与授权统一
 
@@ -687,18 +733,18 @@ LFS:
 
 工作项：
 
-1. 定义 `ProtocolAuthContext`。
-2. HTTP Bearer / Basic token 认证填充同一 context。
-3. SSH publickey 认证成功后保存 username，并传入 `SmartSession`。
-4. 明确 upload-pack 是否允许匿名访问。
-5. receive-pack 检查 repo/path 级 push 权限。
-6. commit binding 使用同一 authenticated actor。
+1. ✅ 定义协议认证上下文：`SmartSession.auth: AuthContext`（`username` + `authenticated_user: PushUserInfo`），HTTP 与 SSH 共用。
+2. ✅ HTTP Bearer / Basic token 认证填充同一 context（`git_receive_pack_auth` → `SmartSession::set_authenticated_user`）。
+3. ✅ SSH publickey 认证成功后保存 username（`SshServer.authenticated_user`），exec 阶段传入 `SmartSession`（`set_authenticated_user`），commit binding 不再匿名。
+4. ✅ 明确 upload-pack 是否允许匿名访问：`check_upload_pack_access(git_config, auth)` 按 `git.anonymous_access`（默认 `true`，向后兼容）放行匿名 clone/fetch，关闭时无 token 返回 `ProtocolError::Forbidden`；HTTP `info/refs` upload 分支（`http.rs:53`）、`git_upload_pack`（`http.rs:217`）与 SSH（`ssh.rs:149`）共用，`mod.rs` 3 个单测锁定 allow/deny/authenticated。
+5. 🔶 receive-pack 检查 repo/path 级 push 权限：`check_push_permission(state, auth, repo_path)` 未认证（无 `username`）直接 `Forbidden`，已认证时对 `Repository(repo_path)` 走 Cedar `pushRepo` 授权（`state.entity_store` 非空时按策略裁决，为空则放行）；HTTP receive-pack 两处（`http.rs:64/355`）与 SSH（`ssh.rs:140`）均在 unpack 前调用。更细粒度的 repo/path ACL 与基于策略的 push-deny 协议层单测待后续。
+6. ✅ commit binding 使用同一 authenticated actor（`bind_commit_to_user` 读取 `auth.authenticated_user`，HTTP/SSH 路径统一）。
 
 验收标准：
 
-- HTTP push 和 SSH push 都能绑定到正确用户。
-- private repo fetch 策略明确且有测试。
-- 未授权 push 返回 401/403 或 SSH failure，不进入 unpack。
+- ✅ HTTP push 和 SSH push 都能绑定到正确用户。
+- 🔶 private repo fetch 策略明确且有测试：`check_upload_pack_access` 的匿名/关闭策略已有 3 个单测；`anonymous_access=false` 的端到端矩阵待补。
+- 🔶 未授权（未认证）push 返回 `Forbidden`，不进入 unpack（`check_push_permission` 在 unpack 前拒绝无 token 请求）；基于策略的 push-deny 协议层单测待后续。
 
 ### 阶段 5：SSH per-channel state 与 LFS hybrid 加固
 
@@ -708,15 +754,16 @@ LFS:
 
 1. 引入 `GitSshChannelState`，按 `ChannelId` 保存状态。
 2. `channel_eof` 只处理当前 channel。
-3. `git-lfs-transfer` 返回规范 unsupported。
-4. `git-lfs-authenticate` 按 upload/download operation 返回准确 response。
-5. LFS HTTP endpoint 绑定 repo path 和认证上下文。
+3. ✅ `git-lfs-transfer` 通过 SSH stderr extended-data 返回规范 unsupported 错误，并通过 channel failure 触发客户端 fallback。
+4. ✅ `git-lfs-authenticate` / `git-lfs-transfer` 已校验 upload/download operation；`git-lfs-authenticate` 仍返回同一 HTTP LFS endpoint，后续如需按 operation 拆分 header/URL 再补。
+5. ✅ LFS HTTP endpoint 已绑定认证上下文与 repo path。HTTP LFS 端点原先完全匿名（未套 `cedar_guard`）。**认证模型以 batch 端点为授权闸门**（`src/api/router/lfs_router.rs`）：`objects/batch` 按 `operation` 分流——`download` 为读、`upload` 为写；读遵循 `git.anonymous_access`（默认 `true`，与 upload-pack 一致，匿名 clone/pull 不受影响），写要求有效 mono access token（Bearer 或 Basic 密码位，与 receive-pack 一致），未认证写返回带 `WWW-Authenticate` 的 `401`。lock `create`/`unlock` 为写、`list`/`verify` 为读，同样按此策略。纯策略函数 `lfs_access_allowed` 与 `enforce_lfs_access` 收敛决策，`lfs_router` 单测锁定策略矩阵、token 解析与 401 challenge。**object 传输端点（`PUT`/`GET /objects/{oid}`）是 batch 下发的能力 URL，不再逐请求鉴权**：git-lfs 不会稳定地对 transfer 请求附带凭据（会导致上传 `PUT` 在 body 传输中途收到 `401` 而 broken pipe）。上传安全性由两层保证：(1) `lfs_upload_object`（handler）要求对象必须已由 `upload` batch 注册 metadata（否则 `Not found`），而 `upload` batch 走写鉴权闸门；(2) **内容寻址不可变**——`lfs_upload_object` 校验上传字节的 `sha256` 等于所声明的 OID 且大小等于注册 size，并对已存在对象跳过写入，因此即便匿名直连 `PUT` 也只能（重复）存入恰好哈希到该 OID 的字节，无法篡改或伪造对象。raw `GET` 为匿名（内容寻址能力 URL，绕过 `anonymous_access`）；OID 为 sha256 内容哈希，知道它即隐含已有该内容的引用。**repo path 绑定**：`rewrite_lfs_request_uri` 在剥离 `/info/lfs` 前缀前先把 repo 前缀存入 `LfsRepoContext` 请求扩展，lock 端点据此把锁行 key 命名空间化为 `{repo}\u{1f}{ref}`（`scoped_lock_ref`），使不同 repo 下同名 ref 的锁不再共用一行；object 由 OID 内容寻址，天然跨 repo 安全，无需隔离。空 repo（`/api/v1/lfs` 内部挂载）回退到裸 ref key 保持向后兼容。
 
 验收标准：
 
-- 单 SSH connection 多 channel 不串状态。
-- Git LFS 客户端能稳定 fallback 到 HTTP LFS。
-- LFS object/lock 操作不会跨 repo 混淆。
+- ✅ 单 SSH connection 多 channel 不串状态（`SshServer` 已按 `ChannelId` 隔离 `GitSshChannelState`）。
+- ✅ Git LFS 客户端能稳定完成 HTTP LFS push/clone（object 传输不逐请求鉴权，避免 transfer `PUT` 因中途 `401` broken pipe；由 CI `git-protocol-smoke` 的 LFS round-trip 覆盖）。
+- ✅ 未认证的 LFS 写操作（`objects/batch operation=upload`、lock create-unlock）返回 401，不再匿名可写；读操作遵循 `anonymous_access` 策略（由 `lfs_access_policy_matrix` 锁定）。匿名直连 object `PUT` 因缺少 batch 注册的 metadata 返回 `Not found`；即便针对已注册 OID，也因 `sha256`/size 校验与「已存在则跳过」而无法篡改或伪造。
+- ✅ LFS lock 操作不会跨 repo 混淆：锁行 key 按 repo 命名空间化（由 `locks_are_namespaced_by_repository` 锁定）；object 内容寻址（OID）天然跨 repo 安全。
 
 ### 阶段 6：upload-pack 兼容性扩展
 
@@ -724,42 +771,41 @@ LFS:
 
 工作项：
 
-1. 实现 `deepen` / shallow clone 基础语义。
-2. 支持 `deepen-since`、`deepen-not` 或明确拒绝。
-3. 评估 protocol v2 的 `ls-refs` 和 `fetch`。
-4. 评估 partial clone filter：`blob:none`、tree filters。
+1. ✅ 实现 `deepen` / shallow clone 基础语义：upload-pack 解析 `deepen` / `deepen-relative`，`MonoRepo::shallow_pack` 做 depth-limited traversal，并返回 `shallow` pkt-lines。
+2. ✅ 支持 `deepen-since`、`deepen-not` 或明确拒绝：当前明确返回 `ProtocolError::InvalidInput`。
+3. ✅ 评估并实现 protocol v2 的 `ls-refs` 和 `fetch`：HTTP 通过 `Git-Protocol` header，SSH 通过 `GIT_PROTOCOL` env request。
+4. ✅ 评估 partial clone filter：已实现 protocol v2 `filter blob:none`；tree filters 暂未实现完整语义，后续需按真实 Git CLI 矩阵决定是否扩展。
 
 验收标准：
 
 - `git clone --depth=1` 行为正确。
 - 不支持的 modern feature 有明确错误或 fallback，不 silent misbehave。
-- 大仓库 fetch 不需要一次性读取大请求体。
+- 大仓库 fetch 不需要一次性读取大请求体（仍待 streaming pkt-line reader 完成）。
 
 ## 推荐优先级
 
 | 优先级 | 工作 | 原因 |
 | --- | --- | --- |
-| P0 | 建立真实 Git 客户端兼容性矩阵 | 后续改协议必须防回归 |
+| P0 | 建立真实 Git 客户端兼容性矩阵 | ✅ **已落地并扩展（2026-07-01）**：`scripts/git_protocol_smoke.sh` + `.github/workflows/git-protocol-smoke.yml` CI 自动化回归 gate，覆盖 HTTP read-only 场景（ls-remote/clone/fetch/v2 fetch/shallow/blob:none）、HTTP branch/tag push+delete 以及 HTTP LFS push/clone/pull/locks-list；SSH push/delete 保留为脚本手动 opt-in |
 | P0 | 修复 HTTP query、SSH exec、pkt-line parser 的 panic | 非法客户端输入不能打崩服务 |
-| P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；后续补 streaming parser 与 delete-only push 矩阵 |
+| P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；HTTP branch/tag push+delete 已进入 CI；SSH push/delete 仍为手动 opt-in；后续补 streaming parser |
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |
 | P1 | SSH payload 全部按 bytes 发送 | Git 协议是二进制协议，不能假设 UTF-8 |
-| P1 | 统一 HTTP/SSH auth context | push 审计、commit binding、权限检查依赖此基础 |
-| P2 | SSH per-channel state | 提升 SSH server 正确性和并发安全 |
+| P1 | 统一 HTTP/SSH auth context | ✅ 已落地：HTTP/SSH 共用 `check_upload_pack_access`（匿名策略，可配置）+ `check_push_permission`（Cedar `pushRepo` 授权）；commit binding 绑定 authenticated actor。更细 repo/path ACL 与 push-deny 协议层单测待后续 |
+| P2 | SSH per-channel state | ✅ 已实现（2026-06-28）：`SshServer` 按 `ChannelId` 维护独立 `GitSshChannelState` |
 | P2 | LFS hybrid response 加固 | 提升 Git LFS 客户端兼容性 |
-| P3 | shallow clone / protocol v2 / partial clone | 现代 Git 客户端和大仓库体验优化 |
+| P3 | tree filters / promisor remote / streaming upload-pack parser | 进一步优化现代 Git 客户端和大仓库体验；shallow clone、protocol v2、`filter blob:none` 已完成基础支持 |
 
 ## 建议的文档化兼容声明
 
 在 README 或部署文档中，当前阶段建议明确声明：
 
-- 支持 Git smart HTTP 的基础 clone/fetch/push。
-- 支持 Git SSH 的基础 clone/fetch/push。
+- 支持 Git smart HTTP 的基础 clone/fetch/push，以及 protocol v2 `ls-refs` / `fetch`。
+- 支持 Git SSH 的基础 clone/fetch/push，以及通过 `GIT_PROTOCOL=version=2` 启用 protocol v2 `ls-refs` / `fetch`。
 - 支持 Git LFS HTTP endpoints，以及 SSH `git-lfs-authenticate` hybrid 模式。
 - 暂不支持 pure SSH LFS transfer。
-- 暂不承诺 Git protocol v2。
-- 暂不承诺 partial clone / blobless clone。
-- shallow clone 兼容性需要以测试矩阵结果为准。
+- 支持 shallow fetch/clone 基础语义（`deepen` / `deepen-relative`）；兼容性仍需要真实 Git CLI 矩阵确认。
+- 支持 protocol v2 partial clone `filter blob:none`；暂不承诺 tree filters 或完整 promisor remote 语义。
 - advertise 的 capability 以实现和测试为准，未实现能力不应对外声明。
 
 ## 下一步建议

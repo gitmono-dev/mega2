@@ -31,16 +31,14 @@ impl LfsDbStorage {
     pub async fn get_lfs_object(&self, oid: &str) -> Result<Option<lfs_objects::Model>, MegaError> {
         let result = lfs_objects::Entity::find_by_id(oid)
             .one(self.get_connection())
-            .await
-            .unwrap();
+            .await?;
         Ok(result)
     }
 
     pub async fn delete_lfs_object(&self, oid: String) -> Result<(), MegaError> {
         lfs_objects::Entity::delete_by_id(oid)
             .exec(self.get_connection())
-            .await
-            .unwrap();
+            .await?;
         Ok(())
     }
 
@@ -50,8 +48,7 @@ impl LfsDbStorage {
     ) -> Result<InsertResult<lfs_locks::ActiveModel>, MegaError> {
         Ok(lfs_locks::Entity::insert(lfs_lock.into_active_model())
             .exec(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_lock_by_id(
@@ -60,8 +57,7 @@ impl LfsDbStorage {
     ) -> Result<Option<lfs_locks::Model>, MegaError> {
         let result = lfs_locks::Entity::find_by_id(refspec)
             .one(self.get_connection())
-            .await
-            .unwrap();
+            .await?;
         Ok(result)
     }
 
@@ -74,14 +70,13 @@ impl LfsDbStorage {
         val.data = Set(data.to_owned());
         Ok(lfs_locks::Entity::update(val)
             .exec(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
-    pub async fn delete_lock_by_id(&self, id: String) {
+    pub async fn delete_lock_by_id(&self, id: String) -> Result<(), MegaError> {
         lfs_locks::Entity::delete_by_id(id)
             .exec(self.get_connection())
-            .await
-            .unwrap();
+            .await?;
+        Ok(())
     }
 }

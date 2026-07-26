@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig};
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuildConfig, Config, DbConfig, LFSConfig, LFSLocalConfig,
-    LFSSshConfig, LogConfig, MailConfig, MonoConfig, PackConfig, RedisConfig, SidebarConfig,
+    ArtifactGcConfig, BlameConfig, BuildConfig, Config, DbConfig, GitConfig, LFSConfig,
+    LFSLocalConfig, LFSSshConfig, LogConfig, MailConfig, MonoConfig, PackConfig, RedisConfig,
+    SidebarConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -34,7 +35,14 @@ pub type EnvLockGuard = MutexGuard<'static, ()>;
 
 #[cfg(test)]
 pub fn env_lock() -> EnvLockGuard {
-    ENV_LOCK.lock().expect("env lock should not be poisoned")
+    // Recover from a poisoned lock instead of cascading a single test's panic
+    // into PoisonError failures across every other env-serialized test. The
+    // lock only serializes process-wide env access; `EnvVarGuard`'s Drop restores
+    // any mutated variable during unwinding, so the env is consistent by the time
+    // the next test acquires the lock.
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -52,6 +60,25 @@ impl<'a> EnvVarGuard<'a> {
         // and this guard restores the previous value before that lock is released.
         unsafe {
             std::env::set_var(key, value);
+        }
+        Self {
+            _lock: lock,
+            key,
+            previous,
+        }
+    }
+
+    /// Temporarily remove an environment variable for the duration of the guard,
+    /// restoring its previous value on drop. Used by tests that assert
+    /// file/profile precedence in isolation from any ambient `MEGA_*` override
+    /// (e.g. the `.env.test` `MEGA_DATABASE__DB_URL` that otherwise wins via the
+    /// env source layer).
+    pub fn remove(lock: &'a EnvLockGuard, key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: see EnvVarGuard::set; tests hold the shared config env lock and
+        // this guard restores the previous value before the lock is released.
+        unsafe {
+            std::env::remove_var(key);
         }
         Self {
             _lock: lock,
@@ -195,6 +222,9 @@ impl TestConfigBuilder {
             }),
             notification: None,
             vault: None,
+            oauth: None,
+            chat: None,
+            git: GitConfig::default(),
         }
     }
 }

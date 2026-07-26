@@ -16,7 +16,10 @@ use crate::{
         build_trigger::service::BuildTriggerService,
         protocol::repo::Repo,
     },
-    chat::service::{ChannelChatService, SharedChatService},
+    chat::{
+        domain::InMemoryChatEvents,
+        service::{ChannelChatService, SharedChatService},
+    },
     common::errors::ProtocolError,
     contract::policy::entitystore::EntityStore,
     jupiter::{
@@ -43,6 +46,7 @@ pub struct MonoApiServiceState {
     pub listen_addr: String,
     pub entity_store: EntityStore,
     pub bellatrix: Arc<Bellatrix>,
+    pub chat_events: Arc<InMemoryChatEvents>,
 }
 
 impl FromRef<MonoApiServiceState> for MemoryStore {
@@ -77,6 +81,7 @@ impl FromRef<MonoApiServiceState> for ProtocolApiState {
         ProtocolApiState {
             storage: state.storage.clone(),
             git_object_cache: state.git_object_cache.clone(),
+            entity_store: state.entity_store.clone(),
         }
     }
 }
@@ -130,8 +135,8 @@ impl MonoApiServiceState {
         )
     }
 
-    pub fn channel_chat_svc(&self) -> ChannelChatService {
-        ChannelChatService::from_storage(&self.storage)
+    pub fn channel_chat_svc(&self) -> ChannelChatService<InMemoryChatEvents> {
+        ChannelChatService::from_storage(&self.storage).with_events(self.chat_events.clone())
     }
 
     pub fn shared_chat_svc(&self) -> SharedChatService {

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::{
     Router, ServiceExt,
@@ -170,17 +170,6 @@ fn apply_artifact_gc_config(
     }
 
     Ok(())
-}
-
-pub fn remove_git_suffix(full_path: &str, git_suffix: &str) -> PathBuf {
-    PathBuf::from(full_path.replace(".git", "").replace(git_suffix, ""))
-}
-
-fn is_disallowed_root_repo_path(full_path: &str) -> bool {
-    matches!(
-        full_path.trim_start_matches('/').split('/').next(),
-        Some("third-party.git")
-    )
 }
 
 /// Spawns a background task to clean up expired Buck upload sessions.
@@ -508,6 +497,45 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     Ok(())
 }
 
+/// Built-in development CORS origins used when `oauth.allowed_cors_origins` is
+/// unset or empty.
+const DEFAULT_CORS_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "http://app.gitmega.com",
+    "http://app.gitmono.test",
+];
+
+/// Build the CORS allow-origin list: the configured `oauth.allowed_cors_origins`
+/// when non-empty (invalid entries skipped with a warning), otherwise the
+/// built-in development defaults. An empty/absent config never widens CORS (it
+/// falls back to the defaults, not to allow-all). Configured entries are
+/// validated up-front by `validate_oauth_config`, so the runtime skip is a
+/// defensive belt-and-suspenders.
+fn cors_allow_origins(oauth: Option<&crate::config::OAuthConfig>) -> Vec<HeaderValue> {
+    let configured = oauth
+        .map(|oauth| oauth.allowed_cors_origins.as_slice())
+        .unwrap_or(&[]);
+    if configured.is_empty() {
+        return DEFAULT_CORS_ORIGINS
+            .iter()
+            .map(|origin| HeaderValue::from_static(origin))
+            .collect();
+    }
+    configured
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::warn!(
+                    origin = %origin,
+                    "ignoring invalid oauth.allowed_cors_origins entry"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// This is the main entry for the mono server.
 /// It is responsible for creating the main router and setting up the necessary middleware.
 ///
@@ -551,13 +579,11 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
         entity_store: EntityStore::new(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+        chat_events: Arc::new(crate::chat::domain::InMemoryChatEvents::default()),
     };
 
-    let origins: Vec<HeaderValue> = vec![
-        HeaderValue::from_static("http://localhost"),
-        HeaderValue::from_static("http://app.gitmega.com"),
-        HeaderValue::from_static("http://app.gitmono.test"),
-    ];
+    let app_config = storage.config();
+    let origins: Vec<HeaderValue> = cors_allow_origins(app_config.oauth.as_ref());
 
     // add RequestDecompressionLayer for handle gzip encode
     // add TraceLayer for log record
@@ -629,33 +655,44 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
 }
 
 fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
-    let full_path = req.uri().path();
+    // Capture the repository path prefix (the segment before `/info/lfs/`)
+    // before it is stripped for routing, so LFS handlers can namespace locks
+    // per repository. Empty when the request carries no repo prefix.
+    let (repo_prefix, rewrite_target) = {
+        let full_path = req.uri().path();
+        match full_path.rfind("/info/lfs/") {
+            Some(pos) => {
+                let lfs_subpath = &full_path[pos..];
+                let target = if let Some(query) = req.uri().query() {
+                    format!("{lfs_subpath}?{query}")
+                } else {
+                    lfs_subpath.to_owned()
+                };
+                (full_path[..pos].to_owned(), Some(target))
+            }
+            None => (String::new(), None),
+        }
+    };
 
-    if let Some(pos) = full_path.rfind("/info/lfs/") {
-        let lfs_subpath = &full_path[pos..];
+    req.extensions_mut()
+        .insert(lfs_router::LfsRepoContext(repo_prefix));
 
-        let new_path_and_query = if let Some(query) = req.uri().query() {
-            format!("{}?{}", lfs_subpath, query)
-        } else {
-            lfs_subpath.to_owned()
-        };
-
-        let new_uri = match Uri::builder().path_and_query(&new_path_and_query).build() {
-            Ok(uri) => uri,
+    if let Some(new_path_and_query) = rewrite_target {
+        match Uri::builder().path_and_query(&new_path_and_query).build() {
+            Ok(uri) => {
+                tracing::debug!("rewrite: old uri {:?}", req.uri());
+                *req.uri_mut() = uri;
+                tracing::debug!("rewrite: new uri {:?}", req.uri());
+            }
             Err(e) => {
+                // Leave the URI unchanged and let downstream handlers deal with it.
                 tracing::warn!(
                     "Failed to rewrite LFS URI: {}, error: {}",
                     new_path_and_query,
                     e
                 );
-                // Return the request unchanged, let downstream handlers deal with it
-                return req;
             }
-        };
-
-        tracing::debug!("rewrite: old uri {:?}", req.uri());
-        *req.uri_mut() = new_uri;
-        tracing::debug!("rewrite: new uri {:?}", req.uri());
+        }
     }
     req
 }
@@ -692,29 +729,30 @@ async fn handle_smart_protocol(
     req: Request<Body>,
     state: Arc<ProtocolApiState>,
 ) -> std::result::Result<Response, ProtocolError> {
-    let full_path = req.uri().path();
-    if is_disallowed_root_repo_path(full_path) {
-        return Err(ProtocolError::InvalidInput(
-            "Repository third-party.git is not supported".to_string(),
-        ));
-    }
-    if full_path.ends_with("/info/refs") && req.method().eq(&Method::GET) {
-        let repo_path = remove_git_suffix(full_path, "/info/refs");
-        let uri = req.uri();
-        let query_str = uri.query().unwrap_or("");
-        let params = parse_info_refs_params(query_str)?;
-        crate::contract::git_protocol::http::git_info_refs(&state, params, repo_path).await
-    } else if full_path.ends_with("/git-upload-pack") && req.method().eq(&Method::POST) {
-        let repo_path = remove_git_suffix(full_path, "/git-upload-pack");
-        crate::contract::git_protocol::http::git_upload_pack(&state, req, repo_path).await
-    } else if full_path.ends_with("/git-receive-pack") && req.method().eq(&Method::POST) {
-        let repo_path = remove_git_suffix(full_path, "/git-receive-pack");
-        crate::contract::git_protocol::http::git_receive_pack(&state, req, repo_path).await
-    } else {
-        Ok(Response::builder()
-            .status(404)
-            .body(Body::from("Operation not supported"))
-            .unwrap())
+    let parsed = crate::contract::git_protocol::path::parse_git_protocol_path(
+        req.method(),
+        req.uri().path(),
+    )?;
+
+    match parsed.endpoint {
+        crate::contract::git_protocol::path::GitProtocolEndpoint::InfoRefs => {
+            let params = parse_info_refs_params(req.uri().query().unwrap_or(""))?;
+            crate::contract::git_protocol::http::git_info_refs(
+                &state,
+                params,
+                parsed.repo_path,
+                req.headers(),
+            )
+            .await
+        }
+        crate::contract::git_protocol::path::GitProtocolEndpoint::UploadPack => {
+            crate::contract::git_protocol::http::git_upload_pack(&state, req, parsed.repo_path)
+                .await
+        }
+        crate::contract::git_protocol::path::GitProtocolEndpoint::ReceivePack => {
+            crate::contract::git_protocol::http::git_receive_pack(&state, req, parsed.repo_path)
+                .await
+        }
     }
 }
 
@@ -723,6 +761,57 @@ mod tests {
     use http::Request;
 
     use super::*;
+
+    #[test]
+    fn cors_origins_fall_back_to_defaults_when_unset() {
+        let origins = cors_allow_origins(None);
+        assert_eq!(origins.len(), DEFAULT_CORS_ORIGINS.len());
+        assert!(origins.contains(&HeaderValue::from_static("http://localhost")));
+    }
+
+    #[test]
+    fn cors_origins_fall_back_to_defaults_when_empty() {
+        let oauth = crate::config::OAuthConfig {
+            allowed_cors_origins: vec![],
+        };
+        let origins = cors_allow_origins(Some(&oauth));
+        assert_eq!(origins.len(), DEFAULT_CORS_ORIGINS.len());
+    }
+
+    #[test]
+    fn cors_origins_use_configured_values() {
+        let oauth = crate::config::OAuthConfig {
+            allowed_cors_origins: vec![
+                "https://app.example.com".to_string(),
+                "http://localhost:3000".to_string(),
+            ],
+        };
+        let origins = cors_allow_origins(Some(&oauth));
+        assert_eq!(
+            origins,
+            vec![
+                HeaderValue::from_static("https://app.example.com"),
+                HeaderValue::from_static("http://localhost:3000"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cors_origins_skip_invalid_configured_entries() {
+        // A control char makes HeaderValue::from_str fail; it is skipped, not
+        // turned into an allow-all.
+        let oauth = crate::config::OAuthConfig {
+            allowed_cors_origins: vec![
+                "https://ok.example.com".to_string(),
+                "bad\norigin".to_string(),
+            ],
+        };
+        let origins = cors_allow_origins(Some(&oauth));
+        assert_eq!(
+            origins,
+            vec![HeaderValue::from_static("https://ok.example.com")]
+        );
+    }
     use crate::config::{
         ArtifactGcConfig, BuckConfig, reload::ConfigHandle, testing::isolated_config,
     };
@@ -823,18 +912,6 @@ mod tests {
 
         assert!(shutdown_token.is_cancelled());
         assert!(notification_shutdown.is_cancelled());
-    }
-
-    #[test]
-    fn test_disallow_third_party_git_root_repo() {
-        assert!(is_disallowed_root_repo_path("/third-party.git/info/refs"));
-        assert!(is_disallowed_root_repo_path(
-            "/third-party.git/git-receive-pack"
-        ));
-        assert!(!is_disallowed_root_repo_path(
-            "/third-party/test.git/info/refs"
-        ));
-        assert!(!is_disallowed_root_repo_path("/project.git/info/refs"));
     }
 
     #[test]

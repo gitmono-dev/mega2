@@ -15,7 +15,7 @@ use crate::{
         api_service::state::ProtocolApiState,
         protocol::{
             Capability, ServiceType, SideBind, SmartSession, TransportProtocol, ZERO_ID,
-            import_refs::RefCommand,
+            import_refs::{CommandType, RefCommand},
         },
     },
     common::errors::ProtocolError,
@@ -28,17 +28,18 @@ pub const SP: char = ' ';
 const NUL: char = '\0';
 
 pub const PKT_LINE_END_MARKER: &[u8; 4] = b"0000";
+pub const PKT_LINE_DELIMITER: &[u8; 4] = b"0001";
 
 // see https://git-scm.com/docs/protocol-capabilities
 // Only advertise capabilities that are parsed, acted on, and covered by tests.
-const RECEIVE_CAP_LIST: &str = "report-status ";
+const RECEIVE_CAP_LIST: &str = "report-status delete-refs ";
 
 // The ofs-delta and side-band-64k capabilities are sent and recognized by both upload-pack and receive-pack protocols.
 // The agent and session-id capabilities may optionally be sent in both protocols.
 const COMMON_CAP_LIST: &str = "side-band-64k ofs-delta agent=mega/0.1.0";
 
 // All other capabilities are only recognized by the upload-pack (fetch from server) process.
-const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done ";
+const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done shallow ";
 
 fn advertised_capabilities(service_type: ServiceType) -> String {
     match service_type {
@@ -106,19 +107,28 @@ impl SmartSession {
         let mut want: HashSet<String> = HashSet::new();
         let mut have: HashSet<String> = HashSet::new();
         let mut last_common_commit = String::new();
+        let mut deepen_depth: Option<u32> = None;
+        let mut deepen_relative = false;
+        let mut shallow_commits: Vec<String> = Vec::new();
 
         let mut read_first_line = false;
         loop {
-            let (bytes_take, pkt_line) = try_read_pkt_line(upload_request)?;
-            // read 0000 to continue and read empty str to break
-            if bytes_take == 0 {
-                if upload_request.is_empty() {
-                    break;
-                } else {
-                    continue;
+            let pkt_line = try_read_pkt_line(upload_request)?;
+            let dst = match pkt_line {
+                PktLine::Flush => {
+                    if upload_request.is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
                 }
-            }
-            let dst = pkt_line.to_vec();
+                PktLine::Data(data) => data.to_vec(),
+                _ => {
+                    return Err(ProtocolError::InvalidInput(
+                        "unexpected pkt-line type in upload-pack".to_owned(),
+                    ));
+                }
+            };
             if dst.len() < 4 {
                 return Err(ProtocolError::InvalidInput(
                     "pkt-line command is shorter than 4 bytes".to_owned(),
@@ -148,6 +158,34 @@ impl SmartSession {
                     })?);
                 }
                 b"done" => break,
+                b"deep" => {
+                    let payload = &dst[4..];
+                    if payload.starts_with(b"en ") {
+                        let depth_str = core::str::from_utf8(&payload[3..])
+                            .map_err(|_| {
+                                ProtocolError::InvalidInput(
+                                    "deepen depth is not valid UTF-8".to_owned(),
+                                )
+                            })?
+                            .trim();
+                        deepen_depth = Some(depth_str.parse::<u32>().map_err(|_| {
+                            ProtocolError::InvalidInput(format!(
+                                "invalid deepen depth: {depth_str}"
+                            ))
+                        })?);
+                    } else if payload.starts_with(b"en-relative") {
+                        deepen_relative = true;
+                    } else if payload.starts_with(b"en-since") || payload.starts_with(b"en-not") {
+                        return Err(ProtocolError::InvalidInput(
+                            "deepen-since and deepen-not are not supported".to_owned(),
+                        ));
+                    } else {
+                        tracing::warn!(
+                            "unknown deepen variant: {:?}",
+                            String::from_utf8_lossy(payload)
+                        );
+                    }
+                }
                 other => {
                     tracing::error!(
                         "unsupported command: {:?}",
@@ -168,9 +206,10 @@ impl SmartSession {
         }
 
         tracing::info!(
-            "want commands: {:?}\n have commands: {:?}\n caps:{:?}",
+            "want commands: {:?}\n have commands: {:?}\n deepen: {:?}\n caps:{:?}",
             want,
             have,
+            deepen_depth,
             self.capabilities
         );
 
@@ -180,15 +219,44 @@ impl SmartSession {
         let want: Vec<String> = want.into_iter().collect();
         let have: Vec<String> = have.into_iter().collect();
 
+        // Capability honesty: `shallow` is advertised for upload-pack, but
+        // only MonoRepo genuinely implements depth-limited pack generation.
+        // ImportRepo's default trait `shallow_pack` silently falls back to
+        // `full_pack`, which would mislead clients into thinking they got a
+        // shallow clone. Return an explicit protocol error instead.
+        if deepen_depth.is_some() && !repo_handler.supports_shallow_fetch() {
+            return Err(ProtocolError::InvalidInput(
+                "shallow fetch is not supported for this repository".to_owned(),
+            ));
+        }
+        // Shallow incremental fetch (deepen + non-empty have) is not
+        // implemented: the code would fall through to `incremental_pack`
+        // without applying depth or emitting `shallow` lines, silently
+        // producing a non-shallow pack. Reject this combination explicitly.
+        if deepen_depth.is_some() && !have.is_empty() {
+            return Err(ProtocolError::InvalidInput(
+                "shallow fetch with non-empty have is not supported".to_owned(),
+            ));
+        }
+
         if have.is_empty() {
-            pack_data = repo_handler.full_pack(want).await.unwrap();
+            if let Some(depth) = deepen_depth {
+                let (stream, shallows) = repo_handler
+                    .shallow_pack(want, depth, deepen_relative)
+                    .await
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("shallow pack generation failed: {e}"))
+                    })?;
+                pack_data = stream;
+                shallow_commits = shallows;
+            } else {
+                pack_data = repo_handler.full_pack(want).await.map_err(|e| {
+                    ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
+                })?;
+            }
             add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
         } else {
             if self.capabilities.contains(&Capability::MultiAckDetailed) {
-                // multi_ack_detailed mode, the server will differentiate the ACKs where it is signaling that
-                // it is ready to send data with ACK obj-id ready lines,
-                // and signals the identified common commits with ACK obj-id common lines
-
                 for hash in &have {
                     if repo_handler.check_commit_exist(hash).await {
                         add_pkt_line_string(&mut protocol_buf, format!("ACK {hash} common\n"));
@@ -200,30 +268,32 @@ impl SmartSession {
                 pack_data = repo_handler
                     .incremental_pack(want.clone(), have)
                     .await
-                    .unwrap();
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("pack generation failed: {e}"))
+                    })?;
 
                 if last_common_commit.is_empty() {
-                    //send NAK if missing common commit
                     add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
-                    // need to handle rebase option, still need pack data when has no common commit
                     return Ok((pack_data, protocol_buf));
                 }
 
                 for hash in want {
                     if self.capabilities.contains(&Capability::NoDone) {
-                        // If multi_ack_detailed and no-done are both present, then the sender is free to immediately send a pack
-                        // following its first "ACK obj-id ready" message.
                         add_pkt_line_string(&mut protocol_buf, format!("ACK {hash} ready\n"));
                     }
                 }
             } else {
                 tracing::error!("capability unsupported");
-                // init a empty receiverstream
                 let (_, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
                 pack_data = ReceiverStream::new(rx);
             }
             add_pkt_line_string(&mut protocol_buf, format!("ACK {last_common_commit} \n"));
         }
+
+        for shallow in &shallow_commits {
+            add_pkt_line_string(&mut protocol_buf, format!("shallow {shallow}\n"));
+        }
+
         Ok((pack_data, protocol_buf))
     }
 
@@ -233,9 +303,9 @@ impl SmartSession {
     ) -> Result<Vec<RefCommand>, ProtocolError> {
         let mut commands: Vec<RefCommand> = Vec::new();
         while !protocol_bytes.is_empty() {
-            let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
-            if bytes_take != 0 {
-                let command = self.parse_receive_pack_command_line(&mut pkt_line)?;
+            let pkt_line = try_read_pkt_line(&mut protocol_bytes)?;
+            if let PktLine::Data(mut data) = pkt_line {
+                let command = self.parse_receive_pack_command_line(&mut data)?;
                 commands.push(command);
             }
         }
@@ -249,18 +319,51 @@ impl SmartSession {
         let mut commands: Vec<RefCommand> = Vec::new();
 
         while !protocol_bytes.is_empty() {
-            let (bytes_take, mut pkt_line) = try_read_pkt_line(&mut protocol_bytes)?;
-            if bytes_take == 0 {
-                return Ok((commands, protocol_bytes));
+            let pkt_line = try_read_pkt_line(&mut protocol_bytes)?;
+            match pkt_line {
+                PktLine::Flush => {
+                    if commands.is_empty() {
+                        return Err(ProtocolError::InvalidInput(
+                            "receive-pack request contains no commands".to_owned(),
+                        ));
+                    }
+                    if !Self::is_delete_only_push(&commands) {
+                        if protocol_bytes.is_empty() {
+                            return Err(ProtocolError::InvalidInput(
+                                "receive-pack request missing pack payload".to_owned(),
+                            ));
+                        }
+                        if !protocol_bytes.starts_with(b"PACK") {
+                            return Err(ProtocolError::InvalidInput(
+                                "receive-pack request pack payload does not start with PACK"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    return Ok((commands, protocol_bytes));
+                }
+                PktLine::Data(mut data) => {
+                    let command = self.parse_receive_pack_command_line(&mut data)?;
+                    commands.push(command);
+                }
+                _ => {
+                    return Err(ProtocolError::InvalidInput(
+                        "unexpected pkt-line type in receive-pack".to_owned(),
+                    ));
+                }
             }
-
-            let command = self.parse_receive_pack_command_line(&mut pkt_line)?;
-            commands.push(command);
         }
 
         Err(ProtocolError::InvalidInput(
             "receive-pack command list missing flush-pkt".to_owned(),
         ))
+    }
+
+    fn is_delete_only_push(commands: &[RefCommand]) -> bool {
+        !commands.is_empty()
+            && commands
+                .iter()
+                .all(|c| c.command_type == CommandType::Delete)
     }
 
     fn parse_receive_pack_command_line(
@@ -297,24 +400,32 @@ impl SmartSession {
             .await?;
         let is_monorepo = repo_handler.is_monorepo();
         //1. unpack progress
-        let t_unpack = Instant::now();
-        let receiver = repo_handler
-            .unpack_stream(&state.storage.config().pack, data_stream)
-            .await?;
-        timings_ms.insert(
-            "unpack_stream_ms".to_string(),
-            t_unpack.elapsed().as_millis(),
-        );
+        let delete_only = Self::is_delete_only_push(&commands);
+        let unpack_result = if delete_only {
+            timings_ms.insert("unpack_stream_ms".to_string(), 0);
+            timings_ms.insert("receiver_handler_ms".to_string(), 0);
+            Ok(())
+        } else {
+            let t_unpack = Instant::now();
+            let receiver = repo_handler
+                .unpack_stream(&state.storage.config().pack, data_stream)
+                .await?;
+            timings_ms.insert(
+                "unpack_stream_ms".to_string(),
+                t_unpack.elapsed().as_millis(),
+            );
 
-        let t_receiver = Instant::now();
-        let unpack_result = repo_handler
-            .clone()
-            .receiver_handler(receiver.0, receiver.1)
-            .await;
-        timings_ms.insert(
-            "receiver_handler_ms".to_string(),
-            t_receiver.elapsed().as_millis(),
-        );
+            let t_receiver = Instant::now();
+            let res = repo_handler
+                .clone()
+                .receiver_handler(receiver.0, receiver.1)
+                .await;
+            timings_ms.insert(
+                "receiver_handler_ms".to_string(),
+                t_receiver.elapsed().as_millis(),
+            );
+            res
+        };
 
         // write "unpack ok\n to report"
         add_pkt_line_string(&mut report_status, "unpack ok\n".to_owned());
@@ -561,49 +672,20 @@ pub fn add_pkt_line_string(pkt_line_stream: &mut BytesMut, buf_str: String) {
     pkt_line_stream.put(Bytes::from(format!("{buf_str_length:04x}")));
     pkt_line_stream.put(buf_str.as_bytes());
 }
-/// Read a single pkt-format line from the `bytes` buffer and return the line length and line bytes.
-///
-/// If the `bytes` buffer is empty, indicating no more data is available, the function returns a line length of 0 and an empty `Bytes` object.
-///
-/// The pkt-format line consists of a 4-byte length field followed by the line content. The length field specifies the total length of the line, including the length field itself. The line content is returned as a `Bytes` object.
-///
-/// The function first reads the 4-byte length field from the `bytes` buffer. The length value is then parsed as a hexadecimal string and converted into a `usize` value.
-///
-/// If the resulting line length is 0, indicating an empty line, the function returns a line length of 0 and an empty `Bytes` object.
-///
-/// If the line length is non-zero, the function extracts the line content from the `bytes` buffer. The extracted line content is returned as a `Bytes` object.
-/// Note that this operation modifies the `bytes` buffer, consuming the bytes up to the end of the line.
-///
-/// # Arguments
-///
-/// * `bytes` - A mutable reference to a `Bytes` object representing the buffer containing pkt-format data.
-///
-/// # Returns
-///
-/// A tuple `(usize, Bytes)` representing the line length and line bytes respectively. If there is no more data available in the `bytes` buffer, the line length is 0 and an empty `Bytes` object is returned.
-///
-/// # Examples
-///
-/// ```
-/// use bytes::Bytes;
-/// use crate::ceres::protocol::smart::read_pkt_line;
-///
-/// let mut bytes = Bytes::from_static(b"000Bexample");
-/// let (length, line) = read_pkt_line(&mut bytes);
-/// assert_eq!(length, 11);
-/// assert_eq!(line, Bytes::from_static(b"example"));
-/// ```
-pub fn read_pkt_line(bytes: &mut Bytes) -> (usize, Bytes) {
-    try_read_pkt_line(bytes).unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "invalid pkt-line");
-        bytes.clear();
-        (0, Bytes::new())
-    })
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PktLine {
+    Data(Bytes),
+    Flush,
+    Delim,
+    ResponseEnd,
 }
 
-pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), ProtocolError> {
+pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<PktLine, ProtocolError> {
     if bytes.is_empty() {
-        return Ok((0, Bytes::new()));
+        return Err(ProtocolError::InvalidInput(
+            "no pkt-line data available".to_owned(),
+        ));
     }
     if bytes.len() < 4 {
         return Err(ProtocolError::InvalidInput(
@@ -623,33 +705,45 @@ pub fn try_read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), ProtocolEr
         16,
     )
     .map_err(|_| ProtocolError::InvalidInput("pkt-line length header is invalid".to_owned()))?;
-    if pkt_length == 0 {
-        bytes.advance(4);
-        return Ok((0, Bytes::new()));
-    }
-    if pkt_length < 4 {
-        return Err(ProtocolError::InvalidInput(
-            "pkt-line length is smaller than header".to_owned(),
-        ));
-    }
-    if bytes.len() < pkt_length {
-        return Err(ProtocolError::InvalidInput(
-            "pkt-line payload is incomplete".to_owned(),
-        ));
-    }
-    bytes.advance(4);
-    // this operation will change the original bytes
-    let pkt_line = bytes.copy_to_bytes(pkt_length - 4);
-    tracing::debug!("pkt line: {:?}", pkt_line);
 
-    Ok((pkt_length, pkt_line))
+    match pkt_length {
+        0 => {
+            bytes.advance(4);
+            Ok(PktLine::Flush)
+        }
+        1 => {
+            bytes.advance(4);
+            Ok(PktLine::Delim)
+        }
+        2 => {
+            bytes.advance(4);
+            Ok(PktLine::ResponseEnd)
+        }
+        3 => Err(ProtocolError::InvalidInput(
+            "pkt-line length 0x0003 is reserved".to_owned(),
+        )),
+        n if n < 4 => Err(ProtocolError::InvalidInput(
+            "pkt-line length is smaller than header".to_owned(),
+        )),
+        n => {
+            if bytes.len() < n {
+                return Err(ProtocolError::InvalidInput(
+                    "pkt-line payload is incomplete".to_owned(),
+                ));
+            }
+            bytes.advance(4);
+            let pkt_line = bytes.copy_to_bytes(n - 4);
+            tracing::debug!("pkt line: {:?}", pkt_line);
+            Ok(PktLine::Data(pkt_line))
+        }
+    }
 }
 
 #[cfg(test)]
 pub mod test {
     use std::{process::Command, time::Duration};
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
     use futures::future;
     use tempfile::TempDir;
     use tokio::{task, time::sleep};
@@ -660,7 +754,7 @@ pub mod test {
             Capability, ServiceType, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
             smart::{
-                PKT_LINE_END_MARKER, add_pkt_line_string, advertised_capabilities, read_pkt_line,
+                PKT_LINE_END_MARKER, PktLine, add_pkt_line_string, advertised_capabilities,
                 read_until_white_space, try_read_pkt_line,
             },
         },
@@ -670,9 +764,11 @@ pub mod test {
     #[test]
     pub fn test_read_pkt_line() {
         let mut bytes = Bytes::from_static(b"001e# service=git-upload-pack\n");
-        let (pkt_length, pkt_line) = read_pkt_line(&mut bytes);
-        assert_eq!(pkt_length, 30);
-        assert_eq!(&pkt_line[..], b"# service=git-upload-pack\n");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(
+            pkt_line,
+            PktLine::Data(Bytes::from_static(b"# service=git-upload-pack\n"))
+        );
     }
 
     #[test]
@@ -685,12 +781,81 @@ pub mod test {
     }
 
     #[test]
+    pub fn try_read_pkt_line_rejects_incomplete_header_without_consuming() {
+        let mut bytes = Bytes::from_static(b"00f");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert_eq!(&bytes[..], b"00f");
+    }
+
+    #[test]
     pub fn try_read_pkt_line_rejects_incomplete_payload() {
         let mut bytes = Bytes::from_static(b"000babc");
         let err = try_read_pkt_line(&mut bytes).unwrap_err();
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert_eq!(&bytes[..], b"000babc");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_flush() {
+        let mut bytes = Bytes::from_static(b"0000trailing");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::Flush);
+        assert_eq!(&bytes[..], b"trailing");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_delim() {
+        let mut bytes = Bytes::from_static(b"0001trailing");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::Delim);
+        assert_eq!(&bytes[..], b"trailing");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_response_end() {
+        let mut bytes = Bytes::from_static(b"0002trailing");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::ResponseEnd);
+        assert_eq!(&bytes[..], b"trailing");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_reserved_length_3() {
+        let mut bytes = Bytes::from_static(b"0003");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("reserved"));
+        assert_eq!(&bytes[..], b"0003");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_length_smaller_than_header() {
+        let mut bytes = Bytes::from_static(b"0003want");
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(
+            err.to_string().contains("reserved") || err.to_string().contains("smaller than header")
+        );
+        assert_eq!(&bytes[..], b"0003want");
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_rejects_empty_input() {
+        let mut bytes = Bytes::new();
+        let err = try_read_pkt_line(&mut bytes).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+    }
+
+    #[test]
+    pub fn try_read_pkt_line_parses_data() {
+        let mut bytes = Bytes::from_static(b"000Bexample");
+        let pkt_line = try_read_pkt_line(&mut bytes).unwrap();
+        assert_eq!(pkt_line, PktLine::Data(Bytes::from_static(b"example")));
     }
 
     #[test]
@@ -804,6 +969,98 @@ pub mod test {
     }
 
     #[test]
+    pub fn split_receive_pack_request_accepts_delete_only_without_pack_payload() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "27dd8d4cf39f3868c6eee38b601bc9e9939304f5 0000000000000000000000000000000000000000 refs/heads/old\0report-status\n"
+                .to_owned(),
+        );
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+
+        let (commands, pack_bytes) = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap();
+
+        assert!(pack_bytes.is_empty());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].ref_name, "refs/heads/old");
+        assert_eq!(commands[0].command_type, CommandType::Delete);
+        assert!(SmartSession::is_delete_only_push(&commands));
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_rejects_non_delete_without_pack_payload() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "0000000000000000000000000000000000000000 27dd8d4cf39f3868c6eee38b601bc9e9939304f5 refs/heads/main\0report-status\n"
+                .to_owned(),
+        );
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+
+        let err = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("missing pack payload"));
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_rejects_non_delete_invalid_pack_magic() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        add_pkt_line_string(
+            &mut request,
+            "0000000000000000000000000000000000000000 27dd8d4cf39f3868c6eee38b601bc9e9939304f5 refs/heads/main\0report-status\n"
+                .to_owned(),
+        );
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+        request.extend_from_slice(b"NOPEpayload");
+
+        let err = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("does not start with PACK"));
+    }
+
+    #[test]
+    pub fn split_receive_pack_request_rejects_empty_command_list() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        let mut request = BytesMut::new();
+        request.extend_from_slice(PKT_LINE_END_MARKER);
+        request.extend_from_slice(b"PACKpayload");
+
+        let err = session
+            .split_receive_pack_request(request.freeze())
+            .unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("no commands"));
+    }
+
+    #[test]
     pub fn test_parse_capabilities() {
         let mut mock = SmartSession::new(
             std::path::PathBuf::new(),
@@ -826,8 +1083,8 @@ pub mod test {
         assert!(tokens.contains(&"side-band-64k"));
         assert!(tokens.contains(&"ofs-delta"));
         assert!(tokens.contains(&"agent=mega/0.1.0"));
+        assert!(tokens.contains(&"delete-refs"));
         assert!(!tokens.contains(&"report-status-v2"));
-        assert!(!tokens.contains(&"delete-refs"));
         assert!(!tokens.contains(&"quiet"));
         assert!(!tokens.contains(&"atomic"));
         assert!(!tokens.contains(&"no-thin"));
@@ -842,6 +1099,175 @@ pub mod test {
         assert!(tokens.contains(&"no-done"));
         assert!(tokens.contains(&"side-band-64k"));
         assert!(!tokens.contains(&"include-tag"));
+    }
+
+    #[test]
+    pub fn build_side_band_format_wraps_payload_when_side_band_64k_enabled() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        session.capabilities.insert(Capability::SideBand64k);
+
+        let payload = BytesMut::from(&b"unpack ok\n"[..]);
+        let length = payload.len();
+        let framed = session.build_side_band_format(payload.clone(), length);
+
+        let expected_total = 4 + 1 + payload.len();
+        let header = format!("{expected_total:04x}");
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(header.as_bytes());
+        expected.put_u8(0x01);
+        expected.extend_from_slice(&payload);
+        assert_eq!(&framed[..], &expected[..]);
+    }
+
+    #[test]
+    pub fn build_side_band_format_passthrough_when_capability_absent() {
+        let session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+
+        let payload = BytesMut::from(&b"unpack ok\n"[..]);
+        let framed = session.build_side_band_format(payload.clone(), payload.len());
+        assert_eq!(&framed[..], &payload[..]);
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_ofs_delta() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("report-status ofs-delta side-band-64k");
+        assert!(session.capabilities.contains(&Capability::OfsDelta));
+        assert!(session.capabilities.contains(&Capability::ReportStatus));
+        assert!(session.capabilities.contains(&Capability::SideBand64k));
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_shallow_depth_extensions() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("shallow deepen-since deepen-not multi_ack_detailed");
+
+        assert!(session.capabilities.contains(&Capability::Shallow));
+        assert!(session.capabilities.contains(&Capability::DeepenSince));
+        assert!(session.capabilities.contains(&Capability::DeepenNot));
+        assert!(session.capabilities.contains(&Capability::MultiAckDetailed));
+    }
+
+    #[test]
+    pub fn advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format() {
+        for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+            let caps = advertised_capabilities(service);
+            let tokens = caps.split_whitespace().collect::<Vec<_>>();
+            assert!(
+                !tokens.iter().any(|t| t.starts_with("object-format")),
+                "object-format must not be advertised for a SHA-1-only server ({service:?}): {caps}"
+            );
+        }
+    }
+
+    #[test]
+    pub fn set_authenticated_user_populates_auth_context_for_commit_binding() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Ssh,
+        );
+        assert!(session.auth.authenticated_user.is_none());
+
+        session.set_authenticated_user("alice".to_string());
+
+        assert_eq!(
+            session
+                .auth
+                .authenticated_user
+                .as_ref()
+                .map(|u| u.username.as_str()),
+            Some("alice")
+        );
+        assert_eq!(session.auth.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    pub fn upload_pack_advertises_shallow_capability() {
+        let caps = advertised_capabilities(ServiceType::UploadPack);
+        let tokens = caps.split_whitespace().collect::<Vec<_>>();
+        assert!(tokens.contains(&"shallow"));
+    }
+
+    #[test]
+    pub fn receive_pack_does_not_advertise_shallow() {
+        let caps = advertised_capabilities(ServiceType::ReceivePack);
+        let tokens = caps.split_whitespace().collect::<Vec<_>>();
+        assert!(!tokens.contains(&"shallow"));
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_shallow() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("shallow multi_ack_detailed");
+        assert!(session.capabilities.contains(&Capability::Shallow));
+        assert!(session.capabilities.contains(&Capability::MultiAckDetailed));
+    }
+
+    #[test]
+    pub fn parse_capabilities_recognizes_deepen_since_and_deepen_not() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        );
+        session.parse_capabilities("deepen-since deepen-not");
+        assert!(session.capabilities.contains(&Capability::DeepenSince));
+        assert!(session.capabilities.contains(&Capability::DeepenNot));
+    }
+
+    #[test]
+    pub fn is_delete_only_push_detects_pure_delete_vs_mixed() {
+        fn delete_cmd() -> RefCommand {
+            RefCommand {
+                ref_name: String::from("refs/heads/old"),
+                old_id: String::from("27dd8d4cf39f3868c6eee38b601bc9e9939304f5"),
+                new_id: String::from("0000000000000000000000000000000000000000"),
+                status: String::from("ok"),
+                error_msg: String::new(),
+                command_type: CommandType::Delete,
+                ref_type: RefTypeEnum::Branch,
+                default_branch: false,
+            }
+        }
+        let create = RefCommand {
+            ref_name: String::from("refs/heads/new"),
+            old_id: String::from("0000000000000000000000000000000000000000"),
+            new_id: String::from("27dd8d4cf39f3868c6eee38b601bc9e9939304f5"),
+            status: String::from("ok"),
+            error_msg: String::new(),
+            command_type: CommandType::Create,
+            ref_type: RefTypeEnum::Branch,
+            default_branch: false,
+        };
+
+        assert!(SmartSession::is_delete_only_push(&[delete_cmd()]));
+        assert!(SmartSession::is_delete_only_push(&[
+            delete_cmd(),
+            delete_cmd()
+        ]));
+        assert!(!SmartSession::is_delete_only_push(&[delete_cmd(), create]));
+        assert!(!SmartSession::is_delete_only_push(&[]));
     }
 
     async fn git_push_with_retry(repo_path: &std::path::Path) -> anyhow::Result<()> {

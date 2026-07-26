@@ -7,19 +7,18 @@ use axum::{
 };
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use http::header::AUTHORIZATION;
 use tokio::io::AsyncReadExt;
-use tokio_stream::StreamExt;
 
 use crate::{
     api::oauth::{bearer_token_from_authorization_value, login_user_from_mono_access_token},
     ceres::{
         api_service::state::ProtocolApiState,
-        protocol::{PushUserInfo, ServiceType, SmartSession, TransportProtocol, smart},
+        protocol::{ServiceType, SmartSession, TransportProtocol, smart, v2},
     },
     common::errors::ProtocolError,
-    contract::git_protocol::InfoRefsParams,
+    contract::git_protocol::{InfoRefsParams, check_push_permission, check_upload_pack_access},
 };
 
 // # Discovering Reference
@@ -28,17 +27,57 @@ use crate::{
 // The request MUST contain exactly one query parameter, service=$servicename,
 // where $servicename MUST be the service name the client wishes to contact to complete the operation.
 // The request MUST NOT contain additional query parameters.
+fn is_v2_request(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("Git-Protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("version=2"))
+        .unwrap_or(false)
+}
+
 pub async fn git_info_refs(
     state: &ProtocolApiState,
     params: InfoRefsParams,
     repo_path: std::path::PathBuf,
+    headers: &http::HeaderMap,
 ) -> Result<Response<Body>, ProtocolError> {
     let service_name = params
         .service
         .ok_or_else(|| ProtocolError::InvalidInput("missing service parameter".to_owned()))?;
     let service_type = ServiceType::from_str(&service_name)
         .map_err(|err| ProtocolError::InvalidInput(err.to_string()))?;
-    let session = SmartSession::new(repo_path, service_type, TransportProtocol::Http);
+    let mut session = SmartSession::new(repo_path, service_type, TransportProtocol::Http);
+    match service_type {
+        ServiceType::UploadPack => {
+            let _ = git_http_auth(state, &mut session, headers).await?;
+            if check_upload_pack_access(&state.storage.config().git, &session.auth)
+                .await
+                .is_err()
+            {
+                return auth_failed();
+            }
+        }
+        ServiceType::ReceivePack => {
+            if !git_http_auth(state, &mut session, headers).await? {
+                return auth_failed();
+            }
+            check_push_permission(state, &session.auth, &session.repo_path).await?;
+        }
+    }
+
+    if is_v2_request(headers) && service_type == ServiceType::UploadPack {
+        let pkt_line_stream = v2::build_v2_capability_advertisement();
+        let response = add_default_header(
+            format!("application/x-{service_name}-advertisement"),
+            Response::builder()
+                .body(Body::from(pkt_line_stream.freeze()))
+                .map_err(|e| {
+                    ProtocolError::InvalidInput(format!("failed to build response: {e}"))
+                })?,
+        )?;
+        return Ok(response);
+    }
+
     let pkt_line_stream = session.git_info_refs(state).await?;
 
     let content_type = format!("application/x-{service_name}-advertisement");
@@ -46,8 +85,8 @@ pub async fn git_info_refs(
         content_type,
         Response::builder()
             .body(Body::from(pkt_line_stream.freeze()))
-            .unwrap(),
-    );
+            .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?,
+    )?;
     Ok(response)
 }
 
@@ -59,7 +98,7 @@ fn auth_failed() -> Result<Response<Body>, ProtocolError> {
             HeaderValue::from_static("Basic realm=\"Mega\", Bearer realm=\"Mega\""),
         )
         .body(Body::empty())
-        .unwrap();
+        .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?;
     Ok(resp)
 }
 
@@ -79,7 +118,9 @@ fn basic_auth_password_from_authorization_value(value: &str) -> Option<String> {
 
 /// Uses [`crate::api::oauth::login_user_from_mono_access_token`] (same as [`crate::api::oauth::AccessTokenUser`]).
 /// Supports both Bearer tokens and Basic Auth (with token as password).
-async fn git_receive_pack_auth(
+/// Returns `Ok(true)` if a valid token was found and the user was authenticated,
+/// `Ok(false)` if no auth header was present, and `Err` on lookup failures.
+async fn git_http_auth(
     state: &ProtocolApiState,
     pack_protocol: &mut SmartSession,
     headers: &http::HeaderMap,
@@ -104,22 +145,45 @@ async fn git_receive_pack_auth(
         return Ok(false);
     };
 
-    let username = user.username;
-    pack_protocol.auth.username = Some(username.clone());
-    pack_protocol.auth.authenticated_user = Some(PushUserInfo { username });
+    pack_protocol.set_authenticated_user(user.username);
     Ok(true)
 }
 
+/// Maximum body size accepted for Git HTTP upload-pack / receive-pack requests.
+/// This bounds memory consumption on the server and prevents unbounded buffering
+/// of malformed or malicious requests. Pushes larger than this must use chunked
+/// or other transfer mechanisms not implemented here.
+const GIT_HTTP_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
 async fn collect_body_data(body: Body, operation: &str) -> Result<BytesMut, ProtocolError> {
-    body.into_data_stream()
-        .try_fold(BytesMut::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await
-        .map_err(|err| {
-            ProtocolError::InvalidInput(format!("failed to read {operation} body: {err}"))
-        })
+    collect_body_data_with_limit(body, operation, GIT_HTTP_MAX_BODY_BYTES).await
+}
+
+async fn collect_body_data_with_limit(
+    body: Body,
+    operation: &str,
+    max_bytes: usize,
+) -> Result<BytesMut, ProtocolError> {
+    let mut stream = body.into_data_stream();
+    let mut acc = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if acc.len() + chunk.len() > max_bytes {
+                    return Err(ProtocolError::TooLarge(format!(
+                        "{operation} body exceeds maximum allowed size of {max_bytes} bytes"
+                    )));
+                }
+                acc.extend_from_slice(&chunk);
+            }
+            Err(err) => {
+                return Err(ProtocolError::InvalidInput(format!(
+                    "failed to read {operation} body: {err}"
+                )));
+            }
+        }
+    }
+    Ok(acc)
 }
 
 /// # Handles a Git upload pack request and prepares the response.
@@ -149,27 +213,38 @@ pub async fn git_upload_pack(
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol =
         SmartSession::new(repo_path, ServiceType::UploadPack, TransportProtocol::Http);
+    let _ = git_http_auth(state, &mut pack_protocol, req.headers()).await?;
+    check_upload_pack_access(&state.storage.config().git, &pack_protocol.auth).await?;
     let upload_request = collect_body_data(req.into_body(), "upload-pack").await?;
     tracing::debug!("Receive bytes: <-------- {:?}", upload_request);
-    let (mut send_pack_data, protocol_buf) = pack_protocol
-        .git_upload_pack(state, &mut upload_request.freeze())
-        .await?;
+
+    let mut body = upload_request.freeze();
+    if v2::is_v2_upload_pack_request(&mut body) {
+        return handle_v2_upload_pack(state, &mut pack_protocol, &mut body).await;
+    }
+
+    let (mut send_pack_data, protocol_buf) =
+        pack_protocol.git_upload_pack(state, &mut body).await?;
 
     let body_stream = async_stream::stream! {
         tracing::info!("send ack/nak message buf: --------> {:?}", &protocol_buf);
         yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
-        // send packdata with sideband64k
         while let Some(chunk) = send_pack_data.next().await {
             let mut reader = chunk.as_slice();
             loop {
                 let mut temp = BytesMut::new();
                 temp.reserve(65500);
-                let length = reader.read_buf(&mut temp).await.unwrap();
+                let length = match reader.read_buf(&mut temp).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = %e, "read error in upload-pack sideband stream");
+                        break;
+                    }
+                };
                 if length == 0 {
                     break;
                 }
                 let bytes_out = pack_protocol.build_side_band_format(temp, length);
-                // tracing::info!("send pack file: length: {:?}", bytes_out.len());
                 yield Ok::<_, Infallible>(bytes_out.freeze());
             }
         }
@@ -181,9 +256,75 @@ pub async fn git_upload_pack(
         String::from("application/x-git-upload-pack-result"),
         Response::builder()
             .body(Body::from_stream(body_stream))
-            .unwrap(),
-    );
+            .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?,
+    )?;
     Ok(response)
+}
+
+async fn handle_v2_upload_pack(
+    state: &ProtocolApiState,
+    session: &mut SmartSession,
+    body: &mut Bytes,
+) -> Result<Response<Body>, ProtocolError> {
+    let (command, _caps) = v2::parse_v2_command(body)?;
+
+    match command.as_str() {
+        "ls-refs" => {
+            let refs = v2::handle_v2_ls_refs(session, state, body).await?;
+            let response = add_default_header(
+                String::from("application/x-git-upload-pack-result"),
+                Response::builder()
+                    .body(Body::from(refs.freeze()))
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("failed to build response: {e}"))
+                    })?,
+            )?;
+            Ok(response)
+        }
+        "fetch" => {
+            let (mut send_pack_data, protocol_buf) =
+                v2::handle_v2_fetch(session, state, body).await?;
+
+            let body_stream = async_stream::stream! {
+                let mut protocol_buf = protocol_buf;
+                v2::add_packfile_section_header(&mut protocol_buf);
+                yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
+                while let Some(chunk) = send_pack_data.next().await {
+                    let mut reader = chunk.as_slice();
+                    loop {
+                        let mut temp = BytesMut::new();
+                        temp.reserve(65500);
+                        let length = match reader.read_buf(&mut temp).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::error!(error = %e, "read error in v2 upload-pack sideband stream");
+                                break;
+                            }
+                        };
+                        if length == 0 {
+                            break;
+                        }
+                        let bytes_out = v2::build_packfile_data_packet(temp, length);
+                        yield Ok::<_, Infallible>(bytes_out.freeze());
+                    }
+                }
+                let bytes_out = Bytes::from_static(smart::PKT_LINE_END_MARKER);
+                yield Ok::<_, Infallible>(bytes_out);
+            };
+            let response = add_default_header(
+                String::from("application/x-git-upload-pack-result"),
+                Response::builder()
+                    .body(Body::from_stream(body_stream))
+                    .map_err(|e| {
+                        ProtocolError::InvalidInput(format!("failed to build response: {e}"))
+                    })?,
+            )?;
+            Ok(response)
+        }
+        other => Err(ProtocolError::InvalidInput(format!(
+            "unsupported v2 command: {other}"
+        ))),
+    }
 }
 
 /// Handles the Git receive-pack protocol for receiving and processing data from a client.
@@ -208,9 +349,10 @@ pub async fn git_receive_pack(
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol =
         SmartSession::new(repo_path, ServiceType::ReceivePack, TransportProtocol::Http);
-    if !git_receive_pack_auth(state, &mut pack_protocol, req.headers()).await? {
+    if !git_http_auth(state, &mut pack_protocol, req.headers()).await? {
         return auth_failed();
     }
+    check_push_permission(state, &pack_protocol.auth, &pack_protocol.repo_path).await?;
     let receive_request = collect_body_data(req.into_body(), "receive-pack").await?;
 
     let (commands, pack_bytes) =
@@ -221,27 +363,34 @@ pub async fn git_receive_pack(
         .await?;
 
     tracing::info!("report status:{:?}", report_status);
-    let response = Response::builder().body(Body::from(report_status)).unwrap();
+    let response = Response::builder()
+        .body(Body::from(report_status))
+        .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?;
     let response = add_default_header(
         String::from("application/x-git-receive-pack-result"),
         response,
-    );
+    )?;
     Ok(response)
 }
 
 /// # Build Response headers for Smart Server.
 /// Clients MUST NOT reuse or revalidate a cached response.
 /// Servers MUST include sufficient Cache-Control headers to prevent caching of the response.
-fn add_default_header<T>(content_type: String, mut response: Response<T>) -> Response<T> {
+fn add_default_header<T>(
+    content_type: String,
+    mut response: Response<T>,
+) -> Result<Response<T>, ProtocolError> {
     response.headers_mut().insert(
         "Content-Type",
-        HeaderValue::from_str(&content_type).unwrap(),
+        HeaderValue::from_str(&content_type).map_err(|e| {
+            ProtocolError::InvalidInput(format!("invalid content-type header: {e}"))
+        })?,
     );
     response.headers_mut().insert(
         "Cache-Control",
         HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
     );
-    response
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -260,5 +409,52 @@ mod tests {
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert!(err.to_string().contains("failed to read upload-pack body"));
+    }
+
+    #[tokio::test]
+    async fn collect_body_data_rejects_oversized_bodies() {
+        let err = collect_body_data_with_limit(
+            Body::from(Bytes::from(vec![0u8; 1025])),
+            "upload-pack",
+            1024,
+        )
+        .await
+        .expect_err("oversized body should be rejected");
+
+        assert!(matches!(err, ProtocolError::TooLarge(_)));
+        assert!(
+            err.to_string()
+                .contains("exceeds maximum allowed size of 1024 bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_body_data_accepts_bodies_within_limit() {
+        let data = collect_body_data_with_limit(
+            Body::from(Bytes::from(vec![0u8; 1024])),
+            "upload-pack",
+            1024,
+        )
+        .await
+        .expect("body within limit should be accepted");
+
+        assert_eq!(data.len(), 1024);
+    }
+
+    #[test]
+    fn auth_failed_returns_401_response() {
+        let resp = auth_failed().unwrap();
+
+        assert_eq!(resp.status(), 401);
+        assert!(resp.headers().get(http::header::WWW_AUTHENTICATE).is_some());
+    }
+
+    #[test]
+    fn add_default_header_rejects_invalid_content_type() {
+        let response = Response::builder().body(()).unwrap();
+        let err = add_default_header("bad\ncontent-type".to_string(), response).unwrap_err();
+
+        assert!(matches!(err, ProtocolError::InvalidInput(_)));
+        assert!(err.to_string().contains("invalid content-type header"));
     }
 }

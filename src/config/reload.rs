@@ -15,7 +15,7 @@ use tokio::{
 use crate::{
     common::errors::MegaError,
     config::{
-        ArtifactGcConfig, BuckConfig, Config, DEFAULT_MAIL_TEMPLATE_LOCALE,
+        ArtifactGcConfig, BuckConfig, ChatConfig, Config, DEFAULT_MAIL_TEMPLATE_LOCALE,
         DEFAULT_NOTIFICATION_DELIVERY_MODE, LogConfig, MailConfig, NotificationConfig,
     },
 };
@@ -146,6 +146,7 @@ impl ConfigHandle {
             &mut next.notification,
             &mut report,
         );
+        apply_chat_changes(&current.chat, &candidate.chat, &mut next.chat, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
         collect_static_restart_fields(&current, &candidate, &mut report);
@@ -604,6 +605,24 @@ fn apply_mail_changes(
                 }
                 report.applied_fields.push("mail.starttls");
             }
+            if current.http_url != candidate.http_url {
+                if let Some(next) = next {
+                    next.http_url.clone_from(&candidate.http_url);
+                }
+                report.applied_fields.push("mail.http_url");
+            }
+            if current.http_headers != candidate.http_headers {
+                if let Some(next) = next {
+                    next.http_headers.clone_from(&candidate.http_headers);
+                }
+                report.applied_fields.push("mail.http_headers");
+            }
+            if current.http_timeout_secs != candidate.http_timeout_secs {
+                if let Some(next) = next {
+                    next.http_timeout_secs = candidate.http_timeout_secs;
+                }
+                report.applied_fields.push("mail.http_timeout_secs");
+            }
         }
     }
 }
@@ -659,6 +678,59 @@ fn notification_default_locale(config: &Option<NotificationConfig>) -> String {
         .as_ref()
         .map(|c| c.default_locale.clone())
         .unwrap_or_else(|| DEFAULT_MAIL_TEMPLATE_LOCALE.to_string())
+}
+
+/// `chat.attachment_allowed_mime_types` is read live by the attachment handlers,
+/// so changes can be hot-applied without a restart.
+fn apply_chat_changes(
+    current: &Option<ChatConfig>,
+    candidate: &Option<ChatConfig>,
+    next: &mut Option<ChatConfig>,
+    report: &mut ConfigReloadReport,
+) {
+    if current == candidate {
+        return;
+    }
+
+    let current_list = chat_mime_allowlist(current);
+    let candidate_list = chat_mime_allowlist(candidate);
+    *next = candidate.clone();
+
+    if current_list != candidate_list {
+        report
+            .applied_fields
+            .push("chat.attachment_allowed_mime_types");
+    }
+    if current.as_ref().map(|c| c.open_graph_fetch_enabled)
+        != candidate.as_ref().map(|c| c.open_graph_fetch_enabled)
+    {
+        report.applied_fields.push("chat.open_graph_fetch_enabled");
+    }
+    if current.as_ref().map(|c| c.open_graph_fetch_timeout_ms)
+        != candidate.as_ref().map(|c| c.open_graph_fetch_timeout_ms)
+    {
+        report
+            .applied_fields
+            .push("chat.open_graph_fetch_timeout_ms");
+    }
+    if current
+        .as_ref()
+        .map(|c| c.open_graph_allow_private_networks)
+        != candidate
+            .as_ref()
+            .map(|c| c.open_graph_allow_private_networks)
+    {
+        report
+            .applied_fields
+            .push("chat.open_graph_allow_private_networks");
+    }
+}
+
+fn chat_mime_allowlist(config: &Option<ChatConfig>) -> Vec<String> {
+    config
+        .as_ref()
+        .map(|c| c.attachment_allowed_mime_types.clone())
+        .unwrap_or_default()
 }
 
 fn collect_artifact_gc_restart_fields(
@@ -1057,7 +1129,7 @@ mod tests {
         ArtifactGcConfig, BuckConfig, MailConfig, MailProvider,
         secret::{SecretRef, SecretString},
         template::config_init_template,
-        testing::{env_lock, isolated_config},
+        testing::{EnvVarGuard, env_lock, isolated_config},
     };
 
     fn mail_config(enabled: bool) -> MailConfig {
@@ -1402,6 +1474,41 @@ mod tests {
         assert!(report.applied());
         assert!(!report.requires_restart());
         assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
+    }
+
+    #[test]
+    fn reload_applies_chat_mime_allowlist_without_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.chat = Some(ChatConfig::default());
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate
+            .chat
+            .as_mut()
+            .expect("chat config")
+            .attachment_allowed_mime_types =
+            vec!["image/*".to_string(), "application/pdf".to_string()];
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert_eq!(
+            report.applied_fields,
+            vec!["chat.attachment_allowed_mime_types"]
+        );
+        assert!(report.restart_required_fields.is_empty());
+        assert!(report.applied());
+        assert!(!report.requires_restart());
+        assert_eq!(
+            snapshot
+                .chat
+                .as_ref()
+                .expect("chat config")
+                .attachment_allowed_mime_types,
+            vec!["image/*".to_string(), "application/pdf".to_string()]
+        );
     }
 
     #[test]
@@ -1833,7 +1940,12 @@ mod tests {
 
     #[test]
     fn reload_from_path_uses_profile_candidate_and_keeps_restart_required_fields() {
-        let _lock = env_lock();
+        let lock = env_lock();
+        // Isolate from any ambient MEGA_DATABASE__DB_URL (e.g. set by .env.test):
+        // it would override both the base and the profile db_url via the env
+        // source layer, so no db_url change would be detected and the
+        // restart-required assertion below would see an empty list.
+        let _db_url_guard = EnvVarGuard::remove(&lock, "MEGA_DATABASE__DB_URL");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         let profile_path = temp_dir.path().join("config.prod.toml");

@@ -9,9 +9,11 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
-    MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
-    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, secret::SecretRef,
+    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, ChatConfig, Config, DbConfig,
+    LFSConfig, LogConfig, MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES,
+    NotificationConfig, OAuthConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig,
+    VAULT_AUDIT_SINKS, VaultConfig,
+    secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
 
@@ -129,12 +131,138 @@ impl Config {
         if let Some(notification_config) = &self.notification {
             validate_notification_config(notification_config)?;
         }
+        if let Some(vault_config) = &self.vault {
+            validate_vault_config(vault_config)?;
+        }
+        if let Some(oauth_config) = &self.oauth {
+            validate_oauth_config(oauth_config)?;
+        }
+        if let Some(chat_config) = &self.chat {
+            validate_chat_config(chat_config)?;
+        }
 
         Ok(())
     }
 }
 
-fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
+/// Validate `[oauth]` settings: each CORS origin must be a browser Origin of the
+/// form `scheme://host[:port]` (http/https, no path/query/fragment) that also
+/// parses as an HTTP header value — i.e. exactly what the server's `CorsLayer`
+/// accepts at runtime, so a configured origin can never pass validation yet be
+/// silently dropped by the CORS layer.
+pub(crate) fn validate_oauth_config(config: &OAuthConfig) -> Result<(), MegaError> {
+    for origin in &config.allowed_cors_origins {
+        validate_cors_origin(origin)?;
+    }
+    Ok(())
+}
+
+/// Validate `[chat]` settings: each MIME allowlist entry must be a non-empty
+/// type/subtype pattern without control characters. Wildcards are allowed only
+/// for the subtype (`image/*`), matching the runtime check in
+/// `validate_chat_attachment_metadata`.
+pub(crate) fn validate_chat_config(config: &ChatConfig) -> Result<(), MegaError> {
+    for pattern in &config.attachment_allowed_mime_types {
+        validate_mime_allowlist_pattern(pattern)?;
+    }
+    if config.open_graph_fetch_timeout_ms == 0 {
+        return Err(MegaError::Other(
+            "chat.open_graph_fetch_timeout_ms must be greater than 0".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mime_allowlist_pattern(pattern: &str) -> Result<(), MegaError> {
+    if pattern.trim().is_empty() {
+        return Err(MegaError::Other(
+            "chat.attachment_allowed_mime_types must not contain empty entries".to_string(),
+        ));
+    }
+    if pattern.chars().any(|c| c.is_control()) {
+        return Err(MegaError::Other(format!(
+            "chat.attachment_allowed_mime_types entry `{pattern}` must not contain control characters"
+        )));
+    }
+    let parts: Vec<&str> = pattern.split('/').collect();
+    if parts.len() != 2
+        || parts[0].trim().is_empty()
+        || parts[1].trim().is_empty()
+        || parts[0].contains('*')
+        || parts[1].contains('*') && parts[1] != "*"
+    {
+        return Err(MegaError::Other(format!(
+            "chat.attachment_allowed_mime_types entry `{pattern}` must be a MIME type (`type/subtype`) or wildcard (`type/*`)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cors_origin(origin: &str) -> Result<(), MegaError> {
+    if origin.trim().is_empty() {
+        return Err(MegaError::Other(
+            "oauth.allowed_cors_origins must not contain empty entries".to_string(),
+        ));
+    }
+    // A real Origin cannot contain whitespace (HTTP header values technically
+    // permit spaces/tabs, so reject them explicitly).
+    if origin.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must not contain whitespace or control characters"
+        )));
+    }
+    // Must be usable as the `Access-Control-Allow-Origin` header value the CORS
+    // layer builds at runtime (`HeaderValue::from_str`), which rejects non-ASCII.
+    if http::HeaderValue::from_str(origin).is_err() {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` is not a valid HTTP header value"
+        )));
+    }
+    // Must be a `scheme://host[:port]` origin: http/https, no path/query/fragment.
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must be a scheme://host origin"
+        )));
+    };
+    if scheme != "http" && scheme != "https" {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must use the http or https scheme"
+        )));
+    }
+    if rest.is_empty() || rest.contains(['/', '?', '#']) {
+        return Err(MegaError::Other(format!(
+            "oauth.allowed_cors_origins entry `{origin}` must not contain a path, query, or fragment (use scheme://host[:port])"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate `[vault]` settings (docs/vault.md stage H): the audit sink must be a
+/// supported value, and a `file` sink requires a non-empty `file_path`.
+pub(crate) fn validate_vault_config(config: &VaultConfig) -> Result<(), MegaError> {
+    let audit = &config.audit;
+    if !VAULT_AUDIT_SINKS.contains(&audit.sink.as_str()) {
+        return Err(MegaError::Other(format!(
+            "vault.audit.sink `{}` is not supported; expected one of {:?}",
+            audit.sink, VAULT_AUDIT_SINKS
+        )));
+    }
+    if audit.sink == "file"
+        && audit
+            .file_path
+            .as_ref()
+            .map(|path| path.as_os_str().is_empty())
+            .unwrap_or(true)
+    {
+        return Err(MegaError::Other(
+            "vault.audit.file_path is required (and must be non-empty) when vault.audit.sink is \"file\""
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
     if !NOTIFICATION_DELIVERY_MODES.contains(&config.default_delivery_mode.as_str()) {
         return Err(MegaError::Other(format!(
             "notification.default_delivery_mode `{}` is not supported; expected one of {:?}",
@@ -147,7 +275,72 @@ fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaE
         ));
     }
 
+    if let Some(slack) = &config.slack
+        && slack.enabled
+    {
+        let Some(secret_ref) = &slack.webhook_url_ref else {
+            return Err(MegaError::Other(
+                "notification.slack.webhook_url_ref is required when notification.slack.enabled is true".to_string(),
+            ));
+        };
+        validate_config_secret_ref(
+            "notification.slack.webhook_url_ref",
+            secret_ref,
+            "notification/slack/webhook_url",
+        )?;
+    }
+
+    if let Some(webhook) = &config.webhook
+        && webhook.enabled
+    {
+        if webhook.url.trim().is_empty() {
+            return Err(MegaError::Other(
+                "notification.webhook.url must not be empty when notification.webhook.enabled is true".to_string(),
+            ));
+        }
+        if let Some(secret_ref) = &webhook.token_ref {
+            validate_config_secret_ref(
+                "notification.webhook.token_ref",
+                secret_ref,
+                "notification/webhook/token",
+            )?;
+        }
+    }
+
     Ok(())
+}
+
+/// Validate that a config-managed `SecretRef` lives under the expected
+/// `config/<profile>/<suffix>` namespace (used for `mail.password` and the
+/// notification channel credentials). The SecretRef value is never logged.
+pub(crate) fn validate_config_secret_ref(
+    field_path: &str,
+    secret_ref: &SecretRef,
+    suffix: &str,
+) -> Result<(), MegaError> {
+    if is_config_secret_under(secret_ref.secret_name(), suffix) {
+        return Ok(());
+    }
+
+    Err(MegaError::Other(format!(
+        "{field_path} must use a vault SecretRef under vault://secret/config/<profile>/{suffix}#<field>; value is redacted"
+    )))
+}
+
+/// True when `secret_name` is exactly `config/<profile>/<suffix>` with a single
+/// non-empty `<profile>` segment (no extra path components between `config/` and
+/// the suffix), so a ref cannot point at an unrelated nested vault path.
+fn is_config_secret_under(secret_name: &str, suffix: &str) -> bool {
+    let Some(rest) = secret_name.strip_prefix("config/") else {
+        return false;
+    };
+    let trimmed_suffix = format!("/{suffix}");
+    let Some(profile) = rest.strip_suffix(&trimmed_suffix) else {
+        return false;
+    };
+
+    // Exactly one profile segment: non-empty and containing no further '/'.
+    !profile.is_empty() && !profile.contains('/')
 }
 
 impl MailConfig {
@@ -184,6 +377,38 @@ impl MailConfig {
                 return Err(MegaError::Other(
                     "mail.from is required when mail.enabled is true".to_string(),
                 ));
+            }
+        }
+
+        if self.enabled && self.provider == MailProvider::Http {
+            let url = self
+                .http_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    MegaError::Other(
+                        "mail.http_url is required when mail.provider is http".to_string(),
+                    )
+                })?;
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|e| MegaError::Other(format!("mail.http_url is not a valid URL: {e}")))?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                return Err(MegaError::Other(format!(
+                    "mail.http_url scheme must be http or https, got {}",
+                    parsed.scheme()
+                )));
+            }
+            for (name, value) in &self.http_headers {
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    MegaError::Other(format!(
+                        "mail.http_headers key '{name}' is not a valid HTTP header name: {e}"
+                    ))
+                })?;
+                reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                    MegaError::Other(format!(
+                        "mail.http_headers value for '{name}' is not a valid HTTP header value: {e}"
+                    ))
+                })?;
             }
         }
 
@@ -409,12 +634,26 @@ pub(crate) fn validate_build_config(build_config: &BuildConfig) -> Result<(), Me
 
 pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), MegaError> {
     require_non_empty("redis.url", &redis_config.url)?;
-    let url = Url::parse(&redis_config.url)
-        .map_err(|e| MegaError::Other(format!("redis.url must be a valid URL: {e}")))?;
-    match url.scheme() {
+    let trimmed = redis_config.url.trim_start();
+    if is_secret_ref_value(trimmed) {
+        let secret_ref = SecretRef::parse(trimmed)?;
+        validate_config_secret_ref("redis.url", &secret_ref, "redis/url")?;
+        return Ok(());
+    }
+    validate_redis_url_literal("redis.url", &redis_config.url)
+}
+
+/// Validate that a resolved `redis.url` value is a literal `redis://` / `rediss://`
+/// URL. This is used after a `vault://` SecretRef has been resolved so that a
+/// malformed or accidentally nested SecretRef value fails with a redacted,
+/// diagnostic error before reaching the Redis client.
+pub(crate) fn validate_redis_url_literal(field_path: &str, url: &str) -> Result<(), MegaError> {
+    let parsed = Url::parse(url)
+        .map_err(|_| MegaError::Other(format!("{field_path} must be a valid URL")))?;
+    match parsed.scheme() {
         "redis" | "rediss" => Ok(()),
-        scheme => Err(MegaError::Other(format!(
-            "redis.url scheme must be 'redis' or 'rediss', got '{scheme}'"
+        _ => Err(MegaError::Other(format!(
+            "{field_path} scheme must be 'redis' or 'rediss'"
         ))),
     }
 }
@@ -423,24 +662,7 @@ pub(crate) fn validate_mail_password_secret_ref(
     field_path: &str,
     secret_ref: &SecretRef,
 ) -> Result<(), MegaError> {
-    if is_mail_password_secret_name(secret_ref.secret_name()) {
-        return Ok(());
-    }
-
-    Err(MegaError::Other(format!(
-        "{field_path} must use a vault SecretRef under vault://secret/config/<profile>/mail/password#<field>; value is redacted"
-    )))
-}
-
-fn is_mail_password_secret_name(secret_name: &str) -> bool {
-    let Some(rest) = secret_name.strip_prefix("config/") else {
-        return false;
-    };
-    let Some(namespace) = rest.strip_suffix("/mail/password") else {
-        return false;
-    };
-
-    !namespace.is_empty()
+    validate_config_secret_ref(field_path, secret_ref, "mail/password")
 }
 
 pub(crate) fn validate_buck_config(buck_config: &BuckConfig) -> Result<(), MegaError> {
@@ -474,8 +696,16 @@ fn validate_s3_config(
     require_non_empty("object_storage.s3.bucket", &s3.bucket)?;
     require_non_empty("object_storage.s3.access_key_id", &s3.access_key_id)?;
     require_non_empty("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
-    reject_secret_ref_like_value("object_storage.s3.access_key_id", &s3.access_key_id)?;
-    reject_secret_ref_like_value("object_storage.s3.secret_access_key", &s3.secret_access_key)?;
+    validate_object_storage_secret_ref(
+        "object_storage.s3.access_key_id",
+        &s3.access_key_id,
+        "object_storage/access_key_id",
+    )?;
+    validate_object_storage_secret_ref(
+        "object_storage.s3.secret_access_key",
+        &s3.secret_access_key,
+        "object_storage/secret_access_key",
+    )?;
 
     if require_endpoint {
         require_non_empty("object_storage.s3.endpoint_url", &s3.endpoint_url)?;
@@ -485,14 +715,23 @@ fn validate_s3_config(
     Ok(())
 }
 
-fn reject_secret_ref_like_value(field_path: &str, value: &str) -> Result<(), MegaError> {
-    if value.trim_start().starts_with("vault://") {
-        return Err(MegaError::Other(format!(
-            "{field_path} cannot use monoengine vault SecretRef; keep database, Redis, and object storage credentials in deployment/environment secrets. value is redacted"
-        )));
+/// Validate that an object-storage credential field is either a literal value or
+/// a well-formed `vault://` SecretRef under the required namespace. Literal
+/// values are passed through unchanged; vault refs are validated for format and
+/// namespace so that `config validate` aligns with the runtime resolution path
+/// (`context::resolve_object_storage_secrets`).
+fn validate_object_storage_secret_ref(
+    field_path: &str,
+    value: &str,
+    suffix: &str,
+) -> Result<(), MegaError> {
+    let trimmed = value.trim_start();
+    if !trimmed.starts_with("vault://") {
+        return Ok(());
     }
 
-    Ok(())
+    let secret_ref = SecretRef::parse(trimmed)?;
+    validate_config_secret_ref(field_path, &secret_ref, suffix)
 }
 
 pub(crate) fn validate_orion_server_config(
@@ -728,13 +967,23 @@ fn known_unconsumed_file_fields_from_value(path: &Path, value: &Value) -> Vec<Fi
 pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
 
-    if value.get("oauth").is_some() {
-        warnings.push(ConfigWarning {
-            field_path: "oauth".to_string(),
-            message:
-                "[oauth] is currently ignored because OAuthConfig is not implemented; remove the section until OAuthConfig is implemented"
-                    .to_string(),
-        });
+    // `oauth.allowed_cors_origins` is now consumed by OAuthConfig; the remaining
+    // legacy keys are still ignored (no consumer yet), so warn per-key.
+    if let Some(oauth) = value.get("oauth").and_then(Value::as_table) {
+        for field in [
+            "campsite_api_domain",
+            "tinyship_api_domain",
+            "api_store_backend",
+        ] {
+            if oauth.contains_key(field) {
+                warnings.push(ConfigWarning {
+                    field_path: format!("oauth.{field}"),
+                    message: format!(
+                        "oauth.{field} is currently ignored (no consumer yet); only oauth.allowed_cors_origins is consumed"
+                    ),
+                });
+            }
+        }
     }
 
     if let Some(mail) = value.get("mail").and_then(Value::as_table) {
@@ -769,9 +1018,10 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
 /// `unknown_fields` and is applied during config loading so that typos and
 /// obsolete keys fail fast instead of being silently dropped by serde.
 ///
-/// The legacy `[oauth]` section is intentionally skipped: it is already
-/// reported as a warning by `known_unconsumed_fields` and will be addressed
-/// by implementing or removing OAuthConfig in a follow-up task.
+/// `[oauth]` is now a recognized section (`OAuthConfig`): `allowed_cors_origins`
+/// is consumed, while the legacy keys (`campsite_api_domain`,
+/// `tinyship_api_domain`, `api_store_backend`) are whitelisted-but-ignored, so
+/// the section is validated like any other rather than skipped.
 pub fn reject_unknown_fields(value: &Value) -> Result<(), MegaError> {
     let mut errors = Vec::new();
 
@@ -800,12 +1050,6 @@ fn collect_unknown_field_errors(
     };
 
     for (field, value) in table {
-        // Skip the legacy `[oauth]` section entirely; it is handled as a
-        // dedicated warning by `known_unconsumed_fields`.
-        if schema_path.is_empty() && field == "oauth" {
-            continue;
-        }
-
         let schema_field_path = join_field_path(schema_path, field);
         let display_field_path = join_field_path(display_path, field);
 
@@ -1014,7 +1258,11 @@ fn is_effective_source_field_path(field_path: &str) -> bool {
         && is_known_field_path(field_path)
         && !matches!(field_path, "mail.smtp_tls" | "mail.tls")
         && field_path != "oauth"
-        && !field_path.starts_with("oauth.")
+        // oauth.allowed_cors_origins is consumed; the legacy oauth keys are not.
+        && !matches!(
+            field_path,
+            "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
+        )
 }
 
 fn file_source_label(kind: &str, path: &Path) -> String {
@@ -1087,6 +1335,8 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.endpoint_url"
             | "mail.password"
             | "mail.password_ref"
+            | "notification.slack.webhook_url_ref"
+            | "notification.webhook.token_ref"
     )
 }
 
@@ -1124,9 +1374,12 @@ fn is_reserved_mega_env_var(variable: &str) -> bool {
 }
 
 fn environment_warning_for(variable: &str, field_path: &str) -> Option<EnvironmentConfigWarning> {
-    let message = if field_path == "oauth" || field_path.starts_with("oauth.") {
+    let message = if matches!(
+        field_path,
+        "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
+    ) {
         format!(
-            "{variable} maps to {field_path}, but [oauth] is currently ignored because OAuthConfig is not implemented; remove the variable until OAuthConfig is implemented"
+            "{variable} maps to {field_path}, which is currently ignored (no consumer yet); only oauth.allowed_cors_origins is consumed"
         )
     } else if matches!(field_path, "mail.smtp_tls" | "mail.tls") {
         format!(
@@ -1152,9 +1405,11 @@ fn environment_warning_for(variable: &str, field_path: &str) -> Option<Environme
 }
 
 fn environment_field_is_ignored(field_path: &str) -> bool {
-    field_path == "oauth"
-        || field_path.starts_with("oauth.")
-        || matches!(field_path, "mail.smtp_tls" | "mail.tls")
+    // oauth.allowed_cors_origins is consumed; only the legacy oauth keys are ignored.
+    matches!(
+        field_path,
+        "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
+    ) || matches!(field_path, "mail.smtp_tls" | "mail.tls")
 }
 
 fn is_known_field_path(field_path: &str) -> bool {
@@ -1269,6 +1524,14 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "mail",
             "notification",
             "vault",
+            "oauth",
+            "chat",
+        ]),
+        "chat" => Some(&[
+            "attachment_allowed_mime_types",
+            "open_graph_fetch_enabled",
+            "open_graph_fetch_timeout_ms",
+            "open_graph_allow_private_networks",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1364,9 +1627,27 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "smtp_tls",
             "tls",
         ]),
-        "notification" => Some(&["enabled", "default_delivery_mode", "default_locale"]),
+        "notification" => Some(&[
+            "enabled",
+            "default_delivery_mode",
+            "default_locale",
+            "slack",
+            "webhook",
+        ]),
+        "notification.slack" => Some(&["enabled", "webhook_url_ref"]),
+        "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
-        "vault.audit" => Some(&["enabled"]),
+        "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
+        // `allowed_cors_origins` is the only strongly-typed/consumed key
+        // (OAuthConfig). The remaining keys are legacy compatibility fields:
+        // whitelisted so the sample config loads, but ignored at deserialize time
+        // until a real consumer exists.
+        "oauth" => Some(&[
+            "allowed_cors_origins",
+            "campsite_api_domain",
+            "tinyship_api_domain",
+            "api_store_backend",
+        ]),
         _ => None,
     }
 }
@@ -1412,6 +1693,50 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_accepts_default_chat_config() {
+        let mut config = valid_config();
+        config.chat = Some(crate::config::ChatConfig::default());
+
+        config
+            .validate()
+            .expect("default chat config should validate");
+    }
+
+    #[test]
+    fn config_validate_accepts_chat_mime_wildcards() {
+        let mut config = valid_config();
+        config.chat = Some(crate::config::ChatConfig {
+            attachment_allowed_mime_types: vec![
+                "image/*".to_string(),
+                "application/pdf".to_string(),
+            ],
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("wildcard MIME allowlist should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_chat_mime_patterns() {
+        let mut config = valid_config();
+        config.chat = Some(crate::config::ChatConfig {
+            attachment_allowed_mime_types: vec!["*/*".to_string(), "bad".to_string()],
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("invalid MIME patterns should fail");
+
+        assert!(
+            err.to_string()
+                .contains("chat.attachment_allowed_mime_types")
+        );
+    }
+
+    #[test]
     fn config_validate_rejects_unsupported_notification_delivery_mode() {
         let mut config = valid_config();
         config.notification = Some(crate::config::NotificationConfig {
@@ -1442,6 +1767,266 @@ mod tests {
             .expect_err("empty notification locale should fail");
 
         assert!(err.to_string().contains("notification.default_locale"));
+    }
+
+    #[test]
+    fn config_validate_rejects_enabled_slack_without_webhook_url_ref() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            slack: Some(crate::config::SlackConfig {
+                enabled: true,
+                webhook_url_ref: None,
+            }),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("enabled slack without webhook_url_ref should fail");
+        assert!(
+            err.to_string()
+                .contains("notification.slack.webhook_url_ref")
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_slack_secret_ref_outside_namespace_without_leaking_ref() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            slack: Some(crate::config::SlackConfig {
+                enabled: true,
+                webhook_url_ref: Some(
+                    crate::config::secret::SecretRef::parse(
+                        "vault://secret/config/prod/mail/password#value",
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("slack secret ref outside namespace should fail");
+        let message = err.to_string();
+        assert!(message.contains("notification.slack.webhook_url_ref"));
+        assert!(message.contains("notification/slack/webhook_url"));
+        // The SecretRef value must not leak.
+        assert!(!message.contains("config/prod/mail/password"));
+    }
+
+    #[test]
+    fn config_validate_accepts_enabled_slack_with_correct_namespace() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            slack: Some(crate::config::SlackConfig {
+                enabled: true,
+                webhook_url_ref: Some(
+                    crate::config::secret::SecretRef::parse(
+                        "vault://secret/config/prod/notification/slack/webhook_url#value",
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("slack with correct namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_enabled_webhook_without_url() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            webhook: Some(crate::config::WebhookConfig {
+                enabled: true,
+                url: "   ".to_string(),
+                token_ref: None,
+            }),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("enabled webhook without url should fail");
+        assert!(err.to_string().contains("notification.webhook.url"));
+    }
+
+    #[test]
+    fn config_validate_accepts_webhook_with_token_ref_in_namespace() {
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            webhook: Some(crate::config::WebhookConfig {
+                enabled: true,
+                url: "https://hooks.example.com/notify".to_string(),
+                token_ref: Some(
+                    crate::config::secret::SecretRef::parse(
+                        "vault://secret/config/prod/notification/webhook/token#value",
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("webhook with correct namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_unsupported_vault_audit_sink() {
+        let mut config = valid_config();
+        config.vault = Some(crate::config::VaultConfig {
+            audit: crate::config::VaultAuditConfig {
+                sink: "syslog".to_string(),
+                ..Default::default()
+            },
+        });
+
+        let err = config
+            .validate()
+            .expect_err("unsupported vault audit sink should fail");
+        assert!(err.to_string().contains("vault.audit.sink"));
+    }
+
+    #[test]
+    fn config_validate_rejects_file_audit_sink_without_path() {
+        let mut config = valid_config();
+        config.vault = Some(crate::config::VaultConfig {
+            audit: crate::config::VaultAuditConfig {
+                sink: "file".to_string(),
+                file_path: None,
+                ..Default::default()
+            },
+        });
+
+        let err = config
+            .validate()
+            .expect_err("file audit sink without path should fail");
+        assert!(err.to_string().contains("vault.audit.file_path"));
+    }
+
+    #[test]
+    fn config_validate_accepts_file_audit_sink_with_path() {
+        let mut config = valid_config();
+        config.vault = Some(crate::config::VaultConfig {
+            audit: crate::config::VaultAuditConfig {
+                sink: "file".to_string(),
+                file_path: Some(std::path::PathBuf::from(
+                    "/var/log/monoengine/vault-audit.jsonl",
+                )),
+                fail_closed: true,
+                ..Default::default()
+            },
+        });
+
+        config
+            .validate()
+            .expect("file audit sink with a path should validate");
+    }
+
+    #[test]
+    fn config_validate_accepts_oauth_cors_origins() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec![
+                "http://localhost:3000".to_string(),
+                "https://app.example.com".to_string(),
+            ],
+        });
+
+        config
+            .validate()
+            .expect("valid oauth cors origins should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_whitespace() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["http://has space.example.com".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin with whitespace should fail");
+        assert!(err.to_string().contains("oauth.allowed_cors_origins"));
+    }
+
+    #[test]
+    fn config_validate_rejects_empty_oauth_origin() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["  ".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("empty oauth origin should fail");
+        assert!(err.to_string().contains("oauth.allowed_cors_origins"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_path() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["https://app.example.com/callback".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin with a path should fail");
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_non_http_scheme() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["ftp://app.example.com".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin with non-http scheme should fail");
+        assert!(err.to_string().contains("scheme"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_with_query_or_fragment() {
+        for bad in [
+            "https://app.example.com?x=1",
+            "https://app.example.com#frag",
+        ] {
+            let mut config = valid_config();
+            config.oauth = Some(crate::config::OAuthConfig {
+                allowed_cors_origins: vec![bad.to_string()],
+            });
+            let err = config
+                .validate()
+                .expect_err("oauth origin with query/fragment should fail")
+                .to_string();
+            assert!(
+                err.contains("path, query, or fragment"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_origin_without_scheme() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            allowed_cors_origins: vec!["app.example.com".to_string()],
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth origin without scheme should fail");
+        assert!(err.to_string().contains("scheme://host"));
     }
 
     #[test]
@@ -1631,6 +2216,29 @@ mod tests {
         let err = config.validate().expect_err("redis scheme should fail");
 
         assert!(err.to_string().contains("redis.url scheme"));
+    }
+
+    #[test]
+    fn config_validate_accepts_redis_url_secret_ref_in_namespace() {
+        let mut config = valid_config();
+        config.redis.url = "vault://secret/config/test/redis/url#value".to_string();
+
+        config
+            .validate()
+            .expect("redis.url secret ref in namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_redis_url_secret_ref_outside_namespace() {
+        let mut config = valid_config();
+        config.redis.url = "vault://secret/config/test/mail/password#value".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("redis.url secret ref outside redis/url namespace should fail");
+
+        assert!(err.to_string().contains("redis.url"));
+        assert!(err.to_string().contains("redis/url"));
     }
 
     #[test]
@@ -1965,7 +2573,29 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref() {
+    fn config_validate_accepts_object_storage_secret_refs_under_required_namespace() {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: "vault://secret/config/prod/object_storage/access_key_id#value"
+                    .to_string(),
+                secret_access_key:
+                    "vault://secret/config/prod/object_storage/secret_access_key#value".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        config
+            .validate()
+            .expect("object storage SecretRefs under required namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_object_storage_secret_refs_outside_required_namespace() {
         let mut config = valid_config();
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::S3,
@@ -1981,28 +2611,38 @@ mod tests {
 
         let err = config
             .validate()
-            .expect_err("object storage SecretRef-like value should fail");
+            .expect_err("object storage SecretRef outside required namespace should fail");
         let message = err.to_string();
 
         assert!(message.contains("object_storage.s3.access_key_id"));
-        assert!(message.contains("deployment/environment secrets"));
         assert!(message.contains("value is redacted"));
         assert!(!message.contains("config/prod/object-storage/access"));
         assert!(!message.contains("#value"));
+    }
 
-        config.object_storage.s3.access_key_id = "key".to_string();
-        config.object_storage.s3.secret_access_key =
-            " vault://secret/config/prod/object-storage/secret#value".to_string();
+    #[test]
+    fn config_validate_rejects_object_storage_secret_access_key_outside_required_namespace() {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: "AKIA-example".to_string(),
+                secret_access_key: "vault://secret/config/prod/mail/password#value".to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
 
         let err = config
             .validate()
-            .expect_err("object storage SecretRef-like secret key should fail");
+            .expect_err("object storage secret access key outside required namespace should fail");
         let message = err.to_string();
 
         assert!(message.contains("object_storage.s3.secret_access_key"));
-        assert!(message.contains("deployment/environment secrets"));
         assert!(message.contains("value is redacted"));
-        assert!(!message.contains("config/prod/object-storage/secret"));
+        assert!(!message.contains("config/prod/mail/password"));
         assert!(!message.contains("#value"));
     }
 
@@ -2123,11 +2763,12 @@ mod tests {
     }
 
     #[test]
-    fn known_unconsumed_fields_warns_for_oauth_and_legacy_mail_tls_keys() {
+    fn known_unconsumed_fields_warns_for_legacy_oauth_and_mail_tls_keys() {
         let value = toml::from_str::<Value>(
             r#"
             [oauth]
-            enabled = true
+            allowed_cors_origins = ["http://app.example.com"]
+            campsite_api_domain = "http://api.example.com"
 
             [mail]
             smtp_tls = false
@@ -2143,7 +2784,13 @@ mod tests {
             .map(|warning| warning.field_path.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(fields, vec!["oauth", "mail.smtp_tls", "mail.tls"]);
+        // allowed_cors_origins is now consumed (no warning); the legacy oauth key
+        // and the ignored mail TLS keys still warn.
+        assert!(fields.contains(&"oauth.campsite_api_domain"));
+        assert!(fields.contains(&"mail.smtp_tls"));
+        assert!(fields.contains(&"mail.tls"));
+        assert!(!fields.contains(&"oauth.allowed_cors_origins"));
+        assert!(!fields.contains(&"oauth"));
     }
 
     #[test]
@@ -2491,6 +3138,91 @@ mod tests {
     }
 
     #[test]
+    fn source_diagnostics_redacts_notification_secret_ref_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [notification.slack]
+            enabled = true
+            webhook_url_ref = "vault://secret/config/base/notification/slack/webhook_url#value"
+
+            [notification.webhook]
+            enabled = true
+            url = "https://hooks.example.test/webhook"
+            token_ref = "vault://secret/config/base/notification/webhook/token#value"
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [notification.slack]
+            webhook_url_ref = "vault://secret/config/prod/notification/slack/webhook_url#value"
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_NOTIFICATION__SLACK__WEBHOOK_URL_REF"],
+        )
+        .expect("diagnostics should collect");
+        let source_fields = diagnostics
+            .source_fields
+            .iter()
+            .map(|source_field| source_field.message.as_str())
+            .collect::<Vec<_>>();
+        let source_text = source_fields.join("\n");
+        let overrides = diagnostics
+            .source_overrides
+            .iter()
+            .map(|source_override| source_override.message.as_str())
+            .collect::<Vec<_>>();
+        let override_text = overrides.join("\n");
+
+        assert!(
+            source_fields.iter().any(|message| {
+                message.contains("notification.slack.webhook_url_ref")
+                    && message.contains("base file")
+            }),
+            "missing slack webhook_url_ref base field: {source_text}"
+        );
+        assert!(
+            source_fields.iter().any(|message| {
+                message.contains("notification.webhook.token_ref") && message.contains("base file")
+            }),
+            "missing webhook token_ref base field: {source_text}"
+        );
+        assert!(
+            override_text.contains("notification.slack.webhook_url_ref")
+                && override_text.contains("profile file")
+                && override_text.contains("base file"),
+            "missing slack webhook_url_ref override: {override_text}"
+        );
+        assert!(
+            source_text.contains("sensitive values are omitted"),
+            "notification SecretRef fields should be marked sensitive: {source_text}"
+        );
+        assert!(
+            !source_text.contains("vault://secret/"),
+            "source diagnostics leaked notification SecretRef URI: {source_text}"
+        );
+        assert!(
+            !source_text.contains("config/prod/notification/slack/webhook_url"),
+            "source diagnostics leaked notification vault path: {source_text}"
+        );
+        assert!(
+            !source_text.contains("config/base/notification/webhook/token"),
+            "source diagnostics leaked notification webhook token path: {source_text}"
+        );
+        assert!(!source_text.contains("#value"));
+    }
+
+    #[test]
     fn source_diagnostics_collects_array_element_field_paths() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
@@ -2555,6 +3287,79 @@ mod tests {
         }));
     }
 
+    /// Canonical "complete cross-source/profile matrix" lock-in: a single field
+    /// present in ALL THREE sources (base file, profile file, and a `MEGA_*` env
+    /// override) must be attributed in the source-field graph at every source AND
+    /// produce the full override chain (profile overrides base, env overrides
+    /// profile), with no values leaked (config.md stage 4 source diagnostics).
+    #[test]
+    fn source_diagnostics_full_cross_source_matrix_for_single_field() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let profile_path = temp_dir.path().join("config.prod.toml");
+        // Distinctive sentinel values so the no-leak assertion cannot false-match
+        // (source diagnostics read raw TOML and never validate the value).
+        std::fs::write(
+            &config_path,
+            r#"
+            [log]
+            level = "base-sentinel-value"
+            "#,
+        )
+        .expect("write base config");
+        std::fs::write(
+            &profile_path,
+            r#"
+            [log]
+            level = "profile-sentinel-value"
+            "#,
+        )
+        .expect("write profile config");
+
+        let diagnostics = collect_source_diagnostics_from_keys(
+            Some(&config_path),
+            Some(&profile_path),
+            ["MEGA_LOG__LEVEL"],
+        )
+        .expect("diagnostics should collect");
+
+        // Source-field graph: log.level attributed at base, profile, AND env.
+        let field_messages = diagnostics
+            .source_fields
+            .iter()
+            .filter(|field| field.field_path == "log.level")
+            .map(|field| field.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(field_messages.iter().any(|m| m.contains("base file")));
+        assert!(field_messages.iter().any(|m| m.contains("profile file")));
+        assert!(field_messages.iter().any(|m| m.contains("MEGA_LOG__LEVEL")));
+
+        // Override chain: profile overrides base, env overrides profile.
+        let override_messages = diagnostics
+            .source_overrides
+            .iter()
+            .filter(|over| over.field_path == "log.level")
+            .map(|over| over.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(override_messages.iter().any(|m| {
+            m.contains("profile file") && m.contains("base file") && !m.contains("environment")
+        }));
+        assert!(
+            override_messages
+                .iter()
+                .any(|m| m.contains("MEGA_LOG__LEVEL") && m.contains("profile file"))
+        );
+
+        // No raw values leak anywhere in the diagnostics.
+        let all_text = format!(
+            "{}\n{}",
+            field_messages.join("\n"),
+            override_messages.join("\n")
+        );
+        assert!(!all_text.contains("base-sentinel-value"));
+        assert!(!all_text.contains("profile-sentinel-value"));
+    }
+
     #[test]
     fn unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys() {
         let warnings = unconsumed_environment_fields_from_keys([
@@ -2567,7 +3372,10 @@ mod tests {
             "MEGA_CACHE_DIR",
             "OTHER_VAR",
             "MEGA_UNKNOWN__VALUE",
+            // Consumed now -> must NOT warn.
             "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+            // Legacy, still ignored -> warns.
+            "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
             "MEGA_MAIL__PASSWORD",
             "MEGA_MAIL__TLS",
             "MEGA_MAIL__SMTP_TLS",
@@ -2587,7 +3395,7 @@ mod tests {
                 "MEGA_MAIL__PASSWORD",
                 "MEGA_MAIL__SMTP_TLS",
                 "MEGA_MAIL__TLS",
-                "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
+                "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
                 "MEGA_UNKNOWN__VALUE",
             ]
         );
@@ -2597,10 +3405,12 @@ mod tests {
                 "mail.password",
                 "mail.smtp_tls",
                 "mail.tls",
-                "oauth.allowed_cors_origins",
+                "oauth.campsite_api_domain",
                 "unknown.value",
             ]
         );
+        // The consumed CORS origins env var produces no warning.
+        assert!(!variables.contains(&"MEGA_OAUTH__ALLOWED_CORS_ORIGINS"));
         assert!(
             warnings
                 .iter()
@@ -2614,7 +3424,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.message.contains("OAuthConfig"))
+                .any(|warning| warning.message.contains("no consumer yet"))
         );
         assert!(
             warnings
@@ -2639,7 +3449,7 @@ mod tests {
         assert!(!is_known_field_path("database.db_url.extra"));
         assert!(!is_known_field_path("database.typo"));
         assert!(!is_known_field_path("unknown.value"));
-        assert!(!is_known_field_path("oauth.allowed_cors_origins"));
+        assert!(is_known_field_path("oauth.allowed_cors_origins"));
         assert!(!is_known_field_path("notification.typo"));
     }
 
@@ -2766,8 +3576,10 @@ mod tests {
     }
 
     #[test]
-    fn reject_unknown_fields_allows_legacy_oauth_section() {
-        let value = toml::from_str::<Value>(
+    fn reject_unknown_fields_allows_known_oauth_keys_but_rejects_unknown_ones() {
+        // `[oauth]` is now a recognized section: allowed_cors_origins (consumed)
+        // plus the whitelisted legacy keys pass the strict check.
+        let ok = toml::from_str::<Value>(
             r#"
             base_dir = "/tmp"
 
@@ -2777,10 +3589,19 @@ mod tests {
             "#,
         )
         .unwrap();
+        assert!(reject_unknown_fields(&ok).is_ok());
 
-        // The legacy [oauth] section is skipped by the strict check; it remains
-        // a warning from `known_unconsumed_fields` until OAuthConfig is
-        // implemented or the section is removed.
-        assert!(reject_unknown_fields(&value).is_ok());
+        // A truly unknown key under [oauth] is a hard error now that the section
+        // is validated like any other.
+        let bad = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+
+            [oauth]
+            totally_unknown_key = "x"
+            "#,
+        )
+        .unwrap();
+        assert!(reject_unknown_fields(&bad).is_err());
     }
 }

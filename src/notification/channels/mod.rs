@@ -18,10 +18,14 @@ use crate::{common::errors::MegaError, mail::MailAttachment};
 mod console;
 mod email;
 mod inapp;
+mod slack;
+mod webhook;
 
 pub use console::ConsoleChannel;
 pub use email::{EmailChannel, MailerHandle, MailerSlot};
 pub use inapp::InAppChannel;
+pub use slack::SlackChannel;
+pub use webhook::WebhookChannel;
 
 /// Stable identifier for the SMTP/console-mailer-backed email channel.
 pub const CHANNEL_EMAIL: &str = "email";
@@ -29,6 +33,10 @@ pub const CHANNEL_EMAIL: &str = "email";
 pub const CHANNEL_IN_APP: &str = "in_app";
 /// Stable identifier for the console (dry-run) channel.
 pub const CHANNEL_CONSOLE: &str = "console";
+/// Stable identifier for the Slack incoming-webhook channel.
+pub const CHANNEL_SLACK: &str = "slack";
+/// Stable identifier for the generic outbound webhook channel.
+pub const CHANNEL_WEBHOOK: &str = "webhook";
 
 /// A channel-agnostic outbound notification message.
 ///

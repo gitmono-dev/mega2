@@ -167,24 +167,24 @@ bucket = "gitmega"
 root_dir = "${base_dir}/objects"
 
 [oauth]
-# Legacy sample only: monoengine currently has no OAuthConfig consumer.
-# `config validate` warns that this section is ignored until OAuthConfig exists.
-# Used for call api from campsite server, for example: http://api.gitmono.test:3001
-campsite_api_domain = "http://api.gitmono.test:3001"
-
-# Used for call api from tinyship server, for example: https://libra.tools
-tinyship_api_domain = "https://libra.tools"
-
-# Which auth API to use when loading users (campsite or tinyship)
-api_store_backend = "campsite"
-
-
-# allowed cors origins
+# `allowed_cors_origins` is consumed by the HTTP API's CORS layer (OAuthConfig).
+# When non-empty it is the CORS allow-list; when empty the server falls back to
+# its built-in development defaults. Also overridable via
+# MEGA_OAUTH__ALLOWED_CORS_ORIGINS as a comma-separated list. Each entry must be
+# a valid HTTP header value (no whitespace/control characters).
 allowed_cors_origins = [
     "http://local.gitmega.com",
     "https://app.gitmega.com",
     "http://app.gitmono.test",
 ]
+
+# Legacy keys kept for compatibility but NOT yet strongly-typed/consumed by
+# OAuthConfig (they are tolerated by config validation and ignored at load until
+# a real consumer exists). Used historically for the external auth API stores.
+campsite_api_domain = "http://api.gitmono.test:3001"
+tinyship_api_domain = "https://libra.tools"
+# Which auth API to use when loading users (campsite or tinyship)
+api_store_backend = "campsite"
 
 [blame]
 # Configuration for blame functionality and large file handling
@@ -335,11 +335,47 @@ default_delivery_mode = "email"
 # Default locale for rendered notifications when a user has none.
 default_locale = "en-US"
 
+# Optional Slack incoming-webhook channel (docs/notification.md phase 3). The
+# Slack webhook URL embeds a secret token in its path, so it is supplied as a
+# vault SecretRef (the URL is the credential) and resolved only after vault is
+# ready. Set the secret with: config secret set notification/slack/webhook_url
+# [notification.slack]
+# enabled = true
+# webhook_url_ref = "vault://secret/config/<profile>/notification/slack/webhook_url#value"
+
+# Optional generic outbound webhook channel (docs/notification.md phase 3). The
+# URL is operator-trusted (non-secret); an optional bearer token is a SecretRef
+# sent as `Authorization: Bearer <token>`.
+# [notification.webhook]
+# enabled = true
+# url = "https://hooks.example.com/notify"
+# token_ref = "vault://secret/config/<profile>/notification/webhook/token#value"
+
+[chat]
+# Optional product-level MIME allowlist for chat attachments. An empty list
+# accepts all syntactically valid MIME types (backwards compatible). Entries
+# may be exact types (`image/png`) or wildcards (`image/*`).
+attachment_allowed_mime_types = []
+# Whether to fetch and cache Open Graph previews for URLs seen in messages.
+open_graph_fetch_enabled = true
+# Network timeout in milliseconds for a single Open Graph fetch attempt.
+open_graph_fetch_timeout_ms = 5000
+# Allow fetches against localhost/private IPs. Keep false in production.
+open_graph_allow_private_networks = false
+
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),
-# VaultCore emits one record per secret read/write/delete to the `vault_audit`
-# tracing target with the operation, logical secret name and outcome only
-# (never the secret value). Set to false to opt out. The write-failure policy
-# is fail-open (the tracing sink is infallible, so auditing never blocks a
-# secret operation); a configurable durable/alternate sink is deferred.
+# VaultCore emits one record per secret read/write/delete with the operation,
+# logical secret name, outcome and caller only (never the secret value). Set to
+# false to opt out.
 enabled = true
+# Audit sink: "tracing" (default; the `vault_audit` tracing target, infallible)
+# or "file" (a durable append-only JSONL log, fsync'd per record, for
+# non-repudiation independent of the process log pipeline).
+sink = "tracing"
+# Required when sink = "file": the durable audit log path.
+# file_path = "/var/log/monoengine/vault-audit.jsonl"
+# When true (and sink is fallible, e.g. "file"), a failed audit-record write
+# fails the secret operation (non-repudiation over availability). Default false
+# (fail-open: a sink write failure is logged but does not block secret access).
+fail_closed = false

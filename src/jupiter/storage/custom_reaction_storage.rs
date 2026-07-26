@@ -113,4 +113,40 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().public_id, pub_id);
     }
+
+    #[tokio::test]
+    async fn test_custom_reaction_rejects_duplicate_lowercase_name() {
+        use crate::common::errors::MegaError;
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
+        let cr_storage = storage.custom_reaction_storage();
+
+        cr_storage
+            .create_custom_reaction(
+                generate_public_id(),
+                "Wave".to_string(),
+                "p1".to_string(),
+                "image/png".to_string(),
+                "alice".to_string(),
+            )
+            .await
+            .expect("first create should succeed");
+
+        let err = cr_storage
+            .create_custom_reaction(
+                generate_public_id(),
+                "wave".to_string(),
+                "p2".to_string(),
+                "image/png".to_string(),
+                "alice".to_string(),
+            )
+            .await
+            .expect_err("duplicate lower(name) should be rejected");
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            matches!(&err, MegaError::Db(_)) || msg.contains("unique") || msg.contains("duplicate"),
+            "expected unique-constraint error, got: {err}"
+        );
+    }
 }

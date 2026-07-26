@@ -23,7 +23,7 @@ use git_internal::{
         pack::{Pack, entry::Entry},
     },
 };
-use orbit_api::object_storage::MultiObjectByteStream;
+use orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 use sysinfo::System;
 use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 use tokio_stream::wrappers::ReceiverStream;
@@ -220,6 +220,42 @@ pub trait RepoHandler: Send + Sync + 'static {
         have: Vec<String>,
     ) -> Result<ReceiverStream<Vec<u8>>, GitError>;
 
+    async fn shallow_pack(
+        &self,
+        want: Vec<String>,
+        _depth: u32,
+        _deepen_relative: bool,
+    ) -> Result<(ReceiverStream<Vec<u8>>, Vec<String>), GitError> {
+        let stream = self.full_pack(want).await?;
+        Ok((stream, Vec::new()))
+    }
+
+    /// Whether this handler implements depth-limited (`deepen`) shallow fetch.
+    /// The default trait `shallow_pack` silently falls back to `full_pack`,
+    /// so the default here is `false`. Handlers that provide a real shallow
+    /// traversal must override both this and `shallow_pack`.
+    fn supports_shallow_fetch(&self) -> bool {
+        false
+    }
+
+    async fn filtered_pack(
+        &self,
+        want: Vec<String>,
+        have: Vec<String>,
+        _filter_spec: &str,
+    ) -> Result<ReceiverStream<Vec<u8>>, GitError> {
+        self.incremental_pack(want, have).await
+    }
+
+    /// Whether this handler implements `filter` partial clone (e.g. `blob:none`).
+    /// The default trait `filtered_pack` silently falls back to
+    /// `incremental_pack`, so the default here is `false`. Handlers that
+    /// provide real filter semantics must override both this and
+    /// `filtered_pack`.
+    fn supports_filtered_fetch(&self) -> bool {
+        false
+    }
+
     async fn get_trees_by_hashes(&self, hashes: Vec<String>) -> Result<Vec<Tree>, MegaError>;
 
     async fn get_blobs_by_hashes(
@@ -289,7 +325,7 @@ pub trait RepoHandler: Send + Sync + 'static {
         exist_objs: &HashSet<String>,
         counted_obj: &mut HashSet<String>,
         obj_num: &AtomicUsize,
-    ) {
+    ) -> Result<(), MegaError> {
         let mut search_tree_ids = vec![];
         let mut search_blob_ids = vec![];
         for item in &tree.tree_items {
@@ -303,12 +339,13 @@ pub trait RepoHandler: Send + Sync + 'static {
             }
         }
         obj_num.fetch_add(search_blob_ids.len(), Ordering::SeqCst);
-        let trees = self.get_trees_by_hashes(search_tree_ids).await.unwrap();
+        let trees = self.get_trees_by_hashes(search_tree_ids).await?;
         for t in trees {
             self.traverse_for_count(t, exist_objs, counted_obj, obj_num)
-                .await;
+                .await?;
         }
         obj_num.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Traverse a tree structure asynchronously.
@@ -374,7 +411,7 @@ pub trait RepoHandler: Send + Sync + 'static {
                             meta: ext_data.to_owned(),
                         })
                         .await
-                        .unwrap();
+                        .map_err(|e| IoOrbitError::Other(format!("pack entry send failed: {e}")))?;
 
                     Ok(())
                 })
@@ -393,10 +430,70 @@ pub trait RepoHandler: Send + Sync + 'static {
                     meta: EntryMeta::new(),
                 })
                 .await
-                .unwrap();
+                .map_err(|e| MegaError::Other(format!("pack tree entry send failed: {e}")))?;
         }
         Ok(())
     }
 
     async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError>;
+
+    async fn traverse_trees_only(
+        &self,
+        tree: Tree,
+        exist_objs: &mut HashSet<String>,
+        sender: Option<&tokio::sync::mpsc::Sender<MetaAttached<Entry, EntryMeta>>>,
+    ) -> Result<(), MegaError> {
+        let mut search_tree_ids = vec![];
+
+        for item in &tree.tree_items {
+            let hash = item.id.to_string();
+            if exist_objs.insert(hash.clone()) && item.mode == TreeItemMode::Tree {
+                search_tree_ids.push(hash);
+            }
+        }
+
+        let trees = self.get_trees_by_hashes(search_tree_ids).await?;
+        for t in trees {
+            self.traverse_trees_only(t, exist_objs, sender).await?;
+        }
+
+        if let Some(sender) = sender {
+            sender
+                .send(MetaAttached {
+                    inner: tree.into(),
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| MegaError::Other(format!("pack tree entry send failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn traverse_trees_only_for_count(
+        &self,
+        tree: Tree,
+        exist_objs: &HashSet<String>,
+        counted_obj: &mut HashSet<String>,
+        obj_num: &AtomicUsize,
+    ) -> Result<(), MegaError> {
+        let mut search_tree_ids = vec![];
+
+        for item in &tree.tree_items {
+            let hash = item.id.to_string();
+            if !exist_objs.contains(&hash)
+                && counted_obj.insert(hash.clone())
+                && item.mode == TreeItemMode::Tree
+            {
+                search_tree_ids.push(hash);
+            }
+        }
+
+        let trees = self.get_trees_by_hashes(search_tree_ids).await?;
+        for t in trees {
+            self.traverse_trees_only_for_count(t, exist_objs, counted_obj, obj_num)
+                .await?;
+        }
+        obj_num.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }

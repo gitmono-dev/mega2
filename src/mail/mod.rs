@@ -14,7 +14,7 @@
 //! Current status (see docs/mail.md for the full analysis and phased plan):
 //! - MailConfig lives in `crate::config` (will co-evolve with the config
 //!   module split).
-//! - SMTP, console and Noop are implemented.
+//! - SMTP, console, HTTP and Noop are implemented.
 //! - The background EmailDispatcher (in `crate::notification`) processes the
 //!   `email_jobs` outbox table using a `NotificationStorage`.
 //! - Triggers (e.g. on_cl_comment_created) enqueue jobs respecting user
@@ -41,7 +41,9 @@ use crate::{
     config::{MailConfig, MailProvider},
 };
 
+pub mod http;
 pub mod template;
+pub mod testing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailAttachment {
@@ -386,6 +388,7 @@ pub fn mailer_from_config(
             Ok(Arc::new(SmtpMailer::new_with_password(cfg, password)?))
         }
         MailProvider::Console => Ok(Arc::new(ConsoleMailer::new(cfg))),
+        MailProvider::Http => Ok(Arc::new(http::HttpMailer::new(cfg)?)),
     }
 }
 

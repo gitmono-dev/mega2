@@ -52,7 +52,17 @@ pub async fn build_object_storage(
                 .to_string(),
         )
     })?;
-    provider.build(cfg).await
+    provider.build(cfg).await.map_err(|e| {
+        let redacted = crate::config::redaction::global_redactor().redact(&e.to_string());
+        tracing::warn!(
+            endpoint = %crate::config::redaction::redact_object_storage_endpoint(
+                &cfg.s3.endpoint_url
+            ),
+            access_key = %crate::config::redaction::redact_secret_value(&cfg.s3.access_key_id),
+            "object storage build failed"
+        );
+        MegaError::Other(format!("object storage build failed: {redacted}"))
+    })
 }
 
 #[derive(Default)]

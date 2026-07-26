@@ -18,6 +18,12 @@ const SECRET_REF_PREFIX: &str = "vault://secret/";
 const REDACTED_SECRET: &str = "***";
 const REDACTED_SECRET_REF: &str = "vault://secret/***#***";
 
+/// True if `value` is a `vault://` SecretRef URI (after trimming leading
+/// whitespace) rather than a literal credential.
+pub(crate) fn is_secret_ref_value(value: &str) -> bool {
+    value.trim_start().starts_with("vault://")
+}
+
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct SecretString(String);
 

@@ -8,8 +8,9 @@
 
 ## Highlights
 
-- **Single Rust 2024 binary** — one `cargo build`, one `monoengine` executable,
-  no auxiliary services required to boot the API.
+- **Cargo workspace** — `monoengine-core` (lib, depends only on `orbit-api`)
+  + `monoengine` (thin binary, injects the `orbit` implementation crate);
+  `cargo build -p monoengine` produces the `monoengine` executable.
 - **Git hosting** — HTTP(S) and SSH Git transport (`receive-pack` / `upload-pack`),
   smart‑HTTP discovery, and Git‑LFS (basic, multipart, optional SSH transport).
 - **Monorepo semantics** — first‑class concept of an "import dir" (multi‑branch,
@@ -80,8 +81,11 @@ The full dependency list lives in `Cargo.toml`.
 ### Build
 
 ```bash
-# Debug build of the single binary
+# Debug build (workspace default = monoengine-core lib only)
 cargo build
+
+# Build the monoengine binary explicitly
+cargo build -p monoengine
 
 # Build including tests (must stay at 0 warnings / 0 errors — see AGENTS.md)
 cargo build --tests
@@ -127,7 +131,7 @@ Key sections (see `config/config.toml` for the full list):
 | `[pack]`           | Pack decode memory/disk budget and cache path                           |
 | `[lfs]`            | LFS HTTP/SSH endpoints and local storage path                           |
 | `[object_storage]` | `local` / `s3` / `s3compatible` / `gcs` backends                        |
-| `[oauth]`          | Legacy sample only; currently ignored until `OAuthConfig` exists        |
+| `[oauth]`          | CORS allow-list (`allowed_cors_origins`); consumed by the HTTP API's `CorsLayer` |
 | `[redis]`          | Connection URL                                                          |
 | `[build]`          | Orion build server URL and trigger preheat depth                        |
 | `[buck]`           | Buck upload session limits, cleanup schedule, and concurrency caps       |
@@ -135,24 +139,29 @@ Key sections (see `config/config.toml` for the full list):
 | `[mail]`           | SMTP settings, `password_ref`, dispatcher limits and retry policy         |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
-`mail.password_ref` is currently the only config-backed monoengine Vault
-SecretRef. It must use `vault://secret/config/<profile>/mail/password#<field>`;
-database, Redis, and object storage credentials remain deployment/env secrets.
-`config validate` rejects SecretRef-like `object_storage.s3.access_key_id` and
-`object_storage.s3.secret_access_key` values instead of treating them as
-monoengine Vault-managed credentials.
+`mail.password_ref` is the first config-backed monoengine Vault SecretRef.
+It must use `vault://secret/config/<profile>/mail/password#<field>`.
+Redis URL (`redis.url`), object storage S3 credentials
+(`object_storage.s3.access_key_id` / `secret_access_key`), and notification
+channel credentials (`notification.slack.webhook_url_ref`,
+`notification.webhook.token_ref`) also support `vault://` SecretRefs, each
+with its own required namespace. Database credentials remain
+deployment/env secrets (they are consumed before the vault is ready).
+`config validate` and `config secret set/check` enforce the correct
+namespace for each supported field; `config validate --resolve-secrets`
+resolves all supported SecretRefs through the minimal DB/Vault bootstrap.
 
 ### Run
 
 ```bash
 # Start the HTTP server
-cargo run -- --config config/config.toml service http --host 0.0.0.0 -p 9000
+cargo run -p monoengine -- --config config/config.toml service http --host 0.0.0.0 -p 9000
 
 # Start the SSH Git server
-cargo run -- --config config/config.toml service ssh
+cargo run -p monoengine -- --config config/config.toml service ssh
 
 # Start multiple services in the same process (HTTP is mandatory)
-cargo run -- --config config/config.toml service multi http ssh
+cargo run -p monoengine -- --config config/config.toml service multi http ssh
 ```
 
 On first boot against an empty database the embedded `sea-orm-migration`
@@ -176,9 +185,9 @@ monoengine [--config <file>] [--profile <name>] <SUBCOMMAND>
 CLI options come from `clap` derive types and respect `--help` at every level:
 
 ```bash
-cargo run -- --help
-cargo run -- service --help
-cargo run -- service http --help
+cargo run -p monoengine -- --help
+cargo run -p monoengine -- service --help
+cargo run -p monoengine -- service http --help
 ```
 
 ---
@@ -186,17 +195,21 @@ cargo run -- service http --help
 ## Project Layout
 
 ```
-Cargo.toml                # binary crate manifest; depends on sibling ../orbit/api
+Cargo.toml                # workspace root + monoengine-core lib manifest
+bin/                      # thin composition-root binary crate (monoengine)
+├── Cargo.toml            # binary manifest; depends on monoengine-core + orbit
+├── src/main.rs           # binary entry; registers ObjectStorageProvider
+└── tests/                # black-box integration tests (integration_vault.rs)
 config/config.toml        # default runtime config (TOML)
 rustfmt.toml              # nightly-only formatter options
 src/
-├── main.rs               # entry; declares all top-level modules + allocator
+├── lib.rs                # library entry; declares all top-level modules
 ├── cli.rs                # clap parsing, log init, ctrlc handler
 ├── commands/             # subcommand registry (service / http / ssh / multi)
-├── common/               # config loader, error types (MegaError/MegaResult), utils
+├── common/               # error types (MegaError/MegaResult), utils
+├── config/               # config module: model / loader / SecretRef / reload
 ├── context/              # AppContext: shared state (DB, storages, services)
 ├── api/                  # axum HTTP API surface (routes / handlers)
-├── config/               # config module: model / loader / SecretRef / reload
 ├── server/               # HTTP / SSH server bootstrap
 ├── callisto/             # sea-orm entity models (one file per table)
 ├── jupiter/              # storage / service / migration / redis / utils
@@ -223,12 +236,16 @@ test/project/             # fixture data for integration tests
 target/                   # build artifacts (gitignored)
 ```
 
-`pub use crate::callisto::*;` is re‑exported from `main.rs`; when importing
+`pub use crate::callisto::*;` is re‑exported from `lib.rs`; when importing
 entities elsewhere, prefer the explicit `crate::callisto::<table>` path.
-Object storage public types remain available from `orbit_api::*`; monoengine's
-storage layer builds the concrete backend through
-`crate::jupiter::storage::object_storage::ObjectStorageFactory`, backed by the
-sibling `../orbit` implementation crate.
+Object storage public types remain available from `orbit_api::*`; the
+`monoengine-core` library only depends on `orbit-api` (no heavy
+`object_store` / cloud SDKs). The concrete backend is injected at the
+composition root: `bin/src/main.rs` registers an `OrbitObjectStorageProvider`
+that calls `orbit::factory::ObjectStorageFactory::build`, and
+`AppContext::new` resolves `vault://` SecretRefs for S3 credentials after
+the DB-only vault bootstrap, then constructs the object store and injects
+it into `Storage::new_with_connection`.
 
 ---
 
@@ -312,7 +329,8 @@ cargo test --test <name>
   response to CL events; `notification::dispatcher::EmailDispatcher` polls
   that queue on a 2s tick, claims jobs atomically, loads persisted
   `email_job_attachments`, and hands them to the
-  `Mailer` trait (`email::SmtpMailer` or `email::NoopMailer`). Config reload
+  `Mailer` trait (`mail::SmtpMailer`, `mail::ConsoleMailer`, `mail::http::HttpMailer`, or
+  `mail::NoopMailer`). Config reload
   can disable a running dispatcher via `mail.enabled = false` and hot-reload
   dispatcher batch/concurrency limits plus retry policy; re-enabling mail or
   changing SMTP settings still requires restart. Mail templates have built-in

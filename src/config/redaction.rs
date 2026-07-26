@@ -8,9 +8,12 @@ const REDACTED: &str = "***";
 /// log/error payload unconditionally (vault.md log-redaction tooling). The
 /// default [`UrlRedactor`] strips URL userinfo, which covers the connection
 /// strings (DB/Redis/object storage) and provider errors that most commonly
-/// embed credentials. Secret *values* themselves are handled by `SecretRef` /
-/// `SecretString`, which self-redact, so no value-masking redactor is needed
-/// here.
+/// embed credentials. Secret *values* held in `SecretString` self-redact via
+/// their `Debug`/`Serialize` impls; `SecretRef` redacts via `Debug`/`Display`
+/// but serializes its URI for config round-trip. Raw credential values that
+/// must appear in diagnostics (e.g. an S3 access key id logged on a build
+/// failure) are masked by the standalone [`redact_secret_value`] helper rather
+/// than by this trait.
 pub trait Redactor: Send + Sync {
     fn redact(&self, input: &str) -> String;
 }
@@ -39,6 +42,23 @@ pub fn redact_db_url(input: &str) -> String {
 /// Redact a Redis connection URL (alias of [`redact_url`] for call-site clarity).
 pub fn redact_redis_url(input: &str) -> String {
     redact_url(input)
+}
+
+pub fn redact_object_storage_endpoint(input: &str) -> String {
+    redact_url(input)
+}
+
+pub fn redact_secret_value(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.chars().count() <= 4 {
+        return REDACTED.to_string();
+    }
+    let prefix_end = trimmed
+        .char_indices()
+        .nth(4)
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    format!("{}{}", &trimmed[..prefix_end], REDACTED)
 }
 
 pub fn redact_url(input: &str) -> String {
@@ -127,5 +147,32 @@ mod tests {
     fn global_redactor_strips_userinfo() {
         let redacted = global_redactor().redact("postgres://mono:pw@localhost/mono");
         assert_eq!(redacted, "postgres://***:***@localhost/mono");
+    }
+
+    #[test]
+    fn object_storage_endpoint_alias_strips_userinfo() {
+        let redacted = redact_object_storage_endpoint("https://key:secret@s3.example.com:9000");
+        assert_eq!(redacted, "https://***:***@s3.example.com:9000/");
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn redact_secret_value_keeps_short_prefix() {
+        assert_eq!(redact_secret_value("AKIAIOSFODNN7EXAMPLE"), "AKIA***");
+        assert!(!redact_secret_value("AKIAIOSFODNN7EXAMPLE").contains("EXAMPLE"));
+    }
+
+    #[test]
+    fn redact_secret_value_masks_short_inputs_fully() {
+        assert_eq!(redact_secret_value("pw"), REDACTED);
+        assert_eq!(redact_secret_value("abcd"), REDACTED);
+        assert_eq!(redact_secret_value(""), REDACTED);
+        assert_eq!(redact_secret_value("  ab  "), REDACTED);
+    }
+
+    #[test]
+    fn redact_secret_value_counts_chars_not_bytes_for_non_ascii() {
+        assert_eq!(redact_secret_value("你好"), REDACTED);
+        assert_eq!(redact_secret_value("你好世界xyz"), "你好世界***");
     }
 }

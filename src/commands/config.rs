@@ -14,16 +14,69 @@ use crate::{
     common::errors::{MegaError, MegaResult},
     config::{
         Config,
-        secret::{SecretRef, SecretResolver, VaultSecretResolver},
+        secret::{SecretRef, SecretResolver, VaultSecretResolver, is_secret_ref_value},
         template::config_init_template,
         validate::{
-            ConfigSourceDiagnostics, collect_source_diagnostics, validate_mail_password_secret_ref,
+            ConfigSourceDiagnostics, collect_source_diagnostics, validate_config_secret_ref,
+            validate_redis_url_literal,
         },
     },
-    contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface},
+    contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface, with_audit_caller},
 };
 
 const MAIL_PASSWORD_FIELD: &str = "mail.password";
+
+/// Config-managed secret fields that may be stored in the monoengine vault, with
+/// the vault namespace suffix each must use (`config/<profile>/<suffix>`). Only
+/// these fields are accepted by `config secret set/check/rotate/ref`. Database
+/// credentials remain intentionally excluded — they are a bootstrap dependency
+/// that must stay in deployment/environment secrets. Redis URLs and
+/// object-storage S3 credentials may now be vault-backed and are resolved
+/// post-vault bootstrap.
+const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
+    (MAIL_PASSWORD_FIELD, "mail/password"),
+    (
+        "notification.slack.webhook_url",
+        "notification/slack/webhook_url",
+    ),
+    ("notification.webhook.token", "notification/webhook/token"),
+    ("redis.url", "redis/url"),
+    (
+        "object_storage.s3.access_key_id",
+        "object_storage/access_key_id",
+    ),
+    (
+        "object_storage.s3.secret_access_key",
+        "object_storage/secret_access_key",
+    ),
+];
+
+/// Look up the required vault namespace suffix for a supported secret field.
+fn supported_secret_suffix(name: &str) -> Option<&'static str> {
+    SUPPORTED_SECRET_FIELDS
+        .iter()
+        .find(|(field, _)| *field == name)
+        .map(|(_, suffix)| *suffix)
+}
+
+/// Validate that `secret_ref` uses the namespace required for the named field.
+fn validate_secret_field_ref(name: &str, secret_ref: &SecretRef) -> Result<(), MegaError> {
+    match supported_secret_suffix(name) {
+        Some(suffix) => validate_config_secret_ref(name, secret_ref, suffix),
+        None => Err(unsupported_secret_field_error(name)),
+    }
+}
+
+fn unsupported_secret_field_error(name: &str) -> MegaError {
+    let supported = SUPPORTED_SECRET_FIELDS
+        .iter()
+        .map(|(field, _)| *field)
+        .collect::<Vec<_>>()
+        .join(", ");
+    MegaError::Other(format!(
+        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database credentials must stay in deployment/environment secrets."
+    ))
+}
 
 pub fn cli() -> Command {
     Command::new("config")
@@ -41,7 +94,10 @@ pub fn cli() -> Command {
             Command::new("vault")
                 .about("Manage the monoengine vault")
                 .subcommand_required(true)
-                .subcommand(vault_reset_cli()),
+                .subcommand(vault_reset_cli())
+                .subcommand(vault_rekey_cli())
+                .subcommand(vault_backup_cli())
+                .subcommand(vault_restore_cli()),
         )
         .subcommand(
             Command::new("init")
@@ -157,11 +213,77 @@ fn vault_reset_cli() -> Command {
         )
 }
 
+fn vault_rekey_cli() -> Command {
+    Command::new("rekey")
+        .about("Regenerate and persist a fresh unseal share set for the current vault key")
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm this operation (required)"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
+fn vault_backup_cli() -> Command {
+    Command::new("backup")
+        .about("Back up the vault core key file to a safe location")
+        .arg(
+            Arg::new("destination")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Destination file or directory for the backed-up core key"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
+fn vault_restore_cli() -> Command {
+    Command::new("restore")
+        .about("Restore the vault core key file from a backup and verify it unlocks the vault")
+        .arg(
+            Arg::new("source")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Backup core key file to restore"),
+        )
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm overwriting an existing core_key.json (required)"),
+        )
+        .arg(
+            Arg::new("key-path")
+                .long("key-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Path to core_key.json; defaults to the standard vault data directory"),
+        )
+}
+
 fn secret_name_arg() -> Arg {
     Arg::new("name")
         .value_name("CONFIG_FIELD")
         .required(true)
-        .help("Supported config secret field, currently mail.password")
+        .help(
+            "Supported config secret field: mail.password, redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
+        )
 }
 
 fn vault_path_arg() -> Arg {
@@ -235,6 +357,14 @@ fn exec_init(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         output_path.display()
     );
     println!(
+        "  printf '%s' \"$S3_ACCESS_KEY\" | monoengine --config {} config secret set object_storage.s3.access_key_id --vault-path config/prod/object_storage/access_key_id --field value --value-stdin",
+        output_path.display()
+    );
+    println!(
+        "  printf '%s' \"$S3_SECRET_KEY\" | monoengine --config {} config secret set object_storage.s3.secret_access_key --vault-path config/prod/object_storage/secret_access_key --field value --value-stdin",
+        output_path.display()
+    );
+    println!(
         "  monoengine --config {} config validate --resolve-secrets",
         output_path.display()
     );
@@ -273,6 +403,9 @@ fn write_init_config(output_path: &Path, force: bool) -> Result<(), MegaError> {
 async fn exec_vault(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
         Some(("reset", reset_args)) => exec_vault_reset(ctx, reset_args).await,
+        Some(("rekey", rekey_args)) => exec_vault_rekey(ctx, rekey_args).await,
+        Some(("backup", backup_args)) => exec_vault_backup(ctx, backup_args).await,
+        Some(("restore", restore_args)) => exec_vault_restore(ctx, restore_args).await,
         Some((cmd, _)) => Err(MegaError::Other(format!(
             "Unknown config vault subcommand: {cmd}"
         ))),
@@ -316,6 +449,116 @@ async fn exec_vault_reset(ctx: CommandContext, args: &ArgMatches) -> MegaResult 
     Ok(())
 }
 
+async fn exec_vault_rekey(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    if !args.get_flag("force") {
+        return Err(MegaError::Other(
+            "config vault rekey regenerates unseal shares; pass --force to confirm".to_string(),
+        ));
+    }
+
+    let config_path = require_config_path(&ctx, "config vault rekey")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    let config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let vault = VaultCore::from_database_config(&config.database, key_path.clone())
+        .await
+        .map_err(MegaError::from)?;
+    vault
+        .rekey_unseal_shares(&key_path)
+        .await
+        .map_err(MegaError::from)?;
+
+    println!(
+        "vault rekey complete; fresh unseal shares written to {}",
+        key_path.display()
+    );
+    // The vendored libvault primitive re-splits the current KEK; it does not
+    // rotate the encryption key, so previously exported share sets for this key
+    // still unseal the vault. Be explicit so operators do not assume the old
+    // shares were invalidated.
+    println!(
+        "note: this re-splits the current encryption key; previously exported share sets for this key still unseal the vault. A full KEK rotation is required to invalidate old shares."
+    );
+    Ok(())
+}
+
+async fn exec_vault_backup(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    let config_path = require_config_path(&ctx, "config vault backup")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let destination = args
+        .get_one::<PathBuf>("destination")
+        .cloned()
+        .expect("destination is required");
+
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    // Loading config lets us validate the path/profile even though backup only
+    // needs the key file on disk.
+    let _config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let backup_path = VaultCore::backup_key(&key_path, &destination).map_err(MegaError::from)?;
+    println!(
+        "vault core key backed up to {} (metadata at {}.meta.json)",
+        backup_path.display(),
+        backup_path.display()
+    );
+    Ok(())
+}
+
+async fn exec_vault_restore(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
+    if !args.get_flag("force") {
+        return Err(MegaError::Other(
+            "config vault restore overwrites core_key.json; pass --force to confirm".to_string(),
+        ));
+    }
+
+    let config_path = require_config_path(&ctx, "config vault restore")?;
+    let config_profile_path = ctx.config_profile_path.as_deref();
+    let key_path = args
+        .get_one::<PathBuf>("key-path")
+        .cloned()
+        .unwrap_or_else(VaultCore::default_key_path);
+    let source = args
+        .get_one::<PathBuf>("source")
+        .cloned()
+        .expect("source is required");
+
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        MegaError::Other(format!(
+            "Config path contains invalid UTF-8: {:?}",
+            config_path
+        ))
+    })?;
+    let config = Config::load_vault_bootstrap_with_profile(config_path_str, config_profile_path)?;
+
+    let restored_path = VaultCore::restore_key(&source, &key_path, &config.database)
+        .await
+        .map_err(MegaError::from)?;
+    println!(
+        "vault core key restored to {}; the backup successfully unlocked the vault",
+        restored_path.display()
+    );
+    Ok(())
+}
+
 async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     match args.subcommand() {
         Some(("ref", ref_args)) => {
@@ -334,9 +577,11 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let mut data = Map::new();
             data.insert(secret_ref.field().to_string(), Value::String(value));
-            vault
-                .write_secret(secret_ref.secret_name(), Some(data))
-                .await?;
+            with_audit_caller(
+                "cli:config-secret-set",
+                vault.write_secret(secret_ref.secret_name(), Some(data)),
+            )
+            .await?;
 
             println!("stored {}", secret_ref.as_uri());
             Ok(())
@@ -352,9 +597,11 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let mut data = Map::new();
             data.insert(secret_ref.field().to_string(), Value::String(value));
-            vault
-                .write_secret(secret_ref.secret_name(), Some(data))
-                .await?;
+            with_audit_caller(
+                "cli:config-secret-rotate",
+                vault.write_secret(secret_ref.secret_name(), Some(data)),
+            )
+            .await?;
 
             println!("rotated {}", secret_ref.as_uri());
             // The mailer resolves mail.password_ref once at AppContext startup, so a
@@ -371,7 +618,7 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             ensure_supported_secret_field(name)?;
             let secret_ref = if let Some(value) = check_args.get_one::<String>("ref") {
                 let secret_ref = SecretRef::parse(value)?;
-                validate_mail_password_secret_ref(name, &secret_ref)?;
+                validate_secret_field_ref(name, &secret_ref)?;
                 secret_ref
             } else {
                 secret_ref_from_args(check_args)?
@@ -379,7 +626,11 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
             let vault = bootstrap_vault_from_path(&config_path, config_profile_path).await?;
             let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
-            resolver.resolve(&secret_ref).await?;
+            let resolved =
+                with_audit_caller("cli:config-secret-check", resolver.resolve(&secret_ref)).await?;
+            if name == "redis.url" {
+                validate_redis_url_literal("redis.url", &resolved)?;
+            }
 
             println!("ok {}", secret_ref.as_uri());
             Ok(())
@@ -465,7 +716,47 @@ where
     if let Some(mail_cfg) = &config.mail
         && let Some(secret_ref) = &mail_cfg.password_ref
     {
-        resolver.resolve(secret_ref).await?;
+        with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
+    }
+
+    if let Some(notification_cfg) = &config.notification {
+        if let Some(slack) = &notification_cfg.slack
+            && slack.enabled
+            && let Some(secret_ref) = &slack.webhook_url_ref
+        {
+            with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
+        }
+        if let Some(webhook) = &notification_cfg.webhook
+            && webhook.enabled
+            && let Some(secret_ref) = &webhook.token_ref
+        {
+            with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
+        }
+    }
+
+    let redis_url_trimmed = config.redis.url.trim_start();
+    if is_secret_ref_value(redis_url_trimmed) {
+        let secret_ref = SecretRef::parse(redis_url_trimmed)?;
+        let resolved =
+            with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        validate_redis_url_literal("redis.url", &resolved)?;
+    }
+
+    if matches!(
+        config.object_storage.storage_type,
+        orbit_api::factory::ObjectStorageBackend::S3
+            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+    ) {
+        let access_key_id_trimmed = config.object_storage.s3.access_key_id.trim_start();
+        if is_secret_ref_value(access_key_id_trimmed) {
+            let secret_ref = SecretRef::parse(access_key_id_trimmed)?;
+            with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        }
+        let secret_access_key_trimmed = config.object_storage.s3.secret_access_key.trim_start();
+        if is_secret_ref_value(secret_access_key_trimmed) {
+            let secret_ref = SecretRef::parse(secret_access_key_trimmed)?;
+            with_audit_caller("cli:config-validate", resolver.resolve(&secret_ref)).await?;
+        }
     }
 
     Ok(())
@@ -508,7 +799,7 @@ fn secret_ref_from_args(args: &ArgMatches) -> Result<SecretRef, MegaError> {
     let field = required_string_arg(args, "field")?;
 
     let secret_ref = SecretRef::from_parts(vault_path, field)?;
-    validate_mail_password_secret_ref(name, &secret_ref)?;
+    validate_secret_field_ref(name, &secret_ref)?;
     Ok(secret_ref)
 }
 
@@ -521,13 +812,11 @@ fn required_string_arg<'a>(args: &'a ArgMatches, name: &str) -> Result<&'a Strin
 }
 
 fn ensure_supported_secret_field(name: &str) -> Result<(), MegaError> {
-    if name == MAIL_PASSWORD_FIELD {
+    if supported_secret_suffix(name).is_some() {
         return Ok(());
     }
 
-    Err(MegaError::Other(format!(
-        "{name} cannot be stored in monoengine vault; only {MAIL_PASSWORD_FIELD} is currently supported. Database, Redis, and object storage credentials must stay in deployment/environment secrets."
-    )))
+    Err(unsupported_secret_field_error(name))
 }
 
 fn read_secret_value_from_stdin() -> Result<String, MegaError> {
@@ -550,6 +839,8 @@ fn read_secret_value_from_stdin() -> Result<String, MegaError> {
 
 #[cfg(test)]
 mod tests {
+    use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config};
+
     use super::*;
     use crate::config::{
         MailConfig,
@@ -628,6 +919,105 @@ mod tests {
     }
 
     #[test]
+    fn config_vault_rekey_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "rekey", "--force"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_rekey_requires_force() {
+        // `--force` is a required flag, so omitting it must fail to parse.
+        let err = cli()
+            .try_get_matches_from(["config", "vault", "rekey"])
+            .expect_err("rekey without --force should not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn config_vault_rekey_accepts_key_path() {
+        let matches = cli()
+            .try_get_matches_from([
+                "config",
+                "vault",
+                "rekey",
+                "--force",
+                "--key-path",
+                "/tmp/core_key.json",
+            ])
+            .unwrap();
+        let Some(("vault", vault_args)) = matches.subcommand() else {
+            panic!("vault subcommand should parse");
+        };
+        let Some(("rekey", rekey_args)) = vault_args.subcommand() else {
+            panic!("rekey subcommand should parse");
+        };
+
+        assert!(rekey_args.get_flag("force"));
+        assert_eq!(
+            rekey_args.get_one::<PathBuf>("key-path"),
+            Some(&PathBuf::from("/tmp/core_key.json"))
+        );
+    }
+
+    #[test]
+    fn config_vault_backup_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "backup", "/tmp/vault-backup"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_backup_accepts_key_path() {
+        let matches = cli()
+            .try_get_matches_from([
+                "config",
+                "vault",
+                "backup",
+                "/tmp/vault-backup",
+                "--key-path",
+                "/tmp/core_key.json",
+            ])
+            .unwrap();
+        let Some(("vault", vault_args)) = matches.subcommand() else {
+            panic!("vault subcommand should parse");
+        };
+        let Some(("backup", backup_args)) = vault_args.subcommand() else {
+            panic!("backup subcommand should parse");
+        };
+
+        assert_eq!(
+            backup_args.get_one::<PathBuf>("destination"),
+            Some(&PathBuf::from("/tmp/vault-backup"))
+        );
+        assert_eq!(
+            backup_args.get_one::<PathBuf>("key-path"),
+            Some(&PathBuf::from("/tmp/core_key.json"))
+        );
+    }
+
+    #[test]
+    fn config_vault_restore_uses_vault_bootstrap_load_mode() {
+        let matches = cli()
+            .try_get_matches_from(["config", "vault", "restore", "/tmp/vault-backup", "--force"])
+            .unwrap();
+
+        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
+    }
+
+    #[test]
+    fn config_vault_restore_requires_force() {
+        let err = cli()
+            .try_get_matches_from(["config", "vault", "restore", "/tmp/vault-backup"])
+            .expect_err("restore without --force should not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn config_secret_rotate_rejects_unsupported_field() {
         let matches = secret_rotate_cli()
             .try_get_matches_from([
@@ -640,7 +1030,9 @@ mod tests {
             .unwrap();
 
         let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
-        assert!(err.to_string().contains("only mail.password"));
+        let message = err.to_string();
+        assert!(message.contains("cannot be stored in monoengine vault"));
+        assert!(message.contains("supported fields are"));
     }
 
     #[test]
@@ -699,7 +1091,46 @@ mod tests {
             .unwrap();
 
         let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
-        assert!(err.to_string().contains("only mail.password"));
+        let message = err.to_string();
+        assert!(message.contains("cannot be stored in monoengine vault"));
+        assert!(message.contains("supported fields are"));
+    }
+
+    #[test]
+    fn secret_ref_from_args_accepts_notification_slack_webhook_url_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "notification.slack.webhook_url",
+                "--vault-path",
+                "config/prod/notification/slack/webhook_url",
+            ])
+            .unwrap();
+
+        let secret_ref =
+            secret_ref_from_args(&matches).expect("slack webhook_url ref should be accepted");
+        assert_eq!(
+            secret_ref.secret_name(),
+            "config/prod/notification/slack/webhook_url"
+        );
+    }
+
+    #[test]
+    fn secret_ref_from_args_rejects_notification_secret_outside_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "notification.webhook.token",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+        assert!(message.contains("notification.webhook.token"));
+        assert!(message.contains("notification/webhook/token"));
+        assert!(!message.contains("config/prod/mail/password"));
     }
 
     #[test]
@@ -720,6 +1151,71 @@ mod tests {
         assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
         assert!(message.contains("value is redacted"));
         assert!(!message.contains("config/prod/database/password"));
+    }
+
+    #[test]
+    fn secret_ref_from_args_accepts_redis_url_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from(["ref", "redis.url", "--vault-path", "config/prod/redis/url"])
+            .unwrap();
+
+        let secret_ref = secret_ref_from_args(&matches).expect("redis.url ref should be accepted");
+        assert_eq!(secret_ref.secret_name(), "config/prod/redis/url");
+    }
+
+    #[test]
+    fn secret_ref_from_args_rejects_redis_url_outside_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "redis.url",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+        assert!(message.contains("redis.url"));
+        assert!(message.contains("redis/url"));
+        assert!(!message.contains("config/prod/mail/password"));
+    }
+
+    #[test]
+    fn secret_ref_from_args_accepts_object_storage_access_key_id_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "object_storage.s3.access_key_id",
+                "--vault-path",
+                "config/prod/object_storage/access_key_id",
+            ])
+            .unwrap();
+
+        let secret_ref = secret_ref_from_args(&matches)
+            .expect("object storage access key ref should be accepted");
+        assert_eq!(
+            secret_ref.secret_name(),
+            "config/prod/object_storage/access_key_id"
+        );
+    }
+
+    #[test]
+    fn secret_ref_from_args_rejects_object_storage_secret_access_key_outside_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "object_storage.s3.secret_access_key",
+                "--vault-path",
+                "config/prod/mail/password",
+            ])
+            .unwrap();
+
+        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
+        let message = err.to_string();
+        assert!(message.contains("object_storage.s3.secret_access_key"));
+        assert!(message.contains("object_storage/secret_access_key"));
+        assert!(!message.contains("config/prod/mail/password"));
     }
 
     #[test]
@@ -749,8 +1245,7 @@ mod tests {
             .expect("--ref should exist")
             .expect("SecretRef should parse");
 
-        let err =
-            validate_mail_password_secret_ref(name, &secret_ref).expect_err("wrong namespace");
+        let err = validate_secret_field_ref(name, &secret_ref).expect_err("wrong namespace");
         let message = err.to_string();
 
         assert!(message.contains("mail.password"));
@@ -973,5 +1468,119 @@ mod tests {
         assert!(!message.contains("config/test/mail/password"));
         assert!(!message.contains("#value"));
         assert!(!message.contains("smtp-test-value"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_resolves_object_storage_s3_secret_refs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let access_key_ref =
+            SecretRef::parse("vault://secret/config/test/object_storage/access_key_id#value")
+                .unwrap();
+        let secret_key_ref =
+            SecretRef::parse("vault://secret/config/test/object_storage/secret_access_key#value")
+                .unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine-test".to_string(),
+                access_key_id: access_key_ref.as_uri().to_string(),
+                secret_access_key: secret_key_ref.as_uri().to_string(),
+                endpoint_url: String::new(),
+            },
+            ..Default::default()
+        };
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&access_key_ref, "AKIA-test")
+            .expect("access key should insert")
+            .with_secret(&secret_key_ref, "secret-test")
+            .expect("secret key should insert");
+
+        resolve_config_secrets(&config, &resolver)
+            .await
+            .expect("object storage S3 SecretRefs should resolve");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_resolves_redis_url_secret_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&redis_url_ref, "redis://vault-backed:6379")
+            .expect("redis url secret should insert");
+
+        resolve_config_secrets(&config, &resolver)
+            .await
+            .expect("redis.url SecretRef should resolve");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_reports_missing_redis_url_ref_without_leaking_ref() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new();
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("missing redis.url SecretRef should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("test secret not found"));
+        assert!(!message.contains("config/test/redis/url"));
+        assert!(!message.contains("#value"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_rejects_malformed_resolved_redis_url() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&redis_url_ref, "http://not-a-redis-url:6379")
+            .expect("redis url secret should insert");
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("resolved redis.url with non-redis scheme should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("redis.url scheme"));
+        assert!(!message.contains("http://not-a-redis-url:6379"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolve_config_secrets_redacted_error_does_not_leak_secret_like_scheme() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let redis_url_ref = SecretRef::parse("vault://secret/config/test/redis/url#value").unwrap();
+
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.redis.url = redis_url_ref.as_uri().to_string();
+
+        let resolver = TestSecretResolver::new()
+            .with_secret(&redis_url_ref, "mysecret://sensitive-host:6379")
+            .expect("redis url secret should insert");
+
+        let err = resolve_config_secrets(&config, &resolver)
+            .await
+            .expect_err("resolved redis.url with secret-like scheme should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("redis.url scheme"));
+        assert!(!message.contains("mysecret"));
+        assert!(!message.contains("sensitive-host"));
     }
 }

@@ -1,6 +1,5 @@
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 
-use bytes::BytesMut;
 use clap::Args;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use russh::{
@@ -14,7 +13,10 @@ use crate::{
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::{MegaError, MegaResult},
     context::AppContext,
-    contract::{git_protocol::ssh::SshServer, vault::integration::vault_core::VaultCoreInterface},
+    contract::{
+        git_protocol::ssh::SshServer, policy::entitystore::EntityStore,
+        vault::integration::vault_core::VaultCoreInterface,
+    },
     server::CommonHttpOptions,
 };
 
@@ -61,13 +63,15 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
             connection: ctx.connection.clone(),
             prefix: "git-object-rkyv:v1".to_string(),
         }),
+        entity_store: EntityStore::new(),
     };
     let mut ssh_server = SshServer {
         clients: Arc::new(Mutex::new(HashMap::new())),
         state,
         id: 0,
-        smart_protocol: None,
-        data_combined: BytesMut::new(),
+        channels: HashMap::new(),
+        v2_channels: HashMap::new(),
+        authenticated_user: None,
     };
     let server_url = format!("{host}:{ssh_port}");
     let addr = SocketAddr::from_str(&server_url)

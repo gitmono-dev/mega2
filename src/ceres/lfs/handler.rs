@@ -7,6 +7,7 @@ use futures::{Stream, StreamExt};
 use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 use rand::prelude::*;
 use reqwest::Method;
+use sha2::{Digest, Sha256};
 
 use crate::{
     callisto::lfs_locks,
@@ -23,8 +24,22 @@ use crate::{
     },
 };
 
+/// Namespaces an LFS lock row key by repository so that identical ref names in
+/// different repositories do not share a lock bucket. The `\u{1f}` (unit
+/// separator) cannot appear in a Git ref name, keeping the composite key
+/// unambiguous. An empty `repo` (non repo-scoped mount, e.g. `/api/v1/lfs`)
+/// preserves the legacy bare-ref key for backward compatibility.
+fn scoped_lock_ref(repo: &str, refspec: &str) -> String {
+    if repo.is_empty() {
+        refspec.to_owned()
+    } else {
+        format!("{repo}\u{1f}{refspec}")
+    }
+}
+
 pub async fn lfs_retrieve_lock(
     storage: LfsDbStorage,
+    repo: &str,
     query: LockListQuery,
 ) -> Result<LockList, GitLFSError> {
     let mut lock_list = LockList {
@@ -33,7 +48,7 @@ pub async fn lfs_retrieve_lock(
     };
     match lfs_get_filtered_locks(
         storage,
-        &query.refspec,
+        &scoped_lock_ref(repo, &query.refspec),
         &query.path,
         &query.cursor,
         &query.limit,
@@ -53,6 +68,7 @@ pub async fn lfs_retrieve_lock(
 
 pub async fn lfs_verify_lock(
     storage: LfsDbStorage,
+    repo: &str,
     req: VerifiableLockRequest,
 ) -> Result<VerifiableLockList, MegaError> {
     let mut limit = req.limit.unwrap_or(0);
@@ -61,7 +77,7 @@ pub async fn lfs_verify_lock(
     }
     let res = lfs_get_filtered_locks(
         storage,
-        &req.refs.name,
+        &scoped_lock_ref(repo, &req.refs.name),
         "",
         &req.cursor.clone().unwrap_or("".to_string()).to_string(),
         &limit.to_string(),
@@ -90,15 +106,14 @@ pub async fn lfs_verify_lock(
     Ok(lock_list)
 }
 
-pub async fn lfs_create_lock(storage: LfsDbStorage, req: LockRequest) -> Result<Lock, GitLFSError> {
-    let res = lfs_get_filtered_locks(
-        storage.clone(),
-        &req.refs.name,
-        &req.path.to_string(),
-        "",
-        "1",
-    )
-    .await;
+pub async fn lfs_create_lock(
+    storage: LfsDbStorage,
+    repo: &str,
+    req: LockRequest,
+) -> Result<Lock, GitLFSError> {
+    let lock_ref = scoped_lock_ref(repo, &req.refs.name);
+    let res =
+        lfs_get_filtered_locks(storage.clone(), &lock_ref, &req.path.to_string(), "", "1").await;
 
     match res {
         Ok((locks, _)) => {
@@ -130,7 +145,7 @@ pub async fn lfs_create_lock(storage: LfsDbStorage, req: LockRequest) -> Result<
         },
     };
 
-    match lfs_add_lock(storage.clone(), &req.refs.name, vec![lock.clone()]).await {
+    match lfs_add_lock(storage.clone(), &lock_ref, vec![lock.clone()]).await {
         Ok(_) => Ok(lock),
         Err(_) => Err(GitLFSError::GeneralError(
             "Failed when adding locks!".to_string(),
@@ -140,6 +155,7 @@ pub async fn lfs_create_lock(storage: LfsDbStorage, req: LockRequest) -> Result<
 
 pub async fn lfs_delete_lock(
     storage: LfsDbStorage,
+    repo: &str,
     id: &str,
     unlock_request: UnlockRequest,
 ) -> Result<Lock, GitLFSError> {
@@ -148,7 +164,7 @@ pub async fn lfs_delete_lock(
     }
     let res = delete_lock(
         storage,
-        &unlock_request.refs.name,
+        &scoped_lock_ref(repo, &unlock_request.refs.name),
         None,
         id,
         unlock_request.force.unwrap_or(false),
@@ -199,7 +215,7 @@ pub async fn lfs_process_batch(
                     db_storage
                         .new_lfs_object(meta.clone().into())
                         .await
-                        .unwrap();
+                        .map_err(|e| lfs_storage_error("create LFS object metadata", e))?;
                     meta
                 } else {
                     response_objects.push(ResponseObject::failed_with_err(
@@ -278,6 +294,37 @@ pub async fn lfs_upload_object(
         return Err(GitLFSError::GeneralError(String::from("Not found ")));
     };
 
+    // Content-addressed immutability. The raw transfer PUT is a capability URL
+    // issued by the auth-gated batch endpoint and is not itself per-request
+    // authenticated, so verify the uploaded bytes actually address the claimed
+    // OID (LFS uses sha256) and match the registered size. This makes objects
+    // immutable by content: an unauthenticated PUT can only (re)store the exact
+    // bytes that hash to the OID — it cannot corrupt or spoof an existing one.
+    if body_bytes.len() as i64 != meta.size {
+        return Err(GitLFSError::GeneralError(format!(
+            "Invalid LFS upload: size {} does not match registered size {} for oid {}",
+            body_bytes.len(),
+            meta.size,
+            meta.oid
+        )));
+    }
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(&body_bytes);
+        hex::encode(hasher.finalize())
+    };
+    if digest != meta.oid {
+        return Err(GitLFSError::GeneralError(format!(
+            "Invalid LFS upload: content hash {digest} does not match oid {}",
+            meta.oid
+        )));
+    }
+    // Objects are immutable by OID; if it is already stored, a matching upload
+    // is a no-op and must not overwrite the existing blob.
+    if lfs_object_exists(&service.obj_storage, &meta.oid).await {
+        return Ok(());
+    }
+
     let key = lfs_object_key(&meta.oid);
     let size = meta.size;
     let res = service
@@ -348,6 +395,10 @@ pub async fn lfs_download_object(
     }
 }
 
+fn lfs_storage_error(context: &str, error: impl std::fmt::Display) -> GitLFSError {
+    GitLFSError::GeneralError(format!("{context}: {error}"))
+}
+
 async fn lfs_get_filtered_locks(
     storage: LfsDbStorage,
     refspec: &str,
@@ -355,7 +406,7 @@ async fn lfs_get_filtered_locks(
     cursor: &str,
     limit: &str,
 ) -> Result<(Vec<Lock>, String), GitLFSError> {
-    let mut locks = (lfs_get_locks(storage, refspec).await).unwrap_or_default();
+    let mut locks = lfs_get_locks(storage, refspec).await?;
 
     tracing::debug!("Locks retrieved: {:?}", locks);
 
@@ -393,7 +444,9 @@ async fn lfs_get_filtered_locks(
 
     let mut next = "".to_string();
     if !limit.is_empty() {
-        let mut size = limit.parse::<i64>().unwrap();
+        let mut size = limit
+            .parse::<i64>()
+            .map_err(|e| lfs_storage_error("parse LFS lock limit", e))?;
         size = min(size, locks.len() as i64);
 
         if size + 1 < locks.len() as i64 {
@@ -406,14 +459,18 @@ async fn lfs_get_filtered_locks(
 }
 
 async fn lfs_get_locks(storage: LfsDbStorage, refspec: &str) -> Result<Vec<Lock>, GitLFSError> {
-    let result = storage.get_lock_by_id(refspec).await.unwrap();
+    let result = storage
+        .get_lock_by_id(refspec)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS lock row", e))?;
     match result {
         Some(val) => {
             let data = val.data;
-            let locks: Vec<Lock> = serde_json::from_str(&data).unwrap();
+            let locks: Vec<Lock> = serde_json::from_str(&data)
+                .map_err(|e| lfs_storage_error("parse LFS lock data", e))?;
             Ok(locks)
         }
-        None => Err(GitLFSError::GeneralError("".to_string())),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -422,14 +479,18 @@ async fn lfs_add_lock(
     repo: &str,
     locks: Vec<Lock>,
 ) -> Result<(), GitLFSError> {
-    let result = storage.get_lock_by_id(repo).await.unwrap();
+    let result = storage
+        .get_lock_by_id(repo)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS lock row", e))?;
 
     match result {
         // Update
         Some(val) => {
             let d = val.data.to_owned();
             let mut locks_from_data = if !d.is_empty() {
-                let locks_from_data: Vec<Lock> = serde_json::from_str(&d).unwrap();
+                let locks_from_data: Vec<Lock> = serde_json::from_str(&d)
+                    .map_err(|e| lfs_storage_error("parse LFS lock data", e))?;
                 locks_from_data
             } else {
                 vec![]
@@ -442,16 +503,17 @@ async fn lfs_add_lock(
                     .partial_cmp(&b.locked_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let d = serde_json::to_string(&locks_from_data).unwrap();
+            let d = serde_json::to_string(&locks_from_data)
+                .map_err(|e| lfs_storage_error("serialize LFS lock data", e))?;
 
             // must turn into `ActiveModel` before modify, or update failed.
             // let mut val = val.into_active_model();
             // val.data = Set(d);
-            let res = storage.update_lock(val, &d).await;
-            match res.is_ok() {
-                true => Ok(()),
-                false => Err(GitLFSError::GeneralError("".to_string())),
-            }
+            storage
+                .update_lock(val, &d)
+                .await
+                .map_err(|e| lfs_storage_error("update LFS lock row", e))?;
+            Ok(())
         }
         // Insert
         None => {
@@ -461,17 +523,18 @@ async fn lfs_add_lock(
                     .partial_cmp(&b.locked_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let data = serde_json::to_string(&locks).unwrap();
+            let data = serde_json::to_string(&locks)
+                .map_err(|e| lfs_storage_error("serialize LFS lock data", e))?;
             let lock_to = lfs_locks::Model {
                 id: repo.to_owned(),
                 data: data.to_owned(),
             };
 
-            let res = storage.new_lock(lock_to).await;
-            match res.is_ok() {
-                true => Ok(()),
-                false => Err(GitLFSError::GeneralError("".to_string())),
-            }
+            storage
+                .new_lock(lock_to)
+                .await
+                .map_err(|e| lfs_storage_error("create LFS lock row", e))?;
+            Ok(())
         }
     }
 }
@@ -480,7 +543,11 @@ async fn lfs_get_meta(
     storage: &LfsDbStorage,
     oid: &str,
 ) -> Result<Option<MetaObject>, GitLFSError> {
-    Ok(storage.get_lfs_object(oid).await.unwrap().map(|m| m.into()))
+    Ok(storage
+        .get_lfs_object(oid)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS object metadata", e))?
+        .map(|m| m.into()))
 }
 
 async fn lfs_delete_meta(
@@ -556,13 +623,17 @@ async fn delete_lock(
     id: &str,
     force: bool,
 ) -> Result<Lock, GitLFSError> {
-    let result = storage.get_lock_by_id(repo).await.unwrap();
+    let result = storage
+        .get_lock_by_id(repo)
+        .await
+        .map_err(|e| lfs_storage_error("get LFS lock row", e))?;
     match result {
         // Exist, then delete.
         Some(val) => {
             let d = val.data.to_owned();
             let locks_from_data = if !d.is_empty() {
-                let locks_from_data: Vec<Lock> = serde_json::from_str(&d).unwrap();
+                let locks_from_data: Vec<Lock> = serde_json::from_str(&d)
+                    .map_err(|e| lfs_storage_error("parse LFS lock data", e))?;
                 locks_from_data
             } else {
                 vec![]
@@ -603,17 +674,21 @@ async fn delete_lock(
 
             // No locks remains, delete the repo from database.
             if new_locks.is_empty() {
-                storage.delete_lock_by_id(repo.to_owned()).await;
+                storage
+                    .delete_lock_by_id(repo.to_owned())
+                    .await
+                    .map_err(|e| lfs_storage_error("delete LFS lock row", e))?;
                 return Ok(lock_to_delete);
             }
 
             // Update remaining locks.
-            let data = serde_json::to_string(&new_locks).unwrap();
-            let res = storage.update_lock(val, &data).await;
-            match res.is_ok() {
-                true => Ok(lock_to_delete),
-                false => Err(GitLFSError::GeneralError("".to_string())),
-            }
+            let data = serde_json::to_string(&new_locks)
+                .map_err(|e| lfs_storage_error("serialize LFS lock data", e))?;
+            storage
+                .update_lock(val, &data)
+                .await
+                .map_err(|e| lfs_storage_error("update LFS lock row", e))?;
+            Ok(lock_to_delete)
         }
         // Not exist, error.
         None => Err(GitLFSError::GeneralError("".to_string())),
@@ -624,6 +699,124 @@ async fn delete_lock(
 mod tests {
     use super::*;
     use crate::ceres::lfs::lfs_structs::{Action, Ref, ResCondition, ResponseObject};
+
+    #[tokio::test]
+    async fn locks_are_namespaced_by_repository() {
+        use crate::ceres::lfs::lfs_structs::{LockListQuery, LockRequest};
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let lfs = storage.lfs_db_storage();
+
+        let mk_lock_req = || LockRequest {
+            path: "assets/model.bin".to_string(),
+            refs: Ref {
+                name: "refs/heads/main".to_string(),
+            },
+        };
+        let list_query = |refspec: &str| LockListQuery {
+            path: String::new(),
+            id: String::new(),
+            cursor: String::new(),
+            limit: String::new(),
+            refspec: refspec.to_string(),
+        };
+
+        // Lock created under repo A.
+        lfs_create_lock(lfs.clone(), "/org/repo-a.git", mk_lock_req())
+            .await
+            .expect("create lock in repo A");
+
+        // Visible under repo A + same ref.
+        let a = lfs_retrieve_lock(
+            lfs.clone(),
+            "/org/repo-a.git",
+            list_query("refs/heads/main"),
+        )
+        .await
+        .expect("list repo A");
+        assert_eq!(a.locks.len(), 1);
+        assert_eq!(a.locks[0].path, "assets/model.bin");
+
+        // The identical ref name in a different repo must not see repo A's lock...
+        let b = lfs_retrieve_lock(
+            lfs.clone(),
+            "/org/repo-b.git",
+            list_query("refs/heads/main"),
+        )
+        .await
+        .expect("list repo B");
+        assert!(b.locks.is_empty());
+
+        // ...and locking the same path/ref there must not collide with repo A.
+        lfs_create_lock(lfs.clone(), "/org/repo-b.git", mk_lock_req())
+            .await
+            .expect("create lock in repo B without cross-repo collision");
+
+        // The empty repo (legacy /api/v1/lfs mount) uses the bare ref key and
+        // stays isolated from the repo-scoped rows above.
+        let legacy = lfs_retrieve_lock(lfs.clone(), "", list_query("refs/heads/main"))
+            .await
+            .expect("list legacy mount");
+        assert!(legacy.locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lfs_upload_rejects_content_not_matching_oid() {
+        use crate::jupiter::storage::object_storage::mock_object_storage;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let service = LfsService {
+            lfs_storage: storage.lfs_db_storage(),
+            obj_storage: mock_object_storage(),
+        };
+
+        // Register metadata as an `upload` batch would, for the true sha256 of
+        // the content and its exact size.
+        let content = b"monoengine lfs content".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let oid = hex::encode(hasher.finalize());
+        service
+            .lfs_storage
+            .new_lfs_object(
+                MetaObject {
+                    oid: oid.clone(),
+                    size: content.len() as i64,
+                    exist: false,
+                }
+                .into(),
+            )
+            .await
+            .expect("register lfs metadata");
+
+        // Tampered bytes (same length, different hash) are rejected before any
+        // object-storage write, so an unauthenticated PUT cannot corrupt the OID.
+        let mut tampered = content.clone();
+        tampered[0] ^= 0xff;
+        let req = RequestObject {
+            oid: oid.clone(),
+            size: content.len() as i64,
+            ..Default::default()
+        };
+        let err = lfs_upload_object(&service, &req, tampered)
+            .await
+            .expect_err("content not matching oid must be rejected");
+        assert!(
+            err.to_string().contains("does not match oid"),
+            "unexpected error: {err}"
+        );
+
+        // A size mismatch is likewise rejected.
+        let err2 = lfs_upload_object(&service, &req, vec![0u8; 5])
+            .await
+            .expect_err("size mismatch must be rejected");
+        assert!(
+            err2.to_string().contains("does not match registered size"),
+            "unexpected error: {err2}"
+        );
+    }
 
     #[test]
     fn response_object_download_existing() {

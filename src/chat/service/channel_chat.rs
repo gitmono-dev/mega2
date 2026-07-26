@@ -25,7 +25,7 @@ fn is_mention_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
 }
 
-fn extract_mentioned_usernames(content: &str) -> HashSet<String> {
+pub(crate) fn extract_mentioned_usernames(content: &str) -> HashSet<String> {
     let bytes = content.as_bytes();
     let mut mentions = HashSet::new();
     let mut cursor = 0;
@@ -108,7 +108,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
     pub async fn create_channel(
         &self,
         title: Option<String>,
-        _image_path: Option<String>,
+        image_path: Option<String>,
         creator_username: String,
         mut member_usernames: Vec<String>,
         group: bool,
@@ -128,6 +128,7 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .create_channel(
                 public_id.clone(),
                 title.clone(),
+                image_path.clone(),
                 creator_username.clone(),
                 group,
             )
@@ -152,22 +153,22 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .increment_members_count(ch.id, member_usernames.len() as i32)
             .await;
 
-        // Optional initial message
-        let first_msg = if let Some(content) = initial_message {
-            if !content.trim().is_empty() {
-                Some(
-                    self.send_message_inner(
-                        &ch,
-                        Some(creator_username.clone()),
-                        content,
-                        None,
-                        attachments.unwrap_or_default(),
-                    )
-                    .await?,
+        // Optional initial message: send when there is non-empty content OR
+        // attachments (spec: 如果有 initial_message 或附件，调用发送消息服务).
+        // Attachment-only channels create a first message with empty content.
+        let content = initial_message.unwrap_or_default();
+        let attachments = attachments.unwrap_or_default();
+        let first_msg = if !content.trim().is_empty() || !attachments.is_empty() {
+            Some(
+                self.send_message_inner(
+                    &ch,
+                    Some(creator_username.clone()),
+                    content,
+                    None,
+                    attachments,
                 )
-            } else {
-                None
-            }
+                .await?,
+            )
         } else {
             None
         };
@@ -358,6 +359,10 @@ impl<E: ChatEvents + 'static> ChannelChatService<E> {
             .soft_delete_message(message_public_id)
             .await?;
 
+        self.attachment_storage
+            .soft_delete_attachments_for_subject("Message", msg.id)
+            .await?;
+
         if was_latest {
             self.message_storage
                 .recompute_latest_for_channel(channel_id)
@@ -527,11 +532,11 @@ mod tests {
         // Note: test_storage applies migrations
         let svc = ChannelChatService::from_storage(&storage);
 
-        // Create with initial message
+        // Create with initial message and an image path
         let (ch, first_msg) = svc
             .create_channel(
                 Some("Test Channel".to_string()),
-                None,
+                Some("avatars/test-channel.png".to_string()),
                 "alice".to_string(),
                 vec!["bob".to_string()],
                 true,
@@ -542,6 +547,8 @@ mod tests {
             .expect("create channel");
 
         assert_eq!(ch.owner_username, "alice");
+        // image_path must be persisted at creation time, not silently dropped.
+        assert_eq!(ch.image_path.as_deref(), Some("avatars/test-channel.png"));
         assert!(first_msg.is_some());
         let first = first_msg.unwrap();
         assert_eq!(first.content, "hello world");
@@ -650,6 +657,64 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(final_ch.latest_message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_channel_with_attachments_only_creates_first_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let svc = ChannelChatService::from_storage(&storage);
+
+        // Spec (chat.md 创建 channel): send a first message when initial_message OR
+        // attachments are supplied. Attachment-only create must not silently drop the file.
+        let (ch, first_msg) = svc
+            .create_channel(
+                Some("Files".to_string()),
+                None,
+                "alice".to_string(),
+                vec!["bob".to_string()],
+                true,
+                None,
+                Some(vec![crate::contract::api::chat::AttachmentConfirmReq {
+                    file_path: "chat/attachments/report.pdf".to_string(),
+                    file_type: "application/pdf".to_string(),
+                    file_name: "report.pdf".to_string(),
+                    file_size: 1024,
+                }]),
+            )
+            .await
+            .expect("create channel with attachment");
+
+        let first = first_msg.expect("attachment-only channel must create a first message");
+        assert!(
+            first.content.trim().is_empty(),
+            "attachment-only message has empty content"
+        );
+        assert_eq!(ch.latest_message_id, Some(first.id));
+
+        let attachments = svc
+            .attachment_storage
+            .get_attachments_by_subject("Message", first.id)
+            .await
+            .expect("query attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "report.pdf");
+        assert_eq!(attachments[0].file_path, "chat/attachments/report.pdf");
+
+        // Neither content nor attachments -> no first message.
+        let (_ch2, no_msg) = svc
+            .create_channel(
+                Some("Empty".to_string()),
+                None,
+                "alice".to_string(),
+                vec![],
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create empty channel");
+        assert!(no_msg.is_none());
     }
 
     #[tokio::test]
@@ -784,6 +849,60 @@ mod tests {
                 channel_public_id: ch.public_id,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_message_soft_deletes_attachments() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let svc = ChannelChatService::from_storage(&storage);
+
+        let (ch, _) = svc
+            .create_channel(
+                Some("Test Channel".to_string()),
+                None,
+                "alice".to_string(),
+                vec!["bob".to_string()],
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create channel");
+
+        let msg = svc
+            .send_message(
+                &ch.public_id,
+                "alice".to_string(),
+                "see attached".to_string(),
+                None,
+                Some(vec![crate::contract::api::chat::AttachmentConfirmReq {
+                    file_path: "chat/attachments/xxx/file.png".to_string(),
+                    file_type: "image/png".to_string(),
+                    file_name: "file.png".to_string(),
+                    file_size: 1024,
+                }]),
+            )
+            .await
+            .expect("send message with attachment");
+
+        let attachments_before = svc
+            .attachment_storage
+            .get_attachments_by_subject("Message", msg.id)
+            .await
+            .expect("query attachments before delete");
+        assert_eq!(attachments_before.len(), 1);
+
+        svc.delete_message(&ch.public_id, &msg.public_id, "alice")
+            .await
+            .expect("delete message");
+
+        let attachments_after = svc
+            .attachment_storage
+            .get_attachments_by_subject("Message", msg.id)
+            .await
+            .expect("query attachments after delete");
+        assert!(attachments_after.is_empty());
     }
 }
 

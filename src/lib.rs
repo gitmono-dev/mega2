@@ -22,8 +22,8 @@ pub mod config;
 mod context;
 mod contract;
 mod jupiter;
-mod mail;
-mod notification;
+pub mod mail;
+pub mod notification;
 mod server;
 // The vendored RustyVault code intentionally keeps its upstream style and
 // clippy policy while being compiled as a monoengine module.

@@ -4,7 +4,6 @@ use std::{
     str::from_utf8,
 };
 
-use axum::Error as AxumError;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use reqwest::{Client, Url};
@@ -34,6 +33,7 @@ pub trait ThirdPartyRepoTrait {
     async fn fetch_packs(
         &self,
         want: &[String],
+        depth: Option<u32>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>, MegaError>;
 }
 
@@ -157,9 +157,10 @@ impl ThirdPartyRepoTrait for ThirdPartyClient {
     async fn fetch_packs(
         &self,
         want: &[String],
+        depth: Option<u32>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>, MegaError> {
         let request_url = format!("{}/git-upload-pack", self.url);
-        let body = self.generate_upload_pack_content(want);
+        let body = self.generate_upload_pack_content(want, depth);
         tracing::debug!("fetch_objects with body {:?}", body);
 
         let res = self
@@ -176,11 +177,19 @@ impl ThirdPartyRepoTrait for ThirdPartyClient {
 }
 
 impl ThirdPartyClient {
-    fn generate_upload_pack_content(&self, want: &[String]) -> Bytes {
+    fn generate_upload_pack_content(&self, want: &[String], depth: Option<u32>) -> Bytes {
         let mut buf = BytesMut::new();
+        if let Some(depth) = depth {
+            self.add_pkt_line_string(&mut buf, format!("deepen {depth}\n"));
+        }
+
         let mut write_first_line = false;
 
-        let capability = ["side-band-64k", "ofs-delta", "multi_ack_detailed"].join(" ");
+        let capability = if depth.is_some() {
+            ["side-band-64k", "ofs-delta", "no-progress"].join(" ")
+        } else {
+            ["side-band-64k", "ofs-delta", "multi_ack_detailed"].join(" ")
+        };
         for w in want {
             if !write_first_line {
                 self.add_pkt_line_string(
@@ -207,7 +216,7 @@ impl ThirdPartyClient {
     pub async fn process_pack_stream(
         &self,
         res: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
-    ) -> Result<Vec<u8>, AxumError> {
+    ) -> Result<Vec<u8>, MegaError> {
         let stream = res.map(|r| r.map_err(|e| io::Error::other(format!("reqwest error: {e}"))));
 
         let mut reader = StreamReader::new(stream);
@@ -222,21 +231,28 @@ impl ThirdPartyClient {
             };
 
             if len == 0 {
-                break;
+                continue;
+            }
+
+            if !reach_pack && data.len() >= 4 && &data[0..4] == b"PACK" {
+                reach_pack = true;
+                pack_data.extend_from_slice(&data);
+                tracing::debug!("Receiving raw PACK data...");
+                continue;
             }
 
             if data.len() >= 5 && &data[1..5] == b"PACK" {
                 reach_pack = true;
-                tracing::debug!("Receiving PACK data...");
+                tracing::debug!("Receiving side-band PACK data...");
             }
 
             if reach_pack {
                 let code = data[0];
-                let data = &data[1..];
+                let payload = &data[1..];
                 match code {
-                    1 => pack_data.extend_from_slice(data),
-                    2 => tracing::info!("{}", String::from_utf8_lossy(data)),
-                    3 => tracing::warn!("{}", String::from_utf8_lossy(data)),
+                    1 => pack_data.extend_from_slice(payload),
+                    2 => tracing::info!("{}", String::from_utf8_lossy(payload)),
+                    3 => tracing::warn!("{}", String::from_utf8_lossy(payload)),
                     _ => tracing::warn!("unknown side-band-64k code: {code}"),
                 }
             } else if &data != b"NAK\n" {
@@ -270,5 +286,50 @@ impl ThirdPartyClient {
         let mut data = vec![0u8; (len - 4) as usize];
         tokio::io::AsyncReadExt::read_exact(reader, &mut data).await?;
         Ok((len as usize, data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures::stream;
+
+    use super::*;
+
+    #[test]
+    fn generate_upload_pack_content_includes_deepen_for_shallow_fetch() {
+        let client = ThirdPartyClient::new("https://github.com/foo/bar.git");
+        let body = client.generate_upload_pack_content(&["abc123".to_string()], Some(1));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("deepen 1"));
+        assert!(text.contains("want abc123"));
+    }
+
+    #[tokio::test]
+    async fn process_pack_stream_continues_after_flush_before_pack() {
+        let client = ThirdPartyClient::new("https://github.com/foo/bar.git");
+
+        let shallow_payload = b"shallow 1\n";
+        let shallow_line = format!("{:04x}", shallow_payload.len() + 4);
+        let pack_chunk = b"PACK1234";
+        let pack_line = format!("{:04x}", pack_chunk.len() + 4);
+        let mut body = Vec::new();
+        body.extend_from_slice(shallow_line.as_bytes());
+        body.extend_from_slice(shallow_payload);
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(pack_line.as_bytes());
+        body.extend_from_slice(pack_chunk);
+
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let pack_data = client
+            .process_pack_stream(stream)
+            .await
+            .expect("process_pack_stream should succeed");
+
+        assert!(
+            !pack_data.is_empty(),
+            "PACK data should be read after 0000 flush"
+        );
+        assert!(pack_data.starts_with(b"PACK"));
     }
 }

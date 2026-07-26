@@ -469,18 +469,34 @@ pub fn init_trees(
         if let Some(toolchains_tree_idx) = trees.iter().position(|t| t.id == toolchains_tree_id) {
             let mut toolchains_items = trees[toolchains_tree_idx].tree_items.clone();
             inject_toolchains_buck_file(&mut toolchains_items, &mut blobs);
+            sort_git_tree_items(&mut toolchains_items);
             let toolchains_tree = Tree::from_tree_items(toolchains_items).unwrap();
             trees[toolchains_tree_idx] = toolchains_tree.clone();
             root_items[toolchains_root_idx].id = toolchains_tree.id;
         }
     }
 
+    sort_git_tree_items(&mut root_items);
     let root = Tree::from_tree_items(root_items).unwrap();
     (
         trees.into_iter().map(|x| (x.id, x)).collect(),
         blobs.into_iter().map(|x| (x.id, x)).collect(),
         root,
     )
+}
+
+fn sort_git_tree_items(items: &mut [TreeItem]) {
+    items.sort_by_key(git_tree_sort_key);
+}
+
+fn git_tree_sort_key(item: &TreeItem) -> Vec<u8> {
+    let mut key = item.name.as_bytes().to_vec();
+    key.push(if item.mode == TreeItemMode::Tree {
+        b'/'
+    } else {
+        b'\0'
+    });
+    key
 }
 
 /// Injects Buck configuration files (.buckroot and .buckconfig) into the root directory.
@@ -933,6 +949,54 @@ mod test {
         assert_eq!(mega_trees.len(), dir_nums + 2);
         // Blobs: dir_nums (.gitkeep) + 1 (.mega_cedar.json) + 2 (.buckroot + .buckconfig) + 1 (toolchains/BUCK) + 1 (policies.cedar)
         assert_eq!(mega_blobs.len(), dir_nums + 5);
+    }
+
+    #[test]
+    pub fn init_trees_sorts_git_tree_entries() {
+        let mut mono_config = MonoConfig {
+            root_dirs: vec![
+                "zeta".to_string(),
+                "toolchains".to_string(),
+                "alpha".to_string(),
+            ],
+            ..Default::default()
+        };
+        mono_config.admin.clear();
+
+        let (tree_maps, _, root_tree) = super::init_trees(&mono_config);
+        let root_names = root_tree
+            .tree_items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            root_names,
+            vec![
+                ".buckconfig",
+                ".buckroot",
+                ".cedar",
+                ".mega_cedar.json",
+                "alpha",
+                "toolchains",
+                "zeta"
+            ]
+        );
+
+        let toolchains_id = root_tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == "toolchains")
+            .unwrap()
+            .id;
+        let toolchains_tree = tree_maps.get(&toolchains_id).unwrap();
+        let toolchains_names = toolchains_tree
+            .tree_items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(toolchains_names, vec![".gitkeep", "BUCK"]);
     }
 
     #[test]

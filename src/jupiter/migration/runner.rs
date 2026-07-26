@@ -19,7 +19,7 @@ pub async fn apply_migrations(db: &DatabaseConnection, refresh: bool) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement};
     use sea_orm_migration::prelude::MigratorTrait;
 
     use super::*;
@@ -29,6 +29,11 @@ mod tests {
             user_notification_preferences, user_notification_settings,
         },
         jupiter::tests::test_db_connection,
+        notification::triggers::{
+            EVENT_CHAT_MENTION_CREATED, EVENT_CHAT_REPLY_CREATED, EVENT_CL_COMMENT_CREATED,
+            EVENT_CL_MERGED, EVENT_ISSUE_CLOSED, EVENT_ISSUE_COMMENT_CREATED,
+            EVENT_ITEM_REFERENCED,
+        },
     };
 
     #[tokio::test]
@@ -79,10 +84,32 @@ mod tests {
 
         let now = chrono::Utc::now().naive_utc();
 
+        // Core event types are seeded by migrations. Verify every trigger
+        // constant is present so trigger-time upserts remain only a fallback.
+        for event_type_code in [
+            EVENT_CL_COMMENT_CREATED,
+            EVENT_CL_MERGED,
+            EVENT_ISSUE_COMMENT_CREATED,
+            EVENT_ISSUE_CLOSED,
+            EVENT_ITEM_REFERENCED,
+            EVENT_CHAT_MENTION_CREATED,
+            EVENT_CHAT_REPLY_CREATED,
+        ] {
+            let seeded = notification_event_types::Entity::find_by_id(event_type_code)
+                .one(&db)
+                .await
+                .expect("query seeded event type");
+            assert!(
+                seeded.is_some(),
+                "{event_type_code} should be seeded by migration"
+            );
+        }
+
+        // Insert a non-seeded event type for FK-probe tests below.
         notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".to_owned()),
-            category: Set("cl".to_owned()),
-            description: Set("New comment on a CL".to_owned()),
+            code: Set("custom.event".to_owned()),
+            category: Set("custom".to_owned()),
+            description: Set("Custom test event".to_owned()),
             system_required: Set(false),
             default_enabled: Set(true),
             created_at: Set(now),
@@ -90,7 +117,7 @@ mod tests {
         }
         .insert(&db)
         .await
-        .expect("insert event type");
+        .expect("insert custom event type");
 
         user_notification_settings::ActiveModel {
             username: Set("alice".to_owned()),

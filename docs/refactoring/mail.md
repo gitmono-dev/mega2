@@ -14,7 +14,7 @@
 
 > 本文档中的代码引用已对照当前 `src/` 重新核对。特别注意以下与早期 monoengine 移植状态不一致的事实：
 >
-> **2026-06-19 更新**：(1) `on_cl_comment_created` 已接入真实业务路径——`src/api/router/cl_router.rs::save_comment` 在评论持久化后 best-effort 调用该触发器，outbox 自此有真实生产者（此前仅由测试 enqueue）。(2) email 投递已重构为经 `crate::notification::channels::EmailChannel`（`NotificationChannel` 抽象）投递，dispatcher 由 `NotificationService` 协调启动；mailer 注入语义不变（仍在 vault 之后构造），`mailer_from_config` 与 `SmtpMailer`/`ConsoleMailer` 未变。(3) 管理端模板版本审计/回滚、`mail.template_*` 热加载和 SMTP/mailer 动态重建也已落地；剩余重点是更多业务触发器、原生 HTTP provider（如确有必要）、更完整运维面和 Mailpit/SMTP 故障矩阵。
+> **2026-06-19 更新**：(1) `on_cl_comment_created` 已接入真实业务路径——`src/api/router/cl_router.rs::save_comment` 在评论持久化后 best-effort 调用该触发器，outbox 自此有真实生产者（此前仅由测试 enqueue）。(2) email 投递已重构为经 `crate::notification::channels::EmailChannel`（`NotificationChannel` 抽象）投递，dispatcher 由 `NotificationService` 协调启动；mailer 注入语义不变（仍在 vault 之后构造），`mailer_from_config` 与 `SmtpMailer`/`ConsoleMailer` 未变。(3) 管理端模板版本审计/回滚、`mail.template_*` 热加载和 SMTP/mailer 动态重建也已落地。**2026-06-29 更新**：原生 HTTP provider（`src/mail/http.rs`）已落地，支持 `provider = "http"` 与 `mail.http_url`/`http_headers`/`http_timeout_secs`；剩余重点是更多业务触发器、更完整运维面和 Mailpit/SMTP 故障矩阵。
 
 1. **历史上 `mail` 不是一级模块，也未真正参与编译**。`src/email/mod.rs` 实现了完整的 `Mailer` trait、`NoopMailer`、`SmtpMailer`（基于 `lettre`），并引用了 `MailConfig`，但：
    - `main.rs` 从未声明 `mod email;`（更不用说 `mod mail;`）。
@@ -39,23 +39,23 @@
 
 | 能力 / 组件                  | 实现状态          | 关键事实与风险 |
 |-----------------------------|-------------------|---------------|
-| `MailConfig` 结构体 + 纳入 Config | **已激活** | 添加到 `src/config/model.rs`（`Option<MailConfig>`，`#[serde(default)]`），含默认值函数、`MailProvider`（`smtp` / `console`）、反序列化测试、兼容期明文 `password` 与推荐 `password_ref`。与 mega 结构兼容（扁平 + 额外 toml 字段被忽略）。 |
-| 一级 `mail` 模块 (`src/mail/`) | **已激活** | `mod mail;` 在 `main.rs` 声明。`src/mail/mod.rs` 包含 `Mailer` trait、`NoopMailer`、`ConsoleMailer`、`SmtpMailer::new_with_password(...)`、`mailer_from_config(...)` + 构建消息 + 发送逻辑 + 单元测试。旧 `src/email/` 降级为纯 re-export shim。 |
+| `MailConfig` 结构体 + 纳入 Config | **已激活** | 添加到 `src/config/model.rs`（`Option<MailConfig>`，`#[serde(default)]`），含默认值函数、`MailProvider`（`smtp` / `console` / **`http`**）、反序列化测试、兼容期明文 `password` 与推荐 `password_ref`，以及 HTTP provider 专用的 `http_url` / `http_headers` / `http_timeout_secs`。**2026-06-29 更新**：新增 `http` provider 以支持通用 webhook 式投递。与 mega 结构兼容（扁平 + 额外 toml 字段被忽略）。 |
+| 一级 `mail` 模块 (`src/mail/`) | **已激活** | `mod mail;` 在 `main.rs` 声明。`src/mail/mod.rs` 包含 `Mailer` trait、`NoopMailer`、`ConsoleMailer`、`SmtpMailer::new_with_password(...)`、`mailer_from_config(...)` + 构建消息 + 发送逻辑 + 单元测试。**2026-06-28 更新**：新增 `src/mail/testing.rs`，提供测试用 `MockMailer`。**2026-06-29 更新**：新增 `src/mail/http.rs`，提供 `HttpMailer` 通用 HTTP provider。旧 `src/email/` 降级为纯 re-export shim。 |
 | Notification Dispatcher + 触发器集成 | **已接入编译** | `src/notification/dispatcher.rs` 及测试使用 `crate::mail`。触发器（triggers.rs）使用 NotificationStorage enqueue 逻辑（事件类型、用户偏好过滤）已存在；`main.rs:18` 已声明 `mod notification;`。 |
 | 后台 dispatcher 启动 | **已在 mail 启用时启动，并接入 HTTP graceful shutdown** | `AppContext::new` 在 `VaultCore::new` 之后通过 `mailer_from_config` 构造 provider mailer、创建 `EmailDispatcher` 并 `tokio::spawn(dispatcher.run(shutdown))`；HTTP server shutdown 广播会同时取消 `notification_shutdown`，避免 dispatcher 在进程优雅关停阶段遗留运行。SMTP 构造失败现在返回可诊断错误；发送失败会按 `mail.retry_backoff_base_secs` 指数退避并受 `mail.retry_backoff_max_secs` 截断后重新排队，在达到 `mail.retry_max_attempts` 后转为 `failed` dead-letter，默认仍为 5 次、30s 基础 backoff、300s 上限。`EmailDispatcher` 当前每 tick 先恢复超过 `EMAIL_JOB_SEND_TIMEOUT_SECS = 900` 的 stale `sending` job，再按 `mail.dispatcher_batch_size` 拉取 pending job，并以 `mail.dispatcher_max_in_flight` 做有界并发发送；若启用 `mail.attachment_prune_enabled`，同一 dispatcher 会按 `mail.attachment_prune_interval_secs` 定期清理超过 `mail.attachment_retention_days` 的旧终态附件。默认发送背压仍为 50 / 8，tick 结束输出 sent / retry / dead-letter / skipped / claim-missed / batch_size / max_in_flight / retry policy / attachments_pruned 等结构化汇总。 |
 | 晚于 Vault 的 mailer 构造 | **已落地** | `SmtpMailer::new` / `mailer_from_config` 本身是同步且轻量的，当前调用点在 `context/mod.rs:46-55`，严格晚于 `VaultCore::new`。 |
 | SecretRef / `password_ref` 支持 | **已落地首批** | 当前 `MailConfig.password: Option<SecretString>` 仅为兼容期入口，`password_ref: Option<SecretRef>` 为推荐路径；两者互斥且仅适用于 `provider = "smtp"`，且 `mail.password_ref` / `config secret mail.password` 只接受 `vault://secret/config/<profile>/mail/password#<field>` namespace。`AppContext::new` 在 vault 就绪后通过 resolver 解析 SMTP `password_ref` 并构造 SMTP mailer。 |
-| 多种后端（SES、SendGrid 等） | **SMTP + 本地 provider 已实现** | 已支持 `provider = "smtp"` 与 `provider = "console"`；SES、SendGrid 等可通过其 SMTP relay 使用现有 SMTP provider。console provider 用于本地/dev/CI 干跑，只记录收件人、主题和正文长度，不使用 SMTP 凭据。仍无原生 HTTP API provider；只有在 SMTP relay 不能满足产品需求时才需要新增。 |
+| 多种后端（SES、SendGrid 等） | **SMTP + console + HTTP 已实现** | 已支持 `provider = "smtp"`、`provider = "console"` 与 **`provider = "http"`**；HTTP provider 向 `mail.http_url` POST JSON payload（含 base64 附件），并支持自定义 `http_headers`（如 `Authorization`），可直接对接 SendGrid/SES HTTP API 或自定义 relay。SMTP relay 仍可用。 |
 | 模板 / 富文本 / 附件 | **模板 registry + 启动期 TOML 覆盖 + 管理端审计/预览/持久化 upsert/history/rollback + HTML/Text + 用户 locale + outbox 附件 + 附件 metadata/下载/删除/保留期治理** | `src/mail/template.rs` 已提供轻量 `MailTemplate`、`MailTemplateRegistry`、`LocalizedMailTemplate` 和 `MailTemplateKey`，支持 `{{var}}` 渲染、HTML 变量默认转义、缺失变量脱敏诊断、按 locale 查找以及 language/default fallback；CL 评论触发器已按每个收件人的 `user_notification_settings.preferred_locale` 渲染 subject/html/text，并提供 `zh-CN` 首个本地化模板。`mail.template_default_locale` / `mail.template_dir` 已支持启动期从 TOML 文件加载 key/locale/subject/html/text 覆盖模板，覆盖项按 key + locale 替换内置模板且模板语法 fail-closed 校验；admin-only `GET /admin/mail-templates` 已支持审计内置/外部模板、来源路径和覆盖关系，`POST /admin/mail-templates/preview` 已支持按管理员提供变量预览 subject/html/text 渲染结果，`PUT /admin/mail-templates/{key}/{locale}` 已支持在 `mail.template_dir` 中创建或更新外部 TOML 模板、复用既有来源文件、拒绝坏模板语法并热替换通知模板 registry，history/rollback 端点已支持 `.history` 归档、版本审计和回滚。`send_html(to, subject, html, text?)` 实现 alternative multipart；`send_html_with_attachments(...)` + `MailAttachment` 已支持 SMTP mixed multipart 附件构造，console provider 只记录附件数量/字节数且不输出正文；`email_job_attachments` 已支持 outbox 级附件持久化，dispatcher claim 后会读取附件并调用附件发送路径；admin-only `/admin/email-jobs/{id}/attachments` 已提供附件 metadata 审计视图（id、文件名、content type、字节数、创建时间）且不返回内容，`GET /admin/email-jobs/{job_id}/attachments/{attachment_id}/content` 已支持显式下载单个附件内容，`DELETE /admin/email-jobs/{job_id}/attachments/{attachment_id}` 已支持删除持久化附件，`POST /admin/email-jobs/attachments/prune` 已支持按保留期清理旧 `sent`/`skipped` 终态 job 的持久化附件，并可按 `username` / `event_type_code` 收窄清理范围；`mail.attachment_prune_*` 已支持 dispatcher 内置的可配置自动附件保留清理。仍无更高阶模板引擎和按租户/事件策略预设。 |
 | 与 user_notification_* / 事件类型 的完整联动 | **实体+存储+触发器骨架存在，API 首批落地** | callisto 实体 + NotificationStorage 方法 + triggers（cl.comment 等）已移植自 mega，dispatcher 常驻任务、mailer 注入和失败 dead-letter 基线已接入；admin-only 邮件作业管理 API 已支持按状态/用户/事件查询、状态统计、failed job 手动重排、旧 `sent`/`skipped` 终态 job 清理，以及查看、下载、删除或按保留期清理旧终态 outbox 附件；admin-only 事件类型 API 已支持 list/upsert；用户自助 API 已支持查询当前用户 settings/event preference effective 状态，并更新 global enabled、delivery mode、批量或单个 event preference。仍缺更多业务触发器调用面、更完整观测和运维控制。 |
 | Profile / 热加载 / 集中校验对 mail 的支持 | **部分实现** | Profile、集中校验和 source warning 已接入 config 管线；热加载当前支持 `mail.enabled` true→false 关停 dispatcher 与 false→true 运行时重新启用（启动期 mail 关闭时仍预创建带 NoopMailer 的 dispatcher，reload 后异步重建为配置 provider），`mail.dispatcher_batch_size` / `mail.dispatcher_max_in_flight` 运行期调整 dispatcher 背压参数，`mail.retry_max_attempts` / `mail.retry_backoff_base_secs` / `mail.retry_backoff_max_secs` 运行期调整 retry/dead-letter 策略，`mail.attachment_prune_*` 运行期调整自动附件保留策略，`mail.template_*` 重建模板 registry，以及 `mail.provider`/SMTP 参数/凭据/from/starttls 经异步 mailer 重建热替换。 |
-| 测试与 CI 覆盖 | **部分实现** | mail 自身有构造/消息验证、provider 工厂、console provider、SMTP 附件 mixed multipart 构造、附件 content-type 校验、模板渲染/缺失变量/HTML 转义、template registry、locale fallback、外部 TOML 模板覆盖/来源路径审计/TOML 序列化 round-trip/重复 key-locale 拒绝测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration），并已补充真实 SMTP/Mailpit 正路径测试 `integration_mail_dispatcher_mailpit_sends_outbox_job`，覆盖 pending outbox job 经 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at`，真实 SMTP 连接失败 retry 测试 `integration_mail_dispatcher_smtp_failure_retries_outbox_job`，覆盖 transport 错误后 job 回到 `pending`、`retry_count` 增加且 `next_retry_at` 写入，真实 SMTP 连接失败 dead-letter 测试 `integration_mail_dispatcher_smtp_failure_dead_letters_outbox_job`，覆盖达到尝试上限后 job 进入 `failed` 且不再写入 `next_retry_at`，真实 SMTP 协议拒绝 retry 测试 `integration_mail_dispatcher_smtp_protocol_rejection_retries_without_credential_leak`，覆盖 job 回到 `pending`、`retry_count` 增加且错误中不包含凭据哨兵值，真实 SMTP 认证拒绝 retry 测试 `integration_mail_dispatcher_smtp_auth_rejection_retries_without_credential_leak`，覆盖 job 回到 `pending`、`retry_count` 增加且错误中不包含 username/凭据哨兵值，真实 SMTP 权限/relay 拒绝 retry 测试 `integration_mail_dispatcher_smtp_relay_denied_retries_without_credential_leak`，覆盖 job 回到 `pending`、`retry_count` 增加且错误中不包含 username/凭据哨兵值，真实 SMTP 配置下缺失收件人 skip 测试 `integration_mail_dispatcher_smtp_skips_missing_recipient_without_retry`，覆盖 job 进入 `skipped` 且不递增 retry，以及 `dispatcher_drains_high_water_queue_across_bounded_ticks` 覆盖高水位队列按配置 batch 多 tick 排空；已覆盖 `password_ref` 解析失败脱敏、坏配置不 panic、`mail.enabled` 关停热加载、dispatcher 批次/并发限流热加载、retry policy 热加载、自动附件保留策略热加载、template 配置热加载/失败回滚、provider/SMTP 参数/凭据重配热加载且不泄露 secret、失败发送的 retry/dead-letter disposition、dispatcher 有界并发、单 tick 批次背压、stale `sending` 恢复、storage-level 并发 claim 竞争、跨独立 DB connection pool 的 claim 竞争基线、邮件作业 list/stats/failed retry 管理原语、outbox 附件持久化、附件 metadata 查询/内容读取/删除/保留期清理、dispatcher 自动附件保留清理和 dispatcher 附件投递、admin template list/preview/upsert/history/rollback 管理原语、用户 notification preference/settings response 映射和 update payload 校验、用户 preferred_locale 存储/响应校验，以及 CL 评论触发器按收件人 locale/覆盖 registry 的模板渲染和全收件人显式关闭事件偏好不 enqueue。仍缺更完整 Mailpit/SMTP 故障矩阵、长时间压力形态高水位背压压测和真实多进程/黑盒 claim 竞争矩阵。 |
+| 测试与 CI 覆盖 | **部分实现** | mail 自身有构造/消息验证、provider 工厂、console provider、SMTP 附件 mixed multipart 构造、附件 content-type 校验、模板渲染/缺失变量/HTML 转义、template registry、locale fallback、外部 TOML 模板覆盖/来源路径审计/TOML 序列化 round-trip/重复 key-locale 拒绝测试；dispatcher 有使用 Noop 的集成风格测试（需 DB + migration），并已补充真实 SMTP/Mailpit 正路径测试 `integration_mail_dispatcher_mailpit_sends_outbox_job`，覆盖 pending outbox job 经 `SmtpMailer` 投递到 Mailpit 后进入 `sent` 且写入 `sent_at`，真实 SMTP 连接失败 retry 测试 `integration_mail_dispatcher_smtp_failure_retries_outbox_job`，覆盖 transport 错误后 job 回到 `pending`、`retry_count` 增加且 `next_retry_at` 写入，真实 SMTP 连接失败 dead-letter 测试 `integration_mail_dispatcher_smtp_failure_dead_letters_outbox_job`，覆盖达到尝试上限后 job 进入 `failed` 且不再写入 `next_retry_at`，真实 SMTP 协议拒绝 retry 测试 `integration_mail_dispatcher_smtp_protocol_rejection_retries_without_credential_leak`，覆盖 job 回到 `pending`、`retry_count` 增加且错误中不包含凭据哨兵值，真实 SMTP 认证拒绝 retry 测试 `integration_mail_dispatcher_smtp_auth_rejection_retries_without_credential_leak`，覆盖 job 回到 `pending`、`retry_count` 增加且错误中不包含 username/凭据哨兵值，真实 SMTP 权限/relay 拒绝 retry 测试 `integration_mail_dispatcher_smtp_relay_denied_retries_without_credential_leak`，覆盖 job 回到 `pending`、`retry_count` 增加且错误中不包含 username/凭据哨兵值，真实 SMTP 配置下缺失收件人 skip 测试 `integration_mail_dispatcher_smtp_skips_missing_recipient_without_retry`，覆盖 job 进入 `skipped` 且不递增 retry，以及 `dispatcher_drains_high_water_queue_across_bounded_ticks` 覆盖高水位队列按配置 batch 多 tick 排空；已覆盖 `password_ref` 解析失败脱敏、坏配置不 panic、`mail.enabled` 关停热加载、dispatcher 批次/并发限流热加载、retry policy 热加载、自动附件保留策略热加载、template 配置热加载/失败回滚、provider/SMTP 参数/凭据重配热加载且不泄露 secret、热加载 mailer 重建在 `password_ref` 解析失败时 fail-safe 保留旧 mailer 且错误脱敏（`mailer_rebuild_fails_safely_and_redacts_when_password_ref_unresolvable`）、失败发送的 retry/dead-letter disposition、dispatcher 有界并发、单 tick 批次背压、stale `sending` 恢复、storage-level 并发 claim 竞争、跨独立 DB connection pool 的 claim 竞争基线、邮件作业 list/stats/failed retry 管理原语、outbox 附件持久化、附件 metadata 查询/内容读取/删除/保留期清理、dispatcher 自动附件保留清理和 dispatcher 附件投递、admin template list/preview/upsert/history/rollback 管理原语、用户 notification preference/settings response 映射和 update payload 校验、用户 preferred_locale 存储/响应校验，以及 CL 评论触发器按收件人 locale/覆盖 registry 的模板渲染和全收件人显式关闭事件偏好不 enqueue。仍缺更完整 Mailpit/SMTP 故障矩阵、长时间压力形态高水位背压压测和真实多进程/黑盒 claim 竞争矩阵。 |
 
 **已知加载/启动/安全风险点（必须在相应阶段消除，与 config.md 风险点重叠）**：
 - mailer 或 dispatcher 若被移动到 Storage::new / vault 前路径，会违反 vault 就绪顺序；当前代码位置正确，但需防止后续回归。
 - 兼容期明文 `password` 若由用户配置，仍需避免进入日志、错误、Debug 或 CI 输出。
 - `config/config.toml` 必须保持只给 `password_ref` 占位，不写入示例明文密码。
-- Notification 事件/用户设置的 upsert 逻辑在触发器中（非幂等迁移）。
+- Notification 核心事件类型已迁移到 migration-time seeding；触发器 upsert 仅保留为幂等 fallback，新增事件仍需同步 migration/API registry、触发器常量和模板 key。
 
 ## 总体设计
 
@@ -125,9 +125,9 @@ callisto::{email_jobs, notification_event_types, user_notification_* }
 - NoopMailer 使测试和“邮件未启用”场景零成本。
 - Config 集成后，支持 `MEGA_MAIL__ENABLED=true` 等 env 覆盖和 `${base_dir}` 风格复用（虽 mail 配置中路径较少）。
 
-## 现有 Vault / 引导约束（必须严格遵守）
+## 硬约束与不可违反的原则
 
-与 config.md 「现有 vault 能力与关键约束」完全一致：
+与 config.md 「现有 vault 能力与关键约束」完全一致；以下约束为硬边界，任何实现偏离都必须重新评审：
 
 - mailer 构造**必须**晚于 VaultCore。
 - `config secret set mail.password ...` 等运维命令必须使用**最小 DB/Vault bootstrap**（不能初始化 Redis、对象存储、完整 Storage 服务、HTTP 监听）。
@@ -135,6 +135,19 @@ callisto::{email_jobs, notification_event_types, user_notification_* }
 - 任何在 Storage::new 或 redis init 阶段“触达”密码的行为都是违规的（即使当前是空字符串）。
 
 因此，`MailConfig` 里的 `password` 只作为兼容期入口保留；生产配置应使用 `password_ref`，并由 vault 就绪后的 resolver 路径解析。
+
+## 现状与目标对比
+
+| 维度 | 当前状态 | 目标状态 | 实现难度 |
+|-----|--------|--------|--------|
+| 架构基础 | 一级模块激活，outbox + dispatcher 框架完成，与 Config/Vault 接线就绪 | 强化多实例协调（分布式锁/租约）；完全遵循 config 热加载管道 | 中等 |
+| 密钥管理 | `password_ref` 作为首个 SecretRef 消费端已落地，兼容期明文 `password` 保留 | 明文 `password` 完全退场，vault 加固后升级凭据隐藏等级 | 中等 |
+| Provider 支持 | SMTP + console 已完成；SES/SendGrid 可通过 SMTP relay 使用 | 必要时增加原生 HTTP API provider | 复杂 |
+| 模板与国际化 | registry + TOML 覆盖 + 多 locale + admin 审计/预览/upsert/history/rollback 已落地 | 按租户/事件类型预设；高阶模板继承与默认值机制 | 复杂 |
+| 附件管理 | multipart 构造、持久化、管理 API、清理策略、dispatcher 自动保留已落地 | 优化长期存储成本；副本与跨域备份策略 | 中等 |
+| 可靠性测试 | 基础正路径 + SMTP 失败场景（连接/认证/权限）+ retry/dead-letter 已覆盖 | CI 长期压力验证；真实多进程黑盒 claim 竞争矩阵 | 复杂 |
+| 运维与诊断 | 结构化日志 + 脱敏 + job 管理 API + 退信告警已落地 | 完整 metrics + OpenTelemetry + ops 告警集成 | 中等 |
+| 热加载与灵活性 | `mail.enabled`/provider/SMTP 参数/凭据/`template_*` 已支持运行期调整 | 所有配置项零停机应用；失败自动 rollback | 中等 |
 
 ## Mail 模块的改进方案（一级模块 + SecretRef 就绪）
 
@@ -202,22 +215,22 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 
 `config mail validate --resolve`（或复用 `config validate --resolve-secrets`）应能使用最小 bootstrap 检查 mail 配置是否可发送测试信。
 
-## 迁移步骤（分阶段，绑定 config 阶段）
+## 迁移步骤（分阶段）
 
 > **与 config.md 的强绑定（2026-06-18 更新）**：mail 的后续工作仍依赖 config 的热加载、profile 和 diagnostics 演进。原先阻塞 mail 的构造失败诊断、`SecretRef` + resolver 基础设施和 `password_ref` 首个消费端已经完成首批落地。
 
 **阶段 0（已完成）**：激活一级 mail + MailConfig 入 Config + 修复 notification 引用 + 清理 shim。
 
-**阶段 1（已接入，基线已加固）**：在 service 启动路径中 late-construct mailer 并 spawn dispatcher 已落地；构造失败静默忽略已改为可诊断错误；失败发送已具备可配置 retry + dead-letter disposition，并按 base/max 配置执行指数退避；dispatcher 已具备每 tick 可配置批次/并发限流、结构化汇总日志、stale `sending` 恢复、单 tick 批次背压测试、多 tick 高水位队列 drain 测试、storage-level 并发 claim 竞争测试、跨独立 DB connection pool 的 claim 竞争基线、真实 SMTP/Mailpit 正路径集成测试，以及真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露、权限/relay 拒绝 retry/凭据不泄露与缺失收件人 skip 测试。剩余是完善 Mailpit/SMTP 故障矩阵、长时间压力形态高水位背压验证和真实多进程/黑盒 claim 竞争矩阵。
+**阶段 1（已接入，基线已加固）**：在 service 启动路径中 late-construct mailer 并 spawn dispatcher 已落地；构造失败静默忽略已改为可诊断错误；失败发送已具备可配置 retry + dead-letter disposition，并按 base/max 配置执行指数退避；dispatcher 已具备每 tick 可配置批次/并发限流、结构化汇总日志、stale `sending` 恢复、单 tick 批次背压测试、多 tick 高水位队列 drain 测试（`dispatcher_drains_high_water_queue_across_bounded_ticks` 覆盖 125 个 pending job 在 batch=20/max_in_flight=5 下跨 tick 有界排空）、storage-level 并发 claim 竞争测试、跨独立 DB connection pool 的 claim 竞争基线、真实 SMTP/Mailpit 正路径集成测试，以及真实 SMTP 连接失败 retry/dead-letter、协议拒绝 retry/凭据不泄露、认证拒绝 retry/凭据不泄露、权限/relay 拒绝 retry/凭据不泄露与缺失收件人 skip 测试。剩余是完善 Mailpit/SMTP 故障矩阵、长时间 soak 压力形态高水位背压验证和真实多进程/黑盒 claim 竞争矩阵。
 
 **阶段 2（已完成首批）**：与 config SecretRef 基础设施联动。`MailConfig` 已支持 `password_ref`，resolver 解析路径已在 `AppContext::new` 中落地，`config secret set/check` 已支持 mail password 引用。剩余是继续治理兼容期明文 `password` 的退场策略。
 
 **阶段 3（已完成首批管理面 + template registry/外部 TOML 覆盖 + 管理端模板审计/预览/持久化 upsert + 用户 locale + 本地 provider + outbox 附件 + dispatcher 限流/退信配置）**：邮件作业管理 API 已先落地 admin-only `email-jobs/list`、`email-jobs/stats`、`email-jobs/{id}/retry`、`email-jobs/prune`、`email-jobs/{id}/attachments` metadata 接口、`email-jobs/{job_id}/attachments/{attachment_id}/content` 内容下载接口、`email-jobs/{job_id}/attachments/{attachment_id}` 删除接口和 `email-jobs/attachments/prune` 附件保留期清理接口，支持查询 outbox、按状态统计、将 `failed` job 重新排回 `pending`、按保留期清理旧 `sent`/`skipped` 终态 job，以及查看、下载、删除或按保留期清理旧终态 job 附件；附件保留期清理已支持按 `username` / `event_type_code` 收窄范围；`mail.attachment_prune_*` 已支持 dispatcher 内置的自动附件保留清理策略；admin-only 事件类型 API 已支持 `notification-event-types` list/upsert；admin-only 模板 API 已支持 `mail-templates` list、`mail-templates/preview` 和 `mail-templates/{key}/{locale}` upsert，用于审计内置/外部模板、覆盖关系、来源路径、预览渲染，并向 `mail.template_dir` 持久化外部 TOML 模板后热替换 registry；用户自助偏好 API 已支持 `GET /user/notification/preferences`、`PUT /user/notification/preferences` 和 `PUT /user/notification/preferences/{event_type_code}`，覆盖 global enabled、delivery mode、preferred_locale、批量或单个 event preference；`src/mail/template.rs` 已提供基础模板渲染、template registry、locale fallback 和启动期 TOML 模板覆盖，CL 评论邮件已改为通过 registry 按收件人 locale 生成 subject/html/text 并默认 HTML 转义变量；`mail.provider = "console"` 已提供本地/dev/CI 干跑 provider；`MailAttachment` + `send_html_with_attachments(...)` 已支持 SMTP 附件 multipart 构造；`email_job_attachments` 已支持 outbox 级附件持久化，dispatcher 发送时会加载并传递给 mailer；`mail.dispatcher_batch_size` / `mail.dispatcher_max_in_flight` 已支持运行期调整 dispatcher 背压；`mail.retry_max_attempts` / `mail.retry_backoff_base_secs` / `mail.retry_backoff_max_secs` 已支持运行期调整 retry/dead-letter 策略。
 
-**第三方 Provider 支持说明（2026-06-19）**：真实第三方邮件服务（**Amazon SES、SendGrid 等**）已通过现有 `provider = "smtp"` 直接支持，无需新增 provider 代码——两者都提供 SMTP relay：
-- SES：`smtp_host = "email-smtp.<region>.amazonaws.com"`、`smtp_port = 587`、`starttls = true`，用户名/密码为 SES SMTP 凭据（密码经 `mail.password_ref` 存入 vault）。
-- SendGrid：`smtp_host = "smtp.sendgrid.net"`、`smtp_port = 587`、`username = "apikey"`、密码为 SendGrid API key（经 `mail.password_ref`）。
-原生 HTTP API provider（非 SMTP）并非 SES/SendGrid 支持的必要条件；provider 扩展点本身已由 `console` provider + `Mailer`/`NotificationChannel` 抽象证明可扩展。
+**第三方 Provider 支持说明（2026-06-29 更新）**：真实第三方邮件服务（**Amazon SES、SendGrid 等**）既可通过现有 `provider = "smtp"` 使用其 SMTP relay，也可通过新增的 `provider = "http"` 直接调用其 HTTP API：
+- SMTP relay（已有）：SES `email-smtp.<region>.amazonaws.com:587`、SendGrid `smtp.sendgrid.net:587`，凭据经 `mail.password_ref` 存入 vault。
+- HTTP provider（新增）：配置 `mail.http_url` 与可选 `mail.http_headers`（如 `Authorization: Bearer <token>`），`HttpMailer` 会 POST JSON payload `{to, subject, html, text, attachments}`（附件 base64 编码），可对接 SendGrid `/v3/mail/send`、SES API 或自定义 relay。
+原生 HTTP provider 扩展点已由 `src/mail/http.rs` 落地；SMTP relay 仍保留以兼容已有部署。
 
 ✅ **模板版本审计/回滚（已落地，2026-06-19）**：`mail-templates/{key}/{locale}` upsert 现在覆写前会把旧内容归档到 `{mail.template_dir}/.history/{key}__{locale}/{NNNN}.toml`（顺序版本号；loader 只读顶层 `*.toml`，`.history` 子目录不会被当作 live 模板）。新增 admin-only `GET /admin/mail-templates/{key}/{locale}/history`（列出版本号/subject/字节数）与 `POST /admin/mail-templates/{key}/{locale}/history/{version}/rollback`（回滚到指定版本，回滚本身也归档当前内容，并热替换 registry）。`upsert` 响应新增 `archived_version`。有单测 `mail_template_versions_archive_on_overwrite_and_support_rollback` 覆盖归档编号、列表与还原。更高阶的按租户/事件策略预设同属后续。
 
@@ -227,9 +240,9 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 - **退信告警 hook**：job 进入 dead-letter 时发出 `target: "notification_alert"` 的 warn 事件，供 ops 告警接入（不输出原始错误/收件人 PII）。
 - ✅ **动态 mailer 重建与 mail 运行期重新启用（已落地，2026-06-19；2026-06-23 补 false→true 运行时重启用）**：`mail.provider` / `smtp_host` / `smtp_port` / `username` / `password` / `password_ref` / `from` / `starttls` 已从"需重启"改为运行期热应用。`EmailChannel` 现持 `MailerHandle = Arc<ArcSwap<MailerSlot>>`，每次发送读取当前 mailer；`config_reload_mailer_subscriber`（`src/notification/service.rs`）在这些字段变更时**异步**重建 mailer——通过 `tokio::runtime::Handle::try_current()` 从同步 reload 订阅者 spawn 一个 task，在 vault 就绪态 re-resolve `password_ref`（`VaultSecretResolver`）→ `mailer_from_config` → `handle.store(...)` 热替换；重建失败保留旧 mailer（fail-safe），无运行时则记录需重启。`EmailChannel` 热替换机制有单测 `email_channel_hot_swaps_mailer_via_handle`，reload 行为有 `reload_applies_mail_reconfiguration_and_publishes_snapshot_without_leaking_secrets` / `reload_applies_secret_ref_change_and_publishes_without_leaking`（断言已 applied、快照已发布、report 仅含字段名不泄露 secret）。`mail.enabled` false→true 现在也可运行时完成：`AppContext::new` 在 `[mail]` 存在时即预创建 `NotificationService` 与 dispatcher task（初始 mailer 为 `NoopMailer`、control 按 `mail.enabled && notification.enabled` 关闭），reload 将 `mail.enabled` 从 false 切 true 后，`config_reload_email_dispatcher_subscriber` 打开 control 开关，`config_reload_mailer_subscriber` 异步将 NoopMailer 重建为配置 provider，无需重启进程。
 
-**阶段 5**：完整测试矩阵（坏 SMTP 已覆盖连接失败、dead-letter、协议拒绝、认证拒绝、权限/relay 拒绝和缺失收件人 skip；用户偏好全关场景已覆盖 CL 评论触发器全收件人 opt-out 不 enqueue；仍需解析失败、大量 pending job 背压）、在已有 Mailpit 正路径基线之上扩展 CI 中真实邮件发送干跑与故障矩阵、文档同步（README、部署指南）。Mailpit 正路径测试 `integration_mail_dispatcher_mailpit_sends_outbox_job` 已改为在 Mailpit 不可达时优雅跳过（探测 `MAILPIT_API_URL` 失败即 `eprintln` 提示并 `return`，不再 `panic!`），因此未启动 docker compose 测试栈时不会让整个测试二进制失败；Mailpit 在位时仍完整执行投递断言。
+**阶段 5**：完整测试矩阵（坏 SMTP 已覆盖连接失败、dead-letter、协议拒绝、认证拒绝、权限/relay 拒绝和缺失收件人 skip；用户偏好全关场景已覆盖 CL 评论触发器全收件人 opt-out 不 enqueue；热加载 mailer 重建在 `password_ref` 解析失败时已覆盖 fail-safe 保留旧 mailer 且错误脱敏；大量 pending job 的模块级背压回归已覆盖 125 个 job 跨 tick 有界排空，仍需更长时间 soak/黑盒压测）、在已有 Mailpit 正路径基线之上扩展 CI 中真实邮件发送干跑与故障矩阵、文档同步（README、部署指南）。Mailpit 正路径测试 `integration_mail_dispatcher_mailpit_sends_outbox_job` 已改为在 Mailpit 不可达时优雅跳过（探测 `MAILPIT_API_URL` 失败即 `eprintln` 提示并 `return`，不再 `panic!`），因此未启动 docker compose 测试栈时不会让整个测试二进制失败；Mailpit 在位时仍完整执行投递断言。
 
-### 前置依赖矩阵（2026-06-14 更新）
+## 前置依赖矩阵
 
 | mail 阶段 | 主要工作 | 对 config 的依赖 | 对 vault 的依赖 | 对 notification 的依赖 |
 |----------|--------|------------|-----------|-----------------|
@@ -279,6 +292,14 @@ ConfigLoader + Config::new (含未解析 SecretRef 的 mail)
 所有 mail 相关的实现、文档、测试、配置示例都必须与 config 模块的拆分、CLI LoadMode、最小 bootstrap、日志脱敏、core_key 加固等前置 gate 保持同步。任何试图在 Storage::new 或 `VaultCore::new` 之前构造带真实凭据 mailer 的尝试都必须被视为架构违规。
 
 实施前请完整阅读本档 + `config.md` 的「事实校准」「当前实现状态速览表」「硬约束」「secret 解析的依赖顺序」和「实施前快速检查清单」。
+
+## 预期收益
+
+- **邮件投递链路完整闭合**：从 Config 解析、Vault 解析凭据、Dispatcher 启动到消费侧 enqueue 全链路打通，作为首个 SecretRef 消费端验证了架构顺序与最小 bootstrap 要求（见 `AppContext::new` 链路及 config.md 依赖顺序）。
+- **业务与 I/O 解耦**：outbox 模式把 enqueue 与发送解耦；失败自动重试（指数退避）且有界（可配置次数 + dead-letter）；dispatcher 每 tick 输出结构化计数（sent/retry/dead-letter/skipped），降低邮件丢失与业务阻塞的风险。
+- **用户体验与隐私保护**：邮件偏好过滤、按 recipient locale 驱动多语言渲染；在已覆盖路径上通过错误脱敏与凭据隐藏避免日志/诊断信息泄露（见 `global_redactor` 与 fail-closed 设计及对应脱敏测试）。
+- **运行期灵活性**：`mail.enabled`/provider/SMTP 参数/凭据/`template_*` 可零停机热加载；mailer 重建失败自动保留旧 mailer（fail-safe），支持 `mail.enabled` false→true 运行时重启用（见第 4 阶段 2026-06-23 落地）。
+- **可维护性与扩展性**：与 mega 共享实体与 API（callisto + NotificationStorage）；provider 抽象为后续扩展（HTTP API provider）预留空间；与 config/vault 协同计划明确，降低后续维护成本（见阶段 3-5 与前置依赖矩阵）。
 
 ---
 

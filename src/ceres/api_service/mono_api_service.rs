@@ -98,7 +98,7 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
-    contract::api::common::Pagination,
+    contract::{api::common::Pagination, policy::entitystore::EntityStore},
     jupiter::{
         service::buck_service::{
             CommitArtifacts, CompletePayload as SvcCompletePayload,
@@ -3102,15 +3102,27 @@ impl MonoApiService {
         let url = format!("https://github.com/{owner}/{repo}.git");
         let remote_client = ThirdPartyClient::new(&url);
 
+        let import_dir = self.storage.config().monorepo.import_dir.clone();
+        let fetch_depth = if mega_path.starts_with(&import_dir) {
+            None
+        } else {
+            Some(1)
+        };
+
         let (ref_name, ref_hash) = remote_client.fetch_refs().await?;
 
         let res = remote_client
-            .fetch_packs(std::slice::from_ref(&ref_hash))
+            .fetch_packs(std::slice::from_ref(&ref_hash), fetch_depth)
             .await?;
         let pack_data = remote_client
             .process_pack_stream(res)
             .await
             .map_err(|e| MegaError::Other(format!("{e}")))?;
+        if pack_data.is_empty() {
+            return Err(MegaError::Other(
+                "GitHub sync failed: remote returned no pack data".to_string(),
+            ));
+        }
 
         let repo_path_str = mega_path
             .to_str()
@@ -3142,6 +3154,7 @@ impl MonoApiService {
         let state = ProtocolApiState {
             storage: self.storage.clone(),
             git_object_cache: self.git_object_cache.clone(),
+            entity_store: EntityStore::new(),
         };
         let bytes = protocol
             .git_receive_pack_stream(
@@ -4815,21 +4828,25 @@ async fn test_third_party_trait() {
             }
         };
 
-    let res =
-        match tokio::time::timeout(remote_timeout, third_party_client.fetch_packs(&[refs])).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    "Skipping test_third_party_trait because pack fetch failed: {}",
-                    err
-                );
-                return;
-            }
-            Err(_) => {
-                tracing::warn!("Skipping test_third_party_trait because pack fetch timed out");
-                return;
-            }
-        };
+    let res = match tokio::time::timeout(
+        remote_timeout,
+        third_party_client.fetch_packs(&[refs], Some(1)),
+    )
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                "Skipping test_third_party_trait because pack fetch failed: {}",
+                err
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("Skipping test_third_party_trait because pack fetch timed out");
+            return;
+        }
+    };
 
     match tokio::time::timeout(remote_timeout, third_party_client.process_pack_stream(res)).await {
         Ok(Ok(_)) => {}

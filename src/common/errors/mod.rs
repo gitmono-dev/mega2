@@ -165,6 +165,8 @@ pub enum ProtocolError {
     IO(#[from] std::io::Error),
     #[error("Authentication failed: {0}")]
     Deny(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
     #[error("Repository not found: {0}")]
     NotFound(String),
     #[error("PackFile too large: {0}")]
@@ -185,6 +187,7 @@ impl IntoResponse for ProtocolError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ProtocolError::Deny(err) => (StatusCode::UNAUTHORIZED, err),
+            ProtocolError::Forbidden(err) => (StatusCode::FORBIDDEN, err),
             ProtocolError::TooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
             ProtocolError::NotFound(err) => (StatusCode::NOT_FOUND, err),
             ProtocolError::InvalidInput(err) => (StatusCode::BAD_REQUEST, err),

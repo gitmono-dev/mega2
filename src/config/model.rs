@@ -42,6 +42,15 @@ pub struct Config {
     /// not here (docs/vault.md stage H).
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// OAuth / browser-facing HTTP settings (currently the CORS allow-list).
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
+    /// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
+    #[serde(default)]
+    pub chat: Option<ChatConfig>,
+    /// Git protocol settings (docs/refactoring/protocol.md Stage 4).
+    #[serde(default)]
+    pub git: GitConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -169,6 +178,7 @@ pub enum MailProvider {
     #[default]
     Smtp,
     Console,
+    Http,
 }
 
 pub const DEFAULT_MAIL_DISPATCHER_BATCH_SIZE: u64 = 50;
@@ -225,7 +235,21 @@ pub struct MailConfig {
     pub template_default_locale: String,
     #[serde(default)]
     pub template_dir: Option<PathBuf>,
+    /// URL for the `Http` mail provider. The provider POSTs a JSON payload to
+    /// this endpoint. Required when `provider = "http"`.
+    #[serde(default)]
+    pub http_url: Option<String>,
+    /// Extra headers to send with HTTP provider requests (e.g. `Authorization`).
+    #[serde(default)]
+    pub http_headers: std::collections::HashMap<String, String>,
+    /// Request timeout for the HTTP provider.
+    #[serde(default = "default_http_timeout_secs")]
+    pub http_timeout_secs: u64,
     // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
 }
 
 fn default_smtp_port() -> u16 {
@@ -285,6 +309,9 @@ impl Default for MailConfig {
             attachment_prune_statuses: default_mail_attachment_prune_statuses(),
             template_default_locale: default_mail_template_locale(),
             template_dir: None,
+            http_url: None,
+            http_headers: std::collections::HashMap::new(),
+            http_timeout_secs: default_http_timeout_secs(),
         }
     }
 }
@@ -322,6 +349,43 @@ pub struct NotificationConfig {
     /// Default locale for rendered notifications when a user has none.
     #[serde(default = "default_mail_template_locale")]
     pub default_locale: String,
+    /// Optional Slack incoming-webhook channel (docs/notification.md phase 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<SlackConfig>,
+    /// Optional generic outbound webhook channel (docs/notification.md phase 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookConfig>,
+}
+
+/// Slack incoming-webhook delivery channel (docs/notification.md phase 3).
+///
+/// A Slack incoming-webhook URL embeds a secret token in its path, so the URL
+/// itself is the credential and is supplied as a [`secret::SecretRef`] resolved
+/// from vault after startup — never stored in plaintext config.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct SlackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// SecretRef to the Slack incoming-webhook URL (the URL is the credential).
+    /// Required when `enabled` is true; namespace
+    /// `vault://secret/config/<profile>/notification/slack/webhook_url#<field>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url_ref: Option<secret::SecretRef>,
+}
+
+/// Generic outbound webhook delivery channel (docs/notification.md phase 3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebhookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Destination URL. Operator-trusted, non-secret (unlike a Slack webhook
+    /// URL); required when `enabled` is true.
+    #[serde(default)]
+    pub url: String,
+    /// Optional bearer token SecretRef sent as `Authorization: Bearer <token>`;
+    /// namespace `vault://secret/config/<profile>/notification/webhook/token#<field>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<secret::SecretRef>,
 }
 
 fn default_notification_enabled() -> bool {
@@ -337,6 +401,8 @@ impl Default for NotificationConfig {
             enabled: default_notification_enabled(),
             default_delivery_mode: default_notification_delivery_mode(),
             default_locale: default_mail_template_locale(),
+            slack: None,
+            webhook: None,
         }
     }
 }
@@ -349,28 +415,108 @@ pub struct VaultConfig {
     pub audit: VaultAuditConfig,
 }
 
+/// OAuth / browser-facing HTTP settings.
+///
+/// Currently the strongly-typed home for the HTTP CORS allow-list consumed by
+/// the API server's `CorsLayer`. `allowed_cors_origins` accepts the `MEGA_*`
+/// list-env override (`source.rs` registers `oauth.allowed_cors_origins` as a
+/// list-parse key); when empty the server falls back to its built-in default
+/// origins.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct OAuthConfig {
+    /// Browser origins allowed by CORS (e.g. `https://app.example.com`). Each
+    /// entry must be a valid HTTP header value; an empty list keeps the server's
+    /// built-in defaults.
+    #[serde(default)]
+    pub allowed_cors_origins: Vec<String>,
+}
+
+/// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChatConfig {
+    /// Optional product-level MIME allowlist for chat attachments. When empty or
+    /// absent, all syntactically valid MIME types are accepted (backwards
+    /// compatible). Entries may be exact types (`image/png`) or wildcards
+    /// (`image/*`); invalid patterns are rejected by `Config::validate`.
+    #[serde(default)]
+    pub attachment_allowed_mime_types: Vec<String>,
+    /// Whether to fetch and cache Open Graph link previews for URLs seen in
+    /// messages. Defaults to true.
+    #[serde(default = "default_open_graph_fetch_enabled")]
+    pub open_graph_fetch_enabled: bool,
+    /// Network timeout in milliseconds for a single Open Graph fetch attempt.
+    /// Defaults to 5000 ms.
+    #[serde(default = "default_open_graph_fetch_timeout_ms")]
+    pub open_graph_fetch_timeout_ms: u64,
+    /// Allow Open Graph fetches against localhost/private IPs. Intended for
+    /// tests and isolated development; defaults to false in production.
+    #[serde(default)]
+    pub open_graph_allow_private_networks: bool,
+}
+
+fn default_open_graph_fetch_enabled() -> bool {
+    true
+}
+
+fn default_open_graph_fetch_timeout_ms() -> u64 {
+    5000
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            attachment_allowed_mime_types: Vec::new(),
+            open_graph_fetch_enabled: default_open_graph_fetch_enabled(),
+            open_graph_fetch_timeout_ms: default_open_graph_fetch_timeout_ms(),
+            open_graph_allow_private_networks: false,
+        }
+    }
+}
+
+/// Supported vault audit sinks (docs/vault.md stage H).
+pub const VAULT_AUDIT_SINKS: &[&str] = &["tracing", "file"];
+
 /// Secret-access audit settings (docs/vault.md stage H).
 ///
 /// `enabled` defaults to on, so deployments audit by default; setting it false
-/// opts out of emitting per-access records. The audit destination is the
-/// `vault_audit` `tracing` target; a configurable durable/alternate sink is
-/// deferred (vault.md stage H). The write-failure policy is fail-open: the
-/// `tracing` sink is infallible, so a secret operation is never blocked or
-/// failed by the audit step (availability-over-non-repudiation).
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+/// opts out of emitting per-access records. `sink` selects the destination:
+/// `"tracing"` (default; the infallible `vault_audit` tracing target) or
+/// `"file"` (a durable append-only JSONL log at `file_path`, fsync'd per record).
+/// `fail_closed` makes a failed audit-record write fail the secret operation
+/// (non-repudiation over availability); it only matters for fallible sinks
+/// (`file`) — the `tracing` sink never fails. Audit records carry the operation,
+/// logical secret name, outcome and caller only — never the secret value.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct VaultAuditConfig {
     #[serde(default = "default_vault_audit_enabled")]
     pub enabled: bool,
+    /// `"tracing"` (default) or `"file"`.
+    #[serde(default = "default_vault_audit_sink")]
+    pub sink: String,
+    /// Durable append-only JSONL audit log path; required when `sink = "file"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<PathBuf>,
+    /// Fail the secret operation if the audit record cannot be written
+    /// (default `false` = fail-open).
+    #[serde(default)]
+    pub fail_closed: bool,
 }
 
 fn default_vault_audit_enabled() -> bool {
     true
 }
 
+fn default_vault_audit_sink() -> String {
+    "tracing".to_string()
+}
+
 impl Default for VaultAuditConfig {
     fn default() -> Self {
         Self {
             enabled: default_vault_audit_enabled(),
+            sink: default_vault_audit_sink(),
+            file_path: None,
+            fail_closed: false,
         }
     }
 }
@@ -908,4 +1054,30 @@ impl Default for SidebarConfig {
 
 fn default_visible() -> bool {
     true
+}
+
+/// Git protocol settings (docs/refactoring/protocol.md Stage 4).
+///
+/// Controls whether anonymous (unauthenticated) clients may clone/fetch
+/// repositories via upload-pack. When `anonymous_access` is `false`, every
+/// upload-pack request must carry a valid Bearer or Basic token (HTTP) or
+/// an authenticated SSH key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GitConfig {
+    /// Allow anonymous (unauthenticated) clone/fetch via upload-pack.
+    /// Defaults to `true` (backwards compatible).
+    #[serde(default = "default_git_anonymous_access")]
+    pub anonymous_access: bool,
+}
+
+fn default_git_anonymous_access() -> bool {
+    true
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            anonymous_access: default_git_anonymous_access(),
+        }
+    }
 }

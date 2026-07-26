@@ -76,12 +76,29 @@ impl NotificationService {
         mailer: Arc<dyn Mailer>,
         mail: &MailConfig,
     ) -> Self {
+        Self::from_mail_config_with_extra_channels(stg, mailer, mail, Vec::new())
+    }
+
+    /// Like [`from_mail_config`](Self::from_mail_config) but also registers
+    /// caller-supplied secondary channels (e.g. Slack / webhook built post-vault
+    /// with resolved `SecretRef` credentials, docs/notification.md phase 3). The
+    /// in-app inbox channel is always registered first among the secondaries, so
+    /// the final routing order is `email, in_app, <extra...>`.
+    pub fn from_mail_config_with_extra_channels(
+        stg: NotificationStorage,
+        mailer: Arc<dyn Mailer>,
+        mail: &MailConfig,
+        extra_channels: Vec<Arc<dyn NotificationChannel>>,
+    ) -> Self {
         let inbox: Arc<dyn NotificationChannel> = Arc::new(InAppChannel::new(stg.clone()));
+        let mut channels = Vec::with_capacity(extra_channels.len() + 1);
+        channels.push(inbox);
+        channels.extend(extra_channels);
         Self::new(
             stg,
             mailer,
             EmailDispatcherControl::from_mail_config(mail),
-            vec![inbox],
+            channels,
         )
     }
 
@@ -144,6 +161,9 @@ const MAILER_REBUILD_FIELDS: &[&str] = &[
     "mail.password_ref",
     "mail.from",
     "mail.starttls",
+    "mail.http_url",
+    "mail.http_headers",
+    "mail.http_timeout_secs",
 ];
 
 /// Config-reload subscriber that hot-rebuilds the SMTP mailer when connection /
@@ -195,20 +215,7 @@ fn apply_mailer_rebuild(
     let vault = vault.clone();
     match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
-            runtime.spawn(async move {
-                match rebuild_mailer(&vault, &mail).await {
-                    Ok(mailer) => {
-                        handle.store(Arc::new(MailerSlot(mailer)));
-                        info!("mail mailer hot-rebuilt after config reload");
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %global_redactor().redact(&e.to_string()),
-                            "mail mailer rebuild failed; keeping the previous mailer"
-                        );
-                    }
-                }
-            });
+            runtime.spawn(rebuild_and_swap_mailer(handle, vault, mail));
         }
         Err(_) => {
             warn!(
@@ -220,6 +227,25 @@ fn apply_mailer_rebuild(
     Ok(())
 }
 
+/// Rebuild the SMTP mailer and hot-swap it into `handle`, keeping the previously
+/// installed mailer on failure (fail-safe). Extracted from the task spawned by
+/// [`apply_mailer_rebuild`] so the success/failure outcomes are directly
+/// awaitable in tests instead of only being observable through a detached task.
+async fn rebuild_and_swap_mailer(handle: MailerHandle, vault: VaultCore, mail: MailConfig) {
+    match rebuild_mailer(&vault, &mail).await {
+        Ok(mailer) => {
+            handle.store(Arc::new(MailerSlot(mailer)));
+            info!("mail mailer hot-rebuilt after config reload");
+        }
+        Err(e) => {
+            warn!(
+                error = %global_redactor().redact(&e.to_string()),
+                "mail mailer rebuild failed; keeping the previous mailer"
+            );
+        }
+    }
+}
+
 async fn rebuild_mailer(
     vault: &VaultCore,
     mail: &MailConfig,
@@ -228,7 +254,13 @@ async fn rebuild_mailer(
         && let Some(secret_ref) = &mail.password_ref
     {
         let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-        Some(resolver.resolve(secret_ref).await?)
+        Some(
+            crate::contract::vault::integration::vault_core::with_audit_caller(
+                "reload:mail-password",
+                resolver.resolve(secret_ref),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -239,14 +271,14 @@ async fn rebuild_mailer(
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use sea_orm::EntityTrait;
     use tempfile::TempDir;
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{
-        callisto::{email_jobs, notification_event_types},
+        callisto::email_jobs,
         jupiter::{migration::apply_migrations, tests::test_db_connection},
         mail::NoopMailer,
         notification::channels::ConsoleChannel,
@@ -274,6 +306,38 @@ mod tests {
         assert!(service.channel_for("in_app").is_some());
         assert!(service.channel_for("console").is_some());
         assert!(service.channel_for("slack").is_none());
+    }
+
+    #[tokio::test]
+    async fn from_mail_config_with_extra_channels_registers_slack_and_webhook() {
+        use crate::notification::channels::{SlackChannel, WebhookChannel};
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db));
+        let slack: Arc<dyn NotificationChannel> = Arc::new(
+            SlackChannel::new(crate::config::secret::SecretString::new(
+                "http://127.0.0.1:1/services/secret",
+            ))
+            .unwrap(),
+        );
+        let webhook: Arc<dyn NotificationChannel> =
+            Arc::new(WebhookChannel::new("http://127.0.0.1:1/hook".to_string(), None).unwrap());
+        let service = NotificationService::from_mail_config_with_extra_channels(
+            stg,
+            Arc::new(NoopMailer),
+            &crate::config::MailConfig::default(),
+            vec![slack, webhook],
+        );
+
+        // Order: email, in_app, then the extras.
+        assert_eq!(service.channels().len(), 4);
+        assert_eq!(service.channels()[0].name(), "email");
+        assert_eq!(service.channels()[1].name(), "in_app");
+        assert!(service.channel_for("slack").is_some());
+        assert!(service.channel_for("webhook").is_some());
     }
 
     #[tokio::test]
@@ -342,6 +406,80 @@ mod tests {
         );
     }
 
+    /// docs/mail.md phase 5 ("仍需解析失败"): a hot mailer rebuild whose
+    /// `mail.password_ref` cannot be resolved from the vault must fail *safely* —
+    /// the resolution error is returned (never panicking), it carries only the
+    /// redacted SecretRef (no path/field/value leak), and `apply_mailer_rebuild`
+    /// keeps the previously installed mailer instead of swapping in a half-built
+    /// one. This is the failure counterpart to
+    /// `mailer_rebuild_subscriber_swaps_noop_when_mail_re_enabled`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn mailer_rebuild_fails_safely_and_redacts_when_password_ref_unresolvable() {
+        use arc_swap::ArcSwap;
+
+        use crate::{
+            config::{MailProvider, secret::SecretRef},
+            jupiter::tests::test_storage,
+            mail::NoopMailer,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = test_storage(temp_dir.path()).await;
+        let key_path = temp_dir.path().join("core_key.json");
+        let vault = VaultCore::config(storage.vault_storage(), key_path)
+            .await
+            .expect("vault should initialize");
+
+        // SMTP mail whose password_ref points at a vault path that holds no
+        // secret, so re-resolution during the rebuild fails.
+        let secret_ref =
+            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            username: Some("apikey".to_string()),
+            password: None,
+            password_ref: Some(secret_ref),
+            from: "no-reply@example.com".to_string(),
+            starttls: true,
+            ..Default::default()
+        };
+
+        // The rebuild surfaces an Err (not a panic), and neither the raw nor the
+        // redacted error leaks the SecretRef path/field.
+        let err = match rebuild_mailer(&vault, &mail).await {
+            Ok(_) => panic!("an unresolvable password_ref must fail the rebuild"),
+            Err(e) => e,
+        };
+        let raw = err.to_string();
+        let redacted = global_redactor().redact(&raw);
+        for needle in ["config/test/mail/password", "#value"] {
+            assert!(!raw.contains(needle), "raw rebuild error leaked `{needle}`");
+            assert!(
+                !redacted.contains(needle),
+                "redacted rebuild error leaked `{needle}`"
+            );
+        }
+
+        // End-to-end fail-safe: the swap body that apply_mailer_rebuild spawns
+        // must keep the previously installed mailer when the rebuild fails.
+        // Awaiting it directly drives the failure branch to a deterministic
+        // completion (no detached task to race against), proving the branch ran
+        // and that it never swapped in a half-built mailer.
+        let handle: MailerHandle =
+            Arc::new(ArcSwap::from_pointee(MailerSlot(Arc::new(NoopMailer))));
+        let original = handle.load().0.clone();
+
+        rebuild_and_swap_mailer(handle.clone(), vault.clone(), mail).await;
+
+        assert!(
+            Arc::ptr_eq(&handle.load().0, &original),
+            "a failed rebuild must keep the previous mailer"
+        );
+    }
+
     #[tokio::test]
     async fn service_start_delivers_email_outbox_then_stops_on_shutdown() {
         let dir = TempDir::new().unwrap();
@@ -349,19 +487,9 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db.clone()));
-        let now = chrono::Utc::now().naive_utc();
-        notification_event_types::ActiveModel {
-            code: Set("cl.comment.created".into()),
-            category: Set("cl".into()),
-            description: Set("New comment".into()),
-            system_required: Set(false),
-            default_enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
         stg.enqueue_email_job(
             "alice",
             "alice@example.com",
@@ -411,5 +539,105 @@ mod tests {
         let inbox = stg.list_inbox_notifications("alice", 10).await.unwrap();
         assert_eq!(inbox.len(), 1, "in-app channel should persist an inbox row");
         assert_eq!(inbox[0].event_type_code, "cl.comment.created");
+    }
+
+    /// Multichannel fan-out (docs/integration.md): a registered WebhookChannel
+    /// receives each notification the dispatcher delivers, after the email
+    /// (primary) send succeeds — the end-to-end proof that the phase-3 secret
+    /// channels integrate with the live dispatcher, not just in isolation.
+    #[tokio::test]
+    async fn service_start_fans_out_delivery_to_webhook_channel() {
+        use std::sync::Mutex as StdMutex;
+
+        use axum::{Router, routing::post};
+
+        use crate::notification::channels::WebhookChannel;
+
+        let received: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/hook",
+                post(
+                    |axum::extract::State(state): axum::extract::State<
+                        Arc<StdMutex<Vec<serde_json::Value>>>,
+                    >,
+                     body: axum::body::Bytes| async move {
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                            state.lock().unwrap().push(value);
+                        }
+                        "ok"
+                    },
+                ),
+            )
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{addr}/hook");
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+            .await
+            .unwrap();
+        stg.enqueue_email_job(
+            "bob",
+            "bob@example.com",
+            "cl.comment.created",
+            "Webhook Subject",
+            "<p>Body</p>",
+            Some("Body"),
+        )
+        .await
+        .unwrap();
+
+        let webhook: Arc<dyn NotificationChannel> =
+            Arc::new(WebhookChannel::new(url, None).expect("build webhook channel"));
+        let service = NotificationService::from_mail_config_with_extra_channels(
+            stg.clone(),
+            Arc::new(NoopMailer),
+            &crate::config::MailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            vec![webhook],
+        );
+        // Registration order: email, in_app, webhook.
+        assert!(service.channel_for("webhook").is_some());
+
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { service.start(shutdown).await }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let delivered = loop {
+            if !received.lock().unwrap().is_empty() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        shutdown.cancel();
+        handle.await.unwrap();
+        server.abort();
+
+        assert!(
+            delivered,
+            "webhook channel should receive the fan-out delivery"
+        );
+        let payloads = received.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["username"], "bob");
+        assert_eq!(payloads[0]["event_type"], "cl.comment.created");
+        assert_eq!(payloads[0]["subject"], "Webhook Subject");
+        assert_eq!(payloads[0]["body_html"], "<p>Body</p>");
+        assert_eq!(payloads[0]["body_text"], "Body");
     }
 }
