@@ -7,16 +7,16 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 > **治理规范**：本文档遵循 `../general.md` 中定义的统一结构、共同约束和执行标准。
 > 在审阅或执行本计划前，请先查阅 `general.md`。
 
-## 事实校准（2026-06-28）
+## 事实校准（2026-06-28；IT-07 于 2026-07-29 同步）
 
-> 本文档中的代码引用、测试名与环境配置已对照 `bin/tests/`、`src/notification/`、`docker-compose.test.yml` 和 `.github/workflows/config-validation.yml` 重新核对。需特别注意以下事实：
+> 本文档中的代码引用、测试名与环境配置已对照 `bin/tests/`、`src/notification/`、`docker-compose.test.yml` 和 `.github/workflows/{config-validation,git-protocol-smoke}.yml` 重新核对。需特别注意以下事实：
 
-1. **工作区已拆分**：monoengine 是 Cargo workspace（`Cargo.toml` `members = ["bin"]`）；`monoengine-core`（lib）仅依赖 `orbit-api`，瘦二进制 `monoengine`（`bin/`）依赖实现 crate。黑盒集成测试位于 `bin/tests/integration_vault.rs`（属 `monoengine` bin crate），共享 helper 在 `bin/tests/common/mod.rs`。
-2. **Docker 测试栈已就位**：`docker-compose.test.yml` 定义 PostgreSQL 15（`postgres:15-alpine`，host 端口 15432）、Redis 7（`redis:7-alpine`，16379）、Mailpit（`axllent/mailpit:v1.27`，11025/18025）；使用高位 host 端口避免冲突；无外部 Vault 容器（嵌入式 `VaultCore`）。
+1. **工作区已拆分**：monoengine 是 Cargo workspace（`Cargo.toml` `members = ["bin"]`）；`monoengine-core`（lib）仅依赖 `orbit-api`，瘦二进制 `monoengine`（`bin/`）依赖实现 crate。黑盒集成测试位于 `bin/tests/integration_vault.rs` 与 `bin/tests/integration_git_cli.rs`（属 `monoengine` bin crate），共享 helper 在 `bin/tests/common/`。
+2. **Docker 测试栈已就位**：`docker-compose.test.yml`（固定项目名 `-p monoengine-it`）定义 PostgreSQL 15（host 15432）、Redis 7（16379）、Mailpit（11025/18025）、RustFS（19000/19001）与 `profiles: ["git"]` 的 `git-cli`；使用高位 host 端口避免冲突；无外部 Vault 容器（嵌入式 `VaultCore`）。
 3. **P0 黑盒 CLI/HTTP 门禁已落地**（`bin/tests/integration_vault.rs`）：`config_secret_ref_does_not_load_config`、`config_secret_set_check_and_validate_resolve_secret`、`config_validate_resolve_secrets_fails_when_secret_is_missing`、`config_secret_ref_rejects_bootstrap_secret_fields`、`integration_service_http_smoke`、`integration_service_http_fails_when_mailer_secret_missing`、`integration_config_init_creates_safe_skeleton_and_validates`。
 4. **P1 脱敏与端到端门禁已落地**：脱敏工具 `src/config/redaction.rs` 已实现；活进程门禁 `integration_error_redaction_does_not_leak_db_password`/`..._redis_password`/`..._bad_toml_does_not_leak_values`（`bin/tests/`）断言凭据不泄露；邮件 outbox→Mailpit 端到端由 `integration_mail_dispatcher_mailpit_sends_outbox_job`（`src/notification/dispatcher.rs`）覆盖；CL 评论触发器→enqueue/render 由 `test_on_cl_comment_created_*`（`src/notification/triggers.rs`）覆盖。
 5. **多渠道通知与对象存储已落地（2026-06-27/2026-06-28）**：`NotificationChannel` 抽象支持 slack/webhook/in-app；webhook 扇出由 `service_start_fans_out_delivery_to_webhook_channel`（`src/notification/service.rs`）覆盖；**P2 黑盒 gate `integration_multichannel_notification` 已落地（2026-06-28）**：启动真实 `service http`，通过写入 `email_jobs` outbox 触发 dispatcher，验证 email/Mailpit、in-app、Slack、webhook 均收到扇出；对象存储 `vault://` SecretRef 在 post-vault 启动路径解析（`src/context/mod.rs`），并在 `config validate` / `config secret set/check` / `config validate --resolve-secrets` 中对齐（`src/config/validate.rs`、`src/commands/config.rs`）。**2026-06-29 更新**：新增真实 S3-compatible 后端黑盒 gate `integration_object_storage_s3_compatible_smoke`，基于 `docker-compose.test.yml` 的 RustFS 容器执行对象存储 put/get/delete round-trip。
-6. **CI 门禁**：`.github/workflows/config-validation.yml` 运行 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、配置校验单测与 `cargo test -p monoengine --test integration_vault`、`monoengine-core` 的 `notification::{dispatcher,service,triggers}` 集成测试（启动 postgres+redis+mailpit、`::add-mask::` 凭据脱敏）。
+6. **CI 门禁**：`.github/workflows/config-validation.yml` 是 `cargo test` 主入口（fmt / clippy / `integration_vault` / `integration_git_cli` / `notification::{dispatcher,service,triggers}` 含 IT-06 focused）；`.github/workflows/git-protocol-smoke.yml` 跑 shell smoke，并在协议路径上二次执行 `integration_git_cli`（git/git-lfs 版本由 IT-11 pin）。
 
 ## 审查结论
 
@@ -34,7 +34,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 3. **CLI 能力分层**：当前已有 `config secret ref/set/check/rotate`、
    `config validate [--resolve-secrets]` 以及 `config init`（`config init` 已实现并由
    `config-validation.yml` 的 CI 步骤覆盖）。专门的黑盒用例 `integration_config_init_creates_safe_skeleton_and_validates` 已单列（`bin/tests/integration_vault.rs`）。
-4. **功能边界过宽**（原始分析；部分已落地）：多渠道通知与 Slack/webhook/in-app 投递**已落地**（`NotificationChannel` 抽象 + dispatcher 扇出，2026-06-27 已补模块集成测试，见下表「可行性」行），热加载白名单与用户通知 API 接口亦已实现（单测充分）；其专门的黑盒进程 gate 仍可作为后续 P2 单列，但不放进当前 P0 集成测试 gate。
+4. **功能边界过宽**（原始分析；部分已落地）：多渠道通知与 Slack/webhook/in-app 投递**已落地**（`NotificationChannel` 抽象 + dispatcher 扇出，2026-06-27 已补模块集成测试，见下表「可行性」行），热加载白名单与用户通知 API 接口亦已实现；**热加载 / 多渠道黑盒进程 gate 已落地**（`integration_config_hot_reload`、`integration_multichannel_notification`），详见「P2：能力 gate 收口」。
 5. **二进制 crate 测试边界**：本仓库为 Cargo workspace——库 crate `monoengine-core`
    （`src/lib.rs`）+ 瘦二进制 crate `monoengine`（`bin/src/main.rs`，见 `orbit.md`）。
    黑盒集成测试位于 `bin/tests/integration_*.rs`，通过
@@ -56,7 +56,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 | 可行性 | **（2026-06-27）多渠道通知与对象存储 SecretRef 已补模块集成测试**：`src/notification/service.rs::tests::service_start_fans_out_delivery_to_webhook_channel` 用本地 axum server 验证 `WebhookChannel` 作为 secondary 渠道在 email 主投递成功后收到 dispatcher 扇出（Slack 渠道为同一 `NotificationChannel` 抽象的 webhook 变体）；`src/context/mod.rs::tests` 验证 `object_storage.s3` 凭据的 `vault://` SecretRef 在 post-vault 解析（字面量透传 / 单&双 ref / 缺失报错不 panic）。workspace 拆分后黑盒测试位于 `bin/tests/`（`monoengine` bin crate，不导入内部模块），模块集成测试在 `monoengine-core` 内可 `use crate::`。 | 分成黑盒进程测试、模块集成测试和未来 gate。 |
 | 完整性 | 覆盖面广但缺少测试夹具、隔离、端口冲突、fallback 检测、超时与清理策略。 | 增加环境隔离、数据隔离、超时、清理和覆盖矩阵。 |
 | 安全性 | 原方案要求脱敏但未指出彼时 DB URL 的泄露风险；外部 Vault root token 反而增加误导。 | 明确禁用外部 Vault 容器，secret 只经 stdin；日志脱敏 P1 gate 已落地（DB/Redis 连接串脱敏 + 活进程门禁）。 |
-| 功能正确性与接口兼容性 | `SecretRef`、mail.password、**多渠道通知（Slack/webhook 渠道 + dispatcher 扇出，2026-06-27 已落地并补模块集成测试）** 与对象存储 SecretRef 路径均已对接当前代码；`config init` 黑盒用例已落地（`integration_config_init_creates_safe_skeleton_and_validates`），热加载黑盒用例（接口已实现，单测充分）仍可作为后续 P2 gate 单列。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
+| 功能正确性与接口兼容性 | `SecretRef`、mail.password、**多渠道通知（Slack/webhook 渠道 + dispatcher 扇出，2026-06-27 已落地并补模块集成测试）** 与对象存储 SecretRef 路径均已对接当前代码；`config init` 黑盒用例已落地（`integration_config_init_creates_safe_skeleton_and_validates`）；**热加载黑盒**（`integration_config_hot_reload`）与**多渠道黑盒**（`integration_multichannel_notification`）亦已落地（见 P2 收口表）。 | 当前 gate 只使用已存在 CLI 和 HTTP/service 接口。 |
 | 数据流与控制流正确性 | 原方案的主链路大体正确，但忽略实际启动顺序（DB+migrations → DB-backed Vault → 对象存储 SecretRef 解析/构造 → Storage → Redis → mail 在 Vault 后构造）。 | 明确启动顺序和每类测试允许触达的依赖。 |
 | 性能与效率 | 原方案每次可能重建容器、重跑 release build，成本高。 | 复用 compose stack，测试使用 dev/test binary，按测试隔离 DB/schema。 |
 | 可靠性与容错性 | 原方案依赖固定 sleep/默认端口，且没有明确数据库连接目标。 | 使用 healthcheck + 主动探测，测试必须证明连接的是 PostgreSQL。 |
@@ -91,7 +91,7 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 4. **启动顺序硬约束。** `Config → database_connection()（执行 migrations）→ DB-only VaultCore bootstrap → resolve object_storage SecretRef → build 对象存储 + Storage::new_with_connection → Redis → Mail → Notification → HTTP`（实际顺序见 `AppContext::new`；migrations 在 `database_connection()` 内、vault bootstrap 之前完成）。理由：顺序改变会影响 secret 可用性与依赖解析。
 5. **Secret 值禁止出现在 CLI 参数、日志、panic 中。** 只能经 stdin、受权限保护的文件或 CI secret 注入；日志须经脱敏工具（`redact_db_url`/`redact_redis_url`）。理由：防止凭据泄露到日志、版本控制、事故回放。
 6. **测试数据隔离与清理。** 每个测试使用独立临时目录，并通过独立数据库或 schema 隔离（黑盒进程测试建独立数据库，模块测试用 schema）；结束后删除 `core_key.json` 与临时配置。理由：防止测试间污染、凭据复用、密钥文件泄露。
-7. **三项 gate（本地与 CI 等价）。** 本地必须通过 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test`（指定相关用例）；CI（`config-validation.yml`）以等价方式执行——直接设置 `MEGA_DATABASE__DB_URL`/`MEGA_REDIS__URL`/`MAILPIT_API_URL` 等环境变量后运行 `cargo test -p monoengine --test integration_vault` 与 `monoengine-core` 的 `notification::{dispatcher,service,triggers}` 过滤测试。理由：保持验收标准统一、可回归。
+7. **三项 gate（本地与 CI 等价）。** 本地必须通过 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test`（指定相关用例）；CI 以等价方式执行——`config-validation.yml` 直接设置 `MEGA_DATABASE__DB_URL`/`MEGA_REDIS__URL`/`MAILPIT_API_URL` 等后运行 `integration_vault`、`integration_git_cli` 与 `monoengine-core` 的 `notification::{dispatcher,service,triggers}`（含 IT-06 focused）；`git-protocol-smoke.yml` 另在协议路径二次跑 `integration_git_cli`。理由：保持验收标准统一、可回归。
 
 ## 现状与目标对比
 
@@ -121,47 +121,10 @@ checklist 与客户端版本确定性规则，统一见
 不要包含 Vault 容器。Vault 是 monoengine 进程内组件，状态来自数据库和测试用
 `MEGA_BASE_DIR` 下的 `core_key.json`。
 
-```yaml
-services:
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: mono
-      POSTGRES_PASSWORD: mono_test_password
-      POSTGRES_DB: monoengine_it
-    ports:
-      - "127.0.0.1:15432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mono -d monoengine_it"]
-      interval: 2s
-      timeout: 5s
-      retries: 20
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "127.0.0.1:16379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 5s
-      retries: 20
-
-  mailpit:
-    image: axllent/mailpit:v1.27
-    ports:
-      - "127.0.0.1:11025:1025"
-      - "127.0.0.1:18025:8025"
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8025"]
-      interval: 2s
-      timeout: 5s
-      retries: 20
-
-networks:
-  default:
-    name: monoengine-test-net
-```
+编排以仓库根 [`docker-compose.test.yml`](../../docker-compose.test.yml) 为**唯一事实源**（含
+postgres / redis / mailpit / rustfs / rustfs-init / git-cli 与 `shm_size` 等）。本文**不**内嵌
+compose YAML，避免与真实栈漂移；本地与 CI 启停命令统一见上文「本地快速运行」与
+[`test-infra.md`](./test-infra.md)。
 
 ### 配置隔离
 
@@ -388,17 +351,17 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 `vault_core.rs::tests::test_vault_fails_closed_after_key_file_loss` 覆盖。5 个 bullet 中 3 个已有
 活进程黑盒门禁，其余 2 个由模块级集成测试覆盖。
 
-## P2：未来能力 gate
+## P2：能力 gate 收口
 
-`config init` 黑盒用例已落地；其余能力不属于当前可执行 gate，只有当对应功能实现并稳定后，才新增集成测试。
+P2 清单全部结论为「已落地」或「书面关闭」；不再保留「延后」结案（与 PT-01 完成判据对齐）。
 
-| 能力 | 前置条件 | 验收方向 |
+| 能力 | 结论 | 验收方向 / 证据 |
 | --- | --- | --- |
-| `config init` | 已落地（黑盒） | 无 DB/Redis/Vault 时生成无真实 secret 的配置骨架；`bin/tests/integration_vault.rs::integration_config_init_creates_safe_skeleton_and_validates` 覆盖 |
-| 热加载 | 明确 SIGHUP 或 HTTP API、白名单字段、失败回滚语义 | 白名单生效，非白名单拒绝，旧配置继续服务 |
-| 多渠道通知 | `NotificationChannel` trait、Slack/webhook/in-app outbox 与用户偏好 API | 每渠道独立投递、重试、禁用策略 |
-| 用户通知设置 API | DTO/router/权限策略实现 | 用户可查询/修改偏好，系统必发事件不可关闭 |
-| 对象存储 SecretRef | `Storage::new` 拆成 DB-only -> Vault -> resolve -> full storage | S3/GCS 凭据从 Vault 解析，最小 bootstrap 不依赖对象存储 |
+| `config init` | **已落地** | 无 DB/Redis/Vault 时生成无真实 secret 的配置骨架；证据：`bin/tests/integration_vault.rs::integration_config_init_creates_safe_skeleton_and_validates` |
+| 热加载 | **已落地** | 触发机制为**轮询文件 watcher**（base/profile 文件变更），非 SIGHUP、非 HTTP API；白名单生效、非白名单仅报告 restart-required 且旧配置继续服务、非法 TOML 拒绝且服务不中断。证据：`bin/tests/integration_vault.rs:872`（`integration_config_hot_reload`） |
+| 多渠道通知 | **已落地**（扇出正路径）；次渠道失败 retry **书面关闭**（`DEFER-IT-10`） | email / in-app / Slack / webhook **扇出正路径**已落地：证据 `bin/tests/integration_vault.rs:1008`（`integration_multichannel_notification`）。次渠道（Slack/webhook/in-app）投递失败时 `process_email_job` 仅 best-effort 打日志、主邮件成功仍记 Sent，**无**独立 per-channel retry（`src/notification/dispatcher.rs`）；缺口承接 `DEFER-IT-10`（PT-09） |
+| 用户通知设置 API | **书面关闭**（`DEFER-IT-07`） | 用户偏好查询/更新 API 已落地（`GET/PUT /user/notification/preferences`）。原验收方向「系统必发事件不可关闭」未完全满足：per-event `system_required` 不可被单事件偏好关闭，但全局 `enabled=false` 仍会在 `should_send` 中先于 `system_required` 短路（`src/jupiter/storage/notification_storage.rs`）。缺口承接编号：`DEFER-IT-07`（登记于 `docs/plan/plan-20260727.md`「非目标与延后项」；修复时同步修订 `docs/refactoring/notification.md` 中「system_required 可强制」的过时表述） |
+| 对象存储 SecretRef | **书面关闭**（GCS 部分，`DEFER-IT-08`）；S3/RustFS **已落地** | S3 凭据 `vault://` 解析 + 真实 RustFS 后端 smoke 已落地（`config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs`、`integration_object_storage_s3_compatible_smoke`）。GCS 凭据/真实后端 gate 未做，书面关闭并承接 `DEFER-IT-08` |
 
 ## 执行方式
 
@@ -441,78 +404,14 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v
 P0 的 CLI 黑盒测试已位于 `bin/tests/integration_vault.rs`；新增黑盒测试放在 `bin/tests/` 下。不要为了集成测试新增不必要依赖；
 首版可以只用 `std::process::Command`、`std::net::TcpStream`、`reqwest`、`sea-orm` 和现有依赖。
 
-### CI 示例
+### CI 入口
 
-```yaml
-name: Integration Tests
+不要在本文内嵌第二套 workflow / services 拓扑。仓库实际生效的工作流是：
 
-on: [push, pull_request]
+- [`.github/workflows/config-validation.yml`](../../.github/workflows/config-validation.yml)（`validate-config`：fmt / clippy / compose `-p monoengine-it --profile git` 启栈、`integration_vault`、`integration_git_cli`、dispatcher/service/triggers 集成含 IT-06 focused）
+- [`.github/workflows/git-protocol-smoke.yml`](../../.github/workflows/git-protocol-smoke.yml)（协议路径变更时再跑 `integration_git_cli` + 宿主机 git 脚本矩阵；客户端版本 pin 见 `test-infra.md`）
 
-jobs:
-  integration:
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: mono
-          POSTGRES_PASSWORD: mono_test_password
-          POSTGRES_DB: monoengine_it
-        ports:
-          - 15432:5432
-        options: >-
-          --health-cmd "pg_isready -U mono -d monoengine_it"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 20
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 16379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 20
-
-      mailpit:
-        image: axllent/mailpit:v1.27
-        ports:
-          - 11025:1025
-          - 18025:8025
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Mask integration secrets
-        run: |
-          echo "::add-mask::mono_test_password"
-          echo "::add-mask::smtp-test-password"
-
-      - name: Required checks
-        run: |
-          cargo +nightly fmt --all --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          source .env.test && cargo test --all
-
-      - name: Integration tests
-        env:
-          MEGA_DATABASE__DB_TYPE: postgres
-          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
-          MEGA_REDIS__URL: redis://127.0.0.1:16379
-          MAILPIT_API_URL: http://127.0.0.1:18025
-        run: |
-          cargo test -p monoengine --test integration_vault -- --nocapture --test-threads=1
-          cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
-          cargo test -p monoengine-core 'notification::service::tests' -- --nocapture
-          cargo test -p monoengine-core 'notification::triggers::tests' -- --nocapture
-```
-
-> 上述为示例。仓库实际生效的工作流是 `.github/workflows/config-validation.yml`，其「Check formatting」步骤跑 `cargo +nightly fmt --all --check`、「Lint」步骤跑 `cargo clippy --all-targets --all-features -- -D warnings`（与本示例及 general.md 第 297/310 行强制的 clippy 验收门禁对齐；stable 工具链以 `--component clippy` 安装），「Start test services」步骤以 `docker compose ... up -d --wait` 启动 postgres+redis+mailpit+rustfs 并随后以 `--profile init run --rm rustfs-init` 初始化 bucket，「Mask test secrets」步骤注入 `::add-mask::`，「Run integration tests」步骤运行上面这组集成测试。
+编排与服务登记的单一事实源仍是 [`docker-compose.test.yml`](../../docker-compose.test.yml) 与 [`test-infra.md`](./test-infra.md)。
 
 ## 数据流与控制流契约
 
@@ -590,7 +489,7 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
   - 影响：本地或 CI 测试因端口占用失败。
   - 缓解措施：`docker-compose.test.yml` 统一使用高位 host 端口（15432/16379/11025/18025）。
 - **风险：测试栈未启动。**
-  - 影响：依赖 PostgreSQL/Redis 的黑盒 gate（如 `bin/tests/integration_vault.rs` 的 service/redaction 用例）在 compose 栈缺失时**硬失败（panic）**，必须先 `docker compose -f docker-compose.test.yml up -d --wait`。
+  - 影响：依赖 PostgreSQL/Redis 的黑盒 gate（如 `bin/tests/integration_vault.rs` 的 service/redaction 用例）在 compose 栈缺失时**硬失败（panic）**，必须先 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait`。
   - 缓解措施：仅 Mailpit 相关用例（如 `integration_mail_dispatcher_mailpit_sends_outbox_job`）在探测 `MAILPIT_API_URL` 不可达时优雅跳过（`eprintln` 提示并 `return`，不 `panic!`）；PostgreSQL/Redis 类 gate 以"先起栈"为前提，CI 的「Start test services」步骤保证依赖就绪。
 - **风险：手写 schema 偏离生产。**
   - 影响：测试通过但生产 schema/约束不匹配。
@@ -617,7 +516,7 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
 | `integration_object_storage_s3_secret_ref` | P2 已落地（黑盒） | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
 | `integration_config_hot_reload` | **P2 已落地（2026-06-28）** | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | **P2 已落地（2026-06-28）**：启动真实 `service http`，通过写入 `email_jobs` outbox 触发 dispatcher，验证 email/Mailpit、in-app、Slack、webhook 多渠道扇出 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
-| `integration_git_cli` | **P2 已落地（2026-07-29，IT-03）**：`bin/tests/integration_git_cli.rs` 经 compose `git-cli`（Linux 目标 OS；宿主机 git 仅 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 本地实验）对真实 `service http` 做 clone→push→再 clone（默认 tip）+ 定向 fetch 新 `refs/cl/*` tip 的工作树字节比对与用例隔离；token 经 credential/`GIT_ASKPASS` 注入（不做认证边界/失败路径，见 IT-10/IT-12） | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分（token 不入 remote URL） |
+| `integration_git_cli` | **P2 已落地（2026-07-29，IT-03/10/12）**：`bin/tests/integration_git_cli.rs` 经 compose `git-cli`（Linux 目标 OS；宿主机 git 仅 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 本地实验）对真实 `service http` 做 clone→push→再 clone（默认 tip）+ 定向 fetch 新 `refs/cl/*` tip 的工作树字节比对与用例隔离；IT-10 认证边界（未认证 push 401 + `WWW-Authenticate`、token 零泄漏）；IT-12 失败路径（保留根 `/third-party.git/` 被 `parse_git_protocol_path` 拒绝后 clone 非零退出且服务存活；形态合法 missing repo 见 `DEFER-IT-12`/PT-04） | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分（token 不入 remote URL；零泄漏守卫） |
 | `integration_mail_dispatcher_two_instances_deliver_exactly_once` | **P2 已落地（2026-07-29，IT-06）**：同一测试 DB 上两个 `EmailDispatcher` 实例并发 `tick_once`，真实 Mailpit 收到恰好 N 封且无同 subject 重复；含 stale `sending` 恢复路径；Mailpit 不可达时 fail-closed | ✓ | ✓ | - | - | ✓ | outbox | - | - | - |
 
 ## 迁移步骤（分阶段）
@@ -636,8 +535,8 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
 4. **Phase 3：P1 安全与通知 gate**
    - 先修复 redaction 缺口。
    - 再启用 `integration_error_redaction` 和 notification trigger 到 mail。
-5. **Phase 4：P2 未来能力 gate**
-   - 多渠道通知与对象存储 SecretRef 已落地并补模块集成测试（见上）；`config init` 专门黑盒进程用例已落地（`integration_config_init_creates_safe_skeleton_and_validates`）；**热加载专门黑盒进程用例 `integration_config_hot_reload` 已落地（2026-06-28）**，基于 base/profile 文件 watcher 触发，验证白名单热生效、restart-required 旧配置继续服务、坏 TOML 拒绝回退；**多渠道通知专门黑盒进程用例 `integration_multichannel_notification` 已落地（2026-06-28）**，启动真实 `service http`，通过写入 `email_jobs` outbox 触发 dispatcher，验证 email/Mailpit、in-app、Slack、webhook 均收到扇出。
+5. **Phase 4：P2 能力 gate（已收口）**
+   - 多渠道扇出、`config init`、热加载黑盒均已落地；次渠道失败 retry 书面关闭（`DEFER-IT-10`）；对象存储 SecretRef 的 **S3/RustFS** 路径已落地，**GCS** 书面关闭（`DEFER-IT-08`）；用户通知全局 disabled vs `system_required` 书面关闭（`DEFER-IT-07`）。详见「P2：能力 gate 收口」与覆盖矩阵。
 
 ## 前置依赖矩阵
 
@@ -650,8 +549,8 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
 | P0 service HTTP smoke（启动顺序） | **config.md**、**vault.md**、**orbit.md**（对象存储注入）、**mail.md**（SMTP 初始化） | 协同 | 启动顺序与各模块 fail-closed 策略必须统一 |
 | P0/P1 邮件投递与触发器端到端 | **mail.md**（outbox/dispatcher）、**notification.md**（事件类型、触发器、多渠道扇出） | 协同 | outbox schema、dispatcher tick、trigger API 与文档一致；Mailpit 支持 SMTP 故障模拟 |
 | P1 脱敏门禁 | **config.md**（`redaction.rs`、日志策略）、**vault.md**（解析失败策略） | 后置 | `redact_db_url`/`redact_redis_url` 须已落地 |
-| P2 热加载黑盒 gate | **config.md**（`ConfigHandle`/watcher/订阅者白名单） | 后置 | 热加载逻辑与单测须已就位，明确 SIGHUP/HTTP 触发方式 |
-| P2 多渠道/对象存储黑盒 gate | **notification.md**（渠道抽象）、**vault.md**/**orbit.md**（对象存储 SecretRef） | 后置 | 渠道凭据与对象存储 SecretRef 的 validate/CLI 对齐后再补黑盒 gate |
+| P2 热加载黑盒 gate | **config.md**（`ConfigHandle`/watcher/订阅者白名单） | 协同 | **已落地**：触发为轮询文件 watcher（非 SIGHUP/HTTP）；证据 `integration_config_hot_reload` |
+| P2 多渠道/对象存储黑盒 gate | **notification.md**（渠道抽象）、**vault.md**/**orbit.md**（对象存储 SecretRef） | 协同 | **已落地（S3/RustFS）**：`integration_multichannel_notification` + S3 SecretRef / RustFS smoke；GCS 书面关闭见 `DEFER-IT-08` |
 | 覆盖矩阵维护 | **contract.md**（API DTO 路径）、所有模块文档 | 协同 | API/功能变更先更新矩阵，再落测试 |
 
 ## 故障排查
@@ -659,10 +558,10 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
 ### 容器未就绪
 
 ```bash
-docker compose -f docker-compose.test.yml ps
-docker compose -f docker-compose.test.yml logs postgres
-docker compose -f docker-compose.test.yml logs redis
-docker compose -f docker-compose.test.yml logs mailpit
+docker compose -p monoengine-it -f docker-compose.test.yml ps
+docker compose -p monoengine-it -f docker-compose.test.yml logs postgres
+docker compose -p monoengine-it -f docker-compose.test.yml logs redis
+docker compose -p monoengine-it -f docker-compose.test.yml logs mailpit
 ```
 
 ### 未连接到预期 PostgreSQL
@@ -709,7 +608,7 @@ monoengine --config <temp>/config.toml \
 
 ## 小结
 
-本集成测试方案用接近生产的 PostgreSQL/Redis/Mailpit 容器栈 + 嵌入式 `VaultCore` + 真实 migrations，按 `Config → database_connection()（含 migrations）→ DB-only Vault bootstrap → 对象存储 → Storage → Redis → Mail/Notification → HTTP` 的真实启动顺序，验证跨模块数据流、控制流与脱敏边界。它把已可落地的 P0/P1 gate（CLI secret、config validate、service smoke、邮件投递与触发器、脱敏门禁）与未来能力 gate（P2 热加载/多渠道/对象存储黑盒）显式分离，前者已在 `bin/tests/` 与 `monoengine-core` 模块集成测试 + CI 中稳定执行。原方案中“外部 Vault + 手写 schema”的偏差已修订为嵌入式 Vault + 真实 migrations，与当前 workspace 架构一致。
+本集成测试方案用接近生产的 PostgreSQL/Redis/Mailpit/RustFS/git-cli 容器栈 + 嵌入式 `VaultCore` + 真实 migrations，按 `Config → database_connection()（含 migrations）→ DB-only Vault bootstrap → 对象存储 → Storage → Redis → Mail/Notification → HTTP` 的真实启动顺序，验证跨模块数据流、控制流与脱敏边界。P0/P1 gate 与 **已落地的 P2 正路径**（热加载/多渠道扇出/`config init`）均在 `bin/tests/`、`monoengine-core` 模块集成测试与 CI 中执行；书面关闭项为用户通知全局 disabled vs `system_required`（`DEFER-IT-07`）、GCS 后端（`DEFER-IT-08`）、次渠道失败 retry（`DEFER-IT-10`），不声称已在 CI 执行。原方案中“外部 Vault + 手写 schema”的偏差已修订为嵌入式 Vault + 真实 migrations，与当前 workspace 架构一致。
 
 ## 预期收益
 

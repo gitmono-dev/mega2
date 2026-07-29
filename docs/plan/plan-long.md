@@ -61,7 +61,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 |---|---|---|---|
 | 2026-07-27 | `d2b6d1c3`（#2157） | v0.1.50（`562122c2`，同步分析基于 #2129） | 首版：确认 orion 三件套、ceres/bus+infra、协议测试夹具为主要缺口；已移植模块存在 #2129→#2157 漂移窗口；集成测试基建（PT-01）排为下一个执行任务，Mega 基线追平（PT-02）紧随其后 |
 
-**本次结论：PT-01（集成测试基建扩展与统一）是下一个执行任务；orion 三件套是最大整体缺口。**
+**本次结论：PT-01（集成测试基建扩展与统一）文档收口已随 v0.1.176 发布；IT-03/04/11 D 组仍 `remote-pending`；orion 三件套仍是最大整体缺口。**
 
 ## 规划原则
 
@@ -94,21 +94,21 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | Git smart HTTP/SSH 协议 | `info/refs` 严格化、fallible pkt-line parser、SSH exec parser、receive-pack 分割、capability truth table 首批止血完成（`docs/refactoring/protocol.md`） | PT-03/PT-04 的起点 |
 | bellatrix（orion-client 部分移植） | build dispatch 路径可用，替代 Mega mono 的 `orion_build_dispatch.rs` | PT-06/PT-07/PT-08 的客户端侧基础 |
 | chat 模块（源：campsite Rails，非 Mega） | Slice 0–5 主干完成（9 表、storage、service、router、附件、事件 hub、`chat-migrate` CLI；`docs/refactoring/chat.md`） | 独立改进计划治理，不占 PT 编号 |
-| 集成测试基建 | docker-compose 测试栈（postgres/redis/mailpit）、`bin/tests/integration_vault.rs` 黑盒、错误脱敏活进程门禁、CI `config-validation.yml` | 全部 PT 的验收承载；拓扑扩展与统一由 PT-01 承接 |
+| 集成测试基建 | docker-compose 测试栈（postgres/redis/mailpit/rustfs/git-cli，`-p monoengine-it`）、`bin/tests/integration_vault.rs` + `integration_git_cli.rs` 黑盒、错误脱敏活进程门禁、CI `config-validation.yml`（主 `cargo test`）与 `git-protocol-smoke.yml`（协议路径二次 `integration_git_cli`） | 全部 PT 的验收承载；PT-01 收口最小矩阵；SSH/LFS 完整夹具与协议级矩阵仍由 PT-04 承接 |
 
 ## 长期功能总览
 
 | ID | 能力 | 优先级 | 状态 | 当前判断 | Mega 证据（revision `d2b6d1c3`） | 已关联日期计划 | 最近验证 |
 |---|---|---:|---|---|---|---|---|
-| PT-01 | 集成测试基建扩展与统一 | P0 | 已排期（**下一个执行任务**） | 测试栈与黑盒分层只覆盖 config/vault/mail/notification；真实 Git CLI 矩阵、orion ws、多实例竞争、热加载黑盒无承载 | `mega/tests/`（对照）、`docs/refactoring/integration.md` P2 清单 | [`plan-20260727.md`](plan-20260727.md)（IT-01..IT-07） | 2026-07-27 |
+| PT-01 | 集成测试基建扩展与统一 | P0 | **收口中**（IT-07/IT-09 已发布；D 组待绿，2026-07-29） | git-cli runner、HTTP 最小矩阵、热加载/多渠道扇出黑盒、并发 dispatcher 基线与 CI 执行/触发面已落地；P2：`config init`/热加载/多渠道扇出已落地，次渠道 retry（`DEFER-IT-10`）、GCS（`DEFER-IT-08`）、全局 disabled vs `system_required`（`DEFER-IT-07`）书面关闭；SSH/LFS 完整矩阵与真多进程黑盒仍属 PT-04/PT-09 | `mega/tests/`（对照）、`docs/refactoring/integration.md` P2 清单 | [`plan-20260727.md`](plan-20260727.md)（IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12；IT-05 已关闭为非任务卡） | 2026-07-29 |
 | PT-02 | 已移植模块 Mega 基线追平与持续同步 | P0 | 已验证 | monoengine 同步基线停在 Mega #2129，Mega 已到 #2157；callisto/jupiter/ceres/mono 对应面需逐模块核对漂移 | Mega log #2130–#2157 | 无 | 2026-07-27 |
 | PT-03 | Git 协议兼容性与 LFS 收尾 | P0 | 实施中 | 首批 panic 止血与 capability truth table 已交付；streaming parser、per-channel state、统一 ProtocolAuthContext、delete-push 矩阵等缺失 | `mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` | 无 | 2026-07-27 |
-| PT-04 | Git 协议集成测试夹具与真实 CLI 兼容矩阵 | P0 | 已验证 | `test/project/` 与 `bin/tests/` 不覆盖 Mega 协议级夹具；真实 Git CLI smoke 矩阵未建立 | `mega/tests/{data,diff,objects,refs,scripts}` | 无 | 2026-07-27 |
+| PT-04 | Git 协议集成测试夹具与真实 CLI 兼容矩阵 | P0 | 已验证 | PT-01 已交付 **HTTP 最小**真实 CLI 矩阵（`integration_git_cli` + shell smoke）；本卡仍缺 Mega 协议级夹具（`test/project/` / 对象/refs 脚本）、SSH、完整 LFS 与形态合法 missing-repo 失败矩阵（见 `DEFER-IT-12`） | `mega/tests/{data,diff,objects,refs,scripts}` | 无 | 2026-07-29 |
 | PT-05 | ceres/bus 事件总线与 infra 基础设施归位 | P1 | 已验证 | `TransportRuntime`/`TransportEvent`/`ApplicationEventHandler` 未移植；cache 已并入 api_service，pack_decode/pack_stream 逻辑散落 | `mega/ceres/src/bus/`、`mega/ceres/src/infra/` | 无 | 2026-07-27 |
 | PT-06 | Orion Server 构建控制面移植 | P1 | 已验证 | 整体缺失；monoengine 仅保留消费侧 API 面（buck/artifacts/build_trigger router）与 bellatrix 客户端 | `mega/orion-server/`、`mega/mono/src/api` 的 orion_runner_router | 无 | 2026-07-27 |
 | PT-07 | Orion 构建执行 Agent 移植 | P1 | 已验证 | runner（ws 客户端、buck_controller、disk/repo 管理）整体缺失 | `mega/orion/` | 无 | 2026-07-27 |
 | PT-08 | Orion Scheduler、VM 弹性调度与客户端 API 面补齐 | P2 | 已验证 | scheduler 与 orion-scheduler-client 未移植；bellatrix 仅覆盖 build dispatch，完整 OrionBuildClient API 面未核对 | `mega/orion-scheduler/`、`mega/clients/` | 无 | 2026-07-27 |
-| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | 多渠道框架已超 Mega；webhook/slack 渠道、build 完成触发器、明文 `mail.password` 退场、多实例黑盒矩阵缺失 | `mega/mono/src/notification/`、campsite slack 参考 | 无 | 2026-07-27 |
+| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | 多渠道框架已超 Mega；扇出正路径已有黑盒；次渠道失败 retry（`DEFER-IT-10`）、build 完成触发器、明文 `mail.password` 退场、真多进程黑盒矩阵仍缺 | `mega/mono/src/notification/`、campsite slack 参考 | 无 | 2026-07-29 |
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储/Redis SecretRef（阶段 6 可选项）、`[oauth]` 落地或清理、热加载消费端扩展、source diagnostics 矩阵缺失 | `mega/common/src/config`（基线对照） | 无 | 2026-07-27 |
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | KEK 轮换、审计持久化 sink、root recovery 材料外置、格式版本策略缺失 | `mega/vault/`（基线对照） | 无 | 2026-07-27 |
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | 双前端体系角色与 pinned revision 已确认；apps/next-app 与 moon 的功能差异未逐项审计，一致性追平机制未建立 | website `monoengine` 分支 `afcd69af` 的 `apps/next-app`、`mega/moon/`、campsite | 无 | 2026-07-27 |
@@ -121,7 +121,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 |---|---|---:|---|---|
 | SB-01 | 消除生产路径残余 panic/unwrap | P1 | 协议 response builder、`repo.rs` 路径转换、config 残余加载路径等仍有未收敛点 | 协议、API、配置加载、全部服务可靠性 |
 | SB-02 | 凭据与 secret 边界持续收敛 | P1 | 明文 `mail.password` 兼容期未退场；redaction 覆盖面、resolver 缓存失效语义未闭合 | mail、vault、对象存储、通知渠道 |
-| SB-03 | 测试门禁、Docker 测试栈与 CI 可信度 | P1/P2 | 三道门禁与 docker-compose 栈运行良好；真实 Git CLI 矩阵、多实例竞争矩阵未建立 | CI 稳定性、回归可信度与全部 PT 的验收承载 |
+| SB-03 | 测试门禁、Docker 测试栈与 CI 可信度 | P1/P2 | 三道门禁与 docker-compose 栈运行良好；PT-01 最小真实 Git CLI + 双实例 dispatcher 基线已落地；SSH/LFS 完整矩阵与真多进程黑盒仍缺 | CI 稳定性、回归可信度与全部 PT 的验收承载 |
 
 ### SB-01：消除生产路径残余 panic/unwrap
 
@@ -205,10 +205,10 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 ### 审计证据、真实缺口与提升条件
 
-- **monoengine 现状证据**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`.github/workflows/config-validation.yml` 已复核；`docs/refactoring/integration.md` P2 清单（热加载黑盒、多渠道、对象存储 SecretRef 场景）未落地。
-- **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 monoengine 无承载。
-- **最小可验证第一阶段**：docker-compose 增加 Git CLI runner 服务 + HTTP clone/push 最小矩阵进 CI。
-- **风险与边界**：测试栈膨胀会拖慢 CI；新服务必须可选启用，本地单元测试路径不受影响。
+- **monoengine 现状证据（IT-07 收口中）**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。PT-01 正式「已完成」状态待 IT-09 发布点推送且 **IT-03 / IT-04 / IT-11** D 组 CI 绿后落定。
+- **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 monoengine 无承载（归 PT-06/07）。
+- **完成判据对照（`:202-204`）**：① 新服务接入有标准流程且以 Git CLI runner 示范落地 —— 满足（`test-infra.md` + compose `git-cli`）；② HTTP 通道真实 Git CLI 最小矩阵、热加载黑盒、多实例竞争基线用例 **本地绿且已接入 CI**；远端 CI 绿（IT-03/IT-04/IT-11 D 组）仍为 `remote-pending`，本条在 D 组全绿前不记为满足；③ integration.md P2 清单全部有「落地 / 书面关闭（含理由与承接编号）」结论 —— 满足（无「延后」）。
+- **风险与边界**：测试栈膨胀会拖慢 CI；新服务必须可选启用（`profiles`），本地单元测试路径不受影响。SSH/LFS 完整矩阵与真多进程黑盒仍分别属 PT-04 / PT-09。
 
 ### 依赖与顺序
 
@@ -621,9 +621,9 @@ PT-12 无硬前置，审计切片可立即启动；API 面追平（PT-02）与 o
 
 十一个移植项按四个阶段推进。阶段之间是架构依赖，不要求前一阶段全部结束才开始下一阶段的设计，但不得绕过前置决策直接实施高风险切片。
 
-### 下一个执行任务：PT-01 集成测试基建扩展与统一（2026-07-27 排定）
+### 下一个执行任务：PT-01 收口（IT-07/IT-09，2026-07-29）
 
-PT-01 是当前排定的下一个执行任务：测试栈拓扑扩展机制与真实 Git CLI 最小矩阵先行，为全部后续 PT 提供验收承载。它与 SB-01..SB-03 不互相阻塞（与 SB-03 同源互补），可并行推进。
+实现卡提交已在 `main`（对应任务卡 `Lifecycle` 已在 `plan-20260727.md` 更新；IT-03/IT-04/IT-11 的 D 组为 `remote-pending` 待 CI）。剩余文档收口 IT-07 与发布点 IT-09。完成后按本表优先级另择下一任务（orion 三件套仍是最大整体缺口）。
 
 ### 阶段零：工程安全基线
 
@@ -747,7 +747,7 @@ flowchart TD
 
 | 日期计划 | 对应 PT | 当前状态 | 范围与长期剩余缺口 |
 |---|---|---|---|
-| [`plan-20260727.md`](plan-20260727.md) | PT-01 | 已排期 | IT-01..IT-07：测试双层规范、git-cli runner 拓扑、HTTP clone/push 最小矩阵、CI 接入、热加载黑盒、多实例 claim 竞争、P2 清单收口；不覆盖 SSH/LFS 矩阵（PT-04）、真多进程黑盒（PT-09） |
+| [`plan-20260727.md`](plan-20260727.md) | PT-01 | **收口中**（文档已发；D 组待绿） | 最终卡集 IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12（共 11 张任务卡）；IT-05 已关闭为非任务卡（热加载黑盒此前已落地）。交付：测试双层规范、git-cli runner 拓扑、HTTP clone/push 最小矩阵、认证边界与失败路径、CI 执行/触发面、git/git-lfs 客户端 pin、并发 dispatcher 基线、P2 清单收口。不覆盖 SSH/LFS 矩阵（PT-04）、真多进程黑盒（PT-09） |
 
 ## 已替代 / 不采纳 / 已实现摘要
 
@@ -763,7 +763,7 @@ flowchart TD
 
 ### 已实现
 
-- 当前无 PT-01..PT-11 满足全部完成判据。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、mail、notification、orbit、协议止血、bellatrix、chat 主干）已在"当前基础"据实记录，不因部分能力成熟而提前关闭任何 PT。
+- **PT-01** 实现面已交付，文档收口已随 v0.1.176（IT-07/IT-09）发布；D 组（IT-03/04/11）仍待绿。其余 PT-02..PT-12 仍未全部满足完成判据。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、mail、notification、orbit、协议止血、bellatrix、chat 主干）已在"当前基础"据实记录。
 
 ## 路线图维护
 
