@@ -13,6 +13,11 @@ on:
       - "docs/refactoring/mail.md"
       - "docs/refactoring/vault.md"
       - "README.md"
+      - "bin/tests/**"
+      - "docker-compose.test.yml"
+      - ".env.test.example"
+      - "src/notification/**"
+      - "src/jupiter/storage/notification_storage.rs"
   push:
     branches:
       - main
@@ -27,6 +32,11 @@ on:
       - "docs/refactoring/mail.md"
       - "docs/refactoring/vault.md"
       - "README.md"
+      - "bin/tests/**"
+      - "docker-compose.test.yml"
+      - ".env.test.example"
+      - "src/notification/**"
+      - "src/jupiter/storage/notification_storage.rs"
 
 jobs:
   validate-config:
@@ -73,12 +83,21 @@ jobs:
           echo "::add-mask::mono_test_password"
           echo "::add-mask::smtp-test-password"
 
-      - name: Start test services (PostgreSQL, Redis, Mailpit, RustFS)
+      - name: Start test services (PostgreSQL, Redis, Mailpit, RustFS, git-cli)
         working-directory: monoengine
         run: |
-          docker compose -f docker-compose.test.yml up -d --wait
-          docker compose -f docker-compose.test.yml ps
-          docker compose -f docker-compose.test.yml --profile init run --rm rustfs-init
+          set -euo pipefail
+          # Pre-create the git-cli bind-mount root so Docker does not create it
+          # as root:root (which would EACCES the unprivileged test UID).
+          dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}"
+          mkdir -p "$dir" && chmod 1777 "$dir"
+          # Match the runner identity: ubuntu-latest is often UID 1001, while the
+          # compose default is 1000:1000 (would block writes into host-created dirs).
+          export MONOENGINE_IT_GIT_UID="$(id -u)"
+          export MONOENGINE_IT_GIT_GID="$(id -g)"
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait
+          docker compose -p monoengine-it -f docker-compose.test.yml ps
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init
 
       - name: Run config sample tests
         working-directory: monoengine
@@ -282,7 +301,7 @@ jobs:
           fi
           grep -F "source diagnostics produced" "${profile_warning_output}"
 
-      - name: Run integration tests (vault CLI + mail/notification dispatcher)
+      - name: Run integration tests (vault CLI + mail/notification dispatcher + git-cli)
         working-directory: monoengine
         env:
           MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
@@ -292,14 +311,19 @@ jobs:
           # Black-box CLI integration tests (config secret ref/set/check, validate).
           # The integration test lives in the `monoengine` binary crate (bin/tests/).
           cargo test -p monoengine --test integration_vault -- --test-threads=1
+          # Linux-only git-cli HTTP round-trip / auth / failpath harness (IT-03/10/12).
+          cargo test -p monoengine --test integration_git_cli -- --test-threads=1
           # Mail/notification dispatcher delivery against the real Mailpit + Postgres,
           # plus the NotificationService end-to-end delivery and the CL-comment
           # trigger enqueue/render path. These live in the monoengine-core library.
           cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher'
+          # IT-06 focused exactly-once dual-dispatcher gate (also matched by the
+          # broader dispatcher filter above; kept explicit for CI traceability).
+          cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher_two_instances_deliver_exactly_once'
           cargo test -p monoengine-core 'notification::service::tests'
           cargo test -p monoengine-core 'notification::triggers::tests'
 
       - name: Stop test services
         if: always()
         working-directory: monoengine
-        run: docker compose -f docker-compose.test.yml down -v
+        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v

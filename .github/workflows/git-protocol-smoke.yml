@@ -20,6 +20,11 @@ on:
       - "src/api/router/lfs_router.rs"
       - "src/server/http_server.rs"
       - "docs/refactoring/protocol.md"
+      - "docker-compose.test.yml"
+      - "src/ceres/pack/**"
+      - "src/jupiter/storage/git_db_storage.rs"
+      - "src/jupiter/storage/mono_storage.rs"
+      - "src/jupiter/storage/lfs_db_storage.rs"
   push:
     branches:
       - main
@@ -32,6 +37,11 @@ on:
       - "src/api/router/lfs_router.rs"
       - "src/server/http_server.rs"
       - "docs/refactoring/protocol.md"
+      - "docker-compose.test.yml"
+      - "src/ceres/pack/**"
+      - "src/jupiter/storage/git_db_storage.rs"
+      - "src/jupiter/storage/mono_storage.rs"
+      - "src/jupiter/storage/lfs_db_storage.rs"
 
 jobs:
   git-protocol-smoke:
@@ -83,11 +93,29 @@ jobs:
           echo "::add-mask::mono_test_password"
           echo "::add-mask::smtp-test-password"
 
-      - name: Start test services (PostgreSQL, Redis)
+      - name: Start test services (PostgreSQL, Redis, git-cli)
         working-directory: monoengine
         run: |
-          docker compose -f docker-compose.test.yml up -d --wait postgres redis
-          docker compose -f docker-compose.test.yml ps
+          set -euo pipefail
+          dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}"
+          mkdir -p "$dir" && chmod 1777 "$dir"
+          export MONOENGINE_IT_GIT_UID="$(id -u)"
+          export MONOENGINE_IT_GIT_GID="$(id -g)"
+          # git-cli is under profiles: ["git"]; bring it up alongside postgres/redis so
+          # the cargo-native integration_git_cli gate can run on protocol path changes.
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait postgres redis git-cli
+          docker compose -p monoengine-it -f docker-compose.test.yml ps
+
+      - name: Run cargo-native git-cli integration gate
+        working-directory: monoengine
+        env:
+          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
+          MEGA_REDIS__URL: redis://127.0.0.1:16379
+        run: |
+          set -euo pipefail
+          # Covers auth / failpath / byte-for-byte assertions when protocol paths
+          # change (config-validation allowlist A does not include those paths).
+          cargo test -p monoengine --test integration_git_cli -- --test-threads=1
 
       - name: Prepare smoke config and seed secret
         working-directory: monoengine
@@ -185,4 +213,4 @@ jobs:
       - name: Stop test services
         if: always()
         working-directory: monoengine
-        run: docker compose -f docker-compose.test.yml down -v
+        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v

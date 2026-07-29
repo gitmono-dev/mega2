@@ -45,8 +45,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
    `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}`。启栈前应：
    `mkdir -p "$dir" && chmod 1777 "$dir"`（保证测试 UID 可写）。若目录缺失，
    Docker bind 可能以 `root:root` 自动创建，随后未提权的 cargo 进程分配子目录
-   会 `EACCES`——因此本地与 CI 启动脚本都必须先 mkdir（workflow 侧由 IT-04
-   补齐；在此之前勿依赖自动创建）。用例只在该根下分配子目录并清理。变更
+   会 `EACCES`——因此本地与 CI 启动脚本都必须先 mkdir（`config-validation.yml`
+   的 `validate-config` 已在 `--profile git up` 前执行）。用例只在该根下分配子目录并清理。变更
    `MONOENGINE_IT_GIT_WORKDIR` 后必须 `--force-recreate git-cli`（或整栈），
    否则 host 与容器挂载会静默分叉。`git-cli` 在 `profiles: ["git"]` 下，默认
    `up -d --wait` **不会**启动它（host 网络仅在 Linux 验收路径启用；`--profile git`
@@ -104,7 +104,7 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | profiles | `rustfs-init` 使用 `profiles: ["init"]`：**one-shot** 桶初始化，不参与默认 `up -d --wait`（`--wait` 要求服务保持 running/healthy）；显式执行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init` |
 | depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml down -v`；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `docker compose -f docker-compose.test.yml up -d --wait` 拉起含 rustfs 的栈，再 `--profile init run --rm rustfs-init` 建桶；job 末尾 `if: always()` 下 `down -v`。当前步骤尚未统一 `-p monoengine-it`（与上文「历史命令」同口径，由后续 CI 任务卡对齐） |
+| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs 与 git-cli 的栈，随后 `--profile init run --rm rustfs-init` 建桶；执行面含 `cargo test -p monoengine --test integration_vault`、`--test integration_git_cli`、以及 `monoengine-core` 的 dispatcher / service / triggers 集成（含 IT-06 focused `integration_mail_dispatcher_two_instances_deliver_exactly_once`）；job 末尾 `if: always()` 下 `-p monoengine-it --profile git down -v` |
 | secret | 公开测试口令字符串 `minioadmin` / `minioadmin`（仅测试栈；历史兼容名，**不是** MinIO 依赖）；CI 对同类凭据使用 `::add-mask::` |
 | 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
 
@@ -122,12 +122,12 @@ git-cli 固定版本: `git version 2.49.1`
 | 端口 | 无独立端口映射；通过 `network_mode: host` 访问宿主 `127.0.0.1` 高位端口 |
 | healthcheck | `CMD git --version`（见 `docker-compose.test.yml`） |
 | 网络 | **`network_mode: host`**，因此**不**加入 `networks.default`（与 host 网络互斥，见 ADR-IT-01） |
-| 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `up` 路径在 IT-04 前尚未 mkdir，运维/本地不得依赖自动创建。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MONOENGINE_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
+| 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `validate-config` 已在 `--profile git up` 前 mkdir（见「CI 入口」）。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MONOENGINE_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
 | 运行身份 | `user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"`（Compose 可解析的数值默认，不依赖 Bash 未 export 的 `$UID`）。默认 `1000:1000` 对齐常见 CI runner；本地若 `id -u` 不是 1000，启栈前必须 `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`。变更 UID/GID 后需要 `--force-recreate git-cli` |
 | profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；验收路径在 Linux 上显式 `--profile git`。profile 也避免非目标开发机误启 host 网络拖垮数据面） |
 | depends_on | 无 |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
-| CI 入口 | 由后续 CI 任务卡（IT-04 / IT-11）接入；本卡只登记服务本身 |
+| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p monoengine --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli` 再跑同一 cargo target（补 allowlist A 未含协议路径的覆盖缺口），其后仍用宿主机 git 跑脚本矩阵（版本 pin 由 IT-11 承接） |
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
 | 目标 OS / 降级 | **Linux only**。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于 Linux 本地实验，且不得冒充固定版本门；无 Windows/macOS 兼容路径 |
 
