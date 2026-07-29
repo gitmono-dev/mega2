@@ -47,6 +47,10 @@ jobs:
   git-protocol-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Hosted-runner client pins (ubuntu-latest 20260726 image). Drift fails the job.
+      MONOENGINE_CI_GIT_VERSION: "2.54.0"
+      MONOENGINE_CI_GIT_LFS_VERSION: "3.7.1"
     steps:
       - name: Checkout monoengine
         uses: actions/checkout@v5
@@ -75,12 +79,63 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Install git and git-lfs
+      - name: Install and pin git / git-lfs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git-lfs
-          git --version
-          git lfs version
+          set -euo pipefail
+
+          parse_git_ver() { sed -n 's/^git version //p'; }
+          parse_lfs_ver() { sed -n 's|^git-lfs/\([^ ]*\).*|\1|p'; }
+
+          # git: assert the hosted-runner binary equals the pin (do not apt-upgrade).
+          git_out="$(git --version)"
+          git_ver="$(printf '%s\n' "$git_out" | parse_git_ver)"
+          [ -n "$git_ver" ] || { echo "::error::failed to parse git --version: $git_out"; exit 1; }
+          [ "$git_ver" = "${MONOENGINE_CI_GIT_VERSION}" ] || {
+            echo "::error::git version drift: got [$git_ver], pin [${MONOENGINE_CI_GIT_VERSION}]"
+            exit 1
+          }
+
+          # git-lfs: keep a matching preinstalled binary; otherwise install the
+          # pinned GitHub release artifact (immutable). Never `apt install` latest.
+          need_lfs_install=1
+          if command -v git-lfs >/dev/null 2>&1; then
+            lfs_out="$(git lfs version)"
+            lfs_ver="$(printf '%s\n' "$lfs_out" | parse_lfs_ver)"
+            if [ -n "$lfs_ver" ] && [ "$lfs_ver" = "${MONOENGINE_CI_GIT_LFS_VERSION}" ]; then
+              need_lfs_install=0
+            fi
+          fi
+          if [ "$need_lfs_install" -eq 1 ]; then
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64) lfs_arch=amd64 ;;
+              aarch64|arm64) lfs_arch=arm64 ;;
+              *) echo "::error::unsupported arch for git-lfs pin: $arch"; exit 1 ;;
+            esac
+            ver="${MONOENGINE_CI_GIT_LFS_VERSION}"
+            url="https://github.com/git-lfs/git-lfs/releases/download/v${ver}/git-lfs-linux-${lfs_arch}-v${ver}.tar.gz"
+            curl -fsSL "$url" -o /tmp/git-lfs.tgz
+            rm -rf "/tmp/git-lfs-${ver}"
+            mkdir -p "/tmp/git-lfs-${ver}"
+            tar -xzf /tmp/git-lfs.tgz -C "/tmp/git-lfs-${ver}" --strip-components=1
+            sudo "/tmp/git-lfs-${ver}/install.sh"
+          fi
+
+          lfs_out="$(git lfs version)"
+          lfs_ver="$(printf '%s\n' "$lfs_out" | parse_lfs_ver)"
+          [ -n "$lfs_ver" ] || { echo "::error::failed to parse git lfs version: $lfs_out"; exit 1; }
+          [ "$lfs_ver" = "${MONOENGINE_CI_GIT_LFS_VERSION}" ] || {
+            echo "::error::git-lfs version drift: got [$lfs_ver], pin [${MONOENGINE_CI_GIT_LFS_VERSION}]"
+            exit 1
+          }
+
+          {
+            echo "## CI git client pins"
+            echo ""
+            echo "- \`git --version\`: \`${git_out}\` (pin \`${MONOENGINE_CI_GIT_VERSION}\`)"
+            echo "- \`git lfs version\`: \`${lfs_out}\` (pin \`${MONOENGINE_CI_GIT_LFS_VERSION}\`)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
           git config --global user.email "ci@example.invalid"
           git config --global user.name "CI Smoke"
 

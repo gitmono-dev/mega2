@@ -85,8 +85,11 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 
 - 通过 compose 提供的客户端（如 git-cli runner）必须在登记条目中写明**固定版本字符串**，
   并用 Verification 断言容器内 `git --version`（及同类工具）等于该 pin。
-- CI 若改用宿主机客户端，必须 pin 安装版本并在 job summary 输出实际版本（由后续
-  任务卡落地，不在本文预登记具体 pin 值）。
+- CI 宿主机客户端（`git-protocol-smoke.yml`）固定版本（与 job `env` / summary 断言同源）：
+  - CI git 固定版本：`2.54.0`
+  - CI git-lfs 固定版本：`3.7.1`
+  实际 `git --version` / `git lfs version` 解析出的版本号必须与上述 pin 完全相等，否则 job 失败；
+  两个版本输出写入 `$GITHUB_STEP_SUMMARY`。
 - 升级镜像 tag / digest 或 pin 值必须是显式 PR 动作，并同步更新登记条目。
 
 ## 已登记服务
@@ -127,7 +130,7 @@ git-cli 固定版本: `git version 2.49.1`
 | profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；验收路径在 Linux 上显式 `--profile git`。profile 也避免非目标开发机误启 host 网络拖垮数据面） |
 | depends_on | 无 |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p monoengine --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli` 再跑同一 cargo target（补 allowlist A 未含协议路径的覆盖缺口），其后仍用宿主机 git 跑脚本矩阵（版本 pin 由 IT-11 承接） |
+| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p monoengine --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli` 再跑同一 cargo target（补 allowlist A 未含协议路径的覆盖缺口），其后用宿主机 git（pin 见「客户端版本确定性规则」）跑脚本矩阵 |
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
 | 目标 OS / 降级 | **Linux only**。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于 Linux 本地实验，且不得冒充固定版本门；无 Windows/macOS 兼容路径 |
 
