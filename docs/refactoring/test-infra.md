@@ -2,7 +2,7 @@
 
 本文是 monoengine 测试基建的**单一事实源**：双层测试职责、fixture 生命周期、
 docker-compose 测试栈新服务登记 checklist、客户端版本确定性规则。
-既有的 minio + minio-init 扩展在此按 checklist 补登记；后续新服务（含 git-cli
+既有的 rustfs + rustfs-init（S3-compatible）扩展在此按 checklist 登记；后续新服务（含 git-cli
 runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-compose.test.yml`**。
 
 策略与覆盖矩阵仍住在 [`integration.md`](./integration.md)；本文不复制那些内容。
@@ -91,24 +91,24 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 
 ## 已登记服务
 
-### minio + minio-init（既有扩展补登记）
+### rustfs + rustfs-init（S3-compatible 对象存储）
 
 | 项 | 值 |
 |---|---|
-| 服务名 | `minio`、`minio-init` |
-| 镜像 | `minio/minio:RELEASE.2025-04-22T22-12-26Z`；`minio/mc:RELEASE.2025-04-16T18-13-26Z`（固定 tag，非 `latest`） |
-| 端口 | `127.0.0.1:19000:9000`、`127.0.0.1:19001:9001`（高位 + 仅回环） |
-| healthcheck | `minio`：`curl -f http://localhost:9000/minio/health/live`（见 `docker-compose.test.yml`） |
+| 服务名 | `rustfs`、`rustfs-init` |
+| 镜像 | `rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c`；桶初始化客户端 `minio/mc:RELEASE.2025-04-16T18-13-26Z`（固定 tag，非 `latest`；`mc` 仅作通用 S3 客户端） |
+| 端口 | `127.0.0.1:19000:9000`、`127.0.0.1:19001:9001`（高位 + 仅回环；S3 API / console） |
+| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`（见 `docker-compose.test.yml`） |
 | 网络 | 默认 `networks.default` → `monoengine-test-net` |
-| 卷 / 工作目录 | `minio` 使用容器内路径 `/data`，**无**宿主机 bind-mount；数据仅存在于该容器可写层，`down -v` 后不保留。`minio-init` 无持久卷（one-shot） |
-| profiles | `minio-init` 使用 `profiles: ["init"]`：**one-shot** 桶初始化，不参与默认 `up -d --wait`（`--wait` 要求服务保持 running/healthy）；显式执行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm minio-init` |
-| depends_on | `minio-init` → `minio` 且 `condition: service_healthy` |
+| 卷 / 工作目录 | `rustfs` 使用容器内路径 `/data`（`RUSTFS_VOLUMES=/data`），**无**宿主机 bind-mount；单盘本地 smoke 设 `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`。数据仅存在于该容器可写层，`down -v` 后不保留。`rustfs-init` 无持久卷（one-shot） |
+| profiles | `rustfs-init` 使用 `profiles: ["init"]`：**one-shot** 桶初始化，不参与默认 `up -d --wait`（`--wait` 要求服务保持 running/healthy）；显式执行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init` |
+| depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml down -v`；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `docker compose -f docker-compose.test.yml up -d --wait` 拉起含 minio 的栈，再 `--profile init run --rm minio-init` 建桶；job 末尾 `if: always()` 下 `down -v`。当前步骤尚未统一 `-p monoengine-it`（与上文「历史命令」同口径，由后续 CI 任务卡对齐） |
-| secret | 公开测试口令 `minioadmin` / `minioadmin`（仅测试栈）；CI 对同类凭据使用 `::add-mask::` |
-| 降级 | 无客户端版本 pin 需求；本地可不启 minio（相关 gate 自行 skip/opt-in） |
+| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `docker compose -f docker-compose.test.yml up -d --wait` 拉起含 rustfs 的栈，再 `--profile init run --rm rustfs-init` 建桶；job 末尾 `if: always()` 下 `down -v`。当前步骤尚未统一 `-p monoengine-it`（与上文「历史命令」同口径，由后续 CI 任务卡对齐） |
+| secret | 公开测试口令字符串 `minioadmin` / `minioadmin`（仅测试栈；历史兼容名，**不是** MinIO 依赖）；CI 对同类凭据使用 `::add-mask::` |
+| 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
 
-对照锚点：`docker-compose.test.yml` 的 `minio` / `minio-init` 服务块与 `networks.default`。
+对照锚点：`docker-compose.test.yml` 的 `rustfs` / `rustfs-init` 服务块与 `networks.default`。
 
 ### git-cli（首个按 checklist 落地的扩展服务）
 

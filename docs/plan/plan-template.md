@@ -180,7 +180,7 @@
    - `libra status --short --branch`（`--branch` 才会输出 `## <branch>...<upstream>` 行；不带它只有文件状态），确认当前分支与计划指定分支一致、工作区脏状态、目标文件是否已有无关改动。若目标文件已有未确认用户改动，先报告并避免覆盖。已知现状：本仓 upstream 行可能显示 `## main...origin/main [gone]`，而 `origin/main` ref 实际存在，因此**不要**把 status 的 ahead/behind 当作推送判据。
    - 确认路径依赖 `../orbit` 已就位（`Cargo.toml` 的 `orbit-api` 与 `bin/Cargo.toml` 的 `orbit` 均为 path 依赖）。缺失时任何 `cargo` 命令都会在依赖解析阶段失败，必须先补齐 sibling checkout，不得把该失败当作代码缺陷排查。
    - 确认 `.env.test` 是否存在（仓库只提供 `.env.test.example`，`.env.test` 本身被忽略）。缺失时按 `AGENTS.md` 的规定停下来确认，**不得**静默降级为不 source 的 `cargo test --all`。
-   - 确认需要的测试服务是否已启动：`docker compose -f docker-compose.test.yml up -d --wait`（Postgres `15432`、Redis `16379`、Mailpit `11025/18025`、MinIO `19000/19001`；MinIO 桶初始化需要额外的 `--profile init run --rm minio-init`）。Postgres 缺失会让相关用例直接 panic 而不是跳过。
+   - 确认需要的测试服务是否已启动：`docker compose -f docker-compose.test.yml up -d --wait`（Postgres `15432`、Redis `16379`、Mailpit `11025/18025`、RustFS `19000/19001`；RustFS 桶初始化需要额外的 `--profile init run --rm rustfs-init`）。Postgres 缺失会让相关用例直接 panic 而不是跳过。
 2. **ER-02 先核对后实现:** 刷新本任务相关源码锚点、文档锚点、测试 target 和外部参照 revision，再决定实现、补测、补文档、关闭或降级。
 3. **ER-03 粒度门禁:** 开工前按粒度规则 `G-*` 逐条复核本任务卡，并逐字段核对该卡的 `Granularity` 摘要行。若核对后发现范围已扩大（新增行为轴、AC/Verification 超限、scope 升到 L、写集与其它在跑任务重叠），先修改计划拆卡再开工，不得在实现中静默扩张任务范围。
 4. **ER-04 每卡验收门:** 门由 **A 表面 focused 门**（按实际改动的表面）+ **B 类型门**（按 `Task type`）+ **C 发布收口门**（覆盖要求对所有非延后卡生效，执行归属见下）+ **D 远端后置门**（有不可本地复现的 CI 语义时）四组组成，**所有适用行累加**，全部通过才算验收。权威口径分层：`AGENTS.md`「Required Checks Before Submitting Code Changes」的三门（`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all`）是**任何会提交的改动**的完成契约，模板不得削弱；`AGENTS.md` 另强制 `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告。任务卡指定的 focused 用例是在此之上的**附加**门，用来证明本卡行为，不是三门的替代品。权威口径变更时必须同批同步 `AGENTS.md`、`docs/plan/README.md`，以及**采用本模板当前版本的计划**（存量计划按「模板版本与迁移政策」处理，不因本条被追认为违规）。
@@ -282,7 +282,7 @@
    - 本仓没有安装脚本、没有 release artifact、没有 tag 自动化，因此「安装证据」「artifact 可获取性」默认写 `N/A`；不得照抄其它仓库的发布步骤。
 9. **ER-09 push 失败策略:** 非 fast-forward 需要 pull/merge 后重新验收再推；认证、权限、网络或服务端失败不 blind retry，记录原因，待下一次修复/发布窗口处理。
 10. **ER-10 内部服务错误（有界重试）:** Redis、Postgres、对象存储、SMTP、AI provider 等错误不得直接把任务宣告完成。先分类：确定性错误（4xx 参数/权限、schema 不符、编译或配置缺陷）不重试，按范围决定归属——只有当修复落在**本卡行为轴内**，且先更新本卡 `Acceptance criteria` / `Verification` / `Implementation write set` / `Granularity` 后**重跑 ER-03 的全部 `G-*` 仍然通过**（含 G-10 写集不与在跑卡新冲突）时，才作为本卡修复项就地修；任一条不满足就新建修复卡 `FIX-*`、加一条 `FIX-* -> 当前卡` 的依赖边，并把当前卡置为 `blocked`，不得为了「顺手修完」突破粒度；暂时性错误（超时、5xx、限流、网络中断）按指数退避重试，并写明**最大尝试次数与总时间预算**（计划未另行规定时默认 ≤ 5 次、总计 ≤ 30 分钟）。超预算后把任务置为 `blocked` 并记录 sanitized 证据与升级对象，不得静默空转。发布类动作（push）不自动重试，按 ER-09 处理。
-11. **ER-11 证据卫生:** 验收证据不得保存 secret、API key、token、PII、未脱敏 transcript、绝对私有路径或原始 tool payload。需要留存时只写 sanitized summary。测试栈的口令（如 `mono_test_password`、`smtp-test-password`、`minioadmin`）虽为公开测试值，记录时同样按脱敏处理。
+11. **ER-11 证据卫生:** 验收证据不得保存 secret、API key、token、PII、未脱敏 transcript、绝对私有路径或原始 tool payload。需要留存时只写 sanitized summary。测试栈的口令（如 `mono_test_password`、`smtp-test-password`、RustFS 测试凭据字符串 `minioadmin`）虽为公开测试值，记录时同样按脱敏处理。
 12. **ER-12 并发边界与串行发布:** 并发只适用于**实现与 review 阶段**：只有 `Implementation write set` 不相交（G-10）的卡可以并发推进。**发布动作一律串行，且由单一发布者执行**：
     - 计划必须在「发布分组与并发窗口」声明发布者（哪个 Agent/人负责 C 组的 bump、构建、提交、推送，以及推送后跟踪 D 组远端证据）。同一时刻只允许一个卡处于「已 bump 未完成推送」状态。
     - 进入发布前重新读取 `Cargo.toml` 权威版本（ER-08 的 parity 预检），按顺序做完整套发布动作后才轮到下一张卡。
@@ -569,7 +569,7 @@
 | Git 协议 | `<clone/fetch/push/shallow/protocol v2/LFS>` | `<scripts/git_protocol_smoke.sh 本地等价>` |
 | 安全 | `<鉴权、Cedar 策略、secret、路径 traversal、错误 redaction>` | `<cargo test ...>` |
 | 性能 | `<规模与预算>` | `<criterion / wall-clock>` |
-| live/gated | `<真实外部服务或 provider（MinIO / Mailpit / SMTP）>` | `<docker compose profile 或 env gated command>` |
+| live/gated | `<真实外部服务或 provider（RustFS / Mailpit / SMTP）>` | `<docker compose profile 或 env gated command>` |
 
 ## 追溯表
 

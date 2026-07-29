@@ -1158,18 +1158,18 @@ token_ref = "{NOTIFICATION_WEBHOOK_TOKEN_REF}"
 
 #[test]
 fn integration_object_storage_s3_compatible_smoke() {
-    // 启动真实 Minio 服务后，通过 `debug storage-smoke` 对 S3-compatible 后端
+    // 启动真实 RustFS 服务后，通过 `debug storage-smoke` 对 S3-compatible 后端
     // 执行 put/get/delete  round-trip，验证对象存储后端在 post-vault 启动路径
     // 正确解析 endpoint、bucket、credential 并完成真实 I/O。
-    let minio_endpoint = "http://127.0.0.1:19000";
-    let minio_available = std::net::TcpStream::connect("127.0.0.1:19000").is_ok();
-    if !minio_available {
+    let rustfs_endpoint = "http://127.0.0.1:19000";
+    let rustfs_available = std::net::TcpStream::connect("127.0.0.1:19000").is_ok();
+    if !rustfs_available {
         eprintln!(
-            "integration_object_storage_s3_compatible_smoke requires Minio at {}; \
+            "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
              run `docker compose -f docker-compose.test.yml up -d --wait` \
-             and `docker compose -f docker-compose.test.yml --profile init run --rm minio-init` \
+             and `docker compose -f docker-compose.test.yml --profile init run --rm rustfs-init` \
              first, skipping",
-            minio_endpoint
+            rustfs_endpoint
         );
         return;
     }
@@ -1179,11 +1179,11 @@ fn integration_object_storage_s3_compatible_smoke() {
     command
         // 关闭 mail，避免本测试依赖 mail password vault secret。
         .env("MEGA_MAIL__ENABLED", "false")
-        // 覆盖为 S3-compatible（Minio）配置。
+        // 覆盖为 S3-compatible（RustFS）配置。
         .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible")
         .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
         .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "testbucket")
-        .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", minio_endpoint)
+        .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", rustfs_endpoint)
         .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "minioadmin")
         .env("MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY", "minioadmin");
 
@@ -1197,7 +1197,7 @@ fn integration_object_storage_s3_compatible_smoke() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "debug storage-smoke should succeed against Minio; stderr: {stderr}"
+        "debug storage-smoke should succeed against RustFS; stderr: {stderr}"
     );
 }
 
