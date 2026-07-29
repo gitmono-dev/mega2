@@ -618,6 +618,7 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
 | `integration_config_hot_reload` | **P2 已落地（2026-06-28）** | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | **P2 已落地（2026-06-28）**：启动真实 `service http`，通过写入 `email_jobs` outbox 触发 dispatcher，验证 email/Mailpit、in-app、Slack、webhook 多渠道扇出 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
 | `integration_git_cli` | **P2 已落地（2026-07-29，IT-03）**：`bin/tests/integration_git_cli.rs` 经 compose `git-cli`（Linux 目标 OS；宿主机 git 仅 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 本地实验）对真实 `service http` 做 clone→push→再 clone（默认 tip）+ 定向 fetch 新 `refs/cl/*` tip 的工作树字节比对与用例隔离；token 经 credential/`GIT_ASKPASS` 注入（不做认证边界/失败路径，见 IT-10/IT-12） | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分（token 不入 remote URL） |
+| `integration_mail_dispatcher_two_instances_deliver_exactly_once` | **P2 已落地（2026-07-29，IT-06）**：同一测试 DB 上两个 `EmailDispatcher` 实例并发 `tick_once`，真实 Mailpit 收到恰好 N 封且无同 subject 重复；含 stale `sending` 恢复路径；Mailpit 不可达时 fail-closed | ✓ | ✓ | - | - | ✓ | outbox | - | - | - |
 
 ## 迁移步骤（分阶段）
 

@@ -1827,6 +1827,192 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn integration_mail_dispatcher_two_instances_deliver_exactly_once() {
+        // IT-06: two EmailDispatcher instances on one DB must deliver each outbox
+        // job exactly once to Mailpit (including a stale `sending` recovery path).
+        let mailpit_api_url = mailpit_api_url();
+        let mailpit_client = reqwest::Client::new();
+        assert!(
+            mailpit_available(&mailpit_client, &mailpit_api_url).await,
+            "Mailpit unavailable at {mailpit_api_url}; start it with `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait mailpit` (IT-06 is fail-closed)"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+
+        let stg = NotificationStorage::new(Arc::new(db.clone()));
+        insert_test_event_type(&db).await;
+
+        let run_id = Uuid::new_v4();
+        const JOB_COUNT: usize = 8;
+        let mut subjects = Vec::with_capacity(JOB_COUNT);
+        for idx in 0..JOB_COUNT {
+            let subject = format!("IT-06 exactly-once {run_id} #{idx}");
+            stg.enqueue_email_job(
+                "alice",
+                &format!("alice+it06-{idx}@example.test"),
+                "cl.comment.created",
+                &subject,
+                "<p>IT-06 body</p>",
+                Some("IT-06 body"),
+            )
+            .await
+            .unwrap();
+            subjects.push(subject);
+        }
+
+        // Force one job into stale `sending` *without* a prior SMTP delivery.
+        // (Crash-after-SMTP / at-least-once resend needs idempotency keys and is
+        // outside this card's write set — see ADR-IT-03 / FIX-IT-06-01 if pursued.)
+        let stale_job_id = stg.fetch_pending_jobs(JOB_COUNT as u64).await.unwrap()[0].id;
+        let stale_subject = email_jobs::Entity::find_by_id(stale_job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .subject
+            .clone();
+        assert!(stg.try_claim_job(stale_job_id).await.unwrap());
+        let mut stale_model: email_jobs::ActiveModel = email_jobs::Entity::find_by_id(stale_job_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        stale_model.updated_at = Set(chrono::Utc::now().naive_utc()
+            - chrono::Duration::seconds(EMAIL_JOB_SEND_TIMEOUT_SECS + 60));
+        stale_model.update(&db).await.unwrap();
+        assert!(
+            !mailpit_has_subject_now(&mailpit_client, &mailpit_api_url, &stale_subject).await,
+            "stale job must not have been delivered before recovery"
+        );
+
+        let smtp_port = mailpit_smtp_port();
+        let mail = MailConfig {
+            enabled: true,
+            provider: MailProvider::Smtp,
+            smtp_host: mailpit_smtp_host(),
+            smtp_port,
+            from: "no-reply@example.test".to_string(),
+            starttls: false,
+            ..Default::default()
+        };
+        let mailer_a = SmtpMailer::new_with_password(&mail, None).unwrap();
+        let mailer_b = SmtpMailer::new_with_password(&mail, None).unwrap();
+        let dispatcher_a = EmailDispatcher::new(stg.clone(), Arc::new(mailer_a));
+        let dispatcher_b = EmailDispatcher::new(stg.clone(), Arc::new(mailer_b));
+
+        // Concurrent ticks until the outbox drains (bounded).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (ra, rb) = tokio::join!(dispatcher_a.tick_once(), dispatcher_b.tick_once());
+            ra.unwrap();
+            rb.unwrap();
+
+            let pending = stg.fetch_pending_jobs(JOB_COUNT as u64 + 4).await.unwrap();
+            let all = email_jobs::Entity::find().all(&db).await.unwrap();
+            let sending = all.iter().filter(|j| j.status == "sending").count();
+            if pending.is_empty() && sending == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out draining outbox: pending={} sending={}",
+                pending.len(),
+                sending
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for subject in &subjects {
+            assert!(
+                wait_for_mailpit_subject(&mailpit_client, &mailpit_api_url, subject).await,
+                "Mailpit did not receive subject `{subject}`"
+            );
+        }
+
+        let prefix = format!("IT-06 exactly-once {run_id}");
+        let counts = mailpit_subject_counts(&mailpit_client, &mailpit_api_url, &prefix)
+            .await
+            .expect("mailpit subject counts");
+        let delivered: usize = counts.values().sum();
+        assert_eq!(
+            delivered, JOB_COUNT,
+            "Mailpit must receive exactly {JOB_COUNT} messages for this run, got {delivered} ({counts:?})"
+        );
+        for subject in &subjects {
+            assert_eq!(
+                counts.get(subject.as_str()).copied().unwrap_or(0),
+                1,
+                "subject `{subject}` must appear exactly once in Mailpit (no double delivery)"
+            );
+        }
+
+        let jobs = email_jobs::Entity::find().all(&db).await.unwrap();
+        assert_eq!(jobs.len(), JOB_COUNT);
+        assert!(
+            jobs.iter().all(|j| j.status == EMAIL_JOB_STATUS_SENT),
+            "all outbox jobs must end as sent: {:?}",
+            jobs.iter()
+                .map(|j| (j.id, j.status.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            stg.fetch_pending_jobs(10).await.unwrap().is_empty(),
+            "no pending outbox jobs may remain"
+        );
+    }
+
+    fn mailpit_smtp_host() -> String {
+        std::env::var("MAILPIT_SMTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+    }
+
+    fn mailpit_smtp_port() -> u16 {
+        std::env::var("MAILPIT_SMTP_PORT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(11025)
+    }
+
+    async fn mailpit_subject_counts(
+        client: &reqwest::Client,
+        api_url: &str,
+        subject_prefix: &str,
+    ) -> Result<std::collections::BTreeMap<String, usize>, String> {
+        let response = client
+            .get(format!("{api_url}/api/v1/messages"))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("mailpit list status {}", response.status()));
+        }
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut counts = std::collections::BTreeMap::new();
+        let messages = payload
+            .get("messages")
+            .or_else(|| payload.get("Messages"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for message in messages {
+            let subject = message
+                .get("Subject")
+                .or_else(|| message.get("subject"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if subject.starts_with(subject_prefix) {
+                *counts.entry(subject.to_string()).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
     async fn insert_test_event_type(db: &sea_orm::DatabaseConnection) {
         NotificationStorage::new(Arc::new(db.clone()))
             .upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
@@ -2034,5 +2220,24 @@ mod tests {
                         == Some(subject)
                 })
             })
+    }
+
+    async fn mailpit_has_subject_now(
+        client: &reqwest::Client,
+        api_url: &str,
+        subject: &str,
+    ) -> bool {
+        match client
+            .get(format!("{api_url}/api/v1/messages"))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response
+                .json::<Value>()
+                .await
+                .ok()
+                .is_some_and(|payload| mailpit_has_subject(&payload, subject)),
+            _ => false,
+        }
     }
 }
