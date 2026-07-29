@@ -46,7 +46,9 @@ on:
 jobs:
   git-protocol-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # release build + cargo-native integration_git_cli + shell smoke exceeds 30m
+    # (v0.1.174/175 timed out during the cargo gate). Keep headroom for cold caches.
+    timeout-minutes: 60
     env:
       # Hosted-runner client pins (ubuntu-latest 20260726 image). Drift fails the job.
       MONOENGINE_CI_GIT_VERSION: "2.54.0"
@@ -170,7 +172,9 @@ jobs:
           set -euo pipefail
           # Covers auth / failpath / byte-for-byte assertions when protocol paths
           # change (config-validation allowlist A does not include those paths).
-          cargo test -p monoengine --test integration_git_cli -- --test-threads=1
+          # --release reuses the prior release build artifacts (debug rebuild was
+          # the dominant cost that pushed v0.1.174/175 past the old 30m timeout).
+          cargo test -p monoengine --release --test integration_git_cli -- --test-threads=1
 
       - name: Prepare smoke config and seed secret
         working-directory: monoengine
