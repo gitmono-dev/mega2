@@ -1,9 +1,10 @@
-// Process-level black-box Git CLI integration tests (IT-03 / IT-10).
+// Process-level black-box Git CLI integration tests (IT-03 / IT-10 / IT-12).
 //
 // Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
 // compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
 // re-clone working-tree round-trips with per-case DB/port/workdir isolation.
 // IT-10 adds auth-boundary cases (`integration_git_cli_auth_*`).
+// IT-12 adds failpath cases (`integration_git_cli_failpath_*`).
 // Credential injection lives in `common/git_cli.rs` (included only here).
 // This target does not modify `integration_vault.rs`.
 
@@ -262,6 +263,17 @@ impl ServiceProcess {
             self.reaped = true;
             panic!("service did not exit within {timeout:?} after shutdown signal");
         })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn assert_alive(&mut self) {
+        match self.child.try_wait().expect("poll service") {
+            Some(status) => panic!("service exited unexpectedly with {status}"),
+            None => {}
+        }
     }
 }
 
@@ -789,6 +801,120 @@ fn collect_git_configs(root: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+#[test]
+fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    seed_mail_password(&env);
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+
+    // Legacy-disallowed root repo: parse_git_protocol_path rejects it before any
+    // empty-repo advertisement (monorepo otherwise serves arbitrary paths as empty).
+    let missing_url = format!("http://127.0.0.1:{port}/third-party.git/");
+    let clone_dir = "failpath-missing";
+
+    let first = git_cli::git_cli_no_auth(&env.case_dir, &["clone", &missing_url, clone_dir]);
+    // Remove any partial clone dir so the second attempt is byte-identical input.
+    let _ = fs::remove_dir_all(env.case_dir.join(clone_dir));
+    let second = git_cli::git_cli_no_auth(&env.case_dir, &["clone", &missing_url, clone_dir]);
+
+    assert!(
+        !first.status.success(),
+        "clone of disallowed/missing repo must fail (status={:?} code={:?})\nstdout:\n{}\nstderr:\n{}",
+        first.status,
+        first.status.code(),
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        !second.status.success(),
+        "repeat clone of disallowed/missing repo must fail (status={:?})",
+        second.status
+    );
+
+    let msg1 = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let msg2 = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        normalize_git_cli_error(&msg1),
+        normalize_git_cli_error(&msg2),
+        "missing-repo clone error must be stable across identical inputs\nfirst:\n{msg1}\nsecond:\n{msg2}"
+    );
+    // Fixed substring from the real git client against the 400 rejection.
+    const STABLE_ERR: &str = "The requested URL returned error: 400";
+    assert!(
+        msg1.contains(STABLE_ERR),
+        "missing-repo clone error must contain `{STABLE_ERR}`, got:\n{msg1}"
+    );
+
+    // Liveness probe before teardown (VER reads MONOENGINE_IT_LIVENESS_FILE).
+    service.assert_alive();
+    let status = http_status(port, "/api/openapi.json");
+    assert_eq!(
+        status, 200,
+        "service must still answer HTTP 200 after missing-repo clone failure"
+    );
+    let pid = service.pid();
+    git_cli::append_evidence_line(
+        "MONOENGINE_IT_LIVENESS_FILE",
+        &format!("status={status} pid={pid}"),
+    );
+    // PID must still be alive at evidence time.
+    service.assert_alive();
+
+    let exit = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        exit.success(),
+        "service did not shut down cleanly: {exit}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+fn normalize_git_cli_error(combined: &str) -> String {
+    combined
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn http_status(port: u16, path: &str) -> u16 {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "15",
+        &url,
+    ]);
+    let output = command.output().expect("curl liveness probe");
+    assert!(
+        output.status.success(),
+        "curl liveness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("bad http code from curl: {:?}", output.stdout))
 }
 
 fn ls_remote_cl_refs(case_dir: &Path, token: &str, remote_url: &str) -> Vec<String> {
