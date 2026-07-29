@@ -66,6 +66,41 @@ services:
       /usr/bin/mc anonymous set download local/testbucket
       "
 
+  # Fixed-version Git CLI runner for cargo-native black-box tests (ADR-IT-01).
+  # Uses host networking so the container can reach monoengine bound on the
+  # host's 127.0.0.1 high ports; therefore it cannot join networks.default.
+  #
+  # Prefer pre-creating the shared workdir as the test UID before `up`
+  # (`mkdir -p … && chmod 1777 …`). If the path is missing, Docker's bind
+  # auto-create may make it root:root and the unprivileged cargo process will
+  # then hit EACCES allocating per-case subdirs — CI/startup scripts should
+  # always mkdir first (IT-04 will wire this into workflows).
+  #
+  # Run as a fixed numeric UID/GID so Compose can resolve `user:` without
+  # relying on Bash's unexported `$UID`. Default 1000:1000 matches common
+  # CI runners (ubuntu-latest) and local desktop users; override with
+  # `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`
+  # when the test process is not 1000.
+  git-cli:
+    image: alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+    # Opt-in: host networking is Linux-only. Keeping this off the default
+    # `up -d --wait` set preserves postgres/redis/mailpit/minio on Docker
+    # Desktop (macOS/Windows) where host mode fails before the host-git
+    # fallback can run. Enable with `--profile git`.
+    profiles: ["git"]
+    network_mode: host
+    user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"
+    volumes:
+      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}:/work
+    working_dir: /work
+    # Override the image's `git` entrypoint so the container stays up for `exec`.
+    entrypoint: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "git", "--version"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
 networks:
   default:
     name: monoengine-test-net

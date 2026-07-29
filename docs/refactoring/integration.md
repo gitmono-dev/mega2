@@ -110,37 +110,9 @@ PostgreSQL、Redis、SMTP、对象存储和 Vault 启动顺序，验证跨模块
 
 ## 测试分层
 
-### 1. 单元测试（当前已有）
-
-位置：`src/**/*.rs` 中的 `#[cfg(test)] mod tests`。
-
-用途：
-- 解析、校验、SecretRef、resolver cache、storage 业务逻辑。
-- 允许直接访问 crate 内部模块。
-- 纯逻辑测试不依赖 Docker；涉及数据库的测试使用 PostgreSQL 测试环境，优先通过独立数据库或 schema 隔离。
-
-### 2. 模块集成测试（crate 内部）
-
-位置：放在相关模块的 `#[cfg(test)]` 中（随 `monoengine-core` 库编译，可直接
-`use crate::...`）。
-
-用途：
-- 需要调用 `crate::jupiter::migration::apply_migrations`、`NotificationStorage`、
-  `on_cl_comment_created` 等内部 API 的测试。
-- 可连接 Docker PostgreSQL，但必须由测试显式配置，不依赖开发机默认服务。
-
-### 3. 黑盒集成测试（进程级）
-
-位置：`bin/tests/integration_*.rs`（属于 `monoengine` 二进制 crate）。
-
-限制：
-- 黑盒测试通过 `CARGO_BIN_EXE_monoengine` 拉起真实二进制，不导入 `crate::...`。
-- 只能通过 `std::process::Command` 调用 `CARGO_BIN_EXE_monoengine`、HTTP API、SMTP/Mailpit
-  API、PostgreSQL/Redis 客户端协议进行断言。
-
-用途：
-- CLI 行为、启动顺序、HTTP smoke、secret 不回显、进程退出码。
-- 不验证内部函数细节。
+双层测试职责（模块集成 vs 黑盒进程）、fixture 生命周期、docker-compose 新服务登记
+checklist 与客户端版本确定性规则，统一见
+[`test-infra.md`](./test-infra.md)（单一事实源）。本文只保留策略、P2 gate 与覆盖矩阵。
 
 ## 测试环境架构
 
