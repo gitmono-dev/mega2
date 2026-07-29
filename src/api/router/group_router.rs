@@ -91,7 +91,7 @@ async fn create_group(
     let description = req
         .description
         .map(|item| item.trim().to_string())
-        .and_then(|item| if item.is_empty() { None } else { Some(item) });
+        .filter(|item| !item.is_empty());
 
     let group = state
         .monorepo()
@@ -220,7 +220,7 @@ async fn update_group(
     let description = req
         .description
         .map(|item| item.trim().to_string())
-        .and_then(|item| if item.is_empty() { None } else { Some(item) });
+        .filter(|item| !item.is_empty());
 
     let updated = state
         .monorepo()
