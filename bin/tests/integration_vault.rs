@@ -1638,10 +1638,10 @@ fn wait_for_mailpit_subject(subject: &str, timeout: Duration) -> bool {
     let api_url = mailpit_api_url();
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(payload) = mailpit_messages(&api_url) {
-            if mailpit_has_subject(&payload, subject) {
-                return true;
-            }
+        if let Some(payload) = mailpit_messages(&api_url)
+            && mailpit_has_subject(&payload, subject)
+        {
+            return true;
         }
         if Instant::now() >= deadline {
             return false;

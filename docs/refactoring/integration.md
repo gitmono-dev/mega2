@@ -405,24 +405,35 @@ Mailpit 收到、`email_jobs` 终态为 `sent` 且 `sent_at` 非空。Mailpit �
 ### 本地快速运行
 
 ```bash
-docker compose -f docker-compose.test.yml up -d --wait
+docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait
+# Ensure the shared git workdir exists and is world-writable for the test UID.
+dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}"
+mkdir -p "$dir" && chmod 1777 "$dir"
+# Align git-cli container identity with the host test UID (required when id -u != 1000).
+export MONOENGINE_IT_GIT_UID="$(id -u)" MONOENGINE_IT_GIT_GID="$(id -g)"
 # 初始化 Minio 测试 bucket（one-shot 服务，不纳入默认 --wait 集合）：
-docker compose -f docker-compose.test.yml --profile init run --rm minio-init
+docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm minio-init
+# Linux：启动 git-cli（profiles: ["git"]），否则 cargo test --all 中的
+# integration_git_cli 会以 git-cli runner unavailable 失败。目标 OS 为 Linux；
+# 无跨平台宿主机 git 降级验收路径（见 test-infra.md）。
+docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait git-cli
 
-docker compose -f docker-compose.test.yml exec postgres pg_isready -U mono -d monoengine_it
-docker compose -f docker-compose.test.yml exec redis redis-cli ping
+docker compose -p monoengine-it -f docker-compose.test.yml exec postgres pg_isready -U mono -d monoengine_it
+docker compose -p monoengine-it -f docker-compose.test.yml exec redis redis-cli ping
 curl -fsS http://127.0.0.1:18025/api/v1/messages >/dev/null
 
 source .env.test
 # CLI 黑盒集成测试（config secret ref/set/check、validate）位于 bin/tests/integration_vault.rs：
 cargo test -p monoengine --test integration_vault -- --nocapture --test-threads=1
+# Git CLI HTTP 往返（compose git-cli；Linux 目标 OS）：
+cargo test -p monoengine --test integration_git_cli -- --nocapture --test-threads=1
 # 邮件/通知 dispatcher 端到端（真实 Mailpit + Postgres）、NotificationService 投递、
 # CL 评论触发器 enqueue/render，位于 crate 内集成测试：
 cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher' -- --nocapture
 cargo test -p monoengine-core 'notification::service::tests' -- --nocapture
 cargo test -p monoengine-core 'notification::triggers::tests' -- --nocapture
 
-docker compose -f docker-compose.test.yml down -v
+docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v
 ```
 
 > **测试文件命名说明（2026-06-19；2026-06-22 更新：workspace 拆分后该文件随 `bin/` 一并丢失，已从历史恢复到 `bin/tests/integration_vault.rs` 并修复 CI 引用）**：P0 CLI 黑盒场景（`integration_cli_secret_*`，函数名 `config_secret_*`）实现在 `bin/tests/integration_vault.rs`（沿用既有 `VaultCliEnv`/`isolated_command` 辅助），并非独立的 `tests/integration_cli.rs`；workspace 拆分后该文件随 `monoengine` 二进制 crate 编译，用 `cargo test -p monoengine --test integration_vault` 运行。服务级邮件投递与触发器端到端校验以 crate 内集成测试形式存在（`notification::service`、`notification::dispatcher::integration_mail_dispatcher_*`、`notification::triggers`），对真实 Postgres/Mailpit 实跑，已接入 `.github/workflows/config-validation.yml` 的「Run integration tests」步骤（含 redis/mailpit 启动与 `::add-mask::` 凭据脱敏）。
@@ -606,6 +617,7 @@ Vault 后接入 `vault://` SecretRef（2026-06-28），合法 namespace 为
 | `integration_object_storage_s3_secret_ref` | P2 已落地（黑盒） | ✓ | ✓ | 禁止触达 | ✓ | - | - | ✓ | - | ✓ |
 | `integration_config_hot_reload` | **P2 已落地（2026-06-28）** | ✓ | - | - | - | - | - | - | ✓ | ✓ |
 | `integration_multichannel_notification` | **P2 已落地（2026-06-28）**：启动真实 `service http`，通过写入 `email_jobs` outbox 触发 dispatcher，验证 email/Mailpit、in-app、Slack、webhook 多渠道扇出 | ✓ | ✓ | ✓ | 视渠道 | ✓ | ✓ | - | ✓ | ✓ |
+| `integration_git_cli` | **P2 已落地（2026-07-29，IT-03）**：`bin/tests/integration_git_cli.rs` 经 compose `git-cli`（Linux 目标 OS；宿主机 git 仅 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 本地实验）对真实 `service http` 做 clone→push→再 clone（默认 tip）+ 定向 fetch 新 `refs/cl/*` tip 的工作树字节比对与用例隔离；token 经 credential/`GIT_ASKPASS` 注入（不做认证边界/失败路径，见 IT-10/IT-12） | ✓ | ✓ | ✓ | ✓ | ✓ | - | - | ✓ | 部分（token 不入 remote URL） |
 
 ## 迁移步骤（分阶段）
 

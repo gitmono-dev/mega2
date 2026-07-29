@@ -49,8 +49,14 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
    补齐；在此之前勿依赖自动创建）。用例只在该根下分配子目录并清理。变更
    `MONOENGINE_IT_GIT_WORKDIR` 后必须 `--force-recreate git-cli`（或整栈），
    否则 host 与容器挂载会静默分叉。`git-cli` 在 `profiles: ["git"]` 下，默认
-   `up -d --wait` **不会**启动它（避免 macOS/Windows Docker Desktop 因
-   `network_mode: host` 拖垮既有数据面服务）；需要时加 `--profile git`。
+   `up -d --wait` **不会**启动它（host 网络仅在 Linux 验收路径启用；`--profile git`
+   也避免在非目标开发机上误把 host 网络拉进默认栈）。**集成测试 / git-cli harness
+   的目标 OS 是 Linux**：跑全量门（`source .env.test && cargo test --all`）必须
+   额外启动 git-cli——在基础栈已 `up -d --wait` 后执行
+   `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait git-cli`
+   （或等价的带 `--profile git` 的整栈 `up`），否则 `integration_git_cli`
+   会以 `git-cli runner unavailable` 硬失败。宿主机 `git` **不是**跨平台降级路径；
+   仅 Linux 本地实验可显式设 `MONOENGINE_IT_ALLOW_HOST_GIT=1`（见下方登记条目）。
    默认以 UID/GID `1000:1000` 运行；本地测试 UID 不同时先
    `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)` 再
    `up`/`--force-recreate`。
@@ -69,8 +75,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 7. **secret 只经 stdin/env 注入**（不把凭据写进镜像层或 compose 明文文件之外的
    可提交产物；测试口令仅限公开示例）。
 8. **`::add-mask::` 脱敏**（CI 日志对凭据打码）。
-9. **非 Linux 本地环境的降级路径**（例如 macOS Docker Desktop 无 `network_mode: host`
-   时的宿主机客户端降级，并记录版本）。
+9. **目标 OS = Linux**（集成测试与 `git-cli` harness 不要求 Windows/macOS 兼容路径；
+   宿主机客户端仅作显式本地实验 opt-in，不得冒充固定版本验收）。
 
 另需在登记条目中写明：网络模式（与 `networks.default` 的互斥约束）、卷/工作目录约定、
 `profiles` / `depends_on` 语义、CI 入口（若有）。
@@ -116,14 +122,14 @@ git-cli 固定版本: `git version 2.49.1`
 | 端口 | 无独立端口映射；通过 `network_mode: host` 访问宿主 `127.0.0.1` 高位端口 |
 | healthcheck | `CMD git --version`（见 `docker-compose.test.yml`） |
 | 网络 | **`network_mode: host`**，因此**不**加入 `networks.default`（与 host 网络互斥，见 ADR-IT-01） |
-| 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `up` 路径在 IT-04 前尚未 mkdir，运维/本地不得依赖自动创建。该路径跨用例可见；用例只在其下自建**子目录**并清理。**`MONOENGINE_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
+| 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `up` 路径在 IT-04 前尚未 mkdir，运维/本地不得依赖自动创建。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MONOENGINE_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
 | 运行身份 | `user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"`（Compose 可解析的数值默认，不依赖 Bash 未 export 的 `$UID`）。默认 `1000:1000` 对齐常见 CI runner；本地若 `id -u` 不是 1000，启栈前必须 `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`。变更 UID/GID 后需要 `--force-recreate git-cli` |
-| profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`，以免 host 网络在 Docker Desktop 上拖垮数据面；显式 `--profile git`） |
+| profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；验收路径在 Linux 上显式 `--profile git`。profile 也避免非目标开发机误启 host 网络拖垮数据面） |
 | depends_on | 无 |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
 | CI 入口 | 由后续 CI 任务卡（IT-04 / IT-11）接入；本卡只登记服务本身 |
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
-| 降级 | 非 Linux（如 macOS Docker Desktop 无 host 网络）**不要**启 `--profile git`，降级为宿主机 `git`，用例输出须记录 `git --version` |
+| 目标 OS / 降级 | **Linux only**。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于 Linux 本地实验，且不得冒充固定版本门；无 Windows/macOS 兼容路径 |
 
 ## 强制纪律
 

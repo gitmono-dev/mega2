@@ -1,0 +1,808 @@
+// Process-level black-box Git CLI integration tests (IT-03).
+//
+// Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
+// compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
+// re-clone working-tree round-trips with per-case DB/port/workdir isolation.
+// Credential injection lives in `common/git_cli.rs` (included only here) for
+// IT-10 reuse; this target does not modify `integration_vault.rs`.
+
+mod common;
+#[path = "common/git_cli.rs"]
+mod git_cli;
+
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{ErrorKind, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
+    thread::sleep,
+    time::{Duration, Instant},
+};
+
+use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+use tempfile::TempDir;
+
+const MAIL_PASSWORD_PATH: &str = "config/it/mail/password";
+const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
+const SECRET_VALUE: &str = "smtp-test-password";
+
+const DEFAULT_POSTGRES_URL: &str =
+    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
+
+static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static CASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+struct TestDatabase {
+    admin_url: String,
+    db_name: String,
+    db_url: String,
+}
+
+impl TestDatabase {
+    fn create() -> Self {
+        let admin_url = integration_postgres_url();
+        let db_name = format!(
+            "monoengine_it_git_{}_{}",
+            std::process::id(),
+            DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let db_url = database_url_for_name(&admin_url, &db_name);
+
+        with_runtime(async {
+            let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
+                panic!(
+                    "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                )
+            });
+            execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
+            execute_postgres(&db, format!("CREATE DATABASE {db_name}")).await;
+        });
+
+        Self {
+            admin_url,
+            db_name,
+            db_url,
+        }
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let admin_url = self.admin_url.clone();
+        let db_name = self.db_name.clone();
+        with_runtime(async move {
+            let Ok(db) = Database::connect(admin_url.as_str()).await else {
+                return;
+            };
+            let terminate_sql = format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
+            );
+            let _ = db
+                .execute(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    terminate_sql,
+                ))
+                .await;
+            let _ = db
+                .execute(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!("DROP DATABASE IF EXISTS {db_name}"),
+                ))
+                .await;
+        });
+    }
+}
+
+struct GitCliEnv {
+    temp_dir: TempDir,
+    database: TestDatabase,
+    bootstrap_config_path: PathBuf,
+    full_config_path: PathBuf,
+    base_dir: PathBuf,
+    cache_dir: PathBuf,
+    object_root: PathBuf,
+    case_dir: PathBuf,
+}
+
+impl GitCliEnv {
+    fn new() -> Self {
+        git_cli::require_git_cli_runner();
+
+        let work_root = git_cli::git_cli_workdir();
+        fs::create_dir_all(&work_root).unwrap_or_else(|err| {
+            panic!("create shared git workdir {}: {err}", work_root.display())
+        });
+
+        let case_name = format!(
+            "case-{}-{}",
+            std::process::id(),
+            CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let case_dir = work_root.join(&case_name);
+        if case_dir.exists() {
+            fs::remove_dir_all(&case_dir).expect("clean stale case dir");
+        }
+        fs::create_dir_all(&case_dir).expect("create case dir");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database = TestDatabase::create();
+        let bootstrap_config_path = temp_dir.path().join("bootstrap-config.toml");
+        let full_config_path = temp_dir.path().join("config.toml");
+        let base_dir = temp_dir.path().join("base");
+        let cache_dir = temp_dir.path().join("cache");
+        let object_root = temp_dir.path().join("objects");
+
+        common::write_bootstrap_config(&bootstrap_config_path, &database.db_url);
+        common::write_full_config(&full_config_path);
+        git_cli::write_git_askpass(&case_dir.join("git-askpass.sh"));
+
+        Self {
+            temp_dir,
+            database,
+            bootstrap_config_path,
+            full_config_path,
+            base_dir,
+            cache_dir,
+            object_root,
+            case_dir,
+        }
+    }
+
+    fn bootstrap_command(&self) -> Command {
+        self.command_with_config(&self.bootstrap_config_path)
+    }
+
+    fn full_config_command(&self) -> Command {
+        self.command_with_config(&self.full_config_path)
+    }
+
+    fn command_with_config(&self, config_path: &Path) -> Command {
+        let mut command = isolated_command(self.temp_dir.path(), &self.base_dir, &self.cache_dir);
+        command.arg("--config").arg(config_path);
+        command
+            .env("MEGA_DATABASE__DB_TYPE", "postgres")
+            .env("MEGA_DATABASE__DB_PATH", "")
+            .env("MEGA_DATABASE__DB_URL", &self.database.db_url)
+            .env("MEGA_DATABASE__MAX_CONNECTION", "4")
+            .env("MEGA_DATABASE__MIN_CONNECTION", "1")
+            .env("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5")
+            .env("MEGA_DATABASE__CONNECT_TIMEOUT", "5")
+            .env("MEGA_DATABASE__SQLX_LOGGING", "false")
+            .env("MEGA_LOG__PRINT_STD", "false")
+            .env("MEGA_LOG__WITH_ANSI", "false")
+            .env("MEGA_REDIS__URL", integration_redis_url())
+            .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
+            .env("MEGA_MAIL__ENABLED", "true")
+            .env("MEGA_MAIL__SMTP_HOST", "localhost")
+            .env("MEGA_MAIL__FROM", "no-reply@example.test")
+            .env("MEGA_MAIL__PASSWORD_REF", MAIL_PASSWORD_REF);
+        command
+    }
+}
+
+impl Drop for GitCliEnv {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.case_dir);
+    }
+}
+
+struct ServiceProcess {
+    child: Child,
+    reaped: bool,
+}
+
+impl ServiceProcess {
+    fn spawn(mut command: Command) -> Self {
+        let child = command.spawn().expect("spawn monoengine service");
+        // Own the Child before the fallible evidence write so Drop reaps on panic.
+        let service = Self {
+            child,
+            reaped: false,
+        };
+        git_cli::record_service_pid(service.child.id());
+        service
+    }
+
+    fn wait_until_listening(
+        &mut self,
+        port: u16,
+        timeout: Duration,
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll service") {
+                self.reaped = true;
+                panic!(
+                    "service exited before binding port {port} (status {status})\nstdout:\n{}\nstderr:\n{}",
+                    read_log(stdout_path),
+                    read_log(stderr_path),
+                );
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "service did not bind port {port} within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                    read_log(stdout_path),
+                    read_log(stderr_path),
+                );
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll service") {
+                self.reaped = true;
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn shutdown_via_sigint(&mut self, timeout: Duration) -> ExitStatus {
+        let pid = self.child.id() as libc::pid_t;
+        // SAFETY: SIGINT to a child we own; CLI installs a ctrl-c handler.
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+        self.wait_for_exit(timeout).unwrap_or_else(|| {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+            panic!("service did not exit within {timeout:?} after shutdown signal");
+        })
+    }
+}
+
+impl Drop for ServiceProcess {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[test]
+fn integration_git_cli_http_round_trip() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    seed_mail_password(&env);
+
+    let token = git_cli::resolve_seed_token();
+    let fixture_payload = format!(
+        "monoengine it-03 fixture pid={} case={}\n",
+        std::process::id(),
+        env.case_dir.display()
+    );
+    let fixture_rel = Path::new("it-03-fixture.txt");
+    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
+    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
+    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
+
+    let port = reserve_free_port();
+    git_cli::record_allocated_port(port);
+    let stdout_path = env.temp_dir.path().join("service.out");
+    let stderr_path = env.temp_dir.path().join("service.err");
+
+    let mut command = env.full_config_command();
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+
+    // Migrations + access_token table exist only after service bootstrap.
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let clone1 = env.case_dir.join("clone1");
+    let clone1_name = "clone1";
+    fs::create_dir_all(&clone1).expect("mkdir clone1");
+
+    let output = git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone1_name]);
+    git_cli::assert_git_success(&output, "initial HTTP clone");
+
+    // init_monorepo seeds a deterministic worktree (converter::init_trees). Assert
+    // the complete known fixture set — not just a few markers — so upload-pack
+    // corruption of Buck/Cedar files cannot silently become the round-trip baseline.
+    let initial_tree = snapshot_workdir(&clone1);
+    let expected_initial = expected_init_monorepo_fixture();
+    assert_eq!(
+        initial_tree, expected_initial,
+        "initial HTTP clone must match the complete seeded monorepo fixture byte-for-byte"
+    );
+
+    let branch = format!("it-03-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone1_name, "checkout", "-b", &branch],
+        ),
+        "create branch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone1_name, "config", "user.name", "IT Git CLI"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone1_name,
+                "config",
+                "user.email",
+                "it-git-cli@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+
+    fs::copy(&fixture_host, clone1.join(fixture_rel)).expect("copy fixture into clone1");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone1_name, "add", fixture_rel.to_str().unwrap()],
+        ),
+        "git add fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone1_name, "commit", "-m", "it-03 fixture"],
+        ),
+        "git commit",
+    );
+
+    let fixture_key = path_bytes(fixture_rel);
+    let fixture_bytes = fixture_payload.as_bytes().to_vec();
+
+    let pre_push_tree = snapshot_workdir(&clone1);
+    assert_eq!(
+        pre_push_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "pre-push working tree must contain the preset fixture bytes"
+    );
+
+    let before_refs = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone1_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        ),
+        "authenticated HTTP push",
+    );
+
+    let after_refs = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let cl_ref = after_refs
+        .into_iter()
+        .find(|r| !before_refs.contains(r))
+        .unwrap_or_else(|| panic!("expected a new refs/cl/* after branch push"));
+
+    let clone2_name = "clone2";
+    let clone2 = env.case_dir.join(clone2_name);
+    // Post-push default-tip clone must still succeed (upload-pack advertisement).
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["clone", &remote_url, "clone2-default"],
+        ),
+        "post-push HTTP re-clone of default tip",
+    );
+    let default_tip_tree = snapshot_workdir(&env.case_dir.join("clone2-default"));
+    assert_eq!(
+        default_tip_tree, initial_tree,
+        "post-push default tip must remain the seeded monorepo tree (unchanged by branch push)"
+    );
+    assert!(
+        !default_tip_tree.contains_key(&fixture_key),
+        "default tip must not yet contain the branch-only fixture (lives on refs/cl/*)"
+    );
+    // Monorepo branch push lands on refs/cl/*; directed fetch of that tip is how
+    // we recover the pushed tree (same pattern as scripts/git_protocol_smoke.sh LFS).
+    fs::create_dir_all(&clone2).expect("mkdir clone2");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["-C", clone2_name, "init"]),
+        "init verify worktree",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone2_name, "remote", "add", "origin", &remote_url],
+        ),
+        "add origin for CL tip fetch",
+    );
+    let fetch_refspec = format!("{cl_ref}:refs/heads/verify");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone2_name, "fetch", "origin", &fetch_refspec],
+        ),
+        "fetch pushed CL tip",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone2_name, "checkout", "verify"],
+        ),
+        "checkout pushed CL tip",
+    );
+
+    let post_clone_tree = snapshot_workdir(&clone2);
+    assert_eq!(
+        post_clone_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "HTTP clone of self-built remote tip must match preset fixture bytes"
+    );
+    assert_eq!(
+        post_clone_tree, pre_push_tree,
+        "re-clone working tree must match the pre-push working tree byte-for-byte"
+    );
+
+    // Remote URL for the fetch must remain credential-free.
+    let remote_get = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &["-C", clone2_name, "remote", "get-url", "origin"],
+    );
+    git_cli::assert_git_success(&remote_get, "remote get-url");
+    let remote_printed = String::from_utf8_lossy(&remote_get.stdout);
+    assert!(
+        !remote_printed.contains(&token),
+        "token must not appear in remote URL: {remote_printed}"
+    );
+    assert!(
+        remote_printed.contains(&format!("127.0.0.1:{port}/")),
+        "unexpected remote URL: {remote_printed}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+
+    eprintln!(
+        "integration_git_cli ok; monoengine binary={}",
+        env!("CARGO_BIN_EXE_monoengine")
+    );
+}
+
+fn ls_remote_cl_refs(case_dir: &Path, token: &str, remote_url: &str) -> Vec<String> {
+    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, "refs/cl/*"]);
+    git_cli::assert_git_success(&output, "ls-remote refs/cl/*");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .collect()
+}
+
+fn snapshot_workdir(root: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    snapshot_workdir_rec(root, root, &mut out);
+    out
+}
+
+fn snapshot_workdir_rec(root: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()))
+    {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            snapshot_workdir_rec(root, &path, out);
+            continue;
+        }
+        let rel = path.strip_prefix(root).expect("path under root");
+        let rel_key = path_bytes(rel);
+        let bytes = fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        out.insert(rel_key, bytes);
+    }
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    // Linux-only harness: compare path bytes without lossy Windows mapping.
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// Complete expected worktree for `MegaModelConverter::init` against the default
+/// `config/config.toml` monorepo settings (`admin = ["benjamin_747"]`, the six
+/// `root_dirs`). Kept in sync with `src/jupiter/utils/converter.rs::init_trees`.
+fn expected_init_monorepo_fixture() -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for dir in [
+        "third-party",
+        "project",
+        "doc",
+        "release",
+        "model",
+        "toolchains",
+    ] {
+        out.insert(
+            path_bytes(Path::new(&format!("{dir}/.gitkeep"))),
+            format!("Placeholder file for /{dir} directory").into_bytes(),
+        );
+    }
+    out.insert(path_bytes(Path::new(".buckroot")), Vec::new());
+    out.insert(
+        path_bytes(Path::new(".buckconfig")),
+        expected_buckconfig_bytes(),
+    );
+    out.insert(
+        path_bytes(Path::new("toolchains/BUCK")),
+        br#"load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+
+# All the default toolchains, suitable for a quick demo or early prototyping.
+# Most real projects should copy/paste the implementation to configure them.
+system_demo_toolchains()
+"#
+        .to_vec(),
+    );
+    out.insert(
+        path_bytes(Path::new(".cedar/policies.cedar")),
+        br#"permit(action == "code:review", principal, resource)
+    when { resource.path.startsWith("") }
+    to ["benjamin_747"];
+"#
+        .to_vec(),
+    );
+    out.insert(
+        path_bytes(Path::new(".mega_cedar.json")),
+        expected_mega_cedar_json_bytes(),
+    );
+    out
+}
+
+fn expected_buckconfig_bytes() -> Vec<u8> {
+    let cells = [
+        "  root = .",
+        "  prelude = prelude",
+        "  toolchains = toolchains",
+        "  buckal = toolchains/buckal-bundles",
+        "  none = none",
+    ]
+    .join("\n");
+    format!(
+        r#"[cells]
+{cells}
+
+[cell_aliases]
+  config = prelude
+  ovr_config = prelude
+  fbcode = none
+  fbsource = none
+  fbcode_macros = none
+  buck = none
+
+# Uses a copy of the prelude bundled with the buck2 binary. You can alternatively delete this
+# section and vendor a copy of the prelude to the `prelude` directory of your project.
+[external_cells]
+  prelude = bundled
+
+[parser]
+  target_platform_detector_spec = target:root//...->prelude//platforms:default \
+    target:prelude//...->prelude//platforms:default \
+    target:toolchains//...->prelude//platforms:default
+
+[build]
+  execution_platforms = prelude//platforms:default
+  default_target_platforms = prelude//platforms:default
+"#
+    )
+    .into_bytes()
+}
+
+fn expected_mega_cedar_json_bytes() -> Vec<u8> {
+    // Mirrors `contract::policy::entitystore::generate_entity(["benjamin_747"], "/")`.
+    let json = serde_json::json!({
+        "users": {
+            "User::\"benjamin_747\"": {
+                "euid": "User::\"benjamin_747\"",
+                "parents": ["UserGroup::\"admin\""]
+            }
+        },
+        "repos": {
+            "Repository::\"/\"": {
+                "euid": "Repository::\"/\"",
+                "is_private": true,
+                "admins": "UserGroup::\"admin\"",
+                "maintainers": "UserGroup::\"matainer\"",
+                "readers": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "user_groups": {
+            "UserGroup::\"admin\"": {
+                "euid": "UserGroup::\"admin\"",
+                "parents": ["UserGroup::\"matainer\""]
+            },
+            "UserGroup::\"matainer\"": {
+                "euid": "UserGroup::\"matainer\"",
+                "parents": ["UserGroup::\"reader\""]
+            },
+            "UserGroup::\"reader\"": {
+                "euid": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "merge_requests": {},
+        "issues": {}
+    });
+    serde_json::to_string_pretty(&json)
+        .expect("serialize expected cedar entity")
+        .into_bytes()
+}
+
+fn seed_mail_password(env: &GitCliEnv) {
+    let mut set = env.bootstrap_command();
+    set.args([
+        "config",
+        "secret",
+        "set",
+        "mail.password",
+        "--vault-path",
+        MAIL_PASSWORD_PATH,
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let output = run_with_stdin(set, SECRET_VALUE);
+    assert_success(&output);
+}
+
+fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    command
+        .current_dir(current_dir)
+        .env_clear()
+        .env("MEGA_BASE_DIR", base_dir)
+        .env("MEGA_CACHE_DIR", cache_dir)
+        .env("RUST_BACKTRACE", "0");
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    if let Some(ld_library_path) = std::env::var_os("LD_LIBRARY_PATH") {
+        command.env("LD_LIBRARY_PATH", ld_library_path);
+    }
+    command
+}
+
+fn run_with_stdin(mut command: Command, input: &str) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn monoengine");
+    {
+        let mut stdin = child.stdin.take().expect("child stdin");
+        if let Err(err) = stdin.write_all(input.as_bytes()) {
+            assert_eq!(err.kind(), ErrorKind::BrokenPipe, "write stdin");
+        }
+    }
+    child.wait_with_output().expect("wait monoengine")
+}
+
+fn assert_success(output: &Output) -> (String, String) {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "expected success, got {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout,
+        stderr
+    );
+    (stdout, stderr)
+}
+
+fn integration_postgres_url() -> String {
+    std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| DEFAULT_POSTGRES_URL.to_string())
+}
+
+fn integration_redis_url() -> String {
+    std::env::var("MEGA_REDIS__URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.to_string())
+}
+
+fn database_url_for_name(admin_url: &str, db_name: &str) -> String {
+    let mut url = url::Url::parse(admin_url).unwrap_or_else(|_| {
+        panic!("MEGA_DATABASE__DB_URL must be a valid PostgreSQL URL for integration tests")
+    });
+    url.set_path(db_name);
+    url.to_string()
+}
+
+async fn execute_postgres(db: &sea_orm::DatabaseConnection, sql: String) {
+    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+        .await
+        .unwrap_or_else(|_| panic!("failed to prepare integration PostgreSQL database"));
+}
+
+fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
+}
+
+fn reserve_free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+fn create_log_file(path: &Path) -> fs::File {
+    fs::File::create(path).expect("create service log file")
+}
+
+fn read_log(path: &Path) -> String {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf);
+    buf
+}
