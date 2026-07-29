@@ -162,7 +162,6 @@ pub fn require_git_cli_runner() {
 
     let container_err = match try_container_git_version() {
         Ok(version) if version == PINNED_GIT_CLI_VERSION => {
-            eprintln!("git-cli runner: {version}");
             let _ = RUNNER.set(GitRunnerKind::Container);
             return;
         }
@@ -175,6 +174,9 @@ pub fn require_git_cli_runner() {
     if host_git_opt_in_allowed() {
         match try_host_git_version() {
             Ok(version) => {
+                // Host opt-in is non-CI; keep a visible breadcrumb. Avoid printing on
+                // the default container path so `cargo test` keeps `... ok` on one line
+                // (IT-10 VER scans for `${case} ... ok`).
                 eprintln!(
                     "git-cli runner (host opt-in): {version} (compose git-cli unavailable: {container_err})"
                 );
@@ -253,6 +255,140 @@ pub fn git_cli(case_dir: &Path, token: &str, git_args: &[&str]) -> Output {
     }
 }
 
+/// Run `git` via the selected runner **without** credential injection.
+/// Used by IT-10 to assert unauthenticated receive-pack is rejected.
+pub fn git_cli_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
+    require_git_cli_runner();
+    if git_cli_skip_requested() {
+        panic!("{GIT_CLI_UNAVAILABLE}: skipped runner cannot execute git");
+    }
+
+    match runner_kind() {
+        GitRunnerKind::Container => git_cli_container_no_auth(case_dir, git_args),
+        GitRunnerKind::Host => git_cli_host_no_auth(case_dir, git_args),
+    }
+}
+
+fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
+    let work_container = container_path_for_host(case_dir);
+
+    let mut command = compose_command();
+    command
+        .args(["exec", "-T"])
+        .arg("-w")
+        .arg(&work_container)
+        .arg("-e")
+        .arg("GIT_TERMINAL_PROMPT=0")
+        .arg("-e")
+        .arg("GIT_ASKPASS=true")
+        .arg("-e")
+        .arg("GIT_CONFIG_COUNT=1")
+        .arg("-e")
+        .arg("GIT_CONFIG_KEY_0=credential.helper")
+        .arg("-e")
+        .arg("GIT_CONFIG_VALUE_0=")
+        .arg("git-cli");
+    append_container_git_timeout_wrapper(&mut command);
+    command.args(git_args);
+
+    output_with_timeout(
+        command,
+        GIT_CLI_COMMAND_TIMEOUT + Duration::from_secs(15),
+        "compose git-cli (no-auth)",
+    )
+}
+
+/// In-container wall-clock wrapper around `git`.
+///
+/// Important: do **not** wrap the script itself in `setsid`. BusyBox `setsid`
+/// starts a new session, and `docker compose exec` then reports exit status 0
+/// even when the session leader exits non-zero (auth failures looked like
+/// success while stderr still showed `fatal: Authentication failed`). Only the
+/// `git` child is `setsid`'d so timeout can `kill -KILL -$gpid` its helpers.
+fn append_container_git_timeout_wrapper(command: &mut Command) {
+    command
+        .arg("sh")
+        .arg("-c")
+        .arg(format!(
+            "setsid git \"$@\" &\n\
+             gpid=$!\n\
+             sleep {secs} &\n\
+             spid=$!\n\
+             while kill -0 \"$gpid\" 2>/dev/null && kill -0 \"$spid\" 2>/dev/null; do\n\
+               sleep 1\n\
+             done\n\
+             if kill -0 \"$gpid\" 2>/dev/null; then\n\
+               kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
+               wait \"$gpid\" 2>/dev/null || true\n\
+               kill \"$spid\" 2>/dev/null || true\n\
+               wait \"$spid\" 2>/dev/null || true\n\
+               exit 137\n\
+             fi\n\
+             wait \"$gpid\"\n\
+             status=$?\n\
+             kill \"$spid\" 2>/dev/null || true\n\
+             wait \"$spid\" 2>/dev/null || true\n\
+             exit \"$status\"\n",
+            secs = GIT_CLI_COMMAND_TIMEOUT.as_secs()
+        ))
+        .arg("git-wrapper");
+}
+
+fn git_cli_host_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
+    let isolated_home = case_dir.join("git-home-noauth");
+    fs::create_dir_all(&isolated_home).expect("create isolated git HOME");
+    let null_config = PathBuf::from("/dev/null");
+
+    let mut command = Command::new("git");
+    command
+        .current_dir(case_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove(GIT_ASKPASS_ENV)
+        .env_remove("GIT_ASKPASS")
+        .env("HOME", &isolated_home)
+        .env("XDG_CONFIG_HOME", isolated_home.join("xdg-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &null_config)
+        .env("GIT_CONFIG_SYSTEM", &null_config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        .env("GIT_CONFIG_KEY_1", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .args(git_args);
+    output_with_timeout(command, GIT_CLI_COMMAND_TIMEOUT, "host git (no-auth)")
+}
+
+/// Probe receive-pack info/refs without credentials; returns status + headers body.
+pub fn probe_receive_pack_challenge(port: u16) -> String {
+    let url = format!("http://127.0.0.1:{port}/info/refs?service=git-receive-pack");
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-D",
+        "-",
+        "-o",
+        "/dev/null",
+        "--max-time",
+        "15",
+        &url,
+    ]);
+    let output = output_with_timeout(command, Duration::from_secs(20), "curl receive-pack probe");
+    assert!(
+        output.status.success(),
+        "curl probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn git_cli_container(
     case_dir: &Path,
     askpass_host: &Path,
@@ -280,42 +416,15 @@ fn git_cli_container(
         .arg("GIT_CONFIG_KEY_0=credential.username")
         .arg("-e")
         .arg(format!("GIT_CONFIG_VALUE_0={DEFAULT_GIT_AUTH_USER}"))
-        .arg("git-cli")
-        // Enforce the wall-clock budget *inside* the container so a stalled
-        // git/helper is reaped even if only the host-side docker client dies.
-        // `docker compose exec -T` has no TTY, so BusyBox `set -m` is a no-op.
-        // One outer `setsid` owns the wrapper; inner `setsid git` gives Git its
-        // own session/process group so timeout can `kill -KILL -$gpid` and reap
-        // helpers (job control is off under `docker compose exec -T`). Poll
-        // until `git` or `sleep` ends — never kill the git group on success.
-        .arg("sh")
-        .arg("-c")
-        .arg(format!(
-            "setsid sh -c '\n\
-               setsid git \"$@\" &\n\
-               gpid=$!\n\
-               sleep {secs} &\n\
-               spid=$!\n\
-               while kill -0 \"$gpid\" 2>/dev/null && kill -0 \"$spid\" 2>/dev/null; do\n\
-                 sleep 1\n\
-               done\n\
-               if kill -0 \"$gpid\" 2>/dev/null; then\n\
-                 kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
-                 wait \"$gpid\" 2>/dev/null || true\n\
-                 kill \"$spid\" 2>/dev/null || true\n\
-                 wait \"$spid\" 2>/dev/null || true\n\
-                 exit 137\n\
-               fi\n\
-               wait \"$gpid\"\n\
-               status=$?\n\
-               kill \"$spid\" 2>/dev/null || true\n\
-               wait \"$spid\" 2>/dev/null || true\n\
-               exit \"$status\"\n\
-             ' nested-git-timeout \"$@\"",
-            secs = GIT_CLI_COMMAND_TIMEOUT.as_secs()
-        ))
-        .arg("git-wrapper")
-        .args(git_args);
+        .arg("git-cli");
+    // Enforce the wall-clock budget *inside* the container so a stalled
+    // git/helper is reaped even if only the host-side docker client dies.
+    // `docker compose exec -T` has no TTY, so BusyBox `set -m` is a no-op.
+    // Inner `setsid git` gives Git its own session/process group so timeout
+    // can `kill -KILL -$gpid` and reap helpers. The wrapper shell itself must
+    // *not* be setsid'd — see `append_container_git_timeout_wrapper`.
+    append_container_git_timeout_wrapper(&mut command);
+    command.args(git_args);
 
     // Outer budget must exceed the in-container deadline so the container-side
     // kill wins first; otherwise we may only reap the host `docker compose`

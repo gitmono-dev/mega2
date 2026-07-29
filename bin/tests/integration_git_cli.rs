@@ -1,10 +1,11 @@
-// Process-level black-box Git CLI integration tests (IT-03).
+// Process-level black-box Git CLI integration tests (IT-03 / IT-10).
 //
 // Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
 // compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
 // re-clone working-tree round-trips with per-case DB/port/workdir isolation.
-// Credential injection lives in `common/git_cli.rs` (included only here) for
-// IT-10 reuse; this target does not modify `integration_vault.rs`.
+// IT-10 adds auth-boundary cases (`integration_git_cli_auth_*`).
+// Credential injection lives in `common/git_cli.rs` (included only here).
+// This target does not modify `integration_vault.rs`.
 
 mod common;
 #[path = "common/git_cli.rs"]
@@ -123,6 +124,8 @@ impl GitCliEnv {
             CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let case_dir = work_root.join(&case_name);
+        // Case dirs are retained after the test so IT-10 VER can scan
+        // `.git/config` under the shared work root; VER/operators wipe the root.
         if case_dir.exists() {
             fs::remove_dir_all(&case_dir).expect("clean stale case dir");
         }
@@ -182,12 +185,6 @@ impl GitCliEnv {
             .env("MEGA_MAIL__FROM", "no-reply@example.test")
             .env("MEGA_MAIL__PASSWORD_REF", MAIL_PASSWORD_REF);
         command
-    }
-}
-
-impl Drop for GitCliEnv {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.case_dir);
     }
 }
 
@@ -277,27 +274,7 @@ impl Drop for ServiceProcess {
     }
 }
 
-#[test]
-fn integration_git_cli_http_round_trip() {
-    if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
-        return;
-    }
-
-    let env = GitCliEnv::new();
-    seed_mail_password(&env);
-
-    let token = git_cli::resolve_seed_token();
-    let fixture_payload = format!(
-        "monoengine it-03 fixture pid={} case={}\n",
-        std::process::id(),
-        env.case_dir.display()
-    );
-    let fixture_rel = Path::new("it-03-fixture.txt");
-    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
-    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
-    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
-
+fn boot_service_http(env: &GitCliEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     let port = reserve_free_port();
     git_cli::record_allocated_port(port);
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -319,6 +296,31 @@ fn integration_git_cli_http_round_trip() {
 
     let mut service = ServiceProcess::spawn(command);
     service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+    (service, port, stdout_path, stderr_path)
+}
+
+#[test]
+fn integration_git_cli_http_round_trip() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    seed_mail_password(&env);
+
+    let token = git_cli::resolve_seed_token();
+    let fixture_payload = format!(
+        "monoengine it-03 fixture pid={} case={}\n",
+        std::process::id(),
+        env.case_dir.display()
+    );
+    let fixture_rel = Path::new("it-03-fixture.txt");
+    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
+    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
+    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
+
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
 
     // Migrations + access_token table exist only after service bootstrap.
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
@@ -521,6 +523,272 @@ fn integration_git_cli_http_round_trip() {
         "integration_git_cli ok; monoengine binary={}",
         env!("CARGO_BIN_EXE_monoengine")
     );
+}
+
+#[test]
+fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    seed_mail_password(&env);
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+
+    // Challenge probe: no Authorization header → 401 + WWW-Authenticate.
+    let headers = git_cli::probe_receive_pack_challenge(port);
+    assert!(
+        headers.lines().next().is_some_and(|l| l.contains("401")),
+        "expected HTTP 401 for unauthenticated receive-pack info/refs, got:\n{headers}"
+    );
+    assert!(
+        headers.to_ascii_lowercase().contains("www-authenticate:"),
+        "expected WWW-Authenticate challenge header, got:\n{headers}"
+    );
+
+    // Real client path: anonymous clone (upload-pack) then unauthenticated push fails.
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let clone_name = "auth-unauthed-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(&env.case_dir, &["clone", &remote_url, clone_name]),
+        "anonymous HTTP clone before unauthenticated push",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &["-C", clone_name, "config", "user.name", "IT Auth"],
+        ),
+        "user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "it-auth@example.invalid",
+            ],
+        ),
+        "user.email",
+    );
+    let branch = format!("it-10-unauth-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create unauth branch",
+    );
+    fs::write(
+        env.case_dir.join(clone_name).join("it-10-unauth.txt"),
+        b"unauthenticated push must fail\n",
+    )
+    .expect("write unauth file");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &["-C", clone_name, "add", "it-10-unauth.txt"],
+        ),
+        "git add",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_no_auth(
+            &env.case_dir,
+            &["-C", clone_name, "commit", "-m", "it-10 unauth"],
+        ),
+        "git commit",
+    );
+
+    let push = git_cli::git_cli_no_auth(
+        &env.case_dir,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{branch}"),
+        ],
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    assert!(
+        !push.status.success(),
+        "unauthenticated push must fail with non-zero exit (status={:?} code={:?}):\n{combined}",
+        push.status,
+        push.status.code()
+    );
+    assert!(
+        combined.contains("401")
+            || combined.to_ascii_lowercase().contains("authentication")
+            || combined.to_ascii_lowercase().contains("unauthorized"),
+        "unauthenticated push stderr/stdout must mention auth failure, got:\n{combined}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_auth_token_never_leaks() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    seed_mail_password(&env);
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let clone_name = "auth-leak-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "authenticated clone for leak audit",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "config", "user.name", "IT Leak"],
+        ),
+        "user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "it-leak@example.invalid",
+            ],
+        ),
+        "user.email",
+    );
+    let branch = format!("it-10-leak-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create leak-audit branch",
+    );
+    fs::write(
+        env.case_dir.join(clone_name).join("it-10-leak.txt"),
+        b"token must stay out of remotes and workdir files\n",
+    )
+    .expect("write leak fixture");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "it-10-leak.txt"],
+        ),
+        "git add",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "it-10 leak audit"],
+        ),
+        "git commit",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        ),
+        "authenticated push for leak audit",
+    );
+
+    let remote_get = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "remote", "get-url", "origin"],
+    );
+    git_cli::assert_git_success(&remote_get, "remote get-url");
+    let remote_printed = String::from_utf8_lossy(&remote_get.stdout);
+    assert!(
+        !remote_printed.contains(&token),
+        "token must not appear in remote URL: {remote_printed}"
+    );
+
+    // Scan every .git/config under this case dir (VER also scans the workdir root).
+    let mut configs = Vec::new();
+    collect_git_configs(&env.case_dir, &mut configs);
+    assert!(
+        !configs.is_empty(),
+        "expected at least one .git/config under {}",
+        env.case_dir.display()
+    );
+    for cfg in &configs {
+        let text = fs::read_to_string(cfg).unwrap_or_else(|err| {
+            panic!("read {}: {err}", cfg.display());
+        });
+        assert!(
+            !text.contains(&token),
+            "token leaked into {}",
+            cfg.display()
+        );
+    }
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+fn collect_git_configs(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == ".git") {
+                let cfg = path.join("config");
+                if cfg.is_file() {
+                    out.push(cfg);
+                }
+            } else {
+                collect_git_configs(&path, out);
+            }
+        }
+    }
 }
 
 fn ls_remote_cl_refs(case_dir: &Path, token: &str, remote_url: &str) -> Vec<String> {
