@@ -61,7 +61,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 |---|---|---|---|
 | 2026-07-27 | `d2b6d1c3`（#2157） | v0.1.50（`562122c2`，同步分析基于 #2129） | 首版：确认 orion 三件套、ceres/bus+infra、协议测试夹具为主要缺口；已移植模块存在 #2129→#2157 漂移窗口；集成测试基建（PT-01）排为下一个执行任务，Mega 基线追平（PT-02）紧随其后 |
 
-**本次结论：PT-01（集成测试基建扩展与统一）文档收口已随 v0.1.176 发布；IT-03/04/11 D 组仍 `remote-pending`；orion 三件套仍是最大整体缺口。**
+**本次结论：PT-01（集成测试基建扩展与统一）已完成（D 组随 v0.1.177 smoke 绿收口）；orion 三件套仍是最大整体缺口。**
 
 ## 规划原则
 
@@ -100,7 +100,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 | ID | 能力 | 优先级 | 状态 | 当前判断 | Mega 证据（revision `d2b6d1c3`） | 已关联日期计划 | 最近验证 |
 |---|---|---:|---|---|---|---|---|
-| PT-01 | 集成测试基建扩展与统一 | P0 | **收口中**（IT-07/IT-09 已发布；D 组待绿，2026-07-29） | git-cli runner、HTTP 最小矩阵、热加载/多渠道扇出黑盒、并发 dispatcher 基线与 CI 执行/触发面已落地；P2：`config init`/热加载/多渠道扇出已落地，次渠道 retry（`DEFER-IT-10`）、GCS（`DEFER-IT-08`）、全局 disabled vs `system_required`（`DEFER-IT-07`）书面关闭；SSH/LFS 完整矩阵与真多进程黑盒仍属 PT-04/PT-09 | `mega/tests/`（对照）、`docs/refactoring/integration.md` P2 清单 | [`plan-20260727.md`](plan-20260727.md)（IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12；IT-05 已关闭为非任务卡） | 2026-07-29 |
+| PT-01 | 集成测试基建扩展与统一 | P0 | **已完成**（D 组绿于 v0.1.177，2026-07-30） | git-cli runner、HTTP 最小矩阵、热加载/多渠道扇出黑盒、并发 dispatcher 基线与 CI 执行/触发面已落地；P2：`config init`/热加载/多渠道扇出已落地，次渠道 retry（`DEFER-IT-10`）、GCS（`DEFER-IT-08`）、全局 disabled vs `system_required`（`DEFER-IT-07`）书面关闭；SSH/LFS 完整矩阵与真多进程黑盒仍属 PT-04/PT-09 | `mega/tests/`（对照）、`docs/refactoring/integration.md` P2 清单 | [`plan-20260727.md`](plan-20260727.md)（IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12；IT-05 已关闭为非任务卡） | 2026-07-30 |
 | PT-02 | 已移植模块 Mega 基线追平与持续同步 | P0 | 已验证 | monoengine 同步基线停在 Mega #2129，Mega 已到 #2157；callisto/jupiter/ceres/mono 对应面需逐模块核对漂移 | Mega log #2130–#2157 | 无 | 2026-07-27 |
 | PT-03 | Git 协议兼容性与 LFS 收尾 | P0 | 实施中 | 首批 panic 止血与 capability truth table 已交付；streaming parser、per-channel state、统一 ProtocolAuthContext、delete-push 矩阵等缺失 | `mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` | 无 | 2026-07-27 |
 | PT-04 | Git 协议集成测试夹具与真实 CLI 兼容矩阵 | P0 | 已验证 | PT-01 已交付 **HTTP 最小**真实 CLI 矩阵（`integration_git_cli` + shell smoke）；本卡仍缺 Mega 协议级夹具（`test/project/` / 对象/refs 脚本）、SSH、完整 LFS 与形态合法 missing-repo 失败矩阵（见 `DEFER-IT-12`） | `mega/tests/{data,diff,objects,refs,scripts}` | 无 | 2026-07-29 |
@@ -205,9 +205,9 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 ### 审计证据、真实缺口与提升条件
 
-- **monoengine 现状证据（IT-07 收口中）**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。PT-01 正式「已完成」状态待 IT-09 发布点推送且 **IT-03 / IT-04 / IT-11** D 组 CI 绿后落定。
+- **monoengine 现状证据（已完成，2026-07-30）**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。IT-03 / IT-04 / IT-11 D 组已绿（`validate-config` [30466831819](https://github.com/gitmono-dev/monoengine/actions/runs/30466831819)；`git-protocol-smoke` [30479301244](https://github.com/gitmono-dev/monoengine/actions/runs/30479301244)）。
 - **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 monoengine 无承载（归 PT-06/07）。
-- **完成判据对照（`:202-204`）**：① 新服务接入有标准流程且以 Git CLI runner 示范落地 —— 满足（`test-infra.md` + compose `git-cli`）；② HTTP 通道真实 Git CLI 最小矩阵、热加载黑盒、多实例竞争基线用例 **本地绿且已接入 CI**；远端 CI 绿（IT-03/IT-04/IT-11 D 组）仍为 `remote-pending`，本条在 D 组全绿前不记为满足；③ integration.md P2 清单全部有「落地 / 书面关闭（含理由与承接编号）」结论 —— 满足（无「延后」）。
+- **完成判据对照（`:202-204`）**：① 新服务接入有标准流程且以 Git CLI runner 示范落地 —— 满足（`test-infra.md` + compose `git-cli`）；② HTTP 通道真实 Git CLI 最小矩阵、热加载黑盒、多实例竞争基线用例本地绿、已接入 CI，且远端 CI 绿（IT-03/IT-04/IT-11 D 组）—— 满足；③ integration.md P2 清单全部有「落地 / 书面关闭（含理由与承接编号）」结论 —— 满足（无「延后」）。
 - **风险与边界**：测试栈膨胀会拖慢 CI；新服务必须可选启用（`profiles`），本地单元测试路径不受影响。SSH/LFS 完整矩阵与真多进程黑盒仍分别属 PT-04 / PT-09。
 
 ### 依赖与顺序
@@ -621,9 +621,9 @@ PT-12 无硬前置，审计切片可立即启动；API 面追平（PT-02）与 o
 
 十一个移植项按四个阶段推进。阶段之间是架构依赖，不要求前一阶段全部结束才开始下一阶段的设计，但不得绕过前置决策直接实施高风险切片。
 
-### 下一个执行任务：PT-01 收口（IT-07/IT-09，2026-07-29）
+### 下一个执行任务：择下一 PT（PT-01 已完成，2026-07-30）
 
-实现卡提交已在 `main`（对应任务卡 `Lifecycle` 已在 `plan-20260727.md` 更新；IT-03/IT-04/IT-11 的 D 组为 `remote-pending` 待 CI）。剩余文档收口 IT-07 与发布点 IT-09。完成后按本表优先级另择下一任务（orion 三件套仍是最大整体缺口）。
+PT-01 全部非延后卡 `Lifecycle=done` / `Acceptance=complete`（含 IT-03/IT-04/IT-11 D 组）。按本表优先级另择下一任务（orion 三件套仍是最大整体缺口；候选见 PT-02 / PT-03 / PT-06）。
 
 ### 阶段零：工程安全基线
 
@@ -747,7 +747,7 @@ flowchart TD
 
 | 日期计划 | 对应 PT | 当前状态 | 范围与长期剩余缺口 |
 |---|---|---|---|
-| [`plan-20260727.md`](plan-20260727.md) | PT-01 | **收口中**（文档已发；D 组待绿） | 最终卡集 IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12（共 11 张任务卡）；IT-05 已关闭为非任务卡（热加载黑盒此前已落地）。交付：测试双层规范、git-cli runner 拓扑、HTTP clone/push 最小矩阵、认证边界与失败路径、CI 执行/触发面、git/git-lfs 客户端 pin、并发 dispatcher 基线、P2 清单收口。不覆盖 SSH/LFS 矩阵（PT-04）、真多进程黑盒（PT-09） |
+| [`plan-20260727.md`](plan-20260727.md) | PT-01 | **已完成**（D 组绿于 v0.1.177） | 最终卡集 IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12（共 11 张任务卡）；IT-05 已关闭为非任务卡（热加载黑盒此前已落地）。交付：测试双层规范、git-cli runner 拓扑、HTTP clone/push 最小矩阵、认证边界与失败路径、CI 执行/触发面、git/git-lfs 客户端 pin、并发 dispatcher 基线、P2 清单收口。不覆盖 SSH/LFS 矩阵（PT-04）、真多进程黑盒（PT-09） |
 
 ## 已替代 / 不采纳 / 已实现摘要
 
@@ -763,7 +763,7 @@ flowchart TD
 
 ### 已实现
 
-- **PT-01** 实现面已交付，文档收口已随 v0.1.176（IT-07/IT-09）发布；D 组（IT-03/04/11）仍待绿。其余 PT-02..PT-12 仍未全部满足完成判据。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、mail、notification、orbit、协议止血、bellatrix、chat 主干）已在"当前基础"据实记录。
+- **PT-01** 已完成（实现面 + 文档收口 v0.1.176 + D 组 v0.1.177）。其余 PT-02..PT-12 仍未全部满足完成判据。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、mail、notification、orbit、协议止血、bellatrix、chat 主干）已在"当前基础"据实记录。
 
 ## 路线图维护
 
