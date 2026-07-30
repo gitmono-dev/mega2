@@ -270,9 +270,8 @@ impl ServiceProcess {
     }
 
     fn assert_alive(&mut self) {
-        match self.child.try_wait().expect("poll service") {
-            Some(status) => panic!("service exited unexpectedly with {status}"),
-            None => {}
+        if let Some(status) = self.child.try_wait().expect("poll service") {
+            panic!("service exited unexpectedly with {status}");
         }
     }
 }

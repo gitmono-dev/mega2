@@ -108,7 +108,7 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml down -v`；零残留按 project label 判定 |
 | CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs 与 git-cli 的栈，随后 `--profile init run --rm rustfs-init` 建桶；执行面含 `cargo test -p monoengine --test integration_vault`、`--test integration_git_cli`、以及 `monoengine-core` 的 dispatcher / service / triggers 集成（含 IT-06 focused `integration_mail_dispatcher_two_instances_deliver_exactly_once`）；job 末尾 `if: always()` 下 `-p monoengine-it --profile git down -v` |
-| secret | 公开测试口令字符串 `minioadmin` / `minioadmin`（仅测试栈；历史兼容名，**不是** MinIO 依赖）；CI 对同类凭据使用 `::add-mask::` |
+| secret | 公开测试凭据 `rustfs_it` / `rustfs_it_secret`（仅测试栈，与 `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` 及 `.env.test.example` 对齐）；CI 对同类凭据使用 `::add-mask::` |
 | 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
 
 对照锚点：`docker-compose.test.yml` 的 `rustfs` / `rustfs-init` 服务块与 `networks.default`。

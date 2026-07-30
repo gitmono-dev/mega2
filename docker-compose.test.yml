@@ -35,9 +35,8 @@ services:
       timeout: 5s
       retries: 20
 
-  # S3-compatible object storage for IT smoke (RustFS). Ports and the public
-  # test credential strings stay aligned with existing MEGA_OBJECT_STORAGE__S3__*
-  # contracts (`minioadmin` values are opaque test keys, not a MinIO dependency).
+  # S3-compatible object storage for IT smoke (RustFS). Public IT credentials
+  # are `rustfs_it` / `rustfs_it_secret` (see `.env.test.example`).
   rustfs:
     image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
     environment:
@@ -45,8 +44,8 @@ services:
       RUSTFS_ADDRESS: 0.0.0.0:9000
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: minioadmin
-      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_ACCESS_KEY: rustfs_it
+      RUSTFS_SECRET_KEY: rustfs_it_secret
       # Single-volume local smoke; required when not using multi-disk topology.
       RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
     ports:
@@ -71,7 +70,7 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://rustfs:9000 minioadmin minioadmin &&
+      /usr/bin/mc alias set local http://rustfs:9000 rustfs_it rustfs_it_secret &&
       /usr/bin/mc mb --ignore-existing local/testbucket &&
       /usr/bin/mc anonymous set download local/testbucket
       "

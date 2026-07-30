@@ -1166,8 +1166,8 @@ fn integration_object_storage_s3_compatible_smoke() {
     if !rustfs_available {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
-             run `docker compose -f docker-compose.test.yml up -d --wait` \
-             and `docker compose -f docker-compose.test.yml --profile init run --rm rustfs-init` \
+             run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` \
+             and `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init` \
              first, skipping",
             rustfs_endpoint
         );
@@ -1184,8 +1184,11 @@ fn integration_object_storage_s3_compatible_smoke() {
         .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
         .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "testbucket")
         .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", rustfs_endpoint)
-        .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "minioadmin")
-        .env("MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY", "minioadmin");
+        .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs_it")
+        .env(
+            "MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY",
+            "rustfs_it_secret",
+        );
 
     command.args([
         "debug",
