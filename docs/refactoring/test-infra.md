@@ -22,6 +22,9 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 - **用途：** CLI、启动顺序、HTTP / Git 协议 smoke、secret 不回显、进程退出码。
 - **边界：** 通过 `CARGO_BIN_EXE_monoengine` 与外部协议断言；**不**导入
   `crate::...`。共享编排 helper 放在 `bin/tests/common/mod.rs`。
+  另：compose `monoengine`（profile `app`）提供栈级常驻 HTTP，供
+  `integration_compose_monoengine_http_smoke` / CI 探针使用；**不**替代本层
+  的 per-case 进程隔离。
 
 单元测试（纯逻辑、无外部依赖）仍放在对应源文件的 `#[cfg(test)]` 中，不另立规范。
 
@@ -133,6 +136,46 @@ git-cli 固定版本: `git version 2.49.1`
 | CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p monoengine --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli`，再以 `cargo test -p monoengine --release --test integration_git_cli` 跑同一 target（复用本 job 的 release 构建；补 allowlist A 未含协议路径的覆盖缺口），其后用宿主机 git（pin 见「客户端版本确定性规则」）跑脚本矩阵；该 job `timeout-minutes: 60`（release 构建 + cargo gate + shell smoke） |
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
 | 目标 OS / 降级 | **Linux only**。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于 Linux 本地实验，且不得冒充固定版本门；无 Windows/macOS 兼容路径 |
+
+### monoengine（compose 常驻 HTTP，profile `app`）
+
+被测产品进程进入 compose 拓扑的登记条目。**与 cargo 黑盒分层并存**：`bin/tests/integration_*.rs` 仍通过 `CARGO_BIN_EXE_monoengine` 按用例拉起隔离进程（唯一端口 / 临时 `MEGA_BASE_DIR` / 隔离 DB）；本服务提供**栈级常驻** `service http`，供 compose smoke、手工联调与 CI 健康探针使用，**不**替代 per-case 隔离门。
+
+| 项 | 值 |
+|---|---|
+| 服务名 | `monoengine` |
+| 镜像 | `monoengine-it:local`（`pull_policy: never`）。本地源码构建：`Dockerfile`（context = 含 `monoengine/`+`orbit/` 的父目录，bookworm）。CI/快速路径：宿主机 `cargo build -p monoengine` 后用 `Dockerfile.it-runtime`（**Ubuntu 24.04**，匹配较新 glibc）打包 `monoengine.itbin` |
+| 固定版本字符串 | 无客户端 pin；镜像内容随源码 / 宿主机二进制变化，升级为显式 build |
+| 端口 | `127.0.0.1:19180:8000`（容器内 CLI 默认 `8000`；仅回环） |
+| healthcheck | `curl -f http://127.0.0.1:8000/api/openapi.json` |
+| 网络 | 默认 `networks.default` → `monoengine-test-net`（可解析 `postgres`/`redis` 服务名） |
+| 卷 / 工作目录 | named volume `monoengine-it-data` → `/var/lib/monoengine`（`MEGA_BASE_DIR`）；对象存储默认 local → `/var/lib/monoengine/objects` |
+| profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
+| depends_on | `postgres`、`redis`（`service_healthy`）。mail 默认 `MEGA_MAIL__ENABLED=false`（NoopMailer，无需 vault password）；不依赖 rustfs |
+| 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
+| CI 入口 | `.github/workflows/config-validation.yml`：在数据面 `up` 后 `Dockerfile.it-runtime` 打 `monoengine-it:local`，`--profile app up -d --wait monoengine`，`curl` `127.0.0.1:19180/api/openapi.json`；job 末尾带 `--profile app` 的 `down -v` |
+| secret | 无注入生产 secret；DB 使用公开测试口令 `mono_test_password`；mail 关闭 |
+| 降级 / 黑盒 | 栈级 smoke：`integration_compose_monoengine_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
+
+本地源码构建示例：
+
+```bash
+# 需 sibling ../orbit
+docker compose -p monoengine-it -f docker-compose.test.yml --profile app build monoengine
+docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait postgres redis
+docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine
+curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
+```
+
+CI / 宿主机二进制打包示例：
+
+```bash
+cargo build -p monoengine
+cp target/debug/monoengine monoengine.itbin
+docker build -f Dockerfile.it-runtime -t monoengine-it:local .
+rm -f monoengine.itbin
+docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine
+```
 
 ## 强制纪律
 

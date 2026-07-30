@@ -33,6 +33,9 @@ target-codex-review/
 .env.test
 .env
 
+# Host binary staging for Dockerfile.it-runtime (CI/local compose image)
+monoengine.itbin
+
 # Mac
 .DS_Store
 

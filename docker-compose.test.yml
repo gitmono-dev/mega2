@@ -110,6 +110,49 @@ services:
       timeout: 5s
       retries: 20
 
+  # Standing monoengine HTTP service for stack-level IT (profile `app`).
+  # Per-case cargo black-box tests still spawn via CARGO_BIN_EXE for isolation;
+  # this service is the compose-hosted process under test for stack smoke.
+  # Build context is the parent of `monoengine/` + `orbit/` (see Dockerfile).
+  # CI may pre-tag `monoengine-it:local` from Dockerfile.it-runtime instead of
+  # rebuilding from source (`pull_policy: never`).
+  monoengine:
+    profiles: ["app"]
+    image: monoengine-it:local
+    pull_policy: never
+    build:
+      context: ..
+      dockerfile: monoengine/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MEGA_BASE_DIR: /var/lib/monoengine
+      MEGA_CONFIG: /etc/monoengine/config.toml
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@postgres:5432/monoengine_it
+      MEGA_REDIS__URL: redis://redis:6379
+      MEGA_MAIL__ENABLED: "false"
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
+      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: /var/lib/monoengine/objects
+      MEGA_LOG__PRINT_STD: "true"
+      MEGA_LOG__LEVEL: info
+    volumes:
+      - monoengine-it-data:/var/lib/monoengine
+    ports:
+      - "127.0.0.1:19180:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+volumes:
+  monoengine-it-data:
+
 networks:
   default:
     name: monoengine-test-net

@@ -15,9 +15,12 @@ on:
       - "README.md"
       - "bin/tests/**"
       - "docker-compose.test.yml"
+      - "Dockerfile"
+      - "Dockerfile.it-runtime"
       - ".env.test.example"
       - "src/notification/**"
       - "src/jupiter/storage/notification_storage.rs"
+      - "docs/refactoring/test-infra.md"
   push:
     branches:
       - main
@@ -34,9 +37,12 @@ on:
       - "README.md"
       - "bin/tests/**"
       - "docker-compose.test.yml"
+      - "Dockerfile"
+      - "Dockerfile.it-runtime"
       - ".env.test.example"
       - "src/notification/**"
       - "src/jupiter/storage/notification_storage.rs"
+      - "docs/refactoring/test-infra.md"
 
 jobs:
   validate-config:
@@ -98,6 +104,18 @@ jobs:
           docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait
           docker compose -p monoengine-it -f docker-compose.test.yml ps
           docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init
+
+      - name: Start compose-hosted monoengine (profile app)
+        working-directory: monoengine
+        run: |
+          set -euo pipefail
+          cargo build -p monoengine
+          cp target/debug/monoengine monoengine.itbin
+          docker build -f Dockerfile.it-runtime -t monoengine-it:local .
+          rm -f monoengine.itbin
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine
+          curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
+          echo "OK: compose monoengine healthy on 127.0.0.1:19180"
 
       - name: Run config sample tests
         working-directory: monoengine
@@ -326,4 +344,4 @@ jobs:
       - name: Stop test services
         if: always()
         working-directory: monoengine
-        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v
+        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git --profile app down -v

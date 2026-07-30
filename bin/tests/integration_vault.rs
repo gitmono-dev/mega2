@@ -1157,6 +1157,56 @@ token_ref = "{NOTIFICATION_WEBHOOK_TOKEN_REF}"
 // ===== 真实 S3-compatible 对象存储后端 gate（integration.md P2）=====
 
 #[test]
+fn integration_compose_monoengine_http_smoke() {
+    // Standing compose `monoengine` service (profile `app`, host 19180). Soft
+    // skip when the profile is not up so `cargo test --all` stays usable with
+    // only the default data-plane stack.
+    let available = std::net::TcpStream::connect("127.0.0.1:19180").is_ok();
+    if !available {
+        eprintln!(
+            "integration_compose_monoengine_http_smoke requires compose monoengine at \
+             127.0.0.1:19180; build/start with \
+             `docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine` \
+             (see docs/refactoring/test-infra.md), skipping"
+        );
+        return;
+    }
+
+    let body = http_get_openapi();
+    assert!(
+        body.contains("openapi") || body.contains("paths") || body.contains('{'),
+        "compose monoengine openapi body looked empty/unexpected: {body}"
+    );
+}
+
+fn http_get_openapi() -> String {
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+    };
+
+    let mut stream = TcpStream::connect("127.0.0.1:19180").expect("connect compose monoengine");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    let req =
+        "GET /api/openapi.json HTTP/1.1\r\nHost: 127.0.0.1:19180\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write request");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read response");
+    let text = String::from_utf8_lossy(&buf);
+    let status_ok = text
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "));
+    assert!(
+        status_ok,
+        "expected HTTP 200 from compose monoengine openapi; got:\n{text}"
+    );
+    text.into_owned()
+}
+
+#[test]
 fn integration_object_storage_s3_compatible_smoke() {
     // 启动真实 RustFS 服务后，通过 `debug storage-smoke` 对 S3-compatible 后端
     // 执行 put/get/delete  round-trip，验证对象存储后端在 post-vault 启动路径
