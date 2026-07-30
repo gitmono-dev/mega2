@@ -114,11 +114,11 @@ services:
   # Per-case cargo black-box tests still spawn via CARGO_BIN_EXE for isolation;
   # this service is the compose-hosted process under test for stack smoke.
   # Build context is the parent of `monoengine/` + `orbit/` (see Dockerfile).
-  # CI may pre-tag `monoengine-it:local` from Dockerfile.it-runtime instead of
+  # CI may pre-tag `monoengine:local` from Dockerfile.it-runtime instead of
   # rebuilding from source (`pull_policy: never`).
   monoengine:
     profiles: ["app"]
-    image: monoengine-it:local
+    image: monoengine:local
     pull_policy: never
     build:
       context: ..

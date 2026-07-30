@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
           cargo build -p monoengine
           cp target/debug/monoengine monoengine.itbin
-          docker build -f Dockerfile.it-runtime -t monoengine-it:local .
+          docker build -f Dockerfile.it-runtime -t monoengine:local .
           rm -f monoengine.itbin
           docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null

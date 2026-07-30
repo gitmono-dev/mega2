@@ -144,7 +144,7 @@ git-cli 固定版本: `git version 2.49.1`
 | 项 | 值 |
 |---|---|
 | 服务名 | `monoengine` |
-| 镜像 | `monoengine-it:local`（`pull_policy: never`）。本地源码构建：`Dockerfile`（context = 含 `monoengine/`+`orbit/` 的父目录，bookworm）。CI/快速路径：宿主机 `cargo build -p monoengine` 后用 `Dockerfile.it-runtime`（**Ubuntu 24.04**，匹配较新 glibc）打包 `monoengine.itbin` |
+| 镜像 | `monoengine:local`（`pull_policy: never`）。本地源码构建：`Dockerfile`（context = 含 `monoengine/`+`orbit/` 的父目录，bookworm）。CI/快速路径：宿主机 `cargo build -p monoengine` 后用 `Dockerfile.it-runtime`（**Ubuntu 24.04**，匹配较新 glibc）打包 `monoengine.itbin` |
 | 固定版本字符串 | 无客户端 pin；镜像内容随源码 / 宿主机二进制变化，升级为显式 build |
 | 端口 | `127.0.0.1:19180:8000`（容器内 CLI 默认 `8000`；仅回环） |
 | healthcheck | `curl -f http://127.0.0.1:8000/api/openapi.json` |
@@ -153,7 +153,7 @@ git-cli 固定版本: `git version 2.49.1`
 | profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
 | depends_on | `postgres`、`redis`（`service_healthy`）。mail 默认 `MEGA_MAIL__ENABLED=false`（NoopMailer，无需 vault password）；不依赖 rustfs |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
-| CI 入口 | `.github/workflows/config-validation.yml`：在数据面 `up` 后 `Dockerfile.it-runtime` 打 `monoengine-it:local`，`--profile app up -d --wait monoengine`，`curl` `127.0.0.1:19180/api/openapi.json`；job 末尾带 `--profile app` 的 `down -v` |
+| CI 入口 | `.github/workflows/config-validation.yml`：在数据面 `up` 后 `Dockerfile.it-runtime` 打 `monoengine:local`，`--profile app up -d --wait monoengine`，`curl` `127.0.0.1:19180/api/openapi.json`；job 末尾带 `--profile app` 的 `down -v` |
 | secret | 无注入生产 secret；DB 使用公开测试口令 `mono_test_password`；mail 关闭 |
 | 降级 / 黑盒 | 栈级 smoke：`integration_compose_monoengine_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
 
@@ -172,7 +172,7 @@ CI / 宿主机二进制打包示例：
 ```bash
 cargo build -p monoengine
 cp target/debug/monoengine monoengine.itbin
-docker build -f Dockerfile.it-runtime -t monoengine-it:local .
+docker build -f Dockerfile.it-runtime -t monoengine:local .
 rm -f monoengine.itbin
 docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine
 ```

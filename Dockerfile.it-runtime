@@ -7,7 +7,7 @@
 # desktops. (The source `Dockerfile` still builds+runs on bookworm.)
 #
 #   cp target/debug/monoengine ./monoengine.itbin   # or target/release/...
-#   docker build -f Dockerfile.it-runtime -t monoengine-it:local .
+#   docker build -f Dockerfile.it-runtime -t monoengine:local .
 #   rm -f ./monoengine.itbin
 
 FROM ubuntu:24.04
