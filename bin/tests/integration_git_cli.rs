@@ -84,13 +84,13 @@ impl Drop for TestDatabase {
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
             );
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     terminate_sql,
                 ))
                 .await;
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     format!("DROP DATABASE IF EXISTS {db_name}"),
                 ))
@@ -1165,7 +1165,7 @@ fn database_url_for_name(admin_url: &str, db_name: &str) -> String {
 }
 
 async fn execute_postgres(db: &sea_orm::DatabaseConnection, sql: String) {
-    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+    db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
         .await
         .unwrap_or_else(|_| panic!("failed to prepare integration PostgreSQL database"));
 }

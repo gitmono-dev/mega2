@@ -72,7 +72,7 @@ mod tests {
                 format!("SELECT to_regclass('{table}')::text AS table_name;"),
             );
             let row = db
-                .query_one(stmt)
+                .query_one_raw(stmt)
                 .await
                 .expect("query PostgreSQL catalog")
                 .expect("PostgreSQL catalog query should return one row");

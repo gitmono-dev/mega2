@@ -234,13 +234,13 @@ impl Drop for TestDatabase {
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
             );
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     terminate_sql,
                 ))
                 .await;
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     format!("DROP DATABASE IF EXISTS {db_name}"),
                 ))
@@ -719,7 +719,7 @@ fn assert_postgres_count_at_least(db_url: &str, sql: &str, expected: i64) {
             .await
             .unwrap_or_else(|_| panic!("failed to reconnect to integration PostgreSQL database"));
         let row = db
-            .query_one(Statement::from_string(DatabaseBackend::Postgres, sql))
+            .query_one_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
             .await
             .unwrap_or_else(|_| panic!("failed to query integration PostgreSQL database"))
             .expect("PostgreSQL count query should return one row");
@@ -735,7 +735,7 @@ fn assert_postgres_count_at_least(db_url: &str, sql: &str, expected: i64) {
 
 async fn execute_postgres(db: &sea_orm::DatabaseConnection, sql: String) {
     // PostgreSQL 管理语句集中走这里，便于在失败时给出统一的测试准备错误。
-    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+    db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
         .await
         .unwrap_or_else(|_| panic!("failed to prepare integration PostgreSQL database"));
 }
@@ -1274,7 +1274,8 @@ fn integration_error_redaction_does_not_leak_db_password() {
     let stdout_path = temp_dir.path().join("service.out");
     let stderr_path = temp_dir.path().join("service.err");
     // 端口 1 几乎必然拒绝连接，确保 DB 连接快速失败。
-    let bad_db_url = format!("postgres://monoengine:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
+    let bad_db_url =
+        format!("postgres://monoengine:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
 
     let mut command = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
     command.arg("--config").arg(&config_path);
@@ -1647,7 +1648,7 @@ fn execute_sql(db_url: &str, sql: &str) {
         let db = Database::connect(db_url)
             .await
             .unwrap_or_else(|_| panic!("failed to connect to integration PostgreSQL database"));
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DatabaseBackend::Postgres,
             sql.to_string(),
         ))

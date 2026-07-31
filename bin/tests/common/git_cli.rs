@@ -593,7 +593,7 @@ pub fn seed_access_token(db_url: &str, username: &str, token: &str) {
         let db = Database::connect(db_url)
             .await
             .unwrap_or_else(|err| panic!("connect integration DB for token seed: {err}"));
-        db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+        db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
             .await
             .unwrap_or_else(|err| panic!("seed access_token: {err}"));
     });

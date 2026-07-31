@@ -139,7 +139,7 @@ fn database_url_with_search_path(admin_url: &str, schema: &str) -> String {
 }
 
 async fn execute_postgres(db: &DatabaseConnection, sql: String) {
-    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+    db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
         .await
         .expect("failed to prepare PostgreSQL test schema");
 }

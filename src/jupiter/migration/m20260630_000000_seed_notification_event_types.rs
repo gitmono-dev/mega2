@@ -69,7 +69,7 @@ impl MigrationTrait for Migration {
                     );
                 "#,
             );
-            conn.execute(Statement::from_string(db_backend, sql))
+            conn.execute_raw(Statement::from_string(db_backend, sql))
                 .await?;
         }
 
@@ -89,7 +89,7 @@ impl MigrationTrait for Migration {
         );
         manager
             .get_connection()
-            .execute(Statement::from_string(db_backend, sql))
+            .execute_raw(Statement::from_string(db_backend, sql))
             .await?;
 
         Ok(())

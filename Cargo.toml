@@ -3,7 +3,7 @@ members = ["bin"]
 
 [package]
 name = "monoengine-core"
-version = "0.1.181"
+version = "0.1.182"
 edition = "2024"
 
 [lib]
@@ -89,8 +89,8 @@ rsa = "0.9.10"
 russh = "0.61.1"
 rustls = "0.23"
 rustls-pemfile = "2.1.0"
-sea-orm = { version = "1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "debug-print"] }
-sea-orm-migration = { version = "1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm = { version = "2.0.0", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "debug-print"] }
+sea-orm-migration = { version = "2.0.0", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 secp256k1 = { version = "0.31.1", features = ["serde", "rand", "hashes"] }
 serde = { version = "1.0.228", features = ["derive", "rc", "alloc"] }
 serde_bytes = "0.11.14"
