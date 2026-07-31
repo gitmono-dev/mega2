@@ -64,16 +64,16 @@ pub trait AuthHandler: Send + Sync {
 
 #[derive(Display, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HandlePhase {
-    #[display(fmt = "pre_auth")]
+    #[display("pre_auth")]
     PreAuth,
-    #[display(fmt = "post_auth")]
+    #[display("post_auth")]
     PostAuth,
-    #[display(fmt = "pre_route")]
+    #[display("pre_route")]
     PreRoute,
-    #[display(fmt = "route")]
+    #[display("route")]
     Route,
-    #[display(fmt = "post_route")]
+    #[display("post_route")]
     PostRoute,
-    #[display(fmt = "log")]
+    #[display("log")]
     Log,
 }
