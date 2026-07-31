@@ -86,7 +86,7 @@ jobs:
 
       - name: Mask test secrets in logs
         run: |
-          echo "::add-mask::mono_test_password"
+          echo "::add-mask::monoengine_test_password"
           echo "::add-mask::smtp-test-password"
 
       - name: Start test services (PostgreSQL, Redis, Mailpit, RustFS, git-cli)
@@ -322,7 +322,7 @@ jobs:
       - name: Run integration tests (vault CLI + mail/notification dispatcher + git-cli)
         working-directory: monoengine
         env:
-          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
+          MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine
           MEGA_REDIS__URL: redis://127.0.0.1:16379
           MAILPIT_API_URL: http://127.0.0.1:18025
         run: |

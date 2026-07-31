@@ -60,7 +60,7 @@ const NOTIFICATION_WEBHOOK_TOKEN_REF: &str =
 // 默认连接信息与 `docker-compose.test.yml`、`.env.test.example` 保持一致。
 // 如果 CI 或开发机需要改端口，可以通过 `.env.test` 中的环境变量覆盖。
 const DEFAULT_POSTGRES_URL: &str =
-    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 // 同一个测试进程内可能创建多个临时数据库。计数器只用于生成唯一库名，
@@ -177,7 +177,7 @@ impl VaultCliEnv {
 // PostgreSQL 测试数据库的 RAII 包装。
 //
 // 测试连接到 compose 提供的 admin database，然后为每个用例创建独立数据库：
-// `monoengine_it_<pid>_<counter>`。CLI 子进程拿到的是这个专属数据库的连接串。
+// `monoengine_<pid>_<counter>`。CLI 子进程拿到的是这个专属数据库的连接串。
 // 这样 migrations、Vault 表和 secret 数据都隔离在单个测试里。
 struct TestDatabase {
     admin_url: String,
@@ -190,7 +190,7 @@ impl TestDatabase {
         let admin_url = integration_postgres_url();
         // pid + 进程内递增序号足以避免同一次测试运行中的数据库名冲突。
         let db_name = format!(
-            "monoengine_it_{}_{}",
+            "monoengine_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -1274,7 +1274,7 @@ fn integration_error_redaction_does_not_leak_db_password() {
     let stdout_path = temp_dir.path().join("service.out");
     let stderr_path = temp_dir.path().join("service.err");
     // 端口 1 几乎必然拒绝连接，确保 DB 连接快速失败。
-    let bad_db_url = format!("postgres://mono:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
+    let bad_db_url = format!("postgres://monoengine:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
 
     let mut command = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
     command.arg("--config").arg(&config_path);
@@ -1382,7 +1382,7 @@ fn integration_error_redaction_bad_toml_does_not_leak_values() {
     let bad_toml = format!(
         r#"[database]
 db_type = "postgres"
-db_url = "postgres://mono:{TOML_SENTINEL}@127.0.0.1:5432/mono"
+db_url = "postgres://monoengine:{TOML_SENTINEL}@127.0.0.1:5432/monoengine"
 
 [mail]
 enabled = false
@@ -1471,7 +1471,7 @@ fn integration_config_init_creates_safe_skeleton_and_validates() {
         "init config should not contain plaintext password ="
     );
     assert!(
-        !content.contains("postgres://mono:"),
+        !content.contains("postgres://monoengine:"),
         "init config should not embed predictable postgres credentials"
     );
 

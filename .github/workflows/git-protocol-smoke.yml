@@ -147,7 +147,7 @@ jobs:
 
       - name: Mask test secrets in logs
         run: |
-          echo "::add-mask::mono_test_password"
+          echo "::add-mask::monoengine_test_password"
           echo "::add-mask::smtp-test-password"
 
       - name: Start test services (PostgreSQL, Redis, git-cli)
@@ -166,7 +166,7 @@ jobs:
       - name: Run cargo-native git-cli integration gate
         working-directory: monoengine
         env:
-          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it
+          MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine
           MEGA_REDIS__URL: redis://127.0.0.1:16379
         run: |
           set -euo pipefail
@@ -179,7 +179,7 @@ jobs:
       - name: Prepare smoke config and seed secret
         working-directory: monoengine
         env:
-          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_smoke
+          MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine_smoke
           MEGA_REDIS__URL: redis://127.0.0.1:16379
           MEGA_BASE_DIR: ${{ runner.temp }}/monoengine-smoke/base
         run: |
@@ -190,7 +190,7 @@ jobs:
           cp config/config.toml "${smoke_dir}/config.toml"
 
           # Create a dedicated database for the smoke run.
-          psql "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it" \
+          psql "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine" \
             -c "DROP DATABASE IF EXISTS monoengine_smoke" \
             -c "CREATE DATABASE monoengine_smoke"
 
@@ -220,7 +220,7 @@ jobs:
       - name: Start service http
         working-directory: monoengine
         env:
-          MEGA_DATABASE__DB_URL: postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_smoke
+          MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine_smoke
           MEGA_REDIS__URL: redis://127.0.0.1:16379
           MEGA_DATABASE__SQLX_LOGGING: "false"
           MEGA_LOG__PRINT_STD: "true"

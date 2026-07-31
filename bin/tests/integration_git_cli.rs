@@ -32,7 +32,7 @@ const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
 const SECRET_VALUE: &str = "smtp-test-password";
 
 const DEFAULT_POSTGRES_URL: &str =
-    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -48,7 +48,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_it_git_{}_{}",
+            "monoengine_git_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );

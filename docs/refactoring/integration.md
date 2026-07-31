@@ -141,7 +141,7 @@ PostgreSQL 连接串必须指向高位端口：
 ```toml
 [database]
 db_type = "postgres"
-db_url = "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it"
+db_url = "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine"
 max_connection = 8
 min_connection = 1
 connect_timeout = 5
@@ -381,7 +381,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --
 # 无跨平台宿主机 git 降级验收路径（见 test-infra.md）。
 docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait git-cli
 
-docker compose -p monoengine-it -f docker-compose.test.yml exec postgres pg_isready -U mono -d monoengine_it
+docker compose -p monoengine-it -f docker-compose.test.yml exec postgres pg_isready -U monoengine -d monoengine
 docker compose -p monoengine-it -f docker-compose.test.yml exec redis redis-cli ping
 curl -fsS http://127.0.0.1:18025/api/v1/messages >/dev/null
 
@@ -567,7 +567,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml logs mailpit
 ### 未连接到预期 PostgreSQL
 
 ```bash
-psql 'postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it' \
+psql 'postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine' \
   -c "select current_database(), count(*) from seaql_migrations"
 ```
 

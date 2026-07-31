@@ -154,7 +154,7 @@ git-cli 固定版本: `git version 2.49.1`
 | depends_on | `postgres`、`redis`（`service_healthy`）。mail 默认 `MEGA_MAIL__ENABLED=false`（NoopMailer，无需 vault password）；不依赖 rustfs |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
 | CI 入口 | `.github/workflows/config-validation.yml`：在数据面 `up` 后 `Dockerfile.it-runtime` 打 `monoengine:local`，`--profile app up -d --wait monoengine`，`curl` `127.0.0.1:19180/api/openapi.json`；job 末尾带 `--profile app` 的 `down -v` |
-| secret | 无注入生产 secret；DB 使用公开测试口令 `mono_test_password`；mail 关闭 |
+| secret | 无注入生产 secret；DB 使用公开测试口令 `monoengine_test_password`（用户/库名均为 `monoengine`）；mail 关闭 |
 | 降级 / 黑盒 | 栈级 smoke：`integration_compose_monoengine_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
 
 本地源码构建示例：

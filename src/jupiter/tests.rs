@@ -64,7 +64,7 @@ use crate::{
 };
 
 const DEFAULT_TEST_DATABASE_URL: &str =
-    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
 
 static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
