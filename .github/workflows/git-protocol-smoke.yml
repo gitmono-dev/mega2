@@ -5,9 +5,9 @@ name: Git Protocol Smoke
 # CLI against a running `service http` instance, covering ls-remote, clone,
 # fetch, protocol v2 fetch, shallow clone, and blob:none partial clone.
 #
-# CI seeds a one-off Mono access token directly into the smoke database and
-# runs the HTTP push/delete branch+tag and LFS round-trip matrices with Basic
-# Auth.
+# CI starts `service http` (which applies migrations), then seeds a one-off
+# Mono access token into the smoke database and runs the HTTP push/delete
+# branch+tag and LFS round-trip matrices with Basic Auth.
 
 on:
   pull_request:
@@ -188,19 +188,15 @@ jobs:
           mkdir -p "${smoke_dir}/base"
           cp config/config.toml "${smoke_dir}/config.toml"
 
-          # Create a dedicated database for the smoke run.
+          # Create a dedicated database for the smoke run. Schema is applied when
+          # `service http` boots (see jupiter::storage::init::database_connection).
+          # Do not INSERT into access_token here — the table does not exist yet.
           psql "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine" \
             -c "DROP DATABASE IF EXISTS monoengine_smoke" \
             -c "CREATE DATABASE monoengine_smoke"
 
           smoke_git_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
           echo "::add-mask::${smoke_git_token}"
-          psql "${MEGA_DATABASE__DB_URL}" \
-            -v ON_ERROR_STOP=1 \
-            -v token="${smoke_git_token}" <<'SQL'
-          INSERT INTO access_token (id, username, token, created_at)
-          VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now());
-          SQL
 
           echo "SMOKE_CONFIG_PATH=${smoke_dir}/config.toml" >> "$GITHUB_ENV"
           echo "SMOKE_BASE_DIR=${smoke_dir}/base" >> "$GITHUB_ENV"
@@ -237,6 +233,21 @@ jobs:
             sleep 1
           done
           echo "service http is ready"
+
+      - name: Seed smoke access token
+        working-directory: monoengine
+        env:
+          MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine_smoke
+        run: |
+          set -euo pipefail
+          # Matches bin/tests/integration_git_cli: seed after service bootstrap so
+          # migrations have created access_token.
+          psql "${MEGA_DATABASE__DB_URL}" \
+            -v ON_ERROR_STOP=1 \
+            -v token="${SMOKE_GIT_TOKEN}" <<'SQL'
+          INSERT INTO access_token (id, username, token, created_at)
+          VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now());
+          SQL
 
       - name: Run git protocol smoke (HTTP)
         working-directory: monoengine
