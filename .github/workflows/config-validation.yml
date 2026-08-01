@@ -100,6 +100,24 @@ jobs:
             exit 1
           fi
 
+      - name: Free runner disk before heavy builds
+        run: |
+          set -euo pipefail
+          # ubuntu-latest ships large unused toolchains; website-next's pnpm install
+          # (incl. workerd) otherwise hits ENOSPC during compose profile web build.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
+
       - name: Install Rust toolchains
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -144,6 +162,11 @@ jobs:
           cp target/debug/monoengine monoengine.itbin
           docker build -f Dockerfile.it-runtime -t monoengine:local .
           rm -f monoengine.itbin
+          # Reclaim cargo artifacts before website-next pnpm install (large).
+          # Later cargo test steps will rebuild; disk headroom is required first.
+          rm -rf target
+          docker builder prune -f >/dev/null 2>&1 || true
+          df -h /
           docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
           curl -sf "http://127.0.0.1:17001/api/auth/get-session" >/dev/null
