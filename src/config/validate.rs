@@ -587,7 +587,7 @@ pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), Me
     require_non_empty("redis.url", &redis_config.url)?;
     let trimmed = redis_config.url.trim_start();
     if is_secret_ref_value(trimmed) {
-        let secret_ref = SecretRef::parse(trimmed)?;
+        let secret_ref = parse_secret_ref_for_field("redis.url", trimmed)?;
         validate_config_secret_ref("redis.url", &secret_ref, "redis/url")?;
         return Ok(());
     }
@@ -674,8 +674,17 @@ fn validate_object_storage_secret_ref(
         return Ok(());
     }
 
-    let secret_ref = SecretRef::parse(trimmed)?;
+    let secret_ref = parse_secret_ref_for_field(field_path, trimmed)?;
     validate_config_secret_ref(field_path, &secret_ref, suffix)
+}
+
+/// Parse a `vault://` SecretRef and prefix parse failures with `field_path` so
+/// `config validate` diagnostics name the offending setting (e.g. `redis.url`).
+fn parse_secret_ref_for_field(field_path: &str, value: &str) -> Result<SecretRef, MegaError> {
+    SecretRef::parse(value).map_err(|err| match err {
+        MegaError::Other(msg) => MegaError::Other(format!("{field_path}: {msg}")),
+        other => other,
+    })
 }
 
 pub(crate) fn validate_orion_server_config(
@@ -2199,6 +2208,19 @@ mod tests {
         config
             .validate()
             .expect("redis.url secret ref in namespace should validate");
+    }
+
+    #[test]
+    fn config_validate_rejects_redis_url_secret_ref_missing_field_suffix() {
+        let mut config = valid_config();
+        config.redis.url = "vault://secret/config/test/redis/url".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("redis.url SecretRef without #field should fail");
+        let message = err.to_string();
+        assert!(message.contains("redis.url"));
+        assert!(message.contains("secret ref must include a #field suffix"));
     }
 
     #[test]
