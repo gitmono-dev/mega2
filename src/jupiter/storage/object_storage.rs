@@ -32,8 +32,8 @@ pub trait ObjectStorageProvider: Send + Sync {
 static OBJECT_STORAGE_PROVIDER: OnceLock<Arc<dyn ObjectStorageProvider>> = OnceLock::new();
 
 /// Register the process-wide object-storage provider. The binary (composition
-/// root) calls this once at startup, before any `service` / `chat-migrate`
-/// command builds an `AppContext`. Subsequent calls are ignored.
+/// root) calls this once at startup, before any command builds an `AppContext`.
+/// Subsequent calls are ignored.
 pub fn set_object_storage_provider(provider: Arc<dyn ObjectStorageProvider>) {
     let _ = OBJECT_STORAGE_PROVIDER.set(provider);
 }

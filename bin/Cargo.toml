@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.1.183"
+version = "0.2.0"
 edition = "2024"
 
 # The thin composition-root binary. It depends on `monoengine-core` (which only
@@ -32,6 +32,7 @@ mimalloc = "0.1.52"
 # `libc` is only used by the service-startup smoke test to deliver SIGINT for a
 # graceful-shutdown assertion; it is already in the dependency tree via the core.
 libc = "0.2"
+reqwest = { version = "0.13.4", features = ["json", "blocking"] }
 sea-orm = { version = "2.0.0", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 serde_json = "1.0"
 tempfile = "3.27.0"

@@ -2460,22 +2460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "email-encoding"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "420b9da095f052ea597503e39073b5b3c522f7db933fbac202d91d24492693fd"
-dependencies = [
- "base64 0.23.0",
- "memchr",
-]
-
-[[package]]
-name = "email_address"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
-
-[[package]]
 name = "ena"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3886,33 +3870,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lettre"
-version = "0.11.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "email-encoding",
- "email_address",
- "fastrand",
- "futures-io",
- "futures-util",
- "httpdate",
- "idna",
- "mime",
- "nom 8.0.0",
- "percent-encoding",
- "quoted_printable",
- "rustls",
- "rustls-platform-verifier",
- "socket2",
- "tokio",
- "tokio-rustls",
- "url",
-]
-
-[[package]]
 name = "lexical-core"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4302,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.1.183"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "jemallocator",
@@ -4311,6 +4268,7 @@ dependencies = [
  "monoengine-core",
  "orbit",
  "orbit-api",
+ "reqwest 0.13.4",
  "sea-orm 2.0.0",
  "serde_json",
  "tempfile",
@@ -4320,7 +4278,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine-core"
-version = "0.1.183"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4366,7 +4324,6 @@ dependencies = [
  "ipnetwork",
  "itertools 0.15.0",
  "lazy_static",
- "lettre",
  "libc",
  "lockfile",
  "log",
@@ -5703,12 +5660,6 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
-
-[[package]]
-name = "quoted_printable"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "478e0585659a122aa407eb7e3c0e1fa51b1d8a870038bd29f0cf4a8551eea972"
 
 [[package]]
 name = "r-efi"

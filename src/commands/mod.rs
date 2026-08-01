@@ -1,4 +1,3 @@
-pub mod chat_migrate;
 pub mod config;
 pub mod debug;
 pub mod service;
@@ -32,18 +31,12 @@ pub(crate) struct CommandContext {
 pub(crate) type CommandExec = fn(CommandContext, &ArgMatches) -> MegaResult;
 
 pub fn builtin() -> Vec<Command> {
-    vec![
-        service::cli(),
-        chat_migrate::cli(),
-        config::cli(),
-        debug::cli(),
-    ]
+    vec![service::cli(), config::cli(), debug::cli()]
 }
 
 pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
     let f = match cmd {
         "service" => service::exec,
-        "chat-migrate" => chat_migrate::exec,
         "config" => config::exec,
         "debug" => debug::exec,
         _ => return None,
@@ -54,7 +47,7 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
 
 pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
     match cmd {
-        "service" | "chat-migrate" | "debug" => Some(LoadMode::FullAppContext),
+        "service" | "debug" => Some(LoadMode::FullAppContext),
         "config" => Some(config::load_mode(args)),
         _ => None,
     }
@@ -86,6 +79,6 @@ mod tests {
             .map(|cmd| cmd.get_name().to_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["service", "chat-migrate", "config", "debug"]);
+        assert_eq!(names, vec!["service", "config", "debug"]);
     }
 }

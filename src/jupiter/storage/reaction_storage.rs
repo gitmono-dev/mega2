@@ -220,48 +220,4 @@ mod tests {
 
         assert_eq!(recreated.content.as_deref(), Some("👍"));
     }
-
-    #[tokio::test]
-    async fn test_duplicate_active_custom_reaction_is_rejected() {
-        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
-        let custom_reaction_storage = storage.custom_reaction_storage();
-        let reaction_storage = storage.reaction_storage();
-        let custom_reaction = custom_reaction_storage
-            .create_custom_reaction(
-                generate_public_id(),
-                "party".to_string(),
-                "path/to/party.png".to_string(),
-                "image/png".to_string(),
-                "alice".to_string(),
-            )
-            .await
-            .expect("custom reaction should be created");
-
-        reaction_storage
-            .create_reaction(
-                generate_public_id(),
-                None,
-                "Message".to_string(),
-                123,
-                "alice".to_string(),
-                Some(custom_reaction.id),
-            )
-            .await
-            .expect("first custom reaction should succeed");
-
-        let err = reaction_storage
-            .create_reaction(
-                generate_public_id(),
-                None,
-                "Message".to_string(),
-                123,
-                "alice".to_string(),
-                Some(custom_reaction.id),
-            )
-            .await
-            .expect_err("duplicate active custom reaction should be rejected");
-
-        assert_unique_constraint_error(&err);
-    }
 }

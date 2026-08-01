@@ -167,24 +167,19 @@ bucket = "gitmega"
 root_dir = "${base_dir}/objects"
 
 [oauth]
-# `allowed_cors_origins` is consumed by the HTTP API's CORS layer (OAuthConfig).
-# When non-empty it is the CORS allow-list; when empty the server falls back to
-# its built-in development defaults. Also overridable via
-# MEGA_OAUTH__ALLOWED_CORS_ORIGINS as a comma-separated list. Each entry must be
-# a valid HTTP header value (no whitespace/control characters).
+# Website Better Auth integration (OAuthConfig). Key reference:
+# docs/refactoring/website-auth.md
+# Base URL for GET /api/auth/get-session (required for service http).
+website_api_base_url = "http://127.0.0.1:17001"
+# session_cookie_names defaults to Better Auth cookie names when omitted.
+# `allowed_cors_origins` is the HTTP API CORS allow-list; when empty the server
+# falls back to built-in development defaults. Overridable via
+# MEGA_OAUTH__ALLOWED_CORS_ORIGINS as a comma-separated list.
 allowed_cors_origins = [
     "http://local.gitmega.com",
     "https://app.gitmega.com",
     "http://app.gitmono.test",
 ]
-
-# Legacy keys kept for compatibility but NOT yet strongly-typed/consumed by
-# OAuthConfig (they are tolerated by config validation and ignored at load until
-# a real consumer exists). Used historically for the external auth API stores.
-campsite_api_domain = "http://api.gitmono.test:3001"
-tinyship_api_domain = "https://libra.tools"
-# Which auth API to use when loading users (campsite or tinyship)
-api_store_backend = "campsite"
 
 [blame]
 # Configuration for blame functionality and large file handling
@@ -274,66 +269,33 @@ monobase_url = "http://git.gitmega.com"
 default_items = [
     { public_id = "home", label = "Home", href = "/posts", visible = true, order_index = 0 },
     { public_id = "inbox", label = "Inbox", href = "/inbox", visible = true, order_index = 1 },
-    { public_id = "chat", label = "Chat", href = "/chat", visible = true, order_index = 2 },
-    { public_id = "notes", label = "Docs", href = "/notes", visible = true, order_index = 3 },
-    { public_id = "calls", label = "Calls", href = "/calls", visible = false, order_index = 4 },
-    { public_id = "drafts", label = "Drafts", href = "/drafts", visible = true, order_index = 5 },
-    { public_id = "code", label = "Code", href = "/code", visible = true, order_index = 6 },
-    { public_id = "tags", label = "Tags", href = "/code/tags", visible = true, order_index = 7 },
-    { public_id = "cl", label = "Change List", href = "/cl", visible = true, order_index = 8 },
-    { public_id = "mq", label = "Merge Queue", href = "/queue/main", visible = true, order_index = 9 },
-    { public_id = "issue", label = "Issue", href = "/issue", visible = true, order_index = 10 },
-    { public_id = "rust", label = "Rust", href = "/rust", visible = false, order_index = 11 },
-    { public_id = "oc", label = "Orion Client", href = "/oc", visible = true, order_index = 13 },
+    { public_id = "calls", label = "Calls", href = "/calls", visible = false, order_index = 2 },
+    { public_id = "drafts", label = "Drafts", href = "/drafts", visible = true, order_index = 3 },
+    { public_id = "code", label = "Code", href = "/code", visible = true, order_index = 4 },
+    { public_id = "tags", label = "Tags", href = "/code/tags", visible = true, order_index = 5 },
+    { public_id = "cl", label = "Change List", href = "/cl", visible = true, order_index = 6 },
+    { public_id = "mq", label = "Merge Queue", href = "/queue/main", visible = true, order_index = 7 },
+    { public_id = "issue", label = "Issue", href = "/issue", visible = true, order_index = 8 },
+    { public_id = "rust", label = "Rust", href = "/rust", visible = false, order_index = 9 },
+    { public_id = "oc", label = "Orion Client", href = "/oc", visible = true, order_index = 10 },
 ]
 
-[mail]
-# Prefer `password_ref = "vault://secret/config/<profile>/mail/password#value"`
-# for SMTP credentials. `config validate` and `config secret` reject other
-# monoengine Vault namespaces for mail.password_ref. A plain `password` field
-# remains only for compatibility and is reported by `config validate`;
-# `--deny-warnings` treats it as failure.
-# When the service starts with mail enabled, switching this to false is hot-reloaded
-# and stops the dispatcher. The dispatcher limits below are also hot-reloaded.
-# Provider/SMTP/credential/template fields are hot-reloaded too: the SMTP mailer
-# is rebuilt asynchronously (re-resolving password_ref, keeping the old mailer on
-# failure) and the template registry is rebuilt synchronously. Only re-enabling
-# mail (false -> true), or adding/removing the whole [mail] section, needs a restart.
-enabled = true
-provider = "smtp"
-smtp_host = "localhost"
-smtp_port = 2525
-from = "no-reply@mega.local"
-starttls = false
-dispatcher_batch_size = 50
-dispatcher_max_in_flight = 8
-retry_max_attempts = 5
-retry_backoff_base_secs = 30
-retry_backoff_max_secs = 300
-# Optional external notification mail templates. Template files are TOML documents
-# with key/locale/subject/html/text fields and override built-in templates by
-# matching key + locale.
-template_default_locale = "en-US"
-# template_dir = "${base_dir}/mail-templates"
-# Optional automatic cleanup for persisted outbox attachment content.
-# Runs inside the email dispatcher when enabled; interval/retention/statuses are hot-reloaded.
-attachment_prune_enabled = false
-attachment_prune_interval_secs = 3600
-attachment_retention_days = 30
-attachment_prune_statuses = ["sent", "skipped"]
-# Legacy compatibility keys below are ignored by MailConfig; use starttls.
-smtp_tls = false
-tls = false
-
 [notification]
-# Global notification kill switch. When false the email dispatcher is gated off
-# regardless of `mail.enabled`. Hot-reloaded (toggling this does not need a restart).
+# Global notification kill switch.
 enabled = true
 # Defaults applied for users that have no explicit notification setting yet.
-# `default_delivery_mode` currently supports only "email" (validated by `config validate`).
-default_delivery_mode = "email"
+# `in_app` is primary. `email` remains a compatibility preference: it also
+# writes in-app now and will request website email delivery in MN-05.
+default_delivery_mode = "in_app"
 # Default locale for rendered notifications when a user has none.
 default_locale = "en-US"
+# Optional website-owned product-email client. Leave both values unset to keep
+# email delivery disabled; `delivery_mode = "email"` still writes in-app.
+# Production requires the SecretRef form (set through `config secret set
+# notification/website_mail/bearer`); the literal bearer is IT-only.
+# website_mail_base_url = "https://website.internal"
+# website_mail_bearer_ref = "vault://secret/config/<profile>/notification/website_mail/bearer#value"
+# website_mail_bearer = "it-only-shared-bearer"
 
 # Optional Slack incoming-webhook channel (docs/notification.md phase 3). The
 # Slack webhook URL embeds a secret token in its path, so it is supplied as a
@@ -350,18 +312,6 @@ default_locale = "en-US"
 # enabled = true
 # url = "https://hooks.example.com/notify"
 # token_ref = "vault://secret/config/<profile>/notification/webhook/token#value"
-
-[chat]
-# Optional product-level MIME allowlist for chat attachments. An empty list
-# accepts all syntactically valid MIME types (backwards compatible). Entries
-# may be exact types (`image/png`) or wildcards (`image/*`).
-attachment_allowed_mime_types = []
-# Whether to fetch and cache Open Graph previews for URLs seen in messages.
-open_graph_fetch_enabled = true
-# Network timeout in milliseconds for a single Open Graph fetch attempt.
-open_graph_fetch_timeout_ms = 5000
-# Allow fetches against localhost/private IPs. Keep false in production.
-open_graph_allow_private_networks = false
 
 [vault.audit]
 # Secret-access auditing (docs/vault.md stage H). When enabled (the default),

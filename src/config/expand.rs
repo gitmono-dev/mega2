@@ -379,11 +379,11 @@ mod tests {
         let placeholder = format!("${{file:{}}}", secret_path.display());
 
         let builder = c::Config::builder()
-            .set_override("mail.password", placeholder)
+            .set_override("redis.url", placeholder)
             .expect("set value");
 
         let config = variable_placeholder_substitute(builder).expect("expand");
-        assert_eq!(config.get_string("mail.password").unwrap(), "s3cr3t-value");
+        assert_eq!(config.get_string("redis.url").unwrap(), "s3cr3t-value");
     }
 
     #[test]
@@ -396,12 +396,12 @@ mod tests {
         let placeholder = format!("${{file:{}}}", secret_path.display());
 
         let builder = c::Config::builder()
-            .set_override("mail.password", placeholder)
+            .set_override("redis.url", placeholder)
             .expect("set value");
 
         let config = variable_placeholder_substitute(builder).expect("expand");
         assert_eq!(
-            config.get_string("mail.password").unwrap(),
+            config.get_string("redis.url").unwrap(),
             "p@ss${not_a_var}word"
         );
     }
@@ -419,12 +419,12 @@ mod tests {
         let builder = c::Config::builder()
             .set_override("base_dir", "/tmp/known")
             .expect("set base_dir")
-            .set_override("mail.password", placeholder)
+            .set_override("redis.url", placeholder)
             .expect("set value");
 
         let config = variable_placeholder_substitute(builder).expect("expand");
         assert_eq!(
-            config.get_string("mail.password").unwrap(),
+            config.get_string("redis.url").unwrap(),
             "p@ss${base_dir}word"
         );
         // Non-file `${var}` substitution still works for ordinary fields.
@@ -456,13 +456,13 @@ mod tests {
     #[test]
     fn file_placeholder_unterminated_is_rejected() {
         let builder = c::Config::builder()
-            .set_override("mail.password", "${file:/run/secrets/password")
+            .set_override("redis.url", "${file:/run/secrets/password")
             .expect("set value");
 
         let err = variable_placeholder_substitute(builder)
             .expect_err("unterminated file placeholder should be rejected");
         let message = err.to_string();
-        assert!(message.contains("mail.password"));
+        assert!(message.contains("redis.url"));
         assert!(message.contains("unterminated"));
         // The path must be redacted from the unterminated diagnostic.
         assert!(!message.contains("/run/secrets/password"));
@@ -480,13 +480,13 @@ mod tests {
         let builder = c::Config::builder()
             .set_override("base_dir", "/tmp/x")
             .expect("set base_dir")
-            .set_override("mail.password", value)
+            .set_override("redis.url", value)
             .expect("set value");
 
         let err = variable_placeholder_substitute(builder)
             .expect_err("mixed file/var value should be rejected");
         let message = err.to_string();
-        assert!(message.contains("mail.password"));
+        assert!(message.contains("redis.url"));
         assert!(message.contains("mixes"));
     }
 
@@ -497,13 +497,13 @@ mod tests {
         let builder = c::Config::builder()
             .set_override("base_dir", "/tmp/x")
             .expect("set base_dir")
-            .set_override("mail.password", "${file:${base_dir}/secret}")
+            .set_override("redis.url", "${file:${base_dir}/secret}")
             .expect("set value");
 
         let err = variable_placeholder_substitute(builder)
             .expect_err("nested var in file path should be rejected");
         let message = err.to_string();
-        assert!(message.contains("mail.password"));
+        assert!(message.contains("redis.url"));
         // Must be rejected as mixed/nested, not attempted as a file read.
         assert!(message.contains("mixes"));
         assert!(!message.contains("file not found"));
@@ -516,13 +516,13 @@ mod tests {
         let placeholder = format!("${{file:{}}}", missing.display());
 
         let builder = c::Config::builder()
-            .set_override("mail.password", placeholder)
+            .set_override("redis.url", placeholder)
             .expect("set value");
 
         let err = variable_placeholder_substitute(builder)
             .expect_err("missing file-mounted secret should error");
         let message = err.to_string();
-        assert!(message.contains("mail.password"));
+        assert!(message.contains("redis.url"));
         assert!(message.contains("file not found"));
         assert!(message.contains("never logged"));
     }

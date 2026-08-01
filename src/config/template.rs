@@ -91,28 +91,6 @@ interval_secs = 3600
 grace_secs = 86400
 batch_limit = 100
 
-[mail]
-enabled = false
-provider = "smtp"
-smtp_host = "smtp.example.com"
-smtp_port = 587
-username = "monoengine@example.com"
-# Must stay under config/<profile>/mail/password for mail.password_ref.
-password_ref = "vault://secret/config/prod/mail/password#value"
-from = "no-reply@example.com"
-starttls = true
-dispatcher_batch_size = 50
-dispatcher_max_in_flight = 8
-retry_max_attempts = 5
-retry_backoff_base_secs = 30
-retry_backoff_max_secs = 300
-template_default_locale = "en-US"
-# Optional directory of TOML files with key/locale/subject/html/text fields.
-# template_dir = "{base_dir}/mail-templates"
-attachment_prune_enabled = false
-attachment_prune_interval_secs = 3600
-attachment_retention_days = 30
-attachment_prune_statuses = ["sent", "skipped"]
 "#
     )
 }
@@ -139,7 +117,6 @@ mod tests {
         config.validate().expect("init template should validate");
 
         assert_no_predictable_credentials(&rendered);
-        assert!(rendered.contains("password_ref = "));
     }
 
     #[test]

@@ -70,6 +70,34 @@ jobs:
           path: orbit
           token: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
 
+      - name: Validate website checkout token
+        env:
+          WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN }}
+        run: |
+          if [ -z "${WEBSITE_CHECKOUT_TOKEN}" ]; then
+            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/website sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN with read-only contents access to gitmono-dev/website."
+            exit 1
+          fi
+
+      - name: Checkout website sibling
+        uses: actions/checkout@v5
+        with:
+          repository: gitmono-dev/website
+          # Track branch until the Dockerfile drizzle.config.sqlite.ts COPY lands
+          # on website; then pin this ref and docs/refactoring/website-auth.md to
+          # the same commit SHA (see website-auth.md pin policy).
+          ref: monoengine
+          path: website
+          token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN }}
+
+      - name: Guard website Dockerfile supports IT SQLite init
+        run: |
+          set -euo pipefail
+          if ! grep -q 'drizzle.config.sqlite.ts' website/apps/next-app/Dockerfile; then
+            echo "::error title=Website Dockerfile missing SQLite drizzle config::apps/next-app/Dockerfile must COPY drizzle.config.sqlite.ts so compose website-db-init can pnpm db:push:sqlite. See docs/refactoring/website-auth.md pin policy."
+            exit 1
+          fi
+
       - name: Install Rust toolchains
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -87,15 +115,16 @@ jobs:
       - name: Mask test secrets in logs
         run: |
           echo "::add-mask::monoengine_test_password"
-          echo "::add-mask::smtp-test-password"
 
-      - name: Start test services (PostgreSQL, Redis, Mailpit, RustFS, git-cli)
+      - name: Start test services (PostgreSQL, Redis, RustFS, git-cli)
         working-directory: monoengine
         run: |
           set -euo pipefail
+          # Compose also starts Mailpit by default; it is reserved for website
+          # authentication/product-email IT and is not a monoengine SMTP gate.
           # Pre-create the git-cli bind-mount root so Docker does not create it
           # as root:root (which would EACCES the unprivileged test UID).
-          dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}"
+          dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}"
           mkdir -p "$dir" && chmod 1777 "$dir"
           # Match the runner identity: ubuntu-latest is often UID 1001, while the
           # compose default is 1000:1000 (would block writes into host-created dirs).
@@ -105,7 +134,7 @@ jobs:
           docker compose -p monoengine-it -f docker-compose.test.yml ps
           docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init
 
-      - name: Start compose-hosted monoengine (profile app)
+      - name: Start compose-hosted monoengine and website (profiles app + web)
         working-directory: monoengine
         run: |
           set -euo pipefail
@@ -113,9 +142,10 @@ jobs:
           cp target/debug/monoengine monoengine.itbin
           docker build -f Dockerfile.it-runtime -t monoengine:local .
           rm -f monoengine.itbin
-          docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
-          echo "OK: compose monoengine healthy on 127.0.0.1:19180"
+          curl -sf "http://127.0.0.1:17001/api/auth/get-session" >/dev/null
+          echo "OK: compose monoengine and website-next healthy"
 
       - name: Run config sample tests
         working-directory: monoengine
@@ -135,23 +165,21 @@ jobs:
           cargo test config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref -- --nocapture
           cargo test config_validate_rejects_invalid_sidebar_items -- --nocapture
           cargo test config_validate_rejects_invalid_artifact_gc_settings -- --nocapture
-          cargo test source_diagnostics_collects_base_profile_and_env_warnings -- --nocapture
-          cargo test source_diagnostics_collects_cross_source_overrides_without_values -- --nocapture
-          cargo test source_diagnostics_collects_field_source_graph_without_values -- --nocapture
-          cargo test known_unconsumed_fields_warns_for_deprecated_mail_password_without_value -- --nocapture
-          cargo test unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys -- --nocapture
+          cargo test source_diagnostics_collects_array_element_field_paths -- --nocapture
+          cargo test source_diagnostics_full_cross_source_matrix_for_single_field -- --nocapture
+          cargo test source_diagnostics_redacts_notification_secret_ref_values -- --nocapture
+          cargo test reject_unknown_fields_rejects_typo_fields -- --nocapture
+          cargo test test_load_str_rejects_removed_mail_section -- --nocapture
+          cargo test config_validate_rejects_legacy_mail_environment_variables -- --nocapture
           cargo test test_bad_environment_type_reports_variable_name_without_value -- --nocapture
           cargo test config_validate_uses_raw_sources_load_mode -- --nocapture
           cargo test config_validate_accepts_deny_warnings_flag -- --nocapture
           cargo test validate_config_denies_source_warnings_when_requested -- --nocapture
-          cargo test validate_config_denies_deprecated_mail_password_source_without_leaking_value -- --nocapture
-          cargo test show_sources_lines_include_source_warnings_without_values -- --nocapture
-          cargo test secret_ref_from_args_rejects_wrong_mail_namespace_without_leaking_path -- --nocapture
-          cargo test mail_validate_rejects_password_ref_outside_mail_namespace_without_leaking_ref -- --nocapture
+          cargo test validate_config_rejects_obsolete_section_source -- --nocapture
+          cargo test secret_ref_from_args_rejects_redis_url_outside_namespace -- --nocapture
           cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
           cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
-          cargo test resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref -- --nocapture
-          cargo test resolve_config_secrets_reports_permission_denied_without_leaking_ref -- --nocapture
+          cargo test resolve_config_secrets_reports_missing_redis_url_ref_without_leaking_ref -- --nocapture
           cargo test vault_secret_resolver_reports_missing_field_without_leaking_ref -- --nocapture
           cargo test vault_secret_resolver_reports_non_string_field_without_leaking_ref -- --nocapture
           cargo test test_config_secret_acl_is_not_granted_to_generic_token -- --nocapture
@@ -206,8 +234,8 @@ jobs:
           cp config/config.toml "${config_dir}/config.toml"
 
           {
-            printf '%s\n' '[mail]'
-            printf '%s = "%s%s\n' 'password' 'plain-text' '-password'
+            printf '%s\n' '[database]'
+            printf '%s = "%s%s\n' 'db_url' 'plain-text' '-password'
           } > "${config_dir}/config.bad-toml.toml"
 
           bad_toml_output="${config_dir}/bad-toml.out"
@@ -236,11 +264,8 @@ jobs:
           grep -F "value is redacted" "${placeholder_output}"
 
           cat > "${config_dir}/config.bad-secret-ref.toml" <<'EOF'
-          [mail]
-          enabled = false
-          smtp_host = "smtp.example.com"
-          from = "no-reply@example.com"
-          password_ref = "vault://secret/config/test/mail/password"
+          [redis]
+          url = "vault://secret/config/test/redis/url"
           EOF
 
           secret_ref_output="${config_dir}/bad-secret-ref.out"
@@ -250,14 +275,11 @@ jobs:
             exit 1
           fi
           grep -F "secret ref must include a #field suffix" "${secret_ref_output}"
-          grep -F "mail.password_ref" "${secret_ref_output}"
+          grep -F "redis.url" "${secret_ref_output}"
 
           cat > "${config_dir}/config.bad-secret-ref-namespace.toml" <<'EOF'
-          [mail]
-          enabled = false
-          smtp_host = "smtp.example.com"
-          from = "no-reply@example.com"
-          password_ref = "vault://secret/config/prod/database/password#value"
+          [redis]
+          url = "vault://secret/config/prod/database/password#value"
           EOF
 
           secret_ref_namespace_output="${config_dir}/bad-secret-ref-namespace.out"
@@ -266,8 +288,8 @@ jobs:
             echo "bad SecretRef namespace config unexpectedly validated"
             exit 1
           fi
-          grep -F "mail.password_ref" "${secret_ref_namespace_output}"
-          grep -F "vault://secret/config/<profile>/mail/password#<field>" "${secret_ref_namespace_output}"
+          grep -F "redis.url" "${secret_ref_namespace_output}"
+          grep -F "vault://secret/config/<profile>/redis/url#<field>" "${secret_ref_namespace_output}"
           grep -F "value is redacted" "${secret_ref_namespace_output}"
           ! grep -F "config/prod/database/password" "${secret_ref_namespace_output}"
 
@@ -285,63 +307,51 @@ jobs:
           grep -F "redis.url scheme" "${redis_output}"
           grep -F "'redis' or 'rediss'" "${redis_output}"
 
-          {
-            printf '%s\n' '[mail]'
-            printf '%s = "plain-text-password"\n' 'password'
-          } > "${config_dir}/config.deprecated-mail-password.toml"
-
-          mail_password_output="${config_dir}/deprecated-mail-password.out"
-          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile deprecated-mail-password config validate --deny-warnings >"${mail_password_output}" 2>&1; then
-            cat "${mail_password_output}"
-            echo "deprecated mail.password config unexpectedly passed --deny-warnings"
-            exit 1
-          fi
-          grep -F "mail.password" "${mail_password_output}"
-          grep -F "mail.password_ref" "${mail_password_output}"
-          ! grep -F "plain-text-password" "${mail_password_output}"
-
-          cat > "${config_dir}/config.profile-source-warning.toml" <<'EOF'
+          cat > "${config_dir}/config.removed-mail.toml" <<'EOF'
           [mail]
-          smtp_tls = false
+          enabled = false
           EOF
 
-          profile_warning_output="${config_dir}/profile-source-warning.out"
-          cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --show-sources >"${profile_warning_output}" 2>&1
-          grep -F "source warning: file" "${profile_warning_output}"
-          grep -F "config.profile-source-warning.toml" "${profile_warning_output}"
-          grep -F "mail.smtp_tls" "${profile_warning_output}"
-          grep -F "mail.starttls" "${profile_warning_output}"
-
-          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile profile-source-warning config validate --deny-warnings >"${profile_warning_output}" 2>&1; then
-            cat "${profile_warning_output}"
-            echo "profile source warning unexpectedly passed --deny-warnings"
+          removed_mail_output="${config_dir}/removed-mail.out"
+          if cargo run -p monoengine -- --config "${config_dir}/config.toml" --profile removed-mail config validate >"${removed_mail_output}" 2>&1; then
+            cat "${removed_mail_output}"
+            echo "removed [mail] profile unexpectedly validated"
             exit 1
           fi
-          grep -F "source diagnostics produced" "${profile_warning_output}"
+          grep -F "mail" "${removed_mail_output}"
+          grep -F "not recognized by Config" "${removed_mail_output}"
 
-      - name: Run integration tests (vault CLI + mail/notification dispatcher + git-cli)
+          # Soft source warnings remain for unknown MEGA_* env (not for removed [mail]).
+          env_warning_output="${config_dir}/env-source-warning.out"
+          MEGA_TOTALLY_UNKNOWN__X=1 cargo run -p monoengine -- --config "${config_dir}/config.toml" config validate --show-sources >"${env_warning_output}" 2>&1
+          grep -F "source warning: environment variable MEGA_TOTALLY_UNKNOWN__X" "${env_warning_output}"
+
+          if MEGA_TOTALLY_UNKNOWN__X=1 cargo run -p monoengine -- --config "${config_dir}/config.toml" config validate --deny-warnings >"${env_warning_output}" 2>&1; then
+            cat "${env_warning_output}"
+            echo "unknown MEGA_* env unexpectedly passed --deny-warnings"
+            exit 1
+          fi
+          grep -F "source diagnostics produced" "${env_warning_output}"
+
+      - name: Run integration tests (vault CLI + website auth + git-cli)
         working-directory: monoengine
         env:
           MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine
           MEGA_REDIS__URL: redis://127.0.0.1:16379
-          MAILPIT_API_URL: http://127.0.0.1:18025
+          WEBSITE_IT: "1"
         run: |
           # Black-box CLI integration tests (config secret ref/set/check, validate).
           # The integration test lives in the `monoengine` binary crate (bin/tests/).
           cargo test -p monoengine --test integration_vault -- --test-threads=1
+          # ITW-03: a real Better Auth sign-up/sign-in cookie must identify the
+          # same user through the compose-hosted monoengine session bridge.
+          cargo test -p monoengine --test integration_website_auth -- --test-threads=1
           # Linux-only git-cli HTTP round-trip / auth / failpath harness (IT-03/10/12).
           cargo test -p monoengine --test integration_git_cli -- --test-threads=1
-          # Mail/notification dispatcher delivery against the real Mailpit + Postgres,
-          # plus the NotificationService end-to-end delivery and the CL-comment
-          # trigger enqueue/render path. These live in the monoengine-core library.
-          cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher'
-          # IT-06 focused exactly-once dual-dispatcher gate (also matched by the
-          # broader dispatcher filter above; kept explicit for CI traceability).
-          cargo test -p monoengine-core 'notification::dispatcher::tests::integration_mail_dispatcher_two_instances_deliver_exactly_once'
-          cargo test -p monoengine-core 'notification::service::tests'
-          cargo test -p monoengine-core 'notification::triggers::tests'
+          # Product-email delivery is owned and tested by website. Monoengine's
+          # notification paths are covered without a local SMTP dependency.
 
       - name: Stop test services
         if: always()
         working-directory: monoengine
-        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git --profile app down -v
+        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git --profile app --profile web down -v

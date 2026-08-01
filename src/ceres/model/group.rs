@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::callisto::{
-    mega_group, mega_group_member, mega_resource_permission,
-    sea_orm_active_enums::{PermissionEnum, ResourceTypeEnum},
-};
+use crate::callisto::{mega_group, mega_group_member, sea_orm_active_enums::PermissionEnum};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct EmptyListAdditional {}
@@ -65,45 +62,6 @@ impl PermissionValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ResourceTypeValue {
-    Note,
-}
-
-impl TryFrom<&str> for ResourceTypeValue {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "note" => Ok(ResourceTypeValue::Note),
-            _ => Err(format!("Invalid resource_type: {}", value)),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct PermissionBindingRequest {
-    pub group_id: i64,
-    pub permission: PermissionValue,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct SetPermissionsRequest {
-    pub permissions: Vec<PermissionBindingRequest>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResourcePermissionResponse {
-    pub id: i64,
-    pub resource_type: ResourceTypeValue,
-    pub resource_id: String,
-    pub group_id: i64,
-    pub permission: PermissionValue,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeleteGroupResponse {
     pub group_id: i64,
@@ -120,28 +78,9 @@ pub struct RemoveMemberResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DeletePermissionsResponse {
-    pub resource_type: ResourceTypeValue,
-    pub resource_id: String,
-    pub deleted_count: u64,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
 pub struct UserGroupsResponse {
     pub username: String,
     pub groups: Vec<GroupResponse>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct UserEffectivePermissionResponse {
-    pub username: String,
-    pub resource_type: ResourceTypeValue,
-    pub resource_id: String,
-    pub is_admin: bool,
-    pub permission: Option<PermissionValue>,
-    pub has_read: bool,
-    pub has_write: bool,
-    pub has_admin: bool,
 }
 
 impl From<mega_group::Model> for GroupResponse {
@@ -167,20 +106,6 @@ impl From<mega_group_member::Model> for GroupMemberResponse {
     }
 }
 
-impl From<mega_resource_permission::Model> for ResourcePermissionResponse {
-    fn from(value: mega_resource_permission::Model) -> Self {
-        Self {
-            id: value.id,
-            resource_type: value.resource_type.into(),
-            resource_id: value.resource_id,
-            group_id: value.group_id,
-            permission: value.permission.into(),
-            created_at: value.created_at.and_utc().timestamp(),
-            updated_at: value.updated_at.and_utc().timestamp(),
-        }
-    }
-}
-
 impl From<PermissionValue> for PermissionEnum {
     fn from(value: PermissionValue) -> Self {
         match value {
@@ -197,22 +122,6 @@ impl From<PermissionEnum> for PermissionValue {
             PermissionEnum::Read => PermissionValue::Read,
             PermissionEnum::Write => PermissionValue::Write,
             PermissionEnum::Admin => PermissionValue::Admin,
-        }
-    }
-}
-
-impl From<ResourceTypeValue> for ResourceTypeEnum {
-    fn from(value: ResourceTypeValue) -> Self {
-        match value {
-            ResourceTypeValue::Note => ResourceTypeEnum::Note,
-        }
-    }
-}
-
-impl From<ResourceTypeEnum> for ResourceTypeValue {
-    fn from(value: ResourceTypeEnum) -> Self {
-        match value {
-            ResourceTypeEnum::Note => ResourceTypeValue::Note,
         }
     }
 }

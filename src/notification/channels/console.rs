@@ -36,7 +36,6 @@ impl NotificationChannel for ConsoleChannel {
             subject_len = message.subject.len(),
             body_html_len = message.body_html.len(),
             body_text_len = message.body_text.map(|s| s.len()),
-            attachment_count = message.attachments.len(),
             "console channel dry-run delivery (no actual send)"
         );
         Ok(())
@@ -46,14 +45,12 @@ impl NotificationChannel for ConsoleChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::MailAttachment;
 
     #[tokio::test]
     async fn console_channel_logs_and_succeeds() {
         let channel = ConsoleChannel::new();
         assert_eq!(channel.name(), "console");
 
-        let attachments: Vec<MailAttachment> = vec![];
         let message = OutboundMessage {
             username: "alice",
             event_type_code: "cl_comment_created",
@@ -61,7 +58,6 @@ mod tests {
             subject: "New comment",
             body_html: "<p>hello</p>",
             body_text: Some("hello"),
-            attachments: &attachments,
         };
 
         let result = channel.deliver(&message).await;

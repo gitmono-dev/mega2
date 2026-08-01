@@ -15,10 +15,10 @@ mod git_cli;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{ErrorKind, Read, Write},
+    io::Read,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Output, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     thread::sleep,
     time::{Duration, Instant},
@@ -26,10 +26,6 @@ use std::{
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
-
-const MAIL_PASSWORD_PATH: &str = "config/it/mail/password";
-const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
-const SECRET_VALUE: &str = "smtp-test-password";
 
 const DEFAULT_POSTGRES_URL: &str =
     "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
@@ -102,7 +98,6 @@ impl Drop for TestDatabase {
 struct GitCliEnv {
     temp_dir: TempDir,
     database: TestDatabase,
-    bootstrap_config_path: PathBuf,
     full_config_path: PathBuf,
     base_dir: PathBuf,
     cache_dir: PathBuf,
@@ -134,30 +129,23 @@ impl GitCliEnv {
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
-        let bootstrap_config_path = temp_dir.path().join("bootstrap-config.toml");
         let full_config_path = temp_dir.path().join("config.toml");
         let base_dir = temp_dir.path().join("base");
         let cache_dir = temp_dir.path().join("cache");
         let object_root = temp_dir.path().join("objects");
 
-        common::write_bootstrap_config(&bootstrap_config_path, &database.db_url);
         common::write_full_config(&full_config_path);
         git_cli::write_git_askpass(&case_dir.join("git-askpass.sh"));
 
         Self {
             temp_dir,
             database,
-            bootstrap_config_path,
             full_config_path,
             base_dir,
             cache_dir,
             object_root,
             case_dir,
         }
-    }
-
-    fn bootstrap_command(&self) -> Command {
-        self.command_with_config(&self.bootstrap_config_path)
     }
 
     fn full_config_command(&self) -> Command {
@@ -180,11 +168,7 @@ impl GitCliEnv {
             .env("MEGA_LOG__WITH_ANSI", "false")
             .env("MEGA_REDIS__URL", integration_redis_url())
             .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
-            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
-            .env("MEGA_MAIL__ENABLED", "true")
-            .env("MEGA_MAIL__SMTP_HOST", "localhost")
-            .env("MEGA_MAIL__FROM", "no-reply@example.test")
-            .env("MEGA_MAIL__PASSWORD_REF", MAIL_PASSWORD_REF);
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root);
         command
     }
 }
@@ -318,7 +302,6 @@ fn integration_git_cli_http_round_trip() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
 
     let token = git_cli::resolve_seed_token();
     let fixture_payload = format!(
@@ -544,7 +527,6 @@ fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
 
     // Challenge probe: no Authorization header → 401 + WWW-Authenticate.
@@ -661,7 +643,6 @@ fn integration_git_cli_auth_token_never_leaks() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
     let token = git_cli::resolve_seed_token();
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
@@ -810,7 +791,6 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
 
     // Legacy-disallowed root repo: parse_git_protocol_path rejects it before any
@@ -1085,23 +1065,6 @@ fn expected_mega_cedar_json_bytes() -> Vec<u8> {
         .into_bytes()
 }
 
-fn seed_mail_password(env: &GitCliEnv) {
-    let mut set = env.bootstrap_command();
-    set.args([
-        "config",
-        "secret",
-        "set",
-        "mail.password",
-        "--vault-path",
-        MAIL_PASSWORD_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set, SECRET_VALUE);
-    assert_success(&output);
-}
-
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
     command
@@ -1117,35 +1080,6 @@ fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Co
         command.env("LD_LIBRARY_PATH", ld_library_path);
     }
     command
-}
-
-fn run_with_stdin(mut command: Command, input: &str) -> Output {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn monoengine");
-    {
-        let mut stdin = child.stdin.take().expect("child stdin");
-        if let Err(err) = stdin.write_all(input.as_bytes()) {
-            assert_eq!(err.kind(), ErrorKind::BrokenPipe, "write stdin");
-        }
-    }
-    child.wait_with_output().expect("wait monoengine")
-}
-
-fn assert_success(output: &Output) -> (String, String) {
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "expected success, got {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        stdout,
-        stderr
-    );
-    (stdout, stderr)
 }
 
 fn integration_postgres_url() -> String {

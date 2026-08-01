@@ -24,6 +24,8 @@ services:
       timeout: 5s
       retries: 20
 
+  # Optional SMTP capture for website-next authentication/product-mail IT only.
+  # Monoengine does not connect to or depend on this service.
   mailpit:
     image: axllent/mailpit:v1.27
     ports:
@@ -35,8 +37,8 @@ services:
       timeout: 5s
       retries: 20
 
-  # S3-compatible object storage for IT smoke (RustFS). Public IT credentials
-  # are `rustfs_it` / `rustfs_it_secret` (see `.env.test.example`).
+  # S3-compatible object storage for IT smoke (RustFS). Public test credentials
+  # are `rustfs` / `rustfs_secret` (see `.env.test.example`).
   rustfs:
     image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
     environment:
@@ -44,8 +46,8 @@ services:
       RUSTFS_ADDRESS: 0.0.0.0:9000
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: rustfs_it
-      RUSTFS_SECRET_KEY: rustfs_it_secret
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
       # Single-volume local smoke; required when not using multi-disk topology.
       RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
     ports:
@@ -70,7 +72,7 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://rustfs:9000 rustfs_it rustfs_it_secret &&
+      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
       /usr/bin/mc mb --ignore-existing local/testbucket &&
       /usr/bin/mc anonymous set download local/testbucket
       "
@@ -100,7 +102,7 @@ services:
     network_mode: host
     user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"
     volumes:
-      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}:/work
+      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}:/work
     working_dir: /work
     # Override the image's `git` entrypoint so the container stays up for `exec`.
     entrypoint: ["sleep", "infinity"]
@@ -134,13 +136,19 @@ services:
       MEGA_DATABASE__DB_TYPE: postgres
       MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@postgres:5432/monoengine
       MEGA_REDIS__URL: redis://redis:6379
-      MEGA_MAIL__ENABLED: "false"
+      # Keep the full documented IT CORS allowlist when overriding the sample
+      # config, and add the website-next host origin for stack session tests.
+      MEGA_OAUTH__ALLOWED_CORS_ORIGINS: http://local.gitmega.com,https://app.gitmega.com,http://app.gitmono.test,http://127.0.0.1:17001
+      MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
+      # MN-05: shared IT-only credential for website's internal product-email API.
+      MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL: http://website-next:7001
+      MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
       MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
       MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: /var/lib/monoengine/objects
       MEGA_LOG__PRINT_STD: "true"
       MEGA_LOG__LEVEL: info
     volumes:
-      - monoengine-it-data:/var/lib/monoengine
+      - monoengine-data:/var/lib/monoengine
     ports:
       - "127.0.0.1:19180:8000"
     healthcheck:
@@ -150,8 +158,62 @@ services:
       retries: 40
       start_period: 20s
 
+  # One-shot SQLite schema initialization for website-next. It reuses the
+  # website Dockerfile builder stage because the production runner is a
+  # standalone Next image and deliberately has no Drizzle tooling. The final
+  # chown makes the initialized database writable by the runner's nextjs user.
+  website-db-init:
+    profiles: ["web"]
+    build:
+      context: ../website
+      dockerfile: apps/next-app/Dockerfile
+      target: builder
+    environment:
+      DB_DIALECT: sqlite
+      SQLITE_DB_PATH: /app/data/website-it.sqlite
+    volumes:
+      - website-next-data:/app/data
+    command:
+      - /bin/sh
+      - -ec
+      - pnpm db:push:sqlite && chown -R 1001:1001 /app/data
+
+  # Website Better Auth test instance. It intentionally uses its own SQLite
+  # file rather than the monoengine PostgreSQL business database.
+  # Build locally from the sibling checkout; CI must check out ../website too.
+  website-next:
+    profiles: ["web"]
+    image: website-next:local
+    pull_policy: never
+    build:
+      context: ../website
+      dockerfile: apps/next-app/Dockerfile
+    environment:
+      DB_DIALECT: sqlite
+      SQLITE_DB_PATH: /app/data/website-it.sqlite
+      APP_BASE_URL: http://127.0.0.1:17001
+      BETTER_AUTH_URL: http://127.0.0.1:17001
+      BETTER_AUTH_SECRET: monoengine-it-website-auth-secret-0001
+      # Consumed by DEP-06's internal notification route. This public value is
+      # only for the isolated Compose integration stack.
+      MONOENGINE_INTERNAL_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
+    depends_on:
+      website-db-init:
+        condition: service_completed_successfully
+    volumes:
+      - website-next-data:/app/data
+    ports:
+      - "127.0.0.1:17001:7001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const socket = require('net').connect(7001, '127.0.0.1'); socket.setTimeout(1000); socket.on('connect', () => process.exit(0)); socket.on('error', () => process.exit(1)); socket.on('timeout', () => process.exit(1));\""]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
 volumes:
-  monoengine-it-data:
+  monoengine-data:
+  website-next-data:
 
 networks:
   default:

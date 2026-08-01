@@ -19,4 +19,5 @@
 |---|---|---|
 | `plan-template.md` | 模板 | 基线 |
 | `plan-long.md` | 长期能力 | 当前（2026-07-27 首版，Mega → monoengine 完全移植路线图） |
-| `plan-20260727.md` | 日期计划 | 已排期（承接 PT-01 集成测试基建，IT-01..IT-07） |
+| `plan-20260727.md` | 日期计划 | 已完成（承接 PT-01 集成测试基建） |
+| `plan-20260731.md` | 日期计划 | 已排期（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website，含 compose/env/文档同步；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01） |

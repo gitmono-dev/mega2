@@ -13,16 +13,13 @@ pub const ISSUE_TAG: &str = "Issue Management";
 pub const SIDEBAR_TAG: &str = "Sidebar Management";
 pub const LABEL_TAG: &str = "Label Management";
 pub const CONV_TAG: &str = "Conversation and Comment";
-pub const SYNC_NOTES_STATE_TAG: &str = "sync-notes-state";
 pub const USER_TAG: &str = "User Management";
-pub const MAIL_TAG: &str = "Mail Management";
 pub const REPO_TAG: &str = "Repo creation and synchronisation";
 pub const MERGE_QUEUE_TAG: &str = "Merge Queue Management";
 pub const BUCK_TAG: &str = "Buck Upload API";
 pub const LFS_TAG: &str = "Git LFS";
 pub const CODE_REVIEW_TAG: &str = "Code Review";
 pub const GROUP_PERMISSION_TAG: &str = "Group Permission Management";
-pub const CHAT_TAG: &str = "Chat and Channel Management";
 
 /// Shared OpenAPI tag for automation / integration–related APIs.
 pub const AUTOMATION_TAG: &str = "Automation & Integrations";

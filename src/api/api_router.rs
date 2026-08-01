@@ -12,13 +12,11 @@ use crate::{
     api::{
         MonoApiServiceState,
         api_doc::SYSTEM_COMMON,
-        notes::note_router,
         router::{
             admin_router, artifacts_router, bot_router, buck_router, build_trigger_router,
-            chat_router, cl_router, code_review_router, commit_router, conv_router,
-            dynamic_sidebar_router, gpg_router, group_router, issue_router, label_router,
-            merge_queue_router, permission_router, preview_router, repo_router, reviewer_router,
-            tag_router, user_router, webhook_router,
+            cl_router, code_review_router, commit_router, conv_router, dynamic_sidebar_router,
+            gpg_router, group_router, issue_router, label_router, merge_queue_router,
+            preview_router, repo_router, reviewer_router, tag_router, user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -39,7 +37,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(label_router::routers())
         .merge(conv_router::routers())
         .merge(merge_queue_router::routers())
-        .merge(note_router::routers())
         .merge(commit_router::routers())
         .merge(tag_router::routers())
         .merge(repo_router::routers())
@@ -48,12 +45,10 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(admin_router::routers())
         .merge(artifacts_router::routers())
         .merge(group_router::routers())
-        .merge(permission_router::routers())
         .merge(code_review_router::routers())
         .merge(build_trigger_router::routers())
         .merge(webhook_router::routers())
         .merge(bot_router::routers())
-        .merge(chat_router::routers())
 }
 
 /// Health Check

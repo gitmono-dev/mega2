@@ -148,13 +148,12 @@ jobs:
       - name: Mask test secrets in logs
         run: |
           echo "::add-mask::monoengine_test_password"
-          echo "::add-mask::smtp-test-password"
 
       - name: Start test services (PostgreSQL, Redis, git-cli)
         working-directory: monoengine
         run: |
           set -euo pipefail
-          dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}"
+          dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}"
           mkdir -p "$dir" && chmod 1777 "$dir"
           export MONOENGINE_IT_GIT_UID="$(id -u)"
           export MONOENGINE_IT_GIT_GID="$(id -g)"
@@ -176,7 +175,7 @@ jobs:
           # the dominant cost that pushed v0.1.174/175 past the old 30m timeout).
           cargo test -p monoengine --release --test integration_git_cli -- --test-threads=1
 
-      - name: Prepare smoke config and seed secret
+      - name: Prepare smoke config
         working-directory: monoengine
         env:
           MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine_smoke
@@ -193,16 +192,6 @@ jobs:
           psql "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine" \
             -c "DROP DATABASE IF EXISTS monoengine_smoke" \
             -c "CREATE DATABASE monoengine_smoke"
-
-          # Seed mail.password so that service http can start (mail is enabled
-          # in the default config with a password_ref).  MEGA_BASE_DIR must be
-          # set here too so the vault core key is written to the same location
-          # that `service http` will later read from.
-          printf '%s' 'smtp-test-password' \
-            | ./target/release/monoengine --config "${smoke_dir}/config.toml" \
-                config secret set mail.password \
-                --vault-path config/smoke/mail/password \
-                --field value --value-stdin
 
           smoke_git_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
           echo "::add-mask::${smoke_git_token}"

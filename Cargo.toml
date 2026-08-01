@@ -3,7 +3,7 @@ members = ["bin"]
 
 [package]
 name = "monoengine-core"
-version = "0.1.183"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
@@ -61,7 +61,6 @@ indexmap = "2.14"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 itertools = "0.15.0"
 lazy_static = "1.5.0"
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
 libc = "0.2"
 lockfile = "0.4.0"
 log = "0.4.33"

@@ -12,7 +12,6 @@
 mod api;
 mod bellatrix;
 mod callisto;
-pub mod chat;
 pub use crate::callisto::*;
 mod ceres;
 mod cli;
@@ -22,7 +21,6 @@ pub mod config;
 mod context;
 mod contract;
 mod jupiter;
-pub mod mail;
 pub mod notification;
 mod server;
 // The vendored RustyVault code intentionally keeps its upstream style and

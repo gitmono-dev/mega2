@@ -15,8 +15,8 @@ use tokio::{
 use crate::{
     common::errors::MegaError,
     config::{
-        ArtifactGcConfig, BuckConfig, ChatConfig, Config, DEFAULT_MAIL_TEMPLATE_LOCALE,
-        DEFAULT_NOTIFICATION_DELIVERY_MODE, LogConfig, MailConfig, NotificationConfig,
+        ArtifactGcConfig, BuckConfig, Config, DEFAULT_NOTIFICATION_DELIVERY_MODE, LogConfig,
+        NotificationConfig,
     },
 };
 
@@ -139,14 +139,12 @@ impl ConfigHandle {
             &mut report,
         );
         apply_buck_changes(&current.buck, &candidate.buck, &mut next.buck, &mut report);
-        apply_mail_changes(&current.mail, &candidate.mail, &mut next.mail, &mut report);
         apply_notification_changes(
             &current.notification,
             &candidate.notification,
             &mut next.notification,
             &mut report,
         );
-        apply_chat_changes(&current.chat, &candidate.chat, &mut next.chat, &mut report);
         collect_database_restart_fields(&current, &candidate, &mut report);
         collect_redis_restart_fields(&current, &candidate, &mut report);
         collect_static_restart_fields(&current, &candidate, &mut report);
@@ -465,171 +463,9 @@ fn apply_buck_cleanup_changes(
     }
 }
 
-fn apply_mail_changes(
-    current: &Option<MailConfig>,
-    candidate: &Option<MailConfig>,
-    next: &mut Option<MailConfig>,
-    report: &mut ConfigReloadReport,
-) {
-    match (current, candidate) {
-        (None, None) => {}
-        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("mail"),
-        (Some(current), Some(candidate)) => {
-            if current.enabled != candidate.enabled {
-                if let Some(next) = next {
-                    next.enabled = candidate.enabled;
-                }
-                report.applied_fields.push("mail.enabled");
-            }
-            if current.dispatcher_batch_size != candidate.dispatcher_batch_size {
-                if let Some(next) = next {
-                    next.dispatcher_batch_size = candidate.dispatcher_batch_size;
-                }
-                report.applied_fields.push("mail.dispatcher_batch_size");
-            }
-            if current.dispatcher_max_in_flight != candidate.dispatcher_max_in_flight {
-                if let Some(next) = next {
-                    next.dispatcher_max_in_flight = candidate.dispatcher_max_in_flight;
-                }
-                report.applied_fields.push("mail.dispatcher_max_in_flight");
-            }
-            if current.retry_max_attempts != candidate.retry_max_attempts {
-                if let Some(next) = next {
-                    next.retry_max_attempts = candidate.retry_max_attempts;
-                }
-                report.applied_fields.push("mail.retry_max_attempts");
-            }
-            if current.retry_backoff_base_secs != candidate.retry_backoff_base_secs {
-                if let Some(next) = next {
-                    next.retry_backoff_base_secs = candidate.retry_backoff_base_secs;
-                }
-                report.applied_fields.push("mail.retry_backoff_base_secs");
-            }
-            if current.retry_backoff_max_secs != candidate.retry_backoff_max_secs {
-                if let Some(next) = next {
-                    next.retry_backoff_max_secs = candidate.retry_backoff_max_secs;
-                }
-                report.applied_fields.push("mail.retry_backoff_max_secs");
-            }
-            if current.attachment_prune_enabled != candidate.attachment_prune_enabled {
-                if let Some(next) = next {
-                    next.attachment_prune_enabled = candidate.attachment_prune_enabled;
-                }
-                report.applied_fields.push("mail.attachment_prune_enabled");
-            }
-            if current.attachment_prune_interval_secs != candidate.attachment_prune_interval_secs {
-                if let Some(next) = next {
-                    next.attachment_prune_interval_secs = candidate.attachment_prune_interval_secs;
-                }
-                report
-                    .applied_fields
-                    .push("mail.attachment_prune_interval_secs");
-            }
-            if current.attachment_retention_days != candidate.attachment_retention_days {
-                if let Some(next) = next {
-                    next.attachment_retention_days = candidate.attachment_retention_days;
-                }
-                report.applied_fields.push("mail.attachment_retention_days");
-            }
-            if current.attachment_prune_statuses != candidate.attachment_prune_statuses {
-                if let Some(next) = next {
-                    next.attachment_prune_statuses = candidate.attachment_prune_statuses.clone();
-                }
-                report.applied_fields.push("mail.attachment_prune_statuses");
-            }
-            // Template settings are hot-reloadable: the registry is rebuilt from
-            // files by `config_reload_mail_template_subscriber` (no vault needed),
-            // fail-closed on a bad template_dir (docs/mail.md phase 4).
-            if current.template_default_locale != candidate.template_default_locale {
-                if let Some(next) = next {
-                    next.template_default_locale
-                        .clone_from(&candidate.template_default_locale);
-                }
-                report.applied_fields.push("mail.template_default_locale");
-            }
-            if current.template_dir != candidate.template_dir {
-                if let Some(next) = next {
-                    next.template_dir.clone_from(&candidate.template_dir);
-                }
-                report.applied_fields.push("mail.template_dir");
-            }
-            // SMTP connection / credential / provider fields are hot-reloadable:
-            // `config_reload_mailer_subscriber` rebuilds the mailer asynchronously
-            // (re-resolving password_ref post-vault) and swaps it in, keeping the
-            // previous mailer on failure (docs/mail.md phase 4).
-            if current.provider != candidate.provider {
-                if let Some(next) = next {
-                    next.provider = candidate.provider;
-                }
-                report.applied_fields.push("mail.provider");
-            }
-            if current.smtp_host != candidate.smtp_host {
-                if let Some(next) = next {
-                    next.smtp_host.clone_from(&candidate.smtp_host);
-                }
-                report.applied_fields.push("mail.smtp_host");
-            }
-            if current.smtp_port != candidate.smtp_port {
-                if let Some(next) = next {
-                    next.smtp_port = candidate.smtp_port;
-                }
-                report.applied_fields.push("mail.smtp_port");
-            }
-            if current.username != candidate.username {
-                if let Some(next) = next {
-                    next.username.clone_from(&candidate.username);
-                }
-                report.applied_fields.push("mail.username");
-            }
-            if current.password != candidate.password {
-                if let Some(next) = next {
-                    next.password = candidate.password.clone();
-                }
-                report.applied_fields.push("mail.password");
-            }
-            if current.password_ref != candidate.password_ref {
-                if let Some(next) = next {
-                    next.password_ref = candidate.password_ref.clone();
-                }
-                report.applied_fields.push("mail.password_ref");
-            }
-            if current.from != candidate.from {
-                if let Some(next) = next {
-                    next.from.clone_from(&candidate.from);
-                }
-                report.applied_fields.push("mail.from");
-            }
-            if current.starttls != candidate.starttls {
-                if let Some(next) = next {
-                    next.starttls = candidate.starttls;
-                }
-                report.applied_fields.push("mail.starttls");
-            }
-            if current.http_url != candidate.http_url {
-                if let Some(next) = next {
-                    next.http_url.clone_from(&candidate.http_url);
-                }
-                report.applied_fields.push("mail.http_url");
-            }
-            if current.http_headers != candidate.http_headers {
-                if let Some(next) = next {
-                    next.http_headers.clone_from(&candidate.http_headers);
-                }
-                report.applied_fields.push("mail.http_headers");
-            }
-            if current.http_timeout_secs != candidate.http_timeout_secs {
-                if let Some(next) = next {
-                    next.http_timeout_secs = candidate.http_timeout_secs;
-                }
-                report.applied_fields.push("mail.http_timeout_secs");
-            }
-        }
-    }
-}
-
-/// All `notification.*` fields are runtime-consumed (the `enabled` gate is read
-/// live by the dispatcher subscriber; the defaults are read at consumption
-/// time), so every change is applied — none is restart-required.
+/// Notification delivery settings are read live from the config snapshot.
+/// Website mail credentials construct a bounded HTTP client at startup, so
+/// changing those fields is accepted into the snapshot but requires restart.
 fn apply_notification_changes(
     current: &Option<NotificationConfig>,
     candidate: &Option<NotificationConfig>,
@@ -660,6 +496,29 @@ fn apply_notification_changes(
     if current_locale != candidate_locale {
         report.applied_fields.push("notification.default_locale");
     }
+    if current.as_ref().map(|config| {
+        (
+            &config.website_mail_base_url,
+            &config.website_mail_bearer,
+            &config.website_mail_bearer_ref,
+        )
+    }) != candidate.as_ref().map(|config| {
+        (
+            &config.website_mail_base_url,
+            &config.website_mail_bearer,
+            &config.website_mail_bearer_ref,
+        )
+    }) {
+        report
+            .restart_required_fields
+            .push("notification.website_mail_base_url");
+        report
+            .restart_required_fields
+            .push("notification.website_mail_bearer");
+        report
+            .restart_required_fields
+            .push("notification.website_mail_bearer_ref");
+    }
 }
 
 fn notification_enabled(config: &Option<NotificationConfig>) -> bool {
@@ -677,60 +536,7 @@ fn notification_default_locale(config: &Option<NotificationConfig>) -> String {
     config
         .as_ref()
         .map(|c| c.default_locale.clone())
-        .unwrap_or_else(|| DEFAULT_MAIL_TEMPLATE_LOCALE.to_string())
-}
-
-/// `chat.attachment_allowed_mime_types` is read live by the attachment handlers,
-/// so changes can be hot-applied without a restart.
-fn apply_chat_changes(
-    current: &Option<ChatConfig>,
-    candidate: &Option<ChatConfig>,
-    next: &mut Option<ChatConfig>,
-    report: &mut ConfigReloadReport,
-) {
-    if current == candidate {
-        return;
-    }
-
-    let current_list = chat_mime_allowlist(current);
-    let candidate_list = chat_mime_allowlist(candidate);
-    *next = candidate.clone();
-
-    if current_list != candidate_list {
-        report
-            .applied_fields
-            .push("chat.attachment_allowed_mime_types");
-    }
-    if current.as_ref().map(|c| c.open_graph_fetch_enabled)
-        != candidate.as_ref().map(|c| c.open_graph_fetch_enabled)
-    {
-        report.applied_fields.push("chat.open_graph_fetch_enabled");
-    }
-    if current.as_ref().map(|c| c.open_graph_fetch_timeout_ms)
-        != candidate.as_ref().map(|c| c.open_graph_fetch_timeout_ms)
-    {
-        report
-            .applied_fields
-            .push("chat.open_graph_fetch_timeout_ms");
-    }
-    if current
-        .as_ref()
-        .map(|c| c.open_graph_allow_private_networks)
-        != candidate
-            .as_ref()
-            .map(|c| c.open_graph_allow_private_networks)
-    {
-        report
-            .applied_fields
-            .push("chat.open_graph_allow_private_networks");
-    }
-}
-
-fn chat_mime_allowlist(config: &Option<ChatConfig>) -> Vec<String> {
-    config
-        .as_ref()
-        .map(|c| c.attachment_allowed_mime_types.clone())
-        .unwrap_or_default()
+        .unwrap_or_else(|| "en-US".to_string())
 }
 
 fn collect_artifact_gc_restart_fields(
@@ -880,6 +686,7 @@ fn collect_static_restart_fields(
     collect_object_storage_restart_fields(current, candidate, report);
     collect_orion_server_restart_fields(current, candidate, report);
     collect_sidebar_restart_fields(current, candidate, report);
+    collect_oauth_restart_fields(current, candidate, report);
 }
 
 fn collect_monorepo_restart_fields(
@@ -1122,30 +929,42 @@ fn collect_sidebar_restart_fields(
     }
 }
 
+fn collect_oauth_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    match (&current.oauth, &candidate.oauth) {
+        (None, None) => {}
+        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("oauth"),
+        (Some(current), Some(candidate)) => {
+            if current.allowed_cors_origins != candidate.allowed_cors_origins {
+                report
+                    .restart_required_fields
+                    .push("oauth.allowed_cors_origins");
+            }
+            if current.website_api_base_url != candidate.website_api_base_url {
+                report
+                    .restart_required_fields
+                    .push("oauth.website_api_base_url");
+            }
+            if current.session_cookie_names != candidate.session_cookie_names {
+                report
+                    .restart_required_fields
+                    .push("oauth.session_cookie_names");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        ArtifactGcConfig, BuckConfig, MailConfig, MailProvider,
-        secret::{SecretRef, SecretString},
+        ArtifactGcConfig, BuckConfig,
         template::config_init_template,
         testing::{EnvVarGuard, env_lock, isolated_config},
     };
-
-    fn mail_config(enabled: bool) -> MailConfig {
-        MailConfig {
-            enabled,
-            provider: MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: Some("monoengine@example.com".to_string()),
-            password: None,
-            password_ref: None,
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        }
-    }
 
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1457,309 +1276,6 @@ mod tests {
     }
 
     #[test]
-    fn reload_applies_mail_disable_without_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(true));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.mail.as_mut().expect("mail config").enabled = false;
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-
-        assert_eq!(report.applied_fields, vec!["mail.enabled"]);
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert!(!snapshot.mail.as_ref().expect("mail config").enabled);
-    }
-
-    #[test]
-    fn reload_applies_chat_mime_allowlist_without_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.chat = Some(ChatConfig::default());
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate
-            .chat
-            .as_mut()
-            .expect("chat config")
-            .attachment_allowed_mime_types =
-            vec!["image/*".to_string(), "application/pdf".to_string()];
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-
-        assert_eq!(
-            report.applied_fields,
-            vec!["chat.attachment_allowed_mime_types"]
-        );
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert_eq!(
-            snapshot
-                .chat
-                .as_ref()
-                .expect("chat config")
-                .attachment_allowed_mime_types,
-            vec!["image/*".to_string(), "application/pdf".to_string()]
-        );
-    }
-
-    #[test]
-    fn reload_applies_mail_dispatcher_limits_without_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(true));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        let mail = candidate.mail.as_mut().expect("mail config");
-        mail.dispatcher_batch_size = 12;
-        mail.dispatcher_max_in_flight = 3;
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-        let mail = snapshot.mail.as_ref().expect("mail config");
-
-        assert_eq!(
-            report.applied_fields,
-            vec![
-                "mail.dispatcher_batch_size",
-                "mail.dispatcher_max_in_flight"
-            ]
-        );
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert_eq!(mail.dispatcher_batch_size, 12);
-        assert_eq!(mail.dispatcher_max_in_flight, 3);
-    }
-
-    #[test]
-    fn reload_applies_mail_retry_policy_without_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(true));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        let mail = candidate.mail.as_mut().expect("mail config");
-        mail.retry_max_attempts = 7;
-        mail.retry_backoff_base_secs = 15;
-        mail.retry_backoff_max_secs = 120;
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-        let mail = snapshot.mail.as_ref().expect("mail config");
-
-        assert_eq!(
-            report.applied_fields,
-            vec![
-                "mail.retry_max_attempts",
-                "mail.retry_backoff_base_secs",
-                "mail.retry_backoff_max_secs"
-            ]
-        );
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert_eq!(mail.retry_max_attempts, 7);
-        assert_eq!(mail.retry_backoff_base_secs, 15);
-        assert_eq!(mail.retry_backoff_max_secs, 120);
-    }
-
-    #[test]
-    fn reload_applies_mail_attachment_prune_policy_without_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(true));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        let mail = candidate.mail.as_mut().expect("mail config");
-        mail.attachment_prune_enabled = true;
-        mail.attachment_prune_interval_secs = 600;
-        mail.attachment_retention_days = 14;
-        mail.attachment_prune_statuses = vec!["sent".to_string()];
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-        let mail = snapshot.mail.as_ref().expect("mail config");
-
-        assert_eq!(
-            report.applied_fields,
-            vec![
-                "mail.attachment_prune_enabled",
-                "mail.attachment_prune_interval_secs",
-                "mail.attachment_retention_days",
-                "mail.attachment_prune_statuses"
-            ]
-        );
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert!(mail.attachment_prune_enabled);
-        assert_eq!(mail.attachment_prune_interval_secs, 600);
-        assert_eq!(mail.attachment_retention_days, 14);
-        assert_eq!(mail.attachment_prune_statuses, vec!["sent"]);
-    }
-
-    #[test]
-    fn reload_applies_mail_enable_without_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(false));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.mail.as_mut().expect("mail config").enabled = true;
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-
-        assert_eq!(report.applied_fields, vec!["mail.enabled"]);
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert!(snapshot.mail.as_ref().expect("mail config").enabled);
-    }
-
-    #[test]
-    fn reload_applies_mail_provider_change_and_publishes_snapshot() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(true));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.mail.as_mut().expect("mail config").provider = MailProvider::Console;
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-
-        // Provider change is hot-applied (mailer rebuilt asynchronously).
-        assert!(report.applied_fields.contains(&"mail.provider"));
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        assert_eq!(
-            snapshot.mail.as_ref().expect("mail config").provider,
-            MailProvider::Console
-        );
-    }
-
-    #[test]
-    fn reload_applies_mail_template_settings_and_publishes_snapshot() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let template_dir = temp_dir.path().join("templates");
-        std::fs::create_dir(&template_dir).expect("template dir");
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(mail_config(true));
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        let mail = candidate.mail.as_mut().expect("mail config");
-        mail.template_default_locale = "zh-CN".to_string();
-        mail.template_dir = Some(template_dir.clone());
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-        let mail = snapshot.mail.as_ref().expect("mail config");
-
-        // Template settings are hot-reloadable (registry rebuild from files,
-        // no vault); the new values are published to the snapshot.
-        assert!(
-            report
-                .applied_fields
-                .contains(&"mail.template_default_locale")
-        );
-        assert!(report.applied_fields.contains(&"mail.template_dir"));
-        assert!(!report.requires_restart());
-        assert!(report.applied());
-        assert_eq!(mail.template_default_locale, "zh-CN");
-        assert_eq!(mail.template_dir, Some(template_dir));
-    }
-
-    #[test]
-    fn reload_applies_mail_reconfiguration_and_publishes_snapshot_without_leaking_secrets() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let candidate_ref =
-            SecretRef::parse("vault://secret/config/candidate/mail/password#value").unwrap();
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(MailConfig {
-            enabled: true,
-            provider: MailProvider::Smtp,
-            smtp_host: "smtp.current.example.com".to_string(),
-            smtp_port: 587,
-            username: Some("current-user".to_string()),
-            password: Some(SecretString::new("current-password")),
-            password_ref: None,
-            from: "current@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        });
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.mail = Some(MailConfig {
-            enabled: true,
-            provider: MailProvider::Smtp,
-            smtp_host: "smtp.candidate.example.com".to_string(),
-            smtp_port: 465,
-            username: Some("candidate-user".to_string()),
-            password: None,
-            password_ref: Some(candidate_ref),
-            from: "candidate@example.com".to_string(),
-            starttls: false,
-            ..Default::default()
-        });
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-        let snapshot_mail = snapshot.mail.as_ref().expect("mail config");
-        let report_debug = format!("{report:?}");
-
-        // SMTP connection/credential fields are now hot-applied (mailer rebuilt
-        // asynchronously by config_reload_mailer_subscriber).
-        assert!(report.restart_required_fields.is_empty());
-        for field in [
-            "mail.smtp_host",
-            "mail.smtp_port",
-            "mail.username",
-            "mail.password",
-            "mail.password_ref",
-            "mail.from",
-            "mail.starttls",
-        ] {
-            assert!(
-                report.applied_fields.contains(&field),
-                "{field} should be applied"
-            );
-        }
-        assert!(report.applied());
-        assert!(!report.requires_restart());
-        // The candidate values are published to the snapshot.
-        assert_eq!(snapshot_mail.smtp_host, "smtp.candidate.example.com");
-        assert_eq!(snapshot_mail.smtp_port, 465);
-        assert_eq!(snapshot_mail.username.as_deref(), Some("candidate-user"));
-        assert_eq!(snapshot_mail.from, "candidate@example.com");
-        assert!(!snapshot_mail.starttls);
-        assert!(snapshot_mail.password.is_none());
-        assert!(snapshot_mail.password_ref.is_some());
-        // The reload report carries only field names, never secret values.
-        assert!(!report_debug.contains("current-password"));
-        assert!(!report_debug.contains("candidate-user"));
-        assert!(!report_debug.contains("config/candidate/mail/password"));
-        assert!(!report_debug.contains("#value"));
-    }
-
-    #[test]
     fn reload_rejects_invalid_candidate_and_keeps_current_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut current = isolated_config(temp_dir.path().join("current"));
@@ -1897,45 +1413,6 @@ mod tests {
                 "first rollback info"
             ]
         );
-    }
-
-    #[test]
-    fn reload_applies_secret_ref_change_and_publishes_without_leaking() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let current_ref =
-            SecretRef::parse("vault://secret/config/current/mail/password#value").unwrap();
-        let candidate_ref =
-            SecretRef::parse("vault://secret/config/candidate/mail/password#value").unwrap();
-        let mut current = isolated_config(temp_dir.path().join("current"));
-        current.mail = Some(MailConfig {
-            password_ref: Some(current_ref.clone()),
-            ..mail_config(false)
-        });
-        let handle = ConfigHandle::new(current);
-
-        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
-        candidate.mail.as_mut().expect("mail config").password_ref = Some(candidate_ref.clone());
-
-        let report = handle.reload(candidate).expect("reload should succeed");
-        let snapshot = handle.snapshot().expect("snapshot after reload");
-        let report_debug = format!("{report:?}");
-
-        // password_ref change is hot-applied: the async mailer rebuild re-resolves
-        // it through vault. The new ref is published; only the field name is in
-        // the report, never the ref path or `#value`.
-        assert!(report.applied_fields.contains(&"mail.password_ref"));
-        assert!(report.restart_required_fields.is_empty());
-        assert!(report.applied());
-        assert_eq!(
-            snapshot
-                .mail
-                .as_ref()
-                .and_then(|mail| mail.password_ref.as_ref()),
-            Some(&candidate_ref)
-        );
-        assert!(!report_debug.contains("config/current/mail/password"));
-        assert!(!report_debug.contains("config/candidate/mail/password"));
-        assert!(!report_debug.contains("#value"));
     }
 
     #[test]

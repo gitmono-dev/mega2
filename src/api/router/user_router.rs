@@ -11,11 +11,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{
-        MonoApiServiceState,
-        api_doc::{MAIL_TAG, USER_TAG},
-        oauth::model::LoginUser,
-    },
+    api::{MonoApiServiceState, api_doc::USER_TAG, oauth::model::LoginUser},
     callisto::{
         notification_event_types, user_notification_preferences, user_notification_settings,
     },
@@ -27,11 +23,10 @@ use crate::{
         },
     },
     common::errors::{ApiError, MegaError},
+    config::NOTIFICATION_DELIVERY_MODES,
     contract::api::common::CommonResult,
     jupiter::storage::notification_storage::NotificationStorage,
 };
-
-const NOTIFICATION_DELIVERY_MODE_REALTIME: &str = "realtime";
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest(
@@ -248,7 +243,7 @@ async fn list_token(
         (status = 200, body = CommonResult<UserNotificationPreferencesResponse>, content_type = "application/json"),
         (status = 401, description = "Unauthorized"),
     ),
-    tag = MAIL_TAG
+    tag = USER_TAG
 )]
 async fn list_notification_preferences(
     user: LoginUser,
@@ -272,7 +267,7 @@ async fn list_notification_preferences(
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Notification event type not found"),
     ),
-    tag = MAIL_TAG
+    tag = USER_TAG
 )]
 async fn update_notification_preferences(
     user: LoginUser,
@@ -351,7 +346,7 @@ async fn update_notification_preferences(
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Notification event type not found"),
     ),
-    tag = MAIL_TAG
+    tag = USER_TAG
 )]
 async fn update_notification_preference(
     user: LoginUser,
@@ -565,11 +560,11 @@ fn validate_notification_event_type_code(event_type_code: &str) -> Result<String
 
 fn validate_notification_delivery_mode(delivery_mode: &str) -> Result<String, ApiError> {
     let delivery_mode = delivery_mode.trim().to_ascii_lowercase();
-    if delivery_mode == NOTIFICATION_DELIVERY_MODE_REALTIME {
+    if NOTIFICATION_DELIVERY_MODES.contains(&delivery_mode.as_str()) {
         Ok(delivery_mode)
     } else {
         Err(ApiError::bad_request(anyhow::anyhow!(
-            "delivery_mode must be `{NOTIFICATION_DELIVERY_MODE_REALTIME}`"
+            "delivery_mode must be one of {NOTIFICATION_DELIVERY_MODES:?}"
         )))
     }
 }
@@ -715,10 +710,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_notification_delivery_mode_accepts_realtime_only() {
+    fn validate_notification_delivery_mode_accepts_in_app_and_email() {
         assert_eq!(
-            validate_notification_delivery_mode(" Realtime ").unwrap(),
-            "realtime"
+            validate_notification_delivery_mode(" in_app ").unwrap(),
+            "in_app"
+        );
+        assert_eq!(
+            validate_notification_delivery_mode("email").unwrap(),
+            "email"
         );
         assert!(validate_notification_delivery_mode("digest").is_err());
     }

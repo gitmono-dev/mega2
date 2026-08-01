@@ -321,16 +321,26 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_config_secret_ref() {
+    fn cli_rejects_removed_chat_migrate_command() {
+        assert!(
+            cli()
+                .no_binary_name(true)
+                .try_get_matches_from(["chat-migrate"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_accepts_supported_config_secret_ref() {
         let matches = cli()
             .no_binary_name(true)
             .try_get_matches_from([
                 "config",
                 "secret",
                 "ref",
-                "mail.password",
+                "redis.url",
                 "--vault-path",
-                "config/prod/mail/password",
+                "config/prod/redis/url",
             ])
             .unwrap();
         let Some(("config", config_args)) = matches.subcommand() else {
@@ -343,7 +353,7 @@ mod tests {
             panic!("secret ref subcommand should parse");
         };
 
-        assert_eq!(ref_args.get_one::<String>("name").unwrap(), "mail.password");
+        assert_eq!(ref_args.get_one::<String>("name").unwrap(), "redis.url");
     }
 
     #[test]

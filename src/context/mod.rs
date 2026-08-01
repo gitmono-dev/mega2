@@ -93,69 +93,15 @@ impl AppContext {
         let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
         let connection = init_connection(&redis_config).await?;
 
-        // Late (post-Vault) construction for mail + notification dispatcher (phase 0 per docs/notification.md).
-        // Must be after VaultCore (and mail) per config.md bootstrap constraints and docs/mail.md.
-        // Spawns the EmailDispatcher background task (using existing outbox + claim logic).
-        // The shutdown token is stored so services can coordinate graceful stop if needed.
+        // Build notification channels after Vault so optional Slack and webhook
+        // credentials can be resolved. In-app delivery does not require `[mail]`.
         let notification_shutdown = CancellationToken::new();
-        if let Some(mail_cfg) = &config.mail {
-            mail_cfg.validate()?;
-            mail_cfg.warn_plaintext_password_deprecated();
-            let mail_template_registry =
-                crate::notification::triggers::notification_mail_template_registry_from_config(
-                    mail_cfg,
-                )
-                .map_err(|e| {
-                    MegaError::Other(format!("mail template initialization failed: {e}"))
-                })?;
-            crate::notification::triggers::configure_notification_mail_template_registry(
-                mail_template_registry,
-            )?;
-            // Hot-reload the mail template registry when mail.template_* change
-            // (sync, file-only rebuild; docs/mail.md phase 4).
-            config_handle
-                .subscribe(crate::notification::config_reload_mail_template_subscriber())?;
-
-            // Always construct the notification service when mail is configured,
-            // even if mail.enabled is false at startup. The dispatcher runs with
-            // control.enabled=false and a NoopMailer, so a later reload that sets
-            // mail.enabled=true can re-enable mail without a process restart
-            // (docs/mail.md phase 4: runtime re-enable).
-            let mailer_for_startup: Arc<dyn crate::mail::Mailer> = if mail_cfg.enabled {
-                let resolved_password = if mail_cfg.provider == crate::config::MailProvider::Smtp
-                    && let Some(secret_ref) = &mail_cfg.password_ref
-                {
-                    let resolver =
-                        VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-                    Some(
-                        crate::contract::vault::integration::vault_core::with_audit_caller(
-                            "startup:mail-password",
-                            resolver.resolve(secret_ref),
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-                crate::mail::mailer_from_config(mail_cfg, resolved_password)
-                    .map_err(|e| MegaError::Other(format!("mail initialization failed: {e}")))?
-            } else {
-                Arc::new(crate::mail::NoopMailer)
-            };
-            let notif_stg = storage.notification_storage();
-            // Build secret-bearing secondary channels (Slack / generic webhook)
-            // post-vault, resolving their credentials through the vault resolver
-            // (docs/notification.md phase 3: channel credentials are resolved only
-            // after vault is ready).
-            let mut extra_channels: Vec<
-                Arc<dyn crate::notification::channels::NotificationChannel>,
-            > = Vec::new();
-            if let Some(notification_cfg) = config.notification.as_ref() {
-                // Enforce the notification SecretRef namespace (and required
-                // fields) on the real startup path before resolving any channel
-                // credential, so a config cannot point a channel ref at an
-                // unrelated vault path (the per-validator allowlist must not be
-                // bypassable at runtime, only enforced by manual `config validate`).
+        let notif_stg = storage.notification_storage();
+        let mut extra_channels: Vec<Arc<dyn crate::notification::channels::NotificationChannel>> =
+            Vec::new();
+        let mut website_mail = None;
+        let (notification_enabled, default_delivery_mode) = match config.notification.as_ref() {
+            Some(notification_cfg) => {
                 crate::config::validate::validate_notification_config(notification_cfg)?;
                 let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
                 if let Some(slack) = notification_cfg
@@ -165,8 +111,8 @@ impl AppContext {
                 {
                     let Some(url_ref) = &slack.webhook_url_ref else {
                         return Err(MegaError::Other(
-                            "notification.slack.enabled is true but notification.slack.webhook_url_ref is missing".to_string(),
-                        ));
+                                "notification.slack.enabled is true but notification.slack.webhook_url_ref is missing".to_string(),
+                            ));
                     };
                     let url = crate::contract::vault::integration::vault_core::with_audit_caller(
                         "startup:notification-slack",
@@ -202,39 +148,56 @@ impl AppContext {
                         )?,
                     ));
                 }
+                if !notification_cfg.website_mail_base_url.trim().is_empty() {
+                    let bearer = match (
+                        &notification_cfg.website_mail_bearer,
+                        &notification_cfg.website_mail_bearer_ref,
+                    ) {
+                        (Some(bearer), None) => bearer.clone(),
+                        (None, Some(bearer_ref)) => crate::config::secret::SecretString::new(
+                            crate::contract::vault::integration::vault_core::with_audit_caller(
+                                "startup:notification-website-mail",
+                                resolver.resolve(bearer_ref),
+                            )
+                            .await?,
+                        ),
+                        _ => {
+                            return Err(MegaError::Other(
+                                "website mail configuration must provide exactly one bearer source"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    website_mail = Some(Arc::new(
+                        crate::notification::website_mail::WebsiteMailClient::new(
+                            &notification_cfg.website_mail_base_url,
+                            bearer,
+                        )?,
+                    ));
+                }
+                (
+                    notification_cfg.enabled,
+                    notification_cfg.default_delivery_mode.clone(),
+                )
             }
-            let service =
-                crate::notification::NotificationService::from_mail_config_with_extra_channels(
-                    notif_stg,
-                    mailer_for_startup,
-                    mail_cfg,
-                    extra_channels,
-                );
-            // Honor the global notification kill switch at startup; a later
-            // reload can re-enable both mail and notifications without restart.
-            let notification_globally_enabled = config
-                .notification
-                .as_ref()
-                .map(|notification| notification.enabled)
-                .unwrap_or(true);
-            service
-                .control()
-                .set_enabled(mail_cfg.enabled && notification_globally_enabled);
-            config_handle.subscribe(
-                crate::notification::config_reload_email_dispatcher_subscriber(service.control()),
-            )?;
-            // Hot-rebuild the SMTP mailer when connection/credential fields
-            // change, or when mail is re-enabled at runtime (async rebuild
-            // re-resolves password_ref post-vault; docs/mail.md phase 4).
-            config_handle.subscribe(crate::notification::config_reload_mailer_subscriber(
-                service.email_mailer_handle(),
-                vault.clone(),
-            ))?;
-            let sd = notification_shutdown.clone();
-            tokio::spawn(async move {
-                service.start(sd).await;
-            });
-        }
+            None => (
+                true,
+                crate::config::DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
+            ),
+        };
+        let service = Arc::new(crate::notification::NotificationService::new(
+            notif_stg,
+            extra_channels,
+            website_mail,
+            Some(config_handle.clone()),
+            notification_enabled,
+            default_delivery_mode,
+        ));
+        crate::notification::NotificationService::set_active(Some(Arc::clone(&service)));
+        let sd = notification_shutdown.clone();
+        tokio::spawn(async move {
+            service.start(sd).await;
+        });
 
         storage.mono_service.init_monorepo(&config.monorepo).await?;
 

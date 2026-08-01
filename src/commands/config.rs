@@ -24,8 +24,6 @@ use crate::{
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface, with_audit_caller},
 };
 
-const MAIL_PASSWORD_FIELD: &str = "mail.password";
-
 /// Config-managed secret fields that may be stored in the monoengine vault, with
 /// the vault namespace suffix each must use (`config/<profile>/<suffix>`). Only
 /// these fields are accepted by `config secret set/check/rotate/ref`. Database
@@ -34,7 +32,6 @@ const MAIL_PASSWORD_FIELD: &str = "mail.password";
 /// object-storage S3 credentials may now be vault-backed and are resolved
 /// post-vault bootstrap.
 const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
-    (MAIL_PASSWORD_FIELD, "mail/password"),
     (
         "notification.slack.webhook_url",
         "notification/slack/webhook_url",
@@ -282,7 +279,7 @@ fn secret_name_arg() -> Arg {
         .value_name("CONFIG_FIELD")
         .required(true)
         .help(
-            "Supported config secret field: mail.password, redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
+            "Supported config secret field: redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
         )
 }
 
@@ -352,10 +349,6 @@ fn exec_init(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
 
     println!("created {}", output_path.display());
     println!("next steps:");
-    println!(
-        "  printf '%s' \"$SMTP_PASSWORD\" | monoengine --config {} config secret set mail.password --vault-path config/prod/mail/password --field value --value-stdin",
-        output_path.display()
-    );
     println!(
         "  printf '%s' \"$S3_ACCESS_KEY\" | monoengine --config {} config secret set object_storage.s3.access_key_id --vault-path config/prod/object_storage/access_key_id --field value --value-stdin",
         output_path.display()
@@ -604,8 +597,6 @@ async fn exec_secret(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             .await?;
 
             println!("rotated {}", secret_ref.as_uri());
-            // The mailer resolves mail.password_ref once at AppContext startup, so a
-            // running service keeps using the previous value until it is restarted.
             println!(
                 "note: restart running services that consume this secret so they re-resolve it; new resolves and `config validate --resolve-secrets` use the rotated value immediately"
             );
@@ -663,10 +654,6 @@ async fn validate_config(
         )));
     }
 
-    if let Some(mail_cfg) = &config.mail {
-        mail_cfg.warn_plaintext_password_deprecated();
-    }
-
     if resolve_secrets {
         let vault = bootstrap_vault(config).await?;
         let resolver = VaultSecretResolver::new(vault, Duration::ZERO);
@@ -713,12 +700,6 @@ async fn resolve_config_secrets<R>(config: &Config, resolver: &R) -> Result<(), 
 where
     R: SecretResolver + ?Sized,
 {
-    if let Some(mail_cfg) = &config.mail
-        && let Some(secret_ref) = &mail_cfg.password_ref
-    {
-        with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
-    }
-
     if let Some(notification_cfg) = &config.notification {
         if let Some(slack) = &notification_cfg.slack
             && slack.enabled
@@ -842,56 +823,13 @@ mod tests {
     use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config};
 
     use super::*;
-    use crate::config::{
-        MailConfig,
-        testing::{TestSecretResolver, env_lock, isolated_config},
-        validate::collect_source_diagnostics_from_keys,
-    };
-
-    #[test]
-    fn config_secret_ref_uses_no_config_load_mode() {
-        let matches = cli()
-            .try_get_matches_from([
-                "config",
-                "secret",
-                "ref",
-                "mail.password",
-                "--vault-path",
-                "config/prod/mail/password",
-            ])
-            .unwrap();
-        let Some(("secret", _)) = matches.subcommand() else {
-            panic!("secret subcommand should parse");
-        };
-
-        assert_eq!(load_mode(&matches), LoadMode::None);
-    }
+    use crate::config::testing::{TestSecretResolver, env_lock, isolated_config};
 
     #[test]
     fn config_init_uses_no_config_load_mode() {
         let matches = cli().try_get_matches_from(["config", "init"]).unwrap();
 
         assert_eq!(load_mode(&matches), LoadMode::None);
-    }
-
-    #[test]
-    fn config_secret_rotate_uses_vault_bootstrap_load_mode() {
-        let matches = cli()
-            .try_get_matches_from([
-                "config",
-                "secret",
-                "rotate",
-                "mail.password",
-                "--vault-path",
-                "config/prod/mail/password",
-                "--value-stdin",
-            ])
-            .unwrap();
-        let Some(("secret", _)) = matches.subcommand() else {
-            panic!("secret subcommand should parse");
-        };
-
-        assert_eq!(load_mode(&matches), LoadMode::VaultBootstrap);
     }
 
     #[test]
@@ -1071,7 +1009,6 @@ mod tests {
         assert!(!content.contains("postgres://mega:mega@"));
         assert!(!content.contains("postgres://postgres:postgres@"));
         assert!(!content.contains("password = "));
-        assert!(content.contains("password_ref = "));
 
         let err = write_init_config(&config_path, false).expect_err("existing file should fail");
         assert!(err.to_string().contains("--force"));
@@ -1122,7 +1059,7 @@ mod tests {
                 "ref",
                 "notification.webhook.token",
                 "--vault-path",
-                "config/prod/mail/password",
+                "config/prod/other/path",
             ])
             .unwrap();
 
@@ -1130,27 +1067,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("notification.webhook.token"));
         assert!(message.contains("notification/webhook/token"));
-        assert!(!message.contains("config/prod/mail/password"));
-    }
-
-    #[test]
-    fn secret_ref_from_args_rejects_wrong_mail_namespace_without_leaking_path() {
-        let matches = secret_ref_cli()
-            .try_get_matches_from([
-                "ref",
-                "mail.password",
-                "--vault-path",
-                "config/prod/database/password",
-            ])
-            .unwrap();
-
-        let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
-        let message = err.to_string();
-
-        assert!(message.contains("mail.password"));
-        assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
-        assert!(message.contains("value is redacted"));
-        assert!(!message.contains("config/prod/database/password"));
+        assert!(!message.contains("config/prod/other/path"));
     }
 
     #[test]
@@ -1166,19 +1083,14 @@ mod tests {
     #[test]
     fn secret_ref_from_args_rejects_redis_url_outside_namespace() {
         let matches = secret_ref_cli()
-            .try_get_matches_from([
-                "ref",
-                "redis.url",
-                "--vault-path",
-                "config/prod/mail/password",
-            ])
+            .try_get_matches_from(["ref", "redis.url", "--vault-path", "config/prod/other/path"])
             .unwrap();
 
         let err = secret_ref_from_args(&matches).expect_err("wrong namespace");
         let message = err.to_string();
         assert!(message.contains("redis.url"));
         assert!(message.contains("redis/url"));
-        assert!(!message.contains("config/prod/mail/password"));
+        assert!(!message.contains("config/prod/other/path"));
     }
 
     #[test]
@@ -1207,7 +1119,7 @@ mod tests {
                 "ref",
                 "object_storage.s3.secret_access_key",
                 "--vault-path",
-                "config/prod/mail/password",
+                "config/prod/other/path",
             ])
             .unwrap();
 
@@ -1215,69 +1127,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("object_storage.s3.secret_access_key"));
         assert!(message.contains("object_storage/secret_access_key"));
-        assert!(!message.contains("config/prod/mail/password"));
-    }
-
-    #[test]
-    fn config_secret_check_ref_rejects_wrong_mail_namespace_without_leaking_ref() {
-        let matches = cli()
-            .try_get_matches_from([
-                "config",
-                "secret",
-                "check",
-                "mail.password",
-                "--ref",
-                "vault://secret/config/prod/database/password#value",
-            ])
-            .unwrap();
-        let Some(("secret", secret_args)) = matches.subcommand() else {
-            panic!("secret subcommand should parse");
-        };
-        let Some(("check", check_args)) = secret_args.subcommand() else {
-            panic!("secret check subcommand should parse");
-        };
-        let name = check_args
-            .get_one::<String>("name")
-            .expect("required by clap");
-        let secret_ref = check_args
-            .get_one::<String>("ref")
-            .map(SecretRef::parse)
-            .expect("--ref should exist")
-            .expect("SecretRef should parse");
-
-        let err = validate_secret_field_ref(name, &secret_ref).expect_err("wrong namespace");
-        let message = err.to_string();
-
-        assert!(message.contains("mail.password"));
-        assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
-        assert!(message.contains("value is redacted"));
-        assert!(!message.contains("config/prod/database/password"));
-        assert!(!message.contains("#value"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn validate_rejects_mail_password_and_password_ref_together() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let mut config = isolated_config(temp_dir.path().join("base"));
-        config.mail = Some(MailConfig {
-            enabled: false,
-            provider: crate::config::MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: None,
-            password: Some(crate::config::secret::SecretString::new("plain")),
-            password_ref: Some(
-                SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
-            ),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        });
-
-        let err = validate_config(&config, None, None, false, false, false)
-            .await
-            .expect_err("mutual exclusion should fail");
-        assert!(err.to_string().contains("mutually exclusive"));
+        assert!(!message.contains("config/prod/other/path"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1287,7 +1137,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"
-            [mail]
+            [obsolete]
             smtp_tls = false
             "#,
         )
@@ -1307,14 +1157,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn validate_config_denies_deprecated_mail_password_source_without_leaking_value() {
+    async fn validate_config_rejects_obsolete_section_source() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
         fs::write(
             &config_path,
             format!(
                 r#"
-            [mail]
+            [obsolete]
             {} = "plain-text-password"
             "#,
                 "password"
@@ -1325,149 +1175,11 @@ mod tests {
 
         let err = validate_config(&config, Some(&config_path), None, false, true, false)
             .await
-            .expect_err("deprecated mail password should fail under deny warnings");
+            .expect_err("obsolete section should fail under deny warnings");
         let message = err.to_string();
 
         assert!(message.contains("source diagnostics produced"));
         assert!(!message.contains("plain-text-password"));
-    }
-
-    #[test]
-    fn show_sources_lines_include_source_warnings_without_values() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
-        let profile_path = temp_dir.path().join("config.prod.toml");
-        fs::write(
-            &config_path,
-            r#"
-            [log]
-            level = "info"
-
-            [database]
-            db_url = "postgres://localhost:5432/base"
-
-            [monorepo]
-            root_dirs = ["base-root"]
-            "#,
-        )
-        .expect("write config source");
-        fs::write(
-            &profile_path,
-            format!(
-                r#"
-            [log]
-            level = "debug"
-
-            [monorepo]
-            root_dirs = ["profile-root"]
-
-            [mail]
-            {} = "plain-text-password"
-            "#,
-                "password"
-            ),
-        )
-        .expect("write profile source");
-
-        let diagnostics = collect_source_diagnostics_from_keys(
-            Some(&config_path),
-            Some(&profile_path),
-            [
-                "MEGA_DATABASE__DB_URL",
-                "MEGA_MAIL__PASSWORD",
-                "MEGA_UNKNOWN__VALUE",
-            ],
-        )
-        .expect("diagnostics should collect");
-        let output = source_diagnostic_lines(&diagnostics).join("\n");
-
-        assert!(output.contains("source warning: file"));
-        assert!(output.contains(&profile_path.display().to_string()));
-        assert!(output.contains("mail.password"));
-        assert!(output.contains("mail.password_ref"));
-        assert!(output.contains("source warning: environment variable MEGA_MAIL__PASSWORD"));
-        assert!(output.contains("source warning: environment variable MEGA_UNKNOWN__VALUE"));
-        assert!(output.contains("source field:"));
-        assert!(output.contains("source override:"));
-        assert!(output.contains("suggested fix"));
-        assert!(output.contains("values are omitted"));
-        assert!(output.contains("sensitive values are omitted"));
-        assert!(output.contains("deployment/environment secrets"));
-        assert!(output.contains("arrays replace lower-precedence values rather than append"));
-        assert!(output.contains("unset MEGA_MAIL__PASSWORD"));
-        assert!(!output.contains("plain-text-password"));
-        assert!(!output.contains("postgres://localhost"));
-        assert!(!output.contains("debug"));
-        assert!(!output.contains("info"));
-        assert!(!output.contains("base-root"));
-        assert!(!output.contains("profile-root"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn resolve_config_secrets_reports_missing_mail_password_ref_without_leaking_ref() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let secret_ref =
-            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
-        let mut config = isolated_config(temp_dir.path().join("base"));
-        config.mail = Some(MailConfig {
-            enabled: false,
-            provider: crate::config::MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: None,
-            password: None,
-            password_ref: Some(secret_ref),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        });
-        let resolver = TestSecretResolver::new();
-
-        let err = resolve_config_secrets(&config, &resolver)
-            .await
-            .expect_err("missing SecretRef should fail");
-        let message = err.to_string();
-
-        assert!(message.contains("test secret not found"));
-        assert!(message.contains("vault://secret/***#***"));
-        assert!(!message.contains("config/test/mail/password"));
-        assert!(!message.contains("#value"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn resolve_config_secrets_reports_permission_denied_without_leaking_ref() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let secret_ref =
-            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
-        let mut config = isolated_config(temp_dir.path().join("base"));
-        config.mail = Some(MailConfig {
-            enabled: false,
-            provider: crate::config::MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: None,
-            password: None,
-            password_ref: Some(secret_ref.clone()),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        });
-        let resolver = TestSecretResolver::new()
-            .with_secret(&secret_ref, "smtp-test-value")
-            .expect("secret should insert")
-            .with_denied_secret(&secret_ref)
-            .expect("secret should be denied");
-
-        let err = resolve_config_secrets(&config, &resolver)
-            .await
-            .expect_err("denied SecretRef should fail");
-        let message = err.to_string();
-
-        assert!(message.contains("test secret access denied"));
-        assert!(message.contains("vault://secret/***#***"));
-        assert!(!message.contains("config/test/mail/password"));
-        assert!(!message.contains("#value"));
-        assert!(!message.contains("smtp-test-value"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

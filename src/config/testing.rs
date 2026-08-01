@@ -14,8 +14,7 @@ use orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig}
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuildConfig, Config, DbConfig, GitConfig, LFSConfig,
-    LFSLocalConfig, LFSSshConfig, LogConfig, MailConfig, MonoConfig, PackConfig, RedisConfig,
-    SidebarConfig,
+    LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, PackConfig, RedisConfig, SidebarConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -25,7 +24,6 @@ pub const DEFAULT_TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";
 
 const ENV_DATABASE_URL: &str = "MEGA_DATABASE__DB_URL";
 const ENV_REDIS_URL: &str = "MEGA_REDIS__URL";
-const ENV_MAIL_PASSWORD_REF: &str = "MEGA_MAIL__PASSWORD_REF";
 
 #[cfg(test)]
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -107,7 +105,6 @@ pub struct TestConfigBuilder {
     base_dir: PathBuf,
     database_url: String,
     redis_url: String,
-    mail_password_ref: Option<SecretRef>,
 }
 
 impl TestConfigBuilder {
@@ -116,7 +113,6 @@ impl TestConfigBuilder {
             base_dir: base_dir.into(),
             database_url: DEFAULT_TEST_DATABASE_URL.to_string(),
             redis_url: DEFAULT_TEST_REDIS_URL.to_string(),
-            mail_password_ref: None,
         }
     }
 
@@ -127,11 +123,6 @@ impl TestConfigBuilder {
 
     pub fn redis_url(mut self, redis_url: impl Into<String>) -> Self {
         self.redis_url = redis_url.into();
-        self
-    }
-
-    pub fn mail_password_ref(mut self, secret_ref: SecretRef) -> Self {
-        self.mail_password_ref = Some(secret_ref);
         self
     }
 
@@ -149,9 +140,6 @@ impl TestConfigBuilder {
             match key.as_ref() {
                 ENV_DATABASE_URL => self.database_url = value.as_ref().to_string(),
                 ENV_REDIS_URL => self.redis_url = value.as_ref().to_string(),
-                ENV_MAIL_PASSWORD_REF => {
-                    self.mail_password_ref = Some(SecretRef::parse(value.as_ref())?);
-                }
                 _ => {}
             }
         }
@@ -208,22 +196,9 @@ impl TestConfigBuilder {
             orion_server: None,
             sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
-            mail: self.mail_password_ref.map(|password_ref| MailConfig {
-                enabled: false,
-                provider: crate::config::MailProvider::Smtp,
-                smtp_host: "smtp.example.com".to_string(),
-                smtp_port: 587,
-                username: Some("monoengine@example.com".to_string()),
-                password: None,
-                password_ref: Some(password_ref),
-                from: "no-reply@example.com".to_string(),
-                starttls: true,
-                ..Default::default()
-            }),
             notification: None,
             vault: None,
             oauth: None,
-            chat: None,
             git: GitConfig::default(),
         }
     }
@@ -347,38 +322,6 @@ mod tests {
             base_dir.join("objects").to_string_lossy()
         );
         config.validate().expect("test config should validate");
-    }
-
-    #[test]
-    fn test_config_builder_applies_env_style_overrides() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let secret_ref = "vault://secret/config/test/mail/password#value";
-
-        let config = TestConfigBuilder::new(temp_dir.path())
-            .try_apply_env_overrides_from([
-                (ENV_DATABASE_URL, "postgres://127.0.0.1:15432/test_config"),
-                (ENV_REDIS_URL, "redis://127.0.0.1:16379"),
-                (ENV_MAIL_PASSWORD_REF, secret_ref),
-            ])
-            .expect("env overrides should parse")
-            .build();
-
-        assert_eq!(
-            config.database.db_url,
-            "postgres://127.0.0.1:15432/test_config"
-        );
-        assert_eq!(config.redis.url, "redis://127.0.0.1:16379");
-        assert_eq!(
-            config
-                .mail
-                .as_ref()
-                .and_then(|mail| mail.password_ref.as_ref())
-                .map(SecretRef::as_uri),
-            Some(secret_ref)
-        );
-        config
-            .validate()
-            .expect("overridden config should validate");
     }
 
     #[tokio::test]

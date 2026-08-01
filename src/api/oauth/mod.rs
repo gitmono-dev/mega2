@@ -15,20 +15,19 @@ use axum_extra::{
     TypedHeader,
     headers::{Authorization, authorization::Bearer},
 };
-use http::request::Parts;
+use http::{header::COOKIE, request::Parts};
 use model::LoginUser;
 
 use crate::{
-    api::MonoApiServiceState,
+    api::{MonoApiServiceState, oauth::api_store::BrowserSessionStore},
     callisto::{bot_tokens, bots},
     common::errors::MegaError,
     jupiter::storage::user_storage::UserStorage,
 };
 
 pub mod api_store;
-pub mod campsite_store;
 pub mod model;
-pub mod tinyship_store;
+pub mod website_session_store;
 
 pub struct AuthRedirect;
 
@@ -45,11 +44,11 @@ pub struct BotIdentity {
 
 pub struct AccessTokenUser(pub LoginUser);
 
-/// Authenticated user resolved from a **browser session cookie** (Campsite or Tinyship),
-/// not from `Authorization: Bearer` or the Mono DB access-token table.
+/// Authenticated user resolved from a website browser-session cookie, not from
+/// `Authorization: Bearer` or the Mono DB access-token table.
 ///
-/// The Axum extractor reads the HTTP `Cookie` header, takes the value named by
-/// [`OAuthApiStore::session_cookie_name`], and loads the user via [`OAuthApiStore::load_user_from_api`].
+/// The Axum extractor reads the HTTP `Cookie` header and delegates matching
+/// configured Better Auth cookie names to [`BrowserSessionStore`].
 /// For API clients that send a Mono access token in `Authorization`, use [`AccessTokenUser`] instead.
 pub struct SessionUser(pub LoginUser);
 
@@ -158,19 +157,27 @@ where
 
 impl<S> FromRequestParts<S> for SessionUser
 where
+    BrowserSessionStore: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = AuthRedirect;
 
     /// Reads the session cookie from the request and resolves [`LoginUser`].
-    /// In no-auth mode, this returns a mock administrator user.
-    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(SessionUser(LoginUser {
-            campsite_user_id: "admin".to_string(),
-            username: "admin".to_string(),
-            avatar_url: "".to_string(),
-            email: "admin@gitmono.test".to_string(),
-        }))
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let session_store = BrowserSessionStore::from_ref(state);
+        let cookie_header = parts
+            .headers
+            .get(COOKIE)
+            .and_then(|value| value.to_str().ok());
+
+        match session_store.load_user(cookie_header).await {
+            Ok(Some(user)) => Ok(Self(user)),
+            Ok(None) => Err(AuthRedirect),
+            Err(error) => {
+                tracing::warn!("SessionUser: website session lookup failed: {error}");
+                Err(AuthRedirect)
+            }
+        }
     }
 }
 
@@ -178,6 +185,7 @@ where
 // Use `AccessTokenUser` explicitly where bearer token auth is required.
 impl<S> FromRequestParts<S> for LoginUser
 where
+    BrowserSessionStore: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = AuthRedirect;
@@ -185,5 +193,51 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let SessionUser(user) = SessionUser::from_request_parts(parts, state).await?;
         Ok(user)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    use super::{
+        SessionUser,
+        api_store::{BrowserSessionStore, FixedUserSessionStore},
+        model::LoginUser,
+    };
+
+    async fn current_username(SessionUser(user): SessionUser) -> String {
+        user.username
+    }
+
+    #[tokio::test]
+    async fn fixed_user_session_is_visible_to_handler() {
+        let app = Router::new()
+            .route("/me", get(current_username))
+            .with_state(BrowserSessionStore::Fixed(FixedUserSessionStore {
+                user: LoginUser {
+                    website_user_id: "website-user-1".to_string(),
+                    username: "fixed-session-user".to_string(),
+                    avatar_url: String::new(),
+                    email: "fixed-session@example.com".to_string(),
+                },
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "fixed-session-user"
+        );
     }
 }

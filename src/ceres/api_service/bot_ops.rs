@@ -7,7 +7,7 @@ use crate::{
 };
 
 impl MonoApiService {
-    /// Check whether a bot has sufficient permission on a given resource.
+    /// Check whether a bot has sufficient permission.
     ///
     /// The decision is based on:
     /// - Bot status (must be enabled).
@@ -15,12 +15,10 @@ impl MonoApiService {
     /// - The bot-level `permission_scope` compared against `required_permission`.
     ///
     /// Installation scope is currently checked in an aggregated way (any enabled installation
-    /// is sufficient) and can be refined later to be resource-type aware.
+    /// is sufficient).
     pub async fn check_bot_permission(
         &self,
         bot_id: i64,
-        _resource_type: crate::callisto::sea_orm_active_enums::ResourceTypeEnum,
-        _resource_id: &str,
         required_permission: PermissionEnum,
     ) -> Result<bool, MegaError> {
         let bots_storage = self.storage.bots_storage();

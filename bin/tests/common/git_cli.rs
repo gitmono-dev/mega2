@@ -48,7 +48,7 @@ pub fn docker_compose_file() -> PathBuf {
 
 pub fn git_cli_workdir() -> PathBuf {
     // Integration harness target OS is Linux; default matches compose
-    // `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}`. Relative values
+    // `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}`. Relative values
     // are resolved against the repo root (compose file directory), not Cargo's
     // `bin/` CWD, so host paths stay aligned with the bind mount.
     match env::var("MONOENGINE_IT_GIT_WORKDIR") {
@@ -60,7 +60,7 @@ pub fn git_cli_workdir() -> PathBuf {
                 repo_root().join(path)
             }
         }
-        Err(_) => PathBuf::from("/tmp/monoengine-it-git"),
+        Err(_) => PathBuf::from("/tmp/monoengine-git"),
     }
 }
 
