@@ -72,23 +72,26 @@ jobs:
 
       - name: Validate website checkout token
         env:
-          WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN }}
+          # Prefer a dedicated website token; fall back to ORBIT_CHECKOUT_TOKEN
+          # when it can read the private website sibling (same as local ../website).
+          WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
         run: |
           if [ -z "${WEBSITE_CHECKOUT_TOKEN}" ]; then
-            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/website sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN with read-only contents access to gitmono-dev/website."
+            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private genedna/website sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to genedna/website."
             exit 1
           fi
 
       - name: Checkout website sibling
         uses: actions/checkout@v5
         with:
-          repository: gitmono-dev/website
+          # Local sibling is ../website → github.com/genedna/website (private).
+          repository: genedna/website
           # Track branch until the Dockerfile drizzle.config.sqlite.ts COPY lands
           # on website; then pin this ref and docs/refactoring/website-auth.md to
           # the same commit SHA (see website-auth.md pin policy).
           ref: monoengine
           path: website
-          token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN }}
+          token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
 
       - name: Guard website Dockerfile supports IT SQLite init
         run: |
