@@ -5,13 +5,13 @@
 邮件投递迁出见计划 ADR-WA-08 / 任务 MN-01，事实源为
 [`website-mail.md`](./website-mail.md)。
 
-核对日：**2026-08-01**。Website 仓库 sibling：`../website`，分支 **`monoengine`**，
-会话契约基线 revision：**`afcd69a`**。IT SQLite 初始化额外要求 website
+核对日：**2026-08-01**。Website 仓库 sibling：`../website`（`genedna/website`），分支 **`monoengine`**，
+会话契约基线 revision：**`9afef8f`**（含 Dockerfile `drizzle.config.sqlite.ts` COPY 与
+`next.config.ts` 运行时 `SQLITE_DB_PATH`）。IT SQLite 初始化要求 website
 `apps/next-app/Dockerfile` 在 builder 阶段复制根目录 `drizzle.config.sqlite.ts`，
 且 `next.config.ts` 保持 `SQLITE_DB_PATH` 为运行时可配置（不得在 build 时内联成
-固定路径）。该 Dockerfile/config delta 合入 website `monoengine` 后，须把本文 pin
-与 CI `actions/checkout` `ref` 同步到**同一 commit SHA**；合入前 CI 跟踪分支
-`monoengine`，并用 Dockerfile 内容守卫（缺 `drizzle.config.sqlite.ts` COPY 则失败）。
+固定路径）。CI `actions/checkout` `ref` 与本文 pin 须同步到**同一 commit SHA**；
+Dockerfile 内容守卫（缺 `drizzle.config.sqlite.ts` COPY 则失败）保留为回归保护。
 契约漂移时先改本文再改代码。
 
 ---

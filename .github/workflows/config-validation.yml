@@ -86,10 +86,9 @@ jobs:
         with:
           # Local sibling is ../website → github.com/genedna/website (private).
           repository: genedna/website
-          # Track branch until the Dockerfile drizzle.config.sqlite.ts COPY lands
-          # on website; then pin this ref and docs/refactoring/website-auth.md to
-          # the same commit SHA (see website-auth.md pin policy).
-          ref: monoengine
+          # Pin to the same revision as docs/refactoring/website-auth.md
+          # (Dockerfile copies drizzle.config.sqlite.ts; SQLITE_DB_PATH stays runtime).
+          ref: 9afef8f36ec9d26d18bb968d89c8a7ebaebae2e1
           path: website
           token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
 
