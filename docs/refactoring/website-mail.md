@@ -241,7 +241,9 @@ available in this checkout.
 
 **客户端 vs 契约：** `WebsiteMailClient`（`src/notification/website_mail.rs`）路径、Bearer、`Idempotency-Key`、JSON 字段与上文一致；**无已知冲突**，不阻断 WE-02。
 
-**website `@libs/email` 现状（与 GAP-02/03 一致）：** 仅 `verification` / `resetPassword` 模板；`smtp` provider 仍为未实现 stub（`libs/email/email-sender.ts`）；**无** `apps/next-app/app/api/internal/notifications/email/route.ts`。
+**website `@libs/email` 现状：** 产品五事件模板已由 plan-20260802 WE-03 落地；`smtp` provider 仍为 stub（WE-05）；内部路由已存在。
+
+**幂等存储介质（plan-20260802 / WE-04）：** website 进程内 `MemoryIdempotencyStore`（`(Idempotency-Key) → {delivery_id, fingerprint, state}`）；无 SQLite 表。多实例共享见 `DEFER-WE-01`。
 
 ---
 
