@@ -88,7 +88,7 @@ jobs:
           repository: genedna/website
           # Pin to the same revision as docs/refactoring/website-auth.md
           # (Dockerfile copies drizzle.config.sqlite.ts; SQLITE_DB_PATH stays runtime).
-          ref: 9afef8f36ec9d26d18bb968d89c8a7ebaebae2e1
+          ref: a52d70362586ae5e171be5db2e5c5457d07ce366
           path: website
           token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
 
@@ -371,10 +371,12 @@ jobs:
           # ITW-03: a real Better Auth sign-up/sign-in cookie must identify the
           # same user through the compose-hosted monoengine session bridge.
           cargo test -p monoengine --test integration_website_auth -- --test-threads=1
+          # WE-06: website internal product-email API (bearer + allowlisted event).
+          cargo test -p monoengine --test integration_website_mail -- --test-threads=1
           # Linux-only git-cli HTTP round-trip / auth / failpath harness (IT-03/10/12).
           cargo test -p monoengine --test integration_git_cli -- --test-threads=1
-          # Product-email delivery is owned and tested by website. Monoengine's
-          # notification paths are covered without a local SMTP dependency.
+          # Product-email delivery is owned by website (test provider in compose).
+          # Monoengine proves acceptance via integration_website_mail above.
 
       - name: Stop test services
         if: always()

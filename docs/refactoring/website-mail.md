@@ -235,9 +235,9 @@ available in this checkout.
 | 成功响应 | `202` + `{ delivery_id, accepted, duplicate }` |
 | 错误 `code` | `invalid_request` / `unauthorized` / `forbidden` / `idempotency_conflict` / `unsupported_event` / `invalid_payload` / `rate_limited` / `upstream_unavailable`（见 §2.2） |
 | 产品 `event_type` allowlist | `cl.comment.created`、`cl.merged`、`issue.comment.created`、`issue.closed`、`item.referenced`（`src/notification/triggers.rs`） |
-| CI website pin（`config-validation.yml` checkout） | `9afef8f36ec9d26d18bb968d89c8a7ebaebae2e1` |
+| CI website pin（`config-validation.yml` checkout） | `a52d70362586ae5e171be5db2e5c5457d07ce366` |
 | website 工作分支 | `monoengine` |
-| 建议开发基线 tip（2026-08-02） | `9afef8f36ec9d26d18bb968d89c8a7ebaebae2e1`（与 CI pin 相同） |
+| 建议开发基线 tip（2026-08-02） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（与 CI pin 相同；含内部邮件 API WE-02..WE-05） |
 
 **客户端 vs 契约：** `WebsiteMailClient`（`src/notification/website_mail.rs`）路径、Bearer、`Idempotency-Key`、JSON 字段与上文一致；**无已知冲突**，不阻断 WE-02。
 

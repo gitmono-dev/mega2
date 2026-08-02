@@ -205,8 +205,9 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d -
 | profiles | 两服务均为 `profiles: ["web"]`，不参与默认 `up -d --wait`；显式启动：`docker compose -p monoengine-it -f docker-compose.test.yml --profile web up -d --wait website-next` |
 | depends_on / 会话联调顺序 | `website-next` → `website-db-init`，`condition: service_completed_successfully`；初始化失败时 Next 不会启动。没有 `monoengine` 跨 profile 依赖：`website-next` 是 `web` profile、`monoengine` 是 `app` profile，避免 app-only smoke 被 web 拉起。可联合运行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait`，此时 Compose 先完成 schema 初始化，再等待两个常驻服务 healthy |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile web down -v`；删除 `website-next-data` 后 SQLite 账户状态不保留，零残留仍按 compose project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../website`（`genedna/website` @ `9afef8f`；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `cargo test -p monoengine --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫保留为回归保护。 |
-| secret | `BETTER_AUTH_SECRET` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
+| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../website`（`genedna/website` @ `a52d703`；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫保留为回归保护。 |
+| secret | `BETTER_AUTH_SECRET` 与 `MONOENGINE_INTERNAL_MAIL_BEARER` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
+| 邮件 env（WE-06） | `EMAIL_PROVIDER=test`（内存记录，无云调用）、`EMAIL_DEFAULT_FROM`、`MONOENGINE_INTERNAL_MAIL_BEARER`、可选 `MONOENGINE_PUBLIC_BASE_URL`；默认不依赖 `mailpit`（smtp 捕获仍可选） |
 | 性能 | 首次 source build 预算 ≤ 20 分钟；默认 profile 不构建、不启动该服务 |
 
 对照锚点：`docker-compose.test.yml` 的 `website-db-init` / `website-next` 服务块；拓扑语义见
@@ -227,8 +228,15 @@ source .env.test
 WEBSITE_IT=1 cargo test -p monoengine --test integration_website_auth -- --test-threads=1 --nocapture
 ```
 
+栈级内部产品邮件黑盒（WE-06）：
+
+```bash
+source .env.test
+WEBSITE_IT=1 cargo test -p monoengine --test integration_website_mail -- --test-threads=1 --nocapture
+```
+
 未设置 `WEBSITE_IT=1` 时该 target 会明确输出 `SKIP`，供默认数据面循环使用；设置后，
-`website-next:17001` 或 `monoengine:19180` 不可达即测试失败，因此 CI 不会将跳过误记为通过。
+`website-next:17001` 不可达即测试失败，因此 CI 不会将跳过误记为通过。
 
 ## 强制纪律
 

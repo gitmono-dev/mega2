@@ -5,9 +5,9 @@
 邮件投递迁出见计划 ADR-WA-08 / 任务 MN-01，事实源为
 [`website-mail.md`](./website-mail.md)。
 
-核对日：**2026-08-01**。Website 仓库 sibling：`../website`（`genedna/website`），分支 **`monoengine`**，
-会话契约基线 revision：**`9afef8f`**（含 Dockerfile `drizzle.config.sqlite.ts` COPY 与
-`next.config.ts` 运行时 `SQLITE_DB_PATH`）。IT SQLite 初始化要求 website
+核对日：**2026-08-02**。Website 仓库 sibling：`../website`（`genedna/website`），分支 **`monoengine`**，
+会话契约基线 revision：**`a52d703`**（含 Dockerfile `drizzle.config.sqlite.ts` COPY、
+`next.config.ts` 运行时 `SQLITE_DB_PATH`，以及内部产品邮件 API WE-02..WE-05）。IT SQLite 初始化要求 website
 `apps/next-app/Dockerfile` 在 builder 阶段复制根目录 `drizzle.config.sqlite.ts`，
 且 `next.config.ts` 保持 `SQLITE_DB_PATH` 为运行时可配置（不得在 build 时内联成
 固定路径）。CI `actions/checkout` `ref` 与本文 pin 须同步到**同一 commit SHA**；

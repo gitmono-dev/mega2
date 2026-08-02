@@ -197,6 +197,11 @@ services:
       # Consumed by DEP-06's internal notification route. This public value is
       # only for the isolated Compose integration stack.
       MONOENGINE_INTERNAL_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
+      # WE-05/WE-06: IT product mail uses the in-memory test provider (no cloud).
+      EMAIL_PROVIDER: test
+      EMAIL_DEFAULT_FROM: noreply@monoengine-it.test
+      # Optional CTA base for product templates (not TinyShip APP_BASE_URL).
+      MONOENGINE_PUBLIC_BASE_URL: http://127.0.0.1:19180
     depends_on:
       website-db-init:
         condition: service_completed_successfully
