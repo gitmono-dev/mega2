@@ -116,9 +116,7 @@ fn sample_body() -> Value {
 
 fn website_it_mail_is_requested_and_available() -> bool {
     if std::env::var("WEBSITE_IT").as_deref() != Ok("1") {
-        eprintln!(
-            "SKIP: integration_website_mail requires WEBSITE_IT=1 and compose profile web"
-        );
+        eprintln!("SKIP: integration_website_mail requires WEBSITE_IT=1 and compose profile web");
         return false;
     }
     assert!(
