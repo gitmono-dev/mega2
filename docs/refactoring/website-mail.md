@@ -222,6 +222,27 @@ they all use `deliver_user_notification`. The local wire mock verifies the
 request and the concurrent in-app write while DEP-06's website API is not yet
 available in this checkout.
 
+### 实现基线（plan-20260802 / WE-01）
+
+核对日：**2026-08-02**。本短节冻结 `plan-20260802.md` 执行用契约与 pin，不宣称 website API 已实现。
+
+| 冻结项 | 取值 |
+|---|---|
+| 方法与路径 | `POST /api/internal/notifications/email` |
+| 鉴权 | `Authorization: Bearer <shared-internal-bearer>`（website env：`MONOENGINE_INTERNAL_MAIL_BEARER`；monoengine IT：`MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER`） |
+| 幂等头 | 必填 `Idempotency-Key` |
+| 请求 JSON 字段 | `event_type`、`recipient.username`、`recipient.email`、`locale`、`payload`（见上文 §2.1） |
+| 成功响应 | `202` + `{ delivery_id, accepted, duplicate }` |
+| 错误 `code` | `invalid_request` / `unauthorized` / `forbidden` / `idempotency_conflict` / `unsupported_event` / `invalid_payload` / `rate_limited` / `upstream_unavailable`（见 §2.2） |
+| 产品 `event_type` allowlist | `cl.comment.created`、`cl.merged`、`issue.comment.created`、`issue.closed`、`item.referenced`（`src/notification/triggers.rs`） |
+| CI website pin（`config-validation.yml` checkout） | `9afef8f36ec9d26d18bb968d89c8a7ebaebae2e1` |
+| website 工作分支 | `monoengine` |
+| 建议开发基线 tip（2026-08-02） | `9afef8f36ec9d26d18bb968d89c8a7ebaebae2e1`（与 CI pin 相同） |
+
+**客户端 vs 契约：** `WebsiteMailClient`（`src/notification/website_mail.rs`）路径、Bearer、`Idempotency-Key`、JSON 字段与上文一致；**无已知冲突**，不阻断 WE-02。
+
+**website `@libs/email` 现状（与 GAP-02/03 一致）：** 仅 `verification` / `resetPassword` 模板；`smtp` provider 仍为未实现 stub（`libs/email/email-sender.ts`）；**无** `apps/next-app/app/api/internal/notifications/email/route.ts`。
+
 ---
 
 ## 6. 兼容与安全
