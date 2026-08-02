@@ -107,7 +107,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-06 | Orion Server 构建控制面移植 | P1 | 已验证 | 整体缺失；monoengine 仅保留消费侧 API 面（buck/artifacts/build_trigger router）与 bellatrix 客户端 | `mega/orion-server/`、`mega/mono/src/api` 的 orion_runner_router | 无 | 2026-07-27 |
 | PT-07 | Orion 构建执行 Agent 移植 | P1 | 已验证 | runner（ws 客户端、buck_controller、disk/repo 管理）整体缺失 | `mega/orion/` | 无 | 2026-07-27 |
 | PT-08 | Orion Scheduler、VM 弹性调度与客户端 API 面补齐 | P2 | 已验证 | scheduler 与 orion-scheduler-client 未移植；bellatrix 仅覆盖 build dispatch，完整 OrionBuildClient API 面未核对 | `mega/orion-scheduler/`、`mega/clients/` | 无 | 2026-07-27 |
-| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓邮件投递已移除**，投递归属 website（ADR-WA-08；[`plan-20260731.md`](plan-20260731.md) MN）；compose `mailpit` 消费方 = website IT（与 `test-infra.md` 一致）。剩余：webhook/slack 渠道完善、build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真多进程黑盒矩阵 | `mega/mono/src/notification/`、campsite slack 参考 | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06） | 2026-08-01 |
+| PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓邮件投递已移除**；**website 内部产品邮件 API 已落地**（[`plan-20260802.md`](plan-20260802.md)；tip `a52d703`）。compose `mailpit` 消费方 = website IT。剩余：webhook/slack 渠道完善、build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真多进程黑盒矩阵 | `mega/mono/src/notification/`、campsite slack 参考 | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06）；[`plan-20260802.md`](plan-20260802.md)（WE-* / DEP-06） | 2026-08-02 |
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储/Redis SecretRef（阶段 6 可选项）、热加载消费端扩展、source diagnostics 矩阵缺失；**`[oauth]` 已由 [`plan-20260731.md`](plan-20260731.md) 落地**（website Better Auth 基址 / cookie / CORS） | `mega/common/src/config`（基线对照） | [`plan-20260731.md`](plan-20260731.md)（AU-02；`[oauth]`） | 2026-08-01 |
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | KEK 轮换、审计持久化 sink、root recovery 材料外置、格式版本策略缺失 | `mega/vault/`（基线对照） | 无 | 2026-07-27 |
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已由 [`plan-20260731.md`](plan-20260731.md) 实现；**全量** moon↔`apps/next-app` 功能对照仍候选 | website `monoengine` 分支 `afcd69af` 的 `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW；会话路径） | 2026-08-01 |
@@ -495,13 +495,13 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/mono/src/notification/` 为基线对照；slack 渠道参考 campsite `slack.ts`。
-- **monoengine 现状证据**：`src/notification/` 与 `docs/refactoring/{notification,mail,website-mail,test-infra}.md`；邮件退场与 compose 同步见 [`plan-20260731.md`](plan-20260731.md) MN-01..MN-06。
+- **monoengine 现状证据**：`src/notification/` 与 `docs/refactoring/{notification,mail,website-mail,test-infra}.md`；邮件退场见 [`plan-20260731.md`](plan-20260731.md) MN-01..MN-06；website 内部 API 见 [`plan-20260802.md`](plan-20260802.md)。
 - **最小可验证第一阶段**：webhook 渠道（无外部依赖，fake receiver 可测）。
 - **风险与边界**：build 触发器不得绕过事件面临时硬编码进 PT-06；website 邮件 API 不可达时不得拖死 in-app。
 
 ### 依赖与顺序
 
-webhook/slack 可继续推进；build 完成触发器依赖 PT-05（事件面）与 PT-06（构建事件源）；多实例矩阵的测试栈承载依赖 PT-01；邮件投递契约依赖 website（DEP-06 / `website-mail.md`）。
+webhook/slack 可继续推进；build 完成触发器依赖 PT-05（事件面）与 PT-06（构建事件源）；多实例矩阵的测试栈承载依赖 PT-01；邮件投递契约与 website 内部 API 已由 [`plan-20260802.md`](plan-20260802.md) / `website-mail.md` 关闭 DEP-06。
 
 ---
 

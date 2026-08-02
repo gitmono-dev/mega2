@@ -3,8 +3,8 @@
 本文是 monoengine 产品事件邮件迁至 website 的单一事实源。决议来源：
 [`docs/plan/plan-20260731.md`](../plan/plan-20260731.md) ADR-WA-08 / MN-01。
 
-核对日：**2026-08-01**（CST；UTC 日历日可能仍为 2026-07-31）。本文件定义跨服务契约，**不**实现 website API、monoengine
-客户端或 Compose 改动；分别由 DEP-06、MN-05、MN-06 承接。
+核对日：**2026-08-02**（CST）。本文件定义跨服务契约；website 内部 API 已由
+[`plan-20260802.md`](../plan/plan-20260802.md)（WE-02..WE-05）落地，CI pin 见下文「实现基线」。
 
 ---
 
@@ -203,7 +203,8 @@ docker compose -p monoengine-it -f docker-compose.test.yml \
 
 实施顺序固定为：MN-02 解除 email-primary → MN-03 删除邮件模块/API → MN-04 DROP
 outbox 表 → MN-05 接 website client → MN-06 收口 Compose、环境、CI、测试和文档。
-DEP-06 未就绪时 MN-05/MN-06 为 blocked；不得恢复本仓 SMTP 作为替代路径。
+DEP-06（website 内部邮件 API）已由 [`plan-20260802.md`](../plan/plan-20260802.md) 交付；
+不得恢复本仓 SMTP 作为替代路径。
 
 ### MN-05 implementation note
 
@@ -218,13 +219,13 @@ are logged without the bearer, recipient address, or payload.
 For every enabled `delivery_mode=email` product event, monoengine writes the
 in-app notification first, then POSTs to the website API. This covers the
 existing CL comment/merge, issue comment/close, and reference triggers because
-they all use `deliver_user_notification`. The local wire mock verifies the
-request and the concurrent in-app write while DEP-06's website API is not yet
-available in this checkout.
+they all use `deliver_user_notification`. Local wire mocks and the compose
+stack test (`integration_website_mail`, WEBSITE_IT=1) cover the request shape
+and acceptance against website tip `a52d703` (see 实现基线).
 
-### 实现基线（plan-20260802 / WE-01）
+### 实现基线（plan-20260802）
 
-核对日：**2026-08-02**。本短节冻结 `plan-20260802.md` 执行用契约与 pin，不宣称 website API 已实现。
+核对日：**2026-08-02**。本短节记录契约冻结项与已落地的 website tip / CI pin。
 
 | 冻结项 | 取值 |
 |---|---|
@@ -237,13 +238,24 @@ available in this checkout.
 | 产品 `event_type` allowlist | `cl.comment.created`、`cl.merged`、`issue.comment.created`、`issue.closed`、`item.referenced`（`src/notification/triggers.rs`） |
 | CI website pin（`config-validation.yml` checkout） | `a52d70362586ae5e171be5db2e5c5457d07ce366` |
 | website 工作分支 | `monoengine` |
-| 建议开发基线 tip（2026-08-02） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（与 CI pin 相同；含内部邮件 API WE-02..WE-05） |
+| website tip（REL-WE-SITE） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（含 WE-02..WE-05） |
 
-**客户端 vs 契约：** `WebsiteMailClient`（`src/notification/website_mail.rs`）路径、Bearer、`Idempotency-Key`、JSON 字段与上文一致；**无已知冲突**，不阻断 WE-02。
+客户端与契约：**无已知冲突**（`WebsiteMailClient` 字段与上表一致）。
 
-**website `@libs/email` 现状：** 产品五事件模板已由 plan-20260802 WE-03 落地；`smtp` provider 仍为 stub（WE-05）；内部路由已存在。
+website 实现状态：路由 + Bearer + 五类产品模板 + 幂等 + `EMAIL_PROVIDER=test`/`smtp` 已落地；compose IT 注入 test provider（WE-06）。
+
+**客户端 vs 契约：** `WebsiteMailClient`（`src/notification/website_mail.rs`）路径、Bearer、`Idempotency-Key`、JSON 字段与上文一致；**无已知冲突**。
+
+**website `@libs/email` 现状：** 产品五事件模板、内部路由、幂等、`EMAIL_PROVIDER=test` 与最小 `smtp` 均已落地（plan-20260802 WE-02..WE-05；tip `a52d703`）。
 
 **幂等存储介质（plan-20260802 / WE-04）：** website 进程内 `MemoryIdempotencyStore`（`(Idempotency-Key) → {delivery_id, fingerprint, state}`）；无 SQLite 表。多实例共享见 `DEFER-WE-01`。
+
+### tip 对照（WE-07）
+
+| 仓 | tip / pin | 说明 |
+|---|---|---|
+| website `monoengine` | `a52d70362586ae5e171be5db2e5c5457d07ce366` | REL-WE-SITE；CI checkout 同 SHA |
+| monoengine `main`（WE-06 + REL-WE-SITE 计划收口） | `3b8490c`（含 `3c2b9d1` pin/IT + plan REL-WE-SITE-R2） | compose/`config-validation`/文档 pin 同步 |
 
 ---
 

@@ -9,7 +9,8 @@ longer owns email rendering, queues, SMTP credentials, or SMTP delivery.
 Product events that require email call the website internal notification API.
 The website is the sole owner of templates, delivery providers, retries, and
 SMTP configuration. The contract, authentication, and Compose topology are
-defined in [`website-mail.md`](./website-mail.md).
+defined in [`website-mail.md`](./website-mail.md). Stack IT coverage lives in
+`bin/tests/integration_website_mail.rs` (`WEBSITE_IT=1`).
 
 Consequently, monoengine has no:
 
@@ -35,9 +36,10 @@ forwarded to the website.
 
 ## Testing
 
-Test notification triggers with focused Rust tests and the website-mail client
-mock/IT coverage. Do not add tests that seed `email_jobs`, configure an SMTP
-server, or assert monoengine-to-Mailpit delivery. Mailpit, when started by the
+Test notification triggers with focused Rust tests, the website-mail client
+wire mock, and stack IT (`integration_website_mail` under `WEBSITE_IT=1`). Do
+not add tests that seed `email_jobs`, configure an SMTP server, or assert
+monoengine-to-Mailpit delivery. Mailpit, when started by the
 Compose stack, is exclusively a website authentication/product-email capture
 service.
 

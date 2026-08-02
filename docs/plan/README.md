@@ -20,5 +20,5 @@
 | `plan-template.md` | 模板 | 基线 |
 | `plan-long.md` | 长期能力 | 当前（2026-07-27 首版，Mega → monoengine 完全移植路线图） |
 | `plan-20260727.md` | 日期计划 | 已完成（承接 PT-01 集成测试基建） |
-| `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06（website 内部邮件 API）由 `plan-20260802.md` 承接** |
-| `plan-20260802.md` | 日期计划 | 已排期（Website 内部产品邮件 API：`POST /api/internal/notifications/email` + 产品模板 + 幂等 + IT provider/compose pin；关闭 DEP-06；WE-* / REL-WE-01） |
+| `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06 已由 `plan-20260802.md` 关闭** |
+| `plan-20260802.md` | 日期计划 | 实施中收口（Website 内部产品邮件 API 已落地 tip `a52d703`；DEP-06 关闭；REL-WE-01 待 patch 发布） |
