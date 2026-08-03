@@ -619,9 +619,12 @@ impl RepoHandler for MonoRepo {
 
     async fn update_refs(&self, refs: &RefCommand) -> Result<(), GitError> {
         if refs.ref_type == RefTypeEnum::Tag {
-            self.apply_tag_mega_ref_for_push_command(refs)
-                .await
-                .map_err(GitError::from)
+            // MonoRepo product rule: tags are Web/API-only (docs/monorepo.md §2).
+            // ImportRepo keeps client tag push; never silently write refs/tags/* here.
+            Err(GitError::CustomError(
+                "MonoRepo rejects Git-client tag create/update/delete; use Web UI or /tags API"
+                    .to_string(),
+            ))
         } else {
             self.apply_cl_mega_ref_for_push_command(refs, None)
                 .await
@@ -860,40 +863,6 @@ impl MonoRepo {
                 true,
             );
             storage.save_refs(new_ref, txn).await?;
-        }
-        Ok(())
-    }
-
-    async fn apply_tag_mega_ref_for_push_command(&self, cmd: &RefCommand) -> Result<(), MegaError> {
-        let storage = self.storage.mono_storage();
-        let existing = storage.get_ref_by_name(&cmd.ref_name).await?;
-        if cmd.new_id == ZERO_ID {
-            if let Some(existing) = existing {
-                storage.remove_ref(existing).await?;
-            }
-            return Ok(());
-        }
-
-        let Some(commit) = storage.get_commit_by_hash(&cmd.new_id).await? else {
-            return Err(MegaError::Other(format!(
-                "Target commit '{}' not found for tag '{}'",
-                cmd.new_id, cmd.ref_name
-            )));
-        };
-
-        if let Some(mut tag_ref) = existing {
-            tag_ref.ref_commit_hash = cmd.new_id.clone();
-            tag_ref.ref_tree_hash = commit.tree;
-            storage.update_ref(tag_ref, None).await?;
-        } else {
-            let new_ref = mega_refs::Model::new(
-                &self.path,
-                cmd.ref_name.clone(),
-                cmd.new_id.clone(),
-                commit.tree,
-                false,
-            );
-            storage.save_refs(new_ref, None).await?;
         }
         Ok(())
     }

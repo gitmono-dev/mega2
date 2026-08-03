@@ -10,7 +10,7 @@ Required environment:
 
 Optional environment:
   MONOENGINE_SSH_REPO_URL     SSH repo URL, e.g. ssh://git@127.0.0.1:2222/group/repo.git
-  MONOENGINE_GIT_SMOKE_PUSH   Set to 1 to run opt-in HTTP/SSH push/delete smoke
+  MONOENGINE_GIT_SMOKE_PUSH   Set to 1 to run opt-in HTTP/SSH CL push + tag-reject smoke
   MONOENGINE_GIT_SMOKE_LFS    Set to 1 to run opt-in HTTP LFS push/clone smoke
   MONOENGINE_GIT_SMOKE_WORKDIR  Existing directory for temporary clones
   MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones after the run
@@ -118,16 +118,21 @@ fetch_case() {
 }
 
 push_branch_smoke() {
+  # MonoRepo rule (docs/monorepo.md §1): push creates refs/cl/*, never a second
+  # public refs/heads/<name>. Public heads remain main only.
   local remote_url="$1"
   local label="$2"
   local src="$ROOT_DIR/push-$label-src"
   local branch="monoengine-smoke-$(date +%s)-$$"
   local before_refs="$ROOT_DIR/push-$label-cl-before"
   local after_refs="$ROOT_DIR/push-$label-cl-after"
+  local before_heads="$ROOT_DIR/push-$label-heads-before"
+  local after_heads="$ROOT_DIR/push-$label-heads-after"
   local delete_ref=""
   local cleanup_status=0
   rm -rf "$src"
   git_case ls-remote "$remote_url" "refs/cl/*" | awk '{print $2}' | sort >"$before_refs" || return
+  git_case ls-remote "$remote_url" "refs/heads/*" | awk '{print $2}' | sort >"$before_heads" || return
   git_case clone "$remote_url" "$src" >/dev/null || return
   git -C "$src" checkout -b "$branch" >/dev/null || return
   git -C "$src" config user.name "Monoengine Smoke" || return
@@ -137,6 +142,16 @@ push_branch_smoke() {
   git -C "$src" commit -m "monoengine git smoke" >/dev/null || return
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/$branch" || return
   git_case ls-remote "$remote_url" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
+  git_case ls-remote "$remote_url" "refs/heads/*" | awk '{print $2}' | sort >"$after_heads" || return
+  if ! diff -q "$before_heads" "$after_heads" >/dev/null; then
+    echo "FAIL: MonoRepo push must not change public refs/heads/* (only main is public)" >&2
+    diff -u "$before_heads" "$after_heads" >&2 || true
+    return 1
+  fi
+  if git_case ls-remote "$remote_url" "refs/heads/$branch" | rg -q .; then
+    echo "FAIL: public branch refs/heads/$branch must not exist after MonoRepo push" >&2
+    return 1
+  fi
   delete_ref="$(comm -13 "$before_refs" "$after_refs" | head -n1)"
   if [[ -z "$delete_ref" ]]; then
     echo "failed to find CL ref created by branch push" >&2
@@ -149,12 +164,13 @@ push_branch_smoke() {
   fi
 }
 
-push_tag_smoke() {
+reject_tag_push_smoke() {
+  # MonoRepo rule (docs/monorepo.md §2): Git-client tag push must fail.
   local remote_url="$1"
   local label="$2"
   local src="$ROOT_DIR/push-$label-tag-src"
   local tag="monoengine-smoke-tag-$(date +%s)-$$"
-  local cleanup_status=0
+  local push_status=0
   rm -rf "$src"
   git_case clone "$remote_url" "$src" >/dev/null || return
   git -C "$src" config user.name "Monoengine Smoke" || return
@@ -163,11 +179,18 @@ push_tag_smoke() {
   git -C "$src" add smoke-tag.txt || return
   git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return
   git -C "$src" tag "$tag" || return
-  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag" || return
-  git -C "$src" push origin ":refs/tags/$tag" || cleanup_status=$?
-  if [[ "$cleanup_status" -ne 0 ]]; then
-    echo "failed to delete remote smoke tag refs/tags/$tag" >&2
-    return "$cleanup_status"
+  set +e
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag"
+  push_status=$?
+  set -e
+  if [[ "$push_status" -eq 0 ]]; then
+    echo "FAIL: MonoRepo must reject Git-client tag push (docs/monorepo.md §2)" >&2
+    git -C "$src" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if git_case ls-remote "$remote_url" "refs/tags/$tag" | rg -q .; then
+    echo "FAIL: rejected tag push must not leave refs/tags/$tag on remote" >&2
+    return 1
   fi
 }
 
@@ -262,17 +285,17 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
 fi
 
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
-  run_case "HTTP push and delete branch" push_branch_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
-  run_case "HTTP push and delete tag" push_tag_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
+  run_case "HTTP push CL (no new public branch)" push_branch_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
+  run_case "HTTP reject Git-client tag push" reject_tag_push_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
   if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
     run_case "HTTP LFS push and clone" lfs_smoke_http
   fi
   if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
-    run_case "SSH push and delete branch" push_branch_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
-    run_case "SSH push and delete tag" push_tag_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
+    run_case "SSH push CL (no new public branch)" push_branch_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
+    run_case "SSH reject Git-client tag push" reject_tag_push_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
   fi
 else
-  echo "SKIP: HTTP/SSH push-delete branch and tag (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
+  echo "SKIP: HTTP/SSH CL push + tag-reject (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
   if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
     echo "SKIP: HTTP LFS push/clone also requires MONOENGINE_GIT_SMOKE_PUSH=1"
   fi

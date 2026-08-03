@@ -59,7 +59,10 @@ connect_timeout = 3
 sqlx_logging = false
 
 [monorepo]
-## Only import directory support multi-branch commit and tag, monorepo only support main branch
+## MonoRepo product rules (authoritative: docs/monorepo.md):
+## - Only one public branch: main. Client pushes of other heads become refs/cl/* (not new public branches).
+## - Tags must not be created/updated/deleted via Git client; use Web UI /tags API.
+## Only import_dir supports multi-branch and Git-client tags (ImportRepo).
 ## Mega treats files under this directory as import repo and other directories as monorepo
 import_dir = "/third-party"
 

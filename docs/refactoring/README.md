@@ -90,8 +90,9 @@
 - **验收标准**：见 `integration.md` / `test-infra.md` 现行矩阵；不以本仓 SMTP 为门
 
 ### 6. **其他文档**
+- **[`../monorepo.md`](../monorepo.md)**：MonoRepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化与目录结构）
 - **website-auth.md** / **website-mail.md**：Website 会话与产品邮件契约（见 `plan-20260731.md`）
-- **protocol.md**：协议定义相关（本计划范围外）
+- **protocol.md**：协议定义相关；分支/tag 产品规则以 `monorepo.md` 为准
 - 本仓 Campsite 风格 chat/Notes 产品面已退场；不再维护独立 chat 改进文档
 
 ---

@@ -3,6 +3,9 @@
 // Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
 // compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
 // re-clone working-tree round-trips with per-case DB/port/workdir isolation.
+// MonoRepo product rules (`docs/monorepo.md`): only public branch is `main`;
+// client branch pushes land on `refs/cl/*` (no new public heads); Git-client
+// tag push is rejected (tags via Web `/tags` API only).
 // IT-10 adds auth-boundary cases (`integration_git_cli_auth_*`).
 // IT-12 adds failpath cases (`integration_git_cli_failpath_*`).
 // Credential injection lives in `common/git_cli.rs` (included only here).
@@ -398,6 +401,7 @@ fn integration_git_cli_http_round_trip() {
     );
 
     let before_refs = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let before_heads = ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/heads/*");
 
     let refspec = format!("HEAD:refs/heads/{branch}");
     git_cli::assert_git_success(
@@ -420,6 +424,18 @@ fn integration_git_cli_http_round_trip() {
     );
 
     let after_refs = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let after_heads = ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/heads/*");
+    assert_eq!(
+        before_heads, after_heads,
+        "MonoRepo push must not create/alter public refs/heads/* (docs/monorepo.md §1)"
+    );
+    assert!(
+        !after_heads
+            .iter()
+            .any(|r| r == &format!("refs/heads/{branch}")),
+        "public branch refs/heads/{branch} must not exist after MonoRepo CL push",
+        branch = branch
+    );
     let cl_ref = after_refs
         .into_iter()
         .find(|r| !before_refs.contains(r))
@@ -516,6 +532,115 @@ fn integration_git_cli_http_round_trip() {
     eprintln!(
         "integration_git_cli ok; monoengine binary={}",
         env!("CARGO_BIN_EXE_monoengine")
+    );
+}
+
+#[test]
+fn integration_git_cli_http_rejects_git_client_tag_push() {
+    // docs/monorepo.md §2 — MonoRepo tags are Web/API only.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let clone_name = "tag-reject-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone before tag reject",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "config", "user.name", "IT Git CLI"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "it-git-cli@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+
+    let tag = format!("it-tag-reject-{}", std::process::id());
+    let tag_file = format!("{tag}.txt");
+    fs::write(
+        env.case_dir.join(clone_name).join(&tag_file),
+        b"tag reject\n",
+    )
+    .expect("write tag fixture");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["-C", clone_name, "add", &tag_file]),
+        "git add tag fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "tag reject fixture"],
+        ),
+        "git commit tag fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["-C", clone_name, "tag", &tag]),
+        "git tag local",
+    );
+
+    let push = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("refs/tags/{tag}"),
+        ],
+    );
+    assert!(
+        !push.status.success(),
+        "MonoRepo must reject Git-client tag push; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let remote_tags = ls_remote_refs(
+        &env.case_dir,
+        &token,
+        &remote_url,
+        &format!("refs/tags/{tag}"),
+    );
+    assert!(
+        remote_tags.is_empty(),
+        "rejected tag push must not leave refs/tags/{tag} on remote: {remote_tags:?}",
+        tag = tag,
+        remote_tags = remote_tags
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
     );
 }
 
@@ -897,8 +1022,12 @@ fn http_status(port: u16, path: &str) -> u16 {
 }
 
 fn ls_remote_cl_refs(case_dir: &Path, token: &str, remote_url: &str) -> Vec<String> {
-    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, "refs/cl/*"]);
-    git_cli::assert_git_success(&output, "ls-remote refs/cl/*");
+    ls_remote_refs(case_dir, token, remote_url, "refs/cl/*")
+}
+
+fn ls_remote_refs(case_dir: &Path, token: &str, remote_url: &str, pattern: &str) -> Vec<String> {
+    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, pattern]);
+    git_cli::assert_git_success(&output, &format!("ls-remote {pattern}"));
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
