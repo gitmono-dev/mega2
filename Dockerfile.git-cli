@@ -19,4 +19,8 @@ RUN set -eux; \
     cp "/tmp/git-lfs-${GIT_LFS_VERSION}/git-lfs" /usr/local/bin/git-lfs; \
     chmod 0755 /usr/local/bin/git-lfs; \
     rm -rf "/tmp/$archive" "/tmp/git-lfs-${GIT_LFS_VERSION}"; \
-    test "$(git lfs version | cut -d' ' -f1)" = "git-lfs/${GIT_LFS_VERSION}"
+    test "$(git lfs version | cut -d' ' -f1)" = "git-lfs/${GIT_LFS_VERSION}"; \
+    # Compose runs git-cli as UID/GID 1000 (host network). OpenSSH clients require
+    # a matching passwd entry or every `ssh` invocation fails with
+    # "No user exists for uid 1000" (GM-06A cargo-native SSH auth).
+    adduser -D -u 1000 -g 1000 -h /home/gitcli -s /bin/sh gitcli

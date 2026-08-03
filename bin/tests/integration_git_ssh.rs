@@ -14,6 +14,7 @@ mod common;
 mod git_cli;
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     net::TcpStream,
@@ -336,6 +337,106 @@ fn integration_git_ssh_service_lifecycle_isolated() {
     );
 }
 
+#[test]
+fn integration_git_ssh_authenticated_clone() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    // SSH client fixture allowlist markers (ADR-GM-06 / Deliverables).
+    const _: &str = "client_key_mode=0600";
+    const _: &str = "ssh_keys_row_matches_keypair";
+    const _: &str = "finger=ssh-keygen_-lf_sha256_col2";
+    const _: &str = "known_hosts=case_port_only";
+    const _: &str = "GIT_SSH_COMMAND=ssh -i CASE/ssh/client_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=CASE/ssh/known_hosts -o StrictHostKeyChecking=yes -p PORT";
+
+    let env = GitSshEnv::new();
+    let client_key = env.ssh_dir.join("client_ed25519");
+    let client_pub = env.ssh_dir.join("client_ed25519.pub");
+    let known_hosts = env.ssh_dir.join("known_hosts");
+
+    // client_key_mode=0600
+    git_cli::generate_client_ed25519(&client_key);
+    let pubkey = fs::read_to_string(&client_pub).expect("read client public key");
+    // finger=ssh-keygen_-lf_sha256_col2
+    let finger = git_cli::ssh_fingerprint_sha256_col2(&client_pub);
+
+    // ADR-GM-05: migrations must complete before ssh_keys seed; seed before the
+    // Git-facing SSH listen. First boot applies migrations + Vault host key, then
+    // we shut down, seed, and boot again for the authenticated clone.
+    {
+        let (mut migrate_service, _migrate_port, _out, err) = boot_service_ssh(&env);
+        let status = migrate_service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(
+            status.success(),
+            "migrate boot did not shut down cleanly: {status}\nstderr:\n{}",
+            read_log(&err),
+        );
+        drop(migrate_service);
+    }
+
+    git_cli::seed_ssh_key(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        "gm-06a",
+        pubkey.trim(),
+        &finger,
+    );
+    // ssh_keys_row_matches_keypair
+    git_cli::assert_ssh_keys_row_matches_keypair(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        &finger,
+    );
+
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_ssh(&env);
+    let service_pid = service.pid();
+
+    // known_hosts=case_port_only
+    git_cli::write_known_hosts_via_keyscan(&known_hosts, port);
+    let known_body = fs::read_to_string(&known_hosts).expect("read known_hosts");
+    assert!(
+        known_body
+            .lines()
+            .all(|line| line.contains("127.0.0.1") || line.starts_with('#') || line.is_empty()),
+        "known_hosts=case_port_only must only describe 127.0.0.1 for this case"
+    );
+
+    let git_ssh = git_cli::git_ssh_command(&env.case_dir, port);
+    assert!(
+        git_ssh.contains(&format!("-p {port}")),
+        "GIT_SSH_COMMAND must pin the case port: {git_ssh}"
+    );
+
+    let remote = format!("ssh://{}@127.0.0.1:{port}/", git_cli::DEFAULT_SSH_AUTH_USER);
+    let clone_name = "ssh-auth-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "authenticated SSH clone",
+    );
+
+    let clone_dir = env.case_dir.join(clone_name);
+    let actual = snapshot_workdir(&clone_dir);
+    assert_eq!(
+        actual,
+        expected_init_monorepo_fixture(),
+        "authenticated clone worktree must match the complete seeded monorepo fixture byte-for-byte"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
 fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     // ephemeral_port_from_127.0.0.1:0_to_--ssh-port
     let port = git_cli::reserve_ephemeral_port();
@@ -423,4 +524,164 @@ fn read_log(path: &Path) -> String {
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf);
     buf
+}
+
+fn snapshot_workdir(root: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    snapshot_workdir_rec(root, root, &mut out);
+    out
+}
+
+fn snapshot_workdir_rec(root: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()))
+    {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            snapshot_workdir_rec(root, &path, out);
+            continue;
+        }
+        let rel = path.strip_prefix(root).expect("path under root");
+        let rel_key = path_bytes(rel);
+        let bytes = fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        out.insert(rel_key, bytes);
+    }
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    // Linux-only harness: compare path bytes without lossy Windows mapping.
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// Complete expected worktree for `MegaModelConverter::init` against the default
+/// `config/config.toml` monorepo settings (`admin = ["benjamin_747"]`, the six
+/// `root_dirs`). Kept in sync with `src/jupiter/utils/converter.rs::init_trees`.
+fn expected_init_monorepo_fixture() -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for dir in [
+        "third-party",
+        "project",
+        "doc",
+        "release",
+        "model",
+        "toolchains",
+    ] {
+        out.insert(
+            path_bytes(Path::new(&format!("{dir}/.gitkeep"))),
+            format!("Placeholder file for /{dir} directory").into_bytes(),
+        );
+    }
+    out.insert(path_bytes(Path::new(".buckroot")), Vec::new());
+    out.insert(
+        path_bytes(Path::new(".buckconfig")),
+        expected_buckconfig_bytes(),
+    );
+    out.insert(
+        path_bytes(Path::new("toolchains/BUCK")),
+        br#"load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+
+# All the default toolchains, suitable for a quick demo or early prototyping.
+# Most real projects should copy/paste the implementation to configure them.
+system_demo_toolchains()
+"#
+        .to_vec(),
+    );
+    out.insert(
+        path_bytes(Path::new(".cedar/policies.cedar")),
+        br#"permit(action == "code:review", principal, resource)
+    when { resource.path.startsWith("") }
+    to ["benjamin_747"];
+"#
+        .to_vec(),
+    );
+    out.insert(
+        path_bytes(Path::new(".mega_cedar.json")),
+        expected_mega_cedar_json_bytes(),
+    );
+    out
+}
+
+fn expected_buckconfig_bytes() -> Vec<u8> {
+    let cells = [
+        "  root = .",
+        "  prelude = prelude",
+        "  toolchains = toolchains",
+        "  buckal = toolchains/buckal-bundles",
+        "  none = none",
+    ]
+    .join("\n");
+    format!(
+        r#"[cells]
+{cells}
+
+[cell_aliases]
+  config = prelude
+  ovr_config = prelude
+  fbcode = none
+  fbsource = none
+  fbcode_macros = none
+  buck = none
+
+# Uses a copy of the prelude bundled with the buck2 binary. You can alternatively delete this
+# section and vendor a copy of the prelude to the `prelude` directory of your project.
+[external_cells]
+  prelude = bundled
+
+[parser]
+  target_platform_detector_spec = target:root//...->prelude//platforms:default \
+    target:prelude//...->prelude//platforms:default \
+    target:toolchains//...->prelude//platforms:default
+
+[build]
+  execution_platforms = prelude//platforms:default
+  default_target_platforms = prelude//platforms:default
+"#
+    )
+    .into_bytes()
+}
+
+fn expected_mega_cedar_json_bytes() -> Vec<u8> {
+    // Mirrors `contract::policy::entitystore::generate_entity(["benjamin_747"], "/")`.
+    let json = serde_json::json!({
+        "users": {
+            "User::\"benjamin_747\"": {
+                "euid": "User::\"benjamin_747\"",
+                "parents": ["UserGroup::\"admin\""]
+            }
+        },
+        "repos": {
+            "Repository::\"/\"": {
+                "euid": "Repository::\"/\"",
+                "is_private": true,
+                "admins": "UserGroup::\"admin\"",
+                "maintainers": "UserGroup::\"matainer\"",
+                "readers": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "user_groups": {
+            "UserGroup::\"admin\"": {
+                "euid": "UserGroup::\"admin\"",
+                "parents": ["UserGroup::\"matainer\""]
+            },
+            "UserGroup::\"matainer\"": {
+                "euid": "UserGroup::\"matainer\"",
+                "parents": ["UserGroup::\"reader\""]
+            },
+            "UserGroup::\"reader\"": {
+                "euid": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "merge_requests": {},
+        "issues": {}
+    });
+    serde_json::to_string_pretty(&json)
+        .expect("serialize expected cedar entity")
+        .into_bytes()
 }

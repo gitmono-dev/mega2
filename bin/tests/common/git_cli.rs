@@ -822,6 +822,355 @@ pub fn seed_access_token(db_url: &str, username: &str, token: &str) {
     });
 }
 
+/// Default username seeded into `ssh_keys` for cargo-native SSH ITs.
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub const DEFAULT_SSH_AUTH_USER: &str = "it-git-ssh";
+
+/// Generate `CASE/ssh/client_ed25519` (+ `.pub`) with mode `0600` (ADR-GM-05).
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn generate_client_ed25519(private_key_path: &Path) {
+    if let Some(parent) = private_key_path.parent() {
+        fs::create_dir_all(parent).expect("create client key parent");
+    }
+    if private_key_path.exists() {
+        let _ = fs::remove_file(private_key_path);
+    }
+    let pub_path = PathBuf::from(format!("{}.pub", private_key_path.display()));
+    if pub_path.exists() {
+        let _ = fs::remove_file(&pub_path);
+    }
+    let output = Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            private_key_path
+                .to_str()
+                .expect("client key path must be utf-8"),
+        ])
+        .output()
+        .unwrap_or_else(|err| panic!("ssh-keygen failed to start: {err}"));
+    assert!(
+        output.status.success(),
+        "ssh-keygen failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(private_key_path)
+        .expect("client key metadata")
+        .permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(private_key_path, perms).expect("chmod client key 0600");
+    let mode = fs::metadata(private_key_path)
+        .expect("client key metadata after chmod")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "client_key_mode=0600");
+}
+
+/// Second column of `ssh-keygen -lf <pub> -E sha256` (`SHA256:…`).
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn ssh_fingerprint_sha256_col2(public_key_path: &Path) -> String {
+    let output = Command::new("ssh-keygen")
+        .args([
+            "-lf",
+            public_key_path
+                .to_str()
+                .expect("public key path must be utf-8"),
+            "-E",
+            "sha256",
+        ])
+        .output()
+        .unwrap_or_else(|err| panic!("ssh-keygen -lf failed to start: {err}"));
+    assert!(
+        output.status.success(),
+        "ssh-keygen -lf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = String::from_utf8_lossy(&output.stdout);
+    let finger = line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing ssh-keygen fingerprint column 2 in: {line}"))
+        .to_string();
+    assert!(
+        finger.starts_with("SHA256:"),
+        "finger=ssh-keygen_-lf_sha256_col2 got {finger}"
+    );
+    finger
+}
+
+/// Seed `ssh_keys` with the public key + fingerprint used by the SSH server.
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn seed_ssh_key(db_url: &str, username: &str, title: &str, public_key: &str, finger: &str) {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64;
+    let username_sql = username.replace('\'', "''");
+    let title_sql = title.replace('\'', "''");
+    let key_sql = public_key.replace('\'', "''");
+    let finger_sql = finger.replace('\'', "''");
+    let sql = format!(
+        "INSERT INTO ssh_keys (id, username, title, ssh_key, finger, created_at) \
+         VALUES ({id}, '{username_sql}', '{title_sql}', '{key_sql}', '{finger_sql}', now())"
+    );
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect DB for ssh_keys seed: {err}"));
+        db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
+            .await
+            .unwrap_or_else(|err| panic!("seed ssh_keys: {err}"));
+    });
+}
+
+/// Assert the seeded `ssh_keys` row matches the on-disk keypair fingerprint.
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn assert_ssh_keys_row_matches_keypair(db_url: &str, username: &str, finger: &str) {
+    let username_sql = username.replace('\'', "''");
+    let finger_sql = finger.replace('\'', "''");
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect DB to assert ssh_keys: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT username, finger FROM ssh_keys \
+                     WHERE username = '{username_sql}' AND finger = '{finger_sql}'"
+                ),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query ssh_keys: {err}"));
+        assert_eq!(
+            rows.len(),
+            1,
+            "ssh_keys_row_matches_keypair: expected one row for {username}/{finger}"
+        );
+    });
+}
+
+/// Write `known_hosts` for `127.0.0.1:port` via `ssh-keyscan` on the selected runner.
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn write_known_hosts_via_keyscan(known_hosts: &Path, port: u16) {
+    require_git_cli_runner();
+    ensure_git_cli_passwd_for_runtime_uid();
+    if let Some(parent) = known_hosts.parent() {
+        fs::create_dir_all(parent).expect("create known_hosts parent");
+    }
+    let port_arg = port.to_string();
+    let output = match runner_kind() {
+        GitRunnerKind::Container => {
+            let known_container = container_path_for_host(known_hosts);
+            let container_id = running_git_cli_container_id()
+                .unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
+            let script = format!("ssh-keyscan -p {port_arg} 127.0.0.1 > '{known_container}'");
+            let mut command = docker_exec_base();
+            command.arg(&container_id).args(["sh", "-c", &script]);
+            output_with_timeout(command, Duration::from_secs(30), "docker exec ssh-keyscan")
+        }
+        GitRunnerKind::Host => {
+            let mut command = Command::new("ssh-keyscan");
+            command.args(["-p", &port_arg, "127.0.0.1"]);
+            let output = output_with_timeout(command, Duration::from_secs(30), "host ssh-keyscan");
+            fs::write(known_hosts, &output.stdout).expect("write known_hosts");
+            output
+        }
+    };
+    assert!(
+        output.status.success(),
+        "ssh-keyscan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = fs::read_to_string(known_hosts).expect("read known_hosts");
+    assert!(
+        !body.trim().is_empty(),
+        "ssh-keyscan produced empty known_hosts for port {port}"
+    );
+    assert!(
+        body.contains("127.0.0.1"),
+        "known_hosts=case_port_only missing 127.0.0.1"
+    );
+}
+
+/// Ensure the compose git-cli runtime UID has a passwd entry so OpenSSH works.
+///
+/// CI sets `MONOENGINE_IT_GIT_UID` to the host UID (often 1001); a build-time
+/// `adduser -u 1000` alone is not enough.
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn ensure_git_cli_passwd_for_runtime_uid() {
+    if runner_kind() != GitRunnerKind::Container {
+        return;
+    }
+    let container_id =
+        running_git_cli_container_id().unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
+
+    let mut id_cmd = docker_exec_base();
+    id_cmd
+        .arg(&container_id)
+        .args(["sh", "-c", "printf '%s:%s' \"$(id -u)\" \"$(id -g)\""]);
+    let id_out = output_with_timeout(id_cmd, Duration::from_secs(15), "docker exec id");
+    assert!(
+        id_out.status.success(),
+        "failed to read git-cli runtime uid/gid: {}",
+        String::from_utf8_lossy(&id_out.stderr)
+    );
+    let id_pair = String::from_utf8_lossy(&id_out.stdout);
+    let mut parts = id_pair.trim().split(':');
+    let uid = parts.next().unwrap_or_default().to_string();
+    let gid = parts.next().unwrap_or_default().to_string();
+    assert!(
+        !uid.is_empty() && !gid.is_empty(),
+        "unexpected git-cli id output: {id_pair}"
+    );
+
+    let script = format!(
+        "if getent passwd {uid} >/dev/null 2>&1; then exit 0; fi; \
+         if ! getent group {gid} >/dev/null 2>&1; then addgroup -g {gid} gitcliruntime || true; fi; \
+         group_name=\"$(getent group {gid} | cut -d: -f1)\"; \
+         adduser -D -u {uid} -G \"$group_name\" -h /home/gitcli -s /bin/sh gitcliruntime"
+    );
+    let mut command = docker_exec_base();
+    command
+        .arg("-u")
+        .arg("0")
+        .arg(&container_id)
+        .args(["sh", "-c", &script]);
+    let output = output_with_timeout(command, Duration::from_secs(30), "docker exec adduser");
+    assert!(
+        output.status.success(),
+        "failed to ensure passwd for git-cli uid {uid}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Build ADR-GM-05 `GIT_SSH_COMMAND` for the selected runner (container paths under `/work`).
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn git_ssh_command(case_dir: &Path, port: u16) -> String {
+    require_git_cli_runner();
+    let key = case_dir.join("ssh").join("client_ed25519");
+    let known = case_dir.join("ssh").join("known_hosts");
+    let (key_arg, known_arg) = match runner_kind() {
+        GitRunnerKind::Container => (
+            container_path_for_host(&key),
+            container_path_for_host(&known),
+        ),
+        GitRunnerKind::Host => (
+            key.to_str().expect("utf-8 key").to_string(),
+            known.to_str().expect("utf-8 known_hosts").to_string(),
+        ),
+    };
+    format!(
+        "ssh -i {key_arg} -o IdentitiesOnly=yes -o UserKnownHostsFile={known_arg} -o StrictHostKeyChecking=yes -p {port}"
+    )
+}
+
+/// Run `git` with `GIT_SSH_COMMAND` and no HTTP credential injection.
+#[allow(
+    dead_code,
+    reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn git_cli_ssh(case_dir: &Path, git_ssh_command: &str, git_args: &[&str]) -> Output {
+    require_git_cli_runner();
+    ensure_git_cli_passwd_for_runtime_uid();
+    if git_cli_skip_requested() {
+        panic!("{GIT_CLI_UNAVAILABLE}: skipped runner cannot execute git");
+    }
+    match runner_kind() {
+        GitRunnerKind::Container => git_cli_container_ssh(case_dir, git_ssh_command, git_args),
+        GitRunnerKind::Host => git_cli_host_ssh(case_dir, git_ssh_command, git_args),
+    }
+}
+
+fn git_cli_container_ssh(case_dir: &Path, git_ssh_command: &str, git_args: &[&str]) -> Output {
+    let work_container = container_path_for_host(case_dir);
+    let container_id =
+        running_git_cli_container_id().unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
+    let mut command = docker_exec_base();
+    command.env("GIT_SSH_COMMAND", git_ssh_command);
+    command
+        .arg("-w")
+        .arg(&work_container)
+        .arg("-e")
+        .arg("GIT_SSH_COMMAND")
+        .arg("-e")
+        .arg("GIT_TERMINAL_PROMPT=0")
+        .arg("-e")
+        .arg("GIT_CONFIG_COUNT=1")
+        .arg("-e")
+        .arg("GIT_CONFIG_KEY_0=core.autocrlf")
+        .arg("-e")
+        .arg("GIT_CONFIG_VALUE_0=false")
+        .arg(&container_id);
+    append_container_git_timeout_wrapper(&mut command);
+    command.args(git_args);
+    output_with_timeout(
+        command,
+        GIT_CLI_COMMAND_TIMEOUT + Duration::from_secs(15),
+        "docker exec git-cli (ssh)",
+    )
+}
+
+fn git_cli_host_ssh(case_dir: &Path, git_ssh_command: &str, git_args: &[&str]) -> Output {
+    let isolated_home = case_dir.join("git-home-ssh");
+    fs::create_dir_all(&isolated_home).expect("create isolated git HOME");
+    let null_config = PathBuf::from("/dev/null");
+    let mut command = Command::new("git");
+    command
+        .current_dir(case_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove(GIT_ASKPASS_ENV)
+        .env_remove("GIT_ASKPASS")
+        .env("HOME", &isolated_home)
+        .env("XDG_CONFIG_HOME", isolated_home.join("xdg-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &null_config)
+        .env("GIT_CONFIG_SYSTEM", &null_config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", git_ssh_command)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .args(git_args);
+    output_with_timeout(command, GIT_CLI_COMMAND_TIMEOUT, "host git (ssh)")
+}
+
 fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
