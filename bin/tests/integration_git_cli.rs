@@ -536,6 +536,210 @@ fn integration_git_cli_http_round_trip() {
 }
 
 #[test]
+fn integration_git_cli_http_pull_cl_ref_round_trip() {
+    // ADR-GM-02 / plan-20260803 GM-02: literal `git pull` of refs/cl/* must
+    // update a dedicated local branch to the sender tree; default main stays seed.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let case_id = format!(
+        "gm02-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let fixture_payload = format!(
+        "monoengine gm-02 pull fixture pid={} case={}\n",
+        std::process::id(),
+        env.case_dir.display()
+    );
+    let fixture_rel = Path::new("gm-02-pull-fixture.txt");
+    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
+    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
+    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
+
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let sender_name = "pull-sender";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, sender_name]),
+        "clone sender worktree",
+    );
+    let sender = env.case_dir.join(sender_name);
+    let seed_tree = snapshot_workdir(&sender);
+    let expected_seed = expected_init_monorepo_fixture();
+    assert_eq!(
+        seed_tree, expected_seed,
+        "sender clone must match seeded monorepo fixture before pull case mutates a CL tip"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "checkout", "-b", &case_id],
+        ),
+        "create sender branch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "config", "user.name", "IT Git CLI"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                sender_name,
+                "config",
+                "user.email",
+                "it-git-cli@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::copy(&fixture_host, sender.join(fixture_rel)).expect("copy fixture into sender");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "add", fixture_rel.to_str().unwrap()],
+        ),
+        "git add pull fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "commit", "-m", "gm-02 pull fixture"],
+        ),
+        "git commit pull fixture",
+    );
+    let sender_tree = snapshot_workdir(&sender);
+    let fixture_key = path_bytes(fixture_rel);
+    let fixture_bytes = fixture_payload.as_bytes().to_vec();
+    assert_eq!(
+        sender_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "sender tree must contain the pull fixture bytes"
+    );
+
+    let before_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let refspec = format!("HEAD:refs/heads/{case_id}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                sender_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        ),
+        "push sender tip to create refs/cl/*",
+    );
+    let after_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let cl_ref = after_cl
+        .into_iter()
+        .find(|r| !before_cl.contains(r))
+        .unwrap_or_else(|| panic!("expected new refs/cl/* after push for case {case_id}"));
+    assert!(
+        cl_ref.starts_with("refs/cl/"),
+        "expected refs/cl/* tip, got {cl_ref}"
+    );
+
+    let puller_name = "pull-receiver";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, puller_name]),
+        "clone default tip for literal pull",
+    );
+    let puller = env.case_dir.join(puller_name);
+    let puller_main_before = snapshot_workdir(&puller);
+    assert_eq!(
+        puller_main_before, expected_seed,
+        "pull receiver default main must equal seed tree before literal pull"
+    );
+
+    let local_branch = format!("pulled-{case_id}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", puller_name, "checkout", "-b", &local_branch],
+        ),
+        "create local branch for literal pull",
+    );
+    // Literal `git pull origin <refs/cl/…>` (ADR-GM-02). Not fetch+checkout.
+    // Force protocol v0: v2 ref-prefix from default heads-only remote.fetch can
+    // omit refs/cl/* and yield HTTP 400 / "expected 'acknowledgments'".
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                puller_name,
+                "-c",
+                "protocol.version=0",
+                "pull",
+                "--ff-only",
+                "origin",
+                &cl_ref,
+            ],
+        ),
+        "literal git pull of refs/cl tip into local branch",
+    );
+
+    let pulled_tree = snapshot_workdir(&puller);
+    assert_eq!(
+        pulled_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "literal pull worktree must contain sender fixture bytes"
+    );
+    assert_eq!(
+        pulled_tree, sender_tree,
+        "literal pull worktree must match sender snapshot byte-for-byte"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", puller_name, "checkout", "main"],
+        ),
+        "return to default main after pull",
+    );
+    let puller_main_after = snapshot_workdir(&puller);
+    assert_eq!(
+        puller_main_after, expected_seed,
+        "default main must remain the seed tree after literal CL pull"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
 fn integration_git_cli_http_rejects_git_client_tag_push() {
     // docs/monorepo.md §2 — MonoRepo tags are Web/API only.
     if git_cli::git_cli_skip_requested() {
