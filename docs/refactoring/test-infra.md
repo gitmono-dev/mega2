@@ -41,8 +41,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
    `-p monoengine-it`（`up` / `run` / `down -v` / 残留查询同一项目名），并以
    compose project label 判定零残留卷与网络。启动时用了哪个 `-p`，清理时必须用
    同一个；禁止把 `-p monoengine-it` 的 `down` 拿去清理未带 `-p` 的默认项目（目录名
-   `monoengine`），也禁止反过来。`networks.default` 在 compose 文件里固定名为
-   `monoengine-test-net`，因此**带 `-p` 与不带 `-p` 的两套栈不可并存**——会争用同一
+   `monoengine`），也禁止反过来。`networks.default` 固定名为
+   `monoengine-test-network`，因此**带 `-p` 与不带 `-p` 的两套栈不可并存**——会争用同一
    网络名；启新栈前须先停掉另一套（`down -v`）。仓库内尚存的、未带 `-p` 的历史
    命令在对应任务卡改写前仍指向默认项目。
 5. **共享宿主路径：** git-cli 等服务挂载固定共享目录
@@ -119,13 +119,13 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | 服务名 | `rustfs`、`rustfs-init` |
 | 镜像 | `rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c`；桶初始化客户端 `minio/mc:RELEASE.2025-04-16T18-13-26Z`（固定 tag，非 `latest`；`mc` 仅作通用 S3 客户端） |
 | 端口 | `127.0.0.1:19000:9000`、`127.0.0.1:19001:9001`（高位 + 仅回环；S3 API / console） |
-| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`（见 `docker-compose.test.yml`） |
-| 网络 | 默认 `networks.default` → `monoengine-test-net` |
-| 卷 / 工作目录 | `rustfs` 使用容器内路径 `/data`（`RUSTFS_VOLUMES=/data`），**无**宿主机 bind-mount；单盘本地 smoke 设 `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`。数据仅存在于该容器可写层，`down -v` 后不保留。`rustfs-init` 无持久卷（one-shot） |
-| profiles | `rustfs-init` 使用 `profiles: ["init"]`：**one-shot** 桶初始化，不参与默认 `up -d --wait`（`--wait` 要求服务保持 running/healthy）；显式执行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init` |
+| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`；`rustfs-init`：`mc ls local/testbucket`（建桶后 `sleep infinity`，见 `docker-compose.test.yml`） |
+| 网络 | 默认 `networks.default` → `monoengine-test-network` |
+| 卷 / 工作目录 | `rustfs` 使用容器内路径 `/data`（`RUSTFS_VOLUMES=/data`），**无**宿主机 bind-mount；单盘本地 smoke 设 `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`。数据仅存在于该容器可写层，`down -v` 后不保留。`rustfs-init` 无持久卷（建桶后常驻，供 `--wait`） |
+| profiles | 无；两者均参与默认 `up -d --wait`。`rustfs-init` 在 `rustfs` healthy 后幂等创建 `testbucket`，再以 healthcheck 报告就绪（纯 one-shot exit 会让 `--wait` 失败） |
 | depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml down -v`；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs 与 git-cli 的栈，随后 `--profile init run --rm rustfs-init` 建桶；执行面含 `cargo test -p monoengine --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（产品邮件投递由 website 负责，本 job **不**跑本仓 SmtpMailer→Mailpit 或 `integration_mail_dispatcher_*`）；job 末尾 `if: always()` 下 `-p monoengine-it --profile git --profile app --profile web down -v` |
+| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p monoengine --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（产品邮件投递由 website 负责，本 job **不**跑本仓 SmtpMailer→Mailpit 或 `integration_mail_dispatcher_*`）；job 末尾 `if: always()` 下 `-p monoengine-it --profile git --profile app --profile web down -v` |
 | secret | 公开测试凭据 `rustfs` / `rustfs_secret`（仅测试栈，与 `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` 及 `.env.test.example` 对齐）；CI 对同类凭据使用 `::add-mask::` |
 | 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
 
@@ -163,7 +163,7 @@ git-cli 固定版本: `git version 2.49.1`
 | 固定版本字符串 | 无客户端 pin；镜像内容随源码 / 宿主机二进制变化，升级为显式 build |
 | 端口 | `127.0.0.1:19180:8000`（容器内 CLI 默认 `8000`；仅回环） |
 | healthcheck | `curl -f http://127.0.0.1:8000/api/openapi.json` |
-| 网络 | 默认 `networks.default` → `monoengine-test-net`（可解析 `postgres`/`redis` 服务名） |
+| 网络 | 默认 `networks.default` → `monoengine-test-network`（可解析 `postgres`/`redis` 服务名） |
 | 卷 / 工作目录 | named volume `monoengine-data` → `/var/lib/monoengine`（`MEGA_BASE_DIR`）；对象存储默认 local → `/var/lib/monoengine/objects` |
 | profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
 | depends_on | `postgres`、`redis`（`service_healthy`）。`MEGA_OAUTH__WEBSITE_API_BASE_URL=http://website-next:7001`；`MEGA_OAUTH__ALLOWED_CORS_ORIGINS` 保留既有 IT origin 并含 `http://127.0.0.1:17001`。不声明对 `website-next` 的 `depends_on`：该服务仅属 `web` profile，而 `monoengine` 属 `app`；跨 profile 依赖会使 app-only smoke 无法解析。会话联调使用下方规定的 web-first 启动顺序；不依赖 Mailpit 或 RustFS。 |
@@ -197,15 +197,15 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d -
 | 项 | 值 |
 |---|---|
 | 服务名 | `website-db-init`、`website-next` |
-| 镜像 / 构建 | `website-db-init` 从 sibling `../website` 的 `apps/next-app/Dockerfile` `builder` stage 构建，复用已安装的 `pnpm` / Drizzle 工具；该 Dockerfile 也复制根目录 `drizzle.config.sqlite.ts`，供 init target 解析 schema。`website-next:local`，`pull_policy: never`，从同一 Dockerfile 的 runner stage 构建。本地和 CI 都必须有该 checkout；CI 应缓存构建层但不得尝试拉取同名远程镜像 |
+| 镜像 / 构建 | `website-db-init` 从 sibling `../website` 的 `apps/next-app/Dockerfile` `builder` stage 构建，复用已安装的 `pnpm` / Drizzle / `pg`；该 Dockerfile 必须复制根目录 `drizzle.config.ts`，供 init target 解析 PG schema。`website-next:local`，`pull_policy: never`，从同一 Dockerfile 的 runner stage 构建。本地和 CI 都必须有该 checkout；CI 应缓存构建层但不得尝试拉取同名远程镜像 |
 | 端口 | `127.0.0.1:17001:7001`（仅回环；next-app Dockerfile 的 `EXPOSE 7001`） |
 | healthcheck | 容器内 Node TCP 连接 `127.0.0.1:7001`；只在 Next 进程已监听时 healthy |
-| 网络 | 默认 `networks.default` → `monoengine-test-net`，可由后续 `monoengine` profile 通过 `website-next:7001` 访问 |
-| 账户库 / 卷 | 两服务都设 `DB_DIALECT=sqlite` 与 `SQLITE_DB_PATH=/app/data/website-it.sqlite`，共享 named volume `website-next-data` → `/app/data`。website 的 Next config 保持该路径为运行时环境变量（不在 build 时内联默认 `local.sqlite`）。`website-db-init` 运行 `pnpm db:push:sqlite`，再将目录交给 runner 的 `nextjs` UID/GID `1001:1001`；因此每个新卷在 Next 启动前已有 schema，且运行时仍可写入账户与 session。该数据库不设置 `DATABASE_URL`，不连接或复用 `monoengine` PostgreSQL |
+| 网络 | 默认 `networks.default` → `monoengine-test-network`，可由后续 `monoengine` profile 通过 `website-next:7001` 访问 |
+| 账户库 | 两服务都设 `DB_DIALECT=pg` 与 `DATABASE_URL=postgresql://monoengine:monoengine_test_password@postgres:5432/website`。`website-db-init` 先在共享 `postgres` 上幂等 `CREATE DATABASE website`（经 `DATABASE_ADMIN_URL` 连 maintenance DB），再 `npx drizzle-kit push --force`。账户数据与 `monoengine` 业务库隔离（ADR-WA-07）；**禁止**把 website URL 指到库名 `monoengine`。无 named volume（状态在 Postgres 数据卷） |
 | profiles | 两服务均为 `profiles: ["web"]`，不参与默认 `up -d --wait`；显式启动：`docker compose -p monoengine-it -f docker-compose.test.yml --profile web up -d --wait website-next` |
-| depends_on / 会话联调顺序 | `website-next` → `website-db-init`，`condition: service_completed_successfully`；初始化失败时 Next 不会启动。没有 `monoengine` 跨 profile 依赖：`website-next` 是 `web` profile、`monoengine` 是 `app` profile，避免 app-only smoke 被 web 拉起。可联合运行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait`，此时 Compose 先完成 schema 初始化，再等待两个常驻服务 healthy |
-| 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile web down -v`；删除 `website-next-data` 后 SQLite 账户状态不保留，零残留仍按 compose project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../website`（`genedna/website` @ `a52d703`；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫保留为回归保护。 |
+| depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）；初始化失败时 Next 不会启动。没有 `monoengine` 跨 profile 依赖：`website-next` 是 `web` profile、`monoengine` 是 `app` profile，避免 app-only smoke 被 web 拉起。可联合运行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait`，此时 Compose 先完成 schema 初始化，再等待两个常驻服务 healthy |
+| 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile web down -v`；`-v` 删除 Postgres 数据卷后 `website` 库与 schema 不保留，零残留仍按 compose project label 判定 |
+| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../website`（`genedna/website` @ `2af89c8`；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫（须 COPY `drizzle.config.ts`）保留为回归保护。 |
 | secret | `BETTER_AUTH_SECRET` 与 `MONOENGINE_INTERNAL_MAIL_BEARER` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
 | 邮件 env（WE-06） | `EMAIL_PROVIDER=test`（内存记录，无云调用）、`EMAIL_DEFAULT_FROM`、`MONOENGINE_INTERNAL_MAIL_BEARER`、可选 `MONOENGINE_PUBLIC_BASE_URL`；默认不依赖 `mailpit`（smtp 捕获仍可选） |
 | 性能 | 首次 source build 预算 ≤ 20 分钟；默认 profile 不构建、不启动该服务 |

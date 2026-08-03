@@ -23,7 +23,7 @@ pub const DEFAULT_GIT_AUTH_USER: &str = "it-git-cli";
 pub const PINNED_GIT_CLI_VERSION: &str = "git version 2.49.1";
 /// Per-invocation wall-clock budget so a stalled protocol cannot hang `cargo test`.
 pub const GIT_CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
-/// Bound the initial docker compose runner probe so `cargo test` cannot wedge
+/// Bound the initial docker runner probe so `cargo test` cannot wedge
 /// indefinitely when the docker daemon is unhealthy.
 pub const DOCKER_RUNNER_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -40,10 +40,6 @@ pub fn repo_root() -> PathBuf {
         .join("..")
         .canonicalize()
         .expect("resolve repository root")
-}
-
-pub fn docker_compose_file() -> PathBuf {
-    repo_root().join("docker-compose.test.yml")
 }
 
 pub fn git_cli_workdir() -> PathBuf {
@@ -112,24 +108,68 @@ pub fn record_service_pid(pid: u32) {
     append_evidence_line("MONOENGINE_IT_PIDS_FILE", &pid.to_string());
 }
 
-fn compose_command() -> Command {
+fn compose_up_git_cli_hint() -> String {
+    format!(
+        "hint (Linux): start the opt-in runner with \
+         `docker compose -p {COMPOSE_PROJECT} -f docker-compose.test.yml --profile git up -d --wait` \
+         (see docs/refactoring/test-infra.md / docs/development.md)"
+    )
+}
+
+/// Running container id for compose service `git-cli` in project `monoengine-it`.
+///
+/// Uses `docker ps` label filters instead of `docker compose exec` so the probe
+/// does not contend on the Compose project lock (parallel cargo tests were
+/// timing out the 15s probe while waiting on that lock).
+fn running_git_cli_container_id() -> Result<String, String> {
     let mut command = Command::new("docker");
-    command
-        .arg("compose")
-        .arg("-p")
-        .arg(COMPOSE_PROJECT)
-        .arg("-f")
-        .arg(docker_compose_file());
+    command.args([
+        "ps",
+        "-q",
+        "--filter",
+        &format!("label=com.docker.compose.project={COMPOSE_PROJECT}"),
+        "--filter",
+        "label=com.docker.compose.service=git-cli",
+        "--filter",
+        "status=running",
+    ]);
+    let output = try_output_with_timeout(
+        command,
+        DOCKER_RUNNER_PROBE_TIMEOUT,
+        "docker ps git-cli filter",
+    )?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        Err(format!(
+            "no running git-cli container for project {COMPOSE_PROJECT}"
+        ))
+    } else {
+        // `docker ps -q` may return multiple lines if replicas exist; take first.
+        Ok(id.lines().next().unwrap_or(&id).trim().to_string())
+    }
+}
+
+fn docker_exec_base() -> Command {
+    let mut command = Command::new("docker");
+    // Options (`-w`, `-e`, …) must be appended *before* the container id.
+    command.arg("exec");
     command
 }
 
 fn try_container_git_version() -> Result<String, String> {
-    let mut command = compose_command();
-    command.args(["exec", "-T", "git-cli", "git", "--version"]);
+    let container_id = running_git_cli_container_id()?;
+    let mut command = docker_exec_base();
+    command.arg(&container_id).args(["git", "--version"]);
     // Must return Err (not panic) so opt-in host-git remains reachable when
     // docker is missing or the daemon/probe stalls.
-    let output =
-        try_output_with_timeout(command, DOCKER_RUNNER_PROBE_TIMEOUT, "docker runner probe")?;
+    let output = try_output_with_timeout(
+        command,
+        DOCKER_RUNNER_PROBE_TIMEOUT,
+        "docker exec git-cli probe",
+    )?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -148,22 +188,10 @@ fn try_host_git_version() -> Result<String, String> {
     }
 }
 
-/// Resolve the runner once per process. Prefer compose `git-cli`; host git only
-/// when `MONOENGINE_IT_ALLOW_HOST_GIT=1` (Linux local experiments).
-pub fn require_git_cli_runner() {
-    if git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
-        return;
-    }
-
-    if RUNNER.get().is_some() {
-        return;
-    }
-
+fn resolve_runner_kind() -> GitRunnerKind {
     let container_err = match try_container_git_version() {
         Ok(version) if version == PINNED_GIT_CLI_VERSION => {
-            let _ = RUNNER.set(GitRunnerKind::Container);
-            return;
+            return GitRunnerKind::Container;
         }
         Ok(version) => {
             format!("unexpected git version [{version}], expected [{PINNED_GIT_CLI_VERSION}]")
@@ -180,7 +208,7 @@ pub fn require_git_cli_runner() {
                 eprintln!(
                     "git-cli runner (host opt-in): {version} (compose git-cli unavailable: {container_err})"
                 );
-                let _ = RUNNER.set(GitRunnerKind::Host);
+                GitRunnerKind::Host
             }
             Err(host_err) => {
                 eprintln!("{GIT_CLI_UNAVAILABLE}: compose={container_err}; host={host_err}");
@@ -189,13 +217,25 @@ pub fn require_git_cli_runner() {
         }
     } else {
         eprintln!(
-            "{GIT_CLI_UNAVAILABLE}: docker compose exec failed: {container_err}\n\
-             hint (Linux): start the opt-in runner with \
-             `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait git-cli` \
-             (see docs/refactoring/test-infra.md)"
+            "{GIT_CLI_UNAVAILABLE}: docker exec probe failed: {container_err}\n{}",
+            compose_up_git_cli_hint()
         );
         panic!("{GIT_CLI_UNAVAILABLE}");
     }
+}
+
+/// Resolve the runner once per process. Prefer compose `git-cli`; host git only
+/// when `MONOENGINE_IT_ALLOW_HOST_GIT=1` (Linux local experiments).
+///
+/// Serialized via `OnceLock::get_or_init` so parallel tests do not stampede
+/// docker with concurrent probes.
+pub fn require_git_cli_runner() {
+    if git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let _ = RUNNER.get_or_init(resolve_runner_kind);
 }
 
 fn runner_kind() -> GitRunnerKind {
@@ -271,10 +311,11 @@ pub fn git_cli_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
 
 fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
     let work_container = container_path_for_host(case_dir);
+    let container_id =
+        running_git_cli_container_id().unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
 
-    let mut command = compose_command();
+    let mut command = docker_exec_base();
     command
-        .args(["exec", "-T"])
         .arg("-w")
         .arg(&work_container)
         .arg("-e")
@@ -287,21 +328,21 @@ fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
         .arg("GIT_CONFIG_KEY_0=credential.helper")
         .arg("-e")
         .arg("GIT_CONFIG_VALUE_0=")
-        .arg("git-cli");
+        .arg(&container_id);
     append_container_git_timeout_wrapper(&mut command);
     command.args(git_args);
 
     output_with_timeout(
         command,
         GIT_CLI_COMMAND_TIMEOUT + Duration::from_secs(15),
-        "compose git-cli (no-auth)",
+        "docker exec git-cli (no-auth)",
     )
 }
 
 /// In-container wall-clock wrapper around `git`.
 ///
 /// Important: do **not** wrap the script itself in `setsid`. BusyBox `setsid`
-/// starts a new session, and `docker compose exec` then reports exit status 0
+/// starts a new session, and `docker exec` then reports exit status 0
 /// even when the session leader exits non-zero (auth failures looked like
 /// success while stderr still showed `fatal: Authentication failed`). Only the
 /// `git` child is `setsid`'d so timeout can `kill -KILL -$gpid` its helpers.
@@ -397,11 +438,12 @@ fn git_cli_container(
 ) -> Output {
     let askpass_container = container_path_for_host(askpass_host);
     let work_container = container_path_for_host(case_dir);
+    let container_id =
+        running_git_cli_container_id().unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
 
-    let mut command = compose_command();
+    let mut command = docker_exec_base();
     command.env(GIT_ASKPASS_ENV, token);
     command
-        .args(["exec", "-T"])
         .arg("-w")
         .arg(&work_container)
         .arg("-e")
@@ -416,10 +458,10 @@ fn git_cli_container(
         .arg("GIT_CONFIG_KEY_0=credential.username")
         .arg("-e")
         .arg(format!("GIT_CONFIG_VALUE_0={DEFAULT_GIT_AUTH_USER}"))
-        .arg("git-cli");
+        .arg(&container_id);
     // Enforce the wall-clock budget *inside* the container so a stalled
     // git/helper is reaped even if only the host-side docker client dies.
-    // `docker compose exec -T` has no TTY, so BusyBox `set -m` is a no-op.
+    // Non-interactive `docker exec` has no TTY, so BusyBox `set -m` is a no-op.
     // Inner `setsid git` gives Git its own session/process group so timeout
     // can `kill -KILL -$gpid` and reap helpers. The wrapper shell itself must
     // *not* be setsid'd — see `append_container_git_timeout_wrapper`.
@@ -427,12 +469,12 @@ fn git_cli_container(
     command.args(git_args);
 
     // Outer budget must exceed the in-container deadline so the container-side
-    // kill wins first; otherwise we may only reap the host `docker compose`
+    // kill wins first; otherwise we may only reap the host `docker`
     // client and leave git running against the shared workdir.
     output_with_timeout(
         command,
         GIT_CLI_COMMAND_TIMEOUT + Duration::from_secs(15),
-        "compose git-cli",
+        "docker exec git-cli",
     )
 }
 

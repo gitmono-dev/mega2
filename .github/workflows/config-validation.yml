@@ -87,16 +87,16 @@ jobs:
           # Local sibling is ../website → github.com/genedna/website (private).
           repository: genedna/website
           # Pin to the same revision as docs/refactoring/website-auth.md
-          # (Dockerfile copies drizzle.config.sqlite.ts; SQLITE_DB_PATH stays runtime).
-          ref: a52d70362586ae5e171be5db2e5c5457d07ce366
+          # (Dockerfile must COPY drizzle.config.ts for PG website-db-init).
+          ref: 2af89c874646005dd1a550053b5068f19bb7478a
           path: website
           token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
 
-      - name: Guard website Dockerfile supports IT SQLite init
+      - name: Guard website Dockerfile supports IT Postgres init
         run: |
           set -euo pipefail
-          if ! grep -q 'drizzle.config.sqlite.ts' website/apps/next-app/Dockerfile; then
-            echo "::error title=Website Dockerfile missing SQLite drizzle config::apps/next-app/Dockerfile must COPY drizzle.config.sqlite.ts so compose website-db-init can pnpm db:push:sqlite. See docs/refactoring/website-auth.md pin policy."
+          if ! grep -q 'drizzle.config.ts' website/apps/next-app/Dockerfile; then
+            echo "::error title=Website Dockerfile missing PG drizzle config::apps/next-app/Dockerfile must COPY drizzle.config.ts so compose website-db-init can drizzle-kit push against the isolated website Postgres DB. See docs/refactoring/website-auth.md pin policy."
             exit 1
           fi
 
@@ -152,7 +152,6 @@ jobs:
           export MONOENGINE_IT_GIT_GID="$(id -g)"
           docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait
           docker compose -p monoengine-it -f docker-compose.test.yml ps
-          docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init
 
       - name: Start compose-hosted monoengine and website (profiles app + web)
         working-directory: monoengine

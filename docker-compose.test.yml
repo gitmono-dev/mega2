@@ -60,13 +60,12 @@ services:
       retries: 30
       start_period: 10s
 
-  # One-shot bucket initialization via any S3 client (`mc`). Not part of the
-  # default `up -d --wait` set because `--wait` requires selected services to
-  # stay running/healthy; run explicitly with
-  # `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init`.
+  # Bucket initialization via `mc`. Stays up (sleep infinity) with a healthcheck
+  # so default `up -d --wait` can wait on it — a pure one-shot exit breaks --wait.
+  # Recreate this service (or `down` + `up`) after wiping rustfs if the bucket
+  # disappears; `mb --ignore-existing` is idempotent on fresh starts.
   rustfs-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
-    profiles: ["init"]
     depends_on:
       rustfs:
         condition: service_healthy
@@ -74,8 +73,15 @@ services:
       /bin/sh -c "
       /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
       /usr/bin/mc mb --ignore-existing local/testbucket &&
-      /usr/bin/mc anonymous set download local/testbucket
+      /usr/bin/mc anonymous set download local/testbucket &&
+      exec sleep infinity
       "
+    healthcheck:
+      test: ["CMD", "mc", "ls", "local/testbucket"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
 
   # Fixed-version Git CLI runner for cargo-native black-box tests (ADR-IT-01).
   # Uses host networking so the container can reach monoengine bound on the
@@ -158,28 +164,53 @@ services:
       retries: 40
       start_period: 20s
 
-  # One-shot SQLite schema initialization for website-next. It reuses the
+  # One-shot PostgreSQL schema initialization for website-next. Reuses the
   # website Dockerfile builder stage because the production runner is a
-  # standalone Next image and deliberately has no Drizzle tooling. The final
-  # chown makes the initialized database writable by the runner's nextjs user.
+  # standalone Next image and deliberately has no Drizzle tooling.
+  # Account data lives in an isolated `website` database on the shared
+  # postgres service — never the monoengine business DB (ADR-WA-07).
   website-db-init:
     profiles: ["web"]
     build:
       context: ../website
       dockerfile: apps/next-app/Dockerfile
       target: builder
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      DB_DIALECT: sqlite
-      SQLITE_DB_PATH: /app/data/website-it.sqlite
-    volumes:
-      - website-next-data:/app/data
+      DB_DIALECT: pg
+      DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
+      # Connects to the maintenance DB only to CREATE DATABASE website.
+      DATABASE_ADMIN_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/postgres
     command:
       - /bin/sh
       - -ec
-      - pnpm db:push:sqlite && chown -R 1001:1001 /app/data
+      - |
+        node -e "
+        const { Client } = require('pg');
+        (async () => {
+          const admin = new Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+          await admin.connect();
+          const { rowCount } = await admin.query(
+            \"SELECT 1 FROM pg_database WHERE datname = 'website'\"
+          );
+          if (rowCount === 0) {
+            await admin.query('CREATE DATABASE website');
+            console.log('created database website');
+          } else {
+            console.log('database website already exists');
+          }
+          await admin.end();
+        })().catch((err) => {
+          console.error(err);
+          process.exit(1);
+        });
+        "
+        npx drizzle-kit push --force
 
-  # Website Better Auth test instance. It intentionally uses its own SQLite
-  # file rather than the monoengine PostgreSQL business database.
+  # Website Better Auth test instance. Uses isolated Postgres database
+  # `website` on the shared postgres service (not monoengine's business DB).
   # Build locally from the sibling checkout; CI must check out ../website too.
   website-next:
     profiles: ["web"]
@@ -189,8 +220,8 @@ services:
       context: ../website
       dockerfile: apps/next-app/Dockerfile
     environment:
-      DB_DIALECT: sqlite
-      SQLITE_DB_PATH: /app/data/website-it.sqlite
+      DB_DIALECT: pg
+      DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
       APP_BASE_URL: http://127.0.0.1:17001
       BETTER_AUTH_URL: http://127.0.0.1:17001
       BETTER_AUTH_SECRET: monoengine-it-website-auth-secret-0001
@@ -203,10 +234,10 @@ services:
       # Optional CTA base for product templates (not TinyShip APP_BASE_URL).
       MONOENGINE_PUBLIC_BASE_URL: http://127.0.0.1:19180
     depends_on:
+      postgres:
+        condition: service_healthy
       website-db-init:
         condition: service_completed_successfully
-    volumes:
-      - website-next-data:/app/data
     ports:
       - "127.0.0.1:17001:7001"
     healthcheck:
@@ -218,8 +249,7 @@ services:
 
 volumes:
   monoengine-data:
-  website-next-data:
 
 networks:
   default:
-    name: monoengine-test-net
+    name: monoengine-test-network

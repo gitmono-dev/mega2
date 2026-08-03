@@ -935,8 +935,7 @@ fn integration_object_storage_s3_compatible_smoke() {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
              run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` \
-             and `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init` \
-             first, skipping",
+             first (includes rustfs-init creating testbucket), skipping",
             rustfs_endpoint
         );
         return;

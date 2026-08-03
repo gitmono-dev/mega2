@@ -5,14 +5,13 @@
 邮件投递迁出见计划 ADR-WA-08 / 任务 MN-01，事实源为
 [`website-mail.md`](./website-mail.md)。
 
-核对日：**2026-08-02**。Website 仓库 sibling：`../website`（`genedna/website`），分支 **`monoengine`**，
-会话契约基线 revision：**`a52d703`**（含 Dockerfile `drizzle.config.sqlite.ts` COPY、
-`next.config.ts` 运行时 `SQLITE_DB_PATH`，以及内部产品邮件 API WE-02..WE-05）。IT SQLite 初始化要求 website
-`apps/next-app/Dockerfile` 在 builder 阶段复制根目录 `drizzle.config.sqlite.ts`，
-且 `next.config.ts` 保持 `SQLITE_DB_PATH` 为运行时可配置（不得在 build 时内联成
-固定路径）。CI `actions/checkout` `ref` 与本文 pin 须同步到**同一 commit SHA**；
-Dockerfile 内容守卫（缺 `drizzle.config.sqlite.ts` COPY 则失败）保留为回归保护。
-契约漂移时先改本文再改代码。
+核对日：**2026-08-03**。Website 仓库 sibling：`../website`（`genedna/website`），分支 **`monoengine`**，
+会话契约基线 revision：**`2af89c8`**（含内部产品邮件 API WE-02..WE-05；IT 账户库
+PG；Dockerfile 复制 `drizzle.config.ts`）。IT Postgres schema 初始化要求 website
+`apps/next-app/Dockerfile` 在 builder 阶段复制根目录 `drizzle.config.ts`（供
+`website-db-init` 执行 `drizzle-kit push`）。CI `actions/checkout` `ref` 与本文
+pin 须同步到**同一 commit SHA**；Dockerfile 内容守卫（缺 `drizzle.config.ts`
+COPY 则失败）保留为回归保护。契约漂移时先改本文再改代码。
 
 ---
 
@@ -139,10 +138,10 @@ website（或显式 `AccessTokenUser`）。
 | 服务名 | `website-next` |
 | Profile | `web`（默认 `up -d --wait` **不**拉起） |
 | Build | context `../website`，dockerfile `apps/next-app/Dockerfile` |
-| 网络 | `monoengine-test-net` |
+| 网络 | `monoengine-test-network` |
 | 容器端口 | `7001` |
 | 宿主映射 | `127.0.0.1:17001:7001` |
-| 账户库 | IT 默认容器内 **SQLite**；与 monoengine Postgres **隔离** |
+| 账户库 | IT 默认共享 `postgres` 服务上的独立库 **`website`**（`DB_DIALECT=pg`）；与 monoengine 业务库 **`monoengine` 隔离** |
 | monoengine 基址（容器内） | `http://website-next:7001` |
 | 宿主浏览器 origin | `http://127.0.0.1:17001` |
 | monoengine HTTP（profile `app`） | `127.0.0.1:19180` → 容器 `8000` |
