@@ -279,6 +279,23 @@ fn container_path_for_host(host_path: &Path) -> String {
 /// GIT_ASKPASS. For the container runner the token is placed in the docker CLI
 /// process environment and forwarded with `-e NAME` (no `NAME=value` on argv).
 pub fn git_cli(case_dir: &Path, token: &str, git_args: &[&str]) -> Output {
+    git_cli_with_env(case_dir, token, &[], git_args)
+}
+
+#[allow(
+    dead_code,
+    reason = "used by integration_git_lfs; this file is also path-included by integration_git_cli"
+)]
+pub fn git_cli_lfs_skip_smudge(case_dir: &Path, token: &str, git_args: &[&str]) -> Output {
+    git_cli_with_env(case_dir, token, &[("GIT_LFS_SKIP_SMUDGE", "1")], git_args)
+}
+
+fn git_cli_with_env(
+    case_dir: &Path,
+    token: &str,
+    command_env: &[(&str, &str)],
+    git_args: &[&str],
+) -> Output {
     require_git_cli_runner();
     if git_cli_skip_requested() {
         panic!("{GIT_CLI_UNAVAILABLE}: skipped runner cannot execute git");
@@ -290,8 +307,10 @@ pub fn git_cli(case_dir: &Path, token: &str, git_args: &[&str]) -> Output {
     }
 
     match runner_kind() {
-        GitRunnerKind::Container => git_cli_container(case_dir, &askpass_host, token, git_args),
-        GitRunnerKind::Host => git_cli_host(case_dir, &askpass_host, token, git_args),
+        GitRunnerKind::Container => {
+            git_cli_container(case_dir, &askpass_host, token, command_env, git_args)
+        }
+        GitRunnerKind::Host => git_cli_host(case_dir, &askpass_host, token, command_env, git_args),
     }
 }
 
@@ -434,6 +453,7 @@ fn git_cli_container(
     case_dir: &Path,
     askpass_host: &Path,
     token: &str,
+    command_env: &[(&str, &str)],
     git_args: &[&str],
 ) -> Output {
     let askpass_container = container_path_for_host(askpass_host);
@@ -457,8 +477,11 @@ fn git_cli_container(
         .arg("-e")
         .arg("GIT_CONFIG_KEY_0=credential.username")
         .arg("-e")
-        .arg(format!("GIT_CONFIG_VALUE_0={DEFAULT_GIT_AUTH_USER}"))
-        .arg(&container_id);
+        .arg(format!("GIT_CONFIG_VALUE_0={DEFAULT_GIT_AUTH_USER}"));
+    for (name, value) in command_env {
+        command.env(name, value).arg("-e").arg(name);
+    }
+    command.arg(&container_id);
     // Enforce the wall-clock budget *inside* the container so a stalled
     // git/helper is reaped even if only the host-side docker client dies.
     // Non-interactive `docker exec` has no TTY, so BusyBox `set -m` is a no-op.
@@ -478,7 +501,13 @@ fn git_cli_container(
     )
 }
 
-fn git_cli_host(case_dir: &Path, askpass_host: &Path, token: &str, git_args: &[&str]) -> Output {
+fn git_cli_host(
+    case_dir: &Path,
+    askpass_host: &Path,
+    token: &str,
+    command_env: &[(&str, &str)],
+    git_args: &[&str],
+) -> Output {
     // Isolate from the developer's system/global Git config so the opt-in host
     // path does not inherit gpgSign / autocrlf / credential.helper.
     let isolated_home = case_dir.join("git-home");
@@ -509,8 +538,11 @@ fn git_cli_host(case_dir: &Path, askpass_host: &Path, token: &str, git_args: &[&
         .env("GIT_CONFIG_KEY_1", "credential.helper")
         .env("GIT_CONFIG_VALUE_1", "")
         .env("GIT_CONFIG_KEY_2", "core.autocrlf")
-        .env("GIT_CONFIG_VALUE_2", "false")
-        .args(git_args);
+        .env("GIT_CONFIG_VALUE_2", "false");
+    for (name, value) in command_env {
+        command.env(name, value);
+    }
+    command.args(git_args);
     output_with_timeout(command, GIT_CLI_COMMAND_TIMEOUT, "host git")
 }
 

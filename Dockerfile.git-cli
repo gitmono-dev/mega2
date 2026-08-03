@@ -1,0 +1,22 @@
+FROM alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+
+ARG TARGETARCH
+ARG GIT_LFS_VERSION=3.7.1
+
+USER root
+
+RUN set -eux; \
+    arch="${TARGETARCH:-$(uname -m)}"; \
+    case "$arch" in \
+        amd64|x86_64) arch=amd64; sha256=1c0b6ee5200ca708c5cebebb18fdeb0e1c98f1af5c1a9cba205a4c0ab5a5ec08 ;; \
+        arm64|aarch64) arch=arm64; sha256=73a9c90eeb4312133a63c3eaee0c38c019ea7bfa0953d174809d25b18588dd8d ;; \
+        *) echo "unsupported git-lfs architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    archive="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"; \
+    wget -O "/tmp/$archive" "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/$archive"; \
+    echo "$sha256  /tmp/$archive" | sha256sum -c -; \
+    tar -xzf "/tmp/$archive" -C /tmp; \
+    cp "/tmp/git-lfs-${GIT_LFS_VERSION}/git-lfs" /usr/local/bin/git-lfs; \
+    chmod 0755 /usr/local/bin/git-lfs; \
+    rm -rf "/tmp/$archive" "/tmp/git-lfs-${GIT_LFS_VERSION}"; \
+    test "$(git lfs version | cut -d' ' -f1)" = "git-lfs/${GIT_LFS_VERSION}"
