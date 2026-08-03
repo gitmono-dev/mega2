@@ -135,7 +135,11 @@ impl GitSshEnv {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
         let full_config_path = common::write_case_config(&case_dir);
-        let object_root = temp_dir.path().join("objects");
+        // Keep objects under CASE/ssh/base so `${base_dir}/objects` and the
+        // MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR override always resolve to the
+        // same tree (avoids pack generation looking for hashes that were
+        // written to a different root).
+        let object_root = base_dir.join("objects");
         fs::create_dir_all(&object_root).expect("create object root");
 
         Self {
@@ -165,6 +169,9 @@ impl GitSshEnv {
             .env("MEGA_LOG__PRINT_STD", "false")
             .env("MEGA_LOG__WITH_ANSI", "false")
             .env("MEGA_REDIS__URL", integration_redis_url())
+            // Isolate IT from shared compose Redis git-object cache poisoning across
+            // cases / consecutive upload-pack sessions (see GitObjectCache).
+            .env("MEGA_GIT_OBJECT_CACHE_PREFIX", "disabled")
             .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
             .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root);
         command
@@ -357,8 +364,6 @@ fn integration_git_ssh_authenticated_clone() {
     let client_pub = env.ssh_dir.join("client_ed25519.pub");
     let known_hosts = env.ssh_dir.join("known_hosts");
 
-    flush_shared_redis_cache();
-
     // client_key_mode=0600
     git_cli::generate_client_ed25519(&client_key);
     let pubkey = fs::read_to_string(&client_pub).expect("read client public key");
@@ -442,7 +447,6 @@ fn integration_git_ssh_authenticated_clone() {
 fn prepare_authenticated_ssh(
     env: &GitSshEnv,
 ) -> (ServiceProcess, u16, PathBuf, PathBuf, String, String) {
-    flush_shared_redis_cache();
     let client_key = env.ssh_dir.join("client_ed25519");
     let client_pub = env.ssh_dir.join("client_ed25519.pub");
     let known_hosts = env.ssh_dir.join("known_hosts");
@@ -697,32 +701,265 @@ fn integration_git_ssh_pull_cl_ref_round_trip() {
     drop(env);
 }
 
-fn flush_shared_redis_cache() {
-    // SSH git-object cache keys live on the shared compose Redis. Leftover
-    // entries from prior SSH cases make later `ls-remote`/`clone` fail with
-    // `fatal: protocol error: bad line length character: erro`.
-    let mut command = std::process::Command::new("docker");
-    command.args([
-        "compose",
-        "-p",
-        git_cli::COMPOSE_PROJECT,
-        "-f",
-        "docker-compose.test.yml",
-        "exec",
-        "-T",
-        "redis",
-        "redis-cli",
-        "FLUSHDB",
-    ]);
-    command.current_dir(git_cli::repo_root());
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("flush redis cache failed to start: {err}"));
+#[test]
+fn integration_git_ssh_authenticated_push_creates_cl_ref() {
     assert!(
-        output.status.success(),
-        "flush redis cache failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::new();
+    let branch = format!(
+        "gm08-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let fixture_payload = format!(
+        "monoengine gm-08 ssh push fixture pid={} case={}\n",
+        std::process::id(),
+        env.case_dir.display()
+    );
+    let fixture_rel = Path::new("gm-08-ssh-push-fixture.txt");
+    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
+    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
+    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
+
+    let (mut service, port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh(&env);
+    let service_pid = service.pid();
+
+    let clone_name = "ssh-push-src";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "clone SSH worktree before authenticated push",
+    );
+    let clone = env.case_dir.join(clone_name);
+    let expected_seed = expected_init_monorepo_fixture();
+    assert_eq!(
+        snapshot_workdir(&clone),
+        expected_seed,
+        "pre-push clone must match seeded monorepo fixture"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create push branch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "config", "user.name", "GM-08 SSH Push"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "gm-08-ssh@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::copy(&fixture_host, clone.join(fixture_rel)).expect("copy fixture into clone");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "add", fixture_rel.to_str().unwrap()],
+        ),
+        "git add push fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "commit", "-m", "gm-08 ssh push fixture"],
+        ),
+        "git commit push fixture",
+    );
+
+    let before_cl = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote);
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        ),
+        "authenticated SSH push",
+    );
+
+    let after_cl = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote);
+    let cl_ref = after_cl
+        .into_iter()
+        .find(|r| !before_cl.contains(r))
+        .unwrap_or_else(|| panic!("expected a new refs/cl/* after SSH branch push"));
+    assert!(
+        cl_ref.starts_with("refs/cl/"),
+        "expected refs/cl/* tip after authenticated SSH push, got {cl_ref}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_wrong_key_is_rejected() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::new();
+    let (mut service, port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh(&env);
+    let service_pid = service.pid();
+
+    let clone_name = "ssh-wrong-key-src";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "clone with seeded key before wrong-key push",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "checkout",
+                "-b",
+                &format!("gm08-bad-{}", std::process::id()),
+            ],
+        ),
+        "create branch for wrong-key push attempt",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "config", "user.name", "GM-08 Wrong Key"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "gm-08-wrong@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    let marker = env.case_dir.join(clone_name).join("gm-08-wrong-key.txt");
+    fs::write(&marker, b"wrong-key push must fail\n").expect("write marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "add", "gm-08-wrong-key.txt"],
+        ),
+        "git add wrong-key marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "commit", "-m", "gm-08 wrong-key attempt"],
+        ),
+        "git commit wrong-key marker",
+    );
+
+    // ADR-GM-05: second unseeded keypair; do not rewrite known_hosts.
+    let bad_key = env.ssh_dir.join("client_ed25519_bad");
+    git_cli::generate_client_ed25519(&bad_key);
+    let bad_git_ssh = git_ssh.replace("client_ed25519", "client_ed25519_bad");
+    assert!(
+        bad_git_ssh.contains("client_ed25519_bad"),
+        "wrong-key GIT_SSH_COMMAND must select the unseeded private key"
+    );
+    assert!(
+        !bad_git_ssh.contains("client_ed25519 "),
+        "wrong-key GIT_SSH_COMMAND must not still point at the seeded private key"
+    );
+
+    let push = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &bad_git_ssh,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            "HEAD:refs/heads/gm08-wrong-key",
+        ],
+    );
+    assert!(
+        !push.status.success(),
+        "unseeded SSH key must be rejected; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "SSH service must remain listening after wrong-key rejection on port {port}"
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["ls-remote", &remote, "HEAD"]),
+        "seeded key must still ls-remote after wrong-key rejection",
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
 }
 
 fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
@@ -849,6 +1086,7 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 /// Complete expected worktree for `MegaModelConverter::init` against the default
 /// `config/config.toml` monorepo settings (`admin = ["benjamin_747"]`, the six
 /// `root_dirs`). Kept in sync with `src/jupiter/utils/converter.rs::init_trees`.
+
 fn expected_init_monorepo_fixture() -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut out = BTreeMap::new();
     for dir in [

@@ -108,6 +108,10 @@ services:
     # host networking into the data-plane stack on non-target Docker Desktop
     # machines. Enable with `--profile git` on Linux CI/local VER.
     profiles: ["git"]
+    # Reap orphaned git/ssh children from the docker-exec timeout wrapper
+    # (setsid + kill). Without init, PID 1 is `sleep infinity` and zombies
+    # accumulate until later SSH clones fail with protocol `error: …`.
+    init: true
     network_mode: host
     user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"
     volumes:

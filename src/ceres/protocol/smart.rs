@@ -219,6 +219,14 @@ impl SmartSession {
         let want: Vec<String> = want.into_iter().collect();
         let have: Vec<String> = have.into_iter().collect();
 
+        // Empty want can appear when an SSH data chunk is handled before the
+        // client has sent object ids. Do not attempt pack generation.
+        if want.is_empty() {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
+            return Ok((ReceiverStream::new(rx), protocol_buf));
+        }
+
         // Capability honesty: `shallow` is advertised for upload-pack, but
         // only MonoRepo genuinely implements depth-limited pack generation.
         // ImportRepo's default trait `shallow_pack` silently falls back to

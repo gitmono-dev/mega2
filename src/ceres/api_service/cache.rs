@@ -23,6 +23,10 @@ pub struct GitObjectCache {
 const DEFAULT_EXPIRY_SECONDS: u64 = 60 * 60 * 24; // 1 days
 
 impl GitObjectCache {
+    fn caching_enabled(&self) -> bool {
+        !self.prefix.is_empty() && self.prefix != "disabled"
+    }
+
     pub async fn get_tree<F, Fut>(
         &self,
         oid: ObjectHash,
@@ -35,7 +39,8 @@ impl GitObjectCache {
         let key = format!("{}:tree:{}", self.prefix, oid);
         let mut conn = self.connection.clone();
 
-        if let Ok(data) = conn.get::<_, Vec<u8>>(&key).await
+        if self.caching_enabled()
+            && let Ok(data) = conn.get::<_, Vec<u8>>(&key).await
             && !data.is_empty()
         {
             match rkyv::access::<ArchivedTree, Error>(&data) {
@@ -45,16 +50,39 @@ impl GitObjectCache {
                 }
                 Err(err) => {
                     tracing::error!("deserialize failed with fetch key: {:?}, err{:?}", key, err);
+                    let _: Result<(), _> = conn.del(&key).await;
                 }
             }
         }
 
         let tree_raw = fetch_tree(oid).await?;
-        let serialized = rkyv::to_bytes::<Error>(&tree_raw)?;
         let tree = Arc::new(tree_raw);
-        let _: () = conn
-            .set_ex(key, serialized.as_slice(), DEFAULT_EXPIRY_SECONDS)
-            .await?;
+        if self.caching_enabled() {
+            match rkyv::to_bytes::<Error>(tree.as_ref()) {
+                Ok(serialized) => {
+                    if let Err(err) = conn
+                        .set_ex::<_, _, ()>(&key, serialized.as_slice(), DEFAULT_EXPIRY_SECONDS)
+                        .await
+                    {
+                        // Cache write must not fail the Git protocol response. Shared
+                        // Redis FLUSHALL / transient connection errors otherwise surface
+                        // to clients as `error: …` (`bad line length character: erro`).
+                        tracing::warn!(
+                            key = %key,
+                            error = %err,
+                            "git object tree cache write failed; serving fetched object"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        key = %key,
+                        error = %err,
+                        "git object tree cache serialize failed; serving fetched object"
+                    );
+                }
+            }
+        }
 
         Ok(tree)
     }
@@ -71,7 +99,8 @@ impl GitObjectCache {
         let mut conn = self.connection.clone();
         let key = format!("{}:commit:{}", self.prefix, oid);
 
-        if let Ok(data) = conn.get::<_, Vec<u8>>(&key).await
+        if self.caching_enabled()
+            && let Ok(data) = conn.get::<_, Vec<u8>>(&key).await
             && !data.is_empty()
         {
             match rkyv::access::<ArchivedCommit, Error>(&data) {
@@ -81,16 +110,36 @@ impl GitObjectCache {
                 }
                 Err(err) => {
                     tracing::error!("deserialize failed with fetch key: {:?} err{:?}", key, err);
+                    let _: Result<(), _> = conn.del(&key).await;
                 }
             }
         }
 
         let commit_raw = fetch_commit(oid).await?;
-        let serialized = rkyv::to_bytes::<Error>(&commit_raw)?;
         let commit = Arc::new(commit_raw);
-        let _: () = conn
-            .set_ex(key, serialized.as_slice(), DEFAULT_EXPIRY_SECONDS)
-            .await?;
+        if self.caching_enabled() {
+            match rkyv::to_bytes::<Error>(commit.as_ref()) {
+                Ok(serialized) => {
+                    if let Err(err) = conn
+                        .set_ex::<_, _, ()>(&key, serialized.as_slice(), DEFAULT_EXPIRY_SECONDS)
+                        .await
+                    {
+                        tracing::warn!(
+                            key = %key,
+                            error = %err,
+                            "git object commit cache write failed; serving fetched object"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        key = %key,
+                        error = %err,
+                        "git object commit cache serialize failed; serving fetched object"
+                    );
+                }
+            }
+        }
 
         Ok(commit)
     }

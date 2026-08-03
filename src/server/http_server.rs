@@ -579,7 +579,8 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
 
     let git_object_cache = Arc::new(GitObjectCache {
         connection: ctx.connection.clone(),
-        prefix: "git-object-rkyv:v1".to_string(),
+        prefix: std::env::var("MEGA_GIT_OBJECT_CACHE_PREFIX")
+            .unwrap_or_else(|_| "git-object-rkyv:v1".to_string()),
     });
 
     let api_state = MonoApiServiceState {
