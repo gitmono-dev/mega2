@@ -6,6 +6,7 @@
 use std::{
     env, fs,
     io::Read,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::OnceLock,
@@ -106,6 +107,154 @@ pub fn record_allocated_port(port: u16) {
 
 pub fn record_service_pid(pid: u32) {
     append_evidence_line("MONOENGINE_IT_PIDS_FILE", &pid.to_string());
+}
+
+/// Bind `127.0.0.1:0`, capture the OS-assigned port, then drop the listener.
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn reserve_ephemeral_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn wait_until_port_closed(port: u16, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    panic!("owned service port {port} still accepts connections after shutdown");
+}
+
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn assert_port_refuses(port: u16) {
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "port {port} must refuse connections after SSH lifecycle cleanup"
+    );
+}
+
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn assert_process_reaped(pid: u32) {
+    // SAFETY: signal 0 only probes whether the former child PID still exists.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert_eq!(result, -1, "owned service process {pid} must be gone");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH),
+        "owned service process {pid} must be fully reaped"
+    );
+}
+
+/// Assert the Vault DB holds ciphertext for `ssh_server_key` (no plaintext PEM).
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn assert_ssh_server_key_ciphertext_in_db(db_url: &str) {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect DB to assert vault ssh_server_key: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT key, value FROM vault WHERE key LIKE '%ssh_server_key%'".to_string(),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query vault ssh_server_key: {err}"));
+        assert!(
+            !rows.is_empty(),
+            "expected at least one vault row matching ssh_server_key"
+        );
+        for row in &rows {
+            let key: String = row
+                .try_get("", "key")
+                .unwrap_or_else(|err| panic!("read vault key: {err}"));
+            let value: Vec<u8> = row
+                .try_get("", "value")
+                .unwrap_or_else(|err| panic!("read vault value for {key}: {err}"));
+            assert!(
+                !value.is_empty(),
+                "vault row {key} ciphertext must be non-empty"
+            );
+            let as_utf8 = String::from_utf8_lossy(&value);
+            assert!(
+                !as_utf8.contains("BEGIN OPENSSH PRIVATE KEY"),
+                "vault row {key} must store ciphertext, not plaintext OpenSSH PEM"
+            );
+        }
+    });
+}
+
+/// Walk `root` and fail if any file contains an OpenSSH private key PEM marker.
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn assert_no_openssh_private_key_under(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    fn walk(path: &Path) {
+        if path.is_dir() {
+            for entry in
+                fs::read_dir(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+            {
+                walk(&entry.expect("dir entry").path());
+            }
+            return;
+        }
+        let bytes = fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "host private key plaintext must not appear on disk at {}",
+            path.display()
+        );
+    }
+    walk(root);
+}
+
+/// Confirm the named database no longer exists on the admin URL.
+#[allow(
+    dead_code,
+    reason = "SSH lifecycle helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn assert_database_absent(admin_url: &str, db_name: &str) {
+    with_runtime(async {
+        let db = Database::connect(admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect admin DB to assert drop: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT 1 FROM pg_database WHERE datname = '{db_name}'"),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query pg_database for {db_name}: {err}"));
+        assert!(
+            rows.is_empty(),
+            "temporary database {db_name} must be dropped after SSH lifecycle cleanup"
+        );
+    });
 }
 
 fn compose_up_git_cli_hint() -> String {
