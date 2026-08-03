@@ -357,6 +357,8 @@ fn integration_git_ssh_authenticated_clone() {
     let client_pub = env.ssh_dir.join("client_ed25519.pub");
     let known_hosts = env.ssh_dir.join("known_hosts");
 
+    flush_shared_redis_cache();
+
     // client_key_mode=0600
     git_cli::generate_client_ed25519(&client_key);
     let pubkey = fs::read_to_string(&client_pub).expect("read client public key");
@@ -435,6 +437,292 @@ fn integration_git_ssh_authenticated_clone() {
     git_cli::wait_until_port_closed(port, Duration::from_secs(5));
     drop(service);
     drop(env);
+}
+
+fn prepare_authenticated_ssh(
+    env: &GitSshEnv,
+) -> (ServiceProcess, u16, PathBuf, PathBuf, String, String) {
+    flush_shared_redis_cache();
+    let client_key = env.ssh_dir.join("client_ed25519");
+    let client_pub = env.ssh_dir.join("client_ed25519.pub");
+    let known_hosts = env.ssh_dir.join("known_hosts");
+
+    git_cli::generate_client_ed25519(&client_key);
+    let pubkey = fs::read_to_string(&client_pub).expect("read client public key");
+    let finger = git_cli::ssh_fingerprint_sha256_col2(&client_pub);
+
+    {
+        let (mut migrate_service, _migrate_port, _out, err) = boot_service_ssh(env);
+        let status = migrate_service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(
+            status.success(),
+            "migrate boot did not shut down cleanly: {status}\nstderr:\n{}",
+            read_log(&err),
+        );
+        drop(migrate_service);
+    }
+
+    git_cli::seed_ssh_key(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        "gm-ssh",
+        pubkey.trim(),
+        &finger,
+    );
+    git_cli::assert_ssh_keys_row_matches_keypair(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        &finger,
+    );
+
+    let (service, port, stdout_path, stderr_path) = boot_service_ssh(env);
+    git_cli::write_known_hosts_via_keyscan(&known_hosts, port);
+    let git_ssh = git_cli::git_ssh_command(&env.case_dir, port);
+    let remote = format!("ssh://{}@127.0.0.1:{port}/", git_cli::DEFAULT_SSH_AUTH_USER);
+    (service, port, stdout_path, stderr_path, git_ssh, remote)
+}
+
+fn ls_remote_cl_refs_ssh(case_dir: &Path, git_ssh: &str, remote: &str) -> Vec<String> {
+    let output = git_cli::git_cli_ssh(case_dir, git_ssh, &["ls-remote", remote, "refs/cl/*"]);
+    git_cli::assert_git_success(&output, "list remote CL refs over SSH");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .filter(|name| !name.ends_with("^{}"))
+        .collect()
+}
+
+#[test]
+fn integration_git_ssh_pull_cl_ref_round_trip() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::new();
+    let case_id = format!(
+        "gm07-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let fixture_payload = format!(
+        "monoengine gm-07 ssh pull fixture pid={} case={}\n",
+        std::process::id(),
+        env.case_dir.display()
+    );
+    let fixture_rel = Path::new("gm-07-ssh-pull-fixture.txt");
+    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
+    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
+    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
+
+    let (mut service, port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh(&env);
+    let service_pid = service.pid();
+
+    let sender_name = "ssh-pull-sender";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, sender_name]),
+        "clone SSH sender worktree",
+    );
+    let sender = env.case_dir.join(sender_name);
+    let expected_seed = expected_init_monorepo_fixture();
+    assert_eq!(
+        snapshot_workdir(&sender),
+        expected_seed,
+        "sender clone must match seeded monorepo fixture before pull case mutates a CL tip"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", sender_name, "checkout", "-b", &case_id],
+        ),
+        "create sender branch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", sender_name, "config", "user.name", "GM-07 SSH Pull"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                sender_name,
+                "config",
+                "user.email",
+                "gm-07-ssh@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::copy(&fixture_host, sender.join(fixture_rel)).expect("copy fixture into sender");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", sender_name, "add", fixture_rel.to_str().unwrap()],
+        ),
+        "git add pull fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", sender_name, "commit", "-m", "gm-07 ssh pull fixture"],
+        ),
+        "git commit pull fixture",
+    );
+    let sender_tree = snapshot_workdir(&sender);
+    let fixture_key = path_bytes(fixture_rel);
+    let fixture_bytes = fixture_payload.as_bytes().to_vec();
+    assert_eq!(
+        sender_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "sender tree must contain the pull fixture bytes"
+    );
+
+    let before_cl = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote);
+    let refspec = format!("HEAD:refs/heads/{case_id}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                sender_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        ),
+        "push sender tip to create refs/cl/* for SSH pull",
+    );
+    let after_cl = ls_remote_cl_refs_ssh(&env.case_dir, &git_ssh, &remote);
+    let cl_ref = after_cl
+        .into_iter()
+        .find(|r| !before_cl.contains(r))
+        .unwrap_or_else(|| panic!("expected new refs/cl/* after push for case {case_id}"));
+    assert!(
+        cl_ref.starts_with("refs/cl/"),
+        "expected refs/cl/* tip, got {cl_ref}"
+    );
+
+    let puller_name = "ssh-pull-receiver";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, puller_name]),
+        "clone default tip for literal SSH pull",
+    );
+    let puller = env.case_dir.join(puller_name);
+    assert_eq!(
+        snapshot_workdir(&puller),
+        expected_seed,
+        "pull receiver default main must equal seed tree before literal pull"
+    );
+
+    let local_branch = format!("pulled-{case_id}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", puller_name, "checkout", "-b", &local_branch],
+        ),
+        "create local branch for literal pull",
+    );
+    // Literal `git pull origin <refs/cl/…>` (ADR-GM-02). Not fetch+checkout.
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                puller_name,
+                "-c",
+                "protocol.version=0",
+                "pull",
+                "--ff-only",
+                "origin",
+                &cl_ref,
+            ],
+        ),
+        "literal git pull of refs/cl tip into local branch over SSH",
+    );
+
+    let pulled_tree = snapshot_workdir(&puller);
+    assert_eq!(
+        pulled_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "literal pull worktree must contain sender fixture bytes"
+    );
+    assert_eq!(
+        pulled_tree, sender_tree,
+        "literal pull worktree must match sender snapshot byte-for-byte"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", puller_name, "checkout", "main"],
+        ),
+        "return to default main after pull",
+    );
+    assert_eq!(
+        snapshot_workdir(&puller),
+        expected_seed,
+        "default main must remain the seed tree after literal CL pull"
+    );
+
+    let _ = port;
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
+fn flush_shared_redis_cache() {
+    // SSH git-object cache keys live on the shared compose Redis. Leftover
+    // entries from prior SSH cases make later `ls-remote`/`clone` fail with
+    // `fatal: protocol error: bad line length character: erro`.
+    let mut command = std::process::Command::new("docker");
+    command.args([
+        "compose",
+        "-p",
+        git_cli::COMPOSE_PROJECT,
+        "-f",
+        "docker-compose.test.yml",
+        "exec",
+        "-T",
+        "redis",
+        "redis-cli",
+        "FLUSHDB",
+    ]);
+    command.current_dir(git_cli::repo_root());
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("flush redis cache failed to start: {err}"));
+    assert!(
+        output.status.success(),
+        "flush redis cache failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
