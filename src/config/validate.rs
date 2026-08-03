@@ -1407,6 +1407,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "notification",
             "vault",
             "oauth",
+            "git",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1498,6 +1499,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "website_api_base_url",
             "session_cookie_names",
         ]),
+        "git" => Some(&["anonymous_access"]),
         _ => None,
     }
 }

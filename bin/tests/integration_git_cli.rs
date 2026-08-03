@@ -110,6 +110,14 @@ struct GitCliEnv {
 
 impl GitCliEnv {
     fn new() -> Self {
+        Self::with_config_append("")
+    }
+
+    fn with_git_anonymous_access(anonymous_access: bool) -> Self {
+        Self::with_config_append(&format!("\n[git]\nanonymous_access = {anonymous_access}\n"))
+    }
+
+    fn with_config_append(append: &str) -> Self {
         git_cli::require_git_cli_runner();
 
         let work_root = git_cli::git_cli_workdir();
@@ -137,7 +145,7 @@ impl GitCliEnv {
         let cache_dir = temp_dir.path().join("cache");
         let object_root = temp_dir.path().join("objects");
 
-        common::write_full_config(&full_config_path);
+        common::write_full_config_with_append(&full_config_path, append);
         git_cli::write_git_askpass(&case_dir.join("git-askpass.sh"));
 
         Self {
@@ -729,6 +737,81 @@ fn integration_git_cli_http_pull_cl_ref_round_trip() {
     assert_eq!(
         puller_main_after, expected_seed,
         "default main must remain the seed tree after literal CL pull"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
+    // plan-20260803 GM-03: per-case `[git] anonymous_access = false` must reject
+    // unauthenticated clone while the same service still accepts token clone.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::with_git_anonymous_access(false);
+    let config_text = fs::read_to_string(&env.full_config_path).expect("read per-case config");
+    assert!(
+        config_text.contains("[git]"),
+        "per-case config must contain [git] override:\n{config_text}"
+    );
+    assert!(
+        config_text
+            .lines()
+            .any(|l| l.trim() == "anonymous_access = false"),
+        "per-case config must set anonymous_access = false:\n{config_text}"
+    );
+
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let anon_clone = git_cli::git_cli_no_auth(
+        &env.case_dir,
+        &["clone", &remote_url, "anon-disabled-clone"],
+    );
+    assert!(
+        !anon_clone.status.success(),
+        "anonymous clone must fail when anonymous_access=false; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        anon_clone.status,
+        String::from_utf8_lossy(&anon_clone.stdout),
+        String::from_utf8_lossy(&anon_clone.stderr)
+    );
+    let anon_err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&anon_clone.stdout),
+        String::from_utf8_lossy(&anon_clone.stderr)
+    )
+    .to_ascii_lowercase();
+    assert!(
+        anon_err.contains("authentication")
+            || anon_err.contains("401")
+            || anon_err.contains("unauthorized")
+            || anon_err.contains("auth"),
+        "anonymous failure must look like an auth rejection, got:\n{anon_err}"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["clone", &remote_url, "token-enabled-clone"],
+        ),
+        "token clone must succeed on same service with anonymous_access=false",
+    );
+    let token_tree = snapshot_workdir(&env.case_dir.join("token-enabled-clone"));
+    assert_eq!(
+        token_tree,
+        expected_init_monorepo_fixture(),
+        "authenticated clone must still receive the seeded monorepo tree"
     );
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));
