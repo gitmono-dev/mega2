@@ -601,7 +601,44 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 **（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 CL push 与 LFS；2026-08-03 对齐 MonoRepo 分支/tag 规则）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、CL push（无新公开分支）、**拒绝** Git-client tag push、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MONOENGINE_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
 
-建议脚本或后续集成测试覆盖：
+### 场景覆盖表（权威，plan-20260803 / ADR-GM-01）
+
+> **口径（强制）:** `git clone` / `git fetch` **不等于**覆盖字面 `git pull`。字面 pull 仅以下方 `cargo:…_pull_…` 格计；不得用 clone/fetch 冒充 pull 覆盖。
+
+单元格取值只能是：`cargo:<exact_fn>`、`smoke:<case>`、`DEFER-GM-*`、或 `N/A+理由`。本表是唯一完整矩阵；`integration.md` 只保留 target 索引与回链。
+
+| 用户命令 | HTTP | SSH | Auth | Repo-shape |
+|---|---|---|---|---|
+| ls-remote | smoke:HTTP_ls-remote | smoke:SSH_ls-remote | N/A+只读广告默认匿名 | N/A+MonoRepo根路径；ImportRepo见DEFER-GM-01 |
+| clone | cargo:integration_git_cli_http_round_trip | cargo:integration_git_ssh_authenticated_clone | cargo:integration_git_cli_auth_anonymous_disabled_rejects_clone | cargo:integration_git_cli_failpath_clone_missing_repo_keeps_service_alive |
+| fetch | smoke:HTTP_fetch | smoke:SSH_fetch | N/A+随clone/token往返覆盖 | N/A+MonoRepo；ImportRepo见DEFER-GM-01 |
+| pull（字面） | cargo:integration_git_cli_http_pull_cl_ref_round_trip | cargo:integration_git_ssh_pull_cl_ref_round_trip | N/A+pull用例内鉴权与HTTP匿名默认 | N/A+定向refs/cl；非默认main快进 |
+| push（CL） | cargo:integration_git_cli_http_round_trip | cargo:integration_git_ssh_authenticated_push_creates_cl_ref | cargo:integration_git_cli_auth_push_without_token_returns_401_challenge | N/A+MonoRepo不新建refs/heads |
+| CL ref delete（清理） | smoke:HTTP_push_CL | smoke:SSH_push_CL | N/A+删除随push_CL清理；无独立Auth用例 | N/A+仅删除本用例生成的refs/cl；不覆盖公开分支删除 |
+| tag push（拒绝） | cargo:integration_git_cli_http_rejects_git_client_tag_push | smoke:SSH_reject_Git-client_tag_push | N/A+拒绝路径不依赖token形态 | N/A+MonoRepo禁客户端tag创建 |
+| tag delete（拒绝） | N/A+本计划未单列tag删除拒绝用例；产品禁tag见monorepo.md | N/A+同HTTP；SSH未单列tag删除拒绝 | N/A+非鉴权矩阵轴 | N/A+公开refs/tags删除非本计划目标 |
+| branch delete（公开） | N/A+MonoRepo不提供公开refs/heads删除场景 | N/A+同HTTP | N/A+非鉴权矩阵轴 | N/A+公开分支删除非目标 |
+| LFS push | cargo:integration_git_lfs_http_round_trip | DEFER-GM-02 | N/A+LFS往返内token | N/A+MonoRepo+显式info/lfs |
+| LFS pull | cargo:integration_git_lfs_http_round_trip | DEFER-GM-02 | N/A+随LFS往返 | N/A+定向CL取回后git_lfs_pull |
+| LFS locks（list） | smoke:HTTP_LFS_push_and_clone | DEFER-GM-02 | N/A+随LFS smoke | N/A+只读list |
+| SSH lifecycle/topology | N/A+HTTP不经sshd | cargo:integration_git_ssh_service_lifecycle_isolated | cargo:integration_git_ssh_wrong_key_is_rejected | N/A+cargo-native自启拓扑 |
+| Mega refs fixture | cargo:integration_git_cli_mega_fixture_refs_round_trip | N/A+夹具守卫留在HTTP target | N/A+夹具不改鉴权面 | N/A+GM-09 go/no-go后启用或取消 |
+| shell SSH 广度 CI | N/A+HTTP已有CI smoke | DEFER-GM-04 | N/A+DEFER范围 | N/A+DEFER范围 |
+| missing-repo 客户端失败 | DEFER-GM-05 | DEFER-GM-05 | N/A+空仓广告语义 | N/A+原DEFER-IT-12→DEFER-GM-05由GM-11B收口 |
+
+#### GAP 映射（plan-20260803）
+
+| GAP | 缺口 | 承接 |
+|---|---|---|
+| GAP-01 | 无字面 git pull | GM-02 |
+| GAP-02 | anonymous_access=false 无真实 CLI | GM-03 |
+| GAP-03 | LFS 不在 cargo 分层门 | GM-05 |
+| GAP-04 | SSH 无确定性 cargo 拓扑与指纹播种 | GM-06 |
+| GAP-05 | Mega 夹具许可/体积/生成方式未审计 | GM-09 |
+| GAP-06 | 场景表与 target/CI 归属漂移 | GM-11B |
+| GAP-07 | DEFER-IT-12 missing-repo 边界未收口 | DEFER-GM-05 |
+
+历史建议清单（已被上表取代为权威单元格，仅保留作叙述背景）：
 
 ```text
 HTTP:

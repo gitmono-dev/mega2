@@ -22,10 +22,16 @@ the default integration suite nor CI requires a monoengine SMTP success path.
 
 ## Active integration targets
 
+Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`、LFS、DEFER）以
+[`protocol.md` 的「场景覆盖表」](./protocol.md#场景覆盖表权威plan-20260803--adr-gm-01)
+为唯一事实源；本文件只登记 cargo target 索引，不复制矩阵单元格。
+
 | Target | Purpose | Prerequisites |
 | --- | --- | --- |
 | `integration_vault` | CLI config, Vault bootstrap, redaction, and HTTP smoke | PostgreSQL and Redis |
 | `integration_git_cli` | Git HTTP protocol round trips | PostgreSQL, Redis, `--profile git` |
+| `integration_git_lfs` | Git HTTP LFS push → fetch → `git lfs pull` round trip（plan-20260803 / GM-05） | PostgreSQL, Redis, `--profile git`, git-lfs |
+| `integration_git_ssh` | Git SSH cargo-native self-start clone/pull/push（plan-20260803 / GM-06..08） | PostgreSQL, Redis, `--profile git` |
 | `integration_website_auth` | Better Auth cookie to monoengine session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
 | `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
 

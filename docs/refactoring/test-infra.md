@@ -238,6 +238,22 @@ WEBSITE_IT=1 cargo test -p monoengine --test integration_website_mail -- --test-
 未设置 `WEBSITE_IT=1` 时该 target 会明确输出 `SKIP`，供默认数据面循环使用；设置后，
 `website-next:17001` 不可达即测试失败，因此 CI 不会将跳过误记为通过。
 
+### cargo-native self-start SSH（ADR-GM-05）
+
+SSH 集成测试**禁止**在测试栈中新增 sshd 服务；唯一拓扑是 cargo-native self-start：
+每 case 用 `CARGO_BIN_EXE_monoengine --config CASE/config.toml service ssh --host 127.0.0.1 --ssh-port PORT`
+在临时高位端口拉起进程，证据落在 `bin/tests/integration_git_ssh.rs`。
+
+| 项 | 值 |
+|---|---|
+| Host key | Vault `ssh_server_key` 密文只进 case DB；明文仅服务内存；`MEGA_BASE_DIR=CASE/ssh/base` |
+| Client key | `ssh-keygen` → `CASE/ssh/client_ed25519`（mode `0600`） |
+| DB seed | `ssh_keys` 插入 fingerprint（`ssh-keygen -lf … -E sha256` 第二列） |
+| known_hosts | `ssh-keyscan -p PORT 127.0.0.1` 写入 `CASE/ssh/known_hosts`（仅本 case 端口） |
+| GIT_SSH_COMMAND | `ssh -i CASE/ssh/client_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=CASE/ssh/known_hosts -o StrictHostKeyChecking=yes -p PORT` |
+| 端口 | 探测 `127.0.0.1:0` 取 ephemeral 端口后立即启动 `--ssh-port` |
+| 清理 | SIGINT 停服务、回收 PID、删除临时 DB 与 `CASE/ssh` |
+
 ## 强制纪律
 
 **新增服务必须先按 checklist 登记评审，禁止绕规范加服务。**
