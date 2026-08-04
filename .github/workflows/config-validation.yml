@@ -3,46 +3,52 @@ name: Config Validation
 on:
   pull_request:
     paths:
+      - ".env.test.example"
       - ".github/workflows/config-validation.yml"
-      - "config/**"
-      - "src/cli.rs"
-      - "src/commands/config.rs"
-      - "src/config/**"
-      - "src/contract/vault/integration/vault_core.rs"
-      - "docs/refactoring/config.md"
-      - "docs/refactoring/mail.md"
-      - "docs/refactoring/vault.md"
+      - "Dockerfile"
+      - "Dockerfile.git-cli"
+      - "Dockerfile.it-runtime"
       - "README.md"
       - "bin/tests/**"
+      - "config/**"
       - "docker-compose.test.yml"
-      - "Dockerfile"
-      - "Dockerfile.it-runtime"
-      - ".env.test.example"
-      - "src/notification/**"
-      - "src/jupiter/storage/notification_storage.rs"
+      - "docs/refactoring/config.md"
+      - "docs/refactoring/mail.md"
       - "docs/refactoring/test-infra.md"
+      - "docs/refactoring/vault.md"
+      - "src/cli.rs"
+      - "src/commands/config.rs"
+      - "src/commands/service/ssh.rs"
+      - "src/config/**"
+      - "src/contract/vault/integration/vault_core.rs"
+      - "src/jupiter/storage/notification_storage.rs"
+      - "src/notification/**"
+      - "src/server/ssh_server.rs"
   push:
     branches:
       - main
     paths:
+      - ".env.test.example"
       - ".github/workflows/config-validation.yml"
-      - "config/**"
-      - "src/cli.rs"
-      - "src/commands/config.rs"
-      - "src/config/**"
-      - "src/contract/vault/integration/vault_core.rs"
-      - "docs/refactoring/config.md"
-      - "docs/refactoring/mail.md"
-      - "docs/refactoring/vault.md"
+      - "Dockerfile"
+      - "Dockerfile.git-cli"
+      - "Dockerfile.it-runtime"
       - "README.md"
       - "bin/tests/**"
+      - "config/**"
       - "docker-compose.test.yml"
-      - "Dockerfile"
-      - "Dockerfile.it-runtime"
-      - ".env.test.example"
-      - "src/notification/**"
-      - "src/jupiter/storage/notification_storage.rs"
+      - "docs/refactoring/config.md"
+      - "docs/refactoring/mail.md"
       - "docs/refactoring/test-infra.md"
+      - "docs/refactoring/vault.md"
+      - "src/cli.rs"
+      - "src/commands/config.rs"
+      - "src/commands/service/ssh.rs"
+      - "src/config/**"
+      - "src/contract/vault/integration/vault_core.rs"
+      - "src/jupiter/storage/notification_storage.rs"
+      - "src/notification/**"
+      - "src/server/ssh_server.rs"
 
 jobs:
   validate-config:
@@ -372,8 +378,10 @@ jobs:
           cargo test -p monoengine --test integration_website_auth -- --test-threads=1
           # WE-06: website internal product-email API (bearer + allowlisted event).
           cargo test -p monoengine --test integration_website_mail -- --test-threads=1
-          # Linux-only git-cli HTTP round-trip / auth / failpath harness (IT-03/10/12).
-          cargo test -p monoengine --test integration_git_cli -- --test-threads=1
+          # Linux-only git-cli HTTP / LFS / SSH harnesses (env -u so SKIP cannot soft-pass).
+          env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_cli -- --test-threads=1
+          env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_lfs -- --test-threads=1
+          env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_ssh -- --test-threads=1
           # Product-email delivery is owned by website (test provider in compose).
           # Monoengine proves acceptance via integration_website_mail above.
 
