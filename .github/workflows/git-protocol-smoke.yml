@@ -13,35 +13,45 @@ on:
   pull_request:
     paths:
       - ".github/workflows/git-protocol-smoke.yml"
-      - "scripts/git_protocol_smoke.sh"
-      - "src/ceres/protocol/**"
-      - "src/contract/git_protocol/**"
-      - "src/ceres/lfs/**"
-      - "src/api/router/lfs_router.rs"
-      - "src/server/http_server.rs"
-      - "docs/refactoring/protocol.md"
+      - "Dockerfile.git-cli"
+      - "bin/tests/**"
       - "docker-compose.test.yml"
+      - "docs/refactoring/protocol.md"
+      - "docs/refactoring/test-infra.md"
+      - "scripts/git_protocol_smoke.sh"
+      - "src/api/router/lfs_router.rs"
+      - "src/ceres/lfs/**"
       - "src/ceres/pack/**"
+      - "src/ceres/protocol/**"
+      - "src/commands/service/ssh.rs"
+      - "src/contract/git_protocol/**"
       - "src/jupiter/storage/git_db_storage.rs"
-      - "src/jupiter/storage/mono_storage.rs"
       - "src/jupiter/storage/lfs_db_storage.rs"
+      - "src/jupiter/storage/mono_storage.rs"
+      - "src/server/http_server.rs"
+      - "src/server/ssh_server.rs"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/git-protocol-smoke.yml"
-      - "scripts/git_protocol_smoke.sh"
-      - "src/ceres/protocol/**"
-      - "src/contract/git_protocol/**"
-      - "src/ceres/lfs/**"
-      - "src/api/router/lfs_router.rs"
-      - "src/server/http_server.rs"
-      - "docs/refactoring/protocol.md"
+      - "Dockerfile.git-cli"
+      - "bin/tests/**"
       - "docker-compose.test.yml"
+      - "docs/refactoring/protocol.md"
+      - "docs/refactoring/test-infra.md"
+      - "scripts/git_protocol_smoke.sh"
+      - "src/api/router/lfs_router.rs"
+      - "src/ceres/lfs/**"
       - "src/ceres/pack/**"
+      - "src/ceres/protocol/**"
+      - "src/commands/service/ssh.rs"
+      - "src/contract/git_protocol/**"
       - "src/jupiter/storage/git_db_storage.rs"
-      - "src/jupiter/storage/mono_storage.rs"
       - "src/jupiter/storage/lfs_db_storage.rs"
+      - "src/jupiter/storage/mono_storage.rs"
+      - "src/server/http_server.rs"
+      - "src/server/ssh_server.rs"
 
 jobs:
   git-protocol-smoke:
@@ -162,7 +172,7 @@ jobs:
           docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait postgres redis git-cli
           docker compose -p monoengine-it -f docker-compose.test.yml ps
 
-      - name: Run cargo-native git-cli integration gate
+      - name: Run cargo-native git-cli / LFS / SSH integration gates
         working-directory: monoengine
         env:
           MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine
@@ -173,7 +183,10 @@ jobs:
           # change (config-validation allowlist A does not include those paths).
           # --release reuses the prior release build artifacts (debug rebuild was
           # the dominant cost that pushed v0.1.174/175 past the old 30m timeout).
-          cargo test -p monoengine --release --test integration_git_cli -- --test-threads=1
+          # env -u so SKIP cannot soft-pass; order fixed cli→lfs→ssh (GM-11C).
+          env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --release --test integration_git_cli -- --test-threads=1
+          env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --release --test integration_git_lfs -- --test-threads=1
+          env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --release --test integration_git_ssh -- --test-threads=1
 
       - name: Prepare smoke config
         working-directory: monoengine
