@@ -188,10 +188,22 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_transport_error_does_not_leak_url_or_token() {
-        // Port 1 is not listening; connection fails fast.
+        // Port 1 is not listening; connection fails fast. Proxies are disabled
+        // explicitly: a host-level system proxy (which reqwest honors) would
+        // answer for the dead port with its own HTTP 5xx and route this test
+        // into the HTTP-status branch instead of the transport branch.
         let url = "http://127.0.0.1:1/hook".to_string();
-        let channel = WebhookChannel::new(url.clone(), Some(SecretString::new("s3cret-token")))
-            .expect("build");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()
+            .expect("build no-proxy test client");
+        let channel = WebhookChannel {
+            client,
+            url: url.clone(),
+            token: Some(SecretString::new("s3cret-token")),
+        };
         let err = channel
             .deliver(&sample_message())
             .await

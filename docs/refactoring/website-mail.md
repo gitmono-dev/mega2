@@ -236,9 +236,12 @@ and acceptance against website tip `a52d703` (see 实现基线).
 | 成功响应 | `202` + `{ delivery_id, accepted, duplicate }` |
 | 错误 `code` | `invalid_request` / `unauthorized` / `forbidden` / `idempotency_conflict` / `unsupported_event` / `invalid_payload` / `rate_limited` / `upstream_unavailable`（见 §2.2） |
 | 产品 `event_type` allowlist | `cl.comment.created`、`cl.merged`、`issue.comment.created`、`issue.closed`、`item.referenced`（`src/notification/triggers.rs`） |
-| CI website pin（`config-validation.yml` checkout） | `a52d70362586ae5e171be5db2e5c5457d07ce366` |
+| CI website pin（`config-validation.yml` checkout） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（核对日快照；**现行 pin 见下方 2026-08-06 增补**） |
 | website 工作分支 | `monoengine` |
 | website tip（REL-WE-SITE） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（含 WE-02..WE-05） |
+
+> **增补（2026-08-06 完成度复审）：** `config-validation.yml` 的 website checkout pin 已于 plan-20260803 期间（monoengine `39f7433`，website IT 切换 Postgres）bump 为
+> `2af89c874646005dd1a550053b5068f19bb7478a`（`a52d703…` 的直接子提交，仍含 WE-02..WE-05），并已同步 `website-auth.md` / `test-infra.md`；本表「核对日 2026-08-02」各 pin 行为历史快照。现行 pin 的唯一事实源是 workflow 文件本身与 `website-auth.md` §pin 政策。
 
 客户端与契约：**无已知冲突**（`WebsiteMailClient` 字段与上表一致）。
 
@@ -254,7 +257,7 @@ website 实现状态：路由 + Bearer + 五类产品模板 + 幂等 + `EMAIL_PR
 
 | 仓 | tip / pin | 说明 |
 |---|---|---|
-| website `monoengine` | `a52d70362586ae5e171be5db2e5c5457d07ce366` | REL-WE-SITE；CI checkout 同 SHA |
+| website `monoengine` | `a52d70362586ae5e171be5db2e5c5457d07ce366` | REL-WE-SITE；CI checkout 收口日同 SHA（2026-08-06 起 pin 已 bump 为其子提交 `2af89c8…`，见上方增补） |
 | monoengine `main`（WE-06 + REL-WE-SITE 计划收口） | `3b8490c`（含 `3c2b9d1` pin/IT + plan REL-WE-SITE-R2） | compose/`config-validation`/文档 pin 同步 |
 
 ---

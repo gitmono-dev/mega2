@@ -118,9 +118,22 @@ mod tests {
     #[tokio::test]
     async fn slack_transport_error_does_not_leak_webhook_url() {
         // The webhook URL embeds the Slack secret; a transport failure must not
-        // include it. Port 1 is not listening.
+        // include it. Port 1 is not listening. Proxies are disabled explicitly:
+        // a host-level system proxy (e.g. macOS system configuration, which
+        // reqwest honors) would answer for the dead port with its own HTTP 5xx
+        // and route this test into the HTTP-status branch instead of the
+        // transport branch under test.
         let secret_url = "http://127.0.0.1:1/services/T000/B000/SECRETTOKEN".to_string();
-        let channel = SlackChannel::new(SecretString::new(secret_url.clone())).expect("build");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()
+            .expect("build no-proxy test client");
+        let channel = SlackChannel {
+            client,
+            webhook_url: SecretString::new(secret_url.clone()),
+        };
         let message = OutboundMessage {
             username: "bob",
             event_type_code: "cl.merged",

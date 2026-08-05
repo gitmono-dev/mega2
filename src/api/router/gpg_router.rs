@@ -89,3 +89,33 @@ async fn list_gpg(
 
     Ok(Json(CommonResult::success(Some(res))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LoginUser, routers};
+
+    #[test]
+    fn gpg_routes_are_registered() {
+        let (_, api) = routers().split_for_parts();
+        let paths: Vec<&str> = api.paths.paths.keys().map(String::as_str).collect();
+        for expected in ["/gpg/add", "/gpg/remove", "/gpg/list"] {
+            assert!(paths.contains(&expected), "missing route {expected}");
+        }
+    }
+
+    #[test]
+    fn gpg_identity_uses_website_user_id_json_field() {
+        // Pins the AU-04 rename for this consumer: the external-id field the
+        // gpg handlers read must serialize as `website_user_id`, and the
+        // legacy Campsite name must be gone.
+        let user = LoginUser {
+            website_user_id: "website-user-1".to_string(),
+            username: "u".to_string(),
+            avatar_url: String::new(),
+            email: "u@example.com".to_string(),
+        };
+        let value = serde_json::to_value(&user).expect("serialize LoginUser");
+        assert!(value.get("website_user_id").is_some());
+        assert!(value.get("campsite_user_id").is_none());
+    }
+}

@@ -3,11 +3,13 @@ use crate::api::oauth::{model::LoginUser, website_session_store::WebsiteSessionS
 #[derive(Debug, Clone)]
 pub enum BrowserSessionStore {
     Website(WebsiteSessionStore),
-    /// Test-only session double. The production HTTP server always constructs
-    /// [`BrowserSessionStore::Website`].
+    /// Test-only session double, `cfg(test)`-gated so it is never compiled
+    /// into the production `service http` binary (website-auth.md contract).
+    #[cfg(test)]
     Fixed(FixedUserSessionStore),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct FixedUserSessionStore {
     pub user: LoginUser,
@@ -29,6 +31,7 @@ impl BrowserSessionStore {
                     .load_user_from_cookie_header_pair(cookie_name, cookie_value)
                     .await
             }
+            #[cfg(test)]
             Self::Fixed(store) => Ok(Some(store.user.clone())),
         }
     }

@@ -2,6 +2,8 @@
 
 更新时间：2026-06-21
 
+> **现状注记（2026-08-06，入库时补）：** 本文是 2026-06-21 的功能对比快照，于 2026-08-05 入库；其「monoengine 当前实现地基」一节描述的是当时的仓库状态，早于其后的三轮重构：① chat / Notes 产品面与 `chat-migrate` CLI 已整栈删除（`docs/plan/plan-20260731.md` RM 链，v0.2.0）；② 邮件投递（`[mail]`/SMTP/email outbox/dispatcher）已整体迁出本仓、由 website 承担（同计划 MN 链 + `docs/plan/plan-20260802.md`）；③ 浏览器会话已接入 website Better Auth（AU 链）。文中提及的 chat router、`chat-migrate`、notification email dispatcher、`docs/refactoring/chat.md`（已随 DOC-01 删除）等均为**历史快照**，不代表现行代码；现行事实源见 `docs/refactoring/README.md` 与各专题文档。本文的价值在 Augment 能力对比与增量方向，阅读地基表时请以现行源码为准。
+
 本文基于 Augment Code 官网与公开文档的当前功能快照，对比
 monoengine 已有实现和 `docs/refactoring/` 下的计划文档，给出
 monoengine 若要覆盖同类“企业级 AI 软件工程平台”能力需要新增的功能。
@@ -160,7 +162,7 @@ monoengine 对应缺口：
 | Artifact | `src/api/router/artifacts_router.rs:35` 起支持 discovery、object、batch、commit、fallback upload；`src/jupiter/service/artifact_service.rs:46` 起提供对象服务。 | 可承载 Agent 输出，但缺少 session/run 关联、搜索、可视化报告和生命周期策略。 |
 | Bot/Service Identity | `src/api/router/bot_router.rs:70` 起支持 bot 安装和 token；`src/jupiter/storage/bots_storage.rs:237` 起生成 token hash。 | 可作为 workflow 身份地基，但缺少服务账号归因、权限模板、workflow audit 和 OAuth/user 集成。 |
 | Vault/Secret | `src/context/mod.rs:55` 起 notification 会从 Vault 解析 mail password；`src/contract/vault/` 提供 VaultCore 集成。 | 缺少 Agent secret scope、per-run 注入、日志脱敏、用户私有 secret 覆盖共享 secret。 |
-| 计划文档 | `docs/refactoring/README.md` 当前主线仍是 config/vault/mail/notification/integration；`docs/refactoring/chat.md` 把外部集成和 OpenAI 明确排除在聊天计划外。 | 还没有 Agent/Cosmos/Context Engine 方向的系统计划，本文件应作为后续 refactoring 入口。 |
+| 计划文档 | `docs/refactoring/README.md` 当时主线仍是 config/vault/mail/notification/integration；当时的 `docs/refactoring/chat.md`（**已随 plan-20260731 DOC-01 删除**，chat 产品面整体退场）把外部集成和 OpenAI 明确排除在聊天计划外。 | 还没有 Agent/Cosmos/Context Engine 方向的系统计划，本文件应作为后续 refactoring 入口。 |
 
 ## 需要新增的功能
 
