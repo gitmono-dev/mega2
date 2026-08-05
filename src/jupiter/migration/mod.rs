@@ -105,6 +105,8 @@ mod m20260623_050000_chat_index_hardening;
 mod m20260623_060000_attachment_soft_delete;
 mod m20260630_000000_seed_notification_event_types;
 mod m20260701_000000_fix_reaction_unique_nulls;
+mod m20260731_000000_drop_chat_and_notes;
+pub(crate) mod m20260731_000001_drop_email_jobs;
 mod runner;
 pub use runner::apply_migrations;
 
@@ -197,6 +199,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260623_060000_attachment_soft_delete::Migration),
             Box::new(m20260630_000000_seed_notification_event_types::Migration),
             Box::new(m20260701_000000_fix_reaction_unique_nulls::Migration),
+            Box::new(m20260731_000000_drop_chat_and_notes::Migration),
+            Box::new(m20260731_000001_drop_email_jobs::Migration),
         ]
     }
 }

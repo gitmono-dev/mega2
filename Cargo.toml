@@ -3,7 +3,7 @@ members = ["bin"]
 
 [package]
 name = "monoengine-core"
-version = "0.1.173"
+version = "0.2.11"
 edition = "2024"
 
 [lib]
@@ -15,120 +15,123 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 arc-swap = "1"
-as-any = "0.3.1"
+as-any = "0.3.2"
 async-recursion = "1.1.1"
 async-stream = "0.3.6"
-async-trait = "0.1.89"
+async-trait = "0.1.91"
 axum = { version = "0.8.9", features = ["macros", "json", "ws"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
-base64 = "0.22.1"
-bcrypt = "0.17.1"
+base64 = "0.23.0"
+bcrypt = "0.19.3"
 better_default = "1.0.5"
 blake2b_simd = "1.0"
 blake3 = "1.8"
 bs58 = "0.5.1"
 builder-pattern = "0.4.2"
-bytes = "1.11.1"
-cedar-policy = "4.11.0"
-chrono = { version = "0.4.44", features = ["serde"] }
-clap = { version = "4.6.1", features = ["derive"] }
+bytes = "1.12.1"
+cedar-policy = "4.12.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.4", features = ["derive"] }
 config = "0.15.25"
 crossbeam-channel = "0.5"
 ctrlc = "3.5.2"
-dashmap = "6.1.0"
+dashmap = "6.2.1"
 derivative = "2.2.0"
-derive_more = "0.99.17"
+derive_more = { version = "2.1.1", features = ["full"] }
 directories = "6.0.0"
-ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
-enum-map = "2.6.1"
+ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
+enum-map = "3.1.0"
 envsubst = "0.2.1"
+# Pinned: openssl 0.10 still depends on foreign-types 0.3; 0.5 is a distinct
+# crate API and breaks `ForeignType` use on openssl types.
 foreign-types = "0.3.2"
-futures = "0.3.32"
-git-internal = "0.8.0"
-glob = "0.3.1"
+futures = "0.3.33"
+git-internal = "0.8.5"
+glob = "0.3.4"
 go-defer = "0.1.0"
-hcl-rs = "0.18.0"
+hcl-rs = "0.19.7"
 hex = "0.4.3"
 hmac = "0.13"
-http = "1.4.1"
-humantime = "2.1.0"
+http = "1.5.0"
+humantime = "2.4.0"
 idgenerator = "2.0.0"
 indexmap = "2.14"
-ipnetwork = "0.17.0"
+ipnetwork = { version = "0.21.1", features = ["serde"] }
 itertools = "0.15.0"
 lazy_static = "1.5.0"
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
 libc = "0.2"
 lockfile = "0.4.0"
-log = "0.4.28"
+log = "0.4.33"
 once_cell = "1.21.4"
 # NOTE: `orbit` (the heavy implementation crate pulling object_store + cloud SDKs)
 # is intentionally NOT a dependency of monoengine-core. The core depends only on
 # the `orbit-api` contract crate; the binary (`bin/`) injects the concrete orbit
 # implementation at startup. See docs/refactoring/orbit.md.
 orbit-api = { path = "../orbit/crates/orbit-api" }
-openssl = "0.10.80"
-openssl-sys = "0.9.109"
+openssl = "0.10.81"
+openssl-sys = "0.9.117"
 parse-display = "0.11.0"
 percent-encoding = "2.3"
-pem = "3.0.0"
+pem = "4.0.0"
 pgp = "0.20.0"
-priority-queue = "2.1.0"
-radix_trie = "0.2.1"
-rand = { version = "0.10.1", features = ["thread_rng"] }
-rand08 = { package = "rand", version = "0.8.6" }
+priority-queue = "2.7.0"
+radix_trie = "0.3.0"
+rand = { version = "0.10.2", features = ["thread_rng"] }
+rand08 = { package = "rand", version = "0.8.7" }
+# Pinned to 0.3: pgp 0.20 still uses rand 0.8; rand_chacha 0.10 pairs with
+# rand_core 0.10 and is not interchangeable for PGP key generation.
 rand_chacha = "0.3.1"
-redis = { version = "1.3.0", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
-regex = "1.12.3"
+redis = { version = "1.5.0", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
+regex = "1.13.1"
 reqwest = { version = "0.13.4", features = ["json", "stream", "blocking"] }
 ring = "0.17"
-rkyv = "0.8.16"
+rkyv = "0.8.17"
 rsa = "0.9.10"
-russh = "0.61.1"
+russh = "0.62.4"
 rustls = "0.23"
-rustls-pemfile = "2.1.0"
-sea-orm = { version = "1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "debug-print"] }
-sea-orm-migration = { version = "1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+rustls-pemfile = "2.2.0"
+sea-orm = { version = "2.0.0", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "debug-print"] }
+sea-orm-migration = { version = "2.0.0", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 secp256k1 = { version = "0.31.1", features = ["serde", "rand", "hashes"] }
-serde = { version = "1.0.228", features = ["derive", "rc", "alloc"] }
-serde_bytes = "0.11.14"
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive", "rc", "alloc"] }
+serde_bytes = "0.11.19"
+serde_json = "1.0.151"
 serde_urlencoded = "0.7"
 serde_yaml = "0.9.34"
 sha1 = "0.11"
 sha2 = "0.11"
-smallvec = "1.15.1"
+smallvec = "1.15.2"
 ssh-key = { version = "0.6.7", features = ["std", "crypto"] }
-stretto = "0.8.0"
-strum = { version = "0.25.0", features = ["derive"] }
-strum_macros = "0.25.0"
-sysinfo = "0.39.2"
-thiserror = "2.0.18"
-time = { version = "0.3.47", features = ["serde"] }
-tokio = { version = "1.52.3", features = ["full"] }
-tokio-stream = "0.1.18"
-tokio-util = "0.7.18"
-toml = "1.1.2"
+stretto = "0.9.0"
+strum = { version = "0.28.0", features = ["derive"] }
+strum_macros = "0.28.0"
+sysinfo = "0.39.6"
+thiserror = "2.0.19"
+time = { version = "0.3.54", features = ["serde"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = "0.1.19"
+tokio-util = "0.7.19"
+toml = "1.1.4"
 tower = "0.5.3"
-tower-http = { version = "0.6.11", features = ["cors", "trace", "decompression-full"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace", "decompression-full"] }
 tower-sessions = { version = "0.15", features = ["memory-store"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
-ureq = { version = "2.10.0", features = ["json"] }
+ureq = { version = "3.3.0", features = ["json"] }
 url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["chrono", "axum_extras"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
-uuid = { version = "1.23.4", features = ["v4"] }
-x509-parser = "0.18.0"
-zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+x509-parser = "0.18.1"
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 
 # Global allocators (jemalloc / mimalloc) live in the binary crate (`bin/`),
 # since they are a binary concern; monoengine-core does not depend on them.
 
 [dev-dependencies]
-redis-test = { version = "1.0.3", features = ["aio"] }
+redis-test = { version = "1.0.4", features = ["aio"] }
 tempfile = "3.27.0"

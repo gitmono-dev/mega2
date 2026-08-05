@@ -2,6 +2,5 @@
 
 pub mod artifacts;
 pub mod buck2;
-pub mod chat;
 pub mod common;
 pub mod git;

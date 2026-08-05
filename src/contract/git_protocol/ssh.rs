@@ -6,7 +6,7 @@ use futures::{StreamExt, stream};
 use russh::{
     Channel, ChannelId,
     keys::{HashAlg, PublicKey},
-    server::{self, Auth, Msg, Session},
+    server::{self, Auth, ChannelOpenHandle, Msg, Session},
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
@@ -73,14 +73,16 @@ impl server::Handler for SshServer {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("SshServer::channel_open_session:{}", channel.id());
         {
             let mut clients = self.clients.lock().await;
             clients.insert((self.id, channel.id()), channel);
         }
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn env_request(
@@ -290,8 +292,17 @@ impl server::Handler for SshServer {
         let service_type = state.smart_protocol.service_type;
         match service_type {
             ServiceType::UploadPack => {
-                let api_state = &self.state;
-                handle_upload_pack(state, api_state, channel, data, session).await;
+                // Git may deliver the upload-pack request across multiple SSH
+                // data packets. Process only once the buffer ends in a flush
+                // pkt-line (`0000`), matching HTTP's full-body collection.
+                // Handling a partial/flush-only chunk as a complete request
+                // previously ran pack generation with want=[] and returned
+                // `error: …` (`bad line length character: erro` on the client).
+                state.data_combined.extend_from_slice(data);
+                while upload_pack_buffer_complete(&state.data_combined) {
+                    let request = take_complete_upload_pack_request(&mut state.data_combined);
+                    handle_upload_pack(state, &self.state, channel, &request, session).await;
+                }
             }
             ServiceType::ReceivePack => {
                 state.data_combined.extend_from_slice(data);
@@ -306,11 +317,28 @@ impl server::Handler for SshServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(mut state) = self.channels.remove(&channel)
-            && state.smart_protocol.service_type == ServiceType::ReceivePack
-        {
-            let api_state = &self.state;
-            handle_receive_pack(&mut state, api_state, channel, session).await;
+        if let Some(mut state) = self.channels.remove(&channel) {
+            match state.smart_protocol.service_type {
+                ServiceType::ReceivePack => {
+                    let api_state = &self.state;
+                    handle_receive_pack(&mut state, api_state, channel, session).await;
+                }
+                ServiceType::UploadPack => {
+                    // Flush any trailing buffered request that lacked a final
+                    // pkt flush before the client closed stdin.
+                    if !state.data_combined.is_empty() {
+                        let request = state.data_combined.split().freeze();
+                        handle_upload_pack(
+                            &mut state,
+                            &self.state,
+                            channel,
+                            request.as_ref(),
+                            session,
+                        )
+                        .await;
+                    }
+                }
+            }
         }
 
         {
@@ -511,6 +539,24 @@ async fn handle_upload_pack(
         }
     }
     let _ = session.data(channel, smart::PKT_LINE_END_MARKER.to_vec());
+}
+
+/// True when `buf` holds at least one terminated upload-pack/v2 command.
+///
+/// A flush-only (`0000`) or empty buffer is *not* complete — processing those
+/// as a full request yields `want=[]` and a protocol error to the client.
+fn upload_pack_buffer_complete(buf: &[u8]) -> bool {
+    if buf.len() < 8 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(buf);
+    let has_payload = text.contains("want ") || text.contains("command=") || text.contains("have ");
+    let terminated = buf.ends_with(smart::PKT_LINE_END_MARKER) || text.contains("0009done");
+    has_payload && terminated
+}
+
+fn take_complete_upload_pack_request(buf: &mut BytesMut) -> Bytes {
+    buf.split().freeze()
 }
 
 async fn handle_v2_upload_pack_ssh(

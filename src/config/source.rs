@@ -27,6 +27,11 @@ pub(crate) fn config_from_path_with_profile(
     path: &str,
     profile_path: Option<&Path>,
 ) -> Result<c::Config, ConfigError> {
+    // MN-03: removed `[mail]` must not be injectable via env on any load path
+    // (service/debug startup, `config validate`, vault bootstrap).
+    crate::config::validate::reject_legacy_mail_environment()
+        .map_err(|e| ConfigError::Message(e.to_string()))?;
+
     validate_toml_file(path)?;
 
     let mut builder = c::Config::builder().add_source(c::File::new(path, FileFormat::Toml));
@@ -53,8 +58,8 @@ pub(crate) fn mega_environment_source() -> c::Environment {
         .separator("__")
         .try_parsing(true)
         .with_list_parse_key("oauth.allowed_cors_origins")
+        .with_list_parse_key("oauth.session_cookie_names")
         .with_list_parse_key("monorepo.admin")
         .with_list_parse_key("monorepo.root_dirs")
-        .with_list_parse_key("chat.attachment_allowed_mime_types")
         .list_separator(",")
 }

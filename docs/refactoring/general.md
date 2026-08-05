@@ -15,11 +15,12 @@ docs/
 │   ├── contract.md          ← Contract 边界归并
 │   ├── config.md            ← Config 模块拆分与 SecretRef
 │   ├── vault.md             ← Vault 安全加固与凭据迁移
-│   ├── mail.md              ← Mail 模块完善与 SecretRef 消费
+│   ├── mail.md              ← Mail 模块（已废止；见 website-mail.md）
 │   ├── notification.md       ← Notification 多渠道系统
+│   ├── website-auth.md      ← Website Better Auth 会话接入
+│   ├── website-mail.md      ← 产品邮件投递（website）
 │   └── orbit.md             ← Orbit 依赖重构（项目引用 → API 依赖）
 └── [文档范围外]
-    ├── chat.md
     └── protocol.md
 ```
 

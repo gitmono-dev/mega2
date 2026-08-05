@@ -26,6 +26,7 @@ use crate::{
         MonoApiServiceState,
         api_doc::ApiDoc,
         api_router::{self},
+        oauth::{api_store::BrowserSessionStore, website_session_store::WebsiteSessionStore},
         router::lfs_router,
     },
     bellatrix::Bellatrix,
@@ -371,6 +372,8 @@ fn broadcast_shutdown(
 }
 
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
+    crate::config::validate::require_oauth_for_http_service(ctx.storage.config().as_ref())?;
+
     let CommonHttpOptions { host, port } = options.clone();
     let server_url = format!("{host}:{port}");
     let addr = SocketAddr::from_str(&server_url).map_err(|e| {
@@ -390,7 +393,7 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     let notification_shutdown = ctx.notification_shutdown.clone();
     let server_token = shutdown_token.clone();
 
-    let app = app(ctx, host.clone(), port).await;
+    let app = app(ctx, host.clone(), port).await?;
     let app_with_middleware = middleware.layer(app);
 
     tracing::info!(address = %addr, "HTTP server started up");
@@ -565,25 +568,29 @@ fn cors_allow_origins(oauth: Option<&crate::config::OAuthConfig>) -> Vec<HeaderV
 ///   - GET        end of `Regex::new(r"/info/refs$")`
 ///   - POST       end of `Regex::new(r"/git-upload-pack$")`
 ///   - POST       end of `Regex::new(r"/git-receive-pack$")`
-pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
+pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, MegaError> {
     let storage = ctx.storage;
+    let oauth = storage.config().oauth.clone().ok_or_else(|| {
+        MegaError::Other("OAuth configuration is required for the HTTP service".to_string())
+    })?;
+    let origins: Vec<HeaderValue> = cors_allow_origins(Some(&oauth));
+    let session_store =
+        WebsiteSessionStore::new(oauth.website_api_base_url, oauth.session_cookie_names)?;
 
     let git_object_cache = Arc::new(GitObjectCache {
         connection: ctx.connection.clone(),
-        prefix: "git-object-rkyv:v1".to_string(),
+        prefix: std::env::var("MEGA_GIT_OBJECT_CACHE_PREFIX")
+            .unwrap_or_else(|_| "git-object-rkyv:v1".to_string()),
     });
 
     let api_state = MonoApiServiceState {
         storage: storage.clone(),
+        session_store: BrowserSessionStore::Website(session_store),
         listen_addr: format!("http://{host}:{port}"),
         entity_store: EntityStore::new(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
-        chat_events: Arc::new(crate::chat::domain::InMemoryChatEvents::default()),
     };
-
-    let app_config = storage.config();
-    let origins: Vec<HeaderValue> = cors_allow_origins(app_config.oauth.as_ref());
 
     // add RequestDecompressionLayer for handle gzip encode
     // add TraceLayer for log record
@@ -649,9 +656,9 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Router {
         .with_state(api_state.clone())
         .into();
 
-    router
+    Ok(router
         .nest("/info/lfs", info_lfs_router)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
 }
 
 fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
@@ -773,6 +780,7 @@ mod tests {
     fn cors_origins_fall_back_to_defaults_when_empty() {
         let oauth = crate::config::OAuthConfig {
             allowed_cors_origins: vec![],
+            ..Default::default()
         };
         let origins = cors_allow_origins(Some(&oauth));
         assert_eq!(origins.len(), DEFAULT_CORS_ORIGINS.len());
@@ -785,6 +793,7 @@ mod tests {
                 "https://app.example.com".to_string(),
                 "http://localhost:3000".to_string(),
             ],
+            ..Default::default()
         };
         let origins = cors_allow_origins(Some(&oauth));
         assert_eq!(
@@ -805,6 +814,7 @@ mod tests {
                 "https://ok.example.com".to_string(),
                 "bad\norigin".to_string(),
             ],
+            ..Default::default()
         };
         let origins = cors_allow_origins(Some(&oauth));
         assert_eq!(

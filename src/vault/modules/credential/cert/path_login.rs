@@ -103,7 +103,7 @@ impl CertBackendInner {
             .subject_name()
             .entries_by_nid(Nid::COMMONNAME)
             .next()
-            .map(|c| c.data().as_utf8().map(|s| s.to_owned()))
+            .map(|c| c.data().to_string())
             .transpose()?
             .unwrap_or_else(|| "".into());
 
@@ -487,8 +487,8 @@ impl CertBackendInner {
             .entries_by_nid(Nid::COMMONNAME)
             .next()
         {
-            Some(entry) => match entry.data().as_utf8() {
-                Ok(cn_utf8) => cn_utf8.to_string(),
+            Some(entry) => match entry.data().to_string() {
+                Ok(cn) => cn,
                 Err(_) => return false,
             },
             None => return false,
@@ -535,8 +535,8 @@ impl CertBackendInner {
             .entries_by_nid(Nid::COMMONNAME)
             .next()
         {
-            Some(entry) => match entry.data().as_utf8() {
-                Ok(cn_utf8) => cn_utf8.to_string(),
+            Some(entry) => match entry.data().to_string() {
+                Ok(cn) => cn,
                 Err(_) => return false,
             },
             None => return false,
@@ -644,8 +644,8 @@ impl CertBackendInner {
             .entries_by_nid(Nid::ORGANIZATIONALUNITNAME)
             .next()
         {
-            Some(entry) => match entry.data().as_utf8() {
-                Ok(ou_utf8) => ou_utf8.to_string(),
+            Some(entry) => match entry.data().to_string() {
+                Ok(ou) => ou,
                 Err(_) => return false,
             },
             None => return false,

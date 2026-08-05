@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.1.173"
+version = "0.2.11"
 edition = "2024"
 
 # The thin composition-root binary. It depends on `monoengine-core` (which only
@@ -17,7 +17,7 @@ path = "src/main.rs"
 monoengine-core = { path = ".." }
 orbit = { path = "../../orbit/crates/orbit" }
 orbit-api = { path = "../../orbit/crates/orbit-api" }
-async-trait = "0.1.89"
+async-trait = "0.1.91"
 
 [target.'cfg(not(windows))'.dependencies]
 jemallocator = "0.5.4"
@@ -32,8 +32,9 @@ mimalloc = "0.1.52"
 # `libc` is only used by the service-startup smoke test to deliver SIGINT for a
 # graceful-shutdown assertion; it is already in the dependency tree via the core.
 libc = "0.2"
-sea-orm = { version = "1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+reqwest = { version = "0.13.4", features = ["json", "blocking"] }
+sea-orm = { version = "2.0.0", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 serde_json = "1.0"
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["rt", "net", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "net", "time"] }
 url = "2.5.8"

@@ -1,0 +1,31 @@
+# Slim IT runtime image that packages a host-built `monoengine` binary.
+# Prefer this in CI after `cargo build -p monoengine` to avoid a second full
+# compile inside Docker. Context = monoengine repo root.
+#
+# Host/CI binaries are typically linked against a newer glibc than Debian
+# bookworm; use Ubuntu 24.04 to match `ubuntu-latest` runners and modern
+# desktops. (The source `Dockerfile` still builds+runs on bookworm.)
+#
+#   cp target/debug/monoengine ./monoengine.itbin   # or target/release/...
+#   docker build -f Dockerfile.it-runtime -t monoengine:local .
+#   rm -f ./monoengine.itbin
+
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY monoengine.itbin /usr/local/bin/monoengine
+COPY config/config.toml /etc/monoengine/config.toml
+RUN chmod 755 /usr/local/bin/monoengine
+
+ENV MEGA_BASE_DIR=/var/lib/monoengine \
+    MEGA_CONFIG=/etc/monoengine/config.toml
+
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/monoengine"]
+CMD ["--config", "/etc/monoengine/config.toml", "service", "http", "--host", "0.0.0.0", "-p", "8000"]

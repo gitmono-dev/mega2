@@ -139,11 +139,9 @@ impl Config {
             orion_server: None,
             sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
-            mail: None,
             notification: None,
             vault: None,
             oauth: None,
-            chat: None,
             git: GitConfig::default(),
         }
     }
@@ -230,8 +228,6 @@ fn environment_variable_for_key(key: &str) -> String {
 #[cfg(test)]
 mod test {
     use std::path::Path;
-
-    use serde::Deserialize;
 
     use super::*;
     use crate::config::{
@@ -414,76 +410,6 @@ mod test {
     }
 
     #[test]
-    fn test_mail_config_deserial_basic() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            mail: MailConfig,
-        }
-
-        let toml = r#"
-            [mail]
-            enabled = true
-            smtp_host = "smtp.example.com"
-            smtp_port = 587
-            from = "no-reply@example.com"
-            starttls = true
-        "#;
-
-        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
-        assert!(parsed.mail.enabled);
-        assert_eq!(parsed.mail.provider, MailProvider::Smtp);
-        assert_eq!(parsed.mail.smtp_host, "smtp.example.com");
-        assert_eq!(parsed.mail.smtp_port, 587);
-        assert_eq!(parsed.mail.from, "no-reply@example.com");
-        assert!(parsed.mail.starttls);
-        assert!(parsed.mail.username.is_none());
-        assert!(parsed.mail.password.is_none());
-        assert!(parsed.mail.password_ref.is_none());
-    }
-
-    #[test]
-    fn test_mail_config_deserial_console_provider() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            mail: MailConfig,
-        }
-
-        let toml = r#"
-            [mail]
-            enabled = true
-            provider = "console"
-        "#;
-
-        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
-        assert_eq!(parsed.mail.provider, MailProvider::Console);
-        assert!(parsed.mail.smtp_host.is_empty());
-        assert!(parsed.mail.from.is_empty());
-        parsed.mail.validate().expect("console provider is valid");
-    }
-
-    #[test]
-    fn test_mail_config_deserial_password_ref() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            mail: MailConfig,
-        }
-
-        let toml = r##"
-            [mail]
-            enabled = true
-            smtp_host = "smtp.example.com"
-            from = "no-reply@example.com"
-            password_ref = "vault://secret/config/prod/mail/password#value"
-        "##;
-
-        let parsed: Wrapper = toml::from_str(toml).expect("MailConfig should deserialize");
-        assert_eq!(
-            parsed.mail.password_ref.unwrap().as_uri(),
-            "vault://secret/config/prod/mail/password#value"
-        );
-    }
-
-    #[test]
     fn test_load_str_and_sources_parse_list_env_overrides() {
         let lock = env_lock();
         let _root_dirs = EnvVarGuard::set(&lock, "MEGA_MONOREPO__ROOT_DIRS", "alpha,beta");
@@ -571,6 +497,15 @@ mod test {
     }
 
     #[test]
+    fn test_load_str_rejects_removed_mail_section() {
+        let content = format!("[{}]\nenabled = true\n", "mail");
+
+        let err = Config::load_str(&content).expect_err("removed section should fail");
+
+        assert!(err.to_string().contains("mail"));
+    }
+
+    #[test]
     fn test_profile_type_error_reports_profile_source_without_value() {
         let _lock = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -614,7 +549,7 @@ mod test {
             &profile_path,
             format!(
                 r#"
-                [mail]
+                [notification.webhook]
                 {} = "{}{}
             "#,
                 "password", "plain-text", "-password"
@@ -695,7 +630,7 @@ mod test {
                 [database]
                 db_type = "postgres"
                 db_path = ""
-                db_url = "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it"
+                db_url = "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine"
                 max_connection = 4
                 min_connection = 1
                 acquire_timeout = 5

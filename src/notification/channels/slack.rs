@@ -77,7 +77,6 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::mail::MailAttachment;
 
     #[tokio::test]
     async fn slack_posts_text_payload_to_webhook_url() {
@@ -102,7 +101,6 @@ mod tests {
         let channel = SlackChannel::new(SecretString::new(url)).expect("build");
         assert_eq!(channel.name(), "slack");
 
-        let attachments: Vec<MailAttachment> = vec![];
         let message = OutboundMessage {
             username: "bob",
             event_type_code: "cl.merged",
@@ -110,7 +108,6 @@ mod tests {
             subject: "CL merged",
             body_html: "<p>merged</p>",
             body_text: Some("Your CL was merged"),
-            attachments: &attachments,
         };
         channel.deliver(&message).await.expect("delivery succeeds");
 
@@ -124,7 +121,6 @@ mod tests {
         // include it. Port 1 is not listening.
         let secret_url = "http://127.0.0.1:1/services/T000/B000/SECRETTOKEN".to_string();
         let channel = SlackChannel::new(SecretString::new(secret_url.clone())).expect("build");
-        let attachments: Vec<MailAttachment> = vec![];
         let message = OutboundMessage {
             username: "bob",
             event_type_code: "cl.merged",
@@ -132,7 +128,6 @@ mod tests {
             subject: "CL merged",
             body_html: "<p>merged</p>",
             body_text: None,
-            attachments: &attachments,
         };
         let err = channel.deliver(&message).await.expect_err("should fail");
         let rendered = err.to_string();

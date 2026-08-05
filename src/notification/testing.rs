@@ -2,8 +2,7 @@
 //!
 //! Provides a capturing [`MockChannel`] that records every outbound message it
 //! would have delivered. Intended for unit and integration tests that need to
-//! assert on dispatcher fan-out or channel routing without depending on
-//! external SMTP, Slack, or webhook endpoints.
+//! assert on channel routing without depending on external endpoints.
 
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +21,6 @@ pub struct CapturedNotification {
     pub subject: String,
     pub body_html: String,
     pub body_text: Option<String>,
-    pub attachment_count: usize,
 }
 
 /// In-memory notification channel that records every delivered message.
@@ -84,7 +82,6 @@ impl NotificationChannel for MockChannel {
                 subject: message.subject.to_owned(),
                 body_html: message.body_html.to_owned(),
                 body_text: message.body_text.map(str::to_owned),
-                attachment_count: message.attachments.len(),
             });
         Ok(())
     }
@@ -93,12 +90,10 @@ impl NotificationChannel for MockChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::MailAttachment;
 
     #[tokio::test]
     async fn mock_channel_captures_notification() {
         let channel = MockChannel::default();
-        let attachment = MailAttachment::new("file.txt", "text/plain", b"content");
         let message = OutboundMessage {
             username: "alice",
             event_type_code: "cl.comment.created",
@@ -106,7 +101,6 @@ mod tests {
             subject: "New comment",
             body_html: "<p>hello</p>",
             body_text: Some("hello"),
-            attachments: std::slice::from_ref(&attachment),
         };
 
         channel.deliver(&message).await.unwrap();
@@ -116,7 +110,6 @@ mod tests {
         assert_eq!(sent[0].channel_name, "mock");
         assert_eq!(sent[0].username, "alice");
         assert_eq!(sent[0].event_type_code, "cl.comment.created");
-        assert_eq!(sent[0].attachment_count, 1);
     }
 
     #[tokio::test]
@@ -129,7 +122,6 @@ mod tests {
             subject: "Comment",
             body_html: "body",
             body_text: None,
-            attachments: &[],
         };
 
         channel.deliver(&message).await.unwrap();
@@ -147,7 +139,6 @@ mod tests {
             subject: "Merged",
             body_html: "merged",
             body_text: None,
-            attachments: &[],
         };
 
         // `deliver` is async; for this test we only need the mailbox helper.
@@ -159,7 +150,6 @@ mod tests {
             subject: message.subject.to_owned(),
             body_html: message.body_html.to_owned(),
             body_text: message.body_text.map(str::to_owned),
-            attachment_count: 0,
         });
 
         assert_eq!(channel.take_sent().len(), 1);

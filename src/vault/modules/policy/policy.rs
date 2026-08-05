@@ -40,13 +40,13 @@ use crate::{
 
 #[derive(Display, Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyType {
-    #[display(fmt = "acl")]
+    #[display("acl")]
     Acl,
-    #[display(fmt = "rgp")]
+    #[display("rgp")]
     Rgp,
-    #[display(fmt = "egp")]
+    #[display("egp")]
     Egp,
-    #[display(fmt = "token")]
+    #[display("token")]
     Token,
 }
 

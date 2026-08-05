@@ -52,27 +52,20 @@
 - **关键前置**：日志脱敏工具、与 config 的 CLI 协同设计
 - **阶段范围**：A - J（共 10 个阶段）
 
-### 3. **refactoring/mail.md** — 邮件通知模块与 password_ref 迁移
-- **目标**：完善一级 mail 模块，作为 config 的第一个真实 SecretRef 消费者
-- **核心内容**：
-  - Mail 模块的激活与现状（阶段 0/1 已完成）
-  - Dispatcher 的生命周期管理
-  - password 改为 password_ref 的迁移策略
-  - 多 provider 扩展、模板系统、附件 metadata/下载/删除/按用户或事件类型收窄及自动化的保留期治理、可靠性增强
-- **关键前置**：config 阶段 5 的 SecretRef + resolver 实现
-- **阶段范围**：0 - 5（共 6 个阶段，0/1 已完成）
+### 3. **refactoring/mail.md** — 本仓 SMTP 邮件模块（已废止）
+- **状态**：废止。monoengine 不再实现、配置或运行 SMTP 邮件投递（ADR-WA-08）。
+- **现行事实源**：[`website-mail.md`](./website-mail.md)（产品邮件经 website 内部 API）；本文件仅保留废止说明与历史索引。
+- **不要**：把 `mail.md` 当作活的 SecretRef / SmtpMailer / Mailpit 设计文档。
 
 ### 4. **refactoring/notification.md** — 多渠道用户通知系统
-- **目标**：将 notification 模块完整化，支持多渠道通知与 vault secret 集成
+- **目标**：通知编排（in-app / 可选 Slack/webhook）与用户偏好；产品邮件经 website-mail 客户端转发。
 - **核心内容**：
-  - Notification 模块现状（阶段 0 部分完成）
-  - 渠道抽象（EmailChannel、InAppChannel、SlackChannel 等）
-  - 用户偏好 API 表面（port mega DTOs）
-  - 邮件作业与附件 metadata/下载/删除/按用户或事件类型收窄及自动化的保留期管理面
-  - Vault SecretRef 与多渠道凭据管理
-  - 可靠性、可观测与模板系统
-- **关键前置**：mail 模块的完整实现、vault 的加固完成
-- **阶段范围**：0 - 5（共 6 个阶段）
+  - primary = `in_app`；`delivery_mode=email` 映射为「写 in-app + POST website」
+  - 无 `EmailChannel` / `email_jobs` / 本仓 SmtpMailer
+  - website-mail 客户端配置（`notification.website_mail_*`）
+  - 触发器与偏好 API 表面
+- **关键前置 / 契约**：[`website-mail.md`](./website-mail.md)；Slack/webhook 凭据可继续用 SecretRef
+- **长期收尾**：webhook/slack 完善、build 完成触发器、多实例矩阵（见 `plan-long.md` PT-09）
 
 ### 4a. **refactoring/orbit.md** — Orbit 依赖重构（项目引用 → API 依赖）
 - **目标**：把 monoengine 对 orbit **实现 crate** 的 `path` 项目引用，重构为只依赖 `orbit-api`（纯 API/契约 crate），把唯一的具体构造点通过依赖注入下沉到组合根 / 瘦二进制边界
@@ -87,19 +80,20 @@
 
 ### 5. **refactoring/integration.md** — 集成测试策略与执行方案
 
-- **目标**：建立基于 Docker 容器的集成测试框架，验证配置、Vault、邮件、通知等核心模块的端到端功能
+- **目标**：基于 Docker Compose 的集成测试框架，验证配置、Vault、会话、通知编排与 git-cli 等端到端路径
 - **核心内容**：
-  - Docker Compose 测试环境编排（PostgreSQL、Redis、SMTP、Vault）
-  - 8 个主要集成测试场景（配置初始化、数据库连接、Secret 存储、邮件发送、通知触发等）
-  - 测试覆盖矩阵与改进计划的对应关系
-  - CI/CD 集成示例（GitHub Actions）
-  - 故障排查与调试指南
-- **关键依赖**：Docker、Docker Compose、PostgreSQL、Redis、Mailpit
-- **验收标准**：覆盖所有改进计划的关键路径，确保各模块集成无误
+  - Docker Compose 测试栈（PostgreSQL、Redis、mailpit、rustfs、git-cli、`website-next`；`-p monoengine-it`）
+  - 黑盒 target：`integration_vault` / `integration_website_auth` / `integration_git_cli`
+  - **mailpit 消费方 = website IT**；本仓**无** SmtpMailer→Mailpit 成功门
+  - 覆盖矩阵与 CI（`config-validation.yml` 等）
+- **关键依赖**：Docker、Docker Compose、PostgreSQL、Redis；website 会话/邮件 IT 另需 `website-next`
+- **验收标准**：见 `integration.md` / `test-infra.md` 现行矩阵；不以本仓 SMTP 为门
 
 ### 6. **其他文档**
-- **chat.md**：聊天/消息相关（本计划范围外）
-- **protocol.md**：协议定义相关（本计划范围外）
+- **[`../monorepo.md`](../monorepo.md)**：MonoRepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化与目录结构）
+- **website-auth.md** / **website-mail.md**：Website 会话与产品邮件契约（见 `plan-20260731.md`）
+- **protocol.md**：协议定义相关；分支/tag 产品规则以 `monorepo.md` 为准
+- 本仓 Campsite 风格 chat/Notes 产品面已退场；不再维护独立 chat 改进文档
 
 ---
 
@@ -109,8 +103,8 @@
 
 1. **第一次接触本计划**？阅读 **general.md** 了解框架和规则
 2. **想了解总体执行计划**？阅读 **README.md** 的"执行顺序"部分
-3. **关心具体模块**？阅读对应的 **refactoring/contract.md / refactoring/config.md / refactoring/vault.md / refactoring/mail.md / refactoring/notification.md**
-4. **想验证功能**？查看 **refactoring/integration.md** 的集成测试场景
+3. **关心具体模块**？阅读对应的 **refactoring/contract.md / refactoring/config.md / refactoring/vault.md / refactoring/notification.md / refactoring/website-mail.md**（`mail.md` 已废止）
+4. **想验证功能**？查看 **refactoring/integration.md** / **refactoring/test-infra.md** 的集成测试场景
 
 ### 角色指南
 
@@ -147,7 +141,7 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 ```
 独立前置（第 0 轮）
   ├─ 日志脱敏工具
-  │   → 供 config 0b、vault A、mail 1、notification 0 使用
+  │   → 供 config 0b、vault A、notification 使用
   │
   └─ CLI LoadMode 框架协同设计（config + vault 团队）
       → config 阶段 2 与 vault 阶段 D 都依赖此
@@ -167,12 +161,13 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
   │
   └─ config 阶段 4 → 5（SecretRef + resolver）
 
-第一个真实消费者（第 3 轮）
-  └─ mail 阶段 2（password_ref，依赖 config 5）
-     → mail 阶段 1 的"可诊断处理"需要脱敏工具
+SecretRef 消费者（第 3 轮，现行）
+  └─ redis.url / object_storage / notification.website_mail_bearer_ref 等
+     （本仓 SMTP/`mail.password_ref` 路线已废止，见 mail.md + website-mail.md）
 
-多渠道完善（第 4 轮）
-  └─ notification 阶段 1-3（依赖 mail 2 + vault A/B/C）
+通知编排（第 4 轮）
+  └─ notification：in-app / Slack / webhook + website-mail 客户端
+     （不依赖本仓 mail 模块）
 ```
 
 ---
@@ -184,7 +179,7 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 #### 独立前置 #1：日志脱敏工具 **[优先级：P0 独立]**
 - **交付物**：`src/common/redaction.rs` 或 `src/config/redaction.rs`
 - **职责**：脱敏 URL、token、secret、vault 信息
-- **消费方**：config、vault、mail、notification
+- **消费方**：config、vault、notification（含 website-mail client）
 - **验收**：可被多个模块导入使用，单元测试全覆盖
 
 #### 独立前置 #2：CLI LoadMode 框架设计 **[优先级：P0 独立，config + vault 协同]**
@@ -259,35 +254,35 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 
 ---
 
-### 第 4 阶段：SecretRef 与第一个消费者
+### 第 4 阶段：SecretRef 与现行消费者
 
 #### 4a. refactoring/config.md 阶段 5：SecretRef 基础设施 **[优先级：P2，关键]**
 - **前置**：config 4 完成
-- **消费者**：mail 阶段 2 直接依赖此
+- **消费者**：`redis.url`、对象存储凭据、`notification.website_mail_bearer_ref` 等（**不再**是本仓 `mail.password_ref`）
 - **并行条件**：可与 vault E 并行
-- **完成后**：resolver 就位，第一个可迁移凭据的迁移路径清晰
+- **完成后**：resolver 就位，可迁移凭据的路径清晰
 
 #### 4b. refactoring/vault.md 阶段 E：SecretRef 迁移 **[优先级：P2，与 config 5 协同]**
 - **前置**：vault D 完成
-- **协同**：与 config 5 一起完成，mail 作为共同的验证对象
+- **协同**：与 config 5 一起完成；验证对象为现行 SecretRef 字段（非 SMTP mail）
 - **完成后**：vault 侧的 resolver 就位
 
-#### 4c. refactoring/mail.md 阶段 2：password_ref 迁移 **[优先级：P2]**
-- **前置**：config 5 + vault E 都完成、mail 1 基本完成
-- **完成后**：第一个 SecretRef 消费者验证完成，模式确立
+#### 4c. ~~refactoring/mail.md 阶段 2：password_ref~~ **[已废止]**
+- 本仓 SMTP / `[mail]` / `mail.password_ref` 已按 ADR-WA-08 移除。
+- 现行契约：[`website-mail.md`](./website-mail.md)；废止页：[`mail.md`](./mail.md)。
 
 ---
 
-### 第 5 阶段：多渠道与高级特性
+### 第 5 阶段：通知编排（无本仓 SMTP）
 
-#### 5a. refactoring/mail.md 阶段 3-5：Provider 扩展、可靠性等 **[优先级：P3-P4]**
-- **前置**：mail 2 完成
-- **并行条件**：可部分与 notification 0-1 并行
+#### 5a. ~~refactoring/mail.md 阶段 3-5~~ **[已废止]**
+- 不再扩展本仓 SmtpMailer / provider / outbox。
 
-#### 5b. refactoring/notification.md 阶段 1-3：渠道抽象、API、安全加固 **[优先级：P2-P3]**
-- **前置**：mail 2 完成、vault A/B/C 完成
-- **并行条件**：可部分与 mail 3-5 并行
-- **完成后**：多渠道通知系统基本成型
+#### 5b. refactoring/notification.md：in-app / Slack / webhook + website-mail **[优先级：P2-P3]**
+- **前置**：config/vault SecretRef（渠道凭据）；website-mail 契约（ADR-WA-08）
+- **不依赖**：本仓 mail 模块
+- **完成后**：产品邮件走 website；本仓保留非邮件渠道与编排
+- **长期收尾**：见 `plan-long.md` PT-09
 
 ---
 
@@ -305,21 +300,21 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 
 #### refactoring/integration.md 全景 **[优先级：P1-P2，贯穿全过程]**
 
-集成测试应与各改进计划阶段并行执行，验证关键路径的端到端功能。参见 **refactoring/integration.md**：
+集成测试应与各改进计划阶段并行执行。参见 **refactoring/integration.md** 与 **refactoring/test-infra.md**：
 
-- **Phase 1**：建立 Docker 容器环境（refactoring/config.md 0a/0b/1 并行）
-- **Phase 2**：配置与数据库测试（refactoring/config.md 2/3 并行）
-- **Phase 3**：Vault 与 CLI 测试（refactoring/config.md 4、refactoring/vault.md D/E 并行）
-- **Phase 4**：邮件与通知测试（refactoring/mail.md 2、refactoring/notification.md 1-3 并行）
-- **Phase 5**：高级功能测试（refactoring/config.md 8、测试覆盖矩阵全覆盖）
-- **Phase 6**：CI/CD 集成与报告
+- **Phase 1**：Docker Compose 数据面（postgres/redis/…）
+- **Phase 2**：配置与数据库 / Vault CLI（`integration_vault`）
+- **Phase 3**：会话同栈（`website-next` + `integration_website_auth`）
+- **Phase 4**：通知编排（in-app / website-mail client mock；**无**本仓 SmtpMailer→Mailpit 门）
+- **Phase 5**：git-cli / 协议矩阵与高级覆盖
+- **Phase 6**：CI（`config-validation.yml` 等）
 
 关键验收标准：
-- ✅ 8 个主要集成测试场景全部通过
-- ✅ 配置、Vault、邮件、通知全链路正常
-- ✅ 错误诊断与脱敏功能生效
+- ✅ 现行黑盒 target 与矩阵路径通过（见 `integration.md`）
+- ✅ 配置、Vault、会话、通知编排关键路径正常
+- ✅ 错误诊断与脱敏功能生效；`MEGA_MAIL__*` / `[mail]` 硬拒
 - ✅ CLI 工作流完整可用
-- ✅ GitHub Actions CI 集成完成
+- ✅ GitHub Actions CI 集成完成；mailpit 仅 website IT 可选消费
 
 ---
 
@@ -338,14 +333,15 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
            ↓
         vault B → config 3
            ↓        ↓
-        (vault C/D 可并行)  config 4/5 → mail 2 → notification 1-3
+        (vault C/D 可并行)  config 4/5 → 现行 SecretRef 消费者
+                                      → notification（website-mail，非本仓 SMTP）
 ```
 
 ### 不能跳过的步骤
 
 - ❌ 不能在 vault A 前启动 vault 的其他工作（都需要脱敏工具）
-- ❌ 不能在 config 5 前启动 mail 2（需要 resolver）
-- ❌ 不能在 mail 2 前启动 notification 阶段 3（需要 password_ref）
+- ❌ 不能在 config 5 前把生产凭据迁入 SecretRef（需要 resolver）
+- ❌ 不能恢复本仓 SMTP/`[mail]` 作为 notification 依赖（ADR-WA-08）
 - ❌ 不能分别实施 config 2 和 vault D 的 CLI 改造（必须协同）
 
 ---
@@ -364,19 +360,16 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 ### P2 - 中等优先级，第一批功能完整
 1. config 阶段 4/5
 2. vault 阶段 E
-3. mail 阶段 2
-4. notification 阶段 1-3
+3. notification（website-mail 客户端 + in-app/Slack/webhook；**无本仓 mail 阶段**）
 
 ### P3 - 后续优化与扩展
-1. mail 阶段 3-4
-2. config 阶段 6
-3. notification 阶段 4-5
-4. vault 阶段 F-I
+1. config 阶段 6
+2. notification 长期收尾（PT-09：webhook/slack/多实例等）
+3. vault 阶段 F-I
 
 ### P4 - 长期、可选或低优先级
-1. mail 阶段 5
-2. config 阶段 7-8
-3. vault 阶段 G/J
+1. config 阶段 7-8
+2. vault 阶段 G/J
 
 ---
 
@@ -391,6 +384,6 @@ A: 参照 general.md 的结构创建新文档，确保包含所有必需部分�
 
 ## 📝 最后一次更新
 
-- **日期**：2026-06-14（2026-06-19 新增 refactoring/orbit.md；2026-06-23 完成全部在 Scope 内的改进计划并发布 v0.1.49）
-- **更新内容**：新增前置依赖说明、清晰的执行顺序、跨模块协调点；2026-06-19 新增 orbit 依赖重构计划（项目引用 → API 依赖）；2026-06-23 完成 contract/config/vault/mail/notification/integration 全部在 Scope 内的可交付改进，对应版本 v0.1.42 - v0.1.49。
-- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/contract.md
+- **日期**：2026-08-01（历史：2026-06-14 起稿；2026-06-19 orbit；2026-06-23 Scope 内交付 v0.1.49）
+- **更新内容**：DOC-01 收口——`mail.md` 标废止；执行顺序/依赖图去掉本仓 SMTP/`password_ref` 主线，改为 website-mail + 现行 SecretRef 消费者；integration 验收对齐 `test-infra.md`（mailpit = website IT）。
+- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md（废止）、refactoring/website-mail.md、refactoring/website-auth.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/test-infra.md、refactoring/contract.md

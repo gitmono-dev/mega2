@@ -7,6 +7,7 @@ use pgp::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, prelude::Expr,
+    sea_query::ExprTrait,
 };
 
 use crate::{

@@ -80,9 +80,9 @@
 
 | Contract 工作 | 对其他文档的依赖 | 类型 | 关键同步点 |
 | --- | --- | --- | --- |
-| API DTO 迁移 | chat.md、notification.md | 协同 | DTO 路径应统一使用 `contract::api`。 |
+| API DTO 迁移 | notification.md、website-auth.md | 协同 | DTO 路径应统一使用 `contract::api`。 |
 | Git protocol 迁移 | protocol.md | 协同 | 只更新路径，不改变协议改进阶段。 |
-| Vault 迁移 | vault.md、config.md、mail.md | 协同 | 只更新路径，不改变 SecretRef 或 bootstrap 设计。 |
+| Vault 迁移 | vault.md、config.md、website-mail.md | 协同 | 只更新路径，不改变 SecretRef 或 bootstrap 设计。 |
 | Policy 迁移 | protocol.md、integration.md | 协同 | API guard 与 Cedar context 路径统一到 `contract::policy`。 |
 
 ## 风险与约束

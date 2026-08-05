@@ -96,7 +96,6 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::mail::MailAttachment;
 
     #[derive(Clone, Default)]
     struct Captured {
@@ -129,7 +128,7 @@ mod tests {
         addr
     }
 
-    fn sample_message<'a>(attachments: &'a [MailAttachment]) -> OutboundMessage<'a> {
+    fn sample_message() -> OutboundMessage<'static> {
         OutboundMessage {
             username: "alice",
             event_type_code: "cl.comment.created",
@@ -137,7 +136,6 @@ mod tests {
             subject: "New comment",
             body_html: "<p>hello</p>",
             body_text: Some("hello"),
-            attachments,
         }
     }
 
@@ -151,9 +149,8 @@ mod tests {
             WebhookChannel::new(url, Some(SecretString::new("s3cret-token"))).expect("build");
         assert_eq!(channel.name(), "webhook");
 
-        let attachments: Vec<MailAttachment> = vec![];
         channel
-            .deliver(&sample_message(&attachments))
+            .deliver(&sample_message())
             .await
             .expect("delivery should succeed");
 
@@ -179,9 +176,8 @@ mod tests {
 
         let channel = WebhookChannel::new(url.clone(), Some(SecretString::new("s3cret-token")))
             .expect("build");
-        let attachments: Vec<MailAttachment> = vec![];
         let err = channel
-            .deliver(&sample_message(&attachments))
+            .deliver(&sample_message())
             .await
             .expect_err("non-success status should error");
         let message = err.to_string();
@@ -196,9 +192,8 @@ mod tests {
         let url = "http://127.0.0.1:1/hook".to_string();
         let channel = WebhookChannel::new(url.clone(), Some(SecretString::new("s3cret-token")))
             .expect("build");
-        let attachments: Vec<MailAttachment> = vec![];
         let err = channel
-            .deliver(&sample_message(&attachments))
+            .deliver(&sample_message())
             .await
             .expect_err("connection should fail");
         let message = err.to_string();

@@ -25,15 +25,11 @@ use crate::{
         },
         storage::{
             AppService, Storage,
-            attachment_storage::AttachmentStorage,
             audit_storage::AuditStorage,
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
             build_trigger_storage::BuildTriggerStorage,
-            channel_membership_storage::ChannelMembershipStorage,
-            channel_membership_update_storage::ChannelMembershipUpdateStorage,
-            channel_storage::ChannelStorage,
             cl_reviewer_storage::ClReviewerStorage,
             cl_storage::ClStorage,
             cla_storage::ClaStorage,
@@ -41,7 +37,6 @@ use crate::{
             code_review_thread_storage::CodeReviewThreadStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
-            custom_reaction_storage::CustomReactionStorage,
             dynamic_sidebar_storage::DynamicSidebarStorage,
             git_db_storage::GitDbStorage,
             gpg_storage::GpgStorage,
@@ -49,12 +44,9 @@ use crate::{
             issue_storage::IssueStorage,
             lfs_db_storage::LfsDbStorage,
             merge_queue_storage::MergeQueueStorage,
-            message_storage::MessageStorage,
             mono_storage::MonoStorage,
-            note_storage::NoteStorage,
             notification_storage::NotificationStorage,
             object_storage::mock_object_storage,
-            open_graph_storage::OpenGraphStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
@@ -64,7 +56,7 @@ use crate::{
 };
 
 const DEFAULT_TEST_DATABASE_URL: &str =
-    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
 
 static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -139,7 +131,7 @@ fn database_url_with_search_path(admin_url: &str, schema: &str) -> String {
 }
 
 async fn execute_postgres(db: &DatabaseConnection, sql: String) {
-    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+    db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
         .await
         .expect("failed to prepare PostgreSQL test schema");
 }
@@ -162,7 +154,6 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         issue_storage: IssueStorage { base: base.clone() },
         vault_storage: VaultStorage { base: base.clone() },
         conversation_storage: ConversationStorage { base: base.clone() },
-        note_storage: NoteStorage { base: base.clone() },
         commit_binding_storage: CommitBindingStorage { base: base.clone() },
         reviewer_storage: ClReviewerStorage { base: base.clone() },
         merge_queue_storage: MergeQueueStorage::new(base.clone()),
@@ -174,14 +165,7 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         bots_storage: BotsStorage { base: base.clone() },
         webhook_storage: WebhookStorage { base: base.clone() },
         audit_storage: AuditStorage { base: base.clone() },
-        attachment_storage: AttachmentStorage { base: base.clone() },
         reaction_storage: ReactionStorage { base: base.clone() },
-        custom_reaction_storage: CustomReactionStorage { base: base.clone() },
-        open_graph_storage: OpenGraphStorage { base: base.clone() },
-        channel_storage: ChannelStorage { base: base.clone() },
-        channel_membership_storage: ChannelMembershipStorage { base: base.clone() },
-        channel_membership_update_storage: ChannelMembershipUpdateStorage { base: base.clone() },
-        message_storage: MessageStorage { base: base.clone() },
     };
 
     apply_migrations(&connection, true).await.unwrap();

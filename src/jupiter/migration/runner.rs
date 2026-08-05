@@ -20,19 +20,17 @@ pub async fn apply_migrations(db: &DatabaseConnection, refresh: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement};
-    use sea_orm_migration::prelude::MigratorTrait;
+    use sea_orm_migration::prelude::{MigrationTrait, MigratorTrait};
 
     use super::*;
     use crate::{
         callisto::{
-            email_job_attachments, email_jobs, notification_event_types,
-            user_notification_preferences, user_notification_settings,
+            notification_event_types, user_notification_preferences, user_notification_settings,
         },
         jupiter::tests::test_db_connection,
         notification::triggers::{
-            EVENT_CHAT_MENTION_CREATED, EVENT_CHAT_REPLY_CREATED, EVENT_CL_COMMENT_CREATED,
-            EVENT_CL_MERGED, EVENT_ISSUE_CLOSED, EVENT_ISSUE_COMMENT_CREATED,
-            EVENT_ITEM_REFERENCED,
+            EVENT_CL_COMMENT_CREATED, EVENT_CL_MERGED, EVENT_ISSUE_CLOSED,
+            EVENT_ISSUE_COMMENT_CREATED, EVENT_ITEM_REFERENCED,
         },
     };
 
@@ -52,6 +50,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_drop_chat_and_notes_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+
+        for table in [
+            "message_notifications",
+            "messages",
+            "channel_membership_updates",
+            "channel_memberships",
+            "channels",
+            "attachments",
+            "open_graph_links",
+            "non_member_note_views",
+            "note_views",
+            "notes",
+        ] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected table '{table}' to be dropped"
+            );
+        }
+
+        for table in ["reactions", "custom_reactions", "user_inbox_notifications"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(table_name.is_some(), "expected table '{table}' to remain");
+        }
+
+        for event_type_code in ["chat.mention.created", "chat.reply.created"] {
+            let event_type = notification_event_types::Entity::find_by_id(event_type_code)
+                .one(&db)
+                .await
+                .expect("query notification event type");
+            assert!(
+                event_type.is_none(),
+                "expected '{event_type_code}' event type to be deleted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_email_jobs_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+
+        for table in ["email_job_attachments", "email_jobs"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected table '{table}' to be dropped"
+            );
+        }
+
+        let stmt = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT to_regclass('user_inbox_notifications')::text AS table_name;".to_owned(),
+        );
+        let row = db
+            .query_one_raw(stmt)
+            .await
+            .expect("query PostgreSQL catalog")
+            .expect("PostgreSQL catalog query should return one row");
+        let table_name: Option<String> = row
+            .try_get("", "table_name")
+            .expect("PostgreSQL catalog query should expose table_name");
+        assert!(
+            table_name.is_some(),
+            "expected user_inbox_notifications to remain"
+        );
+
+        // Forward-only: down must be a no-op (tables stay dropped; inbox remains).
+        {
+            use sea_orm_migration::SchemaManager;
+            let manager = SchemaManager::new(&db);
+            crate::jupiter::migration::m20260731_000001_drop_email_jobs::Migration
+                .down(&manager)
+                .await
+                .expect("drop_email_jobs down should be a no-op Ok(())");
+        }
+
+        for table in ["email_job_attachments", "email_jobs"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected table '{table}' to remain dropped after down no-op"
+            );
+        }
+
+        let stmt = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT to_regclass('user_inbox_notifications')::text AS table_name;".to_owned(),
+        );
+        let row = db
+            .query_one_raw(stmt)
+            .await
+            .expect("query PostgreSQL catalog")
+            .expect("PostgreSQL catalog query should return one row");
+        let table_name: Option<String> = row
+            .try_get("", "table_name")
+            .expect("PostgreSQL catalog query should expose table_name");
+        assert!(
+            table_name.is_some(),
+            "expected user_inbox_notifications to remain after down no-op"
+        );
+    }
+
+    #[tokio::test]
     async fn test_notification_center_schema_and_constraints() {
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
         let db = test_db_connection(temp_dir.path()).await;
@@ -64,15 +221,13 @@ mod tests {
             "notification_event_types",
             "user_notification_settings",
             "user_notification_preferences",
-            "email_jobs",
-            "email_job_attachments",
         ] {
             let stmt = Statement::from_string(
                 DbBackend::Postgres,
                 format!("SELECT to_regclass('{table}')::text AS table_name;"),
             );
             let row = db
-                .query_one(stmt)
+                .query_one_raw(stmt)
                 .await
                 .expect("query PostgreSQL catalog")
                 .expect("PostgreSQL catalog query should return one row");
@@ -84,16 +239,13 @@ mod tests {
 
         let now = chrono::Utc::now().naive_utc();
 
-        // Core event types are seeded by migrations. Verify every trigger
-        // constant is present so trigger-time upserts remain only a fallback.
+        // Core event types are seeded by migrations.
         for event_type_code in [
             EVENT_CL_COMMENT_CREATED,
             EVENT_CL_MERGED,
             EVENT_ISSUE_COMMENT_CREATED,
             EVENT_ISSUE_CLOSED,
             EVENT_ITEM_REFERENCED,
-            EVENT_CHAT_MENTION_CREATED,
-            EVENT_CHAT_REPLY_CREATED,
         ] {
             let seeded = notification_event_types::Entity::find_by_id(event_type_code)
                 .one(&db)
@@ -123,7 +275,7 @@ mod tests {
             username: Set("alice".to_owned()),
             email: Set("alice@example.com".to_owned()),
             enabled: Set(true),
-            delivery_mode: Set("realtime".to_owned()),
+            delivery_mode: Set("in_app".to_owned()),
             preferred_locale: Set(Some("en-US".to_owned())),
             created_at: Set(now),
             updated_at: Set(now),
@@ -147,58 +299,6 @@ mod tests {
             username: Set("alice".to_owned()),
             event_type_code: Set("does.not.exist".to_owned()),
             enabled: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await;
-        assert!(res.is_err(), "expected FK violation for unknown event type");
-
-        let email_job = email_jobs::ActiveModel {
-            id: Default::default(),
-            username: Set("alice".to_owned()),
-            to_email: Set("alice@example.com".to_owned()),
-            event_type_code: Set("cl.comment.created".to_owned()),
-            subject: Set("Test".to_owned()),
-            body_html: Set("<p>Hello</p>".to_owned()),
-            body_text: Set(Some("Hello".to_owned())),
-            status: Set("pending".to_owned()),
-            error_message: Set(None),
-            retry_count: Set(0),
-            next_retry_at: Set(None),
-            sent_at: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .expect("insert email job");
-
-        email_job_attachments::ActiveModel {
-            id: Default::default(),
-            email_job_id: Set(email_job.id),
-            filename: Set("report.txt".to_owned()),
-            content_type: Set("text/plain".to_owned()),
-            content: Set(b"hello".to_vec()),
-            created_at: Set(now),
-        }
-        .insert(&db)
-        .await
-        .expect("insert email job attachment");
-
-        let res = email_jobs::ActiveModel {
-            id: Default::default(),
-            username: Set("alice".to_owned()),
-            to_email: Set("alice@example.com".to_owned()),
-            event_type_code: Set("does.not.exist".to_owned()),
-            subject: Set("Test".to_owned()),
-            body_html: Set("<p>Hello</p>".to_owned()),
-            body_text: Set(None),
-            status: Set("pending".to_owned()),
-            error_message: Set(None),
-            retry_count: Set(0),
-            next_retry_at: Set(None),
-            sent_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }

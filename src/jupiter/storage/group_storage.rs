@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    ops::Deref,
-};
+use std::{collections::HashSet, ops::Deref};
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
@@ -9,16 +6,11 @@ use sea_orm::{
 };
 
 use crate::{
-    callisto::{
-        mega_group, mega_group_member, mega_resource_permission,
-        sea_orm_active_enums::ResourceTypeEnum,
-    },
+    callisto::{mega_group, mega_group_member, mega_resource_permission},
     common::{errors::MegaError, utils::generate_id},
     contract::api::common::Pagination,
     jupiter::{
-        model::group_dto::{
-            CreateGroupPayload, DeleteGroupStats, ResourcePermissionBinding, UpdateGroupPayload,
-        },
+        model::group_dto::{CreateGroupPayload, DeleteGroupStats, UpdateGroupPayload},
         storage::base_storage::{BaseStorage, StorageConnector},
     },
 };
@@ -253,157 +245,6 @@ impl GroupStorage {
             .all(self.get_connection())
             .await?)
     }
-
-    pub async fn list_resource_permissions(
-        &self,
-        resource_type: ResourceTypeEnum,
-        resource_id: &str,
-    ) -> Result<Vec<mega_resource_permission::Model>, MegaError> {
-        Ok(mega_resource_permission::Entity::find()
-            .filter(mega_resource_permission::Column::ResourceType.eq(resource_type))
-            .filter(mega_resource_permission::Column::ResourceId.eq(resource_id))
-            .order_by_asc(mega_resource_permission::Column::GroupId)
-            .all(self.get_connection())
-            .await?)
-    }
-
-    pub async fn replace_resource_permissions(
-        &self,
-        resource_type: ResourceTypeEnum,
-        resource_id: &str,
-        permissions: &[ResourcePermissionBinding],
-    ) -> Result<Vec<mega_resource_permission::Model>, MegaError> {
-        let permissions = normalize_permission_bindings(permissions);
-        let txn = self.get_connection().begin().await?;
-
-        mega_resource_permission::Entity::delete_many()
-            .filter(mega_resource_permission::Column::ResourceType.eq(resource_type.clone()))
-            .filter(mega_resource_permission::Column::ResourceId.eq(resource_id))
-            .exec(&txn)
-            .await?;
-
-        if !permissions.is_empty() {
-            let now = chrono::Utc::now().naive_utc();
-            let models = permissions
-                .iter()
-                .map(|binding| mega_resource_permission::ActiveModel {
-                    id: Set(generate_id()),
-                    resource_type: Set(resource_type.clone()),
-                    resource_id: Set(resource_id.to_string()),
-                    group_id: Set(binding.group_id),
-                    permission: Set(binding.permission.clone()),
-                    created_at: Set(now),
-                    updated_at: Set(now),
-                })
-                .collect::<Vec<_>>();
-
-            mega_resource_permission::Entity::insert_many(models)
-                .exec(&txn)
-                .await
-                .map_err(|e| {
-                    map_fk_to_not_found(e, "Group not found in permission binding".to_string())
-                })?;
-        }
-
-        let result = mega_resource_permission::Entity::find()
-            .filter(mega_resource_permission::Column::ResourceType.eq(resource_type.clone()))
-            .filter(mega_resource_permission::Column::ResourceId.eq(resource_id))
-            .order_by_asc(mega_resource_permission::Column::GroupId)
-            .all(&txn)
-            .await?;
-
-        txn.commit().await?;
-        Ok(result)
-    }
-
-    pub async fn upsert_resource_permissions(
-        &self,
-        resource_type: ResourceTypeEnum,
-        resource_id: &str,
-        permissions: &[ResourcePermissionBinding],
-    ) -> Result<Vec<mega_resource_permission::Model>, MegaError> {
-        let permissions = normalize_permission_bindings(permissions);
-        if permissions.is_empty() {
-            return self
-                .list_resource_permissions(resource_type, resource_id)
-                .await;
-        }
-
-        let now = chrono::Utc::now().naive_utc();
-        let models = permissions
-            .iter()
-            .map(|binding| mega_resource_permission::ActiveModel {
-                id: Set(generate_id()),
-                resource_type: Set(resource_type.clone()),
-                resource_id: Set(resource_id.to_string()),
-                group_id: Set(binding.group_id),
-                permission: Set(binding.permission.clone()),
-                created_at: Set(now),
-                updated_at: Set(now),
-            })
-            .collect::<Vec<_>>();
-
-        let on_conflict = OnConflict::columns([
-            mega_resource_permission::Column::ResourceType,
-            mega_resource_permission::Column::ResourceId,
-            mega_resource_permission::Column::GroupId,
-        ])
-        .update_columns([
-            mega_resource_permission::Column::Permission,
-            mega_resource_permission::Column::UpdatedAt,
-        ])
-        .to_owned();
-
-        match mega_resource_permission::Entity::insert_many(models)
-            .on_conflict(on_conflict)
-            .exec(self.get_connection())
-            .await
-        {
-            Ok(_) | Err(DbErr::RecordNotInserted) => {}
-            Err(e) => {
-                return Err(map_fk_to_not_found(
-                    e,
-                    "Group not found in permission binding".to_string(),
-                ));
-            }
-        }
-
-        self.list_resource_permissions(resource_type, resource_id)
-            .await
-    }
-
-    pub async fn delete_resource_permissions(
-        &self,
-        resource_type: ResourceTypeEnum,
-        resource_id: &str,
-    ) -> Result<u64, MegaError> {
-        let result = mega_resource_permission::Entity::delete_many()
-            .filter(mega_resource_permission::Column::ResourceType.eq(resource_type))
-            .filter(mega_resource_permission::Column::ResourceId.eq(resource_id))
-            .exec(self.get_connection())
-            .await?;
-
-        Ok(result.rows_affected)
-    }
-
-    pub async fn find_permissions_by_resource(
-        &self,
-        resource_type: ResourceTypeEnum,
-        resource_id: &str,
-        group_ids: &[i64],
-    ) -> Result<Vec<mega_resource_permission::Model>, MegaError> {
-        if group_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        Ok(mega_resource_permission::Entity::find()
-            .filter(mega_resource_permission::Column::ResourceType.eq(resource_type))
-            .filter(mega_resource_permission::Column::ResourceId.eq(resource_id))
-            .filter(mega_resource_permission::Column::GroupId.is_in(group_ids.to_vec()))
-            .order_by_asc(mega_resource_permission::Column::GroupId)
-            .all(self.get_connection())
-            .await?)
-    }
 }
 
 fn normalize_usernames(usernames: &[String]) -> Vec<String> {
@@ -420,23 +261,6 @@ fn normalize_usernames(usernames: &[String]) -> Vec<String> {
             } else {
                 None
             }
-        })
-        .collect()
-}
-
-fn normalize_permission_bindings(
-    permissions: &[ResourcePermissionBinding],
-) -> Vec<ResourcePermissionBinding> {
-    let mut by_group = BTreeMap::new();
-    for permission in permissions {
-        by_group.insert(permission.group_id, permission.permission.clone());
-    }
-
-    by_group
-        .into_iter()
-        .map(|(group_id, permission)| ResourcePermissionBinding {
-            group_id,
-            permission,
         })
         .collect()
 }
@@ -478,7 +302,7 @@ fn map_unique_to_conflict(err: DbErr, group_name: String) -> MegaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{callisto::sea_orm_active_enums::PermissionEnum, common::errors::MegaError};
+    use crate::common::errors::MegaError;
 
     #[tokio::test]
     async fn create_group_conflicts_on_duplicate_name_concurrently() {
@@ -584,52 +408,6 @@ mod tests {
 
         match result {
             Err(MegaError::Other(msg)) if msg.contains("[code:409]") => {}
-            other => panic!("unexpected result: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn upsert_resource_permissions_returns_not_found_when_group_missing() {
-        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
-        let group_storage = storage.group_storage();
-
-        let result = group_storage
-            .upsert_resource_permissions(
-                ResourceTypeEnum::Note,
-                "1001",
-                &[ResourcePermissionBinding {
-                    group_id: 999_999,
-                    permission: PermissionEnum::Read,
-                }],
-            )
-            .await;
-
-        match result {
-            Err(MegaError::NotFound(msg)) => assert!(msg.contains("Group not found")),
-            other => panic!("unexpected result: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn replace_resource_permissions_returns_not_found_when_group_missing() {
-        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let storage = crate::jupiter::tests::test_storage(temp_dir.path()).await;
-        let group_storage = storage.group_storage();
-
-        let result = group_storage
-            .replace_resource_permissions(
-                ResourceTypeEnum::Note,
-                "1002",
-                &[ResourcePermissionBinding {
-                    group_id: 999_999,
-                    permission: PermissionEnum::Write,
-                }],
-            )
-            .await;
-
-        match result {
-            Err(MegaError::NotFound(msg)) => assert!(msg.contains("Group not found")),
             other => panic!("unexpected result: {other:?}"),
         }
     }

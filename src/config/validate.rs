@@ -9,10 +9,9 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, ChatConfig, Config, DbConfig,
-    LFSConfig, LogConfig, MailConfig, MailProvider, MonoConfig, NOTIFICATION_DELIVERY_MODES,
-    NotificationConfig, OAuthConfig, OrionServerConfig, PackConfig, RedisConfig, SidebarConfig,
-    VAULT_AUDIT_SINKS, VaultConfig,
+    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
+    MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig, OAuthConfig, OrionServerConfig,
+    PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
     secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
@@ -116,9 +115,6 @@ impl Config {
         validate_lfs_config(&self.lfs)?;
         validate_build_config(&self.build)?;
         validate_redis_config(&self.redis)?;
-        if let Some(mail_config) = &self.mail {
-            mail_config.validate()?;
-        }
         if let Some(buck_config) = &self.buck {
             validate_buck_config(buck_config)?;
         }
@@ -137,63 +133,143 @@ impl Config {
         if let Some(oauth_config) = &self.oauth {
             validate_oauth_config(oauth_config)?;
         }
-        if let Some(chat_config) = &self.chat {
-            validate_chat_config(chat_config)?;
-        }
+        reject_legacy_oauth_environment()?;
+        reject_legacy_mail_environment()?;
 
         Ok(())
     }
 }
 
-/// Validate `[oauth]` settings: each CORS origin must be a browser Origin of the
-/// form `scheme://host[:port]` (http/https, no path/query/fragment) that also
-/// parses as an HTTP header value — i.e. exactly what the server's `CorsLayer`
-/// accepts at runtime, so a configured origin can never pass validation yet be
-/// silently dropped by the CORS layer.
+/// Validate `[oauth]` settings: website API base URL, session cookie names, and
+/// each CORS origin must be a browser Origin of the form `scheme://host[:port]`
+/// (http/https, no path/query/fragment) that also parses as an HTTP header value
+/// — i.e. exactly what the server's `CorsLayer` accepts at runtime, so a
+/// configured origin can never pass validation yet be silently dropped by the
+/// CORS layer.
 pub(crate) fn validate_oauth_config(config: &OAuthConfig) -> Result<(), MegaError> {
+    validate_oauth_website_api_base_url(config)?;
+    validate_oauth_session_cookie_names(config)?;
     for origin in &config.allowed_cors_origins {
         validate_cors_origin(origin)?;
     }
     Ok(())
 }
 
-/// Validate `[chat]` settings: each MIME allowlist entry must be a non-empty
-/// type/subtype pattern without control characters. Wildcards are allowed only
-/// for the subtype (`image/*`), matching the runtime check in
-/// `validate_chat_attachment_metadata`.
-pub(crate) fn validate_chat_config(config: &ChatConfig) -> Result<(), MegaError> {
-    for pattern in &config.attachment_allowed_mime_types {
-        validate_mime_allowlist_pattern(pattern)?;
-    }
-    if config.open_graph_fetch_timeout_ms == 0 {
+/// Fail-closed guard for `service http`: requires `[oauth]` with a non-empty
+/// `website_api_base_url`.
+pub fn require_oauth_for_http_service(config: &Config) -> Result<(), MegaError> {
+    let oauth = config.oauth.as_ref().ok_or_else(|| {
+        MegaError::Other(
+            "service http requires [oauth] with oauth.website_api_base_url (see docs/refactoring/website-auth.md)".to_string(),
+        )
+    })?;
+    validate_oauth_website_api_base_url(oauth)
+}
+
+fn validate_oauth_website_api_base_url(config: &OAuthConfig) -> Result<(), MegaError> {
+    let value = config.website_api_base_url.trim();
+    if value.is_empty() {
         return Err(MegaError::Other(
-            "chat.open_graph_fetch_timeout_ms must be greater than 0".to_string(),
+            "oauth.website_api_base_url must not be empty (required for website session introspection; see docs/refactoring/website-auth.md)".to_string(),
         ));
+    }
+    let parsed = Url::parse(value).map_err(|e| {
+        MegaError::Other(format!(
+            "oauth.website_api_base_url `{value}` is not a valid URL: {e}"
+        ))
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(MegaError::Other(format!(
+            "oauth.website_api_base_url `{value}` must use the http or https scheme"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(MegaError::Other(format!(
+            "oauth.website_api_base_url `{value}` must not contain userinfo (use scheme://host[:port])"
+        )));
+    }
+    match parsed.host() {
+        Some(url::Host::Domain("")) => {
+            return Err(MegaError::Other(format!(
+                "oauth.website_api_base_url `{value}` must include a non-empty host"
+            )));
+        }
+        Some(_) => {}
+        None => {
+            return Err(MegaError::Other(format!(
+                "oauth.website_api_base_url `{value}` must include a host (use scheme://host[:port])"
+            )));
+        }
+    }
+    let path_ok = parsed.path().is_empty() || parsed.path() == "/";
+    if !path_ok || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(MegaError::Other(format!(
+            "oauth.website_api_base_url `{value}` must not contain a path, query, or fragment (use scheme://host[:port])"
+        )));
     }
     Ok(())
 }
 
-fn validate_mime_allowlist_pattern(pattern: &str) -> Result<(), MegaError> {
-    if pattern.trim().is_empty() {
+/// Hard-reject removed Campsite/Tinyship oauth env overrides (AU-02). Unknown
+/// `MEGA_*` vars otherwise only warn unless `--deny-warnings`; these three must
+/// fail ordinary `config validate` / startup validation.
+fn reject_legacy_oauth_environment() -> Result<(), MegaError> {
+    const LEGACY: &[&str] = &[
+        "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
+        "MEGA_OAUTH__TINYSHIP_API_DOMAIN",
+        "MEGA_OAUTH__API_STORE_BACKEND",
+    ];
+    for variable in LEGACY {
+        if std::env::var_os(variable).is_some() {
+            return Err(MegaError::Other(format!(
+                "{variable} is removed; use MEGA_OAUTH__WEBSITE_API_BASE_URL (see docs/refactoring/website-auth.md)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Hard-reject removed SMTP `[mail]` env overrides (MN-03). Unknown `MEGA_*`
+/// vars otherwise only warn unless `--deny-warnings`; any `MEGA_MAIL__*` must
+/// fail ordinary `config validate` / config load / startup.
+pub(crate) fn reject_legacy_mail_environment() -> Result<(), MegaError> {
+    const PREFIX: &str = "MEGA_MAIL__";
+    let mut found: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            let key = key.to_string_lossy();
+            if key.starts_with(PREFIX) {
+                Some(key.into_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    found.sort();
+    if let Some(variable) = found.first() {
+        return Err(MegaError::Other(format!(
+            "{variable} is removed; product email is delivered via website (see docs/refactoring/website-mail.md). Unset all MEGA_MAIL__* variables"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_oauth_session_cookie_names(config: &OAuthConfig) -> Result<(), MegaError> {
+    if config.session_cookie_names.is_empty() {
         return Err(MegaError::Other(
-            "chat.attachment_allowed_mime_types must not contain empty entries".to_string(),
+            "oauth.session_cookie_names must not be empty".to_string(),
         ));
     }
-    if pattern.chars().any(|c| c.is_control()) {
-        return Err(MegaError::Other(format!(
-            "chat.attachment_allowed_mime_types entry `{pattern}` must not contain control characters"
-        )));
-    }
-    let parts: Vec<&str> = pattern.split('/').collect();
-    if parts.len() != 2
-        || parts[0].trim().is_empty()
-        || parts[1].trim().is_empty()
-        || parts[0].contains('*')
-        || parts[1].contains('*') && parts[1] != "*"
-    {
-        return Err(MegaError::Other(format!(
-            "chat.attachment_allowed_mime_types entry `{pattern}` must be a MIME type (`type/subtype`) or wildcard (`type/*`)"
-        )));
+    for (index, name) in config.session_cookie_names.iter().enumerate() {
+        if name.trim().is_empty() {
+            return Err(MegaError::Other(format!(
+                "oauth.session_cookie_names[{index}] must not be empty"
+            )));
+        }
+        if name.chars().any(|c| c.is_control()) {
+            return Err(MegaError::Other(format!(
+                "oauth.session_cookie_names[{index}] must not contain control characters"
+            )));
+        }
     }
     Ok(())
 }
@@ -274,6 +350,43 @@ pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Resul
             "notification.default_locale must not be empty".to_string(),
         ));
     }
+    let website_mail_enabled = !config.website_mail_base_url.trim().is_empty();
+    let website_mail_bearer_count = usize::from(config.website_mail_bearer.is_some())
+        + usize::from(config.website_mail_bearer_ref.is_some());
+    if website_mail_enabled {
+        let parsed = Url::parse(&config.website_mail_base_url).map_err(|_| {
+            MegaError::Other(
+                "notification.website_mail_base_url must be a valid HTTP(S) URL".to_string(),
+            )
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(MegaError::Other(
+                "notification.website_mail_base_url must be a valid HTTP(S) URL".to_string(),
+            ));
+        }
+        if parsed.path() != "/" && !parsed.path().is_empty() {
+            return Err(MegaError::Other(
+                "notification.website_mail_base_url must not include a path".to_string(),
+            ));
+        }
+        if website_mail_bearer_count != 1 {
+            return Err(MegaError::Other(
+                "exactly one of notification.website_mail_bearer or notification.website_mail_bearer_ref is required when notification.website_mail_base_url is set".to_string(),
+            ));
+        }
+        if let Some(secret_ref) = &config.website_mail_bearer_ref {
+            validate_config_secret_ref(
+                "notification.website_mail_bearer_ref",
+                secret_ref,
+                "notification/website_mail/bearer",
+            )?;
+        }
+    } else if website_mail_bearer_count != 0 {
+        return Err(MegaError::Other(
+            "notification.website_mail_base_url is required when a website mail bearer is configured"
+                .to_string(),
+        ));
+    }
 
     if let Some(slack) = &config.slack
         && slack.enabled
@@ -311,8 +424,8 @@ pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Resul
 }
 
 /// Validate that a config-managed `SecretRef` lives under the expected
-/// `config/<profile>/<suffix>` namespace (used for `mail.password` and the
-/// notification channel credentials). The SecretRef value is never logged.
+/// `config/<profile>/<suffix>` namespace for notification channel credentials.
+/// The SecretRef value is never logged.
 pub(crate) fn validate_config_secret_ref(
     field_path: &str,
     secret_ref: &SecretRef,
@@ -341,168 +454,6 @@ fn is_config_secret_under(secret_name: &str, suffix: &str) -> bool {
 
     // Exactly one profile segment: non-empty and containing no further '/'.
     !profile.is_empty() && !profile.contains('/')
-}
-
-impl MailConfig {
-    pub fn warn_plaintext_password_deprecated(&self) {
-        if self.password.is_some() {
-            tracing::warn!(
-                field = "mail.password",
-                "mail.password is deprecated; use mail.password_ref for vault-backed SMTP credentials"
-            );
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), MegaError> {
-        self.validate_secret_fields()?;
-        if let Some(secret_ref) = &self.password_ref {
-            validate_mail_password_secret_ref("mail.password_ref", secret_ref)?;
-        }
-        if self.provider != MailProvider::Smtp
-            && (self.password.is_some() || self.password_ref.is_some())
-        {
-            return Err(MegaError::Other(
-                "mail.password and mail.password_ref are only supported when mail.provider is smtp"
-                    .to_string(),
-            ));
-        }
-
-        if self.enabled && self.provider == MailProvider::Smtp {
-            if self.smtp_host.trim().is_empty() {
-                return Err(MegaError::Other(
-                    "mail.smtp_host is required when mail.enabled is true".to_string(),
-                ));
-            }
-            if self.from.trim().is_empty() {
-                return Err(MegaError::Other(
-                    "mail.from is required when mail.enabled is true".to_string(),
-                ));
-            }
-        }
-
-        if self.enabled && self.provider == MailProvider::Http {
-            let url = self
-                .http_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| {
-                    MegaError::Other(
-                        "mail.http_url is required when mail.provider is http".to_string(),
-                    )
-                })?;
-            let parsed = reqwest::Url::parse(url)
-                .map_err(|e| MegaError::Other(format!("mail.http_url is not a valid URL: {e}")))?;
-            if parsed.scheme() != "http" && parsed.scheme() != "https" {
-                return Err(MegaError::Other(format!(
-                    "mail.http_url scheme must be http or https, got {}",
-                    parsed.scheme()
-                )));
-            }
-            for (name, value) in &self.http_headers {
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                    MegaError::Other(format!(
-                        "mail.http_headers key '{name}' is not a valid HTTP header name: {e}"
-                    ))
-                })?;
-                reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                    MegaError::Other(format!(
-                        "mail.http_headers value for '{name}' is not a valid HTTP header value: {e}"
-                    ))
-                })?;
-            }
-        }
-
-        if self.dispatcher_batch_size == 0 {
-            return Err(MegaError::Other(
-                "mail.dispatcher_batch_size must be greater than 0".to_string(),
-            ));
-        }
-        if self.dispatcher_max_in_flight == 0 {
-            return Err(MegaError::Other(
-                "mail.dispatcher_max_in_flight must be greater than 0".to_string(),
-            ));
-        }
-        if self.retry_max_attempts <= 0 {
-            return Err(MegaError::Other(
-                "mail.retry_max_attempts must be greater than 0".to_string(),
-            ));
-        }
-        if self.retry_backoff_base_secs <= 0 {
-            return Err(MegaError::Other(
-                "mail.retry_backoff_base_secs must be greater than 0".to_string(),
-            ));
-        }
-        if self.retry_backoff_max_secs <= 0 {
-            return Err(MegaError::Other(
-                "mail.retry_backoff_max_secs must be greater than 0".to_string(),
-            ));
-        }
-        if self.retry_backoff_max_secs < self.retry_backoff_base_secs {
-            return Err(MegaError::Other(
-                "mail.retry_backoff_max_secs must be greater than or equal to mail.retry_backoff_base_secs".to_string(),
-            ));
-        }
-        if self.attachment_prune_interval_secs == 0 {
-            return Err(MegaError::Other(
-                "mail.attachment_prune_interval_secs must be greater than 0".to_string(),
-            ));
-        }
-        if self.attachment_retention_days == 0 {
-            return Err(MegaError::Other(
-                "mail.attachment_retention_days must be greater than 0".to_string(),
-            ));
-        }
-        if self.attachment_prune_statuses.is_empty() {
-            return Err(MegaError::Other(
-                "mail.attachment_prune_statuses must not be empty".to_string(),
-            ));
-        }
-
-        let mut statuses = BTreeSet::new();
-        for status in &self.attachment_prune_statuses {
-            let status = status.trim();
-            if !matches!(status, "sent" | "skipped") {
-                return Err(MegaError::Other(
-                    "mail.attachment_prune_statuses entries must be `sent` or `skipped`"
-                        .to_string(),
-                ));
-            }
-            if !statuses.insert(status) {
-                return Err(MegaError::Other(
-                    "mail.attachment_prune_statuses must not contain duplicates".to_string(),
-                ));
-            }
-        }
-        if self.template_default_locale.trim().is_empty() {
-            return Err(MegaError::Other(
-                "mail.template_default_locale must not be empty".to_string(),
-            ));
-        }
-        if !self
-            .template_default_locale
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-        {
-            return Err(MegaError::Other(
-                "mail.template_default_locale contains unsupported characters".to_string(),
-            ));
-        }
-        if let Some(template_dir) = &self.template_dir {
-            if template_dir.as_os_str().is_empty() {
-                return Err(MegaError::Other(
-                    "mail.template_dir must not be empty".to_string(),
-                ));
-            }
-            if !template_dir.is_dir() {
-                return Err(MegaError::Other(format!(
-                    "mail.template_dir must point to an existing directory: {}",
-                    template_dir.display()
-                )));
-            }
-        }
-
-        Ok(())
-    }
 }
 
 pub(crate) fn validate_log_config(log_config: &LogConfig) -> Result<(), MegaError> {
@@ -636,7 +587,7 @@ pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), Me
     require_non_empty("redis.url", &redis_config.url)?;
     let trimmed = redis_config.url.trim_start();
     if is_secret_ref_value(trimmed) {
-        let secret_ref = SecretRef::parse(trimmed)?;
+        let secret_ref = parse_secret_ref_for_field("redis.url", trimmed)?;
         validate_config_secret_ref("redis.url", &secret_ref, "redis/url")?;
         return Ok(());
     }
@@ -656,13 +607,6 @@ pub(crate) fn validate_redis_url_literal(field_path: &str, url: &str) -> Result<
             "{field_path} scheme must be 'redis' or 'rediss'"
         ))),
     }
-}
-
-pub(crate) fn validate_mail_password_secret_ref(
-    field_path: &str,
-    secret_ref: &SecretRef,
-) -> Result<(), MegaError> {
-    validate_config_secret_ref(field_path, secret_ref, "mail/password")
 }
 
 pub(crate) fn validate_buck_config(buck_config: &BuckConfig) -> Result<(), MegaError> {
@@ -730,8 +674,17 @@ fn validate_object_storage_secret_ref(
         return Ok(());
     }
 
-    let secret_ref = SecretRef::parse(trimmed)?;
+    let secret_ref = parse_secret_ref_for_field(field_path, trimmed)?;
     validate_config_secret_ref(field_path, &secret_ref, suffix)
+}
+
+/// Parse a `vault://` SecretRef and prefix parse failures with `field_path` so
+/// `config validate` diagnostics name the offending setting (e.g. `redis.url`).
+fn parse_secret_ref_for_field(field_path: &str, value: &str) -> Result<SecretRef, MegaError> {
+    SecretRef::parse(value).map_err(|err| match err {
+        MegaError::Other(msg) => MegaError::Other(format!("{field_path}: {msg}")),
+        other => other,
+    })
 }
 
 pub(crate) fn validate_orion_server_config(
@@ -967,47 +920,6 @@ fn known_unconsumed_file_fields_from_value(path: &Path, value: &Value) -> Vec<Fi
 pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
 
-    // `oauth.allowed_cors_origins` is now consumed by OAuthConfig; the remaining
-    // legacy keys are still ignored (no consumer yet), so warn per-key.
-    if let Some(oauth) = value.get("oauth").and_then(Value::as_table) {
-        for field in [
-            "campsite_api_domain",
-            "tinyship_api_domain",
-            "api_store_backend",
-        ] {
-            if oauth.contains_key(field) {
-                warnings.push(ConfigWarning {
-                    field_path: format!("oauth.{field}"),
-                    message: format!(
-                        "oauth.{field} is currently ignored (no consumer yet); only oauth.allowed_cors_origins is consumed"
-                    ),
-                });
-            }
-        }
-    }
-
-    if let Some(mail) = value.get("mail").and_then(Value::as_table) {
-        if mail.contains_key("password") {
-            warnings.push(ConfigWarning {
-                field_path: "mail.password".to_string(),
-                message:
-                    "mail.password is deprecated; use mail.password_ref for vault-backed SMTP credentials"
-                        .to_string(),
-            });
-        }
-
-        for field in ["smtp_tls", "tls"] {
-            if mail.contains_key(field) {
-                warnings.push(ConfigWarning {
-                    field_path: format!("mail.{field}"),
-                    message: format!(
-                        "mail.{field} is ignored by MailConfig; use mail.starttls for STARTTLS behavior"
-                    ),
-                });
-            }
-        }
-    }
-
     warnings.extend(unknown_fields(value));
 
     warnings
@@ -1018,10 +930,8 @@ pub(crate) fn known_unconsumed_fields(value: &Value) -> Vec<ConfigWarning> {
 /// `unknown_fields` and is applied during config loading so that typos and
 /// obsolete keys fail fast instead of being silently dropped by serde.
 ///
-/// `[oauth]` is now a recognized section (`OAuthConfig`): `allowed_cors_origins`
-/// is consumed, while the legacy keys (`campsite_api_domain`,
-/// `tinyship_api_domain`, `api_store_backend`) are whitelisted-but-ignored, so
-/// the section is validated like any other rather than skipped.
+/// `[oauth]` is a recognized section (`OAuthConfig`) with strongly-typed keys;
+/// unknown keys under the section fail like any other section.
 pub fn reject_unknown_fields(value: &Value) -> Result<(), MegaError> {
     let mut errors = Vec::new();
 
@@ -1254,15 +1164,7 @@ fn collect_value_field_paths(prefix: &str, value: &Value, fields: &mut BTreeSet<
 }
 
 fn is_effective_source_field_path(field_path: &str) -> bool {
-    !field_path.is_empty()
-        && is_known_field_path(field_path)
-        && !matches!(field_path, "mail.smtp_tls" | "mail.tls")
-        && field_path != "oauth"
-        // oauth.allowed_cors_origins is consumed; the legacy oauth keys are not.
-        && !matches!(
-            field_path,
-            "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
-        )
+    !field_path.is_empty() && is_known_field_path(field_path)
 }
 
 fn file_source_label(kind: &str, path: &Path) -> String {
@@ -1333,10 +1235,10 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.access_key_id"
             | "object_storage.s3.secret_access_key"
             | "object_storage.s3.endpoint_url"
-            | "mail.password"
-            | "mail.password_ref"
             | "notification.slack.webhook_url_ref"
             | "notification.webhook.token_ref"
+            | "notification.website_mail_bearer"
+            | "notification.website_mail_bearer_ref"
     )
 }
 
@@ -1374,22 +1276,7 @@ fn is_reserved_mega_env_var(variable: &str) -> bool {
 }
 
 fn environment_warning_for(variable: &str, field_path: &str) -> Option<EnvironmentConfigWarning> {
-    let message = if matches!(
-        field_path,
-        "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
-    ) {
-        format!(
-            "{variable} maps to {field_path}, which is currently ignored (no consumer yet); only oauth.allowed_cors_origins is consumed"
-        )
-    } else if matches!(field_path, "mail.smtp_tls" | "mail.tls") {
-        format!(
-            "{variable} maps to {field_path}, which is ignored by MailConfig; use MEGA_MAIL__STARTTLS for STARTTLS behavior"
-        )
-    } else if field_path == "mail.password" {
-        format!(
-            "{variable} maps to {field_path}, which is deprecated; use MEGA_MAIL__PASSWORD_REF with a vault-backed SecretRef"
-        )
-    } else if !is_known_field_path(field_path) {
+    let message = if !is_known_field_path(field_path) {
         format!(
             "{variable} maps to {field_path}, which is not recognized by Config and will be ignored; remove the variable or use a supported MEGA_* field path"
         )
@@ -1404,12 +1291,8 @@ fn environment_warning_for(variable: &str, field_path: &str) -> Option<Environme
     })
 }
 
-fn environment_field_is_ignored(field_path: &str) -> bool {
-    // oauth.allowed_cors_origins is consumed; only the legacy oauth keys are ignored.
-    matches!(
-        field_path,
-        "oauth.campsite_api_domain" | "oauth.tinyship_api_domain" | "oauth.api_store_backend"
-    ) || matches!(field_path, "mail.smtp_tls" | "mail.tls")
+fn environment_field_is_ignored(_field_path: &str) -> bool {
+    false
 }
 
 fn is_known_field_path(field_path: &str) -> bool {
@@ -1521,17 +1404,10 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "artifacts_gc",
             "orion_server",
             "sidebar",
-            "mail",
             "notification",
             "vault",
             "oauth",
-            "chat",
-        ]),
-        "chat" => Some(&[
-            "attachment_allowed_mime_types",
-            "open_graph_fetch_enabled",
-            "open_graph_fetch_timeout_ms",
-            "open_graph_allow_private_networks",
+            "git",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1603,34 +1479,13 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         ]),
         "sidebar" => Some(&["default_items"]),
         "sidebar.default_items" => Some(&["public_id", "label", "href", "visible", "order_index"]),
-        "mail" => Some(&[
-            "enabled",
-            "provider",
-            "smtp_host",
-            "smtp_port",
-            "username",
-            "password",
-            "password_ref",
-            "from",
-            "starttls",
-            "dispatcher_batch_size",
-            "dispatcher_max_in_flight",
-            "retry_max_attempts",
-            "retry_backoff_base_secs",
-            "retry_backoff_max_secs",
-            "attachment_prune_enabled",
-            "attachment_prune_interval_secs",
-            "attachment_retention_days",
-            "attachment_prune_statuses",
-            "template_default_locale",
-            "template_dir",
-            "smtp_tls",
-            "tls",
-        ]),
         "notification" => Some(&[
             "enabled",
             "default_delivery_mode",
             "default_locale",
+            "website_mail_base_url",
+            "website_mail_bearer",
+            "website_mail_bearer_ref",
             "slack",
             "webhook",
         ]),
@@ -1638,16 +1493,13 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
         "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
-        // `allowed_cors_origins` is the only strongly-typed/consumed key
-        // (OAuthConfig). The remaining keys are legacy compatibility fields:
-        // whitelisted so the sample config loads, but ignored at deserialize time
-        // until a real consumer exists.
+        // Strongly-typed OAuth / website session settings (OAuthConfig).
         "oauth" => Some(&[
             "allowed_cors_origins",
-            "campsite_api_domain",
-            "tinyship_api_domain",
-            "api_store_backend",
+            "website_api_base_url",
+            "session_cookie_names",
         ]),
+        "git" => Some(&["anonymous_access"]),
         _ => None,
     }
 }
@@ -1657,9 +1509,7 @@ mod tests {
     use orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
 
     use super::*;
-    use crate::config::{
-        secret::SecretRef, template::config_init_template, testing::isolated_config,
-    };
+    use crate::config::{template::config_init_template, testing::isolated_config};
 
     fn valid_config() -> Config {
         isolated_config(std::env::temp_dir().join("monoengine-config-validate-tests"))
@@ -1693,47 +1543,31 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_accepts_default_chat_config() {
+    fn config_validate_accepts_website_mail_it_bearer() {
         let mut config = valid_config();
-        config.chat = Some(crate::config::ChatConfig::default());
-
-        config
-            .validate()
-            .expect("default chat config should validate");
-    }
-
-    #[test]
-    fn config_validate_accepts_chat_mime_wildcards() {
-        let mut config = valid_config();
-        config.chat = Some(crate::config::ChatConfig {
-            attachment_allowed_mime_types: vec![
-                "image/*".to_string(),
-                "application/pdf".to_string(),
-            ],
+        config.notification = Some(crate::config::NotificationConfig {
+            website_mail_base_url: "http://website-next:7001".to_string(),
+            website_mail_bearer: Some(crate::config::secret::SecretString::new("it-shared-bearer")),
             ..Default::default()
         });
 
         config
             .validate()
-            .expect("wildcard MIME allowlist should validate");
+            .expect("website mail IT configuration should validate");
     }
 
     #[test]
-    fn config_validate_rejects_invalid_chat_mime_patterns() {
+    fn config_validate_rejects_website_mail_without_single_bearer_source() {
         let mut config = valid_config();
-        config.chat = Some(crate::config::ChatConfig {
-            attachment_allowed_mime_types: vec!["*/*".to_string(), "bad".to_string()],
+        config.notification = Some(crate::config::NotificationConfig {
+            website_mail_base_url: "http://website-next:7001".to_string(),
             ..Default::default()
         });
 
         let err = config
             .validate()
-            .expect_err("invalid MIME patterns should fail");
-
-        assert!(
-            err.to_string()
-                .contains("chat.attachment_allowed_mime_types")
-        );
+            .expect_err("website mail must require a bearer source");
+        assert!(err.to_string().contains("website_mail_bearer"));
     }
 
     #[test]
@@ -1932,10 +1766,12 @@ mod tests {
     fn config_validate_accepts_oauth_cors_origins() {
         let mut config = valid_config();
         config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
             allowed_cors_origins: vec![
                 "http://localhost:3000".to_string(),
                 "https://app.example.com".to_string(),
             ],
+            ..Default::default()
         });
 
         config
@@ -1944,10 +1780,148 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_rejects_empty_oauth_website_api_base_url() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: String::new(),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("empty oauth website_api_base_url should fail");
+        assert!(err.to_string().contains("oauth.website_api_base_url"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_oauth_website_api_base_url() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "not-a-url".to_string(),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("invalid oauth website_api_base_url should fail");
+        assert!(err.to_string().contains("oauth.website_api_base_url"));
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_website_api_base_url_with_path() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "https://example.com/foo".to_string(),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth website_api_base_url with path should fail");
+        assert!(
+            err.to_string().contains("path, query, or fragment"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_oauth_website_api_base_url_with_userinfo() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "https://user@example.com".to_string(),
+            ..Default::default()
+        });
+
+        let err = config
+            .validate()
+            .expect_err("oauth website_api_base_url with userinfo should fail");
+        assert!(
+            err.to_string().contains("userinfo"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_legacy_oauth_environment_variables() {
+        use crate::config::testing::{EnvVarGuard, env_lock};
+
+        let lock = env_lock();
+        let config = valid_config();
+        let _var = EnvVarGuard::set(
+            &lock,
+            "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
+            "http://legacy.example",
+        );
+        let err = config
+            .validate()
+            .expect_err("legacy MEGA_OAUTH__CAMPSITE_API_DOMAIN should fail validate");
+        assert!(
+            err.to_string().contains("MEGA_OAUTH__CAMPSITE_API_DOMAIN"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_legacy_mail_environment_variables() {
+        use crate::config::testing::{EnvVarGuard, env_lock};
+
+        let lock = env_lock();
+        let config = valid_config();
+        let _var = EnvVarGuard::set(&lock, "MEGA_MAIL__ENABLED", "true");
+        let err = config
+            .validate()
+            .expect_err("legacy MEGA_MAIL__ENABLED should fail validate");
+        assert!(
+            err.to_string().contains("MEGA_MAIL__ENABLED"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validate_accepts_default_session_cookie_names() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("default session cookie names should validate");
+        assert_eq!(
+            config.oauth.as_ref().unwrap().session_cookie_names,
+            vec![
+                "better-auth.session_token".to_string(),
+                "__Secure-better-auth.session_token".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn require_oauth_for_http_service_rejects_missing_oauth_section() {
+        let config = valid_config();
+        let err = require_oauth_for_http_service(&config)
+            .expect_err("service http should require oauth section");
+        assert!(err.to_string().contains("service http requires [oauth]"));
+    }
+
+    #[test]
+    fn require_oauth_for_http_service_rejects_empty_website_api_base_url() {
+        let mut config = valid_config();
+        config.oauth = Some(crate::config::OAuthConfig::default());
+
+        let err = require_oauth_for_http_service(&config)
+            .expect_err("service http should reject empty website_api_base_url");
+        assert!(err.to_string().contains("oauth.website_api_base_url"));
+    }
+
+    #[test]
     fn config_validate_rejects_oauth_origin_with_whitespace() {
         let mut config = valid_config();
         config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
             allowed_cors_origins: vec!["http://has space.example.com".to_string()],
+            ..Default::default()
         });
 
         let err = config
@@ -1960,7 +1934,9 @@ mod tests {
     fn config_validate_rejects_empty_oauth_origin() {
         let mut config = valid_config();
         config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
             allowed_cors_origins: vec!["  ".to_string()],
+            ..Default::default()
         });
 
         let err = config
@@ -1973,7 +1949,9 @@ mod tests {
     fn config_validate_rejects_oauth_origin_with_path() {
         let mut config = valid_config();
         config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
             allowed_cors_origins: vec!["https://app.example.com/callback".to_string()],
+            ..Default::default()
         });
 
         let err = config
@@ -1986,7 +1964,9 @@ mod tests {
     fn config_validate_rejects_oauth_origin_with_non_http_scheme() {
         let mut config = valid_config();
         config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
             allowed_cors_origins: vec!["ftp://app.example.com".to_string()],
+            ..Default::default()
         });
 
         let err = config
@@ -2003,7 +1983,9 @@ mod tests {
         ] {
             let mut config = valid_config();
             config.oauth = Some(crate::config::OAuthConfig {
+                website_api_base_url: "http://127.0.0.1:17001".to_string(),
                 allowed_cors_origins: vec![bad.to_string()],
+                ..Default::default()
             });
             let err = config
                 .validate()
@@ -2020,7 +2002,9 @@ mod tests {
     fn config_validate_rejects_oauth_origin_without_scheme() {
         let mut config = valid_config();
         config.oauth = Some(crate::config::OAuthConfig {
+            website_api_base_url: "http://127.0.0.1:17001".to_string(),
             allowed_cors_origins: vec!["app.example.com".to_string()],
+            ..Default::default()
         });
 
         let err = config
@@ -2229,6 +2213,19 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_rejects_redis_url_secret_ref_missing_field_suffix() {
+        let mut config = valid_config();
+        config.redis.url = "vault://secret/config/test/redis/url".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("redis.url SecretRef without #field should fail");
+        let message = err.to_string();
+        assert!(message.contains("redis.url"));
+        assert!(message.contains("secret ref must include a #field suffix"));
+    }
+
+    #[test]
     fn config_validate_rejects_redis_url_secret_ref_outside_namespace() {
         let mut config = valid_config();
         config.redis.url = "vault://secret/config/test/mail/password#value".to_string();
@@ -2255,267 +2252,6 @@ mod tests {
             .expect_err("orion server port should fail");
 
         assert!(err.to_string().contains("orion_server.port"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_password_and_password_ref_together() {
-        let mail_config = MailConfig {
-            enabled: false,
-            provider: MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: None,
-            password: Some(crate::config::secret::SecretString::new("plain")),
-            password_ref: Some(
-                SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
-            ),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        };
-
-        let err = mail_config
-            .validate()
-            .expect_err("mutual exclusion should fail");
-
-        assert!(err.to_string().contains("mutually exclusive"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_password_ref_outside_mail_namespace_without_leaking_ref() {
-        let mail_config = MailConfig {
-            enabled: false,
-            provider: MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: None,
-            password: None,
-            password_ref: Some(
-                SecretRef::parse("vault://secret/config/prod/database/password#value").unwrap(),
-            ),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        };
-
-        let err = mail_config
-            .validate()
-            .expect_err("wrong SecretRef namespace should fail");
-        let message = err.to_string();
-
-        assert!(message.contains("mail.password_ref"));
-        assert!(message.contains("vault://secret/config/<profile>/mail/password#<field>"));
-        assert!(message.contains("value is redacted"));
-        assert!(!message.contains("config/prod/database/password"));
-        assert!(!message.contains("#value"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_missing_enabled_smtp_host() {
-        let mail_config = MailConfig {
-            enabled: true,
-            provider: MailProvider::Smtp,
-            smtp_host: String::new(),
-            smtp_port: 587,
-            username: None,
-            password: None,
-            password_ref: None,
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        };
-
-        let err = mail_config.validate().expect_err("smtp host should fail");
-
-        assert!(err.to_string().contains("mail.smtp_host"));
-    }
-
-    #[test]
-    fn mail_validate_accepts_enabled_console_without_smtp_fields() {
-        let mail_config = MailConfig {
-            enabled: true,
-            provider: MailProvider::Console,
-            smtp_host: String::new(),
-            smtp_port: 587,
-            username: None,
-            password: None,
-            password_ref: None,
-            from: String::new(),
-            starttls: true,
-            ..Default::default()
-        };
-
-        mail_config
-            .validate()
-            .expect("console provider should pass");
-    }
-
-    #[test]
-    fn mail_validate_rejects_console_provider_credentials() {
-        let mail_config = MailConfig {
-            enabled: true,
-            provider: MailProvider::Console,
-            smtp_host: String::new(),
-            smtp_port: 587,
-            username: None,
-            password: None,
-            password_ref: Some(
-                SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap(),
-            ),
-            from: String::new(),
-            starttls: true,
-            ..Default::default()
-        };
-
-        let err = mail_config
-            .validate()
-            .expect_err("console provider must not accept smtp credentials");
-
-        assert!(err.to_string().contains("mail.provider is smtp"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_zero_dispatcher_limits() {
-        let mail_config = MailConfig {
-            dispatcher_batch_size: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero batch size should fail");
-        assert!(err.to_string().contains("mail.dispatcher_batch_size"));
-
-        let mail_config = MailConfig {
-            dispatcher_max_in_flight: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero max in-flight should fail");
-        assert!(err.to_string().contains("mail.dispatcher_max_in_flight"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_invalid_retry_policy() {
-        let mail_config = MailConfig {
-            retry_max_attempts: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero retry max attempts should fail");
-        assert!(err.to_string().contains("mail.retry_max_attempts"));
-
-        let mail_config = MailConfig {
-            retry_backoff_base_secs: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero retry backoff base should fail");
-        assert!(err.to_string().contains("mail.retry_backoff_base_secs"));
-
-        let mail_config = MailConfig {
-            retry_backoff_max_secs: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero retry backoff max should fail");
-        assert!(err.to_string().contains("mail.retry_backoff_max_secs"));
-
-        let mail_config = MailConfig {
-            retry_backoff_base_secs: 60,
-            retry_backoff_max_secs: 30,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("retry backoff max below base should fail");
-        assert!(err.to_string().contains("mail.retry_backoff_max_secs"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_invalid_attachment_prune_policy() {
-        let mail_config = MailConfig {
-            attachment_prune_interval_secs: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero attachment prune interval should fail");
-        assert!(
-            err.to_string()
-                .contains("mail.attachment_prune_interval_secs")
-        );
-
-        let mail_config = MailConfig {
-            attachment_retention_days: 0,
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("zero attachment retention should fail");
-        assert!(err.to_string().contains("mail.attachment_retention_days"));
-
-        let mail_config = MailConfig {
-            attachment_prune_statuses: Vec::new(),
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("empty attachment prune statuses should fail");
-        assert!(err.to_string().contains("mail.attachment_prune_statuses"));
-
-        let mail_config = MailConfig {
-            attachment_prune_statuses: vec!["failed".to_string()],
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("unsafe attachment prune status should fail");
-        assert!(err.to_string().contains("mail.attachment_prune_statuses"));
-
-        let mail_config = MailConfig {
-            attachment_prune_statuses: vec!["sent".to_string(), "sent".to_string()],
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("duplicate attachment prune status should fail");
-        assert!(err.to_string().contains("mail.attachment_prune_statuses"));
-    }
-
-    #[test]
-    fn mail_validate_rejects_invalid_template_settings() {
-        let mail_config = MailConfig {
-            template_default_locale: String::new(),
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("empty template default locale should fail");
-        assert!(err.to_string().contains("mail.template_default_locale"));
-
-        let mail_config = MailConfig {
-            template_default_locale: "en US".to_string(),
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("unsupported template default locale should fail");
-        assert!(err.to_string().contains("mail.template_default_locale"));
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let missing_dir = temp_dir.path().join("missing");
-        let mail_config = MailConfig {
-            template_dir: Some(missing_dir),
-            ..Default::default()
-        };
-        let err = mail_config
-            .validate()
-            .expect_err("missing template dir should fail");
-        assert!(err.to_string().contains("mail.template_dir"));
     }
 
     #[test]
@@ -2763,381 +2499,6 @@ mod tests {
     }
 
     #[test]
-    fn known_unconsumed_fields_warns_for_legacy_oauth_and_mail_tls_keys() {
-        let value = toml::from_str::<Value>(
-            r#"
-            [oauth]
-            allowed_cors_origins = ["http://app.example.com"]
-            campsite_api_domain = "http://api.example.com"
-
-            [mail]
-            smtp_tls = false
-            tls = false
-            starttls = false
-            "#,
-        )
-        .unwrap();
-
-        let warnings = known_unconsumed_fields(&value);
-        let fields = warnings
-            .iter()
-            .map(|warning| warning.field_path.as_str())
-            .collect::<Vec<_>>();
-
-        // allowed_cors_origins is now consumed (no warning); the legacy oauth key
-        // and the ignored mail TLS keys still warn.
-        assert!(fields.contains(&"oauth.campsite_api_domain"));
-        assert!(fields.contains(&"mail.smtp_tls"));
-        assert!(fields.contains(&"mail.tls"));
-        assert!(!fields.contains(&"oauth.allowed_cors_origins"));
-        assert!(!fields.contains(&"oauth"));
-    }
-
-    #[test]
-    fn known_unconsumed_fields_warns_for_deprecated_mail_password_without_value() {
-        let content = format!(
-            r#"
-            [mail]
-            {} = "plain-text-password"
-            "#,
-            "password"
-        );
-        let value = toml::from_str::<Value>(&content).unwrap();
-
-        let warnings = known_unconsumed_fields(&value);
-
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].field_path, "mail.password");
-        assert!(warnings[0].message.contains("mail.password_ref"));
-        assert!(!warnings[0].message.contains("plain-text-password"));
-    }
-
-    #[test]
-    fn known_unconsumed_fields_warns_for_unknown_fields() {
-        let value = toml::from_str::<Value>(
-            r#"
-            unknown_root = true
-
-            [database]
-            typo = true
-
-            [object_storage.s3]
-            unexpected = true
-
-            [mail]
-            smtp_tls = false
-            extra = true
-
-            [sidebar]
-            default_items = [
-                { public_id = "home", label = "Home", href = "/posts", visible = true, order_index = 0, icon = "home" },
-            ]
-            "#,
-        )
-        .unwrap();
-
-        let warnings = known_unconsumed_fields(&value);
-        let fields = warnings
-            .iter()
-            .map(|warning| warning.field_path.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(fields.contains(&"mail.smtp_tls"));
-        assert!(fields.contains(&"unknown_root"));
-        assert!(fields.contains(&"database.typo"));
-        assert!(fields.contains(&"object_storage.s3.unexpected"));
-        assert!(fields.contains(&"mail.extra"));
-        assert!(fields.contains(&"sidebar.default_items[0].icon"));
-    }
-
-    #[test]
-    fn known_unconsumed_file_fields_include_source_path() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let profile_path = temp_dir.path().join("config.prod.toml");
-        std::fs::write(
-            &profile_path,
-            r#"
-            [mail]
-            smtp_tls = false
-
-            [database]
-            typo = true
-            "#,
-        )
-        .expect("write profile config");
-
-        let warnings =
-            known_unconsumed_file_fields(&profile_path).expect("profile diagnostics should parse");
-
-        assert_eq!(warnings.len(), 2);
-        assert!(
-            warnings
-                .iter()
-                .all(|warning| warning.source_path == profile_path)
-        );
-        assert!(warnings.iter().any(|warning| {
-            warning.field_path == "mail.smtp_tls" && warning.message.contains("mail.starttls")
-        }));
-        assert!(warnings.iter().any(|warning| {
-            warning.field_path == "database.typo" && warning.message.contains("not recognized")
-        }));
-    }
-
-    #[test]
-    fn source_diagnostics_collects_base_profile_and_env_warnings() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
-        let profile_path = temp_dir.path().join("config.prod.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-            unknown_root = true
-            "#,
-        )
-        .expect("write base config");
-        std::fs::write(
-            &profile_path,
-            r#"
-            [mail]
-            smtp_tls = false
-            "#,
-        )
-        .expect("write profile config");
-
-        let diagnostics = collect_source_diagnostics_from_keys(
-            Some(&config_path),
-            Some(&profile_path),
-            [
-                "MEGA_DATABASE__DB_URL",
-                "MEGA_UNKNOWN__VALUE",
-                "MEGA_MAIL__PASSWORD",
-                "MEGA_MAIL__TLS",
-            ],
-        )
-        .expect("diagnostics should collect");
-
-        assert_eq!(diagnostics.file_warnings.len(), 2);
-        assert_eq!(diagnostics.environment_warnings.len(), 3);
-        assert_eq!(diagnostics.warning_count(), 5);
-        assert!(diagnostics.has_warnings());
-        assert!(!diagnostics.is_empty());
-        assert!(diagnostics.file_warnings.iter().any(|warning| {
-            warning.source_path == config_path && warning.field_path == "unknown_root"
-        }));
-        assert!(diagnostics.file_warnings.iter().any(|warning| {
-            warning.source_path == profile_path && warning.field_path == "mail.smtp_tls"
-        }));
-        assert!(diagnostics.environment_warnings.iter().any(|warning| {
-            warning.variable == "MEGA_UNKNOWN__VALUE" && warning.field_path == "unknown.value"
-        }));
-        assert!(diagnostics.environment_warnings.iter().any(|warning| {
-            warning.variable == "MEGA_MAIL__TLS" && warning.field_path == "mail.tls"
-        }));
-        assert!(diagnostics.environment_warnings.iter().any(|warning| {
-            warning.variable == "MEGA_MAIL__PASSWORD"
-                && warning.field_path == "mail.password"
-                && warning.message.contains("MEGA_MAIL__PASSWORD_REF")
-        }));
-    }
-
-    #[test]
-    fn source_diagnostics_collects_cross_source_overrides_without_values() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
-        let profile_path = temp_dir.path().join("config.prod.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-            [log]
-            level = "info"
-
-            [database]
-            db_url = "postgres://localhost:5432/base"
-
-            [monorepo]
-            root_dirs = ["base-root"]
-
-            [mail]
-            {} = "plain-text-password"
-            "#,
-                "password"
-            ),
-        )
-        .expect("write base config");
-        std::fs::write(
-            &profile_path,
-            r#"
-            [log]
-            level = "debug"
-
-            [monorepo]
-            root_dirs = ["profile-root"]
-            "#,
-        )
-        .expect("write profile config");
-
-        let diagnostics = collect_source_diagnostics_from_keys(
-            Some(&config_path),
-            Some(&profile_path),
-            [
-                "MEGA_LOG__LEVEL",
-                "MEGA_DATABASE__DB_URL",
-                "MEGA_MAIL__PASSWORD",
-                "MEGA_MAIL__TLS",
-            ],
-        )
-        .expect("diagnostics should collect");
-        let overrides = diagnostics
-            .source_overrides
-            .iter()
-            .map(|source_override| source_override.message.as_str())
-            .collect::<Vec<_>>();
-        let override_text = overrides.join("\n");
-
-        assert_eq!(diagnostics.source_overrides.len(), 5);
-        assert!(overrides.iter().any(|message| {
-            message.contains("profile file")
-                && message.contains("base file")
-                && message.contains("log.level")
-        }));
-        assert!(overrides.iter().any(|message| {
-            message.contains("profile file")
-                && message.contains("base file")
-                && message.contains("monorepo.root_dirs")
-                && message.contains("arrays replace lower-precedence values rather than append")
-        }));
-        assert!(overrides.iter().any(|message| {
-            message.contains("MEGA_LOG__LEVEL")
-                && message.contains("profile file")
-                && message.contains("log.level")
-        }));
-        assert!(overrides.iter().any(|message| {
-            message.contains("MEGA_DATABASE__DB_URL")
-                && message.contains("base file")
-                && message.contains("database.db_url")
-        }));
-        assert!(overrides.iter().any(|message| {
-            message.contains("MEGA_MAIL__PASSWORD")
-                && message.contains("base file")
-                && message.contains("mail.password")
-        }));
-        assert!(override_text.contains("suggested fix"));
-        assert!(override_text.contains("sensitive values are omitted"));
-        assert!(override_text.contains("deployment/environment secrets"));
-        assert!(override_text.contains("unset MEGA_LOG__LEVEL"));
-        assert!(override_text.contains("remove log.level from profile file"));
-        assert!(override_text.contains("duplicate lower-precedence setting"));
-        assert!(!override_text.contains("postgres://localhost"));
-        assert!(!override_text.contains("plain-text-password"));
-        assert!(!override_text.contains("debug"));
-        assert!(!override_text.contains("info"));
-        assert!(!override_text.contains("base-root"));
-        assert!(!override_text.contains("profile-root"));
-        assert!(
-            diagnostics
-                .environment_warnings
-                .iter()
-                .any(|warning| warning.variable == "MEGA_MAIL__TLS")
-        );
-    }
-
-    #[test]
-    fn source_diagnostics_collects_field_source_graph_without_values() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
-        let profile_path = temp_dir.path().join("config.prod.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-            [log]
-            level = "info"
-
-            [database]
-            db_url = "postgres://localhost:5432/base"
-            "#,
-        )
-        .expect("write base config");
-        std::fs::write(
-            &profile_path,
-            r##"
-            [log]
-            level = "debug"
-
-            [mail]
-            password_ref = "vault://secret/config/prod/mail/password#value"
-            "##,
-        )
-        .expect("write profile config");
-
-        let diagnostics = collect_source_diagnostics_from_keys(
-            Some(&config_path),
-            Some(&profile_path),
-            [
-                "MEGA_LOG__LEVEL",
-                "MEGA_MAIL__PASSWORD",
-                "MEGA_UNKNOWN__VALUE",
-            ],
-        )
-        .expect("diagnostics should collect");
-        let source_fields = diagnostics
-            .source_fields
-            .iter()
-            .map(|source_field| source_field.message.as_str())
-            .collect::<Vec<_>>();
-        let source_text = source_fields.join("\n");
-
-        assert_eq!(diagnostics.source_fields.len(), 6);
-        assert!(source_fields.iter().any(|message| {
-            message.contains("log.level")
-                && message.contains("base file")
-                && message.contains(&config_path.display().to_string())
-        }));
-        assert!(source_fields.iter().any(|message| {
-            message.contains("log.level")
-                && message.contains("profile file")
-                && message.contains(&profile_path.display().to_string())
-        }));
-        assert!(source_fields.iter().any(|message| {
-            message.contains("mail.password_ref")
-                && message.contains("profile file")
-                && message.contains(&profile_path.display().to_string())
-        }));
-        assert!(source_fields.iter().any(|message| {
-            message.contains("log.level") && message.contains("MEGA_LOG__LEVEL")
-        }));
-        assert!(source_fields
-            .iter()
-            .any(|message| message.contains("database.db_url") && message.contains("base file")));
-        assert!(
-            source_fields
-                .iter()
-                .any(|message| message.contains("mail.password")
-                    && message.contains("MEGA_MAIL__PASSWORD"))
-        );
-        assert!(source_text.contains("values are omitted"));
-        assert!(source_text.contains("sensitive values are omitted"));
-        assert!(source_text.contains("deployment/environment secrets"));
-        assert!(source_text.contains("use a higher-precedence profile/env override"));
-        assert!(source_text.contains(
-            "update MEGA_MAIL__PASSWORD or unset it to fall back to lower-precedence sources"
-        ));
-        assert!(
-            diagnostics
-                .environment_warnings
-                .iter()
-                .any(|warning| warning.variable == "MEGA_UNKNOWN__VALUE")
-        );
-        assert!(!source_text.contains("postgres://localhost"));
-        assert!(!source_text.contains("debug"));
-        assert!(!source_text.contains("info"));
-        assert!(!source_text.contains("vault://secret/"));
-        assert!(!source_text.contains("config/prod/mail/password"));
-        assert!(!source_text.contains("#value"));
-        assert!(!source_text.contains("plain-text-password"));
-    }
-
-    #[test]
     fn source_diagnostics_redacts_notification_secret_ref_values() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("config.toml");
@@ -3361,84 +2722,6 @@ mod tests {
     }
 
     #[test]
-    fn unconsumed_environment_fields_warns_for_unknown_ignored_and_legacy_keys() {
-        let warnings = unconsumed_environment_fields_from_keys([
-            "MEGA_DATABASE__DB_URL",
-            "MEGA_MONOREPO__ROOT_DIRS",
-            "MEGA_LOG__PRINT_STD",
-            "MEGA_CONFIG",
-            "MEGA_PROFILE",
-            "MEGA_BASE_DIR",
-            "MEGA_CACHE_DIR",
-            "OTHER_VAR",
-            "MEGA_UNKNOWN__VALUE",
-            // Consumed now -> must NOT warn.
-            "MEGA_OAUTH__ALLOWED_CORS_ORIGINS",
-            // Legacy, still ignored -> warns.
-            "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
-            "MEGA_MAIL__PASSWORD",
-            "MEGA_MAIL__TLS",
-            "MEGA_MAIL__SMTP_TLS",
-        ]);
-        let variables = warnings
-            .iter()
-            .map(|warning| warning.variable.as_str())
-            .collect::<Vec<_>>();
-        let fields = warnings
-            .iter()
-            .map(|warning| warning.field_path.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            variables,
-            vec![
-                "MEGA_MAIL__PASSWORD",
-                "MEGA_MAIL__SMTP_TLS",
-                "MEGA_MAIL__TLS",
-                "MEGA_OAUTH__CAMPSITE_API_DOMAIN",
-                "MEGA_UNKNOWN__VALUE",
-            ]
-        );
-        assert_eq!(
-            fields,
-            vec![
-                "mail.password",
-                "mail.smtp_tls",
-                "mail.tls",
-                "oauth.campsite_api_domain",
-                "unknown.value",
-            ]
-        );
-        // The consumed CORS origins env var produces no warning.
-        assert!(!variables.contains(&"MEGA_OAUTH__ALLOWED_CORS_ORIGINS"));
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.message.contains("MEGA_MAIL__PASSWORD_REF"))
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.message.contains("MEGA_MAIL__STARTTLS"))
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.message.contains("no consumer yet"))
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.message.contains("not recognized by Config"))
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.message.contains("supported MEGA_* field path"))
-        );
-    }
-
-    #[test]
     fn known_config_field_path_accepts_nested_fields_and_rejects_orphans() {
         assert!(is_known_field_path("database.db_url"));
         assert!(is_known_field_path("object_storage.s3.access_key_id"));
@@ -3450,6 +2733,8 @@ mod tests {
         assert!(!is_known_field_path("database.typo"));
         assert!(!is_known_field_path("unknown.value"));
         assert!(is_known_field_path("oauth.allowed_cors_origins"));
+        assert!(is_known_field_path("oauth.website_api_base_url"));
+        assert!(is_known_field_path("oauth.session_cookie_names"));
         assert!(!is_known_field_path("notification.typo"));
     }
 
@@ -3517,35 +2802,6 @@ mod tests {
     }
 
     #[test]
-    fn reject_unknown_fields_accepts_known_config() {
-        let value = toml::from_str::<Value>(
-            r#"
-            base_dir = "/tmp"
-
-            [log]
-            level = "info"
-            print_std = true
-
-            [database]
-            db_type = "postgres"
-            db_url = "postgres://localhost:5432/mono"
-
-            [mail]
-            enabled = true
-            smtp_host = "localhost"
-            from = "no-reply@example.com"
-
-            [notification]
-            enabled = true
-            default_delivery_mode = "email"
-            "#,
-        )
-        .unwrap();
-
-        assert!(reject_unknown_fields(&value).is_ok());
-    }
-
-    #[test]
     fn reject_unknown_fields_rejects_typo_fields() {
         let value = toml::from_str::<Value>(
             r#"
@@ -3576,15 +2832,30 @@ mod tests {
     }
 
     #[test]
-    fn reject_unknown_fields_allows_known_oauth_keys_but_rejects_unknown_ones() {
-        // `[oauth]` is now a recognized section: allowed_cors_origins (consumed)
-        // plus the whitelisted legacy keys pass the strict check.
+    fn reject_unknown_fields_rejects_legacy_oauth_keys() {
+        let legacy_key = ["campsite", "api", "domain"].join("_");
+        let legacy = toml::from_str::<Value>(&format!(
+            r#"
+            base_dir = "/tmp"
+
+            [oauth]
+            {legacy_key} = "http://example.test"
+            website_api_base_url = "http://127.0.0.1:17001"
+            "#
+        ))
+        .unwrap();
+        let err = reject_unknown_fields(&legacy).expect_err("legacy oauth keys should fail");
+        assert!(err.to_string().contains(&format!("oauth.{legacy_key}")));
+    }
+
+    #[test]
+    fn reject_unknown_fields_accepts_known_oauth_keys_but_rejects_unknown_ones() {
         let ok = toml::from_str::<Value>(
             r#"
             base_dir = "/tmp"
 
             [oauth]
-            campsite_api_domain = "http://example.test"
+            website_api_base_url = "http://127.0.0.1:17001"
             allowed_cors_origins = ["http://example.test"]
             "#,
         )

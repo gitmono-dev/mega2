@@ -3,13 +3,13 @@ services:
     image: postgres:15-alpine
     shm_size: "1gb"
     environment:
-      POSTGRES_USER: mono
-      POSTGRES_PASSWORD: mono_test_password
-      POSTGRES_DB: monoengine_it
+      POSTGRES_USER: monoengine
+      POSTGRES_PASSWORD: monoengine_test_password
+      POSTGRES_DB: monoengine
     ports:
       - "127.0.0.1:15432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mono -d monoengine_it"]
+      test: ["CMD-SHELL", "pg_isready -U monoengine -d monoengine"]
       interval: 2s
       timeout: 5s
       retries: 20
@@ -24,6 +24,8 @@ services:
       timeout: 5s
       retries: 20
 
+  # Optional SMTP capture for website-next authentication/product-mail IT only.
+  # Monoengine does not connect to or depend on this service.
   mailpit:
     image: axllent/mailpit:v1.27
     ports:
@@ -35,9 +37,8 @@ services:
       timeout: 5s
       retries: 20
 
-  # S3-compatible object storage for IT smoke (RustFS). Ports and the public
-  # test credential strings stay aligned with existing MEGA_OBJECT_STORAGE__S3__*
-  # contracts (`minioadmin` values are opaque test keys, not a MinIO dependency).
+  # S3-compatible object storage for IT smoke (RustFS). Public test credentials
+  # are `rustfs` / `rustfs_secret` (see `.env.test.example`).
   rustfs:
     image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
     environment:
@@ -45,8 +46,8 @@ services:
       RUSTFS_ADDRESS: 0.0.0.0:9000
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: minioadmin
-      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
       # Single-volume local smoke; required when not using multi-disk topology.
       RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
     ports:
@@ -59,22 +60,28 @@ services:
       retries: 30
       start_period: 10s
 
-  # One-shot bucket initialization via any S3 client (`mc`). Not part of the
-  # default `up -d --wait` set because `--wait` requires selected services to
-  # stay running/healthy; run explicitly with
-  # `docker compose -p monoengine-it -f docker-compose.test.yml --profile init run --rm rustfs-init`.
+  # Bucket initialization via `mc`. Stays up (sleep infinity) with a healthcheck
+  # so default `up -d --wait` can wait on it — a pure one-shot exit breaks --wait.
+  # Recreate this service (or `down` + `up`) after wiping rustfs if the bucket
+  # disappears; `mb --ignore-existing` is idempotent on fresh starts.
   rustfs-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
-    profiles: ["init"]
     depends_on:
       rustfs:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://rustfs:9000 minioadmin minioadmin &&
+      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
       /usr/bin/mc mb --ignore-existing local/testbucket &&
-      /usr/bin/mc anonymous set download local/testbucket
+      /usr/bin/mc anonymous set download local/testbucket &&
+      exec sleep infinity
       "
+    healthcheck:
+      test: ["CMD", "mc", "ls", "local/testbucket"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
 
   # Fixed-version Git CLI runner for cargo-native black-box tests (ADR-IT-01).
   # Uses host networking so the container can reach monoengine bound on the
@@ -92,25 +99,164 @@ services:
   # `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`
   # when the test process is not 1000.
   git-cli:
-    image: alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+    image: monoengine-git-cli:3.7.1
+    build:
+      context: .
+      dockerfile: Dockerfile.git-cli
     # Opt-in profile: host networking is Linux-only (IT/prod target OS).
     # Keeping git-cli off the default `up -d --wait` set also avoids pulling
     # host networking into the data-plane stack on non-target Docker Desktop
     # machines. Enable with `--profile git` on Linux CI/local VER.
     profiles: ["git"]
+    # Reap orphaned git/ssh children from the docker-exec timeout wrapper
+    # (setsid + kill). Without init, PID 1 is `sleep infinity` and zombies
+    # accumulate until later SSH clones fail with protocol `error: …`.
+    init: true
     network_mode: host
     user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"
     volumes:
-      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-it-git}:/work
+      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}:/work
     working_dir: /work
     # Override the image's `git` entrypoint so the container stays up for `exec`.
     entrypoint: ["sleep", "infinity"]
     healthcheck:
-      test: ["CMD", "git", "--version"]
+      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
       interval: 2s
       timeout: 5s
       retries: 20
 
+  # Standing monoengine HTTP service for stack-level IT (profile `app`).
+  # Per-case cargo black-box tests still spawn via CARGO_BIN_EXE for isolation;
+  # this service is the compose-hosted process under test for stack smoke.
+  # Build context is the parent of `monoengine/` + `orbit/` (see Dockerfile).
+  # CI may pre-tag `monoengine:local` from Dockerfile.it-runtime instead of
+  # rebuilding from source (`pull_policy: never`).
+  monoengine:
+    profiles: ["app"]
+    image: monoengine:local
+    pull_policy: never
+    build:
+      context: ..
+      dockerfile: monoengine/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MEGA_BASE_DIR: /var/lib/monoengine
+      MEGA_CONFIG: /etc/monoengine/config.toml
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@postgres:5432/monoengine
+      MEGA_REDIS__URL: redis://redis:6379
+      # Keep the full documented IT CORS allowlist when overriding the sample
+      # config, and add the website-next host origin for stack session tests.
+      MEGA_OAUTH__ALLOWED_CORS_ORIGINS: http://local.gitmega.com,https://app.gitmega.com,http://app.gitmono.test,http://127.0.0.1:17001
+      MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
+      # MN-05: shared IT-only credential for website's internal product-email API.
+      MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL: http://website-next:7001
+      MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
+      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: /var/lib/monoengine/objects
+      MEGA_LOG__PRINT_STD: "true"
+      MEGA_LOG__LEVEL: info
+    volumes:
+      - monoengine-data:/var/lib/monoengine
+    ports:
+      - "127.0.0.1:19180:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  # One-shot PostgreSQL schema initialization for website-next. Reuses the
+  # website Dockerfile builder stage because the production runner is a
+  # standalone Next image and deliberately has no Drizzle tooling.
+  # Account data lives in an isolated `website` database on the shared
+  # postgres service — never the monoengine business DB (ADR-WA-07).
+  website-db-init:
+    profiles: ["web"]
+    build:
+      context: ../website
+      dockerfile: apps/next-app/Dockerfile
+      target: builder
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_DIALECT: pg
+      DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
+      # Connects to the maintenance DB only to CREATE DATABASE website.
+      DATABASE_ADMIN_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/postgres
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        node -e "
+        const { Client } = require('pg');
+        (async () => {
+          const admin = new Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+          await admin.connect();
+          const { rowCount } = await admin.query(
+            \"SELECT 1 FROM pg_database WHERE datname = 'website'\"
+          );
+          if (rowCount === 0) {
+            await admin.query('CREATE DATABASE website');
+            console.log('created database website');
+          } else {
+            console.log('database website already exists');
+          }
+          await admin.end();
+        })().catch((err) => {
+          console.error(err);
+          process.exit(1);
+        });
+        "
+        npx drizzle-kit push --force
+
+  # Website Better Auth test instance. Uses isolated Postgres database
+  # `website` on the shared postgres service (not monoengine's business DB).
+  # Build locally from the sibling checkout; CI must check out ../website too.
+  website-next:
+    profiles: ["web"]
+    image: website-next:local
+    pull_policy: never
+    build:
+      context: ../website
+      dockerfile: apps/next-app/Dockerfile
+    environment:
+      DB_DIALECT: pg
+      DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
+      APP_BASE_URL: http://127.0.0.1:17001
+      BETTER_AUTH_URL: http://127.0.0.1:17001
+      BETTER_AUTH_SECRET: monoengine-it-website-auth-secret-0001
+      # Consumed by DEP-06's internal notification route. This public value is
+      # only for the isolated Compose integration stack.
+      MONOENGINE_INTERNAL_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
+      # WE-05/WE-06: IT product mail uses the in-memory test provider (no cloud).
+      EMAIL_PROVIDER: test
+      EMAIL_DEFAULT_FROM: noreply@monoengine-it.test
+      # Optional CTA base for product templates (not TinyShip APP_BASE_URL).
+      MONOENGINE_PUBLIC_BASE_URL: http://127.0.0.1:19180
+    depends_on:
+      postgres:
+        condition: service_healthy
+      website-db-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:17001:7001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const socket = require('net').connect(7001, '127.0.0.1'); socket.setTimeout(1000); socket.on('connect', () => process.exit(0)); socket.on('error', () => process.exit(1)); socket.on('timeout', () => process.exit(1));\""]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+volumes:
+  monoengine-data:
+
 networks:
   default:
-    name: monoengine-test-net
+    name: monoengine-test-network

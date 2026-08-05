@@ -7,6 +7,7 @@ use axum::extract::FromRef;
 use tower_sessions::MemoryStore;
 
 use crate::{
+    api::oauth::api_store::BrowserSessionStore,
     bellatrix::Bellatrix,
     ceres::{
         api_service::{
@@ -16,10 +17,6 @@ use crate::{
         build_trigger::service::BuildTriggerService,
         protocol::repo::Repo,
     },
-    chat::{
-        domain::InMemoryChatEvents,
-        service::{ChannelChatService, SharedChatService},
-    },
     common::errors::ProtocolError,
     contract::policy::entitystore::EntityStore,
     jupiter::{
@@ -27,7 +24,7 @@ use crate::{
         storage::{
             Storage, cl_storage::ClStorage, conversation_storage::ConversationStorage,
             dynamic_sidebar_storage::DynamicSidebarStorage, gpg_storage::GpgStorage,
-            issue_storage::IssueStorage, note_storage::NoteStorage, user_storage::UserStorage,
+            issue_storage::IssueStorage, user_storage::UserStorage,
             webhook_storage::WebhookStorage,
         },
     },
@@ -35,23 +32,28 @@ use crate::{
 pub mod api_common;
 pub mod api_doc;
 pub mod api_router;
-pub mod notes;
 pub mod oauth;
 pub mod router;
 
 #[derive(Clone)]
 pub struct MonoApiServiceState {
     pub storage: Storage,
+    pub session_store: BrowserSessionStore,
     pub git_object_cache: Arc<GitObjectCache>,
     pub listen_addr: String,
     pub entity_store: EntityStore,
     pub bellatrix: Arc<Bellatrix>,
-    pub chat_events: Arc<InMemoryChatEvents>,
 }
 
 impl FromRef<MonoApiServiceState> for MemoryStore {
     fn from_ref(_: &MonoApiServiceState) -> Self {
         MemoryStore::default()
+    }
+}
+
+impl FromRef<MonoApiServiceState> for BrowserSessionStore {
+    fn from_ref(state: &MonoApiServiceState) -> Self {
+        state.session_store.clone()
     }
 }
 
@@ -111,10 +113,6 @@ impl MonoApiServiceState {
         self.storage.conversation_storage()
     }
 
-    fn note_stg(&self) -> NoteStorage {
-        self.storage.note_storage()
-    }
-
     fn webhook_stg(&self) -> WebhookStorage {
         self.storage.webhook_storage()
     }
@@ -133,14 +131,6 @@ impl MonoApiServiceState {
             self.git_object_cache.clone(),
             self.bellatrix.clone(),
         )
-    }
-
-    pub fn channel_chat_svc(&self) -> ChannelChatService<InMemoryChatEvents> {
-        ChannelChatService::from_storage(&self.storage).with_events(self.chat_events.clone())
-    }
-
-    pub fn shared_chat_svc(&self) -> SharedChatService {
-        SharedChatService::from_storage(&self.storage)
     }
 
     async fn api_handler(&self, path: &Path) -> Result<Box<dyn ApiHandler>, ProtocolError> {

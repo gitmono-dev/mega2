@@ -28,9 +28,8 @@
   supplies the concrete `object_store` adapter for
   blobs/LFS on **local FS, AWS S3, S3-compatible (RustFS, MinIO, ...), or GCS**;
   `redis` for cache / queue.
-- **Email notifications** — async dispatcher backed by an `email_jobs` queue,
-  SMTP via `lettre` (rustls + tokio), event triggers for CL comments, and
-  admin-managed plus configurable automatic outbox attachment cleanup.
+- **Notifications** — event triggers and in-app/optional external delivery;
+  product email is delivered by the website through its internal API.
 - **Embedded Vault** — PKI (root CA, role‑based cert issuance) and a KV / secret
   engine via the vendored RustyVault module in `src/vault`, with a `jupiter`
   storage backend so the vault lives in the same database.
@@ -58,7 +57,6 @@
 | Auth / policy    | `cedar-policy`                                                                |
 | Vault / PKI      | vendored RustyVault module in `src/vault`                                     |
 | Crypto / TLS     | `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`, `secp256k1`, `pgp`       |
-| Email            | `lettre` (rustls + tokio)                                                     |
 | Logging          | `tracing`, `tracing-subscriber`, `tracing-appender`                           |
 | Allocator        | `jemallocator` (Unix) / `mimalloc` (Windows)                                  |
 
@@ -75,8 +73,6 @@ The full dependency list lives in `Cargo.toml`.
 - PostgreSQL **or** SQLite (the default `config/config.toml` is wired for
   PostgreSQL; switch `database.db_type` to `"sqlite"` for a zero‑setup demo).
 - (Optional) Redis, if you exercise paths that hit the cache / queue.
-- (Optional) An SMTP endpoint if you want real email delivery; otherwise the
-  `NoopMailer` is used.
 
 ### Build
 
@@ -131,16 +127,14 @@ Key sections (see `config/config.toml` for the full list):
 | `[pack]`           | Pack decode memory/disk budget and cache path                           |
 | `[lfs]`            | LFS HTTP/SSH endpoints and local storage path                           |
 | `[object_storage]` | `local` / `s3` / `s3compatible` / `gcs` backends                        |
-| `[oauth]`          | CORS allow-list (`allowed_cors_origins`); consumed by the HTTP API's `CorsLayer` |
+| `[oauth]`          | Website Better Auth API base URL, session cookies, and CORS allow-list |
 | `[redis]`          | Connection URL                                                          |
 | `[build]`          | Orion build server URL and trigger preheat depth                        |
 | `[buck]`           | Buck upload session limits, cleanup schedule, and concurrency caps       |
 | `[artifacts_gc]`   | Background GC enable flag and schedule for orphan repo artifact blobs    |
-| `[mail]`           | SMTP settings, `password_ref`, dispatcher limits and retry policy         |
+| `[notification]`   | In-app/external notifications and website product-email API client         |
 | `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
 
-`mail.password_ref` is the first config-backed monoengine Vault SecretRef.
-It must use `vault://secret/config/<profile>/mail/password#<field>`.
 Redis URL (`redis.url`), object storage S3 credentials
 (`object_storage.s3.access_key_id` / `secret_access_key`), and notification
 channel credentials (`notification.slack.webhook_url_ref`,
@@ -220,9 +214,7 @@ src/
 │   ├── utils/            # diff / reanchor / misc utilities
 │   └── tests.rs          # shared test helpers (cfg(test))
 ├── ceres/                # CL (Change List) logic, merge checks, build triggers
-├── mail/                 # first-class mail module: Mailer trait + provider factory
-├── notification/         # email notification dispatcher + event triggers
-├── email/                # legacy Mailer re-export shim (now re-exports crate::mail)
+├── notification/         # event triggers and website product-email client
 ├── vault/                # vendored RustyVault module (crate::vault)
 ├── contract/             # API / Git / Vault / Policy data & boundary contracts
 │   ├── api/              # request/response DTOs (utoipa schemas; was api_model)
@@ -250,6 +242,9 @@ it into `Storage::new_with_connection`.
 ---
 
 ## Development
+
+How to bring up the compose test stack and run ordinary vs full integration
+tests: see [`docs/development.md`](docs/development.md).
 
 ### Required Gates Before Submitting Code
 
@@ -313,7 +308,7 @@ cargo test --test <name>
 
 - **`AppContext`** (`src/context/`) is the per‑process shared state. It owns
   the `sea-orm` connection pool, every `*Storage` handle, the object‑store
-  client, the Redis client, the mailer, and the vault. Subcommand executors
+  client, the Redis client, and the vault. Subcommand executors
   build it once and pass `AppContext` (or clones) into route layers and
   background tasks.
 - **`callisto` ↔ `jupiter`** — `callisto` is the *what* of the schema (one
@@ -325,32 +320,17 @@ cargo test --test <name>
   CL sync, merge conflict, CI status, code review, CLA sign). Each check
   yields a `ConditionResult` (`PASSED`/`FAILED`) and aggregates into a
   `RequirementsState` (`MERGEABLE`/`UNMERGEABLE`).
-- **Notifications** — `notification::triggers` enqueues `email_jobs` rows in
-  response to CL events; `notification::dispatcher::EmailDispatcher` polls
-  that queue on a 2s tick, claims jobs atomically, loads persisted
-  `email_job_attachments`, and hands them to the
-  `Mailer` trait (`mail::SmtpMailer`, `mail::ConsoleMailer`, `mail::http::HttpMailer`, or
-  `mail::NoopMailer`). Config reload
-  can disable a running dispatcher via `mail.enabled = false` and hot-reload
-  dispatcher batch/concurrency limits plus retry policy; re-enabling mail or
-  changing SMTP settings still requires restart. Mail templates have built-in
-  locale fallback and can be overridden at startup with TOML files from
-  `mail.template_dir`; admins can audit built-in/external template sources and
-  preview or upsert external TOML templates under `/admin/mail-templates`.
-  Users can inspect and update notification settings, preferred locale, and
-  per-event preferences under `/user/notification/preferences`; admins can
-  manage notification event types
-  under `/admin/notification-event-types` and prune old terminal outbox jobs
-  under `/admin/email-jobs/prune`; attachment audit metadata is available under
-  `/admin/email-jobs/{id}/attachments`, and admins can explicitly download,
-  delete, or prune old terminal-job persisted attachments under the
-  `/admin/email-jobs/.../attachments` management endpoints.
+- **Notifications** — event triggers respect user preferences and retain
+  in-app, Slack, and webhook delivery. Product email uses the website internal
+  notification API; monoengine has no SMTP client, mail queue, or mail-template
+  administration surface. See
+  [`docs/refactoring/website-mail.md`](docs/refactoring/website-mail.md).
 - **Background maintenance** — HTTP service tasks clean expired Buck upload
   sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
   tasks hot-reload schedule settings and can be disabled without restart;
   enabling either task from off still requires restart.
-- **Config reload boundaries** — log settings, mail disable, and running
-  maintenance schedules are the hot-reload surface. Static consumers such as
+- **Config reload boundaries** — log settings and running maintenance
+  schedules are the hot-reload surface. Static consumers such as
   database, Redis, object storage, LFS, build/orion, sidebar, pack, blame, and
   monorepo layout changes are reported as restart-required and do not publish a
   candidate snapshot.

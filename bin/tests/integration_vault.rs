@@ -3,7 +3,7 @@
 // 设计目标：
 // 1. 通过 `CARGO_BIN_EXE_monoengine` 启动真实 CLI，验证用户实际执行命令时会走到的路径。
 // 2. 跟随 `docs/refactoring/integration.md` 的集成测试架构，使用 Docker Compose 提供的
-//    PostgreSQL/Redis/SMTP 捕获服务，而不是在测试里使用轻量本地数据库替身。
+//    PostgreSQL/Redis 服务，而不是在测试里使用轻量本地数据库替身。
 // 3. 对每个需要数据库的测试创建独立 PostgreSQL 数据库，避免并发测试或失败重跑污染状态。
 // 4. 直接查询 PostgreSQL 验证数据落点，防止测试误连到非目标数据库。
 // 5. 所有 secret value 只通过 stdin 传给 CLI，并断言 stdout/stderr 不泄露明文。
@@ -14,30 +14,22 @@ mod common;
 
 use std::{
     fs,
-    io::{BufRead, BufReader, ErrorKind, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{ErrorKind, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    thread::{self, sleep},
+    sync::atomic::{AtomicUsize, Ordering},
+    thread::sleep,
     time::{Duration, Instant},
 };
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
-use serde_json::Value;
 use tempfile::TempDir;
 
 // 这些常量模拟当前 P0/P2 集成测试中允许写入 Vault 的配置项：
-// `mail.password`、`redis.url` 与 `object_storage.s3.access_key_id` / `secret_access_key`。
+// `redis.url` 与 `object_storage.s3.access_key_id` / `secret_access_key`。
 // 数据库凭据在 bootstrap 阶段就要消费，不能依赖 monoengine 自己的 Vault，
 // 否则会形成启动环；Redis URL 在 Vault 就绪后连接，可用 SecretRef 覆盖。
-const MAIL_PASSWORD_PATH: &str = "config/it/mail/password";
-const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
-const SECRET_VALUE: &str = "smtp-test-password";
-
 const OBJECT_STORAGE_ACCESS_KEY_PATH: &str = "config/it/object_storage/access_key_id";
 const OBJECT_STORAGE_SECRET_KEY_PATH: &str = "config/it/object_storage/secret_access_key";
 const OBJECT_STORAGE_ACCESS_KEY_REF: &str =
@@ -50,17 +42,10 @@ const S3_SECRET_KEY_VALUE: &str = "wJalrXUtnFEMI/test/secret/key/EXAMPLE";
 const REDIS_URL_PATH: &str = "config/it/redis/url";
 const REDIS_URL_REF: &str = "vault://secret/config/it/redis/url#value";
 
-const NOTIFICATION_SLACK_WEBHOOK_URL_PATH: &str = "config/it/notification/slack/webhook_url";
-const NOTIFICATION_WEBHOOK_TOKEN_PATH: &str = "config/it/notification/webhook/token";
-const NOTIFICATION_SLACK_WEBHOOK_URL_REF: &str =
-    "vault://secret/config/it/notification/slack/webhook_url#value";
-const NOTIFICATION_WEBHOOK_TOKEN_REF: &str =
-    "vault://secret/config/it/notification/webhook/token#value";
-
 // 默认连接信息与 `docker-compose.test.yml`、`.env.test.example` 保持一致。
 // 如果 CI 或开发机需要改端口，可以通过 `.env.test` 中的环境变量覆盖。
 const DEFAULT_POSTGRES_URL: &str =
-    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 // 同一个测试进程内可能创建多个临时数据库。计数器只用于生成唯一库名，
@@ -73,7 +58,7 @@ static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // - bootstrap_config_path：只包含 `[database]`，用于验证 `config secret set/check`
 //   只走 DB + Vault bootstrap，不触发完整 AppContext。
 // - full_config_path：来自仓库默认 `config/config.toml`，通过环境变量覆盖到测试数据库、
-//   本地对象存储和 mail.password_ref，用于验证 `config validate --resolve-secrets`。
+//   本地对象存储和 redis.url SecretRef，用于验证 `config validate --resolve-secrets`。
 struct VaultCliEnv {
     temp_dir: TempDir,
     database: TestDatabase,
@@ -98,7 +83,7 @@ impl VaultCliEnv {
 
         // 最小 bootstrap 配置只提供数据库字段。这样可以证明 secret set/check
         // 不依赖 Redis、对象存储、邮件或 HTTP service 的完整初始化链路。
-        common::write_bootstrap_config(&bootstrap_config_path, &database.db_url);
+        write_bootstrap_config(&bootstrap_config_path, &database.db_url);
 
         // 完整配置从仓库默认配置复制出来，再由 command_with_config 注入环境变量覆盖。
         // 这样既验证真实配置结构可加载，也避免测试修改仓库里的 config/config.toml。
@@ -121,7 +106,7 @@ impl VaultCliEnv {
     }
 
     fn full_config_command(&self) -> Command {
-        // 用完整配置执行需要解析 mail.password_ref 的命令。
+        // 用完整配置执行需要解析 redis.url SecretRef 的命令。
         self.command_with_config(&self.full_config_path)
     }
 
@@ -146,12 +131,7 @@ impl VaultCliEnv {
             // 的 bootstrap 路径不应触达它们。
             .env("MEGA_REDIS__URL", integration_redis_url())
             .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
-            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
-            // mail.password_ref 是当前集成测试验证的 Vault SecretRef 落点。
-            .env("MEGA_MAIL__ENABLED", "true")
-            .env("MEGA_MAIL__SMTP_HOST", "localhost")
-            .env("MEGA_MAIL__FROM", "no-reply@example.test")
-            .env("MEGA_MAIL__PASSWORD_REF", MAIL_PASSWORD_REF);
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root);
         command
     }
 
@@ -174,10 +154,31 @@ impl VaultCliEnv {
     }
 }
 
+fn write_bootstrap_config(path: &Path, db_url: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"
+            [database]
+            db_type = "postgres"
+            db_path = ""
+            db_url = "{}"
+            max_connection = 4
+            min_connection = 1
+            acquire_timeout = 5
+            connect_timeout = 5
+            sqlx_logging = false
+            "#,
+            db_url
+        ),
+    )
+    .expect("write bootstrap config");
+}
+
 // PostgreSQL 测试数据库的 RAII 包装。
 //
 // 测试连接到 compose 提供的 admin database，然后为每个用例创建独立数据库：
-// `monoengine_it_<pid>_<counter>`。CLI 子进程拿到的是这个专属数据库的连接串。
+// `monoengine_<pid>_<counter>`。CLI 子进程拿到的是这个专属数据库的连接串。
 // 这样 migrations、Vault 表和 secret 数据都隔离在单个测试里。
 struct TestDatabase {
     admin_url: String,
@@ -190,7 +191,7 @@ impl TestDatabase {
         let admin_url = integration_postgres_url();
         // pid + 进程内递增序号足以避免同一次测试运行中的数据库名冲突。
         let db_name = format!(
-            "monoengine_it_{}_{}",
+            "monoengine_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -234,13 +235,13 @@ impl Drop for TestDatabase {
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
             );
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     terminate_sql,
                 ))
                 .await;
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     format!("DROP DATABASE IF EXISTS {db_name}"),
                 ))
@@ -265,9 +266,9 @@ fn config_secret_ref_does_not_load_config() {
         "config",
         "secret",
         "ref",
-        "mail.password",
+        "redis.url",
         "--vault-path",
-        MAIL_PASSWORD_PATH,
+        REDIS_URL_PATH,
         "--field",
         "value",
     ]);
@@ -276,36 +277,40 @@ fn config_secret_ref_does_not_load_config() {
     let (stdout, stderr) = assert_success(&output);
 
     // 成功路径只能输出 SecretRef 本身，不能夹带日志或其他诊断文本。
-    assert_eq!(stdout.trim(), MAIL_PASSWORD_REF);
+    assert_eq!(stdout.trim(), REDIS_URL_REF);
     assert!(stderr.trim().is_empty(), "unexpected stderr: {stderr}");
 }
 
 #[test]
-fn config_secret_set_check_and_validate_resolve_secret() {
+fn config_secret_set_check_and_validate_resolve_redis_url_secret_ref() {
     // 这是 Vault P0 正向链路：
     // 1. `config secret set` 通过 stdin 写入 secret。
     // 2. `config secret check` 验证同一个 SecretRef 可读。
-    // 3. `config validate --resolve-secrets` 在完整配置上解析 mail.password_ref。
+    // 3. `config validate --resolve-secrets` 在完整配置上解析 redis.url SecretRef。
     let env = VaultCliEnv::new();
+    let redis_url = integration_redis_url();
 
     let mut set = env.bootstrap_command();
     set.args([
         "config",
         "secret",
         "set",
-        "mail.password",
+        "redis.url",
         "--vault-path",
-        MAIL_PASSWORD_PATH,
+        REDIS_URL_PATH,
         "--field",
         "value",
         "--value-stdin",
     ]);
-    let output = run_with_stdin(set, SECRET_VALUE);
+    let output = run_with_stdin(set, &redis_url);
     let (stdout, stderr) = assert_success(&output);
 
     // 写入命令只回显 SecretRef，不回显 secret value。
-    assert_eq!(stdout.trim(), format!("stored {MAIL_PASSWORD_REF}"));
-    assert_does_not_leak_secret(&stdout, &stderr);
+    assert_eq!(stdout.trim(), format!("stored {REDIS_URL_REF}"));
+    assert!(
+        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
+        "stdout/stderr leaked Redis URL"
+    );
 
     // 直接查询 PostgreSQL 的 vault 表，保证 secret set 的状态确实落在 compose
     // PostgreSQL，而不是其他本地存储。
@@ -327,32 +332,40 @@ fn config_secret_set_check_and_validate_resolve_secret() {
         "config",
         "secret",
         "check",
-        "mail.password",
+        "redis.url",
         "--ref",
-        MAIL_PASSWORD_REF,
+        REDIS_URL_REF,
     ]);
     let output = run(check);
     let (stdout, stderr) = assert_success(&output);
-    assert_eq!(stdout.trim(), format!("ok {MAIL_PASSWORD_REF}"));
-    assert_does_not_leak_secret(&stdout, &stderr);
+    assert_eq!(stdout.trim(), format!("ok {REDIS_URL_REF}"));
+    assert!(
+        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
+        "stdout/stderr leaked Redis URL"
+    );
 
     // validate 命令改用完整配置，覆盖真实配置加载、环境变量 overlay、
     // Vault SecretRef 解析和配置合法性检查的组合路径。
     let mut validate = env.full_config_command();
+    validate.env("MEGA_REDIS__URL", REDIS_URL_REF);
     validate.args(["config", "validate", "--resolve-secrets"]);
     let output = run(validate);
     let (stdout, stderr) = assert_success(&output);
     assert_eq!(stdout.trim(), "config valid");
-    assert_does_not_leak_secret(&stdout, &stderr);
+    assert!(
+        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
+        "validate leaked Redis URL"
+    );
 }
 
 #[test]
-fn config_validate_resolve_secrets_fails_when_secret_is_missing() {
-    // 负向路径：完整配置声明了 mail.password_ref，但测试没有提前写入 secret。
+fn config_validate_resolve_secrets_fails_when_redis_url_secret_is_missing() {
+    // 负向路径：完整配置声明了 redis.url SecretRef，但测试没有提前写入 secret。
     // 期望 validate 返回非 0，并给出可诊断的缺失 secret 错误。
     let env = VaultCliEnv::new();
 
     let mut validate = env.full_config_command();
+    validate.env("MEGA_REDIS__URL", REDIS_URL_REF);
     validate.args(["config", "validate", "--resolve-secrets"]);
     let output = run(validate);
     let (stdout, stderr) = assert_failure(&output);
@@ -364,14 +377,13 @@ fn config_validate_resolve_secrets_fails_when_secret_is_missing() {
         "unexpected stderr: {stderr}"
     );
     assert!(
-        !stderr.contains(MAIL_PASSWORD_PATH),
+        !stderr.contains(REDIS_URL_PATH),
         "unexpected stderr: {stderr}"
     );
     assert!(
-        !stderr.contains(MAIL_PASSWORD_REF),
+        !stderr.contains(REDIS_URL_REF),
         "unexpected stderr: {stderr}"
     );
-    assert_does_not_leak_secret(&stdout, &stderr);
 }
 
 #[test]
@@ -413,24 +425,6 @@ fn config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs() 
     // 该测试不依赖真实 S3/GCS 服务端，只验证 Vault SecretRef 在 validate/CLI 链路
     // 中的解析与 namespace 对齐（与 `docs/refactoring/integration.md` 中 P2 gate 对应）。
     let env = VaultCliEnv::new();
-
-    // 先写入 mail password，因为完整配置默认启用 mail 并声明了 password_ref。
-    let mut set_mail = env.bootstrap_command();
-    set_mail.args([
-        "config",
-        "secret",
-        "set",
-        "mail.password",
-        "--vault-path",
-        MAIL_PASSWORD_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set_mail, SECRET_VALUE);
-    let (stdout, stderr) = assert_success(&output);
-    assert_eq!(stdout.trim(), format!("stored {MAIL_PASSWORD_REF}"));
-    assert_does_not_leak_secret(&stdout, &stderr);
 
     let mut set_access = env.bootstrap_command();
     set_access.args([
@@ -539,64 +533,6 @@ fn config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs() 
     );
 }
 
-#[test]
-fn config_secret_set_check_and_validate_resolve_redis_url_secret_ref() {
-    // Redis is resolved after DB-only Vault bootstrap and before connecting to Redis,
-    // so it is a valid SecretRef consumer even though database credentials are not.
-    let env = VaultCliEnv::new();
-
-    seed_mail_password(&env);
-
-    let redis_url = integration_redis_url();
-    let mut set = env.bootstrap_command();
-    set.args([
-        "config",
-        "secret",
-        "set",
-        "redis.url",
-        "--vault-path",
-        REDIS_URL_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set, &redis_url);
-    let (stdout, stderr) = assert_success(&output);
-    assert_eq!(stdout.trim(), format!("stored {REDIS_URL_REF}"));
-    assert!(
-        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
-        "stdout/stderr leaked Redis URL"
-    );
-
-    let mut check = env.bootstrap_command();
-    check.args([
-        "config",
-        "secret",
-        "check",
-        "redis.url",
-        "--ref",
-        REDIS_URL_REF,
-    ]);
-    let output = run(check);
-    let (stdout, stderr) = assert_success(&output);
-    assert_eq!(stdout.trim(), format!("ok {REDIS_URL_REF}"));
-    assert!(
-        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
-        "check leaked Redis URL"
-    );
-
-    let mut validate = env.full_config_command();
-    validate.env("MEGA_REDIS__URL", REDIS_URL_REF);
-    validate.args(["config", "validate", "--resolve-secrets"]);
-    let output = run(validate);
-    let (stdout, stderr) = assert_success(&output);
-    assert_eq!(stdout.trim(), "config valid");
-    assert!(
-        !stdout.contains(&redis_url) && !stderr.contains(&redis_url),
-        "validate leaked Redis URL"
-    );
-}
-
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
     // 进程级测试需要尽量隔离外部环境，避免开发机上的 MEGA_* 变量影响结果。
     let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
@@ -677,19 +613,6 @@ fn assert_failure(output: &Output) -> (String, String) {
     (stdout, stderr)
 }
 
-fn assert_does_not_leak_secret(stdout: &str, stderr: &str) {
-    // 这是所有涉及 secret 的测试都要复用的安全断言。
-    // 目前只检查测试明文值；更完整的日志 redaction gate 可在后续扩展。
-    assert!(
-        !stdout.contains(SECRET_VALUE),
-        "stdout leaked secret value: {stdout}"
-    );
-    assert!(
-        !stderr.contains(SECRET_VALUE),
-        "stderr leaked secret value: {stderr}"
-    );
-}
-
 fn integration_postgres_url() -> String {
     // `.env.test` 可以覆盖默认值；没有覆盖时使用 docker-compose.test.yml 的本地端口。
     std::env::var("MEGA_DATABASE__DB_URL").unwrap_or_else(|_| DEFAULT_POSTGRES_URL.to_string())
@@ -719,7 +642,7 @@ fn assert_postgres_count_at_least(db_url: &str, sql: &str, expected: i64) {
             .await
             .unwrap_or_else(|_| panic!("failed to reconnect to integration PostgreSQL database"));
         let row = db
-            .query_one(Statement::from_string(DatabaseBackend::Postgres, sql))
+            .query_one_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
             .await
             .unwrap_or_else(|_| panic!("failed to query integration PostgreSQL database"))
             .expect("PostgreSQL count query should return one row");
@@ -735,7 +658,7 @@ fn assert_postgres_count_at_least(db_url: &str, sql: &str, expected: i64) {
 
 async fn execute_postgres(db: &sea_orm::DatabaseConnection, sql: String) {
     // PostgreSQL 管理语句集中走这里，便于在失败时给出统一的测试准备错误。
-    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+    db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
         .await
         .unwrap_or_else(|_| panic!("failed to prepare integration PostgreSQL database"));
 }
@@ -755,11 +678,8 @@ fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
 #[test]
 fn integration_service_http_smoke() {
     // 验证真实启动顺序 Config -> Storage(DB+migrations) -> Redis -> VaultCore ->
-    // mail resolver -> SmtpMailer/EmailDispatcher -> init_monorepo -> HTTP。
+    // init_monorepo -> HTTP。
     let env = VaultCliEnv::new();
-
-    // 先写入 mail.password，让启动期的 SMTP mailer SecretRef 解析成功。
-    seed_mail_password(&env);
 
     let port = reserve_free_port();
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -809,63 +729,12 @@ fn integration_service_http_smoke() {
         read_log(&stderr_path),
     );
 
-    // 日志中不应出现连接到非 PostgreSQL 后端的记录，也不应泄露 mail secret。
+    // 日志中不应出现连接到非 PostgreSQL 后端的记录。
     let logs = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
     assert!(
         !logs.to_ascii_lowercase().contains("sqlite"),
         "logs unexpectedly mention a non-PostgreSQL backend:\n{logs}"
     );
-    assert_does_not_leak_secret(&logs, "");
-}
-
-#[test]
-fn integration_service_http_fails_when_mailer_secret_missing() {
-    // mail 已启用且声明 password_ref，但从不写入 secret。启动期 mail resolver 必须
-    // fail-closed：进程以非 0 退出并给出脱敏诊断，且从不绑定 HTTP 端口（而非静默禁用）。
-    let env = VaultCliEnv::new();
-    let port = reserve_free_port();
-    let stdout_path = env.temp_dir.path().join("service.out");
-    let stderr_path = env.temp_dir.path().join("service.err");
-
-    let mut command = env.full_config_command();
-    command.args([
-        "service",
-        "http",
-        "--host",
-        "127.0.0.1",
-        "-p",
-        &port.to_string(),
-    ]);
-    command
-        .stdout(Stdio::from(create_log_file(&stdout_path)))
-        .stderr(Stdio::from(create_log_file(&stderr_path)));
-
-    let mut service = ServiceProcess::spawn(command);
-    // 在等待退出的整个过程中持续探测端口：startup 必须在绑定 HTTP 之前 fail-closed。
-    let status = service
-        .wait_for_exit_without_binding(port, Duration::from_secs(90))
-        .expect("service must exit when the mail secret is missing");
-
-    assert!(
-        !status.success(),
-        "mailer initialization failure must fail the process, not silently disable mail"
-    );
-    assert!(
-        TcpStream::connect(("127.0.0.1", port)).is_err(),
-        "HTTP port must not be bound after a fail-closed exit"
-    );
-
-    let stderr = read_log(&stderr_path);
-    assert!(
-        stderr.contains("secret not found"),
-        "expected a missing-secret diagnostic; stderr:\n{stderr}"
-    );
-    // 诊断不得泄露具体 vault path / ref / 明文。
-    assert!(
-        !stderr.contains(MAIL_PASSWORD_PATH) && !stderr.contains(MAIL_PASSWORD_REF),
-        "diagnostic leaked the vault path/ref:\n{stderr}"
-    );
-    assert_does_not_leak_secret("", &stderr);
 }
 
 #[test]
@@ -882,7 +751,6 @@ level = "info"
 print_std = true
 "#,
     );
-    seed_mail_password(&env);
 
     let port = reserve_free_port();
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -1004,157 +872,57 @@ import_dir = "/tmp/hot-reload-restart-required"
     );
 }
 
+// ===== 真实 S3-compatible 对象存储后端 gate（integration.md P2）=====
+
 #[test]
-fn integration_multichannel_notification() {
-    // integration.md P2 多渠道通知黑盒 gate：启动真实 service http，配置 mail + slack +
-    // webhook，通过直接写入 email_jobs outbox 触发 dispatcher，验证 email（Mailpit）、
-    // in-app（user_inbox_notifications）、Slack 与 webhook 均收到扇出。
-    let recorder = HttpRecorder::spawn();
-    let slack_url = format!("http://127.0.0.1:{}/slack", recorder.addr.port());
-    let webhook_url = format!("http://127.0.0.1:{}/webhook", recorder.addr.port());
-
-    assert!(
-        is_mailpit_available(),
-        "integration_multichannel_notification requires Mailpit at {}; \
-         start the docker compose test stack or set MAILPIT_API_URL/MAILPIT_SMTP_HOST/MAILPIT_SMTP_PORT",
-        mailpit_api_url()
-    );
-
-    let env = VaultCliEnv::new();
-    seed_mail_password(&env);
-    seed_notification_secrets(&env, &slack_url, "test-webhook-token");
-
-    // 用 profile 文件提供 notification 渠道配置（config crate 的 env overlay 对可选嵌套
-    // 结构支持不稳定，profile TOML 更可靠）。
-    env.write_profile(
-        "it",
-        &format!(
-            r#"
-[notification.slack]
-enabled = true
-webhook_url_ref = "{NOTIFICATION_SLACK_WEBHOOK_URL_REF}"
-
-[notification.webhook]
-enabled = true
-url = "{webhook_url}"
-token_ref = "{NOTIFICATION_WEBHOOK_TOKEN_REF}"
-"#
-        ),
-    );
-
-    let port = reserve_free_port();
-    let stdout_path = env.temp_dir.path().join("service.out");
-    let stderr_path = env.temp_dir.path().join("service.err");
-
-    let mut command = env.full_config_command();
-    command
-        .env("MEGA_PROFILE", "it")
-        .env("MEGA_MAIL__ENABLED", "true")
-        .env("MEGA_MAIL__PROVIDER", "smtp")
-        .env("MEGA_MAIL__SMTP_HOST", mailpit_smtp_host())
-        .env("MEGA_MAIL__SMTP_PORT", mailpit_smtp_port().to_string())
-        .env("MEGA_MAIL__FROM", "no-reply@example.test")
-        .env("MEGA_MAIL__STARTTLS", "false")
-        .env("MEGA_LOG__PRINT_STD", "true")
-        .args([
-            "service",
-            "http",
-            "--host",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-        ]);
-    command
-        .stdout(Stdio::from(create_log_file(&stdout_path)))
-        .stderr(Stdio::from(create_log_file(&stderr_path)));
-
-    let mut service = ServiceProcess::spawn(command);
-    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
-
-    // 直接往 outbox 写入 pending job，触发 dispatcher 的真实多渠道扇出。
-    let subject = format!(
-        "multichannel-test-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    );
-    let db_url = &env.database.db_url;
-    execute_sql(
-        db_url,
-        "INSERT INTO notification_event_types \
-         (code, category, description, system_required, default_enabled, created_at, updated_at) \
-         VALUES ('cl.comment.created', 'cl', 'comment', false, true, now(), now()) \
-         ON CONFLICT (code) DO NOTHING;",
-    );
-    execute_sql(
-        db_url,
-        &format!(
-            "INSERT INTO email_jobs \
-             (username, to_email, event_type_code, subject, body_html, body_text, status, \
-              error_message, retry_count, next_retry_at, sent_at, created_at, updated_at) \
-             VALUES ('multichannel-user', 'multichannel-user@example.test', 'cl.comment.created', \
-             '{subject}', '<p>multichannel body</p>', 'multichannel body', 'pending', NULL, 0, \
-             NULL, NULL, now(), now());"
-        ),
-    );
-
-    let logs = || {
-        format!(
-            "stdout:\n{}\nstderr:\n{}",
-            read_log(&stdout_path),
-            read_log(&stderr_path)
-        )
-    };
-
-    assert!(
-        wait_for_mailpit_subject(&subject, Duration::from_secs(30)),
-        "Mailpit should receive the email notification; {}",
-        logs()
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let records = recorder.records();
-        let has_slack = records
-            .iter()
-            .any(|req| req.path == "/slack" && req.body.contains("\"text\""));
-        let has_webhook = records
-            .iter()
-            .any(|req| req.path == "/webhook" && req.body.contains("\"username\""));
-        let webhook_auth_ok = records.iter().any(|req| {
-            req.path == "/webhook"
-                && req
-                    .headers
-                    .iter()
-                    .any(|(k, v)| k == "authorization" && v.contains("Bearer test-webhook-token"))
-        });
-        if has_slack && has_webhook && webhook_auth_ok {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for slack/webhook fan-out; recorder received {} requests; {}",
-                records.len(),
-                logs()
-            );
-        }
-        sleep(Duration::from_millis(200));
+fn integration_compose_monoengine_http_smoke() {
+    // Standing compose `monoengine` service (profile `app`, host 19180). Soft
+    // skip when the profile is not up so `cargo test --all` stays usable with
+    // only the default data-plane stack.
+    let available = std::net::TcpStream::connect("127.0.0.1:19180").is_ok();
+    if !available {
+        eprintln!(
+            "integration_compose_monoengine_http_smoke requires compose monoengine at \
+             127.0.0.1:19180; build/start with \
+             `docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine` \
+             (see docs/refactoring/test-infra.md), skipping"
+        );
+        return;
     }
 
-    assert_postgres_count_at_least(
-        db_url,
-        "SELECT count(*) FROM user_inbox_notifications WHERE username = 'multichannel-user'",
-        1,
-    );
-
-    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    let body = http_get_openapi();
     assert!(
-        status.success(),
-        "service did not shut down cleanly: {status}\nstderr:\n{}",
-        read_log(&stderr_path)
+        body.contains("openapi") || body.contains("paths") || body.contains('{'),
+        "compose monoengine openapi body looked empty/unexpected: {body}"
     );
 }
 
-// ===== 真实 S3-compatible 对象存储后端 gate（integration.md P2）=====
+fn http_get_openapi() -> String {
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+    };
+
+    let mut stream = TcpStream::connect("127.0.0.1:19180").expect("connect compose monoengine");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    let req =
+        "GET /api/openapi.json HTTP/1.1\r\nHost: 127.0.0.1:19180\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write request");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read response");
+    let text = String::from_utf8_lossy(&buf);
+    let status_ok = text
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "));
+    assert!(
+        status_ok,
+        "expected HTTP 200 from compose monoengine openapi; got:\n{text}"
+    );
+    text.into_owned()
+}
 
 #[test]
 fn integration_object_storage_s3_compatible_smoke() {
@@ -1166,9 +934,8 @@ fn integration_object_storage_s3_compatible_smoke() {
     if !rustfs_available {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
-             run `docker compose -f docker-compose.test.yml up -d --wait` \
-             and `docker compose -f docker-compose.test.yml --profile init run --rm rustfs-init` \
-             first, skipping",
+             run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` \
+             first (includes rustfs-init creating testbucket), skipping",
             rustfs_endpoint
         );
         return;
@@ -1177,15 +944,16 @@ fn integration_object_storage_s3_compatible_smoke() {
     let env = VaultCliEnv::new();
     let mut command = env.full_config_command();
     command
-        // 关闭 mail，避免本测试依赖 mail password vault secret。
-        .env("MEGA_MAIL__ENABLED", "false")
         // 覆盖为 S3-compatible（RustFS）配置。
         .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible")
         .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
         .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "testbucket")
         .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", rustfs_endpoint)
-        .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "minioadmin")
-        .env("MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY", "minioadmin");
+        .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs")
+        .env(
+            "MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY",
+            "rustfs_secret",
+        );
 
     command.args([
         "debug",
@@ -1221,7 +989,8 @@ fn integration_error_redaction_does_not_leak_db_password() {
     let stdout_path = temp_dir.path().join("service.out");
     let stderr_path = temp_dir.path().join("service.err");
     // 端口 1 几乎必然拒绝连接，确保 DB 连接快速失败。
-    let bad_db_url = format!("postgres://mono:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
+    let bad_db_url =
+        format!("postgres://monoengine:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
 
     let mut command = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
     command.arg("--config").arg(&config_path);
@@ -1235,8 +1004,6 @@ fn integration_error_redaction_does_not_leak_db_password() {
         .env("MEGA_LOG__WITH_ANSI", "false")
         .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
         .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &object_root)
-        // mail 在 DB 之后才初始化；关掉它让失败点确定落在 DB 连接。
-        .env("MEGA_MAIL__ENABLED", "false")
         .args([
             "service",
             "http",
@@ -1329,11 +1096,10 @@ fn integration_error_redaction_bad_toml_does_not_leak_values() {
     let bad_toml = format!(
         r#"[database]
 db_type = "postgres"
-db_url = "postgres://mono:{TOML_SENTINEL}@127.0.0.1:5432/mono"
+db_url = "postgres://monoengine:{TOML_SENTINEL}@127.0.0.1:5432/monoengine"
 
-[mail]
-enabled = false
-password = "{TOML_SENTINEL}
+[redis]
+url = "{TOML_SENTINEL}
 # unterminated string above — TOML syntax error
 "#
     );
@@ -1408,17 +1174,17 @@ fn integration_config_init_creates_safe_skeleton_and_validates() {
     );
 
     let content = fs::read_to_string(&output_path).expect("read init config");
-    // 骨架配置使用 password_ref 而非明文 password，且不包含可复用的生产凭据。
+    // 骨架配置为 Redis 提供安全的本地默认值，且不包含可复用的生产凭据。
     assert!(
-        content.contains("password_ref = "),
-        "init config should use password_ref"
+        content.contains("url = \"redis://127.0.0.1:6379\""),
+        "init config should include the local Redis URL"
     );
     assert!(
         !content.contains("password = "),
         "init config should not contain plaintext password ="
     );
     assert!(
-        !content.contains("postgres://mono:"),
+        !content.contains("postgres://monoengine:"),
         "init config should not embed predictable postgres credentials"
     );
 
@@ -1456,58 +1222,6 @@ fn integration_config_init_creates_safe_skeleton_and_validates() {
     let output = run(init_force);
     assert_success(&output);
     assert!(output_path.exists(), "force overwrite should keep the file");
-}
-
-fn seed_mail_password(env: &VaultCliEnv) {
-    // 复用 secret-set 正路径：通过 stdin 把 mail.password 写入测试专属 Vault。
-    let mut set = env.bootstrap_command();
-    set.args([
-        "config",
-        "secret",
-        "set",
-        "mail.password",
-        "--vault-path",
-        MAIL_PASSWORD_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set, SECRET_VALUE);
-    assert_success(&output);
-}
-
-fn seed_notification_secrets(env: &VaultCliEnv, slack_url: &str, webhook_token: &str) {
-    // 通过最小 DB/Vault bootstrap 写入 notification 渠道凭据，模拟运维人员先 set secret
-    // 再启动 service 的真实流程；凭据值只经 stdin 传入，不泄露到命令行或日志。
-    let mut set_slack = env.bootstrap_command();
-    set_slack.args([
-        "config",
-        "secret",
-        "set",
-        "notification.slack.webhook_url",
-        "--vault-path",
-        NOTIFICATION_SLACK_WEBHOOK_URL_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set_slack, slack_url);
-    assert_success(&output);
-
-    let mut set_token = env.bootstrap_command();
-    set_token.args([
-        "config",
-        "secret",
-        "set",
-        "notification.webhook.token",
-        "--vault-path",
-        NOTIFICATION_WEBHOOK_TOKEN_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set_token, webhook_token);
-    assert_success(&output);
 }
 
 fn create_log_file(path: &Path) -> fs::File {
@@ -1588,252 +1302,6 @@ fn http_get_host(host: &str, port: u16, path: &str) -> String {
     }
 }
 
-fn execute_sql(db_url: &str, sql: &str) {
-    // 黑盒测试通过原始 SQL 直接操作 PostgreSQL，避免引入内部实体类型。
-    with_runtime(async {
-        let db = Database::connect(db_url)
-            .await
-            .unwrap_or_else(|_| panic!("failed to connect to integration PostgreSQL database"));
-        db.execute(Statement::from_string(
-            DatabaseBackend::Postgres,
-            sql.to_string(),
-        ))
-        .await
-        .unwrap_or_else(|_| panic!("failed to execute SQL: {sql}"));
-    });
-}
-
-fn mailpit_api_url() -> String {
-    std::env::var("MAILPIT_API_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:18025".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn mailpit_api_socket_addr() -> Option<SocketAddr> {
-    let url = url::Url::parse(&mailpit_api_url()).ok()?;
-    url.socket_addrs(|| Some(80))
-        .ok()
-        .and_then(|addrs| addrs.into_iter().next())
-}
-
-fn mailpit_smtp_host() -> String {
-    std::env::var("MAILPIT_SMTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
-fn mailpit_smtp_port() -> u16 {
-    std::env::var("MAILPIT_SMTP_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(11025)
-}
-
-fn is_mailpit_available() -> bool {
-    mailpit_api_socket_addr()
-        .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
-        .unwrap_or(false)
-}
-
-fn wait_for_mailpit_subject(subject: &str, timeout: Duration) -> bool {
-    let api_url = mailpit_api_url();
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(payload) = mailpit_messages(&api_url)
-            && mailpit_has_subject(&payload, subject)
-        {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        sleep(Duration::from_millis(200));
-    }
-}
-
-fn mailpit_messages(api_url: &str) -> Option<Value> {
-    let url = url::Url::parse(api_url).ok()?;
-    let host = url.host_str()?.to_string();
-    let port = url.port_or_known_default().unwrap_or(80);
-    let response = http_get_host(&host, port, "/api/v1/messages");
-    let body = http_response_body(&response);
-    serde_json::from_str(&body).ok()
-}
-
-fn mailpit_has_subject(payload: &Value, subject: &str) -> bool {
-    payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("Subject")
-                    .or_else(|| message.get("subject"))
-                    .and_then(Value::as_str)
-                    == Some(subject)
-            })
-        })
-}
-
-fn http_response_body(response: &str) -> String {
-    let mut parts = response.splitn(2, "\r\n\r\n");
-    let headers = parts.next().unwrap_or("").to_lowercase();
-    let body = parts.next().unwrap_or("");
-    if headers.contains("transfer-encoding: chunked") {
-        decode_chunked(body)
-    } else {
-        body.to_string()
-    }
-}
-
-fn decode_chunked(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut output = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let mut line_end = i;
-        while line_end + 1 < bytes.len()
-            && !(bytes[line_end] == b'\r' && bytes[line_end + 1] == b'\n')
-        {
-            line_end += 1;
-        }
-        if line_end + 1 >= bytes.len() {
-            break;
-        }
-        let size_str = std::str::from_utf8(&bytes[i..line_end]).unwrap_or("");
-        let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
-        i = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if i + size > bytes.len() {
-            break;
-        }
-        output.extend_from_slice(&bytes[i..i + size]);
-        i += size;
-        if i + 1 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
-            i += 2;
-        }
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-#[derive(Clone, Debug)]
-struct RecordedRequest {
-    path: String,
-    headers: Vec<(String, String)>,
-    body: String,
-}
-
-/// 轻量 HTTP 记录器：在测试线程里启动一个 TCP 监听器，记录收到的请求体与头部，
-/// 用于捕获 slack/webhook 渠道的扇出 POST，而不引入 axum/reqwest 等重型依赖。
-struct HttpRecorder {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    records: Arc<Mutex<Vec<RecordedRequest>>>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl HttpRecorder {
-    fn spawn() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind HTTP recorder");
-        let addr = listener.local_addr().expect("recorder local addr");
-        let stop = Arc::new(AtomicBool::new(false));
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let stop_t = stop.clone();
-        let records_t = records.clone();
-        let handle = thread::spawn(move || {
-            listener
-                .set_nonblocking(true)
-                .expect("recorder nonblocking");
-            while !stop_t.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        if let Some(req) = read_http_request(&mut stream) {
-                            records_t.lock().unwrap().push(req);
-                        }
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        );
-                    }
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        sleep(Duration::from_millis(50));
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
-        Self {
-            addr,
-            stop,
-            records,
-            handle: Some(handle),
-        }
-    }
-
-    fn records(&self) -> Vec<RecordedRequest> {
-        self.records.lock().unwrap().clone()
-    }
-}
-
-impl Drop for HttpRecorder {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            handle.join().ok();
-        }
-    }
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
-    stream.set_nonblocking(false).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
-    let mut reader = BufReader::new(stream);
-    let mut path = String::new();
-    let mut headers = Vec::new();
-    let mut first = true;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        if line.ends_with('\n') {
-            line.pop();
-        }
-        if line.ends_with('\r') {
-            line.pop();
-        }
-        if first {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                path = parts[1].to_string();
-            }
-            first = false;
-        } else if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_lowercase(), v.trim().to_string()));
-        }
-    }
-    let content_length = headers
-        .iter()
-        .find(|(k, _)| k == "content-length")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
-    }
-    Some(RecordedRequest {
-        path,
-        headers,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    })
-}
-
 // 受控的服务子进程包装：保证测试无论成功失败都不会泄露后台进程。
 struct ServiceProcess {
     child: Child,
@@ -1884,31 +1352,6 @@ impl ServiceProcess {
     fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = self.child.try_wait().expect("poll service") {
-                self.reaped = true;
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            sleep(Duration::from_millis(200));
-        }
-    }
-
-    // 与 wait_for_exit 相同，但在等待退出的整个窗口内持续探测端口：一旦端口可连接就立即
-    // 失败。这样才能证明 fail-closed 启动“从不绑定”HTTP，而不仅是退出后未绑定。
-    fn wait_for_exit_without_binding(
-        &mut self,
-        port: u16,
-        timeout: Duration,
-    ) -> Option<ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                panic!(
-                    "service bound port {port} but was expected to fail closed before binding HTTP"
-                );
-            }
             if let Some(status) = self.child.try_wait().expect("poll service") {
                 self.reaped = true;
                 return Some(status);

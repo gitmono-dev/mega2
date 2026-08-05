@@ -9,8 +9,7 @@ use crate::{
 /// read inside the product (docs/notification.md phase 4).
 ///
 /// Backed by the `user_inbox_notifications` table via [`NotificationStorage`].
-/// Used as a secondary channel alongside email: the dispatcher fans a delivered
-/// notification out to the inbox best-effort after the email send succeeds.
+/// Primary delivery path after MN-02 (email outbox / website call is MN-05).
 pub struct InAppChannel {
     stg: NotificationStorage,
 }

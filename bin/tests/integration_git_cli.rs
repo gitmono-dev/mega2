@@ -3,6 +3,9 @@
 // Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
 // compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
 // re-clone working-tree round-trips with per-case DB/port/workdir isolation.
+// MonoRepo product rules (`docs/monorepo.md`): only public branch is `main`;
+// client branch pushes land on `refs/cl/*` (no new public heads); Git-client
+// tag push is rejected (tags via Web `/tags` API only).
 // IT-10 adds auth-boundary cases (`integration_git_cli_auth_*`).
 // IT-12 adds failpath cases (`integration_git_cli_failpath_*`).
 // Credential injection lives in `common/git_cli.rs` (included only here).
@@ -15,10 +18,10 @@ mod git_cli;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{ErrorKind, Read, Write},
+    io::Read,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Output, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     thread::sleep,
     time::{Duration, Instant},
@@ -27,12 +30,8 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const MAIL_PASSWORD_PATH: &str = "config/it/mail/password";
-const MAIL_PASSWORD_REF: &str = "vault://secret/config/it/mail/password#value";
-const SECRET_VALUE: &str = "smtp-test-password";
-
 const DEFAULT_POSTGRES_URL: &str =
-    "postgres://mono:mono_test_password@127.0.0.1:15432/monoengine_it";
+    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -48,7 +47,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_it_git_{}_{}",
+            "monoengine_git_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -84,13 +83,13 @@ impl Drop for TestDatabase {
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
             );
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     terminate_sql,
                 ))
                 .await;
             let _ = db
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     DatabaseBackend::Postgres,
                     format!("DROP DATABASE IF EXISTS {db_name}"),
                 ))
@@ -102,7 +101,6 @@ impl Drop for TestDatabase {
 struct GitCliEnv {
     temp_dir: TempDir,
     database: TestDatabase,
-    bootstrap_config_path: PathBuf,
     full_config_path: PathBuf,
     base_dir: PathBuf,
     cache_dir: PathBuf,
@@ -112,6 +110,14 @@ struct GitCliEnv {
 
 impl GitCliEnv {
     fn new() -> Self {
+        Self::with_config_append("")
+    }
+
+    fn with_git_anonymous_access(anonymous_access: bool) -> Self {
+        Self::with_config_append(&format!("\n[git]\nanonymous_access = {anonymous_access}\n"))
+    }
+
+    fn with_config_append(append: &str) -> Self {
         git_cli::require_git_cli_runner();
 
         let work_root = git_cli::git_cli_workdir();
@@ -134,30 +140,23 @@ impl GitCliEnv {
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
-        let bootstrap_config_path = temp_dir.path().join("bootstrap-config.toml");
         let full_config_path = temp_dir.path().join("config.toml");
         let base_dir = temp_dir.path().join("base");
         let cache_dir = temp_dir.path().join("cache");
         let object_root = temp_dir.path().join("objects");
 
-        common::write_bootstrap_config(&bootstrap_config_path, &database.db_url);
-        common::write_full_config(&full_config_path);
+        common::write_full_config_with_append(&full_config_path, append);
         git_cli::write_git_askpass(&case_dir.join("git-askpass.sh"));
 
         Self {
             temp_dir,
             database,
-            bootstrap_config_path,
             full_config_path,
             base_dir,
             cache_dir,
             object_root,
             case_dir,
         }
-    }
-
-    fn bootstrap_command(&self) -> Command {
-        self.command_with_config(&self.bootstrap_config_path)
     }
 
     fn full_config_command(&self) -> Command {
@@ -180,11 +179,7 @@ impl GitCliEnv {
             .env("MEGA_LOG__WITH_ANSI", "false")
             .env("MEGA_REDIS__URL", integration_redis_url())
             .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
-            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
-            .env("MEGA_MAIL__ENABLED", "true")
-            .env("MEGA_MAIL__SMTP_HOST", "localhost")
-            .env("MEGA_MAIL__FROM", "no-reply@example.test")
-            .env("MEGA_MAIL__PASSWORD_REF", MAIL_PASSWORD_REF);
+            .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root);
         command
     }
 }
@@ -270,9 +265,8 @@ impl ServiceProcess {
     }
 
     fn assert_alive(&mut self) {
-        match self.child.try_wait().expect("poll service") {
-            Some(status) => panic!("service exited unexpectedly with {status}"),
-            None => {}
+        if let Some(status) = self.child.try_wait().expect("poll service") {
+            panic!("service exited unexpectedly with {status}");
         }
     }
 }
@@ -319,7 +313,6 @@ fn integration_git_cli_http_round_trip() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
 
     let token = git_cli::resolve_seed_token();
     let fixture_payload = format!(
@@ -416,6 +409,7 @@ fn integration_git_cli_http_round_trip() {
     );
 
     let before_refs = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let before_heads = ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/heads/*");
 
     let refspec = format!("HEAD:refs/heads/{branch}");
     git_cli::assert_git_success(
@@ -438,6 +432,18 @@ fn integration_git_cli_http_round_trip() {
     );
 
     let after_refs = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let after_heads = ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/heads/*");
+    assert_eq!(
+        before_heads, after_heads,
+        "MonoRepo push must not create/alter public refs/heads/* (docs/monorepo.md §1)"
+    );
+    assert!(
+        !after_heads
+            .iter()
+            .any(|r| r == &format!("refs/heads/{branch}")),
+        "public branch refs/heads/{branch} must not exist after MonoRepo CL push",
+        branch = branch
+    );
     let cl_ref = after_refs
         .into_iter()
         .find(|r| !before_refs.contains(r))
@@ -538,6 +544,394 @@ fn integration_git_cli_http_round_trip() {
 }
 
 #[test]
+fn integration_git_cli_http_pull_cl_ref_round_trip() {
+    // ADR-GM-02 / plan-20260803 GM-02: literal `git pull` of refs/cl/* must
+    // update a dedicated local branch to the sender tree; default main stays seed.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let case_id = format!(
+        "gm02-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let fixture_payload = format!(
+        "monoengine gm-02 pull fixture pid={} case={}\n",
+        std::process::id(),
+        env.case_dir.display()
+    );
+    let fixture_rel = Path::new("gm-02-pull-fixture.txt");
+    let fixture_host = env.case_dir.join("fixture").join(fixture_rel);
+    fs::create_dir_all(fixture_host.parent().expect("fixture parent")).expect("mkdir fixture");
+    fs::write(&fixture_host, &fixture_payload).expect("write fixture");
+
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let sender_name = "pull-sender";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, sender_name]),
+        "clone sender worktree",
+    );
+    let sender = env.case_dir.join(sender_name);
+    let seed_tree = snapshot_workdir(&sender);
+    let expected_seed = expected_init_monorepo_fixture();
+    assert_eq!(
+        seed_tree, expected_seed,
+        "sender clone must match seeded monorepo fixture before pull case mutates a CL tip"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "checkout", "-b", &case_id],
+        ),
+        "create sender branch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "config", "user.name", "IT Git CLI"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                sender_name,
+                "config",
+                "user.email",
+                "it-git-cli@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::copy(&fixture_host, sender.join(fixture_rel)).expect("copy fixture into sender");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "add", fixture_rel.to_str().unwrap()],
+        ),
+        "git add pull fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", sender_name, "commit", "-m", "gm-02 pull fixture"],
+        ),
+        "git commit pull fixture",
+    );
+    let sender_tree = snapshot_workdir(&sender);
+    let fixture_key = path_bytes(fixture_rel);
+    let fixture_bytes = fixture_payload.as_bytes().to_vec();
+    assert_eq!(
+        sender_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "sender tree must contain the pull fixture bytes"
+    );
+
+    let before_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let refspec = format!("HEAD:refs/heads/{case_id}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                sender_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        ),
+        "push sender tip to create refs/cl/*",
+    );
+    let after_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let cl_ref = after_cl
+        .into_iter()
+        .find(|r| !before_cl.contains(r))
+        .unwrap_or_else(|| panic!("expected new refs/cl/* after push for case {case_id}"));
+    assert!(
+        cl_ref.starts_with("refs/cl/"),
+        "expected refs/cl/* tip, got {cl_ref}"
+    );
+
+    let puller_name = "pull-receiver";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, puller_name]),
+        "clone default tip for literal pull",
+    );
+    let puller = env.case_dir.join(puller_name);
+    let puller_main_before = snapshot_workdir(&puller);
+    assert_eq!(
+        puller_main_before, expected_seed,
+        "pull receiver default main must equal seed tree before literal pull"
+    );
+
+    let local_branch = format!("pulled-{case_id}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", puller_name, "checkout", "-b", &local_branch],
+        ),
+        "create local branch for literal pull",
+    );
+    // Literal `git pull origin <refs/cl/…>` (ADR-GM-02). Not fetch+checkout.
+    // Force protocol v0: v2 ref-prefix from default heads-only remote.fetch can
+    // omit refs/cl/* and yield HTTP 400 / "expected 'acknowledgments'".
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                puller_name,
+                "-c",
+                "protocol.version=0",
+                "pull",
+                "--ff-only",
+                "origin",
+                &cl_ref,
+            ],
+        ),
+        "literal git pull of refs/cl tip into local branch",
+    );
+
+    let pulled_tree = snapshot_workdir(&puller);
+    assert_eq!(
+        pulled_tree.get(&fixture_key),
+        Some(&fixture_bytes),
+        "literal pull worktree must contain sender fixture bytes"
+    );
+    assert_eq!(
+        pulled_tree, sender_tree,
+        "literal pull worktree must match sender snapshot byte-for-byte"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", puller_name, "checkout", "main"],
+        ),
+        "return to default main after pull",
+    );
+    let puller_main_after = snapshot_workdir(&puller);
+    assert_eq!(
+        puller_main_after, expected_seed,
+        "default main must remain the seed tree after literal CL pull"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
+    // plan-20260803 GM-03: per-case `[git] anonymous_access = false` must reject
+    // unauthenticated clone while the same service still accepts token clone.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::with_git_anonymous_access(false);
+    let config_text = fs::read_to_string(&env.full_config_path).expect("read per-case config");
+    assert!(
+        config_text.contains("[git]"),
+        "per-case config must contain [git] override:\n{config_text}"
+    );
+    assert!(
+        config_text
+            .lines()
+            .any(|l| l.trim() == "anonymous_access = false"),
+        "per-case config must set anonymous_access = false:\n{config_text}"
+    );
+
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let anon_clone = git_cli::git_cli_no_auth(
+        &env.case_dir,
+        &["clone", &remote_url, "anon-disabled-clone"],
+    );
+    assert!(
+        !anon_clone.status.success(),
+        "anonymous clone must fail when anonymous_access=false; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        anon_clone.status,
+        String::from_utf8_lossy(&anon_clone.stdout),
+        String::from_utf8_lossy(&anon_clone.stderr)
+    );
+    let anon_err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&anon_clone.stdout),
+        String::from_utf8_lossy(&anon_clone.stderr)
+    )
+    .to_ascii_lowercase();
+    assert!(
+        anon_err.contains("authentication")
+            || anon_err.contains("401")
+            || anon_err.contains("unauthorized")
+            || anon_err.contains("auth"),
+        "anonymous failure must look like an auth rejection, got:\n{anon_err}"
+    );
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["clone", &remote_url, "token-enabled-clone"],
+        ),
+        "token clone must succeed on same service with anonymous_access=false",
+    );
+    let token_tree = snapshot_workdir(&env.case_dir.join("token-enabled-clone"));
+    assert_eq!(
+        token_tree,
+        expected_init_monorepo_fixture(),
+        "authenticated clone must still receive the seeded monorepo tree"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_http_rejects_git_client_tag_push() {
+    // docs/monorepo.md §2 — MonoRepo tags are Web/API only.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let clone_name = "tag-reject-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone before tag reject",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "config", "user.name", "IT Git CLI"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "it-git-cli@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+
+    let tag = format!("it-tag-reject-{}", std::process::id());
+    let tag_file = format!("{tag}.txt");
+    fs::write(
+        env.case_dir.join(clone_name).join(&tag_file),
+        b"tag reject\n",
+    )
+    .expect("write tag fixture");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["-C", clone_name, "add", &tag_file]),
+        "git add tag fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "tag reject fixture"],
+        ),
+        "git commit tag fixture",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["-C", clone_name, "tag", &tag]),
+        "git tag local",
+    );
+
+    let push = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("refs/tags/{tag}"),
+        ],
+    );
+    assert!(
+        !push.status.success(),
+        "MonoRepo must reject Git-client tag push; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let remote_tags = ls_remote_refs(
+        &env.case_dir,
+        &token,
+        &remote_url,
+        &format!("refs/tags/{tag}"),
+    );
+    assert!(
+        remote_tags.is_empty(),
+        "rejected tag push must not leave refs/tags/{tag} on remote: {remote_tags:?}",
+        tag = tag,
+        remote_tags = remote_tags
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
 fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
     if git_cli::git_cli_skip_requested() {
         eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
@@ -545,7 +939,6 @@ fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
 
     // Challenge probe: no Authorization header → 401 + WWW-Authenticate.
@@ -662,7 +1055,6 @@ fn integration_git_cli_auth_token_never_leaks() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
     let token = git_cli::resolve_seed_token();
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
@@ -811,7 +1203,6 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
     }
 
     let env = GitCliEnv::new();
-    seed_mail_password(&env);
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
 
     // Legacy-disallowed root repo: parse_git_protocol_path rejects it before any
@@ -918,8 +1309,12 @@ fn http_status(port: u16, path: &str) -> u16 {
 }
 
 fn ls_remote_cl_refs(case_dir: &Path, token: &str, remote_url: &str) -> Vec<String> {
-    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, "refs/cl/*"]);
-    git_cli::assert_git_success(&output, "ls-remote refs/cl/*");
+    ls_remote_refs(case_dir, token, remote_url, "refs/cl/*")
+}
+
+fn ls_remote_refs(case_dir: &Path, token: &str, remote_url: &str, pattern: &str) -> Vec<String> {
+    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, pattern]);
+    git_cli::assert_git_success(&output, &format!("ls-remote {pattern}"));
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
@@ -1086,23 +1481,6 @@ fn expected_mega_cedar_json_bytes() -> Vec<u8> {
         .into_bytes()
 }
 
-fn seed_mail_password(env: &GitCliEnv) {
-    let mut set = env.bootstrap_command();
-    set.args([
-        "config",
-        "secret",
-        "set",
-        "mail.password",
-        "--vault-path",
-        MAIL_PASSWORD_PATH,
-        "--field",
-        "value",
-        "--value-stdin",
-    ]);
-    let output = run_with_stdin(set, SECRET_VALUE);
-    assert_success(&output);
-}
-
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
     command
@@ -1118,35 +1496,6 @@ fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Co
         command.env("LD_LIBRARY_PATH", ld_library_path);
     }
     command
-}
-
-fn run_with_stdin(mut command: Command, input: &str) -> Output {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn monoengine");
-    {
-        let mut stdin = child.stdin.take().expect("child stdin");
-        if let Err(err) = stdin.write_all(input.as_bytes()) {
-            assert_eq!(err.kind(), ErrorKind::BrokenPipe, "write stdin");
-        }
-    }
-    child.wait_with_output().expect("wait monoengine")
-}
-
-fn assert_success(output: &Output) -> (String, String) {
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "expected success, got {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        stdout,
-        stderr
-    );
-    (stdout, stderr)
 }
 
 fn integration_postgres_url() -> String {
@@ -1166,7 +1515,7 @@ fn database_url_for_name(admin_url: &str, db_name: &str) -> String {
 }
 
 async fn execute_postgres(db: &sea_orm::DatabaseConnection, sql: String) {
-    db.execute(Statement::from_string(DatabaseBackend::Postgres, sql))
+    db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
         .await
         .unwrap_or_else(|_| panic!("failed to prepare integration PostgreSQL database"));
 }

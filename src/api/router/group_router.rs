@@ -7,24 +7,17 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{
-        MonoApiServiceState,
-        api_common::group_permission::{
-            build_user_effective_permission_response, ensure_admin, resolve_resource_context,
-        },
-        api_doc::GROUP_PERMISSION_TAG,
-        oauth::model::LoginUser,
+        MonoApiServiceState, api_common::group_permission::ensure_admin,
+        api_doc::GROUP_PERMISSION_TAG, oauth::model::LoginUser,
     },
     ceres::model::group::{
-        AddMembersRequest, CreateGroupRequest, DeleteGroupResponse, DeletePermissionsResponse,
-        EmptyListAdditional, GroupMemberResponse, GroupResponse, RemoveMemberResponse,
-        ResourcePermissionResponse, SetPermissionsRequest, UpdateGroupRequest,
-        UserEffectivePermissionResponse, UserGroupsResponse,
+        AddMembersRequest, CreateGroupRequest, DeleteGroupResponse, EmptyListAdditional,
+        GroupMemberResponse, GroupResponse, RemoveMemberResponse, UpdateGroupRequest,
+        UserGroupsResponse,
     },
     common::errors::ApiError,
     contract::api::common::{CommonPage, CommonResult, PageParams, Pagination},
-    jupiter::model::group_dto::{
-        CreateGroupPayload, ResourcePermissionBinding, UpdateGroupPayload,
-    },
+    jupiter::model::group_dto::{CreateGroupPayload, UpdateGroupPayload},
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -39,12 +32,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(add_group_members))
             .routes(routes!(remove_group_member))
             .routes(routes!(list_group_members))
-            .routes(routes!(set_resource_permissions))
-            .routes(routes!(get_resource_permissions))
-            .routes(routes!(update_resource_permissions))
-            .routes(routes!(delete_resource_permissions))
-            .routes(routes!(get_user_groups))
-            .routes(routes!(get_user_effective_permission)),
+            .routes(routes!(get_user_groups)),
     )
 }
 
@@ -381,169 +369,6 @@ async fn list_group_members(
 }
 
 #[utoipa::path(
-    post,
-    path = "/resources/{resource_type}/{resource_id}/permissions",
-    request_body = SetPermissionsRequest,
-    params(
-        ("resource_type" = String, Path, description = "Resource type, currently only `note`"),
-        ("resource_id" = String, Path, description = "Resource ID")
-    ),
-    responses(
-        (status = 200, body = CommonResult<Vec<ResourcePermissionResponse>>),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin only"),
-        (status = 404, description = "Resource or group not found"),
-    ),
-    tag = GROUP_PERMISSION_TAG
-)]
-async fn set_resource_permissions(
-    user: LoginUser,
-    State(state): State<MonoApiServiceState>,
-    Path((resource_type, resource_id)): Path<(String, String)>,
-    Json(req): Json<SetPermissionsRequest>,
-) -> Result<Json<CommonResult<Vec<ResourcePermissionResponse>>>, ApiError> {
-    ensure_admin(&state, &user).await?;
-    let (resource_type, _, resource_id) =
-        resolve_resource_context(&state, resource_type.as_str(), &resource_id).await?;
-
-    let permissions = req
-        .permissions
-        .into_iter()
-        .map(|item| ResourcePermissionBinding {
-            group_id: item.group_id,
-            permission: item.permission.into(),
-        })
-        .collect();
-
-    let saved = state
-        .monorepo()
-        .set_resource_permission(resource_type, &resource_id, permissions)
-        .await?;
-    let saved = saved.into_iter().map(Into::into).collect();
-
-    Ok(Json(CommonResult::success(Some(saved))))
-}
-
-#[utoipa::path(
-    get,
-    path = "/resources/{resource_type}/{resource_id}/permissions",
-    params(
-        ("resource_type" = String, Path, description = "Resource type, currently only `note`"),
-        ("resource_id" = String, Path, description = "Resource ID")
-    ),
-    responses(
-        (status = 200, body = CommonResult<Vec<ResourcePermissionResponse>>),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin only"),
-        (status = 404, description = "Resource not found"),
-    ),
-    tag = GROUP_PERMISSION_TAG
-)]
-async fn get_resource_permissions(
-    user: LoginUser,
-    State(state): State<MonoApiServiceState>,
-    Path((resource_type, resource_id)): Path<(String, String)>,
-) -> Result<Json<CommonResult<Vec<ResourcePermissionResponse>>>, ApiError> {
-    ensure_admin(&state, &user).await?;
-    let (resource_type, _, resource_id) =
-        resolve_resource_context(&state, resource_type.as_str(), &resource_id).await?;
-
-    let permissions = state
-        .monorepo()
-        .get_resource_permissions(resource_type, &resource_id)
-        .await?;
-    let permissions = permissions.into_iter().map(Into::into).collect();
-
-    Ok(Json(CommonResult::success(Some(permissions))))
-}
-
-#[utoipa::path(
-    put,
-    path = "/resources/{resource_type}/{resource_id}/permissions",
-    request_body = SetPermissionsRequest,
-    params(
-        ("resource_type" = String, Path, description = "Resource type, currently only `note`"),
-        ("resource_id" = String, Path, description = "Resource ID")
-    ),
-    responses(
-        (status = 200, body = CommonResult<Vec<ResourcePermissionResponse>>),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin only"),
-        (status = 404, description = "Resource or group not found"),
-    ),
-    tag = GROUP_PERMISSION_TAG
-)]
-async fn update_resource_permissions(
-    user: LoginUser,
-    State(state): State<MonoApiServiceState>,
-    Path((resource_type, resource_id)): Path<(String, String)>,
-    Json(req): Json<SetPermissionsRequest>,
-) -> Result<Json<CommonResult<Vec<ResourcePermissionResponse>>>, ApiError> {
-    ensure_admin(&state, &user).await?;
-    let (resource_type, _, resource_id) =
-        resolve_resource_context(&state, resource_type.as_str(), &resource_id).await?;
-
-    let permissions = req
-        .permissions
-        .into_iter()
-        .map(|item| ResourcePermissionBinding {
-            group_id: item.group_id,
-            permission: item.permission.into(),
-        })
-        .collect();
-
-    let updated = state
-        .monorepo()
-        .update_resource_permissions(resource_type, &resource_id, permissions)
-        .await?;
-    let updated = updated.into_iter().map(Into::into).collect();
-
-    Ok(Json(CommonResult::success(Some(updated))))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/resources/{resource_type}/{resource_id}/permissions",
-    params(
-        ("resource_type" = String, Path, description = "Resource type, currently only `note`"),
-        ("resource_id" = String, Path, description = "Resource ID")
-    ),
-    responses(
-        (status = 200, body = CommonResult<DeletePermissionsResponse>),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin only"),
-        (status = 404, description = "Resource not found"),
-    ),
-    tag = GROUP_PERMISSION_TAG
-)]
-async fn delete_resource_permissions(
-    user: LoginUser,
-    State(state): State<MonoApiServiceState>,
-    Path((resource_type, resource_id)): Path<(String, String)>,
-) -> Result<Json<CommonResult<DeletePermissionsResponse>>, ApiError> {
-    ensure_admin(&state, &user).await?;
-    let (resource_type, resource_type_value, resource_id) =
-        resolve_resource_context(&state, resource_type.as_str(), &resource_id).await?;
-
-    let deleted_count = state
-        .monorepo()
-        .delete_resource_permissions(resource_type, &resource_id)
-        .await?;
-
-    Ok(Json(CommonResult::success(Some(
-        DeletePermissionsResponse {
-            resource_type: resource_type_value,
-            resource_id,
-            deleted_count,
-        },
-    ))))
-}
-
-#[utoipa::path(
     get,
     path = "/users/{username}/groups",
     params(
@@ -570,46 +395,6 @@ async fn get_user_groups(
         username,
         groups,
     }))))
-}
-
-#[utoipa::path(
-    get,
-    path = "/users/{username}/permissions/{resource_type}/{resource_id}",
-    params(
-        ("username" = String, Path, description = "Username"),
-        ("resource_type" = String, Path, description = "Resource type, currently only `note`"),
-        ("resource_id" = String, Path, description = "Resource ID")
-    ),
-    responses(
-        (status = 200, body = CommonResult<UserEffectivePermissionResponse>),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin only"),
-        (status = 404, description = "Resource not found"),
-    ),
-    tag = GROUP_PERMISSION_TAG
-)]
-async fn get_user_effective_permission(
-    user: LoginUser,
-    State(state): State<MonoApiServiceState>,
-    Path((username, resource_type, resource_id)): Path<(String, String, String)>,
-) -> Result<Json<CommonResult<UserEffectivePermissionResponse>>, ApiError> {
-    ensure_admin(&state, &user).await?;
-    let (resource_type, resource_type_value, resource_id) =
-        resolve_resource_context(&state, resource_type.as_str(), &resource_id).await?;
-
-    let effective = state
-        .monorepo()
-        .get_user_effective_permission(&username, resource_type, &resource_id)
-        .await?;
-    let response = build_user_effective_permission_response(
-        username,
-        resource_type_value,
-        resource_id,
-        effective,
-    );
-
-    Ok(Json(CommonResult::success(Some(response))))
 }
 
 fn validate_pagination(pagination: &Pagination) -> Result<(), ApiError> {

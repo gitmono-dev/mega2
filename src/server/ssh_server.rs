@@ -61,7 +61,8 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
         storage: ctx.storage.clone(),
         git_object_cache: Arc::new(GitObjectCache {
             connection: ctx.connection.clone(),
-            prefix: "git-object-rkyv:v1".to_string(),
+            prefix: std::env::var("MEGA_GIT_OBJECT_CACHE_PREFIX")
+                .unwrap_or_else(|_| "git-object-rkyv:v1".to_string()),
         }),
         entity_store: EntityStore::new(),
     };

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{ObjectStorageConfig, mega_base, mega_cache, secret};
-use crate::common::errors::MegaError;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -28,10 +27,6 @@ pub struct Config {
     /// (`docs/artifacts-protocol.md` §10.6).
     #[serde(default)]
     pub artifacts_gc: ArtifactGcConfig,
-    /// Mail / SMTP configuration for system notifications (email outbox via email_jobs).
-    /// This is the first planned consumer for SecretRef (password) after vault is ready.
-    #[serde(default)]
-    pub mail: Option<MailConfig>,
     /// Global notification subsystem settings (kill switch, defaults). Per-user
     /// preferences still live in the DB; this is the global layer
     /// (docs/notification.md phase 5).
@@ -45,9 +40,6 @@ pub struct Config {
     /// OAuth / browser-facing HTTP settings (currently the CORS allow-list).
     #[serde(default)]
     pub oauth: Option<OAuthConfig>,
-    /// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
-    #[serde(default)]
-    pub chat: Option<ChatConfig>,
     /// Git protocol settings (docs/refactoring/protocol.md Stage 4).
     #[serde(default)]
     pub git: GitConfig,
@@ -172,183 +164,41 @@ impl Default for ArtifactGcConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum MailProvider {
-    #[default]
-    Smtp,
-    Console,
-    Http,
-}
-
-pub const DEFAULT_MAIL_DISPATCHER_BATCH_SIZE: u64 = 50;
-pub const DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT: usize = 8;
-pub const DEFAULT_MAIL_RETRY_MAX_ATTEMPTS: i32 = 5;
-pub const DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS: i64 = 30;
-pub const DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS: i64 = 300;
-pub const DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS: u64 = 3600;
-pub const DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS: u32 = 30;
-pub const DEFAULT_MAIL_TEMPLATE_LOCALE: &str = "en-US";
-
-/// Mail configuration. Lives here so it participates in the main Config loading
-/// / env overlay / placeholder / (future) SecretRef pipeline.
-/// See docs/mail.md for the full mail module design and SecretRef migration plan.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct MailConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub provider: MailProvider,
-    #[serde(default)]
-    pub smtp_host: String,
-    #[serde(default = "default_smtp_port")]
-    pub smtp_port: u16,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<secret::SecretString>,
-    #[serde(default)]
-    pub password_ref: Option<secret::SecretRef>,
-    #[serde(default)]
-    pub from: String,
-    #[serde(default = "default_starttls")]
-    pub starttls: bool,
-    #[serde(default = "default_mail_dispatcher_batch_size")]
-    pub dispatcher_batch_size: u64,
-    #[serde(default = "default_mail_dispatcher_max_in_flight")]
-    pub dispatcher_max_in_flight: usize,
-    #[serde(default = "default_mail_retry_max_attempts")]
-    pub retry_max_attempts: i32,
-    #[serde(default = "default_mail_retry_backoff_base_secs")]
-    pub retry_backoff_base_secs: i64,
-    #[serde(default = "default_mail_retry_backoff_max_secs")]
-    pub retry_backoff_max_secs: i64,
-    #[serde(default)]
-    pub attachment_prune_enabled: bool,
-    #[serde(default = "default_mail_attachment_prune_interval_secs")]
-    pub attachment_prune_interval_secs: u64,
-    #[serde(default = "default_mail_attachment_retention_days")]
-    pub attachment_retention_days: u32,
-    #[serde(default = "default_mail_attachment_prune_statuses")]
-    pub attachment_prune_statuses: Vec<String>,
-    #[serde(default = "default_mail_template_locale")]
-    pub template_default_locale: String,
-    #[serde(default)]
-    pub template_dir: Option<PathBuf>,
-    /// URL for the `Http` mail provider. The provider POSTs a JSON payload to
-    /// this endpoint. Required when `provider = "http"`.
-    #[serde(default)]
-    pub http_url: Option<String>,
-    /// Extra headers to send with HTTP provider requests (e.g. `Authorization`).
-    #[serde(default)]
-    pub http_headers: std::collections::HashMap<String, String>,
-    /// Request timeout for the HTTP provider.
-    #[serde(default = "default_http_timeout_secs")]
-    pub http_timeout_secs: u64,
-    // Extra fields present in some sample tomls are ignored by serde (unknown fields dropped).
-}
-
-fn default_http_timeout_secs() -> u64 {
-    30
-}
-
-fn default_smtp_port() -> u16 {
-    587
-}
-fn default_starttls() -> bool {
-    true
-}
-fn default_mail_dispatcher_batch_size() -> u64 {
-    DEFAULT_MAIL_DISPATCHER_BATCH_SIZE
-}
-fn default_mail_dispatcher_max_in_flight() -> usize {
-    DEFAULT_MAIL_DISPATCHER_MAX_IN_FLIGHT
-}
-fn default_mail_retry_max_attempts() -> i32 {
-    DEFAULT_MAIL_RETRY_MAX_ATTEMPTS
-}
-fn default_mail_retry_backoff_base_secs() -> i64 {
-    DEFAULT_MAIL_RETRY_BACKOFF_BASE_SECS
-}
-fn default_mail_retry_backoff_max_secs() -> i64 {
-    DEFAULT_MAIL_RETRY_BACKOFF_MAX_SECS
-}
-fn default_mail_attachment_prune_interval_secs() -> u64 {
-    DEFAULT_MAIL_ATTACHMENT_PRUNE_INTERVAL_SECS
-}
-fn default_mail_attachment_retention_days() -> u32 {
-    DEFAULT_MAIL_ATTACHMENT_RETENTION_DAYS
-}
-fn default_mail_attachment_prune_statuses() -> Vec<String> {
-    vec!["sent".to_string(), "skipped".to_string()]
-}
-fn default_mail_template_locale() -> String {
-    DEFAULT_MAIL_TEMPLATE_LOCALE.to_string()
-}
-
-impl Default for MailConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider: MailProvider::default(),
-            smtp_host: String::new(),
-            smtp_port: default_smtp_port(),
-            username: None,
-            password: None,
-            password_ref: None,
-            from: String::new(),
-            starttls: default_starttls(),
-            dispatcher_batch_size: default_mail_dispatcher_batch_size(),
-            dispatcher_max_in_flight: default_mail_dispatcher_max_in_flight(),
-            retry_max_attempts: default_mail_retry_max_attempts(),
-            retry_backoff_base_secs: default_mail_retry_backoff_base_secs(),
-            retry_backoff_max_secs: default_mail_retry_backoff_max_secs(),
-            attachment_prune_enabled: false,
-            attachment_prune_interval_secs: default_mail_attachment_prune_interval_secs(),
-            attachment_retention_days: default_mail_attachment_retention_days(),
-            attachment_prune_statuses: default_mail_attachment_prune_statuses(),
-            template_default_locale: default_mail_template_locale(),
-            template_dir: None,
-            http_url: None,
-            http_headers: std::collections::HashMap::new(),
-            http_timeout_secs: default_http_timeout_secs(),
-        }
-    }
-}
-
-impl MailConfig {
-    pub fn validate_secret_fields(&self) -> Result<(), MegaError> {
-        if self.password.is_some() && self.password_ref.is_some() {
-            return Err(MegaError::Other(
-                "mail.password and mail.password_ref are mutually exclusive".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-pub const DEFAULT_NOTIFICATION_DELIVERY_MODE: &str = "email";
-pub const NOTIFICATION_DELIVERY_MODES: &[&str] = &["email"];
+pub const DEFAULT_NOTIFICATION_DELIVERY_MODE: &str = "in_app";
+/// `email` remains an accepted preference while MN-05 wires website delivery;
+/// both modes write an in-app notification.
+pub const NOTIFICATION_DELIVERY_MODES: &[&str] = &["in_app", "email"];
 
 /// Global notification subsystem configuration.
 ///
 /// This is the global layer above per-user DB preferences (docs/notification.md
 /// phase 5): a global kill switch plus defaults applied when a user has no
-/// explicit setting. `enabled` is hot-reloadable (gates the dispatcher); the
-/// defaults are read at consumption time.
+/// explicit setting. The defaults are read at consumption time.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NotificationConfig {
-    /// Global kill switch. When false the dispatcher is gated off regardless of
-    /// `mail.enabled`. Hot-reloadable.
+    /// Global kill switch. When false notification delivery is gated off
+    /// regardless of per-user prefs. Hot-reloadable (read live from config
+    /// snapshot by the active notification service).
     #[serde(default = "default_notification_enabled")]
     pub enabled: bool,
     /// Default delivery mode for users without an explicit setting.
     #[serde(default = "default_notification_delivery_mode")]
     pub default_delivery_mode: String,
     /// Default locale for rendered notifications when a user has none.
-    #[serde(default = "default_mail_template_locale")]
+    #[serde(default = "default_notification_locale")]
     pub default_locale: String,
+    /// Base URL for the website internal product-email API. Empty disables the
+    /// optional client; when set, exactly one bearer source is required.
+    #[serde(default)]
+    pub website_mail_base_url: String,
+    /// IT-only literal bearer for the website internal email API. Production
+    /// deployments must use `website_mail_bearer_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_mail_bearer: Option<secret::SecretString>,
+    /// Production bearer source for the website internal email API. Namespace:
+    /// `vault://secret/config/<profile>/notification/website_mail/bearer#<field>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_mail_bearer_ref: Option<secret::SecretRef>,
     /// Optional Slack incoming-webhook channel (docs/notification.md phase 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackConfig>,
@@ -394,13 +244,19 @@ fn default_notification_enabled() -> bool {
 fn default_notification_delivery_mode() -> String {
     DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string()
 }
+fn default_notification_locale() -> String {
+    "en-US".to_string()
+}
 
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: default_notification_enabled(),
             default_delivery_mode: default_notification_delivery_mode(),
-            default_locale: default_mail_template_locale(),
+            default_locale: default_notification_locale(),
+            website_mail_base_url: String::new(),
+            website_mail_bearer: None,
+            website_mail_bearer_ref: None,
             slack: None,
             webhook: None,
         }
@@ -417,58 +273,39 @@ pub struct VaultConfig {
 
 /// OAuth / browser-facing HTTP settings.
 ///
-/// Currently the strongly-typed home for the HTTP CORS allow-list consumed by
-/// the API server's `CorsLayer`. `allowed_cors_origins` accepts the `MEGA_*`
-/// list-env override (`source.rs` registers `oauth.allowed_cors_origins` as a
-/// list-parse key); when empty the server falls back to its built-in default
-/// origins.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+/// Strongly-typed home for website Better Auth integration and the HTTP CORS
+/// allow-list consumed by the API server's `CorsLayer`. See
+/// `docs/refactoring/website-auth.md`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct OAuthConfig {
     /// Browser origins allowed by CORS (e.g. `https://app.example.com`). Each
     /// entry must be a valid HTTP header value; an empty list keeps the server's
-    /// built-in defaults.
+    /// built-in defaults. Overridable via `MEGA_OAUTH__ALLOWED_CORS_ORIGINS`
+    /// (comma-separated list).
     #[serde(default)]
     pub allowed_cors_origins: Vec<String>,
-}
-
-/// Chat subsystem settings (docs/refactoring/chat.md Slice 5).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ChatConfig {
-    /// Optional product-level MIME allowlist for chat attachments. When empty or
-    /// absent, all syntactically valid MIME types are accepted (backwards
-    /// compatible). Entries may be exact types (`image/png`) or wildcards
-    /// (`image/*`); invalid patterns are rejected by `Config::validate`.
+    /// Base URL of the website Better Auth API (scheme + host[:port], no path).
+    /// Required for `service http`; validated fail-closed by `config validate`.
     #[serde(default)]
-    pub attachment_allowed_mime_types: Vec<String>,
-    /// Whether to fetch and cache Open Graph link previews for URLs seen in
-    /// messages. Defaults to true.
-    #[serde(default = "default_open_graph_fetch_enabled")]
-    pub open_graph_fetch_enabled: bool,
-    /// Network timeout in milliseconds for a single Open Graph fetch attempt.
-    /// Defaults to 5000 ms.
-    #[serde(default = "default_open_graph_fetch_timeout_ms")]
-    pub open_graph_fetch_timeout_ms: u64,
-    /// Allow Open Graph fetches against localhost/private IPs. Intended for
-    /// tests and isolated development; defaults to false in production.
-    #[serde(default)]
-    pub open_graph_allow_private_networks: bool,
+    pub website_api_base_url: String,
+    /// Session cookie names tried in order when introspecting browser sessions.
+    #[serde(default = "default_session_cookie_names")]
+    pub session_cookie_names: Vec<String>,
 }
 
-fn default_open_graph_fetch_enabled() -> bool {
-    true
+fn default_session_cookie_names() -> Vec<String> {
+    vec![
+        "better-auth.session_token".to_string(),
+        "__Secure-better-auth.session_token".to_string(),
+    ]
 }
 
-fn default_open_graph_fetch_timeout_ms() -> u64 {
-    5000
-}
-
-impl Default for ChatConfig {
+impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
-            attachment_allowed_mime_types: Vec::new(),
-            open_graph_fetch_enabled: default_open_graph_fetch_enabled(),
-            open_graph_fetch_timeout_ms: default_open_graph_fetch_timeout_ms(),
-            open_graph_allow_private_networks: false,
+            allowed_cors_origins: Vec::new(),
+            website_api_base_url: String::new(),
+            session_cookie_names: default_session_cookie_names(),
         }
     }
 }
@@ -1041,11 +878,67 @@ impl Default for SidebarConfig {
                     order_index: 1,
                 },
                 SidebarItem {
-                    public_id: "docs".to_string(),
-                    label: "Docs".to_string(),
-                    href: "/notes".to_string(),
-                    visible: true,
+                    public_id: "calls".to_string(),
+                    label: "Calls".to_string(),
+                    href: "/calls".to_string(),
+                    visible: false,
                     order_index: 2,
+                },
+                SidebarItem {
+                    public_id: "drafts".to_string(),
+                    label: "Drafts".to_string(),
+                    href: "/drafts".to_string(),
+                    visible: true,
+                    order_index: 3,
+                },
+                SidebarItem {
+                    public_id: "code".to_string(),
+                    label: "Code".to_string(),
+                    href: "/code".to_string(),
+                    visible: true,
+                    order_index: 4,
+                },
+                SidebarItem {
+                    public_id: "tags".to_string(),
+                    label: "Tags".to_string(),
+                    href: "/code/tags".to_string(),
+                    visible: true,
+                    order_index: 5,
+                },
+                SidebarItem {
+                    public_id: "cl".to_string(),
+                    label: "Change List".to_string(),
+                    href: "/cl".to_string(),
+                    visible: true,
+                    order_index: 6,
+                },
+                SidebarItem {
+                    public_id: "mq".to_string(),
+                    label: "Merge Queue".to_string(),
+                    href: "/queue/main".to_string(),
+                    visible: true,
+                    order_index: 7,
+                },
+                SidebarItem {
+                    public_id: "issue".to_string(),
+                    label: "Issue".to_string(),
+                    href: "/issue".to_string(),
+                    visible: true,
+                    order_index: 8,
+                },
+                SidebarItem {
+                    public_id: "rust".to_string(),
+                    label: "Rust".to_string(),
+                    href: "/rust".to_string(),
+                    visible: false,
+                    order_index: 9,
+                },
+                SidebarItem {
+                    public_id: "oc".to_string(),
+                    label: "Orion Client".to_string(),
+                    href: "/oc".to_string(),
+                    visible: true,
+                    order_index: 10,
                 },
             ],
         }
@@ -1079,5 +972,50 @@ impl Default for GitConfig {
         Self {
             anonymous_access: default_git_anonymous_access(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, SidebarConfig, SidebarItem};
+
+    fn sidebar_items(items: &[SidebarItem]) -> Vec<(&str, &str, &str, bool, i32)> {
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.public_id.as_str(),
+                    item.label.as_str(),
+                    item.href.as_str(),
+                    item.visible,
+                    item.order_index,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sample_sidebar_defaults_match_model_defaults_without_chat_or_notes() {
+        let sample: Config = toml::from_str(include_str!("../../config/config.toml"))
+            .expect("sample configuration must deserialize");
+        let expected = vec![
+            ("home", "Home", "/posts", true, 0),
+            ("inbox", "Inbox", "/inbox", true, 1),
+            ("calls", "Calls", "/calls", false, 2),
+            ("drafts", "Drafts", "/drafts", true, 3),
+            ("code", "Code", "/code", true, 4),
+            ("tags", "Tags", "/code/tags", true, 5),
+            ("cl", "Change List", "/cl", true, 6),
+            ("mq", "Merge Queue", "/queue/main", true, 7),
+            ("issue", "Issue", "/issue", true, 8),
+            ("rust", "Rust", "/rust", false, 9),
+            ("oc", "Orion Client", "/oc", true, 10),
+        ];
+
+        assert_eq!(
+            sidebar_items(&SidebarConfig::default().default_items),
+            expected
+        );
+        assert_eq!(sidebar_items(&sample.sidebar.default_items), expected);
     }
 }

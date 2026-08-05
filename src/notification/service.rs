@@ -1,129 +1,84 @@
-//! Notification delivery coordinator.
-//!
-//! docs/notification.md phase 1: [`NotificationService`] owns the registered
-//! [`NotificationChannel`]s and starts the outbox-driven [`EmailDispatcher`] for
-//! the email channel. Additional channels (console / in-app / slack) are
-//! registered here so future per-channel outboxes can be coordinated from one
-//! place without touching the request path. Construction happens post-Vault in
-//! `AppContext::new`, after the mailer (and any resolved `mail.password_ref`) is
-//! ready.
+//! Notification channel registration and delivery fan-out.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     common::errors::MegaError,
-    config::{
-        Config, MailConfig,
-        redaction::global_redactor,
-        reload::{ConfigReloadReport, ConfigReloadSubscriber},
-        secret::{SecretResolver, VaultSecretResolver},
-    },
-    contract::vault::integration::vault_core::VaultCore,
+    config::{DEFAULT_NOTIFICATION_DELIVERY_MODE, reload::ConfigHandle},
     jupiter::storage::notification_storage::NotificationStorage,
-    mail::{Mailer, mailer_from_config},
     notification::{
         channels::{
-            ConsoleChannel, EmailChannel, InAppChannel, MailerHandle, MailerSlot,
-            NotificationChannel,
+            CHANNEL_IN_APP, ConsoleChannel, InAppChannel, NotificationChannel, OutboundMessage,
         },
-        dispatcher::{EmailDispatcher, EmailDispatcherControl},
+        website_mail::WebsiteMailClient,
     },
 };
 
-/// Coordinates user-notification delivery across one or more channels.
+static ACTIVE: RwLock<Option<Arc<NotificationService>>> = RwLock::new(None);
+
+/// Holds channels available to notification delivery and the global gate.
+///
+/// Event triggers call [`deliver_user_notification`], which fans out to the
+/// registered in-app channel plus any optional Slack/webhook channels without
+/// requiring a mailer or local outbox dispatcher.
 pub struct NotificationService {
-    stg: NotificationStorage,
-    /// Registered channels in routing-preference order; the email channel is
-    /// always first and also drives the `email_jobs` outbox dispatcher.
     channels: Vec<Arc<dyn NotificationChannel>>,
-    email_channel: Arc<EmailChannel>,
-    control: EmailDispatcherControl,
+    website_mail: Option<Arc<WebsiteMailClient>>,
+    /// When present, `enabled` / `default_delivery_mode` are read live from the
+    /// config snapshot (hot-reload safe).
+    config_handle: Option<ConfigHandle>,
+    enabled_fallback: AtomicBool,
+    default_delivery_mode_fallback: RwLock<String>,
 }
 
 impl NotificationService {
-    /// Build a service whose email channel wraps `mailer`, plus any extra
-    /// channels. Dispatcher batch / concurrency / retry / prune behaviour comes
-    /// from `control`.
     pub fn new(
         stg: NotificationStorage,
-        mailer: Arc<dyn Mailer>,
-        control: EmailDispatcherControl,
         extra_channels: Vec<Arc<dyn NotificationChannel>>,
+        website_mail: Option<Arc<WebsiteMailClient>>,
+        config_handle: Option<ConfigHandle>,
+        enabled: bool,
+        default_delivery_mode: String,
     ) -> Self {
-        let email_channel = Arc::new(EmailChannel::new(mailer));
-        let mut channels = Vec::with_capacity(extra_channels.len() + 1);
-        channels.push(Arc::clone(&email_channel) as Arc<dyn NotificationChannel>);
+        let mut channels: Vec<Arc<dyn NotificationChannel>> =
+            Vec::with_capacity(extra_channels.len() + 1);
+        channels.push(Arc::new(InAppChannel::new(stg)));
         channels.extend(extra_channels);
         Self {
-            stg,
             channels,
-            email_channel,
-            control,
+            website_mail,
+            config_handle,
+            enabled_fallback: AtomicBool::new(enabled),
+            default_delivery_mode_fallback: RwLock::new(default_delivery_mode),
         }
     }
 
-    /// Convenience constructor from [`MailConfig`].
-    ///
-    /// Registers the email channel (which drives the `email_jobs` outbox) plus a
-    /// secondary [`InAppChannel`] (inbox persistence). The dispatcher fans each
-    /// delivered notification out to the in-app channel best-effort after the
-    /// email send succeeds (docs/notification.md phase 1/4).
-    pub fn from_mail_config(
-        stg: NotificationStorage,
-        mailer: Arc<dyn Mailer>,
-        mail: &MailConfig,
-    ) -> Self {
-        Self::from_mail_config_with_extra_channels(stg, mailer, mail, Vec::new())
+    pub fn set_active(service: Option<Arc<Self>>) {
+        match ACTIVE.write() {
+            Ok(mut guard) => *guard = service,
+            Err(poisoned) => {
+                *poisoned.into_inner() = service;
+            }
+        }
     }
 
-    /// Like [`from_mail_config`](Self::from_mail_config) but also registers
-    /// caller-supplied secondary channels (e.g. Slack / webhook built post-vault
-    /// with resolved `SecretRef` credentials, docs/notification.md phase 3). The
-    /// in-app inbox channel is always registered first among the secondaries, so
-    /// the final routing order is `email, in_app, <extra...>`.
-    pub fn from_mail_config_with_extra_channels(
-        stg: NotificationStorage,
-        mailer: Arc<dyn Mailer>,
-        mail: &MailConfig,
-        extra_channels: Vec<Arc<dyn NotificationChannel>>,
-    ) -> Self {
-        let inbox: Arc<dyn NotificationChannel> = Arc::new(InAppChannel::new(stg.clone()));
-        let mut channels = Vec::with_capacity(extra_channels.len() + 1);
-        channels.push(inbox);
-        channels.extend(extra_channels);
-        Self::new(
-            stg,
-            mailer,
-            EmailDispatcherControl::from_mail_config(mail),
-            channels,
-        )
+    pub fn active() -> Option<Arc<Self>> {
+        match ACTIVE.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
-    /// The dispatcher control handle, used to register a config-reload
-    /// subscriber so `mail.*` runtime changes take effect without restart.
-    pub fn control(&self) -> EmailDispatcherControl {
-        self.control.clone()
-    }
-
-    /// A clonable handle to the email channel's hot-swappable mailer, used to
-    /// register the mailer-rebuild reload subscriber
-    /// ([`config_reload_mailer_subscriber`]).
-    pub fn email_mailer_handle(&self) -> MailerHandle {
-        self.email_channel.mailer_handle()
-    }
-
-    /// Registered channels, in routing-preference order (email first).
     pub fn channels(&self) -> &[Arc<dyn NotificationChannel>] {
         &self.channels
     }
 
-    /// Resolve a registered channel by its stable name.
-    ///
-    /// The `email_jobs` outbox is email-only today; additional outbox channel
-    /// selectors plug in here as they are introduced.
     pub fn channel_for(&self, channel_name: &str) -> Option<Arc<dyn NotificationChannel>> {
         self.channels
             .iter()
@@ -131,187 +86,223 @@ impl NotificationService {
             .map(Arc::clone)
     }
 
-    /// Create a [`ConsoleChannel`] as an extra channel for dev/CI dry-run
-    /// delivery. The channel logs a redacted summary without actually sending.
     pub fn console_channel() -> Arc<dyn NotificationChannel> {
         Arc::new(ConsoleChannel::new())
     }
 
-    /// Start the background delivery loop(s). Consumes `self`; runs until
-    /// `shutdown` is cancelled. The email channel is the primary (retried)
-    /// channel; the remaining registered channels are secondary fan-out targets.
-    pub async fn start(self, shutdown: CancellationToken) {
-        let secondaries: Vec<Arc<dyn NotificationChannel>> =
-            self.channels.iter().skip(1).cloned().collect();
-        let primary: Arc<dyn NotificationChannel> = self.email_channel;
-        let dispatcher =
-            EmailDispatcher::new_with_channels(self.stg, primary, secondaries, self.control);
-        dispatcher.run(shutdown).await;
+    pub fn is_enabled(&self) -> bool {
+        if let Some(handle) = &self.config_handle
+            && let Ok(config) = handle.snapshot()
+        {
+            return config
+                .notification
+                .as_ref()
+                .map(|cfg| cfg.enabled)
+                .unwrap_or(true);
+        }
+        self.enabled_fallback.load(Ordering::Relaxed)
+    }
+
+    pub fn default_delivery_mode(&self) -> String {
+        if let Some(handle) = &self.config_handle
+            && let Ok(config) = handle.snapshot()
+        {
+            return config
+                .notification
+                .as_ref()
+                .map(|cfg| cfg.default_delivery_mode.clone())
+                .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string());
+        }
+        match self.default_delivery_mode_fallback.read() {
+            Ok(mode) => mode.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn default_locale(&self) -> String {
+        if let Some(handle) = &self.config_handle
+            && let Ok(config) = handle.snapshot()
+        {
+            return config
+                .notification
+                .as_ref()
+                .map(|cfg| cfg.default_locale.clone())
+                .unwrap_or_else(|| "en-US".to_string());
+        }
+        "en-US".to_string()
+    }
+
+    /// Keep notification-service lifetime tied to application shutdown.
+    pub async fn start(self: Arc<Self>, shutdown: CancellationToken) {
+        shutdown.cancelled().await;
+        Self::set_active(None);
     }
 }
 
-/// Mail fields whose change requires rebuilding the SMTP mailer at runtime.
-const MAILER_REBUILD_FIELDS: &[&str] = &[
-    "mail.enabled",
-    "mail.provider",
-    "mail.smtp_host",
-    "mail.smtp_port",
-    "mail.username",
-    "mail.password",
-    "mail.password_ref",
-    "mail.from",
-    "mail.starttls",
-    "mail.http_url",
-    "mail.http_headers",
-    "mail.http_timeout_secs",
-];
+/// Default delivery mode for new user settings rows (config-backed when active).
+pub fn current_default_delivery_mode() -> String {
+    NotificationService::active()
+        .map(|service| service.default_delivery_mode())
+        .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string())
+}
 
-/// Config-reload subscriber that hot-rebuilds the SMTP mailer when connection /
-/// credential fields change (docs/mail.md phase 4 dynamic mailer rebuild).
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Deliver a product notification: honor the global kill switch, user prefs,
+/// then fan out to registered channels (in-app primary; Slack/webhook extras).
 ///
-/// Rebuilding must re-resolve `mail.password_ref` through the (async) vault
-/// resolver, but the reload pipeline is synchronous. The subscriber therefore
-/// spawns the rebuild onto the current Tokio runtime (the config watcher runs in
-/// an async task) and returns immediately; the new mailer is swapped into the
-/// shared [`MailerHandle`] when it is ready. On rebuild failure the previous
-/// mailer is kept (fail-safe). If no runtime is available, the change is logged
-/// as restart-required.
-pub fn config_reload_mailer_subscriber(
-    mailer_handle: MailerHandle,
-    vault: VaultCore,
-) -> ConfigReloadSubscriber {
-    ConfigReloadSubscriber::new(
-        "mail_mailer_rebuild",
-        move |config, report| apply_mailer_rebuild(&mailer_handle, &vault, config, report),
-        // The async rebuild keeps the previous mailer on failure, so there is no
-        // synchronous rollback work to do.
-        |_config, _report| Ok(()),
-    )
-}
-
-fn apply_mailer_rebuild(
-    mailer_handle: &MailerHandle,
-    vault: &VaultCore,
-    config: &Config,
-    report: &ConfigReloadReport,
+/// When `delivery_mode=email` and a website mail client is configured, also
+/// POST the event-specific `website_payload` to the website API (best-effort).
+pub async fn deliver_user_notification(
+    stg: &NotificationStorage,
+    username: &str,
+    event_type: &str,
+    subject: &str,
+    body_text: &str,
+    website_payload: serde_json::Value,
 ) -> Result<(), MegaError> {
-    let reconfigured = report
-        .applied_fields
-        .iter()
-        .any(|field| MAILER_REBUILD_FIELDS.contains(field));
-    if !reconfigured {
-        return Ok(());
-    }
-    let Some(mail) = config.mail.clone() else {
-        return Ok(());
-    };
-    if !mail.enabled {
-        // A disabled mail section uses the NoopMailer installed at startup. Do
-        // not rebuild (and possibly fail) while mail is off.
-        return Ok(());
-    }
-
-    let handle = Arc::clone(mailer_handle);
-    let vault = vault.clone();
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) => {
-            runtime.spawn(rebuild_and_swap_mailer(handle, vault, mail));
-        }
-        Err(_) => {
-            warn!(
-                "mail connection/credentials reconfigured but no async runtime is available to rebuild the mailer; a restart is required"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Rebuild the SMTP mailer and hot-swap it into `handle`, keeping the previously
-/// installed mailer on failure (fail-safe). Extracted from the task spawned by
-/// [`apply_mailer_rebuild`] so the success/failure outcomes are directly
-/// awaitable in tests instead of only being observable through a detached task.
-async fn rebuild_and_swap_mailer(handle: MailerHandle, vault: VaultCore, mail: MailConfig) {
-    match rebuild_mailer(&vault, &mail).await {
-        Ok(mailer) => {
-            handle.store(Arc::new(MailerSlot(mailer)));
-            info!("mail mailer hot-rebuilt after config reload");
-        }
-        Err(e) => {
-            warn!(
-                error = %global_redactor().redact(&e.to_string()),
-                "mail mailer rebuild failed; keeping the previous mailer"
-            );
-        }
-    }
-}
-
-async fn rebuild_mailer(
-    vault: &VaultCore,
-    mail: &MailConfig,
-) -> Result<Arc<dyn Mailer>, MegaError> {
-    let resolved_password = if mail.provider == crate::config::MailProvider::Smtp
-        && let Some(secret_ref) = &mail.password_ref
+    if let Some(service) = NotificationService::active()
+        && !service.is_enabled()
     {
-        let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-        Some(
-            crate::contract::vault::integration::vault_core::with_audit_caller(
-                "reload:mail-password",
-                resolver.resolve(secret_ref),
-            )
-            .await?,
-        )
-    } else {
-        None
+        return Ok(());
+    }
+
+    if !stg.should_send(username, event_type).await? {
+        return Ok(());
+    }
+
+    let Some(settings) = stg.get_user_settings(username).await? else {
+        return Ok(());
     };
-    mailer_from_config(mail, resolved_password)
+
+    let delivery_mode = if settings.delivery_mode.is_empty() {
+        current_default_delivery_mode()
+    } else {
+        settings.delivery_mode.clone()
+    };
+
+    let body_html = format!("<p>{}</p>", escape_html(body_text));
+    let message = OutboundMessage {
+        username,
+        event_type_code: event_type,
+        to: &settings.email,
+        subject,
+        body_html: &body_html,
+        body_text: Some(body_text),
+    };
+
+    if let Some(service) = NotificationService::active() {
+        for channel in service.channels() {
+            match channel.deliver(&message).await {
+                Ok(()) => {}
+                Err(error) if channel.name() == CHANNEL_IN_APP => return Err(error),
+                Err(error) => {
+                    warn!(
+                        channel = channel.name(),
+                        error = %error,
+                        "notification channel delivery failed"
+                    );
+                }
+            }
+        }
+        if delivery_mode == "email"
+            && let Some(client) = &service.website_mail
+        {
+            let locale = settings
+                .preferred_locale
+                .as_deref()
+                .map(str::trim)
+                .filter(|locale| !locale.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| service.default_locale());
+            if let Err(error) = client
+                .send(
+                    event_type,
+                    username,
+                    &settings.email,
+                    &locale,
+                    &website_payload,
+                )
+                .await
+            {
+                warn!(
+                    event_type,
+                    error = %error,
+                    "website mail delivery failed; notification remains available in-app"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Unit tests / callers without an activated service still write in-app.
+    stg.create_inbox_notification(username, event_type, subject, &body_html, Some(body_text))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
-    use sea_orm::EntityTrait;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+    use serde_json::Value;
     use tempfile::TempDir;
-    use tokio::time::Instant;
-    use tokio_util::sync::CancellationToken;
+    use tokio::sync::Mutex;
 
     use super::*;
     use crate::{
-        callisto::email_jobs,
         jupiter::{migration::apply_migrations, tests::test_db_connection},
-        mail::NoopMailer,
-        notification::channels::ConsoleChannel,
+        notification::{
+            channels::{SlackChannel, WebhookChannel},
+            testing::MockChannel,
+        },
     };
 
+    fn test_service(
+        stg: NotificationStorage,
+        extra: Vec<Arc<dyn NotificationChannel>>,
+        enabled: bool,
+    ) -> Arc<NotificationService> {
+        Arc::new(NotificationService::new(
+            stg,
+            extra,
+            None,
+            None,
+            enabled,
+            DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
+        ))
+    }
+
     #[tokio::test]
-    async fn service_registers_email_and_extra_channels() {
+    async fn service_starts_without_mail_and_registers_in_app() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db));
-        let inbox: Arc<dyn NotificationChannel> = Arc::new(InAppChannel::new(stg.clone()));
-        let console: Arc<dyn NotificationChannel> = Arc::new(ConsoleChannel::new());
-        let service = NotificationService::new(
-            stg,
-            Arc::new(NoopMailer),
-            EmailDispatcherControl::new(true),
-            vec![inbox, console],
-        );
+        let service = test_service(stg, Vec::new(), true);
 
-        assert_eq!(service.channels().len(), 3);
-        assert_eq!(service.channels()[0].name(), "email");
-        assert!(service.channel_for("email").is_some());
+        assert_eq!(service.channels().len(), 1);
+        assert_eq!(service.channels()[0].name(), "in_app");
         assert!(service.channel_for("in_app").is_some());
-        assert!(service.channel_for("console").is_some());
-        assert!(service.channel_for("slack").is_none());
+        assert!(service.channel_for("email").is_none());
     }
 
     #[tokio::test]
-    async fn from_mail_config_with_extra_channels_registers_slack_and_webhook() {
-        use crate::notification::channels::{SlackChannel, WebhookChannel};
-
+    async fn service_registers_configured_extra_channels_without_mail() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
@@ -325,319 +316,208 @@ mod tests {
         );
         let webhook: Arc<dyn NotificationChannel> =
             Arc::new(WebhookChannel::new("http://127.0.0.1:1/hook".to_string(), None).unwrap());
-        let service = NotificationService::from_mail_config_with_extra_channels(
-            stg,
-            Arc::new(NoopMailer),
-            &crate::config::MailConfig::default(),
-            vec![slack, webhook],
-        );
+        let service = test_service(stg, vec![slack, webhook], true);
 
-        // Order: email, in_app, then the extras.
-        assert_eq!(service.channels().len(), 4);
-        assert_eq!(service.channels()[0].name(), "email");
-        assert_eq!(service.channels()[1].name(), "in_app");
+        assert_eq!(service.channels().len(), 3);
+        assert_eq!(service.channels()[0].name(), "in_app");
         assert!(service.channel_for("slack").is_some());
         assert!(service.channel_for("webhook").is_some());
     }
 
     #[tokio::test]
-    async fn from_mail_config_registers_in_app_secondary_channel() {
+    async fn deliver_fans_out_to_extra_channels_when_service_active() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
-
         let stg = NotificationStorage::new(Arc::new(db));
-        let service = NotificationService::from_mail_config(
-            stg,
-            Arc::new(NoopMailer),
-            &crate::config::MailConfig::default(),
-        );
+        stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
+            .await
+            .unwrap();
+        stg.upsert_user_settings("alice", "alice@example.test")
+            .await
+            .unwrap();
 
-        assert_eq!(service.channels().len(), 2);
-        assert!(service.channel_for("email").is_some());
-        assert!(service.channel_for("in_app").is_some());
+        let mock = Arc::new(MockChannel::new("slack", true));
+        let service = test_service(
+            stg.clone(),
+            vec![mock.clone() as Arc<dyn NotificationChannel>],
+            true,
+        );
+        NotificationService::set_active(Some(Arc::clone(&service)));
+
+        deliver_user_notification(
+            &stg,
+            "alice",
+            "cl.comment.created",
+            "subject",
+            "hello <world>",
+            serde_json::json!({
+                "cl_link": "CL1",
+                "actor_username": "bob",
+                "comment_excerpt": "hello <world>",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let sent = mock.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].username, "alice");
+        assert_eq!(sent[0].subject, "subject");
+        NotificationService::set_active(None);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn mailer_rebuild_subscriber_swaps_noop_when_mail_re_enabled() {
-        use arc_swap::ArcSwap;
-
-        use crate::{
-            config::{MailProvider, testing::isolated_config},
-            jupiter::tests::test_storage,
-            mail::NoopMailer,
-        };
-
-        let temp_dir = TempDir::new().unwrap();
-        let storage = test_storage(temp_dir.path()).await;
-        let key_path = temp_dir.path().join("core_key.json");
-        let vault = VaultCore::config(storage.vault_storage(), key_path)
-            .await
-            .expect("vault should initialize");
-        let handle: MailerHandle =
-            Arc::new(ArcSwap::from_pointee(MailerSlot(Arc::new(NoopMailer))));
-        let original = handle.load().0.clone();
-
-        let mut config = isolated_config(temp_dir.path().join("cfg"));
-        config.mail = Some(MailConfig {
-            enabled: true,
-            provider: MailProvider::Console,
-            ..Default::default()
-        });
-        let mut report = ConfigReloadReport::default();
-        report.applied_fields.push("mail.enabled");
-
-        apply_mailer_rebuild(&handle, &vault, &config, &report).expect("apply should succeed");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let swapped = loop {
-            let current = handle.load().0.clone();
-            if !Arc::ptr_eq(&current, &original) {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(
-            swapped,
-            "NoopMailer should be replaced after mail is re-enabled"
-        );
-    }
-
-    /// docs/mail.md phase 5 ("仍需解析失败"): a hot mailer rebuild whose
-    /// `mail.password_ref` cannot be resolved from the vault must fail *safely* —
-    /// the resolution error is returned (never panicking), it carries only the
-    /// redacted SecretRef (no path/field/value leak), and `apply_mailer_rebuild`
-    /// keeps the previously installed mailer instead of swapping in a half-built
-    /// one. This is the failure counterpart to
-    /// `mailer_rebuild_subscriber_swaps_noop_when_mail_re_enabled`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn mailer_rebuild_fails_safely_and_redacts_when_password_ref_unresolvable() {
-        use arc_swap::ArcSwap;
-
-        use crate::{
-            config::{MailProvider, secret::SecretRef},
-            jupiter::tests::test_storage,
-            mail::NoopMailer,
-        };
-
-        let temp_dir = TempDir::new().unwrap();
-        let storage = test_storage(temp_dir.path()).await;
-        let key_path = temp_dir.path().join("core_key.json");
-        let vault = VaultCore::config(storage.vault_storage(), key_path)
-            .await
-            .expect("vault should initialize");
-
-        // SMTP mail whose password_ref points at a vault path that holds no
-        // secret, so re-resolution during the rebuild fails.
-        let secret_ref =
-            SecretRef::parse("vault://secret/config/test/mail/password#value").unwrap();
-        let mail = MailConfig {
-            enabled: true,
-            provider: MailProvider::Smtp,
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            username: Some("apikey".to_string()),
-            password: None,
-            password_ref: Some(secret_ref),
-            from: "no-reply@example.com".to_string(),
-            starttls: true,
-            ..Default::default()
-        };
-
-        // The rebuild surfaces an Err (not a panic), and neither the raw nor the
-        // redacted error leaks the SecretRef path/field.
-        let err = match rebuild_mailer(&vault, &mail).await {
-            Ok(_) => panic!("an unresolvable password_ref must fail the rebuild"),
-            Err(e) => e,
-        };
-        let raw = err.to_string();
-        let redacted = global_redactor().redact(&raw);
-        for needle in ["config/test/mail/password", "#value"] {
-            assert!(!raw.contains(needle), "raw rebuild error leaked `{needle}`");
-            assert!(
-                !redacted.contains(needle),
-                "redacted rebuild error leaked `{needle}`"
-            );
+    #[tokio::test]
+    async fn email_delivery_mode_posts_to_website_and_writes_in_app() {
+        #[derive(Clone, Default)]
+        struct CapturedRequest {
+            authorization: String,
+            idempotency_key: String,
+            payload: Option<Value>,
         }
 
-        // End-to-end fail-safe: the swap body that apply_mailer_rebuild spawns
-        // must keep the previously installed mailer when the rebuild fails.
-        // Awaiting it directly drives the failure branch to a deterministic
-        // completion (no detached task to race against), proving the branch ran
-        // and that it never swapped in a half-built mailer.
-        let handle: MailerHandle =
-            Arc::new(ArcSwap::from_pointee(MailerSlot(Arc::new(NoopMailer))));
-        let original = handle.load().0.clone();
+        async fn capture(
+            State(captured): State<Arc<Mutex<CapturedRequest>>>,
+            headers: HeaderMap,
+            Json(payload): Json<Value>,
+        ) -> StatusCode {
+            let mut captured = captured.lock().await;
+            captured.authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            captured.idempotency_key = headers
+                .get("idempotency-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            captured.payload = Some(payload);
+            StatusCode::ACCEPTED
+        }
 
-        rebuild_and_swap_mailer(handle.clone(), vault.clone(), mail).await;
-
-        assert!(
-            Arc::ptr_eq(&handle.load().0, &original),
-            "a failed rebuild must keep the previous mailer"
-        );
-    }
-
-    #[tokio::test]
-    async fn service_start_delivers_email_outbox_then_stops_on_shutdown() {
-        let dir = TempDir::new().unwrap();
-        let db = test_db_connection(dir.path()).await;
-        apply_migrations(&db, true).await.unwrap();
-
-        let stg = NotificationStorage::new(Arc::new(db.clone()));
-        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
-            .await
-            .unwrap();
-        stg.enqueue_email_job(
-            "alice",
-            "alice@example.com",
-            "cl.comment.created",
-            "Subject",
-            "<p>Body</p>",
-            Some("Body"),
-        )
-        .await
-        .unwrap();
-
-        let service = NotificationService::from_mail_config(
-            stg.clone(),
-            Arc::new(NoopMailer),
-            &crate::config::MailConfig {
-                enabled: true,
-                ..Default::default()
-            },
-        );
-        let shutdown = CancellationToken::new();
-        let handle = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move { service.start(shutdown).await }
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let delivered = loop {
-            let pending = stg.fetch_pending_jobs(10).await.unwrap();
-            if pending.is_empty() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-
-        shutdown.cancel();
-        handle.await.unwrap();
-
-        assert!(delivered, "service should drain the email outbox");
-        let sent = email_jobs::Entity::find().all(&db).await.unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].status, "sent");
-
-        // The in-app secondary channel persisted an inbox row for the recipient.
-        let inbox = stg.list_inbox_notifications("alice", 10).await.unwrap();
-        assert_eq!(inbox.len(), 1, "in-app channel should persist an inbox row");
-        assert_eq!(inbox[0].event_type_code, "cl.comment.created");
-    }
-
-    /// Multichannel fan-out (docs/integration.md): a registered WebhookChannel
-    /// receives each notification the dispatcher delivers, after the email
-    /// (primary) send succeeds — the end-to-end proof that the phase-3 secret
-    /// channels integrate with the live dispatcher, not just in isolation.
-    #[tokio::test]
-    async fn service_start_fans_out_delivery_to_webhook_channel() {
-        use std::sync::Mutex as StdMutex;
-
-        use axum::{Router, routing::post};
-
-        use crate::notification::channels::WebhookChannel;
-
-        let received: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::new(Mutex::new(CapturedRequest::default()));
         let app = Router::new()
-            .route(
-                "/hook",
-                post(
-                    |axum::extract::State(state): axum::extract::State<
-                        Arc<StdMutex<Vec<serde_json::Value>>>,
-                    >,
-                     body: axum::body::Bytes| async move {
-                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-                            state.lock().unwrap().push(value);
-                        }
-                        "ok"
-                    },
-                ),
-            )
-            .with_state(received.clone());
+            .route("/api/internal/notifications/email", post(capture))
+            .with_state(Arc::clone(&captured));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let url = format!("http://{addr}/hook");
 
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
-        let stg = NotificationStorage::new(Arc::new(db.clone()));
-        stg.upsert_event_type("cl.comment.created", "cl", "New comment", false, true)
+        let stg = NotificationStorage::new(Arc::new(db));
+        stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.enqueue_email_job(
-            "bob",
-            "bob@example.com",
+        stg.upsert_user_settings("alice", "alice@example.test")
+            .await
+            .unwrap();
+        stg.set_delivery_mode("alice", "email").await.unwrap();
+        stg.set_preferred_locale("alice", Some("zh-CN"))
+            .await
+            .unwrap();
+
+        let mail_client = Arc::new(
+            WebsiteMailClient::new(
+                &format!("http://{address}"),
+                crate::config::secret::SecretString::new("it-shared-bearer"),
+            )
+            .unwrap(),
+        );
+        let service = Arc::new(NotificationService::new(
+            stg.clone(),
+            Vec::new(),
+            Some(mail_client),
+            None,
+            true,
+            DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
+        ));
+        NotificationService::set_active(Some(service));
+
+        let website_payload = serde_json::json!({
+            "cl_link": "CL-123",
+            "actor_username": "bob",
+            "comment_excerpt": "Please review the latest change.",
+        });
+        deliver_user_notification(
+            &stg,
+            "alice",
             "cl.comment.created",
-            "Webhook Subject",
-            "<p>Body</p>",
-            Some("Body"),
+            "New comment",
+            "review requested",
+            website_payload.clone(),
         )
         .await
         .unwrap();
 
-        let webhook: Arc<dyn NotificationChannel> =
-            Arc::new(WebhookChannel::new(url, None).expect("build webhook channel"));
-        let service = NotificationService::from_mail_config_with_extra_channels(
-            stg.clone(),
-            Arc::new(NoopMailer),
-            &crate::config::MailConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            vec![webhook],
+        assert_eq!(
+            stg.list_inbox_notifications("alice", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
-        // Registration order: email, in_app, webhook.
-        assert!(service.channel_for("webhook").is_some());
-
-        let shutdown = CancellationToken::new();
-        let handle = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move { service.start(shutdown).await }
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let delivered = loop {
-            if !received.lock().unwrap().is_empty() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-
-        shutdown.cancel();
-        handle.await.unwrap();
+        let captured = captured.lock().await;
+        assert_eq!(captured.authorization, "Bearer it-shared-bearer");
+        assert!(!captured.idempotency_key.is_empty());
+        let payload = captured.payload.as_ref().unwrap();
+        assert_eq!(payload["event_type"], "cl.comment.created");
+        assert_eq!(payload["recipient"]["email"], "alice@example.test");
+        assert_eq!(payload["recipient"]["username"], "alice");
+        assert_eq!(payload["locale"], "zh-CN");
+        assert_eq!(payload["payload"], website_payload);
+        assert!(payload["payload"].get("subject").is_none());
+        assert!(payload["payload"].get("body_text").is_none());
+        drop(captured);
+        NotificationService::set_active(None);
         server.abort();
+    }
 
-        assert!(
-            delivered,
-            "webhook channel should receive the fan-out delivery"
+    #[tokio::test]
+    async fn global_disabled_skips_all_delivery() {
+        let dir = TempDir::new().unwrap();
+        let db = test_db_connection(dir.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let stg = NotificationStorage::new(Arc::new(db));
+        stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
+            .await
+            .unwrap();
+        stg.upsert_user_settings("alice", "alice@example.test")
+            .await
+            .unwrap();
+
+        let mock = Arc::new(MockChannel::new("slack", true));
+        let service = test_service(
+            stg.clone(),
+            vec![mock.clone() as Arc<dyn NotificationChannel>],
+            false,
         );
-        let payloads = received.lock().unwrap().clone();
-        assert_eq!(payloads.len(), 1);
-        assert_eq!(payloads[0]["username"], "bob");
-        assert_eq!(payloads[0]["event_type"], "cl.comment.created");
-        assert_eq!(payloads[0]["subject"], "Webhook Subject");
-        assert_eq!(payloads[0]["body_html"], "<p>Body</p>");
-        assert_eq!(payloads[0]["body_text"], "Body");
+        NotificationService::set_active(Some(service));
+
+        deliver_user_notification(
+            &stg,
+            "alice",
+            "cl.comment.created",
+            "subject",
+            "hello",
+            serde_json::json!({
+                "cl_link": "CL1",
+                "actor_username": "bob",
+                "comment_excerpt": "hello",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(mock.take_sent().is_empty());
+        assert!(
+            stg.list_inbox_notifications("alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        NotificationService::set_active(None);
     }
 }
