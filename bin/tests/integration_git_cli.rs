@@ -8,7 +8,8 @@
 // tag push is rejected (tags via Web `/tags` API only).
 // IT-10 adds auth-boundary cases (`integration_git_cli_auth_*`).
 // IT-12 adds failpath cases (`integration_git_cli_failpath_*`).
-// Credential injection lives in `common/git_cli.rs` (included only here).
+// Credential injection lives in `common/git_cli.rs` (shared via `#[path]` with
+// the `integration_git_lfs` / `integration_git_ssh` targets since GM-05/GM-06).
 // This target does not modify `integration_vault.rs`.
 
 mod common;

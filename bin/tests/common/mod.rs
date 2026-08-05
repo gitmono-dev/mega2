@@ -5,8 +5,9 @@
 // CLI binary via `CARGO_BIN_EXE_monoengine` stay decoupled from the library.
 //
 // Git-cli runner/credential helpers live in `common/git_cli.rs` and are
-// included only by `integration_git_cli` (via `#[path]`), so
-// `integration_vault` does not compile unused git symbols into its target.
+// included (via `#[path]`) only by the git-facing targets `integration_git_cli`,
+// `integration_git_lfs`, and `integration_git_ssh`, so `integration_vault`
+// does not compile unused git symbols into its target.
 
 use std::{fs, path::Path};
 

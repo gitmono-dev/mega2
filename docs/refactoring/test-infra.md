@@ -135,13 +135,16 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 
 git-cli 固定版本: `git version 2.49.1`
 
+git-cli runner git-lfs 固定版本: `git-lfs/3.7.1`（GM-05 起随镜像内置；healthcheck 断言前缀）
+
 | 项 | 值 |
 |---|---|
 | 服务名 | `git-cli` |
-| 镜像 | `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`（固定 tag + digest，非 `latest`） |
-| 固定版本字符串 | 见上文 `git-cli 固定版本`（容器内 `git --version` 必须与该字符串完全相等） |
+| 镜像 | `monoengine-git-cli:3.7.1`（本地构建，`build: Dockerfile.git-cli`，GM-05 起）。基底为原登记的固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.7.1` 与 `gitcli`（uid 1000）用户；无 `latest`，git pin 不变 |
+| 固定版本字符串 | 见上文 `git-cli 固定版本`（容器内 `git --version` 必须与该字符串完全相等）；`git lfs version` 输出必须以上文 git-lfs pin 前缀开头 |
 | 端口 | 无独立端口映射；通过 `network_mode: host` 访问宿主 `127.0.0.1` 高位端口 |
-| healthcheck | `CMD git --version`（见 `docker-compose.test.yml`） |
+| healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]7[.]1 '`（见 `docker-compose.test.yml`） |
+| entrypoint / init | `entrypoint: ["sleep","infinity"]`（常驻供 `exec`）；`init: true`（回收 exec 超时包装器遗留的 git/ssh 子进程，GM-08 起） |
 | 网络 | **`network_mode: host`**，因此**不**加入 `networks.default`（与 host 网络互斥，见 ADR-IT-01） |
 | 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `validate-config` 已在 `--profile git up` 前 mkdir（见「CI 入口」）。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MONOENGINE_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
 | 运行身份 | `user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"`（Compose 可解析的数值默认，不依赖 Bash 未 export 的 `$UID`）。默认 `1000:1000` 对齐常见 CI runner；本地若 `id -u` 不是 1000，启栈前必须 `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`。变更 UID/GID 后需要 `--force-recreate git-cli` |
