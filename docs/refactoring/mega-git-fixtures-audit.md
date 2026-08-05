@@ -5,6 +5,10 @@
 - **Pin SHA:** `42cd288d266dade371aed03917d222eb57f1d5a4`
 - **Check date:** 2026-08-03
 - **Verified by:** `cd ../mega && libra rev-parse HEAD` → exact equality with DEP-04
+- **Recheck 2026-08-06（完成度复审）:** sibling `../mega` HEAD 已前进至
+  `a8abbbc5a9d43997c7f53b7346f4a6984babfdad`（pin 的直接子提交；`libra rev-parse HEAD~1` = pin）。
+  本审计与 Decision: NO-GO 仍**只对 pin 有效**（GC-GM-04）；未重审前不得据新 HEAD 启动任何移植，
+  重启须先按 plan-20260803 DEP-04 修订 pin 并重跑本审计。
 
 ## Tree and size
 

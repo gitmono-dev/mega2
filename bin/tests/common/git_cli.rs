@@ -1,6 +1,7 @@
-// Git-cli black-box helpers (IT-03 / IT-10 / IT-12).
+// Git-cli black-box helpers (IT-03 / IT-10 / IT-12; extended by GM-05/GM-06..08).
 //
-// Included only by `integration_git_cli.rs` via `#[path = "common/git_cli.rs"]`
+// Included via `#[path = "common/git_cli.rs"]` only by the git-facing targets
+// (`integration_git_cli.rs`, `integration_git_lfs.rs`, `integration_git_ssh.rs`)
 // so vault and other bin test targets do not compile these symbols.
 
 use std::{
@@ -408,12 +409,36 @@ pub fn write_git_askpass(path: &Path) {
     fs::set_permissions(path, perms).expect("chmod askpass");
 }
 
+/// Canonicalize a path that may not exist yet: resolve the deepest existing
+/// ancestor and re-append the remaining components. Keeps both sides of the
+/// workdir prefix check symmetric on hosts where the shared workdir sits
+/// behind a symlink (macOS `/tmp` -> `/private/tmp`); plain paths on the
+/// Linux target OS are unaffected.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(resolved) = cur.canonicalize() {
+            let mut out = resolved;
+            for component in rest.iter().rev() {
+                out.push(component);
+            }
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn container_path_for_host(host_path: &Path) -> String {
     let workdir = git_cli_workdir();
-    let abs = host_path
-        .canonicalize()
-        .unwrap_or_else(|_| host_path.to_path_buf());
-    let work_abs = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
+    let abs = canonicalize_lenient(host_path);
+    let work_abs = canonicalize_lenient(&workdir);
     let rel = abs.strip_prefix(&work_abs).unwrap_or_else(|_| {
         panic!(
             "git path {} must live under shared workdir {}",
