@@ -7,6 +7,7 @@ on:
       - ".github/workflows/config-validation.yml"
       - "Dockerfile"
       - "Dockerfile.git-cli"
+      - "Dockerfile.git-smoke"
       - "Dockerfile.it-runtime"
       - "README.md"
       - "bin/tests/**"
@@ -32,6 +33,7 @@ on:
       - ".github/workflows/config-validation.yml"
       - "Dockerfile"
       - "Dockerfile.git-cli"
+      - "Dockerfile.git-smoke"
       - "Dockerfile.it-runtime"
       - "README.md"
       - "bin/tests/**"
@@ -172,7 +174,7 @@ jobs:
           rm -rf target
           docker builder prune -f >/dev/null 2>&1 || true
           df -h /
-          docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web --profile git up -d --wait
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
           curl -sf "http://127.0.0.1:17001/api/auth/get-session" >/dev/null
           echo "OK: compose monoengine and website-next healthy"
@@ -384,6 +386,23 @@ jobs:
           env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_ssh -- --test-threads=1
           # Product-email delivery is owned by website (test provider in compose).
           # Monoengine proves acceptance via integration_website_mail above.
+
+      - name: Run linked git protocol smoke (git-smoke)
+        working-directory: monoengine
+        run: |
+          set -euo pipefail
+          # The linked git-smoke service joins networks.default and exercises
+          # push/pull against the compose-hosted monoengine (profile app).
+          # Seed a one-off access token (same pattern as git-protocol-smoke CI).
+          smoke_token="monoengine-it-git-smoke-token-0001"
+          docker compose -p monoengine-it -f docker-compose.test.yml exec -T postgres \
+            psql -U monoengine -d monoengine -v ON_ERROR_STOP=1 -v token="${smoke_token}" <<'SQL'
+          INSERT INTO access_token (id, username, token, created_at)
+          VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now())
+          ON CONFLICT DO NOTHING;
+          SQL
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile git exec -T git-smoke \
+            bash -c 'export MONOENGINE_HTTP_REPO_URL="http://ci-smoke:monoengine-it-git-smoke-token-0001@monoengine:8000/"; export MONOENGINE_GIT_SMOKE_PUSH=1; export MONOENGINE_GIT_SMOKE_LFS=0; export MONOENGINE_GIT_SMOKE_WORKDIR=/work/ci-smoke; mkdir -p /work/ci-smoke; bash /repo/scripts/git_protocol_smoke.sh'
 
       - name: Stop test services
         if: always()

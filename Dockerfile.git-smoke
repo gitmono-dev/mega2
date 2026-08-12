@@ -1,0 +1,58 @@
+# Linked git protocol smoke runner for the compose test stack.
+#
+# Unlike `git-cli` (which uses `network_mode: host` for the cargo-native
+# black-box harness that spawns its own service on the host), this image is
+# designed to join `networks.default` and exercise push/pull against the
+# compose-hosted `monoengine` service over the internal bridge network
+# (http://monoengine:8000/).
+#
+# It extends the pinned alpine/git base (same git + git-lfs versions as
+# `git-cli`) and adds:
+#   - bash: `scripts/git_protocol_smoke.sh` uses bash features ([[ ]], local,
+#     arrays) that Alpine's /bin/sh does not provide.
+#   - postgresql-client: the smoke flow seeds a one-off access_token row into
+#     the compose `postgres` service before running the push/delete matrix
+#     (same pattern as the git-protocol-smoke CI job).
+#
+# Build context = monoengine repo root:
+#   docker compose -p monoengine-it -f docker-compose.test.yml --profile git build git-smoke
+
+FROM alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+
+ARG TARGETARCH
+ARG GIT_LFS_VERSION=3.7.1
+
+USER root
+
+# Install bash + postgresql-client (psql) on top of the alpine/git base.
+# ripgrep (rg) is used by scripts/git_protocol_smoke.sh for ref assertions.
+RUN set -eux; \
+    apk add --no-cache bash postgresql-client ripgrep; \
+    test -x /bin/bash; \
+    test -x /usr/bin/psql; \
+    test -x /usr/bin/rg
+
+# Install git-lfs (same pinned version as Dockerfile.git-cli).
+RUN set -eux; \
+    arch="${TARGETARCH:-$(uname -m)}"; \
+    case "$arch" in \
+        amd64|x86_64) arch=amd64; sha256=1c0b6ee5200ca708c5cebebb18fdeb0e1c98f1af5c1a9cba205a4c0ab5a5ec08 ;; \
+        arm64|aarch64) arch=arm64; sha256=73a9c90eeb4312133a63c3eaee0c38c019ea7bfa0953d174809d25b18588dd8d ;; \
+        *) echo "unsupported git-lfs architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    archive="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"; \
+    wget -O "/tmp/$archive" "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/$archive"; \
+    echo "$sha256  /tmp/$archive" | sha256sum -c -; \
+    tar -xzf "/tmp/$archive" -C /tmp; \
+    cp "/tmp/git-lfs-${GIT_LFS_VERSION}/git-lfs" /usr/local/bin/git-lfs; \
+    chmod 0755 /usr/local/bin/git-lfs; \
+    rm -rf "/tmp/$archive" "/tmp/git-lfs-${GIT_LFS_VERSION}"; \
+    test "$(git lfs version | cut -d' ' -f1)" = "git-lfs/${GIT_LFS_VERSION}"
+
+# The smoke script runs as the compose user; give it a passwd entry so git/ssh
+# do not fail with "No user exists for uid N".
+RUN adduser -D -u 1000 -g 1000 -h /home/gitsmoke -s /bin/bash gitsmoke
+
+# Default: stay up so `docker compose exec` can drive the smoke interactively.
+# Override with `command:` in compose to run the smoke automatically.
+ENTRYPOINT ["/bin/bash", "-c", "exec sleep infinity"]

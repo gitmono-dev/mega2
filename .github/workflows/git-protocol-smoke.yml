@@ -14,6 +14,7 @@ on:
     paths:
       - ".github/workflows/git-protocol-smoke.yml"
       - "Dockerfile.git-cli"
+      - "Dockerfile.git-smoke"
       - "bin/tests/**"
       - "docker-compose.test.yml"
       - "docs/refactoring/protocol.md"
@@ -36,6 +37,7 @@ on:
     paths:
       - ".github/workflows/git-protocol-smoke.yml"
       - "Dockerfile.git-cli"
+      - "Dockerfile.git-smoke"
       - "bin/tests/**"
       - "docker-compose.test.yml"
       - "docs/refactoring/protocol.md"

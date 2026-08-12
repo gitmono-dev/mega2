@@ -155,6 +155,33 @@ git-cli runner git-lfs 固定版本: `git-lfs/3.7.1`（GM-05 起随镜像内置�
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
 | 目标 OS / 降级 | **Linux only**。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于 Linux 本地实验，且不得冒充固定版本门；无 Windows/macOS 兼容路径 |
 
+### git-smoke（linked 栈级 git 协议 smoke，profile `git`）
+
+与 `git-cli`（host 网络、供 cargo-native harness 自起服务）不同，`git-smoke` **加入 `networks.default`**，直接对 compose 常驻的 `monoengine`（profile `app`）跑 `scripts/git_protocol_smoke.sh` 的 push/pull 矩阵。它把「项目镜像 + 其它镜像 link 在一起」的完整 compose 测试环境落到 git 协议面：ls-remote / clone / fetch / shallow / blobless / push CL / tag-reject / LFS。
+
+git-smoke 固定版本: `git version 2.49.1`（与 git-cli 同基底）
+
+git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
+
+| 项 | 值 |
+|---|---|
+| 服务名 | `git-smoke` |
+| 镜像 | `monoengine-git-smoke:3.7.1`（本地构建，`build: Dockerfile.git-smoke`）。基底为固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.7.1`、`bash`（smoke 脚本需要）、`postgresql-client`（psql 用于 seed access_token）与 `ripgrep`（脚本 ref 断言）；无 `latest`，git pin 不变 |
+| 固定版本字符串 | 见上文 `git-smoke 固定版本`（容器内 `git --version` 必须与该字符串完全相等）；`git lfs version` 输出必须以上文 git-lfs pin 前缀开头 |
+| 端口 | 无独立端口映射；通过 `networks.default` 访问 `monoengine:8000` |
+| healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]7[.]1 '`（见 `docker-compose.test.yml`） |
+| entrypoint / init | `entrypoint: ["/bin/bash","-c","exec sleep infinity"]`（常驻供 `exec`）；`init: true` |
+| 网络 | **加入 `networks.default`**（与 `git-cli` 的 host 网络相反），经内部 bridge 访问 compose 常驻 `monoengine` |
+| 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}` → 容器 `/work`（`working_dir: /work`）；另以只读挂载 monoengine 仓库根 → `/repo`（供 `scripts/git_protocol_smoke.sh` 在容器内执行） |
+| 运行身份 | 默认 `1000:1000`（镜像内建 `gitsmoke` 用户）；如需对齐宿主 UID 可 `export MONOENGINE_IT_GIT_UID/GID` 后 `--force-recreate git-smoke` |
+| profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；须与 `--profile app` 同启，因 `depends_on: monoengine`） |
+| depends_on | `monoengine`（`condition: service_healthy`）——因此 `git-smoke` 必须与 `--profile app` 一起 `up` |
+| 环境 | `MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/`（默认指向 linked monoengine）；`MONOENGINE_GIT_SMOKE_PUSH=1`；`MONOENGINE_GIT_SMOKE_LFS=0`；`MONOENGINE_IT_SEED_TOKEN`（receive-pack Basic Auth 种子） |
+| 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
+| 运行示例 | 先 `docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile git up -d --wait`，再在 compose `postgres` 里 seed 一个 access_token（与 CI 相同），最后 `docker compose -p monoengine-it -f docker-compose.test.yml --profile git exec -T git-smoke bash -c 'export MONOENGINE_HTTP_REPO_URL="http://ci-smoke:<token>@monoengine:8000/"; export MONOENGINE_GIT_SMOKE_PUSH=1; bash /repo/scripts/git_protocol_smoke.sh'` |
+| secret | **不**注入任何 secret；token 由 seed 步骤写入 compose `postgres`，经 URL 注入 |
+| 目标 OS / 降级 | 跨平台（bridge 网络，非 host 网络）；macOS/Windows Docker Desktop 亦可跑。git pin 与 `git-cli` 一致 |
+
 ### monoengine（compose 常驻 HTTP，profile `app`）
 
 被测产品进程进入 compose 拓扑的登记条目。**与 cargo 黑盒分层并存**：`bin/tests/integration_*.rs` 仍通过 `CARGO_BIN_EXE_monoengine` 按用例拉起隔离进程（唯一端口 / 临时 `MEGA_BASE_DIR` / 隔离 DB）；本服务提供**栈级常驻** `service http`，供 compose smoke、手工联调与 CI 健康探针使用，**不**替代 per-case 隔离门。

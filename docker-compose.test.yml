@@ -125,6 +125,56 @@ services:
       timeout: 5s
       retries: 20
 
+  # Linked git protocol smoke runner (profile `git`).
+  #
+  # Unlike `git-cli` (host networking, for the cargo-native harness that spawns
+  # its own service on the host), this service JOINS networks.default and talks
+  # to the compose-hosted `monoengine` over the internal bridge
+  # (http://monoengine:8000/). It runs `scripts/git_protocol_smoke.sh` against
+  # the linked stack: ls-remote / clone / fetch / push / tag-reject / LFS.
+  #
+  # It depends on `monoengine` (profile `app`) being up, so bring the whole
+  # linked stack up together:
+  #   docker compose -p monoengine-it -f docker-compose.test.yml \
+  #     --profile app --profile git up -d --wait
+  #
+  # Then drive the smoke from the host:
+  #   docker compose -p monoengine-it -f docker-compose.test.yml \
+  #     --profile git exec -T git-smoke \
+  #     bash scripts/git_protocol_smoke.sh
+  # (with MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ and a seeded token).
+  git-smoke:
+    image: monoengine-git-smoke:3.7.1
+    build:
+      context: .
+      dockerfile: Dockerfile.git-smoke
+    profiles: ["git"]
+    init: true
+    depends_on:
+      monoengine:
+        condition: service_healthy
+    environment:
+      # Default repo URL points at the linked compose-hosted monoengine.
+      MONOENGINE_HTTP_REPO_URL: http://monoengine:8000/
+      # Optional SSH URL (monoengine SSH service, if enabled in the stack).
+      # MONOENGINE_SSH_REPO_URL: ssh://git@monoengine:2222/
+      # Push/tag/LFS smoke are opt-in via these flags.
+      MONOENGINE_GIT_SMOKE_PUSH: "1"
+      MONOENGINE_GIT_SMOKE_LFS: "0"
+      # Seed token for receive-pack Basic Auth (overridden by the exec command).
+      MONOENGINE_IT_SEED_TOKEN: monoengine-it-git-smoke-token-0001
+    volumes:
+      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}:/work
+      # Mount the monoengine repo so the smoke script is available inside the
+      # linked container (scripts/git_protocol_smoke.sh).
+      - .:/repo:ro
+    working_dir: /work
+    healthcheck:
+      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
   # Standing monoengine HTTP service for stack-level IT (profile `app`).
   # Per-case cargo black-box tests still spawn via CARGO_BIN_EXE for isolation;
   # this service is the compose-hosted process under test for stack smoke.
