@@ -108,6 +108,12 @@ impl EntityStore {
             .extend(other_inner.user_groups.clone());
     }
 
+    /// Whether the store contains a repository with the given entity UID.
+    pub fn contains_repository(&self, euid: &SaturnEUid) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.repos.contains_key(euid)
+    }
+
     pub fn is_empty(&self) -> bool {
         let inner = self.inner.read().unwrap();
         inner.users.is_empty()

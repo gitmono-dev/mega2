@@ -7,6 +7,7 @@ pub mod enforcement;
 pub mod entitystore;
 pub mod guard;
 mod objects;
+pub mod resource;
 pub mod reviewer_parser;
 pub mod util;
 

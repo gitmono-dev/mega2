@@ -118,3 +118,14 @@
 - `Enforcement::{Off, Shadow, Enforce}`：`off` 不构建不消费授权数据；`shadow` 构建并评估、记录 would-deny 但不改变放行；`enforce` 构建并评估、真实拒绝。
 - `decide(enforcement, would_deny, store_empty)`：`enforce` + 空 store 返回 deny（fail-closed）。
 - 配置侧 `[cedar].enforcement`（`src/config/model.rs`）由 `config validate` 校验取值，并拒绝 `monorepo.admin` 含保留匿名主体 `User::"__anonymous__"`（ADR-UN-06 ⑤）。
+
+## 单 monorepo 资源归一 helper（ADR-UN-05）
+
+`src/contract/policy/resource.rs` 提供单源资源归一 helper（GC-UN-03）：
+
+- `ROOT_REPOSITORY = Repository::"/"`：单 monorepo 根仓库实体标识，所有请求路径归一到此仓库，其 ACL 治理全部路径（ADR-UN-05）。
+- `normalize_resource(path)`：纯 O(1) 映射，任意合法请求路径（如 `/project`）→ 根仓库实体标识。
+- `root_repository_present(store)` / `resolve_resource(path, store)`：检查 store 是否含根仓库实体；缺失时返回 `ResourceResolution::Missing`（fail-closed）。
+- `decide_resource(enforcement, resolution)`：根实体缺失视为 would-deny——`enforce` 拒绝、`shadow` 放行但记录、`off` 放行。
+
+默认初始化产物（`src/jupiter/utils/converter.rs` 经 `generate_entity(admin, "/")`）只生成 `Repository::"/"` 一个仓库实体，且只为 `admins` 参数创建用户（不生成 maintainer/reader 成员）。
