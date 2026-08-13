@@ -158,4 +158,39 @@ mod tests {
         let err = build_from_json(json).expect_err("reserved anonymous should fail");
         assert!(matches!(err, BuilderError::ReservedAnonymous));
     }
+
+    #[test]
+    fn scale_10k_entities_within_budget() {
+        // 10k users within the 1 MiB JSON budget; first build < 1s in release.
+        let mut users = serde_json::Map::new();
+        for i in 0..10_000 {
+            users.insert(
+                format!("User::\"u{i}\""),
+                serde_json::json!({"euid": format!("User::\"u{i}\""), "parents": []}),
+            );
+        }
+        let json = serde_json::json!({
+            "users": users,
+            "repos": {},
+            "user_groups": {},
+            "merge_requests": {},
+            "issues": {},
+        })
+        .to_string();
+        assert!(
+            json.len() <= 1_048_576,
+            "JSON exceeds 1 MiB: {}",
+            json.len()
+        );
+        let start = std::time::Instant::now();
+        let snapshot = build_from_json(&json).expect("build 10k entities");
+        let elapsed = start.elapsed();
+        if !cfg!(debug_assertions) {
+            assert!(
+                elapsed.as_secs_f64() < 1.0,
+                "first build of 10k entities took {elapsed:?}"
+            );
+        }
+        assert!(!snapshot.entities().is_empty());
+    }
 }

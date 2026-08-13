@@ -10,6 +10,7 @@ use serde_json::{json, to_string_pretty};
 use crate::{
     common::errors::SaturnContextError,
     contract::policy::{
+        builder::{BuilderError, EntitySnapshot, build_from_json},
         objects::{Issue, MergeRequest, Repo, User, UserGroup},
         util::SaturnEUid,
     },
@@ -132,6 +133,78 @@ impl EntityStore {
     }
 }
 
+/// Path of the in-repo authorization data source (ADR-UN-02).
+pub const MEGA_CEDAR_PATH: &str = "/.mega_cedar.json";
+
+/// Runtime holder for the shared authorization snapshot (UN-15): build-then-swap
+/// under a write lock, consistent read view, dirty flag on rebuild failure, and
+/// idempotent first build.
+pub struct SharedEntityStore {
+    inner: RwLock<SharedInner>,
+}
+
+#[derive(Default)]
+struct SharedInner {
+    snapshot: Option<Arc<EntitySnapshot>>,
+    dirty: bool,
+}
+
+impl Default for SharedEntityStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedEntityStore {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(SharedInner::default()),
+        }
+    }
+
+    /// Idempotent first build: if a snapshot already exists, no-op.
+    pub fn ensure(&self, json: &str) -> Result<(), BuilderError> {
+        if self.inner.read().unwrap().snapshot.is_some() {
+            return Ok(());
+        }
+        self.swap(json)
+    }
+
+    /// Build-then-swap: build a new snapshot; on success replace under a write
+    /// lock; on failure keep the old snapshot, set dirty, and log
+    /// `event=authz_rebuild_failed`.
+    pub fn swap(&self, json: &str) -> Result<(), BuilderError> {
+        let new_snapshot = match build_from_json(json) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let mut inner = self.inner.write().unwrap();
+                inner.dirty = true;
+                tracing::error!(
+                    event = "authz_rebuild_failed",
+                    path = MEGA_CEDAR_PATH,
+                    error = %error,
+                    "authorization snapshot rebuild failed; keeping previous snapshot"
+                );
+                return Err(error);
+            }
+        };
+        let mut inner = self.inner.write().unwrap();
+        inner.snapshot = Some(Arc::new(new_snapshot));
+        inner.dirty = false;
+        Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.inner.read().unwrap().dirty
+    }
+
+    /// Consistent read view: returns a shared handle to the current immutable
+    /// snapshot (or `None` if not yet built).
+    pub fn snapshot(&self) -> Option<Arc<EntitySnapshot>> {
+        self.inner.read().unwrap().snapshot.clone()
+    }
+}
+
 pub fn generate_entity(
     admins: &[String],
     repo: &str,
@@ -241,5 +314,61 @@ mod tests {
         assert!(!store2.is_empty(), "round-trip should preserve entities");
         let clone = store2.clone();
         assert!(Arc::ptr_eq(&store2.inner, &clone.inner));
+    }
+
+    #[test]
+    fn shared_store_swap_replaces_snapshot() {
+        let store = SharedEntityStore::new();
+        assert!(store.snapshot().is_none());
+        store
+            .swap(&generate_entity(&["admin".to_string()], "repo").expect("generate"))
+            .expect("first swap");
+        assert!(store.snapshot().is_some());
+        assert!(!store.is_dirty());
+        // Second swap with a different repo replaces the snapshot.
+        store
+            .swap(&generate_entity(&["admin".to_string()], "other").expect("generate"))
+            .expect("second swap");
+        assert!(store.snapshot().is_some());
+    }
+
+    #[test]
+    fn shared_store_rebuild_failure_keeps_old_and_sets_dirty() {
+        let store = SharedEntityStore::new();
+        store
+            .swap(&generate_entity(&["admin".to_string()], "repo").expect("generate"))
+            .expect("first swap");
+        let before = store.snapshot().expect("snapshot");
+        // Invalid JSON: rebuild fails, old snapshot retained, dirty set.
+        let err = store
+            .swap("not-json")
+            .expect_err("invalid json should fail");
+        assert!(matches!(err, BuilderError::Json(_)));
+        assert!(store.is_dirty());
+        let after = store.snapshot().expect("snapshot");
+        assert!(Arc::ptr_eq(&before, &after), "old snapshot retained");
+    }
+
+    #[test]
+    fn shared_store_ensure_is_idempotent() {
+        let store = SharedEntityStore::new();
+        let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
+        store.ensure(&json).expect("first ensure");
+        let first = store.snapshot().expect("snapshot");
+        // Second ensure is a no-op (does not rebuild).
+        store.ensure(&json).expect("second ensure");
+        let second = store.snapshot().expect("snapshot");
+        assert!(Arc::ptr_eq(&first, &second), "ensure must not rebuild");
+    }
+
+    #[test]
+    fn shared_store_consistent_read_view() {
+        let store = SharedEntityStore::new();
+        let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
+        store.ensure(&json).expect("ensure");
+        // Two reads return the same immutable snapshot handle (consistent view).
+        let a = store.snapshot().expect("a");
+        let b = store.snapshot().expect("b");
+        assert!(Arc::ptr_eq(&a, &b));
     }
 }
