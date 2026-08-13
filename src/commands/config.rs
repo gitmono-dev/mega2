@@ -134,6 +134,14 @@ pub fn cli() -> Command {
                         .long("show-sources")
                         .action(ArgAction::SetTrue)
                         .help("Print base/profile/env source field and override diagnostics"),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .value_name("FORMAT")
+                        .value_parser(["human", "json"])
+                        .default_value("human")
+                        .help("Output format for source diagnostics (human | json)"),
                 ),
         )
 }
@@ -330,6 +338,10 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
                 validate_args.get_flag("resolve-secrets"),
                 validate_args.get_flag("deny-warnings"),
                 validate_args.get_flag("show-sources"),
+                validate_args
+                    .get_one::<String>("format")
+                    .map(String::as_str)
+                    .unwrap_or("human"),
             )
             .await?;
             println!("config valid");
@@ -640,12 +652,17 @@ async fn validate_config(
     resolve_secrets: bool,
     deny_warnings: bool,
     show_sources: bool,
+    format: &str,
 ) -> Result<(), MegaError> {
     config.validate()?;
     let diagnostics = collect_source_diagnostics(config_path, config_profile_path)?;
     diagnostics.emit_warnings();
     if show_sources {
-        print_source_diagnostics(&diagnostics);
+        if format == "json" {
+            print_source_diagnostics_json(&diagnostics, config_path, config_profile_path);
+        } else {
+            print_source_diagnostics(&diagnostics);
+        }
     }
     if deny_warnings && diagnostics.has_warnings() {
         return Err(MegaError::Other(format!(
@@ -694,6 +711,86 @@ fn source_diagnostic_lines(diagnostics: &ConfigSourceDiagnostics) -> Vec<String>
     }
 
     lines
+}
+
+/// Print source diagnostics as JSON (frozen schema for `config validate
+/// --show-sources --format json`). Includes the `cedar.enforcement` winning
+/// source field (ADR-UN-01). Human-readable output is unchanged.
+fn print_source_diagnostics_json(
+    diagnostics: &ConfigSourceDiagnostics,
+    config_path: Option<&Path>,
+    config_profile_path: Option<&Path>,
+) {
+    let cedar_source = cedar_enforcement_winning_source(config_path, config_profile_path);
+    let json = serde_json::json!({
+        "valid": true,
+        "cedar": {
+            "enforcement": {
+                "winning_source": cedar_source,
+            }
+        },
+        "source_diagnostics": {
+            "file_warnings": diagnostics.file_warnings.iter().map(|w| serde_json::json!({
+                "source_path": w.source_path,
+                "field_path": w.field_path,
+                "message": w.message,
+            })).collect::<Vec<_>>(),
+            "environment_warnings": diagnostics.environment_warnings.iter().map(|w| serde_json::json!({
+                "variable": w.variable,
+                "field_path": w.field_path,
+                "message": w.message,
+            })).collect::<Vec<_>>(),
+            "source_fields": diagnostics.source_fields.iter().map(|f| serde_json::json!({
+                "field_path": f.field_path,
+                "source": f.source,
+                "message": f.message,
+            })).collect::<Vec<_>>(),
+            "source_overrides": diagnostics.source_overrides.iter().map(|o| serde_json::json!({
+                "field_path": o.field_path,
+                "source": o.source,
+                "overridden_source": o.overridden_source,
+                "message": o.message,
+            })).collect::<Vec<_>>(),
+        }
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// Determine the winning source for `cedar.enforcement` (env > profile > base > default).
+fn cedar_enforcement_winning_source(
+    config_path: Option<&Path>,
+    config_profile_path: Option<&Path>,
+) -> String {
+    if std::env::var("MEGA_CEDAR__ENFORCEMENT").is_ok() {
+        return "environment variable MEGA_CEDAR__ENFORCEMENT".to_string();
+    }
+    if let Some(profile) = config_profile_path
+        && toml_has_cedar_enforcement(profile)
+    {
+        return format!("profile file {}", profile.display());
+    }
+    if let Some(base) = config_path
+        && toml_has_cedar_enforcement(base)
+    {
+        return format!("base file {}", base.display());
+    }
+    "default".to_string()
+}
+
+fn toml_has_cedar_enforcement(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    value
+        .get("cedar")
+        .and_then(|c| c.get("enforcement"))
+        .is_some()
 }
 
 async fn resolve_config_secrets<R>(config: &Config, resolver: &R) -> Result<(), MegaError>
@@ -1144,13 +1241,29 @@ mod tests {
         .expect("write config source");
         let config = isolated_config(temp_dir.path().join("base"));
 
-        validate_config(&config, Some(&config_path), None, false, false, false)
-            .await
-            .expect("warnings should not fail by default");
+        validate_config(
+            &config,
+            Some(&config_path),
+            None,
+            false,
+            false,
+            false,
+            "human",
+        )
+        .await
+        .expect("warnings should not fail by default");
 
-        let err = validate_config(&config, Some(&config_path), None, false, true, false)
-            .await
-            .expect_err("deny warnings should fail");
+        let err = validate_config(
+            &config,
+            Some(&config_path),
+            None,
+            false,
+            true,
+            false,
+            "human",
+        )
+        .await
+        .expect_err("deny warnings should fail");
 
         assert!(err.to_string().contains("source diagnostics produced"));
         assert!(err.to_string().contains("--deny-warnings"));
@@ -1173,9 +1286,17 @@ mod tests {
         .expect("write config source");
         let config = isolated_config(temp_dir.path().join("base"));
 
-        let err = validate_config(&config, Some(&config_path), None, false, true, false)
-            .await
-            .expect_err("obsolete section should fail under deny warnings");
+        let err = validate_config(
+            &config,
+            Some(&config_path),
+            None,
+            false,
+            true,
+            false,
+            "human",
+        )
+        .await
+        .expect_err("obsolete section should fail under deny warnings");
         let message = err.to_string();
 
         assert!(message.contains("source diagnostics produced"));
@@ -1294,5 +1415,23 @@ mod tests {
         assert!(message.contains("redis.url scheme"));
         assert!(!message.contains("mysecret"));
         assert!(!message.contains("sensitive-host"));
+    }
+
+    #[test]
+    fn cedar_enforcement_winning_source_detects_base_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[cedar]\nenforcement = \"off\"\n").expect("write config");
+        let source = cedar_enforcement_winning_source(Some(&path), None);
+        assert!(source.contains("base file"), "got: {source}");
+    }
+
+    #[test]
+    fn cedar_enforcement_winning_source_defaults_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[log]\nlevel = \"info\"\n").expect("write config");
+        let source = cedar_enforcement_winning_source(Some(&path), None);
+        assert_eq!(source, "default");
     }
 }

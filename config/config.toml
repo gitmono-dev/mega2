@@ -332,3 +332,10 @@ sink = "tracing"
 # fails the secret operation (non-repudiation over availability). Default false
 # (fail-open: a sink write failure is logged but does not block secret access).
 fail_closed = false
+
+[cedar]
+# Authorization enforcement switch (ADR-UN-01). Three states:
+#   off     = do not build or consume authorization data (default; zero behavior change)
+#   shadow  = build the store, evaluate, record would-deny logs, but do not change allow
+#   enforce = build the store, evaluate, and deny unauthorized requests
+enforcement = "off"

@@ -9,9 +9,9 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, Config, DbConfig, LFSConfig, LogConfig,
-    MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig, OAuthConfig, OrionServerConfig,
-    PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, CedarConfig, Config, DbConfig,
+    LFSConfig, LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig, OAuthConfig,
+    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
     secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
@@ -115,6 +115,7 @@ impl Config {
         validate_lfs_config(&self.lfs)?;
         validate_build_config(&self.build)?;
         validate_redis_config(&self.redis)?;
+        validate_cedar_config(&self.cedar)?;
         if let Some(buck_config) = &self.buck {
             validate_buck_config(buck_config)?;
         }
@@ -515,6 +516,19 @@ pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), M
     require_non_empty_list_entries("monorepo.root_dirs", &mono_config.root_dirs)?;
     require_non_empty_list_entries("monorepo.admin", &mono_config.admin)?;
 
+    // ADR-UN-06 ⑤: the anonymous fallback principal is a reserved literal; it
+    // must not be occupied by a real admin name (collision would let an
+    // anonymous request inherit admin privileges).
+    if mono_config
+        .admin
+        .iter()
+        .any(|name| name == "User::\"__anonymous__\"")
+    {
+        return Err(MegaError::Other(
+            "monorepo.admin must not contain the reserved anonymous principal User::\"__anonymous__\"".to_string(),
+        ));
+    }
+
     if mono_config.rename.similarity_threshold > 100 {
         return Err(MegaError::Other(format!(
             "monorepo.rename.similarity_threshold must be between 0 and 100; got {}",
@@ -523,6 +537,17 @@ pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), M
     }
 
     Ok(())
+}
+
+/// Validate `[cedar]` settings (ADR-UN-01): `enforcement` must be one of
+/// `off` | `shadow` | `enforce`.
+pub(crate) fn validate_cedar_config(cedar_config: &CedarConfig) -> Result<(), MegaError> {
+    match cedar_config.enforcement.as_str() {
+        "off" | "shadow" | "enforce" => Ok(()),
+        other => Err(MegaError::Other(format!(
+            "cedar.enforcement must be one of \"off\" | \"shadow\" | \"enforce\"; got {other:?}"
+        ))),
+    }
 }
 
 pub(crate) fn validate_pack_config(pack_config: &PackConfig) -> Result<(), MegaError> {
@@ -1408,6 +1433,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "vault",
             "oauth",
             "git",
+            "cedar",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
@@ -1500,6 +1526,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "session_cookie_names",
         ]),
         "git" => Some(&["anonymous_access"]),
+        "cedar" => Some(&["enforcement"]),
         _ => None,
     }
 }
@@ -2095,6 +2122,37 @@ mod tests {
             err.to_string()
                 .contains("monorepo.rename.similarity_threshold")
         );
+    }
+
+    #[test]
+    fn config_validate_accepts_valid_cedar_enforcement() {
+        for mode in ["off", "shadow", "enforce"] {
+            let mut config = valid_config();
+            config.cedar.enforcement = mode.to_string();
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("valid enforcement {mode:?} should pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_cedar_enforcement() {
+        let mut config = valid_config();
+        config.cedar.enforcement = "on".to_string();
+        let err = config
+            .validate()
+            .expect_err("invalid enforcement should fail");
+        assert!(err.to_string().contains("cedar.enforcement"));
+    }
+
+    #[test]
+    fn config_validate_rejects_admin_anonymous_reserved_word() {
+        let mut config = valid_config();
+        config.monorepo.admin = vec!["User::\"__anonymous__\"".to_string()];
+        let err = config
+            .validate()
+            .expect_err("reserved anonymous principal in admin should fail");
+        assert!(err.to_string().contains("__anonymous__"));
     }
 
     #[test]

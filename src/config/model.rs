@@ -43,6 +43,10 @@ pub struct Config {
     /// Git protocol settings (docs/refactoring/protocol.md Stage 4).
     #[serde(default)]
     pub git: GitConfig,
+    /// Authorization enforcement switch (`[cedar]`), ADR-UN-01. Default `off`
+    /// (no build, no consume of authorization data).
+    #[serde(default)]
+    pub cedar: CedarConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -973,6 +977,27 @@ impl Default for GitConfig {
             anonymous_access: default_git_anonymous_access(),
         }
     }
+}
+
+/// `[cedar]` authorization enforcement settings (ADR-UN-01).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CedarConfig {
+    /// Three-state enforcement switch: `off` | `shadow` | `enforce`.
+    /// `off` = do not build or consume authorization data (default).
+    #[serde(default = "default_cedar_enforcement")]
+    pub enforcement: String,
+}
+
+impl Default for CedarConfig {
+    fn default() -> Self {
+        Self {
+            enforcement: default_cedar_enforcement(),
+        }
+    }
+}
+
+fn default_cedar_enforcement() -> String {
+    "off".to_string()
 }
 
 #[cfg(test)]

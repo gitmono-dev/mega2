@@ -110,3 +110,11 @@
 - **文档与代码路径一致**：docs/refactoring 中的源码路径引用已对齐当前 `contract::*` 实现（阶段 1 完成，2026-06-23），降低文档过期误导后续开发者的概率。
 - **下游消费边界更清晰**：调用方区分 `contract::*`（外部协议边界）与 `callisto::*`（数据库实体层），降低路径选择错误或误触数据库实体直译的风险。
 - **后续改造基础就位**：vault.md、protocol.md、mail.md、notification.md 的后续质量改善可基于统一的路径结构展开，把精力聚焦在各自核心目标而非路径调整上。
+
+## 授权三态判定 helper（ADR-UN-01）
+
+`src/contract/policy/enforcement.rs` 提供授权三态判定的单源 helper（GC-UN-03）：
+
+- `Enforcement::{Off, Shadow, Enforce}`：`off` 不构建不消费授权数据；`shadow` 构建并评估、记录 would-deny 但不改变放行；`enforce` 构建并评估、真实拒绝。
+- `decide(enforcement, would_deny, store_empty)`：`enforce` + 空 store 返回 deny（fail-closed）。
+- 配置侧 `[cedar].enforcement`（`src/config/model.rs`）由 `config validate` 校验取值，并拒绝 `monorepo.admin` 含保留匿名主体 `User::"__anonymous__"`（ADR-UN-06 ⑤）。

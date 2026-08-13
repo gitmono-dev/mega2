@@ -12,6 +12,28 @@ Configuration source diagnostics are available with `--show-sources`; use
 Secrets are supplied by deployment configuration or supported Vault
 `SecretRef`s and must never be committed.
 
+## Cedar authorization enforcement
+
+The `[cedar]` section controls the authorization enforcement switch (ADR-UN-01):
+
+```toml
+[cedar]
+enforcement = "off"   # off | shadow | enforce
+```
+
+- `off` (default): do not build or consume authorization data; zero behavior
+  change.
+- `shadow`: build the store, evaluate, record would-deny logs, but do not
+  change allow decisions.
+- `enforce`: build the store, evaluate, and deny unauthorized requests.
+
+`config validate` rejects any other `enforcement` value, and rejects a
+`monorepo.admin` entry equal to the reserved anonymous principal
+`User::"__anonymous__"` (ADR-UN-06 ⑤). Source diagnostics for `cedar.enforcement`
+are available via `config validate --show-sources --format json` (the JSON
+output includes the field's winning source).
+
+
 ## Website authentication and product email
 
 Browser sessions are validated against website Better Auth. The `[oauth]`

@@ -2,6 +2,7 @@ use std::fmt::{self, Display};
 
 pub mod admin_resolver;
 pub mod context;
+pub mod enforcement;
 pub mod entitystore;
 pub mod guard;
 mod objects;
