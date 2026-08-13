@@ -71,7 +71,7 @@ import_dir = "/third-party"
 admin = ["benjamin_747"]
 
 # Set serveral root dirs in directory init
-root_dirs = ["third-party", "project", "doc", "release", "model", "toolchains"]
+root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 [monorepo.rename]
 # Similarity threshold (0-100) for move/rename detection in diff classification.

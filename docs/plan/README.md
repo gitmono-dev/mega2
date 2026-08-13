@@ -23,3 +23,4 @@
 | `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06 已由 `plan-20260802.md` 关闭** |
 | `plan-20260802.md` | 日期计划 | 已完成（Website 内部产品邮件 API；tip `a52d703`；DEP-06 关闭；monoengine `0.2.1`） |
 | `plan-20260803.md` | 日期计划 | 已完成（Git 使用场景测试补全；承接 PT-04 / DEFER-IT-01/02/12；GM-01..GM-12 全部终态，GM-04/GM-R1/GM-10A 正式取消、GM-10B handoff 承接；GM-12 发布于 v0.2.11，完成度复审收口于 v0.2.15） |
+| `plan-20260812.md` | 日期计划 | 评审通过（用户体系统一：website 认证 × monoengine 授权；UN-01..UN-60（无 UN-28），UN-05 为 handoff 移交卡（DEP-04→PT-12），UN-10/UN-18 为 forward-only 迁移，UN-02/UN-03 为 REL-01 家族子卡（发布点 UN-13），UN-33/UN-48/UN-41/UN-46/UN-50/UN-36/UN-53/UN-47/UN-42/UN-44 为 REL-02 家族子卡（发布点 UN-45），UN-26/UN-29..UN-32/UN-34/UN-35/UN-37..UN-40/UN-43/UN-49/UN-51/UN-52/UN-54..UN-60 为 ACL 可信基线审计；Codex R1–R44 FAIL 已修订，R45 复审 PASS） |
