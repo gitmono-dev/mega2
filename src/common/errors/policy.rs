@@ -25,4 +25,6 @@ pub enum SaturnContextError {
     AuthDenied(Diagnostics),
     #[error("Error constructing authorization request: {0}")]
     Request(String),
+    #[error("Error building Cedar entities: {0}")]
+    Entities(String),
 }

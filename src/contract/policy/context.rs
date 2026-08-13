@@ -78,7 +78,7 @@ impl CedarContext {
         resource: impl AsRef<SaturnEUid>,
         context: Context,
     ) -> Result<(), SaturnContextError> {
-        let es = self.entities.as_entities(&self.schema);
+        let es = self.entities.as_entities(&self.schema)?;
         let q = Request::new(
             principal.as_ref().clone().into(),
             action.as_ref().clone().into(),
