@@ -10,7 +10,10 @@ use crate::{
         secret::{SecretRef, SecretResolver, VaultSecretResolver, is_secret_ref_value},
         validate::{validate_config_secret_ref, validate_redis_url_literal},
     },
-    contract::vault::integration::vault_core::{VaultCore, with_audit_caller},
+    contract::{
+        policy::entitystore::SharedEntityStore,
+        vault::integration::vault_core::{VaultCore, with_audit_caller},
+    },
     jupiter::redis::{ConnectionManager, init_connection},
 };
 
@@ -36,6 +39,11 @@ pub struct AppContext {
     /// Token to signal shutdown for notification background tasks (dispatcher etc.).
     /// Created in new() ; callers (e.g. services) can clone and cancel on graceful exit.
     pub notification_shutdown: CancellationToken,
+
+    /// Shared authorization snapshot holder (ADR-UN-02). Unique owner created in
+    /// `new()`; the same `Arc` is injected into `Storage` and the HTTP state so
+    /// the write path (notify) and read path (guard/push) share one instance.
+    pub entity_store: Arc<SharedEntityStore>,
 }
 
 impl AppContext {
@@ -86,6 +94,14 @@ impl AppContext {
         )
         .await?;
         let config_handle = storage.config_handle();
+
+        // Create the shared authorization snapshot holder (ADR-UN-02) and inject
+        // the same `Arc` into `Storage` (write-path notify) and the HTTP state
+        // (read-path guard/push). First-build `ensure` happens before the HTTP
+        // listener binds (UN-02).
+        let entity_store = Arc::new(SharedEntityStore::new());
+        let mut storage = storage;
+        storage.set_entity_store(entity_store.clone());
 
         // Resolve any `vault://` SecretRef in `redis.url` post-vault, then build
         // the shared Redis connection from the resolved config
@@ -208,6 +224,7 @@ impl AppContext {
             config_handle,
             connection,
             notification_shutdown,
+            entity_store,
         })
     }
 

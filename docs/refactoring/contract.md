@@ -129,3 +129,9 @@
 - `decide_resource(enforcement, resolution)`：根实体缺失视为 would-deny——`enforce` 拒绝、`shadow` 放行但记录、`off` 放行。
 
 默认初始化产物（`src/jupiter/utils/converter.rs` 经 `generate_entity(admin, "/")`）只生成 `Repository::"/"` 一个仓库实体，且只为 `admins` 参数创建用户（不生成 maintainer/reader 成员）。
+
+## 共享授权实例创建/注入与 HTTP push 门三态（UN-02）
+
+`AppContext` 创建共享 `SharedEntityStore`（`Arc`，全服务唯一所有者，ADR-UN-02）并注入 `Storage`（写路径 notify 下发）与 HTTP state（读路径 guard/push）。`Storage::entity_store()` 返回同一 `Arc`；HTTP state 的授权句柄唯一来源 = `AppContext.entity_store`（`http_server.rs` 不再独立构造 `EntityStore::new()`）。首建幂等 `ensure` 在 HTTP listener 绑定前完成（`start_http` 内 `ensure_authz_first_build`）；`off` 下不构建，`shadow`/`enforce` 下首建失败使 server 启动失败。
+
+`check_push_permission` 切换到三态 helper（ADR-UN-01）：`off` 短路放行；`shadow` 放行但记录 would-deny（结构化字段 `event=authz_would_deny`）；`enforce` 拒绝无权限 push。资源经 UN-11 归一为根仓库 `Repository::"/"`，根实体缺失 fail-closed。

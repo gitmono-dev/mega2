@@ -36,6 +36,7 @@ use tokio::sync::Semaphore;
 use crate::{
     common::errors::MegaError,
     config::{Config, reload::ConfigHandle, validate::validate_buck_config},
+    contract::policy::entitystore::SharedEntityStore,
     jupiter::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
@@ -155,6 +156,10 @@ pub struct Storage {
     pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
     pub notification_storage: notification_storage::NotificationStorage,
+    /// Shared authorization snapshot holder (ADR-UN-02). Injected by
+    /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
+    /// path (notify) and read path (guard/push) observe the same instance.
+    pub(crate) entity_store: Arc<SharedEntityStore>,
 }
 
 impl Storage {
@@ -296,11 +301,25 @@ impl Storage {
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
             notification_storage,
+            entity_store: Arc::new(SharedEntityStore::default()),
         })
     }
 
     pub fn config_handle(&self) -> ConfigHandle {
         self.config_handle.clone()
+    }
+
+    /// Shared authorization snapshot holder (ADR-UN-02). Returns the same `Arc`
+    /// instance injected by `AppContext`.
+    pub fn entity_store(&self) -> Arc<SharedEntityStore> {
+        self.entity_store.clone()
+    }
+
+    /// Inject the shared authorization snapshot holder (ADR-UN-02). Called once
+    /// by `AppContext` during bootstrap; the same `Arc` is shared with the HTTP
+    /// state.
+    pub fn set_entity_store(&mut self, store: Arc<SharedEntityStore>) {
+        self.entity_store = store;
     }
 
     pub fn config(&self) -> Arc<Config> {
@@ -518,6 +537,7 @@ impl Storage {
             code_review_service: CodeReviewService::mock(),
             webhook_service,
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
+            entity_store: Arc::new(SharedEntityStore::default()),
         }
     }
 }

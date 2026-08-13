@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::{
     config::{DbConfig, reload::ConfigHandle, testing::isolated_config},
+    contract::policy::entitystore::SharedEntityStore,
     jupiter::{
         migration::apply_migrations,
         service::{
@@ -189,5 +190,6 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         code_review_service: CodeReviewService::mock(),
         webhook_service,
         notification_storage: NotificationStorage::new(connection.clone()),
+        entity_store: Arc::new(SharedEntityStore::default()),
     }
 }

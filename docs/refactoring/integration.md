@@ -71,6 +71,10 @@ Website email capture, if needed, belongs to website-next’s test provider
 configuration and may use the Compose `mailpit` service. See
 [`website-mail.md`](./website-mail.md).
 
+## 授权首建与 shadow→enforce 集成（UN-02）
+
+HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensure_authz_first_build`，ADR-UN-02）：`off` 不构建；`shadow`/`enforce` 下首建失败使 server 启动失败。push 门三态（`check_push_permission`）在 `shadow` 下放行并记录 would-deny，`enforce` 下拒绝无权限 push。UN-02 的 5 门 shadow→enforce 判据脚本使用 `MEGA_IT_PG*` 环境变量（登记于 `.env.test.example`，ER-11：凭据只经环境变量）。
+
 ## CI
 
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the

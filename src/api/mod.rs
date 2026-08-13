@@ -18,7 +18,7 @@ use crate::{
         protocol::repo::Repo,
     },
     common::errors::ProtocolError,
-    contract::policy::entitystore::EntityStore,
+    contract::policy::entitystore::{EntityStore, SharedEntityStore},
     jupiter::{
         service::webhook_service::WebhookService,
         storage::{
@@ -41,7 +41,7 @@ pub struct MonoApiServiceState {
     pub session_store: BrowserSessionStore,
     pub git_object_cache: Arc<GitObjectCache>,
     pub listen_addr: String,
-    pub entity_store: EntityStore,
+    pub entity_store: Arc<SharedEntityStore>,
     pub bellatrix: Arc<Bellatrix>,
 }
 
@@ -65,7 +65,13 @@ impl FromRef<MonoApiServiceState> for UserStorage {
 
 impl FromRef<MonoApiServiceState> for EntityStore {
     fn from_ref(state: &MonoApiServiceState) -> Self {
-        state.entity_store.clone()
+        // The guard consumes the shared snapshot's store; empty when not built
+        // (off mode). UN-08 switches the guard to the three-state helper.
+        state
+            .entity_store
+            .snapshot()
+            .map(|s| s.store().clone())
+            .unwrap_or_default()
     }
 }
 

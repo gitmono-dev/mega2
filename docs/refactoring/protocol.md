@@ -860,3 +860,7 @@ LFS:
 6. 已完成首批：SSH upload-pack 初始响应删除 UTF-8 转换，payload 按 bytes 写回 channel。
 
 完成这些之后，再开始 capability 收敛、认证统一和 LFS 加固。
+
+## push 门三态（UN-02）
+
+`check_push_permission` 已切换到三态 helper（ADR-UN-01）：`off` 短路放行（默认，零影响）；`shadow` 放行但记录 would-deny（`event=authz_would_deny` 结构化字段）；`enforce` 拒绝无权限 push。资源经 UN-11 归一为根仓库 `Repository::"/"`，根实体缺失 fail-closed。首建 `ensure` 在 HTTP listener 绑定前完成（`start_http`）。

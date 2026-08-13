@@ -9,6 +9,7 @@ use axum::{
     response::Response,
     routing::any,
 };
+use git_internal::internal::object::tree::Tree;
 use http::{HeaderName, HeaderValue, Method};
 use time::Duration;
 use tokio::{sync::watch, task::JoinHandle};
@@ -42,9 +43,13 @@ use crate::{
     context::AppContext,
     contract::{
         git_protocol::InfoRefsParams,
-        policy::{entitystore::EntityStore, guard::cedar_guard::cedar_guard},
+        policy::{
+            enforcement::Enforcement,
+            entitystore::{MEGA_CEDAR_PATH, SharedEntityStore},
+            guard::cedar_guard::cedar_guard,
+        },
     },
-    jupiter::service::artifact_service::ArtifactService,
+    jupiter::{service::artifact_service::ArtifactService, utils::converter::FromMegaModel},
     server::{CommonHttpOptions, trace_context},
 };
 
@@ -371,8 +376,59 @@ fn broadcast_shutdown(
     notification_shutdown.cancel();
 }
 
+/// Read the in-repo authorization data source `/.mega_cedar.json` from the root
+/// tree (ADR-UN-02).
+async fn load_mega_cedar_json(
+    storage: &crate::jupiter::storage::Storage,
+) -> Result<String, MegaError> {
+    let mono_storage = storage.mono_storage();
+    let root_ref = mono_storage
+        .get_main_ref("/")
+        .await?
+        .ok_or_else(|| MegaError::Other("Root ref not found".into()))?;
+    let root_tree = Tree::from_mega_model(
+        mono_storage
+            .get_tree_by_hash(&root_ref.ref_tree_hash)
+            .await?
+            .ok_or_else(|| MegaError::Other("Root tree not found".into()))?,
+    );
+    let file_name = MEGA_CEDAR_PATH.trim_start_matches('/');
+    let blob_item = root_tree
+        .tree_items
+        .iter()
+        .find(|item| item.name == file_name)
+        .ok_or_else(|| MegaError::Other(format!("{file_name} not found in root directory")))?;
+    let blob_hash = blob_item.id.to_string();
+    let content_bytes = storage.git_service.get_object_as_bytes(&blob_hash).await?;
+    String::from_utf8(content_bytes)
+        .map_err(|e| MegaError::Other(format!("UTF-8 decode failed: {e}")))
+}
+
+/// First-build the shared authorization snapshot before binding the HTTP
+/// listener (UN-02). `off` is a no-op; a failed first build fails startup.
+async fn ensure_authz_first_build(
+    shared: &SharedEntityStore,
+    storage: &crate::jupiter::storage::Storage,
+    enforcement: Enforcement,
+) -> Result<(), MegaError> {
+    if !enforcement.builds() {
+        return Ok(());
+    }
+    let json = load_mega_cedar_json(storage).await?;
+    shared
+        .ensure(&json)
+        .map_err(|e| MegaError::Other(format!("authorization first-build failed: {e}")))?;
+    Ok(())
+}
+
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     crate::config::validate::require_oauth_for_http_service(ctx.storage.config().as_ref())?;
+
+    // First-build the shared authorization snapshot before the listener binds
+    // (UN-02). `off` is a no-op; a failed first build fails startup.
+    let enforcement = Enforcement::parse(&ctx.storage.config().cedar.enforcement)
+        .ok_or_else(|| MegaError::Other("invalid cedar.enforcement".to_string()))?;
+    ensure_authz_first_build(&ctx.entity_store, &ctx.storage, enforcement).await?;
 
     let CommonHttpOptions { host, port } = options.clone();
     let server_url = format!("{host}:{port}");
@@ -587,7 +643,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         storage: storage.clone(),
         session_store: BrowserSessionStore::Website(session_store),
         listen_addr: format!("http://{host}:{port}"),
-        entity_store: EntityStore::new(),
+        entity_store: ctx.entity_store.clone(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
     };
@@ -1013,5 +1069,48 @@ mod tests {
         let new_req = rewrite_lfs_request_uri(req);
 
         assert_eq!(new_req.uri().path(), "/info/lfs/objects/123");
+    }
+
+    #[tokio::test]
+    async fn un02_first_build_off_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(dir.path()).await;
+        let shared = SharedEntityStore::new();
+        ensure_authz_first_build(&shared, &storage, Enforcement::Off)
+            .await
+            .expect("off must be a no-op");
+        assert!(shared.snapshot().is_none(), "off must not build");
+    }
+
+    #[tokio::test]
+    async fn un02_first_build_failure_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(dir.path()).await;
+        let shared = SharedEntityStore::new();
+        // Empty test storage has no root repo -> first build fails, which must
+        // fail server startup (UN-02 AC 6/7).
+        let err = ensure_authz_first_build(&shared, &storage, Enforcement::Enforce)
+            .await
+            .expect_err("first build must fail without a root repo");
+        assert!(
+            err.to_string().contains("Root ref not found")
+                || err.to_string().contains("first-build")
+        );
+    }
+
+    #[tokio::test]
+    async fn un02_first_build_shadow_failure_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(dir.path()).await;
+        let shared = SharedEntityStore::new();
+        // `shadow` also builds the store, so a failed first build must fail
+        // server startup (UN-02 AC 6).
+        let err = ensure_authz_first_build(&shared, &storage, Enforcement::Shadow)
+            .await
+            .expect_err("shadow first build must fail without a root repo");
+        assert!(
+            err.to_string().contains("Root ref not found")
+                || err.to_string().contains("first-build")
+        );
     }
 }

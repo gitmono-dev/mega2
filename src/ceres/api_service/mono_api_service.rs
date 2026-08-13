@@ -98,7 +98,7 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
-    contract::{api::common::Pagination, policy::entitystore::EntityStore},
+    contract::api::common::Pagination,
     jupiter::{
         service::buck_service::{
             CommitArtifacts, CompletePayload as SvcCompletePayload,
@@ -301,7 +301,7 @@ impl MonoServiceLogic {
     }
 
     /// Update parent trees along the given update chain with the new child tree hash.
-    /// This function prepares all updated trees and their associated ref updates.  
+    /// This function prepares all updated trees and their associated ref updates.
     /// Trees that do not depend on each other (e.g., sibling directories) can be updated in parallel.
     /// No new commits are created; only tree objects and ref updates are produced.
     pub fn build_result_by_chain(
@@ -3154,7 +3154,7 @@ impl MonoApiService {
         let state = ProtocolApiState {
             storage: self.storage.clone(),
             git_object_cache: self.git_object_cache.clone(),
-            entity_store: EntityStore::new(),
+            entity_store: self.storage.entity_store(),
         };
         let bytes = protocol
             .git_receive_pack_stream(

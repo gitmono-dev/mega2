@@ -13,10 +13,7 @@ use crate::{
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::{MegaError, MegaResult},
     context::AppContext,
-    contract::{
-        git_protocol::ssh::SshServer, policy::entitystore::EntityStore,
-        vault::integration::vault_core::VaultCoreInterface,
-    },
+    contract::{git_protocol::ssh::SshServer, vault::integration::vault_core::VaultCoreInterface},
     server::CommonHttpOptions,
 };
 
@@ -64,7 +61,7 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
             prefix: std::env::var("MEGA_GIT_OBJECT_CACHE_PREFIX")
                 .unwrap_or_else(|_| "git-object-rkyv:v1".to_string()),
         }),
-        entity_store: EntityStore::new(),
+        entity_store: ctx.storage.entity_store(),
     };
     let mut ssh_server = SshServer {
         clients: Arc::new(Mutex::new(HashMap::new())),

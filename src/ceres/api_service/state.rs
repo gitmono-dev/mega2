@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ceres::api_service::cache::GitObjectCache, contract::policy::entitystore::EntityStore,
+    ceres::api_service::cache::GitObjectCache, contract::policy::entitystore::SharedEntityStore,
     jupiter::storage::Storage,
 };
 
@@ -20,6 +20,7 @@ pub struct ProtocolApiState {
     pub storage: Storage,
     /// Shared cache for Git objects to improve access performance and reduce backend load.
     pub git_object_cache: Arc<GitObjectCache>,
-    /// Entity store for Cedar policy authorization.
-    pub entity_store: EntityStore,
+    /// Shared authorization snapshot holder (ADR-UN-02). Same `Arc` instance
+    /// as `AppContext.entity_store` / `Storage::entity_store()`.
+    pub entity_store: Arc<SharedEntityStore>,
 }
