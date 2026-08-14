@@ -158,11 +158,9 @@ jobs:
           # compose default is 1000:1000 (would block writes into host-created dirs).
           export MONOENGINE_IT_GIT_UID="$(id -u)"
           export MONOENGINE_IT_GIT_GID="$(id -g)"
-          # Name the services explicitly: `--profile git` alone would also start
-          # git-smoke, whose `depends_on: monoengine` (profile app) is undefined
-          # in this profile set and fails the whole project (FIX: pre-existing
-          # compose/CI bug, not caused by this release). git-smoke is brought up
-          # later with the app+web+git profiles.
+          # Name the services explicitly (git-smoke lives in its own `smoke`
+          # profile; see docker-compose.test.yml). git-smoke is brought up later
+          # with the app+web+smoke profiles.
           docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait postgres redis git-cli
           docker compose -p monoengine-it -f docker-compose.test.yml ps
 
@@ -179,7 +177,7 @@ jobs:
           rm -rf target
           docker builder prune -f >/dev/null 2>&1 || true
           df -h /
-          docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web --profile git up -d --wait
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web --profile git --profile smoke up -d --wait
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
           curl -sf "http://127.0.0.1:17001/api/auth/get-session" >/dev/null
           echo "OK: compose monoengine and website-next healthy"
@@ -406,10 +404,10 @@ jobs:
           VALUES ((extract(epoch from clock_timestamp()) * 1000000)::bigint, 'ci-smoke', :'token', now())
           ON CONFLICT DO NOTHING;
           SQL
-          docker compose -p monoengine-it -f docker-compose.test.yml --profile git exec -T git-smoke \
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile smoke exec -T git-smoke \
             bash -c 'export MONOENGINE_HTTP_REPO_URL="http://ci-smoke:monoengine-it-git-smoke-token-0001@monoengine:8000/"; export MONOENGINE_GIT_SMOKE_PUSH=1; export MONOENGINE_GIT_SMOKE_LFS=0; export MONOENGINE_GIT_SMOKE_WORKDIR=/work/ci-smoke; mkdir -p /work/ci-smoke; bash /repo/scripts/git_protocol_smoke.sh'
 
       - name: Stop test services
         if: always()
         working-directory: monoengine
-        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git --profile app --profile web down -v
+        run: docker compose -p monoengine-it -f docker-compose.test.yml --profile git --profile app --profile web --profile smoke down -v

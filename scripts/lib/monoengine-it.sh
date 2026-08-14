@@ -79,8 +79,8 @@ monoengine_it_up_full() {
 }
 
 monoengine_it_down() {
-  monoengine_it_info "tearing down ${MONOENGINE_IT_PROJECT} (profiles git+app+web, -v)"
-  monoengine_it_compose --profile git --profile app --profile web down -v
+  monoengine_it_info "tearing down ${MONOENGINE_IT_PROJECT} (profiles git+app+web+smoke, -v)"
+  monoengine_it_compose --profile git --profile app --profile web --profile smoke down -v
 }
 
 monoengine_it_health() {

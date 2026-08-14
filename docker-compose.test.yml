@@ -125,7 +125,7 @@ services:
       timeout: 5s
       retries: 20
 
-  # Linked git protocol smoke runner (profile `git`).
+  # Linked git protocol smoke runner (profile `smoke`).
   #
   # Unlike `git-cli` (host networking, for the cargo-native harness that spawns
   # its own service on the host), this service JOINS networks.default and talks
@@ -136,19 +136,25 @@ services:
   # It depends on `monoengine` (profile `app`) being up, so bring the whole
   # linked stack up together:
   #   docker compose -p monoengine-it -f docker-compose.test.yml \
-  #     --profile app --profile git up -d --wait
+  #     --profile app --profile smoke up -d --wait
   #
   # Then drive the smoke from the host:
   #   docker compose -p monoengine-it -f docker-compose.test.yml \
-  #     --profile git exec -T git-smoke \
+  #     --profile smoke exec -T git-smoke \
   #     bash scripts/git_protocol_smoke.sh
   # (with MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ and a seeded token).
+  #
+  # NOTE: git-smoke lives in its own `smoke` profile (not `git`) so that
+  # `--profile git` invocations (git-cli + data plane) never activate it. Its
+  # `depends_on: monoengine` (profile `app`) would otherwise make the compose
+  # project invalid whenever the `git` profile is active but `app` is not
+  # ("service git-smoke depends on undefined service monoengine").
   git-smoke:
     image: monoengine-git-smoke:3.7.1
     build:
       context: .
       dockerfile: Dockerfile.git-smoke
-    profiles: ["git"]
+    profiles: ["smoke"]
     init: true
     depends_on:
       monoengine:
