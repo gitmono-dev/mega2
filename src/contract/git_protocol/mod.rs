@@ -124,14 +124,20 @@ pub fn decide_push(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
     use crate::{
-        ceres::protocol::PushUserInfo,
-        contract::policy::{
-            builder::build_from_json,
-            entitystore::{SharedEntityStore, generate_entity},
+        ceres::{
+            api_service::{cache::GitObjectCache, state::ProtocolApiState},
+            protocol::PushUserInfo,
+        },
+        contract::{
+            git_protocol::ssh::SshServer,
+            policy::{
+                builder::build_from_json,
+                entitystore::{SharedEntityStore, generate_entity},
+            },
         },
     };
 
@@ -234,17 +240,56 @@ mod tests {
 
         // `ctx_entity_store` is the `AppContext.entity_store` field (unique
         // owner, ADR-UN-02). `AppContext::new` injects the same `Arc` into
-        // `Storage` and the HTTP state.
+        // `Storage`, the HTTP state, and the SSH state.
         let ctx_entity_store = Arc::new(SharedEntityStore::new());
         storage.set_entity_store(ctx_entity_store.clone());
 
         // Storage leg: `entity_store()` returns the injected `Arc`.
         assert!(Arc::ptr_eq(&ctx_entity_store, &storage.entity_store()));
 
-        // HTTP leg: the HTTP state is built from `ctx.entity_store.clone()`.
-        let http_entity_store = ctx_entity_store.clone();
-        assert!(Arc::ptr_eq(&ctx_entity_store, &http_entity_store));
-        assert!(Arc::ptr_eq(&storage.entity_store(), &http_entity_store));
+        // HTTP leg: build a real `ProtocolApiState` exactly as the HTTP server
+        // does (`src/server/http_server.rs`), from `ctx.entity_store.clone()`.
+        let http_state = ProtocolApiState {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: crate::jupiter::redis::init_connection(&crate::config::RedisConfig {
+                    url: std::env::var("MEGA_REDIS__URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+                })
+                .await
+                .expect("redis connection"),
+                prefix: "test".to_string(),
+            }),
+            entity_store: ctx_entity_store.clone(),
+        };
+        assert!(Arc::ptr_eq(&ctx_entity_store, &http_state.entity_store));
+        assert!(Arc::ptr_eq(
+            &storage.entity_store(),
+            &http_state.entity_store
+        ));
+
+        // SSH leg (UN-03): build a real `SshServer` exactly as the SSH server
+        // does (`src/server/ssh_server.rs`), from `ctx.entity_store.clone()`.
+        let ssh_server = SshServer {
+            clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            state: ProtocolApiState {
+                storage: storage.clone(),
+                git_object_cache: http_state.git_object_cache.clone(),
+                entity_store: ctx_entity_store.clone(),
+            },
+            id: 0,
+            channels: HashMap::new(),
+            v2_channels: HashMap::new(),
+            authenticated_user: None,
+        };
+        assert!(Arc::ptr_eq(
+            &ctx_entity_store,
+            &ssh_server.state.entity_store
+        ));
+        assert!(Arc::ptr_eq(
+            &storage.entity_store(),
+            &ssh_server.state.entity_store
+        ));
     }
 
     #[tokio::test]

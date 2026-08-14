@@ -863,4 +863,6 @@ LFS:
 
 ## push 门三态（UN-02）
 
-`check_push_permission` 已切换到三态 helper（ADR-UN-01）：`off` 短路放行（默认，零影响）；`shadow` 放行但记录 would-deny（`event=authz_would_deny` 结构化字段）；`enforce` 拒绝无权限 push。资源经 UN-11 归一为根仓库 `Repository::"/"`，根实体缺失 fail-closed。首建 `ensure` 在 HTTP listener 绑定前完成（`start_http`）。
+`check_push_permission` 切换到三态 helper（ADR-UN-01）：`off` 短路放行（默认，零影响）；`shadow` 放行但记录 would-deny（`event=authz_would_deny` 结构化字段）；`enforce` 拒绝无权限 push。资源经 UN-11 归一为根仓库 `Repository::"/"`，根实体缺失 fail-closed。首建 `ensure` 在 HTTP listener 绑定前完成（`start_http`）。
+
+SSH 面（UN-03）与 HTTP 面共享同一 `AppContext.entity_store` 实例（`service multi` 单进程内四方恒等：context↔storage↔HTTP↔SSH）。独立 `service ssh` 在命令层对 `enforcement != off` 拒绝启动（指引改用 `service multi` 或保持 `off`）；SSH listener 绑定前完成幂等首建。

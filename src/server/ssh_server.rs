@@ -13,7 +13,10 @@ use crate::{
     ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
     common::errors::{MegaError, MegaResult},
     context::AppContext,
-    contract::{git_protocol::ssh::SshServer, vault::integration::vault_core::VaultCoreInterface},
+    contract::{
+        git_protocol::ssh::SshServer, policy::enforcement::Enforcement,
+        vault::integration::vault_core::VaultCoreInterface,
+    },
     server::CommonHttpOptions,
 };
 
@@ -54,6 +57,18 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
         custom: SshCustom { ssh_port },
     } = command;
 
+    // First-build the shared authorization snapshot before the SSH listener
+    // binds (UN-03). `off` is a no-op; in `multi` the HTTP server already built
+    // it (idempotent `ensure`).
+    let enforcement = Enforcement::parse(&ctx.storage.config().cedar.enforcement)
+        .ok_or_else(|| MegaError::Other("invalid cedar.enforcement".to_string()))?;
+    crate::server::http_server::ensure_authz_first_build(
+        &ctx.entity_store,
+        &ctx.storage,
+        enforcement,
+    )
+    .await?;
+
     let state = ProtocolApiState {
         storage: ctx.storage.clone(),
         git_object_cache: Arc::new(GitObjectCache {
@@ -61,7 +76,7 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
             prefix: std::env::var("MEGA_GIT_OBJECT_CACHE_PREFIX")
                 .unwrap_or_else(|_| "git-object-rkyv:v1".to_string()),
         }),
-        entity_store: ctx.storage.entity_store(),
+        entity_store: ctx.entity_store.clone(),
     };
     let mut ssh_server = SshServer {
         clients: Arc::new(Mutex::new(HashMap::new())),

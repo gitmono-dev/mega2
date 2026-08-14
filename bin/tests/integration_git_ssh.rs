@@ -990,6 +990,329 @@ fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) 
     (service, port, stdout_path, stderr_path)
 }
 
+/// Boot `service multi http ssh` (UN-03): the SSH leg shares the `AppContext`
+/// instance with the HTTP leg, so authorization enforcement (`shadow`/`enforce`)
+/// is available over SSH. Standalone `service ssh` refuses `enforcement != off`,
+/// so the real-CLI push rejection cases must go through `multi`.
+fn boot_service_multi(
+    env: &GitSshEnv,
+    enforcement: &str,
+) -> (ServiceProcess, u16, u16, PathBuf, PathBuf) {
+    let http_port = git_cli::reserve_ephemeral_port();
+    let ssh_port = git_cli::reserve_ephemeral_port();
+    git_cli::record_allocated_port(http_port);
+    git_cli::record_allocated_port(ssh_port);
+    let stdout_path = env.temp_dir.path().join("multi.out");
+    let stderr_path = env.temp_dir.path().join("multi.err");
+
+    let mut command = env.full_config_command();
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    command.env("MEGA_CEDAR__ENFORCEMENT", enforcement);
+    let http_port_arg = http_port.to_string();
+    let ssh_port_arg = ssh_port.to_string();
+    command.args([
+        "service",
+        "multi",
+        "http",
+        "ssh",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &http_port_arg,
+        "--ssh-port",
+        &ssh_port_arg,
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    service.wait_until_listening(
+        ssh_port,
+        Duration::from_secs(90),
+        &stdout_path,
+        &stderr_path,
+    );
+    (service, http_port, ssh_port, stdout_path, stderr_path)
+}
+
+/// Migrate-boot (off), seed the SSH key, then boot `service multi` under the
+/// given enforcement. Returns the live service plus the SSH port / git_ssh /
+/// remote for the case.
+fn prepare_authenticated_ssh_multi(
+    env: &GitSshEnv,
+    enforcement: &str,
+) -> (ServiceProcess, u16, PathBuf, PathBuf, String, String) {
+    let client_key = env.ssh_dir.join("client_ed25519");
+    let client_pub = env.ssh_dir.join("client_ed25519.pub");
+    let known_hosts = env.ssh_dir.join("known_hosts");
+
+    git_cli::generate_client_ed25519(&client_key);
+    let pubkey = fs::read_to_string(&client_pub).expect("read client public key");
+    let finger = git_cli::ssh_fingerprint_sha256_col2(&client_pub);
+
+    // Migrations must complete before ssh_keys seed (ADR-GM-05). Boot multi with
+    // `off` (the default) to apply migrations + Vault host key, then shut down.
+    {
+        let (mut migrate_service, _hp, _sp, _out, err) = boot_service_multi(env, "off");
+        let status = migrate_service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(
+            status.success(),
+            "migrate boot did not shut down cleanly: {status}\nstderr:\n{}",
+            read_log(&err),
+        );
+        drop(migrate_service);
+    }
+
+    git_cli::seed_ssh_key(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        "un03-multi",
+        pubkey.trim(),
+        &finger,
+    );
+    git_cli::assert_ssh_keys_row_matches_keypair(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        &finger,
+    );
+
+    let (service, _http_port, ssh_port, stdout_path, stderr_path) =
+        boot_service_multi(env, enforcement);
+    git_cli::write_known_hosts_via_keyscan(&known_hosts, ssh_port);
+    let git_ssh = git_cli::git_ssh_command(&env.case_dir, ssh_port);
+    let remote = format!(
+        "ssh://{}@127.0.0.1:{ssh_port}/",
+        git_cli::DEFAULT_SSH_AUTH_USER
+    );
+    (service, ssh_port, stdout_path, stderr_path, git_ssh, remote)
+}
+
+#[test]
+fn integration_git_ssh_enforce_rejects_unauthorized_push() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    // UN-03 allowlist markers (three-state gate over SSH via `service multi`).
+    const _: &str = "enforce_rejects_non_admin_ssh_push";
+    const _: &str = "service_multi_shared_instance_http_ssh";
+    const _: &str = "ssh_push_uses_check_push_permission_three_state_gate";
+
+    let env = GitSshEnv::new();
+    let (mut service, ssh_port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh_multi(&env, "enforce");
+    let service_pid = service.pid();
+
+    let clone_name = "un03-enforce-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "clone before enforce push",
+    );
+    let clone = env.case_dir.join(clone_name);
+    let branch = format!("un03-enforce-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create branch for enforce push attempt",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "config", "user.name", "UN-03 Enforce"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "un03-enforce@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::write(clone.join("un03-enforce.txt"), b"enforce push must fail\n").expect("write marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "add", "un03-enforce.txt"],
+        ),
+        "git add enforce marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "commit", "-m", "un03 enforce attempt"],
+        ),
+        "git commit enforce marker",
+    );
+
+    // Non-admin user (`it-git-ssh`) pushing to the private root repo must be
+    // denied under `enforce` (fail-closed three-state gate, ADR-UN-01).
+    let push = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{branch}"),
+        ],
+    );
+    assert!(
+        !push.status.success(),
+        "enforce must reject non-admin SSH push; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", ssh_port)).is_ok(),
+        "SSH service must remain listening after enforce rejection on port {ssh_port}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(ssh_port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_shadow_allows_push_but_records_would_deny() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    // UN-03 allowlist markers (three-state gate over SSH via `service multi`).
+    const _: &str = "shadow_allows_ssh_push_but_records_would_deny";
+    const _: &str = "service_multi_shared_instance_http_ssh";
+    const _: &str = "ssh_push_uses_check_push_permission_three_state_gate";
+
+    let env = GitSshEnv::new();
+    let (mut service, ssh_port, stdout_path, _stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh_multi(&env, "shadow");
+    let service_pid = service.pid();
+
+    let clone_name = "un03-shadow-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "clone before shadow push",
+    );
+    let clone = env.case_dir.join(clone_name);
+    let branch = format!("un03-shadow-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create branch for shadow push",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "config", "user.name", "UN-03 Shadow"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "un03-shadow@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::write(clone.join("un03-shadow.txt"), b"shadow push allowed\n").expect("write marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "add", "un03-shadow.txt"],
+        ),
+        "git add shadow marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "commit", "-m", "un03 shadow push"],
+        ),
+        "git commit shadow marker",
+    );
+
+    // `shadow` allows the push (no behavior change) but records would-deny.
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        ),
+        "shadow must allow non-admin SSH push",
+    );
+    // The three-state gate must have evaluated and recorded would-deny.
+    let stdout_body = read_log(&stdout_path);
+    assert!(
+        stdout_body.contains("authz_would_deny"),
+        "shadow push must record authz_would_deny in service stdout:\n{stdout_body}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&_stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(ssh_port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
     command

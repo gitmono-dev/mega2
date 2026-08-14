@@ -406,7 +406,7 @@ async fn load_mega_cedar_json(
 
 /// First-build the shared authorization snapshot before binding the HTTP
 /// listener (UN-02). `off` is a no-op; a failed first build fails startup.
-async fn ensure_authz_first_build(
+pub(crate) async fn ensure_authz_first_build(
     shared: &SharedEntityStore,
     storage: &crate::jupiter::storage::Storage,
     enforcement: Enforcement,
