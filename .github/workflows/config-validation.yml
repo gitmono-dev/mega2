@@ -158,6 +158,13 @@ jobs:
           # compose default is 1000:1000 (would block writes into host-created dirs).
           export MONOENGINE_IT_GIT_UID="$(id -u)"
           export MONOENGINE_IT_GIT_GID="$(id -g)"
+          # Persist across steps: the "Start compose-hosted monoengine" step also
+          # brings up --profile git, and its `docker compose up` recomputes the
+          # git-cli `user:` from the environment. Without these, it recreates
+          # git-cli as the default 1000:1000, which cannot write into the case
+          # dirs the test process (runner UID) creates under the shared workdir.
+          echo "MONOENGINE_IT_GIT_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "MONOENGINE_IT_GIT_GID=$(id -g)" >> "$GITHUB_ENV"
           # Name the services explicitly (git-smoke lives in its own `smoke`
           # profile; see docker-compose.test.yml). git-smoke is brought up later
           # with the app+web+smoke profiles.
@@ -177,6 +184,12 @@ jobs:
           rm -rf target
           docker builder prune -f >/dev/null 2>&1 || true
           df -h /
+          # Re-assert the runner identity (also persisted via $GITHUB_ENV above):
+          # this `up` includes --profile git, so git-cli's `user:` must stay the
+          # runner UID or the container is recreated as 1000:1000 and the IT
+          # harness's host-created case dirs become unwritable.
+          export MONOENGINE_IT_GIT_UID="$(id -u)"
+          export MONOENGINE_IT_GIT_GID="$(id -g)"
           docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web --profile git --profile smoke up -d --wait
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
           curl -sf "http://127.0.0.1:17001/api/auth/get-session" >/dev/null
