@@ -144,7 +144,7 @@ jobs:
         run: |
           echo "::add-mask::monoengine_test_password"
 
-      - name: Start test services (PostgreSQL, Redis, RustFS, git-cli)
+      - name: Start test services (PostgreSQL, Redis, git-cli)
         working-directory: monoengine
         run: |
           set -euo pipefail
@@ -158,7 +158,12 @@ jobs:
           # compose default is 1000:1000 (would block writes into host-created dirs).
           export MONOENGINE_IT_GIT_UID="$(id -u)"
           export MONOENGINE_IT_GIT_GID="$(id -g)"
-          docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait
+          # Name the services explicitly: `--profile git` alone would also start
+          # git-smoke, whose `depends_on: monoengine` (profile app) is undefined
+          # in this profile set and fails the whole project (FIX: pre-existing
+          # compose/CI bug, not caused by this release). git-smoke is brought up
+          # later with the app+web+git profiles.
+          docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait postgres redis git-cli
           docker compose -p monoengine-it -f docker-compose.test.yml ps
 
       - name: Start compose-hosted monoengine and website (profiles app + web)
