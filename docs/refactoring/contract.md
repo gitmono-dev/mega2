@@ -135,3 +135,20 @@
 `AppContext` 创建共享 `SharedEntityStore`（`Arc`，全服务唯一所有者，ADR-UN-02）并注入 `Storage`（写路径 notify 下发）与 HTTP state（读路径 guard/push）。`Storage::entity_store()` 返回同一 `Arc`；HTTP state 的授权句柄唯一来源 = `AppContext.entity_store`（`http_server.rs` 不再独立构造 `EntityStore::new()`）。首建幂等 `ensure` 在 HTTP listener 绑定前完成（`start_http` 内 `ensure_authz_first_build`）；`off` 下不构建，`shadow`/`enforce` 下首建失败使 server 启动失败。
 
 `check_push_permission` 切换到三态 helper（ADR-UN-01）：`off` 短路放行；`shadow` 放行但记录 would-deny（结构化字段 `event=authz_would_deny`）；`enforce` 拒绝无权限 push。资源经 UN-11 归一为根仓库 `Repository::"/"`，根实体缺失 fail-closed。
+
+## 授权快照传播闭合与主干删除防护（UN-16）
+
+`src/contract/policy/notify.rs` 是触发共享快照重建的**唯一入口**（GC-UN-03）：
+
+- `notify_authz_changed(storage, old_blob_id, new_blob_id)`：以主干 `/.mega_cedar.json` 的 blob ID 变化为条件（O(1) 比较），无变化直接返回；变化时经 `Storage::entity_store()` 拿到的共享实例执行 build-then-swap（UN-15 语义：失败保留旧快照 + `error` 日志 + 置 dirty）。
+- `notify_authz_changed_best_effort(...)`：ref 已写、后续步骤失败的路径不得回滚业务操作，因此只记录并置 dirty（ADR-UN-01：`enforce` + dirty = 受护判定全拒）。
+
+主干 ref 的真实出入口全部挂接（写点 allowlist 由 `scripts/authz_write_points_guard.sh` 强制，新增调用方必须挂接或登记为例外）：
+
+| 出入口 | 挂接点 | 备注 |
+| --- | --- | --- |
+| merge 漏斗 | `mono_api_service.rs::apply_update_result` 成功后 | 覆盖 merge / merge-no-auth / merge queue 三条路径 |
+| import 根挂接 | `import_repo.rs::attach_to_monorepo_parent` 的 `txn.commit()` 之后 | CAS 推进根主干 |
+| receive-pack Delete | `monorepo.rs::apply_cl_mega_ref_for_push_command` 的 Delete 分支 | 同点**拒绝删除主干 ref**（`MEGA_BRANCH_NAME`），错误对 git 客户端可操作 |
+
+主干删除拒绝是有意的安全收口（非 enforcement 门控，GC-UN-01 例外公示），在 `off` 默认下也生效。

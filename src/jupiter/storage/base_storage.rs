@@ -91,15 +91,20 @@ pub trait StorageConnector {
         while i < len {
             let end = (i + Self::BATCH_CHUNK_SIZE).min(len);
             let models = save_models[i..end].to_vec();
-            let _ = match E::insert_many(models)
+            match E::insert_many(models)
                 .on_conflict(onconflict.clone())
                 .exec(&conn)
                 .await
             {
-                Ok(_) => Ok(()),
-                Err(DbErr::RecordNotInserted) => Ok(()),
-                Err(e) => Err(e),
-            };
+                Ok(_) => {}
+                Err(DbErr::RecordNotInserted) => {}
+                // UN-16: propagate genuine errors (dropped table, constraint
+                // violation, ...). The previous `let _ =` silently discarded
+                // them, so a failed commit/tree save after a ref write left the
+                // ref pointing at a missing object with no dirty flag — a
+                // fail-open window for the shared authz snapshot.
+                Err(e) => return Err(e.into()),
+            }
             i = end;
         }
         Ok(())

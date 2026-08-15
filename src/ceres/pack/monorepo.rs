@@ -45,9 +45,12 @@ use crate::{
     },
     common::{
         errors::MegaError,
-        utils::{self, ZERO_ID},
+        utils::{self, MEGA_BRANCH_NAME, ZERO_ID},
     },
-    contract::api::common::Pagination,
+    contract::{
+        api::common::Pagination,
+        policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
+    },
     jupiter::{storage::Storage, utils::converter::FromMegaModel},
 };
 
@@ -817,7 +820,40 @@ impl MonoRepo {
                     .await?;
             }
         }
-        txn.commit().await.map_err(MegaError::Db)
+        txn.commit().await.map_err(MegaError::Db)?;
+        // UN-16: receive-pack Delete branch hook (post-commit). A branch
+        // delete cannot touch main (rejected above), so the old/new blob IDs
+        // from main's tree are equal and the notify is a no-op — but the hook
+        // point is wired so any future path that removes main's
+        // `/.mega_cedar.json` marks the shared snapshot dirty (fail-closed).
+        if cmds.iter().any(|cmd| {
+            cmd.ref_type == RefTypeEnum::Branch
+                && (cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID)
+        }) {
+            let storage = self.storage.mono_storage();
+            // The ref deletions are already committed, so a failure while
+            // reading main's tree leaves the snapshot stale: mark dirty
+            // (fail-closed) before propagating.
+            let blob_id = match async {
+                let root = storage.get_main_ref("/").await?;
+                let tree = match root {
+                    Some(r) => storage.get_tree_by_hash(&r.ref_tree_hash).await?,
+                    None => None,
+                };
+                Ok::<_, MegaError>(tree.and_then(|t| authz_blob_id(&Tree::from_mega_model(t))))
+            }
+            .await
+            {
+                Ok(blob_id) => blob_id,
+                Err(e) => {
+                    self.storage.entity_store().mark_dirty();
+                    return Err(e);
+                }
+            };
+            notify_authz_changed_best_effort(&self.storage, blob_id.as_deref(), blob_id.as_deref())
+                .await;
+        }
+        Ok(())
     }
 
     async fn apply_cl_mega_ref_for_push_command(
@@ -827,6 +863,18 @@ impl MonoRepo {
     ) -> Result<(), MegaError> {
         let storage = self.storage.mono_storage();
         if cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID {
+            // UN-16: reject deleting the main branch ref. The shared authz
+            // snapshot is keyed on main's `/.mega_cedar.json`; deleting main
+            // would leave the snapshot without a source of truth. This is a
+            // deliberate safety closure (not an enforcement gate), surfaced to
+            // git clients as an actionable error.
+            if cmd.ref_name == MEGA_BRANCH_NAME {
+                return Err(MegaError::Other(format!(
+                    "refusing to delete the main branch ref `{MEGA_BRANCH_NAME}`: \
+                     the authorization snapshot is keyed on main's `/.mega_cedar.json`; \
+                     use the Web UI / API to manage the default branch"
+                )));
+            }
             let existing = match txn {
                 Some(t) => storage.get_ref_by_name_in_txn(&cmd.ref_name, t).await?,
                 None => storage.get_ref_by_name(&cmd.ref_name).await?,

@@ -75,6 +75,18 @@ configuration and may use the Compose `mailpit` service. See
 
 HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensure_authz_first_build`，ADR-UN-02）：`off` 不构建；`shadow`/`enforce` 下首建失败使 server 启动失败。push 门三态（`check_push_permission`）在 `shadow` 下放行并记录 would-deny，`enforce` 下拒绝无权限 push。SSH 面（UN-03）与 HTTP 面共享同一 `AppContext.entity_store` 实例；独立 `service ssh` 对 `enforcement != off` 拒绝启动（指引 `service multi` 或 `off`）。UN-02 的 5 门 shadow→enforce 判据脚本使用 `MEGA_IT_PG*` 环境变量（登记于 `.env.test.example`，ER-11：凭据只经环境变量）。
 
+## 授权快照传播与主干删除防护集成（UN-16）
+
+`integration_git_cli` 与 `integration_git_ssh` 覆盖快照传播闭合的端到端行为：
+
+- `integration_git_cli_authz_revoke_grant_immediate_effect`：`enforce` 下非 admin push 被拒 → admin 合并授予变更后同一 push 通过 → 合并撤销变更后再次被拒，全程不重启服务。
+- `integration_git_cli_rejects_main_branch_delete`：receive-pack 删除主干 ref 被拒绝，错误对 git 客户端可操作。
+- `integration_git_ssh_authz_grant_immediate_effect`：ACL 变更经 HTTP 腿的 merge 漏斗合入，SSH 腿在下一次 push 即刻生效——`service multi` 下两腿共享同一实例的直接证据。
+
+授权变更后再次 push 前必须先 `git fetch` 并从新的 `origin/main` 起分支：`MonoRepo::check_entry` 只接受每次 push 携带单个 commit，陈旧克隆会把父提交一并打包而被拒。
+
+写点 allowlist 守卫（`scripts/authz_write_points_guard.sh`）与其两个自测变异（`--selftest-add` / `--selftest-remove`）是三道独立门，任何未登记的主干 ref 写入口都会使守卫非零退出。
+
 ## CI
 
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the

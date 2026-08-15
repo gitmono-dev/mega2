@@ -282,6 +282,15 @@ impl Drop for ServiceProcess {
 }
 
 fn boot_service_http(env: &GitCliEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_http_with_enforcement(env, None)
+}
+
+/// Boot `service http` under an explicit `MEGA_CEDAR__ENFORCEMENT` (UN-16 e2e:
+/// the grant/revoke immediate-effect case runs under `enforce`).
+fn boot_service_http_with_enforcement(
+    env: &GitCliEnv,
+    enforcement: Option<&str>,
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     let port = reserve_free_port();
     git_cli::record_allocated_port(port);
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -289,6 +298,9 @@ fn boot_service_http(env: &GitCliEnv) -> (ServiceProcess, u16, PathBuf, PathBuf)
 
     let mut command = env.full_config_command();
     command.env("MEGA_LOG__PRINT_STD", "true");
+    if let Some(enforcement) = enforcement {
+        command.env("MEGA_CEDAR__ENFORCEMENT", enforcement);
+    }
     command.args([
         "service",
         "http",
@@ -304,6 +316,35 @@ fn boot_service_http(env: &GitCliEnv) -> (ServiceProcess, u16, PathBuf, PathBuf)
     let mut service = ServiceProcess::spawn(command);
     service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
     (service, port, stdout_path, stderr_path)
+}
+
+/// Merge a CL via the no-auth merge API (`POST /cl/{link}/merge-no-auth`,
+/// "system" user). Returns the HTTP status code.
+fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
+    let url = format!("http://127.0.0.1:{port}/api/v1/cl/{cl_link}/merge-no-auth");
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-X",
+        "POST",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "30",
+        &url,
+    ]);
+    let output = command.output().expect("curl merge-no-auth");
+    assert!(
+        output.status.success(),
+        "curl merge-no-auth failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("bad http code from curl merge: {:?}", output.stdout))
 }
 
 #[test]
@@ -1176,6 +1217,529 @@ fn integration_git_cli_auth_token_never_leaks() {
     );
 }
 
+#[test]
+fn integration_git_cli_authz_revoke_grant_immediate_effect() {
+    // UN-16: 撤权/授权即时生效 e2e. The shared authz snapshot is rebuilt from
+    // main's `/.mega_cedar.json` via `notify_authz_changed` after a merge
+    // funnel commit (`apply_update_result`). Under `enforce`, a non-admin push
+    // is denied; after the admin merges a grant change, the same push is
+    // allowed; after the admin merges a revoke change, it is denied again —
+    // all without a service restart (the snapshot is swapped in-process).
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let admin_token = git_cli::resolve_seed_token();
+    let user_token = format!(
+        "it-git-token-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let (mut service, port, stdout_path, stderr_path) =
+        boot_service_http_with_enforcement(&env, Some("enforce"));
+
+    // Migrations + access_token table exist only after service bootstrap.
+    git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
+    git_cli::seed_access_token(
+        &env.database.db_url,
+        git_cli::DEFAULT_GIT_AUTH_USER,
+        &user_token,
+    );
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+
+    // --- baseline: non-admin push denied under enforce ---
+    let clone_name = "un16-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["clone", &remote_url, clone_name],
+        ),
+        "clone as non-admin",
+    );
+    let clone = env.case_dir.join(clone_name);
+    let baseline_branch = format!("un16-baseline-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "checkout", "-b", &baseline_branch],
+        ),
+        "create baseline branch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "config", "user.name", "IT Git CLI"],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &[
+                "-C",
+                clone_name,
+                "config",
+                "user.email",
+                "it-git-cli@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::write(
+        clone.join("un16-baseline.txt"),
+        b"baseline push must fail\n",
+    )
+    .expect("write marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "add", "un16-baseline.txt"],
+        ),
+        "git add baseline marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "commit", "-m", "un16 baseline"],
+        ),
+        "git commit baseline marker",
+    );
+    let baseline_push = git_cli::git_cli(
+        &env.case_dir,
+        &user_token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{baseline_branch}"),
+        ],
+    );
+    assert!(
+        !baseline_push.status.success(),
+        "non-admin push must be denied under enforce; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        baseline_push.status,
+        String::from_utf8_lossy(&baseline_push.stdout),
+        String::from_utf8_lossy(&baseline_push.stderr)
+    );
+
+    // --- grant: admin merges a change adding it-git-cli as admin ---
+    let admin_clone = "un16-admin-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["clone", &remote_url, admin_clone],
+        ),
+        "clone as admin",
+    );
+    let admin_dir = env.case_dir.join(admin_clone);
+    let grant_json = authz_json_with_admins(&["benjamin_747", git_cli::DEFAULT_GIT_AUTH_USER]);
+    fs::write(admin_dir.join(".mega_cedar.json"), &grant_json).expect("write grant authz json");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone, "config", "user.name", "Admin"],
+        ),
+        "admin git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone,
+                "config",
+                "user.email",
+                "admin@example.invalid",
+            ],
+        ),
+        "admin git user.email",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone, "add", ".mega_cedar.json"],
+        ),
+        "admin git add authz json",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone,
+                "commit",
+                "-m",
+                "un16 grant it-git-cli admin",
+            ],
+        ),
+        "admin git commit grant",
+    );
+    let grant_branch = format!("un16-grant-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{grant_branch}"),
+            ],
+        ),
+        "admin push grant change",
+    );
+    let grant_cl_link = latest_cl_link_for_user(&env.database.db_url, "benjamin_747");
+    let merge_status = merge_cl_no_auth(port, &grant_cl_link);
+    assert_eq!(merge_status, 200, "grant merge must succeed");
+
+    // --- grant takes effect immediately: non-admin push now allowed ---
+    // Fetch the merged main first so the pushed commit's parent is known to the
+    // server (a stale clone would otherwise send the parent commit too, which
+    // the single-commit-per-push MonoRepo rule rejects).
+    let fetch_grant = git_cli::git_cli(
+        &env.case_dir,
+        &user_token,
+        &["-C", clone_name, "fetch", "origin"],
+    );
+    assert!(
+        fetch_grant.status.success(),
+        "fetch new main after grant merge failed; status={:?}\nstdout:\n{}\nstderr:\n{}\nservice.out:\n{}\nservice.err:\n{}",
+        fetch_grant.status,
+        String::from_utf8_lossy(&fetch_grant.stdout),
+        String::from_utf8_lossy(&fetch_grant.stderr),
+        read_log(&stdout_path),
+        read_log(&stderr_path),
+    );
+    let granted_branch = format!("un16-granted-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &[
+                "-C",
+                clone_name,
+                "checkout",
+                "-b",
+                &granted_branch,
+                "origin/main",
+            ],
+        ),
+        "checkout granted branch from origin/main",
+    );
+    fs::write(
+        clone.join("un16-granted.txt"),
+        b"granted push must succeed\n",
+    )
+    .expect("write granted marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "add", "un16-granted.txt"],
+        ),
+        "git add granted marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "commit", "-m", "un16 granted push"],
+        ),
+        "git commit granted marker",
+    );
+    let granted_push = git_cli::git_cli(
+        &env.case_dir,
+        &user_token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{granted_branch}"),
+        ],
+    );
+    assert!(
+        granted_push.status.success(),
+        "granted push must succeed after merge; status={:?}\nstdout:\n{}\nstderr:\n{}\nservice.out:\n{}\nservice.err:\n{}",
+        granted_push.status,
+        String::from_utf8_lossy(&granted_push.stdout),
+        String::from_utf8_lossy(&granted_push.stderr),
+        read_log(&stdout_path),
+        read_log(&stderr_path),
+    );
+
+    // --- revoke: admin merges a change removing it-git-cli from admin ---
+    let admin_clone2 = "un16-admin-clone2";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["clone", &remote_url, admin_clone2],
+        ),
+        "clone as admin (revoke)",
+    );
+    let admin_dir2 = env.case_dir.join(admin_clone2);
+    let revoke_json = authz_json_with_admins(&["benjamin_747"]);
+    fs::write(admin_dir2.join(".mega_cedar.json"), &revoke_json).expect("write revoke authz json");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone2, "config", "user.name", "Admin"],
+        ),
+        "admin2 git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone2,
+                "config",
+                "user.email",
+                "admin@example.invalid",
+            ],
+        ),
+        "admin2 git user.email",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone2, "add", ".mega_cedar.json"],
+        ),
+        "admin2 git add authz json",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone2,
+                "commit",
+                "-m",
+                "un16 revoke it-git-cli admin",
+            ],
+        ),
+        "admin2 git commit revoke",
+    );
+    let revoke_branch = format!("un16-revoke-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone2,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{revoke_branch}"),
+            ],
+        ),
+        "admin push revoke change",
+    );
+    let revoke_cl_link = latest_cl_link_for_user(&env.database.db_url, "benjamin_747");
+    let merge_status = merge_cl_no_auth(port, &revoke_cl_link);
+    assert_eq!(merge_status, 200, "revoke merge must succeed");
+
+    // --- revoke takes effect immediately: non-admin push denied again ---
+    // Fetch the merged main first (same stale-clone rationale as the grant push).
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "fetch", "origin"],
+        ),
+        "fetch new main after revoke merge",
+    );
+    let revoked_branch = format!("un16-revoked-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &[
+                "-C",
+                clone_name,
+                "checkout",
+                "-b",
+                &revoked_branch,
+                "origin/main",
+            ],
+        ),
+        "checkout revoked branch from origin/main",
+    );
+    fs::write(
+        clone.join("un16-revoked.txt"),
+        b"revoked push must be denied\n",
+    )
+    .expect("write revoked marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "add", "un16-revoked.txt"],
+        ),
+        "git add revoked marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &user_token,
+            &["-C", clone_name, "commit", "-m", "un16 revoked push"],
+        ),
+        "git commit revoked marker",
+    );
+    let revoked_push = git_cli::git_cli(
+        &env.case_dir,
+        &user_token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{revoked_branch}"),
+        ],
+    );
+    assert!(
+        !revoked_push.status.success(),
+        "revoked push must be denied after merge; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        revoked_push.status,
+        String::from_utf8_lossy(&revoked_push.stdout),
+        String::from_utf8_lossy(&revoked_push.stderr)
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_rejects_main_branch_delete() {
+    // UN-16: receive-pack Delete branch rejects deleting the main branch ref
+    // (`refs/heads/main`). The shared authz snapshot is keyed on main's
+    // `/.mega_cedar.json`; deleting main would leave the snapshot without a
+    // source of truth. The error must be actionable for git clients. This is a
+    // deliberate safety closure (not an enforcement gate), so it holds under
+    // the default `off` enforcement too.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = format!("http://127.0.0.1:{port}/");
+    let clone_name = "un16-main-delete-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for main-delete rejection",
+    );
+
+    let delete = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            ":refs/heads/main",
+        ],
+    );
+    assert!(
+        !delete.status.success(),
+        "deleting the main branch ref must be rejected; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        delete.status,
+        String::from_utf8_lossy(&delete.stdout),
+        String::from_utf8_lossy(&delete.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&delete.stderr);
+    assert!(
+        stderr.contains("refusing to delete the main branch ref"),
+        "main-delete rejection must be actionable for git clients; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("refs/heads/main"),
+        "main-delete rejection must name the main ref; stderr:\n{stderr}"
+    );
+
+    // The main ref must still be present after the rejected delete.
+    let heads = ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/heads/main");
+    assert!(
+        heads.iter().any(|r| r == "refs/heads/main"),
+        "main ref must survive the rejected delete; heads={heads:?}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
 fn collect_git_configs(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -1482,6 +2046,75 @@ fn expected_mega_cedar_json_bytes() -> Vec<u8> {
     serde_json::to_string_pretty(&json)
         .expect("serialize expected cedar entity")
         .into_bytes()
+}
+
+/// Generate `/.mega_cedar.json` content granting the given users admin
+/// membership (mirrors `contract::policy::entitystore::generate_entity`).
+fn authz_json_with_admins(admins: &[&str]) -> Vec<u8> {
+    let mut users = serde_json::Map::new();
+    for admin in admins {
+        let key = format!("User::\"{admin}\"");
+        users.insert(
+            key.clone(),
+            serde_json::json!({
+                "euid": key,
+                "parents": ["UserGroup::\"admin\""]
+            }),
+        );
+    }
+    let json = serde_json::json!({
+        "users": users,
+        "repos": {
+            "Repository::\"/\"": {
+                "euid": "Repository::\"/\"",
+                "is_private": true,
+                "admins": "UserGroup::\"admin\"",
+                "maintainers": "UserGroup::\"matainer\"",
+                "readers": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "user_groups": {
+            "UserGroup::\"admin\"": {
+                "euid": "UserGroup::\"admin\"",
+                "parents": ["UserGroup::\"matainer\""]
+            },
+            "UserGroup::\"matainer\"": {
+                "euid": "UserGroup::\"matainer\"",
+                "parents": ["UserGroup::\"reader\""]
+            },
+            "UserGroup::\"reader\"": {
+                "euid": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "merge_requests": {},
+        "issues": {}
+    });
+    serde_json::to_vec_pretty(&json).expect("serialize authz json")
+}
+
+/// Query the most recently created CL link for a username (UN-16 e2e: the
+/// admin's push creates a CL; the merge API needs its link).
+fn latest_cl_link_for_user(db_url: &str, username: &str) -> String {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for CL link: {err}"));
+        let username_sql = username.replace('\'', "''");
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT link FROM mega_cl WHERE username = '{username_sql}' \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+            ))
+            .await
+            .expect("query latest CL link")
+            .expect("CL row exists for admin push");
+        row.try_get("", "link").expect("link column")
+    })
 }
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {

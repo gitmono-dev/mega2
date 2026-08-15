@@ -476,22 +476,31 @@ impl SmartSession {
 
         let mut finalize_ms: Option<u128> = None;
         let mut bind_ms: Option<u128> = None;
+        let mut finalize_failed = false;
         if !unpack_failed {
             let t_finalize = Instant::now();
             if let Err(e) = repo_handler.finalize_receive_pack().await {
+                // UN-16: a per-ref rejection (e.g. main-branch delete) must reach
+                // the git client as an actionable `ng <ref> <reason>` report-status
+                // line, not a bare HTTP 400. Mark the branch commands failed and
+                // continue to build the report; skip the post-finalize bindings
+                // (the refs were not written).
                 let msg = e.to_string();
                 for c in commands.iter_mut() {
                     if c.ref_type == RefTypeEnum::Branch && c.status == "ok" {
                         c.failed(msg.clone());
                     }
                 }
-                return Err(e.into());
+                finalize_failed = true;
+            } else {
+                finalize_ms = Some(t_finalize.elapsed().as_millis());
             }
-            finalize_ms = Some(t_finalize.elapsed().as_millis());
 
-            let t_bind = Instant::now();
-            self.process_commit_bindings(state, &commands).await;
-            bind_ms = Some(t_bind.elapsed().as_millis());
+            if !finalize_failed {
+                let t_bind = Instant::now();
+                self.process_commit_bindings(state, &commands).await;
+                bind_ms = Some(t_bind.elapsed().as_millis());
+            }
         }
 
         for command in &commands {

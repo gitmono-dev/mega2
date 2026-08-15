@@ -98,7 +98,10 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
-    contract::api::common::Pagination,
+    contract::{
+        api::common::Pagination,
+        policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
+    },
     jupiter::{
         service::buck_service::{
             CommitArtifacts, CompletePayload as SvcCompletePayload,
@@ -2306,6 +2309,10 @@ impl MonoApiService {
         let mut new_commit_id = String::new();
         let mut commits: Vec<Commit> = Vec::new();
 
+        // UN-16: capture the pre-update main tree so the authz notify can
+        // compare the old/new `/.mega_cedar.json` blob IDs after the ref write.
+        let old_main_tree_hash = storage.get_main_ref("/").await?.map(|r| r.ref_tree_hash);
+
         let paths: Vec<&str> = result.ref_updates.iter().map(|r| r.path.as_str()).collect();
 
         let cl_refs_formatted = cl_link.map(|cl| format!("refs/cl/{}", cl));
@@ -2339,10 +2346,13 @@ impl MonoApiService {
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
 
-        storage
-            .save_mega_commits(commits, None)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        // UN-16: the main ref is now written. If a subsequent step fails, the
+        // shared authz snapshot is stale — mark dirty (fail-closed) so enforce
+        // mode rejects all (ADR-UN-01).
+        if let Err(e) = storage.save_mega_commits(commits, None).await {
+            self.storage.entity_store().mark_dirty();
+            return Err(GitError::CustomError(e.to_string()));
+        }
 
         let save_trees: Vec<mega_tree::ActiveModel> = result
             .updated_trees
@@ -2355,10 +2365,48 @@ impl MonoApiService {
             })
             .collect();
 
-        storage
-            .batch_save_model(save_trees)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        if let Err(e) = storage.batch_save_model(save_trees).await {
+            self.storage.entity_store().mark_dirty();
+            return Err(GitError::CustomError(e.to_string()));
+        }
+
+        // UN-16: notify the shared authz snapshot of a possible
+        // `/.mega_cedar.json` change on main. merge / merge-no-auth / merge
+        // queue all funnel through this single point.
+        // These reads also happen after the ref write, so a failure here leaves
+        // the snapshot stale just like a failed save above: mark dirty too.
+        let blob_ids = async {
+            let new_commit = storage
+                .get_commit_by_hash(&new_commit_id)
+                .await?
+                .ok_or_else(|| MegaError::Other("new commit not found".into()))?;
+            let new_blob_id = storage
+                .get_tree_by_hash(&new_commit.tree)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            let old_blob_id = match &old_main_tree_hash {
+                Some(hash) => storage
+                    .get_tree_by_hash(hash)
+                    .await?
+                    .and_then(|t| authz_blob_id(&Tree::from_mega_model(t))),
+                None => None,
+            };
+            Ok::<_, MegaError>((old_blob_id, new_blob_id))
+        }
+        .await;
+        let (old_blob_id, new_blob_id) = match blob_ids {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.storage.entity_store().mark_dirty();
+                return Err(GitError::CustomError(e.to_string()));
+            }
+        };
+        notify_authz_changed_best_effort(
+            &self.storage,
+            old_blob_id.as_deref(),
+            new_blob_id.as_deref(),
+        )
+        .await;
 
         Ok(new_commit_id)
     }
@@ -4860,4 +4908,240 @@ async fn test_third_party_trait() {
             tracing::warn!("Skipping test_third_party_trait because pack processing timed out");
         }
     }
+}
+
+// --- UN-16: merge funnel notify + dirty fail-closed (real test DB) ---
+//
+// These tests drive `apply_update_result` against a real Postgres test
+// schema (`crate::jupiter::tests::test_storage`, ER-01 test stack). The
+// `git_object_cache` is a lazy Redis connection that is never used by
+// `apply_update_result`, so no live Redis is required.
+
+async fn save_authz_json(storage: &Storage, json: &str) -> String {
+    storage
+        .git_service
+        .save_object_from_raw(bytes::Bytes::from(json.to_string()))
+        .await
+        .expect("save authz blob to object storage")
+}
+
+fn blob_item(name: &str, hex: &str) -> TreeItem {
+    TreeItem::new(
+        TreeItemMode::Blob,
+        ObjectHash::from_str(hex).unwrap(),
+        name.to_string(),
+    )
+}
+
+async fn setup_main_ref(storage: &Storage, old_tree: &Tree, old_commit_id: &str) {
+    storage
+        .mono_storage()
+        .save_mega_trees(
+            vec![old_tree.clone()],
+            ObjectHash::from_str(old_commit_id).unwrap(),
+            None,
+        )
+        .await
+        .expect("save old tree");
+    let main_ref = mega_refs::Model {
+        id: 1,
+        path: "/".to_string(),
+        ref_name: MEGA_BRANCH_NAME.to_string(),
+        ref_commit_hash: old_commit_id.to_string(),
+        ref_tree_hash: old_tree.id.to_string(),
+        created_at: chrono::Utc::now().naive_utc(),
+        updated_at: chrono::Utc::now().naive_utc(),
+        is_cl: false,
+    };
+    storage
+        .mono_storage()
+        .save_refs(main_ref, None)
+        .await
+        .expect("save main ref");
+}
+
+fn test_service(storage: &Storage) -> MonoApiService {
+    MonoApiService {
+        storage: storage.clone(),
+        git_object_cache: Arc::new(GitObjectCache {
+            connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                ::redis::aio::ConnectionManagerConfig::new(),
+            )
+            .expect("lazy connection manager"),
+            prefix: "test".to_string(),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn apply_update_result_rebuilds_snapshot_when_authz_blob_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+    let service = test_service(&storage);
+
+    let old_json =
+        crate::contract::policy::entitystore::generate_entity(&["admin".to_string()], "old-repo")
+            .expect("generate old authz");
+    let new_json =
+        crate::contract::policy::entitystore::generate_entity(&["admin".to_string()], "new-repo")
+            .expect("generate new authz");
+    let old_blob_id = save_authz_json(&storage, &old_json).await;
+    let new_blob_id = save_authz_json(&storage, &new_json).await;
+
+    let old_tree = Tree::from_tree_items(vec![blob_item(
+        crate::contract::policy::entitystore::MEGA_CEDAR_PATH.trim_start_matches('/'),
+        &old_blob_id,
+    )])
+    .unwrap();
+    setup_main_ref(
+        &storage,
+        &old_tree,
+        "1111111111111111111111111111111111111111",
+    )
+    .await;
+
+    let new_tree = Tree::from_tree_items(vec![blob_item(
+        crate::contract::policy::entitystore::MEGA_CEDAR_PATH.trim_start_matches('/'),
+        &new_blob_id,
+    )])
+    .unwrap();
+    let result = TreeUpdateResult {
+        updated_trees: vec![new_tree.clone()],
+        ref_updates: vec![RefUpdate {
+            path: "/".to_string(),
+            tree_id: new_tree.id,
+        }],
+    };
+
+    let new_commit_id = service
+        .apply_update_result(&result, "update authz", None)
+        .await
+        .expect("apply_update_result should succeed");
+    assert!(!new_commit_id.is_empty());
+
+    assert!(!storage.entity_store().is_dirty());
+    let snap = storage.entity_store().snapshot().expect("snapshot built");
+    assert!(
+        snap.store()
+            .contains_repository(&r#"Repository::"new-repo""#.parse().unwrap()),
+        "snapshot should reflect the new authz content"
+    );
+}
+
+#[tokio::test]
+async fn apply_update_result_marks_dirty_when_authz_blob_unreadable() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+    let service = test_service(&storage);
+
+    // Old main tree has no `/.mega_cedar.json` (old_blob_id = None).
+    // `from_tree_items` rejects empty trees, so build the empty tree via the
+    // struct literal (id is arbitrary; only the tree_items matter here).
+    let old_tree = Tree {
+        id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+        tree_items: vec![],
+    };
+    setup_main_ref(
+        &storage,
+        &old_tree,
+        "1111111111111111111111111111111111111111",
+    )
+    .await;
+
+    // New tree references a `/.mega_cedar.json` blob that does not exist in
+    // object storage: the notify read fails -> snapshot marked dirty
+    // (fail-closed). The write itself is already committed, so
+    // `apply_update_result` still returns Ok (best-effort notify).
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    let new_tree = Tree::from_tree_items(vec![blob_item(
+        crate::contract::policy::entitystore::MEGA_CEDAR_PATH.trim_start_matches('/'),
+        missing,
+    )])
+    .unwrap();
+    let result = TreeUpdateResult {
+        updated_trees: vec![new_tree.clone()],
+        ref_updates: vec![RefUpdate {
+            path: "/".to_string(),
+            tree_id: new_tree.id,
+        }],
+    };
+
+    service
+        .apply_update_result(&result, "update authz", None)
+        .await
+        .expect("apply_update_result succeeds; notify is best-effort");
+    assert!(
+        storage.entity_store().is_dirty(),
+        "unreadable authz blob must mark the snapshot dirty (fail-closed)"
+    );
+}
+
+#[tokio::test]
+async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+    let service = test_service(&storage);
+
+    let old_tree = Tree {
+        id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+        tree_items: vec![],
+    };
+    setup_main_ref(
+        &storage,
+        &old_tree,
+        "1111111111111111111111111111111111111111",
+    )
+    .await;
+
+    // Fault injection: a `BEFORE INSERT` trigger on `mega_tree` that raises
+    // an exception, so the tree save (`batch_save_model`, which propagates
+    // errors) fails AFTER the main ref write (`batch_update_by_path_concurrent`)
+    // succeeds. The ref write targets `mega_refs` (intact); the commit save
+    // targets `mega_commit` (intact); the tree save hits the trigger -> a
+    // non-RecordNotInserted error that propagates to the dirty-marking
+    // branch. (A plain `DROP TABLE` would not work: the search_path includes
+    // `public`, so the insert would fall back to the public schema's table.)
+    let mono = storage.mono_storage();
+    let conn = mono.get_connection();
+    sea_orm::ConnectionTrait::execute_raw(
+            conn,
+            sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "CREATE OR REPLACE FUNCTION fault_inject_block_tree_insert() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'fault injection: mega_tree insert blocked'; END; $$ LANGUAGE plpgsql".to_string(),
+            ),
+        )
+        .await
+        .expect("create fault-injection trigger function");
+    sea_orm::ConnectionTrait::execute_raw(
+            conn,
+            sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "CREATE TRIGGER fault_inject_mega_tree_trigger BEFORE INSERT ON mega_tree FOR EACH ROW EXECUTE FUNCTION fault_inject_block_tree_insert()".to_string(),
+            ),
+        )
+        .await
+        .expect("create fault-injection trigger on mega_tree");
+
+    let new_tree = Tree {
+        id: ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap(),
+        tree_items: vec![],
+    };
+    let result = TreeUpdateResult {
+        updated_trees: vec![new_tree.clone()],
+        ref_updates: vec![RefUpdate {
+            path: "/".to_string(),
+            tree_id: new_tree.id,
+        }],
+    };
+
+    let err = service
+        .apply_update_result(&result, "update", None)
+        .await
+        .expect_err("tree save must fail after the ref write");
+    assert!(!err.to_string().is_empty());
+    assert!(
+        storage.entity_store().is_dirty(),
+        "ref written but subsequent step failed -> dirty (fail-closed)"
+    );
 }

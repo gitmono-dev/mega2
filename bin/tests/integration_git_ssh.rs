@@ -1043,6 +1043,18 @@ fn prepare_authenticated_ssh_multi(
     env: &GitSshEnv,
     enforcement: &str,
 ) -> (ServiceProcess, u16, PathBuf, PathBuf, String, String) {
+    let (service, _http_port, ssh_port, stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh_multi_with_http(env, enforcement);
+    (service, ssh_port, stdout_path, stderr_path, git_ssh, remote)
+}
+
+/// Same as [`prepare_authenticated_ssh_multi`], but also returns the HTTP port
+/// of the `multi` process (UN-16 e2e drives the ACL change over the HTTP leg
+/// and asserts the SSH leg sees it, which is only true for a shared instance).
+fn prepare_authenticated_ssh_multi_with_http(
+    env: &GitSshEnv,
+    enforcement: &str,
+) -> (ServiceProcess, u16, u16, PathBuf, PathBuf, String, String) {
     let client_key = env.ssh_dir.join("client_ed25519");
     let client_pub = env.ssh_dir.join("client_ed25519.pub");
     let known_hosts = env.ssh_dir.join("known_hosts");
@@ -1077,7 +1089,7 @@ fn prepare_authenticated_ssh_multi(
         &finger,
     );
 
-    let (service, _http_port, ssh_port, stdout_path, stderr_path) =
+    let (service, http_port, ssh_port, stdout_path, stderr_path) =
         boot_service_multi(env, enforcement);
     git_cli::write_known_hosts_via_keyscan(&known_hosts, ssh_port);
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, ssh_port);
@@ -1085,7 +1097,15 @@ fn prepare_authenticated_ssh_multi(
         "ssh://{}@127.0.0.1:{ssh_port}/",
         git_cli::DEFAULT_SSH_AUTH_USER
     );
-    (service, ssh_port, stdout_path, stderr_path, git_ssh, remote)
+    (
+        service,
+        http_port,
+        ssh_port,
+        stdout_path,
+        stderr_path,
+        git_ssh,
+        remote,
+    )
 }
 
 #[test]
@@ -1311,6 +1331,368 @@ fn integration_git_ssh_shadow_allows_push_but_records_would_deny() {
     git_cli::wait_until_port_closed(ssh_port, Duration::from_secs(5));
     drop(service);
     drop(env);
+}
+
+#[test]
+fn integration_git_ssh_authz_grant_immediate_effect() {
+    // UN-16: 授权即时生效 e2e over the SSH channel. The ACL change is merged
+    // through the HTTP leg's merge funnel (`apply_update_result` →
+    // `notify_authz_changed`), and the SSH leg — which shares the same
+    // `AppContext`/`EntityStore` instance under `service multi` — must honour
+    // the new snapshot on the very next push, with no restart.
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::new();
+    // The HTTP leg drives the ACL change, so the git credential askpass helper
+    // must exist under the case dir (GitSshEnv only prepares SSH material).
+    git_cli::write_git_askpass(&env.case_dir.join("git-askpass.sh"));
+
+    let (mut service, http_port, ssh_port, _stdout_path, stderr_path, git_ssh, remote) =
+        prepare_authenticated_ssh_multi_with_http(&env, "enforce");
+    let service_pid = service.pid();
+
+    let admin_token = git_cli::resolve_seed_token();
+    git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
+    let http_remote = format!("http://127.0.0.1:{http_port}/");
+
+    // --- baseline: the SSH user is not an admin, so `enforce` denies its push ---
+    let clone_name = "un16-ssh-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
+        "SSH clone before grant",
+    );
+    let clone = env.case_dir.join(clone_name);
+    for (key, value) in [
+        ("user.name", "UN-16 SSH"),
+        ("user.email", "un16-ssh@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli_ssh(
+                &env.case_dir,
+                &git_ssh,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "SSH clone git config",
+        );
+    }
+    let baseline_branch = format!("un16-ssh-baseline-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "checkout", "-b", &baseline_branch],
+        ),
+        "create SSH baseline branch",
+    );
+    fs::write(
+        clone.join("un16-ssh-baseline.txt"),
+        b"ssh baseline push must fail\n",
+    )
+    .expect("write SSH baseline marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "add", "un16-ssh-baseline.txt"],
+        ),
+        "git add SSH baseline marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "commit", "-m", "un16 ssh baseline"],
+        ),
+        "git commit SSH baseline marker",
+    );
+    let baseline_push = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{baseline_branch}"),
+        ],
+    );
+    assert!(
+        !baseline_push.status.success(),
+        "non-admin SSH push must be denied under enforce; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        baseline_push.status,
+        String::from_utf8_lossy(&baseline_push.stdout),
+        String::from_utf8_lossy(&baseline_push.stderr)
+    );
+
+    // --- grant: the admin merges an ACL change over the HTTP leg ---
+    let admin_clone = "un16-ssh-admin-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["clone", &http_remote, admin_clone],
+        ),
+        "HTTP clone as admin",
+    );
+    let admin_dir = env.case_dir.join(admin_clone);
+    fs::write(
+        admin_dir.join(".mega_cedar.json"),
+        authz_json_with_admins(&["benjamin_747", git_cli::DEFAULT_SSH_AUTH_USER]),
+    )
+    .expect("write grant authz json");
+    for (key, value) in [
+        ("user.name", "Admin"),
+        ("user.email", "admin@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli_as_user(
+                &env.case_dir,
+                "benjamin_747",
+                &admin_token,
+                &["-C", admin_clone, "config", key, value],
+            ),
+            "admin git config",
+        );
+    }
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone, "add", ".mega_cedar.json"],
+        ),
+        "admin git add authz json",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone,
+                "commit",
+                "-m",
+                "un16 grant it-git-ssh admin",
+            ],
+        ),
+        "admin git commit grant",
+    );
+    let grant_branch = format!("un16-ssh-grant-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{grant_branch}"),
+            ],
+        ),
+        "admin push grant change",
+    );
+    let grant_cl_link = latest_cl_link_for_user(&env.database.db_url, "benjamin_747");
+    assert_eq!(
+        merge_cl_no_auth(http_port, &grant_cl_link),
+        200,
+        "grant merge must succeed"
+    );
+
+    // --- the SSH leg must honour the new snapshot immediately ---
+    // Refresh from the merged main first: MonoRepo rejects packs carrying more
+    // than one commit, so the new commit's parent must already be on main.
+    let fetch = git_cli::git_cli_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["-C", clone_name, "fetch", "origin"],
+    );
+    assert!(
+        fetch.status.success(),
+        "SSH fetch of merged main failed; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        fetch.status,
+        String::from_utf8_lossy(&fetch.stdout),
+        String::from_utf8_lossy(&fetch.stderr)
+    );
+    let granted_branch = format!("un16-ssh-granted-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "checkout",
+                "-b",
+                &granted_branch,
+                "origin/main",
+            ],
+        ),
+        "branch SSH granted push off merged main",
+    );
+    fs::write(
+        clone.join("un16-ssh-granted.txt"),
+        b"ssh granted push must succeed\n",
+    )
+    .expect("write SSH granted marker");
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "add", "un16-ssh-granted.txt"],
+        ),
+        "git add SSH granted marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", clone_name, "commit", "-m", "un16 ssh granted push"],
+        ),
+        "git commit SSH granted marker",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                clone_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{granted_branch}"),
+            ],
+        ),
+        "granted SSH push must succeed without a restart",
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    git_cli::assert_process_reaped(service_pid);
+    git_cli::wait_until_port_closed(ssh_port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
+/// Build a `/.mega_cedar.json` body whose `admin` group holds exactly `admins`
+/// (UN-16 e2e: grant/revoke by merging this file onto main).
+fn authz_json_with_admins(admins: &[&str]) -> Vec<u8> {
+    let mut users = serde_json::Map::new();
+    for admin in admins {
+        let key = format!("User::\"{admin}\"");
+        users.insert(
+            key.clone(),
+            serde_json::json!({
+                "euid": key,
+                "parents": ["UserGroup::\"admin\""]
+            }),
+        );
+    }
+    let json = serde_json::json!({
+        "users": users,
+        "repos": {
+            "Repository::\"/\"": {
+                "euid": "Repository::\"/\"",
+                "is_private": true,
+                "admins": "UserGroup::\"admin\"",
+                "maintainers": "UserGroup::\"matainer\"",
+                "readers": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "user_groups": {
+            "UserGroup::\"admin\"": {
+                "euid": "UserGroup::\"admin\"",
+                "parents": ["UserGroup::\"matainer\""]
+            },
+            "UserGroup::\"matainer\"": {
+                "euid": "UserGroup::\"matainer\"",
+                "parents": ["UserGroup::\"reader\""]
+            },
+            "UserGroup::\"reader\"": {
+                "euid": "UserGroup::\"reader\"",
+                "parents": []
+            }
+        },
+        "merge_requests": {},
+        "issues": {}
+    });
+    serde_json::to_vec_pretty(&json).expect("serialize authz json")
+}
+
+/// Query the most recently created CL link for a username (UN-16 e2e: the
+/// admin's push creates a CL; the merge API needs its link).
+fn latest_cl_link_for_user(db_url: &str, username: &str) -> String {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for CL link: {err}"));
+        let username_sql = username.replace('\'', "''");
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT link FROM mega_cl WHERE username = '{username_sql}' \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+            ))
+            .await
+            .expect("query latest CL link")
+            .expect("CL row exists for admin push");
+        row.try_get::<String>("", "link").expect("link column")
+    })
+}
+
+/// Merge a CL via the no-auth merge API. Returns the HTTP status code.
+fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
+    let url = format!("http://127.0.0.1:{port}/api/v1/cl/{cl_link}/merge-no-auth");
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "30",
+            &url,
+        ])
+        .output()
+        .expect("curl merge-no-auth");
+    assert!(
+        output.status.success(),
+        "curl merge-no-auth failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("bad http code from curl merge: {:?}", output.stdout))
 }
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {

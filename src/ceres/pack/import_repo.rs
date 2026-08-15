@@ -36,11 +36,12 @@ use crate::{
         },
     },
     common::{errors::MegaError, utils::ZERO_ID},
+    contract::policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
     jupiter::{
         redis::lock::RedLock,
         service::git_service::GitService,
         storage::{Storage, git_db_storage::GitDbStorage},
-        utils::converter::FromGitModel,
+        utils::converter::{FromGitModel, FromMegaModel},
     },
 };
 
@@ -531,6 +532,9 @@ impl ImportRepo {
                 vec![ObjectHash::from_str(&expected_commit).unwrap()],
                 &format!("\n{commit_msg}"),
             );
+            // UN-16: capture the post-attach root tree hash before `new_commit`
+            // is moved into the txn call, for the authz notify below.
+            let new_root_tree_hash = new_commit.tree_id.to_string();
 
             let txn = self.storage.begin_db_transaction().await?;
             let git_db = self.storage.git_db_storage();
@@ -571,6 +575,38 @@ impl ImportRepo {
             {
                 Ok(()) => {
                     txn.commit().await.map_err(MegaError::Db)?;
+                    // UN-16: notify the shared authz snapshot of a possible
+                    // `/.mega_cedar.json` change on main after the import
+                    // advanced the root ref (post-commit hook).
+                    // The root ref is already committed, so a failure while
+                    // resolving the blob IDs leaves the snapshot stale: mark
+                    // dirty (fail-closed) before propagating.
+                    let blob_ids = async {
+                        let old_blob_id = storage
+                            .get_tree_by_hash(&expected_tree)
+                            .await?
+                            .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+                        let new_blob_id = storage
+                            .get_tree_by_hash(&new_root_tree_hash)
+                            .await?
+                            .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+                        Ok::<_, MegaError>((old_blob_id, new_blob_id))
+                    }
+                    .await;
+                    match blob_ids {
+                        Ok((old_blob_id, new_blob_id)) => {
+                            notify_authz_changed_best_effort(
+                                &self.storage,
+                                old_blob_id.as_deref(),
+                                new_blob_id.as_deref(),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            self.storage.entity_store().mark_dirty();
+                            return Err(e);
+                        }
+                    }
                     let t_unlock = Instant::now();
                     guard.unlock().await?;
                     self.receive_pack_extra_timings_ms

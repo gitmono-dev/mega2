@@ -204,6 +204,15 @@ impl SharedEntityStore {
         self.inner.read().unwrap().dirty
     }
 
+    /// Mark the shared snapshot dirty (fail-closed) without attempting a
+    /// rebuild. Used when the source of truth changed in a way that cannot be
+    /// rebuilt (e.g. `/.mega_cedar.json` was deleted from main, or a write
+    /// path advanced the main ref but a subsequent step failed). `enforce` +
+    /// dirty = protected decisions all reject (ADR-UN-01).
+    pub fn mark_dirty(&self) {
+        self.inner.write().unwrap().dirty = true;
+    }
+
     /// Consistent read view: returns a shared handle to the current immutable
     /// snapshot (or `None` if not yet built).
     pub fn snapshot(&self) -> Option<Arc<EntitySnapshot>> {

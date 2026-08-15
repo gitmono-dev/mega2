@@ -456,6 +456,13 @@ pub fn git_cli(case_dir: &Path, token: &str, git_args: &[&str]) -> Output {
     git_cli_with_env(case_dir, token, &[], git_args)
 }
 
+/// Run `git` authenticated as an explicit username (UN-16 e2e: the seeded
+/// persistent admin `benjamin_747` pushes the `/.mega_cedar.json` change, then
+/// the default `it-git-cli` user's push is asserted granted/revoked).
+pub fn git_cli_as_user(case_dir: &Path, username: &str, token: &str, git_args: &[&str]) -> Output {
+    git_cli_with_user_env(case_dir, username, token, &[], git_args)
+}
+
 #[allow(
     dead_code,
     reason = "used by integration_git_lfs; this file is also path-included by integration_git_cli"
@@ -466,6 +473,22 @@ pub fn git_cli_lfs_skip_smudge(case_dir: &Path, token: &str, git_args: &[&str]) 
 
 fn git_cli_with_env(
     case_dir: &Path,
+    token: &str,
+    command_env: &[(&str, &str)],
+    git_args: &[&str],
+) -> Output {
+    git_cli_with_user_env(
+        case_dir,
+        DEFAULT_GIT_AUTH_USER,
+        token,
+        command_env,
+        git_args,
+    )
+}
+
+fn git_cli_with_user_env(
+    case_dir: &Path,
+    username: &str,
     token: &str,
     command_env: &[(&str, &str)],
     git_args: &[&str],
@@ -481,10 +504,22 @@ fn git_cli_with_env(
     }
 
     match runner_kind() {
-        GitRunnerKind::Container => {
-            git_cli_container(case_dir, &askpass_host, token, command_env, git_args)
-        }
-        GitRunnerKind::Host => git_cli_host(case_dir, &askpass_host, token, command_env, git_args),
+        GitRunnerKind::Container => git_cli_container(
+            case_dir,
+            &askpass_host,
+            username,
+            token,
+            command_env,
+            git_args,
+        ),
+        GitRunnerKind::Host => git_cli_host(
+            case_dir,
+            &askpass_host,
+            username,
+            token,
+            command_env,
+            git_args,
+        ),
     }
 }
 
@@ -626,6 +661,7 @@ pub fn probe_receive_pack_challenge(port: u16) -> String {
 fn git_cli_container(
     case_dir: &Path,
     askpass_host: &Path,
+    username: &str,
     token: &str,
     command_env: &[(&str, &str)],
     git_args: &[&str],
@@ -651,7 +687,7 @@ fn git_cli_container(
         .arg("-e")
         .arg("GIT_CONFIG_KEY_0=credential.username")
         .arg("-e")
-        .arg(format!("GIT_CONFIG_VALUE_0={DEFAULT_GIT_AUTH_USER}"));
+        .arg(format!("GIT_CONFIG_VALUE_0={username}"));
     for (name, value) in command_env {
         command.env(name, value).arg("-e").arg(name);
     }
@@ -678,6 +714,7 @@ fn git_cli_container(
 fn git_cli_host(
     case_dir: &Path,
     askpass_host: &Path,
+    username: &str,
     token: &str,
     command_env: &[(&str, &str)],
     git_args: &[&str],
@@ -708,7 +745,7 @@ fn git_cli_host(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "credential.username")
-        .env("GIT_CONFIG_VALUE_0", DEFAULT_GIT_AUTH_USER)
+        .env("GIT_CONFIG_VALUE_0", username)
         .env("GIT_CONFIG_KEY_1", "credential.helper")
         .env("GIT_CONFIG_VALUE_1", "")
         .env("GIT_CONFIG_KEY_2", "core.autocrlf")
@@ -841,9 +878,31 @@ pub fn seed_access_token(db_url: &str, username: &str, token: &str) {
         let db = Database::connect(db_url)
             .await
             .unwrap_or_else(|err| panic!("connect integration DB for token seed: {err}"));
-        db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
-            .await
-            .unwrap_or_else(|err| panic!("seed access_token: {err}"));
+        // The caller boots the service first, but "the port answers" does not
+        // prove *this* case's migrations finished — under a parallel
+        // `cargo test --all` the reserved port can briefly be answered by a
+        // neighbouring case's service. Wait (bounded) for the table instead of
+        // failing the case on that race.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match db
+                .execute_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    sql.clone(),
+                ))
+                .await
+            {
+                Ok(_) => break,
+                Err(err) => {
+                    let missing_table = err.to_string().contains("access_token")
+                        && err.to_string().contains("does not exist");
+                    if !missing_table || Instant::now() >= deadline {
+                        panic!("seed access_token: {err}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
     });
 }
 

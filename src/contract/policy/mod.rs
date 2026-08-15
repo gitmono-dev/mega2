@@ -6,6 +6,7 @@ pub mod context;
 pub mod enforcement;
 pub mod entitystore;
 pub mod guard;
+pub mod notify;
 mod objects;
 pub mod resource;
 pub mod reviewer_parser;
