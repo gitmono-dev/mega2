@@ -172,6 +172,21 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## merge-no-auth 入口鉴权与双参数签名（UN-24）
+
+`merge-no-auth` 原本是本地调试的捷径：不在 guard 映射内、硬编码 `"system"` 执行者——**能连上端口的人就能合并**。UN-24 把它按 `{method, path}` 纳入映射（action = `approveMergeRequest`，与 `merge` 完全相同），并让 handler 经 `OptionalSessionUser` 取可选主体。名字里的 "no auth" 从此只表示**不需要认证会话**，不表示跳过授权。
+
+`merge_cl` / `merge_cl_unchecked` 的签名落地两个**独立**参数（ADR-UN-06 ④）：
+
+| 参数 | 含义 | merge | merge-no-auth | queue |
+|---|---|---|---|---|
+| `authz_principal` | 以谁的身份被**授权** | 登录用户 | 登录用户，匿名时为保留字 `User::"__anonymous__"` | `system`（UN-17 改为持久化的 requester） |
+| `execution_actor` | 记录为由谁**执行** | 登录用户 | 登录用户，匿名时为 `system` | `system` |
+
+两者合一会导致二选一的错误：要么审计记错执行者，要么以错误主体授权。匿名调用在 `enforce` 下由 guard 返回 **403**——不是 401：后者是「没有会话」的回答，用在这里等于把认证问题冒充成授权答案，而且无会话本来就能产出 401，会成为假绿。
+
+四角色矩阵（`api::un24_merge_matrix` / `api::un24_merge_no_auth_matrix`）对两个入口断言**同一结果**。按当前 `mega_policies.cedar`，`approveMergeRequest` 是 maintainer 级动作（admin 经组继承同样具备），reader 与匿名被拒；「批准是否应当仅限 admin」属策略内容问题，归 UN-09/UN-04。
+
 ## guard 三态接线与真实资源解析（UN-08）
 
 `/api/v1` guard 从「与 store 无关的硬编码 permit-all」切换为对共享快照的真实三态评估：

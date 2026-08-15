@@ -9,7 +9,7 @@ use crate::{
         MonoApiServiceState,
         api_common::{self},
         api_doc::CL_TAG,
-        oauth::model::LoginUser,
+        oauth::{OptionalSessionUser, model::LoginUser},
     },
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     ceres::model::{
@@ -22,7 +22,10 @@ use crate::{
         label::LabelUpdatePayload,
     },
     common::errors::{ApiError, MegaError},
-    contract::api::common::{CommonPage, CommonResult, PageParams},
+    contract::{
+        api::common::{CommonPage, CommonResult, PageParams},
+        policy::guard::cedar_guard::ANONYMOUS_PRINCIPAL_ID,
+    },
     jupiter::service::{cl_service::CLService, webhook_service::WebhookEvent},
 };
 
@@ -171,7 +174,9 @@ async fn merge(
     if model.status == MergeStatusEnum::Open {
         state
             .monorepo()
-            .merge_cl(&user.username, model.clone())
+            // A normal merge is authorized as, and executed by, the same
+            // logged-in user (ADR-UN-06 ④).
+            .merge_cl(&user.username, &user.username, model.clone())
             .await?;
         let updated_model = state
             .cl_stg()
@@ -201,8 +206,11 @@ async fn merge(
     Ok(Json(CommonResult::success(None)))
 }
 
-/// Change List without authentication
-/// It's for local testing purposes.
+/// Merge a Change List without an authenticated session.
+///
+/// "No auth" here means no *authentication* is required, not that authorization
+/// is skipped (UN-24): an anonymous caller is authorized as the reserved
+/// anonymous principal, which under `enforce` the guard rejects with 403.
 #[utoipa::path(
     post,
     params(
@@ -210,12 +218,18 @@ async fn merge(
     ),
     path = "/{link}/merge-no-auth",
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
 async fn merge_no_auth(
     Path(link): Path<String>,
+    // UN-24: the subject is optional, not absent. `OptionalSessionUser` never
+    // rejects, so an anonymous call still reaches the handler — and is then
+    // authorized as the reserved anonymous principal, which under `enforce`
+    // the guard has already turned into a 403.
+    OptionalSessionUser(requester): OptionalSessionUser,
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<String>>, ApiError> {
     let res = state.cl_stg().get_cl(&link).await?;
@@ -228,11 +242,21 @@ async fn merge_no_auth(
         ))));
     }
 
-    // No authentication required - using default system user
-    let default_username = "system";
+    // No *authentication* required — which is not the same as no
+    // authorization. An anonymous caller is authorized as the reserved
+    // anonymous principal (never as a name a real account could hold), and the
+    // merge is recorded as executed by `system`.
+    let authz_principal = requester
+        .as_ref()
+        .map(|user| user.username.as_str())
+        .unwrap_or(ANONYMOUS_PRINCIPAL_ID);
+    let execution_actor = requester
+        .as_ref()
+        .map(|user| user.username.as_str())
+        .unwrap_or("system");
     state
         .monorepo()
-        .merge_cl(default_username, model.clone())
+        .merge_cl(authz_principal, execution_actor, model.clone())
         .await?;
     let updated_model = state
         .cl_stg()

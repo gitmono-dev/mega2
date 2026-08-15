@@ -17,7 +17,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Read,
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -998,6 +998,16 @@ fn boot_service_multi(
     env: &GitSshEnv,
     enforcement: &str,
 ) -> (ServiceProcess, u16, u16, PathBuf, PathBuf) {
+    boot_service_multi_with_session(env, enforcement, None)
+}
+
+/// As above, but optionally points the service's browser-session lookup at a
+/// stub website (UN-24: privileged API calls now need a real subject).
+fn boot_service_multi_with_session(
+    env: &GitSshEnv,
+    enforcement: &str,
+    session_stub_port: Option<u16>,
+) -> (ServiceProcess, u16, u16, PathBuf, PathBuf) {
     let http_port = git_cli::reserve_ephemeral_port();
     let ssh_port = git_cli::reserve_ephemeral_port();
     git_cli::record_allocated_port(http_port);
@@ -1008,6 +1018,12 @@ fn boot_service_multi(
     let mut command = env.full_config_command();
     command.env("MEGA_LOG__PRINT_STD", "true");
     command.env("MEGA_CEDAR__ENFORCEMENT", enforcement);
+    if let Some(stub_port) = session_stub_port {
+        command.env(
+            "MEGA_OAUTH__WEBSITE_API_BASE_URL",
+            format!("http://127.0.0.1:{stub_port}"),
+        );
+    }
     let http_port_arg = http_port.to_string();
     let ssh_port_arg = ssh_port.to_string();
     command.args([
@@ -1055,6 +1071,14 @@ fn prepare_authenticated_ssh_multi_with_http(
     env: &GitSshEnv,
     enforcement: &str,
 ) -> (ServiceProcess, u16, u16, PathBuf, PathBuf, String, String) {
+    prepare_authenticated_ssh_multi_with_session(env, enforcement, None)
+}
+
+fn prepare_authenticated_ssh_multi_with_session(
+    env: &GitSshEnv,
+    enforcement: &str,
+    session_stub_port: Option<u16>,
+) -> (ServiceProcess, u16, u16, PathBuf, PathBuf, String, String) {
     let client_key = env.ssh_dir.join("client_ed25519");
     let client_pub = env.ssh_dir.join("client_ed25519.pub");
     let known_hosts = env.ssh_dir.join("known_hosts");
@@ -1090,7 +1114,7 @@ fn prepare_authenticated_ssh_multi_with_http(
     );
 
     let (service, http_port, ssh_port, stdout_path, stderr_path) =
-        boot_service_multi(env, enforcement);
+        boot_service_multi_with_session(env, enforcement, session_stub_port);
     git_cli::write_known_hosts_via_keyscan(&known_hosts, ssh_port);
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, ssh_port);
     let remote = format!(
@@ -1351,8 +1375,12 @@ fn integration_git_ssh_authz_grant_immediate_effect() {
     // must exist under the case dir (GitSshEnv only prepares SSH material).
     git_cli::write_git_askpass(&env.case_dir.join("git-askpass.sh"));
 
+    // The ACL-change merge below goes through `merge-no-auth`, which since
+    // UN-24 is authorized like any other merge entry point; the stub lets this
+    // test present the admin's session for that call.
+    let session_stub_port = spawn_website_session_stub("benjamin_747");
     let (mut service, http_port, ssh_port, _stdout_path, stderr_path, git_ssh, remote) =
-        prepare_authenticated_ssh_multi_with_http(&env, "enforce");
+        prepare_authenticated_ssh_multi_with_session(&env, "enforce", Some(session_stub_port));
     let service_pid = service.pid();
 
     let admin_token = git_cli::resolve_seed_token();
@@ -1666,7 +1694,42 @@ fn latest_cl_link_for_user(db_url: &str, username: &str) -> String {
     })
 }
 
-/// Merge a CL via the no-auth merge API. Returns the HTTP status code.
+/// Cookie value the session stub accepts; its content is irrelevant because the
+/// stub answers every request the same way.
+const SESSION_COOKIE: &str = "better-auth.session_token=it-un16-ssh-session";
+
+/// Minimal stand-in for the website's Better Auth `get-session` endpoint.
+///
+/// Since UN-24, `merge-no-auth` requires *authorization* (it never required
+/// authentication), so this test has to make its privileged merge call as a
+/// real subject. The service resolves browser sessions by asking the website;
+/// this stub answers with the admin whose ACL change is being merged. Returns
+/// the port it listens on.
+fn spawn_website_session_stub(username: &str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind session stub");
+    let port = listener.local_addr().expect("stub addr").port();
+    let body = format!(
+        r#"{{"session":{{"id":"it-session","userId":"{username}"}},"user":{{"id":"{username}","name":"{username}","email":"{username}@example.invalid"}}}}"#
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            let _ = std::io::Write::flush(&mut stream);
+        }
+    });
+    port
+}
+
+/// Merge a CL through the `merge-no-auth` API, carrying the stub session so the
+/// call is authorized (UN-24). Returns the HTTP status code.
 fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
     let url = format!("http://127.0.0.1:{port}/api/v1/cl/{cl_link}/merge-no-auth");
     let output = Command::new("curl")
@@ -1674,6 +1737,8 @@ fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
             "-sS",
             "-X",
             "POST",
+            "-H",
+            &format!("Cookie: {SESSION_COOKIE}"),
             "-o",
             "/dev/null",
             "-w",

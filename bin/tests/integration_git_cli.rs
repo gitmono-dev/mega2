@@ -19,12 +19,12 @@ mod git_cli;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
-    thread::sleep,
+    thread::{self, sleep},
     time::{Duration, Instant},
 };
 
@@ -291,6 +291,16 @@ fn boot_service_http_with_enforcement(
     env: &GitCliEnv,
     enforcement: Option<&str>,
 ) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_http_with_enforcement_and_session(env, enforcement, None)
+}
+
+/// As above, but optionally points the service's browser-session lookup at a
+/// stub website (UN-24: privileged API calls now need a real subject).
+fn boot_service_http_with_enforcement_and_session(
+    env: &GitCliEnv,
+    enforcement: Option<&str>,
+    session_stub_port: Option<u16>,
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     let port = reserve_free_port();
     git_cli::record_allocated_port(port);
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -300,6 +310,12 @@ fn boot_service_http_with_enforcement(
     command.env("MEGA_LOG__PRINT_STD", "true");
     if let Some(enforcement) = enforcement {
         command.env("MEGA_CEDAR__ENFORCEMENT", enforcement);
+    }
+    if let Some(stub_port) = session_stub_port {
+        command.env(
+            "MEGA_OAUTH__WEBSITE_API_BASE_URL",
+            format!("http://127.0.0.1:{stub_port}"),
+        );
     }
     command.args([
         "service",
@@ -318,8 +334,43 @@ fn boot_service_http_with_enforcement(
     (service, port, stdout_path, stderr_path)
 }
 
-/// Merge a CL via the no-auth merge API (`POST /cl/{link}/merge-no-auth`,
-/// "system" user). Returns the HTTP status code.
+/// Cookie value the session stub accepts; its content is irrelevant because the
+/// stub answers every request the same way.
+const SESSION_COOKIE: &str = "better-auth.session_token=it-un16-session";
+
+/// Minimal stand-in for the website's Better Auth `get-session` endpoint.
+///
+/// Since UN-24, `merge-no-auth` requires *authorization* (it never required
+/// authentication), so this test has to make its privileged merge call as a
+/// real subject. The service resolves browser sessions by asking the website;
+/// this stub answers with the admin, which is the subject whose ACL change the
+/// test is merging. Returns the port it listens on.
+fn spawn_website_session_stub(username: &str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind session stub");
+    let port = listener.local_addr().expect("stub addr").port();
+    let body = format!(
+        r#"{{"session":{{"id":"it-session","userId":"{username}"}},"user":{{"id":"{username}","name":"{username}","email":"{username}@example.invalid"}}}}"#
+    );
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Read just enough to reach the end of the request head.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// Merge a CL through `POST /cl/{link}/merge-no-auth`, carrying the stub
+/// session so the call is authorized (UN-24). Returns the HTTP status code.
 fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
     let url = format!("http://127.0.0.1:{port}/api/v1/cl/{cl_link}/merge-no-auth");
     let mut command = Command::new("curl");
@@ -327,6 +378,8 @@ fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
         "-sS",
         "-X",
         "POST",
+        "-H",
+        &format!("Cookie: {SESSION_COOKIE}"),
         "-o",
         "/dev/null",
         "-w",
@@ -1238,8 +1291,17 @@ fn integration_git_cli_authz_revoke_grant_immediate_effect() {
         CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
 
+    // The ACL-change merges below go through `merge-no-auth`, which since
+    // UN-24 is authorized like any other merge entry point. The stub lets this
+    // test present the admin's session for those calls; the pushes it asserts
+    // on stay anonymous-to-the-website (they authenticate with a git token).
+    let session_stub_port = spawn_website_session_stub("benjamin_747");
     let (mut service, port, stdout_path, stderr_path) =
-        boot_service_http_with_enforcement(&env, Some("enforce"));
+        boot_service_http_with_enforcement_and_session(
+            &env,
+            Some("enforce"),
+            Some(session_stub_port),
+        );
 
     // Migrations + access_token table exist only after service bootstrap.
     git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);

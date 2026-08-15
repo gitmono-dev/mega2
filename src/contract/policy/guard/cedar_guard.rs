@@ -140,7 +140,7 @@ fn match_operation(
 /// `"reader"` fallback collided with a real account named `reader`, which would
 /// have handed every anonymous request that account's permissions. UN-14's
 /// builder refuses to let ACL input occupy this name.
-const ANONYMOUS_PRINCIPAL_ID: &str = "__anonymous__";
+pub const ANONYMOUS_PRINCIPAL_ID: &str = "__anonymous__";
 
 /// What the guard evaluates the request against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,6 +579,13 @@ mod tests {
         ("POST", "/cl/ABC123/reopen", ActionEnum::EditMergeRequest),
         ("POST", "/cl/ABC123/close", ActionEnum::EditMergeRequest),
         ("POST", "/cl/ABC123/merge", ActionEnum::ApproveMergeRequest),
+        // UN-24 brought this entry point under authorization; it used to be
+        // unmapped and hardcoded a "system" actor.
+        (
+            "POST",
+            "/cl/ABC123/merge-no-auth",
+            ActionEnum::ApproveMergeRequest,
+        ),
         ("POST", "/cl/ABC123/comment", ActionEnum::EditMergeRequest),
         ("POST", "/cl/ABC123/title", ActionEnum::EditMergeRequest),
         ("POST", "/cl/ABC123/status", ActionEnum::EditMergeRequest),
@@ -712,16 +719,18 @@ mod tests {
         assert_eq!(action, ActionEnum::UnprotectedRequest);
     }
 
-    /// `merge-no-auth` is a registered route but is deliberately *not* in the
-    /// mapping yet: bringing that entry point under authorization is UN-24's
-    /// axis. Pinning it here makes the handover explicit instead of silent.
+    /// UN-24: `merge-no-auth` is under authorization now. Its name is a
+    /// leftover from a local-testing shortcut — it no longer means the request
+    /// skips authorization, only that it needs no *authenticated session*.
     #[test]
-    fn un23_merge_no_auth_is_not_yet_mapped() {
-        let (action, _) = resolve_cl_action("POST", "/cl/ABC123/merge-no-auth").unwrap();
+    fn un24_merge_no_auth_is_mapped_like_merge() {
+        let (action, link) = resolve_cl_action("POST", "/cl/ABC123/merge-no-auth").unwrap();
+        assert_eq!(action, ActionEnum::ApproveMergeRequest);
+        assert_eq!(link, "ABC123");
         assert_eq!(
             action,
-            ActionEnum::UnprotectedRequest,
-            "merge-no-auth stays unmapped until UN-24"
+            resolve_cl_action("POST", "/cl/ABC123/merge").unwrap().0,
+            "both merge entry points require the same action"
         );
     }
 

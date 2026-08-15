@@ -1800,7 +1800,21 @@ impl MonoApiService {
     }
     /// Merges a CL after checking for conflicts.
     /// This is the public API that includes conflict checking.
-    pub async fn merge_cl(&self, username: &str, cl: mega_cl::Model) -> Result<(), GitError> {
+    /// Merge a CL.
+    ///
+    /// The two subjects are deliberately separate (ADR-UN-06 ④):
+    /// `authz_principal` is who the merge is *authorized as*, while
+    /// `execution_actor` is who it is *recorded as* having run. They coincide
+    /// for a normal merge, but not for an anonymous `merge-no-auth` (a reserved
+    /// anonymous principal, executed as `system`) or a queued merge (the stored
+    /// requester, executed as `system`). Collapsing them would either audit the
+    /// wrong actor or authorize as the wrong subject.
+    pub async fn merge_cl(
+        &self,
+        authz_principal: &str,
+        execution_actor: &str,
+        cl: mega_cl::Model,
+    ) -> Result<(), GitError> {
         let storage = self.storage.mono_storage();
         let refs = storage
             .get_main_ref(&cl.path)
@@ -1812,7 +1826,8 @@ impl MonoApiService {
             return Err(GitError::CustomError("ref hash conflict".to_owned()));
         }
 
-        self.merge_cl_unchecked(username, cl).await
+        self.merge_cl_unchecked(authz_principal, execution_actor, cl)
+            .await
     }
 
     /// Apply all CL changes onto the target_head in-memory and emit a single commit on the CL ref.
@@ -2240,7 +2255,18 @@ impl MonoApiService {
 
     /// Merges a CL without checking for conflicts.
     /// Caller is responsible for ensuring no conflicts exist before calling this method.
-    async fn merge_cl_unchecked(&self, username: &str, cl: mega_cl::Model) -> Result<(), GitError> {
+    async fn merge_cl_unchecked(
+        &self,
+        authz_principal: &str,
+        execution_actor: &str,
+        cl: mega_cl::Model,
+    ) -> Result<(), GitError> {
+        // Deliberately not evaluated here yet: UN-24 only lands the parameter so
+        // the call chain carries the authorization subject. The merge-face
+        // checks that consume it (ACL-file protection, the failure contract)
+        // are UN-19/UN-25, and the queue's principal is UN-17. Until then the
+        // entry points are guarded at the router.
+        let _ = authz_principal;
         let storage = self.storage.mono_storage();
 
         let commit_model = storage
@@ -2275,7 +2301,7 @@ impl MonoApiService {
         // add conversation
         self.storage
             .conversation_storage()
-            .add_conversation(&cl.link, username, None, ConvTypeEnum::Merged)
+            .add_conversation(&cl.link, execution_actor, None, ConvTypeEnum::Merged)
             .await
             .map_err(|e| GitError::CustomError(format!("Failed to add conversation: {}", e)))?;
         // update cl status last
@@ -3812,7 +3838,9 @@ impl MonoApiService {
         }
 
         // Step 5: Execute merge (conflict already checked in step 3)
-        self.merge_cl_unchecked("system", cl_model.clone())
+        // UN-24 lands the dual parameters; the queue passes `system`/`system`
+        // until UN-17 substitutes the persisted requester as the principal.
+        self.merge_cl_unchecked("system", "system", cl_model.clone())
             .await
             .map_err(|e| {
                 (

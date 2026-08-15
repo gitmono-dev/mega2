@@ -40,6 +40,8 @@ mod un08_guard_enforcement;
 mod un20_queue_requester;
 #[cfg(test)]
 mod un22_principal;
+#[cfg(test)]
+mod un24_merge_authz;
 
 #[derive(Clone)]
 pub struct MonoApiServiceState {

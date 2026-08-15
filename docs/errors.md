@@ -88,7 +88,7 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 
 映射键为 `{method, path}`（`src/contract/policy/guard/guarded_endpoints.json`）：同一路径的不同方法可以是不同 action，例如 `GET /cl/{link}/reviewers` 是读（`viewRepo`），而 `POST`/`DELETE` 同路径是写（`editMergeRequest`）。未登记 `{method,path}` 的操作视为 unprotected，**不会**继承同路径其它方法的 action。
 
-`POST /cl/{link}/merge-no-auth` 是已注册路由但尚未纳入映射，其入口鉴权与 403 注解归 UN-24。
+`POST /cl/{link}/merge-no-auth` 自 UN-24 起与 `POST /cl/{link}/merge` 映射到**同一** action（`approveMergeRequest`）并声明 403。其名字里的 "no auth" 只表示不需要**认证会话**，不表示跳过授权：匿名调用以保留字 `User::"__anonymous__"` 参与求值，在 `enforce` 下被拒为 403。
 
 ## 响应安全
 
