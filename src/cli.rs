@@ -199,7 +199,18 @@ fn log_format_layer(
 ) -> FmtLayer<tracing_subscriber::Registry, DefaultFields, Format, BoxMakeWriter> {
     tracing_subscriber::fmt::layer()
         .with_writer(log_writer(config))
-        .with_ansi(config.with_ansi)
+        .with_ansi(ansi_enabled(config))
+}
+
+/// ANSI colors belong on a terminal and nowhere else.
+///
+/// There is a single writer, chosen by `print_std`, so applying `with_ansi`
+/// unconditionally wrote escape sequences into the rotating log files — where
+/// they split structured fields (`action=` became `\e[3maction\e[0m\e[2m=\e[0m`)
+/// and defeated grep-based log processing. `log.with_ansi` is documented as
+/// having no effect on file logs; this makes that true.
+fn ansi_enabled(config: &LogConfig) -> bool {
+    config.print_std && config.with_ansi
 }
 
 fn log_writer(config: &LogConfig) -> BoxMakeWriter {
@@ -385,5 +396,27 @@ mod tests {
         assert!(message.contains("value is redacted"));
         assert!(message.contains("remove the override"));
         assert!(!message.contains("not_bool_secret"));
+    }
+
+    /// FIX-03: file logs must never carry ANSI escapes — they break grep-based
+    /// processing of the structured fields (would-deny records among them).
+    #[test]
+    fn fix03_ansi_is_only_enabled_for_stdout_logs() {
+        let mut config = LogConfig {
+            print_std: true,
+            with_ansi: true,
+            ..LogConfig::default()
+        };
+        assert!(ansi_enabled(&config), "a terminal may have colors");
+
+        config.print_std = false;
+        assert!(
+            !ansi_enabled(&config),
+            "the rotating log files must stay plain even with with_ansi = true"
+        );
+
+        config.with_ansi = false;
+        config.print_std = true;
+        assert!(!ansi_enabled(&config), "with_ansi = false disables them");
     }
 }
