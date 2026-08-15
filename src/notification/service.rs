@@ -271,6 +271,13 @@ mod tests {
         },
     };
 
+    /// `NotificationService::set_active` writes a process-global handle, so the
+    /// tests that install one must not overlap — `cargo test` runs them on
+    /// parallel threads, and without this lock one test's `set_active(None)`
+    /// tears down the service another test is mid-delivery on (FIX-02).
+    static ACTIVE_SERVICE_LOCK: std::sync::LazyLock<Mutex<()>> =
+        std::sync::LazyLock::new(|| Mutex::new(()));
+
     fn test_service(
         stg: NotificationStorage,
         extra: Vec<Arc<dyn NotificationChannel>>,
@@ -326,6 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_fans_out_to_extra_channels_when_service_active() {
+        let _active_guard = ACTIVE_SERVICE_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
@@ -369,6 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn email_delivery_mode_posts_to_website_and_writes_in_app() {
+        let _active_guard = ACTIVE_SERVICE_LOCK.lock().await;
         #[derive(Clone, Default)]
         struct CapturedRequest {
             authorization: String,
@@ -477,6 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_disabled_skips_all_delivery() {
+        let _active_guard = ACTIVE_SERVICE_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
