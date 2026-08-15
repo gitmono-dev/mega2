@@ -1,6 +1,7 @@
 use std::fmt::{self, Display};
 
 pub mod admin_resolver;
+pub mod authz_audit;
 pub mod builder;
 pub mod context;
 pub mod enforcement;
@@ -18,6 +19,8 @@ mod un09_push_matrix;
 mod un21_cache;
 #[cfg(test)]
 mod un21_matrix;
+#[cfg(test)]
+mod un26_audit;
 pub mod util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -172,6 +172,21 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## ACL 可信基线审计核心（UN-26）
+
+打开 enforcement 等于信任 ACL 当前的内容。如果它在无人执行期间被改过，切到 `enforce` 只会把这次篡改固化——因此进入 shadow 前必须把 ACL 与**经具名审批的基线**比对一次。
+
+可信源是**审批过的 artifact**（规范化快照 + 角色投影 + digest），而不是一个裸 digest：能替换快照的人同样能重算 digest。digest 只是 artifact 的完整性索引；使 artifact 可信的是**审批**——所以 `compare` 还要校验审批台账里独立记录的 digest（`--expect-digest`）。
+
+两个阶段刻意不对称（`src/contract/policy/authz_audit.rs`）：
+
+- `bootstrap-candidate` 产出候选 artifact，**永远不报告通过**——`diff_verdict` 恒为 `not_compared`。此时没有可比对的对象；首次运行若报「审计通过」，就会把一份已被篡改的 ACL 直接封为基线，正好毁掉这个机制的意义。
+- `compare` 先校验 artifact 自洽（内置 digest 描述其自身快照）与**被审批过**（内置 digest == 台账 digest），再比对当前快照并列出差异。
+
+闭包按**传递组关系 + `repos[].admins` 引用展开**计算，而不是读直接成员：新建一个以 `admin` 为父的组并把人放进去，直接成员视角下毫无变化——`closure_only_admins` 正是为这种情形而存在。仓库角色引用被静默改指（没有任何用户变动）同样是权限变更，故 `repo_role_refs` 逐仓库比对。
+
+**PII 边界**：sanitized 报告只有 `{digest, closure_count, diff_verdict}` 三字段（`source_summary` 由 UN-29 装配层嵌入 UN-34 交付的对象），不含任何用户名；完整闭包与角色级差异清单属受限通道（UN-29 双输出 + UN-32 writer）。规范化对**键**与 `parents` **成员**排序：`parents` 是一个组集合，其书写顺序与键序一样只是排版；同一份 ACL 被重新格式化后必须 digest 相同，否则每次 reformat 都会报成篡改，审计很快就没人看了。
+
 ## ACL 文件变更仅 admin 可合（UN-19）
 
 编辑 `/.mega_cedar.json` **就是**授予权限的方式，因此谁能合并这种变更，谁就能给自己授予任何权限。maintainer 持有 `approveMergeRequest`——若不加限制，这正是一条自提权通道。
