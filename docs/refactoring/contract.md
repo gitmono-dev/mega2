@@ -172,6 +172,16 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## admin 事实源收敛（UN-04）
+
+策略文件里原有一条「root admin 可做任何事」的规则，硬编码两个个人用户名。它使策略文件成为**第二个、不可见的 admin 权力来源**：运维读 ACL 看不出谁真正有特权，把某人从 admin 组移除也不会收回其权限。该规则已删除。
+
+**enforce 下 admin 能力唯一来自实体存储的 `UserGroup::"admin"` 成员**——数据源是库内 `/.mega_cedar.json`，由 config `monorepo.admin` 播种（ADR-UN-03）。这既是收敛也是可审计性：ACL 就是全部答案。
+
+删除的是**特例**而不是这两个名字：把它们写进 ACL 与写任何其他名字效果完全相同（`un04_a_formerly_hardcoded_name_becomes_admin_only_by_being_listed` 钉住这一点）；把某人从 ACL 移除会真正撤权（`un04_dropping_an_admin_from_the_acl_removes_their_privilege`）——正是硬编码规则曾经悄悄破坏的性质。
+
+**与 website `role=admin` 的边界**：两者是**独立系统**。website 的 `role=admin` 只治理产品面（站点管理界面），monoengine 的 admin 只来自上述 ACL；两边都要授予的用户必须**双写**。自动同步未实现（DEP-02 / DEFER-UN-03 已移交），运维双写指引由 UN-06 手册承接。
+
 ## `pushRepo` 策略语义修正（UN-09）
 
 `pushRepo` 此前同时出现在两个不该出现的地方：

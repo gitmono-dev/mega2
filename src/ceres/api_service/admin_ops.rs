@@ -151,3 +151,131 @@ impl MonoApiService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{str::FromStr, sync::Arc};
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::tree::{Tree, TreeItem, TreeItemMode},
+    };
+
+    use super::*;
+    use crate::{
+        callisto::mega_refs, ceres::api_service::cache::GitObjectCache,
+        common::utils::MEGA_BRANCH_NAME, contract::policy::entitystore::generate_entity,
+        jupiter::storage::Storage,
+    };
+
+    fn service(storage: &Storage) -> MonoApiService {
+        MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                // Lazy, and pointed at a port nothing listens on: the cache is
+                // an optimization, so the read path must work without it. That
+                // is also what keeps this case about the ACL rather than Redis.
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:1").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "un04-admin-ops-test".to_string(),
+            }),
+        }
+    }
+
+    /// Put a `/.mega_cedar.json` listing `admins` on main, the way the server
+    /// seeds it.
+    async fn seed_acl(storage: &Storage, admins: &[&str]) {
+        let json = generate_entity(
+            &admins.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "/",
+        )
+        .expect("real init product");
+        let blob_id = storage
+            .git_service
+            .save_object_from_raw(bytes::Bytes::from(json))
+            .await
+            .expect("save ACL blob");
+
+        let tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(&blob_id).expect("blob hash"),
+            ADMIN_FILE.to_string(),
+        )])
+        .expect("build root tree");
+        let commit_id = "1111111111111111111111111111111111111111";
+        storage
+            .mono_storage()
+            .save_mega_trees(
+                vec![tree.clone()],
+                ObjectHash::from_str(commit_id).unwrap(),
+                None,
+            )
+            .await
+            .expect("save root tree");
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model {
+                    id: 1,
+                    path: "/".to_string(),
+                    ref_name: MEGA_BRANCH_NAME.to_string(),
+                    ref_commit_hash: commit_id.to_string(),
+                    ref_tree_hash: tree.id.to_string(),
+                    created_at: chrono::Utc::now().naive_utc(),
+                    updated_at: chrono::Utc::now().naive_utc(),
+                    is_cl: false,
+                },
+                None,
+            )
+            .await
+            .expect("save main ref");
+    }
+
+    /// UN-04 regression: the admin read path answers from the ACL on main.
+    #[tokio::test]
+    async fn admin_read_path_answers_from_the_acl_on_main() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        seed_acl(&storage, &["un04-ops-admin"]).await;
+
+        let service = service(&storage);
+        assert!(
+            service
+                .check_is_admin("un04-ops-admin")
+                .await
+                .expect("admin check"),
+            "a user listed in the ACL is an admin"
+        );
+        assert!(
+            !service
+                .check_is_admin("un04-ops-outsider")
+                .await
+                .expect("admin check"),
+            "a user absent from the ACL is not"
+        );
+        assert_eq!(
+            service.get_all_admins().await.expect("admin list"),
+            vec!["un04-ops-admin".to_string()]
+        );
+    }
+
+    /// The names that were hardcoded in the policy file get no privilege from
+    /// this path either — it reads the ACL and nothing else.
+    #[tokio::test]
+    async fn the_formerly_hardcoded_names_are_not_admins_here() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        seed_acl(&storage, &["un04-ops-admin"]).await;
+
+        let service = service(&storage);
+        for name in ["genedna", "benjamin-747"] {
+            assert!(
+                !service.check_is_admin(name).await.expect("admin check"),
+                "{name} must not be an admin unless the ACL says so"
+            );
+        }
+    }
+}

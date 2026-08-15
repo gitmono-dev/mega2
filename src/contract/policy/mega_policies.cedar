@@ -63,6 +63,12 @@ permit (
 )
 when { principal in resource.admins };
 
-// root admin can do anything
-permit (principal, action, resource)
-when { principal == User::"genedna" || principal == User::"benjamin-747" };
+// UN-04: there is no hardcoded root admin.
+//
+// Two named individuals used to be permitted everything on every resource,
+// which made the policy file a second, invisible source of admin power: an
+// operator reading the ACL could not tell who was actually privileged, and
+// removing someone from the admin group did not remove their access. Admin is
+// now exactly membership of `UserGroup::"admin"` in the entity store — seeded
+// from `monorepo.admin` into `/.mega_cedar.json` — so the ACL is the whole
+// answer (ADR-UN-03).
