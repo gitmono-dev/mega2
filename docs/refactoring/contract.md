@@ -347,3 +347,20 @@ prefix 也接受「目录名但不带尾部 `/`」的形状——`TokenStore::re
 - **最小读取 facade**：`ReadOnlyStorage`（`src/jupiter/storage/mod.rs`）只装读一次真正需要的东西：mono storage（解析根 ref 与树）与对象存储（取 blob），`read_authz_source()` 走的是服务端启动时同一条读路径，因此审计描述的是服务端真会加载的那份文件。**不**写默认 sidebar，不装配任何为写而存在的 service。以后要加，应当是加一条谁真的需要的读，而不是把完整装配请回来。
 - **只读上下文**：`ReadOnlyContext::open()`（`src/context/mod.rs`）串起只读连接、只读 Vault（UN-31，且**仅在** object storage 配置真的含 `vault://` 时才打开——为没有 vault 的部署去开一个 vault，只为读取零个 secret，是把审计变成不可用）与 provenance 摘要（UN-34）。
 - **零写入证明**：`bin/tests/integration_authz_audit.rs` 用**真实二进制**播种（迁移 + `init_monorepo` + sidebar 全都真的发生），拍下六个面的快照（范围是**除系统 schema 外的全部 schema**，不限于 `public`——只读装配若在别处留下东西，那也是一次写）——schema（schema.表.列:类型）、**每表内容摘要**（整行转文本后排序聚合再 md5，而不是行数：一次 UPDATE 不改变计数）、**序列当前值**（被回滚的插入不留行却会推进序列，那同样是一次写）、refs 全行、对象三表全行、对象存储目录的内容散列——跑完只读装配再拍一次，逐面比对。最后做两次量具校准：写一行探针（快照必须变）、再原地改写它（行数不变、摘要必须变）；否则「前后相等」可能只是因为这份快照什么都没量到。Vault 与文件系统面归 UN-43。
+
+## 只读装配的副作用禁用（UN-43）
+
+`AppContext::new()` 在任何命令体跑起来之前就启动通知 worker、建 Redis 连接、调用 `init_monorepo()`（写 refs 与对象）。UN-30 交付了读取面，本卡管的是它周围的装配，以及**把每一项「没做」变成可断言的事实**——注释里写「不会启动」不构成证据。
+
+`ReadOnlyContext::open()` 因此逐项对照（`src/context/mod.rs`）：不装通知服务、不建 Redis、不做任何 seed/write、Vault 仅经 UN-31 的 readonly bootstrap，且**只在** object storage 凭据真是 `vault://` 引用时才打开。
+
+判据都写成**成对**用例（`src/context/un43_readonly_assembly.rs`），因为「没有副作用」只在副作用可能发生的地方才有意思：
+
+- 通知服务：断言 active 句柄**未变化**而不是为 None——它是进程级全局，同一二进制里别的用例可能合法地装过一个，只在自己先跑时才通过的用例比没有用例更糟。比的是 `Arc::ptr_eq` 身份而不是「有没有」：把一个 active 服务换成另一个，同样是副作用，只看 `is_some()` 看不见。
+- Redis：**数调用次数**，不是只看装配活没活下来——一条连了、把失败吞掉、然后继续跑的路径同样能通过「活下来」的检查，而它确实做了那件事。计数按 URL 分桶（测试二进制是并行跑的，全局计数会被同时发生的别的初始化搅乱，只在别人不跑时才通过的用例比没有用例更糟）。对照断言真的调用一次时计数确实会动。
+- seed：迁移过但空的库上开完之后 `mega_refs` 与 `dynamic_sidebar` 仍为 0；对照里 `init_monorepo()` 与生产 storage 装配确实把它们写了出来。
+- Vault：用真实 bootstrap 建一个 vault 并存入两个 s3 凭据，再用 `vault://` 引用的配置开只读上下文——断言拿到的是只读句柄、`denied_writes()` 为 0，且 vault 表摘要与 key 文件字节都没变。key 文件是关键的一面：bootstrap 路径会轮换 runtime 凭据并回写它。
+
+黑盒面（真实二进制播种 + Vault/文件系统快照 diff）见 `docs/refactoring/integration.md` 的「只读装配的零副作用比对」。
+
+**这一面量得到什么、量不到什么**：文件系统快照收录的是「最终存在的文件」，因此**创建后又删除**的临时文件不会被发现，两个受监视根目录之外的写也不会。前者是快照法的固有边界，后者是登记范围的选择；两条都写在这里，是因为一份不说明边界的「零副作用」证明会被读成比它实际更强的东西。

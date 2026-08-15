@@ -10,11 +10,39 @@ use crate::{
     },
 };
 
+/// How many times [`init_connection`] has been called, per URL.
+///
+/// UN-43 needs to assert that the read-only assembly does not initialize Redis
+/// *at all*. Inferring it from "the assembly survived an unreachable address"
+/// cannot tell a path that never connected from one that connected, swallowed
+/// the failure and carried on — and the second is still a side effect.
+///
+/// Keyed by URL rather than a single counter because the test binary runs its
+/// tests in parallel: a global count would be perturbed by whatever else
+/// happens to initialize Redis at the same moment, and a test that only passes
+/// when nothing else is running is worse than no test.
+#[cfg(test)]
+static INIT_CALLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn init_connection_calls_for(url: &str) -> usize {
+    INIT_CALLS
+        .lock()
+        .map(|calls| calls.get(url).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
 /// Initializes a Redis multiplexed asynchronous connection from the given configuration.
 ///
 /// # Arguments
 /// * `config` - Redis configuration including the connection URL
 pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, MegaError> {
+    #[cfg(test)]
+    if let Ok(mut calls) = INIT_CALLS.lock() {
+        *calls.entry(config.url.clone()).or_insert(0) += 1;
+    }
+
     validate_redis_config(config)?;
 
     if is_secret_ref_value(config.url.trim_start()) {

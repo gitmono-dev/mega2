@@ -34,6 +34,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_git_ssh` | Git SSH cargo-native self-start clone/pull/push（plan-20260803 / GM-06..08） | PostgreSQL, Redis, `--profile git` |
 | `integration_website_auth` | Better Auth cookie to monoengine session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
 | `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
+| `integration_authz_audit` | 只读装配的零副作用黑盒前后比对（UN-30 / UN-43） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
 
 Run the normal project gate with the test environment loaded:
 
@@ -128,3 +129,22 @@ compose-backed integration targets (including `integration_website_auth` and
 check after checking out the `orbit` and `website` siblings. Product email is
 proven via the website internal API + `EMAIL_PROVIDER=test`; no local SMTP
 dependency is required for monoengine notification paths.
+
+## 只读装配的零副作用比对（UN-30 / UN-43）
+
+`integration_authz_audit` 的立论方式是**前后对照**，不是通读代码。播种走**真实二进制**（`monoengine service http` 起来再 SIGINT），因此迁移、`init_monorepo()` 写下的 refs 与对象、默认 sidebar 全都真的发生过——手搓出来的库只包含我们想到的东西，而「零写入」恰恰是关于没想到的那些。
+
+快照有七个面：schema（范围是除系统 schema 外的**全部** schema）、每表**内容摘要**（整行转文本排序聚合后 md5，而不是行数——一次 UPDATE 不改变计数）、`pg_sequences` 当前值（被回滚的插入不留行却推进序列，那同样是一次写）、`mega_refs` 全行、三张对象表全行、对象存储目录逐文件散列，以及 `MEGA_BASE_DIR` + `MEGA_CACHE_DIR` 的逐文件指纹（vault 的 `core_key.json` 就在这一面里）。文件指纹是**内容散列 + 尺寸 + 权限位 + mtime**：一次「内容相同」的重写不会改变内容散列，却仍然是一次写，只有 mtime 能发现它。目录本身也收（路径 + 权限位），因此创建/删除/改名目录与只改目录权限都看得见。
+
+用例分两幕：
+
+1. **本地对象存储**：只读装配读根 ref 与授权源（这条路径同时用到 DB 与对象存储），前后七面全等。
+2. **需要 vault 的部署**（UN-43）：先用 `config secret set` 把两个对象存储凭据写进 vault，再切到 s3compatible，于是只读装配**真的**打开 vault。断言它拿到的是 UN-31 的只读句柄、`denied_writes()` 为 0，且 vault 表与 core key 文件一字未动——bootstrap 路径会轮换 runtime 凭据并回写 key 文件，那正是这一幕要排除的东西。用本地存储时 vault 根本不会被打开，「Vault 状态零变化」会退化成一句空话，所以第二幕不能省。
+
+最后做两次**量具校准**：插入一行探针（快照必须变）、再原地改写同一行（行数不变、摘要必须变）。否则「前后相等」可能只是因为这份快照什么都没量到。
+
+受限根目录产物的排除项写在 `RESTRICTED_ROOTS` 常量里，今天为空；留着是因为「排除了什么」必须是一份明写的清单，而不是某处 diff 里悄悄少掉的几行。匹配用**路径前缀**而不是子串——受限根目录是一个路径祖先，子串匹配既会误伤中间路径同名的文件，也会漏掉本该排除的；且比的是**相对于受监视根**的路径（受限根目录就是这样登记的），拿拼好的绝对路径去比前缀永远对不上，排除清单会变成一个从不生效的摆设。
+
+**这个 target 只有一个用例，且必须 `--test-threads=1`**：它用 `std::env::set_var` 把数据库与对象存储指向本用例专属的库（`.env.test` 里的 `MEGA_DATABASE__DB_URL` 指向共享 admin 库，而环境变量优先级高于配置文件）。这条约束不是靠注释请求后来者小心，而是**运行期强制**：第二次构造 fixture 直接 panic 并说明原因——两个 fixture 会互相覆盖对方的数据库地址，而且谁都不会报错，于是比对会静悄悄地跑在别人的库上。
+
+**这一面量得到什么、量不到什么**：快照收录的是「最终存在的条目」，因此**创建后又删除**的临时文件不会被发现；两个受监视根目录之外的写也不会。前者是快照法的固有边界（要抓它需要的是事件流而不是快照），后者是登记范围的选择。两条都写在这里，是因为一份不说明边界的「零副作用」证明会被读成比它实际更强的东西。

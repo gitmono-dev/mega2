@@ -403,6 +403,24 @@ impl ReadOnlyContext {
         config: crate::config::Config,
         config_summary: Option<crate::commands::LoadedConfigSummary>,
     ) -> Result<Self, MegaError> {
+        Self::open_with_vault_key_path(
+            config,
+            config_summary,
+            crate::contract::vault::integration::vault_core::VaultCore::default_key_path(),
+        )
+        .await
+    }
+
+    /// [`Self::open`] with the vault key file named explicitly.
+    ///
+    /// Production always uses the default path; naming it is what lets the
+    /// zero-side-effect proof point at a vault it created itself instead of the
+    /// developer's real one.
+    pub(crate) async fn open_with_vault_key_path(
+        config: crate::config::Config,
+        config_summary: Option<crate::commands::LoadedConfigSummary>,
+        vault_key_path: std::path::PathBuf,
+    ) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
         let db_connection = Arc::new(
@@ -422,7 +440,7 @@ impl ReadOnlyContext {
                             db_connection.clone(),
                         ),
                     },
-                    crate::contract::vault::integration::vault_core::VaultCore::default_key_path(),
+                    vault_key_path,
                 )
                 .await?,
             )
@@ -453,6 +471,9 @@ impl ReadOnlyContext {
 
 #[cfg(test)]
 mod un30_readonly;
+
+#[cfg(test)]
+mod un43_readonly_assembly;
 
 #[cfg(test)]
 mod tests {

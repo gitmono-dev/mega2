@@ -265,7 +265,19 @@ struct Snapshot {
     refs: Vec<String>,
     objects: Vec<String>,
     object_files: BTreeMap<String, String>,
+    /// MEGA_BASE_DIR 与 MEGA_CACHE_DIR 下的逐文件内容散列（UN-43）。
+    ///
+    /// Vault 的 core key 文件就在这里面：只读装配若走了 bootstrap 路径，它会被重写
+    /// （轮换 runtime 凭据后回写），这一面就会变。
+    filesystem: BTreeMap<String, String>,
 }
+
+/// 受限根目录产物的排除项（UN-43）。
+///
+/// 只读命令允许在**登记过的**受限根目录下写产物（run 目录等，由 UN-32 引入）；除此之外
+/// 文件系统必须一字未动。今天还没有这样的目录，所以这里是空的——留着是因为「排除了什么」
+/// 必须是一份明写的清单，而不是某处 diff 里悄悄少掉的几行。
+const RESTRICTED_ROOTS: &[&str] = &[];
 
 async fn query_column<T: TryGetable>(db: &DatabaseConnection, sql: &str, column: &str) -> Vec<T> {
     db.query_all_raw(Statement::from_string(
@@ -279,7 +291,7 @@ async fn query_column<T: TryGetable>(db: &DatabaseConnection, sql: &str, column:
     .collect()
 }
 
-async fn snapshot(db: &DatabaseConnection, object_root: &Path) -> Snapshot {
+async fn snapshot(db: &DatabaseConnection, object_root: &Path, watched: &[&Path]) -> Snapshot {
     // Schema：表名 + 列名 + 类型。一个多出来的列或一次类型变更都会在这里现形。
     let schema: Vec<String> = query_column(
         db,
@@ -368,6 +380,25 @@ async fn snapshot(db: &DatabaseConnection, object_root: &Path) -> Snapshot {
         refs,
         objects,
         object_files: hash_tree(object_root),
+        filesystem: watched
+            .iter()
+            .flat_map(|root| {
+                hash_tree(root)
+                    .into_iter()
+                    // 排除判定用的是**相对于受监视根**的路径，因为受限根目录也是这样登记的。
+                    // 拿拼好的绝对路径去比，前缀永远对不上，排除清单会变成一个从不生效的
+                    // 摆设。前缀匹配而不是子串匹配：受限根目录是路径祖先，contains 既会误伤
+                    // 中间路径同名的文件，也会漏掉本该排除的。
+                    .filter(|(relative, _)| {
+                        !RESTRICTED_ROOTS
+                            .iter()
+                            .any(|restricted| Path::new(relative).starts_with(restricted))
+                    })
+                    .map(move |(relative, digest)| {
+                        (format!("{}/{}", root.display(), relative), digest)
+                    })
+            })
+            .collect(),
     }
 }
 
@@ -382,6 +413,20 @@ fn hash_tree(root: &Path) -> BTreeMap<String, String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // 目录本身也要收：创建/删除/改名一个目录，以及只改目录权限，都是写，
+                // 而只收文件的快照看不见它们。
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                let mode = fs::metadata(&path)
+                    .map(|m| {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode()
+                    })
+                    .unwrap_or(0);
+                out.insert(relative, format!("dir:{mode:o}"));
                 walk(&path, base, out);
             } else if let Ok(bytes) = fs::read(&path) {
                 let relative = path
@@ -389,7 +434,26 @@ fn hash_tree(root: &Path) -> BTreeMap<String, String> {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                out.insert(relative, format!("{:x}", md5_like(&bytes)));
+                // 指纹里带上尺寸、权限位与 mtime：一次「内容相同」的重写不改内容散列，却仍然
+                // 是一次写，只有 mtime 能发现它。
+                let meta = fs::metadata(&path).ok();
+                let mode = meta
+                    .as_ref()
+                    .map(|m| {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode()
+                    })
+                    .unwrap_or(0);
+                let mtime = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                out.insert(
+                    relative,
+                    format!("{:x}:{}:{:o}:{mtime}", md5_like(&bytes), bytes.len(), mode),
+                );
             }
         }
     }
@@ -414,7 +478,44 @@ fn md5_like(bytes: &[u8]) -> u128 {
 
 // ---------------------------------------------------------------- the test
 
+/// 进程级环境变量的保存/还原。
+///
+/// 单例断言已经让「同进程第二个 fixture」当场炸掉，但用例 panic 后 `Drop` 仍会跑，还原能
+/// 让残留的环境不至于影响同一进程里后续任何代码。这是补上「不留痕迹」的最后一段，而不是
+/// 单例断言的替代。
+struct EnvGuard {
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn new() -> Self {
+        Self { saved: Vec::new() }
+    }
+
+    fn set(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        self.saved.push((key.to_string(), std::env::var_os(key)));
+        // SAFETY: 见 `Fixture::new` —— 本 target 只有一个用例且门带 `--test-threads=1`。
+        unsafe { std::env::set_var(key, value) }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.saved.drain(..).rev() {
+            // SAFETY: 同上。
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(&key, value),
+                    None => std::env::remove_var(&key),
+                }
+            }
+        }
+    }
+}
+
 struct Fixture {
+    /// 先于其它字段声明，因此**最后**析构：还原环境是收尾动作。
+    env: std::sync::Mutex<EnvGuard>,
     _temp: tempfile::TempDir,
     database: TestDatabase,
     config_path: PathBuf,
@@ -424,8 +525,20 @@ struct Fixture {
     cache_dir: PathBuf,
 }
 
+/// 本 target 里已经创建过 fixture 没有。
+///
+/// 环境变量是进程级的，第二个 fixture 会覆盖第一个的数据库地址，而且谁都不会报错——于是
+/// 「前后比对」会静悄悄地跑在别人的库上。与其在注释里请求后来者小心，不如让它当场炸掉。
+static FIXTURE_CREATED: AtomicUsize = AtomicUsize::new(0);
+
 impl Fixture {
     fn new() -> Self {
+        assert_eq!(
+            FIXTURE_CREATED.fetch_add(1, Ordering::SeqCst),
+            0,
+            "这个 target 只能有一个 fixture：环境变量是进程级的，第二个会覆盖第一个的数据库 \
+             地址且不报错。要加用例，先把配置改成不经环境变量注入"
+        );
         let temp = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
         let config_path = temp.path().join("config.toml");
@@ -477,25 +590,24 @@ impl Fixture {
         // 数据上做「前后比对」。
         //
         // SAFETY: 本 target 只有这一个用例，验收命令也带 `--test-threads=1`，因此没有并发
-        // 读取环境变量的线程。**往这个 target 里加第二个用例前必须先解决这件事**——两个
-        // fixture 会互相覆盖对方的数据库地址，而且谁都不会报错。
-        unsafe {
-            std::env::set_var("MEGA_DATABASE__DB_TYPE", "postgres");
-            std::env::set_var("MEGA_DATABASE__DB_PATH", "");
-            std::env::set_var("MEGA_DATABASE__DB_URL", &database.db_url);
-            std::env::set_var("MEGA_DATABASE__MAX_CONNECTION", "4");
-            std::env::set_var("MEGA_DATABASE__MIN_CONNECTION", "1");
-            std::env::set_var("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5");
-            std::env::set_var("MEGA_DATABASE__CONNECT_TIMEOUT", "5");
-            std::env::set_var("MEGA_DATABASE__SQLX_LOGGING", "false");
-            std::env::set_var("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local");
-            std::env::set_var("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &object_root);
-            std::env::set_var("MEGA_REDIS__URL", integration_redis_url());
-            std::env::set_var("MEGA_BASE_DIR", &base_dir);
-            std::env::set_var("MEGA_CACHE_DIR", &cache_dir);
-        }
+        // 读取环境变量的线程。加第二个用例会被 `FIXTURE_CREATED` 当场拦下。
+        let mut env = EnvGuard::new();
+        env.set("MEGA_DATABASE__DB_TYPE", "postgres");
+        env.set("MEGA_DATABASE__DB_PATH", "");
+        env.set("MEGA_DATABASE__DB_URL", &database.db_url);
+        env.set("MEGA_DATABASE__MAX_CONNECTION", "4");
+        env.set("MEGA_DATABASE__MIN_CONNECTION", "1");
+        env.set("MEGA_DATABASE__ACQUIRE_TIMEOUT", "5");
+        env.set("MEGA_DATABASE__CONNECT_TIMEOUT", "5");
+        env.set("MEGA_DATABASE__SQLX_LOGGING", "false");
+        env.set("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local");
+        env.set("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &object_root);
+        env.set("MEGA_REDIS__URL", integration_redis_url());
+        env.set("MEGA_BASE_DIR", &base_dir);
+        env.set("MEGA_CACHE_DIR", &cache_dir);
 
         Self {
+            env: std::sync::Mutex::new(env),
             _temp: temp,
             database,
             config_path,
@@ -555,6 +667,82 @@ impl Fixture {
         service.shutdown(Duration::from_secs(60));
     }
 
+    /// 除对象存储外还要盯住的文件系统面：mega base（含 vault core key）与 cache。
+    fn watched(&self) -> Vec<&Path> {
+        vec![self.base_dir.as_path(), self.cache_dir.as_path()]
+    }
+
+    /// 把两个对象存储凭据写进 vault，并改用需要它们的 s3compatible 后端。
+    ///
+    /// 用本地对象存储时只读装配根本不会打开 vault，「Vault 状态零变化」就成了一句空话。
+    /// 这里把配置换成真的需要 vault 的形态，后面的比对才有内容。
+    fn store_object_storage_credentials_in_vault(&self) {
+        for (field, vault_path, value) in [
+            (
+                "object_storage.s3.access_key_id",
+                "config/it/object_storage/access_key_id",
+                "AKIA-un43-access-key",
+            ),
+            (
+                "object_storage.s3.secret_access_key",
+                "config/it/object_storage/secret_access_key",
+                "un43-secret-access-key",
+            ),
+        ] {
+            let mut command = self.command();
+            command
+                .args([
+                    "config",
+                    "secret",
+                    "set",
+                    field,
+                    "--vault-path",
+                    vault_path,
+                    "--field",
+                    "value",
+                    "--value-stdin",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().expect("spawn config secret set");
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin")
+                    .write_all(value.as_bytes())
+                    .expect("write secret value");
+            }
+            let output = child.wait_with_output().expect("config secret set");
+            assert!(
+                output.status.success(),
+                "config secret set failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        // 环境变量优先级高于配置文件，因此后端切换也走环境变量；同样经 guard，退出时还原。
+        let mut env = self.env.lock().expect("env guard");
+        env.set("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible");
+        env.set("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1");
+        env.set("MEGA_OBJECT_STORAGE__S3__BUCKET", "un43");
+        env.set(
+            "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
+            "http://127.0.0.1:1",
+        );
+        env.set(
+            "MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID",
+            "vault://secret/config/it/object_storage/access_key_id#value",
+        );
+        env.set(
+            "MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY",
+            "vault://secret/config/it/object_storage/secret_access_key#value",
+        );
+    }
+
     async fn observer(&self) -> DatabaseConnection {
         Database::connect(self.database.db_url.as_str())
             .await
@@ -573,7 +761,7 @@ fn integration_readonly_assembly_changes_nothing() {
     with_runtime(async {
         let observer = fixture.observer().await;
 
-        let before = snapshot(&observer, &fixture.object_root).await;
+        let before = snapshot(&observer, &fixture.object_root, &fixture.watched()).await;
         assert!(
             !before.schema.is_empty(),
             "fixture：播种后应当有 schema，否则后面的「零变化」是在比对两个空集"
@@ -646,7 +834,7 @@ fn integration_readonly_assembly_changes_nothing() {
             "读回来的应该是实体存储 JSON，而不是别的什么：{authz}"
         );
 
-        let after = snapshot(&observer, &fixture.object_root).await;
+        let after = snapshot(&observer, &fixture.object_root, &fixture.watched()).await;
 
         assert_eq!(before.schema, after.schema, "DB schema 变了");
         assert_eq!(before.table_digests, after.table_digests, "DB 行内容变了");
@@ -670,7 +858,7 @@ fn integration_readonly_assembly_changes_nothing() {
             )
             .await
             .expect("写入探针行");
-        let probed = snapshot(&observer, &fixture.object_root).await;
+        let probed = snapshot(&observer, &fixture.object_root, &fixture.watched()).await;
         assert_ne!(
             after, probed,
             "快照必须能发现变化，否则上面的相等不构成证据"
@@ -686,10 +874,72 @@ fn integration_readonly_assembly_changes_nothing() {
             .execute_unprepared("UPDATE mega_refs SET ref_commit_hash = 'c2' WHERE id = 990001")
             .await
             .expect("原地改写探针行");
-        let updated = snapshot(&observer, &fixture.object_root).await;
+        let updated = snapshot(&observer, &fixture.object_root, &fixture.watched()).await;
         assert_ne!(
             probed.table_digests, updated.table_digests,
             "原地改写必须被发现——这正是只数行数会漏掉的那一类"
+        );
+
+        // ---- 第二幕（UN-43）：真的需要 vault 的那种部署 ----
+        //
+        // 用本地对象存储时只读装配根本不打开 vault，「Vault 状态零变化」是空话。把凭据放进
+        // vault 并切到 s3compatible 之后，只读装配必须**真的**打开它，且开完什么都没变。
+        fixture.store_object_storage_credentials_in_vault();
+
+        let key_path = fixture.base_dir.join("vault").join("core_key.json");
+        assert!(
+            key_path.exists(),
+            "fixture：播种后应当已经有 vault core key 文件"
+        );
+
+        let before_vault = snapshot(&observer, &fixture.object_root, &fixture.watched()).await;
+        assert!(
+            before_vault
+                .filesystem
+                .keys()
+                .any(|path| path.ends_with("core_key.json")),
+            "fixture：文件系统面必须真的包含 core key 文件，否则后面的比对量不到它"
+        );
+        assert!(
+            before_vault.table_digests.contains_key("public.vault"),
+            "fixture：vault 表必须在内容摘要里"
+        );
+
+        let config = monoengine_core::config::Config::new_with_profile(
+            fixture.config_path.to_str().expect("utf-8 config path"),
+            Some(fixture.profile_path.as_path()),
+        )
+        .expect("parse config");
+        let context = monoengine_core::readonly_ops::ReadOnlyContext::open(config, None)
+            .await
+            .expect("需要 vault 的只读上下文必须能打开");
+        let vault = context
+            .vault
+            .as_ref()
+            .expect("凭据是 vault 引用时，只读装配必须打开 vault");
+        assert!(
+            vault.is_readonly(),
+            "而且必须是 UN-31 的只读句柄，不是 bootstrap 出来的那个"
+        );
+        assert_eq!(
+            vault.denied_writes(),
+            Some(0),
+            "只读装配期间不该有任何写被最终保险拦下"
+        );
+
+        let after_vault = snapshot(&observer, &fixture.object_root, &fixture.watched()).await;
+        assert_eq!(
+            before_vault.table_digests.get("public.vault"),
+            after_vault.table_digests.get("public.vault"),
+            "Vault 存储状态变了"
+        );
+        assert_eq!(
+            before_vault.filesystem, after_vault.filesystem,
+            "文件系统变了（core key 文件被重写是 bootstrap 路径的标志）"
+        );
+        assert_eq!(
+            before_vault, after_vault,
+            "打开 vault 的只读装配同样必须零副作用"
         );
     });
 }
