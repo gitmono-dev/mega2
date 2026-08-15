@@ -45,6 +45,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use cedar_policy::{Context as CedarRequestContext, EntityId, EntityTypeName, EntityUid};
 use futures::{StreamExt, stream};
 use git_internal::{
     DiffItem,
@@ -100,7 +101,14 @@ use crate::{
     },
     contract::{
         api::common::Pagination,
-        policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
+        policy::{
+            builder::EntitySnapshot,
+            context::CedarContext,
+            enforcement::Enforcement,
+            notify::{authz_blob_id, notify_authz_changed_best_effort},
+            resource::resolve_resource,
+            util::SaturnEUid,
+        },
     },
     jupiter::{
         service::buck_service::{
@@ -124,6 +132,119 @@ pub struct MonoApiService {
 }
 
 const LARGE_CL_RENAME_DETECTION_THRESHOLD: usize = 1000;
+
+/// What the queue's background worker should do with an item (UN-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueExecutionDecision {
+    /// Merge it, authorized as this principal. The execution actor stays
+    /// `system` — the worker is what runs the merge, the requester is what
+    /// justifies it (ADR-UN-06 ④).
+    Execute { authz_principal: String },
+    /// Do not merge: authorization for this item cannot proceed. The reason
+    /// carries the operator guidance, since a frozen item needs a human
+    /// decision rather than a blind retry.
+    Freeze { reason: String },
+}
+
+/// Guidance stored and logged when a queued item has no recorded requester.
+///
+/// Retrying alone cannot fix this one: the item predates requester capture (or
+/// was queued anonymously), so there is no subject to authorize it as. Saying
+/// that plainly is the difference between an operator re-queueing it correctly
+/// and repeatedly retrying something that can never succeed.
+pub const QUEUE_MISSING_REQUESTER_GUIDANCE: &str = "the queued item has no recorded requester (it was queued before requester capture,      or queued anonymously), so there is no subject to authorize the merge as;      an operator must re-queue it as an identified user";
+
+/// The queue's execution decision (UN-17).
+///
+/// `off` and `shadow` never change what runs, matching the three-state contract
+/// (ADR-UN-01): `shadow` evaluates and records what `enforce` would have
+/// refused. Under `enforce` an item is executed only if its recorded requester
+/// is still authorized to approve the merge — the subject that asked for it,
+/// re-checked at the moment it actually runs, which may be long after queueing.
+pub fn decide_queue_execution(
+    enforcement: Enforcement,
+    snapshot: Option<&EntitySnapshot>,
+    requester: Option<&str>,
+) -> QueueExecutionDecision {
+    let execute_as = |principal: &str| QueueExecutionDecision::Execute {
+        authz_principal: principal.to_owned(),
+    };
+
+    if !enforcement.builds() {
+        // `off`: no build, no consume — unchanged behavior (GC-UN-01). The
+        // recorded requester is still passed through as the principal, which is
+        // inert today (nothing evaluates it under `off`) and keeps the value
+        // meaningful if the parameter ever reaches an audit trail; a legacy
+        // item with no requester keeps running as the worker, exactly as before.
+        return execute_as(requester.unwrap_or("system"));
+    }
+
+    let (would_deny, reason) = match (requester, snapshot) {
+        (None, _) => (true, QUEUE_MISSING_REQUESTER_GUIDANCE.to_owned()),
+        (Some(_), None) => (
+            true,
+            "the authorization snapshot is not built, so the queued merge cannot be decided;              retry once authorization is available"
+                .to_owned(),
+        ),
+        (Some(requester), Some(snapshot)) => {
+            let store = snapshot.store();
+            let denied = match resolve_resource("/", store).resource() {
+                None => true,
+                Some(resource) => match CedarContext::new(store.clone()) {
+                    Err(_) => true,
+                    Ok(context) => {
+                        match queue_euids(requester) {
+                            None => true,
+                            Some((principal, action)) => context
+                                .is_authorized(&principal, &action, resource, CedarRequestContext::empty())
+                                .is_err(),
+                        }
+                    }
+                },
+            } || store.is_empty();
+            (
+                denied,
+                format!(
+                    "the recorded requester `{requester}` is not authorized to approve this merge;                      an operator must re-queue it as an authorized user or grant that permission"
+                ),
+            )
+        }
+    };
+
+    if enforcement.records_would_deny() && would_deny {
+        tracing::warn!(
+            event = "authz_would_deny",
+            principal = %requester.unwrap_or("<none>"),
+            principal_type = "User",
+            action = "approveMergeRequest",
+            resource = "/",
+            "would-deny recorded: this queued merge would be frozen under enforce"
+        );
+    }
+
+    if enforcement.enforces() && would_deny {
+        return QueueExecutionDecision::Freeze { reason };
+    }
+
+    execute_as(requester.unwrap_or("system"))
+}
+
+/// Cedar ids for the queue's decision, or `None` when the requester is not a
+/// valid entity id (treated as would-deny rather than as an allow).
+fn queue_euids(requester: &str) -> Option<(SaturnEUid, SaturnEUid)> {
+    let user_type = EntityTypeName::from_str("User").ok()?;
+    let action_type = EntityTypeName::from_str("Action").ok()?;
+    Some((
+        SaturnEUid::from(EntityUid::from_type_name_and_id(
+            user_type,
+            EntityId::from_str(requester).ok()?,
+        )),
+        SaturnEUid::from(EntityUid::from_type_name_and_id(
+            action_type,
+            EntityId::from_str("approveMergeRequest").ok()?,
+        )),
+    ))
+}
 
 /// The single emit site of the `merge_queue_authz_frozen` alert (UN-25).
 ///
@@ -3908,10 +4029,53 @@ impl MonoApiService {
             ));
         }
 
-        // Step 5: Execute merge (conflict already checked in step 3)
-        // UN-24 lands the dual parameters; the queue passes `system`/`system`
-        // until UN-17 substitutes the persisted requester as the principal.
-        self.merge_cl_unchecked("system", "system", cl_model.clone())
+        // Step 5: decide the execution subject (UN-17), then merge.
+        //
+        // The merge runs long after the request that queued it, so the subject
+        // that asked for it is re-checked here rather than trusted from queue
+        // time. The worker remains the execution actor; the requester is the
+        // authorization principal (ADR-UN-06 ④).
+        let requester = self
+            .storage
+            .merge_queue_service
+            .get_queue_requester(cl_link)
+            .await
+            .map_err(|e| {
+                (
+                    QueueFailureTypeEnum::SystemError,
+                    format!("Failed to read queue requester: {}", e),
+                )
+            })?
+            .flatten();
+        let enforcement = Enforcement::parse(&self.storage.config().cedar.enforcement)
+            .unwrap_or(Enforcement::Off);
+        let snapshot = self.storage.entity_store().snapshot();
+        let authz_principal =
+            match decide_queue_execution(enforcement, snapshot.as_deref(), requester.as_deref()) {
+                QueueExecutionDecision::Execute { authz_principal } => authz_principal,
+                QueueExecutionDecision::Freeze { reason } => {
+                    // Freeze through the UN-25 helper so the stored message,
+                    // the preserved requester and the alert all match the
+                    // contract; the caller's own failure write then finds the
+                    // item already failed and leaves this diagnosis intact.
+                    if let Err(e) = self
+                        .freeze_merge_queue_item_for_authz(cl_link, &reason)
+                        .await
+                    {
+                        tracing::error!(
+                            cl_link = %cl_link,
+                            error = %e,
+                            "failed to freeze queue item after an authorization refusal"
+                        );
+                    }
+                    return Err((
+                        QueueFailureTypeEnum::SystemError,
+                        format!("merge frozen: {reason}"),
+                    ));
+                }
+            };
+
+        self.merge_cl_unchecked(&authz_principal, "system", cl_model.clone())
             .await
             .map_err(|e| {
                 (

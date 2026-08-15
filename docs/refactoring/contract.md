@@ -172,6 +172,20 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## merge queue 后台执行主体判定（UN-17）
+
+排队的合并在**入队请求早已结束之后**才执行——ACL 可能已经变了，而 worker 本身不是一个主体。因此后台执行以 UN-20 持久化的 `requester` 作为 `authz_principal`，在**执行时刻**重新按 `approveMergeRequest` 判定；`execution_actor` 仍是 `system`（保留既有审计语义，ADR-UN-06 ④）。
+
+`decide_queue_execution(enforcement, snapshot, requester)` 是纯函数：
+
+- `off`：不构建不消费，执行与本卡之前完全一致（legacy 项仍以 `system` 跑）。
+- `shadow`：真实评估并记录 would-deny，但**不改变**执行。
+- `enforce`：requester 未授权、快照未构建、store 为空、requester 为 NULL —— 一律冻结（fail-closed）。
+
+冻结经 UN-25 的 helper 落库（`Failed` + `SystemError`、保留 requester、消息含可重试条件）并产生 `event=merge_queue_authz_frozen` 告警；随后 worker 自身的失败写入发现该项已 Failed，因此**保留**这一诊断而不是覆盖它。
+
+**requester 为 NULL 的项**（早于 requester 捕获入队，或匿名入队）单独给出人工处理指引：这类项没有可授权的主体，单纯重试永远不会成功，必须由运维以具名用户重新入队。指引常量随代码固化，冻结消息与告警都带上它。
+
 ## merge-no-auth 入口鉴权与双参数签名（UN-24）
 
 `merge-no-auth` 原本是本地调试的捷径：不在 guard 映射内、硬编码 `"system"` 执行者——**能连上端口的人就能合并**。UN-24 把它按 `{method, path}` 纳入映射（action = `approveMergeRequest`，与 `merge` 完全相同），并让 handler 经 `OptionalSessionUser` 取可选主体。名字里的 "no auth" 从此只表示**不需要认证会话**，不表示跳过授权。
