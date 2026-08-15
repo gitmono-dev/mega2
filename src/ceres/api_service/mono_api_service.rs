@@ -125,6 +125,36 @@ pub struct MonoApiService {
 
 const LARGE_CL_RENAME_DETECTION_THRESHOLD: usize = 1000;
 
+/// The single emit site of the `merge_queue_authz_frozen` alert (UN-25).
+///
+/// Synchronous and process-local by design: an `error` log cannot fail, so
+/// alerting can never interfere with the freeze transaction that precedes it.
+/// Keeping it in one function also means the field set is one thing to read —
+/// and one thing to assert.
+pub fn emit_authz_frozen_alert(cl_link: &str, requester: Option<&str>, reason: &str) {
+    tracing::error!(
+        event = "merge_queue_authz_frozen",
+        cl_link = %cl_link,
+        requester = %requester.unwrap_or("<none>"),
+        reason = %reason,
+        "merge queue item frozen: authorization could not be decided"
+    );
+}
+
+/// Message stored on a queue item frozen by UN-25.
+///
+/// It names the condition for a successful retry, because a frozen item is not
+/// a failed merge: nothing was wrong with the change, only with the ability to
+/// decide it.
+pub fn authz_freeze_message(reason: &str) -> String {
+    format!(
+        "merge frozen: authorization unavailable ({reason}). \
+         The change was not rejected and no merge was attempted. \
+         Retry this item once authorization is available again; \
+         the recorded requester is reused as the authorization subject."
+    )
+}
+
 impl From<&MonoRepo> for MonoApiService {
     fn from(mono_repo: &MonoRepo) -> Self {
         MonoApiService {
@@ -3320,6 +3350,47 @@ impl MonoApiService {
         self.ensure_merge_processor_running();
 
         Ok(position)
+    }
+
+    /// Freeze a queued CL because authorization could not be decided (UN-25).
+    ///
+    /// "Frozen" reuses the existing terminal state rather than inventing one:
+    /// `Failed` + `SystemError`, which the queue already understands and the
+    /// existing retry entry point already accepts. Two properties matter for a
+    /// frozen item:
+    ///
+    /// * the recorded `requester` is **kept** — it is the authorization subject
+    ///   the merge will be re-decided against, and losing it would turn a retry
+    ///   into an unattributed merge;
+    /// * `error_message` states the condition under which a retry can succeed,
+    ///   so an operator is not left guessing whether to retry or to escalate.
+    ///
+    /// The alert is a process-local `error` log written synchronously in the
+    /// same call: there is no external call that could fail and no way for
+    /// alerting to interfere with the freeze itself.
+    pub async fn freeze_merge_queue_item_for_authz(
+        &self,
+        cl_link: &str,
+        reason: &str,
+    ) -> Result<bool, MegaError> {
+        let requester = self
+            .storage
+            .merge_queue_service
+            .get_queue_requester(cl_link)
+            .await?
+            .flatten();
+
+        let frozen = self
+            .storage
+            .merge_queue_service
+            .freeze_item_for_authz(cl_link, &authz_freeze_message(reason))
+            .await?;
+
+        if frozen {
+            emit_authz_frozen_alert(cl_link, requester.as_deref(), reason);
+        }
+
+        Ok(frozen)
     }
 
     /// Retries a failed merge queue item and ensures the processor is running.

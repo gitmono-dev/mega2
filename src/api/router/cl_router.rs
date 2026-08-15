@@ -154,6 +154,7 @@ async fn close_cl(
     responses(
         (status = 200, body = CommonResult<String>, content_type = "application/json"),
         (status = 403, description = "Authorization denied for this Change List operation"),
+        (status = 503, description = "Authorization is unavailable; the merge is not decidable right now and may be retried"),
     ),
     tag = CL_TAG
 )]
@@ -220,6 +221,7 @@ async fn merge(
     responses(
         (status = 200, body = CommonResult<String>, content_type = "application/json"),
         (status = 403, description = "Authorization denied for this Change List operation"),
+        (status = 503, description = "Authorization is unavailable; the merge is not decidable right now and may be retried"),
     ),
     tag = CL_TAG
 )]

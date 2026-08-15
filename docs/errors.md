@@ -90,6 +90,18 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 
 `POST /cl/{link}/merge-no-auth` 自 UN-24 起与 `POST /cl/{link}/merge` 映射到**同一** action（`approveMergeRequest`）并声明 403。其名字里的 "no auth" 只表示不需要**认证会话**，不表示跳过授权：匿名调用以保留字 `User::"__anonymous__"` 参与求值，在 `enforce` 下被拒为 403。
 
+## merge 面「授权不可判定」的 503（UN-25）
+
+`[code:503]` 映射为 **503 Service Unavailable**。此前未登记的码一律落 500，与真正的 bug 无法区分，且按契约不可重试。
+
+- **503 = 现在判不了，可重试**：授权数据不可用（快照未构建 / dirty / 存储读取失败）时，merge 面既不能放行也不该按「变更被拒绝」处理。
+- **500 = 服务端缺陷**，客户端重试无意义。
+- **403 = 已识别主体但无权限**（UN-23）。
+
+`merge` 与 `merge-no-auth` 在 OpenAPI 中同时声明 403 与 503。
+
+排队项在同样情形下被**冻结**而不是失败：沿用既有终态 `Failed` + `SystemError`（不新增 enum、不加迁移，既有 retry 入口继续可用），保留 `requester`（它是重试时据以再判定的授权主体），`error_message` 写明可重试的条件。冻结路径同步产生进程内 `error` 日志 `event=merge_queue_authz_frozen`（字段 `cl_link` / `requester` / `reason`）——告警不做外部调用，因此不存在告警失败影响冻结事务的路径。
+
 ## 响应安全
 
 - `ApiError` 只向客户端暴露 4xx 细节。

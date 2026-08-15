@@ -176,6 +176,11 @@ where
                 "413" => ApiError::with_status(StatusCode::PAYLOAD_TOO_LARGE, anyhow_err),
                 "416" => ApiError::with_status(StatusCode::RANGE_NOT_SATISFIABLE, anyhow_err),
                 "500" => ApiError::internal(anyhow_err),
+                // 503 says "the server cannot decide right now, try again",
+                // which is exactly the merge face's authorization-unavailable
+                // state (UN-25). Without this arm it fell through to 500 —
+                // indistinguishable from a bug, and not retryable by contract.
+                "503" => ApiError::with_status(StatusCode::SERVICE_UNAVAILABLE, anyhow_err),
                 _ => ApiError::internal(anyhow_err),
             };
         }

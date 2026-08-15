@@ -46,6 +46,8 @@ pub mod import_api_service;
 pub mod mono_api_service;
 pub mod state;
 pub mod tree_ops;
+#[cfg(test)]
+mod un25_freeze;
 
 #[async_trait]
 pub trait ApiHandler: Send + Sync {

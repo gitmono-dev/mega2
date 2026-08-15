@@ -3,7 +3,7 @@ members = ["bin"]
 
 [package]
 name = "monoengine-core"
-version = "0.2.34"
+version = "0.2.35"
 edition = "2024"
 
 [lib]

@@ -237,6 +237,25 @@ impl MergeQueueService {
             .map_err(MegaError::Other)
     }
 
+    /// Freeze a queued item because authorization could not be decided
+    /// (UN-25). Reuses the existing terminal state — `Failed` +
+    /// `SystemError` — so the existing retry entry point keeps working; the
+    /// recorded requester is untouched.
+    pub async fn freeze_item_for_authz(
+        &self,
+        cl_link: &str,
+        message: &str,
+    ) -> Result<bool, MegaError> {
+        self.merge_queue_storage
+            .update_item_status_with_error(
+                cl_link,
+                QueueFailureTypeEnum::SystemError,
+                message.to_owned(),
+            )
+            .await
+            .map_err(MegaError::Other)
+    }
+
     /// The subject recorded for a queued CL (UN-20); consumed by the queue's
     /// execution decision (UN-17).
     pub async fn get_queue_requester(
