@@ -172,6 +172,19 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## `pushRepo` 策略语义修正（UN-09）
+
+`pushRepo` 此前同时出现在两个不该出现的地方：
+
+- **公开仓库块**（`unless { resource.is_private }`）——于是「仓库是公开的」等于「任何人都能往里写」；
+- **reader 块**——于是读权限蕴含写权限。
+
+两者都与角色名的承诺相反。现在 `pushRepo` 只在 maintainer 与 admin 动作集中；admin 单独列出而不依赖它继承 maintainer 组，因为那条继承关系是 ACL 数据，可能被改掉。
+
+矩阵（`src/contract/policy/un09_push_matrix.rs`）在**真实 init 产物派生**的 fixture 上求值（`generate_entity` 生成与服务端播种同形的实体，含历史拼写 `matainer`，DEFER-UN-06），再补入各角色成员：admin/maintainer 在公开与私有下均可 push，reader 与无组主体均不可；同时断言两个被编辑块的**其它动作**一字未改（公开仓库仍可 view/pull/fork/openIssue/createMergeRequest）。
+
+`off` 默认下策略内容是惰性的——没有求值方，因此无行为变化。
+
 ## merge queue 后台执行主体判定（UN-17）
 
 排队的合并在**入队请求早已结束之后**才执行——ACL 可能已经变了，而 worker 本身不是一个主体。因此后台执行以 UN-20 持久化的 `requester` 作为 `authz_principal`，在**执行时刻**重新按 `approveMergeRequest` 判定；`execution_actor` 仍是 `system`（保留既有审计语义，ADR-UN-06 ④）。

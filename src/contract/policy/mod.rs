@@ -11,6 +11,8 @@ mod objects;
 pub mod resource;
 pub mod reviewer_parser;
 #[cfg(test)]
+mod un09_push_matrix;
+#[cfg(test)]
 mod un21_cache;
 #[cfg(test)]
 mod un21_matrix;
