@@ -152,3 +152,22 @@
 | receive-pack Delete | `monorepo.rs::apply_cl_mega_ref_for_push_command` 的 Delete 分支 | 同点**拒绝删除主干 ref**（`MEGA_BRANCH_NAME`），错误对 git 客户端可操作 |
 
 主干删除拒绝是有意的安全收口（非 enforcement 门控，GC-UN-01 例外公示），在 `off` 默认下也生效。
+
+## 快照重建全维即时生效矩阵（UN-21）
+
+`/.mega_cedar.json` 的授权输入维度由 `src/contract/policy/objects.rs` 与 `mega.cedarschema` 的真实 schema 决定，共八维；`merge_requests` / `issues` 播种为空且不参与求值，不是输入维度。八维与其判定翻转的对应关系逐维锁定在 `src/contract/policy/un21_matrix.rs`（每维一个具名测试函数）：
+
+| 维 | 数据源字段 | 翻转的判定 |
+|---|---|---|
+| 一 | `users[].parents` 加入 `admin` | admin 专属 action（`addAdmin`） |
+| 二 | `users[].parents` 移出 `matainer` | maintainer 专属 action（`approveMergeRequest`） |
+| 三 | `users[].parents` 移出 `reader` | reader action（`pullRepo`） |
+| 四 | `user_groups[].parents` 断开继承链 | 继承链上的 reader action |
+| 五 | `repos[].is_private` 翻转 | 无角色主体的可见性（`viewRepo`） |
+| 六 | `repos[].admins` 组引用改指 | admin 专属 action |
+| 七 | `repos[].maintainers` 组引用改指 | maintainer 专属 action |
+| 八 | `repos[].readers` 组引用改指 | reader action |
+
+矩阵的每条断言都针对快照**缓存的** `Entities`（UN-14）求值，而不是从 store 现推，因此缓存残留会让矩阵失败而不是被重新推导掩盖。`src/contract/policy/un21_cache.rs` 另行锁定缓存语义本身：重建发布新的不可变快照而非原地修改（重建前取得的句柄继续服务其自身内容）、反复重建在两个方向都无残留、重建失败保留旧快照并置 dirty。
+
+组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。

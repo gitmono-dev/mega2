@@ -10,6 +10,10 @@ pub mod notify;
 mod objects;
 pub mod resource;
 pub mod reviewer_parser;
+#[cfg(test)]
+mod un21_cache;
+#[cfg(test)]
+mod un21_matrix;
 pub mod util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
