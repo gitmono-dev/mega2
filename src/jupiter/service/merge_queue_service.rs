@@ -40,11 +40,21 @@ impl MergeQueueService {
     /// Note: This method only adds to queue. The background processor
     /// should be started by the caller (MonoApiService) after this call.
     pub async fn add_to_queue(&self, cl_link: String) -> Result<i64, MegaError> {
+        self.add_to_queue_with_requester(cl_link, None).await
+    }
+
+    /// Enqueue a CL, recording the subject that requested it (UN-20).
+    /// `None` = anonymous.
+    pub async fn add_to_queue_with_requester(
+        &self,
+        cl_link: String,
+        requester: Option<String>,
+    ) -> Result<i64, MegaError> {
         self.validate_cl_for_queue(&cl_link).await?;
 
         let position = self
             .merge_queue_storage
-            .add_to_queue(cl_link)
+            .add_to_queue_with_requester(cl_link, requester)
             .await
             .map_err(MegaError::Other)?;
 
@@ -210,6 +220,31 @@ impl MergeQueueService {
     pub async fn retry_queue_item(&self, cl_link: &str) -> Result<bool, MegaError> {
         self.merge_queue_storage
             .retry_failed_item(cl_link)
+            .await
+            .map_err(MegaError::Other)
+    }
+
+    /// Retry a failed item, recording the subject that requested the retry
+    /// (UN-20). `None` = anonymous.
+    pub async fn retry_queue_item_with_requester(
+        &self,
+        cl_link: &str,
+        requester: Option<String>,
+    ) -> Result<bool, MegaError> {
+        self.merge_queue_storage
+            .retry_failed_item_with_requester(cl_link, requester)
+            .await
+            .map_err(MegaError::Other)
+    }
+
+    /// The subject recorded for a queued CL (UN-20); consumed by the queue's
+    /// execution decision (UN-17).
+    pub async fn get_queue_requester(
+        &self,
+        cl_link: &str,
+    ) -> Result<Option<Option<String>>, MegaError> {
+        self.merge_queue_storage
+            .get_requester(cl_link)
             .await
             .map_err(MegaError::Other)
     }

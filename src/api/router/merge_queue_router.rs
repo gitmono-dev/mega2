@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::MERGE_QUEUE_TAG},
+    api::{MonoApiServiceState, api_doc::MERGE_QUEUE_TAG, oauth::OptionalSessionUser},
     ceres::model::merge_queue::{
         AddToQueueRequest, AddToQueueResponse, QueueItem, QueueListResponse, QueueStatsResponse,
         QueueStatus, QueueStatusResponse,
@@ -42,12 +42,16 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
 )]
 async fn add_to_queue(
     state: State<MonoApiServiceState>,
+    // UN-20: capture the requesting subject, if any. `OptionalSessionUser`
+    // never rejects, so an anonymous enqueue stays possible and is recorded as
+    // NULL — this handler adds no new rejection surface.
+    OptionalSessionUser(requester): OptionalSessionUser,
     Json(request): Json<AddToQueueRequest>,
 ) -> Result<Json<CommonResult<AddToQueueResponse>>, ApiError> {
     // Use MonoApiService to add to queue AND start the background processor
     match state
         .monorepo()
-        .add_to_merge_queue(request.cl_link.clone())
+        .add_to_merge_queue_as(request.cl_link.clone(), requester.map(|user| user.username))
         .await
     {
         Ok(position) => {
@@ -207,10 +211,17 @@ async fn get_cl_queue_status(
 )]
 async fn retry_queue_item(
     state: State<MonoApiServiceState>,
+    // UN-20: same optional capture as the add path — a retry records who asked
+    // for it, and an anonymous retry is still allowed (recorded as NULL).
+    OptionalSessionUser(requester): OptionalSessionUser,
     Path(cl_link): Path<String>,
 ) -> Result<Json<CommonResult<Value>>, ApiError> {
     // Use MonoApiService to retry AND start the background processor
-    match state.monorepo().retry_merge_queue_item(&cl_link).await {
+    match state
+        .monorepo()
+        .retry_merge_queue_item_as(&cl_link, requester.map(|user| user.username))
+        .await
+    {
         Ok(success) => {
             let response = if success {
                 json!({

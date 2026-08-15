@@ -108,6 +108,18 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 > 写迁移测试时注意：单元测试库按 **schema** 隔离（`search_path`，见 `src/jupiter/tests.rs`），而 `information_schema` / `pg_indexes` 跨全部 schema，因此目录查询必须带 `current_schema()` 限定，否则会读到并发用例的表。
 
+## merge queue requester 读写链（UN-20）
+
+`/merge-queue/add` 与 `/merge-queue/retry/{cl_link}` 经 `OptionalSessionUser`（UN-22）捕获**可选**主体：该 extractor 永不 401，因此匿名入队/重试仍可服务，记为 NULL——本卡不产生任何新的拒绝面。
+
+链路：router → `MonoApiService::{add_to_merge_queue_as, retry_merge_queue_item_as}` → `MergeQueueService::{add_to_queue_with_requester, retry_queue_item_with_requester}` → storage。requester 与队列行**在同一条插入/更新语句**里落库——排队的合并稍后由后台 worker 执行，行存在而主体缺失就是一次没有主体的合并。
+
+既有 storage 方法签名零变更：`add_to_queue` / `retry_failed_item` 保留并委派。语义差别值得记住：`retry_failed_item`（不知道主体）**不动**已记录的 requester，而 `retry_failed_item_with_requester(link, None)`（显式匿名）会把它清空。
+
+读出面 `get_requester(cl_link) -> Option<Option<String>>`：外层 `None` = 没有该队列行，内层 `None` = 匿名或 UN-18 之前写入的 legacy NULL 行。执行时的主体判定由 UN-17 消费该读出面。
+
+> 单测提示：`jupiter::tests::test_storage` 的 `merge_queue_service` 原本是 `mock()`（disconnected 连接），驱动队列链路会 panic；已改为与该 storage 共用同一测试库。
+
 ## CI
 
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the

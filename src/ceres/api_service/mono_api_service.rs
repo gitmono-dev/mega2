@@ -3262,6 +3262,16 @@ impl MonoApiService {
     /// * `Ok(i64)` - The position in queue on success
     /// * `Err(MegaError)` - If validation fails or database error occurs
     pub async fn add_to_merge_queue(&self, cl_link: String) -> Result<i64, MegaError> {
+        self.add_to_merge_queue_as(cl_link, None).await
+    }
+
+    /// Same as [`add_to_merge_queue`], recording the subject that requested the
+    /// merge (UN-20). `None` = anonymous.
+    pub async fn add_to_merge_queue_as(
+        &self,
+        cl_link: String,
+        requester: Option<String>,
+    ) -> Result<i64, MegaError> {
         // Validate CL exists and is in Open status
         let cl = self.storage.cl_storage().get_cl(&cl_link).await?;
         let model = cl.ok_or(MegaError::Other("CL not found".to_string()))?;
@@ -3277,7 +3287,7 @@ impl MonoApiService {
         let position = self
             .storage
             .merge_queue_service
-            .add_to_queue(cl_link)
+            .add_to_queue_with_requester(cl_link, requester)
             .await?;
 
         // Ensure the background processor is running
@@ -3300,6 +3310,27 @@ impl MonoApiService {
             .storage
             .merge_queue_service
             .retry_queue_item(cl_link)
+            .await?;
+
+        if result {
+            // Ensure the background processor is running
+            self.ensure_merge_processor_running();
+        }
+
+        Ok(result)
+    }
+
+    /// Same as [`retry_merge_queue_item`], recording the subject that requested
+    /// the retry (UN-20). `None` = anonymous.
+    pub async fn retry_merge_queue_item_as(
+        &self,
+        cl_link: &str,
+        requester: Option<String>,
+    ) -> Result<bool, MegaError> {
+        let result = self
+            .storage
+            .merge_queue_service
+            .retry_queue_item_with_requester(cl_link, requester)
             .await?;
 
         if result {

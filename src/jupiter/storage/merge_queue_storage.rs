@@ -37,6 +37,20 @@ impl MergeQueueStorage {
 
     /// Adds CL to queue with timestamp position
     pub async fn add_to_queue(&self, cl_link: String) -> Result<i64, String> {
+        self.add_to_queue_with_requester(cl_link, None).await
+    }
+
+    /// Enqueue a CL and record the subject that requested it (UN-20).
+    ///
+    /// The requester is part of the **same insert** as the queue row: a queued
+    /// merge is executed later by a background worker, so a row that exists
+    /// without its requester would be a merge with no subject of its own.
+    /// `None` means the request was anonymous and the column stays NULL.
+    pub async fn add_to_queue_with_requester(
+        &self,
+        cl_link: String,
+        requester: Option<String>,
+    ) -> Result<i64, String> {
         let db = self.get_connection();
 
         // Check if CL is already in queue (any status)
@@ -80,9 +94,7 @@ impl MergeQueueStorage {
             error_message: Set(None),
             created_at: Set(now.naive_utc()),
             updated_at: Set(now.naive_utc()),
-            // UN-18 adds the column only; writing the requester through is
-            // UN-20's read/write chain, so it stays NULL here for now.
-            requester: Set(None),
+            requester: Set(requester),
         };
 
         new_item
@@ -374,6 +386,29 @@ impl MergeQueueStorage {
     }
 
     pub async fn retry_failed_item(&self, cl_link: &str) -> Result<bool, String> {
+        // `None` here means "leave the recorded requester as it is": a retry
+        // that does not know its subject must not erase the one already stored.
+        self.retry_failed_item_inner(cl_link, None).await
+    }
+
+    /// Retry a failed item and record the subject that requested the retry
+    /// (UN-20), in the same update as the queue row. `requester` is `None` for
+    /// an anonymous retry, which stores NULL.
+    pub async fn retry_failed_item_with_requester(
+        &self,
+        cl_link: &str,
+        requester: Option<String>,
+    ) -> Result<bool, String> {
+        self.retry_failed_item_inner(cl_link, Some(requester)).await
+    }
+
+    /// `requester_update`: outer `None` leaves the column untouched, `Some(v)`
+    /// writes `v` (including `None` for anonymous).
+    async fn retry_failed_item_inner(
+        &self,
+        cl_link: &str,
+        requester_update: Option<Option<String>>,
+    ) -> Result<bool, String> {
         let db = self.get_connection();
 
         let item = Entity::find()
@@ -397,6 +432,9 @@ impl MergeQueueStorage {
             active_model.position = Set(chrono::Utc::now().timestamp_millis());
             active_model.failure_type = Set(None);
             active_model.error_message = Set(None);
+            if let Some(requester) = requester_update {
+                active_model.requester = Set(requester);
+            }
 
             active_model
                 .update(db)
@@ -407,6 +445,21 @@ impl MergeQueueStorage {
         } else {
             Ok(false)
         }
+    }
+
+    /// The subject recorded for a queued CL (UN-20).
+    ///
+    /// The outer `Option` distinguishes "no such queue row" from a row whose
+    /// requester is unknown; the inner one is the anonymous / legacy-NULL case
+    /// (rows written before the column existed read back as `None`).
+    pub async fn get_requester(&self, cl_link: &str) -> Result<Option<Option<String>>, String> {
+        let db = self.get_connection();
+        let item = Entity::find()
+            .filter(Column::ClLink.eq(cl_link))
+            .one(db)
+            .await
+            .map_err(|e| format!("Failed to find item: {}", e))?;
+        Ok(item.map(|item| item.requester))
     }
 
     pub async fn move_item_to_tail(&self, cl_link: &str) -> Result<bool, String> {
@@ -442,5 +495,188 @@ impl MergeQueueStorage {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ConnectionTrait;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+
+    async fn storage() -> (TempDir, MergeQueueStorage) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let conn = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&conn, false).await.expect("migrations");
+        (
+            temp_dir,
+            MergeQueueStorage::new(BaseStorage::new(std::sync::Arc::new(conn))),
+        )
+    }
+
+    /// UN-20: the requester lands in the same insert as the queue row, so a
+    /// queued merge never exists without the subject that asked for it.
+    #[tokio::test]
+    async fn un20_add_to_queue_records_the_requester_in_the_same_insert() {
+        let (_temp, storage) = storage().await;
+
+        storage
+            .add_to_queue_with_requester("UN20WITH".to_string(), Some("alice".to_string()))
+            .await
+            .expect("enqueue with requester");
+
+        assert_eq!(
+            storage.get_requester("UN20WITH").await.expect("read back"),
+            Some(Some("alice".to_string())),
+            "the requester is readable straight after the insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn un20_an_anonymous_enqueue_stores_null() {
+        let (_temp, storage) = storage().await;
+
+        storage
+            .add_to_queue_with_requester("UN20ANON".to_string(), None)
+            .await
+            .expect("anonymous enqueue");
+
+        assert_eq!(
+            storage.get_requester("UN20ANON").await.expect("read back"),
+            Some(None),
+            "an anonymous request is recorded as NULL, not as a made-up subject"
+        );
+    }
+
+    /// The pre-UN-20 entry point keeps its signature *and* its behavior.
+    #[tokio::test]
+    async fn un20_the_legacy_add_entry_point_is_unchanged() {
+        let (_temp, storage) = storage().await;
+
+        storage
+            .add_to_queue("UN20LEGACY".to_string())
+            .await
+            .expect("legacy enqueue");
+
+        assert_eq!(
+            storage
+                .get_requester("UN20LEGACY")
+                .await
+                .expect("read back"),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn un20_get_requester_distinguishes_a_missing_row_from_an_unknown_subject() {
+        let (_temp, storage) = storage().await;
+        storage
+            .add_to_queue_with_requester("UN20PRESENT".to_string(), None)
+            .await
+            .expect("enqueue");
+
+        assert_eq!(
+            storage.get_requester("UN20ABSENT").await.expect("read"),
+            None,
+            "no queue row at all"
+        );
+        assert_eq!(
+            storage.get_requester("UN20PRESENT").await.expect("read"),
+            Some(None),
+            "a row whose subject is unknown"
+        );
+    }
+
+    /// A row written before the column existed reads back as `None` — the
+    /// legacy semantics UN-17's execution decision is built on.
+    #[tokio::test]
+    async fn un20_legacy_null_rows_read_back_as_none() {
+        let (temp, storage) = storage().await;
+        let conn = test_db_connection(temp.path()).await;
+        let _ = conn;
+
+        storage
+            .get_connection()
+            .execute_unprepared(
+                "INSERT INTO merge_queue \
+                 (id, cl_link, status, position, retry_count, created_at, updated_at) \
+                 VALUES (970001, 'UN20NULL', 'failed', 1, 0, now(), now())",
+            )
+            .await
+            .expect("insert a pre-UN-18 shaped row");
+
+        assert_eq!(
+            storage.get_requester("UN20NULL").await.expect("read back"),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn un20_retry_records_the_requester_and_the_legacy_entry_point_preserves_it() {
+        let (_temp, storage) = storage().await;
+        storage
+            .add_to_queue_with_requester("UN20RETRY".to_string(), Some("alice".to_string()))
+            .await
+            .expect("enqueue");
+        storage
+            .get_connection()
+            .execute_unprepared(
+                "UPDATE merge_queue SET status = 'failed' WHERE cl_link = 'UN20RETRY'",
+            )
+            .await
+            .expect("mark failed");
+
+        // A retry that knows its subject overwrites the recorded one.
+        assert!(
+            storage
+                .retry_failed_item_with_requester("UN20RETRY", Some("bob".to_string()))
+                .await
+                .expect("retry with requester")
+        );
+        assert_eq!(
+            storage.get_requester("UN20RETRY").await.expect("read back"),
+            Some(Some("bob".to_string()))
+        );
+
+        // The legacy entry point must not erase it.
+        storage
+            .get_connection()
+            .execute_unprepared(
+                "UPDATE merge_queue SET status = 'failed' WHERE cl_link = 'UN20RETRY'",
+            )
+            .await
+            .expect("mark failed again");
+        assert!(
+            storage
+                .retry_failed_item("UN20RETRY")
+                .await
+                .expect("legacy retry")
+        );
+        assert_eq!(
+            storage.get_requester("UN20RETRY").await.expect("read back"),
+            Some(Some("bob".to_string())),
+            "a retry with no known subject must not erase the recorded one"
+        );
+
+        // An explicitly anonymous retry does clear it.
+        storage
+            .get_connection()
+            .execute_unprepared(
+                "UPDATE merge_queue SET status = 'failed' WHERE cl_link = 'UN20RETRY'",
+            )
+            .await
+            .expect("mark failed once more");
+        assert!(
+            storage
+                .retry_failed_item_with_requester("UN20RETRY", None)
+                .await
+                .expect("anonymous retry")
+        );
+        assert_eq!(
+            storage.get_requester("UN20RETRY").await.expect("read back"),
+            Some(None)
+        );
     }
 }

@@ -178,7 +178,10 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         cla_service: ClaService::new(base.clone()),
         issue_service: IssueService::mock(),
         cl_service: CLService::mock(),
-        merge_queue_service: MergeQueueService::mock(),
+        // UN-20: the queue service must talk to the same test database as the
+        // rest of this storage — `mock()` hands out a disconnected connection,
+        // so any test driving the queue chain would panic on first use.
+        merge_queue_service: MergeQueueService::new(base.clone()),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
         config_handle: ConfigHandle::from_arc(config.clone()),
