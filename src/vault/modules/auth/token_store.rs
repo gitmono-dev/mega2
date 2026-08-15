@@ -169,6 +169,13 @@ impl TokenStore {
         }
 
         if token_store.salt.is_empty() {
+            // A vault that has been initialized already has a salt. Missing one
+            // under a readonly open (UN-31) means the stored state is not what
+            // this code expects, and minting a fresh salt would both write and
+            // silently change how every token in that vault hashes.
+            if core.readonly {
+                return Err(RvError::ErrCoreReadonlyStateIncomplete);
+            }
             token_store.salt = generate_uuid();
             let raw = StorageEntry {
                 key: TOKEN_SALT_LOCATION.to_string(),

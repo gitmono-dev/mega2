@@ -102,6 +102,12 @@ pub struct Core {
     pub mounts_monitor: ArcSwapOption<MountsMonitor>,
     pub mounts_monitor_interval: u64,
     pub state: ArcSwap<CoreState>,
+    /// Readonly bootstrap mode (UN-31).
+    ///
+    /// Set at construction and never afterwards: a core that started readonly
+    /// stays readonly for its whole life, so no caller can flip the flag between
+    /// the checks below and the writes they guard.
+    pub readonly: bool,
 }
 
 impl Default for CoreState {
@@ -141,6 +147,7 @@ impl Default for Core {
             mounts_monitor: ArcSwapOption::empty(),
             mounts_monitor_interval: 0,
             state: ArcSwap::from_pointee(CoreState::default()),
+            readonly: false,
         }
     }
 }
@@ -163,6 +170,19 @@ impl Core {
                 "",
             )),
             ..Default::default()
+        }
+    }
+
+    /// A core that will refuse to repair or persist anything (UN-31).
+    ///
+    /// The caller is still expected to hand in a write-denying physical backend
+    /// ([`crate::vault::storage::readonly::ReadonlyBackend`]); this flag is what
+    /// keeps the bootstrap from *asking* for the writes that backend would then
+    /// have to refuse.
+    pub fn new_readonly(backend: Arc<dyn PhysicalBackend>) -> Self {
+        Core {
+            readonly: true,
+            ..Self::new(backend)
         }
     }
 
@@ -612,13 +632,23 @@ impl Core {
         self.module_manager.setup(self)?;
 
         // Perform initial setup
-        self.mounts_router
-            .load_or_default(
-                self.barrier.as_storage(),
-                Some(&self.state.load().hmac_key),
-                self.mount_entry_hmac_level,
-            )
-            .await?;
+        if self.readonly {
+            self.mounts_router
+                .load_readonly(
+                    self.barrier.as_storage(),
+                    Some(&self.state.load().hmac_key),
+                    self.mount_entry_hmac_level,
+                )
+                .await?;
+        } else {
+            self.mounts_router
+                .load_or_default(
+                    self.barrier.as_storage(),
+                    Some(&self.state.load().hmac_key),
+                    self.mount_entry_hmac_level,
+                )
+                .await?;
+        }
 
         self.mounts_router
             .setup(self.self_ptr.upgrade().unwrap().clone())?;

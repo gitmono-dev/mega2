@@ -26,6 +26,7 @@ pub mod barrier;
 pub mod barrier_aes_gcm;
 pub mod barrier_view;
 pub mod physical;
+pub mod readonly;
 pub mod sql;
 #[cfg(any())]
 pub mod xline;

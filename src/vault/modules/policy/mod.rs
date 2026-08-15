@@ -163,7 +163,13 @@ impl Module for PolicyModule {
         let policy_store = PolicyStore::new(core).await?;
         self.policy_store.store(policy_store.clone());
 
-        self.setup_policy().await?;
+        // `setup_policy` plants the built-in ACL policies when they are absent
+        // (and rewrites the immutable ones when their text has drifted). Under a
+        // readonly open (UN-31) that would be this process editing the very
+        // policy set it was opened to read.
+        if !core.readonly {
+            self.setup_policy().await?;
+        }
 
         core.add_auth_handler(policy_store as Arc<dyn AuthHandler>)?;
 

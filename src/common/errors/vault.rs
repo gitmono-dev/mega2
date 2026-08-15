@@ -89,6 +89,17 @@ pub enum VaultError {
     WriteApi(String),
     #[error("failed to delete from vault API: {0}")]
     DeleteApi(String),
+    #[error(
+        "vault storage is not initialized; a readonly open reports this rather than initializing it"
+    )]
+    ReadonlyNotInitialized,
+    #[error(
+        "vault core key file does not carry a complete runtime token set; creating the missing \
+         tokens is a write, which a readonly open will not perform"
+    )]
+    ReadonlyRuntimeTokensIncomplete,
+    #[error("vault was opened readonly; the write was denied")]
+    ReadonlyWriteDenied,
 }
 
 impl From<VaultError> for MegaError {
@@ -266,6 +277,13 @@ pub enum RvError {
     ErrCoreSealConfigNotFound,
     #[error("Core unseal key set not found.")]
     ErrCoreDeprecatedUnsealKeySetNotFound,
+    #[error("RustyVault is open in readonly bootstrap mode; the write was denied.")]
+    ErrCoreReadonlyWriteDenied,
+    #[error(
+        "RustyVault is open in readonly bootstrap mode and the stored state is missing or in an \
+         older format; readonly mode will not repair it."
+    )]
+    ErrCoreReadonlyStateIncomplete,
     #[error("Physical configuration item is missing.")]
     ErrPhysicalConfigItemMissing,
     #[error("Physical type is invalid.")]
@@ -603,6 +621,8 @@ impl PartialEq for RvError {
             | (RvError::ErrCoreLogicalBackendNoExist, RvError::ErrCoreLogicalBackendNoExist)
             | (RvError::ErrCoreSealConfigInvalid, RvError::ErrCoreSealConfigInvalid)
             | (RvError::ErrCoreSealConfigNotFound, RvError::ErrCoreSealConfigNotFound)
+            | (RvError::ErrCoreReadonlyWriteDenied, RvError::ErrCoreReadonlyWriteDenied)
+            | (RvError::ErrCoreReadonlyStateIncomplete, RvError::ErrCoreReadonlyStateIncomplete)
             | (RvError::ErrCoreRouterNotHandling, RvError::ErrCoreRouterNotHandling)
             | (RvError::ErrCoreHandlerExist, RvError::ErrCoreHandlerExist)
             | (RvError::ErrPhysicalConfigItemMissing, RvError::ErrPhysicalConfigItemMissing)

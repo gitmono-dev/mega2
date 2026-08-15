@@ -53,6 +53,8 @@ pub mod mount;
 pub mod router;
 pub mod shamir;
 pub mod storage;
+#[cfg(test)]
+mod un31_readonly;
 pub mod utils;
 
 pub use crate::{rv_error_response, rv_error_response_status, rv_error_string};
@@ -81,15 +83,37 @@ pub struct RustyVault {
 
 impl RustyVault {
     pub fn new(backend: Arc<dyn Backend>, config: Option<&Config>) -> Result<Self, RvError> {
-        let mut core = Core::new(backend);
+        Self::build(Core::new(backend), config)
+    }
+
+    /// Open a vault in readonly bootstrap mode (UN-31).
+    ///
+    /// `backend` is expected to be a
+    /// [`storage::readonly::ReadonlyBackend`]; wrapping is the caller's job so
+    /// that the write-denying layer stays visible at the construction site
+    /// rather than being conjured up in here.
+    ///
+    /// The mounts monitor is not created at all, whatever the configured
+    /// interval says: it is a background thread that reloads — and, on a
+    /// changed table, re-mounts — while the audit reads. Nothing about a
+    /// readonly open wants it.
+    pub fn new_readonly(
+        backend: Arc<dyn Backend>,
+        config: Option<&Config>,
+    ) -> Result<Self, RvError> {
+        Self::build(Core::new_readonly(backend), config)
+    }
+
+    fn build(mut core: Core, config: Option<&Config>) -> Result<Self, RvError> {
         if let Some(conf) = config {
             core.mount_entry_hmac_level = conf.mount_entry_hmac_level;
             core.mounts_monitor_interval = conf.mounts_monitor_interval;
         }
 
+        let readonly = core.readonly;
         let core = core.wrap();
 
-        if core.mounts_monitor_interval > 0 {
+        if !readonly && core.mounts_monitor_interval > 0 {
             core.mounts_monitor.store(Some(Arc::new(MountsMonitor::new(
                 core.clone(),
                 core.mounts_monitor_interval,

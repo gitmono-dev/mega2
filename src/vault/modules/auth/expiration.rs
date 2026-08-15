@@ -6,7 +6,10 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -101,6 +104,12 @@ pub struct ExpirationManager {
     pub token_view: Arc<BarrierView>,
     pub token_store: RwLock<Weak<TokenStore>>,
     queue: Arc<RwLock<PriorityQueue<Arc<LeaseEntry>, Reverse<u128>>>>,
+    /// Whether the expired-lease checker thread was ever started.
+    ///
+    /// Observable so that "the worker did not start" can be asserted directly
+    /// (UN-31) instead of inferred from the absence of revocations, which would
+    /// only ever be a race with the 200ms tick.
+    lease_checker_started: Arc<AtomicBool>,
 }
 
 impl Hash for LeaseEntry {
@@ -166,6 +175,7 @@ impl ExpirationManager {
             token_view: Arc::new(token_view),
             token_store: RwLock::new(Weak::new()),
             queue: Arc::new(RwLock::new(PriorityQueue::new())),
+            lease_checker_started: Arc::new(AtomicBool::new(false)),
         };
 
         Ok(expiration)
@@ -202,6 +212,35 @@ impl ExpirationManager {
             }
 
             self.register_lease_entry(Arc::new(le.unwrap()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Restores the lease entries without rewriting any of them (UN-31).
+    ///
+    /// [`Self::load_lease_entry`] migrates an entry stored in the older format
+    /// by writing the converted one back. Under a readonly open that write would
+    /// only be stopped by the backstop, and the caller would see
+    /// "write denied" rather than the actual condition. So an older-format lease
+    /// is reported here, in the same terms as an older-format mount table, and
+    /// nothing is attempted.
+    pub async fn restore_readonly(&self) -> Result<(), RvError> {
+        let existing = self.id_view.get_keys().await?;
+
+        for lease_id in existing {
+            let Some(raw) = self.id_view.get(&lease_id).await? else {
+                continue;
+            };
+
+            if let Ok(le) = serde_json::from_slice::<LeaseEntry>(raw.value.as_slice()) {
+                self.register_lease_entry(Arc::new(le))?;
+                continue;
+            }
+
+            if serde_json::from_slice::<OldLeaseEntry>(raw.value.as_slice()).is_ok() {
+                return Err(RvError::ErrCoreReadonlyStateIncomplete);
+            }
         }
 
         Ok(())
@@ -478,8 +517,14 @@ impl ExpirationManager {
         self.queue.read().map(|queue| queue.len()).unwrap_or(0)
     }
 
+    /// Whether the expired-lease checker thread has been started.
+    pub fn is_lease_checker_started(&self) -> bool {
+        self.lease_checker_started.load(Ordering::Relaxed)
+    }
+
     /// Starts a background task to check for and handle expired lease entries.
     pub fn start_check_expired_lease_entries(&self) {
+        self.lease_checker_started.store(true, Ordering::Relaxed);
         let queue = self.queue.clone();
         let expiration = self.self_ptr.upgrade().unwrap().clone();
 

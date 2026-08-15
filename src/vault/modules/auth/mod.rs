@@ -310,6 +310,24 @@ impl AuthModule {
         self.update_auth_mount(hmac_key, hmac_level).await
     }
 
+    /// Load the auth mount table without repairing it (UN-31).
+    ///
+    /// [`Self::load_auth`] plants the default auth mounts when the table is
+    /// absent and rewrites entries left in an older format. Under a readonly
+    /// open both are refused rather than skipped: an auth table that had to be
+    /// invented is not the one the running server uses, so reading on would be
+    /// reporting on a vault that does not exist.
+    pub async fn load_auth_readonly(
+        &self,
+        hmac_key: Option<&[u8]>,
+        hmac_level: MountEntryHMACLevel,
+    ) -> Result<(), RvError> {
+        self.mounts_router
+            .mounts
+            .load_readonly(self.barrier.as_storage(), hmac_key, hmac_level)
+            .await
+    }
+
     pub async fn persist_auth(&self) -> Result<(), RvError> {
         self.mounts_router.persist(self.barrier.as_storage()).await
     }
@@ -399,19 +417,37 @@ impl Module for AuthModule {
         };
 
         self.add_auth_backend("token", Arc::new(token_backend_new_func))?;
-        self.load_auth(
-            Some(&core.state.load().hmac_key),
-            core.mount_entry_hmac_level,
-        )
-        .await?;
+        if core.readonly {
+            self.load_auth_readonly(
+                Some(&core.state.load().hmac_key),
+                core.mount_entry_hmac_level,
+            )
+            .await?;
+        } else {
+            self.load_auth(
+                Some(&core.state.load().hmac_key),
+                core.mount_entry_hmac_level,
+            )
+            .await?;
+        }
         self.setup_auth()?;
 
         if let Some(mounts_monitor) = core.mounts_monitor.load().as_ref() {
             mounts_monitor.add_mounts_router(self.mounts_router.clone());
         }
 
-        expiration.restore().await?;
-        expiration.start_check_expired_lease_entries();
+        // `restore` only reads the stored leases into the in-memory queue, which
+        // is harmless — but the checker thread it normally feeds revokes expired
+        // leases and deletes their records. That is a write, and it happens on a
+        // timer with nobody having asked for it, so a readonly open must not
+        // start it. Without the thread the restored queue is simply never acted
+        // on.
+        if core.readonly {
+            expiration.restore_readonly().await?;
+        } else {
+            expiration.restore().await?;
+            expiration.start_check_expired_lease_entries();
+        }
 
         core.add_handler(ts as Arc<dyn Handler>)?;
 

@@ -19,7 +19,11 @@ use crate::{
         init::database_connection,
         vault_storage::VaultStorage,
     },
-    vault::{RustyVault, logical::Response, storage::Backend},
+    vault::{
+        RustyVault,
+        logical::Response,
+        storage::{Backend, readonly::ReadonlyBackend},
+    },
 };
 
 const CORE_KEY_FILE: &str = "core_key.json";
@@ -110,6 +114,12 @@ pub struct VaultCore {
     key: Arc<CoreKey>,
     runtime_tokens: Arc<RuntimeTokens>,
     audit: VaultAuditConfig,
+    /// Opened through [`VaultCore::open_readonly`] (UN-31).
+    ///
+    /// Writes are refused here with a name the caller can act on, before they
+    /// reach the write-denying backend underneath — that layer stays as the
+    /// backstop for paths nobody thought to guard, not as the first line.
+    readonly: Option<Arc<ReadonlyBackend>>,
 }
 
 #[derive(Clone, Copy)]
@@ -326,7 +336,110 @@ impl VaultCore {
             key,
             runtime_tokens,
             audit: VaultAuditConfig::default(),
+            readonly: None,
         })
+    }
+
+    /// Open an already-initialized vault without changing anything (UN-31).
+    ///
+    /// [`Self::config`] is the production entry point and is not usable for
+    /// audit reads: it initializes an uninitialized vault, writes the core key
+    /// file, mints missing runtime credentials, and revokes the root token —
+    /// all before the first secret is read. This entry point does none of that.
+    /// Everything it needs must already exist:
+    ///
+    /// * the key file and the initialized storage must agree, exactly as
+    ///   `config` requires, but a mismatch here can only be reported, never
+    ///   repaired;
+    /// * the runtime tokens in the key file must be complete, because minting
+    ///   the missing ones is a write;
+    /// * the vault's own stored state (mount tables, token salt) must be
+    ///   present and current, which the readonly core enforces on unseal.
+    ///
+    /// The vault is opened over a [`ReadonlyBackend`], so even a path that gets
+    /// this wrong later fails hard rather than persisting.
+    pub async fn open_readonly(
+        vault_storage: VaultStorage,
+        key_path: PathBuf,
+    ) -> VaultResult<Self> {
+        let backend = Arc::new(ReadonlyBackend::new(Arc::new(JupiterBackend::new(
+            vault_storage,
+        ))));
+        let seal_config = crate::vault::core::SealConfig {
+            secret_shares: 10,
+            secret_threshold: 5,
+        };
+
+        let rvault = RustyVault::new_readonly(backend.clone(), None)
+            .map_err(|e| VaultError::RustyVaultCreate(e.to_string()))?;
+        let storage_initialized = rvault
+            .inited()
+            .await
+            .map_err(|e| VaultError::InitializationState(e.to_string()))?;
+
+        if !storage_initialized {
+            return Err(VaultError::ReadonlyNotInitialized);
+        }
+        if !key_path.exists() {
+            return Err(VaultError::CoreKeyMissing { path: key_path });
+        }
+
+        let core_key = read_core_key(&key_path)?;
+        let expected_shares = seal_config.secret_threshold as usize;
+        if core_key.secret_shares.len() < expected_shares {
+            return Err(VaultError::CoreKeyTooFewShares {
+                expected: expected_shares,
+                actual: core_key.secret_shares.len(),
+            });
+        }
+        if !core_key.runtime_tokens.is_complete() {
+            return Err(VaultError::ReadonlyRuntimeTokensIncomplete);
+        }
+
+        let mut unsealed = false;
+        for i in 0..seal_config.secret_threshold {
+            let key = &core_key.secret_shares[i as usize];
+            unsealed = rvault
+                .unseal(&[key.as_slice()])
+                .await
+                .map_err(|e| VaultError::Unseal(e.to_string()))?;
+            if unsealed {
+                break;
+            }
+        }
+        if !unsealed {
+            return Err(VaultError::Unseal(
+                "not enough valid key shares to unseal vault".to_string(),
+            ));
+        }
+
+        let runtime_tokens = Arc::new(core_key.runtime_tokens.clone());
+
+        Ok(Self {
+            rvault: rvault.into(),
+            key: Arc::new(core_key),
+            runtime_tokens,
+            audit: VaultAuditConfig::default(),
+            readonly: Some(backend),
+        })
+    }
+
+    /// Whether this handle was opened readonly.
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.is_some()
+    }
+
+    /// How many writes the readonly backstop has refused, or `None` for a
+    /// normal handle. A non-zero count means something above tried to write.
+    pub fn denied_writes(&self) -> Option<usize> {
+        self.readonly.as_ref().map(|b| b.denied_writes())
+    }
+
+    fn reject_if_readonly(&self) -> Result<(), VaultError> {
+        if self.readonly.is_some() {
+            return Err(VaultError::ReadonlyWriteDenied);
+        }
+        Ok(())
     }
 
     /// Override the secret-access audit settings (default: enabled, fail-open to
@@ -361,6 +474,7 @@ impl VaultCore {
         path: impl AsRef<str> + Send,
         data: Option<Map<String, Value>>,
     ) -> VaultResult<Option<Response>> {
+        self.reject_if_readonly()?;
         let path = path.as_ref();
         if is_pki_mount_path(path) {
             return Ok(None);
@@ -385,6 +499,7 @@ impl VaultCore {
         &self,
         path: impl AsRef<str> + Send,
     ) -> VaultResult<Option<Response>> {
+        self.reject_if_readonly()?;
         let path = path.as_ref();
         self.rvault
             .delete(
@@ -739,6 +854,7 @@ impl VaultCoreInterface for VaultCore {
         name: &str,
         data: Option<Map<String, Value>>,
     ) -> Result<(), MegaError> {
+        self.reject_if_readonly()?;
         let name = SecretName::parse(name)?;
         let token = self.runtime_tokens.token_for_secret(name).to_string();
         let path = name.secret_path();
@@ -784,6 +900,7 @@ impl VaultCoreInterface for VaultCore {
     }
 
     async fn delete_secret(&self, name: &str) -> Result<(), MegaError> {
+        self.reject_if_readonly()?;
         let name = SecretName::parse(name)?;
         let token = self.runtime_tokens.token_for_secret(name).to_string();
         let path = name.secret_path();

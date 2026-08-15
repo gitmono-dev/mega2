@@ -319,6 +319,63 @@ impl MountTable {
         self.mount_update(storage, hmac_key, hmac_level).await
     }
 
+    /// Load the mount table without ever writing back (UN-31).
+    ///
+    /// The two repairs `load_or_default` performs — planting the default mounts
+    /// when the table is absent, and rewriting entries left in an older format —
+    /// are exactly what a readonly open must not do. Neither can be silently
+    /// skipped either: a vault whose mount table is missing or stale has not
+    /// been read correctly, and reporting on it as if it had been would be worse
+    /// than refusing. So this fails closed in both cases.
+    pub async fn load_readonly(
+        &self,
+        storage: &dyn Storage,
+        hmac_key: Option<&[u8]>,
+        hmac_level: MountEntryHMACLevel,
+    ) -> Result<(), RvError> {
+        match self.load(storage, hmac_key, hmac_level).await {
+            Ok(_) => {}
+            Err(RvError::ErrConfigLoadFailed) => {
+                return Err(RvError::ErrCoreReadonlyStateIncomplete);
+            }
+            Err(err) => return Err(err),
+        }
+
+        if self.needs_mount_update(hmac_key, hmac_level)? {
+            return Err(RvError::ErrCoreReadonlyStateIncomplete);
+        }
+
+        Ok(())
+    }
+
+    /// Whether [`Self::mount_update`] would have to persist anything.
+    ///
+    /// Read-only counterpart of the scan in `mount_update`, kept beside it so
+    /// the two conditions stay in step.
+    pub fn needs_mount_update(
+        &self,
+        hmac_key: Option<&[u8]>,
+        hmac_level: MountEntryHMACLevel,
+    ) -> Result<bool, RvError> {
+        let mounts = self.entries.read()?;
+
+        for mount_entry in mounts.values() {
+            let entry = mount_entry.read()?;
+            if entry.table.is_empty() {
+                return Ok(true);
+            }
+
+            if entry.hmac.is_empty()
+                && hmac_level == MountEntryHMACLevel::Compat
+                && hmac_key.is_some()
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     pub async fn load(
         &self,
         storage: &dyn Storage,

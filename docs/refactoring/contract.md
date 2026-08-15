@@ -302,3 +302,17 @@
 - guard 侧 Bot 分支保持既有优先级（其授权语义归 UN-27）；Bot 请求不解析浏览器会话。匿名请求在 guard 侧是一个主体而不是拒绝——是否放行由策略决定；该主体是保留字 `User::"__anonymous__"`（UN-08 起，ADR-UN-06 ⑤）。
 
 测试用 `CountingSessionStore` 双：它**每次调用返回不同用户**，因此「两个消费方得到同一答案」只可能来自缓存——用固定用户的 double 无法证伪。
+
+## Vault 只读引导模式（UN-31）
+
+审计/只读运维命令要能声称「什么都没改」，就不能走生产引导路径。常规 unseal 在读到第一个 secret 之前就会写：mount 表缺失时补写默认 mount、旧格式条目回写、默认 ACL policy 补写、token salt 补写，并启动一个按 200ms tick **撤销过期租约并删除其记录**的线程。绕开 `VaultCore::config()` 不够——这些副作用在 `Core::post_unseal()` 里。
+
+- **入口**：`VaultCore::open_readonly(vault_storage, key_path)`（`src/contract/vault/integration/vault_core.rs`）。它要求一切都已存在：storage 已初始化、key 文件存在且份额足够、`runtime_tokens` 完整。任一不满足都是**报告**而不是修补——补签一个缺失的 runtime token 本身就是「写 policy + 签发 token + 回写 key 文件」，正是本模式要避免的。同理，它不初始化、不回写 key 文件、不撤销 root token。
+- **核心开关**：`Core::readonly`（构造时确定、终生不变，`src/vault/core.rs`）。`RustyVault::new_readonly()` 据此装配。三个控制点：
+  - `post_unseal()` 走 `MountTable::load_readonly()`：只 load，不 `load_or_default`；表缺失或存在旧格式条目（需要 `mount_update` 回写）一律 `ErrCoreReadonlyStateIncomplete` **fail-closed**——凭空造出来的 mount 表不是运行中服务器用的那张，据此出报告比拒绝更糟。
+  - `AuthModule::init()` 走 `load_auth_readonly()`（同样只 load、fail-closed），且**不调用** `start_check_expired_lease_entries()`。租约恢复走 `restore_readonly()`：`load_lease_entry()` 遇到旧格式条目会**转换后写回**，只读下这个写只会被最终保险拦下、调用方拿到的是「写被拒绝」而不是真实状况；因此旧格式租约在此**具名 fail-closed**（与旧格式 mount 表同样处理），当前格式的条目照常读进内存队列——没有 worker 就没有人去动它。
+  - `PolicyModule::init()` 跳过 `setup_policy()`；`TokenStore::new()` 在 salt 缺失时 fail-closed 而不是新签一个（新 salt 会静默改变该 vault 里每个 token 的哈希方式）。
+  - mounts monitor **不创建**，无论配置的 interval 是多少：它是一个会在审计读取期间重载并可能重新挂载的后台线程。
+- **最终保险**：`ReadonlyBackend`（`src/vault/storage/readonly.rs`）包住物理 backend，`put`/`delete` 一律硬失败并计数。它是最后一道而不是第一道——上面每条路径都能被 review、也都可能漂移，这一层则没有通往被包 backend 的路径。**拒绝必须是错误，不能是静默 no-op**：被吞掉的写会让调用方以为状态已持久化。`VaultCore::denied_writes()` 暴露计数，正常只读运行应当为 0；非 0 意味着上层仍有人尝试写、只是被这层拦住了。
+
+测试（`src/vault/un31_readonly.rs`）**成对**写：可写侧证明该修补对这份 storage 确实会发生，只读侧证明它没发生。单侧断言在一个「本来就没什么可修」的 fixture 上同样会通过。后台线程是**直接断言**（`mounts_monitor.is_none()`、`ExpirationManager::is_lease_checker_started()`），不是从「没观察到副作用」倒推——后者只是和 200ms tick 赛跑。
