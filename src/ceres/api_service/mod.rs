@@ -49,6 +49,10 @@ pub mod tree_ops;
 #[cfg(test)]
 mod un17_queue;
 #[cfg(test)]
+mod un19_acl_change;
+#[cfg(test)]
+mod un19_fail_closed;
+#[cfg(test)]
 mod un25_freeze;
 
 #[async_trait]

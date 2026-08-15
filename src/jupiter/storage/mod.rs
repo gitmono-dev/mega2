@@ -311,6 +311,15 @@ impl Storage {
 
     /// Shared authorization snapshot holder (ADR-UN-02). Returns the same `Arc`
     /// instance injected by `AppContext`.
+    /// Replace the shared authorization snapshot holder. Test-only: production
+    /// receives exactly one instance from `AppContext` (ADR-UN-02), and
+    /// swapping it at runtime would break the object-identity guarantee the
+    /// notify path depends on.
+    #[cfg(test)]
+    pub fn set_entity_store_for_test(&mut self, entity_store: Arc<SharedEntityStore>) {
+        self.entity_store = entity_store;
+    }
+
     pub fn entity_store(&self) -> Arc<SharedEntityStore> {
         self.entity_store.clone()
     }

@@ -336,6 +336,7 @@ fn boot_service_http_with_enforcement_and_session(
 
 /// Cookie value the session stub accepts; its content is irrelevant because the
 /// stub answers every request the same way.
+const SESSION_COOKIE_VALUE: &str = "it-un16-session";
 const SESSION_COOKIE: &str = "better-auth.session_token=it-un16-session";
 
 /// Minimal stand-in for the website's Better Auth `get-session` endpoint.
@@ -346,22 +347,59 @@ const SESSION_COOKIE: &str = "better-auth.session_token=it-un16-session";
 /// this stub answers with the admin, which is the subject whose ACL change the
 /// test is merging. Returns the port it listens on.
 fn spawn_website_session_stub(username: &str) -> u16 {
+    spawn_website_session_stub_for(&[(SESSION_COOKIE_VALUE, username)])
+}
+
+/// Cookie-value → username stub, so one service can be driven as different
+/// subjects. UN-19 needs that: the same CL has to be offered to an admin and to
+/// a non-admin, and only one of them may merge it.
+fn spawn_website_session_stub_for(sessions: &[(&str, &str)]) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind session stub");
     let port = listener.local_addr().expect("stub addr").port();
-    let body = format!(
-        r#"{{"session":{{"id":"it-session","userId":"{username}"}},"user":{{"id":"{username}","name":"{username}","email":"{username}@example.invalid"}}}}"#
-    );
+    let sessions: Vec<(String, String)> = sessions
+        .iter()
+        .map(|(cookie, user)| ((*cookie).to_owned(), (*user).to_owned()))
+        .collect();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             // Read just enough to reach the end of the request head.
             let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..read]).to_string();
+
+            // Match the cookie *value* exactly rather than by substring, so
+            // one session value cannot be mistaken for another that contains it.
+            let presented = head
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+                .and_then(|line| line.split_once(':'))
+                .map(|(_, value)| value.trim().to_owned())
+                .unwrap_or_default();
+            let username = presented
+                .split(';')
+                .filter_map(|pair| pair.trim().split_once('='))
+                .find_map(|(_, value)| {
+                    sessions
+                        .iter()
+                        .find(|(cookie, _)| cookie == value)
+                        .map(|(_, user)| user.clone())
+                });
+
+            let response = match username {
+                Some(username) => {
+                    let body = format!(
+                        r#"{{"session":{{"id":"it-session","userId":"{username}"}},"user":{{"id":"{username}","name":"{username}","email":"{username}@example.invalid"}}}}"#
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                }
+                // An unknown cookie is simply not a session.
+                None => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned(),
+            };
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
@@ -372,6 +410,11 @@ fn spawn_website_session_stub(username: &str) -> u16 {
 /// Merge a CL through `POST /cl/{link}/merge-no-auth`, carrying the stub
 /// session so the call is authorized (UN-24). Returns the HTTP status code.
 fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
+    merge_cl_no_auth_as(port, cl_link, SESSION_COOKIE_VALUE)
+}
+
+/// Same call, carrying the cookie that maps to `session_value` in the stub.
+fn merge_cl_no_auth_as(port: u16, cl_link: &str, session_value: &str) -> u16 {
     let url = format!("http://127.0.0.1:{port}/api/v1/cl/{cl_link}/merge-no-auth");
     let mut command = Command::new("curl");
     command.args([
@@ -379,7 +422,7 @@ fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
         "-X",
         "POST",
         "-H",
-        &format!("Cookie: {SESSION_COOKIE}"),
+        &format!("Cookie: better-auth.session_token={session_value}"),
         "-o",
         "/dev/null",
         "-w",
@@ -1727,6 +1770,137 @@ fn integration_git_cli_authz_revoke_grant_immediate_effect() {
         "service did not shut down cleanly: {status}\nstderr:\n{}",
         read_log(&stderr_path),
     );
+}
+
+#[test]
+fn integration_git_cli_acl_change_requires_admin_to_merge() {
+    // UN-19: editing `/.mega_cedar.json` is how permissions are granted, so a
+    // maintainer being able to merge such a change would be a self-promotion
+    // path. Under `enforce` only an admin may merge it — end to end, through
+    // the real merge entry point.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let admin_token = git_cli::resolve_seed_token();
+
+    // One service, two subjects: the cookie decides which one the request is.
+    const ADMIN_SESSION: &str = "un19-admin-session";
+    const MAINTAINER_SESSION: &str = "un19-maintainer-session";
+    let session_stub_port = spawn_website_session_stub_for(&[
+        (ADMIN_SESSION, "benjamin_747"),
+        (MAINTAINER_SESSION, git_cli::DEFAULT_GIT_AUTH_USER),
+    ]);
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_enforcement_and_session(
+            &env,
+            Some("enforce"),
+            Some(session_stub_port),
+        );
+
+    git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
+    let remote_url = format!("http://127.0.0.1:{port}/");
+
+    // The admin pushes a CL that grants the maintainer the maintainer role —
+    // exactly the kind of change that must not be self-mergeable.
+    let admin_clone = "un19-admin-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["clone", &remote_url, admin_clone],
+        ),
+        "clone as admin",
+    );
+    let admin_dir = env.case_dir.join(admin_clone);
+    // Must differ from what init seeded, or there is no change to merge.
+    fs::write(
+        admin_dir.join(".mega_cedar.json"),
+        authz_json_with_admins(&["benjamin_747", "un19-extra-admin"]),
+    )
+    .expect("write acl change");
+    for (key, value) in [
+        ("user.name", "Admin"),
+        ("user.email", "admin@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli_as_user(
+                &env.case_dir,
+                "benjamin_747",
+                &admin_token,
+                &["-C", admin_clone, "config", key, value],
+            ),
+            "admin git config",
+        );
+    }
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone, "add", ".mega_cedar.json"],
+        ),
+        "admin git add acl",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &["-C", admin_clone, "commit", "-m", "un19 acl change"],
+        ),
+        "admin git commit acl",
+    );
+    let branch = format!("un19-acl-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli_as_user(
+            &env.case_dir,
+            "benjamin_747",
+            &admin_token,
+            &[
+                "-C",
+                admin_clone,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        ),
+        "admin push acl change",
+    );
+    let cl_link = latest_cl_link_for_user(&env.database.db_url, "benjamin_747");
+
+    // A non-admin may not merge it, even though the CL itself is ordinary.
+    let refused = merge_cl_no_auth_as(port, &cl_link, MAINTAINER_SESSION);
+    assert_eq!(
+        refused, 403,
+        "a non-admin merging an ACL change must be refused (403), not merely fail: \
+         503 would mean the check could not run, which is a different outcome"
+    );
+
+    // The admin may.
+    let allowed = merge_cl_no_auth_as(port, &cl_link, ADMIN_SESSION);
+    assert_eq!(
+        allowed,
+        200,
+        "an admin merging the same CL must succeed; service.err:\n{}",
+        read_log(&stderr_path)
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
 }
 
 #[test]

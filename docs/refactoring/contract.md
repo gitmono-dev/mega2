@@ -172,6 +172,22 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## ACL 文件变更仅 admin 可合（UN-19）
+
+编辑 `/.mega_cedar.json` **就是**授予权限的方式，因此谁能合并这种变更，谁就能给自己授予任何权限。maintainer 持有 `approveMergeRequest`——若不加限制，这正是一条自提权通道。
+
+检测挂在 merge 漏斗的唯一汇聚点 `merge_cl_unchecked`，因此 merge / merge-no-auth / merge queue 后台执行**三入口同判定**。涉及该文件时，`authz_principal` 必须经 `addAdmin` 判定（仅 admin 组持有）。
+
+**「判不出来」不等于「通过」。** 三类情况都意味着这次变更**没有被审查过**，`enforce` 一律拒绝、`shadow` 记录后放行：
+
+1. changed-file 列表读不出来（含 CL 的 base/tip commit 缺失——缺失时列表会读回空，与「本 CL 没改动」无法区分，属 fail-open，故先校验两端可解析）；
+2. 主干上 `/.mega_cedar.json` 的 blob 解析失败；
+3. 该文件在主干上缺失（没有可比对的基线）。
+
+三类失败产生 `event=merge_authz_unavailable`（字段 `cl_link` / `principal` / `reason`），对外映射 **503** 而非 500 或 403：变更没有被拒绝，只是没被审查，授权恢复后同一请求可以成功（UN-25 契约）。queue 路径则据此冻结（保留 requester 与重试指引）。
+
+同时移除了复用函数 `get_sorted_changed_file_list` 里的生产 `unwrap()`——它现在跑在合并路径上，存储故障必须以 `Result` 传播而不是 panic 掉请求。
+
 ## admin 事实源收敛（UN-04）
 
 策略文件里原有一条「root admin 可做任何事」的规则，硬编码两个个人用户名。它使策略文件成为**第二个、不可见的 admin 权力来源**：运维读 ACL 看不出谁真正有特权，把某人从 admin 组移除也不会收回其权限。该规则已删除。

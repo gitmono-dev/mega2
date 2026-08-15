@@ -105,6 +105,7 @@ use crate::{
             builder::EntitySnapshot,
             context::CedarContext,
             enforcement::Enforcement,
+            entitystore::MEGA_CEDAR_PATH,
             notify::{authz_blob_id, notify_authz_changed_best_effort},
             resource::resolve_resource,
             util::SaturnEUid,
@@ -132,6 +133,99 @@ pub struct MonoApiService {
 }
 
 const LARGE_CL_RENAME_DETECTION_THRESHOLD: usize = 1000;
+
+/// Outcome of the ACL-change check (UN-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclChangeDecision {
+    /// Either the CL does not touch the authorization file, or this mode does
+    /// not consume authorization data.
+    Proceed,
+    /// The CL changes the authorization file and this principal is not an
+    /// admin.
+    Refuse { reason: String },
+    /// The check itself could not be completed, so nothing about the change is
+    /// known. Under `enforce` that refuses the merge (fail-closed) rather than
+    /// merging an unexamined ACL change.
+    Unavailable { reason: String },
+}
+
+/// Decide whether a CL that (maybe) edits `/.mega_cedar.json` may be merged
+/// (UN-19).
+///
+/// Editing the authorization file is how permissions are granted, so anyone who
+/// can merge such a change can grant themselves anything. A maintainer holds
+/// `approveMergeRequest` and would otherwise have had exactly that: a
+/// self-promotion path. The check therefore demands `addAdmin`, which only the
+/// admin group holds.
+pub fn decide_acl_change(
+    enforcement: Enforcement,
+    snapshot: Option<&EntitySnapshot>,
+    touches_acl: bool,
+    authz_principal: &str,
+) -> AclChangeDecision {
+    // `off`: nothing is detected and nothing is consumed (GC-UN-01).
+    if !enforcement.builds() || !touches_acl {
+        return AclChangeDecision::Proceed;
+    }
+
+    let Some(snapshot) = snapshot else {
+        return AclChangeDecision::Unavailable {
+            reason: "the authorization snapshot is not built, so an ACL change cannot be reviewed"
+                .to_owned(),
+        };
+    };
+
+    let store = snapshot.store();
+    let is_admin = match resolve_resource("/", store).resource() {
+        None => false,
+        Some(resource) => match CedarContext::new(store.clone()) {
+            Err(_) => false,
+            Ok(context) => match acl_change_euids(authz_principal) {
+                None => false,
+                Some((principal, action)) => context
+                    .is_authorized(&principal, &action, resource, CedarRequestContext::empty())
+                    .is_ok(),
+            },
+        },
+    };
+
+    if is_admin && !store.is_empty() {
+        return AclChangeDecision::Proceed;
+    }
+
+    AclChangeDecision::Refuse {
+        reason: format!(
+            "`{authz_principal}` may not merge a change to {MEGA_CEDAR_PATH}:              editing the authorization file requires admin, since it is how permissions              are granted"
+        ),
+    }
+}
+
+/// Cedar ids for the ACL-change check: the `addAdmin` action is admin-only.
+fn acl_change_euids(principal: &str) -> Option<(SaturnEUid, SaturnEUid)> {
+    let user_type = EntityTypeName::from_str("User").ok()?;
+    let action_type = EntityTypeName::from_str("Action").ok()?;
+    Some((
+        SaturnEUid::from(EntityUid::from_type_name_and_id(
+            user_type,
+            EntityId::from_str(principal).ok()?,
+        )),
+        SaturnEUid::from(EntityUid::from_type_name_and_id(
+            action_type,
+            EntityId::from_str("addAdmin").ok()?,
+        )),
+    ))
+}
+
+/// The single emit site of the `merge_authz_unavailable` alert (UN-19).
+pub fn emit_merge_authz_unavailable(cl_link: &str, principal: &str, reason: &str) {
+    tracing::error!(
+        event = "merge_authz_unavailable",
+        cl_link = %cl_link,
+        principal = %principal,
+        reason = %reason,
+        "merge authorization could not be decided"
+    );
+}
 
 /// What the queue's background worker should do with an item (UN-17).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2412,12 +2506,11 @@ impl MonoApiService {
         execution_actor: &str,
         cl: mega_cl::Model,
     ) -> Result<(), GitError> {
-        // Deliberately not evaluated here yet: UN-24 only lands the parameter so
-        // the call chain carries the authorization subject. The merge-face
-        // checks that consume it (ACL-file protection, the failure contract)
-        // are UN-19/UN-25, and the queue's principal is UN-17. Until then the
-        // entry points are guarded at the router.
-        let _ = authz_principal;
+        // UN-19: every merge entry point funnels through here, so the ACL-change
+        // check lives here too — one decision for merge, merge-no-auth and the
+        // queue alike.
+        self.enforce_acl_change_authorization(&cl.link, authz_principal)
+            .await?;
         let storage = self.storage.mono_storage();
 
         let commit_model = storage
@@ -3036,13 +3129,14 @@ impl MonoApiService {
         path: Option<&str>,
     ) -> Result<Vec<String>, MegaError> {
         let normalized_prefix = path.map(|prefix| prefix.replace('\\', "/"));
+        // UN-19: this runs on the merge path now, so a storage failure must
+        // propagate rather than panic the request.
         let cl = self
             .storage
             .cl_storage()
             .get_cl(cl_link)
-            .await
-            .unwrap()
-            .ok_or_else(|| MegaError::Other("Error getting ".to_string()))?;
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("CL not found: {cl_link}")))?;
 
         let old_files = self.get_commit_blobs(&cl.from_hash.clone()).await?;
         let new_files = self.get_commit_blobs(&cl.to_hash.clone()).await?;
@@ -3404,12 +3498,21 @@ impl MonoApiService {
             for item in tree.tree_items {
                 let path = base_path.join(&item.name);
                 if item.is_tree() {
+                    // UN-19: this walk runs on the merge path, where a missing
+                    // subtree must become an undecidable check (503) rather
+                    // than a panicked request.
                     let child = self
                         .storage
                         .mono_storage()
                         .get_tree_by_hash(&item.id.to_string())
                         .await?
-                        .unwrap();
+                        .ok_or_else(|| {
+                            MegaError::Other(format!(
+                                "subtree `{}` of `{}` is missing",
+                                item.id,
+                                path.display()
+                            ))
+                        })?;
                     stack.push((path.clone(), Tree::from_mega_model(child)));
                 } else {
                     result.push((path, item.id));
@@ -3471,6 +3574,197 @@ impl MonoApiService {
         self.ensure_merge_processor_running();
 
         Ok(position)
+    }
+
+    /// Refuse a merge that edits the authorization file unless the subject is
+    /// an admin (UN-19).
+    ///
+    /// Three things can go wrong while deciding, and all of them mean the same
+    /// thing — the change was not examined: the changed-file list cannot be
+    /// read, main's copy of the authorization file cannot be resolved, or it is
+    /// absent from main entirely. Under `enforce` each refuses the merge rather
+    /// than letting an unexamined ACL change through; under `shadow` each is
+    /// recorded and the merge proceeds.
+    pub async fn enforce_acl_change_authorization(
+        &self,
+        cl_link: &str,
+        authz_principal: &str,
+    ) -> Result<(), GitError> {
+        let enforcement = Enforcement::parse(&self.storage.config().cedar.enforcement)
+            .unwrap_or(Enforcement::Off);
+        if !enforcement.builds() {
+            return Ok(());
+        }
+
+        // An unresolvable change set reads back as "changed nothing", which
+        // would silently pass an ACL change through. Establish that the CL's
+        // endpoints exist before trusting the diff.
+        if let Err(reason) = self.ensure_change_set_resolvable(cl_link).await {
+            return self.acl_check_unavailable(enforcement, cl_link, authz_principal, &reason);
+        }
+
+        let touches_acl = match self.cl_touches_authz_file(cl_link).await {
+            Ok(touches) => touches,
+            Err(error) => {
+                return self.acl_check_unavailable(
+                    enforcement,
+                    cl_link,
+                    authz_principal,
+                    &format!("the changed-file list could not be read: {error}"),
+                );
+            }
+        };
+
+        if touches_acl {
+            // The change touches the ACL, so main's own copy has to be
+            // resolvable — without it there is no baseline to review against.
+            if let Err(reason) = self.resolve_main_acl_blob().await {
+                return self.acl_check_unavailable(enforcement, cl_link, authz_principal, &reason);
+            }
+        }
+
+        let snapshot = self.storage.entity_store().snapshot();
+        match decide_acl_change(
+            enforcement,
+            snapshot.as_deref(),
+            touches_acl,
+            authz_principal,
+        ) {
+            AclChangeDecision::Proceed => Ok(()),
+            AclChangeDecision::Unavailable { reason } => {
+                self.acl_check_unavailable(enforcement, cl_link, authz_principal, &reason)
+            }
+            AclChangeDecision::Refuse { reason } => {
+                if enforcement.records_would_deny() {
+                    tracing::warn!(
+                        event = "authz_would_deny",
+                        principal = %authz_principal,
+                        principal_type = "User",
+                        action = "addAdmin",
+                        resource = %MEGA_CEDAR_PATH,
+                        "would-deny recorded: this ACL change would be refused under enforce"
+                    );
+                }
+                if enforcement.enforces() {
+                    return Err(GitError::CustomError(format!("[code:403] {reason}")));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Shared handling of the three "could not decide" classes.
+    fn acl_check_unavailable(
+        &self,
+        enforcement: Enforcement,
+        cl_link: &str,
+        authz_principal: &str,
+        reason: &str,
+    ) -> Result<(), GitError> {
+        emit_merge_authz_unavailable(cl_link, authz_principal, reason);
+        if enforcement.enforces() {
+            // 503, not 500: the change was not rejected, it was not examined —
+            // the same request can succeed once authorization is available
+            // again (UN-25's contract).
+            return Err(GitError::CustomError(format!(
+                "[code:503] merge authorization unavailable: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a CL touches `/.mega_cedar.json` on either side of its diff.
+    ///
+    /// Both sides matter: a rename reports only its *new* path, so looking at
+    /// that alone would let someone move the authorization file out of the way
+    /// — deleting it from where it is read — without ever tripping the check.
+    async fn cl_touches_authz_file(&self, cl_link: &str) -> Result<bool, MegaError> {
+        let acl_file = MEGA_CEDAR_PATH.trim_start_matches('/');
+        let is_acl = |path: &std::path::Path| {
+            let normalized = path.to_string_lossy().replace('\\', "/");
+            normalized == acl_file || normalized.ends_with(&format!("/{acl_file}"))
+        };
+
+        let cl = self
+            .storage
+            .cl_storage()
+            .get_cl(cl_link)
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("CL not found: {cl_link}")))?;
+        let old_files = self.get_commit_blobs(&cl.from_hash).await?;
+        let new_files = self.get_commit_blobs(&cl.to_hash).await?;
+
+        Ok(self
+            .cl_files_list(old_files, new_files)
+            .await?
+            .iter()
+            .any(|file| match file {
+                ClDiffFile::Renamed(old_path, new_path, ..)
+                | ClDiffFile::Moved(old_path, new_path, ..) => is_acl(old_path) || is_acl(new_path),
+                other => is_acl(other.path()),
+            }))
+    }
+
+    /// Both endpoints of the CL's diff must exist, or the changed-file list is
+    /// not evidence of anything: a missing commit yields an empty list, which
+    /// is indistinguishable from "this CL changes nothing".
+    async fn ensure_change_set_resolvable(&self, cl_link: &str) -> Result<(), String> {
+        let cl = self
+            .storage
+            .cl_storage()
+            .get_cl(cl_link)
+            .await
+            .map_err(|e| format!("the CL could not be read: {e}"))?
+            .ok_or_else(|| format!("CL `{cl_link}` not found"))?;
+
+        let storage = self.storage.mono_storage();
+        for (label, hash) in [("base", &cl.from_hash), ("tip", &cl.to_hash)] {
+            let commit = storage
+                .get_commit_by_hash(hash)
+                .await
+                .map_err(|e| format!("the CL's {label} commit could not be read: {e}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "the CL's {label} commit `{hash}` is missing, so its changed-file list \
+                         cannot be computed"
+                    )
+                })?;
+
+            // The tree matters as much as the commit: `get_commit_blobs`
+            // returns an empty list for a commit whose tree is gone, which
+            // reads back as "changed nothing" — the same fail-open shape.
+            let tree_missing = storage
+                .get_tree_by_hash(&commit.tree)
+                .await
+                .map_err(|e| format!("the CL's {label} tree could not be read: {e}"))?
+                .is_none();
+            if tree_missing {
+                return Err(format!(
+                    "the tree `{}` of the CL's {label} commit is missing, so its changed-file \
+                     list cannot be computed",
+                    commit.tree
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the blob id of main's `/.mega_cedar.json`, or say why not.
+    async fn resolve_main_acl_blob(&self) -> Result<String, String> {
+        let storage = self.storage.mono_storage();
+        let main_ref = storage
+            .get_main_ref("/")
+            .await
+            .map_err(|e| format!("main ref could not be read: {e}"))?
+            .ok_or_else(|| "main ref not found".to_owned())?;
+        let tree = storage
+            .get_tree_by_hash(&main_ref.ref_tree_hash)
+            .await
+            .map_err(|e| format!("main tree could not be read: {e}"))?
+            .ok_or_else(|| "main tree not found".to_owned())?;
+        authz_blob_id(&Tree::from_mega_model(tree)).ok_or_else(|| {
+            format!("{MEGA_CEDAR_PATH} is absent from main, so there is no baseline to review")
+        })
     }
 
     /// Freeze a queued CL because authorization could not be decided (UN-25).
@@ -4074,6 +4368,30 @@ impl MonoApiService {
                     ));
                 }
             };
+
+        // UN-19 + UN-25: the funnel below runs the ACL-change check too, but
+        // the queue needs to freeze (with its requester preserved) rather than
+        // just fail, so it asks first.
+        if let Err(error) = self
+            .enforce_acl_change_authorization(cl_link, &authz_principal)
+            .await
+        {
+            let message = error.to_string();
+            // Only an undecidable check freezes; a refusal is a decision and
+            // records as an ordinary failure.
+            if message.contains("[code:503]")
+                && let Err(e) = self
+                    .freeze_merge_queue_item_for_authz(cl_link, &message)
+                    .await
+            {
+                tracing::error!(
+                    cl_link = %cl_link,
+                    error = %e,
+                    "failed to freeze queue item after an undecidable ACL change"
+                );
+            }
+            return Err((QueueFailureTypeEnum::SystemError, message));
+        }
 
         self.merge_cl_unchecked(&authz_principal, "system", cl_model.clone())
             .await
