@@ -263,6 +263,25 @@ async fn resolve_credential(
 /// for `build_object_storage`. Literal credentials are passed through unchanged,
 /// so deployments that keep S3 creds in env/IAM are unaffected (config.md stage 6
 /// / vault.md stage G).
+/// Whether resolving this object-storage config will need the vault.
+///
+/// Same two conditions `resolve_object_storage_secrets` short-circuits on, named
+/// so the read-only assembly can ask the question without opening a vault it may
+/// not need — and so the two cannot drift apart (UN-30).
+fn object_storage_needs_vault(config: &ObjectStorageConfig) -> bool {
+    let s3_like = matches!(
+        config.storage_type,
+        orbit_api::factory::ObjectStorageBackend::S3
+            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+    );
+    if !s3_like {
+        return false;
+    }
+
+    is_secret_ref_value(config.s3.access_key_id.trim_start())
+        || is_secret_ref_value(config.s3.secret_access_key.trim_start())
+}
+
 async fn resolve_object_storage_secrets(
     config: &ObjectStorageConfig,
     vault: &VaultCore,
@@ -285,6 +304,7 @@ async fn resolve_object_storage_secrets(
     if !access_key_id_is_ref && !secret_access_key_is_ref {
         return Ok(config.clone());
     }
+    debug_assert!(object_storage_needs_vault(config));
 
     // Enforce the same namespace as `config validate` so a config cannot point
     // an object-storage credential at an unrelated vault path at runtime.
@@ -345,6 +365,94 @@ async fn resolve_redis_url_secret(
     validate_redis_url_literal("redis.url", &resolved.url)?;
     Ok(resolved)
 }
+
+/// What a read-only ops command is assembled from (UN-30).
+///
+/// [`AppContext::new`] is the production assembly and cannot be reused here: it
+/// migrates the database on connect, writes the default sidebars, calls
+/// `init_monorepo()` — which writes refs and objects — starts the notification
+/// worker, and opens the vault through the bootstrap path that can initialize it
+/// and rotate credentials. Every one of those happens before any command body
+/// runs, so a command assembled that way has already changed the system it was
+/// asked to describe.
+///
+/// This assembly reaches for the read-only counterparts instead: a connection
+/// the server refuses writes on and that runs no migration (UN-30), a vault
+/// opened read-only when one is needed at all (UN-31), and the minimal read
+/// facade (`ReadOnlyStorage`). It carries the config's provenance (UN-34) so a
+/// report can say which configuration it describes.
+///
+/// Proving that the whole assembly writes nothing — vault and filesystem
+/// included — belongs to UN-43; what is proven here is the database, refs and
+/// objects.
+pub struct ReadOnlyContext {
+    pub config: Arc<crate::config::Config>,
+    /// Where that config came from, when the caller resolved it through the
+    /// loader. `None` means nobody claimed a provenance, not that there is none.
+    pub config_summary: Option<crate::commands::LoadedConfigSummary>,
+    pub storage: crate::jupiter::storage::ReadOnlyStorage,
+    /// Present only when the object-storage config actually needed it.
+    ///
+    /// Opening a vault that nothing asks for would make an audit fail on a
+    /// deployment that has no vault, for no reading of anything.
+    pub vault: Option<crate::contract::vault::integration::vault_core::VaultCore>,
+}
+
+impl ReadOnlyContext {
+    pub async fn open(
+        config: crate::config::Config,
+        config_summary: Option<crate::commands::LoadedConfigSummary>,
+    ) -> Result<Self, MegaError> {
+        let config = Arc::new(config);
+
+        let db_connection = Arc::new(
+            crate::jupiter::storage::init::read_only_database_connection(&config.database).await?,
+        );
+
+        // Only open the vault if resolving the object-storage credentials needs
+        // it. When it is needed, a failure to open read-only is fatal: the
+        // alternative would be reading through credentials this process could
+        // not verify, or falling back to the bootstrap path that writes.
+        let vault = if object_storage_needs_vault(&config.object_storage) {
+            Some(
+                crate::contract::vault::integration::vault_core::VaultCore::open_readonly(
+                    crate::jupiter::storage::vault_storage::VaultStorage {
+                        base: <crate::jupiter::storage::base_storage::BaseStorage as
+                            crate::jupiter::storage::base_storage::StorageConnector>::new(
+                            db_connection.clone(),
+                        ),
+                    },
+                    crate::contract::vault::integration::vault_core::VaultCore::default_key_path(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let object_storage_config = match vault.as_ref() {
+            Some(vault) => resolve_object_storage_secrets(&config.object_storage, vault).await?,
+            None => config.object_storage.clone(),
+        };
+        let object_store =
+            crate::jupiter::storage::object_storage::build_object_storage(&object_storage_config)
+                .await?;
+
+        Ok(Self {
+            storage: crate::jupiter::storage::ReadOnlyStorage::new(
+                config.clone(),
+                db_connection,
+                object_store,
+            ),
+            config,
+            config_summary,
+            vault,
+        })
+    }
+}
+
+#[cfg(test)]
+mod un30_readonly;
 
 #[cfg(test)]
 mod tests {

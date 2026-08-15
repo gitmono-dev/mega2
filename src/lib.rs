@@ -44,6 +44,25 @@ mod server;
 )]
 mod vault;
 
+/// Internal seam for the read-only ops assembly (UN-30).
+///
+/// The zero-side-effect proof is a black-box before/after comparison: seed a
+/// real database through the real binary, snapshot it, run the read-only
+/// assembly, snapshot again. Driving that assembly needs a way in, and the
+/// command that will be its real entry point does not exist yet (UN-29).
+///
+/// Not a supported API. It is `#[doc(hidden)]` and exists so the proof can be
+/// written against the real assembly rather than a stand-in; once the audit
+/// command lands, the command is the black-box surface and this can go.
+#[doc(hidden)]
+pub mod readonly_ops {
+    pub use crate::{
+        commands::{LoadedConfigPaths, LoadedConfigSummary},
+        context::ReadOnlyContext,
+        jupiter::storage::ReadOnlyStorage,
+    };
+}
+
 // Public entry points for the thin `monoengine` binary (composition root). The
 // binary registers an `ObjectStorageProvider` (backed by the `orbit` impl
 // crate) via `set_object_storage_provider`, then dispatches the CLI via `parse`.

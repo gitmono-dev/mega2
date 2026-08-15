@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use tracing::log;
+use url::Url;
 
 use crate::{
     common::errors::MegaError,
@@ -19,6 +20,76 @@ pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnect
     apply_migrations(&conn, false).await?;
 
     Ok(conn)
+}
+
+/// Connect for reading only: no migrations, and the server refuses writes.
+///
+/// [`database_connection`] applies pending migrations on the way in, which is a
+/// schema change performed by whatever process happened to connect first. An
+/// audit command must not be that process — a report that begins by migrating
+/// the database it is about to describe has already changed the answer.
+///
+/// Read-only is enforced by the *server*, not by this code being careful:
+/// `default_transaction_read_only=on` is set for the session, so any write
+/// reaching Postgres through this connection is rejected there. That covers the
+/// paths nobody remembered to audit, which are the ones worth covering.
+pub async fn read_only_database_connection(
+    db_config: &DbConfig,
+) -> Result<DatabaseConnection, MegaError> {
+    validate_database_config(db_config)?;
+
+    let db_url = read_only_db_url(&db_config.db_url)?;
+    log::info!(
+        "Connecting to database read-only: {}",
+        redact_db_url(&db_url)
+    );
+
+    let mut read_only_config = db_config.clone();
+    read_only_config.db_url = db_url;
+    let opt = setup_option(&read_only_config);
+    Database::connect(opt).await.map_err(|e| e.into())
+}
+
+/// The connection URL with the read-only session option added.
+///
+/// Any `options` the URL already carries are kept (all of them, if it repeats
+/// the parameter): the test harness isolates
+/// each database behind a `search_path` set exactly this way, and dropping it
+/// would silently point the connection at a different schema. The read-only
+/// option is appended rather than merged in place because libpq applies `-c`
+/// settings left to right, so appending last means a URL that tried to turn
+/// read-only *off* cannot win.
+pub fn read_only_db_url(db_url: &str) -> Result<String, MegaError> {
+    const READ_ONLY_OPTION: &str = "-cdefault_transaction_read_only=on";
+
+    let mut url = Url::parse(db_url)
+        .map_err(|e| MegaError::Other(format!("database url is not a valid URL: {e}")))?;
+
+    // Every `options` occurrence is kept, not just the last one: libpq reads the
+    // whole string as one space-separated list, so overwriting on a repeat would
+    // drop settings the caller asked for.
+    let mut existing: Vec<String> = Vec::new();
+    let mut others: Vec<(String, String)> = Vec::new();
+    for (key, value) in url.query_pairs() {
+        if key == "options" {
+            existing.push(value.into_owned());
+        } else {
+            others.push((key.into_owned(), value.into_owned()));
+        }
+    }
+    existing.push(READ_ONLY_OPTION.to_string());
+    let options = existing.join(" ");
+
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in &others {
+            query.append_pair(key, value);
+        }
+        query.append_pair("options", &options);
+    }
+
+    Ok(url.to_string())
 }
 
 async fn postgres_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {

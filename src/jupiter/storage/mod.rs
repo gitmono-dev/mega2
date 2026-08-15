@@ -608,3 +608,104 @@ mod tests {
         assert_eq!(storage.config().log.level, "debug");
     }
 }
+
+/// The read surface an audit command gets (UN-30).
+///
+/// [`Storage::new_with_connection`] is not usable for reading: it writes the
+/// default sidebars on the way in (`init_default_sidebars`), and it assembles
+/// every service in the system, several of which exist to write. Neither is
+/// something an audit should carry, and the sidebar write alone would make
+/// "this command changed nothing" false before the first read.
+///
+/// So this is built from the pieces a read actually needs and nothing else. It
+/// is deliberately small: what an audit reads is the authorization source in the
+/// monorepo root, which takes the mono storage to resolve the ref and tree and
+/// the object store to fetch the blob. Adding more later should mean adding a
+/// read someone needs, not restoring the full assembly.
+#[derive(Clone)]
+pub struct ReadOnlyStorage {
+    base: BaseStorage,
+    mono_storage: MonoStorage,
+    git_service: GitService,
+    config: Arc<Config>,
+}
+
+impl ReadOnlyStorage {
+    /// Assemble over an existing read-only connection.
+    ///
+    /// The connection is the caller's: `ReadOnlyContext` builds it through
+    /// [`init::read_only_database_connection`], so no migration runs and the
+    /// server rejects writes. Nothing here writes either, which is the point —
+    /// the database-level guarantee is the backstop, not the reason.
+    pub fn new(
+        config: Arc<Config>,
+        connection: Arc<DatabaseConnection>,
+        object_store: MegaObjectStorageWrapper,
+    ) -> Self {
+        let base = BaseStorage::new(connection);
+        Self {
+            mono_storage: MonoStorage { base: base.clone() },
+            git_service: GitService {
+                obj_storage: object_store,
+            },
+            base,
+            config,
+        }
+    }
+
+    pub fn config(&self) -> Arc<Config> {
+        self.config.clone()
+    }
+
+    pub fn mono_storage(&self) -> &MonoStorage {
+        &self.mono_storage
+    }
+
+    pub fn git_service(&self) -> &GitService {
+        &self.git_service
+    }
+
+    pub fn base(&self) -> &BaseStorage {
+        &self.base
+    }
+
+    /// Read the in-repo authorization source from the monorepo root.
+    ///
+    /// This is the read the audit exists to perform, and it is the same walk the
+    /// server does at startup — root ref, root tree, the named blob — so the
+    /// audit describes the file the server would actually load rather than a
+    /// separately-derived idea of it.
+    pub async fn read_authz_source(&self) -> Result<String, MegaError> {
+        use git_internal::internal::object::tree::Tree;
+
+        use crate::{
+            callisto::mega_tree, contract::policy::entitystore::MEGA_CEDAR_PATH,
+            jupiter::utils::converter::FromMegaModel,
+        };
+
+        let root_ref = self
+            .mono_storage
+            .get_main_ref("/")
+            .await?
+            .ok_or_else(|| MegaError::Other("Root ref not found".into()))?;
+        let root_tree: mega_tree::Model = self
+            .mono_storage
+            .get_tree_by_hash(&root_ref.ref_tree_hash)
+            .await?
+            .ok_or_else(|| MegaError::Other("Root tree not found".into()))?;
+        let root_tree = Tree::from_mega_model(root_tree);
+
+        let file_name = MEGA_CEDAR_PATH.trim_start_matches('/');
+        let blob = root_tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == file_name)
+            .ok_or_else(|| MegaError::Other(format!("{file_name} not found in root directory")))?;
+
+        let bytes = self
+            .git_service
+            .get_object_as_bytes(&blob.id.to_string())
+            .await?;
+        String::from_utf8(bytes).map_err(|e| MegaError::Other(format!("UTF-8 decode failed: {e}")))
+    }
+}
