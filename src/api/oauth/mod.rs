@@ -52,6 +52,56 @@ pub struct AccessTokenUser(pub LoginUser);
 /// For API clients that send a Mono access token in `Authorization`, use [`AccessTokenUser`] instead.
 pub struct SessionUser(pub LoginUser);
 
+/// Authenticated user resolved from a browser session, or `None` for an
+/// anonymous request. Unlike [`SessionUser`] this extractor **never rejects**:
+/// callers that must serve anonymous requests (and decide for themselves what
+/// that means) use it instead of turning "no session" into a 401.
+pub struct OptionalSessionUser(pub Option<LoginUser>);
+
+/// Request-scoped result of resolving the authenticated subject (UN-22).
+///
+/// The session store is consulted **once per request**; every consumer — the
+/// authorization guard and the handler extractors alike — reads this cached
+/// extension. Resolving twice was not merely wasteful: the guard and the
+/// handler could observe different subjects for the same request if the
+/// session expired or was revoked in between.
+///
+/// Three source outcomes are normalized into one value: a live session becomes
+/// `Some(user)`; no session and a store failure both become `None`. Collapsing
+/// the failure case keeps the existing behavior (a lookup error has always been
+/// treated as "not logged in", ADR-WA-03) while still logging a warning at the
+/// point of resolution.
+#[derive(Clone, Debug)]
+pub struct ResolvedSessionPrincipal(pub Option<LoginUser>);
+
+/// Resolve the request's subject once, caching the result in the request
+/// extensions. A second call on the same request returns the cached value
+/// without touching the session store.
+pub async fn resolve_session_principal(
+    parts: &mut Parts,
+    session_store: &BrowserSessionStore,
+) -> ResolvedSessionPrincipal {
+    if let Some(cached) = parts.extensions.get::<ResolvedSessionPrincipal>() {
+        return cached.clone();
+    }
+
+    let cookie_header = parts
+        .headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok());
+
+    let resolved = match session_store.load_user(cookie_header).await {
+        Ok(user) => ResolvedSessionPrincipal(user),
+        Err(error) => {
+            tracing::warn!("session lookup failed, treating request as anonymous: {error}");
+            ResolvedSessionPrincipal(None)
+        }
+    };
+
+    parts.extensions.insert(resolved.clone());
+    resolved
+}
+
 /// Parses a raw `Authorization` header value for `Bearer <token>` (case-insensitive `bearer` prefix).
 /// Matches the Git HTTP receive-pack path so CLI clients and API routes share one rule.
 pub fn bearer_token_from_authorization_value(value: &str) -> Option<&str> {
@@ -162,22 +212,30 @@ where
 {
     type Rejection = AuthRedirect;
 
-    /// Reads the session cookie from the request and resolves [`LoginUser`].
+    /// Resolves the request's subject (once per request, UN-22) and rejects
+    /// anonymous requests — unchanged behavior.
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let session_store = BrowserSessionStore::from_ref(state);
-        let cookie_header = parts
-            .headers
-            .get(COOKIE)
-            .and_then(|value| value.to_str().ok());
-
-        match session_store.load_user(cookie_header).await {
-            Ok(Some(user)) => Ok(Self(user)),
-            Ok(None) => Err(AuthRedirect),
-            Err(error) => {
-                tracing::warn!("SessionUser: website session lookup failed: {error}");
-                Err(AuthRedirect)
-            }
+        match resolve_session_principal(parts, &session_store).await {
+            ResolvedSessionPrincipal(Some(user)) => Ok(Self(user)),
+            ResolvedSessionPrincipal(None) => Err(AuthRedirect),
         }
+    }
+}
+
+impl<S> FromRequestParts<S> for OptionalSessionUser
+where
+    BrowserSessionStore: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    /// Same single resolution as [`SessionUser`], but an anonymous request is a
+    /// value rather than a rejection: this extractor never produces a 401.
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let session_store = BrowserSessionStore::from_ref(state);
+        let ResolvedSessionPrincipal(user) = resolve_session_principal(parts, &session_store).await;
+        Ok(Self(user))
     }
 }
 

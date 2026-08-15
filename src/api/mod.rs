@@ -34,6 +34,8 @@ pub mod api_doc;
 pub mod api_router;
 pub mod oauth;
 pub mod router;
+#[cfg(test)]
+mod un22_principal;
 
 #[derive(Clone)]
 pub struct MonoApiServiceState {

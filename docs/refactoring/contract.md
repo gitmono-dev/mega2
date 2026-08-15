@@ -171,3 +171,15 @@
 矩阵的每条断言都针对快照**缓存的** `Entities`（UN-14）求值，而不是从 store 现推，因此缓存残留会让矩阵失败而不是被重新推导掩盖。`src/contract/policy/un21_cache.rs` 另行锁定缓存语义本身：重建发布新的不可变快照而非原地修改（重建前取得的句柄继续服务其自身内容）、反复重建在两个方向都无残留、重建失败保留旧快照并置 dirty。
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
+
+## 请求级认证主体单一解析（UN-22）
+
+同一 HTTP 请求的认证主体**只解析一次**，全部消费方共享同一结果。此前 guard 与 handler extractor 各自调用 session store：不仅多一次存储调用，更关键的是会话在两次解析之间过期或被撤销时，二者会对同一请求得到**不同**主体。
+
+- `ResolvedSessionPrincipal(Option<LoginUser>)`（`src/api/oauth/mod.rs`）是 request-scoped 的解析结果，缓存在请求 extensions 里。
+- `resolve_session_principal(parts, store)` 是唯一解析入口：命中缓存直接返回；未命中则解析一次并回填。
+- **三种来源结果归一为一个值**：有会话 → `Some(user)`；无会话与 store 故障 → `None`。归一故障保持既有行为（查询失败一直按「未登录」处理，ADR-WA-03），但在解析点保留 warn 日志。
+- 消费方：`SessionUser` / `LoginUser`（`None` → `AuthRedirect`，行为不变）、新增的 `OptionalSessionUser`（匿名 → `None`，**永不返回 401**）、以及 guard 的 `guard_principal`（`src/contract/policy/guard/cedar_guard.rs`）。
+- guard 侧 Bot 分支保持既有优先级（其授权语义归 UN-27）；Bot 请求不解析浏览器会话。匿名请求在 guard 侧是一个主体（`User::"reader"`）而不是拒绝——是否放行由策略决定。
+
+测试用 `CountingSessionStore` 双：它**每次调用返回不同用户**，因此「两个消费方得到同一答案」只可能来自缓存——用固定用户的 double 无法证伪。

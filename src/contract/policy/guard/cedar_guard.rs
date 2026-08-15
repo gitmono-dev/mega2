@@ -12,7 +12,7 @@ use once_cell::sync::Lazy;
 use crate::{
     api::{
         MonoApiServiceState,
-        oauth::{BotIdentity, model::LoginUser},
+        oauth::{BotIdentity, OptionalSessionUser},
     },
     common::errors::{ApiError, MegaError},
     contract::policy::{
@@ -110,6 +110,40 @@ fn match_operation(
     None
 }
 
+/// Principal id used when a request carries no authenticated subject.
+const ANONYMOUS_PRINCIPAL_ID: &str = "reader";
+
+/// The guard's authorization principal (UN-22).
+///
+/// Bot identity, decided by the caller, takes precedence — its authorization
+/// semantics are UN-27's axis. Otherwise the subject comes from the
+/// request-scoped resolution, so the guard and the downstream handler
+/// extractors always agree: they used to resolve independently, and could
+/// observe different subjects for one request if the session expired in
+/// between. An anonymous request is a principal, not a rejection — whether it
+/// is allowed is the policy's decision, not this function's.
+pub(crate) async fn guard_principal<S>(
+    parts: &mut http::request::Parts,
+    state: &S,
+    bot: Option<String>,
+) -> (String, String)
+where
+    crate::api::oauth::api_store::BrowserSessionStore: FromRef<S>,
+    S: Send + Sync,
+{
+    if let Some(bot_id) = bot {
+        return ("Bot".to_string(), bot_id);
+    }
+
+    let OptionalSessionUser(user) = OptionalSessionUser::from_request_parts(parts, state)
+        .await
+        .unwrap_or(OptionalSessionUser(None));
+    match user {
+        Some(user) => ("User".to_string(), user.username),
+        None => ("User".to_string(), ANONYMOUS_PRINCIPAL_ID.to_string()),
+    }
+}
+
 pub async fn cedar_guard(
     State(state): State<MonoApiServiceState>,
     req: Request,
@@ -143,14 +177,11 @@ pub async fn cedar_guard(
 
     let (mut parts, body) = req.into_parts();
 
-    let (principal_type, principal_id) =
-        if let Ok(bot) = BotIdentity::from_request_parts(&mut parts, &state).await {
-            ("Bot".to_string(), bot.bot.id.to_string())
-        } else if let Ok(user) = LoginUser::from_request_parts(&mut parts, &state).await {
-            ("User".to_string(), user.username.clone())
-        } else {
-            ("User".to_string(), "reader".to_string())
-        };
+    let bot = BotIdentity::from_request_parts(&mut parts, &state)
+        .await
+        .ok()
+        .map(|bot| bot.bot.id.to_string());
+    let (principal_type, principal_id) = guard_principal(&mut parts, &state, bot).await;
 
     // let policy_path = repo_path.join("cedar/policies.cedar");
     // let policy_content = get_blob_string(&state, &policy_path).await?;
@@ -221,7 +252,138 @@ async fn authorize(
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use http::Request;
+
     use super::*;
+    use crate::{
+        api::oauth::{
+            ResolvedSessionPrincipal,
+            api_store::{BrowserSessionStore, CountingSessionStore},
+            model::LoginUser,
+        },
+        common::errors::MegaError,
+    };
+
+    fn login_user(name: &str) -> LoginUser {
+        LoginUser {
+            username: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn counting_state(
+        answers: Vec<Result<Option<LoginUser>, MegaError>>,
+    ) -> (BrowserSessionStore, CountingSessionStore) {
+        let store = CountingSessionStore::new(answers);
+        (BrowserSessionStore::Counting(store.clone()), store)
+    }
+
+    fn parts() -> http::request::Parts {
+        Request::builder()
+            .uri("/cl/ABC123/merge")
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    #[tokio::test]
+    async fn un22_guard_principal_reads_the_session_subject_once() {
+        // The store answers with a different user on a second call, so reading
+        // the cached resolution is the only way to get a stable answer.
+        let (state, counter) = counting_state(vec![
+            Ok(Some(login_user("session-user"))),
+            Ok(Some(login_user("drifted-user"))),
+        ]);
+        let mut parts = parts();
+
+        let first = guard_principal(&mut parts, &state, None).await;
+        assert_eq!(
+            first,
+            ("User".to_string(), "session-user".to_string()),
+            "the guard's principal is the session subject"
+        );
+        assert_eq!(counter.call_count(), 1);
+
+        // A later consumer on the same request sees the guard's answer.
+        let second = guard_principal(&mut parts, &state, None).await;
+        assert_eq!(second, first, "the resolution is reused, not repeated");
+        assert_eq!(
+            counter.call_count(),
+            1,
+            "the session store must not be consulted twice for one request"
+        );
+    }
+
+    #[tokio::test]
+    async fn un22_guard_principal_reuses_an_already_resolved_extension() {
+        // Whoever resolved first wins; the guard must not go behind its back.
+        let (state, counter) = counting_state(vec![Ok(Some(login_user("store-user")))]);
+        let mut parts = parts();
+        parts
+            .extensions
+            .insert(ResolvedSessionPrincipal(Some(login_user(
+                "resolved-earlier",
+            ))));
+
+        let principal = guard_principal(&mut parts, &state, None).await;
+        assert_eq!(
+            principal,
+            ("User".to_string(), "resolved-earlier".to_string())
+        );
+        assert_eq!(
+            counter.call_count(),
+            0,
+            "an already resolved request must not hit the session store at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn un22_guard_principal_is_anonymous_without_a_session() {
+        let (state, counter) = counting_state(vec![Ok(None)]);
+        let mut parts = parts();
+
+        let principal = guard_principal(&mut parts, &state, None).await;
+        assert_eq!(
+            principal,
+            ("User".to_string(), ANONYMOUS_PRINCIPAL_ID.to_string()),
+            "an anonymous request is a principal, not a rejection"
+        );
+        assert_eq!(counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn un22_guard_principal_normalizes_a_session_store_failure_to_anonymous() {
+        let (state, counter) = counting_state(vec![Err(MegaError::Other("store down".into()))]);
+        let mut parts = parts();
+
+        let principal = guard_principal(&mut parts, &state, None).await;
+        assert_eq!(
+            principal,
+            ("User".to_string(), ANONYMOUS_PRINCIPAL_ID.to_string())
+        );
+        assert_eq!(counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn un22_guard_principal_keeps_bot_precedence_without_a_session_lookup() {
+        let (state, counter) = counting_state(vec![Ok(Some(login_user("session-user")))]);
+        let mut parts = parts();
+
+        let principal = guard_principal(&mut parts, &state, Some("42".to_string())).await;
+        assert_eq!(
+            principal,
+            ("Bot".to_string(), "42".to_string()),
+            "bot identity keeps its existing precedence"
+        );
+        assert_eq!(
+            counter.call_count(),
+            0,
+            "a bot request must not resolve a browser session"
+        );
+    }
+
     #[tokio::test]
     async fn test_match_operation() {
         let patterns: HashMap<String, String> = HashMap::from([
