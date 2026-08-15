@@ -58,7 +58,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     ),
     path = "/{link}/reopen",
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -103,7 +104,8 @@ async fn reopen_cl(
     ),
     path = "/{link}/close",
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -147,7 +149,8 @@ async fn close_cl(
     ),
     path = "/{link}/merge",
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -278,7 +281,8 @@ async fn fetch_cl_list(
     ),
     path = "/{link}/detail",
     responses(
-        (status = 200, body = CommonResult<CLDetailRes>, content_type = "application/json")
+        (status = 200, body = CommonResult<CLDetailRes>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -302,7 +306,8 @@ async fn cl_detail(
     ),
     path = "/{link}/mui-tree",
     responses(
-        (status = 200, body = CommonResult<Vec<MuiTreeNode>>, content_type = "application/json")
+        (status = 200, body = CommonResult<Vec<MuiTreeNode>>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -327,7 +332,8 @@ async fn cl_mui_tree(
     path = "/{link}/files-changed",
     request_body = PageParams<String>,
     responses(
-        (status = 200, body = CommonResult<FilesChangedPage>, content_type = "application/json")
+        (status = 200, body = CommonResult<FilesChangedPage>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -354,7 +360,8 @@ async fn cl_files_changed_by_page(
     ),
     path = "/{link}/files-list",
     responses(
-        (status = 200, body = CommonResult<Vec<ClFilesRes>>, content_type = "application/json")
+        (status = 200, body = CommonResult<Vec<ClFilesRes>>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -391,7 +398,8 @@ async fn cl_files_list(
     ),
     path = "/{link}/update-status",
     responses(
-        (status = 200, body = CommonResult<UpdateBranchStatusRes>, content_type = "application/json")
+        (status = 200, body = CommonResult<UpdateBranchStatusRes>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -411,7 +419,8 @@ async fn update_branch_status(
     ),
     path = "/{link}/update-branch",
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -440,7 +449,8 @@ async fn update_branch(
     ),
     path = "/{link}/merge-box",
     responses(
-        (status = 200, body = CommonResult<MergeBoxRes>, content_type = "application/json")
+        (status = 200, body = CommonResult<MergeBoxRes>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -481,7 +491,8 @@ async fn merge_box(
     path = "/{link}/comment",
     request_body = ContentPayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -550,7 +561,8 @@ async fn save_comment(
     path = "/{link}/title",
     request_body = ContentPayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -575,7 +587,8 @@ async fn edit_title(
     path = "/labels",
     request_body = LabelUpdatePayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -593,7 +606,8 @@ async fn labels(
     path = "/assignees",
     request_body = AssigneeUpdatePayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -614,7 +628,8 @@ async fn assignees(
     path = "/{link}/status",
     request_body = UpdateClStatusPayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]

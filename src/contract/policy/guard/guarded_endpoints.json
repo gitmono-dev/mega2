@@ -1,25 +1,31 @@
 {
     "/cl": {
-        "/list": "unprotectedRequest",
-        "/{link}/reopen": "editMergeRequest",
-        "/{link}/close": "editMergeRequest",
-        "/{link}/merge": "approveMergeRequest",
-        "/{link}/comment": "editMergeRequest",
-        "/{link}/title": "editMergeRequest",
-        "/{link}/labels": "editMergeRequest",
-        "/{link}/assignees": "editMergeRequest",
-        "/{link}/reviewers": "editMergeRequest",
-        "/{link}/approve": "approveMergeRequest",
-        "/{link}/resolve": "editMergeRequest",
-        "/{link}/detail": "viewRepo",
-        "/{link}/mui-tree": "viewRepo",
-        "/{link}/files-changed": "viewRepo",
-        "/{link}/files-list": "viewRepo",
-        "/{link}/merge-box": "viewRepo",
-        "/{link}/status": "editMergeRequest",
-        "/{link}/update-status": "viewRepo",
-        "/{link}/update-branch": "editMergeRequest",
-        "/reviewer/{link}": "viewRepo",
-        "/reviewer": "editMergeRequest"
+        "post": {
+            "/list": "unprotectedRequest",
+            "/labels": "editMergeRequest",
+            "/assignees": "editMergeRequest",
+            "/{link}/reopen": "editMergeRequest",
+            "/{link}/close": "editMergeRequest",
+            "/{link}/merge": "approveMergeRequest",
+            "/{link}/comment": "editMergeRequest",
+            "/{link}/title": "editMergeRequest",
+            "/{link}/status": "editMergeRequest",
+            "/{link}/update-branch": "editMergeRequest",
+            "/{link}/files-changed": "viewRepo",
+            "/{link}/reviewers": "editMergeRequest",
+            "/{link}/reviewer/approve": "approveMergeRequest",
+            "/{link}/review/resolve": "editMergeRequest"
+        },
+        "get": {
+            "/{link}/detail": "viewRepo",
+            "/{link}/mui-tree": "viewRepo",
+            "/{link}/files-list": "viewRepo",
+            "/{link}/merge-box": "viewRepo",
+            "/{link}/update-status": "viewRepo",
+            "/{link}/reviewers": "viewRepo"
+        },
+        "delete": {
+            "/{link}/reviewers": "editMergeRequest"
+        }
     }
 }

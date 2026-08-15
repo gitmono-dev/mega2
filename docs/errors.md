@@ -79,6 +79,17 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 5. 不要在 API/router、Vault 工具、contract 或 storage 模块中新增局部 `thiserror::Error` 枚举；局部解析错误也应放入 `common::errors`。
 6. 字符串型 fallback（如 `MegaError::Other` 和 `[code:xxx]`）只能用于兼容或过渡，新逻辑优先使用结构化变体。
 
+## 授权拒绝的状态码（UN-23）
+
+受 guard 保护的 `/api/v1/cl` 操作在授权被拒绝时返回 **403**，并在 OpenAPI 中显式声明该响应。
+
+- **403 = 已识别主体但无权限**（授权拒绝）。
+- **401 = 认证失败**（必选 extractor 拿不到会话），不得用来冒充授权拒绝——两者含义不同，客户端的处理也不同（重新登录 vs 申请权限）。
+
+映射键为 `{method, path}`（`src/contract/policy/guard/guarded_endpoints.json`）：同一路径的不同方法可以是不同 action，例如 `GET /cl/{link}/reviewers` 是读（`viewRepo`），而 `POST`/`DELETE` 同路径是写（`editMergeRequest`）。未登记 `{method,path}` 的操作视为 unprotected，**不会**继承同路径其它方法的 action。
+
+`POST /cl/{link}/merge-no-auth` 是已注册路由但尚未纳入映射，其入口鉴权与 403 注解归 UN-24。
+
 ## 响应安全
 
 - `ApiError` 只向客户端暴露 4xx 细节。

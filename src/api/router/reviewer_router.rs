@@ -37,7 +37,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     path = "/{link}/reviewers",
     request_body = ReviewerPayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -87,7 +88,8 @@ async fn add_reviewers(
     path = "/{link}/reviewers",
     request_body = ReviewerPayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -133,7 +135,8 @@ async fn remove_reviewers(
     ),
     path = "/{link}/reviewers",
     responses(
-        (status = 200, body = CommonResult<ReviewersResponse>, content_type = "application/json")
+        (status = 200, body = CommonResult<ReviewersResponse>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -168,7 +171,8 @@ async fn list_reviewers(
     path = "/{link}/reviewer/approve",
     request_body = ChangeReviewerStatePayload,
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]
@@ -216,7 +220,8 @@ async fn reviewer_approve(
         content = ChangeReviewStatePayload,
     ),
     responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json")
+        (status = 200, body = CommonResult<String>, content_type = "application/json"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
     ),
     tag = CL_TAG
 )]

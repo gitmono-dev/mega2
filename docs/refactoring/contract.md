@@ -172,6 +172,14 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## guard 映射 `{method,path}` 键与路由对齐（UN-23）
+
+`guarded_endpoints.json` 的键从 path 升级为 `{method, path}`（前缀 → 小写方法 → 路径模式 → action），resolver `resolve_cl_action(method, path)` 接收方法参与匹配。同一路径的不同方法本就是不同 action——`GET /cl/{link}/reviewers` 只读取评审人列表，`POST`/`DELETE` 则修改它——只按 path 归一时，三者里必然有两个被映射错。未登记的 `{method,path}` 视为 unprotected，且**不继承**同路径其它方法的 action。
+
+映射同时对齐了真实注册路由：`/{link}/approve` → `/{link}/reviewer/approve`、`/{link}/resolve` → `/{link}/review/resolve`、`/{link}/labels` → `/labels`、`/{link}/assignees` → `/assignees`；失效条目 `/reviewer/{link}` 与 `/reviewer` 移除（真实路由是 `/{link}/reviewers` 的 GET/POST/DELETE 三个方法）。
+
+固定 `{method, path, action}` 矩阵随卡以测试常量形式提交（`cedar_guard.rs` 的 `UN23_MATRIX`，21 条已登记 + `merge-no-auth` 显式留待 UN-24），因此路由新增或改名而未同步映射会直接让测试失败。受保护的 20 个操作在 OpenAPI 中声明 403（`docs/errors.md` 记录 403/401 的语义区分）。
+
 ## 请求级认证主体单一解析（UN-22）
 
 同一 HTTP 请求的认证主体**只解析一次**，全部消费方共享同一结果。此前 guard 与 handler extractor 各自调用 session store：不仅多一次存储调用，更关键的是会话在两次解析之间过期或被撤销时，二者会对同一请求得到**不同**主体。

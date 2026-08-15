@@ -28,7 +28,14 @@ permit (
     resource
 );"#;
 
-type EndPointConfig = HashMap<String, HashMap<String, String>>;
+/// Guarded endpoints, keyed by `{method, path}`: prefix → lowercase HTTP
+/// method → path pattern → action.
+///
+/// The method is part of the key because the same path serves different
+/// actions per method — `GET /{link}/reviewers` only reads the reviewer list
+/// while `POST`/`DELETE` on that same path change it. Keying on the path alone
+/// collapsed those into one action, so one of them was always mapped wrong.
+type EndPointConfig = HashMap<String, HashMap<String, HashMap<String, String>>>;
 static GURADED_ENDPOINTS: Lazy<EndPointConfig> = Lazy::new(|| {
     let endpoints_config_dict: &str = include_str!("guarded_endpoints.json");
     serde_json::from_str(endpoints_config_dict).unwrap_or_else(|e| {
@@ -37,7 +44,11 @@ static GURADED_ENDPOINTS: Lazy<EndPointConfig> = Lazy::new(|| {
     })
 });
 
-pub fn resolve_cl_action(req_path: &str) -> Result<(ActionEnum, String), MegaError> {
+/// Resolve the guarded action for a `{method, path}` pair.
+///
+/// A path with no registered entry *for this method* is unprotected: an
+/// unmapped operation must not inherit another method's action.
+pub fn resolve_cl_action(method: &str, req_path: &str) -> Result<(ActionEnum, String), MegaError> {
     let cl_path_prefix = "/cl";
     // Avoid parsing request of non-CL endpoints
     if !req_path.starts_with(cl_path_prefix) {
@@ -49,8 +60,14 @@ pub fn resolve_cl_action(req_path: &str) -> Result<(ActionEnum, String), MegaErr
         MegaError::Other("No CL config found in guarded_endpoints.json".to_string())
     })?;
 
-    let Some((action, mr_link)) = match_operation(path, cl_config) else {
-        tracing::warn!("No matching CL action for path: {}", req_path);
+    let method = method.to_ascii_lowercase();
+    let Some(method_config) = cl_config.get(&method) else {
+        tracing::warn!("No matching CL action for {} {}", method, req_path);
+        return Ok((ActionEnum::UnprotectedRequest, String::new()));
+    };
+
+    let Some((action, mr_link)) = match_operation(path, method_config) else {
+        tracing::warn!("No matching CL action for {} {}", method, req_path);
         return Ok((ActionEnum::UnprotectedRequest, String::new()));
     };
 
@@ -113,6 +130,20 @@ fn match_operation(
 /// Principal id used when a request carries no authenticated subject.
 const ANONYMOUS_PRINCIPAL_ID: &str = "reader";
 
+/// An authorization denial is **403, not 401** (UN-23).
+///
+/// The two mean different things to a client: 401 says "authenticate", 403 says
+/// "you are known and still may not do this". The guard has already resolved a
+/// principal by the time it evaluates policy, so 401 would be a lie — and the
+/// protected operations declare 403 in their OpenAPI responses.
+fn authorization_denied(principal_id: &str, action: &str, error: MegaError) -> ApiError {
+    tracing::debug!("Authorization failed for {}: {}", principal_id, action);
+    ApiError::with_status(
+        StatusCode::FORBIDDEN,
+        MegaError::Other(format!("Guard Authorization failed: {}", error)),
+    )
+}
+
 /// The guard's authorization principal (UN-22).
 ///
 /// Bot identity, decided by the caller, takes precedence — its authorization
@@ -152,7 +183,8 @@ pub async fn cedar_guard(
     let request_path = req.uri().path().to_owned();
     tracing::debug!("Processing request: {}", request_path);
 
-    let (action, link) = resolve_cl_action(&request_path).map_err(|e| {
+    let request_method = req.method().as_str().to_owned();
+    let (action, link) = resolve_cl_action(&request_method, &request_path).map_err(|e| {
         tracing::error!("Failed to resolve CL action: {}", e);
         ApiError::with_status(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -192,17 +224,7 @@ pub async fn cedar_guard(
 
     authorize(&c, &principal_type, &principal_id, &action.to_string())
         .await
-        .map_err(|e| {
-            tracing::debug!(
-                "Authorization failed for {}: {}",
-                &principal_id,
-                &action.to_string()
-            );
-            ApiError::with_status(
-                StatusCode::UNAUTHORIZED,
-                MegaError::Other(format!("Guard Authorization failed: {}", e)),
-            )
-        })?;
+        .map_err(|e| authorization_denied(&principal_id, &action.to_string(), e))?;
 
     let req = Request::from_parts(parts, body);
     let response = next.run(req).await;
@@ -381,6 +403,145 @@ mod tests {
             counter.call_count(),
             0,
             "a bot request must not resolve a browser session"
+        );
+    }
+
+    /// The fixed `{method, path, action}` matrix (UN-23). It is the card's
+    /// deliverable: every registered `/cl` operation appears exactly once, so a
+    /// route added or renamed without updating the mapping shows up here.
+    const UN23_MATRIX: &[(&str, &str, ActionEnum)] = &[
+        ("POST", "/cl/list", ActionEnum::UnprotectedRequest),
+        ("POST", "/cl/labels", ActionEnum::EditMergeRequest),
+        ("POST", "/cl/assignees", ActionEnum::EditMergeRequest),
+        ("POST", "/cl/ABC123/reopen", ActionEnum::EditMergeRequest),
+        ("POST", "/cl/ABC123/close", ActionEnum::EditMergeRequest),
+        ("POST", "/cl/ABC123/merge", ActionEnum::ApproveMergeRequest),
+        ("POST", "/cl/ABC123/comment", ActionEnum::EditMergeRequest),
+        ("POST", "/cl/ABC123/title", ActionEnum::EditMergeRequest),
+        ("POST", "/cl/ABC123/status", ActionEnum::EditMergeRequest),
+        (
+            "POST",
+            "/cl/ABC123/update-branch",
+            ActionEnum::EditMergeRequest,
+        ),
+        ("POST", "/cl/ABC123/files-changed", ActionEnum::ViewRepo),
+        ("POST", "/cl/ABC123/reviewers", ActionEnum::EditMergeRequest),
+        (
+            "POST",
+            "/cl/ABC123/reviewer/approve",
+            ActionEnum::ApproveMergeRequest,
+        ),
+        (
+            "POST",
+            "/cl/ABC123/review/resolve",
+            ActionEnum::EditMergeRequest,
+        ),
+        ("GET", "/cl/ABC123/detail", ActionEnum::ViewRepo),
+        ("GET", "/cl/ABC123/mui-tree", ActionEnum::ViewRepo),
+        ("GET", "/cl/ABC123/files-list", ActionEnum::ViewRepo),
+        ("GET", "/cl/ABC123/merge-box", ActionEnum::ViewRepo),
+        ("GET", "/cl/ABC123/update-status", ActionEnum::ViewRepo),
+        // Semantic fix (UN-23): reading the reviewer list is a read, while
+        // POST/DELETE on the same path change it. Keying on the path alone
+        // could only ever get one of the three right.
+        ("GET", "/cl/ABC123/reviewers", ActionEnum::ViewRepo),
+        (
+            "DELETE",
+            "/cl/ABC123/reviewers",
+            ActionEnum::EditMergeRequest,
+        ),
+    ];
+
+    #[test]
+    fn un23_method_path_matrix_resolves_every_registered_operation() {
+        for (method, path, expected) in UN23_MATRIX {
+            let (action, _link) = resolve_cl_action(method, path).expect("resolver must not error");
+            assert_eq!(
+                action, *expected,
+                "{method} {path} must resolve to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn un23_the_same_path_resolves_differently_per_method() {
+        let read = resolve_cl_action("GET", "/cl/ABC123/reviewers").unwrap().0;
+        let write = resolve_cl_action("POST", "/cl/ABC123/reviewers").unwrap().0;
+        let remove = resolve_cl_action("DELETE", "/cl/ABC123/reviewers")
+            .unwrap()
+            .0;
+
+        assert_eq!(read, ActionEnum::ViewRepo);
+        assert_eq!(write, ActionEnum::EditMergeRequest);
+        assert_eq!(remove, ActionEnum::EditMergeRequest);
+        assert_ne!(
+            read, write,
+            "reading and changing the reviewer list are different actions"
+        );
+    }
+
+    #[test]
+    fn un23_an_unmapped_method_does_not_inherit_another_methods_action() {
+        // `/{link}/merge` is only registered for POST. A PUT to the same path
+        // must not pick up `approveMergeRequest` from the POST entry.
+        let (action, _) = resolve_cl_action("PUT", "/cl/ABC123/merge").unwrap();
+        assert_eq!(action, ActionEnum::UnprotectedRequest);
+    }
+
+    #[test]
+    fn un23_the_method_key_is_case_insensitive() {
+        let lower = resolve_cl_action("post", "/cl/ABC123/merge").unwrap().0;
+        let upper = resolve_cl_action("POST", "/cl/ABC123/merge").unwrap().0;
+        assert_eq!(lower, ActionEnum::ApproveMergeRequest);
+        assert_eq!(lower, upper);
+    }
+
+    #[test]
+    fn un23_the_cl_link_is_extracted_alongside_the_action() {
+        let (_, link) = resolve_cl_action("POST", "/cl/ABC123/merge").unwrap();
+        assert_eq!(link, "ABC123");
+        let (_, link) = resolve_cl_action("POST", "/cl/ABC123/reviewer/approve").unwrap();
+        assert_eq!(link, "ABC123");
+    }
+
+    /// An authorization denial must be 403, matching what the protected
+    /// operations declare in OpenAPI. 401 would tell a known principal to log
+    /// in again, which is not the problem.
+    #[tokio::test]
+    async fn un23_an_authorization_denial_is_403_not_401() {
+        use axum::response::IntoResponse;
+
+        let response = authorization_denied(
+            "someone",
+            "approveMergeRequest",
+            MegaError::Other("denied".to_string()),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "401 is for authentication failures, not authorization denials"
+        );
+    }
+
+    #[test]
+    fn un23_non_cl_paths_stay_unprotected() {
+        let (action, _) = resolve_cl_action("POST", "/merge-queue/add").unwrap();
+        assert_eq!(action, ActionEnum::UnprotectedRequest);
+    }
+
+    /// `merge-no-auth` is a registered route but is deliberately *not* in the
+    /// mapping yet: bringing that entry point under authorization is UN-24's
+    /// axis. Pinning it here makes the handover explicit instead of silent.
+    #[test]
+    fn un23_merge_no_auth_is_not_yet_mapped() {
+        let (action, _) = resolve_cl_action("POST", "/cl/ABC123/merge-no-auth").unwrap();
+        assert_eq!(
+            action,
+            ActionEnum::UnprotectedRequest,
+            "merge-no-auth stays unmapped until UN-24"
         );
     }
 
