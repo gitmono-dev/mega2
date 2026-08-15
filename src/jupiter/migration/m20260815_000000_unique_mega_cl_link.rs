@@ -113,7 +113,10 @@ mod tests {
         let row = db
             .query_one_raw(Statement::from_string(
                 DbBackend::Postgres,
-                format!("SELECT to_regclass('{INDEX_NAME}')::text AS name"),
+                // Scoped to the current schema: test databases are
+                // schema-isolated through `search_path` (see `jupiter::tests`)
+                // and the catalog spans every schema.
+                format!("SELECT to_regclass(current_schema() || '.{INDEX_NAME}')::text AS name"),
             ))
             .await
             .expect("catalog query")
@@ -182,7 +185,8 @@ mod tests {
                 DbBackend::Postgres,
                 format!(
                     "SELECT indexdef FROM pg_indexes \
-                     WHERE tablename = 'mega_cl' AND indexname = '{INDEX_NAME}'"
+                     WHERE schemaname = current_schema() AND tablename = 'mega_cl' \
+                     AND indexname = '{INDEX_NAME}'"
                 ),
             ))
             .await

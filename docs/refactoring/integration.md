@@ -95,6 +95,19 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 迁移模块内 `#[cfg(test)]` 覆盖四条：`up` 建唯一索引且 `down` 删除、重复数据使 `up` 带完整冲突清单失败且行数不变、并发插入在迁移事务提交前被锁阻塞（提交后被唯一索引拒绝）、`SET LOCAL enable_seqscan = off` 下 `EXPLAIN` 的计划命中新索引名。`get_cl` 的按 link 回归在 `src/jupiter/storage/cl_storage.rs` 内。
 
+## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
+
+`m20260815_000100_merge_queue_requester` 为 `merge_queue` 增加 nullable `requester` 列（无默认值、无回填、不修改既有行）。排队的合并由后台 worker 稍后执行，请求主体必须随队列项持久化，否则执行时没有自己的授权主体。本卡只加列：写入/读出链归 UN-20，NULL（legacy 行）的执行判定归 UN-17。
+
+**恢复路径按消费面状态区分（forward-only，运行时无 down 入口）：**
+
+- **pre-consumer**（UN-20 未发布，列恒为空）：可由新迁移前滚删列。
+- **post-consumer**（列已在写入 requester）：**禁止无条件删列**——会丢失授权主体与审计数据。只能保留列并停用消费方，或以新列替代并复制数据。
+
+迁移模块内 `#[cfg(test)]` 覆盖：列为 nullable 且无默认值、既有行读回 NULL、隔离库内 `down` 删列后 `up` 可前滚回已发布状态。
+
+> 写迁移测试时注意：单元测试库按 **schema** 隔离（`search_path`，见 `src/jupiter/tests.rs`），而 `information_schema` / `pg_indexes` 跨全部 schema，因此目录查询必须带 `current_schema()` 限定，否则会读到并发用例的表。
+
 ## CI
 
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the

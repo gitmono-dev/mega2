@@ -80,6 +80,9 @@ impl MergeQueueStorage {
             error_message: Set(None),
             created_at: Set(now.naive_utc()),
             updated_at: Set(now.naive_utc()),
+            // UN-18 adds the column only; writing the requester through is
+            // UN-20's read/write chain, so it stays NULL here for now.
+            requester: Set(None),
         };
 
         new_item

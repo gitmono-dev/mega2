@@ -21,6 +21,10 @@ pub struct Model {
     pub error_message: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    /// Subject that requested the queued merge (UN-18). NULL on rows written
+    /// before the column existed; the execution decision for those legacy rows
+    /// is defined by UN-17.
+    pub requester: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
