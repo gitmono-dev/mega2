@@ -16,17 +16,14 @@ use crate::{
     },
     common::errors::{ApiError, MegaError},
     contract::policy::{
-        ActionEnum, context::CedarContext, entitystore::EntityStore, util::SaturnEUid,
+        ActionEnum,
+        builder::EntitySnapshot,
+        context::CedarContext,
+        enforcement::{Enforcement, EnforcementDecision, decide},
+        resource::resolve_resource,
+        util::SaturnEUid,
     },
 };
-
-// TODO: All users are temporary allowed during development stage
-const POLICY_CONTENT: &str = r#"
-permit (
-    principal,  
-    action,
-    resource
-);"#;
 
 /// Guarded endpoints, keyed by `{method, path}`: prefix → lowercase HTTP
 /// method → path pattern → action.
@@ -36,6 +33,10 @@ permit (
 /// while `POST`/`DELETE` on that same path change it. Keying on the path alone
 /// collapsed those into one action, so one of them was always mapped wrong.
 type EndPointConfig = HashMap<String, HashMap<String, HashMap<String, String>>>;
+
+/// Mount point of the API router the guard protects (`http_server.rs` nests it
+/// under this prefix).
+const API_PREFIX: &str = "/api/v1";
 static GURADED_ENDPOINTS: Lazy<EndPointConfig> = Lazy::new(|| {
     let endpoints_config_dict: &str = include_str!("guarded_endpoints.json");
     serde_json::from_str(endpoints_config_dict).unwrap_or_else(|e| {
@@ -50,6 +51,12 @@ static GURADED_ENDPOINTS: Lazy<EndPointConfig> = Lazy::new(|| {
 /// unmapped operation must not inherit another method's action.
 pub fn resolve_cl_action(method: &str, req_path: &str) -> Result<(ActionEnum, String), MegaError> {
     let cl_path_prefix = "/cl";
+    // The guard is a route layer on the router nested under `/api/v1`
+    // (`http_server.rs`), so a request arrives with that prefix while the
+    // mapping is written relative to the router. Without stripping it, no
+    // guarded path ever matched and every endpoint fell through as
+    // unprotected.
+    let req_path = req_path.strip_prefix(API_PREFIX).unwrap_or(req_path);
     // Avoid parsing request of non-CL endpoints
     if !req_path.starts_with(cl_path_prefix) {
         return Ok((ActionEnum::UnprotectedRequest, String::new()));
@@ -128,7 +135,178 @@ fn match_operation(
 }
 
 /// Principal id used when a request carries no authenticated subject.
-const ANONYMOUS_PRINCIPAL_ID: &str = "reader";
+///
+/// A reserved literal rather than a plausible username (ADR-UN-06 ⑤): the old
+/// `"reader"` fallback collided with a real account named `reader`, which would
+/// have handed every anonymous request that account's permissions. UN-14's
+/// builder refuses to let ACL input occupy this name.
+const ANONYMOUS_PRINCIPAL_ID: &str = "__anonymous__";
+
+/// What the guard evaluates the request against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardResource {
+    /// Repository path this request touches.
+    Path(String),
+    /// The mapping produced a CL link, but no such CL exists (or it could not
+    /// be read). There is no resource to authorize against, so this is
+    /// fail-closed under `enforce`.
+    UnknownLink(String),
+}
+
+impl GuardResource {
+    fn label(&self) -> &str {
+        match self {
+            Self::Path(path) => path,
+            Self::UnknownLink(link) => link,
+        }
+    }
+}
+
+/// Resolve the repository a guarded request acts on.
+///
+/// A mapped endpoint carrying a CL link resolves through `get_cl(link)` to the
+/// CL's real path (UN-10's unique index makes that an equality probe). Mapped
+/// endpoints without a link (`/cl/labels`, `/cl/assignees`) act on the monorepo
+/// root. A storage failure is treated exactly like a missing CL: the guard must
+/// not fall open just because the lookup failed.
+async fn resolve_guard_resource(state: &MonoApiServiceState, link: &str) -> GuardResource {
+    if link.is_empty() {
+        return GuardResource::Path("/".to_owned());
+    }
+    match state.storage.cl_storage().get_cl(link).await {
+        Ok(Some(cl)) => GuardResource::Path(cl.path),
+        Ok(None) => GuardResource::UnknownLink(link.to_owned()),
+        Err(error) => {
+            tracing::warn!(
+                event = "authz_resource_lookup_failed",
+                link = %link,
+                error = %error,
+                "CL lookup failed; treating the resource as unresolvable (fail-closed)"
+            );
+            GuardResource::UnknownLink(link.to_owned())
+        }
+    }
+}
+
+/// Pure three-state guard decision (ADR-UN-01/05, UN-08).
+///
+/// The request path is normalized to the single monorepo root repository
+/// (ADR-UN-05, UN-11); a missing root, an unresolvable CL link, or a policy
+/// engine error all count as would-deny. `shadow` allows but records it.
+pub fn decide_guard(
+    enforcement: Enforcement,
+    snapshot: &EntitySnapshot,
+    principal_type: &str,
+    principal_id: &str,
+    action: &str,
+    resource: &GuardResource,
+) -> Result<(), ApiError> {
+    let entity_store = snapshot.store();
+
+    let would_deny = match resource {
+        GuardResource::UnknownLink(_) => true,
+        GuardResource::Path(path) => {
+            let resolution = resolve_resource(path, entity_store);
+            match resolution.resource() {
+                None => true,
+                Some(resource_euid) => match CedarContext::new(entity_store.clone()) {
+                    Err(error) => {
+                        tracing::error!(
+                            event = "authz_policy_engine_error",
+                            error = %error,
+                            "policy engine unavailable; treating as would-deny"
+                        );
+                        true
+                    }
+                    Ok(cedar_context) => match guard_euids(principal_type, principal_id, action) {
+                        None => true,
+                        Some((principal, action_euid)) => cedar_context
+                            .is_authorized(
+                                &principal,
+                                &action_euid,
+                                resource_euid,
+                                Context::empty(),
+                            )
+                            .is_err(),
+                    },
+                },
+            }
+        }
+    };
+
+    if enforcement.records_would_deny() && would_deny {
+        tracing::warn!(
+            event = "authz_would_deny",
+            principal = %principal_id,
+            principal_type = %principal_type,
+            action = %action,
+            resource = %resource.label(),
+            "would-deny recorded: this request would be denied under enforce"
+        );
+    }
+
+    match decide(enforcement, would_deny, entity_store.is_empty()) {
+        EnforcementDecision::Allow => Ok(()),
+        EnforcementDecision::Deny => Err(authorization_denied(
+            principal_id,
+            action,
+            MegaError::Other("not authorized for this operation".to_owned()),
+        )),
+    }
+}
+
+/// Decision for a request that arrives before any snapshot exists.
+///
+/// Nothing can be authorized, so this is a would-deny: recorded under `shadow`
+/// with the same event and fields as every other one, denied under `enforce`.
+fn decide_without_snapshot(
+    enforcement: Enforcement,
+    principal_type: &str,
+    principal_id: &str,
+    action: &str,
+    resource: &GuardResource,
+) -> Result<(), ApiError> {
+    if enforcement.records_would_deny() {
+        tracing::warn!(
+            event = "authz_would_deny",
+            principal = %principal_id,
+            principal_type = %principal_type,
+            action = %action,
+            resource = %resource.label(),
+            reason = "store_not_built",
+            "would-deny recorded: this request would be denied under enforce"
+        );
+    }
+
+    match decide(enforcement, true, true) {
+        EnforcementDecision::Allow => Ok(()),
+        EnforcementDecision::Deny => Err(authorization_denied(
+            principal_id,
+            action,
+            MegaError::Other("authorization store not built".to_owned()),
+        )),
+    }
+}
+
+/// Build the Cedar principal/action ids, or `None` when either is not a valid
+/// entity id (which the caller treats as would-deny rather than as an allow).
+fn guard_euids(
+    principal_type: &str,
+    principal_id: &str,
+    action: &str,
+) -> Option<(SaturnEUid, SaturnEUid)> {
+    let principal_type = EntityTypeName::from_str(principal_type).ok()?;
+    let principal_id = EntityId::from_str(principal_id).ok()?;
+    let action_type = EntityTypeName::from_str("Action").ok()?;
+    let action_id = EntityId::from_str(action).ok()?;
+    Some((
+        SaturnEUid::from(EntityUid::from_type_name_and_id(
+            principal_type,
+            principal_id,
+        )),
+        SaturnEUid::from(EntityUid::from_type_name_and_id(action_type, action_id)),
+    ))
+}
 
 /// An authorization denial is **403, not 401** (UN-23).
 ///
@@ -199,13 +377,18 @@ pub async fn cedar_guard(
         return Ok(next.run(req).await);
     }
 
-    // TODO: Fetch repo path from CL model
-    // let cl_model = state
-    //     .cl_stg()
-    //     .get_cl(&link)
-    //     .await?
-    //     .ok_or_else(|| MegaError::with_message(format!("Change list not found for link: {}", link)))?;
-    // let repo_path: PathBuf = cl_model.path.into();
+    let enforcement =
+        Enforcement::parse(&state.storage.config().cedar.enforcement).ok_or_else(|| {
+            ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                MegaError::Other("invalid cedar.enforcement".to_owned()),
+            )
+        })?;
+
+    // `off`: no build, no consume — behavior identical to before (ADR-UN-01).
+    if !enforcement.builds() {
+        return Ok(next.run(req).await);
+    }
 
     let (mut parts, body) = req.into_parts();
 
@@ -215,16 +398,28 @@ pub async fn cedar_guard(
         .map(|bot| bot.bot.id.to_string());
     let (principal_type, principal_id) = guard_principal(&mut parts, &state, bot).await;
 
-    // let policy_path = repo_path.join("cedar/policies.cedar");
-    // let policy_content = get_blob_string(&state, &policy_path).await?;
-    let policy_content = POLICY_CONTENT.to_string();
+    let resource = resolve_guard_resource(&state, &link).await;
 
-    let entity_store = EntityStore::from_ref(&state);
-    let c = CedarContext::from(entity_store, &policy_content)?;
-
-    authorize(&c, &principal_type, &principal_id, &action.to_string())
-        .await
-        .map_err(|e| authorization_denied(&principal_id, &action.to_string(), e))?;
+    // A store that was never built cannot authorize anything. It takes the
+    // same path as any other would-deny — one event shape, one set of fields —
+    // so shadow-mode log processing does not need a special case.
+    match state.entity_store.snapshot() {
+        Some(snapshot) => decide_guard(
+            enforcement,
+            &snapshot,
+            &principal_type,
+            &principal_id,
+            &action.to_string(),
+            &resource,
+        )?,
+        None => decide_without_snapshot(
+            enforcement,
+            &principal_type,
+            &principal_id,
+            &action.to_string(),
+            &resource,
+        )?,
+    }
 
     let req = Request::from_parts(parts, body);
     let response = next.run(req).await;
@@ -238,38 +433,6 @@ pub async fn cedar_guard(
     }
 
     Ok(response)
-}
-
-async fn authorize(
-    cedar_context: &CedarContext,
-    principal_type: &str,
-    principal_id: &str,
-    action: &str,
-) -> Result<(), MegaError> {
-    let user_entity = EntityId::from_str(principal_id)?;
-    let action_entity = EntityId::from_str(action)?;
-
-    let role_entity = EntityTypeName::from_str(principal_type)?;
-    let actiontype_entity = EntityTypeName::from_str("Action")?;
-
-    let principal = SaturnEUid::from(EntityUid::from_type_name_and_id(role_entity, user_entity));
-    let action = SaturnEUid::from(EntityUid::from_type_name_and_id(
-        actiontype_entity,
-        action_entity,
-    ));
-    // TODO: repository is currently hardcoded to "0", need to change it to actual repo id
-    let resource = SaturnEUid::from(EntityUid::from_type_name_and_id(
-        EntityTypeName::from_str("Repository")?,
-        EntityId::from_str("0")?,
-    ));
-
-    let context = Context::empty();
-
-    cedar_context
-        .is_authorized(&principal, &action, &resource, context)
-        .map_err(|e| MegaError::Other(format!("Authorization failed: {}", e)))?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -526,6 +689,23 @@ mod tests {
         );
     }
 
+    /// The guard sits on the router nested under `/api/v1`, so this is the
+    /// shape a real request actually has. Without stripping the prefix the
+    /// resolver matched nothing and every endpoint fell through unprotected.
+    #[test]
+    fn un08_the_api_prefix_is_stripped_before_matching() {
+        let (action, link) = resolve_cl_action("GET", "/api/v1/cl/ABC123/detail").unwrap();
+        assert_eq!(action, ActionEnum::ViewRepo);
+        assert_eq!(link, "ABC123");
+
+        let (action, _) = resolve_cl_action("POST", "/api/v1/cl/ABC123/merge").unwrap();
+        assert_eq!(action, ActionEnum::ApproveMergeRequest);
+
+        // Non-CL paths under the same prefix stay unprotected.
+        let (action, _) = resolve_cl_action("POST", "/api/v1/merge-queue/add").unwrap();
+        assert_eq!(action, ActionEnum::UnprotectedRequest);
+    }
+
     #[test]
     fn un23_non_cl_paths_stay_unprotected() {
         let (action, _) = resolve_cl_action("POST", "/merge-queue/add").unwrap();
@@ -542,6 +722,234 @@ mod tests {
             action,
             ActionEnum::UnprotectedRequest,
             "merge-no-auth stays unmapped until UN-24"
+        );
+    }
+
+    // ---- UN-08: three-state guard evaluation ----
+
+    fn snapshot_with_admin(admin: &str) -> EntitySnapshot {
+        let json = crate::contract::policy::entitystore::generate_entity(&[admin.to_string()], "/")
+            .expect("generate authz json");
+        crate::contract::policy::builder::build_from_json(&json).expect("build snapshot")
+    }
+
+    fn empty_snapshot() -> EntitySnapshot {
+        crate::contract::policy::builder::build_from_json(
+            r#"{"users":{},"repos":{},"user_groups":{},"merge_requests":{},"issues":{}}"#,
+        )
+        .expect("build empty snapshot")
+    }
+
+    fn root_resource() -> GuardResource {
+        GuardResource::Path("/".to_owned())
+    }
+
+    #[test]
+    fn un08_shadow_allows_a_request_that_enforce_would_deny() {
+        let snapshot = snapshot_with_admin("admin-user");
+        // `outsider` is in no group, so `deleteRepo` is not permitted.
+        let shadow = decide_guard(
+            Enforcement::Shadow,
+            &snapshot,
+            "User",
+            "outsider",
+            "deleteRepo",
+            &root_resource(),
+        );
+        assert!(shadow.is_ok(), "shadow never changes the allow decision");
+
+        let enforced = decide_guard(
+            Enforcement::Enforce,
+            &snapshot,
+            "User",
+            "outsider",
+            "deleteRepo",
+            &root_resource(),
+        );
+        assert!(
+            enforced.is_err(),
+            "the same request must be denied under enforce"
+        );
+    }
+
+    #[test]
+    fn un08_enforce_allows_an_authorized_principal() {
+        let snapshot = snapshot_with_admin("admin-user");
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                "admin-user",
+                "deleteRepo",
+                &root_resource(),
+            )
+            .is_ok(),
+            "an admin keeps its admin-only action under enforce"
+        );
+    }
+
+    #[tokio::test]
+    async fn un08_an_enforced_denial_is_403() {
+        use axum::response::IntoResponse;
+
+        let snapshot = snapshot_with_admin("admin-user");
+        let error = decide_guard(
+            Enforcement::Enforce,
+            &snapshot,
+            "User",
+            "outsider",
+            "deleteRepo",
+            &root_resource(),
+        )
+        .expect_err("must deny");
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn un08_an_unknown_cl_link_is_fail_closed() {
+        let snapshot = snapshot_with_admin("admin-user");
+        let unknown = GuardResource::UnknownLink("NOSUCHCL".to_owned());
+
+        assert!(
+            decide_guard(
+                Enforcement::Shadow,
+                &snapshot,
+                "User",
+                "admin-user",
+                "viewRepo",
+                &unknown,
+            )
+            .is_ok(),
+            "shadow records but still allows"
+        );
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                "admin-user",
+                "viewRepo",
+                &unknown,
+            )
+            .is_err(),
+            "an unresolvable resource must be denied under enforce, even for an admin"
+        );
+    }
+
+    #[test]
+    fn un08_an_empty_store_denies_under_enforce() {
+        let snapshot = empty_snapshot();
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                "admin-user",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_err(),
+            "enforce + empty store = deny (fail-closed, ADR-UN-01)"
+        );
+        assert!(
+            decide_guard(
+                Enforcement::Shadow,
+                &snapshot,
+                "User",
+                "admin-user",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn un08_a_missing_root_repository_is_fail_closed() {
+        // Users but no repository entity: nothing to authorize against.
+        let json = serde_json::json!({
+            "users": { "User::\"solo\"": { "euid": "User::\"solo\"", "parents": [] } },
+            "repos": {},
+            "user_groups": {},
+            "merge_requests": {},
+            "issues": {}
+        })
+        .to_string();
+        let snapshot = crate::contract::policy::builder::build_from_json(&json)
+            .expect("build snapshot without a root repo");
+
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                "solo",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_err(),
+            "a missing root repository denies under enforce"
+        );
+    }
+
+    #[test]
+    fn un08_the_anonymous_principal_is_the_reserved_literal() {
+        assert_eq!(
+            ANONYMOUS_PRINCIPAL_ID, "__anonymous__",
+            "the anonymous fallback must be a reserved literal, not a name a real \
+             account could take (ADR-UN-06)"
+        );
+
+        // An ACL that grants `reader` admin must not thereby grant anonymous
+        // requests anything.
+        let snapshot = snapshot_with_admin("reader");
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                ANONYMOUS_PRINCIPAL_ID,
+                "deleteRepo",
+                &root_resource(),
+            )
+            .is_err(),
+            "the anonymous principal must not inherit an account's permissions"
+        );
+    }
+
+    #[test]
+    fn un08_a_principal_type_outside_the_schema_is_would_deny() {
+        // `Bot` is not a principal type in the schema; UN-27 owns bot
+        // authorization semantics. Until then it must fail closed, not open.
+        let snapshot = snapshot_with_admin("admin-user");
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "Bot",
+                "42",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn un08_any_repository_path_normalizes_to_the_single_root() {
+        // ADR-UN-05: a CL under /project inherits the root repository's ACL.
+        let snapshot = snapshot_with_admin("admin-user");
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                "admin-user",
+                "deleteRepo",
+                &GuardResource::Path("/project/sub".to_owned()),
+            )
+            .is_ok()
         );
     }
 

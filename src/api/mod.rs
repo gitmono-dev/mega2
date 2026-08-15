@@ -35,6 +35,8 @@ pub mod api_router;
 pub mod oauth;
 pub mod router;
 #[cfg(test)]
+mod un08_guard_enforcement;
+#[cfg(test)]
 mod un20_queue_requester;
 #[cfg(test)]
 mod un22_principal;

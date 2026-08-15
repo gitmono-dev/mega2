@@ -172,6 +172,20 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## guard 三态接线与真实资源解析（UN-08）
+
+`/api/v1` guard 从「与 store 无关的硬编码 permit-all」切换为对共享快照的真实三态评估：
+
+- 模式取自 `[cedar].enforcement`。`off` 直接短路——不取快照、不解析资源、不求值，行为与切换前完全一致。
+- `shadow` 真实评估并记录 would-deny（结构化字段 `event=authz_would_deny` / `principal` / `principal_type` / `action` / `resource`），但**不改变放行**。
+- `enforce` 拒绝并返回 403。
+- **路径前缀**：guard 是挂在 `/api/v1` 之下那层路由的 route layer，请求到达时路径带该前缀，而映射是相对路由写的。resolver 先剥掉 `/api/v1` 再匹配——此前没有剥，导致没有任何受保护路径能匹配上，guard 实际上从未拦过任何请求。
+- **资源解析**：带 CL link 的受保护端点经 `get_cl(link)` 解析出 `mega_cl.path`（UN-10 的唯一索引使之成为等值探测），再按 ADR-UN-05 归一到根仓库；不带 link 的（`/cl/labels`、`/cl/assignees`）直接作用于根。
+- **fail-closed 的三种情形**：link 查不到（含存储查询失败）、根仓库实体缺失、快照未构建——在 `enforce` 下一律拒绝，在 `shadow` 下记录并放行。principal 类型不在 schema 内（如 Bot）同样按 would-deny 处理，其语义归 UN-27。
+- **匿名主体**是保留字 `User::"__anonymous__"`（ADR-UN-06 ⑤）而不是 `"reader"`：后者与真实账号名冲突，一旦有人注册 `reader`，匿名请求就会继承该账号的权限。
+
+`decide_guard` 是纯函数（与 push 面的 `decide_push` 同形），三态 × principal × 资源可解析性的矩阵在其上逐条断言。
+
 ## guard 映射 `{method,path}` 键与路由对齐（UN-23）
 
 `guarded_endpoints.json` 的键从 path 升级为 `{method, path}`（前缀 → 小写方法 → 路径模式 → action），resolver `resolve_cl_action(method, path)` 接收方法参与匹配。同一路径的不同方法本就是不同 action——`GET /cl/{link}/reviewers` 只读取评审人列表，`POST`/`DELETE` 则修改它——只按 path 归一时，三者里必然有两个被映射错。未登记的 `{method,path}` 视为 unprotected，且**不继承**同路径其它方法的 action。
@@ -188,6 +202,6 @@
 - `resolve_session_principal(parts, store)` 是唯一解析入口：命中缓存直接返回；未命中则解析一次并回填。
 - **三种来源结果归一为一个值**：有会话 → `Some(user)`；无会话与 store 故障 → `None`。归一故障保持既有行为（查询失败一直按「未登录」处理，ADR-WA-03），但在解析点保留 warn 日志。
 - 消费方：`SessionUser` / `LoginUser`（`None` → `AuthRedirect`，行为不变）、新增的 `OptionalSessionUser`（匿名 → `None`，**永不返回 401**）、以及 guard 的 `guard_principal`（`src/contract/policy/guard/cedar_guard.rs`）。
-- guard 侧 Bot 分支保持既有优先级（其授权语义归 UN-27）；Bot 请求不解析浏览器会话。匿名请求在 guard 侧是一个主体（`User::"reader"`）而不是拒绝——是否放行由策略决定。
+- guard 侧 Bot 分支保持既有优先级（其授权语义归 UN-27）；Bot 请求不解析浏览器会话。匿名请求在 guard 侧是一个主体而不是拒绝——是否放行由策略决定；该主体是保留字 `User::"__anonymous__"`（UN-08 起，ADR-UN-06 ⑤）。
 
 测试用 `CountingSessionStore` 双：它**每次调用返回不同用户**，因此「两个消费方得到同一答案」只可能来自缓存——用固定用户的 double 无法证伪。
