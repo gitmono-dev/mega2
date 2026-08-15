@@ -316,3 +316,15 @@
 - **最终保险**：`ReadonlyBackend`（`src/vault/storage/readonly.rs`）包住物理 backend，`put`/`delete` 一律硬失败并计数。它是最后一道而不是第一道——上面每条路径都能被 review、也都可能漂移，这一层则没有通往被包 backend 的路径。**拒绝必须是错误，不能是静默 no-op**：被吞掉的写会让调用方以为状态已持久化。`VaultCore::denied_writes()` 暴露计数，正常只读运行应当为 0；非 0 意味着上层仍有人尝试写、只是被这层拦住了。
 
 测试（`src/vault/un31_readonly.rs`）**成对**写：可写侧证明该修补对这份 storage 确实会发生，只读侧证明它没发生。单侧断言在一个「本来就没什么可修」的 fixture 上同样会通过。后台线程是**直接断言**（`mounts_monitor.is_none()`、`ExpirationManager::is_lease_checker_started()`），不是从「没观察到副作用」倒推——后者只是和 200ms tick 赛跑。
+
+## `JupiterBackend::list` 的契约（FIX-04）
+
+barrier view 按**层**遍历后端：`BarrierView::get_keys()` 向某个 prefix 要它的**直接子项**，对以 `/` 结尾的名字递归，其余当作**相对于该 prefix** 的叶子。`physical::file::FileBackend` 正是这么答的；`JupiterBackend` 原先直接转发 `VaultStorage::list_keys` 的 `LIKE 'prefix%'` 结果——**递归的完整 key**。于是被遍历出来的每个「叶子」在随后的 `get` 上会二次拼前缀而必然落空。
+
+这不是外观差异：`ExpirationManager::restore()` 就是这样遍历租约视图的，因此在数据库后端下**重启恢复不到任何租约**，过期租约永远不会被撤销；`PolicyStore` 的类型表与 `list_policy` 键值同样错误；`Core::migrate()` 按 `key.ends_with("/")` 递归，也不会进入子目录。
+
+修正是在 `JupiterBackend::list` 里做投影：`strip_prefix` 后取到第一个 `/` 为止，子目录补 `/`，去重排序。这同时收住了 `LIKE` 模式——`_` 与 `%` 对 Postgres 是通配符、对 vault key 只是普通字符，扫描会返回「形似」的 key，而 `strip_prefix` 是精确匹配。
+
+prefix 也接受「目录名但不带尾部 `/`」的形状——`TokenStore::revoke_tree_salted` 遍历某个 token 的子节点时传的就是 `parent/<id>`——因此投影前先剥掉余下部分的前导 `/`；否则子项名会变成一个裸 `/`，遍历在第一层就停住。
+
+**契约只对段对齐的 prefix（空、以 `/` 结尾，或恰好是一个目录名）定义**，这也是 barrier view 唯一会产生的形状。对停在名字中间的 prefix，两个后端确实不同（文件后端把 prefix 当目录路径解析，因而列不出东西）；这一边界有具名用例记录，不是留给后来者去撞。

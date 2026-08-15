@@ -45,6 +45,8 @@ use crate::{
 pub mod config;
 pub mod context;
 pub mod core;
+#[cfg(test)]
+mod fix04_list_contract;
 pub mod handler;
 pub mod logical;
 pub mod module_manager;
