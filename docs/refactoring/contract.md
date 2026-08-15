@@ -328,3 +328,12 @@ barrier view 按**层**遍历后端：`BarrierView::get_keys()` 向某个 prefix
 prefix 也接受「目录名但不带尾部 `/`」的形状——`TokenStore::revoke_tree_salted` 遍历某个 token 的子节点时传的就是 `parent/<id>`——因此投影前先剥掉余下部分的前导 `/`；否则子项名会变成一个裸 `/`，遍历在第一层就停住。
 
 **契约只对段对齐的 prefix（空、以 `/` 结尾，或恰好是一个目录名）定义**，这也是 barrier view 唯一会产生的形状。对停在名字中间的 prefix，两个后端确实不同（文件后端把 prefix 当目录路径解析，因而列不出东西）；这一边界有具名用例记录，不是留给后来者去撞。
+
+## 只读命令的配置预检与来源链（UN-34）
+
+`ConfigLoader::load()` 在无源可解析时会**写出**一份默认 `config.toml` 并在 stderr 上像报好消息一样告诉你。对只读命令这有两重问题：它改动了自己被要求观察的那台系统；而且此后它报告的一切描述的是**本进程刚发明**的配置，不是服务器实际在跑的那份。
+
+- `ConfigLoader::load_readonly()`（`src/config/loader.rs`）两种情况都拒绝：**具名**源（`--config` / `MEGA_CONFIG`）指向不存在的文件——`load()` 原样把这个路径交回去（该路径上没有任何存在性检查），失败要到两层之下才以读取/解析错误的形式冒出来，描述的是错误的问题；以及一个源都解析不到——**这才是** `load()` 会生成默认文件的那一支。`cwd` / `global` 是**因为文件存在**才被选中的，无需再查；profile 不存在照常拒绝——只读入口不放松任何既有校验。
+- `load_readonly_with_ambient(cwd, global)` 把两个环境相关的查找作为参数传入。这不是为了灵活性：ambient 源读进程 CWD 与 `MEGA_BASE_DIR`，测试既不能假设也不能安全改动它们（并行测试二进制里改 env 正是「单跑通过、全量跑失败」那一类），把它们外提才能就「什么都解析不到」这一支做出断言。
+- `CommandContext.config_summary: Option<LoadedConfigSummary>`（`src/commands/mod.rs`）携带 loader **实际解析出的**来源，而不是在下游从命令行重新推导——重新推导得到的是意图，不是结果。`LoadMode::None` 没有加载任何配置，因此是 `None`：一个空摘要等于对一份本进程从未读过的配置作出断言。
+- `paths` 只供运维诊断。进入报告的是 `LoadedConfigSummary::sanitized()` → `SanitizedSourceSummary`，**JSON 表示冻结**为 `{"source": "cli"|"env"|"cwd"|"global"|"default_generated", "profile": <string|null>}`：唯一表示、无路径、无可选字段——消费方要在若干种形状之间猜的话就没法比对两份报告了。无 profile 是显式 `null` 而不是缺键。丢掉路径是目的本身：配置路径描述文件系统布局，profile 路径可能直接点名部署环境，两者都不该出现在会流转的产物里（ER-11）。用例断言的是**序列化后的文本**，因此改名或新增字段会在这里失败，而不是在明年读这份报告的地方失败。

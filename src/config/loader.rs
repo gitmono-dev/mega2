@@ -11,13 +11,29 @@ use crate::{
     config::{mega_base, template::default_config_template},
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
     Cli,
     Env,
     Cwd,
     Global,
     DefaultGenerated,
+}
+
+impl ConfigSource {
+    /// The wire name of this source.
+    ///
+    /// Frozen (UN-34): it is the `source` field of the sanitized provenance
+    /// summary that audit reports embed, so a consumer can key off it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::Cwd => "cwd",
+            Self::Global => "global",
+            Self::DefaultGenerated => "default_generated",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +71,101 @@ pub struct ConfigLoader {
 impl ConfigLoader {
     pub fn new(input: ConfigInput) -> Self {
         Self { input }
+    }
+
+    /// Resolve the config without creating anything (UN-34).
+    ///
+    /// [`Self::load`] writes a default `config.toml` when no source resolves,
+    /// and reports it on stderr as if that were a courtesy. For a read-only
+    /// command it is a side effect on the very system it was asked to observe,
+    /// and the config it would then read is one this process just invented
+    /// rather than the one the server runs on. Both cases are refused here:
+    ///
+    /// * an explicit `--config` (or `MEGA_CONFIG`) naming a file that does not
+    ///   exist — `load` hands the path back regardless and the failure surfaces
+    ///   later as a read or parse error, which describes the wrong problem;
+    /// * no source at all, which is where the generation happens.
+    ///
+    /// A profile that does not exist is still rejected by `loaded_config`, as
+    /// on the normal path.
+    pub fn load_readonly(&self) -> Result<LoadedConfig> {
+        self.load_readonly_with_ambient(Self::cwd_config_path()?, Self::global_config_path()?)
+    }
+
+    /// The body of [`Self::load_readonly`], with the two ambient lookups passed
+    /// in.
+    ///
+    /// The ambient sources read the process's current directory and
+    /// `MEGA_BASE_DIR`. Neither is something a test may assume or safely change
+    /// — mutating the environment under a parallel test binary is exactly the
+    /// kind of order-dependent fixture that passes alone and fails in a full
+    /// run. Taking them as arguments is what lets the "nothing resolves at all"
+    /// branch be exercised for what it is.
+    ///
+    /// Private on purpose: the only production entry point is
+    /// [`Self::load_readonly`], which supplies the real lookups. A caller that
+    /// could pass its own ambient paths could pass one that does not exist and
+    /// slip past the existence check the named sources get.
+    fn load_readonly_with_ambient(
+        &self,
+        cwd_path: Option<PathBuf>,
+        global_path: Option<PathBuf>,
+    ) -> Result<LoadedConfig> {
+        let profile_name = self.profile_name()?;
+
+        if let Some(path) = &self.input.cli_path {
+            return self.readonly_loaded_config(path.clone(), ConfigSource::Cli, profile_name);
+        }
+
+        if let Some(path) = &self.input.env_path {
+            return self.readonly_loaded_config(path.clone(), ConfigSource::Env, profile_name);
+        }
+
+        if let Some(path) = cwd_path {
+            return self.loaded_config(path, ConfigSource::Cwd, profile_name);
+        }
+
+        if let Some(path) = global_path {
+            return self.loaded_config(path, ConfigSource::Global, profile_name);
+        }
+
+        anyhow::bail!(
+            "no config file was found, and a read-only command will not generate a default one; \
+             pass --config <path> or set MEGA_CONFIG"
+        )
+    }
+
+    /// The `cwd` and `global` sources are only chosen because the file was
+    /// found; `cli` and `env` are chosen because they were *named*, and nothing
+    /// on the normal path checks that the named file is there. Saying so at the
+    /// point of resolution beats a parse error two layers down.
+    fn readonly_loaded_config(
+        &self,
+        path: PathBuf,
+        source: ConfigSource,
+        profile_name: Option<String>,
+    ) -> Result<LoadedConfig> {
+        if !path.exists() {
+            anyhow::bail!(
+                "config file `{}` (from {}) does not exist; a read-only command will not \
+                 generate a default one",
+                path.display(),
+                source.as_str()
+            );
+        }
+
+        self.loaded_config(path, source, profile_name)
+    }
+
+    /// [`Self::load_readonly_with_ambient`], reachable from this crate's tests
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn load_readonly_with_ambient_for_test(
+        &self,
+        cwd_path: Option<PathBuf>,
+        global_path: Option<PathBuf>,
+    ) -> Result<LoadedConfig> {
+        self.load_readonly_with_ambient(cwd_path, global_path)
     }
 
     /// Load config path, create default config if not exists

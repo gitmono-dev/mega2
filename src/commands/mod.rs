@@ -1,14 +1,17 @@
 pub mod config;
 pub mod debug;
 pub mod service;
+#[cfg(test)]
+mod un34_readonly_config;
 
 use std::path::PathBuf;
 
 use clap::{ArgMatches, Command};
+use serde::Serialize;
 
 use crate::{
     common::errors::{MegaError, MegaResult},
-    config::Config,
+    config::{Config, loader::ConfigSource},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,11 +24,62 @@ pub(crate) enum LoadMode {
     FullAppContext,
 }
 
+/// Where the config this process is running on came from (UN-34).
+///
+/// A read-only report is only worth as much as the reader's ability to tell
+/// *which* configuration it describes. Carrying the provenance alongside the
+/// parsed config is what lets a report say so instead of leaving the reader to
+/// reconstruct it from the command line.
+///
+/// `paths` is for operator diagnostics only. It never enters a report or any
+/// acceptance evidence (ER-11) — [`Self::sanitized`] is the shape that does, and
+/// it has no path field to leak one.
+#[derive(Debug, Clone)]
+pub struct LoadedConfigSummary {
+    pub source: ConfigSource,
+    pub profile_name: Option<String>,
+    pub paths: LoadedConfigPaths,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedConfigPaths {
+    pub config: PathBuf,
+    pub profile: Option<PathBuf>,
+}
+
+/// The provenance summary as it appears in a report.
+///
+/// The JSON representation is frozen (UN-34): `{"source": "cli"|"env"|"cwd"|
+/// "global"|"default_generated", "profile": <string|null>}`. One representation,
+/// no paths, no options — a consumer that has to guess which of several shapes
+/// it received cannot compare two reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SanitizedSourceSummary {
+    pub source: &'static str,
+    pub profile: Option<String>,
+}
+
+impl LoadedConfigSummary {
+    /// The path-free projection that reports embed.
+    ///
+    /// Dropping the paths is the point: a config path names a filesystem
+    /// layout, and a profile path can name a deployment. Neither belongs in an
+    /// artifact that travels.
+    pub fn sanitized(&self) -> SanitizedSourceSummary {
+        SanitizedSourceSummary {
+            source: self.source.as_str(),
+            profile: self.profile_name.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CommandContext {
     pub config: Option<Config>,
     pub config_path: Option<PathBuf>,
     pub config_profile_path: Option<PathBuf>,
+    /// Provenance of the config above, when one was loaded at all.
+    pub config_summary: Option<LoadedConfigSummary>,
 }
 
 pub(crate) type CommandExec = fn(CommandContext, &ArgMatches) -> MegaResult;

@@ -19,7 +19,10 @@ use tracing_subscriber::{
 };
 
 use crate::{
-    commands::{CommandContext, LoadMode, builtin, builtin_exec, load_mode, unknown_subcommand},
+    commands::{
+        CommandContext, LoadMode, LoadedConfigPaths, LoadedConfigSummary, builtin, builtin_exec,
+        load_mode, unknown_subcommand,
+    },
     common::errors::{MegaError, MegaResult},
     config::{
         Config, LogConfig,
@@ -63,14 +66,19 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
             config: None,
             config_path: matches.get_one::<PathBuf>("config").cloned(),
             config_profile_path: None,
+            // Nothing was loaded, so there is no provenance to report. An empty
+            // summary would be a claim about a config this process never read.
+            config_summary: None,
         },
         LoadMode::ConfigPath | LoadMode::RawSources | LoadMode::VaultBootstrap => {
             let loaded = load_config_path(&matches)?;
+            let config_summary = summarize(&loaded);
             let config_profile_path = loaded.profile.map(|profile| profile.path);
             CommandContext {
                 config: None,
                 config_path: Some(loaded.path),
                 config_profile_path,
+                config_summary: Some(config_summary),
             }
         }
         LoadMode::ParsedConfig | LoadMode::FullAppContext => {
@@ -81,10 +89,12 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
                 path = %loaded.path.display(),
                 "config loaded"
             );
+            let config_summary = summarize(&loaded);
             CommandContext {
                 config: Some(config),
                 config_path: Some(loaded.path),
                 config_profile_path: loaded.profile.map(|profile| profile.path),
+                config_summary: Some(config_summary),
             }
         }
     };
@@ -92,6 +102,22 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
     install_ctrlc_handler();
 
     exec_subcommand(ctx, cmd, subcommand_args)
+}
+
+/// Carry the loader's own answer forward instead of re-deriving it.
+///
+/// Re-deriving provenance downstream from the command line would give the
+/// *intent*; this is what the loader actually resolved, which is what a report
+/// has to describe.
+fn summarize(loaded: &LoadedConfig) -> LoadedConfigSummary {
+    LoadedConfigSummary {
+        source: loaded.source,
+        profile_name: loaded.profile.as_ref().map(|profile| profile.name.clone()),
+        paths: LoadedConfigPaths {
+            config: loaded.path.clone(),
+            profile: loaded.profile.as_ref().map(|profile| profile.path.clone()),
+        },
+    }
 }
 
 fn load_config_path(matches: &ArgMatches) -> Result<LoadedConfig, MegaError> {
