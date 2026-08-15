@@ -44,6 +44,8 @@ mod un22_principal;
 mod un24_merge_authz;
 #[cfg(test)]
 mod un25_service_unavailable;
+#[cfg(test)]
+mod un27_bot_authz;
 
 #[derive(Clone)]
 pub struct MonoApiServiceState {

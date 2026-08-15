@@ -551,6 +551,107 @@ mod tests {
         assert_eq!(counter.call_count(), 1);
     }
 
+    // ---- UN-27: bot principals under the three states ----
+
+    /// A bot is not a principal type the schema knows: every action's principal
+    /// is `User` (`mega.cedarschema`). Evaluating a `Bot::"…"` principal
+    /// therefore cannot produce an allow, and the guard treats it as would-deny
+    /// rather than as an error to swallow. Bots using protected CL endpoints
+    /// must move to a user token before `enforce` is switched on; the full bot
+    /// authorization model (schema plus identity mapping) is deferred.
+    #[test]
+    fn un27_a_bot_principal_is_denied_under_enforce() {
+        let snapshot = snapshot_with_admin("admin-user");
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "Bot",
+                "42",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_err(),
+            "the schema has no Bot principal, so enforce must refuse rather than \
+             silently allow"
+        );
+    }
+
+    #[test]
+    fn un27_a_bot_principal_still_passes_under_shadow() {
+        let snapshot = snapshot_with_admin("admin-user");
+        assert!(
+            decide_guard(
+                Enforcement::Shadow,
+                &snapshot,
+                "Bot",
+                "42",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_ok(),
+            "shadow records the would-deny but must not change what runs — which \
+             is what gives bot owners a window to migrate"
+        );
+    }
+
+    // On the shadow would-deny record for bots: the emitting callsite is
+    // `decide_guard`'s, already asserted by UN-08's shadow-log gate and its
+    // structured-field script. Capturing it a second time from here proved
+    // order-fragile — tracing caches a callsite's interest the first time it is
+    // evaluated, so whichever test in this binary installs a subscriber first
+    // decides whether later ones can observe it. A test that passes alone and
+    // fails in a full run is worse than the division of labor.
+
+    #[test]
+    fn un27_a_bot_principal_is_unaffected_under_off() {
+        // `off` never reaches evaluation at all; asserted here so the
+        // three-state story for bots is complete in one place.
+        let snapshot = snapshot_with_admin("admin-user");
+        assert!(
+            decide_guard(
+                Enforcement::Off,
+                &snapshot,
+                "Bot",
+                "42",
+                "viewRepo",
+                &root_resource(),
+            )
+            .is_ok()
+        );
+    }
+
+    /// Even an ACL that names a user `42` must not lend its permissions to
+    /// `Bot::"42"` — the principal *type* is part of the identity.
+    #[test]
+    fn un27_a_bot_does_not_inherit_a_same_named_users_permissions() {
+        let snapshot = snapshot_with_admin("42");
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "User",
+                "42",
+                "deleteRepo",
+                &root_resource(),
+            )
+            .is_ok(),
+            "the user named 42 is an admin"
+        );
+        assert!(
+            decide_guard(
+                Enforcement::Enforce,
+                &snapshot,
+                "Bot",
+                "42",
+                "deleteRepo",
+                &root_resource(),
+            )
+            .is_err(),
+            "the bot with id 42 is not that user"
+        );
+    }
+
     #[tokio::test]
     async fn un22_guard_principal_keeps_bot_precedence_without_a_session_lookup() {
         let (state, counter) = counting_state(vec![Ok(Some(login_user("session-user")))]);

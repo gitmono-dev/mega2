@@ -172,6 +172,20 @@
 
 组层级为 admin → matainer → reader（`matainer` 为历史拼写现状，DEFER-UN-06）。
 
+## Bot 主体授权语义（UN-27）
+
+`mega.cedarschema` 里**每个 action 的 principal 都只有 `User`**，而 guard 把 bot 构造成 `Bot::"<id>"`——这不是 schema 认识的主体类型。因此（ADR-UN-06 ⑥）：
+
+- `enforce`：bot 主体在受保护端点求值为 **deny**（fail-closed，不是「求值出错就放行」）。
+- `shadow`：记录 would-deny 但仍放行——这个窗口正是 bot 所有者迁移到用户 token 的时间。
+- `off`：短路，与任何主体一样零变化。
+
+**过渡语义（公示）**：在切到 `enforce` 之前，使用受保护 CL 面的 bot 必须迁移到用户 token。完整的 bot 授权模型（schema 扩展 + 身份映射）归 DEFER-UN-01 后续设计。
+
+主体**类型**是身份的一部分：即便 ACL 里存在同名用户 `42`，`Bot::"42"` 也不会继承其权限（`un27_a_bot_does_not_inherit_a_same_named_users_permissions`）。
+
+解析顺序不变（UN-22 保证先 `BotIdentity` 后 session），并且 **bot 请求不产生任何 session store 调用**——用例用计数 double 断言为 0，而不是依赖代码顺序；非 bot 的 bearer 不会被误认成 bot，仍走一次会话解析。
+
 ## ACL 可信基线审计核心（UN-26）
 
 打开 enforcement 等于信任 ACL 当前的内容。如果它在无人执行期间被改过，切到 `enforce` 只会把这次篡改固化——因此进入 shadow 前必须把 ACL 与**经具名审批的基线**比对一次。
