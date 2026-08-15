@@ -118,11 +118,24 @@ pub async fn handle_v2_ls_refs(
     Ok(buf)
 }
 
+/// Response of a protocol v2 `fetch` command.
+///
+/// A negotiation round that ends after the `acknowledgments` section carries no
+/// packfile at all (`gitprotocol-v2`: `output = acknowledgments flush-pkt | …
+/// packfile flush-pkt`), so `has_packfile` tells the transport whether it may
+/// append a packfile section — appending one unconditionally would emit a
+/// section after the round's flush packet.
+pub struct V2FetchResponse {
+    pub pack_data: ReceiverStream<Vec<u8>>,
+    pub protocol_buf: BytesMut,
+    pub has_packfile: bool,
+}
+
 pub async fn handle_v2_fetch(
     session: &mut SmartSession,
     state: &ProtocolApiState,
     request: &mut Bytes,
-) -> Result<(ReceiverStream<Vec<u8>>, BytesMut), ProtocolError> {
+) -> Result<V2FetchResponse, ProtocolError> {
     let mut want: HashSet<String> = HashSet::new();
     let mut have: HashSet<String> = HashSet::new();
     let mut deepen_depth: Option<u32> = None;
@@ -166,12 +179,6 @@ pub async fn handle_v2_fetch(
         }
     }
 
-    if !done {
-        return Err(ProtocolError::InvalidInput(
-            "fetch command missing done marker".to_owned(),
-        ));
-    }
-
     let repo_handler = session
         .repo_handler_with_commands(state, Vec::new())
         .await?;
@@ -213,6 +220,36 @@ pub async fn handle_v2_fetch(
     let mut protocol_buf = BytesMut::new();
     let mut shallow_commits: Vec<String> = Vec::new();
 
+    // Protocol v2 negotiation. When the client has *not* sent `done` this is a
+    // negotiation round, and the response must open with an `acknowledgments`
+    // section — git's fetch-pack dies with "expected 'acknowledgments'"
+    // otherwise. When the client *has* sent `done` the section must be omitted
+    // entirely, because fetch-pack then jumps straight to the packfile section.
+    if !done {
+        let mut acked: Vec<String> = Vec::new();
+        for hash in &have {
+            if repo_handler.check_commit_exist(hash).await {
+                acked.push(hash.clone());
+            }
+        }
+        // A common commit is a usable cut point, so negotiation can end right
+        // here (`ready`) and the packfile follows in this same response.
+        // Otherwise the round ends after the section and the client sends
+        // another one (eventually with `done`).
+        let ready = !acked.is_empty();
+        add_acknowledgments_section(&mut protocol_buf, &acked, ready);
+        if !ready {
+            // The round ends with the section's flush packet; no packfile
+            // section may follow it.
+            let (_, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+            return Ok(V2FetchResponse {
+                pack_data: ReceiverStream::new(rx),
+                protocol_buf,
+                has_packfile: false,
+            });
+        }
+    }
+
     let pack_data = if let Some(ref spec) = filter_spec {
         repo_handler
             .filtered_pack(want.clone(), have.clone(), spec)
@@ -237,20 +274,6 @@ pub async fn handle_v2_fetch(
                 .map_err(|e| ProtocolError::InvalidInput(format!("pack generation failed: {e}")))?
         }
     } else {
-        let mut last_common_commit = String::new();
-        for hash in &have {
-            if repo_handler.check_commit_exist(hash).await {
-                add_pkt_line_string(&mut protocol_buf, format!("ACK {hash}\n"));
-                if last_common_commit.is_empty() {
-                    last_common_commit = hash.to_string();
-                }
-            }
-        }
-        if last_common_commit.is_empty() {
-            add_pkt_line_string(&mut protocol_buf, String::from("NAK\n"));
-            let (_, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-            return Ok((ReceiverStream::new(rx), protocol_buf));
-        }
         repo_handler
             .incremental_pack(want.clone(), have)
             .await
@@ -259,7 +282,41 @@ pub async fn handle_v2_fetch(
 
     add_shallow_info_section(&mut protocol_buf, &shallow_commits);
 
-    Ok((pack_data, protocol_buf))
+    Ok(V2FetchResponse {
+        pack_data,
+        protocol_buf,
+        has_packfile: true,
+    })
+}
+
+/// Write the protocol v2 `acknowledgments` section.
+///
+/// A fetch request that omits `done` is a negotiation round, and git's
+/// fetch-pack reads the response with `process_section_header(.., "acknowledgments")`
+/// — a response that goes straight to the packfile makes it abort with
+/// `fatal: expected 'acknowledgments'`. Conversely, a request that carries
+/// `done` must NOT get this section: fetch-pack then jumps directly to the
+/// packfile section.
+///
+/// `ready` tells the client that a cut point was found and the packfile
+/// sections follow in this same response; it is terminated by a delimiter
+/// packet. Without `ready` the response ends here (flush packet) and the client
+/// negotiates another round.
+pub fn add_acknowledgments_section(buf: &mut BytesMut, acked: &[String], ready: bool) {
+    add_pkt_line_string(buf, "acknowledgments\n".to_owned());
+    if acked.is_empty() {
+        add_pkt_line_string(buf, "NAK\n".to_owned());
+    } else {
+        for hash in acked {
+            add_pkt_line_string(buf, format!("ACK {hash}\n"));
+        }
+    }
+    if ready {
+        add_pkt_line_string(buf, "ready\n".to_owned());
+        buf.put(Bytes::from_static(smart::PKT_LINE_DELIMITER));
+    } else {
+        buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
+    }
 }
 
 pub fn add_shallow_info_section(buf: &mut BytesMut, shallow_commits: &[String]) {
@@ -393,6 +450,30 @@ mod tests {
         add_packfile_section_header(&mut buf);
 
         assert_eq!(&buf[..], b"000dpackfile\n");
+    }
+
+    #[test]
+    fn add_acknowledgments_section_nak_round_ends_with_flush() {
+        // No common commit: the section must still open with the header (git
+        // dies with "expected 'acknowledgments'" otherwise) and the round ends
+        // with a flush packet — no `ready`, no packfile.
+        let mut buf = BytesMut::new();
+        add_acknowledgments_section(&mut buf, &[], false);
+
+        assert_eq!(&buf[..], b"0014acknowledgments\n0008NAK\n0000");
+    }
+
+    #[test]
+    fn add_acknowledgments_section_ready_round_ends_with_delim() {
+        // A common commit was found: ACK it, announce `ready`, and terminate
+        // with a delimiter so the packfile sections continue this response.
+        let mut buf = BytesMut::new();
+        add_acknowledgments_section(&mut buf, &["1234567890abcdef".to_owned()], true);
+
+        assert_eq!(
+            &buf[..],
+            b"0014acknowledgments\n0019ACK 1234567890abcdef\n000aready\n0001"
+        );
     }
 
     #[test]

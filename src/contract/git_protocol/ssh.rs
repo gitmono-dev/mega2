@@ -588,17 +588,26 @@ async fn handle_v2_upload_pack_ssh(
             let _ = session.data(channel, refs.to_vec());
         }
         "fetch" => {
-            let (mut send_pack_data, protocol_buf) =
-                match v2::handle_v2_fetch(&mut state.smart_protocol, api_state, body).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::error!(error = %e, "v2 fetch error");
-                        let _ = session.data(channel, format!("error: {e}\n").into_bytes());
-                        return;
-                    }
-                };
+            let v2::V2FetchResponse {
+                pack_data: mut send_pack_data,
+                protocol_buf,
+                has_packfile,
+            } = match v2::handle_v2_fetch(&mut state.smart_protocol, api_state, body).await {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(error = %e, "v2 fetch error");
+                    let _ = session.data(channel, format!("error: {e}\n").into_bytes());
+                    return;
+                }
+            };
 
             let mut protocol_buf = protocol_buf;
+            if !has_packfile {
+                // Negotiation round: the `acknowledgments` section already
+                // closed the response with its flush packet.
+                let _ = session.data(channel, protocol_buf.to_vec());
+                return;
+            }
             v2::add_packfile_section_header(&mut protocol_buf);
             let _ = session.data(channel, protocol_buf.to_vec());
 

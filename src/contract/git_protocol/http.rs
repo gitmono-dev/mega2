@@ -282,11 +282,20 @@ async fn handle_v2_upload_pack(
             Ok(response)
         }
         "fetch" => {
-            let (mut send_pack_data, protocol_buf) =
-                v2::handle_v2_fetch(session, state, body).await?;
+            let v2::V2FetchResponse {
+                pack_data: mut send_pack_data,
+                protocol_buf,
+                has_packfile,
+            } = v2::handle_v2_fetch(session, state, body).await?;
 
             let body_stream = async_stream::stream! {
                 let mut protocol_buf = protocol_buf;
+                if !has_packfile {
+                    // Negotiation round: the `acknowledgments` section already
+                    // closed the response with its flush packet.
+                    yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
+                    return;
+                }
                 v2::add_packfile_section_header(&mut protocol_buf);
                 yield Ok::<_, Infallible>(Bytes::copy_from_slice(&protocol_buf));
                 while let Some(chunk) = send_pack_data.next().await {
