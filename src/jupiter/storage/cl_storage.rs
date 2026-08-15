@@ -450,3 +450,56 @@ impl ClStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ConnectionTrait;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::jupiter::{
+        migration::apply_migrations, storage::base_storage::BaseStorage, tests::test_db_connection,
+    };
+
+    /// UN-10 regression: `get_cl` looks a CL up by `link` alone. After the
+    /// unique index lands the lookup is an index equality probe, and the
+    /// uniqueness it relies on is now enforced by the database rather than
+    /// assumed.
+    #[tokio::test]
+    async fn get_cl_resolves_a_link_to_its_single_row() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let conn = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&conn, true).await.expect("migrations");
+
+        conn.execute_unprepared(
+            "INSERT INTO mega_cl \
+             (id, link, title, status, path, from_hash, to_hash, created_at, updated_at, \
+              username, base_branch) \
+             VALUES (950001, 'UN10GETCL', 'un10 get_cl', 'open', '/', 'from', 'to', now(), \
+             now(), 'un10-user', 'main')",
+        )
+        .await
+        .expect("insert CL row");
+
+        let storage = ClStorage {
+            base: BaseStorage::new(std::sync::Arc::new(conn)),
+        };
+
+        let found = storage
+            .get_cl("UN10GETCL")
+            .await
+            .expect("get_cl query")
+            .expect("the seeded CL is found by its link");
+        assert_eq!(found.id, 950_001);
+        assert_eq!(found.path, "/");
+
+        assert!(
+            storage
+                .get_cl("UN10MISSING")
+                .await
+                .expect("get_cl query")
+                .is_none(),
+            "an unknown link resolves to no row"
+        );
+    }
+}
