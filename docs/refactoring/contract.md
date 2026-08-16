@@ -450,3 +450,16 @@ producer 映射表归 UN-60；admission/告警归 UN-58。
 | `unprotect` | protect | delete | 0 | UN-55 |
 
 恢复规则：`protect` 期望 digest **存在**；`unprotect` 期望 digest **不存在**（相反终态）。`settled_delta` 对 protect 族为有符号 `after_len − before_len`。生命周期接线归 UN-57。
+
+## 容量 admission 判定（UN-58）
+
+纯判定切片（`src/contract/policy/secure_admission.rs`），不接线写入路径：
+
+- **Projected admission**：`total_bytes + reserved_bytes + UN-60.max_bytes ≤` UN-54 峰值公式；超限 fail-closed，并打结构化告警 `event=audit_retention_disk_pressure`。
+- **A=2**：新 run 类 producer 在 `active_runs ≥ 2` 时拒绝。
+- **P≤20**：`protect` 在清单已满时拒绝。
+- **D=1000**：目录项数超出即 fail-closed。
+- **delete/unprotect**：逻辑配额一律放行（不占 create 槽、不耗 delete headroom 判定）。
+- **Create headroom**：`settled[]` 投影 ≤ 56（留 8 槽给结算/删除）；create 账本字节不可越过 40 KiB 上限。
+
+接线归 UN-59 / UN-35 / UN-52 / UN-55。
