@@ -37,7 +37,7 @@ use crate::{
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_AUDIT_DIFF: i32 = 2;
 pub const EXIT_FENCING: i32 = 3;
-pub const EXIT_PARAM: i32 = 4;
+pub(crate) const EXIT_PARAM: i32 = 4;
 
 #[derive(Debug, Serialize)]
 struct CliSanitizedReport {
@@ -55,6 +55,9 @@ pub fn cli() -> Command {
         .subcommand(bootstrap_cli())
         .subcommand(compare_cli())
         .subcommand(promote_cli())
+        .subcommand(crate::commands::authz_audit_run::run_init_cli())
+        .subcommand(crate::commands::authz_audit_run::run_commit_cli())
+        .subcommand(crate::commands::authz_audit_run::run_abort_cli())
         .subcommand(fsync_cli())
 }
 
@@ -157,7 +160,7 @@ fn restricted_out_arg() -> Arg {
 
 pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
     match args.subcommand() {
-        Some(("fsync" | "promote", _)) => LoadMode::None,
+        Some(("fsync" | "promote" | "run-init" | "run-commit" | "run-abort", _)) => LoadMode::None,
         Some(("bootstrap-candidate" | "compare", _)) => LoadMode::ParsedConfig,
         _ => LoadMode::ParsedConfig,
     }
@@ -169,6 +172,13 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some(("bootstrap-candidate", mode_args)) => exec_bootstrap(ctx, mode_args).await,
         Some(("compare", mode_args)) => exec_compare(ctx, mode_args).await,
         Some(("promote", mode_args)) => exec_promote(mode_args),
+        Some(("run-init", mode_args)) => crate::commands::authz_audit_run::exec_run_init(mode_args),
+        Some(("run-commit", mode_args)) => {
+            crate::commands::authz_audit_run::exec_run_commit(mode_args)
+        }
+        Some(("run-abort", mode_args)) => {
+            crate::commands::authz_audit_run::exec_run_abort(mode_args)
+        }
         Some(("fsync", mode_args)) => exec_fsync(mode_args),
         Some((other, _)) => Err(MegaError::cli_exit(
             EXIT_PARAM,

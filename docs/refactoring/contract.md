@@ -523,7 +523,16 @@ W1..W6 终态与重试收敛（同文件 `baseline_promotion.rs`）：
 - **分派**：`promote()`（UN-35）；无 run 产物、不触发 sweep。
 - **退出**：fencing → 3；`already-current` → 0 且 stderr 打印 `already-current`。
 
+## 运维 run 生命周期工具模式（UN-52）
+
+Kill Switch evidence 专用 run 面（`src/commands/authz_audit_run.rs`；纯文件，`LoadMode::None`）：
+
+- **`run-init`**：`Producer::KillSwitchEvidence` + `owner_fenced=true`；128-bit `run_cap` 只出现在 stdout；ledger 只存 `sha256(cap)`。stdout 恰好两行 `run_id=` / `run_cap=`。
+- **`run-commit` / `run-abort`**：经 `RUN_CAP`（环境变量或 stdin，不进 argv）注入明文 cap；常量时间比对 hash。首次走活动 reservation；响应丢失重试走 `settled[]` 墓碑（run_id + cap_hash）。
+- **abort 三态**：空目录 / 仅 `.lease.lock`|`.evidence.lock` → 删目录并 fsync 父目录后释放；含其它文件 → 按字节计入 `total_bytes` 后删 reservation、**保留文件**。
+
 ## 写入路径容量强制（UN-59）
+
 
 
 

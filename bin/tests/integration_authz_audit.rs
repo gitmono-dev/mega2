@@ -1398,3 +1398,262 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
     let (code, _, _) = run_audit(&fixture, &["authz-audit", "fsync", bogus.to_str().unwrap()]);
     assert_eq!(code, 4, "fsync via non-dir parent / missing child");
 }
+
+/// UN-52：真实二进制 run-init / run-commit / run-abort（含 cap fencing）。
+#[test]
+fn integration_authz_audit_run_lifecycle() {
+    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
+    let fixture = Fixture::new();
+    // No DB seed required — pure file modes.
+    let restricted = fixture._temp.path().join("restricted-run");
+    fs::create_dir_all(&restricted).expect("root");
+    let root = restricted.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_audit(
+        &fixture,
+        &["authz-audit", "run-init", "--restricted-root", root],
+    );
+    assert_eq!(code, 0, "run-init: {stderr}");
+    let mut run_id = None;
+    let mut run_cap = None;
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("run_id=") {
+            run_id = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("run_cap=") {
+            run_cap = Some(v.to_string());
+        }
+    }
+    let run_id = run_id.expect("run_id line");
+    let run_cap = run_cap.expect("run_cap line");
+    assert_eq!(
+        stdout.lines().count(),
+        2,
+        "exactly two stdout lines:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("sha256:"),
+        "stdout must not contain cap_hash"
+    );
+    assert!(!stderr.contains(&run_cap), "stderr must not echo run_cap");
+
+    let run_dir = restricted.join("runs").join(&run_id);
+    assert!(run_dir.is_dir());
+
+    // Missing cap → reject.
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "run-commit",
+            "--restricted-root",
+            root,
+            "--run-id",
+            &run_id,
+        ],
+    );
+    assert_eq!(code, 4, "missing cap: {stderr}");
+
+    // Wrong cap → reject, reservation remains.
+    let (code, _, stderr) = {
+        let mut command = fixture.command();
+        command
+            .env("RUN_CAP", "00000000000000000000000000000000")
+            .args([
+                "authz-audit",
+                "run-commit",
+                "--restricted-root",
+                root,
+                "--run-id",
+                &run_id,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        output_status(&mut command)
+    };
+    assert_eq!(code, 4, "wrong cap: {stderr}");
+
+    // Second run for cross-cap rejection.
+    let (code, stdout2, _) = run_audit(
+        &fixture,
+        &["authz-audit", "run-init", "--restricted-root", root],
+    );
+    assert_eq!(code, 0);
+    let run_id2 = stdout2
+        .lines()
+        .find_map(|l| l.strip_prefix("run_id="))
+        .unwrap()
+        .to_string();
+    let run_cap2 = stdout2
+        .lines()
+        .find_map(|l| l.strip_prefix("run_cap="))
+        .unwrap()
+        .to_string();
+
+    let (code, _, stderr) = {
+        let mut command = fixture.command();
+        command
+            .env("RUN_CAP", &run_cap2)
+            .args([
+                "authz-audit",
+                "run-commit",
+                "--restricted-root",
+                root,
+                "--run-id",
+                &run_id,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        output_status(&mut command)
+    };
+    assert_eq!(code, 4, "cross-cap commit rejected: {stderr}");
+
+    // Empty abort.
+    let (code, _, stderr) = {
+        let mut command = fixture.command();
+        command
+            .env("RUN_CAP", &run_cap)
+            .args([
+                "authz-audit",
+                "run-abort",
+                "--restricted-root",
+                root,
+                "--run-id",
+                &run_id,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        output_status(&mut command)
+    };
+    assert_eq!(code, 0, "empty abort: {stderr}");
+    assert!(!run_dir.exists(), "empty abort removes directory");
+
+    // Idempotent abort retry.
+    let (code, _, stderr) = {
+        let mut command = fixture.command();
+        command
+            .env("RUN_CAP", &run_cap)
+            .args([
+                "authz-audit",
+                "run-abort",
+                "--restricted-root",
+                root,
+                "--run-id",
+                &run_id,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        output_status(&mut command)
+    };
+    assert_eq!(code, 0, "idempotent abort: {stderr}");
+
+    // Locks-only abort on run_id2: plant lease lock then abort.
+    let run_dir2 = restricted.join("runs").join(&run_id2);
+    fs::write(run_dir2.join(".lease.lock"), b"").expect("lease");
+    let (code, _, stderr) = {
+        let mut command = fixture.command();
+        command
+            .env("RUN_CAP", &run_cap2)
+            .args([
+                "authz-audit",
+                "run-abort",
+                "--restricted-root",
+                root,
+                "--run-id",
+                &run_id2,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        output_status(&mut command)
+    };
+    assert_eq!(code, 0, "locks-only abort: {stderr}");
+    assert!(!run_dir2.exists());
+
+    // Partial-file abort: init, write a file, abort keeps files + settles bytes.
+    let (code, stdout3, _) = run_audit(
+        &fixture,
+        &["authz-audit", "run-init", "--restricted-root", root],
+    );
+    assert_eq!(code, 0);
+    let run_id3 = stdout3
+        .lines()
+        .find_map(|l| l.strip_prefix("run_id="))
+        .unwrap()
+        .to_string();
+    let run_cap3 = stdout3
+        .lines()
+        .find_map(|l| l.strip_prefix("run_cap="))
+        .unwrap()
+        .to_string();
+    let run_dir3 = restricted.join("runs").join(&run_id3);
+    fs::write(run_dir3.join("partial.bin"), b"hello-world").expect("partial");
+    let (code, _, stderr) = {
+        let mut command = fixture.command();
+        command
+            .env("RUN_CAP", &run_cap3)
+            .args([
+                "authz-audit",
+                "run-abort",
+                "--restricted-root",
+                root,
+                "--run-id",
+                &run_id3,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        output_status(&mut command)
+    };
+    assert_eq!(code, 0, "partial abort: {stderr}");
+    assert!(
+        run_dir3.join("partial.bin").is_file(),
+        "partial files retained"
+    );
+
+    let counters: serde_json::Value =
+        serde_json::from_slice(&fs::read(restricted.join(".counters.json")).unwrap()).unwrap();
+    assert!(
+        counters["reservations"].as_array().unwrap().is_empty(),
+        "{counters}"
+    );
+    assert!(counters["total_bytes"].as_u64().unwrap() >= 11);
+
+    // Fresh run-init + commit success + idempotent commit.
+    let (code, stdout4, _) = run_audit(
+        &fixture,
+        &["authz-audit", "run-init", "--restricted-root", root],
+    );
+    assert_eq!(code, 0);
+    let run_id4 = stdout4
+        .lines()
+        .find_map(|l| l.strip_prefix("run_id="))
+        .unwrap()
+        .to_string();
+    let run_cap4 = stdout4
+        .lines()
+        .find_map(|l| l.strip_prefix("run_cap="))
+        .unwrap()
+        .to_string();
+    fs::write(
+        restricted.join("runs").join(&run_id4).join("evidence.json"),
+        b"{}",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let (code, _, stderr) = {
+            let mut command = fixture.command();
+            command
+                .env("RUN_CAP", &run_cap4)
+                .args([
+                    "authz-audit",
+                    "run-commit",
+                    "--restricted-root",
+                    root,
+                    "--run-id",
+                    &run_id4,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            output_status(&mut command)
+        };
+        assert_eq!(code, 0, "commit/idempotent: {stderr}");
+    }
+}

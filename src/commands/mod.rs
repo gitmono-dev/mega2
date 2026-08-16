@@ -1,4 +1,5 @@
 pub mod authz_audit;
+mod authz_audit_run;
 pub mod config;
 pub mod debug;
 pub mod service;
