@@ -531,6 +531,15 @@ Kill Switch evidence 专用 run 面（`src/commands/authz_audit_run.rs`；纯文
 - **`run-commit` / `run-abort`**：经 `RUN_CAP`（环境变量或 stdin，不进 argv）注入明文 cap；常量时间比对 hash。首次走活动 reservation；响应丢失重试走 `settled[]` 墓碑（run_id + cap_hash）。
 - **abort 三态**：空目录 / 仅 `.lease.lock`|`.evidence.lock` → 删目录并 fsync 父目录后释放；含其它文件 → 按字节计入 `total_bytes` 后删 reservation、**保留文件**。
 
+## baseline 保护清单 registry（UN-55）
+
+`protected.json` 的唯一写入入口（`src/commands/authz_audit_protect.rs`；纯文件，`LoadMode::None`）：
+
+- **`protect --digest`**：`Producer::Protect`（action=create）；维护锁内 `admit_and_reserve_locked` → canonical 重写 → 临时文件 + fsync + 原子 replace + 父目录 fsync → `commit_locked`（`settled_delta = after_len − before_len`；终态 `digest present`）。已登记则幂等成功、不写账本。
+- **`unprotect --digest`**：`Producer::Unprotect`（action=delete）；同上协议，结算进 `delete_settled[]`，终态 `digest absent`。
+- **P ≤ 20**：清单已满时 `protect` 以退出码 4 拒绝；`unprotect` 不受 P 上限阻挡。
+- **schema**：`{"schema_version":1,"protected":[...]}`（`deny_unknown_fields`；digest 经 `validate_artifact_digest`；写出时按字典序、紧凑 JSON、无尾换行）。
+
 ## 写入路径容量强制（UN-59）
 
 

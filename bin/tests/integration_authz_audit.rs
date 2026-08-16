@@ -1657,3 +1657,179 @@ fn integration_authz_audit_run_lifecycle() {
         assert_eq!(code, 0, "commit/idempotent: {stderr}");
     }
 }
+
+/// UN-55：真实二进制 protect / unprotect（往返、P 上限、预留-结算）。
+#[test]
+fn integration_authz_audit_protect_registry() {
+    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
+    let fixture = Fixture::new();
+    let restricted = fixture._temp.path().join("restricted-protect");
+    fs::create_dir_all(&restricted).expect("root");
+    let root = restricted.to_str().unwrap();
+
+    let digest_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let digest_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "protect",
+            "--restricted-root",
+            root,
+            "--digest",
+            digest_a,
+        ],
+    );
+    assert_eq!(code, 0, "protect a: {stderr}");
+
+    let manifest_path = restricted.join("baselines").join("protected.json");
+    let body = fs::read(&manifest_path).expect("protected.json");
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(
+        parsed["protected"],
+        serde_json::json!([digest_a]),
+        "canonical single-entry manifest"
+    );
+    // Compact canonical: no whitespace, no trailing newline.
+    assert!(!body.contains(&b' '), "no spaces in canonical rewrite");
+    assert!(!body.ends_with(b"\n"), "no trailing newline");
+
+    let counters: serde_json::Value =
+        serde_json::from_slice(&fs::read(restricted.join(".counters.json")).unwrap()).unwrap();
+    assert!(
+        counters["reservations"].as_array().unwrap().is_empty(),
+        "reservation must be settled"
+    );
+    let settled = counters["settled"].as_array().unwrap();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0]["kind"], "protect");
+    assert_eq!(settled[0]["action"], "create");
+    assert_eq!(settled[0]["final_state"], "digest present");
+    let delta_a = settled[0]["settled_delta"].as_i64().unwrap();
+    assert_eq!(delta_a, body.len() as i64);
+
+    // Idempotent protect: already present → exit 0, no new settle.
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "protect",
+            "--restricted-root",
+            root,
+            "--digest",
+            digest_a,
+        ],
+    );
+    assert_eq!(code, 0, "idempotent protect: {stderr}");
+    let counters2: serde_json::Value =
+        serde_json::from_slice(&fs::read(restricted.join(".counters.json")).unwrap()).unwrap();
+    assert_eq!(
+        counters2["settled"].as_array().unwrap().len(),
+        1,
+        "idempotent protect must not settle again"
+    );
+
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "protect",
+            "--restricted-root",
+            root,
+            "--digest",
+            digest_b,
+        ],
+    );
+    assert_eq!(code, 0, "protect b: {stderr}");
+    let body2 = fs::read(&manifest_path).unwrap();
+    let parsed2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(
+        parsed2["protected"],
+        serde_json::json!([digest_a, digest_b]),
+        "sorted digests"
+    );
+
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "unprotect",
+            "--restricted-root",
+            root,
+            "--digest",
+            digest_a,
+        ],
+    );
+    assert_eq!(code, 0, "unprotect a: {stderr}");
+    let body3 = fs::read(&manifest_path).unwrap();
+    let parsed3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
+    assert_eq!(parsed3["protected"], serde_json::json!([digest_b]));
+
+    let counters3: serde_json::Value =
+        serde_json::from_slice(&fs::read(restricted.join(".counters.json")).unwrap()).unwrap();
+    let delete_settled = counters3["delete_settled"].as_array().unwrap();
+    assert_eq!(delete_settled.len(), 1);
+    assert_eq!(delete_settled[0]["kind"], "protect");
+    assert_eq!(delete_settled[0]["action"], "delete");
+    assert_eq!(delete_settled[0]["final_state"], "digest absent");
+    let delta_del = delete_settled[0]["settled_delta"].as_i64().unwrap();
+    assert_eq!(delta_del, body3.len() as i64 - body2.len() as i64);
+
+    // P ≤ 20: fill to capacity then reject the 21st.
+    let restricted_p = fixture._temp.path().join("restricted-protect-p");
+    fs::create_dir_all(&restricted_p).unwrap();
+    let root_p = restricted_p.to_str().unwrap();
+    for i in 0..20 {
+        let digest = format!("sha256:{:064x}", i + 1);
+        let (code, _, stderr) = run_audit(
+            &fixture,
+            &[
+                "authz-audit",
+                "protect",
+                "--restricted-root",
+                root_p,
+                "--digest",
+                &digest,
+            ],
+        );
+        assert_eq!(code, 0, "protect #{i}: {stderr}");
+    }
+    let digest_21 = format!("sha256:{:064x}", 21u64);
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "protect",
+            "--restricted-root",
+            root_p,
+            "--digest",
+            &digest_21,
+        ],
+    );
+    assert_eq!(code, 4, "P=20 reject: {stderr}");
+    assert!(
+        stderr.contains("P limit") || stderr.contains("20"),
+        "P limit message: {stderr}"
+    );
+    let p_body: serde_json::Value = serde_json::from_slice(
+        &fs::read(restricted_p.join("baselines").join("protected.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(p_body["protected"].as_array().unwrap().len(), 20);
+
+    // Bad digest syntax.
+    let (code, _, _) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "protect",
+            "--restricted-root",
+            root,
+            "--digest",
+            "not-a-digest",
+        ],
+    );
+    assert_eq!(code, 4);
+}

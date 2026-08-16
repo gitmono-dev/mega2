@@ -466,6 +466,17 @@ pub fn write_baseline_version(
 /// reader either sees the old pointer or the new one. Serialising concurrent
 /// promotions is the promotion card's job; this is the write primitive it uses.
 pub(crate) fn replace_pointer(root: &RestrictedRoot, contents: &[u8]) -> ArtifactResult<()> {
+    replace_baseline_file(root, POINTER_NAME, contents)
+}
+
+/// Atomically replace a bare file under `baselines/` (temp + fsync + rename +
+/// directory fsync). Used for the current pointer and `protected.json` (UN-55).
+pub(crate) fn replace_baseline_file(
+    root: &RestrictedRoot,
+    name: &str,
+    contents: &[u8],
+) -> ArtifactResult<()> {
+    let name = bare_name(name)?;
     let dir = root.open_dir(Path::new(BASELINES_DIR), true)?;
     let temp = format!(".tmp-{}", random_suffix());
 
@@ -474,9 +485,9 @@ pub(crate) fn replace_pointer(root: &RestrictedRoot, contents: &[u8]) -> Artifac
     fsync(file.as_raw_fd(), &temp)?;
     drop(file);
 
-    if let Err(err) = renameat(dir.as_raw_fd(), &temp, POINTER_NAME) {
+    if let Err(err) = renameat(dir.as_raw_fd(), &temp, &name) {
         unlinkat(dir.as_raw_fd(), &temp);
-        return Err(ArtifactError::io("renameat", POINTER_NAME, err));
+        return Err(ArtifactError::io("renameat", name, err));
     }
     fsync(dir.as_raw_fd(), BASELINES_DIR)?;
     Ok(())
