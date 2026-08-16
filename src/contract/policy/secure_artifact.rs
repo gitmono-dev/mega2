@@ -200,6 +200,15 @@ impl RestrictedRoot {
         self.fd.as_raw_fd()
     }
 
+    /// The anchor descriptor, for the sweep's relative operations (UN-38).
+    ///
+    /// Shared rather than re-derived: a sweep that resolved the root
+    /// independently would be a delete primitive with its own idea of where the
+    /// root is.
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.raw()
+    }
+
     /// Open a directory relative to the root, creating it if asked.
     ///
     /// Walks one component at a time with `O_NOFOLLOW`, so a symlink anywhere
@@ -479,7 +488,7 @@ fn require_linux() -> ArtifactResult<()> {
 /// Without this, a signal arriving at the wrong moment turns a perfectly valid
 /// operation into a hard failure — and the caller cannot tell that from a real
 /// refusal, which is the one distinction this module is built to make clear.
-fn retry_on_interrupt(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
+pub(crate) fn retry_on_interrupt(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
     loop {
         let result = call();
         if result >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {

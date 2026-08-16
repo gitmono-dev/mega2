@@ -12,6 +12,7 @@ mod objects;
 pub mod resource;
 pub mod reviewer_parser;
 pub mod secure_artifact;
+pub mod secure_sweep;
 #[cfg(test)]
 mod un04_admin_source;
 #[cfg(test)]
@@ -24,6 +25,8 @@ mod un21_matrix;
 mod un26_audit;
 #[cfg(test)]
 mod un32_writer;
+#[cfg(test)]
+mod un38_sweep;
 pub mod util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
