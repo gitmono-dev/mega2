@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.2.57"
+version = "0.2.58"
 edition = "2024"
 
 # The thin composition-root binary. It depends on `monoengine-core` (which only

@@ -3,6 +3,7 @@ use std::fmt::{self, Display};
 pub mod admin_resolver;
 pub mod authz_audit;
 pub mod baseline_pointer;
+pub mod baseline_promotion;
 pub mod builder;
 pub mod context;
 pub mod enforcement;
@@ -32,6 +33,8 @@ mod un21_matrix;
 mod un26_audit;
 #[cfg(test)]
 mod un32_writer;
+#[cfg(test)]
+mod un35_promote;
 #[cfg(test)]
 mod un38_sweep;
 #[cfg(test)]

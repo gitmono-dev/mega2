@@ -483,6 +483,16 @@ producer 映射表归 UN-60；admission/告警归 UN-58。
 
 CAS 编排与崩溃恢复归 UN-35 / UN-40。
 
+## baseline promotion CAS（UN-35）
+
+提升状态机（`src/contract/policy/baseline_promotion.rs`），调用方持统一维护锁：
+
+- **顺序**：候选完整性（重算 digest vs `--expect-digest`）→ already-current 幂等 → 期望 fencing → `admit_and_reserve_locked`(Promote) → 写版本 → 切指针 → 即时 settle。
+- **fencing**：`--expect-no-current` / `--expect-current-digest` 互斥且必选其一；不匹配 → 退出码 3、零写入。already-current 是唯一例外。
+- **锁**：与 sweep/admission 共用 `.maintenance.lock`，故「版本已写、指针未切」窗口内并发 sweep 不可达。
+
+崩溃窗口终态表归 UN-40。
+
 ## 写入路径容量强制（UN-59）
 
 硬上限检查与 admission 接线（`src/contract/policy/secure_hardcap.rs` + `secure_artifact.rs` / `secure_sweep.rs`）：

@@ -132,6 +132,10 @@ pub enum ArtifactError {
     LifecycleRejected { reason: String },
     #[error("baseline pointer rejected: {reason}")]
     PointerInvalid { reason: String },
+    #[error("baseline promotion rejected: {reason}")]
+    PromotionRejected { reason: String },
+    #[error("baseline promotion fencing failed: {reason} (frozen exit code {code})")]
+    PromotionFencing { reason: String, code: i32 },
     #[error("{operation} on {path} failed: {source}")]
     Io {
         operation: &'static str,
