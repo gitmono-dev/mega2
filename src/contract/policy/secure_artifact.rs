@@ -111,6 +111,15 @@ pub enum ArtifactError {
     )]
     ReportTooLarge { bytes: usize, limit: usize },
     #[error(
+        "artifact write is {bytes} bytes, exceeding the {limit}-byte hard ceiling for {class}; \
+         refusing rather than truncating"
+    )]
+    WriteTooLarge {
+        class: &'static str,
+        bytes: usize,
+        limit: usize,
+    },
+    #[error(
         "capacity counter is {bytes} bytes, exceeding the {limit}-byte ledger ceiling; refusing \
          rather than truncating"
     )]
@@ -302,22 +311,46 @@ impl RunDir {
         for _ in 0..RUN_ID_CLAIM_ATTEMPTS {
             let run_id = next_id();
             validate_run_id(&run_id)?;
-            let c_name = cstring(Path::new(&run_id))?;
-            // SAFETY: `runs` is an open directory fd; `c_name` outlives the call.
-            let made = unsafe { libc::mkdirat(runs.as_raw_fd(), c_name.as_ptr(), 0o700) };
-            if made == 0 {
-                let fd = openat_dir(runs.as_raw_fd(), &run_id)?;
-                return Ok(Self { run_id, fd });
-            }
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EEXIST) {
-                return Err(ArtifactError::io("mkdirat", run_id, err));
+            match Self::try_mkdir(runs.as_raw_fd(), &run_id)? {
+                Some(fd) => return Ok(Self { run_id, fd }),
+                None => continue,
             }
         }
 
         Err(ArtifactError::RunIdExhausted {
             attempts: RUN_ID_CLAIM_ATTEMPTS,
         })
+    }
+
+    /// Claim a predetermined run id (admission already reserved this target).
+    pub(crate) fn claim_exact(root: &RestrictedRoot, run_id: &str) -> ArtifactResult<Self> {
+        validate_run_id(run_id)?;
+        let runs = root.open_dir(Path::new(RUNS_DIR), true)?;
+        match Self::try_mkdir(runs.as_raw_fd(), run_id)? {
+            Some(fd) => Ok(Self {
+                run_id: run_id.to_string(),
+                fd,
+            }),
+            None => Err(ArtifactError::io(
+                "mkdirat",
+                run_id.to_string(),
+                io::Error::from_raw_os_error(libc::EEXIST),
+            )),
+        }
+    }
+
+    fn try_mkdir(runs: RawFd, run_id: &str) -> ArtifactResult<Option<OwnedFd>> {
+        let c_name = cstring(Path::new(run_id))?;
+        // SAFETY: `runs` is an open directory fd; `c_name` outlives the call.
+        let made = unsafe { libc::mkdirat(runs, c_name.as_ptr(), 0o700) };
+        if made == 0 {
+            return Ok(Some(openat_dir(runs, run_id)?));
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(ArtifactError::io("mkdirat", run_id.to_string(), err));
+        }
+        Ok(None)
     }
 
     pub fn run_id(&self) -> &str {
@@ -339,8 +372,20 @@ impl RunDir {
     /// decide. Final path, `O_EXCL`, `0600`, fsync the file, fsync the
     /// directory, no rename: a crash leaves a partial file at the final path,
     /// and the run is known to have failed by its exit status.
+    ///
+    /// Size is gated by the inferred write-class hard ceiling (UN-59): oversize
+    /// fails closed and does not truncate.
     pub fn write_output(&self, name: &str, contents: &[u8]) -> ArtifactResult<()> {
         let name = bare_name(name)?;
+        crate::contract::policy::secure_capacity::hard_cap_violation(
+            crate::contract::policy::secure_capacity::infer_write_class(&name),
+            contents.len(),
+        )
+        .map_err(|(bytes, limit)| ArtifactError::WriteTooLarge {
+            class: crate::contract::policy::secure_capacity::infer_write_class(&name).name(),
+            bytes,
+            limit,
+        })?;
         let file = openat_create_exclusive(self.fd.as_raw_fd(), &name)?;
         write_all(file.as_raw_fd(), contents, &name)?;
         fsync(file.as_raw_fd(), &name)?;
@@ -362,6 +407,15 @@ pub fn write_baseline_version(
     name: &str,
     contents: &[u8],
 ) -> ArtifactResult<()> {
+    crate::contract::policy::secure_capacity::hard_cap_violation(
+        crate::contract::policy::secure_capacity::WriteClass::CandidateOrBaseline,
+        contents.len(),
+    )
+    .map_err(|(bytes, limit)| ArtifactError::WriteTooLarge {
+        class: "candidate/baseline",
+        bytes,
+        limit,
+    })?;
     let name = bare_name(name)?;
     let dir = root.open_dir(Path::new(BASELINES_DIR), true)?;
 

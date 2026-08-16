@@ -174,7 +174,7 @@ impl MaintenanceLock {
 /// the directory untouched.
 pub fn sweep(
     root: &RestrictedRoot,
-    _lock: &MaintenanceLock,
+    lock: &MaintenanceLock,
     reservations: &dyn ReservationView,
     now: SystemTime,
 ) -> ArtifactResult<SweepOutcome> {
@@ -199,16 +199,31 @@ pub fn sweep(
     )?;
     plan_sweep_versions(root, &protected, now, &mut report, &mut plan)?;
 
-    // Byte ceiling before destruction: a report that cannot be written must not
-    // leave deletions without an audit trail.
+    // Byte ceiling + admission before destruction: a report that cannot be
+    // written (or admitted) must not leave deletions without an audit trail.
     let run_id = generate_run_id();
     let bytes = report.into_bytes(&run_id)?;
+    let admitted = crate::contract::policy::secure_hardcap::admit_sweep_report(
+        root,
+        lock,
+        &run_id,
+        bytes.len(),
+        now,
+        0,
+    )?;
 
-    execute_removal_plan(root, reservations, now, &mut outcome, plan)?;
+    if let Err(err) = execute_removal_plan(root, reservations, now, &mut outcome, plan) {
+        let _ = crate::contract::policy::secure_hardcap::abort_admitted_sweep_report(
+            root, lock, admitted, now,
+        );
+        return Err(err);
+    }
 
-    let written = persist_sweep_report(root, &run_id, &bytes)?;
-    outcome.report_run_id = Some(written.run_id);
-    outcome.report_path = Some(written.path);
+    let written = crate::contract::policy::secure_hardcap::finish_sweep_report(
+        root, lock, admitted, &bytes, now,
+    )?;
+    outcome.report_run_id = Some(run_id);
+    outcome.report_path = Some(written);
 
     Ok(outcome)
 }
@@ -1151,7 +1166,7 @@ fn persist_sweep_report(
 /// illegal name under `sweep-reports/` is left alone for the same reason an
 /// unrecognised run directory is: pruning must not become a delete primitive
 /// over arbitrary `.json` files.
-fn prune_sweep_reports(root: &RestrictedRoot) -> ArtifactResult<()> {
+pub(crate) fn prune_sweep_reports(root: &RestrictedRoot) -> ArtifactResult<()> {
     let Some(dir) = open_dir_if_present(root.as_raw_fd(), SWEEP_REPORTS_DIR)? else {
         return Ok(());
     };

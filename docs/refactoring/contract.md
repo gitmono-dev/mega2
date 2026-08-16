@@ -473,3 +473,11 @@ producer 映射表归 UN-60；admission/告警归 UN-58。
 - **unprotect**：逻辑配额满盘仍可删；结算进独立 `delete_settled[]`；`settled_delta = after − before`（有符号）。
 
 写入路径接线归 UN-59。
+
+## 写入路径容量强制（UN-59）
+
+硬上限检查与 admission 接线（`src/contract/policy/secure_hardcap.rs` + `secure_artifact.rs` / `secure_sweep.rs`）：
+
+- **写时硬上限**：`hard_cap_violation`（常量归 UN-54）接入 `RunDir::write_output` 与 `write_baseline_version`；超限 → `ArtifactError::WriteTooLarge`，**不截断**。
+- **run 创建**：`ReservedRun::create` 在维护锁下调用 `admit_and_reserve_locked`（`bootstrap-candidate` / `compare`），再 `claim_exact`；成功 `commit` / 失败 `abort`，即时结算。
+- **sweep 报告**：`persist_sweep_report_admitted` 经同一原语预留后 `O_EXCL` 落盘，写成败分别 commit/abort。

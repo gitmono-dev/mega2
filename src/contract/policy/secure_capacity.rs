@@ -68,6 +68,62 @@ pub fn saturated_version_plane_bytes(k: usize, p: usize) -> u64 {
     2 * MIB * (k as u64).saturating_add(p as u64).saturating_add(2)
 }
 
+/// Per-type write class (ceiling values freeze here; enforcement is UN-59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteClass {
+    CandidateOrBaseline,
+    SanitizedReport,
+    RestrictedDiff,
+    SweepReportOrEvidence,
+}
+
+impl WriteClass {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CandidateOrBaseline => "candidate/baseline",
+            Self::SanitizedReport => "sanitized-report",
+            Self::RestrictedDiff => "restricted-diff",
+            Self::SweepReportOrEvidence => "sweep-report/evidence",
+        }
+    }
+
+    pub const fn limit_bytes(self) -> usize {
+        match self {
+            Self::CandidateOrBaseline => MAX_CANDIDATE_OR_BASELINE_BYTES as usize,
+            Self::SanitizedReport => MAX_SANITIZED_REPORT_BYTES as usize,
+            Self::RestrictedDiff => MAX_RESTRICTED_DIFF_BYTES as usize,
+            Self::SweepReportOrEvidence => MAX_SWEEP_REPORT_OR_EVIDENCE_BYTES as usize,
+        }
+    }
+}
+
+/// Fail-closed size check predicate used by UN-59 write sites.
+///
+/// Returns `Err((bytes, limit))` when over the ceiling so call sites can map
+/// into their own error type without a module cycle.
+pub fn hard_cap_violation(class: WriteClass, bytes: usize) -> Result<(), (usize, usize)> {
+    let limit = class.limit_bytes();
+    if bytes > limit {
+        Err((bytes, limit))
+    } else {
+        Ok(())
+    }
+}
+
+/// Infer a write class from a bare output name (best-effort for legacy callers).
+pub fn infer_write_class(name: &str) -> WriteClass {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("diff") {
+        WriteClass::RestrictedDiff
+    } else if lower.contains("evidence") || lower.contains("killswitch") {
+        WriteClass::SweepReportOrEvidence
+    } else if lower.contains("sanitized") || lower == "report.json" {
+        WriteClass::SanitizedReport
+    } else {
+        WriteClass::CandidateOrBaseline
+    }
+}
+
 const _: () = {
     assert!(N == 20);
     assert!(K == 10);
