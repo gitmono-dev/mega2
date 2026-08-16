@@ -46,20 +46,25 @@ mod vault;
 
 /// Internal seam for the read-only ops assembly (UN-30).
 ///
-/// The zero-side-effect proof is a black-box before/after comparison: seed a
-/// real database through the real binary, snapshot it, run the read-only
-/// assembly, snapshot again. Driving that assembly needs a way in, and the
-/// command that will be its real entry point does not exist yet (UN-29).
-///
-/// Not a supported API. It is `#[doc(hidden)]` and exists so the proof can be
-/// written against the real assembly rather than a stand-in; once the audit
-/// command lands, the command is the black-box surface and this can go.
+/// The zero-side-effect proof drives the assembly from the bin IT target
+/// without going through the CLI. `authz-audit` (UN-29) is the supported
+/// operator surface; this module stays for the black-box before/after proof.
 #[doc(hidden)]
 pub mod readonly_ops {
     pub use crate::{
         commands::{LoadedConfigPaths, LoadedConfigSummary},
         context::ReadOnlyContext,
         jupiter::storage::ReadOnlyStorage,
+    };
+}
+
+/// Internal seam for IT bridging promote (UN-35) until `authz-audit promote`
+/// lands in UN-37. Not a supported API.
+#[doc(hidden)]
+pub mod authz_audit_ops {
+    pub use crate::contract::policy::{
+        baseline_promotion::{PromoteFence, PromoteRequest, content_digest, promote},
+        secure_artifact::RestrictedRoot,
     };
 }
 

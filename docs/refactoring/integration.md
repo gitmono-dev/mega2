@@ -34,7 +34,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_git_ssh` | Git SSH cargo-native self-start clone/pull/push（plan-20260803 / GM-06..08） | PostgreSQL, Redis, `--profile git` |
 | `integration_website_auth` | Better Auth cookie to monoengine session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
 | `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
-| `integration_authz_audit` | 只读装配的零副作用黑盒前后比对（UN-30 / UN-43） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
+| `integration_authz_audit` | 只读装配零副作用黑盒（UN-30 / UN-43）+ `authz-audit` CLI 审计面与 fsync 工具模式（UN-29） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
 
 Run the normal project gate with the test environment loaded:
 

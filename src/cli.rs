@@ -82,7 +82,14 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
             }
         }
         LoadMode::ParsedConfig | LoadMode::FullAppContext => {
-            let (config, loaded) = load_config(&matches)?;
+            // Audit modes keep `LoadMode::ParsedConfig` (UN-29 AC) but must not
+            // invent a default config.toml — that is exactly the write UN-34
+            // forbids on a readonly command. FullAppContext stays on `load()`.
+            let (config, loaded) = if cmd == "authz-audit" {
+                load_config_readonly(&matches)?
+            } else {
+                load_config(&matches)?
+            };
             init_log(&config.log);
             tracing::info!(
                 source = ?loaded.source,
@@ -131,9 +138,18 @@ fn load_config_path(matches: &ArgMatches) -> Result<LoadedConfig, MegaError> {
     Ok(ConfigLoader::new(input).load()?)
 }
 
-fn load_config(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
-    let loaded = load_config_path(matches)?;
+fn load_config_path_readonly(matches: &ArgMatches) -> Result<LoadedConfig, MegaError> {
+    let cli_path = matches.get_one::<PathBuf>("config").cloned();
+    let input = ConfigInput {
+        cli_path,
+        env_path: std::env::var_os("MEGA_CONFIG").map(PathBuf::from),
+        cli_profile: matches.get_one::<String>("profile").cloned(),
+        env_profile: std::env::var("MEGA_PROFILE").ok(),
+    };
+    Ok(ConfigLoader::new(input).load_readonly()?)
+}
 
+fn parse_loaded_config(loaded: LoadedConfig) -> Result<(Config, LoadedConfig), MegaError> {
     let config = Config::new_with_profile(
         loaded.path.to_str().ok_or_else(|| {
             MegaError::Other(format!(
@@ -148,6 +164,14 @@ fn load_config(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError
     )?;
 
     Ok((config, loaded))
+}
+
+fn load_config(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
+    parse_loaded_config(load_config_path(matches)?)
+}
+
+fn load_config_readonly(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
+    parse_loaded_config(load_config_path_readonly(matches)?)
 }
 
 fn install_ctrlc_handler() {

@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
     thread::sleep,
@@ -514,6 +514,9 @@ impl Drop for EnvGuard {
 }
 
 struct Fixture {
+    /// 串行化本 target 的 fixture：环境变量是进程级的，不能两个同时活着。
+    /// `cargo test --all` 不会传 `--test-threads=1`，所以用锁而不是断言。
+    _lock: MutexGuard<'static, ()>,
     /// 先于其它字段声明，因此**最后**析构：还原环境是收尾动作。
     env: std::sync::Mutex<EnvGuard>,
     _temp: tempfile::TempDir,
@@ -525,20 +528,14 @@ struct Fixture {
     cache_dir: PathBuf,
 }
 
-/// 本 target 里已经创建过 fixture 没有。
-///
-/// 环境变量是进程级的，第二个 fixture 会覆盖第一个的数据库地址，而且谁都不会报错——于是
-/// 「前后比对」会静悄悄地跑在别人的库上。与其在注释里请求后来者小心，不如让它当场炸掉。
-static FIXTURE_CREATED: AtomicUsize = AtomicUsize::new(0);
+/// 本 target 的 fixture 互斥锁（见 `Fixture::_lock`）。
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 impl Fixture {
     fn new() -> Self {
-        assert_eq!(
-            FIXTURE_CREATED.fetch_add(1, Ordering::SeqCst),
-            0,
-            "这个 target 只能有一个 fixture：环境变量是进程级的，第二个会覆盖第一个的数据库 \
-             地址且不报错。要加用例，先把配置改成不经环境变量注入"
-        );
+        let lock = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
         let config_path = temp.path().join("config.toml");
@@ -607,6 +604,7 @@ impl Fixture {
         env.set("MEGA_CACHE_DIR", &cache_dir);
 
         Self {
+            _lock: lock,
             env: std::sync::Mutex::new(env),
             _temp: temp,
             database,
@@ -942,4 +940,270 @@ fn integration_readonly_assembly_changes_nothing() {
             "打开 vault 的只读装配同样必须零副作用"
         );
     });
+}
+
+// ---------------------------------------------------------------- UN-29 CLI
+
+fn run_id_from_stdout(stdout: &str) -> String {
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("run_id="))
+        .unwrap_or_else(|| panic!("missing run_id= line in stdout:\n{stdout}"));
+    let id = line.strip_prefix("run_id=").expect("prefix");
+    assert!(
+        !id.is_empty() && !id.contains('/'),
+        "run_id must be a single bare token: {id:?}"
+    );
+    // Exactly one such line.
+    assert_eq!(
+        stdout.lines().filter(|l| l.starts_with("run_id=")).count(),
+        1,
+        "stdout must contain exactly one run_id= line:\n{stdout}"
+    );
+    id.to_string()
+}
+
+fn output_status(command: &mut Command) -> (i32, String, String) {
+    let output = command.output().expect("spawn monoengine");
+    let code = output.status.code().unwrap_or(1);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (code, stdout, stderr)
+}
+
+fn run_audit(fixture: &Fixture, args: &[&str]) -> (i32, String, String) {
+    let mut command = fixture.command();
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    output_status(&mut command)
+}
+
+/// UN-29：真实二进制审计面（bootstrap → promote 库桥 → compare）与 fsync 工具模式。
+#[test]
+fn integration_authz_audit_cli_bootstrap_compare_fsync() {
+    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
+
+    let fixture = Fixture::new();
+    fixture.seed_through_the_real_binary();
+
+    let restricted = fixture._temp.path().join("restricted");
+    fs::create_dir_all(&restricted).expect("restricted root");
+    let root = restricted.to_str().unwrap();
+
+    // --- bootstrap-candidate ---
+    let (code, stdout, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "bootstrap-candidate",
+            "--restricted-root",
+            root,
+            "--out",
+            "report.json",
+            "--restricted-out",
+            "candidate.json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "bootstrap failed:\nstdout={stdout}\nstderr={stderr}"
+    );
+    let bootstrap_run = run_id_from_stdout(&stdout);
+    let candidate_path = restricted
+        .join("runs")
+        .join(&bootstrap_run)
+        .join("candidate.json");
+    let report_path = restricted
+        .join("runs")
+        .join(&bootstrap_run)
+        .join("report.json");
+    assert!(candidate_path.is_file(), "candidate missing");
+    assert!(report_path.is_file(), "sanitized report missing");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).expect("read report")).expect("report json");
+    assert_eq!(report["diff_verdict"], "not_compared");
+    assert_eq!(report["source_summary"]["source"], "cli");
+    assert_eq!(report["source_summary"]["profile"], "it");
+    assert!(report.get("source_summary").unwrap().get("paths").is_none());
+
+    let candidate_bytes = fs::read(&candidate_path).expect("read candidate");
+    let candidate: serde_json::Value =
+        serde_json::from_slice(&candidate_bytes).expect("candidate json");
+    let acl_digest = candidate["digest"].as_str().expect("digest").to_string();
+
+    let counters: serde_json::Value = serde_json::from_slice(
+        &fs::read(restricted.join(".counters.json")).expect("counters after bootstrap"),
+    )
+    .expect("counters json");
+    assert!(
+        counters["reservations"]
+            .as_array()
+            .expect("reservations")
+            .is_empty(),
+        "bootstrap must settle immediately: {counters}"
+    );
+    assert!(
+        !counters["settled"].as_array().expect("settled").is_empty(),
+        "settled tomb required: {counters}"
+    );
+    assert_eq!(counters["reserved_bytes"], 0);
+
+    let restricted_root = monoengine_core::authz_audit_ops::RestrictedRoot::open(&restricted)
+        .expect("open restricted root");
+    let file_digest = monoengine_core::authz_audit_ops::content_digest(&candidate_bytes);
+    monoengine_core::authz_audit_ops::promote(
+        &restricted_root,
+        monoengine_core::authz_audit_ops::PromoteRequest {
+            candidate: &candidate_bytes,
+            expect_digest: &file_digest,
+            fence: monoengine_core::authz_audit_ops::PromoteFence::ExpectNoCurrent,
+            now: std::time::SystemTime::now(),
+            directory_entries: 0,
+        },
+    )
+    .expect("promote candidate to current pointer");
+
+    let (code, stdout, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "compare",
+            "--restricted-root",
+            root,
+            "--expect-digest",
+            &acl_digest,
+            "--out",
+            "report.json",
+            "--restricted-out",
+            "findings.json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "compare match failed:\nstdout={stdout}\nstderr={stderr}"
+    );
+    let compare_run = run_id_from_stdout(&stdout);
+    assert_ne!(
+        compare_run, bootstrap_run,
+        "each CLI call gets its own run_id"
+    );
+    let compare_report: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            restricted
+                .join("runs")
+                .join(&compare_run)
+                .join("report.json"),
+        )
+        .expect("compare report"),
+    )
+    .expect("compare report json");
+    assert_eq!(compare_report["diff_verdict"], "match");
+
+    let counters: serde_json::Value = serde_json::from_slice(
+        &fs::read(restricted.join(".counters.json")).expect("counters after compare"),
+    )
+    .expect("counters json");
+    assert!(
+        counters["reservations"]
+            .as_array()
+            .expect("reservations")
+            .is_empty()
+    );
+    assert!(counters["settled"].as_array().unwrap().len() >= 2);
+    assert_eq!(counters["reserved_bytes"], 0);
+
+    let (code, stdout, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "bootstrap-candidate",
+            "--restricted-root",
+            root,
+            "--out",
+            "report.json",
+            "--restricted-out",
+            "candidate.json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "bootstrap rerun failed:\nstdout={stdout}\nstderr={stderr}"
+    );
+    let _ = run_id_from_stdout(&stdout);
+
+    let (code, _, _) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "compare",
+            "--restricted-root",
+            root,
+            "--expect-digest",
+            &acl_digest,
+        ],
+    );
+    assert_ne!(code, 0, "missing dual-output flags must fail");
+
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "bootstrap-candidate",
+            "--restricted-root",
+            root,
+            "--out",
+            "../escape.json",
+            "--restricted-out",
+            "candidate.json",
+        ],
+    );
+    assert_eq!(code, 4, "path escape must be exit 4: {stderr}");
+
+    let symlink_root = fixture._temp.path().join("symlink-root");
+    std::os::unix::fs::symlink(&restricted, &symlink_root).expect("symlink root");
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "bootstrap-candidate",
+            "--restricted-root",
+            symlink_root.to_str().unwrap(),
+            "--out",
+            "report.json",
+            "--restricted-out",
+            "candidate.json",
+        ],
+    );
+    assert_eq!(code, 4, "symlink root must be rejected: {stderr}");
+
+    let (code, _, _) = run_audit(&fixture, &["authz-audit", "fsync", "--probe"]);
+    assert_eq!(code, 0, "fsync --probe");
+
+    let (code, _, _) = run_audit(&fixture, &["authz-audit", "fsync", "--probe", "also.bin"]);
+    assert_eq!(code, 4, "fsync mutex");
+
+    let missing = fixture._temp.path().join("no-such-file");
+    let (code, _, _) = run_audit(
+        &fixture,
+        &["authz-audit", "fsync", missing.to_str().unwrap()],
+    );
+    assert_eq!(code, 4, "fsync open failure");
+
+    let ok_file = fixture._temp.path().join("fsync-ok.bin");
+    fs::write(&ok_file, b"durable").expect("write fsync target");
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &["authz-audit", "fsync", ok_file.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "fsync success: {stderr}");
+
+    let nested = fixture._temp.path().join("as-file");
+    fs::write(&nested, b"x").expect("write as-file");
+    let bogus = nested.join("child");
+    let (code, _, _) = run_audit(&fixture, &["authz-audit", "fsync", bogus.to_str().unwrap()]);
+    assert_eq!(code, 4, "fsync via non-dir parent / missing child");
 }

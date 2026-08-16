@@ -501,7 +501,20 @@ W1..W6 终态与重试收敛（同文件 `baseline_promotion.rs`）：
 - **already-current**：指针 digest = 目标且版本字节一致 → `ALREADY_CURRENT_MARKER`（`already-current`），与 expect fencing 无关。
 - W3（版本已建、指针未切）与 W5（指针可能已新）均由读指针 + UN-39 幂等写入收敛。
 
+## `authz-audit` CLI 骨架（UN-29）
+
+子命令注册与审计两模式装配（`src/commands/authz_audit.rs`；promote 模式归 UN-37）：
+
+- **三处注册**：`builtin()` / `builtin_exec()` / `load_mode()`；遗漏 `load_mode` 会在 `cli.rs` 变成 unknown subcommand。
+- **`load_mode`**：`bootstrap-candidate` / `compare` → `LoadMode::ParsedConfig`（AC 冻结名）；`fsync` → `LoadMode::None`。ParsedConfig 在 `authz-audit` 上走 `ConfigLoader::load_readonly()`（UN-34），禁止缺省生成 `config.toml`。
+- **参数表**：审计两模式必选 `--restricted-root` + `--out` + `--restricted-out`（裸文件名）；`compare` 另必选 `--expect-digest`。基线指针由根内部派生（`baselines/current.json`，UN-39），无第二路径参数。
+- **双输出**：`--out` = sanitized 报告（四字段 schema，含 UN-34 `source_summary`）；`--restricted-out` = bootstrap 的候选 artifact / compare 的 findings。全部经 UN-32 writer 落入 `runs/<run-id>/`；stdout 末行恰好一行 `run_id=<id>`。
+- **执行路径**：`ReadOnlyContext::open`（UN-30）→ `read_authz_source` → UN-26 核心 → 维护锁内 sweep → `ReservedRun` admit/write/commit（UN-59）；失败 abort。
+- **退出码**（全文唯一冻结处）：0 成功；2 审计 diff/比对失败；3 CAS fencing（promote，UN-37）；4 参数/环境（含 fsync 互斥、writer/root 失败）。
+- **工具模式**：`authz-audit fsync <路径>`（`File::sync_all` + 父目录 `fsync`）与 `authz-audit fsync --probe`（空操作）互斥；纯文件、不加载配置。
+
 ## 写入路径容量强制（UN-59）
+
 
 硬上限检查与 admission 接线（`src/contract/policy/secure_hardcap.rs` + `secure_artifact.rs` / `secure_sweep.rs`）：
 

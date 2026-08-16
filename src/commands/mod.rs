@@ -1,3 +1,4 @@
+pub mod authz_audit;
 pub mod config;
 pub mod debug;
 pub mod service;
@@ -85,7 +86,12 @@ pub(crate) struct CommandContext {
 pub(crate) type CommandExec = fn(CommandContext, &ArgMatches) -> MegaResult;
 
 pub fn builtin() -> Vec<Command> {
-    vec![service::cli(), config::cli(), debug::cli()]
+    vec![
+        service::cli(),
+        config::cli(),
+        debug::cli(),
+        authz_audit::cli(),
+    ]
 }
 
 pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
@@ -93,6 +99,7 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
         "service" => service::exec,
         "config" => config::exec,
         "debug" => debug::exec,
+        "authz-audit" => authz_audit::exec,
         _ => return None,
     };
 
@@ -103,6 +110,7 @@ pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
     match cmd {
         "service" | "debug" => Some(LoadMode::FullAppContext),
         "config" => Some(config::load_mode(args)),
+        "authz-audit" => Some(authz_audit::load_mode(args)),
         _ => None,
     }
 }
@@ -133,6 +141,6 @@ mod tests {
             .map(|cmd| cmd.get_name().to_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["service", "config", "debug"]);
+        assert_eq!(names, vec!["service", "config", "debug", "authz-audit"]);
     }
 }

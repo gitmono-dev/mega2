@@ -60,11 +60,30 @@ pub enum MegaError {
     StaleMonorepoRootRef,
     #[error("Other error: {0}")]
     Other(String),
+    /// Process exit with a frozen CLI status code (UN-29 authz-audit table).
+    #[error("{message}")]
+    CliExit { code: i32, message: String },
 }
 
 impl MegaError {
     pub fn print(&self) {
         eprintln!("{}", self);
+    }
+
+    /// Status code for the process. Most errors remain exit 1; CLI modes that
+    /// freeze a table (UN-29) use [`MegaError::CliExit`].
+    pub fn process_exit_code(&self) -> i32 {
+        match self {
+            Self::CliExit { code, .. } => *code,
+            _ => 1,
+        }
+    }
+
+    pub fn cli_exit(code: i32, message: impl Into<String>) -> Self {
+        Self::CliExit {
+            code,
+            message: message.into(),
+        }
     }
 }
 
