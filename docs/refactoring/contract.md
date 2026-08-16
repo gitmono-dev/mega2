@@ -399,4 +399,15 @@ digest 只接受**规范小写**形式（版本文件由 `hex::encode` 命名即
 
 **fail-closed 的边界**：指针读不懂、manifest 解析不了（非法 JSON / `schema_version` 不是 1 / digest 不是 `sha256:<64hex>` / 多余字段），一律**停止 sweep**而不是退化成「那就当没有保护」——在不知道什么受保护的情况下继续删，正是这里唯一要避免的结局。**缺失不等于读不懂**：根本没有 manifest 只意味着除 current 外没有额外保护。
 
-**本卡的接缝（不是猜测）**：reservation 计数器归 UN-57（这里只要求「每个 run 一个 bit」的 `ReservationView`，两卡因此不必就更大的东西达成一致；`NoReservations` 是计数器就位前的默认——刻意选**偏向删除**的一侧，因为没有计数器时保护活动 run 的是 lease 与年龄，而假装每个 run 都有 reservation 会直接让 sweep 失效而不是更安全）；sweep 报告归 UN-49、准入与告警归 UN-58、指针完整 schema 归 UN-39（这里只需要「当前是哪个版本」，读不懂即拒绝）。
+**本卡的接缝（不是猜测）**：reservation 计数器归 UN-57（这里只要求「每个 run 一个 bit」的 `ReservationView`，两卡因此不必就更大的东西达成一致；`NoReservations` 是计数器就位前的默认——刻意选**偏向删除**的一侧，因为没有计数器时保护活动 run 的是 lease 与年龄，而假装每个 run 都有 reservation 会直接让 sweep 失效而不是更安全）；准入与告警归 UN-58、指针完整 schema 归 UN-39（这里只需要「当前是哪个版本」，读不懂即拒绝）。
+
+## 留存 sweep 的审计报告（UN-49）
+
+sweep 每跑完一轮，在同一把维护锁下写出一份审计报告（`src/contract/policy/secure_sweep.rs`）：
+
+- **路径**：`<root>/sweep-reports/<run-id>.json`（`O_EXCL`、`0600`、文件 fsync + 目录 fsync；run-id 由 writer 侧 `generate_run_id()` 独占生成）。
+- **逐条记录**：`deleted` / `skipped-active` / `skipped-protected` / `kept`，每条带理由；非法命名项**永不删除**，报告里只保留前 100 个名字 + `total` 计数。
+- **有界性**：明细条目生成期收敛到 ≤ 1000；序列化字节 ≤ 256 KiB 为**写时硬上限**——超限整份写入失败，**不截断产物**。
+- **自限 R=100**：`sweep-reports/` 只留最新 100 份；超出时按 mtime 删最旧，同秒以文件名字典序 tie-break（与 sweep 本体对 run/version 的「最旧」事实源一致）。
+
+预留/结算协议的接线归 UN-59；本卡不消费计数器。

@@ -3,7 +3,7 @@ members = ["bin"]
 
 [package]
 name = "monoengine-core"
-version = "0.2.49"
+version = "0.2.50"
 edition = "2024"
 
 [lib]
@@ -69,7 +69,7 @@ once_cell = "1.21.4"
 # is intentionally NOT a dependency of monoengine-core. The core depends only on
 # the `orbit-api` contract crate; the binary (`bin/`) injects the concrete orbit
 # implementation at startup. See docs/refactoring/orbit.md.
-orbit-api = { path = "../orbit/crates/orbit-api" }
+orbit-api = { path = "../orbit/api" }
 openssl = "0.10.81"
 openssl-sys = "0.9.117"
 parse-display = "0.11.0"

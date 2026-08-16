@@ -53,6 +53,9 @@ pub const RUNS_DIR: &str = "runs";
 /// second path parameter is a second thing to get wrong, and there is only ever
 /// one current pointer per root.
 pub const POINTER_NAME: &str = "current.json";
+/// Sweep audit reports (UN-49). Separate from `runs/` so a retention sweep of
+/// run batches cannot collect the report of the sweep that just ran.
+pub const SWEEP_REPORTS_DIR: &str = "sweep-reports";
 
 /// Bounded retries when claiming a run directory (card: ≤ 5).
 const RUN_ID_CLAIM_ATTEMPTS: usize = 5;
@@ -102,6 +105,11 @@ pub enum ArtifactError {
          immutable once written"
     )]
     BaselineVersionConflict { name: String },
+    #[error(
+        "sweep report is {bytes} bytes, exceeding the {limit}-byte write ceiling; refusing \
+         rather than truncating"
+    )]
+    ReportTooLarge { bytes: usize, limit: usize },
     #[error("{operation} on {path} failed: {source}")]
     Io {
         operation: &'static str,
@@ -213,7 +221,7 @@ impl RestrictedRoot {
     ///
     /// Walks one component at a time with `O_NOFOLLOW`, so a symlink anywhere
     /// along the way is an error rather than a redirection.
-    fn open_dir(&self, relative: &Path, create: bool) -> ArtifactResult<OwnedFd> {
+    pub(crate) fn open_dir(&self, relative: &Path, create: bool) -> ArtifactResult<OwnedFd> {
         let mut current = dup_fd(self.raw(), &self.display)?;
         for component in relative.components() {
             let name = plain_name(&component)?;
@@ -400,6 +408,26 @@ pub fn replace_pointer(root: &RestrictedRoot, contents: &[u8]) -> ArtifactResult
         return Err(ArtifactError::io("renameat", POINTER_NAME, err));
     }
     fsync(dir.as_raw_fd(), BASELINES_DIR)?;
+    Ok(())
+}
+
+/// Write a file under a root-relative directory with the run-output rules:
+/// bare name, `O_EXCL`, `0600`, file fsync, directory fsync. No rename.
+///
+/// Used by the sweep report (UN-49): a crash leaves a partial file at the
+/// final path, and the caller knows the write failed by the returned error.
+pub(crate) fn write_exclusive_under(
+    root: &RestrictedRoot,
+    relative_dir: &str,
+    name: &str,
+    contents: &[u8],
+) -> ArtifactResult<()> {
+    let name = bare_name(name)?;
+    let dir = root.open_dir(Path::new(relative_dir), true)?;
+    let file = openat_create_exclusive(dir.as_raw_fd(), &name)?;
+    write_all(file.as_raw_fd(), contents, &name)?;
+    fsync(file.as_raw_fd(), &name)?;
+    fsync(dir.as_raw_fd(), relative_dir)?;
     Ok(())
 }
 

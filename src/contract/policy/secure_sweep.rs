@@ -1,4 +1,5 @@
 //! UN-38: bounding what accumulates under the restricted root.
+//! UN-49: writing an audit report of what the sweep decided.
 //!
 //! Audit runs and baseline versions pile up, and something has to remove the
 //! old ones. That "something" deletes files inside a directory an operator
@@ -24,10 +25,11 @@
 //! could be redirected by a symlink would be a delete primitive pointed at
 //! arbitrary paths.
 //!
-//! Where this card stops: the reservation counter (UN-57), the sweep report
-//! (UN-49), admission and alerting (UN-58), and the pointer's full schema
-//! (UN-39) belong to other cards. The seams for them are parameters here, not
-//! guesses.
+//! After the decisions are made, UN-49 writes one JSON report under
+//! `sweep-reports/` (0600, bounded entries and bytes, self-limited to the
+//! newest R reports). The reservation counter (UN-57), admission and alerting
+//! (UN-58), and the pointer's full schema (UN-39) belong to other cards. The
+//! seams for them are parameters here, not guesses.
 
 use std::{
     collections::BTreeSet,
@@ -37,11 +39,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::contract::policy::secure_artifact::{
     ArtifactError, ArtifactResult, BASELINES_DIR, POINTER_NAME, RUNS_DIR, RestrictedRoot,
-    retry_on_interrupt, validate_run_id,
+    SWEEP_REPORTS_DIR, generate_run_id, retry_on_interrupt, validate_run_id, write_exclusive_under,
 };
 
 /// The one lock. Sweep, promotion and admission all take it, so none of them
@@ -61,6 +63,15 @@ pub const MAX_BASELINE_VERSIONS: usize = 10;
 pub const ACTIVE_RUN_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// Crash debris is only debris once it has stopped being plausibly in use.
 pub const TEMP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// How many sweep reports are retained (UN-49).
+pub const MAX_SWEEP_REPORTS: usize = 100;
+/// Illegal names listed in a report before the rest are only counted (UN-49).
+pub const MAX_ILLEGAL_NAMES_LISTED: usize = 100;
+/// Detail entries in one report before generation stops appending (UN-49).
+pub const MAX_REPORT_ENTRIES: usize = 1000;
+/// Hard write ceiling for one report; over-size fails rather than truncates.
+pub const MAX_REPORT_BYTES: usize = 256 * 1024;
 
 /// Whether a run still holds an unsettled reservation.
 ///
@@ -103,6 +114,11 @@ pub struct SweepOutcome {
     /// afterwards, and only the second is a retention decision.
     pub skipped_vanished_runs: Vec<String>,
     pub protected_versions: Vec<String>,
+    /// Absolute path of the report written for this sweep, when writing
+    /// succeeded. Absent only if the report step was not reached.
+    pub report_path: Option<String>,
+    /// The run-id used as the report file stem (`<run-id>.json`).
+    pub report_run_id: Option<String>,
 }
 
 /// The maintenance lock, held for as long as the value lives.
@@ -150,6 +166,11 @@ impl MaintenanceLock {
 /// The caller is responsible for holding [`MaintenanceLock`] — passed in rather
 /// than taken here so the lock can span more than the sweep when the caller is
 /// also promoting or admitting, which is the whole reason it is one lock.
+///
+/// After the plan is validated against the report byte ceiling, a bounded JSON
+/// report is written under `sweep-reports/` (UN-49). The ceiling is checked
+/// **before** any retention deletion: an over-size report fails closed with
+/// the directory untouched.
 pub fn sweep(
     root: &RestrictedRoot,
     _lock: &MaintenanceLock,
@@ -157,6 +178,8 @@ pub fn sweep(
     now: SystemTime,
 ) -> ArtifactResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
+    let mut report = ReportBuilder::new();
+    let mut plan = RemovalPlan::default();
 
     // Everything that can refuse is resolved *before* anything is removed. The
     // protected set is read from the pointer and the manifest, and either can
@@ -165,19 +188,47 @@ pub fn sweep(
     let protected = protected_set(root)?;
     outcome.protected_versions = protected.iter().cloned().collect();
 
-    sweep_runs(root, reservations, now, &mut outcome)?;
-    sweep_versions(root, &protected, now, &mut outcome)?;
+    plan_sweep_runs(
+        root,
+        reservations,
+        now,
+        &mut outcome,
+        &mut report,
+        &mut plan,
+    )?;
+    plan_sweep_versions(root, &protected, now, &mut report, &mut plan)?;
+
+    // Byte ceiling before destruction: a report that cannot be written must not
+    // leave deletions without an audit trail.
+    let run_id = generate_run_id();
+    let bytes = report.into_bytes(&run_id)?;
+
+    execute_removal_plan(root, reservations, now, &mut outcome, plan)?;
+
+    let written = persist_sweep_report(root, &run_id, &bytes)?;
+    outcome.report_run_id = Some(written.run_id);
+    outcome.report_path = Some(written.path);
 
     Ok(outcome)
 }
 
+#[derive(Default)]
+struct RemovalPlan {
+    runs: Vec<Entry>,
+    versions: Vec<String>,
+    /// `(parent_dir_name, entry)`
+    temps: Vec<(&'static str, Entry)>,
+}
+
 // ---------------------------------------------------------------- runs
 
-fn sweep_runs(
+fn plan_sweep_runs(
     root: &RestrictedRoot,
     reservations: &dyn ReservationView,
     now: SystemTime,
     outcome: &mut SweepOutcome,
+    report: &mut ReportBuilder,
+    plan: &mut RemovalPlan,
 ) -> ArtifactResult<()> {
     let Some(runs) = open_dir_if_present(root.as_raw_fd(), RUNS_DIR)? else {
         return Ok(());
@@ -186,10 +237,13 @@ fn sweep_runs(
     let mut batches: Vec<Entry> = Vec::new();
     for entry in read_entries(runs.as_raw_fd(), RUNS_DIR)? {
         if entry.name.starts_with(".tmp-") {
-            if let Some(claim) = claim_stale_temp(runs.as_raw_fd(), &entry, now)? {
-                unlink_at(runs.as_raw_fd(), &entry.name, entry.is_dir)?;
-                drop(claim);
-                outcome.removed_temp_files.push(entry.name);
+            if claim_stale_temp(runs.as_raw_fd(), &entry, now)?.is_some() {
+                report.push(
+                    format!("{RUNS_DIR}/{}", entry.name),
+                    ReportAction::Deleted,
+                    "stale temporary under runs/",
+                );
+                plan.temps.push((RUNS_DIR, entry));
             }
             continue;
         }
@@ -197,6 +251,7 @@ fn sweep_runs(
         // Left alone on purpose: a sweep that deletes what it does not
         // recognise is a delete primitive with a directory listing for input.
         if validate_run_id(&entry.name).is_err() || !entry.is_dir {
+            report.note_illegal(format!("{RUNS_DIR}/{}", entry.name));
             continue;
         }
         batches.push(entry);
@@ -205,21 +260,44 @@ fn sweep_runs(
     order_oldest_first(&mut batches);
 
     let removable = batches.len().saturating_sub(MAX_RUN_BATCHES);
-    for entry in batches.into_iter().take(removable) {
-        let claim = match claim_for_removal(runs.as_raw_fd(), &entry, reservations, now)? {
-            Claim::Held(claim) => claim,
+    for (index, entry) in batches.into_iter().enumerate() {
+        if index >= removable {
+            report.push(
+                format!("{RUNS_DIR}/{}", entry.name),
+                ReportAction::Kept,
+                "within run retention limit",
+            );
+            continue;
+        }
+        match claim_for_removal(runs.as_raw_fd(), &entry, reservations, now)? {
+            Claim::Held(_claim) => {
+                // Drop the claim immediately: holding leases across the whole
+                // plan would pin every candidate until execute, and the byte
+                // ceiling check must come first. Execute re-claims.
+                report.push(
+                    format!("{RUNS_DIR}/{}", entry.name),
+                    ReportAction::Deleted,
+                    "beyond run retention limit",
+                );
+                plan.runs.push(entry);
+            }
             Claim::Active => {
+                report.push(
+                    format!("{RUNS_DIR}/{}", entry.name),
+                    ReportAction::SkippedActive,
+                    "lease held or unsettled reservation within active window",
+                );
                 outcome.skipped_active_runs.push(entry.name);
-                continue;
             }
             Claim::Vanished => {
+                report.push(
+                    format!("{RUNS_DIR}/{}", entry.name),
+                    ReportAction::SkippedActive,
+                    "vanished between listing and removal",
+                );
                 outcome.skipped_vanished_runs.push(entry.name);
-                continue;
             }
-        };
-        remove_dir_recursive(runs.as_raw_fd(), &entry.name)?;
-        drop(claim);
-        outcome.removed_runs.push(entry.name);
+        }
     }
 
     Ok(())
@@ -313,11 +391,12 @@ fn try_hold_lease(run_dir: RawFd) -> ArtifactResult<Option<Option<OwnedFd>>> {
 
 // ---------------------------------------------------------------- versions
 
-fn sweep_versions(
+fn plan_sweep_versions(
     root: &RestrictedRoot,
     protected: &BTreeSet<String>,
     now: SystemTime,
-    outcome: &mut SweepOutcome,
+    report: &mut ReportBuilder,
+    plan: &mut RemovalPlan,
 ) -> ArtifactResult<()> {
     let Some(baselines) = open_dir_if_present(root.as_raw_fd(), BASELINES_DIR)? else {
         return Ok(());
@@ -326,11 +405,17 @@ fn sweep_versions(
     let mut versions: Vec<Entry> = Vec::new();
     for entry in read_entries(baselines.as_raw_fd(), BASELINES_DIR)? {
         if entry.name.starts_with(".tmp-") {
-            if let Some(claim) = claim_stale_temp(baselines.as_raw_fd(), &entry, now)? {
-                unlink_at(baselines.as_raw_fd(), &entry.name, entry.is_dir)?;
-                drop(claim);
-                outcome.removed_temp_files.push(entry.name);
+            if claim_stale_temp(baselines.as_raw_fd(), &entry, now)?.is_some() {
+                report.push(
+                    format!("{BASELINES_DIR}/{}", entry.name),
+                    ReportAction::Deleted,
+                    "stale temporary under baselines/",
+                );
+                plan.temps.push((BASELINES_DIR, entry));
             }
+            continue;
+        }
+        if entry.name == POINTER_NAME || entry.name == PROTECTED_MANIFEST {
             continue;
         }
         // Only names this module produces are candidates. Treating every file
@@ -338,11 +423,17 @@ fn sweep_versions(
         // retention casualty — the same reason an unrecognised run directory is
         // left alone.
         if entry.is_dir || !is_version_file_name(&entry.name) {
+            report.note_illegal(format!("{BASELINES_DIR}/{}", entry.name));
             continue;
         }
         // Protected versions are exempt *and* excluded from the count, so
         // protecting one cannot push another out of the retention window.
         if protected.contains(&entry.name) {
+            report.push(
+                format!("{BASELINES_DIR}/{}", entry.name),
+                ReportAction::SkippedProtected,
+                "named by current pointer or protected.json",
+            );
             continue;
         }
         versions.push(entry);
@@ -351,9 +442,67 @@ fn sweep_versions(
     order_oldest_first(&mut versions);
 
     let removable = versions.len().saturating_sub(MAX_BASELINE_VERSIONS);
-    for entry in versions.into_iter().take(removable) {
-        unlink_at(baselines.as_raw_fd(), &entry.name, false)?;
-        outcome.removed_versions.push(entry.name);
+    for (index, entry) in versions.into_iter().enumerate() {
+        if index >= removable {
+            report.push(
+                format!("{BASELINES_DIR}/{}", entry.name),
+                ReportAction::Kept,
+                "within baseline retention limit",
+            );
+            continue;
+        }
+        report.push(
+            format!("{BASELINES_DIR}/{}", entry.name),
+            ReportAction::Deleted,
+            "beyond baseline retention limit",
+        );
+        plan.versions.push(entry.name);
+    }
+
+    Ok(())
+}
+
+fn execute_removal_plan(
+    root: &RestrictedRoot,
+    reservations: &dyn ReservationView,
+    now: SystemTime,
+    outcome: &mut SweepOutcome,
+    plan: RemovalPlan,
+) -> ArtifactResult<()> {
+    if let Some(runs) = open_dir_if_present(root.as_raw_fd(), RUNS_DIR)? {
+        for entry in plan.runs {
+            match claim_for_removal(runs.as_raw_fd(), &entry, reservations, now)? {
+                Claim::Held(claim) => {
+                    remove_dir_recursive(runs.as_raw_fd(), &entry.name)?;
+                    drop(claim);
+                    outcome.removed_runs.push(entry.name);
+                }
+                Claim::Active => {
+                    outcome.skipped_active_runs.push(entry.name);
+                }
+                Claim::Vanished => {
+                    outcome.skipped_vanished_runs.push(entry.name);
+                }
+            }
+        }
+    }
+
+    if let Some(baselines) = open_dir_if_present(root.as_raw_fd(), BASELINES_DIR)? {
+        for name in plan.versions {
+            unlink_at(baselines.as_raw_fd(), &name, false)?;
+            outcome.removed_versions.push(name);
+        }
+    }
+
+    for (parent_name, entry) in plan.temps {
+        let Some(parent) = open_dir_if_present(root.as_raw_fd(), parent_name)? else {
+            continue;
+        };
+        if let Some(claim) = claim_stale_temp(parent.as_raw_fd(), &entry, now)? {
+            unlink_at(parent.as_raw_fd(), &entry.name, entry.is_dir)?;
+            drop(claim);
+            outcome.removed_temp_files.push(entry.name);
+        }
     }
 
     Ok(())
@@ -866,8 +1015,219 @@ fn remove_dir_recursive(parent: RawFd, name: &str) -> ArtifactResult<()> {
     Ok(())
 }
 
-/// Sanity: the sweep's constants are the ones the card froze.
+/// Sanity: the sweep's constants are the ones the cards froze.
 const _: () = {
     assert!(MAX_RUN_BATCHES == 20);
     assert!(MAX_BASELINE_VERSIONS == 10);
+    assert!(MAX_SWEEP_REPORTS == 100);
+    assert!(MAX_ILLEGAL_NAMES_LISTED == 100);
+    assert!(MAX_REPORT_ENTRIES == 1000);
+    assert!(MAX_REPORT_BYTES == 256 * 1024);
 };
+
+// ---------------------------------------------------------------- UN-49 report
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ReportAction {
+    Deleted,
+    SkippedActive,
+    SkippedProtected,
+    Kept,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportEntry {
+    path: String,
+    action: ReportAction,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IllegalNamesSummary {
+    total: usize,
+    sample: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SweepReportDocument {
+    schema_version: u32,
+    run_id: String,
+    entries: Vec<ReportEntry>,
+    illegal_names: IllegalNamesSummary,
+}
+
+struct ReportBuilder {
+    entries: Vec<ReportEntry>,
+    illegal_sample: Vec<String>,
+    illegal_total: usize,
+}
+
+impl ReportBuilder {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            illegal_sample: Vec::new(),
+            illegal_total: 0,
+        }
+    }
+
+    fn push(&mut self, path: String, action: ReportAction, reason: &str) {
+        if self.entries.len() >= MAX_REPORT_ENTRIES {
+            return;
+        }
+        self.entries.push(ReportEntry {
+            path,
+            action,
+            reason: reason.to_string(),
+        });
+    }
+
+    fn note_illegal(&mut self, path: String) {
+        self.illegal_total = self.illegal_total.saturating_add(1);
+        if self.illegal_sample.len() < MAX_ILLEGAL_NAMES_LISTED {
+            self.illegal_sample.push(path);
+        }
+    }
+
+    fn into_bytes(self, run_id: &str) -> ArtifactResult<Vec<u8>> {
+        let doc = SweepReportDocument {
+            schema_version: 1,
+            run_id: run_id.to_string(),
+            entries: self.entries,
+            illegal_names: IllegalNamesSummary {
+                total: self.illegal_total,
+                sample: self.illegal_sample,
+            },
+        };
+        // Compact JSON: every byte counts against the hard ceiling.
+        let bytes = serde_json::to_vec(&doc).map_err(|err| ArtifactError::Io {
+            operation: "serde_json::to_vec",
+            path: format!("{SWEEP_REPORTS_DIR}/{run_id}.json"),
+            source: io::Error::other(err),
+        })?;
+        if bytes.len() > MAX_REPORT_BYTES {
+            return Err(ArtifactError::ReportTooLarge {
+                bytes: bytes.len(),
+                limit: MAX_REPORT_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+struct WrittenReport {
+    run_id: String,
+    path: String,
+}
+
+fn persist_sweep_report(
+    root: &RestrictedRoot,
+    run_id: &str,
+    bytes: &[u8],
+) -> ArtifactResult<WrittenReport> {
+    let file_name = format!("{run_id}.json");
+    write_exclusive_under(root, SWEEP_REPORTS_DIR, &file_name, bytes)?;
+    prune_sweep_reports(root)?;
+    Ok(WrittenReport {
+        path: root
+            .display()
+            .join(SWEEP_REPORTS_DIR)
+            .join(&file_name)
+            .display()
+            .to_string(),
+        run_id: run_id.to_string(),
+    })
+}
+
+/// Keep only the newest [`MAX_SWEEP_REPORTS`] reports.
+///
+/// "Newest" is mtime, with the file name as the tie-break — the same rule the
+/// sweep itself uses for runs and versions, so two reports stamped in the same
+/// second do not depend on directory enumeration order.
+///
+/// Only files whose stem is a valid run-id are candidates for pruning. An
+/// illegal name under `sweep-reports/` is left alone for the same reason an
+/// unrecognised run directory is: pruning must not become a delete primitive
+/// over arbitrary `.json` files.
+fn prune_sweep_reports(root: &RestrictedRoot) -> ArtifactResult<()> {
+    let Some(dir) = open_dir_if_present(root.as_raw_fd(), SWEEP_REPORTS_DIR)? else {
+        return Ok(());
+    };
+
+    let mut reports: Vec<Entry> = Vec::new();
+    for entry in read_entries(dir.as_raw_fd(), SWEEP_REPORTS_DIR)? {
+        if entry.is_dir {
+            continue;
+        }
+        let Some(stem) = entry.name.strip_suffix(".json") else {
+            continue;
+        };
+        if validate_run_id(stem).is_err() {
+            continue;
+        }
+        reports.push(entry);
+    }
+
+    if reports.len() <= MAX_SWEEP_REPORTS {
+        return Ok(());
+    }
+
+    order_oldest_first(&mut reports);
+    let excess = reports.len() - MAX_SWEEP_REPORTS;
+    for entry in reports.into_iter().take(excess) {
+        unlink_at(dir.as_raw_fd(), &entry.name, false)?;
+    }
+    Ok(())
+}
+
+/// Build a report document's bytes without writing — **test only**.
+///
+/// Lets the byte-ceiling and entry-cap tests exercise the serializer without
+/// going through a full sweep fixture.
+#[cfg(test)]
+pub fn un49_report_bytes_for_test(
+    entries: Vec<(String, &'static str, String)>,
+    illegal: Vec<String>,
+    run_id: &str,
+) -> ArtifactResult<Vec<u8>> {
+    let mut builder = ReportBuilder::new();
+    for (path, action, reason) in entries {
+        let action = match action {
+            "deleted" => ReportAction::Deleted,
+            "skipped-active" => ReportAction::SkippedActive,
+            "skipped-protected" => ReportAction::SkippedProtected,
+            "kept" => ReportAction::Kept,
+            other => {
+                return Err(ArtifactError::Io {
+                    operation: "un49_report_bytes_for_test",
+                    path: other.to_string(),
+                    source: io::Error::new(io::ErrorKind::InvalidInput, "unknown action"),
+                });
+            }
+        };
+        builder.push(path, action, &reason);
+    }
+    for name in illegal {
+        builder.note_illegal(name);
+    }
+    builder.into_bytes(run_id)
+}
+
+/// Force-write a report file and prune — **test only**.
+#[cfg(test)]
+pub fn un49_write_and_prune_for_test(
+    root: &RestrictedRoot,
+    run_id: &str,
+    contents: &[u8],
+) -> ArtifactResult<()> {
+    let file_name = format!("{run_id}.json");
+    if contents.len() > MAX_REPORT_BYTES {
+        return Err(ArtifactError::ReportTooLarge {
+            bytes: contents.len(),
+            limit: MAX_REPORT_BYTES,
+        });
+    }
+    write_exclusive_under(root, SWEEP_REPORTS_DIR, &file_name, contents)?;
+    prune_sweep_reports(root)
+}

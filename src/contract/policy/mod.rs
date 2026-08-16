@@ -27,6 +27,8 @@ mod un26_audit;
 mod un32_writer;
 #[cfg(test)]
 mod un38_sweep;
+#[cfg(test)]
+mod un49_report;
 pub mod util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

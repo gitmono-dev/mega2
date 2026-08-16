@@ -4259,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.2.49"
+version = "0.2.50"
 dependencies = [
  "async-trait",
  "jemallocator",
@@ -4278,7 +4278,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine-core"
-version = "0.2.49"
+version = "0.2.50"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4822,7 +4822,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "object_store",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
