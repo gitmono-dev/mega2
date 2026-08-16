@@ -60,6 +60,7 @@ pub fn cli() -> Command {
         .subcommand(crate::commands::authz_audit_run::run_abort_cli())
         .subcommand(crate::commands::authz_audit_protect::protect_cli())
         .subcommand(crate::commands::authz_audit_protect::unprotect_cli())
+        .subcommand(crate::commands::authz_audit_evidence::evidence_append_cli())
         .subcommand(fsync_cli())
 }
 
@@ -163,7 +164,8 @@ fn restricted_out_arg() -> Arg {
 pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
     match args.subcommand() {
         Some((
-            "fsync" | "promote" | "run-init" | "run-commit" | "run-abort" | "protect" | "unprotect",
+            "fsync" | "promote" | "run-init" | "run-commit" | "run-abort" | "protect" | "unprotect"
+            | "evidence-append",
             _,
         )) => LoadMode::None,
         Some(("bootstrap-candidate" | "compare", _)) => LoadMode::ParsedConfig,
@@ -189,6 +191,9 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         }
         Some(("unprotect", mode_args)) => {
             crate::commands::authz_audit_protect::exec_unprotect(mode_args)
+        }
+        Some(("evidence-append", mode_args)) => {
+            crate::commands::authz_audit_evidence::exec_evidence_append(mode_args)
         }
         Some(("fsync", mode_args)) => exec_fsync(mode_args),
         Some((other, _)) => Err(MegaError::cli_exit(

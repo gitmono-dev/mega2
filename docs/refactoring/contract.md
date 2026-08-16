@@ -540,6 +540,15 @@ Kill Switch evidence 专用 run 面（`src/commands/authz_audit_run.rs`；纯文
 - **P ≤ 20**：清单已满时 `protect` 以退出码 4 拒绝；`unprotect` 不受 P 上限阻挡。
 - **schema**：`{"schema_version":1,"protected":[...]}`（`deny_unknown_fields`；digest 经 `validate_artifact_digest`；写出时按字典序、紧凑 JSON、无尾换行）。
 
+## evidence 强类型写入器（UN-56）
+
+Kill Switch evidence 的唯一强类型写入入口（`src/commands/authz_audit_evidence.rs`；纯文件，`LoadMode::None`）：
+
+- **`evidence-append`**：`--run-id` / `--channel` / `--check` / `--verdict` / 可选 `--status`；目标 `runs/<run-id>/killswitch-evidence.json`。
+- **schema（本卡唯一冻结）**：`{"schema_version":1,"run_id":"...","checks":[{channel,check,verdict,status,timestamp},...]}`；`deny_unknown_fields`；timestamp 由本模式生成（RFC3339）；顶层 `run_id` 必须等于参数。
+- **channel→check**：http→`http_serving|http_status|http_binding|tls_chain`；git→`git_ls_remote|git_binding`；ssh→`ssh_negotiate|ssh_host_key|ssh_binding`；log→`log_no_would_deny`；非法组合拒绝。
+- **原子 RMW**：run 目录 `.evidence.lock` 上 `flock(LOCK_EX)`（与脚本长持有的 `.lease.lock` 分文件）→ 读改写 → 临时 O_EXCL → fsync → replace → 目录 fsync；≤ 256 KiB 硬上限，超限失败不截断。
+
 ## 写入路径容量强制（UN-59）
 
 

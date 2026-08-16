@@ -398,6 +398,81 @@ impl RunDir {
         fsync(self.fd.as_raw_fd(), RUNS_DIR)?;
         Ok(())
     }
+
+    /// Open an existing run directory (does not create).
+    pub(crate) fn open(root: &RestrictedRoot, run_id: &str) -> ArtifactResult<Self> {
+        validate_run_id(run_id)?;
+        let runs = root.open_dir(Path::new(RUNS_DIR), false)?;
+        let fd = openat_dir(runs.as_raw_fd(), run_id)?;
+        Ok(Self {
+            run_id: run_id.to_string(),
+            fd,
+        })
+    }
+
+    /// Read a bare regular file under this run, or `None` if absent.
+    pub(crate) fn read_file(&self, name: &str) -> ArtifactResult<Option<Vec<u8>>> {
+        let name = bare_name(name)?;
+        read_regular_if_present(self.fd.as_raw_fd(), &name)
+    }
+
+    /// Atomically replace a bare file under this run (temp + fsync + rename + dir fsync).
+    ///
+    /// Used by Kill Switch evidence append (UN-56): crash leaves a stale temp;
+    /// the committed file stays the previous bytes.
+    pub(crate) fn replace_file(&self, name: &str, contents: &[u8]) -> ArtifactResult<()> {
+        let name = bare_name(name)?;
+        crate::contract::policy::secure_capacity::hard_cap_violation(
+            crate::contract::policy::secure_capacity::infer_write_class(&name),
+            contents.len(),
+        )
+        .map_err(|(bytes, limit)| ArtifactError::WriteTooLarge {
+            class: crate::contract::policy::secure_capacity::infer_write_class(&name).name(),
+            bytes,
+            limit,
+        })?;
+        let temp = format!(".tmp-{}", random_suffix());
+        let file = openat_create_exclusive(self.fd.as_raw_fd(), &temp)?;
+        write_all(file.as_raw_fd(), contents, &temp)?;
+        fsync(file.as_raw_fd(), &temp)?;
+        drop(file);
+        if let Err(err) = renameat(self.fd.as_raw_fd(), &temp, &name) {
+            unlinkat(self.fd.as_raw_fd(), &temp);
+            return Err(ArtifactError::io("renameat", name, err));
+        }
+        fsync(self.fd.as_raw_fd(), RUNS_DIR)?;
+        Ok(())
+    }
+
+    /// Open-or-create a lock file under this run and take `flock(LOCK_EX)`.
+    ///
+    /// The returned fd holds the lock until dropped (kernel unlocks on close).
+    pub(crate) fn lock_exclusive(&self, lock_name: &str) -> ArtifactResult<OwnedFd> {
+        let name = bare_name(lock_name)?;
+        let c_name = cstring(Path::new(&name))?;
+        // SAFETY: run dir fd is open; `c_name` outlives the call.
+        let fd = retry_on_interrupt(|| unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        });
+        if fd < 0 {
+            return Err(ArtifactError::io(
+                "openat",
+                name.clone(),
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: fresh descriptor owned here.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        if retry_on_interrupt(|| unsafe { libc::flock(owned.as_raw_fd(), libc::LOCK_EX) }) < 0 {
+            return Err(ArtifactError::io("flock", name, io::Error::last_os_error()));
+        }
+        Ok(owned)
+    }
 }
 
 /// Write an immutable baseline version file.

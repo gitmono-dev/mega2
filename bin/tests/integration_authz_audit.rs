@@ -1833,3 +1833,313 @@ fn integration_authz_audit_protect_registry() {
     );
     assert_eq!(code, 4);
 }
+
+/// UN-56：真实二进制 evidence-append（往返 / 严格拒绝 / sentinel / 256KiB / lease / 并发）。
+#[test]
+fn integration_authz_audit_evidence_append() {
+    use std::{
+        os::{
+            fd::AsRawFd,
+            unix::fs::{OpenOptionsExt, PermissionsExt},
+        },
+        sync::Barrier,
+        thread,
+    };
+
+    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
+    let fixture = Fixture::new();
+    let restricted = fixture._temp.path().join("restricted-evidence");
+    fs::create_dir_all(&restricted).expect("root");
+    let root = restricted.to_str().unwrap().to_string();
+
+    let (code, stdout, stderr) = run_audit(
+        &fixture,
+        &["authz-audit", "run-init", "--restricted-root", &root],
+    );
+    assert_eq!(code, 0, "run-init: {stderr}");
+    let run_id = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("run_id="))
+        .expect("run_id")
+        .to_string();
+    let run_dir = restricted.join("runs").join(&run_id);
+    let evidence_path = run_dir.join("killswitch-evidence.json");
+
+    // Hold .lease.lock across appends (must not block .evidence.lock RMW).
+    let lease = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(run_dir.join(".lease.lock"))
+        .expect("lease");
+    unsafe {
+        assert_eq!(
+            libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+            0
+        );
+    }
+
+    for (check, verdict, status) in [
+        ("http_serving", "pass", Some("200")),
+        ("http_status", "fail", Some("503")),
+        ("tls_chain", "skip", None),
+    ] {
+        let mut args = vec![
+            "authz-audit",
+            "evidence-append",
+            "--restricted-root",
+            root.as_str(),
+            "--run-id",
+            run_id.as_str(),
+            "--channel",
+            "http",
+            "--check",
+            check,
+            "--verdict",
+            verdict,
+        ];
+        if let Some(s) = status {
+            args.push("--status");
+            args.push(s);
+        }
+        let (code, _, stderr) = run_audit(&fixture, &args);
+        assert_eq!(code, 0, "append {check}: {stderr}");
+    }
+
+    let body = fs::read(&evidence_path).expect("evidence");
+    let meta = fs::metadata(&evidence_path).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["run_id"], run_id);
+    assert_eq!(doc["checks"].as_array().unwrap().len(), 3);
+    assert_eq!(doc["checks"][0]["check"], "http_serving");
+    assert_eq!(doc["checks"][0]["status"], 200);
+    assert_eq!(doc["checks"][2]["status"], serde_json::Value::Null);
+    assert!(
+        doc["checks"][0]["timestamp"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+
+    let text = String::from_utf8_lossy(&body);
+    for needle in [
+        "stdout",
+        "stderr",
+        "\"refs\"",
+        "password",
+        "Bearer ",
+        "/home/",
+        "C:\\\\Users",
+    ] {
+        assert!(!text.contains(needle), "sentinel hit `{needle}` in {text}");
+    }
+
+    let (code, _, _) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "evidence-append",
+            "--restricted-root",
+            &root,
+            "--run-id",
+            &run_id,
+            "--channel",
+            "http",
+            "--check",
+            "git_ls_remote",
+            "--verdict",
+            "pass",
+        ],
+    );
+    assert_eq!(code, 4);
+
+    fs::write(
+        &evidence_path,
+        br#"{"schema_version":1,"run_id":"x","surprise":true}"#,
+    )
+    .unwrap();
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "evidence-append",
+            "--restricted-root",
+            &root,
+            "--run-id",
+            &run_id,
+            "--channel",
+            "log",
+            "--check",
+            "log_no_would_deny",
+            "--verdict",
+            "pass",
+        ],
+    );
+    assert_eq!(code, 4, "strict reject: {stderr}");
+
+    // Fill until one more append would exceed 256 KiB, then write and append once.
+    let sample = serde_json::json!({
+        "channel": "log",
+        "check": "log_no_would_deny",
+        "verdict": "skip",
+        "status": null,
+        "timestamp": "2026-08-17T00:00:00Z",
+    });
+    let mut checks = Vec::new();
+    loop {
+        let mut next = checks.clone();
+        next.push(sample.clone());
+        let next_bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "checks": next,
+        }))
+        .unwrap();
+        if next_bytes.len() > 256 * 1024 {
+            break;
+        }
+        checks.push(sample.clone());
+    }
+    assert!(
+        !checks.is_empty(),
+        "fixture must grow beyond empty before cap test"
+    );
+    fs::write(
+        &evidence_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "checks": checks,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "evidence-append",
+            "--restricted-root",
+            &root,
+            "--run-id",
+            &run_id,
+            "--channel",
+            "log",
+            "--check",
+            "log_no_would_deny",
+            "--verdict",
+            "pass",
+        ],
+    );
+    assert_eq!(code, 4, "256 KiB hard cap: {stderr}");
+
+    // Planted temp must not block a distinct O_EXCL suffix.
+    fs::write(run_dir.join(".tmp-planted"), b"stale").unwrap();
+    fs::write(
+        &evidence_path,
+        format!(r#"{{"schema_version":1,"run_id":"{run_id}","checks":[]}}"#),
+    )
+    .unwrap();
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "evidence-append",
+            "--restricted-root",
+            &root,
+            "--run-id",
+            &run_id,
+            "--channel",
+            "git",
+            "--check",
+            "git_binding",
+            "--verdict",
+            "pass",
+        ],
+    );
+    assert_eq!(code, 0, "temp collision ok: {stderr}");
+    assert!(run_dir.join(".tmp-planted").is_file());
+
+    // Concurrent appends on a fresh run: no lost updates.
+    let (code, stdout2, _) = run_audit(
+        &fixture,
+        &["authz-audit", "run-init", "--restricted-root", &root],
+    );
+    assert_eq!(code, 0);
+    let run_id2 = stdout2
+        .lines()
+        .find_map(|l| l.strip_prefix("run_id="))
+        .unwrap()
+        .to_string();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for i in 0..2 {
+        let barrier = Arc::clone(&barrier);
+        let root_c = root.clone();
+        let rid = run_id2.clone();
+        let config = fixture.config_path.clone();
+        let base_dir = fixture.base_dir.clone();
+        let cache_dir = fixture.cache_dir.clone();
+        let object_root = fixture.object_root.clone();
+        let db_url = fixture.database.db_url.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+            command
+                .env("MEGA_BASE_DIR", &base_dir)
+                .env("MEGA_CACHE_DIR", &cache_dir)
+                .env("MEGA_DATABASE__DB_URL", &db_url)
+                .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
+                .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &object_root)
+                .env("MEGA_REDIS__URL", integration_redis_url())
+                .arg("--config")
+                .arg(&config)
+                .arg("--profile")
+                .arg("it")
+                .args([
+                    "authz-audit",
+                    "evidence-append",
+                    "--restricted-root",
+                    &root_c,
+                    "--run-id",
+                    &rid,
+                    "--channel",
+                    "ssh",
+                    "--check",
+                    "ssh_negotiate",
+                    "--verdict",
+                    "pass",
+                    "--status",
+                    &i.to_string(),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let (code, _, stderr) = output_status(&mut command);
+            assert_eq!(code, 0, "concurrent append: {stderr}");
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let concurrent: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            restricted
+                .join("runs")
+                .join(&run_id2)
+                .join("killswitch-evidence.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        concurrent["checks"].as_array().unwrap().len(),
+        2,
+        "no lost update: {concurrent}"
+    );
+
+    drop(lease);
+}

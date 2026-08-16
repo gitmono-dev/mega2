@@ -26,11 +26,10 @@ use crate::{
             commit_locked,
         },
         secure_producer::Producer,
-        secure_sweep::{LEASE_LOCK, MaintenanceLock},
+        secure_sweep::{EVIDENCE_LOCK, LEASE_LOCK, MaintenanceLock},
     },
 };
 
-const EVIDENCE_LOCK: &str = ".evidence.lock";
 const RUN_CAP_ENV: &str = "RUN_CAP";
 
 pub(crate) fn run_init_cli() -> Command {

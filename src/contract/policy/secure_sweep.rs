@@ -52,6 +52,8 @@ pub const MAINTENANCE_LOCK: &str = ".maintenance.lock";
 /// A run's liveness marker: held by the process that owns the run, so the lock
 /// is released by the kernel when that process dies.
 pub const LEASE_LOCK: &str = ".lease.lock";
+/// Per-call RMW mutex for Kill Switch evidence (UN-56); distinct from [`LEASE_LOCK`].
+pub const EVIDENCE_LOCK: &str = ".evidence.lock";
 /// The machine-readable protection manifest.
 pub const PROTECTED_MANIFEST: &str = "protected.json";
 

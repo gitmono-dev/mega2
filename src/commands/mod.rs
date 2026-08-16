@@ -1,4 +1,5 @@
 pub mod authz_audit;
+mod authz_audit_evidence;
 mod authz_audit_protect;
 mod authz_audit_run;
 pub mod config;
