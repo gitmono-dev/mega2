@@ -117,6 +117,10 @@ pub enum ArtifactError {
     CounterTooLarge { bytes: usize, limit: usize },
     #[error("capacity counter rejected: {reason}")]
     CounterInvalid { reason: String },
+    #[error("capacity admission denied: {reason}")]
+    AdmissionDenied { reason: String },
+    #[error("reservation lifecycle rejected: {reason}")]
+    LifecycleRejected { reason: String },
     #[error("{operation} on {path} failed: {source}")]
     Io {
         operation: &'static str,

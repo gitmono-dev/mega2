@@ -308,7 +308,7 @@ impl CapacityCounter {
     }
 }
 
-fn validate_cap_hash(value: &str) -> ArtifactResult<()> {
+pub(crate) fn validate_cap_hash(value: &str) -> ArtifactResult<()> {
     let rest = value
         .strip_prefix("sha256:")
         .ok_or_else(|| ArtifactError::CounterInvalid {

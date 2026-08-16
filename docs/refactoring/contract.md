@@ -463,3 +463,13 @@ producer 映射表归 UN-60；admission/告警归 UN-58。
 - **Create headroom**：`settled[]` 投影 ≤ 56（留 8 槽给结算/删除）；create 账本字节不可越过 40 KiB 上限。
 
 接线归 UN-59 / UN-35 / UN-52 / UN-55。
+
+## reservation 生命周期（UN-57）
+
+统一原语（`src/contract/policy/secure_lifecycle.rs`），调用方**已持有**维护锁：
+
+- **`admit_and_reserve_locked`**：内联回收（年龄 > 60 分钟且无 lease）→ UN-58 admission → 写 reservation → 更新 `reserved_bytes` → 持久化（create/delete 各用对应字节上限）。
+- **`commit_locked` / `abort_locked`**：删 reservation、写 `settled[]` 或 `delete_settled[]` 墓碑、对账；owner-fenced run 须 `run_id`+`cap_hash`，重试经墓碑幂等，错 cap 拒绝。
+- **unprotect**：逻辑配额满盘仍可删；结算进独立 `delete_settled[]`；`settled_delta = after − before`（有符号）。
+
+写入路径接线归 UN-59。

@@ -15,6 +15,7 @@ pub mod secure_admission;
 pub mod secure_artifact;
 pub mod secure_capacity;
 pub mod secure_counter;
+pub mod secure_lifecycle;
 pub mod secure_producer;
 pub mod secure_sweep;
 #[cfg(test)]
@@ -37,6 +38,8 @@ mod un49_report;
 mod un51_ledger;
 #[cfg(test)]
 mod un54_policy;
+#[cfg(test)]
+mod un57_lifecycle;
 #[cfg(test)]
 mod un58_admission;
 #[cfg(test)]
