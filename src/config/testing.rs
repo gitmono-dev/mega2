@@ -162,8 +162,11 @@ impl TestConfigBuilder {
                 db_url: self.database_url,
                 max_connection: 4,
                 min_connection: 1,
-                acquire_timeout: 5,
-                connect_timeout: 5,
+                // Same reasoning as `jupiter::tests::test_db_config` (FIX-05):
+                // long enough that only a real problem reaches the timeout,
+                // rather than a busy machine.
+                acquire_timeout: 60,
+                connect_timeout: 30,
                 sqlx_logging: false,
             },
             monorepo: MonoConfig::default(),

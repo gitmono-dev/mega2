@@ -82,8 +82,20 @@ pub async fn test_db_config(_temp_dir: &Path) -> DbConfig {
         db_url: create_test_database_url().await,
         max_connection: 2,
         min_connection: 1,
-        acquire_timeout: 5,
-        connect_timeout: 5,
+        // Generous on purpose (FIX-05). These are not a property under test —
+        // no test asserts how long acquiring a connection takes — but at five
+        // seconds they were being hit by the machine being busy rather than by
+        // anything being wrong: a full `cargo test --all` runs dozens of
+        // threads, several of which are applying migrations with
+        // `refresh = true`, which drops and rebuilds an entire schema. The
+        // result was a timeout reported as a vault or storage failure, in a
+        // different test each run.
+        //
+        // A timeout still exists so a genuinely stuck connection fails the run
+        // instead of hanging it; it is simply long enough that only a real
+        // problem reaches it.
+        acquire_timeout: 60,
+        connect_timeout: 30,
         sqlx_logging: false,
     }
 }
