@@ -423,3 +423,14 @@ sweep 每跑完一轮，在同一把维护锁下写出一份审计报告（`src/
 - **对账**：`reconcile_counts_from_disk` 只重建磁盘计数，不动 reservation/settled 墓碑（生命周期归 UN-57）；按根目录 fd 走 `openat`/`O_NOFOLLOW`/`AT_SYMLINK_NOFOLLOW`，每目录 ≤ 1000 项、单 run 嵌套 ≤ 8 层。
 
 reservation 操作、admission、公式常量、写时硬上限分别归 UN-57 / UN-58 / UN-54 / UN-59。
+
+## 容量公式与常量（UN-54）
+
+受限根峰值容量与常量的**唯一冻结处**（`src/contract/policy/secure_capacity.rs`）：
+
+- **Canonical 公式**：`5 MiB × (N + A) + 2 MiB × (K + P + 1 current + 1 temporary) + 256 KiB × R + 64 KiB 固定元数据`（与计划「性能与容量摘要」逐字一致；`peak_capacity_bytes` 代入求值）。
+- **参数**：N=20、K=10、A=2、P≤20、R=100、D=1000；固定元数据 64 KiB；promote admission **一律按 2 MiB** 计（`promote_admission_bytes`）。
+- **元数据上限**（与 UN-51 对齐）：create reservations ≤ 64、settled ≤ 64、delete_settled ≤ 16、`.counters.json` ≤ 48 KiB（含 8 KiB delete headroom）。
+- **per-type 写时硬上限**（值冻结于此，强制归 UN-59）：candidate/baseline ≤ 2 MiB、sanitized report ≤ 1 MiB、restricted diff ≤ 4 MiB、sweep-report/evidence ≤ 256 KiB。
+
+producer 映射表归 UN-60；admission/告警归 UN-58。

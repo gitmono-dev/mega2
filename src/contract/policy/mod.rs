@@ -12,6 +12,7 @@ mod objects;
 pub mod resource;
 pub mod reviewer_parser;
 pub mod secure_artifact;
+pub mod secure_capacity;
 pub mod secure_counter;
 pub mod secure_sweep;
 #[cfg(test)]
@@ -32,6 +33,8 @@ mod un38_sweep;
 mod un49_report;
 #[cfg(test)]
 mod un51_ledger;
+#[cfg(test)]
+mod un54_policy;
 pub mod util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -56,22 +56,23 @@ pub const LEASE_LOCK: &str = ".lease.lock";
 pub const PROTECTED_MANIFEST: &str = "protected.json";
 
 /// How many run batches are kept.
-pub const MAX_RUN_BATCHES: usize = 20;
+pub const MAX_RUN_BATCHES: usize = crate::contract::policy::secure_capacity::N;
 /// How many baseline versions are kept, not counting protected ones.
-pub const MAX_BASELINE_VERSIONS: usize = 10;
+pub const MAX_BASELINE_VERSIONS: usize = crate::contract::policy::secure_capacity::K;
 /// A run younger than this with an unsettled reservation is treated as active.
 pub const ACTIVE_RUN_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// Crash debris is only debris once it has stopped being plausibly in use.
 pub const TEMP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// How many sweep reports are retained (UN-49).
-pub const MAX_SWEEP_REPORTS: usize = 100;
+pub const MAX_SWEEP_REPORTS: usize = crate::contract::policy::secure_capacity::R;
 /// Illegal names listed in a report before the rest are only counted (UN-49).
 pub const MAX_ILLEGAL_NAMES_LISTED: usize = 100;
 /// Detail entries in one report before generation stops appending (UN-49).
-pub const MAX_REPORT_ENTRIES: usize = 1000;
+pub const MAX_REPORT_ENTRIES: usize = crate::contract::policy::secure_capacity::D;
 /// Hard write ceiling for one report; over-size fails rather than truncates.
-pub const MAX_REPORT_BYTES: usize = 256 * 1024;
+pub const MAX_REPORT_BYTES: usize =
+    crate::contract::policy::secure_capacity::MAX_SWEEP_REPORT_OR_EVIDENCE_BYTES as usize;
 
 /// Whether a run still holds an unsettled reservation.
 ///
