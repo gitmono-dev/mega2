@@ -125,6 +125,8 @@ pub struct SweepOutcome {
 /// The maintenance lock, held for as long as the value lives.
 pub struct MaintenanceLock {
     _fd: OwnedFd,
+    /// `(st_dev, st_ino)` of the restricted root this lock was taken against.
+    root_id: (u64, u64),
 }
 
 impl MaintenanceLock {
@@ -152,14 +154,39 @@ impl MaintenanceLock {
         }
     }
 
+    /// Refuse a lock that was acquired against a different restricted root.
+    pub fn assert_guards(&self, root: &RestrictedRoot) -> ArtifactResult<()> {
+        let id = root_identity(root)?;
+        if id != self.root_id {
+            return Err(ArtifactError::Io {
+                operation: "maintenance lock",
+                path: MAINTENANCE_LOCK.to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "maintenance lock was acquired for a different restricted root",
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn open_and_lock(root: &RestrictedRoot, how: libc::c_int) -> ArtifactResult<Self> {
+        let root_id = root_identity(root)?;
         let fd = open_or_create_lock(root.as_raw_fd(), MAINTENANCE_LOCK)?;
         // SAFETY: `fd` is an open descriptor owned by this call.
         if unsafe { libc::flock(fd.as_raw_fd(), how) } < 0 {
             return Err(io_error("flock", MAINTENANCE_LOCK));
         }
-        Ok(Self { _fd: fd })
+        Ok(Self { _fd: fd, root_id })
     }
+}
+
+fn root_identity(root: &RestrictedRoot) -> ArtifactResult<(u64, u64)> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(root.as_raw_fd(), &mut stat) } < 0 {
+        return Err(io_error("fstat", "."));
+    }
+    Ok((stat.st_dev, stat.st_ino))
 }
 
 /// Run the sweep.

@@ -474,6 +474,15 @@ producer 映射表归 UN-60；admission/告警归 UN-58。
 
 写入路径接线归 UN-59。
 
+## baseline 指针 codec（UN-39）
+
+指针与版本文件的冻结 schema（`src/contract/policy/baseline_pointer.rs`；写原语复用 UN-32）：
+
+- **指针** `baselines/current.json`：canonical JSON `{"schema_version":1,"digest":"sha256:<64hex>"}`（紧凑、键序固定、无尾换行）；严格解析（额外字段 / 未知版本 / 非法 digest fail-closed）；no-follow 读取；写入 = 维护锁内临时文件 + 原子 replace。
+- **版本文件** `baselines/<64hex>.json`：内容寻址、NOREPLACE；同 digest 幂等（逐字节一致）或冲突 fail-closed。
+
+CAS 编排与崩溃恢复归 UN-35 / UN-40。
+
 ## 写入路径容量强制（UN-59）
 
 硬上限检查与 admission 接线（`src/contract/policy/secure_hardcap.rs` + `secure_artifact.rs` / `secure_sweep.rs`）：

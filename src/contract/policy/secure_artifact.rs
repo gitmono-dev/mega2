@@ -130,6 +130,8 @@ pub enum ArtifactError {
     AdmissionDenied { reason: String },
     #[error("reservation lifecycle rejected: {reason}")]
     LifecycleRejected { reason: String },
+    #[error("baseline pointer rejected: {reason}")]
+    PointerInvalid { reason: String },
     #[error("{operation} on {path} failed: {source}")]
     Io {
         operation: &'static str,
@@ -459,7 +461,7 @@ pub fn write_baseline_version(
 /// The one artifact meant to be replaced, so a plain rename — atomic, and the
 /// reader either sees the old pointer or the new one. Serialising concurrent
 /// promotions is the promotion card's job; this is the write primitive it uses.
-pub fn replace_pointer(root: &RestrictedRoot, contents: &[u8]) -> ArtifactResult<()> {
+pub(crate) fn replace_pointer(root: &RestrictedRoot, contents: &[u8]) -> ArtifactResult<()> {
     let dir = root.open_dir(Path::new(BASELINES_DIR), true)?;
     let temp = format!(".tmp-{}", random_suffix());
 
