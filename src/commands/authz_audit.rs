@@ -1,7 +1,8 @@
 //! UN-29: `authz-audit` CLI skeleton — audit modes + fsync tool mode.
+//! UN-37: `authz-audit promote` mode (pure file; no config / DB).
 //!
-//! Promote mode is UN-37. Audit core is UN-26; readonly context is UN-30;
-//! restricted writes are UN-32/UN-59.
+//! Audit core is UN-26; readonly context is UN-30; restricted writes are
+//! UN-32/UN-59; promotion state machine is UN-35/UN-40.
 
 use std::{
     fs::OpenOptions,
@@ -23,7 +24,8 @@ use crate::{
             BaselineArtifact, DiffVerdict, SanitizedReport, bootstrap_candidate, compare,
         },
         baseline_pointer::{read_current_pointer, read_version_for_digest},
-        secure_artifact::{ArtifactError, RestrictedRoot},
+        baseline_promotion::{PromoteRequest, promote, resolve_promote_fence},
+        secure_artifact::{ArtifactError, CandidateReference, RestrictedRoot, read_candidate},
         secure_hardcap::ReservedRun,
         secure_lifecycle::NoLeases,
         secure_producer::Producer,
@@ -34,6 +36,7 @@ use crate::{
 /// Frozen CLI exit codes (UN-29 unique freeze point).
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_AUDIT_DIFF: i32 = 2;
+pub const EXIT_FENCING: i32 = 3;
 pub const EXIT_PARAM: i32 = 4;
 
 #[derive(Debug, Serialize)]
@@ -51,6 +54,7 @@ pub fn cli() -> Command {
         .arg_required_else_help(true)
         .subcommand(bootstrap_cli())
         .subcommand(compare_cli())
+        .subcommand(promote_cli())
         .subcommand(fsync_cli())
 }
 
@@ -75,6 +79,38 @@ fn compare_cli() -> Command {
         )
         .arg(out_arg())
         .arg(restricted_out_arg())
+}
+
+fn promote_cli() -> Command {
+    Command::new("promote")
+        .about("Promote a candidate baseline under CAS fencing (no config / DB)")
+        .arg(restricted_root_arg())
+        .arg(
+            Arg::new("candidate")
+                .long("candidate")
+                .required(true)
+                .value_name("RUN_ID/FILE")
+                .help("Root-relative candidate: <run-id>/<bare-file-name>"),
+        )
+        .arg(
+            Arg::new("expect-digest")
+                .long("expect-digest")
+                .required(true)
+                .value_name("DIGEST")
+                .help("Content digest of the candidate bytes (sha256:<64hex>)"),
+        )
+        .arg(
+            Arg::new("expect-no-current")
+                .long("expect-no-current")
+                .action(ArgAction::SetTrue)
+                .help("Fence: current pointer must be absent (first promote)"),
+        )
+        .arg(
+            Arg::new("expect-current-digest")
+                .long("expect-current-digest")
+                .value_name("DIGEST")
+                .help("Fence: current pointer must equal this digest (update)"),
+        )
 }
 
 fn fsync_cli() -> Command {
@@ -121,7 +157,7 @@ fn restricted_out_arg() -> Arg {
 
 pub(crate) fn load_mode(args: &ArgMatches) -> LoadMode {
     match args.subcommand() {
-        Some(("fsync", _)) => LoadMode::None,
+        Some(("fsync" | "promote", _)) => LoadMode::None,
         Some(("bootstrap-candidate" | "compare", _)) => LoadMode::ParsedConfig,
         _ => LoadMode::ParsedConfig,
     }
@@ -132,6 +168,7 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     let result = match args.subcommand() {
         Some(("bootstrap-candidate", mode_args)) => exec_bootstrap(ctx, mode_args).await,
         Some(("compare", mode_args)) => exec_compare(ctx, mode_args).await,
+        Some(("promote", mode_args)) => exec_promote(mode_args),
         Some(("fsync", mode_args)) => exec_fsync(mode_args),
         Some((other, _)) => Err(MegaError::cli_exit(
             EXIT_PARAM,
@@ -235,6 +272,45 @@ async fn exec_compare(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
             "authorization ACL differs from the approved baseline",
         )),
     }
+}
+
+fn exec_promote(args: &ArgMatches) -> MegaResult {
+    let root_path = require_path(args, "restricted-root")?;
+    let candidate_ref = args
+        .get_one::<String>("candidate")
+        .cloned()
+        .ok_or_else(|| MegaError::cli_exit(EXIT_PARAM, "--candidate is required"))?;
+    let expect_digest = args
+        .get_one::<String>("expect-digest")
+        .cloned()
+        .ok_or_else(|| MegaError::cli_exit(EXIT_PARAM, "--expect-digest is required"))?;
+    let expect_no_current = args.get_flag("expect-no-current");
+    let expect_current = args
+        .get_one::<String>("expect-current-digest")
+        .map(String::as_str);
+
+    let fence = resolve_promote_fence(expect_no_current, expect_current).map_err(artifact_err)?;
+    let reference = CandidateReference::parse(&candidate_ref).map_err(artifact_err)?;
+
+    let root = RestrictedRoot::open(&root_path).map_err(artifact_err)?;
+    let candidate = read_candidate(&root, &reference).map_err(artifact_err)?;
+
+    let outcome = promote(
+        &root,
+        PromoteRequest {
+            candidate: &candidate,
+            expect_digest: &expect_digest,
+            fence,
+            now: SystemTime::now(),
+            directory_entries: 0,
+        },
+    )
+    .map_err(artifact_err)?;
+
+    if let Some(marker) = outcome.already_current_marker() {
+        eprintln!("{marker}");
+    }
+    Ok(())
 }
 
 fn exec_fsync(args: &ArgMatches) -> MegaResult {
@@ -391,9 +467,12 @@ fn audit_err(err: crate::contract::policy::authz_audit::AuditError) -> MegaError
 }
 
 fn artifact_err(err: ArtifactError) -> MegaError {
-    // Writer / root / capacity failures are environment errors on this CLI
-    // surface (frozen table: 0/2/3/4 — no separate writer code).
-    MegaError::cli_exit(EXIT_PARAM, err.to_string())
+    match err {
+        ArtifactError::PromotionFencing { reason, code } => MegaError::cli_exit(code, reason),
+        // Writer / root / capacity / fence-param failures are environment or
+        // parameter errors on this CLI surface (frozen table: 0/2/3/4).
+        other => MegaError::cli_exit(EXIT_PARAM, other.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -494,5 +573,117 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn un37_exit_codes_table() {
+        assert_eq!(EXIT_OK, 0);
+        assert_eq!(EXIT_AUDIT_DIFF, 2);
+        assert_eq!(EXIT_FENCING, 3);
+        assert_eq!(EXIT_PARAM, 4);
+    }
+
+    #[test]
+    fn un37_promote_load_mode_is_none() {
+        let matches = app()
+            .try_get_matches_from([
+                "monoengine",
+                "authz-audit",
+                "promote",
+                "--restricted-root",
+                "/tmp/r",
+                "--candidate",
+                "20260815T101112Z-1/candidate.json",
+                "--expect-digest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-no-current",
+            ])
+            .expect("parse");
+        let Some(("authz-audit", args)) = matches.subcommand() else {
+            panic!("missing");
+        };
+        assert_eq!(load_mode("authz-audit", args), Some(LoadMode::None));
+    }
+
+    #[test]
+    fn un37_promote_cas_flags_mutex_and_required() {
+        let both = promote_cli()
+            .try_get_matches_from([
+                "promote",
+                "--restricted-root",
+                "/tmp/r",
+                "--candidate",
+                "20260815T101112Z-1/candidate.json",
+                "--expect-digest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-no-current",
+                "--expect-current-digest",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ])
+            .expect("clap allows both; exec enforces mutex");
+        let err = exec_promote(&both).expect_err("mutex");
+        assert!(matches!(
+            err,
+            MegaError::CliExit {
+                code: EXIT_PARAM,
+                ..
+            }
+        ));
+
+        let neither = promote_cli()
+            .try_get_matches_from([
+                "promote",
+                "--restricted-root",
+                "/tmp/r",
+                "--candidate",
+                "20260815T101112Z-1/candidate.json",
+                "--expect-digest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ])
+            .expect("parse");
+        let err = exec_promote(&neither).expect_err("missing fence");
+        assert!(matches!(
+            err,
+            MegaError::CliExit {
+                code: EXIT_PARAM,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn un37_promote_rejects_absolute_candidate() {
+        let matches = promote_cli()
+            .try_get_matches_from([
+                "promote",
+                "--restricted-root",
+                "/tmp/r",
+                "--candidate",
+                "/abs/candidate.json",
+                "--expect-digest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--expect-no-current",
+            ])
+            .expect("parse");
+        let err = exec_promote(&matches).expect_err("absolute");
+        assert!(matches!(
+            err,
+            MegaError::CliExit {
+                code: EXIT_PARAM,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn un37_promote_missing_required_flags_fail_clap() {
+        let err = app().try_get_matches_from([
+            "monoengine",
+            "authz-audit",
+            "promote",
+            "--restricted-root",
+            "/tmp/r",
+        ]);
+        assert!(err.is_err());
     }
 }

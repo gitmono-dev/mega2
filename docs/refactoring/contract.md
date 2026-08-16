@@ -512,8 +512,19 @@ W1..W6 终态与重试收敛（同文件 `baseline_promotion.rs`）：
 - **执行路径**：`ReadOnlyContext::open`（UN-30）→ `read_authz_source` → UN-26 核心 → 维护锁内 sweep → `ReservedRun` admit/write/commit（UN-59）；失败 abort。
 - **退出码**（全文唯一冻结处）：0 成功；2 审计 diff/比对失败；3 CAS fencing（promote，UN-37）；4 参数/环境（含 fsync 互斥、writer/root 失败）。
 - **工具模式**：`authz-audit fsync <路径>`（`File::sync_all` + 父目录 `fsync`）与 `authz-audit fsync --probe`（空操作）互斥；纯文件、不加载配置。
+- **promote**：见 UN-37。
+
+## `authz-audit promote`（UN-37）
+
+纯文件模式接线（`src/commands/authz_audit.rs`）：
+
+- **`load_mode`**：`promote` → `LoadMode::None`（不加载配置、不触 DB）。
+- **参数**：必选 `--restricted-root`、`--candidate <run-id>/<裸文件名>`（经 `CandidateReference` + 根 fd 读取）、`--expect-digest`（候选**字节** content digest）；CAS 二选一 `--expect-no-current` / `--expect-current-digest`。
+- **分派**：`promote()`（UN-35）；无 run 产物、不触发 sweep。
+- **退出**：fencing → 3；`already-current` → 0 且 stderr 打印 `already-current`。
 
 ## 写入路径容量强制（UN-59）
+
 
 
 硬上限检查与 admission 接线（`src/contract/policy/secure_hardcap.rs` + `secure_artifact.rs` / `secure_sweep.rs`）：

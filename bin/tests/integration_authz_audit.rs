@@ -1052,20 +1052,211 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
     );
     assert_eq!(counters["reserved_bytes"], 0);
 
-    let restricted_root = monoengine_core::authz_audit_ops::RestrictedRoot::open(&restricted)
-        .expect("open restricted root");
     let file_digest = monoengine_core::authz_audit_ops::content_digest(&candidate_bytes);
-    monoengine_core::authz_audit_ops::promote(
-        &restricted_root,
-        monoengine_core::authz_audit_ops::PromoteRequest {
-            candidate: &candidate_bytes,
-            expect_digest: &file_digest,
-            fence: monoengine_core::authz_audit_ops::PromoteFence::ExpectNoCurrent,
-            now: std::time::SystemTime::now(),
-            directory_entries: 0,
-        },
-    )
-    .expect("promote candidate to current pointer");
+    let candidate_ref = format!("{bootstrap_run}/candidate.json");
+
+    // --- promote (first / expect-no-current) ---
+    let (code, stdout, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "promote",
+            "--restricted-root",
+            root,
+            "--candidate",
+            &candidate_ref,
+            "--expect-digest",
+            &file_digest,
+            "--expect-no-current",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "first promote failed:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("already-current"),
+        "first promote must not be already-current"
+    );
+
+    // Retry / crash-window convergence → already-current (exit 0 + stderr token).
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "promote",
+            "--restricted-root",
+            root,
+            "--candidate",
+            &candidate_ref,
+            "--expect-digest",
+            &file_digest,
+            "--expect-no-current",
+        ],
+    );
+    assert_eq!(code, 0, "already-current retry: {stderr}");
+    assert!(
+        stderr.contains("already-current"),
+        "stderr must print already-current: {stderr}"
+    );
+
+    // Fencing: expect-no-current after a pointer exists with a *different* digest.
+    let other_run = "20990101T000000Z-1";
+    let other_dir = restricted.join("runs").join(other_run);
+    fs::create_dir_all(&other_dir).expect("other run dir");
+    let mut other_bytes = candidate_bytes.clone();
+    other_bytes.push(b'\n');
+    let other_path = other_dir.join("candidate.json");
+    fs::write(&other_path, &other_bytes).expect("write other candidate");
+    let other_digest = monoengine_core::authz_audit_ops::content_digest(&other_bytes);
+    let other_ref = format!("{other_run}/candidate.json");
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "promote",
+            "--restricted-root",
+            root,
+            "--candidate",
+            &other_ref,
+            "--expect-digest",
+            &other_digest,
+            "--expect-no-current",
+        ],
+    );
+    assert_eq!(code, 3, "fencing must exit 3: {stderr}");
+
+    // Legal update: CAS on old digest.
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "promote",
+            "--restricted-root",
+            root,
+            "--candidate",
+            &other_ref,
+            "--expect-digest",
+            &other_digest,
+            "--expect-current-digest",
+            &file_digest,
+        ],
+    );
+    assert_eq!(code, 0, "update promote failed: {stderr}");
+
+    // Concurrent already-current (same candidate): both exit 0.
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let mut command = fixture.command();
+        command
+            .args([
+                "authz-audit",
+                "promote",
+                "--restricted-root",
+                root,
+                "--candidate",
+                &other_ref,
+                "--expect-digest",
+                &other_digest,
+                "--expect-current-digest",
+                &other_digest,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        children.push(command.spawn().expect("spawn promote"));
+    }
+    let mut codes = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().expect("wait promote");
+        let code = output.status.code().unwrap_or(1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        codes.push(code);
+        assert_eq!(code, 0, "concurrent already-current exit: {stderr}");
+        assert!(
+            stderr.contains("already-current"),
+            "concurrent already-current stderr: {stderr}"
+        );
+    }
+    assert_eq!(codes, vec![0, 0]);
+
+    // Different-digest concurrent CAS on the same expect-current: at most one promotes.
+    let third_run = "20990101T000000Z-2";
+    let third_dir = restricted.join("runs").join(third_run);
+    fs::create_dir_all(&third_dir).expect("third run");
+    let mut third_bytes = candidate_bytes.clone();
+    third_bytes.extend_from_slice(b"\n\n");
+    fs::write(third_dir.join("candidate.json"), &third_bytes).expect("third candidate");
+    let third_digest = monoengine_core::authz_audit_ops::content_digest(&third_bytes);
+    let third_ref = format!("{third_run}/candidate.json");
+
+    let mut c1 = fixture.command();
+    c1.args([
+        "authz-audit",
+        "promote",
+        "--restricted-root",
+        root,
+        "--candidate",
+        &other_ref,
+        "--expect-digest",
+        &other_digest,
+        "--expect-current-digest",
+        &other_digest,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut c2 = fixture.command();
+    c2.args([
+        "authz-audit",
+        "promote",
+        "--restricted-root",
+        root,
+        "--candidate",
+        &third_ref,
+        "--expect-digest",
+        &third_digest,
+        "--expect-current-digest",
+        &other_digest,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let h1 = c1.spawn().expect("spawn1");
+    let h2 = c2.spawn().expect("spawn2");
+    let o1 = h1.wait_with_output().expect("w1");
+    let o2 = h2.wait_with_output().expect("w2");
+    let pair = (o1.status.code().unwrap_or(1), o2.status.code().unwrap_or(1));
+    let zeros = usize::from(pair.0 == 0) + usize::from(pair.1 == 0);
+    let threes = usize::from(pair.0 == 3) + usize::from(pair.1 == 3);
+    assert!(
+        (zeros == 1 && threes == 1) || zeros == 2,
+        "concurrent different-digest race: got {pair:?} stderr1={} stderr2={}",
+        String::from_utf8_lossy(&o1.stderr),
+        String::from_utf8_lossy(&o2.stderr)
+    );
+
+    // Restore original candidate so compare matches the live ACL snapshot.
+    let current_digest = {
+        let ptr: serde_json::Value = serde_json::from_slice(
+            &fs::read(restricted.join("baselines").join("current.json")).expect("pointer"),
+        )
+        .expect("pointer json");
+        ptr["digest"].as_str().unwrap().to_string()
+    };
+    let (code, _, stderr) = run_audit(
+        &fixture,
+        &[
+            "authz-audit",
+            "promote",
+            "--restricted-root",
+            root,
+            "--candidate",
+            &candidate_ref,
+            "--expect-digest",
+            &file_digest,
+            "--expect-current-digest",
+            &current_digest,
+        ],
+    );
+    assert_eq!(code, 0, "restore original baseline for compare: {stderr}");
 
     let (code, stdout, stderr) = run_audit(
         &fixture,
