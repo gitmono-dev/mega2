@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::policy::{
     secure_artifact::{
-        ArtifactError, ArtifactResult, POINTER_NAME, RestrictedRoot, replace_pointer,
-        write_baseline_version,
+        ArtifactError, ArtifactResult, BASELINES_DIR, POINTER_NAME, RestrictedRoot,
+        read_baseline_file, replace_pointer, write_baseline_version,
     },
     secure_sweep::MaintenanceLock,
 };
@@ -121,6 +121,15 @@ pub fn write_current_pointer(
     replace_pointer(root, &bytes)
 }
 
+/// Read an immutable version file by digest, or `None` if absent.
+pub fn read_version_for_digest(
+    root: &RestrictedRoot,
+    digest: &str,
+) -> ArtifactResult<Option<Vec<u8>>> {
+    let name = version_file_name(digest)?;
+    read_baseline_file(root, &name)
+}
+
 /// Write an immutable version file named for `digest`.
 ///
 /// Same digest with identical bytes is idempotent; differing bytes fail closed.
@@ -136,4 +145,9 @@ pub fn write_version_for_digest(
 /// Convenience: path display fragment for errors / tests.
 pub fn pointer_path_fragment() -> &'static str {
     POINTER_NAME
+}
+
+/// Directory fragment holding pointer and version files.
+pub fn baselines_dir_fragment() -> &'static str {
+    BASELINES_DIR
 }

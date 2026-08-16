@@ -1,8 +1,25 @@
 //! UN-35: baseline promotion CAS under the shared maintenance lock.
+//! UN-40: crash-window end states and retry convergence for that CAS.
 //!
-//! Codec/version rules are UN-39; crash-window recovery tables are UN-40.
-//! This module freezes the critical-section order, expect fencing, and the
-//! promotion producer wiring into `admit_and_reserve_locked`.
+//! Codec/version rules are UN-39. This module freezes the critical-section
+//! order, expect fencing, promotion producer wiring into
+//! `admit_and_reserve_locked`, and the W1..W6 retry table.
+//!
+//! # Crash windows (UN-40)
+//!
+//! | Window | Visible state | Retry | Temps | Exit |
+//! |---|---|---|---|---|
+//! | W1 | version `.tmp-*` left; pointer unchanged | normal promote | sweep clears by age (UN-38) | 0 on success |
+//! | W2 | version may exist after rename; dir fsync pending | UN-39 idempotent version write | — | 0 |
+//! | W3 | version present; pointer still old | continue (fence on old) | — | 0 |
+//! | W4 | pointer `.tmp-*` left | same as W1 | sweep by age | 0 |
+//! | W5 | pointer may be old or new after rename | read pointer → already-current or continue | — | 0 |
+//! | W6 | fully committed before return | already-current | — | 0 |
+//!
+//! **Already-current (frozen):** pointer digest equals the target **and** the
+//! version file bytes match the candidate → success with
+//! [`ALREADY_CURRENT_MARKER`] (CLI maps this to exit 0 + stderr), independent of
+//! expect fencing flags. `.tmp-*` cleanup stays UN-38's age rule.
 
 use std::time::SystemTime;
 
@@ -10,8 +27,8 @@ use sha2::{Digest, Sha256};
 
 use crate::contract::policy::{
     baseline_pointer::{
-        read_current_pointer, validate_artifact_digest, write_current_pointer,
-        write_version_for_digest,
+        read_current_pointer, read_version_for_digest, validate_artifact_digest,
+        write_current_pointer, write_version_for_digest,
     },
     secure_artifact::{ArtifactError, ArtifactResult, RestrictedRoot},
     secure_hardcap::{new_op_id, rfc3339_utc},
@@ -25,6 +42,26 @@ use crate::contract::policy::{
 
 /// Frozen process exit code when fencing rejects a promote (UN-29 table).
 pub const PROMOTION_FENCING_EXIT_CODE: i32 = 3;
+
+/// Stderr token for already-current idempotent success (UN-40 / CLI).
+pub const ALREADY_CURRENT_MARKER: &str = "already-current";
+
+/// Named crash windows from the UN-40 end-state table (documentary + tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashWindow {
+    /// Version temp left; pointer unchanged.
+    W1VersionTemp,
+    /// Version renamed; directory fsync not yet durable.
+    W2VersionRenamed,
+    /// Version present; pointer still previous digest / absent.
+    W3VersionWithoutPointer,
+    /// Pointer temp left.
+    W4PointerTemp,
+    /// Pointer renamed; directory fsync not yet durable.
+    W5PointerRenamed,
+    /// Promote returned successfully; caller crashed before observing it.
+    W6FullyCommitted,
+}
 
 /// Caller-supplied fencing expectation (mutually exclusive, one required).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,8 +87,18 @@ pub struct PromoteRequest<'a> {
 pub enum PromoteOutcome {
     /// Version written and pointer switched.
     Promoted { digest: String },
-    /// Pointer already named the target digest (fencing skipped).
+    /// Pointer already named the target digest with matching version bytes.
     AlreadyCurrent { digest: String },
+}
+
+impl PromoteOutcome {
+    /// CLI/stderr token for [`PromoteOutcome::AlreadyCurrent`].
+    pub fn already_current_marker(&self) -> Option<&'static str> {
+        match self {
+            Self::AlreadyCurrent { .. } => Some(ALREADY_CURRENT_MARKER),
+            Self::Promoted { .. } => None,
+        }
+    }
 }
 
 /// Resolve CLI-style expect flags into a single fence value.
@@ -85,6 +132,9 @@ pub fn content_digest(bytes: &[u8]) -> String {
 ///
 /// Critical-section order (frozen): integrity → already-current → fencing →
 /// admit → write version → switch pointer → settle.
+///
+/// Crash recovery is **retry this function** against the durable end state
+/// (UN-40 W1..W6); temps are left for UN-38 sweep.
 pub fn promote_locked(
     root: &RestrictedRoot,
     lock: &MaintenanceLock,
@@ -124,34 +174,57 @@ fn promote_locked_inner(
     }
     let target = actual;
 
-    // 2. Already-current: unique exception to fencing.
+    // 2. Already-current / repair (UN-40): pointer == target.
+    let mut skip_fencing = false;
     if let Some(current) = read_current_pointer(root)?
         && current.digest == target
     {
-        return Ok(PromoteOutcome::AlreadyCurrent { digest: target });
+        match read_version_for_digest(root, &target)? {
+            Some(existing) if existing.as_slice() == request.candidate => {
+                // W5/W6 / mid-settle crash: durable promote is done but the
+                // reservation may still be open — settle it before returning.
+                settle_matching_promotion(
+                    root,
+                    lock,
+                    &target,
+                    i64::try_from(request.candidate.len()).unwrap_or(i64::MAX),
+                    request.now,
+                )?;
+                return Ok(PromoteOutcome::AlreadyCurrent { digest: target });
+            }
+            Some(_) => {
+                return Err(ArtifactError::BaselineVersionConflict {
+                    name: crate::contract::policy::baseline_pointer::version_file_name(&target)?,
+                });
+            }
+            // Pointer ahead of version (crash mid-repair): continue without fencing.
+            None => skip_fencing = true,
+        }
     }
 
-    // 3. Expect fencing (zero writes on mismatch).
-    match &request.fence {
-        PromoteFence::ExpectNoCurrent => {
-            if read_current_pointer(root)?.is_some() {
-                return Err(fencing(
-                    "pointer already exists; --expect-no-current failed",
-                ));
+    // 3. Expect fencing (zero writes on mismatch) — skipped when repairing.
+    if !skip_fencing {
+        match &request.fence {
+            PromoteFence::ExpectNoCurrent => {
+                if read_current_pointer(root)?.is_some() {
+                    return Err(fencing(
+                        "pointer already exists; --expect-no-current failed",
+                    ));
+                }
             }
+            PromoteFence::ExpectCurrentDigest(expected) => match read_current_pointer(root)? {
+                None => {
+                    return Err(fencing("pointer is absent; --expect-current-digest failed"));
+                }
+                Some(current) if current.digest != *expected => {
+                    return Err(fencing(format!(
+                        "pointer is {}; expected {expected}",
+                        current.digest
+                    )));
+                }
+                Some(_) => {}
+            },
         }
-        PromoteFence::ExpectCurrentDigest(expected) => match read_current_pointer(root)? {
-            None => {
-                return Err(fencing("pointer is absent; --expect-current-digest failed"));
-            }
-            Some(current) if current.digest != *expected => {
-                return Err(fencing(format!(
-                    "pointer is {}; expected {expected}",
-                    current.digest
-                )));
-            }
-            Some(_) => {}
-        },
     }
 
     // 4. Admit under the held lock (kind=promotion).
@@ -233,5 +306,37 @@ fn fencing(reason: impl Into<String>) -> ArtifactError {
     ArtifactError::PromotionFencing {
         reason: reason.into(),
         code: PROMOTION_FENCING_EXIT_CODE,
+    }
+}
+
+/// Commit any open promotion reservation whose payload is `target` (crash after
+/// durable pointer switch but before settle).
+fn settle_matching_promotion(
+    root: &RestrictedRoot,
+    lock: &MaintenanceLock,
+    target: &str,
+    settled_delta: i64,
+    now: SystemTime,
+) -> ArtifactResult<()> {
+    loop {
+        let counter = crate::contract::policy::secure_counter::load_counter(root, lock)?;
+        let Some(reservation) = counter.reservations.iter().find(|r| {
+            r.kind == crate::contract::policy::secure_counter::ReservationKind::Promotion
+                && r.payload == target
+        }) else {
+            return Ok(());
+        };
+        commit_locked(
+            root,
+            lock,
+            SettleRequest {
+                op_id: reservation.op_id.clone(),
+                settled_delta,
+                final_state: "committed".into(),
+                settled_at: rfc3339_utc(now),
+                run_id: None,
+                cap_hash: None,
+            },
+        )?;
     }
 }

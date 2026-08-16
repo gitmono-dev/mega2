@@ -533,6 +533,19 @@ pub(crate) fn write_root_file_atomic(
     Ok(())
 }
 
+/// Read a bare file under `baselines/`, or `None` if the directory or file is absent.
+pub fn read_baseline_file(root: &RestrictedRoot, name: &str) -> ArtifactResult<Option<Vec<u8>>> {
+    let name = bare_name(name)?;
+    let dir = match root.open_dir(Path::new(BASELINES_DIR), false) {
+        Ok(dir) => dir,
+        Err(ArtifactError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    read_regular_if_present(dir.as_raw_fd(), &name)
+}
+
 /// Read the current pointer, if there is one.
 ///
 /// The path is derived, never passed in: one current pointer per root, and a

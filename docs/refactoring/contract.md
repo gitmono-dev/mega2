@@ -493,6 +493,14 @@ CAS 编排与崩溃恢复归 UN-35 / UN-40。
 
 崩溃窗口终态表归 UN-40。
 
+## promotion 崩溃恢复（UN-40）
+
+W1..W6 终态与重试收敛（同文件 `baseline_promotion.rs`）：
+
+- 恢复动作 = **重试 promote**；版本/指针 `.tmp-*` 由 UN-38 按年龄阈值清除（promote 不删临时文件）。
+- **already-current**：指针 digest = 目标且版本字节一致 → `ALREADY_CURRENT_MARKER`（`already-current`），与 expect fencing 无关。
+- W3（版本已建、指针未切）与 W5（指针可能已新）均由读指针 + UN-39 幂等写入收敛。
+
 ## 写入路径容量强制（UN-59）
 
 硬上限检查与 admission 接线（`src/contract/policy/secure_hardcap.rs` + `secure_artifact.rs` / `secure_sweep.rs`）：

@@ -40,6 +40,8 @@ mod un38_sweep;
 #[cfg(test)]
 mod un39_codec;
 #[cfg(test)]
+mod un40_crash;
+#[cfg(test)]
 mod un49_report;
 #[cfg(test)]
 mod un51_ledger;
