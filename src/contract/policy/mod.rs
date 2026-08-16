@@ -14,6 +14,7 @@ pub mod reviewer_parser;
 pub mod secure_artifact;
 pub mod secure_capacity;
 pub mod secure_counter;
+pub mod secure_producer;
 pub mod secure_sweep;
 #[cfg(test)]
 mod un04_admin_source;
@@ -35,6 +36,8 @@ mod un49_report;
 mod un51_ledger;
 #[cfg(test)]
 mod un54_policy;
+#[cfg(test)]
+mod un60_mapping;
 pub mod util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

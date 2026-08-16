@@ -434,3 +434,19 @@ reservation 操作、admission、公式常量、写时硬上限分别归 UN-57 /
 - **per-type 写时硬上限**（值冻结于此，强制归 UN-59）：candidate/baseline ≤ 2 MiB、sanitized report ≤ 1 MiB、restricted diff ≤ 4 MiB、sweep-report/evidence ≤ 256 KiB。
 
 producer 映射表归 UN-60；admission/告警归 UN-58。
+
+## producer 映射表（UN-60）
+
+受限写入入口 → reservation 参数的**唯一冻结处**（`src/contract/policy/secure_producer.rs`）：
+
+| producer | kind | action | max_bytes | settler |
+|---|---|---|---|---|
+| `bootstrap-candidate` | run | create | 3 MiB | 模式内建 |
+| `compare` | run | create | 5 MiB | 模式内建 |
+| `promote` | promotion | create | 2 MiB（取整） | UN-35 |
+| sweep 报告 | report | create | 256 KiB | UN-59 |
+| Kill Switch evidence | run | create | 256 KiB | UN-52 |
+| `protect` | protect | create | 64 KiB | UN-55 |
+| `unprotect` | protect | delete | 0 | UN-55 |
+
+恢复规则：`protect` 期望 digest **存在**；`unprotect` 期望 digest **不存在**（相反终态）。`settled_delta` 对 protect 族为有符号 `after_len − before_len`。生命周期接线归 UN-57。
