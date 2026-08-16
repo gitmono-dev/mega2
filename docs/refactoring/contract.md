@@ -411,3 +411,15 @@ sweep 每跑完一轮，在同一把维护锁下写出一份审计报告（`src/
 - **自限 R=100**：`sweep-reports/` 只留最新 100 份；超出时按 mtime 删最旧，同秒以文件名字典序 tie-break（与 sweep 本体对 run/version 的「最旧」事实源一致）。
 
 预留/结算协议的接线归 UN-59；本卡不消费计数器。
+
+## 容量计数器核心（UN-51）
+
+受限根上的可信账本（`src/contract/policy/secure_counter.rs`），文件名 `.counters.json`：
+
+- **Schema**：`schema_version=1`；计数字段 `runs` / `versions` / `reports` / `total_bytes` / `reserved_bytes`；数组 `reservations[]` / `settled[]` / `delete_settled[]`。严格解析（`deny_unknown_fields`）；未知版本或额外字段 fail-closed。
+- **有界**：create 类 `reservations` ≤ 64（delete action 不占槽）；`settled` ≤ 64；`delete_settled` ≤ 16（满时按 `settled_at` 再 `op_id` 驱逐最旧）；序列化 ≤ 48 KiB，其中 8 KiB 为 delete/恢复应急 headroom（create 路径只许到 40 KiB）。
+- **owner_fenced**：仅 `kind=run`；evidence（`true`）结算须带 `run_id` + `cap_hash`（`sha256:<64hex>`）；audit（`false`）不得带 `cap_hash`。原始 `run_cap=` 明文永不得写入账本字节。
+- **持久化**：维护锁内 `load_counter` / `store_counter`（临时文件 + fsync + rename + 父目录 fsync）。
+- **对账**：`reconcile_counts_from_disk` 只重建磁盘计数，不动 reservation/settled 墓碑（生命周期归 UN-57）；按根目录 fd 走 `openat`/`O_NOFOLLOW`/`AT_SYMLINK_NOFOLLOW`，每目录 ≤ 1000 项、单 run 嵌套 ≤ 8 层。
+
+reservation 操作、admission、公式常量、写时硬上限分别归 UN-57 / UN-58 / UN-54 / UN-59。

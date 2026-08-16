@@ -110,6 +110,13 @@ pub enum ArtifactError {
          rather than truncating"
     )]
     ReportTooLarge { bytes: usize, limit: usize },
+    #[error(
+        "capacity counter is {bytes} bytes, exceeding the {limit}-byte ledger ceiling; refusing \
+         rather than truncating"
+    )]
+    CounterTooLarge { bytes: usize, limit: usize },
+    #[error("capacity counter rejected: {reason}")]
+    CounterInvalid { reason: String },
     #[error("{operation} on {path} failed: {source}")]
     Io {
         operation: &'static str,
@@ -428,6 +435,37 @@ pub(crate) fn write_exclusive_under(
     write_all(file.as_raw_fd(), contents, &name)?;
     fsync(file.as_raw_fd(), &name)?;
     fsync(dir.as_raw_fd(), relative_dir)?;
+    Ok(())
+}
+
+/// Read a regular file directly under the restricted root, or `None` if absent.
+pub(crate) fn read_root_file(root: &RestrictedRoot, name: &str) -> ArtifactResult<Option<Vec<u8>>> {
+    let name = bare_name(name)?;
+    read_regular_if_present(root.as_raw_fd(), &name)
+}
+
+/// Atomically replace a regular file directly under the restricted root.
+///
+/// Temp file + fsync + plain rename + directory fsync: the same durability
+/// sequence as the current-pointer write. Used for the capacity counter
+/// (UN-51), which must be replaced under the maintenance lock.
+pub(crate) fn write_root_file_atomic(
+    root: &RestrictedRoot,
+    name: &str,
+    contents: &[u8],
+) -> ArtifactResult<()> {
+    let name = bare_name(name)?;
+    let temp = format!(".tmp-{}", random_suffix());
+    let file = openat_create_exclusive(root.as_raw_fd(), &temp)?;
+    write_all(file.as_raw_fd(), contents, &temp)?;
+    fsync(file.as_raw_fd(), &temp)?;
+    drop(file);
+
+    if let Err(err) = renameat(root.as_raw_fd(), &temp, &name) {
+        unlinkat(root.as_raw_fd(), &temp);
+        return Err(ArtifactError::io("renameat", name, err));
+    }
+    fsync(root.as_raw_fd(), ".")?;
     Ok(())
 }
 
