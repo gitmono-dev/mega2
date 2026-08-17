@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50 / UN-36 / UN-53 / UN-47 / UN-42).
+# authz_kill_switch.sh — Kill Switch (… / UN-42 / UN-44).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
 # SSH probes (UN-44) on the same --selftest entry.
@@ -67,7 +67,8 @@ Environment (branch mode):
   Probes (after successful --restart): KILL_SWITCH_URLS, KILL_SWITCH_EXPECT_CODE,
     KILL_SWITCH_DEPLOY_HTTP, KILL_SWITCH_RESTRICTED_DIR (evidence run root; UN-53);
     KILL_SWITCH_LOG_DIR (UN-47 would-deny incremental; cursor before restart);
-    KILL_SWITCH_GIT_REMOTE + KILL_SWITCH_DEPLOY_GIT + KILL_SWITCH_GIT_ASKPASS (UN-42)
+    KILL_SWITCH_GIT_REMOTE + KILL_SWITCH_DEPLOY_GIT + KILL_SWITCH_GIT_ASKPASS (UN-42);
+    KILL_SWITCH_SSH_* + KILL_SWITCH_DEPLOY_SSH (UN-44); early bind exit 7
 
 Preflight (UN-50): Linux-only; requires cp/yq/jq/rg/flock/stat/getfacl/getfattr,
   KILL_SWITCH_BIN fsync --probe, and version floors (see script header).
@@ -903,6 +904,169 @@ run_log_probes() {
 
 
 # ---------------------------------------------------------------------------
+# UN-44 SSH readonly channel + cross-channel bind (fail before any writes)
+# ---------------------------------------------------------------------------
+
+fail_bind() {
+  local reason="$1"
+  printf 'authz_kill_switch: bind failure (exit 7): %s. No files were written. Manually verify KILL_SWITCH_DEPLOY_HTTP/GIT/SSH against live probe targets before re-running.\n' "$reason" >&2
+  exit 7
+}
+
+canonical_ssh_endpoint() {
+  python3 - "$1" "${2:-}" <<'PY'
+import sys
+host = sys.argv[1].strip().lower()
+port_s = (sys.argv[2] or "").strip()
+if not host:
+    print("empty ssh host", file=sys.stderr)
+    sys.exit(4)
+if host.startswith("[") and host.endswith("]"):
+    host_inner = host[1:-1]
+else:
+    host_inner = host
+    if host_inner.count(":") == 1:
+        left, right = host_inner.split(":", 1)
+        if right.isdigit():
+            host_inner, port_s = left, right
+if port_s:
+    port = int(port_s)
+else:
+    port = 22
+if ":" in host_inner:
+    host_fmt = f"[{host_inner}]"
+else:
+    host_fmt = host_inner
+print(f"{host_fmt}:{port}")
+PY
+}
+
+# Early bind: before run_branch / any secure_replace. Exit 7, zero writes.
+assert_cross_channel_bindings() {
+  local urls="${KILL_SWITCH_URLS:-}"
+  local git_remote="${KILL_SWITCH_GIT_REMOTE:-}"
+  local ssh_host="${KILL_SWITCH_SSH_HOST:-}"
+  if [[ -z "$urls" && -z "$git_remote" && -z "$ssh_host" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$urls" ]]; then
+    local deploy="${KILL_SWITCH_DEPLOY_HTTP:-}"
+    [[ -n "$deploy" ]] || fail_bind "KILL_SWITCH_DEPLOY_HTTP required when KILL_SWITCH_URLS is set"
+    deploy="$(canonical_http_origin "$deploy")"
+    local -a url_list=()
+    read -r -a url_list <<<"$urls"
+    local u origin
+    for u in "${url_list[@]}"; do
+      [[ -n "$u" ]] || continue
+      origin="$(canonical_http_origin "$u")"
+      if [[ "$origin" != "$deploy" ]]; then
+        fail_bind "HTTP probe $u origin=$origin != deploy=$deploy"
+      fi
+    done
+  fi
+
+  if [[ -n "$git_remote" ]]; then
+    local gdeploy="${KILL_SWITCH_DEPLOY_GIT:-}"
+    [[ -n "$gdeploy" ]] || fail_bind "KILL_SWITCH_DEPLOY_GIT required when KILL_SWITCH_GIT_REMOTE is set"
+    if printf '%s' "$git_remote" | grep -qiE '^https?://[^/]*@'; then
+      fail_bind "KILL_SWITCH_GIT_REMOTE must not embed credentials (userinfo)"
+    fi
+    gdeploy="$(canonical_http_origin "$gdeploy")"
+    local gorigin
+    gorigin="$(canonical_http_origin "$git_remote")"
+    if [[ "$gorigin" != "$gdeploy" ]]; then
+      fail_bind "Git remote origin=$gorigin != deploy=$gdeploy"
+    fi
+  fi
+
+  if [[ -n "$ssh_host" ]]; then
+    local sdeploy="${KILL_SWITCH_DEPLOY_SSH:-}"
+    local sport="${KILL_SWITCH_SSH_PORT:-22}"
+    [[ -n "$sdeploy" ]] || fail_bind "KILL_SWITCH_DEPLOY_SSH required when KILL_SWITCH_SSH_HOST is set"
+    sdeploy="$(canonical_ssh_endpoint "$sdeploy")"
+    local sorigin
+    sorigin="$(canonical_ssh_endpoint "$ssh_host" "$sport")"
+    if [[ "$sorigin" != "$sdeploy" ]]; then
+      fail_bind "SSH endpoint=$sorigin != deploy=$sdeploy"
+    fi
+  fi
+  printf 'authz_kill_switch: cross-channel bind checks passed\n' >&2
+}
+
+run_ssh_probes() {
+  local host="${KILL_SWITCH_SSH_HOST:-}"
+  [[ -n "$host" ]] || return 0
+  local port="${KILL_SWITCH_SSH_PORT:-22}"
+  local user="${KILL_SWITCH_SSH_USER:-}"
+  local key="${KILL_SWITCH_SSH_KEY:-}"
+  local kh="${KILL_SWITCH_SSH_KNOWN_HOSTS:-}"
+  local repo="${KILL_SWITCH_SSH_REPO:-}"
+  local deploy="${KILL_SWITCH_DEPLOY_SSH:-}"
+  local git_bin endpoint
+  [[ -n "$user" ]] || die "KILL_SWITCH_SSH_USER is required when KILL_SWITCH_SSH_HOST is set"
+  [[ -n "$key" ]] || die "KILL_SWITCH_SSH_KEY is required when KILL_SWITCH_SSH_HOST is set"
+  [[ -n "$kh" ]] || die "KILL_SWITCH_SSH_KNOWN_HOSTS is required when KILL_SWITCH_SSH_HOST is set"
+  [[ -n "$repo" ]] || die "KILL_SWITCH_SSH_REPO is required when KILL_SWITCH_SSH_HOST is set"
+  [[ -n "$deploy" ]] || die "KILL_SWITCH_DEPLOY_SSH is required when KILL_SWITCH_SSH_HOST is set"
+  [[ -f "$key" ]] || die "KILL_SWITCH_SSH_KEY is not a file: $key"
+  git_bin="$(require_git)"
+
+  endpoint="$(canonical_ssh_endpoint "$host" "$port")"
+  deploy="$(canonical_ssh_endpoint "$deploy")"
+  if [[ "$endpoint" != "$deploy" ]]; then
+    fail_t2 "SSH bind mismatch (endpoint=$endpoint deploy=$deploy)"
+  fi
+
+  evidence_session_begin
+  local evidence_settled=0
+  # shellcheck disable=SC2064
+  trap '[[ "${evidence_settled:-0}" -eq 1 ]] || evidence_session_abort' EXIT
+
+  if [[ ! -f "$kh" || ! -s "$kh" ]]; then
+    evidence_append_check ssh ssh_host_key fail
+    evidence_session_commit
+    evidence_settled=1
+    trap - EXIT
+    fail_t2 "SSH known_hosts missing or empty: $kh"
+  fi
+
+  local out err rc=0
+  out="$(mktemp "${TMPDIR:-/tmp}/killswitch-ssh-out.XXXXXX")"
+  err="$(mktemp "${TMPDIR:-/tmp}/killswitch-ssh-err.XXXXXX")"
+  local remote_url="ssh://${user}@${host}:${port}/${repo#/}"
+  local ssh_bin="${KILL_SWITCH_SSH:-ssh}"
+  set +e
+  # shellcheck disable=SC2086
+  GIT_SSH_COMMAND="$ssh_bin -i $key -p $port -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$kh -o GlobalKnownHostsFile=/dev/null" \
+    GIT_TERMINAL_PROMPT=0 \
+    "$git_bin" -c credential.helper= ls-remote "$remote_url" >"$out" 2>"$err"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    if grep -qiE 'HOST KEY VERIFICATION FAILED|known hosts|REMOTE HOST IDENTIFICATION' "$err"; then
+      evidence_append_check ssh ssh_host_key fail
+    else
+      evidence_append_check ssh ssh_negotiate fail
+    fi
+    rm -f -- "$out" "$err"
+    evidence_session_commit
+    evidence_settled=1
+    trap - EXIT
+    fail_t2 "SSH git ls-remote failed for $endpoint (exit $rc)"
+  fi
+  rm -f -- "$out" "$err"
+  evidence_append_check ssh ssh_host_key pass
+  evidence_append_check ssh ssh_negotiate pass
+  evidence_append_check ssh ssh_binding pass
+  evidence_session_commit
+  evidence_settled=1
+  trap - EXIT
+  printf 'authz_kill_switch: SSH ls-remote ok for %s; evidence recorded — not a recovery-green claim.\n' "$endpoint" >&2
+}
+
+# ---------------------------------------------------------------------------
 # UN-42 Git HTTP readonly channel (git ls-remote; no ref writes)
 # ---------------------------------------------------------------------------
 
@@ -1362,7 +1526,10 @@ run_selftest() {
     KILL_SWITCH_EXPECT_CODE KILL_SWITCH_DEPLOY_HTTP KILL_SWITCH_RESTRICTED_DIR \
     KILL_SWITCH_CONFIG KILL_SWITCH_ENV_FILE KILL_SWITCH_COMPOSE \
     KILL_SWITCH_GIT_REMOTE KILL_SWITCH_DEPLOY_GIT KILL_SWITCH_GIT_ASKPASS \
-    KILL_SWITCH_GIT_SECRET KILL_SWITCH_GIT_ZEROCHECK_REPO KILL_SWITCH_GIT || true
+    KILL_SWITCH_GIT_SECRET KILL_SWITCH_GIT_ZEROCHECK_REPO KILL_SWITCH_GIT \
+    KILL_SWITCH_SSH_HOST KILL_SWITCH_SSH_PORT KILL_SWITCH_SSH_USER KILL_SWITCH_SSH_KEY \
+    KILL_SWITCH_SSH_KNOWN_HOSTS KILL_SWITCH_SSH_REPO KILL_SWITCH_DEPLOY_SSH KILL_SWITCH_SSH \
+    KILL_SWITCH_DEPLOY_GIT KILL_SWITCH_SSH_FAKE_MODE || true
 
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/killswitch-selftest.XXXXXX")"
@@ -1940,8 +2107,8 @@ PY
     KILL_SWITCH_RESTRICTED_DIR="$restricted" \
     bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g33.err" || t2_rc=$?
   stop_http_fixture
-  [[ "$t2_rc" -eq 6 ]] || gate_fail "http_bind_mismatch" "expected exit 6, got $t2_rc"
-  evidence_json_for_latest_run "$restricted" | grep -q 'http_binding' || gate_fail "http_bind_mismatch" "missing bind evidence"
+  [[ "$t2_rc" -eq 7 ]] || gate_fail "http_bind_mismatch" "expected exit 7 (early bind), got $t2_rc"
+  grep -qi 'bind failure' "$tmp/g33.err" || gate_fail "http_bind_mismatch" "missing bind failure"
   local origin_v6 origin_def
   origin_v6="$(canonical_http_origin 'http://[::1]/x/')"
   [[ "$origin_v6" == "http://[::1]:80" ]] || gate_fail "http_bind_mismatch" "IPv6 origin got $origin_v6"
@@ -2280,7 +2447,8 @@ ASK
     KILL_SWITCH_RESTRICTED_DIR="$restricted" \
     bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g48.err" || t2_rc=$?
   stop_git_http
-  [[ "$t2_rc" -eq 6 ]] || gate_fail "git_bind_mismatch" "expected 6, got $t2_rc"
+  [[ "$t2_rc" -eq 7 ]] || gate_fail "git_bind_mismatch" "expected 7 (early bind), got $t2_rc"
+  grep -qi 'bind failure' "$tmp/g48.err" || gate_fail "git_bind_mismatch" "missing bind failure"
   local g_origin
   g_origin="$(canonical_http_origin 'http://[::1]/repo.git')"
   [[ "$g_origin" == "http://[::1]:80" ]] || gate_fail "git_bind_mismatch" "IPv6 origin $g_origin"
@@ -2355,7 +2523,158 @@ WRAP
   [[ "$t2_rc" -eq 0 ]] || gate_fail "git_zero_mutation" "expected 0, got $t2_rc: $(cat "$tmp/g51.err")"
   gate_pass "git_zero_mutation"
 
-  printf 'authz_kill_switch --selftest: 51/51 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6 + UN-53×5 + UN-47×4 + UN-42×6)\n'
+
+  # --- UN-44 gates (52–58): SSH + cross-channel bind ---
+  local sshfx="$tmp/sshfx"
+  rm -rf -- "$sshfx" && mkdir -p "$sshfx"
+  local fake_git="$sshfx/fake-git"
+  cat >"$fake_git" <<'FGIT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-c" ]]; then
+  shift 2
+fi
+if [[ "${1:-}" == "ls-remote" ]]; then
+  mode="${KILL_SWITCH_SSH_FAKE_MODE:-ok}"
+  kh="${KILL_SWITCH_SSH_KNOWN_HOSTS:-}"
+  if [[ ! -f "$kh" ]]; then
+    echo "Host key verification failed." >&2
+    exit 128
+  fi
+  if [[ "$mode" == "mismatch" ]]; then
+    echo "Host key verification failed." >&2
+    exit 128
+  fi
+  if [[ "$mode" == "negotiate_fail" ]]; then
+    echo "Permission denied (publickey)." >&2
+    exit 128
+  fi
+  printf 'deadbeef\tHEAD\n'
+  exit 0
+fi
+exec git "$@"
+FGIT
+  chmod +x "$fake_git"
+  local kh_ok="$sshfx/known_hosts"
+  printf '127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREUN44HOSTKEY\n' >"$kh_ok"
+  local key_ok="$sshfx/id_ed25519"
+  cat >"$key_ok" <<'KEY'
+-----BEGIN OPENSSH PRIVATE KEY-----
+fixture
+-----END OPENSSH PRIVATE KEY-----
+KEY
+  chmod 600 "$key_ok"
+  local ssh_env="$tmp/ssh.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$ssh_env"
+  local ssh_new="$tmp/ssh.new"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$ssh_new"
+
+  # Gate 52: SSH negotiate + ls-remote pass
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_GIT="$fake_git" \
+    KILL_SWITCH_SSH_HOST=127.0.0.1 KILL_SWITCH_SSH_PORT=22 \
+    KILL_SWITCH_SSH_USER=git KILL_SWITCH_SSH_KEY="$key_ok" \
+    KILL_SWITCH_SSH_KNOWN_HOSTS="$kh_ok" KILL_SWITCH_SSH_REPO=repo.git \
+    KILL_SWITCH_DEPLOY_SSH='127.0.0.1:22' \
+    KILL_SWITCH_SSH_FAKE_MODE=ok \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g52.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "ssh_ls_remote_ok" "expected 0, got $t2_rc: $(cat "$tmp/g52.err")"
+  evidence_json_for_latest_run "$restricted" | grep -qE 'ssh_negotiate|ssh_host_key' \
+    || gate_fail "ssh_ls_remote_ok" "missing ssh evidence"
+  gate_pass "ssh_ls_remote_ok"
+
+  # Gate 53: known_hosts missing
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_GIT="$fake_git" \
+    KILL_SWITCH_SSH_HOST=127.0.0.1 KILL_SWITCH_SSH_PORT=22 \
+    KILL_SWITCH_SSH_USER=git KILL_SWITCH_SSH_KEY="$key_ok" \
+    KILL_SWITCH_SSH_KNOWN_HOSTS="$sshfx/missing_kh" KILL_SWITCH_SSH_REPO=repo.git \
+    KILL_SWITCH_DEPLOY_SSH='127.0.0.1:22' \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g53.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "ssh_known_hosts_missing" "expected 6, got $t2_rc"
+  gate_pass "ssh_known_hosts_missing"
+
+  # Gate 54: known_hosts mismatch
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_GIT="$fake_git" \
+    KILL_SWITCH_SSH_HOST=127.0.0.1 KILL_SWITCH_SSH_PORT=22 \
+    KILL_SWITCH_SSH_USER=git KILL_SWITCH_SSH_KEY="$key_ok" \
+    KILL_SWITCH_SSH_KNOWN_HOSTS="$kh_ok" KILL_SWITCH_SSH_REPO=repo.git \
+    KILL_SWITCH_DEPLOY_SSH='127.0.0.1:22' \
+    KILL_SWITCH_SSH_FAKE_MODE=mismatch \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g54.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "ssh_known_hosts_mismatch" "expected 6, got $t2_rc"
+  gate_pass "ssh_known_hosts_mismatch"
+
+  # Gate 55: cross-channel bind mismatch → exit 7, config untouched
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\nKEEP=1\n' >"$ssh_env"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_SSH_HOST=127.0.0.1 KILL_SWITCH_SSH_PORT=22 \
+    KILL_SWITCH_SSH_USER=git KILL_SWITCH_SSH_KEY="$key_ok" \
+    KILL_SWITCH_SSH_KNOWN_HOSTS="$kh_ok" KILL_SWITCH_SSH_REPO=repo.git \
+    KILL_SWITCH_DEPLOY_SSH='127.0.0.1:2222' \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g55.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 7 ]] || gate_fail "ssh_cross_bind_mismatch" "expected 7, got $t2_rc: $(cat "$tmp/g55.err")"
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=enforce' "$ssh_env" || gate_fail "ssh_cross_bind_mismatch" "config was written"
+  grep -qi 'bind failure' "$tmp/g55.err" || gate_fail "ssh_cross_bind_mismatch" "missing guidance"
+  [[ "$(canonical_ssh_endpoint '::1')" == "[::1]:22" ]] || gate_fail "ssh_cross_bind_mismatch" "ipv6 default"
+  [[ "$(canonical_ssh_endpoint 'Example.COM' '22')" == "example.com:22" ]] || gate_fail "ssh_cross_bind_mismatch" "host case"
+  gate_pass "ssh_cross_bind_mismatch"
+
+  # Gate 56: HTTP path + Git /repo.git slash pairs
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$ssh_env"
+  start_http_fixture 18770 200 /api/v1/cl/killswitch-probe/detail
+  start_git_http 18771
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:18770/api/v1/cl/killswitch-probe/detail/" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:18770" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:18771/repo.git/" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:18771" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_ok" \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g56.err" || t2_rc=$?
+  stop_http_fixture
+  stop_git_http
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "cross_path_slash_pair" "expected 0, got $t2_rc: $(cat "$tmp/g56.err")"
+  gate_pass "cross_path_slash_pair"
+
+  # Gate 57: bind failure terminal — HTTP deploy mismatch before write
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\n' >"$ssh_env"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:18770/x" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:1" \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g57.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 7 ]] || gate_fail "bind_fail_terminal" "expected 7, got $t2_rc"
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=enforce' "$ssh_env" || gate_fail "bind_fail_terminal" "wrote config"
+  grep -qi 'No files were written' "$tmp/g57.err" || gate_fail "bind_fail_terminal" "missing zero-write claim"
+  gate_pass "bind_fail_terminal"
+
+  # Gate 58: multi-entry HTTP URLs must share deploy origin
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\n' >"$ssh_env"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ssh_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:80/a http://127.0.0.1:81/b" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:80" \
+    bash "$SELF" --branch file --apply-content "$ssh_new" --restart -- true 2>"$tmp/g58.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 7 ]] || gate_fail "bind_multi_entry" "expected 7, got $t2_rc"
+  gate_pass "bind_multi_entry"
+
+  printf 'authz_kill_switch --selftest: 58/58 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6 + UN-53×5 + UN-47×4 + UN-42×6 + UN-44×7)\n'
 
   trap - EXIT
   rm -rf -- "$tmp"
@@ -2404,6 +2723,8 @@ main() {
   done
   [[ -n "$branch" ]] || die "missing --branch or --selftest"
   run_preflight
+  # UN-44: bind before any config write (exit 7, zero writes on mismatch).
+  assert_cross_channel_bindings
   if [[ "$want_restart" -eq 1 ]]; then
     # Cursor before mutate/restart so incremental slice excludes pre-switch noise.
     log_cursor_capture
@@ -2414,6 +2735,7 @@ main() {
     run_http_probes
     run_log_probes
     run_git_probes
+    run_ssh_probes
   fi
 }
 
