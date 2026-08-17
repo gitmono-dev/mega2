@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# authz_kill_switch.sh — Kill Switch skeleton + secure write primitives (UN-33).
+# authz_kill_switch.sh — Kill Switch skeleton + secure write + metadata preserve
+# (UN-33 / UN-48).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# transforms (UN-41), metadata preserve (UN-48), restart/T1/T3 (UN-46), preflight
-# (UN-50), and recovery probes (UN-36/47/42/44) on the same --selftest entry.
+# transforms (UN-41), restart/T1/T3 (UN-46), preflight (UN-50), and recovery
+# probes (UN-36/47/42/44) on the same --selftest entry.
 #
 # Modes:
 #   --branch systemd|compose|file [--apply-content <file>]
 #       Resolve the branch target, validate it, then atomically replace its
 #       bytes from --apply-content (UN-41 will generate that content).
 #   --selftest
-#       Run the six UN-33 skeleton gates (no --branch).
+#       Run UN-33 skeleton gates + UN-48 metadata gates (no --branch).
 #   -h | --help
 
 set -euo pipefail
@@ -25,7 +26,7 @@ die() {
 
 usage() {
   cat <<'USAGE'
-authz_kill_switch.sh — Kill Switch skeleton (UN-33).
+authz_kill_switch.sh — Kill Switch skeleton + metadata preserve (UN-33/UN-48).
 
 Usage:
   bash scripts/authz_kill_switch.sh --branch systemd|compose|file --apply-content <file>
@@ -84,17 +85,19 @@ if dupes:
 PY
 }
 
-# Create a same-directory temp with O_EXCL|O_NOFOLLOW (0600), write content
-# through that fd (no reopen), and print the temp path.
-create_temp_excl_write() {
+# Claim an exclusive temp name under the target's parent (O_EXCL|O_NOFOLLOW),
+# seed it with `cp --preserve=all` from the target (owner/mode/ACL/xattr), then
+# rewrite bytes through an O_NOFOLLOW fd. Prints the temp path.
+create_temp_preserve_rewrite() {
   local target="$1"
   local content_file="$2"
   local dir base
   dir="$(dirname -- "$target")"
   base="$(basename -- "$target")"
-  python3 - "$dir" "$base" "$content_file" <<'PY'
-import os, sys, secrets, stat
-directory, base, content_path = sys.argv[1], sys.argv[2], sys.argv[3]
+  python3 - "$dir" "$base" "$target" "$content_file" <<'PY'
+import os, sys, secrets, stat, subprocess
+
+directory, base, target_path, content_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 def write_all(fd, data: bytes) -> None:
     view = memoryview(data)
@@ -104,17 +107,81 @@ def write_all(fd, data: bytes) -> None:
             raise OSError("short write")
         view = view[n:]
 
+def snapshot(path: str) -> dict:
+    st = os.stat(path, follow_symlinks=False)
+    meta = {
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+        "mode": stat.S_IMODE(st.st_mode),
+        "acl": None,
+        "xattrs": {},
+    }
+    try:
+        out = subprocess.check_output(
+            ["getfacl", "-c", "--absolute-names", "--", path],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        # Drop comments; keep ACL entries stable.
+        meta["acl"] = "\n".join(
+            line for line in out.splitlines() if line and not line.startswith("#")
+        )
+    except FileNotFoundError:
+        print("getfacl not found (required for ACL verify; UN-50 preflight)", file=sys.stderr)
+        sys.exit(4)
+    except subprocess.CalledProcessError as err:
+        detail = (err.stderr or "").strip() or str(err)
+        print(f"getfacl failed for {path}: {detail}", file=sys.stderr)
+        sys.exit(4)
+    try:
+        for name in os.listxattr(path, follow_symlinks=False):
+            meta["xattrs"][name] = os.getxattr(path, name, follow_symlinks=False)
+    except OSError as err:
+        print(f"xattr inspect failed for {path}: {err}", file=sys.stderr)
+        sys.exit(4)
+    return meta
+
+def verify(path: str, expected: dict) -> None:
+    force = os.environ.get("KILL_SWITCH_META_VERIFY_FAIL", "")
+    if force in ("1", "owner", "mode", "acl", "xattr"):
+        which = "owner" if force == "1" else force
+        print(f"metadata verify injected failure: {which}", file=sys.stderr)
+        sys.exit(4)
+    got = snapshot(path)
+    if (got["uid"], got["gid"]) != (expected["uid"], expected["gid"]):
+        print(
+            f"owner mismatch: expected {expected['uid']}:{expected['gid']} "
+            f"got {got['uid']}:{got['gid']}",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+    if got["mode"] != expected["mode"]:
+        print(
+            f"mode mismatch: expected {expected['mode']:04o} got {got['mode']:04o}",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+    if got["acl"] != expected["acl"]:
+        print("ACL mismatch after rewrite", file=sys.stderr)
+        sys.exit(4)
+    if got["xattrs"] != expected["xattrs"]:
+        print("xattr mismatch after rewrite", file=sys.stderr)
+        sys.exit(4)
+
 try:
     dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 except OSError as err:
     print(f"open parent dir failed: {directory}: {err}", file=sys.stderr)
     sys.exit(4)
 
+tmp_path = None
 try:
     st = os.stat(base, dir_fd=dir_fd, follow_symlinks=False)
     if not stat.S_ISREG(st.st_mode):
         print(f"target must be a regular file: {base}", file=sys.stderr)
         sys.exit(4)
+
+    expected = snapshot(target_path)
 
     name = f".tmp-killswitch-{base}-{secrets.token_hex(8)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -126,7 +193,31 @@ try:
     except OSError as err:
         print(f"temp O_EXCL|O_NOFOLLOW open failed: {name}: {err}", file=sys.stderr)
         sys.exit(4)
+    os.close(fd)
 
+    tmp_path = os.path.join(directory, name)
+    # Seed content + metadata from the live target (UN-48).
+    try:
+        subprocess.run(
+            ["cp", "--preserve=all", "--", target_path, tmp_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("cp not found (GNU cp --preserve=all required)", file=sys.stderr)
+        sys.exit(4)
+    except subprocess.CalledProcessError as err:
+        print(f"cp --preserve=all failed: {err.stderr.strip()}", file=sys.stderr)
+        sys.exit(4)
+
+    # Rewrite bytes in place without dropping preserved metadata.
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_NOFOLLOW | os.O_TRUNC | os.O_CLOEXEC,
+        dir_fd=dir_fd,
+    )
     try:
         with open(content_path, "rb") as src:
             while True:
@@ -137,7 +228,8 @@ try:
     finally:
         os.close(fd)
 
-    print(os.path.join(directory, name))
+    verify(tmp_path, expected)
+    print(tmp_path)
 except FileNotFoundError:
     print(f"target does not exist: {base}", file=sys.stderr)
     sys.exit(4)
@@ -180,7 +272,7 @@ fsync_path() {
   "$bin" authz-audit fsync "$path"
 }
 
-# Atomic replace: write content → fsync(temp) → mv → fsync(target).
+# Atomic replace: cp --preserve=all → rewrite → verify metadata → fsync → rename → fsync.
 secure_replace() {
   local target="$1"
   local content_file="$2"
@@ -191,7 +283,7 @@ secure_replace() {
   assert_regular_nofollow "$content_file"
 
   local tmp
-  tmp="$(create_temp_excl_write "$target" "$content_file")"
+  tmp="$(create_temp_preserve_rewrite "$target" "$content_file")"
   # shellcheck disable=SC2064
   trap 'rm -f -- "'"$tmp"'"' RETURN
 
@@ -240,7 +332,7 @@ run_branch() {
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (6 gates)
+# --selftest (UN-33 ×6 + UN-48 ×5)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -253,6 +345,44 @@ gate_fail() {
   local detail="$2"
   printf 'FAIL %s: %s\n' "$name" "$detail" >&2
   exit 1
+}
+
+# Compare owner/mode/acl/xattr of two paths (python helper).
+meta_field() {
+  local path="$1"
+  local field="$2"
+  python3 - "$path" "$field" <<'PY'
+import os, sys, stat, subprocess
+path, field = sys.argv[1], sys.argv[2]
+st = os.stat(path, follow_symlinks=False)
+if field == "owner":
+    print(f"{st.st_uid}:{st.st_gid}")
+elif field == "mode":
+    print(f"{stat.S_IMODE(st.st_mode):04o}")
+elif field == "acl":
+    try:
+        out = subprocess.check_output(
+            ["getfacl", "-c", "--absolute-names", "--", path],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        print("\n".join(line for line in out.splitlines() if line and not line.startswith("#")))
+    except Exception as err:
+        print(f"getfacl failed: {err}", file=sys.stderr)
+        raise SystemExit(4)
+elif field == "xattr":
+    items = []
+    try:
+        for name in sorted(os.listxattr(path, follow_symlinks=False)):
+            val = os.getxattr(path, name, follow_symlinks=False)
+            items.append(f"{name}={val!r}")
+    except OSError as err:
+        print(f"xattr inspect failed: {err}", file=sys.stderr)
+        raise SystemExit(4)
+    print(";".join(items))
+else:
+    raise SystemExit(f"unknown field {field}")
+PY
 }
 
 run_selftest() {
@@ -373,11 +503,82 @@ EOF
       bash "$SELF" --branch file --apply-content "$new6" 2>"$tmp/g6.err"; then
     gate_fail "dir_fsync_inject" "expected non-zero when dir fsync fails"
   fi
-  # Post-rename fsync failure: bytes may already be the new content; script must
-  # still exit non-zero (UN-46 will freeze T3). Assert non-zero already done.
   gate_pass "dir_fsync_inject"
 
-  printf 'authz_kill_switch --selftest: 6/6 gates passed\n'
+  # --- UN-48 gate 7: mode preserved ---
+  local target_m="$tmp/meta-mode.env"
+  printf 'BEFORE=1\n' >"$target_m"
+  chmod 0640 "$target_m"
+  local mode_before
+  mode_before="$(meta_field "$target_m" mode)"
+  local new_m="$tmp/meta-mode.new"
+  printf 'AFTER=1\n' >"$new_m"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$target_m" \
+    bash "$SELF" --branch file --apply-content "$new_m"
+  [[ "$(cat -- "$target_m")" == "AFTER=1" ]] || gate_fail "meta_mode_preserve" "content not updated"
+  [[ "$(meta_field "$target_m" mode)" == "$mode_before" ]] || gate_fail "meta_mode_preserve" "mode changed"
+  gate_pass "meta_mode_preserve"
+
+  # --- UN-48 gate 8: owner preserved (same uid/gid; cannot chown without root) ---
+  local target_o="$tmp/meta-owner.env"
+  printf 'OWNER=1\n' >"$target_o"
+  local owner_before
+  owner_before="$(meta_field "$target_o" owner)"
+  local new_o="$tmp/meta-owner.new"
+  printf 'OWNER=2\n' >"$new_o"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$target_o" \
+    bash "$SELF" --branch file --apply-content "$new_o"
+  [[ "$(meta_field "$target_o" owner)" == "$owner_before" ]] || gate_fail "meta_owner_preserve" "owner changed"
+  gate_pass "meta_owner_preserve"
+
+  # --- UN-48 gate 9: ACL preserved ---
+  local target_a="$tmp/meta-acl.env"
+  printf 'ACL=1\n' >"$target_a"
+  if ! setfacl -m "u:nobody:r" "$target_a" 2>"$tmp/setfacl.err"; then
+    gate_fail "meta_acl_preserve" "setfacl required for ACL fixture: $(cat "$tmp/setfacl.err")"
+  fi
+  local acl_before
+  acl_before="$(meta_field "$target_a" acl)"
+  [[ -n "$acl_before" ]] || gate_fail "meta_acl_preserve" "ACL fixture is empty after setfacl"
+  local new_a="$tmp/meta-acl.new"
+  printf 'ACL=2\n' >"$new_a"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$target_a" \
+    bash "$SELF" --branch file --apply-content "$new_a"
+  [[ "$(meta_field "$target_a" acl)" == "$acl_before" ]] || gate_fail "meta_acl_preserve" "ACL changed"
+  gate_pass "meta_acl_preserve"
+
+  # --- UN-48 gate 10: xattr preserved ---
+  local target_x="$tmp/meta-xattr.env"
+  printf 'X=1\n' >"$target_x"
+  python3 - "$target_x" <<'PY'
+import os, sys
+path = sys.argv[1]
+os.setxattr(path, "user.killswitch", b"preserve-me")
+PY
+  local xattr_before
+  xattr_before="$(meta_field "$target_x" xattr)"
+  [[ -n "$xattr_before" ]] || gate_fail "meta_xattr_preserve" "failed to set fixture xattr"
+  local new_x="$tmp/meta-xattr.new"
+  printf 'X=2\n' >"$new_x"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$target_x" \
+    bash "$SELF" --branch file --apply-content "$new_x"
+  [[ "$(meta_field "$target_x" xattr)" == "$xattr_before" ]] || gate_fail "meta_xattr_preserve" "xattr changed"
+  gate_pass "meta_xattr_preserve"
+
+  # --- UN-48 gate 11: verify failure inject ---
+  local target_v="$tmp/meta-verify.env"
+  printf 'V=1\n' >"$target_v"
+  local new_v="$tmp/meta-verify.new"
+  printf 'V=2\n' >"$new_v"
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_META_VERIFY_FAIL=mode \
+      KILL_SWITCH_CONFIG="$target_v" \
+      bash "$SELF" --branch file --apply-content "$new_v" 2>"$tmp/g11.err"; then
+    gate_fail "meta_verify_inject" "expected non-zero when metadata verify fails"
+  fi
+  [[ "$(cat -- "$target_v")" == "V=1" ]] || gate_fail "meta_verify_inject" "target mutated after verify failure"
+  gate_pass "meta_verify_inject"
+
+  printf 'authz_kill_switch --selftest: 11/11 gates passed (UN-33×6 + UN-48×5)\n'
   trap - EXIT
   rm -rf -- "$tmp"
 }
