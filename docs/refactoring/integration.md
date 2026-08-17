@@ -88,6 +88,15 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 写点 allowlist 守卫（`scripts/authz_write_points_guard.sh`）与其两个自测变异（`--selftest-add` / `--selftest-remove`）是三道独立门，任何未登记的主干 ref 写入口都会使守卫非零退出。
 
+## Kill Switch 骨架与安全写原语（UN-33；REL-02）
+
+运维入口：`bash scripts/authz_kill_switch.sh`（生产与 fixture 同一文件；家族内后续卡在同一 `--selftest` 入口叠加门）。
+
+- **分派**：`--branch systemd|compose|file`（目标分别取自 `KILL_SWITCH_ENV_FILE` / `KILL_SWITCH_COMPOSE` / `KILL_SWITCH_CONFIG`）；内容经 `--apply-content <file>` 注入（变换契约归 UN-41）。
+- **写原语**：同目录临时文件 `O_EXCL|O_NOFOLLOW` → 写入 → `KILL_SWITCH_BIN authz-audit fsync <tmp>` → `mv` → `authz-audit fsync <target>`；目标须为 no-follow 普通文件；KEY=VALUE 目标拒绝重复键。
+- **自测**：`bash scripts/authz_kill_switch.sh --selftest`（6 门：symlink 临时/目标拒绝、非 regular 拒绝、重复键拒绝、原子替换、file/dir fsync 失败注入；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/monoengine`。
+- **发布**：REL-02 子卡只本地提交；唯一发布点 UN-45。
+
 ## 迁移覆盖：`mega_cl.link` 唯一索引（UN-10）
 
 `m20260815_000000_unique_mega_cl_link` 为 `mega_cl.link` 建唯一索引 `idx_mega_cl_link_unique`（既有索引只有复合的 `(path, link)`，`link` 单列查询既非索引等值探测也不保证唯一）。`up` 在同一事务内先取 `LOCK TABLE mega_cl IN SHARE ROW EXCLUSIVE MODE`，再扫描重复 `link`；发现重复即中止并在错误里列出全部冲突 link 与各自行数，不修改任何业务行。锁从扫描前持有到索引建成，杜绝「扫描通过后、建索引前插入重复」的竞态。
