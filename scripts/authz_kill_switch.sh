@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50 / UN-36 / UN-53 / UN-47).
+# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50 / UN-36 / UN-53 / UN-47 / UN-42).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# Git/SSH probes (UN-42/44) on the same --selftest entry.
+# SSH probes (UN-44) on the same --selftest entry.
 #
 # Modes:
 #   --branch systemd|compose|file [--apply-content <file>] [--restart -- <argv...>]
 #       Preflight (UN-50) then resolve/validate/replace; without --apply-content,
 #       UN-41 generates transformed content and one-shot readback. Optional
-#       --restart runs argv exactly once; on success, UN-36 HTTP probes run when
-#       KILL_SWITCH_URLS is set (evidence via UN-53; T2→exit 6), then UN-47 log
-#       channel when KILL_SWITCH_LOG_DIR is set. T1=restart fail→exit 4;
-#       T3=post-rename fsync fail→exit 5.
+#       --restart runs argv exactly once; on success: UN-36 HTTP, UN-47 log,
+#       UN-42 Git ls-remote (when respective env set). T1=restart fail→exit 4;
+#       T3=post-rename fsync fail→exit 5; T2=probe fail→exit 6.
 #   --selftest
-#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 + UN-36 + UN-53 + UN-47 gates.
+#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 + UN-36 + UN-53 + UN-47 + UN-42 gates.
 #   -h | --help
 #
 # ---------------------------------------------------------------------------
@@ -67,7 +66,8 @@ Environment (branch mode):
   Inject:  KILL_SWITCH_READBACK_FAIL=1 (force readback failure after write)
   Probes (after successful --restart): KILL_SWITCH_URLS, KILL_SWITCH_EXPECT_CODE,
     KILL_SWITCH_DEPLOY_HTTP, KILL_SWITCH_RESTRICTED_DIR (evidence run root; UN-53);
-    KILL_SWITCH_LOG_DIR (UN-47 would-deny incremental; cursor before restart)
+    KILL_SWITCH_LOG_DIR (UN-47 would-deny incremental; cursor before restart);
+    KILL_SWITCH_GIT_REMOTE + KILL_SWITCH_DEPLOY_GIT + KILL_SWITCH_GIT_ASKPASS (UN-42)
 
 Preflight (UN-50): Linux-only; requires cp/yq/jq/rg/flock/stat/getfacl/getfattr,
   KILL_SWITCH_BIN fsync --probe, and version floors (see script header).
@@ -901,6 +901,126 @@ run_log_probes() {
   printf 'authz_kill_switch: log channel clean (no new would-deny); evidence recorded — not a recovery-green claim.\n' >&2
 }
 
+
+# ---------------------------------------------------------------------------
+# UN-42 Git HTTP readonly channel (git ls-remote; no ref writes)
+# ---------------------------------------------------------------------------
+
+require_git() {
+  local g="${KILL_SWITCH_GIT:-}"
+  if [[ -n "$g" ]]; then
+    [[ -x "$g" || -f "$g" ]] || die "KILL_SWITCH_GIT is not executable: $g"
+    printf '%s\n' "$g"
+    return
+  fi
+  command -v git >/dev/null 2>&1 || die "git is required for Git channel (UN-42)"
+  command -v git
+}
+
+# Redact userinfo and known secret tokens from a log line (never print credentials).
+git_redact_line() {
+  local line="$1"
+  local secret="${KILL_SWITCH_GIT_SECRET:-}"
+  # Strip scheme://user:pass@host → scheme://***@host
+  line="$(printf '%s' "$line" | sed -E 's#(https?://)[^/@[:space:]]+@#\1***@#g')"
+  if [[ -n "$secret" ]]; then
+    line="${line//$secret/***}"
+  fi
+  printf '%s\n' "$line"
+}
+
+git_snapshot_repo() {
+  local repo="$1"
+  # Fingerprint refs + objects names only (no content dump).
+  (
+    cd "$repo" || exit 1
+    find refs objects -type f 2>/dev/null | sort | cksum
+  )
+}
+
+run_git_probes() {
+  local remote="${KILL_SWITCH_GIT_REMOTE:-}"
+  [[ -n "$remote" ]] || return 0
+  local deploy="${KILL_SWITCH_DEPLOY_GIT:-}"
+  local askpass="${KILL_SWITCH_GIT_ASKPASS:-}"
+  local git_bin origin
+  [[ -n "$deploy" ]] || die "KILL_SWITCH_DEPLOY_GIT is required when KILL_SWITCH_GIT_REMOTE is set"
+  [[ -n "$askpass" ]] || die "KILL_SWITCH_GIT_ASKPASS is required when KILL_SWITCH_GIT_REMOTE is set"
+  [[ -x "$askpass" || -f "$askpass" ]] || die "KILL_SWITCH_GIT_ASKPASS is not executable: $askpass"
+  # Credentials must not appear in argv — reject embedded userinfo (user:pass@).
+  if printf '%s' "$remote" | grep -qiE '^https?://[^/]*@'; then
+    die "KILL_SWITCH_GIT_REMOTE must not embed credentials (userinfo); use KILL_SWITCH_GIT_ASKPASS only"
+  fi
+  git_bin="$(require_git)"
+  deploy="$(canonical_http_origin "$deploy")"
+  origin="$(canonical_http_origin "$remote")"
+
+  evidence_session_begin
+  local evidence_settled=0
+  # shellcheck disable=SC2064
+  trap '[[ "${evidence_settled:-0}" -eq 1 ]] || evidence_session_abort' EXIT
+
+  if [[ "$origin" != "$deploy" ]]; then
+    evidence_append_check git git_binding fail
+    evidence_session_commit
+    evidence_settled=1
+    trap - EXIT
+    fail_t2 "Git bind mismatch (origin=$origin deploy=$deploy)"
+  fi
+  evidence_append_check git git_binding pass
+
+  local before="" repo_path=""
+  # Optional zero-change assertion when remote is a local path exported for fixtures.
+  if [[ -n "${KILL_SWITCH_GIT_ZEROCHECK_REPO:-}" ]]; then
+    repo_path="$KILL_SWITCH_GIT_ZEROCHECK_REPO"
+    [[ -d "$repo_path" ]] || die "KILL_SWITCH_GIT_ZEROCHECK_REPO is not a directory: $repo_path"
+    before="$(git_snapshot_repo "$repo_path")"
+  fi
+
+  local out err rc=0
+  out="$(mktemp "${TMPDIR:-/tmp}/killswitch-git-out.XXXXXX")"
+  err="$(mktemp "${TMPDIR:-/tmp}/killswitch-git-err.XXXXXX")"
+  set +e
+  # Credentials only via ASKPASS; never on argv. Disable terminal prompt.
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+    "$git_bin" -c credential.helper= ls-remote "$remote" >"$out" 2>"$err"
+  rc=$?
+  set -e
+
+  # Redacted logging only (raw capture may contain transport noise; never echo secrets).
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    git_redact_line "$line" >&2
+  done <"$err"
+
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f -- "$out" "$err"
+    evidence_append_check git git_ls_remote fail
+    evidence_session_commit
+    evidence_settled=1
+    trap - EXIT
+    fail_t2 "git ls-remote failed for $origin (exit $rc)"
+  fi
+  rm -f -- "$out" "$err"
+  evidence_append_check git git_ls_remote pass
+
+  if [[ -n "$repo_path" ]]; then
+    local after
+    after="$(git_snapshot_repo "$repo_path")"
+    if [[ "$before" != "$after" ]]; then
+      evidence_session_commit
+      evidence_settled=1
+      trap - EXIT
+      fail_t2 "Git probe mutated refs/objects under $repo_path (readonly invariant)"
+    fi
+  fi
+
+  evidence_session_commit
+  evidence_settled=1
+  trap - EXIT
+  printf 'authz_kill_switch: Git ls-remote ok for %s; evidence recorded — not a recovery-green claim.\n' "$origin" >&2
+}
+
 require_yq() {
   local yq_bin="${KILL_SWITCH_YQ:-}"
   if [[ -n "$yq_bin" ]]; then
@@ -1182,7 +1302,7 @@ run_branch() {
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7 + UN-36 ×6 + UN-53 ×5 + UN-47 ×4)
+# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7 + UN-36 ×6 + UN-53 ×5 + UN-47 ×4 + UN-42 ×6)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -1240,7 +1360,9 @@ run_selftest() {
   unset KILL_SWITCH_LOG_DIR KILL_SWITCH_LOG_POLL_ATTEMPTS KILL_SWITCH_LOG_POLL_SLEEP_SECS \
     KILL_SWITCH_LOG_POLL_FORCE_TIMEOUT KILL_SWITCH_RG KILL_SWITCH_URLS \
     KILL_SWITCH_EXPECT_CODE KILL_SWITCH_DEPLOY_HTTP KILL_SWITCH_RESTRICTED_DIR \
-    KILL_SWITCH_CONFIG KILL_SWITCH_ENV_FILE KILL_SWITCH_COMPOSE || true
+    KILL_SWITCH_CONFIG KILL_SWITCH_ENV_FILE KILL_SWITCH_COMPOSE \
+    KILL_SWITCH_GIT_REMOTE KILL_SWITCH_DEPLOY_GIT KILL_SWITCH_GIT_ASKPASS \
+    KILL_SWITCH_GIT_SECRET KILL_SWITCH_GIT_ZEROCHECK_REPO KILL_SWITCH_GIT || true
 
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/killswitch-selftest.XXXXXX")"
@@ -2080,7 +2202,160 @@ BADRG
   [[ "$t2_rc" -eq 6 ]] || gate_fail "log_rotate_cursor" "expected exit 6 for post-rotate would-deny, got $t2_rc"
   gate_pass "log_rotate_cursor"
 
-  printf 'authz_kill_switch --selftest: 45/45 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6 + UN-53×5 + UN-47×4)\n'
+
+  # --- UN-42 gates (46–51): Git HTTP readonly ---
+  local git_root="$tmp/gitfx"
+  rm -rf -- "$git_root" && mkdir -p "$git_root/www/repo.git" "$git_root/wt"
+  git init --bare "$git_root/www/repo.git" >/dev/null
+  git -C "$git_root/www/repo.git" symbolic-ref HEAD refs/heads/main >/dev/null
+  git clone "$git_root/www/repo.git" "$git_root/wt/c" >/dev/null 2>&1
+  git -C "$git_root/wt/c" checkout -B main >/dev/null 2>&1
+  printf 'seed\n' >"$git_root/wt/c/f"
+  git -C "$git_root/wt/c" add f >/dev/null
+  git -C "$git_root/wt/c" -c user.email=t@t -c user.name=t commit -m seed >/dev/null
+  git -C "$git_root/wt/c" push origin main >/dev/null 2>&1
+  git -C "$git_root/www/repo.git" update-server-info >/dev/null
+  local askpass_ok="$git_root/askpass-ok"
+  cat >"$askpass_ok" <<'ASK'
+#!/usr/bin/env bash
+# Fixture askpass: unused for dumb HTTP without 401, but required by contract.
+printf 'fixture-password\n'
+ASK
+  chmod +x "$askpass_ok"
+  local git_env="$tmp/git.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$git_env"
+  local git_new="$tmp/git.new"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$git_new"
+
+  start_git_http() {
+    local port="$1"
+    python3 -m http.server "$port" --directory "$git_root/www" >/dev/null 2>&1 &
+    git_http_pid=$!
+    sleep 0.25
+  }
+  stop_git_http() {
+    if [[ -n "${git_http_pid:-}" ]]; then
+      kill "$git_http_pid" 2>/dev/null || true
+      wait "$git_http_pid" 2>/dev/null || true
+      git_http_pid=""
+    fi
+  }
+
+  # Gate 46: ls-remote auth/transport pass
+  start_git_http 18761
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$git_env" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:18761/repo.git" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:18761" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_ok" \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g46.err" || t2_rc=$?
+  stop_git_http
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "git_ls_remote_ok" "expected 0, got $t2_rc: $(cat "$tmp/g46.err")"
+  evidence_json_for_latest_run "$restricted" | grep -q 'git_ls_remote' \
+    || gate_fail "git_ls_remote_ok" "missing evidence"
+  gate_pass "git_ls_remote_ok"
+
+  # Gate 47: auth/transport failure → T2
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$git_env" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:1/no-such-git.git" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:1" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_ok" \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g47.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "git_ls_remote_fail" "expected 6, got $t2_rc"
+  gate_pass "git_ls_remote_fail"
+
+  # Gate 48: bind mismatch (incl. default-port / IPv6 normalize helpers)
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  start_git_http 18762
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$git_env" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:18762/repo.git" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:9999" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_ok" \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g48.err" || t2_rc=$?
+  stop_git_http
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "git_bind_mismatch" "expected 6, got $t2_rc"
+  local g_origin
+  g_origin="$(canonical_http_origin 'http://[::1]/repo.git')"
+  [[ "$g_origin" == "http://[::1]:80" ]] || gate_fail "git_bind_mismatch" "IPv6 origin $g_origin"
+  g_origin="$(canonical_http_origin 'https://example.com/repo.git')"
+  [[ "$g_origin" == "https://example.com:443" ]] || gate_fail "git_bind_mismatch" "default https $g_origin"
+  gate_pass "git_bind_mismatch"
+
+  # Gate 49: /repo.git path + trailing slash pair (path preserved in request, origin equal)
+  start_git_http 18763
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$git_env" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:18763/repo.git/" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:18763" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_ok" \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g49.err" || t2_rc=$?
+  stop_git_http
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "git_path_slash_pair" "expected 0, got $t2_rc: $(cat "$tmp/g49.err")"
+  [[ "$(canonical_http_origin 'http://127.0.0.1:18763/repo.git')" == \
+     "$(canonical_http_origin 'http://127.0.0.1:18763/repo.git/')" ]] \
+    || gate_fail "git_path_slash_pair" "origins diverged"
+  gate_pass "git_path_slash_pair"
+
+  # Gate 50: credential redaction (secret must not appear in stderr)
+  local askpass_secret="$git_root/askpass-secret"
+  cat >"$askpass_secret" <<'ASK'
+#!/usr/bin/env bash
+printf '%s\n' 'SUPERSECRET_GIT_TOKEN_UN42'
+ASK
+  chmod +x "$askpass_secret"
+  # Wrapper git that prints a fake URL containing the secret then delegates
+  local git_wrap="$git_root/git-wrap"
+  cat >"$git_wrap" <<WRAP
+#!/usr/bin/env bash
+# Simulate noisy stderr that might include secrets; real git follows.
+echo "debug remote=http://user:SUPERSECRET_GIT_TOKEN_UN42@127.0.0.1/repo.git" >&2
+exec git "\$@"
+WRAP
+  chmod +x "$git_wrap"
+  start_git_http 18764
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$git_env" \
+    KILL_SWITCH_GIT="$git_wrap" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:18764/repo.git" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:18764" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_secret" \
+    KILL_SWITCH_GIT_SECRET='SUPERSECRET_GIT_TOKEN_UN42' \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g50.err" || t2_rc=$?
+  stop_git_http
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "git_redaction" "expected 0, got $t2_rc: $(cat "$tmp/g50.err")"
+  if grep -Fq 'SUPERSECRET_GIT_TOKEN_UN42' "$tmp/g50.err"; then
+    gate_fail "git_redaction" "secret leaked into stderr"
+  fi
+  grep -q '\*\*\*' "$tmp/g50.err" || gate_fail "git_redaction" "expected redacted marker"
+  gate_pass "git_redaction"
+
+  # Gate 51: refs/objects unchanged by ls-remote
+  start_git_http 18765
+  rm -rf -- "$restricted" && mkdir -p "$restricted"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$git_env" \
+    KILL_SWITCH_GIT_REMOTE="http://127.0.0.1:18765/repo.git" \
+    KILL_SWITCH_DEPLOY_GIT="http://127.0.0.1:18765" \
+    KILL_SWITCH_GIT_ASKPASS="$askpass_ok" \
+    KILL_SWITCH_GIT_ZEROCHECK_REPO="$git_root/www/repo.git" \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$git_new" --restart -- true 2>"$tmp/g51.err" || t2_rc=$?
+  stop_git_http
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "git_zero_mutation" "expected 0, got $t2_rc: $(cat "$tmp/g51.err")"
+  gate_pass "git_zero_mutation"
+
+  printf 'authz_kill_switch --selftest: 51/51 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6 + UN-53×5 + UN-47×4 + UN-42×6)\n'
 
   trap - EXIT
   rm -rf -- "$tmp"
@@ -2138,6 +2413,7 @@ main() {
     run_restart "${restart_argv[@]}"
     run_http_probes
     run_log_probes
+    run_git_probes
   fi
 }
 
