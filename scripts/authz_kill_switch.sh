@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50).
+# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50 / UN-36).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# recovery probes (UN-36/47/42/44) on the same --selftest entry.
+# evidence (UN-53), log channel (UN-47), Git/SSH probes (UN-42/44) on the same
+# --selftest entry.
 #
 # Modes:
 #   --branch systemd|compose|file [--apply-content <file>] [--restart -- <argv...>]
 #       Preflight (UN-50) then resolve/validate/replace; without --apply-content,
 #       UN-41 generates transformed content and one-shot readback. Optional
-#       --restart runs argv exactly once. T1=restart fail→exit 4; T3=post-rename
-#       fsync fail→exit 5.
+#       --restart runs argv exactly once; on success, UN-36 HTTP probes run when
+#       KILL_SWITCH_URLS is set (T2→exit 6). T1=restart fail→exit 4; T3=post-
+#       rename fsync fail→exit 5.
 #   --selftest
-#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 gates (no --branch).
+#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 + UN-36 gates (no --branch).
 #   -h | --help
 #
 # ---------------------------------------------------------------------------
@@ -41,7 +43,7 @@ die() {
 
 usage() {
   cat <<'USAGE'
-authz_kill_switch.sh — Kill Switch (UN-33/UN-48/UN-41/UN-46/UN-50).
+authz_kill_switch.sh — Kill Switch (UN-33/UN-48/UN-41/UN-46/UN-50/UN-36).
 
 Usage:
   bash scripts/authz_kill_switch.sh --branch systemd|compose|file
@@ -55,6 +57,8 @@ Environment (branch mode):
   compose: KILL_SWITCH_COMPOSE, KILL_SWITCH_SERVICE (yq on PATH or KILL_SWITCH_YQ)
   file:    KILL_SWITCH_CONFIG, MEGA_PROFILE
   Inject:  KILL_SWITCH_READBACK_FAIL=1 (force readback failure after write)
+  Probes (after successful --restart): KILL_SWITCH_URLS, KILL_SWITCH_EXPECT_CODE,
+    KILL_SWITCH_DEPLOY_HTTP; optional KILL_SWITCH_EVIDENCE_FILE (provisional; UN-53)
 
 Preflight (UN-50): Linux-only; requires cp/yq/jq/rg/flock/stat/getfacl/getfattr,
   KILL_SWITCH_BIN fsync --probe, and version floors (see script header).
@@ -62,6 +66,7 @@ Preflight (UN-50): Linux-only; requires cp/yq/jq/rg/flock/stat/getfacl/getfattr,
 Failure terminals:
   T1 restart failure → exit 4 (config remains off; prints manual restart argv)
   T3 post-rename fsync failure → exit 5 (do not roll back to on; re-run to converge)
+  T2 probe failure → exit 6 (config remains off; evidence lines; no recovery-green claim)
 USAGE
 }
 
@@ -492,6 +497,127 @@ run_restart() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# UN-36 HTTP recovery probes (after successful restart)
+# ---------------------------------------------------------------------------
+
+# Canonical origin: scheme://host:port (lowercase; default ports explicit; IPv6 brackets).
+# Path is not part of the origin tuple (kept only on the request URL).
+canonical_http_origin() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlparse
+url = sys.argv[1]
+p = urlparse(url)
+if p.scheme not in ("http", "https") or not p.hostname:
+    print(f"invalid http(s) URL: {url}", file=sys.stderr)
+    sys.exit(4)
+scheme = p.scheme.lower()
+host = p.hostname.lower()
+if ":" in host:
+    host_fmt = f"[{host}]"
+else:
+    host_fmt = host
+port = p.port
+if port is None:
+    port = 443 if scheme == "https" else 80
+print(f"{scheme}://{host_fmt}:{port}")
+PY
+}
+
+record_probe_evidence() {
+  # Provisional evidence sink (UN-53 owns durable evidence-append + lease).
+  local line="$1"
+  local path="${KILL_SWITCH_EVIDENCE_FILE:-}"
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$line" >>"$path"
+    chmod 0600 "$path" 2>/dev/null || true
+  fi
+  printf 'authz_kill_switch: probe evidence: %s\n' "$line" >&2
+}
+
+fail_t2() {
+  local reason="$1"
+  printf 'authz_kill_switch: T2 probe failure (exit 6): %s. Config remains off. Script does not claim recovery-green — operator/CI must judge from evidence.\n' "$reason" >&2
+  exit 6
+}
+
+# Probe one URL: bind origin, GET with cert verify, assert status code.
+# On failure: record evidence, print reason on stdout, return 1 (do not exit — all URLs must run).
+probe_one_http_url() {
+  local url="$1"
+  local expect="$2"
+  local deploy="$3"
+  local origin code errfile rc=0
+  origin="$(canonical_http_origin "$url")"
+  if [[ "$origin" != "$deploy" ]]; then
+    record_probe_evidence "{\"channel\":\"http\",\"url\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$url"),\"ok\":false,\"error\":\"bind_mismatch\",\"origin\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$origin"),\"deploy\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$deploy")}"
+    printf 'HTTP bind mismatch for %s (origin=%s deploy=%s)\n' "$url" "$origin" "$deploy"
+    return 1
+  fi
+  errfile="$(mktemp "${TMPDIR:-/tmp}/killswitch-probe.XXXXXX")"
+  code="$(
+    python3 - "$url" <<'PYInner' 2>"$errfile"
+import ssl, sys, urllib.error, urllib.request
+url = sys.argv[1]
+ctx = ssl.create_default_context()
+try:
+    with urllib.request.urlopen(url, context=ctx, timeout=5) as resp:
+        print(resp.status)
+except urllib.error.HTTPError as err:
+    print(err.code)
+except Exception as err:
+    print(f"{type(err).__name__}: {err}", file=sys.stderr)
+    sys.exit(2)
+PYInner
+  )" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    local detail
+    detail="$(tr '\n' ' ' <"$errfile" 2>/dev/null || true)"
+    rm -f -- "$errfile"
+    record_probe_evidence "{\"channel\":\"http\",\"url\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$url"),\"ok\":false,\"error\":\"serving_or_tls\",\"detail\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$detail")}"
+    printf 'HTTP serving/TLS failure for %s (%s)\n' "$url" "$detail"
+    return 1
+  fi
+  rm -f -- "$errfile"
+  if [[ "$code" != "$expect" ]]; then
+    record_probe_evidence "{\"channel\":\"http\",\"url\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$url"),\"ok\":false,\"error\":\"status_mismatch\",\"got\":$code,\"expect\":$expect}"
+    printf 'HTTP status %s != expect %s for %s\n' "$code" "$expect" "$url"
+    return 1
+  fi
+  record_probe_evidence "{\"channel\":\"http\",\"url\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$url"),\"ok\":true,\"status\":$code,\"origin\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$origin")}"
+  return 0
+}
+
+run_http_probes() {
+  local urls="${KILL_SWITCH_URLS:-}"
+  [[ -n "$urls" ]] || return 0
+  local expect="${KILL_SWITCH_EXPECT_CODE:-}"
+  local deploy="${KILL_SWITCH_DEPLOY_HTTP:-}"
+  [[ -n "$expect" ]] || die "KILL_SWITCH_EXPECT_CODE is required when KILL_SWITCH_URLS is set"
+  [[ -n "$deploy" ]] || die "KILL_SWITCH_DEPLOY_HTTP is required when KILL_SWITCH_URLS is set"
+  deploy="$(canonical_http_origin "$deploy")"
+  local -a url_list=()
+  read -r -a url_list <<<"$urls"
+  local url failures=0
+  local -a fail_reasons=()
+  for url in "${url_list[@]}"; do
+    [[ -n "$url" ]] || continue
+    local reason=""
+    if ! reason="$(probe_one_http_url "$url" "$expect" "$deploy")"; then
+      failures=$((failures + 1))
+      fail_reasons+=("${reason:-unknown failure for $url}")
+    fi
+  done
+  if [[ "$failures" -gt 0 ]]; then
+    local joined
+    joined="$(printf '%s; ' "${fail_reasons[@]}")"
+    fail_t2 "probed ${#url_list[@]} URL(s), ${failures} failed: ${joined}"
+  fi
+  printf 'authz_kill_switch: HTTP probes finished (%s URL(s)); evidence recorded — not a recovery-green claim.\n' "${#url_list[@]}" >&2
+}
+
+
 require_yq() {
   local yq_bin="${KILL_SWITCH_YQ:-}"
   if [[ -n "$yq_bin" ]]; then
@@ -773,7 +899,7 @@ run_branch() {
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7)
+# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7 + UN-36 ×6)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -1317,7 +1443,174 @@ PY
     gate_pass "preflight_version_${ver_tool}"
   done
 
-  printf 'authz_kill_switch --selftest: 30/30 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7)\n'
+  # --- UN-36 HTTP probe helpers ---
+  local http_pid="" https_pid=""
+  start_http_fixture() {
+    local port="$1" code="$2" path="$3"
+    python3 - "$port" "$code" "$path" <<'PY' &
+import http.server, sys
+port, code, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.rstrip("/") == path.rstrip("/") or self.path == path:
+            self.send_response(code)
+        else:
+            self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+PY
+    http_pid=$!
+    sleep 0.2
+  }
+  stop_http_fixture() {
+    if [[ -n "${http_pid:-}" ]]; then
+      kill "$http_pid" 2>/dev/null || true
+      wait "$http_pid" 2>/dev/null || true
+      http_pid=""
+    fi
+  }
+
+  local probe_env="$tmp/probe.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$probe_env"
+  local probe_new="$tmp/probe.new"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$probe_new"
+  local evfile="$tmp/evidence.ndjson"
+
+  # --- UN-36 gate 31: serving failure ---
+  rm -f -- "$evfile"
+  local t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$probe_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:1/api/v1/cl/killswitch-probe/detail" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:1" \
+    KILL_SWITCH_EVIDENCE_FILE="$evfile" \
+    bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g31.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "http_serving_fail" "expected exit 6, got $t2_rc"
+  grep -q 'T2 probe failure' "$tmp/g31.err" || gate_fail "http_serving_fail" "missing T2"
+  grep -q 'serving_or_tls\|T2' "$evfile" "$tmp/g31.err" || gate_fail "http_serving_fail" "missing evidence"
+  gate_pass "http_serving_fail"
+
+  # --- UN-36 gate 32: baseline status mismatch ---
+  start_http_fixture 8765 503 /api/v1/cl/killswitch-probe/detail
+  t2_rc=0
+  rm -f -- "$evfile"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$probe_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:8765/api/v1/cl/killswitch-probe/detail" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:8765" \
+    KILL_SWITCH_EVIDENCE_FILE="$evfile" \
+    bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g32.err" || t2_rc=$?
+  stop_http_fixture
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "http_status_mismatch" "expected exit 6, got $t2_rc"
+  grep -q 'status_mismatch\|status' "$tmp/g32.err" "$evfile" || gate_fail "http_status_mismatch" "missing status evidence"
+  gate_pass "http_status_mismatch"
+
+  # --- UN-36 gate 33: bind mismatch (default port + IPv6 normalize) ---
+  # Default port: URL without :80 must equal deploy with :80; mismatch deploy port fails.
+  t2_rc=0
+  rm -f -- "$evfile"
+  start_http_fixture 8766 200 /api/v1/cl/killswitch-probe/detail
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$probe_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:8766/api/v1/cl/killswitch-probe/detail" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:9999" \
+    KILL_SWITCH_EVIDENCE_FILE="$evfile" \
+    bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g33.err" || t2_rc=$?
+  stop_http_fixture
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "http_bind_mismatch" "expected exit 6, got $t2_rc"
+  grep -q 'bind_mismatch\|bind mismatch' "$tmp/g33.err" "$evfile" || gate_fail "http_bind_mismatch" "missing bind evidence"
+  # IPv6 canonical form unit check
+  local origin_v6
+  origin_v6="$(canonical_http_origin 'http://[::1]/x/')"
+  [[ "$origin_v6" == "http://[::1]:80" ]] || gate_fail "http_bind_mismatch" "IPv6 origin got $origin_v6"
+  local origin_def
+  origin_def="$(canonical_http_origin 'http://127.0.0.1/api/')"
+  [[ "$origin_def" == "http://127.0.0.1:80" ]] || gate_fail "http_bind_mismatch" "default port got $origin_def"
+  gate_pass "http_bind_mismatch"
+
+  # --- UN-36 gate 34: base path + trailing slash pair (path kept, origin equal) ---
+  start_http_fixture 8767 200 /api/v1/cl/killswitch-probe/detail
+  t2_rc=0
+  rm -f -- "$evfile"
+  # Both URLs share origin; trailing slash variants must both bind equal to deploy.
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$probe_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:8767/api/v1/cl/killswitch-probe/detail http://127.0.0.1:8767/api/v1/cl/killswitch-probe/detail/" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:8767" \
+    KILL_SWITCH_EVIDENCE_FILE="$evfile" \
+    bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g34.err" || t2_rc=$?
+  stop_http_fixture
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "http_path_slash_pair" "expected success, got $t2_rc: $(cat "$tmp/g34.err")"
+  grep -q 'not a recovery-green claim' "$tmp/g34.err" || gate_fail "http_path_slash_pair" "must not claim recovery-green"
+  [[ "$(canonical_http_origin 'http://127.0.0.1:8767/api/v1/cl/killswitch-probe/detail')" == \
+     "$(canonical_http_origin 'http://127.0.0.1:8767/api/v1/cl/killswitch-probe/detail/')" ]] \
+    || gate_fail "http_path_slash_pair" "origins diverged"
+  gate_pass "http_path_slash_pair"
+
+  # --- UN-36 gate 35: invalid cert reject ---
+  local tls_dir="$tmp/tls"
+  mkdir -p "$tls_dir"
+  openssl req -x509 -newkey rsa:2048 -keyout "$tls_dir/key.pem" -out "$tls_dir/cert.pem" \
+    -days 1 -nodes -subj "/CN=127.0.0.1" 2>/dev/null
+  python3 - "$tls_dir" <<'PY' &
+import http.server, ssl, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+httpd = http.server.HTTPServer(("127.0.0.1", 8768), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(root / "cert.pem", root / "key.pem")
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PY
+  https_pid=$!
+  sleep 0.3
+  t2_rc=0
+  rm -f -- "$evfile"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$probe_env" \
+    KILL_SWITCH_URLS="https://127.0.0.1:8768/api/v1/cl/killswitch-probe/detail" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="https://127.0.0.1:8768" \
+    KILL_SWITCH_EVIDENCE_FILE="$evfile" \
+    bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g35.err" || t2_rc=$?
+  kill "$https_pid" 2>/dev/null || true
+  wait "$https_pid" 2>/dev/null || true
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "http_tls_reject" "expected exit 6 for self-signed, got $t2_rc"
+  grep -qi 'ssl\|certificate\|TLS\|serving' "$tmp/g35.err" || gate_fail "http_tls_reject" "missing TLS failure"
+  gate_pass "http_tls_reject"
+
+  # --- UN-36 gate 36: T2 terminal (config stays off; exit 6; evidence; no green claim) ---
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\nKEEP=1\n' >"$probe_env"
+  t2_rc=0
+  rm -f -- "$evfile"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$probe_env" \
+    KILL_SWITCH_URLS="http://127.0.0.1:1/nope" \
+    KILL_SWITCH_EXPECT_CODE=200 \
+    KILL_SWITCH_DEPLOY_HTTP="http://127.0.0.1:1" \
+    KILL_SWITCH_EVIDENCE_FILE="$evfile" \
+    bash "$SELF" --branch file --apply-content "$probe_new" --restart -- true 2>"$tmp/g36.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "http_t2_terminal" "expected exit 6, got $t2_rc"
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=off' "$probe_env" || gate_fail "http_t2_terminal" "config not left off"
+  grep -q 'does not claim recovery-green\|not a recovery-green' "$tmp/g36.err" || true
+  grep -q 'T2 probe failure' "$tmp/g36.err" || gate_fail "http_t2_terminal" "missing T2 message"
+  [[ -s "$evfile" ]] || gate_fail "http_t2_terminal" "evidence file empty"
+  if grep -qiE 'recovery.?green|recovered green|恢复绿' "$tmp/g36.err"; then
+    # Allow the negation phrase only
+    if ! grep -q 'not a recovery-green\|does not claim recovery-green' "$tmp/g36.err"; then
+      gate_fail "http_t2_terminal" "script claimed recovery-green"
+    fi
+  fi
+  gate_pass "http_t2_terminal"
+
+  printf 'authz_kill_switch --selftest: 36/36 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6)\n'
   trap - EXIT
   rm -rf -- "$tmp"
 }
@@ -1367,6 +1660,7 @@ main() {
   run_branch "$branch" "$content"
   if [[ "$want_restart" -eq 1 ]]; then
     run_restart "${restart_argv[@]}"
+    run_http_probes
   fi
 }
 
