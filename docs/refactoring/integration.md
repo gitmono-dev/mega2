@@ -92,12 +92,13 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 运维入口：`bash scripts/authz_kill_switch.sh`（生产与 fixture 同一文件；家族内后续卡在同一 `--selftest` 入口叠加门）。
 
-- **分派**：`--branch systemd|compose|file`（目标分别取自 `KILL_SWITCH_ENV_FILE` / `KILL_SWITCH_COMPOSE` / `KILL_SWITCH_CONFIG`）。无 `--apply-content` 时走 UN-41 变换；有则仅为骨架/元数据低层替换。可选 `--restart -- <argv...>`（UN-46：argv 数组恰好一次执行，禁二次分词）。
+- **分派**：`--branch systemd|compose|file`（目标分别取自 `KILL_SWITCH_ENV_FILE` / `KILL_SWITCH_COMPOSE` / `KILL_SWITCH_CONFIG`）。无 `--apply-content` 时走 UN-41 变换；有则仅为骨架/元数据低层替换。可选 `--restart -- <argv...>`（UN-46：argv 数组恰好一次执行，禁二次分词）。启动时先跑 UN-50 preflight。
+- **preflight（UN-50）**：Linux 专属；校验 cp/yq/jq/rg/flock/stat/getfacl/getfattr 存在性、GNU `cp --preserve=all`、`KILL_SWITCH_BIN authz-audit fsync --probe`、版本下限（coreutils≥8.30 / yq≥4.18 / jq≥1.6 / rg≥13 / util-linux≥2.27）；任一缺失/不足 fail-closed 并给出安装指引。
 - **变换与读回（UN-41）**：systemd 将 `MEGA_CEDAR__ENFORCEMENT=` 替换为 `=off`；compose 仅 mapping 形态经 `yq` 写 `"off"`（list/缺键 fail-closed）；file 改写 `[cedar].enforcement` 为 `"off"`（缺键 fail-closed），必选 `MEGA_PROFILE`，并以 UN-01 `config validate --show-sources --format json` 断言 winning source 为该文件（环境源获胜则禁用）。落盘后恰好一次读回校验为 `off`（`KILL_SWITCH_READBACK_FAIL=1` 可注入）。
 - **写原语**：同目录临时文件 `O_EXCL|O_NOFOLLOW` → `cp --preserve=all` 播种 → 原地改写字节 → 元数据逐项校验 → `KILL_SWITCH_BIN authz-audit fsync <tmp>` → `renameat` → `authz-audit fsync <target>`；目标须为 no-follow 普通文件；systemd EnvironmentFile 拒绝重复键。
 - **重启与失败终态（UN-46）**：`--restart -- <argv...>` 恰好一次；T1 重启失败 → 退出码 4、配置保持 off、打印人工重启指引；T3 rename 后 fsync 失败 → 退出码 5、不回滚为 on、重跑幂等收敛。
 - **元数据保持（UN-48）**：owner / mode / ACL / xattr；写后 `stat`/`getfacl`/xattr 比对，不符即失败（可用 `KILL_SWITCH_META_VERIFY_FAIL` 注入）。
-- **自测**：`bash scripts/authz_kill_switch.sh --selftest`（UN-33 六门 + UN-48 五门 + UN-41 七门 + UN-46 五门；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/monoengine`；compose 门需 `yq`（或 `KILL_SWITCH_YQ`）。
+- **自测**：`bash scripts/authz_kill_switch.sh --selftest`（UN-33 六门 + UN-48 五门 + UN-41 七门 + UN-46 五门 + UN-50 七门；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/monoengine`；compose/preflight 需 `yq`（或 `KILL_SWITCH_YQ`）；缺 `getfattr` 时自测会在临时 PATH 放入存在性 stub。
 - **发布**：REL-02 子卡只本地提交；唯一发布点 UN-45。
 
 ## 迁移覆盖：`mega_cl.link` 唯一索引（UN-10）

@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
-# authz_kill_switch.sh — Kill Switch skeleton + secure write + metadata preserve
-# + three-branch transforms/readback + restart/T1/T3 (UN-33 / UN-48 / UN-41 / UN-46).
+# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# preflight (UN-50) and recovery probes (UN-36/47/42/44) on the same --selftest
-# entry.
+# recovery probes (UN-36/47/42/44) on the same --selftest entry.
 #
 # Modes:
 #   --branch systemd|compose|file [--apply-content <file>] [--restart -- <argv...>]
-#       Resolve/validate/replace; without --apply-content, UN-41 generates
-#       transformed content and one-shot readback. Optional --restart runs argv
-#       exactly once (no string re-split). T1=restart fail→exit 4 (config stays
-#       off); T3=post-rename fsync fail→exit 5 (no rollback to on).
+#       Preflight (UN-50) then resolve/validate/replace; without --apply-content,
+#       UN-41 generates transformed content and one-shot readback. Optional
+#       --restart runs argv exactly once. T1=restart fail→exit 4; T3=post-rename
+#       fsync fail→exit 5.
 #   --selftest
-#       Run UN-33 + UN-48 + UN-41 + UN-46 gates (no --branch).
+#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 gates (no --branch).
 #   -h | --help
+#
+# ---------------------------------------------------------------------------
+# UN-50 preflight matrix (frozen):
+#   platform: Linux only (non-Linux fail-closed + install/run-on-Linux guidance)
+#   exist:    cp, yq, jq, rg, flock, stat, getfacl, getfattr
+#   probe:    "$KILL_SWITCH_BIN" authz-audit fsync --probe  (must exit 0)
+#   versions: coreutils (cp) ≥ 8.30 | yq ≥ 4.18 | jq ≥ 1.6 | rg ≥ 13
+#             | util-linux (flock) ≥ 2.27
+#   capability: GNU `cp --preserve=all` must succeed on a temp pair
+# Selftest inject (fixtures only):
+#   KILL_SWITCH_PREFLIGHT_INJECT_UNAME=<os>
+#   KILL_SWITCH_PREFLIGHT_INJECT_MISSING=<tool>
+#   KILL_SWITCH_PREFLIGHT_INJECT_VERSION_{CP,YQ,JQ,RG,FLOCK}=<ver>
+#   KILL_SWITCH_PREFLIGHT_INJECT_FSYNC_PROBE=fail
+# ---------------------------------------------------------------------------
 
 set -euo pipefail
 
@@ -28,7 +41,7 @@ die() {
 
 usage() {
   cat <<'USAGE'
-authz_kill_switch.sh — Kill Switch (UN-33/UN-48/UN-41/UN-46).
+authz_kill_switch.sh — Kill Switch (UN-33/UN-48/UN-41/UN-46/UN-50).
 
 Usage:
   bash scripts/authz_kill_switch.sh --branch systemd|compose|file
@@ -43,6 +56,9 @@ Environment (branch mode):
   file:    KILL_SWITCH_CONFIG, MEGA_PROFILE
   Inject:  KILL_SWITCH_READBACK_FAIL=1 (force readback failure after write)
 
+Preflight (UN-50): Linux-only; requires cp/yq/jq/rg/flock/stat/getfacl/getfattr,
+  KILL_SWITCH_BIN fsync --probe, and version floors (see script header).
+
 Failure terminals:
   T1 restart failure → exit 4 (config remains off; prints manual restart argv)
   T3 post-rename fsync failure → exit 5 (do not roll back to on; re-run to converge)
@@ -54,6 +70,156 @@ require_bin() {
   [[ -n "$bin" ]] || die "KILL_SWITCH_BIN is required"
   [[ -x "$bin" || -f "$bin" ]] || die "KILL_SWITCH_BIN is not executable: $bin"
   printf '%s\n' "$bin"
+}
+
+# ---------------------------------------------------------------------------
+# UN-50 preflight
+# ---------------------------------------------------------------------------
+
+version_ge() {
+  # Return 0 if $1 >= $2 (dotted numeric prefixes).
+  python3 - "$1" "$2" <<'PY'
+import sys
+def parts(s):
+    out = []
+    for p in s.split("."):
+        digits = "".join(ch for ch in p if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return out
+a, b = parts(sys.argv[1]), parts(sys.argv[2])
+n = max(len(a), len(b))
+a += [0] * (n - len(a))
+b += [0] * (n - len(b))
+sys.exit(0 if a >= b else 1)
+PY
+}
+
+preflight_tool_path() {
+  local name="$1"
+  if [[ "${KILL_SWITCH_PREFLIGHT_INJECT_MISSING:-}" == "$name" ]]; then
+    return 1
+  fi
+  if [[ "$name" == "yq" && -n "${KILL_SWITCH_YQ:-}" ]]; then
+    [[ -x "$KILL_SWITCH_YQ" || -f "$KILL_SWITCH_YQ" ]] || return 1
+    printf '%s\n' "$KILL_SWITCH_YQ"
+    return 0
+  fi
+  command -v "$name" 2>/dev/null
+}
+
+preflight_parse_cp_ver() {
+  local out
+  out="$(cp --version 2>&1 | head -n 1)"
+  if [[ -n "${KILL_SWITCH_PREFLIGHT_INJECT_VERSION_CP:-}" ]]; then
+    printf '%s\n' "$KILL_SWITCH_PREFLIGHT_INJECT_VERSION_CP"
+    return
+  fi
+  python3 -c 'import re,sys; m=re.search(r"(\d+\.\d+(?:\.\d+)?)", sys.argv[1]); print(m.group(1) if m else "")' "$out"
+}
+
+preflight_parse_yq_ver() {
+  local yq_bin out
+  yq_bin="$(preflight_tool_path yq)" || return 1
+  if [[ -n "${KILL_SWITCH_PREFLIGHT_INJECT_VERSION_YQ:-}" ]]; then
+    printf '%s\n' "$KILL_SWITCH_PREFLIGHT_INJECT_VERSION_YQ"
+    return
+  fi
+  out="$("$yq_bin" --version 2>&1)"
+  python3 -c 'import re,sys; m=re.search(r"[vV]?(\d+\.\d+(?:\.\d+)?)", sys.argv[1]); print(m.group(1) if m else "")' "$out"
+}
+
+preflight_parse_jq_ver() {
+  local out
+  if [[ -n "${KILL_SWITCH_PREFLIGHT_INJECT_VERSION_JQ:-}" ]]; then
+    printf '%s\n' "$KILL_SWITCH_PREFLIGHT_INJECT_VERSION_JQ"
+    return
+  fi
+  out="$(jq --version 2>&1)"
+  python3 -c 'import re,sys; m=re.search(r"(\d+\.\d+(?:\.\d+)?)", sys.argv[1]); print(m.group(1) if m else "")' "$out"
+}
+
+preflight_parse_rg_ver() {
+  local out
+  if [[ -n "${KILL_SWITCH_PREFLIGHT_INJECT_VERSION_RG:-}" ]]; then
+    printf '%s\n' "$KILL_SWITCH_PREFLIGHT_INJECT_VERSION_RG"
+    return
+  fi
+  out="$(rg --version 2>&1 | head -n 1)"
+  python3 -c 'import re,sys; m=re.search(r"(\d+\.\d+(?:\.\d+)?)", sys.argv[1]); print(m.group(1) if m else "")' "$out"
+}
+
+preflight_parse_flock_ver() {
+  local out
+  if [[ -n "${KILL_SWITCH_PREFLIGHT_INJECT_VERSION_FLOCK:-}" ]]; then
+    printf '%s\n' "$KILL_SWITCH_PREFLIGHT_INJECT_VERSION_FLOCK"
+    return
+  fi
+  out="$(flock --version 2>&1 | head -n 1)"
+  python3 -c 'import re,sys; m=re.search(r"(\d+\.\d+(?:\.\d+)?)", sys.argv[1]); print(m.group(1) if m else "")' "$out"
+}
+
+run_preflight() {
+  local os_name
+  os_name="${KILL_SWITCH_PREFLIGHT_INJECT_UNAME:-$(uname -s)}"
+  if [[ "$os_name" != "Linux" ]]; then
+    die "platform is ${os_name}: Kill Switch requires Linux (O_NOFOLLOW/renameat/xattr/ACL). Run on a Linux host or container."
+  fi
+
+  local tool
+  for tool in cp yq jq rg flock stat getfacl getfattr; do
+    if ! preflight_tool_path "$tool" >/dev/null; then
+      case "$tool" in
+        yq) die "missing tool 'yq' (need mikefarah/yq ≥ 4.18). Install: https://github.com/mikefarah/yq/#install or set KILL_SWITCH_YQ" ;;
+        getfattr | getfacl) die "missing tool '$tool' (need attr package). Install: apt install attr / dnf install attr" ;;
+        flock) die "missing tool 'flock' (need util-linux ≥ 2.27). Install: apt install util-linux" ;;
+        jq) die "missing tool 'jq' (need jq ≥ 1.6). Install: apt install jq" ;;
+        rg) die "missing tool 'rg' (need ripgrep ≥ 13). Install: apt install ripgrep" ;;
+        cp) die "missing tool 'cp' (need GNU coreutils ≥ 8.30). Install: apt install coreutils / dnf install coreutils" ;;
+        stat) die "missing tool 'stat' (need GNU coreutils). Install: apt install coreutils / dnf install coreutils" ;;
+        *) die "missing tool '$tool'" ;;
+      esac
+    fi
+  done
+
+  local ver
+  ver="$(preflight_parse_cp_ver)"
+  [[ -n "$ver" ]] || die "cannot parse GNU coreutils version from cp --version; install/upgrade: apt install coreutils"
+  version_ge "$ver" "8.30" || die "cp/coreutils ${ver} < 8.30 (need GNU cp --preserve=all). Upgrade: apt install --only-upgrade coreutils"
+
+  ver="$(preflight_parse_yq_ver)"
+  [[ -n "$ver" ]] || die "cannot parse yq version; install mikefarah/yq ≥ 4.18 or set KILL_SWITCH_YQ"
+  version_ge "$ver" "4.18" || die "yq ${ver} < 4.18. Upgrade mikefarah/yq: https://github.com/mikefarah/yq/#install"
+
+  ver="$(preflight_parse_jq_ver)"
+  [[ -n "$ver" ]] || die "cannot parse jq version; install: apt install jq"
+  version_ge "$ver" "1.6" || die "jq ${ver} < 1.6. Upgrade jq: apt install --only-upgrade jq"
+
+  ver="$(preflight_parse_rg_ver)"
+  [[ -n "$ver" ]] || die "cannot parse rg version; install: apt install ripgrep"
+  version_ge "$ver" "13" || die "rg ${ver} < 13. Upgrade ripgrep: apt install --only-upgrade ripgrep"
+
+  ver="$(preflight_parse_flock_ver)"
+  [[ -n "$ver" ]] || die "cannot parse util-linux/flock version; install: apt install util-linux"
+  version_ge "$ver" "2.27" || die "flock/util-linux ${ver} < 2.27. Upgrade util-linux: apt install --only-upgrade util-linux"
+
+  # GNU cp --preserve=all capability probe
+  local cp_probe
+  cp_probe="$(mktemp -d "${TMPDIR:-/tmp}/killswitch-cp-probe.XXXXXX")"
+  printf 'x\n' >"$cp_probe/a"
+  if ! cp --preserve=all "$cp_probe/a" "$cp_probe/b" 2>/dev/null; then
+    rm -rf -- "$cp_probe"
+    die "cp --preserve=all failed (need GNU coreutils ≥ 8.30)"
+  fi
+  rm -rf -- "$cp_probe"
+
+  local bin
+  bin="$(require_bin)"
+  if [[ "${KILL_SWITCH_PREFLIGHT_INJECT_FSYNC_PROBE:-}" == "fail" ]]; then
+    die "KILL_SWITCH_BIN authz-audit fsync --probe failed (inject). Need a monoengine build with UN-29 fsync tool mode."
+  fi
+  if ! "$bin" authz-audit fsync --probe >/dev/null 2>&1; then
+    die "KILL_SWITCH_BIN authz-audit fsync --probe failed. Need a monoengine build with UN-29 fsync tool mode (fd-level fsync)."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -607,7 +773,7 @@ run_branch() {
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5)
+# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -683,6 +849,42 @@ run_selftest() {
   local stub="$SCRIPT_DIR/authz_kill_switch_fsync_stub.sh"
   [[ -x "$stub" || -f "$stub" ]] || die "missing fsync stub: $stub"
   chmod +x "$stub" 2>/dev/null || true
+
+  # UN-50: ensure preflight tools exist for subsequent --branch invocations.
+  local pfbin="$tmp/pfbin"
+  mkdir -p "$pfbin"
+  if ! command -v getfattr >/dev/null 2>&1; then
+    printf '#!/bin/sh\nexit 0\n' >"$pfbin/getfattr"
+    chmod +x "$pfbin/getfattr"
+  fi
+  if ! command -v yq >/dev/null 2>&1; then
+    local yq_arch yq_url
+    case "$(uname -m)" in
+      x86_64 | amd64) yq_arch="amd64" ;;
+      aarch64 | arm64) yq_arch="arm64" ;;
+      *) die "unsupported arch for yq bootstrap: $(uname -m)" ;;
+    esac
+    yq_url="https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_${yq_arch}"
+    curl -fsSL -o "$pfbin/yq" "$yq_url"
+    chmod +x "$pfbin/yq"
+  fi
+  export PATH="$pfbin:$PATH"
+  if [[ -x "$pfbin/yq" ]]; then
+    export KILL_SWITCH_YQ="$pfbin/yq"
+  elif command -v yq >/dev/null 2>&1; then
+    export KILL_SWITCH_YQ
+    KILL_SWITCH_YQ="$(command -v yq)"
+  fi
+  # AC platform (not counted in VER=7): non-Linux fail-closed
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_PREFLIGHT_INJECT_UNAME=Darwin \
+      bash "$SELF" --branch systemd --apply-content /dev/null 2>"$tmp/plat.err"; then
+    gate_fail "platform_non_linux" "non-Linux was accepted"
+  fi
+  grep -q 'requires Linux' "$tmp/plat.err" || {
+    printf 'FAIL platform_non_linux: missing Linux guidance\n' >&2
+    cat "$tmp/plat.err" >&2
+    exit 1
+  }
 
   # --- gate 1: symlink-preset path rejected by O_EXCL|O_NOFOLLOW; symlink target refused ---
   local target1="$tmp/target1.conf"
@@ -853,23 +1055,8 @@ PY
   [[ "$(cat -- "$target_v")" == "V=1" ]] || gate_fail "meta_verify_inject" "target mutated after verify failure"
   gate_pass "meta_verify_inject"
 
-  # --- UN-41: ensure yq available for compose gates ---
-  if ! command -v yq >/dev/null 2>&1; then
-    local yq_arch yq_url
-    case "$(uname -m)" in
-      x86_64 | amd64) yq_arch="amd64" ;;
-      aarch64 | arm64) yq_arch="arm64" ;;
-      *) die "unsupported arch for yq bootstrap: $(uname -m)" ;;
-    esac
-    yq_url="https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_${yq_arch}"
-    curl -fsSL -o "$tmp/yq" "$yq_url"
-    chmod +x "$tmp/yq"
-    export PATH="$tmp:$PATH"
-  fi
-  export KILL_SWITCH_YQ
-  KILL_SWITCH_YQ="$(command -v yq)"
-
   # --- UN-41 gate 12: mapping compose transform ---
+  [[ -n "${KILL_SWITCH_YQ:-}" ]] || KILL_SWITCH_YQ="$(command -v yq)"
   local compose_map="$tmp/compose-map.yml"
   cat >"$compose_map" <<'EOF'
 services:
@@ -1088,7 +1275,49 @@ assert parts == ["a$b", "c*d", "e;f", "g`h"], parts
 PY
   gate_pass "restart_argv_special"
 
-  printf 'authz_kill_switch --selftest: 23/23 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5)\n'
+  # --- UN-50 gate 24: missing tool reject ---
+  local miss_env="$tmp/miss.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\n' >"$miss_env"
+  local miss_new="$tmp/miss.new"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$miss_new"
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_PREFLIGHT_INJECT_MISSING=yq \
+      KILL_SWITCH_CONFIG="$miss_env" \
+      bash "$SELF" --branch file --apply-content "$miss_new" 2>"$tmp/g24.err"; then
+    gate_fail "preflight_missing_tool" "missing yq was accepted"
+  fi
+  grep -qi 'missing tool' "$tmp/g24.err" || gate_fail "preflight_missing_tool" "missing guidance"
+  gate_pass "preflight_missing_tool"
+
+  # --- UN-50 gate 25: fsync probe fail ---
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_PREFLIGHT_INJECT_FSYNC_PROBE=fail \
+      KILL_SWITCH_CONFIG="$miss_env" \
+      bash "$SELF" --branch file --apply-content "$miss_new" 2>"$tmp/g25.err"; then
+    gate_fail "preflight_fsync_probe" "fsync probe failure was accepted"
+  fi
+  grep -qi 'fsync --probe' "$tmp/g25.err" || gate_fail "preflight_fsync_probe" "missing probe message"
+  gate_pass "preflight_fsync_probe"
+
+  # --- UN-50 gates 26–30: version floors (cp/yq/jq/rg/flock) ---
+  local ver_tool ver_env ver_msg
+  for ver_tool in CP YQ JQ RG FLOCK; do
+    ver_env="KILL_SWITCH_PREFLIGHT_INJECT_VERSION_${ver_tool}"
+    case "$ver_tool" in
+      CP) ver_msg="8.20" ;;
+      YQ) ver_msg="4.10" ;;
+      JQ) ver_msg="1.5" ;;
+      RG) ver_msg="12.0" ;;
+      FLOCK) ver_msg="2.20" ;;
+    esac
+    if env "$ver_env=$ver_msg" KILL_SWITCH_BIN="$real_bin" \
+        KILL_SWITCH_CONFIG="$miss_env" \
+        bash "$SELF" --branch file --apply-content "$miss_new" 2>"$tmp/gver.${ver_tool}.err"; then
+      gate_fail "preflight_version_${ver_tool}" "old ${ver_tool} version was accepted"
+    fi
+    grep -Eiq 'upgrade|<' "$tmp/gver.${ver_tool}.err" || gate_fail "preflight_version_${ver_tool}" "missing version guidance"
+    gate_pass "preflight_version_${ver_tool}"
+  done
+
+  printf 'authz_kill_switch --selftest: 30/30 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7)\n'
   trap - EXIT
   rm -rf -- "$tmp"
 }
@@ -1134,6 +1363,7 @@ main() {
     esac
   done
   [[ -n "$branch" ]] || die "missing --branch or --selftest"
+  run_preflight
   run_branch "$branch" "$content"
   if [[ "$want_restart" -eq 1 ]]; then
     run_restart "${restart_argv[@]}"
