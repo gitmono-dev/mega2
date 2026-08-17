@@ -15,8 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 monoengine-core = { path = ".." }
-orbit = { path = "../../orbit" }
-orbit-api = { path = "../../orbit/api" }
+orbit = { path = "../../orbit/crates/orbit" }
+orbit-api = { path = "../../orbit/crates/orbit-api" }
 async-trait = "0.1.91"
 
 [target.'cfg(not(windows))'.dependencies]

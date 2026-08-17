@@ -78,6 +78,26 @@ jobs:
           path: orbit
           token: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
 
+      - name: Guard orbit sibling crate layout
+        run: |
+          set -euo pipefail
+          # gitmono-dev/orbit is a virtual workspace (crates/orbit + crates/orbit-api).
+          # monoengine path deps resolve against that layout from working-directory:
+          # monoengine → ../orbit/crates/orbit-api and ../../orbit/crates/orbit.
+          # UN-49 retargeted those deps at a local pre-workspace tree (api/ + repo-root
+          # package); cargo metadata then failed on Actions before any test ran.
+          for p in \
+            orbit/crates/orbit/Cargo.toml \
+            orbit/crates/orbit-api/Cargo.toml
+          do
+            if [ ! -f "${p}" ]; then
+              echo "::error title=Orbit sibling layout mismatch::Expected ${p} (gitmono-dev/orbit workspace members). A checkout of an older orbit tree (api/ at repo root) cannot satisfy Cargo.toml / bin/Cargo.toml."
+              ls -la orbit || true
+              ls -la orbit/crates || true
+              exit 1
+            fi
+          done
+
       - name: Validate website checkout token
         env:
           # Prefer a dedicated website token; fall back to ORBIT_CHECKOUT_TOKEN
