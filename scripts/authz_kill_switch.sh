@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50 / UN-36 / UN-53).
+# authz_kill_switch.sh — Kill Switch (UN-33 / UN-48 / UN-41 / UN-46 / UN-50 / UN-36 / UN-53 / UN-47).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# log channel (UN-47), Git/SSH probes (UN-42/44) on the same --selftest entry.
+# Git/SSH probes (UN-42/44) on the same --selftest entry.
 #
 # Modes:
 #   --branch systemd|compose|file [--apply-content <file>] [--restart -- <argv...>]
 #       Preflight (UN-50) then resolve/validate/replace; without --apply-content,
 #       UN-41 generates transformed content and one-shot readback. Optional
 #       --restart runs argv exactly once; on success, UN-36 HTTP probes run when
-#       KILL_SWITCH_URLS is set (evidence via UN-53; T2→exit 6). T1=restart
-#       fail→exit 4; T3=post-rename fsync fail→exit 5.
+#       KILL_SWITCH_URLS is set (evidence via UN-53; T2→exit 6), then UN-47 log
+#       channel when KILL_SWITCH_LOG_DIR is set. T1=restart fail→exit 4;
+#       T3=post-rename fsync fail→exit 5.
 #   --selftest
-#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 + UN-36 + UN-53 gates (no --branch).
+#       Run UN-33 + UN-48 + UN-41 + UN-46 + UN-50 + UN-36 + UN-53 + UN-47 gates.
 #   -h | --help
 #
+# ---------------------------------------------------------------------------
+# UN-47 log channel (frozen in header):
+#   poll budget: 30 attempts × 2s sleep between samples (override via
+#   KILL_SWITCH_LOG_POLL_ATTEMPTS / KILL_SWITCH_LOG_POLL_SLEEP_SECS for fixtures)
+#   cursor: per-inode byte offset captured before restart; post-restart read is
+#   incremental only (rename rotation keeps inode → archived bytes skipped;
+#   truncated in-place file resets to offset 0)
+#   would-deny: rg on the incremental slice; exit 0=hit (T2), 1=clean, >1=tool error
 # ---------------------------------------------------------------------------
 # UN-50 preflight matrix (frozen):
 #   platform: Linux only (non-Linux fail-closed + install/run-on-Linux guidance)
@@ -57,7 +66,8 @@ Environment (branch mode):
   file:    KILL_SWITCH_CONFIG, MEGA_PROFILE
   Inject:  KILL_SWITCH_READBACK_FAIL=1 (force readback failure after write)
   Probes (after successful --restart): KILL_SWITCH_URLS, KILL_SWITCH_EXPECT_CODE,
-    KILL_SWITCH_DEPLOY_HTTP, KILL_SWITCH_RESTRICTED_DIR (evidence run root; UN-53)
+    KILL_SWITCH_DEPLOY_HTTP, KILL_SWITCH_RESTRICTED_DIR (evidence run root; UN-53);
+    KILL_SWITCH_LOG_DIR (UN-47 would-deny incremental; cursor before restart)
 
 Preflight (UN-50): Linux-only; requires cp/yq/jq/rg/flock/stat/getfacl/getfattr,
   KILL_SWITCH_BIN fsync --probe, and version floors (see script header).
@@ -714,6 +724,183 @@ run_http_probes() {
   printf 'authz_kill_switch: HTTP probes finished (%s URL(s)); evidence recorded — not a recovery-green claim.\n' "${#url_list[@]}" >&2
 }
 
+# ---------------------------------------------------------------------------
+# UN-47 log channel — zero new would-deny on incremental slice after restart
+# ---------------------------------------------------------------------------
+
+LOG_CURSOR_FILE=""
+
+log_poll_attempts() {
+  printf '%s\n' "${KILL_SWITCH_LOG_POLL_ATTEMPTS:-30}"
+}
+
+log_poll_sleep_secs() {
+  printf '%s\n' "${KILL_SWITCH_LOG_POLL_SLEEP_SECS:-2}"
+}
+
+require_rg() {
+  local rg_bin="${KILL_SWITCH_RG:-}"
+  if [[ -n "$rg_bin" ]]; then
+    [[ -x "$rg_bin" || -f "$rg_bin" ]] || die "KILL_SWITCH_RG is not executable: $rg_bin"
+    printf '%s\n' "$rg_bin"
+    return
+  fi
+  command -v rg >/dev/null 2>&1 || die "rg is required for log channel (UN-47)"
+  command -v rg
+}
+
+# Snapshot regular files as inode<TAB>path<TAB>size (sorted by path).
+log_dir_size_snapshot() {
+  local root="$1"
+  find "$root" -type f -printf '%i\t%p\t%s\n' 2>/dev/null | sort -t $'\t' -k2,2
+}
+
+# Capture per-inode byte cursors before restart (must run before run_restart).
+log_cursor_capture() {
+  local root="${KILL_SWITCH_LOG_DIR:-}"
+  [[ -n "$root" ]] || return 0
+  [[ -d "$root" ]] || die "KILL_SWITCH_LOG_DIR is not a directory: $root"
+  LOG_CURSOR_FILE="$(mktemp "${TMPDIR:-/tmp}/killswitch-log-cursor.XXXXXX")"
+  log_dir_size_snapshot "$root" >"$LOG_CURSOR_FILE"
+  printf 'authz_kill_switch: log cursor captured (%s files under %s)\n' \
+    "$(wc -l <"$LOG_CURSOR_FILE" | tr -d ' ')" "$root" >&2
+}
+
+# Wait until two consecutive size snapshots match (flush settled), or fail timeout.
+log_wait_for_flush() {
+  local root="$1"
+  if [[ "${KILL_SWITCH_LOG_POLL_FORCE_TIMEOUT:-}" == "1" ]]; then
+    return 1
+  fi
+  local attempts sleep_s
+  attempts="$(log_poll_attempts)"
+  sleep_s="$(log_poll_sleep_secs)"
+  local prev="" cur="" i
+  for ((i = 1; i <= attempts; i++)); do
+    cur="$(log_dir_size_snapshot "$root")"
+    if [[ -n "$prev" && "$cur" == "$prev" ]]; then
+      printf 'authz_kill_switch: log flush settled after %s sample(s)\n' "$i" >&2
+      return 0
+    fi
+    prev="$cur"
+    if [[ "$i" -lt "$attempts" && "$sleep_s" != "0" ]]; then
+      sleep "$sleep_s"
+    fi
+  done
+  return 1
+}
+
+# Build incremental slice from inode cursors into $3. Rotation keeps inode → skip archived.
+log_build_incremental() {
+  local root="$1"
+  local cursor_file="$2"
+  local out_file="$3"
+  : >"$out_file"
+  python3 - "$root" "$cursor_file" "$out_file" <<'PY'
+import os, sys
+root, cursor_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+cursors = {}  # inode -> offset
+with open(cursor_path, "r", encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            ino = int(parts[0])
+            size = int(parts[2])
+        except ValueError:
+            continue
+        cursors[ino] = size
+with open(out_path, "ab") as out:
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            ino = st.st_ino
+            size = st.st_size
+            start = cursors.get(ino, 0)
+            if size < start:
+                start = 0  # truncated in place
+            if size <= start:
+                continue
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                out.write(fh.read())
+PY
+}
+
+# rg with explicit 0/1/>1 branching. Prints matches to stdout when rc=0.
+# Returns 0=hit, 1=no hit; dies on >1.
+# NOTE: never `set -e` before `return 1` — bash would exit the whole script.
+rg_would_deny_in_file() {
+  local file="$1"
+  local rg_bin rc=0
+  rg_bin="$(require_rg)"
+  set +e
+  "$rg_bin" -n -- 'would-deny' "$file"
+  rc=$?
+  set +e
+  if [[ "$rc" -gt 1 ]]; then
+    die "rg failed while scanning would-deny (exit $rc); refusing to treat as zero-hit"
+  fi
+  return "$rc"
+}
+
+run_log_probes() {
+  local root="${KILL_SWITCH_LOG_DIR:-}"
+  [[ -n "$root" ]] || return 0
+  [[ -d "$root" ]] || die "KILL_SWITCH_LOG_DIR is not a directory: $root"
+  [[ -n "${LOG_CURSOR_FILE:-}" && -f "$LOG_CURSOR_FILE" ]] \
+    || die "log cursor missing — capture must run before --restart when KILL_SWITCH_LOG_DIR is set"
+
+  # Evidence session (UN-53) for the log channel check.
+  evidence_session_begin
+  local evidence_settled=0
+  # shellcheck disable=SC2064
+  trap '[[ "${evidence_settled:-0}" -eq 1 ]] || evidence_session_abort' EXIT
+
+  if ! log_wait_for_flush "$root"; then
+    evidence_append_check log log_no_would_deny fail
+    evidence_session_commit
+    evidence_settled=1
+    trap - EXIT
+    fail_t2 "log flush poll timed out (${KILL_SWITCH_LOG_POLL_ATTEMPTS:-30} × ${KILL_SWITCH_LOG_POLL_SLEEP_SECS:-2}s)"
+  fi
+
+  local slice
+  slice="$(mktemp "${TMPDIR:-/tmp}/killswitch-log-slice.XXXXXX")"
+  log_build_incremental "$root" "$LOG_CURSOR_FILE" "$slice"
+
+  local rg_rc=0
+  set +e
+  rg_would_deny_in_file "$slice" >/dev/null
+  rg_rc=$?
+  set -e
+  rm -f -- "$slice"
+
+  if [[ "$rg_rc" -eq 0 ]]; then
+    evidence_append_check log log_no_would_deny fail
+    evidence_session_commit
+    evidence_settled=1
+    trap - EXIT
+    fail_t2 "new would-deny line(s) in KILL_SWITCH_LOG_DIR incremental slice after restart"
+  fi
+  # rg_rc == 1 → clean
+  evidence_append_check log log_no_would_deny pass
+  evidence_session_commit
+  evidence_settled=1
+  trap - EXIT
+  printf 'authz_kill_switch: log channel clean (no new would-deny); evidence recorded — not a recovery-green claim.\n' >&2
+}
+
 require_yq() {
   local yq_bin="${KILL_SWITCH_YQ:-}"
   if [[ -n "$yq_bin" ]]; then
@@ -995,7 +1182,7 @@ run_branch() {
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7 + UN-36 ×6 + UN-53 ×5)
+# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5 + UN-50 ×7 + UN-36 ×6 + UN-53 ×5 + UN-47 ×4)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -1049,6 +1236,12 @@ PY
 }
 
 run_selftest() {
+  # Isolate from host env leftovers (probe/log vars must be fixture-scoped).
+  unset KILL_SWITCH_LOG_DIR KILL_SWITCH_LOG_POLL_ATTEMPTS KILL_SWITCH_LOG_POLL_SLEEP_SECS \
+    KILL_SWITCH_LOG_POLL_FORCE_TIMEOUT KILL_SWITCH_RG KILL_SWITCH_URLS \
+    KILL_SWITCH_EXPECT_CODE KILL_SWITCH_DEPLOY_HTTP KILL_SWITCH_RESTRICTED_DIR \
+    KILL_SWITCH_CONFIG KILL_SWITCH_ENV_FILE KILL_SWITCH_COMPOSE || true
+
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/killswitch-selftest.XXXXXX")"
   # shellcheck disable=SC2064
@@ -1792,7 +1985,102 @@ PYTLS
   RUN_CAP="$run_cap" "$real_bin" authz-audit run-abort --restricted-root "$e53" --run-id "$run_id" || true
   gate_pass "evidence_unknown_enum"
 
-  printf 'authz_kill_switch --selftest: 41/41 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6 + UN-53×5)\n'
+  # --- UN-47 gates (42–45): log channel / would-deny ---
+  local log_dir="$tmp/logs"
+  local log_env="$tmp/log.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$log_env"
+  local log_new="$tmp/log.new"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$log_new"
+
+  # Gate 42: new would-deny in incremental slice → T2
+  rm -rf -- "$log_dir" "$restricted" && mkdir -p "$log_dir" "$restricted"
+  printf 'noise before cursor\n' >"$log_dir/app.log"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$log_env" \
+    KILL_SWITCH_LOG_DIR="$log_dir" \
+    KILL_SWITCH_LOG_POLL_ATTEMPTS=5 \
+    KILL_SWITCH_LOG_POLL_SLEEP_SECS=0 \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$log_new" --restart -- \
+      bash -c "printf 'line with would-deny marker\\n' >>\"$log_dir/app.log\"" \
+      2>"$tmp/g42.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "log_would_deny_detect" "expected exit 6, got $t2_rc: $(cat "$tmp/g42.err")"
+  evidence_json_for_latest_run "$restricted" | grep -q 'log_no_would_deny' \
+    || gate_fail "log_would_deny_detect" "missing log evidence"
+  gate_pass "log_would_deny_detect"
+
+  # Gate 43: rg exit >1 is tool error (not zero-hit)
+  rm -rf -- "$log_dir" "$restricted" && mkdir -p "$log_dir" "$restricted"
+  printf 'stable\n' >"$log_dir/app.log"
+  local bad_rg="$tmp/bad-rg"
+  cat >"$bad_rg" <<'BADRG'
+#!/usr/bin/env bash
+exit 2
+BADRG
+  chmod +x "$bad_rg"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$log_env" \
+    KILL_SWITCH_LOG_DIR="$log_dir" \
+    KILL_SWITCH_RG="$bad_rg" \
+    KILL_SWITCH_LOG_POLL_ATTEMPTS=3 \
+    KILL_SWITCH_LOG_POLL_SLEEP_SECS=0 \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$log_new" --restart -- true \
+    2>"$tmp/g43.err" || t2_rc=$?
+  [[ "$t2_rc" -ne 0 && "$t2_rc" -ne 6 ]] || gate_fail "log_rg_tool_error" "expected hard fail, got $t2_rc"
+  grep -qi 'rg failed\|refusing to treat as zero-hit' "$tmp/g43.err" \
+    || gate_fail "log_rg_tool_error" "missing rg error message: $(cat "$tmp/g43.err")"
+  gate_pass "log_rg_tool_error"
+
+  # Gate 44: poll timeout (fixture force)
+  rm -rf -- "$log_dir" "$restricted" && mkdir -p "$log_dir" "$restricted"
+  printf 'base\n' >"$log_dir/app.log"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$log_env" \
+    KILL_SWITCH_LOG_DIR="$log_dir" \
+    KILL_SWITCH_LOG_POLL_FORCE_TIMEOUT=1 \
+    KILL_SWITCH_LOG_POLL_ATTEMPTS=2 \
+    KILL_SWITCH_LOG_POLL_SLEEP_SECS=0 \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$log_new" --restart -- true \
+    2>"$tmp/g44.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "log_poll_timeout" "expected exit 6 on poll timeout, got $t2_rc: $(cat "$tmp/g44.err")"
+  grep -qi 'poll timed out\|flush poll' "$tmp/g44.err" \
+    || gate_fail "log_poll_timeout" "missing timeout message"
+  gate_pass "log_poll_timeout"
+
+  # Gate 45: rotation cursor — pre-cursor would-deny ignored; post-rotate incremental counted
+  rm -rf -- "$log_dir" "$restricted" && mkdir -p "$log_dir" "$restricted"
+  printf 'old would-deny should be ignored after cursor\n' >"$log_dir/app.log"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$log_env" \
+    KILL_SWITCH_LOG_DIR="$log_dir" \
+    KILL_SWITCH_LOG_POLL_ATTEMPTS=4 \
+    KILL_SWITCH_LOG_POLL_SLEEP_SECS=0 \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$log_new" --restart -- \
+      bash -c "
+        mv '$log_dir/app.log' '$log_dir/app.log.1'
+        printf 'rotated clean line\\n' >'$log_dir/app.log'
+      " 2>"$tmp/g45ok.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 0 ]] || gate_fail "log_rotate_cursor" "clean rotate should pass, got $t2_rc: $(cat "$tmp/g45ok.err")"
+  rm -rf -- "$log_dir" "$restricted" && mkdir -p "$log_dir" "$restricted"
+  printf 'pre-cursor would-deny noise\n' >"$log_dir/app.log"
+  t2_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$log_env" \
+    KILL_SWITCH_LOG_DIR="$log_dir" \
+    KILL_SWITCH_LOG_POLL_ATTEMPTS=4 \
+    KILL_SWITCH_LOG_POLL_SLEEP_SECS=0 \
+    KILL_SWITCH_RESTRICTED_DIR="$restricted" \
+    bash "$SELF" --branch file --apply-content "$log_new" --restart -- \
+      bash -c "
+        mv '$log_dir/app.log' '$log_dir/app.log.1'
+        printf 'fresh would-deny after rotate\\n' >'$log_dir/app.log'
+      " 2>"$tmp/g45.err" || t2_rc=$?
+  [[ "$t2_rc" -eq 6 ]] || gate_fail "log_rotate_cursor" "expected exit 6 for post-rotate would-deny, got $t2_rc"
+  gate_pass "log_rotate_cursor"
+
+  printf 'authz_kill_switch --selftest: 45/45 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5 + UN-50×7 + UN-36×6 + UN-53×5 + UN-47×4)\n'
 
   trap - EXIT
   rm -rf -- "$tmp"
@@ -1841,10 +2129,15 @@ main() {
   done
   [[ -n "$branch" ]] || die "missing --branch or --selftest"
   run_preflight
+  if [[ "$want_restart" -eq 1 ]]; then
+    # Cursor before mutate/restart so incremental slice excludes pre-switch noise.
+    log_cursor_capture
+  fi
   run_branch "$branch" "$content"
   if [[ "$want_restart" -eq 1 ]]; then
     run_restart "${restart_argv[@]}"
     run_http_probes
+    run_log_probes
   fi
 }
 
