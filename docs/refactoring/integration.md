@@ -104,7 +104,7 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 - **重启与失败终态（UN-46）**：`--restart -- <argv...>` 恰好一次；T1 重启失败 → 退出码 4、配置保持 off、打印人工重启指引；T3 rename 后 fsync 失败 → 退出码 5、不回滚为 on、重跑幂等收敛。
 - **元数据保持（UN-48）**：owner / mode / ACL / xattr；写后 `stat`/`getfacl`/xattr 比对，不符即失败（可用 `KILL_SWITCH_META_VERIFY_FAIL` 注入）。
 - **自测**：`bash scripts/authz_kill_switch.sh --selftest`（… + UN-42×6 + UN-44×7 = **58/58**；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/monoengine`；compose/preflight 需 `yq`（或 `KILL_SWITCH_YQ`）；缺 `getfattr` 时自测会在临时 PATH 放入存在性 stub。
-- **发布**：REL-02 子卡只本地提交；唯一发布点 UN-45。
+- **发布**：REL-02 十子卡本地提交后由 UN-45 原子发布为 **v0.2.65**（脚本入口 / 三分支 / 拓扑绑定 / 失败终态安全方向见上；降级 = 不执行该脚本）。
 
 ## 迁移覆盖：`mega_cl.link` 唯一索引（UN-10）
 
