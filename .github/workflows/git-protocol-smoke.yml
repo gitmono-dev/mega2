@@ -94,6 +94,8 @@ jobs:
           # gitmono-dev/orbit is a virtual workspace (crates/orbit + crates/orbit-api).
           # monoengine path deps resolve against that layout from working-directory:
           # monoengine → ../orbit/crates/orbit-api and ../../orbit/crates/orbit.
+          # Swagger UI is vendored via utoipa-swagger-ui's `vendored` feature so
+          # the release build does not download GitHub zips (InvalidArchive EOCD flake).
           for p in \
             orbit/crates/orbit/Cargo.toml \
             orbit/crates/orbit-api/Cargo.toml

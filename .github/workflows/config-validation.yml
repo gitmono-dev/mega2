@@ -86,6 +86,8 @@ jobs:
           # monoengine → ../orbit/crates/orbit-api and ../../orbit/crates/orbit.
           # UN-49 retargeted those deps at a local pre-workspace tree (api/ + repo-root
           # package); cargo metadata then failed on Actions before any test ran.
+          # Swagger UI is vendored via utoipa-swagger-ui's `vendored` feature so
+          # clippy/test do not download GitHub zips (InvalidArchive EOCD flake).
           for p in \
             orbit/crates/orbit/Cargo.toml \
             orbit/crates/orbit-api/Cargo.toml
