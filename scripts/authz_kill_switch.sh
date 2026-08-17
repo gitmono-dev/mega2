@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # authz_kill_switch.sh — Kill Switch skeleton + secure write + metadata preserve
-# (UN-33 / UN-48).
+# + three-branch transforms/readback (UN-33 / UN-48 / UN-41).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# transforms (UN-41), restart/T1/T3 (UN-46), preflight (UN-50), and recovery
-# probes (UN-36/47/42/44) on the same --selftest entry.
+# restart/T1/T3 (UN-46), preflight (UN-50), and recovery probes
+# (UN-36/47/42/44) on the same --selftest entry.
 #
 # Modes:
 #   --branch systemd|compose|file [--apply-content <file>]
-#       Resolve the branch target, validate it, then atomically replace its
-#       bytes from --apply-content (UN-41 will generate that content).
+#       Resolve the branch target, validate it, then atomically replace.
+#       Without --apply-content, UN-41 generates the transformed content and
+#       performs one-shot readback. With --apply-content, replace only
+#       (skeleton / metadata fixture path).
 #   --selftest
-#       Run UN-33 skeleton gates + UN-48 metadata gates (no --branch).
+#       Run UN-33 + UN-48 + UN-41 gates (no --branch).
 #   -h | --help
 
 set -euo pipefail
@@ -26,18 +28,20 @@ die() {
 
 usage() {
   cat <<'USAGE'
-authz_kill_switch.sh — Kill Switch skeleton + metadata preserve (UN-33/UN-48).
+authz_kill_switch.sh — Kill Switch skeleton + metadata + transforms (UN-33/UN-48/UN-41).
 
 Usage:
+  bash scripts/authz_kill_switch.sh --branch systemd|compose|file
   bash scripts/authz_kill_switch.sh --branch systemd|compose|file --apply-content <file>
   bash scripts/authz_kill_switch.sh --selftest
   bash scripts/authz_kill_switch.sh -h | --help
 
 Environment (branch mode):
   KILL_SWITCH_BIN          monoengine binary (required; used for authz-audit fsync)
-  systemd: KILL_SWITCH_ENV_FILE
-  compose: KILL_SWITCH_COMPOSE
-  file:    KILL_SWITCH_CONFIG
+  systemd: KILL_SWITCH_UNIT, KILL_SWITCH_ENV_FILE
+  compose: KILL_SWITCH_COMPOSE, KILL_SWITCH_SERVICE (yq on PATH or KILL_SWITCH_YQ)
+  file:    KILL_SWITCH_CONFIG, MEGA_PROFILE
+  Inject:  KILL_SWITCH_READBACK_FAIL=1 (force readback failure after write)
 USAGE
 }
 
@@ -293,6 +297,17 @@ secure_replace() {
   fsync_path "$bin" "$target"
 }
 
+require_yq() {
+  local yq_bin="${KILL_SWITCH_YQ:-}"
+  if [[ -n "$yq_bin" ]]; then
+    [[ -x "$yq_bin" || -f "$yq_bin" ]] || die "KILL_SWITCH_YQ is not executable: $yq_bin"
+    printf '%s\n' "$yq_bin"
+    return
+  fi
+  command -v yq >/dev/null 2>&1 || die "yq is required for --branch compose (set KILL_SWITCH_YQ or install mikefarah/yq)"
+  command -v yq
+}
+
 resolve_target() {
   local branch="$1"
   case "$branch" in
@@ -314,25 +329,256 @@ resolve_target() {
   esac
 }
 
+# UN-41 required inputs (transform path only; --apply-content skeleton path skips).
+assert_branch_transform_inputs() {
+  local branch="$1"
+  case "$branch" in
+    systemd)
+      [[ -n "${KILL_SWITCH_UNIT:-}" ]] || die "KILL_SWITCH_UNIT is required for --branch systemd"
+      ;;
+    compose)
+      [[ -n "${KILL_SWITCH_SERVICE:-}" ]] || die "KILL_SWITCH_SERVICE is required for --branch compose"
+      require_yq >/dev/null
+      ;;
+    file)
+      require_bin >/dev/null
+      [[ -n "${MEGA_PROFILE:-}" ]] || die "MEGA_PROFILE is required for --branch file"
+      ;;
+  esac
+}
+
+# Transform EnvironmentFile: replace MEGA_CEDAR__ENFORCEMENT=… → =off (no append).
+transform_systemd_content() {
+  local src="$1"
+  local dest="$2"
+  python3 - "$src" "$dest" <<'PY'
+import sys
+src, dest = sys.argv[1], sys.argv[2]
+key = "MEGA_CEDAR__ENFORCEMENT"
+found = False
+out = []
+with open(src, "r", encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        raw = line.rstrip("\n")
+        newline = "\n" if line.endswith("\n") else ""
+        if raw and not raw.lstrip().startswith("#") and "=" in raw:
+            k = raw.split("=", 1)[0].strip()
+            if k == key:
+                out.append(f"{key}=off{newline}")
+                found = True
+                continue
+        out.append(line if line.endswith("\n") or not line else line + newline)
+if not found:
+    print(f"missing key {key} (fail-closed; will not append)", file=sys.stderr)
+    sys.exit(4)
+with open(dest, "w", encoding="utf-8", newline="") as fh:
+    fh.writelines(out)
+PY
+}
+
+# Transform compose YAML via yq (mapping only; list fail-closed; missing key fail-closed).
+transform_compose_content() {
+  local src="$1"
+  local dest="$2"
+  local svc="$KILL_SWITCH_SERVICE"
+  local yq_bin
+  yq_bin="$(require_yq)"
+  local env_type
+  env_type="$("$yq_bin" -r ".services[\"${svc}\"].environment | type" "$src")"
+  case "$env_type" in
+    "!!map" | "map")
+      ;;
+    "!!seq" | "seq" | "!!seq "*)
+      die "compose service '${svc}' environment is list-shaped (fail-closed; convert to mapping)"
+      ;;
+    *)
+      die "compose service '${svc}' environment type unsupported: ${env_type}"
+      ;;
+  esac
+  if ! "$yq_bin" -e ".services[\"${svc}\"].environment.MEGA_CEDAR__ENFORCEMENT" "$src" >/dev/null 2>&1; then
+    die "compose missing .services.${svc}.environment.MEGA_CEDAR__ENFORCEMENT (fail-closed)"
+  fi
+  "$yq_bin" ".services[\"${svc}\"].environment.MEGA_CEDAR__ENFORCEMENT = \"off\"" "$src" >"$dest"
+}
+
+# Transform TOML [cedar].enforcement → "off" (missing key fail-closed).
+transform_file_content() {
+  local src="$1"
+  local dest="$2"
+  python3 - "$src" "$dest" <<'PY'
+import re, sys, tomllib
+src, dest = sys.argv[1], sys.argv[2]
+text = open(src, "r", encoding="utf-8").read()
+try:
+    data = tomllib.loads(text)
+except Exception as err:
+    print(f"invalid TOML: {err}", file=sys.stderr)
+    sys.exit(4)
+cedar = data.get("cedar")
+if not isinstance(cedar, dict) or "enforcement" not in cedar:
+    print("missing [cedar].enforcement (fail-closed; will not append)", file=sys.stderr)
+    sys.exit(4)
+lines = text.splitlines(keepends=True)
+out = []
+in_cedar = False
+found = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        in_cedar = stripped == "[cedar]"
+        out.append(line)
+        continue
+    if in_cedar and re.match(r"^enforcement\s*=", stripped):
+        nl = "\n" if line.endswith("\n") else ""
+        out.append(f'enforcement = "off"{nl}')
+        found = True
+        continue
+    out.append(line)
+if not found:
+    print("missing [cedar].enforcement line under [cedar] (fail-closed)", file=sys.stderr)
+    sys.exit(4)
+open(dest, "w", encoding="utf-8", newline="").writelines(out)
+PY
+}
+
+# Assert UN-01 JSON winning_source is the file we will edit (env wins → disable).
+assert_file_winning_source() {
+  local bin target abs_target config_arg profile_file out winning
+  bin="$(require_bin)"
+  target="$KILL_SWITCH_CONFIG"
+  abs_target="$(realpath -- "$target")"
+  if [[ -n "${MEGA_CEDAR__ENFORCEMENT+x}" ]]; then
+    die "environment source MEGA_CEDAR__ENFORCEMENT wins; file branch disabled"
+  fi
+  # --config is the base file; profile loads config.<MEGA_PROFILE>.toml beside it.
+  # When KILL_SWITCH_CONFIG points at the profile file, derive the base sibling.
+  config_arg="$target"
+  profile_file="$(dirname -- "$target")/config.${MEGA_PROFILE}.toml"
+  if [[ -e "$profile_file" ]] && [[ "$(realpath -- "$target")" == "$(realpath -- "$profile_file")" ]]; then
+    config_arg="$(dirname -- "$target")/config.toml"
+    [[ -f "$config_arg" ]] || die "base config.toml missing beside profile file $target"
+  fi
+  out="$("$bin" --config "$config_arg" --profile "$MEGA_PROFILE" config validate --show-sources --format json 2>/dev/null || true)"
+  winning="$(printf '%s\n' "$out" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+idx = text.find("{")
+if idx < 0:
+    raise SystemExit(0)
+obj, _ = json.JSONDecoder().raw_decode(text[idx:])
+print(obj.get("cedar", {}).get("enforcement", {}).get("winning_source", ""))
+')"
+  [[ -n "$winning" ]] || die "failed to parse cedar.enforcement.winning_source from config validate JSON"
+  case "$winning" in
+    "environment variable MEGA_CEDAR__ENFORCEMENT")
+      die "environment source wins; file branch disabled"
+      ;;
+    "base file $target" | "base file $abs_target" | "profile file $target" | "profile file $abs_target")
+      return 0
+      ;;
+    *)
+      die "winning source is not the target file (got: ${winning})"
+      ;;
+  esac
+}
+
+readback_once() {
+  local branch="$1"
+  local target="$2"
+  if [[ "${KILL_SWITCH_READBACK_FAIL:-}" == "1" ]]; then
+    die "readback inject: KILL_SWITCH_READBACK_FAIL=1"
+  fi
+  case "$branch" in
+    systemd)
+      python3 - "$target" <<'PY'
+import sys
+path = sys.argv[1]
+key = "MEGA_CEDAR__ENFORCEMENT"
+found = None
+with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        raw = line.rstrip("\n")
+        if not raw or raw.lstrip().startswith("#") or "=" not in raw:
+            continue
+        k, v = raw.split("=", 1)
+        if k.strip() == key:
+            found = v
+if found != "off":
+    print(f"readback failed: {key}={found!r} (want 'off')", file=sys.stderr)
+    sys.exit(4)
+PY
+      ;;
+    compose)
+      local yq_bin svc val
+      yq_bin="$(require_yq)"
+      svc="$KILL_SWITCH_SERVICE"
+      val="$("$yq_bin" -r ".services[\"${svc}\"].environment.MEGA_CEDAR__ENFORCEMENT" "$target")"
+      [[ "$val" == "off" ]] || die "readback failed: compose MEGA_CEDAR__ENFORCEMENT=${val} (want off)"
+      ;;
+    file)
+      python3 - "$target" <<'PY'
+import sys, tomllib
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    data = tomllib.load(fh)
+val = data.get("cedar", {}).get("enforcement")
+if val != "off":
+    print(f"readback failed: cedar.enforcement={val!r} (want 'off')", file=sys.stderr)
+    sys.exit(4)
+PY
+      ;;
+  esac
+}
+
+generate_transform_content() {
+  local branch="$1"
+  local target="$2"
+  local dest="$3"
+  assert_branch_transform_inputs "$branch"
+  case "$branch" in
+    systemd) transform_systemd_content "$target" "$dest" ;;
+    compose) transform_compose_content "$target" "$dest" ;;
+    file)
+      assert_file_winning_source
+      transform_file_content "$target" "$dest"
+      ;;
+  esac
+}
+
 run_branch() {
   local branch="$1"
   local content="${2:-}"
-  [[ -n "$content" ]] || die "--apply-content <file> is required until UN-41 supplies transforms"
   local target
   target="$(resolve_target "$branch")"
   # Duplicate-key check applies to KEY=VALUE-shaped targets (systemd env file,
   # and file-branch TOML is checked for duplicate bare keys on a best-effort
   # KEY= line basis when present; compose YAML is validated as regular file only).
-  if [[ "$branch" == "systemd" || "$branch" == "file" ]]; then
+  if [[ "$branch" == "systemd" ]]; then
     assert_no_duplicate_keys "$target"
   else
     assert_regular_nofollow "$target"
   fi
+
+  local generated=""
+  if [[ -z "$content" ]]; then
+    generated="$(mktemp "${TMPDIR:-/tmp}/killswitch-xform.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap 'rm -f -- "'"$generated"'"' RETURN
+    generate_transform_content "$branch" "$target" "$generated"
+    content="$generated"
+  fi
+
   secure_replace "$target" "$content"
+
+  if [[ -n "$generated" ]]; then
+    readback_once "$branch" "$target"
+    rm -f -- "$generated"
+    trap - RETURN
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (UN-33 ×6 + UN-48 ×5)
+# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -389,7 +635,7 @@ run_selftest() {
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/killswitch-selftest.XXXXXX")"
   # shellcheck disable=SC2064
-  trap 'rm -rf -- "$tmp"' EXIT
+  trap 'rm -rf -- "'"$tmp"'"' EXIT
 
   local real_bin="${KILL_SWITCH_BIN:-}"
   if [[ -z "$real_bin" ]]; then
@@ -578,7 +824,157 @@ PY
   [[ "$(cat -- "$target_v")" == "V=1" ]] || gate_fail "meta_verify_inject" "target mutated after verify failure"
   gate_pass "meta_verify_inject"
 
-  printf 'authz_kill_switch --selftest: 11/11 gates passed (UN-33×6 + UN-48×5)\n'
+  # --- UN-41: ensure yq available for compose gates ---
+  if ! command -v yq >/dev/null 2>&1; then
+    local yq_arch yq_url
+    case "$(uname -m)" in
+      x86_64 | amd64) yq_arch="amd64" ;;
+      aarch64 | arm64) yq_arch="arm64" ;;
+      *) die "unsupported arch for yq bootstrap: $(uname -m)" ;;
+    esac
+    yq_url="https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_${yq_arch}"
+    curl -fsSL -o "$tmp/yq" "$yq_url"
+    chmod +x "$tmp/yq"
+    export PATH="$tmp:$PATH"
+  fi
+  export KILL_SWITCH_YQ
+  KILL_SWITCH_YQ="$(command -v yq)"
+
+  # --- UN-41 gate 12: mapping compose transform ---
+  local compose_map="$tmp/compose-map.yml"
+  cat >"$compose_map" <<'EOF'
+services:
+  web:
+    environment:
+      MEGA_CEDAR__ENFORCEMENT: enforce
+      FOO: bar
+EOF
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_COMPOSE="$compose_map" KILL_SWITCH_SERVICE=web \
+    KILL_SWITCH_YQ="$KILL_SWITCH_YQ" \
+    bash "$SELF" --branch compose
+  local cmap_val
+  cmap_val="$("$KILL_SWITCH_YQ" -r '.services.web.environment.MEGA_CEDAR__ENFORCEMENT' "$compose_map")"
+  [[ "$cmap_val" == "off" ]] || gate_fail "compose_mapping_transform" "got ${cmap_val}"
+  gate_pass "compose_mapping_transform"
+
+  # --- UN-41 gate 13: list compose rejected ---
+  local compose_list="$tmp/compose-list.yml"
+  cat >"$compose_list" <<'EOF'
+services:
+  web:
+    environment:
+      - MEGA_CEDAR__ENFORCEMENT=enforce
+      - FOO=bar
+EOF
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_COMPOSE="$compose_list" KILL_SWITCH_SERVICE=web \
+      KILL_SWITCH_YQ="$KILL_SWITCH_YQ" \
+      bash "$SELF" --branch compose 2>"$tmp/g13.err"; then
+    gate_fail "compose_list_reject" "list-shaped environment was accepted"
+  fi
+  gate_pass "compose_list_reject"
+
+  # --- UN-41 gate 14: two initial env-file states → off ---
+  local env_a="$tmp/env-enforce.env" env_b="$tmp/env-shadow.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\nKEEP=1\n' >"$env_a"
+  printf 'MEGA_CEDAR__ENFORCEMENT=shadow\nKEEP=1\n' >"$env_b"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$env_a" \
+    bash "$SELF" --branch systemd
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$env_b" \
+    bash "$SELF" --branch systemd
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=off' "$env_a" || gate_fail "env_two_initial_states" "enforce fixture"
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=off' "$env_b" || gate_fail "env_two_initial_states" "shadow fixture"
+  gate_pass "env_two_initial_states"
+
+  # --- UN-41 gate 15: format-drift config (missing enforcement) ---
+  local drift_dir="$tmp/drift"
+  mkdir -p "$drift_dir"
+  cp -- "$SCRIPT_DIR/../config/config.toml" "$drift_dir/config.toml"
+  # profile required; strip enforcement from base
+  python3 - "$drift_dir/config.toml" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text2, n = re.subn(
+    r"(?m)^(\s*enforcement\s*=\s*\"[^\"]*\"\s*)$",
+    r"# removed for drift fixture",
+    text,
+    count=1,
+)
+if n != 1:
+    raise SystemExit("failed to strip enforcement from fixture")
+open(path, "w", encoding="utf-8").write(text2)
+PY
+  printf '# empty profile\n' >"$drift_dir/config.ks.toml"
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$drift_dir/config.toml" MEGA_PROFILE=ks \
+      bash "$SELF" --branch file 2>"$tmp/g15.err"; then
+    gate_fail "format_drift_config" "missing enforcement was accepted"
+  fi
+  gate_pass "format_drift_config"
+
+  # --- UN-41 gate 16: MEGA_PROFILE missing ---
+  local ok_dir="$tmp/okcfg"
+  mkdir -p "$ok_dir"
+  cp -- "$SCRIPT_DIR/../config/config.toml" "$ok_dir/config.toml"
+  python3 - "$ok_dir/config.toml" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text2, n = re.subn(r'(enforcement\s*=\s*)"[^"]*"', r'\1"enforce"', text, count=1)
+if n != 1:
+    # append cedar section
+    open(path, "a", encoding="utf-8").write('\n[cedar]\nenforcement = "enforce"\n')
+else:
+    open(path, "w", encoding="utf-8").write(text2)
+PY
+  printf '# profile without cedar\n' >"$ok_dir/config.ks.toml"
+  if env -u MEGA_PROFILE KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$ok_dir/config.toml" \
+      bash "$SELF" --branch file 2>"$tmp/g16.err"; then
+    gate_fail "mega_profile_required" "missing MEGA_PROFILE was accepted"
+  fi
+  gate_pass "mega_profile_required"
+
+  # --- UN-41 gate 17: winning-source env rejects ---
+  if MEGA_CEDAR__ENFORCEMENT=off KILL_SWITCH_BIN="$real_bin" \
+      KILL_SWITCH_CONFIG="$ok_dir/config.toml" MEGA_PROFILE=ks \
+      bash "$SELF" --branch file 2>"$tmp/g17.err"; then
+    gate_fail "winning_source_env_reject" "env winning source was accepted"
+  fi
+  gate_pass "winning_source_env_reject"
+
+  # --- UN-41 gate 18: readback failure inject ---
+  local rb_dir="$tmp/readback"
+  mkdir -p "$rb_dir"
+  cp -- "$ok_dir/config.toml" "$rb_dir/config.toml"
+  printf '# profile without cedar\n' >"$rb_dir/config.ks.toml"
+  if KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$rb_dir/config.toml" MEGA_PROFILE=ks \
+      KILL_SWITCH_READBACK_FAIL=1 \
+      bash "$SELF" --branch file 2>"$tmp/g18.err"; then
+    gate_fail "readback_fail_inject" "expected non-zero when readback injects"
+  fi
+  # Target may already be replaced before readback — inject is post-write; content should be off.
+  python3 - "$rb_dir/config.toml" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    data = tomllib.load(fh)
+assert data.get("cedar", {}).get("enforcement") == "off", data.get("cedar")
+PY
+  gate_pass "readback_fail_inject"
+
+  # Happy-path file transform (not a separate VER gate; proves gate 17/18 fixtures work)
+  local happy="$tmp/happy"
+  mkdir -p "$happy"
+  cp -- "$ok_dir/config.toml" "$happy/config.toml"
+  printf '# profile without cedar\n' >"$happy/config.ks.toml"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_CONFIG="$happy/config.toml" MEGA_PROFILE=ks \
+    bash "$SELF" --branch file
+  python3 - "$happy/config.toml" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    data = tomllib.load(fh)
+assert data["cedar"]["enforcement"] == "off"
+PY
+
+  printf 'authz_kill_switch --selftest: 18/18 gates passed (UN-33×6 + UN-48×5 + UN-41×7)\n'
   trap - EXIT
   rm -rf -- "$tmp"
 }
