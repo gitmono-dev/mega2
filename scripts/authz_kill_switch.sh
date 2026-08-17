@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # authz_kill_switch.sh — Kill Switch skeleton + secure write + metadata preserve
-# + three-branch transforms/readback (UN-33 / UN-48 / UN-41).
+# + three-branch transforms/readback + restart/T1/T3 (UN-33 / UN-48 / UN-41 / UN-46).
 #
 # REL-02 family child: production and fixtures share this file. Later cards add
-# restart/T1/T3 (UN-46), preflight (UN-50), and recovery probes
-# (UN-36/47/42/44) on the same --selftest entry.
+# preflight (UN-50) and recovery probes (UN-36/47/42/44) on the same --selftest
+# entry.
 #
 # Modes:
-#   --branch systemd|compose|file [--apply-content <file>]
-#       Resolve the branch target, validate it, then atomically replace.
-#       Without --apply-content, UN-41 generates the transformed content and
-#       performs one-shot readback. With --apply-content, replace only
-#       (skeleton / metadata fixture path).
+#   --branch systemd|compose|file [--apply-content <file>] [--restart -- <argv...>]
+#       Resolve/validate/replace; without --apply-content, UN-41 generates
+#       transformed content and one-shot readback. Optional --restart runs argv
+#       exactly once (no string re-split). T1=restart fail→exit 4 (config stays
+#       off); T3=post-rename fsync fail→exit 5 (no rollback to on).
 #   --selftest
-#       Run UN-33 + UN-48 + UN-41 gates (no --branch).
+#       Run UN-33 + UN-48 + UN-41 + UN-46 gates (no --branch).
 #   -h | --help
 
 set -euo pipefail
@@ -28,11 +28,11 @@ die() {
 
 usage() {
   cat <<'USAGE'
-authz_kill_switch.sh — Kill Switch skeleton + metadata + transforms (UN-33/UN-48/UN-41).
+authz_kill_switch.sh — Kill Switch (UN-33/UN-48/UN-41/UN-46).
 
 Usage:
   bash scripts/authz_kill_switch.sh --branch systemd|compose|file
-  bash scripts/authz_kill_switch.sh --branch systemd|compose|file --apply-content <file>
+  bash scripts/authz_kill_switch.sh --branch … [--apply-content <file>] [--restart -- <argv...>]
   bash scripts/authz_kill_switch.sh --selftest
   bash scripts/authz_kill_switch.sh -h | --help
 
@@ -42,6 +42,10 @@ Environment (branch mode):
   compose: KILL_SWITCH_COMPOSE, KILL_SWITCH_SERVICE (yq on PATH or KILL_SWITCH_YQ)
   file:    KILL_SWITCH_CONFIG, MEGA_PROFILE
   Inject:  KILL_SWITCH_READBACK_FAIL=1 (force readback failure after write)
+
+Failure terminals:
+  T1 restart failure → exit 4 (config remains off; prints manual restart argv)
+  T3 post-rename fsync failure → exit 5 (do not roll back to on; re-run to converge)
 USAGE
 }
 
@@ -277,6 +281,7 @@ fsync_path() {
 }
 
 # Atomic replace: cp --preserve=all → rewrite → verify metadata → fsync → rename → fsync.
+# T3: post-rename fsync failure → exit 5 (config may be new or old; never roll back to on).
 secure_replace() {
   local target="$1"
   local content_file="$2"
@@ -291,10 +296,34 @@ secure_replace() {
   # shellcheck disable=SC2064
   trap 'rm -f -- "'"$tmp"'"' RETURN
 
-  fsync_path "$bin" "$tmp"
+  if ! fsync_path "$bin" "$tmp"; then
+    die "file fsync failed before rename: $tmp"
+  fi
   renameat_nofollow "$tmp" "$target"
   trap - RETURN
-  fsync_path "$bin" "$target"
+  if ! fsync_path "$bin" "$target"; then
+    printf 'authz_kill_switch: T3 post-rename fsync failed for %s (exit 5). Target may be new or old; do not roll back to on — re-run this script to converge on off.\n' "$target" >&2
+    exit 5
+  fi
+}
+
+# Exactly-once restart via argv array (no env-string re-split). T1 on failure.
+run_restart() {
+  if [[ $# -eq 0 ]]; then
+    die "--restart -- requires at least one argv element"
+  fi
+  local rc=0
+  "$@" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'authz_kill_switch: T1 restart failed (command exit %s). Config remains off (safe direction).\n' "$rc" >&2
+    printf 'authz_kill_switch: manual restart guidance (run exactly):' >&2
+    local arg
+    for arg in "$@"; do
+      printf ' %q' "$arg" >&2
+    done
+    printf '\n' >&2
+    exit 4
+  fi
 }
 
 require_yq() {
@@ -578,7 +607,7 @@ run_branch() {
 }
 
 # ---------------------------------------------------------------------------
-# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7)
+# --selftest (UN-33 ×6 + UN-48 ×5 + UN-41 ×7 + UN-46 ×5)
 # ---------------------------------------------------------------------------
 
 gate_pass() {
@@ -974,7 +1003,92 @@ with open(sys.argv[1], "rb") as fh:
 assert data["cedar"]["enforcement"] == "off"
 PY
 
-  printf 'authz_kill_switch --selftest: 18/18 gates passed (UN-33×6 + UN-48×5 + UN-41×7)\n'
+  # --- UN-46 gate 19: restart failure T1 (config stays off, exit 4) ---
+  local t1_env="$tmp/t1.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\nKEEP=1\n' >"$t1_env"
+  local t1_rc=0
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$t1_env" \
+    bash "$SELF" --branch systemd --restart -- false 2>"$tmp/g19.err" || t1_rc=$?
+  [[ "$t1_rc" -eq 4 ]] || gate_fail "restart_t1" "expected exit 4, got $t1_rc"
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=off' "$t1_env" || gate_fail "restart_t1" "config not left off"
+  grep -q 'T1 restart failed' "$tmp/g19.err" || gate_fail "restart_t1" "missing T1 message"
+  grep -q 'manual restart guidance' "$tmp/g19.err" || gate_fail "restart_t1" "missing manual guidance"
+  gate_pass "restart_t1"
+
+  # --- UN-46 gate 20: post-rename fsync T3 (exit 5) ---
+  local t3_target="$tmp/t3.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\n' >"$t3_target"
+  local t3_new="$tmp/t3.new"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$t3_new"
+  local t3_state="$tmp/t3.count"
+  rm -f -- "$t3_state"
+  local t3_rc=0
+  KILL_SWITCH_BIN="$stub" KILL_SWITCH_FSYNC_STUB_REAL="$real_bin" \
+    KILL_SWITCH_FSYNC_STUB_FAIL_AT=dir KILL_SWITCH_FSYNC_STUB_STATE="$t3_state" \
+    KILL_SWITCH_CONFIG="$t3_target" \
+    bash "$SELF" --branch file --apply-content "$t3_new" 2>"$tmp/g20.err" || t3_rc=$?
+  [[ "$t3_rc" -eq 5 ]] || gate_fail "fsync_t3" "expected exit 5, got $t3_rc"
+  grep -q 'T3 post-rename fsync failed' "$tmp/g20.err" || gate_fail "fsync_t3" "missing T3 message"
+  # Must not have been rolled back to enforce by the script (safe direction).
+  if grep -q 'MEGA_CEDAR__ENFORCEMENT=enforce' "$t3_target"; then
+    # rename may or may not have landed; enforce only OK if replace never completed —
+    # but FAIL_AT=dir means rename already happened, so content must be off.
+    gate_fail "fsync_t3" "target still enforce after post-rename fsync path"
+  fi
+  grep -q 'MEGA_CEDAR__ENFORCEMENT=off' "$t3_target" || gate_fail "fsync_t3" "expected off after rename"
+  gate_pass "fsync_t3"
+
+  # --- UN-46 gate 21: idempotent re-run converges on off ---
+  local id_env="$tmp/idem.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\n' >"$id_env"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$id_env" \
+    bash "$SELF" --branch systemd
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$id_env" \
+    bash "$SELF" --branch systemd
+  # After T3-style partial: force off then re-run
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$id_env"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$id_env" \
+    bash "$SELF" --branch systemd
+  grep -qx 'MEGA_CEDAR__ENFORCEMENT=off' "$id_env" || gate_fail "idempotent_rerun" "not off after re-runs"
+  gate_pass "idempotent_rerun"
+
+  # --- UN-46 gate 22: argv with spaces (no re-split) ---
+  local rec="$tmp/restart-record"
+  local recorder="$tmp/restart-recorder.sh"
+  cat >"$recorder" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >"$KILL_SWITCH_RESTART_RECORD"
+EOF
+  chmod +x "$recorder"
+  local sp_env="$tmp/spaces.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=enforce\n' >"$sp_env"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$sp_env" \
+    KILL_SWITCH_RESTART_RECORD="$rec" \
+    bash "$SELF" --branch systemd --restart -- "$recorder" "arg with spaces" "second"
+  python3 - "$rec" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read().split(b"\0")
+# trailing empty from final \0
+parts = [p.decode() for p in data if p]
+assert parts == ["arg with spaces", "second"], parts
+PY
+  gate_pass "restart_argv_spaces"
+
+  # --- UN-46 gate 23: special characters in argv ---
+  rm -f -- "$rec"
+  local spc_env="$tmp/special.env"
+  printf 'MEGA_CEDAR__ENFORCEMENT=off\n' >"$spc_env"
+  KILL_SWITCH_BIN="$real_bin" KILL_SWITCH_UNIT=mega.service KILL_SWITCH_ENV_FILE="$spc_env" \
+    KILL_SWITCH_RESTART_RECORD="$rec" \
+    bash "$SELF" --branch systemd --restart -- "$recorder" 'a$b' 'c*d' 'e;f' 'g`h'
+  python3 - "$rec" <<'PY'
+import sys
+parts = [p.decode() for p in open(sys.argv[1], "rb").read().split(b"\0") if p]
+assert parts == ["a$b", "c*d", "e;f", "g`h"], parts
+PY
+  gate_pass "restart_argv_special"
+
+  printf 'authz_kill_switch --selftest: 23/23 gates passed (UN-33×6 + UN-48×5 + UN-41×7 + UN-46×5)\n'
   trap - EXIT
   rm -rf -- "$tmp"
 }
@@ -994,6 +1108,8 @@ main() {
   fi
 
   local branch="" content=""
+  local -a restart_argv=()
+  local want_restart=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
@@ -1004,6 +1120,14 @@ main() {
         content="${2:-}"
         shift 2
         ;;
+      --restart)
+        shift
+        [[ "${1:-}" == "--" ]] || die "--restart requires -- before argv (got: ${1:-<eof>})"
+        shift
+        restart_argv=("$@")
+        want_restart=1
+        break
+        ;;
       *)
         die "unknown argument: $1"
         ;;
@@ -1011,6 +1135,9 @@ main() {
   done
   [[ -n "$branch" ]] || die "missing --branch or --selftest"
   run_branch "$branch" "$content"
+  if [[ "$want_restart" -eq 1 ]]; then
+    run_restart "${restart_argv[@]}"
+  fi
 }
 
 main "$@"
