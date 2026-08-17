@@ -23,4 +23,4 @@
 | `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06 已由 `plan-20260802.md` 关闭** |
 | `plan-20260802.md` | 日期计划 | 已完成（Website 内部产品邮件 API；tip `a52d703`；DEP-06 关闭；monoengine `0.2.1`） |
 | `plan-20260803.md` | 日期计划 | 已完成（Git 使用场景测试补全；承接 PT-04 / DEFER-IT-01/02/12；GM-01..GM-12 全部终态，GM-04/GM-R1/GM-10A 正式取消、GM-10B handoff 承接；GM-12 发布于 v0.2.11，完成度复审收口于 v0.2.15） |
-| `plan-20260812.md` | 日期计划 | 执行中收口（用户体系统一：website 认证 × monoengine 授权；主链与 REL-01/REL-02 已发布至 v0.2.65；UN-05 handoff 与 UN-06 手册已于 2026-08-17 入库；待 UN-07 收口发布） |
+| `plan-20260812.md` | 日期计划 | **已完成**（用户体系统一：website 认证 × monoengine 授权；收口发布 **v0.2.66** / UN-07；REL-01→v0.2.22、REL-02→v0.2.65；UN-05 handoff 与 UN-06 手册已入库） |
