@@ -1,362 +1,84 @@
 # monoengine
 
-> A Rust-based monorepo / Git hosting and service engine. Ports and extends several subsystems originally from the [Mega](https://github.com/web3infra-foundation/mega) project (notably the `callisto` ORM entities and the `jupiter` storage / migration layer) into a focused binary crate.
+> 一个基于 Rust 的 monorepo / Git 托管与服务引擎。它将若干最初来自 [Mega](https://github.com/web3infra-foundation/mega) 项目的子系统（尤其是 `callisto` ORM 实体和 `jupiter` 存储 / 迁移层）移植并扩展为一个集中的二进制 crate。
 
-`monoengine` is the backend engine that powers a monorepo platform: it speaks the Git wire protocols over HTTP(S) and SSH, persists Git objects and Git LFS blobs into a relational database plus pluggable object storage, exposes a REST/OpenAPI surface for higher‑level UI clients, and ships an embedded vendored `libvault` secret / PKI engine for signing and credential management.
+`monoengine` 是支撑 monorepo 平台的后端引擎：它通过 HTTP(S) 和 SSH 支持 Git wire 协议，将 Git 对象和 Git LFS blob 持久化到关系数据库以及可插拔的对象存储中，为上层 UI 客户端暴露 REST/OpenAPI 接口，并内置了一个嵌入式、vendored 的 `libvault` 密钥 / PKI 引擎，用于签名和凭据管理。
 
----
+## 与 website 联合启动（同栈联调）
 
-## Highlights
+`monoengine` 承担**授权**（monoengine 管理权限），`website`（sibling `../website` 的 `apps/next-app`）承担**认证**（唯一登录/注册面）。联调栈完全由本仓的 `docker-compose.test.yml` 驱动——website 只是被当作构建上下文拉入，**不要**使用 website 自带的 `docker-compose.yml`（那是独立的 tinyship profiles）。
 
-- **Cargo workspace** — `monoengine-core` (lib, depends only on `orbit-api`)
-  + `monoengine` (thin binary, injects the `orbit` implementation crate);
-  `cargo build -p monoengine` produces the `monoengine` executable.
-- **Git hosting** — HTTP(S) and SSH Git transport (`receive-pack` / `upload-pack`),
-  smart‑HTTP discovery, and Git‑LFS (basic, multipart, optional SSH transport).
-- **Monorepo semantics** — first‑class concept of an "import dir" (multi‑branch,
-  third‑party mirrors) vs. the monorepo tree (single main branch, structured
-  root dirs like `project/ doc/ release/ model/ toolchains/`).
-- **Change Lists & merge checks** — CL (PR‑equivalent) lifecycle with pluggable
-  checkers: GPG signature, branch protection, commit‑message style, CL sync,
-  merge conflicts, CI status, code review, CLA sign.
-- **Build trigger pipeline** — webhook / manual / scheduled / retry / web‑edit /
-  Buck‑file‑upload triggers, dispatched to an external Orion build server.
-- **OpenAPI + Swagger UI** — every HTTP route documented via `utoipa`, browsable
-  out of the box.
-- **Pluggable storage** — `sea-orm` against PostgreSQL or SQLite for metadata;
-  `orbit-api` provides the shared object-storage traits/config, while `../orbit`
-  supplies the concrete `object_store` adapter for
-  blobs/LFS on **local FS, AWS S3, S3-compatible (RustFS, MinIO, ...), or GCS**;
-  `redis` for cache / queue.
-- **Notifications** — event triggers and in-app/optional external delivery;
-  product email is delivered by the website through its internal API.
-- **Embedded Vault** — PKI (root CA, role‑based cert issuance) and a KV / secret
-  engine via the vendored RustyVault module in `src/vault`, with a `jupiter`
-  storage backend so the vault lives in the same database.
-- **Cedar‑policy authorization** — schema (`src/mega.cedarschema`) and policies
-  (`src/mega_policies.cedar`) shipped alongside the binary.
-- **Production allocators** — `jemalloc` on Unix, `mimalloc` on Windows.
-- **Structured logging** — `tracing` with hourly‑rolling file appender or
-  stdout, configurable ANSI colours and log level.
+**目录关系**：`monoengine`、`website`、`orbit` 是**同级 sibling**，共享同一个父目录。联调栈依赖这种相对布局——本仓的 `docker-compose.test.yml` 用相对路径引用它们：
 
----
+```
+<父目录>/
+├── monoengine/      # 本仓库（后端引擎；含 docker-compose.test.yml）
+├── website/         # 前端 + 认证（apps/next-app 由 compose 拉入构建）
+└── orbit/           # 对象存储实现（monoengine 的 path 依赖）
+```
 
-## Tech Stack
+compose 中的 `build.context` 依此解析：
+- `monoengine` 服务：`context: ..`（父目录，包含 `monoengine/` 与 `orbit/` 两个 path 依赖），`dockerfile: monoengine/Dockerfile`；
+- `website-db-init` 与 `website-next` 服务：`context: ../website`，`dockerfile: apps/next-app/Dockerfile`。
 
-| Layer            | Crates / Tech                                                                 |
-| ---------------- | ----------------------------------------------------------------------------- |
-| Language         | Rust **2024 edition** (stable toolchain; nightly used only for `rustfmt`)     |
-| CLI              | `clap` v4 (derive + builder)                                                  |
-| Async runtime    | `tokio` (full)                                                                |
-| HTTP             | `axum` 0.8, `tower-http`, `tower-sessions`                                    |
-| API docs         | `utoipa` + `utoipa-swagger-ui`                                                |
-| ORM / DB         | `sea-orm` 1.1 (Postgres + SQLite, `runtime-tokio-rustls`) + `sea-orm-migration` |
-| Cache / queue    | `redis` (`aio`, `tokio-rustls-comp`, `connection-manager`)                    |
-| Object storage   | `orbit-api` interface + sibling `../orbit` `object_store` adapter             |
-| SSH              | `russh`                                                                       |
-| Auth / policy    | `cedar-policy`                                                                |
-| Vault / PKI      | vendored RustyVault module in `src/vault`                                     |
-| Crypto / TLS     | `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`, `secp256k1`, `pgp`       |
-| Logging          | `tracing`, `tracing-subscriber`, `tracing-appender`                           |
-| Allocator        | `jemallocator` (Unix) / `mimalloc` (Windows)                                  |
+因此**三个仓库必须 checkout 到同一父目录下**，且相对关系保持为 `monoengine`、`website`、`orbit` 平级；缺失其中任一（尤其 `../orbit`，它是 Cargo path 依赖）会让 compose/`cargo` 在依赖解析或构建阶段失败。
 
-The full dependency list lives in `Cargo.toml`.
+**前置条件**：按上表摆放三个 sibling 目录、端口 `17001` / `19180` / `15432` / `16379` 可用。首次构建会拉 `rust:1.97-bookworm` + `node:22-alpine` 并编译 monoengine release（较久）。
 
----
-
-## Quick Start
-
-### Prerequisites
-
-- Rust toolchain (stable) — recommended via [rustup](https://rustup.rs).
-  Nightly is only required for running the formatter check.
-- PostgreSQL **or** SQLite (the default `config/config.toml` is wired for
-  PostgreSQL; switch `database.db_type` to `"sqlite"` for a zero‑setup demo).
-- (Optional) Redis, if you exercise paths that hit the cache / queue.
-
-### Build
+**启动**（推荐先 web 后 app，保证首次会话请求时 website 已就绪）：
 
 ```bash
-# Debug build (workspace default = monoengine-core lib only)
-cargo build
+# 在 monoengine 仓库根目录执行（即本 README 所在目录）
+cd <monoengine 仓库根目录>
 
-# Build the monoengine binary explicitly
-cargo build -p monoengine
+# 1) website 侧（web profile：建 `website` 库 + website-next）
+docker compose -p monoengine-it -f docker-compose.test.yml \
+  --profile web up -d --wait website-next
 
-# Build including tests (must stay at 0 warnings / 0 errors — see AGENTS.md)
-cargo build --tests
+# 2) monoengine 侧（app profile：postgres/redis/monoengine）
+docker compose -p monoengine-it -f docker-compose.test.yml \
+  --profile app up -d --wait monoengine
 ```
 
-### Configure
+`monoengine` 不声明对 `website-next` 的 `depends_on`（跨 profile 依赖会让 compose 拒绝 app-only 配置），因此分两步可保证 website 先健康、首次 `get-session` 不 fail-closed；也可一步 `--profile app --profile web up -d --wait`。
 
-The runtime is driven by a TOML config file. The default ships at
-`config/config.toml` and supports `${base_dir}` interpolation plus environment
-overrides.
+**拓扑**（compose 已配好）：
 
-Resolution order:
+| 项 | 值 |
+|---|---|
+| website 宿主 | `http://127.0.0.1:17001`（容器 7001） |
+| monoengine HTTP | `http://127.0.0.1:19180`（容器 8000） |
+| monoengine→website 会话基址 | `http://website-next:7001`（`MEGA_OAUTH__WEBSITE_API_BASE_URL`） |
+| 账户库 | 共享 postgres 上的独立 `website` 库（与 monoengine 业务库隔离） |
+| CORS | 已含 `http://127.0.0.1:17001` |
 
-1. `--config <path>` CLI flag.
-2. `MEGA_CONFIG` environment variable.
-3. The bundled `config/config.toml`.
-4. `${mega_base}/etc/config.toml`.
-5. If no config exists, generate the default config and load it.
+**页面验证**：
 
-When `--profile <name>` or `MEGA_PROFILE=<name>` is set, monoengine also
-loads `config.<name>.toml` next to the selected base config. CLI profile wins
-over `MEGA_PROFILE`, and the final merge order is base config, profile config,
-then `MEGA_*` environment overrides.
+- 连通性冒烟（从 monoengine 容器内打 website 会话端点）：
 
-The bundled config is a local sample and does not embed reusable database
-passwords. Inject real bootstrap credentials through `MEGA_DATABASE__DB_URL`,
-profile files, or your deployment secret mechanism.
+  ```bash
+  docker compose -p monoengine-it -f docker-compose.test.yml \
+    --profile app --profile web exec -T monoengine \
+    curl -fsS http://website-next:7001/api/auth/get-session
+  ```
 
-Use `monoengine config init` to generate a safe starter config, and
-`monoengine config validate` to check the selected base/profile/env merge
-without starting services. Add `--show-sources` to print source warnings,
-field sources, and overrides without values; add `--deny-warnings` to fail on
-ignored or deprecated config fields.
+- 浏览器页面闭环：打开 `http://127.0.0.1:17001` 注册/登录（Better Auth，浏览器获得 `better-auth.session_token` cookie）→ 打开 `http://127.0.0.1:19180` 访问受保护页面/API（`GET /api/v1/user`）→ 断言返回的 `username` / `website_user_id` 与 website get-session 一致；**无 cookie → 401**。
 
-Key sections (see `config/config.toml` for the full list):
+- 自动化栈级验收（ITW-03，需显式 `WEBSITE_IT=1`，否则软跳过）：
 
-| Section            | Purpose                                                                 |
-| ------------------ | ----------------------------------------------------------------------- |
-| `base_dir`         | Root for logs, caches, SQLite/LFS data (override with `MEGA_BASE_DIR`)  |
-| `[log]`            | Level, stdout vs. rolling file, ANSI colours                            |
-| `[database]`       | `db_type = "postgres"` or `"sqlite"`, URL, pool sizing, timeouts        |
-| `[monorepo]`       | `import_dir`, admin users, default `root_dirs`, rename detection limits |
-| `[pack]`           | Pack decode memory/disk budget and cache path                           |
-| `[lfs]`            | LFS HTTP/SSH endpoints and local storage path                           |
-| `[object_storage]` | `local` / `s3` / `s3compatible` / `gcs` backends                        |
-| `[oauth]`          | Website Better Auth API base URL, session cookies, and CORS allow-list |
-| `[redis]`          | Connection URL                                                          |
-| `[build]`          | Orion build server URL and trigger preheat depth                        |
-| `[buck]`           | Buck upload session limits, cleanup schedule, and concurrency caps       |
-| `[artifacts_gc]`   | Background GC enable flag and schedule for orphan repo artifact blobs    |
-| `[notification]`   | In-app/external notifications and website product-email API client         |
-| `[sidebar]`        | Default UI sidebar items seeded into a fresh DB                         |
+  ```bash
+  # 在 monoengine 仓库根目录执行
+  cd <monoengine 仓库根目录>
+  source .env.test
+  WEBSITE_IT=1 cargo test -p monoengine --test integration_website_auth -- --test-threads=1
+  ```
 
-Redis URL (`redis.url`), object storage S3 credentials
-(`object_storage.s3.access_key_id` / `secret_access_key`), and notification
-channel credentials (`notification.slack.webhook_url_ref`,
-`notification.webhook.token_ref`) also support `vault://` SecretRefs, each
-with its own required namespace. Database credentials remain
-deployment/env secrets (they are consumed before the vault is ready).
-`config validate` and `config secret set/check` enforce the correct
-namespace for each supported field; `config validate --resolve-secrets`
-resolves all supported SecretRefs through the minimal DB/Vault bootstrap.
-
-### Run
+**停止 / 清理**：
 
 ```bash
-# Start the HTTP server
-cargo run -p monoengine -- --config config/config.toml service http --host 0.0.0.0 -p 9000
-
-# Start the SSH Git server
-cargo run -p monoengine -- --config config/config.toml service ssh
-
-# Start multiple services in the same process (HTTP is mandatory)
-cargo run -p monoengine -- --config config/config.toml service multi http ssh
+docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web down
+# 连数据卷一起清（可选）：
+docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web down -v
 ```
 
-On first boot against an empty database the embedded `sea-orm-migration`
-migrators (under `src/jupiter/migration/`) will apply the schema and seed the
-default sidebar / event types.
-
----
-
-## CLI Overview
-
-```
-monoengine [--config <file>] [--profile <name>] <SUBCOMMAND>
-```
-
-| Subcommand              | What it does                                                       |
-| ----------------------- | ------------------------------------------------------------------ |
-| `service http`          | Start the axum HTTP server (Git smart‑HTTP + REST API + Swagger UI) |
-| `service ssh`           | Start the `russh`‑based SSH Git transport server                   |
-| `service multi <kinds…>` | Start several servers in one process (e.g. `multi http ssh`)       |
-
-CLI options come from `clap` derive types and respect `--help` at every level:
-
-```bash
-cargo run -p monoengine -- --help
-cargo run -p monoengine -- service --help
-cargo run -p monoengine -- service http --help
-```
-
----
-
-## Project Layout
-
-```
-Cargo.toml                # workspace root + monoengine-core lib manifest
-bin/                      # thin composition-root binary crate (monoengine)
-├── Cargo.toml            # binary manifest; depends on monoengine-core + orbit
-├── src/main.rs           # binary entry; registers ObjectStorageProvider
-└── tests/                # black-box integration tests (integration_vault.rs)
-config/config.toml        # default runtime config (TOML)
-rustfmt.toml              # nightly-only formatter options
-src/
-├── lib.rs                # library entry; declares all top-level modules
-├── cli.rs                # clap parsing, log init, ctrlc handler
-├── commands/             # subcommand registry (service / http / ssh / multi)
-├── common/               # error types (MegaError/MegaResult), utils
-├── config/               # config module: model / loader / SecretRef / reload
-├── context/              # AppContext: shared state (DB, storages, services)
-├── api/                  # axum HTTP API surface (routes / handlers)
-├── server/               # HTTP / SSH server bootstrap
-├── callisto/             # sea-orm entity models (one file per table)
-├── jupiter/              # storage / service / migration / redis / utils
-│   ├── storage/          # *Storage structs (BaseStorage + per-domain)
-│   ├── migration/        # sea-orm-migration migrators
-│   ├── service/          # higher-level service objects
-│   ├── redis/            # Redis client + helpers
-│   ├── utils/            # diff / reanchor / misc utilities
-│   └── tests.rs          # shared test helpers (cfg(test))
-├── ceres/                # CL (Change List) logic, merge checks, build triggers
-├── notification/         # event triggers and website product-email client
-├── vault/                # vendored RustyVault module (crate::vault)
-├── contract/             # API / Git / Vault / Policy data & boundary contracts
-│   ├── api/              # request/response DTOs (utoipa schemas; was api_model)
-│   ├── git_protocol/     # smart-HTTP and SSH Git wire protocol glue
-│   ├── policy/           # cedar policy guard + reviewer/admin resolution (was saturn + api::guard)
-│   └── vault/            # PKI + KV secret engine integration layer
-│       └── integration/  # VaultCore, VaultCoreInterface, jupiter_backend
-├── bellatrix/            # supporting subsystem ported from Mega
-└── mega.cedarschema, mega_policies.cedar
-test/project/             # fixture data for integration tests
-target/                   # build artifacts (gitignored)
-```
-
-`pub use crate::callisto::*;` is re‑exported from `lib.rs`; when importing
-entities elsewhere, prefer the explicit `crate::callisto::<table>` path.
-Object storage public types remain available from `orbit_api::*`; the
-`monoengine-core` library only depends on `orbit-api` (no heavy
-`object_store` / cloud SDKs). The concrete backend is injected at the
-composition root: `bin/src/main.rs` registers an `OrbitObjectStorageProvider`
-that calls `orbit::factory::ObjectStorageFactory::build`, and
-`AppContext::new` resolves `vault://` SecretRefs for S3 credentials after
-the DB-only vault bootstrap, then constructs the object store and injects
-it into `Storage::new_with_connection`.
-
----
-
-## Development
-
-How to bring up the compose test stack and run ordinary vs full integration
-tests: see [`docs/development.md`](docs/development.md).
-
-### Required Gates Before Submitting Code
-
-Every code change must pass the three commands below (these are enforced by
-`AGENTS.md` and CI):
-
-```bash
-# 1. Formatting (nightly, check-only)
-cargo +nightly fmt --all --check
-
-# 2. Lints (all targets, all features, warnings denied)
-cargo clippy --all-targets --all-features -- -D warnings
-
-# 3. Tests (with the project test environment loaded)
-source .env.test && cargo test --all
-```
-
-Additional sanity checks:
-
-- `cargo build` → 0 errors, 0 warnings.
-- `cargo build --tests` → 0 errors, 0 warnings.
-
-> `.env.test` is **not** committed (it contains DB / cache / service endpoints
-> for the test harness). If it is missing in your environment, stop and ask
-> rather than silently running `cargo test --all` without it — several tests
-> require it.
-
-### Coding Conventions (excerpt)
-
-- **Formatting** — match `cargo +nightly fmt --all` output; don't hand‑format.
-- **Imports** — group by `std` → external crates → `crate::`; avoid wildcard
-  `use crate::*;` outside `mod tests`.
-- **Errors** — application paths use `crate::common::errors::{MegaError, MegaResult}`;
-  low‑level utilities use `anyhow::Result`; new typed errors use `thiserror`.
-  Don't mix the three within the same module.
-- **Logging** — use the `tracing` macros (`info!`, `warn!`, `error!`, `debug!`,
-  `trace!`), never `println!`.
-- **DB access** — go through the `*Storage` types in `src/jupiter/storage/`
-  rather than calling `sea_orm` directly from API/handler code.
-- **`unwrap()`** — avoid in non‑test code; return `MegaResult` / `anyhow::Result`
-  instead.
-
-The complete agent contract — including common pitfalls (e.g. `sea_orm` import
-paths in tests, `VaultCore` import path, the intentional crate‑level
-`#![allow(dead_code)]`) and recipes for adding subcommands or DB entities —
-lives in [`AGENTS.md`](AGENTS.md).
-
-### Running a Single Test
-
-```bash
-# By test substring
-cargo test test_dispatcher_sends_pending_jobs -- --nocapture
-
-# By integration test binary name
-cargo test --test <name>
-```
-
----
-
-## Architecture Notes
-
-- **`AppContext`** (`src/context/`) is the per‑process shared state. It owns
-  the `sea-orm` connection pool, every `*Storage` handle, the object‑store
-  client, the Redis client, and the vault. Subcommand executors
-  build it once and pass `AppContext` (or clones) into route layers and
-  background tasks.
-- **`callisto` ↔ `jupiter`** — `callisto` is the *what* of the schema (one
-  `sea-orm` entity file per table). `jupiter::storage` is the *how* (typed
-  query helpers, transactions, joins). Higher‑level modules never touch
-  `sea-orm` directly; they go through `jupiter::storage`.
-- **CL / merge pipeline** — `ceres::merge_checker` defines a `Checker` trait
-  and a `CheckType` enum (GPG signature, branch protection, commit message,
-  CL sync, merge conflict, CI status, code review, CLA sign). Each check
-  yields a `ConditionResult` (`PASSED`/`FAILED`) and aggregates into a
-  `RequirementsState` (`MERGEABLE`/`UNMERGEABLE`).
-- **Notifications** — event triggers respect user preferences and retain
-  in-app, Slack, and webhook delivery. Product email uses the website internal
-  notification API; monoengine has no SMTP client, mail queue, or mail-template
-  administration surface. See
-  [`docs/refactoring/website-mail.md`](docs/refactoring/website-mail.md).
-- **Background maintenance** — HTTP service tasks clean expired Buck upload
-  sessions and unreferenced artifact blobs. Running Buck cleanup and artifact GC
-  tasks hot-reload schedule settings and can be disabled without restart;
-  enabling either task from off still requires restart.
-- **Config reload boundaries** — log settings and running maintenance
-  schedules are the hot-reload surface. Static consumers such as
-  database, Redis, object storage, LFS, build/orion, sidebar, pack, blame, and
-  monorepo layout changes are reported as restart-required and do not publish a
-  candidate snapshot.
-- **Vault** — `contract::vault::integration::vault_core::VaultCore` wraps
-  the vendored `crate::vault` module with a `jupiter`‑backed storage adapter
-  (`contract::vault::integration::jupiter_backend`), so secrets live in the
-  same Postgres / SQLite database as everything else.
-
----
-
-## Contributing
-
-Bug reports, design discussions and pull requests are welcome.
-
-1. Read [`AGENTS.md`](AGENTS.md) — it documents the build invariants,
-   required CI gates, and the project's coding conventions in full.
-2. Make focused changes — don't rewrite working modules to "modernize" them,
-   and don't widen `#[allow(...)]` scope or `#[ignore]` tests to make a build
-   pass.
-3. Sign your commits (`git commit -s -S …`) and run the three required gates
-   locally before pushing.
-
----
-
-## License
-
-See repository metadata / `LICENSE` (if present) for licensing terms. As
-`monoengine` ports code from the Mega project, downstream consumers should
-also respect the upstream Mega licensing.
+**注意**：浏览器会话 ≠ Git 凭据——登录后 Git/LFS/SSH 仍需在 monoengine `/api/v1/user` 下创建 access token 或登记 SSH key（见 `docs/refactoring/website-auth.md` §3）；`website-next` 未健康时请求按 fail-closed（401）处理，客户端重试即可。

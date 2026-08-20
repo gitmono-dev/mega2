@@ -9,9 +9,6 @@ edition = "2024"
 [lib]
 name = "monoengine_core"
 path = "src/lib.rs"
-# The vendored RustyVault `vault` module (and other modules) carry illustrative
-# `///` code blocks that are not standalone-compilable doctests; they were never
-# run while this was a binary crate. Keep that behavior after the lib split.
 doctest = false
 
 [dependencies]
