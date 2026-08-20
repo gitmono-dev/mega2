@@ -43,6 +43,61 @@
 > - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
 > - G：**（2026-06-27）已落地分阶段 bootstrap，对象存储凭据可走 SecretRef；（2026-06-28）validate/CLI 已对齐。** `AppContext::new` 现只建一次 DB 连接，先用它做 **DB-only `VaultCore` bootstrap**（`from_database_connection`，不依赖完整 `Storage`，打破“vault 需要 Storage、Storage 需要对象存储、对象存储凭据需要 vault”的循环），再解析 `object_storage.s3.access_key_id`/`secret_access_key` 中的 `vault://` SecretRef，最后用解析后的配置 `build_object_storage` 并经 `Storage::new_with_connection`（复用同一连接）建完整 storage。`Storage::new` 本身未拆——通过 DB-only vault bootstrap 达成等效分阶段。字面量凭据原样透传（env/IAM 部署不受影响）。`config validate` 与 `config secret set/check` 现已接受合法 namespace 的 object_storage SecretRef，`config validate --resolve-secrets` 也会解析它们。
 
+## 反向迁移：vendored RustyVault → `libvault` crate（核对日 2026-08-21，计划 `plan-20260820`）
+
+> 本节由 `docs/plan/plan-20260820.md` Task VLT-00 冻结，是「vendored `src/vault/` 改用 crates.io `libvault` 依赖」这一反向迁移的事实源。上文「依赖迁移修订（2026-06-15）」记录的是**正向**迁移（`libvault-core` 0.1.0 → vendored），与本节方向相反；两段并存，按日期取后者为当前目标形态。
+
+### 迁移范围（冻结）
+
+| 面 | 当前事实（核对日 2026-08-21） | 目标形态 |
+| --- | --- | --- |
+| vendored 源码 | `src/vault/` 共 **82** 个 `.rs` + `README` + 三份 LICENSE；经 `src/lib.rs:28-45` 的 `#[allow(...)]` 块 + `mod vault;` 编译 | 删除目录与 `mod vault;`（**仅当 VLT-S1 = go**） |
+| vendored 版本 | `src/vault/mod.rs:69` `VERSION = "0.2.2"` | crates.io `libvault = "0.3.0"`，特性 `storage_pg` + `crypto_adaptor_openssl` |
+| 错误类型 | 本地 `RvError`（`src/common/errors/vault.rs:241`），经 `src/common/errors/mod.rs:23` 重导出 | `libvault::errors::RvError`；只读专用变体（`ErrCoreReadonlyWriteDenied` / `ErrCoreReadonlyStateIncomplete`）上游**不存在**，改挂 `VaultError` |
+| **真实**引用切换面 | 仅 `src/contract/vault/integration/vault_core.rs:260,368` 与 `src/contract/vault/pki.rs:80,114`（doc-link）；`RvError` 另经 `src/contract/vault/integration/jupiter_backend.rs`、`src/common/errors/` | 全部改写为 `libvault::*`，`rg 'crate::vault' src bin` 零命中 |
+| 非切换面（误记纠正） | `src/context/`、`src/server/ssh_server.rs`、`src/config/`、`src/commands/` 只消费 `contract::vault::integration`；`src/jupiter/storage/vault_storage.rs`、`src/callisto/` 是 SeaORM 实体 | 不进引用切换写集；只有只读入口签名面随 VLT-02/04 调整 |
+| 只读原语 | `Core.readonly`（`src/vault/core.rs:110`）、`Core::new_readonly`（`:182`）、`MountsRouter::load_readonly`、`AuthModule::load_auth_readonly`、`ExpirationManager::restore_readonly` / `is_lease_checker_started`、`RustyVault::new_readonly`——**上游零命中** | 一律不搬迁；只读语义在 `src/contract/vault/` 重建（VLT-04） |
+| 只读保险 | `ReadonlyBackend`（`src/vault/storage/readonly.rs`） | 移动到 `src/contract/vault/integration/readonly_backend.rs` 并重挂错误标识 |
+| 测试 | `src/vault/fix04_list_contract.rs`、`src/vault/un31_readonly.rs`（挂载于 `src/vault/mod.rs:49,59`） | 迁至 `src/contract/vault/integration/{fix04_list_contract,un31_readonly}.rs` |
+| 只读消费点 | `VaultCore::open_readonly`（`src/contract/vault/integration/vault_core.rs:361`）→ `src/context/mod.rs:436`；断言在 `src/context/un43_readonly_assembly.rs:300-302`、`bin/tests/integration_authz_audit.rs:919-923` | 语义不变（UN-31 八 AC 等价） |
+
+不在本次反向迁移范围内：vault 表 schema、`core_key.json` 格式、seal 配置（10/5）、`secret/` 挂载路径、mega 的 `libvault-core` 0.1.0 迁移、libra 的 `libvault` 升级。
+
+### 已决议设计决策（摘自 `plan-20260820`）
+
+- **ADR-VLT-01（Accepted）**：目标形态 = crates.io 的 libvault 0.3.0 crate + `src/contract/vault/` 集成层，不继续 fork vendored（方案 A 已拒绝）。默认**不**向上游提 readonly 补丁；`plan-long.md` 原则 2 保护的是「crate + 集成层」，不是永久 vendored。
+- **ADR-VLT-02（Accepted）**：**只读可行性门禁**——上游 `libvault` 0.3.0 的 `post_unseal`（`../libvault-rs/src/core.rs:608-631`）是私有方法且无 readonly 分支，无条件执行 `mounts_router.load_or_default` 与 `module_manager.init`（后者经 `../libvault-rs/src/modules/auth/mod.rs:411-412` 启动过期租约 worker）。因此**删除 vendored 必须排在只读可行性结论之后**，由 Task VLT-S1 判定 go / no-go。
+
+### VLT-S1 go/no-go 门禁（冻结）
+
+| 结论 | 触发的后续 | 禁止的动作 |
+| --- | --- | --- |
+| **go** | VLT-02（引用切换 + 只读原语搬迁 + 删 vendored + 测迁）→ VLT-04（UN-31 集成层等价重建）→ VLT-05（REL-VLT-RO 家族唯一发布点） | VLT-02 单独推送；以「仅 `ReadonlyBackend` 拦写」冒充写前 fail-closed |
+| **no-go** | 登记 `DEFER-VLT-01`，保留 vendored，由 VLT-S2 独立 patch 推送落库；VLT-02/04/05 不进入开工态 | 删除 `src/vault/`；结论只留本地不入库 |
+
+判定必须落到本文档的「VLT-S1」节，写明 `结论: go` 或 `结论: no-go` 之一，并附上游 `file:line` 的逐项否证/采纳表。
+
+### UN-31 八条 AC 冻结（等价基线）
+
+来源：`docs/plan/plan-20260812.md` Task UN-31「Vault readonly bootstrap（R21 P0-1 拆出）」（`Lifecycle=done` / `Acceptance=complete`）。方案 B 的只读重建（VLT-04）必须逐条等价，不得弱化；八条与该卡 `Acceptance criteria` 一一对应。
+
+| # | 冻结的判据 | vendored 当前控制点 | 迁移后落点 |
+| --- | --- | --- | --- |
+| AC1 | 不补写缺失 / 旧格式 mount：只 load 不 `persist()`，缺失或「`mount_update` 会回写」一律写前具名 fail-closed | `MountsRouter::load_readonly` / `needs_mount_update` | 集成层只读引导 |
+| AC2 | 不补写 auth mount，不完整同样写前 fail-closed | `AuthModule::load_auth_readonly` | 集成层只读引导 |
+| AC3 | 不补写默认 ACL policy；`TokenStore` 在 salt 缺失时 fail-closed 而非新签 salt | `PolicyModule::init` 跳过 `setup_policy`；`token_store.rs` readonly 分支 | 集成层只读引导 |
+| AC4 | 禁凭据 rotation：不调用 `ensure_runtime_credentials`；runtime tokens 不完整即 `ReadonlyRuntimeTokensIncomplete`；不回写 key 文件、不撤销 root token | `VaultCore::open_readonly` | 保持在 `VaultCore` |
+| AC5 | 不启动过期租约 worker，且 mounts monitor 完全不创建（无论配置 interval）；只读恢复租约（旧格式 fail-closed），禁「普通 `restore` + 拦写」冒充 | `ExpirationManager::restore_readonly`；`is_lease_checker_started` 观测面 | 集成层只读引导；观测面改公共 API |
+| AC6 | 底层 backend write-denying wrapper：任意 `put`/`delete` 硬失败（不是静默 no-op），拒绝计数经 `VaultCore::denied_writes()` 暴露 | `src/vault/storage/readonly.rs` | `src/contract/vault/integration/readonly_backend.rs` |
+| AC7 | 故障注入：wrapper 层与 `VaultCore` 具名层各一组硬失败；具名层拒绝时 `denied_writes() == 0` | `un31_readonly.rs` | 迁后 `integration/un31_readonly.rs` |
+| AC8 | 故障注入：过期租约**成对**断言——可写侧确实撤销并删除记录，只读侧记录仍在且零写入尝试 | `un31_readonly.rs` | 迁后 `integration/un31_readonly.rs` |
+
+守卫口径（冻结）：迁移后 `un31_` 用例数 **≥ 12**，过滤器用位置无关的 `un31_`（禁用绑定 vendored 模块路径的 `vault::un31_`）；`un43_readonly` ≥ 4 用例；`fix04_list` 保持绿。
+
+### 迁移中间态
+
+`libvault` crate 与 vendored `src/vault/` 在 VLT-01 之后**双存**（依赖已引入、引用未切换、目录未删）。这是刻意的中间态：删除时机取决于 VLT-S1 的 go/no-go，不由依赖引入触发。双存期间 `crate::vault::` 仍是唯一被消费的实现。
+
 ## 当前实现概览
 
 `vault` 模块位于 `src/contract/vault/`，核心集成代码在 `src/contract/vault/integration/`：
