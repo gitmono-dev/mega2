@@ -16,6 +16,8 @@ on:
       - "docs/refactoring/config.md"
       - "docs/refactoring/mail.md"
       - "docs/refactoring/test-infra.md"
+      - "docs/refactoring/website-auth.md"
+      - "docs/refactoring/website-mail.md"
       - "docs/refactoring/vault.md"
       - "src/cli.rs"
       - "src/commands/config.rs"
@@ -42,6 +44,8 @@ on:
       - "docs/refactoring/config.md"
       - "docs/refactoring/mail.md"
       - "docs/refactoring/test-infra.md"
+      - "docs/refactoring/website-auth.md"
+      - "docs/refactoring/website-mail.md"
       - "docs/refactoring/vault.md"
       - "src/cli.rs"
       - "src/commands/config.rs"
@@ -109,7 +113,7 @@ jobs:
           WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
         run: |
           if [ -z "${WEBSITE_CHECKOUT_TOKEN}" ]; then
-            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/monoui sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to gitmono-dev/monoui."
+            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/monoui sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to gitmono-dev/monoui. If you are relying on the ORBIT_CHECKOUT_TOKEN fallback, that token must also be able to read gitmono-dev/monoui — an orbit-only scope passes this guard and then fails the checkout with 'Repository not found'."
             exit 1
           fi
 

@@ -227,7 +227,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d -
 | 项 | 值 |
 |---|---|
 | 服务名 | `website-db-init`、`website-next` |
-| 镜像 / 构建 | `website-db-init` 从 sibling `../monoui` 的 `apps/next-app/Dockerfile` `builder` stage 构建，复用已安装的 `pnpm` / Drizzle / `pg`；该 Dockerfile 必须复制根目录 `drizzle.config.ts`，供 init target 解析 PG schema。`website-next:local`，`pull_policy: never`，从同一 Dockerfile 的 runner stage 构建。本地和 CI 都必须有该 checkout；CI 应缓存构建层但不得尝试拉取同名远程镜像 |
+| 镜像 / 构建 | `website-db-init` 从 sibling `../monoui` 的 `apps/next-app/Dockerfile` `builder` stage 构建，复用已安装的 `pnpm` / Drizzle / `pg`；该 Dockerfile 必须复制根目录 `drizzle.config.ts`，供 init target 解析 PG schema。`website-next:local`，`pull_policy: never`，从同一 Dockerfile 的 runner stage 构建。本地和 CI 都必须有该 checkout；CI 应缓存构建层但不得尝试拉取同名远程镜像。**改指 sibling 后首次启动必须带 `--build`**：`website-next:local` 是 `pull_policy: never` 的本地 tag，旧 sibling 构建出的同名镜像会被静默复用（CI 用一次性 runner 因此不受影响，也因此不会暴露该问题） |
 | 端口 | `127.0.0.1:17001:7001`（仅回环；next-app Dockerfile 的 `EXPOSE 7001`） |
 | healthcheck | 容器内 Node TCP 连接 `127.0.0.1:7001`；只在 Next 进程已监听时 healthy |
 | 网络 | 默认 `networks.default` → `monoengine-test-network`，可由后续 `monoengine` profile 通过 `website-next:7001` 访问 |

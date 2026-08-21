@@ -34,8 +34,11 @@ compose 中的 `build.context` 依此解析：
 cd <monoengine 仓库根目录>
 
 # 1) monoui 侧（web profile：建 `website` 库 + website-next）
+#    首次改指 monoui 后必须带 --build：website-next 是 `pull_policy: never` 的
+#    本地 tag，若机器上还留着从旧 sibling(../website) 构建的 website-next:local，
+#    不带 --build 的 up 会直接复用它——联调看起来全绿，跑的却是旧仓库的镜像。
 docker compose -p monoengine-it -f docker-compose.test.yml \
-  --profile web up -d --wait website-next
+  --profile web up -d --build --wait website-next
 
 # 2) monoengine 侧（app profile：postgres/redis/monoengine）
 docker compose -p monoengine-it -f docker-compose.test.yml \
