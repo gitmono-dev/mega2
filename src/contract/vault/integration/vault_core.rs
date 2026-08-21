@@ -883,8 +883,8 @@ impl VaultCore {
 
     /// Regenerates and persists a fresh Shamir share set for the current KEK.
     ///
-    /// The vendored libvault primitive re-splits the same KEK; it does not rotate
-    /// the KEK and cannot make every previously exported share set invalid.
+    /// The rekey primitive re-splits the same KEK; it does not rotate the KEK
+    /// and cannot make every previously exported share set invalid.
     pub async fn rekey_unseal_shares(&self, key_path: impl AsRef<Path>) -> VaultResult<()> {
         let new_shares = self
             .rvault

@@ -15,10 +15,10 @@
 //!
 //! # Error identity
 //!
-//! This used to live inside the vendored library, where it could invent an
-//! `RvError` variant of its own for "readonly, write denied". The `libvault`
-//! crate has no such variant and should not grow one — "this handle was opened
-//! readonly" is monoengine's concept, not the library's. So the two layers are
+//! This used to live inside the library, where it could invent an `RvError`
+//! variant of its own for "readonly, write denied". The `libvault` crate has no
+//! such variant and should not grow one — "this handle was opened readonly" is
+//! monoengine's concept, not the library's. So the two layers are
 //! named separately:
 //!
 //! * above the backstop, the integration layer refuses with

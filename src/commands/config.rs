@@ -487,10 +487,10 @@ async fn exec_vault_rekey(ctx: CommandContext, args: &ArgMatches) -> MegaResult 
         "vault rekey complete; fresh unseal shares written to {}",
         key_path.display()
     );
-    // The vendored libvault primitive re-splits the current KEK; it does not
-    // rotate the encryption key, so previously exported share sets for this key
-    // still unseal the vault. Be explicit so operators do not assume the old
-    // shares were invalidated.
+    // The rekey primitive re-splits the current KEK; it does not rotate the
+    // encryption key, so previously exported share sets for this key still
+    // unseal the vault. Be explicit so operators do not assume the old shares
+    // were invalidated.
     println!(
         "note: this re-splits the current encryption key; previously exported share sets for this key still unseal the vault. A full KEK rotation is required to invalidate old shares."
     );

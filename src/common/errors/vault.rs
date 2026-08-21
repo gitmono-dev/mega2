@@ -114,11 +114,10 @@ pub enum VaultError {
     /// The stored vault state is missing or in an older format, and a readonly
     /// open will not repair it.
     ///
-    /// This is the identity the vendored library's readonly "state incomplete"
-    /// error used to carry. `libvault` has no such variant, and it should not:
-    /// the condition belongs to monoengine's readonly bootstrap, not to the
-    /// library. `detail` names which piece of state, so an operator is not left
-    /// to guess.
+    /// This is the identity the library's readonly "state incomplete" error used
+    /// to carry. `libvault` has no such variant, and it should not: the condition
+    /// belongs to monoengine's readonly bootstrap, not to the library. `detail`
+    /// names which piece of state, so an operator is not left to guess.
     #[error(
         "vault is being opened readonly and its stored {detail} is missing or in an older format; \
          readonly mode will not repair it"
@@ -126,11 +125,9 @@ pub enum VaultError {
     ReadonlyStateIncomplete { detail: &'static str },
     /// A readonly open was requested while the readonly bootstrap is not built.
     ///
-    /// Fail-closed placeholder for the window between the vendored module being
-    /// removed and the integration-layer bootstrap replacing it (VLT-04). It
-    /// exists so that window has a name rather than a fallback to the writable
-    /// path, which would repair the very state a readonly open exists to leave
-    /// alone.
+    /// Fail-closed placeholder: it exists so the window has a name rather than a
+    /// fallback to the writable path, which would repair the very state a
+    /// readonly open exists to leave alone.
     #[error(
         "vault readonly bootstrap is unavailable in this build; refusing to fall back to the \
          writable open, which would repair stored state"

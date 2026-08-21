@@ -180,10 +180,10 @@ async fn open_readonly(
 /// Whether this vault's auth module has an expiration manager installed.
 ///
 /// This is how "the expired-lease worker never started" is asserted directly
-/// rather than inferred. The vendored library carried a flag on its
-/// `ExpirationManager` recording whether the checker had been started;
-/// `libvault` has no such thing, and the thread it spawns is detached with no
-/// handle to ask. What the library does have is `AuthModule::init` — the only
+/// rather than inferred. There is no flag on `ExpirationManager` recording
+/// whether the checker had been started, and the thread it spawns is detached
+/// with no handle to ask. What the library does have is `AuthModule::init` — the
+/// only
 /// place that starts the worker, the only place that fills this slot, and
 /// nothing else in the library reads it. So an empty slot *is* the statement
 /// that the worker never started, and it is observable on the public API.
@@ -636,10 +636,9 @@ async fn un31_the_readonly_backend_denies_put_and_delete() {
 
 /// The production entry point, over the real database-backed storage.
 ///
-/// The tests above exercise the vendored core through an in-memory backend;
-/// these two cover the seam an audit command actually calls, where the key file
-/// and the initialized storage have to agree and no runtime credential may be
-/// minted.
+/// The tests above exercise the core through an in-memory backend; these two
+/// cover the seam an audit command actually calls, where the key file and the
+/// initialized storage have to agree and no runtime credential may be minted.
 mod vault_core {
     use std::sync::Arc;
 
