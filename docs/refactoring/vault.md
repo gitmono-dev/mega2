@@ -94,9 +94,13 @@
 
 守卫口径（冻结）：迁移后 `un31_` 用例数 **≥ 12**，过滤器用位置无关的 `un31_`（禁用绑定 vendored 模块路径的 `vault::un31_`）；`un43_readonly` ≥ 4 用例；`fix04_list` 保持绿。
 
-### 迁移中间态
+### 迁移中间态（VLT-01 已落地，2026-08-21）
 
-`libvault` crate 与 vendored `src/vault/` 在 VLT-01 之后**双存**（依赖已引入、引用未切换、目录未删）。这是刻意的中间态：删除时机取决于 VLT-S1 的 go/no-go，不由依赖引入触发。双存期间 `crate::vault::` 仍是唯一被消费的实现。
+`libvault` crate 与 vendored `src/vault/` 现处于**双存中间态**：依赖已引入、引用未切换、目录未删。这是刻意的中间态——**删除待 VLT-S1 判定 go**，不由依赖引入触发。双存期间 `crate::vault::` 仍是唯一被消费的实现，`libvault` 只是在依赖图里就位。
+
+- 依赖行（`Cargo.toml`）：`libvault = { version = "0.3.0", features = ["storage_pg", "crypto_adaptor_openssl"] }`；`Cargo.lock` 解析到 `libvault 0.3.0`（registry）。
+- 双版本并存已验证：`cargo build` 0 错误 0 警告。libvault 带入的次要版本与本仓既有版本并行解析，包括 `rand 0.9.5`（本仓 `0.10.2` + `rand08` = `0.8.7`）、`pgp 0.19.0`（本仓 `0.20.0`）、`sqlx 0.8.6`（sea-orm 2.0 用 `0.9.0`）、`ureq 2.12.1`（本仓 `3.3.0`）、`reqwest 0.12.28`（本仓 `0.13.4`）、`strum 0.25.0`、`enum-map 2.7.3`、`pem 3.0.6`、`ipnetwork 0.17.0`、`derive_more 0.99.20`、`hcl-rs 0.18.7`、`radix_trie 0.2.1`、`stretto 0.8.4`、`bcrypt 0.17.1`、`base64 0.22.1`。本仓在此之前已有 `rand` / `rand08` 双版本先例，故不做单版本收敛（`DEFER-VLT-03`）。
+- 编译面：`storage_pg` 与 `crypto_adaptor_openssl` 两个特性显式开启；`crypto_adaptor_openssl` 是上游 `default`，此处显式写出以免将来 `default-features` 变化时静默丢失。
 
 ## 当前实现概览
 
