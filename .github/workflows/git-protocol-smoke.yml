@@ -62,8 +62,11 @@ jobs:
     # (v0.1.174/175 timed out during the cargo gate). Keep headroom for cold caches.
     timeout-minutes: 60
     env:
-      # Hosted-runner client pins (ubuntu-latest 20260726 image). Drift fails the job.
-      MONOENGINE_CI_GIT_VERSION: "2.54.0"
+      # Hosted-runner client pins (ubuntu-latest 20260816.277 image). Drift fails
+      # the job: the point is knowing which client the protocol matrix certifies,
+      # not holding one particular version. Bump only as a deliberate action and
+      # sync docs/refactoring/test-infra.md in the same change.
+      MONOENGINE_CI_GIT_VERSION: "2.55.0"
       MONOENGINE_CI_GIT_LFS_VERSION: "3.7.1"
     steps:
       - name: Checkout monoengine
