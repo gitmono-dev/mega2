@@ -13,7 +13,7 @@
 > 派生的配置面与 Compose 内部 DNS，改名会让会话路径 fail-closed 成 401。
 
 核对日：**2026-08-21**。前端 / 账户仓库 sibling：`../monoui`（`gitmono-dev/monoui`），
-分支 **`monoengine`**，会话契约基线 revision：**`58ef280`**（含内部产品邮件
+分支 **`monoengine`**，会话契约基线 revision：**`48e4acb`**（含内部产品邮件
 API WE-02..WE-05，自 `genedna/website@2af89c8` 移植；IT 账户库 PG；Dockerfile 复制
 `drizzle.config.ts`）。IT Postgres schema 初始化要求 monoui
 `apps/next-app/Dockerfile` 在 builder 阶段复制根目录 `drizzle.config.ts`（供

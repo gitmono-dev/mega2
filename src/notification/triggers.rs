@@ -18,6 +18,44 @@ pub const EVENT_ITEM_REFERENCED: &str = "item.referenced";
 
 const COMMENT_EXCERPT_MAX_CHARS: usize = 500;
 
+/// Stand-ins for business values that are legitimately blank.
+///
+/// The website product templates reject any required payload field that is
+/// blank after `trim()` with `422 invalid_payload`
+/// (`docs/refactoring/website-mail.md` §2.1 field rules). A whitespace-only
+/// comment body, or a CL/Issue saved with an empty title, would therefore make
+/// monoengine emit a request that can only ever be rejected — and because
+/// `service::deliver_user_notification` only `warn!`s on failure, the email
+/// would be dropped silently while the in-app notification still appeared.
+/// Substituting a placeholder keeps the recipient informed that the event
+/// happened, minus an excerpt that carried no information anyway.
+const EMPTY_COMMENT_PLACEHOLDER: &str = "(no comment text)";
+const EMPTY_TITLE_PLACEHOLDER: &str = "(untitled)";
+
+/// Trim using the *website's* notion of whitespace, not Rust's.
+///
+/// `str::trim` follows Unicode `White_Space`, which excludes U+FEFF; JavaScript's
+/// `String.prototype.trim` strips it. A value that is nothing but a BOM
+/// therefore looks non-blank here and blank there, so it would sail past the
+/// guards below and still be rejected `422 invalid_payload` — reopening exactly
+/// the silent-drop hole those guards exist to close.
+fn trim_like_javascript(value: &str) -> &str {
+    value.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+}
+
+/// Return `value` trimmed, or `placeholder` when it is blank.
+///
+/// Only used for payload fields the website marks required; optional fields
+/// keep their real (possibly empty) value.
+fn required_field(value: &str, placeholder: &'static str) -> String {
+    let trimmed = trim_like_javascript(value);
+    if trimmed.is_empty() {
+        placeholder.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 async fn ensure_event_type(
     stg: &NotificationStorage,
     code: &str,
@@ -30,7 +68,10 @@ async fn ensure_event_type(
 }
 
 fn comment_excerpt(text: &str) -> String {
-    let trimmed = text.trim();
+    let trimmed = trim_like_javascript(text);
+    if trimmed.is_empty() {
+        return EMPTY_COMMENT_PLACEHOLDER.to_owned();
+    }
     let mut excerpt = trimmed
         .chars()
         .take(COMMENT_EXCERPT_MAX_CHARS)
@@ -133,7 +174,7 @@ pub async fn on_cl_merged(
             json!({
                 "cl_link": cl_link,
                 "actor_username": actor_username,
-                "cl_title": cl.title,
+                "cl_title": required_field(&cl.title, EMPTY_TITLE_PLACEHOLDER),
             }),
         )
         .await?;
@@ -170,7 +211,7 @@ pub async fn on_issue_comment_created(
             &format!("{actor_username} commented: {comment_text}"),
             json!({
                 "issue_link": issue_link,
-                "issue_title": issue.title,
+                "issue_title": required_field(&issue.title, EMPTY_TITLE_PLACEHOLDER),
                 "actor_username": actor_username,
                 "comment_excerpt": excerpt,
             }),
@@ -201,7 +242,7 @@ pub async fn on_issue_closed(
             &format!("{actor_username} closed {issue_link}."),
             json!({
                 "issue_link": issue_link,
-                "issue_title": issue.title,
+                "issue_title": required_field(&issue.title, EMPTY_TITLE_PLACEHOLDER),
                 "actor_username": actor_username,
             }),
         )
@@ -310,6 +351,61 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].event_type_code, EVENT_CL_COMMENT_CREATED);
         assert!(inbox[0].body_html.contains("&lt;review&gt;"));
+    }
+
+    #[test]
+    fn comment_excerpt_substitutes_a_placeholder_for_blank_input() {
+        // website rejects a blank required payload field with 422
+        // invalid_payload, and service.rs only warns — so a whitespace-only
+        // comment would silently drop the email while the in-app notification
+        // still appeared. See docs/refactoring/website-mail.md §2.1.
+        for blank in ["", "   ", "\n\t "] {
+            let excerpt = comment_excerpt(blank);
+            assert_eq!(excerpt, EMPTY_COMMENT_PLACEHOLDER);
+            assert!(!excerpt.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn comment_excerpt_still_trims_and_truncates_real_input() {
+        assert_eq!(comment_excerpt("  hello  "), "hello");
+        let long = "x".repeat(COMMENT_EXCERPT_MAX_CHARS + 10);
+        let excerpt = comment_excerpt(&long);
+        assert!(excerpt.ends_with('…'));
+        assert_eq!(excerpt.chars().count(), COMMENT_EXCERPT_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn blank_detection_matches_the_websites_javascript_trim() {
+        // U+FEFF is not Unicode White_Space, so `str::trim` keeps it while the
+        // website's `String.prototype.trim` strips it. A BOM-only comment (easy
+        // to produce by pasting from a BOM-prefixed file) would otherwise reach
+        // the website as a "non-blank" required field and come back 422.
+        assert_eq!(comment_excerpt("\u{FEFF}"), EMPTY_COMMENT_PLACEHOLDER);
+        assert_eq!(comment_excerpt(" \u{FEFF}\t"), EMPTY_COMMENT_PLACEHOLDER);
+        assert_eq!(
+            required_field("\u{FEFF}", EMPTY_TITLE_PLACEHOLDER),
+            EMPTY_TITLE_PLACEHOLDER
+        );
+        // A BOM must still be stripped from the edges of real content, again
+        // matching the website (which sees the trimmed value as non-blank).
+        assert_eq!(comment_excerpt("\u{FEFF}hello\u{FEFF}"), "hello");
+    }
+
+    #[test]
+    fn required_field_substitutes_only_for_blank_values() {
+        assert_eq!(
+            required_field("   ", EMPTY_TITLE_PLACEHOLDER),
+            EMPTY_TITLE_PLACEHOLDER
+        );
+        assert_eq!(
+            required_field("", EMPTY_TITLE_PLACEHOLDER),
+            EMPTY_TITLE_PLACEHOLDER
+        );
+        assert_eq!(
+            required_field("  Real title  ", EMPTY_TITLE_PLACEHOLDER),
+            "Real title"
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     common::errors::MegaError,
@@ -232,11 +232,22 @@ pub async fn deliver_user_notification(
                 )
                 .await
             {
-                warn!(
-                    event_type,
-                    error = %error,
-                    "website mail delivery failed; notification remains available in-app"
-                );
+                // A 425 is a concurrent same-key duplicate: the in-flight
+                // sibling request will deliver this email, so calling it a
+                // failure would recreate the very misreading the 409/425 split
+                // exists to prevent (website-mail.md §2.2).
+                if error.to_string().contains("HTTP 425") {
+                    debug!(
+                        event_type,
+                        "website mail: concurrent duplicate in flight; the sibling request delivers"
+                    );
+                } else {
+                    warn!(
+                        event_type,
+                        error = %error,
+                        "website mail delivery failed; notification remains available in-app"
+                    );
+                }
             }
         }
         return Ok(());

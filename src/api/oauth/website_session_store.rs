@@ -19,6 +19,22 @@ impl WebsiteSessionStore {
     pub fn new(api_base_url: String, cookie_names: Vec<String>) -> Result<Self, MegaError> {
         let client = Client::builder()
             .no_proxy()
+            // Refuse redirects, matching every other outbound client in this
+            // repo (notification::website_mail, channels::slack,
+            // channels::webhook). Following one would re-send the session
+            // Cookie to wherever the front end pointed, so a misrouted deploy
+            // could answer with someone else's session. Refusing keeps the
+            // 3xx itself as the observed status: `load_user_from_cookie_header_pair`
+            // then warns with that status and returns `Ok(None)` — the request
+            // is treated as anonymous (fail-closed, HTTP 401 `Login first`),
+            // NOT as an authenticated user of the redirect target. Note this is
+            // a warn plus a 401, not a hard error; CI's
+            // `curl -sf .../api/auth/get-session` probe does not pass -L, so a
+            // 3xx passes CI while every browser session here fails closed.
+            // `oauth.website_api_base_url` is allowed to be plain `http`
+            // (config/validate.rs), so an origin that 301s http->https is a
+            // realistic way to hit this.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|error| {

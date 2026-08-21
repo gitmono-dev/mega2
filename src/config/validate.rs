@@ -352,8 +352,18 @@ pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Resul
         ));
     }
     let website_mail_enabled = !config.website_mail_base_url.trim().is_empty();
-    let website_mail_bearer_count = usize::from(config.website_mail_bearer.is_some())
-        + usize::from(config.website_mail_bearer_ref.is_some());
+    // A present-but-blank bearer is not a configured bearer. `is_some()` alone
+    // let `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (or a whitespace value) pass
+    // validation, producing a service that boots healthy and then 401s on every
+    // product email forever — the website side never matches `Bearer <empty>`,
+    // and the failure is only a `warn!` in service.rs. Treat blank as unset so
+    // it falls into the "exactly one of ... is required" branch below.
+    let website_mail_bearer_count = usize::from(
+        config
+            .website_mail_bearer
+            .as_ref()
+            .is_some_and(|bearer| !bearer.expose_secret().trim().is_empty()),
+    ) + usize::from(config.website_mail_bearer_ref.is_some());
     if website_mail_enabled {
         let parsed = Url::parse(&config.website_mail_base_url).map_err(|_| {
             MegaError::Other(
@@ -1595,6 +1605,53 @@ mod tests {
             .validate()
             .expect_err("website mail must require a bearer source");
         assert!(err.to_string().contains("website_mail_bearer"));
+    }
+
+    #[test]
+    fn config_validate_rejects_blank_website_mail_bearer() {
+        // `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (empty, or whitespace) used
+        // to satisfy the `is_some()` count, so the service booted healthy and
+        // then 401'd on every product email forever — a failure that only ever
+        // surfaces as a `warn!` in notification::service. A blank bearer is not
+        // a configured bearer.
+        for blank in ["", "   ", "\t\n"] {
+            let mut config = valid_config();
+            config.notification = Some(crate::config::NotificationConfig {
+                website_mail_base_url: "http://website-next:7001".to_string(),
+                website_mail_bearer: Some(crate::config::secret::SecretString::new(blank)),
+                ..Default::default()
+            });
+
+            let err = config
+                .validate()
+                .expect_err("a blank website mail bearer must not count as configured");
+            let message = err.to_string();
+            assert!(
+                message.contains("website_mail_bearer"),
+                "error should name the bearer field, got: {message}"
+            );
+            assert!(
+                !message.contains(blank) || blank.is_empty(),
+                "error must not echo the configured value"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_blank_website_mail_bearer_even_without_base_url() {
+        // Mirror of the branch at the bottom of the mail block: a bearer with
+        // no base_url is an error, but a *blank* bearer alone must not trip it
+        // (nothing is configured, so nothing is inconsistent).
+        let mut config = valid_config();
+        config.notification = Some(crate::config::NotificationConfig {
+            website_mail_base_url: String::new(),
+            website_mail_bearer: Some(crate::config::secret::SecretString::new("   ")),
+            ..Default::default()
+        });
+
+        config
+            .validate()
+            .expect("a blank bearer with no base_url is simply 'mail disabled'");
     }
 
     #[test]

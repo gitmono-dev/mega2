@@ -22,6 +22,7 @@ on:
       - "src/cli.rs"
       - "src/commands/config.rs"
       - "src/commands/service/ssh.rs"
+      - "src/api/oauth/**"
       - "src/config/**"
       - "src/contract/vault/integration/vault_core.rs"
       - "src/jupiter/storage/notification_storage.rs"
@@ -50,6 +51,7 @@ on:
       - "src/cli.rs"
       - "src/commands/config.rs"
       - "src/commands/service/ssh.rs"
+      - "src/api/oauth/**"
       - "src/config/**"
       - "src/contract/vault/integration/vault_core.rs"
       - "src/jupiter/storage/notification_storage.rs"
@@ -112,10 +114,42 @@ jobs:
           # out-of-band GitHub-admin step whose omission is a hard `exit 1` below.
           WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
         run: |
+          set -uo pipefail
+          # Presence is not the interesting failure. The orbit step above already
+          # exits when ORBIT_CHECKOUT_TOKEN is empty, so an empty value can only
+          # reach here in an unusual setup. The realistic failure is SCOPE: a
+          # fine-grained PAT scoped to gitmono-dev/orbit — exactly what the orbit
+          # step's own message asks for — satisfies the fallback, then dies 20+
+          # minutes later inside actions/checkout with an opaque
+          # "Repository not found". Probe the API so that surfaces here instead.
           if [ -z "${WEBSITE_CHECKOUT_TOKEN}" ]; then
-            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/monoui sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to gitmono-dev/monoui. If you are relying on the ORBIT_CHECKOUT_TOKEN fallback, that token must also be able to read gitmono-dev/monoui — an orbit-only scope passes this guard and then fails the checkout with 'Repository not found'."
+            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/monoui sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to gitmono-dev/monoui."
             exit 1
           fi
+          # `|| true` matters: GitHub runs this block as `bash -e {0}`, which no
+          # `set` here can undo, so a bare assignment would abort the step on any
+          # nonzero curl exit (DNS/TLS blip) and the branded annotations below
+          # would never print. With the guard, a transport failure yields an
+          # empty body and we report it as 000.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${WEBSITE_CHECKOUT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/gitmono-dev/monoui || true)"
+          status="${status:-000}"
+          case "${status}" in
+            200)
+              echo "OK: checkout token can read gitmono-dev/monoui"
+              ;;
+            401|403|404)
+              echo "::error title=Checkout token cannot read gitmono-dev/monoui::GET /repos/gitmono-dev/monoui returned HTTP ${status}. The token in WEBSITE_CHECKOUT_TOKEN (or the ORBIT_CHECKOUT_TOKEN fallback) needs read-only contents access to gitmono-dev/monoui. A token scoped only to gitmono-dev/orbit returns 404 here and would otherwise fail much later inside actions/checkout as 'Repository not found'."
+              exit 1
+              ;;
+            *)
+              echo "::error title=Cannot reach api.github.com to validate the checkout token::GET /repos/gitmono-dev/monoui returned HTTP ${status} (000 = the request never completed). This is a transport or GitHub-side problem, NOT a token scope problem — do not re-scope the PAT on the strength of this message; re-run the job."
+              exit 1
+              ;;
+          esac
 
       - name: Checkout monoui sibling
         uses: actions/checkout@v5
@@ -124,7 +158,7 @@ jobs:
           repository: gitmono-dev/monoui
           # Pin to the same revision as docs/refactoring/website-auth.md
           # (Dockerfile must COPY drizzle.config.ts for PG website-db-init).
-          ref: 58ef280a2756694e6d68690f16a62f4159bb0a73
+          ref: 48e4acb0897eb7786eaa325e7d6d4777e094bd75
           path: monoui
           token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
 
@@ -226,39 +260,64 @@ jobs:
       - name: Run config sample tests
         working-directory: monoengine
         run: |
-          cargo test config::template -- --nocapture
-          cargo test config::loader -- --nocapture
-          cargo test placeholder_expansion_error_is_returned_instead_of_panicking -- --nocapture
-          cargo test placeholder_substitution_error_redacts_context_values -- --nocapture
-          cargo test reload_applies_subscribers_before_publishing_snapshot -- --nocapture
-          cargo test reload_rolls_back_subscribers_and_keeps_snapshot_when_apply_fails -- --nocapture
-          cargo test reload_reports_static_consumer_fields_as_restart_required_without_publishing_snapshot -- --nocapture
-          cargo test test_new_with_profile_merges_profile_before_env -- --nocapture
-          cargo test config_init_template_has_no_unconsumed_fields -- --nocapture
-          cargo test config_validate_rejects_invalid_monorepo_settings -- --nocapture
-          cargo test config_validate_rejects_invalid_pack_settings -- --nocapture
-          cargo test config_validate_rejects_invalid_blame_settings -- --nocapture
-          cargo test config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref -- --nocapture
-          cargo test config_validate_rejects_invalid_sidebar_items -- --nocapture
-          cargo test config_validate_rejects_invalid_artifact_gc_settings -- --nocapture
-          cargo test source_diagnostics_collects_array_element_field_paths -- --nocapture
-          cargo test source_diagnostics_full_cross_source_matrix_for_single_field -- --nocapture
-          cargo test source_diagnostics_redacts_notification_secret_ref_values -- --nocapture
-          cargo test reject_unknown_fields_rejects_typo_fields -- --nocapture
-          cargo test test_load_str_rejects_removed_mail_section -- --nocapture
-          cargo test config_validate_rejects_legacy_mail_environment_variables -- --nocapture
-          cargo test test_bad_environment_type_reports_variable_name_without_value -- --nocapture
-          cargo test config_validate_uses_raw_sources_load_mode -- --nocapture
-          cargo test config_validate_accepts_deny_warnings_flag -- --nocapture
-          cargo test validate_config_denies_source_warnings_when_requested -- --nocapture
-          cargo test validate_config_rejects_obsolete_section_source -- --nocapture
-          cargo test secret_ref_from_args_rejects_redis_url_outside_namespace -- --nocapture
-          cargo test config_validate_reports_bad_env_type_without_cli_preload -- --nocapture
-          cargo test test_profile_type_error_reports_profile_source_without_value -- --nocapture
-          cargo test resolve_config_secrets_reports_missing_redis_url_ref_without_leaking_ref -- --nocapture
-          cargo test vault_secret_resolver_reports_missing_field_without_leaking_ref -- --nocapture
-          cargo test vault_secret_resolver_reports_non_string_field_without_leaking_ref -- --nocapture
-          cargo test test_config_secret_acl_is_not_granted_to_generic_token -- --nocapture
+          set -euo pipefail
+          # `cargo test <filter>` exits 0 when the filter matches NOTHING, so a
+          # renamed or deleted test turns its gate below into a silent no-op.
+          # That already happened once: the line that used to read
+          # config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref
+          # matched zero tests after a rename and kept the job green. Every
+          # invocation now goes through this wrapper, which fails on
+          # "0 passed" (all-ignored counts as vacuous too).
+          run_test() {
+            local filter="$1" out
+            out="$(cargo test "$filter" -- --nocapture 2>&1)"
+            printf '%s\n' "$out"
+            if printf '%s' "$out" | grep -qE '^test result: ok\. 0 passed'; then
+              echo "::error title=Vacuous test filter::'cargo test ${filter}' matched no tests. The test was renamed or removed and this gate has been passing without running anything. Fix the filter or drop the line."
+              return 1
+            fi
+          }
+          run_test config::template
+          run_test config::loader
+          run_test placeholder_expansion_error_is_returned_instead_of_panicking
+          run_test placeholder_substitution_error_redacts_context_values
+          run_test reload_applies_subscribers_before_publishing_snapshot
+          run_test reload_rolls_back_subscribers_and_keeps_snapshot_when_apply_fails
+          run_test reload_reports_static_consumer_fields_as_restart_required_without_publishing_snapshot
+          run_test test_new_with_profile_merges_profile_before_env
+          run_test config_init_template_has_no_unconsumed_fields
+          run_test config_validate_rejects_invalid_monorepo_settings
+          # Guards added 2026-08-21 with the website-mail defect closure. Without
+          # these names the fixes are ungated: reverting any of them leaves every
+          # workflow green (no job runs `cargo test --lib`).
+          run_test config_validate_rejects_blank_website_mail_bearer
+          run_test notification::website_mail
+          run_test notification::triggers::tests::comment_excerpt
+          run_test notification::triggers::tests::required_field_substitutes_only_for_blank_values
+          run_test notification::triggers::tests::blank_detection_matches_the_websites_javascript_trim
+          run_test config_validate_rejects_invalid_pack_settings
+          run_test config_validate_rejects_invalid_blame_settings
+          run_test config_validate_rejects_object_storage_secret
+          run_test config_validate_rejects_invalid_sidebar_items
+          run_test config_validate_rejects_invalid_artifact_gc_settings
+          run_test source_diagnostics_collects_array_element_field_paths
+          run_test source_diagnostics_full_cross_source_matrix_for_single_field
+          run_test source_diagnostics_redacts_notification_secret_ref_values
+          run_test reject_unknown_fields_rejects_typo_fields
+          run_test test_load_str_rejects_removed_mail_section
+          run_test config_validate_rejects_legacy_mail_environment_variables
+          run_test test_bad_environment_type_reports_variable_name_without_value
+          run_test config_validate_uses_raw_sources_load_mode
+          run_test config_validate_accepts_deny_warnings_flag
+          run_test validate_config_denies_source_warnings_when_requested
+          run_test validate_config_rejects_obsolete_section_source
+          run_test secret_ref_from_args_rejects_redis_url_outside_namespace
+          run_test config_validate_reports_bad_env_type_without_cli_preload
+          run_test test_profile_type_error_reports_profile_source_without_value
+          run_test resolve_config_secrets_reports_missing_redis_url_ref_without_leaking_ref
+          run_test vault_secret_resolver_reports_missing_field_without_leaking_ref
+          run_test vault_secret_resolver_reports_non_string_field_without_leaking_ref
+          run_test test_config_secret_acl_is_not_granted_to_generic_token
 
       - name: Validate bundled config
         working-directory: monoengine

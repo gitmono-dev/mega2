@@ -38,7 +38,7 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 | 方法与路径 | `POST /api/internal/notifications/email` |
 | 调用方 | monoengine notification client（MN-05） |
 | 鉴权 | `Authorization: Bearer <shared-internal-bearer>` |
-| 幂等 | 必填 `Idempotency-Key` 请求头；同一 key 的重放必须返回同一受理结果，不得重复发送 |
+| 幂等 | 必填 `Idempotency-Key` 请求头；同一 key 的重放必须返回同一受理结果，不得重复发送。**key 必须由请求身份确定性推导**（见 §2.3），不得每次调用现取随机值——否则该保证形同虚设 |
 | Content-Type | `application/json` |
 | 超时与重试 | monoengine 使用有界 HTTP 超时；本计划为 best-effort，不在本仓建立重试 outbox |
 
@@ -74,13 +74,15 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 | `recipient.email` | 必填，最终投递地址 |
 | `locale` | 必填 BCP 47 locale；未知值由 website 回退至其默认 locale |
 | `payload` | 必填对象；仅事件模板所需的最小、已转义前的业务字段；不得传密码、token、完整 session cookie 或任意 HTML |
+| `payload` 中模板必填字段 | **必须是非空白字符串**。website 对 `trim()` 后为空的必填字段回 `422 invalid_payload`；调用方负责在业务值可能为空时（如纯空白的评论正文）替换为占位文案，而不是发出一个必然 422 的请求 |
 
 模板归 website 管理。monoengine 不再渲染 mail TOML 模板、构造 HTML/text 正文或传递附件；
 若未来确需预渲染内容或附件，必须修订本契约并单列 PII、大小限制和内容安全策略。
 
 ### 2.2 响应和错误
 
-成功（首次受理或幂等重放）返回 `202 Accepted`：
+成功（首次受理或幂等重放）返回 `202 Accepted`（monoengine 客户端按「任意 2xx = 已受理」
+宽松接收，因此前端把成功码改成其它 2xx 不会立刻打断投递，但仍属契约漂移，须先改本文）：
 
 ```json
 {
@@ -104,13 +106,62 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 | 400 | `invalid_request` | 记录脱敏错误；不阻断业务请求 |
 | 401 | `unauthorized` | 记录配置/secret 告警；不回退 SMTP |
 | 403 | `forbidden` | 记录调用方授权告警；不回退 SMTP |
-| 409 | `idempotency_conflict` | 记录错误；不得换 key 重试 |
+| 409 | `idempotency_conflict` | **仅**用于同 key 不同 body（指纹不匹配）的永久冲突。记录错误；不得换 key 重试 |
 | 422 | `unsupported_event` / `invalid_payload` | 记录契约或模板配置错误 |
+| 425 | `idempotency_in_progress` | 同 key 同 body 的并发请求仍在处理中（瞬时）。记录 debug/告警；**同一 key** 可稍后重试，不得换 key。本仓 best-effort，不建重试队列 |
 | 429 | `rate_limited` | 记录告警；本计划不在本仓重试 |
 | 5xx / 网络超时 | `upstream_unavailable`（或无 body） | best-effort 失败；in-app 等非邮件通道继续 |
 
 website 负责在受理后可靠发送、去重与其自身 provider 失败处理。monoengine 不应把成功响应
 理解为最终送达，也不得将 bearer、完整收件人或完整 payload 写入日志。
+
+区分 409 与 425 的意义：两者都由同一个 `Idempotency-Key` 触发，但 409 是调用方 bug
+（同 key 复用于不同内容），425 只是并发时序。把并发竞争报成 409 会让运维把一次良性
+竞争读成契约违例。
+
+### 2.3 Idempotency-Key 推导与幂等作用域
+
+**key 推导（调用方契约）**：`Idempotency-Key` 必须由「本次投递的身份」确定性推导，
+即 `event_type` + `recipient.username` + `recipient.email` + `locale` + `payload`
+的稳定哈希。monoengine 实现见 `src/notification/website_mail.rs`
+（blake3 over 规范化 JSON，取 hex）。「规范化」= **对象键递归排序**后自行渲染，
+数组保持原序（有序数据，重排即不同投递）。不用 `serde_json::Value::to_string`：
+它的键序取决于 `preserve_order` feature，而该 feature 是依赖树里的其它 crate
+（`cedar-policy-core`）打开的，不在本仓控制之下；直接哈希 `to_string` 会让 key 空间
+随一个我们不掌握的 feature 漂移，两个构建方式不同的副本会对「同一次投递」算出不同
+的 key。
+
+**关键约束：规范化后的字符串必须就是请求体本身**（monoengine 用 `.body(canonical)`
+发送，而非 `.json(&value)`）。若只把规范化用于算 key、却按插入序发送 body，则
+「key 相同」不再蕴含「字节相同」——website 是对**收到的 body** 取指纹的，同一个 key
+就可能带着它已绑定到别的指纹的字节到达，把一次良性重放变成永久 `409`。
+
+由此可得两条不变式：
+
+- 同一逻辑投递无论被重放多少次，key 都相同 → website 侧只发一封；
+- key 相同 ⟺ 所发送字节相同（key 就是这串字节的哈希）→ `409 idempotency_conflict`
+  在 monoengine 这个调用方身上**结构上不可能**发生；它只会出现在 key 由其它调用方
+  手工构造的场景。
+
+代价是**payload 相同的重复通知会被折叠成一封邮件**。注意折叠判据是 payload，不是原始
+业务内容，因此范围比「一字不差」更宽，务必按下面三类理解：
+
+- 同一人对同一对象发了两条一字不差的评论 —— 折叠。这被认为优于「双击提交发两封」。
+- 两条**不同**但前 500 字符相同的评论 —— 也会折叠：`comment_excerpt` 在
+  `src/notification/triggers.rs` 按 `COMMENT_EXCERPT_MAX_CHARS = 500` 截断，截断后的
+  payload 才是 key 的输入。空白正文被替换为占位文案后同理。
+- `issue.closed` 与 `item.referenced` 的 payload 不含任何文本或事件判别位，因此
+  「关闭→重开→再关闭」「重复引用同一对象」在 website 进程生命周期内只会发一封。
+
+要区分这几类，必须先修订本节引入一个显式的事件唯一 id 维度（例如把 in-app 通知行 id
+混入 key 的输入而不放进 payload）。在那之前，上述折叠是**已知且被接受**的行为。
+
+**幂等作用域（website 侧现状，DEFER-WE-01）**：当前实现是**进程内内存** Map
+（`libs/email/internal/idempotency-store.ts`），因此幂等保证的作用域是
+「单个 website 进程的生命周期」：进程重启、或多副本部署下请求落到不同副本时，
+同一 key 会被当作新请求再发一次。IT 栈是单副本，故 `integration_website_mail`
+能稳定验证该语义。跨副本/持久化的幂等存储是 DEFER-WE-01，落地前不得在本表把
+幂等宣称为跨进程保证。
 
 ---
 
@@ -234,7 +285,7 @@ and acceptance against website tip `a52d703` (see 实现基线).
 | 幂等头 | 必填 `Idempotency-Key` |
 | 请求 JSON 字段 | `event_type`、`recipient.username`、`recipient.email`、`locale`、`payload`（见上文 §2.1） |
 | 成功响应 | `202` + `{ delivery_id, accepted, duplicate }` |
-| 错误 `code` | `invalid_request` / `unauthorized` / `forbidden` / `idempotency_conflict` / `unsupported_event` / `invalid_payload` / `rate_limited` / `upstream_unavailable`（见 §2.2） |
+| 错误 `code` | `invalid_request` / `unauthorized` / `idempotency_conflict` / `idempotency_in_progress`(2026-08-21 新增) / `unsupported_event` / `invalid_payload` / `upstream_unavailable`（见 §2.2）。`forbidden` 与 `rate_limited` 为**保留未实现**——前端从未返回过 403/429，monoengine 侧的分类分支相应为死分支 |
 | 产品 `event_type` allowlist | `cl.comment.created`、`cl.merged`、`issue.comment.created`、`issue.closed`、`item.referenced`（`src/notification/triggers.rs`） |
 | CI website pin（`config-validation.yml` checkout） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（核对日快照；**现行 pin 见下方 2026-08-06 增补**） |
 | website 工作分支 | `monoengine` |
@@ -246,9 +297,11 @@ and acceptance against website tip `a52d703` (see 实现基线).
 > **增补（2026-08-21 前端仓库改指）：** 联调栈的前端已由 `genedna/website` 改指
 > **`gitmono-dev/monoui`** 的 `monoengine` 分支（sibling `../monoui`）；WE-02..WE-06
 > 的路由 / Bearer / 五类产品模板 / 幂等 / `EMAIL_PROVIDER=test` 已自
-> `genedna/website@2af89c8` 逐文件移植到 monoui，接口契约与本文各表**逐项不变**
+> `genedna/website@2af89c8` 逐文件移植到 monoui，移植当日接口契约与本文各表**逐项不变**
 > （路径、bearer 头、`Idempotency-Key`、`202 {delivery_id, accepted, duplicate}`、
-> `code` 取值、`event_type` allowlist 全部一致）。本表内所有 `genedna/website`
+> `code` 取值、`event_type` allowlist 全部一致）。**同日稍后有一处刻意分歧**：
+> 并发同 body 在途从 `409` 改为新增的 `425 idempotency_in_progress`（见 §2.2；
+> monoui `05ba97a`），`genedna/website` 侧没有该取值。本表内所有 `genedna/website`
 > pin / tip 行自此为**历史快照**；现行 pin 的唯一事实源仍是 workflow 文件与
 > `website-auth.md` §头部。
 
