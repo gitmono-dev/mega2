@@ -2,7 +2,14 @@
 
 ## 文档职责与维护协议
 
-本文是 monoengine 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/media/eli/sky/mega`）的 Rust 后端能力完整移植到 monoengine**，并在移植过程中保留 monoengine 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/media/eli/sky/campsite`）承载，monoengine 的前端与账户系统是 website 仓库（`/media/eli/sky/website`）`monoengine` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
+本文是 monoengine 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/media/eli/sky/mega`）的 Rust 后端能力完整移植到 monoengine**，并在移植过程中保留 monoengine 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/media/eli/sky/campsite`）承载，monoengine 的前端与账户系统是 monoui 仓库（`gitmono-dev/monoui`，sibling `../monoui`）`monoengine` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
+
+> **术语（2026-08-21）**：本文其余处出现的 *website* 是**角色名**（monoengine 的
+> 前端 / 认证与产品邮件投递面），不再是仓库名——其实现仓库自 2026-08-21 起为
+> `gitmono-dev/monoui` 的 `monoengine` 分支。派生标识（契约名 `website-mail`、
+> Compose 服务 `website-next` / `website-db-init`、隔离账户库 `website`、配置键
+> `MEGA_OAUTH__WEBSITE_*` / `MEGA_NOTIFICATION__WEBSITE_MAIL_*`、测试门
+> `WEBSITE_IT`）**一律不改名**。
 
 本文的持续事实来源有两类：
 
@@ -30,7 +37,7 @@
 - Mega 目标项目：`main` @ `3d22823e8533dd2bb7a275a92e18d8f0160f9929`（2026-08-11，`fix(identity): treat CLA as signed across username/github/public-id aliases (#2169)`）；其前一提交为 `#2168`，用于无 SQL 修复过渡期 CL reviewer。
 - monoengine：`main` @ `38feb4dd78edc998570df17ae9906af56a801d9e`，版本 v0.2.15。最近一次完整 Mega 同步分析仍基于 `#2129`；截至本次审计，**`#2130..#2169` 尚未逐提交归类，漂移窗口扩大。**
 - monoengine 工作区：除本文件外还存在用户或并行工作改动，覆盖 Git protocol、配置、测试与相关文档；本次只更新 `plan-long.md`，不将这些改动作为本次路线图结论或修改其文件。
-- 关联前端与账户系统（PT-12 事实基线，2026-08-11 核对）：campsite（`/media/eli/sky/campsite`，Rails 应用，Mega 前端 moon 的账户/后端配对）；website（`/media/eli/sky/website`，libra 管理）当前 checkout 为 detached `HEAD`。执行 PT-12 对照或联动发布前，必须重新 checkout 并记录 `monoengine` 分支的 pinned revision；其 `apps/next-app`（Next.js）仍是 monoengine 的前端与账户系统。
+- 关联前端与账户系统（PT-12 事实基线，2026-08-21 核对）：campsite（`/media/eli/sky/campsite`，Rails 应用，Mega 前端 moon 的账户/后端配对，Mega 侧引用不在本次改指范围）；**前端仓库自 2026-08-21 由 `genedna/website` 改指 `gitmono-dev/monoui`**（sibling `../monoui`，libra 管理），当前 checkout 为 `monoengine` 分支且工作树 clean。执行 PT-12 对照或联动发布前，仍须记录该分支的 pinned revision（唯一事实源：[`../refactoring/website-auth.md`](../refactoring/website-auth.md) §头部）；其 `apps/next-app`（Next.js）仍是 monoengine 的前端与账户系统。
 
 Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）：
 
@@ -79,7 +86,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 8. **不重复建设事实源。** Mega 侧能力若已被 monoengine 以更强形态覆盖（如 notification、config、mail），不回流旧实现；只补缺口，不重复移植。
 9. **测试随代码移植。** 移植功能必须携带或重建其测试；禁止手写 schema SQL，必须走真实 migration；集成测试沿用 docker-compose 测试栈与 `bin/tests/` 黑盒分层。
 10. **计划状态必须据代码更新。** 每次审计重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
-11. **双前端一致性。** Mega 前端体系是 moon + campsite，monoengine 前端与账户系统是 website `monoengine` 分支的 `apps/next-app`；monoengine 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。
+11. **双前端一致性。** Mega 前端体系是 moon + campsite，monoengine 前端与账户系统是 monoui `monoengine` 分支的 `apps/next-app`；monoengine 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。
 
 ## 当前基础
 
@@ -112,7 +119,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓邮件投递已移除**；**website 内部产品邮件 API、Slack 与 generic webhook 均已落地**，渠道凭据经 SecretRef；compose `mailpit` 消费方 = website IT。剩余：build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真实多进程/多实例黑盒矩阵 | `mega/mono/src/notification/`、campsite slack 参考 | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06）；[`plan-20260802.md`](plan-20260802.md)（WE-* / DEP-06） | 2026-08-03 |
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储与 Redis SecretRef、`[oauth]`、跨 source/profile diagnostics 和首批热加载黑盒均已落地；剩余为真实消费者订阅清单、跨 await 生命周期审计与持续扩展，而非启动顺序改造 | `mega/common/src/config`（基线对照） | [`plan-20260731.md`](plan-20260731.md)（AU-02；`[oauth]`） | 2026-08-03 |
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + UN-31 只读模式集成层重建）已由 [`plan-20260820.md`](plan-20260820.md) 于 2026-08-21 交付，本 PT 安全收尾缺口不变 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-21 |
-| PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；website `monoengine` 分支 pin 须执行期确认；全量对照仍候选 | website `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
+| PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `monoengine` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
 
 ## 工程安全基线
 
@@ -582,16 +589,16 @@ Vault 集成层 A–J 阶段可交付子集已完成：file 持久化 audit sink
 
 ### 移植问题
 
-monoengine 的后端能力（CL、issue、评审、通知、构建等）必须有前端与账户系统承载。Mega 目标项目的前端体系是 moon（Next.js）+ campsite（Rails，账户/后端配对）；monoengine 的对应物是 website 仓库 `monoengine` 分支的 `apps/next-app`。两套前端体系独立演进会产生双向漂移：monoengine 新增或变更的 API/账户行为在 `apps/next-app` 无承载，或 `apps/next-app` 缺少 moon 已有功能，用户侧表现为两侧产品能力不一致。
+monoengine 的后端能力（CL、issue、评审、通知、构建等）必须有前端与账户系统承载。Mega 目标项目的前端体系是 moon（Next.js）+ campsite（Rails，账户/后端配对）；monoengine 的对应物是 monoui 仓库 `monoengine` 分支的 `apps/next-app`。两套前端体系独立演进会产生双向漂移：monoengine 新增或变更的 API/账户行为在 `apps/next-app` 无承载，或 `apps/next-app` 缺少 moon 已有功能，用户侧表现为两侧产品能力不一致。
 
 **已由 [`plan-20260731.md`](plan-20260731.md) 落地（非全量对照）：** 浏览器会话信任路径（cookie → website `get-session` → `LoginUser`）、`[oauth]` 接线，以及 `monoengine-it` 同栈 `website-next` + `integration_website_auth`。本仓 Campsite 风格 chat/Notes 产品面已退场（产品能力留在 website）。**全量** moon↔`apps/next-app` 功能对照审计仍为候选（DEP-03）。
 
 ### 目标范围
 
-- 建立双前端功能对照基线：`apps/next-app`（website `monoengine` 分支 pinned revision）与 `mega/moon/` + campsite 的功能清单与差异表，每项差异给出"追平 / 书面豁免（含理由）"结论。
+- 建立双前端功能对照基线：`apps/next-app`（monoui `monoengine` 分支 pinned revision）与 `mega/moon/` + campsite 的功能清单与差异表，每项差异给出"追平 / 书面豁免（含理由）"结论。
 - 一致性门禁化：monoengine 每个涉及公开 API、账户、认证行为的 PT/日期计划，任务卡必须包含前端影响评估（apps/next-app 是否需要联动改动）。
 - 账户系统语义对齐：在已落地的 website Better Auth 信任路径之上，继续做与 campsite/moon 的功能语义对照，差异书面化。
-- 追平机制：差异追平按功能域拆分进入日期计划；前端代码演进在 website 仓库进行，monoengine 侧只维护契约（OpenAPI/DTO）与对照表。
+- 追平机制：差异追平按功能域拆分进入日期计划；前端代码演进在 monoui 仓库进行，monoengine 侧只维护契约（OpenAPI/DTO）与对照表。
 
 ### 非目标
 
@@ -736,7 +743,7 @@ flowchart TD
 
 以下 Mega 资产经审计不进入 PT-01 至 PT-12，需要时另行单独决策：
 
-- **`moon/` Web 前端**（pnpm + turbo + Next.js）：非 Rust 资产，代码不移植进 monoengine 仓库；monoengine 的前端与账户系统由 website `monoengine` 分支 `apps/next-app` 承载，两个前端体系的功能一致性义务由 PT-12 治理。
+- **`moon/` Web 前端**（pnpm + turbo + Next.js）：非 Rust 资产，代码不移植进 monoengine 仓库；monoengine 的前端与账户系统由 monoui `monoengine` 分支 `apps/next-app` 承载，两个前端体系的功能一致性义务由 PT-12 治理。
 - **`scripts/`**（crates-sync、init_mega、demo、import-buck2-deps、webhook_receiver.py）：运维/开发辅助脚本，按 monoengine 实际需要逐个评估，不做整体移植。
 - **`docker/`**（demo、deployment）：部署形态与 monoengine 的 docker-compose 测试栈是不同层次；部署资产按运维需求单独决策。
 - **`BUCK`、`ci/`、`LICENSE-*`**：构建定义与 CI 形态已按 monoengine 自身体系（Cargo workspace、`.github/workflows/`）建立，不回移植。
@@ -763,7 +770,7 @@ flowchart TD
 
 ### 不采纳
 
-- **不把 moon 前端代码列为移植项。** 非 Rust 资产，monoengine 仓库不承载前端代码；monoengine 前端为 website `apps/next-app`，两个前端体系的功能一致性由 PT-12 治理（见"不进入"章节与 PT-12）。
+- **不把 moon 前端代码列为移植项。** 非 Rust 资产，monoengine 仓库不承载前端代码；monoengine 前端为 monoui `apps/next-app`，两个前端体系的功能一致性由 PT-12 治理（见"不进入"章节与 PT-12）。
 - **不回流 Mega 的旧 notification/email/config 实现。** monoengine 对应模块已是功能超集（`docs/refactoring/{notification,mail,config}.md`），只补缺口不重复移植（原则 8）。
 - **不把"与 Mega 目录结构一致"作为目标。** monoengine 的 contract 归并、config 提升、workspace 拆分、Vault 以 crates.io `libvault` + 集成层为事实源（非 vendored fork、非 Mega `libvault-core` 目录镜像）是已决架构改进，不因结构差异回退（原则 2；依赖形态见 [`plan-20260820.md`](plan-20260820.md)）。
 

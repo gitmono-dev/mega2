@@ -24,7 +24,8 @@ services:
       timeout: 5s
       retries: 20
 
-  # Optional SMTP capture for website-next authentication/product-mail IT only.
+  # Optional SMTP capture for the monoui front end's authentication/product-mail
+  # IT only.
   # Monoengine does not connect to or depend on this service.
   mailpit:
     image: axllent/mailpit:v1.27
@@ -206,10 +207,10 @@ services:
       MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@postgres:5432/monoengine
       MEGA_REDIS__URL: redis://redis:6379
       # Keep the full documented IT CORS allowlist when overriding the sample
-      # config, and add the website-next host origin for stack session tests.
+      # config, and add the monoui host origin for stack session tests.
       MEGA_OAUTH__ALLOWED_CORS_ORIGINS: http://local.gitmega.com,https://app.gitmega.com,http://app.gitmono.test,http://127.0.0.1:17001
       MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
-      # MN-05: shared IT-only credential for website's internal product-email API.
+      # MN-05: shared IT-only credential for monoui's internal product-email API.
       MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL: http://website-next:7001
       MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
       MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
@@ -227,15 +228,15 @@ services:
       retries: 40
       start_period: 20s
 
-  # One-shot PostgreSQL schema initialization for website-next. Reuses the
-  # website Dockerfile builder stage because the production runner is a
+  # One-shot PostgreSQL schema initialization for the monoui front end. Reuses
+  # the monoui Dockerfile builder stage because the production runner is a
   # standalone Next image and deliberately has no Drizzle tooling.
   # Account data lives in an isolated `website` database on the shared
   # postgres service — never the monoengine business DB (ADR-WA-07).
   website-db-init:
     profiles: ["web"]
     build:
-      context: ../website
+      context: ../monoui
       dockerfile: apps/next-app/Dockerfile
       target: builder
     depends_on:
@@ -272,15 +273,15 @@ services:
         "
         npx drizzle-kit push --force
 
-  # Website Better Auth test instance. Uses isolated Postgres database
+  # monoui Better Auth test instance. Uses isolated Postgres database
   # `website` on the shared postgres service (not monoengine's business DB).
-  # Build locally from the sibling checkout; CI must check out ../website too.
+  # Build locally from the sibling checkout; CI must check out ../monoui too.
   website-next:
     profiles: ["web"]
     image: website-next:local
     pull_policy: never
     build:
-      context: ../website
+      context: ../monoui
       dockerfile: apps/next-app/Dockerfile
     environment:
       DB_DIALECT: pg

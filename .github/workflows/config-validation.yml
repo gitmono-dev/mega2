@@ -100,40 +100,42 @@ jobs:
             fi
           done
 
-      - name: Validate website checkout token
+      - name: Validate monoui checkout token
         env:
-          # Prefer a dedicated website token; fall back to ORBIT_CHECKOUT_TOKEN
-          # when it can read the private website sibling (same as local ../website).
+          # Prefer a dedicated monoui token; fall back to ORBIT_CHECKOUT_TOKEN
+          # when it can read the private monoui sibling (same as local ../monoui).
+          # The secret NAMES are intentionally unchanged: renaming them would add an
+          # out-of-band GitHub-admin step whose omission is a hard `exit 1` below.
           WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
         run: |
           if [ -z "${WEBSITE_CHECKOUT_TOKEN}" ]; then
-            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private genedna/website sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to genedna/website."
+            echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/monoui sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to gitmono-dev/monoui."
             exit 1
           fi
 
-      - name: Checkout website sibling
+      - name: Checkout monoui sibling
         uses: actions/checkout@v5
         with:
-          # Local sibling is ../website → github.com/genedna/website (private).
-          repository: genedna/website
+          # Local sibling is ../monoui → github.com/gitmono-dev/monoui (private).
+          repository: gitmono-dev/monoui
           # Pin to the same revision as docs/refactoring/website-auth.md
           # (Dockerfile must COPY drizzle.config.ts for PG website-db-init).
-          ref: 2af89c874646005dd1a550053b5068f19bb7478a
-          path: website
+          ref: 58ef280a2756694e6d68690f16a62f4159bb0a73
+          path: monoui
           token: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
 
-      - name: Guard website Dockerfile supports IT Postgres init
+      - name: Guard monoui Dockerfile supports IT Postgres init
         run: |
           set -euo pipefail
-          if ! grep -q 'drizzle.config.ts' website/apps/next-app/Dockerfile; then
-            echo "::error title=Website Dockerfile missing PG drizzle config::apps/next-app/Dockerfile must COPY drizzle.config.ts so compose website-db-init can drizzle-kit push against the isolated website Postgres DB. See docs/refactoring/website-auth.md pin policy."
+          if ! grep -q 'drizzle.config.ts' monoui/apps/next-app/Dockerfile; then
+            echo "::error title=monoui Dockerfile missing PG drizzle config::apps/next-app/Dockerfile must COPY drizzle.config.ts so compose website-db-init can drizzle-kit push against the isolated website Postgres DB. See docs/refactoring/website-auth.md pin policy."
             exit 1
           fi
 
       - name: Free runner disk before heavy builds
         run: |
           set -euo pipefail
-          # ubuntu-latest ships large unused toolchains; website-next's pnpm install
+          # ubuntu-latest ships large unused toolchains; monoui's pnpm install
           # (incl. workerd) otherwise hits ENOSPC during compose profile web build.
           sudo rm -rf \
             /usr/share/dotnet \
@@ -193,7 +195,7 @@ jobs:
           docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait postgres redis git-cli
           docker compose -p monoengine-it -f docker-compose.test.yml ps
 
-      - name: Start compose-hosted monoengine and website (profiles app + web)
+      - name: Start compose-hosted monoengine and monoui (profiles app + web)
         working-directory: monoengine
         run: |
           set -euo pipefail
@@ -201,7 +203,7 @@ jobs:
           cp target/debug/monoengine monoengine.itbin
           docker build -f Dockerfile.it-runtime -t monoengine:local .
           rm -f monoengine.itbin
-          # Reclaim cargo artifacts before website-next pnpm install (large).
+          # Reclaim cargo artifacts before the monoui pnpm install (large).
           # Later cargo test steps will rebuild; disk headroom is required first.
           rm -rf target
           docker builder prune -f >/dev/null 2>&1 || true
@@ -215,7 +217,7 @@ jobs:
           docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web --profile git --profile smoke up -d --wait
           curl -sf "http://127.0.0.1:19180/api/openapi.json" >/dev/null
           curl -sf "http://127.0.0.1:17001/api/auth/get-session" >/dev/null
-          echo "OK: compose monoengine and website-next healthy"
+          echo "OK: compose monoengine and monoui website-next healthy"
 
       - name: Run config sample tests
         working-directory: monoengine
@@ -403,7 +405,7 @@ jobs:
           fi
           grep -F "source diagnostics produced" "${env_warning_output}"
 
-      - name: Run integration tests (vault CLI + website auth + git-cli)
+      - name: Run integration tests (vault CLI + monoui auth + git-cli)
         working-directory: monoengine
         env:
           MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine
@@ -416,13 +418,13 @@ jobs:
           # ITW-03: a real Better Auth sign-up/sign-in cookie must identify the
           # same user through the compose-hosted monoengine session bridge.
           cargo test -p monoengine --test integration_website_auth -- --test-threads=1
-          # WE-06: website internal product-email API (bearer + allowlisted event).
+          # WE-06: monoui internal product-email API (bearer + allowlisted event).
           cargo test -p monoengine --test integration_website_mail -- --test-threads=1
           # Linux-only git-cli HTTP / LFS / SSH harnesses (env -u so SKIP cannot soft-pass).
           env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_cli -- --test-threads=1
           env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_lfs -- --test-threads=1
           env -u MONOENGINE_IT_SKIP_GIT_CLI cargo test -p monoengine --test integration_git_ssh -- --test-threads=1
-          # Product-email delivery is owned by website (test provider in compose).
+          # Product-email delivery is owned by monoui (test provider in compose).
           # Monoengine proves acceptance via integration_website_mail above.
 
       - name: Run linked git protocol smoke (git-smoke)

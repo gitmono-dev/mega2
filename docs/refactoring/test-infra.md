@@ -103,7 +103,7 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | 项 | 值 |
 |---|---|
 | 服务名 | `mailpit` |
-| 用途 | 可选的 website-next 认证和产品邮件 SMTP 捕获；**不是 monoengine 服务依赖或测试门** |
+| 用途 | 可选的 monoui（`website-next`）认证和产品邮件 SMTP 捕获；**不是 monoengine 服务依赖或测试门** |
 | 端口 | `127.0.0.1:11025:1025`（SMTP）、`127.0.0.1:18025:8025`（UI/API） |
 | profiles | 无；默认数据面可启动，但仅在 website 邮件 IT 需要时消费 |
 | depends_on | monoengine 不依赖它。website-next 若选择 SMTP 测试 provider，可连接 `mailpit:1025` |
@@ -198,7 +198,7 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
 | profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
 | depends_on | `postgres`、`redis`（`service_healthy`）。`MEGA_OAUTH__WEBSITE_API_BASE_URL=http://website-next:7001`；`MEGA_OAUTH__ALLOWED_CORS_ORIGINS` 保留既有 IT origin 并含 `http://127.0.0.1:17001`。不声明对 `website-next` 的 `depends_on`：该服务仅属 `web` profile，而 `monoengine` 属 `app`；跨 profile 依赖会使 app-only smoke 无法解析。会话联调使用下方规定的 web-first 启动顺序；不依赖 Mailpit 或 RustFS。 |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
-| CI 入口 | `.github/workflows/config-validation.yml`：先检查并 checkout private `genedna/website` sibling（缺 `WEBSITE_CHECKOUT_TOKEN`，可回退 `ORBIT_CHECKOUT_TOKEN`，与 orbit 纪律一致），在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `monoengine:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p monoengine --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
+| CI 入口 | `.github/workflows/config-validation.yml`：先检查并 checkout private `gitmono-dev/monoui` sibling（缺 `WEBSITE_CHECKOUT_TOKEN`，可回退 `ORBIT_CHECKOUT_TOKEN`，与 orbit 纪律一致），在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `monoengine:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p monoengine --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
 | secret | 无注入生产 secret；DB 使用公开测试口令 `monoengine_test_password`（用户/库名均为 `monoengine`）；website-mail bearer 仅为公开的隔离 IT 值 |
 | 降级 / 黑盒 | 栈级 smoke：`integration_compose_monoengine_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
 
@@ -227,7 +227,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d -
 | 项 | 值 |
 |---|---|
 | 服务名 | `website-db-init`、`website-next` |
-| 镜像 / 构建 | `website-db-init` 从 sibling `../website` 的 `apps/next-app/Dockerfile` `builder` stage 构建，复用已安装的 `pnpm` / Drizzle / `pg`；该 Dockerfile 必须复制根目录 `drizzle.config.ts`，供 init target 解析 PG schema。`website-next:local`，`pull_policy: never`，从同一 Dockerfile 的 runner stage 构建。本地和 CI 都必须有该 checkout；CI 应缓存构建层但不得尝试拉取同名远程镜像 |
+| 镜像 / 构建 | `website-db-init` 从 sibling `../monoui` 的 `apps/next-app/Dockerfile` `builder` stage 构建，复用已安装的 `pnpm` / Drizzle / `pg`；该 Dockerfile 必须复制根目录 `drizzle.config.ts`，供 init target 解析 PG schema。`website-next:local`，`pull_policy: never`，从同一 Dockerfile 的 runner stage 构建。本地和 CI 都必须有该 checkout；CI 应缓存构建层但不得尝试拉取同名远程镜像 |
 | 端口 | `127.0.0.1:17001:7001`（仅回环；next-app Dockerfile 的 `EXPOSE 7001`） |
 | healthcheck | 容器内 Node TCP 连接 `127.0.0.1:7001`；只在 Next 进程已监听时 healthy |
 | 网络 | 默认 `networks.default` → `monoengine-test-network`，可由后续 `monoengine` profile 通过 `website-next:7001` 访问 |
@@ -235,7 +235,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d -
 | profiles | 两服务均为 `profiles: ["web"]`，不参与默认 `up -d --wait`；显式启动：`docker compose -p monoengine-it -f docker-compose.test.yml --profile web up -d --wait website-next` |
 | depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）；初始化失败时 Next 不会启动。没有 `monoengine` 跨 profile 依赖：`website-next` 是 `web` profile、`monoengine` 是 `app` profile，避免 app-only smoke 被 web 拉起。可联合运行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait`，此时 Compose 先完成 schema 初始化，再等待两个常驻服务 healthy |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile web down -v`；`-v` 删除 Postgres 数据卷后 `website` 库与 schema 不保留，零残留仍按 compose project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../website`（`genedna/website` @ `2af89c8`；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫（须 COPY `drizzle.config.ts`）保留为回归保护。 |
+| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../monoui`（`gitmono-dev/monoui` @ [`website-auth.md`](./website-auth.md) §头部所钉 revision——SHA 不在此重复，避免第二真源；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫（须 COPY `drizzle.config.ts`）保留为回归保护。 |
 | secret | `BETTER_AUTH_SECRET` 与 `MONOENGINE_INTERNAL_MAIL_BEARER` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
 | 邮件 env（WE-06） | `EMAIL_PROVIDER=test`（内存记录，无云调用）、`EMAIL_DEFAULT_FROM`、`MONOENGINE_INTERNAL_MAIL_BEARER`、可选 `MONOENGINE_PUBLIC_BASE_URL`；默认不依赖 `mailpit`（smtp 捕获仍可选） |
 | 性能 | 首次 source build 预算 ≤ 20 分钟；默认 profile 不构建、不启动该服务 |

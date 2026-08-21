@@ -5,9 +5,17 @@
 邮件投递迁出见计划 ADR-WA-08 / 任务 MN-01，事实源为
 [`website-mail.md`](./website-mail.md)。
 
-核对日：**2026-08-03**。Website 仓库 sibling：`../website`（`genedna/website`），分支 **`monoengine`**，
-会话契约基线 revision：**`2af89c8`**（含内部产品邮件 API WE-02..WE-05；IT 账户库
-PG；Dockerfile 复制 `drizzle.config.ts`）。IT Postgres schema 初始化要求 website
+> **术语**：本文中 *website* 指 monoengine 的**前端 / 认证面实现**，其仓库自
+> 2026-08-21 起为 `gitmono-dev/monoui` 的 `monoengine` 分支 `apps/next-app`
+> （sibling `../monoui`）。Compose 服务名 `website-next` / `website-db-init`、
+> 隔离账户库名 `website`、以及 `MEGA_OAUTH__WEBSITE_*` /
+> `MEGA_NOTIFICATION__WEBSITE_MAIL_*` 配置键**均保持不变**——它们是 Rust 结构体
+> 派生的配置面与 Compose 内部 DNS，改名会让会话路径 fail-closed 成 401。
+
+核对日：**2026-08-21**。前端 / 账户仓库 sibling：`../monoui`（`gitmono-dev/monoui`），
+分支 **`monoengine`**，会话契约基线 revision：**`58ef280`**（含内部产品邮件
+API WE-02..WE-05，自 `genedna/website@2af89c8` 移植；IT 账户库 PG；Dockerfile 复制
+`drizzle.config.ts`）。IT Postgres schema 初始化要求 monoui
 `apps/next-app/Dockerfile` 在 builder 阶段复制根目录 `drizzle.config.ts`（供
 `website-db-init` 执行 `drizzle-kit push`）。CI `actions/checkout` `ref` 与本文
 pin 须同步到**同一 commit SHA**；Dockerfile 内容守卫（缺 `drizzle.config.ts`
@@ -17,8 +25,8 @@ COPY 则失败）保留为回归保护。契约漂移时先改本文再改代码
 
 ## 1. 信任路径
 
-浏览器身份**只**信任 website Better Auth。monoengine **不签发** session cookie，
-**不**直连读取 website 的 user/session 表。
+浏览器身份**只**信任 monoui Better Auth。monoengine **不签发** session cookie，
+**不**直连读取 monoui 的 user/session 表。
 
 ```text
 Browser
@@ -128,7 +136,7 @@ website（或显式 `AccessTokenUser`）。
 
 ## 5. Compose 同栈拓扑（ADR-WA-07）
 
-形态对标 Mega demo「前端 + 后端 + 数据面」，资产是 **website `apps/next-app`**，
+形态对标 Mega demo「前端 + 后端 + 数据面」，资产是 **monoui `apps/next-app`**，
 **不是** moon/campsite。
 
 | 项 | 值 |
@@ -137,7 +145,7 @@ website（或显式 `AccessTokenUser`）。
 | 文件 | `docker-compose.test.yml` |
 | 服务名 | `website-next` |
 | Profile | `web`（默认 `up -d --wait` **不**拉起） |
-| Build | context `../website`，dockerfile `apps/next-app/Dockerfile` |
+| Build | context `../monoui`，dockerfile `apps/next-app/Dockerfile` |
 | 网络 | `monoengine-test-network` |
 | 容器端口 | `7001` |
 | 宿主映射 | `127.0.0.1:17001:7001` |
@@ -156,7 +164,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml \
 `monoengine` 不声明对 `website-next` 的 Compose `depends_on`：两个服务分别属于
 `app` / `web` profile；若仅选择 `app`，该跨 profile 依赖会使 Compose 拒绝配置，
 并破坏既有的无 website 的 app smoke。上述联合命令会等待两者健康。需要保证第一次
-会话请求也发生在 website 已就绪后时，按以下顺序启动：
+会话请求也发生在 monoui 已就绪后时，按以下顺序启动：
 
 ```bash
 docker compose -p monoengine-it -f docker-compose.test.yml \
@@ -179,9 +187,9 @@ docker compose -p monoengine-it -f docker-compose.test.yml \
 `website_user_id` 与 get-session 一致；无 cookie → 401。
 
 登记与 CI 入口须同步 [`test-infra.md`](./test-infra.md)（ITW-01）。
-前置：sibling checkout `../website`（与 `../orbit` 同级）；缺失则 ITW blocked。
+前置：sibling checkout `../monoui`（与 `../orbit` 同级）；缺失则 ITW blocked。
 
-与 Mega demo 差异：IdP/前端是 website next-app + Better Auth，无 MySQL campsite；
+与 Mega demo 差异：IdP/前端是 monoui next-app + Better Auth，无 MySQL campsite；
 monoengine 业务库仍为本仓 Postgres。
 
 ---

@@ -248,8 +248,12 @@ docker compose -p monoengine-it -f docker-compose.test.yml \
 curl -fsS http://127.0.0.1:18025/api/v1/messages
 ```
 
-检查 website-next 的测试邮件 provider / SMTP 配置；monoengine 没有 SMTP 配置，也不以
-Mailpit 可用性作为启动或测试门。
+检查 `website-next` 的测试邮件 provider / SMTP 配置；monoengine 没有 SMTP 配置，也不以
+Mailpit 可用性作为启动或测试门。注意 IT 栈默认注入的是 `EMAIL_PROVIDER=test`
+（进程内内存 provider，**不发 SMTP**），因此 WE-06 通过时 Mailpit 里**本就应当为空**；
+要让邮件真正落到 Mailpit，需把 `website-next` 的 `EMAIL_PROVIDER` 改为 `smtp` 并设置
+`SMTP_HOST=mailpit` / `SMTP_PORT=1025`。前端仓库自 2026-08-21 起为
+`gitmono-dev/monoui`（sibling `../monoui`）。
 
 **干净重置**
 

@@ -144,7 +144,7 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 `.github/workflows/config-validation.yml` runs formatting, Clippy, the
 compose-backed integration targets (including `integration_website_auth` and
 `integration_website_mail` under `WEBSITE_IT=1`), and the real website session
-check after checking out the `orbit` and `website` siblings. Product email is
+check after checking out the `orbit` and `monoui` siblings. Product email is
 proven via the website internal API + `EMAIL_PROVIDER=test`; no local SMTP
 dependency is required for monoengine notification paths.
 
