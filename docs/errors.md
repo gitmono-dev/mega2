@@ -7,7 +7,7 @@
 - 所有项目自定义错误类型统一定义在 `src/common/errors/`。
 - 业务代码优先返回 `MegaError` 或领域错误类型，并通过 `From` 自动转换。
 - HTTP 层统一使用 `ApiError` 做状态码和响应体映射。
-- Vault/RustyVault 子系统继续使用 `RvError`，但定义归属移动到 `common::errors`。
+- Vault 子系统继续使用 `RvError`，但它现在是 `libvault` crate 的类型（2026-08-21，`plan-20260820` VLT-02）：`common::errors` 只做 `pub use libvault::errors::RvError` 重导出，不再自带一份定义。
 - 旧的 `crate::api::error`、`crate::vault::errors` 命名空间不再提供兼容 re-export。
 
 ## 当前结构
@@ -17,15 +17,15 @@ src/common/errors/
 ├── mod.rs      # MegaError、MegaResult、BuckError、ProtocolError、GitLFSError、StatusParseError、DiffParseError
 ├── api.rs      # ApiError、map_ceres_error
 ├── policy.rs   # ContextError、SaturnContextError
-└── vault.rs    # RvError、VaultError、VaultResult、CryptoError、SealBoxError、rv_error_* macros
+└── vault.rs    # VaultError、VaultResult（本仓定义）+ RvError（重导出 libvault::errors::RvError）
 ```
 
 对外推荐导入路径：
 
 ```rust
 use crate::common::errors::{
-    ApiError, BuckError, ContextError, CryptoError, DiffParseError, GitLFSError, MegaError,
-    MegaResult, ProtocolError, RvError, SaturnContextError, SealBoxError, VaultError, VaultResult,
+    ApiError, BuckError, ContextError, DiffParseError, GitLFSError, MegaError, MegaResult,
+    ProtocolError, RvError, SaturnContextError, VaultError, VaultResult,
 };
 ```
 
@@ -37,10 +37,8 @@ use crate::common::errors::{
 | `MegaResult` | CLI/命令执行类返回别名，当前为 `Result<(), MegaError>`。 | `commands/*`、`cli.rs` |
 | `ApiError` | HTTP API 响应错误，负责把 `MegaError`、`anyhow::Error` 或 legacy `[code:xxx]` 文案映射为状态码和响应体。 | `src/api/**` |
 | `ProtocolError` | Git HTTP/SSH 协议层错误，负责协议响应状态和 message。 | `src/contract/git_protocol/*`、server |
-| `RvError` | Vault/RustyVault 子系统错误，保留原有 response status 映射和 PartialEq 行为。 | `src/vault/**`、`src/contract/vault/**` |
+| `RvError` | `libvault` 库自身的错误枚举（重导出，非本仓定义）。response status 映射与 `PartialEq` 行为由上游提供。 | `src/contract/vault/**` |
 | `VaultError` / `VaultResult` | Vault 集成启动、初始化、key 文件、运行时 token 和 API 操作错误。 | `src/contract/vault/integration/**` |
-| `CryptoError` | Vault 工具层加解密、序列化、OpenSSL 与 `RvError` 转换错误。 | `src/vault/utils/crypto.rs` |
-| `SealBoxError` | SealBox 封存、解封、分片、加解密错误。 | `src/vault/utils/seal.rs` |
 | `ContextError` | Cedar policy context 构建、schema、policy、validation 和 JSON 错误。 | `src/contract/policy/context.rs` |
 | `SaturnContextError` | Cedar 授权请求构造和授权拒绝错误。 | `src/contract/policy/context.rs` |
 | `BuckError` | Buck session/upload 业务错误，作为 `MegaError::Buck` 被 `ApiError` 映射为精确 HTTP status。 | Buck service/router |
@@ -56,7 +54,7 @@ use crate::common::errors::{
 use crate::common::errors::{ApiError, MegaError, RvError};
 ```
 
-不要新增 `crate::api::error::*`、`crate::vault::errors::*` 或其他模块级错误 facade。`src/api`、`src/vault`、`src/contract` 只消费公共错误类型，不再承载错误定义。
+不要新增 `crate::api::error::*` 或其他模块级错误 facade。`src/api` 与 `src/contract` 只消费公共错误类型，不再承载错误定义。（顶层 `crate::vault` 已随 vendored 模块一并删除，库错误从 `libvault::errors` 来。）
 
 ## 边界说明
 
@@ -75,7 +73,7 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 1. 先判断是否能复用 `MegaError` 现有变体。
 2. 需要领域语义时，在 `src/common/errors/mod.rs` 中增加领域错误枚举，并通过 `MegaError` 包装。
 3. 需要 HTTP status 时，在 `ApiError` 的 `From` 映射中处理，不要在业务层手写 HTTP 状态。
-4. 需要 Vault 语义时扩展 `RvError`，并同步 `response_status()` 和 `PartialEq`。
+4. 需要 Vault 语义时扩展本仓的 `VaultError`，**不要**扩展 `RvError`——它属于 `libvault` crate，本仓只重导出。只读引导的 `Readonly*` 变体就是这么加的（`plan-20260820` VLT-02/VLT-04）。
 5. 不要在 API/router、Vault 工具、contract 或 storage 模块中新增局部 `thiserror::Error` 枚举；局部解析错误也应放入 `common::errors`。
 6. 字符串型 fallback（如 `MegaError::Other` 和 `[code:xxx]`）只能用于兼容或过渡，新逻辑优先使用结构化变体。
 

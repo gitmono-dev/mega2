@@ -248,6 +248,45 @@ vendored 已删除。`src/vault/` 的 82 个 `.rs`（连同 `README.md` 与三�
 | 只读 post-unseal 本身 | 私有的 `Core::post_unseal` | 十二条 UN-31 用例 + 逐字节快照；升级 `libvault` 时按本节与「VLT-S1」节复核 |
 | 只读 auth init 的顺序（先装 token store，后注册 policy 的 auth handler） | `AuthModule::set_auth_handlers` 对 token store 无条件 `unwrap()` | 顺序颠倒会让 `un31_a_readonly_open_reads_what_the_writable_one_stored` 直接 panic |
 
+### 发布节点：v0.2.68（REL-VLT-RO，2026-08-21）
+
+`plan-20260820` 的家族发布点。一次推送同时带上「删除 vendored」与「只读重建」——两者不可分割：中间任一状态单独上线，要么让只读审计失效，要么让 `crate::vault` 与 `libvault` 双存的语义含混。
+
+**兼容性证据：无对外 API / schema 变更。**
+
+| 面 | 结论 |
+| --- | --- |
+| HTTP API / OpenAPI | 无变化。唯一触及的 handler 是 `enforce_lfs_access` 的**内部**返回类型（`Result<(), Response<Body>>` → `Result<(), Box<Response<Body>>>`，FIX-VLT-01），LFS 访问判定与响应字节不变 |
+| CLI | 无新增/改名/删除子命令 |
+| DB schema / migration | 无变化；`vault` 表、`core_key.json` 格式、seal 配置（10/5）、`secret/` 挂载路径均未触碰 |
+| 错误契约 | `MegaError` 变体未变。`VaultError` 新增 `ReadonlyStateIncomplete { detail }` / `ReadonlyUnavailable` / `ReadonlyOpen`（只读引导内部条件，经 `MegaError::Other` 呈现，无状态码映射变化）；`RvError` 由本地定义改为重导出 `libvault::errors::RvError`，变体集合以上游为准 |
+| crate surface | `src/lib.rs` 的 `mod vault;` 是**私有**模块，删除不构成对外 surface 变更（G-11 deprecation window 本项不适用） |
+| 配置项 | 无变化 |
+
+**聚合守卫（发布前全绿）**
+
+| 守卫 | 结果 |
+| --- | --- |
+| `rg 'crate::vault' src bin` | 零命中 |
+| `rg 'ignore = "VLT-04"' src/contract/vault src/context bin/tests` | 零命中 |
+| 防回流 `rg 'fn new_readonly\|fn load_readonly\|fn load_auth_readonly\|fn restore_readonly\|lease_checker_started' src/contract src/common src/context bin --glob '!**/config/**'` | 零命中 |
+| `rg 'start_check_expired_lease_entries' src bin` | 零命中（AC5 的等价关系加固） |
+| `un31_` 用例数 / 结果 | 12 / 12 passed / 0 ignored |
+| `un43_` 用例数 / 结果 | 4 / 4 passed |
+| `fix04_list` | 4 passed |
+| 三门 + `cargo build` / `build --tests` | 全绿（stable 1.98.0 / nightly rustfmt） |
+| 全量 `cargo test --all` | 973 passed / 1 ignored，与迁移前基线逐项一致 |
+
+发布门期间观察到一处**与本次改动无关**的既有不稳定：`bin/tests/**` 的 docker git runner 在 `cargo test --all` 的并行模式下偶发失败（两次分别命中 `integration_git_cli_http_round_trip` / `integration_git_ssh_authz_grant_immediate_effect`，均停在 `assert_git_success`）。同一目标按 `plan-template.md` 规定的 `-- --test-threads=1` 串行跑全绿（`integration_git_ssh` 串行 126s vs 并行 25s，可见是共享 runner 的争用而非逻辑回归），随后的全量重跑亦全绿。按 ER-10 作瞬时错误处理（3 次尝试内收敛），不改本次发布结论；若后续复现，应作为 test-infra 独立小卡承接。
+
+**执行期发现（已记入计划修订历史）**
+
+1. `EX-03`：libra 的提交签名要求 vault unseal key 可用，本环境不可用，本计划全部会推送的卡按 sign-off-only 提交（具名批准 = 计划所有者）。
+2. `FIX-VLT-01`：D 组 clippy 在 CI 的 stable **1.98.0** 上有两条错误，本地 1.97.1 不触发——一条在 vendored `pki/util.rs`（随 VLT-02 删除自动消失），一条在本仓自有 `src/api/router/lfs_router.rs`。后者按 ER-10 另立卡并入本家族。该红在本计划开工前就存在（上一次 push 同一步骤已 failure），本次发布一并关闭。
+3. 事实基线低估：vendored↔上游另有两处**非只读**功能性分歧（`policy_store.rs` 的 ACL 持久回落、`token_store.rs` 的明文 token debug 日志），处置见「VLT-S1」节与 `DEFER-VLT-04`。
+
+**降级指引（`immutable-release`）**：已推送提交不回退。只读引导若在生产暴露缺陷，降级方式是**不使用只读入口**（`authz-audit` 等只读运维路径），常规读写路径不受影响——它走 `VaultCore::config`，与本次改动的只读分支无交集；缺陷按 ER-10 前滚修复。
+
 ## 当前实现概览
 
 `vault` 模块位于 `src/contract/vault/`，核心集成代码在 `src/contract/vault/integration/`：

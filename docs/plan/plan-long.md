@@ -43,7 +43,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | `jupiter-migrate` | sea-orm 迁移 | 已移植 | `src/jupiter/migration/` | 同名目录结构 |
 | `common` | config、enums、errors、utils | 已移植（config 大幅扩展） | `src/common/`；`common/config` 提升为一级 `src/config/` | `docs/refactoring/config.md` |
 | `saturn` | Cedar 策略/授权 | 已移植 | `src/contract/policy/`（并吸入 mono 的 `api/guard/`） | `docs/refactoring/contract.md` |
-| `vault` | RustyVault 集成 | 已移植（加固：目标 = crates.io `libvault` 0.3.0 + 集成层；现状过渡态仍为 vendored `src/vault/`，由 [`plan-20260820.md`](plan-20260820.md) 迁移） | 现状 `src/vault/` + `src/contract/vault/`；目标 `libvault` crate + `src/contract/vault/` | `docs/refactoring/vault.md`；ADR-VLT-01 |
+| `vault` | RustyVault 集成 | 已移植 + 已加固：形态为 crates.io `libvault` 0.3.0 + 集成层（vendored `src/vault/` 于 2026-08-21 删除，见 [`plan-20260820.md`](plan-20260820.md)） | `libvault` crate + `src/contract/vault/` | `docs/refactoring/vault.md`；ADR-VLT-01 |
 | `api-model` | API DTO | 已移植 | `src/contract/api/` | `docs/refactoring/contract.md` |
 | `io-orbit` | 对象存储 | 已移植（拆分为独立 crate） | sibling `../orbit` + `orbit-api`，经 `src/jupiter/storage/object_storage.rs` 注入 | `docs/refactoring/orbit.md` |
 | `clients/orion-client` | orion-server HTTP 客户端 | 部分移植 | `src/bellatrix/`（仅 build dispatch 路径） | 完整 API 面未核对（PT-08） |
@@ -90,7 +90,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | callisto 实体 + jupiter storage/migration/redis | 已从 Mega 移植并持续对齐（最后同步基于 Mega #2129） | 所有 PT 的数据层基础 |
 | `src/config/` 一级配置体系 | LoadMode、SecretRef/resolver、`config` 命令族、集中校验、Profile、测试分层、受控热加载已交付；对象存储与 Redis 凭据均已支持 post-vault `SecretRef`（`docs/refactoring/config.md`、`vault.md`） | PT-10 的起点；所有服务的配置承载 |
 | `src/contract/` 边界归并 | api/git_protocol/policy/vault 四域归并完成，旧路径无兼容层（`docs/refactoring/contract.md`） | 新移植模块的落点规范 |
-| Vault（目标：`libvault` 0.3.0 crate + 集成层；现状过渡：vendored `src/vault/`） | A–J 阶段可交付子集完成：fail-closed、DB-only bootstrap、root token 退役、unseal share rekey、backup/restore、可配置 file audit sink 和 fail-closed 审计策略（`docs/refactoring/vault.md`）；依赖形态由 vendored 迁回 crates.io `libvault` 见 [`plan-20260820.md`](plan-20260820.md) | PT-11 的起点；凭据类 PT 的前置 |
+| Vault（crates.io `libvault` 0.3.0 crate + 集成层） | A–J 阶段可交付子集完成：fail-closed、DB-only bootstrap、root token 退役、unseal share rekey、backup/restore、可配置 file audit sink 和 fail-closed 审计策略（`docs/refactoring/vault.md`）；依赖形态已由 vendored 迁回 crates.io `libvault`，UN-31 只读引导在集成层重建（[`plan-20260820.md`](plan-20260820.md)） | PT-11 的起点；凭据类 PT 的前置 |
 | `src/notification/`（邮件投递在 website） | in-app / Slack / generic webhook 编排已交付，渠道凭据经 SecretRef；本仓 SMTP/`[mail]`/`email_jobs` 已移除，产品邮件经 website 内部 API（ADR-WA-08；`docs/refactoring/website-mail.md`） | PT-09 的起点 |
 | orbit 对象存储（provider 注入） | core 只依赖 `orbit-api`，重量级 SDK 仅留在 bin 编译图（`docs/refactoring/orbit.md`） | LFS/artifact/构建产物的存储承载 |
 | Git smart HTTP/SSH 协议 | `info/refs` 严格化、fallible pkt-line parser、SSH exec parser、per-channel state、认证上下文、delete-only receive-pack、capability truth table、HTTP LFS 边界与首批真实 CLI smoke 已交付；HTTP/SSH 仍完整缓冲请求/通道（`docs/refactoring/protocol.md`） | PT-03/PT-04 的起点 |
@@ -111,7 +111,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-08 | Orion Scheduler、VM 弹性调度与客户端 API 面补齐 | P2 | 已验证 | scheduler 与 orion-scheduler-client 未移植；bellatrix 仅覆盖 build dispatch，完整 OrionBuildClient API 面未核对 | `mega/orion-scheduler/`、`mega/clients/` | 无 | 2026-07-27 |
 | PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓邮件投递已移除**；**website 内部产品邮件 API、Slack 与 generic webhook 均已落地**，渠道凭据经 SecretRef；compose `mailpit` 消费方 = website IT。剩余：build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真实多进程/多实例黑盒矩阵 | `mega/mono/src/notification/`、campsite slack 参考 | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06）；[`plan-20260802.md`](plan-20260802.md)（WE-* / DEP-06） | 2026-08-03 |
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储与 Redis SecretRef、`[oauth]`、跨 source/profile diagnostics 和首批热加载黑盒均已落地；剩余为真实消费者订阅清单、跨 await 生命周期审计与持续扩展，而非启动顺序改造 | `mega/common/src/config`（基线对照） | [`plan-20260731.md`](plan-20260731.md)（AU-02；`[oauth]`） | 2026-08-03 |
-| PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + 只读模式集成层重建）由 [`plan-20260820.md`](plan-20260820.md) 承接，不改变本 PT 安全收尾缺口 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-20 |
+| PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + UN-31 只读模式集成层重建）已由 [`plan-20260820.md`](plan-20260820.md) 于 2026-08-21 交付，本 PT 安全收尾缺口不变 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-21 |
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；website `monoengine` 分支 pin 须执行期确认；全量对照仍候选 | website `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
 
 ## 工程安全基线
@@ -568,8 +568,8 @@ Vault 集成层 A–J 阶段可交付子集已完成：file 持久化 audit sink
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/vault/` 为移植基线对照（monoengine 已在集成层加固，超出 Mega）。
-- **monoengine 现状证据**：过渡态仍为 `src/vault/`（vendored）+ `src/contract/vault/integration/vault_core.rs`；目标形态为 crates.io `libvault` 0.3.0 + 同一集成层（[`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）。`docs/refactoring/vault.md` 已复核；`tracing`/`file` sink、`fail_closed`、backup/restore 和 unseal rekey 已交付。只读审计语义（UN-31）在迁移后须保留于集成层，不得弱化。
-- **最小可验证第一阶段**：格式版本策略（低风险、纯工程）；KEK 轮换需专项设计后承接。依赖形态迁移与 PT-11 安全收尾切片可并行；若 go 路径落地，PT-11 触及 seal/core 的卡须在 VLT-02/VLT-04 后按新路径刷新锚点；若 no-go（DEFER-VLT-01），锚点仍以 `src/vault/` 为准直至后续计划 revisit。
+- **monoengine 现状证据**：形态为 crates.io `libvault` 0.3.0 + `src/contract/vault/integration/vault_core.rs`（vendored `src/vault/` 已于 2026-08-21 删除，[`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）。`docs/refactoring/vault.md` 已复核；`tracing`/`file` sink、`fail_closed`、backup/restore 和 unseal rekey 已交付。只读审计语义（UN-31）在迁移后须保留于集成层，不得弱化。
+- **最小可验证第一阶段**：格式版本策略（低风险、纯工程）；KEK 轮换需专项设计后承接。依赖形态迁移已走 go 路径落地，因此 PT-11 触及 seal/core 的卡一律按 `libvault` crate + `src/contract/vault/` 刷新锚点，不再引用 `src/vault/`。
 - **风险与边界**：KEK 轮换触碰 seal 核心，必须配恢复手册与故障注入，不得赶工；不得为对齐 Mega 目录而回流 vendored fork（原则 2）。
 
 ### 依赖与顺序
@@ -624,7 +624,7 @@ monoengine 的后端能力（CL、issue、评审、通知、构建等）必须�
 
 ### 当前执行任务：[`plan-20260820.md`](plan-20260820.md)（Vault vendored → `libvault` 0.3.0）
 
-`plan-20260803.md` / `plan-20260812.md` 已完成。当前日期计划为 Vault 依赖形态迁移（方案 B：`libvault = "0.3.0"` 替换 `src/vault/` vendored；UN-31 只读语义迁到集成层）。PT-01 全部非延后卡已完成；PT-04 剩余 `DEFER-GM-01..05` 为 follow-up；`plan-20260812` 授权闭环已收口。长期仍按优先级推进 PT-02 逐提交归类；orion 三件套仍是最大整体缺口，但实施前须先完成 PT-05 的通信形态决策。
+`plan-20260803.md` / `plan-20260812.md` 已完成。`plan-20260820.md`（方案 B：`libvault = "0.3.0"` 替换 `src/vault/` vendored；UN-31 只读语义迁到集成层）已于 2026-08-21 完成。PT-01 全部非延后卡已完成；PT-04 剩余 `DEFER-GM-01..05` 为 follow-up；`plan-20260812` 授权闭环已收口。长期仍按优先级推进 PT-02 逐提交归类；orion 三件套仍是最大整体缺口，但实施前须先完成 PT-05 的通信形态决策。
 
 ### 阶段零：工程安全基线
 
@@ -753,7 +753,7 @@ flowchart TD
 | [`plan-20260802.md`](plan-20260802.md) | PT-09（切片） | 已完成 | Website 内部产品邮件 API 与 monoengine client 契约，关闭 DEP-06；不覆盖本仓非邮件通知的多实例语义或 PT-12 全量对照 |
 | [`plan-20260803.md`](plan-20260803.md) | PT-04 | 已完成 | Git 使用场景测试补全：HTTP `pull`、匿名读关闭、HTTP LFS、cargo-native SSH、Mega 夹具 go/no-go（NO-GO 转 `DEFER-GM-03`）及 CI 归属均已交付（GM-12 发布于 v0.2.11，完成度复审收口于 v0.2.15）；不改 Git protocol 产品实现，补测发现的缺陷转 PT-03。不覆盖 ImportRepo 全命令矩阵、pure SSH LFS、Mega 大夹具移植、shell SSH 广度 CI、missing-repo 探针（`DEFER-GM-01..05`，PT-04 follow-up） |
 | [`plan-20260812.md`](plan-20260812.md) | PT-03 / PT-12（切片） | 已完成 | 用户体系统一：website 认证 × monoengine 授权；Cedar 三态、push 门、merge 面鉴权、只读审计（UN-31/UN-43）等；收口 v0.2.66。不覆盖身份键全量迁移（handoff PT-12） |
-| [`plan-20260820.md`](plan-20260820.md) | PT-11（依赖形态切片） | **规划中** | vendored → `libvault` 0.3.0；VLT-00/01/S1/S2 + `REL-VLT-RO`（VLT-02→04→**VLT-05 release**）；VLT-S1 go/no-go 门禁（ADR-VLT-02）；no-go 经 VLT-S2 落库；UN-31 八 AC 等价；FIX-04/un31 测迁。no-go 则 DEFER-VLT-01 保留 vendored |
+| [`plan-20260820.md`](plan-20260820.md) | PT-11（依赖形态切片） | **已完成（2026-08-21）** | vendored → `libvault` 0.3.0 已落地；VLT-S1 判定 **go**（shadow-unseal），VLT-S2 与 DEFER-VLT-01 未触发；`REL-VLT-RO`（VLT-02→04→FIX-VLT-01→**VLT-05 release**）；UN-31 八 AC 在集成层等价重建，十二条 `un31_` 与四条 `un43_` 全绿；FIX-04/un31 已迁至 `src/contract/vault/integration/` |
 
 ## 已替代 / 不采纳 / 已实现摘要
 
