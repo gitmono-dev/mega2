@@ -315,7 +315,7 @@
   - mounts monitor **不创建**，无论配置的 interval 是多少：它是一个会在审计读取期间重载并可能重新挂载的后台线程。
 - **最终保险**：`ReadonlyBackend`（已迁至 `src/contract/vault/integration/readonly_backend.rs`）包住物理 backend，`put`/`delete` 一律硬失败并计数。它是最后一道而不是第一道——上面每条路径都能被 review、也都可能漂移，这一层则没有通往被包 backend 的路径。**拒绝必须是错误，不能是静默 no-op**：被吞掉的写会让调用方以为状态已持久化。错误标识分两层：具名层用 `VaultError::ReadonlyWriteDenied`（写发生**之前**就拒绝），保险层回到库只有 `RvError` 一条通道，选定的唯一变体是 `RvError::ErrString(READONLY_WRITE_DENIED)`。`VaultCore::denied_writes()` 暴露计数，正常只读运行应当为 0；非 0 意味着上层仍有人尝试写、只是被这层拦住了。
 
-**当前状态（VLT-02 中间态）**：`VaultCore::open_readonly` 与库级 `open_readonly_core` 均为**具名 fail-closed 桩**（`VaultError::ReadonlyUnavailable`），不回退到可写路径——回退会修补掉只读打开正要保全的那份状态。迁至 `src/contract/vault/integration/un31_readonly.rs` 的十二个用例连同 `un43_a_needed_vault_is_opened_read_only_and_unchanged`、`integration_readonly_assembly_changes_nothing` 一并 `#[ignore = "VLT-04"]`（**保留不删**），由 VLT-04 换回真实实现并解除。
+**当前状态（VLT-04 已完成）**：`VaultCore::open_readonly` 与库级 `open_readonly_core` / `readonly_unseal` 已是真实实现——集成层自行驱动 barrier 解封与只读版 post-unseal，`docs/refactoring/vault.md` 的「VLT-04」节有逐条 AC 对照与上游私有面镜像清单。全部 `#[ignore = "VLT-04"]` 已解除，十二条 `un31_` 与四条 `un43_` 全绿。
 
 测试**成对**写：可写侧证明该修补对这份 storage 确实会发生，只读侧证明它没发生。单侧断言在一个「本来就没什么可修」的 fixture 上同样会通过。后台线程是**直接断言**（`mounts_monitor.load().is_none()`、`AuthModule.expiration.load().is_none()`），不是从「没观察到副作用」倒推——后者只是和 200ms tick 赛跑。
 

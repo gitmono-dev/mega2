@@ -230,7 +230,6 @@ async fn un43_the_read_only_assembly_seeds_nothing() {
 /// Both faces are checked — the stored rows and the key file on disk — because
 /// the bootstrap path this must not take writes to each of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[ignore = "VLT-04"]
 async fn un43_a_needed_vault_is_opened_read_only_and_unchanged() {
     ensure_object_storage_provider();
     let temp = tempfile::tempdir().expect("temp dir");

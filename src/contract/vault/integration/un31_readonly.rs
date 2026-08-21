@@ -179,18 +179,25 @@ async fn open_readonly(
 
 /// Whether this vault's auth module has an expiration manager installed.
 ///
-/// The vendored library carried a direct "has the expired-lease checker
-/// started?" query on its `ExpirationManager`; `libvault` has no such thing, and
-/// the checker thread it starts is detached with no handle to ask. VLT-04
-/// replaces this with the public
-/// observation the spike settled on — `AuthModule.expiration` is written by
-/// `AuthModule::init` and by nothing else, and `AuthModule::init` is the only
-/// caller of `start_check_expired_lease_entries`, so an empty slot *is* the
-/// statement that the worker never started.
+/// This is how "the expired-lease worker never started" is asserted directly
+/// rather than inferred. The vendored library carried a flag on its
+/// `ExpirationManager` recording whether the checker had been started;
+/// `libvault` has no such thing, and the thread it spawns is detached with no
+/// handle to ask. What the library does have is `AuthModule::init` — the only
+/// place that starts the worker, the only place that fills this slot, and
+/// nothing else in the library reads it. So an empty slot *is* the statement
+/// that the worker never started, and it is observable on the public API.
 ///
-/// Until then it refuses by name rather than guessing.
-fn expiration_installed(_vault: &RustyVault) -> VaultResult<bool> {
-    Err(VaultError::ReadonlyUnavailable)
+/// Inferring it from "no revocation was observed" would only ever be a race
+/// with the 200ms tick.
+fn expiration_installed(vault: &RustyVault) -> VaultResult<bool> {
+    let core = vault.core.load();
+    let auth = core.module_manager.get_module::<AuthModule>("auth").ok_or(
+        VaultError::ReadonlyStateIncomplete {
+            detail: "auth module",
+        },
+    )?;
+    Ok(auth.expiration.load().is_some())
 }
 
 /// Every fail-closed path below refuses with the same named condition: the
@@ -216,7 +223,6 @@ fn secret_data(value: &str) -> Option<Map<String, Value>> {
 /// Refusing to write is only useful if reading still works; without this the
 /// rest of the suite would be satisfied by a mode that fails at everything.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_a_readonly_open_reads_what_the_writable_one_stored() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -272,7 +278,6 @@ async fn un31_a_readonly_open_reads_what_the_writable_one_stored() {
 /// performs — mount table, auth mount, default policies, token salt — would
 /// show up here as a changed or added key.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_a_readonly_open_persists_nothing() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -308,7 +313,6 @@ async fn un31_a_readonly_open_persists_nothing() {
 /// than inferred from the absence of an effect, which would only ever be a race
 /// with their tick.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_a_readonly_open_starts_no_background_worker() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -321,8 +325,8 @@ async fn un31_a_readonly_open_starts_no_background_worker() {
     );
     assert!(
         expiration_installed(&writable).expect("observe the control"),
-        "the control must have gone through AuthModule::init, the only caller \
-         of start_check_expired_lease_entries"
+        "the control must have gone through AuthModule::init, which is the one \
+         place that starts the expired-lease checker"
     );
     drop(writable);
 
@@ -343,7 +347,6 @@ async fn un31_a_readonly_open_starts_no_background_worker() {
 
 /// A missing mount table is reported, not invented.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_a_missing_mount_table_fails_closed() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -376,7 +379,6 @@ async fn un31_a_missing_mount_table_fails_closed() {
 
 /// A mount entry left in an older format is reported, not rewritten.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_an_older_mount_entry_format_fails_closed() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -431,7 +433,6 @@ async fn un31_an_older_mount_entry_format_fails_closed() {
 
 /// A deleted built-in ACL policy is not replanted by a readonly open.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_a_deleted_default_policy_is_not_replanted() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -467,7 +468,6 @@ async fn un31_a_deleted_default_policy_is_not_replanted() {
 /// the point is that the record survives time passing, not that it survives one
 /// scheduling accident.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_an_expired_lease_survives_a_readonly_open() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -526,7 +526,6 @@ async fn un31_an_expired_lease_survives_a_readonly_open() {
 /// is actually wrong. Older format is a state the readonly mode reports, in the
 /// same terms as an older-format mount table.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_an_older_format_lease_fails_closed() {
     let backend = Arc::new(MemoryBackend::default());
     let key = init(backend.clone()).await;
@@ -593,7 +592,6 @@ async fn write_through_barrier(
 /// A denial has to be an error rather than a silent no-op — a swallowed write
 /// leaves the caller believing its state was persisted.
 #[tokio::test]
-#[ignore = "VLT-04"]
 async fn un31_the_readonly_backend_denies_put_and_delete() {
     let inner = Arc::new(MemoryBackend::default());
     inner.raw_put("kept", b"value".to_vec());
@@ -661,7 +659,6 @@ mod vault_core {
     };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[ignore = "VLT-04"]
     async fn un31_open_readonly_reads_secrets_and_refuses_writes() {
         let temp = tempfile::tempdir().expect("temp dir");
         let connection = Arc::new(test_db_connection(temp.path()).await);
@@ -732,7 +729,6 @@ mod vault_core {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[ignore = "VLT-04"]
     async fn un31_open_readonly_reports_an_uninitialized_vault_instead_of_initializing_it() {
         let temp = tempfile::tempdir().expect("temp dir");
         let connection = Arc::new(test_db_connection(temp.path()).await);
@@ -773,7 +769,6 @@ mod vault_core {
     /// with an incomplete token set would mean reading secrets under a
     /// credential that does not cover them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[ignore = "VLT-04"]
     async fn un31_open_readonly_reports_incomplete_runtime_credentials() {
         let temp = tempfile::tempdir().expect("temp dir");
         let connection = Arc::new(test_db_connection(temp.path()).await);

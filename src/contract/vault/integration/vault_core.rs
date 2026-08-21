@@ -2,10 +2,26 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use async_trait::async_trait;
-use libvault::{RustyVault, logical::Response, storage::Backend};
+use libvault::{
+    RustyVault,
+    config::{Config, MountEntryHMACLevel},
+    core::{Core, CoreState},
+    errors::RvError,
+    handler::{AuthHandler, Handler},
+    logical::{Auth, Backend as LogicalBackend, Response, SecretData},
+    modules::{
+        auth::{AuthModule, ExpirationManager, TokenStore},
+        policy::{PolicyModule, PolicyStore},
+    },
+    mount::{MountTable, SYSTEM_BARRIER_PREFIX},
+    shamir::ShamirSecret,
+    storage::{Backend, Storage as BarrierStorage, barrier_view::BarrierView},
+    utils::deserialize_system_time,
+};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -106,29 +122,371 @@ impl RuntimeTokens {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Readonly bootstrap (UN-31)
+// ---------------------------------------------------------------------------
+//
+// `RustyVault::unseal` routes through the crate-private `Core::post_unseal`,
+// which — before the caller can read a single secret — plants the default mount
+// table when it is absent, rewrites entries left in an older format, repairs the
+// auth mount, writes the built-in ACL policies, mints a token salt, and starts a
+// thread that revokes expired leases and deletes their records.
+//
+// None of that can be turned off from outside, so this does not try to: it
+// drives the barrier and its own readonly counterpart of `post_unseal`
+// directly, and simply never asks for the repairs. The library needs no fork
+// for this — `Core`'s fields, the barrier trait, `MountTable::load`,
+// `ShamirSecret::combine` and the module handles are all public, and only
+// `AuthModule` and `PolicyModule` override `Module::init` at all, so the
+// readonly variant of "init every module" is those two rebuilt and nothing
+// else. The full public-API inventory, the upstream anchors it rests on, and
+// the known fragile points are in `docs/refactoring/vault.md` ("VLT-S1").
+
+/// Where the token salt lives, relative to the system barrier view.
+///
+/// Upstream keeps these as private constants in `modules/auth/token_store.rs`,
+/// so they are mirrored rather than imported. The pairing is load-bearing: the
+/// salt has to be checked *before* `TokenStore::new` runs, because that is what
+/// mints one when it is missing. `un31_a_missing_token_salt_fails_closed` keeps
+/// the mirror honest — it deletes the salt at this exact path and requires the
+/// writable control to mint it back, so a path change upstream turns the
+/// control red rather than passing silently.
+const TOKEN_SUB_PATH: &str = "token/";
+const TOKEN_SALT_LOCATION: &str = "salt";
+
+fn readonly_open(error: RvError) -> VaultError {
+    VaultError::ReadonlyOpen(error.to_string())
+}
+
+/// The serde shape of the library's own lease entry.
+///
+/// Used only to answer "would restoring this record have had to rewrite it?".
+/// The library's restore path converts an older-format entry and writes the
+/// converted one back; under a readonly open that write would be caught by the
+/// backstop and the caller would be told "write denied" rather than what is
+/// actually wrong. `LeaseEntry` is private upstream, so this mirrors its fields
+/// — `data` being a required object is the discriminator, and the timestamps go
+/// through the library's own deserializer so the two cannot drift apart in how
+/// they read a time.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct StoredLease {
+    #[serde(default)]
+    lease_id: String,
+    client_token: String,
+    path: String,
+    data: Map<String, Value>,
+    secret: Option<SecretData>,
+    auth: Option<Auth>,
+    #[serde(deserialize_with = "deserialize_system_time")]
+    issue_time: SystemTime,
+    #[serde(deserialize_with = "deserialize_system_time")]
+    expire_time: SystemTime,
+    #[serde(default)]
+    revoke_err: String,
+}
+
+/// Build a sealed vault over `backend` that can never start the mounts monitor.
+///
+/// The monitor reloads mount tables on a timer and can re-mount while an audit
+/// is mid-read, so whether it exists is a decision of the mode rather than of
+/// the caller's configuration — the interval is forced to zero here even when
+/// the caller asked for one.
+pub(crate) fn readonly_vault(
+    backend: Arc<dyn Backend>,
+    config: Option<&Config>,
+) -> VaultResult<RustyVault> {
+    let mut config = config.cloned().unwrap_or_default();
+    config.mounts_monitor_interval = 0;
+    RustyVault::new(backend, Some(&config)).map_err(|e| VaultError::RustyVaultCreate(e.to_string()))
+}
+
+/// Unseal `rvault` and bring it up read-only.
+///
+/// `keys` must hold at least the configured threshold of unseal shares; the
+/// first `threshold` of them are combined here rather than fed one at a time to
+/// `Core::unseal`, which is the call that would run the repairing post-unseal.
+pub(crate) async fn readonly_unseal(rvault: &RustyVault, keys: &[&[u8]]) -> VaultResult<()> {
+    let core = rvault.core.load_full();
+
+    if !core
+        .barrier
+        .inited()
+        .await
+        .map_err(|e| VaultError::InitializationState(e.to_string()))?
+    {
+        return Err(VaultError::ReadonlyNotInitialized);
+    }
+
+    let seal_config = core.seal_config().await.map_err(readonly_open)?;
+    let threshold = seal_config.secret_threshold as usize;
+    if keys.len() < threshold {
+        return Err(VaultError::CoreKeyTooFewShares {
+            expected: threshold,
+            actual: keys.len(),
+        });
+    }
+    let shares: Vec<Vec<u8>> = keys
+        .iter()
+        .take(threshold)
+        .map(|key| key.to_vec())
+        .collect();
+
+    // Retired shares are refused here exactly as the ordinary unseal refuses
+    // them. Reading through a share someone rotated away is not a readonly
+    // concession worth making.
+    if let Ok(deprecated) = core.deprecated_unseal_keys_set().await
+        && shares.iter().any(|share| deprecated.contains(share))
+    {
+        return Err(VaultError::Unseal(
+            "an unseal key share has been deprecated".to_string(),
+        ));
+    }
+
+    let kek = if threshold <= 1 {
+        shares
+            .first()
+            .cloned()
+            .ok_or_else(|| VaultError::Unseal("no unseal key share was supplied".to_string()))?
+    } else {
+        ShamirSecret::combine(shares).ok_or_else(|| {
+            VaultError::Unseal("not enough valid key shares to unseal vault".to_string())
+        })?
+    };
+
+    core.barrier
+        .unseal(&kek)
+        .await
+        .map_err(|e| VaultError::Unseal(e.to_string()))?;
+
+    // The state the ordinary unseal installs, minus the key material a readonly
+    // handle has no use for: `kek` and the accumulated shares are private and
+    // feed only `generate_unseal_keys`, which is a write path.
+    let mut state = CoreState::default();
+    state.hmac_key = core.barrier.derive_hmac_key().map_err(readonly_open)?;
+    state.system_view = Some(Arc::new(BarrierView::new(
+        core.barrier.clone(),
+        SYSTEM_BARRIER_PREFIX,
+    )));
+    state.sealed = false;
+    core.state.store(Arc::new(state));
+
+    readonly_post_unseal(&core).await
+}
+
 /// Open an already-initialized vault over `backend` without changing it.
 ///
-/// This is the library-level half of [`VaultCore::open_readonly`]: it takes the
-/// vault from sealed to serving reads while performing none of the repairs the
-/// ordinary unseal performs on the way. It is separate from `VaultCore` so the
+/// The library-level half of [`VaultCore::open_readonly`], kept separate so the
 /// UN-31 suite can drive it over an in-memory backend, where a repair that did
 /// happen is visible as a changed byte.
-///
-/// # Not built yet (VLT-02 → VLT-04)
-///
-/// `libvault::RustyVault::unseal` routes through the crate-private
-/// `Core::post_unseal`, which unconditionally defaults and persists the mount
-/// table, repairs the auth mount, plants the built-in ACL policies, mints a
-/// token salt, and starts the expired-lease worker. VLT-04 replaces this stub
-/// with the shadow-unseal sequence recorded in `docs/refactoring/vault.md`,
-/// which drives the barrier and a readonly post-unseal from here and so never
-/// asks for any of that.
 pub(crate) async fn open_readonly_core(
-    _backend: Arc<dyn Backend>,
-    _config: Option<&libvault::config::Config>,
-    _keys: &[&[u8]],
+    backend: Arc<dyn Backend>,
+    config: Option<&Config>,
+    keys: &[&[u8]],
 ) -> VaultResult<RustyVault> {
-    Err(VaultError::ReadonlyUnavailable)
+    let rvault = readonly_vault(backend, config)?;
+    readonly_unseal(&rvault, keys).await?;
+    Ok(rvault)
+}
+
+/// The readonly counterpart of the crate-private `Core::post_unseal`.
+async fn readonly_post_unseal(core: &Arc<Core>) -> VaultResult<()> {
+    // Registration only: every module's `setup` adds backends and handlers and
+    // writes nothing.
+    core.module_manager.setup(core).map_err(readonly_open)?;
+
+    let hmac_key = core.state.load().hmac_key.clone();
+
+    load_mount_table_readonly(
+        &core.mounts_router.mounts,
+        core.barrier.as_storage(),
+        Some(&hmac_key),
+        core.mount_entry_hmac_level,
+        "core mount table",
+    )
+    .await?;
+
+    core.mounts_router
+        .setup(core.clone())
+        .map_err(readonly_open)?;
+
+    // Auth first, and not by preference: `Core::add_auth_handler` reaches into
+    // the auth module and unwraps its token store, so the policy module's
+    // handler registration below would panic if this had not run yet.
+    let auth = core.module_manager.get_module::<AuthModule>("auth").ok_or(
+        VaultError::ReadonlyStateIncomplete {
+            detail: "auth module",
+        },
+    )?;
+    readonly_init_auth(&auth, core).await?;
+
+    let policy = core
+        .module_manager
+        .get_module::<PolicyModule>("policy")
+        .ok_or(VaultError::ReadonlyStateIncomplete {
+            detail: "policy module",
+        })?;
+    // `PolicyModule::init` would go on to call `setup_policy`, which plants the
+    // built-in ACL policies when they are absent and rewrites the immutable
+    // ones when their text has drifted — this process editing the very policy
+    // set it was opened to read.
+    let policy_store = PolicyStore::new(core).await.map_err(readonly_open)?;
+    policy.policy_store.store(policy_store.clone());
+    core.add_auth_handler(policy_store as Arc<dyn AuthHandler>)
+        .map_err(readonly_open)?;
+
+    Ok(())
+}
+
+/// `AuthModule::init`, minus every repair and minus the checker thread.
+// The auth-backend factory's signature is fixed by `LogicalBackendNewFunc`, so
+// its `Result<_, RvError>` cannot be boxed here; `RvError` is a large enum and
+// upstream allows this same lint crate-wide for that reason.
+#[allow(clippy::result_large_err)]
+async fn readonly_init_auth(auth: &Arc<AuthModule>, core: &Arc<Core>) -> VaultResult<()> {
+    let hmac_key = core.state.load().hmac_key.clone();
+
+    // An initialized vault already has a token salt. `TokenStore::new` mints one
+    // when it is missing, so the check has to happen first: minting would both
+    // write and silently change how every token in that vault hashes, and
+    // letting the backstop catch it would report "write denied" instead of the
+    // actual condition.
+    let system_view =
+        core.state
+            .load()
+            .system_view
+            .clone()
+            .ok_or(VaultError::ReadonlyStateIncomplete {
+                detail: "system view",
+            })?;
+    let token_view = system_view.new_sub_view(TOKEN_SUB_PATH);
+    let salt_present = token_view
+        .get(TOKEN_SALT_LOCATION)
+        .await
+        .map_err(readonly_open)?
+        .is_some_and(|entry| !entry.value.is_empty());
+    if !salt_present {
+        return Err(VaultError::ReadonlyStateIncomplete {
+            detail: "token salt",
+        });
+    }
+
+    let expiration = ExpirationManager::new(core).map_err(readonly_open)?.wrap();
+    let token_store = TokenStore::new(core, expiration.clone())
+        .await
+        .map_err(readonly_open)?
+        .wrap();
+    expiration
+        .set_token_store(&token_store)
+        .map_err(readonly_open)?;
+
+    // `auth.expiration` is deliberately left empty. `AuthModule::init` is the
+    // only place that starts the expired-lease worker, and also the only place
+    // that fills this slot, and nothing else in the library reads it — so an
+    // empty slot is a direct, public statement that the worker never started,
+    // rather than an inference from not having observed a revocation. That
+    // inference would only ever be a race with the 200ms tick.
+    auth.token_store.store(Some(token_store.clone()));
+
+    let backend_token_store = token_store.clone();
+    auth.add_auth_backend(
+        "token",
+        Arc::new(
+            move |_core: Arc<Core>| -> Result<Arc<dyn LogicalBackend>, RvError> {
+                let mut backend = backend_token_store.new_backend();
+                backend.init()?;
+                Ok(Arc::new(backend))
+            },
+        ),
+    )
+    .map_err(readonly_open)?;
+
+    load_mount_table_readonly(
+        &auth.mounts_router.mounts,
+        auth.barrier.as_storage(),
+        Some(&hmac_key),
+        core.mount_entry_hmac_level,
+        "auth mount table",
+    )
+    .await?;
+    auth.setup_auth().map_err(readonly_open)?;
+
+    readonly_scan_leases(&expiration).await?;
+
+    core.add_handler(token_store as Arc<dyn Handler>)
+        .map_err(readonly_open)?;
+
+    Ok(())
+}
+
+/// Load a mount table, and refuse rather than repair it.
+///
+/// The two repairs the library's own loader performs — planting the default
+/// mounts when the table is absent, and rewriting entries left in an older
+/// format — are exactly what a readonly open must not do. Neither can be
+/// silently skipped either: a vault whose mount table is missing or stale has
+/// not been read correctly, and reporting on it as if it had been would be
+/// worse than refusing.
+async fn load_mount_table_readonly(
+    mounts: &Arc<MountTable>,
+    storage: &dyn BarrierStorage,
+    hmac_key: Option<&[u8]>,
+    hmac_level: MountEntryHMACLevel,
+    detail: &'static str,
+) -> VaultResult<()> {
+    match mounts.load(storage, hmac_key, hmac_level).await {
+        Ok(_) => {}
+        Err(RvError::ErrConfigLoadFailed) => {
+            return Err(VaultError::ReadonlyStateIncomplete { detail });
+        }
+        Err(err) => return Err(readonly_open(err)),
+    }
+
+    // The read-only counterpart of the scan the library's `mount_update` runs
+    // before deciding it has to persist.
+    let entries = mounts
+        .entries
+        .read()
+        .map_err(|_| VaultError::ReadonlyStateIncomplete { detail })?;
+    for mount_entry in entries.values() {
+        let entry = mount_entry
+            .read()
+            .map_err(|_| VaultError::ReadonlyStateIncomplete { detail })?;
+        if entry.table.is_empty() {
+            return Err(VaultError::ReadonlyStateIncomplete { detail });
+        }
+        if entry.hmac.is_empty() && hmac_level == MountEntryHMACLevel::Compat && hmac_key.is_some()
+        {
+            return Err(VaultError::ReadonlyStateIncomplete { detail });
+        }
+    }
+
+    Ok(())
+}
+
+/// Walk the stored leases without restoring or rewriting any of them.
+///
+/// Nothing registers them into the in-memory queue: the queue exists to feed
+/// the checker thread, and there is no checker thread here. What this is for is
+/// the older-format case, which the library's restore would migrate by writing
+/// the converted entry back.
+async fn readonly_scan_leases(expiration: &Arc<ExpirationManager>) -> VaultResult<()> {
+    for lease_id in expiration.id_view.get_keys().await.map_err(readonly_open)? {
+        let Some(raw) = expiration
+            .id_view
+            .get(&lease_id)
+            .await
+            .map_err(readonly_open)?
+        else {
+            continue;
+        };
+        if serde_json::from_slice::<StoredLease>(raw.value.as_slice()).is_err() {
+            return Err(VaultError::ReadonlyStateIncomplete {
+                detail: "lease entry format",
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -381,25 +739,59 @@ impl VaultCore {
     ///
     /// The vault is opened over a [`ReadonlyBackend`], so even a path that gets
     /// this wrong later fails hard rather than persisting.
-    ///
-    /// # Not built yet (VLT-02 → VLT-04)
-    ///
-    /// The vendored library carried monoengine's readonly bootstrap inside it:
-    /// a `Core.readonly` flag that made `post_unseal` load the mount table
-    /// instead of defaulting it, skip the built-in ACL policies, refuse to mint
-    /// a token salt, and leave the expired-lease worker unstarted. `libvault`
-    /// has none of that, and the plan is not to fork it — the bootstrap is
-    /// rebuilt here, on the crate's public API, by VLT-04.
-    ///
-    /// Until then this refuses by name. Falling back to [`Self::config`] would
-    /// be worse than failing: that path repairs exactly the state a readonly
-    /// open exists to leave alone, so an audit that "succeeded" through it
-    /// would be reporting on a vault its own bootstrap had just edited.
     pub async fn open_readonly(
-        _vault_storage: VaultStorage,
-        _key_path: PathBuf,
+        vault_storage: VaultStorage,
+        key_path: PathBuf,
     ) -> VaultResult<Self> {
-        Err(VaultError::ReadonlyUnavailable)
+        let backend = Arc::new(ReadonlyBackend::new(Arc::new(JupiterBackend::new(
+            vault_storage,
+        ))));
+        let seal_config = libvault::core::SealConfig {
+            secret_shares: 10,
+            secret_threshold: 5,
+        };
+
+        let rvault = readonly_vault(backend.clone(), None)?;
+        let storage_initialized = rvault
+            .inited()
+            .await
+            .map_err(|e| VaultError::InitializationState(e.to_string()))?;
+
+        if !storage_initialized {
+            return Err(VaultError::ReadonlyNotInitialized);
+        }
+        if !key_path.exists() {
+            return Err(VaultError::CoreKeyMissing { path: key_path });
+        }
+
+        let core_key = read_core_key(&key_path)?;
+        let expected_shares = seal_config.secret_threshold as usize;
+        if core_key.secret_shares.len() < expected_shares {
+            return Err(VaultError::CoreKeyTooFewShares {
+                expected: expected_shares,
+                actual: core_key.secret_shares.len(),
+            });
+        }
+        if !core_key.runtime_tokens.is_complete() {
+            return Err(VaultError::ReadonlyRuntimeTokensIncomplete);
+        }
+
+        let shares: Vec<&[u8]> = core_key
+            .secret_shares
+            .iter()
+            .map(|share| share.as_slice())
+            .collect();
+        readonly_unseal(&rvault, &shares).await?;
+
+        let runtime_tokens = Arc::new(core_key.runtime_tokens.clone());
+
+        Ok(Self {
+            rvault: rvault.into(),
+            key: Arc::new(core_key),
+            runtime_tokens,
+            audit: VaultAuditConfig::default(),
+            readonly: Some(backend),
+        })
     }
 
     /// Whether this handle was opened readonly.

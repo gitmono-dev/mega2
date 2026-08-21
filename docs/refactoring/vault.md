@@ -205,6 +205,49 @@ vendored 已删除。`src/vault/` 的 82 个 `.rs`（连同 `README.md` 与三�
 
 **回归观测点（VLT-S1 额外发现之一）**：vendored 在 `policy_store.rs` 里有一处 token policy 查询回落到持久 ACL view 的改动，那是 FIX-04 之前 `JupiterBackend::list` 契约发散留下的绕行。删除 vendored 即等于撤销该绕行，因此「限权 token 在重启后仍能通过 ACL 校验」必须由既有测试证明，而不是假定：`fix04_an_expired_lease_is_revoked_after_a_restart`（真实 Postgres 后端上 `restore()` 确实恢复到租约并撤销）、`integration_vault`、`integration_authz_audit` 与 config/generic token 隔离矩阵全绿即为判据。
 
+### VLT-04：UN-31 集成层等价重建（2026-08-21）
+
+只读引导已在集成层重建，八条 AC 逐条等价。生产落点两个文件：`src/contract/vault/integration/vault_core.rs`（shadow-unseal 序列）与 `readonly_backend.rs`（仅错误标识适配，未重迁）。全部 `#[ignore = "VLT-04"]` 已解除，十二条 `un31_` 与四条 `un43_` 全绿。
+
+**入口分层**
+
+| 层 | 函数 | 职责 |
+| --- | --- | --- |
+| 生产 | `VaultCore::open_readonly(vault_storage, key_path)` | AC4：storage 已初始化、key 文件存在、份额足够、`runtime_tokens` 完整——任一不满足都是**报告**而不是修补；不调 `ensure_runtime_credentials`、不回写 key 文件、不撤销 root token |
+| 库级 | `open_readonly_core(backend, config, keys)` = `readonly_vault` + `readonly_unseal` | 拆开是为了让 UN-31 用例能在内存 backend 上驱动它——发生了的修补在那里表现为「多出/改变的字节」 |
+| 保险 | `ReadonlyBackend` | AC6：`put`/`delete` 硬失败并计数 |
+
+**shadow-unseal 序列**（对照上游私有 `Core::post_unseal`）
+
+1. `readonly_vault`：`RustyVault::new(backend, cfg)`，其中 `cfg.mounts_monitor_interval` **强制置 0**。AC5 前半——「有没有 mounts monitor」是模式的决定，不是调用方配置的决定；`un31_a_readonly_open_starts_no_background_worker` 的可写对照特意配了非零 interval，所以该断言说的是模式而不是配置。
+2. `readonly_unseal`：`barrier.inited()` → `seal_config()` → **弃用分片检查**（与常规 unseal 一致，读到一个被轮换掉的分片不是只读该做的让步）→ 自行 `ShamirSecret::combine`（阈值为 1 时直接取分片）→ `barrier.unseal(kek)`。绕开 `Core::unseal` 正是因为它会调私有的 `post_unseal`。
+3. 装配 `CoreState`：`hmac_key` / `system_view` / `sealed = false`。私有的 `kek`、`unseal_key_shares` 不装——它们只服务 `generate_unseal_keys()`，那是写路径。
+4. `readonly_post_unseal`：`module_manager.setup()`（纯注册）→ 只读加载 core mount 表（AC1）→ `mounts_router.setup()` → 只读 auth init（AC2/AC3/AC5）→ 只读 policy init（跳过 `setup_policy`，AC3）。
+
+**AC 与观测面**
+
+| AC | 实现 | 直接观测面 |
+| --- | --- | --- |
+| AC1 | `load_mount_table_readonly`：只 `MountTable::load`；表缺失（`ErrConfigLoadFailed`）或存在 `mount_update` 会回写的条目 → `VaultError::ReadonlyStateIncomplete { detail }` | 具名错误 + storage 快照逐字节相等 |
+| AC2 | 同一函数作用于 `auth.mounts_router.mounts`，不走 `AuthModule::load_auth` | 同上 |
+| AC3 | 跳过 `PolicyModule::setup_policy`；token salt 在 `TokenStore::new` **之前**预读，缺失即具名 fail-closed（新签 salt 会静默改变该 vault 里每个 token 的哈希方式） | 具名错误 + `denied_writes() == 0`（保险层从未触发，说明拒绝发生在写之前） |
+| AC4 | 见上表生产层 | `VaultError::{ReadonlyNotInitialized, CoreKeyTooFewShares, ReadonlyRuntimeTokensIncomplete}` + key 文件字节不变 |
+| AC5 | 不运行 `AuthModule::init`（库内唯一启动过期租约 worker 的地方，也是唯一写 `auth.expiration` 的地方）；租约只读扫描，旧格式具名 fail-closed，不注册进内存队列——队列只服务那个不存在的线程 | `core.mounts_monitor.load().is_none()` **且** `auth.expiration.load().is_none()`；另有源码级零命中守卫：`rg 'start_check_expired_lease_entries' src bin` |
+| AC6 | `ReadonlyBackend::{put,delete}` → `RvError::ErrString(READONLY_WRITE_DENIED)` 并计数 | `denied_writes()` |
+| AC7 | 保险层与 `VaultCore` 具名层各一组硬失败 | 具名层拒绝时 `denied_writes() == 0` |
+| AC8 | 只读扫描不撤销、不启 worker | 成对：可写侧 1.5s 内确实撤销并删除记录，只读侧记录仍在且零写入尝试 |
+
+**AC5 观测面的替换说明**：vendored 曾在 `ExpirationManager` 上挂一个「检查线程起过没有」的标志，上游没有，且它 spawn 的线程是 detached、无句柄可问。替代面是 `AuthModule.expiration`——上游只有 `AuthModule::init` 会写它，且库内没有任何读者，而 `AuthModule::init` 又是唯一启动 worker 的地方；因此「槽是空的」**就是**「worker 没起过」这句话本身，而不是从「没观察到撤销」倒推（后者只是和 200ms tick 赛跑）。等价关系由上述源码级零命中守卫加固。
+
+**上游私有面的镜像（脆弱点，随 `libvault` 升级复核）**
+
+| 镜像 | 上游私有物 | 守卫 |
+| --- | --- | --- |
+| `TOKEN_SUB_PATH` / `TOKEN_SALT_LOCATION` 两个字面量 | `modules/auth/token_store.rs` 的同名私有常量 | `un31_a_missing_token_salt_fails_closed` 在同一路径上删 salt 并要求可写对照把它补回来——上游改路径会先让对照变红 |
+| `StoredLease` 的 serde 形状（`data` 必须是对象） | 私有的 `LeaseEntry` / `OldLeaseEntry` | 时间字段走 `libvault::utils::deserialize_system_time`，与库同源；`un31_an_older_format_lease_fails_closed` 带可写对照 |
+| 只读 post-unseal 本身 | 私有的 `Core::post_unseal` | 十二条 UN-31 用例 + 逐字节快照；升级 `libvault` 时按本节与「VLT-S1」节复核 |
+| 只读 auth init 的顺序（先装 token store，后注册 policy 的 auth handler） | `AuthModule::set_auth_handlers` 对 token store 无条件 `unwrap()` | 顺序颠倒会让 `un31_a_readonly_open_reads_what_the_writable_one_stored` 直接 panic |
+
 ## 当前实现概览
 
 `vault` 模块位于 `src/contract/vault/`，核心集成代码在 `src/contract/vault/integration/`：
