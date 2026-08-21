@@ -102,6 +102,88 @@
 - 双版本并存已验证：`cargo build` 0 错误 0 警告。libvault 带入的次要版本与本仓既有版本并行解析，包括 `rand 0.9.5`（本仓 `0.10.2` + `rand08` = `0.8.7`）、`pgp 0.19.0`（本仓 `0.20.0`）、`sqlx 0.8.6`（sea-orm 2.0 用 `0.9.0`）、`ureq 2.12.1`（本仓 `3.3.0`）、`reqwest 0.12.28`（本仓 `0.13.4`）、`strum 0.25.0`、`enum-map 2.7.3`、`pem 3.0.6`、`ipnetwork 0.17.0`、`derive_more 0.99.20`、`hcl-rs 0.18.7`、`radix_trie 0.2.1`、`stretto 0.8.4`、`bcrypt 0.17.1`、`base64 0.22.1`。本仓在此之前已有 `rand` / `rand08` 双版本先例，故不做单版本收敛（`DEFER-VLT-03`）。
 - 编译面：`storage_pg` 与 `crypto_adaptor_openssl` 两个特性显式开启；`crypto_adaptor_openssl` 是上游 `default`，此处显式写出以免将来 `default-features` 变化时静默丢失。
 
+### VLT-S1：公共 API 只读可行性 spike（2026-08-21）
+
+**结论: go。** 采用路径 = **shadow-unseal**：在集成层自行驱动 barrier 解封与 post-unseal 序列，绕开 `Core::do_unseal`（它会调用私有的 `post_unseal`），从而**根本不去请求** `post_unseal` 无条件执行的那些修补。不改上游源码，不 fork，不需要 `Core.readonly` 标志。
+
+时间箱：≤2 人日，实际约 0.4 人日（静态核对 + 一次性原型）。本卡零生产表面改动。
+
+#### 证据：一次性原型（不进本计划提交）
+
+按 ER-03 在仓外一次性 crate 中构建可编译原型（只依赖 crates.io `libvault 0.3.0`，不依赖 monoengine），把 vendored `src/vault/un31_readonly.rs` 中不依赖 `VaultCore` 的用例逐条移植，并**保留全部成对可写对照**。结果：**10 passed; 0 failed**（另加一条 vendored 未单独覆盖的 AC3 token salt 用例）。原型验证了：只读句柄仍能读出可写句柄写入的 secret；只读引导后 storage 逐字节不变；mounts monitor 与 expiration worker 均未创建；mount 表缺失 / mount 旧格式 / 默认 ACL policy 被删 / 租约旧格式 / token salt 缺失五种情形全部**写前**具名 fail-closed（对应断言里 `denied_writes() == 0`，即最终保险从未触发）。
+
+#### 上游锚点：逐项否证 / 采纳表
+
+| # | 候选路径或关键点 | 上游锚点 | 结论 |
+| --- | --- | --- | --- |
+| 1 | ReadonlyBackend + `mounts_monitor_interval=0` 单独使用 | `../libvault-rs/src/core.rs:608-631`（`post_unseal` 私有、无条件 `load_or_default` + `module_manager.init`） | **否证**：只能写时拒绝，不满足写前具名 fail-closed；worker 仍启动 |
+| 2 | 替换 Auth / Policy module（自定义 `Module` 实现） | `../libvault-rs/src/core.rs:279,356,369`、`modules/system/mod.rs:724,781,819,836,971,1072`、`modules/credential/cert/mod.rs:124,134` 均以 `get_module::<AuthModule>("auth")` / `<PolicyModule>("policy")` 具体类型 downcast | **否证**：wrapper module 会让这些 downcast 全部落空 |
+| 3 | **Shadow-unseal**（绕开 `Core::do_unseal`，自建 readonly post-unseal） | 见下「公共 API 清单」 | **采纳** |
+
+关键的可行性事实（全部经上游源码核对）：
+
+| 事实 | 上游锚点 |
+| --- | --- |
+| `Core` 的全部字段为 `pub`（`barrier` / `mounts_router` / `module_manager` / `state` / `mounts_monitor` / `mount_entry_hmac_level` …） | `../libvault-rs/src/core.rs:89-102` |
+| `RustyVault.core` 为 `pub ArcSwap<Core>` | `../libvault-rs/src/lib.rs:70-78` |
+| `SecurityBarrier` trait 公开 `unseal` / `derive_hmac_key` / `as_storage` / `inited` / `sealed` | `../libvault-rs/src/storage/barrier.rs:17-26` |
+| `BarrierView::new` / `new_sub_view` 公开；`SYSTEM_BARRIER_PREFIX` 为 `pub const` | `../libvault-rs/src/storage/barrier_view.rs:51,58`；`mount.rs:40` |
+| `ShamirSecret::combine` 公开 | `../libvault-rs/src/shamir.rs:183` |
+| `MountTable::load` 公开且在表缺失时返回 `ErrConfigLoadFailed`（即 `load_or_default` 会在此改写并 `persist`） | `../libvault-rs/src/mount.rs:299-320` |
+| `MountTable.entries` / `MountEntry.table` / `.hmac` 为 `pub`，可在集成层重建「`mount_update` 是否需要回写」的判定 | `../libvault-rs/src/mount.rs:98,107` |
+| `ModuleManager::setup` / `init` / `get_module` / `add_module` / `remove_module` 公开 | `../libvault-rs/src/module_manager.rs:49,62,85,101,110` |
+| **只有** `AuthModule` 与 `PolicyModule` 覆写 `Module::init`；`SystemModule` / `PkiModule` / `KvModule` / `CertModule` 只覆写 `setup`（纯注册，无写），其 `init` 取 trait 默认 `Ok(())` | `../libvault-rs/src/modules/mod.rs:78-80`；`modules/{pki,kv,credential/cert}/mod.rs` 的 `impl Module` |
+| `AuthModule` 的 `token_store` / `expiration` / `mounts_router` / `barrier` 为 `pub`，`add_auth_backend` / `setup_auth` / `load_auth` 公开 | `../libvault-rs/src/modules/auth/mod.rs:51-57,287,315,326` |
+| `ExpirationManager::{new,wrap,set_token_store}` 与 `pub id_view` 公开；`TokenStore::{new,wrap,new_backend}` 公开；`PolicyStore::new` 公开 | `auth/expiration.rs:98,152,173,186`；`auth/token_store.rs:150`；`policy/policy_store.rs:224` |
+| `PolicyStore::new` 会从 `acl_view.get_keys()` 重建 `policy_type_map`（重启后 ACL 可解析的前提） | `../libvault-rs/src/modules/policy/policy_store.rs:233,256-272` |
+
+#### 采纳的公共 API 序列
+
+1. `RustyVault::new(backend, Some(&cfg))`，其中 `cfg.mounts_monitor_interval` 被**强制置 0**——「不创建 mounts monitor」由只读模式决定，与调用方配置无关（AC5 前半）。
+2. `core.barrier.inited()` / `sealed()` / `seal_config()` 预检 → `ShamirSecret::combine`（阈值为 1 时直接取分片）→ `core.barrier.unseal(kek)`。
+3. 装配 `CoreState`：`CoreState::default()` 后写 `hmac_key = barrier.derive_hmac_key()`、`system_view = BarrierView::new(barrier, SYSTEM_BARRIER_PREFIX)`、`sealed = false`。私有的 `kek` / `unseal_key_shares` **不需要**——它们只服务 `generate_unseal_keys()`，那是写路径。
+4. 只读 post-unseal：`module_manager.setup(core)` → `mounts_router.mounts.load(...)` + 「是否需要 `mount_update`」扫描（AC1）→ `mounts_router.setup(core)` → 只读版 auth init（AC2/AC3/AC5）→ 只读版 policy init（跳过 `setup_policy`，AC3）。
+5. 只读版 auth init 的顺序必须与上游一致：**先** `auth.token_store.store(..)`，**后**才轮到 policy 的 `core.add_auth_handler(..)`——后者经 `AuthModule::set_auth_handlers` 对 `token_store` 无条件 `unwrap()`（`modules/auth/mod.rs:78-84`），顺序颠倒会 panic。
+
+#### UN-31 八条 AC 在公共 API 上的可断言性
+
+| AC | 重建手段 | 观测面（公共 API） | 原型断言 |
+| --- | --- | --- | --- |
+| AC1 mount | `MountTable::load` + 自建 `needs_mount_update` 扫描，两种情形均具名 fail-closed | 具名错误 + storage 快照 | `un31_a_missing_mount_table_fails_closed`、`un31_an_older_mount_entry_format_fails_closed` |
+| AC2 auth | 同上，作用于 `auth.mounts_router.mounts`，不调用 `load_auth` | 同上 | 由 `un31_a_readonly_open_persists_nothing` 的逐字节快照覆盖 |
+| AC3 policy/token | 跳过 `PolicyModule::setup_policy`；**在** `TokenStore::new` 之前预读 `system_view.new_sub_view("token/").get("salt")`，缺失即具名 fail-closed（而不是让 `TokenStore::new` 去新签再被拦） | 具名错误 + storage 快照 | `un31_a_deleted_default_policy_is_not_replanted`、`un31_a_missing_token_salt_fails_closed` |
+| AC4 rotation | 留在 `VaultCore::open_readonly`，与今日实现一致（不调 `ensure_runtime_credentials`、不回写 key 文件、不撤 root） | `VaultError::ReadonlyRuntimeTokensIncomplete` | 归 VLT-04 的 `vault_core` 子模块用例 |
+| AC5 workers+restore | 强制 `mounts_monitor_interval = 0`；**不**调用 `AuthModule::init`（它是 `start_check_expired_lease_entries` 的唯一调用点，也是 `auth.expiration` 的唯一写入点）；租约改为只读扫描，旧格式具名 fail-closed | `core.mounts_monitor.load().is_none()` **且** `auth.expiration.load().is_none()`——后者是**直接**断言「从未走过启动 worker 的那条路径」，不是从「没观察到撤销」倒推 | `un31_a_readonly_open_starts_no_background_worker`、`un31_an_older_format_lease_fails_closed`、`un31_an_expired_lease_survives_a_readonly_open`（均带可写对照） |
+| AC6 wrapper | `ReadonlyBackend` 迁至集成层；`put`/`delete` 硬失败 | `denied_writes()` | `un31_the_readonly_backend_denies_put_and_delete` |
+| AC7 双层硬失败 | wrapper 层 + `VaultCore` 具名层 | 具名层拒绝时 `denied_writes() == 0` | wrapper 侧已证；具名层归 VLT-04 |
+| AC8 过期租约成对 | 只读扫描不注册、不启 worker | storage 中记录仍在 vs 可写侧被撤销 | `un31_an_expired_lease_survives_a_readonly_open` |
+
+**替代观测面登记（AC5）**：vendored 的 `ExpirationManager::is_lease_checker_started()` 上游零命中，且 `start_check_expired_lease_entries` 不返回句柄、`stop_...` 只清队列（`auth/expiration.rs:480,541`），故上游侧无法直接问「线程起了没有」。替代面为 `AuthModule.expiration.load().is_none()`：`auth.expiration` 在上游**仅**由 `AuthModule::init` 写入（`modules/auth/mod.rs:388`），此外全仓无读者，因此它为空等价于「`AuthModule::init` 未运行」，也就等价于 worker 未启动。该等价关系须由一条源码级零命中守卫加固（集成层不得出现 `start_check_expired_lease_entries`）。
+
+#### 已知脆弱点（drift risk，须随 VLT-04 登记）
+
+| # | 脆弱点 | 缓解 |
+| --- | --- | --- |
+| 1 | 只读 post-unseal 是上游私有 `post_unseal` 的影子实现；上游若在其中新增步骤，只读路径不会自动跟进 | UN-31 十二用例 + 逐字节快照断言；升级 `libvault` 时按本节复核 |
+| 2 | token salt 路径 `"token/"` + `"salt"` 是上游**私有常量** `TOKEN_SUB_PATH` / `TOKEN_SALT_LOCATION`（`auth/token_store.rs:51-52`）的字面量复制 | `un31_a_missing_token_salt_fails_closed` 带可写对照——上游若改路径，可写对照会先红 |
+| 3 | 租约旧格式判定复制了私有 `LeaseEntry` 的 serde 形状（`data` 必须是对象）；`LeaseEntry`/`OldLeaseEntry` 上游为私有类型 | 用 `libvault::utils::deserialize_system_time` 保持时间字段一致；`un31_an_older_format_lease_fails_closed` 带可写对照 |
+| 4 | `set_auth_handlers` 对 `token_store` 无条件 `unwrap()`，只读 init 的顺序不能变 | 顺序写入代码注释 + `un31_a_readonly_open_reads_what_the_writable_one_stored` 会在顺序错时 panic |
+
+#### 额外发现：两处**与只读无关**的 vendored 分歧（执行期核对，2026-08-21）
+
+计划「事实基线」把 vendored↔上游差异记为「UN-31 只读 + `RvError` 本地化 + 依赖版本面」。逐文件核对（剔除纯 import 改写与 doc 后共 24 个文件有差异）另发现两处**功能性**分歧，不在只读轴内，必须随 VLT-02/04 处置：
+
+1. **`modules/policy/policy_store.rs:331`**：vendored 在 `get_policy(_, PolicyType::Token)` 未命中 `policy_type_map` 时回落到持久 ACL view（`policy_type = Acl; (Some(self.get_acl_view()?), &self.token_policies_lru)`），上游为 `(None, &None)`（随后因 `view.is_none()` 报错）。这是 `FIX-04` 之前 `JupiterBackend::list` 返回递归全 key 导致 `PolicyStore::new` 无法正确重建 `policy_type_map` 的历史绕行；FIX-04 已修复该 list 契约，故上游行为**预期**已足够。判据：切换后 `integration_vault` / `integration_authz_audit` 以及限权 token 隔离矩阵必须仍绿——**这是 VLT-02 的强制回归观测点**，不是可选项。
+2. **`modules/auth/token_store.rs:457`**：上游为 `log::debug!("check token: {token}")`，会把明文 client token 写进 debug 日志；vendored 已脱敏为 `log::debug!("check token")`。本仓**未安装任何 `log` facade logger、也未接 `tracing-log` 桥**（`rg 'tracing_log|LogTracer|log::set_logger' src bin` 零命中），因此该语句在 monoengine 内不产生输出，属**残留风险**而非现存泄漏；一旦将来接入 `log` 桥必须重新评估（登记为 `DEFER-VLT-04`）。
+
+#### VLT-04 落点估计
+
+生产落点 2 个文件，与计划的 `scope=S` 一致：
+- `src/contract/vault/integration/vault_core.rs`：`open_readonly` 内的 shadow-unseal 序列（预计 +260～320 行，含只读 post-unseal、只读 auth init、mount 只读加载、租约只读扫描）。
+- `src/contract/vault/integration/readonly_backend.rs`：仅适配错误标识，不重迁。
+
+wrapper 层选定的 `libvault::RvError` 变体 = **`RvError::ErrString(READONLY_WRITE_DENIED)`**（上游唯一携带调用方可读原因、且 `PartialEq` 可断言的变体，`../libvault-rs/src/errors.rs:366,497`）；具名层继续用 `VaultError::ReadonlyWriteDenied` / `ReadonlyRuntimeTokensIncomplete`，并新增 `VaultError::ReadonlyStateIncomplete`（承接 vendored 的 `RvError::ErrCoreReadonlyStateIncomplete`）与 `VaultError::ReadonlyUnavailable`（VLT-02 中间态桩）。
+
 ## 当前实现概览
 
 `vault` 模块位于 `src/contract/vault/`，核心集成代码在 `src/contract/vault/integration/`：
