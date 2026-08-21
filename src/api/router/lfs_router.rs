@@ -228,11 +228,15 @@ fn lfs_auth_challenge() -> Response<Body> {
 
 /// Enforces the LFS access policy for the given operation, returning a ready
 /// `401` challenge response when the caller is not permitted.
+///
+/// The challenge is boxed because it is the rare arm: an unboxed
+/// `Response<Body>` would put 128 bytes of denial into every permitted request's
+/// return value too, which is what `clippy::result_large_err` is about.
 async fn enforce_lfs_access(
     state: &MonoApiServiceState,
     headers: &HeaderMap,
     access: LfsAccess,
-) -> Result<(), Response<Body>> {
+) -> Result<(), Box<Response<Body>>> {
     let anonymous_access = state.storage.config().git.anonymous_access;
     // Only resolve the (DB-backed) token when it can actually affect the outcome.
     let authenticated = if access == LfsAccess::Read && anonymous_access {
@@ -243,7 +247,7 @@ async fn enforce_lfs_access(
     if lfs_access_allowed(access, anonymous_access, authenticated) {
         Ok(())
     } else {
-        Err(lfs_auth_challenge())
+        Err(Box::new(lfs_auth_challenge()))
     }
 }
 
@@ -274,7 +278,7 @@ pub async fn list_locks(
     Query(query): Query<LockListQuery>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
-        return Ok(resp);
+        return Ok(*resp);
     }
     let repo = lfs_repo_path(repo);
     let result: Result<LockList, GitLFSError> =
@@ -314,7 +318,7 @@ pub async fn list_locks_for_verification(
     Json(json): Json<VerifiableLockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
-        return Ok(resp);
+        return Ok(*resp);
     }
     let repo = lfs_repo_path(repo);
     let result = handler::lfs_verify_lock(state.storage.lfs_db_storage(), &repo, json).await;
@@ -353,7 +357,7 @@ pub async fn create_lock(
     Json(json): Json<LockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
-        return Ok(resp);
+        return Ok(*resp);
     }
     let repo = lfs_repo_path(repo);
     let result = handler::lfs_create_lock(state.storage.lfs_db_storage(), &repo, json).await;
@@ -400,7 +404,7 @@ pub async fn delete_lock(
     Json(json): Json<UnlockRequest>,
 ) -> Result<Response, (StatusCode, String)> {
     if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
-        return Ok(resp);
+        return Ok(*resp);
     }
     let repo = lfs_repo_path(repo);
     let result = handler::lfs_delete_lock(state.storage.lfs_db_storage(), &repo, &id, json).await;
@@ -451,7 +455,7 @@ pub async fn lfs_process_batch(
         LfsAccess::Read
     };
     if let Err(resp) = enforce_lfs_access(&state, &headers, access).await {
-        return Ok(resp);
+        return Ok(*resp);
     }
     let result =
         handler::lfs_process_batch(&state.storage.lfs_service, json, &state.listen_addr).await;
