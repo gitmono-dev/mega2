@@ -2,7 +2,7 @@
 
 > 一个基于 Rust 的 monorepo / Git 托管与服务引擎。它将若干最初来自 [Mega](https://github.com/web3infra-foundation/mega) 项目的子系统（尤其是 `callisto` ORM 实体和 `jupiter` 存储 / 迁移层）移植并扩展为一个集中的二进制 crate。
 
-`monoengine` 是支撑 monorepo 平台的后端引擎：它通过 HTTP(S) 和 SSH 支持 Git wire 协议，将 Git 对象和 Git LFS blob 持久化到关系数据库以及可插拔的对象存储中，为上层 UI 客户端暴露 REST/OpenAPI 接口，并内置了一个嵌入式、vendored 的 `libvault` 密钥 / PKI 引擎，用于签名和凭据管理。
+`monoengine` 是支撑 monorepo 平台的后端引擎：它通过 HTTP(S) 和 SSH 支持 Git wire 协议，将 Git 对象和 Git LFS blob 持久化到关系数据库以及可插拔的对象存储中，为上层 UI 客户端暴露 REST/OpenAPI 接口，并通过 `libvault` crate（crates.io `0.3.0`）内嵌一个密钥 / PKI 引擎，用于签名和凭据管理——该引擎的源码此前是 vendored 在 `src/vault/` 的，自 2026-08-21 起改为普通依赖，集成层仍在 `src/contract/vault/`。
 
 ## 与 website 联合启动（同栈联调）
 
