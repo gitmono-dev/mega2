@@ -77,7 +77,7 @@ impl VaultCore {
         Ok(())
     }
 
-    /// - `data`: see [RoleEntry](crate::vault::modules::pki::path_roles)
+    /// - `data`: see `libvault::modules::pki::path_roles`'s `RoleEntry`
     ///  - This function configures a role for issuing certificates.
     ///  - The `ROLE` constant is used as the role name.
     ///
@@ -111,7 +111,7 @@ impl VaultCore {
     }
 
     /// issue certificate
-    /// - `data`: see [issue_path](crate::vault::modules::pki::path_issue)
+    /// - `data`: see `libvault::modules::pki::path_issue`
     /// - return: `(cert_pem, private_key)`
     pub async fn issue_cert(&self, data: Value) -> Result<(String, String), MegaError> {
         // let dns_sans = ["test.com", "a.test.com", "b.test.com"];
@@ -212,12 +212,13 @@ mod tests_raw {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use libvault::logical::Response;
     use openssl::{asn1::Asn1Time, ec::EcKey, nid::Nid, pkey::PKey, rsa::Rsa, x509::X509};
     use serde_json::{Map, Value, json};
 
     use crate::{
         common::errors::VaultResult, contract::vault::integration::vault_core::VaultCore,
-        jupiter::tests::test_storage, vault::logical::Response,
+        jupiter::tests::test_storage,
     };
 
     async fn test_read_api(

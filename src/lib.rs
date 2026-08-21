@@ -23,26 +23,6 @@ mod contract;
 mod jupiter;
 pub mod notification;
 mod server;
-// The vendored RustyVault code intentionally keeps its upstream style and
-// clippy policy while being compiled as a monoengine module.
-#[allow(
-    hidden_glob_reexports,
-    clippy::await_holding_lock,
-    clippy::collapsible_match,
-    clippy::field_reassign_with_default,
-    clippy::large_enum_variant,
-    clippy::let_and_return,
-    clippy::new_without_default,
-    clippy::ptr_arg,
-    clippy::result_large_err,
-    clippy::should_implement_trait,
-    clippy::too_many_arguments,
-    clippy::unnecessary_map_or,
-    clippy::upper_case_acronyms,
-    clippy::wrong_self_convention,
-    unused_imports
-)]
-mod vault;
 
 /// Internal seam for the read-only ops assembly (UN-30).
 ///

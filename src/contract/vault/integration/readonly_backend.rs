@@ -12,6 +12,22 @@
 //! path from `put`/`delete` to the wrapped backend at all. A denial is a hard
 //! error, never a silent no-op: a swallowed write would leave the caller
 //! believing its state was persisted.
+//!
+//! # Error identity
+//!
+//! This used to live inside the vendored library, where it could invent an
+//! `RvError` variant of its own for "readonly, write denied". The `libvault`
+//! crate has no such variant and should not grow one — "this handle was opened
+//! readonly" is monoengine's concept, not the library's. So the two layers are
+//! named separately:
+//!
+//! * above the backstop, the integration layer refuses with
+//!   [`VaultError::ReadonlyWriteDenied`] before a write is ever attempted;
+//! * at the backstop itself, the only channel back into the library is
+//!   `RvError`, and the single variant this wrapper uses is
+//!   [`RvError::ErrString`] carrying [`READONLY_WRITE_DENIED`] — the one
+//!   upstream variant that carries a caller-facing reason and compares by
+//!   equality, so a test can assert the exact refusal rather than "some error".
 
 use std::{
     any::Any,
@@ -22,11 +38,35 @@ use std::{
 };
 
 use async_trait::async_trait;
-
-use crate::{
-    common::errors::RvError,
-    vault::storage::{Backend, BackendEntry},
+use libvault::{
+    errors::RvError,
+    storage::{Backend, BackendEntry},
 };
+
+use crate::common::errors::VaultError;
+
+/// The reason the backstop gives when it refuses a write.
+///
+/// Exported so tests assert against the same string the wrapper produces
+/// instead of a copy that can drift.
+pub const READONLY_WRITE_DENIED: &str =
+    "vault is open in readonly bootstrap mode; the write was denied";
+
+/// The single `libvault` error variant the backstop maps onto.
+pub fn readonly_write_denied() -> RvError {
+    RvError::ErrString(READONLY_WRITE_DENIED.to_string())
+}
+
+/// Whether `error` is this wrapper's refusal.
+pub fn is_readonly_write_denied(error: &RvError) -> bool {
+    matches!(error, RvError::ErrString(message) if message == READONLY_WRITE_DENIED)
+}
+
+/// The named, monoengine-side counterpart of [`readonly_write_denied`], for the
+/// layer above the backstop.
+pub fn readonly_write_denied_error() -> VaultError {
+    VaultError::ReadonlyWriteDenied
+}
 
 pub struct ReadonlyBackend {
     inner: Arc<dyn Backend>,
@@ -58,7 +98,7 @@ impl ReadonlyBackend {
             key,
             "denied a write against a vault opened in readonly bootstrap mode"
         );
-        RvError::ErrCoreReadonlyWriteDenied
+        readonly_write_denied()
     }
 }
 

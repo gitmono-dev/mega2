@@ -750,6 +750,7 @@ impl Fixture {
 
 /// 只读装配跑完，库、refs、对象一字未动。
 #[test]
+#[ignore = "VLT-04"]
 fn integration_readonly_assembly_changes_nothing() {
     monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
 

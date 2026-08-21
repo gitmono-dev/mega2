@@ -184,6 +184,27 @@
 
 wrapper 层选定的 `libvault::RvError` 变体 = **`RvError::ErrString(READONLY_WRITE_DENIED)`**（上游唯一携带调用方可读原因、且 `PartialEq` 可断言的变体，`../libvault-rs/src/errors.rs:366,497`）；具名层继续用 `VaultError::ReadonlyWriteDenied` / `ReadonlyRuntimeTokensIncomplete`，并新增 `VaultError::ReadonlyStateIncomplete`（承接 vendored 的 `RvError::ErrCoreReadonlyStateIncomplete`）与 `VaultError::ReadonlyUnavailable`（VLT-02 中间态桩）。
 
+### VLT-02：引用切换、只读原语搬迁、删除 vendored、迁出测试（2026-08-21）
+
+vendored 已删除。`src/vault/` 的 82 个 `.rs`（连同 `README.md` 与三份 upstream LICENSE）与 `src/lib.rs` 的顶层 `mod vault;`、以及包着它的 `#[allow(...)]` 块一并移除；库类型改由 crates.io 的 `libvault 0.3.0` 提供。`rg 'crate::vault' src bin` 零命中。
+
+| 面 | 迁移前 | 迁移后 |
+| --- | --- | --- |
+| 库入口 | `crate::vault::{RustyVault, logical::Response, storage::Backend, core::SealConfig}` | `libvault::{RustyVault, logical::Response, storage::Backend, core::SealConfig}` |
+| `RvError` | 本地 enum（`src/common/errors/vault.rs`，约 340 行） | `pub use libvault::errors::RvError`（同文件），`crate::common::errors` 继续重导出 |
+| `CryptoError` / `SealBoxError` | 本地 enum + `crate::common::errors` 重导出 | **不再重导出**——消费方只有 vendored 的 `utils/{crypto,seal}.rs`，随目录一起消失；需要时直接用 `libvault::utils::{crypto::CryptoError, seal::SealBoxError}` |
+| `rv_error_string!` / `rv_error_response!` / `rv_error_response_status!` | 本地 `#[macro_export]` | 删除（仅 vendored 使用；上游自带同名宏） |
+| `ReadonlyBackend` | `src/vault/storage/readonly.rs` | `src/contract/vault/integration/readonly_backend.rs` |
+| 只读保险的错误标识 | `RvError::ErrCoreReadonlyWriteDenied`（vendored 自造变体） | 具名层 `VaultError::ReadonlyWriteDenied`；保险层 `RvError::ErrString(READONLY_WRITE_DENIED)`——上游唯一携带调用方可读原因且 `PartialEq` 可断言的变体 |
+| 「状态缺失/旧格式」标识 | `RvError::ErrCoreReadonlyStateIncomplete` | `VaultError::ReadonlyStateIncomplete { detail }`（`detail` 指明是 mount 表、auth 表、token salt 还是租约格式） |
+| FIX-04 / UN-31 测试 | `src/vault/{fix04_list_contract,un31_readonly}.rs` | `src/contract/vault/integration/{fix04_list_contract,un31_readonly}.rs`（钉死落点） |
+
+**一律未搬迁的 vendored-only 扩展**（防回流守卫覆盖）：`RustyVault::new_readonly`、`Core::new_readonly`、`MountsRouter::load_readonly`、`AuthModule::load_auth_readonly`、`ExpirationManager::restore_readonly`，以及那个「租约检查线程起了没有」的观测方法。它们是对上游类型的本地 inherent 扩展，搬进集成层只会把同一个 fork 换个地方放。守卫：`rg -n 'fn new_readonly|fn load_readonly|fn load_auth_readonly|fn restore_readonly|lease_checker_started' src/contract src/common src/context bin --glob '!**/config/**'` 零命中（刻意排除 `src/config/`——`loader.rs` 的 `load_readonly` 是无关的既有 API）。
+
+**中间态（VLT-02 → VLT-04）**：`VaultCore::open_readonly` 与库级 `open_readonly_core` 都是**具名 fail-closed 桩**，返回 `VaultError::ReadonlyUnavailable`。刻意不回退到可写路径——那条路径会修补掉只读打开正要保全的那份状态，「成功」的审计会是在报告一份被自己引导过程改写过的 vault。受影响用例全部 `#[ignore = "VLT-04"]` 且**不得删除**：迁后 `un31_readonly.rs` 十二条、`src/context/un43_readonly_assembly.rs` 的 `un43_a_needed_vault_is_opened_read_only_and_unchanged`、`bin/tests/integration_authz_audit.rs` 的 `integration_readonly_assembly_changes_nothing`。本卡为 `REL-VLT-RO` 家族子卡，**不单独推送**。
+
+**回归观测点（VLT-S1 额外发现之一）**：vendored 在 `policy_store.rs` 里有一处 token policy 查询回落到持久 ACL view 的改动，那是 FIX-04 之前 `JupiterBackend::list` 契约发散留下的绕行。删除 vendored 即等于撤销该绕行，因此「限权 token 在重启后仍能通过 ACL 校验」必须由既有测试证明，而不是假定：`fix04_an_expired_lease_is_revoked_after_a_restart`（真实 Postgres 后端上 `restore()` 确实恢复到租约并撤销）、`integration_vault`、`integration_authz_audit` 与 config/generic token 隔离矩阵全绿即为判据。
+
 ## 当前实现概览
 
 `vault` 模块位于 `src/contract/vault/`，核心集成代码在 `src/contract/vault/integration/`：

@@ -15,6 +15,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use libvault::{
+    RustyVault,
+    core::SealConfig,
+    storage::{Backend, BackendEntry, physical::file::FileBackend},
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -26,11 +31,6 @@ use crate::{
             vault_storage::VaultStorage,
         },
         tests::test_db_connection,
-    },
-    vault::{
-        RustyVault,
-        core::SealConfig,
-        storage::{Backend, BackendEntry, physical::file::FileBackend},
     },
 };
 
@@ -214,7 +214,7 @@ async fn fix04_an_expired_lease_is_revoked_after_a_restart() {
         let core = vault.core.load();
         core.barrier
             .as_storage()
-            .put(&crate::vault::storage::StorageEntry {
+            .put(&libvault::storage::StorageEntry {
                 key: lease_key.to_string(),
                 value: serde_json::to_vec(&json!({
                     "lease_id": "fix04lease",

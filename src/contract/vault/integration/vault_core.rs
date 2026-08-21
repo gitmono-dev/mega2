@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use libvault::{RustyVault, logical::Response, storage::Backend};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -12,17 +13,14 @@ use serde_json::{Map, Value};
 use crate::{
     common::errors::{MegaError, VaultError, VaultResult},
     config::{DbConfig, VaultAuditConfig, mega_base},
-    contract::vault::integration::jupiter_backend::JupiterBackend,
+    contract::vault::integration::{
+        jupiter_backend::JupiterBackend, readonly_backend::ReadonlyBackend,
+    },
     jupiter::storage::{
         Storage,
         base_storage::{BaseStorage, StorageConnector},
         init::database_connection,
         vault_storage::VaultStorage,
-    },
-    vault::{
-        RustyVault,
-        logical::Response,
-        storage::{Backend, readonly::ReadonlyBackend},
     },
 };
 
@@ -106,6 +104,31 @@ impl RuntimeTokens {
             &self.generic
         }
     }
+}
+
+/// Open an already-initialized vault over `backend` without changing it.
+///
+/// This is the library-level half of [`VaultCore::open_readonly`]: it takes the
+/// vault from sealed to serving reads while performing none of the repairs the
+/// ordinary unseal performs on the way. It is separate from `VaultCore` so the
+/// UN-31 suite can drive it over an in-memory backend, where a repair that did
+/// happen is visible as a changed byte.
+///
+/// # Not built yet (VLT-02 → VLT-04)
+///
+/// `libvault::RustyVault::unseal` routes through the crate-private
+/// `Core::post_unseal`, which unconditionally defaults and persists the mount
+/// table, repairs the auth mount, plants the built-in ACL policies, mints a
+/// token salt, and starts the expired-lease worker. VLT-04 replaces this stub
+/// with the shadow-unseal sequence recorded in `docs/refactoring/vault.md`,
+/// which drives the barrier and a readonly post-unseal from here and so never
+/// asks for any of that.
+pub(crate) async fn open_readonly_core(
+    _backend: Arc<dyn Backend>,
+    _config: Option<&libvault::config::Config>,
+    _keys: &[&[u8]],
+) -> VaultResult<RustyVault> {
+    Err(VaultError::ReadonlyUnavailable)
 }
 
 #[derive(Clone)]
@@ -257,7 +280,7 @@ impl VaultCore {
         }
 
         let backend: Arc<dyn Backend> = Arc::new(JupiterBackend::new(vault_storage));
-        let seal_config = crate::vault::core::SealConfig {
+        let seal_config = libvault::core::SealConfig {
             secret_shares: 10,
             secret_threshold: 5,
         };
@@ -358,70 +381,25 @@ impl VaultCore {
     ///
     /// The vault is opened over a [`ReadonlyBackend`], so even a path that gets
     /// this wrong later fails hard rather than persisting.
+    ///
+    /// # Not built yet (VLT-02 → VLT-04)
+    ///
+    /// The vendored library carried monoengine's readonly bootstrap inside it:
+    /// a `Core.readonly` flag that made `post_unseal` load the mount table
+    /// instead of defaulting it, skip the built-in ACL policies, refuse to mint
+    /// a token salt, and leave the expired-lease worker unstarted. `libvault`
+    /// has none of that, and the plan is not to fork it — the bootstrap is
+    /// rebuilt here, on the crate's public API, by VLT-04.
+    ///
+    /// Until then this refuses by name. Falling back to [`Self::config`] would
+    /// be worse than failing: that path repairs exactly the state a readonly
+    /// open exists to leave alone, so an audit that "succeeded" through it
+    /// would be reporting on a vault its own bootstrap had just edited.
     pub async fn open_readonly(
-        vault_storage: VaultStorage,
-        key_path: PathBuf,
+        _vault_storage: VaultStorage,
+        _key_path: PathBuf,
     ) -> VaultResult<Self> {
-        let backend = Arc::new(ReadonlyBackend::new(Arc::new(JupiterBackend::new(
-            vault_storage,
-        ))));
-        let seal_config = crate::vault::core::SealConfig {
-            secret_shares: 10,
-            secret_threshold: 5,
-        };
-
-        let rvault = RustyVault::new_readonly(backend.clone(), None)
-            .map_err(|e| VaultError::RustyVaultCreate(e.to_string()))?;
-        let storage_initialized = rvault
-            .inited()
-            .await
-            .map_err(|e| VaultError::InitializationState(e.to_string()))?;
-
-        if !storage_initialized {
-            return Err(VaultError::ReadonlyNotInitialized);
-        }
-        if !key_path.exists() {
-            return Err(VaultError::CoreKeyMissing { path: key_path });
-        }
-
-        let core_key = read_core_key(&key_path)?;
-        let expected_shares = seal_config.secret_threshold as usize;
-        if core_key.secret_shares.len() < expected_shares {
-            return Err(VaultError::CoreKeyTooFewShares {
-                expected: expected_shares,
-                actual: core_key.secret_shares.len(),
-            });
-        }
-        if !core_key.runtime_tokens.is_complete() {
-            return Err(VaultError::ReadonlyRuntimeTokensIncomplete);
-        }
-
-        let mut unsealed = false;
-        for i in 0..seal_config.secret_threshold {
-            let key = &core_key.secret_shares[i as usize];
-            unsealed = rvault
-                .unseal(&[key.as_slice()])
-                .await
-                .map_err(|e| VaultError::Unseal(e.to_string()))?;
-            if unsealed {
-                break;
-            }
-        }
-        if !unsealed {
-            return Err(VaultError::Unseal(
-                "not enough valid key shares to unseal vault".to_string(),
-            ));
-        }
-
-        let runtime_tokens = Arc::new(core_key.runtime_tokens.clone());
-
-        Ok(Self {
-            rvault: rvault.into(),
-            key: Arc::new(core_key),
-            runtime_tokens,
-            audit: VaultAuditConfig::default(),
-            readonly: Some(backend),
-        })
+        Err(VaultError::ReadonlyUnavailable)
     }
 
     /// Whether this handle was opened readonly.

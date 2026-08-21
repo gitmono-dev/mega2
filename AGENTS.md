@@ -29,9 +29,11 @@ before submitting.
 - **Auth / policy:** `cedar-policy` (schema in `src/mega.cedarschema`,
   policies in `src/mega_policies.cedar`).
 - **Crypto / TLS:** `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`,
-  `secp256k1`, `pgp`. Vault‑style PKI/secret engine via the vendored
-  RustyVault module (`src/vault/`) and monoengine integration layer
-  (`src/contract/vault/`).
+  `secp256k1`, `pgp`. Vault‑style PKI/secret engine via the `libvault` crate
+  (crates.io `0.3.0`, features `storage_pg` + `crypto_adaptor_openssl`) and the
+  monoengine integration layer (`src/contract/vault/`). The RustyVault sources
+  used to be vendored under `src/vault/`; that module was removed on 2026-08-21
+  (`docs/plan/plan-20260820.md`), so import library types from `libvault::*`.
 - **Email:** `lettre` (rustls + tokio).
 - **Object storage:** `orbit-api` interface/config plus the sibling `../orbit`
   implementation crate (local FS, S3/S3-compatible, GCS).
@@ -125,9 +127,9 @@ src/
 │   └── tests.rs          # `pub mod tests` (cfg(test)) — shared test helpers
 ├── notification/         # email notifications: dispatcher, triggers, storage
 ├── email/                # Mailer trait + impls (incl. NoopMailer)
-├── vault/                # vendored RustyVault module used by VaultCore
 ├── contract/
-│   └── vault/            # PKI / KV / secret engine integration layer
+│   └── vault/            # PKI / KV / secret engine integration layer over the
+│       │                 # `libvault` crate (no vendored module since 2026-08-21)
 │       └── integration/
 │           ├── jupiter_backend.rs
 │           └── vault_core.rs # VaultCore, VaultCoreInterface
@@ -181,11 +183,13 @@ sibling `../orbit` implementation crate.
    ```rust
    use crate::contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface};
    ```
-3. **Glob re‑exports / top-level `vault` module.** `src/main.rs` declares a
-   vendored top-level `mod vault;`, which intentionally hides the `vault`
-   entity glob re-export from `pub use crate::callisto::*;`. Keep entity imports
-   explicit via `crate::callisto::vault`, and keep product integration imports
-   rooted under `crate::contract::vault`.
+3. **Glob re‑exports / the `vault` name.** There is no top-level `mod vault;`
+   any more — the vendored RustyVault module was removed on 2026-08-21 and the
+   library comes from the `libvault` crate. `crate::vault::*` is not a valid
+   path; `rg 'crate::vault' src bin` should stay at zero hits. Three different
+   things still share the name, so keep imports explicit: `crate::callisto::vault`
+   is the SeaORM entity, `crate::contract::vault` is the product integration
+   layer, and `libvault::*` is the library itself.
 4. **Crate‑level `dead_code` allow.** `#![allow(dead_code)]` in `main.rs`
    is intentional. If you add a new pub API item, you don't need to add
    per‑item allows; if you remove the crate‑level allow, expect ~70 warnings.

@@ -12,7 +12,7 @@
 2. **当前 `api_model` 已迁入 `contract::api`**。HTTP API DTO、分页类型、Artifact/Buck/Chat/Git commit wire types 均在 `src/contract/api/`。
 3. **Git/Vault/Policy 实现已迁入 contract**。原 Git HTTP/SSH 协议、VaultCore/PKI/PGP/Nostr、Cedar policy/entitystore/guard 代码分别位于 `src/contract/git_protocol/`、`src/contract/vault/`、`src/contract/policy/`。
 4. **旧模块入口不保留 re-export**。`crate::api_model`、`crate::git_protocol`、`crate::saturn`、`crate::api::guard` 不再作为有效代码路径。
-5. **`crate::vault` 是有意保留的 vendored RustyVault 实现模块**，不在本次归并范围内。`src/lib.rs` 仍声明顶层 `mod vault;`（vendored RustyVault，见 `AGENTS.md` 的 vault pitfalls）；`contract::vault` 只是包裹它的集成/消费层（`VaultCore`/PKI/PGP/Nostr 等），两者并存。因此 `crate::vault::*` 仍是有效代码路径，但仅指 vendored 实现，不指产品集成层。
+5. **`crate::vault` 已不存在**（2026-08-21，`plan-20260820` VLT-02）。vendored RustyVault 的 82 个 `.rs` 与 `src/lib.rs` 的顶层 `mod vault;` 已删除，改为 crates.io 依赖 `libvault = "0.3.0"`（`storage_pg` + `crypto_adaptor_openssl`）。库类型一律从 `libvault::*` 引入，`RvError` 由 `crate::common::errors` 重导出 `libvault::errors::RvError`；`contract::vault` 仍是包裹它的集成/消费层（`VaultCore`/PKI/PGP/Nostr 等）。`crate::vault::*` **不再是有效代码路径**，`rg 'crate::vault' src bin` 应当零命中。
 6. **数据库实体不迁移**。`callisto::vault` 是 SeaORM 实体模块，不属于 contract 归并范围。
 
 ## 当前实现状态速览表
@@ -31,7 +31,7 @@
 
 1. **不改变 wire behavior**：HTTP 路径、JSON 字段、OpenAPI schema、Git smart protocol 字节流、Vault secret 数据格式和权限判定语义都不能因路径迁移改变。
 2. **不混淆实体与 contract**：`callisto::*` 仍是数据库实体层，尤其 `callisto::vault` 必须保持原路径。
-3. **旧路径不得回流**：新代码不得重新引入 `api_model`、顶层 `git_protocol`、顶层 `saturn` 或 `api::guard`；产品级 Vault 集成代码只能走 `contract::vault`。此约束**不**针对有意保留的 vendored RustyVault 模块——顶层 `mod vault;`（`crate::vault`）是该 vendored 实现的合法落点（见事实校准第 5 条），不属于回流。
+3. **旧路径不得回流**：新代码不得重新引入 `api_model`、顶层 `git_protocol`、顶层 `saturn`、`api::guard` 或顶层 `mod vault;`；产品级 Vault 集成代码只能走 `contract::vault`，库类型一律走 `libvault::*`（见事实校准第 5 条）。
 4. **contract 可以包含实现，但边界要清楚**：本项目中的 `contract` 表示外部协议、安全边界和权限策略聚合，不等同于纯 DTO。
 
 ## 现状与目标对比
@@ -54,8 +54,8 @@
 
 > **验收标准**：
 > - `cargo check` 通过。
-> - `rg "api_model|crate::git_protocol|crate::saturn|api::guard" src` 不命中有效代码引用。
->   （注意：`crate::vault` **不**包含在此 grep 内——它是有意保留的 vendored RustyVault 实现模块，见事实校准第 5 条；产品集成层一律走 `contract::vault`。）
+> - `rg "api_model|crate::git_protocol|crate::saturn|api::guard|crate::vault" src` 不命中有效代码引用。
+>   （`crate::vault` 自 2026-08-21 起也进入此 grep：vendored 模块已删除，见事实校准第 5 条；产品集成层走 `contract::vault`，库类型走 `libvault::*`。）
 
 **阶段 1 — 文档同步**
 
@@ -308,14 +308,16 @@
 审计/只读运维命令要能声称「什么都没改」，就不能走生产引导路径。常规 unseal 在读到第一个 secret 之前就会写：mount 表缺失时补写默认 mount、旧格式条目回写、默认 ACL policy 补写、token salt 补写，并启动一个按 200ms tick **撤销过期租约并删除其记录**的线程。绕开 `VaultCore::config()` 不够——这些副作用在 `Core::post_unseal()` 里。
 
 - **入口**：`VaultCore::open_readonly(vault_storage, key_path)`（`src/contract/vault/integration/vault_core.rs`）。它要求一切都已存在：storage 已初始化、key 文件存在且份额足够、`runtime_tokens` 完整。任一不满足都是**报告**而不是修补——补签一个缺失的 runtime token 本身就是「写 policy + 签发 token + 回写 key 文件」，正是本模式要避免的。同理，它不初始化、不回写 key 文件、不撤销 root token。
-- **核心开关**：`Core::readonly`（构造时确定、终生不变，`src/vault/core.rs`）。`RustyVault::new_readonly()` 据此装配。三个控制点：
-  - `post_unseal()` 走 `MountTable::load_readonly()`：只 load，不 `load_or_default`；表缺失或存在旧格式条目（需要 `mount_update` 回写）一律 `ErrCoreReadonlyStateIncomplete` **fail-closed**——凭空造出来的 mount 表不是运行中服务器用的那张，据此出报告比拒绝更糟。
-  - `AuthModule::init()` 走 `load_auth_readonly()`（同样只 load、fail-closed），且**不调用** `start_check_expired_lease_entries()`。租约恢复走 `restore_readonly()`：`load_lease_entry()` 遇到旧格式条目会**转换后写回**，只读下这个写只会被最终保险拦下、调用方拿到的是「写被拒绝」而不是真实状况；因此旧格式租约在此**具名 fail-closed**（与旧格式 mount 表同样处理），当前格式的条目照常读进内存队列——没有 worker 就没有人去动它。
-  - `PolicyModule::init()` 跳过 `setup_policy()`；`TokenStore::new()` 在 salt 缺失时 fail-closed 而不是新签一个（新 salt 会静默改变该 vault 里每个 token 的哈希方式）。
+- **核心开关（迁移中，2026-08-21）**：该模式原先靠 vendored 库内的 `Core::readonly` 标志实现，vendored 已随 `plan-20260820` VLT-02 删除。crates.io 的 `libvault` 没有、也不打算有这个标志——「这个句柄是只读打开的」是 monoengine 的概念，不是库的。取而代之的形态是集成层的 **shadow-unseal**：自行驱动 barrier 解封与一个只读版 post-unseal，从而根本不去请求 `Core::post_unseal` 无条件执行的那些修补。可行性与公共 API 清单见 `vault.md` 的「VLT-S1」节。三个控制点在新形态下的落点：
+  - mount 表：只 `MountTable::load`，不 `load_or_default`；表缺失或存在旧格式条目（需要 `mount_update` 回写）一律 `VaultError::ReadonlyStateIncomplete` **fail-closed**——凭空造出来的 mount 表不是运行中服务器用的那张，据此出报告比拒绝更糟。auth mount 表同理，不走 `AuthModule::load_auth`。
+  - 过期租约 worker：只读引导**不运行** `AuthModule::init`，而 `AuthModule::init` 是库内唯一启动该 worker 的地方。租约改为只读扫描：旧格式条目**具名 fail-closed**（与旧格式 mount 表同样处理），因为库的恢复路径遇到旧格式会**转换后写回**，只读下这个写只会被最终保险拦下、调用方拿到的是「写被拒绝」而不是真实状况。
+  - 默认 policy 与 token salt：跳过 `PolicyModule::setup_policy()`；salt 在 `TokenStore::new()` **之前**预读，缺失即 fail-closed 而不是让它新签一个（新 salt 会静默改变该 vault 里每个 token 的哈希方式）。
   - mounts monitor **不创建**，无论配置的 interval 是多少：它是一个会在审计读取期间重载并可能重新挂载的后台线程。
-- **最终保险**：`ReadonlyBackend`（`src/vault/storage/readonly.rs`）包住物理 backend，`put`/`delete` 一律硬失败并计数。它是最后一道而不是第一道——上面每条路径都能被 review、也都可能漂移，这一层则没有通往被包 backend 的路径。**拒绝必须是错误，不能是静默 no-op**：被吞掉的写会让调用方以为状态已持久化。`VaultCore::denied_writes()` 暴露计数，正常只读运行应当为 0；非 0 意味着上层仍有人尝试写、只是被这层拦住了。
+- **最终保险**：`ReadonlyBackend`（已迁至 `src/contract/vault/integration/readonly_backend.rs`）包住物理 backend，`put`/`delete` 一律硬失败并计数。它是最后一道而不是第一道——上面每条路径都能被 review、也都可能漂移，这一层则没有通往被包 backend 的路径。**拒绝必须是错误，不能是静默 no-op**：被吞掉的写会让调用方以为状态已持久化。错误标识分两层：具名层用 `VaultError::ReadonlyWriteDenied`（写发生**之前**就拒绝），保险层回到库只有 `RvError` 一条通道，选定的唯一变体是 `RvError::ErrString(READONLY_WRITE_DENIED)`。`VaultCore::denied_writes()` 暴露计数，正常只读运行应当为 0；非 0 意味着上层仍有人尝试写、只是被这层拦住了。
 
-测试（`src/vault/un31_readonly.rs`）**成对**写：可写侧证明该修补对这份 storage 确实会发生，只读侧证明它没发生。单侧断言在一个「本来就没什么可修」的 fixture 上同样会通过。后台线程是**直接断言**（`mounts_monitor.is_none()`、`ExpirationManager::is_lease_checker_started()`），不是从「没观察到副作用」倒推——后者只是和 200ms tick 赛跑。
+**当前状态（VLT-02 中间态）**：`VaultCore::open_readonly` 与库级 `open_readonly_core` 均为**具名 fail-closed 桩**（`VaultError::ReadonlyUnavailable`），不回退到可写路径——回退会修补掉只读打开正要保全的那份状态。迁至 `src/contract/vault/integration/un31_readonly.rs` 的十二个用例连同 `un43_a_needed_vault_is_opened_read_only_and_unchanged`、`integration_readonly_assembly_changes_nothing` 一并 `#[ignore = "VLT-04"]`（**保留不删**），由 VLT-04 换回真实实现并解除。
+
+测试**成对**写：可写侧证明该修补对这份 storage 确实会发生，只读侧证明它没发生。单侧断言在一个「本来就没什么可修」的 fixture 上同样会通过。后台线程是**直接断言**（`mounts_monitor.load().is_none()`、`AuthModule.expiration.load().is_none()`），不是从「没观察到副作用」倒推——后者只是和 200ms tick 赛跑。
 
 ## `JupiterBackend::list` 的契约（FIX-04）
 

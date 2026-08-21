@@ -20,7 +20,7 @@ mod vault;
 pub use api::ApiError;
 pub(crate) use api::map_ceres_error;
 pub use policy::{ContextError, SaturnContextError};
-pub use vault::{CryptoError, RvError, SealBoxError, VaultError, VaultResult};
+pub use vault::{RvError, VaultError, VaultResult};
 
 pub type MegaResult = Result<(), MegaError>;
 

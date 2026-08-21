@@ -1,12 +1,12 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
+use libvault::storage::{Backend, BackendEntry};
 
 use crate::{
     callisto::vault,
     common::errors::{MegaError, RvError},
     jupiter::storage::vault_storage::VaultStorage,
-    vault::storage::{Backend, BackendEntry},
 };
 
 pub struct JupiterBackend {
