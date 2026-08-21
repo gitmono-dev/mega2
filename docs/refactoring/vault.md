@@ -285,6 +285,8 @@ vendored 已删除。`src/vault/` 的 82 个 `.rs`（连同 `README.md` 与三�
 2. `FIX-VLT-01`：D 组 clippy 在 CI 的 stable **1.98.0** 上有两条错误，本地 1.97.1 不触发——一条在 vendored `pki/util.rs`（随 VLT-02 删除自动消失），一条在本仓自有 `src/api/router/lfs_router.rs`。后者按 ER-10 另立卡并入本家族。该红在本计划开工前就存在（上一次 push 同一步骤已 failure），本次发布一并关闭。
 3. 事实基线低估：vendored↔上游另有两处**非只读**功能性分歧（`policy_store.rs` 的 ACL 持久回落、`token_store.rs` 的明文 token debug 日志），处置见「VLT-S1」节与 `DEFER-VLT-04`。
 
+**D 组结论（2026-08-21）**：D1 `config-validation` = **success**（run 32441837770）——`v0.2.67` 那一轮失败的 clippy 步骤本轮已绿。D2 `git-protocol-smoke` 在 `v0.2.68` 那一轮 failure，根因是 hosted runner 镜像把预装 git 由 2.54.0 滚到 2.55.0、与工作流 pin 不符（失败于第二步，二进制尚未构建，与本次内容无关），已按 ER-04 前滚：`FIX-VLT-02` 上调 pin 并同步 test-infra 登记条目后，同一 workflow run 32442145005 = **success**。
+
 **降级指引（`immutable-release`）**：已推送提交不回退。只读引导若在生产暴露缺陷，降级方式是**不使用只读入口**（`authz-audit` 等只读运维路径），常规读写路径不受影响——它走 `VaultCore::config`，与本次改动的只读分支无交集；缺陷按 ER-10 前滚修复。
 
 ## 当前实现概览
