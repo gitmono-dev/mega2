@@ -38,7 +38,7 @@
 
 1. **Compose = 数据面**：`docker-compose.test.yml` 提供 Postgres / Redis / RustFS 等
    monoengine 依赖；Mailpit 仅供 website 的认证/产品邮件 IT 捕获，**不**替代用例内拉起的被测进程。
-2. **黑盒隔离**：`bin/tests/integration_*.rs` 通过 `CARGO_BIN_EXE_monoengine`
+2. **黑盒隔离**：`tests/integration_*.rs` 通过 `CARGO_BIN_EXE_monoengine`
    按用例启动独立 `service http`（独立端口、临时目录、隔离 DB）。
 3. **`--profile app` ≠ 隔离 IT**：compose 常驻 `monoengine`（`:19180`）只做栈级
    smoke / 手工探针；**不**替代黑盒 per-case 隔离。
@@ -50,7 +50,7 @@
 | --- | --- |
 | OS | **全量 IT / `git-cli` 验收目标为 Linux**（host 网络）；非 Linux 可跑数据面 + 不含 git-cli 的子集 |
 | 工具 | Docker Compose v2、Rust stable、nightly（仅 `rustfmt` 门禁） |
-| 仓库布局 | 源码构建 compose `monoengine` 时需要 sibling `../orbit` |
+| 仓库布局 | 对象存储内联于 `src/orbit_api/` + `src/orbit/`；compose 构建 monoui 时仍需 sibling `../monoui` |
 | 配置 | 从示例生成本地 env（不提交）：`cp .env.test.example .env.test`（`dev-test.sh` 会自动创建） |
 
 公开测试凭据（仅 IT 栈，已写在 compose / example 中）：
@@ -66,7 +66,7 @@
 ./scripts/dev-test.sh unit
 # 或按子串过滤
 ./scripts/dev-test.sh unit <substring> -- --nocapture
-# 等价手贴：cargo test -p monoengine-core --lib
+# 等价手贴：cargo test -p monoengine --lib
 ```
 
 需要 DB / Redis 的 crate 内集成与多数黑盒用例：先起**默认数据面**，再注入 env：

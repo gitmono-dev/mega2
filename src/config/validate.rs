@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 use toml::Value;
 use url::Url;
 
@@ -14,7 +13,10 @@ use super::{
     OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
     secret::{SecretRef, is_secret_ref_value},
 };
-use crate::common::errors::MegaError;
+use crate::{
+    common::errors::MegaError,
+    orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig},
+};
 
 const MEGA_ENV_PREFIX: &str = "MEGA_";
 const RESERVED_MEGA_ENV_VARS: &[&str] = &[
@@ -1543,10 +1545,11 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(test)]
 mod tests {
-    use orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
-
     use super::*;
-    use crate::config::{template::config_init_template, testing::isolated_config};
+    use crate::{
+        config::{template::config_init_template, testing::isolated_config},
+        orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config},
+    };
 
     fn valid_config() -> Config {
         isolated_config(std::env::temp_dir().join("monoengine-config-validate-tests"))

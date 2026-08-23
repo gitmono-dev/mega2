@@ -1,7 +1,8 @@
 # Build monoengine for the IT compose stack.
 #
-# Build context MUST be the parent directory that contains both
-# `monoengine/` and `orbit/` (path deps). From the monoengine repo root:
+# All path deps (monoengine, bin, crates/orbit, crates/orbit-api) live inside
+# the `monoengine/` directory in the build context, so only that directory is
+# copied. From the monoengine repo root:
 #
 #   docker compose -p monoengine-it -f docker-compose.test.yml --profile app build monoengine
 #
@@ -21,7 +22,6 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY monoengine /src/monoengine
-COPY orbit /src/orbit
 
 WORKDIR /src/monoengine
 ARG TARGETARCH

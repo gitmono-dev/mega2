@@ -4455,26 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.2.68"
-dependencies = [
- "async-trait",
- "jemallocator",
- "libc",
- "mimalloc",
- "monoengine-core",
- "orbit",
- "orbit-api",
- "reqwest 0.13.4",
- "sea-orm 2.0.0",
- "serde_json",
- "tempfile",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "monoengine-core"
-version = "0.2.68"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4519,15 +4500,17 @@ dependencies = [
  "indexmap 2.14.0",
  "ipnetwork 0.21.1",
  "itertools 0.15.0",
+ "jemallocator",
  "lazy_static",
  "libc",
  "libvault",
  "lockfile",
  "log",
+ "mimalloc",
+ "object_store",
  "once_cell",
  "openssl",
  "openssl-sys",
- "orbit-api",
  "parse-display",
  "pem 4.0.0",
  "percent-encoding",
@@ -5010,39 +4993,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "orbit"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "object_store",
- "orbit-api",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "toml 1.1.4+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "orbit-api"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "toml 1.1.4+spec-1.1.0",
-]
 
 [[package]]
 name = "ordered-float"

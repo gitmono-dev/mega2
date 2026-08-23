@@ -21,7 +21,6 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
-use orbit_api::object_storage::MultiObjectByteStream;
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -43,6 +42,7 @@ use crate::{
         storage::{Storage, git_db_storage::GitDbStorage},
         utils::converter::{FromGitModel, FromMegaModel},
     },
+    orbit_api::object_storage::MultiObjectByteStream,
 };
 
 pub struct ImportRepo {

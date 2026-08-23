@@ -40,26 +40,6 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-// ---------------------------------------------------------------- object store
-
-/// 与 `bin/src/main.rs` 里注册的是同一个 provider。
-///
-/// 只读装配要真的构造对象存储，因此测试进程必须像真实二进制那样注册它——换一个替身就等于
-/// 在测另一套装配。
-struct OrbitObjectStorageProvider;
-
-#[async_trait::async_trait]
-impl monoengine_core::ObjectStorageProvider for OrbitObjectStorageProvider {
-    async fn build(
-        &self,
-        cfg: &orbit_api::factory::ObjectStorageConfig,
-    ) -> Result<orbit_api::factory::MegaObjectStorageWrapper, monoengine_core::MegaError> {
-        orbit::factory::ObjectStorageFactory::build(cfg)
-            .await
-            .map_err(Into::into)
-    }
-}
-
 // ---------------------------------------------------------------- environment
 
 fn integration_postgres_url() -> String {
@@ -751,8 +731,6 @@ impl Fixture {
 /// 只读装配跑完，库、refs、对象一字未动。
 #[test]
 fn integration_readonly_assembly_changes_nothing() {
-    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
-
     let fixture = Fixture::new();
     fixture.seed_through_the_real_binary();
 
@@ -984,8 +962,6 @@ fn run_audit(fixture: &Fixture, args: &[&str]) -> (i32, String, String) {
 /// UN-29：真实二进制审计面（bootstrap → promote 库桥 → compare）与 fsync 工具模式。
 #[test]
 fn integration_authz_audit_cli_bootstrap_compare_fsync() {
-    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
-
     let fixture = Fixture::new();
     fixture.seed_through_the_real_binary();
 
@@ -1402,7 +1378,6 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
 /// UN-52：真实二进制 run-init / run-commit / run-abort（含 cap fencing）。
 #[test]
 fn integration_authz_audit_run_lifecycle() {
-    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
     let fixture = Fixture::new();
     // No DB seed required — pure file modes.
     let restricted = fixture._temp.path().join("restricted-run");
@@ -1661,7 +1636,6 @@ fn integration_authz_audit_run_lifecycle() {
 /// UN-55：真实二进制 protect / unprotect（往返、P 上限、预留-结算）。
 #[test]
 fn integration_authz_audit_protect_registry() {
-    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
     let fixture = Fixture::new();
     let restricted = fixture._temp.path().join("restricted-protect");
     fs::create_dir_all(&restricted).expect("root");
@@ -1846,7 +1820,6 @@ fn integration_authz_audit_evidence_append() {
         thread,
     };
 
-    monoengine_core::set_object_storage_provider(Arc::new(OrbitObjectStorageProvider));
     let fixture = Fixture::new();
     let restricted = fixture._temp.path().join("restricted-evidence");
     fs::create_dir_all(&restricted).expect("root");
@@ -1868,6 +1841,7 @@ fn integration_authz_audit_evidence_append() {
     // Hold .lease.lock across appends (must not block .evidence.lock RMW).
     let lease = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)

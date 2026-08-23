@@ -4,7 +4,6 @@ use anyhow::Result;
 use bytes::Bytes;
 use chrono::prelude::*;
 use futures::{Stream, StreamExt};
-use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 use rand::prelude::*;
 use reqwest::Method;
 use sha2::{Digest, Sha256};
@@ -22,6 +21,7 @@ use crate::{
         storage::{lfs_db_storage::LfsDbStorage, object_storage::MegaObjectStorageWrapper},
         utils::into_obj_stream::IntoObjectStream,
     },
+    orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
 /// Namespaces an LFS lock row key by repository so that identical ref names in

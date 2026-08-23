@@ -77,7 +77,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 以下原则适用于 PT-01 至 PT-12：
 
 1. **忠实移植优先于重新设计。** 默认保留 Mega 的 wire 行为、DB schema、API 契约和错误语义；架构性偏离必须是已决 ADR 并记录在案（如 contract 归并、config 提升、workspace 拆分），不得在执行中临时发明。
-2. **monoengine 的架构改进不回退。** workspace（`monoengine-core` + thin `bin`）、`src/contract/` 边界归并、一级 `src/config/`、`src/notification/`（邮件投递已迁 website，见 ADR-WA-08）、Vault（crates.io `libvault` + `src/contract/vault/` 集成层加固；不得回流为内嵌 vendored fork，亦不得因与 Mega `libvault-core` 目录差异而回退——依赖形态演进见 [`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）、orbit provider 注入、对象存储构造时机等已交付改进，不因"与 Mega 不一致"而改回。
+2. **monoengine 的架构改进不回退。** 单 package `monoengine`（lib `monoengine_core` + `[[bin]]`）、`src/contract/` 边界归并、一级 `src/config/`、`src/notification/`（邮件投递已迁 website，见 ADR-WA-08）、Vault（crates.io `libvault` + `src/contract/vault/` 集成层加固；不得回流为内嵌 vendored fork，亦不得因与 Mega `libvault-core` 目录差异而回退——依赖形态演进见 [`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）、orbit 内联于 `src/orbit_api/` + `src/orbit/`（见 [`plan-20260824.md`](plan-20260824.md)）、对象存储构造时机等已交付改进，不因"与 Mega 不一致"而改回。
 3. **移植前必须 pin 并核对 Mega revision。** 每个日期计划开工前用 libra 记录 Mega 实际 checkout revision，逐文件刷新源码锚点；不得把浮动 `main`、历史同步报告或本文快照当作当前事实。
 4. **先追平、后扩展。** 已移植模块的 Mega 基线漂移（PT-02）优先于在其上叠加新能力；在漂移窗口上实施新 PT 前，必须先确认相关模块的 Mega 变更已被吸收或明确排除。
 5. **三门验收是硬门禁。** 每个任务至少通过 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test ...` 指定用例；`cargo build [--tests]` 保持 0 错误 0 警告。

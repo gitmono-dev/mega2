@@ -5,7 +5,6 @@ use std::{
 
 use chrono::Utc;
 use idgenerator::IdInstance;
-use orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, TransactionTrait};
 use uuid::Uuid;
 
@@ -31,6 +30,7 @@ use crate::{
         },
         utils::{id_generator, into_obj_stream::IntoObjectStream},
     },
+    orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
 /// Result of one blob GC pass (`docs/artifacts-protocol.md` §10.6).

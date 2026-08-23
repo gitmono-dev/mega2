@@ -55,8 +55,8 @@ impl AppContext {
     /// credentials supplied as vault `SecretRef`s
     /// (`object_storage.s3.access_key_id` / `secret_access_key` = `vault://…`) be
     /// resolved before the object store is constructed. The concrete object store
-    /// is built here through the binary-registered `ObjectStorageProvider`, so the
-    /// callers no longer pre-build and inject it.
+    /// is built here via the inlined orbit factory, so callers no longer
+    /// pre-build and inject it.
     pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
@@ -271,8 +271,8 @@ async fn resolve_credential(
 fn object_storage_needs_vault(config: &ObjectStorageConfig) -> bool {
     let s3_like = matches!(
         config.storage_type,
-        orbit_api::factory::ObjectStorageBackend::S3
-            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+        crate::orbit_api::factory::ObjectStorageBackend::S3
+            | crate::orbit_api::factory::ObjectStorageBackend::S3Compatible
     );
     if !s3_like {
         return false;
@@ -290,8 +290,8 @@ async fn resolve_object_storage_secrets(
     // backends; Local/GCS configs do not consume the `s3.*` fields.
     let s3_like = matches!(
         config.storage_type,
-        orbit_api::factory::ObjectStorageBackend::S3
-            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+        crate::orbit_api::factory::ObjectStorageBackend::S3
+            | crate::orbit_api::factory::ObjectStorageBackend::S3Compatible
     );
     if !s3_like {
         return Ok(config.clone());
@@ -537,7 +537,7 @@ mod tests {
             .expect("write access key secret");
 
         let mut config = ObjectStorageConfig {
-            storage_type: orbit_api::factory::ObjectStorageBackend::S3,
+            storage_type: crate::orbit_api::factory::ObjectStorageBackend::S3,
             ..Default::default()
         };
         config.s3.access_key_id =
@@ -576,7 +576,7 @@ mod tests {
         }
 
         let mut config = ObjectStorageConfig {
-            storage_type: orbit_api::factory::ObjectStorageBackend::S3,
+            storage_type: crate::orbit_api::factory::ObjectStorageBackend::S3,
             ..Default::default()
         };
         config.s3.access_key_id =
@@ -603,7 +603,7 @@ mod tests {
         .expect("vault init");
 
         let mut config = ObjectStorageConfig {
-            storage_type: orbit_api::factory::ObjectStorageBackend::S3,
+            storage_type: crate::orbit_api::factory::ObjectStorageBackend::S3,
             ..Default::default()
         };
         config.s3.access_key_id =

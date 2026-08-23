@@ -5,12 +5,12 @@
 
 use clap::{Arg, ArgMatches, Command};
 use futures::StreamExt;
-use orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace};
 
 use crate::{
     commands::{CommandContext, require_config},
     common::errors::{MegaError, MegaResult},
     context::AppContext,
+    orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
 pub fn cli() -> Command {

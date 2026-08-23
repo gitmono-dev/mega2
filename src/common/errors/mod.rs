@@ -8,10 +8,9 @@ use axum::{
 use cedar_policy::ParseErrors;
 use config::ConfigError;
 use git_internal::errors::GitError;
-use orbit_api::error::IoOrbitError;
 use thiserror::Error;
 
-use crate::contract::api::common::CommonResult;
+use crate::{contract::api::common::CommonResult, orbit_api::error::IoOrbitError};
 
 mod api;
 mod policy;

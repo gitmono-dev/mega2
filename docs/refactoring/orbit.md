@@ -1,4 +1,12 @@
-# Orbit 依赖重构方案分析（项目引用 → API 依赖）
+# Orbit 对象存储（已内联）
+
+> **当前拓扑（plan-20260824，2026-08-24 落地）：** orbit 契约与实现已迁入本 package：
+> `src/orbit_api/`（traits、config、errors）与 `src/orbit/`（`object_store` 后端）。
+> 对象存储由 `src/jupiter/storage/object_storage.rs::build_object_storage` 直接调用
+> `crate::orbit::factory::ObjectStorageFactory::build`；**无** `ObjectStorageProvider`
+> 进程级注册表，**无** 独立 `crates/orbit*` workspace 成员。
+>
+> 下列历史正文记录自 2026-06 起的 provider 注入 + workspace crate 演进，保留供审计。
 
 本文档记录 `monoengine` 对 `orbit` 对象存储库的依赖治理：把当前对 **orbit 实现 crate** 的**项目（path）引用**重构为只依赖 **`orbit-api`（纯 API/契约 crate）**，并通过依赖注入把唯一的具体实现构造点下沉到组合根 / 独立二进制边界。
 
@@ -11,6 +19,8 @@
 > **集成测试指引**：对象存储 4 种后端（`S3` / `S3Compatible` / `Gcs` / `Local`）的构造与读写行为必须保持不变。应通过 **`integration.md`** 中的对象存储 / 服务启动场景（本地后端 put/get、服务 `service http` 启动）端到端验证重构前后行为一致。
 
 > **实现状态（2026-06-19）：阶段 0–3 已全部落地并通过门禁。** monoengine 已拆分为 Cargo workspace：根 crate `monoengine-core`（lib，**只依赖 `orbit-api`**）+ `bin/` crate `monoengine`（瘦二进制，依赖 `monoengine-core` + `orbit` 实现）。核心改造：在 `src/jupiter/storage/object_storage.rs` 定义 `ObjectStorageProvider` trait + 进程级注册表（`set_object_storage_provider` / `build_object_storage`）；`Storage::new` / `AppContext::new` 改为接收注入的 `MegaObjectStorageWrapper` 值；`service` / `chat-migrate` 两个 exec 通过注册的 provider 构造对象存储；`bin/src/main.rs` 注册 `OrbitObjectStorageProvider`（唯一调用 `orbit::factory::ObjectStorageFactory::build` 处）。验收：`cargo tree -p monoengine-core` 的 `object_store` 计数 = 0、orbit-impl 计数 = 0；`bin` 的 `object_store` 计数 = 1。门禁：workspace `fmt` / `clippy -D warnings` 通过，`monoengine-core` 单测 530 passed，`monoengine` 集成测试 4 passed，二进制 `config init`/`validate` 烟雾通过。详见各阶段下的"✅ 已落地"标注。
+
+> **实现状态（2026-08-22）：orbit 两个 crate 已并入本 workspace（"方案 B"）。** `crates/orbit` + `crates/orbit-api`（原 sibling `../orbit/crates/*`）整体拷入本仓 `crates/`，`Cargo.toml` workspace `members = ["bin", "crates/orbit", "crates/orbit-api"]`；`Cargo.toml` 依赖改为 `orbit-api = { path = "crates/orbit-api" }`，`bin/Cargo.toml` 改为 `orbit = { path = "../crates/orbit" }` / `orbit-api = { path = "../crates/orbit-api" }`。crate 边界与依赖方向零变化：core 仍只依赖 `orbit-api`，仍不出现 `orbit::`（实现 crate）源码引用；实测 `cargo tree -e features` 确认 core 的 `object_store` 仅启用 `default/fs/tokio/walkdir`（无 `cloud/aws/gcp`，`aws-lc-rs` 为 rustls TLS 后端，与 AWS 无关），`cloud/aws/gcp` 仍仅存在于 `bin` 的编译图（注：`cargo tree` 中 core 的 `object_store` 计数为 1 系 `orbit-api` 自带依赖，合并前即如此，2026-06-19 的"计数=0"验收口径应理解为"*带 cloud 特性的* object_store = 0"）。同步改动：`Dockerfile` 去掉 `COPY orbit`（path 依赖全在 `monoengine/` 内）；两个 CI workflow（`config-validation.yml` / `git-protocol-smoke.yml`）删除 orbit sibling checkout 步骤（`ORBIT_CHECKOUT_TOKEN` 作为 monoui token 的 fallback secret 名保留未动）；README / docs/development.md 更新目录布局描述。门禁：`cargo +nightly fmt --all --check` 通过（对 `crates/orbit` 既有 2 处 rustfmt 差异已按本仓 rustfmt.toml 修正）；`cargo clippy --all-targets --all-features -- -D warnings` 通过；`cargo test` 中对象存储 / authz / vault / git 协议相关用例全绿（环境受限未跑的用例见下）。验收命令不变。
 
 ## 事实校准（2026-06-19）
 

@@ -42,6 +42,10 @@ Run the normal project gate with the test environment loaded:
 source .env.test && cargo test --all
 ```
 
+Integration test sources live under `tests/integration_*.rs` on the `monoengine`
+package (lib `monoengine_core`). Black-box tests drive the real CLI via
+`CARGO_BIN_EXE_monoengine`.
+
 For the real website-session and internal-mail checks:
 
 ```bash

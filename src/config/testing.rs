@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig};
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuildConfig, CedarConfig, Config, DbConfig, GitConfig,
@@ -18,7 +17,10 @@ use super::{
     SidebarConfig,
     secret::{SecretRef, SecretResolver},
 };
-use crate::common::errors::MegaError;
+use crate::{
+    common::errors::MegaError,
+    orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig},
+};
 
 pub const DEFAULT_TEST_DATABASE_URL: &str = "postgres://localhost:5432/monoengine_test";
 pub const DEFAULT_TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";

@@ -1,68 +1,40 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-pub use orbit_api::factory::MegaObjectStorageWrapper;
-use orbit_api::{
-    error::{IoOrbitError, OrbitResult},
-    log_storage::{LogManifest, LogStorage},
-    object_storage::{MegaObjectStorage, ObjectByteStream, ObjectKey, ObjectMeta},
-};
 use reqwest::Method;
 
-use crate::{common::errors::MegaError, config::ObjectStorageConfig};
+pub use crate::orbit_api::factory::MegaObjectStorageWrapper;
+use crate::{
+    common::errors::MegaError,
+    config::ObjectStorageConfig,
+    orbit_api::{
+        error::{IoOrbitError, OrbitResult},
+        log_storage::{LogManifest, LogStorage},
+        object_storage::{MegaObjectStorage, ObjectByteStream, ObjectKey, ObjectMeta},
+    },
+};
 
-/// Abstraction for constructing the concrete object-storage backend from config.
-///
-/// monoengine's core depends only on this trait plus `orbit-api` types; the
-/// concrete implementation (backed by the heavy `orbit` crate that pulls
-/// `object_store` + cloud SDKs) is registered by the binary at startup via
-/// [`set_object_storage_provider`]. This is the seam that lets the core be
-/// refactored to an API-only dependency on `orbit-api`. See
-/// `docs/refactoring/orbit.md`.
-#[async_trait::async_trait]
-pub trait ObjectStorageProvider: Send + Sync {
-    async fn build(&self, cfg: &ObjectStorageConfig)
-    -> Result<MegaObjectStorageWrapper, MegaError>;
-}
-
-static OBJECT_STORAGE_PROVIDER: OnceLock<Arc<dyn ObjectStorageProvider>> = OnceLock::new();
-
-/// Register the process-wide object-storage provider. The binary (composition
-/// root) calls this once at startup, before any command builds an `AppContext`.
-/// Subsequent calls are ignored.
-pub fn set_object_storage_provider(provider: Arc<dyn ObjectStorageProvider>) {
-    let _ = OBJECT_STORAGE_PROVIDER.set(provider);
-}
-
-/// Build object storage for `cfg` via the registered provider.
-///
-/// Returns a diagnostic error if no provider has been registered (a binary
-/// wiring bug — the binary must call [`set_object_storage_provider`]).
+/// Build object storage for `cfg` via the inlined orbit factory.
 pub async fn build_object_storage(
     cfg: &ObjectStorageConfig,
 ) -> Result<MegaObjectStorageWrapper, MegaError> {
-    let provider = OBJECT_STORAGE_PROVIDER.get().ok_or_else(|| {
-        MegaError::Other(
-            "object storage provider not registered; the binary must call \
-             set_object_storage_provider() at startup"
-                .to_string(),
-        )
-    })?;
-    provider.build(cfg).await.map_err(|e| {
-        let redacted = crate::config::redaction::global_redactor().redact(&e.to_string());
-        tracing::warn!(
-            endpoint = %crate::config::redaction::redact_object_storage_endpoint(
-                &cfg.s3.endpoint_url
-            ),
-            access_key = %crate::config::redaction::redact_secret_value(&cfg.s3.access_key_id),
-            "object storage build failed"
-        );
-        MegaError::Other(format!("object storage build failed: {redacted}"))
-    })
+    crate::orbit::factory::ObjectStorageFactory::build(cfg)
+        .await
+        .map_err(|e| {
+            let redacted = crate::config::redaction::global_redactor().redact(&e.to_string());
+            tracing::warn!(
+                endpoint = %crate::config::redaction::redact_object_storage_endpoint(
+                    &cfg.s3.endpoint_url
+                ),
+                access_key = %crate::config::redaction::redact_secret_value(&cfg.s3.access_key_id),
+                "object storage build failed"
+            );
+            MegaError::Other(format!("object storage build failed: {redacted}"))
+        })
 }
 
 #[derive(Default)]

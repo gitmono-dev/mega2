@@ -61,7 +61,6 @@ use git_internal::{
         },
     },
 };
-use orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 use regex::Regex;
 use tracing::debug;
 
@@ -124,6 +123,7 @@ use crate::{
         },
         utils::converter::{FromMegaModel, IntoMegaModel, generate_git_keep_with_timestamp},
     },
+    orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
 #[derive(Clone)]

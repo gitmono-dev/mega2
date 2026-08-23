@@ -8,10 +8,10 @@ use std::{
 
 pub use ::config as c;
 use c::{ConfigError, FileFormat, Source};
-pub use orbit_api::factory::ObjectStorageConfig;
 use serde::de::DeserializeOwned;
 
 use crate::common::errors::MegaError;
+pub use crate::orbit_api::factory::ObjectStorageConfig;
 
 pub mod error;
 mod expand;
@@ -131,7 +131,7 @@ impl Config {
             redis: RedisConfig::default(),
             buck: None,
             object_storage: ObjectStorageConfig {
-                local: orbit_api::factory::LocalConfig {
+                local: crate::orbit_api::factory::LocalConfig {
                     root_dir: mega_base().join("objects").to_string_lossy().to_string(),
                 },
                 ..Default::default()

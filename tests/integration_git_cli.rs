@@ -337,7 +337,6 @@ fn boot_service_http_with_enforcement_and_session(
 /// Cookie value the session stub accepts; its content is irrelevant because the
 /// stub answers every request the same way.
 const SESSION_COOKIE_VALUE: &str = "it-un16-session";
-const SESSION_COOKIE: &str = "better-auth.session_token=it-un16-session";
 
 /// Minimal stand-in for the website's Better Auth `get-session` endpoint.
 ///

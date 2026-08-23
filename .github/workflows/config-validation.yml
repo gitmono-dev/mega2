@@ -10,7 +10,7 @@ on:
       - "Dockerfile.git-smoke"
       - "Dockerfile.it-runtime"
       - "README.md"
-      - "bin/tests/**"
+      - "tests/**"
       - "config/**"
       - "docker-compose.test.yml"
       - "docs/refactoring/config.md"
@@ -39,7 +39,7 @@ on:
       - "Dockerfile.git-smoke"
       - "Dockerfile.it-runtime"
       - "README.md"
-      - "bin/tests/**"
+      - "tests/**"
       - "config/**"
       - "docker-compose.test.yml"
       - "docs/refactoring/config.md"
@@ -67,45 +67,6 @@ jobs:
         with:
           path: monoengine
 
-      - name: Validate orbit checkout token
-        env:
-          ORBIT_CHECKOUT_TOKEN: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
-        run: |
-          if [ -z "${ORBIT_CHECKOUT_TOKEN}" ]; then
-            echo "::error title=Missing ORBIT_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/orbit sibling repository. Add an Actions secret named ORBIT_CHECKOUT_TOKEN with read-only contents access to gitmono-dev/orbit."
-            exit 1
-          fi
-
-      - name: Checkout orbit sibling
-        uses: actions/checkout@v5
-        with:
-          repository: gitmono-dev/orbit
-          ref: main
-          path: orbit
-          token: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
-
-      - name: Guard orbit sibling crate layout
-        run: |
-          set -euo pipefail
-          # gitmono-dev/orbit is a virtual workspace (crates/orbit + crates/orbit-api).
-          # monoengine path deps resolve against that layout from working-directory:
-          # monoengine → ../orbit/crates/orbit-api and ../../orbit/crates/orbit.
-          # UN-49 retargeted those deps at a local pre-workspace tree (api/ + repo-root
-          # package); cargo metadata then failed on Actions before any test ran.
-          # Swagger UI is vendored via utoipa-swagger-ui's `vendored` feature so
-          # clippy/test do not download GitHub zips (InvalidArchive EOCD flake).
-          for p in \
-            orbit/crates/orbit/Cargo.toml \
-            orbit/crates/orbit-api/Cargo.toml
-          do
-            if [ ! -f "${p}" ]; then
-              echo "::error title=Orbit sibling layout mismatch::Expected ${p} (gitmono-dev/orbit workspace members). A checkout of an older orbit tree (api/ at repo root) cannot satisfy Cargo.toml / bin/Cargo.toml."
-              ls -la orbit || true
-              ls -la orbit/crates || true
-              exit 1
-            fi
-          done
-
       - name: Validate monoui checkout token
         env:
           # Prefer a dedicated monoui token; fall back to ORBIT_CHECKOUT_TOKEN
@@ -115,12 +76,10 @@ jobs:
           WEBSITE_CHECKOUT_TOKEN: ${{ secrets.WEBSITE_CHECKOUT_TOKEN || secrets.ORBIT_CHECKOUT_TOKEN }}
         run: |
           set -uo pipefail
-          # Presence is not the interesting failure. The orbit step above already
-          # exits when ORBIT_CHECKOUT_TOKEN is empty, so an empty value can only
+          # Presence is not the interesting failure. An empty value can only
           # reach here in an unusual setup. The realistic failure is SCOPE: a
-          # fine-grained PAT scoped to gitmono-dev/orbit — exactly what the orbit
-          # step's own message asks for — satisfies the fallback, then dies 20+
-          # minutes later inside actions/checkout with an opaque
+          # fine-grained PAT scoped to a single repo — satisfies the fallback,
+          # then dies 20+ minutes later inside actions/checkout with an opaque
           # "Repository not found". Probe the API so that surfaces here instead.
           if [ -z "${WEBSITE_CHECKOUT_TOKEN}" ]; then
             echo "::error title=Missing WEBSITE_CHECKOUT_TOKEN::Config validation needs to checkout the private gitmono-dev/monoui sibling repository for the Better Auth integration test. Add an Actions secret named WEBSITE_CHECKOUT_TOKEN (or reuse ORBIT_CHECKOUT_TOKEN) with read-only contents access to gitmono-dev/monoui."
@@ -476,7 +435,7 @@ jobs:
           WEBSITE_IT: "1"
         run: |
           # Black-box CLI integration tests (config secret ref/set/check, validate).
-          # The integration test lives in the `monoengine` binary crate (bin/tests/).
+          # The integration test lives in the `monoengine` package (`tests/`).
           cargo test -p monoengine --test integration_vault -- --test-threads=1
           # ITW-03: a real Better Auth sign-up/sign-in cookie must identify the
           # same user through the compose-hosted monoengine session bridge.

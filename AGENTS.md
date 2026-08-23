@@ -6,7 +6,7 @@ before submitting.
 
 ## Project Overview
 
-- **Name:** `monoengine` (a Rust binary crate, see `Cargo.toml`).
+- **Name:** `monoengine` (single Cargo package: lib `monoengine_core` + binaries, see `Cargo.toml`).
 - **Edition:** Rust 2024.
 - **Purpose:** Mono‑repo / Git hosting + service engine. Ports and extends
   several subsystems originally from the Mega project (notably `callisto`
@@ -35,8 +35,9 @@ before submitting.
   used to be vendored under `src/vault/`; that module was removed on 2026-08-21
   (`docs/plan/plan-20260820.md`), so import library types from `libvault::*`.
 - **Email:** `lettre` (rustls + tokio).
-- **Object storage:** `orbit-api` interface/config plus the sibling `../orbit`
-  implementation crate (local FS, S3/S3-compatible, GCS).
+- **Object storage:** inlined `src/orbit_api/` (traits/config) and `src/orbit/`
+  (object_store backends). Built via `crate::orbit::factory::ObjectStorageFactory`
+  from `src/jupiter/storage/object_storage.rs::build_object_storage`.
 - **Allocator:** `jemalloc` on non‑Windows, `mimalloc` on Windows
   (configured in `src/main.rs`).
 - **Logging:** `tracing` + `tracing-subscriber` + `tracing-appender`
@@ -55,8 +56,8 @@ Run these from the repo root (the agent's shell already starts there).
 | Run one test         | `cargo test --test <name>` or `cargo test <substring> -- --nocapture` |
 | Format               | `cargo fmt --all`                                                  |
 | Lint                 | `cargo clippy --all-targets -- -D warnings` (when used)            |
-| Run the binary       | `cargo run -- --config config/config.toml <subcommand>`            |
-| HTTP service example | `cargo run -- --config config/config.toml service http --host 0.0.0.0 -p 9000` |
+| Run the binary       | `cargo run -p monoengine -- --config config/config.toml <subcommand>`            |
+| HTTP service example | `cargo run -p monoengine -- --config config/config.toml service http --host 0.0.0.0 -p 9000` |
 
 **Invariants the build must hold (verified in prior sessions):**
 
@@ -64,7 +65,7 @@ Run these from the repo root (the agent's shell already starts there).
 - `cargo build --tests` MUST produce **0 errors and 0 warnings**.
 - Never silence warnings by adding broad `#[allow(...)]` on items you just
   touched without a reason — the crate‑level `#![allow(dead_code)]` in
-  `src/main.rs` is intentional (large pub API surface ported from Mega);
+  `src/lib.rs` is intentional (large pub API surface ported from Mega);
   do not narrow or remove it without a plan to clean the dead items.
 
 ## Required Checks Before Submitting Code Changes
@@ -108,11 +109,15 @@ without it.
 ## Project Layout
 
 ```
-Cargo.toml                # binary crate manifest; depends on sibling ../orbit/api
+Cargo.toml                # package `monoengine` (lib `monoengine_core` + [[bin]])
 config/config.toml        # default runtime config (TOML)
 src/
-├── main.rs               # entry; declares all top-level modules
+├── main.rs               # `monoengine` binary entry (allocator + CLI dispatch)
+├── lib.rs                # library root; declares top-level modules
 ├── cli.rs                # clap parsing, log init, ctrlc handler
+├── orbit_api/            # object-storage contract (traits, config, errors)
+├── orbit/                # object_store backends (adapter, factory)
+├── bin/                  # auxiliary binaries (e.g. migrate_local_to_s3)
 ├── commands/             # subcommand registry (builtin / builtin_exec)
 ├── common/               # config loader, error types (MegaError/MegaResult), utils
 ├── api/                  # axum HTTP API surface
@@ -135,16 +140,16 @@ src/
 │           └── vault_core.rs # VaultCore, VaultCoreInterface
 ├── bellatrix/  ceres/  saturn/  context/  git_protocol/
 └── mega.cedarschema, mega_policies.cedar
+tests/                    # process-level integration tests (integration_*.rs)
 test/project/             # fixture data for integration tests
 target/                   # build artifacts (gitignored)
 ```
 
-`pub use crate::callisto::*;` is re‑exported from `main.rs`; importing
+`pub use crate::callisto::*;` is re‑exported from `lib.rs`; importing
 `callisto` entities elsewhere should use `crate::callisto::<table>` paths.
-Object storage public types remain available from `orbit_api::*`; monoengine's
-storage layer builds the concrete backend through
-`crate::jupiter::storage::object_storage::ObjectStorageFactory`, backed by the
-sibling `../orbit` implementation crate.
+Object storage public types are available from `crate::orbit_api::*`; the
+concrete backend is built through `crate::jupiter::storage::object_storage::build_object_storage`
+(which calls `crate::orbit::factory::ObjectStorageFactory::build`).
 
 ## Code Conventions
 

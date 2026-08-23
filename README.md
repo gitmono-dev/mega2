@@ -10,22 +10,21 @@
 
 > Compose 服务名仍为 `website-next` / `website-db-init`，隔离账户库仍名 `website`，`MEGA_OAUTH__WEBSITE_*` / `MEGA_NOTIFICATION__WEBSITE_MAIL_*` 配置键也不变——这些是 Rust 派生的配置面与 compose 内部 DNS，改名会让会话路径 fail-closed 成 401。变的只有构建上下文指向哪个仓库。
 
-**目录关系**：`monoengine`、`monoui`、`orbit` 是**同级 sibling**，共享同一个父目录。联调栈依赖这种相对布局——本仓的 `docker-compose.test.yml` 用相对路径引用它们：
+**目录关系**：对象存储已内联为 `src/orbit_api/` + `src/orbit/`（单 package `monoengine`，lib 名 `monoengine_core`），不再使用 sibling `../orbit` 或独立 `crates/orbit*` workspace 成员。联调栈仍依赖 `monoengine` 与 `monoui` 同为 sibling 的相对布局——本仓的 `docker-compose.test.yml` 用相对路径引用 `monoui`：
 
 ```
 <父目录>/
-├── monoengine/      # 本仓库（后端引擎；含 docker-compose.test.yml）
-├── monoui/          # 前端 + 认证（apps/next-app 由 compose 拉入构建）
-└── orbit/           # 对象存储实现（monoengine 的 path 依赖）
+├── monoengine/      # 本仓库（后端引擎；内联 orbit + docker-compose.test.yml）
+└── monoui/          # 前端 + 认证（apps/next-app 由 compose 拉入构建）
 ```
 
 compose 中的 `build.context` 依此解析：
-- `monoengine` 服务：`context: ..`（父目录，包含 `monoengine/` 与 `orbit/` 两个 path 依赖），`dockerfile: monoengine/Dockerfile`；
+- `monoengine` 服务：`context: ..`（父目录；对象存储 crate 已在 monoengine 内，无需再看 sibling），`dockerfile: monoengine/Dockerfile`；
 - `website-db-init` 与 `website-next` 服务：`context: ../monoui`，`dockerfile: apps/next-app/Dockerfile`。
 
-因此**三个仓库必须 checkout 到同一父目录下**，且相对关系保持为 `monoengine`、`monoui`、`orbit` 平级；缺失其中任一（尤其 `../orbit`，它是 Cargo path 依赖）会让 compose/`cargo` 在依赖解析或构建阶段失败。
+因此 **`monoengine` 与 `monoui` 必须 checkout 到同一父目录下**，且相对关系保持平级；缺失 `monoui`（compose path 依赖）会让 compose 在构建阶段失败。
 
-**前置条件**：按上表摆放三个 sibling 目录、端口 `17001` / `19180` / `15432` / `16379` 可用。首次构建会拉 `rust:1.97-bookworm` + `node:22-alpine` 并编译 monoengine release（较久）。
+**前置条件**：按上图摆放 `monoengine` 与 `monoui` 两个 sibling 目录、端口 `17001` / `19180` / `15432` / `16379` 可用。首次构建会拉 `rust:1.97-bookworm` + `node:22-alpine` 并编译 monoengine release（较久）。
 
 **启动**（推荐先 web 后 app，保证首次会话请求时 monoui 已就绪）：
 

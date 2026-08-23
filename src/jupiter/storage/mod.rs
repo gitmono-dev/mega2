@@ -196,9 +196,8 @@ impl Storage {
         let issue_storage = IssueStorage { base: base.clone() };
         let vault_storage = VaultStorage { base: base.clone() };
         let conversation_storage = ConversationStorage { base: base.clone() };
-        // `object_store` is injected by the caller (built via the registered
-        // `ObjectStorageProvider`), so this crate no longer references the heavy
-        // `orbit` implementation crate. See docs/refactoring/orbit.md.
+        // `object_store` is injected by the caller (built via `build_object_storage`),
+        // which delegates to the inlined orbit factory.
         let lfs_service = LfsService {
             lfs_storage: lfs_db_storage.clone(),
             obj_storage: object_store.clone(),

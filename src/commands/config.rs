@@ -822,8 +822,8 @@ where
 
     if matches!(
         config.object_storage.storage_type,
-        orbit_api::factory::ObjectStorageBackend::S3
-            | orbit_api::factory::ObjectStorageBackend::S3Compatible
+        crate::orbit_api::factory::ObjectStorageBackend::S3
+            | crate::orbit_api::factory::ObjectStorageBackend::S3Compatible
     ) {
         let access_key_id_trimmed = config.object_storage.s3.access_key_id.trim_start();
         if is_secret_ref_value(access_key_id_trimmed) {
@@ -917,10 +917,11 @@ fn read_secret_value_from_stdin() -> Result<String, MegaError> {
 
 #[cfg(test)]
 mod tests {
-    use orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config};
-
     use super::*;
-    use crate::config::testing::{TestSecretResolver, env_lock, isolated_config};
+    use crate::{
+        config::testing::{TestSecretResolver, env_lock, isolated_config},
+        orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config},
+    };
 
     #[test]
     fn config_init_uses_no_config_load_mode() {

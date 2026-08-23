@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use git_internal::internal::object::blob::Blob;
-use orbit_api::object_storage::ObjectByteStream;
+
+use crate::orbit_api::object_storage::ObjectByteStream;
 
 pub trait IntoObjectStream {
     fn into_stream(self) -> ObjectByteStream;

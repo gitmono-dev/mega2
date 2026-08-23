@@ -983,7 +983,7 @@ fn integration_error_redaction_does_not_leak_db_password() {
     let cache_dir = temp_dir.path().join("cache");
     let object_root = temp_dir.path().join("objects");
     let config_path = temp_dir.path().join("config.toml");
-    fs::write(&config_path, include_str!("../../config/config.toml")).expect("write config");
+    fs::write(&config_path, include_str!("../config/config.toml")).expect("write config");
 
     let port = reserve_free_port();
     let stdout_path = temp_dir.path().join("service.out");

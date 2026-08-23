@@ -12,7 +12,7 @@
 use std::{fs, path::Path};
 
 pub fn write_full_config(path: &Path) {
-    fs::write(path, include_str!("../../../config/config.toml")).expect("write full config");
+    fs::write(path, include_str!("../../config/config.toml")).expect("write full config");
 }
 
 /// Write the repo default config into `case_dir/config.toml` (ADR-GM-05 layout).
@@ -40,7 +40,7 @@ pub fn write_full_config_with_append(path: &Path, append: &str) {
         write_full_config(path);
         return;
     }
-    let mut body = include_str!("../../../config/config.toml").to_string();
+    let mut body = include_str!("../../config/config.toml").to_string();
     if !body.ends_with('\n') {
         body.push('\n');
     }

@@ -17,29 +17,6 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 
 use crate::{config::Config, context::ReadOnlyContext, notification::service::NotificationService};
 
-/// Register an in-memory object store for this test binary.
-///
-/// The core crate never registers a provider — that is the binary's job — so a
-/// read-only assembly here would fail on the object store before reaching
-/// anything this card is about. The registration is process-wide and
-/// idempotent; `set_object_storage_provider` keeps the first one.
-fn ensure_object_storage_provider() {
-    struct MockProvider;
-
-    #[async_trait::async_trait]
-    impl crate::jupiter::storage::object_storage::ObjectStorageProvider for MockProvider {
-        async fn build(
-            &self,
-            _cfg: &orbit_api::factory::ObjectStorageConfig,
-        ) -> Result<orbit_api::factory::MegaObjectStorageWrapper, crate::common::errors::MegaError>
-        {
-            Ok(crate::jupiter::storage::object_storage::mock_object_storage())
-        }
-    }
-
-    crate::jupiter::storage::object_storage::set_object_storage_provider(Arc::new(MockProvider));
-}
-
 /// A config pointed at `db_config`'s database with a local object store.
 async fn read_only_config(temp: &std::path::Path) -> (Config, crate::config::DbConfig) {
     let db_config = crate::jupiter::tests::test_db_config(temp).await;
@@ -75,7 +52,6 @@ async fn scalar(connection: &DatabaseConnection, sql: &str) -> i64 {
 /// no test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_the_read_only_assembly_installs_no_notification_service() {
-    ensure_object_storage_provider();
     let temp = tempfile::tempdir().expect("temp dir");
     let (config, db_config) = read_only_config(temp.path()).await;
     drop(migrated(&db_config).await);
@@ -111,7 +87,6 @@ async fn un43_the_read_only_assembly_installs_no_notification_service() {
 /// address separates "Redis was not needed" from "Redis happened to work".
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_an_unreachable_redis_does_not_stop_the_read_only_assembly() {
-    ensure_object_storage_provider();
     let temp = tempfile::tempdir().expect("temp dir");
     let (mut config, db_config) = read_only_config(temp.path()).await;
     drop(migrated(&db_config).await);
@@ -154,7 +129,6 @@ async fn un43_an_unreachable_redis_does_not_stop_the_read_only_assembly() {
 /// of those counts must still be zero afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_the_read_only_assembly_seeds_nothing() {
-    ensure_object_storage_provider();
     let temp = tempfile::tempdir().expect("temp dir");
     let (config, db_config) = read_only_config(temp.path()).await;
     let observer = migrated(&db_config).await;
@@ -231,7 +205,6 @@ async fn un43_the_read_only_assembly_seeds_nothing() {
 /// the bootstrap path this must not take writes to each of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_a_needed_vault_is_opened_read_only_and_unchanged() {
-    ensure_object_storage_provider();
     let temp = tempfile::tempdir().expect("temp dir");
     let (mut config, db_config) = read_only_config(temp.path()).await;
     let observer = migrated(&db_config).await;
@@ -263,7 +236,11 @@ async fn un43_a_needed_vault_is_opened_read_only_and_unchanged() {
         }
     }
 
-    config.object_storage.storage_type = orbit_api::factory::ObjectStorageBackend::S3Compatible;
+    config.object_storage.storage_type =
+        crate::orbit_api::factory::ObjectStorageBackend::S3Compatible;
+    config.object_storage.s3.region = "us-east-1".to_string();
+    config.object_storage.s3.bucket = "un43-test".to_string();
+    config.object_storage.s3.endpoint_url = "http://127.0.0.1:19000".to_string();
     config.object_storage.s3.access_key_id =
         "vault://secret/config/it/object_storage/access_key_id#value".to_string();
     config.object_storage.s3.secret_access_key =

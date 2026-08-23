@@ -2,12 +2,8 @@
 
 //! `monoengine-core` — the monoengine library.
 //!
-//! This crate contains all of monoengine's logic and depends only on the
-//! `orbit-api` contract crate for object storage (traits + config + wrapper).
-//! The concrete object-storage implementation (the heavy `orbit` crate that
-//! pulls `object_store` + cloud SDKs) is injected by the thin `monoengine`
-//! binary via [`set_object_storage_provider`] at startup. See
-//! `docs/refactoring/orbit.md`.
+//! This crate contains all of monoengine's logic, including the inlined
+//! `orbit_api` contract and `orbit` object-storage implementation.
 
 mod api;
 mod bellatrix;
@@ -22,6 +18,8 @@ mod context;
 mod contract;
 mod jupiter;
 pub mod notification;
+pub mod orbit;
+pub mod orbit_api;
 mod server;
 
 /// Internal seam for the read-only ops assembly (UN-30).
@@ -48,9 +46,6 @@ pub mod authz_audit_ops {
     };
 }
 
-// Public entry points for the thin `monoengine` binary (composition root). The
-// binary registers an `ObjectStorageProvider` (backed by the `orbit` impl
-// crate) via `set_object_storage_provider`, then dispatches the CLI via `parse`.
+// Public entry points for the thin `monoengine` binary (composition root).
 pub use cli::parse;
 pub use common::errors::MegaError;
-pub use jupiter::storage::object_storage::{ObjectStorageProvider, set_object_storage_provider};

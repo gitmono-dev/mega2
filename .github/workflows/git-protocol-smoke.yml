@@ -15,7 +15,7 @@ on:
       - ".github/workflows/git-protocol-smoke.yml"
       - "Dockerfile.git-cli"
       - "Dockerfile.git-smoke"
-      - "bin/tests/**"
+      - "tests/**"
       - "docker-compose.test.yml"
       - "docs/refactoring/protocol.md"
       - "docs/refactoring/test-infra.md"
@@ -38,7 +38,7 @@ on:
       - ".github/workflows/git-protocol-smoke.yml"
       - "Dockerfile.git-cli"
       - "Dockerfile.git-smoke"
-      - "bin/tests/**"
+      - "tests/**"
       - "docker-compose.test.yml"
       - "docs/refactoring/protocol.md"
       - "docs/refactoring/test-infra.md"
@@ -73,43 +73,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           path: monoengine
-
-      - name: Validate orbit checkout token
-        env:
-          ORBIT_CHECKOUT_TOKEN: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
-        run: |
-          if [ -z "${ORBIT_CHECKOUT_TOKEN}" ]; then
-            echo "::error title=Missing ORBIT_CHECKOUT_TOKEN::Git protocol smoke needs to checkout the private gitmono-dev/orbit sibling repository. Add an Actions secret named ORBIT_CHECKOUT_TOKEN with read-only contents access to gitmono-dev/orbit."
-            exit 1
-          fi
-
-      - name: Checkout orbit sibling
-        uses: actions/checkout@v5
-        with:
-          repository: gitmono-dev/orbit
-          ref: main
-          path: orbit
-          token: ${{ secrets.ORBIT_CHECKOUT_TOKEN }}
-
-      - name: Guard orbit sibling crate layout
-        run: |
-          set -euo pipefail
-          # gitmono-dev/orbit is a virtual workspace (crates/orbit + crates/orbit-api).
-          # monoengine path deps resolve against that layout from working-directory:
-          # monoengine → ../orbit/crates/orbit-api and ../../orbit/crates/orbit.
-          # Swagger UI is vendored via utoipa-swagger-ui's `vendored` feature so
-          # the release build does not download GitHub zips (InvalidArchive EOCD flake).
-          for p in \
-            orbit/crates/orbit/Cargo.toml \
-            orbit/crates/orbit-api/Cargo.toml
-          do
-            if [ ! -f "${p}" ]; then
-              echo "::error title=Orbit sibling layout mismatch::Expected ${p} (gitmono-dev/orbit workspace members). A checkout of an older orbit tree (api/ at repo root) cannot satisfy Cargo.toml / bin/Cargo.toml."
-              ls -la orbit || true
-              ls -la orbit/crates || true
-              exit 1
-            fi
-          done
 
       - name: Install Rust toolchain
         run: |
@@ -278,7 +241,7 @@ jobs:
           MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine_smoke
         run: |
           set -euo pipefail
-          # Matches bin/tests/integration_git_cli: seed after service bootstrap so
+          # Matches tests/integration_git_cli: seed after service bootstrap so
           # migrations have created access_token.
           psql "${MEGA_DATABASE__DB_URL}" \
             -v ON_ERROR_STOP=1 \
