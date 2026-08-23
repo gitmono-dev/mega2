@@ -21,8 +21,9 @@ use crate::{
         storage::{lfs_db_storage::LfsDbStorage, object_storage::MegaObjectStorageWrapper},
         utils::into_obj_stream::IntoObjectStream,
     },
-    orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
 };
+#[rustfmt::skip]
+use crate::orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 
 /// Namespaces an LFS lock row key by repository so that identical ref names in
 /// different repositories do not share a lock bucket. The `\u{1f}` (unit

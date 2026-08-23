@@ -8,14 +8,12 @@ use futures::StreamExt;
 use reqwest::Method;
 
 pub use crate::orbit_api::factory::MegaObjectStorageWrapper;
-use crate::{
-    common::errors::MegaError,
-    config::ObjectStorageConfig,
-    orbit_api::{
-        error::{IoOrbitError, OrbitResult},
-        log_storage::{LogManifest, LogStorage},
-        object_storage::{MegaObjectStorage, ObjectByteStream, ObjectKey, ObjectMeta},
-    },
+use crate::{common::errors::MegaError, config::ObjectStorageConfig};
+#[rustfmt::skip]
+use crate::orbit_api::{
+    error::{IoOrbitError, OrbitResult},
+    log_storage::{LogManifest, LogStorage},
+    object_storage::{MegaObjectStorage, ObjectByteStream, ObjectKey, ObjectMeta},
 };
 
 /// Build object storage for `cfg` via the inlined orbit factory.

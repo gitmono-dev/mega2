@@ -51,8 +51,9 @@ use crate::{
         policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
     },
     jupiter::{storage::Storage, utils::converter::FromMegaModel},
-    orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream},
 };
+#[rustfmt::skip]
+use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 
 pub struct MonoRepo {
     pub storage: Storage,

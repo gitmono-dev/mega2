@@ -918,10 +918,9 @@ fn read_secret_value_from_stdin() -> Result<String, MegaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::testing::{TestSecretResolver, env_lock, isolated_config},
-        orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config},
-    };
+    use crate::config::testing::{TestSecretResolver, env_lock, isolated_config};
+    #[rustfmt::skip]
+    use crate::orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig, S3Config};
 
     #[test]
     fn config_init_uses_no_config_load_mode() {

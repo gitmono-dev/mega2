@@ -10,8 +10,9 @@ use crate::{
     commands::{CommandContext, require_config},
     common::errors::{MegaError, MegaResult},
     context::AppContext,
-    orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
+#[rustfmt::skip]
+use crate::orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace};
 
 pub fn cli() -> Command {
     Command::new("debug")

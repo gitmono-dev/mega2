@@ -8,9 +8,10 @@ use crate::{
         storage::object_storage::{MegaObjectStorageWrapper, mock_object_storage},
         utils::into_obj_stream::IntoObjectStream,
     },
-    orbit_api::object_storage::{
-        MultiObjectByteStream, ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace,
-    },
+};
+#[rustfmt::skip]
+use crate::orbit_api::object_storage::{
+    MultiObjectByteStream, ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace,
 };
 
 #[derive(Clone)]

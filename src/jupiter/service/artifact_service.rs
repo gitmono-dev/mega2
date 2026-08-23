@@ -30,8 +30,9 @@ use crate::{
         },
         utils::{id_generator, into_obj_stream::IntoObjectStream},
     },
-    orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
+#[rustfmt::skip]
+use crate::orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace};
 
 /// Result of one blob GC pass (`docs/artifacts-protocol.md` §10.6).
 #[derive(Debug, Default, Clone, Copy)]

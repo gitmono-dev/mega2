@@ -34,8 +34,9 @@ use crate::{
         utils::ZERO_ID,
     },
     config::PackConfig,
-    orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream},
 };
+#[rustfmt::skip]
+use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 
 pub mod import_repo;
 pub mod monorepo;

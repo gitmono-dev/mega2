@@ -123,8 +123,9 @@ use crate::{
         },
         utils::converter::{FromMegaModel, IntoMegaModel, generate_git_keep_with_timestamp},
     },
-    orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
 };
+#[rustfmt::skip]
+use crate::orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace};
 
 #[derive(Clone)]
 pub struct MonoApiService {

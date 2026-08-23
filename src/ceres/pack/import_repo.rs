@@ -42,8 +42,9 @@ use crate::{
         storage::{Storage, git_db_storage::GitDbStorage},
         utils::converter::{FromGitModel, FromMegaModel},
     },
-    orbit_api::object_storage::MultiObjectByteStream,
 };
+#[rustfmt::skip]
+use crate::orbit_api::object_storage::MultiObjectByteStream;
 
 pub struct ImportRepo {
     pub storage: Storage,

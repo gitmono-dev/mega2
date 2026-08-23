@@ -17,10 +17,9 @@ use super::{
     SidebarConfig,
     secret::{SecretRef, SecretResolver},
 };
-use crate::{
-    common::errors::MegaError,
-    orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig},
-};
+use crate::common::errors::MegaError;
+#[rustfmt::skip]
+use crate::orbit_api::factory::{LocalConfig, ObjectStorageBackend, ObjectStorageConfig};
 
 pub const DEFAULT_TEST_DATABASE_URL: &str = "postgres://localhost:5432/monoengine_test";
 pub const DEFAULT_TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";

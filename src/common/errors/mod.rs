@@ -10,7 +10,9 @@ use config::ConfigError;
 use git_internal::errors::GitError;
 use thiserror::Error;
 
-use crate::{contract::api::common::CommonResult, orbit_api::error::IoOrbitError};
+use crate::contract::api::common::CommonResult;
+#[rustfmt::skip]
+use crate::orbit_api::error::IoOrbitError;
 
 mod api;
 mod policy;
