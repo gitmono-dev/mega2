@@ -62,9 +62,8 @@ use std::{
 };
 
 use futures::{StreamExt, TryStreamExt};
-use monoengine_core::orbit::{
-    error::{IoOrbitError, OrbitResult},
-    factory::{ObjectStorageBackend, ObjectStorageConfig},
+use monoengine_core::orbit_bin_api::{
+    IoOrbitError, ObjectStorageBackend, ObjectStorageConfig, OrbitResult, head_result_to_exists,
 };
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, local::LocalFileSystem};
 use serde::Deserialize;
@@ -364,7 +363,7 @@ async fn migrate_one(
     opts: &MigrateOptions,
 ) -> (OrbitResult<Outcome>, u64) {
     // HEAD success -> skip; NotFound -> upload; other error -> fail (see item 4 semantics).
-    match monoengine_core::orbit::adapter::head_result_to_exists(dst.head(path).await) {
+    match head_result_to_exists(dst.head(path).await) {
         Ok(true) => {
             info!("skip existing object on target: {path}");
             return (Ok(Outcome::Skipped), 0);

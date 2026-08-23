@@ -52,7 +52,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | `saturn` | Cedar 策略/授权 | 已移植 | `src/contract/policy/`（并吸入 mono 的 `api/guard/`） | `docs/refactoring/contract.md` |
 | `vault` | RustyVault 集成 | 已移植 + 已加固：形态为 crates.io `libvault` 0.3.0 + 集成层（vendored `src/vault/` 于 2026-08-21 删除，见 [`plan-20260820.md`](plan-20260820.md)） | `libvault` crate + `src/contract/vault/` | `docs/refactoring/vault.md`；ADR-VLT-01 |
 | `api-model` | API DTO | 已移植 | `src/contract/api/` | `docs/refactoring/contract.md` |
-| `io-orbit` | 对象存储 | 已移植（拆分为独立 crate） | sibling `../orbit` + `orbit-api`，经 `src/jupiter/storage/object_storage.rs` 注入 | `docs/refactoring/orbit.md` |
+| `io-orbit` | 对象存储 | 已内联 | `src/orbit_api/` + `src/orbit/`，经 `build_object_storage` 直连工厂 | `docs/refactoring/orbit.md` |
 | `clients/orion-client` | orion-server HTTP 客户端 | 部分移植 | `src/bellatrix/`（仅 build dispatch 路径） | 完整 API 面未核对（PT-08） |
 | `clients/orion-scheduler-client` | orion-scheduler HTTP 客户端 | **未移植** | 无 | PT-08；Mega #2143/#2146/#2150/#2159/#2160 已扩展 runner provisioning、multi-VM、磁盘状态和 VM 元数据面 |
 | `orion` | 构建执行 agent（antares、buck_controller、disk、repo、ws、api） | **未移植** | 无 | PT-07 |
@@ -99,7 +99,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | `src/contract/` 边界归并 | api/git_protocol/policy/vault 四域归并完成，旧路径无兼容层（`docs/refactoring/contract.md`） | 新移植模块的落点规范 |
 | Vault（crates.io `libvault` 0.3.0 crate + 集成层） | A–J 阶段可交付子集完成：fail-closed、DB-only bootstrap、root token 退役、unseal share rekey、backup/restore、可配置 file audit sink 和 fail-closed 审计策略（`docs/refactoring/vault.md`）；依赖形态已由 vendored 迁回 crates.io `libvault`，UN-31 只读引导在集成层重建（[`plan-20260820.md`](plan-20260820.md)） | PT-11 的起点；凭据类 PT 的前置 |
 | `src/notification/`（邮件投递在 website） | in-app / Slack / generic webhook 编排已交付，渠道凭据经 SecretRef；本仓 SMTP/`[mail]`/`email_jobs` 已移除，产品邮件经 website 内部 API（ADR-WA-08；`docs/refactoring/website-mail.md`） | PT-09 的起点 |
-| orbit 对象存储（provider 注入） | core 只依赖 `orbit-api`，重量级 SDK 仅留在 bin 编译图（`docs/refactoring/orbit.md`） | LFS/artifact/构建产物的存储承载 |
+| orbit 对象存储（内联） | `src/orbit_api/` + `src/orbit/` 单 package；`object_store` cloud features 在 core 编译图 | LFS/artifact/构建产物的存储承载 |
 | Git smart HTTP/SSH 协议 | `info/refs` 严格化、fallible pkt-line parser、SSH exec parser、per-channel state、认证上下文、delete-only receive-pack、capability truth table、HTTP LFS 边界与首批真实 CLI smoke 已交付；HTTP/SSH 仍完整缓冲请求/通道（`docs/refactoring/protocol.md`） | PT-03/PT-04 的起点 |
 | bellatrix（orion-client 部分移植） | build dispatch 路径可用，替代 Mega mono 的 `orion_build_dispatch.rs` | PT-06/PT-07/PT-08 的客户端侧基础 |
 | 集成测试基建 | docker-compose 测试栈（Postgres/Redis/Mailpit/RustFS/git-cli/`website-next`，`-p monoengine-it`）、`integration_vault` / `integration_git_cli` / `integration_website_auth` 黑盒；mailpit **消费方 = website IT**（非本仓 SMTP）；CI `config-validation.yml` 与 `git-protocol-smoke.yml` | 全部 PT 的验收承载；PT-01 收口最小矩阵；PT-04 的 SSH/LFS 与完整协议矩阵已进入 `plan-20260803.md` |

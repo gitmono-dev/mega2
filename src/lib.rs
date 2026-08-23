@@ -49,3 +49,13 @@ pub mod authz_audit_ops {
 // Public entry points for the thin `monoengine` binary (composition root).
 pub use cli::parse;
 pub use common::errors::MegaError;
+
+/// Hidden re-exports for the `migrate_local_to_s3` auxiliary binary (ORB-06).
+#[doc(hidden)]
+pub mod orbit_bin_api {
+    pub use crate::orbit::{
+        error::{IoOrbitError, OrbitResult},
+        factory::{ObjectStorageBackend, ObjectStorageConfig},
+        head_result_to_exists,
+    };
+}
