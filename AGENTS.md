@@ -229,6 +229,22 @@ concrete backend is built through `crate::jupiter::storage::object_storage::buil
 4. Cover with a `#[cfg(test)] mod tests` that uses `test_db_connection` +
    `apply_migrations` as shown in `notification/dispatcher.rs::tests`.
 
+## Website-next IT stack reload
+
+When you change **`../monoui`** sources that affect the Code workspace or
+`apps/next-app`, rebuild and restart the compose `website-next` service after
+the change (do not wait for the user to ask):
+
+```bash
+./scripts/reload-website-next.sh
+```
+
+The script debounces rapid edits (~3s) and runs `docker compose` build + recreate
+in the background. Logs: `${TMPDIR:-/tmp}/monoengine-reload-website-next/build.log`.
+
+Project hooks in `.cursor/hooks.json` trigger the same script on monoui file
+edits and again on agent `stop` when a reload was requested.
+
 ## Boundaries
 
 - **Do not** commit secrets, real tokens, or production `config.toml` values.

@@ -296,7 +296,9 @@ services:
       EMAIL_PROVIDER: test
       EMAIL_DEFAULT_FROM: noreply@monoengine-it.test
       # Optional CTA base for product templates (not TinyShip APP_BASE_URL).
-      MONOENGINE_PUBLIC_BASE_URL: http://127.0.0.1:19180
+      MONOENGINE_PUBLIC_BASE_URL: http://monoengine:8000
+      # MC-07: route Code read paths through the monoengine BFF inside compose.
+      MEGA_CODE_DATA_BACKEND: monoengine
     depends_on:
       postgres:
         condition: service_healthy

@@ -255,6 +255,18 @@ Mailpit 可用性作为启动或测试门。注意 IT 栈默认注入的是 `EMA
 `SMTP_HOST=mailpit` / `SMTP_PORT=1025`。前端仓库自 2026-08-21 起为
 `gitmono-dev/monoui`（sibling `../monoui`）。
 
+**Workspace Code 栈 IT（`WEBSITE_IT=1`）**
+
+`docker-compose.test.yml` 的 `website-next` 服务注入
+`MEGA_CODE_DATA_BACKEND=monoengine` 与容器内 `MONOENGINE_PUBLIC_BASE_URL=http://monoengine:8000`，
+使 monoui `/api/mega` Code 读路径经 BFF 转发 monoengine。在 monoui 仓执行：
+
+```bash
+WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
+```
+
+需 `--profile app --profile web` 栈已就绪；未设置 `WEBSITE_IT=1` 时该用例自动跳过。
+
 **干净重置**
 
 ```bash
