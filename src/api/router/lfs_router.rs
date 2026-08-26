@@ -660,6 +660,15 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
+    /// SYNC-04 (mega@2398a92, #2175): the exact lock-list limit rejection
+    /// message, passed through `lfs_retrieve_lock` unmasked, maps to 400.
+    #[test]
+    fn invalid_limit_rejection_maps_to_400() {
+        let (code, msg) = map_lfs_error("Invalid limit parameter: -1");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.starts_with("Invalid limit parameter"));
+    }
+
     #[test]
     fn test_map_lfs_error_internal_server_error() {
         // Test default error mapping

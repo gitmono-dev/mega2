@@ -61,6 +61,13 @@ pub async fn lfs_retrieve_lock(
             lock_list.next_cursor = next;
             Ok(lock_list)
         }
+        // Client-input errors (e.g. a malformed `limit`) must reach the router
+        // unmasked so `map_lfs_error` can classify them as 400; only genuine
+        // lookup failures are hidden behind the generic message.
+        // Ported from mega@2398a92 `ceres/src/lfs/handler.rs` (#2175).
+        Err(GitLFSError::GeneralError(msg)) if msg.starts_with("Invalid") => {
+            Err(GitLFSError::GeneralError(msg))
+        }
         Err(_) => Err(GitLFSError::GeneralError(
             "Lookup operation failed!".to_string(),
         )),
@@ -763,6 +770,34 @@ mod tests {
                 }
                 other => panic!("expected GeneralError, got {other:?}"),
             }
+        }
+    }
+
+    /// SYNC-04 (mega@2398a92, #2175): the `Invalid` rejection must reach the
+    /// caller unmasked so the router can classify it as 400.
+    #[tokio::test]
+    async fn retrieve_lock_passes_invalid_limit_error_through_unmasked() {
+        use crate::ceres::lfs::lfs_structs::LockListQuery;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let lfs = storage.lfs_db_storage();
+
+        let query = LockListQuery {
+            path: String::new(),
+            id: String::new(),
+            cursor: String::new(),
+            limit: "-1".to_string(),
+            refspec: "refs/heads/main".to_string(),
+        };
+        match lfs_retrieve_lock(lfs, "/org/repo.git", query).await {
+            Err(GitLFSError::GeneralError(msg)) => {
+                assert!(
+                    msg.starts_with("Invalid limit parameter"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected the invalid limit to be rejected"),
         }
     }
 
