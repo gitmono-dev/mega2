@@ -404,11 +404,14 @@ fn integration_git_ssh_authenticated_clone() {
     // known_hosts=case_port_only
     git_cli::write_known_hosts_via_keyscan(&known_hosts, port);
     let known_body = fs::read_to_string(&known_hosts).expect("read known_hosts");
+    let known_host = git_cli::monoengine_reachable_host();
     assert!(
         known_body
             .lines()
-            .all(|line| line.contains("127.0.0.1") || line.starts_with('#') || line.is_empty()),
-        "known_hosts=case_port_only must only describe 127.0.0.1 for this case"
+            .all(|line| {
+                line.contains(known_host) || line.starts_with('#') || line.is_empty()
+            }),
+        "known_hosts=case_port_only must only describe {known_host} for this case"
     );
 
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, port);
@@ -417,7 +420,7 @@ fn integration_git_ssh_authenticated_clone() {
         "GIT_SSH_COMMAND must pin the case port: {git_ssh}"
     );
 
-    let remote = format!("ssh://{}@127.0.0.1:{port}/", git_cli::DEFAULT_SSH_AUTH_USER);
+    let remote = git_cli::monoengine_ssh_repo_url(port, git_cli::DEFAULT_SSH_AUTH_USER);
     let clone_name = "ssh-auth-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
@@ -482,7 +485,7 @@ fn prepare_authenticated_ssh(
     let (service, port, stdout_path, stderr_path) = boot_service_ssh(env);
     git_cli::write_known_hosts_via_keyscan(&known_hosts, port);
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, port);
-    let remote = format!("ssh://{}@127.0.0.1:{port}/", git_cli::DEFAULT_SSH_AUTH_USER);
+    let remote = git_cli::monoengine_ssh_repo_url(port, git_cli::DEFAULT_SSH_AUTH_USER);
     (service, port, stdout_path, stderr_path, git_ssh, remote)
 }
 
@@ -1117,10 +1120,7 @@ fn prepare_authenticated_ssh_multi_with_session(
         boot_service_multi_with_session(env, enforcement, session_stub_port);
     git_cli::write_known_hosts_via_keyscan(&known_hosts, ssh_port);
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, ssh_port);
-    let remote = format!(
-        "ssh://{}@127.0.0.1:{ssh_port}/",
-        git_cli::DEFAULT_SSH_AUTH_USER
-    );
+    let remote = git_cli::monoengine_ssh_repo_url(ssh_port, git_cli::DEFAULT_SSH_AUTH_USER);
     (
         service,
         http_port,
@@ -1385,7 +1385,7 @@ fn integration_git_ssh_authz_grant_immediate_effect() {
 
     let admin_token = git_cli::resolve_seed_token();
     git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
-    let http_remote = format!("http://127.0.0.1:{http_port}/");
+    let http_remote = git_cli::monoengine_http_repo_url(http_port);
 
     // --- baseline: the SSH user is not an admin, so `enforce` denies its push ---
     let clone_name = "un16-ssh-clone";

@@ -280,7 +280,7 @@ fn integration_git_lfs_http_round_trip() {
         let service_pid = service.pid();
         git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-        let remote_url = format!("http://127.0.0.1:{port}/");
+        let remote_url = git_cli::monoengine_http_repo_url(port);
         let lfs_url = format!("{}/info/lfs", remote_url.trim_end_matches('/'));
         let source_name = "lfs-source";
         let source = env.case_dir.join(source_name);

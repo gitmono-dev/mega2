@@ -21,6 +21,10 @@ pub const GIT_CLI_UNAVAILABLE: &str = "git-cli runner unavailable";
 pub const COMPOSE_PROJECT: &str = "monoengine-it";
 pub const GIT_ASKPASS_ENV: &str = "MONOENGINE_IT_GIT_PASSWORD";
 pub const DEFAULT_GIT_AUTH_USER: &str = "it-git-cli";
+/// Host loopback for probes from the cargo test process (curl, TcpStream, service bind).
+pub const HOST_LOOPBACK: &str = "127.0.0.1";
+/// Docker Desktop / Compose gateway hostname for reaching host-bound services from git-cli.
+pub const DOCKER_HOST_GATEWAY: &str = "host.docker.internal";
 /// Must match `docs/refactoring/test-infra.md` / compose `alpine/git:v2.49.1`.
 pub const PINNED_GIT_CLI_VERSION: &str = "git version 2.49.1";
 /// Per-invocation wall-clock budget so a stalled protocol cannot hang `cargo test`.
@@ -45,10 +49,9 @@ pub fn repo_root() -> PathBuf {
 }
 
 pub fn git_cli_workdir() -> PathBuf {
-    // Integration harness target OS is Linux; default matches compose
-    // `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}`. Relative values
-    // are resolved against the repo root (compose file directory), not Cargo's
-    // `bin/` CWD, so host paths stay aligned with the bind mount.
+    // Default matches compose `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}`.
+    // Relative values are resolved against the repo root (compose file directory),
+    // not Cargo's `bin/` CWD, so host paths stay aligned with the bind mount.
     match env::var("MONOENGINE_IT_GIT_WORKDIR") {
         Ok(raw) => {
             let path = PathBuf::from(raw);
@@ -68,7 +71,7 @@ pub fn git_cli_skip_requested() -> bool {
 
 fn host_git_opt_in_allowed() -> bool {
     // Compose `git-cli` is the only supported runner for CI / VER. Host git is
-    // an explicit Linux local opt-in (`MONOENGINE_IT_ALLOW_HOST_GIT=1`), not a
+    // an explicit local opt-in (`MONOENGINE_IT_ALLOW_HOST_GIT=1`), not a
     // cross-platform compatibility path.
     matches!(env::var("MONOENGINE_IT_ALLOW_HOST_GIT").as_deref(), Ok("1"))
 }
@@ -260,10 +263,38 @@ pub fn assert_database_absent(admin_url: &str, db_name: &str) {
 
 fn compose_up_git_cli_hint() -> String {
     format!(
-        "hint (Linux): start the opt-in runner with \
+        "hint: start the opt-in runner with \
          `docker compose -p {COMPOSE_PROJECT} -f docker-compose.test.yml --profile git up -d --wait` \
          (see docs/refactoring/test-infra.md / docs/development.md)"
     )
+}
+
+/// Hostname git-cli uses to reach per-case monoengine / SSH listeners on the host.
+///
+/// Container runner: `host.docker.internal` (bridge + extra_hosts).
+/// Host opt-in runner: loopback.
+pub fn monoengine_reachable_host() -> &'static str {
+    require_git_cli_runner();
+    match runner_kind() {
+        GitRunnerKind::Container => DOCKER_HOST_GATEWAY,
+        GitRunnerKind::Host => HOST_LOOPBACK,
+    }
+}
+
+pub fn monoengine_http_repo_url(port: u16) -> String {
+    format!("http://{}:{port}/", monoengine_reachable_host())
+}
+
+pub fn monoengine_http_url(port: u16, path: &str) -> String {
+    format!("http://{}:{port}{path}", monoengine_reachable_host())
+}
+
+#[allow(
+    dead_code,
+    reason = "SSH remote URL helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn monoengine_ssh_repo_url(port: u16, user: &str) -> String {
+    format!("ssh://{user}@{}:{port}/", monoengine_reachable_host())
 }
 
 /// Running container id for compose service `git-cli` in project `monoengine-it`.
@@ -375,7 +406,7 @@ fn resolve_runner_kind() -> GitRunnerKind {
 }
 
 /// Resolve the runner once per process. Prefer compose `git-cli`; host git only
-/// when `MONOENGINE_IT_ALLOW_HOST_GIT=1` (Linux local experiments).
+/// when `MONOENGINE_IT_ALLOW_HOST_GIT=1` (local experiments).
 ///
 /// Serialized via `OnceLock::get_or_init` so parallel tests do not stampede
 /// docker with concurrent probes.
@@ -1055,7 +1086,7 @@ pub fn assert_ssh_keys_row_matches_keypair(db_url: &str, username: &str, finger:
     });
 }
 
-/// Write `known_hosts` for `127.0.0.1:port` via `ssh-keyscan` on the selected runner.
+/// Write `known_hosts` for the case SSH port via `ssh-keyscan` on the selected runner.
 #[allow(
     dead_code,
     reason = "SSH auth helper; path-included into HTTP targets that do not call it yet"
@@ -1067,19 +1098,21 @@ pub fn write_known_hosts_via_keyscan(known_hosts: &Path, port: u16) {
         fs::create_dir_all(parent).expect("create known_hosts parent");
     }
     let port_arg = port.to_string();
+    let scan_host = monoengine_reachable_host();
     let output = match runner_kind() {
         GitRunnerKind::Container => {
             let known_container = container_path_for_host(known_hosts);
             let container_id = running_git_cli_container_id()
                 .unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
-            let script = format!("ssh-keyscan -p {port_arg} 127.0.0.1 > '{known_container}'");
+            let script =
+                format!("ssh-keyscan -p {port_arg} {scan_host} > '{known_container}'");
             let mut command = docker_exec_base();
             command.arg(&container_id).args(["sh", "-c", &script]);
             output_with_timeout(command, Duration::from_secs(30), "docker exec ssh-keyscan")
         }
         GitRunnerKind::Host => {
             let mut command = Command::new("ssh-keyscan");
-            command.args(["-p", &port_arg, "127.0.0.1"]);
+            command.args(["-p", &port_arg, scan_host]);
             let output = output_with_timeout(command, Duration::from_secs(30), "host ssh-keyscan");
             fs::write(known_hosts, &output.stdout).expect("write known_hosts");
             output
@@ -1096,8 +1129,8 @@ pub fn write_known_hosts_via_keyscan(known_hosts: &Path, port: u16) {
         "ssh-keyscan produced empty known_hosts for port {port}"
     );
     assert!(
-        body.contains("127.0.0.1"),
-        "known_hosts=case_port_only missing 127.0.0.1"
+        body.contains(scan_host),
+        "known_hosts=case_port_only missing {scan_host}"
     );
 }
 

@@ -73,20 +73,23 @@ services:
     entrypoint: >
       /bin/sh -c "
       /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
-      /usr/bin/mc mb --ignore-existing local/testbucket &&
-      /usr/bin/mc anonymous set download local/testbucket &&
+      /usr/bin/mc mb --ignore-existing local/monoengine &&
+      /usr/bin/mc anonymous set download local/monoengine &&
+      /usr/bin/mc mb --ignore-existing local/monoui &&
+      /usr/bin/mc anonymous set download local/monoui &&
       exec sleep infinity
       "
     healthcheck:
-      test: ["CMD", "mc", "ls", "local/testbucket"]
+      test: ["CMD-SHELL", "/usr/bin/mc ls local/monoengine && /usr/bin/mc ls local/monoui"]
       interval: 2s
       timeout: 5s
       retries: 20
       start_period: 3s
 
   # Fixed-version Git CLI runner for cargo-native black-box tests (ADR-IT-01).
-  # Uses host networking so the container can reach monoengine bound on the
-  # host's 127.0.0.1 high ports; therefore it cannot join networks.default.
+  # Joins networks.default and reaches per-case monoengine on the host via
+  # host.docker.internal (extra_hosts below). Cross-platform on Linux and macOS
+  # Docker Desktop; harness maps remote URLs accordingly.
   #
   # Prefer pre-creating the shared workdir as the test UID before `up`
   # (`mkdir -p … && chmod 1777 …`). If the path is missing, Docker's bind
@@ -104,16 +107,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.git-cli
-    # Opt-in profile: host networking is Linux-only (IT/prod target OS).
-    # Keeping git-cli off the default `up -d --wait` set also avoids pulling
-    # host networking into the data-plane stack on non-target Docker Desktop
-    # machines. Enable with `--profile git` on Linux CI/local VER.
+    # Opt-in profile: keeping git-cli off the default `up -d --wait` set avoids
+    # pulling the runner into data-plane-only dev loops. Enable with
+    # `--profile git` for integration_git_cli / cargo test --all IT gates.
     profiles: ["git"]
     # Reap orphaned git/ssh children from the docker-exec timeout wrapper
     # (setsid + kill). Without init, PID 1 is `sleep infinity` and zombies
     # accumulate until later SSH clones fail with protocol `error: …`.
     init: true
-    network_mode: host
+    networks:
+      - default
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"
     volumes:
       - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}:/work
@@ -128,8 +133,8 @@ services:
 
   # Linked git protocol smoke runner (profile `smoke`).
   #
-  # Unlike `git-cli` (host networking, for the cargo-native harness that spawns
-  # its own service on the host), this service JOINS networks.default and talks
+  # Unlike `git-cli` (bridge + host.docker.internal, for the cargo-native harness
+  # that spawns its own service on the host), this service talks
   # to the compose-hosted `monoengine` over the internal bridge
   # (http://monoengine:8000/). It runs `scripts/git_protocol_smoke.sh` against
   # the linked stack: ls-remote / clone / fetch / push / tag-reject / LFS.
@@ -299,11 +304,22 @@ services:
       MONOENGINE_PUBLIC_BASE_URL: http://monoengine:8000
       # MC-07: route Code read paths through the monoengine BFF inside compose.
       MEGA_CODE_DATA_BACKEND: monoengine
+      # FS-02: monoui uploads via RustFS S3 (monoui bucket)
+      STORAGE_PROVIDER: s3
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: rustfs
+      S3_ACCESS_KEY_SECRET: rustfs_secret
+      S3_BUCKET: monoui
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_URL: http://127.0.0.1:19000/monoui
+      S3_FORCE_PATH_STYLE: "true"
     depends_on:
       postgres:
         condition: service_healthy
       website-db-init:
         condition: service_completed_successfully
+      rustfs-init:
+        condition: service_healthy
     ports:
       - "127.0.0.1:17001:7001"
     healthcheck:

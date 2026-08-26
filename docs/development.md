@@ -19,7 +19,7 @@
 
 # 栈
 ./scripts/dev-test.sh up-data          # 仅数据面
-./scripts/dev-test.sh up-full          # 数据面 + git-cli（Linux，推荐）
+./scripts/dev-test.sh up-full          # 数据面 + git-cli（推荐）
 ./scripts/dev-test.sh health
 ./scripts/dev-test.sh down
 
@@ -48,7 +48,7 @@
 
 | 项 | 说明 |
 | --- | --- |
-| OS | **全量 IT / `git-cli` 验收目标为 Linux**（host 网络）；非 Linux 可跑数据面 + 不含 git-cli 的子集 |
+| OS | **全量 IT / `git-cli`** 在 **Linux 与 macOS Docker Desktop** 上验收（bridge + `host.docker.internal`）；Windows 未验收 |
 | 工具 | Docker Compose v2、Rust stable、nightly（仅 `rustfmt` 门禁） |
 | 仓库布局 | 对象存储内联于 `src/orbit_api/` + `src/orbit/`；compose 构建 monoui 时仍需 sibling `../monoui` |
 | 配置 | 从示例生成本地 env（不提交）：`cp .env.test.example .env.test`（`dev-test.sh` 会自动创建） |
@@ -56,7 +56,7 @@
 公开测试凭据（仅 IT 栈，已写在 compose / example 中）：
 
 - Postgres：用户/库 `monoengine`，密码 `monoengine_test_password`
-- RustFS：`rustfs` / `rustfs_secret`，桶 `testbucket`
+- RustFS：`rustfs` / `rustfs_secret`，桶 **`monoengine`**（monoengine IT）与 **`monoui`**（monoui 上传，FS-ME-01）
 
 ## 快速开始：普通 / 基础测试
 
@@ -87,7 +87,7 @@
 
 ## 完整集成测试栈（推荐路径）
 
-在仓库根执行。目标：**数据面 + RustFS 桶初始化 + Linux `git-cli`**，然后跑全量测试。
+在仓库根执行。目标：**数据面 + RustFS 桶初始化 + git-cli**，然后跑全量测试。
 
 ```bash
 ./scripts/dev-test.sh full
@@ -101,7 +101,7 @@ dir="${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}"
 mkdir -p "$dir" && chmod 1777 "$dir"
 export MONOENGINE_IT_GIT_UID="$(id -u)" MONOENGINE_IT_GIT_GID="$(id -g)"
 
-# 2) 数据面 + rustfs-init 建桶 + git-cli（Linux；mailpit 仅供 website IT 捕获）
+# 2) 数据面 + rustfs-init 建桶 + git-cli（mailpit 仅供 website IT 捕获）
 #    一次 --profile git up，避免漏启 git-cli 导致 integration_git_cli 硬失败。
 docker compose -p monoengine-it -f docker-compose.test.yml \
   --profile git up -d --wait
@@ -133,9 +133,9 @@ cargo test --all
 
 | Profile | 服务 | 何时启用 |
 | --- | --- | --- |
-| （默认） | `postgres`、`redis`、`rustfs`、`rustfs-init` | monoengine 日常 IT 数据面；`rustfs-init` 幂等建 `testbucket` 后常驻供 `--wait` |
+| （默认） | `postgres`、`redis`、`rustfs`、`rustfs-init` | monoengine 日常 IT 数据面；`rustfs-init` 幂等建 **`monoengine`** + **`monoui`** 桶后常驻供 `--wait` |
 | （默认，可选消费） | `mailpit` | website 认证/产品邮件捕获；不是 monoengine 测试门 |
-| `git` | `git-cli`（host 网络，Linux） | 跑 `integration_git_cli` / `cargo test --all` 全量门 |
+| `git` | `git-cli`（bridge + `host.docker.internal`） | 跑 `integration_git_cli` / `cargo test --all` 全量门 |
 | `app` | 常驻 `monoengine` → `127.0.0.1:19180` | 栈级 HTTP smoke / 联调；**不是**隔离黑盒 |
 
 栈级 HTTP 探针示例（需先 build 镜像，见 `test-infra.md`）：
@@ -180,7 +180,7 @@ curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 | rustfs S3 API | `127.0.0.1:19000` → 9000 | `MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL` |
 | rustfs console | `127.0.0.1:19001` → 9001 | 人工查看 |
 | monoengine（`app`） | `127.0.0.1:19180` → 8000 | `MONOENGINE_IT_HTTP_URL` |
-| git-cli | 无端口映射 | host 网络访问宿主高位端口 |
+| git-cli | 无端口映射 | bridge 网络经 `host.docker.internal` 访问宿主高位端口 |
 
 网络名固定为 `monoengine-test-network`：带 `-p monoengine-it` 与不带 `-p` 的两套栈会争用，启新栈前先 `down -v` 旧栈。
 
@@ -205,7 +205,7 @@ curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 | `MONOENGINE_IT_GIT_WORKDIR` | git-cli 共享宿主根（默认 `/tmp/monoengine-git`）；变更后须 `--force-recreate git-cli` |
 | `MONOENGINE_IT_GIT_UID` / `GID` | 容器内用户；本地 `id -u` ≠ 1000 时必设（脚本默认导出当前用户） |
 | `MONOENGINE_IT_HTTP_URL` | 指向 compose `app` 常驻服务 |
-| `MONOENGINE_IT_ALLOW_HOST_GIT=1` | **仅** Linux 本地实验用宿主机 git；**不是**验收路径 |
+| `MONOENGINE_IT_ALLOW_HOST_GIT=1` | **仅**本地实验用宿主机 git；**不是**验收路径 |
 | `MONOENGINE_IT_SKIP_GIT_CLI=1` | 显式跳过 git-cli 用例（非默认门禁） |
 | `MONOENGINE_IT_PROJECT` | Compose 项目名（默认 `monoengine-it`；脚本可覆盖） |
 
@@ -266,6 +266,22 @@ WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
 ```
 
 需 `--profile app --profile web` 栈已就绪；未设置 `WEBSITE_IT=1` 时该用例自动跳过。
+
+**Workspace 对象存储 IT（FS-02，`website-next`）**
+
+`website-next` 还注入 RustFS S3 环境（monoui 固定桶 **`monoui`**）：
+
+| 变量 | compose 值 |
+|------|------------|
+| `STORAGE_PROVIDER` | `s3` |
+| `S3_BUCKET` | `monoui` |
+| `S3_ENDPOINT` | `http://rustfs:9000` |
+| `S3_PUBLIC_URL` | `http://127.0.0.1:19000/monoui` |
+| `S3_FORCE_PATH_STYLE` | `true` |
+| `S3_ACCESS_KEY_ID` / `S3_ACCESS_KEY_SECRET` | `rustfs` / `rustfs_secret` |
+
+`website-next` 依赖 `rustfs-init: service_healthy`（双桶 **`monoengine`** + **`monoui`** 已建）。
+设计细节见 monoui [`docs/implementation/workspace-storage-backend.md`](../monoui/docs/implementation/workspace-storage-backend.md)。
 
 **干净重置**
 

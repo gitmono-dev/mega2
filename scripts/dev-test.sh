@@ -15,7 +15,7 @@ Usage:
 
 Stack commands:
   up-data              Start default data plane (postgres/redis/rustfs/rustfs-init/mailpit)
-  up-full              Start data plane + git-cli (Linux; recommended for cargo test --all)
+  up-full              Start data plane + git-cli (recommended for cargo test --all)
   down                 Tear down project (profiles git/app/web, volumes)
   health               Postgres / Redis / Mailpit smoke checks
 

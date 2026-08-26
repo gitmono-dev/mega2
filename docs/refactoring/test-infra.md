@@ -53,14 +53,16 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
    的 `validate-config` 已在 `--profile git up` 前执行）。用例只在该根下分配子目录并清理。变更
    `MONOENGINE_IT_GIT_WORKDIR` 后必须 `--force-recreate git-cli`（或整栈），
    否则 host 与容器挂载会静默分叉。`git-cli` 在 `profiles: ["git"]` 下，默认
-   `up -d --wait` **不会**启动它（host 网络仅在 Linux 验收路径启用；`--profile git`
-   也避免在非目标开发机上误把 host 网络拉进默认栈）。**集成测试 / git-cli harness
-   的目标 OS 是 Linux**：跑全量门（`source .env.test && cargo test --all`）必须
-   额外启动 git-cli——在基础栈已 `up -d --wait` 后执行
+   `up -d --wait` **不会**启动它（避免数据面-only 开发循环误拉 runner；
+   `--profile git` 显式启用）。**集成测试 / git-cli harness** 在 **Linux 与
+   macOS Docker Desktop** 上验收：cargo 在宿主绑定 `127.0.0.1` 高位端口，compose
+   `git-cli` 经 bridge + `host.docker.internal` 访问。跑全量门
+   （`source .env.test && cargo test --all`）必须额外启动 git-cli——在基础栈已
+   `up -d --wait` 后执行
    `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait git-cli`
    （或等价的带 `--profile git` 的整栈 `up`），否则 `integration_git_cli`
    会以 `git-cli runner unavailable` 硬失败。宿主机 `git` **不是**跨平台降级路径；
-   仅 Linux 本地实验可显式设 `MONOENGINE_IT_ALLOW_HOST_GIT=1`（见下方登记条目）。
+   仅本地实验可显式设 `MONOENGINE_IT_ALLOW_HOST_GIT=1`（见下方登记条目）。
    默认以 UID/GID `1000:1000` 运行；本地测试 UID 不同时先
    `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)` 再
    `up`/`--force-recreate`。
@@ -79,8 +81,9 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 7. **secret 只经 stdin/env 注入**（不把凭据写进镜像层或 compose 明文文件之外的
    可提交产物；测试口令仅限公开示例）。
 8. **`::add-mask::` 脱敏**（CI 日志对凭据打码）。
-9. **目标 OS = Linux**（集成测试与 `git-cli` harness 不要求 Windows/macOS 兼容路径；
-   宿主机客户端仅作显式本地实验 opt-in，不得冒充固定版本验收）。
+9. **目标 OS = Linux + macOS Docker Desktop**（集成测试与 `git-cli` harness 通过
+   bridge + `host.docker.internal` 跨平台；Windows 未验收）。
+   宿主机客户端仅作显式本地实验 opt-in，不得冒充固定版本验收。
 
 另需在登记条目中写明：网络模式（与 `networks.default` 的互斥约束）、卷/工作目录约定、
 `profiles` / `depends_on` 语义、CI 入口（若有）。
@@ -119,10 +122,10 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | 服务名 | `rustfs`、`rustfs-init` |
 | 镜像 | `rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c`；桶初始化客户端 `minio/mc:RELEASE.2025-04-16T18-13-26Z`（固定 tag，非 `latest`；`mc` 仅作通用 S3 客户端） |
 | 端口 | `127.0.0.1:19000:9000`、`127.0.0.1:19001:9001`（高位 + 仅回环；S3 API / console） |
-| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`；`rustfs-init`：`mc ls local/testbucket`（建桶后 `sleep infinity`，见 `docker-compose.test.yml`） |
+| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`；`rustfs-init`：`mc ls local/monoengine` **且** `mc ls local/monoui`（建桶后 `sleep infinity`，见 `docker-compose.test.yml`） |
 | 网络 | 默认 `networks.default` → `monoengine-test-network` |
 | 卷 / 工作目录 | `rustfs` 使用容器内路径 `/data`（`RUSTFS_VOLUMES=/data`），**无**宿主机 bind-mount；单盘本地 smoke 设 `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`。数据仅存在于该容器可写层，`down -v` 后不保留。`rustfs-init` 无持久卷（建桶后常驻，供 `--wait`） |
-| profiles | 无；两者均参与默认 `up -d --wait`。`rustfs-init` 在 `rustfs` healthy 后幂等创建 `testbucket`，再以 healthcheck 报告就绪（纯 one-shot exit 会让 `--wait` 失败） |
+| profiles | 无；两者均参与默认 `up -d --wait`。`rustfs-init` 在 `rustfs` healthy 后幂等创建 **`monoengine`** 与 **`monoui`** 桶，再以 healthcheck 报告就绪（纯 one-shot exit 会让 `--wait` 失败） |
 | depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml down -v`；零残留按 project label 判定 |
 | CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p monoengine-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p monoengine --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（产品邮件投递由 website 负责，本 job **不**跑本仓 SmtpMailer→Mailpit 或 `integration_mail_dispatcher_*`）；job 末尾 `if: always()` 下 `-p monoengine-it --profile git --profile app --profile web down -v` |
@@ -142,22 +145,22 @@ git-cli runner git-lfs 固定版本: `git-lfs/3.7.1`（GM-05 起随镜像内置�
 | 服务名 | `git-cli` |
 | 镜像 | `monoengine-git-cli:3.7.1`（本地构建，`build: Dockerfile.git-cli`，GM-05 起）。基底为原登记的固定 digest `alpine/git:v2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26`，叠加 sha256 校验安装的 git-lfs `3.7.1` 与 `gitcli`（uid 1000）用户；无 `latest`，git pin 不变 |
 | 固定版本字符串 | 见上文 `git-cli 固定版本`（容器内 `git --version` 必须与该字符串完全相等）；`git lfs version` 输出必须以上文 git-lfs pin 前缀开头 |
-| 端口 | 无独立端口映射；通过 `network_mode: host` 访问宿主 `127.0.0.1` 高位端口 |
+| 端口 | 无独立端口映射；经 `host.docker.internal` 访问宿主 `127.0.0.1` 高位端口 |
 | healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]7[.]1 '`（见 `docker-compose.test.yml`） |
 | entrypoint / init | `entrypoint: ["sleep","infinity"]`（常驻供 `exec`）；`init: true`（回收 exec 超时包装器遗留的 git/ssh 子进程，GM-08 起） |
-| 网络 | **`network_mode: host`**，因此**不**加入 `networks.default`（与 host 网络互斥，见 ADR-IT-01） |
+| 网络 | **加入 `networks.default`**；`extra_hosts: host.docker.internal:host-gateway`。Harness 将 git remote URL 映射为 `http://host.docker.internal:<port>/`（容器 runner）或 `127.0.0.1`（宿主机 opt-in runner）；宿主侧 curl/TcpStream 仍用 loopback（ADR-IT-01 修订） |
 | 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}` → 容器 `/work`（`working_dir: /work`）。**启栈前应由宿主机预创建且对测试 UID 可写**（推荐 `mkdir -p "$dir" && chmod 1777 "$dir"`）。若缺失，Docker 可能以 `root:root` 自动建目录，导致后续未提权进程 `EACCES`；CI `validate-config` 已在 `--profile git up` 前 mkdir（见「CI 入口」）。该路径跨用例可见；用例只在其下自建**子目录**并清理。相对路径按 compose 文件所在目录（仓库根）解析，与 harness `git_cli_workdir()` 对齐（不以 `bin/` CWD 为准）。**`MONOENGINE_IT_GIT_WORKDIR` 仅在容器创建时解析**：改根路径必须用同一环境变量值执行 `docker compose -p monoengine-it -f docker-compose.test.yml up -d --force-recreate git-cli`（或整栈 recreate）；已在跑的栈上事后 `export` 新值不会改挂载 |
 | 运行身份 | `user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"`（Compose 可解析的数值默认，不依赖 Bash 未 export 的 `$UID`）。默认 `1000:1000` 对齐常见 CI runner；本地若 `id -u` 不是 1000，启栈前必须 `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`。变更 UID/GID 后需要 `--force-recreate git-cli` |
-| profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；验收路径在 Linux 上显式 `--profile git`。profile 也避免非目标开发机误启 host 网络拖垮数据面） |
+| profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；验收路径显式 `--profile git`） |
 | depends_on | 无 |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile git down -v`（或整栈 `down -v`）；零残留按 project label 判定 |
 | CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config`：mkdir 工作根、导出 `MONOENGINE_IT_GIT_UID/GID=$(id -u/g)` 后 `--profile git up -d --wait`，再跑 `cargo test -p monoengine --test integration_git_cli -- --test-threads=1`；`.github/workflows/git-protocol-smoke.yml` 在协议路径变更时同样先拉起 `git-cli`，再以 `cargo test -p monoengine --release --test integration_git_cli` 跑同一 target（复用本 job 的 release 构建；补 allowlist A 未含协议路径的覆盖缺口），其后用宿主机 git（pin 见「客户端版本确定性规则」）跑脚本矩阵；该 job `timeout-minutes: 60`（release 构建 + cargo gate + shell smoke） |
 | secret | **不**注入任何 secret；凭据由用例经 credential helper / env 注入 |
-| 目标 OS / 降级 | **Linux only**。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于 Linux 本地实验，且不得冒充固定版本门；无 Windows/macOS 兼容路径 |
+| 目标 OS / 降级 | **Linux + macOS Docker Desktop**（bridge + `host.docker.internal`）。compose `git-cli`（pin `git version 2.49.1`）是唯一验收 runner。宿主机 `git` 仅当显式 `MONOENGINE_IT_ALLOW_HOST_GIT=1` 时用于本地实验，且不得冒充固定版本门 |
 
 ### git-smoke（linked 栈级 git 协议 smoke，profile `git`）
 
-与 `git-cli`（host 网络、供 cargo-native harness 自起服务）不同，`git-smoke` **加入 `networks.default`**，直接对 compose 常驻的 `monoengine`（profile `app`）跑 `scripts/git_protocol_smoke.sh` 的 push/pull 矩阵。它把「项目镜像 + 其它镜像 link 在一起」的完整 compose 测试环境落到 git 协议面：ls-remote / clone / fetch / shallow / blobless / push CL / tag-reject / LFS。
+与 `git-cli`（bridge + `host.docker.internal`，供 cargo-native harness 自起服务）不同，`git-smoke` **加入 `networks.default`**，直接对 compose 常驻的 `monoengine`（profile `app`）跑 `scripts/git_protocol_smoke.sh` 的 push/pull 矩阵。它把「项目镜像 + 其它镜像 link 在一起」的完整 compose 测试环境落到 git 协议面：ls-remote / clone / fetch / shallow / blobless / push CL / tag-reject / LFS。
 
 git-smoke 固定版本: `git version 2.49.1`（与 git-cli 同基底）
 
@@ -171,7 +174,7 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
 | 端口 | 无独立端口映射；通过 `networks.default` 访问 `monoengine:8000` |
 | healthcheck | `CMD-SHELL git --version >/dev/null && git lfs version \| grep -q '^git-lfs/3[.]7[.]1 '`（见 `docker-compose.test.yml`） |
 | entrypoint / init | `entrypoint: ["/bin/bash","-c","exec sleep infinity"]`（常驻供 `exec`）；`init: true` |
-| 网络 | **加入 `networks.default`**（与 `git-cli` 的 host 网络相反），经内部 bridge 访问 compose 常驻 `monoengine` |
+| 网络 | **加入 `networks.default`**（与 `git-cli` 相同 bridge；`git-smoke` 访问 compose 内 `monoengine` DNS 名） |
 | 卷 / 工作目录 | 挂载共享宿主路径 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}` → 容器 `/work`（`working_dir: /work`）；另以只读挂载 monoengine 仓库根 → `/repo`（供 `scripts/git_protocol_smoke.sh` 在容器内执行） |
 | 运行身份 | 默认 `1000:1000`（镜像内建 `gitsmoke` 用户）；如需对齐宿主 UID 可 `export MONOENGINE_IT_GIT_UID/GID` 后 `--force-recreate git-smoke` |
 | profiles | `profiles: ["git"]`（**不**参与默认 `up -d --wait`；须与 `--profile app` 同启，因 `depends_on: monoengine`） |
@@ -233,7 +236,8 @@ docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d -
 | 网络 | 默认 `networks.default` → `monoengine-test-network`，可由后续 `monoengine` profile 通过 `website-next:7001` 访问 |
 | 账户库 | 两服务都设 `DB_DIALECT=pg` 与 `DATABASE_URL=postgresql://monoengine:monoengine_test_password@postgres:5432/website`。`website-db-init` 先在共享 `postgres` 上幂等 `CREATE DATABASE website`（经 `DATABASE_ADMIN_URL` 连 maintenance DB），再 `npx drizzle-kit push --force`。账户数据与 `monoengine` 业务库隔离（ADR-WA-07）；**禁止**把 website URL 指到库名 `monoengine`。无 named volume（状态在 Postgres 数据卷） |
 | profiles | 两服务均为 `profiles: ["web"]`，不参与默认 `up -d --wait`；显式启动：`docker compose -p monoengine-it -f docker-compose.test.yml --profile web up -d --wait website-next` |
-| depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）；初始化失败时 Next 不会启动。没有 `monoengine` 跨 profile 依赖：`website-next` 是 `web` profile、`monoengine` 是 `app` profile，避免 app-only smoke 被 web 拉起。可联合运行 `docker compose -p monoengine-it -f docker-compose.test.yml --profile app --profile web up -d --wait`，此时 Compose 先完成 schema 初始化，再等待两个常驻服务 healthy |
+| depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）+ **`rustfs-init`（`service_healthy`，FS-02：确保 `monoui` 桶已建）**；初始化失败时 Next 不会启动。没有 `monoengine` 跨 profile 依赖 |
+| 对象存储 env（FS-02） | `STORAGE_PROVIDER=s3`，`S3_BUCKET=monoui`，`S3_ENDPOINT=http://rustfs:9000`，`S3_PUBLIC_URL=http://127.0.0.1:19000/monoui`，`S3_FORCE_PATH_STYLE=true`，凭据 `rustfs` / `rustfs_secret`；见 monoui [`workspace-storage-backend.md`](../../../monoui/docs/implementation/workspace-storage-backend.md) |
 | 清理 | `docker compose -p monoengine-it -f docker-compose.test.yml --profile web down -v`；`-v` 删除 Postgres 数据卷后 `website` 库与 schema 不保留，零残留仍按 compose project label 判定 |
 | CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../monoui`（`gitmono-dev/monoui` @ [`website-auth.md`](./website-auth.md) §头部所钉 revision——SHA 不在此重复，避免第二真源；缺 `WEBSITE_CHECKOUT_TOKEN` 时可回退 `ORBIT_CHECKOUT_TOKEN`）。构建 `monoengine:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。Dockerfile 内容守卫（须 COPY `drizzle.config.ts`）保留为回归保护。 |
 | secret | `BETTER_AUTH_SECRET` 与 `MONOENGINE_INTERNAL_MAIL_BEARER` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |

@@ -467,7 +467,7 @@ fn integration_git_cli_http_round_trip() {
     // Migrations + access_token table exist only after service bootstrap.
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let clone1 = env.case_dir.join("clone1");
     let clone1_name = "clone1";
     fs::create_dir_all(&clone1).expect("mkdir clone1");
@@ -663,7 +663,7 @@ fn integration_git_cli_http_round_trip() {
         "token must not appear in remote URL: {remote_printed}"
     );
     assert!(
-        remote_printed.contains(&format!("127.0.0.1:{port}/")),
+        remote_printed.contains(&format!("{}:{port}/", git_cli::monoengine_reachable_host())),
         "unexpected remote URL: {remote_printed}"
     );
 
@@ -709,7 +709,7 @@ fn integration_git_cli_http_pull_cl_ref_round_trip() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let sender_name = "pull-sender";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, sender_name]),
@@ -910,7 +910,7 @@ fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let anon_clone = git_cli::git_cli_no_auth(
         &env.case_dir,
         &["clone", &remote_url, "anon-disabled-clone"],
@@ -972,7 +972,7 @@ fn integration_git_cli_http_rejects_git_client_tag_push() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let clone_name = "tag-reject-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -1090,7 +1090,7 @@ fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
     );
 
     // Real client path: anonymous clone (upload-pack) then unauthenticated push fails.
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let clone_name = "auth-unauthed-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli_no_auth(&env.case_dir, &["clone", &remote_url, clone_name]),
@@ -1196,7 +1196,7 @@ fn integration_git_cli_auth_token_never_leaks() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let clone_name = "auth-leak-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -1353,7 +1353,7 @@ fn integration_git_cli_authz_revoke_grant_immediate_effect() {
         &user_token,
     );
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
 
     // --- baseline: non-admin push denied under enforce ---
     let clone_name = "un16-clone";
@@ -1800,7 +1800,7 @@ fn integration_git_cli_acl_change_requires_admin_to_merge() {
         );
 
     git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
 
     // The admin pushes a CL that grants the maintainer the maintainer role —
     // exactly the kind of change that must not be self-mergeable.
@@ -1921,7 +1921,7 @@ fn integration_git_cli_rejects_main_branch_delete() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = format!("http://127.0.0.1:{port}/");
+    let remote_url = git_cli::monoengine_http_repo_url(port);
     let clone_name = "un16-main-delete-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -2007,7 +2007,7 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
 
     // Legacy-disallowed root repo: parse_git_protocol_path rejects it before any
     // empty-repo advertisement (monorepo otherwise serves arbitrary paths as empty).
-    let missing_url = format!("http://127.0.0.1:{port}/third-party.git/");
+    let missing_url = git_cli::monoengine_http_url(port, "/third-party.git/");
     let clone_dir = "failpath-missing";
 
     let first = git_cli::git_cli_no_auth(&env.case_dir, &["clone", &missing_url, clone_dir]);
@@ -2084,7 +2084,7 @@ fn normalize_git_cli_error(combined: &str) -> String {
 }
 
 fn http_status(port: u16, path: &str) -> u16 {
-    let url = format!("http://127.0.0.1:{port}{path}");
+    let url = git_cli::monoengine_http_url(port, path);
     let mut command = Command::new("curl");
     command.args([
         "-sS",

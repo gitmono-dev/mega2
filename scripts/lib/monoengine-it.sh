@@ -60,19 +60,12 @@ monoengine_it_ensure_env_test() {
   monoengine_it_info "sourced ${env_file}"
 }
 
-monoengine_it_require_linux_for_git() {
-  if [[ "$(uname -s)" != "Linux" ]]; then
-    monoengine_it_die "git-cli profile requires Linux (host networking); uname=$(uname -s)"
-  fi
-}
-
 monoengine_it_up_data() {
   monoengine_it_info "starting data plane (postgres/redis/rustfs/rustfs-init/mailpit)"
   monoengine_it_compose up -d --wait
 }
 
 monoengine_it_up_full() {
-  monoengine_it_require_linux_for_git
   monoengine_it_prepare_git_workdir
   monoengine_it_info "starting data plane + git-cli (--profile git)"
   monoengine_it_compose --profile git up -d --wait
