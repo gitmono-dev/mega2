@@ -292,10 +292,21 @@ async fn fetch_cl_list(
         .cl_stg()
         .get_cl_list(json.additional.into(), json.pagination)
         .await?;
-    let res = CommonPage {
-        items: items.into_iter().map(|m| m.into()).collect(),
-        total,
-    };
+    let mut items: Vec<ItemRes> = items.into_iter().map(|m| m.into()).collect();
+
+    // Backfill the aggregated Orion build status for this page (worst-wins
+    // over the latest task per CL). One batch query, and a failure only
+    // leaves the statuses empty — the list itself still returns.
+    // Ported from mega@fae6823 `ceres/.../mono/cl_list.rs` (#2163).
+    let links: Vec<String> = items.iter().map(|i| i.link.clone()).collect();
+    match state.cl_stg().latest_build_status_by_cl_links(&links).await {
+        Ok(statuses) => ItemRes::apply_build_statuses(&mut items, &statuses),
+        Err(e) => {
+            tracing::warn!("Failed to load CL build statuses for list: {e}");
+        }
+    }
+
+    let res = CommonPage { items, total };
     Ok(Json(CommonResult::success(Some(res))))
 }
 
