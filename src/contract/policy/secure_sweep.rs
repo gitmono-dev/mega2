@@ -43,7 +43,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::policy::secure_artifact::{
     ArtifactError, ArtifactResult, BASELINES_DIR, POINTER_NAME, RUNS_DIR, RestrictedRoot,
-    SWEEP_REPORTS_DIR, generate_run_id, retry_on_interrupt, validate_run_id, write_exclusive_under,
+    SWEEP_REPORTS_DIR, clear_errno, generate_run_id, retry_on_interrupt, validate_run_id,
+    write_exclusive_under,
 };
 
 /// The one lock. Sweep, promotion and admission all take it, so none of them
@@ -188,7 +189,8 @@ fn root_identity(root: &RestrictedRoot) -> ArtifactResult<(u64, u64)> {
     if unsafe { libc::fstat(root.as_raw_fd(), &mut stat) } < 0 {
         return Err(io_error("fstat", "."));
     }
-    Ok((stat.st_dev, stat.st_ino))
+    // `dev_t`/`ino_t` widths vary by platform (i32/u64 on macOS); normalise.
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 /// Run the sweep.
@@ -751,8 +753,7 @@ fn read_entries(dir: RawFd, label: &str) -> ArtifactResult<Vec<Entry>> {
         // errno has to be cleared first: without this, a failed read looks
         // exactly like a complete listing, and the sweep would quietly act on a
         // truncated view of the directory.
-        // SAFETY: `__errno_location` returns a valid pointer for this thread.
-        unsafe { *libc::__errno_location() = 0 };
+        clear_errno();
         // SAFETY: `stream` is an open directory stream.
         let raw = unsafe { libc::readdir(stream) };
         if raw.is_null() {

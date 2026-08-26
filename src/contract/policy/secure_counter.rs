@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::contract::policy::{
     secure_artifact::{
         ArtifactError, ArtifactResult, BASELINES_DIR, POINTER_NAME, RUNS_DIR, RestrictedRoot,
-        SWEEP_REPORTS_DIR, read_root_file, validate_run_id, write_root_file_atomic,
+        SWEEP_REPORTS_DIR, clear_errno, read_root_file, validate_run_id, write_root_file_atomic,
     },
     secure_sweep::{MaintenanceLock, PROTECTED_MANIFEST},
 };
@@ -512,8 +512,9 @@ fn list_entries(dir: RawFd, label: &str) -> ArtifactResult<Vec<ListedEntry>> {
         if entries.len() >= MAX_RECONCILE_DIR_ENTRIES {
             break;
         }
-        // SAFETY: `__errno_location` returns a valid pointer for this thread.
-        unsafe { *libc::__errno_location() = 0 };
+        // `readdir` reports both "end of directory" and "error" as NULL, so
+        // errno has to be cleared first to tell them apart.
+        clear_errno();
         // SAFETY: `stream` is an open directory stream.
         let raw = unsafe { libc::readdir(stream) };
         if raw.is_null() {

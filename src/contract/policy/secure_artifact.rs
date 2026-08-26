@@ -726,6 +726,25 @@ pub(crate) fn retry_on_interrupt(mut call: impl FnMut() -> libc::c_int) -> libc:
     }
 }
 
+/// Zero the thread's `errno` slot before a `readdir` call.
+///
+/// `readdir` reports both "end of directory" and "error" as NULL, so callers
+/// distinguish them by clearing errno first. The thread-local accessor has a
+/// different name per platform: `__errno_location` on Linux, `__error` on
+/// macOS.
+#[cfg(target_os = "linux")]
+pub(crate) fn clear_errno() {
+    // SAFETY: `__errno_location` returns a valid pointer for this thread.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+/// See the Linux variant above.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn clear_errno() {
+    // SAFETY: `__error` returns a valid pointer for this thread.
+    unsafe { *libc::__error() = 0 };
+}
+
 fn retry_on_interrupt_isize(mut call: impl FnMut() -> libc::ssize_t) -> libc::ssize_t {
     loop {
         let result = call();
