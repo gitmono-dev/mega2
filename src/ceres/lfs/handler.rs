@@ -1,4 +1,4 @@
-use std::{cmp::min, time::Duration};
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -443,17 +443,28 @@ async fn lfs_get_filtered_locks(
         locks = filterd;
     }
 
-    let mut next = "".to_string();
-    if !limit.is_empty() {
-        let mut size = limit
-            .parse::<i64>()
-            .map_err(|e| lfs_storage_error("parse LFS lock limit", e))?;
-        size = min(size, locks.len() as i64);
+    apply_lock_limit(locks, limit)
+}
 
-        if size + 1 < locks.len() as i64 {
-            locks[size as usize].id.clone_into(&mut next);
+/// Applies the `limit` parameter to an ordered lock list, returning the page and
+/// the id of the first lock past the page (empty when no further page exists).
+///
+/// The limit comes straight from the query string, so anything non-numeric
+/// (including negative values) is rejected instead of being parsed leniently.
+/// Ported from mega@2398a92 `ceres/src/lfs/handler.rs` (#2175).
+fn apply_lock_limit(locks: Vec<Lock>, limit: &str) -> Result<(Vec<Lock>, String), GitLFSError> {
+    let mut next = "".to_string();
+    let mut locks = locks;
+    if !limit.is_empty() {
+        let size = limit
+            .parse::<usize>()
+            .map_err(|_| GitLFSError::GeneralError(format!("Invalid limit parameter: {limit}")))?;
+        let size = size.min(locks.len());
+
+        if size + 1 < locks.len() {
+            locks[size].id.clone_into(&mut next);
         }
-        let _ = locks.split_off(size as usize);
+        let _ = locks.split_off(size);
     }
 
     Ok((locks, next))
@@ -700,6 +711,60 @@ async fn delete_lock(
 mod tests {
     use super::*;
     use crate::ceres::lfs::lfs_structs::{Action, Ref, ResCondition, ResponseObject};
+
+    fn lock(id: &str) -> Lock {
+        Lock {
+            id: id.to_string(),
+            path: format!("/dir/{id}.bin"),
+            owner: None,
+            locked_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn lock_limit_slices_page_and_reports_next_cursor() {
+        let locks = vec![lock("1"), lock("2"), lock("3"), lock("4")];
+
+        let (page, next) = apply_lock_limit(locks, "2").unwrap();
+        assert_eq!(
+            page.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(next, "3");
+    }
+
+    #[test]
+    fn lock_limit_beyond_list_returns_everything_without_cursor() {
+        let locks = vec![lock("1"), lock("2")];
+
+        let (page, next) = apply_lock_limit(locks, "10").unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(next, "");
+    }
+
+    #[test]
+    fn empty_limit_returns_unpaged_locks() {
+        let locks = vec![lock("1")];
+
+        let (page, next) = apply_lock_limit(locks, "").unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, "");
+    }
+
+    #[test]
+    fn non_numeric_and_negative_limits_are_rejected() {
+        // The router classifies by message content ("Invalid..." -> 400), so the
+        // rejection must carry that prefix to survive the lookup-error masking
+        // in `lfs_retrieve_lock`.
+        for limit in ["abc", "-1"] {
+            match apply_lock_limit(vec![lock("1")], limit) {
+                Err(GitLFSError::GeneralError(msg)) => {
+                    assert!(msg.starts_with("Invalid"), "unexpected message: {msg}");
+                }
+                other => panic!("expected GeneralError, got {other:?}"),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn locks_are_namespaced_by_repository() {
