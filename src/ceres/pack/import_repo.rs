@@ -523,7 +523,8 @@ impl ImportRepo {
             let expected_tree = root_ref.ref_tree_hash.clone();
             let root_ref_id = root_ref.id;
 
-            let save_trees = tree_ops::search_and_create_tree(&mono_api_service, &path).await?;
+            let (save_trees, gitkeep_blob) =
+                tree_ops::search_and_create_tree(&mono_api_service, &path).await?;
 
             let new_commit = Commit::from_tree_id(
                 save_trees
@@ -536,6 +537,15 @@ impl ImportRepo {
             // UN-16: capture the post-attach root tree hash before `new_commit`
             // is moved into the txn call, for the authz notify below.
             let new_root_tree_hash = new_commit.tree_id.to_string();
+
+            // Persist the placeholder `.gitkeep` blob referenced by the newly
+            // created path trees before attach; otherwise clone/fetch 404s on
+            // it (mega@f5d22b9, #2152). Fails before the txn starts, so attach
+            // never leaves a tree referencing a missing blob.
+            self.storage
+                .mono_service
+                .save_blobs(&new_commit.id.to_string(), vec![gitkeep_blob])
+                .await?;
 
             let txn = self.storage.begin_db_transaction().await?;
             let git_db = self.storage.git_db_storage();
@@ -773,19 +783,43 @@ async fn process_objects(
 
 #[cfg(test)]
 mod test {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
+    use git_internal::internal::{
+        metadata::{EntryMeta, MetaAttached},
+        object::{
+            blob::Blob,
+            commit::Commit,
+            tree::{Tree, TreeItem, TreeItemMode},
+        },
+    };
     use sea_orm::TransactionTrait;
 
+    use super::ImportRepo;
     use crate::{
         callisto::{import_refs, sea_orm_active_enums::RefTypeEnum},
+        ceres::{
+            api_service::cache::GitObjectCache,
+            protocol::{import_refs::RefCommand, repo::Repo},
+        },
+        common::utils::ZERO_ID,
+        config::RedisConfig,
         jupiter::{
             migration::apply_migrations,
+            redis::{init_connection, lock::RedLock},
+            service::{
+                git_service::GitService, import_service::ImportService, mono_service::MonoService,
+            },
             storage::{
                 base_storage::{BaseStorage, StorageConnector},
                 git_db_storage::GitDbStorage,
+                object_storage::mock_object_storage,
             },
-            tests::test_db_connection,
+            tests::{test_db_connection, test_storage},
+            utils::converter::FromMegaModel,
         },
     };
 
@@ -829,5 +863,148 @@ mod test {
         txn.commit().await.unwrap();
 
         assert!(git_db.get_ref(repo_id).await.unwrap().is_empty());
+    }
+
+    /// Regression for mega@f5d22b9 (#2152): attach must persist the placeholder
+    /// `.gitkeep` blob into object storage before the txn commits, so the new
+    /// leaf tree never references an object that clone/fetch would 404 on.
+    #[tokio::test]
+    async fn attach_to_monorepo_parent_persists_gitkeep_blob_in_object_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = test_storage(temp.path()).await;
+
+        // Wire the services to the real test DB with one shared in-memory object store.
+        let git_service = GitService {
+            obj_storage: mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: git_service.clone(),
+        };
+        storage.import_service = ImportService {
+            git_db_storage: storage.git_db_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .unwrap();
+
+        // Import repo with a single commit on refs/heads/main.
+        let repo = Repo::new(PathBuf::from("/third-party/newrepo"), false).unwrap();
+        let repo_id = repo.repo_id;
+        let readme = Blob::from_content("hello from import repo");
+        let tree = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: readme.id,
+            name: "README.md".to_string(),
+        }])
+        .unwrap();
+        let commit = Commit::from_tree_id(tree.id, vec![], "\nimport commit");
+        storage
+            .import_service
+            .save_entry(
+                repo_id,
+                vec![
+                    MetaAttached {
+                        inner: readme.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: tree.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: commit.clone().into(),
+                        meta: EntryMeta::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let command = RefCommand::new(
+            ZERO_ID.to_string(),
+            commit.id.to_string(),
+            "refs/heads/main".to_string(),
+        );
+
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let connection = init_connection(&RedisConfig { url: redis_url })
+            .await
+            .expect("redis connection");
+
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![command]),
+            unpack_redlock: Arc::new(RedLock::new(
+                connection.clone(),
+                format!("test:attach-gitkeep:{}:{}", std::process::id(), repo_id),
+                30_000,
+            )),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "disabled".to_string(),
+            }),
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+
+        import_repo.attach_to_monorepo_parent().await.unwrap();
+
+        // Walk the attached monorepo tree down to the new leaf.
+        let mono = storage.mono_storage();
+        let root_ref = mono.get_main_ref("/").await.unwrap().unwrap();
+        let root_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&root_ref.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let third_party = root_tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == "third-party")
+            .expect("root tree must contain third-party");
+        let third_party_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&third_party.id.to_string())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let newrepo = third_party_tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == "newrepo")
+            .expect("third-party tree must contain newrepo after attach");
+        let leaf_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&newrepo.id.to_string())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let gitkeep = leaf_tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == ".gitkeep")
+            .expect("leaf tree must reference a .gitkeep blob");
+
+        // The regression: before the fix the blob was referenced by the tree but
+        // never written to object storage, so reads 404'd on it.
+        let bytes = storage
+            .git_service
+            .get_object_as_bytes(&gitkeep.id.to_string())
+            .await
+            .expect(".gitkeep blob must be readable from object storage");
+        assert!(!bytes.is_empty());
+
+        let blob_rows = mono
+            .get_mega_blobs_by_hashes(vec![gitkeep.id.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(blob_rows.len(), 1);
     }
 }

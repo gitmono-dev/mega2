@@ -8,6 +8,7 @@ use git_internal::{
     errors::GitError,
     internal::object::{
         ObjectTrait,
+        blob::Blob,
         tree::{Tree, TreeItem, TreeItemMode},
     },
 };
@@ -114,11 +115,16 @@ pub async fn search_tree_by_path<T: ApiHandler + ?Sized>(
 ///
 /// # Errors
 ///
-/// Returns a `GitError` if an error occurs during the search or tree creation process.
+/// Returns a `MegaError` if an error occurs during the search or tree creation process.
+///
+/// The returned [`Blob`] is the placeholder `.gitkeep` referenced by the new leaf tree.
+/// Callers **must** persist it via object storage (`save_blobs` / `put_objects`) before
+/// or with the trees; otherwise clone/fetch will 404 on that object.
+/// Ported from mega@f5d22b9 `ceres/src/application/api_service/tree_ops.rs` (#2152).
 pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
     handler: &T,
     path: &Path,
-) -> Result<VecDeque<Tree>, MegaError> {
+) -> Result<(VecDeque<Tree>, Blob), MegaError> {
     let relative_path = handler.strip_relative(path)?;
     let root_tree = handler.get_root_tree(None).await?;
     let mut search_tree = root_tree.clone();
@@ -192,7 +198,7 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
         }
     }
 
-    Ok(saving_trees)
+    Ok((saving_trees, blob))
 }
 
 /// return the dir's hash only
@@ -314,5 +320,87 @@ pub async fn get_tree_content_hash<T: ApiHandler + ?Sized>(
             Ok(items)
         }
         None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::Arc};
+
+    use git_internal::internal::object::tree::TreeItemMode;
+
+    use super::search_and_create_tree;
+    use crate::{
+        ceres::api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
+        config::RedisConfig,
+        jupiter::{
+            redis::init_connection,
+            service::{git_service::GitService, mono_service::MonoService},
+            storage::object_storage::mock_object_storage,
+            tests::test_storage,
+        },
+    };
+
+    /// Regression coverage for mega@f5d22b9 (#2152): `search_and_create_tree`
+    /// returns the placeholder `.gitkeep` blob so callers can persist it together
+    /// with the new trees; the leaf tree must reference exactly that blob.
+    #[tokio::test]
+    async fn search_and_create_tree_returns_gitkeep_blob_referenced_by_leaf_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = test_storage(temp.path()).await;
+
+        // Wire the services to the real test DB with a shared in-memory object store.
+        let git_service = GitService {
+            obj_storage: mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .unwrap();
+
+        let handler = MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: init_connection(&RedisConfig {
+                    url: std::env::var("MEGA_REDIS__URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string()),
+                })
+                .await
+                .expect("redis connection"),
+                prefix: "disabled".to_string(),
+            }),
+        };
+
+        let (trees, blob) = search_and_create_tree(&handler, Path::new("a/b"))
+            .await
+            .expect("search_and_create_tree on a new path");
+
+        // "a/b" does not exist: leaf tree + intermediate "a" tree + updated root.
+        assert_eq!(trees.len(), 3);
+
+        // The leaf tree must reference the returned blob via a `.gitkeep` entry.
+        let leaf = trees.front().unwrap();
+        let gitkeep = leaf
+            .tree_items
+            .iter()
+            .find(|item| item.name == ".gitkeep")
+            .expect("leaf tree must contain a .gitkeep entry");
+        assert_eq!(gitkeep.mode, TreeItemMode::Blob);
+        assert_eq!(gitkeep.id, blob.id);
+
+        // The updated root must link the new "a" subtree.
+        let new_root = trees.back().unwrap();
+        assert!(
+            new_root
+                .tree_items
+                .iter()
+                .any(|item| item.name == "a" && item.mode == TreeItemMode::Tree)
+        );
     }
 }
