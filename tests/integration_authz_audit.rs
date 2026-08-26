@@ -13,6 +13,9 @@
 // 播种走真实二进制而不是在测试里手搓状态：手搓出来的库只包含我们想到的东西，而「零写入」
 // 恰恰是关于没想到的那些。
 
+// Only the Linux-gated audit-writer suites below use these helpers.
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     fs,
@@ -21,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
     thread::sleep,
@@ -922,6 +925,7 @@ fn integration_readonly_assembly_changes_nothing() {
 
 // ---------------------------------------------------------------- UN-29 CLI
 
+#[cfg(target_os = "linux")]
 fn run_id_from_stdout(stdout: &str) -> String {
     let line = stdout
         .lines()
@@ -942,6 +946,7 @@ fn run_id_from_stdout(stdout: &str) -> String {
     id.to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn output_status(command: &mut Command) -> (i32, String, String) {
     let output = command.output().expect("spawn monoengine");
     let code = output.status.code().unwrap_or(1);
@@ -950,6 +955,7 @@ fn output_status(command: &mut Command) -> (i32, String, String) {
     (code, stdout, stderr)
 }
 
+#[cfg(target_os = "linux")]
 fn run_audit(fixture: &Fixture, args: &[&str]) -> (i32, String, String) {
     let mut command = fixture.command();
     command
@@ -960,6 +966,8 @@ fn run_audit(fixture: &Fixture, args: &[&str]) -> (i32, String, String) {
 }
 
 /// UN-29：真实二进制审计面（bootstrap → promote 库桥 → compare）与 fsync 工具模式。
+// The authz audit writer is Linux-only by design (RENAME_NOREPLACE).
+#[cfg(target_os = "linux")]
 #[test]
 fn integration_authz_audit_cli_bootstrap_compare_fsync() {
     let fixture = Fixture::new();
@@ -1376,6 +1384,8 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
 }
 
 /// UN-52：真实二进制 run-init / run-commit / run-abort（含 cap fencing）。
+// The authz audit writer is Linux-only by design (RENAME_NOREPLACE).
+#[cfg(target_os = "linux")]
 #[test]
 fn integration_authz_audit_run_lifecycle() {
     let fixture = Fixture::new();
@@ -1634,6 +1644,8 @@ fn integration_authz_audit_run_lifecycle() {
 }
 
 /// UN-55：真实二进制 protect / unprotect（往返、P 上限、预留-结算）。
+// The authz audit writer is Linux-only by design (RENAME_NOREPLACE).
+#[cfg(target_os = "linux")]
 #[test]
 fn integration_authz_audit_protect_registry() {
     let fixture = Fixture::new();
@@ -1809,6 +1821,8 @@ fn integration_authz_audit_protect_registry() {
 }
 
 /// UN-56：真实二进制 evidence-append（往返 / 严格拒绝 / sentinel / 256KiB / lease / 并发）。
+// The authz audit writer is Linux-only by design (RENAME_NOREPLACE).
+#[cfg(target_os = "linux")]
 #[test]
 fn integration_authz_audit_evidence_append() {
     use std::{
