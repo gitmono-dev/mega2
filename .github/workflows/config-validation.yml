@@ -225,13 +225,19 @@ jobs:
           # That already happened once: the line that used to read
           # config_validate_rejects_object_storage_secret_ref_values_without_leaking_ref
           # matched zero tests after a rename and kept the job green. Every
-          # invocation now goes through this wrapper, which fails on
-          # "0 passed" (all-ignored counts as vacuous too).
+          # invocation now goes through this wrapper, which fails unless some
+          # test binary actually ran a test (all-ignored counts as vacuous too).
+          #
+          # Vacuity is judged by the POSITIVE signal: at least one binary must
+          # report `test result: ok. <N> passed` with N >= 1. Checking for
+          # `0 passed` lines instead would false-positive on every integration
+          # test binary, which prints `0 passed; N filtered out` for any
+          # lib-only filter.
           run_test() {
             local filter="$1" out
             out="$(cargo test "$filter" -- --nocapture 2>&1)"
             printf '%s\n' "$out"
-            if printf '%s' "$out" | grep -qE '^test result: ok\. 0 passed'; then
+            if ! printf '%s' "$out" | grep -qE '^test result: ok\. [1-9][0-9]* passed'; then
               echo "::error title=Vacuous test filter::'cargo test ${filter}' matched no tests. The test was renamed or removed and this gate has been passing without running anything. Fix the filter or drop the line."
               return 1
             fi
