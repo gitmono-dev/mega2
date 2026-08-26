@@ -31,27 +31,30 @@ mod un21_cache;
 mod un21_matrix;
 #[cfg(test)]
 mod un26_audit;
-#[cfg(test)]
+// The UN-32..UN-59 suites exercise the secure_* modules, which are
+// Linux-only by design (`require_linux` fails closed elsewhere): their
+// guarantees rest on renameat2/RENAME_NOREPLACE and flock semantics.
+#[cfg(all(test, target_os = "linux"))]
 mod un32_writer;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un35_promote;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un38_sweep;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un39_codec;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un40_crash;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un49_report;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un51_ledger;
 #[cfg(test)]
 mod un54_policy;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un57_lifecycle;
 #[cfg(test)]
 mod un58_admission;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod un59_hardcap;
 #[cfg(test)]
 mod un60_mapping;
