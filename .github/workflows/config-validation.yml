@@ -1,6 +1,9 @@
 name: Config Validation
 
 on:
+  # Manual trigger so manifest-only fixes (e.g. Cargo.toml default-run) can
+  # be validated without a no-op change to a paths-matched file.
+  workflow_dispatch:
   pull_request:
     paths:
       - ".env.test.example"
