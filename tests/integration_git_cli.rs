@@ -317,6 +317,7 @@ fn boot_service_http_with_enforcement_and_session(
             format!("http://127.0.0.1:{stub_port}"),
         );
     }
+    git_cli::apply_monoengine_public_http_base_env(&mut command, port);
     command.args([
         "service",
         "http",
@@ -2084,7 +2085,7 @@ fn normalize_git_cli_error(combined: &str) -> String {
 }
 
 fn http_status(port: u16, path: &str) -> u16 {
-    let url = git_cli::monoengine_http_url(port, path);
+    let url = git_cli::monoengine_host_http_url(port, path);
     let mut command = Command::new("curl");
     command.args([
         "-sS",

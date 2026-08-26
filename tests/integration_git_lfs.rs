@@ -581,6 +581,7 @@ fn boot_service_http(env: &GitLfsEnv) -> (ServiceProcess, u16, PathBuf, PathBuf)
 
     let mut command = env.full_config_command();
     command.env("MEGA_LOG__PRINT_STD", "true");
+    git_cli::apply_monoengine_public_http_base_env(&mut command, port);
     command.args([
         "service",
         "http",

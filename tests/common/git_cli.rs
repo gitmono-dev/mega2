@@ -289,6 +289,31 @@ pub fn monoengine_http_url(port: u16, path: &str) -> String {
     format!("http://{}:{port}{path}", monoengine_reachable_host())
 }
 
+/// HTTP URL for probes from the cargo test process on the host (curl, TcpStream).
+pub fn monoengine_host_http_url(port: u16, path: &str) -> String {
+    format!("http://{}:{port}{path}", HOST_LOOPBACK)
+}
+
+/// Public HTTP base advertised in Git LFS batch responses when the git-cli
+/// container reaches the host via `host.docker.internal`.
+pub fn monoengine_public_http_base(port: u16) -> String {
+    format!("http://{}:{port}", monoengine_reachable_host())
+}
+
+/// When the compose git-cli runner is active, point LFS batch hrefs at the same
+/// host git uses for clone/push (`host.docker.internal` on Docker Desktop).
+pub fn apply_monoengine_public_http_base_env(command: &mut Command, port: u16) {
+    if git_cli_skip_requested() {
+        return;
+    }
+    if runner_kind() == GitRunnerKind::Container {
+        command.env(
+            "MEGA_HTTP__PUBLIC_BASE_URL",
+            monoengine_public_http_base(port),
+        );
+    }
+}
+
 #[allow(
     dead_code,
     reason = "SSH remote URL helper; path-included into HTTP targets that do not call it yet"

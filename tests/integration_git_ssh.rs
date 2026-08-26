@@ -1027,6 +1027,7 @@ fn boot_service_multi_with_session(
             format!("http://127.0.0.1:{stub_port}"),
         );
     }
+    git_cli::apply_monoengine_public_http_base_env(&mut command, http_port);
     let http_port_arg = http_port.to_string();
     let ssh_port_arg = ssh_port.to_string();
     command.args([

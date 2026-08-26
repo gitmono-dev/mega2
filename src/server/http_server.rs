@@ -639,10 +639,16 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
             .unwrap_or_else(|_| "git-object-rkyv:v1".to_string()),
     });
 
+    let listen_addr = std::env::var("MEGA_HTTP__PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("http://{host}:{port}"));
+
     let api_state = MonoApiServiceState {
         storage: storage.clone(),
         session_store: BrowserSessionStore::Website(session_store),
-        listen_addr: format!("http://{host}:{port}"),
+        listen_addr,
         entity_store: ctx.entity_store.clone(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
