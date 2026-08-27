@@ -293,6 +293,7 @@ services:
       DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
       APP_BASE_URL: http://127.0.0.1:17001
       BETTER_AUTH_URL: http://127.0.0.1:17001
+      BETTER_AUTH_TRUSTED_ORIGINS: "http://localhost:17001,http://127.0.0.1:17001"
       BETTER_AUTH_SECRET: monoengine-it-website-auth-secret-0001
       # Consumed by DEP-06's internal notification route. This public value is
       # only for the isolated Compose integration stack.
