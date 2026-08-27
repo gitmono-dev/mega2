@@ -586,7 +586,7 @@ fn boot_service_http(env: &GitLfsEnv) -> (ServiceProcess, u16, PathBuf, PathBuf)
         "service",
         "http",
         "--host",
-        "127.0.0.1",
+        git_cli::service_listen_host(),
         "-p",
         &port.to_string(),
     ]);

@@ -977,7 +977,7 @@ fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) 
         "service",
         "ssh",
         "--host",
-        "127.0.0.1",
+        git_cli::service_listen_host(),
         "--ssh-port",
         &port_arg,
     ]);
@@ -1034,7 +1034,7 @@ fn boot_service_multi_with_session(
         "http",
         "ssh",
         "--host",
-        "127.0.0.1",
+        git_cli::service_listen_host(),
         "-p",
         &http_port_arg,
         "--ssh-port",

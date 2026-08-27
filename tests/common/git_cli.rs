@@ -281,6 +281,28 @@ pub fn monoengine_reachable_host() -> &'static str {
     }
 }
 
+/// Address per-case services pass to `--host` for their listener bind.
+///
+/// Container runner: `0.0.0.0`. The in-container git client dials
+/// `host.docker.internal`, which on Linux resolves via the `host-gateway`
+/// mapping to the bridge gateway IP — a service bound to host loopback is
+/// unreachable there (macOS Docker Desktop forwards to loopback, which is why
+/// loopback binding only ever worked on macOS). Host opt-in runner:
+/// `HOST_LOOPBACK` suffices.
+///
+/// Safety boundary: the `0.0.0.0` bind applies only to the per-case service on
+/// a temporary random high port with a short test lifetime; IT credentials are
+/// disposable by construction. CI runners and local dev machines may still see
+/// the port on the LAN for the duration of a case — accepted test-infra risk,
+/// never to be used for standing services.
+pub fn service_listen_host() -> &'static str {
+    require_git_cli_runner();
+    match runner_kind() {
+        GitRunnerKind::Container => "0.0.0.0",
+        GitRunnerKind::Host => HOST_LOOPBACK,
+    }
+}
+
 pub fn monoengine_http_repo_url(port: u16) -> String {
     format!("http://{}:{port}/", monoengine_reachable_host())
 }
