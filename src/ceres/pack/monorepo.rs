@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     vec,
 };
@@ -17,10 +17,7 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
-        object::{
-            ObjectTrait, blob::Blob, commit::Commit, signature::Signature, tree::Tree,
-            types::ObjectType,
-        },
+        object::{blob::Blob, commit::Commit, signature::Signature, tree::Tree, types::ObjectType},
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
@@ -39,7 +36,10 @@ use crate::{
         api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
         code_edit::{on_push::OnpushCodeEdit, utils::get_changed_files},
         model::change_list::ClDiffFile,
-        pack::RepoHandler,
+        pack::{
+            RepoHandler,
+            push_chain::{self, PushChain, PushChainResolution},
+        },
         protocol::import_refs::{CommandType, RefCommand, Refs},
     },
     common::{
@@ -60,11 +60,18 @@ pub struct MonoRepo {
     pub git_object_cache: Arc<GitObjectCache>,
     pub path: PathBuf,
     pub base_branch: String,
-    pub from_hash: String,
-    pub to_hash: String,
-    // current_commit only exists when an unpack operation occurs.
-    // When only a branch is updated and the pack file is empty, this value will be None.
-    pub current_commit: Arc<RwLock<Option<Commit>>>,
+    /// Whether the current unpack delivered a commit object. Presence only —
+    /// base/tip never derive from pack arrival order (GC-MC-13); the
+    /// [`PushChain`](crate::ceres::pack::push_chain::PushChain) is built from
+    /// `command_list` plus this flag at finalize.
+    pub pack_commit_seen: AtomicBool,
+    /// ADR-MC-05 no-op notice set by `build_push_chain`; read by the protocol
+    /// layer via `receive_pack_notice` after a successful finalize.
+    pub no_op_notice: Mutex<Option<String>>,
+    /// Resolved push chains keyed by `new_id` (MC01-R1 P2-2): each branch
+    /// command's chain is built once per receive-pack — a single-commit push
+    /// costs exactly one DB read and logs the ADR-MC-05 notice once.
+    pub push_chain_cache: Mutex<HashMap<String, Option<PushChain>>>,
     pub cl_link: Arc<RwLock<Option<String>>>,
     pub bellatrix: Arc<Bellatrix>,
     pub username: Option<String>,
@@ -87,6 +94,13 @@ impl RepoHandler for MonoRepo {
             .command_list
             .lock()
             .expect("command_list lock poisoned") = commands.to_vec();
+    }
+
+    fn receive_pack_notice(&self) -> Option<String> {
+        self.no_op_notice
+            .lock()
+            .expect("no_op_notice lock poisoned")
+            .clone()
     }
 
     async fn refs_with_head_hash(&self) -> (String, Vec<Refs>) {
@@ -182,12 +196,21 @@ impl RepoHandler for MonoRepo {
         &self,
         entry_list: Vec<MetaAttached<Entry, EntryMeta>>,
     ) -> Result<(), MegaError> {
-        let current_commit = self.current_commit.read().await;
-        let commit_id = if let Some(commit) = &*current_commit {
-            commit.id.to_string()
-        } else {
-            String::new()
-        };
+        // ADR-MC-06: object `commit_id` attribution = the push chain tip, i.e.
+        // the branch command's `new_id` ("the chain tip of the push that last
+        // touched the object on this path") — derived from the ref commands
+        // alone, independent of pack arrival order (MC01-R2 P1-2; safety
+        // analysis on `push_chain::attribution_commit_id`). Live reader: the
+        // file browser's "last commit" column (`item_to_commit_map` →
+        // `preview_router::get_tree_commit_info`) — exactly correct under the
+        // single-commit-per-push constraint, an approximate value once MC-06
+        // opens multi-commit pushes (recorded in ADR-MC-06 / DEFER-MC-03).
+        let commit_id = push_chain::attribution_commit_id(
+            &self
+                .command_list
+                .lock()
+                .expect("command_list lock poisoned"),
+        );
         let commit_models = self
             .storage
             .mono_service
@@ -219,16 +242,37 @@ impl RepoHandler for MonoRepo {
     }
 
     async fn check_entry(&self, entry: &Entry) -> Result<(), GitError> {
-        if self.current_commit.read().await.is_none() {
-            if entry.obj_type == ObjectType::Commit {
-                let commit = Commit::from_bytes(&entry.data, entry.hash).unwrap();
-                let mut current = self.current_commit.write().await;
-                *current = Some(commit);
+        // Only presence is tracked here; the commit itself is resolved from the
+        // ref command after unpack (`PushChain`). A second commit in one pack
+        // is still rejected (multi-commit push opens up with MC-03).
+        if entry.obj_type == ObjectType::Commit {
+            if self.pack_commit_seen.swap(true, Ordering::SeqCst) {
+                return Err(GitError::CustomError(
+                    "only single commit support in each push".to_string(),
+                ));
             }
-        } else if entry.obj_type == ObjectType::Commit {
-            return Err(GitError::CustomError(
-                "only single commit support in each push".to_string(),
-            ));
+            // Fail closed at unpack (MC01-R1 P2-1): the pack's commit must be
+            // the ref command's `new_id`. A mismatching push would otherwise
+            // get its objects stamped with the ref's `new_id` attribution
+            // before finalize rejected it. Entries flushed before the commit
+            // entry stay harmless: `batch_save_model` is insert-only
+            // (on-conflict do-nothing), so pre-existing rows are untouched and
+            // new rows of a failed push are unreachable garbage. Known
+            // limitation (MC01-R2 P2-B, accepted): if a ≥1000-object pack
+            // flushes earlier batches before the offending commit entry, those
+            // first-seen tree/blob rows keep the wrong attribution, and a later
+            // legitimate push reintroducing identical content will not correct
+            // them (content-addressed dedup). Affects only the "last commit"
+            // display until DEFER-MC-03 lands.
+            if let Some(cmd) = self.primary_branch_command()
+                && entry.hash.to_string() != cmd.new_id
+            {
+                return Err(GitError::CustomError(format!(
+                    "pack commit {} does not match the ref update new_id {}; \
+                     the pack's commit must match the ref update",
+                    entry.hash, cmd.new_id
+                )));
+            }
         }
         Ok(())
     }
@@ -650,19 +694,20 @@ impl RepoHandler for MonoRepo {
     }
 
     async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError> {
-        let commit_guard = self.current_commit.read().await;
-        let commit_opt = match commit_guard.as_ref() {
-            Some(commit) => commit,
-            None => {
-                tracing::info!(
-                    "Skipping file path update: no current commit available. \
-                     This typically occurs when only updating references or pushing empty pack files."
-                );
-                return Ok(());
-            }
+        // File indexing follows the push tip's tree; the tip is resolved from
+        // the ref command (GC-MC-13), same as `ImportRepo`'s explicit tip
+        // query.
+        let Some(cmd) = self.primary_branch_command() else {
+            tracing::info!("Skipping file path update: no branch update in this push.");
+            return Ok(());
         };
+        let Some(chain) = self.build_push_chain(&cmd).await? else {
+            // ADR-MC-05 no-op: nothing new to index.
+            return Ok(());
+        };
+        let tip = chain.tip;
 
-        let tree_hashes = vec![commit_opt.tree_id.to_string()];
+        let tree_hashes = vec![tip.tree_id.to_string()];
         let trees = self
             .storage
             .mono_storage()
@@ -671,14 +716,14 @@ impl RepoHandler for MonoRepo {
             .map_err(|e| {
                 MegaError::Other(format!(
                     "Failed to retrieve root tree for commit {}: {}",
-                    commit_opt.id, e
+                    tip.id, e
                 ))
             })?;
 
         if trees.is_empty() {
             return Err(MegaError::Other(format!(
                 "Root tree {} not found for commit {}",
-                commit_opt.tree_id, commit_opt.id
+                tip.tree_id, tip.id
             )));
         }
 
@@ -686,8 +731,8 @@ impl RepoHandler for MonoRepo {
 
         tracing::info!(
             "Starting file path update for commit {} with root tree {}",
-            commit_opt.id,
-            commit_opt.tree_id
+            tip.id,
+            tip.tree_id
         );
 
         self.traverses_and_update_filepath(root_tree, PathBuf::new())
@@ -695,13 +740,13 @@ impl RepoHandler for MonoRepo {
             .map_err(|e| {
                 MegaError::Other(format!(
                     "Failed to update file paths for commit {}: {}",
-                    commit_opt.id, e
+                    tip.id, e
                 ))
             })?;
 
         tracing::info!(
             "Successfully completed file path update for commit {}",
-            commit_opt.id
+            tip.id
         );
 
         Ok(())
@@ -886,12 +931,12 @@ impl MonoRepo {
             return Ok(());
         }
 
-        let current_commit = self.current_commit.read().await;
-        let Some(c) = &*current_commit else {
+        // ADR-MC-05: empty pack / already-known `new_id` is an explicit no-op
+        // — CL ref and CL stay untouched.
+        let Some(chain) = self.build_push_chain(cmd).await? else {
             return Ok(());
         };
-        let from_hash = Self::effective_from_hash(&self.from_hash, c)?;
-        let cl_link = self.fetch_or_new_cl_link(&from_hash).await?;
+        let cl_link = self.fetch_or_new_cl_link(&chain.base).await?;
         let ref_name = utils::cl_ref_name(&cl_link);
 
         let existing = match txn {
@@ -899,16 +944,18 @@ impl MonoRepo {
             None => storage.get_ref_by_name(&ref_name).await?,
         };
 
+        // `ref_commit_hash` and `ref_tree_hash` come from the same tip commit
+        // (`cmd.new_id` and its tree).
         if let Some(mut cl_ref) = existing {
-            cl_ref.ref_commit_hash = cmd.new_id.clone();
-            cl_ref.ref_tree_hash = c.tree_id.to_string();
+            cl_ref.ref_commit_hash = chain.tip.id.to_string();
+            cl_ref.ref_tree_hash = chain.tip.tree_id.to_string();
             storage.update_ref(cl_ref, txn).await?;
         } else {
             let new_ref = mega_refs::Model::new(
                 &self.path,
                 ref_name,
-                cmd.new_id.clone(),
-                c.tree_id.to_string(),
+                chain.tip.id.to_string(),
+                chain.tip.tree_id.to_string(),
                 true,
             );
             storage.save_refs(new_ref, txn).await?;
@@ -918,19 +965,15 @@ impl MonoRepo {
 
     /// CL / conversations / build / code-review hooks after branch `mega_refs` are committed.
     async fn run_mono_post_push_pipeline(&self) -> Result<(), MegaError> {
-        let cmds = self
-            .command_list
-            .lock()
-            .expect("command_list lock poisoned")
-            .clone();
-        if !cmds.iter().any(|cmd| cmd.ref_type == RefTypeEnum::Branch) {
-            return Ok(());
-        }
-        let current_commit = self.current_commit.read().await;
-        let Some(current_commit) = &*current_commit else {
+        let Some(cmd) = self.primary_branch_command() else {
             return Ok(());
         };
-        let from_hash = Self::effective_from_hash(&self.from_hash, current_commit)?;
+        // ADR-MC-05 no-op: CL / build / reanchor hooks stay untouched.
+        let Some(chain) = self.build_push_chain(&cmd).await? else {
+            return Ok(());
+        };
+        let from_hash = chain.base.clone();
+        let to_hash = chain.tip.id.to_string();
         let username = self.username();
         let mono_api_service = self.into();
         let editor = OnpushCodeEdit::from(
@@ -940,7 +983,7 @@ impl MonoRepo {
             &mono_api_service,
         );
         let cl = editor
-            .update_or_create_cl(&self.storage, &from_hash, &self.to_hash, &username)
+            .update_or_create_cl(&self.storage, &from_hash, &to_hash, &username)
             .await?;
         self.traverses_tree_and_update_filepath().await?;
         if self.bellatrix.enable_build() {
@@ -954,7 +997,7 @@ impl MonoRepo {
                 )
                 .await?;
         }
-        self.reanchor_code_review_threads(&cl).await
+        self.reanchor_code_review_threads(&cl, &to_hash).await
     }
 
     #[async_recursion]
@@ -1033,17 +1076,61 @@ impl MonoRepo {
 
         Ok(())
     }
-    fn effective_from_hash(from_hash: &str, current_commit: &Commit) -> Result<String, MegaError> {
-        if from_hash != ZERO_ID {
-            return Ok(from_hash.to_owned());
+    /// The semantics-defining command of this push: the first non-delete
+    /// branch command. Delete commands never build a chain; multi-branch
+    /// pushes remain as-is until MC-06 rejects them (ADR-MC-04).
+    fn primary_branch_command(&self) -> Option<RefCommand> {
+        push_chain::primary_branch_command(
+            &self
+                .command_list
+                .lock()
+                .expect("command_list lock poisoned"),
+        )
+    }
+
+    /// Build the [`PushChain`] for a branch command, cached per `new_id` so a
+    /// finalize builds each chain at most once (MC01-R1 P2-2). `None` means
+    /// the ADR-MC-05 no-op (empty pack / known `new_id`) — callers must leave
+    /// CL refs and the CL untouched; the notice is logged and stored on the
+    /// first (cache-miss) build only.
+    async fn build_push_chain(&self, cmd: &RefCommand) -> Result<Option<PushChain>, MegaError> {
+        if let Some(cached) = self
+            .push_chain_cache
+            .lock()
+            .expect("push_chain_cache lock poisoned")
+            .get(&cmd.new_id)
+        {
+            return Ok(cached.clone());
         }
-        current_commit
-            .parent_commit_ids
-            .first()
-            .map(ToString::to_string)
-            .ok_or_else(|| {
-                MegaError::Other("Can not init directory under monorepo directory!".to_string())
-            })
+        let tip_commit = self
+            .storage
+            .mono_storage()
+            .get_commit_by_hash(&cmd.new_id)
+            .await?
+            .map(Commit::from_mega_model);
+        let chain = match PushChain::resolve(
+            cmd,
+            self.pack_commit_seen.load(Ordering::SeqCst),
+            tip_commit,
+        )? {
+            PushChainResolution::Chain(chain) => Some(*chain),
+            PushChainResolution::Noop { notice } => {
+                // GC-MC-14: the no-op is logged, not silent; the notice also
+                // reaches the git client as a `remote:` line (sideband
+                // channel 2, see `receive_pack_notice`).
+                tracing::info!(ref_name = %cmd.ref_name, new_id = %cmd.new_id, "{notice}");
+                *self
+                    .no_op_notice
+                    .lock()
+                    .expect("no_op_notice lock poisoned") = Some(notice);
+                None
+            }
+        };
+        self.push_chain_cache
+            .lock()
+            .expect("push_chain_cache lock poisoned")
+            .insert(cmd.new_id.clone(), chain.clone());
+        Ok(chain)
     }
 
     async fn fetch_or_new_cl_link(&self, from_hash: &str) -> Result<String, MegaError> {
@@ -1091,7 +1178,12 @@ impl MonoRepo {
 
     // Mark code review threads whose anchors may be affected by this change as outdated.
     // These threads will require reanchoring to restore accurate code positions.
-    pub async fn reanchor_code_review_threads(&self, cl: &mega_cl::Model) -> Result<(), MegaError> {
+    // `to_hash` is the push chain tip (CL `to_hash`).
+    pub async fn reanchor_code_review_threads(
+        &self,
+        cl: &mega_cl::Model,
+        to_hash: &str,
+    ) -> Result<(), MegaError> {
         let mono_api_service: MonoApiService = self.into();
         let cl_link = cl.link.clone();
 
@@ -1160,7 +1252,7 @@ impl MonoRepo {
                 let cl_link = cl_link.clone();
                 let mono_api_service = Arc::clone(&mono_api_service);
                 let anchors_map = anchors_map.clone();
-                let to_hash = self.to_hash.clone();
+                let to_hash = to_hash.to_owned();
 
                 async move {
                     let thread_id = thread.id;
@@ -1206,7 +1298,7 @@ impl MonoRepo {
                                 anchor,
                                 Some(latest_blob),
                                 diff_content.clone(),
-                                &self.to_hash,
+                                &to_hash,
                             )
                             .await
                         {
@@ -1231,73 +1323,5 @@ impl MonoRepo {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use git_internal::{
-        hash::ObjectHash,
-        internal::object::{
-            commit::Commit,
-            signature::{Signature, SignatureType},
-        },
-    };
-
-    use super::MonoRepo;
-    use crate::common::utils::ZERO_ID;
-
-    fn test_signature(signature_type: SignatureType) -> Signature {
-        Signature::new(
-            signature_type,
-            "Monoengine Test".to_string(),
-            "monoengine-test@example.invalid".to_string(),
-        )
-    }
-
-    fn test_commit(parent_commit_ids: Vec<ObjectHash>) -> Commit {
-        let tree_id = ObjectHash::from_str("27dd8d4cf39f3868c6eee38b601bc9e9939304f5").unwrap();
-        Commit::new(
-            test_signature(SignatureType::Author),
-            test_signature(SignatureType::Committer),
-            tree_id,
-            parent_commit_ids,
-            "test commit",
-        )
-    }
-
-    #[test]
-    fn effective_from_hash_keeps_existing_ref_old_id() {
-        let old_id = "119bc457cb05b52dfb0d6b14f66d9a8a52d09e25";
-        let parent = ObjectHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let commit = test_commit(vec![parent]);
-
-        let effective = MonoRepo::effective_from_hash(old_id, &commit).unwrap();
-
-        assert_eq!(effective, old_id);
-    }
-
-    #[test]
-    fn effective_from_hash_uses_first_parent_for_new_branch_push() {
-        let parent = ObjectHash::from_str("119bc457cb05b52dfb0d6b14f66d9a8a52d09e25").unwrap();
-        let commit = test_commit(vec![parent]);
-
-        let effective = MonoRepo::effective_from_hash(ZERO_ID, &commit).unwrap();
-
-        assert_eq!(effective, parent.to_string());
-    }
-
-    #[test]
-    fn effective_from_hash_rejects_orphan_new_branch_push() {
-        let commit = test_commit(Vec::new());
-
-        let err = MonoRepo::effective_from_hash(ZERO_ID, &commit).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("Can not init directory under monorepo directory")
-        );
     }
 }

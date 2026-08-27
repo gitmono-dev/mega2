@@ -40,6 +40,7 @@ use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStrea
 
 pub mod import_repo;
 pub mod monorepo;
+pub mod push_chain;
 
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {
@@ -63,6 +64,14 @@ pub trait RepoHandler: Send + Sync + 'static {
     /// (`default_branch`, `status`, etc.). The handler is built from an early `commands.clone()`,
     /// so without this, metadata updated in `git_receive_pack_stream` would be stale at finalize.
     fn sync_commands_after_unpack(&self, _commands: &[RefCommand]) {}
+
+    /// ADR-MC-05 no-op push notice, surfaced to the git client as a sideband
+    /// progress (`remote:`) line. Handlers set it during
+    /// `finalize_receive_pack`; the protocol layer reads it after a successful
+    /// finalize. Default: no notice.
+    fn receive_pack_notice(&self) -> Option<String> {
+        None
+    }
 
     async fn refs_with_head_hash(&self) -> (String, Vec<Refs>);
 

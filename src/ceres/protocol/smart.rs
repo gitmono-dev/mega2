@@ -477,6 +477,7 @@ impl SmartSession {
         let mut finalize_ms: Option<u128> = None;
         let mut bind_ms: Option<u128> = None;
         let mut finalize_failed = false;
+        let mut receive_notice: Option<String> = None;
         if !unpack_failed {
             let t_finalize = Instant::now();
             if let Err(e) = repo_handler.finalize_receive_pack().await {
@@ -494,6 +495,9 @@ impl SmartSession {
                 finalize_failed = true;
             } else {
                 finalize_ms = Some(t_finalize.elapsed().as_millis());
+                // ADR-MC-05: a no-op push notice only accompanies a successful
+                // finalize (a failed one already reports `ng` lines).
+                receive_notice = repo_handler.receive_pack_notice();
             }
 
             if !finalize_failed {
@@ -507,10 +511,7 @@ impl SmartSession {
             add_pkt_line_string(&mut report_status, command.get_status());
         }
 
-        report_status.put(&PKT_LINE_END_MARKER[..]);
-        let length = report_status.len();
-        let mut buf = self.build_side_band_format(report_status, length);
-        buf.put(&PKT_LINE_END_MARKER[..]);
+        let buf = self.build_receive_pack_report(report_status, receive_notice);
 
         if let Some(ms) = finalize_ms {
             timings_ms.insert("finalize_receive_pack_ms".to_string(), ms);
@@ -587,6 +588,42 @@ impl SmartSession {
         from_bytes
     }
 
+    /// Build the receive-pack response tail: the ADR-MC-05 no-op notice as a
+    /// sideband progress frame (channel 2 — git clients render it with a
+    /// `remote: ` prefix), then the report-status payload (channel 1 when a
+    /// side-band capability was negotiated), then the final flush packet.
+    ///
+    /// Without a negotiated side-band capability there is no progress channel,
+    /// so the notice is not sent at all (the server log already recorded it)
+    /// rather than writing raw bytes that would corrupt the report stream.
+    fn build_receive_pack_report(
+        &self,
+        mut report_status: BytesMut,
+        notice: Option<String>,
+    ) -> BytesMut {
+        report_status.put(&PKT_LINE_END_MARKER[..]);
+        let length = report_status.len();
+        let report = self.build_side_band_format(report_status, length);
+
+        let mut buf = BytesMut::new();
+        let side_band = self.capabilities.contains(&Capability::SideBand)
+            || self.capabilities.contains(&Capability::SideBand64k);
+        if side_band && let Some(notice) = notice {
+            let notice = if notice.ends_with('\n') {
+                notice
+            } else {
+                format!("{notice}\n")
+            };
+            // pkt-line length covers the header, the channel byte, and the payload.
+            buf.put(Bytes::from(format!("{:04x}", notice.len() + 5)));
+            buf.put_u8(SideBind::ProgressInfo.value());
+            buf.put(Bytes::from(notice.into_bytes()));
+        }
+        buf.extend_from_slice(&report);
+        buf.put(&PKT_LINE_END_MARKER[..]);
+        buf
+    }
+
     pub fn build_smart_reply(&self, ref_list: &Vec<String>, service: String) -> BytesMut {
         let mut pkt_line_stream = BytesMut::new();
         if self.transport_protocol == TransportProtocol::Http {
@@ -621,6 +658,10 @@ impl SmartSession {
     }
 
     /// Process commit bindings for successfully pushed commits
+    // NOTE (plan-20260827 MC-01): this protocol-layer binding duplicates the
+    // author-derived binding in `MonoRepo::save_entry` (`process_commit_bindings`).
+    // Cleanup is a permanent non-goal — same file as the push state model but
+    // behavior-neutral, so it is only annotated here and left for a future pass.
     async fn process_commit_bindings(&self, state: &ProtocolApiState, commands: &[RefCommand]) {
         for command in commands {
             // Only process successful branch updates (not tags or failed commands)
@@ -1151,6 +1192,79 @@ pub mod test {
         let payload = BytesMut::from(&b"unpack ok\n"[..]);
         let framed = session.build_side_band_format(payload.clone(), payload.len());
         assert_eq!(&framed[..], &payload[..]);
+    }
+
+    #[test]
+    pub fn receive_pack_report_progress_frame_precedes_report_status() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        session.capabilities.insert(Capability::SideBand64k);
+
+        let report_status = BytesMut::from(&b"unpack ok\n"[..]);
+        let framed =
+            session.build_receive_pack_report(report_status, Some("no new commits".to_string()));
+
+        // channel-2 progress frame ("no new commits\n" = 15 bytes payload):
+        // header + channel byte + payload = 20 = 0x14; git renders it as
+        // `remote: no new commits`.
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(b"0014");
+        expected.put_u8(0x02);
+        expected.extend_from_slice(b"no new commits\n");
+        // channel-1 report-status frame: 10 payload + 4 flush = 14, +5 = 19 = 0x13.
+        expected.extend_from_slice(b"0013");
+        expected.put_u8(0x01);
+        expected.extend_from_slice(b"unpack ok\n");
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        // final flush packet.
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        assert_eq!(&framed[..], &expected[..]);
+    }
+
+    #[test]
+    pub fn receive_pack_report_omits_progress_frame_without_side_band() {
+        let session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+
+        let report_status = BytesMut::from(&b"unpack ok\n"[..]);
+        let framed =
+            session.build_receive_pack_report(report_status, Some("no new commits".to_string()));
+
+        // No negotiated side-band capability: no channel byte may hit the
+        // stream — the report payload passes through between flush packets.
+        let mut expected = BytesMut::from(&b"unpack ok\n"[..]);
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        assert_eq!(&framed[..], &expected[..]);
+        assert!(!framed.contains(&0x02));
+    }
+
+    #[test]
+    pub fn receive_pack_report_without_notice_emits_only_report_status() {
+        let mut session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        );
+        session.capabilities.insert(Capability::SideBand64k);
+
+        let report_status = BytesMut::from(&b"unpack ok\n"[..]);
+        let framed = session.build_receive_pack_report(report_status, None);
+
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(b"0013");
+        expected.put_u8(0x01);
+        expected.extend_from_slice(b"unpack ok\n");
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        expected.extend_from_slice(PKT_LINE_END_MARKER);
+        assert_eq!(&framed[..], &expected[..]);
+        assert!(!framed.contains(&0x02));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use core::fmt;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use import_refs::RefCommand;
@@ -12,10 +12,9 @@ use tokio::sync::RwLock;
 
 use crate::{
     bellatrix::Bellatrix,
-    callisto::sea_orm_active_enums::RefTypeEnum,
     ceres::{
         api_service::state::ProtocolApiState,
-        pack::{RepoHandler, import_repo::ImportRepo, monorepo::MonoRepo},
+        pack::{RepoHandler, import_repo::ImportRepo, monorepo::MonoRepo, push_chain},
     },
     common::{
         errors::{MegaError, ProtocolError},
@@ -221,17 +220,18 @@ impl SmartSession {
                 storage: state.storage.clone(),
                 path: self.repo_path.clone(),
                 base_branch: "main".to_string(),
-                from_hash: String::new(),
-                to_hash: String::new(),
-                current_commit: Arc::new(RwLock::new(None)),
+                pack_commit_seen: AtomicBool::new(false),
+                no_op_notice: Mutex::new(None),
+                push_chain_cache: Mutex::new(HashMap::new()),
                 cl_link: Arc::new(RwLock::new(None)),
                 bellatrix: Arc::new(Bellatrix::new(config.build.clone())),
                 username: self.auth.username.clone(),
                 command_list: Mutex::new(commands.clone()),
             };
-            if let Some(command) = commands.iter().find(|x| x.ref_type == RefTypeEnum::Branch) {
-                res.from_hash = command.old_id.clone();
-                res.to_hash = command.new_id.clone();
+            // base_branch comes from the primary (first non-delete) branch
+            // command — a mixed delete+update push must not take the delete
+            // command's ref name (MC01-R2 P1-1).
+            if let Some(command) = push_chain::primary_branch_command(&commands) {
                 res.base_branch = command
                     .ref_name
                     .strip_prefix("refs/heads/")

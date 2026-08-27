@@ -81,6 +81,13 @@ impl MonoService {
         Ok(txn.commit().await?)
     }
 
+    /// `commit_id` follows ADR-MC-06 attribution: the caller passes the push
+    /// chain tip (`RefCommand.new_id`), which is stamped on every tree/blob of
+    /// the batch. It means "the chain tip of the push that last touched the
+    /// object", not the commit that introduced it. Live reader: the file
+    /// browser's "last commit" column (`item_to_commit_map`); exactly correct
+    /// under single-commit-per-push, approximate once MC-06 opens multi-commit
+    /// pushes. Any new reader must revisit ADR-MC-06 first.
     pub async fn save_entry(
         &self,
         commit_id: &str,

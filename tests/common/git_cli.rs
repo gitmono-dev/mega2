@@ -1129,8 +1129,7 @@ pub fn write_known_hosts_via_keyscan(known_hosts: &Path, port: u16) {
             let known_container = container_path_for_host(known_hosts);
             let container_id = running_git_cli_container_id()
                 .unwrap_or_else(|err| panic!("{GIT_CLI_UNAVAILABLE}: {err}"));
-            let script =
-                format!("ssh-keyscan -p {port_arg} {scan_host} > '{known_container}'");
+            let script = format!("ssh-keyscan -p {port_arg} {scan_host} > '{known_container}'");
             let mut command = docker_exec_base();
             command.arg(&container_id).args(["sh", "-c", &script]);
             output_with_timeout(command, Duration::from_secs(30), "docker exec ssh-keyscan")

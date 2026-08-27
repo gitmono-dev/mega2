@@ -408,9 +408,7 @@ fn integration_git_ssh_authenticated_clone() {
     assert!(
         known_body
             .lines()
-            .all(|line| {
-                line.contains(known_host) || line.starts_with('#') || line.is_empty()
-            }),
+            .all(|line| { line.contains(known_host) || line.starts_with('#') || line.is_empty() }),
         "known_hosts=case_port_only must only describe {known_host} for this case"
     );
 
