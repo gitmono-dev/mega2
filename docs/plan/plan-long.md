@@ -32,7 +32,7 @@
 
 ## 本次 Mega 源码审计快照
 
-审计时间：**2026-08-11**。审计方式：使用 libra 分别核对两个仓库的当前 checkout 与工作区状态（两仓库均由 libra 管理，不得用 git 命令误判）。
+审计时间：**2026-08-11**。审计方式：分别核对两个仓库的当前 checkout 与工作区状态。（**2026-08-27 订正**：本行原写「使用 libra……两仓库均由 libra 管理，不得用 git 命令误判」；monoengine 已于当日删除 `.libra` 改由 Git 管理，本仓一律用 `git` 命令核对。Mega 目标项目侧的 VCS 归属未随之变化，下次审计时须逐仓确认后再选命令，不得沿用「两仓库同构」的旧假设。上述 2026-08-11 的审计结论本身不受影响，不回改。）
 
 - Mega 目标项目：`main` @ `3d22823e8533dd2bb7a275a92e18d8f0160f9929`（2026-08-11，`fix(identity): treat CLA as signed across username/github/public-id aliases (#2169)`）；其前一提交为 `#2168`，用于无 SQL 修复过渡期 CL reviewer。
 - monoengine：`main` @ `38feb4dd78edc998570df17ae9906af56a801d9e`，版本 v0.2.15。最近一次完整 Mega 同步分析仍基于 `#2129`；截至本次审计，**`#2130..#2169` 尚未逐提交归类，漂移窗口扩大。**
