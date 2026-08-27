@@ -67,16 +67,15 @@
 - **关键前置 / 契约**：[`website-mail.md`](./website-mail.md)；Slack/webhook 凭据可继续用 SecretRef
 - **长期收尾**：webhook/slack 完善、build 完成触发器、多实例矩阵（见 `plan-long.md` PT-09）
 
-### 4a. **refactoring/orbit.md** — Orbit 依赖重构（项目引用 → API 依赖）
-- **目标**：把 monoengine 对 orbit **实现 crate** 的 `path` 项目引用，重构为只依赖 `orbit-api`（纯 API/契约 crate），把唯一的具体构造点通过依赖注入下沉到组合根 / 瘦二进制边界
-- **核心内容**：
-  - 唯一实现 crate 触点定位（`Storage::new` 中的 `ObjectStorageFactory::build`）与 18 处已是 `orbit_api` 的引用
-  - 注入 `MegaObjectStorageWrapper` 值的两段式策略（seam 隔离 + lib/bin 拆分）
-  - 单一二进制 crate 形态对"真正移除重量级依赖"的约束（需阶段 3 拆 `monoengine-core`）
-  - 待决策项：是否拆 crate、impl 落点、注入形态、orbit-api 是否发布
+### 4a. **refactoring/orbit.md** — Orbit 对象存储（已内联；依赖治理历史存档）
+- **当前拓扑（事实源，与 `orbit.md` 头部一致）**：orbit 契约与实现已迁入本 package —— `src/orbit_api/`（traits / config / errors）+ `src/orbit/`（`object_store` 后端）；对象存储由 `src/jupiter/storage/object_storage.rs::build_object_storage` 直接调用 `crate::orbit::factory::ObjectStorageFactory::build`
+- **历史正文（保留供审计，不再是现行设计）**：
+  - 把对 orbit **实现 crate** 的 `path` 项目引用重构为只依赖 `orbit-api`（纯 API/契约 crate），并把唯一构造点通过依赖注入下沉到组合根 / 瘦二进制边界
+  - 唯一实现 crate 触点定位（`Storage::new` 中的 `ObjectStorageFactory::build`）与 18 处已是 `orbit_api` 的引用；注入 `MegaObjectStorageWrapper` 值的两段式策略（seam 隔离 + lib/bin 拆分）
+  - 2026-08-22 的「orbit 两个 crate 并入 workspace（方案 B）」中间态
 - **关键前置**：无（结构性依赖治理）；与 config（ObjectStorageConfig 来源）、vault（启动顺序）协同
-- **阶段范围**：0 - 3（共 4 个阶段）
-- **状态（2026-06-19）**：✅ 已完整实现。已拆为 `monoengine-core`（lib，仅 `orbit-api`）+ `monoengine`（bin，注入 `orbit` 实现）；`cargo tree -p monoengine-core` 无 `object_store`/云 SDK。唯一开放项：是否发布 `orbit-api` 为带版本依赖
+- **阶段范围**：0 - 3（共 4 个阶段，均属历史正文）
+- **状态（2026-08-27 核对）**：⛔️ **双 package 拆分已被 `plan-20260824` 的单体内联撤销**。当前是**单 package `monoengine`**（lib target `monoengine_core` + `monoengine` / `migrate_local_to_s3` 两个 bin target）：**无** `bin/` crate、**无** `crates/orbit*` workspace 成员、**无** `orbit-api` path 依赖、**无** `ObjectStorageProvider` 进程级注册表。本条目旧文记录的「✅ 已拆为 `monoengine-core`（lib，仅 `orbit-api`）+ `monoengine`（bin）」及 `cargo tree -p monoengine-core` 验收口径、「是否发布 `orbit-api`」开放项均已失效，只作历史阅读
 
 ### 5. **refactoring/integration.md** — 集成测试策略与执行方案
 
