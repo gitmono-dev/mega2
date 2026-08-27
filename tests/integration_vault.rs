@@ -935,7 +935,7 @@ fn integration_object_storage_s3_compatible_smoke() {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
              run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` \
-             first (includes rustfs-init creating testbucket), skipping",
+             first (includes rustfs-init creating monoengine and monoui buckets), skipping",
             rustfs_endpoint
         );
         return;
@@ -947,7 +947,7 @@ fn integration_object_storage_s3_compatible_smoke() {
         // 覆盖为 S3-compatible（RustFS）配置。
         .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible")
         .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
-        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "testbucket")
+        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "monoengine")
         .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", rustfs_endpoint)
         .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs")
         .env(
