@@ -166,6 +166,16 @@
 - 链长上限 `MAX_CL_CHAIN_COMMITS = 250`（CL 累计范围口径，ADR-MC-07），超限拒绝并提示拆分链；`from_hash` 不在链上（断链）fail-closed。
 - merge 门控（最小接通）：存在 `check_type_code=GpgSignature` 且 `status=FAILED` 检查结果的 CL 不得 merge；无任何检查行的 CL 不被阻断。
 
+### 服务端合成 commit 签名（MC-09，REL-MC-02）
+
+- **范围**：只有会进入 CL 链（`from_hash→to_hash` 范围、会被逐 commit 验签）的服务端合成 commit 才签名，共两个来源——`update_branch` rebase 链（`process_ref_updates_cl_only` 内部签名）与 buck 上传链（`complete_buck_upload` 在 `build_commit` 返回后签名重算）。merge 到 trunk 的 commit 与仓建根 commit 不属于任何 open CL 链范围，**明确不签名**（永久非目标）。
+- **身份与载荷**：合成 commit 的 author/committer = 固定服务端身份常量（`SERVER_SIGNING_NAME` / `SERVER_SIGNING_EMAIL`，`src/contract/vault/server_signing.rs`，单一事实源，MC-11 身份判定复用）；签名载荷 = ADR-MC-09 规范化完整 commit 字节（tree + parents + author + committer + message），`gpgsig` 以 header 形式嵌入 message（`gpgsig ` 起行、续行单空格前缀、后随空行 + message），与验签侧 header 区锚定提取兼容；对存量无签名合成 commit 的 CL 为行为收紧。
+- **原子契约**：「签名 → 重算 commit ID → 统一回填派生引用」不可拆分——`mega_commit.commit_id`、`mega_tree.commit_id`（逐项回填，构造层定型后不联动）、CL ref `ref_commit_hash`、`mega_cl.to_hash` 四值必须同为最终已签名 hash；禁止调用方后处理签名。
+- **Fail-closed**：合成点经 `Storage::vault()` 获取 vault 句柄，`None` 即拒绝产出（server signing unavailable）；签名预检（vault 读取 + 密钥解析 + 签名计算）在任何 ref/commit/tree/CL 持久化之前完成，失败零副作用。
+- **密钥管理（版本化，私钥不出 Vault）**：`server-signing/keys/<key-id>` 存各代密钥（`key-id` = fingerprint，与 `gpg_key.fingerprint` 同格式），`server-signing/active` 为签名指针，`server-signing/index` 为追加式全量索引；签名只用 active；验签侧（MC-11）经 `list_server_signing_public_keys` 遍历未撤销历史公钥。**轮换只增不删**：历史密钥永不删除/重写，数据不变量 = 既有签名 commit 始终可由历史公钥验证。
+- **首次初始化**：经既有 RedLock（`src/jupiter/redis/lock.rs`）跨副本互斥，锁内重读 `active` 指针确认——并发首启时唯一胜者生成密钥，其余副本重读到同一密钥。
+- **手动轮换指引**（自动化尚未排期）：当前**没有**操作面板、CLI 子命令或 admin 路由暴露轮换/停用入口，也没有写路径会把 `revoked` 置位；轮换与停用需由运维以自定义脚本直接调用 Rust API 执行——轮换调 `VaultCore::rotate_server_signing_key`（`src/contract/vault/server_signing.rs`，同一 RedLock 互斥）生成新代、追加索引并移动 `active` 指针，旧代保留，新合成 commit 即用新代签名；停用某代 = 经 `VaultCoreInterface::write_secret` 将该代 `server-signing/keys/<key-id>` 的 `revoked` 置 `true`（只改标志、不删密钥体），验签侧 `list_server_signing_public_keys` 随之跳过该代。**顺序规则**：停用当前 active 代之前必须先轮换出新一代（active 指向可用代）——签名端拒绝加载 revoked 的 active 代（fail-closed），直接停用当前 active 代会让两个合成点停摆。
+
 ---
 
 ## 6. 交叉引用
@@ -177,6 +187,7 @@
 | Tag REST | `src/api/router/tag_router.rs` |
 | Push 状态模型 / `commit_id` 归属 | `src/ceres/pack/push_chain.rs`、`docs/plan/plan-20260827.md`（ADR-MC-05/06） |
 | GPG 链式验签与 merge 门控 | `src/ceres/merge_checker/gpg_signature_checker.rs`、`docs/plan/plan-20260827.md`（ADR-MC-03/07/08/09） |
+| 服务端合成 commit 签名与密钥轮换 | `src/contract/vault/server_signing.rs`、`docs/plan/plan-20260827.md`（MC-09，ADR-MC-09） |
 | 初始化实现 | `src/jupiter/service/mono_service.rs::init_monorepo`、`src/jupiter/utils/converter.rs` |
 | 配置样例 | `config/config.toml` `[monorepo]` |
 | 本地开发入口 | [`development.md`](./development.md) |

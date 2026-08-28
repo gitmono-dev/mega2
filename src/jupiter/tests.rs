@@ -206,5 +206,6 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         webhook_service,
         notification_storage: NotificationStorage::new(connection.clone()),
         entity_store: Arc::new(SharedEntityStore::default()),
+        vault: None,
     }
 }

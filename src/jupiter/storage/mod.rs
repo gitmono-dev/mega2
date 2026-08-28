@@ -36,7 +36,7 @@ use tokio::sync::Semaphore;
 use crate::{
     common::errors::MegaError,
     config::{Config, reload::ConfigHandle, validate::validate_buck_config},
-    contract::policy::entitystore::SharedEntityStore,
+    contract::{policy::entitystore::SharedEntityStore, vault::integration::vault_core::VaultCore},
     jupiter::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
@@ -160,6 +160,11 @@ pub struct Storage {
     /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
     /// path (notify) and read path (guard/push) observe the same instance.
     pub(crate) entity_store: Arc<SharedEntityStore>,
+    /// Server-side commit-signing vault handle (MC-09). `None` in tests and
+    /// other non-production assemblies; the synthetic-commit sites fail
+    /// closed when it is absent. Injected by `AppContext::new` via
+    /// [`Storage::with_vault`].
+    pub(crate) vault: Option<VaultCore>,
 }
 
 impl Storage {
@@ -301,6 +306,7 @@ impl Storage {
             webhook_service,
             notification_storage,
             entity_store: Arc::new(SharedEntityStore::default()),
+            vault: None,
         })
     }
 
@@ -328,6 +334,19 @@ impl Storage {
     /// state.
     pub fn set_entity_store(&mut self, store: Arc<SharedEntityStore>) {
         self.entity_store = store;
+    }
+
+    /// The server-signing vault handle (MC-09), if wired in by `AppContext`.
+    pub fn vault(&self) -> Option<&VaultCore> {
+        self.vault.as_ref()
+    }
+
+    /// Builder-style injection of the server-signing vault handle (MC-09).
+    /// Production calls this exactly once from `AppContext::new`; tests use
+    /// it to inject a test `VaultCore`.
+    pub fn with_vault(mut self, vault: VaultCore) -> Self {
+        self.vault = Some(vault);
+        self
     }
 
     pub fn config(&self) -> Arc<Config> {
@@ -546,6 +565,7 @@ impl Storage {
             webhook_service,
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
             entity_store: Arc::new(SharedEntityStore::default()),
+            vault: None,
         }
     }
 }

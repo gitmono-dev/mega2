@@ -109,6 +109,7 @@ use crate::{
             resource::resolve_resource,
             util::SaturnEUid,
         },
+        vault::server_signing::ServerSigningContext,
     },
     jupiter::{
         service::buck_service::{
@@ -646,15 +647,33 @@ impl MonoServiceLogic {
     }
 
     /// Processes ref updates but only for CL refs; never touches main and supports chaining parents.
-    pub fn process_ref_updates_cl_only(
+    ///
+    /// MC-09: every synthesized commit is signed with the server key inside
+    /// this function — after construction, before its id is read (the parent
+    /// chain via `prev_parent` likewise references the signed id) — so
+    /// `commits`, `updates` and `new_commit_id` only ever carry the final
+    /// signed hash. Callers must not post-process the signature. The signing
+    /// precheck (vault read + key parse) runs before any output is produced,
+    /// and the caller persists refs/commits/trees only after this returns, so
+    /// a signing failure leaves zero persisted side effects.
+    // too_many_arguments: the three output vecs mirror `process_ref_updates`;
+    // `signing` is the MC-09 capability parameter the card requires.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_ref_updates_cl_only(
         result: &TreeUpdateResult,
         cl_ref: &mega_refs::Model,
         commit_msg: &str,
         parent_override: Option<ObjectHash>,
+        signing: &ServerSigningContext,
         commits: &mut Vec<Commit>,
         updates: &mut Vec<RefUpdateData>,
         new_commit_id: &mut String,
     ) -> Result<(), GitError> {
+        let signing_key = signing
+            .active_key()
+            .await
+            .map_err(|e| GitError::CustomError(format!("server signing unavailable: {e}")))?;
+
         let mut prev_parent: Option<ObjectHash> = None;
 
         for update in &result.ref_updates {
@@ -672,6 +691,9 @@ impl MonoServiceLogic {
             };
 
             let commit = Commit::from_tree_id(update.tree_id, parent_ids, commit_msg);
+            let commit = signing.sign_commit(&signing_key, &commit).map_err(|e| {
+                GitError::CustomError(format!("failed to sign synthesized commit: {e}"))
+            })?;
             let commit_id = commit.id;
             *new_commit_id = commit_id.to_string();
 
@@ -2708,6 +2730,22 @@ impl MonoApiService {
         Ok(new_commit_id)
     }
 
+    /// The signing capability for server-synthesized commits that enter a CL
+    /// chain (MC-09). Fail-closed: without the vault handle no synthetic
+    /// commit may leave this service unsigned. The Redis manager backs the
+    /// RedLock that guards first-time key initialization.
+    fn server_signing_context(&self) -> Result<ServerSigningContext, MegaError> {
+        let vault = self.storage.vault().ok_or_else(|| {
+            MegaError::Other(
+                "server signing unavailable: vault handle is not configured".to_string(),
+            )
+        })?;
+        Ok(ServerSigningContext::new(
+            vault.clone(),
+            self.git_object_cache.connection.clone(),
+        ))
+    }
+
     /// Apply update result but only update the CL ref (never main).
     /// Optionally override the parent commit for the first created commit (used by rebase).
     async fn apply_update_result_cl_only(
@@ -2730,15 +2768,24 @@ impl MonoApiService {
 
         let mut updates: Vec<RefUpdateData> = Vec::new();
 
+        // MC-09: fail-closed when the server-signing vault is not wired in.
+        // Signing happens inside `process_ref_updates_cl_only`, before any
+        // ref/commit/tree persistence below.
+        let signing = self
+            .server_signing_context()
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
         MonoServiceLogic::process_ref_updates_cl_only(
             result,
             &cl_ref,
             commit_msg,
             parent_override,
+            &signing,
             &mut commits,
             &mut updates,
             &mut new_commit_id,
-        )?;
+        )
+        .await?;
 
         if new_commit_id.is_empty() {
             debug!(
@@ -4111,14 +4158,34 @@ impl MonoApiService {
         let commit_result = if file_changes.is_empty() {
             None
         } else {
+            // MC-09: signing precheck (vault read + key parse) runs before
+            // any ref/commit/tree/CL persistence in this request; a failure
+            // here leaves zero side effects.
+            let signing = self.server_signing_context()?;
+            let signing_key = signing.active_key().await?;
+
             let builder = BuckCommitBuilder::new(self.storage.mono_storage());
-            let result = builder
+            let mut result = builder
                 .build_commit(
                     session.from_hash.as_deref().unwrap_or_default(),
                     &file_changes,
                     &commit_message,
                 )
                 .await?;
+
+            // Sign the synthesized commit and recompute its id, then backfill
+            // every derived reference: each tree model's `commit_id` was
+            // stamped at construction (`buck_tree_builder`) and does not
+            // follow `res.commit`/`res.commit_id`, so update them one by one.
+            // Everything downstream (`buck_service::complete_upload`) consumes
+            // this single signed hash.
+            let signed_commit = signing.sign_commit(&signing_key, &result.commit)?;
+            let signed_id = signed_commit.id.to_string();
+            result.commit = signed_commit;
+            result.commit_id = signed_id.clone();
+            for tree_model in &mut result.new_tree_models {
+                tree_model.commit_id = signed_id.clone();
+            }
             Some(result)
         };
 
@@ -5979,4 +6046,541 @@ async fn execute_merge_workflow_passes_gate_without_failed_gpg_check() {
     );
     assert!(!message.contains("GPG signature check failed"), "{message}");
     assert!(message.contains("Commit not found"), "{message}");
+}
+
+// --- MC-09: server-side signing of synthetic commits entering a CL chain ---
+//
+// Both synthesis points — the `update_branch` chain (via
+// `process_ref_updates_cl_only`) and the buck upload chain
+// (`complete_buck_upload`) — must emit commits signed with the server key
+// from the vault. Every derived reference must carry the final signed hash:
+// the `mega_commit.commit_id` row, the `mega_tree.commit_id` stamps, the CL
+// ref's `ref_commit_hash` and the CL's `to_hash`; and the ref-pointed commit
+// must pass the MC-02 chain verifier (`GpgSignatureChecker`).
+
+#[cfg(test)]
+mod mc09_tests {
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+
+    use super::*;
+    use crate::{
+        ceres::merge_checker::{
+            Checker, ConditionResult, gpg_signature_checker::GpgSignatureChecker,
+        },
+        contract::vault::{
+            integration::vault_core::VaultCore,
+            server_signing::{SERVER_SIGNING_EMAIL, ServerSigningContext},
+        },
+        jupiter::{
+            migration::apply_migrations, storage::base_storage::BaseStorage,
+            tests::test_db_connection,
+        },
+    };
+
+    async fn test_redis() -> ::redis::aio::ConnectionManager {
+        let url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let client = ::redis::Client::open(url).expect("redis client");
+        ::redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("redis connection")
+    }
+
+    /// A standalone test vault (own schema, own key file) for signing.
+    async fn test_vault(dir: &Path) -> VaultCore {
+        let conn = Arc::new(test_db_connection(dir).await);
+        apply_migrations(&conn, true).await.expect("migrations");
+        VaultCore::config(
+            crate::jupiter::storage::vault_storage::VaultStorage {
+                base: BaseStorage::new(conn),
+            },
+            dir.join("mc09_core_key.json"),
+        )
+        .await
+        .expect("vault core should initialize")
+    }
+
+    /// A service whose `git_object_cache` connection is the real test Redis —
+    /// the RedLock backend for first-time signing-key initialization. The
+    /// object cache itself is disabled (empty prefix).
+    fn signing_service(
+        storage: &Storage,
+        redis: ::redis::aio::ConnectionManager,
+    ) -> MonoApiService {
+        MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: redis,
+                prefix: String::new(),
+            }),
+        }
+    }
+
+    /// Register the active server signing public key as a user GPG key so the
+    /// MC-02 checker resolves the issuer fingerprint (the dedicated server
+    /// keyring routing lands with MC-11).
+    async fn register_server_key(
+        storage: &Storage,
+        vault: &VaultCore,
+        redis: ::redis::aio::ConnectionManager,
+    ) {
+        let signing = ServerSigningContext::new(vault.clone(), redis);
+        let key = signing.active_key().await.expect("active server key");
+        let armor = key
+            .public_key
+            .to_armored_string(pgp::composed::ArmorOptions::default())
+            .expect("armor public key");
+        storage
+            .gpg_storage()
+            .add_gpg_key("monoengine-server".to_string(), armor)
+            .await
+            .expect("register server key");
+    }
+
+    /// Run the MC-02 chain verifier over `(from, to]` and demand PASSED.
+    async fn assert_chain_verifies(storage: &Storage, from: &str, to: &str) {
+        let checker = GpgSignatureChecker {
+            storage: Arc::new(storage.clone()),
+        };
+        let res = checker
+            .run(&serde_json::json!({"cl_from": from, "cl_to": to}))
+            .await;
+        assert_eq!(
+            res.status,
+            ConditionResult::PASSED,
+            "MC-02 chain verification must pass for the signed commit: {}",
+            res.message
+        );
+    }
+
+    fn assert_server_commit(commit: &crate::callisto::mega_commit::Model) {
+        let content = commit.content.as_deref().unwrap_or_default();
+        assert!(
+            content.starts_with("gpgsig -----BEGIN PGP SIGNATURE-----"),
+            "synthesized commit must embed the gpgsig header: {content}"
+        );
+        assert!(
+            commit
+                .author
+                .as_deref()
+                .unwrap_or_default()
+                .contains(SERVER_SIGNING_EMAIL),
+            "author must be the reserved server identity"
+        );
+        assert!(
+            commit
+                .committer
+                .as_deref()
+                .unwrap_or_default()
+                .contains(SERVER_SIGNING_EMAIL),
+            "committer must be the reserved server identity"
+        );
+    }
+
+    async fn commit_count(storage: &Storage) -> usize {
+        crate::callisto::mega_commit::Entity::find()
+            .all(storage.mono_storage().get_connection())
+            .await
+            .expect("count commits")
+            .len()
+    }
+
+    async fn tree_count(storage: &Storage) -> usize {
+        crate::callisto::mega_tree::Entity::find()
+            .all(storage.mono_storage().get_connection())
+            .await
+            .expect("count trees")
+            .len()
+    }
+
+    /// `update_branch` fixture: three commits — `from` (old CL base),
+    /// `cl_tip` (CL head adding `cl.txt`) and `target` (current main, adding
+    /// `other.txt`; disjoint from the CL change so no conflict) — plus the
+    /// main ref, the CL ref and the open CL.
+    async fn chain_fixture(storage: &Storage, link: &str) -> (String, String, String) {
+        let blob_base = ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap();
+        let blob_other = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
+        let blob_cl = ObjectHash::from_str("3333333333333333333333333333333333333333").unwrap();
+
+        let from_tree = Tree::from_tree_items(vec![blob_item("base.txt", &blob_base.to_string())])
+            .expect("from tree");
+        let target_tree = Tree::from_tree_items(vec![
+            blob_item("base.txt", &blob_base.to_string()),
+            blob_item("other.txt", &blob_other.to_string()),
+        ])
+        .expect("target tree");
+        let cl_tree = Tree::from_tree_items(vec![
+            blob_item("base.txt", &blob_base.to_string()),
+            blob_item("cl.txt", &blob_cl.to_string()),
+        ])
+        .expect("cl tree");
+
+        let from_commit = Commit::from_tree_id(from_tree.id, vec![], "mc09 base");
+        let target_commit = Commit::from_tree_id(target_tree.id, vec![], "mc09 main advanced");
+        let cl_commit = Commit::from_tree_id(cl_tree.id, vec![from_commit.id], "mc09 cl change");
+
+        let mono = storage.mono_storage();
+        mono.save_mega_commits(
+            vec![
+                from_commit.clone(),
+                target_commit.clone(),
+                cl_commit.clone(),
+            ],
+            None,
+        )
+        .await
+        .expect("fixture commits");
+        mono.save_mega_trees(vec![from_tree.clone()], from_commit.id, None)
+            .await
+            .expect("from tree");
+        mono.save_mega_trees(vec![cl_tree.clone()], cl_commit.id, None)
+            .await
+            .expect("cl tree");
+        // Saves the target tree and the main ref.
+        setup_main_ref(storage, &target_tree, &target_commit.id.to_string()).await;
+
+        let now = chrono::Utc::now().naive_utc();
+        let cl_ref = mega_refs::Model {
+            id: 2,
+            path: "/".to_string(),
+            ref_name: format!("refs/cl/{link}"),
+            ref_commit_hash: cl_commit.id.to_string(),
+            ref_tree_hash: cl_tree.id.to_string(),
+            created_at: now,
+            updated_at: now,
+            is_cl: true,
+        };
+        mono.save_refs(cl_ref, None).await.expect("cl ref");
+
+        storage
+            .cl_storage()
+            .new_cl(
+                "/",
+                link,
+                "mc09 update-branch",
+                "main",
+                &from_commit.id.to_string(),
+                &cl_commit.id.to_string(),
+                "alice",
+            )
+            .await
+            .expect("cl");
+
+        (
+            from_commit.id.to_string(),
+            cl_commit.id.to_string(),
+            target_commit.id.to_string(),
+        )
+    }
+
+    // AC⑥ (update_branch chain): the synthesized rebase commit is
+    // server-signed and all four derived references carry the final signed
+    // hash; the ref-pointed commit passes the MC-02 chain verifier.
+    #[tokio::test]
+    async fn update_branch_signs_commit_and_backfills_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = test_vault(temp.path()).await;
+        let redis = test_redis().await;
+        let storage = crate::jupiter::tests::test_storage(temp.path())
+            .await
+            .with_vault(vault.clone());
+        let service = signing_service(&storage, redis.clone());
+
+        let link = "MC09UPD1";
+        let (_from_hash, cl_tip, target_head) = chain_fixture(&storage, link).await;
+
+        let new_head = service
+            .update_branch("alice", link)
+            .await
+            .expect("update_branch with signing");
+        assert_ne!(new_head, cl_tip, "a new rebased commit must be created");
+
+        let mono = storage.mono_storage();
+        let commit = mono
+            .get_commit_by_hash(&new_head)
+            .await
+            .expect("load commit")
+            .expect("signed commit row");
+        let cl_ref = mono
+            .get_ref_by_name(&format!("refs/cl/{link}"))
+            .await
+            .expect("load cl ref")
+            .expect("cl ref row");
+        let cl = storage
+            .cl_storage()
+            .get_cl(link)
+            .await
+            .expect("load cl")
+            .expect("cl row");
+        let tree = mono
+            .get_tree_by_hash(&cl_ref.ref_tree_hash)
+            .await
+            .expect("load tree")
+            .expect("new root tree row");
+
+        // Four sinks, one final signed hash.
+        assert_eq!(commit.commit_id, new_head);
+        assert_eq!(tree.commit_id, new_head, "mega_tree.commit_id");
+        assert_eq!(cl_ref.ref_commit_hash, new_head, "CL ref");
+        assert_eq!(cl.to_hash, new_head, "mega_cl.to_hash");
+        assert_eq!(cl.from_hash, target_head, "rebase advances the CL base");
+        assert_server_commit(&commit);
+
+        register_server_key(&storage, &vault, redis).await;
+        assert_chain_verifies(&storage, &target_head, &new_head).await;
+    }
+
+    // AC③/AC④ (update_branch chain): without the vault handle the synthesis
+    // fails closed and nothing is persisted — ref, commits, trees and CL
+    // hashes all unchanged.
+    #[tokio::test]
+    async fn update_branch_without_vault_fails_closed_with_zero_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        // `test_service`'s lazy Redis connection is never reached: the
+        // fail-closed vault check happens first.
+        let service = test_service(&storage);
+
+        let link = "MC09UPD2";
+        let (from_hash, cl_tip, _target_head) = chain_fixture(&storage, link).await;
+
+        let err = service
+            .update_branch("alice", link)
+            .await
+            .expect_err("update_branch must fail closed without a vault");
+        assert!(
+            err.to_string().contains("server signing unavailable"),
+            "{err}"
+        );
+
+        let mono = storage.mono_storage();
+        let cl = storage
+            .cl_storage()
+            .get_cl(link)
+            .await
+            .expect("load cl")
+            .expect("cl row");
+        assert_eq!(cl.from_hash, from_hash, "CL from_hash unchanged");
+        assert_eq!(cl.to_hash, cl_tip, "CL to_hash unchanged");
+        let cl_ref = mono
+            .get_ref_by_name(&format!("refs/cl/{link}"))
+            .await
+            .expect("load cl ref")
+            .expect("cl ref row");
+        assert_eq!(cl_ref.ref_commit_hash, cl_tip, "CL ref unchanged");
+        assert_eq!(commit_count(&storage).await, 3, "no new commit persisted");
+        assert_eq!(tree_count(&storage).await, 3, "no new tree persisted");
+    }
+
+    /// Buck-upload fixture: base commit + root tree, the draft CL consumed by
+    /// `get_and_update_cl_in_txn`, and a session with one uploaded file.
+    /// Returns the base commit hash (`from_hash`).
+    async fn buck_fixture(storage: &Storage, link: &str, username: &str) -> String {
+        let blob_old = ObjectHash::from_str("4444444444444444444444444444444444444444").unwrap();
+        let base_tree = Tree::from_tree_items(vec![blob_item("old.txt", &blob_old.to_string())])
+            .expect("base tree");
+        let base_commit = Commit::from_tree_id(base_tree.id, vec![], "mc09 buck base");
+        let base_hash = base_commit.id.to_string();
+
+        let mono = storage.mono_storage();
+        mono.save_mega_commits(vec![base_commit.clone()], None)
+            .await
+            .expect("base commit");
+        mono.save_mega_trees(vec![base_tree.clone()], base_commit.id, None)
+            .await
+            .expect("base tree");
+
+        storage
+            .cl_storage()
+            .new_cl(
+                "/",
+                link,
+                "mc09 buck",
+                "main",
+                &base_hash,
+                &base_hash,
+                username,
+            )
+            .await
+            .expect("cl");
+
+        let now = chrono::Utc::now().naive_utc();
+        crate::callisto::buck_session::ActiveModel {
+            id: Set(1),
+            session_id: Set(link.to_string()),
+            user_id: Set(username.to_string()),
+            repo_path: Set("/".to_string()),
+            status: Set(session_status::MANIFEST_UPLOADED.to_string()),
+            commit_message: Set(Some("buck upload".to_string())),
+            from_hash: Set(Some(base_hash.clone())),
+            expires_at: Set(now + chrono::Duration::hours(1)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(storage.buck_storage().get_connection())
+        .await
+        .expect("buck session");
+
+        let new_blob = "5555555555555555555555555555555555555555";
+        crate::callisto::buck_session_file::ActiveModel {
+            id: Set(1),
+            session_id: Set(link.to_string()),
+            file_path: Set("new.txt".to_string()),
+            file_size: Set(3),
+            file_hash: Set(format!("sha1:{new_blob}")),
+            file_mode: Set(Some("100644".to_string())),
+            upload_status: Set(upload_status::UPLOADED.to_string()),
+            upload_reason: Set(None),
+            blob_id: Set(Some(format!("sha1:{new_blob}"))),
+            uploaded_at: Set(Some(now)),
+            created_at: Set(now),
+        }
+        .insert(storage.buck_storage().get_connection())
+        .await
+        .expect("buck file");
+
+        base_hash
+    }
+
+    /// `test_storage` mocks `BuckService` with a disconnected connection;
+    /// rewire it onto the test database so `complete_upload` persists.
+    fn wire_buck_service(storage: &mut Storage) {
+        let conn = storage.mono_storage().get_connection().clone();
+        let base = BaseStorage::new(Arc::new(conn));
+        storage.buck_service = crate::jupiter::service::buck_service::BuckService::new(
+            base,
+            crate::jupiter::service::cl_service::CLService::mock(),
+            Arc::new(tokio::sync::Semaphore::new(10)),
+            Arc::new(tokio::sync::Semaphore::new(5)),
+            crate::config::BuckConfig::default(),
+            crate::jupiter::service::git_service::GitService::mock(),
+        )
+        .expect("buck service");
+    }
+
+    // AC⑥ (buck chain): the upload-synthesized commit is server-signed and
+    // all four derived references — including every tree model's commit_id,
+    // backfilled one by one — carry the final signed hash; the ref-pointed
+    // commit passes the MC-02 chain verifier.
+    #[tokio::test]
+    async fn complete_buck_upload_signs_commit_and_backfills_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = test_vault(temp.path()).await;
+        let redis = test_redis().await;
+        let mut storage = crate::jupiter::tests::test_storage(temp.path())
+            .await
+            .with_vault(vault.clone());
+        wire_buck_service(&mut storage);
+        let service = signing_service(&storage, redis.clone());
+
+        let link = "MC09BUP1";
+        let base_hash = buck_fixture(&storage, link, "alice").await;
+
+        let response = service
+            .complete_buck_upload("alice", link, CompletePayload {})
+            .await
+            .expect("complete_buck_upload with signing");
+        let signed = response.commit_id;
+        assert_ne!(signed, base_hash, "a new upload commit must be created");
+
+        let mono = storage.mono_storage();
+        let commit = mono
+            .get_commit_by_hash(&signed)
+            .await
+            .expect("load commit")
+            .expect("signed commit row");
+        let cl_ref = mono
+            .get_ref_by_name(&format!("refs/cl/{link}"))
+            .await
+            .expect("load cl ref")
+            .expect("cl ref created by complete_upload");
+        let cl = storage
+            .cl_storage()
+            .get_cl(link)
+            .await
+            .expect("load cl")
+            .expect("cl row");
+
+        // Four sinks, one final signed hash.
+        assert_eq!(commit.commit_id, signed);
+        assert_eq!(cl_ref.ref_commit_hash, signed, "CL ref");
+        assert_eq!(cl.to_hash, signed, "mega_cl.to_hash");
+        assert_eq!(cl.from_hash, base_hash);
+        assert_server_commit(&commit);
+
+        // Every new tree model was backfilled with the signed commit_id (the
+        // root tree is reachable through the ref; assert the whole set).
+        let stamped = crate::callisto::mega_tree::Entity::find()
+            .filter(crate::callisto::mega_tree::Column::CommitId.eq(&signed))
+            .all(mono.get_connection())
+            .await
+            .expect("stamped trees");
+        assert!(
+            !stamped.is_empty(),
+            "new tree models must carry the signed commit_id"
+        );
+        assert!(
+            stamped.iter().any(|t| t.tree_id == cl_ref.ref_tree_hash),
+            "the ref-pointed root tree must carry the signed commit_id"
+        );
+        assert_eq!(
+            tree_count(&storage).await,
+            1 + stamped.len(),
+            "only the base tree plus the stamped new trees exist"
+        );
+
+        register_server_key(&storage, &vault, redis).await;
+        assert_chain_verifies(&storage, &base_hash, &signed).await;
+    }
+
+    // AC③/AC④ (buck chain): without the vault handle the precheck fails
+    // closed before `build_commit`; session, CL, refs, commits and trees are
+    // all untouched.
+    #[tokio::test]
+    async fn complete_buck_upload_without_vault_fails_closed_with_zero_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        wire_buck_service(&mut storage);
+        let service = test_service(&storage);
+
+        let link = "MC09BUP2";
+        let base_hash = buck_fixture(&storage, link, "alice").await;
+
+        let err = service
+            .complete_buck_upload("alice", link, CompletePayload {})
+            .await
+            .expect_err("complete_buck_upload must fail closed without a vault");
+        assert!(
+            err.to_string().contains("server signing unavailable"),
+            "{err}"
+        );
+
+        let mono = storage.mono_storage();
+        let cl = storage
+            .cl_storage()
+            .get_cl(link)
+            .await
+            .expect("load cl")
+            .expect("cl row");
+        assert_eq!(cl.from_hash, base_hash, "CL from_hash unchanged");
+        assert_eq!(cl.to_hash, base_hash, "CL to_hash unchanged");
+        let cl_ref = mono
+            .get_ref_by_name(&format!("refs/cl/{link}"))
+            .await
+            .expect("load cl ref");
+        assert!(cl_ref.is_none(), "no CL ref may be created");
+        assert_eq!(commit_count(&storage).await, 1, "no new commit persisted");
+        assert_eq!(tree_count(&storage).await, 1, "no new tree persisted");
+        let session = storage
+            .buck_storage()
+            .get_session(link)
+            .await
+            .expect("load session")
+            .expect("session row");
+        assert_eq!(
+            session.status,
+            session_status::MANIFEST_UPLOADED,
+            "session status unchanged"
+        );
+    }
 }

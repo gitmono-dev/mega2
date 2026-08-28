@@ -102,6 +102,9 @@ impl AppContext {
         let entity_store = Arc::new(SharedEntityStore::new());
         let mut storage = storage;
         storage.set_entity_store(entity_store.clone());
+        // MC-09: the server-signing vault handle reaches the synthetic-commit
+        // sites through storage; vault is built before storage above.
+        let storage = storage.with_vault(vault.clone());
 
         // Resolve any `vault://` SecretRef in `redis.url` post-vault, then build
         // the shared Redis connection from the resolved config
