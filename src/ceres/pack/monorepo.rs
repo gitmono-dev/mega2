@@ -244,7 +244,7 @@ impl RepoHandler for MonoRepo {
     async fn check_entry(&self, entry: &Entry) -> Result<(), GitError> {
         // Only presence is tracked here; the commit itself is resolved from the
         // ref command after unpack (`PushChain`). A second commit in one pack
-        // is still rejected (multi-commit push opens up with MC-03).
+        // is still rejected (multi-commit push opens up with MC-06).
         if entry.obj_type == ObjectType::Commit {
             if self.pack_commit_seen.swap(true, Ordering::SeqCst) {
                 return Err(GitError::CustomError(
