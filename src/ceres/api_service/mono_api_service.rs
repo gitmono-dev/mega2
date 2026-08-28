@@ -6068,8 +6068,7 @@ mod mc09_tests {
             Checker, ConditionResult, gpg_signature_checker::GpgSignatureChecker,
         },
         contract::vault::{
-            integration::vault_core::VaultCore,
-            server_signing::{SERVER_SIGNING_EMAIL, ServerSigningContext},
+            integration::vault_core::VaultCore, server_signing::SERVER_SIGNING_EMAIL,
         },
         jupiter::{
             migration::apply_migrations, storage::base_storage::BaseStorage,
@@ -6114,27 +6113,6 @@ mod mc09_tests {
                 prefix: String::new(),
             }),
         }
-    }
-
-    /// Register the active server signing public key as a user GPG key so the
-    /// MC-02 checker resolves the issuer fingerprint (the dedicated server
-    /// keyring routing lands with MC-11).
-    async fn register_server_key(
-        storage: &Storage,
-        vault: &VaultCore,
-        redis: ::redis::aio::ConnectionManager,
-    ) {
-        let signing = ServerSigningContext::new(vault.clone(), redis);
-        let key = signing.active_key().await.expect("active server key");
-        let armor = key
-            .public_key
-            .to_armored_string(pgp::composed::ArmorOptions::default())
-            .expect("armor public key");
-        storage
-            .gpg_storage()
-            .add_gpg_key("monoengine-server".to_string(), armor)
-            .await
-            .expect("register server key");
     }
 
     /// Run the MC-02 chain verifier over `(from, to]` and demand PASSED.
@@ -6326,7 +6304,8 @@ mod mc09_tests {
         assert_eq!(cl.from_hash, target_head, "rebase advances the CL base");
         assert_server_commit(&commit);
 
-        register_server_key(&storage, &vault, redis).await;
+        // MC-10 test hygiene: no `gpg_key` registration — the chain must
+        // verify through the server keyring routing alone (MC-11).
         assert_chain_verifies(&storage, &target_head, &new_head).await;
     }
 
@@ -6529,7 +6508,8 @@ mod mc09_tests {
             "only the base tree plus the stamped new trees exist"
         );
 
-        register_server_key(&storage, &vault, redis).await;
+        // MC-10 test hygiene: no `gpg_key` registration — the chain must
+        // verify through the server keyring routing alone (MC-11).
         assert_chain_verifies(&storage, &base_hash, &signed).await;
     }
 

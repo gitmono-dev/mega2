@@ -2,6 +2,11 @@ services:
   postgres:
     image: postgres:15-alpine
     shm_size: "1gb"
+    # The test suite creates a per-test schema + connection pool and applies
+    # the full migration set concurrently; stock max_connections=100 is below
+    # the suite's measured peak (~104), producing pool-acquire timeout flakes
+    # (MC-10 close-out evidence). 500 aligns capacity with the real profile.
+    command: ["postgres", "-c", "max_connections=500"]
     environment:
       POSTGRES_USER: monoengine
       POSTGRES_PASSWORD: monoengine_test_password

@@ -67,6 +67,13 @@ pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
     let mut opt = ConnectOptions::new(db_url);
     opt.max_connections(2)
         .min_connections(1)
+        // Generous on purpose (FIX-05, same rationale as `test_db_config`):
+        // a full `cargo test --all` runs dozens of tests applying full-schema
+        // migrations concurrently; acquire waits reflect machine load, not
+        // broken code. A timeout still exists so a genuinely stuck connection
+        // fails the run instead of hanging it.
+        .acquire_timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(60))
         .sqlx_logging(true)
         .sqlx_logging_level(log::LevelFilter::Debug);
 
@@ -115,6 +122,11 @@ async fn create_test_database_url() -> String {
     admin_opt
         .max_connections(1)
         .min_connections(1)
+        // Same FIX-05 rationale as `test_db_connection`: the probe above all
+        // else must not fail merely because the shared test PostgreSQL is
+        // busy serving dozens of concurrent migration runs.
+        .connect_timeout(std::time::Duration::from_secs(60))
+        .acquire_timeout(std::time::Duration::from_secs(120))
         .sqlx_logging(false);
 
     let admin = Database::connect(admin_opt).await.unwrap_or_else(|_| {
