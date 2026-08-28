@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, Mutex},
 };
 
 use import_refs::RefCommand;
@@ -220,7 +220,8 @@ impl SmartSession {
                 storage: state.storage.clone(),
                 path: self.repo_path.clone(),
                 base_branch: "main".to_string(),
-                pack_commit_seen: AtomicBool::new(false),
+                pack_commit_ids: Mutex::new(HashSet::new()),
+                new_commit_ids: Mutex::new(HashSet::new()),
                 no_op_notice: Mutex::new(None),
                 push_chain_cache: Mutex::new(HashMap::new()),
                 cl_link: Arc::new(RwLock::new(None)),

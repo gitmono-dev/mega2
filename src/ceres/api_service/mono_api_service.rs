@@ -616,6 +616,20 @@ impl MonoServiceLogic {
         new_commit_id: &mut String,
     ) -> Result<(), GitError> {
         for update in &result.ref_updates {
+            // GAP-07 / ADR-MC-01 coupling — re-review both before changing
+            // this lookup: the synthesized trunk commit's parent is the FIRST
+            // candidate ref on the update's path, and
+            // `get_refs_for_paths_and_cls` sorts by `ref_name` ascending, so
+            // `refs/cl/<cl.link>` (when present in the candidate set) sorts
+            // before `refs/heads/main` and the parent becomes the CL tip
+            // instead of the pre-merge main head. Under GAP-07's naming
+            // divergence the push-side CL ref name differs from the CL row's
+            // link, so the candidate set contains no matching CL ref for a
+            // never-updated CL and the parent lands on main's head — the MC-06
+            // e2e pins that shape. A GAP-07 same-source fix makes the CL ref
+            // always match, flipping every merge parent to the chain tip and
+            // reversing ADR-MC-01's "chain commits never reach trunk"
+            // invariant.
             if let Some(p_ref) = refs.iter().find(|r| r.path == update.path) {
                 let commit = Commit::from_tree_id(
                     update.tree_id,

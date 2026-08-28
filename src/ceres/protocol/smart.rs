@@ -500,7 +500,7 @@ impl SmartSession {
                 receive_notice = repo_handler.receive_pack_notice();
             }
 
-            if !finalize_failed {
+            if !finalize_failed && repo_handler.bind_tip_after_receive() {
                 let t_bind = Instant::now();
                 self.process_commit_bindings(state, &commands).await;
                 bind_ms = Some(t_bind.elapsed().as_millis());
@@ -658,10 +658,13 @@ impl SmartSession {
     }
 
     /// Process commit bindings for successfully pushed commits
-    // NOTE (plan-20260827 MC-01): this protocol-layer binding duplicates the
-    // author-derived binding in `MonoRepo::save_entry` (`process_commit_bindings`).
-    // Cleanup is a permanent non-goal — same file as the push state model but
-    // behavior-neutral, so it is only annotated here and left for a future pass.
+    // NOTE (plan-20260827, updated MC-06/Codex R3 P1): this protocol-layer
+    // tip binding now serves ImportRepo only. MonoRepo opts out via
+    // `RepoHandler::bind_tip_after_receive` — its post-push pipeline binds
+    // exactly the accepted chain's newly introduced commits
+    // (`MonoRepo::run_mono_post_push_pipeline`), so an unconditional upsert
+    // here could still clobber a known tip's existing binding on an
+    // empty-pack idempotent re-push or a known-tip push.
     async fn process_commit_bindings(&self, state: &ProtocolApiState, commands: &[RefCommand]) {
         for command in commands {
             // Only process successful branch updates (not tags or failed commands)

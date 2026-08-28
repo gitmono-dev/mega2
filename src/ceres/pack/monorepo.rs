@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     vec,
 };
@@ -17,7 +17,7 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
-        object::{blob::Blob, commit::Commit, signature::Signature, tree::Tree, types::ObjectType},
+        object::{blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
@@ -29,7 +29,7 @@ use crate::{
     bellatrix::Bellatrix,
     callisto::{
         entity_ext::generate_link,
-        mega_cl, mega_code_review_anchor, mega_commit, mega_refs,
+        mega_cl, mega_code_review_anchor, mega_refs,
         sea_orm_active_enums::{PositionStatusEnum, RefTypeEnum},
     },
     ceres::{
@@ -60,11 +60,18 @@ pub struct MonoRepo {
     pub git_object_cache: Arc<GitObjectCache>,
     pub path: PathBuf,
     pub base_branch: String,
-    /// Whether the current unpack delivered a commit object. Presence only —
-    /// base/tip never derive from pack arrival order (GC-MC-13); the
-    /// [`PushChain`](crate::ceres::pack::push_chain::PushChain) is built from
-    /// `command_list` plus this flag at finalize.
-    pub pack_commit_seen: AtomicBool,
+    /// Object ids of every commit the current unpack delivered (presence).
+    /// Drives the ADR-MC-05 no-op split and the "pack carries the ref target"
+    /// fail-closed check — presence, not newness, keeps rejections sticky for
+    /// a retried push whose objects are already stored. base/tip never derive
+    /// from pack arrival order (GC-MC-13); the [`PushChain`](crate::ceres::pack::push_chain::PushChain)
+    /// is built from `command_list` plus these sets at finalize.
+    pub pack_commit_ids: Mutex<HashSet<String>>,
+    /// The subset of `pack_commit_ids` that was absent from storage at unpack
+    /// time (Codex R1 P1-1). Bounds the fork-point walk in
+    /// [`PushChain::resolve`]: a pack may redundantly carry server-known
+    /// ancestors, and only newly introduced commits extend the chain.
+    pub new_commit_ids: Mutex<HashSet<String>>,
     /// ADR-MC-05 no-op notice set by `build_push_chain`; read by the protocol
     /// layer via `receive_pack_notice` after a successful finalize.
     pub no_op_notice: Mutex<Option<String>>,
@@ -101,6 +108,14 @@ impl RepoHandler for MonoRepo {
             .lock()
             .expect("no_op_notice lock poisoned")
             .clone()
+    }
+
+    /// Codex R3 P1: MonoRepo binds the accepted chain's newly introduced
+    /// commits in its post-push pipeline; the protocol layer must not re-upsert
+    /// the tip (an empty-pack idempotent re-push or a known-tip push would
+    /// otherwise clobber the existing binding).
+    fn bind_tip_after_receive(&self) -> bool {
+        false
     }
 
     async fn refs_with_head_hash(&self) -> (String, Vec<Refs>) {
@@ -188,6 +203,7 @@ impl RepoHandler for MonoRepo {
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
+        self.validate_incoming_push().await?;
         self.persist_mono_branch_cl_mega_refs_transaction().await?;
         self.run_mono_post_push_pipeline().await
     }
@@ -205,34 +221,22 @@ impl RepoHandler for MonoRepo {
         // `preview_router::get_tree_commit_info`) — exactly correct under the
         // single-commit-per-push constraint, an approximate value once MC-06
         // opens multi-commit pushes (recorded in ADR-MC-06 / DEFER-MC-03).
+        //
+        // Codex R1 P1-2: no commit binding here — unpack runs before chain
+        // validation, so binding here would let a rejected push upsert
+        // `commit_auths` (overwriting existing bindings' usernames). Bindings
+        // are written post-finalize for the accepted chain only (see
+        // `run_mono_post_push_pipeline`).
         let commit_id = push_chain::attribution_commit_id(
             &self
                 .command_list
                 .lock()
                 .expect("command_list lock poisoned"),
         );
-        let commit_models = self
-            .storage
+        self.storage
             .mono_service
             .save_entry(&commit_id, entry_list)
             .await?;
-
-        if !commit_models.is_empty() {
-            let commits_to_process: Result<Vec<(String, String)>, MegaError> = commit_models
-                .into_iter()
-                .map(|c| {
-                    let model: mega_commit::Model = c.try_into()?;
-                    let author_bytes = model.author.as_deref().unwrap_or("").as_bytes();
-                    let signature = Signature::from_data(author_bytes.to_vec())?;
-                    Ok((model.commit_id, signature.email))
-                })
-                .collect();
-
-            self.storage
-                .mono_storage()
-                .process_commit_bindings(&commits_to_process?, self.username.clone().as_deref())
-                .await?;
-        }
         Ok(())
     }
 
@@ -242,36 +246,40 @@ impl RepoHandler for MonoRepo {
     }
 
     async fn check_entry(&self, entry: &Entry) -> Result<(), GitError> {
-        // Only presence is tracked here; the commit itself is resolved from the
-        // ref command after unpack (`PushChain`). A second commit in one pack
-        // is still rejected (multi-commit push opens up with MC-06).
+        // MC-06: multi-commit packs are admitted. Commit entries are only
+        // recorded here; consistency with the ref update is enforced at
+        // finalize — `PushChain::resolve` fail-closes when the pack does not
+        // carry the ref update target, and `PushChain::validate` (MC-03) gates
+        // the chain before any ref/CL mutation. Objects of a rejected push
+        // stay harmless: `batch_save_model` is insert-only (on-conflict
+        // do-nothing), so pre-existing rows are untouched and new rows are
+        // unreachable garbage (MC01-R2 P2-B accepted limitation: early-flushed
+        // batches of a failed push may keep tip attribution until DEFER-MC-03).
         if entry.obj_type == ObjectType::Commit {
-            if self.pack_commit_seen.swap(true, Ordering::SeqCst) {
-                return Err(GitError::CustomError(
-                    "only single commit support in each push".to_string(),
-                ));
-            }
-            // Fail closed at unpack (MC01-R1 P2-1): the pack's commit must be
-            // the ref command's `new_id`. A mismatching push would otherwise
-            // get its objects stamped with the ref's `new_id` attribution
-            // before finalize rejected it. Entries flushed before the commit
-            // entry stay harmless: `batch_save_model` is insert-only
-            // (on-conflict do-nothing), so pre-existing rows are untouched and
-            // new rows of a failed push are unreachable garbage. Known
-            // limitation (MC01-R2 P2-B, accepted): if a ≥1000-object pack
-            // flushes earlier batches before the offending commit entry, those
-            // first-seen tree/blob rows keep the wrong attribution, and a later
-            // legitimate push reintroducing identical content will not correct
-            // them (content-addressed dedup). Affects only the "last commit"
-            // display until DEFER-MC-03 lands.
-            if let Some(cmd) = self.primary_branch_command()
-                && entry.hash.to_string() != cmd.new_id
-            {
-                return Err(GitError::CustomError(format!(
-                    "pack commit {} does not match the ref update new_id {}; \
-                     the pack's commit must match the ref update",
-                    entry.hash, cmd.new_id
-                )));
+            let hash = entry.hash.to_string();
+            self.pack_commit_ids
+                .lock()
+                .expect("pack_commit_ids lock poisoned")
+                .insert(hash.clone());
+            // Codex R1 P1-1: only commits absent from storage count as newly
+            // introduced — packs may redundantly carry server-known ancestors,
+            // and the fork-point walk must not extend the chain past the true
+            // fork point. Fail closed on a storage error (newness is
+            // undecidable then).
+            let known = self
+                .storage
+                .mono_storage()
+                .get_commit_by_hash(&hash)
+                .await
+                .map_err(|e| {
+                    GitError::CustomError(format!("commit existence check failed for {hash}: {e}"))
+                })?
+                .is_some();
+            if !known {
+                self.new_commit_ids
+                    .lock()
+                    .expect("new_commit_ids lock poisoned")
+                    .insert(hash);
             }
         }
         Ok(())
@@ -997,7 +1005,30 @@ impl MonoRepo {
                 )
                 .await?;
         }
-        self.reanchor_code_review_threads(&cl, &to_hash).await
+        self.reanchor_code_review_threads(&cl, &to_hash).await?;
+        // Codex R1 P1-2 / R2 P1-2: commit bindings are written only now — the
+        // push has been accepted (chain validated, CL updated) — and cover
+        // exactly the accepted chain's *newly introduced* commits: a rejected
+        // push leaves `commit_auths` untouched, and a no-new-content push
+        // re-binds nothing (the commits keep their original binding).
+        let new_ids = self
+            .new_commit_ids
+            .lock()
+            .expect("new_commit_ids lock poisoned")
+            .clone();
+        let bindings: Vec<(String, String)> = chain
+            .ordered_commits
+            .iter()
+            .filter(|c| new_ids.contains(&c.id.to_string()))
+            .map(|c| (c.id.to_string(), c.author.email.clone()))
+            .collect();
+        if !bindings.is_empty() {
+            self.storage
+                .mono_storage()
+                .process_commit_bindings(&bindings, self.username.clone().as_deref())
+                .await?;
+        }
+        Ok(())
     }
 
     #[async_recursion]
@@ -1077,8 +1108,10 @@ impl MonoRepo {
         Ok(())
     }
     /// The semantics-defining command of this push: the first non-delete
-    /// branch command. Delete commands never build a chain; multi-branch
-    /// pushes remain as-is until MC-06 rejects them (ADR-MC-04).
+    /// branch command. Delete commands never build a chain; a push with more
+    /// than one non-delete branch command is rejected by
+    /// [`Self::validate_incoming_push`] before this is ever consulted at
+    /// finalize (ADR-MC-04).
     fn primary_branch_command(&self) -> Option<RefCommand> {
         push_chain::primary_branch_command(
             &self
@@ -1086,6 +1119,57 @@ impl MonoRepo {
                 .lock()
                 .expect("command_list lock poisoned"),
         )
+    }
+
+    /// Receive-pack admission gate (MC-06), run before any ref/CL mutation:
+    ///
+    /// 1. ADR-MC-04 — a receive-pack carrying more than one non-delete branch
+    ///    command is rejected as a whole; the message tells the user to push
+    ///    one branch at a time. Delete commands do not count.
+    /// 2. MC-03 chain validation — the primary branch command's resolved
+    ///    [`PushChain`] is validated against storage, with the path's existing
+    ///    open CL (queried on the same path as `fetch_or_new_cl_link` /
+    ///    `update_or_create_cl`) supplying the ADR-MC-07 cumulative boundary.
+    ///
+    /// A failure aborts `finalize_receive_pack`; the protocol layer marks every
+    /// branch command `ng` with this message, so the client rejects the whole
+    /// push. The ADR-MC-05 no-op path and delete-only pushes pass through.
+    async fn validate_incoming_push(&self) -> Result<(), MegaError> {
+        let cmds = self
+            .command_list
+            .lock()
+            .expect("command_list lock poisoned")
+            .clone();
+        let branch_updates = cmds
+            .iter()
+            .filter(|c| {
+                c.ref_type == RefTypeEnum::Branch
+                    && c.command_type != CommandType::Delete
+                    && c.new_id != ZERO_ID
+            })
+            .count();
+        if branch_updates > 1 {
+            return Err(MegaError::Other(format!(
+                "monorepo receive-pack accepts at most one branch update per push \
+                 (got {branch_updates}); push one branch at a time \
+                 (delete commands are unaffected)"
+            )));
+        }
+        let Some(cmd) = push_chain::primary_branch_command(&cmds) else {
+            return Ok(());
+        };
+        // ADR-MC-05 no-op: nothing to validate.
+        let Some(chain) = self.build_push_chain(&cmd).await? else {
+            return Ok(());
+        };
+        let open_cl = self
+            .storage
+            .cl_storage()
+            .get_open_cl_by_path(self.path.to_str().unwrap(), &self.username())
+            .await?;
+        chain
+            .validate(&cmd, &self.storage.mono_storage(), open_cl.as_ref())
+            .await
     }
 
     /// Build the [`PushChain`] for a branch command, cached per `new_id` so a
@@ -1102,6 +1186,16 @@ impl MonoRepo {
         {
             return Ok(cached.clone());
         }
+        let pack_commit_ids = self
+            .pack_commit_ids
+            .lock()
+            .expect("pack_commit_ids lock poisoned")
+            .clone();
+        let new_commit_ids = self
+            .new_commit_ids
+            .lock()
+            .expect("new_commit_ids lock poisoned")
+            .clone();
         let tip_commit = self
             .storage
             .mono_storage()
@@ -1110,9 +1204,13 @@ impl MonoRepo {
             .map(Commit::from_mega_model);
         let chain = match PushChain::resolve(
             cmd,
-            self.pack_commit_seen.load(Ordering::SeqCst),
+            &pack_commit_ids,
+            &new_commit_ids,
             tip_commit,
-        )? {
+            &self.storage.mono_storage(),
+        )
+        .await?
+        {
             PushChainResolution::Chain(chain) => Some(*chain),
             PushChainResolution::Noop { notice } => {
                 // GC-MC-14: the no-op is logged, not silent; the notice also
@@ -1323,5 +1421,226 @@ impl MonoRepo {
         }
 
         Ok(())
+    }
+}
+
+// Codex R1 P1-2: commit bindings (`commit_auths`) are written only after a
+// push has been accepted, and only for the accepted chain's commits. These
+// tests pin the two named rejection paths (multi-branch refusal, ref target
+// missing from the pack) plus the unpack stage itself.
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        str::FromStr,
+        sync::{Arc, Mutex},
+    };
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::{
+            metadata::{EntryMeta, MetaAttached},
+            object::{
+                commit::Commit,
+                signature::{Signature, SignatureType},
+            },
+            pack::entry::Entry,
+        },
+    };
+    use sea_orm::{EntityTrait, IntoActiveModel, PaginatorTrait};
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    use super::{MonoRepo, RepoHandler};
+    use crate::{
+        bellatrix::Bellatrix,
+        callisto::{commit_auths, mega_commit},
+        ceres::{api_service::cache::GitObjectCache, protocol::import_refs::RefCommand},
+        common::utils::ZERO_ID,
+        jupiter::{
+            storage::{Storage, base_storage::StorageConnector},
+            tests::test_storage,
+            utils::converter::IntoMegaModel,
+        },
+    };
+
+    fn test_commit(message: &str) -> Commit {
+        let tree_id = ObjectHash::from_str("27dd8d4cf39f3868c6eee38b601bc9e9939304f5").unwrap();
+        let parent = ObjectHash::from_str("119bc457cb05b52dfb0d6b14f66d9a8a52d09e25").unwrap();
+        Commit::new(
+            Signature::new(
+                SignatureType::Author,
+                "Monoengine Test".to_string(),
+                "monoengine-test@example.invalid".to_string(),
+            ),
+            Signature::new(
+                SignatureType::Committer,
+                "Monoengine Test".to_string(),
+                "monoengine-test@example.invalid".to_string(),
+            ),
+            tree_id,
+            vec![parent],
+            message,
+        )
+    }
+
+    fn id_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn test_monorepo(
+        storage: &Storage,
+        commands: Vec<RefCommand>,
+        pack_commit_ids: HashSet<String>,
+        new_commit_ids: HashSet<String>,
+    ) -> MonoRepo {
+        // Never connected: the gate paths under test do not touch the cache.
+        let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
+            ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+            ::redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy connection manager");
+        MonoRepo {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "mc06-test".to_string(),
+            }),
+            path: PathBuf::from("/"),
+            base_branch: "main".to_string(),
+            pack_commit_ids: Mutex::new(pack_commit_ids),
+            new_commit_ids: Mutex::new(new_commit_ids),
+            no_op_notice: Mutex::new(None),
+            push_chain_cache: Mutex::new(HashMap::new()),
+            cl_link: Arc::new(RwLock::new(None)),
+            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+            username: Some("tester".to_string()),
+            command_list: Mutex::new(commands),
+        }
+    }
+
+    async fn commit_auth_count(storage: &Storage) -> u64 {
+        commit_auths::Entity::find()
+            .count(storage.mono_storage().get_connection())
+            .await
+            .expect("count commit_auths")
+    }
+
+    #[tokio::test]
+    async fn multi_branch_rejection_never_binds_commits() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let t1 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let t2 = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+        let commands = vec![
+            RefCommand::new(old.clone(), t1.clone(), "refs/heads/one".to_string()),
+            RefCommand::new(old.clone(), t2.clone(), "refs/heads/two".to_string()),
+        ];
+        let repo = test_monorepo(&storage, commands, id_set(&[&t1]), id_set(&[&t1]));
+
+        let err = repo
+            .validate_incoming_push()
+            .await
+            .expect_err("a two-branch receive-pack must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("at most one branch update per push"),
+            "{err}"
+        );
+        assert_eq!(
+            commit_auth_count(&storage).await,
+            0,
+            "a rejected push must leave commit_auths untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ref_target_rejection_never_binds_commits() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        // The ref target exists in storage but the pack carries only an
+        // unrelated commit — resolve fail-closes on "tip not in pack".
+        let tip = test_commit("the ref update target");
+        let other = test_commit("unrelated pack content");
+        let model: mega_commit::Model = tip.clone().into_mega_model(EntryMeta::default());
+        mega_commit::Entity::insert(model.into_active_model())
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("insert tip commit");
+        let tip_id = tip.id.to_string();
+        let commands = vec![RefCommand::new(
+            ZERO_ID.to_string(),
+            tip_id.clone(),
+            "refs/heads/main".to_string(),
+        )];
+        let repo = test_monorepo(
+            &storage,
+            commands,
+            id_set(&[&other.id.to_string()]),
+            id_set(&[&other.id.to_string()]),
+        );
+
+        let err = repo
+            .validate_incoming_push()
+            .await
+            .expect_err("a pack missing the ref update target must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("does not contain the ref update target"),
+            "{err}"
+        );
+        assert_eq!(
+            commit_auth_count(&storage).await,
+            0,
+            "a rejected push must leave commit_auths untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_entry_does_not_bind_commits() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut storage = test_storage(temp.path()).await;
+        // `test_storage` hands out a mock MonoService on a disconnected
+        // connection; re-point it at the test database. The mock GitService is
+        // fine: a commit-only entry never touches object storage.
+        storage.mono_service = crate::jupiter::service::mono_service::MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: storage.git_service.clone(),
+        };
+        let tip = test_commit("unpacked but not yet accepted");
+        let tip_id = tip.id.to_string();
+        let commands = vec![RefCommand::new(
+            ZERO_ID.to_string(),
+            tip_id.clone(),
+            "refs/heads/main".to_string(),
+        )];
+        let repo = test_monorepo(&storage, commands, id_set(&[&tip_id]), id_set(&[&tip_id]));
+
+        let entry: Entry = tip.into();
+        repo.save_entry(vec![MetaAttached {
+            inner: entry,
+            meta: EntryMeta::new(),
+        }])
+        .await
+        .expect("save_entry must persist the commit");
+
+        assert!(
+            storage
+                .mono_storage()
+                .get_commit_by_hash(&tip_id)
+                .await
+                .expect("lookup")
+                .is_some(),
+            "save_entry must have persisted the commit row"
+        );
+        assert_eq!(
+            commit_auth_count(&storage).await,
+            0,
+            "unpack/save_entry must not bind commits (Codex R1 P1-2)"
+        );
     }
 }

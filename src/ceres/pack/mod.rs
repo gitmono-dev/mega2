@@ -73,6 +73,20 @@ pub trait RepoHandler: Send + Sync + 'static {
         None
     }
 
+    /// Whether the protocol layer should bind each successful branch command's
+    /// `new_id` to the authenticated user after a successful finalize
+    /// (`commit_auths`; `SmartSession::process_commit_bindings`).
+    ///
+    /// MonoRepo opts out (Codex R3 P1): its post-push pipeline already binds
+    /// exactly the accepted chain's newly introduced commits
+    /// (`ordered_commits ∩ new`), and an unconditional protocol-layer re-upsert
+    /// of a possibly already-known tip would clobber existing bindings
+    /// (`matched_at`, and the username when a different authenticated user
+    /// re-pushes the same tip). ImportRepo keeps the default `true`.
+    fn bind_tip_after_receive(&self) -> bool {
+        true
+    }
+
     async fn refs_with_head_hash(&self) -> (String, Vec<Refs>);
 
     async fn receiver_handler(
@@ -205,6 +219,13 @@ pub trait RepoHandler: Send + Sync + 'static {
     ///   build hooks run afterward (not in that transaction).
     async fn finalize_receive_pack(&self) -> Result<(), MegaError>;
 
+    /// Persist one batch of unpacked entries.
+    ///
+    /// Contract (Codex R1 P1-2): implementations must NOT write commit
+    /// bindings (`commit_auths`) here — unpack runs before chain validation,
+    /// so binding here would let a rejected push upsert bindings. MonoRepo
+    /// binds the accepted chain post-finalize in
+    /// `MonoRepo::run_mono_post_push_pipeline`.
     async fn save_entry(
         &self,
         entry_list: Vec<MetaAttached<Entry, EntryMeta>>,

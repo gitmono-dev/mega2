@@ -1976,6 +1976,1089 @@ fn integration_git_cli_rejects_main_branch_delete() {
     );
 }
 
+#[test]
+fn integration_git_cli_multicommit_chain_push_acceptance() {
+    // plan-20260827 MC-06: a 3-commit linear chain push is admitted end to end
+    // — exactly one CL with from = fork point / to = chain tip, CL ref fields
+    // sourced from the tip, files introduced/renamed by non-first commits
+    // indexed in mega_blob.file_path, and the merge advances refs/heads/main by
+    // exactly one new single-parent commit (ADR-MC-01).
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let clone_name = "mc06-chain-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for multicommit chain push",
+    );
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "git config identity",
+        );
+    }
+    let base_head = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "origin/main"],
+    );
+    let branch = format!("mc06-chain-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create chain branch",
+    );
+
+    // c1 adds a root file, c2 adds a file in a new subdirectory, c3 renames the
+    // c1 file — the c2/c3 changes are the non-first-commit indexing surface.
+    let clone = env.case_dir.join(clone_name);
+    fs::write(clone.join("mc06-fileA.txt"), b"mc06 chain file A\n").expect("write file A");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-fileA.txt"],
+        ),
+        "git add file A",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 c1 add fileA"],
+        ),
+        "commit c1",
+    );
+    fs::create_dir_all(clone.join("mc06-dir")).expect("mkdir mc06-dir");
+    fs::write(
+        clone.join("mc06-dir/mc06-fileB.txt"),
+        b"mc06 chain file B\n",
+    )
+    .expect("write file B");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-dir/mc06-fileB.txt"],
+        ),
+        "git add file B",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 c2 add fileB"],
+        ),
+        "commit c2",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "mv",
+                "mc06-fileA.txt",
+                "mc06-fileA-renamed.txt",
+            ],
+        ),
+        "git mv file A",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 c3 rename fileA"],
+        ),
+        "commit c3",
+    );
+
+    let c1 = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD~2"],
+    );
+    let c2 = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD~1"],
+    );
+    let c3 = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD"],
+    );
+    let c3_tree = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD^{tree}"],
+    );
+    let blob_b = git_stdout(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "rev-parse",
+            "HEAD:mc06-dir/mc06-fileB.txt",
+        ],
+    );
+    let blob_a = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD:mc06-fileA-renamed.txt"],
+    );
+    let pre_push_tree = snapshot_workdir(&clone);
+
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let push = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &refspec,
+        ],
+    );
+    git_cli::assert_git_success(&push, "3-commit chain push must be admitted (MC-06)");
+
+    // AC: exactly one CL for (path, user); from = fork point, to = chain tip.
+    let cls = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        cls.len(),
+        1,
+        "a chain push must create exactly one CL: {cls:?}"
+    );
+    let cl = &cls[0];
+    assert_eq!(
+        cl.from_hash, base_head,
+        "CL from_hash must be the chain base (fork point)"
+    );
+    assert_eq!(cl.to_hash, c3, "CL to_hash must be the chain tip");
+    assert_eq!(cl.status, "open", "CL must be open before merge");
+
+    // CL ref fields must be sourced from the same tip commit. The push-side CL
+    // ref is discovered by `is_cl`: its name is generated independently of the
+    // CL row's link (pre-existing behavior, not MC-06 scope).
+    let cl_refs = cl_ref_rows(&env.database.db_url);
+    assert_eq!(
+        cl_refs.len(),
+        1,
+        "exactly one refs/cl/* must exist after the chain push: {cl_refs:?}"
+    );
+    let (_cl_ref_name, ref_commit, ref_tree) = &cl_refs[0];
+    assert_eq!(
+        ref_commit, &c3,
+        "CL ref ref_commit_hash must be the chain tip"
+    );
+    assert_eq!(
+        ref_tree, &c3_tree,
+        "CL ref ref_tree_hash must be the chain tip tree"
+    );
+
+    // AC: files added/renamed by non-first commits are indexed in
+    // mega_blob.file_path (the post-push tip-tree walk covers the whole chain).
+    assert_eq!(
+        blob_file_paths(&env.database.db_url, &blob_b),
+        vec!["mc06-dir/mc06-fileB.txt".to_string()],
+        "blob added in c2 must be indexed at its path"
+    );
+    assert_eq!(
+        blob_file_paths(&env.database.db_url, &blob_a),
+        vec!["mc06-fileA-renamed.txt".to_string()],
+        "blob renamed in c3 must be indexed at the renamed path"
+    );
+
+    // Codex R1 P1-2 (positive path): the accepted chain's commits are bound to
+    // the authenticated pusher — post-finalize, chain-scoped (not pack-scoped).
+    let bindings = commit_auth_rows(&env.database.db_url);
+    for sha in [&c1, &c2, &c3] {
+        assert!(
+            bindings
+                .iter()
+                .any(|(s, u)| s == sha && u.as_deref() == Some(git_cli::DEFAULT_GIT_AUTH_USER)),
+            "accepted chain commit {sha} must be bound to the pusher: {bindings:?}"
+        );
+    }
+
+    // Codex R3 P1: an idempotent re-push of the same tip is an ADR-MC-05 no-op
+    // (the CL ref tip is advertised, so the client sends an empty pack) and
+    // must not rewrite any `commit_auths` field — MonoRepo owns binding via its
+    // pipeline, the protocol layer's generic tip upsert is disabled for it.
+    let auth_snapshot_before = commit_auth_snapshot(&env.database.db_url);
+    let cl_refs_before = cl_ref_rows(&env.database.db_url);
+    let repush = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &refspec,
+        ],
+    );
+    git_cli::assert_git_success(&repush, "idempotent empty-pack re-push must succeed");
+    let repush_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&repush.stdout),
+        String::from_utf8_lossy(&repush.stderr)
+    );
+    assert!(
+        repush_text.contains("no change list was created or updated"),
+        "the no-op re-push must carry the ADR-MC-05 remote notice; got:\n{repush_text}"
+    );
+    assert_eq!(
+        commit_auth_snapshot(&env.database.db_url),
+        auth_snapshot_before,
+        "an idempotent re-push must leave every commit_auths field byte-identical"
+    );
+    assert_eq!(
+        cl_ref_rows(&env.database.db_url),
+        cl_refs_before,
+        "an idempotent re-push must not move any CL ref"
+    );
+    assert_eq!(
+        cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER).len(),
+        1,
+        "an idempotent re-push must not create a second CL"
+    );
+
+    // AC (ADR-MC-01): merging the CL moves refs/heads/main to exactly one new
+    // single-parent commit — never a fast-forward to the user's chain tip.
+    //
+    // GAP-07 coupling: the strict `parents == [pre-merge main head]` shape
+    // below currently rests on an accident of the CL ref naming divergence —
+    // the push-side CL ref name (L1, from `fetch_or_new_cl_link`) differs from
+    // the CL row's link (L2, from `create_new_cl`), and this CL only ever saw
+    // one push, so `refs/cl/<L2>` is absent from the merge's ref candidate set
+    // and `process_ref_updates` falls through to main's head. Once GAP-07 is
+    // fixed (same-source link), the merge parent becomes the chain tip and
+    // this assertion must be re-reviewed together with ADR-MC-01.
+    let merge_status = merge_cl_no_auth(port, &cl.link);
+    assert_eq!(merge_status, 200, "chain CL merge must succeed");
+    let (main_commit, main_tree) = ref_commit_tree(&env.database.db_url, "/", "refs/heads/main")
+        .expect("main ref must exist after merge");
+    assert!(
+        main_commit != c1 && main_commit != c2 && main_commit != c3,
+        "main must advance to a server-synthesized commit, not a chain commit: {main_commit}"
+    );
+    assert_eq!(
+        main_tree, c3_tree,
+        "root CL merge adopts the chain tip tree (aggregate diff)"
+    );
+    let parents = commit_parents(&env.database.db_url, &main_commit);
+    assert_eq!(
+        parents,
+        vec![base_head.clone()],
+        "the merge commit must be single-parented on the pre-merge main head \
+         (ADR-MC-01: the pushed chain never lands on trunk; GAP-07 coupling: \
+         this shape depends on the CL ref name differing from the CL link — \
+         re-review with ADR-MC-01 when GAP-07 is fixed): {parents:?}"
+    );
+    let cl_after = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(cl_after.len(), 1, "still exactly one CL after merge");
+    assert_eq!(cl_after[0].status, "merged", "CL must be merged");
+
+    // End-to-end aggregate proof: a fresh clone of main matches the pre-push
+    // working tree byte-for-byte.
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["clone", &remote_url, "mc06-verify-clone"],
+        ),
+        "post-merge clone of main",
+    );
+    let merged_tree = snapshot_workdir(&env.case_dir.join("mc06-verify-clone"));
+    assert_eq!(
+        merged_tree, pre_push_tree,
+        "post-merge main worktree must equal the pushed 3-commit working tree"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_multicommit_two_commit_chain_acceptance() {
+    // plan-20260827 MC-06: the lower boundary of the opened range — a 2-commit
+    // chain push is admitted and lands as one CL with from = base / to = tip.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let clone_name = "mc06-two-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for two-commit chain push",
+    );
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "git config identity",
+        );
+    }
+    let base_head = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "origin/main"],
+    );
+    let branch = format!("mc06-two-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create two-commit branch",
+    );
+
+    let clone = env.case_dir.join(clone_name);
+    fs::write(clone.join("mc06-two-1.txt"), b"mc06 two-commit c1\n").expect("write c1 file");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-two-1.txt"],
+        ),
+        "git add c1 file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 two c1"],
+        ),
+        "commit c1",
+    );
+    fs::write(clone.join("mc06-two-2.txt"), b"mc06 two-commit c2\n").expect("write c2 file");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-two-2.txt"],
+        ),
+        "git add c2 file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 two c2"],
+        ),
+        "commit c2",
+    );
+    let tip = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD"],
+    );
+    let tip_tree = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD^{tree}"],
+    );
+
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let push = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &refspec,
+        ],
+    );
+    git_cli::assert_git_success(&push, "2-commit chain push must be admitted (MC-06)");
+
+    let cls = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        cls.len(),
+        1,
+        "a 2-commit push must create exactly one CL: {cls:?}"
+    );
+    let cl = &cls[0];
+    assert_eq!(
+        cl.from_hash, base_head,
+        "CL from_hash must be the chain base"
+    );
+    assert_eq!(cl.to_hash, tip, "CL to_hash must be the chain tip");
+
+    let cl_refs = cl_ref_rows(&env.database.db_url);
+    assert_eq!(
+        cl_refs.len(),
+        1,
+        "exactly one refs/cl/* must exist after the 2-commit push: {cl_refs:?}"
+    );
+    let (_cl_ref_name, ref_commit, ref_tree) = &cl_refs[0];
+    assert_eq!(
+        ref_commit, &tip,
+        "CL ref ref_commit_hash must be the chain tip"
+    );
+    assert_eq!(
+        ref_tree, &tip_tree,
+        "CL ref ref_tree_hash must be the chain tip tree"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_multicommit_multi_branch_rejected() {
+    // plan-20260827 MC-06 / ADR-MC-04: one receive-pack carrying more than one
+    // non-delete branch command is rejected as a whole, with a message that
+    // tells the user to push one branch at a time.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let clone_name = "mc06-multibranch-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for multi-branch rejection",
+    );
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "git config identity",
+        );
+    }
+    let branch = format!("mc06-mb-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create multi-branch source branch",
+    );
+    let clone = env.case_dir.join(clone_name);
+    fs::write(clone.join("mc06-mb.txt"), b"mc06 multi-branch rejection\n").expect("write mb file");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-mb.txt"],
+        ),
+        "git add mb file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 multi-branch"],
+        ),
+        "git commit mb file",
+    );
+    let pushed_commit = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD"],
+    );
+
+    let before_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    let push = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{branch}-a"),
+            &format!("HEAD:refs/heads/{branch}-b"),
+        ],
+    );
+    assert!(
+        !push.status.success(),
+        "a two-branch receive-pack must be rejected; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    assert!(
+        combined.contains("at most one branch update per push"),
+        "multi-branch rejection must state the rule; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("push one branch at a time"),
+        "multi-branch rejection must guide towards separate pushes; got:\n{combined}"
+    );
+
+    // Whole-push rejection: no CL ref and no CL row survive.
+    let after_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    assert_eq!(
+        before_cl, after_cl,
+        "a rejected multi-branch push must not create/update any refs/cl/*"
+    );
+    assert!(
+        cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER).is_empty(),
+        "a rejected multi-branch push must not create a CL"
+    );
+    // Codex R1 P1-2: the rejected pack's commit must not be bound either.
+    assert!(
+        commit_auth_rows(&env.database.db_url)
+            .iter()
+            .all(|(s, _)| s != &pushed_commit),
+        "a rejected multi-branch push must leave commit_auths untouched"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
+    // plan-20260827 MC-06 / ADR-MC-04 (Codex R1 P2): delete commands do not
+    // count towards the one-branch-update limit — one receive-pack carrying a
+    // delete plus a legitimate update is accepted; a delete-only push still
+    // skips unpack entirely.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let clone_name = "mc06-mixed-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for mixed delete+update case",
+    );
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "git config identity",
+        );
+    }
+    let base_head = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "origin/main"],
+    );
+    let branch = format!("mc06-mixed-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create mixed-case branch",
+    );
+    let clone = env.case_dir.join(clone_name);
+    fs::write(clone.join("mc06-mixed-1.txt"), b"mc06 mixed c1\n").expect("write c1 file");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-mixed-1.txt"],
+        ),
+        "git add c1 file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 mixed c1"],
+        ),
+        "commit c1",
+    );
+    let c1 = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD"],
+    );
+
+    // First push: creates the CL and the push-side CL ref (name generated
+    // independently of the CL row's link — discovered via `is_cl`).
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let push1 = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &refspec,
+        ],
+    );
+    git_cli::assert_git_success(&push1, "first push creates the CL");
+    let cl_refs = cl_ref_rows(&env.database.db_url);
+    assert_eq!(cl_refs.len(), 1, "exactly one CL ref after the first push");
+    let first_ref = cl_refs[0].0.clone();
+    assert_eq!(cl_refs[0].1, c1, "first CL ref must point at c1");
+
+    // c2 on top of c1.
+    fs::write(clone.join("mc06-mixed-2.txt"), b"mc06 mixed c2\n").expect("write c2 file");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "mc06-mixed-2.txt"],
+        ),
+        "git add c2 file",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "mc06 mixed c2"],
+        ),
+        "commit c2",
+    );
+    let c2 = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD"],
+    );
+
+    // ONE receive-pack: delete the first CL ref + push the c2 update. The
+    // delete must not trip the ADR-MC-04 multi-branch refusal.
+    let mixed = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!(":{first_ref}"),
+            &refspec,
+        ],
+    );
+    git_cli::assert_git_success(
+        &mixed,
+        "a receive-pack with one delete plus one update must be accepted",
+    );
+
+    // The delete took effect; the update advanced the CL and its ref.
+    let cl_refs = cl_ref_rows(&env.database.db_url);
+    assert_eq!(
+        cl_refs.len(),
+        1,
+        "exactly one CL ref after the mixed push: {cl_refs:?}"
+    );
+    assert_ne!(
+        cl_refs[0].0, first_ref,
+        "the deleted CL ref must be gone: {cl_refs:?}"
+    );
+    assert_eq!(cl_refs[0].1, c2, "the CL ref must advance to c2");
+    let cls = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(cls.len(), 1, "still exactly one CL");
+    assert_eq!(
+        cls[0].from_hash, base_head,
+        "CL from_hash stays frozen at the fork point"
+    );
+    assert_eq!(cls[0].to_hash, c2, "CL to_hash advances to c2");
+    let remote_cls = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
+    assert!(
+        !remote_cls.iter().any(|r| r == &first_ref),
+        "deleted CL ref must not be advertised: {remote_cls:?}"
+    );
+    assert!(
+        remote_cls.iter().any(|r| r == &cl_refs[0].0),
+        "the advanced CL ref must be advertised: {remote_cls:?}"
+    );
+
+    // Delete-only regression: skips unpack entirely and removes the ref.
+    let second_ref = cl_refs[0].0.clone();
+    let delete_only = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "push",
+            "origin",
+            &format!(":{second_ref}"),
+        ],
+    );
+    git_cli::assert_git_success(&delete_only, "delete-only push must succeed");
+    assert!(
+        cl_ref_rows(&env.database.db_url).is_empty(),
+        "delete-only push must remove the CL ref row"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_multicommit_cumulative_limit_rejected() {
+    // plan-20260827 MC-06 / ADR-MC-07: the 250 bound applies to the CL's
+    // cumulative (from_hash → to_hash) range. A 200-commit push opens the CL;
+    // a follow-up 100-commit push is a legal increment on its own but crosses
+    // the cumulative limit and must be rejected at push time, leaving the CL
+    // and its ref untouched.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let clone_name = "mc06-cumulative-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for cumulative limit case",
+    );
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "git config identity",
+        );
+    }
+    let base_head = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "origin/main"],
+    );
+    // All commits share the seed tree: the chain exercises commit-count limits
+    // without packing 300 trees/blobs.
+    let seed_tree = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD^{tree}"],
+    );
+    let mut parent = base_head.clone();
+    for i in 1..=200 {
+        parent = git_stdout(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "commit-tree",
+                &seed_tree,
+                "-p",
+                &parent,
+                "-m",
+                &format!("mc06 cumulative {i}"),
+            ],
+        );
+    }
+    let tip200 = parent.clone();
+    let branch = format!("mc06-cumulative-{}", std::process::id());
+
+    let push200 = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("{tip200}:refs/heads/{branch}"),
+        ],
+    );
+    git_cli::assert_git_success(&push200, "the 200-commit push must pass the 250 bound");
+
+    let cls = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        cls.len(),
+        1,
+        "the 200-commit push must create exactly one CL: {cls:?}"
+    );
+    let cl = &cls[0];
+    assert_eq!(
+        cl.from_hash, base_head,
+        "CL from_hash must be the fork point"
+    );
+    assert_eq!(cl.to_hash, tip200, "CL to_hash must be the first push tip");
+    let cl_refs = cl_ref_rows(&env.database.db_url);
+    assert_eq!(
+        cl_refs.len(),
+        1,
+        "exactly one refs/cl/* must exist after the 200-commit push: {cl_refs:?}"
+    );
+
+    // Second push: another 100 commits on top of the first tip — the increment
+    // is legal, the cumulative range (300 > 250) is not.
+    let mut mid_commit = String::new();
+    for i in 201..=300 {
+        parent = git_stdout(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "commit-tree",
+                &seed_tree,
+                "-p",
+                &parent,
+                "-m",
+                &format!("mc06 cumulative {i}"),
+            ],
+        );
+        if i == 250 {
+            mid_commit = parent.clone();
+        }
+    }
+    let tip300 = parent.clone();
+    let push300 = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("{tip300}:refs/heads/{branch}"),
+        ],
+    );
+    assert!(
+        !push300.status.success(),
+        "the 200+100 cumulative overflow push must be rejected; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push300.status,
+        String::from_utf8_lossy(&push300.stdout),
+        String::from_utf8_lossy(&push300.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&push300.stdout),
+        String::from_utf8_lossy(&push300.stderr)
+    );
+    assert!(
+        combined.contains("cumulative limit"),
+        "cumulative rejection must name the limit; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("merge the current CL first or open a new CL"),
+        "cumulative rejection must be actionable; got:\n{combined}"
+    );
+
+    // The rejected push must not move the CL or its ref.
+    let cls_after = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        cls_after.len(),
+        1,
+        "the rejected push must not create a second CL"
+    );
+    assert_eq!(
+        cls_after[0].to_hash, tip200,
+        "the rejected push must not advance the CL to_hash"
+    );
+    let cl_refs_after = cl_ref_rows(&env.database.db_url);
+    assert_eq!(
+        cl_refs_after.len(),
+        1,
+        "the rejected push must not create a second CL ref: {cl_refs_after:?}"
+    );
+    assert_eq!(
+        cl_refs_after[0].1, tip200,
+        "the rejected push must not move the CL ref"
+    );
+
+    // Codex R1 P1-2 / R2: bindings follow acceptance — the accepted first
+    // chain's commits are bound, the rejected second chain's are not.
+    let bindings = commit_auth_rows(&env.database.db_url);
+    assert!(
+        bindings
+            .iter()
+            .any(|(s, u)| s == &tip200 && u.as_deref() == Some(git_cli::DEFAULT_GIT_AUTH_USER)),
+        "the accepted 200-commit tip must be bound to the pusher"
+    );
+    for sha in [&mid_commit, &tip300] {
+        assert!(
+            !bindings.iter().any(|(s, _)| s == sha),
+            "rejected chain commit {sha} must not be bound"
+        );
+    }
+
+    // Codex R2 P1-1 (sticky rejection): a verbatim retry of the rejected push
+    // re-carries the same 100 commits — all already stored from the rejected
+    // attempt, so nothing is newly introduced — and must be rejected
+    // identically, leaving CL, ref and bindings untouched.
+    let push_retry = git_cli::git_cli(
+        &env.case_dir,
+        &token,
+        &[
+            "-C",
+            clone_name,
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            &format!("{tip300}:refs/heads/{branch}"),
+        ],
+    );
+    assert!(
+        !push_retry.status.success(),
+        "a verbatim retry of the rejected push must be rejected (sticky); status={:?}\nstdout:\n{}\nstderr:\n{}",
+        push_retry.status,
+        String::from_utf8_lossy(&push_retry.stdout),
+        String::from_utf8_lossy(&push_retry.stderr)
+    );
+    // Codex R3 P2: the retry must fail with the *byte-identical* server
+    // diagnostic — not merely another message that mentions the limit.
+    let first_rejection = remote_rejected_lines(&push300);
+    let retry_rejection = remote_rejected_lines(&push_retry);
+    assert!(
+        !first_rejection.is_empty(),
+        "the first rejection must carry a server diagnostic line; stderr:\n{}",
+        String::from_utf8_lossy(&push300.stderr)
+    );
+    assert_eq!(
+        first_rejection, retry_rejection,
+        "a verbatim retry must fail with the byte-identical server diagnostic"
+    );
+    let cls_retry = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(cls_retry.len(), 1, "the retry must not create a second CL");
+    assert_eq!(
+        cls_retry[0].to_hash, tip200,
+        "the retry must not advance the CL"
+    );
+    let cl_refs_retry = cl_ref_rows(&env.database.db_url);
+    assert_eq!(cl_refs_retry.len(), 1, "the retry must not add a CL ref");
+    assert_eq!(
+        cl_refs_retry[0].1, tip200,
+        "the retry must not move the CL ref"
+    );
+    assert_eq!(
+        commit_auth_rows(&env.database.db_url),
+        bindings,
+        "the retry must not change commit_auths"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
 fn collect_git_configs(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -2350,6 +3433,225 @@ fn latest_cl_link_for_user(db_url: &str, username: &str) -> String {
             .expect("query latest CL link")
             .expect("CL row exists for admin push");
         row.try_get("", "link").expect("link column")
+    })
+}
+
+/// Run a git command expected to succeed and return its trimmed stdout.
+fn git_stdout(case_dir: &Path, token: &str, git_args: &[&str]) -> String {
+    let output = git_cli::git_cli(case_dir, token, git_args);
+    git_cli::assert_git_success(&output, &format!("git {}", git_args.join(" ")));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// One `mega_cl` row as the MC-06 assertions need it.
+#[derive(Debug)]
+struct ClRow {
+    link: String,
+    from_hash: String,
+    to_hash: String,
+    status: String,
+}
+
+/// All CL rows of a user on the root repo path, in creation order (MC-06 e2e:
+/// chain pushes must create/update exactly one CL).
+fn cl_rows_for_user(db_url: &str, username: &str) -> Vec<ClRow> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for CL rows: {err}"));
+        let username_sql = username.replace('\'', "''");
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT link, from_hash, to_hash, status::text AS status FROM mega_cl \
+                     WHERE username = '{username_sql}' AND path = '/' ORDER BY id"
+                ),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query CL rows: {err}"));
+        rows.iter()
+            .map(|row| ClRow {
+                link: row.try_get("", "link").expect("link column"),
+                from_hash: row.try_get("", "from_hash").expect("from_hash column"),
+                to_hash: row.try_get("", "to_hash").expect("to_hash column"),
+                status: row.try_get("", "status").expect("status column"),
+            })
+            .collect()
+    })
+}
+
+/// All `refs/cl/*` rows on the root repo path as `(ref_name, ref_commit_hash,
+/// ref_tree_hash)`, in name order (MC-06 e2e). Located by `is_cl` rather than
+/// by CL link: the push-side CL ref name is generated independently of the CL
+/// row's link (pre-existing behavior — see `fetch_or_new_cl_link` vs
+/// `create_new_cl`), so the two cannot be joined by name.
+fn cl_ref_rows(db_url: &str) -> Vec<(String, String, String)> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for CL ref rows: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT ref_name, ref_commit_hash, ref_tree_hash FROM mega_refs \
+                 WHERE path = '/' AND is_cl ORDER BY ref_name"
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query CL ref rows: {err}"));
+        rows.iter()
+            .map(|row| {
+                (
+                    row.try_get("", "ref_name").expect("ref_name column"),
+                    row.try_get("", "ref_commit_hash")
+                        .expect("ref_commit_hash column"),
+                    row.try_get("", "ref_tree_hash")
+                        .expect("ref_tree_hash column"),
+                )
+            })
+            .collect()
+    })
+}
+
+/// All `commit_auths` rows as `(commit_sha, matched_username)`, ordered by sha
+/// (Codex R1 P1-2 e2e pins: accepted chains bind their commits post-finalize;
+/// rejected pushes leave the table untouched).
+fn commit_auth_rows(db_url: &str) -> Vec<(String, Option<String>)> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for commit_auths: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT commit_sha, matched_username FROM commit_auths ORDER BY commit_sha"
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query commit_auths: {err}"));
+        rows.iter()
+            .map(|row| {
+                (
+                    row.try_get("", "commit_sha").expect("commit_sha column"),
+                    row.try_get("", "matched_username")
+                        .expect("matched_username column"),
+                )
+            })
+            .collect()
+    })
+}
+
+/// Full-row snapshot of `commit_auths`, each row formatted with every column
+/// and ordered by id (Codex R3 P1: an empty-pack idempotent re-push must leave
+/// every field — `matched_at` included — byte-identical).
+fn commit_auth_snapshot(db_url: &str) -> Vec<String> {
+    with_runtime(async {
+        let db = Database::connect(db_url).await.unwrap_or_else(|err| {
+            panic!("connect integration DB for commit_auths snapshot: {err}")
+        });
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT id, commit_sha, matched_username, is_anonymous, \
+                 matched_at::text AS matched_txt, created_at::text AS created_txt \
+                 FROM commit_auths ORDER BY id"
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("snapshot commit_auths: {err}"));
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("", "id").expect("id column");
+                let sha: String = row.try_get("", "commit_sha").expect("commit_sha column");
+                let user: Option<String> = row
+                    .try_get("", "matched_username")
+                    .expect("matched_username column");
+                let anon: bool = row
+                    .try_get("", "is_anonymous")
+                    .expect("is_anonymous column");
+                let matched: Option<String> = row.try_get("", "matched_txt").expect("matched_txt");
+                let created: Option<String> = row.try_get("", "created_txt").expect("created_txt");
+                format!("{id}|{sha}|{user:?}|{anon}|{matched:?}|{created:?}")
+            })
+            .collect()
+    })
+}
+
+/// The server's per-ref rejection lines from a failed push
+/// (`! [remote rejected] <ref> (<reason>)` on stderr) — Codex R3 P2: a
+/// verbatim retry must carry the byte-identical server diagnostic.
+fn remote_rejected_lines(output: &std::process::Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.contains("[remote rejected]"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `(ref_commit_hash, ref_tree_hash)` of one `mega_refs` row, if it exists.
+fn ref_commit_tree(db_url: &str, path: &str, ref_name: &str) -> Option<(String, String)> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for ref row: {err}"));
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT ref_commit_hash, ref_tree_hash FROM mega_refs \
+                     WHERE path = '{path}' AND ref_name = '{ref_name}'"
+                ),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query ref row {ref_name}: {err}"));
+        row.map(|row| {
+            (
+                row.try_get("", "ref_commit_hash").expect("ref_commit_hash"),
+                row.try_get("", "ref_tree_hash").expect("ref_tree_hash"),
+            )
+        })
+    })
+}
+
+/// Distinct `file_path` values stored for a blob id (MC-06 e2e: files
+/// introduced or renamed by non-first chain commits must be indexed).
+fn blob_file_paths(db_url: &str, blob_id: &str) -> Vec<String> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for blob rows: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT DISTINCT file_path FROM mega_blob WHERE blob_id = '{blob_id}'"),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query blob file_path for {blob_id}: {err}"));
+        rows.iter()
+            .map(|row| row.try_get("", "file_path").expect("file_path column"))
+            .collect()
+    })
+}
+
+/// Parsed `parents_id` of a `mega_commit` row (MC-06 e2e: the merge commit on
+/// `refs/heads/main` must be single-parent, ADR-MC-01).
+fn commit_parents(db_url: &str, commit_id: &str) -> Vec<String> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for commit row: {err}"));
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT parents_id::text AS parents FROM mega_commit WHERE commit_id = '{commit_id}'"),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query commit parents for {commit_id}: {err}"))
+            .unwrap_or_else(|| panic!("mega_commit row {commit_id} must exist"));
+        let parents: String = row.try_get("", "parents").expect("parents column");
+        serde_json::from_str(&parents)
+            .unwrap_or_else(|err| panic!("parse parents_id of {commit_id}: {err}"))
     })
 }
 

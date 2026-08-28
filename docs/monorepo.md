@@ -146,8 +146,18 @@
 ### PushChain：base/tip 的唯一事实源
 
 - MonoRepo receive-pack 的 push 语义状态是 `PushChain { base, tip, ordered_commits }`（`src/ceres/pack/push_chain.rs`），解包后由 `RefCommand.old_id/new_id` 加 tip commit 的 parent 链构建；**不得**从 pack 对象到达顺序推断 base/tip/归属。
-- `base` = `RefCommand.old_id`（新分支 push 即 `old_id` 为零值时取 tip 的第一个 parent），即 CL 的 `from_hash`；`tip` = `new_id` 对应的 commit，即 CL 的 `to_hash`。
-- CL ref（`refs/cl/<link>`）的 `ref_commit_hash` 与 `ref_tree_hash` 同源自 tip commit（`new_id` 及其 tree）；文件路径索引按 tip 的 tree 遍历。
+- `base` = `RefCommand.old_id`；新分支 push（`old_id` 为零值）时沿 tip 首父链反走，取第一个**非本 push 新引入**的 commit（fork point；unpack 时已存在于服务端的祖先——即便 pack 冗余携带——不构成链的一部分，Codex R1 P1-1）。`base` 即 CL 的 `from_hash`；`tip` = `new_id` 对应的 commit，即 CL 的 `to_hash`。
+- CL ref（`refs/cl/<link>`）的 `ref_commit_hash` 与 `ref_tree_hash` 同源自 tip commit（`new_id` 及其 tree）；文件路径索引按 tip 的 tree 遍历，链上任意 commit 引入/重命名的文件都在覆盖范围内。
+- finalize 先过接收闸门再写任何 ref/CL：多 branch 命令拒绝（ADR-MC-04）+ 链校验（MC-03 校验器，增量段复用 resolve 反走的结果不重复读库，历史段仅计数）+ 链外 junk commit 拒绝（pack 携带的每个 commit 必须落在 tip 的首父路径上；冗余携带的已知祖先在路径上故不误伤）。所有拒绝规则只基于 pack **内容**（presence），与 unpack 时的瞬时「新引入」状态无关——被拒 push 原样重试必被同样拒绝（粘性，Codex R2 P1-1）；失败时本 push 的全部 branch 命令以 `ng <ref> <原因>` 回报，对象落库保持 insert-only 语义（被拒 push 的新行是不可达垃圾，不改动既有行）。
+- commit 绑定（`commit_auths`）只在 finalize 成功之后写入，且仅覆盖已接受链中**本 push 新引入**的 commit——被拒 push 不得 upsert 绑定，无新引入的 push 不重绑存量（Codex R1 P1-2 / R2 P1-2）。
+
+### 多 commit 链式 push（MC-06 起放开）
+
+- 单次 push 允许携带 **2..=250 个 commit 的线性链**；每次链 push 恰好创建/更新**一个** CL，`from_hash` = 链 base 基线、`to_hash` = 链 tip（ADR-MC-02）。
+- 链必须是线性的：含 merge commit（双父）、parent 断链、环或 tip 与 ref 更新目标不符的 push 一律 fail-closed 拒绝，报错引导 rebase 成线性历史后重推（`PushChain::validate`，MC-03 落地、MC-06 接通到 receive-pack 主路径）。
+- 链长上限的单一口径 = **CL 累计范围** `(from_hash → to_hash)` ≤ `MAX_CL_CHAIN_COMMITS = 250`（ADR-MC-07）：对既有 open CL 的更新 push 除增量校验外还校验 `cl.from_hash → 新 tip` 的累计长度，超限在 push 阶段拒绝，文案引导「先合并当前 CL 或开新 CL / squash 后重推」。
+- 单次 receive-pack 携带多于一条非删除 branch 命令时**整体拒绝**，文案引导分次 push；删除命令不受影响（ADR-MC-04）。
+- trunk 侧不变（ADR-MC-01）：CL merge 仍由服务端合成**单父新 commit** 推进 `main`，不做向用户链的 fast-forward。
 
 ### 空 pack / 已知 `new_id` = 幂等 no-op（ADR-MC-05）
 
@@ -156,7 +166,7 @@
 ### 对象 `commit_id` 归属语义（ADR-MC-06）
 
 - `mega_tree` / `mega_blob` 的 `commit_id` 归属 = **链 tip**，语义为「该对象在本路径最后一次被某次 push 触及时的链 tip」。
-- 该字段存在**存活读取点**：文件浏览的「最后提交」列（`item_to_commit_map` → `tree_ops.rs` → `preview_router.rs`）。在单 commit/push 强约束下数值恰好正确（tip = 本次唯一 commit）；MC-06 放开多 commit push 后归属 = 链 tip 成为**近似语义**（已记录的非精确值，精确化属 DEFER-MC-03）。
+- 该字段存在**存活读取点**：文件浏览的「最后提交」列（`item_to_commit_map` → `tree_ops.rs` → `preview_router.rs`）。单 commit/push 强约束下数值恰好正确（tip = 本次唯一 commit）；多 commit push 放开后（MC-06 已生效）归属 = 链 tip，为**近似语义**（已记录的非精确值，精确化属 DEFER-MC-03）。
 - 任何新增读取该字段的功能必须先重审 ADR-MC-06（`docs/plan/plan-20260827.md`）。
 
 ### GPG 签名策略：逐 commit 链式验证（ADR-MC-03/08/09）
