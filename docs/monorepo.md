@@ -159,6 +159,13 @@
 - 该字段存在**存活读取点**：文件浏览的「最后提交」列（`item_to_commit_map` → `tree_ops.rs` → `preview_router.rs`）。在单 commit/push 强约束下数值恰好正确（tip = 本次唯一 commit）；MC-06 放开多 commit push 后归属 = 链 tip 成为**近似语义**（已记录的非精确值，精确化属 DEFER-MC-03）。
 - 任何新增读取该字段的功能必须先重审 ADR-MC-06（`docs/plan/plan-20260827.md`）。
 
+### GPG 签名策略：逐 commit 链式验证（ADR-MC-03/08/09）
+
+- CL 的 GPG 检查（`gpg_signature_checker`）对 `(from_hash, to_hash]` 链上**每个 commit** 逐一验签，不只验 tip；验签载荷 = 由持久化列确定性重建的完整 commit 字节（tree + parents + author + committer + message，剔除 `gpgsig` 块），与 `git verify-commit` 等价；篡改 tree/parent/author/committer 任一字段即验签失败。
+- 验签身份：从签名包解析 issuer fingerprint（hashed subpacket 须恰好解析出唯一值，缺失/多值/与 unhashed 冲突一律 fail-closed），反查 `gpg_key.fingerprint`（unique）定位 key 与所属用户；**不认 committer email，不回退 CL owner**。行为变化两处：**非 CL owner 的已注册用户签名可通过**；**未注册 key 的签名 fail-closed**。
+- 链长上限 `MAX_CL_CHAIN_COMMITS = 250`（CL 累计范围口径，ADR-MC-07），超限拒绝并提示拆分链；`from_hash` 不在链上（断链）fail-closed。
+- merge 门控（最小接通）：存在 `check_type_code=GpgSignature` 且 `status=FAILED` 检查结果的 CL 不得 merge；无任何检查行的 CL 不被阻断。
+
 ---
 
 ## 6. 交叉引用
@@ -169,6 +176,7 @@
 | HTTP Git CLI IT | `bin/tests/integration_git_cli.rs` |
 | Tag REST | `src/api/router/tag_router.rs` |
 | Push 状态模型 / `commit_id` 归属 | `src/ceres/pack/push_chain.rs`、`docs/plan/plan-20260827.md`（ADR-MC-05/06） |
+| GPG 链式验签与 merge 门控 | `src/ceres/merge_checker/gpg_signature_checker.rs`、`docs/plan/plan-20260827.md`（ADR-MC-03/07/08/09） |
 | 初始化实现 | `src/jupiter/service/mono_service.rs::init_monorepo`、`src/jupiter/utils/converter.rs` |
 | 配置样例 | `config/config.toml` `[monorepo]` |
 | 本地开发入口 | [`development.md`](./development.md) |

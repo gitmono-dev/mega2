@@ -20,6 +20,12 @@ mod code_review_checker;
 mod commit_message_checker;
 pub(crate) mod gpg_signature_checker;
 
+/// Upper bound of a CL's cumulative `(from_hash → to_hash)` commit range —
+/// the single meaning defined by ADR-MC-07. The receive side enforces the
+/// same bound on push (MC-03); the GPG signature checker keeps it as defense
+/// in depth while walking the parent chain.
+pub const MAX_CL_CHAIN_COMMITS: usize = 250;
+
 #[async_trait]
 pub trait Checker: Send + Sync {
     async fn run(&self, params: &serde_json::Value) -> CheckResult;

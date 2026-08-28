@@ -87,6 +87,32 @@ impl GpgStorage {
         Ok(())
     }
 
+    /// Look up a registered key by fingerprint (unique column), keeping
+    /// `list_user_gpg`'s expiry semantics (`expires_at` null or in the future).
+    ///
+    /// The query value must already be normalized to the storage format
+    /// (`format!("{:?}", fingerprint)` as in `create_key`).
+    pub async fn find_gpg_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<gpg_key::Model>, MegaError> {
+        let now = Utc::now().naive_utc();
+
+        gpg_key::Entity::find()
+            .filter(gpg_key::Column::Fingerprint.eq(fingerprint))
+            .filter(
+                Expr::col(gpg_key::Column::ExpiresAt)
+                    .is_null()
+                    .or(Expr::col(gpg_key::Column::ExpiresAt).gt(now)),
+            )
+            .one(self.get_connection())
+            .await
+            .map_err(|e| {
+                tracing::error!("{:?}", e);
+                MegaError::Other("Failed to look up GPG key by fingerprint".to_string())
+            })
+    }
+
     pub async fn list_user_gpg(&self, user_id: String) -> Result<Vec<gpg_key::Model>, MegaError> {
         let now = Utc::now().naive_utc();
 
@@ -125,4 +151,88 @@ fn test_create_key() {
     assert_eq!(key_id, "42FF407836735DBD");
     assert_eq!(fingerprint, "C59ED2DBB2531850A4F3E82942FF407836735DBD");
     assert!(expires_at.is_none());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sea_orm::{ActiveModelTrait, Set};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+
+    async fn expiry_test_storage() -> (TempDir, GpgStorage) {
+        let temp = TempDir::new().expect("temp dir");
+        let conn = test_db_connection(temp.path()).await;
+        apply_migrations(&conn, true).await.expect("migrations");
+        (
+            temp,
+            GpgStorage {
+                base: BaseStorage::new(Arc::new(conn)),
+            },
+        )
+    }
+
+    async fn insert_key_row(
+        storage: &GpgStorage,
+        fingerprint: &str,
+        expires_at: Option<chrono::NaiveDateTime>,
+    ) {
+        gpg_key::ActiveModel {
+            id: Set(generate_id()),
+            user_id: Set("expiry-user".to_string()),
+            key_id: Set(fingerprint[..16].to_string()),
+            public_key: Set("unused-for-expiry-test".to_string()),
+            fingerprint: Set(fingerprint.to_string()),
+            alias: Set("user-key".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            expires_at: Set(expires_at),
+        }
+        .insert(storage.get_connection())
+        .await
+        .expect("insert gpg_key row");
+    }
+
+    // Codex R1 P2-2: the fingerprint reverse lookup keeps `list_user_gpg`'s
+    // expiry semantics — expires_at NULL and future expire dates are hits, an
+    // already-expired key is not.
+    #[tokio::test]
+    async fn find_gpg_key_by_fingerprint_applies_expiry_filter() {
+        let (_temp, storage) = expiry_test_storage().await;
+        let now = Utc::now().naive_utc();
+
+        let no_expiry = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let future_expiry = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let expired = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        insert_key_row(&storage, no_expiry, None).await;
+        insert_key_row(&storage, future_expiry, Some(now + Duration::days(1))).await;
+        insert_key_row(&storage, expired, Some(now - Duration::days(1))).await;
+
+        assert!(
+            storage
+                .find_gpg_key_by_fingerprint(no_expiry)
+                .await
+                .expect("query")
+                .is_some(),
+            "expires_at NULL must be a hit"
+        );
+        assert!(
+            storage
+                .find_gpg_key_by_fingerprint(future_expiry)
+                .await
+                .expect("query")
+                .is_some(),
+            "a future expires_at must be a hit"
+        );
+        assert!(
+            storage
+                .find_gpg_key_by_fingerprint(expired)
+                .await
+                .expect("query")
+                .is_none(),
+            "an expired key must not be returned"
+        );
+    }
 }

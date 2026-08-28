@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
-use regex::Regex;
+use pgp::{
+    composed::{Deserializable, DetachedSignature, SignedPublicKey},
+    packet::{Signature, SubpacketData},
+};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    ceres::merge_checker::{CheckResult, CheckType, Checker, ConditionResult},
+    callisto::mega_commit,
+    ceres::merge_checker::{
+        CheckResult, CheckType, Checker, ConditionResult, MAX_CL_CHAIN_COMMITS,
+    },
     common::errors::MegaError,
     jupiter::{model::cl_dto::ClInfoDto, storage::Storage},
 };
@@ -18,8 +23,8 @@ pub struct GpgSignatureChecker {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GpgSignatureParams {
+    cl_from: String,
     cl_to: String,
-    committer: String,
 }
 
 impl GpgSignatureParams {
@@ -38,7 +43,7 @@ impl Checker for GpgSignatureChecker {
             message: String::new(),
         };
 
-        let is_verified = self.verify_cl(&params.cl_to, params.committer).await;
+        let is_verified = self.verify_cl(&params.cl_from, &params.cl_to).await;
         match is_verified {
             Ok(_) => {
                 res.status = ConditionResult::PASSED;
@@ -56,27 +61,111 @@ impl Checker for GpgSignatureChecker {
 
     async fn build_params(&self, cl_info: &ClInfoDto) -> Result<Value, MegaError> {
         Ok(serde_json::json!({
+            "cl_from": cl_info.from_hash,
             "cl_to": cl_info.to_hash,
-            "committer": cl_info.username,
         }))
     }
 }
 
 impl GpgSignatureChecker {
-    async fn verify_cl(&self, cl_to: &str, assignee: String) -> Result<(), MegaError> {
-        let commit = self
-            .storage
-            .mono_storage()
+    /// Verify every commit in the CL's cumulative range `(cl_from, cl_to]`
+    /// (ADR-MC-03): walk the first-parent chain from `cl_to` towards
+    /// `cl_from`; the walk must reach `cl_from` as the range boundary
+    /// (fail-closed otherwise) and is bounded by `MAX_CL_CHAIN_COMMITS`
+    /// (ADR-MC-07; the receive side enforces the same bound, this is defense
+    /// in depth). `cl_from` itself is the baseline, not a CL member, and is
+    /// not verified.
+    ///
+    /// The walk follows first parents only: the chain is assumed linear.
+    /// That assumption is enforced on the receive side, which rejects merge
+    /// commits on push (plan-20260827 MC-03; still in force once MC-06 opens
+    /// multi-commit pushes).
+    async fn verify_cl(&self, cl_from: &str, cl_to: &str) -> Result<(), MegaError> {
+        let storage = self.storage.mono_storage();
+        let mut current = storage
             .get_commit_by_hash(cl_to)
             .await?
-            .ok_or_else(|| MegaError::Other("Commit not found".to_string()))?;
+            .ok_or_else(|| MegaError::Other(format!("commit {cl_to} not found")))?;
 
-        let content = commit.content.clone().unwrap_or_default();
-        self.verify_commit_gpg_signature(&content, assignee).await?;
+        let mut verified = 0usize;
+        loop {
+            if verified >= MAX_CL_CHAIN_COMMITS {
+                return Err(MegaError::Other(format!(
+                    "CL chain exceeds the {MAX_CL_CHAIN_COMMITS}-commit limit \
+                     ({cl_from}..{cl_to}); merge the current CL first or squash and re-push"
+                )));
+            }
+            self.verify_commit_chain_member(&current)
+                .await
+                .map_err(|e| {
+                    MegaError::Other(format!("commit {}: {e}", sha_prefix(&current.commit_id)))
+                })?;
+            verified += 1;
 
+            if current.commit_id == cl_from {
+                // Degenerate empty range (from == to): the tip was verified, stop.
+                break;
+            }
+            let parents: Vec<String> =
+                serde_json::from_value(current.parents_id.clone()).map_err(|e| {
+                    MegaError::Other(format!(
+                        "corrupt parents_id for commit {}: {e}",
+                        current.commit_id
+                    ))
+                })?;
+            match parents.first() {
+                // The base is the range boundary, not a CL member: stop before it.
+                Some(parent) if parent == cl_from => break,
+                Some(parent) => {
+                    current = storage
+                        .get_commit_by_hash(parent)
+                        .await?
+                        .ok_or_else(|| MegaError::Other(broken_chain_message(cl_from, cl_to)))?;
+                }
+                None => return Err(MegaError::Other(broken_chain_message(cl_from, cl_to))),
+            }
+        }
         Ok(())
     }
 
+    /// Verify one chain member. Keyring selection follows ADR-MC-08 step ①:
+    /// the signature's issuer fingerprint (resolved fail-closed from the
+    /// hashed subpacket area) selects the registered key — no fallback to the
+    /// CL owner or any externally supplied identity. The payload is the
+    /// canonical full commit byte stream rebuilt from the persisted columns
+    /// (ADR-MC-09), not just the message.
+    async fn verify_commit_chain_member(
+        &self,
+        commit: &mega_commit::Model,
+    ) -> Result<(), MegaError> {
+        let raw = rebuild_canonical_commit_bytes(commit)?;
+        let (payload, signature) = extract_from_commit_content(&raw);
+        let Some(signature) = signature else {
+            return Err(MegaError::Other("no GPG signature found".to_string()));
+        };
+
+        let sig = DetachedSignature::from_string(&signature)
+            .map_err(|e| MegaError::Other(format!("failed to parse signature: {e}")))?
+            .0;
+        let fingerprint = resolve_issuer_fingerprint(&sig.signature)?;
+
+        let key = self
+            .storage
+            .gpg_storage()
+            .find_gpg_key_by_fingerprint(&fingerprint)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other("signature issuer key is not registered to any user".to_string())
+            })?;
+
+        self.verify_signature_with_key(&key.public_key, &signature, &payload)
+            .await
+    }
+
+    /// Legacy commit-badge path (consumer: `api_service::commit_ops.rs`,
+    /// cache key `gpg_status:v1`): verifies the message-only payload against
+    /// the given user's keyring. The merge gate deliberately does not use it;
+    /// see `verify_commit_chain_member` (ADR-MC-08/09).
     pub(crate) async fn verify_commit_gpg_signature(
         &self,
         commit_content: &str,
@@ -128,51 +217,164 @@ impl GpgSignatureChecker {
     }
 }
 
-fn normalize_signature_block(sig_block: &str) -> String {
-    let mut lines = Vec::new();
-    for (i, line) in sig_block.lines().enumerate() {
-        if i == 0 {
-            lines.push(line.trim_start_matches("gpgsig ").to_string());
-        } else {
-            lines.push(line.trim_start().to_string());
-        }
-    }
-    lines.join("\n") + "\n"
+fn sha_prefix(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
 }
 
+/// The walk reached the chain root (or a gap in storage) without meeting the
+/// CL base: the range is not a contiguous chain.
+fn broken_chain_message(cl_from: &str, cl_to: &str) -> String {
+    format!(
+        "broken commit chain: {cl_from} is not an ancestor of {cl_to}. \
+         This can happen when an open CL for the same path and user was rebased or \
+         diverged; close or update that CL (or rebase onto its base) and re-push"
+    )
+}
+
+/// Rebuild the canonical full commit bytes from the persisted `mega_commit`
+/// columns (ADR-MC-09): `tree {tree}\n`, one `parent {id}\n` per `parents_id`
+/// entry in stored order, then the author and committer lines (the columns
+/// already carry the `author `/`committer ` prefixes — git-internal
+/// `Signature::to_data`), then `content` verbatim (which holds the `gpgsig`
+/// block for signed commits). `extract_from_commit_content` strips the
+/// signature block from this byte stream, yielding exactly the payload git
+/// signed.
+pub(crate) fn rebuild_canonical_commit_bytes(
+    commit: &mega_commit::Model,
+) -> Result<String, MegaError> {
+    let parents: Vec<String> = serde_json::from_value(commit.parents_id.clone()).map_err(|e| {
+        MegaError::Other(format!(
+            "corrupt parents_id for commit {}: {e}",
+            commit.commit_id
+        ))
+    })?;
+    let mut raw = String::from("tree ");
+    raw.push_str(&commit.tree);
+    raw.push('\n');
+    for parent in parents {
+        raw.push_str("parent ");
+        raw.push_str(&parent);
+        raw.push('\n');
+    }
+    raw.push_str(commit.author.as_deref().unwrap_or_default());
+    raw.push('\n');
+    raw.push_str(commit.committer.as_deref().unwrap_or_default());
+    raw.push('\n');
+    raw.push_str(commit.content.as_deref().unwrap_or_default());
+    Ok(raw)
+}
+
+/// Resolve the signature's issuer fingerprint, fail-closed (ADR-MC-08):
+/// exactly one `IssuerFingerprint` subpacket in the hashed area, and every
+/// unhashed occurrence must agree with it. The returned string is normalized
+/// to the `gpg_key.fingerprint` storage format (`format!("{:?}", ..)`, see
+/// `GpgStorage::create_key`).
+fn resolve_issuer_fingerprint(sig: &Signature) -> Result<String, MegaError> {
+    let config = sig
+        .config()
+        .ok_or_else(|| MegaError::Other("unsupported signature packet".to_string()))?;
+    let hashed: Vec<_> = config
+        .hashed_subpackets()
+        .filter_map(|sp| match &sp.data {
+            SubpacketData::IssuerFingerprint(fp) => Some(fp),
+            _ => None,
+        })
+        .collect();
+    let unhashed: Vec<_> = config
+        .unhashed_subpackets()
+        .filter_map(|sp| match &sp.data {
+            SubpacketData::IssuerFingerprint(fp) => Some(fp),
+            _ => None,
+        })
+        .collect();
+
+    let [issuer] = hashed.as_slice() else {
+        return Err(MegaError::Other(format!(
+            "signature must carry exactly one issuer fingerprint in its hashed area \
+             (found {})",
+            hashed.len()
+        )));
+    };
+    if unhashed.iter().any(|fp| fp != issuer) {
+        return Err(MegaError::Other(
+            "unhashed issuer fingerprint conflicts with the hashed one".to_string(),
+        ));
+    }
+    Ok(format!("{issuer:?}"))
+}
+
+/// Split a full commit byte stream (or a bare `content` column value, whose
+/// header region is its start up to the first empty line) into the payload
+/// git signed and the detached armor carried by its `gpgsig` header.
+///
+/// The `gpgsig` header is recognized only inside the header region — the
+/// lines before the first *empty* (zero-character) line — mirroring git:
+/// an armor block forged inside the message body is not a signature and
+/// leaves the commit unsigned (fail-closed). Header continuation lines carry
+/// exactly one leading space, which is stripped; the armor's internal blank
+/// line arrives as a single-space continuation `" "`, never as an empty
+/// line, so it cannot be mistaken for the header/body boundary. The header
+/// line and its continuations are removed from the payload, which then keeps
+/// git's canonical shape (remaining headers, blank line, message).
 pub(crate) fn extract_from_commit_content(msg_gpg: &str) -> (String, Option<String>) {
-    const SIG_PATTERN: &str = r"gpgsig (-----BEGIN (?:PGP|SSH) SIGNATURE-----[\s\S]*?-----END (?:PGP|SSH) SIGNATURE-----)";
-    let sig_regex = Regex::new(SIG_PATTERN).unwrap();
+    const GPGSIG_PREFIX: &str = "gpgsig ";
 
-    if let Some(caps) = sig_regex.captures(msg_gpg) {
-        let signature = caps.get(1).unwrap().as_str().to_string();
-        let signature = format!("{signature}\n");
-        let start = caps.get(0).unwrap().start();
-        let end = caps.get(0).unwrap().end();
+    let mut payload = String::with_capacity(msg_gpg.len());
+    let mut signature: Option<String> = None;
+    let mut in_header = true;
+    let mut in_gpgsig_continuation = false;
 
-        let mut commit = String::new();
-        commit.push_str(&msg_gpg[..start.saturating_sub(1)]);
-        commit.push_str(&msg_gpg[end..]);
+    for line in msg_gpg.split_inclusive('\n') {
+        let text = line.strip_suffix('\n').unwrap_or(line);
 
-        while commit.starts_with('\n') {
-            commit = commit[1..].to_string();
+        if in_gpgsig_continuation {
+            match text.strip_prefix(' ') {
+                Some(continuation) => {
+                    if let Some(sig) = signature.as_mut() {
+                        sig.push('\n');
+                        sig.push_str(continuation);
+                    }
+                    continue;
+                }
+                None => in_gpgsig_continuation = false,
+            }
         }
-        // Add a trailing newline if not present
-        let commit = if commit.ends_with('\n') {
-            commit
-        } else {
-            format!("{commit}\n")
-        };
 
-        (commit, Some(normalize_signature_block(&signature)))
-    } else {
-        (msg_gpg.to_string(), None)
+        if in_header {
+            if text.is_empty() {
+                in_header = false;
+            } else if signature.is_none()
+                && let Some(value) = text.strip_prefix(GPGSIG_PREFIX)
+            {
+                signature = Some(value.to_string());
+                in_gpgsig_continuation = true;
+                continue;
+            }
+        }
+
+        payload.push_str(line);
     }
+
+    let Some(mut signature) = signature else {
+        return (msg_gpg.to_string(), None);
+    };
+    signature.push('\n');
+
+    // Historical payload shape (locked by `test_commits_verification` and the
+    // badge path): leading newlines left by a removed first header line are
+    // stripped, and the payload always ends with exactly one newline.
+    let mut payload = payload.trim_start_matches('\n').to_string();
+    if !payload.ends_with('\n') {
+        payload.push('\n');
+    }
+    (payload, Some(signature))
 }
 
-#[test]
-fn test_commits_verification() {
-    let cm = r#"tree 52a266a58f2c028ad7de4dfd3a72fdf76b0d4e24
+/// Real GnuPG-signed commit in git object byte format — the external format
+/// anchor shared by `test_commits_verification` and the full-chain
+/// `real_git_signed_commit_passes_full_chain` test. Do not edit the bytes.
+#[cfg(test)]
+const REAL_SIGNED_COMMIT: &str = r#"tree 52a266a58f2c028ad7de4dfd3a72fdf76b0d4e24
 author AidCheng <cn.aiden.cheng@gmail.com> 1758211153 +0100
 committer AidCheng <cn.aiden.cheng@gmail.com> 1758211153 +0100
 gpgsig -----BEGIN PGP SIGNATURE-----
@@ -193,6 +395,10 @@ gpgsig -----BEGIN PGP SIGNATURE-----
 test
 
 Signed-off-by: AidCheng <cn.aiden.cheng@gmail.com>"#;
+
+#[test]
+fn test_commits_verification() {
+    let cm = REAL_SIGNED_COMMIT;
     let (msg, sig) = extract_from_commit_content(cm);
     let sig = sig.expect("unable to parse");
     println!("{msg}\n{sig}");
@@ -228,7 +434,21 @@ jjI4Ah4p
 "#
     );
 
-    let pk = r#"-----BEGIN PGP PUBLIC KEY BLOCK-----
+    let pk = REAL_PUBLIC_KEY;
+    let pub_key = SignedPublicKey::from_string(pk)
+        .expect("unable to parse key")
+        .0;
+    let sig = DetachedSignature::from_string(&sig)
+        .expect("unable to parse sig")
+        .0;
+    let bytes = msg.as_bytes();
+    sig.verify(&pub_key, bytes).expect("unable to verify");
+}
+
+/// The public key matching `REAL_SIGNED_COMMIT`'s GnuPG signature.
+/// Do not edit the bytes.
+#[cfg(test)]
+const REAL_PUBLIC_KEY: &str = r#"-----BEGIN PGP PUBLIC KEY BLOCK-----
 
 mQGNBGiGkcsBDADDQzGo993e+e/6h5lvYGtPt2kSHAmGIXyzeNUsePfEE2lewNLl
 uAnAUR56A5vxyV0zER1F8Sp2OGXola/x6yT86c0ZRQ6nItMojYTKJUfcy7o56F9Z
@@ -271,12 +491,903 @@ F5MtAwnDBeT2Qg==
 =Q/C5
 -----END PGP PUBLIC KEY BLOCK-----
 "#;
-    let pub_key = SignedPublicKey::from_string(pk)
-        .expect("unable to parse key")
-        .0;
-    let sig = DetachedSignature::from_string(&sig)
-        .expect("unable to parse sig")
-        .0;
-    let bytes = msg.as_bytes();
-    sig.verify(&pub_key, bytes).expect("unable to verify");
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use pgp::{
+        composed::{
+            ArmorOptions, KeyType, SecretKeyParamsBuilder, SignedSecretKey, SubpacketConfig,
+        },
+        crypto::hash::HashAlgorithm,
+        packet::Subpacket,
+        types::{KeyDetails, KeyVersion, Password, Timestamp},
+    };
+    use sea_orm::{ActiveModelTrait, Set};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        callisto::sea_orm_active_enums::MergeStatusEnum,
+        jupiter::{
+            model::cl_dto::ClInfoDto, storage::base_storage::StorageConnector, tests::test_storage,
+        },
+    };
+
+    const AUTHOR: &str = "author Test User <test@example.com> 1750000000 +0000";
+    const COMMITTER: &str = "committer Test User <test@example.com> 1750000000 +0000";
+
+    fn sha(n: u64) -> String {
+        format!("{n:040x}")
+    }
+
+    fn generate_key(uid: &str) -> SignedSecretKey {
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .version(KeyVersion::V4)
+            .key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(true)
+            .primary_user_id(uid.into());
+        params
+            .build()
+            .expect("key params")
+            .generate(rand08::thread_rng())
+            .expect("generate key")
+    }
+
+    fn public_key_armored(key: &SignedSecretKey) -> String {
+        SignedPublicKey::from(key.clone())
+            .to_armored_string(ArmorOptions::default())
+            .expect("armor public key")
+    }
+
+    fn sign_payload(key: &SignedSecretKey, payload: &str, subpackets: SubpacketConfig) -> String {
+        DetachedSignature::sign_binary_data_with_subpackets(
+            rand08::thread_rng(),
+            &key.primary_key,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            payload.as_bytes(),
+            subpackets,
+        )
+        .expect("sign payload")
+        .to_armored_string(ArmorOptions::default())
+        .expect("armor signature")
+    }
+
+    /// The exact byte stream git signs: headers (tree, parents, author,
+    /// committer), a blank line, then the message.
+    fn canonical_payload(tree: &str, parents: &[String], message: &str) -> String {
+        let mut payload = format!("tree {tree}\n");
+        for parent in parents {
+            payload.push_str("parent ");
+            payload.push_str(parent);
+            payload.push('\n');
+        }
+        payload.push_str(AUTHOR);
+        payload.push('\n');
+        payload.push_str(COMMITTER);
+        payload.push('\n');
+        payload.push('\n');
+        payload.push_str(message);
+        if !payload.ends_with('\n') {
+            payload.push('\n');
+        }
+        payload
+    }
+
+    /// Embed an armored detached signature into the commit the way git does:
+    /// a `gpgsig ` header whose continuation lines are space-prefixed, then a
+    /// blank line and the message. This is what the `content` column holds
+    /// for a signed commit (git-internal `Commit.message` keeps the gpgsig
+    /// block).
+    fn signed_content(message: &str, armored_sig: &str) -> String {
+        let mut content = String::from("gpgsig ");
+        for (i, line) in armored_sig.trim_end_matches('\n').lines().enumerate() {
+            if i > 0 {
+                content.push(' ');
+            }
+            content.push_str(line);
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(message);
+        content
+    }
+
+    fn commit_model(
+        id: i64,
+        commit_sha: &str,
+        tree: &str,
+        parents: &[String],
+        content: Option<String>,
+    ) -> mega_commit::Model {
+        mega_commit::Model {
+            id,
+            commit_id: commit_sha.to_string(),
+            tree: tree.to_string(),
+            parents_id: serde_json::json!(parents),
+            author: Some(AUTHOR.to_string()),
+            committer: Some(COMMITTER.to_string()),
+            content,
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    /// Sign `message` over the canonical payload of the described commit and
+    /// return the persistable model. Asserts the ADR-MC-09 round-trip:
+    /// rebuilding the commit bytes from the persisted columns and stripping
+    /// the gpgsig block reproduces exactly the signed payload.
+    fn make_signed_commit(
+        key: &SignedSecretKey,
+        id: i64,
+        commit_sha: &str,
+        tree: &str,
+        parents: &[String],
+        message: &str,
+        subpackets: SubpacketConfig,
+    ) -> mega_commit::Model {
+        let payload = canonical_payload(tree, parents, message);
+        let armored = sign_payload(key, &payload, subpackets);
+        let model = commit_model(
+            id,
+            commit_sha,
+            tree,
+            parents,
+            Some(signed_content(message, &armored)),
+        );
+        let raw = rebuild_canonical_commit_bytes(&model).expect("rebuild commit bytes");
+        let (extracted, sig) = extract_from_commit_content(&raw);
+        assert!(sig.is_some(), "embedded signature must be extractable");
+        assert_eq!(
+            extracted, payload,
+            "rebuilt-and-stripped commit must equal the signed payload"
+        );
+        model
+    }
+
+    async fn setup_checker() -> (TempDir, Arc<Storage>, GpgSignatureChecker) {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = Arc::new(test_storage(temp.path()).await);
+        let checker = GpgSignatureChecker {
+            storage: storage.clone(),
+        };
+        (temp, storage, checker)
+    }
+
+    async fn insert_commit(storage: &Storage, model: &mega_commit::Model) {
+        mega_commit::ActiveModel {
+            id: Set(model.id),
+            commit_id: Set(model.commit_id.clone()),
+            tree: Set(model.tree.clone()),
+            parents_id: Set(model.parents_id.clone()),
+            author: Set(model.author.clone()),
+            committer: Set(model.committer.clone()),
+            content: Set(model.content.clone()),
+            created_at: Set(model.created_at),
+            pack_id: Set(model.pack_id.clone()),
+            pack_offset: Set(model.pack_offset),
+        }
+        .insert(storage.mono_storage().get_connection())
+        .await
+        .expect("insert commit");
+    }
+
+    async fn register_key(storage: &Storage, user: &str, key: &SignedSecretKey) {
+        storage
+            .gpg_storage()
+            .add_gpg_key(user.to_string(), public_key_armored(key))
+            .await
+            .expect("register key");
+    }
+
+    fn cl_info(from: &str, to: &str, owner: &str) -> ClInfoDto {
+        ClInfoDto {
+            link: "CLGPG001".to_string(),
+            title: "gpg test".to_string(),
+            merge_date: None,
+            status: MergeStatusEnum::Open,
+            path: "/".to_string(),
+            from_hash: from.to_string(),
+            to_hash: to.to_string(),
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+            username: owner.to_string(),
+        }
+    }
+
+    // AC①: a commit signed over the full commit bytes verifies when the
+    // payload is rebuilt from the persisted columns.
+    #[tokio::test]
+    async fn single_commit_signed_over_full_payload_passes() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1000);
+        let tip = sha(1001);
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9001),
+            std::slice::from_ref(&base),
+            "feat: signed commit",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &commit).await;
+
+        checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect("chain verification must pass");
+    }
+
+    // AC①: the same scenario driven through the checker framework entry
+    // points keeps the pre-chain behavior for a chain of length 1 (AC⑥).
+    #[tokio::test]
+    async fn single_commit_chain_compat_owner_signed_passes_via_run() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1010);
+        let tip = sha(1011);
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9011),
+            std::slice::from_ref(&base),
+            "feat: owner signed",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &commit).await;
+
+        let cl = cl_info(&base, &tip, "alice");
+        let params = checker.build_params(&cl).await.expect("build params");
+        let res = checker.run(&params).await;
+        assert_eq!(res.status, ConditionResult::PASSED);
+    }
+
+    // AC⑥: an unsigned single-commit CL fails, as before the change.
+    #[tokio::test]
+    async fn single_commit_chain_unsigned_fails_via_run() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1020);
+        let tip = sha(1021);
+        let commit = commit_model(
+            1,
+            &tip,
+            &sha(9021),
+            std::slice::from_ref(&base),
+            Some("feat: unsigned".to_string()),
+        );
+        insert_commit(&storage, &commit).await;
+
+        let cl = cl_info(&base, &tip, "alice");
+        let params = checker.build_params(&cl).await.expect("build params");
+        let res = checker.run(&params).await;
+        assert_eq!(res.status, ConditionResult::FAILED);
+        assert!(
+            res.message.contains(&tip[..7]),
+            "failure message must carry the failing commit sha prefix: {}",
+            res.message
+        );
+    }
+
+    // AC①: tampering with the persisted tree invalidates the signature.
+    #[tokio::test]
+    async fn tampered_tree_fails_verification() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1030);
+        let tip = sha(1031);
+        let mut commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9031),
+            std::slice::from_ref(&base),
+            "feat: tree binding",
+            SubpacketConfig::Default,
+        );
+        commit.tree = sha(9999);
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("tampered tree must fail");
+        assert!(err.to_string().contains(&tip[..7]), "{err}");
+    }
+
+    // AC①: tampering with the persisted parent list invalidates the signature.
+    #[tokio::test]
+    async fn tampered_parent_fails_verification() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1040);
+        let tip = sha(1041);
+        let mut commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9041),
+            std::slice::from_ref(&base),
+            "feat: parent binding",
+            SubpacketConfig::Default,
+        );
+        commit.parents_id = serde_json::json!([sha(8888)]);
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("tampered parents must fail");
+        assert!(err.to_string().contains(&tip[..7]), "{err}");
+    }
+
+    // AC①: tampering with the persisted author header invalidates the signature.
+    #[tokio::test]
+    async fn tampered_author_fails_verification() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1050);
+        let tip = sha(1051);
+        let mut commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9051),
+            std::slice::from_ref(&base),
+            "feat: author binding",
+            SubpacketConfig::Default,
+        );
+        commit.author = Some("author Mallory <mallory@example.com> 1750000000 +0000".to_string());
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("tampered author must fail");
+        assert!(err.to_string().contains(&tip[..7]), "{err}");
+    }
+
+    // AC①: tampering with the persisted committer header invalidates the signature.
+    #[tokio::test]
+    async fn tampered_committer_fails_verification() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1060);
+        let tip = sha(1061);
+        let mut commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9061),
+            std::slice::from_ref(&base),
+            "feat: committer binding",
+            SubpacketConfig::Default,
+        );
+        commit.committer =
+            Some("committer Mallory <mallory@example.com> 1750000001 +0000".to_string());
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("tampered committer must fail");
+        assert!(err.to_string().contains(&tip[..7]), "{err}");
+    }
+
+    // AC②: the keyring is selected by issuer fingerprint, so a commit signed
+    // by a registered user who is not the CL owner passes.
+    #[tokio::test]
+    async fn non_owner_registered_key_passes() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("bob <bob@example.com>");
+        register_key(&storage, "bob", &key).await;
+
+        let base = sha(1070);
+        let tip = sha(1071);
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9071),
+            std::slice::from_ref(&base),
+            "feat: bob signed alice's CL",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &commit).await;
+
+        let cl = cl_info(&base, &tip, "alice");
+        let params = checker.build_params(&cl).await.expect("build params");
+        let res = checker.run(&params).await;
+        assert_eq!(res.status, ConditionResult::PASSED);
+    }
+
+    // AC②: a signature from an unregistered key is fail-closed (no fallback).
+    #[tokio::test]
+    async fn unregistered_key_is_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("mallory <mallory@example.com>");
+
+        let base = sha(1080);
+        let tip = sha(1081);
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9081),
+            std::slice::from_ref(&base),
+            "feat: unknown key",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("unregistered key must fail");
+        assert!(err.to_string().contains("not registered"), "{err}");
+    }
+
+    // AC② (0 of the 0/1/many states): no issuer fingerprint subpacket in the
+    // hashed area is fail-closed even though the signature itself is valid.
+    #[tokio::test]
+    async fn missing_issuer_fingerprint_is_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1090);
+        let tip = sha(1091);
+        let hashed = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now()))
+                .expect("subpacket"),
+        ];
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9091),
+            std::slice::from_ref(&base),
+            "feat: no issuer fingerprint",
+            SubpacketConfig::UserDefined {
+                hashed,
+                unhashed: vec![],
+            },
+        );
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("missing issuer fingerprint must fail");
+        assert!(
+            err.to_string().contains("exactly one issuer fingerprint"),
+            "{err}"
+        );
+    }
+
+    // AC② (many): two issuer fingerprint subpackets in the hashed area are
+    // fail-closed even though the signature itself is valid.
+    #[tokio::test]
+    async fn multiple_issuer_fingerprints_are_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+        let other = generate_key("carol <carol@example.com>");
+
+        let base = sha(1100);
+        let tip = sha(1101);
+        let hashed = vec![
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                SignedPublicKey::from(key.clone()).fingerprint(),
+            ))
+            .expect("subpacket"),
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now()))
+                .expect("subpacket"),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                SignedPublicKey::from(other.clone()).fingerprint(),
+            ))
+            .expect("subpacket"),
+        ];
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9101),
+            std::slice::from_ref(&base),
+            "feat: two issuer fingerprints",
+            SubpacketConfig::UserDefined {
+                hashed,
+                unhashed: vec![],
+            },
+        );
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("multiple issuer fingerprints must fail");
+        assert!(
+            err.to_string().contains("exactly one issuer fingerprint"),
+            "{err}"
+        );
+    }
+
+    // AC②: an unhashed issuer fingerprint conflicting with the hashed one is
+    // fail-closed.
+    #[tokio::test]
+    async fn conflicting_unhashed_issuer_fingerprint_is_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+        let other = generate_key("carol <carol@example.com>");
+
+        let base = sha(1110);
+        let tip = sha(1111);
+        let hashed = vec![
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                SignedPublicKey::from(key.clone()).fingerprint(),
+            ))
+            .expect("subpacket"),
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now()))
+                .expect("subpacket"),
+        ];
+        let unhashed = vec![
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                SignedPublicKey::from(other.clone()).fingerprint(),
+            ))
+            .expect("subpacket"),
+        ];
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9111),
+            std::slice::from_ref(&base),
+            "feat: conflicting issuer fingerprints",
+            SubpacketConfig::UserDefined { hashed, unhashed },
+        );
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("conflicting unhashed issuer fingerprint must fail");
+        assert!(err.to_string().contains("conflicts"), "{err}");
+    }
+
+    // AC①/AC③: every commit in a multi-commit chain is verified, and the
+    // failure names the offending commit.
+    #[tokio::test]
+    async fn multi_commit_chain_fails_at_the_unsigned_member() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1200);
+        let mid = sha(1201);
+        let tip = sha(1202);
+        let tip_commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9202),
+            std::slice::from_ref(&mid),
+            "feat: tip signed",
+            SubpacketConfig::Default,
+        );
+        let mid_commit = commit_model(2, &mid, &sha(9201), std::slice::from_ref(&base), None);
+        insert_commit(&storage, &tip_commit).await;
+        insert_commit(&storage, &mid_commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("unsigned middle commit must fail the chain");
+        assert!(err.to_string().contains(&mid[..7]), "{err}");
+    }
+
+    // AC⑤: `from_hash` not on the parent chain is fail-closed, and the error
+    // explains the regular trigger path (an open CL for the same path+user
+    // whose frozen base is no longer an ancestor) and the remediation.
+    #[tokio::test]
+    async fn from_hash_not_on_chain_is_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let real_base = sha(1300);
+        let tip = sha(1301);
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9301),
+            std::slice::from_ref(&real_base),
+            "feat: rebased chain",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &commit).await;
+        // The chain root: no parents, so the walk terminates here without
+        // ever meeting the (stale) `cl_from`. It must still carry a valid
+        // signature — every walked commit is verified before its parents are
+        // followed, so only a signed root lets the walk reach the
+        // broken-chain branch.
+        let root = make_signed_commit(
+            &key,
+            2,
+            &real_base,
+            &sha(9300),
+            &[],
+            "feat: chain root",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &root).await;
+
+        let stale_from = sha(7777);
+        let err = checker
+            .verify_cl(&stale_from, &tip)
+            .await
+            .expect_err("a from_hash outside the chain must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("broken commit chain"), "{msg}");
+        assert!(msg.contains("same path and user"), "{msg}");
+    }
+
+    // AC④: the cumulative range limit — 250 commits pass, 251 are rejected.
+    #[tokio::test]
+    async fn chain_at_limit_passes_and_over_limit_is_rejected() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        // Build one chain of MAX_CL_CHAIN_COMMITS + 1 signed commits;
+        // sha(2000) is the base, sha(2001..=2251) are CL members.
+        let base = sha(2000);
+        for i in 1..=(MAX_CL_CHAIN_COMMITS as u64 + 1) {
+            let commit_sha = sha(2000 + i);
+            let parent = sha(2000 + i - 1);
+            let commit = make_signed_commit(
+                &key,
+                i as i64,
+                &commit_sha,
+                &sha(9900 + i),
+                std::slice::from_ref(&parent),
+                &format!("feat: chain member {i}"),
+                SubpacketConfig::Default,
+            );
+            insert_commit(&storage, &commit).await;
+        }
+
+        let at_limit_tip = sha(2000 + MAX_CL_CHAIN_COMMITS as u64);
+        checker
+            .verify_cl(&base, &at_limit_tip)
+            .await
+            .expect("a chain at the limit must pass");
+
+        let over_limit_tip = sha(2001 + MAX_CL_CHAIN_COMMITS as u64);
+        let err = checker
+            .verify_cl(&base, &over_limit_tip)
+            .await
+            .expect_err("a chain over the limit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("{MAX_CL_CHAIN_COMMITS}-commit limit")),
+            "{msg}"
+        );
+        assert!(msg.contains("squash"), "{msg}");
+    }
+
+    // Codex R1 P1-2: the real GnuPG-signed commit from the format-anchor
+    // fixture, decomposed into `mega_commit` columns and verified through the
+    // production path (rebuild → extract → issuer fingerprint lookup →
+    // verify) — an external, non-self-referential anchor for the commit-byte
+    // reconstruction.
+    #[tokio::test]
+    async fn real_git_signed_commit_passes_full_chain() {
+        let (_temp, storage, checker) = setup_checker().await;
+        storage
+            .gpg_storage()
+            .add_gpg_key("aidcheng".to_string(), REAL_PUBLIC_KEY.to_string())
+            .await
+            .expect("register the real fixture key");
+
+        // The `content` column of a signed commit holds the gpgsig block and
+        // the message (git-internal keeps the signature in `Commit.message`).
+        let content = &REAL_SIGNED_COMMIT[REAL_SIGNED_COMMIT
+            .find("gpgsig ")
+            .expect("fixture carries a gpgsig header")..];
+        let tip = sha(3001);
+        let commit = mega_commit::Model {
+            author: Some("author AidCheng <cn.aiden.cheng@gmail.com> 1758211153 +0100".to_string()),
+            committer: Some(
+                "committer AidCheng <cn.aiden.cheng@gmail.com> 1758211153 +0100".to_string(),
+            ),
+            ..commit_model(
+                1,
+                &tip,
+                "52a266a58f2c028ad7de4dfd3a72fdf76b0d4e24",
+                &[],
+                Some(content.to_string()),
+            )
+        };
+        insert_commit(&storage, &commit).await;
+
+        // External anchor: the persisted columns rebuild to the exact git
+        // object bytes, and stripping the gpgsig header yields the payload
+        // git signed, byte-for-byte (the same expectation the format-anchor
+        // test locks).
+        let raw = rebuild_canonical_commit_bytes(&commit).expect("rebuild commit bytes");
+        assert_eq!(raw, REAL_SIGNED_COMMIT);
+        let (payload, signature) = extract_from_commit_content(&raw);
+        assert!(signature.is_some());
+        assert_eq!(
+            payload,
+            "tree 52a266a58f2c028ad7de4dfd3a72fdf76b0d4e24\n\
+             author AidCheng <cn.aiden.cheng@gmail.com> 1758211153 +0100\n\
+             committer AidCheng <cn.aiden.cheng@gmail.com> 1758211153 +0100\n\
+             \ntest\n\nSigned-off-by: AidCheng <cn.aiden.cheng@gmail.com>\n"
+        );
+
+        // from == to (degenerate range): the tip is verified once.
+        checker
+            .verify_cl(&tip, &tip)
+            .await
+            .expect("the real GnuPG signature must verify through the full chain");
+    }
+
+    // Codex R1 P1-1: an armor block forged inside the message body must not
+    // be extracted as the signature — git only honors gpgsig in the header
+    // region, so this commit is unsigned and fails closed.
+    #[tokio::test]
+    async fn armor_block_forged_in_message_body_is_not_a_signature() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1400);
+        let tip = sha(1401);
+        let forged = "feat: subject\n\nbody text\ngpgsig -----BEGIN PGP SIGNATURE-----\n\n forged\n -----END PGP SIGNATURE-----\n";
+        let commit = commit_model(
+            1,
+            &tip,
+            &sha(9401),
+            std::slice::from_ref(&base),
+            Some(forged.to_string()),
+        );
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("forged body armor must not count as a signature");
+        assert!(err.to_string().contains("no GPG signature found"), "{err}");
+    }
+
+    // P1-1 unit-level pin: body armor is invisible to the extractor and the
+    // input passes through untouched.
+    #[test]
+    fn extract_ignores_armor_forged_in_message_body() {
+        let raw = "tree 52a266a58f2c028ad7de4dfd3a72fdf76b0d4e24\n\
+                   author A <a@x> 1 +0000\n\
+                   committer C <c@x> 1 +0000\n\
+                   \nbody\ngpgsig -----BEGIN PGP SIGNATURE-----\n -----END PGP SIGNATURE-----\n";
+        let (payload, signature) = extract_from_commit_content(raw);
+        assert!(signature.is_none());
+        assert_eq!(payload, raw);
+    }
+
+    // P1-1 badge-path pin: the bare `content` column of a signed commit
+    // starts with the gpgsig header; its header region runs to the first
+    // empty line and extraction must work there exactly as before.
+    #[test]
+    fn extract_handles_content_column_shape_for_badge_path() {
+        let content = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n abcdef\n =csum\n -----END PGP SIGNATURE-----\n\nmessage subject\n\nbody line\n";
+        let (payload, signature) = extract_from_commit_content(content);
+        assert_eq!(
+            signature.as_deref(),
+            Some("-----BEGIN PGP SIGNATURE-----\n\nabcdef\n=csum\n-----END PGP SIGNATURE-----\n")
+        );
+        assert_eq!(payload, "message subject\n\nbody line\n");
+    }
+
+    // P2-1: from == to degenerate range — the tip is still verified (once).
+    #[tokio::test]
+    async fn degenerate_from_equals_to_verifies_tip() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let tip = sha(1501);
+        let signed = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9501),
+            &[],
+            "feat: degenerate",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &signed).await;
+        checker
+            .verify_cl(&tip, &tip)
+            .await
+            .expect("signed tip passes the degenerate range");
+
+        let tip2 = sha(1502);
+        let unsigned = commit_model(2, &tip2, &sha(9502), &[], None);
+        insert_commit(&storage, &unsigned).await;
+        let err = checker
+            .verify_cl(&tip2, &tip2)
+            .await
+            .expect_err("unsigned tip must fail even when from == to");
+        assert!(err.to_string().contains("no GPG signature found"), "{err}");
+    }
+
+    // P2-1: parents_id pointing at a commit missing from storage fails
+    // closed as a broken chain.
+    #[tokio::test]
+    async fn missing_parent_object_is_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let key = generate_key("alice <alice@example.com>");
+        register_key(&storage, "alice", &key).await;
+
+        let base = sha(1600);
+        let tip = sha(1601);
+        let ghost_parent = sha(1699);
+        let commit = make_signed_commit(
+            &key,
+            1,
+            &tip,
+            &sha(9601),
+            std::slice::from_ref(&ghost_parent),
+            "feat: dangling parent",
+            SubpacketConfig::Default,
+        );
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("a missing parent object must fail closed");
+        assert!(err.to_string().contains("broken commit chain"), "{err}");
+    }
+
+    // P2-1: a parents_id that is not a Json array fails closed.
+    #[tokio::test]
+    async fn corrupt_parents_id_is_fail_closed() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let base = sha(1700);
+        let tip = sha(1701);
+        let mut commit = commit_model(1, &tip, &sha(9701), std::slice::from_ref(&base), None);
+        commit.parents_id = serde_json::json!({"not": "an array"});
+        insert_commit(&storage, &commit).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("corrupt parents_id must fail closed");
+        assert!(err.to_string().contains("corrupt parents_id"), "{err}");
+    }
 }

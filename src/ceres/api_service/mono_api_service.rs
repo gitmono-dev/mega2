@@ -69,7 +69,7 @@ use crate::{
     callisto::{
         mega_cl, mega_refs, mega_tag, mega_tree,
         sea_orm_active_enums::{
-            ConvTypeEnum, MergeStatusEnum, QueueFailureTypeEnum, QueueStatusEnum,
+            CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, QueueFailureTypeEnum, QueueStatusEnum,
         },
     },
     ceres::{
@@ -2072,8 +2072,34 @@ impl MonoApiService {
             return Err(GitError::CustomError("ref hash conflict".to_owned()));
         }
 
+        self.ensure_gpg_check_passed(&cl.link).await?;
+
         self.merge_cl_unchecked(authz_principal, execution_actor, cl)
             .await
+    }
+
+    /// MC-02 minimal merge gate (the full `ensure_cl_mergeable` below stays
+    /// disabled): a CL with a FAILED GPG signature check cannot be merged.
+    /// CLs without any check rows (never checked) are not blocked. Every
+    /// merge entry point — `merge_cl` and the merge queue's
+    /// `execute_merge_workflow` — must call this before `merge_cl_unchecked`.
+    async fn ensure_gpg_check_passed(&self, link: &str) -> Result<(), GitError> {
+        let gpg_failed = self
+            .storage
+            .cl_storage()
+            .get_check_result(link)
+            .await
+            .map_err(|e| GitError::CustomError(format!("Failed to load check results: {e}")))?
+            .into_iter()
+            .any(|result| {
+                result.check_type_code == CheckTypeEnum::GpgSignature && result.status == "FAILED"
+            });
+        if gpg_failed {
+            return Err(GitError::CustomError(format!(
+                "CL {link} cannot be merged: GPG signature check failed"
+            )));
+        }
+        Ok(())
     }
 
     /// Apply all CL changes onto the target_head in-memory and emit a single commit on the CL ref.
@@ -4394,6 +4420,13 @@ impl MonoApiService {
             return Err((QueueFailureTypeEnum::SystemError, message));
         }
 
+        // MC-02: the queue path enforces the same minimal GPG merge gate as
+        // `merge_cl`. A refusal here is a decision, so it records as an
+        // ordinary merge failure — only undecidable checks freeze (above).
+        if let Err(error) = self.ensure_gpg_check_passed(cl_link).await {
+            return Err((QueueFailureTypeEnum::MergeFailure, error.to_string()));
+        }
+
         self.merge_cl_unchecked(&authz_principal, "system", cl_model.clone())
             .await
             .map_err(|e| {
@@ -5757,4 +5790,193 @@ async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() 
         storage.entity_store().is_dirty(),
         "ref written but subsequent step failed -> dirty (fail-closed)"
     );
+}
+
+// --- MC-02: minimal GPG merge gate (real test DB) ---
+//
+// `merge_cl` rejects a CL whose `check_result` rows contain a FAILED
+// GpgSignature entry, and only that one. The full `ensure_cl_mergeable`
+// gate stays disabled; these tests pin the minimal wiring.
+
+#[cfg(test)]
+fn gate_test_cl(link: &str, from_hash: &str, to_hash: &str) -> mega_cl::Model {
+    mega_cl::Model {
+        id: 42,
+        link: link.to_string(),
+        title: "gpg gate test".to_string(),
+        merge_date: None,
+        status: MergeStatusEnum::Open,
+        path: "/".to_string(),
+        from_hash: from_hash.to_string(),
+        to_hash: to_hash.to_string(),
+        created_at: chrono::Utc::now().naive_utc(),
+        updated_at: chrono::Utc::now().naive_utc(),
+        username: "gate-tester".to_string(),
+        base_branch: "main".to_string(),
+    }
+}
+
+#[cfg(test)]
+async fn insert_check_result(
+    storage: &Storage,
+    link: &str,
+    check_type: CheckTypeEnum,
+    status: &str,
+) {
+    let model =
+        crate::callisto::check_result::Model::new("/", link, "deadbeef", check_type, status, "msg");
+    storage
+        .cl_storage()
+        .save_check_results(vec![model])
+        .await
+        .expect("save check result");
+}
+
+#[cfg(test)]
+async fn gate_test_service() -> (tempfile::TempDir, Storage, MonoApiService) {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+    let service = test_service(&storage);
+    let old_tree = Tree {
+        id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+        tree_items: vec![],
+    };
+    setup_main_ref(
+        &storage,
+        &old_tree,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .await;
+    (temp, storage, service)
+}
+
+#[tokio::test]
+async fn merge_cl_rejects_cl_with_failed_gpg_signature_check() {
+    let (_temp, storage, service) = gate_test_service().await;
+    let cl = gate_test_cl(
+        "GPGFAIL1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    insert_check_result(&storage, &cl.link, CheckTypeEnum::GpgSignature, "FAILED").await;
+
+    let err = service
+        .merge_cl("gate-tester", "gate-tester", cl.clone())
+        .await
+        .expect_err("a FAILED GPG signature check must block the merge");
+    assert!(
+        err.to_string().contains("GPG signature check failed"),
+        "{err}"
+    );
+    assert!(err.to_string().contains(&cl.link), "{err}");
+}
+
+#[tokio::test]
+async fn merge_cl_passes_gate_without_any_check_rows() {
+    let (_temp, _storage, service) = gate_test_service().await;
+    let cl = gate_test_cl(
+        "GPGNONE1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+
+    // The gate must not block; the merge then fails later because the tip
+    // commit does not exist in this fixture — that error proves the gate let
+    // the CL through.
+    let err = service
+        .merge_cl("gate-tester", "gate-tester", cl)
+        .await
+        .expect_err("merge fails on the missing tip commit, not on the gate");
+    assert!(
+        !err.to_string().contains("GPG signature check failed"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("Commit not found"), "{err}");
+}
+
+#[tokio::test]
+async fn merge_cl_passes_gate_with_passed_gpg_and_other_failed_checks() {
+    let (_temp, storage, service) = gate_test_service().await;
+    let cl = gate_test_cl(
+        "GPGPASS1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    insert_check_result(&storage, &cl.link, CheckTypeEnum::GpgSignature, "PASSED").await;
+    insert_check_result(&storage, &cl.link, CheckTypeEnum::ClSync, "FAILED").await;
+
+    let err = service
+        .merge_cl("gate-tester", "gate-tester", cl)
+        .await
+        .expect_err("merge fails on the missing tip commit, not on the gate");
+    assert!(
+        !err.to_string().contains("GPG signature check failed"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("Commit not found"), "{err}");
+}
+
+// The merge queue entry point (`execute_merge_workflow`) goes through the
+// same gate; these tests pin that wiring (MC-02 R1 P0).
+
+#[cfg(test)]
+async fn gate_test_queued_service(link: &str) -> (tempfile::TempDir, Storage, MonoApiService) {
+    use sea_orm::{ActiveModelTrait, IntoActiveModel};
+
+    let (temp, storage, service) = gate_test_service().await;
+    // CL row: Open, from_hash matches the main ref so the queue workflow's
+    // conflict check passes and the run reaches the GPG gate.
+    let cl = gate_test_cl(
+        link,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    cl.into_active_model()
+        .insert(storage.mono_storage().get_connection())
+        .await
+        .expect("insert CL row");
+    storage
+        .merge_queue_service
+        .add_to_queue_with_requester(link.to_string(), Some("gate-tester".to_string()))
+        .await
+        .expect("enqueue CL");
+    (temp, storage, service)
+}
+
+#[tokio::test]
+async fn execute_merge_workflow_rejects_cl_with_failed_gpg_signature_check() {
+    let (_temp, storage, service) = gate_test_queued_service("GPGQFAIL").await;
+    insert_check_result(&storage, "GPGQFAIL", CheckTypeEnum::GpgSignature, "FAILED").await;
+
+    let (failure_type, message) = service
+        .execute_merge_workflow("GPGQFAIL")
+        .await
+        .expect_err("a FAILED GPG signature check must block the queued merge");
+    assert!(
+        matches!(failure_type, QueueFailureTypeEnum::MergeFailure),
+        "a gate refusal is a decision, recorded as MergeFailure (no freeze): {failure_type:?}"
+    );
+    assert!(message.contains("GPG signature check failed"), "{message}");
+    assert!(message.contains("GPGQFAIL"), "{message}");
+}
+
+#[tokio::test]
+async fn execute_merge_workflow_passes_gate_without_failed_gpg_check() {
+    let (_temp, storage, service) = gate_test_queued_service("GPGQPASS").await;
+    insert_check_result(&storage, "GPGQPASS", CheckTypeEnum::GpgSignature, "PASSED").await;
+    insert_check_result(&storage, "GPGQPASS", CheckTypeEnum::ClSync, "FAILED").await;
+
+    // The gate must not block; the queued merge then fails downstream
+    // because the tip commit does not exist in this fixture — that error
+    // proves the gate let the CL through.
+    let (failure_type, message) = service
+        .execute_merge_workflow("GPGQPASS")
+        .await
+        .expect_err("merge fails on the missing tip commit, not on the gate");
+    assert!(
+        matches!(failure_type, QueueFailureTypeEnum::MergeFailure),
+        "{failure_type:?}"
+    );
+    assert!(!message.contains("GPG signature check failed"), "{message}");
+    assert!(message.contains("Commit not found"), "{message}");
 }
