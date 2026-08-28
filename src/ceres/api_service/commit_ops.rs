@@ -35,13 +35,18 @@ use crate::{
 ///
 /// This function checks whether a commit has a valid GPG signature by:
 /// 1. Checking Redis cache for previously computed status
-/// 2. Extracting the GPG signature from commit content
-/// 3. Verifying the signature against stored GPG keys for the committer
+/// 2. Extracting the GPG signature from the commit
+/// 3. Verifying the signature under the same trust domain as the merge-gate
+///    checker (MC-11): the keyring is selected by the commit's own committer
+///    header (ADR-MC-08) — the reserved server identity verifies against the
+///    server keyring, any other identity against the user keyring via
+///    issuer-fingerprint lookup. No externally supplied username is
+///    consulted, and the payload is the canonical full commit byte stream
+///    (ADR-MC-09), not just the message.
 ///
 /// # Arguments
 /// * `handler` - API handler providing storage and cache access
 /// * `commit` - The commit to verify
-/// * `committer` - Username of the committer for key lookup
 ///
 /// # Returns
 /// * `GpgStatus::Verified` - Commit has a valid signature
@@ -49,15 +54,15 @@ use crate::{
 /// * `GpgStatus::NoSignature` - Commit is not signed
 ///
 /// # Cache
-/// Results are cached in Redis with a 600-second TTL to avoid redundant verification.
+/// Results are cached in Redis with a 600-second TTL to avoid redundant
+/// verification (key `gpg_status:v2`; v1 cached the pre-MC-11 semantics).
 async fn compute_gpg_status_for_commit<T: ApiHandler + ?Sized>(
     handler: &T,
     commit: &Commit,
-    committer: &str,
 ) -> GpgStatus {
     // Cache key per commit
     let cache_key = format!(
-        "{}:gpg_status:v1:sha={}",
+        "{}:gpg_status:v2:sha={}",
         handler.object_cache().prefix,
         commit.id
     );
@@ -84,10 +89,7 @@ async fn compute_gpg_status_for_commit<T: ApiHandler + ?Sized>(
             let checker = crate::ceres::merge_checker::gpg_signature_checker::GpgSignatureChecker {
                 storage: Arc::new(storage),
             };
-            match checker
-                .verify_commit_gpg_signature(content, committer.to_string())
-                .await
-            {
+            match checker.verify_commit_gpg_signature(commit).await {
                 Ok(()) => GpgStatus::Verified,
                 Err(e) => {
                     tracing::debug!("GPG verification failed for commit {}: {}", commit.id, e);
@@ -533,7 +535,7 @@ pub async fn list_commit_history<T: ApiHandler + ?Sized>(
             let mut wrapper: LatestCommitInfoWrapper = c.clone().into();
             apply_username_binding(handler, &c.id.to_string(), &mut wrapper).await;
             let info = wrapper.0;
-            let gpg_status = compute_gpg_status_for_commit(handler, &c, &info.committer).await;
+            let gpg_status = compute_gpg_status_for_commit(handler, &c).await;
             res.push(CommitSummary {
                 sha: c.id.to_string(),
                 short_message: info.short_message,
@@ -578,7 +580,7 @@ pub async fn list_commit_history<T: ApiHandler + ?Sized>(
         let mut wrapper: LatestCommitInfoWrapper = c.clone().into();
         apply_username_binding(handler, &c.id.to_string(), &mut wrapper).await;
         let info = wrapper.0;
-        let gpg_status = compute_gpg_status_for_commit(handler, c, &info.committer).await;
+        let gpg_status = compute_gpg_status_for_commit(handler, c).await;
         res.push(CommitSummary {
             sha: c.id.to_string(),
             short_message: info.short_message,
@@ -678,7 +680,7 @@ async fn assemble_commit_summary<T: ApiHandler + ?Sized>(
     let mut wrapper: LatestCommitInfoWrapper = commit.clone().into();
     apply_username_binding(handler, &commit.id.to_string(), &mut wrapper).await;
     let info = wrapper.0;
-    let gpg_status = compute_gpg_status_for_commit(handler, commit, &info.committer).await;
+    let gpg_status = compute_gpg_status_for_commit(handler, commit).await;
     CommitSummary {
         sha: commit.id.to_string(),
         short_message: info.short_message,
@@ -905,4 +907,285 @@ pub async fn get_commit_files_changed<T: ApiHandler + ?Sized>(
         commit: summary,
         page: CommonPage { total, items },
     })
+}
+
+// --- MC-11: commit-status GPG trust domain (AC⑦) ---
+//
+// The badge path selects the keyring from the commit's own committer header
+// (ADR-MC-08 step ②): server-synthesized commits verify against the server
+// keyring from the vault, user commits against the user keyring via issuer
+// fingerprint — the same semantics as the merge-gate chain checker. Results
+// cache under `gpg_status:v2` (v1 held the pre-MC-11 message-only /
+// external-username semantics).
+
+#[cfg(test)]
+mod tests {
+    use pgp::{
+        composed::{
+            ArmorOptions, DetachedSignature, KeyType, SecretKeyParamsBuilder, SignedPublicKey,
+            SignedSecretKey,
+        },
+        crypto::hash::HashAlgorithm,
+        types::{KeyVersion, Password},
+    };
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        ceres::api_service::{GitObjectCache, mono_api_service::MonoApiService},
+        contract::vault::{
+            integration::vault_core::VaultCore, server_signing::ServerSigningContext,
+        },
+        jupiter::{
+            migration::apply_migrations,
+            storage::{
+                base_storage::{BaseStorage, StorageConnector},
+                vault_storage::VaultStorage,
+            },
+            tests::{test_db_connection, test_storage},
+        },
+    };
+
+    const TEST_CACHE_PREFIX: &str = "mc11test";
+
+    fn test_redis_url() -> String {
+        std::env::var("MEGA_REDIS__URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string())
+    }
+
+    /// A badge-path handler whose storage carries the MC-09 vault handle and
+    /// whose object cache talks to the real test Redis (the cache-key
+    /// assertions need it).
+    async fn badge_fixture() -> (TempDir, MonoApiService, ServerSigningContext, VaultCore) {
+        let temp = TempDir::new().expect("temp dir");
+        let conn = Arc::new(test_db_connection(temp.path()).await);
+        apply_migrations(&conn, true).await.expect("migrations");
+        let vault = VaultCore::config(
+            VaultStorage {
+                base: BaseStorage::new(conn),
+            },
+            temp.path().join("mc11_badge_core_key.json"),
+        )
+        .await
+        .expect("vault core should initialize");
+        let storage = test_storage(temp.path()).await.with_vault(vault.clone());
+
+        let client = ::redis::Client::open(test_redis_url()).expect("redis client");
+        let redis = ::redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("redis connection");
+        let service = MonoApiService {
+            storage,
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: redis.clone(),
+                prefix: TEST_CACHE_PREFIX.to_string(),
+            }),
+        };
+        let signing = ServerSigningContext::new(vault.clone(), redis);
+        (temp, service, signing, vault)
+    }
+
+    /// A server-synthesized commit through the real MC-09 signing path.
+    async fn server_commit(
+        signing: &ServerSigningContext,
+        tree: ObjectHash,
+        parents: Vec<ObjectHash>,
+        message: &str,
+    ) -> Commit {
+        let key = signing.active_key().await.expect("active server key");
+        let unsigned = Commit::from_tree_id(tree, parents, message);
+        signing.sign_commit(&key, &unsigned).expect("sign commit")
+    }
+
+    fn generate_user_key(uid: &str) -> SignedSecretKey {
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .version(KeyVersion::V4)
+            .key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(true)
+            .primary_user_id(uid.into());
+        params
+            .build()
+            .expect("key params")
+            .generate(rand08::thread_rng())
+            .expect("generate key")
+    }
+
+    fn user_public_key_armored(key: &SignedSecretKey) -> String {
+        SignedPublicKey::from(key.clone())
+            .to_armored_string(ArmorOptions::default())
+            .expect("armor public key")
+    }
+
+    /// A user-signed commit as produced by a git client: the signature covers
+    /// the full commit bytes minus the gpgsig block (ADR-MC-09).
+    fn user_signed_commit(
+        key: &SignedSecretKey,
+        tree: ObjectHash,
+        parents: Vec<ObjectHash>,
+        message: &str,
+    ) -> Commit {
+        use git_internal::internal::object::signature::Signature;
+
+        let author =
+            Signature::from_data(b"author Test User <test@example.com> 1750000000 +0000".to_vec())
+                .expect("author signature");
+        let committer = Signature::from_data(
+            b"committer Test User <test@example.com> 1750000000 +0000".to_vec(),
+        )
+        .expect("committer signature");
+
+        let mut payload = format!("tree {tree}\n");
+        for parent in &parents {
+            payload.push_str(&format!("parent {parent}\n"));
+        }
+        payload.push_str("author Test User <test@example.com> 1750000000 +0000\n");
+        payload.push_str("committer Test User <test@example.com> 1750000000 +0000\n\n");
+        payload.push_str(message);
+        if !payload.ends_with('\n') {
+            payload.push('\n');
+        }
+        let armor = DetachedSignature::sign_binary_data(
+            rand08::thread_rng(),
+            &key.primary_key,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            payload.as_bytes(),
+        )
+        .expect("sign payload")
+        .to_armored_string(ArmorOptions::default())
+        .expect("armor signature");
+
+        // Embed the way git does: `gpgsig ` header, space-prefixed
+        // continuations, blank line, message.
+        let mut content = String::from("gpgsig ");
+        for (i, line) in armor.trim_end_matches('\n').lines().enumerate() {
+            if i > 0 {
+                content.push(' ');
+            }
+            content.push_str(line);
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(message);
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        Commit::new(author, committer, tree, parents, &content)
+    }
+
+    // AC⑦: per-commit routing on a mixed chain (server-synthesized commit
+    // after an update_branch, then a user push on top) — each verifies
+    // through its own keyring; an unsigned commit reports NoSignature.
+    #[tokio::test]
+    async fn gpg_status_routes_server_and_user_commits_per_commit() {
+        let (_temp, service, signing, _vault) = badge_fixture().await;
+        let tree: ObjectHash = "52a266a58f2c028ad7de4dfd3a72fdf76b0d4e24".parse().unwrap();
+
+        // Real chain topology: the server-synthesized update_branch commit is
+        // the chain root here, the user commit is pushed on top of it, and an
+        // unsigned commit sits at the tip.
+        let server = server_commit(&signing, tree, vec![], "update-branch: rebase").await;
+
+        // User commit pushed on top of the server commit → user keyring via
+        // issuer fingerprint.
+        let user_key = generate_user_key("alice <alice@example.com>");
+        service
+            .storage
+            .gpg_storage()
+            .add_gpg_key("alice".to_string(), user_public_key_armored(&user_key))
+            .await
+            .expect("register user key");
+        let user = user_signed_commit(
+            &user_key,
+            tree,
+            vec![server.id],
+            "feat: user push after update-branch",
+        );
+        assert_eq!(
+            user.parent_commit_ids,
+            vec![server.id],
+            "user commit must be a child of the server commit"
+        );
+
+        let unsigned = Commit::from_tree_id(tree, vec![user.id], "plain unsigned");
+
+        // Persist the chain so the public history entry point can load it.
+        service
+            .storage
+            .mono_storage()
+            .save_mega_commits(vec![server.clone(), user.clone(), unsigned.clone()], None)
+            .await
+            .expect("persist commit chain");
+
+        // Assert through the public commit-history entry point (the one the
+        // badge API consumes), not just the private helper.
+        let (summaries, total) = list_commit_history(
+            &service,
+            Some(&unsigned.id.to_string()),
+            None,
+            None,
+            Pagination {
+                page: 1,
+                per_page: 10,
+            },
+        )
+        .await
+        .expect("commit history");
+        assert_eq!(total, 3, "history must cover the whole chain");
+
+        let summary_of = |sha: &ObjectHash| -> &CommitSummary {
+            summaries
+                .iter()
+                .find(|s| s.sha == sha.to_string())
+                .unwrap_or_else(|| panic!("missing summary for {sha}"))
+        };
+        assert_eq!(
+            summary_of(&user.id).parents,
+            vec![server.id.to_string()],
+            "public payload must show the user commit on top of the server commit"
+        );
+
+        // The server key is NOT registered in the user table, so the user
+        // path cannot produce the server commit's status.
+        assert!(
+            matches!(summary_of(&server.id).gpg_status, GpgStatus::Verified),
+            "server-synthesized commit must verify via the server keyring: {:?}",
+            summary_of(&server.id).gpg_status
+        );
+        assert!(
+            matches!(summary_of(&user.id).gpg_status, GpgStatus::Verified),
+            "user commit must verify via issuer-fingerprint lookup: {:?}",
+            summary_of(&user.id).gpg_status
+        );
+        assert!(
+            matches!(summary_of(&unsigned.id).gpg_status, GpgStatus::NoSignature),
+            "unsigned commit must report NoSignature: {:?}",
+            summary_of(&unsigned.id).gpg_status
+        );
+    }
+
+    // AC⑦: the result cache moved to `gpg_status:v2` (v1 held the pre-MC-11
+    // semantics); the cached status is served on a second read.
+    #[tokio::test]
+    async fn gpg_status_cache_key_uses_v2() {
+        let (_temp, service, signing, _vault) = badge_fixture().await;
+        let tree: ObjectHash = "341e54913a3a43069f2927cc0f703e5a9f730df1".parse().unwrap();
+        let commit = server_commit(&signing, tree, vec![], "Upload via buck push").await;
+
+        let status = compute_gpg_status_for_commit(&service, &commit).await;
+        assert!(matches!(status, GpgStatus::Verified), "{status:?}");
+
+        let mut conn = service.git_object_cache.connection.clone();
+        let v2_key = format!("{TEST_CACHE_PREFIX}:gpg_status:v2:sha={}", commit.id);
+        let cached: Option<String> = conn.get(&v2_key).await.expect("read v2 cache key");
+        assert!(cached.is_some(), "the v2 cache key must be written");
+        let v1_key = format!("{TEST_CACHE_PREFIX}:gpg_status:v1:sha={}", commit.id);
+        let stale: Option<String> = conn.get(&v1_key).await.expect("read v1 cache key");
+        assert!(stale.is_none(), "no v1 cache key may be written");
+
+        // Second read hits the cache and returns the same status.
+        let again = compute_gpg_status_for_commit(&service, &commit).await;
+        assert!(matches!(again, GpgStatus::Verified), "{again:?}");
+    }
 }

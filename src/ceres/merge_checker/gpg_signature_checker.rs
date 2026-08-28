@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use git_internal::internal::object::{ObjectTrait, commit::Commit};
 use pgp::{
     composed::{Deserializable, DetachedSignature, SignedPublicKey},
     packet::{Signature, SubpacketData},
@@ -14,6 +15,7 @@ use crate::{
         CheckResult, CheckType, Checker, ConditionResult, MAX_CL_CHAIN_COMMITS,
     },
     common::errors::MegaError,
+    contract::vault::server_signing::{SERVER_SIGNING_EMAIL, SERVER_SIGNING_NAME},
     jupiter::{model::cl_dto::ClInfoDto, storage::Storage},
 };
 
@@ -128,22 +130,56 @@ impl GpgSignatureChecker {
         Ok(())
     }
 
-    /// Verify one chain member. Keyring selection follows ADR-MC-08 step ①:
-    /// the signature's issuer fingerprint (resolved fail-closed from the
-    /// hashed subpacket area) selects the registered key — no fallback to the
-    /// CL owner or any externally supplied identity. The payload is the
-    /// canonical full commit byte stream rebuilt from the persisted columns
-    /// (ADR-MC-09), not just the message.
+    /// Verify one chain member. The committer header selects the trust
+    /// domain (ADR-MC-08): the reserved server identity verifies against the
+    /// server keyring only — falling back to the user keyring would be a
+    /// spoofing escape hatch — while any other identity follows MC-02 step
+    /// ①: the signature's issuer fingerprint (resolved fail-closed from the
+    /// hashed subpacket area) selects the registered user key. The payload
+    /// is the canonical full commit byte stream rebuilt from the persisted
+    /// columns (ADR-MC-09), not just the message.
     async fn verify_commit_chain_member(
         &self,
         commit: &mega_commit::Model,
     ) -> Result<(), MegaError> {
         let raw = rebuild_canonical_commit_bytes(commit)?;
-        let (payload, signature) = extract_from_commit_content(&raw);
+        self.verify_raw_commit_bytes(
+            &raw,
+            committer_is_server_identity(commit.committer.as_deref()),
+        )
+        .await
+    }
+
+    /// Shared per-commit verification: strip the `gpgsig` block, then verify
+    /// the canonical payload against the keyring selected by the committer
+    /// header. `server_identity` is the caller-resolved ADR-MC-08 step ②
+    /// verdict for the commit's committer.
+    async fn verify_raw_commit_bytes(
+        &self,
+        raw: &str,
+        server_identity: bool,
+    ) -> Result<(), MegaError> {
+        let (payload, signature) = extract_from_commit_content(raw);
         let Some(signature) = signature else {
+            if server_identity {
+                // Historical server-synthesized commit predating MC-09 —
+                // distinct, actionable message (never the user-facing one).
+                return Err(MegaError::Other(
+                    "server-synthesized commit carries no GPG signature (historical commit \
+                     predating server signing); fix: re-trigger the synthesis (e.g. \
+                     update-branch or buck upload) or contact an administrator"
+                        .to_string(),
+                ));
+            }
             return Err(MegaError::Other("no GPG signature found".to_string()));
         };
 
+        if server_identity {
+            return self.verify_with_server_keyring(&signature, &payload).await;
+        }
+
+        // User identity (ADR-MC-08 step ①, MC-02): issuer fingerprint reverse
+        // lookup, fail-closed.
         let sig = DetachedSignature::from_string(&signature)
             .map_err(|e| MegaError::Other(format!("failed to parse signature: {e}")))?
             .0;
@@ -162,39 +198,57 @@ impl GpgSignatureChecker {
             .await
     }
 
-    /// Legacy commit-badge path (consumer: `api_service::commit_ops.rs`,
-    /// cache key `gpg_status:v1`): verifies the message-only payload against
-    /// the given user's keyring. The merge gate deliberately does not use it;
-    /// see `verify_commit_chain_member` (ADR-MC-08/09).
-    pub(crate) async fn verify_commit_gpg_signature(
+    /// Server trust domain (ADR-MC-08 step ②): verify against the server
+    /// keyring only — every non-revoked historical public key loaded from
+    /// the vault through MC-09's read-only interface, so commits signed by
+    /// rotated-out generations stay verifiable. The vault handle comes from
+    /// the checker's storage; absent or empty keyring → fail-closed. No
+    /// fallback to the user keyring.
+    async fn verify_with_server_keyring(
         &self,
-        commit_content: &str,
-        assignee: String,
+        signature: &str,
+        payload: &str,
     ) -> Result<(), MegaError> {
-        let (commit_msg, signature) = extract_from_commit_content(commit_content);
-        if signature.is_none() {
-            return Err(MegaError::Other(format!(
-                "No GPG signature found for user {assignee}"
-            )));
-        }
-
-        let sig = signature.unwrap();
-
-        let keys = self.storage.gpg_storage().list_user_gpg(assignee).await?;
-
-        for key in keys {
-            let verified = self
-                .verify_signature_with_key(&key.public_key, &sig, &commit_msg)
-                .await;
-
-            if verified.is_ok() {
+        let vault = self.storage.vault().ok_or_else(|| {
+            MegaError::Other(
+                "server signing unavailable: vault handle is not configured".to_string(),
+            )
+        })?;
+        let keys = vault.list_server_signing_public_keys().await?;
+        let sig = DetachedSignature::from_string(signature)
+            .map_err(|e| MegaError::Other(format!("failed to parse signature: {e}")))?
+            .0;
+        for key in &keys {
+            if sig.verify(&key.public_key, payload.as_bytes()).is_ok() {
                 return Ok(());
             }
         }
-
         Err(MegaError::Other(
-            "No valid GPG key found to verify the signature".to_string(),
+            "server-identity commit not verified by any non-revoked server signing key \
+             (user keyring fallback is forbidden)"
+                .to_string(),
         ))
+    }
+
+    /// Commit status/badge path (consumer: `api_service::commit_ops.rs`,
+    /// cache key `gpg_status:v2`): verifies one commit from its live git
+    /// object under the same trust domain as the chain path
+    /// (`verify_commit_chain_member`) — canonical full commit bytes
+    /// (ADR-MC-09), keyring selected by the commit's own committer header
+    /// (ADR-MC-08). No externally supplied username is consulted.
+    pub(crate) async fn verify_commit_gpg_signature(
+        &self,
+        commit: &Commit,
+    ) -> Result<(), MegaError> {
+        let raw = commit.to_data().map_err(|e| {
+            MegaError::Other(format!("failed to serialize commit {}: {e}", commit.id))
+        })?;
+        let raw = String::from_utf8_lossy(&raw);
+        self.verify_raw_commit_bytes(
+            &raw,
+            is_server_identity(&commit.committer.name, &commit.committer.email),
+        )
+        .await
     }
 
     async fn verify_signature_with_key(
@@ -219,6 +273,33 @@ impl GpgSignatureChecker {
 
 fn sha_prefix(sha: &str) -> &str {
     &sha[..7.min(sha.len())]
+}
+
+/// Whether the identity (name + email) is the reserved server identity
+/// (MC-09 constants; ADR-MC-08 step ②).
+fn is_server_identity(name: &str, email: &str) -> bool {
+    name == SERVER_SIGNING_NAME && email == SERVER_SIGNING_EMAIL
+}
+
+/// Parse the persisted committer header (git-internal `Signature::to_data`
+/// output: `committer <name> <<email>> <ts> <tz>`) into (name, email)
+/// without panicking on malformed input. Anything unparseable is treated as
+/// a user identity — the user path is fail-closed anyway.
+fn parse_committer_identity(raw: &str) -> Option<(&str, &str)> {
+    let rest = raw.strip_prefix("committer ")?;
+    let lt = rest.rfind('<')?;
+    let gt = rest[lt..].find('>')? + lt;
+    let name = rest[..lt].strip_suffix(' ')?;
+    let email = &rest[lt + 1..gt];
+    Some((name, email))
+}
+
+/// The ADR-MC-08 step ② verdict for a persisted `mega_commit.committer`
+/// column value.
+fn committer_is_server_identity(committer: Option<&str>) -> bool {
+    committer
+        .and_then(parse_committer_identity)
+        .is_some_and(|(name, email)| is_server_identity(name, email))
 }
 
 /// The walk reached the chain root (or a gap in storage) without meeting the
@@ -510,6 +591,9 @@ mod tests {
     use super::*;
     use crate::{
         callisto::sea_orm_active_enums::MergeStatusEnum,
+        contract::vault::{
+            integration::vault_core::VaultCore, server_signing::ServerSigningContext,
+        },
         jupiter::{
             model::cl_dto::ClInfoDto, storage::base_storage::StorageConnector, tests::test_storage,
         },
@@ -1389,5 +1473,267 @@ mod tests {
             .await
             .expect_err("corrupt parents_id must fail closed");
         assert!(err.to_string().contains("corrupt parents_id"), "{err}");
+    }
+
+    // --- MC-11: server trust domain (ADR-MC-08 step ②) ---
+    //
+    // The committer header selects the keyring: the reserved server identity
+    // verifies against the server keyring loaded from the vault (real MC-09
+    // production path: `ServerSigningContext::sign_commit` +
+    // `list_server_signing_public_keys`), every other identity against the
+    // user keyring via issuer fingerprint — with no fallback between them.
+
+    fn server_author_header() -> String {
+        format!("author {SERVER_SIGNING_NAME} <{SERVER_SIGNING_EMAIL}> 1750000000 +0000")
+    }
+
+    fn server_committer_header() -> String {
+        format!("committer {SERVER_SIGNING_NAME} <{SERVER_SIGNING_EMAIL}> 1750000000 +0000")
+    }
+
+    async fn test_redis() -> ::redis::aio::ConnectionManager {
+        let url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let client = ::redis::Client::open(url).expect("redis client");
+        ::redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("redis connection")
+    }
+
+    /// A vault-backed checker: the storage carries the MC-09 vault handle so
+    /// the server keyring is reachable, and the signing context produces real
+    /// server-signed commits.
+    async fn setup_server_checker() -> (
+        TempDir,
+        Arc<Storage>,
+        GpgSignatureChecker,
+        ServerSigningContext,
+        VaultCore,
+    ) {
+        use crate::jupiter::{
+            migration::apply_migrations,
+            storage::{base_storage::BaseStorage, vault_storage::VaultStorage},
+            tests::test_db_connection,
+        };
+
+        let temp = TempDir::new().expect("temp dir");
+        let conn = Arc::new(test_db_connection(temp.path()).await);
+        apply_migrations(&conn, true).await.expect("migrations");
+        let vault = VaultCore::config(
+            VaultStorage {
+                base: BaseStorage::new(conn),
+            },
+            temp.path().join("mc11_core_key.json"),
+        )
+        .await
+        .expect("vault core should initialize");
+
+        let storage = test_storage(temp.path()).await.with_vault(vault.clone());
+        let storage = Arc::new(storage);
+        let checker = GpgSignatureChecker {
+            storage: storage.clone(),
+        };
+        let signing = ServerSigningContext::new(vault.clone(), test_redis().await);
+        (temp, storage, checker, signing, vault)
+    }
+
+    /// Sign a synthetic commit through the real MC-09 production path and
+    /// return its persistable model (committer column = server identity).
+    async fn server_signed_commit(
+        signing: &ServerSigningContext,
+        tree: &str,
+        parents: &[String],
+        message: &str,
+    ) -> mega_commit::Model {
+        use crate::jupiter::utils::converter::IntoMegaModel;
+
+        let key = signing.active_key().await.expect("active server key");
+        let tree_id = tree.parse().expect("tree hash");
+        let parent_ids = parents
+            .iter()
+            .map(|p| p.parse().expect("parent hash"))
+            .collect();
+        let unsigned = Commit::from_tree_id(tree_id, parent_ids, message);
+        let signed = signing.sign_commit(&key, &unsigned).expect("sign commit");
+        signed.into_mega_model(git_internal::internal::metadata::EntryMeta::default())
+    }
+
+    // AC①/②: a server-identity commit verifies against the server keyring;
+    // the server key is never registered in the user table, so this cannot
+    // pass through the user path.
+    #[tokio::test]
+    async fn server_identity_commit_verifies_against_server_keyring() {
+        let (_temp, storage, checker, signing, _vault) = setup_server_checker().await;
+        let base = sha(2000);
+        let model = server_signed_commit(
+            &signing,
+            &sha(9000),
+            std::slice::from_ref(&base),
+            "update-branch: rebase",
+        )
+        .await;
+        let tip = model.commit_id.clone();
+        insert_commit(&storage, &model).await;
+
+        checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect("server-identity commit must verify via the server keyring");
+    }
+
+    // AC③: after rotation, a historical commit signed by the rotated-out
+    // generation still verifies (non-revoked historical public keys stay
+    // listed), and the new synthetic commit signed by the new active
+    // generation verifies — both in one chain walk.
+    #[tokio::test]
+    async fn rotated_server_key_generations_verify_mixed_chain() {
+        let (_temp, storage, checker, signing, vault) = setup_server_checker().await;
+        let base = sha(2100);
+
+        // Generation 1 signs the first synthetic commit.
+        let first = server_signed_commit(
+            &signing,
+            &sha(9101),
+            std::slice::from_ref(&base),
+            "update-branch: rebase (gen-1)",
+        )
+        .await;
+        let first_id = first.commit_id.clone();
+        insert_commit(&storage, &first).await;
+
+        // Rotate: generation 2 becomes active; generation 1 stays listed.
+        let rotated = vault
+            .rotate_server_signing_key(test_redis().await)
+            .await
+            .expect("rotate server key");
+        let listed = vault
+            .list_server_signing_public_keys()
+            .await
+            .expect("list public keys");
+        assert_eq!(listed.len(), 2, "both generations stay in the keyring");
+        assert!(listed.iter().any(|k| k.key_id == rotated.key_id));
+
+        // Generation 2 signs the next synthetic commit, chained on the first.
+        let second = server_signed_commit(
+            &signing,
+            &sha(9102),
+            std::slice::from_ref(&first_id),
+            "update-branch: rebase (gen-2)",
+        )
+        .await;
+        let second_id = second.commit_id.clone();
+        insert_commit(&storage, &second).await;
+
+        checker
+            .verify_cl(&base, &second_id)
+            .await
+            .expect("mixed-generation chain must verify after rotation");
+    }
+
+    // AC④ (negative A): the signature comes from the server key (its issuer
+    // fingerprint) but the committer header is a user identity — the user
+    // path resolves no registered key and fails closed; the server keyring
+    // must NOT rescue it. The tampered committer also breaks the payload,
+    // which is fine: the fingerprint lookup precedes (and precludes) any
+    // cryptographic step.
+    #[tokio::test]
+    async fn server_key_with_user_identity_is_fail_closed() {
+        let (_temp, storage, checker, signing, vault) = setup_server_checker().await;
+        let base = sha(2200);
+        let mut model = server_signed_commit(
+            &signing,
+            &sha(9200),
+            std::slice::from_ref(&base),
+            "server-signed but user-identity",
+        )
+        .await;
+        // Precondition: the signing key really is in the server keyring.
+        let active_key_id = vault
+            .list_server_signing_public_keys()
+            .await
+            .expect("list public keys")
+            .first()
+            .map(|k| k.key_id.clone());
+        assert!(active_key_id.is_some(), "server keyring must be non-empty");
+
+        model.committer = Some(COMMITTER.to_string());
+        let tip = model.commit_id.clone();
+        insert_commit(&storage, &model).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("user-identity commit signed by the server key must fail closed");
+        assert!(err.to_string().contains("not registered"), "{err}");
+    }
+
+    // AC⑤ (negative B): a user key signs a commit whose committer header
+    // claims the reserved server identity. The server keyring does not hold
+    // the user key, and the absence of fallback is asserted by registering
+    // the user key in the user table — a fallback would pass, so failure
+    // proves none happened.
+    #[tokio::test]
+    async fn user_key_with_forged_server_identity_is_fail_closed() {
+        let (_temp, storage, checker, signing, _vault) = setup_server_checker().await;
+        // The server keyring exists (gen-1 initialized) but holds no user key.
+        signing.active_key().await.expect("init server key");
+        let user_key = generate_key("mallory <mallory@example.com>");
+        register_key(&storage, "mallory", &user_key).await;
+
+        let base = sha(2300);
+        let tip = sha(2301);
+        let tree = sha(9301);
+        let author = server_author_header();
+        let committer = server_committer_header();
+        let payload =
+            format!("tree {tree}\nparent {base}\n{author}\n{committer}\n\nforge: pretend server\n");
+        let armor = sign_payload(&user_key, &payload, SubpacketConfig::Default);
+        let mut model = commit_model(
+            1,
+            &tip,
+            &tree,
+            std::slice::from_ref(&base),
+            Some(signed_content("forge: pretend server", &armor)),
+        );
+        model.author = Some(author);
+        model.committer = Some(committer);
+        insert_commit(&storage, &model).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("forged server identity must fail against the server keyring");
+        let msg = err.to_string();
+        assert!(msg.contains("server signing key"), "{msg}");
+        assert!(msg.contains("fallback is forbidden"), "{msg}");
+    }
+
+    // AC⑥: a historical server-synthesized commit without a gpgsig block
+    // fails with the dedicated actionable message, not the user-facing one.
+    // (No vault needed: the identity branch precedes any keyring access.)
+    #[tokio::test]
+    async fn unsigned_server_synthesized_commit_gets_actionable_message() {
+        let (_temp, storage, checker) = setup_checker().await;
+        let base = sha(2400);
+        let tip = sha(2401);
+        let mut model = commit_model(
+            1,
+            &tip,
+            &sha(9401),
+            std::slice::from_ref(&base),
+            Some("historical synthetic commit".to_string()),
+        );
+        model.author = Some(server_author_header());
+        model.committer = Some(server_committer_header());
+        insert_commit(&storage, &model).await;
+
+        let err = checker
+            .verify_cl(&base, &tip)
+            .await
+            .expect_err("unsigned historical synthetic commit must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("server-synthesized commit"), "{msg}");
+        assert!(msg.contains("re-trigger the synthesis"), "{msg}");
+        assert!(msg.contains("administrator"), "{msg}");
     }
 }
