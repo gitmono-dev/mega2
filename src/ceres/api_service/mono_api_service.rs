@@ -430,6 +430,19 @@ struct ApplyChangeContext<'a> {
     new_trees: &'a mut HashMap<ObjectHash, Tree>,
 }
 
+/// MC-04 R2: the constructed + server-signed output of a CL-ref update,
+/// before any persistence. Persistence is the caller's job, inside one DB
+/// transaction together with the CL hash move and the commit-listing
+/// rebuild — a failure there must not leave ref/commit/tree pointing at a
+/// range the CL row no longer claims.
+struct PreparedClUpdate {
+    commits: Vec<Commit>,
+    cl_ref: mega_refs::Model,
+    updates: Vec<RefUpdateData>,
+    tree_models: Vec<mega_tree::ActiveModel>,
+    new_commit_id: String,
+}
+
 /// `MonoServiceLogic` is a helper struct for `MonoApiService` containing stateless logic.
 ///
 /// It encapsulates the pure logic methods of `MonoApiService` that do not depend on
@@ -2138,13 +2151,16 @@ impl MonoApiService {
         Ok(())
     }
 
-    /// Apply all CL changes onto the target_head in-memory and emit a single commit on the CL ref.
-    async fn apply_changes_as_single_commit(
+    /// Apply all CL changes onto the target_head in-memory and construct +
+    /// sign the CL-ref update — without persisting anything (MC-04 R2 split:
+    /// persistence moved into `update_branch`'s single transaction). Was
+    /// `apply_changes_as_single_commit`.
+    async fn build_signed_cl_update(
         &self,
         cl: &mega_cl::Model,
         changes: &[ClDiffFile],
         target_head: &str,
-    ) -> Result<String, GitError> {
+    ) -> Result<PreparedClUpdate, GitError> {
         let mono_storage = self.storage.mono_storage();
 
         // Load base commit and its root tree
@@ -2348,7 +2364,7 @@ impl MonoApiService {
             }],
         };
 
-        self.apply_update_result_cl_only(
+        self.prepare_signed_cl_update(
             &result,
             "update-branch: rebase",
             &cl.link,
@@ -2762,13 +2778,17 @@ impl MonoApiService {
 
     /// Apply update result but only update the CL ref (never main).
     /// Optionally override the parent commit for the first created commit (used by rebase).
-    async fn apply_update_result_cl_only(
+    /// Construct and sign a CL-ref update without persisting anything (MC-04
+    /// R2 split of the former `apply_update_result_cl_only`): the MC-09
+    /// signing precheck runs before any output is produced, and every output
+    /// carries only the final signed hash (see `process_ref_updates_cl_only`).
+    async fn prepare_signed_cl_update(
         &self,
         result: &TreeUpdateResult,
         commit_msg: &str,
         cl_link: &str,
         parent_override: Option<ObjectHash>,
-    ) -> Result<String, GitError> {
+    ) -> Result<PreparedClUpdate, GitError> {
         let storage = self.storage.mono_storage();
         let mut new_commit_id = String::new();
         let mut commits: Vec<Commit> = Vec::new();
@@ -2784,7 +2804,7 @@ impl MonoApiService {
 
         // MC-09: fail-closed when the server-signing vault is not wired in.
         // Signing happens inside `process_ref_updates_cl_only`, before any
-        // ref/commit/tree persistence below.
+        // persistence by the caller.
         let signing = self
             .server_signing_context()
             .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -2807,24 +2827,14 @@ impl MonoApiService {
                 ref_name = %cl_ref.ref_name,
                 ref_path = %cl_ref.path,
                 commit_msg,
-                "apply_update_result_cl_only: no commit_id generated"
+                "prepare_signed_cl_update: no commit_id generated"
             );
             return Err(GitError::CustomError(
                 "no commit_id generated: no matching refs found for the update paths".into(),
             ));
         }
 
-        storage
-            .batch_update_by_path_concurrent(updates)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-
-        storage
-            .save_mega_commits(commits, None)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-
-        let save_trees: Vec<mega_tree::ActiveModel> = result
+        let tree_models: Vec<mega_tree::ActiveModel> = result
             .updated_trees
             .clone()
             .into_iter()
@@ -2835,12 +2845,13 @@ impl MonoApiService {
             })
             .collect();
 
-        storage
-            .batch_save_model(save_trees)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-
-        Ok(new_commit_id)
+        Ok(PreparedClUpdate {
+            commits,
+            cl_ref,
+            updates,
+            tree_models,
+            new_commit_id,
+        })
     }
 
     /// Fetches the content difference for a merge request, paginated by page_id and page_size.
@@ -3340,8 +3351,54 @@ impl MonoApiService {
             .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         if cl_changed.is_empty() {
-            // No-op rebase: just advance base hash and log.
-            stg.update_cl_hash(cl.clone(), &target_head, &cl.to_hash)
+            // No-op rebase: the CL's aggregate diff is empty — its content is
+            // already contained in the target head's tree.
+            //
+            // MC-04 R3: represent that as a self-consistent empty range
+            // `(from, to) = (target_head, target_head)`. The previous shape
+            // (move from to target_head, keep the old tip) was *not* an empty
+            // range: the old tip's tree can lack files the target has, so a
+            // merge of such a CL would adopt the stale tip tree and roll back
+            // target files, and the GPG chain walk requires `from` reachable
+            // from `to` (it would fail closed). The active CL ref follows to
+            // the target head and the commit listing is cleared (an empty
+            // listing reads as an empty list); the old tip stays in the
+            // object store for audit, and the conversation below records the
+            // move.
+            //
+            // Merge/GPG推演 for such an empty-range CL (from == to), both
+            // content-safe by construction: merge_cl passes the
+            // from==main-head check and synthesizes a no-op trunk commit with
+            // the unchanged tree (the diff is empty by construction); if a
+            // GPG check runs on the degenerate `(from == to]` range, MC-02
+            // verifies the single tip — a trunk commit, unsigned by design
+            // (MC-09 scope) — and fails closed, blocking the merge. Neither
+            // path can lose content; merge/GPG logic is deliberately
+            // untouched (out of this card's scope).
+            let mono = self.storage.mono_storage();
+            let cl_ref_name = format!("refs/cl/{cl_link}");
+            let mut cl_ref = mono
+                .get_ref_by_name(&cl_ref_name)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+                .ok_or_else(|| GitError::CustomError("CL ref not found".to_string()))?;
+            cl_ref.ref_commit_hash = target_head.clone();
+            cl_ref.ref_tree_hash = main_ref.ref_tree_hash.clone();
+            let txn = self
+                .storage
+                .begin_db_transaction()
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            mono.update_ref(cl_ref, Some(&txn))
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            stg.update_cl_hash_in_txn(cl.clone(), &target_head, &target_head, &txn)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            stg.delete_cl_commits_in_txn(cl_link, &txn)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            txn.commit()
                 .await
                 .map_err(|e| GitError::CustomError(e.to_string()))?;
             conv_stg
@@ -3357,16 +3414,51 @@ impl MonoApiService {
                 )
                 .await
                 .map_err(|e| GitError::CustomError(e.to_string()))?;
-            return Ok(cl.to_hash);
+            return Ok(target_head);
         }
 
-        // Apply all changes in-memory atop target_head and emit a single commit for the CL ref.
-        let new_head = self
-            .apply_changes_as_single_commit(&cl, &cl_changed, &target_head)
+        // Construct and sign the CL-ref update in memory first (MC-09
+        // precheck semantics: zero persistence before signing succeeds), then
+        // persist commit rows, tree rows, the CL ref, the CL hash move and
+        // the commit-listing rebuild in ONE transaction (MC-04 R3) — a
+        // failure anywhere leaves every sink untouched. The listing content
+        // is the constructed chain itself: `collect_cl_chain`'s DB walk cannot
+        // see the not-yet-persisted commit, and the parent threading in
+        // `process_ref_updates_cl_only` (parent_override = target_head)
+        // already guarantees the (target_head, new_head] topology.
+        let prepared = self
+            .build_signed_cl_update(&cl, &cl_changed, &target_head)
             .await?;
-
-        // Update cl hashes and log
-        stg.update_cl_hash(cl.clone(), &target_head, &new_head)
+        let new_head = prepared.new_commit_id.clone();
+        let mono = self.storage.mono_storage();
+        let mut cl_ref = prepared.cl_ref.clone();
+        for update in &prepared.updates {
+            if update.ref_name == cl_ref.ref_name {
+                cl_ref.ref_commit_hash = update.commit_id.clone();
+                cl_ref.ref_tree_hash = update.tree_hash.clone();
+            }
+        }
+        let txn = self
+            .storage
+            .begin_db_transaction()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        mono.update_ref(cl_ref, Some(&txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        mono.save_mega_commits(prepared.commits.clone(), Some(&txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        mono.batch_save_model_with_txn(prepared.tree_models.clone(), Some(&txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        stg.update_cl_hash_in_txn(cl.clone(), &target_head, &new_head, &txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        stg.save_cl_commits_in_txn(cl_link, &prepared.commits, &txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        txn.commit()
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
         conv_stg
@@ -6321,6 +6413,304 @@ mod mc09_tests {
         // MC-10 test hygiene: no `gpg_key` registration — the chain must
         // verify through the server keyring routing alone (MC-11).
         assert_chain_verifies(&storage, &target_head, &new_head).await;
+    }
+
+    // MC-04 R2: update_branch's CL hash move and the commit-listing rebuild
+    // share one transaction — after a rebase the listing is readable (the
+    // read-side coverage check must not fail closed on the moved range) and
+    // equals the new `(target_head, new_head]` chain: exactly the synthesized
+    // commit.
+    #[tokio::test]
+    async fn update_branch_rebuilds_cl_commits_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = test_vault(temp.path()).await;
+        let redis = test_redis().await;
+        let storage = crate::jupiter::tests::test_storage(temp.path())
+            .await
+            .with_vault(vault.clone());
+        let service = signing_service(&storage, redis.clone());
+
+        let link = "MC04UB1";
+        let (_from_hash, cl_tip, _target_head) = chain_fixture(&storage, link).await;
+
+        // Pre-stage a stale listing (the pre-rebase tip) so the rebuild's
+        // delete+insert is exercised.
+        let cl_stg = storage.cl_storage();
+        let stale = [Commit::from_mega_model(
+            storage
+                .mono_storage()
+                .get_commit_by_hash(&cl_tip)
+                .await
+                .expect("load cl tip")
+                .expect("cl tip row"),
+        )];
+        let txn = storage.begin_db_transaction().await.expect("begin txn");
+        cl_stg
+            .save_cl_commits_in_txn(link, &stale, &txn)
+            .await
+            .expect("stage stale listing");
+        txn.commit().await.expect("commit staging txn");
+
+        let new_head = service
+            .update_branch("alice", link)
+            .await
+            .expect("update_branch with signing");
+
+        let listing = cl_stg
+            .get_cl_commits(link)
+            .await
+            .expect("listing must be readable after update_branch");
+        assert_eq!(
+            listing.len(),
+            1,
+            "the rebase emits exactly one synthesized commit"
+        );
+        assert_eq!(
+            listing[0].commit_sha, new_head,
+            "the listing is the new (target_head, new_head] chain"
+        );
+        assert_eq!(listing[0].message, "update-branch: rebase");
+        assert!(
+            listing[0].author_email.contains(SERVER_SIGNING_EMAIL),
+            "the listing member is the server-signed synthesized commit"
+        );
+    }
+
+    // MC-04 R2 (no-change branch): a no-op rebase synthesizes no commit, so
+    // the new range has no valid chain — the listing must be cleared with the
+    // base move (atomically), and reads return an empty list rather than
+    // failing the coverage check.
+    #[tokio::test]
+    async fn update_branch_no_change_clears_cl_commits_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        // No vault: the no-change branch synthesizes nothing, so no signing
+        // capability is needed.
+        let service = test_service(&storage);
+
+        let link = "MC04UB2";
+        // Fixture like chain_fixture, but the CL commit shares the base tree —
+        // the CL diff (from → to) is empty.
+        let blob_base = ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap();
+        let blob_other = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
+        let from_tree = Tree::from_tree_items(vec![blob_item("base.txt", &blob_base.to_string())])
+            .expect("from tree");
+        let target_tree = Tree::from_tree_items(vec![
+            blob_item("base.txt", &blob_base.to_string()),
+            blob_item("other.txt", &blob_other.to_string()),
+        ])
+        .expect("target tree");
+        let from_commit = Commit::from_tree_id(from_tree.id, vec![], "mc04 base");
+        let cl_commit = Commit::from_tree_id(from_tree.id, vec![from_commit.id], "mc04 cl no-op");
+        let target_commit = Commit::from_tree_id(target_tree.id, vec![], "mc04 main advanced");
+
+        let mono = storage.mono_storage();
+        mono.save_mega_commits(
+            vec![
+                from_commit.clone(),
+                cl_commit.clone(),
+                target_commit.clone(),
+            ],
+            None,
+        )
+        .await
+        .expect("fixture commits");
+        mono.save_mega_trees(vec![from_tree.clone()], from_commit.id, None)
+            .await
+            .expect("from/cl tree");
+        setup_main_ref(&storage, &target_tree, &target_commit.id.to_string()).await;
+        let now = chrono::Utc::now().naive_utc();
+        mono.save_refs(
+            mega_refs::Model {
+                id: 2,
+                path: "/".to_string(),
+                ref_name: format!("refs/cl/{link}"),
+                ref_commit_hash: cl_commit.id.to_string(),
+                ref_tree_hash: from_tree.id.to_string(),
+                created_at: now,
+                updated_at: now,
+                is_cl: true,
+            },
+            None,
+        )
+        .await
+        .expect("cl ref");
+        storage
+            .cl_storage()
+            .new_cl(
+                "/",
+                link,
+                "mc04 no-change update-branch",
+                "main",
+                &from_commit.id.to_string(),
+                &cl_commit.id.to_string(),
+                "alice",
+            )
+            .await
+            .expect("cl");
+        // Pre-stage the pre-rebase listing (the CL tip).
+        let cl_stg = storage.cl_storage();
+        let txn = storage.begin_db_transaction().await.expect("begin txn");
+        cl_stg
+            .save_cl_commits_in_txn(link, std::slice::from_ref(&cl_commit), &txn)
+            .await
+            .expect("stage listing");
+        txn.commit().await.expect("commit staging txn");
+
+        let returned = service
+            .update_branch("alice", link)
+            .await
+            .expect("no-change update_branch");
+
+        // MC-04 R3: the empty-range state is self-consistent —
+        // from == to == target_head, the CL ref follows, the listing is
+        // cleared, and the old tip stays in the object store for audit.
+        assert_eq!(
+            returned,
+            target_commit.id.to_string(),
+            "the empty range's head is the target head"
+        );
+        let cl = cl_stg.get_cl(link).await.expect("get_cl").expect("cl row");
+        assert_eq!(cl.from_hash, target_commit.id.to_string(), "base advanced");
+        assert_eq!(
+            cl.to_hash,
+            target_commit.id.to_string(),
+            "head follows the base: the empty range is self-consistent"
+        );
+        let cl_ref = mono
+            .get_ref_by_name(&format!("refs/cl/{link}"))
+            .await
+            .expect("load cl ref")
+            .expect("cl ref row");
+        assert_eq!(
+            cl_ref.ref_commit_hash,
+            target_commit.id.to_string(),
+            "the active CL ref follows to the target head"
+        );
+        assert_eq!(
+            cl_ref.ref_tree_hash,
+            target_tree.id.to_string(),
+            "the CL ref tree follows to the target tree"
+        );
+        let listing = cl_stg
+            .get_cl_commits(link)
+            .await
+            .expect("listing must be readable (empty) after a no-change rebase");
+        assert!(
+            listing.is_empty(),
+            "a no-change rebase clears the listing (the new range has no chain)"
+        );
+        assert!(
+            mono.get_commit_by_hash(&cl_commit.id.to_string())
+                .await
+                .expect("lookup old tip")
+                .is_some(),
+            "the old tip commit stays in the object store for audit"
+        );
+    }
+
+    // MC-04 R3 fault injection: if the commit-listing write fails inside
+    // update_branch's single transaction, every sink stays untouched — the CL
+    // ref, commit rows, tree rows and the CL row all keep the old range. The
+    // transaction body below mirrors `update_branch`'s statement sequence.
+    #[tokio::test]
+    async fn update_branch_listing_failure_leaves_all_sinks_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = test_vault(temp.path()).await;
+        let redis = test_redis().await;
+        let storage = crate::jupiter::tests::test_storage(temp.path())
+            .await
+            .with_vault(vault.clone());
+        let service = signing_service(&storage, redis.clone());
+
+        let link = "MC04UB3";
+        let (from_hash, cl_tip, target_head) = chain_fixture(&storage, link).await;
+
+        let cl = storage
+            .cl_storage()
+            .get_cl(link)
+            .await
+            .expect("get_cl")
+            .expect("cl row");
+        let old_blobs = service
+            .get_commit_blobs(&cl.from_hash)
+            .await
+            .expect("old blobs");
+        let new_blobs = service
+            .get_commit_blobs(&cl.to_hash)
+            .await
+            .expect("new blobs");
+        let changes = service
+            .cl_files_list(old_blobs, new_blobs)
+            .await
+            .expect("cl changes");
+        assert!(!changes.is_empty(), "the fixture CL has a real change");
+
+        let prepared = service
+            .build_signed_cl_update(&cl, &changes, &target_head)
+            .await
+            .expect("construct + sign the update");
+
+        // Mirror update_branch's single-transaction persistence body, with a
+        // poisoned listing batch (duplicate (link, sha) primary key) — the
+        // write must fail and roll everything back.
+        let mono = storage.mono_storage();
+        let mut cl_ref = prepared.cl_ref.clone();
+        for update in &prepared.updates {
+            if update.ref_name == cl_ref.ref_name {
+                cl_ref.ref_commit_hash = update.commit_id.clone();
+                cl_ref.ref_tree_hash = update.tree_hash.clone();
+            }
+        }
+        let poisoned: Vec<Commit> = vec![prepared.commits[0].clone(), prepared.commits[0].clone()];
+        let txn = storage.begin_db_transaction().await.expect("begin txn");
+        mono.update_ref(cl_ref, Some(&txn))
+            .await
+            .expect("ref update in txn");
+        mono.save_mega_commits(prepared.commits.clone(), Some(&txn))
+            .await
+            .expect("commits in txn");
+        mono.batch_save_model_with_txn(prepared.tree_models.clone(), Some(&txn))
+            .await
+            .expect("trees in txn");
+        storage
+            .cl_storage()
+            .update_cl_hash_in_txn(cl.clone(), &target_head, &prepared.new_commit_id, &txn)
+            .await
+            .expect("cl hashes in txn");
+        storage
+            .cl_storage()
+            .save_cl_commits_in_txn(link, &poisoned, &txn)
+            .await
+            .expect_err("the poisoned listing write must fail");
+        drop(txn); // rolls back
+
+        // All four sinks unchanged.
+        let cl_ref_after = mono
+            .get_ref_by_name(&format!("refs/cl/{link}"))
+            .await
+            .expect("load cl ref")
+            .expect("cl ref row");
+        assert_eq!(cl_ref_after.ref_commit_hash, cl_tip, "CL ref unchanged");
+        assert_eq!(commit_count(&storage).await, 3, "no new commit persisted");
+        assert_eq!(tree_count(&storage).await, 3, "no new tree persisted");
+        let cl_after = storage
+            .cl_storage()
+            .get_cl(link)
+            .await
+            .expect("get_cl")
+            .expect("cl row");
+        assert_eq!(cl_after.from_hash, from_hash, "CL from_hash unchanged");
+        assert_eq!(cl_after.to_hash, cl_tip, "CL to_hash unchanged");
+        assert!(
+            storage
+                .cl_storage()
+                .get_cl_commits(link)
+                .await
+                .expect("listing read")
+                .is_empty(),
+            "no listing rows persisted"
+        );
     }
 
     // AC③/AC④ (update_branch chain): without the vault handle the synthesis

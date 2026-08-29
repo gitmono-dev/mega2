@@ -9,7 +9,7 @@ use crate::{
         api_service::{ApiHandler, cache::GitObjectCache},
         build_trigger::{BuildTriggerService, TriggerContext},
         code_edit::utils as edit_utils,
-        merge_checker::CheckerRegistry,
+        merge_checker::{CheckerRegistry, MAX_CL_CHAIN_COMMITS},
     },
     common::errors::MegaError,
     jupiter::{
@@ -18,6 +18,62 @@ use crate::{
         utils::converter::FromMegaModel,
     },
 };
+
+/// MC-04: rebuild a CL's complete commit chain for its current
+/// `(from_hash, to_hash)` — a first-parent walk from `to_hash` down to
+/// `from_hash` (the frozen baseline, not itself a member), tip first.
+///
+/// The listing must never be the push's increment: an update push keeps the
+/// CL's frozen `from_hash` and only advances `to_hash`, so the chain is
+/// always rebuilt over the CL's full cumulative range. Bounded by
+/// `MAX_CL_CHAIN_COMMITS` (the receive side guarantees the cumulative range
+/// fits, ADR-MC-07; this is the fail-closed backstop) and fail-closed on a
+/// missing commit row, a parent cycle, or a walk that roots out before
+/// reaching `from_hash`.
+pub(crate) async fn collect_cl_chain(
+    storage: &Storage,
+    from_hash: &str,
+    to_hash: &str,
+) -> Result<Vec<Commit>, MegaError> {
+    let mono_storage = storage.mono_storage();
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut current = to_hash.to_string();
+    while current != from_hash {
+        if !visited.insert(current.clone()) {
+            return Err(MegaError::Other(format!(
+                "CL chain has a parent cycle at commit {current}; cannot rebuild the listing"
+            )));
+        }
+        if chain.len() >= MAX_CL_CHAIN_COMMITS {
+            return Err(MegaError::Other(format!(
+                "CL chain exceeds the {MAX_CL_CHAIN_COMMITS}-commit limit \
+                 ({from_hash}..{to_hash}); cannot rebuild the listing"
+            )));
+        }
+        let model = mono_storage
+            .get_commit_by_hash(&current)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!(
+                    "CL chain commit {current} is missing from storage; cannot rebuild the \
+                     listing (fail-closed)"
+                ))
+            })?;
+        let commit = Commit::from_mega_model(model);
+        current = match commit.parent_commit_ids.first() {
+            Some(parent) => parent.to_string(),
+            None => {
+                return Err(MegaError::Other(format!(
+                    "CL chain rooted out at commit {current} before reaching the frozen base \
+                     {from_hash}; cannot rebuild the listing (fail-closed)"
+                )));
+            }
+        };
+        chain.push(commit);
+    }
+    Ok(chain)
+}
 
 pub(crate) trait ConversationMessageFormater {
     fn format(
@@ -262,8 +318,25 @@ impl<
                 tracing::info!("repeat commit with change_list: {}, do nothing", cl.id);
             }
             _ => {
+                // MC-04: the to_hash advance and the commit-listing rebuild
+                // share one DB transaction — neither takes effect without the
+                // other, so a listing failure rolls the advance back and a
+                // retried push simply re-runs this path. The listing is the
+                // complete chain over the frozen `(from_hash, to_hash]`, never
+                // the push's increment.
+                let chain = collect_cl_chain(storage, &cl.from_hash, to_hash).await?;
+                let txn = storage.begin_db_transaction().await?;
+                cl_stg
+                    .update_cl_to_hash_in_txn(cl.clone(), to_hash, &txn)
+                    .await?;
+                cl_stg
+                    .save_cl_commits_in_txn(&cl.link, &chain, &txn)
+                    .await?;
+                txn.commit().await.map_err(MegaError::Db)?;
                 // Freeze cl base for Open cl: do NOT auto-update from_hash here.
                 // Only update to_hash to reflect latest edits, and prompt user to run Update Branch.
+                // The conversation entry narrates the committed advance, so it
+                // is written only after the transaction commits.
                 comment_stg
                     .add_conversation(
                         &cl.link,
@@ -272,7 +345,6 @@ impl<
                         ConvTypeEnum::Comment,
                     )
                     .await?;
-                cl_stg.update_cl_to_hash(cl, to_hash).await?;
             }
         }
         Ok(())
@@ -294,9 +366,14 @@ impl<
                 .await?
                 .expect("invalid to_hash"),
         );
-        let cl = storage
-            .cl_storage()
-            .new_cl_model(
+        let cl_stg = storage.cl_storage();
+        // MC-04: CL creation and the commit-listing rebuild share one DB
+        // transaction — the listing is the complete `(from_hash, to_hash]`
+        // chain, rebuilt at write time.
+        let chain = collect_cl_chain(storage, from_hash, to_hash).await?;
+        let txn = storage.begin_db_transaction().await?;
+        let cl = cl_stg
+            .new_cl_model_in_txn(
                 repo_path,
                 &cl_link,
                 &dst_commit.format_message(),
@@ -304,8 +381,13 @@ impl<
                 from_hash,
                 to_hash,
                 username,
+                &txn,
             )
             .await?;
+        cl_stg
+            .save_cl_commits_in_txn(&cl_link, &chain, &txn)
+            .await?;
+        txn.commit().await.map_err(MegaError::Db)?;
 
         self.clref_acceptor
             .accept(
@@ -457,5 +539,223 @@ mod tests {
         assert_eq!(updated.to_hash, "dddddddddddddddddddddddddddddddddddddddd");
         assert_eq!(updated.link, original.link);
         assert_eq!(updated.path, original.path);
+    }
+
+    // --- MC-04: CL row write and commit-listing rebuild in one transaction ---
+
+    use std::sync::Arc;
+
+    use sea_orm::{ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter};
+    use tempfile::TempDir;
+
+    use crate::{
+        callisto::{mega_commit, mega_tree},
+        ceres::{
+            api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
+            code_edit::on_push::OnpushCodeEdit,
+        },
+        jupiter::{
+            storage::{Storage, base_storage::StorageConnector},
+            tests::test_storage,
+        },
+    };
+
+    /// The well-known git empty-tree id — the seeded commits all share it, so
+    /// the reviewer/diff machinery sees an empty change set.
+    const MC04_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+    fn mc04_sha(n: u64) -> String {
+        format!("{n:040x}")
+    }
+
+    fn mc04_commit_row(n: u64, parents: &[u64]) -> mega_commit::Model {
+        mega_commit::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            commit_id: mc04_sha(n),
+            tree: MC04_TREE.to_string(),
+            parents_id: serde_json::json!(parents.iter().map(|p| mc04_sha(*p)).collect::<Vec<_>>()),
+            author: Some("author Test User <mc04@example.invalid> 1750000000 +0000".to_string()),
+            committer: Some(
+                "committer Test User <mc04@example.invalid> 1750000000 +0000".to_string(),
+            ),
+            content: Some(format!("mc04 message {}", n)),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    async fn mc04_seed(storage: &Storage, rows: Vec<mega_commit::Model>) {
+        let mono_storage = storage.mono_storage();
+        let conn = mono_storage.get_connection();
+        // The shared empty tree is seeded once; the update phase must not
+        // duplicate it.
+        if mega_tree::Entity::find()
+            .filter(mega_tree::Column::TreeId.eq(MC04_TREE))
+            .one(conn)
+            .await
+            .expect("probe empty tree")
+            .is_none()
+        {
+            mega_tree::Entity::insert(
+                mega_tree::Model {
+                    id: crate::callisto::entity_ext::generate_id(),
+                    tree_id: MC04_TREE.to_string(),
+                    sub_trees: Vec::new(),
+                    size: 0,
+                    created_at: chrono::Utc::now().naive_utc(),
+                    pack_id: String::new(),
+                    pack_offset: 0,
+                    commit_id: String::new(),
+                }
+                .into_active_model(),
+            )
+            .exec(conn)
+            .await
+            .expect("insert empty tree");
+        }
+        mega_commit::Entity::insert_many(
+            rows.into_iter()
+                .map(|m| m.into_active_model())
+                .collect::<Vec<_>>(),
+        )
+        .exec(conn)
+        .await
+        .expect("insert commits");
+    }
+
+    fn mc04_editor(storage: &Storage) -> OnpushCodeEdit {
+        // Never connected: the listing path under test does not touch the cache.
+        let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
+            ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+            ::redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy connection manager");
+        let api = MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection,
+                prefix: "mc04-test".to_string(),
+            }),
+        };
+        OnpushCodeEdit::from("/", "main", &mc04_sha(0), &api)
+    }
+
+    #[tokio::test]
+    async fn update_or_create_cl_writes_cl_and_listing_atomically() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        mc04_seed(
+            &storage,
+            vec![
+                mc04_commit_row(500, &[]),
+                mc04_commit_row(501, &[500]),
+                mc04_commit_row(502, &[501]),
+            ],
+        )
+        .await;
+        let editor = mc04_editor(&storage);
+
+        let cl = editor
+            .update_or_create_cl(&storage, &mc04_sha(500), &mc04_sha(502), "tester")
+            .await
+            .expect("create CL with listing");
+        assert_eq!(cl.from_hash, mc04_sha(500));
+        assert_eq!(cl.to_hash, mc04_sha(502));
+        let listing = storage
+            .cl_storage()
+            .get_cl_commits(&cl.link)
+            .await
+            .expect("read listing");
+        let shas: Vec<String> = listing.iter().map(|r| r.commit_sha.clone()).collect();
+        assert_eq!(
+            shas,
+            vec![mc04_sha(501), mc04_sha(502)],
+            "the create path lists the full chain, oldest first"
+        );
+        assert_eq!(listing[0].author_email, "mc04@example.invalid");
+
+        // Update path: advance to 503 with the frozen from_hash — the listing
+        // must rebuild over the whole cumulative chain, not the increment.
+        mc04_seed(&storage, vec![mc04_commit_row(503, &[502])]).await;
+        let cl2 = editor
+            .update_or_create_cl(&storage, &mc04_sha(500), &mc04_sha(503), "tester")
+            .await
+            .expect("update CL");
+        assert_eq!(cl2.link, cl.link, "the update reuses the open CL");
+        assert_eq!(cl2.from_hash, mc04_sha(500), "from_hash stays frozen");
+        assert_eq!(cl2.to_hash, mc04_sha(503));
+        let listing2 = storage
+            .cl_storage()
+            .get_cl_commits(&cl.link)
+            .await
+            .expect("read listing after update");
+        let shas2: Vec<String> = listing2.iter().map(|r| r.commit_sha.clone()).collect();
+        assert_eq!(
+            shas2,
+            vec![mc04_sha(501), mc04_sha(502), mc04_sha(503)],
+            "the update rebuilds the complete chain from the frozen from_hash"
+        );
+    }
+
+    // collect_cl_chain fail-closed: a chain member missing from storage errors
+    // instead of producing a truncated listing.
+    #[tokio::test]
+    async fn collect_cl_chain_missing_member_fails_closed() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        // sha(601) — the middle member — is deliberately not seeded.
+        mc04_seed(&storage, vec![mc04_commit_row(602, &[601])]).await;
+
+        let err = super::collect_cl_chain(&storage, &mc04_sha(600), &mc04_sha(602))
+            .await
+            .expect_err("a walk that never reaches the base must fail closed");
+        assert!(err.to_string().contains("fail-closed"), "{err}");
+        assert!(err.to_string().contains(&mc04_sha(601)), "{err}");
+    }
+
+    // MC-04 R3: a CL left at an empty range (from == to) by a no-change rebase
+    // recovers normally on the next push — the update path advances to the new
+    // tip and the listing is rebuilt to the new chain.
+    #[tokio::test]
+    async fn update_or_create_cl_recovers_after_empty_range_rebase() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        mc04_seed(
+            &storage,
+            vec![mc04_commit_row(700, &[]), mc04_commit_row(701, &[700])],
+        )
+        .await;
+        let editor = mc04_editor(&storage);
+
+        // Seed the empty-range state directly (from == to), as the no-change
+        // rebase leaves it.
+        storage
+            .cl_storage()
+            .new_cl_model(
+                "/",
+                "CLMC04ER",
+                "empty range",
+                "main",
+                &mc04_sha(700),
+                &mc04_sha(700),
+                "tester",
+            )
+            .await
+            .expect("seed empty-range CL");
+
+        let cl = editor
+            .update_or_create_cl(&storage, &mc04_sha(700), &mc04_sha(701), "tester")
+            .await
+            .expect("push onto an empty-range CL");
+        assert_eq!(cl.from_hash, mc04_sha(700), "from stays frozen");
+        assert_eq!(cl.to_hash, mc04_sha(701), "to advances to the new tip");
+        let listing = storage
+            .cl_storage()
+            .get_cl_commits(&cl.link)
+            .await
+            .expect("listing readable after recovery push");
+        let shas: Vec<String> = listing.iter().map(|r| r.commit_sha.clone()).collect();
+        assert_eq!(shas, vec![mc04_sha(701)], "the listing is the new chain");
     }
 }

@@ -34,7 +34,7 @@ use crate::{
     },
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
-        code_edit::{on_push::OnpushCodeEdit, utils::get_changed_files},
+        code_edit::{model::collect_cl_chain, on_push::OnpushCodeEdit, utils::get_changed_files},
         model::change_list::ClDiffFile,
         pack::{
             RepoHandler,
@@ -993,6 +993,22 @@ impl MonoRepo {
         let cl = editor
             .update_or_create_cl(&self.storage, &from_hash, &to_hash, &username)
             .await?;
+        // MC-04: the commit listing is rebuilt in the CL update's own
+        // transaction (code_edit/model.rs). A CL whose listing is missing or
+        // does not cover its current `to_hash` — legacy CLs, or intermediate
+        // states from before this invariant — gets the listing rebuilt
+        // idempotently here, without touching the CL body (ADR-MC-05 R2: this
+        // is not "creating or changing a CL"). The rebuild is conditional on
+        // the CL still sitting at the probed `(from_hash, to_hash)` — a
+        // concurrent newer push abandons it rather than being overwritten by a
+        // stale listing (Codex MC-04 R1 P1-2).
+        let cl_stg = self.storage.cl_storage();
+        if !cl_stg.cl_commits_contain(&cl.link, &cl.to_hash).await? {
+            let chain = collect_cl_chain(&self.storage, &cl.from_hash, &cl.to_hash).await?;
+            cl_stg
+                .rebuild_cl_commits_if_current(&cl.link, &cl.from_hash, &cl.to_hash, &chain)
+                .await?;
+        }
         self.traverses_tree_and_update_filepath().await?;
         if self.bellatrix.enable_build() {
             editor
@@ -1448,20 +1464,20 @@ mod tests {
             pack::entry::Entry,
         },
     };
-    use sea_orm::{EntityTrait, IntoActiveModel, PaginatorTrait};
+    use sea_orm::{EntityTrait, IntoActiveModel, PaginatorTrait, TransactionTrait};
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
     use super::{MonoRepo, RepoHandler};
     use crate::{
         bellatrix::Bellatrix,
-        callisto::{commit_auths, mega_commit},
+        callisto::{commit_auths, mega_commit, mega_tree},
         ceres::{api_service::cache::GitObjectCache, protocol::import_refs::RefCommand},
         common::utils::ZERO_ID,
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
             tests::test_storage,
-            utils::converter::IntoMegaModel,
+            utils::converter::{FromMegaModel, IntoMegaModel},
         },
     };
 
@@ -1641,6 +1657,240 @@ mod tests {
             commit_auth_count(&storage).await,
             0,
             "unpack/save_entry must not bind commits (Codex R1 P1-2)"
+        );
+    }
+
+    // --- MC-04: pipeline backfill of a missing/stale CL commit listing ---
+
+    /// The well-known git empty-tree id: the seeded chain shares it, so the
+    /// pipeline's file walk is a no-op.
+    const MC04_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+    fn mc04_sha(n: u64) -> String {
+        format!("{n:040x}")
+    }
+
+    fn mc04_commit_row(n: u64, parents: &[u64]) -> mega_commit::Model {
+        mega_commit::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            commit_id: mc04_sha(n),
+            tree: MC04_TREE.to_string(),
+            parents_id: serde_json::json!(parents.iter().map(|p| mc04_sha(*p)).collect::<Vec<_>>()),
+            author: Some("author Test User <mc04@example.invalid> 1750000000 +0000".to_string()),
+            committer: Some(
+                "committer Test User <mc04@example.invalid> 1750000000 +0000".to_string(),
+            ),
+            content: Some(format!("mc04 message {n}")),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    /// MC-04 AC⑥: a CL whose listing does not cover its current `to_hash`
+    /// (missing or stale — legacy rows, or intermediate states from before the
+    /// transactional invariant) gets the listing rebuilt by the post-push
+    /// pipeline over the full frozen `(from_hash, to_hash]` chain, with the CL
+    /// body untouched.
+    #[tokio::test]
+    async fn post_push_pipeline_backfills_missing_cl_commits() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let mono_storage = storage.mono_storage();
+        // Seed the shared empty tree and the chain t0 ← t1 ← t2.
+        mega_tree::Entity::insert(
+            mega_tree::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                tree_id: MC04_TREE.to_string(),
+                sub_trees: Vec::new(),
+                size: 0,
+                created_at: chrono::Utc::now().naive_utc(),
+                pack_id: String::new(),
+                pack_offset: 0,
+                commit_id: String::new(),
+            }
+            .into_active_model(),
+        )
+        .exec(mono_storage.get_connection())
+        .await
+        .expect("insert empty tree");
+        mega_commit::Entity::insert_many(
+            vec![
+                mc04_commit_row(700, &[]),
+                mc04_commit_row(701, &[700]),
+                mc04_commit_row(702, &[701]),
+            ]
+            .into_iter()
+            .map(|m| m.into_active_model())
+            .collect::<Vec<_>>(),
+        )
+        .exec(mono_storage.get_connection())
+        .await
+        .expect("insert chain");
+        // The open CL exists with to_hash = t2, but its listing is empty (the
+        // state the backfill exists for).
+        let seeded_cl = storage
+            .cl_storage()
+            .new_cl_model(
+                "/",
+                "CLMC04BP",
+                "backfill probe",
+                "main",
+                &mc04_sha(700),
+                &mc04_sha(702),
+                "tester",
+            )
+            .await
+            .expect("seed open CL");
+
+        let commands = vec![RefCommand::new(
+            mc04_sha(700),
+            mc04_sha(702),
+            "refs/heads/main".to_string(),
+        )];
+        let repo = test_monorepo(
+            &storage,
+            commands,
+            id_set(&[&mc04_sha(701), &mc04_sha(702)]),
+            id_set(&[&mc04_sha(701), &mc04_sha(702)]),
+        );
+
+        repo.run_mono_post_push_pipeline()
+            .await
+            .expect("pipeline must run");
+
+        let listing = storage
+            .cl_storage()
+            .get_cl_commits("CLMC04BP")
+            .await
+            .expect("read backfilled listing");
+        let shas: Vec<String> = listing.iter().map(|r| r.commit_sha.clone()).collect();
+        assert_eq!(
+            shas,
+            vec![mc04_sha(701), mc04_sha(702)],
+            "the backfilled listing must be the full (from, to] chain, oldest first"
+        );
+        assert_eq!(listing[0].author_email, "mc04@example.invalid");
+
+        let cl_after = storage
+            .cl_storage()
+            .get_cl("CLMC04BP")
+            .await
+            .expect("get_cl")
+            .expect("CL row exists");
+        assert_eq!(cl_after.from_hash, seeded_cl.from_hash, "CL from unchanged");
+        assert_eq!(cl_after.to_hash, seeded_cl.to_hash, "CL to unchanged");
+        assert_eq!(cl_after.title, seeded_cl.title, "CL title unchanged");
+        assert_eq!(cl_after.status, seeded_cl.status, "CL status unchanged");
+        assert_eq!(
+            cl_after.updated_at, seeded_cl.updated_at,
+            "the backfill must not touch the CL body (updated_at unchanged)"
+        );
+    }
+
+    /// MC-04 R1 P2: the other staleness shape — an old listing exists but does
+    /// not cover the CL's current `to_hash` (it was built for a previous tip).
+    /// The probe must call it stale and the backfill must rebuild the full
+    /// chain to the current tip.
+    #[tokio::test]
+    async fn post_push_pipeline_backfills_stale_cl_commits() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let mono_storage = storage.mono_storage();
+        mega_tree::Entity::insert(
+            mega_tree::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                tree_id: MC04_TREE.to_string(),
+                sub_trees: Vec::new(),
+                size: 0,
+                created_at: chrono::Utc::now().naive_utc(),
+                pack_id: String::new(),
+                pack_offset: 0,
+                commit_id: String::new(),
+            }
+            .into_active_model(),
+        )
+        .exec(mono_storage.get_connection())
+        .await
+        .expect("insert empty tree");
+        mega_commit::Entity::insert_many(
+            vec![
+                mc04_commit_row(800, &[]),
+                mc04_commit_row(801, &[800]),
+                mc04_commit_row(802, &[801]),
+            ]
+            .into_iter()
+            .map(|m| m.into_active_model())
+            .collect::<Vec<_>>(),
+        )
+        .exec(mono_storage.get_connection())
+        .await
+        .expect("insert chain");
+        let seeded_cl = storage
+            .cl_storage()
+            .new_cl_model(
+                "/",
+                "CLMC04ST",
+                "stale listing probe",
+                "main",
+                &mc04_sha(800),
+                &mc04_sha(802),
+                "tester",
+            )
+            .await
+            .expect("seed open CL");
+        // Stage the stale listing: built for the previous tip t1, so it does
+        // not contain the current to_hash t2.
+        let cl_stg = storage.cl_storage();
+        let stale_chain = [Commit::from_mega_model(mc04_commit_row(801, &[800]))];
+        let txn = mono_storage
+            .get_connection()
+            .begin()
+            .await
+            .expect("begin txn");
+        cl_stg
+            .save_cl_commits_in_txn("CLMC04ST", &stale_chain, &txn)
+            .await
+            .expect("stage stale listing");
+        txn.commit().await.expect("commit staging txn");
+
+        let commands = vec![RefCommand::new(
+            mc04_sha(800),
+            mc04_sha(802),
+            "refs/heads/main".to_string(),
+        )];
+        let repo = test_monorepo(
+            &storage,
+            commands,
+            id_set(&[&mc04_sha(801), &mc04_sha(802)]),
+            id_set(&[&mc04_sha(801), &mc04_sha(802)]),
+        );
+
+        repo.run_mono_post_push_pipeline()
+            .await
+            .expect("pipeline must run");
+
+        let listing = cl_stg
+            .get_cl_commits("CLMC04ST")
+            .await
+            .expect("read backfilled listing");
+        let shas: Vec<String> = listing.iter().map(|r| r.commit_sha.clone()).collect();
+        assert_eq!(
+            shas,
+            vec![mc04_sha(801), mc04_sha(802)],
+            "a stale listing (previous tip only) must be rebuilt to the full current chain"
+        );
+
+        let cl_after = cl_stg
+            .get_cl("CLMC04ST")
+            .await
+            .expect("get_cl")
+            .expect("CL row exists");
+        assert_eq!(cl_after.from_hash, seeded_cl.from_hash);
+        assert_eq!(cl_after.to_hash, seeded_cl.to_hash);
+        assert_eq!(
+            cl_after.updated_at, seeded_cl.updated_at,
+            "the backfill must not touch the CL body"
         );
     }
 }
