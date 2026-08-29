@@ -24,9 +24,15 @@ start_worker() {
   fi
 
   (
-    flock -n 9 || exit 0
+    # Singleton worker lock. flock is Linux-only; fall back to an atomic
+    # mkdir lock on macOS (and other flock-less hosts).
+    if command -v flock >/dev/null 2>&1; then
+      flock -n 9 || exit 0
+    elif ! mkdir "$STATE_DIR/build.lock" 2>/dev/null; then
+      exit 0
+    fi
     echo $$ >"$WORKER_PID_FILE"
-    trap 'rm -f "$WORKER_PID_FILE"' EXIT
+    trap 'rm -f "$WORKER_PID_FILE"; rmdir "$STATE_DIR/build.lock" 2>/dev/null || true' EXIT
 
     while true; do
       local last_request current_request
