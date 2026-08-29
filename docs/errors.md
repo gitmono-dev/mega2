@@ -100,6 +100,14 @@ use crate::common::errors::{ApiError, MegaError, RvError};
 
 排队项在同样情形下被**冻结**而不是失败：沿用既有终态 `Failed` + `SystemError`（不新增 enum、不加迁移，既有 retry 入口继续可用），保留 `requester`（它是重试时据以再判定的授权主体），`error_message` 写明可重试的条件。冻结路径同步产生进程内 `error` 日志 `event=merge_queue_authz_frozen`（字段 `cl_link` / `requester` / `reason`）——告警不做外部调用，因此不存在告警失败影响冻结事务的路径。
 
+## CL commits 读取端点的状态码（MC-05，plan-20260827）
+
+`GET /api/v1/cl/{link}/commits`（plan-20260827 MC-05，DEP-01 冻结契约）不新增错误类型，复用既有映射：
+
+- **404 = 未知 `link`**：`MegaError::NotFound` 经 `ApiError` 的 typed matching 映射（处理器先查 CL 行确立存在性，再读清单——裸透传 `get_cl_commits` 的空列表会把未知 link 与无数据 CL 混淆）。
+- **200 + 空列表 = CL 存在但无清单数据**（存量 CL 无回填，`mega_cl_commits` 无行）。
+- **403 = 授权拒绝**：OpenAPI 中声明；Cedar guard 映射（`guarded_endpoints.json` 登记 `GET /cl/{link}/commits`）随 MC-07 落地，经 REL-MC-01（MC-08）与该端点同时发布——在那之前该路径按 UN-23 口径处于「未登记即 unprotected」的中间态，这正是家族原子发布的原因。
+
 ## 响应安全
 
 - `ApiError` 只向客户端暴露 4xx 细节。

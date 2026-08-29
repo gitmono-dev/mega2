@@ -6,7 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    callisto::{check_result, sea_orm_active_enums::MergeStatusEnum},
+    callisto::{check_result, mega_cl_commits, sea_orm_active_enums::MergeStatusEnum},
     ceres::{
         merge_checker::{CheckType, ConditionResult},
         model::{conversation::ConversationItem, label::LabelItem},
@@ -80,6 +80,29 @@ impl From<CLDetails> for CLDetailRes {
                 .map(|x| x.assignnee_id)
                 .collect(),
             path: value.cl.path,
+        }
+    }
+}
+
+/// One commit in a CL's commit listing — the DEP-01 frozen wire contract
+/// (`sha`/`message`/`author_name`/`author_email`, snake_case on the wire,
+/// chain order decided by the storage read). Commit metadata only, never blob
+/// content. plan-20260827 MC-05.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ClCommitRes {
+    pub sha: String,
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+}
+
+impl From<mega_cl_commits::Model> for ClCommitRes {
+    fn from(value: mega_cl_commits::Model) -> Self {
+        Self {
+            sha: value.commit_sha,
+            message: value.message,
+            author_name: value.author_name,
+            author_email: value.author_email,
         }
     }
 }

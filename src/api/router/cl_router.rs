@@ -14,8 +14,9 @@ use crate::{
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     ceres::model::{
         change_list::{
-            AssigneeUpdatePayload, CLDetailRes, ClFilesRes, Condition, FilesChangedPage,
-            ListPayload, MergeBoxRes, MuiTreeNode, UpdateBranchStatusRes, UpdateClStatusPayload,
+            AssigneeUpdatePayload, CLDetailRes, ClCommitRes, ClFilesRes, Condition,
+            FilesChangedPage, ListPayload, MergeBoxRes, MuiTreeNode, UpdateBranchStatusRes,
+            UpdateClStatusPayload,
         },
         conversation::ContentPayload,
         issue::ItemRes,
@@ -49,8 +50,49 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(edit_title))
             .routes(routes!(update_cl_status))
             .routes(routes!(update_branch_status))
-            .routes(routes!(update_branch)),
+            .routes(routes!(update_branch))
+            .routes(routes!(cl_commits)),
     )
+}
+
+/// List a Change List's commits (DEP-01 frozen contract; plan-20260827
+/// MC-05). Chain order, commit metadata only.
+///
+/// Authorization is mapped by the Cedar guard in MC-07 and ships atomically
+/// with it (REL-MC-01 / MC-08). The mandatory session extractor mirrors the
+/// sibling `cl_detail` (also `viewRepo`): an anonymous request is a 401 from
+/// the extractor (UN-23), while a known-but-unauthorized principal is the
+/// guard's 403 under enforce.
+#[utoipa::path(
+    get,
+    params(
+        ("link", description = "CL link"),
+    ),
+    path = "/{link}/commits",
+    responses(
+        (status = 200, body = CommonResult<Vec<ClCommitRes>>, content_type = "application/json"),
+        (status = 401, description = "Login required"),
+        (status = 404, description = "Change List not found"),
+        (status = 403, description = "Authorization denied for this Change List operation"),
+    ),
+    tag = CL_TAG
+)]
+async fn cl_commits(
+    _user: LoginUser,
+    Path(link): Path<String>,
+    state: State<MonoApiServiceState>,
+) -> Result<Json<CommonResult<Vec<ClCommitRes>>>, ApiError> {
+    // DEP-01 ④: unknown link → 404. The read function answers an unknown link
+    // with an empty listing too, so existence is established first (the CL row
+    // is the authority) instead of returning a bare empty list.
+    state
+        .cl_stg()
+        .get_cl(&link)
+        .await?
+        .ok_or_else(|| MegaError::NotFound(format!("CL {link} not found")))?;
+    let rows = state.cl_stg().get_cl_commits(&link).await?;
+    let res: Vec<ClCommitRes> = rows.into_iter().map(Into::into).collect();
+    Ok(Json(CommonResult::success(Some(res))))
 }
 
 /// Reopen Change List
@@ -970,5 +1012,235 @@ index 1234567..0000000"#;
         let children = root.children.as_ref().unwrap();
         assert!(children.iter().any(|child| child.label == "b"));
         assert!(children.iter().any(|child| child.label == "another.txt"));
+    }
+}
+
+// MC-05 endpoint tests live in a sibling module: they need async runtimes and
+// DB-backed state, unlike the pure-logic cases above.
+#[cfg(test)]
+mod mc05_tests {
+
+    use std::sync::Arc;
+
+    use axum::{body::Body, http::Request};
+    use sea_orm::{EntityTrait, IntoActiveModel};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+    use utoipa_axum::router::OpenApiRouter;
+
+    use super::routers;
+    use crate::{
+        api::{MonoApiServiceState, oauth::api_store::BrowserSessionStore},
+        bellatrix::Bellatrix,
+        callisto::{mega_cl_commits, mega_commit},
+        contract::policy::entitystore::SharedEntityStore,
+        jupiter::{
+            storage::{Storage, base_storage::StorageConnector},
+            tests::test_storage,
+        },
+    };
+
+    fn mc05_state(storage: Storage) -> MonoApiServiceState {
+        MonoApiServiceState {
+            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "mc05-test".to_string(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_string(),
+            // MC-07: the handler takes a mandatory session (401 otherwise);
+            // these handler-level tests authenticate as a fixed user.
+            session_store: BrowserSessionStore::Fixed(
+                crate::api::oauth::api_store::FixedUserSessionStore {
+                    user: crate::api::oauth::model::LoginUser {
+                        username: "mc05-user".to_string(),
+                        ..Default::default()
+                    },
+                },
+            ),
+            storage,
+        }
+    }
+
+    fn mc05_sha(n: u64) -> String {
+        format!("{n:040x}")
+    }
+
+    fn mc05_commit_row(n: u64, parents: &[u64]) -> mega_commit::Model {
+        mega_commit::Model {
+            id: crate::callisto::entity_ext::generate_id(),
+            commit_id: mc05_sha(n),
+            tree: mc05_sha(900_000),
+            parents_id: serde_json::json!(parents.iter().map(|p| mc05_sha(*p)).collect::<Vec<_>>()),
+            author: Some("author MC05 User <mc05@example.invalid> 1750000000 +0000".to_string()),
+            committer: Some(
+                "committer MC05 User <mc05@example.invalid> 1750000000 +0000".to_string(),
+            ),
+            content: Some(format!("mc05 message {n}")),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        }
+    }
+
+    /// Seed a CL at `(from, to)` plus the listing rows for `listing_members`
+    /// (chain order is rebuilt read-side; the write order here is irrelevant).
+    async fn mc05_seed(storage: &Storage, link: &str, from: u64, to: u64, listing_members: &[u64]) {
+        let cl_stg = storage.cl_storage();
+        cl_stg
+            .new_cl_model(
+                "/",
+                link,
+                "mc05 test cl",
+                "main",
+                &mc05_sha(from),
+                &mc05_sha(to),
+                "mc05-user",
+            )
+            .await
+            .expect("seed CL row");
+        let mono_storage = storage.mono_storage();
+        let conn = mono_storage.get_connection();
+        let mut commit_rows = vec![mc05_commit_row(from, &[])];
+        commit_rows.extend((from + 1..=to).map(|i| mc05_commit_row(i, &[i - 1])));
+        mega_commit::Entity::insert_many(
+            commit_rows
+                .into_iter()
+                .map(|m| m.into_active_model())
+                .collect::<Vec<_>>(),
+        )
+        .exec(conn)
+        .await
+        .expect("insert commits");
+        if listing_members.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().naive_utc();
+        let listing: Vec<mega_cl_commits::ActiveModel> = listing_members
+            .iter()
+            .map(|&n| {
+                let row = mc05_commit_row(n, &[n - 1]);
+                mega_cl_commits::ActiveModel {
+                    cl_link: sea_orm::Set(link.to_string()),
+                    commit_sha: sea_orm::Set(row.commit_id),
+                    author_name: sea_orm::Set("MC05 User".to_string()),
+                    author_email: sea_orm::Set("mc05@example.invalid".to_string()),
+                    message: sea_orm::Set(row.content.unwrap_or_default()),
+                    created_at: sea_orm::Set(now),
+                    updated_at: sea_orm::Set(now),
+                }
+            })
+            .collect();
+        mega_cl_commits::Entity::insert_many(listing)
+            .exec(conn)
+            .await
+            .expect("seed listing");
+    }
+
+    async fn mc05_get(state: MonoApiServiceState, link: &str) -> (axum::http::StatusCode, String) {
+        let (router, _api) = OpenApiRouter::new().merge(routers()).split_for_parts();
+        let resp = router
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/cl/{link}/commits"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// AC①②: the route is registered under the `/cl` nest and its 200 response
+    /// advertises the DEP-01 contract schema (the four snake_case fields).
+    #[test]
+    fn cl_commits_route_is_registered_with_contract_schema() {
+        let (_router, api) = routers().split_for_parts();
+        let path_item = api
+            .paths
+            .paths
+            .get("/cl/{link}/commits")
+            .expect("the /cl/{link}/commits path must be registered");
+        let operation = path_item.get.as_ref().expect("GET operation");
+        let success = operation
+            .responses
+            .responses
+            .get("200")
+            .expect("200 response documented");
+        let content_ref = serde_json::to_value(success).expect("response to json");
+        assert!(
+            content_ref.to_string().contains("ClCommitRes"),
+            "the 200 response must reference the ClCommitRes schema: {content_ref}"
+        );
+        let components = serde_json::to_value(api.components).expect("components to json");
+        let schema = &components["schemas"]["ClCommitRes"];
+        for field in ["sha", "message", "author_name", "author_email"] {
+            assert!(
+                schema["properties"][field].is_string() || schema["properties"][field].is_object(),
+                "ClCommitRes must declare `{field}`: {schema}"
+            );
+        }
+    }
+
+    /// AC④⑤: a CL with a listing returns the contract fields in chain order
+    /// (oldest first), wrapped in CommonResult.
+    #[tokio::test]
+    async fn cl_commits_returns_contract_fields_in_chain_order() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        mc05_seed(&storage, "CLMC05A1", 100, 103, &[101, 102, 103]).await;
+
+        let (status, body) = mc05_get(mc05_state(storage), "CLMC05A1").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(json["req_result"], true);
+        let data = json["data"].as_array().expect("data is an array");
+        let shas: Vec<&str> = data.iter().map(|c| c["sha"].as_str().unwrap()).collect();
+        assert_eq!(
+            shas,
+            vec![mc05_sha(101), mc05_sha(102), mc05_sha(103)],
+            "commits must arrive oldest-first in chain order"
+        );
+        let first = &data[0];
+        assert_eq!(first["message"], "mc05 message 101");
+        assert_eq!(first["author_name"], "MC05 User");
+        assert_eq!(first["author_email"], "mc05@example.invalid");
+    }
+
+    /// AC⑤: a CL without listing data returns an empty list, not an error.
+    #[tokio::test]
+    async fn cl_commits_empty_listing_returns_empty_list() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        mc05_seed(&storage, "CLMC05E1", 200, 201, &[]).await;
+
+        let (status, body) = mc05_get(mc05_state(storage), "CLMC05E1").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(json["req_result"], true);
+        assert_eq!(json["data"].as_array().expect("data array").len(), 0);
+    }
+
+    /// AC⑥ (DEP-01 ④): an unknown link is a 404, not an empty list.
+    #[tokio::test]
+    async fn cl_commits_unknown_link_returns_404() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+
+        let (status, body) = mc05_get(mc05_state(storage), "CLMC05NO").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(json["req_result"], false);
     }
 }
