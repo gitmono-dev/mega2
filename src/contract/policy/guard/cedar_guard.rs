@@ -708,6 +708,8 @@ mod tests {
             ActionEnum::EditMergeRequest,
         ),
         ("GET", "/cl/ABC123/detail", ActionEnum::ViewRepo),
+        // MC-07: the CL commits listing endpoint (GET /cl/{link}/commits).
+        ("GET", "/cl/ABC123/commits", ActionEnum::ViewRepo),
         ("GET", "/cl/ABC123/mui-tree", ActionEnum::ViewRepo),
         ("GET", "/cl/ABC123/files-list", ActionEnum::ViewRepo),
         ("GET", "/cl/ABC123/merge-box", ActionEnum::ViewRepo),

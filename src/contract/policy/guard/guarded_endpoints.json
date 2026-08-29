@@ -23,7 +23,8 @@
             "/{link}/files-list": "viewRepo",
             "/{link}/merge-box": "viewRepo",
             "/{link}/update-status": "viewRepo",
-            "/{link}/reviewers": "viewRepo"
+            "/{link}/reviewers": "viewRepo",
+            "/{link}/commits": "viewRepo"
         },
         "delete": {
             "/{link}/reviewers": "editMergeRequest"
