@@ -13,7 +13,6 @@ pub mod mega_code_review_comment;
 pub mod mega_code_review_position;
 pub mod mega_code_review_thread;
 pub mod mega_conversation;
-pub mod mega_issue;
 pub mod mega_refs;
 pub mod reactions;
 

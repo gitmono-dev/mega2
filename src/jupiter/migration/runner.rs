@@ -208,6 +208,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_drop_mega_issue_tables_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+
+        for table in ["mega_issue", "git_issue", "git_pr"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected table '{table}' to be dropped"
+            );
+        }
+
+        for table in ["mega_cl", "mega_conversation", "label", "item_labels"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_some(),
+                "expected shared table '{table}' to remain"
+            );
+        }
+
+        // Forward-only: down must be a no-op (Issue tables stay dropped).
+        {
+            use sea_orm_migration::SchemaManager;
+            let manager = SchemaManager::new(&db);
+            crate::jupiter::migration::m20260831_000000_drop_mega_issue_tables::Migration
+                .down(&manager)
+                .await
+                .expect("drop_mega_issue_tables down should be a no-op Ok(())");
+        }
+
+        for table in ["mega_issue", "git_issue", "git_pr"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT to_regclass('{table}')::text AS table_name;"),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected table '{table}' to remain dropped after down no-op"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_notification_center_schema_and_constraints() {
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
         let db = test_db_connection(temp_dir.path()).await;

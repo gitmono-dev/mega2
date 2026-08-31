@@ -326,7 +326,7 @@ mod tests {
         assert!(updated.updated_at >= inserted.updated_at);
 
         let event_types = storage.list_event_types().await.unwrap();
-        assert_eq!(event_types.len(), 6);
+        assert_eq!(event_types.len(), 4);
         assert!(event_types.iter().any(|et| et.code == "test.event"));
     }
 
