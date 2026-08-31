@@ -9,7 +9,6 @@ pub const CODE_PREVIEW: &str = "Code Preview";
 pub const TAG_MANAGE: &str = "Tag Management";
 pub const CL_TAG: &str = "Change List";
 pub const GPG_TAG: &str = "Gpg Key";
-pub const ISSUE_TAG: &str = "Issue Management";
 pub const SIDEBAR_TAG: &str = "Sidebar Management";
 pub const LABEL_TAG: &str = "Label Management";
 pub const CONV_TAG: &str = "Conversation and Comment";
