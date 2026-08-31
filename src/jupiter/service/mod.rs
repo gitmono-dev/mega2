@@ -5,7 +5,6 @@ pub mod cla_service;
 pub mod code_review_service;
 pub mod git_service;
 pub mod import_service;
-pub mod issue_service;
 pub mod lfs_service;
 pub mod merge_queue_service;
 pub mod mono_service;

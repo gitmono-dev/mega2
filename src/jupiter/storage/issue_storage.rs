@@ -1,30 +1,23 @@
-use std::{collections::HashMap, ops::Deref};
+use std::ops::Deref;
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, IntoActiveModel, JoinType,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, Set,
-    TransactionTrait, prelude::Expr,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, IntoActiveModel, PaginatorTrait,
+    QueryFilter, TransactionTrait,
 };
 
 use crate::{
-    callisto::{
-        issue_cl_references, item_assignees, item_labels, label, mega_conversation, mega_issue,
-        sea_orm_active_enums::ReferenceTypeEnum,
-    },
+    callisto::{issue_cl_references, item_assignees, item_labels, label, sea_orm_active_enums::ReferenceTypeEnum},
     common::errors::MegaError,
     contract::api::common::Pagination,
     jupiter::{
-        model::common::{ItemDetails, LabelAssigneeParams, ListParams},
+        model::common::LabelAssigneeParams,
         storage::{
             base_storage::{BaseStorage, StorageConnector},
-            stg_common::{
-                combine_item_list,
-                query_build::{apply_sort, filter_by_assignees, filter_by_labels},
-            },
         },
     },
 };
 
+/// Shared label/assignee/reference persistence for CL items (CE-22: Issue HTTP retired).
 #[derive(Clone)]
 pub struct IssueStorage {
     pub base: BaseStorage,
@@ -38,187 +31,6 @@ impl Deref for IssueStorage {
 }
 
 impl IssueStorage {
-    pub async fn get_issue_list(
-        &self,
-        params: ListParams,
-        page: Pagination,
-    ) -> Result<(Vec<ItemDetails>, u64), MegaError> {
-        let cond = Condition::all();
-        let cond = filter_by_labels(cond, params.labels);
-        let cond = filter_by_assignees(cond, params.assignees);
-
-        let query = mega_issue::Entity::find()
-            .join(
-                JoinType::LeftJoin,
-                crate::callisto::entity_ext::mega_issue::Relation::ItemLabels.def(),
-            )
-            .join(
-                JoinType::LeftJoin,
-                crate::callisto::entity_ext::mega_issue::Relation::ItemAssignees.def(),
-            )
-            .filter(mega_issue::Column::Status.eq(params.status))
-            .apply_if(params.author, |q, author| {
-                q.filter(mega_issue::Column::Author.eq(author))
-            })
-            .filter(cond)
-            .distinct()
-            .order_by_asc(mega_issue::Column::Id);
-
-        let mut sort_map = HashMap::new();
-        sort_map.insert("created_at", mega_issue::Column::CreatedAt);
-        sort_map.insert("updated_at", mega_issue::Column::UpdatedAt);
-
-        let query = apply_sort(query, params.sort_by.as_deref(), params.asc, &sort_map);
-
-        let paginator = query.paginate(self.get_connection(), page.per_page);
-        let total = paginator.num_items().await?;
-        let issues = paginator.fetch_page(page.page - 1).await?;
-
-        if issues.is_empty() {
-            return Ok((vec![], 0));
-        }
-
-        let issue_ids = issues.iter().map(|m| m.id).collect::<Vec<_>>();
-
-        let label_query =
-            mega_issue::Entity::find().filter(mega_issue::Column::Id.is_in(issue_ids.clone()));
-        let label_query = apply_sort(
-            label_query,
-            params.sort_by.as_deref(),
-            params.asc,
-            &sort_map,
-        );
-        let labels: Vec<(mega_issue::Model, Vec<label::Model>)> = label_query
-            .find_with_related(label::Entity)
-            .all(self.get_connection())
-            .await?;
-
-        let assignees: Vec<(mega_issue::Model, Vec<item_assignees::Model>)> =
-            mega_issue::Entity::find()
-                .filter(mega_issue::Column::Id.is_in(issue_ids.clone()))
-                .find_with_related(item_assignees::Entity)
-                .all(self.get_connection())
-                .await?;
-
-        let conversations: Vec<(mega_issue::Model, Vec<mega_conversation::Model>)> =
-            mega_issue::Entity::find()
-                .filter(mega_issue::Column::Id.is_in(issue_ids))
-                .find_with_related(mega_conversation::Entity)
-                .all(self.get_connection())
-                .await?;
-
-        let res = combine_item_list::<mega_issue::Entity>(labels, assignees, conversations);
-
-        Ok((res, total))
-    }
-
-    pub async fn get_issue_suggestions_by_query(
-        &self,
-        query: &str,
-    ) -> Result<Vec<mega_issue::Model>, MegaError> {
-        let keyword = format!("%{query}%");
-        let res = mega_issue::Entity::find()
-            .filter(
-                Condition::any()
-                    .add(mega_issue::Column::Link.like(&keyword))
-                    .add(mega_issue::Column::Title.like(&keyword)),
-            )
-            .limit(5)
-            .all(self.get_connection())
-            .await?;
-        Ok(res)
-    }
-
-    pub async fn get_issue(&self, link: &str) -> Result<Option<mega_issue::Model>, MegaError> {
-        let model = mega_issue::Entity::find()
-            .filter(mega_issue::Column::Link.eq(link))
-            .one(self.get_connection())
-            .await
-            .unwrap();
-        Ok(model)
-    }
-
-    pub async fn get_issue_labels(
-        &self,
-        link: &str,
-    ) -> Result<Option<(mega_issue::Model, Vec<label::Model>)>, MegaError> {
-        let labels: Vec<(mega_issue::Model, Vec<label::Model>)> = mega_issue::Entity::find()
-            .filter(mega_issue::Column::Link.eq(link))
-            .find_with_related(label::Entity)
-            .all(self.get_connection())
-            .await?;
-        Ok(labels.first().cloned())
-    }
-
-    pub async fn get_issue_assignees(
-        &self,
-        link: &str,
-    ) -> Result<Option<(mega_issue::Model, Vec<item_assignees::Model>)>, MegaError> {
-        let assignees: Vec<(mega_issue::Model, Vec<item_assignees::Model>)> =
-            mega_issue::Entity::find()
-                .filter(mega_issue::Column::Link.eq(link))
-                .find_with_related(item_assignees::Entity)
-                .all(self.get_connection())
-                .await?;
-        Ok(assignees.first().cloned())
-    }
-
-    pub async fn get_issue_by_id(&self, id: i64) -> Result<Option<mega_issue::Model>, MegaError> {
-        let model = mega_issue::Entity::find_by_id(id)
-            .one(self.get_connection())
-            .await
-            .unwrap();
-        Ok(model)
-    }
-
-    pub async fn save_issue(
-        &self,
-        username: &str,
-        title: &str,
-    ) -> Result<mega_issue::Model, MegaError> {
-        let model = mega_issue::Model::new(title.to_owned(), username.to_owned());
-        let res = model
-            .into_active_model()
-            .insert(self.get_connection())
-            .await?;
-        Ok(res)
-    }
-
-    pub async fn edit_title(&self, link: &str, title: &str) -> Result<(), MegaError> {
-        mega_issue::Entity::update_many()
-            .col_expr(mega_issue::Column::Title, Expr::value(title))
-            .col_expr(
-                mega_issue::Column::UpdatedAt,
-                Expr::value(chrono::Utc::now().naive_utc()),
-            )
-            .filter(mega_issue::Column::Link.eq(link))
-            .exec(self.get_connection())
-            .await?;
-        Ok(())
-    }
-
-    pub async fn close_issue(&self, link: &str) -> Result<bool, MegaError> {
-        let now = chrono::Utc::now().naive_utc();
-        let result = mega_issue::Entity::update_many()
-            .col_expr(mega_issue::Column::Status, Expr::value("closed"))
-            .col_expr(mega_issue::Column::ClosedAt, Expr::value(Some(now)))
-            .col_expr(mega_issue::Column::UpdatedAt, Expr::value(now))
-            .filter(mega_issue::Column::Link.eq(link))
-            .filter(mega_issue::Column::Status.ne("closed"))
-            .exec(self.get_connection())
-            .await?;
-        Ok(result.rows_affected > 0)
-    }
-
-    pub async fn reopen_issue(&self, link: &str) -> Result<(), MegaError> {
-        if let Some(model) = self.get_issue(link).await.unwrap() {
-            let mut issue = model.into_active_model();
-            issue.status = Set("open".to_owned());
-            issue.update(self.get_connection()).await.unwrap();
-        };
-        Ok(())
-    }
-
     pub async fn new_label(
         &self,
         name: &str,
@@ -388,56 +200,5 @@ impl IssueStorage {
             .await?;
 
         Ok(res)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use sea_orm::{ActiveModelTrait, Set};
-
-    use crate::{
-        callisto::mega_issue,
-        jupiter::{
-            migration::apply_migrations,
-            storage::{
-                base_storage::{BaseStorage, StorageConnector},
-                issue_storage::IssueStorage,
-            },
-            tests::test_db_connection,
-        },
-    };
-
-    #[tokio::test]
-    async fn close_issue_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = test_db_connection(dir.path()).await;
-        apply_migrations(&db, true).await.unwrap();
-
-        let storage = IssueStorage {
-            base: BaseStorage::new(Arc::new(db.clone())),
-        };
-
-        let now = chrono::Utc::now().naive_utc();
-        mega_issue::ActiveModel {
-            id: Set(1),
-            link: Set("ISSUE1".to_string()),
-            title: Set("T".to_string()),
-            status: Set("open".to_string()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            closed_at: Set(None),
-            author: Set("alice".to_string()),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
-
-        let first = storage.close_issue("ISSUE1").await.unwrap();
-        assert!(first, "first close should transition the issue");
-
-        let second = storage.close_issue("ISSUE1").await.unwrap();
-        assert!(!second, "second close should report no transition");
     }
 }

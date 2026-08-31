@@ -41,7 +41,7 @@ use crate::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService, issue_service::IssueService,
+            git_service::GitService, import_service::ImportService,
             lfs_service::LfsService, merge_queue_service::MergeQueueService,
             mono_service::MonoService, webhook_service::WebhookService,
         },
@@ -142,7 +142,6 @@ impl AppService {
 pub struct Storage {
     pub(crate) app_service: Arc<AppService>,
     pub cla_service: ClaService,
-    pub issue_service: IssueService,
     pub cl_service: CLService,
     pub merge_queue_service: MergeQueueService,
     pub artifact_service: ArtifactService,
@@ -293,7 +292,6 @@ impl Storage {
             cla_service: ClaService::new(base.clone()),
             config_handle,
             config,
-            issue_service: IssueService::new(base.clone()),
             cl_service: CLService::new(base.clone()),
             merge_queue_service,
             artifact_service,
@@ -550,7 +548,6 @@ impl Storage {
             app_service,
             // app_service: AppService::mock(),
             cla_service: ClaService::mock(),
-            issue_service: IssueService::mock(),
             cl_service: CLService::mock(),
             merge_queue_service: MergeQueueService::mock(),
             artifact_service: ArtifactService::mock(),

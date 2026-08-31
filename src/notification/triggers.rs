@@ -5,15 +5,13 @@ use serde_json::{Value, json};
 use crate::{
     common::errors::MegaError,
     jupiter::storage::{
-        cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage, issue_storage::IssueStorage,
+        cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage,
         notification_storage::NotificationStorage,
     },
 };
 
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
 pub const EVENT_CL_MERGED: &str = "cl.merged";
-pub const EVENT_ISSUE_COMMENT_CREATED: &str = "issue.comment.created";
-pub const EVENT_ISSUE_CLOSED: &str = "issue.closed";
 pub const EVENT_ITEM_REFERENCED: &str = "item.referenced";
 
 const COMMENT_EXCERPT_MAX_CHARS: usize = 500;
@@ -182,91 +180,18 @@ pub async fn on_cl_merged(
     Ok(())
 }
 
-/// Trigger: a new comment is created on an Issue.
-pub async fn on_issue_comment_created(
-    notif_stg: &NotificationStorage,
-    issue_stg: &IssueStorage,
-    actor_username: &str,
-    issue_link: &str,
-    comment_text: &str,
-) -> Result<(), MegaError> {
-    ensure_event_type(
-        notif_stg,
-        EVENT_ISSUE_COMMENT_CREATED,
-        "issue",
-        "New comment on an Issue",
-    )
-    .await?;
-    let issue = issue_stg
-        .get_issue(issue_link)
-        .await?
-        .ok_or_else(|| MegaError::NotFound(format!("Issue {issue_link} not found")))?;
-    if issue.author != actor_username {
-        let excerpt = comment_excerpt(comment_text);
-        deliver_event(
-            notif_stg,
-            &issue.author,
-            EVENT_ISSUE_COMMENT_CREATED,
-            &format!("New comment on issue {}", issue.title),
-            &format!("{actor_username} commented: {comment_text}"),
-            json!({
-                "issue_link": issue_link,
-                "issue_title": required_field(&issue.title, EMPTY_TITLE_PLACEHOLDER),
-                "actor_username": actor_username,
-                "comment_excerpt": excerpt,
-            }),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// Trigger: an issue was closed.
-pub async fn on_issue_closed(
-    notif_stg: &NotificationStorage,
-    issue_stg: &IssueStorage,
-    actor_username: &str,
-    issue_link: &str,
-) -> Result<(), MegaError> {
-    ensure_event_type(notif_stg, EVENT_ISSUE_CLOSED, "issue", "Issue was closed").await?;
-    let issue = issue_stg
-        .get_issue(issue_link)
-        .await?
-        .ok_or_else(|| MegaError::NotFound(format!("Issue {issue_link} not found")))?;
-    if issue.author != actor_username {
-        deliver_event(
-            notif_stg,
-            &issue.author,
-            EVENT_ISSUE_CLOSED,
-            &format!("Issue {} was closed", issue.title),
-            &format!("{actor_username} closed {issue_link}."),
-            json!({
-                "issue_link": issue_link,
-                "issue_title": required_field(&issue.title, EMPTY_TITLE_PLACEHOLDER),
-                "actor_username": actor_username,
-            }),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// Trigger: an item (CL or Issue) is referenced from a comment.
+/// Trigger: an item (CL) is referenced from a comment.
 pub async fn on_item_referenced(
     notif_stg: &NotificationStorage,
     cl_stg: &ClStorage,
-    issue_stg: &IssueStorage,
     actor_username: &str,
     source_link: &str,
     referenced_link: &str,
 ) -> Result<(), MegaError> {
-    let author = if let Some(cl) = cl_stg.get_cl(referenced_link).await? {
-        cl.username
-    } else if let Some(issue) = issue_stg.get_issue(referenced_link).await? {
-        issue.author
-    } else {
+    let Some(cl) = cl_stg.get_cl(referenced_link).await? else {
         return Ok(());
     };
+    let author = cl.username;
     if author == actor_username {
         return Ok(());
     }
@@ -275,7 +200,7 @@ pub async fn on_item_referenced(
         notif_stg,
         EVENT_ITEM_REFERENCED,
         "reference",
-        "Your CL or Issue was referenced (mentioned)",
+        "Your CL was referenced (mentioned)",
     )
     .await?;
     deliver_event(

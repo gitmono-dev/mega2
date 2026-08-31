@@ -20,7 +20,7 @@ use crate::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService, issue_service::IssueService,
+            git_service::GitService, import_service::ImportService,
             lfs_service::LfsService, merge_queue_service::MergeQueueService,
             mono_service::MonoService, webhook_service::WebhookService,
         },
@@ -200,7 +200,6 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
     Storage {
         app_service: Arc::new(svc),
         cla_service: ClaService::new(base.clone()),
-        issue_service: IssueService::mock(),
         cl_service: CLService::mock(),
         // UN-20: the queue service must talk to the same test database as the
         // rest of this storage — `mock()` hands out a disconnected connection,

@@ -1,13 +1,12 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::ToSchema;
 
 use crate::{
-    callisto::{mega_cl, mega_issue, sea_orm_active_enums::MergeStatusEnum},
-    ceres::model::{conversation::ConversationItem, label::LabelItem},
+    callisto::{mega_cl, sea_orm_active_enums::MergeStatusEnum},
+    ceres::model::label::LabelItem,
     jupiter::model::{
         common::{ItemDetails, ItemKind},
-        issue_dto::IssueDetails,
     },
 };
 
@@ -83,47 +82,6 @@ impl From<ItemDetails> for ItemRes {
     }
 }
 
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct NewIssue {
-    pub title: String,
-    pub description: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct IssueDetailRes {
-    pub id: i64,
-    pub link: String,
-    pub title: String,
-    pub status: String,
-    pub open_timestamp: i64,
-    pub conversations: Vec<ConversationItem>,
-    pub labels: Vec<LabelItem>,
-    pub assignees: Vec<String>,
-}
-
-impl From<IssueDetails> for IssueDetailRes {
-    fn from(value: IssueDetails) -> Self {
-        Self {
-            id: value.issue.id,
-            link: value.issue.link,
-            title: value.issue.title,
-            status: value.issue.status.to_string(),
-            open_timestamp: value.issue.created_at.and_utc().timestamp(),
-            conversations: value
-                .conversations
-                .into_iter()
-                .map(|x| ConversationItem::from_model(x.conversation, x.reactions, &value.username))
-                .collect(),
-            labels: value.labels.into_iter().map(|x| x.into()).collect(),
-            assignees: value
-                .assignees
-                .into_iter()
-                .map(|x| x.assignnee_id)
-                .collect(),
-        }
-    }
-}
-
 #[derive(Serialize, ToSchema, PartialEq, Eq)]
 pub struct IssueSuggestions {
     pub id: i64,
@@ -147,22 +105,6 @@ impl Ord for IssueSuggestions {
     }
 }
 
-impl From<mega_issue::Model> for IssueSuggestions {
-    fn from(value: mega_issue::Model) -> Self {
-        Self {
-            id: value.id,
-            link: value.link,
-            title: value.title,
-            suggest_type: if value.status == "open" {
-                String::from("issue_open")
-            } else {
-                String::from("issue_closed")
-            },
-            created_at: value.created_at,
-        }
-    }
-}
-
 impl From<mega_cl::Model> for IssueSuggestions {
     fn from(value: mega_cl::Model) -> Self {
         Self {
@@ -177,11 +119,6 @@ impl From<mega_cl::Model> for IssueSuggestions {
             created_at: value.created_at,
         }
     }
-}
-
-#[derive(Deserialize, ToSchema, IntoParams)]
-pub struct QueryPayload {
-    pub query: String,
 }
 
 #[cfg(test)]

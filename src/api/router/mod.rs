@@ -10,7 +10,6 @@ pub mod conv_router;
 pub mod dynamic_sidebar_router;
 pub mod gpg_router;
 pub mod group_router;
-pub mod issue_router;
 pub mod label_router;
 pub mod lfs_router;
 pub mod merge_queue_router;

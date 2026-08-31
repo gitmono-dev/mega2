@@ -29,8 +29,7 @@ mod tests {
         },
         jupiter::tests::test_db_connection,
         notification::triggers::{
-            EVENT_CL_COMMENT_CREATED, EVENT_CL_MERGED, EVENT_ISSUE_CLOSED,
-            EVENT_ISSUE_COMMENT_CREATED, EVENT_ITEM_REFERENCED,
+            EVENT_CL_COMMENT_CREATED, EVENT_CL_MERGED, EVENT_ITEM_REFERENCED,
         },
     };
 
@@ -243,8 +242,6 @@ mod tests {
         for event_type_code in [
             EVENT_CL_COMMENT_CREATED,
             EVENT_CL_MERGED,
-            EVENT_ISSUE_COMMENT_CREATED,
-            EVENT_ISSUE_CLOSED,
             EVENT_ITEM_REFERENCED,
         ] {
             let seeded = notification_event_types::Entity::find_by_id(event_type_code)
