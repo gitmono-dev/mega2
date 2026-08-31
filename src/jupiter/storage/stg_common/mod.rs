@@ -12,20 +12,12 @@ pub mod query_build;
 
 /// Combine labels, assignees, and conversations into a unified list of `ItemDetails`.
 ///
-/// This function merges multiple related datasets for a list of issues:
-/// - `item_labels`: pairs of (issue, list of labels)
-/// - `item_assignees`: pairs of (issue, list of assignees)
-/// - `conversations`: pairs of (issue, list of conversations)
+/// This function merges multiple related datasets for a list of CL items:
+/// * `item_labels` - A vector of tuples where each tuple contains a CL and its associated labels.
+/// * `item_assignees` - A vector of tuples where each tuple contains a CL and its associated assignees.
+/// * `conversations` - A vector of tuples where each tuple contains a CL and its associated conversations.
 ///
-/// It aggregates the data into a single `ItemDetails` structure for each issue,
-/// ensuring that even if some parts are missing (e.g. labels or assignees),
-/// a complete `ItemDetails` entry is still created.
-///
-/// # Arguments
-///
-/// * `item_labels` - A vector of tuples where each tuple contains an issue and its associated labels.
-/// * `item_assignees` - A vector of tuples where each tuple contains an issue and its associated assignees.
-/// * `conversations` - A vector of tuples where each tuple contains an issue and its associated conversations.
+/// It aggregates the data into a single `ItemDetails` structure for each CL,
 ///
 /// # Returns
 ///
@@ -91,20 +83,24 @@ where
 mod tests {
     use super::*;
     use crate::callisto::{
-        item_assignees, label, mega_conversation, mega_issue, sea_orm_active_enums::ConvTypeEnum,
+        item_assignees, label, mega_cl, mega_conversation, sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     };
 
     #[test]
     fn test_combine_item_list() {
-        let issue = mega_issue::Model {
+        let cl = mega_cl::Model {
             id: 1,
-            link: String::from("ILD2EV5V"),
-            title: String::from("[Monobean] no such column: mega_refs.is_cl #1028"),
-            status: String::from("open"),
+            link: String::from("CLAAAA"),
+            title: String::from("sample CL"),
+            status: MergeStatusEnum::Open,
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
-            closed_at: None,
-            author: String::from("benjamin_747"),
+            merge_date: None,
+            username: String::from("alice"),
+            from_hash: String::from("abc"),
+            to_hash: String::from("def"),
+            path: String::from("/"),
+            base_branch: String::from("main"),
         };
 
         let label = label::Model {
@@ -121,26 +117,26 @@ mod tests {
             assignnee_id: "alice".to_string(),
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
-            item_type: String::from("issue"),
+            item_type: String::from("change_list"),
         };
 
         let conv = mega_conversation::Model {
             id: 1,
             conv_type: ConvTypeEnum::Comment,
-            link: String::from("ILD2EV5V"),
+            link: String::from("CLAAAA"),
             comment: None,
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
-            username: String::from("benjamin_747"),
+            username: String::from("alice"),
             resolved: None,
         };
 
-        let item_labels = vec![(issue.clone(), vec![label])];
-        let item_assignees = vec![(issue.clone(), vec![assignee])];
-        let conversations = vec![(issue.clone(), vec![conv])];
+        let item_labels = vec![(cl.clone(), vec![label])];
+        let item_assignees = vec![(cl.clone(), vec![assignee])];
+        let conversations = vec![(cl.clone(), vec![conv])];
 
         let results =
-            combine_item_list::<mega_issue::Entity>(item_labels, item_assignees, conversations);
+            combine_item_list::<mega_cl::Entity>(item_labels, item_assignees, conversations);
 
         assert_eq!(results.len(), 1);
         let details = &results[0];

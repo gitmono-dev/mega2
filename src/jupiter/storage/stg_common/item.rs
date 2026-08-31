@@ -1,5 +1,5 @@
 use crate::{
-    callisto::{mega_cl, mega_issue},
+    callisto::mega_cl,
     jupiter::model::common::ItemKind,
 };
 
@@ -8,18 +8,6 @@ pub trait ItemEntity {
     fn item_kind(model: Self::Model) -> ItemKind;
 
     fn get_id(model: &Self::Model) -> i64;
-}
-
-impl ItemEntity for mega_issue::Entity {
-    type Model = mega_issue::Model;
-
-    fn item_kind(model: Self::Model) -> ItemKind {
-        ItemKind::Issue(model)
-    }
-
-    fn get_id(model: &Self::Model) -> i64 {
-        model.id
-    }
 }
 
 impl ItemEntity for mega_cl::Entity {

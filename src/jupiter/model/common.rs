@@ -1,7 +1,7 @@
-use crate::callisto::{label, mega_cl, mega_issue};
+use crate::callisto::{label, mega_cl};
 
+/// CL-only item wrapper after CE-22 Issue HTTP retirement (CE-23 drops `mega_issue` tables).
 pub enum ItemKind {
-    Issue(mega_issue::Model),
     Cl(mega_cl::Model),
 }
 

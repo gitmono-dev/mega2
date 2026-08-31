@@ -1,9 +1,7 @@
-use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    callisto::{mega_cl, sea_orm_active_enums::MergeStatusEnum},
     ceres::model::label::LabelItem,
     jupiter::model::{
         common::{ItemDetails, ItemKind},
@@ -47,76 +45,21 @@ impl ItemRes {
 
 impl From<ItemDetails> for ItemRes {
     fn from(value: ItemDetails) -> Self {
-        match value.item {
-            ItemKind::Issue(model) => Self {
-                id: model.id,
-                link: model.link,
-                title: model.title,
-                status: model.status.to_string(),
-                author: model.author,
-                open_timestamp: model.created_at.and_utc().timestamp(),
-                merge_timestamp: None,
-                closed_at: model.closed_at.map(|dt| dt.and_utc().timestamp()),
-                updated_at: model.updated_at.and_utc().timestamp(),
-                labels: value.labels.into_iter().map(|m| m.into()).collect(),
-                assignees: value.assignees,
-                comment_num: value.comment_num,
-                build_status: None,
-            },
-            ItemKind::Cl(model) => Self {
-                id: model.id,
-                link: model.link,
-                title: model.title,
-                status: format!("{:?}", model.status),
-                author: model.username,
-                open_timestamp: model.created_at.and_utc().timestamp(),
-                merge_timestamp: model.merge_date.map(|dt| dt.and_utc().timestamp()),
-                closed_at: None,
-                updated_at: model.updated_at.and_utc().timestamp(),
-                labels: value.labels.into_iter().map(|m| m.into()).collect(),
-                assignees: value.assignees,
-                comment_num: value.comment_num,
-                build_status: None,
-            },
-        }
-    }
-}
-
-#[derive(Serialize, ToSchema, PartialEq, Eq)]
-pub struct IssueSuggestions {
-    pub id: i64,
-    pub link: String,
-    pub title: String,
-    #[serde(rename = "type")]
-    pub suggest_type: String,
-    #[serde(skip)]
-    pub created_at: NaiveDateTime,
-}
-
-impl PartialOrd for IssueSuggestions {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for IssueSuggestions {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.created_at.cmp(&other.created_at)
-    }
-}
-
-impl From<mega_cl::Model> for IssueSuggestions {
-    fn from(value: mega_cl::Model) -> Self {
+        let ItemKind::Cl(model) = value.item;
         Self {
-            id: value.id,
-            link: value.link,
-            title: value.title,
-            suggest_type: if value.status == MergeStatusEnum::Open {
-                String::from("change_list")
-            } else {
-                String::from("change_list_closed")
-            },
-            created_at: value.created_at,
+            id: model.id,
+            link: model.link,
+            title: model.title,
+            status: format!("{:?}", model.status),
+            author: model.username,
+            open_timestamp: model.created_at.and_utc().timestamp(),
+            merge_timestamp: model.merge_date.map(|dt| dt.and_utc().timestamp()),
+            closed_at: None,
+            updated_at: model.updated_at.and_utc().timestamp(),
+            labels: value.labels.into_iter().map(|m| m.into()).collect(),
+            assignees: value.assignees,
+            comment_num: value.comment_num,
+            build_status: None,
         }
     }
 }
