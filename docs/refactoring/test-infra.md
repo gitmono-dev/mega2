@@ -93,8 +93,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 - 通过 compose 提供的客户端（如 git-cli runner）必须在登记条目中写明**固定版本字符串**，
   并用 Verification 断言容器内 `git --version`（及同类工具）等于该 pin。
 - CI 宿主机客户端（`git-protocol-smoke.yml`）固定版本（与 job `env` / summary 断言同源）：
-  - CI git 固定版本：`2.55.0`（2026-08-21 起；随 `ubuntu-latest` 镜像 `20260816.277` 由 `2.54.0` 上调。宿主机 git 由镜像提供、不 apt 升级，因此镜像滚动时 pin 必须显式跟随——`git-protocol-smoke` 在 `Install and pin git` 步骤直接失败，正是为了逼出这次显式决定）
-  - CI git-lfs 固定版本：`3.7.1`（未随镜像漂移；由固定 GitHub release 制品安装）
+  - CI git 固定版本：`2.53.0`（2026-08-31 起；随 self-hosted runner 迁移由 `2.55.0` 改为跟随 runner 机器实际安装的 git 版本，不再随 GitHub `ubuntu-latest` 镜像滚动。宿主机 git 由 runner 机器管理员维护、workflow 不 apt 升级，因此升级 runner 机器 git 时必须同步显式上调这个 pin——`git-protocol-smoke` 在 `Install and pin git` 步骤直接失败，正是为了逼出这次显式决定）
+  - CI git-lfs 固定版本：`3.7.1`（runner 机器未预装；由 `Install and pin git / git-lfs` 步骤按此 pin 下载固定 GitHub release 制品自动安装）
   实际 `git --version` / `git lfs version` 解析出的版本号必须与上述 pin 完全相等，否则 job 失败；
   两个版本输出写入 `$GITHUB_STEP_SUMMARY`。
 - 升级镜像 tag / digest 或 pin 值必须是显式 PR 动作，并同步更新登记条目。

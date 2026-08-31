@@ -63,7 +63,7 @@ on:
 
 jobs:
   validate-config:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
       - name: Checkout monoengine
         uses: actions/checkout@v5

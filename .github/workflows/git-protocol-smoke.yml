@@ -57,16 +57,17 @@ on:
 
 jobs:
   git-protocol-smoke:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     # release build + cargo-native integration_git_cli + shell smoke exceeds 30m
     # (v0.1.174/175 timed out during the cargo gate). Keep headroom for cold caches.
     timeout-minutes: 60
     env:
-      # Hosted-runner client pins (ubuntu-latest 20260816.277 image). Drift fails
-      # the job: the point is knowing which client the protocol matrix certifies,
-      # not holding one particular version. Bump only as a deliberate action and
-      # sync docs/refactoring/test-infra.md in the same change.
-      MONOENGINE_CI_GIT_VERSION: "2.55.0"
+      # Self-hosted runner client pins (match the runner machine's installed
+      # git). Drift fails the job: the point is knowing which client the
+      # protocol matrix certifies, not holding one particular version. Bump
+      # only as a deliberate action (after upgrading git on the runner
+      # machine) and sync docs/refactoring/test-infra.md in the same change.
+      MONOENGINE_CI_GIT_VERSION: "2.53.0"
       MONOENGINE_CI_GIT_LFS_VERSION: "3.7.1"
     steps:
       - name: Checkout monoengine
