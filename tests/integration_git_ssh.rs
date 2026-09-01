@@ -1766,6 +1766,7 @@ fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Co
         .env_clear()
         .env("MEGA_BASE_DIR", base_dir)
         .env("MEGA_CACHE_DIR", cache_dir)
+        .env("MEGA_ID_GENERATOR_LAYOUT_VERSION", "8+8-v1")
         .env("RUST_BACKTRACE", "0");
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
