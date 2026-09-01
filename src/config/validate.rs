@@ -23,6 +23,8 @@ const RESERVED_MEGA_ENV_VARS: &[&str] = &[
     "MEGA_PROFILE",
     "MEGA_BASE_DIR",
     "MEGA_CACHE_DIR",
+    "MEGA_ID_GENERATOR_WORKER_ID",
+    "MEGA_ID_GENERATOR_LAYOUT_VERSION",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2762,6 +2764,22 @@ mod tests {
                     .message
                     .contains("arrays replace lower-precedence values rather than append")
         }));
+    }
+
+    #[test]
+    fn source_diagnostics_ignores_runtime_id_environment_variables() {
+        let diagnostics = collect_source_diagnostics_from_keys(
+            None,
+            None,
+            [
+                "MEGA_ID_GENERATOR_WORKER_ID",
+                "MEGA_ID_GENERATOR_LAYOUT_VERSION",
+            ],
+        )
+        .expect("diagnostics should collect");
+
+        assert!(diagnostics.environment_warnings.is_empty());
+        assert!(diagnostics.source_fields.is_empty());
     }
 
     /// Canonical "complete cross-source/profile matrix" lock-in: a single field
