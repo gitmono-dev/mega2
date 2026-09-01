@@ -155,15 +155,14 @@ impl GroupStorage {
         let models = usernames
             .iter()
             .map(|username| {
-                Ok::<_, String>(mega_group_member::ActiveModel {
-                    id: Set(generate_id().map_err(|error| error.to_string())?),
+                Ok::<_, MegaError>(mega_group_member::ActiveModel {
+                    id: Set(generate_id()?),
                     group_id: Set(group_id),
                     username: Set(username.clone()),
                     joined_at: Set(now),
                 })
             })
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(MegaError::Other)?;
+            .collect::<Result<Vec<_>, MegaError>>()?;
 
         let on_conflict = OnConflict::columns([
             mega_group_member::Column::GroupId,

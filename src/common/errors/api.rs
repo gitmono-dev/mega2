@@ -144,6 +144,9 @@ where
             // Handle other MegaError variants
             match mega_err {
                 MegaError::NotFound(_) => return ApiError::not_found(anyhow_err),
+                MegaError::IdGenerationUnavailable(_) => {
+                    return ApiError::with_status(StatusCode::SERVICE_UNAVAILABLE, anyhow_err);
+                }
                 MegaError::Db(_) | MegaError::Redis(_) | MegaError::Io(_) => {
                     // Hide internal details in production, return generic 500
                     tracing::error!(
@@ -205,4 +208,17 @@ pub(crate) fn map_ceres_error<D: std::fmt::Display>(err: D, ctx: &str) -> ApiErr
     }
 
     ApiError::internal(anyhow::anyhow!(format!("{}: {}", ctx, s)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_generation_unavailable_is_retryable() {
+        let response = ApiError::from(MegaError::IdGenerationUnavailable("lease lost".to_string()))
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

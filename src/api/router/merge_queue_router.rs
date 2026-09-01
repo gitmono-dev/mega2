@@ -11,7 +11,7 @@ use crate::{
         AddToQueueRequest, AddToQueueResponse, QueueItem, QueueListResponse, QueueStatsResponse,
         QueueStatus, QueueStatusResponse,
     },
-    common::errors::ApiError,
+    common::errors::{ApiError, MegaError},
     contract::api::common::CommonResult,
 };
 
@@ -78,6 +78,7 @@ async fn add_to_queue(
             };
             Ok(Json(CommonResult::success(Some(response))))
         }
+        Err(error @ MegaError::IdGenerationUnavailable(_)) => Err(ApiError::from(error)),
         Err(e) => Ok(Json(CommonResult::failed(&e.to_string()))),
     }
 }

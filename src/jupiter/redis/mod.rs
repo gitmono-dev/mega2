@@ -2,7 +2,9 @@ pub mod lock;
 pub mod snowflake_worker;
 
 pub use ::redis::{AsyncCommands, aio::ConnectionManager};
-pub use snowflake_worker::{SnowflakeWorkerLease, claim_snowflake_worker};
+pub(crate) use snowflake_worker::{
+    SnowflakeWorkerLease, WorkerFence, claim_snowflake_worker, try_acquire_worker_fence,
+};
 
 use crate::{
     common::errors::MegaError,

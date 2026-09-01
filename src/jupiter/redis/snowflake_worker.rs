@@ -1,10 +1,14 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use redis::{Script, aio::ConnectionManager};
-use tokio::{task::JoinHandle, time::timeout};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, Statement,
+    TransactionTrait,
+};
+use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -16,6 +20,184 @@ const SLOT_REFRESH_INTERVAL_MS: u64 = SLOT_TTL_MS / 2;
 const SLOT_REFRESH_TIMEOUT_MS: u64 = 5_000;
 const SLOT_RELEASE_TIMEOUT_MS: u64 = 5_000;
 const SLOT_SCAN_TIMEOUT_MS: u64 = 2_000;
+const SLOT_CLAIM_TIMEOUT_MS: u64 = 1_000;
+const SLOT_SCAN_CLEANUP_TIMEOUT_MS: u64 = 5_000;
+const FENCE_VERIFY_TIMEOUT_MS: u64 = 5_000;
+const WORKER_FENCE_NAMESPACE: i32 = 0x004d_4f4e;
+
+struct WorkerFenceInner {
+    transaction: Mutex<Option<DatabaseTransaction>>,
+    health: Option<Arc<WorkerLeaseHealth>>,
+    cancel: CancellationToken,
+    task: StdMutex<Option<JoinHandle<()>>>,
+}
+
+/// A PostgreSQL transaction-scoped advisory lock that fences a worker slot
+/// independently of Redis key expiry. The transaction is held for as long as
+/// the process owns the worker selection, so a Redis restart cannot let a new
+/// process reuse the slot while the old process is still alive.
+#[derive(Clone)]
+pub(crate) struct WorkerFence {
+    inner: Arc<WorkerFenceInner>,
+}
+
+impl WorkerFence {
+    fn new(transaction: DatabaseTransaction, health: Option<Arc<WorkerLeaseHealth>>) -> Self {
+        Self {
+            inner: Arc::new(WorkerFenceInner {
+                transaction: Mutex::new(Some(transaction)),
+                health,
+                cancel: CancellationToken::new(),
+                task: StdMutex::new(None),
+            }),
+        }
+    }
+
+    pub(crate) async fn verify(&self) -> Result<(), crate::common::errors::MegaError> {
+        let transaction = self.inner.transaction.lock().await;
+        let transaction = transaction.as_ref().ok_or_else(|| {
+            crate::common::errors::MegaError::IdGenerationUnavailable(
+                "worker database fence is no longer active".to_string(),
+            )
+        })?;
+        timeout(
+            Duration::from_millis(FENCE_VERIFY_TIMEOUT_MS),
+            transaction.query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT 1".to_string(),
+            )),
+        )
+        .await
+        .map_err(|_| {
+            crate::common::errors::MegaError::Other(format!(
+                "worker database fence verification timed out after {FENCE_VERIFY_TIMEOUT_MS}ms"
+            ))
+        })??;
+        Ok(())
+    }
+
+    /// Start a database-fence monitor for an explicitly configured worker ID.
+    /// Redis-backed leases use the same verification from their Redis refresh
+    /// task, while this path has no Redis task to own the health deadline.
+    pub(crate) fn start_refresh(&self) {
+        let Some(health) = self.inner.health.as_ref().cloned() else {
+            return;
+        };
+        let mut task = match self.inner.task.lock() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if task.is_some() {
+            return;
+        }
+
+        let weak = Arc::downgrade(&self.inner);
+        let cancel = self.inner.cancel.clone();
+        *task = Some(tokio::spawn(async move {
+            run_fence_refresh(weak, health, cancel).await;
+        }));
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), crate::common::errors::MegaError> {
+        if let Some(health) = self.inner.health.as_ref() {
+            id_generator::revoke_worker_lease(health);
+        }
+        self.inner.cancel.cancel();
+        let task = match self.inner.task.lock() {
+            Ok(mut task) => task.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let task_error = if let Some(task) = task {
+            task.await
+                .err()
+                .map(|error| crate::common::errors::MegaError::Other(error.to_string()))
+        } else {
+            None
+        };
+
+        let transaction = self.inner.transaction.lock().await.take();
+        let rollback_error = if let Some(transaction) = transaction {
+            transaction.rollback().await.err()
+        } else {
+            None
+        };
+        task_error
+            .or_else(|| rollback_error.map(Into::into))
+            .map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for WorkerFenceInner {
+    fn drop(&mut self) {
+        if let Some(health) = self.health.as_ref() {
+            id_generator::revoke_worker_lease(health);
+        }
+        self.cancel.cancel();
+    }
+}
+
+async fn run_fence_refresh(
+    weak: std::sync::Weak<WorkerFenceInner>,
+    health: Arc<WorkerLeaseHealth>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_millis(SLOT_REFRESH_INTERVAL_MS)) => {}
+        }
+
+        if cancel.is_cancelled() {
+            continue;
+        }
+        let Some(inner) = weak.upgrade() else {
+            break;
+        };
+        let fence = WorkerFence { inner };
+        match fence.verify().await {
+            Ok(()) if id_generator::refresh_worker_lease(&health) => {}
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(error = %error, "worker database fence verification failed");
+                id_generator::revoke_worker_lease(&health);
+                break;
+            }
+        }
+    }
+}
+
+/// Try to acquire a database-side fence for a worker slot. PostgreSQL advisory
+/// locks are session/transaction scoped and therefore survive Redis key loss as
+/// long as the old process still owns its database transaction.
+pub(crate) async fn try_acquire_worker_fence(
+    connection: &DatabaseConnection,
+    worker_id: u32,
+    health: Option<Arc<WorkerLeaseHealth>>,
+) -> Result<Option<WorkerFence>, crate::common::errors::MegaError> {
+    if connection.get_database_backend() != DatabaseBackend::Postgres {
+        return Ok(None);
+    }
+
+    let transaction = connection.begin().await?;
+    let statement = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_try_advisory_xact_lock($1, $2) AS locked",
+        vec![WORKER_FENCE_NAMESPACE.into(), (worker_id as i32).into()],
+    );
+    let Some(row) = transaction.query_one_raw(statement).await? else {
+        transaction.rollback().await?;
+        return Err(crate::common::errors::MegaError::Other(
+            "worker fence query returned no row".to_string(),
+        ));
+    };
+    let locked: bool = row.try_get("", "locked")?;
+    if !locked {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+
+    Ok(Some(WorkerFence::new(transaction, health)))
+}
 
 struct WorkerLeaseInner {
     worker_id: u32,
@@ -23,8 +205,20 @@ struct WorkerLeaseInner {
     token: String,
     connection: ConnectionManager,
     health: Arc<WorkerLeaseHealth>,
+    fence: Option<WorkerFence>,
     cancel: CancellationToken,
-    task: Mutex<Option<JoinHandle<()>>>,
+    task: StdMutex<Option<JoinHandle<()>>>,
+}
+
+struct SlotRefreshConfig {
+    connection: ConnectionManager,
+    key: String,
+    token: String,
+    health: Arc<WorkerLeaseHealth>,
+    fence: Option<WorkerFence>,
+    cancel: CancellationToken,
+    interval_ms: u64,
+    ttl_ms: u64,
 }
 
 /// A process-owned Redis worker slot and its refresh task.
@@ -45,6 +239,7 @@ impl SnowflakeWorkerLease {
         token: String,
         connection: ConnectionManager,
         health: Arc<WorkerLeaseHealth>,
+        fence: Option<WorkerFence>,
     ) -> Self {
         Self {
             inner: Arc::new(WorkerLeaseInner {
@@ -53,8 +248,9 @@ impl SnowflakeWorkerLease {
                 token,
                 connection,
                 health,
+                fence,
                 cancel: CancellationToken::new(),
-                task: Mutex::new(None),
+                task: StdMutex::new(None),
             }),
         }
     }
@@ -79,15 +275,16 @@ impl SnowflakeWorkerLease {
         }
 
         let inner = Arc::clone(&self.inner);
-        *task = Some(tokio::spawn(run_slot_refresh(
-            inner.connection.clone(),
-            inner.key.clone(),
-            inner.token.clone(),
-            Arc::clone(&inner.health),
-            inner.cancel.clone(),
-            SLOT_REFRESH_INTERVAL_MS,
-            SLOT_TTL_MS,
-        )));
+        *task = Some(tokio::spawn(run_slot_refresh(SlotRefreshConfig {
+            connection: inner.connection.clone(),
+            key: inner.key.clone(),
+            token: inner.token.clone(),
+            health: Arc::clone(&inner.health),
+            fence: inner.fence.clone(),
+            cancel: inner.cancel.clone(),
+            interval_ms: SLOT_REFRESH_INTERVAL_MS,
+            ttl_ms: SLOT_TTL_MS,
+        })));
     }
 
     /// Stop refresh, await its completion, and release this token-owned slot.
@@ -114,10 +311,17 @@ impl SnowflakeWorkerLease {
                 .await
                 .map(|_| ());
 
-        if let Some(error) = task_error {
-            return Err(error);
+        let mut first_error = task_error;
+        if first_error.is_none() {
+            first_error = release_result.err();
         }
-        release_result
+        if let Some(fence) = &self.inner.fence
+            && let Err(error) = fence.shutdown().await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -125,6 +329,21 @@ impl Drop for WorkerLeaseInner {
     fn drop(&mut self) {
         id_generator::revoke_worker_lease(&self.health);
         self.cancel.cancel();
+
+        let refresh_started = match self.task.lock() {
+            Ok(task) => task.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        };
+        if !refresh_started && let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let mut connection = self.connection.clone();
+            let key = self.key.clone();
+            let token = self.token.clone();
+            handle.spawn(async move {
+                if let Err(error) = release_slot_bounded(&mut connection, &key, &token).await {
+                    tracing::warn!(error = %error, slot_key = %key, "failed to release unstarted snowflake worker slot");
+                }
+            });
+        }
     }
 }
 
@@ -135,51 +354,194 @@ impl Drop for WorkerLeaseInner {
 /// identity hash for diagnostics, but must not generate IDs from that hash in
 /// a multi-writer process. On success, the caller must bind the returned guard
 /// to the ID generator before starting its refresh task.
-pub async fn claim_snowflake_worker(
+pub(crate) async fn claim_snowflake_worker(
     connection: &ConnectionManager,
+    database: &DatabaseConnection,
 ) -> Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError> {
     let identity = id_generator::process_identity();
-    let claim = timeout(
-        Duration::from_millis(SLOT_SCAN_TIMEOUT_MS),
-        claim_worker_lease(connection, SLOT_KEY_PREFIX, &identity),
-    )
-    .await;
+    let token = Uuid::new_v4().to_string();
+    let cancellation = CancellationToken::new();
+    let scan_cancellation = cancellation.clone();
+    let scan_connection = connection.clone();
+    let scan_database = database.clone();
+    let scan_identity = identity.clone();
+    let scan_token = token.clone();
+    let mut scan = tokio::spawn(async move {
+        claim_worker_lease(
+            &scan_connection,
+            SLOT_KEY_PREFIX,
+            &scan_identity,
+            scan_token,
+            Some(&scan_database),
+            &scan_cancellation,
+        )
+        .await
+    });
+    let claim = timeout(Duration::from_millis(SLOT_SCAN_TIMEOUT_MS), &mut scan).await;
 
     match claim {
-        Ok(lease) => Ok(lease),
+        Ok(Ok(Ok(lease))) => Ok(lease),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(error = %error, "snowflake worker slot scan failed");
+            spawn_abandoned_claim_cleanup(
+                scan,
+                connection.clone(),
+                SLOT_KEY_PREFIX.to_owned(),
+                token,
+            );
+            Ok(None)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "snowflake worker slot scan task failed");
+            spawn_abandoned_claim_cleanup(
+                scan,
+                connection.clone(),
+                SLOT_KEY_PREFIX.to_owned(),
+                token,
+            );
+            Ok(None)
+        }
         Err(_) => {
+            cancellation.cancel();
             tracing::warn!(
                 timeout_ms = SLOT_SCAN_TIMEOUT_MS,
                 process_identity = %id_generator::identity_digest(&identity),
                 "snowflake worker slot scan timed out; ID writes require explicit exclusive worker configuration"
+            );
+            spawn_abandoned_claim_cleanup(
+                scan,
+                connection.clone(),
+                SLOT_KEY_PREFIX.to_owned(),
+                token,
             );
             Ok(None)
         }
     }
 }
 
+fn spawn_abandoned_claim_cleanup(
+    scan: JoinHandle<Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError>>,
+    connection: ConnectionManager,
+    slot_key_prefix: String,
+    token: String,
+) {
+    tokio::spawn(async move {
+        let mut scan = scan;
+        match timeout(
+            Duration::from_millis(SLOT_SCAN_CLEANUP_TIMEOUT_MS),
+            &mut scan,
+        )
+        .await
+        {
+            Ok(Ok(Ok(Some(lease)))) => {
+                if let Err(error) = lease.shutdown().await {
+                    tracing::warn!(error = %error, "failed to shut down an abandoned snowflake worker lease");
+                }
+            }
+            Ok(Ok(Ok(None))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(error = %error, "abandoned snowflake worker slot scan returned an error");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "abandoned snowflake worker slot scan task failed");
+            }
+            Err(_) => {
+                scan.abort();
+                let _ = scan.await;
+                tracing::warn!(
+                    timeout_ms = SLOT_SCAN_CLEANUP_TIMEOUT_MS,
+                    "abandoned snowflake worker slot scan was aborted before cleanup"
+                );
+            }
+        }
+
+        let mut connection = connection;
+        if let Err(error) =
+            release_token_slots_bounded(&mut connection, &slot_key_prefix, &token).await
+        {
+            tracing::warn!(error = %error, "failed to clean up abandoned snowflake worker claims");
+        }
+    });
+}
+
 async fn claim_worker_lease(
     connection: &ConnectionManager,
     slot_key_prefix: &str,
     identity: &str,
-) -> Option<SnowflakeWorkerLease> {
-    let token = Uuid::new_v4().to_string();
+    token: String,
+    database: Option<&DatabaseConnection>,
+    cancellation: &CancellationToken,
+) -> Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError> {
     let mut conn = connection.clone();
 
     for worker_id in 0..=MAX_WORKER_ID {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
         let key = format!("{slot_key_prefix}{worker_id}");
-        match claim_slot(&mut conn, &key, &token, SLOT_TTL_MS).await {
+        let claim = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(None),
+            result = timeout(
+                Duration::from_millis(SLOT_CLAIM_TIMEOUT_MS),
+                claim_slot(&mut conn, &key, &token, SLOT_TTL_MS),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = SLOT_CLAIM_TIMEOUT_MS,
+                        slot_key = %key,
+                        "snowflake worker slot claim timed out"
+                    );
+                    return Err(crate::common::errors::MegaError::Other(format!(
+                        "snowflake worker slot claim timed out after {SLOT_CLAIM_TIMEOUT_MS}ms"
+                    )));
+                }
+            },
+        };
+        match claim {
             Ok(true) => {
+                if cancellation.is_cancelled() {
+                    let _ = release_slot_bounded(&mut conn, &key, &token).await;
+                    return Ok(None);
+                }
+                let fence = if let Some(database) = database {
+                    match try_acquire_worker_fence(database, worker_id, None).await {
+                        Ok(Some(fence)) => Some(fence),
+                        Ok(None) => {
+                            let _ = release_slot_bounded(&mut conn, &key, &token).await;
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = release_slot_bounded(&mut conn, &key, &token).await;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+                if cancellation.is_cancelled() {
+                    let _ = release_slot_bounded(&mut conn, &key, &token).await;
+                    if let Some(fence) = fence {
+                        let _ = fence.shutdown().await;
+                    }
+                    return Ok(None);
+                }
                 let health = WorkerLeaseHealth::claimed();
-                let lease =
-                    SnowflakeWorkerLease::new(worker_id, key, token, connection.clone(), health);
+                let lease = SnowflakeWorkerLease::new(
+                    worker_id,
+                    key,
+                    token.clone(),
+                    connection.clone(),
+                    health,
+                    fence,
+                );
                 tracing::info!(
                     worker_id,
                     slot_key = %lease.inner.key,
                     process_identity = %id_generator::identity_digest(identity),
                     "claimed snowflake worker slot"
                 );
-                return Some(lease);
+                return Ok(Some(lease));
             }
             Ok(false) => continue,
             Err(error) => {
@@ -188,7 +550,7 @@ async fn claim_worker_lease(
                     slot_key = %key,
                     "snowflake worker slot claim failed; ID writes require explicit exclusive worker configuration"
                 );
-                return None;
+                return Err(error.into());
             }
         }
     }
@@ -198,7 +560,7 @@ async fn claim_worker_lease(
         process_identity = %id_generator::identity_digest(identity),
         "all snowflake worker slots are taken; ID writes require explicit exclusive worker configuration"
     );
-    None
+    Ok(None)
 }
 
 async fn claim_slot(
@@ -218,15 +580,17 @@ async fn claim_slot(
     Ok(result.is_some())
 }
 
-async fn run_slot_refresh(
-    connection: ConnectionManager,
-    key: String,
-    token: String,
-    health: Arc<WorkerLeaseHealth>,
-    cancel: CancellationToken,
-    interval_ms: u64,
-    ttl_ms: u64,
-) {
+async fn run_slot_refresh(config: SlotRefreshConfig) {
+    let SlotRefreshConfig {
+        connection,
+        key,
+        token,
+        health,
+        fence,
+        cancel,
+        interval_ms,
+        ttl_ms,
+    } = config;
     let mut conn = connection;
     loop {
         tokio::select! {
@@ -239,6 +603,14 @@ async fn run_slot_refresh(
 
         if cancel.is_cancelled() {
             continue;
+        }
+
+        if let Some(fence) = &fence
+            && let Err(error) = fence.verify().await
+        {
+            tracing::warn!(error = %error, slot_key = %key, "snowflake worker database fence lost");
+            stop_refresh(&mut conn, &key, &token, &health).await;
+            break;
         }
 
         match timeout(
@@ -362,6 +734,48 @@ async fn release_slot_bounded(
     .map_err(crate::common::errors::MegaError::from)
 }
 
+async fn release_token_slots_bounded(
+    connection: &mut ConnectionManager,
+    slot_key_prefix: &str,
+    token: &str,
+) -> Result<i32, crate::common::errors::MegaError> {
+    timeout(
+        Duration::from_millis(SLOT_RELEASE_TIMEOUT_MS),
+        release_token_slots(connection, slot_key_prefix, token),
+    )
+    .await
+    .map_err(|_| {
+        crate::common::errors::MegaError::Other(format!(
+            "abandoned snowflake worker cleanup timed out after {SLOT_RELEASE_TIMEOUT_MS}ms"
+        ))
+    })?
+    .map_err(crate::common::errors::MegaError::from)
+}
+
+async fn release_token_slots(
+    connection: &mut ConnectionManager,
+    slot_key_prefix: &str,
+    token: &str,
+) -> redis::RedisResult<i32> {
+    let script = Script::new(
+        r#"
+            local released = 0
+            for _, key in ipairs(KEYS) do
+                if redis.call("GET", key) == ARGV[1] then
+                    released = released + redis.call("DEL", key)
+                end
+            end
+            return released
+        "#,
+    );
+    let mut invocation = script.prepare_invoke();
+    invocation.arg(token);
+    for worker_id in 0..=MAX_WORKER_ID {
+        invocation.key(format!("{slot_key_prefix}{worker_id}"));
+    }
+    invocation.invoke_async(connection).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -388,13 +802,13 @@ mod tests {
 
     async fn test_connection() -> (Option<RedisServer>, ConnectionManager) {
         if redis_server_available() {
-            let server = RedisServer::new();
-            let client =
-                redis::Client::open(server.client_addr().to_owned()).expect("redis test URL");
-            let connection = ConnectionManager::new(client)
-                .await
-                .expect("redis test connection");
-            return (Some(server), connection);
+            let local_server = std::panic::catch_unwind(RedisServer::new).ok();
+            if let Some(server) = local_server
+                && let Ok(client) = redis::Client::open(server.client_addr().to_owned())
+                && let Ok(connection) = ConnectionManager::new(client).await
+            {
+                return (Some(server), connection);
+            }
         }
 
         let url =
@@ -408,6 +822,24 @@ mod tests {
 
     fn test_prefix() -> String {
         format!("mega:test:snowflake:{}:", Uuid::new_v4())
+    }
+
+    async fn claim_test_worker(
+        connection: &ConnectionManager,
+        prefix: &str,
+        identity: &str,
+    ) -> Option<SnowflakeWorkerLease> {
+        let cancellation = CancellationToken::new();
+        claim_worker_lease(
+            connection,
+            prefix,
+            identity,
+            Uuid::new_v4().to_string(),
+            None,
+            &cancellation,
+        )
+        .await
+        .expect("worker slot scan should complete")
     }
 
     async fn cleanup_slots(connection: &mut ConnectionManager, prefix: &str) {
@@ -425,7 +857,7 @@ mod tests {
     async fn claims_with_set_nx_px_and_refreshes_by_token() {
         let (_server, mut connection) = test_connection().await;
         let prefix = test_prefix();
-        let lease = claim_worker_lease(&connection, &prefix, "pod-a")
+        let lease = claim_test_worker(&connection, &prefix, "pod-a")
             .await
             .expect("first worker slot should be available");
 
@@ -460,7 +892,7 @@ mod tests {
     async fn duplicate_claim_and_stale_refresh_cannot_extend_new_owner() {
         let (_server, mut connection) = test_connection().await;
         let prefix = test_prefix();
-        let first = claim_worker_lease(&connection, &prefix, "pod-a")
+        let first = claim_test_worker(&connection, &prefix, "pod-a")
             .await
             .expect("first worker slot should be available");
         let second_token = Uuid::new_v4().to_string();
@@ -537,15 +969,16 @@ mod tests {
         let health = WorkerLeaseHealth::claimed();
         health.activate();
         let cancel = CancellationToken::new();
-        let refresh_task = tokio::spawn(run_slot_refresh(
-            connection.clone(),
-            key.clone(),
-            old_token,
-            health.clone(),
+        let refresh_task = tokio::spawn(run_slot_refresh(SlotRefreshConfig {
+            connection: connection.clone(),
+            key: key.clone(),
+            token: old_token,
+            health: health.clone(),
+            fence: None,
             cancel,
-            10,
-            200,
-        ));
+            interval_ms: 10,
+            ttl_ms: 200,
+        }));
         sleep(Duration::from_millis(25)).await;
         let _: String = redis::cmd("SET")
             .arg(&key)
@@ -582,7 +1015,7 @@ mod tests {
         }
 
         assert!(
-            claim_worker_lease(&connection, &prefix, "overflow-pod")
+            claim_test_worker(&connection, &prefix, "overflow-pod")
                 .await
                 .is_none()
         );
@@ -593,7 +1026,7 @@ mod tests {
     async fn lease_shutdown_releases_slot_and_marks_health_lost() {
         let (_server, mut connection) = test_connection().await;
         let prefix = test_prefix();
-        let lease = claim_worker_lease(&connection, &prefix, "shutdown-pod")
+        let lease = claim_test_worker(&connection, &prefix, "shutdown-pod")
             .await
             .expect("worker slot should be available");
         let health = lease.health();
@@ -612,6 +1045,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandoned_claim_cleanup_is_token_scoped() {
+        let (_server, mut connection) = test_connection().await;
+        let prefix = test_prefix();
+        let token = Uuid::new_v4().to_string();
+        let other_token = Uuid::new_v4().to_string();
+
+        let _: String = redis::cmd("SET")
+            .arg(format!("{prefix}0"))
+            .arg(&token)
+            .arg("PX")
+            .arg(SLOT_TTL_MS)
+            .query_async(&mut connection)
+            .await
+            .expect("seed abandoned claim");
+        let _: String = redis::cmd("SET")
+            .arg(format!("{prefix}1"))
+            .arg(&other_token)
+            .arg("PX")
+            .arg(SLOT_TTL_MS)
+            .query_async(&mut connection)
+            .await
+            .expect("seed another owner");
+
+        let released = release_token_slots_bounded(&mut connection, &prefix, &token)
+            .await
+            .expect("token-scoped cleanup");
+        assert_eq!(released, 1);
+        let abandoned_exists: bool = connection
+            .exists(format!("{prefix}0"))
+            .await
+            .expect("check abandoned claim");
+        assert!(!abandoned_exists);
+        let other_exists: bool = connection
+            .exists(format!("{prefix}1"))
+            .await
+            .expect("check another owner");
+        assert!(other_exists);
+
+        cleanup_slots(&mut connection, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_scan_cleanup_releases_its_token_after_scan_completion() {
+        let (_server, mut connection) = test_connection().await;
+        let prefix = test_prefix();
+        let token = Uuid::new_v4().to_string();
+        let other_token = Uuid::new_v4().to_string();
+
+        let _: String = redis::cmd("SET")
+            .arg(format!("{prefix}0"))
+            .arg(&token)
+            .arg("PX")
+            .arg(SLOT_TTL_MS)
+            .query_async(&mut connection)
+            .await
+            .expect("seed abandoned scan claim");
+        let _: String = redis::cmd("SET")
+            .arg(format!("{prefix}1"))
+            .arg(&other_token)
+            .arg("PX")
+            .arg(SLOT_TTL_MS)
+            .query_async(&mut connection)
+            .await
+            .expect("seed another scan owner");
+
+        let scan = tokio::spawn(async {
+            Ok::<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError>(None)
+        });
+        spawn_abandoned_claim_cleanup(scan, connection.clone(), prefix.clone(), token);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let exists: bool = connection
+                    .exists(format!("{prefix}0"))
+                    .await
+                    .expect("check abandoned scan claim");
+                if !exists {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("abandoned scan cleanup should finish");
+        let other_exists: bool = connection
+            .exists(format!("{prefix}1"))
+            .await
+            .expect("check another scan owner");
+        assert!(other_exists);
+
+        cleanup_slots(&mut connection, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_worker_fence_prevents_reuse_until_shutdown() {
+        let first_temp = tempfile::TempDir::new().expect("first fence temp dir");
+        let second_temp = tempfile::TempDir::new().expect("second fence temp dir");
+        let first = crate::jupiter::tests::test_db_connection(first_temp.path()).await;
+        let second = crate::jupiter::tests::test_db_connection(second_temp.path()).await;
+        let worker_id = (Uuid::new_v4().as_u128() as u32) & MAX_WORKER_ID;
+
+        let first_fence = try_acquire_worker_fence(&first, worker_id, None)
+            .await
+            .expect("first fence query")
+            .expect("first process should acquire the fence");
+        first_fence
+            .verify()
+            .await
+            .expect("first fence should be alive");
+        assert!(
+            try_acquire_worker_fence(&second, worker_id, None)
+                .await
+                .expect("second fence query")
+                .is_none(),
+            "a second process must not reuse a worker while the first fence is held"
+        );
+
+        first_fence
+            .shutdown()
+            .await
+            .expect("first process should release the fence");
+        let second_fence = try_acquire_worker_fence(&second, worker_id, None)
+            .await
+            .expect("second fence retry")
+            .expect("worker should be reusable after the first fence shuts down");
+        second_fence
+            .shutdown()
+            .await
+            .expect("second process should release the fence");
+    }
+
+    #[tokio::test]
     async fn unreachable_redis_claim_is_bounded_and_returns_no_lease() {
         let client = redis::Client::open("redis://127.0.0.1:1").expect("test Redis URL");
         let connection = ConnectionManager::new_lazy_with_config(
@@ -621,7 +1186,7 @@ mod tests {
         .expect("lazy Redis manager should be constructible");
         let started = Instant::now();
 
-        let lease = claim_snowflake_worker(&connection)
+        let lease = claim_snowflake_worker(&connection, &DatabaseConnection::default())
             .await
             .expect("unreachable Redis is a bounded fallback");
 

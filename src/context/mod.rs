@@ -16,7 +16,8 @@ use crate::{
     },
     jupiter::{
         redis::{
-            ConnectionManager, SnowflakeWorkerLease, claim_snowflake_worker, init_connection_lazy,
+            ConnectionManager, SnowflakeWorkerLease, WorkerFence, claim_snowflake_worker,
+            init_connection_lazy, try_acquire_worker_fence,
         },
         storage::init::database_connection_without_id_generator,
         utils::id_generator,
@@ -46,6 +47,11 @@ pub struct AppContext {
     /// Keeping the guard in the context makes refresh lifetime and shutdown
     /// explicit instead of leaving a detached task behind.
     pub(crate) worker_lease: Option<SnowflakeWorkerLease>,
+
+    /// PostgreSQL advisory fence for an explicitly configured worker ID.
+    /// Redis leases carry their own fence, while the env-selected path keeps
+    /// this guard directly in the application context.
+    pub(crate) worker_fence: Option<WorkerFence>,
 
     /// Token to signal shutdown for notification background tasks (dispatcher etc.).
     /// Created in new() ; callers (e.g. services) can clone and cancel on graceful exit.
@@ -115,14 +121,29 @@ impl AppContext {
         // the legacy fixed worker ID.
         let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
         let connection = init_connection_lazy(&redis_config)?;
+        let mut worker_fence = None;
         let worker_lease = if let Some(worker_id) = id_generator::configured_env_worker_id() {
-            id_generator::initialize_worker(worker_id, id_generator::WorkerIdSource::Env, None)?;
+            let health = id_generator::WorkerLeaseHealth::claimed();
+            let fence = try_acquire_worker_fence(&db_connection, worker_id, Some(health.clone()))
+                .await?
+                .ok_or_else(|| {
+                    MegaError::IdGenerationUnavailable(format!(
+                        "configured worker ID {worker_id} is already fenced by another process"
+                    ))
+                })?;
+            id_generator::initialize_worker(
+                worker_id,
+                id_generator::WorkerIdSource::Env,
+                Some(health),
+            )?;
+            fence.start_refresh();
+            worker_fence = Some(fence);
             tracing::info!(
                 source = ?id_generator::WorkerIdSource::Env,
                 "valid MEGA_ID_GENERATOR_WORKER_ID set; skipping Redis worker slot claim"
             );
             None
-        } else if let Some(lease) = claim_snowflake_worker(&connection).await? {
+        } else if let Some(lease) = claim_snowflake_worker(&connection, &db_connection).await? {
             let worker_id = lease.worker_id();
             let health = lease.health();
             if let Err(error) = id_generator::initialize_worker(
@@ -295,6 +316,7 @@ impl AppContext {
                 config_handle,
                 connection,
                 worker_lease: worker_lease_guard.take(),
+                worker_fence: worker_fence.take(),
                 notification_shutdown,
                 entity_store,
             })
@@ -307,6 +329,14 @@ impl AppContext {
                 tracing::warn!(
                     error = %error,
                     "failed to release snowflake worker lease after startup error"
+                );
+            }
+            if let Some(fence) = worker_fence.take()
+                && let Err(error) = fence.shutdown().await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "failed to release worker fence after startup error"
                 );
             }
         }
@@ -328,6 +358,9 @@ impl AppContext {
         self.notification_shutdown.cancel();
         if let Some(lease) = &self.worker_lease {
             lease.shutdown().await?;
+        }
+        if let Some(fence) = &self.worker_fence {
+            fence.shutdown().await?;
         }
         Ok(())
     }

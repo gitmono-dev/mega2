@@ -36,7 +36,10 @@ impl MergeQueueStorage {
     }
 
     /// Adds CL to queue with timestamp position
-    pub async fn add_to_queue(&self, cl_link: String) -> Result<i64, String> {
+    pub async fn add_to_queue(
+        &self,
+        cl_link: String,
+    ) -> Result<i64, crate::common::errors::MegaError> {
         self.add_to_queue_with_requester(cl_link, None).await
     }
 
@@ -50,7 +53,7 @@ impl MergeQueueStorage {
         &self,
         cl_link: String,
         requester: Option<String>,
-    ) -> Result<i64, String> {
+    ) -> Result<i64, crate::common::errors::MegaError> {
         let db = self.get_connection();
 
         // Check if CL is already in queue (any status)
@@ -58,23 +61,25 @@ impl MergeQueueStorage {
             .filter(Column::ClLink.eq(&cl_link))
             .one(db)
             .await
-            .map_err(|e| format!("Failed to check existing CL: {}", e))?;
+            .map_err(|e| {
+                crate::common::errors::MegaError::Other(format!("Failed to check existing CL: {e}"))
+            })?;
 
         if let Some(item) = existing {
             return match item.status {
                 QueueStatusEnum::Waiting | QueueStatusEnum::Testing | QueueStatusEnum::Merging => {
-                    Err(format!(
+                    Err(crate::common::errors::MegaError::Other(format!(
                         "CL is already in the queue with status {:?}",
                         item.status
-                    ))
+                    )))
                 }
-                QueueStatusEnum::Merged => {
-                    Err("CL has already been merged, cannot add to queue again".to_string())
-                }
-                QueueStatusEnum::Failed => Err(
+                QueueStatusEnum::Merged => Err(crate::common::errors::MegaError::Other(
+                    "CL has already been merged, cannot add to queue again".to_string(),
+                )),
+                QueueStatusEnum::Failed => Err(crate::common::errors::MegaError::Other(
                     "CL previously failed, please use retry endpoint instead of adding again"
                         .to_string(),
-                ),
+                )),
             };
         }
 
@@ -84,7 +89,7 @@ impl MergeQueueStorage {
 
         // Create new queue item
         let new_item = ActiveModel {
-            id: Set(crate::common::utils::generate_id().map_err(|error| error.to_string())?),
+            id: Set(crate::common::utils::generate_id()?),
             cl_link: Set(cl_link),
             status: Set(QueueStatusEnum::Waiting),
             position: Set(position),
@@ -97,10 +102,9 @@ impl MergeQueueStorage {
             requester: Set(requester),
         };
 
-        new_item
-            .insert(db)
-            .await
-            .map_err(|e| format!("Failed to insert queue item: {}", e))?;
+        new_item.insert(db).await.map_err(|e| {
+            crate::common::errors::MegaError::Other(format!("Failed to insert queue item: {e}"))
+        })?;
 
         Ok(position)
     }

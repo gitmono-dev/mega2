@@ -476,3 +476,16 @@ pub async fn upload_object_fallback(
         .map_err(mega_to_api)?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_generation_unavailable_is_a_retryable_artifact_error() {
+        let response = mega_to_api(MegaError::IdGenerationUnavailable("lease lost".to_owned()))
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

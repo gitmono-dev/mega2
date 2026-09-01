@@ -55,8 +55,7 @@ impl MergeQueueService {
         let position = self
             .merge_queue_storage
             .add_to_queue_with_requester(cl_link, requester)
-            .await
-            .map_err(MegaError::Other)?;
+            .await?;
 
         Ok(position)
     }

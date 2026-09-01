@@ -58,16 +58,16 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     };
 
     let mut result = result;
-    if let Some(reload_watcher) = reload_watcher {
-        if let Err(stop_error) = reload_watcher.stop().await {
-            if result.is_ok() {
-                result = Err(stop_error);
-            } else {
-                tracing::warn!(
-                    error = %stop_error,
-                    "config reload watcher failed to stop after service error"
-                );
-            }
+    if let Some(reload_watcher) = reload_watcher
+        && let Err(stop_error) = reload_watcher.stop().await
+    {
+        if result.is_ok() {
+            result = Err(stop_error);
+        } else {
+            tracing::warn!(
+                error = %stop_error,
+                "config reload watcher failed to stop after service error"
+            );
         }
     }
 

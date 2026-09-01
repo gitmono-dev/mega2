@@ -26,22 +26,12 @@ static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
 const WORKER_LEASE_TTL_MS: u64 = 30_000;
 const WORKER_LEASE_SAFETY_MARGIN_MS: u64 = 5_000;
 
+#[derive(Default)]
 struct GeneratorState {
     generator: Option<CoreIdGenerator>,
     worker_id: Option<u32>,
     source: Option<WorkerIdSource>,
     lease_health: Option<Arc<WorkerLeaseHealth>>,
-}
-
-impl Default for GeneratorState {
-    fn default() -> Self {
-        Self {
-            generator: None,
-            worker_id: None,
-            source: None,
-            lease_health: None,
-        }
-    }
 }
 
 /// Shared process-local health state for the Redis worker lease.
@@ -269,22 +259,22 @@ fn bind_generator_state(
                 "ID generator is already bound to a different worker selection".to_string(),
             ));
         }
-        if let Some(health) = state.lease_health.as_ref() {
-            if !health.activate() {
-                return Err(MegaError::IdGenerationUnavailable(
-                    "Redis worker lease expired before ID generator initialization".to_string(),
-                ));
-            }
-        }
-        return Ok(());
-    }
-
-    if let Some(health) = lease_health.as_ref() {
-        if !health.activate() {
+        if let Some(health) = state.lease_health.as_ref()
+            && !health.activate()
+        {
             return Err(MegaError::IdGenerationUnavailable(
                 "Redis worker lease expired before ID generator initialization".to_string(),
             ));
         }
+        return Ok(());
+    }
+
+    if let Some(health) = lease_health.as_ref()
+        && !health.activate()
+    {
+        return Err(MegaError::IdGenerationUnavailable(
+            "Redis worker lease expired before ID generator initialization".to_string(),
+        ));
     }
     state.generator = Some(generator);
     state.worker_id = Some(worker_id);
@@ -311,9 +301,9 @@ pub(crate) fn initialize_worker(
             "Redis worker selection requires an active lease".to_string(),
         ));
     }
-    if source != WorkerIdSource::Redis && lease_health.is_some() {
+    if source == WorkerIdSource::Hash && lease_health.is_some() {
         return Err(MegaError::IdGenerationUnavailable(
-            "only Redis worker selections may carry a lease".to_string(),
+            "hash worker selections cannot carry a lease health guard".to_string(),
         ));
     }
 
@@ -376,9 +366,7 @@ fn parse_env_worker_id(raw: &str) -> Option<u32> {
 /// Return the explicitly configured worker ID, logging invalid input once at
 /// the boundary that consumes the environment variable.
 pub fn configured_env_worker_id() -> Option<u32> {
-    let Some(raw) = std::env::var(ENV_WORKER_ID).ok() else {
-        return None;
-    };
+    let raw = std::env::var(ENV_WORKER_ID).ok()?;
     if let Some(id) = parse_env_worker_id(&raw) {
         return Some(id);
     }
@@ -424,17 +412,17 @@ pub fn ensure_initialized() -> Result<(), MegaError> {
     {
         let state = lock_generator_state();
         if state.worker_id.is_some() {
-            if state.source == Some(WorkerIdSource::Redis) {
-                let Some(health) = state.lease_health.as_ref() else {
-                    return Err(MegaError::IdGenerationUnavailable(
-                        "Redis worker selection is missing its active lease".to_string(),
-                    ));
-                };
-                if !health.is_healthy() {
-                    return Err(MegaError::IdGenerationUnavailable(
-                        "Redis worker lease was lost or expired".to_string(),
-                    ));
-                }
+            if state.source == Some(WorkerIdSource::Redis) && state.lease_health.is_none() {
+                return Err(MegaError::IdGenerationUnavailable(
+                    "Redis worker selection is missing its active lease".to_string(),
+                ));
+            }
+            if let Some(health) = state.lease_health.as_ref()
+                && !health.is_healthy()
+            {
+                return Err(MegaError::IdGenerationUnavailable(
+                    "worker lease or database fence was lost or expired".to_string(),
+                ));
             }
             return Ok(());
         }

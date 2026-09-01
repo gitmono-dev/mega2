@@ -176,6 +176,9 @@ impl From<MegaError> for GitError {
             MegaError::ObjStorageNotFound(msg) => {
                 GitError::CustomError(format!("[code:404] ObjStorage not found: {msg}"))
             }
+            MegaError::IdGenerationUnavailable(msg) => {
+                GitError::CustomError(format!("[code:503] {msg}"))
+            }
             other => GitError::CustomError(other.to_string()),
         }
     }
@@ -286,6 +289,13 @@ mod tests {
         let err: GitError = MegaError::NotFound("repo missing".to_owned()).into();
 
         assert!(err.to_string().contains("[code:404] repo missing"));
+    }
+
+    #[test]
+    fn converts_id_generation_unavailable_to_git_503_marker() {
+        let err: GitError = MegaError::IdGenerationUnavailable("lease lost".to_owned()).into();
+
+        assert!(err.to_string().contains("[code:503] lease lost"));
     }
 
     #[test]
