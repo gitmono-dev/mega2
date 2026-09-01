@@ -656,7 +656,9 @@ fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
 /// Disable job control before spawning `setsid`: the background launcher then
 /// stays in the wrapper's process group, so BusyBox can `exec` Git directly.
 /// The wrapper can consequently wait for and reap the session leader while a
-/// watchdog interrupts that wait only when the wall-clock budget expires.
+/// watchdog interrupts that wait only when the wall-clock budget expires. The
+/// watchdog is a separate session too, so normal completion can terminate and
+/// reap its entire process group before disarming its `USR1` trap.
 fn container_git_timeout_script(timeout: Duration) -> String {
     let secs = timeout.as_secs();
 
@@ -667,12 +669,13 @@ fn container_git_timeout_script(timeout: Duration) -> String {
          watchdog_pid=\n\
          stop_watchdog() {{\n\
            if [ -n \"$watchdog_pid\" ]; then\n\
-             kill \"$watchdog_pid\" 2>/dev/null || true\n\
+             kill -TERM -\"$watchdog_pid\" 2>/dev/null || true\n\
              wait \"$watchdog_pid\" 2>/dev/null || true\n\
+             watchdog_pid=\n\
            fi\n\
          }}\n\
          on_timeout() {{\n\
-           trap - USR1\n\
+           trap '' USR1\n\
            kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
            wait \"$gpid\" 2>/dev/null || true\n\
            stop_watchdog\n\
@@ -681,21 +684,12 @@ fn container_git_timeout_script(timeout: Duration) -> String {
          trap 'on_timeout' USR1\n\
          setsid git \"$@\" &\n\
          gpid=$!\n\
-         (\n\
-           sleeper=\n\
-           trap '[ -n \"$sleeper\" ] && kill \"$sleeper\" 2>/dev/null || true; exit 0' TERM\n\
-           sleep {secs} &\n\
-           sleeper=$!\n\
-           wait \"$sleeper\"\n\
-           if [ $? -eq 0 ]; then\n\
-             kill -USR1 \"$parent_pid\"\n\
-           fi\n\
-         ) &\n\
+         setsid sh -c 'sleep \"$1\"; kill -USR1 \"$2\"' watchdog \"{secs}\" \"$parent_pid\" &\n\
          watchdog_pid=$!\n\
          wait \"$gpid\"\n\
          status=$?\n\
-         trap - USR1\n\
          stop_watchdog\n\
+         trap - USR1\n\
          exit \"$status\"\n"
     )
 }
@@ -719,7 +713,7 @@ mod timeout_wrapper_tests {
         time::{Duration, Instant},
     };
 
-    use tempfile::tempdir;
+    use tempfile::{Builder, tempdir};
 
     use super::container_git_timeout_script;
 
@@ -751,6 +745,77 @@ mod timeout_wrapper_tests {
             command.env(name, value);
         }
         command.output().expect("run timeout wrapper")
+    }
+
+    fn shared_tempdir() -> tempfile::TempDir {
+        let workdir = super::git_cli_workdir();
+        fs::create_dir_all(&workdir).expect("create shared git workdir");
+        Builder::new()
+            .prefix("timeout-wrapper-")
+            .tempdir_in(workdir)
+            .expect("shared timeout-wrapper temp dir")
+    }
+
+    fn run_timeout_script_in_container(
+        bin_dir: &Path,
+        timeout: Duration,
+        extra_env: &[(&str, &Path)],
+    ) -> (String, std::process::Output) {
+        let case_dir = bin_dir.parent().expect("bin directory parent");
+        let container_id = super::running_git_cli_container_id()
+            .expect("running compose git-cli container for BusyBox coverage");
+        let container_bin_dir = super::container_path_for_host(bin_dir);
+        let container_case_dir = super::container_path_for_host(case_dir);
+        let mut command = super::docker_exec_base();
+        command
+            .arg("-w")
+            .arg(container_case_dir)
+            .arg("-e")
+            .arg(format!(
+                "PATH={container_bin_dir}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ));
+        for (name, value) in extra_env {
+            command
+                .arg("-e")
+                .arg(format!("{name}={}", super::container_path_for_host(value)));
+        }
+        command
+            .arg(&container_id)
+            .arg("sh")
+            .arg("-c")
+            .arg(container_git_timeout_script(timeout))
+            .arg("git-wrapper");
+
+        let output = super::output_with_timeout(
+            command,
+            timeout + Duration::from_secs(10),
+            "docker exec git-cli timeout-wrapper coverage",
+        );
+        (container_id, output)
+    }
+
+    fn assert_container_pid_reaped(container_id: &str, pid: u32, description: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut command = super::docker_exec_base();
+            command
+                .arg(container_id)
+                .arg("sh")
+                .arg("-c")
+                .arg("test ! -e \"/proc/$1\"")
+                .arg("pid-probe")
+                .arg(pid.to_string());
+            let output = super::output_with_timeout(
+                command,
+                Duration::from_secs(5),
+                "docker exec git-cli process probe",
+            );
+            if output.status.success() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("{description} {pid} must be reaped in the git-cli container");
     }
 
     #[test]
@@ -806,6 +871,53 @@ mod timeout_wrapper_tests {
             !Path::new(&format!("/proc/{child_pid}")).exists(),
             "timed-out git helper {child_pid} must be reaped"
         );
+    }
+
+    #[test]
+    fn timeout_wrapper_matches_busybox_runner_status_and_reaping() {
+        let temp_dir = shared_tempdir();
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        let watchdog_pid_path = temp_dir.path().join("watchdog.pid");
+        write_executable(
+            &bin_dir.join("sleep"),
+            "#!/bin/sh\nif [ -n \"$WATCHDOG_SLEEP_PID\" ]; then\n  printf '%s\\n' \"$$\" > \"$WATCHDOG_SLEEP_PID\"\nfi\nexec /bin/sleep \"$@\"\n",
+        );
+        write_executable(&bin_dir.join("git"), "#!/bin/sh\n/bin/sleep 1\nexit 23\n");
+
+        let (container_id, output) = run_timeout_script_in_container(
+            &bin_dir,
+            Duration::from_secs(5),
+            &[("WATCHDOG_SLEEP_PID", &watchdog_pid_path)],
+        );
+        assert_eq!(output.status.code(), Some(23));
+
+        let watchdog_pid = fs::read_to_string(&watchdog_pid_path)
+            .expect("watchdog sleep pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric watchdog sleep pid");
+        assert_container_pid_reaped(&container_id, watchdog_pid, "normal-completion watchdog");
+
+        let child_pid_path = temp_dir.path().join("child.pid");
+        write_executable(
+            &bin_dir.join("git"),
+            "#!/bin/sh\n/bin/sleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$FAKE_GIT_CHILD_PID\"\nwait \"$child\"\n",
+        );
+
+        let (container_id, output) = run_timeout_script_in_container(
+            &bin_dir,
+            Duration::from_secs(1),
+            &[("FAKE_GIT_CHILD_PID", &child_pid_path)],
+        );
+        assert_eq!(output.status.code(), Some(137));
+
+        let child_pid = fs::read_to_string(&child_pid_path)
+            .expect("fake git child pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric fake git child pid");
+        assert_container_pid_reaped(&container_id, child_pid, "timed-out git helper");
     }
 }
 
