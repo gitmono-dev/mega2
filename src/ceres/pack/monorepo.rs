@@ -51,7 +51,7 @@ use crate::{
         policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
     },
     jupiter::{
-        storage::{Storage, base_storage::StorageConnector},
+        storage::{Storage, base_storage::StorageConnector, mono_storage::MonoStorage},
         utils::converter::FromMegaModel,
     },
 };
@@ -754,7 +754,8 @@ impl RepoHandler for MonoRepo {
             tip.tree_id
         );
 
-        self.traverses_and_update_filepath(root_tree, PathBuf::new())
+        let storage = self.storage.mono_storage();
+        let pairs = collect_mega_blob_filepaths(storage.clone(), root_tree, PathBuf::new())
             .await
             .map_err(|e| {
                 MegaError::Other(format!(
@@ -762,6 +763,12 @@ impl RepoHandler for MonoRepo {
                     tip.id, e
                 ))
             })?;
+        storage.update_blob_filepaths(pairs).await.map_err(|e| {
+            MegaError::Other(format!(
+                "Failed to update file paths for commit {}: {}",
+                tip.id, e
+            ))
+        })?;
 
         tracing::info!(
             "Successfully completed file path update for commit {}",
@@ -770,6 +777,67 @@ impl RepoHandler for MonoRepo {
 
         Ok(())
     }
+}
+
+#[async_recursion]
+pub(crate) async fn collect_mega_blob_filepaths(
+    storage: MonoStorage,
+    tree: Tree,
+    path: PathBuf,
+) -> Result<Vec<(String, String)>, MegaError> {
+    let mut pairs = Vec::new();
+    for item in tree.tree_items {
+        let item_path = path.join(&item.name);
+
+        if item.is_tree() {
+            let tree_hash = item.id.to_string();
+            let trees = storage
+                .get_trees_by_hashes(vec![tree_hash.clone()])
+                .await
+                .map_err(|e| {
+                    MegaError::Other(format!(
+                        "Failed to retrieve tree {} at path '{}': {}",
+                        tree_hash,
+                        item_path.display(),
+                        e
+                    ))
+                })?;
+
+            if trees.is_empty() {
+                return Err(MegaError::Other(format!(
+                    "Tree {} not found at path '{}'",
+                    tree_hash,
+                    item_path.display()
+                )));
+            }
+
+            let child_tree = Tree::from_mega_model(trees[0].clone());
+            pairs.extend(
+                collect_mega_blob_filepaths(storage.clone(), child_tree, item_path.clone())
+                    .await
+                    .map_err(|e| {
+                        MegaError::Other(format!(
+                            "Failed to process subtree {} at path '{}': {}",
+                            tree_hash,
+                            item_path.display(),
+                            e
+                        ))
+                    })?,
+            );
+        } else {
+            let blob_id = item.id.to_string();
+            let file_path = item_path.to_str().ok_or_else(|| {
+                MegaError::Other(format!(
+                    "Invalid UTF-8 path for blob {}: '{}'",
+                    blob_id,
+                    item_path.display()
+                ))
+            })?;
+            pairs.push((blob_id, file_path.to_owned()));
+        }
+    }
+
+    Ok(pairs)
 }
 
 impl MonoRepo {
@@ -1082,82 +1150,6 @@ impl MonoRepo {
         Ok(())
     }
 
-    #[async_recursion]
-    async fn traverses_and_update_filepath(
-        &self,
-        tree: Tree,
-        path: PathBuf,
-    ) -> Result<(), MegaError> {
-        for item in tree.tree_items {
-            let item_path = path.join(&item.name);
-
-            if item.is_tree() {
-                let tree_hash = item.id.to_string();
-                let trees = self
-                    .storage
-                    .mono_storage()
-                    .get_trees_by_hashes(vec![tree_hash.clone()])
-                    .await
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "Failed to retrieve tree {} at path '{}': {}",
-                            tree_hash,
-                            item_path.display(),
-                            e
-                        ))
-                    })?;
-
-                if trees.is_empty() {
-                    return Err(MegaError::Other(format!(
-                        "Tree {} not found at path '{}'",
-                        tree_hash,
-                        item_path.display()
-                    )));
-                }
-
-                let child_tree = Tree::from_mega_model(trees[0].clone());
-
-                self.traverses_and_update_filepath(child_tree, item_path.clone())
-                    .await
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "Failed to process subtree {} at path '{}': {}",
-                            tree_hash,
-                            item_path.display(),
-                            e
-                        ))
-                    })?;
-            } else {
-                let blob_id = item.id.to_string();
-                let file_path_str = item_path.to_str().ok_or_else(|| {
-                    MegaError::Other(format!(
-                        "Invalid UTF-8 path for blob {}: '{}'",
-                        blob_id,
-                        item_path.display()
-                    ))
-                })?;
-
-                self.storage
-                    .mono_storage()
-                    .update_blob_filepath(&blob_id, file_path_str)
-                    .await
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "Failed to update file path for blob {} at '{}': {}",
-                            blob_id, file_path_str, e
-                        ))
-                    })?;
-
-                tracing::debug!(
-                    "Updated file path for blob {} to '{}'",
-                    blob_id,
-                    file_path_str
-                );
-            }
-        }
-
-        Ok(())
-    }
     /// The semantics-defining command of this push: the first non-delete
     /// branch command. Delete commands never build a chain; a push with more
     /// than one non-delete branch command is rejected by
@@ -1493,8 +1485,10 @@ mod tests {
         internal::{
             metadata::{EntryMeta, MetaAttached},
             object::{
+                blob::Blob,
                 commit::Commit,
                 signature::{Signature, SignatureType},
+                tree::{Tree, TreeItem, TreeItemMode},
             },
             pack::entry::Entry,
         },
@@ -1503,7 +1497,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    use super::{MonoRepo, RepoHandler};
+    use super::{MonoRepo, RepoHandler, collect_mega_blob_filepaths};
     use crate::{
         bellatrix::Bellatrix,
         callisto::{commit_auths, mega_commit, mega_tree},
@@ -1538,6 +1532,50 @@ mod tests {
 
     fn id_set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn collect_mega_blob_filepaths_preserves_nested_tree_order() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let first = Blob::from_content("first");
+        let second = Blob::from_content("second");
+        let nested = Tree::from_tree_items(vec![
+            TreeItem {
+                mode: TreeItemMode::Blob,
+                id: first.id,
+                name: "文件.txt".to_owned(),
+            },
+            TreeItem {
+                mode: TreeItemMode::Blob,
+                id: second.id,
+                name: "second.txt".to_owned(),
+            },
+        ])
+        .expect("build nested tree");
+        let nested_model = nested.clone().into_mega_model(EntryMeta::default());
+        mega_tree::Entity::insert(nested_model.into_active_model())
+            .exec(storage.mono_storage().get_connection())
+            .await
+            .expect("insert nested tree");
+        let root = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Tree,
+            id: nested.id,
+            name: "src".to_owned(),
+        }])
+        .expect("build root tree");
+
+        let pairs = collect_mega_blob_filepaths(storage.mono_storage(), root, PathBuf::new())
+            .await
+            .expect("collect nested paths");
+
+        assert_eq!(
+            pairs,
+            vec![
+                (first.id.to_string(), "src/文件.txt".to_owned()),
+                (second.id.to_string(), "src/second.txt".to_owned()),
+            ]
+        );
     }
 
     fn test_monorepo(

@@ -430,7 +430,9 @@ impl RepoHandler for ImportRepo {
                 .lock()
                 .expect("command_list lock poisoned");
             cmds.iter()
-                .find(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
+                .find(|c| {
+                    c.ref_type == RefTypeEnum::Branch && c.status == "ok" && c.new_id != ZERO_ID
+                })
                 .map(|c| c.new_id.clone())
         };
         let current_head = match from_commands {
@@ -453,45 +455,63 @@ impl RepoHandler for ImportRepo {
                 .unwrap()
                 .clone(),
         );
-        self.traverses_and_update_filepath(root_tree, PathBuf::new())
+        let storage = self.storage.git_db_storage();
+        let pairs = collect_git_blob_filepaths(
+            storage.clone(),
+            self.repo.repo_id,
+            root_tree,
+            PathBuf::new(),
+        )
+        .await?;
+        storage
+            .update_git_blob_filepaths(self.repo.repo_id, pairs)
             .await?;
         Ok(())
     }
 }
 
-impl ImportRepo {
-    #[async_recursion]
-    async fn traverses_and_update_filepath(
-        &self,
-        tree: Tree,
-        path: PathBuf,
-    ) -> Result<(), MegaError> {
-        for item in tree.tree_items {
-            if item.is_tree() {
-                let tree = Tree::from_git_model(
-                    self.storage
-                        .git_db_storage()
-                        .get_tree_by_hash(self.repo.repo_id, &item.id.to_string())
-                        .await?
-                        .unwrap()
-                        .clone(),
-                );
-
-                // 递归调用
-                self.traverses_and_update_filepath(tree, path.join(item.name))
-                    .await?;
-            } else {
-                let id = item.id.to_string();
-                self.storage
-                    .git_db_storage()
-                    .update_git_blob_filepath(&id, path.join(item.name).to_str().unwrap())
-                    .await?;
-            }
+#[async_recursion]
+pub(crate) async fn collect_git_blob_filepaths(
+    storage: GitDbStorage,
+    repo_id: i64,
+    tree: Tree,
+    path: PathBuf,
+) -> Result<Vec<(String, String)>, MegaError> {
+    let mut pairs = Vec::new();
+    for item in tree.tree_items {
+        let item_path = path.join(&item.name);
+        if item.is_tree() {
+            let tree_model = storage
+                .get_tree_by_hash(repo_id, &item.id.to_string())
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(format!(
+                        "Tree {} not found at path '{}'",
+                        item.id,
+                        item_path.display()
+                    ))
+                })?;
+            let child_tree = Tree::from_git_model(tree_model);
+            pairs.extend(
+                collect_git_blob_filepaths(storage.clone(), repo_id, child_tree, item_path).await?,
+            );
+        } else {
+            let blob_id = item.id.to_string();
+            let file_path = item_path.to_str().ok_or_else(|| {
+                MegaError::Other(format!(
+                    "Invalid UTF-8 path for blob {}: '{}'",
+                    blob_id,
+                    item_path.display()
+                ))
+            })?;
+            pairs.push((blob_id, file_path.to_owned()));
         }
-
-        Ok(())
     }
 
+    Ok(pairs)
+}
+
+impl ImportRepo {
     async fn apply_tag_ref_in_txn(
         &self,
         git_db: &GitDbStorage,
@@ -905,7 +925,7 @@ async fn process_objects(
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::{
         path::PathBuf,
         sync::{Arc, Mutex},
@@ -919,11 +939,11 @@ mod test {
             tree::{Tree, TreeItem, TreeItemMode},
         },
     };
-    use sea_orm::TransactionTrait;
+    use sea_orm::{EntityTrait, IntoActiveModel, TransactionTrait};
 
-    use super::ImportRepo;
+    use super::{ImportRepo, collect_git_blob_filepaths};
     use crate::{
-        callisto::{import_refs, sea_orm_active_enums::RefTypeEnum},
+        callisto::{git_tree, import_refs, sea_orm_active_enums::RefTypeEnum},
         ceres::{
             api_service::cache::GitObjectCache,
             protocol::{import_refs::RefCommand, repo::Repo},
@@ -942,7 +962,7 @@ mod test {
                 object_storage::mock_object_storage,
             },
             tests::{test_db_connection, test_storage},
-            utils::converter::FromMegaModel,
+            utils::converter::{FromMegaModel, IntoGitModel},
         },
     };
 
@@ -953,6 +973,56 @@ mod test {
         for path in ancestors.into_iter() {
             println!("{path:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn collect_git_blob_filepaths_preserves_nested_tree_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.unwrap();
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        let repo_id = 41;
+        let first = Blob::from_content("first");
+        let second = Blob::from_content("second");
+        let nested = Tree::from_tree_items(vec![
+            TreeItem {
+                mode: TreeItemMode::Blob,
+                id: first.id,
+                name: "文件.txt".to_owned(),
+            },
+            TreeItem {
+                mode: TreeItemMode::Blob,
+                id: second.id,
+                name: "second.txt".to_owned(),
+            },
+        ])
+        .unwrap();
+        let mut nested_model = nested.clone().into_git_model(EntryMeta::default());
+        nested_model.repo_id = repo_id;
+        git_tree::Entity::insert(nested_model.into_active_model())
+            .exec(storage.get_connection())
+            .await
+            .unwrap();
+        let root = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Tree,
+            id: nested.id,
+            name: "src".to_owned(),
+        }])
+        .unwrap();
+
+        let pairs = collect_git_blob_filepaths(storage, repo_id, root, PathBuf::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                (first.id.to_string(), "src/文件.txt".to_owned()),
+                (second.id.to_string(), "src/second.txt".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

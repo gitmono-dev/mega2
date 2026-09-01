@@ -72,6 +72,8 @@
 
 > **2026-09-01 更新（FC-09）**：ImportRepo 的 branch/tag 删除与 MonoRepo 的 non-default CL ref 删除均按客户端 advertisement 的 old object id 做原子 CAS 删除，并将 repository/path 与 ref name 纳入条件；删除发生在对应 metadata transaction 内。ref 已被并发更新时返回该 ref 的 `ng` conflict status，保留新值并回滚同一事务中的其他删除/写入；按当前值删除的正常外部语义不变。FC-08 的默认 `refs/heads/main` 删除前置拒绝规则继续生效。
 
+> **2026-09-01 更新（FC-10）**：ImportRepo 与 MonoRepo 的 post-receive tree traversal 先按遍历顺序收集 `(blob_id, file_path)`，再分别通过 repository/domain-scoped 的 `CASE` 批量 UPDATE 写入 filepath index；空输入直接返回，重复 blob id 保留最后一次路径，missing blob 继续忽略，批量大小按 1000 条分块。该优化只改变导入索引写入的数据库调用数量，不改变 root lock/CAS、`.gitkeep` 持久化或 Git receive-pack 协议语义；nested tree 与 UTF-8 路径错误仍按原有契约传播。
+
 > **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MONOENGINE_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
 >
 > **2026-07-01 更新 7**：首轮 LFS CI gate 暴露 Git LFS 对 monorepo 根路径 remote `http://host/` 的默认 discovery 派生问题：客户端会拼出 `http://host.git/info/lfs` 并导致端口解析失败。`lfs_smoke_http` 现在对源仓库和验证 clone 显式配置 `lfs.url=<remote>/info/lfs`，并关闭 locks verify 探测，避免根路径 URL 被 Git LFS 自动追加 `.git`。

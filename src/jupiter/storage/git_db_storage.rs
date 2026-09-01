@@ -1,10 +1,11 @@
-use std::ops::Deref;
+use std::{collections::HashMap, ops::Deref};
 
 use futures::Stream;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
     EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set,
-    TransactionTrait, sea_query::Expr,
+    TransactionTrait,
+    sea_query::{CaseStatement, Expr, ExprTrait},
 };
 
 use crate::{
@@ -277,21 +278,47 @@ impl GitDbStorage {
 
     pub async fn update_git_blob_filepath(
         &self,
-        blob_id: &String,
+        repo_id: i64,
+        blob_id: &str,
         file_path: &str,
     ) -> Result<(), MegaError> {
-        if let Some(model) = git_blob::Entity::find()
-            .filter(git_blob::Column::BlobId.eq(blob_id))
-            .one(self.get_connection())
-            .await?
-        {
-            let mut active: git_blob::ActiveModel = model.into();
+        self.update_git_blob_filepaths(repo_id, vec![(blob_id.to_string(), file_path.to_string())])
+            .await
+    }
 
-            active.file_path = Set(file_path.to_string());
-
-            active.update(self.get_connection()).await?;
+    /// Batch-assigns file paths for blobs belonging to one import repository.
+    ///
+    /// Duplicate blob ids keep the last path, matching the old sequential
+    /// traversal. Missing blob ids are ignored by the guarded UPDATE, and an
+    /// empty batch does no database work.
+    pub async fn update_git_blob_filepaths(
+        &self,
+        repo_id: i64,
+        pairs: Vec<(String, String)>,
+    ) -> Result<(), MegaError> {
+        if pairs.is_empty() {
+            return Ok(());
         }
 
+        let collapsed = last_wins_filepaths(pairs);
+        for chunk in collapsed.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            let blob_ids: Vec<String> = chunk.iter().map(|(blob_id, _)| blob_id.clone()).collect();
+            let mut case = CaseStatement::new();
+            for (blob_id, file_path) in chunk {
+                case = case.case(
+                    Expr::col(git_blob::Column::BlobId).eq(blob_id.clone()),
+                    file_path.clone(),
+                );
+            }
+            case = case.finally(Expr::col(git_blob::Column::FilePath));
+
+            git_blob::Entity::update_many()
+                .col_expr(git_blob::Column::FilePath, case.into())
+                .filter(git_blob::Column::RepoId.eq(repo_id))
+                .filter(git_blob::Column::BlobId.is_in(blob_ids))
+                .exec(self.get_connection())
+                .await?;
+        }
         Ok(())
     }
 
@@ -569,16 +596,34 @@ impl GitDbStorage {
     }
 }
 
+fn last_wins_filepaths(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut positions: HashMap<String, usize> = HashMap::with_capacity(pairs.len());
+    let mut collapsed: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+
+    for (blob_id, file_path) in pairs {
+        if let Some(index) = positions.get(&blob_id).copied() {
+            collapsed[index].1 = file_path;
+        } else {
+            positions.insert(blob_id.clone(), collapsed.len());
+            collapsed.push((blob_id, file_path));
+        }
+    }
+
+    collapsed
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait, sea_query::Expr};
+    use sea_orm::{
+        ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, TransactionTrait, sea_query::Expr,
+    };
     use tokio::sync::Barrier;
 
     use super::GitDbStorage;
     use crate::{
-        callisto::{git_tag, import_refs, sea_orm_active_enums::RefTypeEnum},
+        callisto::{git_blob, git_tag, import_refs, sea_orm_active_enums::RefTypeEnum},
         common::utils::generate_id,
         jupiter::{
             migration::apply_migrations,
@@ -639,6 +684,135 @@ mod tests {
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
         }
+    }
+
+    fn blob_row(id: i64, repo_id: i64, blob_id: &str, file_path: &str) -> git_blob::Model {
+        git_blob::Model {
+            id,
+            repo_id,
+            blob_id: blob_id.to_owned(),
+            name: None,
+            size: 0,
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            file_path: file_path.to_owned(),
+            pack_offset: 0,
+            is_delta_in_pack: false,
+        }
+    }
+
+    async fn insert_blob(storage: &GitDbStorage, model: git_blob::Model) {
+        git_blob::Entity::insert(model.into_active_model())
+            .exec(storage.get_connection())
+            .await
+            .expect("insert git blob");
+    }
+
+    async fn filepath_of(storage: &GitDbStorage, repo_id: i64, blob_id: &str) -> Option<String> {
+        git_blob::Entity::find()
+            .filter(git_blob::Column::RepoId.eq(repo_id))
+            .filter(git_blob::Column::BlobId.eq(blob_id))
+            .one(storage.get_connection())
+            .await
+            .expect("load git blob")
+            .map(|blob| blob.file_path)
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_is_empty_safe_and_repo_scoped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("apply migrations");
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        insert_blob(&storage, blob_row(1, 1, "shared", "old-a")).await;
+        insert_blob(&storage, blob_row(2, 2, "shared", "old-b")).await;
+
+        storage
+            .update_git_blob_filepaths(1, Vec::new())
+            .await
+            .expect("empty batch");
+        storage
+            .update_git_blob_filepaths(1, vec![("shared".to_owned(), "new-a".to_owned())])
+            .await
+            .expect("update repo-scoped batch");
+
+        assert_eq!(
+            filepath_of(&storage, 1, "shared").await.as_deref(),
+            Some("new-a")
+        );
+        assert_eq!(
+            filepath_of(&storage, 2, "shared").await.as_deref(),
+            Some("old-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_keeps_last_duplicate_and_ignores_missing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("apply migrations");
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        insert_blob(&storage, blob_row(1, 1, "duplicate", "old")).await;
+
+        storage
+            .update_git_blob_filepaths(
+                1,
+                vec![
+                    ("duplicate".to_owned(), "first.rs".to_owned()),
+                    ("missing".to_owned(), "missing.rs".to_owned()),
+                    ("duplicate".to_owned(), "last.rs".to_owned()),
+                ],
+            )
+            .await
+            .expect("duplicate and missing ids are valid input");
+
+        assert_eq!(
+            filepath_of(&storage, 1, "duplicate").await.as_deref(),
+            Some("last.rs")
+        );
+        assert!(filepath_of(&storage, 1, "missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_chunks_large_tree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("apply migrations");
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        let repo_id = 3;
+        let count = <BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE + 1;
+        let mut pairs = Vec::with_capacity(count);
+        for index in 0..count {
+            let blob_id = format!("blob-{index:04}");
+            insert_blob(&storage, blob_row(index as i64 + 1, repo_id, &blob_id, "")).await;
+            pairs.push((blob_id, format!("dir/file-{index}.rs")));
+        }
+
+        storage
+            .update_git_blob_filepaths(repo_id, pairs)
+            .await
+            .expect("update chunked batch");
+
+        assert_eq!(
+            filepath_of(&storage, repo_id, "blob-0000").await.as_deref(),
+            Some("dir/file-0.rs")
+        );
+        assert_eq!(
+            filepath_of(
+                &storage,
+                repo_id,
+                &format!("blob-{count_minus_one:04}", count_minus_one = count - 1),
+            )
+            .await
+            .as_deref(),
+            Some(format!("dir/file-{}.rs", count - 1).as_str())
+        );
     }
 
     #[tokio::test]

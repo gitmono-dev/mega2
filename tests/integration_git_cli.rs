@@ -3501,6 +3501,11 @@ fn integration_git_cli_import_receive_pack_packless_statuses() {
         "the surviving import branch must be finalized"
     );
     assert_eq!(
+        git_blob_file_paths(&env.database.db_url, &blob_id),
+        vec!["payload.txt".to_owned()],
+        "import filepath traversal must persist the payload path"
+    );
+    assert_eq!(
         remote_ref(&env.case_dir, &token, &remote_url, &missing_branch),
         None,
         "a rejected pack-less import branch must never be persisted"
@@ -4247,6 +4252,25 @@ fn blob_file_paths(db_url: &str, blob_id: &str) -> Vec<String> {
             ))
             .await
             .unwrap_or_else(|err| panic!("query blob file_path for {blob_id}: {err}"));
+        rows.iter()
+            .map(|row| row.try_get("", "file_path").expect("file_path column"))
+            .collect()
+    })
+}
+
+/// Distinct `file_path` values stored for an imported Git blob (FC-10 e2e).
+fn git_blob_file_paths(db_url: &str, blob_id: &str) -> Vec<String> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for git blob rows: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT DISTINCT file_path FROM git_blob WHERE blob_id = '{blob_id}'"),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query git blob file_path for {blob_id}: {err}"));
         rows.iter()
             .map(|row| row.try_get("", "file_path").expect("file_path column"))
             .collect()
