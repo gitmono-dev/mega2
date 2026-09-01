@@ -737,6 +737,125 @@ fn integration_service_http_smoke() {
     );
 }
 
+#[cfg(feature = "fastcdc")]
+#[test]
+fn integration_fastcdc_media_http_contract() {
+    // 通过真实 service http 进程验证 FastCDC Media 的最终 repository-scoped
+    // URL、Mono Bearer token、capabilities 载荷与 runtime OpenAPI，而非只测
+    // in-process router。VaultCliEnv 为此 case 提供独立 Vault/DB/对象存储目录。
+    let env = VaultCliEnv::new();
+    let port = reserve_free_port();
+    let stdout_path = env.temp_dir.path().join("fastcdc-service.out");
+    let stderr_path = env.temp_dir.path().join("fastcdc-service.err");
+
+    let mut command = env.full_config_command();
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+
+    let mut service = ServiceProcess::spawn(command);
+    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+
+    let token_id = 9_000_000_000_i64 + DB_COUNTER.fetch_add(1, Ordering::Relaxed) as i64;
+    let token = format!("fastcdc-http-token-{token_id}");
+    let username = "fastcdc-http-user";
+    let sql = format!(
+        "INSERT INTO access_token (id, username, token, created_at) \
+         VALUES ({token_id}, '{username}', '{token}', now())"
+    );
+    with_runtime(async {
+        let db = Database::connect(&env.database.db_url)
+            .await
+            .expect("connect FastCDC integration database");
+        execute_postgres(&db, sql).await;
+    });
+
+    let capabilities_path = "/project/demo.git/info/lfs/libra/media/v1/capabilities";
+    let anonymous = http_get(port, capabilities_path);
+    assert!(
+        anonymous
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains(" 401 ")),
+        "FastCDC Media capabilities must require a Mono access token"
+    );
+
+    let capabilities_response = http_get_bearer(port, capabilities_path, &token);
+    let (capabilities_headers, capabilities_body) = capabilities_response
+        .split_once("\r\n\r\n")
+        .expect("FastCDC capabilities response must contain headers and JSON body");
+    assert!(
+        capabilities_headers
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains(" 200 ")),
+        "authenticated FastCDC capabilities request failed: {}",
+        capabilities_headers.lines().next().unwrap_or_default()
+    );
+    let capabilities: serde_json::Value =
+        serde_json::from_str(capabilities_body).expect("FastCDC capabilities JSON");
+    assert_eq!(capabilities["version"], "1");
+    assert_eq!(
+        capabilities["chunk_algorithms"],
+        serde_json::json!(["fastcdc-v1"])
+    );
+    assert_eq!(
+        capabilities["hash_algorithms"],
+        serde_json::json!(["sha256"])
+    );
+    assert_eq!(capabilities["max_chunk_size"], 8 * 1024 * 1024);
+    assert_eq!(capabilities["max_manifest_size"], 10 * 1024 * 1024);
+    assert_eq!(capabilities["supports_batch_exists"], true);
+    assert_eq!(capabilities["supports_standard_lfs_fallback"], true);
+
+    let openapi_response = http_get(port, "/api/openapi.json");
+    let (openapi_headers, openapi_body) = openapi_response
+        .split_once("\r\n\r\n")
+        .expect("runtime OpenAPI response must contain headers and JSON body");
+    assert!(
+        openapi_headers
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains(" 200 ")),
+        "runtime OpenAPI request failed: {}",
+        openapi_headers.lines().next().unwrap_or_default()
+    );
+    let openapi: serde_json::Value =
+        serde_json::from_str(openapi_body).expect("runtime OpenAPI JSON");
+    let paths = openapi["paths"]
+        .as_object()
+        .expect("runtime OpenAPI paths object");
+    let documented_path = "/info/lfs/libra/media/v1/capabilities";
+    assert!(
+        paths.contains_key(documented_path),
+        "runtime OpenAPI must describe the callable repository-scoped Media URL"
+    );
+    assert!(
+        !paths.contains_key("/api/v1/lfs/libra/media/v1/capabilities"),
+        "runtime OpenAPI must not document a repository-free Media alias"
+    );
+    assert_eq!(
+        openapi["paths"][documented_path]["get"]["security"][0]["monoAccessToken"],
+        serde_json::json!([])
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "FastCDC service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path)
+    );
+}
+
 #[test]
 fn integration_config_hot_reload() {
     // integration.md P2 热加载黑盒 gate：在运行的 `service http` 上通过修改 profile
@@ -1263,6 +1382,42 @@ fn reserve_free_port() -> u16 {
 
 fn http_get(port: u16, path: &str) -> String {
     http_get_host("127.0.0.1", port, path)
+}
+
+#[cfg(feature = "fastcdc")]
+fn http_get_bearer(port: u16, path: &str, token: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(15)))
+                    .expect("set FastCDC HTTP write timeout");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .expect("set FastCDC HTTP read timeout");
+                let request = format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(request.as_bytes())
+                    .expect("write FastCDC authenticated HTTP request");
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .expect("read FastCDC authenticated HTTP response");
+                return response;
+            }
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "failed to connect FastCDC authenticated request on 127.0.0.1:{port}: {err}"
+                    );
+                }
+                sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
 fn http_get_host(host: &str, port: u16, path: &str) -> String {
