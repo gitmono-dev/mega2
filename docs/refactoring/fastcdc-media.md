@@ -114,4 +114,6 @@ Media 领域错误映射为 Invalid=`400`、NotFound=`404`、Conflict=`409` 和
 Storage/Io/Json=`500`。所有 `500` 响应固定为 `media storage operation failed`，不返回
 scope digest、repository 或 object key。普通 LFS route 不变；未启用 feature 时 Media route
 和其 OpenAPI paths 均不会注册。本卡不新增 `MegaError` 变体或 TOML 配置项：启用面仅由
-Cargo feature `fastcdc` 控制。
+Cargo feature `fastcdc` 控制。OpenAPI 以共享 `MediaErrorResponse { message: string }` schema
+描述 Media 的 JSON `400`/`404`/`409`/`413`/`500` 响应；`401` 沿用 access-token extractor 的
+`text/plain` 认证拒绝响应。

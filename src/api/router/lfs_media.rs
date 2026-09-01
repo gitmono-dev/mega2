@@ -6,10 +6,10 @@ use axum::{
     Extension, Json,
     body::to_bytes,
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_LENGTH},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use tower_http::limit::RequestBodyLimitLayer;
 use utoipa::openapi::{
     OpenApi,
     security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
@@ -50,10 +50,10 @@ fn media_openapi_server() -> Server {
 pub(crate) fn routes() -> OpenApiRouter<MonoApiServiceState> {
     let prepare_routes = OpenApiRouter::new()
         .routes(routes!(prepare))
-        .route_layer(RequestBodyLimitLayer::new(protocol::MAX_MANIFEST_SIZE));
+        .route_layer(middleware::from_fn(reject_oversized_manifest));
     let chunk_routes = OpenApiRouter::new()
         .routes(routes!(upload_chunk))
-        .route_layer(RequestBodyLimitLayer::new(chunker::MAX_SIZE));
+        .route_layer(middleware::from_fn(reject_oversized_chunk));
 
     OpenApiRouter::new()
         .routes(routes!(capabilities))
@@ -109,6 +109,11 @@ enum MediaHttpError {
     Body,
 }
 
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct MediaErrorResponse {
+    message: String,
+}
+
 impl From<MediaServiceError> for MediaHttpError {
     fn from(error: MediaServiceError) -> Self {
         Self::Media(error)
@@ -150,9 +155,33 @@ fn media_json_response(status: StatusCode, message: &'static str) -> Response {
     (
         status,
         [("content-type", LFS_CONTENT_TYPE)],
-        Json(serde_json::json!({"message": message})),
+        Json(MediaErrorResponse {
+            message: message.to_owned(),
+        }),
     )
         .into_response()
+}
+
+async fn reject_declared_body_over_limit(request: Request, next: Next, limit: usize) -> Response {
+    let exceeds_limit = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > limit);
+    if exceeds_limit {
+        return MediaHttpError::Body.into_response();
+    }
+
+    next.run(request).await
+}
+
+async fn reject_oversized_manifest(request: Request, next: Next) -> Response {
+    reject_declared_body_over_limit(request, next, protocol::MAX_MANIFEST_SIZE).await
+}
+
+async fn reject_oversized_chunk(request: Request, next: Next) -> Response {
+    reject_declared_body_over_limit(request, next, chunker::MAX_SIZE).await
 }
 
 async fn read_body(request: Request, limit: usize) -> Result<bytes::Bytes, MediaHttpError> {
@@ -166,8 +195,8 @@ async fn read_body(request: Request, limit: usize) -> Result<bytes::Bytes, Media
     path = "/capabilities",
     responses(
         (status = 200, description = "FastCDC Media capabilities", content_type = "application/json"),
-        (status = 401, description = "Mono access token required"),
-        (status = 404, description = "Repository context unavailable", content_type = "application/vnd.git-lfs+json")
+        (status = 401, description = "Mono access token required", body = String, content_type = "text/plain"),
+        (status = 404, description = "Repository context unavailable", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json")
     ),
     security(("monoAccessToken" = [])),
     tag = LFS_TAG
@@ -186,11 +215,11 @@ async fn capabilities(
     request_body = MediaManifest,
     responses(
         (status = 200, description = "Prepared manifest and ordered missing chunk hashes", body = PrepareResponse, content_type = "application/json"),
-        (status = 400, description = "Malformed or invalid Media manifest", content_type = "application/vnd.git-lfs+json"),
-        (status = 401, description = "Mono access token required"),
-        (status = 404, description = "Repository context unavailable", content_type = "application/vnd.git-lfs+json"),
-        (status = 413, description = "Manifest exceeds 10 MiB"),
-        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
+        (status = 400, description = "Malformed or invalid Media manifest", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 401, description = "Mono access token required", body = String, content_type = "text/plain"),
+        (status = 404, description = "Repository context unavailable", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 413, description = "Manifest exceeds 10 MiB", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 500, description = "Storage operation failed", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json")
     ),
     security(("monoAccessToken" = [])),
     tag = LFS_TAG
@@ -221,12 +250,12 @@ async fn prepare(
     ),
     responses(
         (status = 204, description = "Chunk verified and stored"),
-        (status = 400, description = "Chunk content or request is invalid", content_type = "application/vnd.git-lfs+json"),
-        (status = 401, description = "Mono access token required"),
-        (status = 404, description = "Manifest, chunk declaration, or repository was not found", content_type = "application/vnd.git-lfs+json"),
-        (status = 409, description = "Stored pending manifest conflicts", content_type = "application/vnd.git-lfs+json"),
-        (status = 413, description = "Chunk exceeds 8 MiB"),
-        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
+        (status = 400, description = "Chunk content or request is invalid", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 401, description = "Mono access token required", body = String, content_type = "text/plain"),
+        (status = 404, description = "Manifest, chunk declaration, or repository was not found", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 409, description = "Stored pending manifest conflicts", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 413, description = "Chunk exceeds 8 MiB", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 500, description = "Storage operation failed", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json")
     ),
     security(("monoAccessToken" = [])),
     tag = LFS_TAG
@@ -254,11 +283,11 @@ async fn upload_chunk(
     params(("manifest_id" = String, Path, description = "Canonical Media manifest ID")),
     responses(
         (status = 204, description = "Verified Media object published to standard LFS fallback"),
-        (status = 400, description = "Uploaded Media object is invalid", content_type = "application/vnd.git-lfs+json"),
-        (status = 401, description = "Mono access token required"),
-        (status = 404, description = "Manifest or repository was not found", content_type = "application/vnd.git-lfs+json"),
-        (status = 409, description = "Manifest or fallback state conflicts", content_type = "application/vnd.git-lfs+json"),
-        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
+        (status = 400, description = "Uploaded Media object is invalid", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 401, description = "Mono access token required", body = String, content_type = "text/plain"),
+        (status = 404, description = "Manifest or repository was not found", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 409, description = "Manifest or fallback state conflicts", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 500, description = "Storage operation failed", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json")
     ),
     security(("monoAccessToken" = [])),
     tag = LFS_TAG
@@ -284,10 +313,10 @@ async fn finalize(
     params(("media_oid" = String, Path, description = "Finalized Media SHA-256 object ID")),
     responses(
         (status = 200, description = "Finalized Media manifest", body = ManifestResponse, content_type = "application/json"),
-        (status = 401, description = "Mono access token required"),
-        (status = 404, description = "Manifest or repository was not found", content_type = "application/vnd.git-lfs+json"),
-        (status = 409, description = "Stored manifest conflicts with its Media object", content_type = "application/vnd.git-lfs+json"),
-        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
+        (status = 401, description = "Mono access token required", body = String, content_type = "text/plain"),
+        (status = 404, description = "Manifest or repository was not found", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 409, description = "Stored manifest conflicts with its Media object", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 500, description = "Storage operation failed", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json")
     ),
     security(("monoAccessToken" = [])),
     tag = LFS_TAG
@@ -316,11 +345,11 @@ async fn manifest(
     ),
     responses(
         (status = 200, description = "Verified Media chunk bytes", content_type = "application/octet-stream"),
-        (status = 400, description = "Stored chunk content is invalid", content_type = "application/vnd.git-lfs+json"),
-        (status = 401, description = "Mono access token required"),
-        (status = 404, description = "Manifest, chunk declaration, or repository was not found", content_type = "application/vnd.git-lfs+json"),
-        (status = 409, description = "Stored manifest conflicts with its Media object", content_type = "application/vnd.git-lfs+json"),
-        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
+        (status = 400, description = "Stored chunk content is invalid", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 401, description = "Mono access token required", body = String, content_type = "text/plain"),
+        (status = 404, description = "Manifest, chunk declaration, or repository was not found", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 409, description = "Stored manifest conflicts with its Media object", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json"),
+        (status = 500, description = "Storage operation failed", body = MediaErrorResponse, content_type = "application/vnd.git-lfs+json")
     ),
     security(("monoAccessToken" = [])),
     tag = LFS_TAG
@@ -487,6 +516,26 @@ mod tests {
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .body(body)
             .expect("build request")
+    }
+
+    async fn assert_media_body_limit_response(response: Response) {
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(LFS_CONTENT_TYPE)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), 1024)
+                    .await
+                    .expect("read body limit response"),
+            )
+            .expect("decode body limit response"),
+            serde_json::json!({"message": "media body exceeds its size limit"})
+        );
     }
 
     #[tokio::test]
@@ -734,9 +783,10 @@ mod tests {
             )
             .await
             .expect("router responds");
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_media_body_limit_response(response).await;
 
         let response = media_app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("PUT")
@@ -752,7 +802,22 @@ mod tests {
             )
             .await
             .expect("router responds");
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_media_body_limit_response(response).await;
+
+        let response = media_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(media_uri("/manifests"))
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![0_u8; protocol::MAX_MANIFEST_SIZE + 1]))
+                    .expect("build unknown-length oversized manifest request"),
+            )
+            .await
+            .expect("router responds");
+        assert_media_body_limit_response(response).await;
     }
 
     #[tokio::test]
@@ -864,6 +929,63 @@ mod tests {
                     "{method} {path} is missing documented HTTP {status}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn media_openapi_declares_error_response_schemas() {
+        let document = serde_json::to_value(openapi()).expect("serialize OpenAPI document");
+        assert_eq!(
+            document["components"]["schemas"]["MediaErrorResponse"]["type"],
+            "object"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["MediaErrorResponse"]["properties"]["message"]["type"],
+            "string"
+        );
+
+        for (path, method, statuses) in [
+            ("/info/lfs/libra/media/v1/capabilities", "get", &["404"][..]),
+            (
+                "/info/lfs/libra/media/v1/manifests",
+                "post",
+                &["400", "404", "413", "500"][..],
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/{manifest_id}/chunks/{hash}",
+                "put",
+                &["400", "404", "409", "413", "500"][..],
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/{manifest_id}/finalize",
+                "post",
+                &["400", "404", "409", "500"][..],
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}",
+                "get",
+                &["404", "409", "500"][..],
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}/chunks/{hash}",
+                "get",
+                &["400", "404", "409", "500"][..],
+            ),
+        ] {
+            for status in statuses {
+                assert_eq!(
+                    document["paths"][path][method]["responses"][*status]["content"]
+                        [LFS_CONTENT_TYPE]["schema"]["$ref"],
+                    "#/components/schemas/MediaErrorResponse",
+                    "{method} {path} HTTP {status} must expose MediaErrorResponse"
+                );
+            }
+            assert_eq!(
+                document["paths"][path][method]["responses"]["401"]["content"]["text/plain"]["schema"]
+                    ["type"],
+                "string",
+                "{method} {path} HTTP 401 must expose its inherited text response"
+            );
         }
     }
 
