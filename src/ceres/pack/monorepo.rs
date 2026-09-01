@@ -880,14 +880,13 @@ impl MonoRepo {
             .clone();
         let txn = self.storage.begin_db_transaction().await?;
         for cmd in &cmds {
-            if cmd.ref_type == RefTypeEnum::Branch {
-                if let Err(error) = self
+            if cmd.ref_type == RefTypeEnum::Branch
+                && let Err(error) = self
                     .apply_cl_mega_ref_for_push_command(cmd, Some(&txn))
                     .await
-                {
-                    let _ = txn.rollback().await;
-                    return Err(error);
-                }
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
             }
         }
         txn.commit().await.map_err(MegaError::Db)?;
