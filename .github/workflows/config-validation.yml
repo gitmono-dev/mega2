@@ -446,6 +446,9 @@ jobs:
           # Black-box CLI integration tests (config secret ref/set/check, validate).
           # The integration test lives in the `monoengine` package (`tests/`).
           cargo test -p monoengine --test integration_vault -- --test-threads=1
+          # FastCDC is opt-in, so run its real HTTP service contract with the
+          # feature explicitly enabled rather than letting cfg-gated coverage go stale.
+          cargo test -p monoengine --features fastcdc --test integration_vault integration_fastcdc_media_http_contract -- --test-threads=1
           # ITW-03: a real Better Auth sign-up/sign-in cookie must identify the
           # same user through the compose-hosted monoengine session bridge.
           cargo test -p monoengine --test integration_website_auth -- --test-threads=1

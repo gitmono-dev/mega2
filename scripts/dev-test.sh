@@ -23,7 +23,7 @@ Test commands:
   unit [cargo-args...]          Unit tests only (no compose): cargo test -p monoengine-core --lib
   basic [cargo-args...]         up-data + source .env.test + cargo test --all
   full [cargo-args...]          up-full + source .env.test + cargo test --all  (recommended IT)
-  vault [cargo-args...]         Ensure data plane, then integration_vault
+  vault [cargo-args...]         Ensure data plane, then feature-on integration_vault
   git-cli [cargo-args...]       Ensure full stack, then integration_git_cli
   gates                         Submit gates: nightly fmt check, clippy -D warnings, full IT tests
 
@@ -71,8 +71,8 @@ cmd_vault() {
   if [[ $# -eq 0 ]]; then
     set -- -- --nocapture --test-threads=1
   fi
-  monoengine_it_info "cargo test -p monoengine --test integration_vault $*"
-  cargo test -p monoengine --test integration_vault "$@"
+  monoengine_it_info "cargo test -p monoengine --features fastcdc --test integration_vault $*"
+  cargo test -p monoengine --features fastcdc --test integration_vault "$@"
 }
 
 cmd_git_cli() {

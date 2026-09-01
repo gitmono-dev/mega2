@@ -789,7 +789,22 @@ fn integration_fastcdc_media_http_contract() {
         "FastCDC Media capabilities must require a Mono access token"
     );
 
-    let capabilities_response = http_get_bearer(port, capabilities_path, &token);
+    for authorization in [
+        "Bearer unknown-fastcdc-http-token",
+        "Basic ZmFzdGNkYy1odHRwLXVzZXI6d3Jvbmc=",
+    ] {
+        let response = http_get_authorization(port, capabilities_path, authorization);
+        assert!(
+            response
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains(" 401 ")),
+            "FastCDC Media capabilities must reject {authorization:?}"
+        );
+    }
+
+    let bearer = format!("Bearer {token}");
+    let capabilities_response = http_get_authorization(port, capabilities_path, &bearer);
     let (capabilities_headers, capabilities_body) = capabilities_response
         .split_once("\r\n\r\n")
         .expect("FastCDC capabilities response must contain headers and JSON body");
@@ -834,18 +849,48 @@ fn integration_fastcdc_media_http_contract() {
     let paths = openapi["paths"]
         .as_object()
         .expect("runtime OpenAPI paths object");
-    let documented_path = "/info/lfs/libra/media/v1/capabilities";
-    assert!(
-        paths.contains_key(documented_path),
-        "runtime OpenAPI must describe the callable repository-scoped Media URL"
-    );
+    for (documented_path, method) in [
+        ("/info/lfs/libra/media/v1/capabilities", "get"),
+        ("/info/lfs/libra/media/v1/manifests", "post"),
+        (
+            "/info/lfs/libra/media/v1/manifests/{manifest_id}/chunks/{hash}",
+            "put",
+        ),
+        (
+            "/info/lfs/libra/media/v1/manifests/{manifest_id}/finalize",
+            "post",
+        ),
+        (
+            "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}",
+            "get",
+        ),
+        (
+            "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}/chunks/{hash}",
+            "get",
+        ),
+    ] {
+        assert!(
+            paths.contains_key(documented_path),
+            "runtime OpenAPI must describe {method} {documented_path}"
+        );
+        assert_eq!(
+            openapi["paths"][documented_path][method]["security"],
+            serde_json::json!([{"monoAccessToken": []}]),
+            "runtime OpenAPI must require a Mono access token for {method} {documented_path}"
+        );
+        assert_eq!(
+            openapi["paths"][documented_path]["servers"][0]["url"], "/{repository}",
+            "runtime OpenAPI must scope {method} {documented_path} by repository"
+        );
+        assert_eq!(
+            openapi["paths"][documented_path]["servers"][0]["variables"]["repository"]["default"],
+            "project/demo.git",
+            "runtime OpenAPI must provide a canonical repository default for {method} {documented_path}"
+        );
+    }
     assert!(
         !paths.contains_key("/api/v1/lfs/libra/media/v1/capabilities"),
         "runtime OpenAPI must not document a repository-free Media alias"
-    );
-    assert_eq!(
-        openapi["paths"][documented_path]["get"]["security"][0]["monoAccessToken"],
-        serde_json::json!([])
     );
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));
@@ -1385,33 +1430,33 @@ fn http_get(port: u16, path: &str) -> String {
 }
 
 #[cfg(feature = "fastcdc")]
-fn http_get_bearer(port: u16, path: &str, token: &str) -> String {
+fn http_get_authorization(port: u16, path: &str, authorization: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut stream) => {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(15)))
-                    .expect("set FastCDC HTTP write timeout");
+                    .expect("set FastCDC authorized HTTP write timeout");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(15)))
-                    .expect("set FastCDC HTTP read timeout");
+                    .expect("set FastCDC authorized HTTP read timeout");
                 let request = format!(
-                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
                 );
                 stream
                     .write_all(request.as_bytes())
-                    .expect("write FastCDC authenticated HTTP request");
+                    .expect("write FastCDC authorized HTTP request");
                 let mut response = String::new();
                 stream
                     .read_to_string(&mut response)
-                    .expect("read FastCDC authenticated HTTP response");
+                    .expect("read FastCDC authorized HTTP response");
                 return response;
             }
             Err(err) => {
                 if Instant::now() >= deadline {
                     panic!(
-                        "failed to connect FastCDC authenticated request on 127.0.0.1:{port}: {err}"
+                        "failed to connect FastCDC authorized request on 127.0.0.1:{port}: {err}"
                     );
                 }
                 sleep(Duration::from_millis(200));
@@ -1481,10 +1526,8 @@ impl ServiceProcess {
     ) {
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return;
-            }
-            // 子进程在绑定端口前退出，说明启动失败。
+            // 先确认受测子进程仍活着，再接受端口可连；否则并发进程抢占该端口时会
+            // 把别的服务误判为本 case 成功启动。
             if let Some(status) = self.child.try_wait().expect("poll service") {
                 self.reaped = true;
                 panic!(
@@ -1492,6 +1535,14 @@ impl ServiceProcess {
                     read_log(stdout_path),
                     read_log(stderr_path),
                 );
+            }
+            // `HTTP server started up` 是受测子进程在 bind 成功后写入其专属 stdout
+            // 文件的 readiness signal。结合存活检查和端口探测，避免 reserve/free
+            // port 的短暂 TOCTOU 窗口命中无关进程。
+            if read_log(stdout_path).contains("HTTP server started up")
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+            {
+                return;
             }
             if Instant::now() >= deadline {
                 panic!(
