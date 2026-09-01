@@ -3289,6 +3289,208 @@ fn integration_git_cli_receive_pack_packless_statuses() {
     );
 }
 
+#[test]
+fn integration_git_cli_import_receive_pack_packless_statuses() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    const ZERO_ID: &str = "0000000000000000000000000000000000000000";
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let case_id = format!(
+        "fc08-import-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let repo_path = format!("/third-party/{case_id}");
+    let remote_url = git_cli::monoengine_http_url(port, &format!("{repo_path}.git"));
+    let receive_pack_path = format!("{repo_path}.git/git-receive-pack");
+    let local_repo = format!("{case_id}-local");
+
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["init", &local_repo]),
+        "initialize import repository",
+    );
+    for (key, value) in [
+        ("user.name", "FC08 Import Test"),
+        ("user.email", "fc08-import@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", &local_repo, "config", key, value],
+            ),
+            "configure import repository identity",
+        );
+    }
+    fs::write(
+        env.case_dir.join(&local_repo).join("payload.txt"),
+        "fc08 payload\n",
+    )
+    .expect("write import repository payload");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "add", "payload.txt"],
+        ),
+        "stage import repository payload",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "commit", "-m", "FC08 import seed"],
+        ),
+        "commit import repository payload",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "remote", "add", "origin", &remote_url],
+        ),
+        "add import repository remote",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "push", "origin", "HEAD:refs/heads/main"],
+        ),
+        "seed import repository",
+    );
+
+    let commit_id = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", &local_repo, "rev-parse", "HEAD"],
+    );
+    let tree_id = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", &local_repo, "rev-parse", "HEAD^{tree}"],
+    );
+    let blob_id = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", &local_repo, "rev-parse", "HEAD:payload.txt"],
+    );
+    let annotated_tag = format!("{case_id}-annotated");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                &local_repo,
+                "tag",
+                "-a",
+                &annotated_tag,
+                "-m",
+                "FC08 annotated tag",
+            ],
+        ),
+        "create annotated tag",
+    );
+    let tag_object_id = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", &local_repo, "rev-parse", &annotated_tag],
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                &local_repo,
+                "push",
+                "origin",
+                &format!("refs/tags/{annotated_tag}"),
+            ],
+        ),
+        "publish annotated tag object",
+    );
+
+    let tag_refs = [
+        ("commit", &commit_id),
+        ("tree", &tree_id),
+        ("blob", &blob_id),
+        ("annotated", &tag_object_id),
+    ];
+    let tag_commands = tag_refs
+        .iter()
+        .enumerate()
+        .map(|(index, (kind, object_id))| {
+            receive_pack_command(
+                ZERO_ID,
+                object_id,
+                &format!("refs/tags/{case_id}-{index}-{kind}"),
+                index == 0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let tag_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-tag-targets",
+        &receive_pack_path,
+        &tag_commands,
+    );
+    for (index, (kind, _)) in tag_refs.iter().enumerate() {
+        assert_receive_pack_status(
+            &tag_reply,
+            &format!("ok refs/tags/{case_id}-{index}-{kind}"),
+        );
+    }
+
+    let valid_branch = format!("refs/heads/{case_id}-valid");
+    let missing_branch = format!("refs/heads/{case_id}-missing");
+    let missing = "f".repeat(40);
+    let mixed_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-valid-and-missing",
+        &receive_pack_path,
+        &[
+            receive_pack_command(ZERO_ID, &commit_id, &valid_branch, true),
+            receive_pack_command(ZERO_ID, &missing, &missing_branch, false),
+        ],
+    );
+    assert_receive_pack_status(&mixed_reply, &format!("ok {valid_branch}"));
+    assert_receive_pack_status(
+        &mixed_reply,
+        &format!("ng {missing_branch} target object {missing} not found"),
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &valid_branch),
+        Some(commit_id),
+        "the surviving import branch must be finalized"
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &missing_branch),
+        None,
+        "a rejected pack-less import branch must never be persisted"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
 fn normalize_git_cli_error(combined: &str) -> String {
     combined
         .lines()
@@ -3334,6 +3536,16 @@ fn remote_head(case_dir: &Path, token: &str, remote_url: &str) -> String {
         .unwrap_or_else(|| panic!("missing HEAD from ls-remote: {:?}", output.stdout))
 }
 
+fn remote_ref(case_dir: &Path, token: &str, remote_url: &str, ref_name: &str) -> Option<String> {
+    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, ref_name]);
+    git_cli::assert_git_success(&output, "ls-remote ref");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+}
+
 fn receive_pack_command(old_id: &str, new_id: &str, ref_name: &str, capabilities: bool) -> String {
     let capabilities = if capabilities {
         "\0report-status\n"
@@ -3350,6 +3562,17 @@ fn raw_receive_pack(
     case_name: &str,
     commands: &[String],
 ) -> String {
+    raw_receive_pack_at(env, port, token, case_name, "/git-receive-pack", commands)
+}
+
+fn raw_receive_pack_at(
+    env: &GitCliEnv,
+    port: u16,
+    token: &str,
+    case_name: &str,
+    receive_pack_path: &str,
+    commands: &[String],
+) -> String {
     let mut request = Vec::new();
     for command in commands {
         let length = command.len() + 4;
@@ -3363,7 +3586,7 @@ fn raw_receive_pack(
     let response_path = env.temp_dir.path().join(format!("{case_name}.response"));
     fs::write(&request_path, request).expect("write receive-pack request");
 
-    let url = git_cli::monoengine_host_http_url(port, "/git-receive-pack");
+    let url = git_cli::monoengine_host_http_url(port, receive_pack_path);
     let credentials = format!("{}:{token}", git_cli::DEFAULT_GIT_AUTH_USER);
     let request_arg = format!("@{}", request_path.display());
     let mut command = Command::new("curl");

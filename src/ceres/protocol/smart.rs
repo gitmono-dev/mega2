@@ -556,7 +556,15 @@ impl SmartSession {
 
         // Handler was built with an early `commands.clone()`; merge loop updates (e.g.
         // `default_branch`) before finalize so import/mono metadata uses the final commands.
-        repo_handler.sync_commands_after_unpack(&commands);
+        // Only accepted commands may reach a finalizer: ImportRepo persists every
+        // branch command in its snapshot, so retaining a pre-validation `ng`
+        // command here could create a dangling ref alongside a valid command.
+        let finalized_commands = commands
+            .iter()
+            .filter(|command| command.status == "ok")
+            .cloned()
+            .collect::<Vec<_>>();
+        repo_handler.sync_commands_after_unpack(&finalized_commands);
 
         let mut finalize_ms: Option<u128> = None;
         let mut bind_ms: Option<u128> = None;
