@@ -216,6 +216,7 @@ async fn uninstall_bot(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - admin only"),
         (status = 404, description = "Bot not found"),
+        (status = 503, description = "Snowflake ID generation is temporarily unavailable", content_type = "application/json"),
     ),
     tag = BOT_TAG
 )]
@@ -257,6 +258,27 @@ async fn create_bot_token(
     };
 
     Ok(Json(CommonResult::success(Some(resp))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::routers;
+
+    #[test]
+    fn create_bot_token_documents_service_unavailable() {
+        let (_router, api) = routers().split_for_parts();
+        let operation = api
+            .paths
+            .paths
+            .get("/bots/{bot_id}/tokens")
+            .and_then(|path| path.post.as_ref())
+            .expect("bot token creation route must be documented");
+
+        assert!(
+            operation.responses.responses.contains_key("503"),
+            "bot token creation must document Snowflake lease unavailability"
+        );
+    }
 }
 
 /// GET /api/v1/bots/{bot_id}/tokens

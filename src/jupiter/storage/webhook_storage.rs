@@ -227,6 +227,7 @@ fn normalize_event_types(event_types: Vec<WebhookEventTypeEnum>) -> Vec<WebhookE
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use sea_orm::EntityTrait;
     use tempfile::TempDir;
 
     use super::*;
@@ -339,6 +340,63 @@ mod tests {
             .await
             .unwrap();
         assert!(outside_path_matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delivery_id_uses_database_sequence_when_snowflake_lease_is_lost() {
+        let id_error = crate::jupiter::utils::id_generator::test_id_generation_after_lease_loss()
+            .expect_err("a lost Snowflake lease must block business ID generation");
+        assert!(matches!(
+            id_error,
+            MegaError::IdGenerationUnavailable(message) if message.contains("lost or expired")
+        ));
+
+        let temp_dir = TempDir::new().expect("failed to create temporary directory");
+        let storage = test_storage(temp_dir.path()).await;
+        let webhook_storage = storage.webhook_storage();
+        let now = Utc::now().naive_utc();
+        let webhook = webhook_storage
+            .create_webhook(
+                mega_webhook::Model {
+                    id: crate::jupiter::utils::id_generator::next_id()
+                        .expect("test ID generator initialized"),
+                    target_url: "https://example.com/delivery".to_string(),
+                    secret: "test-secret".to_string(),
+                    event_types: "[]".to_string(),
+                    path_filter: None,
+                    active: true,
+                    created_at: now,
+                    updated_at: now,
+                },
+                vec![WebhookEventTypeEnum::ClCreated],
+            )
+            .await
+            .unwrap();
+
+        let inserted = webhook_storage
+            .create_delivery(mega_webhook_delivery::Model {
+                id: 0,
+                webhook_id: webhook.webhook.id,
+                event_type: WebhookEventTypeEnum::ClCreated,
+                payload: "{\"pending\":true}".to_string(),
+                response_status: None,
+                response_body: None,
+                success: false,
+                attempt: 1,
+                error_message: Some("delivery pending".to_string()),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        assert!(inserted.id > 0);
+        let persisted = mega_webhook_delivery::Entity::find_by_id(inserted.id)
+            .one(webhook_storage.get_connection())
+            .await
+            .unwrap()
+            .expect("database-generated delivery row should be durable");
+        assert_eq!(persisted.webhook_id, webhook.webhook.id);
+        assert_eq!(persisted.error_message.as_deref(), Some("delivery pending"));
     }
 
     #[tokio::test]

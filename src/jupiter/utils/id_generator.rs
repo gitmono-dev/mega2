@@ -496,6 +496,21 @@ pub fn set_up_options() -> Result<(), OptionError> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_id_generation_after_lease_loss() -> Result<i64, MegaError> {
+    let health = WorkerLeaseHealth::claimed();
+    health.activate();
+    let mut state = GeneratorState {
+        generator: Some(build_generator(7).expect("valid test worker ID")),
+        worker_id: Some(7),
+        source: Some(WorkerIdSource::Redis),
+        lease_health: Some(health.clone()),
+    };
+
+    health.lost();
+    next_id_from_state(&mut state)
+}
+
+#[cfg(test)]
 static TEST_ID_GENERATOR_INIT: OnceLock<()> = OnceLock::new();
 
 #[cfg(test)]
