@@ -94,15 +94,19 @@ fn lfs_repo_path(ctx: Option<Extension<LfsRepoContext>>) -> String {
     ctx.map(|Extension(c)| c.0).unwrap_or_default()
 }
 
-pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
-    let router = OpenApiRouter::new()
+fn standard_lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
+    OpenApiRouter::new()
         .routes(routes!(lfs_upload_object))
         .routes(routes!(lfs_download_object))
         .routes(routes!(list_locks))
         .routes(routes!(create_lock))
         .routes(routes!(list_locks_for_verification))
         .routes(routes!(delete_lock))
-        .routes(routes!(lfs_process_batch));
+        .routes(routes!(lfs_process_batch))
+}
+
+pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
+    let router = standard_lfs_routes();
     #[cfg(feature = "fastcdc")]
     let router = router.nest("/libra/media/v1", lfs_media::routes());
     router
@@ -115,15 +119,17 @@ pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
 /// LFS server: https://git-server.com/foo/bar.git/info/lfs
 /// Locks API: https://git-server.com/foo/bar.git/info/lfs/locks
 ///
-/// We expose both `/info/lfs` (standard Git LFS discovery path) and `/api/v1/lfs`
-/// (versioned REST path for internal consistency). Both paths serve identical handlers.
+/// Standard LFS routes are exposed both at `/info/lfs` (the Git LFS discovery
+/// path) and `/api/v1/lfs` (the versioned REST path). Scoped FastCDC Media
+/// routes are intentionally only callable through a repository's `/info/lfs`
+/// URL because that raw URL supplies the repository context.
 ///
-/// For OpenAPI documentation, we only register `/api/v1/lfs` paths to avoid duplication.
-/// The `/info/lfs` paths are still available at runtime for Git LFS client compatibility.
+/// For OpenAPI documentation, this router registers only the static standard
+/// LFS paths under `/api/v1/lfs`. The Media OpenAPI document is merged by the
+/// HTTP server with a repository server variable, so it describes the actual
+/// scoped `/info/lfs` URL instead of an unusable repository-free alias.
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
-    // Only register /api/v1/lfs for OpenAPI to avoid path duplication
-    // /info/lfs paths are still available at runtime via the main router
-    OpenApiRouter::new().nest("/api/v1/lfs", lfs_routes())
+    OpenApiRouter::new().nest("/api/v1/lfs", standard_lfs_routes())
 }
 
 /// Maps GitLFSError to HTTP status code and message.
@@ -857,13 +863,14 @@ mod tests {
     #[cfg(not(feature = "fastcdc"))]
     #[test]
     fn fastcdc_media_routes_are_absent_without_feature() {
-        let api = routers().into_openapi();
-        assert!(
-            !api.paths
-                .paths
-                .keys()
-                .any(|path| path.contains("/libra/media/v1"))
-        );
+        for api in [routers().into_openapi(), lfs_routes().into_openapi()] {
+            assert!(
+                !api.paths
+                    .paths
+                    .keys()
+                    .any(|path| path.contains("/libra/media/v1"))
+            );
+        }
     }
 
     #[test]

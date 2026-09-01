@@ -89,9 +89,10 @@ prepare 响应使用 `manifest_id` 和 `missing_chunks`；已发布 manifest 响
 例如 repository 为 `/project/demo.git` 时，capabilities URL 是
 `/project/demo.git/info/lfs/libra/media/v1/capabilities`。HTTP server 会在标准 LFS URI
 改写前保存这个原始 repository 前缀；Media scope 仅从它和已验证的 access-token username
-构造。`/api/openapi.json` 将同一逻辑接口列为
-`/api/v1/lfs/libra/media/v1/...`，以便现有 LFS OpenAPI mount 统一展示；客户端不能把这个
-repository-free 文档路径当作实际 Media scope。
+构造。`/api/openapi.json` 将接口列为 `/info/lfs/libra/media/v1/...`，并在每个 Media path
+上声明 OpenAPI server variable `/{repository}`（默认 `project/demo.git`）；组合后就是实际
+可调用的 repository-scoped URL。不会注册或文档化 repository-free 的
+`/api/v1/lfs/libra/media/v1/...` alias。
 
 所有端点都要求 `Authorization: Bearer <mono-access-token>`，不会接受普通 LFS 的 Basic
 凭据作为 Media 身份。相对上述 Media 前缀的路由为：
@@ -110,4 +111,5 @@ manifest route 由请求层限制为 10 MiB，chunk route 限制为 8 MiB；带�
 Media 领域错误映射为 Invalid=`400`、NotFound=`404`、Conflict=`409` 和
 Storage/Io/Json=`500`。所有 `500` 响应固定为 `media storage operation failed`，不返回
 scope digest、repository 或 object key。普通 LFS route 不变；未启用 feature 时 Media route
-和其 OpenAPI paths 均不会注册。
+和其 OpenAPI paths 均不会注册。本卡不新增 `MegaError` 变体或 TOML 配置项：启用面仅由
+Cargo feature `fastcdc` 控制。

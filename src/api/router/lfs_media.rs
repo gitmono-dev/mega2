@@ -1,5 +1,7 @@
 //! HTTP adapter for the opt-in FastCDC Media protocol.
 
+use std::collections::BTreeMap;
+
 use axum::{
     Extension, Json,
     body::to_bytes,
@@ -8,6 +10,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use tower_http::limit::RequestBodyLimitLayer;
+use utoipa::openapi::{
+    OpenApi,
+    server::{Server, ServerVariableBuilder},
+};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::lfs_router::{LFS_CONTENT_TYPE, LFS_STREAM_CONTENT_TYPE, LfsRepoContext};
@@ -20,6 +26,22 @@ use crate::{
         service::MediaServiceError,
     },
 };
+
+const MEDIA_OPENAPI_PREFIX: &str = "/info/lfs/libra/media/v1";
+
+fn media_openapi_server() -> Server {
+    let mut server = Server::new("/{repository}");
+    server.description =
+        Some("Canonical repository prefix used to derive the server-side Media scope.".to_owned());
+    server.variables = Some(BTreeMap::from([(
+        "repository".to_owned(),
+        ServerVariableBuilder::new()
+            .default_value("project/demo.git")
+            .description(Some("Canonical repository path without the leading slash."))
+            .build(),
+    )]));
+    server
+}
 
 /// Builds the Media suffix routes. [`super::lfs_router::lfs_routes`] owns the
 /// `/libra/media/v1` prefix so the same handlers work at both LFS mounts.
@@ -38,6 +60,21 @@ pub(crate) fn routes() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(finalize))
         .routes(routes!(manifest))
         .routes(routes!(download_chunk))
+}
+
+/// Returns the Media OpenAPI paths with the same repository-prefixed URL that
+/// the HTTP rewrite middleware serves at runtime. The static `/api/v1/lfs`
+/// mount deliberately excludes Media because it cannot provide this context.
+pub(crate) fn openapi() -> OpenApi {
+    let mut api = routes().into_openapi();
+    let paths = std::mem::take(&mut api.paths.paths);
+    for (path, mut item) in paths {
+        item.servers = Some(vec![media_openapi_server()]);
+        api.paths
+            .paths
+            .insert(format!("{MEDIA_OPENAPI_PREFIX}{path}"), item);
+    }
+    api
 }
 
 fn media_scope(
@@ -137,7 +174,8 @@ async fn capabilities(
         (status = 400, description = "Malformed or invalid Media manifest", content_type = "application/vnd.git-lfs+json"),
         (status = 401, description = "Mono access token required"),
         (status = 404, description = "Repository context unavailable", content_type = "application/vnd.git-lfs+json"),
-        (status = 413, description = "Manifest exceeds 10 MiB")
+        (status = 413, description = "Manifest exceeds 10 MiB"),
+        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
     tag = LFS_TAG
 )]
@@ -170,7 +208,9 @@ async fn prepare(
         (status = 400, description = "Chunk content or request is invalid", content_type = "application/vnd.git-lfs+json"),
         (status = 401, description = "Mono access token required"),
         (status = 404, description = "Manifest, chunk declaration, or repository was not found", content_type = "application/vnd.git-lfs+json"),
-        (status = 413, description = "Chunk exceeds 8 MiB")
+        (status = 409, description = "Stored pending manifest conflicts", content_type = "application/vnd.git-lfs+json"),
+        (status = 413, description = "Chunk exceeds 8 MiB"),
+        (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
     tag = LFS_TAG
 )]
@@ -257,6 +297,7 @@ async fn manifest(
     ),
     responses(
         (status = 200, description = "Verified Media chunk bytes", content_type = "application/octet-stream"),
+        (status = 400, description = "Stored chunk content is invalid", content_type = "application/vnd.git-lfs+json"),
         (status = 401, description = "Mono access token required"),
         (status = 404, description = "Manifest, chunk declaration, or repository was not found", content_type = "application/vnd.git-lfs+json"),
         (status = 409, description = "Stored manifest conflicts with its Media object", content_type = "application/vnd.git-lfs+json"),
@@ -281,17 +322,17 @@ async fn download_chunk(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{convert::Infallible, sync::Arc};
 
     use axum::{
-        Extension, Router,
+        Router,
         body::{Body, to_bytes},
         http::{
             Request, StatusCode,
             header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
         },
     };
-    use tower::ServiceExt;
+    use tower::{Service, ServiceBuilder, ServiceExt};
 
     use super::*;
     use crate::{
@@ -368,11 +409,27 @@ mod tests {
         (temp_dir, api_state(storage), alice, bob)
     }
 
-    fn app(state: MonoApiServiceState, repository: &str) -> Router {
-        let router: Router = super::super::lfs_router::lfs_routes()
+    const REPOSITORY: &str = "/project/demo.git";
+
+    fn app(
+        state: MonoApiServiceState,
+    ) -> impl Service<Request<Body>, Response = Response, Error = Infallible> + Clone {
+        let info_lfs_router: Router = super::super::lfs_router::lfs_routes()
             .with_state(state)
             .into();
-        router.layer(Extension(LfsRepoContext(repository.to_owned())))
+        ServiceBuilder::new()
+            .layer(tower::util::MapRequestLayer::new(
+                crate::server::http_server::rewrite_lfs_request_uri::<Body>,
+            ))
+            .service(Router::new().nest("/info/lfs", info_lfs_router))
+    }
+
+    fn media_uri_for(repository: &str, suffix: &str) -> String {
+        format!("{repository}/info/lfs/libra/media/v1{suffix}")
+    }
+
+    fn media_uri(suffix: &str) -> String {
+        media_uri_for(REPOSITORY, suffix)
     }
 
     fn manifest_for(media: &[u8]) -> MediaManifest {
@@ -415,11 +472,11 @@ mod tests {
     #[tokio::test]
     async fn media_router_requires_token_and_preserves_actor_and_repository_scope() {
         let (_temp_dir, state, alice, bob) = fixture().await;
-        let media_app = app(state.clone(), "/project/demo.git");
-        let capability_path = "/libra/media/v1/capabilities";
+        let media_app = app(state);
+        let capability_path = media_uri("/capabilities");
 
         for token in [None, Some("unknown-token")] {
-            let mut request = Request::builder().uri(capability_path);
+            let mut request = Request::builder().uri(&capability_path);
             if let Some(token) = token {
                 request = request.header(AUTHORIZATION, format!("Bearer {token}"));
             }
@@ -435,7 +492,7 @@ mod tests {
             .clone()
             .oneshot(bearer_request(
                 "GET",
-                capability_path.to_owned(),
+                capability_path.clone(),
                 &alice,
                 Body::empty(),
             ))
@@ -473,7 +530,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/libra/media/v1/manifests")
+                    .uri(media_uri("/manifests"))
                     .header(AUTHORIZATION, format!("Bearer {alice}"))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -503,10 +560,10 @@ mod tests {
                 .clone()
                 .oneshot(bearer_request(
                     "PUT",
-                    format!(
-                        "/libra/media/v1/manifests/{}/chunks/{hash}",
+                    media_uri(&format!(
+                        "/manifests/{}/chunks/{hash}",
                         prepared.manifest_id
-                    ),
+                    )),
                     &alice,
                     Body::from(media[start..end].to_vec()),
                 ))
@@ -519,10 +576,7 @@ mod tests {
             .clone()
             .oneshot(bearer_request(
                 "POST",
-                format!(
-                    "/libra/media/v1/manifests/{}/finalize",
-                    prepared.manifest_id
-                ),
+                media_uri(&format!("/manifests/{}/finalize", prepared.manifest_id)),
                 &alice,
                 Body::empty(),
             ))
@@ -530,7 +584,7 @@ mod tests {
             .expect("router responds");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        let manifest_path = format!("/libra/media/v1/manifests/by-media/{}", manifest.media_oid);
+        let manifest_path = media_uri(&format!("/manifests/by-media/{}", manifest.media_oid));
         let response = media_app
             .clone()
             .oneshot(bearer_request(
@@ -593,9 +647,16 @@ mod tests {
             .expect("router responds");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let other_repository = app(state, "/project/other.git");
-        let response = other_repository
-            .oneshot(bearer_request("GET", manifest_path, &alice, Body::empty()))
+        let response = media_app
+            .oneshot(bearer_request(
+                "GET",
+                media_uri_for(
+                    "/project/other.git",
+                    &format!("/manifests/by-media/{}", manifest.media_oid),
+                ),
+                &alice,
+                Body::empty(),
+            ))
             .await
             .expect("router responds");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -604,14 +665,14 @@ mod tests {
     #[tokio::test]
     async fn media_router_rejects_malformed_and_oversized_bodies() {
         let (_temp_dir, state, alice, _) = fixture().await;
-        let media_app = app(state, "/project/demo.git");
+        let media_app = app(state);
 
         let response = media_app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/libra/media/v1/manifests")
+                    .uri(media_uri("/manifests"))
                     .header(AUTHORIZATION, format!("Bearer {alice}"))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from("{"))
@@ -642,7 +703,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/libra/media/v1/manifests")
+                    .uri(media_uri("/manifests"))
                     .header(AUTHORIZATION, format!("Bearer {alice}"))
                     .header(
                         CONTENT_LENGTH,
@@ -659,11 +720,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri(format!(
-                        "/libra/media/v1/manifests/{}/chunks/{}",
+                    .uri(media_uri(&format!(
+                        "/manifests/{}/chunks/{}",
                         "a".repeat(64),
                         "b".repeat(64)
-                    ))
+                    )))
                     .header(AUTHORIZATION, format!("Bearer {alice}"))
                     .header(CONTENT_LENGTH, (chunker::MAX_SIZE + 1).to_string())
                     .body(Body::empty())
@@ -718,20 +779,71 @@ mod tests {
     }
 
     #[test]
-    fn media_routes_are_present_in_feature_on_openapi() {
-        let api = super::super::lfs_router::routers().into_openapi();
+    fn media_openapi_describes_the_callable_repository_scoped_routes() {
+        let api = openapi();
         for path in [
-            "/api/v1/lfs/libra/media/v1/capabilities",
-            "/api/v1/lfs/libra/media/v1/manifests",
-            "/api/v1/lfs/libra/media/v1/manifests/{manifest_id}/chunks/{hash}",
-            "/api/v1/lfs/libra/media/v1/manifests/{manifest_id}/finalize",
-            "/api/v1/lfs/libra/media/v1/manifests/by-media/{media_oid}",
-            "/api/v1/lfs/libra/media/v1/manifests/by-media/{media_oid}/chunks/{hash}",
+            "/info/lfs/libra/media/v1/capabilities",
+            "/info/lfs/libra/media/v1/manifests",
+            "/info/lfs/libra/media/v1/manifests/{manifest_id}/chunks/{hash}",
+            "/info/lfs/libra/media/v1/manifests/{manifest_id}/finalize",
+            "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}",
+            "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}/chunks/{hash}",
         ] {
-            assert!(
-                api.paths.paths.contains_key(path),
-                "missing OpenAPI path {path}"
+            let item = api
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("missing OpenAPI path {path}"));
+            let server = item
+                .servers
+                .as_ref()
+                .and_then(|servers| servers.first())
+                .expect("Media path declares its repository server");
+            assert_eq!(server.url, "/{repository}");
+            assert_eq!(
+                server
+                    .variables
+                    .as_ref()
+                    .and_then(|variables| variables.get("repository"))
+                    .map(|variable| variable.default_value.as_str()),
+                Some("project/demo.git")
             );
+        }
+        assert!(
+            !api.paths
+                .paths
+                .contains_key("/api/v1/lfs/libra/media/v1/capabilities"),
+            "a repository-free Media alias must not be documented"
+        );
+    }
+
+    #[test]
+    fn media_openapi_documents_every_handler_error_status() {
+        let document = serde_json::to_value(openapi()).expect("serialize OpenAPI document");
+        for (path, method, statuses) in [
+            (
+                "/info/lfs/libra/media/v1/manifests",
+                "post",
+                &["400", "401", "404", "413", "500"][..],
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/{manifest_id}/chunks/{hash}",
+                "put",
+                &["400", "401", "404", "409", "413", "500"][..],
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}/chunks/{hash}",
+                "get",
+                &["400", "401", "404", "409", "500"][..],
+            ),
+        ] {
+            let responses = &document["paths"][path][method]["responses"];
+            for status in statuses {
+                assert!(
+                    responses.get(*status).is_some(),
+                    "{method} {path} is missing documented HTTP {status}"
+                );
+            }
         }
     }
 }

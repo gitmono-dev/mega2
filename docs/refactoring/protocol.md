@@ -363,11 +363,12 @@ HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/i
 repository 路径，并与服务端解析的 token actor 共同构造私有 scope。这样相同 hash
 不能跨 actor 或 repository 读取。
 
-`/api/openapi.json` 使用 `/api/v1/lfs/libra/media/v1/...` 作为静态文档 mount，便于与
-既有 LFS schema 一起展示；它不携带 repository context，不能替代实际客户端 URL。Media
-manifest 和 chunk 请求分别限制为 10 MiB 与 8 MiB，超限在 handler 前返回 `413`。Media
-domain error 映射为 `400`、`404`、`409` 或不泄漏 scope/key 的 `500`；未启用 feature 时
-Media runtime route 和 OpenAPI path 均不存在。标准 Git LFS endpoint、其 Basic/Bearer
+`/api/openapi.json` 使用 `/info/lfs/libra/media/v1/...` path，并在每个 Media path 上通过
+OpenAPI server variable `/{repository}` 表达真实 repository 前缀（默认
+`project/demo.git`）；不会暴露 repository-free 的 `/api/v1/lfs/libra/media/v1/...` alias。
+Media manifest 和 chunk 请求分别限制为 10 MiB 与 8 MiB，超限在 handler 前返回 `413`。
+Media domain error 映射为 `400`、`404`、`409` 或不泄漏 scope/key 的 `500`；未启用 feature
+时 Media runtime route 和 OpenAPI path 均不存在。标准 Git LFS endpoint、其 Basic/Bearer
 认证兼容和 SSH hybrid discovery 均不因此改变。详情见
 [`fastcdc-media.md`](fastcdc-media.md)。
 

@@ -22,6 +22,8 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
+#[cfg(feature = "fastcdc")]
+use crate::api::router::lfs_media;
 use crate::{
     api::{
         MonoApiServiceState,
@@ -711,6 +713,8 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         .layer(middleware::from_fn(trace_context::inject_trace_context))
         .with_state(api_state.clone())
         .split_for_parts();
+    #[cfg(feature = "fastcdc")]
+    let api = api.merge_from(lfs_media::openapi());
 
     // Register /info/lfs paths for runtime compatibility (not in OpenAPI)
     // Convert OpenApiRouter to Router to avoid including /info/lfs in OpenAPI docs
@@ -723,7 +727,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
 }
 
-fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
+pub(crate) fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
     // Capture the repository path prefix (the segment before `/info/lfs/`)
     // before it is stripped for routing, so LFS handlers can namespace locks
     // per repository. Empty when the request carries no repo prefix.
