@@ -336,8 +336,7 @@ impl GitDbStorage {
             .filter(git_commit::Column::RepoId.eq(repo_id))
             .filter(git_commit::Column::CommitId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_commits_by_hashes(
@@ -410,8 +409,7 @@ impl GitDbStorage {
             .filter(git_tree::Column::RepoId.eq(repo_id))
             .filter(git_tree::Column::TreeId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_blobs_by_repo_id(
@@ -434,8 +432,7 @@ impl GitDbStorage {
             .filter(git_blob::Column::RepoId.eq(repo_id))
             .filter(git_blob::Column::BlobId.is_in(hashes))
             .all(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_tags_by_repo_id(
@@ -447,6 +444,20 @@ impl GitDbStorage {
             .all(self.get_connection())
             .await
             .unwrap())
+    }
+
+    /// Find a stored annotated tag object by its object id.
+    pub async fn get_tag_by_hash(
+        &self,
+        repo_id: i64,
+        tag_id: &str,
+    ) -> Result<Option<git_tag::Model>, MegaError> {
+        let result = git_tag::Entity::find()
+            .filter(git_tag::Column::RepoId.eq(repo_id))
+            .filter(git_tag::Column::TagId.eq(tag_id))
+            .one(self.get_connection())
+            .await?;
+        Ok(result)
     }
 
     /// Paginated annotated tags for a given import repo id.
@@ -535,5 +546,62 @@ impl GitDbStorage {
         (c_count + t_count + b_count + tag_count)
             .try_into()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::GitDbStorage;
+    use crate::{
+        callisto::git_tag,
+        common::utils::generate_id,
+        jupiter::{
+            migration::apply_migrations,
+            storage::base_storage::{BaseStorage, StorageConnector},
+            tests::test_db_connection,
+        },
+    };
+
+    #[tokio::test]
+    async fn get_tag_by_hash_is_repo_scoped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("apply migrations");
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        let repo_id = 17;
+        let tag = git_tag::Model {
+            id: generate_id(),
+            repo_id,
+            tag_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            object_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            object_type: "commit".to_owned(),
+            tag_name: "v1.0.0".to_owned(),
+            tagger: "Monoengine Test <test@example.invalid>".to_owned(),
+            message: "tag lookup regression".to_owned(),
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            pack_offset: 0,
+        };
+        storage.insert_tag(tag.clone()).await.expect("insert tag");
+
+        assert_eq!(
+            storage
+                .get_tag_by_hash(repo_id, &tag.tag_id)
+                .await
+                .expect("look up tag")
+                .map(|stored| stored.tag_name),
+            Some(tag.tag_name)
+        );
+        assert!(
+            storage
+                .get_tag_by_hash(repo_id + 1, &tag.tag_id)
+                .await
+                .expect("look up other repo")
+                .is_none()
+        );
     }
 }

@@ -3659,7 +3659,9 @@ impl MonoApiService {
             .git_receive_pack_stream(
                 &state,
                 commands,
-                Box::pin(tokio_stream::once(Ok(Bytes::from(pack_data)))),
+                crate::ceres::protocol::smart::receive_pack_stream_from_bytes(Some(Bytes::from(
+                    pack_data,
+                ))),
             )
             .await
             .map_err(|e| MegaError::Other(format!("{e}")))?;

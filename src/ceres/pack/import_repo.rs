@@ -362,8 +362,37 @@ impl RepoHandler for ImportRepo {
             .git_db_storage()
             .get_commit_by_hash(self.repo.repo_id, hash)
             .await
-            .unwrap()
+            .ok()
+            .flatten()
             .is_some()
+    }
+
+    async fn check_object_exist(&self, hash: &str) -> bool {
+        let storage = self.storage.git_db_storage();
+        if storage
+            .get_tag_by_hash(self.repo.repo_id, hash)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+            || self.check_commit_exist(hash).await
+        {
+            return true;
+        }
+        if storage
+            .get_tree_by_hash(self.repo.repo_id, hash)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return true;
+        }
+        storage
+            .get_blobs_by_hashes(self.repo.repo_id, vec![hash.to_owned()])
+            .await
+            .map(|blobs| !blobs.is_empty())
+            .unwrap_or(false)
     }
 
     async fn check_default_branch(&self) -> bool {

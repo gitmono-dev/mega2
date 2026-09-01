@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::Stream;
+use futures::{Stream, stream};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
             import_refs::{CommandType, RefCommand},
         },
     },
-    common::errors::ProtocolError,
+    common::{errors::ProtocolError, utils::MEGA_BRANCH_NAME},
 };
 
 const LF: char = '\n';
@@ -40,6 +40,16 @@ const COMMON_CAP_LIST: &str = "side-band-64k ofs-delta agent=mega/0.1.0";
 
 // All other capabilities are only recognized by the upload-pack (fetch from server) process.
 const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done shallow ";
+
+type ReceivePackByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
+
+pub(crate) fn receive_pack_stream_from_bytes(
+    pack_bytes: Option<Bytes>,
+) -> Option<ReceivePackByteStream> {
+    pack_bytes.map(|pack_bytes| {
+        Box::pin(stream::once(async move { Ok(pack_bytes) })) as ReceivePackByteStream
+    })
+}
 
 fn advertised_capabilities(service_type: ServiceType) -> String {
     match service_type {
@@ -323,7 +333,7 @@ impl SmartSession {
     pub fn split_receive_pack_request(
         &mut self,
         mut protocol_bytes: Bytes,
-    ) -> Result<(Vec<RefCommand>, Bytes), ProtocolError> {
+    ) -> Result<(Vec<RefCommand>, Option<Bytes>), ProtocolError> {
         let mut commands: Vec<RefCommand> = Vec::new();
 
         while !protocol_bytes.is_empty() {
@@ -335,20 +345,15 @@ impl SmartSession {
                             "receive-pack request contains no commands".to_owned(),
                         ));
                     }
-                    if !Self::is_delete_only_push(&commands) {
-                        if protocol_bytes.is_empty() {
-                            return Err(ProtocolError::InvalidInput(
-                                "receive-pack request missing pack payload".to_owned(),
-                            ));
-                        }
-                        if !protocol_bytes.starts_with(b"PACK") {
-                            return Err(ProtocolError::InvalidInput(
-                                "receive-pack request pack payload does not start with PACK"
-                                    .to_owned(),
-                            ));
-                        }
+                    if protocol_bytes.is_empty() {
+                        return Ok((commands, None));
                     }
-                    return Ok((commands, protocol_bytes));
+                    if !protocol_bytes.starts_with(b"PACK") {
+                        return Err(ProtocolError::InvalidInput(
+                            "receive-pack request pack payload does not start with PACK".to_owned(),
+                        ));
+                    }
+                    return Ok((commands, Some(protocol_bytes)));
                 }
                 PktLine::Data(mut data) => {
                     let command = self.parse_receive_pack_command_line(&mut data)?;
@@ -395,7 +400,7 @@ impl SmartSession {
         &mut self,
         state: &ProtocolApiState,
         commands: Vec<RefCommand>,
-        data_stream: Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>,
+        data_stream: Option<ReceivePackByteStream>,
     ) -> Result<Bytes, ProtocolError> {
         let t0 = Instant::now();
         let mut timings_ms: BTreeMap<String, u128> = BTreeMap::new();
@@ -407,33 +412,109 @@ impl SmartSession {
             .repo_handler_with_commands(state, commands.clone())
             .await?;
         let is_monorepo = repo_handler.is_monorepo();
-        //1. unpack progress
-        let delete_only = Self::is_delete_only_push(&commands);
-        let unpack_result = if delete_only {
-            timings_ms.insert("unpack_stream_ms".to_string(), 0);
-            timings_ms.insert("receiver_handler_ms".to_string(), 0);
-            Ok(())
-        } else {
-            let t_unpack = Instant::now();
-            let receiver = repo_handler
-                .unpack_stream(&state.storage.config().pack, data_stream)
-                .await?;
-            timings_ms.insert(
-                "unpack_stream_ms".to_string(),
-                t_unpack.elapsed().as_millis(),
-            );
 
-            let t_receiver = Instant::now();
-            let res = repo_handler
-                .clone()
-                .receiver_handler(receiver.0, receiver.1)
-                .await;
-            timings_ms.insert(
-                "receiver_handler_ms".to_string(),
-                t_receiver.elapsed().as_millis(),
-            );
-            res
+        // Reject the default-branch deletion and Git-client tags before unpack
+        // so a report-status failure cannot persist an unrelated ref or reach
+        // finalize. Other deletes retain the monorepo's established semantics:
+        // they can remove an existing CL or non-default branch ref.
+        if is_monorepo {
+            for command in commands.iter_mut() {
+                if command.command_type == CommandType::Delete
+                    && command.ref_name == MEGA_BRANCH_NAME
+                {
+                    command.failed(format!(
+                        "refusing to delete the main branch ref `{MEGA_BRANCH_NAME}`: \
+                         the authorization snapshot is keyed on main's `/.mega_cedar.json`; \
+                         use the Web UI / API to manage the default branch"
+                    ));
+                } else if command.ref_type == RefTypeEnum::Tag {
+                    command.failed(
+                        "tag pushes are not supported on monorepo; manage tags through the tag API"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+
+        // A pack-less request introduces no objects. Every surviving ref must
+        // therefore point at an object that already exists in this repository.
+        // Branches can only target commits; tags can target any stored object.
+        if data_stream.is_none() {
+            for command in commands.iter_mut() {
+                if command.status != "ok" || command.command_type == CommandType::Delete {
+                    continue;
+                }
+                let exists = match command.ref_type {
+                    RefTypeEnum::Branch => repo_handler.check_commit_exist(&command.new_id).await,
+                    RefTypeEnum::Tag => repo_handler.check_object_exist(&command.new_id).await,
+                };
+                if !exists {
+                    command.failed(format!("target object {} not found", command.new_id));
+                }
+            }
+        }
+
+        // MonoRepo accepts one surviving non-delete branch update per
+        // receive-pack. This must run before unpack/finalize for pack-less
+        // requests, where the handler's later chain validator otherwise has no
+        // safe work item.
+        if is_monorepo {
+            let surviving_branch_updates = commands
+                .iter()
+                .filter(|command| {
+                    command.ref_type == RefTypeEnum::Branch
+                        && command.command_type != CommandType::Delete
+                        && command.new_id != ZERO_ID
+                        && command.status == "ok"
+                })
+                .count();
+            if surviving_branch_updates > 1 {
+                let message = format!(
+                    "monorepo receive-pack accepts at most one branch update per push \
+                     (got {surviving_branch_updates}); push one branch at a time \
+                     (delete commands are unaffected)"
+                );
+                for command in commands.iter_mut() {
+                    if command.ref_type == RefTypeEnum::Branch
+                        && command.command_type != CommandType::Delete
+                        && command.new_id != ZERO_ID
+                        && command.status == "ok"
+                    {
+                        command.failed(message.clone());
+                    }
+                }
+            }
+        }
+
+        // 1. Unpack only when a pack body was supplied. A pack-less push can
+        // safely proceed to report-status after the target checks above.
+        let t_unpack = Instant::now();
+        let receiver = match data_stream {
+            Some(data_stream) => Some(
+                repo_handler
+                    .unpack_stream(&state.storage.config().pack, data_stream)
+                    .await?,
+            ),
+            None => None,
         };
+        timings_ms.insert(
+            "unpack_stream_ms".to_string(),
+            t_unpack.elapsed().as_millis(),
+        );
+
+        let t_receiver = Instant::now();
+        let unpack_result = if let Some((receiver, pack_ids)) = receiver {
+            repo_handler
+                .clone()
+                .receiver_handler(receiver, pack_ids)
+                .await
+        } else {
+            Ok(())
+        };
+        timings_ms.insert(
+            "receiver_handler_ms".to_string(),
+            t_receiver.elapsed().as_millis(),
+        );
 
         // write "unpack ok\n to report"
         add_pkt_line_string(&mut report_status, "unpack ok\n".to_owned());
@@ -445,6 +526,9 @@ impl SmartSession {
         // 2. Tags: persist immediately. Branches: only unpack / default-branch flags here;
         //    mono and import both persist branch refs inside `finalize_receive_pack`.
         for command in commands.iter_mut() {
+            if command.status != "ok" {
+                continue;
+            }
             if command.ref_type == RefTypeEnum::Tag {
                 // just update if refs type is tag
                 if let Err(e) = repo_handler.update_refs(command).await {
@@ -478,7 +562,10 @@ impl SmartSession {
         let mut bind_ms: Option<u128> = None;
         let mut finalize_failed = false;
         let mut receive_notice: Option<String> = None;
-        if !unpack_failed {
+        let has_branch_work = commands
+            .iter()
+            .any(|command| command.ref_type == RefTypeEnum::Branch && command.status == "ok");
+        if !unpack_failed && has_branch_work {
             let t_finalize = Instant::now();
             if let Err(e) = repo_handler.finalize_receive_pack().await {
                 // UN-16: a per-ref rejection (e.g. main-branch delete) must reach
@@ -1004,7 +1091,7 @@ pub mod test {
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].ref_name, "refs/heads/main");
-        assert_eq!(&pack_bytes[..], b"PACKpayload");
+        assert_eq!(&pack_bytes.expect("pack payload")[..], b"PACKpayload");
         assert!(session.capabilities.contains(&Capability::ReportStatus));
     }
 
@@ -1048,7 +1135,7 @@ pub mod test {
             .split_receive_pack_request(request.freeze())
             .unwrap();
 
-        assert!(pack_bytes.is_empty());
+        assert!(pack_bytes.is_none());
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].ref_name, "refs/heads/old");
         assert_eq!(commands[0].command_type, CommandType::Delete);
@@ -1056,7 +1143,7 @@ pub mod test {
     }
 
     #[test]
-    pub fn split_receive_pack_request_rejects_non_delete_without_pack_payload() {
+    pub fn split_receive_pack_request_accepts_non_delete_without_pack_payload() {
         let mut session = SmartSession::new(
             std::path::PathBuf::new(),
             ServiceType::ReceivePack,
@@ -1070,12 +1157,13 @@ pub mod test {
         );
         request.extend_from_slice(PKT_LINE_END_MARKER);
 
-        let err = session
+        let (commands, pack_bytes) = session
             .split_receive_pack_request(request.freeze())
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(err, ProtocolError::InvalidInput(_)));
-        assert!(err.to_string().contains("missing pack payload"));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].ref_name, "refs/heads/main");
+        assert!(pack_bytes.is_none());
     }
 
     #[test]

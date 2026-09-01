@@ -660,8 +660,7 @@ impl MonoStorage {
         Ok(mega_commit::Entity::find()
             .filter(mega_commit::Column::CommitId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_commits_by_hashes(

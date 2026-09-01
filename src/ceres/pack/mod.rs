@@ -303,6 +303,11 @@ pub trait RepoHandler: Send + Sync + 'static {
 
     async fn check_commit_exist(&self, hash: &str) -> bool;
 
+    /// Whether this repository stores an object with this id. Tags may point
+    /// at annotated tags, commits, trees, or blobs, while branches must use
+    /// `check_commit_exist`.
+    async fn check_object_exist(&self, hash: &str) -> bool;
+
     async fn check_default_branch(&self) -> bool;
 
     fn find_head_hash(&self, refs: Vec<Refs>) -> (String, Vec<Refs>) {

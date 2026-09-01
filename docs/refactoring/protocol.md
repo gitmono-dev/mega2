@@ -68,6 +68,8 @@
 >
 > **2026-08-29 更新 3（MC-06 R2 粘性收口）**：拒绝规则改为只基于 pack **内容**（presence 集）——resolve 沿 tip 首父路径做 presence 界定的走查（新引入成员走 250 语义上界，冗余携带的已知祖先走独立卫生上界），凡不在路径上的 pack commit 一律判 junk 拒绝，与瞬时 newness 无关；无新引入的 push 不再退化为 `[tip]` 链，而是把整段内容链交给校验器重验。净效果：**同一被拒 pack 原样重试必被同样拒绝**（junk / 链中 merge / 超长 / 累计超限全部粘性），且 ref/CL/`commit_auths` 零变化；已接受 push 的幂等重试在真实客户端下天然走空 pack no-op 分支不受影响。绑定消费收窄为 `ordered ∩ 新引入`。
 
+> **2026-09-01 更新（FC-08）**：receive-pack 在 command flush 后允许没有 pack body 的 **pack-less** 请求。该路径不调用 unpack：branch 更新只可指向当前仓库中已有的 commit，普通仓库 tag 只可指向已有 object；不存在的目标以对应 `ng <ref> target object ... not found` 返回，且不会写 ref。MonoRepo 会在持久化前拒绝 Git-client tag 和默认 `refs/heads/main` 删除；既有的 CL/non-default ref 删除语义保持不变。单次两个以上非删除 branch 更新同样在 unpack 前整体标记 `ng`，而只有至少一个成功 branch command 才进入 finalize/bind；tag-only 请求不会触发 monorepo finalize。该行为由 protocol 单测和 `integration_git_cli_receive_pack_packless_statuses` 黑盒测试锁定。
+
 > **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MONOENGINE_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
 >
 > **2026-07-01 更新 7**：首轮 LFS CI gate 暴露 Git LFS 对 monorepo 根路径 remote `http://host/` 的默认 discovery 派生问题：客户端会拼出 `http://host.git/info/lfs` 并导致端口解析失败。`lfs_smoke_http` 现在对源仓库和验证 clone 显式配置 `lfs.url=<remote>/info/lfs`，并关闭 locks verify 探测，避免根路径 URL 被 Git LFS 自动追加 `.git`。
@@ -78,7 +80,7 @@
 
 2. **基础 fetch/push/clone 可工作**。当前能支持标准 Git 客户端的基本 clone、fetch、push 操作，但多处使用 `unwrap()` 和缺乏边界检查。
 
-3. **pkt-line 解析与 receive-pack 分流已完成首批止血。** `read_pkt_line` 的可失败版本已落地，HTTP/SSH receive-pack 已按 flush-pkt 分割 commands 与 pack bytes，不再搜索 `PACK` magic；delete-only push（全 delete）已支持（跳过 unpack）；残余风险是当前实现仍缓冲完整 body / channel 数据，尚未实现真正 streaming pkt-line reader。
+3. **pkt-line 解析与 receive-pack 分流已完成首批止血。** `read_pkt_line` 的可失败版本已落地，HTTP/SSH receive-pack 已按 flush-pkt 分割 commands 与可选 pack bytes，不再搜索 `PACK` magic；delete-only 和已存在对象的 pack-less 请求均跳过 unpack，并在写 ref 前返回每条命令的 status；残余风险是当前实现仍缓冲完整 body / channel 数据，尚未实现真正 streaming pkt-line reader。
 
 4. **认证上下文已统一（HTTP/SSH）。** HTTP receive-pack 需要 Bearer/Basic token，upload-pack 无认证；SSH publickey 认证成功后保存 username 并传入 `SmartSession`，commit binding 绑定到 authenticated actor。receive-pack 尚未做 repo/path 级 push 权限校验。
 
@@ -92,7 +94,7 @@
 |-----------|--------|-------------|
 | HTTP GET /info/refs | 已实现（含 protocol v2 advertisement） | query 已要求 exactly one `service=...`；缺失、重复、非法或额外参数均返回 `ProtocolError::InvalidInput`；`Git-Protocol: version=2` 会返回 v2 capabilities；**真实 Git CLI 兼容性矩阵已通过 CI smoke gate 覆盖（2026-06-30）**。 |
 | HTTP POST upload-pack | 已实现（含 shallow / v2 fetch / blob:none） | 一次性读取 request body 到内存；pkt-line 与 `want`/`have` malformed input 已返回协议错误；protocol v1 支持 `deepen`/`deepen-relative`，v2 支持 `ls-refs`、`fetch`、`deepen`、`filter blob:none`；仍不支持 streaming request parser。 |
-| HTTP POST receive-pack | 已实现（CL push + delete-only 与 HTTP smoke 已纳入 CI） | command pkt-line malformed input、非 delete 缺失 pack payload、空命令列表与无效 `PACK` magic 已返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`；delete-only push 已支持（跳过 unpack）；HTTP **CL push**（无新公开分支）与 **Git-client tag 拒绝** 已进入 Git CLI smoke CI gate（见 `docs/monorepo.md`）；**多 commit 线性链 push 已放开（2..=250 累计口径），含 merge commit 链 / 断链 / 累计超限 / 单次多条非删除 branch 命令均在 finalize 前整体拒绝（2026-08-29，MC-06 / ADR-MC-04/07）**；仍需 streaming parser。 |
+| HTTP POST receive-pack | 已实现（CL push + pack-less status + HTTP smoke 已纳入 CI） | command pkt-line malformed input、空命令列表与无效非空 pack payload 均返回协议错误；commands / pack 已按 flush-pkt 分割，不再搜索 `PACK`。没有 pack body 时跳过 unpack，branch target 必须是已有 commit、普通仓库 tag target 必须是已有 object；失败逐 ref 返回 `ng` 且不写入。MonoRepo 的 Git-client tag 和默认 main 删除在持久化前拒绝，tag-only 不 finalize，CL/non-default ref 删除保持既有行为。HTTP **CL push**（无新公开分支）与 **Git-client tag 拒绝** 已进入 Git CLI smoke CI gate（见 `docs/monorepo.md`）；**多 commit 线性链 push 已放开（2..=250 累计口径），含 merge commit 链 / 断链 / 累计超限 / 单次多条非删除 branch 命令均在 finalize 前整体拒绝（2026-08-29，MC-06 / ADR-MC-04/07）**；仍需 streaming parser。 |
 | SSH git-upload-pack | 已实现（per-channel state + protocol v2） | exec command 已走独立 parser，支持基础 shell quoting、包含空格的路径和严格命令白名单；upload-pack 初始响应已按 bytes 发送；`SshServer` 已按 `ChannelId` 隔离 `SmartSession` 与 receive-pack 缓冲区；`GIT_PROTOCOL=version=2` 可启用 v2 `ls-refs` / `fetch`。 |
 | SSH git-receive-pack | 已实现（per-channel state） | 与 HTTP 共用 flush-pkt 分割逻辑，不再搜索 `PACK`；每个 SSH channel 拥有独立的 receive-pack 缓冲区，多 channel 不再共享状态。 |
 | SSH git-lfs-authenticate / transfer | 已实现 hybrid；pure SSH transfer 明确 unsupported | `git-lfs-authenticate` 支持 hybrid 模式，返回 HTTP LFS URL；`git-lfs-authenticate` / `git-lfs-transfer` 均要求 operation 为 `upload` 或 `download`；`git-lfs-transfer` 通过 stderr extended-data 返回明确 unsupported 错误 + channel failure，不再输出普通占位文本。 |

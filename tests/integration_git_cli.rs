@@ -3158,6 +3158,137 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
     );
 }
 
+#[test]
+fn integration_git_cli_receive_pack_packless_statuses() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    const ZERO_ID: &str = "0000000000000000000000000000000000000000";
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let tip = remote_head(&env.case_dir, &token, &remote_url);
+    let case_id = format!(
+        "fc08-{}-{}",
+        std::process::id(),
+        CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let missing = "f".repeat(40);
+
+    let missing_branch = format!("refs/heads/{case_id}-missing");
+    let missing_reply = raw_receive_pack(
+        &env,
+        port,
+        &token,
+        "missing-target",
+        &[receive_pack_command(
+            ZERO_ID,
+            &missing,
+            &missing_branch,
+            true,
+        )],
+    );
+    assert_receive_pack_status(
+        &missing_reply,
+        &format!("ng {missing_branch} target object {missing} not found"),
+    );
+
+    let tag_name = format!("refs/tags/{case_id}-tag");
+    let tag_reply = raw_receive_pack(
+        &env,
+        port,
+        &token,
+        "tag-only",
+        &[receive_pack_command(ZERO_ID, &tip, &tag_name, true)],
+    );
+    assert_receive_pack_status(
+        &tag_reply,
+        &format!("ng {tag_name} tag pushes are not supported on monorepo"),
+    );
+
+    let mixed_branch = format!("refs/heads/{case_id}-mixed");
+    let mixed_tag = format!("refs/tags/{case_id}-mixed");
+    let mixed_reply = raw_receive_pack(
+        &env,
+        port,
+        &token,
+        "mixed",
+        &[
+            receive_pack_command(ZERO_ID, &tip, &mixed_branch, true),
+            receive_pack_command(ZERO_ID, &tip, &mixed_tag, false),
+        ],
+    );
+    assert_receive_pack_status(&mixed_reply, &format!("ok {mixed_branch}"));
+    assert_receive_pack_status(
+        &mixed_reply,
+        &format!("ng {mixed_tag} tag pushes are not supported on monorepo"),
+    );
+
+    let delete_reply = raw_receive_pack(
+        &env,
+        port,
+        &token,
+        "monorepo-delete",
+        &[receive_pack_command(&tip, ZERO_ID, "refs/heads/main", true)],
+    );
+    assert_receive_pack_status(
+        &delete_reply,
+        "ng refs/heads/main refusing to delete the main branch ref `refs/heads/main`",
+    );
+
+    let first_branch = format!("refs/heads/{case_id}-first");
+    let second_branch = format!("refs/heads/{case_id}-second");
+    let multi_reply = raw_receive_pack(
+        &env,
+        port,
+        &token,
+        "multiple-branches",
+        &[
+            receive_pack_command(ZERO_ID, &tip, &first_branch, true),
+            receive_pack_command(ZERO_ID, &tip, &second_branch, false),
+        ],
+    );
+    assert_receive_pack_status(
+        &multi_reply,
+        &format!(
+            "ng {first_branch} monorepo receive-pack accepts at most one branch update per push"
+        ),
+    );
+    assert_receive_pack_status(
+        &multi_reply,
+        &format!(
+            "ng {second_branch} monorepo receive-pack accepts at most one branch update per push"
+        ),
+    );
+
+    assert_eq!(
+        remote_head(&env.case_dir, &token, &remote_url),
+        tip,
+        "rejected pack-less commands must not alter the monorepo default tip"
+    );
+    assert!(
+        ls_remote_cl_refs(&env.case_dir, &token, &remote_url).is_empty(),
+        "pack-less no-op branch requests and rejected commands must not create CL refs"
+    );
+    assert!(
+        ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/tags/*").is_empty(),
+        "rejected Git-client tag requests must not create tag refs"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
 fn normalize_git_cli_error(combined: &str) -> String {
     combined
         .lines()
@@ -3190,6 +3321,93 @@ fn http_status(port: u16, path: &str) -> u16 {
         .trim()
         .parse()
         .unwrap_or_else(|_| panic!("bad http code from curl: {:?}", output.stdout))
+}
+
+fn remote_head(case_dir: &Path, token: &str, remote_url: &str) -> String {
+    let output = git_cli::git_cli(case_dir, token, &["ls-remote", remote_url, "HEAD"]);
+    git_cli::assert_git_success(&output, "ls-remote HEAD");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("missing HEAD from ls-remote: {:?}", output.stdout))
+}
+
+fn receive_pack_command(old_id: &str, new_id: &str, ref_name: &str, capabilities: bool) -> String {
+    let capabilities = if capabilities {
+        "\0report-status\n"
+    } else {
+        "\n"
+    };
+    format!("{old_id} {new_id} {ref_name}{capabilities}")
+}
+
+fn raw_receive_pack(
+    env: &GitCliEnv,
+    port: u16,
+    token: &str,
+    case_name: &str,
+    commands: &[String],
+) -> String {
+    let mut request = Vec::new();
+    for command in commands {
+        let length = command.len() + 4;
+        assert!(length <= u16::MAX as usize, "pkt-line is too large");
+        request.extend_from_slice(format!("{length:04x}").as_bytes());
+        request.extend_from_slice(command.as_bytes());
+    }
+    request.extend_from_slice(b"0000");
+
+    let request_path = env.temp_dir.path().join(format!("{case_name}.request"));
+    let response_path = env.temp_dir.path().join(format!("{case_name}.response"));
+    fs::write(&request_path, request).expect("write receive-pack request");
+
+    let url = git_cli::monoengine_host_http_url(port, "/git-receive-pack");
+    let credentials = format!("{}:{token}", git_cli::DEFAULT_GIT_AUTH_USER);
+    let request_arg = format!("@{}", request_path.display());
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-u",
+        &credentials,
+        "-H",
+        "Content-Type: application/x-git-receive-pack-request",
+        "--data-binary",
+        &request_arg,
+        "-o",
+        response_path.to_str().expect("UTF-8 response path"),
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "30",
+        &url,
+    ]);
+    let output = command.output().expect("run raw receive-pack request");
+    assert!(
+        output.status.success(),
+        "raw receive-pack request failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "200",
+        "raw receive-pack must return a report-status response"
+    );
+
+    String::from_utf8_lossy(&fs::read(&response_path).expect("read receive-pack response"))
+        .into_owned()
+}
+
+fn assert_receive_pack_status(response: &str, expected: &str) {
+    assert!(
+        response.contains("unpack ok\n"),
+        "receive-pack response must include unpack status: {response:?}"
+    );
+    assert!(
+        response.contains(expected),
+        "receive-pack response is missing `{expected}`: {response:?}"
+    );
 }
 
 fn ls_remote_cl_refs(case_dir: &Path, token: &str, remote_url: &str) -> Vec<String> {

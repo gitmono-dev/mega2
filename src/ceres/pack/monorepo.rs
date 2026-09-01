@@ -693,8 +693,16 @@ impl RepoHandler for MonoRepo {
             .mono_storage()
             .get_commit_by_hash(hash)
             .await
-            .unwrap()
+            .ok()
+            .flatten()
             .is_some()
+    }
+
+    async fn check_object_exist(&self, hash: &str) -> bool {
+        // Git-client tag pushes are rejected before this check on MonoRepo.
+        // A commit check is retained as the fail-closed fallback for future
+        // callers that need a non-tag object existence probe.
+        self.check_commit_exist(hash).await
     }
 
     async fn check_default_branch(&self) -> bool {
