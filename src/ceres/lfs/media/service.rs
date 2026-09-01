@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,7 +34,7 @@ pub(crate) enum MediaServiceError {
     #[error("media storage failed")]
     Storage,
     #[error("media I/O failed")]
-    Io(#[source] std::io::Error),
+    Io,
     #[error("media JSON failed")]
     Json(#[source] serde_json::Error),
 }
@@ -64,6 +64,18 @@ fn scope_error() -> MediaServiceError {
     MediaServiceError::Invalid
 }
 
+fn validate_duplicate_chunk_lengths(manifest: &MediaManifest) -> Result<(), MediaServiceError> {
+    let mut lengths = HashMap::with_capacity(manifest.chunks.len());
+    for chunk in &manifest.chunks {
+        if let Some(length) = lengths.insert(chunk.chunk_hash.as_str(), chunk.length)
+            && length != chunk.length
+        {
+            return Err(MediaServiceError::Invalid);
+        }
+    }
+    Ok(())
+}
+
 async fn read_bounded(
     service: &LfsService,
     key: &ObjectKey,
@@ -87,7 +99,7 @@ async fn read_bounded(
         .map_err(storage_error)?;
     let mut data = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(MediaServiceError::Io)?;
+        let chunk = chunk.map_err(|_| MediaServiceError::Io)?;
         if chunk.len() > limit.saturating_sub(data.len()) {
             return Err(MediaServiceError::Invalid);
         }
@@ -143,6 +155,7 @@ pub(crate) async fn pending_manifest(
         .manifest
         .validate()
         .map_err(|_| MediaServiceError::Conflict)?;
+    validate_duplicate_chunk_lengths(&pending.manifest).map_err(|_| MediaServiceError::Conflict)?;
     if pending.manifest.fallback_oid.as_deref() != Some(&pending.manifest.media_oid) {
         return Err(MediaServiceError::Conflict);
     }
@@ -166,6 +179,7 @@ pub(crate) async fn prepare(
     manifest
         .validate()
         .map_err(|_| MediaServiceError::Invalid)?;
+    validate_duplicate_chunk_lengths(&manifest)?;
     manifest.fallback_oid = Some(manifest.media_oid.clone());
     let manifest_id = manifest.id().map_err(|_| MediaServiceError::Invalid)?;
 

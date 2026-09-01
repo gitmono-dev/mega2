@@ -157,6 +157,15 @@ async fn prepare_and_upload() {
         Err(MediaServiceError::Invalid)
     ));
 
+    let mut inconsistent_duplicate = manifest.clone();
+    inconsistent_duplicate.chunks[1].length += 1;
+    inconsistent_duplicate.chunks[1].encoded_length += 1;
+    inconsistent_duplicate.media_size += 1;
+    assert!(matches!(
+        service.prepare_media(&scope, inconsistent_duplicate).await,
+        Err(MediaServiceError::Invalid)
+    ));
+
     let mut oversized = manifest_for_parts(&[]);
     oversized.created_by.client = "x".repeat(protocol::MAX_MANIFEST_SIZE);
     assert!(matches!(
@@ -250,4 +259,9 @@ async fn resume_and_deduplicate() {
             .await,
         Err(MediaServiceError::Conflict)
     ));
+}
+
+#[test]
+fn service_io_errors_do_not_retain_sources() {
+    assert!(std::error::Error::source(&MediaServiceError::Io).is_none());
 }
