@@ -276,14 +276,26 @@ impl GitDbStorage {
         Ok(())
     }
 
+    /// Updates one blob using the pre-FC-10 repository-wide lookup contract.
+    ///
+    /// New traversal code must use [`Self::update_git_blob_filepaths`] so the
+    /// repository scope is explicit and all paths are written in batches.
+    #[deprecated(note = "use update_git_blob_filepaths with an explicit repo_id")]
     pub async fn update_git_blob_filepath(
         &self,
-        repo_id: i64,
-        blob_id: &str,
+        blob_id: &String,
         file_path: &str,
     ) -> Result<(), MegaError> {
-        self.update_git_blob_filepaths(repo_id, vec![(blob_id.to_string(), file_path.to_string())])
-            .await
+        if let Some(model) = git_blob::Entity::find()
+            .filter(git_blob::Column::BlobId.eq(blob_id))
+            .one(self.get_connection())
+            .await?
+        {
+            let mut active: git_blob::ActiveModel = model.into();
+            active.file_path = Set(file_path.to_owned());
+            active.update(self.get_connection()).await?;
+        }
+        Ok(())
     }
 
     /// Batch-assigns file paths for blobs belonging to one import repository.
@@ -617,7 +629,8 @@ mod tests {
     use std::sync::Arc;
 
     use sea_orm::{
-        ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, TransactionTrait, sea_query::Expr,
+        ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, IntoActiveModel, MockDatabase,
+        MockExecResult, QueryFilter, TransactionTrait, sea_query::Expr,
     };
     use tokio::sync::Barrier;
 
@@ -716,6 +729,61 @@ mod tests {
             .await
             .expect("load git blob")
             .map(|blob| blob.file_path)
+    }
+
+    fn mock_storage(exec_count: usize) -> (GitDbStorage, DatabaseConnection) {
+        let connection = MockDatabase::new(DbBackend::Postgres)
+            .append_exec_results((0..exec_count).map(|_| MockExecResult::default()))
+            .into_connection();
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(connection.clone())),
+        };
+        (storage, connection)
+    }
+
+    fn update_statement_count(connection: DatabaseConnection) -> usize {
+        connection
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| statement.sql.trim_start().starts_with("UPDATE"))
+            .count()
+    }
+
+    fn filepath_pairs(count: usize) -> Vec<(String, String)> {
+        (0..count)
+            .map(|index| (format!("blob-{index:04}"), format!("dir/file-{index}.rs")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_has_one_update_per_chunk() {
+        let (storage, connection) = mock_storage(0);
+        storage
+            .update_git_blob_filepaths(1, Vec::new())
+            .await
+            .expect("empty batch");
+        assert_eq!(update_statement_count(connection), 0);
+
+        let (storage, connection) = mock_storage(1);
+        storage
+            .update_git_blob_filepaths(
+                1,
+                filepath_pairs(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE),
+            )
+            .await
+            .expect("single chunk");
+        assert_eq!(update_statement_count(connection), 1);
+
+        let (storage, connection) = mock_storage(2);
+        storage
+            .update_git_blob_filepaths(
+                1,
+                filepath_pairs(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE + 1),
+            )
+            .await
+            .expect("two chunks");
+        assert_eq!(update_statement_count(connection), 2);
     }
 
     #[tokio::test]

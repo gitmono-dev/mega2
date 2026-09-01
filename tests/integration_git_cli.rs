@@ -3501,7 +3501,7 @@ fn integration_git_cli_import_receive_pack_packless_statuses() {
         "the surviving import branch must be finalized"
     );
     assert_eq!(
-        git_blob_file_paths(&env.database.db_url, &blob_id),
+        git_blob_file_paths(&env.database.db_url, &repo_path, &blob_id),
         vec!["payload.txt".to_owned()],
         "import filepath traversal must persist the payload path"
     );
@@ -4259,15 +4259,22 @@ fn blob_file_paths(db_url: &str, blob_id: &str) -> Vec<String> {
 }
 
 /// Distinct `file_path` values stored for an imported Git blob (FC-10 e2e).
-fn git_blob_file_paths(db_url: &str, blob_id: &str) -> Vec<String> {
+fn git_blob_file_paths(db_url: &str, repo_path: &str, blob_id: &str) -> Vec<String> {
     with_runtime(async {
         let db = Database::connect(db_url)
             .await
             .unwrap_or_else(|err| panic!("connect integration DB for git blob rows: {err}"));
+        let repo_path_sql = repo_path.replace('\'', "''");
+        let blob_id_sql = blob_id.replace('\'', "''");
         let rows = db
             .query_all_raw(Statement::from_string(
                 DatabaseBackend::Postgres,
-                format!("SELECT DISTINCT file_path FROM git_blob WHERE blob_id = '{blob_id}'"),
+                format!(
+                    "SELECT DISTINCT gb.file_path FROM git_blob gb \
+                     JOIN git_repo gr ON gr.id = gb.repo_id \
+                     WHERE gr.repo_path = '{repo_path_sql}' AND gb.blob_id = '{blob_id_sql}' \
+                     ORDER BY gb.file_path"
+                ),
             ))
             .await
             .unwrap_or_else(|err| panic!("query git blob file_path for {blob_id}: {err}"));

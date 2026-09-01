@@ -817,7 +817,8 @@ mod tests {
     use std::sync::Arc;
 
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, TransactionTrait,
+        ActiveModelTrait, ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, IntoActiveModel,
+        MockDatabase, MockExecResult, QueryFilter, TransactionTrait,
     };
 
     use super::MonoStorage;
@@ -859,6 +860,59 @@ mod tests {
             .await
             .expect("load mega blob")
             .map(|blob| blob.file_path)
+    }
+
+    fn mock_storage(exec_count: usize) -> (MonoStorage, DatabaseConnection) {
+        let connection = MockDatabase::new(DbBackend::Postgres)
+            .append_exec_results((0..exec_count).map(|_| MockExecResult::default()))
+            .into_connection();
+        let storage = MonoStorage {
+            base: BaseStorage::new(Arc::new(connection.clone())),
+        };
+        (storage, connection)
+    }
+
+    fn update_statement_count(connection: DatabaseConnection) -> usize {
+        connection
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| statement.sql.trim_start().starts_with("UPDATE"))
+            .count()
+    }
+
+    fn filepath_pairs(count: usize) -> Vec<(String, String)> {
+        (0..count)
+            .map(|index| (format!("blob-{index:04}"), format!("dir/file-{index}.rs")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn update_blob_filepaths_has_one_update_per_chunk() {
+        let (storage, connection) = mock_storage(0);
+        storage
+            .update_blob_filepaths(Vec::new())
+            .await
+            .expect("empty batch");
+        assert_eq!(update_statement_count(connection), 0);
+
+        let (storage, connection) = mock_storage(1);
+        storage
+            .update_blob_filepaths(filepath_pairs(
+                <BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE,
+            ))
+            .await
+            .expect("single chunk");
+        assert_eq!(update_statement_count(connection), 1);
+
+        let (storage, connection) = mock_storage(2);
+        storage
+            .update_blob_filepaths(filepath_pairs(
+                <BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE + 1,
+            ))
+            .await
+            .expect("two chunks");
+        assert_eq!(update_statement_count(connection), 2);
     }
 
     #[tokio::test]

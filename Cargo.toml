@@ -113,7 +113,7 @@ mimalloc = "0.1.52"
 libc = "0.2"
 redis-test = { version = "1.0.4", features = ["aio"] }
 reqwest = { version = "0.13.4", features = ["json", "blocking"] }
-sea-orm = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "mock"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt", "net", "time"] }
 url = "2.5.8"
