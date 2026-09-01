@@ -585,6 +585,7 @@ impl Fixture {
         env.set("MEGA_REDIS__URL", integration_redis_url());
         env.set("MEGA_BASE_DIR", &base_dir);
         env.set("MEGA_CACHE_DIR", &cache_dir);
+        env.set("MEGA_ID_GENERATOR_LAYOUT_VERSION", "8+8-v1");
 
         Self {
             _lock: lock,
@@ -609,6 +610,7 @@ impl Fixture {
             .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
             .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
             .env("MEGA_REDIS__URL", integration_redis_url())
+            .env("MEGA_ID_GENERATOR_LAYOUT_VERSION", "8+8-v1")
             .arg("--config")
             .arg(&self.config_path)
             .arg("--profile")
