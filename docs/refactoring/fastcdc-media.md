@@ -64,4 +64,4 @@ prepare 响应使用 `manifest_id` 和 `missing_chunks`；已发布 manifest 响
 - `supports_batch_exists: true`、`supports_range_read: false`、`supports_standard_lfs_fallback: true`；
 - `scope: "authenticated-user-and-repository"`。
 
-此文档尚不声明公开 route 或上传生命周期；这些内容在对应实现可用后追加，避免向 feature-off 用户暴露未实现的协议面。
+此文档尚不声明公开 route；该协议面在对应实现可用后追加，避免向 feature-off 用户暴露未实现的接口。
