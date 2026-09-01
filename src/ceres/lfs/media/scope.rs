@@ -1,5 +1,7 @@
 //! Server-owned FastCDC media scope and private object-key construction.
 
+use std::fmt;
+
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -9,13 +11,19 @@ const MEDIA_V1_PREFIX: &str = "media-v1";
 
 /// A private media scope derived from the authenticated actor and canonical
 /// repository path. The digest is intentionally not exposed to HTTP callers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaScope {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MediaScope {
     digest: String,
 }
 
+impl fmt::Debug for MediaScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MediaScope { .. }")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum MediaScopeError {
+pub(crate) enum MediaScopeError {
     #[error("a canonical repository and authenticated actor are required")]
     InvalidActorOrRepository,
     #[error("a media object ID must be lowercase SHA-256 hex")]
@@ -29,7 +37,7 @@ impl MediaScope {
     ///
     /// The actor must be resolved from the validated Mono access token before
     /// this call; request JSON (including `created_by`) must never supply it.
-    pub fn from_access_token_username(
+    pub(crate) fn from_access_token_username(
         username: &str,
         repository: &str,
     ) -> Result<Self, MediaScopeError> {
@@ -44,15 +52,21 @@ impl MediaScope {
         })
     }
 
-    pub fn pending_manifest_key(&self, manifest_id: &str) -> Result<ObjectKey, MediaScopeError> {
+    pub(crate) fn pending_manifest_key(
+        &self,
+        manifest_id: &str,
+    ) -> Result<ObjectKey, MediaScopeError> {
         self.key("pending", manifest_id)
     }
 
-    pub fn chunk_key(&self, chunk_hash: &str) -> Result<ObjectKey, MediaScopeError> {
+    pub(crate) fn chunk_key(&self, chunk_hash: &str) -> Result<ObjectKey, MediaScopeError> {
         self.key("chunks", chunk_hash)
     }
 
-    pub fn finalized_manifest_key(&self, media_oid: &str) -> Result<ObjectKey, MediaScopeError> {
+    pub(crate) fn finalized_manifest_key(
+        &self,
+        media_oid: &str,
+    ) -> Result<ObjectKey, MediaScopeError> {
         self.key("finalized", media_oid)
     }
 
@@ -174,5 +188,30 @@ mod tests {
             scope.chunk_key(&"A".repeat(64)),
             Err(MediaScopeError::InvalidObjectId)
         );
+    }
+
+    #[test]
+    fn scope_formatting_and_errors_do_not_leak_private_values() {
+        let repository = "/project/demo.git";
+        let scope = MediaScope::from_access_token_username("alice", repository).unwrap();
+        let object_key = scope.pending_manifest_key(&"a".repeat(64)).unwrap();
+        let scope_format = format!("{scope:?}");
+        let invalid_id = "not-a-sha256";
+        let error = scope.chunk_key(invalid_id).unwrap_err();
+
+        for output in [
+            scope_format,
+            error.to_string(),
+            format!("{error:?}"),
+            MediaScope::from_access_token_username("", repository)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(!output.contains(ALICE_DEMO_SCOPE));
+            assert!(!output.contains(&object_key.key));
+            assert!(!output.contains("alice"));
+            assert!(!output.contains(repository));
+            assert!(!output.contains(invalid_id));
+        }
     }
 }

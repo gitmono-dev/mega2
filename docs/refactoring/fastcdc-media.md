@@ -35,7 +35,7 @@ Media scope 只由服务端已验证的 Mono access-token 身份和 canonical re
 
 repository 必须为绝对路径，且拒绝 backslash、`%`、`?`、空段、`.` 和 `..`。scope digest 是 `SHA-256(serde_json([actor, repository]))` 的小写 hex，因而 actor 和 repository 任一变化都会产生隔离的 key space。
 
-逻辑对象 key 使用 `ObjectNamespace::Media`（稳定前缀 `media`）和 `media-v1/<scope-digest>/`：`pending/<manifest-id>`、`chunks/<chunk-hash>`、`finalized/<media-oid>`。底层仍应用 `ObjectKey` 的固定 sharding；它不会将 Media 与既有 LFS、Attachment 或其他 namespace 混合。scope 模块的错误不携带 actor、repository、digest 或内部 object key；HTTP adapter 在 FC-07 继续把存储失败映射为不泄漏这些值的公共错误。
+逻辑对象 key 使用 `ObjectNamespace::Media`（稳定前缀 `media`）和 `media-v1/<scope-digest>/`：`pending/<manifest-id>`、`chunks/<chunk-hash>`、`finalized/<media-oid>`。底层仍应用 `ObjectKey` 的固定 sharding；它不会将 Media 与既有 LFS、Attachment 或其他 namespace 混合。scope 和原始 `ObjectKey` 构造 API 仅在 crate 内可见，且 scope 的格式化和错误不携带 actor、repository、digest 或内部 object key；HTTP adapter 在 FC-07 继续把存储失败映射为不泄漏这些值的公共错误。
 
 ## Responses and capabilities
 

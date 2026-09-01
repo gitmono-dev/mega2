@@ -5,5 +5,5 @@ pub mod lfs_structs;
 pub mod media {
     pub mod chunker;
     pub mod protocol;
-    pub mod scope;
+    pub(crate) mod scope;
 }
