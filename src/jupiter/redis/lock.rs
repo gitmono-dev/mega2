@@ -506,12 +506,12 @@ mod test {
 
     #[tokio::test]
     async fn test_lock_contention_uses_short_retry_interval() {
-        let Some(conn) = init_server()
-            .await
-            .map(|(_server, conn)| conn)
-            .or(init_configured_connection().await)
-        else {
-            return;
+        let (_server, conn) = if let Some((server, conn)) = init_server().await {
+            (Some(server), conn)
+        } else if let Some(conn) = init_configured_connection().await {
+            (None, conn)
+        } else {
+            panic!("FC-12 contention test requires redis-server or a reachable MEGA_REDIS__URL");
         };
 
         let key = format!("short-retry-contention-{}", Uuid::new_v4());
