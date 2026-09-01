@@ -118,6 +118,8 @@ pub struct RedLock {
     /// a `try_lock`-only handle. Bare `try_lock`/`unlock` calls operate on
     /// this current lease; `lock()` replaces it with a fresh one.
     current: Arc<StdMutex<Arc<Lease>>>,
+    #[cfg(test)]
+    lock_attempts: Arc<AtomicUsize>,
 }
 
 impl RedLock {
@@ -127,6 +129,8 @@ impl RedLock {
             key: key.into(),
             ttl_ms,
             current: Arc::new(StdMutex::new(Lease::new())),
+            #[cfg(test)]
+            lock_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -140,12 +144,20 @@ impl RedLock {
         self.current_lease().test_hooks.clone()
     }
 
+    #[cfg(test)]
+    fn lock_attempts(&self) -> usize {
+        self.lock_attempts.load(Ordering::Relaxed)
+    }
+
     /// Try lock: SET key <current lease token> NX PX TTL
     pub async fn try_lock(&self) -> Result<bool, MegaError> {
         self.try_lock_lease(&self.current_lease()).await
     }
 
     async fn try_lock_lease(&self, lease: &Lease) -> Result<bool, MegaError> {
+        #[cfg(test)]
+        self.lock_attempts.fetch_add(1, Ordering::Relaxed);
+
         let mut conn = self.connection.clone();
         // SET returns "OK" or Nil
         let result: Option<String> = redis::cmd("SET")
@@ -160,6 +172,10 @@ impl RedLock {
         Ok(result.is_some())
     }
 
+    /// Retry interval while waiting for SET NX. A short bounded wait reduces
+    /// handoff latency without turning lock contention into a busy loop.
+    const LOCK_RETRY_SLEEP: Duration = Duration::from_millis(10);
+
     /// Lock with retry
     pub async fn lock(self: Arc<Self>) -> Result<RedLockGuard, MegaError> {
         let t0 = Instant::now();
@@ -170,7 +186,7 @@ impl RedLock {
         let lease = Lease::new();
         *self.current.lock().expect("lease mutex poisoned") = lease.clone();
         while !self.try_lock_lease(&lease).await? {
-            sleep(Duration::from_millis(200)).await;
+            sleep(Self::LOCK_RETRY_SLEEP).await;
         }
 
         self.spawn_auto_renew(lease.clone());
@@ -369,12 +385,13 @@ impl Drop for RedLockGuard {
 #[cfg(test)]
 mod test {
 
-    use std::{process::Command, sync::Arc};
+    use std::{process::Command, sync::Arc, time::Instant};
 
     use futures::future::join_all;
     use redis::{AsyncCommands, aio::ConnectionManager};
     use redis_test::server::RedisServer;
     use tokio::time::{Duration, sleep, timeout};
+    use uuid::Uuid;
 
     use crate::jupiter::redis::lock::RedLock;
 
@@ -396,6 +413,12 @@ mod test {
         let client = redis::Client::open(url).unwrap();
         let conn = ConnectionManager::new(client).await.unwrap();
         Some((server, conn))
+    }
+
+    async fn init_configured_connection() -> Option<ConnectionManager> {
+        let url = std::env::var("MEGA_REDIS__URL").ok()?;
+        let client = redis::Client::open(url).ok()?;
+        ConnectionManager::new(client).await.ok()
     }
 
     #[tokio::test]
@@ -470,6 +493,62 @@ mod test {
             .count();
 
         assert_eq!(success_count, 1);
+    }
+
+    #[test]
+    fn lock_retry_interval_is_ten_millis() {
+        assert_eq!(
+            RedLock::LOCK_RETRY_SLEEP,
+            Duration::from_millis(10),
+            "lock contention must use a short sleep rather than busy-spin"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lock_contention_uses_short_retry_interval() {
+        let Some(conn) = init_server()
+            .await
+            .map(|(_server, conn)| conn)
+            .or(init_configured_connection().await)
+        else {
+            return;
+        };
+
+        let key = format!("short-retry-contention-{}", Uuid::new_v4());
+        let holder = Arc::new(RedLock::new(conn.clone(), key.clone(), 1000));
+        let holder_guard = holder.clone().lock().await.unwrap();
+        let contender = Arc::new(RedLock::new(conn, key, 1000));
+        let started = Instant::now();
+        let contender_task = {
+            let contender = contender.clone();
+            tokio::spawn(async move { contender.lock().await })
+        };
+
+        wait_until("contender's first lock attempt", || {
+            contender.lock_attempts() >= 1
+        })
+        .await;
+        sleep(Duration::from_millis(60)).await;
+        holder_guard.unlock().await.unwrap();
+
+        let contender_guard = timeout(Duration::from_millis(500), contender_task)
+            .await
+            .expect("contender must acquire after the holder unlocks")
+            .expect("contender task must not panic")
+            .expect("contender lock must succeed");
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(180),
+            "10ms polling should hand off well before a 200ms interval: {waited:?}"
+        );
+
+        let attempts = contender.lock_attempts();
+        assert!(attempts >= 2, "the contender must observe lock contention");
+        assert!(
+            attempts <= 20,
+            "contention must sleep between attempts instead of busy-spinning: {attempts}"
+        );
+        contender_guard.unlock().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
