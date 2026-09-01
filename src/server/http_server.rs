@@ -1015,6 +1015,13 @@ mod tests {
         let new_req = rewrite_lfs_request_uri(req);
 
         assert_eq!(new_req.uri().path(), "/info/lfs/objects/123");
+        assert_eq!(
+            new_req
+                .extensions()
+                .get::<lfs_router::LfsRepoContext>()
+                .map(|context| context.0.as_str()),
+            Some("/repo/a/b")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # FastCDC Media
 
-> 状态：FC-01～FC-06 已定义 feature-gated v1 chunker/manifest contract、私有 Media scope、pending 上传会话和标准 LFS fallback 发布；HTTP API 仍由 FC-07 补齐。默认构建不启用该能力。
+> 状态：FC-01～FC-07 已定义 feature-gated v1 chunker/manifest contract、私有 Media scope、pending 上传会话、标准 LFS fallback 和 HTTP API；默认构建不启用该能力，最终 family release 仍由 FC-14 收口。
 
 ## v1 manifest
 
@@ -53,7 +53,6 @@ scope 中已有且校验正确的 chunk 直接复用，错误的上传内容会�
 finalize 之前，服务只提供“当前 scope、当前 pending manifest、已声明 hash”的 chunk
 读取能力；即使同 scope 下存在其他对象，也不能通过任意 hash 读取。此阶段返回的
 Invalid、NotFound、Conflict、Storage、Io 和 Json 均为不携带 scope/key 的领域错误。
-公开 HTTP 路由尚未实现。
 
 ## Finalize and fallback
 
@@ -67,8 +66,7 @@ pending manifest 中声明的 chunks，并对每个 chunk 的 length 和 SHA-256
 `ON CONFLICT DO NOTHING` 语义登记 `lfs_objects`，随后重新读取 metadata 验证 size 与
 存在状态。只有该验证成功，才写入当前 scope 的 `finalized/<media-oid>` manifest。相同
 canonical manifest 的重复 finalize 可安全重试；同一 media OID 的不同 finalized
-manifest、错误 OID 的已存 manifest 或不同 scope 均会被拒绝。公开 HTTP 路由仍由 FC-07
-提供。
+manifest、错误 OID 的已存 manifest 或不同 scope 均会被拒绝。
 
 ## Responses and capabilities
 
@@ -79,4 +77,37 @@ prepare 响应使用 `manifest_id` 和 `missing_chunks`；已发布 manifest 响
 - `supports_batch_exists: true`、`supports_range_read: false`、`supports_standard_lfs_fallback: true`；
 - `scope: "authenticated-user-and-repository"`。
 
-此文档尚不声明公开 route；该协议面在对应实现可用后追加，避免向 feature-off 用户暴露未实现的接口。
+## HTTP API
+
+启用 Cargo feature `fastcdc` 时，客户端必须在已有 repository LFS URL 后追加
+`/libra/media/v1`。因此服务端实际可调用前缀为：
+
+```
+<canonical-repository>/info/lfs/libra/media/v1
+```
+
+例如 repository 为 `/project/demo.git` 时，capabilities URL 是
+`/project/demo.git/info/lfs/libra/media/v1/capabilities`。HTTP server 会在标准 LFS URI
+改写前保存这个原始 repository 前缀；Media scope 仅从它和已验证的 access-token username
+构造。`/api/openapi.json` 将同一逻辑接口列为
+`/api/v1/lfs/libra/media/v1/...`，以便现有 LFS OpenAPI mount 统一展示；客户端不能把这个
+repository-free 文档路径当作实际 Media scope。
+
+所有端点都要求 `Authorization: Bearer <mono-access-token>`，不会接受普通 LFS 的 Basic
+凭据作为 Media 身份。相对上述 Media 前缀的路由为：
+
+| 方法 | 路径 | 结果 |
+|---|---|---|
+| `GET` | `/capabilities` | 返回固定 v1 capabilities。 |
+| `POST` | `/manifests` | 校验并创建/恢复 pending manifest，返回 manifest ID 和缺失 hash。 |
+| `PUT` | `/manifests/{manifest_id}/chunks/{hash}` | 校验并写入一个声明的 chunk。 |
+| `POST` | `/manifests/{manifest_id}/finalize` | 完整校验后发布标准 LFS fallback。 |
+| `GET` | `/manifests/by-media/{media_oid}` | 返回当前 scope 的 finalized manifest。 |
+| `GET` | `/manifests/by-media/{media_oid}/chunks/{hash}` | 仅从 finalized manifest 中读取已声明且再次校验的 chunk。 |
+
+manifest route 由请求层限制为 10 MiB，chunk route 限制为 8 MiB；带超限
+`Content-Length` 的请求会在 handler 前以 `413` 拒绝，未知长度的流也受同一上限约束。
+Media 领域错误映射为 Invalid=`400`、NotFound=`404`、Conflict=`409` 和
+Storage/Io/Json=`500`。所有 `500` 响应固定为 `media storage operation failed`，不返回
+scope digest、repository 或 object key。普通 LFS route 不变；未启用 feature 时 Media route
+和其 OpenAPI paths 均不会注册。

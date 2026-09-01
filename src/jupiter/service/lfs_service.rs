@@ -83,4 +83,13 @@ impl LfsService {
     ) -> Result<ManifestResponse, MediaServiceError> {
         finalize::finalized_manifest(self, scope, media_oid).await
     }
+
+    pub(crate) async fn read_finalized_media_chunk(
+        &self,
+        scope: &MediaScope,
+        media_oid: &str,
+        hash: &str,
+    ) -> Result<Bytes, MediaServiceError> {
+        finalize::finalized_chunk(self, scope, media_oid, hash).await
+    }
 }

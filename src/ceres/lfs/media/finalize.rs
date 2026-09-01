@@ -77,6 +77,24 @@ pub(crate) async fn finalized_manifest(
     })
 }
 
+pub(crate) async fn finalized_chunk(
+    service: &LfsService,
+    scope: &MediaScope,
+    media_oid: &str,
+    hash: &str,
+) -> Result<Bytes, MediaServiceError> {
+    let manifest = finalized_manifest(service, scope, media_oid)
+        .await?
+        .manifest;
+    let chunk = manifest
+        .chunks
+        .iter()
+        .find(|chunk| chunk.chunk_hash == hash)
+        .ok_or(MediaServiceError::NotFound)?;
+
+    service::read_chunk(service, scope, hash, chunk.length).await
+}
+
 async fn reconstruct(
     service: &LfsService,
     scope: &MediaScope,

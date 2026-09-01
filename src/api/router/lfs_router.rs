@@ -55,6 +55,8 @@ use base64::Engine;
 use futures::TryStreamExt;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+#[cfg(feature = "fastcdc")]
+use super::lfs_media;
 use crate::{
     api::{
         MonoApiServiceState,
@@ -72,8 +74,8 @@ use crate::{
     common::errors::GitLFSError,
 };
 
-const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
-const LFS_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
+pub(crate) const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
+pub(crate) const LFS_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// The repository path prefix of an LFS request (the segment before
 /// `/info/lfs/`), captured by `rewrite_lfs_request_uri` before that prefix is
@@ -93,14 +95,17 @@ fn lfs_repo_path(ctx: Option<Extension<LfsRepoContext>>) -> String {
 }
 
 pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
-    OpenApiRouter::new()
+    let router = OpenApiRouter::new()
         .routes(routes!(lfs_upload_object))
         .routes(routes!(lfs_download_object))
         .routes(routes!(list_locks))
         .routes(routes!(create_lock))
         .routes(routes!(list_locks_for_verification))
         .routes(routes!(delete_lock))
-        .routes(routes!(lfs_process_batch))
+        .routes(routes!(lfs_process_batch));
+    #[cfg(feature = "fastcdc")]
+    let router = router.nest("/libra/media/v1", lfs_media::routes());
+    router
 }
 
 /// The [LFS Server Discovery](https://github.com/git-lfs/git-lfs/blob/main/docs/api/server-discovery.md)
@@ -847,6 +852,18 @@ mod tests {
         // failures during router creation. It does NOT assert individual paths;
         // those should be covered by more targeted endpoint tests if needed.
         let _router = routers();
+    }
+
+    #[cfg(not(feature = "fastcdc"))]
+    #[test]
+    fn fastcdc_media_routes_are_absent_without_feature() {
+        let api = routers().into_openapi();
+        assert!(
+            !api.paths
+                .paths
+                .keys()
+                .any(|path| path.contains("/libra/media/v1"))
+        );
     }
 
     #[test]

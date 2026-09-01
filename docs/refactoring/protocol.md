@@ -354,6 +354,23 @@ LFS router 同时暴露：
 
 HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/info/lfs/...` 重写到 LFS runtime router。SSH 下 `git-lfs-authenticate` 会返回 HTTP LFS URL，让 Git LFS 客户端走 hybrid 模式。
 
+### FastCDC Media（feature-gated）
+
+启用 Cargo feature `fastcdc` 后，既有 repository LFS URL 还会暴露
+`/libra/media/v1` 后缀，例如
+`/project/demo.git/info/lfs/libra/media/v1/capabilities`。Media 端点只接受
+`Authorization: Bearer <mono-access-token>`；HTTP server 会在 URI 改写前保存原始
+repository 路径，并与服务端解析的 token actor 共同构造私有 scope。这样相同 hash
+不能跨 actor 或 repository 读取。
+
+`/api/openapi.json` 使用 `/api/v1/lfs/libra/media/v1/...` 作为静态文档 mount，便于与
+既有 LFS schema 一起展示；它不携带 repository context，不能替代实际客户端 URL。Media
+manifest 和 chunk 请求分别限制为 10 MiB 与 8 MiB，超限在 handler 前返回 `413`。Media
+domain error 映射为 `400`、`404`、`409` 或不泄漏 scope/key 的 `500`；未启用 feature 时
+Media runtime route 和 OpenAPI path 均不存在。标准 Git LFS endpoint、其 Basic/Bearer
+认证兼容和 SSH hybrid discovery 均不因此改变。详情见
+[`fastcdc-media.md`](fastcdc-media.md)。
+
 ## 主要兼容性问题
 
 ### HTTP info/refs 参数校验（首批已止血）

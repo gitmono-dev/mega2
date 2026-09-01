@@ -89,7 +89,7 @@ tokio-stream = "0.1.19"
 tokio-util = "0.7.19"
 toml = "1.1.4"
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["cors", "trace", "decompression-full"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace", "decompression-full", "limit"] }
 tower-sessions = { version = "0.15", features = ["memory-store"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"

@@ -3,13 +3,14 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use utoipa::ToSchema;
 
 use super::chunker;
 
 pub const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 8192;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChunkEntry {
     pub offset: u64,
     pub length: u64,
@@ -20,14 +21,14 @@ pub struct ChunkEntry {
     pub checksum: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CreatedBy {
     pub client: String,
     pub version: String,
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct MediaManifest {
     pub version: u32,
     pub algorithm: String,
@@ -171,13 +172,13 @@ impl MediaManifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareResponse {
     pub manifest_id: String,
     pub missing_chunks: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ManifestResponse {
     pub manifest_id: String,
     pub manifest: MediaManifest,
