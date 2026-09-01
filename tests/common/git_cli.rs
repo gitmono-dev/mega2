@@ -652,29 +652,54 @@ fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
 /// even when the session leader exits non-zero (auth failures looked like
 /// success while stderr still showed `fatal: Authentication failed`). Only the
 /// `git` child is `setsid`'d so timeout can `kill -KILL -$gpid` its helpers.
+///
+/// BusyBox `setsid` may fork before it starts the session leader. The wrapper
+/// therefore exchanges a PID and an exit status through a private temporary
+/// directory: it can kill the actual process group on timeout while still
+/// returning Git's real exit status to the caller.
 fn append_container_git_timeout_wrapper(command: &mut Command) {
     command
         .arg("sh")
         .arg("-c")
         .arg(format!(
-            "setsid git \"$@\" &\n\
-             gpid=$!\n\
-             sleep {secs} &\n\
-             spid=$!\n\
-             while kill -0 \"$gpid\" 2>/dev/null && kill -0 \"$spid\" 2>/dev/null; do\n\
-               sleep 1\n\
+            "state_dir=$(mktemp -d /tmp/monoengine-git-wrapper.XXXXXX) || exit 70\n\
+             pid_file=$state_dir/pid\n\
+             status_file=$state_dir/status\n\
+             setsid sh -c '\n\
+               pid_file=$1\n\
+               status_file=$2\n\
+               shift 2\n\
+               printf \"%s\\n\" \"$$\" > \"$pid_file\"\n\
+               git \"$@\"\n\
+               status=$?\n\
+               printf \"%s\\n\" \"$status\" > \"$status_file\"\n\
+               exit \"$status\"\n\
+             ' git-wrapper \"$pid_file\" \"$status_file\" \"$@\" &\n\
+             launcher=$!\n\
+             attempt=0\n\
+             while [ ! -s \"$pid_file\" ] && [ \"$attempt\" -lt 20 ]; do\n\
+               sleep 0.1\n\
+               attempt=$((attempt + 1))\n\
              done\n\
-             if kill -0 \"$gpid\" 2>/dev/null; then\n\
+             if [ ! -s \"$pid_file\" ]; then\n\
+               wait \"$launcher\"\n\
+               status=$?\n\
+               rm -rf \"$state_dir\"\n\
+               exit \"$status\"\n\
+             fi\n\
+             gpid=$(cat \"$pid_file\")\n\
+             elapsed=0\n\
+             while [ ! -s \"$status_file\" ] && [ \"$elapsed\" -lt {secs} ]; do\n\
+               sleep 1\n\
+               elapsed=$((elapsed + 1))\n\
+             done\n\
+             if [ ! -s \"$status_file\" ]; then\n\
                kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
-               wait \"$gpid\" 2>/dev/null || true\n\
-               kill \"$spid\" 2>/dev/null || true\n\
-               wait \"$spid\" 2>/dev/null || true\n\
+               rm -rf \"$state_dir\"\n\
                exit 137\n\
              fi\n\
-             wait \"$gpid\"\n\
-             status=$?\n\
-             kill \"$spid\" 2>/dev/null || true\n\
-             wait \"$spid\" 2>/dev/null || true\n\
+             status=$(cat \"$status_file\")\n\
+             rm -rf \"$state_dir\"\n\
              exit \"$status\"\n",
             secs = GIT_CLI_COMMAND_TIMEOUT.as_secs()
         ))
