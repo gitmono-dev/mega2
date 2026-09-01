@@ -653,49 +653,49 @@ fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
 /// success while stderr still showed `fatal: Authentication failed`). Only the
 /// `git` child is `setsid`'d so timeout can `kill -KILL -$gpid` its helpers.
 ///
-/// BusyBox `setsid` may fork before it starts the session leader. The wrapper
-/// therefore exchanges a PID and an exit status through a private temporary
-/// directory: it can kill the actual process group on timeout while still
-/// returning Git's real exit status to the caller.
+/// Disable job control before spawning `setsid`: the background launcher then
+/// stays in the wrapper's process group, so BusyBox can `exec` Git directly.
+/// The wrapper can consequently wait for and reap the session leader while a
+/// watchdog interrupts that wait only when the wall-clock budget expires.
 fn container_git_timeout_script(timeout: Duration) -> String {
     let secs = timeout.as_secs();
 
     format!(
-        "state_dir=$(mktemp -d /tmp/monoengine-git-wrapper.XXXXXX) || exit 70\n\
-         pid_file=$state_dir/pid\n\
-         status_file=$state_dir/status\n\
-         setsid sh -c '\n\
-           pid_file=$1\n\
-           status_file=$2\n\
-           shift 2\n\
-           printf \"%s\\n\" \"$$\" > \"$pid_file\"\n\
-           git \"$@\"\n\
-           status=$?\n\
-           printf \"%s\\n\" \"$status\" > \"$status_file\"\n\
-           exit \"$status\"\n\
-         ' git-wrapper \"$pid_file\" \"$status_file\" \"$@\" &\n\
-         max_ticks=$(({secs} * 10))\n\
-         ticks=0\n\
-         while [ ! -s \"$pid_file\" ] && [ \"$ticks\" -lt \"$max_ticks\" ]; do\n\
-           sleep 0.1\n\
-           ticks=$((ticks + 1))\n\
-         done\n\
-         if [ ! -s \"$pid_file\" ]; then\n\
-           rm -rf \"$state_dir\"\n\
-           exit 137\n\
-         fi\n\
-         gpid=$(cat \"$pid_file\")\n\
-         while [ ! -s \"$status_file\" ] && [ \"$ticks\" -lt \"$max_ticks\" ]; do\n\
-           sleep 0.1\n\
-           ticks=$((ticks + 1))\n\
-         done\n\
-         if [ ! -s \"$status_file\" ]; then\n\
+        "set +m\n\
+         parent_pid=$$\n\
+         gpid=\n\
+         watchdog_pid=\n\
+         stop_watchdog() {{\n\
+           if [ -n \"$watchdog_pid\" ]; then\n\
+             kill \"$watchdog_pid\" 2>/dev/null || true\n\
+             wait \"$watchdog_pid\" 2>/dev/null || true\n\
+           fi\n\
+         }}\n\
+         on_timeout() {{\n\
+           trap - USR1\n\
            kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
-           rm -rf \"$state_dir\"\n\
+           wait \"$gpid\" 2>/dev/null || true\n\
+           stop_watchdog\n\
            exit 137\n\
-         fi\n\
-         status=$(cat \"$status_file\")\n\
-         rm -rf \"$state_dir\"\n\
+         }}\n\
+         trap 'on_timeout' USR1\n\
+         setsid git \"$@\" &\n\
+         gpid=$!\n\
+         (\n\
+           sleeper=\n\
+           trap '[ -n \"$sleeper\" ] && kill \"$sleeper\" 2>/dev/null || true; exit 0' TERM\n\
+           sleep {secs} &\n\
+           sleeper=$!\n\
+           wait \"$sleeper\"\n\
+           if [ $? -eq 0 ]; then\n\
+             kill -USR1 \"$parent_pid\"\n\
+           fi\n\
+         ) &\n\
+         watchdog_pid=$!\n\
+         wait \"$gpid\"\n\
+         status=$?\n\
+         trap - USR1\n\
+         stop_watchdog\n\
          exit \"$status\"\n"
     )
 }
@@ -754,14 +754,15 @@ mod timeout_wrapper_tests {
     }
 
     #[test]
-    fn timeout_wrapper_waits_for_forked_setsid_and_propagates_git_status() {
+    fn timeout_wrapper_propagates_git_status_from_the_setsid_child() {
+        assert!(
+            Command::new("setsid").arg("--version").output().is_ok(),
+            "Linux test environment must provide setsid"
+        );
+
         let temp_dir = tempdir().expect("temp dir");
         let bin_dir = temp_dir.path().join("bin");
         fs::create_dir(&bin_dir).expect("create bin dir");
-        write_executable(
-            &bin_dir.join("setsid"),
-            "#!/bin/sh\n( sleep 3; exec \"$@\" ) &\nexit 0\n",
-        );
         write_executable(&bin_dir.join("git"), "#!/bin/sh\nexit 23\n");
 
         let output = run_timeout_script(&bin_dir, Duration::from_secs(5), &[]);
