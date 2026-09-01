@@ -1,9 +1,12 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::generate_id,
-    mega_code_review_thread::{self, Column, Entity},
-    sea_orm_active_enums::ThreadStatusEnum,
+use crate::{
+    callisto::{
+        entity_ext::generate_id,
+        mega_code_review_thread::{self, Column, Entity},
+        sea_orm_active_enums::ThreadStatusEnum,
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -33,15 +36,15 @@ impl Related<crate::callisto::mega_cl::Entity> for Entity {
 }
 
 impl mega_code_review_thread::Model {
-    pub fn new(link: &str, thread_status: ThreadStatusEnum) -> Self {
+    pub fn new(link: &str, thread_status: ThreadStatusEnum) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             link: link.to_owned(),
             thread_status,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 }

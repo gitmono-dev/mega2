@@ -1,4 +1,7 @@
-use crate::callisto::{buck_session_file, entity_ext::generate_id};
+use crate::{
+    callisto::{buck_session_file, entity_ext::generate_id},
+    common::errors::MegaError,
+};
 
 impl buck_session_file::Model {
     /// Create a new file record model
@@ -12,9 +15,9 @@ impl buck_session_file::Model {
         upload_status: String,
         upload_reason: Option<String>,
         blob_id: Option<String>,
-    ) -> Self {
-        Self {
-            id: generate_id(),
+    ) -> Result<Self, MegaError> {
+        Ok(Self {
+            id: generate_id()?,
             session_id,
             file_path,
             file_size,
@@ -25,6 +28,6 @@ impl buck_session_file::Model {
             blob_id,
             uploaded_at: None,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }

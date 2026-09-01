@@ -185,13 +185,19 @@ impl RepoHandler for MonoRepo {
                     &commit.message,
                 );
 
-                let new_mega_ref = mega_refs::Model::new(
+                let new_mega_ref = match mega_refs::Model::new(
                     &self.path,
                     root_ref.ref_name.clone(),
                     c.id.to_string(),
                     c.tree_id.to_string(),
                     false,
-                );
+                ) {
+                    Ok(new_ref) => new_ref,
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to allocate monorepo ref ID");
+                        return (ZERO_ID.to_string(), vec![]);
+                    }
+                };
 
                 storage
                     .mega_head_hash_with_txn(new_mega_ref.clone(), c)
@@ -1068,7 +1074,7 @@ impl MonoRepo {
                 chain.tip.id.to_string(),
                 chain.tip.tree_id.to_string(),
                 true,
-            );
+            )?;
             storage.save_refs(new_ref, txn).await?;
         }
         Ok(())
@@ -1553,7 +1559,10 @@ mod tests {
             },
         ])
         .expect("build nested tree");
-        let nested_model = nested.clone().into_mega_model(EntryMeta::default());
+        let nested_model = nested
+            .clone()
+            .into_mega_model(EntryMeta::default())
+            .expect("test ID generator initialized");
         mega_tree::Entity::insert(nested_model.into_active_model())
             .exec(storage.mono_storage().get_connection())
             .await
@@ -1654,7 +1663,10 @@ mod tests {
         // unrelated commit — resolve fail-closes on "tip not in pack".
         let tip = test_commit("the ref update target");
         let other = test_commit("unrelated pack content");
-        let model: mega_commit::Model = tip.clone().into_mega_model(EntryMeta::default());
+        let model: mega_commit::Model = tip
+            .clone()
+            .into_mega_model(EntryMeta::default())
+            .expect("test ID generator initialized");
         mega_commit::Entity::insert(model.into_active_model())
             .exec(storage.mono_storage().get_connection())
             .await
@@ -1745,7 +1757,7 @@ mod tests {
 
     fn mc04_commit_row(n: u64, parents: &[u64]) -> mega_commit::Model {
         mega_commit::Model {
-            id: crate::callisto::entity_ext::generate_id(),
+            id: crate::callisto::entity_ext::generate_id().expect("test ID generator initialized"),
             commit_id: mc04_sha(n),
             tree: MC04_TREE.to_string(),
             parents_id: serde_json::json!(parents.iter().map(|p| mc04_sha(*p)).collect::<Vec<_>>()),
@@ -1773,7 +1785,8 @@ mod tests {
         // Seed the shared empty tree and the chain t0 ← t1 ← t2.
         mega_tree::Entity::insert(
             mega_tree::Model {
-                id: crate::callisto::entity_ext::generate_id(),
+                id: crate::callisto::entity_ext::generate_id()
+                    .expect("test ID generator initialized"),
                 tree_id: MC04_TREE.to_string(),
                 sub_trees: Vec::new(),
                 size: 0,
@@ -1872,7 +1885,8 @@ mod tests {
         let mono_storage = storage.mono_storage();
         mega_tree::Entity::insert(
             mega_tree::Model {
-                id: crate::callisto::entity_ext::generate_id(),
+                id: crate::callisto::entity_ext::generate_id()
+                    .expect("test ID generator initialized"),
                 tree_id: MC04_TREE.to_string(),
                 sub_trees: Vec::new(),
                 size: 0,

@@ -1,9 +1,12 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::generate_id,
-    mega_code_review_position::{self, Column, Entity},
-    sea_orm_active_enums::{DiffSideEnum, PositionStatusEnum},
+use crate::{
+    callisto::{
+        entity_ext::generate_id,
+        mega_code_review_position::{self, Column, Entity},
+        sea_orm_active_enums::{DiffSideEnum, PositionStatusEnum},
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -31,11 +34,11 @@ impl mega_code_review_position::Model {
         line_number: i32,
         confidence: i32,
         position_status: PositionStatusEnum,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             anchor_id,
             commit_sha: commit_sha.to_owned(),
             file_path: file_path.to_owned(),
@@ -45,6 +48,6 @@ impl mega_code_review_position::Model {
             position_status,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 }

@@ -56,7 +56,7 @@ impl CodeReviewCommentStorage {
         content: Option<String>,
     ) -> Result<mega_code_review_comment::Model, MegaError> {
         let comment =
-            mega_code_review_comment::Model::new(thread_id, parent_id, user_name, content);
+            mega_code_review_comment::Model::new(thread_id, parent_id, user_name, content)?;
         let active_comment = comment.into_active_model();
         let res = active_comment.insert(self.get_connection()).await?;
         Ok(res)

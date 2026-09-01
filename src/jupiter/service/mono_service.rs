@@ -55,10 +55,10 @@ impl MonoService {
             return Ok(());
         }
         let txn = self.mono_storage.get_connection().begin().await?;
-        let converter = MegaModelConverter::init(mono_config);
+        let converter = MegaModelConverter::init(mono_config)?;
         let commit = converter
             .commit
-            .into_mega_model(EntryMeta::default())
+            .into_mega_model(EntryMeta::default())?
             .into_active_model();
 
         self.mono_storage
@@ -101,7 +101,7 @@ impl MonoService {
                 async move {
                     let raw_obj = process_entry(entry.inner);
 
-                    let model = raw_obj.convert_to_mega_model(entry.meta);
+                    let model = raw_obj.convert_to_mega_model(entry.meta)?;
                     match model {
                         MegaObjectModel::Commit(commit) => git_objects
                             .lock()
@@ -168,6 +168,8 @@ impl MonoService {
         let mega_blobs: Vec<mega_blob::ActiveModel> = blobs
             .iter()
             .map(|b| (*b).clone().into_mega_model(EntryMeta::default()))
+            .collect::<Result<Vec<mega_blob::Model>, MegaError>>()?
+            .into_iter()
             .map(|mut m: mega_blob::Model| {
                 m.commit_id = commit_id.to_owned();
                 m.into_active_model()

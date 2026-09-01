@@ -1,8 +1,11 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::generate_id,
-    label::{self, Entity},
+use crate::{
+    callisto::{
+        entity_ext::generate_id,
+        label::{self, Entity},
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -19,15 +22,15 @@ impl RelationTrait for Relation {
 }
 
 impl label::Model {
-    pub fn new(name: &str, color: &str, description: &str) -> Self {
+    pub fn new(name: &str, color: &str, description: &str) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             created_at: now,
             updated_at: now,
             name: name.to_owned(),
             color: color.to_owned(),
             description: description.to_owned(),
-        }
+        })
     }
 }

@@ -15,7 +15,9 @@ use crate::{
         vault::integration::vault_core::{VaultCore, with_audit_caller},
     },
     jupiter::{
-        redis::{ConnectionManager, claim_snowflake_worker, init_connection_lazy},
+        redis::{
+            ConnectionManager, SnowflakeWorkerLease, claim_snowflake_worker, init_connection_lazy,
+        },
         storage::init::database_connection_without_id_generator,
         utils::id_generator,
     },
@@ -39,6 +41,11 @@ pub struct AppContext {
     pub config_handle: ConfigHandle,
 
     pub connection: ConnectionManager,
+
+    /// The process-owned Redis worker lease, when worker selection used Redis.
+    /// Keeping the guard in the context makes refresh lifetime and shutdown
+    /// explicit instead of leaving a detached task behind.
+    pub(crate) worker_lease: Option<SnowflakeWorkerLease>,
 
     /// Token to signal shutdown for notification background tasks (dispatcher etc.).
     /// Created in new() ; callers (e.g. services) can clone and cancel on graceful exit.
@@ -88,20 +95,39 @@ impl AppContext {
         // the legacy fixed worker ID.
         let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
         let connection = init_connection_lazy(&redis_config)?;
-        if id_generator::env_worker_id_is_valid() {
+        let worker_lease = if id_generator::env_worker_id_is_valid() {
+            let (worker_id, source) = id_generator::resolve_worker_id();
+            id_generator::initialize_worker(worker_id, source, None)?;
             tracing::info!(
                 source = ?id_generator::WorkerIdSource::Env,
                 "valid MEGA_ID_GENERATOR_WORKER_ID set; skipping Redis worker slot claim"
             );
-        } else if let Some(worker_id) = claim_snowflake_worker(&connection).await
-            && !id_generator::claim_worker_id(worker_id)
-        {
-            tracing::warn!(
+            None
+        } else if let Some(lease) = claim_snowflake_worker(&connection).await? {
+            let worker_id = lease.worker_id();
+            let health = lease.health();
+            if let Err(error) = id_generator::initialize_worker(
                 worker_id,
-                "Snowflake worker slot was claimed but the process already selected a worker ID"
+                id_generator::WorkerIdSource::Redis,
+                Some(health),
+            ) {
+                let _ = lease.shutdown().await;
+                return Err(error);
+            }
+            lease.start_refresh();
+            Some(lease)
+        } else {
+            let identity = id_generator::process_identity();
+            let worker_id = id_generator::hash_worker_id(&identity);
+            id_generator::initialize_worker(worker_id, id_generator::WorkerIdSource::Hash, None)?;
+            tracing::error!(
+                worker_id,
+                source = ?id_generator::WorkerIdSource::Hash,
+                process_identity = %id_generator::identity_digest(&identity),
+                "Redis worker lease unavailable; ID writes remain disabled until an exclusive worker ID is configured"
             );
-        }
-        id_generator::ensure_initialized();
+            None
+        };
 
         // Resolve any `vault://` SecretRef object-storage credentials post-vault,
         // then build the concrete object store from the resolved config.
@@ -244,6 +270,7 @@ impl AppContext {
             config,
             config_handle,
             connection,
+            worker_lease,
             notification_shutdown,
             entity_store,
         })
@@ -257,6 +284,15 @@ impl AppContext {
 
     pub fn wrapped_context(&self) -> Arc<Self> {
         Arc::new(self.clone())
+    }
+
+    /// Stop background work and release the Redis worker lease, if any.
+    pub async fn shutdown(&self) -> Result<(), MegaError> {
+        self.notification_shutdown.cancel();
+        if let Some(lease) = &self.worker_lease {
+            lease.shutdown().await?;
+        }
+        Ok(())
     }
 }
 

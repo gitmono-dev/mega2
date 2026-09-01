@@ -51,7 +51,7 @@ impl GpgStorage {
             .map(|days| created_at + Duration::days(i64::from(days)));
 
         let key = gpg_key::Model {
-            id: generate_id(),
+            id: generate_id()?,
             user_id,
             key_id,
             public_key: gpg_content,
@@ -181,7 +181,7 @@ mod tests {
         expires_at: Option<chrono::NaiveDateTime>,
     ) {
         gpg_key::ActiveModel {
-            id: Set(generate_id()),
+            id: Set(generate_id().expect("test ID generator initialized")),
             user_id: Set("expiry-user".to_string()),
             key_id: Set(fingerprint[..16].to_string()),
             public_key: Set("unused-for-expiry-test".to_string()),

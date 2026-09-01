@@ -59,7 +59,7 @@ impl ImportService {
                 let git_objects = git_objects.clone();
                 async move {
                     let raw_obj = process_entry(entry.inner);
-                    let model = raw_obj.convert_to_git_model(entry.meta);
+                    let model = raw_obj.convert_to_git_model(entry.meta)?;
 
                     match model {
                         GitObjectModel::Commit(mut commit) => {

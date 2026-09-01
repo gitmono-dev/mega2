@@ -343,7 +343,7 @@ impl RepoHandler for ImportRepo {
         match refs.command_type {
             CommandType::Create => {
                 storage
-                    .save_ref(self.repo.repo_id, refs.clone().into())
+                    .save_ref(self.repo.repo_id, refs.clone().into_import_ref()?)
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?;
             }
@@ -521,7 +521,7 @@ impl ImportRepo {
         match cmd.command_type {
             CommandType::Create => {
                 git_db
-                    .save_ref_in_txn(self.repo.repo_id, cmd.clone().into(), txn)
+                    .save_ref_in_txn(self.repo.repo_id, cmd.clone().into_import_ref()?, txn)
                     .await
             }
             CommandType::Delete => {
@@ -674,7 +674,11 @@ impl ImportRepo {
                     match cmd.command_type {
                         CommandType::Create => {
                             git_db
-                                .save_ref_in_txn(self.repo.repo_id, cmd.clone().into(), &txn)
+                                .save_ref_in_txn(
+                                    self.repo.repo_id,
+                                    cmd.clone().into_import_ref()?,
+                                    &txn,
+                                )
                                 .await
                         }
                         CommandType::Delete => {
@@ -999,7 +1003,10 @@ mod tests {
             },
         ])
         .unwrap();
-        let mut nested_model = nested.clone().into_git_model(EntryMeta::default());
+        let mut nested_model = nested
+            .clone()
+            .into_git_model(EntryMeta::default())
+            .expect("test ID generator initialized");
         nested_model.repo_id = repo_id;
         git_tree::Entity::insert(nested_model.into_active_model())
             .exec(storage.get_connection())

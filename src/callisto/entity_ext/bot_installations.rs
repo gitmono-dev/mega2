@@ -1,9 +1,12 @@
 use chrono::Utc;
 
-use crate::callisto::{
-    bot_installations,
-    entity_ext::generate_id,
-    sea_orm_active_enums::{InstallationBotStatusEnum, InstallationTargetTypeEnum},
+use crate::{
+    callisto::{
+        bot_installations,
+        entity_ext::generate_id,
+        sea_orm_active_enums::{InstallationBotStatusEnum, InstallationTargetTypeEnum},
+    },
+    common::errors::MegaError,
 };
 
 impl bot_installations::Model {
@@ -13,17 +16,17 @@ impl bot_installations::Model {
         target_id: i64,
         status: InstallationBotStatusEnum,
         installed_by: i64,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = Utc::now().into();
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             bot_id,
             target_type,
             target_id,
             status,
             installed_by,
             installed_at: now,
-        }
+        })
     }
 }

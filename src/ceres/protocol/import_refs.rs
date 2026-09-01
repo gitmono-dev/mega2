@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     callisto::{import_refs, mega_refs, sea_orm_active_enums::RefTypeEnum},
-    common::utils::{MEGA_BRANCH_NAME, ZERO_ID, generate_id},
+    common::{
+        errors::MegaError,
+        utils::{MEGA_BRANCH_NAME, ZERO_ID, generate_id},
+    },
 };
 
 ///
@@ -110,32 +113,30 @@ impl RefCommand {
     }
 }
 
-impl From<RefCommand> for import_refs::Model {
-    fn from(value: RefCommand) -> Self {
-        import_refs::Model {
-            id: generate_id(),
+impl RefCommand {
+    pub fn into_import_ref(self) -> Result<import_refs::Model, MegaError> {
+        Ok(import_refs::Model {
+            id: generate_id()?,
             repo_id: 0,
-            ref_name: value.ref_name,
-            ref_git_id: value.new_id,
-            ref_type: value.ref_type,
-            default_branch: value.default_branch,
+            ref_name: self.ref_name,
+            ref_git_id: self.new_id,
+            ref_type: self.ref_type,
+            default_branch: self.default_branch,
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
-}
 
-impl From<RefCommand> for mega_refs::Model {
-    fn from(value: RefCommand) -> Self {
-        mega_refs::Model {
-            id: generate_id(),
+    pub fn into_mega_ref(self) -> Result<mega_refs::Model, MegaError> {
+        Ok(mega_refs::Model {
+            id: generate_id()?,
             path: String::new(),
-            ref_name: value.ref_name,
-            ref_commit_hash: value.new_id,
+            ref_name: self.ref_name,
+            ref_commit_hash: self.new_id,
             ref_tree_hash: String::new(),
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
             is_cl: false,
-        }
+        })
     }
 }

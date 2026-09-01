@@ -37,7 +37,7 @@ impl UserStorage {
         finger: &str,
     ) -> Result<(), MegaError> {
         let model = ssh_keys::Model {
-            id: generate_id(),
+            id: generate_id()?,
             username,
             title: title.to_owned(),
             ssh_key: ssh_key.to_owned(),
@@ -83,7 +83,7 @@ impl UserStorage {
     pub async fn generate_token(&self, username: String) -> Result<String, MegaError> {
         let token_str = Uuid::new_v4().to_string();
         let model = access_token::Model {
-            id: generate_id(),
+            id: generate_id()?,
             username,
             token: token_str.clone(),
             created_at: chrono::Utc::now().naive_utc(),

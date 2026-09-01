@@ -27,7 +27,7 @@ impl Repo {
                 ProtocolError::InvalidInput("repository path has no valid name".to_owned())
             })?;
         Ok(Self {
-            repo_id: generate_id(),
+            repo_id: generate_id()?,
             repo_path,
             repo_name,
             is_monorepo,

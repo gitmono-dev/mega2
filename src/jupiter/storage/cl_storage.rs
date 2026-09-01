@@ -273,7 +273,7 @@ impl ClStorage {
             from_hash.to_owned(),
             to_hash.to_owned(),
             username.to_owned(),
-        );
+        )?;
         let res = model.into_active_model().insert(txn).await?;
         Ok(res)
     }
@@ -297,7 +297,7 @@ impl ClStorage {
             from_hash.to_owned(),
             to_hash.to_owned(),
             username.to_owned(),
-        );
+        )?;
         let res = model
             .into_active_model()
             .insert(self.get_connection())
@@ -322,7 +322,7 @@ impl ClStorage {
             base_branch.to_owned(),
             from_hash.to_owned(),
             username.to_owned(),
-        );
+        )?;
         let res = model
             .into_active_model()
             .insert(self.get_connection())
@@ -935,7 +935,7 @@ mod tests {
 
     fn mc04_commit_row(commit_sha: &str, parents: &[String]) -> mega_commit::Model {
         mega_commit::Model {
-            id: crate::callisto::entity_ext::generate_id(),
+            id: crate::callisto::entity_ext::generate_id().expect("test ID generator initialized"),
             commit_id: commit_sha.to_string(),
             tree: mc04_sha(900_000),
             parents_id: serde_json::json!(parents),

@@ -1,9 +1,12 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::generate_id,
-    mega_conversation::{self, Column, Entity},
-    sea_orm_active_enums::ConvTypeEnum,
+use crate::{
+    callisto::{
+        entity_ext::generate_id,
+        mega_conversation::{self, Column, Entity},
+        sea_orm_active_enums::ConvTypeEnum,
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -45,7 +48,7 @@ impl mega_conversation::Model {
         conv_type: ConvTypeEnum,
         comment: Option<String>,
         username: &str,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
         let resolved = if conv_type == ConvTypeEnum::Review {
             Some(false)
@@ -53,8 +56,8 @@ impl mega_conversation::Model {
             None
         };
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             link: link.to_owned(),
             conv_type,
             comment,
@@ -62,6 +65,6 @@ impl mega_conversation::Model {
             updated_at: now,
             username: username.to_owned(),
             resolved,
-        }
+        })
     }
 }

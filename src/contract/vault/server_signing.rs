@@ -651,7 +651,8 @@ mod tests {
         use crate::jupiter::utils::converter::IntoMegaModel;
         let model = signed
             .clone()
-            .into_mega_model(git_internal::internal::metadata::EntryMeta::default());
+            .into_mega_model(git_internal::internal::metadata::EntryMeta::default())
+            .expect("test ID generator initialized");
 
         // Rotate: a new generation becomes active; the old one is history.
         let second = vault
@@ -779,7 +780,8 @@ mod tests {
         use crate::jupiter::utils::converter::IntoMegaModel;
         let model = signed
             .clone()
-            .into_mega_model(git_internal::internal::metadata::EntryMeta::default());
+            .into_mega_model(git_internal::internal::metadata::EntryMeta::default())
+            .expect("test ID generator initialized");
         assert_eq!(model.commit_id, signed.id.to_string());
         assert_eq!(
             model.author.as_deref(),

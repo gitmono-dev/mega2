@@ -201,11 +201,11 @@ impl BuckCommitBuilder {
             .iter()
             .map(|t| {
                 let mut model: crate::callisto::mega_tree::Model =
-                    t.clone().into_mega_model(EntryMeta::default());
+                    t.clone().into_mega_model(EntryMeta::default())?;
                 model.commit_id = commit.id.to_string();
-                model
+                Ok(model)
             })
-            .collect();
+            .collect::<Result<_, MegaError>>()?;
 
         Ok(CommitBuildResult {
             commit_id: commit.id.to_string(),

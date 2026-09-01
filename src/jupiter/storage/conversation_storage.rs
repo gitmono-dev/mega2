@@ -33,7 +33,7 @@ impl ConversationStorage {
         comment: Option<String>,
         conv_type: ConvTypeEnum,
     ) -> Result<i64, MegaError> {
-        let conversation = mega_conversation::Model::new(link, conv_type, comment, username);
+        let conversation = mega_conversation::Model::new(link, conv_type, comment, username)?;
         let conversation = conversation.into_active_model();
         let res = conversation.insert(self.get_connection()).await.unwrap();
         Ok(res.id)
@@ -72,7 +72,7 @@ impl ConversationStorage {
         subject_type: &str,
         username: &str,
     ) -> Result<reactions::Model, MegaError> {
-        let reactions = reactions::Model::new(content, subject_id, subject_type, username);
+        let reactions = reactions::Model::new(content, subject_id, subject_type, username)?;
         let a_model = reactions.into_active_model();
         let res = a_model.insert(self.get_connection()).await?;
         Ok(res)

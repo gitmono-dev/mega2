@@ -1,9 +1,12 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::generate_id,
-    mega_cl::{self, Entity},
-    sea_orm_active_enums::MergeStatusEnum,
+use crate::{
+    callisto::{
+        entity_ext::generate_id,
+        mega_cl::{self, Entity},
+        sea_orm_active_enums::MergeStatusEnum,
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -60,10 +63,10 @@ impl mega_cl::Model {
         from_hash: String,
         to_hash: String,
         username: String,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             link,
             title: title.to_owned(),
             status: MergeStatusEnum::Open,
@@ -75,7 +78,7 @@ impl mega_cl::Model {
             from_hash,
             to_hash,
             username,
-        }
+        })
     }
 
     /// Create a new CL with Draft status
@@ -86,10 +89,10 @@ impl mega_cl::Model {
         base_branch: String,
         from_hash: String,
         username: String,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             link,
             title: title.to_owned(),
             status: MergeStatusEnum::Draft,
@@ -101,6 +104,6 @@ impl mega_cl::Model {
             from_hash,
             to_hash: String::new(),
             username,
-        }
+        })
     }
 }

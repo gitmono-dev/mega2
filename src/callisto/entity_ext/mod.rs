@@ -19,7 +19,9 @@ pub mod reactions;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 
-pub fn generate_id() -> i64 {
+use crate::common::errors::MegaError;
+
+pub fn generate_id() -> Result<i64, MegaError> {
     // Call `next_id` to generate a new unique id.
     crate::jupiter::utils::id_generator::next_id()
 }

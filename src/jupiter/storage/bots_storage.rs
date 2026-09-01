@@ -135,7 +135,7 @@ impl BotsStorage {
             target_id,
             InstallationBotStatusEnum::Enabled,
             installed_by,
-        );
+        )?;
 
         let active_model = model.into_active_model();
 
@@ -201,7 +201,7 @@ impl BotsStorage {
             creator_user_id,
             permission_scope,
             status,
-        );
+        )?;
         let res = model
             .into_active_model()
             .insert(self.get_connection())
@@ -216,7 +216,7 @@ impl BotsStorage {
         private_key: String,
         public_key: String,
     ) -> Result<bot_keys::Model, MegaError> {
-        let model = bot_keys::Model::new(bot_id, private_key, public_key);
+        let model = bot_keys::Model::new(bot_id, private_key, public_key)?;
 
         let res = model
             .into_active_model()
@@ -249,7 +249,7 @@ impl BotsStorage {
         let token_hash = compute_bot_token_hash(token_body, &hmac_key);
 
         let active = bot_tokens::ActiveModel {
-            id: Set(crate::jupiter::utils::id_generator::next_id()),
+            id: Set(crate::jupiter::utils::id_generator::next_id()?),
             bot_id: Set(bot_id),
             token_hash: Set(token_hash),
             token_name: Set(token_name.to_owned()),

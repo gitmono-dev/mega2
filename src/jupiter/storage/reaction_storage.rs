@@ -33,7 +33,7 @@ impl ReactionStorage {
     ) -> Result<reactions::Model, MegaError> {
         let now = Utc::now().naive_utc();
         let active_model = reactions::ActiveModel {
-            id: Set(crate::jupiter::utils::id_generator::next_id()),
+            id: Set(crate::jupiter::utils::id_generator::next_id()?),
             public_id: Set(public_id),
             content: Set(content),
             subject_type: Set(subject_type),

@@ -119,7 +119,7 @@ impl BuckStorage {
             repo_path.to_string(),
             Some(from_hash.to_string()),
             expires_at.naive_utc(),
-        );
+        )?;
         let res = model
             .into_active_model()
             .insert(self.get_connection())
@@ -285,10 +285,10 @@ impl BuckStorage {
                     record.upload_status,
                     record.upload_reason,
                     record.blob_id,
-                );
-                model.into_active_model()
+                )?;
+                Ok::<_, MegaError>(model.into_active_model())
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Use ON CONFLICT DO NOTHING to ensure idempotency
         // This allows safe retries: already-inserted records are silently skipped

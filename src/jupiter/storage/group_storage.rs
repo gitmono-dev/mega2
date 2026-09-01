@@ -34,7 +34,7 @@ impl GroupStorage {
         payload: CreateGroupPayload,
     ) -> Result<mega_group::Model, MegaError> {
         let CreateGroupPayload { name, description } = payload;
-        let group_id = generate_id();
+        let group_id = generate_id()?;
         let now = chrono::Utc::now().naive_utc();
         let group = mega_group::ActiveModel {
             id: Set(group_id),
@@ -154,13 +154,16 @@ impl GroupStorage {
         let now = chrono::Utc::now().naive_utc();
         let models = usernames
             .iter()
-            .map(|username| mega_group_member::ActiveModel {
-                id: Set(generate_id()),
-                group_id: Set(group_id),
-                username: Set(username.clone()),
-                joined_at: Set(now),
+            .map(|username| {
+                Ok::<_, String>(mega_group_member::ActiveModel {
+                    id: Set(generate_id().map_err(|error| error.to_string())?),
+                    group_id: Set(group_id),
+                    username: Set(username.clone()),
+                    joined_at: Set(now),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(MegaError::Other)?;
 
         let on_conflict = OnConflict::columns([
             mega_group_member::Column::GroupId,

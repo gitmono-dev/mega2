@@ -84,7 +84,7 @@ impl MergeQueueStorage {
 
         // Create new queue item
         let new_item = ActiveModel {
-            id: Set(crate::common::utils::generate_id()),
+            id: Set(crate::common::utils::generate_id().map_err(|error| error.to_string())?),
             cl_link: Set(cl_link),
             status: Set(QueueStatusEnum::Waiting),
             position: Set(position),

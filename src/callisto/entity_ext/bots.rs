@@ -1,9 +1,12 @@
 use chrono::Utc;
 
-use crate::callisto::{
-    bots,
-    entity_ext::generate_id,
-    sea_orm_active_enums::{BotStatusEnum, PermissionScopeEnum},
+use crate::{
+    callisto::{
+        bots,
+        entity_ext::generate_id,
+        sea_orm_active_enums::{BotStatusEnum, PermissionScopeEnum},
+    },
+    common::errors::MegaError,
 };
 
 impl bots::Model {
@@ -13,11 +16,11 @@ impl bots::Model {
         creator_user_id: i64,
         permission_scope: PermissionScopeEnum,
         status: BotStatusEnum,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = Utc::now().into();
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             name,
             organization_id,
             creator_user_id,
@@ -25,6 +28,6 @@ impl bots::Model {
             status,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 }

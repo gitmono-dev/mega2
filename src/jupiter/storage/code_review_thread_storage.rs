@@ -217,7 +217,7 @@ impl CodeReviewThreadStorage {
         let txn = self.get_connection().begin().await?;
 
         // Insert thread
-        let new_thread = mega_code_review_thread::Model::new(link, ThreadStatusEnum::Open);
+        let new_thread = mega_code_review_thread::Model::new(link, ThreadStatusEnum::Open)?;
         let thread = new_thread.into_active_model().insert(&txn).await?;
 
         // Insert anchor
@@ -230,7 +230,7 @@ impl CodeReviewThreadStorage {
             normalized_content,
             context_before,
             context_after,
-        );
+        )?;
         let anchor = new_anchor.into_active_model().insert(&txn).await?;
 
         // Insert position
@@ -242,7 +242,7 @@ impl CodeReviewThreadStorage {
             original_line_number,
             100,
             PositionStatusEnum::Exact,
-        );
+        )?;
         let position = new_position.into_active_model().insert(&txn).await?;
 
         // Commit transaction

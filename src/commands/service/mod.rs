@@ -70,7 +70,15 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         );
     }
 
-    result
+    let shutdown_result = context.shutdown().await;
+    if result.is_err() {
+        if let Err(error) = shutdown_result {
+            tracing::warn!(error = %error, "failed to release background resources after service error");
+        }
+        result
+    } else {
+        shutdown_result
+    }
 }
 
 struct ConfigReloadWatcherTask {

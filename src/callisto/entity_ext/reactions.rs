@@ -1,8 +1,11 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::{generate_id, generate_public_id},
-    reactions::{self, Entity},
+use crate::{
+    callisto::{
+        entity_ext::{generate_id, generate_public_id},
+        reactions::{self, Entity},
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -33,10 +36,10 @@ impl reactions::Model {
         subject_id: i64,
         subject_type: &str,
         username: &str,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             created_at: now,
             updated_at: now,
             public_id: generate_public_id(),
@@ -46,6 +49,6 @@ impl reactions::Model {
             username: username.to_owned(),
             custom_reaction_id: None,
             discarded_at: None,
-        }
+        })
     }
 }

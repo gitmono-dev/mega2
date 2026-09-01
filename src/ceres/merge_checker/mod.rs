@@ -219,7 +219,7 @@ impl CheckerRegistry {
                     res.check_type_code.into(),
                     &res.status.to_string(),
                     &res.message,
-                );
+                )?;
                 save_models.push(model);
             }
         }

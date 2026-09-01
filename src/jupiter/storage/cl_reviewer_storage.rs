@@ -21,17 +21,21 @@ impl Deref for ClReviewerStorage {
 }
 
 impl ClReviewerStorage {
-    pub fn new_reviewer(&self, cl_link: &str, username: &str) -> mega_cl_reviewer::Model {
+    pub fn new_reviewer(
+        &self,
+        cl_link: &str,
+        username: &str,
+    ) -> Result<mega_cl_reviewer::Model, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        mega_cl_reviewer::Model {
-            id: generate_id(),
+        Ok(mega_cl_reviewer::Model {
+            id: generate_id()?,
             cl_link: cl_link.to_string(),
             approved: false,
             username: username.to_string(),
             created_at: now,
             updated_at: now,
             system_required: false,
-        }
+        })
     }
 
     pub async fn add_reviewers(
@@ -40,7 +44,7 @@ impl ClReviewerStorage {
         reviewers: Vec<String>,
     ) -> Result<(), MegaError> {
         for reviewer in reviewers {
-            let new_reviewer = self.new_reviewer(cl_link, &reviewer);
+            let new_reviewer = self.new_reviewer(cl_link, &reviewer)?;
             let a_model: mega_cl_reviewer::ActiveModel = new_reviewer.into_active_model();
             a_model.insert(self.get_connection()).await.map_err(|e| {
                 tracing::error!("{}", e);

@@ -1073,7 +1073,7 @@ mod mc05_tests {
 
     fn mc05_commit_row(n: u64, parents: &[u64]) -> mega_commit::Model {
         mega_commit::Model {
-            id: crate::callisto::entity_ext::generate_id(),
+            id: crate::callisto::entity_ext::generate_id().expect("test ID generator initialized"),
             commit_id: mc05_sha(n),
             tree: mc05_sha(900_000),
             parents_id: serde_json::json!(parents.iter().map(|p| mc05_sha(*p)).collect::<Vec<_>>()),

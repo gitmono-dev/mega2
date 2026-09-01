@@ -7,15 +7,16 @@ use url::Url;
 use crate::{
     common::errors::MegaError,
     config::{DbConfig, redaction::redact_db_url, validate::validate_database_config},
-    jupiter::{migration::apply_migrations, utils::id_generator},
+    jupiter::migration::apply_migrations,
 };
 
 /// Create a PostgreSQL database connection.
 ///
 /// After a successful connection, applies any pending database migrations.
+/// Worker ID selection is intentionally owned by the application bootstrap;
+/// this low-level helper must not initialize an ID generator before Redis
+/// lease selection has completed.
 pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
-    id_generator::ensure_initialized();
-
     database_connection_without_id_generator(db_config).await
 }
 
@@ -23,9 +24,7 @@ pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnect
 /// generator.
 ///
 /// Production bootstrap uses this deferred variant while it resolves Redis
-/// credentials and claims the worker lease. Keeping the existing
-/// database_connection wrapper preserves the initialization behavior for
-/// callers that do not have the application bootstrap context.
+/// credentials and claims the worker lease.
 pub async fn database_connection_without_id_generator(
     db_config: &DbConfig,
 ) -> Result<DatabaseConnection, MegaError> {

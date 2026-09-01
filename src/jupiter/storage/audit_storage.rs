@@ -40,7 +40,7 @@ impl AuditStorage {
     ) -> Result<audit_logs::Model, MegaError> {
         let created_at: DateTimeWithTimeZone = Utc::now().into();
         let model = audit_logs::ActiveModel {
-            id: Set(crate::jupiter::utils::id_generator::next_id()),
+            id: Set(crate::jupiter::utils::id_generator::next_id()?),
             actor_id: Set(actor_id),
             actor_type: Set(actor_type),
             action: Set(action),

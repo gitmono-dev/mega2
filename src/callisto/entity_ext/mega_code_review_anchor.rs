@@ -1,9 +1,12 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::{generate_hash_content, generate_id, normalize},
-    mega_code_review_anchor::{self, Column, Entity},
-    sea_orm_active_enums::DiffSideEnum,
+use crate::{
+    callisto::{
+        entity_ext::{generate_hash_content, generate_id, normalize},
+        mega_code_review_anchor::{self, Column, Entity},
+        sea_orm_active_enums::DiffSideEnum,
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -39,11 +42,11 @@ impl mega_code_review_anchor::Model {
         normalized_content: &str,
         context_before: &str,
         context_after: &str,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             thread_id,
             file_path: file_path.to_owned(),
             diff_side: diff_side.to_owned(),
@@ -56,6 +59,6 @@ impl mega_code_review_anchor::Model {
             context_after: context_after.to_owned(),
             context_after_hash: generate_hash_content(&normalize(context_after)),
             created_at: now,
-        }
+        })
     }
 }

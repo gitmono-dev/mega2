@@ -891,12 +891,12 @@ impl ApiHandler for MonoApiService {
         all_trees.extend(update_result.updated_trees);
         let save_trees: Vec<mega_tree::ActiveModel> = all_trees
             .into_iter()
-            .map(|save_t| {
-                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+            .map(|save_t| -> Result<mega_tree::ActiveModel, GitError> {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new())?;
                 tree_model.commit_id.clone_from(&new_commit_id);
-                tree_model.into()
+                Ok(tree_model.into())
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         self.storage
             .mono_service
@@ -1008,12 +1008,12 @@ impl ApiHandler for MonoApiService {
         all_trees.append(&mut save_trees);
         let save_trees: Vec<mega_tree::ActiveModel> = all_trees
             .into_iter()
-            .map(|save_t| {
-                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+            .map(|save_t| -> Result<mega_tree::ActiveModel, GitError> {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new())?;
                 tree_model.commit_id.clone_from(&new_commit_id);
-                tree_model.into()
+                Ok(tree_model.into())
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         self.storage
             .mono_service
             .save_blobs(&new_commit_id, vec![blob])
@@ -1913,7 +1913,7 @@ impl MonoApiService {
             name.clone(),
             tagger_info.clone(),
             message.clone(),
-        );
+        )?;
 
         match mono_storage.insert_tag(tag_model).await {
             Ok(saved_tag) => {
@@ -1921,8 +1921,13 @@ impl MonoApiService {
                 let path_str = repo_path.unwrap_or_else(|| "/".to_string());
                 // Resolve tree hash from target commit so ref metadata is complete
                 let tree_hash = self.resolve_tree_hash_for_commit(&object_id).await?;
-                let refs =
-                    mega_refs::Model::new(&path_str, full_ref.clone(), object_id, tree_hash, false);
+                let refs = mega_refs::Model::new(
+                    &path_str,
+                    full_ref.clone(),
+                    object_id,
+                    tree_hash,
+                    false,
+                )?;
 
                 if let Err(e) = mono_storage.save_refs(refs, None).await {
                     // attempt to remove DB record
@@ -1974,7 +1979,7 @@ impl MonoApiService {
             object_id.clone(),
             tree_hash,
             false,
-        );
+        )?;
         mono_storage.save_refs(refs, None).await.map_err(|e| {
             tracing::error!("Failed to write lightweight tag ref: {}", e);
             GitError::CustomError("[code:500] Failed to write lightweight tag ref".to_string())
@@ -2079,9 +2084,9 @@ impl MonoApiService {
         name: String,
         tagger_info: String,
         message: Option<String>,
-    ) -> mega_tag::Model {
-        mega_tag::Model {
-            id: crate::common::utils::generate_id(),
+    ) -> Result<mega_tag::Model, GitError> {
+        Ok(mega_tag::Model {
+            id: crate::common::utils::generate_id()?,
             tag_id: tag_id_hex,
             object_id,
             object_type: "commit".to_string(),
@@ -2091,7 +2096,7 @@ impl MonoApiService {
             pack_id: String::new(),
             pack_offset: 0,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
     /// Merges a CL after checking for conflicts.
     /// This is the public API that includes conflict checking.
@@ -2707,12 +2712,12 @@ impl MonoApiService {
             .updated_trees
             .clone()
             .into_iter()
-            .map(|save_t| {
-                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+            .map(|save_t| -> Result<mega_tree::ActiveModel, GitError> {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new())?;
                 tree_model.commit_id.clone_from(&new_commit_id);
-                tree_model.into()
+                Ok(tree_model.into())
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         if let Err(e) = storage.batch_save_model(save_trees).await {
             self.storage.entity_store().mark_dirty();
@@ -2838,12 +2843,12 @@ impl MonoApiService {
             .updated_trees
             .clone()
             .into_iter()
-            .map(|save_t| {
-                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+            .map(|save_t| -> Result<mega_tree::ActiveModel, GitError> {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new())?;
                 tree_model.commit_id.clone_from(&new_commit_id);
-                tree_model.into()
+                Ok(tree_model.into())
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         Ok(PreparedClUpdate {
             commits,
@@ -4298,21 +4303,23 @@ impl MonoApiService {
         };
 
         // Convert to artifacts acceptable by BuckService
-        let artifacts = commit_result.map(|res| {
-            let commit_model: crate::callisto::mega_commit::ActiveModel = res
-                .commit
-                .clone()
-                .into_mega_model(git_internal::internal::metadata::EntryMeta::default())
-                .into();
-            let new_tree_models: Vec<crate::callisto::mega_tree::ActiveModel> =
-                res.new_tree_models.into_iter().map(|m| m.into()).collect();
-            CommitArtifacts {
-                commit_id: res.commit_id,
-                tree_hash: res.tree_hash,
-                new_tree_models,
-                commit_model,
-            }
-        });
+        let artifacts = commit_result
+            .map(|res| -> Result<CommitArtifacts, MegaError> {
+                let commit_model: crate::callisto::mega_commit::ActiveModel = res
+                    .commit
+                    .clone()
+                    .into_mega_model(git_internal::internal::metadata::EntryMeta::default())?
+                    .into();
+                let new_tree_models: Vec<crate::callisto::mega_tree::ActiveModel> =
+                    res.new_tree_models.into_iter().map(|m| m.into()).collect();
+                Ok(CommitArtifacts {
+                    commit_id: res.commit_id,
+                    tree_hash: res.tree_hash,
+                    new_tree_models,
+                    commit_model,
+                })
+            })
+            .transpose()?;
 
         let svc_resp: SvcCompleteResponse = self
             .storage
@@ -5999,7 +6006,8 @@ async fn insert_check_result(
     status: &str,
 ) {
     let model =
-        crate::callisto::check_result::Model::new("/", link, "deadbeef", check_type, status, "msg");
+        crate::callisto::check_result::Model::new("/", link, "deadbeef", check_type, status, "msg")
+            .expect("test ID generator initialized");
     storage
         .cl_storage()
         .save_check_results(vec![model])

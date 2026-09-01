@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::callisto::{entity_ext::generate_id, mega_refs};
+use crate::{
+    callisto::{entity_ext::generate_id, mega_refs},
+    common::errors::MegaError,
+};
 
 impl mega_refs::Model {
     pub fn new<P: AsRef<Path>>(
@@ -9,17 +12,22 @@ impl mega_refs::Model {
         ref_commit_hash: String,
         ref_tree_hash: String,
         is_cl: bool,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
-            path: path.as_ref().to_str().unwrap().to_string(),
+        let path = path
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| MegaError::Other("reference path is not valid UTF-8".to_string()))?
+            .to_string();
+        Ok(Self {
+            id: generate_id()?,
+            path,
             ref_name,
             ref_commit_hash,
             ref_tree_hash,
             created_at: now,
             updated_at: now,
             is_cl,
-        }
+        })
     }
 }

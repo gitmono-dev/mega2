@@ -764,7 +764,7 @@ impl ArtifactService {
             });
         }
 
-        id_generator::ensure_initialized();
+        id_generator::ensure_initialized()?;
 
         let conn = self.st.get_connection();
         let txn = conn.begin().await?;
@@ -776,7 +776,7 @@ impl ArtifactService {
         });
 
         let set_am = artifact_sets::ActiveModel {
-            id: Set(crate::jupiter::utils::id_generator::next_id()),
+            id: Set(crate::jupiter::utils::id_generator::next_id()?),
             repo: Set(repo.to_string()),
             namespace: Set(req.namespace.clone()),
             object_type: Set(object_type_label),

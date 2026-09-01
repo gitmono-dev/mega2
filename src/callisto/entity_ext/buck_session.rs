@@ -1,6 +1,9 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{buck_session, entity_ext::generate_id};
+use crate::{
+    callisto::{buck_session, entity_ext::generate_id},
+    common::errors::MegaError,
+};
 
 impl buck_session::Model {
     /// Create a new session model
@@ -10,10 +13,10 @@ impl buck_session::Model {
         repo_path: String,
         from_hash: Option<String>,
         expires_at: DateTime,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             session_id,
             user_id,
             repo_path,
@@ -23,6 +26,6 @@ impl buck_session::Model {
             expires_at,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 }

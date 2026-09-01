@@ -169,7 +169,7 @@ impl WebhookService {
                             Some(format!("webhook endpoint returned HTTP {status}"))
                         };
                         let delivery = crate::callisto::mega_webhook_delivery::Model {
-                            id: crate::jupiter::utils::id_generator::next_id(),
+                            id: crate::jupiter::utils::id_generator::next_id()?,
                             webhook_id: webhook.id,
                             event_type: event_type.clone(),
                             payload: payload_json.clone(),
@@ -194,7 +194,7 @@ impl WebhookService {
                     Err(e) => {
                         let error_message = e.to_string();
                         let delivery = crate::callisto::mega_webhook_delivery::Model {
-                            id: crate::jupiter::utils::id_generator::next_id(),
+                            id: crate::jupiter::utils::id_generator::next_id()?,
                             webhook_id: webhook.id,
                             event_type: event_type.clone(),
                             payload: payload_json.clone(),

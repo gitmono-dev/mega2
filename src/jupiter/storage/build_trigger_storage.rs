@@ -28,7 +28,7 @@ impl BuildTriggerStorage {
         let now = chrono::Utc::now().naive_utc();
 
         let trigger = build_triggers::ActiveModel {
-            id: ActiveValue::Set(crate::common::utils::generate_id()),
+            id: ActiveValue::Set(crate::common::utils::generate_id()?),
             trigger_type: ActiveValue::Set(trigger_type),
             trigger_source: ActiveValue::Set(trigger_source),
             trigger_payload: ActiveValue::Set(trigger_payload),

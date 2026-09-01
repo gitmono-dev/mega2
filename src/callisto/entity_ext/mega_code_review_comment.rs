@@ -1,8 +1,11 @@
 use sea_orm::entity::prelude::*;
 
-use crate::callisto::{
-    entity_ext::generate_id,
-    mega_code_review_comment::{self, Column, Entity},
+use crate::{
+    callisto::{
+        entity_ext::generate_id,
+        mega_code_review_comment::{self, Column, Entity},
+    },
+    common::errors::MegaError,
 };
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -27,17 +30,17 @@ impl mega_code_review_comment::Model {
         parent_id: Option<i64>,
         user_name: String,
         content: Option<String>,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
 
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             thread_id,
             parent_id,
             user_name,
             content,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 }

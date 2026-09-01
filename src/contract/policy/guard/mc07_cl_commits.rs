@@ -136,7 +136,8 @@ async fn seed_cl_with_listing(storage: &Storage) {
                 vec![mc07_sha(n - 1)]
             };
             mega_commit::Model {
-                id: crate::callisto::entity_ext::generate_id(),
+                id: crate::callisto::entity_ext::generate_id()
+                    .expect("test ID generator initialized"),
                 commit_id: mc07_sha(n),
                 tree: mc07_sha(900_000),
                 parents_id: serde_json::json!(parents),

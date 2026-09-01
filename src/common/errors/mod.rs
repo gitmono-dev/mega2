@@ -107,6 +107,8 @@ pub enum MegaError {
     ObjStorageInconsistent(String),
     #[error("Monorepo root ref changed concurrently (attach should retry)")]
     StaleMonorepoRootRef,
+    #[error("Snowflake ID generation is unavailable: {0}")]
+    IdGenerationUnavailable(String),
     #[error("Other error: {0}")]
     Other(String),
     /// Process exit with a frozen CLI status code (UN-29 authz-audit table).

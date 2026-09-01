@@ -1,4 +1,7 @@
-use crate::callisto::{check_result, entity_ext::generate_id, sea_orm_active_enums::CheckTypeEnum};
+use crate::{
+    callisto::{check_result, entity_ext::generate_id, sea_orm_active_enums::CheckTypeEnum},
+    common::errors::MegaError,
+};
 
 impl check_result::Model {
     pub fn new(
@@ -8,10 +11,10 @@ impl check_result::Model {
         check_type_code: CheckTypeEnum,
         status: &str,
         message: &str,
-    ) -> Self {
+    ) -> Result<Self, MegaError> {
         let now = chrono::Utc::now().naive_utc();
-        Self {
-            id: generate_id(),
+        Ok(Self {
+            id: generate_id()?,
             created_at: now,
             updated_at: now,
             path: path.to_owned(),
@@ -20,6 +23,6 @@ impl check_result::Model {
             check_type_code,
             status: status.to_owned(),
             message: message.to_owned(),
-        }
+        })
     }
 }

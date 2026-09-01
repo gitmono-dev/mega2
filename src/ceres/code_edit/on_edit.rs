@@ -43,7 +43,7 @@ impl crate::ceres::code_edit::model::CLRefUpdateVisitor for OneditVisitor {
             commit_hash.to_string(),
             tree_hash.to_string(),
             true,
-        );
+        )?;
         self.mono_storage.save_refs(cl_ref.clone(), None).await?;
         Ok(cl_ref)
     }

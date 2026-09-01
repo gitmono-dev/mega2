@@ -570,7 +570,7 @@ mod tests {
 
     fn mc04_commit_row(n: u64, parents: &[u64]) -> mega_commit::Model {
         mega_commit::Model {
-            id: crate::callisto::entity_ext::generate_id(),
+            id: crate::callisto::entity_ext::generate_id().expect("test ID generator initialized"),
             commit_id: mc04_sha(n),
             tree: MC04_TREE.to_string(),
             parents_id: serde_json::json!(parents.iter().map(|p| mc04_sha(*p)).collect::<Vec<_>>()),
@@ -599,7 +599,8 @@ mod tests {
         {
             mega_tree::Entity::insert(
                 mega_tree::Model {
-                    id: crate::callisto::entity_ext::generate_id(),
+                    id: crate::callisto::entity_ext::generate_id()
+                        .expect("test ID generator initialized"),
                     tree_id: MC04_TREE.to_string(),
                     sub_trees: Vec::new(),
                     size: 0,

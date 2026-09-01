@@ -22,7 +22,10 @@ use crate::{
         git_blob, git_commit, git_tag, git_tree, mega_blob, mega_commit, mega_refs, mega_tag,
         mega_tree,
     },
-    common::utils::{MEGA_BRANCH_NAME, generate_id},
+    common::{
+        errors::MegaError,
+        utils::{MEGA_BRANCH_NAME, generate_id},
+    },
     config::MonoConfig,
 };
 
@@ -58,12 +61,12 @@ fn commit_from_model(
 
 pub trait IntoMegaModel {
     type MegaTarget;
-    fn into_mega_model(self, ext_meta: EntryMeta) -> Self::MegaTarget;
+    fn into_mega_model(self, ext_meta: EntryMeta) -> Result<Self::MegaTarget, MegaError>;
 }
 
 pub trait IntoGitModel {
     type GitTarget;
-    fn into_git_model(self, ext_meta: EntryMeta) -> Self::GitTarget;
+    fn into_git_model(self, ext_meta: EntryMeta) -> Result<Self::GitTarget, MegaError>;
 }
 
 pub trait FromMegaModel {
@@ -100,29 +103,29 @@ pub enum MegaObjectModel {
 }
 
 impl GitObject {
-    pub fn convert_to_mega_model(self, meta: EntryMeta) -> MegaObjectModel {
+    pub fn convert_to_mega_model(self, meta: EntryMeta) -> Result<MegaObjectModel, MegaError> {
         match self {
-            GitObject::Commit(commit) => MegaObjectModel::Commit(commit.into_mega_model(meta)),
-            GitObject::Tree(tree) => MegaObjectModel::Tree(tree.into_mega_model(meta)),
+            GitObject::Commit(commit) => Ok(MegaObjectModel::Commit(commit.into_mega_model(meta)?)),
+            GitObject::Tree(tree) => Ok(MegaObjectModel::Tree(tree.into_mega_model(meta)?)),
             GitObject::Blob(blob) => {
                 let blob_data = blob.data.clone();
-                let mega_model = blob.into_mega_model(meta);
-                MegaObjectModel::Blob(mega_model, blob_data)
+                let mega_model = blob.into_mega_model(meta)?;
+                Ok(MegaObjectModel::Blob(mega_model, blob_data))
             }
-            GitObject::Tag(tag) => MegaObjectModel::Tag(tag.into_mega_model(meta)),
+            GitObject::Tag(tag) => Ok(MegaObjectModel::Tag(tag.into_mega_model(meta)?)),
         }
     }
 
-    pub fn convert_to_git_model(self, meta: EntryMeta) -> GitObjectModel {
+    pub fn convert_to_git_model(self, meta: EntryMeta) -> Result<GitObjectModel, MegaError> {
         match self {
-            GitObject::Commit(commit) => GitObjectModel::Commit(commit.into_git_model(meta)),
-            GitObject::Tree(tree) => GitObjectModel::Tree(tree.into_git_model(meta)),
+            GitObject::Commit(commit) => Ok(GitObjectModel::Commit(commit.into_git_model(meta)?)),
+            GitObject::Tree(tree) => Ok(GitObjectModel::Tree(tree.into_git_model(meta)?)),
             GitObject::Blob(blob) => {
                 let blob_data = blob.data.clone();
-                let git_model = blob.into_git_model(meta);
-                GitObjectModel::Blob(git_model, blob_data)
+                let git_model = blob.into_git_model(meta)?;
+                Ok(GitObjectModel::Blob(git_model, blob_data))
             }
-            GitObject::Tag(tag) => GitObjectModel::Tag(tag.into_git_model(meta)),
+            GitObject::Tag(tag) => Ok(GitObjectModel::Tag(tag.into_git_model(meta)?)),
         }
     }
 }
@@ -151,9 +154,9 @@ impl IntoMegaModel for Blob {
     /// # Returns
     ///
     /// A new mega_blob::Model instance populated with data from the blob
-    fn into_mega_model(self, meta: EntryMeta) -> Self::MegaTarget {
-        mega_blob::Model {
-            id: generate_id(),
+    fn into_mega_model(self, meta: EntryMeta) -> Result<Self::MegaTarget, MegaError> {
+        Ok(mega_blob::Model {
+            id: generate_id()?,
             blob_id: self.id.to_string(),
             size: 0,
             commit_id: String::new(),
@@ -163,7 +166,7 @@ impl IntoMegaModel for Blob {
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             is_delta_in_pack: meta.is_delta.unwrap_or(false),
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -183,9 +186,9 @@ impl IntoMegaModel for Commit {
     /// # Panics
     ///
     /// This function will panic if author or committer signature data cannot be converted to bytes
-    fn into_mega_model(self, meta: EntryMeta) -> Self::MegaTarget {
-        mega_commit::Model {
-            id: generate_id(),
+    fn into_mega_model(self, meta: EntryMeta) -> Result<Self::MegaTarget, MegaError> {
+        Ok(mega_commit::Model {
+            id: generate_id()?,
             commit_id: self.id.to_string(),
             tree: self.tree_id.to_string(),
             parents_id: self
@@ -201,7 +204,7 @@ impl IntoMegaModel for Commit {
             pack_id: meta.pack_id.unwrap_or_default(),
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -221,9 +224,9 @@ impl IntoMegaModel for Tag {
     /// # Panics
     ///
     /// This function will panic if tagger signature data cannot be converted to bytes
-    fn into_mega_model(self, meta: EntryMeta) -> Self::MegaTarget {
-        mega_tag::Model {
-            id: generate_id(),
+    fn into_mega_model(self, meta: EntryMeta) -> Result<Self::MegaTarget, MegaError> {
+        Ok(mega_tag::Model {
+            id: generate_id()?,
             tag_id: self.id.to_string(),
             object_id: self.object_hash.to_string(),
             object_type: self.object_type.to_string(),
@@ -233,7 +236,7 @@ impl IntoMegaModel for Tag {
             pack_id: meta.pack_id.unwrap_or_default(),
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -253,9 +256,9 @@ impl IntoMegaModel for Tree {
     /// # Panics
     ///
     /// This function will panic if the tree's data cannot be serialized
-    fn into_mega_model(self, meta: EntryMeta) -> Self::MegaTarget {
-        mega_tree::Model {
-            id: generate_id(),
+    fn into_mega_model(self, meta: EntryMeta) -> Result<Self::MegaTarget, MegaError> {
+        Ok(mega_tree::Model {
+            id: generate_id()?,
             tree_id: self.id.to_string(),
             sub_trees: self.to_data().unwrap(),
             size: 0,
@@ -263,7 +266,7 @@ impl IntoMegaModel for Tree {
             pack_id: meta.pack_id.unwrap_or_default(),
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -279,9 +282,9 @@ impl IntoGitModel for Blob {
     /// # Returns
     ///
     /// A new git_blob::Model instance populated with data from the blob
-    fn into_git_model(self, meta: EntryMeta) -> Self::GitTarget {
-        git_blob::Model {
-            id: generate_id(),
+    fn into_git_model(self, meta: EntryMeta) -> Result<Self::GitTarget, MegaError> {
+        Ok(git_blob::Model {
+            id: generate_id()?,
             repo_id: 0,
             blob_id: self.id.to_string(),
             size: 0,
@@ -291,7 +294,7 @@ impl IntoGitModel for Blob {
             file_path: meta.file_path.unwrap_or_default(),
             is_delta_in_pack: meta.is_delta.unwrap_or(false),
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -312,9 +315,9 @@ impl IntoGitModel for Commit {
     /// # Panics
     ///
     /// This function will panic if author or committer signature data cannot be converted to bytes
-    fn into_git_model(self, meta: EntryMeta) -> Self::GitTarget {
-        git_commit::Model {
-            id: generate_id(),
+    fn into_git_model(self, meta: EntryMeta) -> Result<Self::GitTarget, MegaError> {
+        Ok(git_commit::Model {
+            id: generate_id()?,
             repo_id: 0,
             commit_id: self.id.to_string(),
             tree: self.tree_id.to_string(),
@@ -331,7 +334,7 @@ impl IntoGitModel for Commit {
             pack_id: meta.pack_id.unwrap_or_default(),
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -352,9 +355,9 @@ impl IntoGitModel for Tag {
     /// # Panics
     ///
     /// This function will panic if tagger signature data cannot be converted to bytes
-    fn into_git_model(self, meta: EntryMeta) -> Self::GitTarget {
-        git_tag::Model {
-            id: generate_id(),
+    fn into_git_model(self, meta: EntryMeta) -> Result<Self::GitTarget, MegaError> {
+        Ok(git_tag::Model {
+            id: generate_id()?,
             repo_id: 0,
             tag_id: self.id.to_string(),
             object_id: self.object_hash.to_string(),
@@ -365,7 +368,7 @@ impl IntoGitModel for Tag {
             pack_id: meta.pack_id.unwrap_or_default(),
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -386,9 +389,9 @@ impl IntoGitModel for Tree {
     /// # Panics
     ///
     /// This function will panic if the tree's data cannot be serialized
-    fn into_git_model(self, meta: EntryMeta) -> Self::GitTarget {
-        git_tree::Model {
-            id: generate_id(),
+    fn into_git_model(self, meta: EntryMeta) -> Result<Self::GitTarget, MegaError> {
+        Ok(git_tree::Model {
+            id: generate_id()?,
             repo_id: 0,
             tree_id: self.id.to_string(),
             sub_trees: self.to_data().unwrap(),
@@ -396,7 +399,7 @@ impl IntoGitModel for Tree {
             pack_id: meta.pack_id.unwrap_or_default(),
             pack_offset: meta.pack_offset.unwrap_or(0) as i64,
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 }
 
@@ -654,31 +657,35 @@ pub struct MegaModelConverter {
 }
 
 impl MegaModelConverter {
-    fn traverse_from_root(&self) {
+    fn traverse_from_root(&self) -> Result<(), MegaError> {
         let root_tree = &self.root_tree;
-        let mut mega_tree: mega_tree::Model = root_tree.clone().into_mega_model(EntryMeta::new());
+        let mut mega_tree: mega_tree::Model = root_tree.clone().into_mega_model(EntryMeta::new())?;
         mega_tree.commit_id = self.commit.id.to_string();
         self.mega_trees
             .borrow_mut()
             .insert(root_tree.id, mega_tree.clone().into());
-        self.traverse_for_update(root_tree);
+        self.traverse_for_update(root_tree)
     }
 
-    fn traverse_for_update(&self, tree: &Tree) {
+    fn traverse_for_update(&self, tree: &Tree) -> Result<(), MegaError> {
         for item in &tree.tree_items {
             if item.mode == TreeItemMode::Tree {
-                let child_tree = self.tree_maps.get(&item.id).unwrap();
+                let child_tree = self.tree_maps.get(&item.id).ok_or_else(|| {
+                    MegaError::Other(format!("tree {} is missing from converter map", item.id))
+                })?;
                 let mut mega_tree: mega_tree::Model =
-                    child_tree.clone().into_mega_model(EntryMeta::new());
+                    child_tree.clone().into_mega_model(EntryMeta::new())?;
                 mega_tree.commit_id = self.commit.id.to_string();
                 self.mega_trees
                     .borrow_mut()
                     .insert(child_tree.id, mega_tree.clone().into());
-                self.traverse_for_update(child_tree);
+                self.traverse_for_update(child_tree)?;
             } else {
-                let blob = self.blob_maps.get(&item.id).unwrap();
+                let blob = self.blob_maps.get(&item.id).ok_or_else(|| {
+                    MegaError::Other(format!("blob {} is missing from converter map", item.id))
+                })?;
                 let mut mega_blob: mega_blob::Model =
-                    blob.clone().into_mega_model(EntryMeta::new());
+                    blob.clone().into_mega_model(EntryMeta::new())?;
                 mega_blob.commit_id = self.commit.id.to_string();
                 self.mega_blobs
                     .borrow_mut()
@@ -687,14 +694,15 @@ impl MegaModelConverter {
                 self.raw_blobs.borrow_mut().push(blob.clone());
             }
         }
+        Ok(())
     }
 
-    pub fn init(mono_config: &MonoConfig) -> Self {
+    pub fn init(mono_config: &MonoConfig) -> Result<Self, MegaError> {
         let (tree_maps, blob_maps, root_tree) = init_trees(mono_config);
         let commit = Commit::from_tree_id(root_tree.id, vec![], "\nInit Mega Directory");
 
         let mega_ref = mega_refs::Model {
-            id: generate_id(),
+            id: generate_id()?,
             path: "/".to_owned(),
             ref_name: MEGA_BRANCH_NAME.to_owned(),
             ref_commit_hash: commit.id.to_string(),
@@ -714,8 +722,8 @@ impl MegaModelConverter {
             raw_blobs: RefCell::new(Vec::new()),
             refs: mega_ref.into(),
         };
-        converter.traverse_from_root();
-        converter
+        converter.traverse_from_root()?;
+        Ok(converter)
     }
 }
 
@@ -941,7 +949,8 @@ mod test {
         if !mono_config.root_dirs.iter().any(|d| d == "toolchains") {
             mono_config.root_dirs.push("toolchains".to_string());
         }
-        let converter = MegaModelConverter::init(&mono_config);
+        let converter =
+            MegaModelConverter::init(&mono_config).expect("test ID generator initialized");
         let mega_trees = converter.mega_trees.borrow().clone();
         let mega_blobs = converter.mega_blobs.borrow().clone();
         let dir_nums = mono_config.root_dirs.len();

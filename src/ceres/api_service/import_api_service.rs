@@ -503,7 +503,7 @@ impl ImportApiService {
             name.clone(),
             tagger_info.clone(),
             message.clone(),
-        );
+        )?;
         match git_storage.insert_tag(new_model).await {
             Ok(saved) => {
                 // write import ref; rollback handled inside helper
@@ -543,7 +543,7 @@ impl ImportApiService {
     ) -> Result<TagInfo, GitError> {
         let object_id = target.clone().unwrap_or_default();
         let import_ref = import_refs::Model {
-            id: crate::common::utils::generate_id(),
+            id: crate::common::utils::generate_id()?,
             repo_id: self.repo.repo_id,
             ref_name: full_ref.clone(),
             ref_git_id: object_id.clone(),
@@ -628,9 +628,9 @@ impl ImportApiService {
         name: String,
         tagger_info: String,
         message: Option<String>,
-    ) -> git_tag::Model {
-        git_tag::Model {
-            id: crate::common::utils::generate_id(),
+    ) -> Result<git_tag::Model, GitError> {
+        Ok(git_tag::Model {
+            id: crate::common::utils::generate_id()?,
             repo_id: self.repo.repo_id,
             tag_id: tag_id_hex,
             object_id,
@@ -642,7 +642,7 @@ impl ImportApiService {
             pack_offset: 0,
 
             created_at: chrono::Utc::now().naive_utc(),
-        }
+        })
     }
 
     async fn write_import_ref_with_rollback(
@@ -654,7 +654,7 @@ impl ImportApiService {
     ) -> Result<(), GitError> {
         let git_storage = self.storage.git_db_storage();
         let import_ref = import_refs::Model {
-            id: crate::common::utils::generate_id(),
+            id: crate::common::utils::generate_id()?,
             repo_id,
             ref_name: full_ref.clone(),
             ref_git_id: object_id.clone(),

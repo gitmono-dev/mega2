@@ -422,7 +422,7 @@ pub async fn create_repo_commit(storage: &Storage, repo_path: &str) -> Result<St
                 c.id.to_string(),
                 c.tree_id.to_string(),
                 false,
-            );
+            )?;
 
             storage
                 .mega_head_hash_with_txn(new_mega_ref.clone(), c)

@@ -65,8 +65,10 @@ The service selects the Snowflake worker ID before the first ID is generated:
 - Otherwise, startup claims the first available
   mega:snowflake:worker:<id> Redis slot with SET NX PX for 30 seconds and
   refreshes it every 15 seconds using an ownership token.
-- If Redis is unavailable or all 256 slots are occupied, the ID is the stable
-  FNV-1a hash of POD_UID, then HOSTNAME, or the local fallback identity.
+- If Redis is unavailable or all 256 slots are occupied, startup records the
+  stable FNV-1a hash of POD_UID, then HOSTNAME, or the local fallback identity
+  for diagnostics, but refuses ID writes until an exclusive worker ID is
+  configured. The hash is never advertised as a uniqueness guarantee.
 
 The generator uses 8 worker bits and 8 sequence bits: this preserves 256 IDs
 per millisecond per worker and expands the worker space from 64 to 256. The

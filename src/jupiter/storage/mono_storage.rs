@@ -281,7 +281,7 @@ impl MonoStorage {
                 commit_id.to_owned(),
                 tree_hash.to_owned(),
                 true, // is_cl_ref
-            );
+            )?;
             mega_refs::Entity::insert(new_ref.into_active_model())
                 .exec(conn)
                 .await?;
@@ -666,6 +666,8 @@ impl MonoStorage {
         let save_models: Vec<mega_commit::ActiveModel> = commits
             .into_iter()
             .map(|c| c.into_mega_model(EntryMeta::default()))
+            .collect::<Result<Vec<mega_commit::Model>, MegaError>>()?
+            .into_iter()
             .map(|m| m.into_active_model())
             .collect();
         self.batch_save_model_with_txn(save_models, txn).await?;
@@ -681,6 +683,8 @@ impl MonoStorage {
         let save_models: Vec<mega_tree::ActiveModel> = trees
             .into_iter()
             .map(|t| t.into_mega_model(EntryMeta::default()))
+            .collect::<Result<Vec<mega_tree::Model>, MegaError>>()?
+            .into_iter()
             .map(|mut m| {
                 m.commit_id = commit_id.to_string();
                 m.into_active_model()
@@ -990,7 +994,8 @@ mod tests {
                 expected.to_owned(),
                 String::new(),
                 true,
-            );
+            )
+            .expect("test ID generator initialized");
             reference
                 .into_active_model()
                 .insert(storage.get_connection())

@@ -44,7 +44,7 @@ impl GitDbStorage {
         let repo_id = if let Some(existing) = self.find_git_repo_exact_match(repo_path).await? {
             existing.id
         } else {
-            let repo_id = generate_id();
+            let repo_id = generate_id()?;
             let repo = git_repo::Model {
                 id: repo_id,
                 repo_path: repo_path.to_string(),
@@ -57,7 +57,7 @@ impl GitDbStorage {
         };
 
         let refs = import_refs::Model {
-            id: generate_id(),
+            id: generate_id()?,
             repo_id: 0,
             ref_name: ref_name.to_string(),
             ref_git_id: ref_id.to_string(),
@@ -655,7 +655,7 @@ mod tests {
         };
         let repo_id = 17;
         let tag = git_tag::Model {
-            id: generate_id(),
+            id: generate_id().expect("test ID generator initialized"),
             repo_id,
             tag_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             object_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
@@ -688,7 +688,7 @@ mod tests {
 
     fn branch_ref(repo_id: i64, ref_name: &str, ref_git_id: &str) -> import_refs::Model {
         import_refs::Model {
-            id: generate_id(),
+            id: generate_id().expect("test ID generator initialized"),
             repo_id,
             ref_name: ref_name.to_owned(),
             ref_git_id: ref_git_id.to_owned(),

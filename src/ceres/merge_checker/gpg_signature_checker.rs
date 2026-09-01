@@ -1555,7 +1555,9 @@ mod tests {
             .collect();
         let unsigned = Commit::from_tree_id(tree_id, parent_ids, message);
         let signed = signing.sign_commit(&key, &unsigned).expect("sign commit");
-        signed.into_mega_model(git_internal::internal::metadata::EntryMeta::default())
+        signed
+            .into_mega_model(git_internal::internal::metadata::EntryMeta::default())
+            .expect("test ID generator initialized")
     }
 
     // AC①/②: a server-identity commit verifies against the server keyring;
