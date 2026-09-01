@@ -38,7 +38,7 @@ impl MegaObjectStorage for ObjectStoreAdapter {
         // Do not inherit SinglePut: bounded writes must use the adapter's
         // multipart publication path for every concrete backend.
         let path = Self::checked_path(key)?;
-        self.put_multipart(&path, data).await
+        self.put_multipart_bounded(&path, data).await
     }
 
     async fn get_stream(&self, key: &ObjectKey) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {

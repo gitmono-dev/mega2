@@ -287,35 +287,51 @@ impl ObjectStoreAdapter {
     async fn put_multipart(
         &self,
         path: &object_store::path::Path,
-        data: ObjectByteStream,
+        mut data: ObjectByteStream,
     ) -> OrbitResult<()> {
-        Self::put_multipart_to(self.to_store(), path, data).await
+        let mut upload = self
+            .to_store()
+            .put_multipart(path)
+            .await
+            .map_err(IoOrbitError::from)?;
+
+        let res = async {
+            while let Some(chunk) = data.try_next().await? {
+                upload
+                    .put_part(chunk.into())
+                    .await
+                    .map_err(IoOrbitError::from)?;
+            }
+
+            upload.complete().await.map_err(IoOrbitError::from)?;
+
+            Ok::<(), IoOrbitError>(())
+        }
+        .await;
+
+        if res.is_err() {
+            upload.abort().await.map_err(IoOrbitError::from)?;
+        }
+
+        res
     }
 
     /// Uses one fixed-size upload buffer and waits for each part before reading
     /// more input. The backend publishes only on `complete`; a multipart failure
     /// is never an excuse to buffer the full object instead.
-    async fn put_multipart_to(
+    async fn put_multipart_bounded(
+        &self,
+        path: &object_store::path::Path,
+        data: ObjectByteStream,
+    ) -> OrbitResult<()> {
+        Self::put_multipart_bounded_to(self.to_store(), path, data).await
+    }
+
+    async fn put_multipart_bounded_to(
         store: &dyn ObjectStore,
         path: &object_store::path::Path,
         mut data: ObjectByteStream,
     ) -> OrbitResult<()> {
-        // S3 cannot complete a multipart upload with no parts. Ignore empty
-        // input items before deciding whether to issue the empty-object PUT.
-        let first = loop {
-            match data.try_next().await? {
-                Some(chunk) if chunk.is_empty() => continue,
-                Some(chunk) => break chunk,
-                None => {
-                    store
-                        .put(path, PutPayload::new())
-                        .await
-                        .map_err(IoOrbitError::from)?;
-                    return Ok(());
-                }
-            }
-        };
-
         let mut upload = store
             .put_multipart(path)
             .await
@@ -323,8 +339,9 @@ impl ObjectStoreAdapter {
 
         let res = async {
             let mut buffer = BytesMut::with_capacity(MULTIPART_PART_SIZE);
-            let mut chunk = first;
-            loop {
+            let mut saw_data = false;
+            while let Some(chunk) = data.try_next().await? {
+                saw_data |= !chunk.is_empty();
                 let mut remaining = chunk.as_ref();
                 while !remaining.is_empty() {
                     let take = remaining.len().min(MULTIPART_PART_SIZE - buffer.len());
@@ -338,10 +355,9 @@ impl ObjectStoreAdapter {
                         buffer.reserve(MULTIPART_PART_SIZE);
                     }
                 }
-                match data.try_next().await? {
-                    Some(next) => chunk = next,
-                    None => break,
-                }
+            }
+            if !saw_data {
+                return Ok::<bool, IoOrbitError>(false);
             }
             if !buffer.is_empty() {
                 upload
@@ -352,20 +368,31 @@ impl ObjectStoreAdapter {
 
             upload.complete().await.map_err(IoOrbitError::from)?;
 
-            Ok::<(), IoOrbitError>(())
+            Ok(true)
         }
         .await;
 
-        if let Err(error) = res {
-            if let Err(abort_error) = upload.abort().await {
-                return Err(IoOrbitError::Other(format!(
-                    "{error}; failed to abort multipart upload: {abort_error}"
-                )));
+        match res {
+            Ok(true) => Ok(()),
+            // S3 cannot complete a multipart upload with no parts. Abort its
+            // staging session before publishing the permitted empty-object PUT.
+            Ok(false) => {
+                upload.abort().await.map_err(IoOrbitError::from)?;
+                store
+                    .put(path, PutPayload::new())
+                    .await
+                    .map_err(IoOrbitError::from)?;
+                Ok(())
             }
-            return Err(error);
+            Err(error) => {
+                if let Err(abort_error) = upload.abort().await {
+                    return Err(IoOrbitError::Other(format!(
+                        "{error}; failed to abort multipart upload: {abort_error}"
+                    )));
+                }
+                Err(error)
+            }
         }
-
-        Ok(())
     }
 
     /// Upload an object using a *single PUT* request.
@@ -713,7 +740,7 @@ mod tests {
                         }
                     }
                 });
-                ObjectStoreAdapter::put_multipart_to(&store, &path, Box::pin(source))
+                ObjectStoreAdapter::put_multipart_bounded_to(&store, &path, Box::pin(source))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -739,12 +766,14 @@ mod tests {
             let store = StrictStore::default();
             let path = Path::from("empty");
             let source = stream::iter((0..empty_items).map(|_| Ok(Bytes::new())));
-            ObjectStoreAdapter::put_multipart_to(&store, &path, Box::pin(source))
+            ObjectStoreAdapter::put_multipart_bounded_to(&store, &path, Box::pin(source))
                 .await
                 .unwrap();
             assert_eq!(store.head(&path).await.unwrap().size, 0);
             let stats = store.stats.lock().unwrap();
-            assert_eq!(stats.started, 0);
+            assert_eq!(stats.started, 1);
+            assert_eq!(stats.abort_calls, 1);
+            assert_eq!(stats.complete_calls, 0);
             assert_eq!(stats.single_lengths, [0]);
         }
     }
@@ -776,11 +805,14 @@ mod tests {
             if !failures.part && !failures.complete {
                 items.push(Err(io::Error::other("injected stream failure")));
             }
-            let error =
-                ObjectStoreAdapter::put_multipart_to(&store, &path, Box::pin(stream::iter(items)))
-                    .await
-                    .unwrap_err()
-                    .to_string();
+            let error = ObjectStoreAdapter::put_multipart_bounded_to(
+                &store,
+                &path,
+                Box::pin(stream::iter(items)),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             let phase = if failures.part {
                 "part"
             } else if failures.complete {
@@ -807,6 +839,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_first_stream_error_aborts_and_preserves_existing_object() {
+        for abort_fails in [false, true] {
+            let store = StrictStore {
+                failures: Failures {
+                    abort: abort_fails,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let path = Path::from("first-stream-error");
+            store.inner.put(&path, "keep me".into()).await.unwrap();
+            let source =
+                stream::once(async { Err(io::Error::other("injected first stream failure")) });
+
+            let error =
+                ObjectStoreAdapter::put_multipart_bounded_to(&store, &path, Box::pin(source))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+
+            assert!(error.contains("injected first stream failure"), "{error}");
+            if abort_fails {
+                assert!(error.contains("injected abort failure"), "{error}");
+            }
+            assert_eq!(
+                store.get(&path).await.unwrap().bytes().await.unwrap(),
+                "keep me"
+            );
+            let stats = store.stats.lock().unwrap();
+            assert_eq!(stats.started, 1);
+            assert_eq!(stats.abort_calls, 1);
+            assert_eq!(stats.complete_calls, 0);
+            assert!(stats.part_lengths.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn multipart_unsupported_does_not_fall_back_to_buffering() {
         let store = StrictStore {
             failures: Failures {
@@ -818,13 +887,52 @@ mod tests {
         let path = Path::from("unsupported");
         let source = stream::once(async { Ok(Bytes::from_static(b"data")) });
         assert!(
-            ObjectStoreAdapter::put_multipart_to(&store, &path, Box::pin(source))
+            ObjectStoreAdapter::put_multipart_bounded_to(&store, &path, Box::pin(source))
                 .await
                 .is_err()
         );
         let stats = store.stats.lock().unwrap();
         assert_eq!(stats.started, 1);
         assert!(stats.single_lengths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordinary_multipart_keeps_per_input_part_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let adapter = ObjectStoreAdapter {
+            store: BackendStore::Local(Arc::clone(&local)),
+            upload_strategy: UploadStrategy::Multipart,
+        };
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: "b".repeat(64),
+        };
+        let path = key.to_object_store_path();
+        let target = local.path_to_filesystem(&path).unwrap();
+        let observed_parent = target.parent().unwrap().to_path_buf();
+        let first = stream::once(async { Ok(Bytes::from_static(b"first")) });
+        let second = stream::once(async move {
+            assert!(std::fs::read_dir(observed_parent).unwrap().any(|entry| {
+                std::fs::File::open(entry.unwrap().path())
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .len()
+                    == 5
+            }));
+            Ok(Bytes::from_static(b"second"))
+        });
+
+        adapter
+            .put_stream(&key, Box::pin(first.chain(second)), ObjectMeta::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            local.get(&path).await.unwrap().bytes().await.unwrap(),
+            "firstsecond"
+        );
     }
 
     #[tokio::test]
