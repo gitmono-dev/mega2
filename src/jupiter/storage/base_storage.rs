@@ -378,6 +378,20 @@ mod tests {
             .collect()
     }
 
+    fn database_error_code(error: &DbErr) -> Option<String> {
+        let runtime = match error {
+            DbErr::Exec(runtime) | DbErr::Query(runtime) => runtime,
+            _ => return None,
+        };
+        let sea_orm::RuntimeErr::SqlxError(source) = runtime else {
+            return None;
+        };
+        let sea_orm::SqlxError::Database(database_error) = source.as_ref() else {
+            return None;
+        };
+        database_error.code().map(|code| code.into_owned())
+    }
+
     #[tokio::test]
     async fn retries_transient_batch_insert_and_preserves_on_conflict() {
         let connection = MockDatabase::new(DbBackend::Postgres)
@@ -427,9 +441,7 @@ mod tests {
     #[tokio::test]
     async fn propagates_non_retryable_batch_error_without_retry() {
         let connection = MockDatabase::new(DbBackend::Postgres)
-            .append_query_errors([DbErr::Custom(
-                "duplicate key value violates unique constraint".to_owned(),
-            )])
+            .append_query_errors([structured_database_error("23505")])
             .into_connection();
         let storage = BaseStorage::new(Arc::new(connection.clone()));
 
@@ -438,7 +450,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(MegaError::Db(DbErr::Custom(message))) if message.contains("duplicate key"))
+            matches!(result, Err(MegaError::Db(error)) if database_error_code(&error).as_deref() == Some("23505"))
         );
         assert_eq!(statement_sql(connection).len(), 1);
     }
@@ -486,12 +498,16 @@ mod tests {
             .exec(&connection)
             .await
             .expect("seed real test blob");
+        let mut duplicate_composite = test_blob(id + 1);
+        duplicate_composite.blob_id = Set(format!("blob-{id}"));
 
         let storage = BaseStorage::new(Arc::new(connection.clone()));
         let result = storage
             .batch_save_model_with_conflict::<git_blob::Entity, _>(
-                vec![model],
-                OnConflict::new().to_owned(),
+                vec![model, duplicate_composite],
+                OnConflict::column(git_blob::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
             )
             .await;
         let error = match result {
@@ -499,6 +515,7 @@ mod tests {
             other => panic!("expected database error, got {other:?}"),
         };
 
+        assert_eq!(database_error_code(&error).as_deref(), Some("23505"));
         assert_eq!(classify_db_error(&error), None);
         assert!(matches!(error, DbErr::Exec(_) | DbErr::Query(_)));
     }
