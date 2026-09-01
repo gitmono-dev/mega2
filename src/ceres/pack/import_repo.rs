@@ -85,16 +85,15 @@ impl RepoHandler for ImportRepo {
         true
     }
 
-    async fn refs_with_head_hash(&self) -> (String, Vec<Refs>) {
+    async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
         let result = self
             .storage
             .git_db_storage()
             .get_ref(self.repo.repo_id)
-            .await
-            .unwrap();
+            .await?;
         let refs: Vec<Refs> = result.into_iter().map(|x| x.into()).collect();
 
-        self.find_head_hash(refs)
+        Ok(self.find_head_hash(refs))
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
@@ -437,7 +436,7 @@ impl RepoHandler for ImportRepo {
         };
         let current_head = match from_commands {
             Some(h) => h,
-            None => self.refs_with_head_hash().await.0,
+            None => self.refs_with_head_hash().await?.0,
         };
         let commit = Commit::from_git_model(
             self.storage

@@ -95,7 +95,7 @@ use crate::{
         protocol::{ServiceType, SmartSession, TransportProtocol},
     },
     common::{
-        errors::{BuckError, MegaError},
+        errors::{BuckError, ID_GENERATION_UNAVAILABLE_MARKER, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
     contract::{
@@ -4426,6 +4426,20 @@ impl MonoApiService {
                     Ok(true)
                 }
                 Err((failure_type, message)) => {
+                    if let Some(marker_start) = message.find(ID_GENERATION_UNAVAILABLE_MARKER) {
+                        if let Err(error) = queue_service.move_item_to_tail(&cl_link).await {
+                            tracing::warn!(
+                                cl_link = %cl_link,
+                                error = %error,
+                                "failed to return queue item after ID generation became unavailable"
+                            );
+                        }
+                        let detail = message
+                            [marker_start + ID_GENERATION_UNAVAILABLE_MARKER.len()..]
+                            .trim()
+                            .to_string();
+                        return Err(MegaError::IdGenerationUnavailable(detail));
+                    }
                     if matches!(failure_type, QueueFailureTypeEnum::Conflict) {
                         // Conflict - move to tail of queue for retry
                         if let Err(e) = queue_service.move_item_to_tail(&cl_link).await {
@@ -4589,6 +4603,7 @@ impl MonoApiService {
             // Only an undecidable check freezes; a refusal is a decision and
             // records as an ordinary failure.
             if message.contains("[code:503]")
+                && !message.contains(ID_GENERATION_UNAVAILABLE_MARKER)
                 && let Err(e) = self
                     .freeze_merge_queue_item_for_authz(cl_link, &message)
                     .await
@@ -4612,10 +4627,14 @@ impl MonoApiService {
         self.merge_cl_unchecked(&authz_principal, "system", cl_model.clone())
             .await
             .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::MergeFailure,
-                    format!("Merge failed: {}", e),
-                )
+                let error = e.to_string();
+                let message =
+                    if let Some(marker_start) = error.find(ID_GENERATION_UNAVAILABLE_MARKER) {
+                        error[marker_start..].trim().to_string()
+                    } else {
+                        format!("Merge failed: {error}")
+                    };
+                (QueueFailureTypeEnum::MergeFailure, message)
             })?;
 
         // Step 6: Update queue status to Merged

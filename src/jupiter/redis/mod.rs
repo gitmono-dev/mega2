@@ -3,7 +3,7 @@ pub mod snowflake_worker;
 
 pub use ::redis::{AsyncCommands, aio::ConnectionManager};
 pub(crate) use snowflake_worker::{
-    SnowflakeWorkerLease, WorkerFence, claim_snowflake_worker, try_acquire_worker_fence,
+    SnowflakeWorkerLease, claim_snowflake_worker, claim_snowflake_worker_for_id,
 };
 
 use crate::{

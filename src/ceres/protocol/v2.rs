@@ -67,7 +67,7 @@ pub async fn handle_v2_ls_refs(
     let repo_handler = session
         .repo_handler_with_commands(state, Vec::new())
         .await?;
-    let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await;
+    let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
 
     let mut buf = BytesMut::new();
 

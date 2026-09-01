@@ -41,9 +41,9 @@ use crate::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService,
-            lfs_service::LfsService, merge_queue_service::MergeQueueService,
-            mono_service::MonoService, webhook_service::WebhookService,
+            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
+            merge_queue_service::MergeQueueService, mono_service::MonoService,
+            webhook_service::WebhookService,
         },
         storage::{
             audit_storage::AuditStorage,
@@ -172,6 +172,7 @@ impl Storage {
         config: Arc<Config>,
         object_store: MegaObjectStorageWrapper,
     ) -> Result<Self, MegaError> {
+        id_generator::validate_layout_version()?;
         let connection = Arc::new(database_connection(&config.database).await?);
         Self::new_with_connection(config, connection, object_store).await
     }
@@ -189,6 +190,7 @@ impl Storage {
         // Public constructors must fail before assembling writable services if
         // the process has not selected an exclusive worker ID yet. AppContext
         // performs that selection before calling this constructor.
+        id_generator::validate_layout_version()?;
         id_generator::ensure_initialized()?;
         let config_handle = ConfigHandle::from_arc(config.clone());
         let notification_storage = NotificationStorage::new(connection.clone());

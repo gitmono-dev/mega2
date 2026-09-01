@@ -94,7 +94,7 @@ pub trait RepoHandler: Send + Sync + 'static {
         true
     }
 
-    async fn refs_with_head_hash(&self) -> (String, Vec<Refs>);
+    async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError>;
 
     async fn receiver_handler(
         self: Arc<Self>,

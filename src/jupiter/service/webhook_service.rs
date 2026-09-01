@@ -116,8 +116,19 @@ impl WebhookService {
         let path = cl_model.path.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = svc.dispatch_inner(event_type, cl_payload, &path).await {
-                tracing::error!("webhook dispatch error: {e}");
+            if let Err(error) = svc.dispatch_inner(event_type, cl_payload, &path).await {
+                if matches!(
+                    error,
+                    crate::common::errors::MegaError::IdGenerationUnavailable(_)
+                ) {
+                    tracing::warn!(
+                        retryable = true,
+                        error = %error,
+                        "webhook dispatch paused because delivery ID generation is unavailable"
+                    );
+                } else {
+                    tracing::error!(error = %error, "webhook dispatch error");
+                }
             }
         });
     }
@@ -152,6 +163,10 @@ impl WebhookService {
             let mut last_failure_message = None;
             let mut delivered_successfully = false;
             for attempt in 1..=WEBHOOK_DELIVERY_MAX_ATTEMPTS {
+                // Allocate the durable delivery identity before making the
+                // external request. If the process has lost its worker lease,
+                // no webhook is sent without a record that can be persisted.
+                let delivery_id = crate::jupiter::utils::id_generator::next_id()?;
                 let should_retry = match self
                     .deliver(
                         &webhook.target_url,
@@ -169,7 +184,7 @@ impl WebhookService {
                             Some(format!("webhook endpoint returned HTTP {status}"))
                         };
                         let delivery = crate::callisto::mega_webhook_delivery::Model {
-                            id: crate::jupiter::utils::id_generator::next_id()?,
+                            id: delivery_id,
                             webhook_id: webhook.id,
                             event_type: event_type.clone(),
                             payload: payload_json.clone(),
@@ -194,7 +209,7 @@ impl WebhookService {
                     Err(e) => {
                         let error_message = e.to_string();
                         let delivery = crate::callisto::mega_webhook_delivery::Model {
-                            id: crate::jupiter::utils::id_generator::next_id()?,
+                            id: delivery_id,
                             webhook_id: webhook.id,
                             event_type: event_type.clone(),
                             payload: payload_json.clone(),

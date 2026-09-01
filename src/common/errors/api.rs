@@ -203,6 +203,7 @@ pub(crate) fn map_ceres_error<D: std::fmt::Display>(err: D, ctx: &str) -> ApiErr
         return match code {
             "400" => ApiError::bad_request(error_msg),
             "404" => ApiError::not_found(error_msg),
+            "503" => ApiError::with_status(StatusCode::SERVICE_UNAVAILABLE, error_msg),
             _ => ApiError::internal(error_msg),
         };
     }
@@ -218,6 +219,13 @@ mod tests {
     fn id_generation_unavailable_is_retryable() {
         let response = ApiError::from(MegaError::IdGenerationUnavailable("lease lost".to_string()))
             .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn coded_service_unavailable_is_retryable() {
+        let response = map_ceres_error("[code:503] lease lost", "test context").into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }

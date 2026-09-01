@@ -7,20 +7,18 @@ use url::Url;
 use crate::{
     common::errors::MegaError,
     config::{DbConfig, redaction::redact_db_url, validate::validate_database_config},
-    jupiter::{migration::apply_migrations, utils::id_generator},
+    jupiter::migration::apply_migrations,
 };
 
 /// Create a PostgreSQL database connection.
 ///
 /// After a successful connection, applies any pending database migrations.
-/// This compatibility entry point initializes the standalone generator after
-/// the database is ready. Production [`crate::context::AppContext`] uses
-/// [`database_connection_without_id_generator`] so it can bind the worker
-/// selection before exposing writable storage.
+/// Worker selection is deliberately not part of this low-level database
+/// bootstrap. Callers that assemble writable storage must initialize the
+/// generator explicitly; this keeps DB-only tools such as vault bootstrap
+/// independent of process-wide ID state.
 pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
-    let connection = database_connection_without_id_generator(db_config).await?;
-    id_generator::ensure_initialized()?;
-    Ok(connection)
+    database_connection_without_id_generator(db_config).await
 }
 
 /// Create the writable database connection without initializing the Snowflake

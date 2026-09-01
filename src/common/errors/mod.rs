@@ -25,6 +25,8 @@ pub use vault::{RvError, VaultError, VaultResult};
 
 pub type MegaResult = Result<(), MegaError>;
 
+pub(crate) const ID_GENERATION_UNAVAILABLE_MARKER: &str = "[id-generation-unavailable]";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbRetryKind {
     Deadlock,
@@ -176,9 +178,9 @@ impl From<MegaError> for GitError {
             MegaError::ObjStorageNotFound(msg) => {
                 GitError::CustomError(format!("[code:404] ObjStorage not found: {msg}"))
             }
-            MegaError::IdGenerationUnavailable(msg) => {
-                GitError::CustomError(format!("[code:503] {msg}"))
-            }
+            MegaError::IdGenerationUnavailable(msg) => GitError::CustomError(format!(
+                "[code:503] {ID_GENERATION_UNAVAILABLE_MARKER} {msg}"
+            )),
             other => GitError::CustomError(other.to_string()),
         }
     }
@@ -295,7 +297,10 @@ mod tests {
     fn converts_id_generation_unavailable_to_git_503_marker() {
         let err: GitError = MegaError::IdGenerationUnavailable("lease lost".to_owned()).into();
 
-        assert!(err.to_string().contains("[code:503] lease lost"));
+        assert!(
+            err.to_string()
+                .contains("[code:503] [id-generation-unavailable] lease lost")
+        );
     }
 
     #[test]

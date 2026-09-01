@@ -146,7 +146,10 @@ fn validate_tag_name(name: &str) -> Result<(), ApiError> {
         content_type = "application/json"
     ),
     responses(
-        (status = 201, body = CommonResult<TagResponse>, content_type = "application/json")
+        (status = 201, body = CommonResult<TagResponse>, content_type = "application/json"),
+        (status = 400, body = CommonResult<String>, content_type = "application/json"),
+        (status = 404, body = CommonResult<String>, content_type = "application/json"),
+        (status = 503, body = CommonResult<String>, content_type = "application/json")
     ),
     tag = TAG_MANAGE
 )]

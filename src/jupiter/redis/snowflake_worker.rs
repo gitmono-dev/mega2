@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use futures::FutureExt;
 use redis::{Script, aio::ConnectionManager};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, Statement,
@@ -22,14 +23,14 @@ const SLOT_RELEASE_TIMEOUT_MS: u64 = 5_000;
 const SLOT_SCAN_TIMEOUT_MS: u64 = 2_000;
 const SLOT_CLAIM_TIMEOUT_MS: u64 = 1_000;
 const SLOT_SCAN_CLEANUP_TIMEOUT_MS: u64 = 5_000;
+const FENCE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
+const FENCE_ROLLBACK_TIMEOUT_MS: u64 = 5_000;
 const FENCE_VERIFY_TIMEOUT_MS: u64 = 5_000;
+const WORKER_CLEANUP_TIMEOUT_MS: u64 = 10_000;
 const WORKER_FENCE_NAMESPACE: i32 = 0x004d_4f4e;
 
 struct WorkerFenceInner {
     transaction: Mutex<Option<DatabaseTransaction>>,
-    health: Option<Arc<WorkerLeaseHealth>>,
-    cancel: CancellationToken,
-    task: StdMutex<Option<JoinHandle<()>>>,
 }
 
 /// A PostgreSQL transaction-scoped advisory lock that fences a worker slot
@@ -42,13 +43,10 @@ pub(crate) struct WorkerFence {
 }
 
 impl WorkerFence {
-    fn new(transaction: DatabaseTransaction, health: Option<Arc<WorkerLeaseHealth>>) -> Self {
+    fn new(transaction: DatabaseTransaction) -> Self {
         Self {
             inner: Arc::new(WorkerFenceInner {
                 transaction: Mutex::new(Some(transaction)),
-                health,
-                cancel: CancellationToken::new(),
-                task: StdMutex::new(None),
             }),
         }
     }
@@ -76,92 +74,73 @@ impl WorkerFence {
         Ok(())
     }
 
-    /// Start a database-fence monitor for an explicitly configured worker ID.
-    /// Redis-backed leases use the same verification from their Redis refresh
-    /// task, while this path has no Redis task to own the health deadline.
-    pub(crate) fn start_refresh(&self) {
-        let Some(health) = self.inner.health.as_ref().cloned() else {
-            return;
-        };
-        let mut task = match self.inner.task.lock() {
-            Ok(task) => task,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if task.is_some() {
-            return;
-        }
-
-        let weak = Arc::downgrade(&self.inner);
-        let cancel = self.inner.cancel.clone();
-        *task = Some(tokio::spawn(async move {
-            run_fence_refresh(weak, health, cancel).await;
-        }));
-    }
-
     pub(crate) async fn shutdown(&self) -> Result<(), crate::common::errors::MegaError> {
-        if let Some(health) = self.inner.health.as_ref() {
-            id_generator::revoke_worker_lease(health);
-        }
-        self.inner.cancel.cancel();
-        let task = match self.inner.task.lock() {
-            Ok(mut task) => task.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let task_error = if let Some(task) = task {
-            task.await
-                .err()
-                .map(|error| crate::common::errors::MegaError::Other(error.to_string()))
-        } else {
-            None
-        };
-
         let transaction = self.inner.transaction.lock().await.take();
-        let rollback_error = if let Some(transaction) = transaction {
-            transaction.rollback().await.err()
+        if let Some(transaction) = transaction {
+            rollback_fence(transaction).await
         } else {
-            None
-        };
-        task_error
-            .or_else(|| rollback_error.map(Into::into))
-            .map_or(Ok(()), Err)
+            Ok(())
+        }
     }
 }
 
 impl Drop for WorkerFenceInner {
     fn drop(&mut self) {
-        if let Some(health) = self.health.as_ref() {
-            id_generator::revoke_worker_lease(health);
+        let transaction = self
+            .transaction
+            .try_lock()
+            .ok()
+            .and_then(|mut transaction| transaction.take());
+        let Some(transaction) = transaction else {
+            return;
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = rollback_fence(transaction).await {
+                    tracing::warn!(error = %error, "failed to roll back dropped worker fence");
+                }
+            });
+        } else {
+            // There is no executor on which to run the asynchronous rollback.
+            // The process is normally terminating in this path; leaking the
+            // handle avoids invoking SeaORM's fallible transaction Drop.
+            std::mem::forget(transaction);
         }
-        self.cancel.cancel();
     }
 }
 
-async fn run_fence_refresh(
-    weak: std::sync::Weak<WorkerFenceInner>,
-    health: Arc<WorkerLeaseHealth>,
-    cancel: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(SLOT_REFRESH_INTERVAL_MS)) => {}
-        }
-
-        if cancel.is_cancelled() {
-            continue;
-        }
-        let Some(inner) = weak.upgrade() else {
-            break;
-        };
-        let fence = WorkerFence { inner };
-        match fence.verify().await {
-            Ok(()) if id_generator::refresh_worker_lease(&health) => {}
-            Ok(()) => break,
-            Err(error) => {
-                tracing::warn!(error = %error, "worker database fence verification failed");
-                id_generator::revoke_worker_lease(&health);
-                break;
-            }
+async fn rollback_fence(
+    transaction: DatabaseTransaction,
+) -> Result<(), crate::common::errors::MegaError> {
+    // Isolate SeaORM's fallible transaction Drop in a task. If the database is
+    // already broken, an aborted rollback must not unwind the caller through
+    // the driver's panic-on-drop path.
+    let mut rollback = tokio::spawn(async move {
+        std::panic::AssertUnwindSafe(transaction.rollback())
+            .catch_unwind()
+            .await
+    });
+    match timeout(
+        Duration::from_millis(FENCE_ROLLBACK_TIMEOUT_MS),
+        &mut rollback,
+    )
+    .await
+    {
+        Ok(Ok(Ok(Ok(())))) => Ok(()),
+        Ok(Ok(Ok(Err(error)))) => Err(error.into()),
+        Ok(Ok(Err(_))) => Err(crate::common::errors::MegaError::Other(
+            "worker database fence rollback panicked".to_string(),
+        )),
+        Ok(Err(error)) => Err(crate::common::errors::MegaError::Other(format!(
+            "worker database fence rollback task failed: {error}"
+        ))),
+        Err(_) => {
+            rollback.abort();
+            let _ = rollback.await;
+            Err(crate::common::errors::MegaError::Other(format!(
+                "worker database fence rollback timed out after {FENCE_ROLLBACK_TIMEOUT_MS}ms"
+            )))
         }
     }
 }
@@ -172,31 +151,71 @@ async fn run_fence_refresh(
 pub(crate) async fn try_acquire_worker_fence(
     connection: &DatabaseConnection,
     worker_id: u32,
-    health: Option<Arc<WorkerLeaseHealth>>,
 ) -> Result<Option<WorkerFence>, crate::common::errors::MegaError> {
     if connection.get_database_backend() != DatabaseBackend::Postgres {
         return Ok(None);
     }
 
-    let transaction = connection.begin().await?;
+    let transaction = timeout(
+        Duration::from_millis(FENCE_ACQUIRE_TIMEOUT_MS),
+        connection.begin(),
+    )
+    .await
+    .map_err(|_| {
+        crate::common::errors::MegaError::Other(format!(
+            "worker database fence acquisition timed out after {FENCE_ACQUIRE_TIMEOUT_MS}ms"
+        ))
+    })??;
     let statement = Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "SELECT pg_try_advisory_xact_lock($1, $2) AS locked",
         vec![WORKER_FENCE_NAMESPACE.into(), (worker_id as i32).into()],
     );
-    let Some(row) = transaction.query_one_raw(statement).await? else {
-        transaction.rollback().await?;
+    let row = match timeout(
+        Duration::from_millis(FENCE_ACQUIRE_TIMEOUT_MS),
+        transaction.query_one_raw(statement),
+    )
+    .await
+    {
+        Ok(Ok(row)) => row,
+        Ok(Err(error)) => {
+            if let Err(rollback_error) = rollback_fence(transaction).await {
+                tracing::warn!(error = %rollback_error, "failed to roll back worker fence after query error");
+            }
+            return Err(error.into());
+        }
+        Err(_) => {
+            if let Err(error) = rollback_fence(transaction).await {
+                tracing::warn!(error = %error, "failed to roll back timed-out worker fence query");
+            }
+            return Err(crate::common::errors::MegaError::Other(format!(
+                "worker database fence query timed out after {FENCE_ACQUIRE_TIMEOUT_MS}ms"
+            )));
+        }
+    };
+    let Some(row) = row else {
+        if let Err(error) = rollback_fence(transaction).await {
+            tracing::warn!(error = %error, "failed to roll back empty worker fence query");
+        }
         return Err(crate::common::errors::MegaError::Other(
             "worker fence query returned no row".to_string(),
         ));
     };
-    let locked: bool = row.try_get("", "locked")?;
+    let locked: bool = match row.try_get("", "locked") {
+        Ok(locked) => locked,
+        Err(error) => {
+            if let Err(rollback_error) = rollback_fence(transaction).await {
+                tracing::warn!(error = %rollback_error, "failed to roll back worker fence after result error");
+            }
+            return Err(error.into());
+        }
+    };
     if !locked {
-        transaction.rollback().await?;
+        rollback_fence(transaction).await?;
         return Ok(None);
     }
 
-    Ok(Some(WorkerFence::new(transaction, health)))
+    Ok(Some(WorkerFence::new(transaction)))
 }
 
 struct WorkerLeaseInner {
@@ -297,10 +316,19 @@ impl SnowflakeWorkerLease {
             Ok(mut task) => task.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
-        let task_error = if let Some(task) = task {
-            task.await
-                .err()
-                .map(|error| crate::common::errors::MegaError::Other(error.to_string()))
+        let task_error = if let Some(mut task) = task {
+            match timeout(Duration::from_millis(WORKER_CLEANUP_TIMEOUT_MS), &mut task).await {
+                Ok(result) => result
+                    .err()
+                    .map(|error| crate::common::errors::MegaError::Other(error.to_string())),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    Some(crate::common::errors::MegaError::Other(format!(
+                        "snowflake worker refresh shutdown timed out after {WORKER_CLEANUP_TIMEOUT_MS}ms"
+                    )))
+                }
+            }
         } else {
             None
         };
@@ -330,17 +358,19 @@ impl Drop for WorkerLeaseInner {
         id_generator::revoke_worker_lease(&self.health);
         self.cancel.cancel();
 
-        let refresh_started = match self.task.lock() {
-            Ok(task) => task.is_some(),
-            Err(poisoned) => poisoned.into_inner().is_some(),
-        };
-        if !refresh_started && let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let mut connection = self.connection.clone();
             let key = self.key.clone();
             let token = self.token.clone();
+            let fence = self.fence.clone();
             handle.spawn(async move {
                 if let Err(error) = release_slot_bounded(&mut connection, &key, &token).await {
-                    tracing::warn!(error = %error, slot_key = %key, "failed to release unstarted snowflake worker slot");
+                    tracing::warn!(error = %error, slot_key = %key, "failed to release dropped snowflake worker slot");
+                }
+                if let Some(fence) = fence
+                    && let Err(error) = fence.shutdown().await
+                {
+                    tracing::warn!(error = %error, "failed to release dropped snowflake worker fence");
                 }
             });
         }
@@ -358,6 +388,30 @@ pub(crate) async fn claim_snowflake_worker(
     connection: &ConnectionManager,
     database: &DatabaseConnection,
 ) -> Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError> {
+    claim_snowflake_worker_inner(connection, database, None).await
+}
+
+/// Claim the Redis lease for one explicitly configured worker ID. The explicit
+/// value remains the source of the ID, but it is still backed by the same Redis
+/// lease and PostgreSQL fence as an automatically selected worker.
+pub(crate) async fn claim_snowflake_worker_for_id(
+    connection: &ConnectionManager,
+    database: &DatabaseConnection,
+    worker_id: u32,
+) -> Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError> {
+    if worker_id > MAX_WORKER_ID {
+        return Err(crate::common::errors::MegaError::IdGenerationUnavailable(
+            format!("worker ID {worker_id} is outside 0..={MAX_WORKER_ID}"),
+        ));
+    }
+    claim_snowflake_worker_inner(connection, database, Some(worker_id)).await
+}
+
+async fn claim_snowflake_worker_inner(
+    connection: &ConnectionManager,
+    database: &DatabaseConnection,
+    preferred_worker_id: Option<u32>,
+) -> Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError> {
     let identity = id_generator::process_identity();
     let token = Uuid::new_v4().to_string();
     let cancellation = CancellationToken::new();
@@ -372,6 +426,7 @@ pub(crate) async fn claim_snowflake_worker(
             SLOT_KEY_PREFIX,
             &scan_identity,
             scan_token,
+            preferred_worker_id,
             Some(&scan_database),
             &scan_cancellation,
         )
@@ -469,12 +524,16 @@ async fn claim_worker_lease(
     slot_key_prefix: &str,
     identity: &str,
     token: String,
+    preferred_worker_id: Option<u32>,
     database: Option<&DatabaseConnection>,
     cancellation: &CancellationToken,
 ) -> Result<Option<SnowflakeWorkerLease>, crate::common::errors::MegaError> {
     let mut conn = connection.clone();
+    let worker_ids = preferred_worker_id
+        .map(|worker_id| vec![worker_id])
+        .unwrap_or_else(|| (0..=MAX_WORKER_ID).collect());
 
-    for worker_id in 0..=MAX_WORKER_ID {
+    for worker_id in worker_ids {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -504,8 +563,9 @@ async fn claim_worker_lease(
                     let _ = release_slot_bounded(&mut conn, &key, &token).await;
                     return Ok(None);
                 }
+                let health = WorkerLeaseHealth::claimed();
                 let fence = if let Some(database) = database {
-                    match try_acquire_worker_fence(database, worker_id, None).await {
+                    match try_acquire_worker_fence(database, worker_id).await {
                         Ok(Some(fence)) => Some(fence),
                         Ok(None) => {
                             let _ = release_slot_bounded(&mut conn, &key, &token).await;
@@ -526,7 +586,6 @@ async fn claim_worker_lease(
                     }
                     return Ok(None);
                 }
-                let health = WorkerLeaseHealth::claimed();
                 let lease = SnowflakeWorkerLease::new(
                     worker_id,
                     key,
@@ -595,7 +654,7 @@ async fn run_slot_refresh(config: SlotRefreshConfig) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                stop_refresh(&mut conn, &key, &token, &health).await;
+                stop_refresh(&mut conn, &key, &token, &health, fence.as_ref()).await;
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
@@ -609,7 +668,7 @@ async fn run_slot_refresh(config: SlotRefreshConfig) {
             && let Err(error) = fence.verify().await
         {
             tracing::warn!(error = %error, slot_key = %key, "snowflake worker database fence lost");
-            stop_refresh(&mut conn, &key, &token, &health).await;
+            stop_refresh(&mut conn, &key, &token, &health, Some(fence)).await;
             break;
         }
 
@@ -625,7 +684,7 @@ async fn run_slot_refresh(config: SlotRefreshConfig) {
                         slot_key = %key,
                         "snowflake worker refresh completed after local lease revocation"
                     );
-                    stop_refresh(&mut conn, &key, &token, &health).await;
+                    stop_refresh(&mut conn, &key, &token, &health, fence.as_ref()).await;
                     break;
                 }
             }
@@ -634,7 +693,7 @@ async fn run_slot_refresh(config: SlotRefreshConfig) {
                     slot_key = %key,
                     "snowflake worker slot refresh lost ownership"
                 );
-                stop_refresh(&mut conn, &key, &token, &health).await;
+                stop_refresh(&mut conn, &key, &token, &health, fence.as_ref()).await;
                 break;
             }
             Ok(Err(error)) => {
@@ -643,7 +702,7 @@ async fn run_slot_refresh(config: SlotRefreshConfig) {
                     slot_key = %key,
                     "snowflake worker slot refresh failed"
                 );
-                stop_refresh(&mut conn, &key, &token, &health).await;
+                stop_refresh(&mut conn, &key, &token, &health, fence.as_ref()).await;
                 break;
             }
             Err(_) => {
@@ -652,7 +711,7 @@ async fn run_slot_refresh(config: SlotRefreshConfig) {
                     slot_key = %key,
                     "snowflake worker slot refresh timed out"
                 );
-                stop_refresh(&mut conn, &key, &token, &health).await;
+                stop_refresh(&mut conn, &key, &token, &health, fence.as_ref()).await;
                 break;
             }
         }
@@ -664,6 +723,7 @@ async fn stop_refresh(
     key: &str,
     token: &str,
     health: &std::sync::Arc<WorkerLeaseHealth>,
+    fence: Option<&WorkerFence>,
 ) {
     id_generator::revoke_worker_lease(health);
     match release_slot_bounded(connection, key, token).await {
@@ -671,6 +731,11 @@ async fn stop_refresh(
         Err(error) => {
             tracing::warn!(error = %error, slot_key = %key, "failed to release snowflake worker slot");
         }
+    }
+    if let Some(fence) = fence
+        && let Err(error) = fence.shutdown().await
+    {
+        tracing::warn!(error = %error, slot_key = %key, "failed to release snowflake worker fence");
     }
 }
 
@@ -835,6 +900,7 @@ mod tests {
             prefix,
             identity,
             Uuid::new_v4().to_string(),
+            None,
             None,
             &cancellation,
         )
@@ -1146,7 +1212,7 @@ mod tests {
         let second = crate::jupiter::tests::test_db_connection(second_temp.path()).await;
         let worker_id = (Uuid::new_v4().as_u128() as u32) & MAX_WORKER_ID;
 
-        let first_fence = try_acquire_worker_fence(&first, worker_id, None)
+        let first_fence = try_acquire_worker_fence(&first, worker_id)
             .await
             .expect("first fence query")
             .expect("first process should acquire the fence");
@@ -1155,7 +1221,7 @@ mod tests {
             .await
             .expect("first fence should be alive");
         assert!(
-            try_acquire_worker_fence(&second, worker_id, None)
+            try_acquire_worker_fence(&second, worker_id)
                 .await
                 .expect("second fence query")
                 .is_none(),
@@ -1166,7 +1232,7 @@ mod tests {
             .shutdown()
             .await
             .expect("first process should release the fence");
-        let second_fence = try_acquire_worker_fence(&second, worker_id, None)
+        let second_fence = try_acquire_worker_fence(&second, worker_id)
             .await
             .expect("second fence retry")
             .expect("worker should be reusable after the first fence shuts down");

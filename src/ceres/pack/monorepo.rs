@@ -121,13 +121,14 @@ impl RepoHandler for MonoRepo {
         false
     }
 
-    async fn refs_with_head_hash(&self) -> (String, Vec<Refs>) {
+    async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
         let storage = self.storage.mono_storage();
 
-        let path_refs = storage
-            .get_all_refs(self.path.to_str().unwrap(), false)
-            .await
-            .unwrap();
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".to_string()))?;
+        let path_refs = storage.get_all_refs(path, false).await?;
 
         let heads_exist = path_refs
             .iter()
@@ -140,40 +141,47 @@ impl RepoHandler for MonoRepo {
             let target_path = self.path.clone();
             let mut refs = vec![];
 
-            let root_refs = storage.get_all_refs("/", true).await.unwrap();
+            let root_refs = storage.get_all_refs("/", true).await?;
 
             for root_ref in root_refs {
                 let (tree_hash, commit_hash) = (root_ref.ref_tree_hash, root_ref.ref_commit_hash);
-                let mut tree: Tree = Tree::from_mega_model(
-                    storage.get_tree_by_hash(&tree_hash).await.unwrap().unwrap(),
-                );
+                let tree_model = storage
+                    .get_tree_by_hash(&tree_hash)
+                    .await?
+                    .ok_or_else(|| MegaError::NotFound(format!("tree {tree_hash} not found")))?;
+                let mut tree: Tree = Tree::from_mega_model(tree_model);
 
-                let commit: Commit = Commit::from_mega_model(
+                let commit_model =
                     storage
                         .get_commit_by_hash(&commit_hash)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                );
+                        .await?
+                        .ok_or_else(|| {
+                            MegaError::NotFound(format!("commit {commit_hash} not found"))
+                        })?;
+                let commit: Commit = Commit::from_mega_model(commit_model);
 
                 for component in target_path.components() {
                     if component != Component::RootDir {
-                        let path_compo_name = component.as_os_str().to_str().unwrap();
+                        let path_compo_name = component.as_os_str().to_str().ok_or_else(|| {
+                            MegaError::Other(
+                                "repository path component is not valid UTF-8".to_string(),
+                            )
+                        })?;
                         let path_compo_hash = tree
                             .tree_items
                             .iter()
                             .find(|x| x.name == path_compo_name)
                             .map(|x| x.id);
                         if let Some(hash) = path_compo_hash {
-                            tree = Tree::from_mega_model(
-                                storage
-                                    .get_tree_by_hash(&hash.to_string())
-                                    .await
-                                    .unwrap()
-                                    .unwrap(),
-                            );
+                            let tree_model = storage
+                                .get_tree_by_hash(&hash.to_string())
+                                .await?
+                                .ok_or_else(|| {
+                                    MegaError::NotFound(format!("tree {hash} not found"))
+                                })?;
+                            tree = Tree::from_mega_model(tree_model);
                         } else {
-                            return (ZERO_ID.to_string(), vec![]);
+                            return Ok((ZERO_ID.to_string(), vec![]));
                         }
                     }
                 }
@@ -185,30 +193,23 @@ impl RepoHandler for MonoRepo {
                     &commit.message,
                 );
 
-                let new_mega_ref = match mega_refs::Model::new(
+                let new_mega_ref = mega_refs::Model::new(
                     &self.path,
                     root_ref.ref_name.clone(),
                     c.id.to_string(),
                     c.tree_id.to_string(),
                     false,
-                ) {
-                    Ok(new_ref) => new_ref,
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to allocate monorepo ref ID");
-                        return (ZERO_ID.to_string(), vec![]);
-                    }
-                };
+                )?;
 
                 storage
                     .mega_head_hash_with_txn(new_mega_ref.clone(), c)
-                    .await
-                    .unwrap();
+                    .await?;
 
                 refs.push(new_mega_ref.into());
             }
             refs
         };
-        self.find_head_hash(refs)
+        Ok(self.find_head_hash(refs))
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {

@@ -18,6 +18,8 @@ pub const SEQ_BIT_LEN: u8 = 8;
 pub const TIMESTAMP_SHIFT: u8 = WORKER_ID_BIT_LEN + SEQ_BIT_LEN;
 pub const MAX_WORKER_ID: u32 = (1 << WORKER_ID_BIT_LEN) - 1;
 pub const ENV_WORKER_ID: &str = "MEGA_ID_GENERATOR_WORKER_ID";
+pub const ENV_LAYOUT_VERSION: &str = "MEGA_ID_GENERATOR_LAYOUT_VERSION";
+pub const ID_LAYOUT_VERSION: &str = "8+8-v1";
 
 static CLAIMED_WORKER_ID: OnceLock<u32> = OnceLock::new();
 static GENERATOR_STATE: OnceLock<Mutex<GeneratorState>> = OnceLock::new();
@@ -333,6 +335,32 @@ pub fn process_identity() -> String {
         .unwrap_or_else(|| "mono-local".to_string())
 }
 
+/// Require an explicit rollout marker before enabling the 8+8 layout.
+///
+/// The marker is intentionally mandatory in the production context: an
+/// operator must stop old 6+8 writers before setting it, so a deployment that
+/// forgot the compatibility window fails closed instead of silently mixing
+/// ID layouts. The value is never logged.
+pub fn validate_layout_version() -> Result<(), MegaError> {
+    match std::env::var(ENV_LAYOUT_VERSION) {
+        Ok(value) => validate_layout_version_value(Some(value.trim())),
+        Err(std::env::VarError::NotPresent) => validate_layout_version_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(MegaError::IdGenerationUnavailable(format!(
+            "{ENV_LAYOUT_VERSION} is not valid UTF-8; refusing mixed Snowflake layouts"
+        ))),
+    }
+}
+
+fn validate_layout_version_value(value: Option<&str>) -> Result<(), MegaError> {
+    if value == Some(ID_LAYOUT_VERSION) {
+        return Ok(());
+    }
+
+    Err(MegaError::IdGenerationUnavailable(format!(
+        "{ENV_LAYOUT_VERSION} must be set to {ID_LAYOUT_VERSION} before enabling the 8+8 Snowflake layout"
+    )))
+}
+
 /// FNV-1a 32-bit. Stable across rustc versions (unlike `DefaultHasher`).
 pub fn fnv1a_32(bytes: &[u8]) -> u32 {
     let mut hash = 0x811c9dc5u32;
@@ -412,6 +440,12 @@ pub fn ensure_initialized() -> Result<(), MegaError> {
     {
         let state = lock_generator_state();
         if state.worker_id.is_some() {
+            if state.source == Some(WorkerIdSource::Hash) {
+                return Err(MegaError::IdGenerationUnavailable(
+                    "an exclusive worker ID is required; stable identity hash is diagnostic-only"
+                        .to_string(),
+                ));
+            }
             if state.source == Some(WorkerIdSource::Redis) && state.lease_health.is_none() {
                 return Err(MegaError::IdGenerationUnavailable(
                     "Redis worker selection is missing its active lease".to_string(),
@@ -538,6 +572,15 @@ mod tests {
         assert_eq!(MAX_WORKER_ID, 255);
         assert_eq!(1 << WORKER_ID_BIT_LEN, 256);
         assert_eq!(1 << SEQ_BIT_LEN, 256);
+    }
+
+    #[test]
+    fn layout_version_is_explicit_and_non_secret() {
+        assert_eq!(ID_LAYOUT_VERSION, "8+8-v1");
+        assert_eq!(ENV_LAYOUT_VERSION, "MEGA_ID_GENERATOR_LAYOUT_VERSION");
+        assert!(validate_layout_version_value(Some(ID_LAYOUT_VERSION)).is_ok());
+        assert!(validate_layout_version_value(None).is_err());
+        assert!(validate_layout_version_value(Some("6+8-v1")).is_err());
     }
 
     #[test]

@@ -74,8 +74,12 @@ The generator uses 8 worker bits and 8 sequence bits: this preserves 256 IDs
 per millisecond per worker and expands the worker space from 64 to 256. The
 two additional low bits used by the worker layout reduce the timestamp horizon
 by a factor of four, so old writers must be stopped before switching layouts.
-Worker source and a non-reversible process-identity digest are emitted in
-structured logs; Redis URLs, lease tokens, and pod secrets are not logged.
+Production startup requires `MEGA_ID_GENERATOR_LAYOUT_VERSION=8+8-v1`; set it
+only after all 6+8 writers are stopped. If that maintenance window cannot be
+guaranteed, keep the old release running and do not start the new layout. A
+different or missing marker fails closed. Worker source and a non-reversible
+process-identity digest are emitted in structured logs; Redis URLs, lease
+tokens, and pod secrets are not logged.
 
 ## Test configuration
 
