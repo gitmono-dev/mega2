@@ -2,9 +2,9 @@ use std::ops::Deref;
 
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
-    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set, TransactionTrait,
-    sea_query::Expr,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set,
+    TransactionTrait, sea_query::Expr,
 };
 
 use crate::{
@@ -158,6 +158,26 @@ impl GitDbStorage {
             .exec(txn)
             .await?;
         Ok(())
+    }
+
+    /// Deletes a ref only if it still points at the client-advertised object.
+    ///
+    /// The receive-pack old id is a lease, so a concurrent update must leave
+    /// the moved ref intact instead of turning a stale delete into data loss.
+    pub async fn remove_ref_if_unchanged<C: ConnectionTrait>(
+        &self,
+        repo_id: i64,
+        ref_name: &str,
+        expected_git_id: &str,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = import_refs::Entity::delete_many()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::RefName.eq(ref_name))
+            .filter(import_refs::Column::RefGitId.eq(expected_git_id))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn update_ref_in_txn(
@@ -553,9 +573,11 @@ impl GitDbStorage {
 mod tests {
     use std::sync::Arc;
 
+    use sea_orm::TransactionTrait;
+
     use super::GitDbStorage;
     use crate::{
-        callisto::git_tag,
+        callisto::{git_tag, import_refs, sea_orm_active_enums::RefTypeEnum},
         common::utils::generate_id,
         jupiter::{
             migration::apply_migrations,
@@ -602,6 +624,108 @@ mod tests {
                 .await
                 .expect("look up other repo")
                 .is_none()
+        );
+    }
+
+    fn branch_ref(repo_id: i64, ref_name: &str, ref_git_id: &str) -> import_refs::Model {
+        import_refs::Model {
+            id: generate_id(),
+            repo_id,
+            ref_name: ref_name.to_owned(),
+            ref_git_id: ref_git_id.to_owned(),
+            ref_type: RefTypeEnum::Branch,
+            default_branch: false,
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_ref_if_unchanged_is_atomic_and_repo_scoped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("apply migrations");
+        let storage = GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        let repo_id = 29;
+        let original = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let moved = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let other_repo = "cccccccccccccccccccccccccccccccccccccccc";
+        storage
+            .save_ref(repo_id, branch_ref(repo_id, "refs/heads/cas", original))
+            .await
+            .expect("save ref");
+        storage
+            .save_ref(repo_id, branch_ref(repo_id, "refs/heads/atomic", original))
+            .await
+            .expect("save atomic ref");
+        storage
+            .save_ref(
+                repo_id + 1,
+                branch_ref(repo_id + 1, "refs/heads/cas", other_repo),
+            )
+            .await
+            .expect("save other-repo ref");
+
+        storage
+            .update_ref(repo_id, "refs/heads/cas", moved)
+            .await
+            .expect("move ref before stale delete");
+
+        let txn = storage
+            .get_connection()
+            .begin()
+            .await
+            .expect("begin transaction");
+        assert!(
+            storage
+                .remove_ref_if_unchanged(repo_id, "refs/heads/atomic", original, &txn)
+                .await
+                .expect("delete unchanged ref")
+        );
+        assert!(
+            !storage
+                .remove_ref_if_unchanged(repo_id, "refs/heads/cas", original, &txn)
+                .await
+                .expect("check stale delete")
+        );
+        txn.rollback()
+            .await
+            .expect("rollback conflicted transaction");
+
+        let refs = storage.get_ref(repo_id).await.expect("load refs");
+        assert_eq!(refs.len(), 2, "a stale delete must roll back sibling work");
+        assert_eq!(
+            refs.iter()
+                .find(|reference| reference.ref_name == "refs/heads/cas")
+                .map(|reference| reference.ref_git_id.as_str()),
+            Some(moved)
+        );
+        assert_eq!(
+            storage
+                .get_ref(repo_id + 1)
+                .await
+                .expect("load other-repo refs")
+                .len(),
+            1,
+            "the repository scope must be part of the conditional delete"
+        );
+
+        assert!(
+            storage
+                .remove_ref_if_unchanged(
+                    repo_id,
+                    "refs/heads/cas",
+                    moved,
+                    storage.get_connection(),
+                )
+                .await
+                .expect("delete current ref")
+        );
+        assert_eq!(
+            storage.get_ref(repo_id).await.expect("reload refs").len(),
+            1
         );
     }
 }

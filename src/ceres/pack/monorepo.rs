@@ -50,7 +50,10 @@ use crate::{
         api::common::Pagination,
         policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
     },
-    jupiter::{storage::Storage, utils::converter::FromMegaModel},
+    jupiter::{
+        storage::{Storage, base_storage::StorageConnector},
+        utils::converter::FromMegaModel,
+    },
 };
 #[rustfmt::skip]
 use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
@@ -878,8 +881,13 @@ impl MonoRepo {
         let txn = self.storage.begin_db_transaction().await?;
         for cmd in &cmds {
             if cmd.ref_type == RefTypeEnum::Branch {
-                self.apply_cl_mega_ref_for_push_command(cmd, Some(&txn))
-                    .await?;
+                if let Err(error) = self
+                    .apply_cl_mega_ref_for_push_command(cmd, Some(&txn))
+                    .await
+                {
+                    let _ = txn.rollback().await;
+                    return Err(error);
+                }
             }
         }
         txn.commit().await.map_err(MegaError::Db)?;
@@ -937,12 +945,32 @@ impl MonoRepo {
                      use the Web UI / API to manage the default branch"
                 )));
             }
-            let existing = match txn {
-                Some(t) => storage.get_ref_by_name_in_txn(&cmd.ref_name, t).await?,
-                None => storage.get_ref_by_name(&cmd.ref_name).await?,
+            let path = self
+                .path
+                .to_str()
+                .ok_or_else(|| MegaError::Other("monorepo path is not valid UTF-8".to_owned()))?;
+            let deleted = match txn {
+                Some(t) => {
+                    storage
+                        .remove_ref_if_unchanged(path, &cmd.ref_name, &cmd.old_id, t)
+                        .await?
+                }
+                None => {
+                    storage
+                        .remove_ref_if_unchanged(
+                            path,
+                            &cmd.ref_name,
+                            &cmd.old_id,
+                            storage.get_connection(),
+                        )
+                        .await?
+                }
             };
-            if let Some(existing) = existing {
-                storage.remove_ref(existing).await?;
+            if !deleted {
+                return Err(MegaError::Other(format!(
+                    "ref {} moved since advertisement (expected {})",
+                    cmd.ref_name, cmd.old_id
+                )));
             }
             return Ok(());
         }

@@ -2604,6 +2604,8 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
         return;
     }
 
+    const ZERO_ID: &str = "0000000000000000000000000000000000000000";
+
     let env = GitCliEnv::new();
     let token = git_cli::resolve_seed_token();
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
@@ -2768,6 +2770,27 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
 
     // Delete-only regression: skips unpack entirely and removes the ref.
     let second_ref = cl_refs[0].0.clone();
+    let second_ref_tip = cl_refs[0].1.clone();
+    let stale_old = "d".repeat(40);
+    let stale_reply = raw_receive_pack(
+        &env,
+        port,
+        &token,
+        "stale-cl-delete",
+        &[receive_pack_command(&stale_old, ZERO_ID, &second_ref, true)],
+    );
+    assert_receive_pack_status(
+        &stale_reply,
+        &format!(
+            "ng {second_ref} Other error: ref {second_ref} moved since advertisement (expected {stale_old})"
+        ),
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &second_ref),
+        Some(second_ref_tip),
+        "a stale MonoRepo CL delete must preserve the current ref"
+    );
+
     let delete_only = git_cli::git_cli(
         &env.case_dir,
         &token,
@@ -3474,13 +3497,94 @@ fn integration_git_cli_import_receive_pack_packless_statuses() {
     );
     assert_eq!(
         remote_ref(&env.case_dir, &token, &remote_url, &valid_branch),
-        Some(commit_id),
+        Some(commit_id.clone()),
         "the surviving import branch must be finalized"
     );
     assert_eq!(
         remote_ref(&env.case_dir, &token, &remote_url, &missing_branch),
         None,
         "a rejected pack-less import branch must never be persisted"
+    );
+
+    // FC-09: a stale branch delete must not remove the ref after a concurrent
+    // update, and the same advertised-old-id lease applies to import tags.
+    fs::write(
+        env.case_dir.join(&local_repo).join("payload.txt"),
+        "fc09 payload moved\n",
+    )
+    .expect("update import repository payload");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "add", "payload.txt"],
+        ),
+        "stage moved import repository payload",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "commit", "-m", "FC09 import move"],
+        ),
+        "commit moved import repository payload",
+    );
+    let moved_commit = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", &local_repo, "rev-parse", "HEAD"],
+    );
+    let valid_refspec = format!("HEAD:{valid_branch}");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", &local_repo, "push", "origin", &valid_refspec],
+        ),
+        "move import branch before stale delete",
+    );
+    let stale_branch_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-stale-branch-delete",
+        &receive_pack_path,
+        &[receive_pack_command(
+            &commit_id,
+            ZERO_ID,
+            &valid_branch,
+            true,
+        )],
+    );
+    assert_receive_pack_status(
+        &stale_branch_reply,
+        &format!(
+            "ng {valid_branch} Other error: ref {valid_branch} moved since advertisement (expected {commit_id})"
+        ),
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &valid_branch),
+        Some(moved_commit),
+        "a stale import branch delete must preserve the moved ref"
+    );
+
+    let tag_ref = format!("refs/tags/{annotated_tag}");
+    let stale_tag_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-stale-tag-delete",
+        &receive_pack_path,
+        &[receive_pack_command(&missing, ZERO_ID, &tag_ref, true)],
+    );
+    assert_receive_pack_status(
+        &stale_tag_reply,
+        &format!("ng {tag_ref} tag {tag_ref} moved since advertisement (expected {missing})"),
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &tag_ref),
+        Some(tag_object_id),
+        "a stale import tag delete must preserve the moved tag"
     );
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));

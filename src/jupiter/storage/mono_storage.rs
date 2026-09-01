@@ -92,6 +92,24 @@ impl MonoStorage {
         Ok(())
     }
 
+    /// Deletes a MonoRepo ref only while it still points at the advertised
+    /// commit. The path keeps same-named refs in other repositories isolated.
+    pub async fn remove_ref_if_unchanged<C: ConnectionTrait>(
+        &self,
+        path: &str,
+        ref_name: &str,
+        expected_commit_hash: &str,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = mega_refs::Entity::delete_many()
+            .filter(mega_refs::Column::Path.eq(path))
+            .filter(mega_refs::Column::RefName.eq(ref_name))
+            .filter(mega_refs::Column::RefCommitHash.eq(expected_commit_hash))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
     pub async fn get_refs_for_paths_and_cls(
         &self,
         paths: &[&str],

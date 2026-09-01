@@ -39,7 +39,7 @@ use crate::{
     jupiter::{
         redis::lock::RedLock,
         service::git_service::GitService,
-        storage::{Storage, git_db_storage::GitDbStorage},
+        storage::{Storage, base_storage::StorageConnector, git_db_storage::GitDbStorage},
         utils::converter::{FromGitModel, FromMegaModel},
     },
 };
@@ -343,10 +343,23 @@ impl RepoHandler for ImportRepo {
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?;
             }
-            CommandType::Delete => storage
-                .remove_ref(self.repo.repo_id, &refs.ref_name)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?,
+            CommandType::Delete => {
+                if !storage
+                    .remove_ref_if_unchanged(
+                        self.repo.repo_id,
+                        &refs.ref_name,
+                        &refs.old_id,
+                        storage.get_connection(),
+                    )
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?
+                {
+                    return Err(GitError::CustomError(format!(
+                        "tag {} moved since advertisement (expected {})",
+                        refs.ref_name, refs.old_id
+                    )));
+                }
+            }
             CommandType::Update => {
                 storage
                     .update_ref(self.repo.repo_id, &refs.ref_name, &refs.new_id)
@@ -494,9 +507,21 @@ impl ImportRepo {
                     continue;
                 }
                 if let CommandType::Delete = cmd.command_type {
-                    git_db
-                        .remove_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &txn)
-                        .await?;
+                    if !git_db
+                        .remove_ref_if_unchanged(
+                            self.repo.repo_id,
+                            &cmd.ref_name,
+                            &cmd.old_id,
+                            &txn,
+                        )
+                        .await?
+                    {
+                        let _ = txn.rollback().await;
+                        return Err(MegaError::Other(format!(
+                            "ref {} moved since advertisement (expected {})",
+                            cmd.ref_name, cmd.old_id
+                        )));
+                    }
                 }
             }
             txn.commit().await.map_err(MegaError::Db)?;
@@ -589,9 +614,21 @@ impl ImportRepo {
                             .await?;
                     }
                     CommandType::Delete => {
-                        git_db
-                            .remove_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &txn)
-                            .await?;
+                        if !git_db
+                            .remove_ref_if_unchanged(
+                                self.repo.repo_id,
+                                &cmd.ref_name,
+                                &cmd.old_id,
+                                &txn,
+                            )
+                            .await?
+                        {
+                            let _ = txn.rollback().await;
+                            return Err(MegaError::Other(format!(
+                                "ref {} moved since advertisement (expected {})",
+                                cmd.ref_name, cmd.old_id
+                            )));
+                        }
                     }
                     CommandType::Update => {
                         git_db
