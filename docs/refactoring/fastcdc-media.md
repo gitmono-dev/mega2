@@ -1,6 +1,6 @@
 # FastCDC Media
 
-> 状态：FC-01～FC-07 已定义 feature-gated v1 chunker/manifest contract、私有 Media scope、pending 上传会话、标准 LFS fallback 和 HTTP API；默认构建不启用该能力，最终 family release 仍由 FC-14 收口。
+> 状态：FC-01～FC-07 已实现并验证 feature-gated v1 chunker/manifest contract、私有 Media scope、pending 上传会话、标准 LFS fallback 和 HTTP API。FC-07 通过隔离真实服务验证了 repository-scoped route、Bearer 鉴权、capabilities 和运行时 OpenAPI；默认构建不启用该能力，最终 family release 仍由 FC-14 收口。
 
 ## v1 manifest
 
