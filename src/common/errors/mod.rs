@@ -25,6 +25,77 @@ pub use vault::{RvError, VaultError, VaultResult};
 
 pub type MegaResult = Result<(), MegaError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbRetryKind {
+    Deadlock,
+    SerializationFailure,
+}
+
+impl DbRetryKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadlock => "deadlock",
+            Self::SerializationFailure => "serialization_failure",
+        }
+    }
+}
+
+/// Classifies only PostgreSQL deadlocks and serialization failures as retryable.
+pub fn classify_db_error(err: &sea_orm::DbErr) -> Option<DbRetryKind> {
+    if let sea_orm::DbErr::Exec(runtime) | sea_orm::DbErr::Query(runtime) = err
+        && let sea_orm::RuntimeErr::SqlxError(source) = runtime
+        && let sea_orm::SqlxError::Database(database_error) = source.as_ref()
+    {
+        let database_error = database_error.as_ref();
+        if let Some(kind) = database_error.code().as_deref().and_then(classify_sqlstate) {
+            return Some(kind);
+        }
+
+        return classify_db_error_text(database_error.message());
+    }
+
+    match err {
+        sea_orm::DbErr::Custom(message)
+        | sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(message))
+        | sea_orm::DbErr::Query(sea_orm::RuntimeErr::Internal(message)) => {
+            classify_db_error_text(message)
+        }
+        _ => None,
+    }
+}
+
+pub fn db_err_is_retryable_serialization(err: &sea_orm::DbErr) -> bool {
+    classify_db_error(err).is_some()
+}
+
+fn classify_sqlstate(code: &str) -> Option<DbRetryKind> {
+    match code.trim() {
+        "40P01" => Some(DbRetryKind::Deadlock),
+        "40001" => Some(DbRetryKind::SerializationFailure),
+        _ => None,
+    }
+}
+
+fn classify_db_error_text(text: &str) -> Option<DbRetryKind> {
+    let lower = text.to_ascii_lowercase();
+    let has_sqlstate = |state: &str| {
+        lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| token == state)
+    };
+
+    if has_sqlstate("40p01") || lower.contains("deadlock detected") {
+        Some(DbRetryKind::Deadlock)
+    } else if has_sqlstate("40001")
+        || lower.contains("serialization failure")
+        || lower.contains("could not serialize access")
+    {
+        Some(DbRetryKind::SerializationFailure)
+    } else {
+        None
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum MegaError {
     #[error("config error: {0}")]
@@ -242,5 +313,84 @@ mod tests {
     #[test]
     fn print_does_not_panic() {
         MegaError::Other("print smoke".to_owned()).print();
+    }
+
+    #[test]
+    fn classifies_postgres_retryable_errors() {
+        let deadlock = sea_orm::DbErr::Custom("ERROR: 40P01 deadlock detected".to_owned());
+        let serialization =
+            sea_orm::DbErr::Custom("ERROR: 40001 could not serialize access".to_owned());
+
+        assert_eq!(classify_db_error(&deadlock), Some(DbRetryKind::Deadlock));
+        assert_eq!(
+            classify_db_error(&serialization),
+            Some(DbRetryKind::SerializationFailure)
+        );
+        assert!(db_err_is_retryable_serialization(&deadlock));
+    }
+
+    #[test]
+    fn rejects_non_retryable_database_errors() {
+        let unique = sea_orm::DbErr::Custom(
+            "duplicate key value violates unique constraint \"git_blob_pkey\"".to_owned(),
+        );
+        let migration = sea_orm::DbErr::Migration("40P01 is not a database execution error".into());
+
+        assert_eq!(classify_db_error(&unique), None);
+        assert_eq!(classify_db_error(&migration), None);
+        assert!(!db_err_is_retryable_serialization(&unique));
+    }
+
+    #[test]
+    fn classifies_structured_sqlstate_without_logging_database_details() {
+        use std::{borrow::Cow, error::Error, sync::Arc};
+
+        #[derive(Debug)]
+        struct FakeDatabaseError {
+            code: &'static str,
+        }
+
+        impl std::fmt::Display for FakeDatabaseError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "database error {}", self.code)
+            }
+        }
+
+        impl Error for FakeDatabaseError {}
+
+        impl sea_orm::sqlx::error::DatabaseError for FakeDatabaseError {
+            fn message(&self) -> &str {
+                "database error"
+            }
+
+            fn code(&self) -> Option<Cow<'_, str>> {
+                Some(Cow::Borrowed(self.code))
+            }
+
+            fn as_error(&self) -> &(dyn Error + Send + Sync + 'static) {
+                self
+            }
+
+            fn as_error_mut(&mut self) -> &mut (dyn Error + Send + Sync + 'static) {
+                self
+            }
+
+            fn into_error(self: Box<Self>) -> Box<dyn Error + Send + Sync + 'static> {
+                self
+            }
+
+            fn kind(&self) -> sea_orm::sqlx::error::ErrorKind {
+                sea_orm::sqlx::error::ErrorKind::Other
+            }
+        }
+
+        let error = sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sea_orm::SqlxError::Database(Box::new(FakeDatabaseError { code: "40001" })),
+        )));
+
+        assert_eq!(
+            classify_db_error(&error),
+            Some(DbRetryKind::SerializationFailure)
+        );
     }
 }
