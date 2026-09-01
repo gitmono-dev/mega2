@@ -257,10 +257,40 @@ mod tests {
 
     #[test]
     fn streaming_and_memory_agree() {
+        struct FragmentedReader<'a> {
+            data: &'a [u8],
+            offset: usize,
+            max_read: usize,
+        }
+
+        impl Read for FragmentedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let remaining = &self.data[self.offset..];
+                let count = remaining.len().min(buffer.len()).min(self.max_read);
+                buffer[..count].copy_from_slice(&remaining[..count]);
+                self.offset += count;
+                Ok(count)
+            }
+        }
+
         let data = vec![0xAB; MAX_SIZE + 123];
-        let streamed = chunk_reader(io::Cursor::new(&data)).unwrap();
+        let streamed = chunk_reader(FragmentedReader {
+            data: &data,
+            offset: 0,
+            max_read: 37,
+        })
+        .unwrap();
 
         assert_eq!(streamed, chunk_bytes(&data));
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|chunk| (chunk.offset, chunk.length))
+                .collect::<Vec<_>>(),
+            vec![(0, MAX_SIZE as u64), (MAX_SIZE as u64, 123)]
+        );
+        assert_eq!(streamed[0].chunk_hash, sha256_hex(&data[..MAX_SIZE]));
+        assert_eq!(streamed[1].chunk_hash, sha256_hex(&data[MAX_SIZE..]));
     }
 
     #[test]
