@@ -1,6 +1,6 @@
 # FastCDC Media
 
-> 状态：FC-02 已定义 feature-gated v1 manifest wire contract；对象 scope、上传/完成生命周期和 HTTP API 由后续 FC-03～FC-07 补齐。默认构建不启用该能力。
+> 状态：FC-01～FC-03 已定义 feature-gated v1 chunker/manifest contract 和私有 Media scope；上传/完成生命周期和 HTTP API 由后续 FC-04～FC-07 补齐。默认构建不启用该能力。
 
 ## v1 manifest
 
