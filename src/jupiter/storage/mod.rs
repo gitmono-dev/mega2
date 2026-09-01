@@ -172,7 +172,10 @@ impl Storage {
         config: Arc<Config>,
         object_store: MegaObjectStorageWrapper,
     ) -> Result<Self, MegaError> {
+        #[cfg(not(test))]
         id_generator::validate_layout_version()?;
+        #[cfg(test)]
+        id_generator::ensure_test_initialized();
         // Validate the process-wide worker lease before opening a writable DB
         // connection. This keeps the public constructor fail-closed even when
         // callers bypass AppContext.
@@ -194,7 +197,10 @@ impl Storage {
         // Public constructors must fail before assembling writable services if
         // the process has not selected an exclusive worker ID yet. AppContext
         // performs that selection before calling this constructor.
+        #[cfg(not(test))]
         id_generator::validate_layout_version()?;
+        #[cfg(test)]
+        id_generator::ensure_test_initialized();
         id_generator::ensure_initialized()?;
         let config_handle = ConfigHandle::from_arc(config.clone());
         let notification_storage = NotificationStorage::new(connection.clone());

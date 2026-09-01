@@ -1418,7 +1418,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_postgres_worker_fence_is_rejected() {
-        let error = match try_acquire_worker_fence(&DatabaseConnection::default(), 0).await {
+        let mock_non_postgres =
+            sea_orm::MockDatabase::new(sea_orm::DbBackend::Sqlite).into_connection();
+        let error = match try_acquire_worker_fence(&mock_non_postgres, 0).await {
             Err(error) => error,
             Ok(_) => panic!("worker identity must not run without a PostgreSQL fence"),
         };

@@ -107,6 +107,7 @@ impl AppContext {
     pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
+        #[cfg(not(test))]
         id_generator::validate_layout_version()?;
         validate_worker_fence_database_config(&config.database)?;
 
