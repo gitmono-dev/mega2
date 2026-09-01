@@ -95,7 +95,9 @@ prepare 响应使用 `manifest_id` 和 `missing_chunks`；已发布 manifest 响
 `/api/v1/lfs/libra/media/v1/...` alias。
 
 所有端点都要求 `Authorization: Bearer <mono-access-token>`，不会接受普通 LFS 的 Basic
-凭据作为 Media 身份。相对上述 Media 前缀的路由为：
+凭据作为 Media 身份。`/api/openapi.json` 的每个 Media operation 都引用
+`monoAccessToken` HTTP Bearer security scheme，供生成客户端发现这一要求。相对上述 Media
+前缀的路由为：
 
 | 方法 | 路径 | 结果 |
 |---|---|---|

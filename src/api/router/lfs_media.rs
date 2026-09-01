@@ -12,6 +12,7 @@ use axum::{
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa::openapi::{
     OpenApi,
+    security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
     server::{Server, ServerVariableBuilder},
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -28,6 +29,7 @@ use crate::{
 };
 
 const MEDIA_OPENAPI_PREFIX: &str = "/info/lfs/libra/media/v1";
+const MEDIA_OPENAPI_SECURITY_SCHEME: &str = "monoAccessToken";
 
 fn media_openapi_server() -> Server {
     let mut server = Server::new("/{repository}");
@@ -67,6 +69,18 @@ pub(crate) fn routes() -> OpenApiRouter<MonoApiServiceState> {
 /// mount deliberately excludes Media because it cannot provide this context.
 pub(crate) fn openapi() -> OpenApi {
     let mut api = routes().into_openapi();
+    api.components.get_or_insert_default().add_security_scheme(
+        MEDIA_OPENAPI_SECURITY_SCHEME,
+        SecurityScheme::Http(
+            HttpBuilder::new()
+                .scheme(HttpAuthScheme::Bearer)
+                .bearer_format("Mono access token")
+                .description(Some(
+                    "Mono access token sent as `Authorization: Bearer <token>`.",
+                ))
+                .build(),
+        ),
+    );
     let paths = std::mem::take(&mut api.paths.paths);
     for (path, mut item) in paths {
         item.servers = Some(vec![media_openapi_server()]);
@@ -155,6 +169,7 @@ async fn read_body(request: Request, limit: usize) -> Result<bytes::Bytes, Media
         (status = 401, description = "Mono access token required"),
         (status = 404, description = "Repository context unavailable", content_type = "application/vnd.git-lfs+json")
     ),
+    security(("monoAccessToken" = [])),
     tag = LFS_TAG
 )]
 async fn capabilities(
@@ -177,6 +192,7 @@ async fn capabilities(
         (status = 413, description = "Manifest exceeds 10 MiB"),
         (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
+    security(("monoAccessToken" = [])),
     tag = LFS_TAG
 )]
 async fn prepare(
@@ -212,6 +228,7 @@ async fn prepare(
         (status = 413, description = "Chunk exceeds 8 MiB"),
         (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
+    security(("monoAccessToken" = [])),
     tag = LFS_TAG
 )]
 async fn upload_chunk(
@@ -243,6 +260,7 @@ async fn upload_chunk(
         (status = 409, description = "Manifest or fallback state conflicts", content_type = "application/vnd.git-lfs+json"),
         (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
+    security(("monoAccessToken" = [])),
     tag = LFS_TAG
 )]
 async fn finalize(
@@ -271,6 +289,7 @@ async fn finalize(
         (status = 409, description = "Stored manifest conflicts with its Media object", content_type = "application/vnd.git-lfs+json"),
         (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
+    security(("monoAccessToken" = [])),
     tag = LFS_TAG
 )]
 async fn manifest(
@@ -303,6 +322,7 @@ async fn manifest(
         (status = 409, description = "Stored manifest conflicts with its Media object", content_type = "application/vnd.git-lfs+json"),
         (status = 500, description = "Storage operation failed", content_type = "application/vnd.git-lfs+json")
     ),
+    security(("monoAccessToken" = [])),
     tag = LFS_TAG
 )]
 async fn download_chunk(
@@ -844,6 +864,50 @@ mod tests {
                     "{method} {path} is missing documented HTTP {status}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn media_openapi_declares_bearer_authentication_for_every_operation() {
+        let document = serde_json::to_value(openapi()).expect("serialize OpenAPI document");
+        assert_eq!(
+            document["components"]["securitySchemes"][MEDIA_OPENAPI_SECURITY_SCHEME]["type"],
+            "http"
+        );
+        assert_eq!(
+            document["components"]["securitySchemes"][MEDIA_OPENAPI_SECURITY_SCHEME]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            document["components"]["securitySchemes"][MEDIA_OPENAPI_SECURITY_SCHEME]["bearerFormat"],
+            "Mono access token"
+        );
+
+        for (path, method) in [
+            ("/info/lfs/libra/media/v1/capabilities", "get"),
+            ("/info/lfs/libra/media/v1/manifests", "post"),
+            (
+                "/info/lfs/libra/media/v1/manifests/{manifest_id}/chunks/{hash}",
+                "put",
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/{manifest_id}/finalize",
+                "post",
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}",
+                "get",
+            ),
+            (
+                "/info/lfs/libra/media/v1/manifests/by-media/{media_oid}/chunks/{hash}",
+                "get",
+            ),
+        ] {
+            assert_eq!(
+                document["paths"][path][method]["security"],
+                serde_json::json!([{MEDIA_OPENAPI_SECURITY_SCHEME: []}]),
+                "{method} {path} must require the Mono bearer token"
+            );
         }
     }
 }
