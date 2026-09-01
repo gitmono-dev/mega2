@@ -8,6 +8,12 @@
 >
 > 下列历史正文记录自 2026-06 起的 provider 注入 + workspace crate 演进，保留供审计。
 
+## 有界流式写入（FC-04）
+
+`MegaObjectStorage::put_stream_bounded` 用于需要有界内存并在流成功前不发布对象的替换式写入。trait 默认明确拒绝且不消费输入流，不能回退到全量缓冲；调用方也必须限制单个 stream item 的大小。
+
+内置 `ObjectStoreAdapter` 对 Local、GCS 和 S3 一律校验 `ObjectKey` 后走 multipart，不继承配置的 `SinglePut` 策略。非末尾 part 固定为 8 MiB，最后一段可更小；每次上传 part 都会等待完成后才读取后续输入，从而形成 backpressure。空对象使用空 PUT（S3 不能完成零 part multipart）。流、part 或 complete 失败时会 abort，既有对象保持未发布前的内容；multipart 不支持时返回现有 `OrbitResult` 错误，绝不回退为全对象缓冲。
+
 本文档记录 `monoengine` 对 `orbit` 对象存储库的依赖治理：把当前对 **orbit 实现 crate** 的**项目（path）引用**重构为只依赖 **`orbit-api`（纯 API/契约 crate）**，并通过依赖注入把唯一的具体实现构造点下沉到组合根 / 独立二进制边界。
 
 > **治理规范**：本文档遵循 **`general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md。

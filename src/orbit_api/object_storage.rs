@@ -206,6 +206,28 @@ pub trait MegaObjectStorage: Send + Sync {
         meta: ObjectMeta,
     ) -> OrbitResult<()>;
 
+    /// Atomically replace an object without buffering its entire contents.
+    ///
+    /// Implementations must bound upload buffering independently of object size,
+    /// apply backpressure to the input, and publish only after the stream succeeds.
+    /// Callers must also bound each input item because an implementation may need
+    /// to retain the current item while filling its upload buffer. Unlike
+    /// [`put_stream`](Self::put_stream), this operation does not inherit
+    /// create-only or single-PUT upload policies.
+    ///
+    /// Unsupported backends must fail explicitly rather than buffering the full
+    /// object. The default rejects the operation without consuming `data`.
+    async fn put_stream_bounded(
+        &self,
+        _key: &ObjectKey,
+        _data: ObjectByteStream,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        Err(IoOrbitError::Other(
+            "storage backend does not support bounded streaming writes".to_owned(),
+        ))
+    }
+
     /// Retrieve a single object from the storage backend.
     ///
     /// # Returns
@@ -362,9 +384,87 @@ pub fn dump_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use ObjectNamespace;
+    use futures::stream;
 
     use super::*;
+
+    struct UnsupportedStorage;
+
+    #[async_trait::async_trait]
+    impl MegaObjectStorage for UnsupportedStorage {
+        async fn put_stream(
+            &self,
+            _key: &ObjectKey,
+            _data: ObjectByteStream,
+            _meta: ObjectMeta,
+        ) -> OrbitResult<()> {
+            Err(IoOrbitError::Other("unsupported test storage".to_owned()))
+        }
+
+        async fn get_stream(
+            &self,
+            _key: &ObjectKey,
+        ) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
+            Err(IoOrbitError::Other("unsupported test storage".to_owned()))
+        }
+
+        async fn get_range_stream(
+            &self,
+            _key: &ObjectKey,
+            _start: u64,
+            _end: Option<u64>,
+        ) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
+            Err(IoOrbitError::Other("unsupported test storage".to_owned()))
+        }
+
+        async fn exists(&self, _key: &ObjectKey) -> OrbitResult<bool> {
+            Err(IoOrbitError::Other("unsupported test storage".to_owned()))
+        }
+
+        async fn signed_url(
+            &self,
+            _key: &ObjectKey,
+            _method: Method,
+            _expires_in: Duration,
+        ) -> OrbitResult<Option<String>> {
+            Err(IoOrbitError::Other("unsupported test storage".to_owned()))
+        }
+
+        async fn delete(&self, _key: &ObjectKey) -> OrbitResult<()> {
+            Err(IoOrbitError::Other("unsupported test storage".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_write_default_rejects_without_consuming_data() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream_polls = Arc::clone(&polls);
+        let data: ObjectByteStream = Box::pin(stream::once(async move {
+            stream_polls.fetch_add(1, Ordering::Relaxed);
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"must not be read"))
+        }));
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: "abcdef1234567890".to_owned(),
+        };
+
+        let error = UnsupportedStorage
+            .put_stream_bounded(&key, data, ObjectMeta::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "other error: storage backend does not support bounded streaming writes"
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn test_s3_key_lfs() {
