@@ -23,6 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "fastcdc")]
+use base64::Engine as _;
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
@@ -789,9 +791,19 @@ fn integration_fastcdc_media_http_contract() {
         "FastCDC Media capabilities must require a Mono access token"
     );
 
-    for authorization in [
-        "Bearer unknown-fastcdc-http-token",
-        "Basic ZmFzdGNkYy1odHRwLXVzZXI6d3Jvbmc=",
+    let valid_basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"))
+    );
+    for (credential, authorization) in [
+        (
+            "unknown Bearer credential",
+            "Bearer unknown-fastcdc-http-token",
+        ),
+        (
+            "ordinary Basic credentials carrying a valid Mono token",
+            valid_basic.as_str(),
+        ),
     ] {
         let response = http_get_authorization(port, capabilities_path, authorization);
         assert!(
@@ -799,7 +811,7 @@ fn integration_fastcdc_media_http_contract() {
                 .lines()
                 .next()
                 .is_some_and(|line| line.contains(" 401 ")),
-            "FastCDC Media capabilities must reject {authorization:?}"
+            "FastCDC Media capabilities must reject {credential}"
         );
     }
 
