@@ -206,6 +206,18 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const MEGA_V1_MANIFEST_JSON: &str = concat!(
+        "{\"version\":1,\"algorithm\":\"fastcdc-v1\",\"hash_algorithm\":\"sha256\",\"media_oid\":\"",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "\",\"media_size\":3,\"chunks\":[{\"offset\":0,\"length\":3,\"chunk_hash\":\"",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "\",\"encoded_length\":3,\"compression\":\"none\"}],\"created_by\":{\"client\":\"mega\",\"version\":\"bb3ef17\",\"capabilities\":[\"fastcdc-v1\"]},\"fallback_oid\":\"",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "\"}",
+    );
+    const MEGA_V1_MANIFEST_ID: &str =
+        "b62523d099b04d52dcf7b55cce8f09bd08d07569d21ed999522ae1a14de5bdac";
+
     fn sample_manifest() -> MediaManifest {
         MediaManifest {
             version: 1,
@@ -247,6 +259,17 @@ mod tests {
         let mut protocol_changed = manifest;
         protocol_changed.chunks[0].chunk_hash = "c".repeat(64);
         assert_ne!(protocol_changed.id().unwrap(), id);
+    }
+
+    #[test]
+    fn mega_pinned_manifest_vector_has_expected_canonical_id() {
+        let manifest = parse_manifest(MEGA_V1_MANIFEST_JSON.as_bytes()).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&manifest).unwrap(),
+            MEGA_V1_MANIFEST_JSON
+        );
+        assert_eq!(manifest.id().unwrap(), MEGA_V1_MANIFEST_ID);
     }
 
     #[test]
@@ -372,8 +395,9 @@ mod tests {
     #[test]
     fn response_and_capability_payloads_match_v1_wire_contract() {
         let manifest = sample_manifest();
+        let manifest_id = "d".repeat(64);
         let prepare = PrepareResponse {
-            manifest_id: "d".repeat(64),
+            manifest_id: manifest_id.clone(),
             missing_chunks: vec![manifest.chunks[0].chunk_hash.clone()],
         };
         assert_eq!(
@@ -385,11 +409,32 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ManifestResponse {
-                manifest_id: "d".repeat(64),
+                manifest_id,
                 manifest,
             })
-            .unwrap()["manifest_id"],
-            "d".repeat(64)
+            .unwrap(),
+            serde_json::json!({
+                "manifest_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "manifest": {
+                    "version": 1,
+                    "algorithm": "fastcdc-v1",
+                    "hash_algorithm": "sha256",
+                    "media_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "media_size": 3,
+                    "chunks": [{
+                        "offset": 0,
+                        "length": 3,
+                        "chunk_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "encoded_length": 3,
+                        "compression": "none",
+                    }],
+                    "created_by": {
+                        "client": "monoengine",
+                        "version": "test",
+                        "capabilities": ["fastcdc-v1"],
+                    },
+                },
+            })
         );
         assert_eq!(
             capabilities(),

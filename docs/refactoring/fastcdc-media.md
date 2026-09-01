@@ -33,7 +33,7 @@
 
 prepare 响应使用 `manifest_id` 和 `missing_chunks`；已发布 manifest 响应使用 `manifest_id` 和 `manifest`。v1 capability payload 固定声明：
 
-- `chunked_lfs: true`、`chunk_algorithms: ["fastcdc-v1"]`、`hash_algorithms: ["sha256"]`；
+- `version: "1"`、`chunked_lfs: true`、`chunk_algorithms: ["fastcdc-v1"]`、`hash_algorithms: ["sha256"]`；
 - `max_chunk_size: 8388608`、`max_manifest_size: 10485760`；
 - `supports_batch_exists: true`、`supports_range_read: false`、`supports_standard_lfs_fallback: true`；
 - `scope: "authenticated-user-and-repository"`。
