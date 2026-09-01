@@ -480,6 +480,12 @@ pub fn ensure_initialized() -> Result<(), MegaError> {
             "Redis worker selection requires an active lease".to_string(),
         ));
     }
+    if source == WorkerIdSource::Env {
+        #[cfg(not(test))]
+        return Err(MegaError::IdGenerationUnavailable(
+            "configured worker ID requires an active Redis lease".to_string(),
+        ));
+    }
     initialize_worker(worker_id, source, None)
 }
 
