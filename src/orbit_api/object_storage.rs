@@ -106,6 +106,8 @@ fn invalid_key(msg: impl Into<String>) -> IoOrbitError {
 pub enum ObjectNamespace {
     Git,
     Lfs,
+    /// Private FastCDC media manifests and chunks.
+    Media,
     Log,
     /// Artifact protocol objects (`docs/artifacts-protocol.md`), keyed by UUID string.
     Artifact,
@@ -118,6 +120,7 @@ impl ObjectNamespace {
         match self {
             ObjectNamespace::Git => "git",
             ObjectNamespace::Lfs => "lfs",
+            ObjectNamespace::Media => "media",
             ObjectNamespace::Log => "log",
             ObjectNamespace::Artifact => "artifact",
             ObjectNamespace::Attachment => "attachment",
@@ -375,6 +378,16 @@ mod tests {
     }
 
     #[test]
+    fn test_media_namespace_is_separate_from_lfs() {
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Media,
+            key: "abcdef1234567890".to_owned(),
+        };
+
+        assert_eq!(key.default_sharding(), "media/ab/cd/ef/1234567890");
+    }
+
+    #[test]
     fn test_s3_key_git() {
         let key = ObjectKey {
             namespace: ObjectNamespace::Git,
@@ -445,6 +458,7 @@ mod tests {
         for ns in [
             ObjectNamespace::Git,
             ObjectNamespace::Lfs,
+            ObjectNamespace::Media,
             ObjectNamespace::Log,
             ObjectNamespace::Artifact,
             ObjectNamespace::Attachment,
@@ -465,6 +479,7 @@ mod tests {
         // only be appended with new strings.
         assert_eq!(ObjectNamespace::Git.to_string(), "git");
         assert_eq!(ObjectNamespace::Lfs.to_string(), "lfs");
+        assert_eq!(ObjectNamespace::Media.to_string(), "media");
         assert_eq!(ObjectNamespace::Log.to_string(), "log");
         assert_eq!(ObjectNamespace::Artifact.to_string(), "artifact");
         assert_eq!(ObjectNamespace::Attachment.to_string(), "attachment");

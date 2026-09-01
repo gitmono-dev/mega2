@@ -13,7 +13,7 @@
 //! - Public trait method signatures ([`MegaObjectStorage`], [`LogStorage`]).
 //! - [`ObjectKey::default_sharding`] output — the on-disk object path format.
 //! - [`ObjectNamespace`] variant string values
-//!   (`git`/`lfs`/`log`/`artifact`/`attachment`).
+//!   (`git`/`lfs`/`media`/`log`/`artifact`/`attachment`).
 //! - Serialized manifest layout: new [`LogManifest`]/[`LogSegmentMeta`] fields
 //!   must be backward-compatible (`#[serde(default)]`).
 //!

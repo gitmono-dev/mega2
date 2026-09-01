@@ -29,6 +29,14 @@
 
 这个规则与 Mega `bb3ef17` 的 v1 contract 对齐。修改字段集合、序列化顺序、分块算法或任何 chunk 参数都需要新的 algorithm/version，不能原地改变 v1。
 
+## Scope and storage keys
+
+Media scope 只由服务端已验证的 Mono access-token 身份和 canonical repository 生成。当前 access-token 解析会填充 `LoginUser.username`，因此 FC-03 使用它作为 actor key；它不是 request JSON 的 actor/repository，也不读取 manifest 的 `created_by`。当前 access-token 路径没有 `website_user_id`：若 username 日后改名，会得到一个新 scope；任何旧 Media 对象迁移或 identity backfill 都必须走后续独立计划，不能静默修改 v1 digest。
+
+repository 必须为绝对路径，且拒绝 backslash、`%`、`?`、空段、`.` 和 `..`。scope digest 是 `SHA-256(serde_json([actor, repository]))` 的小写 hex，因而 actor 和 repository 任一变化都会产生隔离的 key space。
+
+逻辑对象 key 使用 `ObjectNamespace::Media`（稳定前缀 `media`）和 `media-v1/<scope-digest>/`：`pending/<manifest-id>`、`chunks/<chunk-hash>`、`finalized/<media-oid>`。底层仍应用 `ObjectKey` 的固定 sharding；它不会将 Media 与既有 LFS、Attachment 或其他 namespace 混合。scope 模块的错误不携带 actor、repository、digest 或内部 object key；HTTP adapter 在 FC-07 继续把存储失败映射为不泄漏这些值的公共错误。
+
 ## Responses and capabilities
 
 prepare 响应使用 `manifest_id` 和 `missing_chunks`；已发布 manifest 响应使用 `manifest_id` 和 `manifest`。v1 capability payload 固定声明：
