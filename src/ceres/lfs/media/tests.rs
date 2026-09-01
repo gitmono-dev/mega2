@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures::StreamExt;
 
 use super::{
     chunker,
@@ -9,8 +10,14 @@ use super::{
     service::{MediaServiceError, PENDING_TTL, PendingManifest},
 };
 use crate::{
-    jupiter::{service::lfs_service::LfsService, utils::into_obj_stream::IntoObjectStream},
-    orbit_api::object_storage::{ObjectKey, ObjectMeta},
+    jupiter::{
+        service::lfs_service::LfsService, tests::test_storage,
+        utils::into_obj_stream::IntoObjectStream,
+    },
+    orbit::factory::{
+        LocalConfig, ObjectStorageBackend, ObjectStorageConfig, ObjectStorageFactory,
+    },
+    orbit_api::object_storage::{ObjectKey, ObjectMeta, ObjectNamespace},
 };
 
 fn fixture() -> (LfsService, MediaScope) {
@@ -71,6 +78,148 @@ async fn put_raw(service: &LfsService, key: &ObjectKey, data: Bytes) {
         )
         .await
         .unwrap();
+}
+
+async fn finalize_fixture() -> (tempfile::TempDir, LfsService, MediaScope) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(temp_dir.path()).await;
+    let object_storage = ObjectStorageFactory::build(&ObjectStorageConfig {
+        storage_type: ObjectStorageBackend::Local,
+        local: LocalConfig {
+            root_dir: temp_dir
+                .path()
+                .join("objects")
+                .to_string_lossy()
+                .into_owned(),
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    (
+        temp_dir,
+        LfsService {
+            lfs_storage: storage.lfs_db_storage(),
+            obj_storage: object_storage,
+        },
+        MediaScope::from_access_token_username("alice", "/project/demo.git").unwrap(),
+    )
+}
+
+fn deterministic_bytes(length: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(length);
+    let mut state = 0x1234_5678_9abc_def0u64;
+    while data.len() < length {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push((state >> 33) as u8);
+    }
+    data
+}
+
+fn fastcdc_manifest(media: &[u8]) -> MediaManifest {
+    let chunks = chunker::chunk_bytes(media)
+        .into_iter()
+        .map(|chunk| ChunkEntry {
+            offset: chunk.offset,
+            length: chunk.length,
+            chunk_hash: chunk.chunk_hash,
+            encoded_length: chunk.length,
+            compression: "none".into(),
+            checksum: None,
+        })
+        .collect();
+
+    MediaManifest {
+        version: 1,
+        algorithm: chunker::ALGORITHM.into(),
+        hash_algorithm: "sha256".into(),
+        media_oid: protocol::sha256_hex(media),
+        media_size: media.len() as u64,
+        chunks,
+        created_by: CreatedBy {
+            client: "monoengine".into(),
+            version: "test".into(),
+            capabilities: vec![chunker::ALGORITHM.into()],
+        },
+        fallback_oid: None,
+    }
+}
+
+async fn upload_all(
+    service: &LfsService,
+    scope: &MediaScope,
+    manifest: &MediaManifest,
+    media: &[u8],
+) -> String {
+    let prepared = service
+        .prepare_media(scope, manifest.clone())
+        .await
+        .unwrap();
+    for hash in &prepared.missing_chunks {
+        let chunk = manifest
+            .chunks
+            .iter()
+            .find(|chunk| &chunk.chunk_hash == hash)
+            .unwrap();
+        let start = chunk.offset as usize;
+        let end = (chunk.offset + chunk.length) as usize;
+        service
+            .upload_media_chunk(
+                scope,
+                &prepared.manifest_id,
+                hash,
+                Bytes::copy_from_slice(&media[start..end]),
+            )
+            .await
+            .unwrap();
+    }
+    prepared.manifest_id
+}
+
+fn lfs_fallback_key(media_oid: &str) -> ObjectKey {
+    ObjectKey {
+        namespace: ObjectNamespace::Lfs,
+        key: media_oid.to_owned(),
+    }
+}
+
+async fn read_lfs_fallback(service: &LfsService, media_oid: &str) -> Vec<u8> {
+    let stream =
+        crate::ceres::lfs::handler::lfs_download_object(service.clone(), media_oid.to_owned())
+            .await
+            .unwrap();
+    let mut stream = Box::pin(stream);
+    let mut media = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        media.extend_from_slice(&chunk.unwrap());
+    }
+    media
+}
+
+async fn assert_not_published(service: &LfsService, scope: &MediaScope, media_oid: &str) {
+    assert!(
+        service
+            .lfs_storage
+            .get_lfs_object(media_oid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !service
+            .obj_storage
+            .inner
+            .exists(&lfs_fallback_key(media_oid))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        service.finalized_media_manifest(scope, media_oid).await,
+        Err(MediaServiceError::NotFound)
+    ));
 }
 
 #[tokio::test]
@@ -264,4 +413,119 @@ async fn resume_and_deduplicate() {
 #[test]
 fn service_io_errors_do_not_retain_sources() {
     assert!(std::error::Error::source(&MediaServiceError::Io).is_none());
+}
+
+#[tokio::test]
+async fn finalize_round_trip() {
+    let (_temp_dir, service, scope) = finalize_fixture().await;
+    let media = deterministic_bytes(chunker::MIN_SIZE + 128 * 1024);
+    let manifest = fastcdc_manifest(&media);
+    let manifest_id = upload_all(&service, &scope, &manifest, &media).await;
+
+    service.finalize_media(&scope, &manifest_id).await.unwrap();
+    service.finalize_media(&scope, &manifest_id).await.unwrap();
+
+    let finalized = service
+        .finalized_media_manifest(&scope, &manifest.media_oid)
+        .await
+        .unwrap();
+    assert_eq!(finalized.manifest_id, manifest_id);
+    assert_eq!(finalized.manifest, {
+        let mut expected = manifest.clone();
+        expected.fallback_oid = Some(expected.media_oid.clone());
+        expected
+    });
+    let metadata = service
+        .lfs_storage
+        .get_lfs_object(&manifest.media_oid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.size, media.len() as i64);
+    assert!(metadata.exist);
+    assert_eq!(
+        read_lfs_fallback(&service, &manifest.media_oid).await,
+        media
+    );
+
+    let other_scope = MediaScope::from_access_token_username("bob", "/project/demo.git").unwrap();
+    assert!(matches!(
+        service
+            .finalized_media_manifest(&other_scope, &manifest.media_oid)
+            .await,
+        Err(MediaServiceError::NotFound)
+    ));
+    assert!(matches!(
+        service.finalize_media(&other_scope, &manifest_id).await,
+        Err(MediaServiceError::NotFound)
+    ));
+
+    let noncanonical = manifest_for_parts(&[&media[..1], &media[1..]]);
+    let noncanonical_id = upload_all(&service, &scope, &noncanonical, &media).await;
+    assert_ne!(noncanonical_id, manifest_id);
+    assert!(matches!(
+        service.finalize_media(&scope, &noncanonical_id).await,
+        Err(MediaServiceError::Conflict)
+    ));
+
+    let empty_manifest = fastcdc_manifest(&[]);
+    let empty_id = upload_all(&service, &scope, &empty_manifest, &[]).await;
+    service.finalize_media(&scope, &empty_id).await.unwrap();
+    assert_eq!(
+        read_lfs_fallback(&service, &empty_manifest.media_oid).await,
+        Vec::<u8>::new()
+    );
+}
+
+#[tokio::test]
+async fn rejects_corruption_without_publication() {
+    let (_temp_dir, service, scope) = finalize_fixture().await;
+    let media = deterministic_bytes(chunker::MIN_SIZE + 128 * 1024);
+    let manifest = fastcdc_manifest(&media);
+    let manifest_id = upload_all(&service, &scope, &manifest, &media).await;
+    let corrupted_chunk = &manifest.chunks[0];
+    put_raw(
+        &service,
+        &scope.chunk_key(&corrupted_chunk.chunk_hash).unwrap(),
+        Bytes::from_static(b"corrupt"),
+    )
+    .await;
+
+    assert!(matches!(
+        service.finalize_media(&scope, &manifest_id).await,
+        Err(MediaServiceError::Invalid)
+    ));
+    assert_not_published(&service, &scope, &manifest.media_oid).await;
+
+    let noncanonical_media = deterministic_bytes(chunker::MIN_SIZE + 1);
+    let noncanonical = manifest_for_parts(&[&noncanonical_media[..1], &noncanonical_media[1..]]);
+    let noncanonical_id = upload_all(&service, &scope, &noncanonical, &noncanonical_media).await;
+    assert!(matches!(
+        service.finalize_media(&scope, &noncanonical_id).await,
+        Err(MediaServiceError::Invalid)
+    ));
+    assert_not_published(&service, &scope, &noncanonical.media_oid).await;
+}
+
+#[tokio::test]
+async fn rejects_mismatched_finalized_manifest() {
+    let (_temp_dir, service, scope) = finalize_fixture().await;
+    let media = deterministic_bytes(chunker::MIN_SIZE + 1);
+    let manifest = fastcdc_manifest(&media);
+    let mut mismatched = manifest.clone();
+    mismatched.media_oid = "a".repeat(64);
+    mismatched.fallback_oid = Some(mismatched.media_oid.clone());
+    put_raw(
+        &service,
+        &scope.finalized_manifest_key(&manifest.media_oid).unwrap(),
+        Bytes::from(serde_json::to_vec(&mismatched).unwrap()),
+    )
+    .await;
+
+    assert!(matches!(
+        service
+            .finalized_media_manifest(&scope, &manifest.media_oid)
+            .await,
+        Err(MediaServiceError::Conflict)
+    ));
 }

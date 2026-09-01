@@ -1,6 +1,6 @@
 # FastCDC Media
 
-> 状态：FC-01～FC-05 已定义 feature-gated v1 chunker/manifest contract、私有 Media scope 和 pending 上传会话；finalize/fallback 与 HTTP API 仍由 FC-06～FC-07 补齐。默认构建不启用该能力。
+> 状态：FC-01～FC-06 已定义 feature-gated v1 chunker/manifest contract、私有 Media scope、pending 上传会话和标准 LFS fallback 发布；HTTP API 仍由 FC-07 补齐。默认构建不启用该能力。
 
 ## v1 manifest
 
@@ -53,7 +53,22 @@ scope 中已有且校验正确的 chunk 直接复用，错误的上传内容会�
 finalize 之前，服务只提供“当前 scope、当前 pending manifest、已声明 hash”的 chunk
 读取能力；即使同 scope 下存在其他对象，也不能通过任意 hash 读取。此阶段返回的
 Invalid、NotFound、Conflict、Storage、Io 和 Json 均为不携带 scope/key 的领域错误。
-finalized manifest、标准 LFS fallback 和公开 HTTP 路由尚未实现。
+公开 HTTP 路由尚未实现。
+
+## Finalize and fallback
+
+`finalize` 最多允许两个并发 finalizer。它只读取当前 scope、当前未过期
+pending manifest 中声明的 chunks，并对每个 chunk 的 length 和 SHA-256 重新校验。服务
+将内容重建到匿名临时文件，先验证完整 `media_oid`/`media_size`，再重跑冻结的
+`fastcdc-v1`，要求每个 offset、length 和 hash 均与 manifest 一致；任一步失败都不会
+发布标准 LFS fallback 或 finalized manifest，临时文件会在成功和失败时自动清理。
+
+验证完成后，fallback 使用 `put_stream_bounded` 写入标准 `Lfs` namespace，并以
+`ON CONFLICT DO NOTHING` 语义登记 `lfs_objects`，随后重新读取 metadata 验证 size 与
+存在状态。只有该验证成功，才写入当前 scope 的 `finalized/<media-oid>` manifest。相同
+canonical manifest 的重复 finalize 可安全重试；同一 media OID 的不同 finalized
+manifest、错误 OID 的已存 manifest 或不同 scope 均会被拒绝。公开 HTTP 路由仍由 FC-07
+提供。
 
 ## Responses and capabilities
 

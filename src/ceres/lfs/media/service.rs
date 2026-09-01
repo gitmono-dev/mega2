@@ -60,11 +60,13 @@ fn storage_error(error: IoOrbitError) -> MediaServiceError {
     }
 }
 
-fn scope_error() -> MediaServiceError {
+pub(super) fn scope_error() -> MediaServiceError {
     MediaServiceError::Invalid
 }
 
-fn validate_duplicate_chunk_lengths(manifest: &MediaManifest) -> Result<(), MediaServiceError> {
+pub(super) fn validate_duplicate_chunk_lengths(
+    manifest: &MediaManifest,
+) -> Result<(), MediaServiceError> {
     let mut lengths = HashMap::with_capacity(manifest.chunks.len());
     for chunk in &manifest.chunks {
         if let Some(length) = lengths.insert(chunk.chunk_hash.as_str(), chunk.length)
@@ -76,7 +78,7 @@ fn validate_duplicate_chunk_lengths(manifest: &MediaManifest) -> Result<(), Medi
     Ok(())
 }
 
-async fn read_bounded(
+pub(super) async fn read_bounded(
     service: &LfsService,
     key: &ObjectKey,
     limit: usize,
@@ -108,7 +110,7 @@ async fn read_bounded(
     Ok(Bytes::from(data))
 }
 
-async fn put_bytes(
+pub(super) async fn put_bytes(
     service: &LfsService,
     key: &ObjectKey,
     data: Bytes,
@@ -218,7 +220,7 @@ pub(crate) async fn prepare(
     })
 }
 
-async fn read_chunk(
+pub(super) async fn read_chunk(
     service: &LfsService,
     scope: &MediaScope,
     hash: &str,

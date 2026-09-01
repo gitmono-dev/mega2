@@ -3,7 +3,8 @@ use bytes::Bytes;
 
 #[cfg(feature = "fastcdc")]
 use crate::ceres::lfs::media::{
-    protocol::{MediaManifest, PrepareResponse},
+    finalize,
+    protocol::{ManifestResponse, MediaManifest, PrepareResponse},
     scope::MediaScope,
     service::{self, MediaServiceError},
 };
@@ -65,5 +66,21 @@ impl LfsService {
         hash: &str,
     ) -> Result<Bytes, MediaServiceError> {
         service::read_pending_chunk(self, scope, manifest_id, hash).await
+    }
+
+    pub(crate) async fn finalize_media(
+        &self,
+        scope: &MediaScope,
+        manifest_id: &str,
+    ) -> Result<(), MediaServiceError> {
+        finalize::finalize(self, scope, manifest_id).await
+    }
+
+    pub(crate) async fn finalized_media_manifest(
+        &self,
+        scope: &MediaScope,
+        media_oid: &str,
+    ) -> Result<ManifestResponse, MediaServiceError> {
+        finalize::finalized_manifest(self, scope, media_oid).await
     }
 }

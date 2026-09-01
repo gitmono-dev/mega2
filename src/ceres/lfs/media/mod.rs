@@ -4,6 +4,7 @@
 //! a later finalize step publishes the standard LFS fallback.
 
 pub mod chunker;
+pub(crate) mod finalize;
 pub mod protocol;
 pub(crate) mod scope;
 pub(crate) mod service;
