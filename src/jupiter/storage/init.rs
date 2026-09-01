@@ -16,6 +16,19 @@ use crate::{
 pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
     id_generator::ensure_initialized();
 
+    database_connection_without_id_generator(db_config).await
+}
+
+/// Create the writable database connection without initializing the Snowflake
+/// generator.
+///
+/// Production bootstrap uses this deferred variant while it resolves Redis
+/// credentials and claims the worker lease. Keeping the existing
+/// database_connection wrapper preserves the initialization behavior for
+/// callers that do not have the application bootstrap context.
+pub async fn database_connection_without_id_generator(
+    db_config: &DbConfig,
+) -> Result<DatabaseConnection, MegaError> {
     let conn = postgres_connection(db_config).await?;
     apply_migrations(&conn, false).await?;
 

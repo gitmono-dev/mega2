@@ -14,7 +14,11 @@ use crate::{
         policy::entitystore::SharedEntityStore,
         vault::integration::vault_core::{VaultCore, with_audit_caller},
     },
-    jupiter::redis::{ConnectionManager, init_connection},
+    jupiter::{
+        redis::{ConnectionManager, claim_snowflake_worker, init_connection},
+        storage::init::database_connection_without_id_generator,
+        utils::id_generator,
+    },
 };
 
 /// This is the main application context for the Mono application.
@@ -62,7 +66,7 @@ impl AppContext {
 
         // One DB connection, shared by the bootstrap vault and the full storage.
         let db_connection =
-            Arc::new(crate::jupiter::storage::init::database_connection(&config.database).await?);
+            Arc::new(database_connection_without_id_generator(&config.database).await?);
 
         // Vault first (DB-only bootstrap), so SecretRef object-storage credentials
         // can be resolved before the object store is built.
@@ -78,6 +82,26 @@ impl AppContext {
             )
             .await?
             .with_audit_config(vault_audit);
+
+        // Resolve Redis before the first ID-generator initialization so a
+        // multi-instance deployment can claim a worker slot instead of using
+        // the legacy fixed worker ID.
+        let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
+        let connection = init_connection(&redis_config).await?;
+        if id_generator::env_worker_id_is_valid() {
+            tracing::info!(
+                source = ?id_generator::WorkerIdSource::Env,
+                "valid MEGA_ID_GENERATOR_WORKER_ID set; skipping Redis worker slot claim"
+            );
+        } else if let Some(worker_id) = claim_snowflake_worker(&connection).await
+            && !id_generator::claim_worker_id(worker_id)
+        {
+            tracing::warn!(
+                worker_id,
+                "Snowflake worker slot was claimed but the process already selected a worker ID"
+            );
+        }
+        id_generator::ensure_initialized();
 
         // Resolve any `vault://` SecretRef object-storage credentials post-vault,
         // then build the concrete object store from the resolved config.
@@ -105,12 +129,6 @@ impl AppContext {
         // MC-09: the server-signing vault handle reaches the synthetic-commit
         // sites through storage; vault is built before storage above.
         let storage = storage.with_vault(vault.clone());
-
-        // Resolve any `vault://` SecretRef in `redis.url` post-vault, then build
-        // the shared Redis connection from the resolved config
-        // (docs/refactoring/integration.md: redis.url SecretRef support).
-        let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
-        let connection = init_connection(&redis_config).await?;
 
         // Build notification channels after Vault so optional Slack and webhook
         // credentials can be resolved. In-app delivery does not require `[mail]`.

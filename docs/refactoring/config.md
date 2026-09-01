@@ -57,6 +57,24 @@ Slack, and webhook notifications. The `email` preference requests delivery
 through the website API; it does not configure a local mail provider. Refer to
 [`notification.md`](./notification.md) for behavior and test boundaries.
 
+## Snowflake worker identity
+
+The service selects the Snowflake worker ID before the first ID is generated:
+
+- A valid MEGA_ID_GENERATOR_WORKER_ID value in 0..=255 takes precedence.
+- Otherwise, startup claims the first available
+  mega:snowflake:worker:<id> Redis slot with SET NX PX for 30 seconds and
+  refreshes it every 15 seconds using an ownership token.
+- If Redis is unavailable or all 256 slots are occupied, the ID is the stable
+  FNV-1a hash of POD_UID, then HOSTNAME, or the local fallback identity.
+
+The generator uses 8 worker bits and 8 sequence bits: this preserves 256 IDs
+per millisecond per worker and expands the worker space from 64 to 256. The
+two additional low bits used by the worker layout reduce the timestamp horizon
+by a factor of four, so old writers must be stopped before switching layouts.
+Worker source and a non-reversible process-identity digest are emitted in
+structured logs; Redis URLs, lease tokens, and pod secrets are not logged.
+
 ## Test configuration
 
 `.env.test.example` documents public test endpoints for PostgreSQL, Redis, and

@@ -1,6 +1,8 @@
 pub mod lock;
+pub mod snowflake_worker;
 
 pub use ::redis::{AsyncCommands, aio::ConnectionManager};
+pub use snowflake_worker::claim_snowflake_worker;
 
 use crate::{
     common::errors::MegaError,
