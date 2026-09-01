@@ -657,53 +657,155 @@ fn git_cli_container_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
 /// therefore exchanges a PID and an exit status through a private temporary
 /// directory: it can kill the actual process group on timeout while still
 /// returning Git's real exit status to the caller.
+fn container_git_timeout_script(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+
+    format!(
+        "state_dir=$(mktemp -d /tmp/monoengine-git-wrapper.XXXXXX) || exit 70\n\
+         pid_file=$state_dir/pid\n\
+         status_file=$state_dir/status\n\
+         setsid sh -c '\n\
+           pid_file=$1\n\
+           status_file=$2\n\
+           shift 2\n\
+           printf \"%s\\n\" \"$$\" > \"$pid_file\"\n\
+           git \"$@\"\n\
+           status=$?\n\
+           printf \"%s\\n\" \"$status\" > \"$status_file\"\n\
+           exit \"$status\"\n\
+         ' git-wrapper \"$pid_file\" \"$status_file\" \"$@\" &\n\
+         max_ticks=$(({secs} * 10))\n\
+         ticks=0\n\
+         while [ ! -s \"$pid_file\" ] && [ \"$ticks\" -lt \"$max_ticks\" ]; do\n\
+           sleep 0.1\n\
+           ticks=$((ticks + 1))\n\
+         done\n\
+         if [ ! -s \"$pid_file\" ]; then\n\
+           rm -rf \"$state_dir\"\n\
+           exit 137\n\
+         fi\n\
+         gpid=$(cat \"$pid_file\")\n\
+         while [ ! -s \"$status_file\" ] && [ \"$ticks\" -lt \"$max_ticks\" ]; do\n\
+           sleep 0.1\n\
+           ticks=$((ticks + 1))\n\
+         done\n\
+         if [ ! -s \"$status_file\" ]; then\n\
+           kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
+           rm -rf \"$state_dir\"\n\
+           exit 137\n\
+         fi\n\
+         status=$(cat \"$status_file\")\n\
+         rm -rf \"$state_dir\"\n\
+         exit \"$status\"\n"
+    )
+}
+
 fn append_container_git_timeout_wrapper(command: &mut Command) {
     command
         .arg("sh")
         .arg("-c")
-        .arg(format!(
-            "state_dir=$(mktemp -d /tmp/monoengine-git-wrapper.XXXXXX) || exit 70\n\
-             pid_file=$state_dir/pid\n\
-             status_file=$state_dir/status\n\
-             setsid sh -c '\n\
-               pid_file=$1\n\
-               status_file=$2\n\
-               shift 2\n\
-               printf \"%s\\n\" \"$$\" > \"$pid_file\"\n\
-               git \"$@\"\n\
-               status=$?\n\
-               printf \"%s\\n\" \"$status\" > \"$status_file\"\n\
-               exit \"$status\"\n\
-             ' git-wrapper \"$pid_file\" \"$status_file\" \"$@\" &\n\
-             launcher=$!\n\
-             attempt=0\n\
-             while [ ! -s \"$pid_file\" ] && [ \"$attempt\" -lt 20 ]; do\n\
-               sleep 0.1\n\
-               attempt=$((attempt + 1))\n\
-             done\n\
-             if [ ! -s \"$pid_file\" ]; then\n\
-               wait \"$launcher\"\n\
-               status=$?\n\
-               rm -rf \"$state_dir\"\n\
-               exit \"$status\"\n\
-             fi\n\
-             gpid=$(cat \"$pid_file\")\n\
-             elapsed=0\n\
-             while [ ! -s \"$status_file\" ] && [ \"$elapsed\" -lt {secs} ]; do\n\
-               sleep 1\n\
-               elapsed=$((elapsed + 1))\n\
-             done\n\
-             if [ ! -s \"$status_file\" ]; then\n\
-               kill -KILL -\"$gpid\" 2>/dev/null || kill -KILL \"$gpid\" 2>/dev/null || true\n\
-               rm -rf \"$state_dir\"\n\
-               exit 137\n\
-             fi\n\
-             status=$(cat \"$status_file\")\n\
-             rm -rf \"$state_dir\"\n\
-             exit \"$status\"\n",
-            secs = GIT_CLI_COMMAND_TIMEOUT.as_secs()
-        ))
+        .arg(container_git_timeout_script(GIT_CLI_COMMAND_TIMEOUT))
         .arg("git-wrapper");
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod timeout_wrapper_tests {
+    use std::{
+        env, fs,
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        process::Command,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use tempfile::tempdir;
+
+    use super::container_git_timeout_script;
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("write executable");
+        let mut permissions = fs::metadata(path)
+            .expect("executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make executable");
+    }
+
+    fn run_timeout_script(
+        bin_dir: &Path,
+        timeout: Duration,
+        extra_env: &[(&str, &Path)],
+    ) -> std::process::Output {
+        let inherited_path = env::var_os("PATH").expect("PATH must be set");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(container_git_timeout_script(timeout))
+            .arg("git-wrapper")
+            .env(
+                "PATH",
+                format!("{}:{}", bin_dir.display(), inherited_path.to_string_lossy()),
+            );
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command.output().expect("run timeout wrapper")
+    }
+
+    #[test]
+    fn timeout_wrapper_waits_for_forked_setsid_and_propagates_git_status() {
+        let temp_dir = tempdir().expect("temp dir");
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        write_executable(
+            &bin_dir.join("setsid"),
+            "#!/bin/sh\n( sleep 3; exec \"$@\" ) &\nexit 0\n",
+        );
+        write_executable(&bin_dir.join("git"), "#!/bin/sh\nexit 23\n");
+
+        let output = run_timeout_script(&bin_dir, Duration::from_secs(5), &[]);
+
+        assert_eq!(output.status.code(), Some(23));
+    }
+
+    #[test]
+    fn timeout_wrapper_kills_the_setsid_process_group() {
+        assert!(
+            Command::new("setsid").arg("--version").output().is_ok(),
+            "Linux test environment must provide setsid"
+        );
+
+        let temp_dir = tempdir().expect("temp dir");
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("create bin dir");
+        let child_pid_path = temp_dir.path().join("child.pid");
+        write_executable(
+            &bin_dir.join("git"),
+            "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$FAKE_GIT_CHILD_PID\"\nwait \"$child\"\n",
+        );
+
+        let output = run_timeout_script(
+            &bin_dir,
+            Duration::from_secs(1),
+            &[("FAKE_GIT_CHILD_PID", &child_pid_path)],
+        );
+        assert_eq!(output.status.code(), Some(137));
+
+        let child_pid = fs::read_to_string(&child_pid_path)
+            .expect("fake git child pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric fake git child pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{child_pid}")).exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !Path::new(&format!("/proc/{child_pid}")).exists(),
+            "timed-out git helper {child_pid} must be reaped"
+        );
+    }
 }
 
 fn git_cli_host_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
