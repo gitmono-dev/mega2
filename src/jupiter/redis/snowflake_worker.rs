@@ -165,7 +165,9 @@ pub(crate) async fn try_acquire_worker_fence(
     worker_id: u32,
 ) -> Result<Option<WorkerFence>, crate::common::errors::MegaError> {
     if connection.get_database_backend() != DatabaseBackend::Postgres {
-        return Ok(None);
+        return Err(crate::common::errors::MegaError::Other(
+            "worker database fence requires a PostgreSQL connection".to_string(),
+        ));
     }
 
     let transaction = timeout(
@@ -1412,5 +1414,19 @@ mod tests {
 
         assert!(lease.is_none());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn non_postgres_worker_fence_is_rejected() {
+        let error = match try_acquire_worker_fence(&DatabaseConnection::default(), 0).await {
+            Err(error) => error,
+            Ok(_) => panic!("worker identity must not run without a PostgreSQL fence"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a PostgreSQL connection")
+        );
     }
 }
