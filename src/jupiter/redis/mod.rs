@@ -45,6 +45,22 @@ pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, 
         *calls.entry(config.url.clone()).or_insert(0) += 1;
     }
 
+    let (client, redis_url) = redis_client(config)?;
+    ConnectionManager::new(client)
+        .await
+        .map_err(|e| MegaError::Other(format!("failed to connect to Redis at {redis_url}: {e}")))
+}
+
+/// Build a Redis manager without requiring the server to be reachable during
+/// application bootstrap. Commands still fail normally when the manager is
+/// used, allowing Snowflake worker selection to fall back to a stable hash.
+pub fn init_connection_lazy(config: &RedisConfig) -> Result<ConnectionManager, MegaError> {
+    let (client, redis_url) = redis_client(config)?;
+    ConnectionManager::new_lazy_with_config(client, ::redis::aio::ConnectionManagerConfig::new())
+        .map_err(|e| MegaError::Other(format!("failed to build Redis manager at {redis_url}: {e}")))
+}
+
+fn redis_client(config: &RedisConfig) -> Result<(::redis::Client, String), MegaError> {
     validate_redis_config(config)?;
 
     if is_secret_ref_value(config.url.trim_start()) {
@@ -63,9 +79,7 @@ pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, 
     let redis_url = redact_redis_url(&config.url);
     let client = ::redis::Client::open(config.url.as_str())
         .map_err(|e| MegaError::Other(format!("failed to open Redis URL {redis_url}: {e}")))?;
-    ConnectionManager::new(client)
-        .await
-        .map_err(|e| MegaError::Other(format!("failed to connect to Redis at {redis_url}: {e}")))
+    Ok((client, redis_url))
 }
 
 #[cfg(test)]
@@ -99,5 +113,15 @@ mod tests {
         assert!(message.contains("unresolved vault:// SecretRef"));
         assert!(!message.contains("config/test/redis/url"));
         assert!(!message.contains("#value"));
+    }
+
+    #[tokio::test]
+    async fn init_connection_lazy_does_not_require_a_reachable_server() {
+        let config = RedisConfig {
+            url: "redis://127.0.0.1:1".to_string(),
+        };
+
+        init_connection_lazy(&config)
+            .expect("lazy Redis manager should not connect during bootstrap");
     }
 }

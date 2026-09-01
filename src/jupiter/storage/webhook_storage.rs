@@ -204,7 +204,6 @@ fn normalize_event_types(event_types: Vec<WebhookEventTypeEnum>) -> Vec<WebhookE
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use idgenerator::IdInstance;
     use tempfile::TempDir;
 
     use super::*;
@@ -243,7 +242,7 @@ mod tests {
         let created = storage
             .create_webhook(
                 mega_webhook::Model {
-                    id: IdInstance::next_id(),
+                    id: crate::jupiter::utils::id_generator::next_id(),
                     target_url: "https://example.com/a".to_string(),
                     secret: "s1".to_string(),
                     event_types: "[]".to_string(),
@@ -264,7 +263,7 @@ mod tests {
         storage
             .create_webhook(
                 mega_webhook::Model {
-                    id: IdInstance::next_id(),
+                    id: crate::jupiter::utils::id_generator::next_id(),
                     target_url: "https://example.com/b".to_string(),
                     secret: "s2".to_string(),
                     event_types: "[]".to_string(),
@@ -327,7 +326,7 @@ mod tests {
         let webhook_a = webhook_storage
             .create_webhook(
                 mega_webhook::Model {
-                    id: IdInstance::next_id(),
+                    id: crate::jupiter::utils::id_generator::next_id(),
                     target_url: "https://example.com/a".to_string(),
                     secret: "s1".to_string(),
                     event_types: "[]".to_string(),
@@ -343,7 +342,7 @@ mod tests {
         let webhook_b = webhook_storage
             .create_webhook(
                 mega_webhook::Model {
-                    id: IdInstance::next_id(),
+                    id: crate::jupiter::utils::id_generator::next_id(),
                     target_url: "https://example.com/b".to_string(),
                     secret: "s2".to_string(),
                     event_types: "[]".to_string(),

@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use redis::{Script, aio::ConnectionManager};
 use tokio::time::sleep;
@@ -15,6 +21,7 @@ struct WorkerLease {
     worker_id: u32,
     key: String,
     token: String,
+    health: Arc<AtomicBool>,
 }
 
 /// Try to exclusively claim a Snowflake worker slot in Redis (SET NX PX).
@@ -25,9 +32,9 @@ struct WorkerLease {
 /// stale process cannot renew a slot after it changes hands.
 pub async fn claim_snowflake_worker(connection: &ConnectionManager) -> Option<u32> {
     let identity = id_generator::process_identity();
-    claim_worker_lease(connection, SLOT_KEY_PREFIX, &identity, true)
-        .await
-        .map(|lease| lease.worker_id)
+    let lease = claim_worker_lease(connection, SLOT_KEY_PREFIX, &identity, true).await?;
+    id_generator::activate_worker_lease(lease.health.clone());
+    Some(lease.worker_id)
 }
 
 async fn claim_worker_lease(
@@ -47,6 +54,7 @@ async fn claim_worker_lease(
                     worker_id,
                     key,
                     token,
+                    health: Arc::new(AtomicBool::new(true)),
                 };
                 tracing::info!(
                     worker_id,
@@ -101,6 +109,7 @@ fn spawn_slot_refresh(connection: ConnectionManager, lease: WorkerLease) {
         connection,
         lease.key,
         lease.token,
+        lease.health,
         SLOT_REFRESH_INTERVAL_MS,
         SLOT_TTL_MS,
     ));
@@ -110,6 +119,7 @@ async fn run_slot_refresh(
     connection: ConnectionManager,
     key: String,
     token: String,
+    health: Arc<AtomicBool>,
     interval_ms: u64,
     ttl_ms: u64,
 ) {
@@ -119,6 +129,7 @@ async fn run_slot_refresh(
         match refresh_slot(&mut conn, &key, &token, ttl_ms).await {
             Ok(true) => {}
             Ok(false) => {
+                health.store(false, Ordering::Release);
                 tracing::warn!(
                     slot_key = %key,
                     "snowflake worker slot refresh lost ownership"
@@ -126,6 +137,7 @@ async fn run_slot_refresh(
                 break;
             }
             Err(error) => {
+                health.store(false, Ordering::Release);
                 tracing::warn!(
                     error = %error,
                     slot_key = %key,
@@ -311,10 +323,12 @@ mod tests {
             .query_async(&mut connection)
             .await
             .expect("seed lease for refresh task");
+        let health = Arc::new(AtomicBool::new(true));
         let refresh_task = tokio::spawn(run_slot_refresh(
             connection.clone(),
             key.clone(),
             old_token,
+            health.clone(),
             10,
             200,
         ));
@@ -331,6 +345,7 @@ mod tests {
             .await
             .expect("stale refresh task should stop")
             .expect("stale refresh task should not panic");
+        assert!(!health.load(Ordering::Acquire));
         let owner: String = connection.get(&key).await.expect("read replacement owner");
         assert_eq!(owner, new_token);
 

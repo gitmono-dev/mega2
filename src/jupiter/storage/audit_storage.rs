@@ -1,7 +1,6 @@
 use std::ops::Deref;
 
 use chrono::Utc;
-use idgenerator::IdInstance;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::DateTimeWithTimeZone};
 
 use crate::{
@@ -41,7 +40,7 @@ impl AuditStorage {
     ) -> Result<audit_logs::Model, MegaError> {
         let created_at: DateTimeWithTimeZone = Utc::now().into();
         let model = audit_logs::ActiveModel {
-            id: Set(IdInstance::next_id()),
+            id: Set(crate::jupiter::utils::id_generator::next_id()),
             actor_id: Set(actor_id),
             actor_type: Set(actor_type),
             action: Set(action),

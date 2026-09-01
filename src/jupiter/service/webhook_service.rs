@@ -6,7 +6,6 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
-use idgenerator::IdInstance;
 use reqwest::redirect::Policy;
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
@@ -170,7 +169,7 @@ impl WebhookService {
                             Some(format!("webhook endpoint returned HTTP {status}"))
                         };
                         let delivery = crate::callisto::mega_webhook_delivery::Model {
-                            id: IdInstance::next_id(),
+                            id: crate::jupiter::utils::id_generator::next_id(),
                             webhook_id: webhook.id,
                             event_type: event_type.clone(),
                             payload: payload_json.clone(),
@@ -195,7 +194,7 @@ impl WebhookService {
                     Err(e) => {
                         let error_message = e.to_string();
                         let delivery = crate::callisto::mega_webhook_delivery::Model {
-                            id: IdInstance::next_id(),
+                            id: crate::jupiter::utils::id_generator::next_id(),
                             webhook_id: webhook.id,
                             event_type: event_type.clone(),
                             payload: payload_json.clone(),

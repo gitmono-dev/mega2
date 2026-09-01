@@ -15,7 +15,7 @@ use crate::{
         vault::integration::vault_core::{VaultCore, with_audit_caller},
     },
     jupiter::{
-        redis::{ConnectionManager, claim_snowflake_worker, init_connection},
+        redis::{ConnectionManager, claim_snowflake_worker, init_connection_lazy},
         storage::init::database_connection_without_id_generator,
         utils::id_generator,
     },
@@ -87,7 +87,7 @@ impl AppContext {
         // multi-instance deployment can claim a worker slot instead of using
         // the legacy fixed worker ID.
         let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
-        let connection = init_connection(&redis_config).await?;
+        let connection = init_connection_lazy(&redis_config)?;
         if id_generator::env_worker_id_is_valid() {
             tracing::info!(
                 source = ?id_generator::WorkerIdSource::Env,

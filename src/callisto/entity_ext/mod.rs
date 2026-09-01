@@ -16,13 +16,12 @@ pub mod mega_conversation;
 pub mod mega_refs;
 pub mod reactions;
 
-use idgenerator::IdInstance;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 pub fn generate_id() -> i64 {
     // Call `next_id` to generate a new unique id.
-    IdInstance::next_id()
+    crate::jupiter::utils::id_generator::next_id()
 }
 
 pub fn generate_link() -> String {

@@ -1,4 +1,7 @@
-use std::sync::{Once, OnceLock};
+use std::sync::{
+    Arc, Once, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use idgenerator::*;
 
@@ -13,6 +16,7 @@ pub const ENV_WORKER_ID: &str = "MEGA_ID_GENERATOR_WORKER_ID";
 
 static ID_GENERATOR_INIT: Once = Once::new();
 static CLAIMED_WORKER_ID: OnceLock<u32> = OnceLock::new();
+static ACTIVE_WORKER_LEASE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerIdSource {
@@ -24,6 +28,34 @@ pub enum WorkerIdSource {
 /// Record a Redis-claimed worker ID. Must run before [`set_up_options`].
 pub fn claim_worker_id(id: u32) -> bool {
     id <= MAX_WORKER_ID && CLAIMED_WORKER_ID.set(id).is_ok()
+}
+
+pub(crate) fn activate_worker_lease(health: Arc<AtomicBool>) {
+    if ACTIVE_WORKER_LEASE.set(health).is_err() {
+        tracing::warn!("Snowflake worker lease was already registered");
+    }
+}
+
+fn worker_lease_is_healthy() -> bool {
+    ACTIVE_WORKER_LEASE
+        .get()
+        .is_none_or(|health| lease_allows_generation(health))
+}
+
+fn lease_allows_generation(health: &AtomicBool) -> bool {
+    health.load(Ordering::Acquire)
+}
+
+/// Generate an ID while the process still owns its Redis worker lease.
+///
+/// Once a lease is lost, refusing to generate further IDs is safer than
+/// continuing with a worker ID that another process may already have claimed.
+pub(crate) fn next_id() -> i64 {
+    assert!(
+        worker_lease_is_healthy(),
+        "Snowflake worker lease lost; refusing to generate an ID"
+    );
+    IdInstance::next_id()
 }
 
 pub fn process_identity() -> String {
@@ -81,7 +113,7 @@ pub fn resolve_worker_id_from(
             Ok(id) if id <= MAX_WORKER_ID => return (id, WorkerIdSource::Env),
             _ => {
                 tracing::warn!(
-                    raw,
+                    raw_len = raw.len(),
                     max = MAX_WORKER_ID,
                     "ignoring out-of-range or invalid MEGA_ID_GENERATOR_WORKER_ID"
                 );
@@ -188,5 +220,14 @@ mod tests {
     #[test]
     fn claim_worker_id_rejects_invalid_ids() {
         assert!(!claim_worker_id(MAX_WORKER_ID + 1));
+    }
+
+    #[test]
+    fn worker_lease_health_gate_is_fail_closed() {
+        let health = Arc::new(AtomicBool::new(true));
+        assert!(lease_allows_generation(&health));
+
+        health.store(false, Ordering::Release);
+        assert!(!lease_allows_generation(&health));
     }
 }

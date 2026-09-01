@@ -1,4 +1,3 @@
-use idgenerator::IdInstance;
 use regex::Regex;
 use serde_json::{Value, json};
 
@@ -22,7 +21,7 @@ pub fn is_full_hex_object_id(oid: &str) -> bool {
 
 pub fn generate_id() -> i64 {
     // Call `next_id` to generate a new unique id.
-    IdInstance::next_id()
+    crate::jupiter::utils::id_generator::next_id()
 }
 
 pub const MEGA_BRANCH_NAME: &str = "refs/heads/main";

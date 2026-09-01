@@ -113,7 +113,8 @@ mod m20260831_000000_drop_mega_issue_tables;
 mod runner;
 pub use runner::apply_migrations;
 
-/// Primary key `BIGINT` (not DB auto-increment); the application assigns `id` (e.g. `idgenerator::IdInstance::next_id`).
+/// Primary key `BIGINT` (not DB auto-increment); the application assigns `id`
+/// through the guarded Snowflake wrapper.
 fn pk_bigint<T: IntoIden>(name: T) -> ColumnDef {
     big_integer(name).primary_key().take()
 }

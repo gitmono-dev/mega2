@@ -3,7 +3,6 @@ use std::ops::Deref;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
-use idgenerator::IdInstance;
 use rsa::{
     RsaPrivateKey,
     pkcs8::{EncodePrivateKey, EncodePublicKey},
@@ -250,7 +249,7 @@ impl BotsStorage {
         let token_hash = compute_bot_token_hash(token_body, &hmac_key);
 
         let active = bot_tokens::ActiveModel {
-            id: Set(IdInstance::next_id()),
+            id: Set(crate::jupiter::utils::id_generator::next_id()),
             bot_id: Set(bot_id),
             token_hash: Set(token_hash),
             token_name: Set(token_name.to_owned()),

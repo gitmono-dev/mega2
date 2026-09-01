@@ -3,7 +3,6 @@ use axum::{
     extract::{Path, Query, State},
 };
 use chrono::Utc;
-use idgenerator::IdInstance;
 use sea_orm::ActiveEnum;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -107,7 +106,7 @@ async fn create_webhook(
 
     let now = Utc::now().naive_utc();
     let model = crate::callisto::mega_webhook::Model {
-        id: IdInstance::next_id(),
+        id: crate::jupiter::utils::id_generator::next_id(),
         target_url: payload.target_url,
         secret: encrypted_secret,
         event_types: serde_json::to_string(&event_types).unwrap_or_else(|_| "[]".to_string()),
