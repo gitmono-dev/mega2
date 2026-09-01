@@ -8,7 +8,7 @@ use super::sea_orm_active_enums::WebhookEventTypeEnum;
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "mega_webhook_delivery")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
     pub webhook_id: i64,
     pub event_type: WebhookEventTypeEnum,

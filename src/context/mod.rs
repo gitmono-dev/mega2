@@ -24,7 +24,9 @@ use crate::{
     },
 };
 
-const MIN_WORKER_FENCE_CONNECTIONS: u32 = 2;
+// Keep one connection pinned by the process-lifetime advisory fence and leave
+// at least two connections available for application transactions.
+const MIN_WORKER_FENCE_CONNECTIONS: u32 = 3;
 
 fn validate_worker_fence_database_config(
     database: &crate::config::DbConfig,
@@ -896,14 +898,14 @@ mod tests {
     }
 
     #[test]
-    fn worker_fence_requires_a_second_database_connection() {
+    fn worker_fence_requires_application_connections_in_addition_to_fence() {
         let config = crate::config::DbConfig {
-            max_connection: 1,
+            max_connection: 2,
             ..Default::default()
         };
 
         let error = validate_worker_fence_database_config(&config)
-            .expect_err("a worker fence must not starve a one-connection pool");
-        assert!(error.to_string().contains("at least 2"));
+            .expect_err("a worker fence must leave application connections available");
+        assert!(error.to_string().contains("at least 3"));
     }
 }

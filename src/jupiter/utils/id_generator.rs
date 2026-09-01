@@ -451,6 +451,12 @@ pub fn ensure_initialized() -> Result<(), MegaError> {
                     "Redis worker selection is missing its active lease".to_string(),
                 ));
             }
+            if state.source == Some(WorkerIdSource::Env) && state.lease_health.is_none() {
+                #[cfg(not(test))]
+                return Err(MegaError::IdGenerationUnavailable(
+                    "configured worker ID requires an active Redis lease".to_string(),
+                ));
+            }
             if let Some(health) = state.lease_health.as_ref()
                 && !health.is_healthy()
             {
@@ -478,39 +484,9 @@ pub fn ensure_initialized() -> Result<(), MegaError> {
 }
 
 pub fn set_up_options() -> Result<(), OptionError> {
-    let (worker_id, source) = resolve_worker_id();
-    if source != WorkerIdSource::Env {
-        return Err(OptionError::InvalidWorkerId(
-            "standalone ID generation requires MEGA_ID_GENERATOR_WORKER_ID".to_string(),
-        ));
-    }
-    let generator = build_generator(worker_id)
-        .map_err(|error| OptionError::InvalidWorkerId(error.to_string()))?;
-
-    let mut state = lock_generator_state();
-    if let Some(existing_worker_id) = state.worker_id {
-        if existing_worker_id != worker_id || state.source != Some(source) {
-            return Err(OptionError::InvalidWorkerId(
-                "ID generator is already bound to another worker selection".to_string(),
-            ));
-        }
-        return Ok(());
-    }
-    bind_generator_state(&mut state, worker_id, source, None, generator)
-        .map_err(|error| OptionError::InvalidWorkerId(error.to_string()))?;
-
-    let identity = process_identity();
-
-    tracing::info!(
-        worker_id,
-        worker_id_bit_len = WORKER_ID_BIT_LEN,
-        seq_bit_len = SEQ_BIT_LEN,
-        timestamp_shift = TIMESTAMP_SHIFT,
-        ?source,
-        process_identity = %identity_digest(&identity),
-        "snowflake id generator initialized"
-    );
-    Ok(())
+    Err(OptionError::InvalidWorkerId(
+        "standalone ID generation requires an active Redis worker lease".to_string(),
+    ))
 }
 
 #[cfg(test)]

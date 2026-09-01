@@ -36,7 +36,8 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     path = "/add",
     request_body = AddToQueueRequest,
     responses(
-        (status = 200, body = CommonResult<AddToQueueResponse>, content_type = "application/json")
+        (status = 200, body = CommonResult<AddToQueueResponse>, content_type = "application/json"),
+        (status = 503, description = "Snowflake ID generation is temporarily unavailable", content_type = "application/json")
     ),
     tag = MERGE_QUEUE_TAG
 )]

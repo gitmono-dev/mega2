@@ -87,7 +87,8 @@ fn parse_event_types(raw: Vec<String>) -> Result<Vec<WebhookEventTypeEnum>, ApiE
     path = "/webhooks",
     request_body = CreateWebhookRequest,
     responses(
-        (status = 200, body = CommonResult<WebhookResponse>, content_type = "application/json")
+        (status = 200, body = CommonResult<WebhookResponse>, content_type = "application/json"),
+        (status = 503, description = "Snowflake ID generation is temporarily unavailable", content_type = "application/json")
     ),
     tag = WEBHOOK_TAG
 )]

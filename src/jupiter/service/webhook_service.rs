@@ -163,10 +163,22 @@ impl WebhookService {
             let mut last_failure_message = None;
             let mut delivered_successfully = false;
             for attempt in 1..=WEBHOOK_DELIVERY_MAX_ATTEMPTS {
-                // Allocate the durable delivery identity before making the
-                // external request. If the process has lost its worker lease,
-                // no webhook is sent without a record that can be persisted.
-                let delivery_id = crate::jupiter::utils::id_generator::next_id()?;
+                // Persist a pending attempt before making the external
+                // request. Delivery IDs come from the database sequence, so a
+                // lost Snowflake lease cannot drop this durable event.
+                let pending_delivery = crate::callisto::mega_webhook_delivery::Model {
+                    id: 0,
+                    webhook_id: webhook.id,
+                    event_type: event_type.clone(),
+                    payload: payload_json.clone(),
+                    response_status: None,
+                    response_body: None,
+                    success: false,
+                    attempt,
+                    error_message: Some("delivery pending".to_string()),
+                    created_at: Utc::now().naive_utc(),
+                };
+                let delivery_id = self.storage.create_delivery(pending_delivery).await?.id;
                 let should_retry = match self
                     .deliver(
                         &webhook.target_url,
@@ -195,7 +207,7 @@ impl WebhookService {
                             error_message: error_message.clone(),
                             created_at: Utc::now().naive_utc(),
                         };
-                        if let Err(e) = self.storage.save_delivery(delivery).await {
+                        if let Err(e) = self.storage.update_delivery(delivery).await {
                             tracing::warn!("failed to save webhook delivery record: {e}");
                         }
                         if success {
@@ -220,7 +232,7 @@ impl WebhookService {
                             error_message: Some(error_message.clone()),
                             created_at: Utc::now().naive_utc(),
                         };
-                        if let Err(save_err) = self.storage.save_delivery(delivery).await {
+                        if let Err(save_err) = self.storage.update_delivery(delivery).await {
                             tracing::warn!("failed to save webhook delivery record: {save_err}");
                         }
                         last_failure_message = Some(error_message);

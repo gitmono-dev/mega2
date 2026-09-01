@@ -337,6 +337,46 @@ impl MonoStorage {
         Ok(())
     }
 
+    /// Update existing refs on the caller's transaction. Merge application
+    /// uses this together with commit/tree inserts so a lost ID lease cannot
+    /// leave refs pointing at objects that were never persisted.
+    pub async fn batch_update_by_path_in_txn(
+        &self,
+        updates: Vec<RefUpdateData>,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut condition = Condition::any();
+        for update in &updates {
+            condition = condition.add(
+                Condition::all()
+                    .add(mega_refs::Column::Path.eq(update.path.clone()))
+                    .add(mega_refs::Column::RefName.eq(update.ref_name.clone())),
+            );
+        }
+
+        let existing_refs = mega_refs::Entity::find().filter(condition).all(txn).await?;
+        let ref_map: HashMap<(String, String), mega_refs::Model> = existing_refs
+            .into_iter()
+            .map(|r| ((r.path.clone(), r.ref_name.clone()), r))
+            .collect();
+
+        for update in updates {
+            if let Some(ref_data) = ref_map.get(&(update.path, update.ref_name)) {
+                let mut active: mega_refs::ActiveModel = ref_data.clone().into();
+                active.ref_commit_hash = Set(update.commit_id);
+                active.ref_tree_hash = Set(update.tree_hash);
+                active.updated_at = Set(chrono::Utc::now().naive_utc());
+                active.update(txn).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn update_blob_filepath(
         &self,
         blob_id: &str,

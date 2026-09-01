@@ -128,7 +128,9 @@ pub trait RepoHandler: Send + Sync + 'static {
                 let sem = semaphore.clone();
                 let handle = tokio::spawn(async move {
                     let _permit = match sem {
-                        Some(s) => Some(s.acquire_owned().await.expect("semaphore closed")),
+                        Some(s) => Some(s.acquire_owned().await.map_err(|error| {
+                            MegaError::Other(format!("receive-pack save semaphore closed: {error}"))
+                        })?),
                         None => None,
                     };
                     let t = Instant::now();
@@ -153,7 +155,9 @@ pub trait RepoHandler: Send + Sync + 'static {
             let sem = semaphore.clone();
             let handle = tokio::spawn(async move {
                 let _permit = match sem {
-                    Some(s) => Some(s.acquire_owned().await.expect("semaphore closed")),
+                    Some(s) => Some(s.acquire_owned().await.map_err(|error| {
+                        MegaError::Other(format!("receive-pack save semaphore closed: {error}"))
+                    })?),
                     None => None,
                 };
                 let t = Instant::now();
@@ -176,13 +180,13 @@ pub trait RepoHandler: Send + Sync + 'static {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::error!("Task {} save_entry Err: {:?}", i, e);
-                    return Err(MegaError::Other(format!(
-                        "Failed to save entry in repository in task {}: {}",
-                        i, e
-                    )));
+                    return Err(e);
                 }
                 Err(join_err) => {
                     tracing::error!("Task {} panic or cancle: {:?}", i, join_err);
+                    return Err(MegaError::Other(format!(
+                        "receive-pack save task {i} failed: {join_err}"
+                    )));
                 }
             }
         }

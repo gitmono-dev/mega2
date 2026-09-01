@@ -62,12 +62,13 @@ use git_internal::{
     },
 };
 use regex::Regex;
+use sea_orm::{IntoActiveModel, TransactionTrait};
 use tracing::debug;
 
 use crate::{
     bellatrix::Bellatrix,
     callisto::{
-        mega_cl, mega_refs, mega_tag, mega_tree,
+        mega_cl, mega_commit, mega_refs, mega_tag, mega_tree,
         sea_orm_active_enums::{
             CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, QueueFailureTypeEnum, QueueStatusEnum,
         },
@@ -2695,19 +2696,16 @@ impl MonoApiService {
             ));
         }
 
-        storage
-            .batch_update_by_path_concurrent(updates)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-
-        // UN-16: the main ref is now written. If a subsequent step fails, the
-        // shared authz snapshot is stale — mark dirty (fail-closed) so enforce
-        // mode rejects all (ADR-UN-01).
-        if let Err(e) = storage.save_mega_commits(commits, None).await {
-            self.storage.entity_store().mark_dirty();
-            return Err(GitError::CustomError(e.to_string()));
-        }
-
+        // Build every model, including all generated IDs, before mutating the
+        // refs. ID-generation failure must therefore leave the database
+        // untouched and retain the typed 503 marker for callers.
+        let save_commits: Vec<mega_commit::ActiveModel> = commits
+            .into_iter()
+            .map(|commit| commit.into_mega_model(EntryMeta::default()))
+            .collect::<Result<Vec<mega_commit::Model>, MegaError>>()?
+            .into_iter()
+            .map(|model| model.into_active_model())
+            .collect();
         let save_trees: Vec<mega_tree::ActiveModel> = result
             .updated_trees
             .clone()
@@ -2719,10 +2717,45 @@ impl MonoApiService {
             })
             .collect::<Result<_, _>>()?;
 
-        if let Err(e) = storage.batch_save_model(save_trees).await {
-            self.storage.entity_store().mark_dirty();
-            return Err(GitError::CustomError(e.to_string()));
+        let txn = storage
+            .get_connection()
+            .begin()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let write_result = async {
+            storage.batch_update_by_path_in_txn(updates, &txn).await?;
+            storage
+                .batch_save_model_with_txn::<mega_commit::Entity, _>(save_commits, Some(&txn))
+                .await?;
+            let on_conflict =
+                sea_orm::sea_query::OnConflict::columns(vec![mega_tree::Column::TreeId])
+                    .do_nothing()
+                    .to_owned();
+            storage
+                .batch_save_model_with_conflict_and_txn::<mega_tree::Entity, _>(
+                    save_trees,
+                    on_conflict,
+                    Some(&txn),
+                )
+                .await?;
+            Ok::<(), MegaError>(())
         }
+        .await;
+
+        if let Err(error) = write_result {
+            if let Err(rollback_error) = txn.rollback().await {
+                self.storage.entity_store().mark_dirty();
+                tracing::error!(
+                    error = %rollback_error,
+                    "failed to roll back atomic mono ref/object update"
+                );
+            }
+            return Err(error.into());
+        }
+
+        txn.commit()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         // UN-16: notify the shared authz snapshot of a possible
         // `/.mega_cedar.json` change on main. merge / merge-no-auth / merge
@@ -4433,6 +4466,21 @@ impl MonoApiService {
                                 error = %error,
                                 "failed to return queue item after ID generation became unavailable"
                             );
+                            match queue_service.return_item_to_waiting(&cl_link).await {
+                                Ok(true) => tracing::info!(
+                                    cl_link = %cl_link,
+                                    "restored queue item to waiting after retry bookkeeping failure"
+                                ),
+                                Ok(false) => tracing::error!(
+                                    cl_link = %cl_link,
+                                    "queue item was not in Testing state during retry recovery"
+                                ),
+                                Err(recovery_error) => tracing::error!(
+                                    cl_link = %cl_link,
+                                    error = %recovery_error,
+                                    "failed to restore queue item visibility after ID lease loss"
+                                ),
+                            }
                         }
                         let detail = message
                             [marker_start + ID_GENERATION_UNAVAILABLE_MARKER.len()..]
@@ -5925,7 +5973,7 @@ async fn apply_update_result_marks_dirty_when_authz_blob_unreadable() {
 }
 
 #[tokio::test]
-async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() {
+async fn apply_update_result_rolls_back_ref_when_tree_save_fails() {
     let temp = tempfile::tempdir().unwrap();
     let storage = crate::jupiter::tests::test_storage(temp.path()).await;
     let service = test_service(&storage);
@@ -5942,13 +5990,8 @@ async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() 
     .await;
 
     // Fault injection: a `BEFORE INSERT` trigger on `mega_tree` that raises
-    // an exception, so the tree save (`batch_save_model`, which propagates
-    // errors) fails AFTER the main ref write (`batch_update_by_path_concurrent`)
-    // succeeds. The ref write targets `mega_refs` (intact); the commit save
-    // targets `mega_commit` (intact); the tree save hits the trigger -> a
-    // non-RecordNotInserted error that propagates to the dirty-marking
-    // branch. (A plain `DROP TABLE` would not work: the search_path includes
-    // `public`, so the insert would fall back to the public schema's table.)
+    // an exception. Ref, commit, and tree writes share one transaction, so the
+    // trigger must roll all of them back together.
     let mono = storage.mono_storage();
     let conn = mono.get_connection();
     sea_orm::ConnectionTrait::execute_raw(
@@ -5985,11 +6028,21 @@ async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() 
     let err = service
         .apply_update_result(&result, "update", None)
         .await
-        .expect_err("tree save must fail after the ref write");
+        .expect_err("tree save must fail and roll back the transaction");
     assert!(!err.to_string().is_empty());
+    let main_ref = storage
+        .mono_storage()
+        .get_main_ref("/")
+        .await
+        .expect("read main ref after rollback")
+        .expect("main ref should remain present");
+    assert_eq!(
+        main_ref.ref_commit_hash,
+        "1111111111111111111111111111111111111111"
+    );
     assert!(
-        storage.entity_store().is_dirty(),
-        "ref written but subsequent step failed -> dirty (fail-closed)"
+        !storage.entity_store().is_dirty(),
+        "an atomic rollback must not leave the authorization snapshot dirty"
     );
 }
 

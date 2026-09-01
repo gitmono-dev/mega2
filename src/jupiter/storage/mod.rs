@@ -173,6 +173,10 @@ impl Storage {
         object_store: MegaObjectStorageWrapper,
     ) -> Result<Self, MegaError> {
         id_generator::validate_layout_version()?;
+        // Validate the process-wide worker lease before opening a writable DB
+        // connection. This keeps the public constructor fail-closed even when
+        // callers bypass AppContext.
+        id_generator::ensure_initialized()?;
         let connection = Arc::new(database_connection(&config.database).await?);
         Self::new_with_connection(config, connection, object_store).await
     }

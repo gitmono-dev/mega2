@@ -110,6 +110,7 @@ pub(crate) mod m20260731_000001_drop_email_jobs;
 mod m20260815_000000_unique_mega_cl_link;
 mod m20260815_000100_merge_queue_requester;
 mod m20260831_000000_drop_mega_issue_tables;
+mod m20260902_000000_make_webhook_delivery_id_generated;
 mod runner;
 pub use runner::apply_migrations;
 
@@ -208,6 +209,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260815_000000_unique_mega_cl_link::Migration),
             Box::new(m20260815_000100_merge_queue_requester::Migration),
             Box::new(m20260831_000000_drop_mega_issue_tables::Migration),
+            Box::new(m20260902_000000_make_webhook_delivery_id_generated::Migration),
         ]
     }
 }

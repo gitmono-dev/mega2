@@ -18,7 +18,10 @@ use crate::{
             import_refs::{CommandType, RefCommand},
         },
     },
-    common::{errors::ProtocolError, utils::MEGA_BRANCH_NAME},
+    common::{
+        errors::{ID_GENERATION_UNAVAILABLE_MARKER, MegaError, ProtocolError},
+        utils::MEGA_BRANCH_NAME,
+    },
 };
 
 const LF: char = '\n';
@@ -516,6 +519,13 @@ impl SmartSession {
             t_receiver.elapsed().as_millis(),
         );
 
+        // ID generation failures are process-wide lease failures, not
+        // per-command rejections. Preserve the typed error so HTTP callers
+        // receive 503 instead of a successful report-status response.
+        if let Err(MegaError::IdGenerationUnavailable(message)) = &unpack_result {
+            return Err(ProtocolError::Unavailable(message.clone()));
+        }
+
         // write "unpack ok\n to report"
         add_pkt_line_string(&mut report_status, "unpack ok\n".to_owned());
 
@@ -540,6 +550,9 @@ impl SmartSession {
                         command.failed(error.clone());
                     }
                 } else if let Err(e) = repo_handler.update_refs(command).await {
+                    if let Some(message) = id_generation_error_message(&e.to_string()) {
+                        return Err(ProtocolError::Unavailable(message));
+                    }
                     command.failed(e.to_string());
                 }
             } else {
@@ -588,6 +601,9 @@ impl SmartSession {
         if !unpack_failed && (has_branch_work || has_deferred_tag_work) {
             let t_finalize = Instant::now();
             if let Err(e) = repo_handler.finalize_receive_pack().await {
+                if let MegaError::IdGenerationUnavailable(message) = &e {
+                    return Err(ProtocolError::Unavailable(message.clone()));
+                }
                 // UN-16: a per-ref rejection (e.g. main-branch delete) must reach
                 // the git client as an actionable `ng <ref> <reason>` report-status
                 // line, not a bare HTTP 400. Mark the branch commands failed and
@@ -820,6 +836,15 @@ impl SmartSession {
 
         Ok(())
     }
+}
+
+fn id_generation_error_message(error: &str) -> Option<String> {
+    let marker_start = error.find(ID_GENERATION_UNAVAILABLE_MARKER)?;
+    Some(
+        error[marker_start + ID_GENERATION_UNAVAILABLE_MARKER.len()..]
+            .trim()
+            .to_string(),
+    )
 }
 
 // SmartProtocol struct removed; remaining codec helpers live on SmartSession.

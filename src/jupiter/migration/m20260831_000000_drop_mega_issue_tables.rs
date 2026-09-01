@@ -158,6 +158,9 @@ mod tests {
             .expect("cl assignee count row")
             .try_get("", "count")
             .expect("count column");
-        assert_eq!(cl_assignees, 1, "CL item_assignees must survive id collision");
+        assert_eq!(
+            cl_assignees, 1,
+            "CL item_assignees must survive id collision"
+        );
     }
 }

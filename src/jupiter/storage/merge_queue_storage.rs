@@ -500,6 +500,28 @@ impl MergeQueueStorage {
             Ok(false)
         }
     }
+
+    /// Restore a processor item to the visible waiting state after a retry
+    /// bookkeeping failure. The status predicate prevents this recovery from
+    /// overwriting a concurrent cancellation or terminal failure.
+    pub async fn return_item_to_waiting(&self, cl_link: &str) -> Result<bool, String> {
+        let now = chrono::Utc::now().naive_utc();
+        let result = Entity::update_many()
+            .set(ActiveModel {
+                status: Set(QueueStatusEnum::Waiting),
+                position: Set(chrono::Utc::now().timestamp_millis()),
+                updated_at: Set(now),
+                failure_type: Set(None),
+                error_message: Set(None),
+                ..Default::default()
+            })
+            .filter(Column::ClLink.eq(cl_link))
+            .filter(Column::Status.eq(QueueStatusEnum::Testing))
+            .exec(self.get_connection())
+            .await
+            .map_err(|e| format!("Failed to restore item to waiting: {e}"))?;
+        Ok(result.rows_affected > 0)
+    }
 }
 
 #[cfg(test)]

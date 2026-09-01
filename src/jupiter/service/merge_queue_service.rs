@@ -159,6 +159,15 @@ impl MergeQueueService {
             .map_err(MegaError::Other)
     }
 
+    /// Restore an item to the visible waiting state when retry bookkeeping
+    /// itself fails after the processor marked it Testing.
+    pub async fn return_item_to_waiting(&self, cl_link: &str) -> Result<bool, MegaError> {
+        self.merge_queue_storage
+            .return_item_to_waiting(cl_link)
+            .await
+            .map_err(MegaError::Other)
+    }
+
     // ========== Processor control methods ==========
 
     /// Tries to start the processor. Returns true if this call started it,

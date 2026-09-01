@@ -1,8 +1,8 @@
 use std::ops::Deref;
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, JoinType, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, EntityTrait, IntoActiveModel, JoinType,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
 };
 
 use crate::{
@@ -141,6 +141,29 @@ impl WebhookStorage {
         model
             .into_active_model()
             .insert(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    /// Persist an attempt with a database-generated identity. Webhook
+    /// delivery is an auxiliary durable record and must remain writable while
+    /// the process-wide Snowflake lease is unavailable.
+    pub async fn create_delivery(
+        &self,
+        model: mega_webhook_delivery::Model,
+    ) -> Result<mega_webhook_delivery::Model, MegaError> {
+        let mut active = model.into_active_model();
+        active.id = NotSet;
+        Ok(active.insert(self.get_connection()).await?)
+    }
+
+    pub async fn update_delivery(
+        &self,
+        model: mega_webhook_delivery::Model,
+    ) -> Result<(), MegaError> {
+        model
+            .into_active_model()
+            .update(self.get_connection())
             .await?;
         Ok(())
     }

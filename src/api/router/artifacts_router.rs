@@ -371,6 +371,7 @@ pub async fn head_artifact_object(
     responses(
         (status = 200, description = "Batch response with upload actions", body = ArtifactBatchResponse, content_type = "application/json"),
         (status = 400, description = "Invalid request (namespace, oid, path, size, limits)", content_type = "application/json"),
+        (status = 503, description = "Snowflake ID generation is temporarily unavailable", content_type = "application/json"),
         (status = 500, description = "Database error", content_type = "application/json")
     ),
     tag = ARTIFACTS_TAG
@@ -401,6 +402,7 @@ pub async fn batch(
         (status = 200, description = "Commit response (ok or missing_objects)", body = ArtifactCommitResponse, content_type = "application/json"),
         (status = 400, description = "Invalid request or size mismatch", content_type = "application/json"),
         (status = 409, description = "artifact_set_id already committed with a different manifest", content_type = "application/json"),
+        (status = 503, description = "Snowflake ID generation is temporarily unavailable", content_type = "application/json"),
         (status = 500, description = "Database error", content_type = "application/json")
     ),
     tag = ARTIFACTS_TAG
