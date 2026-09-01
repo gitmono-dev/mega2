@@ -28,4 +28,4 @@
 | `plan-20260824.md` | 日期计划 | **已执行**（orbit 完全单体内联：`src/orbit_api` + `src/orbit`，移除 `ObjectStorageProvider`，单 package `monoengine`；家族发布 REL-ORB-01 → ORB-09） |
 | `plan-20260826.md` | 日期计划 | Mega 同步 #2130→#2175（SYNC-01..05；状态以计划内任务卡为准） |
 | `plan-20260827.md` | 日期计划 | **新建**（CL 多 commit push 放开：push 侧链式校验 + 拒绝 merge commit + 修 ref 配对，trunk 侧 CL merge 永远单父新 commit 不动；MC-01..04；设计经 Codex/Claude 双评审有条件批准；下游 = monoui `docs/plan/plan-20260827.md`） |
-| `plan-20260901.md` | 日期计划 | **Claude Code Review PASS**（Mega `bb3ef17` FastCDC media transport，以及 receive-pack 状态安全、导入批处理、DB/Redis 并发和多实例 ID 改进；FC-01..14；R4 通过） |
+| `plan-20260901.md` | 日期计划 | **已完成（本地 release `v0.6.0`）**（Mega `bb3ef17` FastCDC media transport，以及 receive-pack 状态安全、导入批处理、DB/Redis 并发和多实例 ID 改进；FC-01..14；Claude Code 计划 Review PASS，逐卡 Codex 实施 Review PASS；远端 peer/push 按 `D-FC-14-01/02` 登记） |
