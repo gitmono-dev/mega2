@@ -20,9 +20,9 @@ use crate::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService,
-            lfs_service::LfsService, merge_queue_service::MergeQueueService,
-            mono_service::MonoService, webhook_service::WebhookService,
+            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
+            merge_queue_service::MergeQueueService, mono_service::MonoService,
+            webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -62,6 +62,7 @@ const DEFAULT_TEST_DATABASE_URL: &str =
 static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
+    crate::jupiter::utils::id_generator::ensure_test_initialized();
     let db_url = create_test_database_url().await;
 
     let mut opt = ConnectOptions::new(db_url);

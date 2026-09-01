@@ -52,49 +52,63 @@ async fn storage_smoke(config: crate::config::Config, args: &ArgMatches) -> Mega
         .unwrap_or_else(|| "debug/storage-smoke/test-object.bin".to_string());
 
     let context = AppContext::new(config).await?;
-    let obj_storage = &context.storage.git_service.obj_storage;
+    let result = async {
+        let obj_storage = &context.storage.git_service.obj_storage;
 
-    let object_key = ObjectKey {
-        namespace: ObjectNamespace::Attachment,
-        key: key.clone(),
-    };
+        let object_key = ObjectKey {
+            namespace: ObjectNamespace::Attachment,
+            key: key.clone(),
+        };
 
-    let payload = b"monoengine storage smoke test payload".to_vec();
-    let payload_bytes = bytes::Bytes::from(payload.clone());
-    let stream = Box::pin(futures::stream::once(async move {
-        Ok::<_, std::io::Error>(payload_bytes)
-    }));
+        let payload = b"monoengine storage smoke test payload".to_vec();
+        let payload_bytes = bytes::Bytes::from(payload.clone());
+        let stream = Box::pin(futures::stream::once(async move {
+            Ok::<_, std::io::Error>(payload_bytes)
+        }));
 
-    obj_storage
-        .inner
-        .put_stream(&object_key, stream, ObjectMeta::default())
-        .await
-        .map_err(|e| MegaError::Other(format!("object storage put failed: {e}")))?;
+        obj_storage
+            .inner
+            .put_stream(&object_key, stream, ObjectMeta::default())
+            .await
+            .map_err(|e| MegaError::Other(format!("object storage put failed: {e}")))?;
 
-    let (stream, _meta) = obj_storage
-        .inner
-        .get_stream(&object_key)
-        .await
-        .map_err(|e| MegaError::Other(format!("object storage get failed: {e}")))?;
+        let (stream, _meta) = obj_storage
+            .inner
+            .get_stream(&object_key)
+            .await
+            .map_err(|e| MegaError::Other(format!("object storage get failed: {e}")))?;
 
-    let got_bytes = read_object_stream(stream)
-        .await
-        .map_err(|e| MegaError::Other(format!("object storage read failed: {e}")))?;
+        let got_bytes = read_object_stream(stream)
+            .await
+            .map_err(|e| MegaError::Other(format!("object storage read failed: {e}")))?;
 
-    if got_bytes != payload {
-        return Err(MegaError::Other(
-            "object storage round-trip payload mismatch".to_string(),
-        ));
+        if got_bytes != payload {
+            return Err(MegaError::Other(
+                "object storage round-trip payload mismatch".to_string(),
+            ));
+        }
+
+        obj_storage
+            .inner
+            .delete(&object_key)
+            .await
+            .map_err(|e| MegaError::Other(format!("object storage delete failed: {e}")))?;
+
+        tracing::info!(key = %key, "object storage smoke test passed");
+        Ok::<(), MegaError>(())
     }
+    .await;
 
-    obj_storage
-        .inner
-        .delete(&object_key)
-        .await
-        .map_err(|e| MegaError::Other(format!("object storage delete failed: {e}")))?;
-
-    tracing::info!(key = %key, "object storage smoke test passed");
-    Ok(())
+    if let Err(shutdown_error) = context.shutdown().await {
+        if result.is_ok() {
+            return Err(shutdown_error);
+        }
+        tracing::warn!(
+            error = %shutdown_error,
+            "failed to release background resources after storage smoke error"
+        );
+    }
+    result
 }
 
 async fn read_object_stream(mut stream: ObjectByteStream) -> Result<Vec<u8>, MegaError> {

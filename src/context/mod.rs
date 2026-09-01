@@ -57,6 +57,26 @@ pub struct AppContext {
     pub entity_store: Arc<SharedEntityStore>,
 }
 
+struct StartupLeaseGuard(Option<SnowflakeWorkerLease>);
+
+impl StartupLeaseGuard {
+    fn new(lease: Option<SnowflakeWorkerLease>) -> Self {
+        Self(lease)
+    }
+
+    fn take(&mut self) -> Option<SnowflakeWorkerLease> {
+        self.0.take()
+    }
+
+    async fn shutdown(&mut self) -> Result<(), MegaError> {
+        if let Some(lease) = self.0.take() {
+            lease.shutdown().await
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl AppContext {
     /// Creates a new application context with the given configuration.
     ///
@@ -95,9 +115,8 @@ impl AppContext {
         // the legacy fixed worker ID.
         let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
         let connection = init_connection_lazy(&redis_config)?;
-        let worker_lease = if id_generator::env_worker_id_is_valid() {
-            let (worker_id, source) = id_generator::resolve_worker_id();
-            id_generator::initialize_worker(worker_id, source, None)?;
+        let worker_lease = if let Some(worker_id) = id_generator::configured_env_worker_id() {
+            id_generator::initialize_worker(worker_id, id_generator::WorkerIdSource::Env, None)?;
             tracing::info!(
                 source = ?id_generator::WorkerIdSource::Env,
                 "valid MEGA_ID_GENERATOR_WORKER_ID set; skipping Redis worker slot claim"
@@ -129,151 +148,169 @@ impl AppContext {
             None
         };
 
-        // Resolve any `vault://` SecretRef object-storage credentials post-vault,
-        // then build the concrete object store from the resolved config.
-        let object_storage_config =
-            resolve_object_storage_secrets(&config.object_storage, &vault).await?;
-        let object_store =
-            crate::jupiter::storage::object_storage::build_object_storage(&object_storage_config)
-                .await?;
-
-        let storage = crate::jupiter::storage::Storage::new_with_connection(
-            config.clone(),
-            db_connection,
-            object_store,
-        )
-        .await?;
-        let config_handle = storage.config_handle();
-
-        // Create the shared authorization snapshot holder (ADR-UN-02) and inject
-        // the same `Arc` into `Storage` (write-path notify) and the HTTP state
-        // (read-path guard/push). First-build `ensure` happens before the HTTP
-        // listener binds (UN-02).
-        let entity_store = Arc::new(SharedEntityStore::new());
-        let mut storage = storage;
-        storage.set_entity_store(entity_store.clone());
-        // MC-09: the server-signing vault handle reaches the synthetic-commit
-        // sites through storage; vault is built before storage above.
-        let storage = storage.with_vault(vault.clone());
-
-        // Build notification channels after Vault so optional Slack and webhook
-        // credentials can be resolved. In-app delivery does not require `[mail]`.
+        let mut worker_lease_guard = StartupLeaseGuard::new(worker_lease);
         let notification_shutdown = CancellationToken::new();
-        let notif_stg = storage.notification_storage();
-        let mut extra_channels: Vec<Arc<dyn crate::notification::channels::NotificationChannel>> =
-            Vec::new();
-        let mut website_mail = None;
-        let (notification_enabled, default_delivery_mode) = match config.notification.as_ref() {
-            Some(notification_cfg) => {
-                crate::config::validate::validate_notification_config(notification_cfg)?;
-                let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-                if let Some(slack) = notification_cfg
-                    .slack
-                    .as_ref()
-                    .filter(|slack| slack.enabled)
-                {
-                    let Some(url_ref) = &slack.webhook_url_ref else {
-                        return Err(MegaError::Other(
+        let startup_notification_shutdown = notification_shutdown.clone();
+        let result = async {
+            // Resolve any `vault://` SecretRef object-storage credentials post-vault,
+            // then build the concrete object store from the resolved config.
+            let object_storage_config =
+                resolve_object_storage_secrets(&config.object_storage, &vault).await?;
+            let object_store = crate::jupiter::storage::object_storage::build_object_storage(
+                &object_storage_config,
+            )
+            .await?;
+
+            let storage = crate::jupiter::storage::Storage::new_with_connection(
+                config.clone(),
+                db_connection,
+                object_store,
+            )
+            .await?;
+            let config_handle = storage.config_handle();
+
+            // Create the shared authorization snapshot holder (ADR-UN-02) and inject
+            // the same `Arc` into `Storage` (write-path notify) and the HTTP state
+            // (read-path guard/push). First-build `ensure` happens before the HTTP
+            // listener binds (UN-02).
+            let entity_store = Arc::new(SharedEntityStore::new());
+            let mut storage = storage;
+            storage.set_entity_store(entity_store.clone());
+            // MC-09: the server-signing vault handle reaches the synthetic-commit
+            // sites through storage; vault is built before storage above.
+            let storage = storage.with_vault(vault.clone());
+
+            // Build notification channels after Vault so optional Slack and webhook
+            // credentials can be resolved. In-app delivery does not require `[mail]`.
+            let notif_stg = storage.notification_storage();
+            let mut extra_channels: Vec<
+                Arc<dyn crate::notification::channels::NotificationChannel>,
+            > = Vec::new();
+            let mut website_mail = None;
+            let (notification_enabled, default_delivery_mode) = match config.notification.as_ref() {
+                Some(notification_cfg) => {
+                    crate::config::validate::validate_notification_config(notification_cfg)?;
+                    let resolver = VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
+                    if let Some(slack) = notification_cfg
+                        .slack
+                        .as_ref()
+                        .filter(|slack| slack.enabled)
+                    {
+                        let Some(url_ref) = &slack.webhook_url_ref else {
+                            return Err(MegaError::Other(
                                 "notification.slack.enabled is true but notification.slack.webhook_url_ref is missing".to_string(),
                             ));
-                    };
-                    let url = crate::contract::vault::integration::vault_core::with_audit_caller(
-                        "startup:notification-slack",
-                        resolver.resolve(url_ref),
+                        };
+                        let url = crate::contract::vault::integration::vault_core::with_audit_caller(
+                            "startup:notification-slack",
+                            resolver.resolve(url_ref),
+                        )
+                        .await?;
+                        extra_channels.push(Arc::new(
+                            crate::notification::channels::SlackChannel::new(
+                                crate::config::secret::SecretString::new(url),
+                            )?,
+                        ));
+                    }
+                    if let Some(webhook) = notification_cfg
+                        .webhook
+                        .as_ref()
+                        .filter(|webhook| webhook.enabled)
+                    {
+                        let token = if let Some(token_ref) = &webhook.token_ref {
+                            Some(crate::config::secret::SecretString::new(
+                                crate::contract::vault::integration::vault_core::with_audit_caller(
+                                    "startup:notification-webhook",
+                                    resolver.resolve(token_ref),
+                                )
+                                .await?,
+                            ))
+                        } else {
+                            None
+                        };
+                        extra_channels.push(Arc::new(
+                            crate::notification::channels::WebhookChannel::new(
+                                webhook.url.clone(),
+                                token,
+                            )?,
+                        ));
+                    }
+                    if !notification_cfg.website_mail_base_url.trim().is_empty() {
+                        let bearer = match (
+                            &notification_cfg.website_mail_bearer,
+                            &notification_cfg.website_mail_bearer_ref,
+                        ) {
+                            (Some(bearer), None) => bearer.clone(),
+                            (None, Some(bearer_ref)) => crate::config::secret::SecretString::new(
+                                crate::contract::vault::integration::vault_core::with_audit_caller(
+                                    "startup:notification-website-mail",
+                                    resolver.resolve(bearer_ref),
+                                )
+                                .await?,
+                            ),
+                            _ => {
+                                return Err(MegaError::Other(
+                                    "website mail configuration must provide exactly one bearer source"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        website_mail = Some(Arc::new(
+                            crate::notification::website_mail::WebsiteMailClient::new(
+                                &notification_cfg.website_mail_base_url,
+                                bearer,
+                            )?,
+                        ));
+                    }
+                    (
+                        notification_cfg.enabled,
+                        notification_cfg.default_delivery_mode.clone(),
                     )
-                    .await?;
-                    extra_channels.push(Arc::new(
-                        crate::notification::channels::SlackChannel::new(
-                            crate::config::secret::SecretString::new(url),
-                        )?,
-                    ));
                 }
-                if let Some(webhook) = notification_cfg
-                    .webhook
-                    .as_ref()
-                    .filter(|webhook| webhook.enabled)
-                {
-                    let token = if let Some(token_ref) = &webhook.token_ref {
-                        Some(crate::config::secret::SecretString::new(
-                            crate::contract::vault::integration::vault_core::with_audit_caller(
-                                "startup:notification-webhook",
-                                resolver.resolve(token_ref),
-                            )
-                            .await?,
-                        ))
-                    } else {
-                        None
-                    };
-                    extra_channels.push(Arc::new(
-                        crate::notification::channels::WebhookChannel::new(
-                            webhook.url.clone(),
-                            token,
-                        )?,
-                    ));
-                }
-                if !notification_cfg.website_mail_base_url.trim().is_empty() {
-                    let bearer = match (
-                        &notification_cfg.website_mail_bearer,
-                        &notification_cfg.website_mail_bearer_ref,
-                    ) {
-                        (Some(bearer), None) => bearer.clone(),
-                        (None, Some(bearer_ref)) => crate::config::secret::SecretString::new(
-                            crate::contract::vault::integration::vault_core::with_audit_caller(
-                                "startup:notification-website-mail",
-                                resolver.resolve(bearer_ref),
-                            )
-                            .await?,
-                        ),
-                        _ => {
-                            return Err(MegaError::Other(
-                                "website mail configuration must provide exactly one bearer source"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-                    website_mail = Some(Arc::new(
-                        crate::notification::website_mail::WebsiteMailClient::new(
-                            &notification_cfg.website_mail_base_url,
-                            bearer,
-                        )?,
-                    ));
-                }
-                (
-                    notification_cfg.enabled,
-                    notification_cfg.default_delivery_mode.clone(),
-                )
+                None => (
+                    true,
+                    crate::config::DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
+                ),
+            };
+            let service = Arc::new(crate::notification::NotificationService::new(
+                notif_stg,
+                extra_channels,
+                website_mail,
+                Some(config_handle.clone()),
+                notification_enabled,
+                default_delivery_mode,
+            ));
+            crate::notification::NotificationService::set_active(Some(Arc::clone(&service)));
+            let sd = notification_shutdown.clone();
+            tokio::spawn(async move {
+                service.start(sd).await;
+            });
+
+            storage.mono_service.init_monorepo(&config.monorepo).await?;
+
+            Ok(Self {
+                storage,
+                vault,
+                config,
+                config_handle,
+                connection,
+                worker_lease: worker_lease_guard.take(),
+                notification_shutdown,
+                entity_store,
+            })
+        }
+        .await;
+
+        if result.is_err() {
+            startup_notification_shutdown.cancel();
+            if let Err(error) = worker_lease_guard.shutdown().await {
+                tracing::warn!(
+                    error = %error,
+                    "failed to release snowflake worker lease after startup error"
+                );
             }
-            None => (
-                true,
-                crate::config::DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
-            ),
-        };
-        let service = Arc::new(crate::notification::NotificationService::new(
-            notif_stg,
-            extra_channels,
-            website_mail,
-            Some(config_handle.clone()),
-            notification_enabled,
-            default_delivery_mode,
-        ));
-        crate::notification::NotificationService::set_active(Some(Arc::clone(&service)));
-        let sd = notification_shutdown.clone();
-        tokio::spawn(async move {
-            service.start(sd).await;
-        });
-
-        storage.mono_service.init_monorepo(&config.monorepo).await?;
-
-        Ok(Self {
-            storage,
-            vault,
-            config,
-            config_handle,
-            connection,
-            worker_lease,
-            notification_shutdown,
-            entity_store,
-        })
+        }
+        result
     }
 
     pub fn config(&self) -> Arc<crate::config::Config> {

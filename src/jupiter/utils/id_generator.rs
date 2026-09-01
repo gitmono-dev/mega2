@@ -51,28 +51,57 @@ impl Default for GeneratorState {
 /// for the whole Redis TTL after the lease should have been considered stale.
 pub(crate) struct WorkerLeaseHealth {
     healthy: AtomicBool,
+    revoked: AtomicBool,
     deadline_ms: AtomicU64,
 }
 
 impl WorkerLeaseHealth {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub(crate) fn claimed() -> Arc<Self> {
+        let health = Arc::new(Self {
             healthy: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
             deadline_ms: AtomicU64::new(0),
-        })
+        });
+        health.refresh_deadline();
+        health
     }
 
-    pub(crate) fn activate(&self) {
+    pub(crate) fn activate(&self) -> bool {
+        if self.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let now = monotonic_millis();
+        let deadline = self.deadline_ms.load(Ordering::Acquire);
+        if deadline != 0 && now >= deadline {
+            self.lost();
+            return false;
+        }
+        if deadline == 0 {
+            self.refresh_deadline();
+        }
         self.healthy.store(true, Ordering::Release);
-        self.refresh_deadline();
+        true
     }
 
-    pub(crate) fn refreshed(&self) {
+    pub(crate) fn refreshed(&self) -> bool {
+        if self.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let now = monotonic_millis();
+        let deadline = self.deadline_ms.load(Ordering::Acquire);
+        if deadline != 0 && now >= deadline {
+            self.lost();
+            return false;
+        }
         self.refresh_deadline();
         self.healthy.store(true, Ordering::Release);
+        true
     }
 
     pub(crate) fn lost(&self) {
+        self.revoked.store(true, Ordering::Release);
         self.healthy.store(false, Ordering::Release);
         self.deadline_ms.store(0, Ordering::Release);
     }
@@ -82,7 +111,7 @@ impl WorkerLeaseHealth {
         let deadline = self.deadline_ms.load(Ordering::Acquire);
         let within_deadline = deadline != 0 && monotonic_millis() < deadline;
         if healthy && !within_deadline {
-            self.healthy.store(false, Ordering::Release);
+            self.lost();
         }
         healthy && within_deadline
     }
@@ -95,8 +124,10 @@ impl WorkerLeaseHealth {
 
     #[cfg(test)]
     fn expire(&self) {
-        self.deadline_ms
-            .store(monotonic_millis().saturating_sub(1), Ordering::Release);
+        self.deadline_ms.store(1, Ordering::Release);
+        while monotonic_millis() < 1 {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -119,6 +150,9 @@ pub fn claim_worker_id(id: u32) -> bool {
 /// Once a lease is lost, refusing to generate further IDs is safer than
 /// continuing with a worker ID that another process may already have claimed.
 pub(crate) fn next_id() -> Result<i64, MegaError> {
+    #[cfg(test)]
+    ensure_test_initialized();
+
     let mut state = lock_generator_state();
     next_id_from_state(&mut state)
 }
@@ -166,6 +200,35 @@ fn lock_generator_state() -> std::sync::MutexGuard<'static, GeneratorState> {
     }
 }
 
+pub(crate) fn refresh_worker_lease(health: &Arc<WorkerLeaseHealth>) -> bool {
+    let mut state = lock_generator_state();
+    refresh_worker_lease_in_state(&mut state, health)
+}
+
+fn refresh_worker_lease_in_state(
+    state: &mut GeneratorState,
+    health: &Arc<WorkerLeaseHealth>,
+) -> bool {
+    let is_bound = state
+        .lease_health
+        .as_ref()
+        .is_some_and(|bound| Arc::ptr_eq(bound, health));
+    if !is_bound {
+        health.lost();
+        return false;
+    }
+    health.refreshed()
+}
+
+pub(crate) fn revoke_worker_lease(health: &Arc<WorkerLeaseHealth>) {
+    let mut state = lock_generator_state();
+    revoke_worker_lease_in_state(&mut state, health);
+}
+
+fn revoke_worker_lease_in_state(_state: &mut GeneratorState, health: &Arc<WorkerLeaseHealth>) {
+    health.lost();
+}
+
 fn monotonic_millis() -> u64 {
     MONOTONIC_EPOCH
         .get_or_init(Instant::now)
@@ -207,13 +270,21 @@ fn bind_generator_state(
             ));
         }
         if let Some(health) = state.lease_health.as_ref() {
-            health.activate();
+            if !health.activate() {
+                return Err(MegaError::IdGenerationUnavailable(
+                    "Redis worker lease expired before ID generator initialization".to_string(),
+                ));
+            }
         }
         return Ok(());
     }
 
     if let Some(health) = lease_health.as_ref() {
-        health.activate();
+        if !health.activate() {
+            return Err(MegaError::IdGenerationUnavailable(
+                "Redis worker lease expired before ID generator initialization".to_string(),
+            ));
+        }
     }
     state.generator = Some(generator);
     state.worker_id = Some(worker_id);
@@ -234,6 +305,16 @@ pub(crate) fn initialize_worker(
         return Err(MegaError::IdGenerationUnavailable(format!(
             "worker ID {worker_id} is outside 0..={MAX_WORKER_ID}"
         )));
+    }
+    if source == WorkerIdSource::Redis && lease_health.is_none() {
+        return Err(MegaError::IdGenerationUnavailable(
+            "Redis worker selection requires an active lease".to_string(),
+        ));
+    }
+    if source != WorkerIdSource::Redis && lease_health.is_some() {
+        return Err(MegaError::IdGenerationUnavailable(
+            "only Redis worker selections may carry a lease".to_string(),
+        ));
     }
 
     let generator = build_generator(worker_id)?;
@@ -288,11 +369,30 @@ pub fn resolve_worker_id() -> (u32, WorkerIdSource) {
     )
 }
 
+fn parse_env_worker_id(raw: &str) -> Option<u32> {
+    raw.parse::<u32>().ok().filter(|id| *id <= MAX_WORKER_ID)
+}
+
+/// Return the explicitly configured worker ID, logging invalid input once at
+/// the boundary that consumes the environment variable.
+pub fn configured_env_worker_id() -> Option<u32> {
+    let Some(raw) = std::env::var(ENV_WORKER_ID).ok() else {
+        return None;
+    };
+    if let Some(id) = parse_env_worker_id(&raw) {
+        return Some(id);
+    }
+
+    tracing::warn!(
+        raw_len = raw.len(),
+        max = MAX_WORKER_ID,
+        "ignoring out-of-range or invalid MEGA_ID_GENERATOR_WORKER_ID"
+    );
+    None
+}
+
 pub fn env_worker_id_is_valid() -> bool {
-    std::env::var(ENV_WORKER_ID)
-        .ok()
-        .and_then(|raw| raw.parse::<u32>().ok())
-        .is_some_and(|id| id <= MAX_WORKER_ID)
+    configured_env_worker_id().is_some()
 }
 
 pub fn resolve_worker_id_from(
@@ -301,16 +401,14 @@ pub fn resolve_worker_id_from(
     identity: &str,
 ) -> (u32, WorkerIdSource) {
     if let Some(raw) = env_val {
-        match raw.parse::<u32>() {
-            Ok(id) if id <= MAX_WORKER_ID => return (id, WorkerIdSource::Env),
-            _ => {
-                tracing::warn!(
-                    raw_len = raw.len(),
-                    max = MAX_WORKER_ID,
-                    "ignoring out-of-range or invalid MEGA_ID_GENERATOR_WORKER_ID"
-                );
-            }
+        if let Some(id) = parse_env_worker_id(raw) {
+            return (id, WorkerIdSource::Env);
         }
+        tracing::warn!(
+            raw_len = raw.len(),
+            max = MAX_WORKER_ID,
+            "ignoring out-of-range or invalid MEGA_ID_GENERATOR_WORKER_ID"
+        );
     }
     if let Some(id) = claimed {
         return (id.min(MAX_WORKER_ID), WorkerIdSource::Redis);
@@ -323,12 +421,47 @@ pub fn resolve_worker_id_from(
 /// single-writer process; production [`crate::context::AppContext`] binds a
 /// Redis lease before allowing IDs to be generated.
 pub fn ensure_initialized() -> Result<(), MegaError> {
+    {
+        let state = lock_generator_state();
+        if state.worker_id.is_some() {
+            if state.source == Some(WorkerIdSource::Redis) {
+                let Some(health) = state.lease_health.as_ref() else {
+                    return Err(MegaError::IdGenerationUnavailable(
+                        "Redis worker selection is missing its active lease".to_string(),
+                    ));
+                };
+                if !health.is_healthy() {
+                    return Err(MegaError::IdGenerationUnavailable(
+                        "Redis worker lease was lost or expired".to_string(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let (worker_id, source) = resolve_worker_id();
+    if source == WorkerIdSource::Hash {
+        return Err(MegaError::IdGenerationUnavailable(
+            "an exclusive worker ID is required; stable identity hash is diagnostic-only"
+                .to_string(),
+        ));
+    }
+    if source == WorkerIdSource::Redis {
+        return Err(MegaError::IdGenerationUnavailable(
+            "Redis worker selection requires an active lease".to_string(),
+        ));
+    }
     initialize_worker(worker_id, source, None)
 }
 
 pub fn set_up_options() -> Result<(), OptionError> {
     let (worker_id, source) = resolve_worker_id();
+    if source != WorkerIdSource::Env {
+        return Err(OptionError::InvalidWorkerId(
+            "standalone ID generation requires MEGA_ID_GENERATOR_WORKER_ID".to_string(),
+        ));
+    }
     let generator = build_generator(worker_id)
         .map_err(|error| OptionError::InvalidWorkerId(error.to_string()))?;
 
@@ -341,14 +474,8 @@ pub fn set_up_options() -> Result<(), OptionError> {
         }
         return Ok(());
     }
-    if source == WorkerIdSource::Redis {
-        return Err(OptionError::InvalidWorkerId(
-            "Redis worker selection requires an active lease".to_string(),
-        ));
-    }
-    state.generator = Some(generator);
-    state.worker_id = Some(worker_id);
-    state.source = Some(source);
+    bind_generator_state(&mut state, worker_id, source, None, generator)
+        .map_err(|error| OptionError::InvalidWorkerId(error.to_string()))?;
 
     let identity = process_identity();
 
@@ -362,6 +489,22 @@ pub fn set_up_options() -> Result<(), OptionError> {
         "snowflake id generator initialized"
     );
     Ok(())
+}
+
+#[cfg(test)]
+static TEST_ID_GENERATOR_INIT: OnceLock<()> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn ensure_test_initialized() {
+    TEST_ID_GENERATOR_INIT.get_or_init(|| {
+        let state = lock_generator_state();
+        if state.worker_id.is_some() {
+            return;
+        }
+        drop(state);
+        initialize_worker(0, WorkerIdSource::Env, None)
+            .expect("test ID generator should bind a deterministic worker");
+    });
 }
 
 #[cfg(test)]
@@ -410,6 +553,15 @@ mod tests {
     }
 
     #[test]
+    fn generated_id_contains_the_configured_worker_bits() {
+        let mut generator = build_generator(MAX_WORKER_ID).expect("valid test worker ID");
+        let id = generator.next_id();
+        let worker_bits = (id >> SEQ_BIT_LEN) & i64::from(MAX_WORKER_ID);
+
+        assert_eq!(worker_bits, i64::from(MAX_WORKER_ID));
+    }
+
+    #[test]
     fn hash_is_stable_and_bounded_for_distinct_identities() {
         let first = hash_worker_id("mono-engine-5f6d8d7cc9-45tx");
         let second = hash_worker_id("mono-engine-5f6d8d7cc9-rknxw");
@@ -428,7 +580,7 @@ mod tests {
 
     #[test]
     fn worker_lease_health_gate_is_fail_closed() {
-        let health = WorkerLeaseHealth::new();
+        let health = WorkerLeaseHealth::claimed();
         health.activate();
         assert!(health.is_healthy());
 
@@ -438,7 +590,7 @@ mod tests {
 
     #[test]
     fn worker_lease_health_gate_expires_before_redis_ttl() {
-        let health = WorkerLeaseHealth::new();
+        let health = WorkerLeaseHealth::claimed();
         health.activate();
         health.expire();
 
@@ -446,8 +598,25 @@ mod tests {
     }
 
     #[test]
+    fn claimed_lease_rejects_activation_after_local_deadline() {
+        let health = WorkerLeaseHealth::claimed();
+        health.expire();
+
+        assert!(!health.activate());
+        assert!(!health.is_healthy());
+    }
+
+    #[test]
+    fn redis_worker_binding_requires_a_lease() {
+        let error = initialize_worker(7, WorkerIdSource::Redis, None)
+            .expect_err("Redis worker IDs must be lease-backed");
+
+        assert!(error.to_string().contains("active lease"));
+    }
+
+    #[test]
     fn production_id_gate_stops_after_lease_loss() {
-        let health = WorkerLeaseHealth::new();
+        let health = WorkerLeaseHealth::claimed();
         health.activate();
         let mut state = GeneratorState {
             generator: Some(build_generator(7).expect("valid test worker ID")),
@@ -482,7 +651,7 @@ mod tests {
 
     #[test]
     fn worker_selection_binding_rejects_incompatible_second_context() {
-        let health = WorkerLeaseHealth::new();
+        let health = WorkerLeaseHealth::claimed();
         let mut state = GeneratorState::default();
         bind_generator_state(
             &mut state,
@@ -497,7 +666,7 @@ mod tests {
             &mut state,
             8,
             WorkerIdSource::Redis,
-            Some(WorkerLeaseHealth::new()),
+            Some(WorkerLeaseHealth::claimed()),
             build_generator(8).expect("valid test worker ID"),
         )
         .expect_err("a second context must not combine another worker and lease");
@@ -509,5 +678,33 @@ mod tests {
             state.lease_health.as_ref().expect("lease bound"),
             &health
         ));
+    }
+
+    #[test]
+    fn late_refresh_cannot_reactivate_a_revoked_lease() {
+        let health = WorkerLeaseHealth::claimed();
+        let mut state = GeneratorState::default();
+        bind_generator_state(
+            &mut state,
+            7,
+            WorkerIdSource::Redis,
+            Some(health.clone()),
+            build_generator(7).expect("valid test worker ID"),
+        )
+        .expect("worker lease should bind");
+
+        assert!(refresh_worker_lease_in_state(&mut state, &health));
+        revoke_worker_lease_in_state(&mut state, &health);
+        assert!(!refresh_worker_lease_in_state(&mut state, &health));
+        assert!(next_id_from_state(&mut state).is_err());
+    }
+
+    #[test]
+    fn unbound_lease_cannot_refresh_or_activate_id_generation() {
+        let health = WorkerLeaseHealth::claimed();
+        let mut state = GeneratorState::default();
+
+        assert!(!refresh_worker_lease_in_state(&mut state, &health));
+        assert!(!health.is_healthy());
     }
 }

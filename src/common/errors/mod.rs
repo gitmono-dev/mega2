@@ -243,13 +243,18 @@ pub enum ProtocolError {
     TooLarge(String),
     #[error("Invalid Input: {0}")]
     InvalidInput(String),
+    #[error("Service unavailable: {0}")]
+    Unavailable(String),
     #[error("HTTP Push Has Been Disabled")]
     Disabled,
 }
 
 impl From<MegaError> for ProtocolError {
     fn from(err: MegaError) -> ProtocolError {
-        ProtocolError::InvalidInput(err.to_string())
+        match err {
+            MegaError::IdGenerationUnavailable(message) => ProtocolError::Unavailable(message),
+            other => ProtocolError::InvalidInput(other.to_string()),
+        }
     }
 }
 
@@ -261,6 +266,7 @@ impl IntoResponse for ProtocolError {
             ProtocolError::TooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
             ProtocolError::NotFound(err) => (StatusCode::NOT_FOUND, err),
             ProtocolError::InvalidInput(err) => (StatusCode::BAD_REQUEST, err),
+            ProtocolError::Unavailable(err) => (StatusCode::SERVICE_UNAVAILABLE, err),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong".to_owned(),
@@ -287,6 +293,16 @@ mod tests {
         let response = ProtocolError::NotFound("repo missing".to_owned()).into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn id_generation_unavailable_maps_to_retryable_protocol_status() {
+        let error: ProtocolError =
+            MegaError::IdGenerationUnavailable("lease lost".to_owned()).into();
+        assert!(matches!(error, ProtocolError::Unavailable(message) if message == "lease lost"));
+
+        let response = ProtocolError::Unavailable("lease lost".to_owned()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

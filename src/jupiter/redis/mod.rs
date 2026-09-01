@@ -53,7 +53,8 @@ pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, 
 
 /// Build a Redis manager without requiring the server to be reachable during
 /// application bootstrap. Commands still fail normally when the manager is
-/// used, allowing Snowflake worker selection to fall back to a stable hash.
+/// used, allowing Snowflake worker selection to enter diagnostic-only fallback
+/// without treating the hash as an ID uniqueness guarantee.
 pub fn init_connection_lazy(config: &RedisConfig) -> Result<ConnectionManager, MegaError> {
     let (client, redis_url) = redis_client(config)?;
     ConnectionManager::new_lazy_with_config(client, ::redis::aio::ConnectionManagerConfig::new())

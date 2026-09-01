@@ -57,28 +57,31 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         ))),
     };
 
-    if let Some(reload_watcher) = reload_watcher
-        && let Err(stop_error) = reload_watcher.stop().await
-    {
+    let mut result = result;
+    if let Some(reload_watcher) = reload_watcher {
+        if let Err(stop_error) = reload_watcher.stop().await {
+            if result.is_ok() {
+                result = Err(stop_error);
+            } else {
+                tracing::warn!(
+                    error = %stop_error,
+                    "config reload watcher failed to stop after service error"
+                );
+            }
+        }
+    }
+
+    if let Err(shutdown_error) = context.shutdown().await {
         if result.is_ok() {
-            return Err(stop_error);
+            result = Err(shutdown_error);
+        } else {
+            tracing::warn!(
+                error = %shutdown_error,
+                "failed to release background resources after service error"
+            );
         }
-
-        tracing::warn!(
-            error = %stop_error,
-            "config reload watcher failed to stop after service error"
-        );
     }
-
-    let shutdown_result = context.shutdown().await;
-    if result.is_err() {
-        if let Err(error) = shutdown_result {
-            tracing::warn!(error = %error, "failed to release background resources after service error");
-        }
-        result
-    } else {
-        shutdown_result
-    }
+    result
 }
 
 struct ConfigReloadWatcherTask {

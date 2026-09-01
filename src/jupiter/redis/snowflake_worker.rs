@@ -14,6 +14,7 @@ const SLOT_KEY_PREFIX: &str = "mega:snowflake:worker:";
 const SLOT_TTL_MS: u64 = 30_000;
 const SLOT_REFRESH_INTERVAL_MS: u64 = SLOT_TTL_MS / 2;
 const SLOT_REFRESH_TIMEOUT_MS: u64 = 5_000;
+const SLOT_RELEASE_TIMEOUT_MS: u64 = 5_000;
 const SLOT_SCAN_TIMEOUT_MS: u64 = 2_000;
 
 struct WorkerLeaseInner {
@@ -91,6 +92,9 @@ impl SnowflakeWorkerLease {
 
     /// Stop refresh, await its completion, and release this token-owned slot.
     pub async fn shutdown(&self) -> Result<(), crate::common::errors::MegaError> {
+        // Revoke before cancellation/release. A refresh that is already in
+        // flight must not reactivate the generator after shutdown begins.
+        id_generator::revoke_worker_lease(&self.inner.health);
         self.inner.cancel.cancel();
         let task = match self.inner.task.lock() {
             Ok(mut task) => task.take(),
@@ -105,11 +109,10 @@ impl SnowflakeWorkerLease {
         };
 
         let mut connection = self.inner.connection.clone();
-        let release_result = release_slot(&mut connection, &self.inner.key, &self.inner.token)
-            .await
-            .map(|_| ())
-            .map_err(crate::common::errors::MegaError::from);
-        self.inner.health.lost();
+        let release_result =
+            release_slot_bounded(&mut connection, &self.inner.key, &self.inner.token)
+                .await
+                .map(|_| ());
 
         if let Some(error) = task_error {
             return Err(error);
@@ -120,8 +123,8 @@ impl SnowflakeWorkerLease {
 
 impl Drop for WorkerLeaseInner {
     fn drop(&mut self) {
+        id_generator::revoke_worker_lease(&self.health);
         self.cancel.cancel();
-        self.health.lost();
     }
 }
 
@@ -167,7 +170,7 @@ async fn claim_worker_lease(
         let key = format!("{slot_key_prefix}{worker_id}");
         match claim_slot(&mut conn, &key, &token, SLOT_TTL_MS).await {
             Ok(true) => {
-                let health = WorkerLeaseHealth::new();
+                let health = WorkerLeaseHealth::claimed();
                 let lease =
                     SnowflakeWorkerLease::new(worker_id, key, token, connection.clone(), health);
                 tracing::info!(
@@ -228,9 +231,7 @@ async fn run_slot_refresh(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                if let Err(error) = release_slot(&mut conn, &key, &token).await {
-                    tracing::warn!(error = %error, slot_key = %key, "failed to release snowflake worker slot during shutdown");
-                }
+                stop_refresh(&mut conn, &key, &token, &health).await;
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
@@ -246,33 +247,57 @@ async fn run_slot_refresh(
         )
         .await
         {
-            Ok(Ok(true)) => health.refreshed(),
+            Ok(Ok(true)) => {
+                if !id_generator::refresh_worker_lease(&health) {
+                    tracing::warn!(
+                        slot_key = %key,
+                        "snowflake worker refresh completed after local lease revocation"
+                    );
+                    stop_refresh(&mut conn, &key, &token, &health).await;
+                    break;
+                }
+            }
             Ok(Ok(false)) => {
-                health.lost();
                 tracing::warn!(
                     slot_key = %key,
                     "snowflake worker slot refresh lost ownership"
                 );
+                stop_refresh(&mut conn, &key, &token, &health).await;
                 break;
             }
             Ok(Err(error)) => {
-                health.lost();
                 tracing::warn!(
                     error = %error,
                     slot_key = %key,
                     "snowflake worker slot refresh failed"
                 );
+                stop_refresh(&mut conn, &key, &token, &health).await;
                 break;
             }
             Err(_) => {
-                health.lost();
                 tracing::warn!(
                     timeout_ms = SLOT_REFRESH_TIMEOUT_MS,
                     slot_key = %key,
                     "snowflake worker slot refresh timed out"
                 );
+                stop_refresh(&mut conn, &key, &token, &health).await;
                 break;
             }
+        }
+    }
+}
+
+async fn stop_refresh(
+    connection: &mut ConnectionManager,
+    key: &str,
+    token: &str,
+    health: &std::sync::Arc<WorkerLeaseHealth>,
+) {
+    id_generator::revoke_worker_lease(health);
+    match release_slot_bounded(connection, key, token).await {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, slot_key = %key, "failed to release snowflake worker slot");
         }
     }
 }
@@ -317,6 +342,24 @@ async fn release_slot(
     );
     let released: i32 = script.key(key).arg(token).invoke_async(connection).await?;
     Ok(released == 1)
+}
+
+async fn release_slot_bounded(
+    connection: &mut ConnectionManager,
+    key: &str,
+    token: &str,
+) -> Result<bool, crate::common::errors::MegaError> {
+    timeout(
+        Duration::from_millis(SLOT_RELEASE_TIMEOUT_MS),
+        release_slot(connection, key, token),
+    )
+    .await
+    .map_err(|_| {
+        crate::common::errors::MegaError::Other(format!(
+            "snowflake worker slot release timed out after {SLOT_RELEASE_TIMEOUT_MS}ms"
+        ))
+    })?
+    .map_err(crate::common::errors::MegaError::from)
 }
 
 #[cfg(test)]
@@ -491,7 +534,7 @@ mod tests {
             .query_async(&mut connection)
             .await
             .expect("seed lease for refresh task");
-        let health = WorkerLeaseHealth::new();
+        let health = WorkerLeaseHealth::claimed();
         health.activate();
         let cancel = CancellationToken::new();
         let refresh_task = tokio::spawn(run_slot_refresh(
