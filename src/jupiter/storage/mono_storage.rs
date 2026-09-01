@@ -774,4 +774,105 @@ impl MonoStorage {
 }
 
 #[cfg(test)]
-mod test {}
+mod tests {
+    use std::sync::Arc;
+
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, TransactionTrait,
+    };
+
+    use super::MonoStorage;
+    use crate::{
+        callisto::mega_refs,
+        jupiter::{
+            migration::apply_migrations,
+            storage::base_storage::{BaseStorage, StorageConnector},
+            tests::test_db_connection,
+        },
+    };
+
+    #[tokio::test]
+    async fn remove_ref_if_unchanged_is_atomic_and_path_scoped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("apply migrations");
+        let storage = MonoStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        };
+        let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let ref_name = "refs/cl/path-cas";
+        for path in ["/repo-a", "/repo-b"] {
+            let reference = mega_refs::Model::new(
+                path,
+                ref_name.to_owned(),
+                expected.to_owned(),
+                String::new(),
+                true,
+            );
+            reference
+                .into_active_model()
+                .insert(storage.get_connection())
+                .await
+                .expect("insert path-scoped ref");
+        }
+
+        let txn = storage
+            .get_connection()
+            .begin()
+            .await
+            .expect("begin transaction");
+        assert!(
+            storage
+                .remove_ref_if_unchanged("/repo-a", ref_name, expected, &txn)
+                .await
+                .expect("delete unchanged ref")
+        );
+        assert!(
+            !storage
+                .remove_ref_if_unchanged(
+                    "/repo-a",
+                    ref_name,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &txn,
+                )
+                .await
+                .expect("check mismatched ref")
+        );
+        txn.rollback().await.expect("rollback transaction");
+
+        assert_eq!(
+            mega_refs::Entity::find()
+                .filter(mega_refs::Column::Path.eq("/repo-a"))
+                .all(storage.get_connection())
+                .await
+                .expect("reload repo-a refs")
+                .len(),
+            1
+        );
+        assert_eq!(
+            mega_refs::Entity::find()
+                .filter(mega_refs::Column::Path.eq("/repo-b"))
+                .all(storage.get_connection())
+                .await
+                .expect("reload repo-b refs")
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .remove_ref_if_unchanged("/repo-a", ref_name, expected, storage.get_connection(),)
+                .await
+                .expect("delete repo-a ref")
+        );
+        assert_eq!(
+            mega_refs::Entity::find()
+                .filter(mega_refs::Column::Path.eq("/repo-b"))
+                .all(storage.get_connection())
+                .await
+                .expect("verify repo-b ref")
+                .len(),
+            1,
+            "a path-scoped CAS delete must preserve same-named refs elsewhere"
+        );
+    }
+}

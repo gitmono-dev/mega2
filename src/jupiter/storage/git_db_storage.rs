@@ -573,7 +573,8 @@ impl GitDbStorage {
 mod tests {
     use std::sync::Arc;
 
-    use sea_orm::TransactionTrait;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait, sea_query::Expr};
+    use tokio::sync::Barrier;
 
     use super::GitDbStorage;
     use crate::{
@@ -651,7 +652,6 @@ mod tests {
         let repo_id = 29;
         let original = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let moved = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let other_repo = "cccccccccccccccccccccccccccccccccccccccc";
         storage
             .save_ref(repo_id, branch_ref(repo_id, "refs/heads/cas", original))
             .await
@@ -663,7 +663,7 @@ mod tests {
         storage
             .save_ref(
                 repo_id + 1,
-                branch_ref(repo_id + 1, "refs/heads/cas", other_repo),
+                branch_ref(repo_id + 1, "refs/heads/cas", original),
             )
             .await
             .expect("save other-repo ref");
@@ -721,11 +721,63 @@ mod tests {
                     storage.get_connection(),
                 )
                 .await
-                .expect("delete current ref")
+            .expect("delete current ref")
         );
         assert_eq!(
             storage.get_ref(repo_id).await.expect("reload refs").len(),
             1
         );
+
+        let race_repo_id = repo_id + 2;
+        storage
+            .save_ref(
+                race_repo_id,
+                branch_ref(race_repo_id, "refs/heads/race", original),
+            )
+            .await
+            .expect("save race ref");
+        let update_connection = storage.get_connection().clone();
+        let delete_connection = storage.get_connection().clone();
+        let delete_storage = storage.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let update_barrier = barrier.clone();
+        let delete_barrier = barrier.clone();
+        let update_original = original.to_owned();
+        let update_moved = moved.to_owned();
+        let update_task = async move {
+            update_barrier.wait().await;
+            import_refs::Entity::update_many()
+                .col_expr(import_refs::Column::RefGitId, Expr::value(update_moved))
+                .filter(import_refs::Column::RepoId.eq(race_repo_id))
+                .filter(import_refs::Column::RefName.eq("refs/heads/race"))
+                .filter(import_refs::Column::RefGitId.eq(update_original))
+                .exec(&update_connection)
+                .await
+                .expect("race update")
+                .rows_affected
+        };
+        let delete_task = async move {
+            delete_barrier.wait().await;
+            delete_storage
+                .remove_ref_if_unchanged(
+                    race_repo_id,
+                    "refs/heads/race",
+                    original,
+                    &delete_connection,
+                )
+                .await
+                .expect("race delete")
+        };
+        let (updated, deleted) = tokio::join!(update_task, delete_task);
+        assert!(
+            !(updated == 1 && deleted),
+            "a successful later update and stale delete must not both commit"
+        );
+        let race_refs = storage.get_ref(race_repo_id).await.expect("load race refs");
+        match (updated, deleted) {
+            (1, false) => assert_eq!(race_refs[0].ref_git_id, moved),
+            (0, true) => assert!(race_refs.is_empty()),
+            outcome => panic!("unexpected CAS race outcome: {outcome:?}"),
+        }
     }
 }

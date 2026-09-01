@@ -3564,11 +3564,45 @@ fn integration_git_cli_import_receive_pack_packless_statuses() {
     );
     assert_eq!(
         remote_ref(&env.case_dir, &token, &remote_url, &valid_branch),
-        Some(moved_commit),
+        Some(moved_commit.clone()),
         "a stale import branch delete must preserve the moved ref"
     );
 
     let tag_ref = format!("refs/tags/{annotated_tag}");
+    let mixed_rollback_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-mixed-stale-delete-rollback",
+        &receive_pack_path,
+        &[
+            receive_pack_command(&tag_object_id, ZERO_ID, &tag_ref, true),
+            receive_pack_command(&commit_id, ZERO_ID, &valid_branch, false),
+        ],
+    );
+    assert_receive_pack_status(
+        &mixed_rollback_reply,
+        &format!(
+            "ng {tag_ref} Other error: ref {valid_branch} moved since advertisement (expected {commit_id})"
+        ),
+    );
+    assert_receive_pack_status(
+        &mixed_rollback_reply,
+        &format!(
+            "ng {valid_branch} Other error: ref {valid_branch} moved since advertisement (expected {commit_id})"
+        ),
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &tag_ref),
+        Some(tag_object_id.clone()),
+        "a stale sibling delete must roll back the matching tag delete"
+    );
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &valid_branch),
+        Some(moved_commit.clone()),
+        "a stale sibling delete must preserve the moved branch"
+    );
+
     let stale_tag_reply = raw_receive_pack_at(
         &env,
         port,
@@ -3583,8 +3617,48 @@ fn integration_git_cli_import_receive_pack_packless_statuses() {
     );
     assert_eq!(
         remote_ref(&env.case_dir, &token, &remote_url, &tag_ref),
-        Some(tag_object_id),
+        Some(tag_object_id.clone()),
         "a stale import tag delete must preserve the moved tag"
+    );
+
+    let delete_tag_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-delete-current-tag",
+        &receive_pack_path,
+        &[receive_pack_command(
+            &tag_object_id,
+            ZERO_ID,
+            &tag_ref,
+            true,
+        )],
+    );
+    assert_receive_pack_status(&delete_tag_reply, &format!("ok {tag_ref}"));
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &tag_ref),
+        None,
+        "a matching import tag delete must remove the tag ref"
+    );
+
+    let delete_branch_reply = raw_receive_pack_at(
+        &env,
+        port,
+        &token,
+        "import-delete-current-branch",
+        &receive_pack_path,
+        &[receive_pack_command(
+            &moved_commit,
+            ZERO_ID,
+            &valid_branch,
+            true,
+        )],
+    );
+    assert_receive_pack_status(&delete_branch_reply, &format!("ok {valid_branch}"));
+    assert_eq!(
+        remote_ref(&env.case_dir, &token, &remote_url, &valid_branch),
+        None,
+        "a matching import branch delete must remove the branch ref"
     );
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));

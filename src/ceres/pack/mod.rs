@@ -65,6 +65,13 @@ pub trait RepoHandler: Send + Sync + 'static {
     /// so without this, metadata updated in `git_receive_pack_stream` would be stale at finalize.
     fn sync_commands_after_unpack(&self, _commands: &[RefCommand]) {}
 
+    /// Whether tag ref writes should be deferred until `finalize_receive_pack`.
+    /// This lets handlers with mixed tag/branch receive-pack requests commit
+    /// all ref metadata in one transaction.
+    fn defer_tag_ref_updates(&self) -> bool {
+        false
+    }
+
     /// ADR-MC-05 no-op push notice, surfaced to the git client as a sideband
     /// progress (`remote:`) line. Handlers set it during
     /// `finalize_receive_pack`; the protocol layer reads it after a successful
@@ -212,7 +219,8 @@ pub trait RepoHandler: Send + Sync + 'static {
     }
 
     /// After unpack succeeds: persist branch metadata, run repo-specific side effects, then the
-    /// protocol layer appends ref report lines. Tags are already persisted earlier.
+    /// protocol layer appends ref report lines. Tags are persisted earlier unless the handler
+    /// opts into `defer_tag_ref_updates`.
     ///
     /// - **Import**: one DB transaction for `import_refs` + monorepo attach (under unpack lock).
     /// - **Mono**: one DB transaction for all branch CL `mega_refs` updates; CL / conversations /

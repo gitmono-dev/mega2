@@ -81,6 +81,10 @@ impl RepoHandler for ImportRepo {
             .expect("command_list lock poisoned") = commands.to_vec();
     }
 
+    fn defer_tag_ref_updates(&self) -> bool {
+        true
+    }
+
     async fn refs_with_head_hash(&self) -> (String, Vec<Refs>) {
         let result = self
             .storage
@@ -488,6 +492,38 @@ impl ImportRepo {
         Ok(())
     }
 
+    async fn apply_tag_ref_in_txn(
+        &self,
+        git_db: &GitDbStorage,
+        cmd: &RefCommand,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        match cmd.command_type {
+            CommandType::Create => {
+                git_db
+                    .save_ref_in_txn(self.repo.repo_id, cmd.clone().into(), txn)
+                    .await
+            }
+            CommandType::Delete => {
+                if !git_db
+                    .remove_ref_if_unchanged(self.repo.repo_id, &cmd.ref_name, &cmd.old_id, txn)
+                    .await?
+                {
+                    return Err(MegaError::Other(format!(
+                        "tag {} moved since advertisement (expected {})",
+                        cmd.ref_name, cmd.old_id
+                    )));
+                }
+                Ok(())
+            }
+            CommandType::Update => {
+                git_db
+                    .update_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &cmd.new_id, txn)
+                    .await
+            }
+        }
+    }
+
     // attach import repo to monorepo parent tree
     pub(crate) async fn attach_to_monorepo_parent(&self) -> Result<(), MegaError> {
         // Snapshot commands without holding the mutex across await (Send + avoids deadlocks).
@@ -503,10 +539,11 @@ impl ImportRepo {
             let txn = self.storage.begin_db_transaction().await?;
             let git_db = self.storage.git_db_storage();
             for cmd in &commands_snapshot {
-                if cmd.ref_type != RefTypeEnum::Branch {
-                    continue;
-                }
-                if let CommandType::Delete = cmd.command_type {
+                let result = if cmd.ref_type == RefTypeEnum::Tag {
+                    self.apply_tag_ref_in_txn(&git_db, cmd, &txn).await
+                } else if cmd.ref_type == RefTypeEnum::Branch
+                    && cmd.command_type == CommandType::Delete
+                {
                     if !git_db
                         .remove_ref_if_unchanged(
                             self.repo.repo_id,
@@ -516,12 +553,19 @@ impl ImportRepo {
                         )
                         .await?
                     {
-                        let _ = txn.rollback().await;
-                        return Err(MegaError::Other(format!(
+                        Err(MegaError::Other(format!(
                             "ref {} moved since advertisement (expected {})",
                             cmd.ref_name, cmd.old_id
-                        )));
+                        )))
+                    } else {
+                        Ok(())
                     }
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    let _ = txn.rollback().await;
+                    return Err(error);
                 }
             }
             txn.commit().await.map_err(MegaError::Db)?;
@@ -604,37 +648,50 @@ impl ImportRepo {
             let txn = self.storage.begin_db_transaction().await?;
             let git_db = self.storage.git_db_storage();
             for cmd in &commands_snapshot {
-                if cmd.ref_type != RefTypeEnum::Branch {
-                    continue;
-                }
-                match cmd.command_type {
-                    CommandType::Create => {
-                        git_db
-                            .save_ref_in_txn(self.repo.repo_id, cmd.clone().into(), &txn)
-                            .await?;
-                    }
-                    CommandType::Delete => {
-                        if !git_db
-                            .remove_ref_if_unchanged(
-                                self.repo.repo_id,
-                                &cmd.ref_name,
-                                &cmd.old_id,
-                                &txn,
-                            )
-                            .await?
-                        {
-                            let _ = txn.rollback().await;
-                            return Err(MegaError::Other(format!(
-                                "ref {} moved since advertisement (expected {})",
-                                cmd.ref_name, cmd.old_id
-                            )));
+                let result = if cmd.ref_type == RefTypeEnum::Tag {
+                    self.apply_tag_ref_in_txn(&git_db, cmd, &txn).await
+                } else if cmd.ref_type == RefTypeEnum::Branch {
+                    match cmd.command_type {
+                        CommandType::Create => {
+                            git_db
+                                .save_ref_in_txn(self.repo.repo_id, cmd.clone().into(), &txn)
+                                .await
+                        }
+                        CommandType::Delete => {
+                            if !git_db
+                                .remove_ref_if_unchanged(
+                                    self.repo.repo_id,
+                                    &cmd.ref_name,
+                                    &cmd.old_id,
+                                    &txn,
+                                )
+                                .await?
+                            {
+                                Err(MegaError::Other(format!(
+                                    "ref {} moved since advertisement (expected {})",
+                                    cmd.ref_name, cmd.old_id
+                                )))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        CommandType::Update => {
+                            git_db
+                                .update_ref_in_txn(
+                                    self.repo.repo_id,
+                                    &cmd.ref_name,
+                                    &cmd.new_id,
+                                    &txn,
+                                )
+                                .await
                         }
                     }
-                    CommandType::Update => {
-                        git_db
-                            .update_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &cmd.new_id, &txn)
-                            .await?;
-                    }
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    let _ = txn.rollback().await;
+                    return Err(error);
                 }
             }
 

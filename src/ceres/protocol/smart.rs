@@ -523,15 +523,23 @@ impl SmartSession {
 
         let mut unpack_failed = false;
 
-        // 2. Tags: persist immediately. Branches: only unpack / default-branch flags here;
-        //    mono and import both persist branch refs inside `finalize_receive_pack`.
+        // 2. Tags normally persist immediately. ImportRepo defers tags when a branch is part of
+        //    the same request, so its tag and branch metadata share the finalizer transaction.
+        let defer_tag_updates = repo_handler.defer_tag_ref_updates()
+            && commands
+                .iter()
+                .any(|command| command.ref_type == RefTypeEnum::Branch && command.status == "ok");
+        let unpack_error = unpack_result.as_ref().err().map(ToString::to_string);
         for command in commands.iter_mut() {
             if command.status != "ok" {
                 continue;
             }
             if command.ref_type == RefTypeEnum::Tag {
-                // just update if refs type is tag
-                if let Err(e) = repo_handler.update_refs(command).await {
+                if defer_tag_updates {
+                    if let Some(error) = unpack_error.as_ref() {
+                        command.failed(error.clone());
+                    }
+                } else if let Err(e) = repo_handler.update_refs(command).await {
                     command.failed(e.to_string());
                 }
             } else {
@@ -573,7 +581,11 @@ impl SmartSession {
         let has_branch_work = commands
             .iter()
             .any(|command| command.ref_type == RefTypeEnum::Branch && command.status == "ok");
-        if !unpack_failed && has_branch_work {
+        let has_deferred_tag_work = defer_tag_updates
+            && commands
+                .iter()
+                .any(|command| command.ref_type == RefTypeEnum::Tag && command.status == "ok");
+        if !unpack_failed && (has_branch_work || has_deferred_tag_work) {
             let t_finalize = Instant::now();
             if let Err(e) = repo_handler.finalize_receive_pack().await {
                 // UN-16: a per-ref rejection (e.g. main-branch delete) must reach
@@ -583,7 +595,8 @@ impl SmartSession {
                 // (the refs were not written).
                 let msg = e.to_string();
                 for c in commands.iter_mut() {
-                    if c.ref_type == RefTypeEnum::Branch && c.status == "ok" {
+                    let is_deferred_tag = defer_tag_updates && c.ref_type == RefTypeEnum::Tag;
+                    if (c.ref_type == RefTypeEnum::Branch || is_deferred_tag) && c.status == "ok" {
                         c.failed(msg.clone());
                     }
                 }
