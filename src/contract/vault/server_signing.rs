@@ -837,6 +837,9 @@ mod tests {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
+        // gpg localizes its verdict lines ("Good signature" → 完好的签名, …);
+        // pin the locale so assertions are locale-independent.
+        cmd.env("LC_ALL", "C").env("LANG", "C");
         if let Some(home) = gnupg_home {
             cmd.env("GNUPGHOME", home);
         }
