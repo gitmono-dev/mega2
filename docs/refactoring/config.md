@@ -12,6 +12,27 @@ Configuration source diagnostics are available with `--show-sources`; use
 Secrets are supplied by deployment configuration or supported Vault
 `SecretRef`s and must never be committed.
 
+## MonoRepo initial object-ID format
+
+`[monorepo].object_format` selects the object-ID algorithm used while an empty
+MonoRepo creates its initial commit, trees, and blobs. Its canonical values are
+`sha1` (the default) and `sha256`; the parser also accepts `sha-1` and
+`sha-256` for configuration compatibility. The setting is restart-required and
+does not convert an existing repository.
+
+`blake3` is intentionally recognized but rejected by `config validate` and by
+the initializer until monoengine consumes the explicit BLAKE3 APIs planned for
+`git-internal` 0.9.0. `black3` is not a valid spelling or value.
+
+This is an initialization-only contract. Ceres still has SHA-1-only protocol
+and pack paths, so `sha256` must not be presented as an end-to-end Git
+clone/fetch/push format until the repository context, protocol, and pack work
+are completed. Use it only for a controlled bootstrap invocation; do not start
+a normal Git service with this setting. Run
+`monoengine --config <path> service init --yes` to create the initial graph;
+the command requires an existing config and exits without starting Git listeners
+or normal service runtime dependencies.
+
 ## Cedar authorization enforcement
 
 The `[cedar]` section controls the authorization enforcement switch (ADR-UN-01):

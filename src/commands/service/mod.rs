@@ -14,13 +14,14 @@ use crate::{
 };
 
 pub mod http;
+pub mod init;
 pub mod multi;
 pub mod ssh;
 
 const CONFIG_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn cli() -> Command {
-    let subcommands = vec![http::cli(), ssh::cli(), multi::cli()];
+    let subcommands = vec![init::cli(), http::cli(), ssh::cli(), multi::cli()];
     Command::new("service")
         .about("Start different kinds of server: for example https or ssh")
         .subcommands(subcommands)
@@ -36,6 +37,16 @@ pub(crate) async fn exec(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
         Some((cmd, args)) => (cmd, args),
         _ => return Ok(()),
     };
+
+    if cmd == "init" {
+        return init::exec(config, subcommand_args).await;
+    }
+
+    if !matches!(cmd, "http" | "ssh" | "multi") {
+        return Err(MegaError::Other(format!(
+            "Unknown service subcommand: {cmd}"
+        )));
+    }
 
     let context = AppContext::new(config).await?;
     context
@@ -160,7 +171,7 @@ mod tests {
             .map(|cmd| cmd.get_name().to_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["http", "ssh", "multi"]);
+        assert_eq!(names, vec!["init", "http", "ssh", "multi"]);
     }
 
     #[test]

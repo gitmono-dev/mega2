@@ -518,6 +518,7 @@ pub(crate) fn validate_database_config(db_config: &DbConfig) -> Result<(), MegaE
 }
 
 pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), MegaError> {
+    mono_config.object_hash_kind()?;
     require_non_empty_path("monorepo.import_dir", &mono_config.import_dir)?;
     if mono_config.root_dirs.is_empty() {
         return Err(MegaError::Other(
@@ -1457,7 +1458,13 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "connect_timeout",
             "sqlx_logging",
         ]),
-        "monorepo" => Some(&["import_dir", "admin", "root_dirs", "rename"]),
+        "monorepo" => Some(&[
+            "import_dir",
+            "admin",
+            "root_dirs",
+            "object_format",
+            "rename",
+        ]),
         "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
         "build" => Some(&[
             "enable_build",
@@ -2180,6 +2187,19 @@ mod tests {
             err.to_string()
                 .contains("monorepo.rename.similarity_threshold")
         );
+    }
+
+    #[test]
+    fn config_validate_rejects_reserved_blake3_monorepo_object_format() {
+        let mut config = valid_config();
+        config.monorepo.object_format = crate::config::MonoObjectFormat::Blake3;
+
+        let err = config
+            .validate()
+            .expect_err("BLAKE3 object IDs are not available in git-internal 0.8.x");
+        let message = err.to_string();
+        assert!(message.contains("monorepo.object_format"));
+        assert!(message.contains("reserved"));
     }
 
     #[test]

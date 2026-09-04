@@ -81,12 +81,13 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
                 config_summary: Some(config_summary),
             }
         }
-        LoadMode::ParsedConfig | LoadMode::FullAppContext => {
-            // Audit modes keep `LoadMode::ParsedConfig` (UN-29 AC) but must not
-            // invent a default config.toml — that is exactly the write UN-34
-            // forbids on a readonly command. FullAppContext stays on `load()`.
+        LoadMode::ParsedConfig | LoadMode::ParsedExistingConfig | LoadMode::FullAppContext => {
+            // Audit modes and the one-shot initializer must not invent a
+            // default config.toml. FullAppContext stays on `load()`.
             let (config, loaded) = if cmd == "authz-audit" {
                 load_config_readonly(&matches)?
+            } else if matches!(mode, LoadMode::ParsedExistingConfig) {
+                load_config_existing(&matches)?
             } else {
                 load_config(&matches)?
             };
@@ -172,6 +173,17 @@ fn load_config(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError
 
 fn load_config_readonly(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
     parse_loaded_config(load_config_path_readonly(matches)?)
+}
+
+fn load_config_existing(matches: &ArgMatches) -> Result<(Config, LoadedConfig), MegaError> {
+    let cli_path = matches.get_one::<PathBuf>("config").cloned();
+    let input = ConfigInput {
+        cli_path,
+        env_path: std::env::var_os("MEGA_CONFIG").map(PathBuf::from),
+        cli_profile: matches.get_one::<String>("profile").cloned(),
+        env_profile: std::env::var("MEGA_PROFILE").ok(),
+    };
+    parse_loaded_config(ConfigLoader::new(input).load_existing()?)
 }
 
 fn install_ctrlc_handler() {

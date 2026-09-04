@@ -703,6 +703,11 @@ fn collect_monorepo_restart_fields(
     if current.monorepo.root_dirs != candidate.monorepo.root_dirs {
         report.restart_required_fields.push("monorepo.root_dirs");
     }
+    if current.monorepo.object_format != candidate.monorepo.object_format {
+        report
+            .restart_required_fields
+            .push("monorepo.object_format");
+    }
     if current.monorepo.rename.similarity_threshold
         != candidate.monorepo.rename.similarity_threshold
     {
@@ -1036,6 +1041,7 @@ mod tests {
 
         let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
         candidate.monorepo.root_dirs = vec!["changed-root".to_string()];
+        candidate.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
         candidate.pack.channel_message_size = 2_000_000;
         candidate.lfs.local.lfs_file_path = temp_dir.path().join("candidate-lfs");
         candidate.blame.enable_caching = false;
@@ -1059,6 +1065,7 @@ mod tests {
             report.restart_required_fields,
             vec![
                 "monorepo.root_dirs",
+                "monorepo.object_format",
                 "pack.channel_message_size",
                 "lfs.local.lfs_file_path",
                 "blame.enable_caching",
@@ -1074,6 +1081,10 @@ mod tests {
         assert!(report.requires_restart());
         assert_eq!(snapshot.object_storage.local.root_dir, current_object_root);
         assert_eq!(snapshot.lfs.local.lfs_file_path, current_lfs_path);
+        assert_eq!(
+            snapshot.monorepo.object_format,
+            crate::config::MonoObjectFormat::Sha1
+        );
         assert!(snapshot.orion_server.is_none());
         assert_ne!(snapshot.sidebar.default_items[0].label, "Changed");
         assert!(!report_debug.contains("candidate-secret-access-key"));

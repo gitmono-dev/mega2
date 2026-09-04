@@ -89,11 +89,28 @@ impl ConfigLoader {
     /// A profile that does not exist is still rejected by `loaded_config`, as
     /// on the normal path.
     pub fn load_readonly(&self) -> Result<LoadedConfig> {
-        self.load_readonly_with_ambient(Self::cwd_config_path()?, Self::global_config_path()?)
+        self.load_existing_with_ambient(
+            Self::cwd_config_path()?,
+            Self::global_config_path()?,
+            "a read-only command",
+        )
     }
 
-    /// The body of [`Self::load_readonly`], with the two ambient lookups passed
-    /// in.
+    /// Resolve an existing config without generating a default one.
+    ///
+    /// This uses the same source resolution as [`Self::load_readonly`], but is
+    /// for commands that will write their intended resource and must never
+    /// write a surprise default config first.
+    pub fn load_existing(&self) -> Result<LoadedConfig> {
+        self.load_existing_with_ambient(
+            Self::cwd_config_path()?,
+            Self::global_config_path()?,
+            "a command that requires an existing config",
+        )
+    }
+
+    /// The body of [`Self::load_readonly`] and [`Self::load_existing`], with
+    /// the two ambient lookups passed in.
     ///
     /// The ambient sources read the process's current directory and
     /// `MEGA_BASE_DIR`. Neither is something a test may assume or safely change
@@ -102,23 +119,34 @@ impl ConfigLoader {
     /// run. Taking them as arguments is what lets the "nothing resolves at all"
     /// branch be exercised for what it is.
     ///
-    /// Private on purpose: the only production entry point is
-    /// [`Self::load_readonly`], which supplies the real lookups. A caller that
-    /// could pass its own ambient paths could pass one that does not exist and
-    /// slip past the existence check the named sources get.
-    fn load_readonly_with_ambient(
+    /// Private on purpose: the production entry points supply the real
+    /// lookups. A caller that could pass its own ambient paths could pass one
+    /// that does not exist and slip past the existence check the named sources
+    /// get.
+    fn load_existing_with_ambient(
         &self,
         cwd_path: Option<PathBuf>,
         global_path: Option<PathBuf>,
+        command_description: &str,
     ) -> Result<LoadedConfig> {
         let profile_name = self.profile_name()?;
 
         if let Some(path) = &self.input.cli_path {
-            return self.readonly_loaded_config(path.clone(), ConfigSource::Cli, profile_name);
+            return self.existing_loaded_config(
+                path.clone(),
+                ConfigSource::Cli,
+                profile_name,
+                command_description,
+            );
         }
 
         if let Some(path) = &self.input.env_path {
-            return self.readonly_loaded_config(path.clone(), ConfigSource::Env, profile_name);
+            return self.existing_loaded_config(
+                path.clone(),
+                ConfigSource::Env,
+                profile_name,
+                command_description,
+            );
         }
 
         if let Some(path) = cwd_path {
@@ -130,7 +158,7 @@ impl ConfigLoader {
         }
 
         anyhow::bail!(
-            "no config file was found, and a read-only command will not generate a default one; \
+            "no config file was found, and {command_description} will not generate a default one; \
              pass --config <path> or set MEGA_CONFIG"
         )
     }
@@ -139,15 +167,16 @@ impl ConfigLoader {
     /// found; `cli` and `env` are chosen because they were *named*, and nothing
     /// on the normal path checks that the named file is there. Saying so at the
     /// point of resolution beats a parse error two layers down.
-    fn readonly_loaded_config(
+    fn existing_loaded_config(
         &self,
         path: PathBuf,
         source: ConfigSource,
         profile_name: Option<String>,
+        command_description: &str,
     ) -> Result<LoadedConfig> {
         if !path.exists() {
             anyhow::bail!(
-                "config file `{}` (from {}) does not exist; a read-only command will not \
+                "config file `{}` (from {}) does not exist; {command_description} will not \
                  generate a default one",
                 path.display(),
                 source.as_str()
@@ -165,7 +194,7 @@ impl ConfigLoader {
         cwd_path: Option<PathBuf>,
         global_path: Option<PathBuf>,
     ) -> Result<LoadedConfig> {
-        self.load_readonly_with_ambient(cwd_path, global_path)
+        self.load_existing_with_ambient(cwd_path, global_path, "a read-only command")
     }
 
     /// Load config path, create default config if not exists
@@ -386,5 +415,21 @@ mod tests {
         .expect_err("invalid profile should fail");
 
         assert!(err.to_string().contains("profile name"));
+    }
+
+    #[test]
+    fn load_existing_rejects_missing_config_without_generation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let missing_path = temp_dir.path().join("missing.toml");
+
+        let err = ConfigLoader::new(ConfigInput {
+            cli_path: Some(missing_path.clone()),
+            ..Default::default()
+        })
+        .load_existing()
+        .expect_err("an existing config is required");
+
+        assert!(err.to_string().contains("requires an existing config"));
+        assert!(!missing_path.exists());
     }
 }

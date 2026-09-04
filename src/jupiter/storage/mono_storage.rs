@@ -137,6 +137,19 @@ impl MonoStorage {
         Ok(result)
     }
 
+    pub async fn get_main_ref_in_txn(
+        &self,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_refs::Model>, MegaError> {
+        let result = mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.eq(path))
+            .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME.to_owned()))
+            .one(txn)
+            .await?;
+        Ok(result)
+    }
+
     pub async fn get_ref_by_commit(
         &self,
         path: &str,

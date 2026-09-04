@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap, str::FromStr};
 
 use git_internal::{
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
     internal::{
         metadata::EntryMeta,
         object::{
@@ -22,7 +22,10 @@ use crate::{
         git_blob, git_commit, git_tag, git_tree, mega_blob, mega_commit, mega_refs, mega_tag,
         mega_tree,
     },
-    common::utils::{MEGA_BRANCH_NAME, generate_id},
+    common::{
+        errors::MegaError,
+        utils::{MEGA_BRANCH_NAME, generate_id},
+    },
     config::MonoConfig,
 };
 
@@ -653,6 +656,31 @@ pub struct MegaModelConverter {
     pub refs: mega_refs::ActiveModel,
 }
 
+struct InitializationHashKindGuard {
+    previous: HashKind,
+}
+
+impl InitializationHashKindGuard {
+    fn set(hash_kind: HashKind) -> Self {
+        let previous = get_hash_kind();
+        set_hash_kind(hash_kind);
+        Self { previous }
+    }
+}
+
+impl Drop for InitializationHashKindGuard {
+    fn drop(&mut self) {
+        set_hash_kind(self.previous);
+    }
+}
+
+fn with_initialization_hash_kind<T>(hash_kind: HashKind, build: impl FnOnce() -> T) -> T {
+    // git-internal 0.8.x selects object IDs through thread-local state. This
+    // synchronous scope always ends before MonoService reaches object-storage awaits.
+    let _guard = InitializationHashKindGuard::set(hash_kind);
+    build()
+}
+
 impl MegaModelConverter {
     fn traverse_from_root(&self) {
         let root_tree = &self.root_tree;
@@ -689,33 +717,37 @@ impl MegaModelConverter {
         }
     }
 
-    pub fn init(mono_config: &MonoConfig) -> Self {
-        let (tree_maps, blob_maps, root_tree) = init_trees(mono_config);
-        let commit = Commit::from_tree_id(root_tree.id, vec![], "\nInit Mega Directory");
+    pub fn init(mono_config: &MonoConfig) -> Result<Self, MegaError> {
+        let hash_kind = mono_config.object_hash_kind()?;
 
-        let mega_ref = mega_refs::Model {
-            id: generate_id(),
-            path: "/".to_owned(),
-            ref_name: MEGA_BRANCH_NAME.to_owned(),
-            ref_commit_hash: commit.id.to_string(),
-            ref_tree_hash: commit.tree_id.to_string(),
-            created_at: chrono::Utc::now().naive_utc(),
-            updated_at: chrono::Utc::now().naive_utc(),
-            is_cl: false,
-        };
+        Ok(with_initialization_hash_kind(hash_kind, || {
+            let (tree_maps, blob_maps, root_tree) = init_trees(mono_config);
+            let commit = Commit::from_tree_id(root_tree.id, vec![], "\nInit Mega Directory");
 
-        let converter = MegaModelConverter {
-            commit,
-            root_tree,
-            tree_maps,
-            blob_maps,
-            mega_trees: RefCell::new(HashMap::new()),
-            mega_blobs: RefCell::new(HashMap::new()),
-            raw_blobs: RefCell::new(Vec::new()),
-            refs: mega_ref.into(),
-        };
-        converter.traverse_from_root();
-        converter
+            let mega_ref = mega_refs::Model {
+                id: generate_id(),
+                path: "/".to_owned(),
+                ref_name: MEGA_BRANCH_NAME.to_owned(),
+                ref_commit_hash: commit.id.to_string(),
+                ref_tree_hash: commit.tree_id.to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+                is_cl: false,
+            };
+
+            let converter = MegaModelConverter {
+                commit,
+                root_tree,
+                tree_maps,
+                blob_maps,
+                mega_trees: RefCell::new(HashMap::new()),
+                mega_blobs: RefCell::new(HashMap::new()),
+                raw_blobs: RefCell::new(Vec::new()),
+                refs: mega_ref.into(),
+            };
+            converter.traverse_from_root();
+            converter
+        }))
     }
 }
 
@@ -931,9 +963,15 @@ mod test {
 
     use std::str::FromStr;
 
-    use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
+    use git_internal::{
+        hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind_for_test},
+        internal::object::{blob::Blob, commit::Commit},
+    };
 
-    use crate::{config::MonoConfig, jupiter::utils::converter::MegaModelConverter};
+    use crate::{
+        config::{MonoConfig, MonoObjectFormat},
+        jupiter::utils::converter::MegaModelConverter,
+    };
 
     #[test]
     pub fn test_init_mega_dir() {
@@ -941,7 +979,7 @@ mod test {
         if !mono_config.root_dirs.iter().any(|d| d == "toolchains") {
             mono_config.root_dirs.push("toolchains".to_string());
         }
-        let converter = MegaModelConverter::init(&mono_config);
+        let converter = MegaModelConverter::init(&mono_config).expect("initialize MonoRepo graph");
         let mega_trees = converter.mega_trees.borrow().clone();
         let mega_blobs = converter.mega_blobs.borrow().clone();
         let dir_nums = mono_config.root_dirs.len();
@@ -949,6 +987,97 @@ mod test {
         assert_eq!(mega_trees.len(), dir_nums + 2);
         // Blobs: dir_nums (.gitkeep) + 1 (.mega_cedar.json) + 2 (.buckroot + .buckconfig) + 1 (toolchains/BUCK) + 1 (policies.cedar)
         assert_eq!(mega_blobs.len(), dir_nums + 5);
+    }
+
+    #[test]
+    fn init_uses_configured_object_format_and_restores_hash_kind() {
+        for (initial_kind, object_format, expected_kind, expected_hex_len) in [
+            (HashKind::Sha1, MonoObjectFormat::Sha1, HashKind::Sha1, 40),
+            (HashKind::Sha256, MonoObjectFormat::Sha1, HashKind::Sha1, 40),
+            (
+                HashKind::Sha1,
+                MonoObjectFormat::Sha256,
+                HashKind::Sha256,
+                64,
+            ),
+            (
+                HashKind::Sha256,
+                MonoObjectFormat::Sha256,
+                HashKind::Sha256,
+                64,
+            ),
+        ] {
+            let _hash_kind_guard = set_hash_kind_for_test(initial_kind);
+            let mono_config = MonoConfig {
+                object_format,
+                ..Default::default()
+            };
+
+            let converter =
+                MegaModelConverter::init(&mono_config).expect("initialize configured object graph");
+
+            assert_eq!(converter.commit.id.kind(), expected_kind);
+            assert_eq!(converter.root_tree.id.kind(), expected_kind);
+            assert_eq!(converter.commit.id.to_string().len(), expected_hex_len);
+            assert!(
+                converter
+                    .tree_maps
+                    .values()
+                    .chain(std::iter::once(&converter.root_tree))
+                    .all(|tree| {
+                        tree.id.kind() == expected_kind
+                            && tree
+                                .tree_items
+                                .iter()
+                                .all(|item| item.id.kind() == expected_kind)
+                    })
+            );
+            assert!(
+                converter
+                    .blob_maps
+                    .values()
+                    .all(|blob| blob.id.kind() == expected_kind)
+            );
+            assert!(
+                converter
+                    .mega_trees
+                    .borrow()
+                    .keys()
+                    .all(|id| id.kind() == expected_kind)
+            );
+            assert!(
+                converter
+                    .mega_blobs
+                    .borrow()
+                    .keys()
+                    .all(|id| id.kind() == expected_kind)
+            );
+            assert!(
+                converter
+                    .raw_blobs
+                    .borrow()
+                    .iter()
+                    .all(|blob| blob.id.kind() == expected_kind)
+            );
+            assert_eq!(get_hash_kind(), initial_kind);
+            assert_eq!(
+                Blob::from_content("after bootstrap").id.kind(),
+                initial_kind
+            );
+        }
+    }
+
+    #[test]
+    fn init_rejects_reserved_blake3_object_format() {
+        let mono_config = MonoConfig {
+            object_format: MonoObjectFormat::Blake3,
+            ..Default::default()
+        };
+
+        let err = MegaModelConverter::init(&mono_config)
+            .err()
+            .expect("BLAKE3 must fail before building the initial graph");
+        assert!(err.to_string().contains("monorepo.object_format"));
     }
 
     #[test]

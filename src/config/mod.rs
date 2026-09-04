@@ -429,6 +429,16 @@ mod test {
     }
 
     #[test]
+    fn test_load_str_allows_monorepo_object_format_environment_override() {
+        let lock = env_lock();
+        let _object_format = EnvVarGuard::set(&lock, "MEGA_MONOREPO__OBJECT_FORMAT", "sha256");
+        let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
+
+        let config = Config::load_str(&rendered).expect("object format override should parse");
+        assert_eq!(config.monorepo.object_format, MonoObjectFormat::Sha256);
+    }
+
+    #[test]
     fn test_bad_environment_type_reports_variable_name_without_value() {
         let lock = env_lock();
         let _print_std = EnvVarGuard::set(&lock, "MEGA_LOG__PRINT_STD", "not_bool_secret");

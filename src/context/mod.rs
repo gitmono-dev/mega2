@@ -14,7 +14,15 @@ use crate::{
         policy::entitystore::SharedEntityStore,
         vault::integration::vault_core::{VaultCore, with_audit_caller},
     },
-    jupiter::redis::{ConnectionManager, init_connection},
+    jupiter::{
+        redis::{ConnectionManager, init_connection},
+        service::{git_service::GitService, mono_service::MonoService},
+        storage::{
+            base_storage::{BaseStorage, StorageConnector},
+            mono_storage::MonoStorage,
+            vault_storage::VaultStorage,
+        },
+    },
 };
 
 /// This is the main application context for the Mono application.
@@ -46,6 +54,51 @@ pub struct AppContext {
     pub entity_store: Arc<SharedEntityStore>,
 }
 
+/// Initializes a MonoRepo without bringing up normal service dependencies.
+///
+/// Vault is opened read-only only when object-storage credentials are SecretRefs;
+/// Redis, notification workers, sidebars, and Git listeners are deliberately
+/// outside this one-shot path.
+pub(crate) async fn bootstrap_monorepo(config: crate::config::Config) -> Result<(), MegaError> {
+    config.validate()?;
+    config.monorepo.object_hash_kind()?;
+    let config = Arc::new(config);
+    let db_connection =
+        Arc::new(crate::jupiter::storage::init::database_connection(&config.database).await?);
+
+    let object_storage_config = if object_storage_needs_vault(&config.object_storage) {
+        let vault_audit = config
+            .vault
+            .as_ref()
+            .map(|vault| vault.audit.clone())
+            .unwrap_or_default();
+        let vault = VaultCore::open_readonly(
+            VaultStorage {
+                base: BaseStorage::new(db_connection.clone()),
+            },
+            VaultCore::default_key_path(),
+        )
+        .await?
+        .with_audit_config(vault_audit);
+        resolve_object_storage_secrets(&config.object_storage, &vault).await?
+    } else {
+        config.object_storage.clone()
+    };
+    let object_store =
+        crate::jupiter::storage::object_storage::build_object_storage(&object_storage_config)
+            .await?;
+    let mono_service = MonoService {
+        mono_storage: MonoStorage {
+            base: BaseStorage::new(db_connection),
+        },
+        git_service: GitService {
+            obj_storage: object_store,
+        },
+    };
+
+    mono_service.bootstrap_monorepo(&config.monorepo).await
+}
+
 impl AppContext {
     /// Creates a new application context with the given configuration.
     ///
@@ -58,6 +111,13 @@ impl AppContext {
     /// is built here via the inlined orbit factory, so callers no longer
     /// pre-build and inject it.
     pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
+        config.monorepo.ensure_normal_service_object_format()?;
+        Self::new_with_monorepo_initialization(config).await
+    }
+
+    async fn new_with_monorepo_initialization(
+        config: crate::config::Config,
+    ) -> Result<Self, MegaError> {
         let config = Arc::new(config);
 
         // One DB connection, shared by the bootstrap vault and the full storage.
@@ -494,6 +554,41 @@ mod tests {
         ));
         assert!(!is_secret_ref_value("AKIAEXAMPLE"));
         assert!(!is_secret_ref_value(""));
+    }
+
+    #[tokio::test]
+    async fn normal_context_rejects_sha256_before_startup_side_effects() {
+        let mut config = crate::config::Config::mock();
+        config.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
+
+        match AppContext::new(config).await {
+            Err(error) => assert!(error.to_string().contains("bootstrap-only")),
+            Ok(_) => panic!("normal context must reject SHA-256 before startup"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_blake3_before_startup_side_effects() {
+        let mut config = crate::config::Config::mock();
+        config.monorepo.object_format = crate::config::MonoObjectFormat::Blake3;
+
+        match bootstrap_monorepo(config).await {
+            Err(error) => assert!(error.to_string().contains("monorepo.object_format")),
+            Ok(_) => panic!("BLAKE3 bootstrap must fail before startup"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_invalid_monorepo_before_database_connection() {
+        let mut config = crate::config::Config::mock();
+        config.database.db_url = "postgres://127.0.0.1:1/monoengine".to_string();
+        config.monorepo.root_dirs.clear();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), bootstrap_monorepo(config))
+            .await
+            .expect("invalid configuration must fail before opening the database");
+        let error = result.expect_err("empty root_dirs must fail validation");
+        assert!(error.to_string().contains("monorepo.root_dirs"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

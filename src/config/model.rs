@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use git_internal::hash::HashKind;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{ObjectStorageConfig, mega_base, mega_cache, secret};
+use crate::common::errors::MegaError;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -104,11 +106,44 @@ impl Default for DbConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MonoObjectFormat {
+    #[default]
+    #[serde(alias = "sha-1")]
+    Sha1,
+    #[serde(alias = "sha-256")]
+    Sha256,
+    Blake3,
+}
+
+impl MonoObjectFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+            Self::Blake3 => "blake3",
+        }
+    }
+
+    pub fn hash_kind(self) -> Result<HashKind, MegaError> {
+        match self {
+            Self::Sha1 => Ok(HashKind::Sha1),
+            Self::Sha256 => Ok(HashKind::Sha256),
+            Self::Blake3 => Err(MegaError::Other(
+                "monorepo.object_format=blake3 is reserved until git-internal 0.9.0 provides BLAKE3 object IDs".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MonoConfig {
     pub import_dir: PathBuf,
     pub admin: Vec<String>,
     pub root_dirs: Vec<String>,
+    #[serde(default)]
+    pub object_format: MonoObjectFormat,
     #[serde(default)]
     pub rename: RenameConfig,
 }
@@ -125,7 +160,24 @@ impl Default for MonoConfig {
                 "doc".to_string(),
                 "release".to_string(),
             ],
+            object_format: MonoObjectFormat::default(),
             rename: RenameConfig::default(),
+        }
+    }
+}
+
+impl MonoConfig {
+    pub fn object_hash_kind(&self) -> Result<HashKind, MegaError> {
+        self.object_format.hash_kind()
+    }
+
+    pub fn ensure_normal_service_object_format(&self) -> Result<(), MegaError> {
+        match self.object_format {
+            MonoObjectFormat::Sha1 => Ok(()),
+            MonoObjectFormat::Sha256 => Err(MegaError::Other(
+                "monorepo.object_format=sha256 is bootstrap-only; run `monoengine service init --yes` before enabling normal Git services".to_string(),
+            )),
+            MonoObjectFormat::Blake3 => self.object_hash_kind().map(|_| ()),
         }
     }
 }
@@ -1002,7 +1054,7 @@ fn default_cedar_enforcement() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, SidebarConfig, SidebarItem};
+    use super::{Config, MonoConfig, MonoObjectFormat, SidebarConfig, SidebarItem};
 
     fn sidebar_items(items: &[SidebarItem]) -> Vec<(&str, &str, &str, bool, i32)> {
         items
@@ -1042,5 +1094,48 @@ mod tests {
             expected
         );
         assert_eq!(sidebar_items(&sample.sidebar.default_items), expected);
+    }
+
+    #[test]
+    fn monorepo_object_format_defaults_and_accepts_sha_aliases() {
+        let default_config: MonoConfig = toml::from_str(
+            r#"
+import_dir = "/third-party"
+admin = ["admin"]
+root_dirs = ["project"]
+"#,
+        )
+        .expect("default object format should deserialize");
+        assert_eq!(default_config.object_format, MonoObjectFormat::Sha1);
+
+        for (value, expected) in [
+            ("sha1", MonoObjectFormat::Sha1),
+            ("sha-1", MonoObjectFormat::Sha1),
+            ("sha256", MonoObjectFormat::Sha256),
+            ("sha-256", MonoObjectFormat::Sha256),
+            ("blake3", MonoObjectFormat::Blake3),
+        ] {
+            let config: MonoConfig = toml::from_str(&format!(
+                r#"
+import_dir = "/third-party"
+admin = ["admin"]
+root_dirs = ["project"]
+object_format = "{value}"
+"#
+            ))
+            .unwrap_or_else(|error| panic!("{value:?} should deserialize: {error}"));
+            assert_eq!(config.object_format, expected);
+        }
+
+        let err = toml::from_str::<MonoConfig>(
+            r#"
+import_dir = "/third-party"
+admin = ["admin"]
+root_dirs = ["project"]
+object_format = "black3"
+"#,
+        )
+        .expect_err("the misspelled BLAKE3 value must not deserialize");
+        assert!(err.to_string().contains("black3"));
     }
 }

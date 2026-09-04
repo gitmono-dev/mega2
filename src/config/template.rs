@@ -41,6 +41,11 @@ sqlx_logging = false
 import_dir = "/third-party"
 admin = ["admin"]
 root_dirs = ["third-party", "project", "doc", "release", "toolchains"]
+# Object-ID format for the initial MonoRepo graph. Values: sha1 (default), sha256.
+# blake3 is reserved until git-internal 0.9.0; SHA-256 is bootstrap-only until
+# the Git protocol and pack paths carry an explicit repository hash context.
+# Do not use SHA-256 for a normal Git service; run `service init --yes` only.
+object_format = "sha1"
 
 [monorepo.rename]
 similarity_threshold = 50

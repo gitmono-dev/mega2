@@ -24,6 +24,7 @@ pub(crate) enum LoadMode {
     ConfigPath,
     RawSources,
     ParsedConfig,
+    ParsedExistingConfig,
     VaultBootstrap,
     FullAppContext,
 }
@@ -111,7 +112,11 @@ pub(crate) fn builtin_exec(cmd: &str) -> Option<CommandExec> {
 
 pub(crate) fn load_mode(cmd: &str, args: &ArgMatches) -> Option<LoadMode> {
     match cmd {
-        "service" | "debug" => Some(LoadMode::FullAppContext),
+        "service" => match args.subcommand_name() {
+            Some("init") => Some(LoadMode::ParsedExistingConfig),
+            _ => Some(LoadMode::FullAppContext),
+        },
+        "debug" => Some(LoadMode::FullAppContext),
         "config" => Some(config::load_mode(args)),
         "authz-audit" => Some(authz_audit::load_mode(args)),
         _ => None,
@@ -145,5 +150,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["service", "config", "debug", "authz-audit"]);
+    }
+
+    #[test]
+    fn service_init_requires_an_existing_config() {
+        let args = service::cli()
+            .try_get_matches_from(["service", "init", "--yes"])
+            .expect("service init arguments");
+
+        assert_eq!(
+            load_mode("service", &args),
+            Some(LoadMode::ParsedExistingConfig)
+        );
     }
 }
