@@ -704,6 +704,12 @@ fn git_cli_host_no_auth(case_dir: &Path, git_args: &[&str]) -> Output {
         .env("GIT_CONFIG_GLOBAL", &null_config)
         .env("GIT_CONFIG_SYSTEM", &null_config)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Match `git_cli_container_no_auth`: an askpass that exits 0 with no
+        // output makes host git fail with `Authentication failed` — the same
+        // message the container runner produces — instead of the
+        // `could not read Username … terminal prompts disabled` variant that
+        // the no-auth IT assertions cannot match on.
+        .env("GIT_ASKPASS", "true")
         .env("GIT_CONFIG_COUNT", "2")
         .env("GIT_CONFIG_KEY_0", "credential.helper")
         .env("GIT_CONFIG_VALUE_0", "")
