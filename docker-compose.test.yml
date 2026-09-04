@@ -29,7 +29,7 @@ services:
       timeout: 5s
       retries: 20
 
-  # Optional SMTP capture for the monoui front end's authentication/product-mail
+  # Optional SMTP capture for the website front end's authentication/product-mail
   # IT only.
   # Monoengine does not connect to or depend on this service.
   mailpit:
@@ -217,10 +217,10 @@ services:
       MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@postgres:5432/monoengine
       MEGA_REDIS__URL: redis://redis:6379
       # Keep the full documented IT CORS allowlist when overriding the sample
-      # config, and add the monoui host origin for stack session tests.
+      # config, and add the website-next host origin for stack session tests.
       MEGA_OAUTH__ALLOWED_CORS_ORIGINS: http://local.gitmega.com,https://app.gitmega.com,http://app.gitmono.test,http://127.0.0.1:17001
       MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
-      # MN-05: shared IT-only credential for monoui's internal product-email API.
+      # MN-05: shared IT-only credential for website's internal product-email API.
       MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL: http://website-next:7001
       MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
       MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
@@ -238,31 +238,32 @@ services:
       retries: 40
       start_period: 20s
 
-  # One-shot PostgreSQL schema initialization for the monoui front end. Reuses
-  # the monoui Dockerfile builder stage because the production runner is a
-  # standalone Next image and deliberately has no Drizzle tooling.
-  # Account data lives in an isolated `website` database on the shared
-  # postgres service — never the monoengine business DB (ADR-WA-07).
+  # One-shot PostgreSQL schema initialization for the website front end
+  # (megaui apps/web). Uses the megaui Dockerfile `db-init` target which
+  # carries drizzle-kit. Account data lives in an isolated `website` database
+  # on the shared postgres service — never the monoengine business DB (ADR-WA-07).
   website-db-init:
     profiles: ["web"]
     build:
-      context: ../monoui
-      dockerfile: apps/next-app/Dockerfile
-      target: builder
+      context: ../megaui
+      dockerfile: apps/web/Dockerfile
+      target: db-init
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DB_DIALECT: pg
       DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
       # Connects to the maintenance DB only to CREATE DATABASE website.
       DATABASE_ADMIN_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/postgres
+    working_dir: /app
     command:
       - /bin/sh
       - -ec
       - |
         node -e "
-        const { Client } = require('pg');
+        const { createRequire } = require('module');
+        const requireFromDb = createRequire('/app/packages/database/package.json');
+        const { Client } = requireFromDb('pg');
         (async () => {
           const admin = new Client({ connectionString: process.env.DATABASE_ADMIN_URL });
           await admin.connect();
@@ -281,20 +282,48 @@ services:
           process.exit(1);
         });
         "
-        npx drizzle-kit push --force
+        cd /app/packages/database && pnpm exec drizzle-kit migrate
 
-  # monoui Better Auth test instance. Uses isolated Postgres database
-  # `website` on the shared postgres service (not monoengine's business DB).
-  # Build locally from the sibling checkout; CI must check out ../monoui too.
+  # Hocuspocus collab server (megaui apps/collab-server). Browser WS on host
+  # 17002; internal HTTP for website-next bridge on the compose network.
+  megaui-collab:
+    profiles: ["web"]
+    image: megaui-collab:local
+    pull_policy: never
+    build:
+      context: ../megaui
+      dockerfile: apps/collab-server/Dockerfile
+    environment:
+      MEGA_COLLAB_PORT: "7002"
+      MEGA_COLLAB_BIND: "0.0.0.0"
+      MEGA_COLLAB_QUIET: "1"
+      MEGA_COLLAB_INTERNAL_TOKEN: monoengine-it-collab-token-0001
+      # IT-only: authenticated tickets may join/edit until a web authz adapter
+      # is wired; production must leave this unset (fail-closed deny-all).
+      MEGA_COLLAB_DEV_ALLOW_AUTHENTICATED: "1"
+    ports:
+      - "127.0.0.1:17002:7002"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7002/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  # website Better Auth + Next app (built from sibling megaui checkout).
+  # Uses isolated Postgres database `website` on the shared postgres service
+  # (not monoengine's business DB). CI must check out ../megaui too.
   website-next:
     profiles: ["web"]
     image: website-next:local
     pull_policy: never
     build:
-      context: ../monoui
-      dockerfile: apps/next-app/Dockerfile
+      context: ../megaui
+      dockerfile: apps/web/Dockerfile
+      target: runner
+      args:
+        NEXT_PUBLIC_MEGA_COLLAB_PUBLIC_URL: ws://127.0.0.1:17002
     environment:
-      DB_DIALECT: pg
       DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
       APP_BASE_URL: http://127.0.0.1:17001
       BETTER_AUTH_URL: http://127.0.0.1:17001
@@ -306,12 +335,10 @@ services:
       # WE-05/WE-06: IT product mail uses the in-memory test provider (no cloud).
       EMAIL_PROVIDER: test
       EMAIL_DEFAULT_FROM: noreply@monoengine-it.test
-      # Optional CTA base for product templates (not TinyShip APP_BASE_URL).
       MONOENGINE_PUBLIC_BASE_URL: http://monoengine:8000
       # MC-07: route Code read paths through the monoengine BFF inside compose.
       MEGA_CODE_DATA_BACKEND: monoengine
-      # FS-02: monoui uploads via RustFS S3 (monoui bucket)
-      STORAGE_PROVIDER: s3
+      # FS-02: uploads via RustFS S3 (stack default bucket name retained).
       S3_REGION: us-east-1
       S3_ACCESS_KEY_ID: rustfs
       S3_ACCESS_KEY_SECRET: rustfs_secret
@@ -319,12 +346,17 @@ services:
       S3_ENDPOINT: http://rustfs:9000
       S3_PUBLIC_URL: http://127.0.0.1:19000/monoui
       S3_FORCE_PATH_STYLE: "true"
+      MEGA_COLLAB_INTERNAL_URL: http://megaui-collab:7002
+      MEGA_COLLAB_INTERNAL_TOKEN: monoengine-it-collab-token-0001
+      NEXT_PUBLIC_MEGA_COLLAB_PUBLIC_URL: ws://127.0.0.1:17002
     depends_on:
       postgres:
         condition: service_healthy
       website-db-init:
         condition: service_completed_successfully
       rustfs-init:
+        condition: service_healthy
+      megaui-collab:
         condition: service_healthy
     ports:
       - "127.0.0.1:17001:7001"
