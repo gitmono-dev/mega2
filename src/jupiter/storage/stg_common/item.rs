@@ -1,7 +1,4 @@
-use crate::{
-    callisto::mega_cl,
-    jupiter::model::common::ItemKind,
-};
+use crate::{callisto::mega_cl, jupiter::model::common::ItemKind};
 
 pub trait ItemEntity {
     type Model;

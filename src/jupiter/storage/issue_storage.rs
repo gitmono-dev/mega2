@@ -6,14 +6,15 @@ use sea_orm::{
 };
 
 use crate::{
-    callisto::{issue_cl_references, item_assignees, item_labels, label, sea_orm_active_enums::ReferenceTypeEnum},
+    callisto::{
+        issue_cl_references, item_assignees, item_labels, label,
+        sea_orm_active_enums::ReferenceTypeEnum,
+    },
     common::errors::MegaError,
     contract::api::common::Pagination,
     jupiter::{
         model::common::LabelAssigneeParams,
-        storage::{
-            base_storage::{BaseStorage, StorageConnector},
-        },
+        storage::base_storage::{BaseStorage, StorageConnector},
     },
 };
 

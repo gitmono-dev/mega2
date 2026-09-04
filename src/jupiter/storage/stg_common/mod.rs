@@ -83,7 +83,8 @@ where
 mod tests {
     use super::*;
     use crate::callisto::{
-        item_assignees, label, mega_cl, mega_conversation, sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
+        item_assignees, label, mega_cl, mega_conversation,
+        sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     };
 
     #[test]

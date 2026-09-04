@@ -15,8 +15,8 @@ use crate::{
         router::{
             admin_router, artifacts_router, bot_router, buck_router, build_trigger_router,
             cl_router, code_review_router, commit_router, conv_router, dynamic_sidebar_router,
-            gpg_router, group_router, label_router, merge_queue_router,
-            preview_router, repo_router, reviewer_router, tag_router, user_router, webhook_router,
+            gpg_router, group_router, label_router, merge_queue_router, preview_router,
+            repo_router, reviewer_router, tag_router, user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},

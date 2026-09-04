@@ -3,9 +3,7 @@ use utoipa::ToSchema;
 
 use crate::{
     ceres::model::label::LabelItem,
-    jupiter::model::{
-        common::{ItemDetails, ItemKind},
-    },
+    jupiter::model::common::{ItemDetails, ItemKind},
 };
 
 #[derive(Serialize, Deserialize, ToSchema)]

@@ -41,9 +41,9 @@ use crate::{
         service::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService,
-            lfs_service::LfsService, merge_queue_service::MergeQueueService,
-            mono_service::MonoService, webhook_service::WebhookService,
+            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
+            merge_queue_service::MergeQueueService, mono_service::MonoService,
+            webhook_service::WebhookService,
         },
         storage::{
             audit_storage::AuditStorage,
