@@ -56,13 +56,13 @@ EXPECTED=(
 
 # ---------------------------------------------------------------------------
 # MonoApiService constructor baseline (UN-02, card-fixed). ADR-UN-02 ⑥ forbids
-# adding an authorization field to MonoApiService/MonoRepo/ImportRepo, so every
+# adding an authorization field to MonoApiService/Monorepo/ImportRepo, so every
 # production `MonoApiService { .. }` literal must keep exactly this field set.
 # The struct declaration is included so a field added there cannot slip through.
 # ---------------------------------------------------------------------------
 EXPECTED_CTORS=(
   "src/api/mod.rs:from -> git_object_cache,storage"                                  # From<&MonoApiServiceState>
-  "src/ceres/api_service/mono_api_service.rs:from -> git_object_cache,storage"       # From<&MonoRepo>
+  "src/ceres/api_service/mono_api_service.rs:from -> git_object_cache,storage"       # From<&Monorepo>
   "src/ceres/api_service/mono_api_service.rs:from -> git_object_cache,storage"       # From<&ImportRepo>
   "src/ceres/build_trigger/changes_calculator.rs:get_commit_blobs -> git_object_cache,storage"
   "src/ceres/build_trigger/changes_calculator.rs:cl_files_list -> git_object_cache,storage"

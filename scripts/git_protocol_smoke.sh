@@ -118,7 +118,7 @@ fetch_case() {
 }
 
 push_branch_smoke() {
-  # MonoRepo rule (docs/monorepo.md §1): push creates refs/cl/*, never a second
+  # Monorepo rule (docs/monorepo.md §1): push creates refs/cl/*, never a second
   # public refs/heads/<name>. Public heads remain main only.
   local remote_url="$1"
   local label="$2"
@@ -144,12 +144,12 @@ push_branch_smoke() {
   git_case ls-remote "$remote_url" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
   git_case ls-remote "$remote_url" "refs/heads/*" | awk '{print $2}' | sort >"$after_heads" || return
   if ! diff -q "$before_heads" "$after_heads" >/dev/null; then
-    echo "FAIL: MonoRepo push must not change public refs/heads/* (only main is public)" >&2
+    echo "FAIL: Monorepo push must not change public refs/heads/* (only main is public)" >&2
     diff -u "$before_heads" "$after_heads" >&2 || true
     return 1
   fi
   if git_case ls-remote "$remote_url" "refs/heads/$branch" | rg -q .; then
-    echo "FAIL: public branch refs/heads/$branch must not exist after MonoRepo push" >&2
+    echo "FAIL: public branch refs/heads/$branch must not exist after Monorepo push" >&2
     return 1
   fi
   delete_ref="$(comm -13 "$before_refs" "$after_refs" | head -n1)"
@@ -165,7 +165,7 @@ push_branch_smoke() {
 }
 
 reject_tag_push_smoke() {
-  # MonoRepo rule (docs/monorepo.md §2): Git-client tag push must fail.
+  # Monorepo rule (docs/monorepo.md §2): Git-client tag push must fail.
   local remote_url="$1"
   local label="$2"
   local src="$ROOT_DIR/push-$label-tag-src"
@@ -184,7 +184,7 @@ reject_tag_push_smoke() {
   push_status=$?
   set -e
   if [[ "$push_status" -eq 0 ]]; then
-    echo "FAIL: MonoRepo must reject Git-client tag push (docs/monorepo.md §2)" >&2
+    echo "FAIL: Monorepo must reject Git-client tag push (docs/monorepo.md §2)" >&2
     git -C "$src" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
     return 1
   fi

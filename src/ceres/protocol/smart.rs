@@ -228,7 +228,7 @@ impl SmartSession {
         }
 
         // Capability honesty: `shallow` is advertised for upload-pack, but
-        // only MonoRepo genuinely implements depth-limited pack generation.
+        // only Monorepo genuinely implements depth-limited pack generation.
         // ImportRepo's default trait `shallow_pack` silently falls back to
         // `full_pack`, which would mislead clients into thinking they got a
         // shallow clone. Return an explicit protocol error instead.
@@ -659,10 +659,10 @@ impl SmartSession {
 
     /// Process commit bindings for successfully pushed commits
     // NOTE (plan-20260827, updated MC-06/Codex R3 P1): this protocol-layer
-    // tip binding now serves ImportRepo only. MonoRepo opts out via
+    // tip binding now serves ImportRepo only. Monorepo opts out via
     // `RepoHandler::bind_tip_after_receive` — its post-push pipeline binds
     // exactly the accepted chain's newly introduced commits
-    // (`MonoRepo::run_mono_post_push_pipeline`), so an unconditional upsert
+    // (`Monorepo::run_mono_post_push_pipeline`), so an unconditional upsert
     // here could still clobber a known tip's existing binding on an
     // empty-pack idempotent re-push or a known-tip push.
     async fn process_commit_bindings(&self, state: &ProtocolApiState, commands: &[RefCommand]) {

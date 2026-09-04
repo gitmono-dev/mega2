@@ -55,7 +55,7 @@ use crate::{
 #[rustfmt::skip]
 use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 
-pub struct MonoRepo {
+pub struct Monorepo {
     pub storage: Storage,
     pub git_object_cache: Arc<GitObjectCache>,
     pub path: PathBuf,
@@ -87,7 +87,7 @@ pub struct MonoRepo {
 }
 
 #[async_trait]
-impl RepoHandler for MonoRepo {
+impl RepoHandler for Monorepo {
     fn is_monorepo(&self) -> bool {
         true
     }
@@ -110,7 +110,7 @@ impl RepoHandler for MonoRepo {
             .clone()
     }
 
-    /// Codex R3 P1: MonoRepo binds the accepted chain's newly introduced
+    /// Codex R3 P1: Monorepo binds the accepted chain's newly introduced
     /// commits in its post-push pipeline; the protocol layer must not re-upsert
     /// the tip (an empty-pack idempotent re-push or a known-tip push would
     /// otherwise clobber the existing binding).
@@ -675,10 +675,10 @@ impl RepoHandler for MonoRepo {
 
     async fn update_refs(&self, refs: &RefCommand) -> Result<(), GitError> {
         if refs.ref_type == RefTypeEnum::Tag {
-            // MonoRepo product rule: tags are Web/API-only (docs/monorepo.md §2).
+            // Monorepo product rule: tags are Web/API-only (docs/monorepo.md §2).
             // ImportRepo keeps client tag push; never silently write refs/tags/* here.
             Err(GitError::CustomError(
-                "MonoRepo rejects Git-client tag create/update/delete; use Web UI or /tags API"
+                "Monorepo rejects Git-client tag create/update/delete; use Web UI or /tags API"
                     .to_string(),
             ))
         } else {
@@ -761,7 +761,7 @@ impl RepoHandler for MonoRepo {
     }
 }
 
-impl MonoRepo {
+impl Monorepo {
     async fn direct_object_pack(
         &self,
         want: Vec<String>,
@@ -1468,7 +1468,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    use super::{MonoRepo, RepoHandler};
+    use super::{Monorepo, RepoHandler};
     use crate::{
         bellatrix::Bellatrix,
         callisto::{commit_auths, mega_commit, mega_tree},
@@ -1510,14 +1510,14 @@ mod tests {
         commands: Vec<RefCommand>,
         pack_commit_ids: HashSet<String>,
         new_commit_ids: HashSet<String>,
-    ) -> MonoRepo {
+    ) -> Monorepo {
         // Never connected: the gate paths under test do not touch the cache.
         let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
             ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
             ::redis::aio::ConnectionManagerConfig::new(),
         )
         .expect("lazy connection manager");
-        MonoRepo {
+        Monorepo {
             storage: storage.clone(),
             git_object_cache: Arc::new(GitObjectCache {
                 connection,

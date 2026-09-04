@@ -1542,7 +1542,7 @@ fn integration_git_ssh_authz_grant_immediate_effect() {
     );
 
     // --- the SSH leg must honour the new snapshot immediately ---
-    // Refresh from the merged main first: MonoRepo rejects packs carrying more
+    // Refresh from the merged main first: Monorepo rejects packs carrying more
     // than one commit, so the new commit's parent must already be on main.
     let fetch = git_cli::git_cli_ssh(
         &env.case_dir,

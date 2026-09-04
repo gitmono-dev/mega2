@@ -3,7 +3,7 @@
 // Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
 // compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
 // re-clone working-tree round-trips with per-case DB/port/workdir isolation.
-// MonoRepo product rules (`docs/monorepo.md`): only public branch is `main`;
+// Monorepo product rules (`docs/monorepo.md`): only public branch is `main`;
 // client branch pushes land on `refs/cl/*` (no new public heads); Git-client
 // tag push is rejected (tags via Web `/tags` API only).
 // IT-10 adds auth-boundary cases (`integration_git_cli_auth_*`).
@@ -573,13 +573,13 @@ fn integration_git_cli_http_round_trip() {
     let after_heads = ls_remote_refs(&env.case_dir, &token, &remote_url, "refs/heads/*");
     assert_eq!(
         before_heads, after_heads,
-        "MonoRepo push must not create/alter public refs/heads/* (docs/monorepo.md §1)"
+        "Monorepo push must not create/alter public refs/heads/* (docs/monorepo.md §1)"
     );
     assert!(
         !after_heads
             .iter()
             .any(|r| r == &format!("refs/heads/{branch}")),
-        "public branch refs/heads/{branch} must not exist after MonoRepo CL push",
+        "public branch refs/heads/{branch} must not exist after Monorepo CL push",
         branch = branch
     );
     let cl_ref = after_refs
@@ -962,7 +962,7 @@ fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
 
 #[test]
 fn integration_git_cli_http_rejects_git_client_tag_push() {
-    // docs/monorepo.md §2 — MonoRepo tags are Web/API only.
+    // docs/monorepo.md §2 — Monorepo tags are Web/API only.
     if git_cli::git_cli_skip_requested() {
         eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
         return;
@@ -1043,7 +1043,7 @@ fn integration_git_cli_http_rejects_git_client_tag_push() {
     );
     assert!(
         !push.status.success(),
-        "MonoRepo must reject Git-client tag push; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        "Monorepo must reject Git-client tag push; status={:?}\nstdout:\n{}\nstderr:\n{}",
         push.status,
         String::from_utf8_lossy(&push.stdout),
         String::from_utf8_lossy(&push.stderr)
@@ -1531,7 +1531,7 @@ fn integration_git_cli_authz_revoke_grant_immediate_effect() {
     // --- grant takes effect immediately: non-admin push now allowed ---
     // Fetch the merged main first so the pushed commit's parent is known to the
     // server (a stale clone would otherwise send the parent commit too, which
-    // the single-commit-per-push MonoRepo rule rejects).
+    // the single-commit-per-push Monorepo rule rejects).
     let fetch_grant = git_cli::git_cli(
         &env.case_dir,
         &user_token,
@@ -2208,7 +2208,7 @@ fn integration_git_cli_multicommit_chain_push_acceptance() {
 
     // Codex R3 P1: an idempotent re-push of the same tip is an ADR-MC-05 no-op
     // (the CL ref tip is advertised, so the client sends an empty pack) and
-    // must not rewrite any `commit_auths` field — MonoRepo owns binding via its
+    // must not rewrite any `commit_auths` field — Monorepo owns binding via its
     // pipeline, the protocol layer's generic tip upsert is disabled for it.
     let auth_snapshot_before = commit_auth_snapshot(&env.database.db_url);
     let cl_refs_before = cl_ref_rows(&env.database.db_url);

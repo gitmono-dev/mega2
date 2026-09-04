@@ -184,7 +184,7 @@ pub async fn handle_v2_fetch(
         .await?;
 
     // Capability honesty: `fetch=shallow filter` is advertised globally, but
-    // only MonoRepo genuinely implements shallow/filter pack generation.
+    // only Monorepo genuinely implements shallow/filter pack generation.
     // ImportRepo's default trait implementations silently fall back to
     // full/incremental packs, which would mislead clients. Return an explicit
     // protocol error instead of silently producing a wrong pack.

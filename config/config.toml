@@ -59,7 +59,7 @@ connect_timeout = 3
 sqlx_logging = false
 
 [monorepo]
-## MonoRepo product rules (authoritative: docs/monorepo.md):
+## Monorepo product rules (authoritative: docs/monorepo.md):
 ## - Only one public branch: main. Client pushes of other heads become refs/cl/* (not new public branches).
 ## - Tags must not be created/updated/deleted via Git client; use Web UI /tags API.
 ## Only import_dir supports multi-branch and Git-client tags (ImportRepo).
@@ -73,7 +73,7 @@ admin = ["benjamin_747"]
 # Set serveral root dirs in directory init
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
-# Object-ID format for the initial MonoRepo graph. Supported bootstrap values:
+# Object-ID format for the initial Monorepo graph. Supported bootstrap values:
 # "sha1" (default) and "sha256". "blake3" is reserved until git-internal 0.9.0.
 # SHA-256 is not yet an end-to-end Git wire/pack format in monoengine. Use it
 # only for a controlled bootstrap invocation, never for a normal Git service.

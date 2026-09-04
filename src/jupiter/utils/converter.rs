@@ -979,7 +979,7 @@ mod test {
         if !mono_config.root_dirs.iter().any(|d| d == "toolchains") {
             mono_config.root_dirs.push("toolchains".to_string());
         }
-        let converter = MegaModelConverter::init(&mono_config).expect("initialize MonoRepo graph");
+        let converter = MegaModelConverter::init(&mono_config).expect("initialize Monorepo graph");
         let mega_trees = converter.mega_trees.borrow().clone();
         let mega_blobs = converter.mega_blobs.borrow().clone();
         let dir_nums = mono_config.root_dirs.len();

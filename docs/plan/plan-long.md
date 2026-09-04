@@ -762,7 +762,7 @@ flowchart TD
 | [`plan-20260803.md`](plan-20260803.md) | PT-04 | 已完成 | Git 使用场景测试补全：HTTP `pull`、匿名读关闭、HTTP LFS、cargo-native SSH、Mega 夹具 go/no-go（NO-GO 转 `DEFER-GM-03`）及 CI 归属均已交付（GM-12 发布于 v0.2.11，完成度复审收口于 v0.2.15）；不改 Git protocol 产品实现，补测发现的缺陷转 PT-03。不覆盖 ImportRepo 全命令矩阵、pure SSH LFS、Mega 大夹具移植、shell SSH 广度 CI、missing-repo 探针（`DEFER-GM-01..05`，PT-04 follow-up） |
 | [`plan-20260812.md`](plan-20260812.md) | PT-03 / PT-12（切片） | 已完成 | 用户体系统一：website 认证 × monoengine 授权；Cedar 三态、push 门、merge 面鉴权、只读审计（UN-31/UN-43）等；收口 v0.2.66。不覆盖身份键全量迁移（handoff PT-12） |
 | [`plan-20260820.md`](plan-20260820.md) | PT-11（依赖形态切片） | **已完成（2026-08-21）** | vendored → `libvault` 0.3.0 已落地；VLT-S1 判定 **go**（shadow-unseal），VLT-S2 与 DEFER-VLT-01 未触发；`REL-VLT-RO`（VLT-02→04→FIX-VLT-01→**VLT-05 release**）；UN-31 八 AC 在集成层等价重建，十二条 `un31_` 与四条 `un43_` 全绿；FIX-04/un31 已迁至 `src/contract/vault/integration/` |
-| [`plan-20260903.md`](plan-20260903.md) | PT-03（准备切片） | 实施中 | MonoRepo 空仓初始化按 `monorepo.object_format` 生成 SHA-1/SHA-256 object graph，BLAKE3 接口 fail-closed；不覆盖 repository-format 持久化、SHA-256 wire/pack 或 BLAKE3 运行时接入。 |
+| [`plan-20260903.md`](plan-20260903.md) | PT-03（准备切片） | 实施中 | Monorepo 空仓初始化按 `monorepo.object_format` 生成 SHA-1/SHA-256 object graph，BLAKE3 接口 fail-closed；不覆盖 repository-format 持久化、SHA-256 wire/pack 或 BLAKE3 运行时接入。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
 

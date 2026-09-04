@@ -2,7 +2,7 @@
 
 本文是 monoengine **Monorepo（非 `import_dir` 下的 ImportRepo）** 的集中规则事实源。协议实现、CI smoke、Web/API 与测试矩阵凡涉及分支、标签或仓库初始化，以本文为准；细节实现锚点见 [`refactoring/protocol.md`](./refactoring/protocol.md) 与 `config/config.toml` 的 `[monorepo]`。
 
-> **范围**：默认路径下的 MonoRepo（根路径 `/` 及非 `import_dir` 子树）。  
+> **范围**：默认路径下的 Monorepo（根路径 `/` 及非 `import_dir` 子树）。  
 > **例外**：`[monorepo].import_dir`（默认 `/third-party`）下的 **ImportRepo** 仍可按普通 Git 多分支 / 客户端 tag 语义工作；本文规则不覆盖 ImportRepo。
 
 ---
@@ -11,13 +11,13 @@
 
 ### 规则
 
-1. MonoRepo **只有一个公开分支**：`refs/heads/main`（简称 `main`）。
+1. Monorepo **只有一个公开分支**：`refs/heads/main`（简称 `main`）。
 2. 客户端对 monoengine 的 Git 推送 **不得** 在远端创建第二个公开分支（例如 `refs/heads/feature` 不得作为持久 heads 出现）。
 3. `git ls-remote` / upload-pack 广告中，heads 侧对用户可见的稳定公开 tip 是 `main`；变更评审用的 tip 落在 `refs/cl/*`，不是公开分支。
 
 ### 与 Change List（CL）的关系
 
-- 客户端常见写法 `git push origin HEAD:refs/heads/<name>`（`<name> ≠` 持久公开分支）在 MonoRepo 上会进入 **CL 管线**：服务端落地为 `refs/cl/<id>`，**不会**把 `<name>` 登记为第二个 `refs/heads/*` 公开分支，也 **不会** 直接改写 `main`。
+- 客户端常见写法 `git push origin HEAD:refs/heads/<name>`（`<name> ≠` 持久公开分支）在 Monorepo 上会进入 **CL 管线**：服务端落地为 `refs/cl/<id>`，**不会**把 `<name>` 登记为第二个 `refs/heads/*` 公开分支，也 **不会** 直接改写 `main`。
 - 合并进 `main`、关闭/更新 CL 等产品动作走 Web / 内部 API，而不是「再 push 一个公开分支」。
 - 因此：smoke / 集成测试里的「branch push」验收的是 **CL 创建与定向 fetch**，不是多分支托管。
 
@@ -37,7 +37,7 @@
 
 ### 规则
 
-1. MonoRepo **禁止** 通过 Git 客户端创建、更新或删除 tag（含 `git push --tags`、`git push origin refs/tags/<name>`、`git push origin :refs/tags/<name>`）。
+1. Monorepo **禁止** 通过 Git 客户端创建、更新或删除 tag（含 `git push --tags`、`git push origin refs/tags/<name>`、`git push origin :refs/tags/<name>`）。
 2. Tag 的创建 / 查询 / 删除 **只允许** Web 界面，并经由对应 HTTP API 完成。
 3. ImportRepo（`import_dir` 下）不受本条约束。
 
@@ -52,14 +52,14 @@
 | 查询 | `GET` … `/tags/{name}` |
 | 删除 | `DELETE` … `/tags/{name}` |
 
-协议层：MonoRepo receive-pack 对 `RefTypeEnum::Tag` **拒绝**更新（返回可诊断错误），不得静默写入 `refs/tags/*`。
+协议层：Monorepo receive-pack 对 `RefTypeEnum::Tag` **拒绝**更新（返回可诊断错误），不得静默写入 `refs/tags/*`。
 
 ### 测试与 CI 期望
 
 | 场景 | 期望 |
 |---|---|
-| `git push origin refs/tags/<name>`（MonoRepo） | **非零退出**；远端不出现该 tag |
-| `git push origin :refs/tags/<name>`（MonoRepo） | **非零退出** |
+| `git push origin refs/tags/<name>`（Monorepo） | **非零退出**；远端不出现该 tag |
+| `git push origin :refs/tags/<name>`（Monorepo） | **非零退出** |
 | Web/API create/list/delete | 由 API / UI 测试覆盖；**不**用 Git CLI smoke 冒充 tag 成功路径 |
 
 权威自动化：`scripts/git_protocol_smoke.sh` 的 tag **拒绝**用例；勿再把「HTTP push and delete tag」写成成功门。
@@ -82,7 +82,7 @@
 | `import_dir` | ImportRepo 根（默认 `/third-party`）；其下多分支/客户端 tag 合法 |
 | `admin` | 初始化时写入 Cedar 实体的系统管理员列表 |
 | `root_dirs` | 根树下一层目录名列表（每个目录带独立 `.gitkeep`） |
-| `object_format` | 空 MonoRepo 初始 object graph 的 ID 格式：`sha1`（默认）或 `sha256`；不会转换既有仓库 |
+| `object_format` | 空 Monorepo 初始 object graph 的 ID 格式：`sha1`（默认）或 `sha256`；不会转换既有仓库 |
 | `rename.*` | diff 重命名检测参数（非初始化布局字段） |
 
 样例见 `config/config.toml`；生成模板见 `src/config/template.rs`。校验：`monorepo.import_dir` / `root_dirs` / `admin` 非空，且 `object_format=blake3` 在当前 `git-internal` 0.8.x build 中 fail-closed（`src/config/validate.rs`）。上述字段变更通常要求进程重启（`reload` 的 `restart_required_fields`）。
@@ -135,12 +135,12 @@ object storage 与 MonoService；不会启动 Redis、notification、sidebar、r
 
 实际一级目录 **以运行配置的 `root_dirs` 为准**；改配置后只影响**尚未初始化**的新库，已初始化库不会自动重建树。
 
-### ImportRepo vs MonoRepo 路径
+### ImportRepo vs Monorepo 路径
 
 | 路径 | 类型 | 分支 | Tag（Git 客户端） |
 |---|---|---|---|
 | `import_dir` 及其子路径 | ImportRepo | 可多分支 | 允许（按 Import 语义） |
-| 其余路径（含 `/`） | MonoRepo | 仅公开 `main` + `refs/cl/*` | **禁止**；走 Web/API |
+| 其余路径（含 `/`） | Monorepo | 仅公开 `main` + `refs/cl/*` | **禁止**；走 Web/API |
 
 路径判定与 smart HTTP 入口见 `protocol.md` / `GitProtocolPath`。
 
@@ -154,7 +154,7 @@ object storage 与 MonoService；不会启动 Redis、notification、sidebar、r
 
 ### PushChain：base/tip 的唯一事实源
 
-- MonoRepo receive-pack 的 push 语义状态是 `PushChain { base, tip, ordered_commits }`（`src/ceres/pack/push_chain.rs`），解包后由 `RefCommand.old_id/new_id` 加 tip commit 的 parent 链构建；**不得**从 pack 对象到达顺序推断 base/tip/归属。
+- Monorepo receive-pack 的 push 语义状态是 `PushChain { base, tip, ordered_commits }`（`src/ceres/pack/push_chain.rs`），解包后由 `RefCommand.old_id/new_id` 加 tip commit 的 parent 链构建；**不得**从 pack 对象到达顺序推断 base/tip/归属。
 - `base` = `RefCommand.old_id`；新分支 push（`old_id` 为零值）时沿 tip 首父链反走，取第一个**非本 push 新引入**的 commit（fork point；unpack 时已存在于服务端的祖先——即便 pack 冗余携带——不构成链的一部分，Codex R1 P1-1）。`base` 即 CL 的 `from_hash`；`tip` = `new_id` 对应的 commit，即 CL 的 `to_hash`。
 - CL ref（`refs/cl/<link>`）的 `ref_commit_hash` 与 `ref_tree_hash` 同源自 tip commit（`new_id` 及其 tree）；文件路径索引按 tip 的 tree 遍历，链上任意 commit 引入/重命名的文件都在覆盖范围内。
 - finalize 先过接收闸门再写任何 ref/CL：多 branch 命令拒绝（ADR-MC-04）+ 链校验（MC-03 校验器，增量段复用 resolve 反走的结果不重复读库，历史段仅计数）+ 链外 junk commit 拒绝（pack 携带的每个 commit 必须落在 tip 的首父路径上；冗余携带的已知祖先在路径上故不误伤）。所有拒绝规则只基于 pack **内容**（presence），与 unpack 时的瞬时「新引入」状态无关——被拒 push 原样重试必被同样拒绝（粘性，Codex R2 P1-1）；失败时本 push 的全部 branch 命令以 `ng <ref> <原因>` 回报，对象落库保持 insert-only 语义（被拒 push 的新行是不可达垃圾，不改动既有行）。
@@ -211,4 +211,4 @@ object storage 与 MonoService；不会启动 Redis、notification、sidebar、r
 | 配置样例 | `config/config.toml` `[monorepo]` |
 | 本地开发入口 | [`development.md`](./development.md) |
 
-修订本规则时：同步更新本文、`protocol.md` 场景表、smoke/IT 期望，以及（若行为变更）MonoRepo receive-pack 实现。
+修订本规则时：同步更新本文、`protocol.md` 场景表、smoke/IT 期望，以及（若行为变更）Monorepo receive-pack 实现。

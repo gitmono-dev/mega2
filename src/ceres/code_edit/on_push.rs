@@ -110,7 +110,7 @@ pub(crate) type OnpushCodeEdit = crate::ceres::code_edit::model::CodeEditService
     crate::ceres::code_edit::model::DefualtDirector<MonoApiService>,
 >;
 
-// impl<'a> crate::ceres::code_edit::model::CodeEditService<OnpushFormator, OnpushVisitor, OnpushAcceptor, OnpushTrigerBuilder, OnpushChecker, crate::ceres::model::DefualthDirector<'a, MonoRepo>> {
+// impl<'a> crate::ceres::code_edit::model::CodeEditService<OnpushFormator, OnpushVisitor, OnpushAcceptor, OnpushTrigerBuilder, OnpushChecker, crate::ceres::model::DefualthDirector<'a, Monorepo>> {
 impl OnpushCodeEdit {
     pub fn from(
         repo_path: &str,

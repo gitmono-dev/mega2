@@ -55,7 +55,7 @@ fn ensure_existing_root_ref_matches_config(
     }
 
     Err(MegaError::Other(format!(
-        "existing MonoRepo root ref is incompatible with monorepo.object_format={}; object-format changes do not convert existing repositories",
+        "existing Monorepo root ref is incompatible with monorepo.object_format={}; object-format changes do not convert existing repositories",
         mono_config.object_format.as_str()
     )))
 }
@@ -87,7 +87,7 @@ impl MonoService {
         self.initialize_monorepo(mono_config).await
     }
 
-    /// Initializes an empty MonoRepo for a controlled, one-shot bootstrap.
+    /// Initializes an empty Monorepo for a controlled, one-shot bootstrap.
     ///
     /// Unlike [`Self::init_monorepo`], this accepts the configured SHA-256
     /// initial object graph. It must not be followed by a normal Git service
@@ -142,7 +142,7 @@ impl MonoService {
             .await?
             .ok_or_else(|| {
                 MegaError::Other(
-                    "MonoRepo initializer did not persist a root ref; refusing to report success"
+                    "Monorepo initializer did not persist a root ref; refusing to report success"
                         .to_string(),
                 )
             })?;

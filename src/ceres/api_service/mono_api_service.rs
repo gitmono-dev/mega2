@@ -91,7 +91,7 @@ use crate::{
             tag::TagInfo,
             third_party::{ThirdPartyClient, ThirdPartyRepoTrait},
         },
-        pack::{import_repo::ImportRepo, monorepo::MonoRepo},
+        pack::{import_repo::ImportRepo, monorepo::Monorepo},
         protocol::{ServiceType, SmartSession, TransportProtocol},
     },
     common::{
@@ -372,8 +372,8 @@ pub fn authz_freeze_message(reason: &str) -> String {
     )
 }
 
-impl From<&MonoRepo> for MonoApiService {
-    fn from(mono_repo: &MonoRepo) -> Self {
+impl From<&Monorepo> for MonoApiService {
+    fn from(mono_repo: &Monorepo) -> Self {
         MonoApiService {
             storage: mono_repo.storage.clone(),
             git_object_cache: mono_repo.git_object_cache.clone(),

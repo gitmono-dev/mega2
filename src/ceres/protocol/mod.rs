@@ -14,7 +14,7 @@ use crate::{
     bellatrix::Bellatrix,
     ceres::{
         api_service::state::ProtocolApiState,
-        pack::{RepoHandler, import_repo::ImportRepo, monorepo::MonoRepo, push_chain},
+        pack::{RepoHandler, import_repo::ImportRepo, monorepo::Monorepo, push_chain},
     },
     common::{
         errors::{MegaError, ProtocolError},
@@ -215,7 +215,7 @@ impl SmartSession {
                 receive_pack_extra_timings_ms: Mutex::new(Vec::new()),
             }) as Arc<dyn RepoHandler>)
         } else {
-            let mut res = MonoRepo {
+            let mut res = Monorepo {
                 git_object_cache: state.git_object_cache.clone(),
                 storage: state.storage.clone(),
                 path: self.repo_path.clone(),

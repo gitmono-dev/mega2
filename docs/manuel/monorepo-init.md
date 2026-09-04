@@ -2,7 +2,7 @@
 
 本文面向运维与开发者，说明 monoengine 在 **Monorepo 初始化**时如何生成目录结构、如何通过配置定制，以及初始化后的实际产物。产品规则（单公开分支、tag 限制、ImportRepo 例外）以 [`../monorepo.md`](../monorepo.md) 为准，本文不重复其规则细节。
 
-> **范围**：默认路径下的 MonoRepo（根路径 `/` 及非 `import_dir` 子树）的首次初始化。  
+> **范围**：默认路径下的 Monorepo（根路径 `/` 及非 `import_dir` 子树）的首次初始化。  
 > **不适用**：`import_dir` 下的 ImportRepo；已初始化库的目录重建（不支持，见下文）。
 
 ---
@@ -58,7 +58,7 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 
 | 目录 | 作用 |
 |---|---|
-| `third-party/` | 第三方导入仓库的归放根，**应与 `import_dir` 对齐**（引擎不强制，脱节后果见下文）；其下每个子路径是一个 ImportRepo，按普通 Git 语义工作（多分支、客户端 tag 合法），MonoRepo 的单分支/禁客户端 tag 规则不适用。详见下文「`import_dir` 的作用」 |
+| `third-party/` | 第三方导入仓库的归放根，**应与 `import_dir` 对齐**（引擎不强制，脱节后果见下文）；其下每个子路径是一个 ImportRepo，按普通 Git 语义工作（多分支、客户端 tag 合法），Monorepo 的单分支/禁客户端 tag 规则不适用。详见下文「`import_dir` 的作用」 |
 | `project/` | 业务工程源码主目录：团队的日常开发代码按子项目组织于此 |
 | `doc/` | 文档目录：设计文档、规范、评审材料等与代码同仓管理的文档 |
 | `artifact/` | 构建/打包产物的归放约定（如发布包、产物清单）。注意引擎另有独立的 artifact 存储子系统（buck/artifacts API 与 `artifact_objects` 表，经对象存储承载），与本目录的约定不是同一物 |
@@ -97,12 +97,12 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 
 ### `import_dir` 的作用
 
-`import_dir`（默认 `/third-party`）不是普通的一级目录声明，而是 **ImportRepo 与 MonoRepo 的路径边界**：
+`import_dir`（默认 `/third-party`）不是普通的一级目录声明，而是 **ImportRepo 与 Monorepo 的路径边界**：
 
-- **路径分类**：协议层按请求路径是否落在 `import_dir` 之下，把仓库判定为 ImportRepo 或 MonoRepo（`GitProtocolPath`，见 [`../refactoring/protocol.md`](../refactoring/protocol.md)）。分类按路径前缀判定，与该目录是否已存在于树中无关。
-- **规则豁免**：`import_dir` 下的 ImportRepo 允许普通 Git 多分支语义、允许客户端推送/删除 tag；MonoRepo 区域则只有公开 `main` 分支、tag 仅经 Web/API、非 `main` 推送进入 `refs/cl/*` 管线（规则全文见 [`../monorepo.md`](../monorepo.md)）。
+- **路径分类**：协议层按请求路径是否落在 `import_dir` 之下，把仓库判定为 ImportRepo 或 Monorepo（`GitProtocolPath`，见 [`../refactoring/protocol.md`](../refactoring/protocol.md)）。分类按路径前缀判定，与该目录是否已存在于树中无关。
+- **规则豁免**：`import_dir` 下的 ImportRepo 允许普通 Git 多分支语义、允许客户端推送/删除 tag；Monorepo 区域则只有公开 `main` 分支、tag 仅经 Web/API、非 `main` 推送进入 `refs/cl/*` 管线（规则全文见 [`../monorepo.md`](../monorepo.md)）。
 - **不参与树的生成**：`import_dir` 本身不产生目录——目录来自 `root_dirs`。若 `root_dirs` 没有对应项，初始化后该路径在树中不存在，但路径分类规则依然生效。
-- **保持对齐**：建议 `root_dirs` 含 `third-party` 且 `import_dir = "/third-party"`（引擎不强制）。二者脱节会导致「目录可见但按 MonoRepo 规则工作」或「按 ImportRepo 规则工作但布局中无对应目录」的混乱。修改 `import_dir` 属 `restart_required`，且只影响路径分类，不影响已生成的树。
+- **保持对齐**：建议 `root_dirs` 含 `third-party` 且 `import_dir = "/third-party"`（引擎不强制）。二者脱节会导致「目录可见但按 Monorepo 规则工作」或「按 ImportRepo 规则工作但布局中无对应目录」的混乱。修改 `import_dir` 属 `restart_required`，且只影响路径分类，不影响已生成的树。
 
 注意默认值差异：`config init` 生成的模板（`src/config/template.rs`）与 `MonoConfig::default`（`src/config/model.rs`）的 `root_dirs` 都不含 `artifact` / `data`（模板也不含 `model`）。如需本文建议的八目录布局，请在首次初始化前于 `config.toml` 显式设置 `root_dirs`；**实际布局以运行配置为准**。
 

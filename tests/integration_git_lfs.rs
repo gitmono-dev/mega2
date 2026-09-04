@@ -1,7 +1,7 @@
 // Process-level HTTP Git LFS round-trip integration test (GM-05).
 //
 // Starts a real `service http`, drives the pinned compose Git/Git LFS runner,
-// pushes an LFS-tracked binary into a MonoRepo CL ref, then performs a directed
+// pushes an LFS-tracked binary into a Monorepo CL ref, then performs a directed
 // fetch and explicit `git lfs pull` from a peer worktree.
 
 mod common;

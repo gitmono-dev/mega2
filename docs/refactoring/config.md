@@ -12,10 +12,10 @@ Configuration source diagnostics are available with `--show-sources`; use
 Secrets are supplied by deployment configuration or supported Vault
 `SecretRef`s and must never be committed.
 
-## MonoRepo initial object-ID format
+## Monorepo initial object-ID format
 
 `[monorepo].object_format` selects the object-ID algorithm used while an empty
-MonoRepo creates its initial commit, trees, and blobs. Its canonical values are
+Monorepo creates its initial commit, trees, and blobs. Its canonical values are
 `sha1` (the default) and `sha256`; the parser also accepts `sha-1` and
 `sha-256` for configuration compatibility. The setting is restart-required and
 does not convert an existing repository.

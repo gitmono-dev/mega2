@@ -1,4 +1,4 @@
-//! Push-chain state model for the MonoRepo receive-pack path.
+//! Push-chain state model for the Monorepo receive-pack path.
 //!
 //! Push semantics (base/tip/attribution) derive solely from
 //! `RefCommand.old_id/new_id` plus the unpacked tip commit's parent chain —
@@ -7,7 +7,7 @@
 //! [`PushChain::validate`] is the chain validator (plan-20260827 MC-03): the
 //! rejection surface for merge commits, broken topology, cycles, tip
 //! mismatch, and the increment/cumulative length bounds. MC-06 wires it into
-//! the receive-pack path: `MonoRepo::finalize_receive_pack` validates the
+//! the receive-pack path: `Monorepo::finalize_receive_pack` validates the
 //! primary branch command's chain before any ref/CL mutation, alongside the
 //! ADR-MC-04 multi-branch rejection.
 
@@ -326,7 +326,7 @@ impl PushChain {
     /// Validate the resolved chain against commit storage (plan-20260827
     /// MC-03). Every rejection path is fail-closed with an actionable
     /// message. Wired into the receive-pack path by MC-06:
-    /// `MonoRepo::finalize_receive_pack` runs it on the primary branch
+    /// `Monorepo::finalize_receive_pack` runs it on the primary branch
     /// command's chain before any ref/CL mutation.
     ///
     /// Two segments (ADR-MC-07), each checked exactly once (Codex R1 P1-3):
@@ -487,7 +487,7 @@ pub fn primary_branch_command(commands: &[RefCommand]) -> Option<RefCommand> {
 /// the push carries no branch command (tag-only) — the historical no-commit
 /// value.
 ///
-/// Safety: a MonoRepo branch push with objects always carries its commit in
+/// Safety: a Monorepo branch push with objects always carries its commit in
 /// the pack, and `PushChain::resolve` fail-closes when the ref update target
 /// is not among the pack's commits; delete-only pushes skip unpack entirely
 /// and empty packs have no entries, so neither reaches `save_entry`. A

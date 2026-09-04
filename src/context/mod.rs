@@ -54,7 +54,7 @@ pub struct AppContext {
     pub entity_store: Arc<SharedEntityStore>,
 }
 
-/// Initializes a MonoRepo without bringing up normal service dependencies.
+/// Initializes a Monorepo without bringing up normal service dependencies.
 ///
 /// Vault is opened read-only only when object-storage credentials are SecretRefs;
 /// Redis, notification workers, sidebars, and Git listeners are deliberately

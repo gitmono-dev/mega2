@@ -77,7 +77,7 @@ pub trait RepoHandler: Send + Sync + 'static {
     /// `new_id` to the authenticated user after a successful finalize
     /// (`commit_auths`; `SmartSession::process_commit_bindings`).
     ///
-    /// MonoRepo opts out (Codex R3 P1): its post-push pipeline already binds
+    /// Monorepo opts out (Codex R3 P1): its post-push pipeline already binds
     /// exactly the accepted chain's newly introduced commits
     /// (`ordered_commits ∩ new`), and an unconditional protocol-layer re-upsert
     /// of a possibly already-known tip would clobber existing bindings
@@ -223,9 +223,9 @@ pub trait RepoHandler: Send + Sync + 'static {
     ///
     /// Contract (Codex R1 P1-2): implementations must NOT write commit
     /// bindings (`commit_auths`) here — unpack runs before chain validation,
-    /// so binding here would let a rejected push upsert bindings. MonoRepo
+    /// so binding here would let a rejected push upsert bindings. Monorepo
     /// binds the accepted chain post-finalize in
-    /// `MonoRepo::run_mono_post_push_pipeline`.
+    /// `Monorepo::run_mono_post_push_pipeline`.
     async fn save_entry(
         &self,
         entry_list: Vec<MetaAttached<Entry, EntryMeta>>,

@@ -88,7 +88,7 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 - `integration_git_cli_rejects_main_branch_delete`：receive-pack 删除主干 ref 被拒绝，错误对 git 客户端可操作。
 - `integration_git_ssh_authz_grant_immediate_effect`：ACL 变更经 HTTP 腿的 merge 漏斗合入，SSH 腿在下一次 push 即刻生效——`service multi` 下两腿共享同一实例的直接证据。
 
-授权变更后再次 push 前必须先 `git fetch` 并从新的 `origin/main` 起分支：`MonoRepo::check_entry` 只接受每次 push 携带单个 commit，陈旧克隆会把父提交一并打包而被拒。
+授权变更后再次 push 前必须先 `git fetch` 并从新的 `origin/main` 起分支：`Monorepo::check_entry` 只接受每次 push 携带单个 commit，陈旧克隆会把父提交一并打包而被拒。
 
 写点 allowlist 守卫（`scripts/authz_write_points_guard.sh`）与其两个自测变异（`--selftest-add` / `--selftest-remove`）是三道独立门，任何未登记的主干 ref 写入口都会使守卫非零退出。
 

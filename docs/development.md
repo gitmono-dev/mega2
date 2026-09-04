@@ -5,7 +5,7 @@
 [`refactoring/test-infra.md`](./refactoring/test-infra.md)；提交前三门禁见
 [`AGENTS.md`](../AGENTS.md)。
 
-**MonoRepo 产品规则**（公开分支仅 `main`、禁止 Git 客户端操作 tag、初始化与目录结构）见集中文档
+**Monorepo 产品规则**（公开分支仅 `main`、禁止 Git 客户端操作 tag、初始化与目录结构）见集中文档
 [`monorepo.md`](./monorepo.md)。
 
 ## 推荐：用脚本代替手贴命令
