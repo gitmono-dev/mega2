@@ -19,7 +19,8 @@ docs/
 │   ├── notification.md       ← Notification 多渠道系统
 │   ├── website-auth.md      ← Website Better Auth 会话接入
 │   ├── website-mail.md      ← 产品邮件投递（website）
-│   └── orbit.md             ← Orbit 依赖重构（项目引用 → API 依赖）
+│   ├── orbit.md             ← Orbit 依赖重构（项目引用 → API 依赖）
+│   └── trunk-push.md        ← Trunk 直推形态与 Monorepo 写入序列化
 └── [文档范围外]
     └── protocol.md
 ```
@@ -34,6 +35,7 @@ docs/
 | **contract.md** | 边界归并 | API/Git/Vault/Policy 模块路径和边界约束 |
 | **config.md / vault.md / mail.md / notification.md** | 专项规划 | 各模块的现状分析、阶段规划、实施细节 |
 | **orbit.md** | 依赖治理 | 把对 orbit 实现 crate 的 path 引用重构为只依赖 orbit-api 契约 |
+| **trunk-push.md** | 写入路径与部署形态 | Monorepo 根树写入的序列化；`push_policy` 形态开关（`review` / `trunk`）；产品规则以 `../monorepo.md` 为准 |
 
 ## 所有文档的共同结构规范
 
@@ -512,6 +514,7 @@ docs/
 - **mail.md**：0, 1, 2, 3, 4, 5（共 6 个阶段，其中 0 和 1 已完成）
 - **notification.md**：0, 1, 2, 3, 4, 5（共 6 个阶段）
 - **orbit.md**：0, 1, 2, 3（共 4 个阶段，其中阶段 3 为决策门）
+- **trunk-push.md**：1, 2, 3, 4, 5, 6（共 6 个阶段，其中阶段 1-3 为独立可上线的缺陷修复，阶段 6 为可选优化）
 
 ### 优先级定义
 
@@ -523,9 +526,9 @@ docs/
 
 ## 最后一次更新
 
-- **日期**：2026-06-14（2026-06-19 增补 orbit.md 登记）
-- **内容**：首版发布，定义所有改进文档的共同治理规范；2026-06-19 新增 orbit.md（orbit 依赖重构）并登记到分层结构、角色定义与阶段编号约定
-- **适用文档**：README.md、config.md、vault.md、mail.md、notification.md、integration.md、orbit.md
+- **日期**：2026-09-04（历史：2026-06-14 首版；2026-06-19 增补 orbit.md 登记）
+- **内容**：首版发布，定义所有改进文档的共同治理规范；2026-06-19 新增 orbit.md（orbit 依赖重构）；2026-09-04 新增 trunk-push.md（Trunk 直推形态与 Monorepo 写入序列化），均已登记到分层结构、角色定义与阶段编号约定
+- **适用文档**：README.md、config.md、vault.md、mail.md、notification.md、integration.md、orbit.md、trunk-push.md
 
 ---
 

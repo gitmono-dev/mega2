@@ -88,8 +88,22 @@
 - **关键依赖**：Docker、Docker Compose、PostgreSQL、Redis；website 会话/邮件 IT 另需 `website-next`
 - **验收标准**：见 `integration.md` / `test-infra.md` 现行矩阵；不以本仓 SMTP 为门
 
+### 5a. **refactoring/trunk-push.md** — Trunk 直推形态与 Monorepo 写入序列化
+
+- **目标**：为「只用存储、不接入用户系统、不使用 Issue 与 Change List」的部署形态提供推送直接落入 `main` 的方案；并先行修复其所依赖的 Monorepo 根树写入路径缺陷
+- **核心内容**：
+  - `MonoWriteQueue`：根树写入的全局 FIFO 队列（顺序）+ 事务级 advisory lock（互斥）+ 根 ref CAS（正确性自检）
+  - `advance_descendant_refs`：后代 ref 由「删除后重新懒生成」改为「续接推进」，消除 `refusing to merge unrelated histories`
+  - Roll-up commit 的真实归属与 provenance trailer（取代硬编码 `mega <admin@mega.org>`）
+  - `push_policy = "review" | "trunk"` 形态开关；无用户系统的推送认证
+  - 决策记录 ADR-TP-01 – ADR-TP-19（另含 15a，共 20 条：队列约束 11 条、多 commit 推送与签名语义 8 条、一致性模型 1 条）
+  - 面向 Agent 的推送语义：N = 1 原样落地，N > 1 自动合并为一个进入 `main`，squash commit 的 message 完整列出全部被合并 commit
+- **关键前置**：阶段 1–3 是现有写入路径的缺陷修复，独立成立；阶段 4 依赖三者全部完成
+- **阶段范围**：1 - 6（共 6 个阶段，其中阶段 6 为可选优化）
+- **产品规则同步**：本文档定稿后再更新 [`../monorepo.md`](../monorepo.md) 的反向声明（不变式、双层历史、墓碑语义、索引最终一致性）
+
 ### 6. **其他文档**
-- **[`../monorepo.md`](../monorepo.md)**：MonoRepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化与目录结构）
+- **[`../monorepo.md`](../monorepo.md)**：Monorepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化与目录结构）
 - **website-auth.md** / **website-mail.md**：Website 会话与产品邮件契约（见 `plan-20260731.md`）
 - **protocol.md**：协议定义相关；分支/tag 产品规则以 `monorepo.md` 为准
 - 本仓 Campsite 风格 chat/Notes 产品面已退场；不再维护独立 chat 改进文档
@@ -317,6 +331,22 @@ SecretRef 消费者（第 3 轮，现行）
 
 ---
 
+### 第 8 阶段：Monorepo 写入序列化与 trunk 直推形态
+
+#### refactoring/trunk-push.md 阶段 1-3：写入路径缺陷修复 **[优先级：P1，独立于其他文档]**
+- **前置**：无（不依赖 config / vault / notification 主线）
+- **并行条件**：可与上述任何阶段并行
+- **完成后**：根树写入具备全序与原子性；已物化路径的历史只增不改；合成 commit 带真实归属
+
+#### refactoring/trunk-push.md 阶段 4-5：形态开关与推送认证 **[优先级：P2-P3]**
+- **前置**：阶段 1-3 全部完成；阶段 5 依赖 config 阶段 5 的 SecretRef
+- **完成后**：`push_policy = "trunk"` 部署形态可用
+
+#### refactoring/trunk-push.md 阶段 6：可选优化 **[优先级：P4]**
+- **前置**：需实测压力证据，否则不启动
+
+---
+
 ## 🔴 关键约束与必须完成的前置
 
 ### 必须先做（不能推迟）
@@ -355,20 +385,24 @@ SecretRef 消费者（第 3 轮，现行）
 ### P1 - 高优先级，紧随 P0
 1. config 阶段 1/2/3
 2. vault 阶段 B/C/D
+3. trunk-push 阶段 1/2/3（写入路径缺陷修复，独立于上述主线）
 
 ### P2 - 中等优先级，第一批功能完整
 1. config 阶段 4/5
 2. vault 阶段 E
 3. notification（website-mail 客户端 + in-app/Slack/webhook；**无本仓 mail 阶段**）
+4. trunk-push 阶段 4（`push_policy` 形态开关）
 
 ### P3 - 后续优化与扩展
 1. config 阶段 6
 2. notification 长期收尾（PT-09：webhook/slack/多实例等）
 3. vault 阶段 F-I
+4. trunk-push 阶段 5（无用户系统的推送认证）
 
 ### P4 - 长期、可选或低优先级
 1. config 阶段 7-8
 2. vault 阶段 G/J
+3. trunk-push 阶段 6（group commit、NOTIFY 唤醒、惰性后代推进）
 
 ---
 
@@ -383,6 +417,6 @@ SecretRef 消费者（第 3 轮，现行）
 
 ## 📝 最后一次更新
 
-- **日期**：2026-08-01（历史：2026-06-14 起稿；2026-06-19 orbit；2026-06-23 Scope 内交付 v0.1.49）
-- **更新内容**：DOC-01 收口——`mail.md` 标废止；执行顺序/依赖图去掉本仓 SMTP/`password_ref` 主线，改为 website-mail + 现行 SecretRef 消费者；integration 验收对齐 `test-infra.md`（mailpit = website IT）。
-- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md（废止）、refactoring/website-mail.md、refactoring/website-auth.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/test-infra.md、refactoring/contract.md
+- **日期**：2026-09-04（历史：2026-06-14 起稿；2026-06-19 orbit；2026-06-23 Scope 内交付 v0.1.49；2026-08-01 DOC-01 收口）
+- **更新内容**：新增 `trunk-push.md`（Trunk 直推形态与 Monorepo 写入序列化）并登记到文档概览（5a）、执行顺序（第 8 阶段）与优先级排序；该文档的阶段 1-3 属独立于 config/vault 主线的写入路径缺陷修复。历史：2026-08-01 DOC-01 收口——`mail.md` 标废止；执行顺序/依赖图去掉本仓 SMTP/`password_ref` 主线，改为 website-mail + 现行 SecretRef 消费者；integration 验收对齐 `test-infra.md`（mailpit = website IT）。
+- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md（废止）、refactoring/website-mail.md、refactoring/website-auth.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/test-infra.md、refactoring/contract.md、refactoring/trunk-push.md
