@@ -30,4 +30,4 @@
 | `plan-20260827.md` | 日期计划 | **新建**（CL 多 commit push 放开：push 侧链式校验 + 拒绝 merge commit + 修 ref 配对，trunk 侧 CL merge 永远单父新 commit 不动；MC-01..04；设计经 Codex/Claude 双评审有条件批准；下游 = monoui `docs/plan/plan-20260827.md`） |
 | `plan-20260901.md` | 日期计划 | **Claude Code Review PASS**（Mega `bb3ef17` FastCDC media transport，以及 receive-pack 状态安全、导入批处理、DB/Redis 并发和多实例 ID 改进；FC-01..14；R4 通过） |
 | `plan-20260903.md` | 日期计划 | 进行中：Monorepo 初始 object-ID 配置（SHA-1/SHA-256 bootstrap；BLAKE3 接口保留且 fail-closed）。端到端 SHA-256 / BLAKE3 Git 协议支持不在本切片。 |
-| `plan-20260905.md` | 日期计划 | **新建**（Trunk 直推形态 storage-only 与 Monorepo 写入序列化：`MonoWriteQueue` 全局序列化 + 后代 ref 续接 + 合成 commit provenance + `push_policy="trunk"` + 静态 token 认证；TP-01..21；设计事实源 = `docs/refactoring/trunk-push.md` ADR-TP-01..20） |
+| `plan-20260905.md` | 日期计划 | **新建**（Trunk 直推形态 storage-only 与 Monorepo 写入序列化：`MonoWriteQueue` 全局序列化 + 后代 ref 续接 + 合成 commit provenance + `push_policy="trunk"` + 静态 token 认证；TP-01..22；设计事实源 = `docs/refactoring/trunk-push.md` ADR-TP-01..20） |

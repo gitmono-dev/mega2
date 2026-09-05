@@ -10,7 +10,7 @@
 
 > **协议实现锚点**：**[`protocol.md`](./protocol.md)**（receive-pack 分层、pkt-line、认证上下文）。**权限模型**：Cedar 判定与 `contract::policy` 见 **[`contract.md`](./contract.md)**。
 
-> **集成测试指引**：验收路径落在 `bin/tests/integration_git_cli.rs` 与 `scripts/git_protocol_smoke.sh`，测试栈与矩阵见 **[`integration.md`](./integration.md)** / **[`test-infra.md`](./test-infra.md)**。
+> **集成测试指引**：验收路径落在 `tests/integration_git_cli.rs` 与 `scripts/git_protocol_smoke.sh`，测试栈与矩阵见 **[`integration.md`](./integration.md)** / **[`test-infra.md`](./test-infra.md)**。
 
 ## 需求前提（部署形态）
 
@@ -945,7 +945,7 @@ CAS 在本设计中的角色是**断言/tripwire**而非并发控制：队列成
 **1.7 控制面**
 
 沿用 `merge_queue_router` 的形状：队列查询（深度、head、running 项、各项 path/kind/requester/等待时长）、`pause` / `resume`（维护窗口，清 `paused`）、
-**存量端点的逐一映射（吸收后不得出现指向死状态的端点）**——`status`/`list`/`stats` → `push_queue` 等价查询（路径/响应形状保留，数据源换表）；`cancel` → 本节 `cancel`（仅 `Queued`）；`retry` → **重新入队并同步等待执行**（caller-owned 模型下重试者即执行者：以原行载荷新建行、幂等键不变，随后走 B2/B3 直至终态并返回真实结果——不允许「已接受未执行」的返回，那会制造无执行者的孤儿行）；`remove` → 废弃（410，登记迁移说明——队列行的删除破坏台账完整性，不留此口）；UN-25 freeze 的挂点随 B3 执行期重查迁移。每个端点配映射后行为一致的验收。
+**存量端点的逐一映射（吸收后不得出现指向死状态的端点）**——`status`/`list`/`stats` → `push_queue` 等价查询（路径/响应形状保留，数据源换表）；`cancel` → 本节 `cancel`（仅 `Queued`）；`retry` → **重新入队并同步等待执行**（caller-owned 模型下重试者即执行者：以原行载荷新建行、幂等键不变，随后走 B2/B3 直至终态并返回真实结果——不允许「已接受未执行」的返回，那会制造无执行者的孤儿行）；`remove` → 废弃（410，登记迁移说明——队列行的删除破坏台账完整性，不留此口）；`cancel-all` → **410 + 迁移说明**（批量取消破坏逐行台账与先到先得语义，逐项 `cancel` 保留）；UN-25 freeze 的挂点随 B3 执行期重查迁移。每个端点配映射后行为一致的验收。
 **`clear-hard-stop`**（独立运维操作，清 `hard_stopped` 并留审计日志——与维护性 resume 分离，防止把 bypass 硬停当维护窗口顺手清掉）、单项 `cancel`。**`cancel` 只允许作用于 `Queued` 行**（条件更新 `WHERE status='Queued'`，与认领竞争时先到先得、败者可见地失败）；`Running` 行不可 cancel——它已在临界区内执行，取消它会与 B3 的 `Done` 写入竞态并留下「数据已提交而行状态为 `Cancelled`」的矛盾；需要中断执行中轮次时走 `pause` + 等待排空或运维干预。指标：队列深度、等待时长 P50/P99、轮次时长 P50/P99（作为 `stuck_timeout` 告警阈值的标定依据）、失败率、**CAS 断言失败计数（应恒为 0）**、**fencing 弃权（ClaimLost）计数**（安全弃权，非零提示 reaper 与慢认领竞争，观测值）、**锁持续持有超过 `stuck_timeout` 的告警**。
 
 **1.8 与现有 merge queue 的关系**
@@ -1406,7 +1406,7 @@ paths = ["/project/foo"]       # 前缀授权；省略表示全库
 
 **范围**：基础静态 token 认证（配置、认证器、权限判定改造、双端点旁路、无 OAuth 启动）已于 **4.2a 随阶段 4 交付**，本阶段不重复列举；阶段 5 交付多 token 运维与强化。**认证身份与 provenance 分离**：`requester` 等一切认证判定只使用 **token 名**——commit 的 author/committer 字段是客户端可任意伪造的自声明元数据，不构成认证身份，只作为 provenance 记录保留（1.9 表的 push 行据此取值）。token 只回答「该客户端能否写这棵子树」；「这批工作是谁写的」由 commit 署名回答，二者不可混用。凭据经 SecretRef / 文件挂载注入，遵循 `config.md` 的既有机制，不在配置文件中内联明文。
 
-**现状认证链的改造点（事实校准 17，本阶段的代码交付物）**——静态 token 模型不是加一段配置就能生效，以下挂点必须逐一改造：
+**现状认证链的改造点（事实校准 17；改造已随 4.2a 于阶段 4 交付，本节保留为规格与验收依据）**——静态 token 模型不是加一段配置就能生效，以下挂点必须逐一改造：
 
 1. **HTTP 启动（两道门槛）与运行时形态**：`start_http()` 的 `require_oauth_for_http_service`（`http_server.rs:424-425`，实现在 `config/validate.rs:162-169`）与 `app()` 内的 OAuth 取用（`http_server.rs:627-634`，含无条件构造的 `WebsiteSessionStore`，`:627-650`）都无条件要求 OAuth 配置。`push_auth` 配置存在时两条路径都改为条件化——storage-only 部署采用**协议专用 router 集**（git 协议路由 + 只读 API 子集），不注册 OAuth 依赖的 Web API 路由（`/auth/*`、website 会话路由等）；会话存储以**匿名/no-op 实现**替代 `WebsiteSessionStore`（`BrowserSessionStore` 现仅有 Website 变体，`api/oauth/api_store.rs:4-14`，需补 no-op 变体）。配启动测试（无 OAuth + 有 push_auth 配置 → 启动成功）。
 2. **git HTTP 认证**：`git_http_auth`（`git_protocol/http.rs:105-149`）经 `login_user_from_mono_access_token` 走 `UserStorage`。`push_auth = "token"` 时替换为静态 token 查找：对 `[[git.push_tokens]]` 表做常量时间比对，命中后 `set_authenticated_user(token.name)`。
@@ -1546,11 +1546,11 @@ Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写
 
 ## 最后一次更新
 
-- **日期**：2026-09-04
+- **日期**：2026-09-05
 - **内容**：首版发布。定义 trunk 直推形态（storage-only）与 Monorepo 根树写入序列化方案；登记 14 条事实校准、9 条硬约束、20 条决策记录（ADR-TP-01 – ADR-TP-19，另含 ADR-TP-15a；队列约束 11 条、多 commit 推送与签名语义 8 条、一致性模型 1 条）、6 个阶段与 7 条不变式。已登记到 `README.md`（文档概览 5a、执行顺序第 8 阶段、优先级排序）与 `general.md`（分层结构、角色定义、阶段编号约定）。`../monorepo.md` 的反向声明待本文档定稿后同步。
   - 首版计数随修订更新（以修订 39 后的正文为准）：事实校准 **17** 条、决策记录 **21** 条（ADR-TP-01 – ADR-TP-20，另含 ADR-TP-15a）、不变式 **7** 条（I1–I6 含 I2a）、阶段 1 交付物 **10** 项。
 - **同日修订 1**：需求前提补入 **Agent 使用场景**（每 commit 一推，N = 1 为常态）；推送落地规则由「被推路径全量保留」改为**按 N 分流**——N = 1 原样落地，N > 1 在被推路径自动合并为一个（ADR-TP-12 重写）。连带修订：硬约束 5 与新增 5a、写入模型表、不变式 I2 改为内容保真并新增 I2a 步长一致、新增 ADR-TP-18（N > 1 后的客户端对齐约定）、阶段 1 B3 伪代码与阶段 3/4 验收标准。
-- **同日修订 65（Claude 第三轮评审后，PASS）**：C-R5 评审 5 条 MINOR + 2 条 SUGGESTION 全部落实。
+- **同日修订 66（对齐修订）**：阶段 5 的「现状认证链改造点」标题更正——改造已随 4.2a 于阶段 4 交付，本节保留为规格与验收依据（消除「本阶段的代码交付物」与 4.2a 的表述矛盾）。：C-R5 评审 5 条 MINOR + 2 条 SUGGESTION 全部落实。
   - **I5 第三类覆盖（Claude C-R5 #1，MINOR）**：bootstrap（服务前 + 专属锁）补入 I5 三分法，与硬约束 2 清单对应。
   - **空 refs 禁令的范围（Claude C-R5 #2，MINOR）**：限定于「放弃插入被伪装成空仓库」；路径不在根树时的 `(ZERO_ID, 空 refs)` 是 2.5 要求的正确答案。
   - **review 索引行为变化登记（Claude C-R5 #3，MINOR）**：隔离规则对 review 形态是登记在案的索引行为变化（不在写入判定链）。
