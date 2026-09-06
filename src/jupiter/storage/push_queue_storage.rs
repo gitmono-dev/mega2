@@ -15,6 +15,10 @@ use crate::{
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
 
+/// MonoWriteQueue B3 serialization lock (trunk-push ADR-TP-03).
+/// Distinct from monorepo initialization advisory lock keys.
+pub const MONO_WRITE_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1297043024, 1229867349)";
+
 /// Result of the B1 conditional INSERT (or its zero-row classification).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueOutcome {
@@ -568,6 +572,251 @@ impl PushQueueStorage {
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    /// Acquire MonoWriteQueue B3 advisory lock inside an open transaction.
+    pub async fn acquire_mono_write_lock(txn: &DatabaseTransaction) -> Result<(), MegaError> {
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            MONO_WRITE_LOCK_SQL.to_owned(),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Whether `queue_control.hard_stopped` is set (plain SELECT, no lock).
+    pub async fn is_hard_stopped_in_txn(txn: &DatabaseTransaction) -> Result<bool, MegaError> {
+        let ctrl = queue_control::Entity::find_by_id(1)
+            .one(txn)
+            .await?
+            .ok_or_else(|| MegaError::Other("queue_control row missing".into()))?;
+        Ok(ctrl.hard_stopped)
+    }
+
+    /// Reset a Running row back to Queued (hard-stop abandon; independent txn).
+    pub async fn reset_running_to_queued(&self, id: i64) -> Result<bool, MegaError> {
+        let conn = self.get_connection();
+        let result = conn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Queued'::push_queue_status_enum,
+                       started_at = NULL,
+                       expected_commit_hash = NULL,
+                       expected_tree_hash = NULL,
+                       pending_action = NULL,
+                       heartbeat_at = now(),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Running'::push_queue_status_enum
+                "#,
+                [Value::from(id)],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Persist `requeue_conflict` intent (B4 phase 1; independent short txn).
+    pub async fn persist_requeue_conflict_intent(&self, id: i64) -> Result<bool, MegaError> {
+        let conn = self.get_connection();
+        let result = conn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET pending_action = 'requeue_conflict'::push_queue_pending_enum,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Running'::push_queue_status_enum
+                "#,
+                [Value::from(id)],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Mark Done when still Running (returns whether the row was updated).
+    pub async fn mark_done_if_running_in_txn(
+        txn: &DatabaseTransaction,
+        id: i64,
+        landed_commit_id: &str,
+    ) -> Result<bool, MegaError> {
+        let result = txn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Done'::push_queue_status_enum,
+                       landed_commit_id = $2,
+                       finished_at = now(),
+                       pending_action = NULL,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Running'::push_queue_status_enum
+                "#,
+                [Value::from(id), Value::from(landed_commit_id.to_owned())],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Mark Failed when still Running (returns whether the row was updated).
+    pub async fn mark_failed_if_running_in_txn(
+        txn: &DatabaseTransaction,
+        id: i64,
+        failure: &str,
+        message: &str,
+    ) -> Result<bool, MegaError> {
+        let result = txn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Failed'::push_queue_status_enum,
+                       failure_type = $2::push_queue_failure_enum,
+                       error_message = $3,
+                       finished_at = now(),
+                       pending_action = NULL,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Running'::push_queue_status_enum
+                "#,
+                [
+                    Value::from(id),
+                    Value::from(failure.to_owned()),
+                    Value::from(message.to_owned()),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Set hard_stopped inside an open transaction.
+    pub async fn set_hard_stopped_in_txn(
+        txn: &DatabaseTransaction,
+        hard_stopped: bool,
+    ) -> Result<(), MegaError> {
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE queue_control SET hard_stopped = $1, updated_at = now() WHERE id = 1",
+            [Value::from(hard_stopped)],
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn notify_mono_write_queue(txn: &DatabaseTransaction) -> Result<(), MegaError> {
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "NOTIFY mono_write_queue".to_owned(),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Establish a SAVEPOINT for B3 kind / B4 business writes (trunk-push B3/B4).
+    /// `name` must be a fixed identifier (letters/digits/underscore only).
+    pub async fn savepoint(txn: &DatabaseTransaction, name: &'static str) -> Result<(), MegaError> {
+        debug_assert!(
+            name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "savepoint name must be a static SQL identifier"
+        );
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!("SAVEPOINT {name}"),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Roll business writes back to a SAVEPOINT; keeps the outer txn + advisory lock.
+    pub async fn rollback_to_savepoint(
+        txn: &DatabaseTransaction,
+        name: &'static str,
+    ) -> Result<(), MegaError> {
+        debug_assert!(
+            name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "savepoint name must be a static SQL identifier"
+        );
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!("ROLLBACK TO SAVEPOINT {name}"),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Complete conflict requeue under admission lock (B4 phase 2).
+    /// Returns the successor id.
+    pub async fn complete_conflict_requeue_in_txn(
+        txn: &DatabaseTransaction,
+        old: &push_queue::Model,
+    ) -> Result<i64, MegaError> {
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT id FROM queue_control WHERE id = 1 FOR UPDATE".to_owned(),
+        ))
+        .await?;
+
+        let cancelled = txn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Cancelled'::push_queue_status_enum,
+                       failure_type = 'Conflict'::push_queue_failure_enum,
+                       finished_at = now(),
+                       pending_action = NULL,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Running'::push_queue_status_enum
+                   AND pending_action = 'requeue_conflict'::push_queue_pending_enum
+                "#,
+                [Value::from(old.id)],
+            ))
+            .await?;
+        if cancelled.rows_affected() == 0 {
+            return Err(MegaError::Other(
+                "conflict requeue: old row not Running with requeue_conflict intent".into(),
+            ));
+        }
+
+        let successor = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                INSERT INTO push_queue (
+                    kind, operation_id, path, old_id, new_id,
+                    requester, payload, status, heartbeat_at
+                ) VALUES (
+                    $1::push_queue_kind_enum, $2, $3, $4, $5, $6, $7::jsonb,
+                    'Queued'::push_queue_status_enum, now()
+                )
+                RETURNING id
+                "#,
+                [
+                    Value::from(kind_to_db(&old.kind)),
+                    Value::from(old.operation_id.clone()),
+                    Value::from(old.path.clone()),
+                    Value::from(old.old_id.clone()),
+                    Value::from(old.new_id.clone()),
+                    Value::from(old.requester.clone()),
+                    Value::from(old.payload.to_string()),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| MegaError::Other("conflict requeue INSERT returned no id".into()))?;
+        let successor_id: i64 = successor.try_get("", "id")?;
+
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE push_queue SET superseded_by = $2, updated_at = now() WHERE id = $1",
+            [Value::from(old.id), Value::from(successor_id)],
+        ))
+        .await?;
+
+        Ok(successor_id)
     }
 
     /// Test helper: force a row into Done with a landed tip (for replay tests).

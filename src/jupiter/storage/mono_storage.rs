@@ -581,6 +581,48 @@ impl MonoStorage {
         Ok(())
     }
 
+    /// Dual-condition CAS on the root `main` ref (path=`/`).
+    ///
+    /// Used by MonoWriteQueue B3 as the tripwire root write (including net-zero
+    /// same-value updates). Returns `Ok(true)` when exactly one row was updated,
+    /// `Ok(false)` on a CAS miss (bypass / concurrent writer).
+    pub async fn cas_update_root_main_ref_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        expected_commit_hash: Option<&str>,
+        expected_tree_hash: Option<&str>,
+        new_commit_hash: &str,
+        new_tree_hash: &str,
+    ) -> Result<bool, MegaError> {
+        let now = chrono::Utc::now().naive_utc();
+        // NULL-safe expected match via IS NOT DISTINCT FROM semantics:
+        // missing root is represented by expected_* = None.
+        let rows = txn
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                UPDATE mega_refs
+                   SET ref_commit_hash = $1,
+                       ref_tree_hash = $2,
+                       updated_at = $3
+                 WHERE path = '/'
+                   AND ref_name = $4
+                   AND ref_commit_hash IS NOT DISTINCT FROM $5
+                   AND ref_tree_hash IS NOT DISTINCT FROM $6
+                "#,
+                [
+                    sea_orm::Value::from(new_commit_hash.to_owned()),
+                    sea_orm::Value::from(new_tree_hash.to_owned()),
+                    sea_orm::Value::from(now),
+                    sea_orm::Value::from(MEGA_BRANCH_NAME.to_owned()),
+                    sea_orm::Value::from(expected_commit_hash.map(str::to_owned)),
+                    sea_orm::Value::from(expected_tree_hash.map(str::to_owned)),
+                ],
+            ))
+            .await?;
+        Ok(rows.rows_affected() == 1)
+    }
+
     pub async fn mega_head_hash_with_txn(
         &self,
         mega_refs: mega_refs::Model,
@@ -1058,6 +1100,44 @@ mod tests {
 
         assert_eq!(after_concurrent.ref_commit_hash, after_txn.ref_commit_hash);
         assert_eq!(after_concurrent.ref_tree_hash, after_txn.ref_tree_hash);
+    }
+
+    #[tokio::test]
+    async fn cas_update_root_main_ref_net_zero_and_miss() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let root = seed_root_ref(&mono).await;
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        let ok = mono
+            .cas_update_root_main_ref_in_txn(
+                &txn,
+                Some(&root.ref_commit_hash),
+                Some(&root.ref_tree_hash),
+                &root.ref_commit_hash,
+                &root.ref_tree_hash,
+            )
+            .await
+            .unwrap();
+        assert!(ok, "net-zero same-value CAS must write exactly once");
+        let miss = mono
+            .cas_update_root_main_ref_in_txn(
+                &txn,
+                Some(&"9".repeat(40)),
+                Some(&root.ref_tree_hash),
+                &"e".repeat(40),
+                &"f".repeat(40),
+            )
+            .await
+            .unwrap();
+        assert!(!miss, "CAS miss must return false without a second write");
+        txn.commit().await.unwrap();
+
+        let after = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(after.ref_commit_hash, root.ref_commit_hash);
+        assert_eq!(after.ref_tree_hash, root.ref_tree_hash);
     }
 
     #[tokio::test]

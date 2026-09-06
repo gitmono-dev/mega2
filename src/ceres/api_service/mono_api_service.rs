@@ -7093,4 +7093,56 @@ mod mc09_tests {
             "session status unchanged"
         );
     }
+
+    /// TP-04: root CAS tripwire is the sole root write at the storage boundary
+    /// that future MonoWriteQueue writers (merge/attach/push) will call through.
+    #[tokio::test]
+    async fn root_cas_update_is_exactly_one_write_per_success() {
+        use sea_orm::TransactionTrait;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let root = mega_refs::Model::new(
+            "/",
+            MEGA_BRANCH_NAME.to_owned(),
+            "a".repeat(40),
+            "b".repeat(40),
+            false,
+        );
+        mono.save_refs(root.clone(), None).await.unwrap();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        let first = mono
+            .cas_update_root_main_ref_in_txn(
+                &txn,
+                Some(&root.ref_commit_hash),
+                Some(&root.ref_tree_hash),
+                &"c".repeat(40),
+                &"d".repeat(40),
+            )
+            .await
+            .unwrap();
+        assert!(first, "successful CAS must affect exactly one root row");
+        let second = mono
+            .cas_update_root_main_ref_in_txn(
+                &txn,
+                Some(&root.ref_commit_hash),
+                Some(&root.ref_tree_hash),
+                &"e".repeat(40),
+                &"f".repeat(40),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !second,
+            "stale expected_* must miss — no second root write in the same success round"
+        );
+        txn.commit().await.unwrap();
+
+        let after = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(after.ref_commit_hash, "c".repeat(40));
+        assert_eq!(after.ref_tree_hash, "d".repeat(40));
+    }
 }
