@@ -1464,6 +1464,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "root_dirs",
             "object_format",
             "rename",
+            "push_policy",
         ]),
         "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
         "build" => Some(&[
@@ -2935,6 +2936,28 @@ mod tests {
         let value = toml::from_str::<Value>(&rendered).unwrap();
 
         assert!(known_unconsumed_fields(&value).is_empty());
+    }
+
+    #[test]
+    fn reject_unknown_fields_accepts_monorepo_push_policy() {
+        let value = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+            [database]
+            db_url = "postgres://localhost:5432/mono"
+            [monorepo]
+            import_dir = "/third-party"
+            admin = ["admin"]
+            root_dirs = ["project"]
+            push_policy = "trunk"
+            [sidebar]
+            default_items = [
+                { public_id = "home", label = "Home", href = "/posts", order_index = 0 },
+            ]
+            "#,
+        )
+        .unwrap();
+        assert!(reject_unknown_fields(&value).is_ok());
     }
 
     #[test]

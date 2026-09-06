@@ -137,6 +137,17 @@ impl MonoObjectFormat {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PushPolicy {
+    /// Review morphology: push does not enter MonoWriteQueue (CL pipeline).
+    #[default]
+    Review,
+    /// Trunk morphology: push enters MonoWriteQueue (test switch in TP-03;
+    /// full protocol wiring is later cards).
+    Trunk,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MonoConfig {
     pub import_dir: PathBuf,
@@ -146,6 +157,11 @@ pub struct MonoConfig {
     pub object_format: MonoObjectFormat,
     #[serde(default)]
     pub rename: RenameConfig,
+    /// Runtime push morphology. Default `review` keeps existing CL semantics
+    /// (hard constraint 8). TP-03 reads this as the test-only trunk switch;
+    /// full fail-closed startup validation lands in TP-15.
+    #[serde(default)]
+    pub push_policy: PushPolicy,
 }
 
 impl Default for MonoConfig {
@@ -162,6 +178,7 @@ impl Default for MonoConfig {
             ],
             object_format: MonoObjectFormat::default(),
             rename: RenameConfig::default(),
+            push_policy: PushPolicy::default(),
         }
     }
 }

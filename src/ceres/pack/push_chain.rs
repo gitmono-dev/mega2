@@ -1550,4 +1550,38 @@ mod tests {
             "{msg}"
         );
     }
+
+    /// TP-03 Verification: operation_id fingerprint semantics (trunk-push §1.11).
+    #[test]
+    fn tp03_operation_id_fingerprints_match_section_1_11() {
+        use crate::jupiter::service::push_queue_service::{
+            attach_operation_id, merge_operation_id, push_operation_id,
+        };
+
+        // Same tip, different baselines → distinct push ops (A→C ≠ B→C).
+        assert_ne!(
+            push_operation_id(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cccccccccccccccccccccccccccccccccccccccc"
+            ),
+            push_operation_id(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "cccccccccccccccccccccccccccccccccccccccc"
+            ),
+        );
+        assert!(
+            push_operation_id("a", "c").contains('→'),
+            "push fingerprint uses U+2192 arrow"
+        );
+        // Different CLs sharing to_hash must not collide (merge = cl.link).
+        assert_ne!(merge_operation_id("CL-1"), merge_operation_id("CL-2"));
+        assert_eq!(merge_operation_id("CL-1"), "CL-1");
+        // Attach is content-addressed and stable.
+        let a = attach_operation_id("repo-1", "refs/heads/main:aaa");
+        let b = attach_operation_id("repo-1", "refs/heads/main:aaa");
+        let c = attach_operation_id("repo-1", "refs/heads/main:bbb");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 64);
+    }
 }

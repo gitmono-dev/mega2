@@ -720,6 +720,9 @@ fn collect_monorepo_restart_fields(
             .restart_required_fields
             .push("monorepo.rename.rename_limit");
     }
+    if current.monorepo.push_policy != candidate.monorepo.push_policy {
+        report.restart_required_fields.push("monorepo.push_policy");
+    }
 }
 
 fn collect_pack_restart_fields(
@@ -1042,6 +1045,7 @@ mod tests {
         let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
         candidate.monorepo.root_dirs = vec!["changed-root".to_string()];
         candidate.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
+        candidate.monorepo.push_policy = crate::config::PushPolicy::Trunk;
         candidate.pack.channel_message_size = 2_000_000;
         candidate.lfs.local.lfs_file_path = temp_dir.path().join("candidate-lfs");
         candidate.blame.enable_caching = false;
@@ -1066,6 +1070,7 @@ mod tests {
             vec![
                 "monorepo.root_dirs",
                 "monorepo.object_format",
+                "monorepo.push_policy",
                 "pack.channel_message_size",
                 "lfs.local.lfs_file_path",
                 "blame.enable_caching",
@@ -1084,6 +1089,10 @@ mod tests {
         assert_eq!(
             snapshot.monorepo.object_format,
             crate::config::MonoObjectFormat::Sha1
+        );
+        assert_eq!(
+            snapshot.monorepo.push_policy,
+            crate::config::PushPolicy::Review
         );
         assert!(snapshot.orion_server.is_none());
         assert_ne!(snapshot.sidebar.default_items[0].label, "Changed");

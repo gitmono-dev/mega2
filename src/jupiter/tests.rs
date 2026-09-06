@@ -22,7 +22,7 @@ use crate::{
             cla_service::ClaService, code_review_service::CodeReviewService,
             git_service::GitService, import_service::ImportService, lfs_service::LfsService,
             merge_queue_service::MergeQueueService, mono_service::MonoService,
-            webhook_service::WebhookService,
+            push_queue_service::PushQueueService, webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -48,6 +48,7 @@ use crate::{
             mono_storage::MonoStorage,
             notification_storage::NotificationStorage,
             object_storage::mock_object_storage,
+            push_queue_storage::PushQueueStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
@@ -182,6 +183,7 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         commit_binding_storage: CommitBindingStorage { base: base.clone() },
         reviewer_storage: ClReviewerStorage { base: base.clone() },
         merge_queue_storage: MergeQueueStorage::new(base.clone()),
+        push_queue_storage: PushQueueStorage::new(base.clone()),
         buck_storage: BuckStorage { base: base.clone() },
         dynamic_sidebar_storage: DynamicSidebarStorage { base: base.clone() },
         code_review_comment_storage: CodeReviewCommentStorage { base: base.clone() },
@@ -205,6 +207,10 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         // rest of this storage — `mock()` hands out a disconnected connection,
         // so any test driving the queue chain would panic on first use.
         merge_queue_service: MergeQueueService::new(base.clone()),
+        push_queue_service: PushQueueService::new(
+            base.clone(),
+            config.monorepo.push_policy.clone(),
+        ),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
         config_handle: ConfigHandle::from_arc(config.clone()),

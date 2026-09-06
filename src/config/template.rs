@@ -46,6 +46,9 @@ root_dirs = ["third-party", "project", "doc", "release", "toolchains"]
 # the Git protocol and pack paths carry an explicit repository hash context.
 # Do not use SHA-256 for a normal Git service; run `service init --yes` only.
 object_format = "sha1"
+# Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
+# Restart-required; full startup fail-closed checks land in TP-15.
+# push_policy = "review"
 
 [monorepo.rename]
 similarity_threshold = 50
