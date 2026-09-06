@@ -30,7 +30,7 @@
 
 > 本仓代码中不存在虚拟文件系统客户端的引用，上述挂载消费方属于部署前提，不是本仓的代码事实。
 
-## 事实校准（2026-09-04）
+## 事实校准（2026-09-04；条目 18 于 2026-09-06 追加）
 
 > 本文档中的代码引用已对照当前 `src/` 逐条核对。
 
@@ -76,6 +76,13 @@
 
 17. **无用户系统的静态 token 认证需要改造现有认证链**。HTTP 启动有**两道** OAuth 门槛：`start_http()` 经 `require_oauth_for_http_service`（`src/server/http_server.rs:424-425`，实现在 `src/config/validate.rs:162-169`）在进入 `app()` 之前校验；`app()` 自身再取一次 OAuth 配置（`http_server.rs:627-634`）。git HTTP 的 token 认证经 `login_user_from_mono_access_token` 走 `UserStorage`（`src/contract/git_protocol/http.rs:105-149`）；`check_push_permission`（`src/contract/git_protocol/mod.rs:43-62`）**在 `cedar.enforcement = off` 时仍要求非空 username** 才放行；SSH 路径要求已认证用户（`src/contract/git_protocol/ssh.rs:135-157`）。阶段 5 的静态 token 模型必须逐一改造这些挂点（含两道启动门槛），不能只加配置项。
 
+18. **阶段 1.1 写入者审计（TP-23，2026-09-06）已完成并机器可核对**。穷举 `rg -n "save_refs|update_ref|mega_head_hash_with_txn|batch_update" src/` 全部命中，并对 `mega_refs` 直接写原语做超集核对后，按硬约束 2 三分法 + 范围外登记：
+   - **queue-serial（改写根树）**：CL merge `merge_cl_unchecked`→`apply_update_result`→`batch_update_by_path_concurrent`（`mono_api_service.rs:2582/2614/2651/2694`）；含分支命令的 ImportRepo attach（`import_repo.rs:450`→`:577`→`mono_storage.rs:453`）；trunk 推送落地为 planned（阶段 4，现状无代码路径）。附属：`remove_none_cl_refs`（`:2619`）。
+   - **adr-tp-20（写路径 `main`）**：`Monorepo::refs_with_head_hash`（`monorepo.rs:121`，经 `:140` `get_all_refs("/", true)`）与 `create_repo_commit`（`code_edit/utils.rs:362/377`）。二者按根上**全部** `is_cl=false` 行（含 tags）复制到路径——路径 `main` 属 ADR-TP-20；路径 tag 复制为范围外副作用（审计清单 W-OOS-09）。
+   - **bootstrap-lock**：`initialize_monorepo`（`mono_service.rs:103`）在 `:105` 持 `acquire_monorepo_initialization_lock`（`:63-70`）；根身份由 `converter.rs:727-746` 构造（`path="/"` + `MEGA_BRANCH_NAME`），经 `:126` ActiveModel insert 落库——**不经** `save_refs`。常态服务路径：`commands/service/mod.rs:51` → `context/mod.rs:281` → 再绑 HTTP/SSH（`multi.rs:53-60`）；one-shot `service init` 走 `bootstrap_monorepo`（`commands/service/init.rs:19-22`）后退出、不接流。
+   - **范围外**：CL ref（`on_edit.rs:47`、`monorepo.rs:913-971`、`mono_api_service.rs:3392/3446`、**Buck** `buck_service.rs:928-938`→`save_or_update_cl_ref_in_txn`）、tag 创建/删除（`:1927/1978`、`:1356/1373`）、惰性物化/merge 清理的路径 tag 副作用、纯删除 attach、`git_db` 自身 refs。`remove_none_cl_refs`（`mono_storage.rs:78-84`，调用于 `mono_api_service.rs:2619`）在 `apply_update_result` **之后另连接**删除全部非 CL 后代（含路径 tags）——**非同事务**，崩溃可留下根已前进而路径行陈旧。
+   - **结论**：无清单外生产 `main`/根树写入者；完整条目见 [`trunk-push-writers-audit.md`](./trunk-push-writers-audit.md)。硬约束 2 清单与本条一致，无需升级修订。
+
 ## 当前实现状态速览表
 
 | 能力 / 组件 | 实现状态 | 关键事实与风险 |
@@ -97,14 +104,14 @@
 
 1. **每一次落地（trunk 推送、CL merge、ImportRepo attach）都必然改写根树，因此写入序列化是语义必然，不是性能取舍**。子路径的改动要出现在根树中，必须重算从该路径到 `/` 的整条树脊并推进 `/` 的 `main`（review 形态的推送只写 `refs/cl/*`，不落地，见硬约束 2）。所有推送在 `/` 上的冲突率是 100%，乐观并发（CAS + 重试）在此负载上退化为忙等。唯一的例外是净零变更推送（ADR-TP-16）：根树内容不变，根与祖先不前进，被推路径仍需记录历史——该例外由显式判定产生，不是对序列化的豁免。违反后果：并发推送互相覆盖根树，路径 ref 与根树给出两个互相矛盾的视图，且无报错。
 
-2. **队列的闸门粒度是「根树与路径 ref 的全部写入者」，不是「推送」**。已知写入者按类划分：
-   - **改写根树的**：CL merge `merge_cl_unchecked`（`mono_api_service.rs:2614`）及其余 `apply_update_result` 调用方（定义于 `mono_api_service.rs:2651`，生产调用方 `:2614`）、**含分支命令的** ImportRepo attach（`import_repo.rs:513`；纯删除式 attach——无非零分支命令时只删 ImportRepo 自身 refs 即返回，`import_repo.rs:450-475`，不触碰根树——**不入队**，登记为范围外）、trunk 形态下的推送落地（阶段 4 引入）。review 形态下的推送**不在其中**——`finalize_receive_pack`（`monorepo.rs:205`）在 review 形态只写 `refs/cl/*` 行，不触碰根树与 `main` 行。
-   - **写路径 ref 的**：两条惰性物化路径（事实校准 15）——advertise/clone 上的 `refs_with_head_hash`（`monorepo.rs:121`）与 code_edit 的 `create_repo_commit`（`utils.rs:362-442`）。它们不改写根树，但写入的 ref 派生自根树快照，必须由 ADR-TP-20 的机制覆盖。
-   - **队列外的**：bootstrap 初始化 `initialize_monorepo`（`mono_service.rs:104`）持有专属 advisory lock，发生在服务开始接流之前，登记在审计清单中但不入队。
+2. **队列的闸门粒度是「根树与路径 ref 的全部写入者」，不是「推送」**。已知写入者按类划分（与事实校准 18 / [`trunk-push-writers-audit.md`](./trunk-push-writers-audit.md) 对齐；锚点 2026-09-06 刷新）：
+   - **改写根树的**：CL merge `merge_cl_unchecked`（`mono_api_service.rs:2582`，经 `:2614` 调 `apply_update_result`；定义于 `:2651`，生产调用方仅此）→`batch_update_by_path_concurrent`（`:2694`）、**含分支命令的** ImportRepo attach（`import_repo.rs:450`→`:577`→`mono_storage.rs:453`；纯删除式 attach——无非零分支命令时只删 ImportRepo 自身 refs 即返回，`import_repo.rs:450-475`，不触碰根树——**不入队**，登记为范围外）、trunk 形态下的推送落地（阶段 4 引入）。review 形态下的推送**不在其中**——`finalize_receive_pack`（`monorepo.rs:205`）在 review 形态只写 `refs/cl/*` 行，不触碰根树与 `main` 行。
+   - **写路径 ref 的**：两条惰性物化路径（事实校准 15）——advertise/clone 上的 `refs_with_head_hash`（`monorepo.rs:121`）与 code_edit 的 `create_repo_commit`（`utils.rs:362-442`）。它们不改写根树，但写入的 ref 派生自根树快照，必须由 ADR-TP-20 的机制覆盖。实现上对根 `get_all_refs("/", true)` 的**全部**非 CL 行（含 tags）做路径复制——I3 相关的是路径 `main`；路径 tag 复制登记为范围外副作用（事实校准 18 / 审计清单 W-OOS-09）。
+   - **队列外的**：bootstrap 初始化 `initialize_monorepo`（`mono_service.rs:103`）于 `:105` 持有专属 advisory lock（`acquire_monorepo_initialization_lock`，`:63-70`）；根身份由 `converter.rs:727-746` 构造，经 `converter.refs.insert`（`:126`）写根 `main`。常态服务在接流前完成（`commands/service/mod.rs:51` → `context/mod.rs:281` → `multi.rs:53-60`）；one-shot `service init` 走 `bootstrap_monorepo`（`commands/service/init.rs:19-22`）后退出。登记在审计清单中但不入队。
    
    违反后果：漏掉任一写入者，序列化形同虚设，且缺陷会以「视图不一致」的形式静默出现。
 
-   **审计范围限定**：本约束与 1.1 的清单只覆盖 `refs/heads/main` 行的写入者——它们是根树的派生视图，参与写入判定链（I3）。`mega_refs` 还承载另外两类行的写入者：CL ref 行（如 `code_edit/on_edit.rs:47`）与 tag ref 行（`mono_api_service.rs:1927-1978`）——它们不是根树的派生视图、不参与任何写入判定：CL ref 行的一致性由 CL 管线自身的门控（`ClSyncChecker` 等）负责；tag ref 行由 tag API（`mono_api_service.rs:1927-1978`）独立管理，与 `ClSyncChecker` 无关——两者都**不在本队列的覆盖范围**，审计清单中登记为「范围外」以免混淆。
+   **审计范围限定**：本约束与 1.1 的清单**主范围**覆盖 `refs/heads/main` 行的写入者——它们是根树的派生视图，参与写入判定链（I3）。`mega_refs` 还承载另外两类行的写入者：CL ref 行（如 `code_edit/on_edit.rs:47`）与 tag ref 行（`mono_api_service.rs:1927-1978`）——它们不是根树的派生视图、不参与任何写入判定：CL ref 行的一致性由 CL 管线自身的门控（`ClSyncChecker` 等）负责；**显式 tag API**（创建/删除，`mono_api_service.rs:1927-1978` / `:1356/1373`）独立管理根路径 tags，与 `ClSyncChecker` 无关——两者都**不在本队列的覆盖范围**，审计清单中登记为「范围外」以免混淆。**例外须同时登记**：惰性物化（`get_all_refs("/", true)`）会把根上非 CL 行（含 tags）复制到路径，merge 的 `remove_none_cl_refs` 会非同事务地删除路径上全部非 CL 后代（含 tags）——这些是真实生产副作用（审计清单 W-OOS-09/09a），不得因「tag API 独立」措辞而被后续队列改造省略。
 
 3. **子路径推送必然在祖先方向产生合成 commit**。路径 `P` 处 commit 的 tree 是 `P` 的子树，根 commit 的 tree 是根树；二者形状不同，客户端 commit 在物理上无法直接作为根 commit。「N 个 commit 在 trunk 上合并成 1 个」是这一事实的推论，不是产品选择。
 
@@ -349,6 +356,8 @@
 **1.1 写入者审计（交付物）**
 
 穷举并登记全部根树与路径 ref 的写入者，形成清单并在代码中以统一入口收敛。已知写入者按硬约束 2 的三类划分登记；其中惰性物化两条路径（事实校准 15）标注为「队列外、ADR-TP-20 覆盖」，bootstrap（事实校准 15/硬约束 2）标注为「服务前、专属锁」。审计结论必须写回本文档的事实校准部分。
+
+**状态（2026-09-06 / TP-23）**：机器可核对清单见 [`trunk-push-writers-audit.md`](./trunk-push-writers-audit.md)；结论已回写事实校准 18。统一入口收敛属后续实现卡（TP-04/07/08），本交付物覆盖「穷举登记 + 回写」文档面。
 
 **1.2 推送生命周期分段**
 
