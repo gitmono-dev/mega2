@@ -57,6 +57,8 @@ pub mod merge_queue;
 pub mod notification_event_types;
 pub mod orion_tasks;
 pub mod path_check_configs;
+pub mod push_queue;
+pub mod queue_control;
 pub mod reactions;
 pub mod sea_orm_active_enums;
 pub mod ssh_keys;

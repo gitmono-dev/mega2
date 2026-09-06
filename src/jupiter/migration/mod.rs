@@ -110,7 +110,9 @@ pub(crate) mod m20260731_000001_drop_email_jobs;
 mod m20260815_000000_unique_mega_cl_link;
 mod m20260815_000100_merge_queue_requester;
 mod m20260831_000000_drop_mega_issue_tables;
+pub(crate) mod m20260905_000100_add_push_queue;
 mod runner;
+pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
 
 /// Primary key `BIGINT` (not DB auto-increment); the application assigns `id` (e.g. `idgenerator::IdInstance::next_id`).
@@ -207,6 +209,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260815_000000_unique_mega_cl_link::Migration),
             Box::new(m20260815_000100_merge_queue_requester::Migration),
             Box::new(m20260831_000000_drop_mega_issue_tables::Migration),
+            Box::new(m20260905_000100_add_push_queue::Migration),
         ]
     }
 }

@@ -477,6 +477,8 @@ create unique index push_queue_operation_states
   where status in ('Queued','Running','Done');
 ```
 
+**实现口径（TP-01）:** `push_queue.id` 由 `sea_query` 渲染为 Postgres IDENTITY 列而非 `bigserial` 字面写法——两者同取自序列，ADR-TP-06 的序号保序性质不变。`queue_control.max_depth` 无默认值，播种取 64（本节未规定初值，由 TP-01 选定）。`enqueued_at` / `updated_at` 取 `DEFAULT now()`，使 1.5 B1 INSERT 列清单（不含二者）可执行。
+
 **1.5 算法**
 
 ```

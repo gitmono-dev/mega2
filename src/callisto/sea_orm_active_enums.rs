@@ -207,6 +207,72 @@ pub enum PositionStatusEnum {
 #[sea_orm(
     rs_type = "String",
     db_type = "Enum",
+    enum_name = "push_queue_failure_enum"
+)]
+pub enum PushQueueFailureEnum {
+    #[sea_orm(string_value = "PushFailure")]
+    PushFailure,
+    #[sea_orm(string_value = "MergeFailure")]
+    MergeFailure,
+    #[sea_orm(string_value = "AttachFailure")]
+    AttachFailure,
+    #[sea_orm(string_value = "Conflict")]
+    Conflict,
+    #[sea_orm(string_value = "QueueBypassDetected")]
+    QueueBypassDetected,
+    #[sea_orm(string_value = "WaitTimeout")]
+    WaitTimeout,
+    #[sea_orm(string_value = "ClaimLost")]
+    ClaimLost,
+    #[sea_orm(string_value = "SystemError")]
+    SystemError,
+}
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
+    enum_name = "push_queue_kind_enum"
+)]
+pub enum PushQueueKindEnum {
+    #[sea_orm(string_value = "push")]
+    Push,
+    #[sea_orm(string_value = "merge")]
+    Merge,
+    #[sea_orm(string_value = "attach")]
+    Attach,
+}
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
+    enum_name = "push_queue_pending_enum"
+)]
+pub enum PushQueuePendingEnum {
+    #[sea_orm(string_value = "requeue_conflict")]
+    RequeueConflict,
+}
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
+    enum_name = "push_queue_status_enum"
+)]
+pub enum PushQueueStatusEnum {
+    #[sea_orm(string_value = "Queued")]
+    Queued,
+    #[sea_orm(string_value = "Running")]
+    Running,
+    #[sea_orm(string_value = "Done")]
+    Done,
+    #[sea_orm(string_value = "Failed")]
+    Failed,
+    #[sea_orm(string_value = "Cancelled")]
+    Cancelled,
+}
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
     enum_name = "queue_failure_type_enum"
 )]
 pub enum QueueFailureTypeEnum {

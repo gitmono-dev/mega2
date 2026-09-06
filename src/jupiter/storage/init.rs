@@ -7,17 +7,24 @@ use url::Url;
 use crate::{
     common::errors::MegaError,
     config::{DbConfig, redaction::redact_db_url, validate::validate_database_config},
-    jupiter::{migration::apply_migrations, utils::id_generator},
+    jupiter::{
+        migration::{apply_migrations, ensure_queue_control_seed},
+        utils::id_generator,
+    },
 };
 
 /// Create a PostgreSQL database connection.
 ///
-/// After a successful connection, applies any pending database migrations.
+/// After a successful connection, applies any pending database migrations and
+/// re-asserts the singleton rows that migrations seed but nothing else
+/// recreates — `queue_control`, whose absence would silently disable the
+/// admission serialization of the write queue (trunk-push.md 1.4).
 pub async fn database_connection(db_config: &DbConfig) -> Result<DatabaseConnection, MegaError> {
     id_generator::ensure_initialized();
 
     let conn = postgres_connection(db_config).await?;
     apply_migrations(&conn, false).await?;
+    ensure_queue_control_seed(&conn).await?;
 
     Ok(conn)
 }
