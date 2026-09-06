@@ -41,7 +41,7 @@ impl Deref for MonoStorage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RefUpdateData {
     pub path: String,
     pub ref_name: String,
@@ -329,6 +329,105 @@ impl MonoStorage {
             res?;
         }
 
+        Ok(())
+    }
+
+    /// Sequential ref updates inside an existing transaction.
+    ///
+    /// Unlike [`Self::batch_update_by_path_concurrent`], this variant:
+    /// - accepts `&DatabaseTransaction` (usable inside B3);
+    /// - updates rows one-by-one (concurrency is meaningless in one txn);
+    /// - returns [`MegaError::NotFound`] when a `(path, ref_name)` row is missing
+    ///   instead of silently skipping it.
+    pub async fn batch_update_by_path_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        updates: Vec<RefUpdateData>,
+    ) -> Result<(), MegaError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut condition = Condition::any();
+        for update in &updates {
+            condition = condition.add(
+                Condition::all()
+                    .add(mega_refs::Column::Path.eq(update.path.clone()))
+                    .add(mega_refs::Column::RefName.eq(update.ref_name.clone())),
+            );
+        }
+
+        let existing_refs: Vec<mega_refs::Model> =
+            mega_refs::Entity::find().filter(condition).all(txn).await?;
+
+        let ref_map: HashMap<(String, String), mega_refs::Model> = existing_refs
+            .into_iter()
+            .map(|r| ((r.path.clone(), r.ref_name.clone()), r))
+            .collect();
+
+        for update in updates {
+            let key = (update.path.clone(), update.ref_name.clone());
+            let Some(ref_data) = ref_map.get(&key) else {
+                return Err(MegaError::NotFound(format!(
+                    "mega_refs row missing for path='{}' ref_name='{}'",
+                    update.path, update.ref_name
+                )));
+            };
+            let mut active: mega_refs::ActiveModel = ref_data.clone().into();
+            active.ref_commit_hash = Set(update.commit_id);
+            active.ref_tree_hash = Set(update.tree_hash);
+            active.updated_at = Set(chrono::Utc::now().naive_utc());
+            active.update(txn).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Insert or update a single `(path, ref_name)` row inside `txn`.
+    ///
+    /// Creation uses `is_cl = false` (main-line / path refs). CL refs continue
+    /// to use [`Self::save_or_update_cl_ref_in_txn`].
+    ///
+    /// Implemented as a single `INSERT … ON CONFLICT (path, ref_name) DO UPDATE`
+    /// so concurrent first-creators do not race into a unique-index abort.
+    /// On conflict, `id` and `is_cl` are preserved; only tip hashes and
+    /// `updated_at` change.
+    pub async fn upsert_ref_by_path_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        update: RefUpdateData,
+    ) -> Result<(), MegaError> {
+        let new_ref = mega_refs::Model::new(
+            update.path,
+            update.ref_name,
+            update.commit_id,
+            update.tree_hash,
+            false,
+        );
+        mega_refs::Entity::insert(new_ref.into_active_model())
+            .on_conflict(
+                OnConflict::columns([mega_refs::Column::Path, mega_refs::Column::RefName])
+                    .update_columns([
+                        mega_refs::Column::RefCommitHash,
+                        mega_refs::Column::RefTreeHash,
+                        mega_refs::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(txn)
+            .await?;
+        Ok(())
+    }
+
+    /// Sequential upsert of many refs inside one transaction (no silent skips).
+    pub async fn batch_upsert_by_path_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        updates: Vec<RefUpdateData>,
+    ) -> Result<(), MegaError> {
+        for update in updates {
+            self.upsert_ref_by_path_in_txn(txn, update).await?;
+        }
         Ok(())
     }
 
@@ -770,4 +869,249 @@ impl MonoStorage {
 }
 
 #[cfg(test)]
-mod test {}
+mod tests {
+    use sea_orm::TransactionTrait;
+
+    use super::*;
+    use crate::{
+        common::utils::{MEGA_BRANCH_NAME, escape_like},
+        jupiter::tests::test_storage,
+    };
+
+    #[test]
+    fn escape_like_covers_percent_underscore_backslash() {
+        assert_eq!(escape_like("%"), r"\%");
+        assert_eq!(escape_like("_"), r"\_");
+        assert_eq!(escape_like(r"\"), r"\\");
+        assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
+    }
+
+    async fn seed_root_ref(mono: &MonoStorage) -> mega_refs::Model {
+        let model = mega_refs::Model::new(
+            "/",
+            MEGA_BRANCH_NAME.to_owned(),
+            "a".repeat(40),
+            "b".repeat(40),
+            false,
+        );
+        mono.save_refs(model.clone(), None).await.unwrap();
+        model
+    }
+
+    #[tokio::test]
+    async fn batch_update_by_path_in_txn_updates_and_rolls_back() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let root = seed_root_ref(&mono).await;
+        let original_commit = root.ref_commit_hash.clone();
+        let original_tree = root.ref_tree_hash.clone();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.batch_update_by_path_in_txn(
+            &txn,
+            vec![RefUpdateData {
+                path: "/".into(),
+                ref_name: MEGA_BRANCH_NAME.into(),
+                commit_id: "c".repeat(40),
+                tree_hash: "d".repeat(40),
+            }],
+        )
+        .await
+        .unwrap();
+
+        // Uncommitted: outside the txn the old values remain visible.
+        let outside = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(outside.ref_commit_hash, original_commit);
+        assert_eq!(outside.ref_tree_hash, original_tree);
+
+        txn.rollback().await.unwrap();
+        let after = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(after.ref_commit_hash, original_commit);
+        assert_eq!(after.ref_tree_hash, original_tree);
+    }
+
+    #[tokio::test]
+    async fn batch_update_by_path_in_txn_errors_on_missing_row() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        let err = mono
+            .batch_update_by_path_in_txn(
+                &txn,
+                vec![RefUpdateData {
+                    path: "/does-not-exist".into(),
+                    ref_name: MEGA_BRANCH_NAME.into(),
+                    commit_id: "a".repeat(40),
+                    tree_hash: "b".repeat(40),
+                }],
+            )
+            .await
+            .expect_err("missing row must not be skipped");
+        assert!(
+            matches!(err, MegaError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upsert_ref_by_path_in_txn_creates_and_updates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.upsert_ref_by_path_in_txn(
+            &txn,
+            RefUpdateData {
+                path: "/new/path".into(),
+                ref_name: MEGA_BRANCH_NAME.into(),
+                commit_id: "c".repeat(40),
+                tree_hash: "d".repeat(40),
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let created = mono.get_main_ref("/new/path").await.unwrap().unwrap();
+        assert_eq!(created.ref_commit_hash, "c".repeat(40));
+        assert!(!created.is_cl);
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.upsert_ref_by_path_in_txn(
+            &txn,
+            RefUpdateData {
+                path: "/new/path".into(),
+                ref_name: MEGA_BRANCH_NAME.into(),
+                commit_id: "e".repeat(40),
+                tree_hash: "f".repeat(40),
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let updated = mono.get_main_ref("/new/path").await.unwrap().unwrap();
+        assert_eq!(updated.ref_commit_hash, "e".repeat(40));
+        assert_eq!(updated.ref_tree_hash, "f".repeat(40));
+    }
+
+    #[tokio::test]
+    async fn batch_update_matches_concurrent_for_existing_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.upsert_ref_by_path_in_txn(
+            &txn,
+            RefUpdateData {
+                path: "/p".into(),
+                ref_name: MEGA_BRANCH_NAME.into(),
+                commit_id: "1".repeat(40),
+                tree_hash: "2".repeat(40),
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let updates = vec![RefUpdateData {
+            path: "/p".into(),
+            ref_name: MEGA_BRANCH_NAME.into(),
+            commit_id: "3".repeat(40),
+            tree_hash: "4".repeat(40),
+        }];
+
+        mono.batch_update_by_path_concurrent(updates.clone())
+            .await
+            .unwrap();
+        let after_concurrent = mono.get_main_ref("/p").await.unwrap().unwrap();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.upsert_ref_by_path_in_txn(
+            &txn,
+            RefUpdateData {
+                path: "/p".into(),
+                ref_name: MEGA_BRANCH_NAME.into(),
+                commit_id: "1".repeat(40),
+                tree_hash: "2".repeat(40),
+            },
+        )
+        .await
+        .unwrap();
+        mono.batch_update_by_path_in_txn(&txn, updates)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let after_txn = mono.get_main_ref("/p").await.unwrap().unwrap();
+
+        assert_eq!(after_concurrent.ref_commit_hash, after_txn.ref_commit_hash);
+        assert_eq!(after_concurrent.ref_tree_hash, after_txn.ref_tree_hash);
+    }
+
+    #[tokio::test]
+    async fn upsert_ref_by_path_in_txn_survives_concurrent_creates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        let left = mono.clone();
+        let right = mono.clone();
+        let (res_a, res_b) = tokio::join!(
+            async {
+                let conn = left.get_connection();
+                let txn = conn.begin().await.unwrap();
+                left.upsert_ref_by_path_in_txn(
+                    &txn,
+                    RefUpdateData {
+                        path: "/race".into(),
+                        ref_name: MEGA_BRANCH_NAME.into(),
+                        commit_id: "a".repeat(40),
+                        tree_hash: "b".repeat(40),
+                    },
+                )
+                .await?;
+                txn.commit().await.map_err(MegaError::from)?;
+                Ok::<(), MegaError>(())
+            },
+            async {
+                let conn = right.get_connection();
+                let txn = conn.begin().await.unwrap();
+                right
+                    .upsert_ref_by_path_in_txn(
+                        &txn,
+                        RefUpdateData {
+                            path: "/race".into(),
+                            ref_name: MEGA_BRANCH_NAME.into(),
+                            commit_id: "c".repeat(40),
+                            tree_hash: "d".repeat(40),
+                        },
+                    )
+                    .await?;
+                txn.commit().await.map_err(MegaError::from)?;
+                Ok::<(), MegaError>(())
+            },
+        );
+
+        res_a.expect("left upsert must succeed");
+        res_b.expect("right upsert must succeed");
+        let row = mono.get_main_ref("/race").await.unwrap().unwrap();
+        // One of the two tip pairs wins; either is fine as long as a single row remains.
+        assert!(
+            (row.ref_commit_hash == "a".repeat(40) && row.ref_tree_hash == "b".repeat(40))
+                || (row.ref_commit_hash == "c".repeat(40) && row.ref_tree_hash == "d".repeat(40))
+        );
+        assert!(!row.is_cl);
+    }
+}

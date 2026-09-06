@@ -488,7 +488,8 @@ pub fn init_trees(
     )
 }
 
-fn sort_git_tree_items(items: &mut [TreeItem]) {
+/// Sort tree items with Git's tree entry order (directories sort as `name/`).
+pub fn sort_git_tree_items(items: &mut [TreeItem]) {
     items.sort_by_key(git_tree_sort_key);
 }
 

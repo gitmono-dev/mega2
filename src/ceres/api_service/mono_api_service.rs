@@ -557,10 +557,136 @@ impl MonoServiceLogic {
             .tree_items
             .iter()
             .position(|item| item.name == name)
-            .ok_or_else(|| GitError::CustomError(format!("Tree item '{}' not found", name)))?;
+            .ok_or_else(|| GitError::CustomError(format!("Tree item '{name}' not found")))?;
         let mut items = tree.tree_items.clone();
         items[index].id = target_hash;
+        // Preserve stored item order: Tree::from_tree_items hashes in the given
+        // sequence and does not sort. Re-sorting here would change review-path
+        // tree ids (hard constraint 8). Sorting belongs only on the new
+        // insert-or-replace create primitives via tree_from_items_checked.
         Tree::from_tree_items(items).map_err(|_| GitError::CustomError("Invalid tree".to_string()))
+    }
+
+    /// Insert or replace a named tree entry, then rebuild with Git tree sort order.
+    ///
+    /// - Existing same-name entry with matching mode: replace its `id` deterministically.
+    /// - Existing same-name entry with a different mode: diagnostic error (no silent
+    ///   blob↔tree conversion).
+    /// - Missing entry: append a new `TreeItem`.
+    /// - Duplicate names inside the resulting item set: diagnostic error.
+    pub fn insert_or_replace_tree_item(
+        tree: &Tree,
+        name: &str,
+        target_hash: ObjectHash,
+        mode: TreeItemMode,
+    ) -> Result<Tree, GitError> {
+        let mut items = tree.tree_items.clone();
+        if let Some(index) = items.iter().position(|item| item.name == name) {
+            if items[index].mode != mode {
+                return Err(GitError::CustomError(format!(
+                    "Tree item '{name}' exists with mode {:?}, refusing mode change to {mode:?}",
+                    items[index].mode
+                )));
+            }
+            items[index].id = target_hash;
+        } else {
+            items.push(TreeItem {
+                mode,
+                id: target_hash,
+                name: name.to_owned(),
+            });
+        }
+        Self::tree_from_items_checked(items)
+    }
+
+    /// Like [`Self::update_tree_hash`], but inserts a `TreeItemMode::Tree` entry when missing.
+    pub fn insert_or_replace_tree_hash(
+        tree: Arc<Tree>,
+        name: &str,
+        target_hash: ObjectHash,
+    ) -> Result<Tree, GitError> {
+        Self::insert_or_replace_tree_item(&tree, name, target_hash, TreeItemMode::Tree)
+    }
+
+    /// Build a [`Tree`] after rejecting duplicate names and applying Git sort order.
+    pub fn tree_from_items_checked(mut items: Vec<TreeItem>) -> Result<Tree, GitError> {
+        let mut seen = std::collections::HashSet::with_capacity(items.len());
+        for item in &items {
+            if !seen.insert(item.name.clone()) {
+                return Err(GitError::CustomError(format!(
+                    "Duplicate tree item name '{}'",
+                    item.name
+                )));
+            }
+        }
+        crate::jupiter::utils::converter::sort_git_tree_items(&mut items);
+        Tree::from_tree_items(items).map_err(|_| GitError::CustomError("Invalid tree".to_string()))
+    }
+
+    /// Insert `leaf` at the end of `chain` path components, creating missing Tree
+    /// entries for `missing_components`.
+    ///
+    /// `chain` is `[root, ..., deepest_existing]` (at least the root). Names linking
+    /// consecutive chain entries are `existing_child_names` (length `chain.len() - 1`).
+    /// `missing_components` must be non-empty and names the path under the deepest
+    /// existing tree through the leaf slot whose content is `leaf`.
+    pub fn ensure_tree_path_with_chain(
+        chain: &[Tree],
+        existing_child_names: &[&str],
+        missing_components: &[&str],
+        leaf: Tree,
+    ) -> Result<(Tree, Vec<Tree>), GitError> {
+        if chain.is_empty() {
+            return Err(GitError::CustomError(
+                "ensure_tree_path_with_chain requires a non-empty chain".into(),
+            ));
+        }
+        if existing_child_names.len() + 1 != chain.len() {
+            return Err(GitError::CustomError(
+                "existing_child_names length must be chain.len() - 1".into(),
+            ));
+        }
+        if missing_components.is_empty() {
+            return Err(GitError::CustomError(
+                "missing_components must name the leaf slot to insert or replace".into(),
+            ));
+        }
+
+        let mut produced = Vec::new();
+        produced.push(leaf.clone());
+        let mut child_hash = leaf.id;
+        let mut child_name = missing_components[missing_components.len() - 1];
+
+        // Build brand-new intermediate trees for all but the first missing component
+        // (the first missing attaches into the deepest existing tree).
+        for name in missing_components.iter().rev().skip(1) {
+            let intermediate = Self::tree_from_items_checked(vec![TreeItem {
+                mode: TreeItemMode::Tree,
+                id: child_hash,
+                name: child_name.to_owned(),
+            }])?;
+            child_hash = intermediate.id;
+            child_name = name;
+            produced.push(intermediate);
+        }
+
+        // Walk existing chain upward, insert-or-replace at each level.
+        let mut next_hash = child_hash;
+        let mut next_name = child_name;
+        let mut new_root = chain[0].clone();
+        for (idx, tree) in chain.iter().enumerate().rev() {
+            let updated =
+                Self::insert_or_replace_tree_item(tree, next_name, next_hash, TreeItemMode::Tree)?;
+            next_hash = updated.id;
+            produced.push(updated.clone());
+            if idx == 0 {
+                new_root = updated;
+                break;
+            }
+            next_name = existing_child_names[idx - 1];
+        }
+
+        Ok((new_root, produced))
     }
 
     /// Update parent trees along the given update chain with the new child tree hash.

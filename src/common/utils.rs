@@ -130,6 +130,25 @@ pub fn get_current_bin_name() -> String {
         .to_owned()
 }
 
+/// Escape `%`, `_`, and `\` for SQL `LIKE` patterns that use `\` as the escape
+/// character (`ESCAPE '\'` / sea-orm `LikeExpr` with backslash escape).
+///
+/// Order matters: backslash must be escaped first so newly inserted escape
+/// markers are not double-processed.
+pub fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -200,5 +219,15 @@ mod test {
 
         let msg = "()(common): add new feature"; // unssupported characters in type
         assert!(!check_conventional_commits_message(msg));
+    }
+
+    #[test]
+    fn escape_like_escapes_percent_underscore_and_backslash() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("a%b"), r"a\%b");
+        assert_eq!(escape_like("a_b"), r"a\_b");
+        assert_eq!(escape_like(r"a\b"), r"a\\b");
+        assert_eq!(escape_like(r"%_\"), r"\%\_\\");
+        assert_eq!(escape_like(r"foo\%bar"), r"foo\\\%bar");
     }
 }
