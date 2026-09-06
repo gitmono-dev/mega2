@@ -3,6 +3,18 @@
 This document describes the active integration-test contract. Compose service
 registration and lifecycle rules live in [`test-infra.md`](./test-infra.md).
 
+## Planned Libra evidence integration coverage
+
+[`libra.md`](libra.md) §9 registers planned acceptance scenarios **AC-LB-01…15**:
+real Libra ingestion, immutable uploads, interrupted sync/GC, task isolation,
+revision invalidation, delegation/access control, derived-data privacy, trusted CI,
+multi-process landing, provenance, projection replay, crash/restore, retention/deletion,
+and optional dependency-graph/SCM integrations. That table is the scenario source of truth.
+These are requirement IDs, **not implemented cargo targets or passing tests**.
+Implementation must register actual targets and CI coverage using the migrations and
+compose lifecycle below; required live-client/multi-process checks must not pass by skipping.
+The landing cases depend on the shared root writer specified in `trunk-push.md`.
+
 ## Test stack
 
 `docker-compose.test.yml` provides PostgreSQL, Redis, RustFS, optional

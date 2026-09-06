@@ -102,6 +102,14 @@
 - **阶段范围**：1 - 6（共 6 个阶段，其中阶段 6 为可选优化）
 - **产品规则同步**：本文档定稿后再更新 [`../monorepo.md`](../monorepo.md) 的反向声明（不变式、双层历史、墓碑语义、索引最终一致性）
 
+### 5b. **refactoring/libra.md** — Libra 协作与 Agent 变更证据
+
+- **状态**：重构需求，尚未实现；文档 review 不代表功能验收。
+- **目标**：把 Libra 捕获的意图、执行记录及验证结果接入 monoengine 的任务、CL 修订、授权与主干追溯。
+- **范围**：版本化摄取、不可覆写证据、任务隔离、委托身份、精确版本检查、原子 landing、历史查询及保留／删除。
+- **执行顺序与优先级**：P0 契约与可信摄取 → 任务／修订 → 依赖 `trunk-push` 阶段 1–3 的合并把关；随后 P1 团队历史与运维，P2 可选依赖图／外部 SCM。具体阶段 0–5 与 AC-LB-01…15 见 [libra.md](libra.md)。
+- **边界**：共用 trunk-push 根写入路径；ADR-TP-10 只约束 push 行，CL merge 不新增路径唯一入队约束；不要求 storage-only 部署接入 website 或人类审批。
+
 ### 6. **其他文档**
 - **[`../monorepo.md`](../monorepo.md)**：Monorepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化与目录结构）
 - **website-auth.md** / **website-mail.md**：Website 会话与产品邮件契约（见 `plan-20260731.md`）
@@ -349,6 +357,18 @@ SecretRef 消费者（第 3 轮，现行）
 
 ## 🔴 关键约束与必须完成的前置
 
+### Libra 专项执行支线（阶段 0–5）
+
+这是独立的产品重构支线，不要求前述八个阶段全部完成后才开始：
+
+1. `libra.md` 阶段 0–2：契约、可信摄取、任务与修订；P0（本专项内）。
+2. 阶段 3：原生主干把关；P0（本专项内），硬依赖 `trunk-push.md` 阶段 1–3。
+3. 阶段 4：团队历史、保留／删除及恢复；P1；完整验收 AC-LB-01…13。
+4. 阶段 5：可选依赖图／外部 SCM；P2；不阻塞原生闭环。
+
+证据服务启用以前必须有实际执行的 fail-closed 授权（不能处于 Cedar off／shadow），
+且隔离 v1 artifacts 旁路。具体相容迁移、阶段验收子集与依赖矩阵以 [libra.md](libra.md) 为准。
+
 ### 必须先做（不能推迟）
 
 1. **脱敏工具** — 是 vault A 的**必要条件**，P0 阶段 A 无法开始
@@ -381,17 +401,20 @@ SecretRef 消费者（第 3 轮，现行）
 1. 脱敏工具（独立前置）
 2. CLI LoadMode 框架设计（协同前置）
 3. config 阶段 0b + vault 阶段 A
+4. libra 专项阶段 0–3（专项内 P0；阶段 3 等待 trunk-push 1–3，不改变其已有全局排序）
 
 ### P1 - 高优先级，紧随 P0
 1. config 阶段 1/2/3
 2. vault 阶段 B/C/D
 3. trunk-push 阶段 1/2/3（写入路径缺陷修复，独立于上述主线）
+4. libra 阶段 4（团队历史与运维；需完成该专项阶段 3）
 
 ### P2 - 中等优先级，第一批功能完整
 1. config 阶段 4/5
 2. vault 阶段 E
 3. notification（website-mail 客户端 + in-app/Slack/webhook；**无本仓 mail 阶段**）
 4. trunk-push 阶段 4（`push_policy` 形态开关）
+5. libra 阶段 5（可选依赖图／外部 SCM；原生闭环不以其为前置）
 
 ### P3 - 后续优化与扩展
 1. config 阶段 6
@@ -417,6 +440,7 @@ SecretRef 消费者（第 3 轮，现行）
 
 ## 📝 最后一次更新
 
-- **日期**：2026-09-04（历史：2026-06-14 起稿；2026-06-19 orbit；2026-06-23 Scope 内交付 v0.1.49；2026-08-01 DOC-01 收口）
+- **日期**：2026-09-06（历史：2026-06-14 起稿；2026-06-19 orbit；2026-06-23 Scope 内交付 v0.1.49；2026-08-01 DOC-01 收口）
+- **本次更新**：登记 libra.md（5b、专项执行支线及 P0–P2 排序）、trunk-push 协同与 AC-LB 验收；仅新增重构需求，不宣称实现完成。
 - **更新内容**：新增 `trunk-push.md`（Trunk 直推形态与 Monorepo 写入序列化）并登记到文档概览（5a）、执行顺序（第 8 阶段）与优先级排序；该文档的阶段 1-3 属独立于 config/vault 主线的写入路径缺陷修复。历史：2026-08-01 DOC-01 收口——`mail.md` 标废止；执行顺序/依赖图去掉本仓 SMTP/`password_ref` 主线，改为 website-mail + 现行 SecretRef 消费者；integration 验收对齐 `test-infra.md`（mailpit = website IT）。
-- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md（废止）、refactoring/website-mail.md、refactoring/website-auth.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/test-infra.md、refactoring/contract.md、refactoring/trunk-push.md
+- **涵盖文档**：refactoring/config.md、refactoring/vault.md、refactoring/mail.md（废止）、refactoring/website-mail.md、refactoring/website-auth.md、refactoring/notification.md、refactoring/orbit.md、refactoring/integration.md、refactoring/test-infra.md、refactoring/contract.md、refactoring/trunk-push.md、refactoring/libra.md

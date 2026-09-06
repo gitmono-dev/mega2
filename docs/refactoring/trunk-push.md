@@ -14,6 +14,8 @@
 
 ## 需求前提（部署形态）
 
+> **Libra 协同（2026-09-06）**：[`libra.md`](libra.md) REQ-LB-03/06 依赖本文阶段 1–3 的根写入序列化与 provenance，复用同一 root writer，不另建 Agent 写入队列。ADR-TP-10 同路径一项在队**仅约束 `kind='push'`**；多个任务的 CL 落地为 merge 行，由全序与锁内重查保证正确性，不新增或放宽 merge 的入队约束。证据重查、landing mapping 与 ref 更新须在同一事务边界设计。本文 storage-only trunk 形态不被强制接入 CL／website／人类批准，净零无新根 commit 的语义继续成立。此项仅登记协同需求，不表示本文功能已实现或修改既有 ADR。
+
 本计划服务于一类明确的部署：使用方只需要 monorepo 的**存储与分发**能力，不接入 monoengine 的用户系统，不使用 Issue 与 Change List，因而不走评审。
 
 **主要使用方是 Agent**。Agent 以「每产生一个 commit 就推送一次」的方式使用 monorepo，因此**单 commit 推送（N = 1）是常态路径，多 commit 推送（N > 1）是例外路径**。这一假设决定了下文对两条路径的不同处理。

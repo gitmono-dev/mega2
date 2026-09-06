@@ -20,10 +20,16 @@ docs/
 │   ├── website-auth.md      ← Website Better Auth 会话接入
 │   ├── website-mail.md      ← 产品邮件投递（website）
 │   ├── orbit.md             ← Orbit 依赖重构（项目引用 → API 依赖）
-│   └── trunk-push.md        ← Trunk 直推形态与 Monorepo 写入序列化
+│   ├── trunk-push.md        ← Trunk 直推形态与 Monorepo 写入序列化
+│   └── libra.md             ← Libra 协作、Agent 变更证据与主干把关
 └── [文档范围外]
     └── protocol.md
 ```
+
+补充登记（2026-09-06）：[`libra.md`](libra.md) 为 Agent 变更证据与 Libra 协作专项需求，
+阶段 0–5 分别为契约、可信接收、任务与修订、主干把关、团队历史／运维、可选接入。
+它复用 `trunk-push.md` 的根写入路径，验收场景在 `integration.md` 登记；执行依赖与优先级见 README 的 5b 条目。
+当前为用户明确要求的文档编写与 review，不执行本文「执行时的共同需求」中的代码实现／版本发布步骤。
 
 ### 文档角色定义
 
@@ -36,6 +42,7 @@ docs/
 | **config.md / vault.md / mail.md / notification.md** | 专项规划 | 各模块的现状分析、阶段规划、实施细节 |
 | **orbit.md** | 依赖治理 | 把对 orbit 实现 crate 的 path 引用重构为只依赖 orbit-api 契约 |
 | **trunk-push.md** | 写入路径与部署形态 | Monorepo 根树写入的序列化；`push_policy` 形态开关（`review` / `trunk`）；产品规则以 `../monorepo.md` 为准 |
+| **libra.md** | Agent 变更证据 | Libra 摄取、任务／CL 修订、证据授权、精确版本验证与 landing；共用 trunk-push 写入边界 |
 
 ## 所有文档的共同结构规范
 
@@ -515,6 +522,7 @@ docs/
 - **notification.md**：0, 1, 2, 3, 4, 5（共 6 个阶段）
 - **orbit.md**：0, 1, 2, 3（共 4 个阶段，其中阶段 3 为决策门）
 - **trunk-push.md**：1, 2, 3, 4, 5, 6（共 6 个阶段，其中阶段 1-3 为独立可上线的缺陷修复，阶段 6 为可选优化）
+- **libra.md**：0, 1, 2, 3, 4, 5（契约、可信接收、任务与修订、主干把关、团队历史与运维、可选接入；阶段 3 依赖 trunk-push 1–3）
 
 ### 优先级定义
 
@@ -526,9 +534,10 @@ docs/
 
 ## 最后一次更新
 
-- **日期**：2026-09-04（历史：2026-06-14 首版；2026-06-19 增补 orbit.md 登记）
+- **日期**：2026-09-06（历史：2026-06-14 首版；2026-06-19 增补 orbit.md 登记）
+- **本次更新**：登记 libra.md 的分层结构、文档角色、阶段编号及专项执行索引；用户要求的本次交付仅为文档与 review。
 - **内容**：首版发布，定义所有改进文档的共同治理规范；2026-06-19 新增 orbit.md（orbit 依赖重构）；2026-09-04 新增 trunk-push.md（Trunk 直推形态与 Monorepo 写入序列化），均已登记到分层结构、角色定义与阶段编号约定
-- **适用文档**：README.md、config.md、vault.md、mail.md、notification.md、integration.md、orbit.md、trunk-push.md
+- **适用文档**：README.md、config.md、vault.md、mail.md、notification.md、integration.md、orbit.md、trunk-push.md、libra.md
 
 ---
 
