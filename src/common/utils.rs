@@ -2,6 +2,8 @@ use idgenerator::IdInstance;
 use regex::Regex;
 use serde_json::{Value, json};
 
+use crate::common::errors::MegaError;
+
 pub const ZERO_ID: &str = match std::str::from_utf8(&[b'0'; 40]) {
     Ok(s) => s,
     Err(_) => panic!("can't get ZERO_ID"),
@@ -147,6 +149,40 @@ pub fn escape_like(input: &str) -> String {
         }
     }
     out
+}
+
+/// Canonicalize a monorepo ref path for I3 / attach prechecks.
+///
+/// Collapses repeated `/`, strips `.` segments and trailing `/`, and requires a
+/// leading `/`. Rejects empty, `..`, and backslash paths so aliases cannot
+/// bypass path-equality checks against `mega_refs.path`.
+pub fn canonicalize_mono_ref_path(path: &str) -> Result<String, MegaError> {
+    let s = path.trim();
+    if s.is_empty() {
+        return Err(MegaError::Other("path cannot be empty".into()));
+    }
+    if s.split('/').any(|p| p == "..") {
+        return Err(MegaError::Other(format!("path traversal not allowed: {s}")));
+    }
+    if s.contains('\\') {
+        return Err(MegaError::Other(format!(
+            "path must use '/' separator: {s}"
+        )));
+    }
+    let s = s.trim_end_matches('/');
+    if s.is_empty() {
+        return Ok("/".to_owned());
+    }
+    let parts: Vec<&str> = s
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    if parts.is_empty() {
+        return Err(MegaError::Other(
+            "path cannot be empty or consist only of '.' segments".into(),
+        ));
+    }
+    Ok(format!("/{}", parts.join("/")))
 }
 
 #[cfg(test)]

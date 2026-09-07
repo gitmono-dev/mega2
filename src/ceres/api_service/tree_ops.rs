@@ -133,11 +133,11 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
     let mut saving_trees = VecDeque::new();
     let mut stack: VecDeque<_> = VecDeque::new();
 
-    for component in relative_path.components() {
-        if component == Component::RootDir {
-            continue;
-        }
-
+    let components: Vec<_> = relative_path
+        .components()
+        .filter(|c| *c != Component::RootDir)
+        .collect();
+    for (idx, component) in components.iter().enumerate() {
         let target_name = component.as_os_str().to_str().unwrap();
         if let Some(search_res) = search_tree
             .tree_items
@@ -145,10 +145,22 @@ pub async fn search_and_create_tree<T: ApiHandler + ?Sized>(
             .find(|x| x.name == target_name)
         {
             search_tree = handler.get_tree_by_hash(&search_res.id.to_string()).await?;
-            update_item_tree.push_back((search_tree.clone(), component));
+            update_item_tree.push_back((search_tree.clone(), *component));
         } else {
-            stack.push_back(component);
+            // First missing component at `idx`: create the remainder as new.
+            // Index-based (not value match) so repeated names like /a/a/b work.
+            for rest in &components[idx..] {
+                stack.push_back(*rest);
+            }
+            break;
         }
+    }
+
+    if stack.is_empty() {
+        return Err(MegaError::Other(format!(
+            "path '{}' already exists in monorepo tree (cannot attach leaf)",
+            relative_path.display()
+        )));
     }
 
     let blob = generate_git_keep_with_timestamp();

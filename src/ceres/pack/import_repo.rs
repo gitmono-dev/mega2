@@ -27,7 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     callisto::sea_orm_active_enums::RefTypeEnum,
     ceres::{
-        api_service::{cache::GitObjectCache, mono_api_service::MonoApiService, tree_ops},
+        api_service::cache::GitObjectCache,
         pack::RepoHandler,
         protocol::{
             import_refs::{CommandType, RefCommand, Refs},
@@ -35,12 +35,16 @@ use crate::{
         },
     },
     common::{errors::MegaError, utils::ZERO_ID},
-    contract::policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
     jupiter::{
-        redis::lock::RedLock,
-        service::git_service::GitService,
+        service::{
+            git_service::GitService,
+            push_queue_service::{
+                AttachCommand, AttachExecContext, AttachPayload, EnqueueRequest, ExecuteOutcome,
+                ExecuteRequest, QueueWaitResult, attach_operation_id, normalize_attach_commands,
+            },
+        },
         storage::{Storage, git_db_storage::GitDbStorage},
-        utils::converter::{FromGitModel, FromMegaModel},
+        utils::converter::FromGitModel,
     },
 };
 #[rustfmt::skip]
@@ -50,7 +54,6 @@ pub struct ImportRepo {
     pub storage: Storage,
     pub repo: Repo,
     pub command_list: Mutex<Vec<RefCommand>>,
-    pub unpack_redlock: Arc<RedLock>,
     pub git_object_cache: Arc<GitObjectCache>,
     pub receive_pack_extra_timings_ms: Mutex<Vec<(String, u128)>>,
 }
@@ -446,7 +449,7 @@ impl ImportRepo {
         Ok(())
     }
 
-    // attach import repo to monorepo parent tree
+    // attach import repo to monorepo parent tree via MonoWriteQueue (TP-08).
     pub(crate) async fn attach_to_monorepo_parent(&self) -> Result<(), MegaError> {
         // Snapshot commands without holding the mutex across await (Send + avoids deadlocks).
         let commands_snapshot: Vec<RefCommand> = self
@@ -454,6 +457,7 @@ impl ImportRepo {
             .lock()
             .expect("command_list lock poisoned")
             .clone();
+        // Pure delete-only attach: no non-zero branch tip → do not enqueue.
         if !commands_snapshot
             .iter()
             .any(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
@@ -474,221 +478,117 @@ impl ImportRepo {
             return Ok(());
         }
 
-        let commit_id = match commands_snapshot
+        let commit_id = commands_snapshot
             .iter()
             .find(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
-        {
-            Some(cmd) => cmd.new_id.clone(),
-            None => return Ok(()),
+            .map(|c| c.new_id.clone())
+            .ok_or_else(|| MegaError::Other("attach: no branch tip".into()))?;
+
+        let path = crate::common::utils::canonicalize_mono_ref_path(&self.repo.repo_path)?;
+        // Materialization precheck permits P=/ (main@/ does not participate), but
+        // ImportRepo attach mounts a named leaf via search_and_create_tree and
+        // cannot target the monorepo root itself — fail before enqueue.
+        if path == "/" {
+            return Err(MegaError::Other(
+                "attach to monorepo path '/' is not supported (no leaf name for tree mount)".into(),
+            ));
+        }
+        let mono = self.storage.mono_storage();
+        // Materialization precheck runs under B3 lock only so identical retries
+        // can adopt/replay Done without being blocked by post-success lazy
+        // materialization of the target path.
+
+        let attach_cmds: Vec<AttachCommand> = commands_snapshot
+            .iter()
+            .filter(|c| c.ref_type == RefTypeEnum::Branch)
+            .map(|c| AttachCommand {
+                ref_name: c.ref_name.clone(),
+                old_id: c.old_id.clone(),
+                new_id: c.new_id.clone(),
+                command_type: match c.command_type {
+                    CommandType::Create => "Create".into(),
+                    CommandType::Update => "Update".into(),
+                    CommandType::Delete => "Delete".into(),
+                },
+                ref_type: "branch".into(),
+                default_branch: c.default_branch,
+            })
+            .collect();
+        let payload = AttachPayload {
+            repo_id: self.repo.repo_id,
+            repo_path: path.clone(),
+            commands: attach_cmds.clone(),
         };
-
-        let path = PathBuf::from(self.repo.repo_path.clone());
-        let mono_api_service: MonoApiService = self.into();
-        let storage = self.storage.mono_storage();
-
-        // Import tip commit + message do not depend on monorepo root; load once so retries
-        // under the root lock do not repeat git_db reads.
-        let latest_commit: Commit = Commit::from_git_model(
-            self.storage
-                .git_db_storage()
-                .get_commit_by_hash(self.repo.repo_id, &commit_id)
-                .await?
-                .ok_or_else(|| MegaError::Other(format!("commit {commit_id} not found")))?,
-        );
-        let commit_msg = latest_commit.format_message();
-
-        // Concurrent attaches need CAS on root mega_refs; retry when head moved.
-        // Redis lock reduces retry storms; DB still enforces correctness via StaleMonorepoRootRef.
-        //
-        // `search_and_create_tree` walks the live root tree via the API (`get_root_tree`); it must
-        // run against the same root snapshot as `get_main_ref` for this attempt, so it stays
-        // inside the locked section. Further reduction would require threading an explicit root
-        // tree/commit into `tree_ops` so tree building can run without holding the global lock.
-        const MAX_ATTACH_ATTEMPTS: u32 = 64;
-        let mut root_lock_wait_max_ms: u128 = 0;
-        let mut root_lock_wait_sum_ms: u128 = 0;
-
-        for attempt in 0..MAX_ATTACH_ATTEMPTS {
-            let t_lock = Instant::now();
-            let guard = self.unpack_redlock.clone().lock().await?;
-            let lock_wait_ms = t_lock.elapsed().as_millis();
-            root_lock_wait_max_ms = root_lock_wait_max_ms.max(lock_wait_ms);
-            root_lock_wait_sum_ms += lock_wait_ms;
-
-            let root_ref = storage
-                .get_main_ref("/")
-                .await?
-                .ok_or_else(|| MegaError::Other("root ref not found".to_string()))?;
-            let expected_commit = root_ref.ref_commit_hash.clone();
-            let expected_tree = root_ref.ref_tree_hash.clone();
-            let root_ref_id = root_ref.id;
-
-            let (save_trees, gitkeep_blob) =
-                tree_ops::search_and_create_tree(&mono_api_service, &path).await?;
-
-            let new_commit = Commit::from_tree_id(
-                save_trees
-                    .back()
-                    .ok_or_else(|| MegaError::Other("no tree generated".to_string()))?
-                    .id,
-                vec![ObjectHash::from_str(&expected_commit).unwrap()],
-                &format!("\n{commit_msg}"),
-            );
-            // UN-16: capture the post-attach root tree hash before `new_commit`
-            // is moved into the txn call, for the authz notify below.
-            let new_root_tree_hash = new_commit.tree_id.to_string();
-
-            // Persist the placeholder `.gitkeep` blob referenced by the newly
-            // created path trees before attach; otherwise clone/fetch 404s on
-            // it (mega@f5d22b9, #2152). Fails before the txn starts, so attach
-            // never leaves a tree referencing a missing blob.
-            self.storage
-                .mono_service
-                .save_blobs(&new_commit.id.to_string(), vec![gitkeep_blob])
-                .await?;
-
-            let txn = self.storage.begin_db_transaction().await?;
-            let git_db = self.storage.git_db_storage();
-            for cmd in &commands_snapshot {
-                if cmd.ref_type != RefTypeEnum::Branch {
-                    continue;
-                }
-                match cmd.command_type {
-                    CommandType::Create => {
-                        git_db
-                            .save_ref_in_txn(self.repo.repo_id, cmd.clone().into(), &txn)
-                            .await?;
-                    }
-                    CommandType::Delete => {
-                        git_db
-                            .remove_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &txn)
-                            .await?;
-                    }
-                    CommandType::Update => {
-                        git_db
-                            .update_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &cmd.new_id, &txn)
-                            .await?;
-                    }
-                }
-            }
-
-            let t_attach_txn = Instant::now();
-            match storage
-                .attach_to_monorepo_parent_in_txn(
-                    &txn,
-                    root_ref_id,
-                    &expected_commit,
-                    &expected_tree,
-                    new_commit,
-                    save_trees.into(),
+        let fingerprint_rows: Vec<_> = attach_cmds
+            .iter()
+            .map(|c| {
+                (
+                    c.ref_name.clone(),
+                    c.command_type.clone(),
+                    c.old_id.clone(),
+                    c.new_id.clone(),
                 )
-                .await
-            {
-                Ok(()) => {
-                    txn.commit().await.map_err(MegaError::Db)?;
-                    // UN-16: notify the shared authz snapshot of a possible
-                    // `/.mega_cedar.json` change on main after the import
-                    // advanced the root ref (post-commit hook).
-                    // The root ref is already committed, so a failure while
-                    // resolving the blob IDs leaves the snapshot stale: mark
-                    // dirty (fail-closed) before propagating.
-                    let blob_ids = async {
-                        let old_blob_id = storage
-                            .get_tree_by_hash(&expected_tree)
-                            .await?
-                            .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
-                        let new_blob_id = storage
-                            .get_tree_by_hash(&new_root_tree_hash)
-                            .await?
-                            .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
-                        Ok::<_, MegaError>((old_blob_id, new_blob_id))
-                    }
-                    .await;
-                    match blob_ids {
-                        Ok((old_blob_id, new_blob_id)) => {
-                            notify_authz_changed_best_effort(
-                                &self.storage,
-                                old_blob_id.as_deref(),
-                                new_blob_id.as_deref(),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            self.storage.entity_store().mark_dirty();
-                            return Err(e);
-                        }
-                    }
-                    let t_unlock = Instant::now();
-                    guard.unlock().await?;
-                    self.receive_pack_extra_timings_ms
-                        .lock()
-                        .expect("receive_pack_extra_timings_ms lock poisoned")
-                        .extend([
-                            (
-                                "import_attach_attempts_count".to_string(),
-                                (attempt + 1) as u128,
-                            ),
-                            (
-                                "import_root_lock_wait_sum_ms".to_string(),
-                                root_lock_wait_sum_ms,
-                            ),
-                            (
-                                "import_root_lock_wait_max_ms".to_string(),
-                                root_lock_wait_max_ms,
-                            ),
-                            (
-                                "import_attach_txn_ms".to_string(),
-                                t_attach_txn.elapsed().as_millis(),
-                            ),
-                            (
-                                "import_root_lock_unlock_ms".to_string(),
-                                t_unlock.elapsed().as_millis(),
-                            ),
-                        ]);
-                    return Ok(());
-                }
-                Err(MegaError::StaleMonorepoRootRef) if attempt + 1 < MAX_ATTACH_ATTEMPTS => {
-                    let _ = txn.rollback().await;
-                    let _ = guard.unlock().await;
-                    tracing::warn!(
-                        attempt = attempt,
-                        repo_path = %self.repo.repo_path,
-                        "attach_to_monorepo_parent: root ref moved, retrying"
-                    );
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    let _ = txn.rollback().await;
-                    let _ = guard.unlock().await;
-                    self.receive_pack_extra_timings_ms
-                        .lock()
-                        .expect("receive_pack_extra_timings_ms lock poisoned")
-                        .extend([
-                            (
-                                "import_attach_attempts_count".to_string(),
-                                (attempt + 1) as u128,
-                            ),
-                            (
-                                "import_root_lock_wait_sum_ms".to_string(),
-                                root_lock_wait_sum_ms,
-                            ),
-                            (
-                                "import_root_lock_wait_max_ms".to_string(),
-                                root_lock_wait_max_ms,
-                            ),
-                            (
-                                "import_attach_txn_ms".to_string(),
-                                t_attach_txn.elapsed().as_millis(),
-                            ),
-                        ]);
-                    return Err(e);
+            })
+            .collect();
+        let operation_id = attach_operation_id(
+            &self.repo.repo_id.to_string(),
+            &normalize_attach_commands(&fingerprint_rows),
+        );
+        let old_id = mono
+            .get_main_ref("/")
+            .await?
+            .map(|r| r.ref_commit_hash)
+            .unwrap_or_else(|| ZERO_ID.to_owned());
+
+        let wait = self
+            .storage
+            .push_queue_service
+            .enqueue_and_wait(EnqueueRequest {
+                kind: crate::callisto::sea_orm_active_enums::PushQueueKindEnum::Attach,
+                operation_id,
+                path,
+                old_id,
+                new_id: commit_id,
+                requester: None,
+                payload: serde_json::to_value(&payload)
+                    .map_err(|e| MegaError::Other(format!("attach payload encode: {e}")))?,
+                ref_name: None,
+                is_delete: false,
+            })
+            .await?;
+
+        match wait {
+            QueueWaitResult::Replayed { .. } => Ok(()),
+            QueueWaitResult::Abandoned { id } => Err(MegaError::Other(format!(
+                "attach wait abandoned for push_queue id {id}"
+            ))),
+            QueueWaitResult::Rejected { id, message } => Err(MegaError::Other(format!(
+                "attach rejected for push_queue id {id}: {message}"
+            ))),
+            QueueWaitResult::Ready { id } => {
+                let ctx = AttachExecContext {
+                    storage: self.storage.clone(),
+                    git_object_cache: self.git_object_cache.clone(),
+                };
+                match self
+                    .storage
+                    .push_queue_service
+                    .execute_b3(
+                        ExecuteRequest {
+                            id,
+                            ..Default::default()
+                        },
+                        Some(&ctx),
+                    )
+                    .await?
+                {
+                    ExecuteOutcome::Done { .. } => Ok(()),
+                    other => Err(MegaError::Other(format!(
+                        "attach B3 did not complete successfully: {other:?}"
+                    ))),
                 }
             }
         }
-
-        Err(MegaError::Other(
-            "attach_to_monorepo_parent: exceeded retry limit for concurrent root updates".into(),
-        ))
     }
 }
 
@@ -782,7 +682,7 @@ async fn process_objects(
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::{
         path::PathBuf,
         sync::{Arc, Mutex},
@@ -796,32 +696,126 @@ mod test {
             tree::{Tree, TreeItem, TreeItemMode},
         },
     };
-    use sea_orm::TransactionTrait;
+    use sea_orm::{EntityTrait, PaginatorTrait, TransactionTrait};
 
     use super::ImportRepo;
     use crate::{
-        callisto::{import_refs, sea_orm_active_enums::RefTypeEnum},
+        callisto::{
+            import_refs, push_queue, queue_control,
+            sea_orm_active_enums::{PushQueueKindEnum, RefTypeEnum},
+        },
         ceres::{
             api_service::cache::GitObjectCache,
-            protocol::{import_refs::RefCommand, repo::Repo},
+            protocol::{
+                import_refs::{CommandType, RefCommand},
+                repo::Repo,
+            },
         },
         common::utils::ZERO_ID,
         config::RedisConfig,
         jupiter::{
             migration::apply_migrations,
-            redis::{init_connection, lock::RedLock},
+            redis::init_connection,
             service::{
-                git_service::GitService, import_service::ImportService, mono_service::MonoService,
+                git_service::GitService,
+                import_service::ImportService,
+                mono_service::MonoService,
+                push_queue_service::{
+                    AttachCommand, AttachExecContext, AttachPayload, EnqueueRequest,
+                    ExecuteOutcome, ExecuteRequest, QueueWaitResult, attach_operation_id,
+                    normalize_attach_commands,
+                },
             },
             storage::{
+                Storage,
                 base_storage::{BaseStorage, StorageConnector},
                 git_db_storage::GitDbStorage,
                 object_storage::mock_object_storage,
+                push_queue_storage::EnqueueOutcome,
             },
             tests::{test_db_connection, test_storage},
             utils::converter::FromMegaModel,
         },
     };
+
+    async fn wired_storage_with_monorepo(temp: &tempfile::TempDir) -> Storage {
+        let mut storage = test_storage(temp.path()).await;
+        let git_service = GitService {
+            obj_storage: mock_object_storage(),
+        };
+        storage.git_service = git_service.clone();
+        storage.mono_service = MonoService {
+            mono_storage: storage.mono_storage(),
+            git_service: git_service.clone(),
+        };
+        storage.import_service = ImportService {
+            git_db_storage: storage.git_db_storage(),
+            git_service,
+        };
+        storage
+            .mono_service
+            .init_monorepo(&storage.config().monorepo)
+            .await
+            .unwrap();
+        storage
+    }
+
+    async fn seed_import_repo_with_main_tip(
+        storage: &Storage,
+        path: &str,
+    ) -> (Repo, Commit, RefCommand) {
+        let repo = Repo::new(PathBuf::from(path), false).unwrap();
+        let repo_id = repo.repo_id;
+        let readme = Blob::from_content("hello from import repo");
+        let tree = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: readme.id,
+            name: "README.md".to_string(),
+        }])
+        .unwrap();
+        let commit = Commit::from_tree_id(tree.id, vec![], "\nimport commit");
+        storage
+            .import_service
+            .save_entry(
+                repo_id,
+                vec![
+                    MetaAttached {
+                        inner: readme.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: tree.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: commit.clone().into(),
+                        meta: EntryMeta::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let mut command = RefCommand::new(
+            ZERO_ID.to_string(),
+            commit.id.to_string(),
+            "refs/heads/main".to_string(),
+        );
+        // Mirror receive-pack: first branch becomes the default (smart.rs).
+        command.default_branch = true;
+        (repo, commit, command)
+    }
+
+    async fn disabled_cache() -> Arc<GitObjectCache> {
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+        let connection = init_connection(&RedisConfig { url: redis_url })
+            .await
+            .expect("redis connection");
+        Arc::new(GitObjectCache {
+            connection,
+            prefix: "disabled".to_string(),
+        })
+    }
 
     #[test]
     pub fn test_recurse_tree() {
@@ -865,95 +859,149 @@ mod test {
         assert!(git_db.get_ref(repo_id).await.unwrap().is_empty());
     }
 
+    /// Pure delete-only attach must not enqueue into MonoWriteQueue.
+    #[tokio::test]
+    async fn attach_delete_only_does_not_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, _commit, create_cmd) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/delonly").await;
+        let repo_id = repo.repo_id;
+        storage
+            .git_db_storage()
+            .save_ref(repo_id, create_cmd.clone().into())
+            .await
+            .unwrap();
+
+        let mut delete_cmd = create_cmd.clone();
+        delete_cmd.command_type = CommandType::Delete;
+        delete_cmd.old_id = create_cmd.new_id.clone();
+        delete_cmd.new_id = ZERO_ID.to_string();
+
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![delete_cmd]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        import_repo.attach_to_monorepo_parent().await.unwrap();
+
+        assert!(
+            storage
+                .git_db_storage()
+                .get_ref(repo_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "delete-only attach must remove the import ref"
+        );
+        let queued = push_queue::Entity::find()
+            .count(storage.git_db_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "delete-only attach must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn attach_materialization_precheck_rejects_target_ancestor_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let mono = storage.mono_storage();
+
+        // Root attach is allowed (no descendants).
+        mono.attach_materialization_precheck("/").await.unwrap();
+
+        let ancestor = crate::callisto::mega_refs::Model::new(
+            "/third-party",
+            crate::common::utils::MEGA_BRANCH_NAME.to_owned(),
+            "a".repeat(40),
+            "b".repeat(40),
+            false,
+        );
+        mono.save_refs(ancestor, None).await.unwrap();
+        let err = mono
+            .attach_materialization_precheck("/third-party/newrepo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ancestor") && err.contains("I3"),
+            "expected ancestor refusal, got {err}"
+        );
+
+        mono.save_refs(
+            crate::callisto::mega_refs::Model::new(
+                "/leaf",
+                crate::common::utils::MEGA_BRANCH_NAME.to_owned(),
+                "c".repeat(40),
+                "d".repeat(40),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = mono
+            .attach_materialization_precheck("/leaf")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already has a materialized main ref") && err.contains("I3"),
+            "expected target refusal, got {err}"
+        );
+
+        mono.save_refs(
+            crate::callisto::mega_refs::Model::new(
+                "/parent/child",
+                crate::common::utils::MEGA_BRANCH_NAME.to_owned(),
+                "e".repeat(40),
+                "f".repeat(40),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = mono
+            .attach_materialization_precheck("/parent")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("descendant") && err.contains("I3"),
+            "expected descendant refusal, got {err}"
+        );
+    }
+
     /// Regression for mega@f5d22b9 (#2152): attach must persist the placeholder
     /// `.gitkeep` blob into object storage before the txn commits, so the new
     /// leaf tree never references an object that clone/fetch would 404 on.
     #[tokio::test]
     async fn attach_to_monorepo_parent_persists_gitkeep_blob_in_object_storage() {
         let temp = tempfile::tempdir().unwrap();
-        let mut storage = test_storage(temp.path()).await;
-
-        // Wire the services to the real test DB with one shared in-memory object store.
-        let git_service = GitService {
-            obj_storage: mock_object_storage(),
-        };
-        storage.git_service = git_service.clone();
-        storage.mono_service = MonoService {
-            mono_storage: storage.mono_storage(),
-            git_service: git_service.clone(),
-        };
-        storage.import_service = ImportService {
-            git_db_storage: storage.git_db_storage(),
-            git_service,
-        };
-        storage
-            .mono_service
-            .init_monorepo(&storage.config().monorepo)
-            .await
-            .unwrap();
-
-        // Import repo with a single commit on refs/heads/main.
-        let repo = Repo::new(PathBuf::from("/third-party/newrepo"), false).unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, commit, command) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/newrepo").await;
         let repo_id = repo.repo_id;
-        let readme = Blob::from_content("hello from import repo");
-        let tree = Tree::from_tree_items(vec![TreeItem {
-            mode: TreeItemMode::Blob,
-            id: readme.id,
-            name: "README.md".to_string(),
-        }])
-        .unwrap();
-        let commit = Commit::from_tree_id(tree.id, vec![], "\nimport commit");
-        storage
-            .import_service
-            .save_entry(
-                repo_id,
-                vec![
-                    MetaAttached {
-                        inner: readme.into(),
-                        meta: EntryMeta::new(),
-                    },
-                    MetaAttached {
-                        inner: tree.into(),
-                        meta: EntryMeta::new(),
-                    },
-                    MetaAttached {
-                        inner: commit.clone().into(),
-                        meta: EntryMeta::new(),
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-
-        let command = RefCommand::new(
-            ZERO_ID.to_string(),
-            commit.id.to_string(),
-            "refs/heads/main".to_string(),
-        );
-
-        let redis_url = std::env::var("MEGA_REDIS__URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
-        let connection = init_connection(&RedisConfig { url: redis_url })
-            .await
-            .expect("redis connection");
 
         let import_repo = ImportRepo {
             storage: storage.clone(),
             repo,
             command_list: Mutex::new(vec![command]),
-            unpack_redlock: Arc::new(RedLock::new(
-                connection.clone(),
-                format!("test:attach-gitkeep:{}:{}", std::process::id(), repo_id),
-                30_000,
-            )),
-            git_object_cache: Arc::new(GitObjectCache {
-                connection,
-                prefix: "disabled".to_string(),
-            }),
+            git_object_cache: disabled_cache().await,
             receive_pack_extra_timings_ms: Mutex::new(vec![]),
         };
 
         import_repo.attach_to_monorepo_parent().await.unwrap();
+
+        // Default-branch marker must survive queue attach (import API get_default_ref).
+        let refs = storage.git_db_storage().get_ref(repo_id).await.unwrap();
+        assert!(
+            refs.iter().any(|r| r.default_branch),
+            "attach must persist default_branch on at least one import ref, got {refs:?}"
+        );
 
         // Walk the attached monorepo tree down to the new leaf.
         let mono = storage.mono_storage();
@@ -1006,5 +1054,391 @@ mod test {
             .await
             .unwrap();
         assert_eq!(blob_rows.len(), 1);
+
+        // Fingerprint + landed_commit_id (TP-08 AC).
+        let rows = push_queue::Entity::find()
+            .all(storage.git_db_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, PushQueueKindEnum::Attach);
+        let expected_op = attach_operation_id(
+            &repo_id.to_string(),
+            &normalize_attach_commands(&[(
+                "refs/heads/main".into(),
+                "Create".into(),
+                ZERO_ID.to_string(),
+                commit.id.to_string(),
+            )]),
+        );
+        assert_eq!(row.operation_id, expected_op);
+        assert_eq!(
+            row.landed_commit_id.as_deref(),
+            Some(root_ref.ref_commit_hash.as_str())
+        );
+    }
+
+    /// Prior queue round advances the root while attach is waiting; lock-held
+    /// redo must land without stale CAS.
+    #[tokio::test]
+    async fn attach_succeeds_after_intervening_root_advance() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo_a, commit_a, cmd_a) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/first").await;
+        let (repo_b, commit_b, cmd_b) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/second").await;
+        let mono = storage.mono_storage();
+        let root_before = mono.get_main_ref("/").await.unwrap().unwrap();
+
+        async fn enqueue_attach(
+            storage: &Storage,
+            repo: &Repo,
+            commit: &Commit,
+            command: &RefCommand,
+        ) -> i64 {
+            let path = repo.repo_path.clone();
+            let attach_cmds = vec![AttachCommand {
+                ref_name: command.ref_name.clone(),
+                old_id: command.old_id.clone(),
+                new_id: command.new_id.clone(),
+                command_type: "Create".into(),
+                ref_type: "branch".into(),
+                default_branch: command.default_branch,
+            }];
+            let payload = AttachPayload {
+                repo_id: repo.repo_id,
+                repo_path: path.clone(),
+                commands: attach_cmds.clone(),
+            };
+            let fingerprint_rows: Vec<_> = attach_cmds
+                .iter()
+                .map(|c| {
+                    (
+                        c.ref_name.clone(),
+                        c.command_type.clone(),
+                        c.old_id.clone(),
+                        c.new_id.clone(),
+                    )
+                })
+                .collect();
+            let operation_id = attach_operation_id(
+                &repo.repo_id.to_string(),
+                &normalize_attach_commands(&fingerprint_rows),
+            );
+            let root = storage
+                .mono_storage()
+                .get_main_ref("/")
+                .await
+                .unwrap()
+                .unwrap();
+            let EnqueueOutcome::Inserted { id } = storage
+                .push_queue_service
+                .enqueue(EnqueueRequest {
+                    kind: PushQueueKindEnum::Attach,
+                    operation_id,
+                    path,
+                    old_id: root.ref_commit_hash,
+                    new_id: commit.id.to_string(),
+                    requester: None,
+                    payload: serde_json::to_value(&payload).unwrap(),
+                    ref_name: None,
+                    is_delete: false,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("attach insert");
+            };
+            id
+        }
+
+        let first_id = enqueue_attach(&storage, &repo_a, &commit_a, &cmd_a).await;
+        let second_id = enqueue_attach(&storage, &repo_b, &commit_b, &cmd_b).await;
+        // Both captured the same diagnostic old_id at enqueue time.
+        let row_a = storage
+            .push_queue_service
+            .storage()
+            .get_by_id(first_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let row_b = storage
+            .push_queue_service
+            .storage()
+            .get_by_id(second_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row_a.old_id, root_before.ref_commit_hash);
+        assert_eq!(row_b.old_id, root_before.ref_commit_hash);
+
+        assert_eq!(
+            storage
+                .push_queue_service
+                .wait_and_claim(first_id)
+                .await
+                .unwrap(),
+            QueueWaitResult::Ready { id: first_id }
+        );
+        let ctx = AttachExecContext {
+            storage: storage.clone(),
+            git_object_cache: disabled_cache().await,
+        };
+        let first_outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: first_id,
+                    ..Default::default()
+                },
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        let ExecuteOutcome::Done {
+            landed_commit_id: tip_after_first,
+            ..
+        } = first_outcome
+        else {
+            panic!("first attach must Done, got {first_outcome:?}");
+        };
+
+        let root_mid = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(root_mid.ref_commit_hash, tip_after_first);
+
+        assert_eq!(
+            storage
+                .push_queue_service
+                .wait_and_claim(second_id)
+                .await
+                .unwrap(),
+            QueueWaitResult::Ready { id: second_id }
+        );
+        let second_outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: second_id,
+                    ..Default::default()
+                },
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = second_outcome
+        else {
+            panic!("second attach must Done after intervening advance, got {second_outcome:?}");
+        };
+
+        let root_after = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(root_after.ref_commit_hash, landed_commit_id);
+        assert_ne!(landed_commit_id, tip_after_first);
+        let landed = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed_commit_id)
+            .await
+            .unwrap()
+            .expect("landed commit row");
+        let parents: Vec<String> = serde_json::from_value(landed.parents_id.clone()).unwrap();
+        assert!(
+            parents.contains(&tip_after_first),
+            "second attach parents {parents:?} must include intervening tip {tip_after_first}"
+        );
+    }
+
+    /// AttachFailure must not freeze the queue (hard_stopped stays false).
+    #[tokio::test]
+    async fn attach_failure_does_not_hard_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, commit, command) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/fail-attach").await;
+        let path = repo.repo_path.clone();
+        let mono = storage.mono_storage();
+        let root = mono.get_main_ref("/").await.unwrap().unwrap();
+
+        let payload = AttachPayload {
+            repo_id: repo.repo_id,
+            repo_path: path.clone(),
+            commands: vec![AttachCommand {
+                ref_name: command.ref_name.clone(),
+                old_id: command.old_id.clone(),
+                new_id: command.new_id.clone(),
+                command_type: "Create".into(),
+                ref_type: "branch".into(),
+                default_branch: command.default_branch,
+            }],
+        };
+        let EnqueueOutcome::Inserted { id } = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: attach_operation_id(
+                    &repo.repo_id.to_string(),
+                    &normalize_attach_commands(&[(
+                        command.ref_name.clone(),
+                        "Create".into(),
+                        command.old_id.clone(),
+                        commit.id.to_string(),
+                    )]),
+                ),
+                path: path.clone(),
+                old_id: root.ref_commit_hash,
+                new_id: commit.id.to_string(),
+                requester: None,
+                payload: serde_json::to_value(&payload).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("insert");
+        };
+
+        // Materialize the target path after enqueue so B3 lock-held precheck fails.
+        mono.save_refs(
+            crate::callisto::mega_refs::Model::new(
+                &path,
+                crate::common::utils::MEGA_BRANCH_NAME.to_owned(),
+                "1".repeat(40),
+                "2".repeat(40),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+            QueueWaitResult::Ready { id }
+        );
+        let ctx = AttachExecContext {
+            storage: storage.clone(),
+            git_object_cache: disabled_cache().await,
+        };
+        let outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        match &outcome {
+            ExecuteOutcome::Failed { failure, .. } if failure == "AttachFailure" => {}
+            other => panic!("expected AttachFailure, got {other:?}"),
+        }
+
+        let ctrl = queue_control::Entity::find_by_id(1)
+            .one(storage.git_db_storage().get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !ctrl.hard_stopped,
+            "AttachFailure must not freeze the queue"
+        );
+    }
+
+    /// Non-canonical path aliases must hit the same I3 precheck as the canonical path.
+    #[tokio::test]
+    async fn attach_precheck_rejects_repeated_slash_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let mono = storage.mono_storage();
+        mono.save_refs(
+            crate::callisto::mega_refs::Model::new(
+                "/third-party/aliased",
+                crate::common::utils::MEGA_BRANCH_NAME.to_owned(),
+                "a".repeat(40),
+                "b".repeat(40),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = mono
+            .attach_materialization_precheck("/third-party//aliased")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/third-party/aliased") && err.contains("I3"),
+            "alias must canonicalize then refuse, got {err}"
+        );
+    }
+
+    /// Corrupt attach payload must terminalize AttachFailure, not leave Running.
+    #[tokio::test]
+    async fn attach_corrupt_payload_terminalizes_not_running() {
+        use crate::callisto::sea_orm_active_enums::PushQueueStatusEnum;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let EnqueueOutcome::Inserted { id } = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: "corrupt-payload-op".into(),
+                path: "/third-party/corrupt".into(),
+                old_id: root.ref_commit_hash,
+                new_id: "c".repeat(40),
+                requester: None,
+                payload: serde_json::json!({"not": "an AttachPayload"}),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("insert");
+        };
+        assert_eq!(
+            storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+            QueueWaitResult::Ready { id }
+        );
+        let ctx = AttachExecContext {
+            storage: storage.clone(),
+            git_object_cache: disabled_cache().await,
+        };
+        let outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        match &outcome {
+            ExecuteOutcome::Failed { failure, .. } if failure == "AttachFailure" => {}
+            other => panic!("expected AttachFailure, got {other:?}"),
+        }
+        let row = storage
+            .push_queue_service
+            .storage()
+            .get_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
     }
 }

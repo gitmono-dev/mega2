@@ -18,9 +18,8 @@ use crate::{
     },
     common::{
         errors::{MegaError, ProtocolError},
-        utils::ZERO_ID,
+        utils::{ZERO_ID, canonicalize_mono_ref_path},
     },
-    jupiter::redis::lock::RedLock,
 };
 
 pub mod import_refs;
@@ -182,36 +181,51 @@ impl SmartSession {
 
         if self.repo_path.starts_with(import_dir.clone()) {
             let storage = state.storage.git_db_storage();
-            let path_str = repo_path_to_str(&self.repo_path)?;
-            let model = storage.find_git_repo_exact_match(path_str).await?;
-            let repo = if let Some(repo) = model {
-                repo.into()
+            // Canonicalize before lookup/create so alias paths cannot split
+            // git_repo identity from the monorepo attach target (TP-08).
+            let raw_path = repo_path_to_str(&self.repo_path)?;
+            let path_str = canonicalize_mono_ref_path(raw_path)
+                .map_err(|e| ProtocolError::InvalidInput(e.to_string()))?;
+            let path_buf = PathBuf::from(&path_str);
+            // Prefer canonical lookup; fall back to the raw path so pre-TP-08
+            // aliased `git_repo` rows remain reachable under the same repo_id.
+            let model = match storage.find_git_repo_exact_match(&path_str).await? {
+                Some(m) => Some(m),
+                None if raw_path != path_str => {
+                    match storage.find_git_repo_exact_match(raw_path).await? {
+                        Some(legacy) => {
+                            // Heal alias rows onto the canonical path so a later
+                            // canonical ReceivePack cannot create a second repo_id.
+                            storage.relabel_git_repo_path(legacy.id, &path_str).await?;
+                            storage.find_git_repo_exact_match(&path_str).await?
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+            let repo = if let Some(model) = model {
+                let mut repo: Repo = model.into();
+                repo.repo_path = path_str;
+                repo
             } else {
                 match self.service_type {
                     ServiceType::UploadPack => {
                         return Err(ProtocolError::NotFound("Repository not found.".to_owned()));
                     }
                     ServiceType::ReceivePack => {
-                        let repo = Repo::new(self.repo_path.clone(), false)?;
+                        let repo = Repo::new(path_buf, false)?;
                         storage.save_git_repo(repo.clone().into()).await?;
                         repo
                     }
                 }
             };
 
-            let unpack_redlock = Arc::new(RedLock::new(
-                state.git_object_cache.connection.clone(),
-                // Serialize monorepo root mega_refs update across concurrent import attaches.
-                // Filepath updates and per-repo work should not be blocked by this lock.
-                "git:receive-pack:lock:monorepo-root".to_string(),
-                30_000, // 30s TTL
-            ));
             Ok(Arc::new(ImportRepo {
                 git_object_cache: state.git_object_cache.clone(),
                 storage: state.storage.clone(),
                 repo,
                 command_list: Mutex::new(commands),
-                unpack_redlock,
                 receive_pack_extra_timings_ms: Mutex::new(Vec::new()),
             }) as Arc<dyn RepoHandler>)
         } else {

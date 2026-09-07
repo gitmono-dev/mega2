@@ -180,6 +180,32 @@ impl GitDbStorage {
         Ok(())
     }
 
+    /// Mark `ref_name` as the sole default branch for `repo_id` (clears peers).
+    pub async fn set_default_branch_in_txn(
+        &self,
+        repo_id: i64,
+        ref_name: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        use sea_orm::sea_query::Expr;
+        import_refs::Entity::update_many()
+            .col_expr(import_refs::Column::DefaultBranch, Expr::value(false))
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .exec(txn)
+            .await?;
+        let ref_data = import_refs::Entity::find()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::RefName.eq(ref_name))
+            .one(txn)
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("import_refs not found: {ref_name}")))?;
+        let mut active: import_refs::ActiveModel = ref_data.into();
+        active.default_branch = Set(true);
+        active.updated_at = Set(chrono::Utc::now().naive_utc());
+        active.update(txn).await?;
+        Ok(())
+    }
+
     pub async fn get_default_ref(
         &self,
         repo_id: i64,
@@ -199,6 +225,32 @@ impl GitDbStorage {
             .count(self.get_connection())
             .await?;
         Ok(result > 0)
+    }
+
+    pub async fn default_branch_exist_in_txn(
+        &self,
+        repo_id: i64,
+        txn: &DatabaseTransaction,
+    ) -> Result<bool, MegaError> {
+        let result = import_refs::Entity::find()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::DefaultBranch.eq(true))
+            .count(txn)
+            .await?;
+        Ok(result > 0)
+    }
+
+    pub async fn list_branch_refs_in_txn(
+        &self,
+        repo_id: i64,
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<import_refs::Model>, MegaError> {
+        Ok(import_refs::Entity::find()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::RefType.eq(RefTypeEnum::Branch))
+            .order_by_asc(import_refs::Column::Id)
+            .all(txn)
+            .await?)
     }
 
     pub async fn update_pack_id(&self, temp_pack_id: &str, pack_id: &str) -> Result<(), MegaError> {
@@ -327,6 +379,29 @@ impl GitDbStorage {
         Ok(())
     }
 
+    /// Rewrite `git_repo.repo_path` for an existing id (legacy alias → canonical).
+    pub async fn relabel_git_repo_path(
+        &self,
+        repo_id: i64,
+        new_path: &str,
+    ) -> Result<(), MegaError> {
+        let model = git_repo::Entity::find_by_id(repo_id)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("git_repo id {repo_id} not found")))?;
+        if model.repo_path == new_path {
+            return Ok(());
+        }
+        let mut active: git_repo::ActiveModel = model.into();
+        active.repo_path = Set(new_path.to_owned());
+        active.updated_at = Set(chrono::Utc::now().naive_utc());
+        active
+            .update(self.get_connection())
+            .await
+            .map_err(|e| MegaError::Other(format!("Failed to relabel git_repo path: {e}")))?;
+        Ok(())
+    }
+
     pub async fn get_commit_by_hash(
         &self,
         repo_id: i64,
@@ -336,8 +411,7 @@ impl GitDbStorage {
             .filter(git_commit::Column::RepoId.eq(repo_id))
             .filter(git_commit::Column::CommitId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_commits_by_hashes(
@@ -410,8 +484,7 @@ impl GitDbStorage {
             .filter(git_tree::Column::RepoId.eq(repo_id))
             .filter(git_tree::Column::TreeId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_blobs_by_repo_id(

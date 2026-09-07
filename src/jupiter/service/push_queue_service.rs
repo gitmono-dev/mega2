@@ -44,6 +44,64 @@ pub fn attach_operation_id(repo_id: &str, normalized_commands: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Deterministic attach command fingerprint input (Branch commands only).
+///
+/// Fingerprint covers wire intent (ref + tip ids), not derived `default_branch`
+/// (smart.rs sets that from repo state and would break identical-retry adopt).
+pub fn normalize_attach_commands(cmds: &[(String, String, String, String)]) -> String {
+    // tuples: (ref_name, command_type, old_id, new_id)
+    let mut rows: Vec<_> = cmds.to_vec();
+    rows.sort_by(|a, b| (&a.0, &a.1, &a.2, &a.3).cmp(&(&b.0, &b.1, &b.2, &b.3)));
+    rows.into_iter()
+        .map(|(ref_name, ctype, old_id, new_id)| format!("{ref_name}:{ctype}:{old_id}:{new_id}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Serializable attach payload (trunk-push 1.4 / 1.9).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AttachPayload {
+    pub repo_id: i64,
+    pub repo_path: String,
+    pub commands: Vec<AttachCommand>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AttachCommand {
+    pub ref_name: String,
+    pub old_id: String,
+    pub new_id: String,
+    pub command_type: String,
+    pub ref_type: String,
+    #[serde(default)]
+    pub default_branch: bool,
+}
+
+impl AttachPayload {
+    pub fn normalize_fingerprint_input(&self) -> String {
+        let rows: Vec<_> = self
+            .commands
+            .iter()
+            .filter(|c| c.ref_type == "branch")
+            .map(|c| {
+                (
+                    c.ref_name.clone(),
+                    c.command_type.clone(),
+                    c.old_id.clone(),
+                    c.new_id.clone(),
+                )
+            })
+            .collect();
+        normalize_attach_commands(&rows)
+    }
+}
+
+/// Context required to execute a claimed `kind=attach` round under B3.
+pub struct AttachExecContext {
+    pub storage: crate::jupiter::storage::Storage,
+    pub git_object_cache: std::sync::Arc<crate::ceres::api_service::cache::GitObjectCache>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnqueueRequest {
     pub kind: PushQueueKindEnum,
@@ -371,9 +429,15 @@ impl PushQueueService {
         }
     }
 
-    /// B3 execution skeleton + B4 failure/requeue (kind branches are stubs until
-    /// TP-07/08/12). Caller must already hold a B2.5 claim (`status=Running`).
-    pub async fn execute_b3(&self, req: ExecuteRequest) -> Result<ExecuteOutcome, MegaError> {
+    /// B3 execution skeleton + B4 failure/requeue.
+    ///
+    /// `attach_ctx` is required when the claimed row is `kind=attach` (TP-08);
+    /// other kinds ignore it.
+    pub async fn execute_b3(
+        &self,
+        req: ExecuteRequest,
+        attach_ctx: Option<&AttachExecContext>,
+    ) -> Result<ExecuteOutcome, MegaError> {
         use sea_orm::{EntityTrait, TransactionTrait};
 
         if !req.pre_lock_delay().is_zero() {
@@ -422,8 +486,6 @@ impl PushQueueService {
             && cur_tree == row.expected_tree_hash.as_deref();
         if !baseline_ok {
             // Do not ROLLBACK the outer txn — stay locked while fail-closing.
-            // No kind writes precede this branch yet; SAVEPOINT is reserved for
-            // post-baseline kind work (CAS path below / TP-07/08/12).
             PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
             let updated = PushQueueStorage::mark_failed_if_running_in_txn(
                 &txn,
@@ -467,22 +529,30 @@ impl PushQueueService {
             });
         }
 
-        // Kind dispatch skeleton (1.10 deliverable 9 / Description): consult
-        // push_policy and branch on kind. Concrete push/merge/attach semantics
-        // land in TP-12/07/08; all kinds share the single root CAS stub below.
-        let kind_stub = match row.kind {
-            PushQueueKindEnum::Push => "push",     // TP-12
-            PushQueueKindEnum::Merge => "merge",   // TP-07
-            PushQueueKindEnum::Attach => "attach", // TP-08
-        };
-        tracing::trace!(
-            policy = ?self.push_policy,
-            kind = kind_stub,
-            id = req.id,
-            "B3 kind dispatch stub"
-        );
+        // Kind dispatch (1.10 deliverable 9).
+        match row.kind {
+            PushQueueKindEnum::Attach => {
+                let Some(ctx) = attach_ctx else {
+                    let msg = "execute_b3 attach requires AttachExecContext";
+                    tracing::error!(id = req.id, "{msg}");
+                    // Release the B3 txn first; terminalize on a fresh connection
+                    // (same pattern as b3_execute_attach Err recovery).
+                    txn.rollback().await?;
+                    return self.terminalize_attach_failure(req.id, msg).await;
+                };
+                return self
+                    .b3_execute_attach(txn, &row, ctx, cur_commit, cur_tree, root.as_ref())
+                    .await;
+            }
+            PushQueueKindEnum::Push => {
+                tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 push stub");
+            }
+            PushQueueKindEnum::Merge => {
+                tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 merge stub");
+            }
+        }
 
-        // Kind stub: exactly one root CAS write (net-zero or advance).
+        // Push/merge stubs: exactly one root CAS write (net-zero or advance).
         let (new_commit, new_tree) = match req.kind_root_write {
             KindRootWrite::NetZero => (
                 cur_commit
@@ -574,6 +644,432 @@ impl PushQueueService {
             id: req.id,
             landed_commit_id: new_commit,
             root_cas_writes,
+        })
+    }
+
+    /// TP-08: attach kind under held `MONO_WRITE_LOCK` — sole root write is
+    /// `attach_to_monorepo_parent_in_txn` (no generic CAS stub, no retry loop).
+    ///
+    /// Unexpected `Err` paths terminalize the claimed row as `AttachFailure` on
+    /// a fresh txn so a dropped B3 txn cannot leave the queue head `Running`.
+    async fn b3_execute_attach(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &AttachExecContext,
+        cur_commit: Option<&str>,
+        cur_tree: Option<&str>,
+        root: Option<&crate::callisto::mega_refs::Model>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        let id = row.id;
+        match self
+            .b3_execute_attach_inner(txn, row, ctx, cur_commit, cur_tree, root)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                tracing::error!(
+                    id,
+                    error = %e,
+                    "B3 attach aborted with Err; terminalizing AttachFailure"
+                );
+                self.terminalize_attach_failure(id, &e.to_string()).await
+            }
+        }
+    }
+
+    async fn terminalize_attach_failure(
+        &self,
+        id: i64,
+        message: &str,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use sea_orm::TransactionTrait;
+
+        let conn = self.push_queue_storage.get_connection();
+        let txn = conn.begin().await?;
+        let updated =
+            PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, "AttachFailure", message)
+                .await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(
+                id,
+                "B3 attach Err recovery: Failed update hit 0 rows (already terminal?)"
+            );
+            return Ok(ExecuteOutcome::ClaimLost { id });
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Failed {
+            id,
+            failure: "AttachFailure".into(),
+            message: message.to_owned(),
+        })
+    }
+
+    async fn b3_execute_attach_inner(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &AttachExecContext,
+        cur_commit: Option<&str>,
+        cur_tree: Option<&str>,
+        root: Option<&crate::callisto::mega_refs::Model>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use std::{path::PathBuf, str::FromStr};
+
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{commit::Commit, tree::Tree},
+        };
+
+        use crate::{
+            callisto::sea_orm_active_enums::RefTypeEnum,
+            ceres::{
+                api_service::{mono_api_service::MonoApiService, tree_ops},
+                protocol::import_refs::{CommandType, RefCommand},
+            },
+            common::utils::canonicalize_mono_ref_path,
+            contract::policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
+            jupiter::utils::converter::{FromGitModel, FromMegaModel},
+        };
+
+        let payload: AttachPayload = serde_json::from_value(row.payload.clone())
+            .map_err(|e| MegaError::Other(format!("attach payload deserialize failed: {e}")))?;
+        let repo_path = canonicalize_mono_ref_path(&payload.repo_path)?;
+        // AC allows P=/ through the materialization precheck (main@/ does not
+        // participate). ImportRepo attach still mounts a named leaf under the
+        // root tree via search_and_create_tree, which requires a non-root path.
+        if repo_path == "/" {
+            return Err(MegaError::Other(
+                "attach to monorepo path '/' is not supported (no leaf name for tree mount)".into(),
+            ));
+        }
+
+        let Some(root) = root else {
+            let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                &txn,
+                row.id,
+                "AttachFailure",
+                "attach requires an existing root ref",
+            )
+            .await?;
+            if !updated {
+                tracing::error!(id = row.id, "B3 attach missing-root failure hit 0 rows");
+            }
+            PushQueueStorage::notify_mono_write_queue(&txn).await?;
+            txn.commit().await?;
+            return Ok(ExecuteOutcome::Failed {
+                id: row.id,
+                failure: "AttachFailure".into(),
+                message: "missing root".into(),
+            });
+        };
+
+        let expected_commit = cur_commit
+            .ok_or_else(|| MegaError::Other("attach root commit missing".into()))?
+            .to_owned();
+        let expected_tree = cur_tree
+            .ok_or_else(|| MegaError::Other("attach root tree missing".into()))?
+            .to_owned();
+
+        // Lock-held redo of materialization precheck (intervening writes).
+        if let Err(e) = self
+            .mono_storage
+            .attach_materialization_precheck_in_txn(&repo_path, &txn)
+            .await
+        {
+            let msg = e.to_string();
+            let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                &txn,
+                row.id,
+                "AttachFailure",
+                &msg,
+            )
+            .await?;
+            if !updated {
+                tracing::error!(id = row.id, "B3 attach precheck failure hit 0 rows");
+            }
+            PushQueueStorage::notify_mono_write_queue(&txn).await?;
+            txn.commit().await?;
+            return Ok(ExecuteOutcome::Failed {
+                id: row.id,
+                failure: "AttachFailure".into(),
+                message: msg,
+            });
+        }
+
+        let mono_api = MonoApiService {
+            storage: ctx.storage.clone(),
+            git_object_cache: ctx.git_object_cache.clone(),
+        };
+        let path = PathBuf::from(&repo_path);
+
+        PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+
+        let (save_trees, gitkeep_blob) =
+            match tree_ops::search_and_create_tree(&mono_api, &path).await {
+                Ok(v) => v,
+                Err(e) => {
+                    PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                    let msg = e.to_string();
+                    let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                        &txn,
+                        row.id,
+                        "AttachFailure",
+                        &msg,
+                    )
+                    .await?;
+                    if !updated {
+                        tracing::error!(id = row.id, "B3 attach tree build failure hit 0 rows");
+                    }
+                    PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                    txn.commit().await?;
+                    return Ok(ExecuteOutcome::Failed {
+                        id: row.id,
+                        failure: "AttachFailure".into(),
+                        message: msg,
+                    });
+                }
+            };
+
+        let tip_commit_id = payload
+            .commands
+            .iter()
+            .find(|c| c.ref_type == "branch" && c.new_id != ZERO_ID)
+            .map(|c| c.new_id.clone())
+            .ok_or_else(|| MegaError::Other("attach payload has no branch tip".into()))?;
+
+        let latest_commit: Commit = Commit::from_git_model(
+            ctx.storage
+                .git_db_storage()
+                .get_commit_by_hash(payload.repo_id, &tip_commit_id)
+                .await?
+                .ok_or_else(|| MegaError::Other(format!("commit {tip_commit_id} not found")))?,
+        );
+        let commit_msg = latest_commit.format_message();
+
+        let new_commit = Commit::from_tree_id(
+            save_trees
+                .back()
+                .ok_or_else(|| MegaError::Other("no tree generated".into()))?
+                .id,
+            vec![
+                ObjectHash::from_str(&expected_commit)
+                    .map_err(|e| MegaError::Other(format!("invalid expected commit hash: {e}")))?,
+            ],
+            &format!("\n{commit_msg}"),
+        );
+        let new_root_tree_hash = new_commit.tree_id.to_string();
+        let landed_commit_id = new_commit.id.to_string();
+
+        // Object-store write is outside the DB SAVEPOINT (same as pre-queue attach).
+        if let Err(e) = ctx
+            .storage
+            .mono_service
+            .save_blobs(&landed_commit_id, vec![gitkeep_blob])
+            .await
+        {
+            PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+            let msg = e.to_string();
+            let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                &txn,
+                row.id,
+                "AttachFailure",
+                &msg,
+            )
+            .await?;
+            if !updated {
+                tracing::error!(id = row.id, "B3 attach gitkeep failure hit 0 rows");
+            }
+            PushQueueStorage::notify_mono_write_queue(&txn).await?;
+            txn.commit().await?;
+            return Ok(ExecuteOutcome::Failed {
+                id: row.id,
+                failure: "AttachFailure".into(),
+                message: msg,
+            });
+        }
+
+        let git_db = ctx.storage.git_db_storage();
+        for cmd in &payload.commands {
+            if cmd.ref_type != "branch" {
+                continue;
+            }
+            let command_type = match cmd.command_type.as_str() {
+                "Create" => CommandType::Create,
+                "Delete" => CommandType::Delete,
+                "Update" => CommandType::Update,
+                other => {
+                    return Err(MegaError::Other(format!(
+                        "unknown attach command_type '{other}'"
+                    )));
+                }
+            };
+            let ref_cmd = RefCommand {
+                ref_name: cmd.ref_name.clone(),
+                old_id: cmd.old_id.clone(),
+                new_id: cmd.new_id.clone(),
+                status: "ok".into(),
+                error_msg: String::new(),
+                command_type: command_type.clone(),
+                ref_type: RefTypeEnum::Branch,
+                default_branch: cmd.default_branch,
+            };
+            match command_type {
+                CommandType::Create => {
+                    git_db
+                        .save_ref_in_txn(payload.repo_id, ref_cmd.into(), &txn)
+                        .await?;
+                    if cmd.default_branch {
+                        git_db
+                            .set_default_branch_in_txn(payload.repo_id, &cmd.ref_name, &txn)
+                            .await?;
+                    }
+                }
+                CommandType::Delete => {
+                    git_db
+                        .remove_ref_in_txn(payload.repo_id, &cmd.ref_name, &txn)
+                        .await?;
+                }
+                CommandType::Update => {
+                    git_db
+                        .update_ref_in_txn(payload.repo_id, &cmd.ref_name, &cmd.new_id, &txn)
+                        .await?;
+                    if cmd.default_branch {
+                        git_db
+                            .set_default_branch_in_txn(payload.repo_id, &cmd.ref_name, &txn)
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        // Ensure a sole default survives the batch (e.g. Delete of the old
+        // default + Create of a replacement without a precomputed flag).
+        if !git_db
+            .default_branch_exist_in_txn(payload.repo_id, &txn)
+            .await?
+            && let Some(first) = git_db
+                .list_branch_refs_in_txn(payload.repo_id, &txn)
+                .await?
+                .into_iter()
+                .next()
+        {
+            git_db
+                .set_default_branch_in_txn(payload.repo_id, &first.ref_name, &txn)
+                .await?;
+        }
+
+        let trees: Vec<Tree> = save_trees.into_iter().collect();
+        match self
+            .mono_storage
+            .attach_to_monorepo_parent_in_txn(
+                &txn,
+                root.id,
+                &expected_commit,
+                &expected_tree,
+                new_commit,
+                trees,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(MegaError::StaleMonorepoRootRef) => {
+                // Under the queue this is a bypass tripwire, not a retry signal.
+                PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
+                let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                    &txn,
+                    row.id,
+                    "QueueBypassDetected",
+                    "attach root CAS affected 0 rows",
+                )
+                .await?;
+                if !updated {
+                    tracing::error!(
+                        id = row.id,
+                        "B3 attach CAS fail-closed: Failed update hit 0 rows"
+                    );
+                }
+                PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                txn.commit().await?;
+                return Ok(ExecuteOutcome::BypassDetected { id: row.id });
+            }
+            Err(e) => {
+                PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                let msg = e.to_string();
+                let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                    &txn,
+                    row.id,
+                    "AttachFailure",
+                    &msg,
+                )
+                .await?;
+                if !updated {
+                    tracing::error!(id = row.id, "B3 attach failure hit 0 rows");
+                }
+                PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                txn.commit().await?;
+                return Ok(ExecuteOutcome::Failed {
+                    id: row.id,
+                    failure: "AttachFailure".into(),
+                    message: msg,
+                });
+            }
+        }
+
+        let updated =
+            PushQueueStorage::mark_done_if_running_in_txn(&txn, row.id, &landed_commit_id).await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(
+                id = row.id,
+                "B3 attach Done update hit 0 rows after fencing"
+            );
+            return Ok(ExecuteOutcome::ClaimLost { id: row.id });
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+
+        // Authz notify post-commit (same as pre-queue attach).
+        let blob_ids = async {
+            let old_blob_id = self
+                .mono_storage
+                .get_tree_by_hash(&expected_tree)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            let new_blob_id = self
+                .mono_storage
+                .get_tree_by_hash(&new_root_tree_hash)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            Ok::<_, MegaError>((old_blob_id, new_blob_id))
+        }
+        .await;
+        match blob_ids {
+            Ok((old_blob_id, new_blob_id)) => {
+                notify_authz_changed_best_effort(
+                    &ctx.storage,
+                    old_blob_id.as_deref(),
+                    new_blob_id.as_deref(),
+                )
+                .await;
+            }
+            Err(e) => {
+                ctx.storage.entity_store().mark_dirty();
+                tracing::error!(
+                    id = row.id,
+                    error = %e,
+                    "attach authz blob resolve failed after Done; marked entity store dirty"
+                );
+            }
+        }
+
+        Ok(ExecuteOutcome::Done {
+            id: row.id,
+            landed_commit_id,
+            root_cas_writes: 1,
         })
     }
 
@@ -1158,10 +1654,13 @@ mod tests {
         let id = enqueue_and_claim(&svc, "CL-B3-NZ").await;
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1192,11 +1691,14 @@ mod tests {
         let exec = {
             let svc = svc.clone();
             tokio::spawn(async move {
-                svc.execute_b3(ExecuteRequest {
-                    id,
-                    pre_lock_delay: Duration::from_millis(80),
-                    ..Default::default()
-                })
+                svc.execute_b3(
+                    ExecuteRequest {
+                        id,
+                        pre_lock_delay: Duration::from_millis(80),
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .await
             })
         };
@@ -1221,14 +1723,17 @@ mod tests {
         let id = enqueue_and_claim(&svc, "CL-B3-CASMISS").await;
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                force_cas_miss: true,
-                kind_root_write: KindRootWrite::Advance,
-                advance_commit: Some("e".repeat(40)),
-                advance_tree: Some("f".repeat(40)),
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    force_cas_miss: true,
+                    kind_root_write: KindRootWrite::Advance,
+                    advance_commit: Some("e".repeat(40)),
+                    advance_tree: Some("f".repeat(40)),
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(outcome, ExecuteOutcome::BypassDetected { id });
@@ -1277,10 +1782,13 @@ mod tests {
         .unwrap();
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(outcome, ExecuteOutcome::BypassDetected { id });
@@ -1311,10 +1819,13 @@ mod tests {
             .unwrap();
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(outcome, ExecuteOutcome::HardStopped { id });
@@ -1330,11 +1841,14 @@ mod tests {
         let id = enqueue_and_claim(&svc, "CL-B4-CF").await;
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                force_conflict: true,
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    force_conflict: true,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         let ExecuteOutcome::Requeued {
@@ -1367,11 +1881,14 @@ mod tests {
         let id = enqueue_and_claim(&svc, "CL-B4-FAIL").await;
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                force_failure: Some("injected boom".into()),
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    force_failure: Some("injected boom".into()),
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1397,13 +1914,16 @@ mod tests {
         let new_t = "f".repeat(40);
 
         let outcome = svc
-            .execute_b3(ExecuteRequest {
-                id,
-                kind_root_write: KindRootWrite::Advance,
-                advance_commit: Some(new_c.clone()),
-                advance_tree: Some(new_t.clone()),
-                ..Default::default()
-            })
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    kind_root_write: KindRootWrite::Advance,
+                    advance_commit: Some(new_c.clone()),
+                    advance_tree: Some(new_t.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(

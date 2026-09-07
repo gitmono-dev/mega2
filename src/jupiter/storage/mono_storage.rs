@@ -150,6 +150,119 @@ impl MonoStorage {
         Ok(result)
     }
 
+    /// Main refs under `path/` with a component boundary (`path LIKE '{p}/%'`).
+    /// Uses `escape_like` so `%`/`_`/`\` in path cannot broaden the match.
+    pub async fn list_descendant_main_refs(
+        &self,
+        path: &str,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        self.list_descendant_main_refs_on(self.get_connection(), path)
+            .await
+    }
+
+    pub async fn list_descendant_main_refs_in_txn(
+        &self,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        self.list_descendant_main_refs_on(txn, path).await
+    }
+
+    async fn list_descendant_main_refs_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        use crate::common::utils::escape_like;
+        let normalized = if path.is_empty() { "/" } else { path };
+        // `LIKE '/%'` matches `/` itself because `%` may be empty — always
+        // exclude the query path from "descendants".
+        let pattern = if normalized == "/" {
+            "/%".to_owned()
+        } else {
+            format!("{}/%", escape_like(normalized.trim_end_matches('/')))
+        };
+        let result = mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.like(pattern))
+            .filter(mega_refs::Column::Path.ne(normalized.to_owned()))
+            .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME.to_owned()))
+            .filter(mega_refs::Column::IsCl.eq(false))
+            .all(conn)
+            .await?;
+        Ok(result)
+    }
+
+    /// Strict non-root ancestors of `path` (excludes `path` itself and `/`).
+    pub fn strict_non_root_ancestor_paths(path: &str) -> Vec<String> {
+        use std::path::Path;
+        Path::new(path)
+            .ancestors()
+            .skip(1)
+            .filter_map(|a| {
+                let s = a.to_str()?;
+                if s.is_empty() || s == "/" {
+                    None
+                } else {
+                    Some(s.to_owned())
+                }
+            })
+            .collect()
+    }
+
+    pub async fn attach_materialization_precheck(&self, path: &str) -> Result<(), MegaError> {
+        self.attach_materialization_precheck_on(self.get_connection(), path)
+            .await
+    }
+
+    pub async fn attach_materialization_precheck_in_txn(
+        &self,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        self.attach_materialization_precheck_on(txn, path).await
+    }
+
+    async fn attach_materialization_precheck_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+    ) -> Result<(), MegaError> {
+        use crate::common::utils::canonicalize_mono_ref_path;
+        let normalized = canonicalize_mono_ref_path(path)?;
+        if normalized != "/" {
+            let target = mega_refs::Entity::find()
+                .filter(mega_refs::Column::Path.eq(normalized.clone()))
+                .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME.to_owned()))
+                .one(conn)
+                .await?;
+            if target.is_some() {
+                return Err(MegaError::Other(format!(
+                    "attach refused: path '{normalized}' already has a materialized main ref (I3)"
+                )));
+            }
+            for ancestor in Self::strict_non_root_ancestor_paths(&normalized) {
+                let row = mega_refs::Entity::find()
+                    .filter(mega_refs::Column::Path.eq(ancestor.clone()))
+                    .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME.to_owned()))
+                    .one(conn)
+                    .await?;
+                if row.is_some() {
+                    return Err(MegaError::Other(format!(
+                        "attach refused: ancestor '{ancestor}' already has a materialized main ref (I3)"
+                    )));
+                }
+            }
+        }
+        let descendants = self.list_descendant_main_refs_on(conn, &normalized).await?;
+        if let Some(d) = descendants.first() {
+            return Err(MegaError::Other(format!(
+                "attach refused: descendant '{}' already has a materialized main ref (I3)",
+                d.path
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn get_ref_by_commit(
         &self,
         path: &str,
@@ -814,8 +927,7 @@ impl MonoStorage {
         Ok(mega_commit::Entity::find()
             .filter(mega_commit::Column::CommitId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_commits_by_hashes(
@@ -836,8 +948,7 @@ impl MonoStorage {
         Ok(mega_tree::Entity::find()
             .filter(mega_tree::Column::TreeId.eq(hash))
             .one(self.get_connection())
-            .await
-            .unwrap())
+            .await?)
     }
 
     pub async fn get_trees_by_hashes(
