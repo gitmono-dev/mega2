@@ -245,6 +245,21 @@ in the background. Logs: `${TMPDIR:-/tmp}/monoengine-reload-website-next/build.l
 Project hooks in `.cursor/hooks.json` trigger the same script on megaui file
 edits and again on agent `stop` when a reload was requested.
 
+## Task card release (plan-20260905 and other `docs/plan/` cards)
+
+When a plan task card is complete (`Lifecycle=done`, dual review PASS), do
+**not** wait for the user to ask: bump version, commit that card only, and
+push. VCS is Libra (no `git`).
+
+1. Bump `Cargo.toml` `version` by the card’s `Version increment` (default
+   **patch +1**) and refresh `Cargo.lock` for `monoengine`.
+2. `libra add` + `libra commit -m` for **that card only**.
+3. `libra push origin main`. Never `--force`. If the branch has diverged from
+   origin, stop and report.
+4. Start the next card only after this card’s commit and push succeed.
+
+See `.cursor/rules/task-card-release.mdc`.
+
 ## Boundaries
 
 - **Do not** commit secrets, real tokens, or production `config.toml` values.
