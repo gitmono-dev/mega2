@@ -231,8 +231,8 @@ concrete backend is built through `crate::jupiter::storage::object_storage::buil
 
 ## Website-next IT stack reload
 
-When you change **`../monoui`** sources that affect the Code workspace or
-`apps/next-app`, rebuild and restart the compose `website-next` service after
+When you change **`../megaui`** sources that affect `apps/web`, rebuild and
+restart the compose `website-next` service after
 the change (do not wait for the user to ask):
 
 ```bash
@@ -242,7 +242,7 @@ the change (do not wait for the user to ask):
 The script debounces rapid edits (~3s) and runs `docker compose` build + recreate
 in the background. Logs: `${TMPDIR:-/tmp}/monoengine-reload-website-next/build.log`.
 
-Project hooks in `.cursor/hooks.json` trigger the same script on monoui file
+Project hooks in `.cursor/hooks.json` trigger the same script on megaui file
 edits and again on agent `stop` when a reload was requested.
 
 ## Boundaries

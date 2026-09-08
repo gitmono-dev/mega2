@@ -50,13 +50,13 @@
 | --- | --- |
 | OS | **全量 IT / `git-cli`** 在 **Linux 与 macOS Docker Desktop** 上验收（bridge + `host.docker.internal`）；Windows 未验收 |
 | 工具 | Docker Compose v2、Rust stable、nightly（仅 `rustfmt` 门禁） |
-| 仓库布局 | 对象存储内联于 `src/orbit_api/` + `src/orbit/`；compose 构建 monoui 时仍需 sibling `../monoui` |
+| 仓库布局 | 对象存储内联于 `src/orbit_api/` + `src/orbit/`；compose 构建 megaui 时仍需 sibling `../megaui` |
 | 配置 | 从示例生成本地 env（不提交）：`cp .env.test.example .env.test`（`dev-test.sh` 会自动创建） |
 
 公开测试凭据（仅 IT 栈，已写在 compose / example 中）：
 
 - Postgres：用户/库 `monoengine`，密码 `monoengine_test_password`
-- RustFS：`rustfs` / `rustfs_secret`，桶 **`monoengine`**（monoengine IT）与 **`monoui`**（monoui 上传，FS-ME-01）
+- RustFS：`rustfs` / `rustfs_secret`，桶 **`monoengine`**（monoengine IT）与保留名称 **`monoui`**（megaui 上传，FS-ME-01）
 
 ## 快速开始：普通 / 基础测试
 
@@ -252,14 +252,13 @@ curl -fsS http://127.0.0.1:18025/api/v1/messages
 Mailpit 可用性作为启动或测试门。注意 IT 栈默认注入的是 `EMAIL_PROVIDER=test`
 （进程内内存 provider，**不发 SMTP**），因此 WE-06 通过时 Mailpit 里**本就应当为空**；
 要让邮件真正落到 Mailpit，需把 `website-next` 的 `EMAIL_PROVIDER` 改为 `smtp` 并设置
-`SMTP_HOST=mailpit` / `SMTP_PORT=1025`。前端仓库自 2026-08-21 起为
-`gitmono-dev/monoui`（sibling `../monoui`）。
+`SMTP_HOST=mailpit` / `SMTP_PORT=1025`。前端仓库为 sibling `../megaui`（`apps/web`）。
 
 **Workspace Code 栈 IT（`WEBSITE_IT=1`）**
 
 `docker-compose.test.yml` 的 `website-next` 服务注入
 `MEGA_CODE_DATA_BACKEND=monoengine` 与容器内 `MONOENGINE_PUBLIC_BASE_URL=http://monoengine:8000`，
-使 monoui `/api/mega` Code 读路径经 BFF 转发 monoengine。在 monoui 仓执行：
+使 megaui `/api/mega` Code 读路径经 BFF 转发 monoengine。在 megaui 仓执行：
 
 ```bash
 WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
@@ -269,7 +268,7 @@ WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
 
 **Workspace 对象存储 IT（FS-02，`website-next`）**
 
-`website-next` 还注入 RustFS S3 环境（monoui 固定桶 **`monoui`**）：
+`website-next` 还注入 RustFS S3 环境（保留桶名 **`monoui`**）：
 
 | 变量 | compose 值 |
 |------|------------|
@@ -281,7 +280,7 @@ WEBSITE_IT=1 pnpm test:api -- tests/api/mega/workspace-code-stack.test.ts
 | `S3_ACCESS_KEY_ID` / `S3_ACCESS_KEY_SECRET` | `rustfs` / `rustfs_secret` |
 
 `website-next` 依赖 `rustfs-init: service_healthy`（双桶 **`monoengine`** + **`monoui`** 已建）。
-设计细节见 monoui [`docs/implementation/workspace-storage-backend.md`](../monoui/docs/implementation/workspace-storage-backend.md)。
+设计细节见 megaui [`docs/implementation/workspace-storage-backend.md`](../megaui/docs/implementation/workspace-storage-backend.md)。
 
 **干净重置**
 

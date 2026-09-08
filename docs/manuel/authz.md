@@ -4,7 +4,7 @@
 
 术语约定：**认证** = website Better Auth 会话与 Mono access token / Bot / SSH 公钥身份；**授权** = monoengine Cedar 三态（`off` / `shadow` / `enforce`）对 HTTP guard 与 Git push 的判定。
 
-本文中 **website** 是角色名（认证面），其实现仓库自 2026-08-21 起为 `gitmono-dev/monoui` 的 `monoengine` 分支 `apps/next-app`（sibling `../monoui`）；Compose 服务名 `website-next`、隔离账户库名 `website` 与 `MEGA_OAUTH__WEBSITE_*` 配置键均未改名。
+本文中 **website** 是角色名（认证面），其实现仓库为 sibling `../megaui` 的 `apps/web`；Compose 服务名 `website-next`、隔离账户库名 `website` 与 `MEGA_OAUTH__WEBSITE_*` 配置键均未改名。
 
 ---
 

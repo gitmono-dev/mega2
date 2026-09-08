@@ -10,7 +10,7 @@
 
 目標是讓團隊能回答「誰因何需求修改了什麼、在哪個精確版本上得到哪些驗證、由誰批准、最後進入哪個主幹版本」，並把有效歷史回饋給後續 Agent 任務。產品最小閉環是跨服務修改的證據審查與合併把關。
 
-monoengine 的責任是中央接收、身分與授權、持久化、關係索引、證據有效性、批准及 landing；Libra 的責任是本機工作區、Agent adapter、捕獲、脫敏、checkpoint 與上傳。monoui 消費 monoengine API 呈現 diff、證據及批准；本文只定義它所需的後端契約。
+monoengine 的責任是中央接收、身分與授權、持久化、關係索引、證據有效性、批准及 landing；Libra 的責任是本機工作區、Agent adapter、捕獲、脫敏、checkpoint 與上傳。megaui 消費 monoengine API 呈現 diff、證據及批准；本文只定義它所需的後端契約。
 
 下列內容不在本次重構的核心交付範圍：
 
@@ -169,12 +169,12 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 ### REQ-LB-07 — 評審與歷史查詢 API（P1）
 
 - 可由 commit、CL revision、change、run、repo/path 查詢完整關係；回傳來源定位、coverage、信任、有效性與缺失原因。unknown 保持 unknown。
-- monoui 所需契約包括 diff 對應意圖摘要、被否決方案、測試版本、批准／撤銷及 landing；不要求 reviewer 預設讀取全部 transcript。
+- megaui 所需契約包括 diff 對應意圖摘要、被否決方案、測試版本、批准／撤銷及 landing；不要求 reviewer 預設讀取全部 transcript。
 - 所有摘要保留來源 bundle／物件／事件位置、生成器及版本；人類批准與模型建議用不同類型表示。
 - history retrieval 按 revision、依賴 fingerprint、有效／否決狀態及當前權限過濾。被否決方案可作反例，但不得標成推薦；新任務不自動執行歷史指令。
 - 以 keyset cursor 分頁、指定投影版本／讀取水位；投影可重建，落後時回傳 pending／watermark，而非以空結果暗示無證據。合併門讀取權威狀態，不依賴最終一致的搜尋索引。
 
-**驗收**：AC-LB-07／10／11。monoui 變更需另行納入實作寫集、同栈測試與 README 所載 rebuild/reload 工作流；本次不修改前端。
+**驗收**：AC-LB-07／10／11。megaui 變更需另行納入實作寫集、同栈測試與 README 所載 rebuild/reload 工作流；本次不修改前端。
 
 ### REQ-LB-08 — 影響分析與外部 SCM 模式（P2，可選擴展）
 
@@ -205,7 +205,7 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 | LB-03／06 | [trunk-push.md](trunk-push.md) 階段 1–3、ADR-TP-10/14/15/16 | 前置／協同 | 共用 root writer 和 provenance；ADR-TP-10 只限制 push 行，merge 不新增路徑唯一約束；no-op 無新根 commit |
 | LB-04／05 | 既有 Cedar、BotIdentity；[website-auth.md](website-auth.md) 的認證分工 | 前置 | 新服務身分不另建登入面；政策快取、各入口及撤銷一致 |
 | LB-01／04／09 | [config.md](config.md)、[vault.md](vault.md) 現行配置／SecretRef 約束 | 協同 | 使用既有啟動與憑據載入次序；新增 config schema／validation／reload 需同步既有規則 |
-| LB-07 | monoui API 消費 | 後置 | 後端契約先凍結；前端不讀 artifact store 或 DB 旁路授權 |
+| LB-07 | megaui API 消費 | 後置 | 後端契約先凍結；前端不讀 artifact store 或 DB 旁路授權 |
 | LB-08 | 既有 CI／SCM provider adapter | 可選 | 固定測試集合即可完成首批 gate，不依赖 Orion 整體移植 |
 | 全部 | [integration.md](integration.md)、[test-infra.md](test-infra.md) | 協同 | AC-LB 場景登记、migration 真實建庫、雙進程與真 Libra 客户端 |
 
@@ -221,7 +221,7 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 | 1：可信接收 | LB-01／02、LB-04 接收讀取所需權限、LB-09 基礎隔離／保留；schema 用 additive migration | 0 | AC-01（至 bundle 查回）、02/03、06（接收／讀取）、07（既有讀取／下載面）、13（攝取／保留子集）；legacy 不能冒充 verified |
 | 2：任務與 lineage | LB-03、LB-07 基本查詢；為舊 CL 建立 legacy change mapping | 1 | AC-01（含 CL 查詢）、04、05/10 的修訂及來源查詢子集；不要求尚未交付的 gate／landing 通過 |
 | 3：主幹把關 | LB-05／06；復用已驗收的 root writer；先 observe 對照再逐 repo 啟用 required | 2＋trunk-push 1–3 | 完整 AC-05/06/08/09/10，AC-12 的 landing crash／migration 子集及 AC-13 的未落地 gate 子集；所有落地入口無旁路 |
-| 4：團隊歷史與運維 | 完整 LB-07／09；monoui 契約、刪除／restore／投影重建 | 3 | AC-07/10/11/12/13；版本追溯與刪除不復活，評審可看對應證據 |
+| 4：團隊歷史與運維 | 完整 LB-07／09；megaui 契約、刪除／restore／投影重建 | 3 | AC-07/10/11/12/13；版本追溯與刪除不復活，評審可看對應證據 |
 | 5：可選接入 | LB-08 依賴圖與外部 SCM adapter，按獨立能力開關逐一啟用 | 4 | AC-14/15；外部 enforcement 不確定時不聲稱已保護 |
 
 表內 AC 數字均指 `AC-LB-*`。階段 1–3 的子集驗收不能聲稱整項 AC 已完成；階段 4 出口需重跑並完整通過 AC-LB-01…13。階段 0 契約稿須將子集對應到具名測試，未交付介面標為 pending，不用軟跳過當成功。

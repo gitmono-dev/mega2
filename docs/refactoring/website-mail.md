@@ -294,7 +294,7 @@ and acceptance against website tip `a52d703` (see 实现基线).
 > **增补（2026-08-06 完成度复审）：** `config-validation.yml` 的 website checkout pin 已于 plan-20260803 期间（monoengine `39f7433`，website IT 切换 Postgres）bump 为
 > `2af89c874646005dd1a550053b5068f19bb7478a`（`a52d703…` 的直接子提交，仍含 WE-02..WE-05），并已同步 `website-auth.md` / `test-infra.md`；本表「核对日 2026-08-02」各 pin 行为历史快照。现行 pin 的唯一事实源是 workflow 文件本身与 `website-auth.md` §pin 政策。
 
-> **增补（2026-08-21 前端仓库改指）：** 联调栈的前端已由 `genedna/website` 改指
+> **历史快照（2026-08-21 前端仓库改指）：** 当时联调栈的前端由 `genedna/website` 改指
 > **`gitmono-dev/monoui`** 的 `monoengine` 分支（sibling `../monoui`）；WE-02..WE-06
 > 的路由 / Bearer / 五类产品模板 / 幂等 / `EMAIL_PROVIDER=test` 已自
 > `genedna/website@2af89c8` 逐文件移植到 monoui，移植当日接口契约与本文各表**逐项不变**
@@ -307,7 +307,9 @@ and acceptance against website tip `a52d703` (see 实现基线).
 
 客户端与契约：**无已知冲突**（`WebsiteMailClient` 字段与上表一致）。
 
-前端（monoui）实现状态：路由 + Bearer + 五类产品模板 + 幂等 + `EMAIL_PROVIDER=test`/`smtp` 已落地；compose IT 注入 test provider（WE-06）。
+> **现行实现（2026-09-04）：** Compose web profile 已改用 sibling `../megaui` 的
+> `apps/web`；上述 monoui revision 与路径仅用于说明历史迁移。邮件路由、Bearer、模板、
+> 幂等与 `EMAIL_PROVIDER=test`/`smtp` 契约保持不变，Compose IT 仍注入 test provider（WE-06）。
 
 **客户端 vs 契约：** `WebsiteMailClient`（`src/notification/website_mail.rs`）路径、Bearer、`Idempotency-Key`、JSON 字段与上文一致；**无已知冲突**。
 
