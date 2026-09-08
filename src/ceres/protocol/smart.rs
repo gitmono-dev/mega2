@@ -78,7 +78,7 @@ impl SmartSession {
         let service_type = self.service_type;
 
         // The stream MUST include capability declarations behind a NUL on the first ref.
-        let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await;
+        let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
         let name = if head_hash == ZERO_ID {
             "capabilities^{}"
         } else {

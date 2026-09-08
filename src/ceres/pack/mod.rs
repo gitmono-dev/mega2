@@ -39,6 +39,7 @@ use crate::{
 use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 
 pub mod import_repo;
+pub mod materialize;
 pub mod monorepo;
 pub mod push_chain;
 
@@ -87,7 +88,7 @@ pub trait RepoHandler: Send + Sync + 'static {
         true
     }
 
-    async fn refs_with_head_hash(&self) -> (String, Vec<Refs>);
+    async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError>;
 
     async fn receiver_handler(
         self: Arc<Self>,

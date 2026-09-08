@@ -59,6 +59,8 @@ pub enum MegaError {
     ObjStorageInconsistent(String),
     #[error("Monorepo root ref changed concurrently (attach should retry)")]
     StaleMonorepoRootRef,
+    #[error("lazy materialize aborted after concurrent root updates; retry the advertise")]
+    MaterializeAborted,
     #[error("Other error: {0}")]
     Other(String),
     /// Process exit with a frozen CLI status code (UN-29 authz-audit table).
@@ -195,11 +197,16 @@ pub enum ProtocolError {
     InvalidInput(String),
     #[error("HTTP Push Has Been Disabled")]
     Disabled,
+    #[error("lazy materialize aborted after concurrent root updates; retry the advertise")]
+    AdvertiseFailed,
 }
 
 impl From<MegaError> for ProtocolError {
     fn from(err: MegaError) -> ProtocolError {
-        ProtocolError::InvalidInput(err.to_string())
+        match err {
+            MegaError::MaterializeAborted => ProtocolError::AdvertiseFailed,
+            other => ProtocolError::InvalidInput(other.to_string()),
+        }
     }
 }
 
@@ -211,6 +218,10 @@ impl IntoResponse for ProtocolError {
             ProtocolError::TooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
             ProtocolError::NotFound(err) => (StatusCode::NOT_FOUND, err),
             ProtocolError::InvalidInput(err) => (StatusCode::BAD_REQUEST, err),
+            ProtocolError::AdvertiseFailed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                MegaError::MaterializeAborted.to_string(),
+            ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong".to_owned(),
@@ -237,6 +248,18 @@ mod tests {
         let response = ProtocolError::NotFound("repo missing".to_owned()).into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn materialize_aborted_maps_to_advertise_5xx() {
+        let mapped: ProtocolError = MegaError::MaterializeAborted.into();
+        assert!(matches!(mapped, ProtocolError::AdvertiseFailed));
+        let response = mapped.into_response();
+        assert!(response.status().is_server_error());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let parse: ProtocolError = MegaError::Other("bad pkt-line".to_owned()).into();
+        let parse_response = parse.into_response();
+        assert_eq!(parse_response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

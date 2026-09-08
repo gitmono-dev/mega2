@@ -74,6 +74,8 @@
 >
 > **2026-07-01 更新 8**：第二轮 LFS CI gate 暴露普通 `git clone` 在临时 LFS push 后会先拉取 remote 全量 refs，并可在 upload-pack 阶段因临时 CL ref 状态返回 HTTP 400。`lfs_smoke_http` 的验证端现在改为空仓库 `git init`，只 fetch 本次创建的 `refs/cl/*` 到本地 `lfs-smoke` 分支，再执行 checkout、`git lfs pull` 和 locks-list；CI 验证聚焦在目标 CL ref 的 LFS round-trip，不再依赖全量 clone。
 
+> **2026-09-08 更新（TP-10 / ADR-TP-20 第 1 项）**：惰性物化（`info/refs` / `ls-refs` 经 `RepoHandler::refs_with_head_hash`）在锁外遍历后持 `MONO_WRITE_LOCK` 校验根身份对再插入。根在遍历与插入之间被推进时，服务端有界重试（K=2）耗尽后返回 `ProtocolError::AdvertiseFailed`（HTTP **503**），**不再**把失败伪装成空仓库的 capabilities-only advertise。客户端应重试 advertise。错误正文不泄漏内部路径。解析类输入错误仍为 `InvalidInput`（400）。
+
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
 2. **基础 fetch/push/clone 可工作**。当前能支持标准 Git 客户端的基本 clone、fetch、push 操作，但多处使用 `unwrap()` 和缺乏边界检查。

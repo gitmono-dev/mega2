@@ -36,7 +36,7 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Fixed expectation set (11 entries). The diff comparison uses the plain
+# Fixed expectation set. The diff comparison uses the plain
 # `filename:function` lines; the trailing comments are the per-entry exception
 # proof (plan-fixed).
 # ---------------------------------------------------------------------------
@@ -44,10 +44,11 @@ EXPECTED=(
   "import_repo.rs:attach_to_monorepo_parent"        # hooked: UN-16 post-commit notify
   "mono_api_service.rs:apply_update_result"          # hooked: UN-16 post-commit notify
   "monorepo.rs:apply_cl_mega_ref_for_push_command"   # hooked: UN-16 main-delete rejection + notify
-  "mono_api_service.rs:apply_update_result_cl_only"  # exception: CL-only funnel (no main ref write)
-  "mono_service.rs:init_monorepo"                    # exception: first-create of the monorepo root
-  "monorepo.rs:refs_with_head_hash"                  # exception: lazy-create of a missing branch ref
-  "code_edit/utils.rs:create_repo_commit"            # exception: lazy-create of a missing branch ref
+  "mono_api_service.rs:apply_update_result_in_txn"  # hooked: queue B3 merge write
+  "mono_api_service.rs:update_branch"                # hooked: branch ref write
+  "mono_service.rs:initialize_monorepo"             # exception: first-create of the monorepo root
+  "materialize.rs:persist_walked_refs"            # exception: lazy-create of a missing branch ref (ADR-TP-20)
+  "push_queue_service.rs:b3_execute_attach_inner"  # hooked: queue B3 attach write
   "mono_api_service.rs:delete_tag"                   # exception: tag-only ref removal
   "import_api_service.rs:delete_tag"                 # exception: tag-only ref removal
   "import_repo.rs:update_refs"                       # exception: tag-only ref removal
@@ -99,7 +100,7 @@ from collections import defaultdict
 PRIMITIVES = (
     r'batch_update_by_path_concurrent|attach_to_monorepo_parent_in_txn|'
     r'remove_ref|mega_head_hash_with_txn|batch_save_model_with_txn|'
-    r'save_or_update_cl_ref'
+    r'save_or_update_cl_ref|insert_ref_if_not_exists_in_txn'
 )
 FN_DEF = re.compile(r'\bfn\s+(?:' + PRIMITIVES + r')\b')
 FN_ANY = re.compile(r'\bfn\s+([A-Za-z_][A-Za-z0-9_]*)')

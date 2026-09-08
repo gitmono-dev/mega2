@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     vec,
 };
 
@@ -13,7 +13,7 @@ use git_internal::{
 };
 
 use crate::{
-    callisto::{mega_cl, mega_refs},
+    callisto::mega_cl,
     ceres::{
         api_service::{ApiHandler, commit_ops, mono_api_service::MonoServiceLogic},
         model::change_list::ClDiffFile,
@@ -360,87 +360,7 @@ pub async fn get_parent_policy_content<T: ApiHandler>(
 }
 
 pub async fn create_repo_commit(storage: &Storage, repo_path: &str) -> Result<String, MegaError> {
-    let storage = storage.mono_storage();
-
-    let path_refs = storage.get_all_refs(repo_path, false).await?;
-
-    let heads_exist = path_refs
-        .iter()
-        .any(|x| x.ref_name == crate::common::utils::MEGA_BRANCH_NAME);
-
-    let refs: Vec<mega_refs::Model> = if heads_exist {
-        path_refs
-    } else {
-        let target_path = PathBuf::from(repo_path);
-        let mut refs: Vec<_> = vec![];
-
-        let root_refs = storage.get_all_refs("/", true).await?;
-
-        for root_ref in root_refs {
-            let (tree_hash, commit_hash) = (root_ref.ref_tree_hash, root_ref.ref_commit_hash);
-            let mut tree: Tree =
-                Tree::from_mega_model(storage.get_tree_by_hash(&tree_hash).await?.unwrap());
-
-            let commit: Commit = Commit::from_mega_model(
-                storage
-                    .get_commit_by_hash(&commit_hash)
-                    .await?
-                    .expect("can't get commit by ref.ref_commit_hash"),
-            );
-
-            for component in target_path.components() {
-                if component != Component::RootDir {
-                    let path_compo_name = component.as_os_str().to_str().unwrap();
-                    let path_compo_hash = tree
-                        .tree_items
-                        .iter()
-                        .find(|x| x.name == path_compo_name)
-                        .map(|x| x.id);
-                    if let Some(hash) = path_compo_hash {
-                        tree = Tree::from_mega_model(
-                            storage
-                                .get_tree_by_hash(&hash.to_string())
-                                .await?
-                                .expect("can't get commit by tree_items hash"),
-                        );
-                    } else {
-                        return Ok(ZERO_ID.to_string());
-                    }
-                }
-            }
-            let parents = storage
-                .materialize_parents(repo_path, &root_ref.ref_name)
-                .await?;
-            let continued = !parents.is_empty();
-            let c = Commit::new(
-                commit.author,
-                commit.committer,
-                tree.id,
-                parents,
-                &commit.message,
-            );
-
-            let new_mega_ref = mega_refs::Model::new(
-                repo_path,
-                root_ref.ref_name.clone(),
-                c.id.to_string(),
-                c.tree_id.to_string(),
-                false,
-            );
-
-            storage
-                .mega_head_hash_with_txn(new_mega_ref.clone(), c)
-                .await?;
-            if continued {
-                storage
-                    .delete_tombstone(repo_path, &root_ref.ref_name)
-                    .await?;
-            }
-
-            refs.push(new_mega_ref);
-        }
-        refs
-    };
+    let refs = crate::ceres::pack::materialize::materialize_path_refs(storage, repo_path).await?;
     let mut head_hash = ZERO_ID.to_string();
     for git_ref in refs.iter() {
         if git_ref.ref_name == crate::common::utils::MEGA_BRANCH_NAME {

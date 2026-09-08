@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Component, PathBuf},
+    path::PathBuf,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -121,99 +121,17 @@ impl RepoHandler for Monorepo {
         false
     }
 
-    async fn refs_with_head_hash(&self) -> (String, Vec<Refs>) {
-        let storage = self.storage.mono_storage();
-
-        let path_refs = storage
-            .get_all_refs(self.path.to_str().unwrap(), false)
-            .await
-            .unwrap();
-
-        let heads_exist = path_refs
-            .iter()
-            .any(|x| x.ref_name == crate::common::utils::MEGA_BRANCH_NAME);
-
-        let refs = if heads_exist {
-            let refs: Vec<Refs> = path_refs.into_iter().map(|x| x.into()).collect();
-            refs
-        } else {
-            let target_path = self.path.clone();
-            let mut refs = vec![];
-
-            let root_refs = storage.get_all_refs("/", true).await.unwrap();
-
-            for root_ref in root_refs {
-                let (tree_hash, commit_hash) = (root_ref.ref_tree_hash, root_ref.ref_commit_hash);
-                let mut tree: Tree = Tree::from_mega_model(
-                    storage.get_tree_by_hash(&tree_hash).await.unwrap().unwrap(),
-                );
-
-                let commit: Commit = Commit::from_mega_model(
-                    storage
-                        .get_commit_by_hash(&commit_hash)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                );
-
-                for component in target_path.components() {
-                    if component != Component::RootDir {
-                        let path_compo_name = component.as_os_str().to_str().unwrap();
-                        let path_compo_hash = tree
-                            .tree_items
-                            .iter()
-                            .find(|x| x.name == path_compo_name)
-                            .map(|x| x.id);
-                        if let Some(hash) = path_compo_hash {
-                            tree = Tree::from_mega_model(
-                                storage
-                                    .get_tree_by_hash(&hash.to_string())
-                                    .await
-                                    .unwrap()
-                                    .unwrap(),
-                            );
-                        } else {
-                            return (ZERO_ID.to_string(), vec![]);
-                        }
-                    }
-                }
-                let parents = storage
-                    .materialize_parents(self.path.to_str().unwrap(), &root_ref.ref_name)
-                    .await
-                    .unwrap();
-                let continued = !parents.is_empty();
-                let c = Commit::new(
-                    commit.author,
-                    commit.committer,
-                    tree.id,
-                    parents,
-                    &commit.message,
-                );
-
-                let new_mega_ref = mega_refs::Model::new(
-                    &self.path,
-                    root_ref.ref_name.clone(),
-                    c.id.to_string(),
-                    c.tree_id.to_string(),
-                    false,
-                );
-
-                storage
-                    .mega_head_hash_with_txn(new_mega_ref.clone(), c)
-                    .await
-                    .unwrap();
-                if continued {
-                    storage
-                        .delete_tombstone(self.path.to_str().unwrap(), &root_ref.ref_name)
-                        .await
-                        .unwrap();
-                }
-
-                refs.push(new_mega_ref.into());
-            }
-            refs
-        };
-        self.find_head_hash(refs)
+    async fn refs_with_head_hash(&self) -> Result<(String, Vec<Refs>), MegaError> {
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".into()))?;
+        let refs: Vec<Refs> = super::materialize::materialize_path_refs(&self.storage, path)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        Ok(self.find_head_hash(refs))
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
@@ -1495,8 +1413,14 @@ mod tests {
     use crate::{
         bellatrix::Bellatrix,
         callisto::{commit_auths, mega_commit, mega_tree},
-        ceres::{api_service::cache::GitObjectCache, protocol::import_refs::RefCommand},
-        common::utils::{MEGA_BRANCH_NAME, ZERO_ID},
+        ceres::{
+            api_service::cache::GitObjectCache, pack::materialize,
+            protocol::import_refs::RefCommand,
+        },
+        common::{
+            errors::{MegaError, ProtocolError},
+            utils::{MEGA_BRANCH_NAME, ZERO_ID},
+        },
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
             tests::test_storage,
@@ -2093,5 +2017,250 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.ref_commit_hash, head);
+    }
+
+    async fn advance_root_dir(
+        storage: &Storage,
+        dir: &str,
+        blob: &'static [u8],
+    ) -> (String, String) {
+        let mono = storage.mono_storage();
+        let old = mono.get_main_ref("/").await.unwrap().expect("root ref");
+        let blob_id = storage
+            .git_service
+            .save_object_from_raw(bytes::Bytes::from_static(blob))
+            .await
+            .expect("blob");
+        let leaf = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(&blob_id).expect("blob hash"),
+            ".gitkeep".to_string(),
+        )])
+        .expect("leaf");
+        let root = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            leaf.id,
+            dir.to_string(),
+        )])
+        .expect("root");
+        let commit = test_commit("advanced root");
+        let parent = ObjectHash::from_str(&old.ref_commit_hash).unwrap();
+        let commit = Commit::new(
+            commit.author,
+            commit.committer,
+            root.id,
+            vec![parent],
+            &commit.message,
+        );
+        let commit_id = commit.id.to_string();
+        let tree_id = root.id.to_string();
+        mono.save_mega_trees(
+            vec![leaf, root],
+            ObjectHash::from_str(&commit_id).unwrap(),
+            None,
+        )
+        .await
+        .expect("trees");
+        mono.save_mega_commits(vec![commit], None)
+            .await
+            .expect("commit");
+        let txn = mono.get_connection().begin().await.unwrap();
+        let ok = mono
+            .cas_update_root_main_ref_in_txn(
+                &txn,
+                Some(&old.ref_commit_hash),
+                Some(&old.ref_tree_hash),
+                &commit_id,
+                &tree_id,
+            )
+            .await
+            .unwrap();
+        assert!(ok, "root CAS must succeed");
+        txn.commit().await.unwrap();
+        (commit_id, tree_id)
+    }
+
+    #[tokio::test]
+    async fn tp10_materialize_abandons_when_root_advances_after_walk() {
+        let _lock = materialize::lock_materialize_tests().await;
+        materialize::reset_materialize_test_counters();
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "foo").await;
+        let mut first = true;
+        let refs = materialize::materialize_path_refs_with_hook(&storage, "/foo", false, || {
+            let s = storage.clone();
+            let run = first;
+            first = false;
+            async move {
+                if run {
+                    advance_root_dir(&s, "foo", b"next").await;
+                }
+            }
+        })
+        .await
+        .expect("retry after abandon must succeed");
+        assert!(
+            materialize::ABANDON_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "lock insert must abandon the stale walk"
+        );
+        let row = refs
+            .iter()
+            .find(|r| r.ref_name == MEGA_BRANCH_NAME)
+            .expect("main ref");
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let root_tree = Tree::from_mega_model(
+            storage
+                .mono_storage()
+                .get_tree_by_hash(&root.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let foo_id = root_tree
+            .tree_items
+            .iter()
+            .find(|i| i.name == "foo")
+            .expect("foo")
+            .id
+            .to_string();
+        assert_eq!(row.ref_tree_hash, foo_id);
+        assert_ne!(row.ref_commit_hash, ZERO_ID);
+    }
+
+    #[tokio::test]
+    async fn tp10_materialize_retries_exhausted_returns_error_not_empty_refs() {
+        let _lock = materialize::lock_materialize_tests().await;
+        materialize::reset_materialize_test_counters();
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "foo").await;
+        let err = materialize::materialize_path_refs_with_hook(&storage, "/foo", false, || {
+            let s = storage.clone();
+            async move {
+                advance_root_dir(&s, "foo", b"spin").await;
+            }
+        })
+        .await
+        .expect_err("retries exhausted");
+        assert!(matches!(err, MegaError::MaterializeAborted));
+        let mapped: ProtocolError = err.into();
+        assert!(matches!(mapped, ProtocolError::AdvertiseFailed));
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/foo")
+                .await
+                .unwrap()
+                .is_none(),
+            "abandon must not insert"
+        );
+        let create_err = crate::ceres::code_edit::utils::create_repo_commit(&storage, "/missing")
+            .await
+            .unwrap();
+        assert_eq!(
+            create_err, ZERO_ID,
+            "path absent still advertises as empty, not MaterializeAborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp10_not_exists_rereads_persisted_row() {
+        let _lock = materialize::lock_materialize_tests().await;
+        materialize::reset_materialize_test_counters();
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "foo").await;
+        let dummy_commit = "aa".repeat(20);
+        let dummy_tree = "bb".repeat(20);
+        storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model::new(
+                    "/foo",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    dummy_commit.clone(),
+                    dummy_tree.clone(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let refs =
+            materialize::materialize_path_refs_with_hook(&storage, "/foo", true, || async {})
+                .await
+                .expect("NOT EXISTS re-read");
+        let row = refs
+            .iter()
+            .find(|r| r.ref_name == MEGA_BRANCH_NAME)
+            .expect("main");
+        assert_eq!(row.ref_commit_hash, dummy_commit);
+        assert_eq!(row.ref_tree_hash, dummy_tree);
+    }
+
+    #[tokio::test]
+    async fn tp10_retry_bypasses_heads_exist() {
+        let _lock = materialize::lock_materialize_tests().await;
+        materialize::reset_materialize_test_counters();
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "foo").await;
+        let dummy_commit = "cc".repeat(20);
+        let dummy_tree = "dd".repeat(20);
+        let mut n = 0u8;
+        let _refs = materialize::materialize_path_refs_with_hook(&storage, "/foo", false, || {
+            n += 1;
+            let s = storage.clone();
+            let insert = n == 1;
+            let dummy_commit = dummy_commit.clone();
+            let dummy_tree = dummy_tree.clone();
+            async move {
+                if insert {
+                    s.mono_storage()
+                        .save_refs(
+                            crate::callisto::mega_refs::Model::new(
+                                "/foo",
+                                MEGA_BRANCH_NAME.to_owned(),
+                                dummy_commit,
+                                dummy_tree,
+                                false,
+                            ),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    advance_root_dir(&s, "foo", b"next").await;
+                }
+            }
+        })
+        .await
+        .expect("retry after concurrent insert");
+        assert!(
+            materialize::WALK_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "retry must bypass heads_exist and walk again"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp10_refs_with_head_hash_materializes_without_race() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "foo").await;
+        let mut repo = test_monorepo(&storage, vec![], HashSet::new(), HashSet::new());
+        repo.path = PathBuf::from("/foo");
+        let (head, refs) = repo.refs_with_head_hash().await.expect("advertise");
+        assert_ne!(head, ZERO_ID);
+        assert!(refs.iter().any(|r| r.default_branch));
+        let via_create = crate::ceres::code_edit::utils::create_repo_commit(&storage, "/foo")
+            .await
+            .unwrap();
+        assert_eq!(head, via_create);
     }
 }

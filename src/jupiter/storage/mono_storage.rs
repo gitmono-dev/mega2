@@ -170,6 +170,25 @@ impl MonoStorage {
         path: &str,
         filter_cl: bool,
     ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        self.get_all_refs_on(self.get_connection(), path, filter_cl)
+            .await
+    }
+
+    pub async fn get_all_refs_in_txn(
+        &self,
+        path: &str,
+        filter_cl: bool,
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        self.get_all_refs_on(txn, path, filter_cl).await
+    }
+
+    async fn get_all_refs_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+        filter_cl: bool,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
         let mut query = mega_refs::Entity::find()
             .filter(mega_refs::Column::Path.eq(path))
             .order_by_asc(mega_refs::Column::RefName);
@@ -177,7 +196,7 @@ impl MonoStorage {
         if filter_cl {
             query = query.filter(mega_refs::Column::IsCl.eq(false));
         }
-        let result = query.all(self.get_connection()).await?;
+        let result = query.all(conn).await?;
 
         Ok(result)
     }
@@ -202,6 +221,62 @@ impl MonoStorage {
             .one(txn)
             .await?;
         Ok(result)
+    }
+
+    pub async fn get_ref_in_txn(
+        &self,
+        path: &str,
+        ref_name: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_refs::Model>, MegaError> {
+        Ok(mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.eq(path))
+            .filter(mega_refs::Column::RefName.eq(ref_name))
+            .one(txn)
+            .await?)
+    }
+
+    /// Insert a path ref only when no `(path, ref_name)` row exists.
+    ///
+    /// On a `NOT EXISTS` hit, re-reads and returns the persisted row instead of
+    /// the computed model (ADR-TP-20 item 1).
+    pub async fn insert_ref_if_not_exists_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        model: mega_refs::Model,
+    ) -> Result<mega_refs::Model, MegaError> {
+        let path = model.path.clone();
+        let ref_name = model.ref_name.clone();
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO mega_refs (
+                id, path, ref_name, ref_commit_hash, ref_tree_hash,
+                created_at, updated_at, is_cl
+            )
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8
+            WHERE NOT EXISTS (
+                SELECT 1 FROM mega_refs WHERE path = $2 AND ref_name = $3
+            )
+            RETURNING id
+            "#,
+            [
+                sea_orm::Value::from(model.id),
+                sea_orm::Value::from(model.path.clone()),
+                sea_orm::Value::from(model.ref_name.clone()),
+                sea_orm::Value::from(model.ref_commit_hash.clone()),
+                sea_orm::Value::from(model.ref_tree_hash.clone()),
+                sea_orm::Value::from(model.created_at),
+                sea_orm::Value::from(model.updated_at),
+                sea_orm::Value::from(model.is_cl),
+            ],
+        );
+        if txn.query_one_raw(stmt).await?.is_some() {
+            return Ok(model);
+        }
+        self.get_ref_in_txn(&path, &ref_name, txn)
+            .await?
+            .ok_or_else(|| MegaError::Other("ref row vanished after NOT EXISTS".into()))
     }
 
     /// Point lookup of a tombstone by primary key `(path, ref_name)`.
@@ -396,7 +471,26 @@ impl MonoStorage {
         path: &str,
         ref_name: &str,
     ) -> Result<Vec<ObjectHash>, MegaError> {
-        let Some(row) = self.get_tombstone(path, ref_name).await? else {
+        self.materialize_parents_on(self.get_connection(), path, ref_name)
+            .await
+    }
+
+    pub async fn materialize_parents_in_txn(
+        &self,
+        path: &str,
+        ref_name: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<ObjectHash>, MegaError> {
+        self.materialize_parents_on(txn, path, ref_name).await
+    }
+
+    async fn materialize_parents_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+        ref_name: &str,
+    ) -> Result<Vec<ObjectHash>, MegaError> {
+        let Some(row) = self.get_tombstone_on(conn, path, ref_name).await? else {
             return Ok(vec![]);
         };
         let hash = ObjectHash::from_str(&row.last_commit_hash)
