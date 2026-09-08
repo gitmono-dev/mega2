@@ -1,19 +1,31 @@
 use axum::{
     Json,
     extract::{Path, State},
+    http::StatusCode,
 };
 use serde_json::{Value, json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::MERGE_QUEUE_TAG, oauth::OptionalSessionUser},
+    callisto::sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
     ceres::model::merge_queue::{
-        AddToQueueRequest, AddToQueueResponse, QueueItem, QueueListResponse, QueueStatsResponse,
-        QueueStatus, QueueStatusResponse,
+        AddToQueueRequest, AddToQueueResponse, QueueItem, QueueListResponse, QueueStats,
+        QueueStatsResponse, QueueStatus, QueueStatusResponse,
     },
     common::errors::ApiError,
+    config::MergeWriter,
     contract::api::common::CommonResult,
 };
+
+fn retired_gone(feature: &str) -> ApiError {
+    ApiError::with_status(
+        StatusCode::GONE,
+        anyhow::anyhow!(
+            "{feature} is retired on MonoWriteQueue. Queue rows are not deleted (台账). Use POST /push-queue/cancel/{{id}} for a single Queued item."
+        ),
+    )
+}
 
 /// Creates the merge queue router with all endpoints
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -70,11 +82,18 @@ async fn add_to_queue(
                     None
                 });
 
+            let message = if state.storage.config().monorepo.merge_writer
+                == crate::config::MergeWriter::Queue
+            {
+                "Merged".to_string()
+            } else {
+                "Added to queue".to_string()
+            };
             let response = AddToQueueResponse {
                 success: true,
                 position,
                 display_position,
-                message: "Added to queue".to_string(),
+                message,
             };
             Ok(Json(CommonResult::success(Some(response))))
         }
@@ -90,33 +109,15 @@ async fn add_to_queue(
         ("cl_link" = String, Path, description = "CL link to remove")
     ),
     responses(
-        (status = 200, body = CommonResult<Value>, content_type = "application/json")
+        (status = 410, description = "Retired: rows are not deleted from MonoWriteQueue")
     ),
     tag = MERGE_QUEUE_TAG
 )]
 async fn remove_from_queue(
-    state: State<MonoApiServiceState>,
-    Path(cl_link): Path<String>,
+    _state: State<MonoApiServiceState>,
+    Path(_cl_link): Path<String>,
 ) -> Result<Json<CommonResult<Value>>, ApiError> {
-    match state
-        .storage
-        .merge_queue_service
-        .remove_from_queue(&cl_link)
-        .await
-    {
-        Ok(removed) => {
-            if removed {
-                let response = json!({
-                    "success": true,
-                    "message": "Removed from queue"
-                });
-                Ok(Json(CommonResult::success(Some(response))))
-            } else {
-                Ok(Json(CommonResult::failed("CL not found in queue")))
-            }
-        }
-        Err(e) => Ok(Json(CommonResult::failed(&e.to_string()))),
-    }
+    Err(retired_gone("DELETE /merge-queue/remove"))
 }
 
 /// Gets the current merge queue list
@@ -131,6 +132,23 @@ async fn remove_from_queue(
 async fn get_queue_list(
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<QueueListResponse>>, ApiError> {
+    if state.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+        let rows = state
+            .storage
+            .push_queue_service
+            .storage()
+            .list_merge_for_legacy_ui()
+            .await?;
+        let mut items: Vec<QueueItem> = rows.iter().map(QueueItem::from_push_queue).collect();
+        for (idx, item) in items.iter_mut().enumerate() {
+            item.display_position = Some(idx + 1);
+        }
+        let total_count = items.len();
+        return Ok(Json(CommonResult::success(Some(QueueListResponse {
+            items,
+            total_count,
+        }))));
+    }
     let items = state.storage.merge_queue_service.get_queue_list().await?;
     let response = QueueListResponse::from(items);
     Ok(Json(CommonResult::success(Some(response))))
@@ -152,6 +170,36 @@ async fn get_cl_queue_status(
     state: State<MonoApiServiceState>,
     Path(cl_link): Path<String>,
 ) -> Result<Json<CommonResult<QueueStatusResponse>>, ApiError> {
+    if state.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+        let rows = state
+            .storage
+            .push_queue_service
+            .storage()
+            .list_by_kind_and_operation(PushQueueKindEnum::Merge, &cl_link)
+            .await?;
+        let listed = state
+            .storage
+            .push_queue_service
+            .storage()
+            .list_merge_for_legacy_ui()
+            .await?;
+        let item_opt = rows
+            .first()
+            .map(QueueItem::from_push_queue)
+            .map(|mut item| {
+                if let Some(idx) = listed.iter().position(|r| r.id == item.position) {
+                    item.display_position = Some(idx + 1);
+                }
+                item
+            });
+        let in_queue = item_opt
+            .as_ref()
+            .is_some_and(|i| matches!(i.status, QueueStatus::Waiting | QueueStatus::Merging));
+        return Ok(Json(CommonResult::success(Some(QueueStatusResponse {
+            in_queue,
+            item: item_opt,
+        }))));
+    }
     let item_model = state
         .storage
         .merge_queue_service
@@ -252,6 +300,39 @@ async fn retry_queue_item(
 async fn get_queue_stats(
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<QueueStatsResponse>>, ApiError> {
+    if state.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+        let pq = &state.storage.push_queue_service;
+        let waiting = pq
+            .storage()
+            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Queued)
+            .await? as usize;
+        let merging = pq
+            .storage()
+            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Running)
+            .await? as usize;
+        let merged = pq
+            .storage()
+            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Done)
+            .await? as usize;
+        let failed = pq
+            .storage()
+            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Failed)
+            .await? as usize
+            + pq.storage()
+                .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Cancelled)
+                .await? as usize;
+        let stats = QueueStats {
+            total_items: waiting + merging + merged + failed,
+            waiting_count: waiting,
+            testing_count: 0,
+            merging_count: merging,
+            failed_count: failed,
+            merged_count: merged,
+        };
+        return Ok(Json(CommonResult::success(Some(QueueStatsResponse {
+            stats,
+        }))));
+    }
     let stats = state.storage.merge_queue_service.get_queue_stats().await?;
     let response = QueueStatsResponse::from(stats);
     Ok(Json(CommonResult::success(Some(response))))
@@ -262,21 +343,12 @@ async fn get_queue_stats(
     post,
     path = "/cancel-all",
     responses(
-        (status = 200, body = CommonResult<Value>, content_type = "application/json")
+        (status = 410, description = "Retired: batch cancel is not supported")
     ),
     tag = MERGE_QUEUE_TAG
 )]
 async fn cancel_all_pending(
-    state: State<MonoApiServiceState>,
+    _state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<Value>>, ApiError> {
-    state
-        .storage
-        .merge_queue_service
-        .cancel_all_pending()
-        .await?;
-    let response = json!({
-        "success": true,
-        "message": "All pending items cancelled"
-    });
-    Ok(Json(CommonResult::success(Some(response))))
+    Err(retired_gone("POST /merge-queue/cancel-all"))
 }

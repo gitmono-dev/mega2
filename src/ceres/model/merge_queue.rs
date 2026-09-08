@@ -159,6 +159,61 @@ impl From<Model> for QueueItem {
     }
 }
 
+impl QueueItem {
+    /// Map a MonoWriteQueue row onto the legacy merge-queue list shape.
+    pub fn from_push_queue(row: &crate::callisto::push_queue::Model) -> Self {
+        use crate::callisto::sea_orm_active_enums::PushQueueStatusEnum;
+
+        let status = match row.status {
+            PushQueueStatusEnum::Queued => QueueStatus::Waiting,
+            PushQueueStatusEnum::Running => QueueStatus::Merging,
+            PushQueueStatusEnum::Done => QueueStatus::Merged,
+            PushQueueStatusEnum::Failed | PushQueueStatusEnum::Cancelled => QueueStatus::Failed,
+        };
+        let error = row.failure_type.as_ref().map(|ft| {
+            let occurred_at_local = row
+                .updated_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            QueueError {
+                failure_type: match ft {
+                    crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::Conflict => {
+                        FailureType::Conflict
+                    }
+                    crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::MergeFailure => {
+                        FailureType::MergeFailure
+                    }
+                    crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::SystemError => {
+                        FailureType::SystemError
+                    }
+                    _ => FailureType::SystemError,
+                },
+                message: row.error_message.clone().unwrap_or_default(),
+                occurred_at: occurred_at_local,
+            }
+        });
+        QueueItem {
+            cl_link: row.operation_id.clone(),
+            status,
+            position: row.id,
+            display_position: None,
+            created_at: row
+                .enqueued_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            updated_at: row
+                .updated_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            retry_count: 0,
+            error,
+        }
+    }
+}
+
 impl From<crate::jupiter::model::merge_queue_dto::QueueStats> for QueueStats {
     fn from(stats: crate::jupiter::model::merge_queue_dto::QueueStats) -> Self {
         QueueStats {

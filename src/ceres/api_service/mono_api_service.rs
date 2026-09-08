@@ -62,6 +62,7 @@ use git_internal::{
     },
 };
 use regex::Regex;
+use sea_orm::DatabaseTransaction;
 use tracing::debug;
 
 use crate::{
@@ -69,7 +70,8 @@ use crate::{
     callisto::{
         mega_cl, mega_refs, mega_tag, mega_tree,
         sea_orm_active_enums::{
-            CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, QueueFailureTypeEnum, QueueStatusEnum,
+            CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, PushQueueKindEnum, QueueFailureTypeEnum,
+            QueueStatusEnum,
         },
     },
     ceres::{
@@ -98,6 +100,7 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
+    config::MergeWriter,
     contract::{
         api::common::Pagination,
         policy::{
@@ -105,16 +108,25 @@ use crate::{
             context::CedarContext,
             enforcement::Enforcement,
             entitystore::MEGA_CEDAR_PATH,
-            notify::{authz_blob_id, notify_authz_changed_best_effort},
+            notify::{
+                AUTHZ_BARRIER_TIMEOUT, authz_blob_id, ensure_authz_snapshot_caught_up,
+                notify_authz_changed_best_effort,
+            },
             resource::resolve_resource,
             util::SaturnEUid,
         },
         vault::server_signing::ServerSigningContext,
     },
     jupiter::{
-        service::buck_service::{
-            CommitArtifacts, CompletePayload as SvcCompletePayload,
-            CompleteResponse as SvcCompleteResponse,
+        service::{
+            buck_service::{
+                CommitArtifacts, CompletePayload as SvcCompletePayload,
+                CompleteResponse as SvcCompleteResponse,
+            },
+            push_queue_service::{
+                EnqueueRequest, ExecuteOutcome, ExecuteRequest, MergeExecContext, MergePayload,
+                QueueWaitResult, merge_operation_id,
+            },
         },
         storage::{
             Storage,
@@ -2236,6 +2248,28 @@ impl MonoApiService {
         execution_actor: &str,
         cl: mega_cl::Model,
     ) -> Result<(), GitError> {
+        self.ensure_merge_entry_prechecks(&cl).await?;
+
+        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+            self.merge_cl_via_queue(
+                authz_principal,
+                execution_actor,
+                cl,
+                false,
+                Some(authz_principal.to_owned()),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            self.merge_cl_unchecked(authz_principal, execution_actor, cl)
+                .await
+        }
+    }
+
+    /// Entry prechecks shared by `/merge`, `/merge-no-auth`, and queue-mode
+    /// `/merge-queue/add` (TP-07): missing `main@P` refuse, `from_hash != main`
+    /// refuse, GPG gate.
+    async fn ensure_merge_entry_prechecks(&self, cl: &mega_cl::Model) -> Result<(), GitError> {
         let storage = self.storage.mono_storage();
         let refs = storage
             .get_main_ref(&cl.path)
@@ -2247,10 +2281,132 @@ impl MonoApiService {
             return Err(GitError::CustomError("ref hash conflict".to_owned()));
         }
 
-        self.ensure_gpg_check_passed(&cl.link).await?;
+        self.ensure_gpg_check_passed(&cl.link).await
+    }
 
-        self.merge_cl_unchecked(authz_principal, execution_actor, cl)
+    /// Enqueue a merge (`kind=merge`), wait/claim, and run B3 until Done or a
+    /// non-conflict failure. Conflict successors are followed (B4).
+    async fn merge_cl_via_queue(
+        &self,
+        authz_principal: &str,
+        execution_actor: &str,
+        cl: mega_cl::Model,
+        apply_queue_execution_decision: bool,
+        queue_requester: Option<String>,
+    ) -> Result<i64, GitError> {
+        let storage = self.storage.mono_storage();
+        let old_id = storage
+            .get_main_ref(&cl.path)
             .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .map(|r| r.ref_commit_hash)
+            .unwrap_or_else(|| ZERO_ID.to_owned());
+
+        let payload = MergePayload {
+            cl_link: cl.link.clone(),
+            authz_principal: authz_principal.to_owned(),
+            execution_actor: execution_actor.to_owned(),
+            apply_queue_execution_decision,
+            requester: queue_requester,
+        };
+        let wait = self
+            .storage
+            .push_queue_service
+            .enqueue_and_wait(EnqueueRequest {
+                kind: PushQueueKindEnum::Merge,
+                operation_id: merge_operation_id(&cl.link),
+                path: cl.path.clone(),
+                old_id,
+                new_id: cl.to_hash.clone(),
+                requester: Some(authz_principal.to_owned()),
+                payload: serde_json::to_value(&payload)
+                    .map_err(|e| GitError::CustomError(format!("merge payload encode: {e}")))?,
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        let ctx = MergeExecContext {
+            storage: self.storage.clone(),
+            git_object_cache: self.git_object_cache.clone(),
+            abort_before_cl_status: false,
+            pause_after_apply: Duration::ZERO,
+        };
+        self.follow_merge_queue(wait, &ctx).await
+    }
+
+    async fn follow_merge_queue(
+        &self,
+        mut wait: QueueWaitResult,
+        ctx: &MergeExecContext,
+    ) -> Result<i64, GitError> {
+        const MAX_ROUNDS: usize = 32;
+        for _ in 0..MAX_ROUNDS {
+            match wait {
+                QueueWaitResult::Replayed { id, .. } => return Ok(id),
+                QueueWaitResult::Abandoned { id } => {
+                    return Err(GitError::CustomError(format!(
+                        "merge wait abandoned for push_queue id {id}"
+                    )));
+                }
+                QueueWaitResult::Rejected { id, message } => {
+                    return Err(GitError::CustomError(format!(
+                        "merge rejected for push_queue id {id}: {message}"
+                    )));
+                }
+                QueueWaitResult::Ready { id } => {
+                    let outcome = self
+                        .storage
+                        .push_queue_service
+                        .execute_b3(
+                            ExecuteRequest {
+                                id,
+                                ..Default::default()
+                            },
+                            None,
+                            Some(ctx),
+                        )
+                        .await
+                        .map_err(|e| GitError::CustomError(e.to_string()))?;
+                    match outcome {
+                        ExecuteOutcome::Done { id, .. } => return Ok(id),
+                        ExecuteOutcome::Requeued { id, .. } => {
+                            wait = self
+                                .storage
+                                .push_queue_service
+                                .wait_and_claim(id)
+                                .await
+                                .map_err(|e| GitError::CustomError(e.to_string()))?;
+                        }
+                        ExecuteOutcome::ClaimLost { id } => {
+                            wait = self
+                                .storage
+                                .push_queue_service
+                                .wait_and_claim(id)
+                                .await
+                                .map_err(|e| GitError::CustomError(e.to_string()))?;
+                        }
+                        ExecuteOutcome::Failed { message, .. } => {
+                            return Err(GitError::CustomError(message));
+                        }
+                        ExecuteOutcome::HardStopped { id } => {
+                            return Err(GitError::CustomError(format!(
+                                "merge hard-stopped for push_queue id {id}"
+                            )));
+                        }
+                        ExecuteOutcome::BypassDetected { id } => {
+                            return Err(GitError::CustomError(format!(
+                                "queue bypass detected for push_queue id {id}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Err(GitError::CustomError(
+            "merge follow exceeded max conflict requeue rounds".into(),
+        ))
     }
 
     /// MC-02 minimal merge gate (the full `ensure_cl_mergeable` below stays
@@ -2258,7 +2414,7 @@ impl MonoApiService {
     /// CLs without any check rows (never checked) are not blocked. Every
     /// merge entry point — `merge_cl` and the merge queue's
     /// `execute_merge_workflow` — must call this before `merge_cl_unchecked`.
-    async fn ensure_gpg_check_passed(&self, link: &str) -> Result<(), GitError> {
+    pub(crate) async fn ensure_gpg_check_passed(&self, link: &str) -> Result<(), GitError> {
         let gpg_failed = self
             .storage
             .cl_storage()
@@ -2760,8 +2916,13 @@ impl MonoApiService {
             .await
             .map_err(|e| GitError::CustomError(format!("Failed to update CL status: {}", e)))?;
 
-        // Invalidate admin cache when .mega_cedar.json is modified.
-        if let Ok(files) = self.get_sorted_changed_file_list(&cl.link, None).await {
+        self.maybe_invalidate_admin_cache(&cl.link).await;
+
+        Ok(())
+    }
+
+    pub(crate) async fn maybe_invalidate_admin_cache(&self, cl_link: &str) {
+        if let Ok(files) = self.get_sorted_changed_file_list(cl_link, None).await {
             let admin_file_modified = files.iter().any(|file| {
                 let normalized = file.replace('\\', "/");
                 normalized.ends_with(crate::ceres::api_service::admin_ops::ADMIN_FILE)
@@ -2770,8 +2931,6 @@ impl MonoApiService {
                 self.invalidate_admin_cache().await;
             }
         }
-
-        Ok(())
     }
 
     pub async fn apply_update_result(
@@ -2884,6 +3043,122 @@ impl MonoApiService {
         .await;
 
         Ok(new_commit_id)
+    }
+
+    /// TP-11 hook: tree-hash assertion runs before merge business gates.
+    /// No-op until TP-11 lands the predicate.
+    pub(crate) fn assert_merge_tree_hash_tp11(&self) {}
+
+    /// Transactional apply used by merge B3 (TP-07): refs (exactly one root
+    /// CAS for `main@/`), commits, and trees share `txn`. Missing `main` at
+    /// the CL path is refused (no upsert).
+    pub(crate) const MERGE_ROOT_CAS_MISS: &'static str = "root CAS affected 0 rows";
+
+    pub(crate) async fn apply_update_result_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        result: &TreeUpdateResult,
+        commit_msg: &str,
+        cl: &mega_cl::Model,
+        expected_root_commit: Option<&str>,
+        expected_root_tree: Option<&str>,
+    ) -> Result<(String, u32), GitError> {
+        let storage = self.storage.mono_storage();
+        let mut new_commit_id = String::new();
+        let mut commits: Vec<Commit> = Vec::new();
+
+        let paths: Vec<&str> = result.ref_updates.iter().map(|r| r.path.as_str()).collect();
+        let cl_refs_formatted = format!("refs/cl/{}", cl.link);
+        let cl_refs = [cl_refs_formatted.as_str(), MEGA_BRANCH_NAME];
+
+        let refs = storage
+            .get_refs_for_paths_and_cls_in_txn(&paths, Some(&cl_refs), txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        let cl_path = MonoServiceLogic::clean_path_str(&cl.path);
+        if !refs
+            .iter()
+            .any(|r| r.path == cl_path && r.ref_name == MEGA_BRANCH_NAME)
+        {
+            return Err(GitError::CustomError(format!(
+                "Main ref not found at {cl_path}"
+            )));
+        }
+
+        let mut updates: Vec<RefUpdateData> = Vec::new();
+        MonoServiceLogic::process_ref_updates(
+            result,
+            &refs,
+            commit_msg,
+            &mut commits,
+            &mut updates,
+            &mut new_commit_id,
+        )?;
+
+        if new_commit_id.is_empty() {
+            return Err(GitError::CustomError(
+                "no commit_id generated: no matching refs found for the update paths".into(),
+            ));
+        }
+
+        let mut root_cas_writes = 0u32;
+        let mut other_updates = Vec::new();
+        let mut landed_commit_id = new_commit_id.clone();
+        for update in updates {
+            if update.path == "/" && update.ref_name == MEGA_BRANCH_NAME {
+                let cas_ok = storage
+                    .cas_update_root_main_ref_in_txn(
+                        txn,
+                        expected_root_commit,
+                        expected_root_tree,
+                        &update.commit_id,
+                        &update.tree_hash,
+                    )
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                if !cas_ok {
+                    return Err(GitError::CustomError(Self::MERGE_ROOT_CAS_MISS.into()));
+                }
+                root_cas_writes += 1;
+                landed_commit_id = update.commit_id.clone();
+            } else {
+                other_updates.push(update);
+            }
+        }
+        if root_cas_writes != 1 {
+            return Err(GitError::CustomError(format!(
+                "merge B3 expected exactly one root CAS, got {root_cas_writes}"
+            )));
+        }
+
+        storage
+            .batch_update_by_path_in_txn(txn, other_updates)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        storage
+            .save_mega_commits(commits, Some(txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        let save_trees: Vec<mega_tree::ActiveModel> = result
+            .updated_trees
+            .clone()
+            .into_iter()
+            .map(|save_t| {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+                tree_model.commit_id.clone_from(&landed_commit_id);
+                tree_model.into()
+            })
+            .collect();
+
+        storage
+            .batch_save_model_with_txn(save_trees, Some(txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        Ok((landed_commit_id, root_cas_writes))
     }
 
     /// The signing capability for server-synthesized commits that enter a CL
@@ -3869,6 +4144,19 @@ impl MonoApiService {
             )));
         }
 
+        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+            self.ensure_merge_entry_prechecks(&model)
+                .await
+                .map_err(|e| MegaError::Other(e.to_string()))?;
+            let execution_actor = requester.clone().unwrap_or_else(|| "system".into());
+            let authz_principal = requester.clone().unwrap_or_else(|| "system".into());
+            let id = self
+                .merge_cl_via_queue(&authz_principal, &execution_actor, model, true, requester)
+                .await
+                .map_err(|e| MegaError::Other(e.to_string()))?;
+            return Ok(id);
+        }
+
         // Add to queue via jupiter layer service
         let position = self
             .storage
@@ -3900,6 +4188,17 @@ impl MonoApiService {
             .unwrap_or(Enforcement::Off);
         if !enforcement.builds() {
             return Ok(());
+        }
+
+        if let Err(error) =
+            ensure_authz_snapshot_caught_up(&self.storage, AUTHZ_BARRIER_TIMEOUT).await
+        {
+            return self.acl_check_unavailable(
+                enforcement,
+                cl_link,
+                authz_principal,
+                &error.to_string(),
+            );
         }
 
         // An unresolvable change set reads back as "changed nothing", which
@@ -4145,6 +4444,11 @@ impl MonoApiService {
         cl_link: &str,
         requester: Option<String>,
     ) -> Result<bool, MegaError> {
+        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+            self.add_to_merge_queue_as(cl_link.to_owned(), requester)
+                .await?;
+            return Ok(true);
+        }
         let result = self
             .storage
             .merge_queue_service
@@ -4152,7 +4456,6 @@ impl MonoApiService {
             .await?;
 
         if result {
-            // Ensure the background processor is running
             self.ensure_merge_processor_running();
         }
 
@@ -4467,6 +4770,9 @@ impl MonoApiService {
     /// Uses atomic flag to guarantee only one processor task runs at a time.
     /// The processor automatically stops when no active items remain in queue.
     fn ensure_merge_processor_running(&self) {
+        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+            return;
+        }
         // Get the processor running flag from merge queue service
         if self.storage.merge_queue_service.try_start_processor() {
             let service = self.clone();
@@ -4482,6 +4788,13 @@ impl MonoApiService {
     /// Continuously processes queue items until no active items remain.
     async fn run_merge_processor_loop(&self) {
         loop {
+            if self.storage.config().monorepo.merge_writer == MergeWriter::Queue
+                || !self.storage.merge_queue_service.is_processor_running()
+            {
+                self.storage.merge_queue_service.stop_processor();
+                tracing::info!("Merge queue processor stopped (queue writer or stop flag)");
+                break;
+            }
             match self.process_next_queue_item().await {
                 Ok(processed) => {
                     if !processed {
@@ -6112,6 +6425,7 @@ fn gate_test_cl(link: &str, from_hash: &str, to_hash: &str) -> mega_cl::Model {
         updated_at: chrono::Utc::now().naive_utc(),
         username: "gate-tester".to_string(),
         base_branch: "main".to_string(),
+        revision: 0,
     }
 }
 
@@ -6292,6 +6606,8 @@ async fn execute_merge_workflow_passes_gate_without_failed_gpg_check() {
 
 #[cfg(test)]
 mod mc09_tests {
+    use std::time::Duration;
+
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 
     use super::*;
@@ -6303,7 +6619,8 @@ mod mc09_tests {
             integration::vault_core::VaultCore, server_signing::SERVER_SIGNING_EMAIL,
         },
         jupiter::{
-            migration::apply_migrations, storage::base_storage::BaseStorage,
+            migration::apply_migrations,
+            storage::base_storage::{BaseStorage, StorageConnector},
             tests::test_db_connection,
         },
     };
@@ -7144,5 +7461,948 @@ mod mc09_tests {
         let after = mono.get_main_ref("/").await.unwrap().unwrap();
         assert_eq!(after.ref_commit_hash, "c".repeat(40));
         assert_eq!(after.ref_tree_hash, "d".repeat(40));
+    }
+
+    async fn queue_merge_fixture(
+        path: &str,
+        link: &str,
+        extra_child: Option<(String, Tree)>,
+    ) -> (
+        tempfile::TempDir,
+        Storage,
+        MonoApiService,
+        mega_cl::Model,
+        String,
+    ) {
+        use git_internal::internal::object::commit::Commit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage_queue_merge(temp.path()).await;
+        let service = test_service(&storage);
+        let mono = storage.mono_storage();
+
+        let mut root_items = vec![blob_item(
+            ".gitkeep",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )];
+        if let Some((name, child)) = extra_child {
+            mono.save_mega_trees(
+                vec![child.clone()],
+                ObjectHash::from_str(&"1".repeat(40)).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+            root_items.push(TreeItem::new(TreeItemMode::Tree, child.id, name));
+        }
+        let old_tree = Tree::from_tree_items(root_items).expect("old tree");
+        let new_tree = Tree::from_tree_items(vec![blob_item(
+            "queued.txt",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )])
+        .expect("new tree");
+
+        let old_commit = Commit::from_tree_id(old_tree.id, vec![], "base");
+        let new_commit = Commit::from_tree_id(new_tree.id, vec![old_commit.id], "cl tip");
+        mono.save_mega_trees(
+            vec![old_tree.clone(), new_tree.clone()],
+            old_commit.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone(), new_commit.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &old_tree, &old_commit.id.to_string()).await;
+        if path != "/" {
+            mono.save_refs(
+                mega_refs::Model {
+                    id: crate::callisto::entity_ext::generate_id(),
+                    path: path.to_string(),
+                    ref_name: MEGA_BRANCH_NAME.to_string(),
+                    ref_commit_hash: old_commit.id.to_string(),
+                    ref_tree_hash: old_tree.id.to_string(),
+                    created_at: chrono::Utc::now().naive_utc(),
+                    updated_at: chrono::Utc::now().naive_utc(),
+                    is_cl: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        mono.save_or_update_cl_ref(
+            path,
+            &format!("refs/cl/{link}"),
+            &new_commit.id.to_string(),
+            &new_tree.id.to_string(),
+        )
+        .await
+        .unwrap();
+        let cl = storage
+            .cl_storage()
+            .new_cl_model(
+                path,
+                link,
+                "queue merge",
+                "main",
+                &old_commit.id.to_string(),
+                &new_commit.id.to_string(),
+                "gate-tester",
+            )
+            .await
+            .unwrap();
+        (temp, storage, service, cl, new_commit.id.to_string())
+    }
+
+    #[tokio::test]
+    async fn queue_merge_new_id_differs_from_landed_commit() {
+        let (_temp, storage, service, cl, to_hash) = queue_merge_fixture("/", "QMRG01", None).await;
+        service
+            .merge_cl("gate-tester", "gate-tester", cl.clone())
+            .await
+            .expect("queue merge should succeed");
+        let merged = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(root.ref_commit_hash, to_hash, "landed tip is synthesized");
+        let landed = storage
+            .mono_storage()
+            .get_commit_by_hash(&root.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let parents: Vec<String> = serde_json::from_value(landed.parents_id).unwrap_or_default();
+        assert_eq!(
+            parents,
+            vec![to_hash.clone()],
+            "parent is execute-time to_hash"
+        );
+        let row = crate::callisto::push_queue::Entity::find()
+            .filter(crate::callisto::push_queue::Column::OperationId.eq(&cl.link))
+            .one(storage.push_queue_storage().get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.new_id, to_hash);
+        assert_eq!(
+            row.landed_commit_id.as_deref(),
+            Some(root.ref_commit_hash.as_str())
+        );
+        assert_ne!(row.new_id, row.landed_commit_id.clone().unwrap());
+    }
+
+    #[tokio::test]
+    async fn queue_merge_missing_path_main_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage_queue_merge(temp.path()).await;
+        let service = test_service(&storage);
+        let old_tree = Tree {
+            id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+            tree_items: vec![],
+        };
+        setup_main_ref(
+            &storage,
+            &old_tree,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+        let cl = gate_test_cl(
+            "QMISS1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut cl = cl;
+        cl.path = "/missing".into();
+        let err = service
+            .merge_cl("gate-tester", "gate-tester", cl)
+            .await
+            .expect_err("missing main@P must refuse at entry");
+        assert!(err.to_string().to_lowercase().contains("main ref"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn queue_merge_nested_descendant_missing_after_parent_merge() {
+        let blob = blob_item("x.txt", "dddddddddddddddddddddddddddddddddddddddd");
+        let child = Tree::from_tree_items(vec![blob.clone()]).expect("child tree");
+        let (_temp, storage, service, cl_a, _) =
+            queue_merge_fixture("/a", "QNEST1", Some(("a".into(), child))).await;
+        // /a/b exists as a descendant main so parent merge deletes it.
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model {
+                    id: crate::callisto::entity_ext::generate_id(),
+                    path: "/a/b".into(),
+                    ref_name: MEGA_BRANCH_NAME.to_string(),
+                    ref_commit_hash: "a".repeat(40),
+                    ref_tree_hash: "b".repeat(40),
+                    created_at: chrono::Utc::now().naive_utc(),
+                    updated_at: chrono::Utc::now().naive_utc(),
+                    is_cl: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .merge_cl("gate-tester", "gate-tester", cl_a)
+            .await
+            .expect("/a merge");
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/a/b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cl_b = gate_test_cl(
+            "QNEST2",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut cl_b = cl_b;
+        cl_b.path = "/a/b".into();
+        let err = service
+            .merge_cl("gate-tester", "gate-tester", cl_b)
+            .await
+            .expect_err("/a/b merge must refuse missing main");
+        assert!(err.to_string().to_lowercase().contains("main ref"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn queue_merge_add_to_merge_queue_executes_synchronously() {
+        let (_temp, storage, service, cl, to_hash) = queue_merge_fixture("/", "QADD01", None).await;
+        let id = service
+            .add_to_merge_queue_as(cl.link.clone(), Some("gate-tester".into()))
+            .await
+            .expect("queue-mode add is sync merge");
+        assert!(id > 0);
+        let merged = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(root.ref_commit_hash, to_hash);
+    }
+
+    #[tokio::test]
+    async fn queue_merge_twenty_non_nested_paths_serialize() {
+        use git_internal::internal::object::commit::Commit;
+
+        const N: usize = 20;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage_queue_merge(temp.path()).await;
+        let service = test_service(&storage);
+        let mono = storage.mono_storage();
+
+        let mut child_trees = Vec::new();
+        for i in 0..N {
+            let blob = blob_item("base.txt", &format!("{:040x}", i + 1));
+            let tree = Tree::from_tree_items(vec![blob]).expect("child tree");
+            child_trees.push(tree);
+        }
+        let root_items: Vec<TreeItem> = child_trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TreeItem::new(TreeItemMode::Tree, t.id, format!("p{i:02}")))
+            .collect();
+        let old_root = Tree::from_tree_items(root_items).expect("root");
+        let old_commit = Commit::from_tree_id(old_root.id, vec![], "base");
+        for t in &child_trees {
+            mono.save_mega_trees(vec![t.clone()], old_commit.id, None)
+                .await
+                .unwrap();
+        }
+        mono.save_mega_trees(vec![old_root.clone()], old_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &old_root, &old_commit.id.to_string()).await;
+
+        let mut cls = Vec::new();
+        for (i, child) in child_trees.iter().enumerate() {
+            let path = format!("/p{i:02}");
+            let link = format!("Q20{i:02}");
+            let tip_tree =
+                Tree::from_tree_items(vec![blob_item("new.txt", &format!("{:040x}", 1000 + i))])
+                    .expect("tip tree");
+            let tip = Commit::from_tree_id(tip_tree.id, vec![old_commit.id], "cl tip");
+            mono.save_mega_trees(vec![tip_tree.clone()], tip.id, None)
+                .await
+                .unwrap();
+            mono.save_mega_commits(vec![tip.clone()], None)
+                .await
+                .unwrap();
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path.clone(),
+                    MEGA_BRANCH_NAME.to_owned(),
+                    old_commit.id.to_string(),
+                    child.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            mono.save_or_update_cl_ref(
+                &path,
+                &format!("refs/cl/{link}"),
+                &tip.id.to_string(),
+                &tip_tree.id.to_string(),
+            )
+            .await
+            .unwrap();
+            let cl = storage
+                .cl_storage()
+                .new_cl_model(
+                    &path,
+                    &link,
+                    "q20",
+                    "main",
+                    &old_commit.id.to_string(),
+                    &tip.id.to_string(),
+                    "gate-tester",
+                )
+                .await
+                .unwrap();
+            cls.push(cl);
+        }
+
+        let mut joins = Vec::new();
+        for cl in cls.clone() {
+            let svc = service.clone();
+            joins.push(tokio::spawn(async move {
+                svc.merge_cl("gate-tester", "gate-tester", cl).await
+            }));
+        }
+        for j in joins {
+            j.await.unwrap().expect("concurrent merge");
+        }
+
+        for cl in &cls {
+            let row = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, MergeStatusEnum::Merged, "{}", cl.link);
+        }
+        let final_root = mono.get_main_ref("/").await.unwrap().unwrap();
+        let final_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&final_root.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(final_tree.tree_items.len(), N, "all path trees remain");
+
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+        let qrows = crate::callisto::push_queue::Entity::find()
+            .filter(
+                crate::callisto::push_queue::Column::Kind
+                    .eq(crate::callisto::sea_orm_active_enums::PushQueueKindEnum::Merge),
+            )
+            .filter(
+                crate::callisto::push_queue::Column::Status
+                    .eq(crate::callisto::sea_orm_active_enums::PushQueueStatusEnum::Done),
+            )
+            .order_by_asc(crate::callisto::push_queue::Column::Id)
+            .all(storage.push_queue_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(qrows.len(), N);
+        assert_eq!(
+            qrows.last().unwrap().landed_commit_id.as_deref(),
+            Some(final_root.ref_commit_hash.as_str()),
+            "highest queue id is the final root tip"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for row in &qrows {
+            assert!(seen.insert(row.landed_commit_id.clone().unwrap()));
+        }
+        let mut hash = final_root.ref_commit_hash.clone();
+        for row in qrows.iter().rev() {
+            assert_eq!(
+                row.landed_commit_id.as_deref(),
+                Some(hash.as_str()),
+                "root roll-up parent chain must follow push_queue.id order"
+            );
+            let commit = mono.get_commit_by_hash(&hash).await.unwrap().unwrap();
+            let parents: Vec<String> =
+                serde_json::from_value(commit.parents_id).unwrap_or_default();
+            hash = parents
+                .into_iter()
+                .next()
+                .expect("root roll-up must have a parent");
+        }
+        assert_eq!(
+            hash,
+            old_commit.id.to_string(),
+            "oldest roll-up parent is the original root"
+        );
+    }
+
+    fn merge_exec_ctx(storage: &Storage) -> MergeExecContext {
+        MergeExecContext {
+            storage: storage.clone(),
+            git_object_cache: test_service(storage).git_object_cache,
+            abort_before_cl_status: false,
+            pause_after_apply: Duration::ZERO,
+        }
+    }
+
+    async fn enqueue_merge_row(storage: &Storage, cl: &mega_cl::Model) -> i64 {
+        use crate::jupiter::storage::push_queue_storage::EnqueueOutcome;
+
+        let payload = MergePayload {
+            cl_link: cl.link.clone(),
+            authz_principal: "gate-tester".into(),
+            execution_actor: "gate-tester".into(),
+            apply_queue_execution_decision: false,
+            requester: Some("gate-tester".into()),
+        };
+        let old_id = storage
+            .mono_storage()
+            .get_main_ref(&cl.path)
+            .await
+            .unwrap()
+            .map(|r| r.ref_commit_hash)
+            .unwrap_or_else(|| ZERO_ID.to_owned());
+        match storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Merge,
+                operation_id: merge_operation_id(&cl.link),
+                path: cl.path.clone(),
+                old_id,
+                new_id: cl.to_hash.clone(),
+                requester: Some("gate-tester".into()),
+                payload: serde_json::to_value(&payload).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Inserted { id } | EnqueueOutcome::Adopted { id } => id,
+            other => panic!("expected insert, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_merge_add_rejects_failed_gpg_like_merge_cl() {
+        let (_temp, storage, service, cl, _) = queue_merge_fixture("/", "QADDGPG", None).await;
+        insert_check_result(&storage, &cl.link, CheckTypeEnum::GpgSignature, "FAILED").await;
+        let err = service
+            .add_to_merge_queue_as(cl.link.clone(), Some("gate-tester".into()))
+            .await
+            .expect_err("queue-mode add must run GPG entry precheck");
+        assert!(
+            err.to_string().contains("GPG signature check failed"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_merge_add_rejects_from_hash_mismatch() {
+        let (_temp, storage, service, cl, _) = queue_merge_fixture("/", "QADDFH", None).await;
+        let txn = storage.begin_db_transaction().await.unwrap();
+        let current = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            storage
+                .cl_storage()
+                .cas_update_cl_hashes_in_txn(&current, &"f".repeat(40), &current.to_hash, &txn)
+                .await
+                .unwrap()
+        );
+        txn.commit().await.unwrap();
+        let err = service
+            .add_to_merge_queue_as(cl.link, Some("gate-tester".into()))
+            .await
+            .expect_err("from_hash != main must refuse at entry");
+        assert!(err.to_string().to_lowercase().contains("conflict"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn queue_merge_abort_before_cl_status_rolls_back() {
+        let (_temp, storage, _service, cl, _) = queue_merge_fixture("/", "QABORT", None).await;
+        let root_before = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let id = enqueue_merge_row(&storage, &cl).await;
+        assert_eq!(
+            storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+            QueueWaitResult::Ready { id }
+        );
+        let mut ctx = merge_exec_ctx(&storage);
+        ctx.abort_before_cl_status = true;
+        let outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ExecuteOutcome::Failed { .. }),
+            "abort should terminalize after rollback, got {outcome:?}"
+        );
+        let root_after = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_after.ref_commit_hash, root_before.ref_commit_hash);
+        let still = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.status, MergeStatusEnum::Open);
+    }
+
+    #[tokio::test]
+    async fn queue_merge_intervening_other_path_is_preserved() {
+        use git_internal::internal::object::commit::Commit;
+
+        const N: usize = 2;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage_queue_merge(temp.path()).await;
+        let mono = storage.mono_storage();
+        let mut child_trees = Vec::new();
+        for i in 0..N {
+            let blob = blob_item("base.txt", &format!("{:040x}", i + 1));
+            child_trees.push(Tree::from_tree_items(vec![blob]).expect("child"));
+        }
+        let root_items: Vec<TreeItem> = child_trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TreeItem::new(TreeItemMode::Tree, t.id, format!("p{i:02}")))
+            .collect();
+        let old_root = Tree::from_tree_items(root_items).expect("root");
+        let old_commit = Commit::from_tree_id(old_root.id, vec![], "base");
+        for t in &child_trees {
+            mono.save_mega_trees(vec![t.clone()], old_commit.id, None)
+                .await
+                .unwrap();
+        }
+        mono.save_mega_trees(vec![old_root.clone()], old_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &old_root, &old_commit.id.to_string()).await;
+
+        let mut cls = Vec::new();
+        for (i, child) in child_trees.iter().enumerate() {
+            let path = format!("/p{i:02}");
+            let link = format!("QINT{i:02}");
+            let tip_tree =
+                Tree::from_tree_items(vec![blob_item("new.txt", &format!("{:040x}", 1000 + i))])
+                    .expect("tip");
+            let tip = Commit::from_tree_id(tip_tree.id, vec![old_commit.id], "cl tip");
+            mono.save_mega_trees(vec![tip_tree.clone()], tip.id, None)
+                .await
+                .unwrap();
+            mono.save_mega_commits(vec![tip.clone()], None)
+                .await
+                .unwrap();
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path.clone(),
+                    MEGA_BRANCH_NAME.to_owned(),
+                    old_commit.id.to_string(),
+                    child.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            mono.save_or_update_cl_ref(
+                &path,
+                &format!("refs/cl/{link}"),
+                &tip.id.to_string(),
+                &tip_tree.id.to_string(),
+            )
+            .await
+            .unwrap();
+            cls.push(
+                storage
+                    .cl_storage()
+                    .new_cl_model(
+                        &path,
+                        &link,
+                        "qint",
+                        "main",
+                        &old_commit.id.to_string(),
+                        &tip.id.to_string(),
+                        "gate-tester",
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let first = enqueue_merge_row(&storage, &cls[0]).await;
+        let second = enqueue_merge_row(&storage, &cls[1]).await;
+        let ctx = merge_exec_ctx(&storage);
+        assert_eq!(
+            storage
+                .push_queue_service
+                .wait_and_claim(first)
+                .await
+                .unwrap(),
+            QueueWaitResult::Ready { id: first }
+        );
+        let first_out = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: first,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        let ExecuteOutcome::Done {
+            landed_commit_id: tip_after_first,
+            ..
+        } = first_out
+        else {
+            panic!("first merge Done, got {first_out:?}");
+        };
+        assert_eq!(
+            storage
+                .push_queue_service
+                .wait_and_claim(second)
+                .await
+                .unwrap(),
+            QueueWaitResult::Ready { id: second }
+        );
+        let second_out = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: second,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(second_out, ExecuteOutcome::Done { .. }),
+            "second merge Done after intervening, got {second_out:?}"
+        );
+        let final_root = mono.get_main_ref("/").await.unwrap().unwrap();
+        let final_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&final_root.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(final_tree.tree_items.len(), N);
+        let names: Vec<_> = final_tree
+            .tree_items
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert!(names.contains(&"p00".into()) && names.contains(&"p01".into()));
+        assert_ne!(final_root.ref_commit_hash, tip_after_first);
+    }
+
+    #[tokio::test]
+    async fn queue_merge_conflict_requeue_then_succeeds() {
+        let blob = blob_item("x.txt", "dddddddddddddddddddddddddddddddddddddddd");
+        let child = Tree::from_tree_items(vec![blob.clone()]).expect("child");
+        let (_temp, storage, _service, cl, _) =
+            queue_merge_fixture("/p00", "QCF01", Some(("p00".into(), child))).await;
+        let id = enqueue_merge_row(&storage, &cl).await;
+        assert_eq!(
+            storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+            QueueWaitResult::Ready { id }
+        );
+        let path_main = storage
+            .mono_storage()
+            .get_main_ref("/p00")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut advanced = path_main.clone();
+        advanced.ref_commit_hash = "e".repeat(40);
+        storage
+            .mono_storage()
+            .update_ref(advanced, None)
+            .await
+            .unwrap();
+        let ctx = merge_exec_ctx(&storage);
+        let outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        let ExecuteOutcome::Requeued { successor_id, .. } = outcome else {
+            panic!("expected B4 requeue, got {outcome:?}");
+        };
+        let old_row = storage
+            .push_queue_storage()
+            .get_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_row.superseded_by, Some(successor_id));
+        assert!(successor_id > id);
+
+        let current = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        let txn = storage.begin_db_transaction().await.unwrap();
+        assert!(
+            storage
+                .cl_storage()
+                .cas_update_cl_hashes_in_txn(&current, &"e".repeat(40), &current.to_hash, &txn)
+                .await
+                .unwrap()
+        );
+        txn.commit().await.unwrap();
+
+        assert_eq!(
+            storage
+                .push_queue_service
+                .wait_and_claim(successor_id)
+                .await
+                .unwrap(),
+            QueueWaitResult::Ready { id: successor_id }
+        );
+        let done = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: successor_id,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(done, ExecuteOutcome::Done { .. }),
+            "successor must merge, got {done:?}"
+        );
+        let merged = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+    }
+
+    #[tokio::test]
+    async fn queue_merge_revision_cas_miss_is_claim_lost_then_retries() {
+        let (_temp, storage, _service, cl, _) = queue_merge_fixture("/", "QCAS1", None).await;
+        let id = enqueue_merge_row(&storage, &cl).await;
+        assert_eq!(
+            storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+            QueueWaitResult::Ready { id }
+        );
+        let mut ctx = merge_exec_ctx(&storage);
+        ctx.pause_after_apply = Duration::from_millis(80);
+        let storage_racer = storage.clone();
+        let cl_link = cl.link.clone();
+        let racer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let current = storage_racer
+                .cl_storage()
+                .get_cl(&cl_link)
+                .await
+                .unwrap()
+                .unwrap();
+            let txn = storage_racer.begin_db_transaction().await.unwrap();
+            let ok = storage_racer
+                .cl_storage()
+                .cas_update_cl_hashes_in_txn(&current, &current.from_hash, &current.to_hash, &txn)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            ok
+        });
+        let outcome = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap();
+        let raced = racer.await.unwrap();
+        if raced {
+            assert_eq!(outcome, ExecuteOutcome::ClaimLost { id });
+            let still = storage
+                .cl_storage()
+                .get_cl(&cl.link)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(still.status, MergeStatusEnum::Open);
+            let ctx = merge_exec_ctx(&storage);
+            assert_eq!(
+                storage.push_queue_service.wait_and_claim(id).await.unwrap(),
+                QueueWaitResult::Ready { id }
+            );
+            let retry = storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&ctx),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(retry, ExecuteOutcome::Done { .. }),
+                "retry after ClaimLost, got {retry:?}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, ExecuteOutcome::Done { .. }),
+                "if the racer missed, the merge itself must Done, got {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_merge_queue_entry_un17_freezes_anonymous_under_enforce() {
+        use git_internal::internal::object::commit::Commit;
+
+        use crate::config::{MergeWriter, testing::isolated_config};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.merge_writer = MergeWriter::Queue;
+        config.cedar.enforcement = "enforce".into();
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let blob = blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tree = Tree::from_tree_items(vec![blob]).expect("old");
+        let new_tree = Tree::from_tree_items(vec![blob_item(
+            "queued.txt",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )])
+        .expect("new");
+        let old_commit = Commit::from_tree_id(old_tree.id, vec![], "base");
+        let new_commit = Commit::from_tree_id(new_tree.id, vec![old_commit.id], "cl tip");
+        let mono = storage.mono_storage();
+        mono.save_mega_trees(
+            vec![old_tree.clone(), new_tree.clone()],
+            old_commit.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone(), new_commit.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &old_tree, &old_commit.id.to_string()).await;
+        mono.save_or_update_cl_ref(
+            "/",
+            "refs/cl/QUN17",
+            &new_commit.id.to_string(),
+            &new_tree.id.to_string(),
+        )
+        .await
+        .unwrap();
+        let cl = storage
+            .cl_storage()
+            .new_cl_model(
+                "/",
+                "QUN17",
+                "un17",
+                "main",
+                &old_commit.id.to_string(),
+                &new_commit.id.to_string(),
+                "gate-tester",
+            )
+            .await
+            .unwrap();
+        let service = test_service(&storage);
+        let err = service
+            .add_to_merge_queue_as(cl.link.clone(), None)
+            .await
+            .expect_err("anonymous queue add under enforce must freeze");
+        assert!(
+            err.to_string().to_lowercase().contains("frozen")
+                || err.to_string().to_lowercase().contains("requester"),
+            "{err}"
+        );
+        let still = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.status, MergeStatusEnum::Open);
     }
 }
