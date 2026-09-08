@@ -283,6 +283,13 @@ impl AppContext {
             crate::jupiter::service::push_queue_reaper::DEFAULT_REAP_INTERVAL,
             notification_shutdown.clone(),
         );
+        storage
+            .push_queue_service
+            .blob_path_compensator()
+            .spawn_background(
+                crate::jupiter::storage::blob_path_index::DEFAULT_COMPENSATE_INTERVAL,
+                notification_shutdown.clone(),
+            );
         // Inspect/reconcile tombstone live refs; only safe when the queue is
         // the sole root writer (legacy merge does not take MONO_WRITE_LOCK).
         if config.monorepo.merge_writer == MergeWriter::Queue

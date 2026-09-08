@@ -22,6 +22,7 @@ use crate::{
     config::PushPolicy,
     jupiter::storage::{
         base_storage::{BaseStorage, StorageConnector},
+        blob_path_index::BlobPathIndexMode,
         mono_storage::MonoStorage,
         push_queue_storage::{
             ClaimOutcome, EnqueueOutcome, EnqueueParams, EnqueueRejectReason, PushQueueStorage,
@@ -450,6 +451,40 @@ impl PushQueueService {
 
     pub fn audit(&self) -> crate::jupiter::service::mono_write_audit::MonoWriteAudit {
         crate::jupiter::service::mono_write_audit::MonoWriteAudit::from_service(self.clone())
+    }
+
+    pub fn blob_path_compensator(
+        &self,
+    ) -> crate::jupiter::storage::blob_path_index::BlobPathCompensator {
+        crate::jupiter::storage::blob_path_index::BlobPathCompensator::new(
+            self.mono_storage.clone(),
+        )
+    }
+
+    /// C-segment (ADR-TP-11): after B3 commit, index `main@path` off the lock.
+    async fn run_c_segment_index(&self, id: i64, path: &str) {
+        match self
+            .mono_storage
+            .index_blob_paths_c_segment(path, BlobPathIndexMode::Queue { push_id: id })
+            .await
+        {
+            Ok(stats) if stats.skipped => {
+                tracing::info!(
+                    id,
+                    path,
+                    "C-segment skipped; later same-path Done already indexed"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    id,
+                    path,
+                    error = %e,
+                    "C-segment blob_path index failed; compensator will converge"
+                );
+            }
+        }
     }
 
     pub fn metrics(&self) -> &PushQueueMetrics {
@@ -1146,6 +1181,7 @@ impl PushQueueService {
         }
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
+        self.run_c_segment_index(req.id, &row.path).await;
         Ok(ExecuteOutcome::Done {
             id: req.id,
             landed_commit_id: new_commit,
@@ -1570,6 +1606,7 @@ impl PushQueueService {
             }
         }
 
+        self.run_c_segment_index(row.id, &row.path).await;
         Ok(ExecuteOutcome::Done {
             id: row.id,
             landed_commit_id,
@@ -1787,6 +1824,7 @@ impl PushQueueService {
             }
             PushQueueStorage::notify_mono_write_queue(&txn).await?;
             txn.commit().await?;
+            self.run_c_segment_index(row.id, &row.path).await;
             return Ok(ExecuteOutcome::Done {
                 id: row.id,
                 landed_commit_id: pref.ref_commit_hash.clone(),
@@ -1936,6 +1974,7 @@ impl PushQueueService {
         }
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
+        self.run_c_segment_index(row.id, &row.path).await;
         Ok(ExecuteOutcome::Done {
             id: row.id,
             landed_commit_id,
@@ -2361,6 +2400,7 @@ impl PushQueueService {
 
         mono_api.maybe_invalidate_admin_cache(&cl.link).await;
 
+        self.run_c_segment_index(row.id, &row.path).await;
         Ok(ExecuteOutcome::Done {
             id: row.id,
             landed_commit_id,

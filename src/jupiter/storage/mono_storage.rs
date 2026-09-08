@@ -1878,4 +1878,327 @@ mod tests {
             .unwrap();
         assert_eq!(tomb.last_commit_hash, "s".repeat(40));
     }
+
+    fn blob_item(name: &str, hex: &str) -> git_internal::internal::object::tree::TreeItem {
+        git_internal::internal::object::tree::TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(hex).unwrap(),
+            name.to_string(),
+        )
+    }
+
+    async fn insert_mega_blob(mono: &MonoStorage, blob_id: &str, file_path: &str) {
+        use crate::common::utils::generate_id;
+        mega_blob::ActiveModel {
+            id: Set(generate_id()),
+            blob_id: Set(blob_id.to_owned()),
+            name: Set("f".into()),
+            size: Set(0),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            pack_id: Set(String::new()),
+            file_path: Set(file_path.to_owned()),
+            pack_offset: Set(0),
+            is_delta_in_pack: Set(false),
+            commit_id: Set(String::new()),
+        }
+        .insert(mono.get_connection())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tp13_blob_paths_unique_and_queue_cas() {
+        use crate::jupiter::storage::blob_path_index::BlobPathIndexMode;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let blob = "b".repeat(40);
+        let path = "/a/foo.txt";
+
+        assert!(
+            mono.upsert_blob_path(&blob, path, BlobPathIndexMode::Queue { push_id: 6 })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !mono
+                .upsert_blob_path(&blob, path, BlobPathIndexMode::Queue { push_id: 5 })
+                .await
+                .unwrap(),
+            "older queue id must not overwrite"
+        );
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].indexed_push_id, Some(6));
+
+        assert!(
+            !mono
+                .upsert_blob_path(&blob, path, BlobPathIndexMode::Review)
+                .await
+                .unwrap(),
+            "review must not punch through a queue watermark"
+        );
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows[0].indexed_push_id, Some(6));
+    }
+
+    #[tokio::test]
+    async fn tp13_review_only_writes_null_watermark() {
+        use crate::jupiter::storage::blob_path_index::BlobPathIndexMode;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let blob = "c".repeat(40);
+        let path = "/r/file.txt";
+        assert!(
+            mono.upsert_blob_path(&blob, path, BlobPathIndexMode::Review)
+                .await
+                .unwrap()
+        );
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].indexed_push_id.is_none());
+        assert!(
+            mono.upsert_blob_path(&blob, path, BlobPathIndexMode::Queue { push_id: 3 })
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            mono.list_blob_paths().await.unwrap()[0].indexed_push_id,
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn tp13_nested_watermark_and_multipath_delete() {
+        use crate::jupiter::storage::blob_path_index::{BlobPathAppearance, BlobPathIndexMode};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let shared = "d".repeat(40);
+
+        mono.apply_blob_path_index(
+            &[BlobPathAppearance {
+                blob_id: shared.clone(),
+                path: "/a/b/x.txt".into(),
+            }],
+            "/a/b",
+            BlobPathIndexMode::Queue { push_id: 6 },
+        )
+        .await
+        .unwrap();
+
+        // Same blob also appears at `/a` — two appearance pairs must coexist.
+        mono.apply_blob_path_index(
+            &[
+                BlobPathAppearance {
+                    blob_id: shared.clone(),
+                    path: "/a/x.txt".into(),
+                },
+                BlobPathAppearance {
+                    blob_id: shared.clone(),
+                    path: "/a/b/x.txt".into(),
+                },
+            ],
+            "/a",
+            BlobPathIndexMode::Queue { push_id: 5 },
+        )
+        .await
+        .unwrap();
+
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(
+            rows.iter().filter(|r| r.blob_id == shared).count(),
+            2,
+            "same blob at /a and /a/b must keep two appearance rows"
+        );
+        let nested = rows
+            .iter()
+            .find(|r| r.path == "/a/b/x.txt")
+            .expect("nested");
+        let parent = rows.iter().find(|r| r.path == "/a/x.txt").expect("parent");
+        assert_eq!(nested.indexed_push_id, Some(6));
+        assert_eq!(parent.indexed_push_id, Some(5));
+
+        mono.apply_blob_path_index(&[], "/a/b", BlobPathIndexMode::Queue { push_id: 7 })
+            .await
+            .unwrap();
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.blob_id == shared && r.path == "/a/x.txt"),
+            "delete /a/b must not drop the /a appearance of the same blob"
+        );
+        assert!(
+            !rows.iter().any(|r| r.path == "/a/b/x.txt"),
+            "deleted subtree appearance gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp13_stale_reinsert_then_compensate_converges() {
+        use crate::jupiter::storage::blob_path_index::{BlobPathAppearance, BlobPathIndexMode};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let live = "1".repeat(40);
+        let stale = "2".repeat(40);
+        let live_tree = Tree::from_tree_items(vec![blob_item("live.txt", &live)]).unwrap();
+        let commit = ObjectHash::from_str("a".repeat(40).as_str()).unwrap();
+        mono.save_mega_trees(vec![live_tree.clone()], commit, None)
+            .await
+            .unwrap();
+        seed_root_ref_tree(&mono, &commit.to_string(), &live_tree.id.to_string()).await;
+
+        insert_mega_blob(&mono, &live, "").await;
+        mono.apply_blob_path_index(
+            &[BlobPathAppearance {
+                blob_id: live.clone(),
+                path: "/live.txt".into(),
+            }],
+            "/",
+            BlobPathIndexMode::Queue { push_id: 10 },
+        )
+        .await
+        .unwrap();
+        // Lagging task re-inserts a deleted appearance (known limitation).
+        assert!(
+            mono.upsert_blob_path(&stale, "/gone.txt", BlobPathIndexMode::Queue { push_id: 1 })
+                .await
+                .unwrap()
+        );
+        assert_eq!(mono.list_blob_paths().await.unwrap().len(), 2);
+
+        let stats = mono.compensate_blob_paths().await.unwrap();
+        assert!(stats.deleted >= 1);
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/live.txt");
+        assert_eq!(
+            mono.latest_blob_display_path(&live).await.unwrap().unwrap(),
+            "/live.txt"
+        );
+    }
+
+    async fn seed_root_ref_tree(mono: &MonoStorage, commit: &str, tree: &str) {
+        let model = mega_refs::Model::new(
+            "/",
+            MEGA_BRANCH_NAME.to_owned(),
+            commit.to_owned(),
+            tree.to_owned(),
+            false,
+        );
+        mono.save_refs(model, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tp13_later_same_path_done_skips_older_task() {
+        use sea_orm::IntoActiveModel;
+
+        use crate::{
+            callisto::sea_orm_active_enums::PushQueueKindEnum,
+            jupiter::storage::{
+                blob_path_index::BlobPathIndexMode,
+                push_queue_storage::{EnqueueOutcome, EnqueueParams},
+            },
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let pq = storage.push_queue_storage();
+        let blob = "3".repeat(40);
+        let tree = Tree::from_tree_items(vec![blob_item("f.txt", &blob)]).unwrap();
+        let commit = ObjectHash::from_str("b".repeat(40).as_str()).unwrap();
+        mono.save_mega_trees(vec![tree.clone()], commit, None)
+            .await
+            .unwrap();
+        let model = mega_refs::Model::new(
+            "/p",
+            MEGA_BRANCH_NAME.to_owned(),
+            commit.to_string(),
+            tree.id.to_string(),
+            false,
+        );
+        mono.save_refs(model, None).await.unwrap();
+
+        let EnqueueOutcome::Inserted { id: older } = pq
+            .enqueue_atomic(EnqueueParams {
+                kind: PushQueueKindEnum::Push,
+                operation_id: "old",
+                path: "/p",
+                old_id: &"0".repeat(40),
+                new_id: &"1".repeat(40),
+                requester: None,
+                payload: serde_json::json!({}),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("older");
+        };
+        // One active push per path: terminalize the older row so the later
+        // same-path enqueue can insert.
+        let older_row = crate::callisto::push_queue::Entity::find_by_id(older)
+            .one(mono.get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut older_am = older_row.into_active_model();
+        older_am.status = Set(crate::callisto::sea_orm_active_enums::PushQueueStatusEnum::Failed);
+        older_am.update(mono.get_connection()).await.unwrap();
+
+        let EnqueueOutcome::Inserted { id: newer } = pq
+            .enqueue_atomic(EnqueueParams {
+                kind: PushQueueKindEnum::Push,
+                operation_id: "new",
+                path: "/p",
+                old_id: &"1".repeat(40),
+                new_id: &"2".repeat(40),
+                requester: None,
+                payload: serde_json::json!({}),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("newer");
+        };
+        let row = crate::callisto::push_queue::Entity::find_by_id(newer)
+            .one(mono.get_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut am = row.into_active_model();
+        am.status = Set(crate::callisto::sea_orm_active_enums::PushQueueStatusEnum::Done);
+        am.update(mono.get_connection()).await.unwrap();
+
+        let stats = mono
+            .index_tree_blob_paths(
+                &tree.id.to_string(),
+                "/p",
+                BlobPathIndexMode::Queue { push_id: older },
+            )
+            .await
+            .unwrap();
+        assert!(stats.skipped);
+        assert!(mono.list_blob_paths().await.unwrap().is_empty());
+
+        let stats = mono
+            .index_tree_blob_paths(
+                &tree.id.to_string(),
+                "/p",
+                BlobPathIndexMode::Queue { push_id: newer },
+            )
+            .await
+            .unwrap();
+        assert!(!stats.skipped);
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/p/f.txt");
+        assert_eq!(rows[0].indexed_push_id, Some(newer));
+    }
 }

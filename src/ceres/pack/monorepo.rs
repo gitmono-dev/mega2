@@ -6,10 +6,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    vec,
 };
 
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
 use git_internal::{
@@ -54,7 +52,10 @@ use crate::{
             notify_authz_changed_best_effort,
         },
     },
-    jupiter::{storage::Storage, utils::converter::FromMegaModel},
+    jupiter::{
+        storage::{Storage, blob_path_index::BlobPathIndexMode},
+        utils::converter::FromMegaModel,
+    },
 };
 #[rustfmt::skip]
 use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
@@ -635,9 +636,7 @@ impl RepoHandler for Monorepo {
     }
 
     async fn traverses_tree_and_update_filepath(&self) -> Result<(), MegaError> {
-        // File indexing follows the push tip's tree; the tip is resolved from
-        // the ref command (GC-MC-13), same as `ImportRepo`'s explicit tip
-        // query.
+        // Review morphology: sync C-segment with isolation (`indexed_push_id IS NULL`).
         let Some(cmd) = self.primary_branch_command() else {
             tracing::info!("Skipping file path update: no branch update in this push.");
             return Ok(());
@@ -647,28 +646,7 @@ impl RepoHandler for Monorepo {
             return Ok(());
         };
         let tip = chain.tip;
-
-        let tree_hashes = vec![tip.tree_id.to_string()];
-        let trees = self
-            .storage
-            .mono_storage()
-            .get_trees_by_hashes(tree_hashes)
-            .await
-            .map_err(|e| {
-                MegaError::Other(format!(
-                    "Failed to retrieve root tree for commit {}: {}",
-                    tip.id, e
-                ))
-            })?;
-
-        if trees.is_empty() {
-            return Err(MegaError::Other(format!(
-                "Root tree {} not found for commit {}",
-                tip.tree_id, tip.id
-            )));
-        }
-
-        let root_tree = Tree::from_mega_model(trees[0].clone());
+        let prefix = self.path.to_str().unwrap_or("/");
 
         tracing::info!(
             "Starting file path update for commit {} with root tree {}",
@@ -676,7 +654,9 @@ impl RepoHandler for Monorepo {
             tip.tree_id
         );
 
-        self.traverses_and_update_filepath(root_tree, PathBuf::new())
+        self.storage
+            .mono_storage()
+            .index_tree_blob_paths(&tip.tree_id.to_string(), prefix, BlobPathIndexMode::Review)
             .await
             .map_err(|e| {
                 MegaError::Other(format!(
@@ -988,82 +968,6 @@ impl Monorepo {
         Ok(())
     }
 
-    #[async_recursion]
-    async fn traverses_and_update_filepath(
-        &self,
-        tree: Tree,
-        path: PathBuf,
-    ) -> Result<(), MegaError> {
-        for item in tree.tree_items {
-            let item_path = path.join(&item.name);
-
-            if item.is_tree() {
-                let tree_hash = item.id.to_string();
-                let trees = self
-                    .storage
-                    .mono_storage()
-                    .get_trees_by_hashes(vec![tree_hash.clone()])
-                    .await
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "Failed to retrieve tree {} at path '{}': {}",
-                            tree_hash,
-                            item_path.display(),
-                            e
-                        ))
-                    })?;
-
-                if trees.is_empty() {
-                    return Err(MegaError::Other(format!(
-                        "Tree {} not found at path '{}'",
-                        tree_hash,
-                        item_path.display()
-                    )));
-                }
-
-                let child_tree = Tree::from_mega_model(trees[0].clone());
-
-                self.traverses_and_update_filepath(child_tree, item_path.clone())
-                    .await
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "Failed to process subtree {} at path '{}': {}",
-                            tree_hash,
-                            item_path.display(),
-                            e
-                        ))
-                    })?;
-            } else {
-                let blob_id = item.id.to_string();
-                let file_path_str = item_path.to_str().ok_or_else(|| {
-                    MegaError::Other(format!(
-                        "Invalid UTF-8 path for blob {}: '{}'",
-                        blob_id,
-                        item_path.display()
-                    ))
-                })?;
-
-                self.storage
-                    .mono_storage()
-                    .update_blob_filepath(&blob_id, file_path_str)
-                    .await
-                    .map_err(|e| {
-                        MegaError::Other(format!(
-                            "Failed to update file path for blob {} at '{}': {}",
-                            blob_id, file_path_str, e
-                        ))
-                    })?;
-
-                tracing::debug!(
-                    "Updated file path for blob {} to '{}'",
-                    blob_id,
-                    file_path_str
-                );
-            }
-        }
-
-        Ok(())
-    }
     /// The semantics-defining command of this push: the first non-delete
     /// branch command. Delete commands never build a chain; a push with more
     /// than one non-delete branch command is rejected by
@@ -2280,5 +2184,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(head, via_create);
+    }
+
+    #[tokio::test]
+    async fn tp13_review_index_writes_null_watermark() {
+        use crate::jupiter::storage::blob_path_index::BlobPathIndexMode;
+
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let blob = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tree =
+            Tree::from_tree_items(vec![git_internal::internal::object::tree::TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::from_str(blob).unwrap(),
+                "readme.txt".to_string(),
+            )])
+            .unwrap();
+        let commit = ObjectHash::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        mono.save_mega_trees(vec![tree.clone()], commit, None)
+            .await
+            .unwrap();
+        let stats = mono
+            .index_tree_blob_paths(&tree.id.to_string(), "/", BlobPathIndexMode::Review)
+            .await
+            .unwrap();
+        assert!(!stats.skipped);
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/readme.txt");
+        assert!(rows[0].indexed_push_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn tp13_c_segment_after_commit_uses_queue_watermark() {
+        use crate::{
+            callisto::mega_refs, common::utils::MEGA_BRANCH_NAME,
+            jupiter::storage::blob_path_index::BlobPathIndexMode,
+        };
+
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let blob = "cccccccccccccccccccccccccccccccccccccccc";
+        let tree =
+            Tree::from_tree_items(vec![git_internal::internal::object::tree::TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::from_str(blob).unwrap(),
+                "q.txt".to_string(),
+            )])
+            .unwrap();
+        let commit = ObjectHash::from_str("dddddddddddddddddddddddddddddddddddddddd").unwrap();
+        mono.save_mega_trees(vec![tree.clone()], commit, None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/q",
+                MEGA_BRANCH_NAME.to_owned(),
+                commit.to_string(),
+                tree.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // C-segment runs after B3 commit (lock released); this is the same
+        // entry `execute_b3` calls once the txn has committed.
+        let stats = mono
+            .index_blob_paths_c_segment("/q", BlobPathIndexMode::Queue { push_id: 42 })
+            .await
+            .unwrap();
+        assert!(!stats.skipped);
+        let rows = mono.list_blob_paths().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/q/q.txt");
+        assert_eq!(rows[0].indexed_push_id, Some(42));
     }
 }

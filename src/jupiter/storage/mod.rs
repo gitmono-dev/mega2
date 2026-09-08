@@ -1,6 +1,7 @@
 pub mod artifact_storage;
 pub mod audit_storage;
 pub mod base_storage;
+pub mod blob_path_index;
 pub mod bots_storage;
 pub mod buck_storage;
 pub mod build_trigger_storage;

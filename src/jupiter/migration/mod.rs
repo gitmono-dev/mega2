@@ -114,6 +114,7 @@ pub(crate) mod m20260905_000100_add_push_queue;
 mod m20260905_000200_mega_cl_revision;
 mod m20260905_000300_add_mega_ref_tombstones;
 mod m20260905_000400_add_authz_outbox;
+mod m20260905_000500_add_blob_paths;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -216,6 +217,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000200_mega_cl_revision::Migration),
             Box::new(m20260905_000300_add_mega_ref_tombstones::Migration),
             Box::new(m20260905_000400_add_authz_outbox::Migration),
+            Box::new(m20260905_000500_add_blob_paths::Migration),
         ]
     }
 }
