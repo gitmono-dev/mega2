@@ -310,6 +310,41 @@ pub async fn search_tree_for_update<T: ApiHandler + ?Sized>(
     Ok(update_chain)
 }
 
+/// Like [`search_tree_for_update`], but starts from a lock-held root tree
+/// instead of re-reading `main@/` (TP-07 B3 rebuild).
+pub async fn search_tree_for_update_from_root<T: ApiHandler + ?Sized>(
+    handler: &T,
+    path: &Path,
+    root_tree: Tree,
+) -> Result<Vec<Arc<Tree>>, GitError> {
+    let relative_path = handler
+        .strip_relative(path)
+        .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+    let mut current_tree = Arc::new(root_tree.clone());
+    let mut update_chain = vec![Arc::new(root_tree)];
+
+    for component in relative_path.components() {
+        if component != Component::RootDir {
+            let target_name = component.as_os_str().to_str().unwrap();
+
+            let search_res = current_tree
+                .tree_items
+                .iter()
+                .find(|x| x.name == target_name)
+                .ok_or_else(|| {
+                    GitError::CustomError(format!(
+                        "Path '{}' not exist, please create path first!",
+                        target_name
+                    ))
+                })?;
+            current_tree = Arc::new(handler.get_tree_by_hash(&search_res.id.to_string()).await?);
+            update_chain.push(current_tree.clone());
+        }
+    }
+    Ok(update_chain)
+}
+
 /// Like [`search_tree_for_update`], but inserts missing `TreeItemMode::Tree`
 /// components along the path (create semantics for trunk push).
 ///

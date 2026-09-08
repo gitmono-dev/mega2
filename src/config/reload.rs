@@ -723,6 +723,9 @@ fn collect_monorepo_restart_fields(
     if current.monorepo.push_policy != candidate.monorepo.push_policy {
         report.restart_required_fields.push("monorepo.push_policy");
     }
+    if current.monorepo.merge_writer != candidate.monorepo.merge_writer {
+        report.restart_required_fields.push("monorepo.merge_writer");
+    }
 }
 
 fn collect_pack_restart_fields(

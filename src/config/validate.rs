@@ -1465,6 +1465,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "object_format",
             "rename",
             "push_policy",
+            "merge_writer",
         ]),
         "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
         "build" => Some(&[
@@ -2950,6 +2951,7 @@ mod tests {
             admin = ["admin"]
             root_dirs = ["project"]
             push_policy = "trunk"
+            merge_writer = "queue"
             [sidebar]
             default_items = [
                 { public_id = "home", label = "Home", href = "/posts", order_index = 0 },
@@ -2958,6 +2960,24 @@ mod tests {
         )
         .unwrap();
         assert!(reject_unknown_fields(&value).is_ok());
+    }
+
+    #[test]
+    fn merge_writer_rejects_unknown_value() {
+        let err = toml::from_str::<crate::config::MonoConfig>(
+            r#"
+            import_dir = "/third-party"
+            admin = ["admin"]
+            root_dirs = ["project"]
+            merge_writer = "both"
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge_writer") || msg.contains("unknown variant"),
+            "{msg}"
+        );
     }
 
     #[test]

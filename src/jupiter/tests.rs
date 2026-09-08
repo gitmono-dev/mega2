@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use sea_orm::{
@@ -13,7 +14,7 @@ use tracing::log;
 use url::Url;
 
 use crate::{
-    config::{DbConfig, reload::ConfigHandle, testing::isolated_config},
+    config::{Config, DbConfig, MergeWriter, reload::ConfigHandle, testing::isolated_config},
     contract::policy::entitystore::SharedEntityStore,
     jupiter::{
         migration::apply_migrations,
@@ -163,9 +164,24 @@ async fn execute_postgres(db: &DatabaseConnection, sql: String) {
 }
 
 pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
+    test_storage_with_config(
+        temp_dir.as_ref(),
+        isolated_config(temp_dir.as_ref().join("config")),
+    )
+    .await
+}
+
+/// Like [`test_storage`] but with `monorepo.merge_writer = queue`.
+pub async fn test_storage_queue_merge(temp_dir: impl AsRef<Path>) -> Storage {
+    let mut config = isolated_config(temp_dir.as_ref().join("config"));
+    config.monorepo.merge_writer = MergeWriter::Queue;
+    test_storage_with_config(temp_dir.as_ref(), config).await
+}
+
+pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config) -> Storage {
     let connection = test_db_connection(temp_dir.as_ref()).await;
     let connection = Arc::new(connection);
-    let config = Arc::new(isolated_config(temp_dir.as_ref().join("config")));
+    let config = Arc::new(config);
     let base = BaseStorage::new(connection.clone());
 
     let svc = AppService {
@@ -210,7 +226,8 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
         push_queue_service: PushQueueService::new(
             base.clone(),
             config.monorepo.push_policy.clone(),
-        ),
+        )
+        .with_timeouts(Duration::from_secs(30), Duration::from_millis(20)),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
         config_handle: ConfigHandle::from_arc(config.clone()),

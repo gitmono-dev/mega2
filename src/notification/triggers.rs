@@ -258,6 +258,7 @@ mod tests {
             updated_at: Set(now),
             username: Set("alice".to_string()),
             base_branch: Set("main".to_string()),
+            revision: Set(0),
         }
         .insert(&db)
         .await

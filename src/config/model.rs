@@ -162,6 +162,11 @@ pub struct MonoConfig {
     /// full fail-closed startup validation lands in TP-15.
     #[serde(default)]
     pub push_policy: PushPolicy,
+    /// Single-writer switch for CL merge (TP-07). Default `legacy` is the
+    /// migration-period rollback value; production steady state is `queue`.
+    /// Restart-required.
+    #[serde(default)]
+    pub merge_writer: MergeWriter,
 }
 
 impl Default for MonoConfig {
@@ -179,8 +184,20 @@ impl Default for MonoConfig {
             object_format: MonoObjectFormat::default(),
             rename: RenameConfig::default(),
             push_policy: PushPolicy::default(),
+            merge_writer: MergeWriter::default(),
         }
     }
+}
+
+/// Single-writer switch for CL merge (TP-07 / ADR-TP-05).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeWriter {
+    /// Existing merge_queue processor (migration-period rollback only).
+    #[default]
+    Legacy,
+    /// All merge entries enter `MonoWriteQueue` and wait for B3.
+    Queue,
 }
 
 impl MonoConfig {

@@ -75,6 +75,7 @@ impl mega_cl::Model {
             from_hash,
             to_hash,
             username,
+            revision: 0,
         }
     }
 
@@ -101,6 +102,7 @@ impl mega_cl::Model {
             from_hash,
             to_hash: String::new(),
             username,
+            revision: 0,
         }
     }
 }

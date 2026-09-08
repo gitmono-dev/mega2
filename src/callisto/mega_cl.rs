@@ -23,6 +23,8 @@ pub struct Model {
     pub updated_at: DateTime,
     pub username: String,
     pub base_branch: String,
+    /// Monotonic CAS token for merge/rebase (TP-07 / GAP-12).
+    pub revision: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

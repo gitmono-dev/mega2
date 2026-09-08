@@ -80,6 +80,10 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 # Bootstrap with: monoengine --config config/config.toml service init --yes
 object_format = "sha1"
 
+# CL merge writer: "legacy" (migration-period rollback) or "queue" (MonoWriteQueue).
+# Production steady state is queue. Restart-required.
+# merge_writer = "legacy"
+
 [monorepo.rename]
 # Similarity threshold (0-100) for move/rename detection in diff classification.
 similarity_threshold = 50

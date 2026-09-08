@@ -651,6 +651,7 @@ mod tests {
             created_at: DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
             updated_at: DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
             username: "alice".to_string(),
+            revision: 0,
         };
 
         let payload = ClPayload::from(&model);

@@ -111,6 +111,7 @@ mod m20260815_000000_unique_mega_cl_link;
 mod m20260815_000100_merge_queue_requester;
 mod m20260831_000000_drop_mega_issue_tables;
 pub(crate) mod m20260905_000100_add_push_queue;
+mod m20260905_000200_mega_cl_revision;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -210,6 +211,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260815_000100_merge_queue_requester::Migration),
             Box::new(m20260831_000000_drop_mega_issue_tables::Migration),
             Box::new(m20260905_000100_add_push_queue::Migration),
+            Box::new(m20260905_000200_mega_cl_revision::Migration),
         ]
     }
 }

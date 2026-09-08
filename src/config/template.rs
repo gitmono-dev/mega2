@@ -49,6 +49,9 @@ object_format = "sha1"
 # Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
 # Restart-required; full startup fail-closed checks land in TP-15.
 # push_policy = "review"
+# CL merge writer: "legacy" (migration rollback) or "queue" (MonoWriteQueue).
+# Production steady state is queue. Restart-required.
+# merge_writer = "legacy"
 
 [monorepo.rename]
 similarity_threshold = 50

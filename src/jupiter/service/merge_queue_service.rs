@@ -4,14 +4,17 @@ use std::sync::{
 };
 
 use crate::{
-    callisto::sea_orm_active_enums::{MergeStatusEnum, QueueFailureTypeEnum, QueueStatusEnum},
-    common::errors::MegaError,
+    callisto::sea_orm_active_enums::{
+        MergeStatusEnum, PushQueueKindEnum, QueueFailureTypeEnum, QueueStatusEnum,
+    },
+    common::{errors::MegaError, utils::ZERO_ID},
     jupiter::{
         model::merge_queue_dto::QueueStats,
         storage::{
             base_storage::{BaseStorage, StorageConnector},
             cl_storage::ClStorage,
             merge_queue_storage::MergeQueueStorage,
+            push_queue_storage::{EnqueueOutcome, EnqueueParams, PushQueueStorage},
         },
     },
 };
@@ -22,6 +25,13 @@ pub struct MergeQueueService {
     merge_queue_storage: MergeQueueStorage,
     cl_storage: ClStorage,
     processor_running: Arc<AtomicBool>,
+}
+
+/// Counts produced by [`MergeQueueService::absorb_into_push_queue`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AbsorbReport {
+    pub queued: u64,
+    pub failed_interrupted: u64,
 }
 
 impl MergeQueueService {
@@ -268,8 +278,240 @@ impl MergeQueueService {
             .map_err(MegaError::Other)
     }
 
+    /// Absorb leftover `merge_queue` rows into `push_queue` when switching
+    /// `merge_writer=queue` (TP-07 rolling deploy).
+    ///
+    /// `Waiting`/`Testing` → `push_queue` `Queued`; `Merging` →
+    /// `Failed(MergeFailure, interrupted)`. Each source row is deleted after
+    /// the destination insert.
+    pub async fn absorb_into_push_queue(
+        &self,
+        push_queue: &PushQueueStorage,
+    ) -> Result<AbsorbReport, MegaError> {
+        let items = self
+            .merge_queue_storage
+            .list_absorb_candidates()
+            .await
+            .map_err(MegaError::Other)?;
+        let mut report = AbsorbReport::default();
+        for item in items {
+            let cl = self.cl_storage.get_cl(&item.cl_link).await?;
+            let (path, old_id, new_id) = match &cl {
+                Some(cl) => (cl.path.clone(), cl.from_hash.clone(), cl.to_hash.clone()),
+                None => ("/".to_owned(), ZERO_ID.to_owned(), ZERO_ID.to_owned()),
+            };
+            match item.status {
+                QueueStatusEnum::Waiting | QueueStatusEnum::Testing => {
+                    let outcome = push_queue
+                        .enqueue_atomic(EnqueueParams {
+                            kind: PushQueueKindEnum::Merge,
+                            operation_id: &item.cl_link,
+                            path: &path,
+                            old_id: &old_id,
+                            new_id: &new_id,
+                            requester: item.requester.as_deref(),
+                            payload: serde_json::json!({
+                                "cl_link": item.cl_link,
+                                "authz_principal": item.requester.clone().unwrap_or_else(|| "system".into()),
+                                "execution_actor": "system",
+                                "apply_queue_execution_decision": true,
+                                "requester": item.requester,
+                            }),
+                        })
+                        .await?;
+                    match outcome {
+                        EnqueueOutcome::Inserted { .. }
+                        | EnqueueOutcome::Adopted { .. }
+                        | EnqueueOutcome::Replay { .. } => {}
+                        EnqueueOutcome::Rejected { reason } => {
+                            return Err(MegaError::Other(format!(
+                                "absorb enqueue rejected for {}: {reason:?}",
+                                item.cl_link
+                            )));
+                        }
+                    }
+                    report.queued += 1;
+                }
+                QueueStatusEnum::Merging => {
+                    push_queue
+                        .insert_absorbed_failed_merge(
+                            &item.cl_link,
+                            &path,
+                            &old_id,
+                            &new_id,
+                            item.requester.as_deref(),
+                            "interrupted",
+                        )
+                        .await?;
+                    report.failed_interrupted += 1;
+                }
+                _ => {}
+            }
+            self.merge_queue_storage
+                .delete_by_pk(item.id)
+                .await
+                .map_err(MegaError::Other)?;
+        }
+        Ok(report)
+    }
+
+    /// Queue-mode HTTP startup: disable the legacy processor, absorb leftover
+    /// `merge_queue` rows, then refuse to start if any non-terminal rows remain.
+    pub async fn prepare_for_queue_writer(
+        &self,
+        push_queue: &PushQueueStorage,
+    ) -> Result<AbsorbReport, MegaError> {
+        self.stop_processor();
+        let report = self.absorb_into_push_queue(push_queue).await?;
+        let left = self
+            .merge_queue_storage
+            .list_absorb_candidates()
+            .await
+            .map_err(MegaError::Other)?;
+        if !left.is_empty() {
+            return Err(MegaError::Other(format!(
+                "merge_writer=queue requires non-terminal merge_queue rows to be drained; {} remain after absorb",
+                left.len()
+            )));
+        }
+        Ok(report)
+    }
+
     pub fn mock() -> Self {
         let base_storage = BaseStorage::mock();
         Self::new(base_storage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    use super::*;
+    use crate::{
+        callisto::{merge_queue, sea_orm_active_enums::PushQueueStatusEnum},
+        jupiter::{storage::base_storage::StorageConnector, tests::test_storage_queue_merge},
+    };
+
+    async fn seed_open_cl(storage: &crate::jupiter::storage::Storage, link: &str, path: &str) {
+        storage
+            .cl_storage()
+            .new_cl_model(
+                path,
+                link,
+                "absorb test",
+                "main",
+                &"a".repeat(40),
+                &"b".repeat(40),
+                "alice",
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn insert_mq(
+        storage: &crate::jupiter::storage::Storage,
+        link: &str,
+        status: QueueStatusEnum,
+    ) {
+        let now = chrono::Utc::now().naive_utc();
+        merge_queue::ActiveModel {
+            id: Set(crate::common::utils::generate_id()),
+            cl_link: Set(link.to_owned()),
+            status: Set(status),
+            position: Set(chrono::Utc::now().timestamp_millis()),
+            retry_count: Set(0),
+            last_retry_at: Set(None),
+            failure_type: Set(None),
+            error_message: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            requester: Set(Some("alice".into())),
+        }
+        .insert(storage.merge_queue_storage().get_connection())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn absorb_waiting_and_testing_become_queued() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        use crate::callisto::push_queue;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage_queue_merge(temp.path()).await;
+        seed_open_cl(&storage, "CLWAIT", "/p-wait").await;
+        seed_open_cl(&storage, "CLTEST", "/p-test").await;
+        insert_mq(&storage, "CLWAIT", QueueStatusEnum::Waiting).await;
+        insert_mq(&storage, "CLTEST", QueueStatusEnum::Testing).await;
+
+        let report = storage
+            .merge_queue_service
+            .prepare_for_queue_writer(storage.push_queue_service.storage())
+            .await
+            .unwrap();
+        assert_eq!(report.queued, 2);
+        assert_eq!(report.failed_interrupted, 0);
+        assert!(!storage.merge_queue_service.is_processor_running());
+
+        let left = storage
+            .merge_queue_storage()
+            .list_absorb_candidates()
+            .await
+            .unwrap();
+        assert!(left.is_empty());
+
+        for link in ["CLWAIT", "CLTEST"] {
+            let rows = push_queue::Entity::find()
+                .filter(push_queue::Column::OperationId.eq(link))
+                .all(storage.push_queue_storage().get_connection())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "{link}");
+            assert_eq!(rows[0].status, PushQueueStatusEnum::Queued);
+            assert_eq!(rows[0].kind, PushQueueKindEnum::Merge);
+        }
+    }
+
+    #[tokio::test]
+    async fn absorb_merging_becomes_failed_interrupted() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        use crate::callisto::push_queue;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage_queue_merge(temp.path()).await;
+        seed_open_cl(&storage, "CLMERGE", "/p-merge").await;
+        insert_mq(&storage, "CLMERGE", QueueStatusEnum::Merging).await;
+
+        let report = storage
+            .merge_queue_service
+            .prepare_for_queue_writer(storage.push_queue_service.storage())
+            .await
+            .unwrap();
+        assert_eq!(report.queued, 0);
+        assert_eq!(report.failed_interrupted, 1);
+        assert!(!storage.merge_queue_service.is_processor_running());
+        assert!(
+            storage
+                .merge_queue_storage()
+                .list_absorb_candidates()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rows = push_queue::Entity::find()
+            .filter(push_queue::Column::OperationId.eq("CLMERGE"))
+            .all(storage.push_queue_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, PushQueueStatusEnum::Failed);
+        assert_eq!(
+            rows[0].failure_type,
+            Some(crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::MergeFailure)
+        );
+        assert_eq!(rows[0].error_message.as_deref(), Some("interrupted"));
     }
 }

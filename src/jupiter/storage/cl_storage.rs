@@ -5,9 +5,9 @@ use std::{
 
 use git_internal::internal::object::commit::Commit;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, IntoActiveModel,
-    JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    IntoActiveModel, JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    RelationTrait, Set, TransactionTrait,
     prelude::Expr,
     sea_query::{LockType, OnConflict},
 };
@@ -197,6 +197,18 @@ impl ClStorage {
         Ok(model)
     }
 
+    pub async fn get_cl_in_txn(
+        &self,
+        link: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_cl::Model>, MegaError> {
+        let model = mega_cl::Entity::find()
+            .filter(mega_cl::Column::Link.eq(link))
+            .one(txn)
+            .await?;
+        Ok(model)
+    }
+
     pub async fn get_cl_labels(
         &self,
         link: &str,
@@ -372,11 +384,53 @@ impl ClStorage {
     }
 
     pub async fn merge_cl(&self, model: mega_cl::Model) -> Result<(), MegaError> {
-        let mut a_model = model.into_active_model();
-        a_model.status = Set(MergeStatusEnum::Merged);
-        a_model.updated_at = Set(chrono::Utc::now().naive_utc());
-        a_model.update(self.get_connection()).await.unwrap();
+        if !self.merge_cl_cas(self.get_connection(), &model).await? {
+            return Err(MegaError::Other(
+                "CL revision CAS missed (concurrent merge or rebase)".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Merge status write inside `txn` with revision CAS. `false` = 0 rows.
+    pub async fn merge_cl_in_txn(
+        &self,
+        model: mega_cl::Model,
+        txn: &DatabaseTransaction,
+    ) -> Result<bool, MegaError> {
+        self.merge_cl_cas(txn, &model).await
+    }
+
+    async fn merge_cl_cas<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        model: &mega_cl::Model,
+    ) -> Result<bool, MegaError> {
+        let now = chrono::Utc::now().naive_utc();
+        let rows = conn
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                UPDATE mega_cl
+                   SET status = 'merged'::merge_status_enum,
+                       merge_date = $1,
+                       updated_at = $2,
+                       revision = revision + 1
+                 WHERE link = $3
+                   AND revision = $4
+                   AND status = 'open'::merge_status_enum
+                   AND to_hash = $5
+                "#,
+                [
+                    sea_orm::Value::from(now),
+                    sea_orm::Value::from(now),
+                    sea_orm::Value::from(model.link.clone()),
+                    sea_orm::Value::from(model.revision),
+                    sea_orm::Value::from(model.to_hash.clone()),
+                ],
+            ))
+            .await?;
+        Ok(rows.rows_affected() == 1)
     }
 
     /// The to-hash advance inside the caller's transaction (MC-04: the CL row
@@ -390,10 +444,14 @@ impl ClStorage {
         to_hash: &str,
         txn: &DatabaseTransaction,
     ) -> Result<(), MegaError> {
-        let mut a_model = model.into_active_model();
-        a_model.to_hash = Set(to_hash.to_owned());
-        a_model.updated_at = Set(chrono::Utc::now().naive_utc());
-        a_model.update(txn).await?;
+        if !self
+            .cas_update_cl_hashes_in_txn(&model, &model.from_hash, to_hash, txn)
+            .await?
+        {
+            return Err(MegaError::Other(
+                "CL revision CAS missed (concurrent merge or rebase)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -408,12 +466,50 @@ impl ClStorage {
         to_hash: &str,
         txn: &DatabaseTransaction,
     ) -> Result<(), MegaError> {
-        let mut a_model = model.into_active_model();
-        a_model.from_hash = Set(from_hash.to_owned());
-        a_model.to_hash = Set(to_hash.to_owned());
-        a_model.updated_at = Set(chrono::Utc::now().naive_utc());
-        a_model.update(txn).await?;
+        if !self
+            .cas_update_cl_hashes_in_txn(&model, from_hash, to_hash, txn)
+            .await?
+        {
+            return Err(MegaError::Other(
+                "CL revision CAS missed (concurrent merge or rebase)".into(),
+            ));
+        }
         Ok(())
+    }
+
+    pub async fn cas_update_cl_hashes_in_txn(
+        &self,
+        model: &mega_cl::Model,
+        from_hash: &str,
+        to_hash: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<bool, MegaError> {
+        let now = chrono::Utc::now().naive_utc();
+        let rows = txn
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                UPDATE mega_cl
+                   SET from_hash = $1,
+                       to_hash = $2,
+                       updated_at = $3,
+                       revision = revision + 1
+                 WHERE link = $4
+                   AND revision = $5
+                   AND status = 'open'::merge_status_enum
+                   AND to_hash = $6
+                "#,
+                [
+                    sea_orm::Value::from(from_hash.to_owned()),
+                    sea_orm::Value::from(to_hash.to_owned()),
+                    sea_orm::Value::from(now),
+                    sea_orm::Value::from(model.link.clone()),
+                    sea_orm::Value::from(model.revision),
+                    sea_orm::Value::from(model.to_hash.clone()),
+                ],
+            ))
+            .await?;
+        Ok(rows.rows_affected() == 1)
     }
 
     /// Delete a CL's commit listing inside the caller's transaction (MC-04 R2:
@@ -790,12 +886,14 @@ fn aggregate_target_states(states: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::ConnectionTrait;
+    use sea_orm::{ConnectionTrait, TransactionTrait};
     use tempfile::TempDir;
 
     use super::*;
     use crate::jupiter::{
-        migration::apply_migrations, storage::base_storage::BaseStorage, tests::test_db_connection,
+        migration::apply_migrations,
+        storage::base_storage::{BaseStorage, StorageConnector},
+        tests::test_db_connection,
         utils::converter::FromMegaModel,
     };
 
@@ -1390,5 +1488,61 @@ mod tests {
             vec![mc04_sha(401), mc04_sha(402)],
             "the retry listing is the full (from, to] chain"
         );
+    }
+
+    #[tokio::test]
+    async fn merge_cl_revision_cas_misses_on_stale_token() {
+        use crate::callisto::sea_orm_active_enums::MergeStatusEnum;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let conn = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&conn, true).await.expect("migrations");
+        let storage = ClStorage {
+            base: BaseStorage::new(std::sync::Arc::new(conn)),
+        };
+        let cl = storage
+            .new_cl_model(
+                "/",
+                "CLREV01",
+                "revision cas",
+                "main",
+                &mc04_sha(1),
+                &mc04_sha(2),
+                "rev-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(cl.revision, 0);
+        storage.merge_cl(cl.clone()).await.unwrap();
+        let merged = storage.get_cl("CLREV01").await.unwrap().unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+        assert_eq!(merged.revision, 1);
+
+        let conn = storage.get_connection();
+        let txn = conn.begin().await.unwrap();
+        let stale = mega_cl::Model {
+            revision: 0,
+            ..merged.clone()
+        };
+        let missed = storage
+            .cas_update_cl_hashes_in_txn(&stale, &mc04_sha(3), &mc04_sha(4), &txn)
+            .await
+            .unwrap();
+        assert!(!missed, "stale rebase after merge must miss");
+        txn.rollback().await.unwrap();
+        let still = storage.get_cl("CLREV01").await.unwrap().unwrap();
+        assert_eq!(still.status, MergeStatusEnum::Merged);
+        assert_eq!(still.to_hash, mc04_sha(2));
+
+        let txn = conn.begin().await.unwrap();
+        let missed_status = storage
+            .cas_update_cl_hashes_in_txn(&merged, &mc04_sha(3), &mc04_sha(4), &txn)
+            .await
+            .unwrap();
+        assert!(
+            !missed_status,
+            "rebase after merge must miss on status=Open even with current revision"
+        );
+        txn.rollback().await.unwrap();
     }
 }

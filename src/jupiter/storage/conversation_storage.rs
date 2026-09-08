@@ -1,7 +1,8 @@
 use std::ops::Deref;
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set, prelude::Expr,
+    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, IntoActiveModel, QueryFilter,
+    Set, prelude::Expr,
 };
 
 use crate::{
@@ -36,6 +37,20 @@ impl ConversationStorage {
         let conversation = mega_conversation::Model::new(link, conv_type, comment, username);
         let conversation = conversation.into_active_model();
         let res = conversation.insert(self.get_connection()).await.unwrap();
+        Ok(res.id)
+    }
+
+    pub async fn add_conversation_in_txn(
+        &self,
+        link: &str,
+        username: &str,
+        comment: Option<String>,
+        conv_type: ConvTypeEnum,
+        txn: &DatabaseTransaction,
+    ) -> Result<i64, MegaError> {
+        let conversation = mega_conversation::Model::new(link, conv_type, comment, username);
+        let conversation = conversation.into_active_model();
+        let res = conversation.insert(txn).await?;
         Ok(res.id)
     }
 

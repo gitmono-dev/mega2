@@ -167,6 +167,30 @@ impl MergeQueueStorage {
         Ok(items)
     }
 
+    /// Non-terminal rows that must move into `push_queue` on `merge_writer=queue`.
+    pub async fn list_absorb_candidates(&self) -> Result<Vec<Model>, String> {
+        let db = self.get_connection();
+        let items = Entity::find()
+            .filter(Column::Status.is_in([
+                QueueStatusEnum::Waiting,
+                QueueStatusEnum::Testing,
+                QueueStatusEnum::Merging,
+            ]))
+            .order_by_asc(Column::Position)
+            .all(db)
+            .await
+            .map_err(|e| format!("Failed to list absorb candidates: {}", e))?;
+        Ok(items)
+    }
+
+    pub async fn delete_by_pk(&self, id: i64) -> Result<(), String> {
+        Entity::delete_by_id(id)
+            .exec(self.get_connection())
+            .await
+            .map_err(|e| format!("Failed to delete merge_queue row {id}: {e}"))?;
+        Ok(())
+    }
+
     pub async fn get_cl_queue_status(&self, cl_link: &str) -> Result<Option<Model>, String> {
         Entity::find()
             .filter(Column::ClLink.eq(cl_link))
