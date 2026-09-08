@@ -68,6 +68,16 @@ enum DescendantResolve {
     Delete,
 }
 
+/// How to construct descendant continuation commits (TP-16).
+/// Review/CL merge keeps [`Self::Legacy`]; trunk push uses [`Self::Trunk`].
+pub enum DescendantCommitStyle {
+    Legacy,
+    Trunk {
+        plan: Box<crate::ceres::pack::trunk_provenance::TrunkProvenance>,
+        sign: crate::ceres::pack::trunk_provenance::TrunkMegaSign,
+    },
+}
+
 fn path_slash_depth(path: &str) -> usize {
     path.bytes().filter(|b| *b == b'/').count()
 }
@@ -596,6 +606,25 @@ impl MonoStorage {
         old_tree_hash: Option<&str>,
         txn: &DatabaseTransaction,
     ) -> Result<(), MegaError> {
+        self.advance_descendant_refs_with(
+            path,
+            new_tree_hash,
+            old_tree_hash,
+            txn,
+            DescendantCommitStyle::Legacy,
+        )
+        .await
+    }
+
+    /// Advance descendants with an explicit continuation-commit constructor.
+    pub async fn advance_descendant_refs_with(
+        &self,
+        path: &str,
+        new_tree_hash: &str,
+        old_tree_hash: Option<&str>,
+        txn: &DatabaseTransaction,
+        style: DescendantCommitStyle,
+    ) -> Result<(), MegaError> {
         let normalized = if path.is_empty() { "/" } else { path };
         let candidates = self.descendant_main_refs(normalized, txn).await?;
         if candidates.is_empty() {
@@ -632,8 +661,34 @@ impl MonoStorage {
                     let tree = ObjectHash::from_str(&new_hash).map_err(|e| {
                         MegaError::Other(format!("descendant {} tree hash: {e}", row.path))
                     })?;
-                    let commit =
-                        Commit::from_tree_id(tree, vec![parent], "trunk descendant continuation");
+                    let commit = match &style {
+                        DescendantCommitStyle::Legacy => Commit::from_tree_id(
+                            tree,
+                            vec![parent],
+                            "trunk descendant continuation",
+                        ),
+                        DescendantCommitStyle::Trunk { plan, sign } => {
+                            let prev = self
+                                .get_commit_by_hash(&row.ref_commit_hash)
+                                .await?
+                                .map(Commit::from_mega_model)
+                                .map(|c| c.committer);
+                            let committer = crate::ceres::pack::trunk_provenance::committer_at_land(
+                                &plan.committer_name,
+                                &plan.committer_email,
+                                prev.as_ref(),
+                                plan.land_ts,
+                            );
+                            let unsigned = crate::ceres::pack::trunk_provenance::synthesize(
+                                plan.author.clone(),
+                                committer,
+                                tree,
+                                vec![parent],
+                                &plan.layer_message(&row.path),
+                            );
+                            sign(&unsigned)?
+                        }
+                    };
                     updates.push(RefUpdateData {
                         path: row.path.clone(),
                         ref_name: MEGA_BRANCH_NAME.to_owned(),

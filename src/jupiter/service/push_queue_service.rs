@@ -1685,16 +1685,22 @@ impl PushQueueService {
         use std::{path::PathBuf, str::FromStr};
 
         use git_internal::{
+            errors::GitError,
             hash::ObjectHash,
             internal::object::{commit::Commit, tree::Tree},
         };
 
         use crate::{
-            ceres::api_service::{
-                mono_api_service::{MonoApiService, MonoServiceLogic, PushApplyArgs},
-                tree_ops,
+            ceres::{
+                api_service::{
+                    mono_api_service::{MonoApiService, MonoServiceLogic, PushApplyArgs},
+                    tree_ops,
+                },
+                pack::trunk_provenance::{self, TrunkProvenance},
             },
-            jupiter::utils::converter::FromMegaModel,
+            jupiter::{
+                storage::mono_storage::DescendantCommitStyle, utils::converter::FromMegaModel,
+            },
         };
 
         let payload: PushPayload = serde_json::from_value(row.payload.clone())
@@ -1918,17 +1924,95 @@ impl PushQueueService {
         }
         .map_err(|e| MegaError::Other(e.to_string()))?;
 
+        let land_ts = chrono::Utc::now().timestamp() as usize;
+        let signing = mono_api.server_signing_context()?;
+        let signing_key = std::sync::Arc::new(signing.active_key().await?);
+        let sign_git: crate::ceres::api_service::mono_api_service::TrunkGitSign = {
+            let signing = signing.clone();
+            let signing_key = std::sync::Arc::clone(&signing_key);
+            std::sync::Arc::new(move |c: &Commit| {
+                signing
+                    .sign_commit_preserving_identities(&signing_key, c)
+                    .map_err(|e| GitError::CustomError(e.to_string()))
+            })
+        };
+        let sign_mega: crate::ceres::pack::trunk_provenance::TrunkMegaSign = {
+            let signing = signing.clone();
+            let signing_key = std::sync::Arc::clone(&signing_key);
+            std::sync::Arc::new(move |c: &Commit| {
+                signing.sign_commit_preserving_identities(&signing_key, c)
+            })
+        };
+
+        let mut tip_first: Vec<Commit> = Vec::with_capacity(payload.commits.len());
+        if payload.commits.is_empty() {
+            tip_first.push(tip_commit.clone());
+        } else {
+            for id in &payload.commits {
+                let model = self
+                    .mono_storage
+                    .get_commit_by_hash(id)
+                    .await?
+                    .ok_or_else(|| {
+                        MegaError::Other(format!("push payload commit {id} not found"))
+                    })?;
+                tip_first.push(Commit::from_mega_model(model));
+            }
+        }
+        let topo_asc = trunk_provenance::load_topo_asc(&tip_first)?;
+
+        let prev_p = if creating {
+            None
+        } else {
+            self.mono_storage
+                .get_commit_by_hash(&row.old_id)
+                .await?
+                .map(Commit::from_mega_model)
+                .map(|c| c.committer)
+        };
+        let range = if creating {
+            None
+        } else {
+            Some((row.old_id.clone(), row.new_id.clone()))
+        };
+
         let (landed_at_p, extra_commits) = if payload.n == 1 {
             (row.new_id.clone(), Vec::new())
-        } else if creating {
-            let squash = Commit::from_tree_id(tip_tree_id, vec![], "trunk squash");
-            (squash.id.to_string(), vec![squash])
         } else {
-            let parent_hash =
-                ObjectHash::from_str(&row.old_id).map_err(|e| MegaError::Other(e.to_string()))?;
-            let squash = Commit::from_tree_id(tip_tree_id, vec![parent_hash], "trunk squash");
+            let parents = if creating {
+                Vec::new()
+            } else {
+                let parent_hash = ObjectHash::from_str(&row.old_id)
+                    .map_err(|e| MegaError::Other(e.to_string()))?;
+                vec![parent_hash]
+            };
+            let draft = TrunkProvenance::from_tip(
+                &tip_commit,
+                payload.n,
+                &normalized,
+                String::new(),
+                range.clone(),
+                land_ts,
+            );
+            let unsigned = trunk_provenance::synthesize(
+                draft.author.clone(),
+                draft.committer(prev_p.as_ref()),
+                tip_tree_id,
+                parents,
+                &draft.squash_message(&topo_asc),
+            );
+            let squash = sign_mega(&unsigned)?;
             (squash.id.to_string(), vec![squash])
         };
+
+        let plan = TrunkProvenance::from_tip(
+            &tip_commit,
+            payload.n,
+            &normalized,
+            landed_at_p.clone(),
+            range,
+            land_ts,
+        );
 
         PushQueueStorage::savepoint(&txn, "b3_kind").await?;
         let apply = mono_api
@@ -1942,6 +2026,8 @@ impl PushQueueService {
                     expected_root_tree: cur_tree,
                     extra_commits,
                     extra_blob,
+                    provenance: Some(&plan),
+                    sign_trunk: Some(std::sync::Arc::clone(&sign_git)),
                 },
             )
             .await;
@@ -1979,7 +2065,16 @@ impl PushQueueService {
             .map(|r| r.ref_tree_hash)
             .unwrap_or_else(|| tip_tree_id.to_string());
         self.mono_storage
-            .advance_descendant_refs(&normalized, &landed_tree, old_tree.as_deref(), &txn)
+            .advance_descendant_refs_with(
+                &normalized,
+                &landed_tree,
+                old_tree.as_deref(),
+                &txn,
+                DescendantCommitStyle::Trunk {
+                    plan: Box::new(plan.clone()),
+                    sign: std::sync::Arc::clone(&sign_mega),
+                },
+            )
             .await?;
 
         let updated =

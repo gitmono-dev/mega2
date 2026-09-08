@@ -620,6 +620,20 @@ mod tests {
         )
     }
 
+    #[test]
+    fn ordered_commits_reversed_is_topo_ascending() {
+        let a = test_commit(vec![]);
+        let b = test_commit(vec![a.id]);
+        let c = test_commit(vec![b.id]);
+        let tip_first = [c.clone(), b.clone(), a.clone()];
+        let topo: Vec<_> = tip_first.iter().rev().collect();
+        assert_eq!(topo[0].id, a.id);
+        assert_eq!(topo[1].id, b.id);
+        assert_eq!(topo[2].id, c.id);
+        assert_eq!(topo[1].parent_commit_ids[0], a.id);
+        assert_eq!(topo[2].parent_commit_ids[0], b.id);
+    }
+
     fn branch_command(old_id: String, new_id: String) -> RefCommand {
         RefCommand::new(old_id, new_id, "refs/heads/main".to_string())
     }

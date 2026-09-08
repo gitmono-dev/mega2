@@ -244,3 +244,26 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         vault: None,
     }
 }
+
+/// Inject a vault handle so trunk synthetic commits can be server-signed (TP-16).
+pub async fn with_test_vault(storage: Storage, dir: impl AsRef<Path>) -> Storage {
+    use crate::contract::vault::integration::vault_core::VaultCore;
+
+    let vault = VaultCore::config(
+        storage.vault_storage(),
+        dir.as_ref().join("tp16_vault_core_key.json"),
+    )
+    .await
+    .expect("test vault core");
+    storage.with_vault(vault)
+}
+
+/// Redis manager for RedLock-backed server-signing key init.
+pub async fn test_redis_manager() -> crate::jupiter::redis::ConnectionManager {
+    let url =
+        std::env::var("MEGA_REDIS__URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".to_string());
+    let client = ::redis::Client::open(url).expect("redis client");
+    ::redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("redis connection")
+}

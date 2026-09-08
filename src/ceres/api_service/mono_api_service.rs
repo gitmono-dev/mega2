@@ -417,7 +417,12 @@ pub(crate) struct PushApplyArgs<'a> {
     pub expected_root_tree: Option<&'a str>,
     pub extra_commits: Vec<Commit>,
     pub extra_blob: Option<Blob>,
+    pub provenance: Option<&'a crate::ceres::pack::trunk_provenance::TrunkProvenance>,
+    pub sign_trunk: Option<TrunkGitSign>,
 }
+
+pub(crate) type TrunkGitSign =
+    std::sync::Arc<dyn Fn(&Commit) -> Result<Commit, GitError> + Send + Sync>;
 
 pub struct RefUpdate {
     path: String,
@@ -3426,12 +3431,34 @@ impl MonoApiService {
             expected_root_tree,
             extra_commits,
             extra_blob,
+            provenance,
+            sign_trunk,
         } = args;
         let storage = self.storage.mono_storage();
         let path_p = MonoServiceLogic::clean_path_str(path_p);
         let mut commits = extra_commits;
         let mut other_updates: Vec<RefUpdateData> = Vec::new();
         let mut root_tree_new: Option<ObjectHash> = None;
+
+        let (Some(plan), Some(sign)) = (provenance, sign_trunk.as_ref()) else {
+            return Err(GitError::CustomError(
+                "push B3 missing trunk provenance/signing".into(),
+            ));
+        };
+        let trunk_commit = |tree: ObjectHash,
+                            parents: Vec<ObjectHash>,
+                            ref_path: &str,
+                            prev: Option<&git_internal::internal::object::signature::Signature>|
+         -> Result<Commit, GitError> {
+            let unsigned = crate::ceres::pack::trunk_provenance::synthesize(
+                plan.author.clone(),
+                plan.committer(prev),
+                tree,
+                parents,
+                &plan.layer_message(ref_path),
+            );
+            sign(&unsigned)
+        };
 
         for update in &result.ref_updates {
             let clean = MonoServiceLogic::clean_path_str(&update.path);
@@ -3464,7 +3491,16 @@ impl MonoApiService {
                 ],
                 None => Vec::new(),
             };
-            let commit = Commit::from_tree_id(update.tree_id, parent_ids, "trunk ancestor roll-up");
+            let prev = match existing.as_ref() {
+                Some(row) => storage
+                    .get_commit_by_hash(&row.ref_commit_hash)
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?
+                    .map(Commit::from_mega_model)
+                    .map(|c| c.committer),
+                None => None,
+            };
+            let commit = trunk_commit(update.tree_id, parent_ids, &clean, prev.as_ref())?;
             other_updates.push(RefUpdateData {
                 path: clean,
                 ref_name: MEGA_BRANCH_NAME.to_owned(),
@@ -3494,7 +3530,16 @@ impl MonoApiService {
                 ],
                 None => Vec::new(),
             };
-            let commit = Commit::from_tree_id(new_root_tree, parent_ids, "trunk ancestor roll-up");
+            let prev = match expected_root_commit {
+                Some(c) => storage
+                    .get_commit_by_hash(c)
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?
+                    .map(Commit::from_mega_model)
+                    .map(|c| c.committer),
+                None => None,
+            };
+            let commit = trunk_commit(new_root_tree, parent_ids, "/", prev.as_ref())?;
             let id = commit.id.to_string();
             commits.push(commit);
             id
@@ -3559,7 +3604,7 @@ impl MonoApiService {
     /// chain (MC-09). Fail-closed: without the vault handle no synthetic
     /// commit may leave this service unsigned. The Redis manager backs the
     /// RedLock that guards first-time key initialization.
-    fn server_signing_context(&self) -> Result<ServerSigningContext, MegaError> {
+    pub(crate) fn server_signing_context(&self) -> Result<ServerSigningContext, MegaError> {
         let vault = self.storage.vault().ok_or_else(|| {
             MegaError::Other(
                 "server signing unavailable: vault handle is not configured".to_string(),
@@ -8970,7 +9015,8 @@ mod tests {
         let mut config = isolated_config(temp.join("config"));
         config.monorepo.merge_writer = MergeWriter::Queue;
         config.monorepo.push_policy = PushPolicy::Trunk;
-        test_storage_with_config(temp, config).await
+        let storage = test_storage_with_config(temp, config).await;
+        crate::jupiter::tests::with_test_vault(storage, temp).await
     }
 
     async fn nested_queue_fixture(
@@ -9421,9 +9467,12 @@ mod tests {
         );
     }
 
-    fn tp12_ctx(storage: &Storage) -> PushExecContext {
+    async fn tp12_ctx(storage: &Storage) -> PushExecContext {
         PushExecContext {
-            git_object_cache: test_service(storage).git_object_cache,
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
             storage: storage.clone(),
         }
     }
@@ -9466,7 +9515,7 @@ mod tests {
     }
 
     async fn tp12_exec(storage: &Storage, id: i64) -> ExecuteOutcome {
-        let ctx = tp12_ctx(storage);
+        let ctx = tp12_ctx(storage).await;
         storage
             .push_queue_service
             .execute_b3(
@@ -9716,6 +9765,12 @@ mod tests {
             .unwrap();
         let parents: Vec<String> = serde_json::from_value(cont.parents_id).unwrap();
         assert_eq!(parents, vec![foo_c.id.to_string()]);
+        let cont_msg = cont.content.as_deref().unwrap_or("");
+        assert!(
+            cont_msg.contains("push p14") || cont_msg.contains("gpgsig"),
+            "N=1 descendant keeps the client message: {cont_msg}"
+        );
+        assert_has_gpgsig(cont_msg);
 
         let keep_row = mono.get_main_ref("/p14/keep").await.unwrap().unwrap();
         assert_eq!(keep_row.ref_commit_hash, keep_c.id.to_string());
@@ -10355,6 +10410,287 @@ mod tests {
         let built = repo.build_push_chain(&cmd).await.unwrap();
         assert!(built.is_none(), "review empty pack stays Noop");
         assert!(crate::ceres::pack::RepoHandler::receive_pack_notice(&repo).is_some());
+    }
+
+    fn authored_commit(
+        tree: ObjectHash,
+        parents: Vec<ObjectHash>,
+        name: &str,
+        email: &str,
+        ts: usize,
+        message: &str,
+    ) -> Commit {
+        use git_internal::internal::object::signature::{Signature, SignatureType};
+        let author = Signature {
+            signature_type: SignatureType::Author,
+            name: name.into(),
+            email: email.into(),
+            timestamp: ts,
+            timezone: "+0800".into(),
+        };
+        let committer = Signature {
+            signature_type: SignatureType::Committer,
+            name: name.into(),
+            email: email.into(),
+            timestamp: ts,
+            timezone: "+0800".into(),
+        };
+        Commit::new(author, committer, tree, parents, message)
+    }
+
+    fn assert_has_gpgsig(content: &str) {
+        assert!(
+            content.contains("gpgsig ") || content.contains("-----BEGIN PGP SIGNATURE-----"),
+            "synthetic commit must carry a server GPG signature: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp16_n1_lands_client_tip_and_root_message_matches() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _root_tree, _root_c, _child, path_commit, path) =
+            tp12_path_fixture("p16n1", "path tip").await;
+        let new_child = Tree::from_tree_items(vec![blob_item(
+            "y.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let new_commit = authored_commit(
+            new_child.id,
+            vec![path_commit.id],
+            "Alice",
+            "alice@example.com",
+            1_720_000_000,
+            "feat: n1 client message",
+        );
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![new_commit.id.to_string()],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 1,
+        };
+        let id = tp12_enqueue_claim(
+            &storage,
+            &path,
+            &path_commit.id.to_string(),
+            &new_commit.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage, id).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = exec
+        else {
+            panic!("expected Done, got {exec:?}");
+        };
+        assert_eq!(landed_commit_id, new_commit.id.to_string());
+        let landed = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed_commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            landed.content.as_deref(),
+            Some("feat: n1 client message"),
+            "N=1 must keep the client object"
+        );
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let root_c = storage
+            .mono_storage()
+            .get_commit_by_hash(&root.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let root_msg = root_c.content.as_deref().unwrap_or("");
+        assert!(
+            root_msg.contains("feat: n1 client message"),
+            "root roll-up message must match the client commit: {root_msg}"
+        );
+        assert!(!root_msg.contains("Mono-Squash"));
+        assert_has_gpgsig(root_msg);
+        assert!(
+            root_c
+                .author
+                .as_deref()
+                .unwrap_or("")
+                .contains("Alice <alice@example.com>")
+        );
+    }
+
+    #[tokio::test]
+    async fn tp16_n3_squash_provenance_and_coauthors() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _root_tree, _root_c, _child, path_commit, path) =
+            tp12_path_fixture("p16n3", "path tip").await;
+        let t1 = Tree::from_tree_items(vec![blob_item(
+            "a.txt",
+            "1111111111111111111111111111111111111111",
+        )])
+        .unwrap();
+        let t2 = Tree::from_tree_items(vec![blob_item(
+            "b.txt",
+            "2222222222222222222222222222222222222222",
+        )])
+        .unwrap();
+        let t3 = Tree::from_tree_items(vec![blob_item(
+            "c.txt",
+            "3333333333333333333333333333333333333333",
+        )])
+        .unwrap();
+        let c1 = authored_commit(
+            t1.id,
+            vec![path_commit.id],
+            "Alice",
+            "alice@example.com",
+            1_720_000_000,
+            "feat: parser",
+        );
+        let c2 = authored_commit(
+            t2.id,
+            vec![c1.id],
+            "Bob",
+            "bob@example.com",
+            1_720_000_000 + 200_000,
+            "fix: empty input",
+        );
+        let c3 = authored_commit(
+            t3.id,
+            vec![c2.id],
+            "Alice",
+            "alice@example.com",
+            1_720_000_000 + 200_001,
+            "test: edge cases",
+        );
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![t1, t2, t3.clone()], c3.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![c1.clone(), c2.clone(), c3.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![c3.id.to_string(), c2.id.to_string(), c1.id.to_string()],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 3,
+        };
+        let old_id = path_commit.id.to_string();
+        let id = tp12_enqueue_claim(&storage, &path, &old_id, &c3.id.to_string(), &payload).await;
+        let exec = tp12_exec(&storage, id).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = exec
+        else {
+            panic!("expected Done, got {exec:?}");
+        };
+        assert_ne!(landed_commit_id, c3.id.to_string());
+        let squash = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed_commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(squash.tree, t3.id.to_string());
+        let parents: Vec<String> = serde_json::from_value(squash.parents_id).unwrap();
+        assert_eq!(parents, vec![old_id.clone()]);
+        let msg = squash.content.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Squash 3 commits at /p16n3"),
+            "signed squash keeps the subject after gpgsig: {msg}"
+        );
+        assert!(msg.contains("This commit was created by monoengine"));
+        assert!(msg.contains("Mono-Squash-Count: 3"));
+        assert!(msg.contains(&format!("Mono-Squash-Range: {old_id}..{}", c3.id)));
+        assert!(!msg.contains("Mono-Commits"));
+        let pos1 = msg.find(&c1.id.to_string()).expect("c1 listed");
+        let pos2 = msg.find(&c2.id.to_string()).expect("c2 listed");
+        let pos3 = msg.find(&c3.id.to_string()).expect("c3 listed");
+        assert!(pos1 < pos2 && pos2 < pos3, "topo ascending listing");
+        assert!(msg.contains("Co-authored-by: Bob <bob@example.com>"));
+        assert!(msg.contains("Mono-Author-Date-Range:"));
+        assert!(
+            squash
+                .author
+                .as_deref()
+                .unwrap_or("")
+                .contains("Alice <alice@example.com>")
+        );
+        assert_has_gpgsig(msg);
+
+        let root = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let root_c = storage
+            .mono_storage()
+            .get_commit_by_hash(&root.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let root_msg = root_c.content.as_deref().unwrap_or("");
+        assert!(root_msg.contains(&format!("Mono-Squash-Commit: {landed_commit_id}")));
+        assert!(!root_msg.contains("feat: parser"));
+        assert_has_gpgsig(root_msg);
+        assert!(
+            root_c
+                .author
+                .as_deref()
+                .unwrap_or("")
+                .contains("Alice <alice@example.com>")
+        );
+    }
+
+    #[tokio::test]
+    async fn tp16_review_merge_keeps_from_tree_id_shape() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, service, cl, _stale) =
+            nested_queue_fixture("/p16m", "TP16M", "p16m").await;
+        service
+            .merge_cl("gate-tester", "gate-tester", cl.clone())
+            .await
+            .expect("merge");
+        let main = storage
+            .mono_storage()
+            .get_main_ref("/p16m")
+            .await
+            .unwrap()
+            .unwrap();
+        let landed = storage
+            .mono_storage()
+            .get_commit_by_hash(&main.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let msg = landed.content.as_deref().unwrap_or("");
+        assert_eq!(msg, "cl merge generated commit");
+        assert!(
+            landed
+                .author
+                .as_deref()
+                .unwrap_or("")
+                .contains("mega <admin@mega.org>")
+        );
+        assert!(!msg.contains("Mono-Squash"));
     }
 
     fn tp12_monorepo(

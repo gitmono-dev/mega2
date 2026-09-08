@@ -42,6 +42,7 @@ pub mod import_repo;
 pub mod materialize;
 pub mod monorepo;
 pub mod push_chain;
+pub mod trunk_provenance;
 
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {

@@ -194,8 +194,31 @@ impl ServerSigningContext {
         key: &ServerSigningKey,
         commit: &Commit,
     ) -> Result<Commit, MegaError> {
-        let author = server_identity_signature(SignatureType::Author);
-        let committer = server_identity_signature(SignatureType::Committer);
+        Self::sign_with_identities(
+            key,
+            commit,
+            server_identity_signature(SignatureType::Author),
+            server_identity_signature(SignatureType::Committer),
+        )
+    }
+
+    /// Sign without rewriting author/committer (TP-16 trunk provenance).
+    /// The GPG signature still uses the server key; git identity stays the
+    /// tip's (ADR-TP-14).
+    pub(crate) fn sign_commit_preserving_identities(
+        &self,
+        key: &ServerSigningKey,
+        commit: &Commit,
+    ) -> Result<Commit, MegaError> {
+        Self::sign_with_identities(key, commit, commit.author.clone(), commit.committer.clone())
+    }
+
+    fn sign_with_identities(
+        key: &ServerSigningKey,
+        commit: &Commit,
+        author: Signature,
+        committer: Signature,
+    ) -> Result<Commit, MegaError> {
         let payload = canonical_commit_payload(commit, &author, &committer)?;
         let armor = DetachedSignature::sign_binary_data(
             rand08::thread_rng(),
