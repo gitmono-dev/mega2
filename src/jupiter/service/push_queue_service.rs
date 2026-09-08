@@ -1,5 +1,12 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
+use sea_orm::TransactionTrait;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
@@ -102,6 +109,31 @@ pub struct AttachExecContext {
     pub git_object_cache: std::sync::Arc<crate::ceres::api_service::cache::GitObjectCache>,
 }
 
+/// Serializable merge payload (trunk-push 1.4 / 1.9).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MergePayload {
+    pub cl_link: String,
+    pub authz_principal: String,
+    pub execution_actor: String,
+    /// When true, B3 re-runs UN-17 (`decide_queue_execution`) like the legacy
+    /// merge-queue processor. Direct `/merge` leaves this false.
+    #[serde(default)]
+    pub apply_queue_execution_decision: bool,
+    /// Recorded requester for UN-17 (`None` = anonymous / missing).
+    #[serde(default)]
+    pub requester: Option<String>,
+}
+
+/// Context required to execute a claimed `kind=merge` round under B3.
+pub struct MergeExecContext {
+    pub storage: crate::jupiter::storage::Storage,
+    pub git_object_cache: std::sync::Arc<crate::ceres::api_service::cache::GitObjectCache>,
+    /// Test-only: roll back after refs/commits land and before CL status write.
+    pub abort_before_cl_status: bool,
+    /// Test-only: hold the B3 lock after apply so a concurrent rebase can race.
+    pub pause_after_apply: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnqueueRequest {
     pub kind: PushQueueKindEnum,
@@ -155,6 +187,56 @@ pub enum ExecuteOutcome {
         failure: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelQueuedOutcome {
+    Cancelled,
+    NotFound,
+    NotQueued { status: PushQueueStatusEnum },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct QueueSnapshotItem {
+    pub id: i64,
+    pub path: String,
+    pub kind: String,
+    pub requester: Option<String>,
+    pub status: String,
+    pub wait_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct QueueControlSnapshot {
+    pub paused: bool,
+    pub hard_stopped: bool,
+    pub depth: u64,
+    pub head: Option<QueueSnapshotItem>,
+    pub running: Option<QueueSnapshotItem>,
+    pub items: Vec<QueueSnapshotItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct QueueMetricsSnapshot {
+    pub depth: u64,
+    pub wait_ms_p50: Option<f64>,
+    pub wait_ms_p99: Option<f64>,
+    pub round_ms_p50: Option<f64>,
+    pub round_ms_p99: Option<f64>,
+    pub failure_rate: f64,
+    pub cas_assert_failures: u64,
+    pub claim_lost: u64,
+    pub lock_timeout_alarms: u64,
+}
+
+fn percentile(xs: &[f64], p: f64) -> Option<f64> {
+    if xs.is_empty() {
+        return None;
+    }
+    let mut sorted = xs.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted.get(idx).copied()
 }
 
 /// How the B3 kind stub performs its single root write (TP-07/08/12 replace this).
@@ -254,6 +336,14 @@ impl ExecuteRequest {
     }
 }
 
+/// Process-local counters for TP-06 observability (no extra metrics crate).
+#[derive(Clone, Default)]
+pub struct PushQueueMetrics {
+    pub cas_assert_failures: Arc<AtomicU64>,
+    pub claim_lost: Arc<AtomicU64>,
+    pub lock_timeout_alarms: Arc<AtomicU64>,
+}
+
 #[derive(Clone)]
 pub struct PushQueueService {
     push_queue_storage: PushQueueStorage,
@@ -261,6 +351,7 @@ pub struct PushQueueService {
     push_policy: PushPolicy,
     wait_timeout: Duration,
     poll_interval: Duration,
+    metrics: PushQueueMetrics,
 }
 
 impl PushQueueService {
@@ -271,6 +362,7 @@ impl PushQueueService {
             push_policy,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            metrics: PushQueueMetrics::default(),
         }
     }
 
@@ -286,6 +378,171 @@ impl PushQueueService {
 
     pub fn storage(&self) -> &PushQueueStorage {
         &self.push_queue_storage
+    }
+
+    pub(crate) fn mono_storage_for_reaper(
+        &self,
+    ) -> &crate::jupiter::storage::mono_storage::MonoStorage {
+        &self.mono_storage
+    }
+
+    pub fn reaper(&self) -> crate::jupiter::service::push_queue_reaper::PushQueueReaper {
+        crate::jupiter::service::push_queue_reaper::PushQueueReaper::from_service(self.clone())
+    }
+
+    pub fn metrics(&self) -> &PushQueueMetrics {
+        &self.metrics
+    }
+
+    fn outcome_claim_lost(&self, id: i64) -> ExecuteOutcome {
+        self.metrics.claim_lost.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(event = "push_queue_claim_lost", id, "B3 fencing ClaimLost");
+        ExecuteOutcome::ClaimLost { id }
+    }
+
+    fn note_cas_assert_failure(&self) {
+        self.metrics
+            .cas_assert_failures
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            event = "push_queue_cas_assert_failure",
+            "root CAS affected 0 rows (should be 0 in production)"
+        );
+    }
+
+    pub async fn pause(&self) -> Result<(), MegaError> {
+        self.push_queue_storage
+            .set_control_flags(Some(true), None, None)
+            .await
+    }
+
+    pub async fn resume(&self) -> Result<(), MegaError> {
+        self.push_queue_storage
+            .set_control_flags(Some(false), None, None)
+            .await
+    }
+
+    /// Clear `hard_stopped` only. Does not touch `paused`.
+    pub async fn clear_hard_stop(&self, actor: &str) -> Result<(), MegaError> {
+        self.push_queue_storage
+            .set_control_flags(None, Some(false), None)
+            .await?;
+        tracing::warn!(
+            event = "push_queue_clear_hard_stop",
+            actor = %actor,
+            "operator cleared queue_control.hard_stopped"
+        );
+        Ok(())
+    }
+
+    pub async fn cancel_queued(&self, id: i64) -> Result<CancelQueuedOutcome, MegaError> {
+        let Some(row) = self.push_queue_storage.get_by_id(id).await? else {
+            return Ok(CancelQueuedOutcome::NotFound);
+        };
+        if row.status != PushQueueStatusEnum::Queued {
+            return Ok(CancelQueuedOutcome::NotQueued { status: row.status });
+        }
+        if self.push_queue_storage.cancel_if_queued(id).await? {
+            Ok(CancelQueuedOutcome::Cancelled)
+        } else {
+            let current = self.push_queue_storage.get_by_id(id).await?;
+            Ok(CancelQueuedOutcome::NotQueued {
+                status: current
+                    .map(|r| r.status)
+                    .unwrap_or(PushQueueStatusEnum::Cancelled),
+            })
+        }
+    }
+
+    pub async fn control_snapshot(&self) -> Result<QueueControlSnapshot, MegaError> {
+        let ctrl = self.push_queue_storage.get_control().await?;
+        let active = self.push_queue_storage.list_active().await?;
+        let now = chrono::Utc::now().fixed_offset();
+        let items: Vec<QueueSnapshotItem> = active
+            .iter()
+            .map(|row| QueueSnapshotItem {
+                id: row.id,
+                path: row.path.clone(),
+                kind: format!("{:?}", row.kind),
+                requester: row.requester.clone(),
+                status: format!("{:?}", row.status),
+                wait_ms: (now - row.enqueued_at).num_milliseconds().max(0) as u64,
+            })
+            .collect();
+        let head = items.first().cloned();
+        let running = items.iter().find(|i| i.status == "Running").cloned();
+        Ok(QueueControlSnapshot {
+            paused: ctrl.paused,
+            hard_stopped: ctrl.hard_stopped,
+            depth: items.len() as u64,
+            head,
+            running,
+            items,
+        })
+    }
+
+    pub async fn metrics_snapshot(&self) -> Result<QueueMetricsSnapshot, MegaError> {
+        let queued = self
+            .push_queue_storage
+            .count_by_status(PushQueueStatusEnum::Queued)
+            .await?;
+        let running = self
+            .push_queue_storage
+            .count_by_status(PushQueueStatusEnum::Running)
+            .await?;
+        let done = self
+            .push_queue_storage
+            .count_by_status(PushQueueStatusEnum::Done)
+            .await?;
+        let failed = self
+            .push_queue_storage
+            .count_by_status(PushQueueStatusEnum::Failed)
+            .await?;
+        let finished = self.push_queue_storage.list_recent_finished(200).await?;
+        let mut waits: Vec<f64> = finished
+            .iter()
+            .filter_map(|r| {
+                let started = r.started_at?;
+                Some((started - r.enqueued_at).num_milliseconds().max(0) as f64)
+            })
+            .collect();
+        waits.extend(
+            self.push_queue_storage
+                .list_active()
+                .await?
+                .into_iter()
+                .filter(|r| r.status == PushQueueStatusEnum::Queued)
+                .map(|r| {
+                    (chrono::Utc::now().fixed_offset() - r.enqueued_at)
+                        .num_milliseconds()
+                        .max(0) as f64
+                }),
+        );
+        let rounds: Vec<f64> = finished
+            .iter()
+            .filter_map(|r| {
+                let started = r.started_at?;
+                let finished_at = r.finished_at?;
+                Some((finished_at - started).num_milliseconds().max(0) as f64)
+            })
+            .collect();
+        let terminal = done + failed;
+        let failure_rate = if terminal == 0 {
+            0.0
+        } else {
+            failed as f64 / terminal as f64
+        };
+        Ok(QueueMetricsSnapshot {
+            depth: queued + running,
+            wait_ms_p50: percentile(&waits, 0.50),
+            wait_ms_p99: percentile(&waits, 0.99),
+            round_ms_p50: percentile(&rounds, 0.50),
+            round_ms_p99: percentile(&rounds, 0.99),
+            failure_rate,
+            cas_assert_failures: self.metrics.cas_assert_failures.load(Ordering::Relaxed),
+            claim_lost: self.metrics.claim_lost.load(Ordering::Relaxed),
+            lock_timeout_alarms: self.metrics.lock_timeout_alarms.load(Ordering::Relaxed),
+        })
     }
 
     #[cfg(test)]
@@ -330,6 +587,29 @@ impl PushQueueService {
         Ok(())
     }
 
+    /// B0: a ZERO_ID create on a path that still has a tombstone would fork
+    /// history (I1). Refuse with the two-step revive hint.
+    pub async fn b0_reject_create_on_tombstone(
+        &self,
+        req: &EnqueueRequest,
+    ) -> Result<(), MegaError> {
+        if req.kind != PushQueueKindEnum::Push || req.old_id != ZERO_ID {
+            return Ok(());
+        }
+        if self
+            .mono_storage
+            .get_tombstone(&req.path, MEGA_BRANCH_NAME)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        Err(MegaError::Other(format!(
+            "tombstone exists for {}: recreate the parent directory, advertise to continue from the tombstone tip, fetch to align, then push",
+            req.path
+        )))
+    }
+
     /// Observational NFF precheck — never rejects (ADR-TP / trunk-push §1.5).
     pub fn b0_nff_telemetry(old_id: &str, path_tip: Option<&str>) {
         if let Some(tip) = path_tip
@@ -346,6 +626,7 @@ impl PushQueueService {
     /// B0 + B1: admit or classify (adopt / replay / reject).
     pub async fn enqueue(&self, req: EnqueueRequest) -> Result<EnqueueOutcome, MegaError> {
         self.b0_reject_push(&req)?;
+        self.b0_reject_create_on_tombstone(&req).await?;
         self.push_queue_storage
             .enqueue_atomic(EnqueueParams {
                 kind: req.kind,
@@ -357,6 +638,75 @@ impl PushQueueService {
                 payload: req.payload,
             })
             .await
+    }
+
+    /// B3 SAVEPOINT repair: kind writes already rolled back; persist a tombstone
+    /// for `path`'s main ref, delete that row, and mark Failed. No `pending_action`.
+    pub async fn b3_tombstone_repair_after_savepoint(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        id: i64,
+        path: &str,
+        message: &str,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        self.mono_storage
+            .tombstone_and_delete_main_ref_in_txn(path, &txn)
+            .await?;
+        let updated =
+            PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, "Conflict", message).await?;
+        if !updated {
+            tracing::error!(
+                id,
+                "B3 tombstone repair: Failed update hit 0 rows (reaper raced?)"
+            );
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Failed {
+            id,
+            failure: "Conflict".into(),
+            message: message.to_owned(),
+        })
+    }
+
+    /// Reaper I3: when `expected_*` still matches the live root, tombstone a
+    /// stale `main@path` and terminalize a `Running` row (crash after SAVEPOINT
+    /// writes that never committed).
+    pub async fn reaper_i3_tombstone_repair(&self, id: i64) -> Result<bool, MegaError> {
+        let Some(row) = self.push_queue_storage.get_by_id(id).await? else {
+            return Ok(false);
+        };
+        if row.status != PushQueueStatusEnum::Running {
+            return Ok(false);
+        }
+        let conn = self.mono_storage.get_connection();
+        let txn = conn.begin().await?;
+        let root = self.mono_storage.get_main_ref_in_txn("/", &txn).await?;
+        let (cur_commit, cur_tree) = match &root {
+            Some(r) => (
+                Some(r.ref_commit_hash.as_str()),
+                Some(r.ref_tree_hash.as_str()),
+            ),
+            None => (None, None),
+        };
+        let baseline_ok = cur_commit == row.expected_commit_hash.as_deref()
+            && cur_tree == row.expected_tree_hash.as_deref();
+        if !baseline_ok {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        self.mono_storage
+            .tombstone_and_delete_main_ref_in_txn(&row.path, &txn)
+            .await?;
+        PushQueueStorage::mark_failed_if_running_in_txn(
+            &txn,
+            id,
+            "SystemError",
+            "I3 tombstone repair after Running crash",
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(true)
     }
 
     /// B2 wait loop + B2.5 claim. Does not run B3.
@@ -432,11 +782,14 @@ impl PushQueueService {
     /// B3 execution skeleton + B4 failure/requeue.
     ///
     /// `attach_ctx` is required when the claimed row is `kind=attach` (TP-08);
-    /// other kinds ignore it.
+    /// `merge_ctx` is required when the claimed row is `kind=merge` and the
+    /// caller wants the real merge writer (TP-07). Tests that enqueue `kind=merge`
+    /// without a context keep the B3 skeleton stub.
     pub async fn execute_b3(
         &self,
         req: ExecuteRequest,
         attach_ctx: Option<&AttachExecContext>,
+        merge_ctx: Option<&MergeExecContext>,
     ) -> Result<ExecuteOutcome, MegaError> {
         use sea_orm::{EntityTrait, TransactionTrait};
 
@@ -455,7 +808,7 @@ impl PushQueueService {
             .ok_or_else(|| MegaError::Other(format!("push_queue id {} missing", req.id)))?;
         if row.status != PushQueueStatusEnum::Running {
             txn.rollback().await?;
-            return Ok(ExecuteOutcome::ClaimLost { id: req.id });
+            return Ok(self.outcome_claim_lost(req.id));
         }
 
         if PushQueueStorage::is_hard_stopped_in_txn(&txn).await? {
@@ -465,7 +818,7 @@ impl PushQueueService {
                 .reset_running_to_queued(req.id)
                 .await?
             {
-                return Ok(ExecuteOutcome::ClaimLost { id: req.id });
+                return Ok(self.outcome_claim_lost(req.id));
             }
             let ntxn = conn.begin().await?;
             PushQueueStorage::notify_mono_write_queue(&ntxn).await?;
@@ -548,6 +901,11 @@ impl PushQueueService {
                 tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 push stub");
             }
             PushQueueKindEnum::Merge => {
+                if let Some(ctx) = merge_ctx {
+                    return self
+                        .b3_execute_merge(txn, &row, ctx, cur_commit, cur_tree, root.as_ref())
+                        .await;
+                }
                 tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 merge stub");
             }
         }
@@ -611,6 +969,7 @@ impl PushQueueService {
         let root_cas_writes = u32::from(cas_ok);
 
         if !cas_ok {
+            self.note_cas_assert_failure();
             PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
             PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
             let updated = PushQueueStorage::mark_failed_if_running_in_txn(
@@ -636,7 +995,7 @@ impl PushQueueService {
         if !updated {
             txn.rollback().await?;
             tracing::error!(id = req.id, "B3 Done update hit 0 rows after fencing");
-            return Ok(ExecuteOutcome::ClaimLost { id: req.id });
+            return Ok(self.outcome_claim_lost(req.id));
         }
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
@@ -696,7 +1055,7 @@ impl PushQueueService {
                 id,
                 "B3 attach Err recovery: Failed update hit 0 rows (already terminal?)"
             );
-            return Ok(ExecuteOutcome::ClaimLost { id });
+            return Ok(self.outcome_claim_lost(id));
         }
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
@@ -730,7 +1089,9 @@ impl PushQueueService {
                 protocol::import_refs::{CommandType, RefCommand},
             },
             common::utils::canonicalize_mono_ref_path,
-            contract::policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
+            contract::policy::notify::{
+                after_b3_commit_authz, authz_blob_id, insert_b3_authz_outbox_if_builds,
+            },
             jupiter::utils::converter::{FromGitModel, FromMegaModel},
         };
 
@@ -977,6 +1338,7 @@ impl PushQueueService {
             Ok(()) => {}
             Err(MegaError::StaleMonorepoRootRef) => {
                 // Under the queue this is a bypass tripwire, not a retry signal.
+                self.note_cas_assert_failure();
                 PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
                 PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
                 let updated = PushQueueStorage::mark_failed_if_running_in_txn(
@@ -1027,12 +1389,11 @@ impl PushQueueService {
                 id = row.id,
                 "B3 attach Done update hit 0 rows after fencing"
             );
-            return Ok(ExecuteOutcome::ClaimLost { id: row.id });
+            return Ok(self.outcome_claim_lost(row.id));
         }
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        insert_b3_authz_outbox_if_builds(&ctx.storage, &txn, row.id).await?;
         txn.commit().await?;
-
-        // Authz notify post-commit (same as pre-queue attach).
         let blob_ids = async {
             let old_blob_id = self
                 .mono_storage
@@ -1049,12 +1410,8 @@ impl PushQueueService {
         .await;
         match blob_ids {
             Ok((old_blob_id, new_blob_id)) => {
-                notify_authz_changed_best_effort(
-                    &ctx.storage,
-                    old_blob_id.as_deref(),
-                    new_blob_id.as_deref(),
-                )
-                .await;
+                after_b3_commit_authz(&ctx.storage, old_blob_id.as_deref(), new_blob_id.as_deref())
+                    .await;
             }
             Err(e) => {
                 ctx.storage.entity_store().mark_dirty();
@@ -1070,6 +1427,425 @@ impl PushQueueService {
             id: row.id,
             landed_commit_id,
             root_cas_writes: 1,
+        })
+    }
+
+    async fn b3_execute_merge(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &MergeExecContext,
+        cur_commit: Option<&str>,
+        cur_tree: Option<&str>,
+        root: Option<&crate::callisto::mega_refs::Model>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        let id = row.id;
+        match self
+            .b3_execute_merge_inner(txn, row, ctx, cur_commit, cur_tree, root)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                tracing::error!(
+                    id,
+                    error = %e,
+                    "B3 merge aborted with Err; terminalizing MergeFailure"
+                );
+                self.terminalize_merge_failure(id, &e.to_string()).await
+            }
+        }
+    }
+
+    async fn terminalize_merge_failure(
+        &self,
+        id: i64,
+        message: &str,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use sea_orm::TransactionTrait;
+
+        let conn = self.push_queue_storage.get_connection();
+        let txn = conn.begin().await?;
+        let updated =
+            PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, "MergeFailure", message)
+                .await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(
+                id,
+                "B3 merge Err recovery: Failed update hit 0 rows (already terminal?)"
+            );
+            return Ok(self.outcome_claim_lost(id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Failed {
+            id,
+            failure: "MergeFailure".into(),
+            message: message.to_owned(),
+        })
+    }
+
+    async fn b3_fail_merge(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        id: i64,
+        failure: &str,
+        message: String,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        let updated =
+            PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, failure, &message).await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(id, "B3 merge fail-close hit 0 rows");
+            return Ok(self.outcome_claim_lost(id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Failed {
+            id,
+            failure: failure.to_owned(),
+            message,
+        })
+    }
+
+    async fn b3_execute_merge_inner(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &MergeExecContext,
+        cur_commit: Option<&str>,
+        cur_tree: Option<&str>,
+        root: Option<&crate::callisto::mega_refs::Model>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use std::path::PathBuf;
+
+        use git_internal::internal::object::{commit::Commit, tree::Tree};
+        use sea_orm::TransactionTrait;
+
+        use crate::{
+            callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
+            ceres::api_service::{
+                mono_api_service::{
+                    MonoApiService, QueueExecutionDecision, authz_freeze_message,
+                    decide_queue_execution, emit_authz_frozen_alert,
+                },
+                tree_ops,
+            },
+            contract::policy::{
+                enforcement::Enforcement,
+                notify::{after_b3_commit_authz, authz_blob_id, insert_b3_authz_outbox_if_builds},
+            },
+            jupiter::utils::converter::FromMegaModel,
+        };
+
+        let payload: MergePayload = serde_json::from_value(row.payload.clone())
+            .map_err(|e| MegaError::Other(format!("merge payload deserialize failed: {e}")))?;
+
+        let Some(root) = root else {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "MergeFailure",
+                    "merge requires an existing root ref".into(),
+                )
+                .await;
+        };
+
+        let mono_api = MonoApiService {
+            storage: ctx.storage.clone(),
+            git_object_cache: ctx.git_object_cache.clone(),
+        };
+        // TP-11 hook: assertion precedes business gates.
+        mono_api.assert_merge_tree_hash_tp11();
+
+        let Some(cl) = ctx
+            .storage
+            .cl_storage()
+            .get_cl_in_txn(&payload.cl_link, &txn)
+            .await?
+        else {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "MergeFailure",
+                    format!("CL {} no longer exists, cannot merge", payload.cl_link),
+                )
+                .await;
+        };
+        if cl.status == MergeStatusEnum::Closed {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "MergeFailure",
+                    "CL has been closed, cannot merge".into(),
+                )
+                .await;
+        }
+        if cl.status == MergeStatusEnum::Draft {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "MergeFailure",
+                    "CL is in draft status, cannot merge".into(),
+                )
+                .await;
+        }
+        if cl.status == MergeStatusEnum::Merged {
+            return self
+                .b3_fail_merge(txn, row.id, "MergeFailure", "CL is already merged".into())
+                .await;
+        }
+
+        let mut authz_principal = payload.authz_principal.clone();
+        if payload.apply_queue_execution_decision {
+            let enforcement = Enforcement::parse(&ctx.storage.config().cedar.enforcement)
+                .unwrap_or(Enforcement::Off);
+            let snapshot = ctx.storage.entity_store().snapshot();
+            match decide_queue_execution(
+                enforcement,
+                snapshot.as_deref(),
+                payload.requester.as_deref(),
+            ) {
+                QueueExecutionDecision::Execute {
+                    authz_principal: decided,
+                } => {
+                    authz_principal = decided;
+                }
+                QueueExecutionDecision::Freeze { reason } => {
+                    emit_authz_frozen_alert(
+                        &payload.cl_link,
+                        payload.requester.as_deref(),
+                        &reason,
+                    );
+                    return self
+                        .b3_fail_merge(txn, row.id, "SystemError", authz_freeze_message(&reason))
+                        .await;
+                }
+            }
+        }
+
+        if let Err(error) = mono_api
+            .enforce_acl_change_authorization(&cl.link, &authz_principal)
+            .await
+        {
+            let message = error.to_string();
+            let failure = if message.contains("[code:503]") {
+                "SystemError"
+            } else {
+                "MergeFailure"
+            };
+            return self.b3_fail_merge(txn, row.id, failure, message).await;
+        }
+
+        if let Err(error) = mono_api.ensure_gpg_check_passed(&cl.link).await {
+            return self
+                .b3_fail_merge(txn, row.id, "MergeFailure", error.to_string())
+                .await;
+        }
+
+        let path_main = self
+            .mono_storage
+            .get_main_ref_in_txn(&cl.path, &txn)
+            .await?;
+        let Some(path_main) = path_main else {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "MergeFailure",
+                    format!("Main ref not found at {}", cl.path),
+                )
+                .await;
+        };
+        if cl.from_hash != path_main.ref_commit_hash {
+            return self
+                .b4_conflict_requeue_holding_lock(txn, row.id, row)
+                .await;
+        }
+
+        let commit_model = self
+            .mono_storage
+            .get_commit_by_hash(&cl.to_hash)
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("Commit not found: {}", cl.to_hash)))?;
+        let commit: Commit = Commit::from_mega_model(commit_model);
+
+        let root_tree = Tree::from_mega_model(
+            self.mono_storage
+                .get_tree_by_hash(&root.ref_tree_hash)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(format!("root tree {} not found", root.ref_tree_hash))
+                })?,
+        );
+
+        let normalized_path =
+            crate::ceres::api_service::mono_api_service::MonoServiceLogic::clean_path_str(&cl.path);
+        let (path, update_chain) = if normalized_path == "/" {
+            (PathBuf::from("/"), Vec::new())
+        } else {
+            let path = PathBuf::from(&normalized_path);
+            let parent = path
+                .parent()
+                .ok_or_else(|| MegaError::Other(format!("Invalid CL path: {normalized_path}")))?;
+            let update_chain =
+                tree_ops::search_tree_for_update_from_root(&mono_api, parent, root_tree)
+                    .await
+                    .map_err(|e| MegaError::Other(e.to_string()))?;
+            (path, update_chain)
+        };
+        let result =
+            crate::ceres::api_service::mono_api_service::MonoServiceLogic::build_result_by_chain(
+                path,
+                update_chain,
+                commit.tree_id,
+            )
+            .map_err(|e| MegaError::Other(e.to_string()))?;
+
+        PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+
+        let apply = mono_api
+            .apply_update_result_in_txn(
+                &txn,
+                &result,
+                "cl merge generated commit",
+                &cl,
+                cur_commit,
+                cur_tree,
+            )
+            .await;
+        let (landed_commit_id, root_cas_writes) = match apply {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                if msg.contains(MonoApiService::MERGE_ROOT_CAS_MISS) {
+                    self.note_cas_assert_failure();
+                    PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
+                    let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                        &txn,
+                        row.id,
+                        "QueueBypassDetected",
+                        "root CAS affected 0 rows",
+                    )
+                    .await?;
+                    if !updated {
+                        tracing::error!(
+                            id = row.id,
+                            "B3 merge CAS fail-closed: Failed update hit 0 rows"
+                        );
+                    }
+                    PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                    txn.commit().await?;
+                    return Ok(ExecuteOutcome::BypassDetected { id: row.id });
+                }
+                return self.b3_fail_merge(txn, row.id, "MergeFailure", msg).await;
+            }
+        };
+
+        if normalized_path != "/" {
+            self.mono_storage
+                .remove_none_cl_refs_in_txn(&normalized_path, &txn)
+                .await?;
+        }
+
+        if !ctx.pause_after_apply.is_zero() {
+            tokio::time::sleep(ctx.pause_after_apply).await;
+        }
+        if ctx.abort_before_cl_status {
+            PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+            txn.rollback().await?;
+            return Err(MegaError::Other("test abort before CL status write".into()));
+        }
+
+        ctx.storage
+            .conversation_storage()
+            .add_conversation_in_txn(
+                &cl.link,
+                &payload.execution_actor,
+                None,
+                ConvTypeEnum::Merged,
+                &txn,
+            )
+            .await?;
+
+        if !ctx
+            .storage
+            .cl_storage()
+            .merge_cl_in_txn(cl.clone(), &txn)
+            .await?
+        {
+            PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+            txn.rollback().await?;
+            if !self
+                .push_queue_storage
+                .reset_running_to_queued(row.id)
+                .await?
+            {
+                return Ok(self.outcome_claim_lost(row.id));
+            }
+            let conn = self.push_queue_storage.get_connection();
+            let ntxn = conn.begin().await?;
+            PushQueueStorage::notify_mono_write_queue(&ntxn).await?;
+            ntxn.commit().await?;
+            return Ok(self.outcome_claim_lost(row.id));
+        }
+
+        let updated =
+            PushQueueStorage::mark_done_if_running_in_txn(&txn, row.id, &landed_commit_id).await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(id = row.id, "B3 merge Done update hit 0 rows after fencing");
+            return Ok(self.outcome_claim_lost(row.id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        insert_b3_authz_outbox_if_builds(&ctx.storage, &txn, row.id).await?;
+        txn.commit().await?;
+
+        let blob_ids = async {
+            let old_blob_id = self
+                .mono_storage
+                .get_tree_by_hash(&root.ref_tree_hash)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            let new_commit = self
+                .mono_storage
+                .get_commit_by_hash(&landed_commit_id)
+                .await?
+                .ok_or_else(|| MegaError::Other("new commit not found".into()))?;
+            let new_blob_id = self
+                .mono_storage
+                .get_tree_by_hash(&new_commit.tree)
+                .await?
+                .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
+            Ok::<_, MegaError>((old_blob_id, new_blob_id))
+        }
+        .await;
+        match blob_ids {
+            Ok((old_blob_id, new_blob_id)) => {
+                after_b3_commit_authz(&ctx.storage, old_blob_id.as_deref(), new_blob_id.as_deref())
+                    .await;
+            }
+            Err(e) => {
+                ctx.storage.entity_store().mark_dirty();
+                tracing::error!(
+                    id = row.id,
+                    error = %e,
+                    "merge authz blob resolve failed after Done; marked entity store dirty"
+                );
+            }
+        }
+
+        mono_api.maybe_invalidate_admin_cache(&cl.link).await;
+
+        Ok(ExecuteOutcome::Done {
+            id: row.id,
+            landed_commit_id,
+            root_cas_writes,
         })
     }
 
@@ -1090,7 +1866,7 @@ impl PushQueueService {
         if PushQueueStorage::is_hard_stopped_in_txn(&txn).await? {
             txn.rollback().await?;
             if !self.push_queue_storage.reset_running_to_queued(id).await? {
-                return Ok(ExecuteOutcome::ClaimLost { id });
+                return Ok(self.outcome_claim_lost(id));
             }
             let conn = self.push_queue_storage.get_connection();
             let ntxn = conn.begin().await?;
@@ -1105,14 +1881,14 @@ impl PushQueueService {
             .await?
         {
             txn.rollback().await?;
-            return Ok(ExecuteOutcome::ClaimLost { id });
+            return Ok(self.outcome_claim_lost(id));
         }
 
         // Intent persisted; recheck hard_stop before successor INSERT.
         if PushQueueStorage::is_hard_stopped_in_txn(&txn).await? {
             txn.rollback().await?;
             if !self.push_queue_storage.reset_running_to_queued(id).await? {
-                return Ok(ExecuteOutcome::ClaimLost { id });
+                return Ok(self.outcome_claim_lost(id));
             }
             let conn = self.push_queue_storage.get_connection();
             let ntxn = conn.begin().await?;
@@ -1174,7 +1950,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        callisto::sea_orm_active_enums::PushQueueFailureEnum,
+        callisto::{mega_refs, sea_orm_active_enums::PushQueueFailureEnum},
         jupiter::{
             migration::apply_migrations, storage::base_storage::StorageConnector,
             tests::test_db_connection,
@@ -1660,6 +2436,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1698,6 +2475,7 @@ mod tests {
                         ..Default::default()
                     },
                     None,
+                    None,
                 )
                 .await
             })
@@ -1732,6 +2510,7 @@ mod tests {
                     advance_tree: Some("f".repeat(40)),
                     ..Default::default()
                 },
+                None,
                 None,
             )
             .await
@@ -1788,6 +2567,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1825,6 +2605,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1847,6 +2628,7 @@ mod tests {
                     force_conflict: true,
                     ..Default::default()
                 },
+                None,
                 None,
             )
             .await
@@ -1888,6 +2670,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1923,6 +2706,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1937,5 +2721,167 @@ mod tests {
         let root = svc.mono_storage().get_main_ref("/").await.unwrap().unwrap();
         assert_eq!(root.ref_commit_hash, new_c);
         assert_eq!(root.ref_tree_hash, new_t);
+    }
+
+    #[tokio::test]
+    async fn tp09_b0_rejects_zero_id_create_when_tombstone_exists() {
+        let (_t, svc) = service(PushPolicy::Trunk).await;
+        svc.mono_storage()
+            .upsert_tombstone(
+                "/project/x",
+                MEGA_BRANCH_NAME,
+                &"a".repeat(40),
+                &"b".repeat(40),
+            )
+            .await
+            .unwrap();
+        let err = svc
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: push_operation_id(ZERO_ID, &"c".repeat(40)),
+                path: "/project/x".into(),
+                old_id: ZERO_ID.into(),
+                new_id: "c".repeat(40),
+                requester: None,
+                payload: json!({}),
+                ref_name: Some(MEGA_BRANCH_NAME.into()),
+                is_delete: false,
+            })
+            .await
+            .expect_err("create on tombstone");
+        let msg = err.to_string();
+        assert!(msg.contains("tombstone"), "{msg}");
+        assert!(msg.contains("advertise"), "{msg}");
+        assert!(msg.contains("fetch"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tp09_kill9_before_savepoint_commit_leaves_running_then_reaper_i3() {
+        let (_t, svc) = service(PushPolicy::Trunk).await;
+        seed_root(&svc, &"a".repeat(40), &"b".repeat(40)).await;
+        let id = enqueue_and_claim(&svc, "CL-TB-K9").await;
+        let path = "/CL-TB-K9".to_string();
+        svc.mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    &path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "s".repeat(40),
+                    "t".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let conn = svc.mono_storage().get_connection();
+        let txn = conn.begin().await.unwrap();
+        PushQueueStorage::savepoint(&txn, "b3_kind").await.unwrap();
+        svc.mono_storage()
+            .upsert_tombstone_in_txn(
+                &path,
+                MEGA_BRANCH_NAME,
+                &"s".repeat(40),
+                &"t".repeat(40),
+                &txn,
+            )
+            .await
+            .unwrap();
+        txn.rollback().await.unwrap();
+
+        assert!(
+            svc.mono_storage()
+                .get_tombstone(&path, MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "uncommitted SAVEPOINT repair must not be visible"
+        );
+        assert_eq!(
+            svc.storage().get_by_id(id).await.unwrap().unwrap().status,
+            PushQueueStatusEnum::Running
+        );
+
+        assert!(svc.reaper_i3_tombstone_repair(id).await.unwrap());
+        let tomb = svc
+            .mono_storage()
+            .get_tombstone(&path, MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .expect("reaper wrote tombstone");
+        assert_eq!(tomb.last_commit_hash, "s".repeat(40));
+        assert!(
+            svc.mono_storage()
+                .get_main_ref(&path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let row = svc.storage().get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert_eq!(row.failure_type, Some(PushQueueFailureEnum::SystemError));
+        assert!(row.pending_action.is_none());
+    }
+
+    #[tokio::test]
+    async fn tp09_b3_savepoint_repair_commits_tombstone_and_terminal() {
+        let (_t, svc) = service(PushPolicy::Trunk).await;
+        seed_root(&svc, &"a".repeat(40), &"b".repeat(40)).await;
+        let id = enqueue_and_claim(&svc, "CL-TB-SP").await;
+        let path = "/CL-TB-SP".to_string();
+        svc.mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    &path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "s".repeat(40),
+                    "t".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let conn = svc.mono_storage().get_connection();
+        let txn = conn.begin().await.unwrap();
+        PushQueueStorage::savepoint(&txn, "b3_kind").await.unwrap();
+        svc.mono_storage()
+            .upsert_tombstone_in_txn(&path, MEGA_BRANCH_NAME, "x", "y", &txn)
+            .await
+            .unwrap();
+        PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind")
+            .await
+            .unwrap();
+        let outcome = svc
+            .b3_tombstone_repair_after_savepoint(txn, id, &path, "stale materialized ref")
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ExecuteOutcome::Failed {
+                failure,
+                ..
+            } if failure == "Conflict"
+        ));
+        let tomb = svc
+            .mono_storage()
+            .get_tombstone(&path, MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tomb.last_commit_hash, "s".repeat(40));
+        assert!(
+            svc.mono_storage()
+                .get_main_ref(&path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let row = svc.storage().get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert_eq!(row.failure_type, Some(PushQueueFailureEnum::Conflict));
+        assert!(row.pending_action.is_none());
     }
 }

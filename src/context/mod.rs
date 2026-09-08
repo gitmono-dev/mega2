@@ -279,6 +279,10 @@ impl AppContext {
         });
 
         storage.mono_service.init_monorepo(&config.monorepo).await?;
+        storage.push_queue_service.reaper().spawn_background(
+            crate::jupiter::service::push_queue_reaper::DEFAULT_REAP_INTERVAL,
+            notification_shutdown.clone(),
+        );
 
         Ok(Self {
             storage,

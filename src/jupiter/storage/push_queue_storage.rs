@@ -2,13 +2,13 @@ use std::ops::Deref;
 
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, PaginatorTrait,
-    QueryFilter, Statement, TransactionTrait, Value,
+    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
 };
 use serde_json::Value as JsonValue;
 
 use crate::{
     callisto::{
-        mega_refs, push_queue, queue_control,
+        authz_notify_outbox, mega_refs, push_queue, queue_control,
         sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
     },
     common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
@@ -17,7 +17,11 @@ use crate::{
 
 /// MonoWriteQueue B3 serialization lock (trunk-push ADR-TP-03).
 /// Distinct from monorepo initialization advisory lock keys.
+pub const MONO_WRITE_LOCK_KEY1: i32 = 1297043024;
+pub const MONO_WRITE_LOCK_KEY2: i32 = 1229867349;
 pub const MONO_WRITE_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1297043024, 1229867349)";
+pub const MONO_WRITE_TRY_LOCK_SQL: &str =
+    "SELECT pg_try_advisory_xact_lock(1297043024, 1229867349) AS locked";
 
 /// Result of the B1 conditional INSERT (or its zero-row classification).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +59,13 @@ pub enum ClaimOutcome {
     HardStopped,
     /// Predicate missed (not min Queued, another Running, etc.) — back to B2.
     Missed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonoWriteLockHolder {
+    pub pid: i64,
+    pub query_start: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub query: String,
 }
 
 #[derive(Clone)]
@@ -445,6 +456,107 @@ impl PushQueueStorage {
             .await?)
     }
 
+    pub async fn get_control(&self) -> Result<queue_control::Model, MegaError> {
+        queue_control::Entity::find_by_id(1)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| MegaError::Other("queue_control row missing".into()))
+    }
+
+    /// Active (Queued + Running) rows in FIFO id order.
+    pub async fn list_active(&self) -> Result<Vec<push_queue::Model>, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(
+                push_queue::Column::Status
+                    .is_in([PushQueueStatusEnum::Queued, PushQueueStatusEnum::Running]),
+            )
+            .order_by_asc(push_queue::Column::Id)
+            .all(self.get_connection())
+            .await?)
+    }
+
+    /// Merge rows shown on the legacy merge-queue list (active + failed/cancelled).
+    pub async fn list_merge_for_legacy_ui(&self) -> Result<Vec<push_queue::Model>, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Merge))
+            .filter(push_queue::Column::Status.is_in([
+                PushQueueStatusEnum::Queued,
+                PushQueueStatusEnum::Running,
+                PushQueueStatusEnum::Failed,
+                PushQueueStatusEnum::Cancelled,
+            ]))
+            .order_by_asc(push_queue::Column::Id)
+            .all(self.get_connection())
+            .await?)
+    }
+
+    pub async fn count_by_kind_and_status(
+        &self,
+        kind: PushQueueKindEnum,
+        status: PushQueueStatusEnum,
+    ) -> Result<u64, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(kind))
+            .filter(push_queue::Column::Status.eq(status))
+            .count(self.get_connection())
+            .await?)
+    }
+
+    pub async fn list_by_kind_and_operation(
+        &self,
+        kind: PushQueueKindEnum,
+        operation_id: &str,
+    ) -> Result<Vec<push_queue::Model>, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(kind))
+            .filter(push_queue::Column::OperationId.eq(operation_id))
+            .order_by_desc(push_queue::Column::Id)
+            .all(self.get_connection())
+            .await?)
+    }
+
+    pub async fn list_recent_finished(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<push_queue::Model>, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(push_queue::Column::FinishedAt.is_not_null())
+            .order_by_desc(push_queue::Column::FinishedAt)
+            .limit(limit)
+            .all(self.get_connection())
+            .await?)
+    }
+
+    pub async fn count_by_status(&self, status: PushQueueStatusEnum) -> Result<u64, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(push_queue::Column::Status.eq(status))
+            .count(self.get_connection())
+            .await?)
+    }
+
+    /// Cancel only if still `Queued`. Returns true when this caller won the race.
+    pub async fn cancel_if_queued(&self, id: i64) -> Result<bool, MegaError> {
+        let result = self
+            .get_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Cancelled'::push_queue_status_enum,
+                       failure_type = 'SystemError'::push_queue_failure_enum,
+                       error_message = 'cancelled by operator',
+                       finished_at = now(),
+                       pending_action = NULL,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Queued'::push_queue_status_enum
+                "#,
+                [Value::from(id)],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// B2.5: claim under `queue_control FOR UPDATE`, then snapshot root
     /// **after** the claim UPDATE succeeds (same txn, plain SELECT) and persist
     /// that snapshot as `expected_*`.
@@ -582,6 +694,113 @@ impl PushQueueStorage {
         ))
         .await?;
         Ok(())
+    }
+
+    /// Non-blocking try-lock of `MONO_WRITE_LOCK` (reaper). `true` = acquired.
+    pub async fn try_mono_write_lock(txn: &DatabaseTransaction) -> Result<bool, MegaError> {
+        let row = txn
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                MONO_WRITE_TRY_LOCK_SQL.to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| MegaError::Other("pg_try_advisory_xact_lock returned no row".into()))?;
+        Ok(row.try_get("", "locked")?)
+    }
+
+    pub async fn list_running_in_txn(
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<push_queue::Model>, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(push_queue::Column::Status.eq(PushQueueStatusEnum::Running))
+            .order_by_asc(push_queue::Column::Id)
+            .all(txn)
+            .await?)
+    }
+
+    /// Cancel `Queued` rows whose heartbeat is older than `cutoff`.
+    /// Frozen while `hard_stopped` (caller must skip).
+    pub async fn cancel_stale_queued_in_txn(
+        txn: &DatabaseTransaction,
+        cutoff: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Result<u64, MegaError> {
+        let result = txn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Cancelled'::push_queue_status_enum,
+                       failure_type = 'SystemError'::push_queue_failure_enum,
+                       error_message = 'heartbeat timeout',
+                       finished_at = now(),
+                       pending_action = NULL,
+                       updated_at = now()
+                 WHERE status = 'Queued'::push_queue_status_enum
+                   AND heartbeat_at < $1
+                "#,
+                [Value::from(cutoff)],
+            ))
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn reset_running_to_queued_in_txn(
+        txn: &DatabaseTransaction,
+        id: i64,
+    ) -> Result<bool, MegaError> {
+        let result = txn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Queued'::push_queue_status_enum,
+                       started_at = NULL,
+                       expected_commit_hash = NULL,
+                       expected_tree_hash = NULL,
+                       heartbeat_at = now(),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'Running'::push_queue_status_enum
+                "#,
+                [Value::from(id)],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Sessions currently holding `MONO_WRITE_LOCK` (watchdog / runbook).
+    pub async fn list_mono_write_lock_holders(
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<MonoWriteLockHolder>, MegaError> {
+        let rows = txn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                SELECT a.pid::bigint AS pid,
+                       a.query_start,
+                       COALESCE(a.query, '') AS query
+                  FROM pg_locks l
+                  JOIN pg_stat_activity a ON a.pid = l.pid
+                 WHERE l.locktype = 'advisory'
+                   AND l.classid = $1
+                   AND l.objid = $2
+                   AND l.granted
+                "#,
+                [
+                    Value::from(i64::from(MONO_WRITE_LOCK_KEY1)),
+                    Value::from(i64::from(MONO_WRITE_LOCK_KEY2)),
+                ],
+            ))
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(MonoWriteLockHolder {
+                pid: row.try_get("", "pid")?,
+                query_start: row.try_get("", "query_start").ok(),
+                query: row.try_get("", "query").unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     /// Whether `queue_control.hard_stopped` is set (plain SELECT, no lock).
@@ -772,13 +991,19 @@ impl PushQueueStorage {
                  WHERE id = $1
                    AND status = 'Running'::push_queue_status_enum
                    AND pending_action = 'requeue_conflict'::push_queue_pending_enum
+                   AND superseded_by IS NULL
                 "#,
                 [Value::from(old.id)],
             ))
             .await?;
         if cancelled.rows_affected() == 0 {
+            if let Some(existing) = push_queue::Entity::find_by_id(old.id).one(txn).await?
+                && let Some(successor_id) = existing.superseded_by
+            {
+                return Ok(successor_id);
+            }
             return Err(MegaError::Other(
-                "conflict requeue: old row not Running with requeue_conflict intent".into(),
+                "conflict requeue: old row not Running with requeue_conflict intent and superseded_by IS NULL".into(),
             ));
         }
 
@@ -863,6 +1088,52 @@ impl PushQueueStorage {
         .await?;
         Ok(())
     }
+
+    /// Insert a terminal Failed merge row for merge_queue absorb (TP-07).
+    /// `Merging` rows become `Failed(MergeFailure, interrupted)`.
+    pub async fn insert_absorbed_failed_merge(
+        &self,
+        operation_id: &str,
+        path: &str,
+        old_id: &str,
+        new_id: &str,
+        requester: Option<&str>,
+        message: &str,
+    ) -> Result<i64, MegaError> {
+        let conn = self.get_connection();
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                INSERT INTO push_queue (
+                    kind, operation_id, path, old_id, new_id,
+                    requester, payload, status, failure_type, error_message,
+                    heartbeat_at, finished_at
+                )
+                VALUES (
+                    'merge'::push_queue_kind_enum,
+                    $1, $2, $3, $4, $5, '{}'::jsonb,
+                    'Failed'::push_queue_status_enum,
+                    'MergeFailure'::push_queue_failure_enum,
+                    $6, now(), now()
+                )
+                RETURNING id
+                "#,
+                [
+                    Value::from(operation_id.to_owned()),
+                    Value::from(path.to_owned()),
+                    Value::from(old_id.to_owned()),
+                    Value::from(new_id.to_owned()),
+                    Value::from(requester.map(str::to_owned)),
+                    Value::from(message.to_owned()),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| MegaError::Other("absorb Failed insert returned no id".into()))?;
+        row.try_get::<i64>("", "id")
+            .map_err(|e| MegaError::Other(e.to_string()))
+    }
+
     /// Test helper: mark Cancelled with an optional conflict-requeue successor.
     #[cfg(test)]
     pub async fn mark_cancelled_with_successor_for_test(
@@ -883,6 +1154,72 @@ impl PushQueueStorage {
              WHERE id = $1
             "#,
             [Value::from(id), Value::from(successor)],
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// TP-22: persist an authz notify outbox row (B3 same-txn or queue-external).
+    pub async fn insert_authz_outbox<C: ConnectionTrait>(
+        conn: &C,
+        version: Option<i64>,
+        dirty: bool,
+    ) -> Result<(), MegaError> {
+        conn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO authz_notify_outbox (version, dirty) VALUES ($1, $2)",
+            [version.into(), dirty.into()],
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// TP-22: `UPDATE queue_control SET published_version = $v WHERE published_version < $v`.
+    pub async fn cas_published_version<C: ConnectionTrait>(
+        conn: &C,
+        version: i64,
+    ) -> Result<bool, MegaError> {
+        let result = conn
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE queue_control SET published_version = $1, updated_at = now() \
+                 WHERE id = 1 AND published_version < $1",
+                [Value::from(version)],
+            ))
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// TP-22: DB-authoritative snapshot publish watermark.
+    pub async fn load_published_version<C: ConnectionTrait>(conn: &C) -> Result<i64, MegaError> {
+        let ctrl = queue_control::Entity::find_by_id(1)
+            .one(conn)
+            .await?
+            .ok_or_else(|| MegaError::Other("queue_control row missing".into()))?;
+        Ok(ctrl.published_version)
+    }
+
+    /// TP-22: unreplayed outbox rows in insert order.
+    pub async fn pending_authz_outbox<C: ConnectionTrait>(
+        conn: &C,
+    ) -> Result<Vec<authz_notify_outbox::Model>, MegaError> {
+        Ok(authz_notify_outbox::Entity::find()
+            .filter(authz_notify_outbox::Column::ReplayedAt.is_null())
+            .order_by_asc(authz_notify_outbox::Column::Id)
+            .all(conn)
+            .await?)
+    }
+
+    /// TP-22: mark an outbox row replayed (idempotent on already-replayed).
+    pub async fn mark_authz_outbox_replayed<C: ConnectionTrait>(
+        conn: &C,
+        id: i64,
+    ) -> Result<(), MegaError> {
+        conn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE authz_notify_outbox SET replayed_at = now() \
+             WHERE id = $1 AND replayed_at IS NULL",
+            [Value::from(id)],
         ))
         .await?;
         Ok(())
