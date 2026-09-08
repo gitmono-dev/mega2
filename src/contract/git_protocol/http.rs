@@ -18,7 +18,11 @@ use crate::{
         protocol::{ServiceType, SmartSession, TransportProtocol, smart, v2},
     },
     common::errors::ProtocolError,
-    contract::git_protocol::{InfoRefsParams, check_push_permission, check_upload_pack_access},
+    config::PushAuth,
+    contract::git_protocol::{
+        InfoRefsParams, check_push_permission, check_upload_pack_access, lookup_push_token,
+        receive_pack_requires_http_auth,
+    },
 };
 
 // # Discovering Reference
@@ -58,7 +62,9 @@ pub async fn git_info_refs(
             }
         }
         ServiceType::ReceivePack => {
-            if !git_http_auth(state, &mut session, headers).await? {
+            if receive_pack_requires_http_auth(&state.storage.config().git)
+                && !git_http_auth(state, &mut session, headers).await?
+            {
                 return auth_failed();
             }
             check_push_permission(state, &session.auth, &session.repo_path).await?;
@@ -116,28 +122,30 @@ fn basic_auth_password_from_authorization_value(value: &str) -> Option<String> {
     Some(decoded_str.split(':').nth(1)?.to_owned())
 }
 
-/// Uses [`crate::api::oauth::login_user_from_mono_access_token`] (same as [`crate::api::oauth::AccessTokenUser`]).
-/// Supports both Bearer tokens and Basic Auth (with token as password).
-/// Returns `Ok(true)` if a valid token was found and the user was authenticated,
-/// `Ok(false)` if no auth header was present, and `Err` on lookup failures.
+/// Authenticates a Git HTTP request.
+///
+/// `push_auth = "token"`: constant-time lookup over `[[git.push_tokens]]`;
+/// a hit sets the actor to the token name. Omitted `push_auth` keeps the
+/// existing OAuth / UserStorage chain. Supports Bearer and Basic (password
+/// field). Returns `Ok(true)` on a valid credential, `Ok(false)` when no
+/// header is present or the credential misses, and `Err` on lookup failures.
 async fn git_http_auth(
     state: &ProtocolApiState,
     pack_protocol: &mut SmartSession,
     headers: &http::HeaderMap,
 ) -> Result<bool, ProtocolError> {
-    let auth_header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-
-    // Try Bearer token first
-    let token = auth_header.and_then(bearer_token_from_authorization_value);
-
-    // If no Bearer token, try Basic Auth (token as password)
-    let token = token
-        .map(String::from)
-        .or_else(|| auth_header.and_then(basic_auth_password_from_authorization_value));
-
-    let Some(token) = token else {
+    let Some(token) = presented_git_http_token(headers) else {
         return Ok(false);
     };
+
+    let git = &state.storage.config().git;
+    if git.push_auth == Some(PushAuth::Token) {
+        let Some(matched) = lookup_push_token(&git.push_tokens, &token) else {
+            return Ok(false);
+        };
+        pack_protocol.set_authenticated_user(matched.name.clone());
+        return Ok(true);
+    }
 
     let Some(user) =
         login_user_from_mono_access_token(&state.storage.user_storage(), &token).await?
@@ -147,6 +155,13 @@ async fn git_http_auth(
 
     pack_protocol.set_authenticated_user(user.username);
     Ok(true)
+}
+
+fn presented_git_http_token(headers: &http::HeaderMap) -> Option<String> {
+    let auth_header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    bearer_token_from_authorization_value(auth_header)
+        .map(str::to_owned)
+        .or_else(|| basic_auth_password_from_authorization_value(auth_header))
 }
 
 /// Maximum body size accepted for Git HTTP upload-pack / receive-pack requests.
@@ -358,7 +373,9 @@ pub async fn git_receive_pack(
 ) -> Result<Response<Body>, ProtocolError> {
     let mut pack_protocol =
         SmartSession::new(repo_path, ServiceType::ReceivePack, TransportProtocol::Http);
-    if !git_http_auth(state, &mut pack_protocol, req.headers()).await? {
+    if receive_pack_requires_http_auth(&state.storage.config().git)
+        && !git_http_auth(state, &mut pack_protocol, req.headers()).await?
+    {
         return auth_failed();
     }
     check_push_permission(state, &pack_protocol.auth, &pack_protocol.repo_path).await?;
@@ -465,5 +482,31 @@ mod tests {
 
         assert!(matches!(err, ProtocolError::InvalidInput(_)));
         assert!(err.to_string().contains("invalid content-type header"));
+    }
+
+    #[test]
+    fn presented_git_http_token_reads_bearer_and_basic_password() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer static-token"),
+        );
+        assert_eq!(
+            presented_git_http_token(&headers).as_deref(),
+            Some("static-token")
+        );
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode("ignored:basic-secret");
+        let mut basic = http::HeaderMap::new();
+        basic.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+        );
+        assert_eq!(
+            presented_git_http_token(&basic).as_deref(),
+            Some("basic-secret")
+        );
+
+        assert!(presented_git_http_token(&http::HeaderMap::new()).is_none());
     }
 }

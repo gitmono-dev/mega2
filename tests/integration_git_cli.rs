@@ -301,6 +301,15 @@ fn boot_service_http_with_enforcement_and_session(
     enforcement: Option<&str>,
     session_stub_port: Option<u16>,
 ) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_http_with_env(env, enforcement, session_stub_port, &[])
+}
+
+fn boot_service_http_with_env(
+    env: &GitCliEnv,
+    enforcement: Option<&str>,
+    session_stub_port: Option<u16>,
+    extra_env: &[(&str, &str)],
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     let port = reserve_free_port();
     git_cli::record_allocated_port(port);
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -316,6 +325,9 @@ fn boot_service_http_with_enforcement_and_session(
             "MEGA_OAUTH__WEBSITE_API_BASE_URL",
             format!("http://127.0.0.1:{stub_port}"),
         );
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     git_cli::apply_monoengine_public_http_base_env(&mut command, port);
     command.args([
@@ -1390,6 +1402,91 @@ fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
         "service did not shut down cleanly: {status}\nstderr:\n{}",
         read_log(&stderr_path),
     );
+}
+
+fn probe_receive_pack_headers(port: u16, repo_path: &str, bearer: Option<&str>) -> String {
+    let suffix = "/info/refs?service=git-receive-pack";
+    let path = if repo_path == "/" {
+        suffix.to_string()
+    } else {
+        format!("{}{suffix}", repo_path.trim_end_matches('/'))
+    };
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let mut command = Command::new("curl");
+    command.args(["-sS", "-D", "-", "-o", "/dev/null", "--max-time", "15"]);
+    if let Some(token) = bearer {
+        command
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {token}"));
+    }
+    command.arg(&url);
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("curl receive-pack probe failed to spawn: {err}"));
+    assert!(
+        output.status.success(),
+        "curl probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn integration_git_cli_push_auth_token_rejects_without_token_and_out_of_path() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_path = token_dir.path().join("ci.token");
+    let token = format!("tp19-ci-{}", std::process::id());
+    fs::write(&token_path, format!("{token}\n")).expect("write file-mounted token");
+    let append = format!(
+        r#"
+[git]
+push_auth = "token"
+[[git.push_tokens]]
+name = "ci"
+token = "${{file:{}}}"
+paths = ["/project/foo"]
+"#,
+        token_path.display()
+    );
+    let env = GitCliEnv::with_config_append(&append);
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &[("MEGA_MONOREPO__PUSH_POLICY", "trunk")]);
+
+    let unauth = probe_receive_pack_headers(port, "/", None);
+    assert!(
+        unauth.lines().next().is_some_and(|l| l.contains("401")),
+        "push_auth=token must 401 without a token, got:\n{unauth}"
+    );
+    assert!(
+        unauth.to_ascii_lowercase().contains("www-authenticate:"),
+        "401 must include WWW-Authenticate, got:\n{unauth}"
+    );
+
+    let sibling = probe_receive_pack_headers(port, "/project/foobar", Some(&token));
+    assert!(
+        sibling.lines().next().is_some_and(|l| l.contains("403")),
+        "token authorized for /project/foo must not authorize /project/foobar, got:\n{sibling}"
+    );
+
+    let allowed = probe_receive_pack_headers(port, "/project/foo", Some(&token));
+    let status_line = allowed.lines().next().unwrap_or_default();
+    assert!(
+        !status_line.contains("401") && !status_line.contains("403"),
+        "token must pass auth for /project/foo, got:\n{allowed}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(token_dir);
 }
 
 #[test]

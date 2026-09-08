@@ -2,11 +2,12 @@ use std::str::FromStr;
 
 use cedar_policy::{Context, EntityId, EntityTypeName, EntityUid};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::{
     ceres::{api_service::state::ProtocolApiState, protocol::AuthContext},
     common::errors::ProtocolError,
-    config::GitConfig,
+    config::{GitConfig, PushAuth, PushTokenConfig, token_path_authorizes},
     contract::policy::{
         context::CedarContext,
         enforcement::{Enforcement, EnforcementDecision, decide},
@@ -45,22 +46,26 @@ pub async fn check_push_permission(
     auth: &AuthContext,
     repo_path: &std::path::Path,
 ) -> Result<(), ProtocolError> {
-    let username = auth
-        .username
-        .as_deref()
-        .ok_or_else(|| ProtocolError::Forbidden("push requires authentication".to_owned()))?;
+    let config = state.storage.config();
+    apply_push_auth_gate(&config.git, auth, repo_path)?;
 
     let repo_name = repo_path.to_str().ok_or_else(|| {
         ProtocolError::InvalidInput("repository path is not valid UTF-8".to_owned())
     })?;
 
-    let enforcement = Enforcement::parse(&state.storage.config().cedar.enforcement)
+    let enforcement = Enforcement::parse(&config.cedar.enforcement)
         .ok_or_else(|| ProtocolError::Forbidden("invalid cedar.enforcement".to_owned()))?;
 
-    // `off`: no build, no consume (ADR-UN-01).
+    // `off`: no build, no consume (ADR-UN-01). Token path authorization
+    // already ran above; this early return must not skip it.
     if !enforcement.builds() {
         return Ok(());
     }
+
+    let username = auth
+        .username
+        .as_deref()
+        .ok_or_else(|| ProtocolError::Forbidden("push requires authentication".to_owned()))?;
 
     let snapshot = state
         .entity_store
@@ -68,6 +73,101 @@ pub async fn check_push_permission(
         .ok_or_else(|| ProtocolError::Forbidden("authorization store not built".to_owned()))?;
 
     decide_push(enforcement, &snapshot, username, repo_name)
+}
+
+/// Receive-pack HTTP endpoints skip the auth challenge only when
+/// `push_auth = "none"` is explicit. Omitted `push_auth` keeps the OAuth chain.
+pub(crate) fn receive_pack_requires_http_auth(git: &GitConfig) -> bool {
+    git.push_auth != Some(PushAuth::None)
+}
+
+/// Token lookup and path prefix authorization, independent of Cedar.
+///
+/// Commit author/committer are not inputs: authentication identity is
+/// `auth.username` (token name under `push_auth=token`).
+fn apply_push_auth_gate(
+    git: &GitConfig,
+    auth: &AuthContext,
+    repo_path: &std::path::Path,
+) -> Result<(), ProtocolError> {
+    let repo_name = repo_path.to_str().ok_or_else(|| {
+        ProtocolError::InvalidInput("repository path is not valid UTF-8".to_owned())
+    })?;
+
+    match git.push_auth {
+        Some(PushAuth::None) => Ok(()),
+        Some(PushAuth::Token) => {
+            let username = auth.username.as_deref().ok_or_else(|| {
+                ProtocolError::Forbidden("push requires authentication".to_owned())
+            })?;
+            let token = git
+                .push_tokens
+                .iter()
+                .find(|candidate| candidate.name == username)
+                .ok_or_else(|| {
+                    ProtocolError::Forbidden("push requires authentication".to_owned())
+                })?;
+            if token_covers_repo(token, repo_name) {
+                Ok(())
+            } else {
+                Err(ProtocolError::Forbidden(format!(
+                    "token is not authorized for path {repo_name}"
+                )))
+            }
+        }
+        None => {
+            if auth.username.is_none() {
+                Err(ProtocolError::Forbidden(
+                    "push requires authentication".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn token_covers_repo(token: &PushTokenConfig, repo_path: &str) -> bool {
+    match &token.paths {
+        None => true,
+        Some(paths) if paths.is_empty() => true,
+        Some(paths) => paths
+            .iter()
+            .any(|authorized| token_path_authorizes(authorized, repo_path)),
+    }
+}
+
+/// Constant-time scan of `[[git.push_tokens]]`. Digests are compared so
+/// secret length is not leaked by an early return; every configured token is
+/// hashed and compared even after a match.
+pub(crate) fn lookup_push_token<'a>(
+    tokens: &'a [PushTokenConfig],
+    presented: &str,
+) -> Option<&'a PushTokenConfig> {
+    let presented_digest = sha256_bytes(presented);
+    let mut matched = None;
+    for token in tokens {
+        let stored_digest = sha256_bytes(&token.token);
+        if ct_eq_bytes(&presented_digest, &stored_digest) && matched.is_none() {
+            matched = Some(token);
+        }
+    }
+    matched
+}
+
+fn sha256_bytes(value: &str) -> [u8; 32] {
+    Sha256::digest(value.as_bytes()).into()
+}
+
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Pure three-state push decision (ADR-UN-01/05, UN-11). The request path is
@@ -342,5 +442,148 @@ mod tests {
         check_upload_pack_access(&git_config, &auth)
             .await
             .expect("authenticated user should be allowed when anonymous access is disabled");
+    }
+
+    fn token_config(name: &str, secret: &str, paths: Option<Vec<String>>) -> PushTokenConfig {
+        PushTokenConfig {
+            name: name.to_owned(),
+            token: secret.to_owned(),
+            paths,
+        }
+    }
+
+    fn token_auth(name: &str) -> AuthContext {
+        AuthContext {
+            username: Some(name.to_owned()),
+            authenticated_user: Some(PushUserInfo {
+                username: name.to_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn lookup_push_token_matches_by_constant_time_digest() {
+        let tokens = vec![
+            token_config("alpha", "secret-a", None),
+            token_config("ci", "secret-ci", Some(vec!["/project/foo".to_owned()])),
+        ];
+        let hit = lookup_push_token(&tokens, "secret-ci").expect("hit");
+        assert_eq!(hit.name, "ci");
+        assert!(lookup_push_token(&tokens, "secret-missing").is_none());
+        assert!(lookup_push_token(&tokens, "secret-c").is_none());
+    }
+
+    #[test]
+    fn receive_pack_requires_auth_except_explicit_none() {
+        let omitted = GitConfig::default();
+        assert!(receive_pack_requires_http_auth(&omitted));
+
+        let token = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![token_config("ci", "s", None)],
+            ..Default::default()
+        };
+        assert!(receive_pack_requires_http_auth(&token));
+
+        let none = GitConfig {
+            push_auth: Some(PushAuth::None),
+            ..Default::default()
+        };
+        assert!(!receive_pack_requires_http_auth(&none));
+    }
+
+    #[test]
+    fn omitted_push_auth_still_requires_username() {
+        let git = GitConfig::default();
+        let err = apply_push_auth_gate(
+            &git,
+            &AuthContext {
+                username: None,
+                authenticated_user: None,
+            },
+            std::path::Path::new("/"),
+        )
+        .expect_err("omitted push_auth keeps the OAuth username requirement");
+        assert!(matches!(err, ProtocolError::Forbidden(_)));
+    }
+
+    #[test]
+    fn none_push_auth_skips_username() {
+        let git = GitConfig {
+            push_auth: Some(PushAuth::None),
+            ..Default::default()
+        };
+        apply_push_auth_gate(
+            &git,
+            &AuthContext {
+                username: None,
+                authenticated_user: None,
+            },
+            std::path::Path::new("/project/foo"),
+        )
+        .expect("explicit none bypasses the username gate");
+    }
+
+    #[test]
+    fn token_paths_use_component_boundaries() {
+        let git = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![token_config(
+                "ci",
+                "secret",
+                Some(vec!["/project/foo".to_owned()]),
+            )],
+            ..Default::default()
+        };
+        let auth = token_auth("ci");
+        apply_push_auth_gate(&git, &auth, std::path::Path::new("/project/foo"))
+            .expect("exact path is authorized");
+        apply_push_auth_gate(&git, &auth, std::path::Path::new("/project/foo/bar"))
+            .expect("child path is authorized");
+        let err = apply_push_auth_gate(&git, &auth, std::path::Path::new("/project/foobar"))
+            .expect_err("/project/foo must not authorize /project/foobar");
+        assert!(matches!(err, ProtocolError::Forbidden(_)));
+        let err = apply_push_auth_gate(&git, &auth, std::path::Path::new("/other"))
+            .expect_err("path outside token.paths is denied");
+        assert!(matches!(err, ProtocolError::Forbidden(_)));
+    }
+
+    #[test]
+    fn token_auth_uses_token_name_not_commit_author() {
+        let git = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![token_config("ci", "secret", None)],
+            ..Default::default()
+        };
+        // AuthContext.username is the token name. Commit author is not an
+        // input to this gate, so a mismatched author cannot change the result.
+        apply_push_auth_gate(&git, &token_auth("ci"), std::path::Path::new("/anything"))
+            .expect("token name authorizes regardless of commit author");
+        let err = apply_push_auth_gate(&git, &token_auth("alice"), std::path::Path::new("/"))
+            .expect_err("unknown token name is not authenticated");
+        assert!(matches!(err, ProtocolError::Forbidden(_)));
+    }
+
+    #[test]
+    fn omitted_or_empty_token_paths_mean_whole_repo() {
+        let omitted = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![token_config("ci", "secret", None)],
+            ..Default::default()
+        };
+        apply_push_auth_gate(
+            &omitted,
+            &token_auth("ci"),
+            std::path::Path::new("/anywhere"),
+        )
+        .expect("omitted paths authorize the whole repo");
+
+        let empty = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![token_config("ci", "secret", Some(Vec::new()))],
+            ..Default::default()
+        };
+        apply_push_auth_gate(&empty, &token_auth("ci"), std::path::Path::new("/anywhere"))
+            .expect("empty paths authorize the whole repo");
     }
 }
