@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sea_orm::TransactionTrait;
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
@@ -134,6 +134,15 @@ pub struct MergeExecContext {
     pub pause_after_apply: Duration,
 }
 
+/// A `refs/heads/main` row whose `ref_tree_hash` does not match `resolve(root, P)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleMainRef {
+    pub path: String,
+    pub last_commit_hash: String,
+    pub stored_tree_hash: String,
+    pub resolved_tree_hash: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnqueueRequest {
     pub kind: PushQueueKindEnum,
@@ -227,6 +236,9 @@ pub struct QueueMetricsSnapshot {
     pub cas_assert_failures: u64,
     pub claim_lost: u64,
     pub lock_timeout_alarms: u64,
+    pub tree_hash_assert_failures: u64,
+    pub inspect_tombstoned: u64,
+    pub reconcile_tombstoned: u64,
 }
 
 fn percentile(xs: &[f64], p: f64) -> Option<f64> {
@@ -342,6 +354,9 @@ pub struct PushQueueMetrics {
     pub cas_assert_failures: Arc<AtomicU64>,
     pub claim_lost: Arc<AtomicU64>,
     pub lock_timeout_alarms: Arc<AtomicU64>,
+    pub tree_hash_assert_failures: Arc<AtomicU64>,
+    pub inspect_tombstoned: Arc<AtomicU64>,
+    pub reconcile_tombstoned: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -388,6 +403,10 @@ impl PushQueueService {
 
     pub fn reaper(&self) -> crate::jupiter::service::push_queue_reaper::PushQueueReaper {
         crate::jupiter::service::push_queue_reaper::PushQueueReaper::from_service(self.clone())
+    }
+
+    pub fn audit(&self) -> crate::jupiter::service::mono_write_audit::MonoWriteAudit {
+        crate::jupiter::service::mono_write_audit::MonoWriteAudit::from_service(self.clone())
     }
 
     pub fn metrics(&self) -> &PushQueueMetrics {
@@ -542,6 +561,12 @@ impl PushQueueService {
             cas_assert_failures: self.metrics.cas_assert_failures.load(Ordering::Relaxed),
             claim_lost: self.metrics.claim_lost.load(Ordering::Relaxed),
             lock_timeout_alarms: self.metrics.lock_timeout_alarms.load(Ordering::Relaxed),
+            tree_hash_assert_failures: self
+                .metrics
+                .tree_hash_assert_failures
+                .load(Ordering::Relaxed),
+            inspect_tombstoned: self.metrics.inspect_tombstoned.load(Ordering::Relaxed),
+            reconcile_tombstoned: self.metrics.reconcile_tombstoned.load(Ordering::Relaxed),
         })
     }
 
@@ -667,6 +692,62 @@ impl PushQueueService {
             failure: "Conflict".into(),
             message: message.to_owned(),
         })
+    }
+
+    /// Shared TP-11 predicate: `main@P.ref_tree_hash == resolve(root, P)`.
+    /// Only `refs/heads/main` is considered. Missing rows are not stale
+    /// (push create mid-state / merge "Main ref not found"). `path == "/"`
+    /// is skipped (`main@/` is the resolve source).
+    pub async fn assert_main_path_tree_hash_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        path: &str,
+        root_tree_hash: &str,
+    ) -> Result<Option<StaleMainRef>, MegaError> {
+        if path.is_empty() || path == "/" {
+            return Ok(None);
+        }
+        let Some(pref) = self.mono_storage.get_main_ref_in_txn(path, txn).await? else {
+            return Ok(None);
+        };
+        let resolved = self
+            .mono_storage
+            .resolve_path_tree_hash_in_txn(root_tree_hash, path, txn)
+            .await?;
+        if resolved.as_deref() == Some(pref.ref_tree_hash.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(StaleMainRef {
+            path: pref.path,
+            last_commit_hash: pref.ref_commit_hash,
+            stored_tree_hash: pref.ref_tree_hash,
+            resolved_tree_hash: resolved,
+        }))
+    }
+
+    async fn b3_refuse_stale_main_tree(
+        &self,
+        txn: DatabaseTransaction,
+        id: i64,
+        path: &str,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        self.metrics
+            .tree_hash_assert_failures
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            event = "push_queue_tree_hash_assert",
+            id,
+            "stale materialized main ref; tombstone repair"
+        );
+        PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+        PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+        self.b3_tombstone_repair_after_savepoint(
+            txn,
+            id,
+            path,
+            "stale materialized main ref; advertise then fetch",
+        )
+        .await
     }
 
     /// Reaper I3: when `expected_*` still matches the live root, tombstone a
@@ -898,6 +979,14 @@ impl PushQueueService {
                     .await;
             }
             PushQueueKindEnum::Push => {
+                if let Some(root) = root.as_ref()
+                    && self
+                        .assert_main_path_tree_hash_in_txn(&txn, &row.path, &root.ref_tree_hash)
+                        .await?
+                        .is_some()
+                {
+                    return self.b3_refuse_stale_main_tree(txn, req.id, &row.path).await;
+                }
                 tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 push stub");
             }
             PushQueueKindEnum::Merge => {
@@ -1556,8 +1645,14 @@ impl PushQueueService {
             storage: ctx.storage.clone(),
             git_object_cache: ctx.git_object_cache.clone(),
         };
-        // TP-11 hook: assertion precedes business gates.
-        mono_api.assert_merge_tree_hash_tp11();
+        // TP-11: tree-hash assertion precedes get_cl / UN-17 / conflict recheck.
+        if mono_api
+            .assert_merge_tree_hash_tp11(&txn, &row.path, &root.ref_tree_hash)
+            .await?
+            .is_some()
+        {
+            return self.b3_refuse_stale_main_tree(txn, row.id, &row.path).await;
+        }
 
         let Some(cl) = ctx
             .storage

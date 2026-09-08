@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     common::errors::MegaError,
     config::{
-        ObjectStorageConfig,
+        MergeWriter, ObjectStorageConfig, PushPolicy,
         reload::ConfigHandle,
         secret::{SecretRef, SecretResolver, VaultSecretResolver, is_secret_ref_value},
         validate::{validate_config_secret_ref, validate_redis_url_literal},
@@ -283,6 +283,16 @@ impl AppContext {
             crate::jupiter::service::push_queue_reaper::DEFAULT_REAP_INTERVAL,
             notification_shutdown.clone(),
         );
+        // Inspect/reconcile tombstone live refs; only safe when the queue is
+        // the sole root writer (legacy merge does not take MONO_WRITE_LOCK).
+        if config.monorepo.merge_writer == MergeWriter::Queue
+            || config.monorepo.push_policy == PushPolicy::Trunk
+        {
+            storage.push_queue_service.audit().spawn_background(
+                crate::jupiter::service::mono_write_audit::DEFAULT_INSPECT_INTERVAL,
+                notification_shutdown.clone(),
+            );
+        }
 
         Ok(Self {
             storage,

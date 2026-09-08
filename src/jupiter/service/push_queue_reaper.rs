@@ -277,7 +277,6 @@ impl PushQueueReaper {
                 }
                 tracing::warn!(
                     id = row.id,
-                    path = %row.path,
                     "reaper I3: attach path has a main ref (unexpected); tombstoning"
                 );
                 self.mono()
@@ -292,7 +291,6 @@ impl PushQueueReaper {
                         if row.kind == PushQueueKindEnum::Merge {
                             tracing::warn!(
                                 id = row.id,
-                                path = %row.path,
                                 "reaper I3: merge row missing main@path (no repair)"
                             );
                             return Ok(false);
@@ -304,19 +302,16 @@ impl PushQueueReaper {
                         if tomb.is_some() {
                             tracing::warn!(
                                 id = row.id,
-                                path = %row.path,
                                 "reaper I3: push missing main@path but tombstone exists"
                             );
                         } else if row.old_id != ZERO_ID {
                             tracing::warn!(
                                 id = row.id,
-                                path = %row.path,
                                 "reaper I3: push missing main@path with non-ZERO old_id (no tombstone)"
                             );
                         } else {
                             tracing::debug!(
                                 id = row.id,
-                                path = %row.path,
                                 "reaper I3: push missing main@path without tombstone (create mid-crash)"
                             );
                         }
@@ -376,7 +371,9 @@ mod tests {
             },
             storage::{
                 base_storage::{BaseStorage, StorageConnector},
-                push_queue_storage::{ClaimOutcome, EnqueueOutcome, MONO_WRITE_LOCK_SQL},
+                push_queue_storage::{
+                    ClaimOutcome, EnqueueOutcome, MONO_WRITE_LOCK_SQL, PushQueueStorage,
+                },
             },
             tests::test_db_connection,
         },
@@ -917,5 +914,81 @@ mod tests {
         assert!(report.lock_acquired);
         let row = svc.storage().get_by_id(id).await.unwrap().unwrap();
         assert_eq!(row.status, PushQueueStatusEnum::Failed);
+    }
+
+    #[tokio::test]
+    async fn tp11_kill9_before_savepoint_commit_reaper_i3_drops_stale_ref() {
+        let (_t, svc, _lock) = service().await;
+        seed_root(&svc, &"a".repeat(40), &"b".repeat(40)).await;
+        let id = enqueue_and_claim(&svc, "CL-TP11-K9").await;
+        let path = "/CL-TP11-K9".to_string();
+        svc.mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    &path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "s".repeat(40),
+                    "t".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let conn = svc.mono_storage().get_connection();
+        let txn = conn.begin().await.unwrap();
+        PushQueueStorage::savepoint(&txn, "b3_kind").await.unwrap();
+        svc.mono_storage()
+            .upsert_tombstone_in_txn(
+                &path,
+                MEGA_BRANCH_NAME,
+                &"s".repeat(40),
+                &"t".repeat(40),
+                &txn,
+            )
+            .await
+            .unwrap();
+        txn.rollback().await.unwrap();
+
+        assert_eq!(
+            svc.storage().get_by_id(id).await.unwrap().unwrap().status,
+            PushQueueStatusEnum::Running
+        );
+        assert!(
+            svc.mono_storage()
+                .get_main_ref(&path)
+                .await
+                .unwrap()
+                .is_some(),
+            "uncommitted repair must leave the stale row"
+        );
+
+        let report = reaper(&svc).reap_once().await.unwrap();
+        assert!(report.lock_acquired);
+        assert!(report.i3_tombstoned >= 1 || report.running_failed >= 1);
+        assert!(
+            svc.mono_storage()
+                .get_main_ref(&path)
+                .await
+                .unwrap()
+                .is_none(),
+            "I3 must delete the stale main row"
+        );
+        let listed = svc.mono_storage().get_all_refs(&path, false).await.unwrap();
+        assert!(
+            !listed.iter().any(|r| r.ref_name == MEGA_BRANCH_NAME),
+            "stale main@P must not remain in refs listing used by advertise"
+        );
+        let tomb = svc
+            .mono_storage()
+            .get_tombstone(&path, MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .expect("I3 tombstone");
+        assert_eq!(tomb.last_commit_hash, "s".repeat(40));
+        let row = svc.storage().get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert!(row.pending_action.is_none());
     }
 }

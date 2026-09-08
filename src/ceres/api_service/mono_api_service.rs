@@ -2267,8 +2267,10 @@ impl MonoApiService {
     }
 
     /// Entry prechecks shared by `/merge`, `/merge-no-auth`, and queue-mode
-    /// `/merge-queue/add` (TP-07): missing `main@P` refuse, `from_hash != main`
-    /// refuse, GPG gate.
+    /// `/merge-queue/add` (TP-07): missing `main@P` refuse, GPG gate.
+    /// `from_hash != main` is still refused here when the path tree hash is
+    /// consistent. Queue mode defers that check to B3 when the tree hash is
+    /// already stale so the TP-11 assertion repairs first.
     async fn ensure_merge_entry_prechecks(&self, cl: &mega_cl::Model) -> Result<(), GitError> {
         let storage = self.storage.mono_storage();
         let refs = storage
@@ -2277,11 +2279,49 @@ impl MonoApiService {
             .map_err(|e| GitError::CustomError(format!("Failed to get main ref: {}", e)))?
             .ok_or_else(|| GitError::CustomError("Main ref not found".to_string()))?;
 
-        if cl.from_hash != refs.ref_commit_hash {
+        if cl.from_hash != refs.ref_commit_hash
+            && !self
+                .queue_merge_defers_from_hash_conflict_to_b3(&cl.path)
+                .await?
+        {
             return Err(GitError::CustomError("ref hash conflict".to_owned()));
         }
 
         self.ensure_gpg_check_passed(&cl.link).await
+    }
+
+    async fn queue_merge_defers_from_hash_conflict_to_b3(
+        &self,
+        path: &str,
+    ) -> Result<bool, GitError> {
+        if self.storage.config().monorepo.merge_writer != MergeWriter::Queue {
+            return Ok(false);
+        }
+        if path.is_empty() || path == "/" {
+            return Ok(false);
+        }
+        let txn = self
+            .storage
+            .begin_db_transaction()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let root = self
+            .storage
+            .mono_storage()
+            .get_main_ref_in_txn("/", &txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let Some(root) = root else {
+            let _ = txn.rollback().await;
+            return Ok(false);
+        };
+        let stale = self
+            .assert_merge_tree_hash_tp11(&txn, path, &root.ref_tree_hash)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .is_some();
+        let _ = txn.rollback().await;
+        Ok(stale)
     }
 
     /// Enqueue a merge (`kind=merge`), wait/claim, and run B3 until Done or a
@@ -3045,9 +3085,18 @@ impl MonoApiService {
         Ok(new_commit_id)
     }
 
-    /// TP-11 hook: tree-hash assertion runs before merge business gates.
-    /// No-op until TP-11 lands the predicate.
-    pub(crate) fn assert_merge_tree_hash_tp11(&self) {}
+    /// TP-11: `refs/heads/main` tree-hash assertion (shared with push).
+    pub(crate) async fn assert_merge_tree_hash_tp11(
+        &self,
+        txn: &DatabaseTransaction,
+        path: &str,
+        root_tree_hash: &str,
+    ) -> Result<Option<crate::jupiter::service::push_queue_service::StaleMainRef>, MegaError> {
+        self.storage
+            .push_queue_service
+            .assert_main_path_tree_hash_in_txn(txn, path, root_tree_hash)
+            .await
+    }
 
     /// Transactional apply used by merge B3 (TP-07): refs (exactly one root
     /// CAS for `main@/`), commits, and trees share `txn`. Missing `main` at
@@ -7485,6 +7534,7 @@ mod mc09_tests {
             ".gitkeep",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )];
+        let path_tree_hash = extra_child.as_ref().map(|(_, t)| t.id.to_string());
         if let Some((name, child)) = extra_child {
             mono.save_mega_trees(
                 vec![child.clone()],
@@ -7522,7 +7572,9 @@ mod mc09_tests {
                     path: path.to_string(),
                     ref_name: MEGA_BRANCH_NAME.to_string(),
                     ref_commit_hash: old_commit.id.to_string(),
-                    ref_tree_hash: old_tree.id.to_string(),
+                    ref_tree_hash: path_tree_hash
+                        .clone()
+                        .unwrap_or_else(|| old_tree.id.to_string()),
                     created_at: chrono::Utc::now().naive_utc(),
                     updated_at: chrono::Utc::now().naive_utc(),
                     is_cl: false,
@@ -8404,5 +8456,486 @@ mod mc09_tests {
             .unwrap()
             .unwrap();
         assert_eq!(still.status, MergeStatusEnum::Open);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            commit::Commit,
+            tree::{Tree, TreeItem, TreeItemMode},
+        },
+    };
+
+    use super::*;
+    use crate::{
+        callisto::sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
+        ceres::pack::materialize,
+        config::{MergeWriter, PushPolicy, testing::isolated_config},
+        jupiter::{
+            service::push_queue_service::{
+                EnqueueRequest, ExecuteOutcome, ExecuteRequest, push_operation_id,
+            },
+            storage::push_queue_storage::{ClaimOutcome, EnqueueOutcome},
+            tests::test_storage_with_config,
+        },
+    };
+
+    async fn tp11_storage(temp: &std::path::Path) -> Storage {
+        let mut config = isolated_config(temp.join("config"));
+        config.monorepo.merge_writer = MergeWriter::Queue;
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        test_storage_with_config(temp, config).await
+    }
+
+    async fn nested_queue_fixture(
+        path: &str,
+        link: &str,
+        dir: &str,
+    ) -> (
+        tempfile::TempDir,
+        Storage,
+        MonoApiService,
+        mega_cl::Model,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tp11_storage(temp.path()).await;
+        let service = test_service(&storage);
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items(vec![blob_item(
+            "x.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .expect("child");
+        let path_tree_hash = child.id.to_string();
+        mono.save_mega_trees(
+            vec![child.clone()],
+            ObjectHash::from_str(&"1".repeat(40)).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let old_tree = Tree::from_tree_items(vec![
+            blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            TreeItem::new(TreeItemMode::Tree, child.id, dir.to_string()),
+        ])
+        .expect("old tree");
+        let new_tree = Tree::from_tree_items(vec![blob_item(
+            "queued.txt",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )])
+        .expect("new tree");
+        let old_commit = Commit::from_tree_id(old_tree.id, vec![], "base");
+        let new_commit = Commit::from_tree_id(new_tree.id, vec![old_commit.id], "cl tip");
+        mono.save_mega_trees(
+            vec![old_tree.clone(), new_tree.clone()],
+            old_commit.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone(), new_commit.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &old_tree, &old_commit.id.to_string()).await;
+        mono.save_refs(
+            mega_refs::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                path: path.to_string(),
+                ref_name: MEGA_BRANCH_NAME.to_string(),
+                ref_commit_hash: old_commit.id.to_string(),
+                ref_tree_hash: path_tree_hash,
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+                is_cl: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_or_update_cl_ref(
+            path,
+            &format!("refs/cl/{link}"),
+            &new_commit.id.to_string(),
+            &new_tree.id.to_string(),
+        )
+        .await
+        .unwrap();
+        let cl = storage
+            .cl_storage()
+            .new_cl_model(
+                path,
+                link,
+                "queue merge",
+                "main",
+                &old_commit.id.to_string(),
+                &new_commit.id.to_string(),
+                "gate-tester",
+            )
+            .await
+            .unwrap();
+        (temp, storage, service, cl, old_commit.id.to_string())
+    }
+
+    async fn poison_main_tree(storage: &Storage, path: &str) -> String {
+        let mut row = storage
+            .mono_storage()
+            .get_main_ref(path)
+            .await
+            .unwrap()
+            .unwrap();
+        let tip = row.ref_commit_hash.clone();
+        row.ref_tree_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+        storage.mono_storage().update_ref(row, None).await.unwrap();
+        tip
+    }
+
+    #[tokio::test]
+    async fn tp11_merge_stale_tree_hash_refuses_and_tombstones() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, service, cl, stale_tip) =
+            nested_queue_fixture("/p11", "TP11M1", "p11").await;
+        poison_main_tree(&storage, "/p11").await;
+        let err = service
+            .merge_cl("gate-tester", "gate-tester", cl)
+            .await
+            .expect_err("stale tree hash must refuse merge");
+        assert!(err.to_string().contains("stale materialized"), "{err}");
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/p11")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tomb = storage
+            .mono_storage()
+            .get_tombstone("/p11", MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .expect("tombstone");
+        assert_eq!(tomb.last_commit_hash, stale_tip);
+        assert!(
+            storage
+                .push_queue_service
+                .metrics()
+                .tree_hash_assert_failures
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn tp11_push_stale_tree_hash_refuses_and_tombstones() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _service, _cl, stale_tip) =
+            nested_queue_fixture("/p11p", "TP11P1", "p11p").await;
+        poison_main_tree(&storage, "/p11p").await;
+        let outcome = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: push_operation_id(&stale_tip, &"c".repeat(40)),
+                path: "/p11p".into(),
+                old_id: stale_tip.clone(),
+                new_id: "c".repeat(40),
+                requester: None,
+                payload: serde_json::json!({}),
+                ref_name: Some(MEGA_BRANCH_NAME.into()),
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        let EnqueueOutcome::Inserted { id } = outcome else {
+            panic!("insert push {outcome:?}");
+        };
+        assert_eq!(
+            storage
+                .push_queue_service
+                .storage()
+                .claim_for_execution(id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        let exec = storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        match exec {
+            ExecuteOutcome::Failed {
+                failure, message, ..
+            } => {
+                assert_eq!(failure, "Conflict");
+                assert!(message.contains("advertise"), "{message}");
+                assert!(message.contains("fetch"), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/p11p")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tomb = storage
+            .mono_storage()
+            .get_tombstone("/p11p", MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .expect("tombstone");
+        assert_eq!(tomb.last_commit_hash, stale_tip);
+        let row = storage
+            .push_queue_service
+            .storage()
+            .get_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert!(row.pending_action.is_none());
+    }
+
+    #[tokio::test]
+    async fn tp11_merge_repair_advertise_continues_from_tombstone() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, service, cl, stale_tip) =
+            nested_queue_fixture("/p11a", "TP11AD", "p11a").await;
+        poison_main_tree(&storage, "/p11a").await;
+        service
+            .merge_cl("gate-tester", "gate-tester", cl)
+            .await
+            .expect_err("stale");
+        let head = crate::ceres::code_edit::utils::create_repo_commit(&storage, "/p11a")
+            .await
+            .unwrap();
+        assert_ne!(head, ZERO_ID);
+        let commit = storage
+            .mono_storage()
+            .get_commit_by_hash(&head)
+            .await
+            .unwrap()
+            .expect("revived commit");
+        let parents: Vec<String> = serde_json::from_value(commit.parents_id).unwrap();
+        assert_eq!(parents, vec![stale_tip]);
+    }
+
+    #[tokio::test]
+    async fn tp11_assertion_precedes_conflict_recheck() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, service, cl, stale_tip) =
+            nested_queue_fixture("/p11c", "TP11CR", "p11c").await;
+        poison_main_tree(&storage, "/p11c").await;
+        let txn = storage.begin_db_transaction().await.unwrap();
+        let current = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            storage
+                .cl_storage()
+                .cas_update_cl_hashes_in_txn(&current, &"f".repeat(40), &current.to_hash, &txn)
+                .await
+                .unwrap()
+        );
+        txn.commit().await.unwrap();
+        let err = service
+            .merge_cl("gate-tester", "gate-tester", cl)
+            .await
+            .expect_err("stale tree must refuse before from_hash conflict");
+        assert!(err.to_string().contains("stale materialized"), "got {err}");
+        assert!(
+            storage
+                .mono_storage()
+                .get_tombstone("/p11c", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let rows = storage
+            .push_queue_service
+            .storage()
+            .list_recent_finished(20)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.operation_id == "TP11CR")
+            .expect("queued merge row");
+        assert_eq!(row.status, PushQueueStatusEnum::Failed);
+        assert!(row.pending_action.is_none());
+        assert_eq!(
+            storage
+                .mono_storage()
+                .get_tombstone("/p11c", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_commit_hash,
+            stale_tip
+        );
+    }
+
+    #[tokio::test]
+    async fn tp11_cl_ref_is_not_asserted() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, service, cl, _tip) =
+            nested_queue_fixture("/p11cl", "TP11CL", "p11cl").await;
+        let mut cl_ref = storage
+            .mono_storage()
+            .get_ref_by_name(&format!("refs/cl/{}", cl.link))
+            .await
+            .unwrap()
+            .unwrap();
+        cl_ref.ref_tree_hash = "ffffffffffffffffffffffffffffffffffffffff".into();
+        storage
+            .mono_storage()
+            .update_ref(cl_ref, None)
+            .await
+            .unwrap();
+        service
+            .merge_cl("gate-tester", "gate-tester", cl.clone())
+            .await
+            .expect("poisoned CL ref must not trip main tree-hash assertion");
+        let merged = storage
+            .cl_storage()
+            .get_cl(&cl.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, MergeStatusEnum::Merged);
+        assert!(
+            storage
+                .mono_storage()
+                .get_tombstone("/p11cl", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tp11_reconcile_and_inspect_tombstone_stale_rows() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _service, _cl, stale_tip) =
+            nested_queue_fixture("/p11r", "TP11RC", "p11r").await;
+        poison_main_tree(&storage, "/p11r").await;
+        let audit = storage.push_queue_service.audit().with_batch_size(8);
+        let rec = audit.reconcile_once().await.unwrap();
+        assert!(rec.lock_acquired);
+        assert!(rec.tombstoned >= 1);
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/p11r")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .push_queue_service
+                .metrics()
+                .reconcile_tombstoned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rec.tombstoned
+        );
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    "/p11r",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    stale_tip.clone(),
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let ins = audit.inspect_once().await.unwrap();
+        assert!(ins.lock_acquired);
+        assert!(ins.tombstoned >= 1);
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/p11r")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let snap = storage.push_queue_service.metrics_snapshot().await.unwrap();
+        assert!(snap.inspect_tombstoned >= 1);
+        assert!(snap.reconcile_tombstoned >= 1);
+    }
+
+    #[tokio::test]
+    async fn tp11_inspect_skips_root_and_cl_refs() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _service, cl, _) =
+            nested_queue_fixture("/p11s", "TP11SK", "p11s").await;
+        let mut cl_ref = storage
+            .mono_storage()
+            .get_ref_by_name(&format!("refs/cl/{}", cl.link))
+            .await
+            .unwrap()
+            .unwrap();
+        cl_ref.ref_tree_hash = "ffffffffffffffffffffffffffffffffffffffff".into();
+        storage
+            .mono_storage()
+            .update_ref(cl_ref, None)
+            .await
+            .unwrap();
+        let root_before = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let audit = storage.push_queue_service.audit();
+        let rec = audit.reconcile_once().await.unwrap();
+        assert_eq!(rec.tombstoned, 0);
+        let root_after = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_before.ref_tree_hash, root_after.ref_tree_hash);
+        assert!(
+            storage
+                .mono_storage()
+                .get_ref_by_name(&format!("refs/cl/{}", cl.link))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/p11s")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
