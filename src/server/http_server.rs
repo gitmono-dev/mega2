@@ -37,7 +37,7 @@ use crate::{
     },
     common::errors::{MegaError, MegaResult, ProtocolError},
     config::{
-        ArtifactGcConfig, BuckConfig, Config,
+        ArtifactGcConfig, BuckConfig, Config, MergeWriter,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     context::AppContext,
@@ -423,6 +423,22 @@ pub(crate) async fn ensure_authz_first_build(
 
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     crate::config::validate::require_oauth_for_http_service(ctx.storage.config().as_ref())?;
+
+    if ctx.storage.config().monorepo.merge_writer == MergeWriter::Queue {
+        // Config-time validate cannot see the DB. Queue mode absorbs leftover
+        // non-terminal merge_queue rows here (Waiting/Testing → Queued,
+        // Merging → Failed interrupted) — the TP-07 rolling-deploy drain.
+        let report = ctx
+            .storage
+            .merge_queue_service
+            .prepare_for_queue_writer(ctx.storage.push_queue_service.storage())
+            .await?;
+        tracing::info!(
+            queued = report.queued,
+            failed_interrupted = report.failed_interrupted,
+            "merge_queue absorb into push_queue complete"
+        );
+    }
 
     // First-build the shared authorization snapshot before the listener binds
     // (UN-02). `off` is a no-op; a failed first build fails startup.

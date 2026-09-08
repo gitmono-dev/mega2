@@ -143,6 +143,14 @@
 - `notify_authz_changed(storage, old_blob_id, new_blob_id)`：以主干 `/.mega_cedar.json` 的 blob ID 变化为条件（O(1) 比较），无变化直接返回；变化时经 `Storage::entity_store()` 拿到的共享实例执行 build-then-swap（UN-15 语义：失败保留旧快照 + `error` 日志 + 置 dirty）。
 - `notify_authz_changed_best_effort(...)`：ref 已写、后续步骤失败的路径不得回滚业务操作，因此只记录并置 dirty（ADR-UN-01：`enforce` + dirty = 受护判定全拒）。
 
+当 `cedar.enforcement` 为 `shadow`/`enforce`（会构建快照）时，另交付 trunk-push.md 1.2 三件套（`off` 含 trunk 形态全部旁路，仍走上面的内存 blob-id 路径）：
+
+1. **持久化 outbox**：B3 在同一事务内写 `authz_notify_outbox`（`version = push_queue.id`）。提交即登记待重建；崩溃后补偿任务 `replay_authz_outbox` 以**最新根**重建（天然幂等）。
+2. **单调 CAS 发布**：`queue_control.published_version` 以 `UPDATE ... SET published_version = $v WHERE published_version < $v` 推进，乱序完成者发布被拒，发布序 = `push_queue.id` 序。
+3. **按实例读取屏障**：UN-19（`enforce_acl_change_authorization`）在判定前比对 DB 权威版本与本进程 `SharedEntityStore` 水位，落后则本进程从最新根重建后再判定；重建超时 fail-closed 并打 `event=authz_barrier_timeout`。
+
+队列外删除路径（`monorepo.rs` receive-pack Delete）没有 `push_queue.id`：走 dirty 标记 + 补偿重建，不参与 `published_version` 比较。
+
 主干 ref 的真实出入口全部挂接（写点 allowlist 由 `scripts/authz_write_points_guard.sh` 强制，新增调用方必须挂接或登记为例外）：
 
 | 出入口 | 挂接点 | 备注 |

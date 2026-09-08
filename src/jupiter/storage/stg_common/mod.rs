@@ -102,6 +102,7 @@ mod tests {
             to_hash: String::from("def"),
             path: String::from("/"),
             base_branch: String::from("main"),
+            revision: 0,
         };
 
         let label = label::Model {

@@ -20,6 +20,9 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub last_policy: String,
     pub max_depth: i32,
+    /// Monotonic authz snapshot publish watermark (TP-22). CAS:
+    /// `UPDATE ... SET published_version = $v WHERE published_version < $v`.
+    pub published_version: i64,
     pub updated_at: DateTimeWithTimeZone,
 }
 
@@ -68,6 +71,7 @@ mod tests {
         assert!(!row.hard_stopped);
         assert_eq!(row.last_policy, "review");
         assert_eq!(row.max_depth, 64);
+        assert_eq!(row.published_version, 0);
     }
 
     #[tokio::test]

@@ -22,6 +22,8 @@ pub mod secure_lifecycle;
 pub mod secure_producer;
 pub mod secure_sweep;
 #[cfg(test)]
+mod tests;
+#[cfg(test)]
 mod un04_admin_source;
 #[cfg(test)]
 mod un09_push_matrix;

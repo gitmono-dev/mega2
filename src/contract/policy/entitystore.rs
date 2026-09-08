@@ -153,6 +153,9 @@ pub struct SharedEntityStore {
 struct SharedInner {
     snapshot: Option<Arc<EntitySnapshot>>,
     dirty: bool,
+    /// Process-local copy of `queue_control.published_version` after a
+    /// successful publish or catch-up rebuild (TP-22).
+    published_version: i64,
 }
 
 impl Default for SharedEntityStore {
@@ -180,28 +183,95 @@ impl SharedEntityStore {
     /// lock; on failure keep the old snapshot, set dirty, and log
     /// `event=authz_rebuild_failed`.
     pub fn swap(&self, json: &str) -> Result<(), BuilderError> {
+        self.swap_inner(json, None)
+    }
+
+    /// Like [`Self::swap`], then record the CAS-won `published_version`.
+    pub fn swap_at_version(&self, json: &str, version: i64) -> Result<(), BuilderError> {
+        self.swap_inner(json, Some(version))
+    }
+
+    /// Unversioned content refresh whose watermark check and install share the
+    /// write lock. Returns `false` when `published_version` moved off
+    /// `expected` (a versioned publish won); the caller must reload rather than
+    /// clobber the newer snapshot.
+    pub fn swap_if_watermark_eq(&self, json: &str, expected: i64) -> Result<bool, BuilderError> {
         let new_snapshot = match build_from_json(json) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let mut inner = self.inner.write().unwrap();
-                inner.dirty = true;
-                tracing::error!(
-                    event = "authz_rebuild_failed",
-                    path = MEGA_CEDAR_PATH,
-                    error = %error,
-                    "authorization snapshot rebuild failed; keeping previous snapshot"
-                );
+                self.fail_rebuild(&error);
                 return Err(error);
             }
         };
         let mut inner = self.inner.write().unwrap();
+        if inner.published_version != expected {
+            tracing::info!(
+                event = "authz_dirty_refresh_skipped",
+                expected,
+                local_version = inner.published_version,
+                "dirty authz refresh skipped; a versioned publish advanced the watermark"
+            );
+            return Ok(false);
+        }
         inner.snapshot = Some(Arc::new(new_snapshot));
         inner.dirty = false;
+        Ok(true)
+    }
+
+    fn swap_inner(&self, json: &str, version: Option<i64>) -> Result<(), BuilderError> {
+        let new_snapshot = match build_from_json(json) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.fail_rebuild(&error);
+                return Err(error);
+            }
+        };
+        let mut inner = self.inner.write().unwrap();
+        if let Some(version) = version
+            && inner.published_version >= version
+        {
+            tracing::info!(
+                event = "authz_publish_rejected",
+                version,
+                local_version = inner.published_version,
+                "stale authz snapshot publish lost to a newer local watermark"
+            );
+            return Ok(());
+        }
+        inner.snapshot = Some(Arc::new(new_snapshot));
+        inner.dirty = false;
+        if let Some(version) = version {
+            inner.published_version = version;
+        }
         Ok(())
+    }
+
+    fn fail_rebuild(&self, error: &BuilderError) {
+        let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
+        tracing::error!(
+            event = "authz_rebuild_failed",
+            path = MEGA_CEDAR_PATH,
+            error = %error,
+            "authorization snapshot rebuild failed; keeping previous snapshot"
+        );
     }
 
     pub fn is_dirty(&self) -> bool {
         self.inner.read().unwrap().dirty
+    }
+
+    /// Process-local watermark of the last snapshot this instance published
+    /// or caught up to. Compared with DB `published_version` at the UN-19
+    /// read barrier (TP-22).
+    pub fn local_published_version(&self) -> i64 {
+        self.inner.read().unwrap().published_version
+    }
+
+    /// Catch-up: this process rebuilt from the latest root to match `version`
+    /// already stored in DB (no CAS).
+    pub fn adopt_published_version(&self, version: i64) {
+        self.inner.write().unwrap().published_version = version;
     }
 
     /// Mark the shared snapshot dirty (fail-closed) without attempting a
@@ -385,5 +455,97 @@ mod tests {
         let a = store.snapshot().expect("a");
         let b = store.snapshot().expect("b");
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn shared_store_swap_at_version_records_watermark() {
+        let store = SharedEntityStore::new();
+        assert_eq!(store.local_published_version(), 0);
+        store
+            .swap_at_version(
+                &generate_entity(&["admin".to_string()], "repo").expect("generate"),
+                7,
+            )
+            .expect("swap");
+        assert_eq!(store.local_published_version(), 7);
+        assert!(!store.is_dirty());
+    }
+
+    #[test]
+    fn shared_store_swap_at_version_rejects_stale_publish() {
+        let store = SharedEntityStore::new();
+        let json_new = generate_entity(&["admin".to_string()], "new").expect("generate");
+        let json_old = generate_entity(&["admin".to_string()], "old").expect("generate");
+        store.swap_at_version(&json_new, 10).expect("newer");
+        let first = store.snapshot().expect("snapshot");
+        store
+            .swap_at_version(&json_old, 5)
+            .expect("stale publish is Ok");
+        let after = store.snapshot().expect("snapshot");
+        assert!(
+            Arc::ptr_eq(&first, &after),
+            "older id finishing later must not replace the snapshot"
+        );
+        assert_eq!(store.local_published_version(), 10);
+    }
+
+    #[test]
+    fn shared_store_unversioned_swap_refreshes_but_keeps_watermark() {
+        let store = SharedEntityStore::new();
+        let json_new = generate_entity(&["admin".to_string()], "new").expect("generate");
+        let json_refresh = generate_entity(&["admin".to_string()], "refresh").expect("generate");
+        store.swap_at_version(&json_new, 10).expect("versioned");
+        store.swap(&json_refresh).expect("legacy/dirty refresh");
+        assert_eq!(store.local_published_version(), 10);
+        let snap = store.snapshot().expect("snapshot");
+        assert!(
+            snap.store()
+                .contains_repository(&r#"Repository::"refresh""#.parse().unwrap()),
+            "unversioned notify must still install new ACL content"
+        );
+    }
+
+    #[test]
+    fn shared_store_dirty_refresh_does_not_clobber_newer_versioned() {
+        let store = SharedEntityStore::new();
+        let json_v10 = generate_entity(&["admin".to_string()], "v10").expect("generate");
+        let json_v11 = generate_entity(&["admin".to_string()], "v11").expect("generate");
+        let json_stale = generate_entity(&["admin".to_string()], "stale").expect("generate");
+        store.swap_at_version(&json_v10, 10).expect("v10");
+        store.swap_at_version(&json_v11, 11).expect("v11 wins");
+        let applied = store
+            .swap_if_watermark_eq(&json_stale, 10)
+            .expect("skip is Ok");
+        assert!(!applied, "stale dirty refresh must not install");
+        assert_eq!(store.local_published_version(), 11);
+        let snap = store.snapshot().expect("snapshot");
+        assert!(
+            snap.store()
+                .contains_repository(&r#"Repository::"v11""#.parse().unwrap()),
+            "versioned snapshot content must survive a racing dirty refresh"
+        );
+        assert!(
+            !snap
+                .store()
+                .contains_repository(&r#"Repository::"stale""#.parse().unwrap()),
+            "stale dirty tree must not replace the newer snapshot"
+        );
+    }
+
+    #[test]
+    fn shared_store_dirty_refresh_applies_when_watermark_holds() {
+        let store = SharedEntityStore::new();
+        let json_v10 = generate_entity(&["admin".to_string()], "v10").expect("generate");
+        let json_delete = generate_entity(&["admin".to_string()], "deleted-acl").expect("generate");
+        store.swap_at_version(&json_v10, 10).expect("v10");
+        let applied = store.swap_if_watermark_eq(&json_delete, 10).expect("apply");
+        assert!(applied);
+        assert_eq!(store.local_published_version(), 10);
+        let snap = store.snapshot().expect("snapshot");
+        assert!(
+            snap.store()
+                .contains_repository(&r#"Repository::"deleted-acl""#.parse().unwrap()),
+            "dirty refresh must install latest ACL when no versioned publish raced"
+        );
     }
 }
