@@ -124,6 +124,49 @@ pub struct MergePayload {
     pub requester: Option<String>,
 }
 
+/// Serializable push descriptor (trunk-push 1.3). `n` is the client-baseline
+/// first-parent distance `new_id → old_id` and is never recomputed from
+/// object-store knownness.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PushPayload {
+    pub commits: Vec<String>,
+    pub fork_base: Option<String>,
+    pub n: u32,
+}
+
+impl PushPayload {
+    pub fn from_chain(
+        old_id: &str,
+        new_id: &str,
+        chain: &crate::ceres::pack::push_chain::PushChain,
+    ) -> Self {
+        let n = if old_id == new_id {
+            0
+        } else {
+            u32::try_from(chain.ordered_commits.len()).unwrap_or(u32::MAX)
+        };
+        Self {
+            commits: chain
+                .ordered_commits
+                .iter()
+                .map(|c| c.id.to_string())
+                .collect(),
+            fork_base: Some(chain.base.clone()),
+            n,
+        }
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        serde_json::to_value(self).unwrap_or(JsonValue::Null)
+    }
+}
+
+/// Context required to execute a claimed `kind=push` round under B3.
+pub struct PushExecContext {
+    pub storage: crate::jupiter::storage::Storage,
+    pub git_object_cache: std::sync::Arc<crate::ceres::api_service::cache::GitObjectCache>,
+}
+
 /// Context required to execute a claimed `kind=merge` round under B3.
 pub struct MergeExecContext {
     pub storage: crate::jupiter::storage::Storage,
@@ -590,7 +633,12 @@ impl PushQueueService {
             ));
         }
 
-        // Trunk morphology gates (test switch).
+        if req.is_delete || req.new_id == ZERO_ID {
+            return Err(MegaError::Other(
+                "trunk push rejects delete commands; remove content via a parent-path commit"
+                    .into(),
+            ));
+        }
         let ref_name = req.ref_name.as_deref().unwrap_or("");
         if ref_name != MEGA_BRANCH_NAME {
             return Err(MegaError::Other(format!(
@@ -603,11 +651,13 @@ impl PushQueueService {
                     .into(),
             ));
         }
-        if req.is_delete || req.new_id == ZERO_ID {
-            return Err(MegaError::Other(
-                "trunk push rejects delete commands; remove content via a parent-path commit"
-                    .into(),
-            ));
+        if let Some(n) = req.payload.get("n").and_then(JsonValue::as_u64)
+            && n > crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS as u64
+        {
+            return Err(MegaError::Other(format!(
+                "push introduces more than {} commits in one chain; split the changes into smaller pushes or squash and re-push",
+                crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS
+            )));
         }
         Ok(())
     }
@@ -864,13 +914,16 @@ impl PushQueueService {
     ///
     /// `attach_ctx` is required when the claimed row is `kind=attach` (TP-08);
     /// `merge_ctx` is required when the claimed row is `kind=merge` and the
-    /// caller wants the real merge writer (TP-07). Tests that enqueue `kind=merge`
-    /// without a context keep the B3 skeleton stub.
+    /// caller wants the real merge writer (TP-07). `push_ctx` is required when
+    /// the claimed row is `kind=push` and the caller wants the real push writer
+    /// (TP-12). Tests that enqueue `kind=merge` without a context keep the B3
+    /// skeleton stub.
     pub async fn execute_b3(
         &self,
         req: ExecuteRequest,
         attach_ctx: Option<&AttachExecContext>,
         merge_ctx: Option<&MergeExecContext>,
+        push_ctx: Option<&PushExecContext>,
     ) -> Result<ExecuteOutcome, MegaError> {
         use sea_orm::{EntityTrait, TransactionTrait};
 
@@ -986,6 +1039,11 @@ impl PushQueueService {
                         .is_some()
                 {
                     return self.b3_refuse_stale_main_tree(txn, req.id, &row.path).await;
+                }
+                if let Some(ctx) = push_ctx {
+                    return self
+                        .b3_execute_push(txn, &row, ctx, cur_commit, cur_tree, root.as_ref())
+                        .await;
                 }
                 tracing::trace!(policy = ?self.push_policy, id = req.id, "B3 push stub");
             }
@@ -1516,6 +1574,372 @@ impl PushQueueService {
             id: row.id,
             landed_commit_id,
             root_cas_writes: 1,
+        })
+    }
+
+    async fn b3_execute_push(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &PushExecContext,
+        cur_commit: Option<&str>,
+        cur_tree: Option<&str>,
+        root: Option<&crate::callisto::mega_refs::Model>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        let id = row.id;
+        match self
+            .b3_execute_push_inner(txn, row, ctx, cur_commit, cur_tree, root)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                tracing::error!(id, error = %e, "B3 push aborted with Err; terminalizing PushFailure");
+                self.terminalize_push_failure(id, &e.to_string()).await
+            }
+        }
+    }
+
+    async fn terminalize_push_failure(
+        &self,
+        id: i64,
+        message: &str,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        let conn = self.push_queue_storage.get_connection();
+        let txn = conn.begin().await?;
+        let updated =
+            PushQueueStorage::mark_failed_if_running_in_txn(&txn, id, "PushFailure", message)
+                .await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(
+                id,
+                "B3 push Err recovery: Failed update hit 0 rows (already terminal?)"
+            );
+            return Ok(self.outcome_claim_lost(id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Failed {
+            id,
+            failure: "PushFailure".into(),
+            message: message.to_owned(),
+        })
+    }
+
+    async fn b3_execute_push_inner(
+        &self,
+        txn: sea_orm::DatabaseTransaction,
+        row: &push_queue::Model,
+        ctx: &PushExecContext,
+        cur_commit: Option<&str>,
+        cur_tree: Option<&str>,
+        root: Option<&crate::callisto::mega_refs::Model>,
+    ) -> Result<ExecuteOutcome, MegaError> {
+        use std::{path::PathBuf, str::FromStr};
+
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{commit::Commit, tree::Tree},
+        };
+
+        use crate::{
+            ceres::api_service::{
+                mono_api_service::{MonoApiService, MonoServiceLogic, PushApplyArgs},
+                tree_ops,
+            },
+            jupiter::utils::converter::FromMegaModel,
+        };
+
+        let payload: PushPayload = serde_json::from_value(row.payload.clone())
+            .map_err(|e| MegaError::Other(format!("push payload deserialize failed: {e}")))?;
+
+        let n0 = row.old_id == row.new_id;
+        if n0 != (payload.n == 0) {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "SystemError",
+                    "push descriptor n invariant: n=0 iff old_id == new_id".into(),
+                )
+                .await;
+        }
+
+        let Some(root) = root else {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "PushFailure",
+                    "push requires an existing root ref".into(),
+                )
+                .await;
+        };
+
+        let path_row = self
+            .mono_storage
+            .get_main_ref_in_txn(&row.path, &txn)
+            .await?;
+
+        if path_row.is_none() {
+            if self
+                .mono_storage
+                .get_tombstone_in_txn(&row.path, MEGA_BRANCH_NAME, &txn)
+                .await?
+                .is_some()
+            {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "Conflict",
+                        "tombstone exists; advertise then fetch".into(),
+                    )
+                    .await;
+            }
+            if row.old_id != ZERO_ID {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "PushFailure",
+                        "cannot update missing path; create requires old_id=ZERO_ID".into(),
+                    )
+                    .await;
+            }
+            if payload.n == 0 {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "PushFailure",
+                        "create is unreachable for n=0".into(),
+                    )
+                    .await;
+            }
+        } else if row.old_id == ZERO_ID {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "PushFailure",
+                    "path materialized while waiting; fetch then re-push".into(),
+                )
+                .await;
+        }
+
+        if payload.n == 0 {
+            let Some(pref) = path_row.as_ref() else {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "PushFailure",
+                        "n=0 requires an existing path tip".into(),
+                    )
+                    .await;
+            };
+            if row.new_id != pref.ref_commit_hash {
+                return self
+                    .b3_fail_merge(
+                        txn,
+                        row.id,
+                        "PushFailure",
+                        "non-fast-forward: new_id does not match current tip".into(),
+                    )
+                    .await;
+            }
+            PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+            let cas_ok = self
+                .mono_storage
+                .cas_update_root_main_ref_in_txn(
+                    &txn,
+                    cur_commit,
+                    cur_tree,
+                    &root.ref_commit_hash,
+                    &root.ref_tree_hash,
+                )
+                .await?;
+            if !cas_ok {
+                self.note_cas_assert_failure();
+                PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
+                let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                    &txn,
+                    row.id,
+                    "QueueBypassDetected",
+                    "root CAS affected 0 rows",
+                )
+                .await?;
+                if !updated {
+                    tracing::error!(id = row.id, "B3 push N=0 CAS fail-closed: 0 rows");
+                }
+                PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                txn.commit().await?;
+                return Ok(ExecuteOutcome::BypassDetected { id: row.id });
+            }
+            let updated =
+                PushQueueStorage::mark_done_if_running_in_txn(&txn, row.id, &pref.ref_commit_hash)
+                    .await?;
+            if !updated {
+                txn.rollback().await?;
+                return Ok(self.outcome_claim_lost(row.id));
+            }
+            PushQueueStorage::notify_mono_write_queue(&txn).await?;
+            txn.commit().await?;
+            return Ok(ExecuteOutcome::Done {
+                id: row.id,
+                landed_commit_id: pref.ref_commit_hash.clone(),
+                root_cas_writes: 1,
+            });
+        }
+
+        if let Some(pref) = path_row.as_ref()
+            && pref.ref_commit_hash != row.old_id
+        {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "PushFailure",
+                    "non-fast-forward: ref_commit_hash does not match old_id".into(),
+                )
+                .await;
+        }
+
+        let tip_model = self
+            .mono_storage
+            .get_commit_by_hash(&row.new_id)
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("push new_id {} not found", row.new_id)))?;
+        let tip_commit = Commit::from_mega_model(tip_model);
+        let tip_tree_id = tip_commit.tree_id;
+        let creating = path_row.is_none();
+
+        let resolved = self
+            .mono_storage
+            .resolve_path_tree_hash_in_txn(&root.ref_tree_hash, &row.path, &txn)
+            .await?;
+        if creating
+            && let Some(resolved) = resolved.as_deref()
+            && resolved != tip_tree_id.to_string()
+        {
+            return self
+                .b3_fail_merge(
+                    txn,
+                    row.id,
+                    "PushFailure",
+                    "create tree must match resolve(root, P) or the path must be absent from the root tree".into(),
+                )
+                .await;
+        }
+
+        let mono_api = MonoApiService {
+            storage: ctx.storage.clone(),
+            git_object_cache: ctx.git_object_cache.clone(),
+        };
+        let root_tree = Tree::from_mega_model(
+            self.mono_storage
+                .get_tree_by_hash(&root.ref_tree_hash)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(format!("root tree {} not found", root.ref_tree_hash))
+                })?,
+        );
+        let normalized = MonoServiceLogic::clean_path_str(&row.path);
+        let path = PathBuf::from(&normalized);
+        let parent = path
+            .parent()
+            .ok_or_else(|| MegaError::Other(format!("Invalid push path: {normalized}")))?;
+
+        let (update_chain, extra_blob) = if creating {
+            tree_ops::search_tree_for_update_or_create_from_root(&mono_api, parent, root_tree)
+                .await
+                .map_err(|e| MegaError::Other(e.to_string()))?
+        } else {
+            let chain = tree_ops::search_tree_for_update_from_root(&mono_api, parent, root_tree)
+                .await
+                .map_err(|e| MegaError::Other(e.to_string()))?;
+            (chain, None)
+        };
+
+        let result = if creating {
+            MonoServiceLogic::build_result_by_chain_inserting(path, update_chain, tip_tree_id)
+        } else {
+            MonoServiceLogic::build_result_by_chain(path, update_chain, tip_tree_id)
+        }
+        .map_err(|e| MegaError::Other(e.to_string()))?;
+
+        let (landed_at_p, extra_commits) = if payload.n == 1 {
+            (row.new_id.clone(), Vec::new())
+        } else if creating {
+            let squash = Commit::from_tree_id(tip_tree_id, vec![], "trunk squash");
+            (squash.id.to_string(), vec![squash])
+        } else {
+            let parent_hash =
+                ObjectHash::from_str(&row.old_id).map_err(|e| MegaError::Other(e.to_string()))?;
+            let squash = Commit::from_tree_id(tip_tree_id, vec![parent_hash], "trunk squash");
+            (squash.id.to_string(), vec![squash])
+        };
+
+        PushQueueStorage::savepoint(&txn, "b3_kind").await?;
+        let apply = mono_api
+            .apply_push_in_txn(
+                &txn,
+                PushApplyArgs {
+                    result: &result,
+                    path_p: &normalized,
+                    landed_at_p: &landed_at_p,
+                    expected_root_commit: cur_commit,
+                    expected_root_tree: cur_tree,
+                    extra_commits,
+                    extra_blob,
+                },
+            )
+            .await;
+        let (landed_commit_id, root_cas_writes) = match apply {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                PushQueueStorage::rollback_to_savepoint(&txn, "b3_kind").await?;
+                if msg.contains(MonoApiService::MERGE_ROOT_CAS_MISS) {
+                    self.note_cas_assert_failure();
+                    PushQueueStorage::set_hard_stopped_in_txn(&txn, true).await?;
+                    let updated = PushQueueStorage::mark_failed_if_running_in_txn(
+                        &txn,
+                        row.id,
+                        "QueueBypassDetected",
+                        "root CAS affected 0 rows",
+                    )
+                    .await?;
+                    if !updated {
+                        tracing::error!(id = row.id, "B3 push CAS fail-closed: 0 rows");
+                    }
+                    PushQueueStorage::notify_mono_write_queue(&txn).await?;
+                    txn.commit().await?;
+                    return Ok(ExecuteOutcome::BypassDetected { id: row.id });
+                }
+                return self.b3_fail_merge(txn, row.id, "PushFailure", msg).await;
+            }
+        };
+
+        self.mono_storage
+            .remove_none_cl_refs_in_txn(&normalized, &txn)
+            .await?;
+
+        let updated =
+            PushQueueStorage::mark_done_if_running_in_txn(&txn, row.id, &landed_commit_id).await?;
+        if !updated {
+            txn.rollback().await?;
+            tracing::error!(id = row.id, "B3 push Done update hit 0 rows after fencing");
+            return Ok(self.outcome_claim_lost(row.id));
+        }
+        PushQueueStorage::notify_mono_write_queue(&txn).await?;
+        txn.commit().await?;
+        Ok(ExecuteOutcome::Done {
+            id: row.id,
+            landed_commit_id,
+            root_cas_writes,
         })
     }
 
@@ -2137,6 +2561,23 @@ mod tests {
             .await
             .expect_err("delete");
         assert!(del.to_string().contains("delete"));
+        assert!(del.to_string().contains("parent-path"));
+
+        let other = svc
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: "refs/heads/dev→0".into(),
+                path: "/project/x".into(),
+                old_id: "a".repeat(40),
+                new_id: ZERO_ID.into(),
+                requester: None,
+                payload: json!({}),
+                ref_name: Some("refs/heads/dev".into()),
+                is_delete: true,
+            })
+            .await
+            .expect_err("non-main delete");
+        assert!(other.to_string().contains("parent-path"));
     }
 
     #[tokio::test]
@@ -2532,6 +2973,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2571,6 +3013,7 @@ mod tests {
                     },
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -2605,6 +3048,7 @@ mod tests {
                     advance_tree: Some("f".repeat(40)),
                     ..Default::default()
                 },
+                None,
                 None,
                 None,
             )
@@ -2663,6 +3107,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2701,6 +3146,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2723,6 +3169,7 @@ mod tests {
                     force_conflict: true,
                     ..Default::default()
                 },
+                None,
                 None,
                 None,
             )
@@ -2766,6 +3213,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2800,6 +3248,7 @@ mod tests {
                     advance_tree: Some(new_t.clone()),
                     ..Default::default()
                 },
+                None,
                 None,
                 None,
             )

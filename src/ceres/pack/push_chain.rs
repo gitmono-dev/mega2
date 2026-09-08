@@ -323,6 +323,79 @@ impl PushChain {
         }
     }
 
+    /// Walk first-parent from a server-known tip to `cmd.old_id` (GAP-14).
+    ///
+    /// Used when the pack is empty or carries only already-known objects so
+    /// [`Self::resolve`] would return [`PushChainResolution::Noop`]. `n` is
+    /// the resulting increment length (`ordered_commits.len()`), or `0` when
+    /// `old_id == new_id`. Server-knownness does not change `n`.
+    pub async fn from_known_tip(
+        cmd: &RefCommand,
+        tip: Commit,
+        storage: &MonoStorage,
+    ) -> Result<Self, MegaError> {
+        if cmd.new_id != tip.id.to_string() {
+            return Err(MegaError::Other(format!(
+                "known-tip chain expected new_id {} but tip is {}",
+                cmd.new_id, tip.id
+            )));
+        }
+        if cmd.old_id == cmd.new_id {
+            return Ok(PushChain {
+                base: cmd.old_id.clone(),
+                tip: tip.clone(),
+                ordered_commits: vec![tip],
+            });
+        }
+
+        let mut path: Vec<Commit> = vec![tip.clone()];
+        let mut current = tip.clone();
+        loop {
+            if path.len() > MAX_CL_CHAIN_COMMITS {
+                return Err(MegaError::Other(format!(
+                    "push introduces more than {MAX_CL_CHAIN_COMMITS} commits in one chain; \
+                     split the changes into smaller pushes or squash and re-push"
+                )));
+            }
+            let Some(parent_id) = current.parent_commit_ids.first().map(ToString::to_string) else {
+                if cmd.old_id == ZERO_ID {
+                    break;
+                }
+                return Err(MegaError::Other(format!(
+                    "push chain from {} never reached old_id {}; fetch and rebase onto the advertised tip",
+                    cmd.new_id, cmd.old_id
+                )));
+            };
+            if parent_id == cmd.old_id {
+                break;
+            }
+            let parent = storage
+                .get_commit_by_hash(&parent_id)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(format!(
+                        "push chain is broken: commit {parent_id} (parent of {}) is missing from storage",
+                        current.id
+                    ))
+                })?;
+            current = Commit::from_mega_model(parent);
+            path.push(current.clone());
+        }
+
+        let base = if cmd.old_id != ZERO_ID {
+            cmd.old_id.clone()
+        } else {
+            path.last()
+                .and_then(|c| c.parent_commit_ids.first().map(ToString::to_string))
+                .unwrap_or_else(|| ZERO_ID.to_string())
+        };
+        Ok(PushChain {
+            base,
+            tip,
+            ordered_commits: path,
+        })
+    }
+
     /// Validate the resolved chain against commit storage (plan-20260827
     /// MC-03). Every rejection path is fail-closed with an actionable
     /// message. Wired into the receive-pack path by MC-06:

@@ -481,6 +481,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -595,6 +596,7 @@ mod tests {
                     id,
                     ..Default::default()
                 },
+                None,
                 None,
                 None,
             )
@@ -858,6 +860,7 @@ mod tests {
                     id: prior,
                     ..Default::default()
                 },
+                None,
                 None,
                 None,
             )

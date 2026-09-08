@@ -359,10 +359,20 @@ pub async fn search_tree_for_update_or_create<T: ApiHandler + ?Sized>(
     handler: &T,
     path: &Path,
 ) -> Result<(Vec<Arc<Tree>>, Option<Blob>), GitError> {
+    let root_tree = handler.get_root_tree(None).await?;
+    search_tree_for_update_or_create_from_root(handler, path, root_tree).await
+}
+
+/// Like [`search_tree_for_update_or_create`], but starts from a lock-held root
+/// tree instead of re-reading `main@/` (TP-12 B3 create).
+pub async fn search_tree_for_update_or_create_from_root<T: ApiHandler + ?Sized>(
+    handler: &T,
+    path: &Path,
+    root_tree: Tree,
+) -> Result<(Vec<Arc<Tree>>, Option<Blob>), GitError> {
     let relative_path = handler
         .strip_relative(path)
         .map_err(|e| GitError::CustomError(e.to_string()))?;
-    let root_tree = handler.get_root_tree(None).await?;
 
     let mut existing_chain: Vec<Tree> = vec![root_tree.clone()];
     let mut existing_names: Vec<String> = Vec::new();

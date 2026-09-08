@@ -46,6 +46,7 @@ use crate::{
         errors::MegaError,
         utils::{self, MEGA_BRANCH_NAME, ZERO_ID},
     },
+    config::PushPolicy,
     contract::{
         api::common::Pagination,
         policy::notify::{
@@ -1133,7 +1134,14 @@ impl Monorepo {
     /// the ADR-MC-05 no-op (empty pack / known `new_id`) — callers must leave
     /// CL refs and the CL untouched; the notice is logged and stored on the
     /// first (cache-miss) build only.
-    async fn build_push_chain(&self, cmd: &RefCommand) -> Result<Option<PushChain>, MegaError> {
+    ///
+    /// Under `push_policy=trunk` (GAP-14 / TP-12) a Noop still yields a chain
+    /// walked from storage so B1/B3 can persist `{commits, fork_base, n}`.
+    /// Review morphology keeps the Noop short-circuit (hard constraint 8).
+    pub(crate) async fn build_push_chain(
+        &self,
+        cmd: &RefCommand,
+    ) -> Result<Option<PushChain>, MegaError> {
         if let Some(cached) = self
             .push_chain_cache
             .lock()
@@ -1162,22 +1170,32 @@ impl Monorepo {
             cmd,
             &pack_commit_ids,
             &new_commit_ids,
-            tip_commit,
+            tip_commit.clone(),
             &self.storage.mono_storage(),
         )
         .await?
         {
             PushChainResolution::Chain(chain) => Some(*chain),
             PushChainResolution::Noop { notice } => {
-                // GC-MC-14: the no-op is logged, not silent; the notice also
-                // reaches the git client as a `remote:` line (sideband
-                // channel 2, see `receive_pack_notice`).
-                tracing::info!(ref_name = %cmd.ref_name, new_id = %cmd.new_id, "{notice}");
-                *self
-                    .no_op_notice
-                    .lock()
-                    .expect("no_op_notice lock poisoned") = Some(notice);
-                None
+                if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+                    let tip = tip_commit.ok_or_else(|| {
+                        MegaError::Other(format!(
+                            "trunk Noop bridge expected a known tip for {}",
+                            cmd.new_id
+                        ))
+                    })?;
+                    Some(PushChain::from_known_tip(cmd, tip, &self.storage.mono_storage()).await?)
+                } else {
+                    // GC-MC-14: the no-op is logged, not silent; the notice also
+                    // reaches the git client as a `remote:` line (sideband
+                    // channel 2, see `receive_pack_notice`).
+                    tracing::info!(ref_name = %cmd.ref_name, new_id = %cmd.new_id, "{notice}");
+                    *self
+                        .no_op_notice
+                        .lock()
+                        .expect("no_op_notice lock poisoned") = Some(notice);
+                    None
+                }
             }
         };
         self.push_chain_cache

@@ -68,7 +68,7 @@ use tracing::debug;
 use crate::{
     bellatrix::Bellatrix,
     callisto::{
-        mega_cl, mega_refs, mega_tag, mega_tree,
+        mega_blob, mega_cl, mega_refs, mega_tag, mega_tree,
         sea_orm_active_enums::{
             CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, PushQueueKindEnum, QueueFailureTypeEnum,
             QueueStatusEnum,
@@ -409,6 +409,16 @@ pub struct TreeUpdateResult {
     pub ref_updates: Vec<RefUpdate>,
 }
 
+pub(crate) struct PushApplyArgs<'a> {
+    pub result: &'a TreeUpdateResult,
+    pub path_p: &'a str,
+    pub landed_at_p: &'a str,
+    pub expected_root_commit: Option<&'a str>,
+    pub expected_root_tree: Option<&'a str>,
+    pub extra_commits: Vec<Commit>,
+    pub extra_blob: Option<Blob>,
+}
+
 pub struct RefUpdate {
     path: String,
     tree_id: ObjectHash,
@@ -744,6 +754,58 @@ impl MonoServiceLogic {
                 .ok_or_else(|| GitError::CustomError("Empty update chain".into()))?;
 
             let new_tree = MonoServiceLogic::update_tree_hash(tree, name, updated_tree_hash)?;
+            updated_tree_hash = new_tree.id;
+            updated_trees.push(new_tree);
+        }
+
+        Ok(TreeUpdateResult {
+            updated_trees,
+            ref_updates,
+        })
+    }
+
+    /// Like [`Self::build_result_by_chain`], but inserts a missing Tree entry
+    /// (create semantics) instead of requiring the child name to already exist.
+    pub fn build_result_by_chain_inserting(
+        mut path: PathBuf,
+        mut update_chain: Vec<Arc<Tree>>,
+        mut updated_tree_hash: ObjectHash,
+    ) -> Result<TreeUpdateResult, GitError> {
+        let mut updated_trees = Vec::new();
+        let mut ref_updates = Vec::new();
+        let mut path_str = path.to_string_lossy().to_string();
+
+        loop {
+            let clean_path = MonoServiceLogic::clean_path_str(&path_str);
+            let ref_path = if clean_path == "/" || clean_path.starts_with('/') {
+                clean_path
+            } else {
+                format!("/{clean_path}")
+            };
+
+            ref_updates.push(RefUpdate {
+                path: ref_path,
+                tree_id: updated_tree_hash,
+            });
+
+            if update_chain.is_empty() {
+                break;
+            }
+
+            let cloned_path = path.clone();
+            let name = cloned_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| GitError::CustomError("Invalid path".into()))?;
+            path.pop();
+            path_str = path.to_string_lossy().to_string();
+
+            let tree = update_chain
+                .pop()
+                .ok_or_else(|| GitError::CustomError("Empty update chain".into()))?;
+
+            let new_tree =
+                MonoServiceLogic::insert_or_replace_tree_hash(tree, name, updated_tree_hash)?;
             updated_tree_hash = new_tree.id;
             updated_trees.push(new_tree);
         }
@@ -2406,6 +2468,7 @@ impl MonoApiService {
                             },
                             None,
                             Some(ctx),
+                            None,
                         )
                         .await
                         .map_err(|e| GitError::CustomError(e.to_string()))?;
@@ -3208,6 +3271,156 @@ impl MonoApiService {
             .map_err(|e| GitError::CustomError(e.to_string()))?;
 
         Ok((landed_commit_id, root_cas_writes))
+    }
+
+    /// Transactional apply used by push B3 (TP-12): upserts `main@P` and
+    /// ancestor refs, synthesizes ancestor roll-up commits only when the
+    /// tree actually changed, and performs exactly one root CAS (advance or
+    /// net-zero same-value write).
+    pub(crate) async fn apply_push_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        args: PushApplyArgs<'_>,
+    ) -> Result<(String, u32), GitError> {
+        use std::str::FromStr;
+
+        use sea_orm::IntoActiveModel;
+
+        let PushApplyArgs {
+            result,
+            path_p,
+            landed_at_p,
+            expected_root_commit,
+            expected_root_tree,
+            extra_commits,
+            extra_blob,
+        } = args;
+        let storage = self.storage.mono_storage();
+        let path_p = MonoServiceLogic::clean_path_str(path_p);
+        let mut commits = extra_commits;
+        let mut other_updates: Vec<RefUpdateData> = Vec::new();
+        let mut root_tree_new: Option<ObjectHash> = None;
+
+        for update in &result.ref_updates {
+            let clean = MonoServiceLogic::clean_path_str(&update.path);
+            if clean == path_p {
+                other_updates.push(RefUpdateData {
+                    path: path_p.clone(),
+                    ref_name: MEGA_BRANCH_NAME.to_owned(),
+                    commit_id: landed_at_p.to_owned(),
+                    tree_hash: update.tree_id.to_string(),
+                });
+                continue;
+            }
+            if clean == "/" {
+                root_tree_new = Some(update.tree_id);
+                continue;
+            }
+            let existing = storage
+                .get_main_ref_in_txn(&clean, txn)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+            if let Some(row) = existing.as_ref()
+                && row.ref_tree_hash == update.tree_id.to_string()
+            {
+                continue;
+            }
+            let parent_ids = match existing.as_ref() {
+                Some(row) => vec![
+                    ObjectHash::from_str(&row.ref_commit_hash)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?,
+                ],
+                None => Vec::new(),
+            };
+            let commit = Commit::from_tree_id(update.tree_id, parent_ids, "trunk ancestor roll-up");
+            other_updates.push(RefUpdateData {
+                path: clean,
+                ref_name: MEGA_BRANCH_NAME.to_owned(),
+                commit_id: commit.id.to_string(),
+                tree_hash: update.tree_id.to_string(),
+            });
+            commits.push(commit);
+        }
+
+        let Some(new_root_tree) = root_tree_new else {
+            return Err(GitError::CustomError(
+                "push B3 expected a root tree update in the roll-up".into(),
+            ));
+        };
+        let new_root_tree_str = new_root_tree.to_string();
+        let root_unchanged = expected_root_tree == Some(new_root_tree_str.as_str());
+        let root_commit = if root_unchanged {
+            expected_root_commit
+                .ok_or_else(|| {
+                    GitError::CustomError("push B3 missing expected root commit".into())
+                })?
+                .to_owned()
+        } else {
+            let parent_ids = match expected_root_commit {
+                Some(c) => vec![
+                    ObjectHash::from_str(c).map_err(|e| GitError::CustomError(e.to_string()))?,
+                ],
+                None => Vec::new(),
+            };
+            let commit = Commit::from_tree_id(new_root_tree, parent_ids, "trunk ancestor roll-up");
+            let id = commit.id.to_string();
+            commits.push(commit);
+            id
+        };
+
+        let cas_ok = storage
+            .cas_update_root_main_ref_in_txn(
+                txn,
+                expected_root_commit,
+                expected_root_tree,
+                &root_commit,
+                &new_root_tree_str,
+            )
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        if !cas_ok {
+            return Err(GitError::CustomError(Self::MERGE_ROOT_CAS_MISS.into()));
+        }
+
+        storage
+            .batch_upsert_by_path_in_txn(txn, other_updates)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        if !commits.is_empty() {
+            storage
+                .save_mega_commits(commits, Some(txn))
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+        }
+
+        let save_trees: Vec<mega_tree::ActiveModel> = result
+            .updated_trees
+            .clone()
+            .into_iter()
+            .map(|save_t| {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+                tree_model.commit_id = landed_at_p.to_owned();
+                tree_model.into()
+            })
+            .collect();
+        if !save_trees.is_empty() {
+            storage
+                .batch_save_model_with_txn(save_trees, Some(txn))
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+        }
+
+        if let Some(blob) = extra_blob {
+            let mut model: mega_blob::Model = blob.into_mega_model(EntryMeta::new());
+            model.commit_id = landed_at_p.to_owned();
+            storage
+                .batch_save_model_with_txn(vec![model.into_active_model()], Some(txn))
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?;
+        }
+
+        Ok((landed_at_p.to_owned(), 1))
     }
 
     /// The signing capability for server-synthesized commits that enter a CL
@@ -8030,6 +8243,7 @@ mod mc09_tests {
                 },
                 None,
                 Some(&ctx),
+                None,
             )
             .await
             .unwrap();
@@ -8157,6 +8371,7 @@ mod mc09_tests {
                 },
                 None,
                 Some(&ctx),
+                None,
             )
             .await
             .unwrap();
@@ -8184,6 +8399,7 @@ mod mc09_tests {
                 },
                 None,
                 Some(&ctx),
+                None,
             )
             .await
             .unwrap();
@@ -8242,6 +8458,7 @@ mod mc09_tests {
                 },
                 None,
                 Some(&ctx),
+                None,
             )
             .await
             .unwrap();
@@ -8290,6 +8507,7 @@ mod mc09_tests {
                 },
                 None,
                 Some(&ctx),
+                None,
             )
             .await
             .unwrap();
@@ -8344,6 +8562,7 @@ mod mc09_tests {
                 },
                 None,
                 Some(&ctx),
+                None,
             )
             .await
             .unwrap();
@@ -8371,6 +8590,7 @@ mod mc09_tests {
                     },
                     None,
                     Some(&ctx),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -8478,7 +8698,8 @@ mod tests {
         config::{MergeWriter, PushPolicy, testing::isolated_config},
         jupiter::{
             service::push_queue_service::{
-                EnqueueRequest, ExecuteOutcome, ExecuteRequest, push_operation_id,
+                EnqueueRequest, ExecuteOutcome, ExecuteRequest, PushExecContext, PushPayload,
+                push_operation_id,
             },
             storage::push_queue_storage::{ClaimOutcome, EnqueueOutcome},
             tests::test_storage_with_config,
@@ -8671,6 +8892,7 @@ mod tests {
                     id,
                     ..Default::default()
                 },
+                None,
                 None,
                 None,
             )
@@ -8937,5 +9159,846 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn tp12_ctx(storage: &Storage) -> PushExecContext {
+        PushExecContext {
+            git_object_cache: test_service(storage).git_object_cache,
+            storage: storage.clone(),
+        }
+    }
+
+    async fn tp12_enqueue_claim(
+        storage: &Storage,
+        path: &str,
+        old_id: &str,
+        new_id: &str,
+        payload: &PushPayload,
+    ) -> i64 {
+        let outcome = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: push_operation_id(old_id, new_id),
+                path: path.into(),
+                old_id: old_id.into(),
+                new_id: new_id.into(),
+                requester: None,
+                payload: payload.to_json(),
+                ref_name: Some(MEGA_BRANCH_NAME.into()),
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        let EnqueueOutcome::Inserted { id } = outcome else {
+            panic!("insert push {outcome:?}");
+        };
+        assert_eq!(
+            storage
+                .push_queue_service
+                .storage()
+                .claim_for_execution(id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        id
+    }
+
+    async fn tp12_exec(storage: &Storage, id: i64) -> ExecuteOutcome {
+        let ctx = tp12_ctx(storage);
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Root + `main@/{dir}` whose tree is `child` and tip is `path_commit`.
+    async fn tp12_path_fixture(
+        dir: &str,
+        path_commit_msg: &str,
+    ) -> (
+        tempfile::TempDir,
+        Storage,
+        Tree,
+        Commit,
+        Tree,
+        Commit,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tp11_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items(vec![blob_item(
+            "x.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .expect("child");
+        let root_tree = Tree::from_tree_items(vec![
+            blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            TreeItem::new(TreeItemMode::Tree, child.id, dir.to_string()),
+        ])
+        .expect("root");
+        let root_commit = Commit::from_tree_id(root_tree.id, vec![], "root");
+        let path_commit = Commit::from_tree_id(child.id, vec![], path_commit_msg);
+        mono.save_mega_trees(vec![child.clone(), root_tree.clone()], root_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![root_commit.clone(), path_commit.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &root_tree, &root_commit.id.to_string()).await;
+        let path = format!("/{dir}");
+        mono.save_refs(
+            mega_refs::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                path: path.clone(),
+                ref_name: MEGA_BRANCH_NAME.to_string(),
+                ref_commit_hash: path_commit.id.to_string(),
+                ref_tree_hash: child.id.to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+                is_cl: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        (
+            temp,
+            storage,
+            root_tree,
+            root_commit,
+            child,
+            path_commit,
+            path,
+        )
+    }
+
+    #[tokio::test]
+    async fn tp12_n1_fast_forward_lands_client_tip() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _root_tree, _root_c, _child, path_commit, path) =
+            tp12_path_fixture("p12n1", "path tip").await;
+        let new_child = Tree::from_tree_items(vec![blob_item(
+            "y.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![path_commit.id], "n1");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![new_commit.id.to_string()],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 1,
+        };
+        let id = tp12_enqueue_claim(
+            &storage,
+            &path,
+            &path_commit.id.to_string(),
+            &new_commit.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage, id).await;
+        match exec {
+            ExecuteOutcome::Done {
+                landed_commit_id,
+                root_cas_writes,
+                ..
+            } => {
+                assert_eq!(landed_commit_id, new_commit.id.to_string());
+                assert_eq!(root_cas_writes, 1);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, new_commit.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn tp12_n2_known_objects_still_squash_and_done_replay() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _root_tree, _root_c, _child, path_commit, path) =
+            tp12_path_fixture("p12n2", "path tip").await;
+        let mid_tree = Tree::from_tree_items(vec![blob_item(
+            "m.txt",
+            "1111111111111111111111111111111111111111",
+        )])
+        .unwrap();
+        let tip_tree = Tree::from_tree_items(vec![blob_item(
+            "t.txt",
+            "2222222222222222222222222222222222222222",
+        )])
+        .unwrap();
+        let mid = Commit::from_tree_id(mid_tree.id, vec![path_commit.id], "mid");
+        let tip = Commit::from_tree_id(tip_tree.id, vec![mid.id], "tip");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![mid_tree, tip_tree], tip.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![mid.clone(), tip.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![tip.id.to_string(), mid.id.to_string()],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 2,
+        };
+        let old_id = path_commit.id.to_string();
+        let new_id = tip.id.to_string();
+        let id = tp12_enqueue_claim(&storage, &path, &old_id, &new_id, &payload).await;
+        let exec = tp12_exec(&storage, id).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = exec
+        else {
+            panic!("expected Done, got {exec:?}");
+        };
+        assert_ne!(landed_commit_id, new_id, "N>1 must squash, not FF");
+        let squash = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed_commit_id)
+            .await
+            .unwrap()
+            .expect("squash");
+        let parents: Vec<String> = serde_json::from_value(squash.parents_id).unwrap();
+        assert_eq!(parents, vec![old_id.clone()]);
+        let pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, landed_commit_id);
+        for cid in &payload.commits {
+            assert!(
+                storage
+                    .mono_storage()
+                    .get_commit_by_hash(cid)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "payload must reconstruct the original chain"
+            );
+        }
+
+        let replay = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: push_operation_id(&old_id, &new_id),
+                path: path.clone(),
+                old_id: old_id.clone(),
+                new_id: new_id.clone(),
+                requester: None,
+                payload: payload.to_json(),
+                ref_name: Some(MEGA_BRANCH_NAME.into()),
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        match replay {
+            EnqueueOutcome::Replay {
+                id: rid,
+                landed_commit_id: replayed,
+            } => {
+                let row = storage
+                    .push_queue_service
+                    .storage()
+                    .get_by_id(rid)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.status, PushQueueStatusEnum::Done);
+                assert_eq!(replayed.as_deref(), Some(landed_commit_id.as_str()));
+            }
+            other => panic!("expected Done replay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tp12_n0_matching_tip_is_noop_done() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _root_tree, _root_c, _child, path_commit, path) =
+            tp12_path_fixture("p12n0", "path tip").await;
+        let tip = path_commit.id.to_string();
+        let payload = PushPayload {
+            commits: vec![tip.clone()],
+            fork_base: Some(tip.clone()),
+            n: 0,
+        };
+        let root_before = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let id = tp12_enqueue_claim(&storage, &path, &tip, &tip, &payload).await;
+        let exec = tp12_exec(&storage, id).await;
+        match exec {
+            ExecuteOutcome::Done {
+                landed_commit_id,
+                root_cas_writes,
+                ..
+            } => {
+                assert_eq!(landed_commit_id, tip);
+                assert_eq!(root_cas_writes, 1);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let root_after = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_before.ref_commit_hash, root_after.ref_commit_hash);
+        assert_eq!(root_before.ref_tree_hash, root_after.ref_tree_hash);
+        let pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, tip);
+    }
+
+    #[tokio::test]
+    async fn tp12_net_zero_same_tree_cas_once() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _root_tree, _root_c, child, path_commit, path) =
+            tp12_path_fixture("p12nz", "path tip").await;
+        let new_commit = Commit::from_tree_id(child.id, vec![path_commit.id], "same tree n1");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![new_commit.id.to_string()],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 1,
+        };
+        let root_before = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let id = tp12_enqueue_claim(
+            &storage,
+            &path,
+            &path_commit.id.to_string(),
+            &new_commit.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage, id).await;
+        match exec {
+            ExecuteOutcome::Done {
+                landed_commit_id,
+                root_cas_writes,
+                ..
+            } => {
+                assert_eq!(landed_commit_id, new_commit.id.to_string());
+                assert_eq!(root_cas_writes, 1);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let root_after = storage
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_before.ref_commit_hash, root_after.ref_commit_hash);
+        assert_eq!(root_before.ref_tree_hash, root_after.ref_tree_hash);
+        let pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, new_commit.id.to_string());
+        assert_eq!(pref.ref_tree_hash, child.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn tp12_create_n1_and_n2_and_multilevel() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tp11_storage(temp.path()).await;
+        let keep = Tree::from_tree_items(vec![blob_item(
+            ".gitkeep",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap();
+        let root_c = Commit::from_tree_id(keep.id, vec![], "root");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![keep.clone()], root_c.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![root_c.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &keep, &root_c.id.to_string()).await;
+
+        let leaf = Tree::from_tree_items(vec![blob_item(
+            "f.txt",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )])
+        .unwrap();
+        let n1 = Commit::from_tree_id(leaf.id, vec![], "create n1");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![leaf.clone()], n1.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![n1.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![n1.id.to_string()],
+            fork_base: Some(ZERO_ID.to_string()),
+            n: 1,
+        };
+        let id =
+            tp12_enqueue_claim(&storage, "/p12c1", ZERO_ID, &n1.id.to_string(), &payload).await;
+        let exec = tp12_exec(&storage, id).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = exec
+        else {
+            panic!("create n1: {exec:?}");
+        };
+        assert_eq!(landed_commit_id, n1.id.to_string());
+        let pref = storage
+            .mono_storage()
+            .get_main_ref("/p12c1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, n1.id.to_string());
+
+        let mid_t = Tree::from_tree_items(vec![blob_item(
+            "m.txt",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )])
+        .unwrap();
+        let tip_t = Tree::from_tree_items(vec![blob_item(
+            "t.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .unwrap();
+        let mid = Commit::from_tree_id(mid_t.id, vec![], "c2 mid");
+        let tip = Commit::from_tree_id(tip_t.id, vec![mid.id], "c2 tip");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![mid_t, tip_t], tip.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![mid.clone(), tip.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![tip.id.to_string(), mid.id.to_string()],
+            fork_base: Some(ZERO_ID.to_string()),
+            n: 2,
+        };
+        let id =
+            tp12_enqueue_claim(&storage, "/p12c2", ZERO_ID, &tip.id.to_string(), &payload).await;
+        let exec = tp12_exec(&storage, id).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = exec
+        else {
+            panic!("create n2: {exec:?}");
+        };
+        assert_ne!(landed_commit_id, tip.id.to_string());
+        let squash = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed_commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let parents: Vec<String> = serde_json::from_value(squash.parents_id).unwrap();
+        assert!(parents.is_empty(), "create N>1 is parentless");
+        for cid in &payload.commits {
+            assert!(
+                storage
+                    .mono_storage()
+                    .get_commit_by_hash(cid)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let deep = Tree::from_tree_items(vec![blob_item(
+            "z.txt",
+            "ffffffffffffffffffffffffffffffffffffffff",
+        )])
+        .unwrap();
+        let deep_c = Commit::from_tree_id(deep.id, vec![], "deep");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![deep.clone()], deep_c.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![deep_c.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![deep_c.id.to_string()],
+            fork_base: Some(ZERO_ID.to_string()),
+            n: 1,
+        };
+        let id = tp12_enqueue_claim(
+            &storage,
+            "/a/b/c",
+            ZERO_ID,
+            &deep_c.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage, id).await;
+        let ExecuteOutcome::Done {
+            landed_commit_id, ..
+        } = exec
+        else {
+            panic!("multilevel: {exec:?}");
+        };
+        assert_eq!(landed_commit_id, deep_c.id.to_string());
+        let pref = storage
+            .mono_storage()
+            .get_main_ref("/a/b/c")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, deep_c.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn tp12_tombstone_and_wait_materialize_and_assertions() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tp11_storage(temp.path()).await;
+        let keep = Tree::from_tree_items(vec![blob_item(
+            ".gitkeep",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap();
+        let root_c = Commit::from_tree_id(keep.id, vec![], "root");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![keep.clone()], root_c.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![root_c.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &keep, &root_c.id.to_string()).await;
+
+        let leaf = Tree::from_tree_items(vec![blob_item(
+            "f.txt",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )])
+        .unwrap();
+        let n1 = Commit::from_tree_id(leaf.id, vec![], "create");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![leaf.clone()], n1.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![n1.clone()], None)
+            .await
+            .unwrap();
+        let payload = PushPayload {
+            commits: vec![n1.id.to_string()],
+            fork_base: Some(ZERO_ID.to_string()),
+            n: 1,
+        };
+        let id =
+            tp12_enqueue_claim(&storage, "/p12tb", ZERO_ID, &n1.id.to_string(), &payload).await;
+        storage
+            .mono_storage()
+            .upsert_tombstone("/p12tb", MEGA_BRANCH_NAME, &"c".repeat(40), &"d".repeat(40))
+            .await
+            .unwrap();
+        let exec = tp12_exec(&storage, id).await;
+        match exec {
+            ExecuteOutcome::Failed {
+                failure, message, ..
+            } => {
+                assert_eq!(failure, "Conflict");
+                assert!(message.contains("advertise"), "{message}");
+                assert!(message.contains("fetch"), "{message}");
+            }
+            other => panic!("tombstone race: {other:?}"),
+        }
+
+        let (_temp2, storage2, _rt, _rc, child, path_commit, path) =
+            tp12_path_fixture("p12wm", "synth").await;
+        let payload = PushPayload {
+            commits: vec![n1.id.to_string()],
+            fork_base: Some(ZERO_ID.to_string()),
+            n: 1,
+        };
+        let id = tp12_enqueue_claim(&storage2, &path, ZERO_ID, &n1.id.to_string(), &payload).await;
+        let exec = tp12_exec(&storage2, id).await;
+        match exec {
+            ExecuteOutcome::Failed { message, .. } => {
+                assert!(message.contains("materialized while waiting"), "{message}");
+            }
+            other => panic!("wait materialize: {other:?}"),
+        }
+        let _ = (child, path_commit);
+
+        let (_temp3, storage3, _rt, _rc, _child, path_commit, path) =
+            tp12_path_fixture("p12as", "tip").await;
+        let payload = PushPayload {
+            commits: vec!["e".repeat(40)],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 1,
+        };
+        let wrong_old = "f".repeat(40);
+        let id = tp12_enqueue_claim(&storage3, &path, &wrong_old, &"e".repeat(40), &payload).await;
+        let exec = tp12_exec(&storage3, id).await;
+        match exec {
+            ExecuteOutcome::Failed { message, .. } => {
+                assert!(message.contains("non-fast-forward"), "{message}");
+            }
+            other => panic!("nff: {other:?}"),
+        }
+
+        let payload = PushPayload {
+            commits: vec![path_commit.id.to_string()],
+            fork_base: Some(path_commit.id.to_string()),
+            n: 1,
+        };
+        let id = tp12_enqueue_claim(
+            &storage3,
+            "/missing-path",
+            &path_commit.id.to_string(),
+            &n1.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage3, id).await;
+        match exec {
+            ExecuteOutcome::Failed { message, .. } => {
+                assert!(
+                    message.contains("missing path") || message.contains("ZERO_ID"),
+                    "{message}"
+                );
+            }
+            other => panic!("missing row: {other:?}"),
+        }
+
+        let tip = path_commit.id.to_string();
+        let bogus = "9".repeat(40);
+        let payload = PushPayload {
+            commits: vec![bogus.clone()],
+            fork_base: Some(tip.clone()),
+            n: 0,
+        };
+        let id = tp12_enqueue_claim(&storage3, &path, &bogus, &bogus, &payload).await;
+        let exec = tp12_exec(&storage3, id).await;
+        match exec {
+            ExecuteOutcome::Failed { message, .. } => {
+                assert!(
+                    message.contains("n=0")
+                        || message.contains("new_id does not match")
+                        || message.contains("invariant"),
+                    "{message}"
+                );
+            }
+            other => panic!("n0 mismatch: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tp12_gap14_empty_pack_and_all_known_enqueue_b3() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, _child, path_commit, path) =
+            tp12_path_fixture("p12g14", "path tip").await;
+        let new_child = Tree::from_tree_items(vec![blob_item(
+            "g.txt",
+            "3333333333333333333333333333333333333333",
+        )])
+        .unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![path_commit.id], "g14");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+
+        let cmd = crate::ceres::protocol::import_refs::RefCommand::new(
+            path_commit.id.to_string(),
+            new_commit.id.to_string(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let chain = crate::ceres::pack::push_chain::PushChain::from_known_tip(
+            &cmd,
+            new_commit.clone(),
+            &storage.mono_storage(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chain.ordered_commits.len(), 1);
+        let payload = PushPayload::from_chain(
+            &path_commit.id.to_string(),
+            &new_commit.id.to_string(),
+            &chain,
+        );
+        assert_eq!(payload.n, 1);
+
+        let repo = tp12_monorepo(
+            &storage,
+            vec![cmd.clone()],
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let built = repo.build_push_chain(&cmd).await.unwrap();
+        assert!(built.is_some(), "trunk empty pack must not Noop");
+
+        let id = tp12_enqueue_claim(
+            &storage,
+            &path,
+            &path_commit.id.to_string(),
+            &new_commit.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage, id).await;
+        assert!(matches!(exec, ExecuteOutcome::Done { .. }), "{exec:?}");
+
+        let mut pack = std::collections::HashSet::new();
+        pack.insert(new_commit.id.to_string());
+        let repo = tp12_monorepo(
+            &storage,
+            vec![cmd.clone()],
+            pack,
+            std::collections::HashSet::new(),
+        );
+        let built = repo.build_push_chain(&cmd).await.unwrap();
+        assert!(
+            built.is_some(),
+            "all-known pack still yields a chain under trunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp12_review_keeps_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.merge_writer = MergeWriter::Legacy;
+        config.monorepo.push_policy = PushPolicy::Review;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let keep = Tree::from_tree_items(vec![blob_item(
+            ".gitkeep",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap();
+        let root_c = Commit::from_tree_id(keep.id, vec![], "root");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![keep.clone()], root_c.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![root_c.clone()], None)
+            .await
+            .unwrap();
+        setup_main_ref(&storage, &keep, &root_c.id.to_string()).await;
+        let cmd = crate::ceres::protocol::import_refs::RefCommand::new(
+            root_c.id.to_string(),
+            root_c.id.to_string(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = tp12_monorepo(
+            &storage,
+            vec![cmd.clone()],
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let built = repo.build_push_chain(&cmd).await.unwrap();
+        assert!(built.is_none(), "review empty pack stays Noop");
+        assert!(crate::ceres::pack::RepoHandler::receive_pack_notice(&repo).is_some());
+    }
+
+    fn tp12_monorepo(
+        storage: &Storage,
+        commands: Vec<crate::ceres::protocol::import_refs::RefCommand>,
+        pack_commit_ids: std::collections::HashSet<String>,
+        new_commit_ids: std::collections::HashSet<String>,
+    ) -> crate::ceres::pack::monorepo::Monorepo {
+        use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+
+        use tokio::sync::RwLock;
+
+        crate::ceres::pack::monorepo::Monorepo {
+            storage: storage.clone(),
+            git_object_cache: test_service(storage).git_object_cache,
+            path: PathBuf::from("/"),
+            base_branch: "main".to_string(),
+            pack_commit_ids: Mutex::new(pack_commit_ids),
+            new_commit_ids: Mutex::new(new_commit_ids),
+            no_op_notice: Mutex::new(None),
+            push_chain_cache: Mutex::new(HashMap::new()),
+            cl_link: std::sync::Arc::new(RwLock::new(None)),
+            bellatrix: std::sync::Arc::new(crate::bellatrix::Bellatrix::new(
+                storage.config().build.clone(),
+            )),
+            username: Some("tester".to_string()),
+            command_list: Mutex::new(commands),
+        }
     }
 }

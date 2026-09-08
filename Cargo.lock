@@ -4427,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.5.15"
+version = "0.5.16"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -5836,14 +5836,14 @@ dependencies = [
 name = "quinn-udp"
 version = "0.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
