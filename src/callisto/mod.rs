@@ -47,6 +47,7 @@ pub mod mega_commit;
 pub mod mega_conversation;
 pub mod mega_group;
 pub mod mega_group_member;
+pub mod mega_ref_tombstones;
 pub mod mega_refs;
 pub mod mega_resource_permission;
 pub mod mega_tag;

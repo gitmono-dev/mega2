@@ -1,11 +1,14 @@
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, ops::Deref, str::FromStr};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use git_internal::{
     hash::ObjectHash,
     internal::{
         metadata::EntryMeta,
-        object::{commit::Commit, tree::Tree},
+        object::{
+            commit::Commit,
+            tree::{Tree, TreeItemMode},
+        },
     },
 };
 use sea_orm::{
@@ -13,12 +16,17 @@ use sea_orm::{
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
     IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
-    sea_query::{Expr, OnConflict},
+    sea_query::{Expr, LikeExpr, OnConflict},
 };
 
 use crate::{
-    callisto::{mega_blob, mega_cl, mega_commit, mega_refs, mega_tag, mega_tree},
-    common::{errors::MegaError, utils::MEGA_BRANCH_NAME},
+    callisto::{
+        mega_blob, mega_cl, mega_commit, mega_ref_tombstones, mega_refs, mega_tag, mega_tree,
+    },
+    common::{
+        errors::MegaError,
+        utils::{MEGA_BRANCH_NAME, escape_like},
+    },
     contract::api::common::Pagination,
     jupiter::{
         storage::{
@@ -26,7 +34,7 @@ use crate::{
             commit_binding_storage::CommitBindingStorage,
             user_storage::UserStorage,
         },
-        utils::converter::IntoMegaModel,
+        utils::converter::{FromMegaModel, IntoMegaModel},
     },
 };
 #[derive(Clone)]
@@ -85,6 +93,32 @@ impl MonoStorage {
         Ok(())
     }
 
+    /// Transactional descendant cleanup (1.10 deliverable 5).
+    ///
+    /// Unlike [`Self::remove_none_cl_refs`] this:
+    /// - accepts `&DatabaseTransaction` (usable inside B3);
+    /// - uses a component-boundary `LIKE '{path}/%'` prefix;
+    /// - escapes LIKE metacharacters via [`crate::common::utils::escape_like`].
+    pub async fn remove_none_cl_refs_in_txn(
+        &self,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        let normalized = if path.is_empty() { "/" } else { path };
+        let pattern = if normalized == "/" {
+            "/%".to_owned()
+        } else {
+            format!("{}/%", escape_like(normalized.trim_end_matches('/')))
+        };
+        mega_refs::Entity::delete_many()
+            .filter(mega_refs::Column::Path.like(pattern))
+            .filter(mega_refs::Column::Path.ne(normalized.to_owned()))
+            .filter(mega_refs::Column::IsCl.eq(false))
+            .exec(txn)
+            .await?;
+        Ok(())
+    }
+
     pub async fn remove_ref(&self, refs: mega_refs::Model) -> Result<(), MegaError> {
         mega_refs::Entity::delete_by_id(refs.id)
             .exec(self.get_connection())
@@ -108,6 +142,26 @@ impl MonoStorage {
         }
 
         let result = query.all(self.get_connection()).await?;
+        Ok(result)
+    }
+
+    pub async fn get_refs_for_paths_and_cls_in_txn(
+        &self,
+        paths: &[&str],
+        cls: Option<&[&str]>,
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        let mut query = mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.is_in(paths.iter().copied()))
+            .order_by_asc(mega_refs::Column::RefName);
+
+        if let Some(cls_values) = cls {
+            query = query.filter(mega_refs::Column::RefName.is_in(cls_values.iter().copied()));
+        } else {
+            query = query.filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME));
+        }
+
+        let result = query.all(txn).await?;
         Ok(result)
     }
 
@@ -150,6 +204,206 @@ impl MonoStorage {
         Ok(result)
     }
 
+    /// Point lookup of a tombstone by primary key `(path, ref_name)`.
+    pub async fn get_tombstone(
+        &self,
+        path: &str,
+        ref_name: &str,
+    ) -> Result<Option<mega_ref_tombstones::Model>, MegaError> {
+        self.get_tombstone_on(self.get_connection(), path, ref_name)
+            .await
+    }
+
+    pub async fn get_tombstone_in_txn(
+        &self,
+        path: &str,
+        ref_name: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_ref_tombstones::Model>, MegaError> {
+        self.get_tombstone_on(txn, path, ref_name).await
+    }
+
+    async fn get_tombstone_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+        ref_name: &str,
+    ) -> Result<Option<mega_ref_tombstones::Model>, MegaError> {
+        Ok(
+            mega_ref_tombstones::Entity::find_by_id((path.to_owned(), ref_name.to_owned()))
+                .one(conn)
+                .await?,
+        )
+    }
+
+    /// Tombstones under `path/` with a component boundary. Uses `escape_like`.
+    pub async fn list_tombstones_under_prefix(
+        &self,
+        path: &str,
+    ) -> Result<Vec<mega_ref_tombstones::Model>, MegaError> {
+        let normalized = if path.is_empty() { "/" } else { path };
+        let pattern = if normalized == "/" {
+            "/%".to_owned()
+        } else {
+            format!("{}/%", escape_like(normalized.trim_end_matches('/')))
+        };
+        Ok(mega_ref_tombstones::Entity::find()
+            .filter(mega_ref_tombstones::Column::Path.like(LikeExpr::new(pattern).escape('\\')))
+            .filter(mega_ref_tombstones::Column::Path.ne(normalized.to_owned()))
+            .all(self.get_connection())
+            .await?)
+    }
+
+    /// Insert or replace a tombstone. Idempotent on `(path, ref_name)`.
+    pub async fn upsert_tombstone(
+        &self,
+        path: &str,
+        ref_name: &str,
+        last_commit_hash: &str,
+        last_tree_hash: &str,
+    ) -> Result<(), MegaError> {
+        self.upsert_tombstone_on(
+            self.get_connection(),
+            path,
+            ref_name,
+            last_commit_hash,
+            last_tree_hash,
+        )
+        .await
+    }
+
+    pub async fn upsert_tombstone_in_txn(
+        &self,
+        path: &str,
+        ref_name: &str,
+        last_commit_hash: &str,
+        last_tree_hash: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        self.upsert_tombstone_on(txn, path, ref_name, last_commit_hash, last_tree_hash)
+            .await
+    }
+
+    async fn upsert_tombstone_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+        ref_name: &str,
+        last_commit_hash: &str,
+        last_tree_hash: &str,
+    ) -> Result<(), MegaError> {
+        let now = chrono::Utc::now().fixed_offset();
+        let model = mega_ref_tombstones::ActiveModel {
+            path: Set(path.to_owned()),
+            ref_name: Set(ref_name.to_owned()),
+            last_commit_hash: Set(last_commit_hash.to_owned()),
+            last_tree_hash: Set(last_tree_hash.to_owned()),
+            deleted_at: Set(now),
+        };
+        match mega_ref_tombstones::Entity::insert(model)
+            .on_conflict(
+                OnConflict::columns([
+                    mega_ref_tombstones::Column::Path,
+                    mega_ref_tombstones::Column::RefName,
+                ])
+                .update_columns([
+                    mega_ref_tombstones::Column::LastCommitHash,
+                    mega_ref_tombstones::Column::LastTreeHash,
+                    mega_ref_tombstones::Column::DeletedAt,
+                ])
+                .to_owned(),
+            )
+            .exec(conn)
+            .await
+        {
+            Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn delete_tombstone(&self, path: &str, ref_name: &str) -> Result<(), MegaError> {
+        self.delete_tombstone_on(self.get_connection(), path, ref_name)
+            .await
+    }
+
+    pub async fn delete_tombstone_in_txn(
+        &self,
+        path: &str,
+        ref_name: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        self.delete_tombstone_on(txn, path, ref_name).await
+    }
+
+    async fn delete_tombstone_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        path: &str,
+        ref_name: &str,
+    ) -> Result<(), MegaError> {
+        mega_ref_tombstones::Entity::delete_by_id((path.to_owned(), ref_name.to_owned()))
+            .exec(conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Best-effort upgrade backfill: insert tombstones from an operator-supplied
+    /// deletion list (path, ref_name, last_commit, last_tree). Not complete.
+    pub async fn backfill_tombstones_best_effort(
+        &self,
+        entries: &[(String, String, String, String)],
+    ) -> Result<u64, MegaError> {
+        let mut n = 0u64;
+        for (path, ref_name, commit, tree) in entries {
+            self.upsert_tombstone(path, ref_name, commit, tree).await?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Fail-closed default upgrade path: do not invent tombstones for
+    /// pre-upgrade deletions. Returns 0.
+    pub fn backfill_tombstones_fail_closed(&self) -> u64 {
+        0
+    }
+
+    /// Write a tombstone from the current `main` ref at `path` and delete the
+    /// ref row, in one transaction (B3 SAVEPOINT repair / reaper I3).
+    pub async fn tombstone_and_delete_main_ref_in_txn(
+        &self,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<bool, MegaError> {
+        let Some(row) = self.get_main_ref_in_txn(path, txn).await? else {
+            return Ok(false);
+        };
+        self.upsert_tombstone_in_txn(
+            path,
+            MEGA_BRANCH_NAME,
+            &row.ref_commit_hash,
+            &row.ref_tree_hash,
+            txn,
+        )
+        .await?;
+        mega_refs::Entity::delete_by_id(row.id).exec(txn).await?;
+        Ok(true)
+    }
+
+    /// Parents for a lazy-materialized commit: tombstone `last_commit_hash` if
+    /// present, otherwise an empty parent list (first materialization).
+    pub async fn materialize_parents(
+        &self,
+        path: &str,
+        ref_name: &str,
+    ) -> Result<Vec<ObjectHash>, MegaError> {
+        let Some(row) = self.get_tombstone(path, ref_name).await? else {
+            return Ok(vec![]);
+        };
+        let hash = ObjectHash::from_str(&row.last_commit_hash)
+            .map_err(|e| MegaError::Other(format!("tombstone parent hash: {e}")))?;
+        Ok(vec![hash])
+    }
+
     /// Main refs under `path/` with a component boundary (`path LIKE '{p}/%'`).
     /// Uses `escape_like` so `%`/`_`/`\` in path cannot broaden the match.
     pub async fn list_descendant_main_refs(
@@ -173,7 +427,6 @@ impl MonoStorage {
         conn: &C,
         path: &str,
     ) -> Result<Vec<mega_refs::Model>, MegaError> {
-        use crate::common::utils::escape_like;
         let normalized = if path.is_empty() { "/" } else { path };
         // `LIKE '/%'` matches `/` itself because `%` may be empty — always
         // exclude the query path from "descendants".
@@ -862,26 +1115,49 @@ impl MonoStorage {
     where
         C: ConnectionTrait,
     {
-        use sea_orm::ActiveValue::Set;
-
-        use crate::callisto::sea_orm_active_enums::MergeStatusEnum;
-
         let cl = mega_cl::Entity::find()
             .filter(mega_cl::Column::Link.eq(cl_link))
             .one(conn)
             .await?
             .ok_or_else(|| MegaError::Other(format!("CL not found: {}", cl_link)))?;
 
-        let mut cl_active = cl.clone().into_active_model();
-        cl_active.from_hash = Set(from_hash.to_owned());
-        cl_active.to_hash = Set(to_hash.to_owned());
-        cl_active.status = Set(MergeStatusEnum::Open);
-        cl_active.title = Set(commit_message.to_owned());
-        cl_active.updated_at = Set(chrono::Utc::now().naive_utc());
+        let now = chrono::Utc::now().naive_utc();
+        let rows = conn
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                UPDATE mega_cl
+                   SET from_hash = $1,
+                       to_hash = $2,
+                       status = 'open'::merge_status_enum,
+                       title = $3,
+                       updated_at = $4,
+                       revision = revision + 1
+                 WHERE link = $5
+                   AND revision = $6
+                   AND status <> 'merged'::merge_status_enum
+                "#,
+                [
+                    sea_orm::Value::from(from_hash.to_owned()),
+                    sea_orm::Value::from(to_hash.to_owned()),
+                    sea_orm::Value::from(commit_message.to_owned()),
+                    sea_orm::Value::from(now),
+                    sea_orm::Value::from(cl_link.to_owned()),
+                    sea_orm::Value::from(cl.revision),
+                ],
+            ))
+            .await?;
+        if rows.rows_affected() != 1 {
+            return Err(MegaError::Other(
+                "CL revision CAS missed (concurrent merge or rebase)".into(),
+            ));
+        }
 
-        cl_active.update(conn).await?;
-
-        Ok(cl)
+        mega_cl::Entity::find()
+            .filter(mega_cl::Column::Link.eq(cl_link))
+            .one(conn)
+            .await?
+            .ok_or_else(|| MegaError::Other(format!("CL not found after CAS: {cl_link}")))
     }
 
     pub async fn save_mega_commits(
@@ -945,10 +1221,59 @@ impl MonoStorage {
         &self,
         hash: &str,
     ) -> Result<Option<mega_tree::Model>, MegaError> {
+        self.get_tree_by_hash_on(self.get_connection(), hash).await
+    }
+
+    pub async fn get_tree_by_hash_in_txn(
+        &self,
+        hash: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<mega_tree::Model>, MegaError> {
+        self.get_tree_by_hash_on(txn, hash).await
+    }
+
+    async fn get_tree_by_hash_on<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        hash: &str,
+    ) -> Result<Option<mega_tree::Model>, MegaError> {
         Ok(mega_tree::Entity::find()
             .filter(mega_tree::Column::TreeId.eq(hash))
-            .one(self.get_connection())
+            .one(conn)
             .await?)
+    }
+
+    /// Walk `path` from `root_tree_hash`. `None` if a component is missing or
+    /// is not a tree. `path == "/"` returns the root tree hash.
+    pub async fn resolve_path_tree_hash_in_txn(
+        &self,
+        root_tree_hash: &str,
+        path: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<String>, MegaError> {
+        if path.is_empty() || path == "/" {
+            return Ok(Some(root_tree_hash.to_owned()));
+        }
+        let Some(model) = self.get_tree_by_hash_in_txn(root_tree_hash, txn).await? else {
+            return Ok(None);
+        };
+        let mut tree = Tree::from_mega_model(model);
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            let Some(item) = tree.tree_items.iter().find(|x| x.name == component) else {
+                return Ok(None);
+            };
+            if item.mode != TreeItemMode::Tree {
+                return Ok(None);
+            }
+            let Some(next) = self
+                .get_tree_by_hash_in_txn(&item.id.to_string(), txn)
+                .await?
+            else {
+                return Ok(None);
+            };
+            tree = Tree::from_mega_model(next);
+        }
+        Ok(Some(tree.id.to_string()))
     }
 
     pub async fn get_trees_by_hashes(
@@ -1304,5 +1629,159 @@ mod tests {
                 || (row.ref_commit_hash == "c".repeat(40) && row.ref_tree_hash == "d".repeat(40))
         );
         assert!(!row.is_cl);
+    }
+
+    #[tokio::test]
+    async fn remove_none_cl_refs_in_txn_uses_component_boundary_and_escapes_like() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        for path in ["/", "/a", "/a/b", "/ab", "/a%x"] {
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "a".repeat(40),
+                    "b".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.remove_none_cl_refs_in_txn("/a", &txn).await.unwrap();
+        txn.commit().await.unwrap();
+
+        assert!(mono.get_main_ref("/a").await.unwrap().is_some());
+        assert!(
+            mono.get_main_ref("/a/b").await.unwrap().is_none(),
+            "descendant /a/b must be removed"
+        );
+        assert!(
+            mono.get_main_ref("/ab").await.unwrap().is_some(),
+            "sibling-prefix /ab must remain"
+        );
+        assert!(
+            mono.get_main_ref("/a%x").await.unwrap().is_some(),
+            "unrelated path with LIKE metacharacter must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp09_tombstone_table_exists_after_migration() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        assert!(
+            mono.get_tombstone("/never", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        mono.upsert_tombstone(
+            "/project/foo",
+            MEGA_BRANCH_NAME,
+            &"a".repeat(40),
+            &"b".repeat(40),
+        )
+        .await
+        .unwrap();
+        let row = mono
+            .get_tombstone("/project/foo", MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .expect("tombstone");
+        assert_eq!(row.last_commit_hash, "a".repeat(40));
+        assert_eq!(mono.backfill_tombstones_fail_closed(), 0);
+        let n = mono
+            .backfill_tombstones_best_effort(&[(
+                "/project/bar".into(),
+                MEGA_BRANCH_NAME.into(),
+                "c".repeat(40),
+                "d".repeat(40),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn tp09_tombstone_prefix_query_uses_escape_like() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        for path in [
+            "/project/my_lib/child",
+            "/project/myXlib/child",
+            "/project/my%lib/child",
+        ] {
+            mono.upsert_tombstone(path, MEGA_BRANCH_NAME, &"a".repeat(40), &"b".repeat(40))
+                .await
+                .unwrap();
+        }
+        let under = mono
+            .list_tombstones_under_prefix("/project/my_lib")
+            .await
+            .unwrap();
+        let paths: Vec<_> = under.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(paths, vec!["/project/my_lib/child"]);
+        assert!(
+            !paths.contains(&"/project/myXlib/child"),
+            "unescaped _ must not match myXlib/child"
+        );
+        assert!(
+            !paths.contains(&"/project/my%lib/child"),
+            "unescaped % must not match my%lib/child"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp09_tombstone_and_delete_main_ref_is_atomic() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/stale",
+                MEGA_BRANCH_NAME.to_owned(),
+                "s".repeat(40),
+                "t".repeat(40),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        assert!(
+            mono.tombstone_and_delete_main_ref_in_txn("/stale", &txn)
+                .await
+                .unwrap()
+        );
+        txn.rollback().await.unwrap();
+        assert!(mono.get_main_ref("/stale").await.unwrap().is_some());
+        assert!(
+            mono.get_tombstone("/stale", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let txn = conn.begin().await.unwrap();
+        mono.tombstone_and_delete_main_ref_in_txn("/stale", &txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(mono.get_main_ref("/stale").await.unwrap().is_none());
+        let tomb = mono
+            .get_tombstone("/stale", MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tomb.last_commit_hash, "s".repeat(40));
     }
 }

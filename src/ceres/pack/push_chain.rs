@@ -1243,6 +1243,7 @@ mod tests {
             updated_at: chrono::Utc::now().naive_utc(),
             username: "tester".to_string(),
             base_branch: "main".to_string(),
+            revision: 0,
         }
     }
 

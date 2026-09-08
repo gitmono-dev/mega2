@@ -48,7 +48,10 @@ use crate::{
     },
     contract::{
         api::common::Pagination,
-        policy::notify::{authz_blob_id, notify_authz_changed_best_effort},
+        policy::notify::{
+            authz_barrier_enabled, authz_blob_id, mark_authz_dirty_and_compensate,
+            notify_authz_changed_best_effort,
+        },
     },
     jupiter::{storage::Storage, utils::converter::FromMegaModel},
 };
@@ -174,11 +177,16 @@ impl RepoHandler for Monorepo {
                         }
                     }
                 }
+                let parents = storage
+                    .materialize_parents(self.path.to_str().unwrap(), &root_ref.ref_name)
+                    .await
+                    .unwrap();
+                let continued = !parents.is_empty();
                 let c = Commit::new(
                     commit.author,
                     commit.committer,
                     tree.id,
-                    vec![],
+                    parents,
                     &commit.message,
                 );
 
@@ -194,6 +202,12 @@ impl RepoHandler for Monorepo {
                     .mega_head_hash_with_txn(new_mega_ref.clone(), c)
                     .await
                     .unwrap();
+                if continued {
+                    storage
+                        .delete_tombstone(self.path.to_str().unwrap(), &root_ref.ref_name)
+                        .await
+                        .unwrap();
+                }
 
                 refs.push(new_mega_ref.into());
             }
@@ -875,37 +889,45 @@ impl Monorepo {
             }
         }
         txn.commit().await.map_err(MegaError::Db)?;
-        // UN-16: receive-pack Delete branch hook (post-commit). A branch
-        // delete cannot touch main (rejected above), so the old/new blob IDs
-        // from main's tree are equal and the notify is a no-op — but the hook
-        // point is wired so any future path that removes main's
-        // `/.mega_cedar.json` marks the shared snapshot dirty (fail-closed).
+        // UN-16 / TP-22: receive-pack Delete cannot touch main. When the
+        // authz barrier is on, this queue-external hook dirty-marks and
+        // compensates without a `published_version` compare. `off` keeps the
+        // original equal-blob notify (a no-op unless a future path removes
+        // main's `/.mega_cedar.json`).
         if cmds.iter().any(|cmd| {
             cmd.ref_type == RefTypeEnum::Branch
                 && (cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID)
         }) {
-            let storage = self.storage.mono_storage();
-            // The ref deletions are already committed, so a failure while
-            // reading main's tree leaves the snapshot stale: mark dirty
-            // (fail-closed) before propagating.
-            let blob_id = match async {
-                let root = storage.get_main_ref("/").await?;
-                let tree = match root {
-                    Some(r) => storage.get_tree_by_hash(&r.ref_tree_hash).await?,
-                    None => None,
-                };
-                Ok::<_, MegaError>(tree.and_then(|t| authz_blob_id(&Tree::from_mega_model(t))))
-            }
-            .await
-            {
-                Ok(blob_id) => blob_id,
-                Err(e) => {
-                    self.storage.entity_store().mark_dirty();
-                    return Err(e);
+            if authz_barrier_enabled(&self.storage) {
+                mark_authz_dirty_and_compensate(&self.storage).await;
+            } else {
+                let storage = self.storage.mono_storage();
+                // The ref deletions are already committed, so a failure while
+                // reading main's tree leaves the snapshot stale: mark dirty
+                // (fail-closed) before propagating.
+                let blob_id = match async {
+                    let root = storage.get_main_ref("/").await?;
+                    let tree = match root {
+                        Some(r) => storage.get_tree_by_hash(&r.ref_tree_hash).await?,
+                        None => None,
+                    };
+                    Ok::<_, MegaError>(tree.and_then(|t| authz_blob_id(&Tree::from_mega_model(t))))
                 }
-            };
-            notify_authz_changed_best_effort(&self.storage, blob_id.as_deref(), blob_id.as_deref())
+                .await
+                {
+                    Ok(blob_id) => blob_id,
+                    Err(e) => {
+                        self.storage.entity_store().mark_dirty();
+                        return Err(e);
+                    }
+                };
+                notify_authz_changed_best_effort(
+                    &self.storage,
+                    blob_id.as_deref(),
+                    blob_id.as_deref(),
+                )
                 .await;
+            }
         }
         Ok(())
     }
@@ -1460,6 +1482,7 @@ mod tests {
             object::{
                 commit::Commit,
                 signature::{Signature, SignatureType},
+                tree::{Tree, TreeItem, TreeItemMode},
             },
             pack::entry::Entry,
         },
@@ -1473,7 +1496,7 @@ mod tests {
         bellatrix::Bellatrix,
         callisto::{commit_auths, mega_commit, mega_tree},
         ceres::{api_service::cache::GitObjectCache, protocol::import_refs::RefCommand},
-        common::utils::ZERO_ID,
+        common::utils::{MEGA_BRANCH_NAME, ZERO_ID},
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
             tests::test_storage,
@@ -1892,5 +1915,183 @@ mod tests {
             cl_after.updated_at, seeded_cl.updated_at,
             "the backfill must not touch the CL body"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_path_dirty_outbox_skips_published_version() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.cedar.enforcement = "enforce".to_string();
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        storage
+            .entity_store()
+            .swap(
+                &crate::contract::policy::entitystore::generate_entity(&["admin".to_string()], "/")
+                    .expect("generate"),
+            )
+            .expect("baseline snapshot");
+        assert!(!storage.entity_store().is_dirty());
+
+        let commands = vec![RefCommand::new(
+            "a".repeat(40),
+            ZERO_ID.to_string(),
+            "refs/heads/feature".to_string(),
+        )];
+        let repo = test_monorepo(&storage, commands, HashSet::new(), HashSet::new());
+        repo.persist_mono_branch_cl_mega_refs_transaction()
+            .await
+            .expect("delete persist");
+
+        let conn = storage.mono_storage().get_connection().clone();
+        let rows = crate::callisto::authz_notify_outbox::Entity::find()
+            .all(&conn)
+            .await
+            .expect("outbox");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].dirty, "delete path is an unversioned dirty mark");
+        assert!(rows[0].version.is_none());
+        assert!(rows[0].replayed_at.is_some());
+        assert_eq!(
+            crate::jupiter::storage::push_queue_storage::PushQueueStorage::load_published_version(
+                &conn
+            )
+            .await
+            .expect("watermark"),
+            0,
+            "delete compensate must not CAS published_version"
+        );
+    }
+
+    async fn seed_root_with_dir(storage: &Storage, dir: &str) -> (String, String) {
+        let blob_id = storage
+            .git_service
+            .save_object_from_raw(bytes::Bytes::from_static(b"keep"))
+            .await
+            .expect("blob");
+        let leaf = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(&blob_id).expect("blob hash"),
+            ".gitkeep".to_string(),
+        )])
+        .expect("leaf");
+        let root = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            leaf.id,
+            dir.to_string(),
+        )])
+        .expect("root");
+        let commit = test_commit("root with dir");
+        let commit = Commit::new(
+            commit.author,
+            commit.committer,
+            root.id,
+            vec![],
+            &commit.message,
+        );
+        let commit_id = commit.id.to_string();
+        let tree_id = root.id.to_string();
+        storage
+            .mono_storage()
+            .save_mega_trees(
+                vec![leaf, root],
+                ObjectHash::from_str(&commit_id).unwrap(),
+                None,
+            )
+            .await
+            .expect("trees");
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![commit], None)
+            .await
+            .expect("commit");
+        storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model::new(
+                    "/",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    commit_id.clone(),
+                    tree_id.clone(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .expect("root ref");
+        (commit_id, tree_id)
+    }
+
+    #[tokio::test]
+    async fn tp09_materialize_skips_when_tombstone_path_missing_from_root() {
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "other").await;
+        storage
+            .mono_storage()
+            .upsert_tombstone("/foo", MEGA_BRANCH_NAME, &"a".repeat(40), &"b".repeat(40))
+            .await
+            .unwrap();
+        let head = crate::ceres::code_edit::utils::create_repo_commit(&storage, "/foo")
+            .await
+            .unwrap();
+        assert_eq!(head, ZERO_ID);
+        assert!(
+            storage
+                .mono_storage()
+                .get_main_ref("/foo")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .mono_storage()
+                .get_tombstone("/foo", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "skip must keep the tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp09_materialize_continues_from_tombstone_then_deletes_it() {
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        seed_root_with_dir(&storage, "foo").await;
+        let old_tip = "119bc457cb05b52dfb0d6b14f66d9a8a52d09e25";
+        storage
+            .mono_storage()
+            .upsert_tombstone("/foo", MEGA_BRANCH_NAME, old_tip, &"b".repeat(40))
+            .await
+            .unwrap();
+        let head = crate::ceres::code_edit::utils::create_repo_commit(&storage, "/foo")
+            .await
+            .unwrap();
+        assert_ne!(head, ZERO_ID);
+        let commit = storage
+            .mono_storage()
+            .get_commit_by_hash(&head)
+            .await
+            .unwrap()
+            .expect("commit");
+        let parents: Vec<String> = serde_json::from_value(commit.parents_id).unwrap();
+        assert_eq!(parents, vec![old_tip.to_string()]);
+        assert!(
+            storage
+                .mono_storage()
+                .get_tombstone("/foo", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "revival must delete the tombstone"
+        );
+        let row = storage
+            .mono_storage()
+            .get_main_ref("/foo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.ref_commit_hash, head);
     }
 }

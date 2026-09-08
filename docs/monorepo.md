@@ -197,7 +197,19 @@ object storage 与 MonoService；不会启动 Redis、notification、sidebar、r
 
 ---
 
-## 6. 交叉引用
+## 6. 墓碑与升级回填
+
+路径 `main` ref 被删除后记入 `mega_ref_tombstones`。再次 advertise / 懒物化时：
+
+- 路径仍在当前根树中 → 以墓碑 `last_commit_hash` 为 parent 续接，成功后删除墓碑行。
+- 路径不在根树（目录尚未重建）→ **跳过物化**，不凭空造行。
+- 对仍有墓碑的路径，`old_id = ZERO_ID` 的创建推送在 B0 被拒绝：先重建父目录 → advertise 续接物化 → fetch 对齐 → 再推送。
+
+**升级前的历史删除**（升级前 `remove_none_cl_refs` 不留痕）默认 **fail-closed**：迁移只建空表，不猜测「曾物化后被删」的路径。旧客户端可能遭遇一次 unrelated history。运维可在升级前按删除清单调用 `backfill_tombstones_best_effort`（不保证完备）。完整产品声明随 TP-21 回写。
+
+---
+
+## 7. 交叉引用
 
 | 主题 | 文档 / 代码 |
 |---|---|

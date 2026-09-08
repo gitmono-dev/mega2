@@ -22,7 +22,7 @@ pub use super::{
     mega_code_review_position::Entity as MegaCodeReviewPosition,
     mega_code_review_thread::Entity as MegaCodeReviewThread, mega_commit::Entity as MegaCommit,
     mega_conversation::Entity as MegaConversation, mega_group::Entity as MegaGroup,
-    mega_group_member::Entity as MegaGroupMember,
+    mega_group_member::Entity as MegaGroupMember, mega_ref_tombstones::Entity as MegaRefTombstones,
     mega_refs::Entity as MegaRefs, mega_resource_permission::Entity as MegaResourcePermission,
     mega_tag::Entity as MegaTag, mega_tree::Entity as MegaTree,
     mega_webhook::Entity as MegaWebhook, mega_webhook_delivery::Entity as MegaWebhookDelivery,

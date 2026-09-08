@@ -408,11 +408,15 @@ pub async fn create_repo_commit(storage: &Storage, repo_path: &str) -> Result<St
                     }
                 }
             }
+            let parents = storage
+                .materialize_parents(repo_path, &root_ref.ref_name)
+                .await?;
+            let continued = !parents.is_empty();
             let c = Commit::new(
                 commit.author,
                 commit.committer,
                 tree.id,
-                vec![],
+                parents,
                 &commit.message,
             );
 
@@ -427,6 +431,11 @@ pub async fn create_repo_commit(storage: &Storage, repo_path: &str) -> Result<St
             storage
                 .mega_head_hash_with_txn(new_mega_ref.clone(), c)
                 .await?;
+            if continued {
+                storage
+                    .delete_tombstone(repo_path, &root_ref.ref_name)
+                    .await?;
+            }
 
             refs.push(new_mega_ref);
         }
