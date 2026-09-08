@@ -1961,8 +1961,15 @@ impl PushQueueService {
             }
         };
 
+        let old_tree = path_row.as_ref().map(|r| r.ref_tree_hash.clone());
+        let landed_tree = self
+            .mono_storage
+            .get_main_ref_in_txn(&normalized, &txn)
+            .await?
+            .map(|r| r.ref_tree_hash)
+            .unwrap_or_else(|| tip_tree_id.to_string());
         self.mono_storage
-            .remove_none_cl_refs_in_txn(&normalized, &txn)
+            .advance_descendant_refs(&normalized, &landed_tree, old_tree.as_deref(), &txn)
             .await?;
 
         let updated =
@@ -2305,11 +2312,21 @@ impl PushQueueService {
             }
         };
 
-        if normalized_path != "/" {
-            self.mono_storage
-                .remove_none_cl_refs_in_txn(&normalized_path, &txn)
-                .await?;
-        }
+        let old_tree_p = path_main.ref_tree_hash.clone();
+        let landed_tree = self
+            .mono_storage
+            .get_main_ref_in_txn(&normalized_path, &txn)
+            .await?
+            .map(|r| r.ref_tree_hash)
+            .unwrap_or_else(|| commit.tree_id.to_string());
+        self.mono_storage
+            .advance_descendant_refs(
+                &normalized_path,
+                &landed_tree,
+                Some(old_tree_p.as_str()),
+                &txn,
+            )
+            .await?;
 
         if !ctx.pause_after_apply.is_zero() {
             tokio::time::sleep(ctx.pause_after_apply).await;

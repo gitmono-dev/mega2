@@ -1,4 +1,9 @@
-use std::{collections::HashMap, ops::Deref, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+    str::FromStr,
+    sync::Arc,
+};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use git_internal::{
@@ -55,6 +60,35 @@ pub struct RefUpdateData {
     pub ref_name: String,
     pub commit_id: String,
     pub tree_hash: String,
+}
+
+enum DescendantResolve {
+    Unchanged,
+    Changed(String),
+    Delete,
+}
+
+fn path_slash_depth(path: &str) -> usize {
+    path.bytes().filter(|b| *b == b'/').count()
+}
+
+fn path_is_under(path: &str, prefix: &str) -> bool {
+    if path == prefix {
+        return true;
+    }
+    let prefix = prefix.trim_end_matches('/');
+    path.starts_with(&format!("{prefix}/"))
+}
+
+fn descendant_relative<'a>(parent: &str, descendant: &'a str) -> Option<&'a str> {
+    if parent == "/" {
+        return descendant.strip_prefix('/').filter(|s| !s.is_empty());
+    }
+    let parent = parent.trim_end_matches('/');
+    descendant
+        .strip_prefix(parent)?
+        .strip_prefix('/')
+        .filter(|s| !s.is_empty())
 }
 
 impl MonoStorage {
@@ -516,6 +550,18 @@ impl MonoStorage {
         self.list_descendant_main_refs_on(txn, path).await
     }
 
+    /// Stage 2 candidate set (trunk-push.md 2.2): same query as
+    /// [`Self::list_descendant_main_refs_in_txn`], sorted by path depth.
+    pub async fn descendant_main_refs(
+        &self,
+        p: &str,
+        txn: &DatabaseTransaction,
+    ) -> Result<Vec<mega_refs::Model>, MegaError> {
+        let mut refs = self.list_descendant_main_refs_on(txn, p).await?;
+        refs.sort_by_key(|r| path_slash_depth(&r.path));
+        Ok(refs)
+    }
+
     async fn list_descendant_main_refs_on<C: ConnectionTrait>(
         &self,
         conn: &C,
@@ -530,13 +576,148 @@ impl MonoStorage {
             format!("{}/%", escape_like(normalized.trim_end_matches('/')))
         };
         let result = mega_refs::Entity::find()
-            .filter(mega_refs::Column::Path.like(pattern))
+            .filter(mega_refs::Column::Path.like(LikeExpr::new(pattern).escape('\\')))
             .filter(mega_refs::Column::Path.ne(normalized.to_owned()))
             .filter(mega_refs::Column::RefName.eq(MEGA_BRANCH_NAME.to_owned()))
             .filter(mega_refs::Column::IsCl.eq(false))
             .all(conn)
             .await?;
         Ok(result)
+    }
+
+    /// Advance already-materialized `main` descendants of `path` inside `txn`
+    /// (trunk-push.md 2.3–2.4 / ADR-TP-19). `new_tree_hash` is the tree at
+    /// `path` after the B3 apply. `old_tree_hash` enables Merkle prune when
+    /// the pushed path existed before the write.
+    pub async fn advance_descendant_refs(
+        &self,
+        path: &str,
+        new_tree_hash: &str,
+        old_tree_hash: Option<&str>,
+        txn: &DatabaseTransaction,
+    ) -> Result<(), MegaError> {
+        let normalized = if path.is_empty() { "/" } else { path };
+        let candidates = self.descendant_main_refs(normalized, txn).await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let mut cache: HashMap<String, Arc<Tree>> = HashMap::new();
+        let mut unchanged: HashSet<String> = HashSet::new();
+        let mut updates: Vec<RefUpdateData> = Vec::new();
+        let mut commits: Vec<Commit> = Vec::new();
+
+        for row in candidates {
+            if unchanged.iter().any(|p| path_is_under(&row.path, p)) {
+                continue;
+            }
+            let Some(relative) = descendant_relative(normalized, &row.path) else {
+                continue;
+            };
+            match self
+                .resolve_descendant_tree(new_tree_hash, old_tree_hash, relative, &mut cache, txn)
+                .await?
+            {
+                DescendantResolve::Unchanged => {
+                    unchanged.insert(row.path.clone());
+                }
+                DescendantResolve::Changed(new_hash) => {
+                    if new_hash == row.ref_tree_hash {
+                        unchanged.insert(row.path.clone());
+                        continue;
+                    }
+                    let parent = ObjectHash::from_str(&row.ref_commit_hash).map_err(|e| {
+                        MegaError::Other(format!("descendant {} parent hash: {e}", row.path))
+                    })?;
+                    let tree = ObjectHash::from_str(&new_hash).map_err(|e| {
+                        MegaError::Other(format!("descendant {} tree hash: {e}", row.path))
+                    })?;
+                    let commit =
+                        Commit::from_tree_id(tree, vec![parent], "trunk descendant continuation");
+                    updates.push(RefUpdateData {
+                        path: row.path.clone(),
+                        ref_name: MEGA_BRANCH_NAME.to_owned(),
+                        commit_id: commit.id.to_string(),
+                        tree_hash: new_hash,
+                    });
+                    commits.push(commit);
+                }
+                DescendantResolve::Delete => {
+                    self.tombstone_and_delete_main_ref_in_txn(&row.path, txn)
+                        .await?;
+                }
+            }
+        }
+
+        if !commits.is_empty() {
+            self.save_mega_commits(commits, Some(txn)).await?;
+        }
+        if !updates.is_empty() {
+            self.batch_update_by_path_in_txn(txn, updates).await?;
+        }
+        Ok(())
+    }
+
+    async fn resolve_descendant_tree(
+        &self,
+        new_tree_hash: &str,
+        old_tree_hash: Option<&str>,
+        relative: &str,
+        cache: &mut HashMap<String, Arc<Tree>>,
+        txn: &DatabaseTransaction,
+    ) -> Result<DescendantResolve, MegaError> {
+        let mut new_hash = new_tree_hash.to_owned();
+        let mut old_hash = old_tree_hash.map(str::to_owned);
+        for component in relative.split('/').filter(|c| !c.is_empty()) {
+            let Some(new_tree) = self.load_tree_cached(&new_hash, cache, txn).await? else {
+                return Ok(DescendantResolve::Delete);
+            };
+            let Some(item) = new_tree.tree_items.iter().find(|x| x.name == component) else {
+                return Ok(DescendantResolve::Delete);
+            };
+            if item.mode != TreeItemMode::Tree {
+                return Ok(DescendantResolve::Delete);
+            }
+            let next_new = item.id.to_string();
+            if let Some(old) = old_hash.as_deref()
+                && let Some(old_tree) = self.load_tree_cached(old, cache, txn).await?
+                && let Some(old_item) = old_tree.tree_items.iter().find(|x| x.name == component)
+                && old_item.mode == TreeItemMode::Tree
+                && old_item.id.to_string() == next_new
+            {
+                return Ok(DescendantResolve::Unchanged);
+            }
+            old_hash = match old_hash.as_deref() {
+                Some(old) => match self.load_tree_cached(old, cache, txn).await? {
+                    Some(old_tree) => old_tree
+                        .tree_items
+                        .iter()
+                        .find(|x| x.name == component && x.mode == TreeItemMode::Tree)
+                        .map(|x| x.id.to_string()),
+                    None => None,
+                },
+                None => None,
+            };
+            new_hash = next_new;
+        }
+        Ok(DescendantResolve::Changed(new_hash))
+    }
+
+    async fn load_tree_cached(
+        &self,
+        hash: &str,
+        cache: &mut HashMap<String, Arc<Tree>>,
+        txn: &DatabaseTransaction,
+    ) -> Result<Option<Arc<Tree>>, MegaError> {
+        if let Some(tree) = cache.get(hash) {
+            return Ok(Some(tree.clone()));
+        }
+        let Some(model) = self.get_tree_by_hash_in_txn(hash, txn).await? else {
+            return Ok(None);
+        };
+        let tree = Arc::new(Tree::from_mega_model(model));
+        cache.insert(hash.to_owned(), tree.clone());
+        Ok(Some(tree))
     }
 
     /// Strict non-root ancestors of `path` (excludes `path` itself and `/`).
@@ -2200,5 +2381,366 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "/p/f.txt");
         assert_eq!(rows[0].indexed_push_id, Some(newer));
+    }
+
+    fn tree_item_tree(name: &str, tree: &Tree) -> git_internal::internal::object::tree::TreeItem {
+        git_internal::internal::object::tree::TreeItem::new(
+            TreeItemMode::Tree,
+            tree.id,
+            name.to_string(),
+        )
+    }
+
+    async fn save_main_ref(
+        mono: &MonoStorage,
+        path: &str,
+        commit: &Commit,
+        tree: &Tree,
+        is_cl: bool,
+    ) {
+        mono.save_refs(
+            mega_refs::Model::new(
+                path,
+                MEGA_BRANCH_NAME.to_owned(),
+                commit.id.to_string(),
+                tree.id.to_string(),
+                is_cl,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn descendant_main_refs_component_boundary_escape_and_self_exclude() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        for path in [
+            "/",
+            "/project",
+            "/project/foo",
+            "/project/foobar",
+            "/project/my_lib",
+            "/project/myXlib",
+        ] {
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path,
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "a".repeat(40),
+                    "b".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/project/foo",
+                "refs/tags/v1".to_owned(),
+                "c".repeat(40),
+                "d".repeat(40),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/project/foo/cl",
+                MEGA_BRANCH_NAME.to_owned(),
+                "e".repeat(40),
+                "f".repeat(40),
+                true,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        let under_project = mono.descendant_main_refs("/project", &txn).await.unwrap();
+        let paths: Vec<_> = under_project.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/project/foo"));
+        assert!(paths.contains(&"/project/foobar"));
+        assert!(paths.contains(&"/project/my_lib"));
+        assert!(paths.contains(&"/project/myXlib"));
+        assert!(!paths.contains(&"/project"));
+        assert!(!paths.contains(&"/"));
+
+        let under_foo = mono
+            .descendant_main_refs("/project/foo", &txn)
+            .await
+            .unwrap();
+        assert!(
+            under_foo.is_empty(),
+            "is_cl descendant and tags must be excluded: {under_foo:?}"
+        );
+
+        let under_lib = mono
+            .descendant_main_refs("/project/my_lib", &txn)
+            .await
+            .unwrap();
+        assert!(
+            under_lib.is_empty(),
+            "LIKE '_' must not match /project/myXlib"
+        );
+
+        let under_root = mono.descendant_main_refs("/", &txn).await.unwrap();
+        assert!(!under_root.iter().any(|r| r.path == "/"));
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn advance_descendant_refs_four_outcomes_prune_and_isolation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        let leaf_eq = Tree::from_tree_items(vec![blob_item(
+            "same.txt",
+            "1111111111111111111111111111111111111111",
+        )])
+        .unwrap();
+        let leaf_old = Tree::from_tree_items(vec![blob_item(
+            "old.txt",
+            "2222222222222222222222222222222222222222",
+        )])
+        .unwrap();
+        let leaf_new = Tree::from_tree_items(vec![blob_item(
+            "new.txt",
+            "3333333333333333333333333333333333333333",
+        )])
+        .unwrap();
+        let gone = Tree::from_tree_items(vec![blob_item(
+            "gone.txt",
+            "4444444444444444444444444444444444444444",
+        )])
+        .unwrap();
+        let file_was_dir = Tree::from_tree_items(vec![blob_item(
+            "wasdir.txt",
+            "5555555555555555555555555555555555555555",
+        )])
+        .unwrap();
+        let deep = Tree::from_tree_items(vec![blob_item(
+            "deep.txt",
+            "6666666666666666666666666666666666666666",
+        )])
+        .unwrap();
+        let mid = Tree::from_tree_items(vec![tree_item_tree("c", &deep)]).unwrap();
+
+        let old_p = Tree::from_tree_items(vec![
+            tree_item_tree("eq", &leaf_eq),
+            tree_item_tree("chg", &leaf_old),
+            tree_item_tree("gone", &gone),
+            tree_item_tree("file", &file_was_dir),
+            tree_item_tree("mid", &mid),
+        ])
+        .unwrap();
+        let new_p = Tree::from_tree_items(vec![
+            tree_item_tree("eq", &leaf_eq),
+            tree_item_tree("chg", &leaf_new),
+            blob_item("file", "7777777777777777777777777777777777777777"),
+            tree_item_tree("mid", &mid),
+            blob_item("extra.txt", "8888888888888888888888888888888888888888"),
+        ])
+        .unwrap();
+
+        let dummy = ObjectHash::from_str(&"9".repeat(40)).unwrap();
+        mono.save_mega_trees(
+            vec![
+                leaf_eq.clone(),
+                leaf_old.clone(),
+                leaf_new.clone(),
+                gone.clone(),
+                file_was_dir.clone(),
+                deep.clone(),
+                mid.clone(),
+                old_p.clone(),
+                new_p.clone(),
+            ],
+            dummy,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let c_eq = Commit::from_tree_id(leaf_eq.id, vec![], "eq");
+        let c_chg = Commit::from_tree_id(leaf_old.id, vec![], "chg");
+        let c_gone = Commit::from_tree_id(gone.id, vec![], "gone");
+        let c_file = Commit::from_tree_id(file_was_dir.id, vec![], "file");
+        let c_mid = Commit::from_tree_id(mid.id, vec![], "mid");
+        let c_deep = Commit::from_tree_id(deep.id, vec![], "deep");
+        let c_p = Commit::from_tree_id(old_p.id, vec![], "p");
+        let c_sib = Commit::from_tree_id(leaf_eq.id, vec![], "sib");
+        mono.save_mega_commits(
+            vec![
+                c_eq.clone(),
+                c_chg.clone(),
+                c_gone.clone(),
+                c_file.clone(),
+                c_mid.clone(),
+                c_deep.clone(),
+                c_p.clone(),
+                c_sib.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+
+        save_main_ref(&mono, "/project", &c_p, &old_p, false).await;
+        save_main_ref(&mono, "/project/eq", &c_eq, &leaf_eq, false).await;
+        save_main_ref(&mono, "/project/chg", &c_chg, &leaf_old, false).await;
+        save_main_ref(&mono, "/project/gone", &c_gone, &gone, false).await;
+        save_main_ref(&mono, "/project/file", &c_file, &file_was_dir, false).await;
+        save_main_ref(&mono, "/project/mid", &c_mid, &mid, false).await;
+        save_main_ref(&mono, "/project/mid/c", &c_deep, &deep, false).await;
+        save_main_ref(&mono, "/projectX", &c_sib, &leaf_eq, false).await;
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/project/chg",
+                "refs/tags/keep".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        save_main_ref(&mono, "/project/cl-only", &c_eq, &leaf_eq, true).await;
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.advance_descendant_refs(
+            "/project",
+            &new_p.id.to_string(),
+            Some(&old_p.id.to_string()),
+            &txn,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let eq = mono.get_main_ref("/project/eq").await.unwrap().unwrap();
+        assert_eq!(eq.ref_commit_hash, c_eq.id.to_string(), "unchanged skip");
+        assert_eq!(eq.ref_tree_hash, leaf_eq.id.to_string());
+
+        let chg = mono.get_main_ref("/project/chg").await.unwrap().unwrap();
+        assert_eq!(chg.ref_tree_hash, leaf_new.id.to_string());
+        assert_ne!(chg.ref_commit_hash, c_chg.id.to_string());
+        let cont = mono
+            .get_commit_by_hash(&chg.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let parents: Vec<String> = serde_json::from_value(cont.parents_id).unwrap();
+        assert_eq!(parents, vec![c_chg.id.to_string()]);
+
+        assert!(mono.get_main_ref("/project/gone").await.unwrap().is_none());
+        let tomb = mono
+            .get_tombstone("/project/gone", MEGA_BRANCH_NAME)
+            .await
+            .unwrap()
+            .expect("tombstone for deleted dir");
+        assert_eq!(tomb.last_commit_hash, c_gone.id.to_string());
+
+        assert!(
+            mono.get_main_ref("/project/file").await.unwrap().is_none(),
+            "directory replaced by blob must delete, not write blob hash"
+        );
+        assert!(
+            mono.get_tombstone("/project/file", MEGA_BRANCH_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let mid_row = mono.get_main_ref("/project/mid").await.unwrap().unwrap();
+        assert_eq!(mid_row.ref_commit_hash, c_mid.id.to_string(), "prune skip");
+        let deep_row = mono.get_main_ref("/project/mid/c").await.unwrap().unwrap();
+        assert_eq!(
+            deep_row.ref_commit_hash,
+            c_deep.id.to_string(),
+            "deeper candidate skipped after same-layer prune"
+        );
+
+        let sib = mono.get_main_ref("/projectX").await.unwrap().unwrap();
+        assert_eq!(sib.ref_commit_hash, c_sib.id.to_string());
+
+        let tag = mono
+            .get_ref_by_name("refs/tags/keep")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag.ref_commit_hash, "a".repeat(40));
+
+        let cl = mono.get_main_ref("/project/cl-only");
+        // is_cl rows are not main refs via get_main_ref (RefName=main AND we saved is_cl)
+        // get_main_ref does not filter is_cl — it will find the is_cl row if RefName is main.
+        let cl_row = cl.await.unwrap();
+        assert!(cl_row.is_some(), "is_cl descendant must be untouched");
+        assert_eq!(cl_row.unwrap().ref_commit_hash, c_eq.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn advance_descendant_refs_root_does_not_self_parent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items(vec![blob_item(
+            "x.txt",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap();
+        let old_root = Tree::from_tree_items(vec![tree_item_tree("child", &child)]).unwrap();
+        let new_root = Tree::from_tree_items(vec![
+            tree_item_tree("child", &child),
+            blob_item("root.txt", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ])
+        .unwrap();
+        let dummy = ObjectHash::from_str(&"1".repeat(40)).unwrap();
+        mono.save_mega_trees(
+            vec![child.clone(), old_root.clone(), new_root.clone()],
+            dummy,
+            None,
+        )
+        .await
+        .unwrap();
+        let c_child = Commit::from_tree_id(child.id, vec![], "child");
+        let c_root = Commit::from_tree_id(old_root.id, vec![], "root");
+        mono.save_mega_commits(vec![c_child.clone(), c_root.clone()], None)
+            .await
+            .unwrap();
+        save_main_ref(&mono, "/", &c_root, &old_root, false).await;
+        save_main_ref(&mono, "/child", &c_child, &child, false).await;
+
+        let conn = mono.get_connection();
+        let txn = conn.begin().await.unwrap();
+        mono.advance_descendant_refs(
+            "/",
+            &new_root.id.to_string(),
+            Some(&old_root.id.to_string()),
+            &txn,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let root = mono.get_main_ref("/").await.unwrap().unwrap();
+        assert_eq!(
+            root.ref_commit_hash,
+            c_root.id.to_string(),
+            "root must not continue itself"
+        );
+        let child_row = mono.get_main_ref("/child").await.unwrap().unwrap();
+        assert_eq!(child_row.ref_commit_hash, c_child.id.to_string());
     }
 }

@@ -62,7 +62,7 @@ use git_internal::{
     },
 };
 use regex::Regex;
-use sea_orm::DatabaseTransaction;
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use tracing::debug;
 
 use crate::{
@@ -2964,6 +2964,7 @@ impl MonoApiService {
 
     /// Merges a CL without checking for conflicts.
     /// Caller is responsible for ensuring no conflicts exist before calling this method.
+    /// Path/root writes and descendant continuation share one transaction (2.7).
     async fn merge_cl_unchecked(
         &self,
         authz_principal: &str,
@@ -2996,16 +2997,28 @@ impl MonoApiService {
             (path, update_chain)
         };
         let result = MonoServiceLogic::build_result_by_chain(path, update_chain, commit.tree_id)?;
-        self.apply_update_result(&result, "cl merge generated commit", Some(cl.link.as_str()))
-            .await?;
+        let old_main_tree_hash = storage.get_main_ref("/").await?.map(|r| r.ref_tree_hash);
 
-        if normalized_path != "/" {
-            storage
-                .remove_none_cl_refs(&normalized_path)
-                .await
-                .map_err(|e| GitError::CustomError(format!("Failed to remove refs: {}", e)))?;
-            // TODO: self.clean_dangling_commits().await;
-        }
+        let conn = storage.get_connection();
+        let txn = conn
+            .begin()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let new_commit_id = match self
+            .merge_apply_and_advance_in_txn(&txn, &result, &normalized_path, &cl.link)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        };
+        txn.commit()
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        self.notify_authz_after_main_write(&new_commit_id, old_main_tree_hash.as_deref())
+            .await?;
         // add conversation
         self.storage
             .conversation_storage()
@@ -3107,21 +3120,141 @@ impl MonoApiService {
             return Err(GitError::CustomError(e.to_string()));
         }
 
-        // UN-16: notify the shared authz snapshot of a possible
-        // `/.mega_cedar.json` change on main. merge / merge-no-auth / merge
-        // queue all funnel through this single point.
-        // These reads also happen after the ref write, so a failure here leaves
-        // the snapshot stale just like a failed save above: mark dirty too.
+        // UN-16: these reads happen after the ref write, so a failure here
+        // leaves the snapshot stale just like a failed save above: mark dirty.
+        self.notify_authz_after_main_write(&new_commit_id, old_main_tree_hash.as_deref())
+            .await?;
+
+        Ok(new_commit_id)
+    }
+
+    /// trunk-push.md 2.7: path/root writes and descendant continuation share one
+    /// commit. Unlike [`Self::apply_update_result_in_txn`] this keeps the
+    /// legacy last-write-wins ref update (no root CAS). Authz notify is the
+    /// caller's after `txn.commit()`.
+    async fn apply_update_result_in_open_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        result: &TreeUpdateResult,
+        commit_msg: &str,
+        cl_link: Option<&str>,
+    ) -> Result<String, GitError> {
+        let storage = self.storage.mono_storage();
+        let mut new_commit_id = String::new();
+        let mut commits: Vec<Commit> = Vec::new();
+
+        let paths: Vec<&str> = result.ref_updates.iter().map(|r| r.path.as_str()).collect();
+
+        let cl_refs_formatted = cl_link.map(|cl| format!("refs/cl/{}", cl));
+        let cl_refs: Option<Vec<&str>> = cl_refs_formatted
+            .as_ref()
+            .map(|formatted| vec![formatted.as_str(), MEGA_BRANCH_NAME]);
+
+        let refs = storage
+            .get_refs_for_paths_and_cls_in_txn(&paths, cl_refs.as_deref(), txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        let mut updates: Vec<RefUpdateData> = Vec::new();
+
+        MonoServiceLogic::process_ref_updates(
+            result,
+            &refs,
+            commit_msg,
+            &mut commits,
+            &mut updates,
+            &mut new_commit_id,
+        )?;
+
+        if new_commit_id.is_empty() {
+            return Err(GitError::CustomError(
+                "no commit_id generated: no matching refs found for the update paths".into(),
+            ));
+        }
+
+        storage
+            .batch_update_by_path_in_txn(txn, updates)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        storage
+            .save_mega_commits(commits, Some(txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        let save_trees: Vec<mega_tree::ActiveModel> = result
+            .updated_trees
+            .clone()
+            .into_iter()
+            .map(|save_t| {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+                tree_model.commit_id.clone_from(&new_commit_id);
+                tree_model.into()
+            })
+            .collect();
+
+        storage
+            .batch_save_model_with_txn(save_trees, Some(txn))
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        Ok(new_commit_id)
+    }
+
+    async fn merge_apply_and_advance_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        result: &TreeUpdateResult,
+        normalized_path: &str,
+        cl_link: &str,
+    ) -> Result<String, GitError> {
+        let storage = self.storage.mono_storage();
+        let old_tree = storage
+            .get_main_ref_in_txn(normalized_path, txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .map(|r| r.ref_tree_hash);
+        let new_commit_id = self
+            .apply_update_result_in_open_txn(
+                txn,
+                result,
+                "cl merge generated commit",
+                Some(cl_link),
+            )
+            .await?;
+        let new_tree = storage
+            .get_main_ref_in_txn(normalized_path, txn)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?
+            .map(|r| r.ref_tree_hash)
+            .ok_or_else(|| {
+                GitError::CustomError(format!("Main ref missing after merge at {normalized_path}"))
+            })?;
+        storage
+            .advance_descendant_refs(normalized_path, &new_tree, old_tree.as_deref(), txn)
+            .await
+            .map_err(|e| {
+                GitError::CustomError(format!("Failed to advance descendant refs: {e}"))
+            })?;
+        Ok(new_commit_id)
+    }
+
+    async fn notify_authz_after_main_write(
+        &self,
+        new_commit_id: &str,
+        old_main_tree_hash: Option<&str>,
+    ) -> Result<(), GitError> {
+        let storage = self.storage.mono_storage();
         let blob_ids = async {
             let new_commit = storage
-                .get_commit_by_hash(&new_commit_id)
+                .get_commit_by_hash(new_commit_id)
                 .await?
                 .ok_or_else(|| MegaError::Other("new commit not found".into()))?;
             let new_blob_id = storage
                 .get_tree_by_hash(&new_commit.tree)
                 .await?
                 .and_then(|t| authz_blob_id(&Tree::from_mega_model(t)));
-            let old_blob_id = match &old_main_tree_hash {
+            let old_blob_id = match old_main_tree_hash {
                 Some(hash) => storage
                     .get_tree_by_hash(hash)
                     .await?
@@ -3144,8 +3277,7 @@ impl MonoApiService {
             new_blob_id.as_deref(),
         )
         .await;
-
-        Ok(new_commit_id)
+        Ok(())
     }
 
     /// TP-11: `refs/heads/main` tree-hash assertion (shared with push).
@@ -7898,53 +8030,181 @@ mod mc09_tests {
     }
 
     #[tokio::test]
-    async fn queue_merge_nested_descendant_missing_after_parent_merge() {
-        let blob = blob_item("x.txt", "dddddddddddddddddddddddddddddddddddddddd");
-        let child = Tree::from_tree_items(vec![blob.clone()]).expect("child tree");
-        let (_temp, storage, service, cl_a, _) =
-            queue_merge_fixture("/a", "QNEST1", Some(("a".into(), child))).await;
-        // /a/b exists as a descendant main so parent merge deletes it.
-        storage
-            .mono_storage()
-            .save_refs(
-                mega_refs::Model {
-                    id: crate::callisto::entity_ext::generate_id(),
-                    path: "/a/b".into(),
-                    ref_name: MEGA_BRANCH_NAME.to_string(),
-                    ref_commit_hash: "a".repeat(40),
-                    ref_tree_hash: "b".repeat(40),
-                    created_at: chrono::Utc::now().naive_utc(),
-                    updated_at: chrono::Utc::now().naive_utc(),
-                    is_cl: false,
-                },
-                None,
+    async fn queue_merge_nested_descendant_continues_then_second_merge_lands() {
+        let _lock = crate::ceres::pack::materialize::lock_materialize_tests().await;
+        let blob_old = blob_item("x.txt", "dddddddddddddddddddddddddddddddddddddddd");
+        let b_old = Tree::from_tree_items(vec![blob_old]).expect("b old");
+        let a_old = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            b_old.id,
+            "b".into(),
+        )])
+        .expect("a old");
+        let blob_new = blob_item("x.txt", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let b_mid = Tree::from_tree_items(vec![blob_new]).expect("b mid");
+        let a_new = Tree::from_tree_items(vec![
+            TreeItem::new(TreeItemMode::Tree, b_mid.id, "b".into()),
+            blob_item("queued.txt", "cccccccccccccccccccccccccccccccccccccccc"),
+        ])
+        .expect("a new");
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage_queue_merge(temp.path()).await;
+        let service = test_service(&storage);
+        let mono = storage.mono_storage();
+
+        let root = Tree::from_tree_items(vec![
+            blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            TreeItem::new(TreeItemMode::Tree, a_old.id, "a".into()),
+        ])
+        .expect("root");
+        let old_commit = Commit::from_tree_id(root.id, vec![], "base");
+        let cl_a_commit = Commit::from_tree_id(a_new.id, vec![old_commit.id], "cl /a");
+        let b_commit = Commit::from_tree_id(b_old.id, vec![], "main@/a/b");
+        let a_commit = Commit::from_tree_id(a_old.id, vec![], "main@/a");
+        mono.save_mega_trees(
+            vec![
+                b_old.clone(),
+                a_old.clone(),
+                b_mid.clone(),
+                a_new.clone(),
+                root.clone(),
+            ],
+            old_commit.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(
+            vec![
+                old_commit.clone(),
+                cl_a_commit.clone(),
+                b_commit.clone(),
+                a_commit.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        setup_main_ref(&storage, &root, &old_commit.id.to_string()).await;
+        mono.save_refs(
+            mega_refs::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                path: "/a".into(),
+                ref_name: MEGA_BRANCH_NAME.to_string(),
+                ref_commit_hash: a_commit.id.to_string(),
+                ref_tree_hash: a_old.id.to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+                is_cl: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_refs(
+            mega_refs::Model {
+                id: crate::callisto::entity_ext::generate_id(),
+                path: "/a/b".into(),
+                ref_name: MEGA_BRANCH_NAME.to_string(),
+                ref_commit_hash: b_commit.id.to_string(),
+                ref_tree_hash: b_old.id.to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+                is_cl: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_or_update_cl_ref(
+            "/a",
+            "refs/cl/QNEST1",
+            &cl_a_commit.id.to_string(),
+            &a_new.id.to_string(),
+        )
+        .await
+        .unwrap();
+        let cl_a = storage
+            .cl_storage()
+            .new_cl_model(
+                "/a",
+                "QNEST1",
+                "queue merge /a",
+                "main",
+                &a_commit.id.to_string(),
+                &cl_a_commit.id.to_string(),
+                "gate-tester",
             )
             .await
             .unwrap();
+
         service
             .merge_cl("gate-tester", "gate-tester", cl_a)
             .await
             .expect("/a merge");
-        assert!(
-            storage
-                .mono_storage()
-                .get_main_ref("/a/b")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let cl_b = gate_test_cl(
-            "QNEST2",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        );
-        let mut cl_b = cl_b;
-        cl_b.path = "/a/b".into();
-        let err = service
+
+        let after_a = storage
+            .mono_storage()
+            .get_main_ref("/a/b")
+            .await
+            .unwrap()
+            .expect("descendant must continue, not be deleted");
+        assert_eq!(after_a.ref_tree_hash, b_mid.id.to_string());
+        let cont = storage
+            .mono_storage()
+            .get_commit_by_hash(&after_a.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let parents: Vec<String> = serde_json::from_value(cont.parents_id).unwrap();
+        assert_eq!(parents, vec![b_commit.id.to_string()]);
+
+        let blob_tip = blob_item("x.txt", "ffffffffffffffffffffffffffffffffffffffff");
+        let b_tip = Tree::from_tree_items(vec![blob_tip]).expect("b tip");
+        let parent = ObjectHash::from_str(&after_a.ref_commit_hash).unwrap();
+        let cl_b_commit = Commit::from_tree_id(b_tip.id, vec![parent], "cl /a/b");
+        mono.save_mega_trees(vec![b_tip.clone()], cl_b_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![cl_b_commit.clone()], None)
+            .await
+            .unwrap();
+        let cl_b = storage
+            .cl_storage()
+            .new_cl_model(
+                "/a/b",
+                "QNEST2",
+                "queue merge /a/b",
+                "main",
+                &after_a.ref_commit_hash,
+                &cl_b_commit.id.to_string(),
+                "gate-tester",
+            )
+            .await
+            .unwrap();
+        service
             .merge_cl("gate-tester", "gate-tester", cl_b)
             .await
-            .expect_err("/a/b merge must refuse missing main");
-        assert!(err.to_string().to_lowercase().contains("main ref"), "{err}");
+            .expect("/a/b merge after parent continuation");
+        let landed = storage
+            .mono_storage()
+            .get_main_ref("/a/b")
+            .await
+            .unwrap()
+            .unwrap();
+        let landed_c = storage
+            .mono_storage()
+            .get_commit_by_hash(&landed.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let landed_parents: Vec<String> = serde_json::from_value(landed_c.parents_id).unwrap();
+        assert_eq!(
+            landed_parents,
+            vec![after_a.ref_commit_hash],
+            "second merge parent must equal post-/a continuation tip"
+        );
     }
 
     #[tokio::test]
@@ -9337,6 +9597,128 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pref.ref_commit_hash, new_commit.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn tp14_push_continues_changed_descendant_and_skips_unchanged() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tp11_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let foo_old = Tree::from_tree_items(vec![blob_item(
+            "a.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .unwrap();
+        let foo_new = Tree::from_tree_items(vec![blob_item(
+            "a.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let keep = Tree::from_tree_items(vec![blob_item(
+            "k.txt",
+            "ffffffffffffffffffffffffffffffffffffffff",
+        )])
+        .unwrap();
+        let p_old = Tree::from_tree_items(vec![
+            TreeItem::new(TreeItemMode::Tree, foo_old.id, "foo".into()),
+            TreeItem::new(TreeItemMode::Tree, keep.id, "keep".into()),
+        ])
+        .unwrap();
+        let p_new = Tree::from_tree_items(vec![
+            TreeItem::new(TreeItemMode::Tree, foo_new.id, "foo".into()),
+            TreeItem::new(TreeItemMode::Tree, keep.id, "keep".into()),
+        ])
+        .unwrap();
+        let root = Tree::from_tree_items(vec![
+            blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            TreeItem::new(TreeItemMode::Tree, p_old.id, "p14".into()),
+        ])
+        .unwrap();
+        let root_c = Commit::from_tree_id(root.id, vec![], "root");
+        let p_c = Commit::from_tree_id(p_old.id, vec![], "p14");
+        let foo_c = Commit::from_tree_id(foo_old.id, vec![], "foo");
+        let keep_c = Commit::from_tree_id(keep.id, vec![], "keep");
+        let push_c = Commit::from_tree_id(p_new.id, vec![p_c.id], "push p14");
+        mono.save_mega_trees(
+            vec![
+                foo_old.clone(),
+                foo_new.clone(),
+                keep.clone(),
+                p_old.clone(),
+                p_new.clone(),
+                root.clone(),
+            ],
+            root_c.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(
+            vec![
+                root_c.clone(),
+                p_c.clone(),
+                foo_c.clone(),
+                keep_c.clone(),
+                push_c.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        setup_main_ref(&storage, &root, &root_c.id.to_string()).await;
+        for (path, commit, tree) in [
+            ("/p14", &p_c, &p_old),
+            ("/p14/foo", &foo_c, &foo_old),
+            ("/p14/keep", &keep_c, &keep),
+        ] {
+            mono.save_refs(
+                mega_refs::Model {
+                    id: crate::callisto::entity_ext::generate_id(),
+                    path: path.into(),
+                    ref_name: MEGA_BRANCH_NAME.to_string(),
+                    ref_commit_hash: commit.id.to_string(),
+                    ref_tree_hash: tree.id.to_string(),
+                    created_at: chrono::Utc::now().naive_utc(),
+                    updated_at: chrono::Utc::now().naive_utc(),
+                    is_cl: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let payload = PushPayload {
+            commits: vec![push_c.id.to_string()],
+            fork_base: Some(p_c.id.to_string()),
+            n: 1,
+        };
+        let id = tp12_enqueue_claim(
+            &storage,
+            "/p14",
+            &p_c.id.to_string(),
+            &push_c.id.to_string(),
+            &payload,
+        )
+        .await;
+        let exec = tp12_exec(&storage, id).await;
+        assert!(
+            matches!(exec, ExecuteOutcome::Done { .. }),
+            "push B3: {exec:?}"
+        );
+
+        let foo = mono.get_main_ref("/p14/foo").await.unwrap().unwrap();
+        assert_eq!(foo.ref_tree_hash, foo_new.id.to_string());
+        let cont = mono
+            .get_commit_by_hash(&foo.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let parents: Vec<String> = serde_json::from_value(cont.parents_id).unwrap();
+        assert_eq!(parents, vec![foo_c.id.to_string()]);
+
+        let keep_row = mono.get_main_ref("/p14/keep").await.unwrap().unwrap();
+        assert_eq!(keep_row.ref_commit_hash, keep_c.id.to_string());
     }
 
     #[tokio::test]

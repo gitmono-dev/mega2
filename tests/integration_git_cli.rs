@@ -681,6 +681,213 @@ fn integration_git_cli_http_round_trip() {
     );
 }
 
+/// Host-side git for TP-14 e2e. The compose git-cli runner reaches the host via
+/// `host.docker.internal`; on this Linux bridge that path can be firewalled.
+/// The product assertions (clone /project/foo, parent merge, pull) are the same.
+fn descendant_host_git(env: &GitCliEnv, token: &str, git_args: &[&str]) -> std::process::Output {
+    git_cli::write_git_askpass(&env.case_dir.join("git-askpass.sh"));
+    let isolated_home = env.case_dir.join("git-home");
+    fs::create_dir_all(&isolated_home).expect("git home");
+    let null_config = PathBuf::from("/dev/null");
+    let mut command = Command::new("git");
+    command
+        .current_dir(&env.case_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("HOME", &isolated_home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &null_config)
+        .env("GIT_CONFIG_SYSTEM", &null_config)
+        .env(git_cli::GIT_ASKPASS_ENV, token)
+        .env("GIT_ASKPASS", env.case_dir.join("git-askpass.sh"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "credential.username")
+        .env("GIT_CONFIG_VALUE_0", git_cli::DEFAULT_GIT_AUTH_USER)
+        .env("GIT_CONFIG_KEY_1", "credential.helper")
+        .env("GIT_CONFIG_VALUE_1", "")
+        .env("GIT_CONFIG_KEY_2", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .args(git_args);
+    let output = command.output().expect("host git");
+    git_cli::assert_git_success(&output, &format!("git {}", git_args.join(" ")));
+    output
+}
+
+#[test]
+fn integration_git_cli_descendant_ref_continuation_after_parent_merge() {
+    // TP-14: clone /project/foo, local commit, merge at /project, then pull.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let root_url = git_cli::monoengine_host_http_url(port, "/");
+    descendant_host_git(&env, &token, &["clone", &root_url, "seed"]);
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        descendant_host_git(&env, &token, &["-C", "seed", "config", key, value]);
+    }
+    let seed = env.case_dir.join("seed");
+    fs::create_dir_all(seed.join("project/foo")).expect("mkdir project/foo");
+    fs::write(seed.join("project/foo/from-a.txt"), b"a-base\n").expect("write foo file");
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "seed", "add", "project/foo/from-a.txt"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "seed", "commit", "-m", "tp14 seed project/foo"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "seed",
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            "HEAD:refs/heads/tp14-seed",
+        ],
+    );
+    let seed_cl = latest_cl_link_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        merge_cl_no_auth(port, &seed_cl),
+        200,
+        "seed merge must succeed; stderr:\n{}",
+        read_log(&stderr_path)
+    );
+
+    let foo_url = git_cli::monoengine_host_http_url(port, "/project/foo");
+    descendant_host_git(&env, &token, &["clone", &foo_url, "clone-foo"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "clone-foo", "config", "user.name", "IT Git CLI"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "clone-foo",
+            "config",
+            "user.email",
+            "it-git-cli@example.invalid",
+        ],
+    );
+    fs::write(
+        env.case_dir.join("clone-foo").join("local.txt"),
+        b"a-local\n",
+    )
+    .expect("write local commit");
+    descendant_host_git(&env, &token, &["-C", "clone-foo", "add", "local.txt"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "clone-foo", "commit", "-m", "tp14 local on foo"],
+    );
+
+    let project_url = git_cli::monoengine_host_http_url(port, "/project");
+    descendant_host_git(&env, &token, &["clone", &project_url, "clone-project"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "clone-project", "config", "user.name", "IT Git CLI"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "clone-project",
+            "config",
+            "user.email",
+            "it-git-cli@example.invalid",
+        ],
+    );
+    fs::write(
+        env.case_dir.join("clone-project").join("from-b.txt"),
+        b"b-sibling\n",
+    )
+    .expect("write sibling");
+    descendant_host_git(&env, &token, &["-C", "clone-project", "add", "from-b.txt"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "clone-project", "commit", "-m", "tp14 parent push"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "clone-project",
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            "HEAD:refs/heads/tp14-parent",
+        ],
+    );
+    let parent_cl = latest_cl_link_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        merge_cl_no_auth(port, &parent_cl),
+        200,
+        "parent merge must succeed; stderr:\n{}",
+        read_log(&stderr_path)
+    );
+
+    let foo_row = ref_commit_tree(&env.database.db_url, "/project/foo", "refs/heads/main");
+    assert!(
+        foo_row.is_some(),
+        "main@/project/foo must survive parent merge"
+    );
+
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "clone-foo", "pull", "--no-rebase", "origin", "main"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "clone-foo",
+            "-c",
+            "pack.window=0",
+            "-c",
+            "pack.depth=0",
+            "push",
+            "origin",
+            "HEAD:refs/heads/tp14-continue",
+        ],
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
 #[test]
 fn integration_git_cli_http_pull_cl_ref_round_trip() {
     // ADR-GM-02 / plan-20260803 GM-02: literal `git pull` of refs/cl/* must

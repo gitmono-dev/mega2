@@ -1196,7 +1196,7 @@ CREATE INDEX mega_refs_path_pattern
 
 **2.8 merge 分支的后代切换**
 
-阶段 2 的续接逻辑必须同时接管 **merge 分支**的后代处理：`merge_cl_unchecked` 现状调用 `remove_none_cl_refs`（`mono_api_service.rs:2617-2622`），阶段 2 落地时该调用替换为 `advance_descendant_refs`（同一 B3 事务内，候选集来源从推送链 tip 的 tree 换为合并后子树的 tree，其余四种结果的处理完全一致）；**push 分支（trunk 形态）同样从交付物 5 的事务内变体切换到 `advance_descendant_refs`**——两个分支共用同一实现。这是**登记在案的行为变化**（硬约束 8 的「缺陷修复除外」）：2.1 的故障链在 review 形态下正是由 merge 触发的（B 在 `/project` 合入 CL → `remove_none_cl_refs("/project")` 删除 `main@/project/foo`），只修 push 分支不修 merge 分支等于没修——review 形态才是该故障的主战场。阶段 1 过渡期内 merge 分支沿用 `remove_none_cl_refs`（1.5 的 merge 分支注明），阶段 2 落地时一并切换，阶段 2 的验收标准补一条 merge 触发路径的断裂回归。
+阶段 2 的续接逻辑必须同时接管 **merge 分支**的后代处理：`merge_cl_unchecked` 与 B3 merge/push 均调用 `advance_descendant_refs`（同一 B3 事务内，候选集来源从推送链 tip 的 tree 换为合并后子树的 tree，其余四种结果的处理完全一致）。这是**登记在案的行为变化**（硬约束 8 的「缺陷修复除外」）：2.1 的故障链在 review 形态下正是由 merge 触发的（B 在 `/project` 合入 CL → 旧 `remove_none_cl_refs("/project")` 删除 `main@/project/foo`），只修 push 分支不修 merge 分支等于没修——review 形态才是该故障的主战场。**已落地（TP-14）**：`remove_none_cl_refs` 不再出现在 merge/push 落地面；legacy `merge_cl_unchecked` 将路径/根写入与 `advance_descendant_refs` 放在同一事务（CL 状态与 conversation 仍在提交后写入）。
 
 > **验收标准**：
 > - ✅ 断裂回归：A clone `/project/foo` 并本地提交 → B 在 `/project` 推送 → A `git pull` 成功并可继续推送（当前实现下此用例必失败）
