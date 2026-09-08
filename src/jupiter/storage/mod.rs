@@ -37,7 +37,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     common::errors::MegaError,
-    config::{Config, reload::ConfigHandle, validate::validate_buck_config},
+    config::{Config, PushPolicy, reload::ConfigHandle, validate::validate_buck_config},
     contract::{policy::entitystore::SharedEntityStore, vault::integration::vault_core::VaultCore},
     jupiter::{
         service::{
@@ -284,7 +284,8 @@ impl Storage {
         };
         let merge_queue_service = MergeQueueService::new(base.clone());
         let push_queue_service =
-            PushQueueService::new(base.clone(), config.monorepo.push_policy.clone());
+            PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
+                .with_max_push_commits(config.monorepo.max_push_commits);
         let artifact_service = ArtifactService::new(base.clone(), object_store.clone());
         let buck_service = BuckService::new(
             base.clone(),
@@ -362,6 +363,36 @@ impl Storage {
         self.config_handle
             .snapshot()
             .unwrap_or_else(|_| Arc::clone(&self.config))
+    }
+
+    /// TP-15 / 4.1 ②③⑥: DB-backed fail-closed checks at HTTP start.
+    ///
+    /// ①④⑤ live in [`Config::validate`] (no DB). ②③⑥ run here because they
+    /// read `mega_cl`, `push_queue`, and `queue_control.last_policy`. Check ⑥
+    /// (watermark reset) runs together with ③ only after a successful empty-queue
+    /// policy switch.
+    pub async fn prepare_push_policy_startup(&self) -> Result<(), MegaError> {
+        let config = self.config();
+        let policy = config.monorepo.push_policy.as_str();
+        if config.monorepo.push_policy == PushPolicy::Trunk {
+            let open = self.cl_storage().get_open_cls().await?;
+            if !open.is_empty() {
+                return Err(MegaError::Other(format!(
+                    "push_policy=trunk refuses startup with {} open change list(s); close or merge them first",
+                    open.len()
+                )));
+            }
+        }
+
+        let queue = self.push_queue_storage();
+        if let Some((from, to)) = queue.switch_last_policy_if_queue_empty(policy).await? {
+            tracing::info!(
+                from = %from,
+                to = %to,
+                "push_policy morphology switch: blob_paths.indexed_push_id reset, last_policy updated"
+            );
+        }
+        Ok(())
     }
 
     /// Get recommended concurrency limit for batch database operations.

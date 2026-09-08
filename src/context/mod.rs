@@ -111,6 +111,10 @@ impl AppContext {
     /// is built here via the inlined orbit factory, so callers no longer
     /// pre-build and inject it.
     pub async fn new(config: crate::config::Config) -> Result<Self, MegaError> {
+        // TP-15 ①④⑤ (and the rest of Config::validate) must fail-close here:
+        // `config validate` is a CLI path; service http/ssh/debug go through
+        // AppContext without that command.
+        config.validate()?;
         config.monorepo.ensure_normal_service_object_format()?;
         Self::new_with_monorepo_initialization(config).await
     }
@@ -575,6 +579,19 @@ mod tests {
         ));
         assert!(!is_secret_ref_value("AKIAEXAMPLE"));
         assert!(!is_secret_ref_value(""));
+    }
+
+    #[tokio::test]
+    async fn app_context_new_runs_config_validate_before_startup() {
+        let mut config = crate::config::Config::mock();
+        config.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        match AppContext::new(config).await {
+            Err(error) => assert!(
+                error.to_string().contains("push_auth"),
+                "trunk without push_auth must fail Config::validate: {error}"
+            ),
+            Ok(_) => panic!("trunk without push_auth must fail before AppContext startup"),
+        }
     }
 
     #[tokio::test]

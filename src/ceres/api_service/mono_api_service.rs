@@ -10270,6 +10270,7 @@ mod tests {
             &cmd,
             new_commit.clone(),
             &storage.mono_storage(),
+            crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();

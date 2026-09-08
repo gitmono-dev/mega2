@@ -17,10 +17,7 @@ use git_internal::internal::object::commit::Commit;
 
 use crate::{
     callisto::{mega_cl, sea_orm_active_enums::RefTypeEnum},
-    ceres::{
-        merge_checker::MAX_CL_CHAIN_COMMITS,
-        protocol::import_refs::{CommandType, RefCommand},
-    },
+    ceres::protocol::import_refs::{CommandType, RefCommand},
     common::{errors::MegaError, utils::ZERO_ID},
     jupiter::{storage::mono_storage::MonoStorage, utils::converter::FromMegaModel},
 };
@@ -96,6 +93,7 @@ impl PushChain {
         new_commit_ids: &HashSet<String>,
         tip_commit: Option<Commit>,
         storage: &MonoStorage,
+        max_commits: usize,
     ) -> Result<PushChainResolution, MegaError> {
         debug_assert!(
             cmd.command_type != CommandType::Delete && cmd.new_id != ZERO_ID,
@@ -179,18 +177,18 @@ impl PushChain {
                     let parent_is_new = new_commit_ids.contains(&parent_id);
                     if tip_is_new {
                         if parent_is_new {
-                            if new_len >= MAX_CL_CHAIN_COMMITS {
+                            if new_len >= max_commits {
                                 return Err(MegaError::Other(format!(
-                                    "push introduces more than {MAX_CL_CHAIN_COMMITS} commits in \
+                                    "push introduces more than {max_commits} commits in \
                                      one chain; split the changes into smaller pushes or squash \
                                      and re-push"
                                 )));
                             }
                             new_len += 1;
                         } else {
-                            if known_len >= MAX_CL_CHAIN_COMMITS {
+                            if known_len >= max_commits {
                                 return Err(MegaError::Other(format!(
-                                    "pack carries more than {MAX_CL_CHAIN_COMMITS} already-known \
+                                    "pack carries more than {max_commits} already-known \
                                      commits along the chain for `{}`; re-push with a thinner \
                                      pack (the redundant ancestors are not needed)",
                                     cmd.ref_name
@@ -198,9 +196,9 @@ impl PushChain {
                             }
                             known_len += 1;
                         }
-                    } else if path.len() >= MAX_CL_CHAIN_COMMITS {
+                    } else if path.len() >= max_commits {
                         return Err(MegaError::Other(format!(
-                            "push introduces more than {MAX_CL_CHAIN_COMMITS} commits in one \
+                            "push introduces more than {max_commits} commits in one \
                              chain; split the changes into smaller pushes or squash and re-push"
                         )));
                     }
@@ -333,6 +331,7 @@ impl PushChain {
         cmd: &RefCommand,
         tip: Commit,
         storage: &MonoStorage,
+        max_commits: usize,
     ) -> Result<Self, MegaError> {
         if cmd.new_id != tip.id.to_string() {
             return Err(MegaError::Other(format!(
@@ -351,9 +350,9 @@ impl PushChain {
         let mut path: Vec<Commit> = vec![tip.clone()];
         let mut current = tip.clone();
         loop {
-            if path.len() > MAX_CL_CHAIN_COMMITS {
+            if path.len() > max_commits {
                 return Err(MegaError::Other(format!(
-                    "push introduces more than {MAX_CL_CHAIN_COMMITS} commits in one chain; \
+                    "push introduces more than {max_commits} commits in one chain; \
                      split the changes into smaller pushes or squash and re-push"
                 )));
             }
@@ -413,13 +412,16 @@ impl PushChain {
     /// when counting is impossible: a missing object, unparseable
     /// `parents_id`, a parent cycle (would otherwise loop forever), or a chain
     /// that never reaches `from_hash`. The CL's cumulative range
-    /// `(from_hash → tip]` stays bounded by `MAX_CL_CHAIN_COMMITS`: exactly
-    /// 250 commits pass, one more is rejected.
+    /// `(from_hash → tip]` stays bounded by `max_commits` (review passes
+    /// [`crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS`]; trunk passes
+    /// `[monorepo].max_push_commits`): exactly that many commits pass, one more
+    /// is rejected.
     pub async fn validate(
         &self,
         cmd: &RefCommand,
         storage: &MonoStorage,
         open_cl: Option<&mega_cl::Model>,
+        max_commits: usize,
     ) -> Result<(), MegaError> {
         let tip_id = self.tip.id.to_string();
         if tip_id != cmd.new_id {
@@ -478,9 +480,9 @@ impl PushChain {
                 _ => {}
             }
         }
-        if increment_len > MAX_CL_CHAIN_COMMITS {
+        if increment_len > max_commits {
             return Err(MegaError::Other(format!(
-                "push introduces more than {MAX_CL_CHAIN_COMMITS} commits in one \
+                "push introduces more than {max_commits} commits in one \
                  chain; split the changes into smaller pushes or squash and re-push"
             )));
         }
@@ -512,11 +514,11 @@ impl PushChain {
                         ))
                     })?;
                 history_len += 1;
-                if increment_len + history_len > MAX_CL_CHAIN_COMMITS {
+                if increment_len + history_len > max_commits {
                     // The increment itself fit; the overflow comes from the
                     // pre-existing CL history — a cumulative violation.
                     return Err(MegaError::Other(format!(
-                        "updating CL {} would exceed the {MAX_CL_CHAIN_COMMITS}-commit \
+                        "updating CL {} would exceed the {max_commits}-commit \
                          cumulative limit ({} → {tip_id}); \
                          merge the current CL first or open a new CL",
                         cl.link, cl.from_hash
@@ -645,6 +647,7 @@ mod tests {
             &pack.clone(),
             Some(tip.clone()),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();
@@ -674,6 +677,7 @@ mod tests {
             &pack.clone(),
             Some(tip.clone()),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();
@@ -704,6 +708,7 @@ mod tests {
             &pack.clone(),
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();
@@ -748,6 +753,7 @@ mod tests {
             &new_ids,
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();
@@ -786,6 +792,7 @@ mod tests {
             &new_ids,
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();
@@ -818,6 +825,7 @@ mod tests {
             &id_set(&[&junk.commit_id]),
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -835,6 +843,7 @@ mod tests {
             &id_set(&[]),
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -866,6 +875,7 @@ mod tests {
             &new_ids,
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -896,6 +906,7 @@ mod tests {
             &pack.clone(),
             Some(Commit::from_mega_model(merge.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -915,6 +926,7 @@ mod tests {
             &id_set(&[]),
             Some(Commit::from_mega_model(merge.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -946,6 +958,7 @@ mod tests {
             &pack.clone(),
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -976,6 +989,7 @@ mod tests {
             &pack.clone(),
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1010,6 +1024,7 @@ mod tests {
             &pack.clone(),
             Some(tip.clone()),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1039,6 +1054,7 @@ mod tests {
             &pack.clone(),
             Some(Commit::from_mega_model(a)),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1065,6 +1081,7 @@ mod tests {
             &pack.clone(),
             Some(Commit::from_mega_model(tip.clone())),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1090,6 +1107,7 @@ mod tests {
             &pack.clone(),
             Some(tip),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1115,6 +1133,7 @@ mod tests {
             &id_set(&[]),
             Some(tip.clone()),
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap();
@@ -1137,6 +1156,7 @@ mod tests {
             &id_set(&[]),
             None,
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1160,6 +1180,7 @@ mod tests {
             &id_set(&[&new_id]),
             None,
             &storage.mono_storage(),
+            MAX_CL_CHAIN_COMMITS,
         )
         .await
         .unwrap_err();
@@ -1338,13 +1359,18 @@ mod tests {
         let chain = chain_from_increment(&base, std::slice::from_ref(&tip));
 
         chain
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect("single-commit push without an open CL must pass");
 
         let cl = open_cl(&base, &tip.commit_id);
         chain
-            .validate(&cmd, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect("single-commit push with an open CL must pass");
     }
@@ -1359,7 +1385,7 @@ mod tests {
         let cmd = branch_command(base.clone(), tip.commit_id.clone());
 
         let err = chain_from_increment(&base, &[tip, merge])
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect_err("a merge commit in the chain must be rejected");
 
@@ -1382,7 +1408,7 @@ mod tests {
         let tip = commit_row(301, &sha(301), &[sha(399)]);
         let cmd = branch_command(base.clone(), tip.commit_id.clone());
         let err = chain_from_increment(&base, std::slice::from_ref(&tip))
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect_err("an increment not reaching its base must be rejected");
         assert!(err.to_string().contains("push chain is broken"), "{err}");
@@ -1392,7 +1418,7 @@ mod tests {
         let tip2 = commit_row(311, &sha(311), &[sha(310)]);
         let cmd2 = branch_command(base.clone(), tip2.commit_id.clone());
         let err2 = chain_from_increment(&base, &[tip2, root])
-            .validate(&cmd2, &storage.mono_storage(), None)
+            .validate(&cmd2, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect_err("a chain that never reaches its base must be rejected");
         assert!(err2.to_string().contains("push chain is broken"), "{err2}");
@@ -1404,7 +1430,12 @@ mod tests {
         let cl = open_cl(&sha(350), &increment[0].commit_id);
         let cmd3 = branch_command(sha(999), increment[0].commit_id.clone());
         let err3 = chain_from_increment(&sha(999), &increment)
-            .validate(&cmd3, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd3,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect_err("a base outside the chain must be rejected");
         assert!(err3.to_string().contains("push chain is broken"), "{err3}");
@@ -1424,7 +1455,7 @@ mod tests {
         let cmd = branch_command(base.clone(), tip.commit_id.clone());
 
         let err = chain_from_increment(&base, &[tip, a.clone(), b, a])
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect_err("a parent cycle must be rejected");
 
@@ -1440,7 +1471,7 @@ mod tests {
         let cmd = branch_command(base.clone(), sha(599));
 
         let err = chain_from_increment(&base, std::slice::from_ref(&tip))
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect_err("a chain tip that is not the ref update target must be rejected");
 
@@ -1461,7 +1492,7 @@ mod tests {
         let at_limit = increment_rows(1000, MAX_CL_CHAIN_COMMITS as u64);
         let cmd = branch_command(base.clone(), at_limit[0].commit_id.clone());
         chain_from_increment(&base, &at_limit)
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect("a chain at the limit must pass");
 
@@ -1469,7 +1500,7 @@ mod tests {
         let over_limit = increment_rows(1000, MAX_CL_CHAIN_COMMITS as u64 + 1);
         let cmd = branch_command(base.clone(), over_limit[0].commit_id.clone());
         let err = chain_from_increment(&base, &over_limit)
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect_err("a chain over the limit must be rejected");
         assert!(
@@ -1492,7 +1523,7 @@ mod tests {
         let at_limit = increment_rows(8000, MAX_CL_CHAIN_COMMITS as u64);
         let cmd = branch_command(base.clone(), at_limit[0].commit_id.clone());
         chain_from_increment(&base, &at_limit)
-            .validate(&cmd, &storage.mono_storage(), None)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect("a 250-commit increment must validate with an empty mega_commit table");
 
@@ -1504,7 +1535,12 @@ mod tests {
         let cl = open_cl(&from, &base);
         let cmd = branch_command(base.clone(), increment[0].commit_id.clone());
         chain_from_increment(&base, &increment)
-            .validate(&cmd, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect("a 100+100 cumulative chain must pass reading only the history segment");
     }
@@ -1523,7 +1559,7 @@ mod tests {
         let first = increment_rows(2000, 200);
         let cmd1 = branch_command(from.clone(), first[0].commit_id.clone());
         chain_from_increment(&from, &first)
-            .validate(&cmd1, &storage.mono_storage(), None)
+            .validate(&cmd1, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
             .await
             .expect("the first 200-commit push must pass");
 
@@ -1540,7 +1576,12 @@ mod tests {
             ok_increment[0].commit_id.clone(),
         );
         chain_from_increment(&first[0].commit_id, &ok_increment)
-            .validate(&cmd_ok, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd_ok,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect("a cumulative range at the limit must pass");
 
@@ -1552,7 +1593,12 @@ mod tests {
             over_increment[0].commit_id.clone(),
         );
         let err = chain_from_increment(&first[0].commit_id, &over_increment)
-            .validate(&cmd2, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd2,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect_err("a cumulative range over the limit must be rejected");
         let msg = err.to_string();
@@ -1590,7 +1636,12 @@ mod tests {
         let tip = commit_row(704, &sha(704), std::slice::from_ref(&base));
         let cmd = branch_command(base.clone(), tip.commit_id.clone());
         chain_from_increment(&base, std::slice::from_ref(&tip))
-            .validate(&cmd, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect("a merge commit in CL history must not reject a clean increment");
 
@@ -1614,7 +1665,12 @@ mod tests {
         let increment = increment_rows(3000 + 249, 2);
         let cmd = branch_command(base.clone(), increment[0].commit_id.clone());
         let err = chain_from_increment(&base, &increment)
-            .validate(&cmd, &storage.mono_storage(), Some(&cl))
+            .validate(
+                &cmd,
+                &storage.mono_storage(),
+                Some(&cl),
+                MAX_CL_CHAIN_COMMITS,
+            )
             .await
             .expect_err("an overlong CL history must be rejected by the cumulative count");
         let msg = err.to_string();
@@ -1623,6 +1679,22 @@ mod tests {
             msg.contains("merge the current CL first or open a new CL"),
             "{msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_respects_caller_max_commits() {
+        let (_temp, storage) = setup_storage().await;
+        let base = sha(9000);
+        let three = increment_rows(9000, 3);
+        let cmd = branch_command(base.clone(), three[0].commit_id.clone());
+        chain_from_increment(&base, &three)
+            .validate(&cmd, &storage.mono_storage(), None, 2)
+            .await
+            .expect_err("trunk max_push_commits=2 must reject a 3-commit increment");
+        chain_from_increment(&base, &three)
+            .validate(&cmd, &storage.mono_storage(), None, MAX_CL_CHAIN_COMMITS)
+            .await
+            .expect("review MAX_CL_CHAIN_COMMITS=250 still accepts a 3-commit increment");
     }
 
     /// TP-03 Verification: operation_id fingerprint semantics (trunk-push §1.11).

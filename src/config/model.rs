@@ -158,15 +158,25 @@ pub struct MonoConfig {
     #[serde(default)]
     pub rename: RenameConfig,
     /// Runtime push morphology. Default `review` keeps existing CL semantics
-    /// (hard constraint 8). TP-03 reads this as the test-only trunk switch;
-    /// full fail-closed startup validation lands in TP-15.
+    /// (hard constraint 8). Restart-required; fail-closed startup checks
+    /// live in [`crate::config::validate`].
     #[serde(default)]
     pub push_policy: PushPolicy,
+    /// Trunk-only first-parent chain bound (ADR-TP-17). Review morphology
+    /// keeps [`crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS`].
+    #[serde(default = "default_max_push_commits")]
+    pub max_push_commits: usize,
     /// Single-writer switch for CL merge (TP-07). Default `legacy` is the
     /// migration-period rollback value; production steady state is `queue`.
     /// Restart-required.
     #[serde(default)]
     pub merge_writer: MergeWriter,
+}
+
+pub const DEFAULT_MAX_PUSH_COMMITS: usize = 250;
+
+fn default_max_push_commits() -> usize {
+    DEFAULT_MAX_PUSH_COMMITS
 }
 
 impl Default for MonoConfig {
@@ -184,7 +194,17 @@ impl Default for MonoConfig {
             object_format: MonoObjectFormat::default(),
             rename: RenameConfig::default(),
             push_policy: PushPolicy::default(),
+            max_push_commits: default_max_push_commits(),
             merge_writer: MergeWriter::default(),
+        }
+    }
+}
+
+impl PushPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Trunk => "trunk",
         }
     }
 }
@@ -1051,6 +1071,41 @@ pub struct GitConfig {
     /// Defaults to `true` (backwards compatible).
     #[serde(default = "default_git_anonymous_access")]
     pub anonymous_access: bool,
+    /// Omitted = existing OAuth/UserStorage chain (review-only). Explicit
+    /// `"token"` / `"none"` is storage-only and requires `push_policy=trunk`.
+    #[serde(default)]
+    pub push_auth: Option<PushAuth>,
+    /// Static push tokens for `push_auth = "token"`. `paths` omitted means
+    /// the whole repository. Restart-required.
+    #[serde(default)]
+    pub push_tokens: Vec<PushTokenConfig>,
+}
+
+/// Storage-only git HTTP push authentication (TP-15 config surface; TP-19
+/// implements the authenticator).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PushAuth {
+    Token,
+    None,
+}
+
+impl PushAuth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PushTokenConfig {
+    pub name: String,
+    pub token: String,
+    /// Prefix authorization. Omitted or empty = whole repository.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
 }
 
 fn default_git_anonymous_access() -> bool {
@@ -1061,8 +1116,36 @@ impl Default for GitConfig {
     fn default() -> Self {
         Self {
             anonymous_access: default_git_anonymous_access(),
+            push_auth: None,
+            push_tokens: Vec::new(),
         }
     }
+}
+
+/// Component-boundary path authorization used by `[[git.push_tokens]].paths`.
+/// `/foo` does not authorize `/foobar`.
+pub fn token_path_authorizes(authorized: &str, pushed: &str) -> bool {
+    let authorized = normalize_token_path(authorized);
+    let pushed = normalize_token_path(pushed);
+    if authorized == "/" {
+        return true;
+    }
+    pushed == authorized || pushed.starts_with(&format!("{authorized}/"))
+}
+
+pub fn normalize_token_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "/".to_owned();
+    }
+    let mut p = trimmed.replace('\\', "/");
+    if !p.starts_with('/') {
+        p.insert(0, '/');
+    }
+    while p.len() > 1 && p.ends_with('/') {
+        p.pop();
+    }
+    p
 }
 
 /// `[cedar]` authorization enforcement settings (ADR-UN-01).

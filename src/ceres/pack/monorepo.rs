@@ -33,6 +33,7 @@ use crate::{
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
         code_edit::{model::collect_cl_chain, on_push::OnpushCodeEdit, utils::get_changed_files},
+        merge_checker::MAX_CL_CHAIN_COMMITS,
         model::change_list::ClDiffFile,
         pack::{
             RepoHandler,
@@ -1029,8 +1030,20 @@ impl Monorepo {
             .get_open_cl_by_path(self.path.to_str().unwrap(), &self.username())
             .await?;
         chain
-            .validate(&cmd, &self.storage.mono_storage(), open_cl.as_ref())
+            .validate(
+                &cmd,
+                &self.storage.mono_storage(),
+                open_cl.as_ref(),
+                self.chain_commit_limit(),
+            )
             .await
+    }
+
+    fn chain_commit_limit(&self) -> usize {
+        match self.storage.config().monorepo.push_policy {
+            PushPolicy::Trunk => self.storage.config().monorepo.max_push_commits,
+            PushPolicy::Review => MAX_CL_CHAIN_COMMITS,
+        }
     }
 
     /// Build the [`PushChain`] for a branch command, cached per `new_id` so a
@@ -1076,6 +1089,7 @@ impl Monorepo {
             &new_commit_ids,
             tip_commit.clone(),
             &self.storage.mono_storage(),
+            self.chain_commit_limit(),
         )
         .await?
         {
@@ -1088,7 +1102,15 @@ impl Monorepo {
                             cmd.new_id
                         ))
                     })?;
-                    Some(PushChain::from_known_tip(cmd, tip, &self.storage.mono_storage()).await?)
+                    Some(
+                        PushChain::from_known_tip(
+                            cmd,
+                            tip,
+                            &self.storage.mono_storage(),
+                            self.chain_commit_limit(),
+                        )
+                        .await?,
+                    )
                 } else {
                     // GC-MC-14: the no-op is logged, not silent; the notice also
                     // reaches the git client as a `remote:` line (sideband

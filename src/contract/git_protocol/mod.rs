@@ -296,6 +296,7 @@ mod tests {
     async fn anonymous_access_allowed_by_default() {
         let git_config = GitConfig {
             anonymous_access: true,
+            ..Default::default()
         };
         let auth = AuthContext {
             username: None,
@@ -310,6 +311,7 @@ mod tests {
     async fn anonymous_access_denied_when_disabled_and_no_auth() {
         let git_config = GitConfig {
             anonymous_access: false,
+            ..Default::default()
         };
         let auth = AuthContext {
             username: None,
@@ -329,6 +331,7 @@ mod tests {
     async fn authenticated_access_allowed_when_anonymous_disabled() {
         let git_config = GitConfig {
             anonymous_access: false,
+            ..Default::default()
         };
         let auth = AuthContext {
             username: Some("alice".to_string()),

@@ -47,8 +47,11 @@ root_dirs = ["third-party", "project", "doc", "release", "toolchains"]
 # Do not use SHA-256 for a normal Git service; run `service init --yes` only.
 object_format = "sha1"
 # Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
-# Restart-required; full startup fail-closed checks land in TP-15.
+# Restart-required. Trunk requires cedar.enforcement="off", no open CLs, and
+# an explicit git.push_auth of "token" or "none".
 # push_policy = "review"
+# Trunk-only first-parent chain bound. Review morphology keeps MAX_CL_CHAIN_COMMITS=250.
+# max_push_commits = 250
 # CL merge writer: "legacy" (migration rollback) or "queue" (MonoWriteQueue).
 # Production steady state is queue. Restart-required.
 # merge_writer = "legacy"
@@ -101,6 +104,16 @@ enable = false
 interval_secs = 3600
 grace_secs = 86400
 batch_limit = 100
+
+# Git protocol / trunk push authentication. Omitted push_auth = OAuth/UserStorage
+# (review only). "token" | "none" requires monorepo.push_policy = "trunk".
+# [git]
+# anonymous_access = true
+# push_auth = "token"
+# [[git.push_tokens]]
+# name = "team-foo"
+# token = "${{file:/run/secrets/team_foo_token}}"
+# paths = ["/project/foo"]
 
 "#
     )

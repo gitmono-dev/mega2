@@ -298,6 +298,16 @@ impl MonoStorage {
         Ok(sql.rows_affected() > 0)
     }
 
+    /// TP-15 / 4.1 ⑥: morphology switch resets every watermark to NULL.
+    pub async fn reset_blob_path_index_watermarks(&self) -> Result<u64, MegaError> {
+        let stmt = Statement::from_string(
+            DbBackend::Postgres,
+            "UPDATE blob_paths SET indexed_push_id = NULL".to_owned(),
+        );
+        let res = self.get_connection().execute_raw(stmt).await?;
+        Ok(res.rows_affected())
+    }
+
     async fn reconcile_blob_paths_under_prefix(
         &self,
         prefix: &str,

@@ -658,3 +658,6 @@ mod test {
         assert_eq!(loaded.database.max_connection, 4);
     }
 }
+
+#[cfg(test)]
+mod tests;

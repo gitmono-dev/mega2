@@ -54,6 +54,25 @@ enforcement = "off"   # off | shadow | enforce
 are available via `config validate --show-sources --format json` (the JSON
 output includes the field's winning source).
 
+## Push morphology and trunk authentication
+
+`[monorepo].push_policy` is `"review"` (default, CL pipeline) or `"trunk"`
+(MonoWriteQueue). `[monorepo].max_push_commits` (default 250) bounds first-parent
+chain length in trunk morphology only; review morphology keeps the
+`MAX_CL_CHAIN_COMMITS` constant. Both fields are restart-required.
+
+`[git].push_auth` omitted keeps the existing OAuth / UserStorage chain (review
+only). Explicit `"token"` or `"none"` requires `push_policy = "trunk"`; trunk
+requires an explicit `push_auth`. `[[git.push_tokens]]` entries authorize by
+component-boundary path prefix (`/foo` does not authorize `/foobar`); omitted
+`paths` means the whole repository. Token values may be literals (IT/tests) or
+`vault://secret/config/<profile>/git/push_tokens/<name>#<field>` SecretRefs.
+File-mounted secrets use `${file:...}` and are expanded at load.
+
+Trunk HTTP start additionally refuses open change lists, a `push_policy`
+change while `push_queue` has non-terminal rows (`queue_control.last_policy`),
+and resets `blob_paths.indexed_push_id` to NULL on a successful empty-queue
+morphology switch.
 
 ## Website authentication and product email
 

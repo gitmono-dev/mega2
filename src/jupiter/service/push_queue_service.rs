@@ -19,7 +19,7 @@ use crate::{
         errors::MegaError,
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
-    config::PushPolicy,
+    config::{DEFAULT_MAX_PUSH_COMMITS, PushPolicy},
     jupiter::storage::{
         base_storage::{BaseStorage, StorageConnector},
         blob_path_index::BlobPathIndexMode,
@@ -408,6 +408,7 @@ pub struct PushQueueService {
     push_queue_storage: PushQueueStorage,
     mono_storage: MonoStorage,
     push_policy: PushPolicy,
+    max_push_commits: usize,
     wait_timeout: Duration,
     poll_interval: Duration,
     metrics: PushQueueMetrics,
@@ -419,6 +420,7 @@ impl PushQueueService {
             push_queue_storage: PushQueueStorage::new(base.clone()),
             mono_storage: MonoStorage { base },
             push_policy,
+            max_push_commits: DEFAULT_MAX_PUSH_COMMITS,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             poll_interval: DEFAULT_POLL_INTERVAL,
             metrics: PushQueueMetrics::default(),
@@ -428,6 +430,11 @@ impl PushQueueService {
     pub fn with_timeouts(mut self, wait_timeout: Duration, poll_interval: Duration) -> Self {
         self.wait_timeout = wait_timeout;
         self.poll_interval = poll_interval;
+        self
+    }
+
+    pub fn with_max_push_commits(mut self, max_push_commits: usize) -> Self {
+        self.max_push_commits = max_push_commits;
         self
     }
 
@@ -686,12 +693,15 @@ impl PushQueueService {
                     .into(),
             ));
         }
+        let chain_limit = match self.push_policy {
+            PushPolicy::Trunk => self.max_push_commits,
+            PushPolicy::Review => crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS,
+        };
         if let Some(n) = req.payload.get("n").and_then(JsonValue::as_u64)
-            && n > crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS as u64
+            && n > chain_limit as u64
         {
             return Err(MegaError::Other(format!(
-                "push introduces more than {} commits in one chain; split the changes into smaller pushes or squash and re-push",
-                crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS
+                "push introduces more than {chain_limit} commits in one chain; split the changes into smaller pushes or squash and re-push"
             )));
         }
         Ok(())
@@ -2749,6 +2759,33 @@ mod tests {
                 })
                 .is_ok(),
             "B0 must not reject when old_id differs from any tip"
+        );
+    }
+
+    #[test]
+    fn b0_trunk_uses_configured_max_push_commits() {
+        let trunk =
+            PushQueueService::new(BaseStorage::mock(), PushPolicy::Trunk).with_max_push_commits(2);
+        let over = EnqueueRequest {
+            kind: PushQueueKindEnum::Push,
+            operation_id: "a→c".into(),
+            path: "/project/x".into(),
+            old_id: "a".repeat(40),
+            new_id: "c".repeat(40),
+            requester: None,
+            payload: json!({"n": 3}),
+            ref_name: Some(MEGA_BRANCH_NAME.into()),
+            is_delete: false,
+        };
+        let err = trunk
+            .b0_reject_push(&over)
+            .expect_err("n=3 must exceed max_push_commits=2");
+        assert!(err.to_string().contains("2"), "{err}");
+        let mut at_limit = over.clone();
+        at_limit.payload = json!({"n": 2});
+        assert!(
+            trunk.b0_reject_push(&at_limit).is_ok(),
+            "n equal to max_push_commits must pass B0"
         );
     }
 

@@ -321,6 +321,11 @@ fn traverse_config(key: &str, value: &c::Value, f: &impl Fn(&str, &c::Value)) {
                 traverse_config(&new_key, v, f);
             }
         }
+        ValueKind::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                traverse_config(&format!("{key}[{index}]"), item, f);
+            }
+        }
         _ => f(key, value),
     }
 }
@@ -525,5 +530,53 @@ mod tests {
         assert!(message.contains("redis.url"));
         assert!(message.contains("file not found"));
         assert!(message.contains("never logged"));
+    }
+
+    #[test]
+    fn file_placeholder_expands_inside_array_of_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_path = dir.path().join("token");
+        std::fs::write(&secret_path, "from-file\n").expect("write secret");
+        let toml = format!(
+            r#"
+            [git]
+            push_auth = "token"
+            [[git.push_tokens]]
+            name = "ci"
+            token = "${{file:{}}}"
+            "#,
+            secret_path.display()
+        );
+        let builder =
+            c::Config::builder().add_source(c::File::from_str(&toml, c::FileFormat::Toml));
+        let config = variable_placeholder_substitute(builder).expect("expand array table");
+        assert_eq!(
+            config.get_string("git.push_tokens[0].token").unwrap(),
+            "from-file"
+        );
+        assert_eq!(config.get_string("git.push_tokens[0].name").unwrap(), "ci");
+    }
+
+    #[test]
+    fn file_placeholder_missing_file_in_array_of_tables_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent_token");
+        let toml = format!(
+            r#"
+            [git]
+            push_auth = "token"
+            [[git.push_tokens]]
+            name = "ci"
+            token = "${{file:{}}}"
+            "#,
+            missing.display()
+        );
+        let builder =
+            c::Config::builder().add_source(c::File::from_str(&toml, c::FileFormat::Toml));
+        let err = variable_placeholder_substitute(builder)
+            .expect_err("missing file in [[git.push_tokens]] must fail");
+        let message = err.to_string();
+        assert!(message.contains("git.push_tokens[0].token"), "{message}");
+        assert!(message.contains("file not found"), "{message}");
     }
 }

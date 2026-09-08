@@ -440,6 +440,9 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
         );
     }
 
+    // TP-15 / 4.1 ②③⑥: open CLs, last_policy vs non-terminal rows, watermark reset.
+    ctx.storage.prepare_push_policy_startup().await?;
+
     // First-build the shared authorization snapshot before the listener binds
     // (UN-02). `off` is a no-op; a failed first build fails startup.
     let enforcement = Enforcement::parse(&ctx.storage.config().cedar.enforcement)

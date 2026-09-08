@@ -679,6 +679,7 @@ fn collect_static_restart_fields(
     }
 
     collect_monorepo_restart_fields(current, candidate, report);
+    collect_git_restart_fields(current, candidate, report);
     collect_pack_restart_fields(current, candidate, report);
     collect_lfs_restart_fields(current, candidate, report);
     collect_blame_restart_fields(current, candidate, report);
@@ -723,8 +724,29 @@ fn collect_monorepo_restart_fields(
     if current.monorepo.push_policy != candidate.monorepo.push_policy {
         report.restart_required_fields.push("monorepo.push_policy");
     }
+    if current.monorepo.max_push_commits != candidate.monorepo.max_push_commits {
+        report
+            .restart_required_fields
+            .push("monorepo.max_push_commits");
+    }
     if current.monorepo.merge_writer != candidate.monorepo.merge_writer {
         report.restart_required_fields.push("monorepo.merge_writer");
+    }
+}
+
+fn collect_git_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.git.anonymous_access != candidate.git.anonymous_access {
+        report.restart_required_fields.push("git.anonymous_access");
+    }
+    if current.git.push_auth != candidate.git.push_auth {
+        report.restart_required_fields.push("git.push_auth");
+    }
+    if current.git.push_tokens != candidate.git.push_tokens {
+        report.restart_required_fields.push("git.push_tokens");
     }
 }
 

@@ -9,8 +9,9 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, CedarConfig, Config, DbConfig,
-    LFSConfig, LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig, OAuthConfig,
-    OrionServerConfig, PackConfig, RedisConfig, SidebarConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    GitConfig, LFSConfig, LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
+    OAuthConfig, OrionServerConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, SidebarConfig,
+    VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
     secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
@@ -111,6 +112,7 @@ impl Config {
         validate_log_config(&self.log)?;
         validate_database_config(&self.database)?;
         validate_monorepo_config(&self.monorepo)?;
+        validate_git_config(&self.git)?;
         validate_pack_config(&self.pack)?;
         validate_blame_config(&self.blame)?;
         validate_lfs_config(&self.lfs)?;
@@ -137,6 +139,7 @@ impl Config {
         }
         reject_legacy_oauth_environment()?;
         reject_legacy_mail_environment()?;
+        validate_trunk_config_surface(self)?;
 
         Ok(())
     }
@@ -548,6 +551,102 @@ pub(crate) fn validate_monorepo_config(mono_config: &MonoConfig) -> Result<(), M
         )));
     }
 
+    if mono_config.max_push_commits == 0 {
+        return Err(MegaError::Other(
+            "monorepo.max_push_commits must be greater than 0".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_git_config(git: &GitConfig) -> Result<(), MegaError> {
+    let mut names = BTreeSet::new();
+    for (idx, token) in git.push_tokens.iter().enumerate() {
+        let field = format!("git.push_tokens[{idx}]");
+        if token.name.trim().is_empty() {
+            return Err(MegaError::Other(format!("{field}.name must not be empty")));
+        }
+        if !names.insert(token.name.as_str()) {
+            return Err(MegaError::Other(format!(
+                "{field}.name {:?} is duplicated",
+                token.name
+            )));
+        }
+        if token.token.trim().is_empty() {
+            return Err(MegaError::Other(format!("{field}.token must not be empty")));
+        }
+        if is_secret_ref_value(&token.token) {
+            let field_token = format!("{field}.token");
+            let secret_ref = parse_secret_ref_for_field(&field_token, &token.token)?;
+            validate_config_secret_ref(
+                &field_token,
+                &secret_ref,
+                &format!("git/push_tokens/{}", token.name),
+            )?;
+        }
+        if let Some(paths) = &token.paths {
+            for path in paths {
+                validate_token_auth_path(&format!("{field}.paths"), path)?;
+            }
+        }
+    }
+    if git.push_auth == Some(PushAuth::Token) && git.push_tokens.is_empty() {
+        return Err(MegaError::Other(
+            "git.push_auth=token requires at least one [[git.push_tokens]] entry".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_auth_path(field_path: &str, path: &str) -> Result<(), MegaError> {
+    if path.trim().is_empty() {
+        return Err(MegaError::Other(format!(
+            "{field_path} must not contain an empty path"
+        )));
+    }
+    if path.contains("//") {
+        return Err(MegaError::Other(format!(
+            "{field_path} {path:?} must not contain empty path components"
+        )));
+    }
+    let normalized = normalize_token_path(path);
+    if !path.trim().starts_with('/') {
+        return Err(MegaError::Other(format!(
+            "{field_path} {path:?} must start with '/' (component-boundary prefix)"
+        )));
+    }
+    if path.trim().ends_with('/') && normalized != "/" {
+        return Err(MegaError::Other(format!(
+            "{field_path} {path:?} must not have a trailing slash"
+        )));
+    }
+    Ok(())
+}
+
+/// Fail-closed checks ①④⑤ (no DB). ②③⑥ run at HTTP start.
+pub(crate) fn validate_trunk_config_surface(config: &Config) -> Result<(), MegaError> {
+    if config.monorepo.push_policy == PushPolicy::Trunk && config.cedar.enforcement != "off" {
+        return Err(MegaError::Other(format!(
+            "push_policy=trunk requires cedar.enforcement=\"off\" (got {:?}); trunk has no Cedar authorization gate",
+            config.cedar.enforcement
+        )));
+    }
+    match &config.git.push_auth {
+        Some(auth) if config.monorepo.push_policy != PushPolicy::Trunk => {
+            return Err(MegaError::Other(format!(
+                "git.push_auth=\"{}\" requires monorepo.push_policy=\"trunk\"",
+                auth.as_str()
+            )));
+        }
+        None if config.monorepo.push_policy == PushPolicy::Trunk => {
+            return Err(MegaError::Other(
+                "push_policy=trunk requires an explicit git.push_auth of \"token\" or \"none\""
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -1465,6 +1564,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "object_format",
             "rename",
             "push_policy",
+            "max_push_commits",
             "merge_writer",
         ]),
         "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
@@ -1545,7 +1645,8 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "website_api_base_url",
             "session_cookie_names",
         ]),
-        "git" => Some(&["anonymous_access"]),
+        "git" => Some(&["anonymous_access", "push_auth", "push_tokens"]),
+        "git.push_tokens" => Some(&["name", "token", "paths"]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
     }

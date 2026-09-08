@@ -463,6 +463,83 @@ impl PushQueueStorage {
             .ok_or_else(|| MegaError::Other("queue_control row missing".into()))
     }
 
+    pub async fn set_last_policy(&self, policy: &str) -> Result<(), MegaError> {
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE queue_control SET last_policy = $1, updated_at = now() WHERE id = 1",
+            [policy.into()],
+        );
+        let res = self.get_connection().execute_raw(stmt).await?;
+        if res.rows_affected() != 1 {
+            return Err(MegaError::Other(
+                "queue_control last_policy update affected 0 rows".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn count_non_terminal(&self) -> Result<u64, MegaError> {
+        Ok(push_queue::Entity::find()
+            .filter(
+                push_queue::Column::Status
+                    .is_in([PushQueueStatusEnum::Queued, PushQueueStatusEnum::Running]),
+            )
+            .count(self.get_connection())
+            .await?)
+    }
+
+    /// TP-15 / 4.1 ③⑥: hold `queue_control FOR UPDATE` so B1 enqueue cannot
+    /// insert a non-terminal row between the empty-queue check and the
+    /// `last_policy` / watermark update.
+    pub async fn switch_last_policy_if_queue_empty(
+        &self,
+        new_policy: &str,
+    ) -> Result<Option<(String, String)>, MegaError> {
+        let conn = self.get_connection();
+        let txn = conn.begin().await?;
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT id FROM queue_control WHERE id = 1 FOR UPDATE".to_owned(),
+        ))
+        .await?;
+        let ctrl = queue_control::Entity::find_by_id(1)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| MegaError::Other("queue_control row missing".into()))?;
+        if ctrl.last_policy == new_policy {
+            txn.commit().await?;
+            return Ok(None);
+        }
+        let n = push_queue::Entity::find()
+            .filter(
+                push_queue::Column::Status
+                    .is_in([PushQueueStatusEnum::Queued, PushQueueStatusEnum::Running]),
+            )
+            .count(&txn)
+            .await?;
+        if n > 0 {
+            txn.rollback().await?;
+            return Err(MegaError::Other(format!(
+                "push_policy changing from {:?} to {new_policy} with {n} non-terminal push_queue row(s); drain or cancel them first",
+                ctrl.last_policy
+            )));
+        }
+        txn.execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "UPDATE blob_paths SET indexed_push_id = NULL".to_owned(),
+        ))
+        .await?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE queue_control SET last_policy = $1, updated_at = now() WHERE id = 1",
+            [Value::from(new_policy)],
+        ))
+        .await?;
+        let from = ctrl.last_policy.clone();
+        txn.commit().await?;
+        Ok(Some((from, new_policy.to_owned())))
+    }
+
     /// Active (Queued + Running) rows in FIFO id order.
     pub async fn list_active(&self) -> Result<Vec<push_queue::Model>, MegaError> {
         Ok(push_queue::Entity::find()

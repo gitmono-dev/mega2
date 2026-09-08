@@ -227,7 +227,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
             base.clone(),
             config.monorepo.push_policy.clone(),
         )
-        .with_timeouts(Duration::from_secs(30), Duration::from_millis(20)),
+        .with_timeouts(Duration::from_secs(30), Duration::from_millis(20))
+        .with_max_push_commits(config.monorepo.max_push_commits),
         artifact_service: ArtifactService::new(base.clone(), mock_object_storage()),
         buck_service: BuckService::mock(),
         config_handle: ConfigHandle::from_arc(config.clone()),

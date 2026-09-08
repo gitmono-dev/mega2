@@ -84,6 +84,15 @@ object_format = "sha1"
 # Production steady state is queue. Restart-required.
 # merge_writer = "legacy"
 
+# Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
+# Restart-required. Trunk fail-closed startup: cedar.enforcement must be "off",
+# no open CLs, empty non-terminal push_queue on policy change, and git.push_auth
+# must be an explicit "token" or "none". Default sample keeps review + omitted
+# push_auth (existing OAuth/UserStorage chain).
+# push_policy = "review"
+# Trunk-only first-parent chain bound. Review morphology keeps MAX_CL_CHAIN_COMMITS=250.
+# max_push_commits = 250
+
 [monorepo.rename]
 # Similarity threshold (0-100) for move/rename detection in diff classification.
 similarity_threshold = 50
@@ -350,3 +359,16 @@ fail_closed = false
 #   shadow  = build the store, evaluate, record would-deny logs, but do not change allow
 #   enforce = build the store, evaluate, and deny unauthorized requests
 enforcement = "off"
+
+# Git protocol / trunk push authentication (TP-15 config surface; authenticator is TP-19).
+# Omitted push_auth = existing OAuth/UserStorage chain (review morphology only).
+# Explicit "token" | "none" requires monorepo.push_policy = "trunk".
+# Credentials via ${file:...} or vault://secret/config/<profile>/git/push_tokens/<name>#value.
+# [git]
+# anonymous_access = true
+# push_auth = "token"
+# [[git.push_tokens]]
+# name = "team-foo"
+# token = "${file:/run/secrets/team_foo_token}"
+# paths = ["/project/foo"]
+
