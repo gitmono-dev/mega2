@@ -1489,6 +1489,543 @@ paths = ["/project/foo"]
     drop(token_dir);
 }
 
+fn trunk_subpath_url(port: u16, path: &str) -> String {
+    format!(
+        "{}/",
+        git_cli::monoengine_host_http_url(port, path).trim_end_matches('/')
+    )
+}
+
+fn trunk_boot_env() -> [(&'static str, &'static str); 3] {
+    [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+    ]
+}
+
+/// Host-side git for TP-17 e2e. The compose git-cli runner reaches the host via
+/// `host.docker.internal`; on this Linux bridge that path is firewalled (same
+/// as `descendant_host_git`).
+fn trunk_host_git(case_dir: &Path, git_args: &[&str]) -> std::process::Output {
+    let isolated_home = case_dir.join("git-home-trunk");
+    fs::create_dir_all(&isolated_home).expect("trunk git home");
+    let null_config = PathBuf::from("/dev/null");
+    let mut command = Command::new("git");
+    command
+        .current_dir(case_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("HOME", &isolated_home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &null_config)
+        .env("GIT_CONFIG_SYSTEM", &null_config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "true")
+        .env("GIT_CONFIG_COUNT", "5")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        .env("GIT_CONFIG_KEY_1", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "http.version")
+        .env("GIT_CONFIG_VALUE_2", "HTTP/1.1")
+        .env("GIT_CONFIG_KEY_3", "pack.window")
+        .env("GIT_CONFIG_VALUE_3", "0")
+        .env("GIT_CONFIG_KEY_4", "pack.depth")
+        .env("GIT_CONFIG_VALUE_4", "0")
+        .args(git_args);
+    command.output().expect("host git")
+}
+
+fn git_ok_no_auth(case_dir: &Path, args: &[&str]) {
+    git_cli::assert_git_success(
+        &trunk_host_git(case_dir, args),
+        &format!("git {}", args.join(" ")),
+    );
+}
+
+fn git_stdout_no_auth(case_dir: &Path, args: &[&str]) -> String {
+    let output = trunk_host_git(case_dir, args);
+    git_cli::assert_git_success(&output, &format!("git {}", args.join(" ")));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn trunk_push(case_dir: &Path, repo: &str) -> std::process::Output {
+    trunk_host_git(
+        case_dir,
+        &[
+            "-C",
+            repo,
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    )
+}
+
+fn configure_git_identity_no_auth(case_dir: &Path, clone: &str) {
+    git_ok_no_auth(case_dir, &["-C", clone, "config", "user.name", "IT Trunk"]);
+    git_ok_no_auth(
+        case_dir,
+        &[
+            "-C",
+            clone,
+            "config",
+            "user.email",
+            "it-trunk@example.invalid",
+        ],
+    );
+}
+
+fn probe_upload_pack_body(port: u16, repo_path: &str) -> (String, String) {
+    let suffix = "/info/refs?service=git-upload-pack";
+    let path = if repo_path == "/" {
+        suffix.to_string()
+    } else {
+        format!("{}{suffix}", repo_path.trim_end_matches('/'))
+    };
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let headers_path = std::env::temp_dir().join(format!("tp17-headers-{port}"));
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "-D",
+            headers_path.to_str().expect("utf8"),
+            "--max-time",
+            "15",
+        ])
+        .arg(&url)
+        .output()
+        .unwrap_or_else(|err| panic!("curl upload-pack probe failed to spawn: {err}"));
+    assert!(
+        output.status.success(),
+        "curl upload-pack probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let headers = fs::read_to_string(&headers_path).unwrap_or_default();
+    let _ = fs::remove_file(&headers_path);
+    let body = String::from_utf8_lossy(&output.stdout).into_owned();
+    (headers, body)
+}
+
+fn assert_upload_pack_advertises_main(port: u16, repo_path: &str) {
+    let (headers, body) = probe_upload_pack_body(port, repo_path);
+    assert!(
+        headers.lines().next().is_some_and(|l| l.contains("200")),
+        "trunk {repo_path} upload-pack must 200, got:\n{headers}\nbody:\n{body:?}"
+    );
+    assert!(
+        body.contains("refs/heads/main") || body.contains("refs/heads/master"),
+        "trunk {repo_path} advertise must list main, headers:\n{headers}\nbody:\n{body:?}"
+    );
+}
+
+/// Create `foo/` under `/project` so `/project/foo` can be cloned (B0 rejects `/`).
+fn seed_project_foo(case_dir: &Path, port: u16) {
+    assert_upload_pack_advertises_main(port, "/");
+    assert_upload_pack_advertises_main(port, "/project");
+    let project_url = trunk_subpath_url(port, "/project");
+    git_ok_no_auth(case_dir, &["clone", &project_url, "project-seed"]);
+    configure_git_identity_no_auth(case_dir, "project-seed");
+    let foo_file = case_dir.join("project-seed").join("foo").join("seed.txt");
+    fs::create_dir_all(foo_file.parent().expect("foo parent")).expect("mkdir foo");
+    fs::write(&foo_file, "seed\n").expect("write foo/seed.txt");
+    git_ok_no_auth(case_dir, &["-C", "project-seed", "add", "foo/seed.txt"]);
+    git_ok_no_auth(
+        case_dir,
+        &["-C", "project-seed", "commit", "-m", "seed /project/foo"],
+    );
+    git_ok_no_auth(
+        case_dir,
+        &[
+            "-C",
+            "project-seed",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+fn ls_remote_main(case_dir: &Path, remote_url: &str) -> String {
+    let output = trunk_host_git(case_dir, &["ls-remote", remote_url, "refs/heads/main"]);
+    git_cli::assert_git_success(&output, "ls-remote refs/heads/main");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn push_queue_requesters(db_url: &str) -> Vec<Option<String>> {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for push_queue: {err}"));
+        let rows = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT requester FROM push_queue WHERE kind::text = 'push' ORDER BY id"
+                    .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("query push_queue requesters: {err}"));
+        rows.iter()
+            .map(|row| row.try_get("", "requester").ok())
+            .collect()
+    })
+}
+
+fn count_cl_artifacts(db_url: &str) -> (i64, i64) {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB for CL count: {err}"));
+        let cl = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::bigint AS n FROM mega_cl".to_string(),
+            ))
+            .await
+            .expect("count mega_cl")
+            .expect("mega_cl count row");
+        let refs = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*)::bigint AS n FROM mega_refs WHERE is_cl".to_string(),
+            ))
+            .await
+            .expect("count mega_refs")
+            .expect("mega_refs count row");
+        (
+            cl.try_get("", "n").expect("n"),
+            refs.try_get("", "n").expect("n"),
+        )
+    })
+}
+
+#[test]
+fn integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let extra = trunk_boot_env();
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &extra);
+
+    seed_project_foo(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo"]);
+    configure_git_identity_no_auth(&env.case_dir, "foo");
+
+    for round in 1..=3 {
+        let rel = format!("round-{round}.txt");
+        fs::write(
+            env.case_dir.join("foo").join(&rel),
+            format!("trunk n1 round {round}\n"),
+        )
+        .expect("write round file");
+        git_ok_no_auth(&env.case_dir, &["-C", "foo", "add", &rel]);
+        git_ok_no_auth(
+            &env.case_dir,
+            &["-C", "foo", "commit", "-m", &format!("n1 round {round}")],
+        );
+        let pretty = git_stdout_no_auth(&env.case_dir, &["-C", "foo", "cat-file", "-p", "HEAD"]);
+        let head = git_stdout_no_auth(&env.case_dir, &["-C", "foo", "rev-parse", "HEAD"]);
+        git_cli::assert_git_success(&trunk_push(&env.case_dir, "foo"), "n1 trunk push");
+        let remote = ls_remote_main(&env.case_dir, &foo_url);
+        assert_eq!(
+            remote, head,
+            "round {round}: ls-remote main@/project/foo must equal the client commit"
+        );
+        git_ok_no_auth(&env.case_dir, &["-C", "foo", "fetch", "origin"]);
+        git_ok_no_auth(
+            &env.case_dir,
+            &["-C", "foo", "reset", "--hard", "origin/main"],
+        );
+        let after = git_stdout_no_auth(&env.case_dir, &["-C", "foo", "rev-parse", "HEAD"]);
+        assert_eq!(after, head, "round {round}: fetch+reset is a no-op");
+        let pretty_after =
+            git_stdout_no_auth(&env.case_dir, &["-C", "foo", "cat-file", "-p", "HEAD"]);
+        assert_eq!(
+            pretty_after, pretty,
+            "round {round}: author/time/message identical"
+        );
+    }
+
+    let (cls, cl_refs) = count_cl_artifacts(&env.database.db_url);
+    assert_eq!(cls, 0, "trunk pushes must not create mega_cl rows");
+    assert_eq!(cl_refs, 0, "trunk pushes must not create refs/cl/*");
+    let advertised = trunk_host_git(&env.case_dir, &["ls-remote", &foo_url, "refs/cl/*"]);
+    git_cli::assert_git_success(&advertised, "ls-remote refs/cl/*");
+    assert!(
+        String::from_utf8_lossy(&advertised.stdout)
+            .trim()
+            .is_empty(),
+        "trunk must not advertise CL refs:\n{}",
+        String::from_utf8_lossy(&advertised.stdout)
+    );
+    let requesters = push_queue_requesters(&env.database.db_url);
+    assert!(
+        requesters.iter().any(|r| r.is_none()),
+        "push_auth=none must record NULL requester: {requesters:?}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let extra = trunk_boot_env();
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &extra);
+
+    seed_project_foo(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    git_ok_no_auth(&env.case_dir, &["clone", &foo_url, "foo-batch"]);
+    configure_git_identity_no_auth(&env.case_dir, "foo-batch");
+    let pre_push = ls_remote_main(&env.case_dir, &foo_url);
+
+    for i in 1..=3 {
+        let rel = format!("batch-{i}.txt");
+        fs::write(
+            env.case_dir.join("foo-batch").join(&rel),
+            format!("batch {i}\n"),
+        )
+        .expect("write batch file");
+        git_ok_no_auth(&env.case_dir, &["-C", "foo-batch", "add", &rel]);
+        git_ok_no_auth(
+            &env.case_dir,
+            &["-C", "foo-batch", "commit", "-m", &format!("batch {i}")],
+        );
+    }
+    let tip = git_stdout_no_auth(&env.case_dir, &["-C", "foo-batch", "rev-parse", "HEAD"]);
+    let tip_tree = git_stdout_no_auth(
+        &env.case_dir,
+        &["-C", "foo-batch", "rev-parse", "HEAD^{tree}"],
+    );
+    let push = trunk_push(&env.case_dir, "foo-batch");
+    git_cli::assert_git_success(&push, "3-commit trunk push");
+    let remote_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let landed = ls_remote_main(&env.case_dir, &foo_url);
+    assert_ne!(landed, tip, "N>1 must squash, not keep the client tip");
+    assert!(
+        remote_out.contains(&landed),
+        "sideband must name the squash id {landed}:\n{remote_out}"
+    );
+    assert!(
+        remote_out.contains("git fetch && git reset --hard origin/main"),
+        "ADR-TP-18 squash notice missing:\n{remote_out}"
+    );
+
+    git_ok_no_auth(
+        &env.case_dir,
+        &[
+            "-C",
+            "foo-batch",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "unaligned",
+        ],
+    );
+    // After squash, advertise is a new SHA the client does not have, so Git
+    // refuses with "fetch first" unless forced. --force still sends the update;
+    // B3 must reject it as non-fast-forward (ADR-TP-18).
+    let repush = trunk_host_git(
+        &env.case_dir,
+        &[
+            "-C",
+            "foo-batch",
+            "push",
+            "--no-thin",
+            "--force",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+    assert!(
+        !repush.status.success(),
+        "unaligned re-push must be rejected"
+    );
+    let nff = format!(
+        "{}{}",
+        String::from_utf8_lossy(&repush.stdout),
+        String::from_utf8_lossy(&repush.stderr)
+    );
+    assert!(
+        nff.contains("non-fast-forward") || nff.contains("push chain is broken"),
+        "unaligned re-push must be rejected as NFF or broken chain:\n{nff}"
+    );
+    assert!(
+        nff.contains("git fetch && git reset --hard origin/main"),
+        "NFF must include the align command:\n{nff}"
+    );
+
+    git_ok_no_auth(&env.case_dir, &["-C", "foo-batch", "fetch", "origin"]);
+    let origin_tree = git_stdout_no_auth(
+        &env.case_dir,
+        &["-C", "foo-batch", "rev-parse", "origin/main^{tree}"],
+    );
+    assert_eq!(origin_tree, tip_tree, "squash tree equals client tip tree");
+    let origin_parent = git_stdout_no_auth(
+        &env.case_dir,
+        &["-C", "foo-batch", "rev-parse", "origin/main^"],
+    );
+    assert_eq!(origin_parent, pre_push, "squash parent is the pre-push tip");
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_trunk_requester_token_name() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_path = token_dir.path().join("ci.token");
+    let token = format!("tp17-ci-{}", std::process::id());
+    fs::write(&token_path, format!("{token}\n")).expect("write file-mounted token");
+    let append = format!(
+        r#"
+[git]
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "ci"
+token = "${{file:{}}}"
+paths = ["/project"]
+"#,
+        token_path.display()
+    );
+    let env = GitCliEnv::with_config_append(&append);
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_with_env(&env, None, None, &[("MEGA_MONOREPO__PUSH_POLICY", "trunk")]);
+
+    let project_url = trunk_subpath_url(port, "/project");
+    descendant_host_git(&env, &token, &["clone", &project_url, "project-seed"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "project-seed", "config", "user.name", "Not The Token"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "project-seed",
+            "config",
+            "user.email",
+            "author@example.invalid",
+        ],
+    );
+    let foo_file = env
+        .case_dir
+        .join("project-seed")
+        .join("foo")
+        .join("seed.txt");
+    fs::create_dir_all(foo_file.parent().expect("foo parent")).expect("mkdir foo");
+    fs::write(&foo_file, "seed\n").expect("write foo/seed.txt");
+    descendant_host_git(&env, &token, &["-C", "project-seed", "add", "foo/seed.txt"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "project-seed", "commit", "-m", "seed /project/foo"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "project-seed",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    descendant_host_git(&env, &token, &["clone", &foo_url, "foo"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "foo", "config", "user.name", "Not The Token"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "foo",
+            "config",
+            "user.email",
+            "author@example.invalid",
+        ],
+    );
+    fs::write(env.case_dir.join("foo").join("n1.txt"), "n1\n").expect("write n1");
+    descendant_host_git(&env, &token, &["-C", "foo", "add", "n1.txt"]);
+    descendant_host_git(
+        &env,
+        &token,
+        &["-C", "foo", "commit", "-m", "n1 from mismatched author"],
+    );
+    descendant_host_git(
+        &env,
+        &token,
+        &[
+            "-C",
+            "foo",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let requesters = push_queue_requesters(&env.database.db_url);
+    assert!(
+        requesters.iter().all(|r| r.as_deref() == Some("ci")),
+        "token mode must record token name, not commit author: {requesters:?}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(token_dir);
+}
+
 #[test]
 fn integration_git_cli_auth_token_never_leaks() {
     if git_cli::git_cli_skip_requested() {

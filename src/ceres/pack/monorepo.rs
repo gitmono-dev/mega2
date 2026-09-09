@@ -28,7 +28,7 @@ use crate::{
     callisto::{
         entity_ext::generate_link,
         mega_cl, mega_code_review_anchor, mega_refs,
-        sea_orm_active_enums::{PositionStatusEnum, RefTypeEnum},
+        sea_orm_active_enums::{PositionStatusEnum, PushQueueKindEnum, RefTypeEnum},
     },
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
@@ -54,6 +54,10 @@ use crate::{
         },
     },
     jupiter::{
+        service::push_queue_service::{
+            EnqueueRequest, ExecuteOutcome, ExecuteRequest, PushExecContext, PushPayload,
+            QueueWaitResult, push_operation_id,
+        },
         storage::{Storage, blob_path_index::BlobPathIndexMode},
         utils::converter::FromMegaModel,
     },
@@ -90,6 +94,31 @@ pub struct Monorepo {
     pub username: Option<String>,
     /// Ref commands for this push (same role as on [`ImportRepo`](crate::ceres::pack::import_repo::ImportRepo)).
     pub command_list: Mutex<Vec<RefCommand>>,
+}
+
+/// ADR-TP-18: after a squash (or any landed tip the client is not based on),
+/// refusals tell the client how to align. Real `git push` without fetch+reset
+/// either NFF-fails in B3 (`old_id` mismatch) or fails chain validation when
+/// the client force-sends a history that does not include the squash.
+fn trunk_nff_align_message(message: &str) -> String {
+    const ALIGN: &str = "git fetch && git reset --hard origin/main";
+    let needs_align =
+        message.contains("non-fast-forward") || message.contains("push chain is broken");
+    if needs_align && !message.contains(ALIGN) {
+        format!("{message}; align with `{ALIGN}`")
+    } else {
+        message.to_owned()
+    }
+}
+
+fn trunk_align_finalize_err(err: MegaError) -> MegaError {
+    let raw = err.to_string();
+    let aligned = trunk_nff_align_message(&raw);
+    if aligned == raw {
+        return err;
+    }
+    let inner = aligned.strip_prefix("Other error: ").unwrap_or(&aligned);
+    MegaError::Other(inner.to_owned())
 }
 
 #[async_trait]
@@ -129,18 +158,33 @@ impl RepoHandler for Monorepo {
             .path
             .to_str()
             .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".into()))?;
+        let trunk = self.storage.config().monorepo.push_policy == PushPolicy::Trunk;
         let refs: Vec<Refs> = super::materialize::materialize_path_refs(&self.storage, path)
             .await?
             .into_iter()
+            .filter(|r| !trunk || !r.is_cl)
             .map(Into::into)
             .collect();
         Ok(self.find_head_hash(refs))
     }
 
     async fn finalize_receive_pack(&self) -> Result<(), MegaError> {
-        self.validate_incoming_push().await?;
-        self.persist_mono_branch_cl_mega_refs_transaction().await?;
-        self.run_mono_post_push_pipeline().await
+        let trunk = self.storage.config().monorepo.push_policy == PushPolicy::Trunk;
+        let result = async {
+            self.validate_incoming_push().await?;
+            if trunk {
+                self.finalize_trunk_push().await
+            } else {
+                self.persist_mono_branch_cl_mega_refs_transaction().await?;
+                self.run_mono_post_push_pipeline().await
+            }
+        }
+        .await;
+        if trunk {
+            result.map_err(trunk_align_finalize_err)
+        } else {
+            result
+        }
     }
 
     async fn save_entry(
@@ -1157,6 +1201,141 @@ impl Monorepo {
         self.username.clone().unwrap_or(String::from("Anonymous"))
     }
 
+    /// Trunk morphology: enqueue `kind=push` and run B3. Does not write
+    /// `refs/cl/*` or run the CL post-push pipeline. Requester is the protocol
+    /// actor (`None` under `push_auth=none`), never [`Self::username`]'s
+    /// `"Anonymous"` default.
+    async fn finalize_trunk_push(&self) -> Result<(), MegaError> {
+        let cmds = self
+            .command_list
+            .lock()
+            .expect("command_list lock poisoned")
+            .clone();
+        if cmds.iter().any(|c| {
+            c.ref_type == RefTypeEnum::Branch
+                && (c.command_type == CommandType::Delete || c.new_id == ZERO_ID)
+        }) {
+            return Err(MegaError::Other(
+                "trunk push rejects delete commands; remove content via a parent-path commit"
+                    .into(),
+            ));
+        }
+        let Some(cmd) = self.primary_branch_command() else {
+            return Ok(());
+        };
+        let Some(chain) = self.build_push_chain(&cmd).await? else {
+            return Err(MegaError::Other(
+                "trunk receive-pack expected a push chain (GAP-14 Noop bridge)".into(),
+            ));
+        };
+        let payload = PushPayload::from_chain(&cmd.old_id, &cmd.new_id, &chain);
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".into()))?;
+        let wait = self
+            .storage
+            .push_queue_service
+            .enqueue_and_wait(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: push_operation_id(&cmd.old_id, &cmd.new_id),
+                path: path.to_owned(),
+                old_id: cmd.old_id.clone(),
+                new_id: cmd.new_id.clone(),
+                requester: self.username.clone(),
+                payload: payload.to_json(),
+                ref_name: Some(cmd.ref_name.clone()),
+                is_delete: false,
+            })
+            .await?;
+        let landed = self.follow_push_queue(wait).await?;
+        if payload.n > 1 {
+            *self
+                .no_op_notice
+                .lock()
+                .expect("no_op_notice lock poisoned") = Some(format!(
+                "trunk squash landed as {landed}; git fetch && git reset --hard origin/main"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn follow_push_queue(&self, mut wait: QueueWaitResult) -> Result<String, MegaError> {
+        const MAX_ROUNDS: usize = 32;
+        let ctx = PushExecContext {
+            storage: self.storage.clone(),
+            git_object_cache: self.git_object_cache.clone(),
+        };
+        for _ in 0..MAX_ROUNDS {
+            match wait {
+                QueueWaitResult::Replayed {
+                    landed_commit_id, ..
+                } => {
+                    return landed_commit_id.ok_or_else(|| {
+                        MegaError::Other("push replay missing landed_commit_id".into())
+                    });
+                }
+                QueueWaitResult::Abandoned { id } => {
+                    return Err(MegaError::Other(format!(
+                        "push wait abandoned for push_queue id {id}"
+                    )));
+                }
+                QueueWaitResult::Rejected { id, message } => {
+                    return Err(MegaError::Other(format!(
+                        "push rejected for push_queue id {id}: {}",
+                        trunk_nff_align_message(&message)
+                    )));
+                }
+                QueueWaitResult::Ready { id } => {
+                    let outcome = self
+                        .storage
+                        .push_queue_service
+                        .execute_b3(
+                            ExecuteRequest {
+                                id,
+                                ..Default::default()
+                            },
+                            None,
+                            None,
+                            Some(&ctx),
+                        )
+                        .await?;
+                    match outcome {
+                        ExecuteOutcome::Done {
+                            landed_commit_id, ..
+                        } => return Ok(landed_commit_id),
+                        ExecuteOutcome::Requeued { successor_id, .. } => {
+                            wait = self
+                                .storage
+                                .push_queue_service
+                                .wait_and_claim(successor_id)
+                                .await?;
+                        }
+                        ExecuteOutcome::ClaimLost { id } => {
+                            wait = self.storage.push_queue_service.wait_and_claim(id).await?;
+                        }
+                        ExecuteOutcome::Failed { message, .. } => {
+                            return Err(MegaError::Other(trunk_nff_align_message(&message)));
+                        }
+                        ExecuteOutcome::HardStopped { id } => {
+                            return Err(MegaError::Other(format!(
+                                "push hard-stopped for push_queue id {id}"
+                            )));
+                        }
+                        ExecuteOutcome::BypassDetected { id } => {
+                            return Err(MegaError::Other(format!(
+                                "queue bypass detected for push_queue id {id}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Err(MegaError::Other(
+            "push follow exceeded max conflict requeue rounds".into(),
+        ))
+    }
+
     pub async fn get_commit_blobs(
         &self,
         commit_hash: &str,
@@ -1349,14 +1528,20 @@ mod tests {
             pack::entry::Entry,
         },
     };
-    use sea_orm::{EntityTrait, IntoActiveModel, PaginatorTrait, TransactionTrait};
+    use sea_orm::{
+        ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder,
+        TransactionTrait,
+    };
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    use super::{Monorepo, RepoHandler};
+    use super::{Monorepo, RepoHandler, trunk_nff_align_message};
     use crate::{
         bellatrix::Bellatrix,
-        callisto::{commit_auths, mega_commit, mega_tree},
+        callisto::{
+            commit_auths, mega_cl, mega_commit, mega_refs, mega_tree, push_queue,
+            sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
+        },
         ceres::{
             api_service::cache::GitObjectCache, pack::materialize,
             protocol::import_refs::RefCommand,
@@ -1365,9 +1550,10 @@ mod tests {
             errors::{MegaError, ProtocolError},
             utils::{MEGA_BRANCH_NAME, ZERO_ID},
         },
+        config::{MergeWriter, PushPolicy, testing::isolated_config},
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
-            tests::test_storage,
+            tests::{test_storage, test_storage_with_config, with_test_vault},
             utils::converter::{FromMegaModel, IntoMegaModel},
         },
     };
@@ -1425,6 +1611,110 @@ mod tests {
             username: Some("tester".to_string()),
             command_list: Mutex::new(commands),
         }
+    }
+
+    fn blob_item(name: &str, hex: &str) -> TreeItem {
+        TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(hex).unwrap(),
+            name.to_string(),
+        )
+    }
+
+    async fn trunk_storage(temp: &std::path::Path) -> Storage {
+        let mut config = isolated_config(temp.join("config"));
+        config.monorepo.merge_writer = MergeWriter::Queue;
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        let storage = test_storage_with_config(temp, config).await;
+        with_test_vault(storage, temp).await
+    }
+
+    async fn trunk_monorepo(
+        storage: &Storage,
+        path: &str,
+        commands: Vec<RefCommand>,
+        pack_commit_ids: HashSet<String>,
+        new_commit_ids: HashSet<String>,
+        username: Option<String>,
+    ) -> Monorepo {
+        Monorepo {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+            path: PathBuf::from(path),
+            base_branch: "main".to_string(),
+            pack_commit_ids: Mutex::new(pack_commit_ids),
+            new_commit_ids: Mutex::new(new_commit_ids),
+            no_op_notice: Mutex::new(None),
+            push_chain_cache: Mutex::new(HashMap::new()),
+            cl_link: Arc::new(RwLock::new(None)),
+            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+            username,
+            command_list: Mutex::new(commands),
+        }
+    }
+
+    async fn trunk_path_fixture(
+        dir: &str,
+        path_commit_msg: &str,
+    ) -> (TempDir, Storage, Tree, Commit, Tree, Commit, String) {
+        let temp = TempDir::new().expect("temp");
+        let storage = trunk_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items(vec![blob_item(
+            "x.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .expect("child");
+        let root_tree = Tree::from_tree_items(vec![
+            blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            TreeItem::new(TreeItemMode::Tree, child.id, dir.to_string()),
+        ])
+        .expect("root");
+        let root_commit = Commit::from_tree_id(root_tree.id, vec![], "root");
+        let path_commit = Commit::from_tree_id(child.id, vec![], path_commit_msg);
+        mono.save_mega_trees(vec![child.clone(), root_tree.clone()], root_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![root_commit.clone(), path_commit.clone()], None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                root_commit.id.to_string(),
+                root_tree.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let path = format!("/{dir}");
+        mono.save_refs(
+            mega_refs::Model::new(
+                path.clone(),
+                MEGA_BRANCH_NAME.to_owned(),
+                path_commit.id.to_string(),
+                child.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        (
+            temp,
+            storage,
+            root_tree,
+            root_commit,
+            child,
+            path_commit,
+            path,
+        )
     }
 
     async fn commit_auth_count(storage: &Storage) -> u64 {
@@ -2284,5 +2574,645 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "/q/q.txt");
         assert_eq!(rows[0].indexed_push_id, Some(42));
+    }
+
+    #[test]
+    fn trunk_nff_align_appends_fetch_reset_once() {
+        let raw = "non-fast-forward: ref_commit_hash does not match old_id";
+        let aligned = trunk_nff_align_message(raw);
+        assert!(aligned.contains("git fetch && git reset --hard origin/main"));
+        assert_eq!(trunk_nff_align_message(&aligned), aligned);
+        assert_eq!(trunk_nff_align_message("other"), "other");
+        let broken = "push chain is broken: base aaa is not on the first-parent chain of tip bbb";
+        let broken_aligned = trunk_nff_align_message(broken);
+        assert!(broken_aligned.contains("git fetch && git reset --hard origin/main"));
+        assert_eq!(trunk_nff_align_message(&broken_aligned), broken_aligned);
+    }
+
+    #[tokio::test]
+    async fn tp17_trunk_advertise_omits_cl_refs_review_keeps_them() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let (commit_id, tree_id) = seed_root_with_dir(&storage, "foo").await;
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    "/foo",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    commit_id.clone(),
+                    tree_id.clone(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    "/foo",
+                    "refs/cl/archived".to_owned(),
+                    commit_id,
+                    tree_id,
+                    true,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut review = test_monorepo(&storage, vec![], HashSet::new(), HashSet::new());
+        review.path = PathBuf::from("/foo");
+        let (_head, refs) = review
+            .refs_with_head_hash()
+            .await
+            .expect("review advertise");
+        assert!(
+            refs.iter().any(|r| r.ref_name == "refs/cl/archived"),
+            "review morphology advertises archived CL refs: {:?}",
+            refs.iter().map(|r| r.ref_name.as_str()).collect::<Vec<_>>()
+        );
+
+        let trunk_temp = TempDir::new().expect("trunk temp");
+        let trunk_storage = trunk_storage(trunk_temp.path()).await;
+        let (commit_id, tree_id) = seed_root_with_dir(&trunk_storage, "foo").await;
+        trunk_storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    "/foo",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    commit_id.clone(),
+                    tree_id.clone(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        trunk_storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    "/foo",
+                    "refs/cl/archived".to_owned(),
+                    commit_id,
+                    tree_id,
+                    true,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let repo = trunk_monorepo(
+            &trunk_storage,
+            "/foo",
+            vec![],
+            HashSet::new(),
+            HashSet::new(),
+            Some("tester".into()),
+        )
+        .await;
+        let (_head, refs) = repo.refs_with_head_hash().await.expect("trunk advertise");
+        assert!(
+            refs.iter().all(|r| r.ref_name != "refs/cl/archived"),
+            "trunk morphology must not advertise CL refs: {:?}",
+            refs.iter().map(|r| r.ref_name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(refs.iter().any(|r| r.ref_name == MEGA_BRANCH_NAME));
+    }
+
+    #[tokio::test]
+    async fn tp17_trunk_finalize_rejects_delete_without_cl() {
+        let temp = TempDir::new().expect("temp");
+        let storage = trunk_storage(temp.path()).await;
+        let cmd = RefCommand::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ZERO_ID.to_string(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            "/foo",
+            vec![cmd],
+            HashSet::new(),
+            HashSet::new(),
+            Some("tester".into()),
+        )
+        .await;
+        let err = repo
+            .finalize_receive_pack()
+            .await
+            .expect_err("trunk delete must be rejected");
+        assert!(
+            err.to_string()
+                .contains("trunk push rejects delete commands"),
+            "{err}"
+        );
+        let cl_count = mega_cl::Entity::find()
+            .count(storage.mono_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(cl_count, 0);
+        let cl_refs = mega_refs::Entity::find()
+            .filter(mega_refs::Column::IsCl.eq(true))
+            .count(storage.mono_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(cl_refs, 0);
+    }
+
+    #[tokio::test]
+    async fn tp17_trunk_finalize_n1_lands_client_tip_and_records_requester() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, _child, path_commit, path) =
+            trunk_path_fixture("p17n1", "path tip").await;
+        let new_child = Tree::from_tree_items(vec![blob_item(
+            "y.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![path_commit.id], "n1");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let new_id = new_commit.id.to_string();
+        let cmd = RefCommand::new(
+            path_commit.id.to_string(),
+            new_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            &path,
+            vec![cmd],
+            id_set(&[&new_id]),
+            id_set(&[&new_id]),
+            None,
+        )
+        .await;
+        repo.finalize_receive_pack()
+            .await
+            .expect("trunk N=1 finalize");
+        let pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, new_id);
+        let cl_refs = mega_refs::Entity::find()
+            .filter(mega_refs::Column::IsCl.eq(true))
+            .count(storage.mono_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(cl_refs, 0, "trunk push must not write refs/cl/*");
+        let cl_count = mega_cl::Entity::find()
+            .count(storage.mono_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(cl_count, 0, "trunk push must not create CLs");
+        let row = push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Push))
+            .one(storage.mono_storage().get_connection())
+            .await
+            .unwrap()
+            .expect("push_queue row");
+        assert_eq!(row.status, PushQueueStatusEnum::Done);
+        assert!(
+            row.requester.is_none(),
+            "push_auth=none records NULL requester"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp17_trunk_finalize_token_requester_and_n_gt1_notice() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, _child, path_commit, path) =
+            trunk_path_fixture("p17n3", "path tip").await;
+        let t1 = Tree::from_tree_items(vec![blob_item(
+            "a.txt",
+            "1111111111111111111111111111111111111111",
+        )])
+        .unwrap();
+        let t2 = Tree::from_tree_items(vec![blob_item(
+            "b.txt",
+            "2222222222222222222222222222222222222222",
+        )])
+        .unwrap();
+        let t3 = Tree::from_tree_items(vec![blob_item(
+            "c.txt",
+            "3333333333333333333333333333333333333333",
+        )])
+        .unwrap();
+        let c1 = Commit::from_tree_id(t1.id, vec![path_commit.id], "c1");
+        let c2 = Commit::from_tree_id(t2.id, vec![c1.id], "c2");
+        let c3 = Commit::from_tree_id(t3.id, vec![c2.id], "c3");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![t1, t2, t3.clone()], c3.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![c1.clone(), c2.clone(), c3.clone()], None)
+            .await
+            .unwrap();
+        let new_id = c3.id.to_string();
+        let cmd = RefCommand::new(
+            path_commit.id.to_string(),
+            new_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            &path,
+            vec![cmd],
+            id_set(&[&c1.id.to_string(), &c2.id.to_string(), &new_id]),
+            id_set(&[&c1.id.to_string(), &c2.id.to_string(), &new_id]),
+            Some("ci".into()),
+        )
+        .await;
+        repo.finalize_receive_pack()
+            .await
+            .expect("trunk N>1 finalize");
+        let pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(pref.ref_commit_hash, new_id, "N>1 must squash");
+        let squash = storage
+            .mono_storage()
+            .get_commit_by_hash(&pref.ref_commit_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(squash.tree, t3.id.to_string());
+        let parents: Vec<String> = serde_json::from_value(squash.parents_id).unwrap();
+        assert_eq!(parents, vec![path_commit.id.to_string()]);
+        let notice = repo.receive_pack_notice().expect("ADR-TP-18 squash notice");
+        assert!(
+            notice.contains(&pref.ref_commit_hash),
+            "sideband must name the squash id: {notice}"
+        );
+        assert!(notice.contains("git fetch && git reset --hard origin/main"));
+        let row = push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Push))
+            .one(storage.mono_storage().get_connection())
+            .await
+            .unwrap()
+            .expect("push_queue row");
+        assert_eq!(row.requester.as_deref(), Some("ci"));
+    }
+
+    #[tokio::test]
+    async fn tp17_trunk_finalize_nff_includes_align_command() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, _child, path_commit, path) =
+            trunk_path_fixture("p17nff", "path tip").await;
+        let landed = Tree::from_tree_items(vec![blob_item(
+            "y.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let landed_commit = Commit::from_tree_id(landed.id, vec![path_commit.id], "already landed");
+        let sibling = Tree::from_tree_items(vec![blob_item(
+            "z.txt",
+            "ffffffffffffffffffffffffffffffffffffffff",
+        )])
+        .unwrap();
+        let sibling_commit = Commit::from_tree_id(sibling.id, vec![path_commit.id], "sibling");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![landed, sibling], landed_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![landed_commit.clone(), sibling_commit.clone()], None)
+            .await
+            .unwrap();
+
+        let landed_id = landed_commit.id.to_string();
+        let land_cmd = RefCommand::new(
+            path_commit.id.to_string(),
+            landed_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let land_repo = trunk_monorepo(
+            &storage,
+            &path,
+            vec![land_cmd],
+            id_set(&[&landed_id]),
+            id_set(&[&landed_id]),
+            Some("tester".into()),
+        )
+        .await;
+        land_repo
+            .finalize_receive_pack()
+            .await
+            .expect("land N=1 tip before NFF probe");
+
+        let new_id = sibling_commit.id.to_string();
+        let cmd = RefCommand::new(
+            path_commit.id.to_string(),
+            new_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            &path,
+            vec![cmd],
+            id_set(&[&new_id]),
+            id_set(&[&new_id]),
+            Some("tester".into()),
+        )
+        .await;
+        let err = repo
+            .finalize_receive_pack()
+            .await
+            .expect_err("stale old_id must NFF");
+        let msg = err.to_string();
+        assert!(msg.contains("non-fast-forward"), "{msg}");
+        assert!(
+            msg.contains("git fetch && git reset --hard origin/main"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp17_trunk_finalize_stale_nested_baseline_refuses() {
+        let _lock = materialize::lock_materialize_tests().await;
+        let (_temp, storage, _rt, _rc, child, path_commit, path) =
+            trunk_path_fixture("p17st", "path tip").await;
+        let nested = Tree::from_tree_items(vec![blob_item(
+            "n.txt",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )])
+        .unwrap();
+        let nested_commit = Commit::from_tree_id(nested.id, vec![], "nested");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![nested.clone()], nested_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![nested_commit.clone()], None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    format!("{path}/b"),
+                    MEGA_BRANCH_NAME.to_owned(),
+                    nested_commit.id.to_string(),
+                    nested.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut pref = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        pref.ref_tree_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+        storage.mono_storage().update_ref(pref, None).await.unwrap();
+
+        let new_child = Tree::from_tree_items(vec![blob_item(
+            "y.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![path_commit.id], "n1");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let new_id = new_commit.id.to_string();
+        let cmd = RefCommand::new(
+            path_commit.id.to_string(),
+            new_id.clone(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            &path,
+            vec![cmd],
+            id_set(&[&new_id]),
+            id_set(&[&new_id]),
+            Some("tester".into()),
+        )
+        .await;
+        let err = repo
+            .finalize_receive_pack()
+            .await
+            .expect_err("stale /a with nested /a/b must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stale materialized") || msg.contains("advertise"),
+            "{msg}"
+        );
+        let _ = child;
+    }
+
+    #[tokio::test]
+    async fn tp17_twenty_concurrent_trunk_finalizes_serialize_root_chain() {
+        let _lock = materialize::lock_materialize_tests().await;
+        const N: usize = 20;
+        let temp = TempDir::new().expect("temp");
+        let storage = trunk_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        let mut child_trees = Vec::new();
+        for i in 0..N {
+            let tree =
+                Tree::from_tree_items(vec![blob_item("base.txt", &format!("{:040x}", i + 1))])
+                    .expect("child tree");
+            child_trees.push(tree);
+        }
+        let root_items: Vec<TreeItem> = child_trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TreeItem::new(TreeItemMode::Tree, t.id, format!("p{i:02}")))
+            .collect();
+        let old_root = Tree::from_tree_items(root_items).expect("root");
+        let old_commit = Commit::from_tree_id(old_root.id, vec![], "base");
+        for t in &child_trees {
+            mono.save_mega_trees(vec![t.clone()], old_commit.id, None)
+                .await
+                .unwrap();
+        }
+        mono.save_mega_trees(vec![old_root.clone()], old_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone()], None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                old_commit.id.to_string(),
+                old_root.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut repos = Vec::new();
+        for (i, child) in child_trees.iter().enumerate() {
+            let path = format!("/p{i:02}");
+            let path_commit = Commit::from_tree_id(child.id, vec![], "path tip");
+            let new_tree =
+                Tree::from_tree_items(vec![blob_item("new.txt", &format!("{:040x}", 1000 + i))])
+                    .expect("new tree");
+            let new_commit = Commit::from_tree_id(new_tree.id, vec![path_commit.id], "n1");
+            mono.save_mega_trees(vec![new_tree], new_commit.id, None)
+                .await
+                .unwrap();
+            mono.save_mega_commits(vec![path_commit.clone(), new_commit.clone()], None)
+                .await
+                .unwrap();
+            mono.save_refs(
+                mega_refs::Model::new(
+                    path.clone(),
+                    MEGA_BRANCH_NAME.to_owned(),
+                    path_commit.id.to_string(),
+                    child.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            let new_id = new_commit.id.to_string();
+            let cmd = RefCommand::new(
+                path_commit.id.to_string(),
+                new_id.clone(),
+                MEGA_BRANCH_NAME.to_string(),
+            );
+            repos.push(
+                trunk_monorepo(
+                    &storage,
+                    &path,
+                    vec![cmd],
+                    id_set(&[&new_id]),
+                    id_set(&[&new_id]),
+                    Some("tester".into()),
+                )
+                .await,
+            );
+        }
+
+        let mut joins = Vec::new();
+        for repo in repos {
+            joins.push(tokio::spawn(
+                async move { repo.finalize_receive_pack().await },
+            ));
+        }
+        for j in joins {
+            j.await.expect("join").expect("concurrent trunk finalize");
+        }
+
+        for i in 0..N {
+            let path = format!("/p{i:02}");
+            let pref = mono.get_main_ref(&path).await.unwrap().unwrap();
+            assert_ne!(
+                pref.ref_commit_hash,
+                old_commit.id.to_string(),
+                "{path} must advance"
+            );
+        }
+        let final_root = mono.get_main_ref("/").await.unwrap().unwrap();
+        let final_tree = Tree::from_mega_model(
+            mono.get_tree_by_hash(&final_root.ref_tree_hash)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(final_tree.tree_items.len(), N, "root tree keeps every path");
+
+        let qrows = push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Push))
+            .filter(push_queue::Column::Status.eq(PushQueueStatusEnum::Done))
+            .order_by_asc(push_queue::Column::Id)
+            .all(storage.mono_storage().get_connection())
+            .await
+            .unwrap();
+        assert_eq!(qrows.len(), N);
+
+        // Root roll-up parent chain is one commit per serialized B3 round; the
+        // changed child name of each roll-up matches push_queue.id order.
+        let mut hash = final_root.ref_commit_hash.clone();
+        let mut changed_paths = Vec::new();
+        for _ in 0..N {
+            let commit = mono.get_commit_by_hash(&hash).await.unwrap().unwrap();
+            let parents: Vec<String> =
+                serde_json::from_value(commit.parents_id).unwrap_or_default();
+            let parent_hash = parents
+                .into_iter()
+                .next()
+                .expect("root roll-up must have a parent");
+            let this_tree =
+                Tree::from_mega_model(mono.get_tree_by_hash(&commit.tree).await.unwrap().unwrap());
+            let parent_commit = mono
+                .get_commit_by_hash(&parent_hash)
+                .await
+                .unwrap()
+                .unwrap();
+            let parent_tree = Tree::from_mega_model(
+                mono.get_tree_by_hash(&parent_commit.tree)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            let parent_ids: HashMap<String, String> = parent_tree
+                .tree_items
+                .iter()
+                .map(|i| (i.name.clone(), i.id.to_string()))
+                .collect();
+            let changed: Vec<String> = this_tree
+                .tree_items
+                .iter()
+                .filter(|i| parent_ids.get(&i.name).map(String::as_str) != Some(&i.id.to_string()))
+                .map(|i| format!("/{}", i.name))
+                .collect();
+            assert_eq!(changed.len(), 1, "each roll-up changes exactly one path");
+            changed_paths.push(changed[0].clone());
+            hash = parent_hash;
+        }
+        assert_eq!(hash, old_commit.id.to_string());
+        changed_paths.reverse();
+        let queue_paths: Vec<String> = qrows.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(
+            changed_paths, queue_paths,
+            "root roll-up parent chain must follow push_queue.id order"
+        );
     }
 }

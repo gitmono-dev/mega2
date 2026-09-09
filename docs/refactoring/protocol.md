@@ -74,7 +74,7 @@
 >
 > **2026-07-01 更新 8**：第二轮 LFS CI gate 暴露普通 `git clone` 在临时 LFS push 后会先拉取 remote 全量 refs，并可在 upload-pack 阶段因临时 CL ref 状态返回 HTTP 400。`lfs_smoke_http` 的验证端现在改为空仓库 `git init`，只 fetch 本次创建的 `refs/cl/*` 到本地 `lfs-smoke` 分支，再执行 checkout、`git lfs pull` 和 locks-list；CI 验证聚焦在目标 CL ref 的 LFS round-trip，不再依赖全量 clone。
 
-> **2026-09-08 更新（TP-10 / ADR-TP-20 第 1 项）**：惰性物化（`info/refs` / `ls-refs` 经 `RepoHandler::refs_with_head_hash`）在锁外遍历后持 `MONO_WRITE_LOCK` 校验根身份对再插入。根在遍历与插入之间被推进时，服务端有界重试（K=2）耗尽后返回 `ProtocolError::AdvertiseFailed`（HTTP **503**），**不再**把失败伪装成空仓库的 capabilities-only advertise。客户端应重试 advertise。错误正文不泄漏内部路径。解析类输入错误仍为 `InvalidInput`（400）。
+> **2026-09-09 更新（TP-17 / ADR-TP-18）**：monorepo `finalize_receive_pack` 按 `[monorepo].push_policy` 条件化。`review` 仍走 `persist_mono_branch_cl_mega_refs_transaction` + CL post-push 管线（写 `refs/cl/*`）。`trunk` 跳过 CL 落地，以 `kind=push` 入队并执行 B3：N=1 客户端 commit 原样落 `main@P`，N>1 squash（sideband 返回合成 id 与对齐命令 `git fetch && git reset --hard origin/main`）；删除类 branch 命令在 finalize 以 B0 正文拒绝。trunk 形态 `refs_with_head_hash` 过滤 `is_cl` 行（档案 CL refs 不 advertise）。`push_queue.requester` 取协议身份（token 名 / `none` 为 NULL），不用 commit author。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
