@@ -95,12 +95,13 @@
   - `MonoWriteQueue`：根树写入的全局 FIFO 队列（顺序）+ 事务级 advisory lock（互斥）+ 根 ref CAS（正确性自检）
   - `advance_descendant_refs`：后代 ref 由「删除后重新懒生成」改为「续接推进」，消除 `refusing to merge unrelated histories`
   - Roll-up commit 的真实归属与 provenance trailer（取代硬编码 `mega <admin@mega.org>`）
-  - `push_policy = "review" | "trunk"` 形态开关；无用户系统的推送认证
-  - 决策记录 ADR-TP-01 – ADR-TP-19（另含 15a，共 20 条：队列约束 11 条、多 commit 推送与签名语义 8 条、一致性模型 1 条）
+  - `push_policy = "review" | "trunk"` 形态开关；无用户系统的推送认证（基础认证已于 4.2a 随阶段 4 交付）
+  - 决策记录 ADR-TP-01..20 含 15a（21 条：队列约束、多 commit 推送与签名语义、一致性模型）
   - 面向 Agent 的推送语义：N = 1 原样落地，N > 1 自动合并为一个进入 `main`，squash commit 的 message 完整列出全部被合并 commit
-- **关键前置**：阶段 1–3 是现有写入路径的缺陷修复，独立成立；阶段 4 依赖三者全部完成
-- **阶段范围**：1 - 6（共 6 个阶段，其中阶段 6 为可选优化）
-- **产品规则同步**：本文档定稿后再更新 [`../monorepo.md`](../monorepo.md) 的反向声明（不变式、双层历史、墓碑语义、索引最终一致性）
+  - 基础静态 token 认证已于 **4.2a 随阶段 4** 交付（阶段 5 收窄为多 token 运维，DEFER-TP-05）
+- **关键前置**：阶段 1–3 是现有写入路径的缺陷修复，**可独立验收**；生产部署以阶段 2 为前置（阶段 1 删除式后代处理违反 I1）。阶段 4 依赖 1–3 全部完成
+- **阶段范围**：1 - 6（共 6 个阶段，其中阶段 6 为可选优化：group commit、NOTIFY 唤醒、**物化 TTL + 墓碑回收**）
+- **产品规则同步**：反向声明已同步至 [`../monorepo.md`](../monorepo.md)；部署见 [`../deploy-trunk.md`](../deploy-trunk.md)
 
 ### 5b. **refactoring/libra.md** — Libra 协作与 Agent 变更证据
 
@@ -111,7 +112,8 @@
 - **边界**：共用 trunk-push 根写入路径；ADR-TP-10 只约束 push 行，CL merge 不新增路径唯一入队约束；不要求 storage-only 部署接入 website 或人类审批。
 
 ### 6. **其他文档**
-- **[`../monorepo.md`](../monorepo.md)**：Monorepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化与目录结构）
+- **[`../monorepo.md`](../monorepo.md)**：Monorepo 产品规则（公开分支仅 `main`、禁止 Git 客户端 tag、初始化、trunk 不变式）
+- **[`../deploy-trunk.md`](../deploy-trunk.md)**：trunk / storage-only 部署（`push_auth`、LFS、SSH、形态切换）
 - **website-auth.md** / **website-mail.md**：Website 会话与产品邮件契约（见 `plan-20260731.md`）
 - **protocol.md**：协议定义相关；分支/tag 产品规则以 `monorepo.md` 为准
 - 本仓 Campsite 风格 chat/Notes 产品面已退场；不再维护独立 chat 改进文档
@@ -347,8 +349,8 @@ SecretRef 消费者（第 3 轮，现行）
 - **完成后**：根树写入具备全序与原子性；已物化路径的历史只增不改；合成 commit 带真实归属
 
 #### refactoring/trunk-push.md 阶段 4-5：形态开关与推送认证 **[优先级：P2-P3]**
-- **前置**：阶段 1-3 全部完成；阶段 5 依赖 config 阶段 5 的 SecretRef
-- **完成后**：`push_policy = "trunk"` 部署形态可用
+- **前置**：阶段 1-3 全部完成；基础认证已于 4.2a 随阶段 4 交付（SecretRef 仍依赖 config 阶段 5）
+- **完成后**：`push_policy = "trunk"` 部署形态可用；阶段 5 多 token 运维为 DEFER-TP-05
 
 #### refactoring/trunk-push.md 阶段 6：可选优化 **[优先级：P4]**
 - **前置**：需实测压力证据，否则不启动
@@ -420,12 +422,12 @@ SecretRef 消费者（第 3 轮，现行）
 1. config 阶段 6
 2. notification 长期收尾（PT-09：webhook/slack/多实例等）
 3. vault 阶段 F-I
-4. trunk-push 阶段 5（无用户系统的推送认证）
+4. trunk-push 阶段 5（无用户系统的推送认证——**基础认证已随 4.2a 进阶段 4**；本行仅余 DEFER-TP-05 运维强化）
 
 ### P4 - 长期、可选或低优先级
 1. config 阶段 7-8
 2. vault 阶段 G/J
-3. trunk-push 阶段 6（group commit、NOTIFY 唤醒、惰性后代推进）
+3. trunk-push 阶段 6（group commit、NOTIFY 唤醒、物化 TTL + 墓碑回收）
 
 ---
 

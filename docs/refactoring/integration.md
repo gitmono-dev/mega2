@@ -42,6 +42,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | --- | --- | --- |
 | `integration_vault` | CLI config, Vault bootstrap, redaction, and HTTP smoke | PostgreSQL and Redis |
 | `integration_git_cli` | Git HTTP protocol round trips | PostgreSQL, Redis, `--profile git` |
+| `integration_git_cli` filter `trunk` / `push_auth` | Trunk 直推 e2e：`integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs`、`integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align`、`integration_git_cli_trunk_requester_token_name`、`integration_git_cli_push_auth_token_rejects_without_token_and_out_of_path` | PostgreSQL, Redis；本机防火墙下 compose `git-cli` 可能不可达，用例走 host git + `127.0.0.1` |
 | `integration_git_lfs` | Git HTTP LFS push → fetch → `git lfs pull` round trip（plan-20260803 / GM-05） | PostgreSQL, Redis, `--profile git`, git-lfs |
 | `integration_git_ssh` | Git SSH cargo-native self-start clone/pull/push（plan-20260803 / GM-06..08） | PostgreSQL, Redis, `--profile git` |
 | `integration_website_auth` | Better Auth cookie to monoengine session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |

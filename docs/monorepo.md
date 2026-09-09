@@ -20,6 +20,7 @@
 - 客户端常见写法 `git push origin HEAD:refs/heads/<name>`（`<name> ≠` 持久公开分支）在 Monorepo 上会进入 **CL 管线**：服务端落地为 `refs/cl/<id>`，**不会**把 `<name>` 登记为第二个 `refs/heads/*` 公开分支，也 **不会** 直接改写 `main`。
 - 合并进 `main`、关闭/更新 CL 等产品动作走 Web / 内部 API，而不是「再 push 一个公开分支」。
 - 因此：smoke / 集成测试里的「branch push」验收的是 **CL 创建与定向 fetch**，不是多分支托管。
+- **`push_policy=trunk` 例外**：CL 管线不参与推送落地；唯一公开分支仍是 `main`，推送 `refs/heads/main` 经队列写入 `main`，其它 heads 在 B0 被拒绝。见第 8–11 节与 [`deploy-trunk.md`](./deploy-trunk.md)。
 
 ### 测试与 CI 期望
 
@@ -205,7 +206,7 @@ object storage 与 MonoService；不会启动 Redis、notification、sidebar、r
 - 路径不在根树（目录尚未重建）→ **跳过物化**，不凭空造行。
 - 对仍有墓碑的路径，`old_id = ZERO_ID` 的创建推送在 B0 被拒绝：先重建父目录 → advertise 续接物化 → fetch 对齐 → 再推送。
 
-**升级前的历史删除**（升级前 `remove_none_cl_refs` 不留痕）默认 **fail-closed**：迁移只建空表，不猜测「曾物化后被删」的路径。旧客户端可能遭遇一次 unrelated history。运维可在升级前按删除清单调用 `backfill_tombstones_best_effort`（不保证完备）。完整产品声明随 TP-21 回写。
+**升级前的历史删除**（升级前 `remove_none_cl_refs` 不留痕）默认 **fail-closed**：迁移只建空表，不猜测「曾物化后被删」的路径。旧客户端可能遭遇一次 unrelated history。运维可在升级前按删除清单调用 `backfill_tombstones_best_effort`（不保证完备）。
 
 ---
 
@@ -221,6 +222,55 @@ object storage 与 MonoService；不会启动 Redis、notification、sidebar、r
 | 服务端合成 commit 签名与密钥轮换 | `src/contract/vault/server_signing.rs`、`docs/plan/plan-20260827.md`（MC-09，ADR-MC-09） |
 | 初始化实现 | `src/jupiter/service/mono_service.rs::init_monorepo`、`src/jupiter/utils/converter.rs` |
 | 配置样例 | `config/config.toml` `[monorepo]` |
+| Trunk 直推设计 | [`refactoring/trunk-push.md`](./refactoring/trunk-push.md) |
+| Trunk / storage-only 部署 | [`deploy-trunk.md`](./deploy-trunk.md) |
 | 本地开发入口 | [`development.md`](./development.md) |
 
 修订本规则时：同步更新本文、`protocol.md` 场景表、smoke/IT 期望，以及（若行为变更）Monorepo receive-pack 实现。
+
+---
+
+## 8. 部署形态：`review`（默认）与 `trunk`
+
+`[monorepo].push_policy` 是部署形态开关（重启生效；缺省 **`review`**）。
+
+| 形态 | 推送落地 | 公开分支 | CL / Issue / reviewer HTTP | LFS |
+|---|---|---|---|---|
+| `review`（默认） | 非删除分支更新进入 CL 管线，落地 `refs/cl/*`，不直接改 `main` | 仍仅 `main`；`refs/cl/*` 可 advertise | 注册 | 可用（经 `UserStorage`） |
+| `trunk` | 子路径 receive-pack 入 `MonoWriteQueue`（`kind=push`），B3 写入 `main` | 仅 `main`；存量已关闭 CL ref **保留为档案**但不 advertise | **不注册**（OpenAPI 如实为空） | **不可用** |
+
+`review` 形态下本文第 1–5 节一字不改。`trunk` 形态下第 1 节「唯一公开分支 `main`」、第 2 节「Git 客户端禁 tag」、`import_dir` 例外继续生效；CL 管线不参与推送落地。推送 `refs/heads/dev` 在 trunk 被 B0 拒绝。
+
+Trunk **强制**显式 `[git].push_auth`（`token` 或 `none`），且与 `cedar.enforcement != "off"` 互斥。配置与启动校验见 [`deploy-trunk.md`](./deploy-trunk.md)。
+
+## 9. 按 N 分流的推送语义与客户端对齐（ADR-TP-12 / ADR-TP-18）
+
+仅 **`push_policy=trunk`**。`N` = 客户端推送链在被推路径 `P` 上的首父链长度（`new_id → old_id`）。
+
+| N | `main@P` | 对象保真 | 客户端 |
+|---|---|---|---|
+| 1（Agent 常态） | 等于客户端 `cmd.new_id`，**不合成** | 作者 / 时间 / message / 签名随对象保留 | `git fetch && git reset --hard origin/main` 为 no-op |
+| > 1 | 一个 squash commit：`tree` = 客户端 tip 的 tree，`parent` = 推送前 tip（创建且无旧 tip 时 parentless） | 不承诺逐字段对象保真；内容保真见 I2 | 成功 sideband 给出落地 id；随后必须 `git fetch && git reset --hard origin/main`。未对齐再推会被 non-fast-forward 拒绝，拒绝信息含同一对齐命令 |
+
+根路径 `/` 的 push 不是该形态的假设（会塌缩根 CAS 与 `P` 落地）。净零推送（被推路径 tree 未变）不推进祖先与 `/`（ADR-TP-16）。
+
+## 10. 写入不变式（I1–I6，含 I2a）
+
+产品层声明；证明与闸门细节以 [`refactoring/trunk-push.md`](./refactoring/trunk-push.md) 附录 A 为准。
+
+- **I1 历史只增不改**：已物化路径的旧 tip 必须仍是新 tip 的祖先。成立时点自阶段 2（墓碑续接）起；阶段 1 的删除式后代处理不得部署生产。
+- **I2 内容保真**：`main@P` tip 的 tree 等于客户端 tip 的 tree。N = 1 时更强：tip 等于客户端 commit id。
+- **I2a 步长一致**：一次**有树变更**的推送后，被推路径、受影响祖先与 `/` 各恰好前进一个 commit。净零推送时未受影响的层前进零个。
+- **I3 视图一致（强一致）**：每个已物化 `main@P.ref_tree_hash` 等于从当前根树解析的子树。路径 ref 是根树的视图，不分层为最终一致。前提是全部根写入者遵守队列锁纪律（I5）。
+- **I4 provenance 完整**：N > 1 时被推路径 squash 完整枚举被合并 commit，不截断；创建情形省略 `Mono-Squash-Range`，由 message 与 tip 锚定。
+- **I5 队列完备性**：根树写入经 `MonoWriteQueue`，或被物化短锁（ADR-TP-20）覆盖，或在接流前 bootstrap。根 ref CAS 是 tripwire，不是完备性证明。
+- **I6 时间线全序**：任意时刻至多一个 B 段；`/` 上 roll-up 的先后与 `push_queue.id` **保序**（允许空洞，例如净零占用 id 却不产生根 commit）。
+
+## 11. 文件路径索引最终一致性（`blob_paths`）
+
+浏览用路径索引是 **`(blob_id, path, indexed_push_id)` 出现对**（`blob_paths`），在 B3 提交之后的 C 段重建，**不在**写入判定链上。
+
+- 索引相对根树 / 路径 ref **最终一致**：推送刚提交后，Web 路径查询可能短暂落后。
+- 行级 `indexed_push_id` CAS 防止滞后任务覆盖更新的嵌套路径。
+- **不承诺「永不复活」**：旧任务仍可能把已删除的 `(blob_id, path)` 重插；补偿任务周期重扫会再次清除。
+- 形态切换时执行 `RESET INDEX WATERMARK`（`indexed_push_id = NULL`），见 [`deploy-trunk.md`](./deploy-trunk.md)。

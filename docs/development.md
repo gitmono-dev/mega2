@@ -5,8 +5,8 @@
 [`refactoring/test-infra.md`](./refactoring/test-infra.md)；提交前三门禁见
 [`AGENTS.md`](../AGENTS.md)。
 
-**Monorepo 产品规则**（公开分支仅 `main`、禁止 Git 客户端操作 tag、初始化与目录结构）见集中文档
-[`monorepo.md`](./monorepo.md)。
+**Monorepo 产品规则**（公开分支仅 `main`、禁止 Git 客户端操作 tag、初始化与目录结构、trunk 不变式）见集中文档
+[`monorepo.md`](./monorepo.md)。Trunk / storage-only 部署见 [`deploy-trunk.md`](./deploy-trunk.md)。
 
 ## 推荐：用脚本代替手贴命令
 

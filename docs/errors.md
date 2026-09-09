@@ -131,3 +131,7 @@ source .env.test && cargo test --all
 cargo build
 cargo build --tests
 ```
+
+## plan-20260905（Trunk 直推）
+
+本计划未新增用户可见的 `MegaError` 枚举变体。`StaleMonorepoRootRef` 在计划前已存在。TP-15/17/19 的协议拒绝（trunk 链长、token 路径前缀、B0 非 `main` 分支、LFS review-only）走既有 `MegaError::Other` 字符串，不在此登记新类型。

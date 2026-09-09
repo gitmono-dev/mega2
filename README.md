@@ -4,6 +4,8 @@
 
 `monoengine` 是支撑 monorepo 平台的后端引擎：它通过 HTTP(S) 和 SSH 支持 Git wire 协议，将 Git 对象和 Git LFS blob 持久化到关系数据库以及可插拔的对象存储中，为上层 UI 客户端暴露 REST/OpenAPI 接口，并通过 `libvault` crate（crates.io `0.3.0`）内嵌一个密钥 / PKI 引擎，用于签名和凭据管理——该引擎的源码此前是 vendored 在 `src/vault/` 的，自 2026-08-21 起改为普通依赖，集成层仍在 `src/contract/vault/`。
 
+产品规则见 [`docs/monorepo.md`](docs/monorepo.md)。Trunk / storage-only 部署见 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。
+
 ## 与 megaui 联合启动（同栈联调）
 
 `monoengine` 承担**授权**（monoengine 管理权限），`megaui`（sibling `../megaui` 的 `apps/web`）承担**认证**（唯一登录/注册面）和浏览器 UI。联调栈完全由本仓的 `docker-compose.test.yml` 驱动；megaui 仅作为构建上下文引入。
