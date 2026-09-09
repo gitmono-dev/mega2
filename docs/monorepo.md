@@ -237,7 +237,7 @@ object storage 与 MonoService；不会启动 Redis、notification、reload watc
 | 形态 | 推送落地 | 公开分支 | CL / Issue / reviewer HTTP | LFS |
 |---|---|---|---|---|
 | `review`（默认） | 非删除分支更新进入 CL 管线，落地 `refs/cl/*`，不直接改 `main` | 仍仅 `main`；`refs/cl/*` 可 advertise | 注册 | 可用（经 `UserStorage`） |
-| `trunk` | 子路径 receive-pack 入 `MonoWriteQueue`（`kind=push`），B3 写入 `main` | 仅 `main`；存量已关闭 CL ref **保留为档案**但不 advertise | **不注册**（OpenAPI 如实为空） | **不可用** |
+| `trunk` | 子路径 receive-pack 入 `MonoWriteQueue`（`kind=push`），B3 写入 `main` | 仅 `main`；存量已关闭 CL ref **保留为档案**但不 advertise | **不注册**（OpenAPI 如实为空） | 可用（`push_auth`） |
 
 `review` 形态下本文第 1–5 节一字不改。`trunk` 形态下第 1 节「唯一公开分支 `main`」、第 2 节「Git 客户端禁 tag」、`import_dir` 例外继续生效；CL 管线不参与推送落地。推送 `refs/heads/dev` 在 trunk 被 B0 拒绝。
 

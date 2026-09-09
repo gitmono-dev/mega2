@@ -28,7 +28,7 @@ ssh_receive_pack = false # storage-only 必须显式写 false，省略会拒绝�
 6. storage-only（显式 `push_auth`）⇒ 必须 `git.ssh_receive_pack = false`（省略 ≠ 关闭）。
 7. 形态切换后执行索引水位重置（第 5 节）。
 
-HTTP 表面：只读 preview + Git smart HTTP；**不**注册 CL / issue / reviewer / code_edit 写路由；OpenAPI（`/api/openapi.json`）如实为空。只读 blob/tree/blame 保留。
+HTTP 表面：只读 preview + Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）；**不**注册 CL / issue / reviewer / code_edit 写路由；OpenAPI（`/api/openapi.json`）如实为空（CL/issue）并列出 LFS。只读 blob/tree/blame 保留。
 
 ## 2. 安全边界（无评审授权 ≠ 无访问控制）
 
@@ -38,9 +38,9 @@ Trunk **没有** review 门控与 Cedar 判定：`cedar.enforcement` 必须为 `
 
 仍然生效的访问控制：
 
-- **`push_auth=token`**：静态 token 常量时间查找；命中后身份为 token 名。`paths` 前缀按**组件边界**授权（`/project/foo` 不授权 `/project/foobar`）。认证身份与 commit author 分离——author 是自声明 provenance，不参与判定。
+- **`push_auth=token`**：静态 token 常量时间查找；命中后身份为 token 名。`paths` 前缀按**组件边界**授权（`/project/foo` 不授权 `/project/foobar`）。认证身份与 commit author 分离——author 是自声明 provenance，不参与判定。Git receive-pack 与 **LFS 批/锁写**共用该模型（见第 6 节）。
 - **对象存储与 pack 收发**仍按既有存储配置。
-- **LFS 不可用**（第 6 节）。Git 客户端 tag 仍禁止。
+- Git 客户端 tag 仍禁止。
 
 ## 3. `push_auth=token` 与 `push_auth=none`
 
@@ -56,7 +56,7 @@ token = "${file:/run/secrets/monoengine-push-token}"
 paths = ["/project"]   # 省略或空 = 全库
 ```
 
-`push_auth=none` **必须写在配置里**（省略 ≠ none）。它旁路 git HTTP 的 token/OAuth 前置，只适用于**受控内网、回环或 Unix socket 前置**的部署。对公网暴露 `none` 等于匿名 receive-pack。启动会打可诊断警告；SSH receive-pack 在 storage-only 下仍关闭（第 4 节），因此「无凭据推送」只可能出现在你显式打开的 HTTP 面上。
+`push_auth=none` **必须写在配置里**（省略 ≠ none）。它旁路 git HTTP 的 token/OAuth 前置，只适用于**受控内网、回环或 Unix socket 前置**的部署。对公网暴露 `none` 等于匿名 receive-pack **以及匿名 LFS 上传**（批/锁写与 receive-pack 同级）。启动会打可诊断警告；SSH receive-pack 在 storage-only 下仍关闭（第 4 节），因此「无凭据推送 / 无凭据 LFS 写」只可能出现在你显式打开的 HTTP 面上。
 
 ## 4. SSH
 
@@ -71,9 +71,18 @@ Storage-only（显式 `push_auth`）**不暴露 SSH receive-pack**。启动要�
 
 `trunk` → `review` **不**重建 roll-up 之前的 CL 历史。切回后新的推送重新走 CL 管线。
 
-## 6. LFS 仅 review 形态
+## 6. LFS 随 `push_auth`
 
-LFS 批/锁/上传走 `UserStorage` 认证，静态 token 模型不覆盖。Trunk 不挂载 `/info/lfs` 与 `/api/v1/lfs`；若仍命中 handler，返回 404 `push_policy=trunk: LFS is review-only`。需要 LFS 时使用 `push_policy=review`，或另立 token-aware LFS 授权议题。
+Trunk / storage-only **挂载** `/info/lfs` 与 `/api/v1/lfs`。LFS 批/锁写授权与 Git receive-pack 共用 `git.push_auth`（[`plan-20260909.md`](./plan/plan-20260909.md) ADR-LF-01；**supersede** plan-20260905 TP-18「关闭 LFS」产品决策，不回改该卡历史验收）：
+
+| `push_auth` | LFS 读 | LFS 写（batch upload / locks） |
+|---|---|---|
+| `none` | 匿名允许 | 匿名允许（与匿名 receive-pack **同级网络边界**；见第 3 节警告） |
+| `token` | `anonymous_access` 或有效 token | 有效 `[[git.push_tokens]]` 且 `paths` 覆盖 `LfsRepoContext` 路径 |
+
+Object PUT/GET 仍走 batch 注册后的能力 URL，不逐请求鉴权。Review 形态（省略 `push_auth`）仍走 `UserStorage` mono access token。SSH `git-lfs-transfer` 不在 storage-only 交付范围；LFS 走 HTTP。
+
+不再把 token-aware LFS 列为未决议题。多 token 轮换/审计/限流仍属 `DEFER-TP-05`（第 7 节），与 LFS 是否可用无关。
 
 ## 7. 阶段 5 多 token 运维（DEFER-TP-05）
 

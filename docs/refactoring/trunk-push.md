@@ -1366,7 +1366,7 @@ push_policy = "review"          # "review"（默认，CL 管线）| "trunk"（�
 
 | 关闭 | 保留 |
 | --- | --- |
-| CL 创建（`update_or_create_cl`）、**code_edit 的 CL 变更写路由**（`preview_router.rs:46-59` 的 `/create-entry` 与 `/edit/save`——其 handler 经 `find_or_create_cl_for_edit`（`on_edit.rs:162-214`）创建/变更 CL，trunk 形态一并关闭；只读 preview 路由保留）、**LFS 写路由**（`lfs_router.rs:205-213/235-250` 经 `UserStorage` 认证，静态 token 模型不覆盖 LFS 批/锁授权——trunk 形态 LFS 不可用并在部署文档声明；如需 LFS 须另立 token-aware LFS 授权议题） | 对象存储、pack 收发（LFS 仅 review 形态） |
+| CL 创建（`update_or_create_cl`）、**code_edit 的 CL 变更写路由**（`preview_router.rs` 的 `/create-entry` 与 `/edit/save`——其 handler 经 `find_or_create_cl_for_edit` 创建/变更 CL，trunk 形态一并关闭；只读 preview 路由保留） | 对象存储、pack 收发、**LFS HTTP**（批/锁鉴权对齐 `push_auth`；已由 [`plan-20260909.md`](../plan/plan-20260909.md) ADR-LF-01 开启，**supersede** 本阶段曾关闭 LFS 的决策。历史评审记录见修订史 Codex R58 #2） |
 | `CheckerRegistry` 全部 checker | `traverses_tree_and_update_filepath`（C 段） |
 | merge queue、conversation | UN-16 的写入侧钩子（见下） |
 | code review 线程重锚、CLA | MC-03 链校验与链长上限 |
@@ -1575,7 +1575,7 @@ Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写
   - **B1 线性化点（Codex R59 #2，MINOR）**：准入锁使并发入队串行，「双双通过 NOT EXISTS」在主路径不发生；无锁退化的冲突恢复路径保留并在伪码/验收中显式。
   - **`/retry` 行为（Codex R59 #3，SUGGESTION 采纳）**：重新入队并同步等待执行（重试者即执行者），不允许「已接受未执行」返回。：R58 评审 1 条 BLOCKING + 1 条 MINOR 全部落实。
   - **水位重置必须置 NULL（Codex R58 #1，BLOCKING）**：置 0 会让 trunk → review 切换后的行永久不符 review 更新条件。`indexed_push_id` 明确为可空列，重置 `SET NULL`，两个切换方向各配方向测试；隔离规则同步。
-  - **trunk 形态的 LFS 不可用（Codex R58 #2，MINOR）**：LFS 路由经 `UserStorage` 认证（`lfs_router.rs:205-213/235-250`），静态 token 不覆盖。4.3 将 LFS 写路由移入关闭清单并在部署文档声明；token-aware LFS 授权列为独立议题。：R57 评审 1 条 BLOCKING + 2 条 MINOR 全部落实。
+  - **trunk 形态的 LFS 不可用（Codex R58 #2，MINOR）**：当时关闭 LFS 并列为独立议题。**已由 [`plan-20260909.md`](../plan/plan-20260909.md) ADR-LF-01 supersede**（本条为历史评审落实记录，不代表当前产品状态）。：R57 评审 1 条 BLOCKING + 2 条 MINOR 全部落实。
   - **B3 权威 commit 校验显式化（Codex R57 #1，BLOCKING）**：push 分支逐一显式——行存在须 `ref_commit_hash == old_id`；行缺失须 `old_id = ZERO_ID`（经 upsert 原语）；N=0 须 `new_id == 当前 tip`。
   - **tag 保留为登记在案的行为变化（Codex R57 #2，MINOR）**：2.2 明确新查询按 `ref_name = main` 过滤、tag 行保留（现状删除属缺陷），配不变回归。
   - **验收与修订记录的精确化（Codex R57 #3，MINOR）**：`P=/` attach 收养加「无已物化后代」限定；修订 52 条目补后续扩展注记。：R56 评审 2 条 BLOCKING + 1 条 SUGGESTION（正面确认）全部落实。

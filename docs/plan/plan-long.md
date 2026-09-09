@@ -764,7 +764,7 @@ flowchart TD
 | [`plan-20260820.md`](plan-20260820.md) | PT-11（依赖形态切片） | **已完成（2026-08-21）** | vendored → `libvault` 0.3.0 已落地；VLT-S1 判定 **go**（shadow-unseal），VLT-S2 与 DEFER-VLT-01 未触发；`REL-VLT-RO`（VLT-02→04→FIX-VLT-01→**VLT-05 release**）；UN-31 八 AC 在集成层等价重建，十二条 `un31_` 与四条 `un43_` 全绿；FIX-04/un31 已迁至 `src/contract/vault/integration/` |
 | [`plan-20260903.md`](plan-20260903.md) | PT-03（准备切片） | 实施中 | Monorepo 空仓初始化按 `monorepo.object_format` 生成 SHA-1/SHA-256 object graph，BLAKE3 接口 fail-closed；不覆盖 repository-format 持久化、SHA-256 wire/pack 或 BLAKE3 运行时接入。 |
 | [`plan-20260905.md`](plan-20260905.md) | N/A（trunk / MonoWriteQueue；非 Mega PT） | **已完成** | Trunk 直推与 storage-only；LFS 当时关闭（GAP-13/TP-18），由 [`plan-20260909.md`](plan-20260909.md) supersede。 |
-| [`plan-20260909.md`](plan-20260909.md) | N/A（storage-only LFS；承接 TP-18 关闭后的独立议题） | **新建** | LFS 批/锁鉴权对齐 `push_auth=none`/`token`；trunk 重新挂载；IT + 文档 supersede。不覆盖 SSH LFS transfer、PUT 逐请求鉴权、DEFER-TP-05。 |
+| [`plan-20260909.md`](plan-20260909.md) | N/A（storage-only LFS；承接 TP-18 关闭后的独立议题） | **已完成** | LFS 批/锁鉴权对齐 `push_auth=none`/`token`；trunk 重新挂载；IT + 文档 supersede。不覆盖 SSH LFS transfer、PUT 逐请求鉴权、DEFER-TP-05。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
 
