@@ -127,7 +127,10 @@ fn apply_push_auth_gate(
     }
 }
 
-fn token_covers_repo(token: &PushTokenConfig, repo_path: &str) -> bool {
+/// Whether a static push token authorizes `repo_path` (component-boundary
+/// prefixes via [`token_path_authorizes`]). Omitted/empty `paths` = whole repo.
+/// Shared by receive-pack and trunk LFS write gates (ADR-LF-01 / GC-LF-02).
+pub(crate) fn token_covers_repo(token: &PushTokenConfig, repo_path: &str) -> bool {
     match &token.paths {
         None => true,
         Some(paths) if paths.is_empty() => true,

@@ -70,7 +70,8 @@ use crate::{
         },
     },
     common::errors::GitLFSError,
-    config::PushPolicy,
+    config::{GitConfig, PushAuth, PushPolicy},
+    contract::git_protocol::{lookup_push_token, token_covers_repo},
 };
 
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
@@ -227,24 +228,63 @@ fn lfs_auth_challenge() -> Response<Body> {
     response
 }
 
+/// Trunk / storage-only LFS gate aligned with `git.push_auth` (ADR-LF-01/02).
+/// Does not consult `UserStorage`. Empty `repo_path` is treated as `/`.
+fn enforce_trunk_lfs_access(
+    git: &GitConfig,
+    headers: &HeaderMap,
+    access: LfsAccess,
+    repo_path: &str,
+) -> Result<(), Box<Response<Body>>> {
+    let path = if repo_path.is_empty() { "/" } else { repo_path };
+    match git.push_auth {
+        Some(PushAuth::None) => Ok(()),
+        Some(PushAuth::Token) => {
+            let matched = lfs_token_from_headers(headers)
+                .as_deref()
+                .and_then(|presented| lookup_push_token(&git.push_tokens, presented));
+            match access {
+                LfsAccess::Read => {
+                    if git.anonymous_access || matched.is_some() {
+                        Ok(())
+                    } else {
+                        Err(Box::new(lfs_auth_challenge()))
+                    }
+                }
+                LfsAccess::Write => match matched {
+                    None => Err(Box::new(lfs_auth_challenge())),
+                    Some(token) if token_covers_repo(token, path) => Ok(()),
+                    Some(_) => Err(Box::new(lfs_error_response(
+                        StatusCode::FORBIDDEN,
+                        format!("token is not authorized for path {path}"),
+                    ))),
+                },
+            }
+        }
+        // Trunk boot requires explicit push_auth; fail-closed if somehow absent.
+        None => Err(Box::new(lfs_auth_challenge())),
+    }
+}
+
 /// Enforces the LFS access policy for the given operation, returning a ready
-/// `401` challenge response when the caller is not permitted.
+/// denial response when the caller is not permitted.
 ///
-/// The challenge is boxed because it is the rare arm: an unboxed
-/// `Response<Body>` would put 128 bytes of denial into every permitted request's
-/// return value too, which is what `clippy::result_large_err` is about.
+/// Trunk uses [`enforce_trunk_lfs_access`] (static `push_auth`). Review keeps
+/// the `UserStorage` mono access-token model. The challenge is boxed because
+/// it is the rare arm: an unboxed `Response<Body>` would put 128 bytes of
+/// denial into every permitted request's return value too
+/// (`clippy::result_large_err`).
 async fn enforce_lfs_access(
     state: &MonoApiServiceState,
     headers: &HeaderMap,
     access: LfsAccess,
+    repo_path: &str,
 ) -> Result<(), Box<Response<Body>>> {
-    if state.storage.config().monorepo.push_policy == PushPolicy::Trunk {
-        return Err(Box::new(lfs_error_response(
-            StatusCode::NOT_FOUND,
-            "push_policy=trunk: LFS is review-only".to_owned(),
-        )));
+    let config = state.storage.config();
+    if config.monorepo.push_policy == PushPolicy::Trunk {
+        return enforce_trunk_lfs_access(&config.git, headers, access, repo_path);
     }
-    let anonymous_access = state.storage.config().git.anonymous_access;
+    let anonymous_access = config.git.anonymous_access;
     // Only resolve the (DB-backed) token when it can actually affect the outcome.
     let authenticated = if access == LfsAccess::Read && anonymous_access {
         false
@@ -284,10 +324,10 @@ pub async fn list_locks(
     headers: HeaderMap,
     Query(query): Query<LockListQuery>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
+    let repo = lfs_repo_path(repo);
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read, &repo).await {
         return Ok(*resp);
     }
-    let repo = lfs_repo_path(repo);
     let result: Result<LockList, GitLFSError> =
         handler::lfs_retrieve_lock(state.storage.lfs_db_storage(), &repo, query).await;
     match result {
@@ -324,10 +364,10 @@ pub async fn list_locks_for_verification(
     headers: HeaderMap,
     Json(json): Json<VerifiableLockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read).await {
+    let repo = lfs_repo_path(repo);
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Read, &repo).await {
         return Ok(*resp);
     }
-    let repo = lfs_repo_path(repo);
     let result = handler::lfs_verify_lock(state.storage.lfs_db_storage(), &repo, json).await;
     match result {
         Ok(lock_list) => {
@@ -363,10 +403,10 @@ pub async fn create_lock(
     headers: HeaderMap,
     Json(json): Json<LockRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
+    let repo = lfs_repo_path(repo);
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write, &repo).await {
         return Ok(*resp);
     }
-    let repo = lfs_repo_path(repo);
     let result = handler::lfs_create_lock(state.storage.lfs_db_storage(), &repo, json).await;
     match result {
         Ok(lock) => {
@@ -410,10 +450,10 @@ pub async fn delete_lock(
     headers: HeaderMap,
     Json(json): Json<UnlockRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write).await {
+    let repo = lfs_repo_path(repo);
+    if let Err(resp) = enforce_lfs_access(&state, &headers, LfsAccess::Write, &repo).await {
         return Ok(*resp);
     }
-    let repo = lfs_repo_path(repo);
     let result = handler::lfs_delete_lock(state.storage.lfs_db_storage(), &repo, &id, json).await;
 
     match result {
@@ -451,6 +491,7 @@ pub async fn delete_lock(
 )]
 pub async fn lfs_process_batch(
     state: State<MonoApiServiceState>,
+    repo: Option<Extension<LfsRepoContext>>,
     headers: HeaderMap,
     Json(json): Json<BatchRequest>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
@@ -461,7 +502,8 @@ pub async fn lfs_process_batch(
     } else {
         LfsAccess::Read
     };
-    if let Err(resp) = enforce_lfs_access(&state, &headers, access).await {
+    let repo = lfs_repo_path(repo);
+    if let Err(resp) = enforce_lfs_access(&state, &headers, access, &repo).await {
         return Ok(*resp);
     }
     let result =
@@ -637,6 +679,117 @@ mod tests {
         let resp = lfs_auth_challenge();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(resp.headers().contains_key(WWW_AUTHENTICATE));
+    }
+
+    fn push_token(
+        name: &str,
+        secret: &str,
+        paths: Option<Vec<&str>>,
+    ) -> crate::config::PushTokenConfig {
+        crate::config::PushTokenConfig {
+            name: name.to_owned(),
+            token: secret.to_owned(),
+            paths: paths.map(|p| p.into_iter().map(str::to_owned).collect()),
+        }
+    }
+
+    fn bearer_headers(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {secret}")).unwrap(),
+        );
+        headers
+    }
+
+    /// Trunk + `push_auth=token` never consults UserStorage: the gate is the
+    /// pure [`enforce_trunk_lfs_access`] helper (ADR-LF-01).
+    #[test]
+    fn trunk_token_write_gate_does_not_need_user_storage() {
+        let git = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![push_token("ci", "secret-ci", Some(vec!["/project"]))],
+            ..GitConfig::default()
+        };
+
+        // Missing credential → 401 challenge (no DB).
+        let denied =
+            enforce_trunk_lfs_access(&git, &HeaderMap::new(), LfsAccess::Write, "/project")
+                .expect_err("anonymous write denied");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(denied.headers().contains_key(WWW_AUTHENTICATE));
+
+        // Valid token covering path → allow.
+        enforce_trunk_lfs_access(
+            &git,
+            &bearer_headers("secret-ci"),
+            LfsAccess::Write,
+            "/project/foo",
+        )
+        .expect("covering token allows write");
+
+        // Valid token outside paths → 403.
+        let forbidden = enforce_trunk_lfs_access(
+            &git,
+            &bearer_headers("secret-ci"),
+            LfsAccess::Write,
+            "/other",
+        )
+        .expect_err("out-of-path write denied");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn trunk_none_allows_anonymous_read_and_write() {
+        let git = GitConfig {
+            push_auth: Some(PushAuth::None),
+            ..GitConfig::default()
+        };
+        enforce_trunk_lfs_access(&git, &HeaderMap::new(), LfsAccess::Write, "/project")
+            .expect("none write");
+        enforce_trunk_lfs_access(&git, &HeaderMap::new(), LfsAccess::Read, "/project")
+            .expect("none read");
+    }
+
+    #[test]
+    fn trunk_token_read_respects_anonymous_access() {
+        let mut git = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            anonymous_access: true,
+            push_tokens: vec![push_token("ci", "secret-ci", None)],
+            ..GitConfig::default()
+        };
+        enforce_trunk_lfs_access(&git, &HeaderMap::new(), LfsAccess::Read, "/")
+            .expect("anonymous read when anonymous_access");
+
+        git.anonymous_access = false;
+        let denied = enforce_trunk_lfs_access(&git, &HeaderMap::new(), LfsAccess::Read, "/")
+            .expect_err("read denied without token when anonymous_access=false");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        enforce_trunk_lfs_access(&git, &bearer_headers("secret-ci"), LfsAccess::Read, "/")
+            .expect("token allows read");
+    }
+
+    #[test]
+    fn empty_repo_path_is_treated_as_root_for_token_paths() {
+        let whole_repo = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![push_token("root-only", "s", None)],
+            ..GitConfig::default()
+        };
+        enforce_trunk_lfs_access(&whole_repo, &bearer_headers("s"), LfsAccess::Write, "")
+            .expect("empty repo + whole-repo token");
+
+        let scoped = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![push_token("scoped", "s", Some(vec!["/project"]))],
+            ..GitConfig::default()
+        };
+        let forbidden =
+            enforce_trunk_lfs_access(&scoped, &bearer_headers("s"), LfsAccess::Write, "")
+                .expect_err("empty repo is /, scoped token does not cover");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
