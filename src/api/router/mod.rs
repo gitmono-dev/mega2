@@ -20,3 +20,88 @@ pub mod reviewer_router;
 pub mod tag_router;
 pub mod user_router;
 pub mod webhook_router;
+
+#[cfg(test)]
+mod tests {
+    use utoipa::OpenApi;
+    use utoipa_axum::router::OpenApiRouter;
+
+    use crate::{
+        api::{api_doc::ApiDoc, api_router, router::lfs_router},
+        config::PushPolicy,
+    };
+
+    fn api_v1_paths(policy: PushPolicy) -> Vec<String> {
+        OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .nest("/api/v1", api_router::routers_for(policy))
+            .split_for_parts()
+            .1
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn trunk_openapi_omits_cl_issue_reviewer_and_preview_writes() {
+        let paths = api_v1_paths(PushPolicy::Trunk);
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.contains("/blob") || p.contains("/tree")),
+            "trunk OpenAPI must keep readonly preview: {paths:?}"
+        );
+        for needle in ["/cl", "/issue", "reviewer", "create-entry", "/edit/save"] {
+            assert!(
+                paths.iter().all(|p| !p.contains(needle)),
+                "trunk OpenAPI must not include {needle}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_openapi_keeps_cl_reviewer_and_preview_writes() {
+        let paths = api_v1_paths(PushPolicy::Review);
+        assert!(
+            paths.iter().any(|p| p.contains("/cl")),
+            "review OpenAPI must include /cl: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("reviewer")),
+            "review OpenAPI must include reviewer: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "review OpenAPI must include create-entry: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/edit/save")),
+            "review OpenAPI must include /edit/save: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn trunk_http_assembly_does_not_merge_lfs_review_does() {
+        let trunk = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .nest("/api/v1", api_router::routers_for(PushPolicy::Trunk))
+            .split_for_parts()
+            .1;
+        let trunk_paths: Vec<String> = trunk.paths.paths.keys().cloned().collect();
+        assert!(
+            trunk_paths.iter().all(|p| !p.contains("/lfs")),
+            "trunk must not register LFS: {trunk_paths:?}"
+        );
+
+        let review = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers())
+            .nest("/api/v1", api_router::routers_for(PushPolicy::Review))
+            .split_for_parts()
+            .1;
+        let review_paths: Vec<String> = review.paths.paths.keys().cloned().collect();
+        assert!(
+            review_paths.iter().any(|p| p.contains("/lfs")),
+            "review HTTP must still register LFS: {review_paths:?}"
+        );
+    }
+}

@@ -70,6 +70,7 @@ use crate::{
         },
     },
     common::errors::GitLFSError,
+    config::PushPolicy,
 };
 
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
@@ -237,6 +238,12 @@ async fn enforce_lfs_access(
     headers: &HeaderMap,
     access: LfsAccess,
 ) -> Result<(), Box<Response<Body>>> {
+    if state.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+        return Err(Box::new(lfs_error_response(
+            StatusCode::NOT_FOUND,
+            "push_policy=trunk: LFS is review-only".to_owned(),
+        )));
+    }
     let anonymous_access = state.storage.config().git.anonymous_access;
     // Only resolve the (DB-backed) token when it can actually affect the outcome.
     let authenticated = if access == LfsAccess::Read && anonymous_access {

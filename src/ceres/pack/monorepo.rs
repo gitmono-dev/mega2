@@ -1061,6 +1061,16 @@ impl Monorepo {
                  (delete commands are unaffected)"
             )));
         }
+        if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            for cmd in cmds.iter().filter(|c| c.ref_type == RefTypeEnum::Branch) {
+                if cmd.ref_name != MEGA_BRANCH_NAME {
+                    return Err(MegaError::Other(format!(
+                        "trunk push rejects ref '{}'; the only public branch is {MEGA_BRANCH_NAME}",
+                        cmd.ref_name
+                    )));
+                }
+            }
+        }
         let Some(cmd) = push_chain::primary_branch_command(&cmds) else {
             return Ok(());
         };
@@ -2723,6 +2733,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cl_refs, 0);
+    }
+
+    #[tokio::test]
+    async fn tp18_trunk_validate_rejects_non_main_ref() {
+        let temp = TempDir::new().expect("temp");
+        let storage = trunk_storage(temp.path()).await;
+        let cmd = RefCommand::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "refs/heads/dev".to_string(),
+        );
+        let repo = trunk_monorepo(
+            &storage,
+            "/foo",
+            vec![cmd],
+            HashSet::new(),
+            HashSet::new(),
+            Some("tester".into()),
+        )
+        .await;
+        let err = repo
+            .validate_incoming_push()
+            .await
+            .expect_err("trunk must reject refs/heads/dev at B0");
+        assert!(err.to_string().contains("only public branch"), "{err}");
+        assert!(err.to_string().contains("refs/heads/dev"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tp18_review_validate_does_not_use_trunk_branch_reject() {
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let cmd = RefCommand::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "refs/heads/dev".to_string(),
+        );
+        let repo = test_monorepo(&storage, vec![cmd], HashSet::new(), HashSet::new());
+        let err = repo
+            .validate_incoming_push()
+            .await
+            .expect_err("review still validates the chain");
+        assert!(
+            !err.to_string().contains("only public branch"),
+            "review must not use the trunk unique-branch reject: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tp18_review_still_refuses_delete_main() {
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let cmd = RefCommand::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ZERO_ID.to_string(),
+            MEGA_BRANCH_NAME.to_string(),
+        );
+        let repo = test_monorepo(&storage, vec![cmd.clone()], HashSet::new(), HashSet::new());
+        let err = repo
+            .apply_cl_mega_ref_for_push_command(&cmd, None)
+            .await
+            .expect_err("UN-16 must still refuse deleting main under review");
+        assert!(
+            err.to_string()
+                .contains("refusing to delete the main branch ref"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

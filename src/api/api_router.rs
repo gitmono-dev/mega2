@@ -22,6 +22,7 @@ use crate::{
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
     common::errors::{ApiError, MegaError},
+    config::PushPolicy,
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -50,6 +51,16 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(build_trigger_router::routers())
         .merge(webhook_router::routers())
         .merge(bot_router::routers())
+}
+
+/// HTTP `/api/v1` surface keyed on [`PushPolicy`] (TP-18). Trunk is the
+/// readonly protocol subset: no CL / issue / reviewer routers and no
+/// code_edit write routes. Review keeps the full OAuth web surface.
+pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
+    match policy {
+        PushPolicy::Trunk => storage_only_routers(),
+        PushPolicy::Review => routers(),
+    }
 }
 
 /// Git-adjacent read surface for storage-only HTTP (no OAuth/CL/user routers).

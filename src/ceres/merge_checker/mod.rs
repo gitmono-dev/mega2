@@ -11,6 +11,7 @@ use crate::{
         commit_message_checker::CommitMessageChecker, gpg_signature_checker::GpgSignatureChecker,
     },
     common::errors::MegaError,
+    config::PushPolicy,
     jupiter::{model::cl_dto::ClInfoDto, storage::Storage},
 };
 
@@ -201,6 +202,11 @@ impl CheckerRegistry {
     }
 
     pub async fn run_checks(&self, cl_info: ClInfoDto) -> Result<(), MegaError> {
+        if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            return Err(MegaError::Other(
+                "push_policy=trunk: CheckerRegistry is closed; CL checkers do not run".into(),
+            ));
+        }
         let check_configs = self
             .storage
             .cl_storage()
@@ -228,5 +234,43 @@ impl CheckerRegistry {
             .save_check_results(save_models)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        callisto::sea_orm_active_enums::MergeStatusEnum, config::PushPolicy,
+        jupiter::tests::test_storage_with_config,
+    };
+
+    #[tokio::test]
+    async fn run_checks_fails_closed_under_trunk() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let registry = CheckerRegistry::new(std::sync::Arc::new(storage), "tester".into());
+        let now = chrono::Utc::now().naive_utc();
+        let err = registry
+            .run_checks(ClInfoDto {
+                link: "C0000001".into(),
+                title: "t".into(),
+                merge_date: None,
+                status: MergeStatusEnum::Open,
+                path: "/foo".into(),
+                from_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                to_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                created_at: now,
+                updated_at: now,
+                username: "tester".into(),
+            })
+            .await
+            .expect_err("trunk must not run CL checkers");
+        assert!(
+            err.to_string().contains("CheckerRegistry is closed"),
+            "{err}"
+        );
     }
 }

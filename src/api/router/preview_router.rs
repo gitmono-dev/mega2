@@ -393,3 +393,53 @@ async fn save_edit(
 
     Ok(Json(CommonResult::success(Some(res))))
 }
+
+#[cfg(test)]
+mod tests {
+    use utoipa::OpenApi;
+    use utoipa_axum::router::OpenApiRouter;
+
+    use super::*;
+    use crate::api::api_doc::ApiDoc;
+
+    fn path_list(router: OpenApiRouter<MonoApiServiceState>) -> Vec<String> {
+        OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(router)
+            .split_for_parts()
+            .1
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn readonly_preview_keeps_reads_and_omits_cl_writes() {
+        let paths = path_list(readonly_routers());
+        assert!(
+            paths.iter().any(|p| p.contains("/blob")),
+            "readonly preview must keep /blob: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/tree")),
+            "readonly preview must keep /tree: {paths:?}"
+        );
+        for needle in ["create-entry", "/edit/save"] {
+            assert!(
+                paths.iter().all(|p| !p.contains(needle)),
+                "readonly preview must not include {needle}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_preview_registers_create_entry_and_save() {
+        let paths = path_list(routers());
+        assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "{paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.contains("/edit/save")), "{paths:?}");
+    }
+}

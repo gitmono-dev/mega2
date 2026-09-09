@@ -12,6 +12,7 @@ use crate::{
         errors::MegaError,
         utils::{self},
     },
+    config::PushPolicy,
     jupiter::storage::{Storage, mono_storage::MonoStorage},
 };
 
@@ -167,6 +168,12 @@ impl OneditCodeEdit {
         to_hash: &str,
         username: &str,
     ) -> Result<mega_cl::Model, GitError> {
+        if storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            return Err(GitError::CustomError(
+                "push_policy=trunk: code_edit CL writes are closed; land changes with git push"
+                    .into(),
+            ));
+        }
         let repo_path = &self.repo_path;
         match mode {
             EditCLMode::ForceCreate => Ok(editor
@@ -211,5 +218,56 @@ impl OneditCodeEdit {
                 _ => Err(GitError::CustomError(format!("link {} not found", link))),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ceres::{
+            api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
+            model::git::EditCLMode,
+        },
+        config::PushPolicy,
+        jupiter::tests::test_storage_with_config,
+    };
+
+    #[tokio::test]
+    async fn find_or_create_cl_for_edit_fails_closed_under_trunk() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        let storage = test_storage_with_config(temp.path(), config).await;
+        let connection = ::redis::aio::ConnectionManager::new_lazy_with_config(
+            ::redis::Client::open("redis://127.0.0.1:6379").expect("redis client"),
+            ::redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("lazy connection manager");
+        let api = MonoApiService {
+            storage: storage.clone(),
+            git_object_cache: std::sync::Arc::new(GitObjectCache {
+                connection,
+                prefix: String::new(),
+            }),
+        };
+        let editor = OneditCodeEdit::from(
+            "/foo",
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &api,
+            storage.mono_storage(),
+        );
+        let err = editor
+            .find_or_create_cl_for_edit(
+                &storage,
+                &editor,
+                EditCLMode::ForceCreate,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "tester",
+            )
+            .await
+            .expect_err("trunk must not create a CL from code_edit");
+        assert!(err.to_string().contains("push_policy=trunk"), "{err}");
     }
 }

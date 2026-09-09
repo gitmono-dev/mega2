@@ -12,12 +12,22 @@ use crate::{
         merge_checker::{CheckerRegistry, MAX_CL_CHAIN_COMMITS},
     },
     common::errors::MegaError,
+    config::PushPolicy,
     jupiter::{
         service::{reviewer_service::ReviewerService, webhook_service::WebhookEvent},
         storage::{Storage, mono_storage::MonoStorage},
         utils::converter::FromMegaModel,
     },
 };
+
+pub(crate) fn reject_trunk_cl_write(storage: &Storage) -> Result<(), MegaError> {
+    if storage.config().monorepo.push_policy == PushPolicy::Trunk {
+        return Err(MegaError::Other(
+            "push_policy=trunk: CL writes are closed; land changes with git push".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// MC-04: rebuild a CL's complete commit chain for its current
 /// `(from_hash, to_hash)` — a first-parent walk from `to_hash` down to
@@ -308,6 +318,7 @@ impl<
         to_hash: &str,
         username: &str,
     ) -> Result<(), MegaError> {
+        reject_trunk_cl_write(storage)?;
         let cl_stg = storage.cl_storage();
         let comment_stg = storage.conversation_storage();
 
@@ -358,6 +369,7 @@ impl<
         to_hash: &str,
         username: &str,
     ) -> Result<mega_cl::Model, MegaError> {
+        reject_trunk_cl_write(storage)?;
         let cl_link = generate_link();
         let dst_commit = Commit::from_mega_model(
             storage
@@ -420,6 +432,7 @@ impl<
         to_hash: &str,
         username: &str,
     ) -> Result<mega_cl::Model, MegaError> {
+        reject_trunk_cl_write(storage)?;
         let path_str = &self.repo_path;
         match storage
             .cl_storage()
@@ -758,5 +771,28 @@ mod tests {
             .expect("listing readable after recovery push");
         let shas: Vec<String> = listing.iter().map(|r| r.commit_sha.clone()).collect();
         assert_eq!(shas, vec![mc04_sha(701)], "the listing is the new chain");
+    }
+
+    #[tokio::test]
+    async fn update_or_create_cl_fails_closed_under_trunk() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+        let editor = mc04_editor(&storage);
+        let err = editor
+            .update_or_create_cl(&storage, &mc04_sha(500), &mc04_sha(502), "tester")
+            .await
+            .expect_err("trunk must not create a CL");
+        assert!(err.to_string().contains("push_policy=trunk"), "{err}");
+        assert!(
+            storage
+                .cl_storage()
+                .get_open_cl_by_path("/", "tester")
+                .await
+                .unwrap()
+                .is_none(),
+            "trunk must not persist a mega_cl row"
+        );
     }
 }
