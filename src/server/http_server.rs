@@ -37,7 +37,7 @@ use crate::{
     },
     common::errors::{MegaError, MegaResult, ProtocolError},
     config::{
-        ArtifactGcConfig, BuckConfig, Config, MergeWriter,
+        ArtifactGcConfig, BuckConfig, Config, MergeWriter, PushAuth,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     context::AppContext,
@@ -423,6 +423,7 @@ pub(crate) async fn ensure_authz_first_build(
 
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     crate::config::validate::require_oauth_for_http_service(ctx.storage.config().as_ref())?;
+    warn_if_unauthenticated_push(ctx.storage.config().as_ref());
 
     if ctx.storage.config().monorepo.merge_writer == MergeWriter::Queue {
         // Config-time validate cannot see the DB. Queue mode absorbs leftover
@@ -614,6 +615,14 @@ fn cors_allow_origins(oauth: Option<&crate::config::OAuthConfig>) -> Vec<HeaderV
         .collect()
 }
 
+fn warn_if_unauthenticated_push(config: &Config) {
+    if config.git.push_auth == Some(PushAuth::None) {
+        tracing::warn!(
+            "git.push_auth=none: HTTP receive-pack has no pusher identity; only use behind a trusted network boundary (loopback, Unix socket, or controlled intranet)"
+        );
+    }
+}
+
 /// This is the main entry for the mono server.
 /// It is responsible for creating the main router and setting up the necessary middleware.
 ///
@@ -645,12 +654,8 @@ fn cors_allow_origins(oauth: Option<&crate::config::OAuthConfig>) -> Vec<HeaderV
 ///   - POST       end of `Regex::new(r"/git-receive-pack$")`
 pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, MegaError> {
     let storage = ctx.storage;
-    let oauth = storage.config().oauth.clone().ok_or_else(|| {
-        MegaError::Other("OAuth configuration is required for the HTTP service".to_string())
-    })?;
-    let origins: Vec<HeaderValue> = cors_allow_origins(Some(&oauth));
-    let session_store =
-        WebsiteSessionStore::new(oauth.website_api_base_url, oauth.session_cookie_names)?;
+    let config = storage.config();
+    let storage_only = config.git.storage_only();
 
     let git_object_cache = Arc::new(GitObjectCache {
         connection: ctx.connection.clone(),
@@ -664,82 +669,120 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("http://{host}:{port}"));
 
+    let (session_store, origins) = if storage_only {
+        (
+            BrowserSessionStore::Anonymous,
+            cors_allow_origins(config.oauth.as_ref()),
+        )
+    } else {
+        let oauth = config.oauth.clone().ok_or_else(|| {
+            MegaError::Other("OAuth configuration is required for the HTTP service".to_string())
+        })?;
+        let session_store = WebsiteSessionStore::new(
+            oauth.website_api_base_url.clone(),
+            oauth.session_cookie_names.clone(),
+        )?;
+        (
+            BrowserSessionStore::Website(session_store),
+            cors_allow_origins(Some(&oauth)),
+        )
+    };
+
     let api_state = MonoApiServiceState {
         storage: storage.clone(),
-        session_store: BrowserSessionStore::Website(session_store),
+        session_store,
         listen_addr,
         entity_store: ctx.entity_store.clone(),
         git_object_cache,
         bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
     };
 
-    // add RequestDecompressionLayer for handle gzip encode
-    // add TraceLayer for log record
-    // add CorsLayer to add cors header
-    // add SessionManagerLayer for session management
     let session_store = MemoryStore::default();
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false) // Set to true in production with HTTPS
-        .with_expiry(Expiry::OnInactivity(Duration::seconds(3600))); // 1 hour of inactivity
+        .with_secure(false)
+        .with_expiry(Expiry::OnInactivity(Duration::seconds(3600)));
 
-    let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
-        .merge(lfs_router::routers().with_state(api_state.clone()))
-        .nest(
-            "/api/v1",
-            api_router::routers()
-                .with_state(api_state.clone())
-                .route_layer(middleware::from_fn_with_state(
-                    api_state.clone(),
-                    cedar_guard,
-                )),
-        )
-        // .nest("/auth", oauth::routers().with_state(api_state.clone()))
-        // Using Regular Expressions for Path Matching in Protocol
-        .route(
-            "/{*path}",
-            any({
-                let api_state = api_state.clone();
-                move |req: Request<Body>| {
-                    handle_smart_protocol(req, Arc::new(ProtocolApiState::from_ref(&api_state)))
-                }
-            }),
-        )
-        .layer(
-            ServiceBuilder::new().layer(session_layer).layer(
-                CorsLayer::new()
-                    .allow_origin(origins)
-                    .allow_headers(vec![
-                        http::header::AUTHORIZATION,
-                        http::header::CONTENT_TYPE,
-                        HeaderName::from_static("x-request-id"),
-                        HeaderName::from_static("x-trace-id"),
-                    ])
-                    .expose_headers(vec![HeaderName::from_static("x-request-id")])
-                    .allow_methods([
-                        Method::GET,
-                        Method::POST,
-                        Method::OPTIONS,
-                        Method::DELETE,
-                        Method::PUT,
-                    ])
-                    .allow_credentials(true),
-            ),
-        )
-        .layer(TraceLayer::new_for_http().make_span_with(trace_context::http_request_span))
-        .layer(RequestDecompressionLayer::new())
-        .layer(middleware::from_fn(trace_context::inject_trace_context))
-        .with_state(api_state.clone())
-        .split_for_parts();
+    let cors = CorsLayer::new()
+        .allow_origin(origins)
+        .allow_headers(vec![
+            http::header::AUTHORIZATION,
+            http::header::CONTENT_TYPE,
+            HeaderName::from_static("x-request-id"),
+            HeaderName::from_static("x-trace-id"),
+        ])
+        .expose_headers(vec![HeaderName::from_static("x-request-id")])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::OPTIONS,
+            Method::DELETE,
+            Method::PUT,
+        ])
+        .allow_credentials(true);
 
-    // Register /info/lfs paths for runtime compatibility (not in OpenAPI)
-    // Convert OpenApiRouter to Router to avoid including /info/lfs in OpenAPI docs
-    let info_lfs_router: Router = lfs_router::lfs_routes()
-        .with_state(api_state.clone())
-        .into();
+    let protocol_state = api_state.clone();
+    let protocol_route = || {
+        let protocol_state = protocol_state.clone();
+        any(move |req: Request<Body>| {
+            handle_smart_protocol(req, Arc::new(ProtocolApiState::from_ref(&protocol_state)))
+        })
+    };
 
-    Ok(router
-        .nest("/info/lfs", info_lfs_router)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
+    let (router, api) = if storage_only {
+        OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .nest(
+                "/api/v1",
+                api_router::storage_only_routers().with_state(api_state.clone()),
+            )
+            .route("/{*path}", protocol_route())
+            .layer(
+                ServiceBuilder::new()
+                    .layer(session_layer.clone())
+                    .layer(cors.clone()),
+            )
+            .layer(TraceLayer::new_for_http().make_span_with(trace_context::http_request_span))
+            .layer(RequestDecompressionLayer::new())
+            .layer(middleware::from_fn(trace_context::inject_trace_context))
+            .with_state(api_state.clone())
+            .split_for_parts()
+    } else {
+        OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers().with_state(api_state.clone()))
+            .nest(
+                "/api/v1",
+                api_router::routers()
+                    .with_state(api_state.clone())
+                    .route_layer(middleware::from_fn_with_state(
+                        api_state.clone(),
+                        cedar_guard,
+                    )),
+            )
+            .route("/{*path}", protocol_route())
+            .layer(ServiceBuilder::new().layer(session_layer).layer(cors))
+            .layer(TraceLayer::new_for_http().make_span_with(trace_context::http_request_span))
+            .layer(RequestDecompressionLayer::new())
+            .layer(middleware::from_fn(trace_context::inject_trace_context))
+            .with_state(api_state.clone())
+            .split_for_parts()
+    };
+
+    let router = if storage_only {
+        router
+    } else {
+        let info_lfs_router: Router = lfs_router::lfs_routes()
+            .with_state(api_state.clone())
+            .into();
+        router.nest("/info/lfs", info_lfs_router)
+    };
+
+    Ok(router.merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
+}
+
+pub(crate) fn storage_only_openapi_doc() -> utoipa::openapi::OpenApi {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .nest("/api/v1", api_router::storage_only_routers())
+        .split_for_parts()
+        .1
 }
 
 fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
@@ -1094,6 +1137,116 @@ mod tests {
         let new_req = rewrite_lfs_request_uri(req);
 
         assert_eq!(new_req.uri().path(), "/info/lfs/objects/123");
+    }
+
+    #[test]
+    fn push_auth_none_warns_that_pusher_identity_is_absent() {
+        use std::{
+            io::Write,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl MakeWriter<'_> for Buf {
+            type Writer = Buf;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut none = isolated_config(temp_dir.path().join("none"));
+        none.git.push_auth = Some(PushAuth::None);
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Buf(buf.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_unauthenticated_push(&none);
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).expect("utf8");
+        assert!(
+            out.contains("git.push_auth=none") && out.contains("no pusher identity"),
+            "missing identity warning: {out}"
+        );
+    }
+
+    #[test]
+    fn storage_only_skips_oauth_http_gate() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.oauth = None;
+        config.git.push_auth = Some(PushAuth::None);
+        crate::config::validate::require_oauth_for_http_service(&config)
+            .expect("storage-only HTTP must start without [oauth]");
+    }
+
+    #[test]
+    fn omitted_push_auth_still_requires_oauth_http_gate() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.oauth = None;
+        let err = crate::config::validate::require_oauth_for_http_service(&config)
+            .expect_err("omitted push_auth keeps the OAuth HTTP form");
+        assert!(
+            err.to_string().contains("[oauth]"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_only_openapi_is_readonly_protocol_subset() {
+        let api = storage_only_openapi_doc();
+        let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("/status")),
+            "storage-only OpenAPI must include /status: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.contains("/blob") || p.contains("/tree")),
+            "storage-only OpenAPI must include blob/tree reads: {paths:?}"
+        );
+        for needle in ["/auth", "create-entry", "/cl", "/user"] {
+            assert!(
+                paths.iter().all(|p| !p.contains(needle)),
+                "storage-only OpenAPI must not include {needle}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_openapi_still_includes_cl_user_and_preview_writes() {
+        let (_, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .nest("/api/v1", api_router::routers())
+            .split_for_parts();
+        let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
+        assert!(
+            paths.iter().any(|p| p.contains("/cl")),
+            "OAuth OpenAPI must include /cl: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/user")),
+            "OAuth OpenAPI must include /user: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "OAuth OpenAPI must include create-entry: {paths:?}"
+        );
     }
 
     #[tokio::test]

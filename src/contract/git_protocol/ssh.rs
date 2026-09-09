@@ -139,6 +139,11 @@ impl server::Handler for SshServer {
                     smart_protocol.set_authenticated_user(username);
                 }
                 if service_type == ServiceType::ReceivePack {
+                    if !self.state.storage.config().git.ssh_receive_pack_enabled() {
+                        session.data(channel, b"error: SSH receive-pack is disabled\n".to_vec())?;
+                        session.channel_failure(channel)?;
+                        return Ok(());
+                    }
                     check_push_permission(
                         &self.state,
                         &smart_protocol.auth,

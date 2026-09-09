@@ -44,8 +44,15 @@ async fn upsert_commit_binding(
 }
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
-    OpenApiRouter::new()
+    readonly_routers()
         .routes(routes!(create_entry))
+        .routes(routes!(preview_diff))
+        .routes(routes!(save_edit))
+}
+
+/// GET-only code preview used by the storage-only HTTP surface (TP-20).
+pub fn readonly_routers() -> OpenApiRouter<MonoApiServiceState> {
+    OpenApiRouter::new()
         .routes(routes!(get_latest_commit))
         .routes(routes!(get_tree_commit_info))
         .routes(routes!(get_file_blame))
@@ -54,8 +61,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(path_can_be_cloned))
         .routes(routes!(get_tree_info))
         .routes(routes!(get_blob_string))
-        .routes(routes!(preview_diff))
-        .routes(routes!(save_edit))
 }
 
 /// Get blob file as string

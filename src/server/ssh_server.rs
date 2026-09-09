@@ -69,6 +69,14 @@ pub async fn start_server(ctx: AppContext, command: &SshOptions) -> MegaResult {
     )
     .await?;
 
+    if ctx.storage.config().git.storage_only()
+        && ctx.storage.config().git.ssh_receive_pack != Some(false)
+    {
+        return Err(MegaError::Other(
+            "git.push_auth requires git.ssh_receive_pack=false (SSH receive-pack must be explicitly disabled for storage-only)".to_string(),
+        ));
+    }
+
     let state = ProtocolApiState {
         storage: ctx.storage.clone(),
         git_object_cache: Arc::new(GitObjectCache {

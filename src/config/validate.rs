@@ -163,6 +163,9 @@ pub(crate) fn validate_oauth_config(config: &OAuthConfig) -> Result<(), MegaErro
 /// Fail-closed guard for `service http`: requires `[oauth]` with a non-empty
 /// `website_api_base_url`.
 pub fn require_oauth_for_http_service(config: &Config) -> Result<(), MegaError> {
+    if config.git.storage_only() {
+        return Ok(());
+    }
     let oauth = config.oauth.as_ref().ok_or_else(|| {
         MegaError::Other(
             "service http requires [oauth] with oauth.website_api_base_url (see docs/refactoring/website-auth.md)".to_string(),
@@ -646,6 +649,11 @@ pub(crate) fn validate_trunk_config_surface(config: &Config) -> Result<(), MegaE
             ));
         }
         _ => {}
+    }
+    if config.git.storage_only() && config.git.ssh_receive_pack != Some(false) {
+        return Err(MegaError::Other(
+            "git.push_auth requires git.ssh_receive_pack=false (SSH receive-pack must be explicitly disabled for storage-only)".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1645,7 +1653,12 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "website_api_base_url",
             "session_cookie_names",
         ]),
-        "git" => Some(&["anonymous_access", "push_auth", "push_tokens"]),
+        "git" => Some(&[
+            "anonymous_access",
+            "push_auth",
+            "push_tokens",
+            "ssh_receive_pack",
+        ]),
         "git.push_tokens" => Some(&["name", "token", "paths"]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
@@ -2098,6 +2111,15 @@ mod tests {
         let err = require_oauth_for_http_service(&config)
             .expect_err("service http should require oauth section");
         assert!(err.to_string().contains("service http requires [oauth]"));
+    }
+
+    #[test]
+    fn require_oauth_for_http_service_skips_when_push_auth_is_set() {
+        let mut config = valid_config();
+        config.oauth = None;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        require_oauth_for_http_service(&config)
+            .expect("storage-only HTTP must not require [oauth]");
     }
 
     #[test]

@@ -748,6 +748,9 @@ fn collect_git_restart_fields(
     if current.git.push_tokens != candidate.git.push_tokens {
         report.restart_required_fields.push("git.push_tokens");
     }
+    if current.git.ssh_receive_pack != candidate.git.ssh_receive_pack {
+        report.restart_required_fields.push("git.ssh_receive_pack");
+    }
 }
 
 fn collect_pack_restart_fields(
@@ -1071,6 +1074,8 @@ mod tests {
         candidate.monorepo.root_dirs = vec!["changed-root".to_string()];
         candidate.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
         candidate.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        candidate.git.push_auth = Some(crate::config::PushAuth::None);
+        candidate.git.ssh_receive_pack = Some(false);
         candidate.pack.channel_message_size = 2_000_000;
         candidate.lfs.local.lfs_file_path = temp_dir.path().join("candidate-lfs");
         candidate.blame.enable_caching = false;
@@ -1096,6 +1101,8 @@ mod tests {
                 "monorepo.root_dirs",
                 "monorepo.object_format",
                 "monorepo.push_policy",
+                "git.push_auth",
+                "git.ssh_receive_pack",
                 "pack.channel_message_size",
                 "lfs.local.lfs_file_path",
                 "blame.enable_caching",

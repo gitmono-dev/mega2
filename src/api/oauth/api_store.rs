@@ -3,6 +3,8 @@ use crate::api::oauth::{model::LoginUser, website_session_store::WebsiteSessionS
 #[derive(Debug, Clone)]
 pub enum BrowserSessionStore {
     Website(WebsiteSessionStore),
+    /// Storage-only: never resolves a browser session (no website).
+    Anonymous,
     /// Test-only session double, `cfg(test)`-gated so it is never compiled
     /// into the production `service http` binary (website-auth.md contract).
     #[cfg(test)]
@@ -59,6 +61,7 @@ impl BrowserSessionStore {
                     .load_user_from_cookie_header_pair(cookie_name, cookie_value)
                     .await
             }
+            Self::Anonymous => Ok(None),
             #[cfg(test)]
             Self::Fixed(store) => Ok(Some(store.user.clone())),
             #[cfg(test)]

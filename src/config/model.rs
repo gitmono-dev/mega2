@@ -1079,6 +1079,10 @@ pub struct GitConfig {
     /// the whole repository. Restart-required.
     #[serde(default)]
     pub push_tokens: Vec<PushTokenConfig>,
+    /// SSH receive-pack. Storage-only (`push_auth` set) requires this to be
+    /// explicitly `false`. Omitted in review/OAuth form keeps today's SSH push.
+    #[serde(default)]
+    pub ssh_receive_pack: Option<bool>,
 }
 
 /// Storage-only git HTTP push authentication (TP-15 config surface; TP-19
@@ -1096,6 +1100,19 @@ impl PushAuth {
             Self::Token => "token",
             Self::None => "none",
         }
+    }
+}
+
+impl GitConfig {
+    /// Explicit `push_auth` selects the storage-only HTTP/SSH form.
+    pub fn storage_only(&self) -> bool {
+        self.push_auth.is_some()
+    }
+
+    /// SSH receive-pack is a review/OAuth channel. Storage-only never exposes
+    /// it; `ssh_receive_pack = false` also disables it under review.
+    pub fn ssh_receive_pack_enabled(&self) -> bool {
+        !self.storage_only() && self.ssh_receive_pack != Some(false)
     }
 }
 
@@ -1118,6 +1135,7 @@ impl Default for GitConfig {
             anonymous_access: default_git_anonymous_access(),
             push_auth: None,
             push_tokens: Vec::new(),
+            ssh_receive_pack: None,
         }
     }
 }

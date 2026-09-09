@@ -18,6 +18,7 @@ fn trunk_config(base: &std::path::Path) -> super::Config {
     let mut config = isolated_config(base.join("config"));
     config.monorepo.push_policy = PushPolicy::Trunk;
     config.git.push_auth = Some(PushAuth::None);
+    config.git.ssh_receive_pack = Some(false);
     config.cedar.enforcement = "off".to_string();
     config
 }
@@ -41,6 +42,7 @@ fn trunk_with_explicit_push_auth_none_validates() {
     let mut config = valid_config();
     config.monorepo.push_policy = PushPolicy::Trunk;
     config.git.push_auth = Some(PushAuth::None);
+    config.git.ssh_receive_pack = Some(false);
     config.cedar.enforcement = "off".to_string();
     config
         .validate()
@@ -71,6 +73,18 @@ fn push_auth_token_requires_trunk() {
 }
 
 #[test]
+fn storage_only_requires_explicit_ssh_receive_pack_false() {
+    let mut config = valid_config();
+    config.monorepo.push_policy = PushPolicy::Trunk;
+    config.git.push_auth = Some(PushAuth::None);
+    config.cedar.enforcement = "off".to_string();
+    let err = config
+        .validate()
+        .expect_err("storage-only must fail closed without ssh_receive_pack=false");
+    assert!(err.to_string().contains("ssh_receive_pack"), "{err}");
+}
+
+#[test]
 fn trunk_without_push_auth_is_rejected() {
     let mut config = valid_config();
     config.monorepo.push_policy = PushPolicy::Trunk;
@@ -92,6 +106,7 @@ fn push_auth_token_requires_at_least_one_token() {
     let mut config = valid_config();
     config.monorepo.push_policy = PushPolicy::Trunk;
     config.git.push_auth = Some(PushAuth::Token);
+    config.git.ssh_receive_pack = Some(false);
     config.cedar.enforcement = "off".to_string();
     let err = config.validate().expect_err("token table required");
     assert!(err.to_string().contains("push_tokens"), "{err}");
@@ -102,6 +117,7 @@ fn push_token_secret_ref_must_use_config_namespace() {
     let mut config = valid_config();
     config.monorepo.push_policy = PushPolicy::Trunk;
     config.git.push_auth = Some(PushAuth::Token);
+    config.git.ssh_receive_pack = Some(false);
     config.cedar.enforcement = "off".to_string();
     config.git.push_tokens = vec![PushTokenConfig {
         name: "ci".into(),
@@ -156,6 +172,7 @@ fn push_token_file_placeholder_expands_through_config_load() {
         r#"
 [git]
 push_auth = "token"
+ssh_receive_pack = false
 [[git.push_tokens]]
 name = "ci"
 token = "${{file:{}}}"
@@ -206,6 +223,7 @@ fn restart_required_fields_include_trunk_surface() {
     let mut current = isolated_config(temp_dir.path().join("current"));
     current.monorepo.push_policy = PushPolicy::Trunk;
     current.git.push_auth = Some(PushAuth::None);
+    current.git.ssh_receive_pack = Some(false);
     current.cedar.enforcement = "off".to_string();
     let handle = ConfigHandle::new(current);
     let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
@@ -224,6 +242,22 @@ fn restart_required_fields_include_trunk_surface() {
     );
     assert!(report.restart_required_fields.contains(&"git.push_auth"));
     assert!(report.restart_required_fields.contains(&"git.push_tokens"));
+}
+
+#[test]
+fn ssh_receive_pack_change_is_restart_required() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let mut current = isolated_config(temp_dir.path().join("current"));
+    current.git.ssh_receive_pack = Some(false);
+    let handle = ConfigHandle::new(current);
+    let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+    candidate.git.ssh_receive_pack = None;
+    let report = handle.reload(candidate).expect("reload");
+    assert!(
+        report
+            .restart_required_fields
+            .contains(&"git.ssh_receive_pack")
+    );
 }
 
 #[tokio::test]

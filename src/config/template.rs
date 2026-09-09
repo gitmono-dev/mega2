@@ -110,6 +110,7 @@ batch_limit = 100
 # [git]
 # anonymous_access = true
 # push_auth = "token"
+# ssh_receive_pack = false
 # [[git.push_tokens]]
 # name = "team-foo"
 # token = "${{file:/run/secrets/team_foo_token}}"

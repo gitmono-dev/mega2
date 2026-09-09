@@ -474,6 +474,38 @@ mod tests {
     }
 
     #[test]
+    fn ssh_receive_pack_enabled_only_for_review_oauth_form() {
+        assert!(GitConfig::default().ssh_receive_pack_enabled());
+
+        let review_disabled = GitConfig {
+            ssh_receive_pack: Some(false),
+            ..Default::default()
+        };
+        assert!(!review_disabled.ssh_receive_pack_enabled());
+
+        let token = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            ssh_receive_pack: Some(false),
+            ..Default::default()
+        };
+        assert!(!token.ssh_receive_pack_enabled());
+
+        let none = GitConfig {
+            push_auth: Some(PushAuth::None),
+            ssh_receive_pack: Some(false),
+            ..Default::default()
+        };
+        assert!(!none.ssh_receive_pack_enabled());
+
+        let storage_only_even_if_true = GitConfig {
+            push_auth: Some(PushAuth::Token),
+            ssh_receive_pack: Some(true),
+            ..Default::default()
+        };
+        assert!(!storage_only_even_if_true.ssh_receive_pack_enabled());
+    }
+
+    #[test]
     fn receive_pack_requires_auth_except_explicit_none() {
         let omitted = GitConfig::default();
         assert!(receive_pack_requires_http_auth(&omitted));

@@ -52,6 +52,15 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(bot_router::routers())
 }
 
+/// Git-adjacent read surface for storage-only HTTP (no OAuth/CL/user routers).
+pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
+    OpenApiRouter::new()
+        .routes(routes!(life_cycle_check))
+        .route("/file/blob/{object_id}", get(get_blob_file))
+        .route("/file/tree", get(get_tree_file))
+        .merge(preview_router::readonly_routers())
+}
+
 /// Health Check
 #[utoipa::path(
     get,
