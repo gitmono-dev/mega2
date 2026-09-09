@@ -161,7 +161,6 @@ fn write_bootstrap_config(path: &Path, db_url: &str) {
             r#"
             [database]
             db_type = "postgres"
-            db_path = ""
             db_url = "{}"
             max_connection = 4
             min_connection = 1

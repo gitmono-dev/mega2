@@ -27,7 +27,6 @@ with_ansi = true
 
 [database]
 db_type = "postgres"
-db_path = ""
 # Override with MEGA_DATABASE__DB_URL or a deployment secret. Do not put a
 # reusable production password in this file.
 db_url = "postgres://localhost:5432/monoengine"

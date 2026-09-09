@@ -30,9 +30,6 @@ with_ansi = true
 # Only PostgreSQL is supported.
 db_type = "postgres"
 
-# Deprecated compatibility field; ignored by PostgreSQL connections.
-db_path = ""
-
 # Database connection URL. This sample intentionally avoids embedding a
 # reusable password; inject credentials with MEGA_DATABASE__DB_URL or your
 # deployment secret mechanism when PostgreSQL requires auth.

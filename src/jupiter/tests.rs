@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -87,7 +87,6 @@ pub async fn test_db_connection(_temp_dir: &Path) -> DatabaseConnection {
 pub async fn test_db_config(_temp_dir: &Path) -> DbConfig {
     DbConfig {
         db_type: "postgres".to_owned(),
-        db_path: PathBuf::new(),
         db_url: create_test_database_url().await,
         max_connection: 2,
         min_connection: 1,

@@ -159,7 +159,6 @@ impl TestConfigBuilder {
             log: LogConfig::default(),
             database: DbConfig {
                 db_type: "postgres".to_string(),
-                db_path: PathBuf::new(),
                 db_url: self.database_url,
                 max_connection: 4,
                 min_connection: 1,

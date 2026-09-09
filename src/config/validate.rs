@@ -1557,7 +1557,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         "log" => Some(&["level", "print_std", "with_ansi"]),
         "database" => Some(&[
             "db_type",
-            "db_path",
             "db_url",
             "max_connection",
             "min_connection",
@@ -2985,6 +2984,7 @@ mod tests {
     #[test]
     fn known_config_field_path_accepts_nested_fields_and_rejects_orphans() {
         assert!(is_known_field_path("database.db_url"));
+        assert!(!is_known_field_path("database.db_path"));
         assert!(is_known_field_path("object_storage.s3.access_key_id"));
         assert!(is_known_field_path("sidebar.default_items.label"));
         assert!(is_known_field_path("notification.enabled"));
@@ -3131,6 +3131,23 @@ mod tests {
         assert!(message.contains("database.typo"));
         assert!(message.contains("object_storage.s3.unexpected"));
         assert!(message.contains("sidebar.default_items[0].icon"));
+    }
+
+    #[test]
+    fn reject_unknown_fields_rejects_removed_database_db_path() {
+        let value = toml::from_str::<Value>(
+            r#"
+            [database]
+            db_type = "postgres"
+            db_path = ""
+            db_url = "postgres://localhost:5432/mono"
+            "#,
+        )
+        .unwrap();
+
+        let err =
+            reject_unknown_fields(&value).expect_err("removed database.db_path must fail closed");
+        assert!(err.to_string().contains("database.db_path"), "{}", err);
     }
 
     #[test]

@@ -538,7 +538,6 @@ impl Fixture {
             format!(
                 "[database]\n\
                  db_type = \"postgres\"\n\
-                 db_path = \"\"\n\
                  db_url = \"{}\"\n\
                  max_connection = 4\n\
                  min_connection = 1\n\

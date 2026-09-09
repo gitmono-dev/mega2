@@ -82,7 +82,6 @@ fn default_with_ansi() -> bool {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DbConfig {
     pub db_type: String,
-    pub db_path: PathBuf,
     pub db_url: String,
     pub max_connection: u32,
     pub min_connection: u32,
@@ -95,7 +94,6 @@ impl Default for DbConfig {
     fn default() -> Self {
         Self {
             db_type: String::from("postgres"),
-            db_path: PathBuf::new(),
             db_url: String::from("postgres://localhost:5432/mega"),
             max_connection: 16,
             min_connection: 8,

@@ -628,9 +628,6 @@ fn collect_database_restart_fields(
     if current.database.db_type != candidate.database.db_type {
         report.restart_required_fields.push("database.db_type");
     }
-    if current.database.db_path != candidate.database.db_path {
-        report.restart_required_fields.push("database.db_path");
-    }
     if current.database.db_url != candidate.database.db_url {
         report.restart_required_fields.push("database.db_url");
     }

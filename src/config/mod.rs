@@ -599,7 +599,6 @@ mod test {
             r#"
                 [database]
                 db_type = "postgres"
-                db_path = ""
                 db_url = "postgres://localhost:5432/base"
                 max_connection = 4
                 min_connection = 1
@@ -640,7 +639,6 @@ mod test {
 
                 [database]
                 db_type = "postgres"
-                db_path = ""
                 db_url = "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine"
                 max_connection = 4
                 min_connection = 1
