@@ -6,7 +6,6 @@ pub mod cl;
 pub mod code_review;
 pub mod commit;
 pub mod conversation;
-pub mod dynamic_sidebar;
 pub mod git;
 pub mod gpg;
 pub mod group;

@@ -23,8 +23,6 @@ pub struct Config {
     pub object_storage: ObjectStorageConfig,
     #[serde(default)]
     pub orion_server: Option<OrionServerConfig>,
-    #[serde(default)]
-    pub sidebar: SidebarConfig,
     /// Background GC for `artifact_objects` rows with no `artifact_set_files` references
     /// (`docs/artifacts-protocol.md` §10.6).
     #[serde(default)]
@@ -952,111 +950,6 @@ impl Default for BuckConfig {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct SidebarConfig {
-    pub default_items: Vec<SidebarItem>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct SidebarItem {
-    pub public_id: String,
-    pub label: String,
-    pub href: String,
-    #[serde(default = "default_visible")]
-    pub visible: bool,
-    pub order_index: i32,
-}
-
-impl Default for SidebarConfig {
-    fn default() -> Self {
-        Self {
-            default_items: vec![
-                SidebarItem {
-                    public_id: "home".to_string(),
-                    label: "Home".to_string(),
-                    href: "/posts".to_string(),
-                    visible: true,
-                    order_index: 0,
-                },
-                SidebarItem {
-                    public_id: "inbox".to_string(),
-                    label: "Inbox".to_string(),
-                    href: "/inbox".to_string(),
-                    visible: true,
-                    order_index: 1,
-                },
-                SidebarItem {
-                    public_id: "calls".to_string(),
-                    label: "Calls".to_string(),
-                    href: "/calls".to_string(),
-                    visible: false,
-                    order_index: 2,
-                },
-                SidebarItem {
-                    public_id: "drafts".to_string(),
-                    label: "Drafts".to_string(),
-                    href: "/drafts".to_string(),
-                    visible: true,
-                    order_index: 3,
-                },
-                SidebarItem {
-                    public_id: "code".to_string(),
-                    label: "Code".to_string(),
-                    href: "/code".to_string(),
-                    visible: true,
-                    order_index: 4,
-                },
-                SidebarItem {
-                    public_id: "tags".to_string(),
-                    label: "Tags".to_string(),
-                    href: "/code/tags".to_string(),
-                    visible: true,
-                    order_index: 5,
-                },
-                SidebarItem {
-                    public_id: "cl".to_string(),
-                    label: "Change List".to_string(),
-                    href: "/cl".to_string(),
-                    visible: true,
-                    order_index: 6,
-                },
-                SidebarItem {
-                    public_id: "mq".to_string(),
-                    label: "Merge Queue".to_string(),
-                    href: "/queue/main".to_string(),
-                    visible: true,
-                    order_index: 7,
-                },
-                SidebarItem {
-                    public_id: "issue".to_string(),
-                    label: "Issue".to_string(),
-                    href: "/issue".to_string(),
-                    visible: true,
-                    order_index: 8,
-                },
-                SidebarItem {
-                    public_id: "rust".to_string(),
-                    label: "Rust".to_string(),
-                    href: "/rust".to_string(),
-                    visible: false,
-                    order_index: 9,
-                },
-                SidebarItem {
-                    public_id: "oc".to_string(),
-                    label: "Orion Client".to_string(),
-                    href: "/oc".to_string(),
-                    visible: true,
-                    order_index: 10,
-                },
-            ],
-        }
-    }
-}
-
-fn default_visible() -> bool {
-    true
-}
-
 /// Git protocol settings (docs/refactoring/protocol.md Stage 4).
 ///
 /// Controls whether anonymous (unauthenticated) clients may clone/fetch
@@ -1187,47 +1080,7 @@ fn default_cedar_enforcement() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, MonoConfig, MonoObjectFormat, SidebarConfig, SidebarItem};
-
-    fn sidebar_items(items: &[SidebarItem]) -> Vec<(&str, &str, &str, bool, i32)> {
-        items
-            .iter()
-            .map(|item| {
-                (
-                    item.public_id.as_str(),
-                    item.label.as_str(),
-                    item.href.as_str(),
-                    item.visible,
-                    item.order_index,
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn sample_sidebar_defaults_match_model_defaults_without_chat_or_notes() {
-        let sample: Config = toml::from_str(include_str!("../../config/config.toml"))
-            .expect("sample configuration must deserialize");
-        let expected = vec![
-            ("home", "Home", "/posts", true, 0),
-            ("inbox", "Inbox", "/inbox", true, 1),
-            ("calls", "Calls", "/calls", false, 2),
-            ("drafts", "Drafts", "/drafts", true, 3),
-            ("code", "Code", "/code", true, 4),
-            ("tags", "Tags", "/code/tags", true, 5),
-            ("cl", "Change List", "/cl", true, 6),
-            ("mq", "Merge Queue", "/queue/main", true, 7),
-            ("issue", "Issue", "/issue", true, 8),
-            ("rust", "Rust", "/rust", false, 9),
-            ("oc", "Orion Client", "/oc", true, 10),
-        ];
-
-        assert_eq!(
-            sidebar_items(&SidebarConfig::default().default_items),
-            expected
-        );
-        assert_eq!(sidebar_items(&sample.sidebar.default_items), expected);
-    }
+    use super::{MonoConfig, MonoObjectFormat};
 
     #[test]
     fn monorepo_object_format_defaults_and_accepts_sha_aliases() {

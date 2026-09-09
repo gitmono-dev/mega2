@@ -5,4 +5,3 @@ pub mod common;
 pub mod conv_dto;
 pub mod group_dto;
 pub mod merge_queue_dto;
-pub mod sidebar_dto;

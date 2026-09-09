@@ -23,8 +23,7 @@ use crate::{
         service::webhook_service::WebhookService,
         storage::{
             Storage, cl_storage::ClStorage, conversation_storage::ConversationStorage,
-            dynamic_sidebar_storage::DynamicSidebarStorage, gpg_storage::GpgStorage,
-            issue_storage::IssueStorage, user_storage::UserStorage,
+            gpg_storage::GpgStorage, issue_storage::IssueStorage, user_storage::UserStorage,
             webhook_storage::WebhookStorage,
         },
     },
@@ -137,10 +136,6 @@ impl MonoApiServiceState {
 
     fn webhook_svc(&self) -> WebhookService {
         self.storage.webhook_service.clone()
-    }
-
-    fn dynamic_sidebar_stg(&self) -> DynamicSidebarStorage {
-        self.storage.dynamic_sidebar_storage()
     }
 
     pub fn build_trigger_service(&self) -> BuildTriggerService {

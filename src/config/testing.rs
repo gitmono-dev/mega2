@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use super::{
     ArtifactGcConfig, BlameConfig, BuildConfig, CedarConfig, Config, DbConfig, GitConfig,
     LFSConfig, LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, PackConfig, RedisConfig,
-    SidebarConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -198,7 +197,6 @@ impl TestConfigBuilder {
                 ..Default::default()
             },
             orion_server: None,
-            sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
             notification: None,
             vault: None,

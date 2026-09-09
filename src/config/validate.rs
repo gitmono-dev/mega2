@@ -10,7 +10,7 @@ use url::Url;
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, CedarConfig, Config, DbConfig,
     GitConfig, LFSConfig, LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
-    OAuthConfig, OrionServerConfig, PackConfig, PushAuth, PushPolicy, RedisConfig, SidebarConfig,
+    OAuthConfig, OrionServerConfig, PackConfig, PushAuth, PushPolicy, RedisConfig,
     VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
     secret::{SecretRef, is_secret_ref_value},
 };
@@ -126,7 +126,6 @@ impl Config {
         if let Some(orion_server_config) = &self.orion_server {
             validate_orion_server_config(orion_server_config)?;
         }
-        validate_sidebar_config(&self.sidebar)?;
         validate_artifact_gc_config(&self.artifacts_gc)?;
         if let Some(notification_config) = &self.notification {
             validate_notification_config(notification_config)?;
@@ -887,28 +886,6 @@ pub(crate) fn validate_artifact_gc_config(
     Ok(())
 }
 
-pub(crate) fn validate_sidebar_config(sidebar_config: &SidebarConfig) -> Result<(), MegaError> {
-    let mut public_ids = BTreeSet::new();
-    for (index, item) in sidebar_config.default_items.iter().enumerate() {
-        let public_id_field = format!("sidebar.default_items[{index}].public_id");
-        require_non_empty(&public_id_field, &item.public_id)?;
-        if !public_ids.insert(item.public_id.clone()) {
-            return Err(MegaError::Other(format!(
-                "{public_id_field} must be unique; duplicate public_id '{}'",
-                item.public_id
-            )));
-        }
-
-        let label_field = format!("sidebar.default_items[{index}].label");
-        require_non_empty(&label_field, &item.label)?;
-
-        let href_field = format!("sidebar.default_items[{index}].href");
-        require_non_empty(&href_field, &item.href)?;
-    }
-
-    Ok(())
-}
-
 fn validate_size_string(field_path: &str, value: &str) -> Result<(), MegaError> {
     let bytes = PackConfig::get_size_from_str(value, || Ok(8 * 1024 * 1024 * 1024))
         .map_err(|e| MegaError::Other(format!("{field_path} must be a valid size: {e}")))?;
@@ -1364,10 +1341,11 @@ fn source_override_note(field_path: &str) -> String {
 fn is_array_source_field_path(field_path: &str) -> bool {
     matches!(
         field_path,
-        "monorepo.admin" | "monorepo.root_dirs" | "sidebar.default_items"
+        "monorepo.admin" | "monorepo.root_dirs" | "oauth.allowed_cors_origins" | "git.push_tokens"
     ) || field_path.starts_with("monorepo.admin[")
         || field_path.starts_with("monorepo.root_dirs[")
-        || field_path.starts_with("sidebar.default_items[")
+        || field_path.starts_with("oauth.allowed_cors_origins[")
+        || field_path.starts_with("git.push_tokens[")
 }
 
 fn is_sensitive_source_field_path(field_path: &str) -> bool {
@@ -1547,7 +1525,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "buck",
             "artifacts_gc",
             "orion_server",
-            "sidebar",
             "notification",
             "vault",
             "oauth",
@@ -1630,8 +1607,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "port",
             "monobase_url",
         ]),
-        "sidebar" => Some(&["default_items"]),
-        "sidebar.default_items" => Some(&["public_id", "label", "href", "visible", "order_index"]),
         "notification" => Some(&[
             "enabled",
             "default_delivery_mode",
@@ -2720,42 +2695,19 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_invalid_sidebar_items() {
-        let mut config = valid_config();
-        config.sidebar.default_items[0].public_id.clear();
-        let err = config
-            .validate()
-            .expect_err("blank sidebar public_id should fail");
-        assert!(
-            err.to_string()
-                .contains("sidebar.default_items[0].public_id")
-        );
+    fn reject_unknown_fields_rejects_removed_sidebar_section() {
+        let value = toml::from_str::<Value>(
+            r#"
+            [sidebar]
+            default_items = [
+                { public_id = "home", label = "Home", href = "/posts", order_index = 0 },
+            ]
+            "#,
+        )
+        .unwrap();
 
-        let mut config = valid_config();
-        config.sidebar.default_items[0].label.clear();
-        let err = config
-            .validate()
-            .expect_err("blank sidebar label should fail");
-        assert!(err.to_string().contains("sidebar.default_items[0].label"));
-
-        let mut config = valid_config();
-        config.sidebar.default_items[0].href.clear();
-        let err = config
-            .validate()
-            .expect_err("blank sidebar href should fail");
-        assert!(err.to_string().contains("sidebar.default_items[0].href"));
-
-        let mut config = valid_config();
-        let duplicate_id = config.sidebar.default_items[0].public_id.clone();
-        config.sidebar.default_items[1].public_id = duplicate_id;
-        let err = config
-            .validate()
-            .expect_err("duplicate sidebar public_id should fail");
-        assert!(
-            err.to_string()
-                .contains("sidebar.default_items[1].public_id")
-        );
-        assert!(err.to_string().contains("unique"));
+        let err = reject_unknown_fields(&value).expect_err("removed [sidebar] must fail closed");
+        assert!(err.to_string().contains("sidebar"), "{}", err);
     }
 
     #[test]
@@ -2851,21 +2803,27 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"
-            [sidebar]
-            default_items = [
-                { public_id = "home", label = "Home", href = "/posts", visible = true, order_index = 0 },
-            ]
+            [git]
+            push_auth = "token"
+            [[git.push_tokens]]
+            name = "ci"
+            token = "base-token"
+            paths = ["/project"]
             "#,
         )
         .expect("write base config");
         std::fs::write(
             &profile_path,
             r#"
-            [sidebar]
-            default_items = [
-                { public_id = "home", label = "Home", href = "/prod", visible = true, order_index = 0 },
-                { public_id = "chat", label = "Chat", href = "/chat", visible = true, order_index = 1 },
-            ]
+            [git]
+            push_auth = "token"
+            [[git.push_tokens]]
+            name = "ci"
+            token = "profile-token"
+            paths = ["/project"]
+            [[git.push_tokens]]
+            name = "bot"
+            token = "bot-token"
             "#,
         )
         .expect("write profile config");
@@ -2889,19 +2847,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Per-element paths are now reported in addition to the whole-array path.
-        assert!(fields.contains(&"sidebar.default_items[0].public_id"));
-        assert!(fields.contains(&"sidebar.default_items[0].label"));
-        assert!(fields.contains(&"sidebar.default_items[0].href"));
-        assert!(fields.contains(&"sidebar.default_items[1].public_id"));
-        assert!(fields.contains(&"sidebar.default_items[1].href"));
-        assert!(fields.contains(&"sidebar.default_items"));
+        assert!(fields.contains(&"git.push_tokens[0].name"));
+        assert!(fields.contains(&"git.push_tokens[0].token"));
+        assert!(fields.contains(&"git.push_tokens[0].paths"));
+        assert!(fields.contains(&"git.push_tokens[1].name"));
+        assert!(fields.contains(&"git.push_tokens[1].token"));
+        assert!(fields.contains(&"git.push_tokens"));
 
-        // The first element's href is overridden by the profile.
-        assert!(overrides.contains(&"sidebar.default_items[0].href"));
+        // The first element's token is overridden by the profile.
+        assert!(overrides.contains(&"git.push_tokens[0].token"));
 
         // Array-replace note applies to element paths too.
         assert!(diagnostics.source_overrides.iter().any(|source_override| {
-            source_override.field_path == "sidebar.default_items[0].href"
+            source_override.field_path == "git.push_tokens[0].token"
                 && source_override
                     .message
                     .contains("arrays replace lower-precedence values rather than append")
@@ -2985,8 +2943,9 @@ mod tests {
     fn known_config_field_path_accepts_nested_fields_and_rejects_orphans() {
         assert!(is_known_field_path("database.db_url"));
         assert!(!is_known_field_path("database.db_path"));
+        assert!(!is_known_field_path("sidebar.default_items"));
         assert!(is_known_field_path("object_storage.s3.access_key_id"));
-        assert!(is_known_field_path("sidebar.default_items.label"));
+        assert!(is_known_field_path("git.push_tokens.name"));
         assert!(is_known_field_path("notification.enabled"));
         assert!(is_known_field_path("notification.default_delivery_mode"));
         assert!(is_known_field_path("notification.default_locale"));
@@ -3075,10 +3034,6 @@ mod tests {
             root_dirs = ["project"]
             push_policy = "trunk"
             merge_writer = "queue"
-            [sidebar]
-            default_items = [
-                { public_id = "home", label = "Home", href = "/posts", order_index = 0 },
-            ]
             "#,
         )
         .unwrap();
@@ -3117,10 +3072,10 @@ mod tests {
             [object_storage.s3]
             unexpected = true
 
-            [sidebar]
-            default_items = [
-                { public_id = "home", label = "Home", href = "/posts", order_index = 0, icon = "x" },
-            ]
+            [[git.push_tokens]]
+            name = "ci"
+            token = "x"
+            unexpected = true
             "#,
         )
         .unwrap();
@@ -3130,7 +3085,7 @@ mod tests {
         assert!(message.contains("unknown_root"));
         assert!(message.contains("database.typo"));
         assert!(message.contains("object_storage.s3.unexpected"));
-        assert!(message.contains("sidebar.default_items[0].icon"));
+        assert!(message.contains("git.push_tokens[0].unexpected"));
     }
 
     #[test]

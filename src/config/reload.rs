@@ -683,7 +683,6 @@ fn collect_static_restart_fields(
     collect_build_restart_fields(current, candidate, report);
     collect_object_storage_restart_fields(current, candidate, report);
     collect_orion_server_restart_fields(current, candidate, report);
-    collect_sidebar_restart_fields(current, candidate, report);
     collect_oauth_restart_fields(current, candidate, report);
 }
 
@@ -939,29 +938,6 @@ fn collect_orion_server_restart_fields(
     }
 }
 
-fn collect_sidebar_restart_fields(
-    current: &Config,
-    candidate: &Config,
-    report: &mut ConfigReloadReport,
-) {
-    let current_items = &current.sidebar.default_items;
-    let candidate_items = &candidate.sidebar.default_items;
-    if current_items.len() != candidate_items.len()
-        || current_items
-            .iter()
-            .zip(candidate_items)
-            .any(|(current, candidate)| {
-                current.public_id != candidate.public_id
-                    || current.label != candidate.label
-                    || current.href != candidate.href
-                    || current.visible != candidate.visible
-                    || current.order_index != candidate.order_index
-            })
-    {
-        report.restart_required_fields.push("sidebar.default_items");
-    }
-}
-
 fn collect_oauth_restart_fields(
     current: &Config,
     candidate: &Config,
@@ -1085,7 +1061,6 @@ mod tests {
         candidate.object_storage.s3.secret_access_key = "candidate-secret-access-key".to_string();
         candidate.object_storage.gcs.bucket = "candidate-gcs-bucket".to_string();
         candidate.orion_server = Some(Default::default());
-        candidate.sidebar.default_items[0].label = "Changed".to_string();
 
         let report = handle.reload(candidate).expect("reload should succeed");
         let snapshot = handle.snapshot().expect("snapshot after reload");
@@ -1108,7 +1083,6 @@ mod tests {
                 "object_storage.s3.secret_access_key",
                 "object_storage.gcs.bucket",
                 "orion_server",
-                "sidebar.default_items",
             ]
         );
         assert!(!report.applied());
@@ -1124,7 +1098,6 @@ mod tests {
             crate::config::PushPolicy::Review
         );
         assert!(snapshot.orion_server.is_none());
-        assert_ne!(snapshot.sidebar.default_items[0].label, "Changed");
         assert!(!report_debug.contains("candidate-secret-access-key"));
         assert!(!report_debug.contains("candidate-gcs-bucket"));
         assert!(!report_debug.contains("candidate-objects"));

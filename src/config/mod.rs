@@ -137,7 +137,6 @@ impl Config {
                 ..Default::default()
             },
             orion_server: None,
-            sidebar: SidebarConfig::default(),
             artifacts_gc: ArtifactGcConfig::default(),
             notification: None,
             vault: None,

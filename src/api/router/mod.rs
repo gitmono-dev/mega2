@@ -7,7 +7,6 @@ pub mod cl_router;
 pub mod code_review_router;
 pub mod commit_router;
 pub mod conv_router;
-pub mod dynamic_sidebar_router;
 pub mod gpg_router;
 pub mod group_router;
 pub mod label_router;

@@ -4,7 +4,7 @@
 //! The connection must not migrate on the way in — a report that begins by
 //! altering the schema it is about to describe has already changed the answer —
 //! and the assembly must not write, which the production one does before any
-//! command body runs (default sidebars, `init_monorepo`, the notification
+//! command body runs (`init_monorepo`, the notification
 //! worker).
 //!
 //! The database-level guarantee is what these tests lean on. Code being careful
@@ -229,11 +229,12 @@ async fn table_count(connection: &sea_orm::DatabaseConnection) -> i64 {
     row.try_get::<i64>("", "n").expect("count")
 }
 
-/// The read facade does not write the default sidebars.
+/// The read facade does not write through production storage assembly side
+/// effects that used to seed UI menu rows.
 ///
-/// `Storage::new_with_connection` calls `init_default_sidebars` on the way in.
-/// One row written during assembly is enough to make "this command changed
-/// nothing" false, and it would be written before the command body ran.
+/// Historically `Storage::new_with_connection` wrote default sidebars on the
+/// way in; that seed is gone. This test still proves the read facade leaves
+/// `dynamic_sidebar` empty, and that the production assembly no longer seeds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un30_building_the_read_facade_writes_no_sidebar() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -273,7 +274,6 @@ async fn un30_building_the_read_facade_writes_no_sidebar() {
         "fixture: a fresh schema has no root ref"
     );
 
-    // The control: the full assembly is what writes them.
     crate::jupiter::storage::Storage::new_with_connection(
         config,
         writable.clone(),
@@ -281,9 +281,10 @@ async fn un30_building_the_read_facade_writes_no_sidebar() {
     )
     .await
     .expect("full assembly");
-    assert!(
-        sidebar_count(&writable).await > 0,
-        "fixture: the production assembly is what writes the default sidebars"
+    assert_eq!(
+        sidebar_count(&writable).await,
+        0,
+        "production assembly must not seed dynamic_sidebar after UI split"
     );
 }
 

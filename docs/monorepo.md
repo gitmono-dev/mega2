@@ -93,7 +93,7 @@
 只能在受控的 `monoengine --config <path> service init --yes` invocation 使用
 `sha256`，不能以这个设置启动一般 Git 服务；该命令完成初始图建构后即退出，不启动
 Git listener。它要求已有配置，并只装配初始化所需的 DB、必要时 readonly Vault、
-object storage 与 MonoService；不会启动 Redis、notification、sidebar、reload watcher
+object storage 与 MonoService；不会启动 Redis、notification、reload watcher
 或任何 Git listener。
 
 ### 初始化产物（语义）

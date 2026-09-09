@@ -12,7 +12,6 @@ pub mod code_review_comment_storage;
 pub mod code_review_thread_storage;
 pub mod commit_binding_storage;
 pub mod conversation_storage;
-pub mod dynamic_sidebar_storage;
 pub mod git_db_storage;
 pub mod gpg_storage;
 pub mod group_storage;
@@ -60,7 +59,6 @@ use crate::{
             code_review_thread_storage::CodeReviewThreadStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
-            dynamic_sidebar_storage::DynamicSidebarStorage,
             git_db_storage::GitDbStorage,
             gpg_storage::GpgStorage,
             group_storage::GroupStorage,
@@ -98,7 +96,6 @@ pub struct AppService {
     pub merge_queue_storage: MergeQueueStorage,
     pub push_queue_storage: PushQueueStorage,
     pub buck_storage: BuckStorage,
-    pub dynamic_sidebar_storage: DynamicSidebarStorage,
     pub code_review_comment_storage: CodeReviewCommentStorage,
     pub code_review_thread_storage: CodeReviewThreadStorage,
     pub build_trigger_storage: BuildTriggerStorage,
@@ -131,7 +128,6 @@ impl AppService {
             merge_queue_storage: MergeQueueStorage::new(mock.clone()),
             push_queue_storage: PushQueueStorage::new(mock.clone()),
             buck_storage: BuckStorage { base: mock.clone() },
-            dynamic_sidebar_storage: DynamicSidebarStorage { base: mock.clone() },
             code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
             code_review_thread_storage: CodeReviewThreadStorage { base: mock.clone() },
             build_trigger_storage: BuildTriggerStorage { base: mock.clone() },
@@ -219,11 +215,6 @@ impl Storage {
         let push_queue_storage = PushQueueStorage::new(base.clone());
         let buck_storage = BuckStorage { base: base.clone() };
 
-        let dynamic_sidebar_storage = DynamicSidebarStorage { base: base.clone() };
-        dynamic_sidebar_storage
-            .init_default_sidebars(&config.sidebar)
-            .await?;
-
         let code_review_comment_storage = CodeReviewCommentStorage { base: base.clone() };
         let code_review_thread_storage = CodeReviewThreadStorage { base: base.clone() };
         let build_trigger_storage = BuildTriggerStorage { base: base.clone() };
@@ -273,7 +264,6 @@ impl Storage {
             merge_queue_storage: merge_queue_storage.clone(),
             push_queue_storage: push_queue_storage.clone(),
             buck_storage,
-            dynamic_sidebar_storage,
             code_review_comment_storage,
             code_review_thread_storage,
             build_trigger_storage,
@@ -542,10 +532,6 @@ impl Storage {
         self.app_service.buck_storage.clone()
     }
 
-    pub fn dynamic_sidebar_storage(&self) -> DynamicSidebarStorage {
-        self.app_service.dynamic_sidebar_storage.clone()
-    }
-
     pub fn code_review_thread_storage(&self) -> CodeReviewThreadStorage {
         self.app_service.code_review_thread_storage.clone()
     }
@@ -677,11 +663,9 @@ mod tests {
 
 /// The read surface an audit command gets (UN-30).
 ///
-/// [`Storage::new_with_connection`] is not usable for reading: it writes the
-/// default sidebars on the way in (`init_default_sidebars`), and it assembles
-/// every service in the system, several of which exist to write. Neither is
-/// something an audit should carry, and the sidebar write alone would make
-/// "this command changed nothing" false before the first read.
+/// [`Storage::new_with_connection`] is not usable for reading: it assembles
+/// every service in the system, several of which exist to write. That is not
+/// something an audit should carry.
 ///
 /// So this is built from the pieces a read actually needs and nothing else. It
 /// is deliberately small: what an audit reads is the authorization source in the

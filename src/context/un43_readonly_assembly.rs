@@ -124,9 +124,10 @@ async fn un43_an_unreachable_redis_does_not_stop_the_read_only_assembly() {
 
 /// The read-only assembly seeds nothing.
 ///
-/// `init_monorepo()` writes a root ref, a commit, a tree and blobs; building
-/// storage writes the default sidebars. On a migrated but empty database, all
-/// of those counts must still be zero afterwards.
+/// `init_monorepo()` writes a root ref, a commit, a tree and blobs. On a
+/// migrated but empty database, those counts must still be zero afterwards.
+/// The legacy `dynamic_sidebar` seed is gone; the table must stay empty on both
+/// the read-only and production storage assemblies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un43_the_read_only_assembly_seeds_nothing() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -163,11 +164,10 @@ async fn un43_the_read_only_assembly_seeds_nothing() {
         )
         .await,
         0,
-        "nor written the default sidebars"
+        "nor written dynamic_sidebar rows"
     );
 
-    // The control: the production pieces are what write these, so the zeros
-    // above are a decision rather than a test that could not have failed.
+    // The control: production storage + init_monorepo write refs, not sidebars.
     let storage = crate::jupiter::storage::Storage::new_with_connection(
         Arc::new(config),
         Arc::new(observer),
@@ -186,14 +186,14 @@ async fn un43_the_read_only_assembly_seeds_nothing() {
         scalar(&observer, "SELECT count(*)::bigint AS n FROM mega_refs").await > 0,
         "fixture: init_monorepo writes a root ref"
     );
-    assert!(
+    assert_eq!(
         scalar(
             &observer,
             "SELECT count(*)::bigint AS n FROM dynamic_sidebar"
         )
-        .await
-            > 0,
-        "fixture: the production storage assembly writes the default sidebars"
+        .await,
+        0,
+        "production storage assembly must not seed dynamic_sidebar after UI split"
     );
 }
 

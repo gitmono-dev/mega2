@@ -57,7 +57,7 @@ pub struct AppContext {
 /// Initializes a Monorepo without bringing up normal service dependencies.
 ///
 /// Vault is opened read-only only when object-storage credentials are SecretRefs;
-/// Redis, notification workers, sidebars, and Git listeners are deliberately
+/// Redis, notification workers, and Git listeners are deliberately
 /// outside this one-shot path.
 pub(crate) async fn bootstrap_monorepo(config: crate::config::Config) -> Result<(), MegaError> {
     config.validate()?;
@@ -457,12 +457,11 @@ async fn resolve_redis_url_secret(
 /// What a read-only ops command is assembled from (UN-30).
 ///
 /// [`AppContext::new`] is the production assembly and cannot be reused here: it
-/// migrates the database on connect, writes the default sidebars, calls
-/// `init_monorepo()` — which writes refs and objects — starts the notification
-/// worker, and opens the vault through the bootstrap path that can initialize it
-/// and rotate credentials. Every one of those happens before any command body
-/// runs, so a command assembled that way has already changed the system it was
-/// asked to describe.
+/// migrates the database on connect, calls `init_monorepo()` — which writes refs
+/// and objects — starts the notification worker, and opens the vault through the
+/// bootstrap path that can initialize it and rotate credentials. Every one of
+/// those happens before any command body runs, so a command assembled that way
+/// has already changed the system it was asked to describe.
 ///
 /// This assembly reaches for the read-only counterparts instead: a connection
 /// the server refuses writes on and that runs no migration (UN-30), a vault

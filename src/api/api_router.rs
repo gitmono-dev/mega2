@@ -14,10 +14,9 @@ use crate::{
         api_doc::SYSTEM_COMMON,
         router::{
             admin_router, artifacts_router, bot_router, buck_router, build_trigger_router,
-            cl_router, code_review_router, commit_router, conv_router, dynamic_sidebar_router,
-            gpg_router, group_router, label_router, merge_queue_router, preview_router,
-            push_queue_router, repo_router, reviewer_router, tag_router, user_router,
-            webhook_router,
+            cl_router, code_review_router, commit_router, conv_router, gpg_router, group_router,
+            label_router, merge_queue_router, preview_router, push_queue_router, repo_router,
+            reviewer_router, tag_router, user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -42,7 +41,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(commit_router::routers())
         .merge(tag_router::routers())
         .merge(repo_router::routers())
-        .merge(dynamic_sidebar_router::routers())
         .merge(buck_router::routers())
         .merge(admin_router::routers())
         .merge(artifacts_router::routers())

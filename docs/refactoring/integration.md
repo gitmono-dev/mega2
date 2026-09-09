@@ -167,7 +167,7 @@ dependency is required for monoengine notification paths.
 
 ## 只读装配的零副作用比对（UN-30 / UN-43）
 
-`integration_authz_audit` 的立论方式是**前后对照**，不是通读代码。播种走**真实二进制**（`monoengine service http` 起来再 SIGINT），因此迁移、`init_monorepo()` 写下的 refs 与对象、默认 sidebar 全都真的发生过——手搓出来的库只包含我们想到的东西，而「零写入」恰恰是关于没想到的那些。
+`integration_authz_audit` 的立论方式是**前后对照**，不是通读代码。播种走**真实二进制**（`monoengine service http` 起来再 SIGINT），因此迁移、`init_monorepo()` 写下的 refs 与对象全都真的发生过——手搓出来的库只包含我们想到的东西，而「零写入」恰恰是关于没想到的那些。
 
 快照有七个面：schema（范围是除系统 schema 外的**全部** schema）、每表**内容摘要**（整行转文本排序聚合后 md5，而不是行数——一次 UPDATE 不改变计数）、`pg_sequences` 当前值（被回滚的插入不留行却推进序列，那同样是一次写）、`mega_refs` 全行、三张对象表全行、对象存储目录逐文件散列，以及 `MEGA_BASE_DIR` + `MEGA_CACHE_DIR` 的逐文件指纹（vault 的 `core_key.json` 就在这一面里）。文件指纹是**内容散列 + 尺寸 + 权限位 + mtime**：一次「内容相同」的重写不会改变内容散列，却仍然是一次写，只有 mtime 能发现它。目录本身也收（路径 + 权限位），因此创建/删除/改名目录与只改目录权限都看得见。
 
