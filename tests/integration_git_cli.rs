@@ -1446,6 +1446,7 @@ fn integration_git_cli_push_auth_token_rejects_without_token_and_out_of_path() {
         r#"
 [git]
 push_auth = "token"
+ssh_receive_pack = false
 [[git.push_tokens]]
 name = "ci"
 token = "${{file:{}}}"
@@ -3022,16 +3023,17 @@ fn integration_git_cli_multicommit_chain_push_acceptance() {
         "CL ref ref_tree_hash must be the chain tip tree"
     );
 
-    // AC: files added/renamed by non-first commits are indexed in
-    // mega_blob.file_path (the post-push tip-tree walk covers the whole chain).
+    // AC: files added/renamed by non-first commits are indexed (the post-push
+    // tip-tree walk covers the whole chain). Paths are rooted (`/…`) after
+    // ADR-TP-11 (`blob_paths` / `mega_blob.file_path` display fallback).
     assert_eq!(
         blob_file_paths(&env.database.db_url, &blob_b),
-        vec!["mc06-dir/mc06-fileB.txt".to_string()],
+        vec!["/mc06-dir/mc06-fileB.txt".to_string()],
         "blob added in c2 must be indexed at its path"
     );
     assert_eq!(
         blob_file_paths(&env.database.db_url, &blob_a),
-        vec!["mc06-fileA-renamed.txt".to_string()],
+        vec!["/mc06-fileA-renamed.txt".to_string()],
         "blob renamed in c3 must be indexed at the renamed path"
     );
 
