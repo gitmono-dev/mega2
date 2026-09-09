@@ -106,6 +106,10 @@ struct GitLfsEnv {
 
 impl GitLfsEnv {
     fn new() -> Self {
+        Self::with_config_append("")
+    }
+
+    fn with_config_append(append: &str) -> Self {
         git_cli::require_git_cli_runner();
 
         let work_root = git_cli::git_cli_workdir();
@@ -130,7 +134,7 @@ impl GitLfsEnv {
         let cache_dir = temp_dir.path().join("cache");
         let object_root = temp_dir.path().join("objects");
 
-        common::write_full_config_with_append(&full_config_path, "");
+        common::write_full_config_with_append(&full_config_path, append);
         git_cli::write_git_askpass(&case_dir.join("git-askpass.sh"));
 
         Self {
@@ -450,6 +454,492 @@ fn integration_git_lfs_http_round_trip() {
     );
 }
 
+#[test]
+fn integration_git_lfs_trunk_push_auth_none_round_trip() {
+    // LF-03: trunk + push_auth=none — anonymous LFS upload + push to main.
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let probe_token = git_cli::resolve_seed_token();
+    assert_pinned_git_lfs(&probe_token);
+
+    let env = GitLfsEnv::new();
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_trunk(&env, &trunk_boot_env());
+    let payload = binary_payload();
+    assert_host_git_lfs_pinned();
+
+    seed_project_foo_trunk(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    let lfs_url = format!("{}/info/lfs", foo_url.trim_end_matches('/'));
+
+    trunk_git_ok(&env.case_dir, None, &["clone", &foo_url, "lfs-trunk-src"]);
+    configure_git_identity_trunk(&env.case_dir, None, "lfs-trunk-src");
+    configure_lfs_trunk(&env.case_dir, None, "lfs-trunk-src", &lfs_url);
+
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &["-C", "lfs-trunk-src", "lfs", "track", "*.bin"],
+    );
+    let binary_name = "lf-03-none.bin";
+    fs::write(
+        env.case_dir.join("lfs-trunk-src").join(binary_name),
+        &payload,
+    )
+    .expect("write trunk LFS fixture");
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &["-C", "lfs-trunk-src", "add", ".gitattributes", binary_name],
+    );
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &[
+            "-C",
+            "lfs-trunk-src",
+            "commit",
+            "-m",
+            "lf-03 trunk LFS none round trip",
+        ],
+    );
+    let pointer = trunk_host_git(
+        &env.case_dir,
+        None,
+        &[
+            "-C",
+            "lfs-trunk-src",
+            "show",
+            &format!("HEAD:{binary_name}"),
+        ],
+    );
+    git_cli::assert_git_success(&pointer, "read committed trunk LFS pointer");
+    assert!(
+        pointer
+            .stdout
+            .starts_with(b"version https://git-lfs.github.com/spec/v1\n"),
+        "committed blob must be an LFS pointer"
+    );
+    git_cli::assert_git_success(
+        &trunk_push_main(&env.case_dir, None, "lfs-trunk-src"),
+        "anonymous trunk LFS push to main",
+    );
+
+    let peer_name = "lfs-trunk-peer";
+    fs::create_dir_all(env.case_dir.join(peer_name)).expect("peer dir");
+    trunk_git_ok(&env.case_dir, None, &["-C", peer_name, "init"]);
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &["-C", peer_name, "remote", "add", "origin", &foo_url],
+    );
+    configure_lfs_trunk(&env.case_dir, None, peer_name, &lfs_url);
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &[
+            "-C",
+            peer_name,
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    let mut skip_smudge = trunk_host_git_command(&env.case_dir, None);
+    skip_smudge.env("GIT_LFS_SKIP_SMUDGE", "1");
+    skip_smudge.args(["-C", peer_name, "checkout", "main"]);
+    git_cli::assert_git_success(
+        &skip_smudge.output().expect("checkout skip-smudge"),
+        "checkout main without smudging",
+    );
+    let pre_pull = fs::read(env.case_dir.join(peer_name).join(binary_name)).expect("peer pointer");
+    assert!(
+        pre_pull.starts_with(b"version https://git-lfs.github.com/spec/v1\n"),
+        "peer checkout must keep the pointer before git lfs pull"
+    );
+    trunk_git_ok(&env.case_dir, None, &["-C", peer_name, "lfs", "pull"]);
+    assert_eq!(
+        fs::read(env.case_dir.join(peer_name).join(binary_name)).expect("pulled bytes"),
+        payload,
+        "peer LFS bytes must match source fixture"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_lfs_trunk_push_auth_token_round_trip() {
+    // LF-03: trunk + push_auth=token — static token round trip; missing token fails.
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let probe_token = git_cli::resolve_seed_token();
+    assert_pinned_git_lfs(&probe_token);
+
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_path = token_dir.path().join("ci.token");
+    let push_token = format!("lf03-ci-{}", std::process::id());
+    fs::write(&token_path, format!("{push_token}\n")).expect("write file-mounted token");
+    let append = format!(
+        r#"
+[git]
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "ci"
+token = "${{file:{}}}"
+paths = ["/project"]
+"#,
+        token_path.display()
+    );
+    let env = GitLfsEnv::with_config_append(&append);
+    let (mut service, port, _stdout_path, stderr_path) =
+        boot_service_http_trunk(&env, &[("MEGA_MONOREPO__PUSH_POLICY", "trunk")]);
+    let payload = binary_payload();
+    assert_host_git_lfs_pinned();
+
+    // Unauthenticated LFS upload batch must 401 (observable write failure).
+    let unauth = probe_lfs_upload_batch(port, "/project/foo", None);
+    assert!(
+        unauth.lines().next().is_some_and(|l| l.contains("401")),
+        "push_auth=token must 401 LFS upload without a token, got:\n{unauth}"
+    );
+
+    seed_project_foo_trunk_with_token(&env.case_dir, port, &push_token);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    let lfs_url = format!("{}/info/lfs", foo_url.trim_end_matches('/'));
+
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &["clone", &foo_url, "lfs-token-src"],
+    );
+    configure_git_identity_trunk(&env.case_dir, Some(&push_token), "lfs-token-src");
+    configure_lfs_trunk(&env.case_dir, Some(&push_token), "lfs-token-src", &lfs_url);
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &["-C", "lfs-token-src", "lfs", "track", "*.bin"],
+    );
+    let binary_name = "lf-03-token.bin";
+    fs::write(
+        env.case_dir.join("lfs-token-src").join(binary_name),
+        &payload,
+    )
+    .expect("write token LFS fixture");
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &["-C", "lfs-token-src", "add", ".gitattributes", binary_name],
+    );
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &[
+            "-C",
+            "lfs-token-src",
+            "commit",
+            "-m",
+            "lf-03 trunk LFS token round trip",
+        ],
+    );
+    git_cli::assert_git_success(
+        &trunk_push_main(&env.case_dir, Some(&push_token), "lfs-token-src"),
+        "token trunk LFS push to main",
+    );
+
+    let peer_name = "lfs-token-peer";
+    fs::create_dir_all(env.case_dir.join(peer_name)).expect("peer dir");
+    trunk_git_ok(&env.case_dir, Some(&push_token), &["-C", peer_name, "init"]);
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &["-C", peer_name, "remote", "add", "origin", &foo_url],
+    );
+    configure_lfs_trunk(&env.case_dir, Some(&push_token), peer_name, &lfs_url);
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &[
+            "-C",
+            peer_name,
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    let mut skip_smudge = trunk_host_git_command(&env.case_dir, Some(&push_token));
+    skip_smudge.env("GIT_LFS_SKIP_SMUDGE", "1");
+    skip_smudge.args(["-C", peer_name, "checkout", "main"]);
+    git_cli::assert_git_success(
+        &skip_smudge.output().expect("checkout skip-smudge"),
+        "checkout main without smudging",
+    );
+    trunk_git_ok(
+        &env.case_dir,
+        Some(&push_token),
+        &["-C", peer_name, "lfs", "pull"],
+    );
+    assert_eq!(
+        fs::read(env.case_dir.join(peer_name).join(binary_name)).expect("pulled bytes"),
+        payload,
+        "peer LFS bytes must match source fixture"
+    );
+
+    assert_token_absent(&env.case_dir, push_token.as_bytes());
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(token_dir);
+}
+
+fn trunk_boot_env() -> [(&'static str, &'static str); 3] {
+    [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+    ]
+}
+
+fn trunk_subpath_url(port: u16, path: &str) -> String {
+    format!(
+        "{}/",
+        git_cli::monoengine_host_http_url(port, path).trim_end_matches('/')
+    )
+}
+
+fn trunk_host_git_command(case_dir: &Path, token: Option<&str>) -> Command {
+    let isolated_home = case_dir.join(match token {
+        Some(_) => "git-home-token",
+        None => "git-home-none",
+    });
+    fs::create_dir_all(&isolated_home).expect("trunk git home");
+    let null_config = PathBuf::from("/dev/null");
+    let mut command = Command::new("git");
+    command
+        .current_dir(case_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("HOME", &isolated_home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &null_config)
+        .env("GIT_CONFIG_SYSTEM", &null_config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "5")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        .env("GIT_CONFIG_KEY_1", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "http.version")
+        .env("GIT_CONFIG_VALUE_2", "HTTP/1.1")
+        .env("GIT_CONFIG_KEY_3", "pack.window")
+        .env("GIT_CONFIG_VALUE_3", "0")
+        .env("GIT_CONFIG_KEY_4", "pack.depth")
+        .env("GIT_CONFIG_VALUE_4", "0");
+    if let Some(token) = token {
+        git_cli::write_git_askpass(&case_dir.join("git-askpass.sh"));
+        command
+            .env(git_cli::GIT_ASKPASS_ENV, token)
+            .env("GIT_ASKPASS", case_dir.join("git-askpass.sh"))
+            .env("GIT_CONFIG_COUNT", "6")
+            .env("GIT_CONFIG_KEY_5", "credential.username")
+            .env("GIT_CONFIG_VALUE_5", git_cli::DEFAULT_GIT_AUTH_USER);
+    } else {
+        command.env("GIT_ASKPASS", "true");
+    }
+    // Ensure host git-lfs (installed under ~/.local/bin) is on PATH.
+    let mut path = std::env::var_os("PATH").unwrap_or_default();
+    let local_bin = dirs_next_home().join(".local/bin");
+    if local_bin.is_dir() {
+        let mut prefix = local_bin.into_os_string();
+        prefix.push(":");
+        prefix.push(&path);
+        path = prefix;
+    }
+    command.env("PATH", path);
+    command
+}
+
+fn dirs_next_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn trunk_host_git(case_dir: &Path, token: Option<&str>, git_args: &[&str]) -> std::process::Output {
+    let mut command = trunk_host_git_command(case_dir, token);
+    command.args(git_args);
+    command.output().expect("host git")
+}
+
+fn trunk_git_ok(case_dir: &Path, token: Option<&str>, args: &[&str]) {
+    git_cli::assert_git_success(
+        &trunk_host_git(case_dir, token, args),
+        &format!("git {}", args.join(" ")),
+    );
+}
+
+fn trunk_push_main(case_dir: &Path, token: Option<&str>, repo: &str) -> std::process::Output {
+    trunk_host_git(
+        case_dir,
+        token,
+        &[
+            "-C",
+            repo,
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    )
+}
+
+fn configure_git_identity_trunk(case_dir: &Path, token: Option<&str>, repo: &str) {
+    trunk_git_ok(
+        case_dir,
+        token,
+        &["-C", repo, "config", "user.name", "LF-03 Trunk LFS"],
+    );
+    trunk_git_ok(
+        case_dir,
+        token,
+        &[
+            "-C",
+            repo,
+            "config",
+            "user.email",
+            "lf-03-lfs@example.invalid",
+        ],
+    );
+}
+
+fn configure_lfs_trunk(case_dir: &Path, token: Option<&str>, repo: &str, lfs_url: &str) {
+    trunk_git_ok(case_dir, token, &["-C", repo, "lfs", "install", "--local"]);
+    trunk_git_ok(case_dir, token, &["-C", repo, "config", "lfs.url", lfs_url]);
+    trunk_git_ok(
+        case_dir,
+        token,
+        &["-C", repo, "config", "lfs.locksverify", "false"],
+    );
+}
+
+fn seed_project_foo_trunk(case_dir: &Path, port: u16) {
+    let project_url = trunk_subpath_url(port, "/project");
+    trunk_git_ok(case_dir, None, &["clone", &project_url, "project-seed"]);
+    configure_git_identity_trunk(case_dir, None, "project-seed");
+    let foo_file = case_dir.join("project-seed").join("foo").join("seed.txt");
+    fs::create_dir_all(foo_file.parent().expect("foo parent")).expect("mkdir foo");
+    fs::write(&foo_file, "seed\n").expect("write foo/seed.txt");
+    trunk_git_ok(
+        case_dir,
+        None,
+        &["-C", "project-seed", "add", "foo/seed.txt"],
+    );
+    trunk_git_ok(
+        case_dir,
+        None,
+        &["-C", "project-seed", "commit", "-m", "seed /project/foo"],
+    );
+    trunk_git_ok(
+        case_dir,
+        None,
+        &[
+            "-C",
+            "project-seed",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+fn seed_project_foo_trunk_with_token(case_dir: &Path, port: u16, token: &str) {
+    let project_url = trunk_subpath_url(port, "/project");
+    trunk_git_ok(
+        case_dir,
+        Some(token),
+        &["clone", &project_url, "project-seed"],
+    );
+    configure_git_identity_trunk(case_dir, Some(token), "project-seed");
+    let foo_file = case_dir.join("project-seed").join("foo").join("seed.txt");
+    fs::create_dir_all(foo_file.parent().expect("foo parent")).expect("mkdir foo");
+    fs::write(&foo_file, "seed\n").expect("write foo/seed.txt");
+    trunk_git_ok(
+        case_dir,
+        Some(token),
+        &["-C", "project-seed", "add", "foo/seed.txt"],
+    );
+    trunk_git_ok(
+        case_dir,
+        Some(token),
+        &["-C", "project-seed", "commit", "-m", "seed /project/foo"],
+    );
+    trunk_git_ok(
+        case_dir,
+        Some(token),
+        &[
+            "-C",
+            "project-seed",
+            "push",
+            "--no-thin",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+fn probe_lfs_upload_batch(port: u16, repo_path: &str, bearer: Option<&str>) -> String {
+    let path = format!("{}/info/lfs/objects/batch", repo_path.trim_end_matches('/'));
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let body = r#"{"operation":"upload","transfers":["basic"],"objects":[{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1}],"hash_algo":"sha256"}"#;
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-D",
+        "-",
+        "-o",
+        "/dev/null",
+        "--max-time",
+        "15",
+        "-H",
+        "Content-Type: application/vnd.git-lfs+json",
+        "-H",
+        "Accept: application/vnd.git-lfs+json",
+        "-d",
+        body,
+    ]);
+    if let Some(token) = bearer {
+        command
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {token}"));
+    }
+    command.arg(&url);
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("curl LFS batch probe failed to spawn: {err}"));
+    assert!(
+        output.status.success(),
+        "curl LFS batch probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn assert_pinned_git_lfs(token: &str) {
     let work_root = git_cli::git_cli_workdir();
     fs::create_dir_all(&work_root)
@@ -468,6 +958,31 @@ fn assert_pinned_git_lfs(token: &str) {
     assert_eq!(
         version, "git-lfs/3.7.1",
         "git-cli runner must provide the pinned Git LFS version"
+    );
+}
+
+fn assert_host_git_lfs_pinned() {
+    let mut command = Command::new("git");
+    let mut path = std::env::var_os("PATH").unwrap_or_default();
+    let local_bin = dirs_next_home().join(".local/bin");
+    if local_bin.is_dir() {
+        let mut prefix = local_bin.into_os_string();
+        prefix.push(":");
+        prefix.push(&path);
+        path = prefix;
+    }
+    command.env("PATH", path);
+    command.args(["lfs", "version"]);
+    let output = command.output().expect("host git lfs version");
+    git_cli::assert_git_success(&output, "probe host Git LFS");
+    let version = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        version, "git-lfs/3.7.1",
+        "host git-lfs used by trunk LFS IT must be the pinned version"
     );
 }
 
@@ -574,6 +1089,31 @@ fn assert_token_absent(root: &Path, token: &[u8]) {
 }
 
 fn boot_service_http(env: &GitLfsEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_http_with_extra_env(env, &[])
+}
+
+fn boot_service_http_with_extra_env(
+    env: &GitLfsEnv,
+    extra_env: &[(&str, &str)],
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_http_with_options(env, extra_env, false)
+}
+
+/// Trunk LFS IT drives host git against `127.0.0.1`. Force the advertised
+/// public base to the loopback URL so batch hrefs stay reachable even when the
+/// compose git-cli runner would otherwise inject `host.docker.internal`.
+fn boot_service_http_trunk(
+    env: &GitLfsEnv,
+    extra_env: &[(&str, &str)],
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_http_with_options(env, extra_env, true)
+}
+
+fn boot_service_http_with_options(
+    env: &GitLfsEnv,
+    extra_env: &[(&str, &str)],
+    force_loopback_public_base: bool,
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     let port = reserve_free_port();
     git_cli::record_allocated_port(port);
     let stdout_path = env.temp_dir.path().join("service.out");
@@ -581,7 +1121,17 @@ fn boot_service_http(env: &GitLfsEnv) -> (ServiceProcess, u16, PathBuf, PathBuf)
 
     let mut command = env.full_config_command();
     command.env("MEGA_LOG__PRINT_STD", "true");
-    git_cli::apply_monoengine_public_http_base_env(&mut command, port);
+    for (key, value) in extra_env {
+        command.env(*key, *value);
+    }
+    if force_loopback_public_base {
+        command.env(
+            "MEGA_HTTP__PUBLIC_BASE_URL",
+            format!("http://127.0.0.1:{port}"),
+        );
+    } else {
+        git_cli::apply_monoengine_public_http_base_env(&mut command, port);
+    }
     command.args([
         "service",
         "http",
