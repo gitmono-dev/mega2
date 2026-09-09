@@ -656,9 +656,9 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
     let storage = ctx.storage;
     let config = storage.config();
     let storage_only = config.git.storage_only();
-    // TP-18: CL/LFS/code_edit writes are gated by `push_policy`, not only the
-    // `push_auth` storage-only HTTP form. The two coincide at a valid trunk
-    // boot (TP-15 ⑤), but OpenAPI must follow the morphology switch.
+    // Trunk/storage-only omit CL/reviewer/preview-write OpenAPI; LFS is mounted
+    // on both morphologies (plan-20260909 LF-02). Morphology still switches the
+    // `/api/v1` subset via `routers_for(PushPolicy::Trunk)`.
     let protocol_surface = storage_only || config.monorepo.push_policy == PushPolicy::Trunk;
 
     let git_object_cache = Arc::new(GitObjectCache {
@@ -734,6 +734,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
 
     let (router, api) = if protocol_surface {
         OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers().with_state(api_state.clone()))
             .nest(
                 "/api/v1",
                 api_router::routers_for(PushPolicy::Trunk).with_state(api_state.clone()),
@@ -770,30 +771,30 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
             .split_for_parts()
     };
 
-    let router = if protocol_surface {
-        router
-    } else {
-        let info_lfs_router: Router = lfs_router::lfs_routes()
-            .with_state(api_state.clone())
-            .into();
-        router.nest("/info/lfs", info_lfs_router)
-    };
+    // Nest `/info/lfs` for both trunk/storage-only and review so Git LFS
+    // discovery does not fall through to the smart-protocol catch-all.
+    let info_lfs_router: Router = lfs_router::lfs_routes()
+        .with_state(api_state.clone())
+        .into();
+    let router = router.nest("/info/lfs", info_lfs_router);
 
     Ok(router.merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
 }
 
 pub(crate) fn storage_only_openapi_doc() -> utoipa::openapi::OpenApi {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(lfs_router::routers())
         .nest("/api/v1", api_router::storage_only_routers())
         .split_for_parts()
         .1
 }
 
-/// OpenAPI for `push_policy=trunk` HTTP (no LFS merge). Same `/api/v1`
+/// OpenAPI for `push_policy=trunk` HTTP (includes LFS merge). Same `/api/v1`
 /// subset as storage-only; assembled via [`api_router::routers_for`] so
 /// the surface is keyed on morphology, not only `push_auth`.
 pub(crate) fn trunk_openapi_doc() -> utoipa::openapi::OpenApi {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(lfs_router::routers())
         .nest("/api/v1", api_router::routers_for(PushPolicy::Trunk))
         .split_for_parts()
         .1
@@ -1235,6 +1236,10 @@ mod tests {
                 .any(|p| p.contains("/blob") || p.contains("/tree")),
             "storage-only OpenAPI must include blob/tree reads: {paths:?}"
         );
+        assert!(
+            paths.iter().any(|p| p.contains("/lfs")),
+            "storage-only OpenAPI must include LFS: {paths:?}"
+        );
         for needle in ["/auth", "create-entry", "/cl", "/user"] {
             assert!(
                 paths.iter().all(|p| !p.contains(needle)),
@@ -1244,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn trunk_openapi_omits_cl_issue_reviewer_preview_writes_and_lfs() {
+    fn trunk_openapi_omits_cl_issue_reviewer_preview_writes_keeps_lfs() {
         let api = trunk_openapi_doc();
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
@@ -1253,13 +1258,16 @@ mod tests {
                 .any(|p| p.contains("/blob") || p.contains("/tree")),
             "trunk OpenAPI must keep readonly preview: {paths:?}"
         );
+        assert!(
+            paths.iter().any(|p| p.contains("/lfs")),
+            "trunk OpenAPI must include LFS: {paths:?}"
+        );
         for needle in [
             "/cl",
             "/issue",
             "reviewer",
             "create-entry",
             "/edit/save",
-            "/lfs",
             "/user",
         ] {
             assert!(

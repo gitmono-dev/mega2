@@ -81,15 +81,16 @@ mod tests {
     }
 
     #[test]
-    fn trunk_http_assembly_does_not_merge_lfs_review_does() {
+    fn trunk_http_assembly_merges_lfs_as_does_review() {
         let trunk = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers())
             .nest("/api/v1", api_router::routers_for(PushPolicy::Trunk))
             .split_for_parts()
             .1;
         let trunk_paths: Vec<String> = trunk.paths.paths.keys().cloned().collect();
         assert!(
-            trunk_paths.iter().all(|p| !p.contains("/lfs")),
-            "trunk must not register LFS: {trunk_paths:?}"
+            trunk_paths.iter().any(|p| p.contains("/lfs")),
+            "trunk must register LFS: {trunk_paths:?}"
         );
 
         let review = OpenApiRouter::with_openapi(ApiDoc::openapi())
