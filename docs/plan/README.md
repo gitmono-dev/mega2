@@ -30,7 +30,7 @@
 | `plan-20260827.md` | 日期计划 | **新建**（CL 多 commit push 放开：push 侧链式校验 + 拒绝 merge commit + 修 ref 配对，trunk 侧 CL merge 永远单父新 commit 不动；MC-01..04；设计经 Codex/Claude 双评审有条件批准；下游 = monoui `docs/plan/plan-20260827.md`） |
 | `plan-20260901.md` | 日期计划 | **Claude Code Review PASS**（Mega `bb3ef17` FastCDC media transport，以及 receive-pack 状态安全、导入批处理、DB/Redis 并发和多实例 ID 改进；FC-01..14；R4 通过） |
 | `plan-20260903.md` | 日期计划 | 进行中：Monorepo 初始 object-ID 配置（SHA-1/SHA-256 bootstrap；BLAKE3 接口保留且 fail-closed）。端到端 SHA-256 / BLAKE3 Git 协议支持不在本切片。 |
-| `plan-20260905.md` | 日期计划 | **已完成**（Trunk 直推 / `MonoWriteQueue`：TP-01..TP-23。设计事实源 = [`../refactoring/trunk-push.md`](../refactoring/trunk-push.md)。文档概览条目在 [`../refactoring/README.md`](../refactoring/README.md) **§5a**，不是仓库根 `README.md`） |
+| `plan-20260904.md` | 日期计划 | **新建**（AW-01..05；trunk 产品 API 写文件经 MonoWriteQueue；compose 可继承黑盒；Codex R2 **PASS**） |
 | `plan-20260906.md` | 日期计划 | **新建**（一 case 一卡；compose 黑盒；测试客户端=git；ADR-SO-07..10；Codex R7 PASS；实现未开工） |
 | `plan-20260909.md` | 日期计划 | **已完成**（LF-01..LF-04；Claude+Codex 每卡双 PASS；Storage-only LFS：`push_auth=none` / `token`；supersede plan-20260905「trunk LFS 不可用」） |
 | `plan-20260908.md` | 日期计划 | **进行中**（SP-01..SP-05；SP-01/SP-02 已落地并 push；SP-04 cancelled→SP-01；SP-03 本卡索引；SP-05 待终态 release；Codex R18 PASS；每实现/release 卡 patch+1） |
