@@ -21,7 +21,7 @@
 ```
 
 compose 中的 `build.context` 依此解析：
-- `monoengine` 服务：`context: ..`（父目录；对象存储 crate 已在 monoengine 内，无需再看 sibling），`dockerfile: monoengine/Dockerfile`；
+- `monoengine` 服务：`context: .`（本仓库根；`.dockerignore` 排除 `target/`），`dockerfile: Dockerfile`；
 - `website-db-init` 与 `website-next` 服务：`context: ../megaui`，`dockerfile: apps/web/Dockerfile`；
 - `megaui-collab` 服务：`context: ../megaui`，`dockerfile: apps/collab-server/Dockerfile`。
 

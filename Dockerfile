@@ -1,12 +1,13 @@
-# Build monoengine for the IT compose stack.
+# Build monoengine for the compose stacks (IT + storage-only).
 #
-# All path deps (monoengine, bin, crates/orbit, crates/orbit-api) live inside
-# the `monoengine/` directory in the build context, so only that directory is
-# copied. From the monoengine repo root:
+# Build context = this repository root (not the parent). From the monoengine
+# repo root:
 #
 #   docker compose -p monoengine-it -f docker-compose.test.yml --profile app build monoengine
+#   docker compose -p monoengine-trunk -f docker-compose.storage-only.yml build monoengine
 #
-# (compose sets `build.context: ..` and `dockerfile: monoengine/Dockerfile`.)
+# `.dockerignore` excludes `target/` and other host artifacts so they are never
+# sent in the build context.
 
 FROM rust:1.97-bookworm AS builder
 
@@ -20,10 +21,9 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-COPY monoengine /src/monoengine
-
 WORKDIR /src/monoengine
+COPY . /src/monoengine
+
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=monoengine-it-cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=monoengine-it-cargo-git-${TARGETARCH},sharing=locked \
@@ -41,7 +41,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/monoengine /usr/local/bin/monoengine
-COPY monoengine/config/config.toml /etc/monoengine/config.toml
+COPY config/config.toml /etc/monoengine/config.toml
 
 ENV MEGA_BASE_DIR=/var/lib/monoengine \
     MEGA_CONFIG=/etc/monoengine/config.toml

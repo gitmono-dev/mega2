@@ -1,0 +1,28 @@
+# Host / CI artifacts — never send into the image build context.
+target/
+target-*/
+**/target/
+
+# Local VCS / editor / agent state
+.libra/
+.git/
+.github/
+.cursor/
+.idea/
+.vscode/
+.agent/
+.agents/
+.codex/
+.claude/
+
+# Env, secrets, and staged IT binaries
+.env
+.env.*
+!.env*.example
+secrets/
+monoengine.itbin
+
+# Logs / temp
+**/*.log
+tmp/
+.tmp*/

@@ -203,8 +203,8 @@ services:
     image: monoengine:local
     pull_policy: never
     build:
-      context: ..
-      dockerfile: monoengine/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
