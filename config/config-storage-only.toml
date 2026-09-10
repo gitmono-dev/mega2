@@ -339,6 +339,10 @@ token = "${file:/run/secrets/monoengine-push-token}"
 # Scenario / 场景: scope each token to the subtree its automation owns
 # (least privilege); a single whole-repo token is for the initial bootstrap only.
 # 场景:按最小权限把每个 token 限定到它负责的子树;全库 token 只用于初期 bootstrap.
+# SSH password (anonymous_access=false): the same token bytes are the SSH
+# password (auth_password → lookup_push_token). Username is ignored. Use
+# SSH_ASKPASS / sshpass; do not put the token on the ssh command line.
+# SSH 密码读:匿名关时 SSH password = 本 token 密文,username 不参与判定.
 # paths = ["/project"]
 
 # Alternative for a fully trusted network / 全可信网络下的替代方案:

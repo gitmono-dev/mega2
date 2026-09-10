@@ -453,6 +453,15 @@ fn integration_git_ssh_authenticated_clone() {
     drop(env);
 }
 
+fn git_ssh_command_loopback_password(case_dir: &Path, port: u16) -> String {
+    let known = case_dir.join("ssh").join("known_hosts");
+    // BatchMode must stay off: OpenSSH disables password/ASKPASS when BatchMode=yes.
+    format!(
+        "ssh -o IdentitiesOnly=yes -o IdentityFile=/dev/null -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes -o BatchMode=no -p {port}",
+        known.display(),
+    )
+}
+
 fn git_ssh_command_loopback(case_dir: &Path, port: u16, none_only: bool) -> String {
     let key = case_dir.join("ssh").join("client_ed25519");
     let known = case_dir.join("ssh").join("known_hosts");
@@ -671,6 +680,481 @@ token = "sp01-unused-for-anon-clone"
         "storage-only token + anonymous SSH clone without password",
     );
 
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+const SP02_PUSH_TOKEN: &str = "sp02-it-password-token";
+
+fn boot_token_anon_off_ssh() -> (GitSshEnv, ServiceProcess, u16, PathBuf, PathBuf, String) {
+    let env = GitSshEnv::with_config_append(&format!(
+        r#"
+[git]
+anonymous_access = false
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "agent-ci"
+token = "{SP02_PUSH_TOKEN}"
+"#
+    ));
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [("MEGA_MONOREPO__PUSH_POLICY", "trunk")];
+    let (service, port, stdout, stderr) = boot_storage_only_ssh(&env, &extra);
+    (
+        env,
+        service,
+        port,
+        stdout,
+        stderr,
+        format!("ssh://git@127.0.0.1:{port}/"),
+    )
+}
+
+fn ls_remote_head(case_dir: &Path, git_ssh: &str, remote: &str, password: Option<&str>) -> String {
+    let output = match password {
+        Some(password) => git_cli::git_cli_ssh_with_password(
+            case_dir,
+            git_ssh,
+            password,
+            &["ls-remote", remote, "HEAD"],
+        ),
+        None => git_host_ssh(case_dir, git_ssh, &["ls-remote", remote, "HEAD"]),
+    };
+    git_cli::assert_git_success(&output, "ls-remote HEAD");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn prepare_review_pubkey_loopback(
+    anonymous_access: bool,
+) -> (GitSshEnv, ServiceProcess, u16, PathBuf, String, String) {
+    let env = GitSshEnv::with_config_append(&format!(
+        r#"
+[git]
+anonymous_access = {anonymous_access}
+"#
+    ));
+    let client_key = env.ssh_dir.join("client_ed25519");
+    let client_pub = env.ssh_dir.join("client_ed25519.pub");
+    git_cli::generate_client_ed25519(&client_key);
+    let pubkey = fs::read_to_string(&client_pub).expect("read client public key");
+    let finger = git_cli::ssh_fingerprint_sha256_col2(&client_pub);
+    let extra = [(
+        "MEGA_GIT__ANONYMOUS_ACCESS",
+        if anonymous_access { "true" } else { "false" },
+    )];
+    {
+        let (mut migrate_service, _migrate_port, _out, err) =
+            boot_service_ssh_with_env(&env, &extra);
+        let status = migrate_service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(
+            status.success(),
+            "migrate boot did not shut down cleanly: {status}\nstderr:\n{}",
+            read_log(&err),
+        );
+        drop(migrate_service);
+    }
+    git_cli::seed_ssh_key(
+        &env.database.db_url,
+        git_cli::DEFAULT_SSH_AUTH_USER,
+        "sp02-review",
+        pubkey.trim(),
+        &finger,
+    );
+    let (service, port, _stdout, stderr) = boot_service_ssh_with_env(&env, &extra);
+    write_known_hosts_via_host_keyscan(&env.ssh_dir.join("known_hosts"), port);
+    let git_ssh = git_ssh_command_loopback(&env.case_dir, port, false);
+    let remote = format!("ssh://{}@127.0.0.1:{port}/", git_cli::DEFAULT_SSH_AUTH_USER);
+    (env, service, port, stderr, git_ssh, remote)
+}
+
+#[test]
+fn integration_git_ssh_trunk_token_anon_off_clone_fail() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
+    let git_ssh = git_ssh_command_loopback(&env.case_dir, port, false);
+    let output = git_host_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["clone", &remote, "ssh-token-anon-off-fail"],
+    );
+    assert!(
+        !output.status.success(),
+        "token + anonymous_access=false without password must fail; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_trunk_token_anon_off_password_clone() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, port, stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
+    let git_ssh = git_ssh_command_loopback_password(&env.case_dir, port);
+    let output = git_cli::git_cli_ssh_with_password(
+        &env.case_dir,
+        &git_ssh,
+        SP02_PUSH_TOKEN,
+        &["clone", &remote, "ssh-token-password-clone"],
+    );
+    if !output.status.success() {
+        panic!(
+            "token + password SSH clone failed ({})\nstdout:\n{}\nstderr:\n{}\n--- service stdout ---\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            read_log(&stdout_path),
+        );
+    }
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_trunk_token_anon_off_password_fetch() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
+    let git_ssh = git_ssh_command_loopback_password(&env.case_dir, port);
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh_with_password(
+            &env.case_dir,
+            &git_ssh,
+            SP02_PUSH_TOKEN,
+            &["clone", &remote, "ssh-token-password-fetch"],
+        ),
+        "clone before password fetch",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh_with_password(
+            &env.case_dir,
+            &git_ssh,
+            SP02_PUSH_TOKEN,
+            &["-C", "ssh-token-password-fetch", "fetch", "origin"],
+        ),
+        "token + password SSH fetch",
+    );
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_trunk_token_anon_off_password_pull() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
+    let git_ssh = git_ssh_command_loopback_password(&env.case_dir, port);
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh_with_password(
+            &env.case_dir,
+            &git_ssh,
+            SP02_PUSH_TOKEN,
+            &["clone", &remote, "ssh-token-password-pull"],
+        ),
+        "clone before password pull",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh_with_password(
+            &env.case_dir,
+            &git_ssh,
+            SP02_PUSH_TOKEN,
+            &["-C", "ssh-token-password-pull", "pull", "--ff-only"],
+        ),
+        "token + password SSH pull",
+    );
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_trunk_token_push_receive_pack_disabled() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
+    let git_ssh = git_ssh_command_loopback_password(&env.case_dir, port);
+    git_cli::assert_git_success(
+        &git_cli::git_cli_ssh_with_password(
+            &env.case_dir,
+            &git_ssh,
+            SP02_PUSH_TOKEN,
+            &["clone", &remote, "ssh-token-rp-disabled"],
+        ),
+        "clone before receive-pack negative",
+    );
+    let tip_before = ls_remote_head(&env.case_dir, &git_ssh, &remote, Some(SP02_PUSH_TOKEN));
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-token-rp-disabled",
+                "config",
+                "user.name",
+                "SP-02",
+            ],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-token-rp-disabled",
+                "config",
+                "user.email",
+                "sp02@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::write(
+        env.case_dir.join("ssh-token-rp-disabled").join("sp02.txt"),
+        "sp02 receive-pack must stay disabled\n",
+    )
+    .expect("write local commit file");
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", "ssh-token-rp-disabled", "add", "sp02.txt"],
+        ),
+        "git add",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", "ssh-token-rp-disabled", "commit", "-m", "sp02"],
+        ),
+        "git commit",
+    );
+    let push = git_cli::git_cli_ssh_with_password(
+        &env.case_dir,
+        &git_ssh,
+        SP02_PUSH_TOKEN,
+        &[
+            "-C",
+            "ssh-token-rp-disabled",
+            "push",
+            "origin",
+            "HEAD:refs/heads/sp02-disabled",
+        ],
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    assert!(
+        !push.status.success(),
+        "storage-only SSH push must fail after password auth"
+    );
+    assert!(
+        combined.contains("SSH receive-pack is disabled"),
+        "push stderr/stdout must mention disabled receive-pack, got: {combined}"
+    );
+    let tip_after = ls_remote_head(&env.case_dir, &git_ssh, &remote, Some(SP02_PUSH_TOKEN));
+    assert_eq!(tip_before, tip_after, "server tip must be unchanged");
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_review_pubkey_anon_off_clone() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, _port, stderr_path, git_ssh, remote) =
+        prepare_review_pubkey_loopback(false);
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["clone", &remote, "ssh-review-anon-off"],
+        ),
+        "review publickey clone with anonymous_access=false",
+    );
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_review_pubkey_anon_on_push() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+    let (env, mut service, _port, stderr_path, git_ssh, remote) =
+        prepare_review_pubkey_loopback(true);
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["clone", &remote, "ssh-review-anon-on-push"],
+        ),
+        "review publickey clone with anonymous_access=true",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-review-anon-on-push",
+                "checkout",
+                "-b",
+                "sp02-review-push",
+            ],
+        ),
+        "create push branch",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-review-anon-on-push",
+                "config",
+                "user.name",
+                "SP-02 Review",
+            ],
+        ),
+        "git user.name",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-review-anon-on-push",
+                "config",
+                "user.email",
+                "sp02-review@example.invalid",
+            ],
+        ),
+        "git user.email",
+    );
+    fs::write(
+        env.case_dir
+            .join("ssh-review-anon-on-push")
+            .join("sp02-review.txt"),
+        "review pubkey push still works when anonymous_access=true\n",
+    )
+    .expect("write review push fixture");
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["-C", "ssh-review-anon-on-push", "add", "sp02-review.txt"],
+        ),
+        "git add",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-review-anon-on-push",
+                "commit",
+                "-m",
+                "sp02 review pubkey push",
+            ],
+        ),
+        "git commit",
+    );
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &[
+                "-C",
+                "ssh-review-anon-on-push",
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                "HEAD:refs/heads/sp02-review-push",
+            ],
+        ),
+        "review publickey SSH push with anonymous_access=true",
+    );
     let status = service.shutdown_via_sigint(Duration::from_secs(10));
     assert!(
         status.success(),

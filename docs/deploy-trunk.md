@@ -67,7 +67,7 @@ Storage-only（显式 `push_auth`）**不暴露 SSH receive-pack**。启动要�
 
 - `anonymous_access = true`：SSH `auth_none` 放行，无需 UserStorage 公钥、无需 password。
 - `push_auth = "none"` 且 `anonymous_access = false`：SSH 读 fail-closed（无 password 通道；勿在 trunk+none 依赖 UserStorage）。
-- `push_auth = "token"` 且匿名关：password = `[[git.push_tokens]]` 密文（见后续 password 文档 / plan-20260908 SP-02）。
+- `push_auth = "token"` 且 `anonymous_access = false`：SSH `auth_password`，password 字段 = `[[git.push_tokens]]` 密文（与 HTTP Basic 只取 password、忽略 username 对齐）。客户端用 `SSH_ASKPASS` / `sshpass` / 定制 `GIT_SSH_COMMAND`。storage-only 仍不提供 SSH receive-pack。
 
 review 形态（省略 `push_auth`）仍走 UserStorage 公钥；默认匿名开时 **不** 成功放行 `auth_none`，以免 OpenSSH 跳过公钥推送。
 

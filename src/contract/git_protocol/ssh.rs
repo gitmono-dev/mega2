@@ -20,7 +20,8 @@ use crate::{
             v2,
         },
     },
-    contract::git_protocol::{check_push_permission, check_upload_pack_access},
+    config::PushAuth,
+    contract::git_protocol::{check_push_permission, check_upload_pack_access, lookup_push_token},
     jupiter::storage::Storage,
 };
 
@@ -141,8 +142,17 @@ impl server::Handler for SshServer {
                 }
                 if service_type == ServiceType::ReceivePack {
                     if !self.state.storage.config().git.ssh_receive_pack_enabled() {
-                        session.data(channel, b"error: SSH receive-pack is disabled\n".to_vec())?;
-                        session.channel_failure(channel)?;
+                        // Accept the exec so OpenSSH surfaces the error on the
+                        // git channel; CHANNEL_FAILURE only yields "exec request
+                        // failed" and drops the payload.
+                        session.channel_success(channel)?;
+                        session.extended_data(
+                            channel,
+                            1,
+                            b"error: SSH receive-pack is disabled\n".to_vec(),
+                        )?;
+                        session.eof(channel)?;
+                        session.close(channel)?;
                         return Ok(());
                     }
                     check_push_permission(
@@ -248,6 +258,34 @@ impl server::Handler for SshServer {
                 proceed_with_methods: None,
                 partial_success: false,
             })
+        }
+    }
+
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        let git = &self.state.storage.config().git;
+        if git.push_auth != Some(PushAuth::Token) {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
+        match lookup_push_token(&git.push_tokens, password) {
+            Some(token) => {
+                tracing::info!(token_name = %token.name, "auth_password token hit");
+                self.authenticated_user = Some(token.name.clone());
+                Ok(Auth::Accept)
+            }
+            None => {
+                tracing::info!(
+                    n_tokens = git.push_tokens.len(),
+                    presented_len = password.len(),
+                    "auth_password token miss"
+                );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
         }
     }
 
@@ -846,6 +884,119 @@ mod tests {
             }
         ));
         assert!(server.authenticated_user.is_none());
+    }
+
+    fn token_git_config(anonymous: bool) -> GitConfig {
+        GitConfig {
+            anonymous_access: anonymous,
+            push_auth: Some(PushAuth::Token),
+            ssh_receive_pack: Some(false),
+            push_tokens: vec![crate::config::PushTokenConfig {
+                name: "agent-ci".to_string(),
+                token: "sp02-secret-token".to_string(),
+                paths: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_password_token_hit_sets_name() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(dir.path(), token_git_config(false)).await;
+        let auth = server
+            .auth_password("ignored-user", "sp02-secret-token")
+            .await
+            .expect("auth_password");
+        assert!(matches!(auth, Auth::Accept));
+        assert_eq!(server.authenticated_user.as_deref(), Some("agent-ci"));
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_password_token_miss_rejects() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(dir.path(), token_git_config(false)).await;
+        let auth = server
+            .auth_password("git", "wrong-token")
+            .await
+            .expect("auth_password");
+        assert!(matches!(
+            auth,
+            Auth::Reject {
+                partial_success: false,
+                ..
+            }
+        ));
+        assert!(server.authenticated_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_password_rejected_when_push_auth_none() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: false,
+                push_auth: Some(PushAuth::None),
+                ssh_receive_pack: Some(false),
+                push_tokens: Vec::new(),
+            },
+        )
+        .await;
+        let auth = server
+            .auth_password("git", "sp02-secret-token")
+            .await
+            .expect("auth_password");
+        assert!(matches!(
+            auth,
+            Auth::Reject {
+                partial_success: false,
+                ..
+            }
+        ));
+        assert!(server.authenticated_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_password_rejected_when_push_auth_omitted() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: false,
+                push_auth: None,
+                ssh_receive_pack: None,
+                push_tokens: vec![crate::config::PushTokenConfig {
+                    name: "agent-ci".to_string(),
+                    token: "sp02-secret-token".to_string(),
+                    paths: None,
+                }],
+            },
+        )
+        .await;
+        let auth = server
+            .auth_password("git", "sp02-secret-token")
+            .await
+            .expect("auth_password");
+        assert!(matches!(
+            auth,
+            Auth::Reject {
+                partial_success: false,
+                ..
+            }
+        ));
+        assert!(server.authenticated_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_password_ignores_ssh_username() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(dir.path(), token_git_config(false)).await;
+        let auth = server
+            .auth_password("not-the-token-name", "sp02-secret-token")
+            .await
+            .expect("auth_password");
+        assert!(matches!(auth, Auth::Accept));
+        assert_eq!(server.authenticated_user.as_deref(), Some("agent-ci"));
     }
 
     #[test]

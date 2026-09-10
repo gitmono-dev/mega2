@@ -1281,6 +1281,61 @@ pub fn git_cli_ssh(case_dir: &Path, git_ssh_command: &str, git_args: &[&str]) ->
     }
 }
 
+/// Run `git` over SSH using password authentication (`SSH_ASKPASS`).
+///
+/// The password is passed only via environment to the askpass helper (never
+/// written into the script or `GIT_SSH_COMMAND`). Host `git` is used so the
+/// cargo-native SSH listener on loopback is reachable when compose git-cli
+/// cannot hairpin to `host.docker.internal`.
+#[allow(
+    dead_code,
+    reason = "SSH password helper; path-included into HTTP targets that do not call it yet"
+)]
+pub fn git_cli_ssh_with_password(
+    case_dir: &Path,
+    git_ssh_command: &str,
+    password: &str,
+    git_args: &[&str],
+) -> Output {
+    require_git_cli_runner();
+    if git_cli_skip_requested() {
+        panic!("{GIT_CLI_UNAVAILABLE}: skipped runner cannot execute git");
+    }
+    let askpass = case_dir.join("ssh").join("ssh_askpass");
+    write_git_askpass(&askpass);
+    let ssh = format!(
+        "{git_ssh_command} -o PreferredAuthentications=password -o PubkeyAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=1 -o BatchMode=no"
+    );
+    let isolated_home = case_dir.join("git-home-ssh-password");
+    fs::create_dir_all(&isolated_home).expect("create isolated git HOME");
+    let null_config = PathBuf::from("/dev/null");
+    let mut command = Command::new("timeout");
+    command
+        .args(["-k", "5", "45"])
+        .arg("git")
+        .current_dir(case_dir)
+        .stdin(Stdio::null())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("HOME", &isolated_home)
+        .env("XDG_CONFIG_HOME", isolated_home.join("xdg-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &null_config)
+        .env("GIT_CONFIG_SYSTEM", &null_config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .env("GIT_ASKPASS", &askpass)
+        .env(GIT_ASKPASS_ENV, password)
+        .env("GIT_SSH_COMMAND", &ssh)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .args(git_args);
+    command.output().expect("host git ssh password")
+}
+
 fn git_cli_container_ssh(case_dir: &Path, git_ssh_command: &str, git_args: &[&str]) -> Output {
     let work_container = container_path_for_host(case_dir);
     let container_id =
