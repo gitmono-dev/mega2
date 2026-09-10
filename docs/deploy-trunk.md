@@ -134,7 +134,7 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile 
   git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
 ```
 
-单 case：`MONOENGINE_SMOKE_CASE='HTTP ls-remote'`（精确 case 名；未匹配退出非 0）。已注册只读 case：`HTTP ls-remote`、`HTTP clone`、`HTTP fetch`、`HTTP protocol v2 fetch`、`HTTP shallow clone depth=1`（后续卡继续追加）。
+单 case：`MONOENGINE_SMOKE_CASE='HTTP ls-remote'`（精确 case 名；未匹配退出非 0）。已注册只读 case：`HTTP ls-remote`、`HTTP clone`、`HTTP fetch`、`HTTP protocol v2 fetch`、`HTTP shallow clone depth=1`、`HTTP protocol v2 ls-remote`（后续卡继续追加）。
 
 结果获取（stdout 为主；推荐宿主 tee）：
 

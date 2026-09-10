@@ -156,6 +156,11 @@ case_http_shallow_clone() {
   fi
 }
 
+case_http_protocol_v2_ls_remote() {
+  require_http_url || return 1
+  git_case -c protocol.version=2 ls-remote "$MONOENGINE_HTTP_REPO_URL"
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -163,6 +168,7 @@ run_case "HTTP clone" case_http_clone
 run_case "HTTP fetch" case_http_fetch
 run_case "HTTP protocol v2 fetch" case_http_protocol_v2_fetch
 run_case "HTTP shallow clone depth=1" case_http_shallow_clone
+run_case "HTTP protocol v2 ls-remote" case_http_protocol_v2_ls_remote
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
