@@ -765,7 +765,7 @@ flowchart TD
 | [`plan-20260903.md`](plan-20260903.md) | PT-03（准备切片） | 实施中 | Monorepo 空仓初始化按 `monorepo.object_format` 生成 SHA-1/SHA-256 object graph，BLAKE3 接口 fail-closed；不覆盖 repository-format 持久化、SHA-256 wire/pack 或 BLAKE3 运行时接入。 |
 | [`plan-20260905.md`](plan-20260905.md) | N/A（trunk / MonoWriteQueue；非 Mega PT） | **已完成** | Trunk 直推与 storage-only；LFS 当时关闭（GAP-13/TP-18），由 [`plan-20260909.md`](plan-20260909.md) supersede。 |
 | [`plan-20260909.md`](plan-20260909.md) | N/A（storage-only LFS；承接 TP-18 关闭后的独立议题） | **已完成** | LFS 批/锁鉴权对齐 `push_auth=none`/`token`；trunk 重新挂载；IT + 文档 supersede。不覆盖 SSH LFS transfer、PUT 逐请求鉴权、DEFER-TP-05。 |
-| [`plan-20260908.md`](plan-20260908.md) | N/A（storage-only SSH 只读；非 Mega PT） | **新建** | **SP-01..SP-05**：SSH upload-pack 对齐 HTTP 读；SP-01=`auth_none`/none 行为，SP-02=password-token 行为（各含测+文档）；SP-04 cancelled→SP-01；SP-03 索引；SP-05 终态 release。DEFER-SP-01..04。每实现/release 卡仅 patch+1。Codex R18 PASS。 |
+| [`plan-20260908.md`](plan-20260908.md) | N/A（storage-only SSH 只读；非 Mega PT） | **进行中** | **SP-01..SP-05**：SSH upload-pack 对齐 HTTP 读；SP-01=`auth_none`/none 与 SP-02=password-token 已落地；SP-04 cancelled→SP-01；SP-03 索引收口；SP-05 终态 release。DEFER-SP-01..04。每实现/release 卡仅 patch+1。Codex R18 PASS。 |
 | [`plan-20260910.md`](plan-20260910.md) | N/A（merge_writer sunset；非 Mega PT） | **已完成** | CL merge 唯一写者 = MonoWriteQueue；删除 `[monorepo].merge_writer`、Legacy processor、`merge_queue` 表。不删除 `/merge-queue` HTTP 门面（DEFER-MW-01）。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
