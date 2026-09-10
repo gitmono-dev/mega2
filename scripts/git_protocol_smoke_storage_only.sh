@@ -233,10 +233,8 @@ case_http_trunk_push() {
   fi
   local auth_url src before after head
   # B0 rejects path=/; default stack exposes /project after service init (deploy-trunk §9).
-  local repo_url="$MONOENGINE_HTTP_REPO_URL"
-  if [[ "$repo_url" =~ ^https?://[^/]+/?$ ]]; then
-    repo_url="${repo_url%/}/project"
-  fi
+  local repo_url
+  repo_url="$(trunk_http_repo_url)" || return 1
   auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
   src="$ROOT_DIR/http-trunk-push"
   rm -rf "$src"
@@ -264,6 +262,49 @@ case_http_trunk_push() {
   fi
 }
 
+trunk_http_repo_url() {
+  local repo_url="${MONOENGINE_HTTP_REPO_URL:-}"
+  require_http_url || return 1
+  if [[ "$repo_url" =~ ^https?://[^/]+/?$ ]]; then
+    repo_url="${repo_url%/}/project"
+  fi
+  printf '%s\n' "$repo_url"
+}
+
+# Tag push must fail; remote must not retain the tag (ADR-SO-02).
+case_http_reject_git_client_tag_push() {
+  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP reject Git-client tag push" >&2
+    return 1
+  fi
+  local repo_url auth_url src tag push_status=0
+  repo_url="$(trunk_http_repo_url)" || return 1
+  auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
+  src="$ROOT_DIR/http-reject-tag"
+  tag="monoengine-smoke-tag-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  rm -rf "$src"
+  git_case clone "$auth_url" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  printf 'monoengine git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
+  git -C "$src" add smoke-tag.txt || return 1
+  git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return 1
+  git -C "$src" tag "$tag" || return 1
+  set +e
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag"
+  push_status=$?
+  set -e
+  if [[ "$push_status" -eq 0 ]]; then
+    echo "FAIL: trunk must reject Git-client tag push" >&2
+    git -C "$src" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if git_case ls-remote "$auth_url" "refs/tags/$tag" | rg -q .; then
+    echo "FAIL: rejected tag push must not leave refs/tags/$tag on remote" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -276,8 +317,9 @@ run_case "HTTP protocol v2 blob:none clone" case_http_protocol_v2_blob_none_clon
 
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP trunk push" case_http_trunk_push
-elif [[ -n "$CASE_FILTER" && "$CASE_FILTER" == "HTTP trunk push" ]]; then
-  echo "FAIL: MONOENGINE_SMOKE_CASE='HTTP trunk push' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
+  run_case "HTTP reject Git-client tag push" case_http_reject_git_client_tag_push
+elif [[ -n "$CASE_FILTER" && ( "$CASE_FILTER" == "HTTP trunk push" || "$CASE_FILTER" == "HTTP reject Git-client tag push" ) ]]; then
+  echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2
 fi

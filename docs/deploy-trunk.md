@@ -134,7 +134,7 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile 
   git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
 ```
 
-单 case：`MONOENGINE_SMOKE_CASE='HTTP ls-remote'`（精确 case 名；未匹配退出非 0）。已注册只读 case：`HTTP ls-remote`、`HTTP clone`、`HTTP fetch`、`HTTP protocol v2 fetch`、`HTTP shallow clone depth=1`、`HTTP protocol v2 ls-remote`、`HTTP protocol v2 blob:none clone`。写 case（需 `MONOENGINE_GIT_SMOKE_PUSH=1` + token / `MONOENGINE_IT_SEED_TOKEN`）：`HTTP trunk push`——对 **`/project`**（非根 `/`；B0 拒根路径）断言 tip 前进；不以新建 `refs/cl` 为成功条件。根 URL 入参时脚本自动改写为 `/project`。
+单 case：`MONOENGINE_SMOKE_CASE='HTTP ls-remote'`（精确 case 名；未匹配退出非 0）。已注册只读 case：`HTTP ls-remote`、`HTTP clone`、`HTTP fetch`、`HTTP protocol v2 fetch`、`HTTP shallow clone depth=1`、`HTTP protocol v2 ls-remote`、`HTTP protocol v2 blob:none clone`。写 case（需 `MONOENGINE_GIT_SMOKE_PUSH=1` + token / `MONOENGINE_IT_SEED_TOKEN`）：`HTTP trunk push`——对 **`/project`**（非根 `/`；B0 拒根路径）断言 tip 前进；不以新建 `refs/cl` 为成功条件。根 URL 入参时脚本自动改写为 `/project`。另：`HTTP reject Git-client tag push`（tag push 非 0 且远端无残留 tag）。
 
 Token 写示例：
 
