@@ -105,6 +105,24 @@ require_http_url() {
   fi
 }
 
+# Trunk SSH reads use auth_none when anonymous_access=true (no UserStorage key).
+ensure_git_ssh_command() {
+  if [[ -n "${GIT_SSH_COMMAND:-}" ]]; then
+    return 0
+  fi
+  local kh="${ROOT_DIR}/ssh-known_hosts"
+  # accept-new: first-contact host key only; does not disable verification afterward.
+  export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${kh}"
+}
+
+require_ssh_url() {
+  if [[ -z "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
+    echo "MONOENGINE_SSH_REPO_URL is required for SSH smoke cases" >&2
+    return 1
+  fi
+  ensure_git_ssh_command
+}
+
 case_http_ls_remote() {
   require_http_url || return 1
   git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
@@ -489,6 +507,11 @@ case_http_lfs_push_and_pull_trunk() {
   git -C "$peer" lfs locks >/dev/null || return 1
 }
 
+case_ssh_ls_remote() {
+  require_ssh_url || return 1
+  git_case ls-remote "$MONOENGINE_SSH_REPO_URL"
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -520,6 +543,14 @@ elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "HTTP LFS push and pull (trunk)"
 ) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
+  echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
+  exit 2
+fi
+
+if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
+  run_case "SSH ls-remote" case_ssh_ls_remote
+elif [[ -n "$CASE_FILTER" && "$CASE_FILTER" == "SSH ls-remote" ]]; then
+  echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2
 fi

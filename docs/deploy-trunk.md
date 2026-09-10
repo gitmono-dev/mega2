@@ -188,6 +188,25 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile 
 
 切回宿主机 LFS URL：去掉 `--env-file`，再 `--force-recreate monoengine`。
 
+SSH 只读（`anonymous_access=true` → `auth_none`，**不**依赖 UserStorage 公钥）。首次连接写入 known_hosts：
+
+```bash
+# Inside git-smoke (or any OpenSSH client on the compose network):
+export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/monoengine-smoke-known_hosts'
+# Or omit GIT_SSH_COMMAND: scripts/git_protocol_smoke_storage_only.sh defaults the same
+# StrictHostKeyChecking=accept-new + a workdir UserKnownHostsFile.
+```
+
+```bash
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  exec -T \
+  -e MONOENGINE_SSH_REPO_URL=ssh://git@monoengine:2222/ \
+  -e MONOENGINE_SMOKE_CASE='SSH ls-remote' \
+  git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
+```
+
+已注册 SSH case：`SSH ls-remote`（后续场景卡追加 clone/fetch/…）。
+
 结果获取（stdout 为主；推荐宿主 tee）：
 
 ```bash
