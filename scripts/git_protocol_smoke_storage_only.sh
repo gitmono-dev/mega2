@@ -161,6 +161,36 @@ case_http_protocol_v2_ls_remote() {
   git_case -c protocol.version=2 ls-remote "$MONOENGINE_HTTP_REPO_URL"
 }
 
+clone_protocol_v2_blobless() {
+  local url="$1"
+  local dest="$2"
+  local log="$3"
+  local filter
+  rm -rf "$dest"
+  if ! git_case -c protocol.version=2 clone --filter=blob:none "$url" "$dest" 2>"$log"; then
+    cat "$log" >&2
+    return 1
+  fi
+  if grep -qi "filtering not recognized" "$log"; then
+    cat "$log" >&2
+    return 1
+  fi
+  git -C "$dest" fsck --no-dangling >/dev/null || return
+  filter="$(git -C "$dest" config --get remote.origin.partialclonefilter || true)"
+  if [[ "$filter" != "blob:none" ]]; then
+    echo "FAIL: expected remote.origin.partialclonefilter=blob:none, got '${filter:-<empty>}'" >&2
+    return 1
+  fi
+}
+
+case_http_protocol_v2_blob_none_clone() {
+  require_http_url || return 1
+  clone_protocol_v2_blobless \
+    "$MONOENGINE_HTTP_REPO_URL" \
+    "$ROOT_DIR/http-blobless" \
+    "$ROOT_DIR/http-blobless.stderr"
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -169,6 +199,7 @@ run_case "HTTP fetch" case_http_fetch
 run_case "HTTP protocol v2 fetch" case_http_protocol_v2_fetch
 run_case "HTTP shallow clone depth=1" case_http_shallow_clone
 run_case "HTTP protocol v2 ls-remote" case_http_protocol_v2_ls_remote
+run_case "HTTP protocol v2 blob:none clone" case_http_protocol_v2_blob_none_clone
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
