@@ -97,8 +97,21 @@ git_case() {
   git -c advice.detachedHead=false "$@"
 }
 
-# --- Protocol cases are registered by later plan cards (SO-07..). ---
-# Harness ships with zero protocol cases: CASE filter with no match → non-zero.
+require_http_url() {
+  if [[ -z "${MONOENGINE_HTTP_REPO_URL:-}" ]]; then
+    echo "MONOENGINE_HTTP_REPO_URL is required for HTTP smoke cases" >&2
+    return 1
+  fi
+}
+
+case_http_ls_remote() {
+  require_http_url || return 1
+  git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
+}
+
+# --- Protocol cases (registered by plan-20260906 scene cards). ---
+
+run_case "HTTP ls-remote" case_http_ls_remote
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
