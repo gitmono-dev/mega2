@@ -592,6 +592,41 @@ impl PushQueueStorage {
             .await?)
     }
 
+    /// Freeze an active Merge row (Queued or Running) for UN-25.
+    /// Leaves `requester` unchanged. Returns whether a row was updated.
+    pub async fn freeze_merge_for_authz(
+        &self,
+        cl_link: &str,
+        message: &str,
+    ) -> Result<bool, MegaError> {
+        let result = self
+            .get_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                UPDATE push_queue
+                   SET status = 'Failed'::push_queue_status_enum,
+                       failure_type = 'SystemError'::push_queue_failure_enum,
+                       error_message = $2,
+                       finished_at = now(),
+                       pending_action = NULL,
+                       updated_at = now()
+                 WHERE kind = 'merge'::push_queue_kind_enum
+                   AND operation_id = $1
+                   AND status IN (
+                         'Queued'::push_queue_status_enum,
+                         'Running'::push_queue_status_enum
+                       )
+                "#,
+                [
+                    Value::from(cl_link.to_owned()),
+                    Value::from(message.to_owned()),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn list_recent_finished(
         &self,
         limit: u64,
@@ -1164,51 +1199,6 @@ impl PushQueueStorage {
         ))
         .await?;
         Ok(())
-    }
-
-    /// Insert a terminal Failed merge row for merge_queue absorb (TP-07).
-    /// `Merging` rows become `Failed(MergeFailure, interrupted)`.
-    pub async fn insert_absorbed_failed_merge(
-        &self,
-        operation_id: &str,
-        path: &str,
-        old_id: &str,
-        new_id: &str,
-        requester: Option<&str>,
-        message: &str,
-    ) -> Result<i64, MegaError> {
-        let conn = self.get_connection();
-        let row = conn
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                r#"
-                INSERT INTO push_queue (
-                    kind, operation_id, path, old_id, new_id,
-                    requester, payload, status, failure_type, error_message,
-                    heartbeat_at, finished_at
-                )
-                VALUES (
-                    'merge'::push_queue_kind_enum,
-                    $1, $2, $3, $4, $5, '{}'::jsonb,
-                    'Failed'::push_queue_status_enum,
-                    'MergeFailure'::push_queue_failure_enum,
-                    $6, now(), now()
-                )
-                RETURNING id
-                "#,
-                [
-                    Value::from(operation_id.to_owned()),
-                    Value::from(path.to_owned()),
-                    Value::from(old_id.to_owned()),
-                    Value::from(new_id.to_owned()),
-                    Value::from(requester.map(str::to_owned)),
-                    Value::from(message.to_owned()),
-                ],
-            ))
-            .await?
-            .ok_or_else(|| MegaError::Other("absorb Failed insert returned no id".into()))?;
-        row.try_get::<i64>("", "id")
-            .map_err(|e| MegaError::Other(e.to_string()))
     }
 
     /// Test helper: mark Cancelled with an optional conflict-requeue successor.

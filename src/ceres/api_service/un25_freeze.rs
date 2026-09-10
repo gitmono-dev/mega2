@@ -17,9 +17,15 @@ use std::sync::Arc;
 use sea_orm::ConnectionTrait;
 
 use crate::{
-    callisto::sea_orm_active_enums::{QueueFailureTypeEnum, QueueStatusEnum},
+    callisto::sea_orm_active_enums::{
+        PushQueueFailureEnum, PushQueueKindEnum, PushQueueStatusEnum,
+    },
     ceres::api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
-    jupiter::storage::{Storage, base_storage::StorageConnector},
+    jupiter::storage::{
+        Storage,
+        base_storage::StorageConnector,
+        push_queue_storage::{EnqueueOutcome, EnqueueParams},
+    },
 };
 
 fn service(storage: &Storage) -> MonoApiService {
@@ -53,11 +59,40 @@ async fn seed_open_cl(storage: &Storage, id: i64, cl_link: &str) {
 
 async fn queued_item(storage: &Storage, id: i64, cl_link: &str, requester: Option<&str>) {
     seed_open_cl(storage, id, cl_link).await;
-    storage
-        .merge_queue_service
-        .add_to_queue_with_requester(cl_link.to_string(), requester.map(str::to_string))
+    let outcome = storage
+        .push_queue_storage()
+        .enqueue_atomic(EnqueueParams {
+            kind: PushQueueKindEnum::Merge,
+            operation_id: cl_link,
+            path: "/",
+            old_id: "from",
+            new_id: "to",
+            requester,
+            payload: serde_json::json!({
+                "cl_link": cl_link,
+                "authz_principal": requester.unwrap_or("system"),
+                "execution_actor": "system",
+                "apply_queue_execution_decision": true,
+                "requester": requester,
+            }),
+        })
         .await
         .expect("enqueue");
+    assert!(
+        matches!(outcome, EnqueueOutcome::Inserted { .. }),
+        "expected insert, got {outcome:?}"
+    );
+}
+
+async fn merge_row(storage: &Storage, cl_link: &str) -> crate::callisto::push_queue::Model {
+    storage
+        .push_queue_storage()
+        .list_by_kind_and_operation(PushQueueKindEnum::Merge, cl_link)
+        .await
+        .expect("read item")
+        .into_iter()
+        .next()
+        .expect("the item exists")
 }
 
 /// Capture what the freeze writes to the log, so the alert is asserted rather
@@ -118,17 +153,12 @@ async fn un25_freeze_writes_every_field_the_contract_promises() {
         "a queued item must be freezable"
     );
 
-    let item = storage
-        .merge_queue_service
-        .get_cl_queue_status("UN25FREEZE")
-        .await
-        .expect("read item")
-        .expect("the item exists");
+    let item = merge_row(&storage, "UN25FREEZE").await;
 
-    assert_eq!(item.status, QueueStatusEnum::Failed, "state");
+    assert_eq!(item.status, PushQueueStatusEnum::Failed, "state");
     assert_eq!(
         item.failure_type,
-        Some(QueueFailureTypeEnum::SystemError),
+        Some(PushQueueFailureEnum::SystemError),
         "failure type reuses the existing enum value — no new variant, no migration"
     );
     assert_eq!(
@@ -239,12 +269,8 @@ async fn un25_freezing_an_already_failed_item_preserves_the_original_reason() {
         "an already-failed item is left alone, so the first diagnosis is not overwritten"
     );
 
-    let message = storage
-        .merge_queue_service
-        .get_cl_queue_status("UN25TWICE")
+    let message = merge_row(&storage, "UN25TWICE")
         .await
-        .expect("read item")
-        .expect("item")
         .error_message
         .expect("message");
     assert!(message.contains("first reason"), "{message}");

@@ -18,7 +18,6 @@ pub mod group_storage;
 pub mod init;
 pub mod issue_storage;
 pub mod lfs_db_storage;
-pub mod merge_queue_storage;
 pub mod mono_storage;
 pub mod notification_storage;
 pub mod object_storage;
@@ -43,8 +42,8 @@ use crate::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
             git_service::GitService, import_service::ImportService, lfs_service::LfsService,
-            merge_queue_service::MergeQueueService, mono_service::MonoService,
-            push_queue_service::PushQueueService, webhook_service::WebhookService,
+            mono_service::MonoService, push_queue_service::PushQueueService,
+            webhook_service::WebhookService,
         },
         storage::{
             audit_storage::AuditStorage,
@@ -65,7 +64,6 @@ use crate::{
             init::database_connection,
             issue_storage::IssueStorage,
             lfs_db_storage::LfsDbStorage,
-            merge_queue_storage::MergeQueueStorage,
             mono_storage::MonoStorage,
             notification_storage::NotificationStorage,
             object_storage::MegaObjectStorageWrapper,
@@ -93,7 +91,6 @@ pub struct AppService {
     pub conversation_storage: ConversationStorage,
     pub commit_binding_storage: CommitBindingStorage,
     pub reviewer_storage: ClReviewerStorage,
-    pub merge_queue_storage: MergeQueueStorage,
     pub push_queue_storage: PushQueueStorage,
     pub buck_storage: BuckStorage,
     pub code_review_comment_storage: CodeReviewCommentStorage,
@@ -125,7 +122,6 @@ impl AppService {
             conversation_storage: ConversationStorage { base: mock.clone() },
             commit_binding_storage: CommitBindingStorage { base: mock.clone() },
             reviewer_storage: ClReviewerStorage { base: mock.clone() },
-            merge_queue_storage: MergeQueueStorage::new(mock.clone()),
             push_queue_storage: PushQueueStorage::new(mock.clone()),
             buck_storage: BuckStorage { base: mock.clone() },
             code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
@@ -144,7 +140,6 @@ pub struct Storage {
     pub(crate) app_service: Arc<AppService>,
     pub cla_service: ClaService,
     pub cl_service: CLService,
-    pub merge_queue_service: MergeQueueService,
     pub push_queue_service: PushQueueService,
     pub artifact_service: ArtifactService,
     pub buck_service: BuckService,
@@ -211,7 +206,6 @@ impl Storage {
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
         let reviewer_storage = ClReviewerStorage { base: base.clone() };
-        let merge_queue_storage = MergeQueueStorage::new(base.clone());
         let push_queue_storage = PushQueueStorage::new(base.clone());
         let buck_storage = BuckStorage { base: base.clone() };
 
@@ -261,7 +255,6 @@ impl Storage {
             conversation_storage,
             commit_binding_storage,
             reviewer_storage,
-            merge_queue_storage: merge_queue_storage.clone(),
             push_queue_storage: push_queue_storage.clone(),
             buck_storage,
             code_review_comment_storage,
@@ -272,7 +265,6 @@ impl Storage {
             audit_storage,
             reaction_storage,
         };
-        let merge_queue_service = MergeQueueService::new(base.clone());
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
                 .with_max_push_commits(config.monorepo.max_push_commits);
@@ -294,7 +286,6 @@ impl Storage {
             config_handle,
             config,
             cl_service: CLService::new(base.clone()),
-            merge_queue_service,
             push_queue_service,
             artifact_service,
             buck_service,
@@ -520,10 +511,6 @@ impl Storage {
         self.app_service.reviewer_storage.clone()
     }
 
-    pub fn merge_queue_storage(&self) -> MergeQueueStorage {
-        self.app_service.merge_queue_storage.clone()
-    }
-
     pub fn push_queue_storage(&self) -> PushQueueStorage {
         self.app_service.push_queue_storage.clone()
     }
@@ -581,7 +568,6 @@ impl Storage {
             // app_service: AppService::mock(),
             cla_service: ClaService::mock(),
             cl_service: CLService::mock(),
-            merge_queue_service: MergeQueueService::mock(),
             push_queue_service: PushQueueService::new(
                 BaseStorage::mock(),
                 crate::config::PushPolicy::Review,

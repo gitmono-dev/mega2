@@ -69,7 +69,9 @@ use crate::{
     bellatrix::Bellatrix,
     callisto::{
         mega_blob, mega_cl, mega_refs, mega_tag, mega_tree,
-        sea_orm_active_enums::{CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, PushQueueKindEnum},
+        sea_orm_active_enums::{
+            CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, PushQueueKindEnum, PushQueueStatusEnum,
+        },
     },
     ceres::{
         api_service::{
@@ -4670,17 +4672,25 @@ impl MonoApiService {
         cl_link: &str,
         reason: &str,
     ) -> Result<bool, MegaError> {
-        let requester = self
+        let rows = self
             .storage
-            .merge_queue_service
-            .get_queue_requester(cl_link)
-            .await?
-            .flatten();
+            .push_queue_storage()
+            .list_by_kind_and_operation(PushQueueKindEnum::Merge, cl_link)
+            .await?;
+        let requester = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.status,
+                    PushQueueStatusEnum::Queued | PushQueueStatusEnum::Running
+                )
+            })
+            .and_then(|row| row.requester.clone());
 
         let frozen = self
             .storage
-            .merge_queue_service
-            .freeze_item_for_authz(cl_link, &authz_freeze_message(reason))
+            .push_queue_storage()
+            .freeze_merge_for_authz(cl_link, &authz_freeze_message(reason))
             .await?;
 
         if frozen {

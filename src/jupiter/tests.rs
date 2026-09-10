@@ -22,8 +22,8 @@ use crate::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
             git_service::GitService, import_service::ImportService, lfs_service::LfsService,
-            merge_queue_service::MergeQueueService, mono_service::MonoService,
-            push_queue_service::PushQueueService, webhook_service::WebhookService,
+            mono_service::MonoService, push_queue_service::PushQueueService,
+            webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -44,7 +44,6 @@ use crate::{
             group_storage::GroupStorage,
             issue_storage::IssueStorage,
             lfs_db_storage::LfsDbStorage,
-            merge_queue_storage::MergeQueueStorage,
             mono_storage::MonoStorage,
             notification_storage::NotificationStorage,
             object_storage::mock_object_storage,
@@ -198,7 +197,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         conversation_storage: ConversationStorage { base: base.clone() },
         commit_binding_storage: CommitBindingStorage { base: base.clone() },
         reviewer_storage: ClReviewerStorage { base: base.clone() },
-        merge_queue_storage: MergeQueueStorage::new(base.clone()),
         push_queue_storage: PushQueueStorage::new(base.clone()),
         buck_storage: BuckStorage { base: base.clone() },
         code_review_comment_storage: CodeReviewCommentStorage { base: base.clone() },
@@ -218,10 +216,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         app_service: Arc::new(svc),
         cla_service: ClaService::new(base.clone()),
         cl_service: CLService::mock(),
-        // UN-20: the queue service must talk to the same test database as the
-        // rest of this storage — `mock()` hands out a disconnected connection,
-        // so any test driving the queue chain would panic on first use.
-        merge_queue_service: MergeQueueService::new(base.clone()),
         push_queue_service: PushQueueService::new(
             base.clone(),
             config.monorepo.push_policy.clone(),

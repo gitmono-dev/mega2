@@ -17,14 +17,21 @@ use git_internal::{
 use sea_orm::ConnectionTrait;
 
 use crate::{
-    callisto::{mega_refs, sea_orm_active_enums::QueueStatusEnum},
+    callisto::{
+        mega_refs,
+        sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
+    },
     ceres::api_service::{
         cache::GitObjectCache,
         mono_api_service::{MonoApiService, emit_merge_authz_unavailable},
     },
     common::utils::MEGA_BRANCH_NAME,
     contract::policy::entitystore::{SharedEntityStore, generate_entity},
-    jupiter::storage::{Storage, base_storage::StorageConnector},
+    jupiter::storage::{
+        Storage,
+        base_storage::StorageConnector,
+        push_queue_storage::{EnqueueOutcome, EnqueueParams},
+    },
 };
 
 fn service(storage: &Storage) -> MonoApiService {
@@ -306,11 +313,29 @@ async fn un19_fail_closed_freezes_a_queued_item() {
     let storage = storage_in(temp.path(), "enforce").await;
     seed_main(&storage, true).await;
     seed_cl(&storage, 720_003, "UN19QUEUE").await;
-    storage
-        .merge_queue_service
-        .add_to_queue_with_requester("UN19QUEUE".to_string(), Some("un19-admin".to_string()))
+    let outcome = storage
+        .push_queue_storage()
+        .enqueue_atomic(EnqueueParams {
+            kind: PushQueueKindEnum::Merge,
+            operation_id: "UN19QUEUE",
+            path: "/",
+            old_id: "from",
+            new_id: "to",
+            requester: Some("un19-admin"),
+            payload: serde_json::json!({
+                "cl_link": "UN19QUEUE",
+                "authz_principal": "un19-admin",
+                "execution_actor": "system",
+                "apply_queue_execution_decision": true,
+                "requester": "un19-admin",
+            }),
+        })
         .await
         .expect("enqueue");
+    assert!(
+        matches!(outcome, EnqueueOutcome::Inserted { .. }),
+        "expected insert, got {outcome:?}"
+    );
 
     let service = service(&storage);
     let error = service
@@ -323,12 +348,14 @@ async fn un19_fail_closed_freezes_a_queued_item() {
         .expect("freeze");
 
     let item = storage
-        .merge_queue_service
-        .get_cl_queue_status("UN19QUEUE")
+        .push_queue_storage()
+        .list_by_kind_and_operation(PushQueueKindEnum::Merge, "UN19QUEUE")
         .await
         .expect("read item")
+        .into_iter()
+        .next()
         .expect("item");
-    assert_eq!(item.status, QueueStatusEnum::Failed);
+    assert_eq!(item.status, PushQueueStatusEnum::Failed);
     assert_eq!(
         item.requester,
         Some("un19-admin".to_string()),
