@@ -27,6 +27,17 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
   `integration_compose_monoengine_http_smoke` / CI 探针使用；**不**替代本层
   的 per-case 进程隔离。
 
+### 栈级 Compose 黑盒（storage-only / trunk）
+
+- **位置：** `scripts/git_protocol_smoke_storage_only.sh`，由
+  `docker-compose-storage-only.yml` 的 `--profile smoke` / `git-smoke` 驱动
+  （项目名 `monoengine-trunk`）。运维入口见 [`deploy-trunk.md`](../deploy-trunk.md) §8.1。
+- **用途：** 对常驻 storage-only 栈的 Git 协议面黑盒（真实 **`git` / `git-lfs` / `ssh`**
+  客户端经已发布端口）。结果经宿主 stdout / 可选 `tee` 到 `target/tmp`。
+- **边界：** **不**使用 `libra` 作协议客户端（本仓 VCS 与冒烟观察者正交）；
+  **不**替代 `CARGO_BIN_EXE` 黑盒 IT；review/CL 冒烟仍用
+  `scripts/git_protocol_smoke.sh`，勿在 trunk 上当作成功门。
+
 单元测试（纯逻辑、无外部依赖）仍放在对应源文件的 `#[cfg(test)]` 中，不另立规范。
 
 ## fixture 生命周期

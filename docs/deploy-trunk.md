@@ -107,6 +107,13 @@ Object PUT/GET 仍走 batch 注册后的能力 URL，不逐请求鉴权。Review
 # 默认 RustFS（s3compatible）——无需 --env-file
 docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
 
+# 空卷 bootstrap（可复制）
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml exec -T monoengine \
+  monoengine --config /etc/monoengine/config.toml service init --yes
+
+# 干净重跑（破坏性：删 named volume）
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml down -v
+
 # 可选：monoengine 改用本地文件系统（仅此情况加 --env-file）
 docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
   --env-file config/compose.env.storage-only.local up -d --wait
@@ -115,6 +122,32 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
 # RustFS API/console: 127.0.0.1:29000 / 29001
 # push token 默认: monoengine-storage-only-local-dev-token-0001
 ```
+
+### 8.1 Compose 黑盒 Git 协议 smoke（`git` 客户端）
+
+Trunk / storage-only 协议冒烟使用 **`scripts/git_protocol_smoke_storage_only.sh`**，经 compose `--profile smoke` 的 `git-smoke` 容器内真实 **`git` / `git-lfs` / `ssh`** 调用已发布端口。这是 **compose 黑盒**，与 cargo `CARGO_BIN_EXE` 黑盒分层并存；**不要**用 `libra` 作协议客户端，也**不要**在 trunk 上跑 review/CL 语义的 `scripts/git_protocol_smoke.sh`。
+
+```bash
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  exec -T \
+  -e MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
+  git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
+```
+
+单 case：`MONOENGINE_SMOKE_CASE='HTTP ls-remote'`（精确 case 名；未匹配退出非 0）。
+
+结果获取（stdout 为主；推荐宿主 tee）：
+
+```bash
+mkdir -p target/tmp
+LOG="target/tmp/so-smoke-$(date -u +%Y%m%dT%H%M%SZ)-${MONOENGINE_SMOKE_CASE:-all}.log"
+set -o pipefail
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  exec -T git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh \
+  2>&1 | tee "$LOG"
+```
+
+排障工作区（非 PASS 主证据）：宿主 `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-trunk-git}`（挂载为容器 `/work`）。
 
 与 `-p monoengine-it` 的测试栈可并存（端口 25432 / 26379 / 9000 / 2222 / 29000）。生产凭据用 `MONOENGINE_PUSH_TOKEN_FILE` 覆盖，勿提交。
 

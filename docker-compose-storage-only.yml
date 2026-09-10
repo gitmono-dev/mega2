@@ -173,13 +173,20 @@ services:
 
   # Optional linked Git CLI smoke against the compose-hosted monoengine.
   # Bring up with: --profile smoke
-  # Then:
+  # Empty-volume bootstrap (once):
+  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml exec -T monoengine \
+  #     monoengine --config /etc/monoengine/config.toml service init --yes
+  # Then (storage-only / trunk black-box; uses git client, not libra):
   #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
   #     --profile smoke exec -T git-smoke \
   #     env MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
   #         MONOENGINE_IT_SEED_TOKEN=monoengine-storage-only-local-dev-token-0001 \
   #         MONOENGINE_GIT_SMOKE_PUSH=1 \
-  #         bash scripts/git_protocol_smoke.sh
+  #         bash /repo/scripts/git_protocol_smoke_storage_only.sh
+  #
+  # Persist host log: tee to target/tmp/so-smoke-*.log (see docs/deploy-trunk.md).
+  # Review/CL smoke remains scripts/git_protocol_smoke.sh (do not use on trunk).
   #
   # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (host 127.0.0.1:9000). For
   # in-network LFS smoke, override that env on monoengine to http://monoengine:8000

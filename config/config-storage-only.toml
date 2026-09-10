@@ -348,4 +348,4 @@ token = "${file:/run/secrets/monoengine-push-token}"
 # 把上面的 push_auth 改成 "none",并删掉整个 [[git.push_tokens]] 段.
 # SSH: none + anonymous_access=true → auth_none clone; none + anonymous_access=false
 # is fail-closed (no UserStorage, no password). Do not seed UserStorage on trunk+none.
-push_auth = "none"
+# push_auth = "none"   # opt-in via config/config-storage-only.none.toml + compose override (plan-20260906)
