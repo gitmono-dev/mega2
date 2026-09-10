@@ -61,7 +61,15 @@ paths = ["/project"]   # 省略或空 = 全库
 
 ## 4. SSH
 
-Storage-only（显式 `push_auth`）**不暴露 SSH receive-pack**。启动要求配置里写 `ssh_receive_pack = false`；省略该项会 fail-closed，不是默默关闭。Clone/fetch 若走 SSH，仍受该键约束。需要推送时用 Git smart HTTP + token（或 `none` + 网络边界）。
+Storage-only（显式 `push_auth`）**不暴露 SSH receive-pack**。启动要求配置里写 `ssh_receive_pack = false`；省略该项会 fail-closed，不是默默关闭。需要推送时用 Git smart HTTP + token（或 `none` + 网络边界）。
+
+`ssh_receive_pack = false` **不关闭** SSH clone/fetch/pull（upload-pack）。storage-only 读与 HTTP 共用 `git.anonymous_access`：
+
+- `anonymous_access = true`：SSH `auth_none` 放行，无需 UserStorage 公钥、无需 password。
+- `push_auth = "none"` 且 `anonymous_access = false`：SSH 读 fail-closed（无 password 通道；勿在 trunk+none 依赖 UserStorage）。
+- `push_auth = "token"` 且匿名关：password = `[[git.push_tokens]]` 密文（见后续 password 文档 / plan-20260908 SP-02）。
+
+review 形态（省略 `push_auth`）仍走 UserStorage 公钥；默认匿名开时 **不** 成功放行 `auth_none`，以免 OpenSSH 跳过公钥推送。
 
 ## 5. 形态切换
 
@@ -89,7 +97,19 @@ Object PUT/GET 仍走 batch 注册后的能力 URL，不逐请求鉴权。Review
 
 基础认证（单/多 token 查找、组件边界前缀、`none` 旁路）已随阶段 4.2a（TP-19/20）交付。Token 轮换、审计、限流等运维强化**未**规范，登记为 `DEFER-TP-05`（重启条件：`trunk-push.md` 阶段 5 补齐可执行规范）。
 
-## 8. Agent 工作流备忘
+## 8. 本地 Compose 栈
+
+仓库根 `docker-compose.storage-only.yml` 对照 IT 的 `docker-compose.test.yml`，只保留 Postgres / Redis / monoengine，挂载 `config/config-storage-only.toml` 与 `/run/secrets/monoengine-push-token`（默认本地文件 `secrets/monoengine-push-token.local`）。不含 website、mailpit、RustFS、OAuth。
+
+```bash
+docker compose -p monoengine-trunk -f docker-compose.storage-only.yml up -d --wait
+# HTTP http://127.0.0.1:9000/  SSH ssh://git@127.0.0.1:2222/
+# push token 默认: monoengine-storage-only-local-dev-token-0001
+```
+
+与 `-p monoengine-it` 的测试栈可并存（端口 25432 / 26379 / 9000 / 2222）。生产凭据用 `MONOENGINE_PUSH_TOKEN_FILE` 覆盖，勿提交。
+
+## 9. Agent 工作流备忘
 
 每次 trunk 推送后执行：
 

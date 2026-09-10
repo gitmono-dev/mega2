@@ -46,6 +46,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_git_lfs` | Git HTTP LFS push → fetch → `git lfs pull` round trip（plan-20260803 / GM-05 review/CL） | PostgreSQL, Redis, `--profile git`, git-lfs |
 | `integration_git_lfs` filter `trunk` | storage-only LFS（plan-20260909 / LF-03）：`integration_git_lfs_trunk_push_auth_none_round_trip`、`integration_git_lfs_trunk_push_auth_token_round_trip`；直推 `main` 子路径，非 CL | PostgreSQL, Redis, git-lfs；本机防火墙下 compose `git-cli` 可能不可达时走 host git + `MONOENGINE_IT_ALLOW_HOST_GIT=1` |
 | `integration_git_ssh` | Git SSH cargo-native self-start clone/pull/push（plan-20260803 / GM-06..08） | PostgreSQL, Redis, `--profile git` |
+| `integration_git_ssh` filter `trunk_none` / `token_anon` | storage-only SSH 只读（plan-20260908 / SP-01）：`integration_git_ssh_trunk_none_anon_on_clone`、`integration_git_ssh_trunk_none_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_on_clone` | PostgreSQL, Redis；`--profile git` 或 host git |
 | `integration_website_auth` | Better Auth cookie to monoengine session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
 | `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
 | `integration_authz_audit` | 只读装配零副作用黑盒（UN-30 / UN-43）+ `authz-audit` CLI（UN-29 审计/fsync + UN-37 promote） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |

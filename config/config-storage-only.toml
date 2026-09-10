@@ -289,9 +289,11 @@ enforcement = "off"
 # every read needs a token — pick per repo sensitivity. Push is NEVER anonymous
 # under "token" (below); under push_auth="none" even push is anonymous, so that
 # combination is intranet/loopback-only.
+# SSH upload-pack (clone/fetch/pull) uses the same flag: true → storage-only
+# auth_none (no UserStorage key); false + push_auth="none" is fail-closed.
 # 场景:true = 可公开读的镜像(代码分发);false = 读也要 token,按仓库敏感度选.
 # 注意:push_auth="token" 时推送永远要 token;若用 push_auth="none" 则推送也匿名,
-# 该组合只能放内网/回环.
+# 该组合只能放内网/回环. SSH 只读与 HTTP 共用本开关.
 anonymous_access = true
 
 # Storage-only push authentication / storage-only 推送认证.
@@ -342,4 +344,6 @@ token = "${file:/run/secrets/monoengine-push-token}"
 # Alternative for a fully trusted network / 全可信网络下的替代方案:
 # replace push_auth above with "none" AND delete this [[git.push_tokens]] block.
 # 把上面的 push_auth 改成 "none",并删掉整个 [[git.push_tokens]] 段.
+# SSH: none + anonymous_access=true → auth_none clone; none + anonymous_access=false
+# is fail-closed (no UserStorage, no password). Do not seed UserStorage on trunk+none.
 # push_auth = "none"

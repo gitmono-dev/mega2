@@ -76,6 +76,8 @@
 
 > **2026-09-09 更新（TP-17 / ADR-TP-18）**：monorepo `finalize_receive_pack` 按 `[monorepo].push_policy` 条件化。`review` 仍走 `persist_mono_branch_cl_mega_refs_transaction` + CL post-push 管线（写 `refs/cl/*`）。`trunk` 跳过 CL 落地，以 `kind=push` 入队并执行 B3：N=1 客户端 commit 原样落 `main@P`，N>1 squash（sideband 返回合成 id 与对齐命令 `git fetch && git reset --hard origin/main`）；删除类 branch 命令在 finalize 以 B0 正文拒绝。trunk 形态 `refs_with_head_hash` 过滤 `is_cl` 行（档案 CL refs 不 advertise）。`push_queue.requester` 取协议身份（token 名 / `none` 为 NULL），不用 commit author。
 
+> **2026-09-10 更新（plan-20260908 SP-01）：** storage-only SSH 读与 HTTP 共用 `anonymous_access`：仅 `push_auth.is_some() && anonymous_access=true` 时 `auth_none` Accept。review 即使匿名开也不 Accept `auth_none`（保护公钥推送）。storage-only `auth_publickey` 早拒。进程 IT：`integration_git_ssh_trunk_none_anon_on_clone`、`integration_git_ssh_trunk_none_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_on_clone`。password-token 通道见 SP-02。
+
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
 2. **基础 fetch/push/clone 可工作**。当前能支持标准 Git 客户端的基本 clone、fetch、push 操作，但多处使用 `unwrap()` 和缺乏边界检查。
@@ -235,7 +237,7 @@ SSH 服务入口位于 `src/server/ssh_server.rs` 和 `src/contract/git_protocol
 - 支持 `git-upload-pack` 和 `git-receive-pack`。
 - 支持 `git-lfs-authenticate` hybrid LFS discovery。
 - 对 `git-lfs-transfer` 返回明确 unsupported failure。
-- 使用用户上传的 SSH public key fingerprint 进行认证。
+- SSH 认证：review（省略 `push_auth`）用 UserStorage publickey，**不**成功放行 `auth_none`；storage-only 在 `anonymous_access=true` 时 `auth_none` Accept，`auth_publickey` 早拒（不查 UserStorage）。`ssh_receive_pack=false` 只关 receive-pack，不关 upload-pack。
 
 SSH 和 HTTP 最终共用 `SmartSession` 与 `src/ceres/protocol/smart.rs` 中的 smart protocol 实现。
 

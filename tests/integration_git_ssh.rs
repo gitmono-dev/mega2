@@ -111,6 +111,10 @@ struct GitSshEnv {
 
 impl GitSshEnv {
     fn new() -> Self {
+        Self::with_config_append("")
+    }
+
+    fn with_config_append(append: &str) -> Self {
         let work_root = git_cli::git_cli_workdir();
         fs::create_dir_all(&work_root).unwrap_or_else(|err| {
             panic!("create shared git workdir {}: {err}", work_root.display())
@@ -134,7 +138,11 @@ impl GitSshEnv {
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database = TestDatabase::create();
-        let full_config_path = common::write_case_config(&case_dir);
+        let full_config_path = {
+            let path = case_dir.join("config.toml");
+            common::write_full_config_with_append(&path, append);
+            path
+        };
         // Keep objects under CASE/ssh/base so `${base_dir}/objects` and the
         // MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR override always resolve to the
         // same tree (avoids pack generation looking for hashes that were
@@ -441,6 +449,234 @@ fn integration_git_ssh_authenticated_clone() {
     );
     git_cli::assert_process_reaped(service_pid);
     git_cli::wait_until_port_closed(port, Duration::from_secs(5));
+    drop(service);
+    drop(env);
+}
+
+fn git_ssh_command_loopback(case_dir: &Path, port: u16, none_only: bool) -> String {
+    let key = case_dir.join("ssh").join("client_ed25519");
+    let known = case_dir.join("ssh").join("known_hosts");
+    let mut cmd = format!(
+        "ssh -i {} -o IdentitiesOnly=yes -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes -o BatchMode=yes -p {port}",
+        key.display(),
+        known.display(),
+    );
+    if none_only {
+        cmd.push_str(" -o PreferredAuthentications=none -o PubkeyAuthentication=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no");
+    } else {
+        cmd.push_str(" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no");
+    }
+    cmd
+}
+
+fn git_host_ssh(case_dir: &Path, git_ssh: &str, git_args: &[&str]) -> std::process::Output {
+    let isolated_home = case_dir.join("git-home-ssh-loopback");
+    fs::create_dir_all(&isolated_home).expect("create isolated git HOME");
+    let mut command = Command::new("timeout");
+    command
+        .args(["-k", "5", "45"])
+        .arg("git")
+        .current_dir(case_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("HOME", &isolated_home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", git_ssh)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .args(git_args);
+    command.output().expect("host git via timeout")
+}
+
+fn write_known_hosts_via_host_keyscan(known_hosts: &Path, port: u16) {
+    if let Some(parent) = known_hosts.parent() {
+        fs::create_dir_all(parent).expect("create known_hosts parent");
+    }
+    let port_arg = port.to_string();
+    let output = Command::new("ssh-keyscan")
+        .args(["-T", "5", "-p", &port_arg, "127.0.0.1"])
+        .output()
+        .expect("spawn host ssh-keyscan");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !body.trim().is_empty(),
+        "host ssh-keyscan produced empty known_hosts for port {port}; status={:?} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        body,
+    );
+    fs::write(known_hosts, body.as_bytes()).expect("write known_hosts");
+}
+
+fn boot_storage_only_ssh(
+    env: &GitSshEnv,
+    extra_env: &[(&str, &str)],
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    {
+        let (mut migrate_service, _migrate_port, _out, err) =
+            boot_service_ssh_with_env(env, extra_env);
+        let status = migrate_service.shutdown_via_sigint(Duration::from_secs(10));
+        assert!(
+            status.success(),
+            "migrate boot did not shut down cleanly: {status}\nstderr:\n{}",
+            read_log(&err),
+        );
+        drop(migrate_service);
+    }
+    let (service, port, stdout_path, stderr_path) = boot_service_ssh_with_env(env, extra_env);
+    write_known_hosts_via_host_keyscan(&env.ssh_dir.join("known_hosts"), port);
+    (service, port, stdout_path, stderr_path)
+}
+
+#[test]
+fn integration_git_ssh_trunk_none_anon_on_clone() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::with_config_append(
+        r#"
+[git]
+anonymous_access = true
+push_auth = "none"
+ssh_receive_pack = false
+"#,
+    );
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+    ];
+    let (mut service, port, stdout_path, stderr_path) = boot_storage_only_ssh(&env, &extra);
+    let git_ssh = git_ssh_command_loopback(&env.case_dir, port, true);
+    let remote = format!("ssh://git@127.0.0.1:{port}/");
+    let output = git_host_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["clone", &remote, "ssh-none-anon-on"],
+    );
+    if !output.status.success() {
+        panic!(
+            "storage-only none + anonymous SSH clone failed ({})\nstdout:\n{}\nstderr:\n{}\n--- service stdout ---\n{}\n--- service stderr ---\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            read_log(&stdout_path),
+            read_log(&stderr_path),
+        );
+    }
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_trunk_none_anon_off_clone_fail() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::with_config_append(
+        r#"
+[git]
+anonymous_access = false
+push_auth = "none"
+ssh_receive_pack = false
+"#,
+    );
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "none"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "false"),
+    ];
+    let (mut service, port, _stdout_path, stderr_path) = boot_storage_only_ssh(&env, &extra);
+    let git_ssh = git_ssh_command_loopback(&env.case_dir, port, false);
+    let remote = format!("ssh://git@127.0.0.1:{port}/");
+    let output = git_host_ssh(
+        &env.case_dir,
+        &git_ssh,
+        &["clone", &remote, "ssh-none-anon-off"],
+    );
+    assert!(
+        !output.status.success(),
+        "none + anonymous_access=false SSH clone must fail; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+    drop(service);
+    drop(env);
+}
+
+#[test]
+fn integration_git_ssh_trunk_token_anon_on_clone() {
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+    );
+    git_cli::require_git_cli_runner();
+
+    let env = GitSshEnv::with_config_append(
+        r#"
+[git]
+anonymous_access = true
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "agent-ci"
+token = "sp01-unused-for-anon-clone"
+"#,
+    );
+    git_cli::generate_client_ed25519(&env.ssh_dir.join("client_ed25519"));
+    let extra = [
+        ("MEGA_MONOREPO__PUSH_POLICY", "trunk"),
+        ("MEGA_GIT__PUSH_AUTH", "token"),
+        ("MEGA_GIT__SSH_RECEIVE_PACK", "false"),
+        ("MEGA_GIT__ANONYMOUS_ACCESS", "true"),
+    ];
+    let (mut service, port, _stdout_path, stderr_path) = boot_storage_only_ssh(&env, &extra);
+    let git_ssh = git_ssh_command_loopback(&env.case_dir, port, true);
+    let remote = format!("ssh://git@127.0.0.1:{port}/");
+    git_cli::assert_git_success(
+        &git_host_ssh(
+            &env.case_dir,
+            &git_ssh,
+            &["clone", &remote, "ssh-token-anon-on"],
+        ),
+        "storage-only token + anonymous SSH clone without password",
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
     drop(service);
     drop(env);
 }
@@ -964,6 +1200,13 @@ fn integration_git_ssh_wrong_key_is_rejected() {
 }
 
 fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) {
+    boot_service_ssh_with_env(env, &[])
+}
+
+fn boot_service_ssh_with_env(
+    env: &GitSshEnv,
+    extra_env: &[(&str, &str)],
+) -> (ServiceProcess, u16, PathBuf, PathBuf) {
     // ephemeral_port_from_127.0.0.1:0_to_--ssh-port
     let port = git_cli::reserve_ephemeral_port();
     git_cli::record_allocated_port(port);
@@ -972,6 +1215,9 @@ fn boot_service_ssh(env: &GitSshEnv) -> (ServiceProcess, u16, PathBuf, PathBuf) 
 
     let mut command = env.full_config_command();
     command.env("MEGA_LOG__PRINT_STD", "true");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     let port_arg = port.to_string();
     command.args([
         "service",

@@ -338,6 +338,8 @@ enforcement = "off"
 # Omitted push_auth = existing OAuth/UserStorage chain (review morphology only).
 # Explicit "token" | "none" requires monorepo.push_policy = "trunk".
 # Credentials via ${file:...} or vault://secret/config/<profile>/git/push_tokens/<name>#value.
+# SSH read (upload-pack): storage-only + anonymous_access=true → auth_none (no UserStorage key).
+# none + anonymous_access=false is fail-closed. Review never Accepts auth_none (keeps publickey push).
 # [git]
 # anonymous_access = true
 # push_auth = "token"

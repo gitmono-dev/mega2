@@ -937,8 +937,9 @@ impl Default for BuckConfig {
 ///
 /// Controls whether anonymous (unauthenticated) clients may clone/fetch
 /// repositories via upload-pack. When `anonymous_access` is `false`, every
-/// upload-pack request must carry a valid Bearer or Basic token (HTTP) or
-/// an authenticated SSH key.
+/// upload-pack request must carry a valid Bearer or Basic token (HTTP) or a
+/// successful SSH session (review UserStorage publickey; storage-only password
+/// is SP-02).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GitConfig {
     /// Allow anonymous (unauthenticated) clone/fetch via upload-pack.

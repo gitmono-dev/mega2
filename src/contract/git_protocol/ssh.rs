@@ -21,6 +21,7 @@ use crate::{
         },
     },
     contract::git_protocol::{check_push_permission, check_upload_pack_access},
+    jupiter::storage::Storage,
 };
 
 type ClientMap = HashMap<(usize, ChannelId), Channel<Msg>>;
@@ -230,21 +231,42 @@ impl server::Handler for SshServer {
         Ok(())
     }
 
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        let git = &self.state.storage.config().git;
+        let accept = git.storage_only() && git.anonymous_access;
+        tracing::info!(
+            user,
+            storage_only = git.storage_only(),
+            anonymous_access = git.anonymous_access,
+            accept,
+            "auth_none"
+        );
+        if accept {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        }
+    }
+
     async fn auth_publickey(
         &mut self,
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
+        if self.state.storage.config().git.storage_only() {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
+
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
 
         tracing::info!("auth_publickey: {} / {}", user, fingerprint);
-        let res = match self
-            .state
-            .storage
-            .user_storage()
-            .search_ssh_key_finger(&fingerprint)
-            .await
-        {
+        let res = match lookup_ssh_key_finger_for_review(&self.state.storage, &fingerprint).await {
             Ok(res) => res,
             Err(e) => {
                 tracing::error!(error = %e, "SSH key DB lookup failed");
@@ -680,9 +702,151 @@ async fn handle_receive_pack(
     let _ = session.data(channel, report_status.to_vec());
 }
 
+async fn lookup_ssh_key_finger_for_review(
+    storage: &Storage,
+    fingerprint: &str,
+) -> Result<Vec<crate::callisto::ssh_keys::Model>, crate::common::errors::MegaError> {
+    storage
+        .user_storage()
+        .search_ssh_key_finger(fingerprint)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
+    use russh::server::Handler;
+
     use super::*;
+    use crate::{
+        ceres::api_service::{cache::GitObjectCache, state::ProtocolApiState},
+        config::{GitConfig, PushAuth, testing::isolated_config},
+        contract::policy::entitystore::SharedEntityStore,
+        jupiter::tests::test_storage_with_config,
+    };
+
+    fn sample_public_key() -> PublicKey {
+        PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqvkVqjzI9K4TDbjKjktkiHFdBzxv88ZUFl/XtNwF",
+        )
+        .expect("fixture public key")
+    }
+
+    async fn ssh_server_with_git(temp_dir: &std::path::Path, git: GitConfig) -> SshServer {
+        let mut config = isolated_config(temp_dir.join("cfg"));
+        config.git = git;
+        let storage = test_storage_with_config(temp_dir, config).await;
+        let redis_url = std::env::var("MEGA_REDIS__URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        SshServer {
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            state: ProtocolApiState {
+                storage,
+                git_object_cache: Arc::new(GitObjectCache {
+                    connection: crate::jupiter::redis::init_connection(
+                        &crate::config::RedisConfig { url: redis_url },
+                    )
+                    .await
+                    .expect("redis connection"),
+                    prefix: "disabled".to_string(),
+                }),
+                entity_store: Arc::new(SharedEntityStore::new()),
+            },
+            id: 0,
+            channels: HashMap::new(),
+            v2_channels: HashMap::new(),
+            authenticated_user: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_none_accepts_only_when_storage_only_and_anonymous() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: true,
+                push_auth: Some(PushAuth::None),
+                ssh_receive_pack: Some(false),
+                push_tokens: Vec::new(),
+            },
+        )
+        .await;
+        let auth = server.auth_none("git").await.expect("auth_none");
+        assert!(matches!(auth, Auth::Accept));
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_none_rejects_for_review_even_when_anonymous() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: true,
+                push_auth: None,
+                ssh_receive_pack: None,
+                push_tokens: Vec::new(),
+            },
+        )
+        .await;
+        let auth = server.auth_none("git").await.expect("auth_none");
+        assert!(matches!(
+            auth,
+            Auth::Reject {
+                partial_success: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_none_rejects_when_anonymous_false() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: false,
+                push_auth: Some(PushAuth::Token),
+                ssh_receive_pack: Some(false),
+                push_tokens: Vec::new(),
+            },
+        )
+        .await;
+        let auth = server.auth_none("git").await.expect("auth_none");
+        assert!(matches!(
+            auth,
+            Auth::Reject {
+                partial_success: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_publickey_rejects_storage_only_before_lookup() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut server = ssh_server_with_git(
+            dir.path(),
+            GitConfig {
+                anonymous_access: true,
+                push_auth: Some(PushAuth::Token),
+                ssh_receive_pack: Some(false),
+                push_tokens: Vec::new(),
+            },
+        )
+        .await;
+        let auth = server
+            .auth_publickey("git", &sample_public_key())
+            .await
+            .expect("auth_publickey");
+        assert!(matches!(
+            auth,
+            Auth::Reject {
+                partial_success: false,
+                ..
+            }
+        ));
+        assert!(server.authenticated_user.is_none());
+    }
 
     #[test]
     fn parse_git_exec_accepts_quoted_repo_path_with_spaces() {
