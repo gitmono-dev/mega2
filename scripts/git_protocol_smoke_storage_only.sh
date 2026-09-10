@@ -109,9 +109,24 @@ case_http_ls_remote() {
   git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
 }
 
+clone_case() {
+  local url="$1"
+  local dest="$2"
+  shift 2
+  rm -rf "$dest"
+  git_case clone "$@" "$url" "$dest" || return
+  git -C "$dest" fsck --no-dangling >/dev/null || return
+}
+
+case_http_clone() {
+  require_http_url || return 1
+  clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
+run_case "HTTP clone" case_http_clone
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
