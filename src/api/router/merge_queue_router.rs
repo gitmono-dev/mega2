@@ -311,7 +311,7 @@ mod tests {
             tree::{Tree, TreeItem, TreeItemMode},
         },
     };
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement};
     use tower::ServiceExt;
     use utoipa_axum::router::OpenApiRouter;
 
@@ -321,7 +321,7 @@ mod tests {
             oauth::{api_store::BrowserSessionStore, model::LoginUser},
         },
         bellatrix::Bellatrix,
-        callisto::{merge_queue, push_queue, sea_orm_active_enums::PushQueueKindEnum},
+        callisto::{push_queue, sea_orm_active_enums::PushQueueKindEnum},
         ceres::api_service::cache::GitObjectCache,
         common::utils::MEGA_BRANCH_NAME,
         contract::policy::entitystore::SharedEntityStore,
@@ -457,14 +457,23 @@ mod tests {
             "default config POST /merge-queue/add must write push_queue"
         );
 
-        let mq_rows = merge_queue::Entity::find()
-            .filter(merge_queue::Column::ClLink.eq("MW01ADD"))
-            .all(storage.cl_storage().get_connection())
+        let stmt = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT to_regclass('merge_queue')::text AS table_name;".to_owned(),
+        );
+        let row = storage
+            .cl_storage()
+            .get_connection()
+            .query_one_raw(stmt)
             .await
-            .expect("read merge_queue");
+            .expect("query PostgreSQL catalog")
+            .expect("PostgreSQL catalog query should return one row");
+        let table_name: Option<String> = row
+            .try_get("", "table_name")
+            .expect("PostgreSQL catalog query should expose table_name");
         assert!(
-            mq_rows.is_empty(),
-            "default config POST /merge-queue/add must not write merge_queue"
+            table_name.is_none(),
+            "POST /merge-queue/add must not write merge_queue; the table is dropped"
         );
     }
 }

@@ -270,40 +270,6 @@ pub enum PushQueueStatusEnum {
     Cancelled,
 }
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
-#[sea_orm(
-    rs_type = "String",
-    db_type = "Enum",
-    enum_name = "queue_failure_type_enum"
-)]
-pub enum QueueFailureTypeEnum {
-    #[sea_orm(string_value = "conflict")]
-    Conflict,
-    #[sea_orm(string_value = "test_failure")]
-    TestFailure,
-    #[sea_orm(string_value = "build_failure")]
-    BuildFailure,
-    #[sea_orm(string_value = "merge_failure")]
-    MergeFailure,
-    #[sea_orm(string_value = "system_error")]
-    SystemError,
-    #[sea_orm(string_value = "timeout")]
-    Timeout,
-}
-#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
-#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "queue_status_enum")]
-pub enum QueueStatusEnum {
-    #[sea_orm(string_value = "waiting")]
-    Waiting,
-    #[sea_orm(string_value = "testing")]
-    Testing,
-    #[sea_orm(string_value = "merging")]
-    Merging,
-    #[sea_orm(string_value = "merged")]
-    Merged,
-    #[sea_orm(string_value = "failed")]
-    Failed,
-}
-#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
 #[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "ref_type_enum")]
 pub enum RefTypeEnum {
     #[sea_orm(string_value = "branch")]

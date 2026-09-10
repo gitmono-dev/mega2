@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::callisto::{
-    merge_queue::Model,
-    sea_orm_active_enums::{QueueFailureTypeEnum, QueueStatusEnum},
-};
+use crate::callisto::sea_orm_active_enums::{PushQueueFailureEnum, PushQueueStatusEnum};
 
 /// CL queue status for API
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -94,76 +91,9 @@ pub struct QueueStatsResponse {
     pub stats: QueueStats,
 }
 
-impl From<QueueStatusEnum> for QueueStatus {
-    fn from(status: QueueStatusEnum) -> Self {
-        match status {
-            QueueStatusEnum::Waiting => QueueStatus::Waiting,
-            QueueStatusEnum::Testing => QueueStatus::Testing,
-            QueueStatusEnum::Merging => QueueStatus::Merging,
-            QueueStatusEnum::Merged => QueueStatus::Merged,
-            QueueStatusEnum::Failed => QueueStatus::Failed,
-        }
-    }
-}
-
-impl From<QueueFailureTypeEnum> for FailureType {
-    fn from(failure_type: QueueFailureTypeEnum) -> Self {
-        match failure_type {
-            QueueFailureTypeEnum::TestFailure => FailureType::TestFailure,
-            QueueFailureTypeEnum::BuildFailure => FailureType::BuildFailure,
-            QueueFailureTypeEnum::Conflict => FailureType::Conflict,
-            QueueFailureTypeEnum::MergeFailure => FailureType::MergeFailure,
-            QueueFailureTypeEnum::SystemError => FailureType::SystemError,
-            QueueFailureTypeEnum::Timeout => FailureType::Timeout,
-        }
-    }
-}
-
-impl From<Model> for QueueItem {
-    fn from(item: Model) -> Self {
-        let error = item.failure_type.map(|ft| {
-            let occurred_at_local = item
-                .updated_at
-                .and_utc()
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string();
-
-            QueueError {
-                failure_type: ft.into(),
-                message: item.error_message.unwrap_or_default(),
-                occurred_at: occurred_at_local,
-            }
-        });
-
-        QueueItem {
-            cl_link: item.cl_link,
-            status: item.status.into(),
-            position: item.position,
-            display_position: None,
-            created_at: item
-                .created_at
-                .and_utc()
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
-            updated_at: item
-                .updated_at
-                .and_utc()
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
-            retry_count: item.retry_count,
-            error,
-        }
-    }
-}
-
 impl QueueItem {
     /// Map a MonoWriteQueue row onto the legacy merge-queue list shape.
     pub fn from_push_queue(row: &crate::callisto::push_queue::Model) -> Self {
-        use crate::callisto::sea_orm_active_enums::PushQueueStatusEnum;
-
         let status = match row.status {
             PushQueueStatusEnum::Queued => QueueStatus::Waiting,
             PushQueueStatusEnum::Running => QueueStatus::Merging,
@@ -178,15 +108,9 @@ impl QueueItem {
                 .to_string();
             QueueError {
                 failure_type: match ft {
-                    crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::Conflict => {
-                        FailureType::Conflict
-                    }
-                    crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::MergeFailure => {
-                        FailureType::MergeFailure
-                    }
-                    crate::callisto::sea_orm_active_enums::PushQueueFailureEnum::SystemError => {
-                        FailureType::SystemError
-                    }
+                    PushQueueFailureEnum::Conflict => FailureType::Conflict,
+                    PushQueueFailureEnum::MergeFailure => FailureType::MergeFailure,
+                    PushQueueFailureEnum::SystemError => FailureType::SystemError,
                     _ => FailureType::SystemError,
                 },
                 message: row.error_message.clone().unwrap_or_default(),
@@ -211,57 +135,6 @@ impl QueueItem {
             retry_count: 0,
             error,
         }
-    }
-}
-
-impl From<crate::jupiter::model::merge_queue_dto::QueueStats> for QueueStats {
-    fn from(stats: crate::jupiter::model::merge_queue_dto::QueueStats) -> Self {
-        QueueStats {
-            total_items: stats.total_items,
-            waiting_count: stats.waiting_count,
-            testing_count: stats.testing_count,
-            merging_count: stats.merging_count,
-            failed_count: stats.failed_count,
-            merged_count: stats.merged_count,
-        }
-    }
-}
-
-impl From<Vec<Model>> for QueueListResponse {
-    fn from(items: Vec<Model>) -> Self {
-        let total_count = items.len();
-        let mut api_items: Vec<QueueItem> = items.into_iter().map(|item| item.into()).collect();
-        for (idx, item) in api_items.iter_mut().enumerate() {
-            item.display_position = Some(idx + 1);
-        }
-
-        QueueListResponse {
-            items: api_items,
-            total_count,
-        }
-    }
-}
-
-impl From<Option<Model>> for QueueStatusResponse {
-    fn from(item: Option<Model>) -> Self {
-        match item {
-            Some(queue_item) => QueueStatusResponse {
-                in_queue: true,
-                item: Some(queue_item.into()),
-            },
-            None => QueueStatusResponse {
-                in_queue: false,
-                item: None,
-            },
-        }
-    }
-}
-
-impl From<crate::jupiter::model::merge_queue_dto::QueueStats> for QueueStatsResponse {
-    fn from(stats: crate::jupiter::model::merge_queue_dto::QueueStats) -> Self {
-        let ceres_stats: QueueStats = stats.into();
-
-        ceres_stats.into()
     }
 }
 

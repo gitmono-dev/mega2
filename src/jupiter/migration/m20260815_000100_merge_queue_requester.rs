@@ -67,10 +67,13 @@ impl MigrationTrait for Migration {
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
-    use sea_orm_migration::{SchemaManager, prelude::MigrationTrait};
+    use sea_orm_migration::{
+        SchemaManager,
+        prelude::{MigrationTrait, MigratorTrait},
+    };
 
     use super::*;
-    use crate::jupiter::{migration::runner::apply_migrations, tests::test_db_connection};
+    use crate::jupiter::{migration::Migrator, tests::test_db_connection};
 
     /// `(is_nullable, column_default)` of `merge_queue.requester`, or `None`
     /// when the column does not exist.
@@ -106,13 +109,26 @@ mod tests {
         .expect("insert merge_queue row");
     }
 
+    /// Apply every migration up to UN-18, excluding MW-05's DROP TABLE.
+    async fn apply_migrations_before_merge_queue_drop(db: &DatabaseConnection) {
+        let drop_name = "m20260910_000100_drop_merge_queue";
+        let migrations = Migrator::migrations();
+        assert_eq!(
+            migrations.last().map(|m| m.name()),
+            Some(drop_name),
+            "MW-05 drop must stay last so UN-18 can apply the prefix"
+        );
+        let steps = (migrations.len() - 1) as u32;
+        Migrator::up(db, Some(steps))
+            .await
+            .expect("migrations through UN-18 should apply");
+    }
+
     #[tokio::test]
     async fn un18_up_adds_a_nullable_requester_column_without_a_default() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let db = test_db_connection(temp_dir.path()).await;
-        apply_migrations(&db, false)
-            .await
-            .expect("migrations should apply");
+        apply_migrations_before_merge_queue_drop(&db).await;
 
         let (is_nullable, default) = requester_column(&db)
             .await
@@ -128,9 +144,7 @@ mod tests {
     async fn un18_existing_rows_keep_a_null_requester_and_down_drops_the_column() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let db = test_db_connection(temp_dir.path()).await;
-        apply_migrations(&db, false)
-            .await
-            .expect("migrations should apply");
+        apply_migrations_before_merge_queue_drop(&db).await;
 
         // A row written before any consumer exists reads back as NULL — the
         // legacy semantics UN-17 builds on.

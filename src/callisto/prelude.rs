@@ -26,7 +26,7 @@ pub use super::{
     mega_refs::Entity as MegaRefs, mega_resource_permission::Entity as MegaResourcePermission,
     mega_tag::Entity as MegaTag, mega_tree::Entity as MegaTree,
     mega_webhook::Entity as MegaWebhook, mega_webhook_delivery::Entity as MegaWebhookDelivery,
-    mega_webhook_event_type::Entity as MegaWebhookEventType, merge_queue::Entity as MergeQueue,
+    mega_webhook_event_type::Entity as MegaWebhookEventType,
     notification_event_types::Entity as NotificationEventTypes, orion_tasks::Entity as OrionTasks,
     path_check_configs::Entity as PathCheckConfigs, push_queue::Entity as PushQueue,
     queue_control::Entity as QueueControl, reactions::Entity as Reactions,
