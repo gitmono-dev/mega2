@@ -526,6 +526,13 @@ case_ssh_fetch() {
   fetch_case "$dest"
 }
 
+case_ssh_protocol_v2_fetch() {
+  require_ssh_url || return 1
+  local dest="$ROOT_DIR/ssh-v2-fetch"
+  clone_case "$MONOENGINE_SSH_REPO_URL" "$dest" || return 1
+  fetch_case "$dest" -c protocol.version=2
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -565,10 +572,12 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH ls-remote" case_ssh_ls_remote
   run_case "SSH clone" case_ssh_clone
   run_case "SSH fetch" case_ssh_fetch
+  run_case "SSH protocol v2 fetch" case_ssh_protocol_v2_fetch
 elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "SSH ls-remote" ||
   "$CASE_FILTER" == "SSH clone" ||
-  "$CASE_FILTER" == "SSH fetch"
+  "$CASE_FILTER" == "SSH fetch" ||
+  "$CASE_FILTER" == "SSH protocol v2 fetch"
 ) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
