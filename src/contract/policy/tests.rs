@@ -7,6 +7,7 @@ use git_internal::{
     internal::object::tree::{Tree, TreeItem, TreeItemMode},
 };
 use sea_orm::{EntityTrait, TransactionTrait};
+use tokio::sync::Mutex;
 
 use crate::{
     callisto::{authz_notify_outbox, mega_refs},
@@ -24,6 +25,10 @@ use crate::{
         tests::test_storage_with_config,
     },
 };
+
+/// Serializes this module's tests: `set_after_authz_json_load_publish_for_test` /
+/// `set_rebuild_delay_for_test` are process-global and race under `cargo test --all`.
+static POLICY_TEST_SERIAL: Mutex<()> = Mutex::const_new(());
 
 async fn storage_enforce(temp: &std::path::Path) -> crate::jupiter::storage::Storage {
     let mut config = crate::config::testing::isolated_config(temp.join("config"));
@@ -78,6 +83,9 @@ async fn seed_cedar_on_main(storage: &crate::jupiter::storage::Storage, json: &s
 
 #[tokio::test]
 async fn tp22_migration_seeds_published_version_and_outbox() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let conn = storage.mono_storage().get_connection().clone();
@@ -96,6 +104,9 @@ async fn tp22_migration_seeds_published_version_and_outbox() {
 
 #[tokio::test]
 async fn tp22_outbox_shares_b3_transaction() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let conn = storage.mono_storage().get_connection().clone();
@@ -128,6 +139,9 @@ async fn tp22_outbox_shares_b3_transaction() {
 
 #[tokio::test]
 async fn tp22_kill9_after_outbox_replay_rebuilds_from_latest_root() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
@@ -163,6 +177,9 @@ async fn tp22_kill9_after_outbox_replay_rebuilds_from_latest_root() {
 
 #[tokio::test]
 async fn tp22_monotonic_cas_rejects_stale_publish() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
@@ -204,6 +221,9 @@ async fn tp22_monotonic_cas_rejects_stale_publish() {
 
 #[tokio::test]
 async fn tp22_read_barrier_rebuilds_lagging_instance() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let mut storage = storage_enforce(temp.path()).await;
     let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
@@ -229,6 +249,9 @@ async fn tp22_read_barrier_rebuilds_lagging_instance() {
 
 #[tokio::test]
 async fn tp22_read_barrier_timeout_is_fail_closed() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let conn = storage.mono_storage().get_connection().clone();
@@ -246,6 +269,9 @@ async fn tp22_read_barrier_timeout_is_fail_closed() {
 
 #[tokio::test]
 async fn tp22_barrier_clears_dirty_when_watermarks_already_match() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
@@ -271,6 +297,9 @@ async fn tp22_barrier_clears_dirty_when_watermarks_already_match() {
 
 #[tokio::test]
 async fn tp22_off_bypasses_the_trio() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = test_storage_with_config(
         temp.path(),
@@ -304,6 +333,9 @@ async fn tp22_off_bypasses_the_trio() {
 
 #[tokio::test]
 async fn tp22_dirty_outbox_skips_version_compare() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
@@ -341,6 +373,9 @@ async fn tp22_dirty_outbox_skips_version_compare() {
 
 #[tokio::test]
 async fn tp22_barrier_drains_pending_outbox_when_watermarks_match() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let temp = tempfile::tempdir().expect("temp");
     let storage = storage_enforce(temp.path()).await;
     let json = generate_entity(&["admin".to_string()], "repo").expect("generate");
@@ -383,6 +418,9 @@ impl Drop for AfterJsonLoadGuard {
 
 #[tokio::test]
 async fn tp22_catch_up_does_not_stamp_stale_tree_with_newer_watermark() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let _guard = AfterJsonLoadGuard;
     let temp = tempfile::tempdir().expect("temp");
     let mut storage = storage_enforce(temp.path()).await;
@@ -425,6 +463,9 @@ impl Drop for RebuildDelayGuard {
 
 #[tokio::test]
 async fn tp22_read_barrier_timeout_covers_rebuild_io() {
+    let _serial = POLICY_TEST_SERIAL.lock().await;
+    set_after_authz_json_load_publish_for_test(None);
+    set_rebuild_delay_for_test(Duration::ZERO);
     let _guard = RebuildDelayGuard;
     set_rebuild_delay_for_test(Duration::from_millis(400));
     let temp = tempfile::tempdir().expect("temp");

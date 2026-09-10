@@ -176,6 +176,8 @@ pub struct MergeExecContext {
     pub abort_before_cl_status: bool,
     /// Test-only: hold the B3 lock after apply so a concurrent rebase can race.
     pub pause_after_apply: Duration,
+    /// Test-only: sync point when `pause_after_apply` begins (race window open).
+    pub pause_after_apply_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 /// A `refs/heads/main` row whose `ref_tree_hash` does not match `resolve(root, P)`.
@@ -2434,6 +2436,9 @@ impl PushQueueService {
             .await?;
 
         if !ctx.pause_after_apply.is_zero() {
+            if let Some(barrier) = &ctx.pause_after_apply_barrier {
+                barrier.wait().await;
+            }
             tokio::time::sleep(ctx.pause_after_apply).await;
         }
         if ctx.abort_before_cl_status {

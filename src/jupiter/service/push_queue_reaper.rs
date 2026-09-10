@@ -371,16 +371,14 @@ mod tests {
             },
             storage::{
                 base_storage::{BaseStorage, StorageConnector},
-                push_queue_storage::{
-                    ClaimOutcome, EnqueueOutcome, MONO_WRITE_LOCK_SQL, PushQueueStorage,
-                },
+                push_queue_storage::{ClaimOutcome, EnqueueOutcome, PushQueueStorage},
             },
             tests::test_db_connection,
         },
     };
 
-    /// Advisory locks are database-wide (not per test schema). Serialize this
-    /// module so parallel tests do not steal `MONO_WRITE_LOCK` from each other.
+    /// Serialize this module: schema-scoped advisory locks avoid cross-schema
+    /// contention, but same-module setup still shares timing-sensitive fixtures.
     static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn service() -> (tempfile::TempDir, PushQueueService, MutexGuard<'static, ()>) {
@@ -577,11 +575,7 @@ mod tests {
         let id = enqueue_and_claim(&svc, "CL-RP-SLOW").await;
         let conn = svc.storage().get_connection();
         let holder = conn.begin().await.unwrap();
-        holder
-            .execute_raw(Statement::from_string(
-                DbBackend::Postgres,
-                MONO_WRITE_LOCK_SQL.to_owned(),
-            ))
+        PushQueueStorage::acquire_mono_write_lock(&holder)
             .await
             .unwrap();
         let report = reaper(&svc).reap_once().await.unwrap();
@@ -901,11 +895,7 @@ mod tests {
         .await
         .unwrap();
         let holder = conn.begin().await.unwrap();
-        holder
-            .execute_raw(Statement::from_string(
-                DbBackend::Postgres,
-                MONO_WRITE_LOCK_SQL.to_owned(),
-            ))
+        PushQueueStorage::acquire_mono_write_lock(&holder)
             .await
             .unwrap();
         let report = reaper(&svc).reap_once().await.unwrap();

@@ -23,6 +23,36 @@ pub const MONO_WRITE_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1297043024, 
 pub const MONO_WRITE_TRY_LOCK_SQL: &str =
     "SELECT pg_try_advisory_xact_lock(1297043024, 1229867349) AS locked";
 
+/// Production uses fixed key2. Unit tests isolate per `current_schema()` so
+/// parallel schemas on one Postgres do not contend for the same advisory lock.
+fn mono_write_lock_sql() -> String {
+    #[cfg(test)]
+    {
+        format!(
+            "SELECT pg_advisory_xact_lock({}, hashtext(current_schema()))",
+            MONO_WRITE_LOCK_KEY1
+        )
+    }
+    #[cfg(not(test))]
+    {
+        MONO_WRITE_LOCK_SQL.to_owned()
+    }
+}
+
+fn mono_write_try_lock_sql() -> String {
+    #[cfg(test)]
+    {
+        format!(
+            "SELECT pg_try_advisory_xact_lock({}, hashtext(current_schema())) AS locked",
+            MONO_WRITE_LOCK_KEY1
+        )
+    }
+    #[cfg(not(test))]
+    {
+        MONO_WRITE_TRY_LOCK_SQL.to_owned()
+    }
+}
+
 /// Result of the B1 conditional INSERT (or its zero-row classification).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueOutcome {
@@ -802,7 +832,7 @@ impl PushQueueStorage {
     pub async fn acquire_mono_write_lock(txn: &DatabaseTransaction) -> Result<(), MegaError> {
         txn.execute_raw(Statement::from_string(
             DbBackend::Postgres,
-            MONO_WRITE_LOCK_SQL.to_owned(),
+            mono_write_lock_sql(),
         ))
         .await?;
         Ok(())
@@ -813,7 +843,7 @@ impl PushQueueStorage {
         let row = txn
             .query_one_raw(Statement::from_string(
                 DbBackend::Postgres,
-                MONO_WRITE_TRY_LOCK_SQL.to_owned(),
+                mono_write_try_lock_sql(),
             ))
             .await?
             .ok_or_else(|| MegaError::Other("pg_try_advisory_xact_lock returned no row".into()))?;
@@ -884,6 +914,25 @@ impl PushQueueStorage {
     pub async fn list_mono_write_lock_holders(
         txn: &DatabaseTransaction,
     ) -> Result<Vec<MonoWriteLockHolder>, MegaError> {
+        #[cfg(test)]
+        let rows = txn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
+                SELECT a.pid::bigint AS pid,
+                       a.query_start,
+                       COALESCE(a.query, '') AS query
+                  FROM pg_locks l
+                  JOIN pg_stat_activity a ON a.pid = l.pid
+                 WHERE l.locktype = 'advisory'
+                   AND l.classid = $1
+                   AND l.objid = hashtext(current_schema())
+                   AND l.granted
+                "#,
+                [Value::from(i64::from(MONO_WRITE_LOCK_KEY1))],
+            ))
+            .await?;
+        #[cfg(not(test))]
         let rows = txn
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,

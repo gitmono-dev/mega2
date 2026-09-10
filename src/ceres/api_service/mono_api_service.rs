@@ -2429,6 +2429,7 @@ impl MonoApiService {
             git_object_cache: self.git_object_cache.clone(),
             abort_before_cl_status: false,
             pause_after_apply: Duration::ZERO,
+            pause_after_apply_barrier: None,
         };
         self.follow_merge_queue(wait, &ctx).await
     }
@@ -7853,6 +7854,7 @@ mod mc09_tests {
             git_object_cache: test_service(storage).git_object_cache,
             abort_before_cl_status: false,
             pause_after_apply: Duration::ZERO,
+            pause_after_apply_barrier: None,
         }
     }
 
@@ -8247,12 +8249,14 @@ mod mc09_tests {
             storage.push_queue_service.wait_and_claim(id).await.unwrap(),
             QueueWaitResult::Ready { id }
         );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let mut ctx = merge_exec_ctx(&storage);
-        ctx.pause_after_apply = Duration::from_millis(80);
+        ctx.pause_after_apply = Duration::from_millis(200);
+        ctx.pause_after_apply_barrier = Some(barrier.clone());
         let storage_racer = storage.clone();
         let cl_link = cl.link.clone();
         let racer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            barrier.wait().await;
             let current = storage_racer
                 .cl_storage()
                 .get_cl(&cl_link)
