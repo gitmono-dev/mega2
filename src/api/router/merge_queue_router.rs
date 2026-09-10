@@ -14,7 +14,6 @@ use crate::{
         QueueStatsResponse, QueueStatus, QueueStatusResponse,
     },
     common::errors::ApiError,
-    config::MergeWriter,
     contract::api::common::CommonResult,
 };
 
@@ -60,40 +59,38 @@ async fn add_to_queue(
     OptionalSessionUser(requester): OptionalSessionUser,
     Json(request): Json<AddToQueueRequest>,
 ) -> Result<Json<CommonResult<AddToQueueResponse>>, ApiError> {
-    // Use MonoApiService to add to queue AND start the background processor
     match state
         .monorepo()
         .add_to_merge_queue_as(request.cl_link.clone(), requester.map(|user| user.username))
         .await
     {
         Ok(position) => {
-            let display_position = state
+            let display_position = match state
                 .storage
-                .merge_queue_service
-                .get_display_position_by_position(position)
+                .push_queue_service
+                .storage()
+                .list_merge_for_legacy_ui()
                 .await
-                .map(Some)
-                .unwrap_or_else(|e| {
+            {
+                Ok(listed) => listed
+                    .iter()
+                    .position(|row| row.id == position)
+                    .map(|idx| idx + 1),
+                Err(e) => {
                     tracing::warn!(
                         "Failed to get display position after add for {}: {}",
                         request.cl_link,
                         e
                     );
                     None
-                });
-
-            let message = if state.storage.config().monorepo.merge_writer
-                == crate::config::MergeWriter::Queue
-            {
-                "Merged".to_string()
-            } else {
-                "Added to queue".to_string()
+                }
             };
+
             let response = AddToQueueResponse {
                 success: true,
                 position,
                 display_position,
-                message,
+                message: "Merged".to_string(),
             };
             Ok(Json(CommonResult::success(Some(response))))
         }
@@ -132,26 +129,21 @@ async fn remove_from_queue(
 async fn get_queue_list(
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<QueueListResponse>>, ApiError> {
-    if state.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-        let rows = state
-            .storage
-            .push_queue_service
-            .storage()
-            .list_merge_for_legacy_ui()
-            .await?;
-        let mut items: Vec<QueueItem> = rows.iter().map(QueueItem::from_push_queue).collect();
-        for (idx, item) in items.iter_mut().enumerate() {
-            item.display_position = Some(idx + 1);
-        }
-        let total_count = items.len();
-        return Ok(Json(CommonResult::success(Some(QueueListResponse {
-            items,
-            total_count,
-        }))));
+    let rows = state
+        .storage
+        .push_queue_service
+        .storage()
+        .list_merge_for_legacy_ui()
+        .await?;
+    let mut items: Vec<QueueItem> = rows.iter().map(QueueItem::from_push_queue).collect();
+    for (idx, item) in items.iter_mut().enumerate() {
+        item.display_position = Some(idx + 1);
     }
-    let items = state.storage.merge_queue_service.get_queue_list().await?;
-    let response = QueueListResponse::from(items);
-    Ok(Json(CommonResult::success(Some(response))))
+    let total_count = items.len();
+    Ok(Json(CommonResult::success(Some(QueueListResponse {
+        items,
+        total_count,
+    }))))
 }
 
 /// Gets the status of a specific CL in the queue
@@ -170,77 +162,34 @@ async fn get_cl_queue_status(
     state: State<MonoApiServiceState>,
     Path(cl_link): Path<String>,
 ) -> Result<Json<CommonResult<QueueStatusResponse>>, ApiError> {
-    if state.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-        let rows = state
-            .storage
-            .push_queue_service
-            .storage()
-            .list_by_kind_and_operation(PushQueueKindEnum::Merge, &cl_link)
-            .await?;
-        let listed = state
-            .storage
-            .push_queue_service
-            .storage()
-            .list_merge_for_legacy_ui()
-            .await?;
-        let item_opt = rows
-            .first()
-            .map(QueueItem::from_push_queue)
-            .map(|mut item| {
-                if let Some(idx) = listed.iter().position(|r| r.id == item.position) {
-                    item.display_position = Some(idx + 1);
-                }
-                item
-            });
-        let in_queue = item_opt
-            .as_ref()
-            .is_some_and(|i| matches!(i.status, QueueStatus::Waiting | QueueStatus::Merging));
-        return Ok(Json(CommonResult::success(Some(QueueStatusResponse {
-            in_queue,
-            item: item_opt,
-        }))));
-    }
-    let item_model = state
+    let rows = state
         .storage
-        .merge_queue_service
-        .get_cl_queue_status(&cl_link)
+        .push_queue_service
+        .storage()
+        .list_by_kind_and_operation(PushQueueKindEnum::Merge, &cl_link)
         .await?;
-
-    let mut item_opt: Option<QueueItem> = item_model.map(|m| m.into());
-
-    if let Some(ref mut item) = item_opt {
-        match item.status {
-            QueueStatus::Waiting | QueueStatus::Testing | QueueStatus::Merging => {
-                let index_result = state
-                    .storage
-                    .merge_queue_service
-                    .get_display_position(&item.cl_link)
-                    .await;
-
-                match index_result {
-                    Ok(index) => {
-                        item.display_position = index;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to get display position for {}: {}",
-                            item.cl_link,
-                            e
-                        );
-                        item.display_position = None;
-                    }
-                }
+    let listed = state
+        .storage
+        .push_queue_service
+        .storage()
+        .list_merge_for_legacy_ui()
+        .await?;
+    let item_opt = rows
+        .first()
+        .map(QueueItem::from_push_queue)
+        .map(|mut item| {
+            if let Some(idx) = listed.iter().position(|r| r.id == item.position) {
+                item.display_position = Some(idx + 1);
             }
-            _ => {}
-        }
-    }
-
-    let response = QueueStatusResponse {
-        in_queue: item_opt.is_some(),
+            item
+        });
+    let in_queue = item_opt
+        .as_ref()
+        .is_some_and(|i| matches!(i.status, QueueStatus::Waiting | QueueStatus::Merging));
+    Ok(Json(CommonResult::success(Some(QueueStatusResponse {
+        in_queue,
         item: item_opt,
-    };
-
-    Ok(Json(CommonResult::success(Some(response))))
+    }))))
 }
 
 /// Retries a failed queue item
@@ -264,7 +213,6 @@ async fn retry_queue_item(
     OptionalSessionUser(requester): OptionalSessionUser,
     Path(cl_link): Path<String>,
 ) -> Result<Json<CommonResult<Value>>, ApiError> {
-    // Use MonoApiService to retry AND start the background processor
     match state
         .monorepo()
         .retry_merge_queue_item_as(&cl_link, requester.map(|user| user.username))
@@ -300,42 +248,37 @@ async fn retry_queue_item(
 async fn get_queue_stats(
     state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<QueueStatsResponse>>, ApiError> {
-    if state.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-        let pq = &state.storage.push_queue_service;
-        let waiting = pq
-            .storage()
-            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Queued)
+    let pq = &state.storage.push_queue_service;
+    let waiting = pq
+        .storage()
+        .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Queued)
+        .await? as usize;
+    let merging = pq
+        .storage()
+        .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Running)
+        .await? as usize;
+    let merged = pq
+        .storage()
+        .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Done)
+        .await? as usize;
+    let failed = pq
+        .storage()
+        .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Failed)
+        .await? as usize
+        + pq.storage()
+            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Cancelled)
             .await? as usize;
-        let merging = pq
-            .storage()
-            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Running)
-            .await? as usize;
-        let merged = pq
-            .storage()
-            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Done)
-            .await? as usize;
-        let failed = pq
-            .storage()
-            .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Failed)
-            .await? as usize
-            + pq.storage()
-                .count_by_kind_and_status(PushQueueKindEnum::Merge, PushQueueStatusEnum::Cancelled)
-                .await? as usize;
-        let stats = QueueStats {
-            total_items: waiting + merging + merged + failed,
-            waiting_count: waiting,
-            testing_count: 0,
-            merging_count: merging,
-            failed_count: failed,
-            merged_count: merged,
-        };
-        return Ok(Json(CommonResult::success(Some(QueueStatsResponse {
-            stats,
-        }))));
-    }
-    let stats = state.storage.merge_queue_service.get_queue_stats().await?;
-    let response = QueueStatsResponse::from(stats);
-    Ok(Json(CommonResult::success(Some(response))))
+    let stats = QueueStats {
+        total_items: waiting + merging + merged + failed,
+        waiting_count: waiting,
+        testing_count: 0,
+        merging_count: merging,
+        failed_count: failed,
+        merged_count: merged,
+    };
+    Ok(Json(CommonResult::success(Some(QueueStatsResponse {
+        stats,
+    }))))
 }
 
 /// Cancels all pending queue items
@@ -351,4 +294,177 @@ async fn cancel_all_pending(
     _state: State<MonoApiServiceState>,
 ) -> Result<Json<CommonResult<Value>>, ApiError> {
     Err(retired_gone("POST /merge-queue/cancel-all"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{str::FromStr, sync::Arc};
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header::CONTENT_TYPE},
+    };
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            commit::Commit,
+            tree::{Tree, TreeItem, TreeItemMode},
+        },
+    };
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use tower::ServiceExt;
+    use utoipa_axum::router::OpenApiRouter;
+
+    use crate::{
+        api::{
+            MonoApiServiceState,
+            oauth::{api_store::BrowserSessionStore, model::LoginUser},
+        },
+        bellatrix::Bellatrix,
+        callisto::{merge_queue, push_queue, sea_orm_active_enums::PushQueueKindEnum},
+        ceres::api_service::cache::GitObjectCache,
+        common::utils::MEGA_BRANCH_NAME,
+        contract::policy::entitystore::SharedEntityStore,
+        jupiter::storage::{Storage, base_storage::StorageConnector},
+    };
+
+    fn blob_item(name: &str, hex: &str) -> TreeItem {
+        TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(hex).unwrap(),
+            name.to_string(),
+        )
+    }
+
+    async fn seed_mergeable_cl(storage: &Storage, link: &str) {
+        let mono = storage.mono_storage();
+        let old_tree = Tree::from_tree_items(vec![blob_item(
+            ".gitkeep",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .expect("old tree");
+        let new_tree = Tree::from_tree_items(vec![blob_item(
+            "queued.txt",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )])
+        .expect("new tree");
+        let old_commit = Commit::from_tree_id(old_tree.id, vec![], "base");
+        let new_commit = Commit::from_tree_id(new_tree.id, vec![old_commit.id], "cl tip");
+        mono.save_mega_trees(
+            vec![old_tree.clone(), new_tree.clone()],
+            old_commit.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(vec![old_commit.clone(), new_commit.clone()], None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            crate::callisto::mega_refs::Model {
+                id: 1,
+                path: "/".to_string(),
+                ref_name: MEGA_BRANCH_NAME.to_string(),
+                ref_commit_hash: old_commit.id.to_string(),
+                ref_tree_hash: old_tree.id.to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+                is_cl: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_or_update_cl_ref(
+            "/",
+            &format!("refs/cl/{link}"),
+            &new_commit.id.to_string(),
+            &new_tree.id.to_string(),
+        )
+        .await
+        .unwrap();
+        storage
+            .cl_storage()
+            .new_cl_model(
+                "/",
+                link,
+                "queue add",
+                "main",
+                &old_commit.id.to_string(),
+                &new_commit.id.to_string(),
+                "gate-tester",
+            )
+            .await
+            .unwrap();
+    }
+
+    fn api_state(storage: Storage) -> MonoApiServiceState {
+        MonoApiServiceState {
+            session_store: BrowserSessionStore::Fixed(
+                crate::api::oauth::api_store::FixedUserSessionStore {
+                    user: LoginUser {
+                        username: "queue-requester".to_string(),
+                        ..Default::default()
+                    },
+                },
+            ),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "mw01-test".to_string(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_string(),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+            storage,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_add_uses_push_queue_not_merge_queue_table() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        seed_mergeable_cl(&storage, "MW01ADD").await;
+
+        let (router, _api) = OpenApiRouter::new()
+            .merge(super::routers())
+            .split_for_parts();
+        let response = router
+            .with_state(api_state(storage.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/merge-queue/add")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"cl_link":"MW01ADD"}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let pq_rows = push_queue::Entity::find()
+            .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Merge))
+            .filter(push_queue::Column::OperationId.eq("MW01ADD"))
+            .all(storage.cl_storage().get_connection())
+            .await
+            .expect("read push_queue");
+        assert!(
+            !pq_rows.is_empty(),
+            "default config POST /merge-queue/add must write push_queue"
+        );
+
+        let mq_rows = merge_queue::Entity::find()
+            .filter(merge_queue::Column::ClLink.eq("MW01ADD"))
+            .all(storage.cl_storage().get_connection())
+            .await
+            .expect("read merge_queue");
+        assert!(
+            mq_rows.is_empty(),
+            "default config POST /merge-queue/add must not write merge_queue"
+        );
+    }
 }

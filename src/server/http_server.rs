@@ -37,7 +37,7 @@ use crate::{
     },
     common::errors::{MegaError, MegaResult, ProtocolError},
     config::{
-        ArtifactGcConfig, BuckConfig, Config, MergeWriter, PushAuth, PushPolicy,
+        ArtifactGcConfig, BuckConfig, Config, PushAuth, PushPolicy,
         reload::{ConfigReloadReport, ConfigReloadSubscriber},
     },
     context::AppContext,
@@ -424,22 +424,6 @@ pub(crate) async fn ensure_authz_first_build(
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     crate::config::validate::require_oauth_for_http_service(ctx.storage.config().as_ref())?;
     warn_if_unauthenticated_push(ctx.storage.config().as_ref());
-
-    if ctx.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-        // Config-time validate cannot see the DB. Queue mode absorbs leftover
-        // non-terminal merge_queue rows here (Waiting/Testing → Queued,
-        // Merging → Failed interrupted) — the TP-07 rolling-deploy drain.
-        let report = ctx
-            .storage
-            .merge_queue_service
-            .prepare_for_queue_writer(ctx.storage.push_queue_service.storage())
-            .await?;
-        tracing::info!(
-            queued = report.queued,
-            failed_interrupted = report.failed_interrupted,
-            "merge_queue absorb into push_queue complete"
-        );
-    }
 
     // TP-15 / 4.1 ②③⑥: open CLs, last_policy vs non-terminal rows, watermark reset.
     ctx.storage.prepare_push_policy_startup().await?;

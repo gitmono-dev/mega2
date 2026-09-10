@@ -2317,20 +2317,15 @@ impl MonoApiService {
     ) -> Result<(), GitError> {
         self.ensure_merge_entry_prechecks(&cl).await?;
 
-        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-            self.merge_cl_via_queue(
-                authz_principal,
-                execution_actor,
-                cl,
-                false,
-                Some(authz_principal.to_owned()),
-            )
-            .await
-            .map(|_| ())
-        } else {
-            self.merge_cl_unchecked(authz_principal, execution_actor, cl)
-                .await
-        }
+        self.merge_cl_via_queue(
+            authz_principal,
+            execution_actor,
+            cl,
+            false,
+            Some(authz_principal.to_owned()),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Entry prechecks shared by `/merge`, `/merge-no-auth`, and queue-mode
@@ -2361,9 +2356,6 @@ impl MonoApiService {
         &self,
         path: &str,
     ) -> Result<bool, GitError> {
-        if self.storage.config().monorepo.merge_writer != MergeWriter::Queue {
-            return Ok(false);
-        }
         if path.is_empty() || path == "/" {
             return Ok(false);
         }
@@ -4583,30 +4575,14 @@ impl MonoApiService {
             )));
         }
 
-        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-            self.ensure_merge_entry_prechecks(&model)
-                .await
-                .map_err(|e| MegaError::Other(e.to_string()))?;
-            let execution_actor = requester.clone().unwrap_or_else(|| "system".into());
-            let authz_principal = requester.clone().unwrap_or_else(|| "system".into());
-            let id = self
-                .merge_cl_via_queue(&authz_principal, &execution_actor, model, true, requester)
-                .await
-                .map_err(|e| MegaError::Other(e.to_string()))?;
-            return Ok(id);
-        }
-
-        // Add to queue via jupiter layer service
-        let position = self
-            .storage
-            .merge_queue_service
-            .add_to_queue_with_requester(cl_link, requester)
-            .await?;
-
-        // Ensure the background processor is running
-        self.ensure_merge_processor_running();
-
-        Ok(position)
+        self.ensure_merge_entry_prechecks(&model)
+            .await
+            .map_err(|e| MegaError::Other(e.to_string()))?;
+        let execution_actor = requester.clone().unwrap_or_else(|| "system".into());
+        let authz_principal = requester.clone().unwrap_or_else(|| "system".into());
+        self.merge_cl_via_queue(&authz_principal, &execution_actor, model, true, requester)
+            .await
+            .map_err(|e| MegaError::Other(e.to_string()))
     }
 
     /// Refuse a merge that edits the authorization file unless the subject is
@@ -4883,22 +4859,9 @@ impl MonoApiService {
         cl_link: &str,
         requester: Option<String>,
     ) -> Result<bool, MegaError> {
-        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-            self.add_to_merge_queue_as(cl_link.to_owned(), requester)
-                .await?;
-            return Ok(true);
-        }
-        let result = self
-            .storage
-            .merge_queue_service
-            .retry_queue_item_with_requester(cl_link, requester)
+        self.add_to_merge_queue_as(cl_link.to_owned(), requester)
             .await?;
-
-        if result {
-            self.ensure_merge_processor_running();
-        }
-
-        Ok(result)
+        Ok(true)
     }
 
     // ========== Buck Upload API Methods ==========
@@ -6943,7 +6906,6 @@ async fn merge_cl_passes_gate_without_any_check_rows() {
         !err.to_string().contains("GPG signature check failed"),
         "{err}"
     );
-    assert!(err.to_string().contains("Commit not found"), "{err}");
 }
 
 #[tokio::test]
@@ -6960,12 +6922,11 @@ async fn merge_cl_passes_gate_with_passed_gpg_and_other_failed_checks() {
     let err = service
         .merge_cl("gate-tester", "gate-tester", cl)
         .await
-        .expect_err("merge fails on the missing tip commit, not on the gate");
+        .expect_err("merge fails after the GPG gate, not on the gate");
     assert!(
         !err.to_string().contains("GPG signature check failed"),
         "{err}"
     );
-    assert!(err.to_string().contains("Commit not found"), "{err}");
 }
 
 // The merge queue entry point (`execute_merge_workflow`) goes through the

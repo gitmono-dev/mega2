@@ -1,20 +1,27 @@
 //! UN-20: the merge-queue handlers capture the requesting subject.
 //!
-//! A queued merge is executed later by a background worker, so the subject that
-//! asked for it must be recorded with the queue row. The capture is *optional*:
+//! A queued merge is executed via MonoWriteQueue, so the subject that asked
+//! for it is recorded on the `push_queue` row. The capture is *optional*:
 //! `OptionalSessionUser` never rejects, so an anonymous enqueue stays possible
-//! and is stored as NULL — this adds no new rejection surface to the endpoint.
+//! — this adds no new rejection surface to the endpoint.
 //!
 //! These cases drive the real routers through axum so the extractor wiring
 //! itself is under test, not just the storage chain underneath it.
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use axum::{
     body::Body,
     http::{Request, StatusCode, header::CONTENT_TYPE},
 };
-use sea_orm::ConnectionTrait;
+use git_internal::{
+    hash::ObjectHash,
+    internal::object::{
+        commit::Commit,
+        tree::{Tree, TreeItem, TreeItemMode},
+    },
+};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tower::ServiceExt;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -28,7 +35,9 @@ use crate::{
         router::merge_queue_router,
     },
     bellatrix::Bellatrix,
+    callisto::{push_queue, sea_orm_active_enums::PushQueueKindEnum},
     ceres::api_service::cache::GitObjectCache,
+    common::utils::MEGA_BRANCH_NAME,
     contract::policy::entitystore::SharedEntityStore,
     jupiter::storage::{Storage, base_storage::StorageConnector},
 };
@@ -44,8 +53,7 @@ fn api_state(storage: Storage, session_store: BrowserSessionStore) -> MonoApiSer
     MonoApiServiceState {
         session_store,
         git_object_cache: Arc::new(GitObjectCache {
-            // Lazy: these cases never touch the cache, and a live Redis is not
-            // part of what they prove.
+            // Lazy: a live Redis is not part of what these cases prove.
             connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
                 ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
                 ::redis::aio::ConnectionManagerConfig::new(),
@@ -60,19 +68,73 @@ fn api_state(storage: Storage, session_store: BrowserSessionStore) -> MonoApiSer
     }
 }
 
-/// An open CL is the precondition for enqueuing; seed one directly so the case
-/// stays about the requester capture.
-async fn seed_open_cl(storage: &Storage, id: i64, cl_link: &str) {
+fn blob_item(name: &str, hex: &str) -> TreeItem {
+    TreeItem::new(
+        TreeItemMode::Blob,
+        ObjectHash::from_str(hex).unwrap(),
+        name.to_string(),
+    )
+}
+
+/// A mergeable Open CL so `/merge-queue/add` can land via MonoWriteQueue.
+async fn seed_mergeable_cl(storage: &Storage, link: &str) {
+    let mono = storage.mono_storage();
+    let old_tree = Tree::from_tree_items(vec![blob_item(
+        ".gitkeep",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )])
+    .expect("old tree");
+    let new_tree = Tree::from_tree_items(vec![blob_item(
+        "queued.txt",
+        "cccccccccccccccccccccccccccccccccccccccc",
+    )])
+    .expect("new tree");
+    let old_commit = Commit::from_tree_id(old_tree.id, vec![], "base");
+    let new_commit = Commit::from_tree_id(new_tree.id, vec![old_commit.id], "cl tip");
+    mono.save_mega_trees(
+        vec![old_tree.clone(), new_tree.clone()],
+        old_commit.id,
+        None,
+    )
+    .await
+    .expect("save trees");
+    mono.save_mega_commits(vec![old_commit.clone(), new_commit.clone()], None)
+        .await
+        .expect("save commits");
+    mono.save_refs(
+        crate::callisto::mega_refs::Model {
+            id: 1,
+            path: "/".to_string(),
+            ref_name: MEGA_BRANCH_NAME.to_string(),
+            ref_commit_hash: old_commit.id.to_string(),
+            ref_tree_hash: old_tree.id.to_string(),
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+            is_cl: false,
+        },
+        None,
+    )
+    .await
+    .expect("save main ref");
+    mono.save_or_update_cl_ref(
+        "/",
+        &format!("refs/cl/{link}"),
+        &new_commit.id.to_string(),
+        &new_tree.id.to_string(),
+    )
+    .await
+    .expect("save cl ref");
     storage
         .cl_storage()
-        .get_connection()
-        .execute_unprepared(&format!(
-            "INSERT INTO mega_cl \
-             (id, link, title, status, path, from_hash, to_hash, created_at, updated_at, \
-              username, base_branch) \
-             VALUES ({id}, '{cl_link}', 'un20', 'open', '/', 'from', 'to', now(), now(), \
-             'un20-author', 'main')"
-        ))
+        .new_cl_model(
+            "/",
+            link,
+            "un20",
+            "main",
+            &old_commit.id.to_string(),
+            &new_commit.id.to_string(),
+            "un20-author",
+        )
         .await
         .expect("seed open CL");
 }
@@ -113,11 +175,21 @@ async fn post_retry(state: MonoApiServiceState, cl_link: &str) -> StatusCode {
         .status()
 }
 
+async fn push_queue_merge_row(storage: &Storage, cl_link: &str) -> push_queue::Model {
+    push_queue::Entity::find()
+        .filter(push_queue::Column::Kind.eq(PushQueueKindEnum::Merge))
+        .filter(push_queue::Column::OperationId.eq(cl_link))
+        .one(storage.cl_storage().get_connection())
+        .await
+        .expect("read push_queue")
+        .expect("merge row must exist")
+}
+
 #[tokio::test]
 async fn un20_add_handler_records_the_session_subject() {
     let temp = tempfile::tempdir().expect("temp dir");
     let storage = crate::jupiter::tests::test_storage(temp.path()).await;
-    seed_open_cl(&storage, 980_001, "UN20ADD").await;
+    seed_mergeable_cl(&storage, "UN20ADD").await;
 
     let state = api_state(
         storage.clone(),
@@ -127,14 +199,11 @@ async fn un20_add_handler_records_the_session_subject() {
     );
     assert_eq!(post_add(state, "UN20ADD").await, StatusCode::OK);
 
+    let row = push_queue_merge_row(&storage, "UN20ADD").await;
     assert_eq!(
-        storage
-            .merge_queue_service
-            .get_queue_requester("UN20ADD")
-            .await
-            .expect("read requester"),
-        Some(Some("queue-requester".to_string())),
-        "the enqueue must record the session subject"
+        row.requester.as_deref(),
+        Some("queue-requester"),
+        "the enqueue must record the session subject on push_queue"
     );
 }
 
@@ -142,9 +211,8 @@ async fn un20_add_handler_records_the_session_subject() {
 async fn un20_add_handler_accepts_an_anonymous_request_and_records_null() {
     let temp = tempfile::tempdir().expect("temp dir");
     let storage = crate::jupiter::tests::test_storage(temp.path()).await;
-    seed_open_cl(&storage, 980_002, "UN20ANONADD").await;
+    seed_mergeable_cl(&storage, "UN20ANONADD").await;
 
-    // A store that reports "no session" — the anonymous path.
     let session_store = BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)]));
     let state = api_state(storage.clone(), session_store);
 
@@ -153,14 +221,21 @@ async fn un20_add_handler_accepts_an_anonymous_request_and_records_null() {
         StatusCode::OK,
         "an anonymous enqueue must still be served — the capture is optional"
     );
+    let row = push_queue_merge_row(&storage, "UN20ANONADD").await;
+    let payload_requester = row
+        .payload
+        .get("requester")
+        .and_then(|v| {
+            if v.is_null() {
+                Some(None)
+            } else {
+                v.as_str().map(|s| Some(s.to_string()))
+            }
+        })
+        .unwrap_or(Some("missing".into()));
     assert_eq!(
-        storage
-            .merge_queue_service
-            .get_queue_requester("UN20ANONADD")
-            .await
-            .expect("read requester"),
-        Some(None),
-        "an anonymous request is recorded as NULL, not as a made-up subject"
+        payload_requester, None,
+        "an anonymous request is recorded as NULL in the merge payload, not as a made-up subject"
     );
 }
 
@@ -168,22 +243,7 @@ async fn un20_add_handler_accepts_an_anonymous_request_and_records_null() {
 async fn un20_retry_handler_records_the_session_subject() {
     let temp = tempfile::tempdir().expect("temp dir");
     let storage = crate::jupiter::tests::test_storage(temp.path()).await;
-    seed_open_cl(&storage, 980_003, "UN20RETRYAPI").await;
-
-    // Enqueue anonymously, then fail the item so it becomes retryable.
-    storage
-        .merge_queue_service
-        .add_to_queue_with_requester("UN20RETRYAPI".to_string(), None)
-        .await
-        .expect("enqueue");
-    storage
-        .cl_storage()
-        .get_connection()
-        .execute_unprepared(
-            "UPDATE merge_queue SET status = 'failed' WHERE cl_link = 'UN20RETRYAPI'",
-        )
-        .await
-        .expect("mark failed");
+    seed_mergeable_cl(&storage, "UN20RETRYAPI").await;
 
     let state = api_state(
         storage.clone(),
@@ -193,13 +253,10 @@ async fn un20_retry_handler_records_the_session_subject() {
     );
     assert_eq!(post_retry(state, "UN20RETRYAPI").await, StatusCode::OK);
 
+    let row = push_queue_merge_row(&storage, "UN20RETRYAPI").await;
     assert_eq!(
-        storage
-            .merge_queue_service
-            .get_queue_requester("UN20RETRYAPI")
-            .await
-            .expect("read requester"),
-        Some(Some("retry-requester".to_string())),
-        "the retry must record who asked for it"
+        row.requester.as_deref(),
+        Some("retry-requester"),
+        "the retry must record who asked for it on push_queue"
     );
 }
