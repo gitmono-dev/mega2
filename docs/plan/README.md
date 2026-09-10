@@ -35,3 +35,4 @@
 | `plan-20260909.md` | 日期计划 | **已完成**（LF-01..LF-04；Claude+Codex 每卡双 PASS；Storage-only LFS：`push_auth=none` / `token`；supersede plan-20260905「trunk LFS 不可用」） |
 | `plan-20260908.md` | 日期计划 | **进行中**（SP-01..SP-05；SP-01/SP-02 已落地并 push；SP-04 cancelled→SP-01；SP-03 本卡索引；SP-05 待终态 release；Codex R18 PASS；每实现/release 卡 patch+1） |
 | `plan-20260910.md` | 日期计划 | **已完成**（MW-01..MW-06；CL merge 强制 MonoWriteQueue；删除 `merge_writer` / Legacy processor / `merge_queue` 表；无存量迁移） |
+| `plan-20260902.md` | 日期计划 | **新建**（storage-only OCI Distribution 容器镜像仓库：DR-01..DR-15；`[oci]` 配置门、4 表元数据、`oci` 对象命名空间、`/v2` 最小 push/pull 面 + tags/list、Basic 静态凭据流、两遍流式 complete；Codex R19 **PASS**；实现未开工） |
