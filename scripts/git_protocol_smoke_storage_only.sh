@@ -378,6 +378,43 @@ case_http_trunk_push_none() {
   fi
 }
 
+# Tag push must fail under push_auth=none; remote must not retain the tag.
+case_http_reject_git_client_tag_push_none() {
+  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP reject Git-client tag push (none)" >&2
+    return 1
+  fi
+  local repo_url src tag push_status=0
+  repo_url="$(trunk_http_repo_url)" || return 1
+  case "$repo_url" in
+    http://*@*) repo_url="http://${repo_url#*@}" ;;
+    https://*@*) repo_url="https://${repo_url#*@}" ;;
+  esac
+  src="$ROOT_DIR/http-reject-tag-none"
+  tag="monoengine-smoke-tag-none-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  rm -rf "$src"
+  git_case clone "$repo_url" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  printf 'monoengine git tag none smoke %s\n' "$tag" >"$src/smoke-tag-none.txt"
+  git -C "$src" add smoke-tag-none.txt || return 1
+  git -C "$src" commit -m "monoengine git tag none smoke" >/dev/null || return 1
+  git -C "$src" tag "$tag" || return 1
+  set +e
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag"
+  push_status=$?
+  set -e
+  if [[ "$push_status" -eq 0 ]]; then
+    echo "FAIL: none stack must reject Git-client tag push" >&2
+    git -C "$src" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if git_case ls-remote "$repo_url" "refs/tags/$tag" | rg -q .; then
+    echo "FAIL: rejected tag push must not leave refs/tags/$tag on remote" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -393,10 +430,12 @@ if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP trunk push" case_http_trunk_push
   run_case "HTTP reject Git-client tag push" case_http_reject_git_client_tag_push
   run_case "HTTP trunk push (none)" case_http_trunk_push_none
+  run_case "HTTP reject Git-client tag push (none)" case_http_reject_git_client_tag_push_none
 elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "HTTP trunk push" ||
   "$CASE_FILTER" == "HTTP reject Git-client tag push" ||
-  "$CASE_FILTER" == "HTTP trunk push (none)"
+  "$CASE_FILTER" == "HTTP trunk push (none)" ||
+  "$CASE_FILTER" == "HTTP reject Git-client tag push (none)"
 ) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
