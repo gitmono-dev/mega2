@@ -26,7 +26,7 @@ async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["macros", "json", "ws"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 base64 = "0.23.1"
-blake3 = "1.8"
+blake3 = "1.8.7"
 bs58 = "0.5.1"
 bytes = "1.12.1"
 cedar-policy = "4.12.0"
@@ -38,15 +38,15 @@ directories = "6.0.0"
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
 envsubst = "0.2.1"
 futures = "0.3.34"
-git-internal = "0.8.7"
+git-internal = "0.9.0"
 hex = "0.4.3"
-hmac = "0.13"
+hmac = "0.13.0"
 http = "1.5.0"
 idgenerator = "2.0.0"
-indexmap = "2.14"
+indexmap = "2.14.2"
 itertools = "0.15.0"
 lazy_static = "1.5.0"
-libc = "0.2"
+libc = "0.2.189"
 libvault = { version = "0.3.0", features = ["storage_pg", "crypto_adaptor_openssl"] }
 log = "0.4.34"
 once_cell = "1.21.4"
@@ -55,37 +55,38 @@ once_cell = "1.21.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 openssl = "0.10.81"
 parse-display = "0.11.0"
-percent-encoding = "2.3"
+percent-encoding = "2.3.2"
 pgp = "0.20.0"
 rand = { version = "0.10.2", features = ["thread_rng"] }
+# pgp / ed25519 signing helpers still need the rand 0.8 API surface.
 rand08 = { package = "rand", version = "0.8.7" }
-redis = { version = "1.6.0", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
+redis = { version = "1.7.0", features = ["aio", "tokio-rustls-comp", "connection-manager"] }
 regex = "1.13.1"
-reqwest = { version = "0.13.4", features = ["json", "stream", "blocking"] }
-ring = "0.17"
+reqwest = { version = "0.13.5", features = ["json", "stream", "blocking"] }
+ring = "0.17.14"
 rkyv = "0.8.18"
 rsa = "0.9.10"
-russh = "0.63.1"
-rustls = "0.23"
+russh = "0.63.3"
+rustls = "0.23.44"
 sea-orm = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "debug-print"] }
 sea-orm-migration = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
-secp256k1 = { version = "0.31.1", features = ["serde", "rand", "hashes"] }
+secp256k1 = { version = "0.33.1", features = ["serde", "rand"] }
 serde = { version = "1.0.229", features = ["derive", "rc", "alloc"] }
 serde_json = "1.0.151"
-serde_urlencoded = "0.7"
-sha1 = "0.11"
-sha2 = "0.11"
-smallvec = "1.15.2"
+serde_urlencoded = "0.7.1"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+smallvec = "1.16.0"
 sysinfo = "0.39.6"
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["serde"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = "0.1.19"
 tokio-util = "0.7.19"
-toml = "1.1.4"
+toml = "1.1.5"
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["cors", "trace", "decompression-full"] }
-tower-sessions = { version = "0.15", features = ["memory-store"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace", "decompression-full"] }
+tower-sessions = { version = "0.15.0", features = ["memory-store"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
@@ -93,7 +94,7 @@ url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["chrono", "axum_extras"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
-uuid = { version = "1.25.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 
 # Global allocators (jemalloc / mimalloc) are a binary concern and live in
 # `src/main.rs`; the library crate does not depend on them.
@@ -105,9 +106,9 @@ jemallocator = "0.5.4"
 mimalloc = "0.1.52"
 
 [dev-dependencies]
-libc = "0.2"
+libc = "0.2.189"
 redis-test = { version = "1.0.4", features = ["aio"] }
-reqwest = { version = "0.13.4", features = ["json", "blocking"] }
+reqwest = { version = "0.13.5", features = ["json", "blocking"] }
 sea-orm = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"

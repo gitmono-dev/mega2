@@ -86,9 +86,9 @@
 | `object_format` | 空 Monorepo 初始 object graph 的 ID 格式：`sha1`（默认）或 `sha256`；不会转换既有仓库 |
 | `rename.*` | diff 重命名检测参数（非初始化布局字段） |
 
-样例见 `config/config.toml`；生成模板见 `src/config/template.rs`。校验：`monorepo.import_dir` / `root_dirs` / `admin` 非空，且 `object_format=blake3` 在当前 `git-internal` 0.8.x build 中 fail-closed（`src/config/validate.rs`）。上述字段变更通常要求进程重启（`reload` 的 `restart_required_fields`）。
+样例见 `config/config.toml`；生成模板见 `src/config/template.rs`。校验：`monorepo.import_dir` / `root_dirs` / `admin` 非空，且 `object_format=blake3` 仍 fail-closed（`src/config/validate.rs`；启用需单独计划的 repository hash context）。上述字段变更通常要求进程重启（`reload` 的 `restart_required_fields`）。
 
-`object_format` 只控制 `init_monorepo` 的同步初始物件建构。`sha256` 会产生 64 位 initial commit/tree/blob ID；当前 Ceres v1/v2、zero ID 和 pack/runtime context 仍是 SHA-1-only，因此它不是可对外 clone/fetch/push 的完整 SHA-256 仓库格式。`blake3`（正确拼写；不是 `black3`）保留为配置接口，待 `git-internal` 0.9.0 的显式 repository hash context 与下游协议接入完成后再启用。
+`object_format` 只控制 `init_monorepo` 的同步初始物件建构。`sha256` 会产生 64 位 initial commit/tree/blob ID；当前 Ceres v1/v2、zero ID 和 pack/runtime context 仍是 SHA-1-only，因此它不是可对外 clone/fetch/push 的完整 SHA-256 仓库格式。`blake3`（正确拼写；不是 `black3`）保留为配置接口，待显式 repository hash context 与下游协议接入完成后再启用（与 `git-internal` 版本解耦，单独计划）。
 
 只能在受控的 `monoengine --config <path> service init --yes` invocation 使用
 `sha256`，不能以这个设置启动一般 Git 服务；该命令完成初始图建构后即退出，不启动

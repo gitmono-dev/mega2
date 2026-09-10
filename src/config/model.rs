@@ -130,7 +130,7 @@ impl MonoObjectFormat {
             Self::Sha1 => Ok(HashKind::Sha1),
             Self::Sha256 => Ok(HashKind::Sha256),
             Self::Blake3 => Err(MegaError::Other(
-                "monorepo.object_format=blake3 is reserved until git-internal 0.9.0 provides BLAKE3 object IDs".to_string(),
+                "monorepo.object_format=blake3 is reserved until an explicit repository hash context is wired for normal Git services".to_string(),
             )),
         }
     }

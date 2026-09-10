@@ -1,4 +1,6 @@
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use std::str::FromStr;
+
+use secp256k1::{PublicKey, SecretKey};
 use serde_json::{Map, Value};
 use tracing::log;
 
@@ -19,10 +21,9 @@ const NOSTR_IDENTITY_KEY: &str = "nostr_identity_key";
 /// - The Nostr ID as a `String`
 /// - A tuple of `(SecretKey, PublicKey)`
 pub fn generate_nostr_id() -> (String, (SecretKey, PublicKey)) {
-    let secp = Secp256k1::new();
     let mut rng = secp256k1::rand::rng();
     let secret_key = SecretKey::new(&mut rng);
-    let public_key = secret_key.public_key(&secp);
+    let public_key = secret_key.public_key();
     let nostr = bs58::encode(public_key.serialize()).into_string();
 
     (nostr, (secret_key, public_key))
@@ -79,8 +80,7 @@ impl VaultCore {
     /// Initialize the Nostr ID and return it along with the secret key.
     pub async fn load_nostr_secp_pair(&self) -> Result<secp256k1::Keypair, MegaError> {
         let (_, sk) = self.load_nostr_pair().await?;
-        let secp = secp256k1::Secp256k1::new();
-        secp256k1::Keypair::from_seckey_str(&secp, &sk).map_err(|e| {
+        secp256k1::Keypair::from_str(&sk).map_err(|e| {
             MegaError::Other(format!(
                 "Vault secret {NOSTR_IDENTITY_KEY} contains an invalid secret_key: {e}"
             ))
@@ -90,7 +90,7 @@ impl VaultCore {
 
 #[cfg(test)]
 mod tests {
-    use secp256k1::Message;
+    use secp256k1::{Message, ecdsa};
 
     use super::*;
 
@@ -111,10 +111,8 @@ mod tests {
         let nostr_decode = bs58::decode(&nostr).into_vec().unwrap();
         assert_eq!(nostr_decode, public_key.serialize().to_vec());
         assert_eq!(PublicKey::from_slice(&nostr_decode).unwrap(), public_key);
-        // verify
-        let secp = Secp256k1::new();
         let message = Message::from_digest([0xab; 32]);
-        let sig = secp.sign_ecdsa(message, &secret_key);
-        assert_eq!(secp.verify_ecdsa(message, &sig, &public_key), Ok(()));
+        let sig = ecdsa::sign(message, &secret_key);
+        assert_eq!(ecdsa::verify(&sig, message, &public_key), Ok(()));
     }
 }

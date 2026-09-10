@@ -2294,7 +2294,7 @@ mod tests {
 
         let err = config
             .validate()
-            .expect_err("BLAKE3 object IDs are not available in git-internal 0.8.x");
+            .expect_err("BLAKE3 object IDs remain reserved until repository hash context is wired");
         let message = err.to_string();
         assert!(message.contains("monorepo.object_format"));
         assert!(message.contains("reserved"));

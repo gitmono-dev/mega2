@@ -12,7 +12,20 @@
 use std::{fs, path::Path};
 
 pub fn write_full_config(path: &Path) {
-    fs::write(path, include_str!("../../config/config.toml")).expect("write full config");
+    // Product sample defaults to `admin = ["mega2"]` (local convenience), but
+    // the git/SSH/LFS IT harness and seeded cedar fixtures still use the
+    // stable `benjamin_747` principal. Keep IT configs aligned with those
+    // fixtures without rewriting every case.
+    let text = include_str!("../../config/config.toml").replacen(
+        r#"admin = ["mega2"]"#,
+        r#"admin = ["benjamin_747"]"#,
+        1,
+    );
+    assert!(
+        text.contains(r#"admin = ["benjamin_747"]"#),
+        "IT config rewrite expected admin = [\"mega2\"] in config/config.toml"
+    );
+    fs::write(path, text).expect("write full config");
 }
 
 /// Write the repo default config into `case_dir/config.toml` (ADR-GM-05 layout).
@@ -40,7 +53,16 @@ pub fn write_full_config_with_append(path: &Path, append: &str) {
         write_full_config(path);
         return;
     }
-    let mut body = include_str!("../../config/config.toml").to_string();
+    // Keep the IT admin rewrite in sync with `write_full_config`.
+    let mut body = include_str!("../../config/config.toml").replacen(
+        r#"admin = ["mega2"]"#,
+        r#"admin = ["benjamin_747"]"#,
+        1,
+    );
+    assert!(
+        body.contains(r#"admin = ["benjamin_747"]"#),
+        "IT config rewrite expected admin = [\"mega2\"] in config/config.toml"
+    );
     if !body.ends_with('\n') {
         body.push('\n');
     }
