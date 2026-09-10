@@ -62,17 +62,14 @@ use git_internal::{
     },
 };
 use regex::Regex;
-use sea_orm::{DatabaseTransaction, TransactionTrait};
+use sea_orm::DatabaseTransaction;
 use tracing::debug;
 
 use crate::{
     bellatrix::Bellatrix,
     callisto::{
         mega_blob, mega_cl, mega_refs, mega_tag, mega_tree,
-        sea_orm_active_enums::{
-            CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, PushQueueKindEnum, QueueFailureTypeEnum,
-            QueueStatusEnum,
-        },
+        sea_orm_active_enums::{CheckTypeEnum, ConvTypeEnum, MergeStatusEnum, PushQueueKindEnum},
     },
     ceres::{
         api_service::{
@@ -100,7 +97,6 @@ use crate::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
-    config::MergeWriter,
     contract::{
         api::common::Pagination,
         policy::{
@@ -2512,8 +2508,8 @@ impl MonoApiService {
     /// MC-02 minimal merge gate (the full `ensure_cl_mergeable` below stays
     /// disabled): a CL with a FAILED GPG signature check cannot be merged.
     /// CLs without any check rows (never checked) are not blocked. Every
-    /// merge entry point — `merge_cl` and the merge queue's
-    /// `execute_merge_workflow` — must call this before `merge_cl_unchecked`.
+    /// merge entry point — `merge_cl` and `/merge-queue/add` — must call this
+    /// before enqueueing.
     pub(crate) async fn ensure_gpg_check_passed(&self, link: &str) -> Result<(), GitError> {
         let gpg_failed = self
             .storage
@@ -2959,81 +2955,6 @@ impl MonoApiService {
         Ok(updated_tree)
     }
 
-    /// Merges a CL without checking for conflicts.
-    /// Caller is responsible for ensuring no conflicts exist before calling this method.
-    /// Path/root writes and descendant continuation share one transaction (2.7).
-    async fn merge_cl_unchecked(
-        &self,
-        authz_principal: &str,
-        execution_actor: &str,
-        cl: mega_cl::Model,
-    ) -> Result<(), GitError> {
-        // UN-19: every merge entry point funnels through here, so the ACL-change
-        // check lives here too — one decision for merge, merge-no-auth and the
-        // queue alike.
-        self.enforce_acl_change_authorization(&cl.link, authz_principal)
-            .await?;
-        let storage = self.storage.mono_storage();
-
-        let commit_model = storage
-            .get_commit_by_hash(&cl.to_hash)
-            .await
-            .map_err(|e| GitError::CustomError(format!("Failed to get commit: {}", e)))?
-            .ok_or_else(|| GitError::CustomError(format!("Commit not found: {}", cl.to_hash)))?;
-        let commit: Commit = Commit::from_mega_model(commit_model);
-
-        let normalized_path = MonoServiceLogic::clean_path_str(&cl.path);
-        let (path, update_chain) = if normalized_path == "/" {
-            (PathBuf::from("/"), Vec::new())
-        } else {
-            let path = PathBuf::from(&normalized_path);
-            let parent = path.parent().ok_or_else(|| {
-                GitError::CustomError(format!("Invalid CL path: {}", normalized_path))
-            })?;
-            let update_chain = self.search_tree_for_update(parent).await?;
-            (path, update_chain)
-        };
-        let result = MonoServiceLogic::build_result_by_chain(path, update_chain, commit.tree_id)?;
-        let old_main_tree_hash = storage.get_main_ref("/").await?.map(|r| r.ref_tree_hash);
-
-        let conn = storage.get_connection();
-        let txn = conn
-            .begin()
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let new_commit_id = match self
-            .merge_apply_and_advance_in_txn(&txn, &result, &normalized_path, &cl.link)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = txn.rollback().await;
-                return Err(e);
-            }
-        };
-        txn.commit()
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        self.notify_authz_after_main_write(&new_commit_id, old_main_tree_hash.as_deref())
-            .await?;
-        // add conversation
-        self.storage
-            .conversation_storage()
-            .add_conversation(&cl.link, execution_actor, None, ConvTypeEnum::Merged)
-            .await
-            .map_err(|e| GitError::CustomError(format!("Failed to add conversation: {}", e)))?;
-        // update cl status last
-        self.storage
-            .cl_storage()
-            .merge_cl(cl.clone())
-            .await
-            .map_err(|e| GitError::CustomError(format!("Failed to update CL status: {}", e)))?;
-
-        self.maybe_invalidate_admin_cache(&cl.link).await;
-
-        Ok(())
-    }
-
     pub(crate) async fn maybe_invalidate_admin_cache(&self, cl_link: &str) {
         if let Ok(files) = self.get_sorted_changed_file_list(cl_link, None).await {
             let admin_file_modified = files.iter().any(|file| {
@@ -3195,44 +3116,6 @@ impl MonoApiService {
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
 
-        Ok(new_commit_id)
-    }
-
-    async fn merge_apply_and_advance_in_txn(
-        &self,
-        txn: &DatabaseTransaction,
-        result: &TreeUpdateResult,
-        normalized_path: &str,
-        cl_link: &str,
-    ) -> Result<String, GitError> {
-        let storage = self.storage.mono_storage();
-        let old_tree = storage
-            .get_main_ref_in_txn(normalized_path, txn)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .map(|r| r.ref_tree_hash);
-        let new_commit_id = self
-            .apply_update_result_in_open_txn(
-                txn,
-                result,
-                "cl merge generated commit",
-                Some(cl_link),
-            )
-            .await?;
-        let new_tree = storage
-            .get_main_ref_in_txn(normalized_path, txn)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?
-            .map(|r| r.ref_tree_hash)
-            .ok_or_else(|| {
-                GitError::CustomError(format!("Main ref missing after merge at {normalized_path}"))
-            })?;
-        storage
-            .advance_descendant_refs(normalized_path, &new_tree, old_tree.as_deref(), txn)
-            .await
-            .map_err(|e| {
-                GitError::CustomError(format!("Failed to advance descendant refs: {e}"))
-            })?;
         Ok(new_commit_id)
     }
 
@@ -4536,29 +4419,8 @@ impl MonoApiService {
 
     // ========== Merge Queue Methods ==========
 
-    /// Queue polling interval in seconds when no items are processed
-    const QUEUE_POLL_INTERVAL_SECS: u64 = 5;
-
-    /// Error backoff interval in seconds after processing failure
-    const ERROR_BACKOFF_SECS: u64 = 30;
-
-    /// Adds a CL to the merge queue and ensures the background processor is running.
-    ///
-    /// This method validates the CL status before adding to queue and automatically
-    /// starts the background processor if not already running.
-    ///
-    /// # Arguments
-    /// * `cl_link` - The unique identifier of the CL to add to queue
-    ///
-    /// # Returns
-    /// * `Ok(i64)` - The position in queue on success
-    /// * `Err(MegaError)` - If validation fails or database error occurs
-    pub async fn add_to_merge_queue(&self, cl_link: String) -> Result<i64, MegaError> {
-        self.add_to_merge_queue_as(cl_link, None).await
-    }
-
-    /// Same as [`add_to_merge_queue`], recording the subject that requested the
-    /// merge (UN-20). `None` = anonymous.
+    /// Enqueue a CL merge via MonoWriteQueue, recording the subject that requested
+    /// the merge (UN-20). `None` = anonymous.
     pub async fn add_to_merge_queue_as(
         &self,
         cl_link: String,
@@ -4828,31 +4690,7 @@ impl MonoApiService {
         Ok(frozen)
     }
 
-    /// Retries a failed merge queue item and ensures the processor is running.
-    ///
-    /// # Arguments
-    /// * `cl_link` - The unique identifier of the CL to retry
-    ///
-    /// # Returns
-    /// * `Ok(true)` - If retry was successful
-    /// * `Ok(false)` - If item not found or cannot be retried
-    /// * `Err(MegaError)` - If database error occurs
-    pub async fn retry_merge_queue_item(&self, cl_link: &str) -> Result<bool, MegaError> {
-        let result = self
-            .storage
-            .merge_queue_service
-            .retry_queue_item(cl_link)
-            .await?;
-
-        if result {
-            // Ensure the background processor is running
-            self.ensure_merge_processor_running();
-        }
-
-        Ok(result)
-    }
-
-    /// Same as [`retry_merge_queue_item`], recording the subject that requested
+    /// Retry a CL merge via MonoWriteQueue, recording the subject that requested
     /// the retry (UN-20). `None` = anonymous.
     pub async fn retry_merge_queue_item_as(
         &self,
@@ -5165,340 +5003,6 @@ impl MonoApiService {
         self.trigger_build_for_buck_upload(&response, username);
 
         Ok(response)
-    }
-
-    /// Ensures the background merge processor is running.
-    ///
-    /// Uses atomic flag to guarantee only one processor task runs at a time.
-    /// The processor automatically stops when no active items remain in queue.
-    fn ensure_merge_processor_running(&self) {
-        if self.storage.config().monorepo.merge_writer == MergeWriter::Queue {
-            return;
-        }
-        // Get the processor running flag from merge queue service
-        if self.storage.merge_queue_service.try_start_processor() {
-            let service = self.clone();
-            tokio::spawn(async move {
-                tracing::info!("Merge queue processor started (from MonoApiService)");
-                service.run_merge_processor_loop().await;
-            });
-        }
-    }
-
-    /// Main loop for the background merge processor.
-    ///
-    /// Continuously processes queue items until no active items remain.
-    async fn run_merge_processor_loop(&self) {
-        loop {
-            if self.storage.config().monorepo.merge_writer == MergeWriter::Queue
-                || !self.storage.merge_queue_service.is_processor_running()
-            {
-                self.storage.merge_queue_service.stop_processor();
-                tracing::info!("Merge queue processor stopped (queue writer or stop flag)");
-                break;
-            }
-            match self.process_next_queue_item().await {
-                Ok(processed) => {
-                    if !processed {
-                        // Check if there are active items
-                        if let Ok(stats) = self.storage.merge_queue_service.get_queue_stats().await
-                        {
-                            let has_active = stats.waiting_count > 0
-                                || stats.testing_count > 0
-                                || stats.merging_count > 0;
-
-                            if !has_active {
-                                // No active items, stop processor
-                                self.storage.merge_queue_service.stop_processor();
-                                tracing::info!("Merge queue processor stopped (no active items)");
-                                break;
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(Self::QUEUE_POLL_INTERVAL_SECS))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Merge queue processor error: {}", e);
-                    tokio::time::sleep(Duration::from_secs(Self::ERROR_BACKOFF_SECS)).await;
-                }
-            }
-        }
-    }
-
-    /// Processes the next item in the merge queue.
-    ///
-    /// # Returns
-    /// * `Ok(true)` - An item was processed (success or failure)
-    /// * `Ok(false)` - No items to process
-    /// * `Err(MegaError)` - System error occurred
-    async fn process_next_queue_item(&self) -> Result<bool, MegaError> {
-        let queue_service = &self.storage.merge_queue_service;
-
-        // Get next waiting item from queue
-        let next_item = queue_service.get_next_waiting_item().await?;
-
-        if let Some(item) = next_item {
-            let cl_link = item.cl_link.clone();
-
-            // Update status to Testing
-            let updated = queue_service
-                .update_item_status(&cl_link, QueueStatusEnum::Testing)
-                .await?;
-
-            // Item was cancelled before we could start processing
-            if !updated {
-                return Ok(false);
-            }
-
-            // Execute the merge workflow
-            match self.execute_merge_workflow(&cl_link).await {
-                Ok(()) => {
-                    // Success - status already updated to Merged in workflow
-                    Ok(true)
-                }
-                Err((failure_type, message)) => {
-                    if matches!(failure_type, QueueFailureTypeEnum::Conflict) {
-                        // Conflict - move to tail of queue for retry
-                        if let Err(e) = queue_service.move_item_to_tail(&cl_link).await {
-                            tracing::warn!(
-                                "Failed to move conflicting item {} to tail: {}",
-                                cl_link,
-                                e
-                            );
-                        }
-                        Ok(false)
-                    } else {
-                        // Other failure - mark as failed
-                        if let Err(e) = queue_service
-                            .update_item_status_with_error(&cl_link, failure_type, message)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to update item {} status to failed: {}",
-                                cl_link,
-                                e
-                            );
-                        }
-                        Ok(true)
-                    }
-                }
-            }
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Executes the complete merge workflow for a CL.
-    ///
-    /// Workflow steps:
-    /// 1. Validate CL exists and is in valid status
-    /// 2. Run tests (TODO: Buck2 integration)
-    /// 3. Check for conflicts
-    /// 4. Execute merge
-    /// 5. Update statuses
-    async fn execute_merge_workflow(
-        &self,
-        cl_link: &str,
-    ) -> Result<(), (QueueFailureTypeEnum, String)> {
-        let queue_service = &self.storage.merge_queue_service;
-
-        // Step 1: Validate CL still exists and is not closed
-        let cl = self
-            .storage
-            .cl_storage()
-            .get_cl(cl_link)
-            .await
-            .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::SystemError,
-                    format!("Failed to fetch CL: {}", e),
-                )
-            })?;
-
-        let cl_model = match cl {
-            Some(model) => {
-                if model.status == MergeStatusEnum::Closed {
-                    return Err((
-                        QueueFailureTypeEnum::SystemError,
-                        "CL has been closed, cannot merge".to_string(),
-                    ));
-                }
-                if model.status == MergeStatusEnum::Draft {
-                    return Err((
-                        QueueFailureTypeEnum::SystemError,
-                        "CL is in draft status, cannot merge".to_string(),
-                    ));
-                }
-                model
-            }
-            None => {
-                return Err((
-                    QueueFailureTypeEnum::SystemError,
-                    "CL no longer exists, cannot merge".to_string(),
-                ));
-            }
-        };
-
-        // Step 2: Run tests (TODO: Buck2 integration)
-        // self.run_tests(&cl_model).await?;
-
-        // Step 3: Check for conflicts
-        self.check_merge_conflicts(&cl_model).await?;
-
-        // Step 4: Update status to Merging
-        let updated = queue_service
-            .update_item_status(cl_link, QueueStatusEnum::Merging)
-            .await
-            .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::SystemError,
-                    format!("Failed to update status to merging: {}", e),
-                )
-            })?;
-
-        if !updated {
-            return Err((
-                QueueFailureTypeEnum::SystemError,
-                "Item was cancelled".to_string(),
-            ));
-        }
-
-        // Step 5: decide the execution subject (UN-17), then merge.
-        //
-        // The merge runs long after the request that queued it, so the subject
-        // that asked for it is re-checked here rather than trusted from queue
-        // time. The worker remains the execution actor; the requester is the
-        // authorization principal (ADR-UN-06 ④).
-        let requester = self
-            .storage
-            .merge_queue_service
-            .get_queue_requester(cl_link)
-            .await
-            .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::SystemError,
-                    format!("Failed to read queue requester: {}", e),
-                )
-            })?
-            .flatten();
-        let enforcement = Enforcement::parse(&self.storage.config().cedar.enforcement)
-            .unwrap_or(Enforcement::Off);
-        let snapshot = self.storage.entity_store().snapshot();
-        let authz_principal =
-            match decide_queue_execution(enforcement, snapshot.as_deref(), requester.as_deref()) {
-                QueueExecutionDecision::Execute { authz_principal } => authz_principal,
-                QueueExecutionDecision::Freeze { reason } => {
-                    // Freeze through the UN-25 helper so the stored message,
-                    // the preserved requester and the alert all match the
-                    // contract; the caller's own failure write then finds the
-                    // item already failed and leaves this diagnosis intact.
-                    if let Err(e) = self
-                        .freeze_merge_queue_item_for_authz(cl_link, &reason)
-                        .await
-                    {
-                        tracing::error!(
-                            cl_link = %cl_link,
-                            error = %e,
-                            "failed to freeze queue item after an authorization refusal"
-                        );
-                    }
-                    return Err((
-                        QueueFailureTypeEnum::SystemError,
-                        format!("merge frozen: {reason}"),
-                    ));
-                }
-            };
-
-        // UN-19 + UN-25: the funnel below runs the ACL-change check too, but
-        // the queue needs to freeze (with its requester preserved) rather than
-        // just fail, so it asks first.
-        if let Err(error) = self
-            .enforce_acl_change_authorization(cl_link, &authz_principal)
-            .await
-        {
-            let message = error.to_string();
-            // Only an undecidable check freezes; a refusal is a decision and
-            // records as an ordinary failure.
-            if message.contains("[code:503]")
-                && let Err(e) = self
-                    .freeze_merge_queue_item_for_authz(cl_link, &message)
-                    .await
-            {
-                tracing::error!(
-                    cl_link = %cl_link,
-                    error = %e,
-                    "failed to freeze queue item after an undecidable ACL change"
-                );
-            }
-            return Err((QueueFailureTypeEnum::SystemError, message));
-        }
-
-        // MC-02: the queue path enforces the same minimal GPG merge gate as
-        // `merge_cl`. A refusal here is a decision, so it records as an
-        // ordinary merge failure — only undecidable checks freeze (above).
-        if let Err(error) = self.ensure_gpg_check_passed(cl_link).await {
-            return Err((QueueFailureTypeEnum::MergeFailure, error.to_string()));
-        }
-
-        self.merge_cl_unchecked(&authz_principal, "system", cl_model.clone())
-            .await
-            .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::MergeFailure,
-                    format!("Merge failed: {}", e),
-                )
-            })?;
-
-        // Step 6: Update queue status to Merged
-        queue_service
-            .update_item_status(cl_link, QueueStatusEnum::Merged)
-            .await
-            .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::SystemError,
-                    format!("Failed to update status to merged: {}", e),
-                )
-            })?;
-
-        Ok(())
-    }
-
-    /// Checks for merge conflicts by comparing CL base hash with current main ref.
-    ///
-    /// A conflict occurs when the CL's from_hash differs from the current
-    /// main branch ref, indicating the base has changed since CL creation.
-    async fn check_merge_conflicts(
-        &self,
-        cl: &mega_cl::Model,
-    ) -> Result<(), (QueueFailureTypeEnum, String)> {
-        let storage = self.storage.mono_storage();
-
-        let refs = storage
-            .get_main_ref(&cl.path)
-            .await
-            .map_err(|e| {
-                (
-                    QueueFailureTypeEnum::SystemError,
-                    format!("Failed to get main ref: {}", e),
-                )
-            })?
-            .ok_or((
-                QueueFailureTypeEnum::SystemError,
-                "Main ref not found".to_string(),
-            ))?;
-
-        if cl.from_hash != refs.ref_commit_hash {
-            return Err((
-                QueueFailureTypeEnum::Conflict,
-                format!(
-                    "Conflict detected: CL base hash {} differs from current main ref {}",
-                    cl.from_hash, refs.ref_commit_hash
-                ),
-            ));
-        }
-
-        Ok(())
     }
 }
 
@@ -6927,71 +6431,6 @@ async fn merge_cl_passes_gate_with_passed_gpg_and_other_failed_checks() {
         !err.to_string().contains("GPG signature check failed"),
         "{err}"
     );
-}
-
-// The merge queue entry point (`execute_merge_workflow`) goes through the
-// same gate; these tests pin that wiring (MC-02 R1 P0).
-
-#[cfg(test)]
-async fn gate_test_queued_service(link: &str) -> (tempfile::TempDir, Storage, MonoApiService) {
-    use sea_orm::{ActiveModelTrait, IntoActiveModel};
-
-    let (temp, storage, service) = gate_test_service().await;
-    // CL row: Open, from_hash matches the main ref so the queue workflow's
-    // conflict check passes and the run reaches the GPG gate.
-    let cl = gate_test_cl(
-        link,
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    );
-    cl.into_active_model()
-        .insert(storage.mono_storage().get_connection())
-        .await
-        .expect("insert CL row");
-    storage
-        .merge_queue_service
-        .add_to_queue_with_requester(link.to_string(), Some("gate-tester".to_string()))
-        .await
-        .expect("enqueue CL");
-    (temp, storage, service)
-}
-
-#[tokio::test]
-async fn execute_merge_workflow_rejects_cl_with_failed_gpg_signature_check() {
-    let (_temp, storage, service) = gate_test_queued_service("GPGQFAIL").await;
-    insert_check_result(&storage, "GPGQFAIL", CheckTypeEnum::GpgSignature, "FAILED").await;
-
-    let (failure_type, message) = service
-        .execute_merge_workflow("GPGQFAIL")
-        .await
-        .expect_err("a FAILED GPG signature check must block the queued merge");
-    assert!(
-        matches!(failure_type, QueueFailureTypeEnum::MergeFailure),
-        "a gate refusal is a decision, recorded as MergeFailure (no freeze): {failure_type:?}"
-    );
-    assert!(message.contains("GPG signature check failed"), "{message}");
-    assert!(message.contains("GPGQFAIL"), "{message}");
-}
-
-#[tokio::test]
-async fn execute_merge_workflow_passes_gate_without_failed_gpg_check() {
-    let (_temp, storage, service) = gate_test_queued_service("GPGQPASS").await;
-    insert_check_result(&storage, "GPGQPASS", CheckTypeEnum::GpgSignature, "PASSED").await;
-    insert_check_result(&storage, "GPGQPASS", CheckTypeEnum::ClSync, "FAILED").await;
-
-    // The gate must not block; the queued merge then fails downstream
-    // because the tip commit does not exist in this fixture — that error
-    // proves the gate let the CL through.
-    let (failure_type, message) = service
-        .execute_merge_workflow("GPGQPASS")
-        .await
-        .expect_err("merge fails on the missing tip commit, not on the gate");
-    assert!(
-        matches!(failure_type, QueueFailureTypeEnum::MergeFailure),
-        "{failure_type:?}"
-    );
-    assert!(!message.contains("GPG signature check failed"), "{message}");
-    assert!(message.contains("Commit not found"), "{message}");
 }
 
 // --- MC-09: server-side signing of synthetic commits entering a CL chain ---

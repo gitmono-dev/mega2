@@ -4,8 +4,8 @@
 //! merge such a change can grant themselves anything. A maintainer holds
 //! `approveMergeRequest`, which would have been exactly that: a self-promotion
 //! path. The check therefore asks for `addAdmin`, which only the admin group
-//! holds — the same decision for all three merge entry points, because they all
-//! funnel through `merge_cl_unchecked`.
+//! holds — the same decision for every merge entry, because they all land
+//! through `merge_cl_via_queue` → B3.
 //!
 //! A check that cannot be completed is not a pass. Three things can go wrong —
 //! the changed-file list cannot be read, main's copy of the file cannot be

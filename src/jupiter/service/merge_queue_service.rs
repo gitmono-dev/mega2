@@ -1,8 +1,3 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
 use crate::{
     callisto::sea_orm_active_enums::{
         MergeStatusEnum, PushQueueKindEnum, QueueFailureTypeEnum, QueueStatusEnum,
@@ -24,7 +19,6 @@ use crate::{
 pub struct MergeQueueService {
     merge_queue_storage: MergeQueueStorage,
     cl_storage: ClStorage,
-    processor_running: Arc<AtomicBool>,
 }
 
 /// Counts produced by [`MergeQueueService::absorb_into_push_queue`].
@@ -41,14 +35,10 @@ impl MergeQueueService {
             cl_storage: ClStorage {
                 base: base_storage.clone(),
             },
-            processor_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Adds a CL to the merge queue.
-    ///
-    /// Note: This method only adds to queue. The background processor
-    /// should be started by the caller (MonoApiService) after this call.
     pub async fn add_to_queue(&self, cl_link: String) -> Result<i64, MegaError> {
         self.add_to_queue_with_requester(cl_link, None).await
     }
@@ -124,8 +114,6 @@ impl MergeQueueService {
     // ========== Methods for MonoApiService to use ==========
 
     /// Gets the next waiting item from the queue.
-    ///
-    /// Called by MonoApiService's background processor.
     pub async fn get_next_waiting_item(
         &self,
     ) -> Result<Option<crate::callisto::merge_queue::Model>, MegaError> {
@@ -170,28 +158,6 @@ impl MergeQueueService {
             .map_err(MegaError::Other)
     }
 
-    // ========== Processor control methods ==========
-
-    /// Tries to start the processor. Returns true if this call started it,
-    /// false if it was already running.
-    ///
-    /// The actual processor loop should be implemented in MonoApiService (ceres layer).
-    pub fn try_start_processor(&self) -> bool {
-        self.processor_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    /// Stops the processor by setting the running flag to false.
-    pub fn stop_processor(&self) {
-        self.processor_running.store(false, Ordering::SeqCst);
-    }
-
-    /// Checks if the processor is currently running.
-    pub fn is_processor_running(&self) -> bool {
-        self.processor_running.load(Ordering::SeqCst)
-    }
-
     // ========== Validation and helper methods ==========
 
     /// Validates CL exists and is not closed before adding to queue
@@ -225,8 +191,6 @@ impl MergeQueueService {
     }
 
     /// Retries a failed queue item by resetting its status to Waiting.
-    ///
-    /// Note: The caller (MonoApiService) should start the processor after this.
     pub async fn retry_queue_item(&self, cl_link: &str) -> Result<bool, MegaError> {
         self.merge_queue_storage
             .retry_failed_item(cl_link)
@@ -355,13 +319,12 @@ impl MergeQueueService {
         Ok(report)
     }
 
-    /// Queue-mode HTTP startup: disable the legacy processor, absorb leftover
-    /// `merge_queue` rows, then refuse to start if any non-terminal rows remain.
+    /// Absorb leftover `merge_queue` rows, then refuse if any non-terminal
+    /// rows remain. (MW-01 no longer calls this from `start_http`; MW-04 deletes it.)
     pub async fn prepare_for_queue_writer(
         &self,
         push_queue: &PushQueueStorage,
     ) -> Result<AbsorbReport, MegaError> {
-        self.stop_processor();
         let report = self.absorb_into_push_queue(push_queue).await?;
         let left = self
             .merge_queue_storage
@@ -453,7 +416,6 @@ mod tests {
             .unwrap();
         assert_eq!(report.queued, 2);
         assert_eq!(report.failed_interrupted, 0);
-        assert!(!storage.merge_queue_service.is_processor_running());
 
         let left = storage
             .merge_queue_storage()
@@ -492,7 +454,6 @@ mod tests {
             .unwrap();
         assert_eq!(report.queued, 0);
         assert_eq!(report.failed_interrupted, 1);
-        assert!(!storage.merge_queue_service.is_processor_running());
         assert!(
             storage
                 .merge_queue_storage()
