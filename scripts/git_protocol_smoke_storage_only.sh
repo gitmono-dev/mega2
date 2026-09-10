@@ -533,6 +533,18 @@ case_ssh_protocol_v2_fetch() {
   fetch_case "$dest" -c protocol.version=2
 }
 
+case_ssh_shallow_clone() {
+  require_ssh_url || return 1
+  local dest="$ROOT_DIR/ssh-shallow"
+  clone_case "$MONOENGINE_SSH_REPO_URL" "$dest" --depth=1 || return 1
+  local shallow
+  shallow="$(git -C "$dest" rev-parse --is-shallow-repository)" || return 1
+  if [[ "$shallow" != "true" ]]; then
+    echo "FAIL: expected shallow repository after --depth=1 SSH clone, got is-shallow=$shallow" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -573,11 +585,13 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH clone" case_ssh_clone
   run_case "SSH fetch" case_ssh_fetch
   run_case "SSH protocol v2 fetch" case_ssh_protocol_v2_fetch
+  run_case "SSH shallow clone depth=1" case_ssh_shallow_clone
 elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "SSH ls-remote" ||
   "$CASE_FILTER" == "SSH clone" ||
   "$CASE_FILTER" == "SSH fetch" ||
-  "$CASE_FILTER" == "SSH protocol v2 fetch"
+  "$CASE_FILTER" == "SSH protocol v2 fetch" ||
+  "$CASE_FILTER" == "SSH shallow clone depth=1"
 ) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
