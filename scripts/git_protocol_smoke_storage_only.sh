@@ -558,6 +558,34 @@ case_ssh_protocol_v2_blob_none_clone() {
     "$ROOT_DIR/ssh-blobless.stderr"
 }
 
+# SSH receive-pack must stay disabled under storage-only (ssh_receive_pack=false).
+case_ssh_reject_receive_pack() {
+  require_ssh_url || return 1
+  local src log push_status=0
+  src="$ROOT_DIR/ssh-reject-receive-pack"
+  log="$ROOT_DIR/ssh-reject-receive-pack.stderr"
+  rm -rf "$src"
+  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$MONOENGINE_SSH_REPO_URL" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  printf 'monoengine ssh receive-pack reject %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/ssh-rp-reject.txt"
+  git -C "$src" add ssh-rp-reject.txt || return 1
+  git -C "$src" commit -m "monoengine ssh receive-pack reject" >/dev/null || return 1
+  set +e
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" >"$log" 2>&1
+  push_status=$?
+  set -e
+  if [[ "$push_status" -eq 0 ]]; then
+    echo "FAIL: SSH receive-pack must be rejected under ssh_receive_pack=false" >&2
+    return 1
+  fi
+  if ! rg -q 'SSH receive-pack is disabled' "$log"; then
+    echo "FAIL: expected stable disable substring 'SSH receive-pack is disabled' in push output:" >&2
+    cat "$log" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -601,18 +629,23 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH shallow clone depth=1" case_ssh_shallow_clone
   run_case "SSH protocol v2 ls-remote" case_ssh_protocol_v2_ls_remote
   run_case "SSH protocol v2 blob:none clone" case_ssh_protocol_v2_blob_none_clone
-elif [[ -n "$CASE_FILTER" && (
-  "$CASE_FILTER" == "SSH ls-remote" ||
-  "$CASE_FILTER" == "SSH clone" ||
-  "$CASE_FILTER" == "SSH fetch" ||
-  "$CASE_FILTER" == "SSH protocol v2 fetch" ||
-  "$CASE_FILTER" == "SSH shallow clone depth=1" ||
-  "$CASE_FILTER" == "SSH protocol v2 ls-remote" ||
-  "$CASE_FILTER" == "SSH protocol v2 blob:none clone"
-) ]]; then
-  echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
-  echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
-  exit 2
+  run_case "SSH reject receive-pack" case_ssh_reject_receive_pack
+else
+  # SO-04: unset SSH URL ⇒ SKIP (not failed), even under CASE filter.
+  skip_case "SSH reject receive-pack" "MONOENGINE_SSH_REPO_URL unset"
+  if [[ -n "$CASE_FILTER" && (
+    "$CASE_FILTER" == "SSH ls-remote" ||
+    "$CASE_FILTER" == "SSH clone" ||
+    "$CASE_FILTER" == "SSH fetch" ||
+    "$CASE_FILTER" == "SSH protocol v2 fetch" ||
+    "$CASE_FILTER" == "SSH shallow clone depth=1" ||
+    "$CASE_FILTER" == "SSH protocol v2 ls-remote" ||
+    "$CASE_FILTER" == "SSH protocol v2 blob:none clone"
+  ) ]]; then
+    echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
+    echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
+    exit 2
+  fi
 fi
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then

@@ -80,7 +80,7 @@
 
 > **2026-09-10 更新（plan-20260908 SP-02）：** `push_auth=token` 时 SSH `auth_password` 复用 `lookup_push_token`（username 不参与判定，身份为 token `name`）。客户端用 `SSH_ASKPASS`（password 不进 tracing、不进 `GIT_SSH_COMMAND`）。`push_auth=none` 与 review（省略）均 Reject password。进程 IT：`integration_git_ssh_trunk_token_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_off_password_clone` / `_fetch` / `_pull`、`integration_git_ssh_trunk_token_push_receive_pack_disabled`、`integration_git_ssh_review_pubkey_anon_off_clone`、`integration_git_ssh_review_pubkey_anon_on_push`。
 
-> **2026-09-11 更新（plan-20260906 SO-19）：** storage-only SSH 只读黑盒起点为 `scripts/git_protocol_smoke_storage_only.sh` case **`SSH ls-remote`**（`MONOENGINE_SSH_REPO_URL=ssh://git@monoengine:2222/`；`anonymous_access=true` 下 `auth_none`，默认 `GIT_SSH_COMMAND` 使用 `StrictHostKeyChecking=accept-new` + workdir known_hosts）。对照 review smoke 的 SSH 矩阵与 plan-20260908 产品契约。
+> **2026-09-11 更新（plan-20260906 SO-19..SO-25 / SO-04）：** storage-only SSH 黑盒为 `scripts/git_protocol_smoke_storage_only.sh`：只读矩阵（`SSH ls-remote` … `SSH protocol v2 blob:none clone`）+ **`SSH reject receive-pack`**（断言稳定子串 `SSH receive-pack is disabled`；未设 `MONOENGINE_SSH_REPO_URL` 时 SKIP）。默认 `GIT_SSH_COMMAND` 使用 `StrictHostKeyChecking=accept-new` + workdir known_hosts；`anonymous_access=true` 下 `auth_none`。对照 review smoke 与 plan-20260908。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
