@@ -99,15 +99,24 @@ Object PUT/GET 仍走 batch 注册后的能力 URL，不逐请求鉴权。Review
 
 ## 8. 本地 Compose 栈
 
-仓库根 `docker-compose.storage-only.yml` 对照 IT 的 `docker-compose.test.yml`，只保留 Postgres / Redis / monoengine，挂载 `config/config-storage-only.toml` 与 `/run/secrets/monoengine-push-token`（默认本地文件 `secrets/monoengine-push-token.local`）。不含 website、mailpit、RustFS、OAuth。
+仓库根 `docker-compose-storage-only.yml` 对照 IT 的 `docker-compose.test.yml`，保留 Postgres / Redis / **RustFS** / monoengine，挂载 `config/config-storage-only.toml` 与 `/run/secrets/monoengine-push-token`（默认 `secrets/monoengine-push-token.local`）。不含 website、mailpit、OAuth。
+
+对象存储默认 **RustFS**（`s3compatible`）。**默认启动不要加 `--env-file`**；只有把 monoengine 改成本地文件系统后端时，才需要 `--env-file config/compose.env.storage-only.local`（RustFS 容器仍会启动，仅切换 monoengine 的 `storage_type`）。
 
 ```bash
-docker compose -p monoengine-trunk -f docker-compose.storage-only.yml up -d --wait
+# 默认 RustFS（s3compatible）——无需 --env-file
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+
+# 可选：monoengine 改用本地文件系统（仅此情况加 --env-file）
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
+  --env-file config/compose.env.storage-only.local up -d --wait
+
 # HTTP http://127.0.0.1:9000/  SSH ssh://git@127.0.0.1:2222/
+# RustFS API/console: 127.0.0.1:29000 / 29001
 # push token 默认: monoengine-storage-only-local-dev-token-0001
 ```
 
-与 `-p monoengine-it` 的测试栈可并存（端口 25432 / 26379 / 9000 / 2222）。生产凭据用 `MONOENGINE_PUSH_TOKEN_FILE` 覆盖，勿提交。
+与 `-p monoengine-it` 的测试栈可并存（端口 25432 / 26379 / 9000 / 2222 / 29000）。生产凭据用 `MONOENGINE_PUSH_TOKEN_FILE` 覆盖，勿提交。
 
 ## 9. Agent 工作流备忘
 

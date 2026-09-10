@@ -13,8 +13,11 @@
 #   # token file must exist for ${file:...} below (compose mounts Docker secret).
 #   monoengine --config config/config-storage-only.toml config validate
 #   monoengine --config config/config-storage-only.toml service http --host 0.0.0.0 -p 9000
-#   # Compose lab stack (default RustFS / s3compatible):
+#   # Compose lab stack — default RustFS / s3compatible (no --env-file):
 #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+#   # Optional local FS backend only:
+#   #   ... -f docker-compose-storage-only.yml \
+#   #     --env-file config/compose.env.storage-only.local up -d --wait
 #
 # Storage-only checklist (must all hold / 下列必须同时满足,否则 trunk 启动失败):
 #   monorepo.push_policy = "trunk"
@@ -238,14 +241,17 @@ lfs_file_path = "${base_dir}/lfs"
 #   "gcs"           → [object_storage.gcs] only (omit s3 / local)
 # Scenario / 场景:
 #   "s3compatible"  = THIS sample's default — RustFS (or MinIO etc.) behind an
-#                     S3 API. docker-compose-storage-only.yml starts RustFS and
-#                     overrides endpoint to http://rustfs:9000 inside the network.
+#                     S3 API. docker-compose-storage-only.yml starts RustFS;
+#                     default `up` needs no --env-file (compose sets in-network
+#                     endpoint http://rustfs:9000).
 #   "local"         = single-node filesystem only; set storage_type = "local"
-#                     and replace this block with [object_storage.local] only
-#                     (compose: --env-file config/compose.env.storage-only.local).
+#                     and replace this block with [object_storage.local] only.
+#                     Compose optional override (not the default path):
+#                     --env-file config/compose.env.storage-only.local
 #   "s3" / "gcs"    = cloud production — fill the matching section; inject
 #                     real credentials via MEGA_* / secrets, never commit them.
-# 场景:本样例默认 s3compatible + RustFS;local 仅单机备选;云上用 s3/gcs 并注入真密钥.
+# 场景:本样例/compose 默认 s3compatible + RustFS(无需 --env-file);
+# local 仅可选覆盖;云上用 s3/gcs 并注入真密钥.
 storage_type = "s3compatible"
 
 [object_storage.s3]
@@ -342,4 +348,4 @@ token = "${file:/run/secrets/monoengine-push-token}"
 # 把上面的 push_auth 改成 "none",并删掉整个 [[git.push_tokens]] 段.
 # SSH: none + anonymous_access=true → auth_none clone; none + anonymous_access=false
 # is fail-closed (no UserStorage, no password). Do not seed UserStorage on trunk+none.
-# push_auth = "none"
+push_auth = "none"

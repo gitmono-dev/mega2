@@ -1,0 +1,225 @@
+# Local / lab stack for storage-only (trunk) mode.
+# 对照 `docker-compose.test.yml` 的数据面，去掉 website / mailpit / OAuth IT，
+# 以 `config/config-storage-only.toml` 跑 Git smart HTTP 推送 + 可选 SSH 只读。
+# 对象存储默认 RustFS（s3compatible）——直接 up 即可，不必加 --env-file。
+# 仅当要把 monoengine 改成本地文件系统后端时，才加
+# `--env-file config/compose.env.storage-only.local`（RustFS 容器仍会启动）。
+#
+# 权威配置 / 运维说明:
+#   config/config-storage-only.toml
+#   docs/deploy-trunk.md
+#
+# 与 IT 栈并存时务必带不同项目名，且本文件端口不与
+# `docker-compose.test.yml`（15432 / 16379 / 19000 / 19180）冲突:
+#
+#   # 默认 RustFS（无需 --env-file）
+#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+#
+#   # 可选：monoengine 改用本地文件系统对象存储（仅此情况需要 --env-file）
+#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
+#     --env-file config/compose.env.storage-only.local up -d --wait
+#
+# 首次构建（context = 本仓库根；`.dockerignore` 排除 target/）:
+#
+#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml build monoengine
+#
+# HTTP:  http://127.0.0.1:9000/
+# SSH:   ssh://git@127.0.0.1:2222/   (upload-pack only; receive-pack 关闭)
+# RustFS API / console: 127.0.0.1:29000 / 127.0.0.1:29001
+# Push:  Basic/Bearer，password/token = secrets/monoengine-push-token.local 内容
+#        （默认本地 token: monoengine-storage-only-local-dev-token-0001）
+#
+# 生产/非本机: 用 MONOENGINE_PUSH_TOKEN_FILE 指向真实 secret 文件，勿提交明文。
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    shm_size: "256mb"
+    environment:
+      POSTGRES_USER: monoengine
+      POSTGRES_PASSWORD: monoengine_storage_password
+      POSTGRES_DB: monoengine
+    ports:
+      - "127.0.0.1:25432:5432"
+    volumes:
+      - monoengine-trunk-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monoengine -d monoengine"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:26379:6379"
+    volumes:
+      - monoengine-trunk-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  # Default S3-compatible object store (RustFS). Lab credentials: rustfs /
+  # rustfs_secret — matches config/config-storage-only.toml.
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+    ports:
+      - "127.0.0.1:29000:9000"
+      - "127.0.0.1:29001:9001"
+    volumes:
+      - monoengine-trunk-rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Bucket init via mc. Stays up so `up -d --wait` can wait on it.
+  rustfs-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/mc mb --ignore-existing local/monoengine &&
+      /usr/bin/mc anonymous set download local/monoengine &&
+      exec sleep infinity
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/mc ls local/monoengine"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+
+  # Standing monoengine for storage-only: trunk + push_auth=token + RustFS.
+  monoengine:
+    image: monoengine:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_healthy
+    environment:
+      MEGA_BASE_DIR: /var/lib/monoengine
+      MEGA_CONFIG: /etc/monoengine/config.toml
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_storage_password@postgres:5432/monoengine
+      MEGA_REDIS__URL: redis://redis:6379
+      # Default RustFS (s3compatible). No --env-file needed for the default.
+      # Optional local FS backend: --env-file config/compose.env.storage-only.local
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: ${MEGA_OBJECT_STORAGE__STORAGE_TYPE:-s3compatible}
+      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: ${MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR:-/var/lib/monoengine/objects}
+      MEGA_OBJECT_STORAGE__S3__REGION: ${MEGA_OBJECT_STORAGE__S3__REGION:-us-east-1}
+      MEGA_OBJECT_STORAGE__S3__BUCKET: ${MEGA_OBJECT_STORAGE__S3__BUCKET:-monoengine}
+      MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: ${MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID:-rustfs}
+      MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: ${MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY:-rustfs_secret}
+      # In-network endpoint (sample file uses host 127.0.0.1:29000 for bare-metal).
+      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: ${MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL:-http://rustfs:9000}
+      MEGA_LOG__PRINT_STD: "true"
+      MEGA_LOG__LEVEL: info
+      # Host-facing LFS / capability URLs (published on 127.0.0.1:9000).
+      MEGA_HTTP__PUBLIC_BASE_URL: http://127.0.0.1:9000
+      MEGA_LFS__SSH__HTTP_URL: http://127.0.0.1:9000
+    secrets:
+      - monoengine-push-token
+    volumes:
+      - ./config/config-storage-only.toml:/etc/monoengine/config.toml:ro
+      - monoengine-trunk-data:/var/lib/monoengine
+    ports:
+      - "127.0.0.1:9000:8000"
+      - "127.0.0.1:2222:2222"
+    # HTTP push + SSH upload-pack (receive-pack still off via config).
+    command:
+      [
+        "--config",
+        "/etc/monoengine/config.toml",
+        "service",
+        "multi",
+        "http",
+        "ssh",
+        "--host",
+        "0.0.0.0",
+        "-p",
+        "8000",
+        "--ssh-port",
+        "2222",
+      ]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  # Optional linked Git CLI smoke against the compose-hosted monoengine.
+  # Bring up with: --profile smoke
+  # Then:
+  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
+  #     --profile smoke exec -T git-smoke \
+  #     env MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
+  #         MONOENGINE_IT_SEED_TOKEN=monoengine-storage-only-local-dev-token-0001 \
+  #         MONOENGINE_GIT_SMOKE_PUSH=1 \
+  #         bash scripts/git_protocol_smoke.sh
+  #
+  # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (host 127.0.0.1:9000). For
+  # in-network LFS smoke, override that env on monoengine to http://monoengine:8000
+  # before re-creating the service.
+  git-smoke:
+    image: monoengine-git-smoke:3.7.1
+    build:
+      context: .
+      dockerfile: Dockerfile.git-smoke
+    profiles: ["smoke"]
+    init: true
+    depends_on:
+      monoengine:
+        condition: service_healthy
+    environment:
+      MONOENGINE_HTTP_REPO_URL: http://monoengine:8000/
+      MONOENGINE_GIT_SMOKE_PUSH: "1"
+      MONOENGINE_GIT_SMOKE_LFS: "0"
+      MONOENGINE_IT_SEED_TOKEN: monoengine-storage-only-local-dev-token-0001
+    volumes:
+      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-trunk-git}:/work
+      - .:/repo:ro
+    working_dir: /work
+    healthcheck:
+      test: ["CMD-SHELL", "git --version >/dev/null && git lfs version | grep -q '^git-lfs/3[.]7[.]1 '"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+secrets:
+  monoengine-push-token:
+    # Override for real deployments: MONOENGINE_PUSH_TOKEN_FILE=/path/to/secret
+    file: ${MONOENGINE_PUSH_TOKEN_FILE:-./secrets/monoengine-push-token.local}
+
+volumes:
+  monoengine-trunk-pg:
+  monoengine-trunk-redis:
+  monoengine-trunk-rustfs:
+  monoengine-trunk-data:
+
+networks:
+  default:
+    name: monoengine-trunk-network
