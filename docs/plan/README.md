@@ -32,4 +32,4 @@
 | `plan-20260903.md` | 日期计划 | 进行中：Monorepo 初始 object-ID 配置（SHA-1/SHA-256 bootstrap；BLAKE3 接口保留且 fail-closed）。端到端 SHA-256 / BLAKE3 Git 协议支持不在本切片。 |
 | `plan-20260905.md` | 日期计划 | **已完成**（Trunk 直推 / `MonoWriteQueue`：TP-01..TP-23。设计事实源 = [`../refactoring/trunk-push.md`](../refactoring/trunk-push.md)。文档概览条目在 [`../refactoring/README.md`](../refactoring/README.md) **§5a**，不是仓库根 `README.md`） |
 | `plan-20260909.md` | 日期计划 | **已完成**（LF-01..LF-04；Claude+Codex 每卡双 PASS；Storage-only LFS：`push_auth=none` / `token`；supersede plan-20260905「trunk LFS 不可用」） |
-| `plan-20260910.md` | 日期计划 | **新建**（MW-01..MW-06；CL merge 强制 MonoWriteQueue；删除 `merge_writer` / Legacy processor / `merge_queue` 表；无存量迁移） |
+| `plan-20260910.md` | 日期计划 | **已完成**（MW-01..MW-06；CL merge 强制 MonoWriteQueue；删除 `merge_writer` / Legacy processor / `merge_queue` 表；无存量迁移） |

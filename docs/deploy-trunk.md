@@ -10,13 +10,14 @@
 [monorepo]
 push_policy = "trunk"
 max_push_commits = 250   # trunk 链长；review 仍用 MAX_CL_CHAIN_COMMITS = 250
-merge_writer = "queue"   # 生产稳态；缺省 legacy 仅迁移回退
 
 [git]
 push_auth = "token"      # 或 "none"；缺省（省略）拒绝启动
 ssh_receive_pack = false # storage-only 必须显式写 false，省略会拒绝启动
 # [[git.push_tokens]] 见第 3 节
 ```
+
+CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20260910.md`](./plan/plan-20260910.md)）。残留该键按未知字段拒绝启动。
 
 启动期 fail-closed（`Config::validate` / `AppContext::new`）：
 

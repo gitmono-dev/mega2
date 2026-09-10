@@ -134,6 +134,8 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 
 ## 迁移覆盖：`merge_queue.requester` nullable 列（UN-18）
 
+**历史表。** [`plan-20260910.md`](../plan/plan-20260910.md) MW-05 已 `DROP TABLE merge_queue`；下列描述 UN-18 当时的加列迁移，不再是现行 schema。
+
 `m20260815_000100_merge_queue_requester` 为 `merge_queue` 增加 nullable `requester` 列（无默认值、无回填、不修改既有行）。排队的合并由后台 worker 稍后执行，请求主体必须随队列项持久化，否则执行时没有自己的授权主体。本卡只加列：写入/读出链归 UN-20，NULL（legacy 行）的执行判定归 UN-17。
 
 **恢复路径按消费面状态区分（forward-only，运行时无 down 入口）：**

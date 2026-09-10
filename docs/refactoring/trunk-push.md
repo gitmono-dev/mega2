@@ -965,6 +965,8 @@ CAS 在本设计中的角色是**断言/tripwire**而非并发控制：队列成
 
 `merge_queue` 被 `MonoWriteQueue` **吸收**，不并存——两个队列各管一部分根树写入者等于没有全序。可复用的是**四层形状**（storage/service/router/DTO）与既有语义资产：`requester`（UN-18）、freeze 语义（UN-25）、位置查询与统计 API、HTTP 表面。**不复用**其枚举——`QueueStatusEnum`（`Waiting/Testing/Merging/Merged/Failed`）是 CL 工作流状态机，与本队列生命周期不同构，本队列为新实体配新枚举（`push_queue_status_enum` / `push_queue_kind_enum` / `push_queue_failure_enum`，见 1.4），走独立迁移，不动既有列；UN-25 的 freeze 契约（`un25_freeze.rs`）现以 `Failed + SystemError` 表达，新枚举保留 `SystemError` 变体并在迁移时逐条映射。**不可复用**其互斥（`AtomicBool` → advisory lock）、claim（裸 SELECT → `WHERE status='Queued'` 条件写回）与序号（毫秒时间戳 → `bigserial`）实现。冲突重排的语义映射见 ADR-TP-05 影响段（关行重入队，不改 id）。
 
+**Sunset（[`plan-20260910.md`](../plan/plan-20260910.md)）：** 下列「存量行迁移与滚动部署」及 `merge_writer` 双写者开关已废止。CL merge 只经 MonoWriteQueue；无该配置键；不吸收 `merge_queue` 行（表已 DROP）。下文保留为阶段 1 设计时的历史叙述。
+
 **存量行迁移与滚动部署**：切换步骤必须显式设计，防止新旧两套执行器混跑——(1) 切换前**排空**：置 `merge_queue` 不再接受新入队，存量 `Waiting/Testing/Merging` 行由旧 processor 执行至终态；(2) 终态后一次性数据迁移（`Waiting/Testing → Queued`、`Merging → Failed(MergeFailure, interrupted)` 或等其终态后迁移、`Merged/Failed` 按映射归档）；(3) **单写者切换**：以配置开关（重启生效）在旧 processor 与 `MonoWriteQueue` 之间二选一，配置校验拒绝两者同时启用；(4) 混合版本部署窗口内，旧实例的 processor 必须因开关关闭而不再启动。配一条「开关双开拒绝启动」的校验测试。
 
 **1.9 非推送写入者到队列模型的映射**
