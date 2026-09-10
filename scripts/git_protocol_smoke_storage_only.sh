@@ -123,10 +123,33 @@ case_http_clone() {
   clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
 }
 
+fetch_case() {
+  local dest="$1"
+  shift
+  git_case -C "$dest" "$@" fetch --all --prune || return
+  git -C "$dest" fsck --no-dangling >/dev/null || return
+}
+
+case_http_fetch() {
+  require_http_url || return 1
+  local dest="$ROOT_DIR/http-fetch"
+  clone_case "$MONOENGINE_HTTP_REPO_URL" "$dest" || return
+  fetch_case "$dest"
+}
+
+case_http_protocol_v2_fetch() {
+  require_http_url || return 1
+  local dest="$ROOT_DIR/http-v2-fetch"
+  clone_case "$MONOENGINE_HTTP_REPO_URL" "$dest" || return
+  fetch_case "$dest" -c protocol.version=2
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
 run_case "HTTP clone" case_http_clone
+run_case "HTTP fetch" case_http_fetch
+run_case "HTTP protocol v2 fetch" case_http_protocol_v2_fetch
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
