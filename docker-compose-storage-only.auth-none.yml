@@ -1,0 +1,14 @@
+# Opt-in override: remount push_auth=none sample (plan-20260906 ADR-SO-06).
+# Must be composed with the base file and recreate monoengine:
+#
+#   docker compose -p monoengine-trunk \
+#     -f docker-compose-storage-only.yml \
+#     -f docker-compose-storage-only.auth-none.yml \
+#     up -d --wait --force-recreate monoengine
+#
+# Revert to token: drop the second -f and --force-recreate monoengine again.
+
+services:
+  monoengine:
+    volumes:
+      - ./config/config-storage-only.none.toml:/etc/monoengine/config.toml:ro

@@ -1,0 +1,315 @@
+# Storage-only (trunk) sample configuration / storage-only（trunk 直推）形态示例配置.
+#
+# Scenario / 适用场景: a deployment with NO user system, NO Issue / Change List
+# and NO review gates — Git clients push straight to `main` over smart HTTP.
+# 适用场景:不接入用户系统、不使用 Issue / Change List、不走评审门控的存储与分发
+# 部署,Git 客户端通过 smart HTTP 把提交直接推入 `main`.
+#
+# Authoritative references / 权威文档:
+# - ops runbook / 运维手册: docs/deploy-trunk.md
+# - product rules / 产品规则: docs/monorepo.md
+#
+# Opt-in push_auth=none sibling of config-storage-only.toml (plan-20260906 ADR-SO-06).
+# Compose: dual -f with docker-compose-storage-only.auth-none.yml + --force-recreate monoengine.
+#
+# Usage / 用法:
+#   monoengine --config config/config-storage-only.none.toml config validate
+#   docker compose -p monoengine-trunk \
+#     -f docker-compose-storage-only.yml \
+#     -f docker-compose-storage-only.auth-none.yml \
+#     up -d --wait --force-recreate monoengine
+#
+# Storage-only checklist (must all hold / 下列必须同时满足,否则 trunk 启动失败):
+#   monorepo.push_policy = "trunk"
+#   cedar.enforcement = "off"
+#   git.push_auth = "token" | "none"   (omit → rejected)
+#   git.ssh_receive_pack = false       (omit → rejected when push_auth is set)
+#   git.push_auth=token ⇒ ≥1 [[git.push_tokens]]
+#   No [oauth] required (storage_only skips website session); omit review-only
+#   sections: [oauth], [buck], [notification], [vault], [orion_server], [build], …
+#   Object store: only the section matching storage_type (default s3compatible
+#   → [object_storage.s3] only; omit .local / .gcs). See docker-compose-storage-only.yml.
+#
+# Secrets / 凭据: inject DB/Redis/object-store credentials with MEGA_* env vars
+# or your deployment secret mechanism — never commit production tokens or
+# passwords to this file. The push token bytes below come from ${file:...}.
+# Lab-only RustFS keys below match docker-compose-storage-only.yml; replace in
+# real deployments.
+# 凭据:用 MEGA_* 或部署侧 secret 注入.下面的推送 token 走 ${file:...}.
+# 下方 RustFS 密钥仅实验室占位,与 compose 一致,生产必须替换.
+
+# Local data root / 本地数据根目录.
+# Scenario / 场景: base directory for logs, LFS files and local object storage
+# (all `${base_dir}` references below resolve against this).
+# 场景:日志、LFS 文件、本地对象存储的根目录(下文中所有 `${base_dir}` 都相对它解析).
+# Change it when / 何时改: pack the data volume elsewhere (container volume,
+# dedicated disk), or override per-environment with MEGA_BASE_DIR instead of
+# editing this file. 换数据盘 / 容器挂载卷时改,或用 MEGA_BASE_DIR 按环境覆盖,
+# 不必改文件.
+base_dir = "/tmp/.mono"
+
+[log]
+# Log verbosity / 日志级别.
+# Scenario / 场景: "debug"/"trace" only when diagnosing push failures or queue
+# stalls; keep "info" in production (per-request Git protocol logs are noisy).
+# 场景:只在排查推送失败或队列停滞时开 "debug"/"trace",生产环境保持 "info"
+# (Git 协议按请求打日志,开太细会很吵).
+level = "info"
+
+# Write logs to stdout as well as the rolling file under ${base_dir}/logs.
+# 输出到 stdout(同时还会写 ${base_dir}/logs 下的滚动文件).
+# Scenario / 场景: keep true when a container runtime collects stdout; set false
+# for bare-metal production to save the double-write cost.
+# 场景:容器运行时采集 stdout 时保持 true;物理机/高性能生产环境可设 false 省一次写开销.
+print_std = true
+
+# ANSI colors on stdout only (file logs never carry colors).
+# 仅 stdout 着色(文件日志永不带颜色).
+# Scenario / 场景: disable when the log collector cannot parse escape codes.
+# 场景:日志采集器处理不了转义字符时关掉.
+with_ansi = true
+
+[database]
+# Only "postgres" is supported / 仅支持 "postgres".
+# Scenario / 场景: the single source of truth for refs, trees, queue rows and
+# authz snapshots — storage-only still needs it; there is no embedded-DB mode.
+# 场景:ref、树、队列表、授权快照的唯一事实源,storage-only 也必须配,没有内嵌 DB 模式.
+db_type = "postgres"
+
+# Connection URL / 连接串.
+# Scenario / 场景: point at the deployment's Postgres (schema is created by
+# migrations on boot). Inject the password with MEGA_DATABASE__DB_URL or a
+# secret mount — the literal value here is a local-dev placeholder only.
+# 场景:指向部署环境的 Postgres(启动时由 migration 建表).密码用
+# MEGA_DATABASE__DB_URL 或 secret 挂载注入,此处明文仅本地开发占位.
+db_url = "postgres://localhost:5432/mono"
+
+# Pool sizing / 连接池大小.
+# Scenario / 场景: receive-pack bursts fan out into many concurrent DB writes
+# (ref updates, queue claim, index rows). Rule of thumb: max ≈ 2 × CPU cores,
+# min ≈ 1 × CPU cores for baseline concurrency.
+# 场景:receive-pack 突发会产生大量并发 DB 写(ref 更新、队列认领、索引行).
+# 经验值:max ≈ 2 × CPU 核数,min ≈ 1 × CPU 核数保底并发.
+max_connection = 16
+min_connection = 8
+
+# Seconds to wait for a pooled connection / connection handshake before failing.
+# 从池里拿连接 / 建连握手超时(秒).
+# Scenario / 场景: fail fast under pool exhaustion so push requests surface a
+# clear error instead of hanging behind the queue wait_timeout.
+# 场景:池耗尽时快速失败,让推送请求拿到明确错误,而不是在队列等待里 hanging.
+acquire_timeout = 3
+connect_timeout = 3
+
+# SQL statement logging / SQL 语句日志.
+# Scenario / 场景: enable only while diagnosing slow queries; it logs every
+# statement and is far too noisy (and leaky) for production.
+# 场景:只在排查慢查询时打开;它记录每条 SQL,生产环境开会又吵又可能泄漏数据.
+sqlx_logging = false
+
+[redis]
+# Redis URL / Redis 连接地址.
+# Scenario / 场景: distributed locks and ephemeral coordination state
+# (e.g. RedLock around attach paths, rate-limit / session state). Required even
+# in storage-only — the queue's B-stage locking assumes Redis is reachable.
+# 场景:分布式锁与临时协调状态(如 attach 路径的 RedLock、限流/会话状态).
+# storage-only 也必填,队列 B 阶段加锁依赖 Redis 可达.
+# Inject auth with MEGA_REDIS__URL or a secret mount when Redis requires it.
+# Redis 需要密码时用 MEGA_REDIS__URL 或 secret 挂载注入.
+url = "redis://127.0.0.1:6379"
+
+[monorepo]
+# Import-repo directory / ImportRepo 目录.
+# Scenario / 场景: paths under this dir are treated as imported repos (they may
+# keep multi-branch + Git-client tags); everything else is monorepo content with
+# a single public branch `main`.
+# 场景:该目录下的路径按导入仓库处理(可保留多分支与客户端 tag);其余一律按
+# monorepo 管理,只有 `main` 一个公开分支.
+import_dir = "/third-party"
+
+# System admins at `service init` / 初始化时的系统管理员.
+# Scenario / 场景: only used by the one-time `service init` bootstrap to seed
+# the admin group. Changing it later does NOT re-seed; manage admins via the API.
+# 场景:只在一次性 `service init` 建库时播种 admin 组,事后改这里不会重新播种,
+# 管理员改动走 API.
+admin = ["mega2"]
+
+# Top-level directories created at `service init` / 初始化时创建的顶层目录.
+# Scenario / 场景: the fixed namespace of the monorepo tree. Push `paths`
+# authorization (below) is expressed against these roots. Reorganizing them is a
+# data migration, not a config edit.
+# 场景:monorepo 树的固定命名空间,下文 token 的 `paths` 授权就写这些根.
+# 重组它们属于数据迁移,不是改配置能解决的.
+root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
+
+# Object-ID hash for the repo graph / 仓库图的 Object-ID 哈希.
+# Scenario / 场景: "sha1" is the only wire-compatible choice for a live Git
+# service. "sha256" is bootstrap-only (`service init`), never for normal Git
+# service; "blake3" is reserved until git-internal 0.9.0.
+# 场景:在线 Git 服务只能用 "sha1"."sha256" 仅用于建库那次 bootstrap,不能跑正常
+# Git 服务;"blake3" 要等 git-internal 0.9.0.
+object_format = "sha1"
+
+# Push morphology / 推送形态: "review" (CL pipeline) or "trunk" (direct to main).
+# Scenario / 场景: "trunk" = THIS file's scenario — pushes enter MonoWriteQueue
+# and land on `main` (N=1 verbatim, N>1 squashed), no CL created. "review" =
+# pushes land as refs/cl/* and go through the CL pipeline instead.
+# 场景:"trunk" 就是本文件的场景——推送进 MonoWriteQueue 后落到 `main`
+# (N=1 原样落地,N>1 squash),不建 CL;"review" 则落到 refs/cl/* 走评审管线.
+# Restart-required / 改后需重启. Trunk fails closed at startup unless ALL hold:
+# trunk 启动 fail-closed,以下必须同时满足否则拒绝启动:
+# cedar.enforcement="off", no open CLs, empty non-terminal push_queue rows on
+# policy change, explicit git.push_auth. 无 open CL、切形态时 push_queue 无非终态行、
+# 显式配 git.push_auth.
+push_policy = "trunk"
+
+# Trunk-only bound on first-parent chain length per push / trunk 单次推送链长上限.
+# Scenario / 场景: caps how many commits one push may carry before the server
+# squashes them (DoS guard on pack processing + B3 cost bound). Review
+# morphology ignores this and keeps MAX_CL_CHAIN_COMMITS=250.
+# 场景:限制一次推送最多带多少 commit(防超大 pack 拖垮 B3).review 形态不看它,
+# 仍用代码常量 MAX_CL_CHAIN_COMMITS=250.
+max_push_commits = 250
+
+# No [monorepo].merge_writer — key removed (plan-20260910 MW-03). CL merges and
+# trunk pushes both serialize on MonoWriteQueue; a leftover merge_writer key is
+# rejected as unknown at startup.
+# 无 merge_writer 键(已删除).残留该键会按未知字段拒绝启动.
+
+[pack]
+# Cap on RAM used while decoding an incoming pack / 解包最多用多少内存.
+# Scenario / 场景: back-pressure against a single giant push OOMing the server;
+# overflow spills to pack_decode_cache_path on disk.
+# 场景:防单个超大 pack 打爆内存,超限部分 spill 到磁盘缓存目录.
+pack_decode_mem_size = "4G"
+# Cap on disk spill for pack decode ("20%" = of total disk).
+# 解包磁盘溢写上限("20%" 指整盘比例).
+# Scenario / 场景: raise on hosts with small system disks, lower when the disk
+# is shared with object storage.
+# 场景:系统盘小就调大?不——与对象存储共用一盘时调小,独立大盘可调大.
+pack_decode_disk_size = "20%"
+
+# Disk spill directory / 磁盘溢写目录.
+# Scenario / 场景: must live on a filesystem with room for the largest push you
+# accept; point it at fast local SSD, never at a quota-limited mount.
+# 场景:必须放在装得下最大推送的盘上,指到本地高速 SSD,别指到有限额的挂载点.
+pack_decode_cache_path = "${base_dir}/cache"
+# Delete the spill files after decode / 解完即删溢写文件.
+# Scenario / 场景: keep true; false is only for post-mortem debugging of a
+# corrupt pack (and will fill the disk).
+# 场景:保持 true;false 只在事后分析坏包时用(会撑满磁盘).
+clean_cache_after_decode = true
+
+# Channel buffer size (messages) during decode / 解包 channel 缓冲消息数.
+# Scenario / 场景: throughput knob for the decode pipeline; raise only if
+# profiling shows the channel starved, it costs RAM per slot.
+# 场景:解包流水线吞吐旋钮;只有 profiling 证明 channel 饿死才调大,每槽都占内存.
+channel_message_size = 1_000_000
+
+# Max concurrent save_entry batches during receive-pack (0 = unbounded).
+# receive-pack 落库最大并发批数(0 = 不限).
+# Scenario / 场景: 1 serializes object writes (safest for HDD / small Postgres);
+# raise on fast NVMe + roomy pool, never 0 in production (unbounded fan-out).
+# 场景:1 = 对象写串行(HDD / 小库最稳);NVMe 快盘 + 连接池够大可调高,生产环境
+# 永不用 0(无界扇出).
+save_entry_concurrency = 1
+
+[lfs.ssh]
+# HTTP fallback URL for the SSH LFS transport (`git-lfs-authenticate`).
+# SSH LFS 传输的 HTTP 回退地址.
+# Scenario / 场景: storage-only disables SSH receive-pack entirely, so this is
+# unreachable in THIS deployment — kept only because the schema requires the
+# section. It matters solely for review/OAuth deployments that still serve SSH.
+# 场景:storage-only 完全关闭 SSH receive-pack,所以本部署走不到这里,保留只因
+# schema 要求.只有还提供 SSH 的 review/OAuth 部署才需要配对它.
+http_url = "http://localhost:8000"
+
+[lfs.local]
+# On-disk root for LFS objects / LFS 对象落盘根目录.
+# Scenario / 场景: used when object_storage keeps the `local` backend (below);
+# S3/GCS deployments still need the section present but never write here.
+# 场景:对象存储用 `local` 后端(见下)时 LFS 写这里;S3/GCS 部署保留本段但不会写.
+lfs_file_path = "${base_dir}/lfs"
+
+[object_storage]
+# Global backend for Git blobs, LFS, artifacts, logs: "local" | "s3" |
+# "s3compatible" | "gcs". Git blobs、LFS、artifact、日志的全局后端.
+# Only the section matching storage_type is required; omit the others.
+# 只需填写与 storage_type 对应的段,其余可省略:
+#   "local"         → [object_storage.local] only (omit s3 / gcs)
+#   "s3"/"s3compatible" → [object_storage.s3] only (omit gcs / local)
+#   "gcs"           → [object_storage.gcs] only (omit s3 / local)
+# Scenario / 场景:
+#   "s3compatible"  = THIS sample's default — RustFS (or MinIO etc.) behind an
+#                     S3 API. docker-compose-storage-only.yml starts RustFS;
+#                     default `up` needs no --env-file (compose sets in-network
+#                     endpoint http://rustfs:9000).
+#   "local"         = single-node filesystem only; set storage_type = "local"
+#                     and replace this block with [object_storage.local] only.
+#                     Compose optional override (not the default path):
+#                     --env-file config/compose.env.storage-only.local
+#   "s3" / "gcs"    = cloud production — fill the matching section; inject
+#                     real credentials via MEGA_* / secrets, never commit them.
+# 场景:本样例/compose 默认 s3compatible + RustFS(无需 --env-file);
+# local 仅可选覆盖;云上用 s3/gcs 并注入真密钥.
+storage_type = "s3compatible"
+
+[object_storage.s3]
+# Required for storage_type = "s3" | "s3compatible" (endpoint_url required for
+# s3compatible; leave empty for real AWS). Omit this whole section for local/gcs.
+# s3compatible 必须填 endpoint_url;真 AWS 留空走默认 endpoint. local/gcs 时整段可删.
+#
+# Lab defaults match docker-compose-storage-only.yml (RustFS access key
+# rustfs / rustfs_secret, bucket monoengine). Host API: 127.0.0.1:29000.
+# Inside compose, MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL=http://rustfs:9000.
+# 实验室默认与 compose 一致;容器内由 compose 把 endpoint 改成 rustfs:9000.
+# Replace keys for any non-lab deployment — do not reuse these in production.
+# 非实验室部署必须替换密钥,勿把下列明文用于生产.
+region = "us-east-1"
+bucket = "monoengine"
+access_key_id = "rustfs"
+secret_access_key = "rustfs_secret"
+endpoint_url = "http://127.0.0.1:29000"
+
+[cedar]
+# Authorization enforcement: "off" | "shadow" | "enforce".
+# 授权 enforcement 开关.
+# Scenario / 场景: storage-only has NO review gates and NO Cedar policy
+# evaluation, so this MUST be "off" — trunk startup refuses anything else.
+# "shadow"/"enforce" belong to review/OAuth deployments with a user system.
+# 场景:storage-only 无评审门控、无 Cedar 策略求值,必须是 "off",trunk 启动会拒
+# 掉其他值;"shadow"/"enforce" 只给带用户系统的 review/OAuth 部署用.
+enforcement = "off"
+
+[git]
+# Allow anonymous clone/fetch over smart HTTP / 是否允许匿名 clone/fetch.
+# Scenario / 场景: true = public-readable mirror (code distribution); false =
+# every read needs a token — pick per repo sensitivity. Push is NEVER anonymous
+# under "token" (below); under push_auth="none" even push is anonymous, so that
+# combination is intranet/loopback-only.
+# SSH upload-pack (clone/fetch/pull) uses the same flag: true → storage-only
+# auth_none (no UserStorage key); false + push_auth="none" is fail-closed.
+# 场景:true = 可公开读的镜像(代码分发);false = 读也要 token,按仓库敏感度选.
+# 注意:push_auth="token" 时推送永远要 token;若用 push_auth="none" 则推送也匿名,
+# 该组合只能放内网/回环. SSH 只读与 HTTP 共用本开关.
+anonymous_access = true
+
+# Storage-only push authentication / storage-only 推送认证.
+# Scenario / 场景: this file chooses "none" (anonymous receive-pack). Sibling
+# config-storage-only.toml chooses "token". Omitted = review/OAuth (trunk rejects).
+# 场景:本文件选 "none"(匿名 receive-pack);兄弟样例选 "token".省略 = review/OAuth(trunk 拒).
+# Restart-required / 改后需重启.
+# none = anonymous receive-pack (intranet/loopback only). No [[git.push_tokens]].
+push_auth = "none"
+
+# SSH receive-pack switch / SSH receive-pack 开关.
+# Scenario / 场景: storage-only NEVER serves SSH push — this must be an
+# explicit false (omitted ≠ disabled; startup fails closed). Pushes go over Git
+# smart HTTP (anonymous under none + network boundary).
+# 场景:storage-only 永不提供 SSH 推送,必须显式写 false(省略≠关闭,启动会
+# fail-closed).推送走 Git smart HTTP(none + 网络边界下匿名).
+ssh_receive_pack = false
+
+# No [[git.push_tokens]] under push_auth=none (token sibling keeps the block).
+# SSH: none + anonymous_access=true → auth_none clone; none + anonymous_access=false
+# is fail-closed (no UserStorage, no password). Do not seed UserStorage on trunk+none.

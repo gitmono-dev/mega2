@@ -339,6 +339,45 @@ case_http_reject_unauthenticated_push() {
   fi
 }
 
+# Anonymous tip advance under push_auth=none (ADR-SO-06 stack).
+case_http_trunk_push_none() {
+  require_http_url || return 1
+  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP trunk push (none)" >&2
+    return 1
+  fi
+  local repo_url src before after head
+  repo_url="$(trunk_http_repo_url)" || return 1
+  case "$repo_url" in
+    http://*@*) repo_url="http://${repo_url#*@}" ;;
+    https://*@*) repo_url="https://${repo_url#*@}" ;;
+  esac
+  src="$ROOT_DIR/http-trunk-push-none"
+  rm -rf "$src"
+  before="$(remote_tip_sha "$repo_url")" || return 1
+  if [[ -z "$before" ]]; then
+    echo "FAIL: could not resolve remote HEAD tip before anonymous push" >&2
+    return 1
+  fi
+  git_case clone "$repo_url" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  printf 'monoengine trunk none smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/trunk-none-smoke.txt"
+  git -C "$src" add trunk-none-smoke.txt || return 1
+  git -C "$src" commit -m "monoengine trunk none smoke" >/dev/null || return 1
+  head="$(git -C "$src" rev-parse HEAD)" || return 1
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" || return 1
+  after="$(remote_tip_sha "$repo_url")" || return 1
+  if [[ -z "$after" || "$after" == "$before" ]]; then
+    echo "FAIL: anonymous trunk tip did not advance (before=$before after=${after:-<empty>})" >&2
+    return 1
+  fi
+  if [[ "$after" != "$head" ]]; then
+    echo "FAIL: N=1 anonymous tip must equal client HEAD (expected=$head got=$after)" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -353,7 +392,12 @@ run_case "HTTP reject unauthenticated push" case_http_reject_unauthenticated_pus
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP trunk push" case_http_trunk_push
   run_case "HTTP reject Git-client tag push" case_http_reject_git_client_tag_push
-elif [[ -n "$CASE_FILTER" && ( "$CASE_FILTER" == "HTTP trunk push" || "$CASE_FILTER" == "HTTP reject Git-client tag push" ) ]]; then
+  run_case "HTTP trunk push (none)" case_http_trunk_push_none
+elif [[ -n "$CASE_FILTER" && (
+  "$CASE_FILTER" == "HTTP trunk push" ||
+  "$CASE_FILTER" == "HTTP reject Git-client tag push" ||
+  "$CASE_FILTER" == "HTTP trunk push (none)"
+) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2

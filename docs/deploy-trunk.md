@@ -148,6 +148,27 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile 
   git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
 ```
 
+`push_auth=none` 栈（ADR-SO-06）：双 `-f` 覆盖挂载 `config/config-storage-only.none.toml`，并 `--force-recreate monoengine`。opt-in case：`HTTP trunk push (none)`（无凭据 tip 前进）。
+
+```bash
+docker compose -p monoengine-trunk \
+  -f docker-compose-storage-only.yml \
+  -f docker-compose-storage-only.auth-none.yml \
+  up -d --wait --force-recreate monoengine
+
+docker compose -p monoengine-trunk \
+  -f docker-compose-storage-only.yml \
+  -f docker-compose-storage-only.auth-none.yml \
+  --profile smoke \
+  exec -T \
+  -e MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
+  -e MONOENGINE_GIT_SMOKE_PUSH=1 \
+  -e MONOENGINE_SMOKE_CASE='HTTP trunk push (none)' \
+  git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
+```
+
+切回默认 token 样例：去掉第二个 `-f`，再 `--force-recreate monoengine`。
+
 结果获取（stdout 为主；推荐宿主 tee）：
 
 ```bash
