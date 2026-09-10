@@ -133,7 +133,9 @@ clone_case() {
   local dest="$2"
   shift 2
   rm -rf "$dest"
-  git_case clone "$@" "$url" "$dest" || return
+  # Protocol clone/fetch cases are not LFS smudge gates; tip may contain LFS
+  # pointers whose PUBLIC_BASE_URL is host-facing (ADR-SO-04).
+  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$@" "$url" "$dest" || return
   git -C "$dest" fsck --no-dangling >/dev/null || return
 }
 
@@ -186,7 +188,7 @@ clone_protocol_v2_blobless() {
   local log="$3"
   local filter
   rm -rf "$dest"
-  if ! git_case -c protocol.version=2 clone --filter=blob:none "$url" "$dest" 2>"$log"; then
+  if ! GIT_LFS_SKIP_SMUDGE=1 git_case -c protocol.version=2 clone --filter=blob:none "$url" "$dest" 2>"$log"; then
     cat "$log" >&2
     return 1
   fi
@@ -512,6 +514,11 @@ case_ssh_ls_remote() {
   git_case ls-remote "$MONOENGINE_SSH_REPO_URL"
 }
 
+case_ssh_clone() {
+  require_ssh_url || return 1
+  clone_case "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-clone"
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -549,7 +556,11 @@ fi
 
 if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH ls-remote" case_ssh_ls_remote
-elif [[ -n "$CASE_FILTER" && "$CASE_FILTER" == "SSH ls-remote" ]]; then
+  run_case "SSH clone" case_ssh_clone
+elif [[ -n "$CASE_FILTER" && (
+  "$CASE_FILTER" == "SSH ls-remote" ||
+  "$CASE_FILTER" == "SSH clone"
+) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2
