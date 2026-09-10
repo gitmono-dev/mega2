@@ -8315,11 +8315,10 @@ mod mc09_tests {
     async fn queue_merge_queue_entry_un17_freezes_anonymous_under_enforce() {
         use git_internal::internal::object::commit::Commit;
 
-        use crate::config::{MergeWriter, testing::isolated_config};
+        use crate::config::testing::isolated_config;
 
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
-        config.monorepo.merge_writer = MergeWriter::Queue;
         config.cedar.enforcement = "enforce".into();
         let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
         let blob = blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -8400,7 +8399,7 @@ mod tests {
     use crate::{
         callisto::sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
         ceres::pack::materialize,
-        config::{MergeWriter, PushPolicy, testing::isolated_config},
+        config::{PushPolicy, testing::isolated_config},
         jupiter::{
             service::push_queue_service::{
                 EnqueueRequest, ExecuteOutcome, ExecuteRequest, PushExecContext, PushPayload,
@@ -8413,7 +8412,6 @@ mod tests {
 
     async fn tp11_storage(temp: &std::path::Path) -> Storage {
         let mut config = isolated_config(temp.join("config"));
-        config.monorepo.merge_writer = MergeWriter::Queue;
         config.monorepo.push_policy = PushPolicy::Trunk;
         let storage = test_storage_with_config(temp, config).await;
         crate::jupiter::tests::with_test_vault(storage, temp).await
@@ -9776,7 +9774,6 @@ mod tests {
     async fn tp12_review_keeps_noop() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = isolated_config(temp.path().join("config"));
-        config.monorepo.merge_writer = MergeWriter::Legacy;
         config.monorepo.push_policy = PushPolicy::Review;
         let storage = test_storage_with_config(temp.path(), config).await;
         let keep = Tree::from_tree_items(vec![blob_item(

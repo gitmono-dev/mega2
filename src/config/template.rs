@@ -51,9 +51,6 @@ object_format = "sha1"
 # push_policy = "review"
 # Trunk-only first-parent chain bound. Review morphology keeps MAX_CL_CHAIN_COMMITS=250.
 # max_push_commits = 250
-# CL merge writer: "legacy" (migration rollback) or "queue" (MonoWriteQueue).
-# Production steady state is queue. Restart-required.
-# merge_writer = "legacy"
 
 [monorepo.rename]
 similarity_threshold = 50

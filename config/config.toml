@@ -77,10 +77,6 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 # Bootstrap with: monoengine --config config/config.toml service init --yes
 object_format = "sha1"
 
-# CL merge writer: "legacy" (migration-period rollback) or "queue" (MonoWriteQueue).
-# Production steady state is queue. Restart-required.
-# merge_writer = "legacy"
-
 # Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
 # Restart-required. Trunk fail-closed startup: cedar.enforcement must be "off",
 # no open CLs, empty non-terminal push_queue on policy change, and git.push_auth

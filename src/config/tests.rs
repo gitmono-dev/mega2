@@ -200,24 +200,6 @@ fn token_path_must_start_with_slash() {
 }
 
 #[test]
-fn merge_writer_rejects_unknown_value() {
-    let err = toml::from_str::<crate::config::MonoConfig>(
-        r#"
-        import_dir = "/third-party"
-        admin = ["admin"]
-        root_dirs = ["project"]
-        merge_writer = "both"
-        "#,
-    )
-    .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("merge_writer") || msg.contains("unknown variant"),
-        "{msg}"
-    );
-}
-
-#[test]
 fn restart_required_fields_include_trunk_surface() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let mut current = isolated_config(temp_dir.path().join("current"));

@@ -162,11 +162,6 @@ pub struct MonoConfig {
     /// keeps [`crate::ceres::merge_checker::MAX_CL_CHAIN_COMMITS`].
     #[serde(default = "default_max_push_commits")]
     pub max_push_commits: usize,
-    /// Single-writer switch for CL merge (TP-07). Default `legacy` is the
-    /// migration-period rollback value; production steady state is `queue`.
-    /// Restart-required.
-    #[serde(default)]
-    pub merge_writer: MergeWriter,
 }
 
 pub const DEFAULT_MAX_PUSH_COMMITS: usize = 250;
@@ -191,7 +186,6 @@ impl Default for MonoConfig {
             rename: RenameConfig::default(),
             push_policy: PushPolicy::default(),
             max_push_commits: default_max_push_commits(),
-            merge_writer: MergeWriter::default(),
         }
     }
 }
@@ -203,17 +197,6 @@ impl PushPolicy {
             Self::Trunk => "trunk",
         }
     }
-}
-
-/// Single-writer switch for CL merge (TP-07 / ADR-TP-05).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum MergeWriter {
-    /// Existing merge_queue processor (migration-period rollback only).
-    #[default]
-    Legacy,
-    /// All merge entries enter `MonoWriteQueue` and wait for B3.
-    Queue,
 }
 
 impl MonoConfig {

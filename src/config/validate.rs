@@ -1549,7 +1549,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "rename",
             "push_policy",
             "max_push_commits",
-            "merge_writer",
         ]),
         "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
         "build" => Some(&[
@@ -3033,7 +3032,6 @@ mod tests {
             admin = ["admin"]
             root_dirs = ["project"]
             push_policy = "trunk"
-            merge_writer = "queue"
             "#,
         )
         .unwrap();
@@ -3041,21 +3039,22 @@ mod tests {
     }
 
     #[test]
-    fn merge_writer_rejects_unknown_value() {
-        let err = toml::from_str::<crate::config::MonoConfig>(
+    fn reject_unknown_fields_rejects_unknown_monorepo_key() {
+        let value = toml::from_str::<Value>(
             r#"
+            base_dir = "/tmp"
+            [database]
+            db_url = "postgres://localhost:5432/mono"
+            [monorepo]
             import_dir = "/third-party"
             admin = ["admin"]
             root_dirs = ["project"]
-            merge_writer = "both"
+            leftover_writer = "queue"
             "#,
         )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("merge_writer") || msg.contains("unknown variant"),
-            "{msg}"
-        );
+        .unwrap();
+        let err = reject_unknown_fields(&value).expect_err("unknown monorepo key");
+        assert!(err.to_string().contains("leftover_writer"), "{err}");
     }
 
     #[test]

@@ -242,8 +242,8 @@ impl MergeQueueService {
             .map_err(MegaError::Other)
     }
 
-    /// Absorb leftover `merge_queue` rows into `push_queue` when switching
-    /// `merge_writer=queue` (TP-07 rolling deploy).
+    /// Absorb leftover `merge_queue` rows into `push_queue` (TP-07 rolling
+    /// deploy leftover).
     ///
     /// `Waiting`/`Testing` → `push_queue` `Queued`; `Merging` →
     /// `Failed(MergeFailure, interrupted)`. Each source row is deleted after
@@ -333,7 +333,7 @@ impl MergeQueueService {
             .map_err(MegaError::Other)?;
         if !left.is_empty() {
             return Err(MegaError::Other(format!(
-                "merge_writer=queue requires non-terminal merge_queue rows to be drained; {} remain after absorb",
+                "non-terminal merge_queue rows must be drained; {} remain after absorb",
                 left.len()
             )));
         }

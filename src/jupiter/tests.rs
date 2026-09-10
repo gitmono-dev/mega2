@@ -14,7 +14,7 @@ use tracing::log;
 use url::Url;
 
 use crate::{
-    config::{Config, DbConfig, MergeWriter, reload::ConfigHandle, testing::isolated_config},
+    config::{Config, DbConfig, reload::ConfigHandle, testing::isolated_config},
     contract::policy::entitystore::SharedEntityStore,
     jupiter::{
         migration::apply_migrations,
@@ -169,11 +169,13 @@ pub async fn test_storage(temp_dir: impl AsRef<Path>) -> Storage {
     .await
 }
 
-/// Like [`test_storage`] but with `monorepo.merge_writer = queue`.
+/// Like [`test_storage`], named for queue-merge fixtures.
 pub async fn test_storage_queue_merge(temp_dir: impl AsRef<Path>) -> Storage {
-    let mut config = isolated_config(temp_dir.as_ref().join("config"));
-    config.monorepo.merge_writer = MergeWriter::Queue;
-    test_storage_with_config(temp_dir.as_ref(), config).await
+    test_storage_with_config(
+        temp_dir.as_ref(),
+        isolated_config(temp_dir.as_ref().join("config")),
+    )
+    .await
 }
 
 pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config) -> Storage {

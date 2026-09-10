@@ -1560,7 +1560,7 @@ mod tests {
             errors::{MegaError, ProtocolError},
             utils::{MEGA_BRANCH_NAME, ZERO_ID},
         },
-        config::{MergeWriter, PushPolicy, testing::isolated_config},
+        config::{PushPolicy, testing::isolated_config},
         jupiter::{
             storage::{Storage, base_storage::StorageConnector},
             tests::{test_storage, test_storage_with_config, with_test_vault},
@@ -1633,7 +1633,6 @@ mod tests {
 
     async fn trunk_storage(temp: &std::path::Path) -> Storage {
         let mut config = isolated_config(temp.join("config"));
-        config.monorepo.merge_writer = MergeWriter::Queue;
         config.monorepo.push_policy = PushPolicy::Trunk;
         let storage = test_storage_with_config(temp, config).await;
         with_test_vault(storage, temp).await

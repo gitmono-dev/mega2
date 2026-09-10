@@ -167,7 +167,7 @@ impl MergeQueueStorage {
         Ok(items)
     }
 
-    /// Non-terminal rows that must move into `push_queue` on `merge_writer=queue`.
+    /// Non-terminal rows that absorb into `push_queue`.
     pub async fn list_absorb_candidates(&self) -> Result<Vec<Model>, String> {
         let db = self.get_connection();
         let items = Entity::find()

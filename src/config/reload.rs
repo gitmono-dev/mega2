@@ -725,9 +725,6 @@ fn collect_monorepo_restart_fields(
             .restart_required_fields
             .push("monorepo.max_push_commits");
     }
-    if current.monorepo.merge_writer != candidate.monorepo.merge_writer {
-        report.restart_required_fields.push("monorepo.merge_writer");
-    }
 }
 
 fn collect_git_restart_fields(
