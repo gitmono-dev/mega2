@@ -10,20 +10,30 @@
 # - product rules / 产品规则: docs/monorepo.md
 #
 # Usage / 用法:
+#   # token file must exist for ${file:...} below (compose mounts Docker secret).
 #   monoengine --config config/config-storage-only.toml config validate
 #   monoengine --config config/config-storage-only.toml service http --host 0.0.0.0 -p 9000
+#   # Compose lab stack (default RustFS / s3compatible):
+#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+#
+# Storage-only checklist (must all hold / 下列必须同时满足,否则 trunk 启动失败):
+#   monorepo.push_policy = "trunk"
+#   cedar.enforcement = "off"
+#   git.push_auth = "token" | "none"   (omit → rejected)
+#   git.ssh_receive_pack = false       (omit → rejected when push_auth is set)
+#   git.push_auth=token ⇒ ≥1 [[git.push_tokens]]
+#   No [oauth] required (storage_only skips website session); omit review-only
+#   sections: [oauth], [buck], [notification], [vault], [orion_server], [build], …
+#   Object store: only the section matching storage_type (default s3compatible
+#   → [object_storage.s3] only; omit .local / .gcs). See docker-compose-storage-only.yml.
 #
 # Secrets / 凭据: inject DB/Redis/object-store credentials with MEGA_* env vars
 # or your deployment secret mechanism — never commit production tokens or
 # passwords to this file. The push token bytes below come from ${file:...}.
-# 凭据:用 MEGA_* 环境变量或部署侧 secret 机制注入 DB/Redis/对象存储凭据,
-# 不要把生产环境的 token 或密码提交到本文件.下面的推送 token 通过 ${file:...}
-# 从挂载文件读取.
-#
-# Omitted on purpose /  purposely omitted sections (not used on the storage-only
-# HTTP surface; the server does not register those routes here):
-# 故意省略的段(storage-only HTTP 面不挂载这些路由,用不到):
-# [oauth], [buck], [notification], [vault], [orion_server], [blame], [artifacts_gc].
+# Lab-only RustFS keys below match docker-compose-storage-only.yml; replace in
+# real deployments.
+# 凭据:用 MEGA_* 或部署侧 secret 注入.下面的推送 token 走 ${file:...}.
+# 下方 RustFS 密钥仅实验室占位,与 compose 一致,生产必须替换.
 
 # Local data root / 本地数据根目录.
 # Scenario / 场景: base directory for logs, LFS files and local object storage
@@ -158,28 +168,10 @@ push_policy = "trunk"
 # 仍用代码常量 MAX_CL_CHAIN_COMMITS=250.
 max_push_commits = 250
 
-# CL merge writer / CL 合并写者: "legacy" (old merge_queue processor) or
-# "queue" (MonoWriteQueue).
-# Scenario / 场景: "queue" is the production steady state — merges serialize
-# through the same MonoWriteQueue as pushes, so concurrent writers cannot
-# overwrite the root tree. "legacy" is migration-period rollback only.
-# 场景:"queue" 是生产稳态——合并与推送走同一条 MonoWriteQueue 串行,并发写者
-# 不会互相覆盖根树;"legacy" 只是迁移期回退开关.
-
-[build]
-# Build-system trigger switch / 构建系统触发开关.
-# Scenario / 场景: storage-only serves Git objects only — no Orion build
-# triggering. Keep false; the section stays because the schema requires it.
-# 场景:storage-only 只做 Git 对象存取,不触发 Orion 构建,保持 false.保留本段是
-# 因为 schema 要求有它.
-enable_build = false
-
-# Orion server URL (checked ONLY when enable_build = true).
-# 仅 enable_build=true 时才校验.
-# Scenario / 场景: dead value in storage-only; fill it only if you flip this
-# deployment back to a build-triggering one.
-# 场景:storage-only 下是死值,只有把本部署切回触发构建时才填.
-orion_server = ""
+# No [monorepo].merge_writer — key removed (plan-20260910 MW-03). CL merges and
+# trunk pushes both serialize on MonoWriteQueue; a leftover merge_writer key is
+# rejected as unknown at startup.
+# 无 merge_writer 键(已删除).残留该键会按未知字段拒绝启动.
 
 [pack]
 # Cap on RAM used while decoding an incoming pack / 解包最多用多少内存.
@@ -239,39 +231,39 @@ lfs_file_path = "${base_dir}/lfs"
 [object_storage]
 # Global backend for Git blobs, LFS, artifacts, logs: "local" | "s3" |
 # "s3compatible" | "gcs". Git blobs、LFS、artifact、日志的全局后端.
-# Scenario / 场景: "local" = single-node / dev (this file). "s3"/"s3compatible"
-# (e.g. RustFS) / "gcs" = multi-node production — switch storage_type AND fill
-# the matching section below; the other sections stay as empty placeholders.
-# 场景:"local" = 单机/开发(本文件默认).多机生产用 "s3"/"s3compatible"(如 RustFS)/
-# "gcs"——切 storage_type 的同时填下面对应段,其余段留空占位.
-storage_type = "local"
-
-[object_storage.local]
-# Filesystem root for the local backend / 本地后端根目录.
-# Scenario / 场景: every object's bytes live here in production-local
-# deployments — put it on the biggest, most durable mount, back it up.
-# 场景:本地部署下所有对象字节都在这,放最大最可靠的挂载点,并备份.
-root_dir = "${base_dir}/objects"
+# Only the section matching storage_type is required; omit the others.
+# 只需填写与 storage_type 对应的段,其余可省略:
+#   "local"         → [object_storage.local] only (omit s3 / gcs)
+#   "s3"/"s3compatible" → [object_storage.s3] only (omit gcs / local)
+#   "gcs"           → [object_storage.gcs] only (omit s3 / local)
+# Scenario / 场景:
+#   "s3compatible"  = THIS sample's default — RustFS (or MinIO etc.) behind an
+#                     S3 API. docker-compose-storage-only.yml starts RustFS and
+#                     overrides endpoint to http://rustfs:9000 inside the network.
+#   "local"         = single-node filesystem only; set storage_type = "local"
+#                     and replace this block with [object_storage.local] only
+#                     (compose: --env-file config/compose.env.storage-only.local).
+#   "s3" / "gcs"    = cloud production — fill the matching section; inject
+#                     real credentials via MEGA_* / secrets, never commit them.
+# 场景:本样例默认 s3compatible + RustFS;local 仅单机备选;云上用 s3/gcs 并注入真密钥.
+storage_type = "s3compatible"
 
 [object_storage.s3]
-# Required-but-empty placeholders when storage_type = "local".
-# storage_type="local" 时必填但留空的占位段(切到 S3 系后端时再填).
-# Scenario / 场景: fill ALL of these (or inject via MEGA_*/secrets) when moving
-# to AWS S3 or an S3-compatible store; endpoint_url is for compatible stores
-# (e.g. RustFS) and stays empty for real AWS.
-# 场景:迁到 AWS S3 / S3 兼容存储时全填(或走 MEGA_*/secret 注入);endpoint_url 只
-# 给兼容存储(如 RustFS)用,真 AWS 留空走默认 endpoint.
-region = ""
-bucket = ""
-access_key_id = ""
-secret_access_key = ""
-endpoint_url = ""
-
-[object_storage.gcs]
-# Placeholder for the GCS backend / GCS 后端占位.
-# Scenario / 场景: fill when storage_type = "gcs" (the bucket must already exist).
-# 场景:storage_type="gcs" 时填(桶需事先建好).
-bucket = ""
+# Required for storage_type = "s3" | "s3compatible" (endpoint_url required for
+# s3compatible; leave empty for real AWS). Omit this whole section for local/gcs.
+# s3compatible 必须填 endpoint_url;真 AWS 留空走默认 endpoint. local/gcs 时整段可删.
+#
+# Lab defaults match docker-compose-storage-only.yml (RustFS access key
+# rustfs / rustfs_secret, bucket monoengine). Host API: 127.0.0.1:29000.
+# Inside compose, MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL=http://rustfs:9000.
+# 实验室默认与 compose 一致;容器内由 compose 把 endpoint 改成 rustfs:9000.
+# Replace keys for any non-lab deployment — do not reuse these in production.
+# 非实验室部署必须替换密钥,勿把下列明文用于生产.
+region = "us-east-1"
+bucket = "monoengine"
+access_key_id = "rustfs"
+secret_access_key = "rustfs_secret"
+endpoint_url = "http://127.0.0.1:29000"
 
 [cedar]
 # Authorization enforcement: "off" | "shadow" | "enforce".

@@ -80,20 +80,23 @@ lfs_file_path = "{base_dir}/lfs"
 url = "redis://127.0.0.1:6379"
 
 [object_storage]
+# Only the section matching storage_type is required; omit unused backends.
 storage_type = "local"
 
 [object_storage.local]
 root_dir = "{base_dir}/objects"
 
-[object_storage.s3]
-region = ""
-bucket = ""
-access_key_id = ""
-secret_access_key = ""
-endpoint_url = ""
+# Uncomment when storage_type = "s3" | "s3compatible":
+# [object_storage.s3]
+# region = ""
+# bucket = ""
+# access_key_id = ""
+# secret_access_key = ""
+# endpoint_url = ""
 
-[object_storage.gcs]
-bucket = ""
+# Uncomment when storage_type = "gcs":
+# [object_storage.gcs]
+# bucket = ""
 
 [artifacts_gc]
 enable = false

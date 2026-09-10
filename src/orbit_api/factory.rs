@@ -58,13 +58,19 @@ pub struct ObjectStorageConfig {
     /// Global backend for Git blobs, Git LFS, artifact protocol objects, and Orion cloud log segments (`mix` mode).
     #[serde(default)]
     pub storage_type: ObjectStorageBackend,
-    /// S3-compatible storage configuration
+    /// S3 / S3-compatible credentials. Required when `storage_type` is `s3` or
+    /// `s3compatible`; omit or leave empty for `local` / `gcs`.
+    #[serde(default)]
     pub s3: S3Config,
 
-    /// Google Cloud Storage configuration
+    /// GCS credentials. Required when `storage_type` is `gcs`; omit or leave
+    /// empty for `local` / `s3` / `s3compatible`.
+    #[serde(default)]
     pub gcs: GcsConfig,
 
-    /// Local filesystem storage configuration
+    /// Local filesystem root. Required when `storage_type` is `local`; omit or
+    /// leave empty for cloud backends.
+    #[serde(default)]
     pub local: LocalConfig,
 }
 
@@ -157,6 +163,48 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{cfg:?}").contains("top-secret"));
+    }
+
+    #[test]
+    fn omitted_unused_backend_sections_deserialize_and_validate() {
+        let local_only: ObjectStorageConfig = toml::from_str(
+            r#"
+storage_type = "local"
+[local]
+root_dir = "/tmp/objects"
+"#,
+        )
+        .expect("local may omit s3/gcs");
+        assert!(local_only.validate().is_ok());
+        assert!(local_only.s3.bucket.is_empty());
+        assert!(local_only.gcs.bucket.is_empty());
+
+        let s3_compat: ObjectStorageConfig = toml::from_str(
+            r#"
+storage_type = "s3compatible"
+[s3]
+region = "us-east-1"
+bucket = "monoengine"
+access_key_id = "ak"
+secret_access_key = "sk"
+endpoint_url = "http://127.0.0.1:9000"
+"#,
+        )
+        .expect("s3compatible may omit gcs/local");
+        assert!(s3_compat.validate().is_ok());
+        assert!(s3_compat.gcs.bucket.is_empty());
+        assert!(s3_compat.local.root_dir.is_empty());
+
+        let gcs_only: ObjectStorageConfig = toml::from_str(
+            r#"
+storage_type = "gcs"
+[gcs]
+bucket = "monoengine"
+"#,
+        )
+        .expect("gcs may omit s3/local");
+        assert!(gcs_only.validate().is_ok());
+        assert!(gcs_only.s3.bucket.is_empty());
     }
 
     #[test]

@@ -2427,6 +2427,15 @@ mod tests {
     }
 
     #[test]
+    fn build_orion_server_may_be_omitted_when_disabled() {
+        let build: BuildConfig =
+            toml::from_str("enable_build = false").expect("disabled [build] may omit orion_server");
+        assert!(!build.enable_build);
+        assert!(build.orion_server.is_empty());
+        validate_build_config(&build).expect("empty orion_server is valid when disabled");
+    }
+
+    #[test]
     fn config_validate_rejects_invalid_redis_url_scheme() {
         let mut config = valid_config();
         config.redis.url = "http://localhost:6379".to_string();
@@ -2500,6 +2509,50 @@ mod tests {
 
         assert!(err.to_string().contains("Invalid Buck configuration"));
         assert!(err.to_string().contains("max_files"));
+    }
+
+    #[test]
+    fn config_validate_accepts_omitted_unused_object_storage_sections() {
+        let mut config = valid_config();
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::S3Compatible,
+            s3: S3Config {
+                region: "us-east-1".to_string(),
+                bucket: "monoengine".to_string(),
+                access_key_id: "ak".to_string(),
+                secret_access_key: "sk".to_string(),
+                endpoint_url: "http://127.0.0.1:9000".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "s3compatible needs only [object_storage.s3]"
+        );
+
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::Local,
+            local: LocalConfig {
+                root_dir: "/tmp/objects".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "local needs only [object_storage.local]"
+        );
+
+        config.object_storage = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::Gcs,
+            gcs: GcsConfig {
+                bucket: "monoengine".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "gcs needs only [object_storage.gcs]"
+        );
     }
 
     #[test]

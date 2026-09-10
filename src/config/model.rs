@@ -16,6 +16,9 @@ pub struct Config {
     pub lfs: LFSConfig,
     #[serde(default)]
     pub blame: BlameConfig,
+    /// Build-system trigger. Omit the whole `[build]` section when unused
+    /// (defaults to `enable_build = false`).
+    #[serde(default)]
     pub build: BuildConfig,
     pub redis: RedisConfig,
     #[serde(default)]
@@ -698,10 +701,10 @@ impl BlameConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct BuildConfig {
     pub enable_build: bool,
     pub orion_server: String,
-    #[serde(default)]
     pub orion_preheat_shallow_depth: usize,
 }
 
