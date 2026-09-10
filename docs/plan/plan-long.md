@@ -766,6 +766,7 @@ flowchart TD
 | [`plan-20260904.md`](plan-20260904.md) | N/A（storage-only trunk 产品 API 写文件；非 Mega PT） | **新建**（Codex R2 PASS） | AW-01..05：push_auth 门控 + MonoWriteQueue tip 落地；API 写后 git clone/pull 可见；compose 可继承黑盒脚本。不重开 CL/Cedar；不打开 SSH receive-pack。 |
 | [`plan-20260905.md`](plan-20260905.md) | N/A（trunk / MonoWriteQueue；非 Mega PT） | **已完成** | Trunk 直推与 storage-only；LFS 当时关闭（GAP-13/TP-18），由 [`plan-20260909.md`](plan-20260909.md) supersede。 |
 | [`plan-20260909.md`](plan-20260909.md) | N/A（storage-only LFS；承接 TP-18 关闭后的独立议题） | **已完成** | LFS 批/锁鉴权对齐 `push_auth=none`/`token`；trunk 重新挂载；IT + 文档 supersede。不覆盖 SSH LFS transfer、PUT 逐请求鉴权、DEFER-TP-05。 |
+| [`plan-20260906.md`](plan-20260906.md) | N/A（storage-only / trunk compose Git 黑盒；非 Mega PT） | **已完成** | 一 case 一卡；compose 黑盒；客户端=`git`/`git-lfs`/`ssh`（禁止 libra 作协议客户端）；SO-01 harness → HTTP 读/写/none/LFS → SSH 读 + reject receive-pack → SO-06 收口。 |
 | [`plan-20260908.md`](plan-20260908.md) | N/A（storage-only SSH 只读；非 Mega PT） | **进行中** | **SP-01..SP-05**：SSH upload-pack 对齐 HTTP 读；SP-01=`auth_none`/none 与 SP-02=password-token 已落地；SP-04 cancelled→SP-01；SP-03 索引收口；SP-05 终态 release。DEFER-SP-01..04。每实现/release 卡仅 patch+1。Codex R18 PASS。 |
 | [`plan-20260910.md`](plan-20260910.md) | N/A（merge_writer sunset；非 Mega PT） | **已完成** | CL merge 唯一写者 = MonoWriteQueue；删除 `[monorepo].merge_writer`、Legacy processor、`merge_queue` 表。不删除 `/merge-queue` HTTP 门面（DEFER-MW-01）。 |
 
