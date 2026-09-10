@@ -138,8 +138,9 @@ services:
       MEGA_LOG__PRINT_STD: "true"
       MEGA_LOG__LEVEL: info
       # Host-facing LFS / capability URLs (published on 127.0.0.1:9000).
-      MEGA_HTTP__PUBLIC_BASE_URL: http://127.0.0.1:9000
-      MEGA_LFS__SSH__HTTP_URL: http://127.0.0.1:9000
+      # In-network LFS smoke: --env-file config/compose.env.storage-only.lfs-innetwork
+      MEGA_HTTP__PUBLIC_BASE_URL: ${MEGA_HTTP__PUBLIC_BASE_URL:-http://127.0.0.1:9000}
+      MEGA_LFS__SSH__HTTP_URL: ${MEGA_LFS__SSH__HTTP_URL:-http://127.0.0.1:9000}
     secrets:
       - monoengine-push-token
     volumes:
@@ -188,9 +189,9 @@ services:
   # Persist host log: tee to target/tmp/so-smoke-*.log (see docs/deploy-trunk.md).
   # Review/CL smoke remains scripts/git_protocol_smoke.sh (do not use on trunk).
   #
-  # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (host 127.0.0.1:9000). For
-  # in-network LFS smoke, override that env on monoengine to http://monoengine:8000
-  # before re-creating the service.
+  # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (default host 127.0.0.1:9000).
+  # For in-network LFS smoke (git-smoke → monoengine), recreate with:
+  #   --env-file config/compose.env.storage-only.lfs-innetwork
   git-smoke:
     image: monoengine-git-smoke:3.7.1
     build:

@@ -415,6 +415,80 @@ case_http_reject_git_client_tag_push_none() {
   fi
 }
 
+lfs_http_url_for() {
+  local remote_url="${1%/}"
+  printf '%s/info/lfs\n' "$remote_url"
+}
+
+configure_lfs_http_remote() {
+  local repo_dir="$1"
+  local remote_url="$2"
+  git -C "$repo_dir" config lfs.url "$(lfs_http_url_for "$remote_url")" || return 1
+  git -C "$repo_dir" config lfs.locksverify false || return 1
+}
+
+# Trunk LFS: push pointer+object to main, peer pull + cmp (ADR-SO-02/04). No CL-ref fetch.
+case_http_lfs_push_and_pull_trunk() {
+  require_http_url || return 1
+  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP LFS push and pull (trunk)" >&2
+    return 1
+  fi
+  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" != "1" ]]; then
+    echo "MONOENGINE_GIT_SMOKE_LFS=1 is required for HTTP LFS push and pull (trunk)" >&2
+    return 1
+  fi
+  git lfs version >/dev/null 2>&1 || {
+    echo "git-lfs is required for MONOENGINE_GIT_SMOKE_LFS=1" >&2
+    return 1
+  }
+  local repo_url auth_url src peer before after head binary
+  repo_url="$(trunk_http_repo_url)" || return 1
+  auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
+  src="$ROOT_DIR/http-lfs-trunk-src"
+  peer="$ROOT_DIR/http-lfs-trunk-peer"
+  binary="monoengine-smoke-lfs.bin"
+  rm -rf "$src" "$peer"
+  before="$(remote_tip_sha "$auth_url")" || return 1
+  if [[ -z "$before" ]]; then
+    echo "FAIL: could not resolve remote HEAD tip before LFS push" >&2
+    return 1
+  fi
+  git_case clone "$auth_url" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  git -C "$src" lfs install --local >/dev/null || return 1
+  configure_lfs_http_remote "$src" "$auth_url" || return 1
+  git -C "$src" lfs track "*.bin" >/dev/null || return 1
+  printf 'monoengine trunk lfs smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/$binary"
+  git -C "$src" add .gitattributes "$binary" || return 1
+  git -C "$src" commit -m "monoengine trunk lfs smoke" >/dev/null || return 1
+  head="$(git -C "$src" rev-parse HEAD)" || return 1
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" || return 1
+  after="$(remote_tip_sha "$auth_url")" || return 1
+  if [[ -z "$after" || "$after" == "$before" ]]; then
+    echo "FAIL: LFS trunk tip did not advance (before=$before after=${after:-<empty>})" >&2
+    return 1
+  fi
+  if [[ "$after" != "$head" ]]; then
+    echo "FAIL: N=1 LFS tip must equal client HEAD (expected=$head got=$after)" >&2
+    return 1
+  fi
+  mkdir -p "$peer"
+  git_case -C "$peer" init >/dev/null || return 1
+  git -C "$peer" remote add origin "$auth_url" || return 1
+  git -C "$peer" lfs install --local >/dev/null || return 1
+  configure_lfs_http_remote "$peer" "$auth_url" || return 1
+  git_case -C "$peer" fetch origin "refs/heads/main:refs/heads/main" || return 1
+  GIT_LFS_SKIP_SMUDGE=1 git -C "$peer" checkout main >/dev/null || return 1
+  git -C "$peer" lfs pull || return 1
+  if ! cmp -s "$src/$binary" "$peer/$binary"; then
+    echo "FAIL: LFS round-trip content mismatch for $binary" >&2
+    return 1
+  fi
+  git -C "$peer" lfs locks >/dev/null || return 1
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -431,11 +505,19 @@ if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP reject Git-client tag push" case_http_reject_git_client_tag_push
   run_case "HTTP trunk push (none)" case_http_trunk_push_none
   run_case "HTTP reject Git-client tag push (none)" case_http_reject_git_client_tag_push_none
+  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
+    run_case "HTTP LFS push and pull (trunk)" case_http_lfs_push_and_pull_trunk
+  elif [[ -n "$CASE_FILTER" && "$CASE_FILTER" == "HTTP LFS push and pull (trunk)" ]]; then
+    echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_LFS=1" >&2
+    echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
+    exit 2
+  fi
 elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "HTTP trunk push" ||
   "$CASE_FILTER" == "HTTP reject Git-client tag push" ||
   "$CASE_FILTER" == "HTTP trunk push (none)" ||
-  "$CASE_FILTER" == "HTTP reject Git-client tag push (none)"
+  "$CASE_FILTER" == "HTTP reject Git-client tag push (none)" ||
+  "$CASE_FILTER" == "HTTP LFS push and pull (trunk)"
 ) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"

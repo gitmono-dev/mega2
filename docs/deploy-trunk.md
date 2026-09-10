@@ -169,6 +169,25 @@ docker compose -p monoengine-trunk \
 
 切回默认 token 样例：去掉第二个 `-f`，再 `--force-recreate monoengine`。
 
+LFS 网内 URL（ADR-SO-04）：`--env-file config/compose.env.storage-only.lfs-innetwork` 把 `MEGA_HTTP__PUBLIC_BASE_URL` / `MEGA_LFS__SSH__HTTP_URL` 设为 `http://monoengine:8000`，供 `git-smoke` 容器内 LFS href 可达。opt-in case：`HTTP LFS push and pull (trunk)`（需 `MONOENGINE_GIT_SMOKE_PUSH=1` + `MONOENGINE_GIT_SMOKE_LFS=1` + token）。
+
+```bash
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
+  --env-file config/compose.env.storage-only.lfs-innetwork \
+  up -d --wait --force-recreate monoengine
+
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  exec -T \
+  -e MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
+  -e MONOENGINE_IT_SEED_TOKEN=monoengine-storage-only-local-dev-token-0001 \
+  -e MONOENGINE_GIT_SMOKE_PUSH=1 \
+  -e MONOENGINE_GIT_SMOKE_LFS=1 \
+  -e MONOENGINE_SMOKE_CASE='HTTP LFS push and pull (trunk)' \
+  git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
+```
+
+切回宿主机 LFS URL：去掉 `--env-file`，再 `--force-recreate monoengine`。
+
 结果获取（stdout 为主；推荐宿主 tee）：
 
 ```bash
