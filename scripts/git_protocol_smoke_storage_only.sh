@@ -144,12 +144,25 @@ case_http_protocol_v2_fetch() {
   fetch_case "$dest" -c protocol.version=2
 }
 
+case_http_shallow_clone() {
+  require_http_url || return 1
+  local dest="$ROOT_DIR/http-shallow"
+  clone_case "$MONOENGINE_HTTP_REPO_URL" "$dest" --depth=1 || return
+  local shallow
+  shallow="$(git -C "$dest" rev-parse --is-shallow-repository)" || return
+  if [[ "$shallow" != "true" ]]; then
+    echo "FAIL: expected shallow repository after --depth=1 clone, got is-shallow=$shallow" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
 run_case "HTTP clone" case_http_clone
 run_case "HTTP fetch" case_http_fetch
 run_case "HTTP protocol v2 fetch" case_http_protocol_v2_fetch
+run_case "HTTP shallow clone depth=1" case_http_shallow_clone
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
