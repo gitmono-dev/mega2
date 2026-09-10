@@ -305,6 +305,40 @@ case_http_reject_git_client_tag_push() {
   fi
 }
 
+# Unauthenticated receive-pack must fail under push_auth=token (ADR-SO-03).
+case_http_reject_unauthenticated_push() {
+  require_http_url || return 1
+  local repo_url src push_status=0 before after
+  repo_url="$(trunk_http_repo_url)" || return 1
+  # Force no userinfo even if caller passed a credentialed URL.
+  case "$repo_url" in
+    http://*@*) repo_url="http://${repo_url#*@}" ;;
+    https://*@*) repo_url="https://${repo_url#*@}" ;;
+  esac
+  src="$ROOT_DIR/http-reject-unauth"
+  rm -rf "$src"
+  before="$(remote_tip_sha "$repo_url")" || return 1
+  git_case clone "$repo_url" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  printf 'monoengine unauth push smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/unauth-smoke.txt"
+  git -C "$src" add unauth-smoke.txt || return 1
+  git -C "$src" commit -m "monoengine unauth push smoke" >/dev/null || return 1
+  set +e
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main"
+  push_status=$?
+  set -e
+  if [[ "$push_status" -eq 0 ]]; then
+    echo "FAIL: unauthenticated trunk push must be rejected under push_auth=token" >&2
+    return 1
+  fi
+  after="$(remote_tip_sha "$repo_url")" || return 1
+  if [[ -n "$before" && "$after" != "$before" ]]; then
+    echo "FAIL: rejected unauth push must not advance tip (before=$before after=$after)" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -314,6 +348,7 @@ run_case "HTTP protocol v2 fetch" case_http_protocol_v2_fetch
 run_case "HTTP shallow clone depth=1" case_http_shallow_clone
 run_case "HTTP protocol v2 ls-remote" case_http_protocol_v2_ls_remote
 run_case "HTTP protocol v2 blob:none clone" case_http_protocol_v2_blob_none_clone
+run_case "HTTP reject unauthenticated push" case_http_reject_unauthenticated_push
 
 if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP trunk push" case_http_trunk_push

@@ -80,7 +80,7 @@
 
 > **2026-09-10 更新（plan-20260908 SP-02）：** `push_auth=token` 时 SSH `auth_password` 复用 `lookup_push_token`（username 不参与判定，身份为 token `name`）。客户端用 `SSH_ASKPASS`（password 不进 tracing、不进 `GIT_SSH_COMMAND`）。`push_auth=none` 与 review（省略）均 Reject password。进程 IT：`integration_git_ssh_trunk_token_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_off_password_clone` / `_fetch` / `_pull`、`integration_git_ssh_trunk_token_push_receive_pack_disabled`、`integration_git_ssh_review_pubkey_anon_off_clone`、`integration_git_ssh_review_pubkey_anon_on_push`。
 
-> **2026-09-10 更新（plan-20260906 SO-02 / SO-14）：** storage-only / trunk 形态的 compose 黑盒写门为 `scripts/git_protocol_smoke_storage_only.sh`：case **`HTTP trunk push`**（`MONOENGINE_GIT_SMOKE_PUSH=1` + Basic token / `MONOENGINE_IT_SEED_TOKEN`，tip 前进，不以新建 `refs/cl/*` 为条件）与 **`HTTP reject Git-client tag push`**（tag push 必须失败且远端无残留 tag）。对照 review smoke 的 CL 语义。
+> **2026-09-10 更新（plan-20260906 SO-02 / SO-14 / SO-15）：** storage-only / trunk 形态的 compose 黑盒写门为 `scripts/git_protocol_smoke_storage_only.sh`：case **`HTTP trunk push`**（token tip 前进）、**`HTTP reject Git-client tag push`**（tag 拒且无残留）、**`HTTP reject unauthenticated push`**（默认 `push_auth=token` 下无凭据 push 必须失败）。对照 review smoke 的 CL 语义。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
