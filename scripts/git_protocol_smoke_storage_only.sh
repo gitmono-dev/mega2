@@ -16,6 +16,7 @@ Optional environment:
   MONOENGINE_SMOKE_CASE          Exact case name; run only that case (unmatched → exit 2)
   MONOENGINE_GIT_SMOKE_PUSH      Set to 1 to enable write cases (when registered)
   MONOENGINE_GIT_SMOKE_LFS       Set to 1 to enable LFS cases (when registered)
+  MONOENGINE_IT_SEED_TOKEN      Push token for Basic auth when URL has no userinfo
   MONOENGINE_GIT_SMOKE_WORKDIR    Existing directory for temporary clones
   MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
 
@@ -191,6 +192,78 @@ case_http_protocol_v2_blob_none_clone() {
     "$ROOT_DIR/http-blobless.stderr"
 }
 
+# Inject Basic credentials for trunk receive-pack (ADR-SO-03). Username is ignored.
+http_url_with_push_token() {
+  local url="${1:-}"
+  local token="${2:-}"
+  if [[ -z "$url" ]]; then
+    echo "http_url_with_push_token: empty URL" >&2
+    return 1
+  fi
+  # Already has userinfo.
+  if [[ "$url" =~ ^https?://[^/@]+:[^/@]+@ ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+  if [[ -z "$token" ]]; then
+    echo "MONOENGINE_IT_SEED_TOKEN (or credentialed MONOENGINE_HTTP_REPO_URL) is required for trunk push" >&2
+    return 1
+  fi
+  case "$url" in
+    http://*) printf 'http://x:%s@%s\n' "$token" "${url#http://}" ;;
+    https://*) printf 'https://x:%s@%s\n' "$token" "${url#https://}" ;;
+    *)
+      echo "unsupported HTTP URL scheme: $url" >&2
+      return 1
+      ;;
+  esac
+}
+
+remote_tip_sha() {
+  local url="$1"
+  git_case ls-remote "$url" HEAD | awk '{print $1; exit}'
+}
+
+# Trunk write: tip must advance (ADR-SO-02). CL-ref creation is not a pass criterion.
+case_http_trunk_push() {
+  require_http_url || return 1
+  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP trunk push" >&2
+    return 1
+  fi
+  local auth_url src before after head
+  # B0 rejects path=/; default stack exposes /project after service init (deploy-trunk §9).
+  local repo_url="$MONOENGINE_HTTP_REPO_URL"
+  if [[ "$repo_url" =~ ^https?://[^/]+/?$ ]]; then
+    repo_url="${repo_url%/}/project"
+  fi
+  auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
+  src="$ROOT_DIR/http-trunk-push"
+  rm -rf "$src"
+  before="$(remote_tip_sha "$auth_url")" || return 1
+  if [[ -z "$before" ]]; then
+    echo "FAIL: could not resolve remote HEAD tip before push" >&2
+    return 1
+  fi
+  git_case clone "$auth_url" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Monoengine Smoke" || return 1
+  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  printf 'monoengine trunk smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/trunk-smoke.txt"
+  git -C "$src" add trunk-smoke.txt || return 1
+  git -C "$src" commit -m "monoengine trunk smoke" >/dev/null || return 1
+  head="$(git -C "$src" rev-parse HEAD)" || return 1
+  git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" || return 1
+  after="$(remote_tip_sha "$auth_url")" || return 1
+  if [[ -z "$after" || "$after" == "$before" ]]; then
+    echo "FAIL: trunk tip did not advance (before=$before after=${after:-<empty>})" >&2
+    return 1
+  fi
+  if [[ "$after" != "$head" ]]; then
+    echo "FAIL: N=1 trunk tip must equal client HEAD (expected=$head got=$after)" >&2
+    return 1
+  fi
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -200,6 +273,14 @@ run_case "HTTP protocol v2 fetch" case_http_protocol_v2_fetch
 run_case "HTTP shallow clone depth=1" case_http_shallow_clone
 run_case "HTTP protocol v2 ls-remote" case_http_protocol_v2_ls_remote
 run_case "HTTP protocol v2 blob:none clone" case_http_protocol_v2_blob_none_clone
+
+if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
+  run_case "HTTP trunk push" case_http_trunk_push
+elif [[ -n "$CASE_FILTER" && "$CASE_FILTER" == "HTTP trunk push" ]]; then
+  echo "FAIL: MONOENGINE_SMOKE_CASE='HTTP trunk push' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
+  echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
+  exit 2
+fi
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
