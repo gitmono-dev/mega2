@@ -550,6 +550,14 @@ case_ssh_protocol_v2_ls_remote() {
   git_case -c protocol.version=2 ls-remote "$MONOENGINE_SSH_REPO_URL"
 }
 
+case_ssh_protocol_v2_blob_none_clone() {
+  require_ssh_url || return 1
+  clone_protocol_v2_blobless \
+    "$MONOENGINE_SSH_REPO_URL" \
+    "$ROOT_DIR/ssh-blobless" \
+    "$ROOT_DIR/ssh-blobless.stderr"
+}
+
 # --- Protocol cases (registered by plan-20260906 scene cards). ---
 
 run_case "HTTP ls-remote" case_http_ls_remote
@@ -592,13 +600,15 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH protocol v2 fetch" case_ssh_protocol_v2_fetch
   run_case "SSH shallow clone depth=1" case_ssh_shallow_clone
   run_case "SSH protocol v2 ls-remote" case_ssh_protocol_v2_ls_remote
+  run_case "SSH protocol v2 blob:none clone" case_ssh_protocol_v2_blob_none_clone
 elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "SSH ls-remote" ||
   "$CASE_FILTER" == "SSH clone" ||
   "$CASE_FILTER" == "SSH fetch" ||
   "$CASE_FILTER" == "SSH protocol v2 fetch" ||
   "$CASE_FILTER" == "SSH shallow clone depth=1" ||
-  "$CASE_FILTER" == "SSH protocol v2 ls-remote"
+  "$CASE_FILTER" == "SSH protocol v2 ls-remote" ||
+  "$CASE_FILTER" == "SSH protocol v2 blob:none clone"
 ) ]]; then
   echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"

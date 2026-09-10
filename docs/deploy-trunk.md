@@ -205,7 +205,7 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile 
   git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
 ```
 
-已注册 SSH case：`SSH ls-remote`、`SSH clone`、`SSH fetch`、`SSH protocol v2 fetch`、`SSH shallow clone depth=1`、`SSH protocol v2 ls-remote`（后续场景卡追加 blob:none / reject receive-pack）。
+已注册 SSH case：`SSH ls-remote`、`SSH clone`、`SSH fetch`、`SSH protocol v2 fetch`、`SSH shallow clone depth=1`、`SSH protocol v2 ls-remote`、`SSH protocol v2 blob:none clone`（后续：`SSH reject receive-pack`）。
 
 结果获取（stdout 为主；推荐宿主 tee）：
 
