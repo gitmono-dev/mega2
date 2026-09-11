@@ -8,6 +8,7 @@ pub mod import_service;
 pub mod lfs_service;
 pub mod mono_service;
 pub mod mono_write_audit;
+pub mod oci_service;
 pub mod push_queue_reaper;
 pub mod push_queue_service;
 pub mod reviewer_service;

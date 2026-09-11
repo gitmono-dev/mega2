@@ -43,8 +43,8 @@ use crate::{
             artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
             cla_service::ClaService, code_review_service::CodeReviewService,
             git_service::GitService, import_service::ImportService, lfs_service::LfsService,
-            mono_service::MonoService, push_queue_service::PushQueueService,
-            webhook_service::WebhookService,
+            mono_service::MonoService, oci_service::OciService,
+            push_queue_service::PushQueueService, webhook_service::WebhookService,
         },
         storage::{
             audit_storage::AuditStorage,
@@ -151,6 +151,7 @@ pub struct Storage {
     pub import_service: ImportService,
     pub git_service: GitService,
     pub lfs_service: LfsService,
+    pub oci_service: OciService,
     pub config_handle: ConfigHandle,
     pub config: Arc<Config>,
     pub code_review_service: CodeReviewService,
@@ -221,6 +222,10 @@ impl Storage {
         let audit_storage = AuditStorage { base: base.clone() };
         let reaction_storage = ReactionStorage { base: base.clone() };
         let oci_db_storage = OciDbStorage { base: base.clone() };
+        let oci_service = OciService {
+            oci_storage: oci_db_storage.clone(),
+            obj_storage: object_store.clone(),
+        };
 
         let git_service = GitService {
             obj_storage: object_store.clone(),
@@ -299,6 +304,7 @@ impl Storage {
             mono_service,
             import_service,
             lfs_service,
+            oci_service,
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
             notification_storage,
@@ -590,6 +596,7 @@ impl Storage {
             mono_service: MonoService::mock(),
             import_service: ImportService::mock(),
             lfs_service: LfsService::mock(),
+            oci_service: OciService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),

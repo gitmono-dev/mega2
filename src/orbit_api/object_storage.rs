@@ -111,6 +111,8 @@ pub enum ObjectNamespace {
     Artifact,
     /// Chat attachments.
     Attachment,
+    /// OCI registry objects.
+    Oci,
 }
 
 impl ObjectNamespace {
@@ -121,6 +123,7 @@ impl ObjectNamespace {
             ObjectNamespace::Log => "log",
             ObjectNamespace::Artifact => "artifact",
             ObjectNamespace::Attachment => "attachment",
+            ObjectNamespace::Oci => "oci",
         }
     }
 }
@@ -448,6 +451,7 @@ mod tests {
             ObjectNamespace::Log,
             ObjectNamespace::Artifact,
             ObjectNamespace::Attachment,
+            ObjectNamespace::Oci,
         ] {
             let key = ObjectKey {
                 namespace: ns,
@@ -468,6 +472,7 @@ mod tests {
         assert_eq!(ObjectNamespace::Log.to_string(), "log");
         assert_eq!(ObjectNamespace::Artifact.to_string(), "artifact");
         assert_eq!(ObjectNamespace::Attachment.to_string(), "attachment");
+        assert_eq!(ObjectNamespace::Oci.to_string(), "oci");
     }
 
     #[test]
