@@ -2,7 +2,8 @@ use std::ops::Deref;
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set, sea_query::OnConflict,
+    QuerySelect, Set,
+    sea_query::{Expr, OnConflict},
 };
 
 use crate::{
@@ -218,6 +219,30 @@ impl OciDbStorage {
         Ok(Some(upload.update(self.get_connection()).await?))
     }
 
+    /// Conditional update: succeeds only when the row's `offset` and `chunks`
+    /// still equal the expected values. Returns `true` when exactly one row
+    /// was updated.
+    pub async fn cas_update_upload_offset_and_chunks(
+        &self,
+        uuid: &str,
+        expected_offset: i64,
+        expected_chunks: i64,
+        offset: i64,
+        chunks: i64,
+    ) -> Result<bool, MegaError> {
+        let now = chrono::Utc::now().fixed_offset();
+        let result = oci_upload::Entity::update_many()
+            .col_expr(oci_upload::Column::Offset, Expr::value(offset))
+            .col_expr(oci_upload::Column::Chunks, Expr::value(chunks))
+            .col_expr(oci_upload::Column::UpdatedAt, Expr::value(now))
+            .filter(oci_upload::Column::Uuid.eq(uuid))
+            .filter(oci_upload::Column::Offset.eq(expected_offset))
+            .filter(oci_upload::Column::Chunks.eq(expected_chunks))
+            .exec(self.get_connection())
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
     pub async fn delete_upload(&self, uuid: &str) -> Result<(), MegaError> {
         oci_upload::Entity::delete_by_id(uuid.to_owned())
             .exec(self.get_connection())
@@ -360,5 +385,47 @@ mod tests {
                 .expect("read deleted upload")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn cas_upload_requires_matching_offset_and_chunks() {
+        let (_temp_dir, storage) = storage().await;
+        storage
+            .insert_upload("upload-cas", "team/image")
+            .await
+            .expect("insert");
+
+        assert!(
+            storage
+                .cas_update_upload_offset_and_chunks("upload-cas", 0, 0, 4, 1)
+                .await
+                .expect("first claim")
+        );
+        // Stale claim on (0,0) must miss after a successful advance.
+        assert!(
+            !storage
+                .cas_update_upload_offset_and_chunks("upload-cas", 0, 0, 8, 2)
+                .await
+                .expect("stale claim")
+        );
+        // Empty-body style advance: offset unchanged, chunks increments.
+        assert!(
+            storage
+                .cas_update_upload_offset_and_chunks("upload-cas", 4, 1, 4, 2)
+                .await
+                .expect("empty claim")
+        );
+        assert!(
+            !storage
+                .cas_update_upload_offset_and_chunks("upload-cas", 4, 1, 4, 3)
+                .await
+                .expect("stale empty claim")
+        );
+        let upload = storage
+            .get_upload("upload-cas")
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!((upload.offset, upload.chunks), (4, 2));
     }
 }

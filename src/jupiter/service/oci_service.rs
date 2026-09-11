@@ -4,6 +4,7 @@ use futures::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    callisto::oci_upload,
     common::errors::MegaError,
     jupiter::storage::{
         base_storage::{BaseStorage, StorageConnector},
@@ -12,6 +13,10 @@ use crate::{
     },
     orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
+
+/// Maximum accepted PATCH chunk size (128 MiB). DR-11 may also apply this as a
+/// body limit at the HTTP layer.
+pub const DEFAULT_MAX_UPLOAD_CHUNK: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct OciService {
@@ -136,6 +141,68 @@ impl OciService {
             )
             .await?;
         Ok(())
+    }
+
+    /// Create a new chunked-upload session (`offset=0`, `chunks=0`).
+    pub async fn create_upload_session(&self, repo_name: &str) -> Result<String, MegaError> {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        self.oci_storage.insert_upload(&uuid, repo_name).await?;
+        Ok(uuid)
+    }
+
+    /// Load an upload session only when it belongs to `repo_name`.
+    pub async fn get_upload_session(
+        &self,
+        uuid: &str,
+        repo_name: &str,
+    ) -> Result<Option<oci_upload::Model>, MegaError> {
+        Ok(self
+            .oci_storage
+            .get_upload(uuid)
+            .await?
+            .filter(|upload| upload.repo_name == repo_name))
+    }
+
+    /// Claim the next offset/chunks slot (CAS on both columns), then persist
+    /// the chunk. Rollback uses the same CAS so a failed write cannot erase a
+    /// later accepted claim. Returns `Ok(None)` on CAS conflict.
+    pub async fn append_upload_chunk(
+        &self,
+        uuid: &str,
+        expected_offset: i64,
+        sequence: i64,
+        chunk_len: i64,
+        stream: ObjectByteStream,
+    ) -> Result<Option<(i64, i64)>, MegaError> {
+        let new_offset = expected_offset + chunk_len;
+        let new_chunks = sequence + 1;
+        let claimed = self
+            .oci_storage
+            .cas_update_upload_offset_and_chunks(
+                uuid,
+                expected_offset,
+                sequence,
+                new_offset,
+                new_chunks,
+            )
+            .await?;
+        if !claimed {
+            return Ok(None);
+        }
+        if let Err(error) = self.put_chunk(uuid, sequence as u64, stream).await {
+            let _ = self
+                .oci_storage
+                .cas_update_upload_offset_and_chunks(
+                    uuid,
+                    new_offset,
+                    new_chunks,
+                    expected_offset,
+                    sequence,
+                )
+                .await;
+            return Err(error);
+        }
+        Ok(Some((new_offset, new_chunks)))
     }
 
     pub async fn get_chunk_stream(

@@ -8,7 +8,7 @@ use axum::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
             ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-            IF_RANGE, RANGE,
+            IF_RANGE, LOCATION, RANGE,
         },
     },
     response::{IntoResponse, Response},
@@ -29,7 +29,9 @@ use crate::{
             ManifestIndex, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
         },
     },
-    jupiter::utils::into_obj_stream::IntoObjectStream,
+    jupiter::{
+        service::oci_service::DEFAULT_MAX_UPLOAD_CHUNK, utils::into_obj_stream::IntoObjectStream,
+    },
 };
 
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
@@ -108,6 +110,21 @@ async fn dispatch(
             if !name.is_empty() && *digest != "uploads" && request.method() == Method::DELETE =>
         {
             Err(OciError::Unsupported)
+        }
+        [name @ .., "blobs", "uploads"] | [name @ .., "blobs", "uploads", ""]
+            if !name.is_empty() && request.method() == Method::POST =>
+        {
+            init_blob_upload(state, name.join("/"), request).await
+        }
+        [name @ .., "blobs", "uploads", uuid]
+            if !name.is_empty() && !uuid.is_empty() && request.method() == Method::PATCH =>
+        {
+            patch_blob_upload(state, name.join("/"), uuid, request).await
+        }
+        [name @ .., "blobs", "uploads", uuid]
+            if !name.is_empty() && !uuid.is_empty() && request.method() == Method::GET =>
+        {
+            get_blob_upload_status(state, name.join("/"), uuid, request).await
         }
         _ => Err(OciError::NameInvalid),
     }
@@ -243,6 +260,195 @@ fn resolve_blob_range(headers: &HeaderMap, size: u64) -> Result<BlobGetMode, Oci
         requested_end.min(size.saturating_sub(1))
     };
     Ok(BlobGetMode::Partial { start, end })
+}
+
+async fn init_blob_upload(
+    state: MonoApiServiceState,
+    repo: String,
+    request: Request,
+) -> Result<Response, OciError> {
+    if query_has_mount_or_digest(request.uri().query()) {
+        return Err(OciError::Unsupported);
+    }
+    if !valid_repository_name(&repo) {
+        return Err(OciError::NameInvalid);
+    }
+    authorize_repo_write(&state.storage.config().git, request.headers(), &repo)?;
+
+    let uuid = state
+        .storage
+        .oci_service
+        .create_upload_session(&repo)
+        .await
+        .map_err(|_| OciError::BlobUploadInvalid)?;
+    upload_session_response(StatusCode::ACCEPTED, &repo, &uuid, 0)
+}
+
+async fn patch_blob_upload(
+    state: MonoApiServiceState,
+    repo: String,
+    uuid: &str,
+    request: Request,
+) -> Result<Response, OciError> {
+    if !valid_repository_name(&repo) {
+        return Err(OciError::NameInvalid);
+    }
+    authorize_repo_write(&state.storage.config().git, request.headers(), &repo)?;
+
+    let upload = state
+        .storage
+        .oci_service
+        .get_upload_session(uuid, &repo)
+        .await
+        .map_err(|_| OciError::BlobUploadUnknown)?
+        .ok_or(OciError::BlobUploadUnknown)?;
+
+    let content_range = parse_upload_content_range(request.headers())?;
+    if let Some((start, _)) = content_range
+        && start != upload.offset as u64
+    {
+        return Err(OciError::RangeInvalid);
+    }
+
+    let content_length = parse_content_length(request.headers())?;
+    if let (Some(cl), Some((start, end))) = (content_length, content_range)
+        && cl != end.saturating_sub(start).saturating_add(1)
+    {
+        return Err(OciError::SizeInvalid);
+    }
+
+    let body = to_bytes(request.into_body(), DEFAULT_MAX_UPLOAD_CHUNK + 1)
+        .await
+        .map_err(|_| OciError::SizeInvalid)?;
+    if body.len() > DEFAULT_MAX_UPLOAD_CHUNK {
+        return Err(OciError::SizeInvalid);
+    }
+    if let Some(cl) = content_length
+        && body.len() as u64 != cl
+    {
+        return Err(OciError::SizeInvalid);
+    }
+
+    let chunk_len = body.len() as i64;
+    let updated = state
+        .storage
+        .oci_service
+        .append_upload_chunk(
+            uuid,
+            upload.offset,
+            upload.chunks,
+            chunk_len,
+            Bytes::from(body.to_vec()).into_stream(),
+        )
+        .await
+        .map_err(|_| OciError::BlobUploadInvalid)?
+        .ok_or(OciError::RangeInvalid)?;
+    upload_session_response(StatusCode::ACCEPTED, &repo, uuid, updated.0)
+}
+
+async fn get_blob_upload_status(
+    state: MonoApiServiceState,
+    repo: String,
+    uuid: &str,
+    request: Request,
+) -> Result<Response, OciError> {
+    if !valid_repository_name(&repo) {
+        return Err(OciError::NameInvalid);
+    }
+    authorize_repo_write(&state.storage.config().git, request.headers(), &repo)?;
+
+    let upload = state
+        .storage
+        .oci_service
+        .get_upload_session(uuid, &repo)
+        .await
+        .map_err(|_| OciError::BlobUploadUnknown)?
+        .ok_or(OciError::BlobUploadUnknown)?;
+    upload_session_response(StatusCode::NO_CONTENT, &repo, uuid, upload.offset)
+}
+
+fn upload_session_response(
+    status: StatusCode,
+    repo: &str,
+    uuid: &str,
+    offset: i64,
+) -> Result<Response, OciError> {
+    let location = format!("/v2/{repo}/blobs/uploads/{uuid}");
+    let range = upload_range_header(offset);
+    let mut response = status.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        LOCATION,
+        HeaderValue::from_str(&location).map_err(|_| OciError::BlobUploadInvalid)?,
+    );
+    headers.insert(
+        "Docker-Upload-UUID",
+        HeaderValue::from_str(uuid).map_err(|_| OciError::BlobUploadInvalid)?,
+    );
+    headers.insert(
+        RANGE,
+        HeaderValue::from_str(&range).map_err(|_| OciError::BlobUploadInvalid)?,
+    );
+    Ok(response)
+}
+
+fn upload_range_header(offset: i64) -> String {
+    if offset <= 0 {
+        "0-0".to_owned()
+    } else {
+        format!("0-{}", offset - 1)
+    }
+}
+
+fn query_has_mount_or_digest(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let key = pair.split('=').next().unwrap_or("");
+        key == "mount" || key == "digest"
+    })
+}
+
+/// Parse upload `Content-Range` as `start-end`, optional `bytes ` prefix and
+/// optional `/*` total (distribution + HTTP forms).
+fn parse_upload_content_range(headers: &HeaderMap) -> Result<Option<(u64, u64)>, OciError> {
+    let Some(value) = headers.get(CONTENT_RANGE) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| OciError::RangeInvalid)?;
+    let mut spec = value.trim();
+    if let Some(rest) = spec.strip_prefix("bytes") {
+        spec = rest.trim_start();
+    }
+    if let Some((range, _total)) = spec.split_once('/') {
+        spec = range.trim();
+    }
+    let Some((start_spec, end_spec)) = spec.split_once('-') else {
+        return Err(OciError::RangeInvalid);
+    };
+    let start = start_spec
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| OciError::RangeInvalid)?;
+    let end = end_spec
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| OciError::RangeInvalid)?;
+    if start > end {
+        return Err(OciError::RangeInvalid);
+    }
+    Ok(Some((start, end)))
+}
+
+fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, OciError> {
+    let Some(value) = headers.get(CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| OciError::SizeInvalid)?;
+    Ok(Some(
+        value.parse::<u64>().map_err(|_| OciError::SizeInvalid)?,
+    ))
 }
 
 async fn get_or_head_manifest(
@@ -1123,6 +1329,297 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn init_upload(state: MonoApiServiceState) -> (MonoApiServiceState, String) {
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::post("/team/image/blobs/uploads/"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("init");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let uuid = response
+            .headers()
+            .get("Docker-Upload-UUID")
+            .expect("uuid")
+            .to_str()
+            .expect("valid uuid")
+            .to_owned();
+        (state, uuid)
+    }
+
+    #[tokio::test]
+    async fn init_returns_session_headers() {
+        let response = oci_routes()
+            .with_state(state(true).await)
+            .oneshot(
+                authenticated(Request::post("/team/image/blobs/uploads/"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("init");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let uuid = response
+            .headers()
+            .get("Docker-Upload-UUID")
+            .expect("uuid")
+            .to_str()
+            .expect("valid uuid");
+        assert_eq!(
+            response
+                .headers()
+                .get("Location")
+                .expect("location")
+                .to_str()
+                .expect("valid"),
+            format!("/v2/team/image/blobs/uploads/{uuid}")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RANGE)
+                .expect("range")
+                .to_str()
+                .expect("valid"),
+            "0-0"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_updates_offset() {
+        let (state, uuid) = init_upload(state(true).await).await;
+        let payload = b"chunk-one";
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .header(CONTENT_LENGTH, payload.len().to_string())
+                    .body(Body::from(payload.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(RANGE)
+                .expect("range")
+                .to_str()
+                .expect("valid"),
+            format!("0-{}", payload.len() - 1)
+        );
+        let upload = state
+            .storage
+            .oci_service
+            .oci_storage
+            .get_upload(&uuid)
+            .await
+            .expect("get upload")
+            .expect("upload exists");
+        assert_eq!(upload.offset, payload.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn patch_updates_chunks() {
+        let (state, uuid) = init_upload(state(true).await).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .body(Body::from(&b"abc"[..]))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let upload = state
+            .storage
+            .oci_service
+            .oci_storage
+            .get_upload(&uuid)
+            .await
+            .expect("get upload")
+            .expect("upload exists");
+        assert_eq!(upload.chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn patch_range_mismatch_keeps_session() {
+        let (state, uuid) = init_upload(state(true).await).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .header(CONTENT_RANGE, "bytes 5-8/*")
+                    .header(CONTENT_LENGTH, "4")
+                    .body(Body::from(&b"abcd"[..]))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch");
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("RANGE_INVALID")
+        );
+        let upload = state
+            .storage
+            .oci_service
+            .oci_storage
+            .get_upload(&uuid)
+            .await
+            .expect("get upload")
+            .expect("session kept");
+        assert_eq!((upload.offset, upload.chunks), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn patch_size_mismatch_keeps_session() {
+        let (state, uuid) = init_upload(state(true).await).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .header(CONTENT_RANGE, "bytes 0-3/*")
+                    .header(CONTENT_LENGTH, "9")
+                    .body(Body::from(&b"abcd"[..]))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("SIZE_INVALID")
+        );
+        let upload = state
+            .storage
+            .oci_service
+            .oci_storage
+            .get_upload(&uuid)
+            .await
+            .expect("get upload")
+            .expect("session kept");
+        assert_eq!((upload.offset, upload.chunks), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn status_204_with_range_header() {
+        let (state, uuid) = init_upload(state(true).await).await;
+        let patch = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .body(Body::from(&b"hello"[..]))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch");
+        assert_eq!(patch.status(), StatusCode::ACCEPTED);
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                authenticated(Request::get(format!("/team/image/blobs/uploads/{uuid}")))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("status");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(RANGE)
+                .expect("range")
+                .to_str()
+                .expect("valid"),
+            "0-4"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Docker-Upload-UUID")
+                .expect("uuid")
+                .to_str()
+                .expect("valid"),
+            uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn session_survives_restart() {
+        let (state, uuid) = init_upload(state(true).await).await;
+        let patch = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .body(Body::from(&b"persist"[..]))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch");
+        assert_eq!(patch.status(), StatusCode::ACCEPTED);
+
+        // Drop in-memory API state and rebuild from the same Storage (DB + CAS).
+        let restarted = state_with_storage(state.storage.clone());
+        let response = oci_routes()
+            .with_state(restarted)
+            .oneshot(
+                authenticated(Request::get(format!("/team/image/blobs/uploads/{uuid}")))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("status after restart");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(RANGE)
+                .expect("range")
+                .to_str()
+                .expect("valid"),
+            "0-6"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_upload_uuid_404() {
+        let response = oci_routes()
+            .with_state(state(true).await)
+            .oneshot(
+                authenticated(Request::get(
+                    "/team/image/blobs/uploads/00000000-0000-4000-8000-000000000000",
+                ))
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("status");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("BLOB_UPLOAD_UNKNOWN")
+        );
     }
 
     #[test]
