@@ -31,6 +31,7 @@ use crate::{
 pub mod api_common;
 pub mod api_doc;
 pub mod api_router;
+pub mod api_write_auth;
 pub mod oauth;
 pub mod router;
 #[cfg(test)]
