@@ -109,16 +109,16 @@ mod tests {
         .expect("insert merge_queue row");
     }
 
-    /// Apply every migration up to UN-18, excluding MW-05's DROP TABLE.
+    /// Apply every migration up to UN-18, excluding MW-05's DROP TABLE and any
+    /// later append-only migrations (e.g. DR-02 OCI tables after the drop).
     async fn apply_migrations_before_merge_queue_drop(db: &DatabaseConnection) {
         let drop_name = "m20260910_000100_drop_merge_queue";
         let migrations = Migrator::migrations();
-        assert_eq!(
-            migrations.last().map(|m| m.name()),
-            Some(drop_name),
-            "MW-05 drop must stay last so UN-18 can apply the prefix"
-        );
-        let steps = (migrations.len() - 1) as u32;
+        let drop_idx = migrations
+            .iter()
+            .position(|m| m.name() == drop_name)
+            .expect("MW-05 drop migration must remain registered");
+        let steps = drop_idx as u32;
         Migrator::up(db, Some(steps))
             .await
             .expect("migrations through UN-18 should apply");

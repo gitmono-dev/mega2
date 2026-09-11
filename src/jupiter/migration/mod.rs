@@ -110,6 +110,7 @@ pub(crate) mod m20260731_000001_drop_email_jobs;
 mod m20260815_000000_unique_mega_cl_link;
 mod m20260815_000100_merge_queue_requester;
 mod m20260831_000000_drop_mega_issue_tables;
+mod m20260902_000100_add_oci_tables;
 pub(crate) mod m20260905_000100_add_push_queue;
 mod m20260905_000200_mega_cl_revision;
 mod m20260905_000300_add_mega_ref_tombstones;
@@ -222,6 +223,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000500_add_blob_paths::Migration),
             Box::new(m20260905_000600_mega_refs_path_pattern::Migration),
             Box::new(m20260910_000100_drop_merge_queue::Migration),
+            Box::new(m20260902_000100_add_oci_tables::Migration),
         ]
     }
 }
