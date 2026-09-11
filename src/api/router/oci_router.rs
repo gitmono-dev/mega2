@@ -2,9 +2,12 @@ use std::sync::LazyLock;
 
 use axum::{
     Router,
-    body::to_bytes,
+    body::{Body, to_bytes},
     extract::{Path, Request, State},
-    http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+    },
     response::{IntoResponse, Response},
     routing::{any, get},
 };
@@ -15,7 +18,7 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::{
     api::MonoApiServiceState,
     ceres::oci::{
-        auth::{authorize_repo_write, registry_ping_allowed},
+        auth::{authorize_repo_read, authorize_repo_write, registry_ping_allowed},
         digest::{compute_digest, parse_digest},
         error::OciError,
         model::{
@@ -80,8 +83,117 @@ async fn dispatch(
         {
             put_manifest(state, name.join("/"), reference, request).await
         }
+        [name @ .., "manifests", reference]
+            if !name.is_empty()
+                && (*request.method() == Method::GET || *request.method() == Method::HEAD) =>
+        {
+            get_or_head_manifest(state, name.join("/"), reference, request).await
+        }
+        [name @ .., "manifests", _reference]
+            if !name.is_empty() && request.method() == Method::DELETE =>
+        {
+            Err(OciError::Unsupported)
+        }
         _ => Err(OciError::NameInvalid),
     }
+}
+
+async fn get_or_head_manifest(
+    state: MonoApiServiceState,
+    repo: String,
+    reference: &str,
+    request: Request,
+) -> Result<Response, OciError> {
+    if !valid_repository_name(&repo) {
+        return Err(OciError::NameInvalid);
+    }
+    authorize_repo_read(&state.storage.config().git, request.headers(), &repo)?;
+
+    let oci_storage = &state.storage.oci_service.oci_storage;
+    let digest = if reference.starts_with("sha256:") {
+        parse_digest(reference)?.as_str().to_owned()
+    } else {
+        match oci_storage
+            .get_tag(&repo, reference)
+            .await
+            .map_err(|_| OciError::ManifestUnknown)?
+        {
+            Some(tag) => tag.digest,
+            None => {
+                return if oci_storage
+                    .repo_exists(&repo)
+                    .await
+                    .map_err(|_| OciError::ManifestUnknown)?
+                {
+                    Err(OciError::ManifestUnknown)
+                } else {
+                    Err(OciError::NameUnknown)
+                };
+            }
+        }
+    };
+
+    let row = oci_storage
+        .get_manifest(&repo, &digest)
+        .await
+        .map_err(|_| OciError::ManifestUnknown)?
+        .ok_or(OciError::ManifestUnknown)?;
+
+    let etag = format!("\"{digest}\"");
+    if etag_match(request.headers(), &digest) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        let headers = response.headers_mut();
+        headers.insert(
+            "Docker-Content-Digest",
+            HeaderValue::from_str(&digest).map_err(|_| OciError::ManifestInvalid)?,
+        );
+        headers.insert(
+            ETAG,
+            HeaderValue::from_str(&etag).map_err(|_| OciError::ManifestInvalid)?,
+        );
+        return Ok(response);
+    }
+
+    let mut response = if request.method() == Method::HEAD {
+        StatusCode::OK.into_response()
+    } else {
+        let hex = parse_digest(&digest)?.hex().to_owned();
+        let (byte_stream, _meta) = state
+            .storage
+            .oci_service
+            .get_manifest(&hex)
+            .await
+            .map_err(|_| OciError::ManifestUnknown)?;
+        Body::from_stream(byte_stream).into_response()
+    };
+
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&row.media_type).map_err(|_| OciError::ManifestInvalid)?,
+    );
+    headers.insert(
+        "Docker-Content-Digest",
+        HeaderValue::from_str(&digest).map_err(|_| OciError::ManifestInvalid)?,
+    );
+    headers.insert(
+        ETAG,
+        HeaderValue::from_str(&etag).map_err(|_| OciError::ManifestInvalid)?,
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&row.size.to_string()).map_err(|_| OciError::ManifestInvalid)?,
+    );
+    Ok(response)
+}
+
+fn etag_match(headers: &HeaderMap, digest: &str) -> bool {
+    let quoted = format!("\"{digest}\"");
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value == digest || value == quoted)
 }
 
 async fn put_manifest(
@@ -244,7 +356,9 @@ mod tests {
         body::{Body, to_bytes},
         http::{
             Request, StatusCode,
-            header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+            header::{
+                AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE,
+            },
         },
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -466,6 +580,204 @@ mod tests {
                 .expect("utf8")
                 .contains("NAME_INVALID")
         );
+    }
+
+    #[tokio::test]
+    async fn get_manifest_by_tag_200() {
+        let state = state(true).await;
+        let put = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("put");
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get("/team/image/manifests/v1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content-type")
+                .to_str()
+                .expect("valid"),
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert!(response.headers().contains_key("Docker-Content-Digest"));
+    }
+
+    #[tokio::test]
+    async fn get_manifest_by_digest_200() {
+        let state = state(true).await;
+        let put = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("put");
+        let digest = put
+            .headers()
+            .get("Docker-Content-Digest")
+            .expect("digest")
+            .to_str()
+            .expect("valid digest")
+            .to_owned();
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get(format!("/team/image/manifests/{digest}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_manifest_if_none_match_304() {
+        let state = state(true).await;
+        let put = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("put");
+        let digest = put
+            .headers()
+            .get("Docker-Content-Digest")
+            .expect("digest")
+            .to_str()
+            .expect("valid digest")
+            .to_owned();
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get("/team/image/manifests/v1")
+                    .header(IF_NONE_MATCH, &digest)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(response.headers().contains_key("Docker-Content-Digest"));
+        assert!(response.headers().contains_key(ETAG));
+    }
+
+    #[tokio::test]
+    async fn get_manifest_unknown_repo() {
+        let response = oci_routes()
+            .with_state(state(true).await)
+            .oneshot(
+                Request::get("/missing/repo/manifests/v1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("NAME_UNKNOWN")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_manifest_unknown_tag() {
+        // `state()` seeds an `oci_blob_ref` for team/image (no tags), so the
+        // repo is known and a missing tag must be MANIFEST_UNKNOWN, not NAME_UNKNOWN.
+        let response = oci_routes()
+            .with_state(state(true).await)
+            .oneshot(
+                Request::get("/team/image/manifests/missing")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("MANIFEST_UNKNOWN")
+        );
+    }
+
+    #[tokio::test]
+    async fn head_manifest_headers_no_body() {
+        let state = state(true).await;
+        let put = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("put");
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::head("/team/image/manifests/v1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("head");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(CONTENT_TYPE));
+        assert!(response.headers().contains_key("Docker-Content-Digest"));
+        assert!(response.headers().contains_key(ETAG));
+        assert!(response.headers().contains_key(CONTENT_LENGTH));
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn manifest_read_auth_anonymous_off() {
+        let response = oci_routes()
+            .with_state(state(false).await)
+            .oneshot(
+                Request::get("/team/image/manifests/v1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

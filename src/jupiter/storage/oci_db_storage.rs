@@ -152,6 +152,35 @@ impl OciDbStorage {
         Ok(self.get_blob_ref(repo_name, digest).await?.is_some())
     }
 
+    /// Repository existence without an `oci_repository` table (ADR-DR-03):
+    /// any tag, manifest, or blob_ref row for `repo_name`.
+    pub async fn repo_exists(&self, repo_name: &str) -> Result<bool, MegaError> {
+        if oci_tag::Entity::find()
+            .filter(oci_tag::Column::RepoName.eq(repo_name))
+            .limit(1)
+            .one(self.get_connection())
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if oci_manifest::Entity::find()
+            .filter(oci_manifest::Column::RepoName.eq(repo_name))
+            .limit(1)
+            .one(self.get_connection())
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(oci_blob_ref::Entity::find()
+            .filter(oci_blob_ref::Column::RepoName.eq(repo_name))
+            .limit(1)
+            .one(self.get_connection())
+            .await?
+            .is_some())
+    }
+
     pub async fn insert_upload(&self, uuid: &str, repo_name: &str) -> Result<(), MegaError> {
         let now = chrono::Utc::now().fixed_offset();
         oci_upload::Entity::insert(oci_upload::ActiveModel {
