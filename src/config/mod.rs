@@ -142,6 +142,7 @@ impl Config {
             vault: None,
             oauth: None,
             git: GitConfig::default(),
+            oci: OciConfig::default(),
             cedar: CedarConfig::default(),
         }
     }

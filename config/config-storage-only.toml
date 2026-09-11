@@ -349,3 +349,13 @@ token = "${file:/run/secrets/monoengine-push-token}"
 # SSH: none + anonymous_access=true → auth_none clone; none + anonymous_access=false
 # is fail-closed (no UserStorage, no password). Do not seed UserStorage on trunk+none.
 # push_auth = "none"   # opt-in via config/config-storage-only.none.toml + compose override (plan-20260906)
+
+# OCI Distribution (container registry) / 容器镜像仓库 (plan-20260902).
+# Scenario / 场景: this file is the storage-only form (git.push_auth above),
+# so enabling the /v2 surface (docker push/pull against http://<host>:9000)
+# is a single explicit switch. Pulls follow git.anonymous_access; pushes use
+# the [[git.push_tokens]] below via Basic auth (docker login -u any -p <token>).
+# 场景:本文件即 storage-only 形态(push_auth 已显式),启用 /v2 面只需这一个开关.
+# 拉取跟随 anonymous_access;推送用下方 push_tokens 走 Basic 认证.
+[oci]
+enabled = true

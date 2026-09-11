@@ -46,10 +46,24 @@ pub struct Config {
     /// Git protocol settings (docs/refactoring/protocol.md Stage 4).
     #[serde(default)]
     pub git: GitConfig,
+    /// OCI Distribution (container registry) settings, plan-20260902.
+    /// `enabled = true` requires storage-only (`git.push_auth` set); the
+    /// `/v2` protocol surface is only mounted under that combination.
+    #[serde(default)]
+    pub oci: OciConfig,
     /// Authorization enforcement switch (`[cedar]`), ADR-UN-01. Default `off`
     /// (no build, no consume of authorization data).
     #[serde(default)]
     pub cedar: CedarConfig,
+}
+
+/// OCI Distribution (container registry) settings (ADR-DR-01).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct OciConfig {
+    /// Mount `/v2` when true AND `git.storage_only()`. Default `false`
+    /// (fail-closed: the surface is not registered).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]

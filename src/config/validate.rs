@@ -654,6 +654,13 @@ pub(crate) fn validate_trunk_config_surface(config: &Config) -> Result<(), MegaE
             "git.push_auth requires git.ssh_receive_pack=false (SSH receive-pack must be explicitly disabled for storage-only)".to_string(),
         ));
     }
+    if config.oci.enabled && !config.git.storage_only() {
+        return Err(MegaError::Other(
+            "[oci] enabled=true requires git.push_auth (storage-only); the OCI \
+             Distribution surface is only mounted in storage-only deployments"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1529,6 +1536,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "vault",
             "oauth",
             "git",
+            "oci",
             "cedar",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
@@ -1633,6 +1641,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "ssh_receive_pack",
         ]),
         "git.push_tokens" => Some(&["name", "token", "paths"]),
+        "oci" => Some(&["enabled"]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
     }
@@ -3085,6 +3094,25 @@ mod tests {
             admin = ["admin"]
             root_dirs = ["project"]
             push_policy = "trunk"
+            "#,
+        )
+        .unwrap();
+        assert!(reject_unknown_fields(&value).is_ok());
+    }
+
+    #[test]
+    fn reject_unknown_fields_accepts_oci_enabled() {
+        let value = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+            [database]
+            db_url = "postgres://localhost:5432/mono"
+            [monorepo]
+            import_dir = "/third-party"
+            admin = ["admin"]
+            root_dirs = ["project"]
+            [oci]
+            enabled = true
             "#,
         )
         .unwrap();

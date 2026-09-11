@@ -94,6 +94,22 @@ fn trunk_without_push_auth_is_rejected() {
 }
 
 #[test]
+fn oci_enabled_requires_storage_only() {
+    let mut review = valid_config();
+    review.oci.enabled = true;
+    let err = review
+        .validate()
+        .expect_err("[oci] enabled=true must fail closed without git.push_auth");
+    assert!(err.to_string().contains("[oci]"), "{err}");
+
+    let mut storage_only = trunk_config(std::env::temp_dir().as_path());
+    storage_only.oci.enabled = true;
+    storage_only
+        .validate()
+        .expect("[oci] enabled in storage-only");
+}
+
+#[test]
 fn max_push_commits_zero_is_rejected() {
     let mut config = valid_config();
     config.monorepo.max_push_commits = 0;

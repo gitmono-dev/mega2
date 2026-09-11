@@ -349,3 +349,10 @@ enforcement = "off"
 # token = "${file:/run/secrets/team_foo_token}"
 # paths = ["/project/foo"]
 
+# OCI Distribution (container registry, plan-20260902). Storage-only only:
+# enabled=true requires an explicit [git].push_auth ("token" | "none") above,
+# otherwise startup is rejected (fail-closed). The /v2 protocol surface
+# (docker push/pull) is only mounted when both conditions hold.
+# [oci]
+# enabled = true
+
