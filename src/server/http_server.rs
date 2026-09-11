@@ -719,16 +719,13 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         })
     };
 
-    let (router, api) = if protocol_surface {
-        let include_oci = storage_only && config.oci.enabled;
-        let openapi = OpenApiRouter::with_openapi(ApiDoc::openapi())
-            .merge(lfs_router::routers().with_state(api_state.clone()));
-        let openapi = if include_oci {
-            openapi.merge(oci_router::routers().with_state(api_state.clone()))
-        } else {
-            openapi
-        };
-        openapi
+    // OCI OpenAPI stubs document `/v2/...` but must not be merged into the live
+    // OpenApiRouter: those stub routes conflict with the runtime `/{*tail}`
+    // dispatcher nested at `/v2` below. Merge OpenAPI paths into `api` only.
+    let include_oci = protocol_surface && storage_only && config.oci.enabled;
+    let (router, mut api) = if protocol_surface {
+        OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers().with_state(api_state.clone()))
             .nest(
                 "/api/v1",
                 api_router::routers_for(PushPolicy::Trunk).with_state(api_state.clone()),
@@ -766,6 +763,11 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
             .split_for_parts()
     };
 
+    if include_oci {
+        let (_, oci_api) = oci_router::routers().split_for_parts();
+        api.merge(oci_api);
+    }
+
     // Nest `/info/lfs` for both trunk/storage-only and review so Git LFS
     // discovery does not fall through to the smart-protocol catch-all.
     let info_lfs_router: Router = lfs_router::lfs_routes()
@@ -773,12 +775,14 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         .into();
     let router = router.nest("/info/lfs", info_lfs_router);
 
-    // Static `/v2` prefix before catch-all (same pattern as `/info/lfs`).
-    let router = if storage_only && config.oci.enabled {
+    // Static `/v2/` prefix before catch-all (same pattern as `/info/lfs`).
+    // Nest at `/v2/` (trailing slash): axum `nest("/v2")` matches `/v2` and
+    // `/v2/{…}` but not the OCI-canonical `GET /v2/` registry ping.
+    let router = if include_oci {
         let oci = oci_router::oci_routes()
             .route_layer(DefaultBodyLimit::max(DEFAULT_MAX_UPLOAD_CHUNK))
             .with_state(api_state.clone());
-        router.nest("/v2", oci)
+        router.nest("/v2/", oci)
     } else {
         router
     };
