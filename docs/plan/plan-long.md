@@ -769,6 +769,7 @@ flowchart TD
 | [`plan-20260906.md`](plan-20260906.md) | N/A（storage-only / trunk compose Git 黑盒；非 Mega PT） | **已完成** | 一 case 一卡；compose 黑盒；客户端=`git`/`git-lfs`/`ssh`（禁止 libra 作协议客户端）；SO-01 harness → HTTP 读/写/none/LFS → SSH 读 + reject receive-pack → SO-06 收口。 |
 | [`plan-20260908.md`](plan-20260908.md) | N/A（storage-only SSH 只读；非 Mega PT） | **进行中** | **SP-01..SP-05**：SSH upload-pack 对齐 HTTP 读；SP-01=`auth_none`/none 与 SP-02=password-token 已落地；SP-04 cancelled→SP-01；SP-03 索引收口；SP-05 终态 release。DEFER-SP-01..04。每实现/release 卡仅 patch+1。Codex R18 PASS。 |
 | [`plan-20260910.md`](plan-20260910.md) | N/A（merge_writer sunset；非 Mega PT） | **已完成** | CL merge 唯一写者 = MonoWriteQueue；删除 `[monorepo].merge_writer`、Legacy processor、`merge_queue` 表。不删除 `/merge-queue` HTTP 门面（DEFER-MW-01）。 |
+| [`plan-20260902.md`](plan-20260902.md) | N/A（storage-only OCI Distribution；非 Mega PT） | **文档收口**（待 DR-15 release） | DR-01..DR-14：`[oci]` 双重门、4 表元数据、`ObjectNamespace::Oci`、`/v2` 最小 push/pull + tags/list、Basic 复用 push token、两遍流式 complete；文档见 [`../refactoring/oci.md`](../refactoring/oci.md)。不覆盖 `_catalog`/referrers/删除 GC/token 服务（DEFER-DR-01..06）。 |
 
 ## 已替代 / 不采纳 / 已实现摘要
 

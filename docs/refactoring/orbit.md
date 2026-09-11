@@ -194,3 +194,16 @@ monoengine 对 orbit 的"实现 crate 项目引用"实际上**只落在一处**�
 - **核心编译显著瘦身**（阶段 3 后）：从 core 编译图移除 `object_store {cloud,aws,gcp}` 与 AWS/GCP 云 SDK，缩短编译时间、减少依赖攻击面。
 - **可插拔与可测试性提升**：注入边界使内存实现 / 替身存储可直接用于测试与本地运行，`mock_object_storage()` 模式被推广为一等公民。
 - **依赖卫生与边界清晰**：`grep orbit:: src/` 收敛到单一 bootstrap 点（阶段 2）乃至 core 内为 0（阶段 3），消除"项目引用"式的隐式强耦合。
+
+## ObjectNamespace 契约清单
+
+`ObjectNamespace` 变体的 **字符串形式**是稳定契约（实现：`src/orbit_api/object_storage.rs`；变更须走兼容性文档）。现行清单：
+
+| Variant | `as_str()` | 用途 |
+|---|---|---|
+| `Git` | `git` | Git 对象字节 |
+| `Lfs` | `lfs` | Git LFS 对象 |
+| `Log` | `log` | 日志段 |
+| `Artifact` | `artifact` | 构建产物 |
+| `Attachment` | `attachment` | 附件 |
+| `Oci` | `oci` | OCI Distribution 字节（`blobs/` / `manifests/` / `uploads/`；键布局见 [`oci.md`](./oci.md)，plan-20260902 / DR-04+DR-14） |

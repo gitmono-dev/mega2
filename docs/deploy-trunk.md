@@ -239,3 +239,42 @@ git fetch && git reset --hard origin/main
 ```
 
 N = 1 时为 no-op；N > 1 时对齐到 squash tip。子路径 clone（例如 `/project/foo`），不要对 `/` 做根 clone 作为该形态的假设。
+
+## 10. storage-only OCI Distribution（`/v2`）
+
+架构与端点事实源：[`refactoring/oci.md`](./refactoring/oci.md)（plan-20260902）。本节只覆盖运维启用与 `docker login` 认证语义。
+
+### 10.1 启用条件
+
+`/v2` **双重门**：必须同时满足
+
+1. storage-only：配置显式 `git.push_auth`（`token` 或 `none`）——与第 3 节相同；
+2. `[oci] enabled = true`。
+
+缺一则**不挂载** `/v2`（裸 404）。`enabled=true` 且非 storage-only → **启动拒绝**。`config/config-storage-only.toml` 样例已含启用段；review / 省略 `push_auth` 的形态不得打开本开关。
+
+### 10.2 `docker login` 与推送
+
+认证复用 `[[git.push_tokens]]`（无独立 OCI token 服务）：
+
+```bash
+# username 可为任意值；password = push token 密文
+docker login <host> -u oci -p '<push-token>'
+docker tag <local-image> <host>/<repo>:<tag>   # repo 可为多段，如 team/app
+docker push <host>/<repo>:<tag>
+docker pull <host>/<repo>:<tag>
+```
+
+HTTP 明文 registry（如本机 compose `http://127.0.0.1:9000`）需在客户端配置 insecure registry；生产应终止 TLS。
+
+宿主机 live smoke：`bash scripts/oci_smoke_storage_only.sh`（默认 registry `http://127.0.0.1:9000`；token 见 `MONOENGINE_OCI_SMOKE_TOKEN` 或 `secrets/monoengine-push-token.local`）。docker / 端点不可达时脚本 SKIP 并以退出码 0 结束。
+
+### 10.3 认证语义摘要
+
+| 面 | 行为 |
+|---|---|
+| 写（push / upload） | `push_auth=token`：Basic/Bearer 取 token，且 `paths` 必须覆盖 `"/" + repo`；否则 `DENIED`。`push_auth=none`：写全放行（同第 3 节受控网络前提）。 |
+| 读（pull / ping） | 跟随 `git.anonymous_access`：开 → 无凭据可读；关 → 需有效 token。无效凭据恒 401（含 `GET /v2/`，保证 `docker login` 失败可呈现）。 |
+| 跨仓 mount | 目标写授权 + 源读授权。 |
+
+manifest/blob `DELETE` 路由存在但恒返回 OCI `UNSUPPORTED`（405）。`_catalog` / referrers 未实现。
