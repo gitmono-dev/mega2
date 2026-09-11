@@ -47,6 +47,7 @@ use crate::{
             mono_storage::MonoStorage,
             notification_storage::NotificationStorage,
             object_storage::mock_object_storage,
+            oci_db_storage::OciDbStorage,
             push_queue_storage::PushQueueStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
@@ -206,6 +207,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         webhook_storage: WebhookStorage { base: base.clone() },
         audit_storage: AuditStorage { base: base.clone() },
         reaction_storage: ReactionStorage { base: base.clone() },
+        oci_db_storage: OciDbStorage { base: base.clone() },
     };
 
     apply_migrations(&connection, true).await.unwrap();

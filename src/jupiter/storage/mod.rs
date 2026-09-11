@@ -21,6 +21,7 @@ pub mod lfs_db_storage;
 pub mod mono_storage;
 pub mod notification_storage;
 pub mod object_storage;
+pub mod oci_db_storage;
 pub mod push_queue_storage;
 pub mod reaction_storage;
 pub mod stg_common;
@@ -67,6 +68,7 @@ use crate::{
             mono_storage::MonoStorage,
             notification_storage::NotificationStorage,
             object_storage::MegaObjectStorageWrapper,
+            oci_db_storage::OciDbStorage,
             push_queue_storage::PushQueueStorage,
             reaction_storage::ReactionStorage,
             user_storage::UserStorage,
@@ -100,6 +102,7 @@ pub struct AppService {
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
     pub reaction_storage: ReactionStorage,
+    pub oci_db_storage: OciDbStorage,
 }
 
 impl AppService {
@@ -131,6 +134,7 @@ impl AppService {
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
             reaction_storage: ReactionStorage { base: mock.clone() },
+            oci_db_storage: OciDbStorage { base: mock.clone() },
         })
     }
 }
@@ -216,6 +220,7 @@ impl Storage {
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
         let reaction_storage = ReactionStorage { base: base.clone() };
+        let oci_db_storage = OciDbStorage { base: base.clone() };
 
         let git_service = GitService {
             obj_storage: object_store.clone(),
@@ -264,6 +269,7 @@ impl Storage {
             webhook_storage: webhook_storage.clone(),
             audit_storage,
             reaction_storage,
+            oci_db_storage,
         };
         let push_queue_service =
             PushQueueService::new(base.clone(), config.monorepo.push_policy.clone())
@@ -549,6 +555,10 @@ impl Storage {
 
     pub fn bots_storage(&self) -> BotsStorage {
         self.app_service.bots_storage.clone()
+    }
+
+    pub fn oci_db_storage(&self) -> OciDbStorage {
+        self.app_service.oci_db_storage.clone()
     }
 
     #[cfg(test)]
