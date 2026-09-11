@@ -30,7 +30,7 @@
 | `plan-20260827.md` | 日期计划 | **新建**（CL 多 commit push 放开：push 侧链式校验 + 拒绝 merge commit + 修 ref 配对，trunk 侧 CL merge 永远单父新 commit 不动；MC-01..04；设计经 Codex/Claude 双评审有条件批准；下游 = monoui `docs/plan/plan-20260827.md`） |
 | `plan-20260901.md` | 日期计划 | **Claude Code Review PASS**（Mega `bb3ef17` FastCDC media transport，以及 receive-pack 状态安全、导入批处理、DB/Redis 并发和多实例 ID 改进；FC-01..14；R4 通过） |
 | `plan-20260903.md` | 日期计划 | **已完成**（HSH-01/HSH-02：`monorepo.object_format` SHA-1/SHA-256 bootstrap；BLAKE3 fail-closed；DEFER wire/pack/BLAKE3 runtime） |
-| `plan-20260904.md` | 日期计划 | **新建**（AW-01..05；trunk 产品 API 写文件经 MonoWriteQueue；compose 可继承黑盒；Codex R2 **PASS**） |
+| `plan-20260904.md` | 日期计划 | **已完成**（AW-01..05；trunk 产品 API 写经 push_auth + MonoWriteQueue；compose 可继承黑盒 `api_write_smoke_storage_only.sh`；收口 **v0.8.61** / tip 以 AW-05 提交为准；Codex 卡级 PASS） |
 | `plan-20260906.md` | 日期计划 | **已完成**（一 case 一卡；compose 黑盒；测试客户端=git；SO-01..SO-04 / SO-07..15 / SO-17..25；SO-05 cancelled；收口 SO-06） |
 | `plan-20260909.md` | 日期计划 | **已完成**（LF-01..LF-04；Claude+Codex 每卡双 PASS；Storage-only LFS：`push_auth=none` / `token`；supersede plan-20260905「trunk LFS 不可用」） |
 | `plan-20260908.md` | 日期计划 | **已完成**（SP-01..SP-05；SSH upload-pack 对齐 HTTP 读；`auth_none`/password-token；SP-04 cancelled→SP-01；DEFER-SP-01..04；Codex R18 PASS） |
