@@ -12,6 +12,7 @@ pub mod group_router;
 pub mod label_router;
 pub mod lfs_router;
 pub mod merge_queue_router;
+pub mod oci_router;
 pub mod preview_router;
 pub mod push_queue_router;
 pub mod repo_router;

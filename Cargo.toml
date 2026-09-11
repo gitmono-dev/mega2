@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.8.44"
+version = "0.8.45"
 edition = "2024"
 # Two [[bin]] targets exist; keep `cargo run -p monoengine` unambiguous.
 default-run = "monoengine"
