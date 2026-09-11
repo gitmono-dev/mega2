@@ -5,5 +5,6 @@ pub mod diff;
 pub mod lfs;
 pub mod merge_checker;
 pub mod model;
+pub mod oci;
 pub mod pack;
 pub mod protocol;
