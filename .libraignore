@@ -32,6 +32,7 @@ target-codex-review/
 # Test credentials (never commit)
 .env.test
 .env
+secrets/
 
 # Host binary staging for Dockerfile.it-runtime (CI/local compose image)
 monoengine.itbin
