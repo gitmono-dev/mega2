@@ -6,7 +6,10 @@ use axum::{
     extract::{Path, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+        header::{
+            ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+            IF_RANGE, RANGE,
+        },
     },
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -94,8 +97,152 @@ async fn dispatch(
         {
             Err(OciError::Unsupported)
         }
+        [name @ .., "blobs", digest]
+            if !name.is_empty()
+                && *digest != "uploads"
+                && (*request.method() == Method::GET || *request.method() == Method::HEAD) =>
+        {
+            get_or_head_blob(state, name.join("/"), digest, request).await
+        }
+        [name @ .., "blobs", digest]
+            if !name.is_empty() && *digest != "uploads" && request.method() == Method::DELETE =>
+        {
+            Err(OciError::Unsupported)
+        }
         _ => Err(OciError::NameInvalid),
     }
+}
+
+async fn get_or_head_blob(
+    state: MonoApiServiceState,
+    repo: String,
+    digest_raw: &str,
+    request: Request,
+) -> Result<Response, OciError> {
+    if !valid_repository_name(&repo) {
+        return Err(OciError::NameInvalid);
+    }
+    authorize_repo_read(&state.storage.config().git, request.headers(), &repo)?;
+
+    let digest = parse_digest(digest_raw)?;
+    let blob_ref = state
+        .storage
+        .oci_service
+        .oci_storage
+        .get_blob_ref(&repo, digest.as_str())
+        .await
+        .map_err(|_| OciError::BlobUnknown)?
+        .ok_or(OciError::BlobUnknown)?;
+    let size = blob_ref.size.max(0) as u64;
+
+    if request.method() == Method::HEAD {
+        let mut response = StatusCode::OK.into_response();
+        insert_blob_headers(response.headers_mut(), digest.as_str(), size)?;
+        return Ok(response);
+    }
+
+    match resolve_blob_range(request.headers(), size)? {
+        BlobGetMode::Full => {
+            let (byte_stream, _meta) = state
+                .storage
+                .oci_service
+                .get_blob(digest.hex())
+                .await
+                .map_err(|_| OciError::BlobUnknown)?;
+            let mut response = Body::from_stream(byte_stream).into_response();
+            *response.status_mut() = StatusCode::OK;
+            insert_blob_headers(response.headers_mut(), digest.as_str(), size)?;
+            Ok(response)
+        }
+        BlobGetMode::Partial { start, end } => {
+            let length = end - start + 1;
+            let (byte_stream, _meta) = state
+                .storage
+                .oci_service
+                .get_blob_range(digest.hex(), start, Some(end + 1))
+                .await
+                .map_err(|_| OciError::BlobUnknown)?;
+            let mut response = Body::from_stream(byte_stream).into_response();
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            let headers = response.headers_mut();
+            insert_blob_headers(headers, digest.as_str(), length)?;
+            headers.insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+                    .map_err(|_| OciError::BlobUnknown)?,
+            );
+            Ok(response)
+        }
+    }
+}
+
+fn insert_blob_headers(
+    headers: &mut HeaderMap,
+    digest: &str,
+    content_length: u64,
+) -> Result<(), OciError> {
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string()).map_err(|_| OciError::BlobUnknown)?,
+    );
+    headers.insert(
+        "Docker-Content-Digest",
+        HeaderValue::from_str(digest).map_err(|_| OciError::BlobUnknown)?,
+    );
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BlobGetMode {
+    Full,
+    Partial { start: u64, end: u64 },
+}
+
+/// Resolve a single `bytes=` Range. Multi-range and `If-Range` are ignored
+/// (full 200), matching distribution-compatible registry behavior.
+fn resolve_blob_range(headers: &HeaderMap, size: u64) -> Result<BlobGetMode, OciError> {
+    if headers.contains_key(IF_RANGE) {
+        return Ok(BlobGetMode::Full);
+    }
+    let Some(value) = headers.get(RANGE) else {
+        return Ok(BlobGetMode::Full);
+    };
+    let Ok(value) = value.to_str() else {
+        return Ok(BlobGetMode::Full);
+    };
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return Ok(BlobGetMode::Full);
+    };
+    if spec.contains(',') {
+        return Ok(BlobGetMode::Full);
+    }
+    let Some((start_spec, end_spec)) = spec.split_once('-') else {
+        return Ok(BlobGetMode::Full);
+    };
+    let start_spec = start_spec.trim();
+    let end_spec = end_spec.trim();
+    if start_spec.is_empty() {
+        return Ok(BlobGetMode::Full);
+    }
+    let Ok(start) = start_spec.parse::<u64>() else {
+        return Ok(BlobGetMode::Full);
+    };
+    if start >= size {
+        return Err(OciError::RangeInvalid);
+    }
+    let end = if end_spec.is_empty() {
+        size.saturating_sub(1)
+    } else {
+        let Ok(requested_end) = end_spec.parse::<u64>() else {
+            return Ok(BlobGetMode::Full);
+        };
+        if requested_end < start {
+            return Ok(BlobGetMode::Full);
+        }
+        requested_end.min(size.saturating_sub(1))
+    };
+    Ok(BlobGetMode::Partial { start, end })
 }
 
 async fn get_or_head_manifest(
@@ -357,11 +504,13 @@ mod tests {
         http::{
             Request, StatusCode,
             header::{
-                AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE,
+                ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+                IF_NONE_MATCH, RANGE, WWW_AUTHENTICATE,
             },
         },
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use bytes::Bytes;
     use tower::ServiceExt;
 
     use super::oci_routes;
@@ -371,13 +520,14 @@ mod tests {
             oauth::api_store::{BrowserSessionStore, CountingSessionStore},
         },
         bellatrix::Bellatrix,
-        ceres::api_service::cache::GitObjectCache,
+        ceres::{api_service::cache::GitObjectCache, oci::digest::compute_digest},
         config::{GitConfig, PushAuth, PushTokenConfig, testing::isolated_config},
         contract::policy::entitystore::SharedEntityStore,
         jupiter::{
             service::oci_service::OciService,
             storage::{Storage, object_storage::mock_object_storage},
             tests::{test_db_config, test_storage_with_config},
+            utils::into_obj_stream::IntoObjectStream,
         },
     };
 
@@ -440,6 +590,24 @@ mod tests {
             AUTHORIZATION,
             format!("Basic {}", STANDARD.encode("any:secret")),
         )
+    }
+
+    async fn seed_blob(state: &MonoApiServiceState, bytes: &[u8]) -> String {
+        let digest = compute_digest(bytes);
+        state
+            .storage
+            .oci_service
+            .put_blob(digest.hex(), Bytes::copy_from_slice(bytes).into_stream())
+            .await
+            .expect("put blob bytes");
+        state
+            .storage
+            .oci_service
+            .oci_storage
+            .put_blob_ref("team/image", digest.as_str(), bytes.len() as i64)
+            .await
+            .expect("put blob ref");
+        digest.as_str().to_owned()
     }
 
     #[tokio::test]
@@ -777,6 +945,183 @@ mod tests {
             )
             .await
             .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn head_blob_sets_three_headers() {
+        let state = state(true).await;
+        let digest = seed_blob(&state, b"blob-bytes").await;
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::head(format!("/team/image/blobs/{digest}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("head");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .expect("content-length")
+                .to_str()
+                .expect("valid"),
+            "10"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Docker-Content-Digest")
+                .expect("digest")
+                .to_str()
+                .expect("valid"),
+            digest
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(ACCEPT_RANGES)
+                .expect("accept-ranges")
+                .to_str()
+                .expect("valid"),
+            "bytes"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_blob_returns_source_bytes() {
+        let state = state(true).await;
+        let payload = b"source-blob-payload";
+        let digest = seed_blob(&state, payload).await;
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get(format!("/team/image/blobs/{digest}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Docker-Content-Digest")
+                .expect("digest")
+                .to_str()
+                .expect("valid"),
+            digest
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn get_blob_range_206_content_range() {
+        let state = state(true).await;
+        let payload = b"0123456789";
+        let digest = seed_blob(&state, payload).await;
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get(format!("/team/image/blobs/{digest}"))
+                    .header(RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_RANGE)
+                .expect("content-range")
+                .to_str()
+                .expect("valid"),
+            "bytes 2-5/10"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.as_ref(), b"2345");
+    }
+
+    #[tokio::test]
+    async fn get_blob_range_start_ge_size_416() {
+        let state = state(true).await;
+        let digest = seed_blob(&state, b"abcd").await;
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get(format!("/team/image/blobs/{digest}"))
+                    .header(RANGE, "bytes=4-7")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("RANGE_INVALID")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_blob_unknown_404() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let response = oci_routes()
+            .with_state(state(true).await)
+            .oneshot(
+                Request::get(format!("/team/image/blobs/{digest}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("BLOB_UNKNOWN")
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_read_auth_anonymous_off() {
+        let state = state(false).await;
+        let digest = seed_blob(&state, b"auth-check").await;
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get(format!("/team/image/blobs/{digest}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
