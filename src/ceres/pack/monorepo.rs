@@ -28,7 +28,7 @@ use crate::{
     callisto::{
         entity_ext::generate_link,
         mega_cl, mega_code_review_anchor, mega_refs,
-        sea_orm_active_enums::{PositionStatusEnum, PushQueueKindEnum, RefTypeEnum},
+        sea_orm_active_enums::{PositionStatusEnum, RefTypeEnum},
     },
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
@@ -37,6 +37,7 @@ use crate::{
         model::change_list::ClDiffFile,
         pack::{
             RepoHandler,
+            api_tip_lander::{land_api_tip_push, trunk_nff_align_message},
             push_chain::{self, PushChain, PushChainResolution},
         },
         protocol::import_refs::{CommandType, RefCommand, Refs},
@@ -54,10 +55,7 @@ use crate::{
         },
     },
     jupiter::{
-        service::push_queue_service::{
-            EnqueueRequest, ExecuteOutcome, ExecuteRequest, PushExecContext, PushPayload,
-            QueueWaitResult, push_operation_id,
-        },
+        service::push_queue_service::PushPayload,
         storage::{Storage, blob_path_index::BlobPathIndexMode},
         utils::converter::FromMegaModel,
     },
@@ -100,17 +98,6 @@ pub struct Monorepo {
 /// refusals tell the client how to align. Real `git push` without fetch+reset
 /// either NFF-fails in B3 (`old_id` mismatch) or fails chain validation when
 /// the client force-sends a history that does not include the squash.
-fn trunk_nff_align_message(message: &str) -> String {
-    const ALIGN: &str = "git fetch && git reset --hard origin/main";
-    let needs_align =
-        message.contains("non-fast-forward") || message.contains("push chain is broken");
-    if needs_align && !message.contains(ALIGN) {
-        format!("{message}; align with `{ALIGN}`")
-    } else {
-        message.to_owned()
-    }
-}
-
 fn trunk_align_finalize_err(err: MegaError) -> MegaError {
     let raw = err.to_string();
     let aligned = trunk_nff_align_message(&raw);
@@ -1243,22 +1230,16 @@ impl Monorepo {
             .path
             .to_str()
             .ok_or_else(|| MegaError::Other("repository path is not valid UTF-8".into()))?;
-        let wait = self
-            .storage
-            .push_queue_service
-            .enqueue_and_wait(EnqueueRequest {
-                kind: PushQueueKindEnum::Push,
-                operation_id: push_operation_id(&cmd.old_id, &cmd.new_id),
-                path: path.to_owned(),
-                old_id: cmd.old_id.clone(),
-                new_id: cmd.new_id.clone(),
-                requester: self.username.clone(),
-                payload: payload.to_json(),
-                ref_name: Some(cmd.ref_name.clone()),
-                is_delete: false,
-            })
-            .await?;
-        let landed = self.follow_push_queue(wait).await?;
+        let landed = land_api_tip_push(
+            &self.storage,
+            self.git_object_cache.clone(),
+            path,
+            &cmd.old_id,
+            &cmd.new_id,
+            self.username.clone(),
+            &payload,
+        )
+        .await?;
         if payload.n > 1 {
             *self
                 .no_op_notice
@@ -1268,82 +1249,6 @@ impl Monorepo {
             ));
         }
         Ok(())
-    }
-
-    async fn follow_push_queue(&self, mut wait: QueueWaitResult) -> Result<String, MegaError> {
-        const MAX_ROUNDS: usize = 32;
-        let ctx = PushExecContext {
-            storage: self.storage.clone(),
-            git_object_cache: self.git_object_cache.clone(),
-        };
-        for _ in 0..MAX_ROUNDS {
-            match wait {
-                QueueWaitResult::Replayed {
-                    landed_commit_id, ..
-                } => {
-                    return landed_commit_id.ok_or_else(|| {
-                        MegaError::Other("push replay missing landed_commit_id".into())
-                    });
-                }
-                QueueWaitResult::Abandoned { id } => {
-                    return Err(MegaError::Other(format!(
-                        "push wait abandoned for push_queue id {id}"
-                    )));
-                }
-                QueueWaitResult::Rejected { id, message } => {
-                    return Err(MegaError::Other(format!(
-                        "push rejected for push_queue id {id}: {}",
-                        trunk_nff_align_message(&message)
-                    )));
-                }
-                QueueWaitResult::Ready { id } => {
-                    let outcome = self
-                        .storage
-                        .push_queue_service
-                        .execute_b3(
-                            ExecuteRequest {
-                                id,
-                                ..Default::default()
-                            },
-                            None,
-                            None,
-                            Some(&ctx),
-                        )
-                        .await?;
-                    match outcome {
-                        ExecuteOutcome::Done {
-                            landed_commit_id, ..
-                        } => return Ok(landed_commit_id),
-                        ExecuteOutcome::Requeued { successor_id, .. } => {
-                            wait = self
-                                .storage
-                                .push_queue_service
-                                .wait_and_claim(successor_id)
-                                .await?;
-                        }
-                        ExecuteOutcome::ClaimLost { id } => {
-                            wait = self.storage.push_queue_service.wait_and_claim(id).await?;
-                        }
-                        ExecuteOutcome::Failed { message, .. } => {
-                            return Err(MegaError::Other(trunk_nff_align_message(&message)));
-                        }
-                        ExecuteOutcome::HardStopped { id } => {
-                            return Err(MegaError::Other(format!(
-                                "push hard-stopped for push_queue id {id}"
-                            )));
-                        }
-                        ExecuteOutcome::BypassDetected { id } => {
-                            return Err(MegaError::Other(format!(
-                                "queue bypass detected for push_queue id {id}"
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        Err(MegaError::Other(
-            "push follow exceeded max conflict requeue rounds".into(),
-        ))
     }
 
     pub async fn get_commit_blobs(
@@ -1545,7 +1450,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    use super::{Monorepo, RepoHandler, trunk_nff_align_message};
+    use super::{Monorepo, RepoHandler};
     use crate::{
         bellatrix::Bellatrix,
         callisto::{
@@ -1553,7 +1458,8 @@ mod tests {
             sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
         },
         ceres::{
-            api_service::cache::GitObjectCache, pack::materialize,
+            api_service::cache::GitObjectCache,
+            pack::{api_tip_lander::trunk_nff_align_message, materialize},
             protocol::import_refs::RefCommand,
         },
         common::{

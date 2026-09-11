@@ -38,6 +38,7 @@ use crate::{
 #[rustfmt::skip]
 use crate::orbit_api::{error::IoOrbitError, object_storage::MultiObjectByteStream};
 
+pub mod api_tip_lander;
 pub mod import_repo;
 pub mod materialize;
 pub mod monorepo;

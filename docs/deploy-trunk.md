@@ -19,6 +19,8 @@ ssh_receive_pack = false # storage-only 必须显式写 false，省略会拒绝�
 
 CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20260910.md`](./plan/plan-20260910.md)）。残留该键按未知字段拒绝启动。
 
+产品 **API 写**（`create-entry` / `edit/save`，见 [`plan-20260904.md`](./plan/plan-20260904.md)）在 trunk 下同样经 **MonoWriteQueue** 前进 path tip（与 `git push` 同 tip 权威）；完整 HTTP 鉴权与路由契约由后续卡片落地，本节仅登记「API 写经队列」不变量。
+
 启动期 fail-closed（`Config::validate` / `AppContext::new`）：
 
 1. `trunk` + `cedar.enforcement != "off"` → 拒绝。
