@@ -24,12 +24,14 @@ ARG GIT_LFS_VERSION=3.7.1
 
 USER root
 
-# Install bash + postgresql-client (psql) on top of the alpine/git base.
-# ripgrep (rg) is used by scripts/git_protocol_smoke.sh for ref assertions.
+# Install bash + postgresql-client (psql) + curl + ripgrep on top of alpine/git.
+# curl: product API write smoke (scripts/api_write_smoke_storage_only.sh).
+# ripgrep (rg): ref/content assertions in protocol and API smoke scripts.
 RUN set -eux; \
-    apk add --no-cache bash postgresql-client ripgrep; \
+    apk add --no-cache bash postgresql-client curl ripgrep; \
     test -x /bin/bash; \
     test -x /usr/bin/psql; \
+    test -x /usr/bin/curl; \
     test -x /usr/bin/rg
 
 # Install git-lfs (same pinned version as Dockerfile.git-cli).

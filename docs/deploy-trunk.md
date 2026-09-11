@@ -130,6 +130,20 @@ docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
 
 Trunk / storage-only 协议冒烟使用 **`scripts/git_protocol_smoke_storage_only.sh`**，经 compose `--profile smoke` 的 `git-smoke` 容器内真实 **`git` / `git-lfs` / `ssh`** 调用已发布端口。这是 **compose 黑盒**，与 cargo `CARGO_BIN_EXE` 黑盒分层并存；**不要**用 `libra` 作协议客户端，也**不要**在 trunk 上跑 review/CL 语义的 `scripts/git_protocol_smoke.sh`。
 
+产品 **API 写 → Git 可见性** 另用 **`scripts/api_write_smoke_storage_only.sh`**（`curl` + `git`；同样禁止 `libra` 客户端）：
+
+```bash
+TOKEN='monoengine-storage-only-local-dev-token-0001'
+docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  exec -T \
+  -e MONOENGINE_HTTP_REPO_URL="http://x:${TOKEN}@monoengine:8000/" \
+  -e MONOENGINE_API_BASE=http://monoengine:8000 \
+  -e MONOENGINE_IT_SEED_TOKEN="${TOKEN}" \
+  git-smoke bash /repo/scripts/api_write_smoke_storage_only.sh
+```
+
+稳定 case：`API create-entry then git clone sees file`、`API edit/save then git pull sees update`、`API write rejects unauthenticated`。summary 须 `0 failed`。可被 plan-20260906 吸收为附加 case（见 `docs/refactoring/test-infra.md`）。
+
 ```bash
 docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
   exec -T \

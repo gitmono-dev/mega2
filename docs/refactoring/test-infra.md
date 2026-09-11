@@ -37,6 +37,11 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 - **边界：** **不**使用 `libra` 作协议客户端（本仓 VCS 与冒烟观察者正交）；
   **不**替代 `CARGO_BIN_EXE` 黑盒 IT；review/CL 冒烟仍用
   `scripts/git_protocol_smoke.sh`，勿在 trunk 上当作成功门。
+- **API 写 → Git 可见性（plan-20260904）：** `scripts/api_write_smoke_storage_only.sh`
+  （`curl` + `git`）可与协议 smoke 并列在同一 `git-smoke` 容器执行；运维入口见
+  [`deploy-trunk.md`](../deploy-trunk.md)。该脚本独立于 plan-20260906 的 SO case
+  编号；**plan-20260906** 后续可吸收 `api_write_smoke_storage_only.sh` 的稳定
+  case 名为附加 VER（本仓不要求 60906 已吸收才算 AW-04 完成）。
 
 单元测试（纯逻辑、无外部依赖）仍放在对应源文件的 `#[cfg(test)]` 中，不另立规范。
 

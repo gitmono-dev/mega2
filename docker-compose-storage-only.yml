@@ -186,6 +186,15 @@ services:
   #         MONOENGINE_GIT_SMOKE_PUSH=1 \
   #         bash /repo/scripts/git_protocol_smoke_storage_only.sh
   #
+  # Product API write → Git visibility (plan-20260904 AW-04; curl+git):
+  #   TOKEN='monoengine-storage-only-local-dev-token-0001'
+  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  #     exec -T \
+  #     -e MONOENGINE_HTTP_REPO_URL="http://x:${TOKEN}@monoengine:8000/" \
+  #     -e MONOENGINE_API_BASE=http://monoengine:8000 \
+  #     -e MONOENGINE_IT_SEED_TOKEN="${TOKEN}" \
+  #     git-smoke bash /repo/scripts/api_write_smoke_storage_only.sh
+  #
   # Persist host log: tee to target/tmp/so-smoke-*.log (see docs/deploy-trunk.md).
   # Review/CL smoke remains scripts/git_protocol_smoke.sh (do not use on trunk).
   #
