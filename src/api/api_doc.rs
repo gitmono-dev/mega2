@@ -17,6 +17,8 @@ pub const MERGE_QUEUE_TAG: &str = "Merge Queue Management";
 pub const PUSH_QUEUE_TAG: &str = "MonoWriteQueue Control";
 pub const BUCK_TAG: &str = "Buck Upload API";
 pub const LFS_TAG: &str = "Git LFS";
+/// OpenAPI tag for OCI Distribution API (`/v2/...`).
+pub const OCI_TAG: &str = "OCI Distribution";
 pub const CODE_REVIEW_TAG: &str = "Code Review";
 pub const GROUP_PERMISSION_TAG: &str = "Group Permission Management";
 

@@ -3,7 +3,7 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use axum::{
     Router, ServiceExt,
     body::Body,
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     http::{self, Request, Uri},
     middleware,
     response::Response,
@@ -28,7 +28,7 @@ use crate::{
         api_doc::ApiDoc,
         api_router::{self},
         oauth::{api_store::BrowserSessionStore, website_session_store::WebsiteSessionStore},
-        router::lfs_router,
+        router::{lfs_router, oci_router},
     },
     bellatrix::Bellatrix,
     ceres::{
@@ -49,7 +49,10 @@ use crate::{
             guard::cedar_guard::cedar_guard,
         },
     },
-    jupiter::{service::artifact_service::ArtifactService, utils::converter::FromMegaModel},
+    jupiter::{
+        service::{artifact_service::ArtifactService, oci_service::DEFAULT_MAX_UPLOAD_CHUNK},
+        utils::converter::FromMegaModel,
+    },
     server::{CommonHttpOptions, trace_context},
 };
 
@@ -717,8 +720,15 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
     };
 
     let (router, api) = if protocol_surface {
-        OpenApiRouter::with_openapi(ApiDoc::openapi())
-            .merge(lfs_router::routers().with_state(api_state.clone()))
+        let include_oci = storage_only && config.oci.enabled;
+        let openapi = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers().with_state(api_state.clone()));
+        let openapi = if include_oci {
+            openapi.merge(oci_router::routers().with_state(api_state.clone()))
+        } else {
+            openapi
+        };
+        openapi
             .nest(
                 "/api/v1",
                 api_router::routers_for(PushPolicy::Trunk).with_state(api_state.clone()),
@@ -735,6 +745,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
             .with_state(api_state.clone())
             .split_for_parts()
     } else {
+        // Review morphology: never register OCI `/v2` (ADR-DR-01 fail-closed).
         OpenApiRouter::with_openapi(ApiDoc::openapi())
             .merge(lfs_router::routers().with_state(api_state.clone()))
             .nest(
@@ -762,26 +773,44 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         .into();
     let router = router.nest("/info/lfs", info_lfs_router);
 
+    // Static `/v2` prefix before catch-all (same pattern as `/info/lfs`).
+    let router = if storage_only && config.oci.enabled {
+        let oci = oci_router::oci_routes()
+            .route_layer(DefaultBodyLimit::max(DEFAULT_MAX_UPLOAD_CHUNK))
+            .with_state(api_state.clone());
+        router.nest("/v2", oci)
+    } else {
+        router
+    };
+
     Ok(router.merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
 }
 
-pub(crate) fn storage_only_openapi_doc() -> utoipa::openapi::OpenApi {
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
+pub(crate) fn storage_only_openapi_doc(include_oci: bool) -> utoipa::openapi::OpenApi {
+    let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(lfs_router::routers())
-        .nest("/api/v1", api_router::storage_only_routers())
-        .split_for_parts()
-        .1
+        .nest("/api/v1", api_router::storage_only_routers());
+    let router = if include_oci {
+        router.merge(oci_router::routers())
+    } else {
+        router
+    };
+    router.split_for_parts().1
 }
 
 /// OpenAPI for `push_policy=trunk` HTTP (includes LFS merge). Same `/api/v1`
 /// subset as storage-only; assembled via [`api_router::routers_for`] so
 /// the surface is keyed on morphology, not only `push_auth`.
-pub(crate) fn trunk_openapi_doc() -> utoipa::openapi::OpenApi {
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
+pub(crate) fn trunk_openapi_doc(include_oci: bool) -> utoipa::openapi::OpenApi {
+    let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(lfs_router::routers())
-        .nest("/api/v1", api_router::routers_for(PushPolicy::Trunk))
-        .split_for_parts()
-        .1
+        .nest("/api/v1", api_router::routers_for(PushPolicy::Trunk));
+    let router = if include_oci {
+        router.merge(oci_router::routers())
+    } else {
+        router
+    };
+    router.split_for_parts().1
 }
 
 fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
@@ -1208,7 +1237,7 @@ mod tests {
 
     #[test]
     fn storage_only_openapi_is_readonly_protocol_subset() {
-        let api = storage_only_openapi_doc();
+        let api = storage_only_openapi_doc(false);
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
             paths.iter().any(|p| p.ends_with("/status")),
@@ -1224,6 +1253,10 @@ mod tests {
             paths.iter().any(|p| p.contains("/lfs")),
             "storage-only OpenAPI must include LFS: {paths:?}"
         );
+        assert!(
+            paths.iter().all(|p| !p.contains("/v2")),
+            "storage-only OpenAPI without include_oci must omit /v2: {paths:?}"
+        );
         for needle in ["/auth", "create-entry", "/cl", "/user"] {
             assert!(
                 paths.iter().all(|p| !p.contains(needle)),
@@ -1233,8 +1266,25 @@ mod tests {
     }
 
     #[test]
+    fn storage_only_openapi_include_oci_dual_state() {
+        let with_oci = storage_only_openapi_doc(true);
+        let with_paths: Vec<String> = with_oci.paths.paths.keys().cloned().collect();
+        assert!(
+            with_paths.iter().any(|p| p.contains("/v2")),
+            "include_oci=true must document /v2: {with_paths:?}"
+        );
+
+        let without_oci = storage_only_openapi_doc(false);
+        let without_paths: Vec<String> = without_oci.paths.paths.keys().cloned().collect();
+        assert!(
+            without_paths.iter().all(|p| !p.contains("/v2")),
+            "include_oci=false must omit /v2: {without_paths:?}"
+        );
+    }
+
+    #[test]
     fn trunk_openapi_omits_cl_issue_reviewer_preview_writes_keeps_lfs() {
-        let api = trunk_openapi_doc();
+        let api = trunk_openapi_doc(false);
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
             paths
@@ -1245,6 +1295,10 @@ mod tests {
         assert!(
             paths.iter().any(|p| p.contains("/lfs")),
             "trunk OpenAPI must include LFS: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains("/v2")),
+            "trunk OpenAPI without include_oci must omit /v2: {paths:?}"
         );
         for needle in [
             "/cl",
@@ -1259,6 +1313,36 @@ mod tests {
                 "trunk OpenAPI must not include {needle}: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn trunk_openapi_include_oci_dual_state() {
+        let with_oci = trunk_openapi_doc(true);
+        let with_paths: Vec<String> = with_oci.paths.paths.keys().cloned().collect();
+        assert!(
+            with_paths.iter().any(|p| p.contains("/v2")),
+            "include_oci=true must document /v2: {with_paths:?}"
+        );
+
+        let without_oci = trunk_openapi_doc(false);
+        let without_paths: Vec<String> = without_oci.paths.paths.keys().cloned().collect();
+        assert!(
+            without_paths.iter().all(|p| !p.contains("/v2")),
+            "include_oci=false must omit /v2: {without_paths:?}"
+        );
+    }
+
+    #[test]
+    fn review_openapi_never_includes_oci() {
+        let (_, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .merge(lfs_router::routers())
+            .nest("/api/v1", api_router::routers())
+            .split_for_parts();
+        let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
+        assert!(
+            paths.iter().all(|p| !p.contains("/v2")),
+            "review OpenAPI must never include OCI /v2: {paths:?}"
+        );
     }
 
     #[test]

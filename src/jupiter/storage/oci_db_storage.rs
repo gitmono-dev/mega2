@@ -153,6 +153,17 @@ impl OciDbStorage {
         Ok(self.get_blob_ref(repo_name, digest).await?.is_some())
     }
 
+    /// True when the repo has at least one `oci_manifest` row (ADR-DR-03
+    /// `NAME_UNKNOWN` for tags/list).
+    pub async fn manifest_exists(&self, repo_name: &str) -> Result<bool, MegaError> {
+        Ok(oci_manifest::Entity::find()
+            .filter(oci_manifest::Column::RepoName.eq(repo_name))
+            .limit(1)
+            .one(self.get_connection())
+            .await?
+            .is_some())
+    }
+
     /// Repository existence without an `oci_repository` table (ADR-DR-03):
     /// any tag, manifest, or blob_ref row for `repo_name`.
     pub async fn repo_exists(&self, repo_name: &str) -> Result<bool, MegaError> {

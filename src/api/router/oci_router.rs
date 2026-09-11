@@ -1,14 +1,14 @@
 use std::sync::LazyLock;
 
 use axum::{
-    Router,
+    Json, Router,
     body::{Body, to_bytes},
     extract::{Path, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
             ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-            IF_RANGE, LOCATION, RANGE,
+            IF_RANGE, LINK, LOCATION, RANGE,
         },
     },
     response::{IntoResponse, Response},
@@ -16,11 +16,12 @@ use axum::{
 };
 use bytes::Bytes;
 use regex::Regex;
+use serde::Serialize;
 use url::form_urlencoded;
-use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::MonoApiServiceState,
+    api::{MonoApiServiceState, api_doc::OCI_TAG},
     ceres::oci::{
         auth::{
             authorize_repo_read, authorize_repo_write, registry_ping_allowed,
@@ -42,6 +43,8 @@ use crate::{
 
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const REGISTRY_API_VERSION: &str = "registry/2.0";
+/// Default / max page size for `GET .../tags/list` (`n` query).
+const DEFAULT_TAGS_PAGE_SIZE: u64 = 100;
 
 /// OCI repository path (`remoteName`): one or more `/`-separated path components.
 /// Each component is `alphanumeric(?:(?:[._]|__|[-]+)alphanumeric)*`, matching
@@ -63,10 +66,47 @@ pub fn oci_routes() -> Router<MonoApiServiceState> {
         .route("/{*tail}", any(dispatch))
 }
 
-/// OCI's OpenAPI contribution. Fine-grained operations are documented when
-/// the full route family is mounted in DR-11.
+/// OCI's OpenAPI contribution (merged when `include_oci=true`).
+///
+/// Runtime traffic uses [`oci_routes`]; this router documents the `/v2` surface
+/// for Swagger / OpenAPI assembly.
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
+        .routes(routes!(openapi_registry_ping))
+        .routes(routes!(openapi_tags_list))
+}
+
+#[derive(Serialize)]
+struct TagsListResponse {
+    name: String,
+    tags: Vec<String>,
+}
+
+/// OpenAPI-only stub: registry base path.
+#[utoipa::path(
+    get,
+    path = "/v2/",
+    responses((status = 200, description = "Registry API version check")),
+    tag = OCI_TAG
+)]
+async fn openapi_registry_ping() -> StatusCode {
+    StatusCode::OK
+}
+
+/// OpenAPI-only stub: tags list path.
+#[utoipa::path(
+    get,
+    path = "/v2/{name}/tags/list",
+    params(
+        ("name" = String, Path, description = "Repository name (may contain `/`)"),
+        ("n" = Option<u64>, Query, description = "Maximum tags to return (default/max 100)"),
+        ("last" = Option<String>, Query, description = "Return tags lexicographically after this tag"),
+    ),
+    responses((status = 200, description = "Tag list for the repository")),
+    tag = OCI_TAG
+)]
+async fn openapi_tags_list() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn ping(
@@ -142,8 +182,90 @@ async fn dispatch(
         {
             delete_blob_upload(state, name.join("/"), uuid, request).await
         }
+        [name @ .., "tags", "list"] if !name.is_empty() && request.method() == Method::GET => {
+            list_tags(state, name.join("/"), request).await
+        }
         _ => Err(OciError::NameInvalid),
     }
+}
+
+async fn list_tags(
+    state: MonoApiServiceState,
+    repo: String,
+    request: Request,
+) -> Result<Response, OciError> {
+    if !valid_repository_name(&repo) {
+        return Err(OciError::NameInvalid);
+    }
+    authorize_repo_read(&state.storage.config().git, request.headers(), &repo)?;
+
+    let query = request.uri().query();
+    let limit = parse_tags_page_limit(query)?;
+    let last = query_param(query, "last");
+
+    let oci_storage = &state.storage.oci_service.oci_storage;
+    if !oci_storage
+        .manifest_exists(&repo)
+        .await
+        .map_err(|_| OciError::NameUnknown)?
+    {
+        return Err(OciError::NameUnknown);
+    }
+
+    // Fetch one extra row to detect a following page (distribution Link style).
+    let fetch_limit = if limit == 0 {
+        0
+    } else {
+        limit.saturating_add(1)
+    };
+    let rows = if fetch_limit == 0 {
+        Vec::new()
+    } else {
+        oci_storage
+            .list_tags(&repo, last.as_deref(), fetch_limit)
+            .await
+            .map_err(|_| OciError::NameUnknown)?
+    };
+
+    let more = limit > 0 && rows.len() as u64 > limit;
+    let tags: Vec<String> = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(|row| row.tag)
+        .collect();
+
+    let mut response = Json(TagsListResponse {
+        name: repo.clone(),
+        tags: tags.clone(),
+    })
+    .into_response();
+
+    if more {
+        let last_tag = tags.last().ok_or(OciError::NameUnknown)?;
+        let link = format!(
+            "</v2/{repo}/tags/list?n={limit}&last={}>; rel=\"next\"",
+            form_urlencoded::byte_serialize(last_tag.as_bytes()).collect::<String>()
+        );
+        response.headers_mut().insert(
+            LINK,
+            HeaderValue::from_str(&link).map_err(|_| OciError::NameInvalid)?,
+        );
+    }
+
+    Ok(response)
+}
+
+fn parse_tags_page_limit(query: Option<&str>) -> Result<u64, OciError> {
+    let Some(raw) = query_param(query, "n") else {
+        return Ok(DEFAULT_TAGS_PAGE_SIZE);
+    };
+    let parsed = raw
+        .parse::<i64>()
+        .map_err(|_| OciError::PaginationNumberInvalid)?;
+    if parsed < 0 {
+        return Err(OciError::PaginationNumberInvalid);
+    }
+    Ok((parsed as u64).min(DEFAULT_TAGS_PAGE_SIZE))
 }
 
 async fn get_or_head_blob(
@@ -1041,7 +1163,7 @@ mod tests {
         config::{GitConfig, PushAuth, PushTokenConfig, testing::isolated_config},
         contract::policy::entitystore::SharedEntityStore,
         jupiter::{
-            service::oci_service::OciService,
+            service::oci_service::{DEFAULT_MAX_UPLOAD_CHUNK, OciService},
             storage::{Storage, object_storage::mock_object_storage},
             tests::{test_db_config, test_storage_with_config},
             utils::into_obj_stream::IntoObjectStream,
@@ -2404,5 +2526,191 @@ mod tests {
         assert!(!super::valid_repository_name("team/image__"));
         assert!(!super::valid_repository_name("team/../image"));
         assert!(!super::valid_repository_name(""));
+    }
+
+    async fn put_tagged_manifest(state: &MonoApiServiceState, tag: &str) {
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put(format!("/team/image/manifests/{tag}")))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("put manifest");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn tags_list_returns_name_tags_shape() {
+        let state = state(true).await;
+        for tag in ["v1", "v2", "v3"] {
+            put_tagged_manifest(&state, tag).await;
+        }
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get("/team/image/tags/list?n=2")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("tags list");
+        assert_eq!(response.status(), StatusCode::OK);
+        let link = response
+            .headers()
+            .get(axum::http::header::LINK)
+            .expect("Link header")
+            .to_str()
+            .expect("utf8");
+        assert!(
+            link.contains("rel=\"next\"") && link.contains("last="),
+            "unexpected Link: {link}"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["name"], "team/image");
+        let tags = json["tags"].as_array().expect("tags array");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], "v1");
+        assert_eq!(tags[1], "v2");
+    }
+
+    #[tokio::test]
+    async fn tags_list_pagination_n() {
+        let state = state(true).await;
+        for tag in ["a", "b", "c"] {
+            put_tagged_manifest(&state, tag).await;
+        }
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get("/team/image/tags/list?n=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("tags list");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["tags"].as_array().expect("tags").len(), 1);
+        assert_eq!(json["tags"][0], "a");
+    }
+
+    #[tokio::test]
+    async fn tags_list_pagination_last() {
+        let state = state(true).await;
+        for tag in ["a", "b", "c"] {
+            put_tagged_manifest(&state, tag).await;
+        }
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get("/team/image/tags/list?n=10&last=a")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("tags list");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(axum::http::header::LINK).is_none());
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let tags = json["tags"].as_array().expect("tags");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], "b");
+        assert_eq!(tags[1], "c");
+    }
+
+    #[tokio::test]
+    async fn tags_list_invalid_n() {
+        let state = state(true).await;
+        put_tagged_manifest(&state, "v1").await;
+
+        let response = oci_routes()
+            .with_state(state)
+            .oneshot(
+                Request::get("/team/image/tags/list?n=abc")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("tags list");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("PAGINATION_NUMBER_INVALID")
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_unknown_repo_without_manifest() {
+        let response = oci_routes()
+            .with_state(state(true).await)
+            .oneshot(
+                Request::get("/team/image/tags/list")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("tags list");
+        // `state()` seeds a blob_ref but no manifest → NAME_UNKNOWN (ADR-DR-03).
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("NAME_UNKNOWN")
+        );
+    }
+
+    #[tokio::test]
+    async fn body_limit_128mib_accepts_large_chunk() {
+        use axum::extract::DefaultBodyLimit;
+
+        let (state, uuid) = init_upload(state(true).await).await;
+        // Larger than axum's default 2MiB limit; within DEFAULT_MAX_UPLOAD_CHUNK.
+        let payload = vec![0u8; 2 * 1024 * 1024 + 1];
+        let router = oci_routes()
+            .route_layer(DefaultBodyLimit::max(DEFAULT_MAX_UPLOAD_CHUNK))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                authenticated(Request::patch(format!("/team/image/blobs/uploads/{uuid}")))
+                    .header(CONTENT_LENGTH, payload.len().to_string())
+                    .body(Body::from(payload))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch large chunk");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(RANGE)
+                .expect("range")
+                .to_str()
+                .expect("valid"),
+            &format!("0-{}", 2 * 1024 * 1024)
+        );
     }
 }
