@@ -19,7 +19,7 @@ ssh_receive_pack = false # storage-only 必须显式写 false，省略会拒绝�
 
 CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20260910.md`](./plan/plan-20260910.md)）。残留该键按未知字段拒绝启动。
 
-产品 **API 写**（`create-entry` / `edit/save`，见 [`plan-20260904.md`](./plan/plan-20260904.md)）在 trunk 下同样经 **MonoWriteQueue** 前进 path tip（与 `git push` 同 tip 权威）；完整 HTTP 鉴权与路由契约由后续卡片落地，本节仅登记「API 写经队列」不变量。
+产品 **API 写**（`POST /api/v1/create-entry`、`POST /api/v1/edit/save`）在 trunk 下经 **`git.push_auth`** 鉴权后，将对象写入存储并用 **MonoWriteQueue** 前进 path tip（与 `git push` 同 tip 权威；见 [`plan-20260904.md`](./plan/plan-20260904.md)）。成功响应的 `cl_link` 为 `null`，不创建 `mega_cl` / `refs/cl/*`。写后同栈 `git clone` / `git pull` 可读到新内容。集成黑盒见 [`refactoring/integration.md`](./refactoring/integration.md) 的 `integration_api_write_trunk`。
 
 启动期 fail-closed（`Config::validate` / `AppContext::new`）：
 
@@ -31,7 +31,7 @@ CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20
 6. storage-only（显式 `push_auth`）⇒ 必须 `git.ssh_receive_pack = false`（省略 ≠ 关闭）。
 7. 形态切换后执行索引水位重置（第 5 节）。
 
-HTTP 表面：只读 preview + Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）；**不**注册 CL / issue / reviewer / code_edit 写路由；OpenAPI（`/api/openapi.json`）如实为空（CL/issue）并列出 LFS。只读 blob/tree/blame 保留。
+HTTP 表面：只读 preview + **产品写**（`create-entry` / `edit/save`）+ Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）；**不**注册 CL / issue / reviewer / OAuth user 路由；OpenAPI（`/api/openapi.json`）列出 LFS 与上述写路径，CL/issue 为空。只读 blob/tree/blame 保留。
 
 ## 2. 安全边界（无评审授权 ≠ 无访问控制）
 
@@ -41,7 +41,8 @@ Trunk **没有** review 门控与 Cedar 判定：`cedar.enforcement` 必须为 `
 
 仍然生效的访问控制：
 
-- **`push_auth=token`**：静态 token 常量时间查找；命中后身份为 token 名。`paths` 前缀按**组件边界**授权（`/project/foo` 不授权 `/project/foobar`）。认证身份与 commit author 分离——author 是自声明 provenance，不参与判定。Git receive-pack 与 **LFS 批/锁写**共用该模型（见第 6 节）。
+- **`push_auth=token`**：静态 token 常量时间查找；命中后身份为 token 名。`paths` 前缀按**组件边界**授权（`/project/foo` 不授权 `/project/foobar`）。认证身份与 commit author 分离——author 是自声明 provenance，不参与判定。Git receive-pack、**LFS 批/锁写**与 **产品 API 写**共用该模型（见第 6 节与上文 API 写段）。无凭据 / 坏 token → **HTTP 401**；path 越权 → **HTTP 403**。
+- **`push_auth=none`**：允许无凭据 API 写（requester=`anonymous`），仅适用于受控网络（第 3 节）。
 - **对象存储与 pack 收发**仍按既有存储配置。
 - Git 客户端 tag 仍禁止。
 

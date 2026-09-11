@@ -129,9 +129,13 @@ pub trait ApiHandler: Send + Sync {
     }
 
     /// Create a file or directory entry under the monorepo path.
+    ///
+    /// `requester` is the trunk `push_auth` identity (token name / anonymous);
+    /// review callers pass `None` and keep the CL path.
     async fn create_monorepo_entry(
         &self,
         file_info: CreateEntryInfo,
+        requester: Option<String>,
     ) -> Result<CreateEntryResult, GitError>;
 
     async fn get_raw_blob_by_hash(&self, hash: &str) -> Result<Vec<u8>, MegaError> {
@@ -243,7 +247,14 @@ pub trait ApiHandler: Send + Sync {
     }
 
     /// Save file edit with conflict detection and commit creation.
-    async fn save_file_edit(&self, payload: EditFilePayload) -> Result<EditFileResult, GitError>;
+    ///
+    /// `requester` is the trunk `push_auth` identity (token name / anonymous);
+    /// review callers pass `None` and keep the CL path.
+    async fn save_file_edit(
+        &self,
+        payload: EditFilePayload,
+        requester: Option<String>,
+    ) -> Result<EditFileResult, GitError>;
 
     /// the dir's hash as same as old,file's hash is the content hash
     /// may think about change dir'hash as the content

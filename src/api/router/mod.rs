@@ -44,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn trunk_openapi_omits_cl_issue_reviewer_and_preview_writes() {
+    fn trunk_openapi_includes_writes_omits_cl_issue_reviewer() {
         let paths = api_v1_paths(PushPolicy::Trunk);
         assert!(
             paths
@@ -52,7 +52,15 @@ mod tests {
                 .any(|p| p.contains("/blob") || p.contains("/tree")),
             "trunk OpenAPI must keep readonly preview: {paths:?}"
         );
-        for needle in ["/cl", "/issue", "reviewer", "create-entry", "/edit/save"] {
+        assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "trunk OpenAPI must include create-entry: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/edit/save")),
+            "trunk OpenAPI must include /edit/save: {paths:?}"
+        );
+        for needle in ["/cl", "/issue", "reviewer"] {
             assert!(
                 paths.iter().all(|p| !p.contains(needle)),
                 "trunk OpenAPI must not include {needle}: {paths:?}"

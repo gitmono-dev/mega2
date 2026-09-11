@@ -92,13 +92,14 @@ use crate::{
             tag::TagInfo,
             third_party::{ThirdPartyClient, ThirdPartyRepoTrait},
         },
-        pack::{import_repo::ImportRepo, monorepo::Monorepo},
+        pack::{api_tip_lander::land_api_tip_push, import_repo::ImportRepo, monorepo::Monorepo},
         protocol::{ServiceType, SmartSession, TransportProtocol},
     },
     common::{
         errors::{BuckError, MegaError},
         utils::{MEGA_BRANCH_NAME, ZERO_ID},
     },
+    config::PushPolicy,
     contract::{
         api::common::Pagination,
         policy::{
@@ -123,7 +124,7 @@ use crate::{
             },
             push_queue_service::{
                 EnqueueRequest, ExecuteOutcome, ExecuteRequest, MergeExecContext, MergePayload,
-                QueueWaitResult, merge_operation_id,
+                PushPayload, QueueWaitResult, merge_operation_id,
             },
         },
         storage::{
@@ -997,7 +998,11 @@ impl ApiHandler for MonoApiService {
     }
 
     /// Save file edit in monorepo with optimistic concurrency check
-    async fn save_file_edit(&self, payload: EditFilePayload) -> Result<EditFileResult, GitError> {
+    async fn save_file_edit(
+        &self,
+        payload: EditFilePayload,
+        requester: Option<String>,
+    ) -> Result<EditFileResult, GitError> {
         let file_path = PathBuf::from("/").join(PathBuf::from(&payload.path));
         let parent_path = file_path
             .parent()
@@ -1019,6 +1024,12 @@ impl ApiHandler for MonoApiService {
                 );
                 cl_root_path.clone()
             }
+        };
+
+        let tip_path = if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            self.resolve_trunk_land_path(&cl_root_path).await?
+        } else {
+            build_repo_path.clone()
         };
 
         let parent_tree = tree_ops::search_tree_by_path(self, parent_path, None)
@@ -1059,15 +1070,14 @@ impl ApiHandler for MonoApiService {
             update_chain,
             new_tree.id,
         )?;
-        let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &build_repo_path)
+        let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &tip_path)
             .ok_or_else(|| {
                 GitError::CustomError(format!(
-                    "Missing updated tree for build repo root {build_repo_path}"
+                    "Missing updated tree for build repo root {tip_path}"
                 ))
             })?;
 
-        let src_commit =
-            edit_utils::get_repo_main_latest_commit(&self.storage, &build_repo_path).await?;
+        let src_commit = edit_utils::get_repo_main_latest_commit(&self.storage, &tip_path).await?;
         let dst_commit = Commit::from_tree_id(
             target_tree_id,
             vec![
@@ -1108,6 +1118,37 @@ impl ApiHandler for MonoApiService {
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?;
 
+        self.storage
+            .mono_service
+            .save_blobs(&new_commit_id, vec![new_blob.clone()])
+            .await?;
+
+        if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            let old_id = src_commit.id.to_string();
+            let payload_n1 = PushPayload {
+                commits: vec![new_commit_id.clone()],
+                fork_base: Some(old_id.clone()),
+                n: 1,
+            };
+            let landed = land_api_tip_push(
+                &self.storage,
+                self.git_object_cache.clone(),
+                &tip_path,
+                &old_id,
+                &new_commit_id,
+                requester,
+                &payload_n1,
+            )
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+            return Ok(EditFileResult {
+                commit_id: landed,
+                new_oid: new_blob.id.to_string(),
+                path: tip_path,
+                cl_link: None,
+            });
+        }
+
         let editor = OneditCodeEdit::from(
             &build_repo_path,
             MEGA_BRANCH_NAME
@@ -1127,11 +1168,6 @@ impl ApiHandler for MonoApiService {
             )
             .await?;
 
-        self.storage
-            .mono_service
-            .save_blobs(&new_commit_id, vec![new_blob.clone()])
-            .await?;
-
         if !payload.skip_build {
             self.trigger_build_for_cl(&editor, &cl, &username).await?;
         }
@@ -1149,6 +1185,7 @@ impl ApiHandler for MonoApiService {
     /// # Arguments
     ///
     /// * `entry_info` - Information about the file or directory to create.
+    /// * `requester` - Trunk push_auth identity; review passes `None`.
     ///
     /// # Returns
     ///
@@ -1156,6 +1193,7 @@ impl ApiHandler for MonoApiService {
     async fn create_monorepo_entry(
         &self,
         entry_info: CreateEntryInfo,
+        requester: Option<String>,
     ) -> Result<CreateEntryResult, GitError> {
         let storage = self.storage.mono_storage();
         let CreateEntryUpdate {
@@ -1185,15 +1223,20 @@ impl ApiHandler for MonoApiService {
             }
         };
 
-        let src_commit =
-            edit_utils::get_repo_main_latest_commit(&self.storage, &build_repo_path).await?;
+        let tip_path = if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            self.resolve_trunk_land_path(&repo_path_str).await?
+        } else {
+            build_repo_path.clone()
+        };
+
+        let src_commit = edit_utils::get_repo_main_latest_commit(&self.storage, &tip_path).await?;
         let base_commit = ObjectHash::from_str(&src_commit.id.to_string()).map_err(|e| {
             GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id))
         })?;
-        let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &build_repo_path)
+        let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &tip_path)
             .ok_or_else(|| {
                 GitError::CustomError(format!(
-                    "Missing updated tree for build repo root {build_repo_path}"
+                    "Missing updated tree for build repo root {tip_path}"
                 ))
             })?;
         let dst_commit =
@@ -1233,6 +1276,34 @@ impl ApiHandler for MonoApiService {
             .save_mega_commits(vec![dst_commit], None)
             .await?;
 
+        let entry_path = Self::build_entry_path(&entry_info.path, &entry_info.name);
+
+        if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            let old_id = src_commit.id.to_string();
+            let payload_n1 = PushPayload {
+                commits: vec![new_commit_id.clone()],
+                fork_base: Some(old_id.clone()),
+                n: 1,
+            };
+            let landed = land_api_tip_push(
+                &self.storage,
+                self.git_object_cache.clone(),
+                &tip_path,
+                &old_id,
+                &new_commit_id,
+                requester,
+                &payload_n1,
+            )
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+            return Ok(CreateEntryResult {
+                commit_id: landed,
+                new_oid,
+                path: entry_path,
+                cl_link: None,
+            });
+        }
+
         let editor = OneditCodeEdit::from(
             &build_repo_path,
             MEGA_BRANCH_NAME
@@ -1255,8 +1326,6 @@ impl ApiHandler for MonoApiService {
         if !entry_info.skip_build {
             self.trigger_build_for_cl(&editor, &cl, &username).await?;
         }
-
-        let entry_path = Self::build_entry_path(&entry_info.path, &entry_info.name);
 
         Ok(CreateEntryResult {
             commit_id: new_commit_id,
@@ -1887,6 +1956,25 @@ impl MonoApiService {
             .iter()
             .find(|update| update.path == normalized)
             .map(|update| update.tree_id)
+    }
+
+    /// Deepest existing non-root `mega_refs` tip covering `write_path` (AW-03).
+    /// Buck-root resolution returns `/`, which B0 rejects for MonoWriteQueue.
+    async fn resolve_trunk_land_path(&self, write_path: &str) -> Result<String, GitError> {
+        let candidates = MonoServiceLogic::repo_root_candidates(Path::new(write_path));
+        for candidate in candidates {
+            if candidate == "/" {
+                continue;
+            }
+            match self.storage.mono_storage().get_main_ref(&candidate).await {
+                Ok(Some(_)) => return Ok(candidate),
+                Ok(None) => continue,
+                Err(e) => return Err(GitError::CustomError(e.to_string())),
+            }
+        }
+        Err(GitError::CustomError(format!(
+            "[code:400] no non-root path tip under {write_path} for trunk API write"
+        )))
     }
 
     // helper to convert mega_tag model into TagInfo

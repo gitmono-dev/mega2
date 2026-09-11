@@ -52,6 +52,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
 | `integration_authz_audit` | 只读装配零副作用黑盒（UN-30 / UN-43）+ `authz-audit` CLI（UN-29 审计/fsync + UN-37 promote） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
 | `integration_oci` | storage-only OCI `/v2` 进程级黑盒（plan-20260902 / DR-12）：`integration_oci_auth_matrix`、`integration_oci_protocol_walkthrough`、`integration_oci_docker_gated`（daemon 不可用 → SKIP，不 FAIL） | PostgreSQL, Redis；raw HTTP（reqwest）；docker CLI 仅 `docker_gated` 组可选 |
+| `integration_api_write_trunk` | trunk 产品 API 写（plan-20260904 / AW-03）：token `create-entry` / `edit/save` 前进 tip、无 CL、无凭据 401 | PostgreSQL, Redis；raw HTTP（reqwest）；`push_policy=trunk` + `push_auth=token` |
 
 Run the normal project gate with the test environment loaded:
 

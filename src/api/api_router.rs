@@ -51,9 +51,10 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .merge(bot_router::routers())
 }
 
-/// HTTP `/api/v1` surface keyed on [`PushPolicy`] (TP-18). Trunk is the
-/// readonly protocol subset: no CL / issue / reviewer routers and no
-/// code_edit write routes. Review keeps the full OAuth web surface.
+/// HTTP `/api/v1` surface keyed on [`PushPolicy`] (TP-18 / AW-03). Trunk is the
+/// protocol subset without CL / issue / reviewer / OAuth user routers, but
+/// **does** register product create-entry / edit/save. Review keeps the full
+/// OAuth web surface.
 pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
     match policy {
         PushPolicy::Trunk => storage_only_routers(),
@@ -61,13 +62,14 @@ pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
     }
 }
 
-/// Git-adjacent read surface for storage-only HTTP (no OAuth/CL/user routers).
+/// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user routers).
 pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(life_cycle_check))
         .route("/file/blob/{object_id}", get(get_blob_file))
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::readonly_routers())
+        .merge(preview_router::write_routers())
 }
 
 /// Health Check

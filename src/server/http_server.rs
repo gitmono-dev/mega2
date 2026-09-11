@@ -1240,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_only_openapi_is_readonly_protocol_subset() {
+    fn storage_only_openapi_includes_writes_omits_cl_auth_user() {
         let api = storage_only_openapi_doc(false);
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
@@ -1258,10 +1258,18 @@ mod tests {
             "storage-only OpenAPI must include LFS: {paths:?}"
         );
         assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "storage-only OpenAPI must include create-entry: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/edit/save")),
+            "storage-only OpenAPI must include /edit/save: {paths:?}"
+        );
+        assert!(
             paths.iter().all(|p| !p.contains("/v2")),
             "storage-only OpenAPI without include_oci must omit /v2: {paths:?}"
         );
-        for needle in ["/auth", "create-entry", "/cl", "/user"] {
+        for needle in ["/auth", "/cl", "/user"] {
             assert!(
                 paths.iter().all(|p| !p.contains(needle)),
                 "storage-only OpenAPI must not include {needle}: {paths:?}"
@@ -1287,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn trunk_openapi_omits_cl_issue_reviewer_preview_writes_keeps_lfs() {
+    fn trunk_openapi_includes_writes_omits_cl_issue_reviewer() {
         let api = trunk_openapi_doc(false);
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
@@ -1301,17 +1309,18 @@ mod tests {
             "trunk OpenAPI must include LFS: {paths:?}"
         );
         assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "trunk OpenAPI must include create-entry: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/edit/save")),
+            "trunk OpenAPI must include /edit/save: {paths:?}"
+        );
+        assert!(
             paths.iter().all(|p| !p.contains("/v2")),
             "trunk OpenAPI without include_oci must omit /v2: {paths:?}"
         );
-        for needle in [
-            "/cl",
-            "/issue",
-            "reviewer",
-            "create-entry",
-            "/edit/save",
-            "/user",
-        ] {
+        for needle in ["/cl", "/issue", "reviewer", "/user"] {
             assert!(
                 paths.iter().all(|p| !p.contains(needle)),
                 "trunk OpenAPI must not include {needle}: {paths:?}"

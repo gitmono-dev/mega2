@@ -54,6 +54,7 @@ impl ApiHandler for ImportApiService {
     async fn create_monorepo_entry(
         &self,
         _: CreateEntryInfo,
+        _: Option<String>,
     ) -> Result<CreateEntryResult, GitError> {
         Err(GitError::CustomError(
             "import dir does not support create entry".to_string(),
@@ -392,7 +393,11 @@ impl ApiHandler for ImportApiService {
     }
 
     /// Save file edit for import repo path
-    async fn save_file_edit(&self, payload: EditFilePayload) -> Result<EditFileResult, GitError> {
+    async fn save_file_edit(
+        &self,
+        payload: EditFilePayload,
+        _: Option<String>,
+    ) -> Result<EditFileResult, GitError> {
         use git_internal::internal::object::{blob::Blob, tree::TreeItemMode};
 
         let path = PathBuf::from(&payload.path);

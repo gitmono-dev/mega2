@@ -4,11 +4,12 @@ use anyhow::Result;
 use axum::{
     Json,
     extract::{Query, State},
+    http::HeaderMap,
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::CODE_PREVIEW},
+    api::{MonoApiServiceState, api_doc::CODE_PREVIEW, api_write_auth::authorize_trunk_api_write},
     ceres::model::{
         blame::{BlameQuery, BlameRequest, BlameResult},
         change_list::DiffItemSchema,
@@ -19,6 +20,7 @@ use crate::{
         },
     },
     common::errors::ApiError,
+    config::PushPolicy,
     contract::api::{common::CommonResult, git::commit::LatestCommitInfo},
 };
 
@@ -45,8 +47,14 @@ async fn upsert_commit_binding(
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     readonly_routers()
-        .routes(routes!(create_entry))
+        .merge(write_routers())
         .routes(routes!(preview_diff))
+}
+
+/// POST create-entry / edit/save used by review and trunk product API writes.
+pub fn write_routers() -> OpenApiRouter<MonoApiServiceState> {
+    OpenApiRouter::new()
+        .routes(routes!(create_entry))
         .routes(routes!(save_edit))
 }
 
@@ -99,10 +107,14 @@ async fn get_blob_string(
 )]
 async fn create_entry(
     state: State<MonoApiServiceState>,
+    headers: HeaderMap,
     Json(json): Json<CreateEntryInfo>,
 ) -> Result<Json<CommonResult<CreateEntryResult>>, ApiError> {
+    let requester = trunk_write_requester(&state, &headers, &json.path)?;
     let handler = state.api_handler(json.path.as_ref()).await?;
-    let result = handler.create_monorepo_entry(json.clone()).await?;
+    let result = handler
+        .create_monorepo_entry(json.clone(), requester)
+        .await?;
 
     upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
     Ok(Json(CommonResult::success(Some(result))))
@@ -384,14 +396,28 @@ async fn preview_diff(
 )]
 async fn save_edit(
     state: State<MonoApiServiceState>,
+    headers: HeaderMap,
     Json(payload): Json<EditFilePayload>,
 ) -> Result<Json<CommonResult<EditFileResult>>, ApiError> {
+    let requester = trunk_write_requester(&state, &headers, &payload.path)?;
     let handler = state.api_handler(payload.path.as_ref()).await?;
-    let res = handler.save_file_edit(payload.clone()).await?;
+    let res = handler.save_file_edit(payload.clone(), requester).await?;
 
     upsert_commit_binding(&state, &res.commit_id, payload.author_username.as_deref()).await?;
 
     Ok(Json(CommonResult::success(Some(res))))
+}
+
+fn trunk_write_requester(
+    state: &MonoApiServiceState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Option<String>, ApiError> {
+    let config = state.storage.config();
+    if config.monorepo.push_policy != PushPolicy::Trunk {
+        return Ok(None);
+    }
+    authorize_trunk_api_write(&config.git, headers, path).map(Some)
 }
 
 #[cfg(test)]
@@ -431,6 +457,20 @@ mod tests {
                 "readonly preview must not include {needle}: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn write_routers_register_create_entry_and_save() {
+        let paths = path_list(write_routers());
+        assert!(
+            paths.iter().any(|p| p.contains("create-entry")),
+            "{paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.contains("/edit/save")), "{paths:?}");
+        assert!(
+            paths.iter().all(|p| !p.contains("preview")),
+            "write_routers must omit preview_diff: {paths:?}"
+        );
     }
 
     #[test]
