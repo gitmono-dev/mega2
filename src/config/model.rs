@@ -221,13 +221,9 @@ impl MonoConfig {
 
     pub fn ensure_normal_service_object_format(&self) -> Result<(), MegaError> {
         match self.object_format {
-            MonoObjectFormat::Sha1 => Ok(()),
-            MonoObjectFormat::Sha256 => Err(MegaError::Other(
-                "monorepo.object_format=sha256 is bootstrap-only; run `monoengine service init --yes` before enabling normal Git services".to_string(),
-            )),
-            MonoObjectFormat::Blake3 => Err(MegaError::Other(
-                "monorepo.object_format=blake3 is bootstrap-only; run `monoengine service init --yes` before enabling normal Git services".to_string(),
-            )),
+            MonoObjectFormat::Sha1 | MonoObjectFormat::Sha256 | MonoObjectFormat::Blake3 => {
+                self.object_hash_kind().map(|_| ())
+            }
         }
     }
 }
@@ -1141,15 +1137,17 @@ object_format = "black3"
     }
 
     #[test]
-    fn b3_03_blake3_normal_service_still_rejected() {
-        let config = MonoConfig {
-            object_format: MonoObjectFormat::Blake3,
-            ..Default::default()
-        };
-        let err = config
-            .ensure_normal_service_object_format()
-            .expect_err("blake3 remains bootstrap-only for normal Git services");
-        assert!(err.to_string().contains("bootstrap-only"), "{err}");
-        assert!(!err.to_string().contains("reserved until"), "{err}");
+    fn b3_04_blake3_normal_service_ok() {
+        for format in [MonoObjectFormat::Sha256, MonoObjectFormat::Blake3] {
+            let config = MonoConfig {
+                object_format: format,
+                ..Default::default()
+            };
+            config
+                .ensure_normal_service_object_format()
+                .unwrap_or_else(|err| {
+                    panic!("{format:?} must be servable for Libra/git-internal peers: {err}")
+                });
+        }
     }
 }

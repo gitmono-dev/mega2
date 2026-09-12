@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use git_internal::hash::HashKind;
+use git_internal::hash::{HashKind, ObjectHash};
 use import_refs::{RefCommand, Refs};
 use repo::Repo;
 use tokio::sync::RwLock;
@@ -19,7 +19,7 @@ use crate::{
     },
     common::{
         errors::{MegaError, ProtocolError},
-        utils::{ZERO_ID, canonicalize_mono_ref_path, is_full_hex_object_id},
+        utils::{canonicalize_mono_ref_path, is_full_hex_object_id, is_protocol_zero_id},
     },
 };
 
@@ -199,18 +199,17 @@ impl SmartSession {
     }
 
     pub fn ensure_object_id_hex(&self, hex: &str, what: &str) -> Result<(), ProtocolError> {
-        if hex == ZERO_ID {
+        if is_protocol_zero_id(hex) {
             return Ok(());
         }
-        if hex_object_id_matches_kind(hex, self.hash_kind) {
-            return Ok(());
-        }
-        Err(ProtocolError::InvalidInput(format!(
-            "{what} object id width {} is incompatible with object-format {} (expected {} hex chars); object-format changes do not convert existing repositories",
-            hex.len(),
-            self.hash_kind.as_str(),
-            self.hash_kind.hex_len(),
-        )))
+        ObjectHash::from_hex_for_kind(self.hash_kind, hex).map_err(|error| {
+            ProtocolError::InvalidInput(format!(
+                "{what} object id is incompatible with object-format {} (expected {} hex chars): {error}",
+                self.hash_kind.as_str(),
+                self.hash_kind.hex_len(),
+            ))
+        })?;
+        Ok(())
     }
 
     pub fn ensure_advertised_object_ids(
@@ -347,6 +346,8 @@ mod tests {
         assert!(!hex_object_id_matches_kind(&sha1_id, HashKind::Sha256));
         assert!(hex_object_id_matches_kind(&sha256_id, HashKind::Sha256));
         assert!(!hex_object_id_matches_kind(&sha256_id, HashKind::Sha1));
+        assert!(hex_object_id_matches_kind(&sha256_id, HashKind::Blake3));
+        assert!(!hex_object_id_matches_kind(&sha1_id, HashKind::Blake3));
 
         let session = SmartSession::new(
             PathBuf::from("/tmp/repo.git"),

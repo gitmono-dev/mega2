@@ -12,7 +12,7 @@ use crate::{
             smart::{self, PktLine, add_pkt_line_string, try_read_pkt_line},
         },
     },
-    common::errors::ProtocolError,
+    common::{errors::ProtocolError, utils::is_protocol_zero_id},
 };
 
 // Only advertise v2 capabilities that are parsed, acted on, and covered by
@@ -70,7 +70,7 @@ pub async fn handle_v2_ls_refs(
     let mut buf = BytesMut::new();
 
     if symrefs {
-        let head_ref = if head_hash == crate::common::utils::ZERO_ID {
+        let head_ref = if is_protocol_zero_id(&head_hash) {
             "capabilities^{}"
         } else {
             "HEAD"
@@ -80,7 +80,7 @@ pub async fn handle_v2_ls_refs(
             format!("{head_hash} {head_ref} symref-target:refs/heads/main\n"),
         );
     } else {
-        let head_ref = if head_hash == crate::common::utils::ZERO_ID {
+        let head_ref = if is_protocol_zero_id(&head_hash) {
             "capabilities^{}"
         } else {
             "HEAD"
@@ -153,8 +153,16 @@ pub async fn handle_v2_fetch(
                 let line = String::from_utf8_lossy(&data);
                 let line = line.trim_end_matches('\n');
                 if let Some(oid) = line.strip_prefix("want ") {
+                    let oid = oid.split_whitespace().next().ok_or_else(|| {
+                        ProtocolError::InvalidInput("want command is missing object id".to_owned())
+                    })?;
+                    session.ensure_object_id_hex(oid, "want")?;
                     want.insert(oid.to_owned());
                 } else if let Some(oid) = line.strip_prefix("have ") {
+                    let oid = oid.split_whitespace().next().ok_or_else(|| {
+                        ProtocolError::InvalidInput("have command is missing object id".to_owned())
+                    })?;
+                    session.ensure_object_id_hex(oid, "have")?;
                     have.insert(oid.to_owned());
                 } else if line == "done" {
                     done = true;

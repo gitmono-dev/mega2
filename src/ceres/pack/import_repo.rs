@@ -33,7 +33,10 @@ use crate::{
             repo::Repo,
         },
     },
-    common::{errors::MegaError, utils::ZERO_ID},
+    common::{
+        errors::MegaError,
+        utils::{ZERO_ID, is_protocol_zero_id},
+    },
     jupiter::{
         service::{
             git_service::GitService,
@@ -396,7 +399,7 @@ impl RepoHandler for ImportRepo {
                 .lock()
                 .expect("command_list lock poisoned");
             cmds.iter()
-                .find(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
+                .find(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
                 .map(|c| c.new_id.clone())
         };
         let current_head = match from_commands {
@@ -469,7 +472,7 @@ impl ImportRepo {
         // Pure delete-only attach: no non-zero branch tip → do not enqueue.
         if !commands_snapshot
             .iter()
-            .any(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
+            .any(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
         {
             let txn = self.storage.begin_db_transaction().await?;
             let git_db = self.storage.git_db_storage();
@@ -489,7 +492,7 @@ impl ImportRepo {
 
         let commit_id = commands_snapshot
             .iter()
-            .find(|c| c.ref_type == RefTypeEnum::Branch && c.new_id != ZERO_ID)
+            .find(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
             .map(|c| c.new_id.clone())
             .ok_or_else(|| MegaError::Other("attach: no branch tip".into()))?;
 

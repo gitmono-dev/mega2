@@ -9,6 +9,11 @@ pub const ZERO_ID: &str = match std::str::from_utf8(&[b'0'; 40]) {
     Err(_) => panic!("can't get ZERO_ID"),
 };
 
+/// All-zero object id in either SHA-1 (40) or SHA-256/BLAKE3 (64) wire width.
+pub fn is_protocol_zero_id(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.as_bytes().iter().all(|&b| b == b'0')
+}
+
 /// Returns true if `oid` looks like a full Git object id in hex form.
 ///
 /// We intentionally only accept full-hex ids here (no short ids), because short ids

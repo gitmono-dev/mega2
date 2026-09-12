@@ -538,3 +538,110 @@ pub trait RepoHandler: Send + Sync + 'static {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Cursor,
+        sync::{Arc, Mutex},
+    };
+
+    use git_internal::{
+        hash::{HashKind, ObjectHash},
+        internal::{
+            metadata::{EntryMeta, MetaAttached},
+            object::blob::Blob,
+            pack::{Pack, encode::PackEncoder, entry::Entry},
+        },
+    };
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn b3_04_cross_kind_pack_rejected() {
+        let blob = Blob::from_content_with_kind(HashKind::Blake3, "b3-04 pack").unwrap();
+        assert_eq!(blob.id.kind(), HashKind::Blake3);
+        assert_eq!(blob.id.to_string().len(), 64);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(8);
+        let mut encoder = PackEncoder::new_with_hash_kind(HashKind::Blake3, 1, 0, tx);
+        assert_eq!(encoder.hash_kind(), HashKind::Blake3);
+        entry_tx
+            .send(MetaAttached {
+                inner: Entry::from(blob.clone()),
+                meta: EntryMeta::new(),
+            })
+            .await
+            .unwrap();
+        drop(entry_tx);
+        encoder.encode(entry_rx).await.expect("blake3 pack encode");
+        let mut pack = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            pack.extend(chunk);
+        }
+        let trailer = encoder.get_hash().expect("blake3 pack trailer");
+        assert_eq!(trailer.kind(), HashKind::Blake3);
+        assert_eq!(&pack[pack.len() - 32..], trailer.to_data().as_slice());
+
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let sink = decoded.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = Pack::new_with_hash_kind(
+            HashKind::Blake3,
+            Some(1),
+            Some(64 * 1024 * 1024),
+            Some(tmp.path().to_path_buf()),
+            true,
+        );
+        p.decode(
+            &mut Cursor::new(&pack),
+            move |entry| sink.lock().unwrap().push(entry.inner.hash),
+            None::<fn(ObjectHash)>,
+        )
+        .expect("blake3 pack decode");
+        assert_eq!(p.signature.kind(), HashKind::Blake3);
+        assert_eq!(decoded.lock().unwrap().as_slice(), [blob.id]);
+
+        let tmp_wrong = tempfile::tempdir().unwrap();
+        let mut wrong = Pack::new_with_hash_kind(
+            HashKind::Sha256,
+            Some(1),
+            Some(64 * 1024 * 1024),
+            Some(tmp_wrong.path().to_path_buf()),
+            true,
+        );
+        let err = wrong
+            .decode(&mut Cursor::new(&pack), |_| {}, None::<fn(ObjectHash)>)
+            .expect_err("sha256 decoder must reject a blake3 pack");
+        assert!(
+            err.to_string().contains("does not match the trailer hash")
+                || err.to_string().contains("hash"),
+            "cross-kind pack must fail closed: {err}"
+        );
+
+        let sha1_blob = Blob::from_content_with_kind(HashKind::Sha1, "foreign sha1").unwrap();
+        assert_eq!(sha1_blob.id.kind(), HashKind::Sha1);
+        let (tx, _rx) = mpsc::channel(8);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(8);
+        let mut encoder = PackEncoder::new_with_hash_kind(HashKind::Blake3, 1, 0, tx);
+        entry_tx
+            .send(MetaAttached {
+                inner: Entry::from(sha1_blob),
+                meta: EntryMeta::new(),
+            })
+            .await
+            .unwrap();
+        drop(entry_tx);
+        let err = encoder
+            .encode(entry_rx)
+            .await
+            .expect_err("blake3 encoder must reject a sha1 object id");
+        assert!(
+            err.to_string().contains("cannot be encoded") || err.to_string().contains("kind"),
+            "cross-kind entry must fail closed: {err}"
+        );
+
+        ObjectHash::from_hex_for_kind(HashKind::Blake3, &"a".repeat(40))
+            .expect_err("40-hex is not a blake3 object id");
+    }
+}

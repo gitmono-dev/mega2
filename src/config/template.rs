@@ -40,9 +40,9 @@ sqlx_logging = false
 import_dir = "/third-party"
 admin = ["admin"]
 root_dirs = ["third-party", "project", "doc", "release", "toolchains"]
-# Object-ID format for the initial Monorepo graph. Values: sha1 (default), sha256, blake3.
-# sha256 and blake3 are bootstrap-only until normal Git service is enabled for that
-# format; do not use them for a normal Git service. Run `service init --yes` only.
+# Object-ID format for the initial Monorepo graph and live Git service.
+# Values: sha1 (default; standard Git), sha256, blake3.
+# sha256 and blake3 are git-internal / Libra extensions, not stock Git.
 object_format = "sha1"
 # Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
 # Restart-required. Trunk requires cedar.enforcement="off", no open CLs, and

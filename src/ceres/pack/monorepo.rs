@@ -43,7 +43,7 @@ use crate::{
     },
     common::{
         errors::MegaError,
-        utils::{self, MEGA_BRANCH_NAME, ZERO_ID},
+        utils::{self, MEGA_BRANCH_NAME, is_protocol_zero_id},
     },
     config::PushPolicy,
     contract::{
@@ -849,7 +849,7 @@ impl Monorepo {
         // main's `/.mega_cedar.json`).
         if cmds.iter().any(|cmd| {
             cmd.ref_type == RefTypeEnum::Branch
-                && (cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID)
+                && (cmd.command_type == CommandType::Delete || is_protocol_zero_id(&cmd.new_id))
         }) {
             if authz_barrier_enabled(&self.storage) {
                 mark_authz_dirty_and_compensate(&self.storage).await;
@@ -891,7 +891,7 @@ impl Monorepo {
         txn: Option<&DatabaseTransaction>,
     ) -> Result<(), MegaError> {
         let storage = self.storage.mono_storage();
-        if cmd.command_type == CommandType::Delete || cmd.new_id == ZERO_ID {
+        if cmd.command_type == CommandType::Delete || is_protocol_zero_id(&cmd.new_id) {
             // UN-16: reject deleting the main branch ref. The shared authz
             // snapshot is keyed on main's `/.mega_cedar.json`; deleting main
             // would leave the snapshot without a source of truth. This is a
@@ -1060,7 +1060,7 @@ impl Monorepo {
             .filter(|c| {
                 c.ref_type == RefTypeEnum::Branch
                     && c.command_type != CommandType::Delete
-                    && c.new_id != ZERO_ID
+                    && !is_protocol_zero_id(&c.new_id)
             })
             .count();
         if branch_updates > 1 {
@@ -1203,7 +1203,7 @@ impl Monorepo {
         {
             Some(cl) => cl.link.clone(),
             None => {
-                if from_hash == ZERO_ID {
+                if is_protocol_zero_id(from_hash) {
                     return Err(MegaError::Other(
                         "Can not init directory under monorepo directory!".to_string(),
                     ));
@@ -1232,7 +1232,7 @@ impl Monorepo {
             .clone();
         if cmds.iter().any(|c| {
             c.ref_type == RefTypeEnum::Branch
-                && (c.command_type == CommandType::Delete || c.new_id == ZERO_ID)
+                && (c.command_type == CommandType::Delete || is_protocol_zero_id(&c.new_id))
         }) {
             return Err(MegaError::Other(
                 "trunk push rejects delete commands; remove content via a parent-path commit"

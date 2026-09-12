@@ -590,28 +590,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_context_rejects_sha256_before_startup_side_effects() {
+    async fn normal_context_accepts_sha256_object_format_preflight() {
         let mut config = crate::config::Config::mock();
         config.monorepo.object_format = crate::config::MonoObjectFormat::Sha256;
-
-        match AppContext::new(config).await {
-            Err(error) => assert!(error.to_string().contains("bootstrap-only")),
-            Ok(_) => panic!("normal context must reject SHA-256 before startup"),
-        }
+        config
+            .monorepo
+            .ensure_normal_service_object_format()
+            .expect("sha256 normal service is enabled for Libra/git-internal peers");
     }
 
     #[tokio::test]
-    async fn normal_context_rejects_blake3_before_startup_side_effects() {
+    async fn normal_context_accepts_blake3_object_format_preflight() {
         let mut config = crate::config::Config::mock();
         config.monorepo.object_format = crate::config::MonoObjectFormat::Blake3;
-
-        match AppContext::new(config).await {
-            Err(error) => assert!(
-                error.to_string().contains("bootstrap-only"),
-                "normal context must reject BLAKE3: {error}"
-            ),
-            Ok(_) => panic!("normal context must reject BLAKE3 before startup"),
-        }
+        config
+            .monorepo
+            .ensure_normal_service_object_format()
+            .expect("blake3 normal service is enabled for Libra/git-internal peers");
     }
 
     #[tokio::test]

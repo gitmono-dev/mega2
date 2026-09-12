@@ -77,6 +77,8 @@
 > **2026-09-09 更新（TP-17 / ADR-TP-18）**：monorepo `finalize_receive_pack` 按 `[monorepo].push_policy` 条件化。`review` 仍走 `persist_mono_branch_cl_mega_refs_transaction` + CL post-push 管线（写 `refs/cl/*`）。`trunk` 跳过 CL 落地，以 `kind=push` 入队并执行 B3：N=1 客户端 commit 原样落 `main@P`，N>1 squash（sideband 返回合成 id 与对齐命令 `git fetch && git reset --hard origin/main`）；删除类 branch 命令在 finalize 以 B0 正文拒绝。trunk 形态 `refs_with_head_hash` 过滤 `is_cl` 行（档案 CL refs 不 advertise）。`push_queue.requester` 取协议身份（token 名 / `none` 为 NULL），不用 commit author。
 
 > **2026-09-10 更新（plan-20260908 SP-01）：** storage-only SSH 读与 HTTP 共用 `anonymous_access`：仅 `push_auth.is_some() && anonymous_access=true` 时 `auth_none` Accept。review 即使匿名开也不 Accept `auth_none`（保护公钥推送）。storage-only `auth_publickey` 早拒。进程 IT：`integration_git_ssh_trunk_none_anon_on_clone`、`integration_git_ssh_trunk_none_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_on_clone`。
+>
+> **2026-09-12 更新（plan-20260907 B3-04）：** `monorepo.object_format` 为 `sha256` / `blake3` 时，normal Git service 会 advertise `object-format={kind}`，pack 编解码走 `*_with_hash_kind`。这是 **git-internal / Libra extension**，**不是** 标准 Git BLAKE3 互通（永久非目标，DEFER-B3-01）。跨 kind / 错宽度 ID 与 pack trailer 错配 fail-closed。
 
 > **2026-09-10 更新（plan-20260908 SP-02）：** `push_auth=token` 时 SSH `auth_password` 复用 `lookup_push_token`（username 不参与判定，身份为 token `name`）。客户端用 `SSH_ASKPASS`（password 不进 tracing、不进 `GIT_SSH_COMMAND`）。`push_auth=none` 与 review（省略）均 Reject password。进程 IT：`integration_git_ssh_trunk_token_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_off_password_clone` / `_fetch` / `_pull`、`integration_git_ssh_trunk_token_push_receive_pack_disabled`、`integration_git_ssh_review_pubkey_anon_off_clone`、`integration_git_ssh_review_pubkey_anon_on_push`。
 
@@ -861,6 +863,7 @@ LFS:
 - 支持 shallow fetch/clone 基础语义（`deepen` / `deepen-relative`）；兼容性仍需要真实 Git CLI 矩阵确认。
 - 支持 protocol v2 partial clone `filter blob:none`；暂不承诺 tree filters 或完整 promisor remote 语义。
 - advertise 的 capability 以实现和测试为准，未实现能力不应对外声明。
+- `object-format=blake3`（及 servable `sha256`）是 git-internal / Libra **extension**，不宣称与标准 Git 客户端互通。
 
 ## 下一步建议
 

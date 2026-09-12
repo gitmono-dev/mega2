@@ -2306,7 +2306,7 @@ mod tests {
         config
             .monorepo
             .ensure_normal_service_object_format()
-            .expect_err("blake3 must remain bootstrap-only for normal Git services");
+            .expect("blake3 normal service is enabled for Libra/git-internal peers");
     }
 
     #[test]

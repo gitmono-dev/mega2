@@ -143,11 +143,10 @@ admin = ["mega2"]
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID hash for the repo graph / 仓库图的 Object-ID 哈希.
-# Scenario / 场景: "sha1" is the only wire-compatible choice for a live Git
-# service. "sha256" and "blake3" are bootstrap-only (`service init`), never for
-# normal Git service.
-# 场景:在线 Git 服务只能用 "sha1"."sha256"/"blake3" 仅用于建库那次 bootstrap,不能跑正常
-# Git 服务.
+# Scenario / 场景: "sha1" is stock Git. "sha256" and "blake3" are git-internal /
+# Libra extensions for live service; do not claim stock Git interop.
+# 场景:"sha1" 是标准 Git。"sha256"/"blake3" 可作为 Libra/git-internal 在线服务,
+# 但不宣称与标准 Git 客户端互通.
 object_format = "sha1"
 
 # Push morphology / 推送形态: "review" (CL pipeline) or "trunk" (direct to main).

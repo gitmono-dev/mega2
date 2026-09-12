@@ -89,10 +89,9 @@ impl MonoService {
 
     /// Initializes an empty Monorepo for a controlled, one-shot bootstrap.
     ///
-    /// Unlike [`Self::init_monorepo`], this accepts a configured SHA-256 or
-    /// BLAKE3 initial object graph. It must not be followed by a normal Git
-    /// service until protocol and pack paths carry an explicit repository hash
-    /// context.
+    /// Unlike [`Self::init_monorepo`], this path does not go through HTTP/SSH
+    /// listeners. SHA-1, SHA-256, and BLAKE3 graphs are all accepted; existing
+    /// repositories are never converted in place.
     pub(crate) async fn bootstrap_monorepo(
         &self,
         mono_config: &MonoConfig,
@@ -269,27 +268,16 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn normal_service_initialization_rejects_non_sha1_before_storage_access() {
-        let sha256_config = MonoConfig {
-            object_format: MonoObjectFormat::Sha256,
-            ..Default::default()
-        };
-        let err = MonoService::mock()
-            .init_monorepo(&sha256_config)
-            .await
-            .expect_err("SHA-256 must use the controlled bootstrap entrypoint");
-        assert!(err.to_string().contains("bootstrap-only"));
-
-        let mono_config = MonoConfig {
-            object_format: MonoObjectFormat::Blake3,
-            ..Default::default()
-        };
-
-        let err = MonoService::mock()
-            .init_monorepo(&mono_config)
-            .await
-            .expect_err("BLAKE3 must use the controlled bootstrap entrypoint");
-        assert!(err.to_string().contains("bootstrap-only"));
+    async fn normal_service_initialization_allows_non_sha1_object_format() {
+        for format in [MonoObjectFormat::Sha256, MonoObjectFormat::Blake3] {
+            let config = MonoConfig {
+                object_format: format,
+                ..Default::default()
+            };
+            config
+                .ensure_normal_service_object_format()
+                .unwrap_or_else(|err| panic!("{format:?} must be servable: {err}"));
+        }
     }
 
     #[test]

@@ -15,11 +15,11 @@ use crate::{
     ceres::{
         api_service::state::ProtocolApiState,
         protocol::{
-            Capability, ServiceType, SideBind, SmartSession, TransportProtocol, ZERO_ID,
+            Capability, ServiceType, SideBind, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
         },
     },
-    common::errors::ProtocolError,
+    common::{errors::ProtocolError, utils::is_protocol_zero_id},
 };
 
 const LF: char = '\n';
@@ -82,7 +82,7 @@ impl SmartSession {
         // The stream MUST include capability declarations behind a NUL on the first ref.
         let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
         self.ensure_advertised_object_ids(&head_hash, &git_refs)?;
-        let name = if head_hash == ZERO_ID {
+        let name = if is_protocol_zero_id(&head_hash) {
             "capabilities^{}"
         } else {
             "HEAD"
@@ -141,24 +141,12 @@ impl SmartSession {
 
             match commands {
                 b"want" => {
-                    if dst.len() < 45 {
-                        return Err(ProtocolError::InvalidInput(
-                            "want command is missing object id".to_owned(),
-                        ));
-                    }
-                    want.insert(String::from_utf8(dst[5..45].to_vec()).map_err(|_| {
-                        ProtocolError::InvalidInput("want object id is not valid UTF-8".to_owned())
-                    })?);
+                    let oid = self.parse_pkt_object_id(&dst, 5, "want")?;
+                    want.insert(oid);
                 }
                 b"have" => {
-                    if dst.len() < 45 {
-                        return Err(ProtocolError::InvalidInput(
-                            "have command is missing object id".to_owned(),
-                        ));
-                    }
-                    have.insert(String::from_utf8(dst[5..45].to_vec()).map_err(|_| {
-                        ProtocolError::InvalidInput("have object id is not valid UTF-8".to_owned())
-                    })?);
+                    let oid = self.parse_pkt_object_id(&dst, 5, "have")?;
+                    have.insert(oid);
                 }
                 b"done" => break,
                 b"deep" => {
@@ -198,8 +186,9 @@ impl SmartSession {
                 }
             };
             if !read_first_line {
-                if dst.len() > 46 {
-                    let caps = core::str::from_utf8(&dst[46..]).map_err(|_| {
+                let caps_at = 5 + self.hash_kind.hex_len() + 1;
+                if dst.len() > caps_at {
+                    let caps = core::str::from_utf8(&dst[caps_at..]).map_err(|_| {
                         ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
                     })?;
                     self.parse_capabilities(caps);
@@ -382,6 +371,8 @@ impl SmartSession {
         pkt_line: &mut Bytes,
     ) -> Result<RefCommand, ProtocolError> {
         let command = Self::parse_ref_command(pkt_line);
+        self.ensure_object_id_hex(&command.old_id, "old")?;
+        self.ensure_object_id_hex(&command.new_id, "new")?;
         let caps = core::str::from_utf8(pkt_line).map_err(|_| {
             ProtocolError::InvalidInput("capabilities are not valid UTF-8".to_owned())
         })?;
@@ -651,6 +642,30 @@ impl SmartSession {
         }
     }
 
+    fn parse_pkt_object_id(
+        &self,
+        dst: &[u8],
+        offset: usize,
+        what: &str,
+    ) -> Result<String, ProtocolError> {
+        if dst.len() <= offset {
+            return Err(ProtocolError::InvalidInput(format!(
+                "{what} command is missing object id"
+            )));
+        }
+        let rest = core::str::from_utf8(&dst[offset..]).map_err(|_| {
+            ProtocolError::InvalidInput(format!("{what} object id is not valid UTF-8"))
+        })?;
+        let oid = rest.split_whitespace().next().unwrap_or("");
+        if oid.is_empty() {
+            return Err(ProtocolError::InvalidInput(format!(
+                "{what} command is missing object id"
+            )));
+        }
+        self.ensure_object_id_hex(oid, what)?;
+        Ok(oid.to_owned())
+    }
+
     // the first line contains the capabilities
     pub fn parse_ref_command(pkt_line: &mut Bytes) -> RefCommand {
         RefCommand::new(
@@ -673,7 +688,7 @@ impl SmartSession {
             // Only process successful branch updates (not tags or failed commands)
             if command.ref_type == RefTypeEnum::Branch
                 && command.status == "ok"
-                && command.new_id != ZERO_ID
+                && !is_protocol_zero_id(&command.new_id)
                 && let Err(e) = self.bind_commit_to_user(state, &command.new_id).await
             {
                 tracing::warn!("Failed to bind commit {} to user: {}", command.new_id, e);
@@ -1355,6 +1370,103 @@ pub mod test {
             !v2_sha256.contains("object-format=sha1"),
             "v2 Sha256 advertisement must not include sha1: {v2_sha256}"
         );
+    }
+
+    #[test]
+    pub fn b3_04_advertise_blake3() {
+        for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+            let caps = advertised_capabilities(service, HashKind::Blake3);
+            assert!(
+                caps.contains("object-format=blake3"),
+                "blake3 capability must contain object-format=blake3 ({service:?}): {caps}"
+            );
+            assert!(
+                !caps.contains("object-format=sha1"),
+                "blake3 advertisement must not fall back to sha1 ({service:?}): {caps}"
+            );
+        }
+
+        let session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        )
+        .with_hash_kind(HashKind::Blake3);
+        assert_eq!(session.hash_kind, HashKind::Blake3);
+        assert_eq!(session.hash_kind.as_str(), "blake3");
+
+        let v2 = crate::ceres::protocol::v2::build_v2_capability_advertisement(HashKind::Blake3);
+        let v2 = String::from_utf8_lossy(&v2);
+        assert!(
+            v2.contains("object-format=blake3"),
+            "v2 blake3 advertisement: {v2}"
+        );
+        assert!(
+            !v2.contains("object-format=sha1"),
+            "v2 blake3 advertisement must not include sha1: {v2}"
+        );
+    }
+
+    #[test]
+    pub fn b3_04_wire_object_ids_use_injected_kind() {
+        let session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        )
+        .with_hash_kind(HashKind::Blake3);
+        let oid64 = "ab".repeat(32);
+        let want_line = format!("want {oid64} multi_ack_detailed\n");
+        let parsed = session
+            .parse_pkt_object_id(want_line.as_bytes(), 5, "want")
+            .expect("64-hex blake3 want must parse");
+        assert_eq!(parsed, oid64);
+
+        let sha1_want = format!("want {}\n", "a".repeat(40));
+        let err = session
+            .parse_pkt_object_id(sha1_want.as_bytes(), 5, "want")
+            .expect_err("40-hex want must not be accepted as blake3");
+        assert!(
+            err.to_string().contains("object-format blake3")
+                || err.to_string().contains("missing object id"),
+            "{err}"
+        );
+
+        let mut recv = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+        )
+        .with_hash_kind(HashKind::Blake3);
+        let mut pkt = Bytes::from(format!(
+            "{} {} refs/heads/main\0report-status\n",
+            "0".repeat(64),
+            oid64
+        ));
+        let command = recv
+            .parse_receive_pack_command_line(&mut pkt)
+            .expect("64-hex receive-pack ids must parse for blake3");
+        assert_eq!(command.command_type, CommandType::Create);
+        assert_eq!(command.new_id, oid64);
+
+        let mut del = Bytes::from(format!(
+            "{} {} refs/heads/main\0report-status\n",
+            oid64,
+            "0".repeat(64)
+        ));
+        let command = recv
+            .parse_receive_pack_command_line(&mut del)
+            .expect("64-zero new_id is a blake3 delete");
+        assert_eq!(command.command_type, CommandType::Delete);
+        assert!(crate::common::utils::is_protocol_zero_id(&command.new_id));
+
+        let mut bad = Bytes::from(format!(
+            "{} {} refs/heads/main\0report-status\n",
+            "0".repeat(40),
+            "a".repeat(40)
+        ));
+        recv.parse_receive_pack_command_line(&mut bad)
+            .expect_err("40-hex receive-pack ids must not be accepted as blake3");
     }
 
     #[test]

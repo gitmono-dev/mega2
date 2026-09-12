@@ -18,7 +18,10 @@ use git_internal::internal::object::commit::Commit;
 use crate::{
     callisto::{mega_cl, sea_orm_active_enums::RefTypeEnum},
     ceres::protocol::import_refs::{CommandType, RefCommand},
-    common::{errors::MegaError, utils::ZERO_ID},
+    common::{
+        errors::MegaError,
+        utils::{ZERO_ID, is_protocol_zero_id},
+    },
     jupiter::{storage::mono_storage::MonoStorage, utils::converter::FromMegaModel},
 };
 
@@ -96,7 +99,7 @@ impl PushChain {
         max_commits: usize,
     ) -> Result<PushChainResolution, MegaError> {
         debug_assert!(
-            cmd.command_type != CommandType::Delete && cmd.new_id != ZERO_ID,
+            cmd.command_type != CommandType::Delete && !is_protocol_zero_id(&cmd.new_id),
             "push chain is only resolved for non-delete branch commands"
         );
         match (!pack_commit_ids.is_empty(), tip_commit) {
@@ -285,7 +288,7 @@ impl PushChain {
                     };
                     (path.clone(), fork)
                 };
-                let base = if cmd.old_id != ZERO_ID {
+                let base = if !is_protocol_zero_id(&cmd.old_id) {
                     // The ref contract pins the base; the validator's
                     // termination check requires the walk to have reached it.
                     cmd.old_id.clone()
@@ -357,7 +360,7 @@ impl PushChain {
                 )));
             }
             let Some(parent_id) = current.parent_commit_ids.first().map(ToString::to_string) else {
-                if cmd.old_id == ZERO_ID {
+                if is_protocol_zero_id(&cmd.old_id) {
                     break;
                 }
                 return Err(MegaError::Other(format!(
@@ -381,7 +384,7 @@ impl PushChain {
             path.push(current.clone());
         }
 
-        let base = if cmd.old_id != ZERO_ID {
+        let base = if !is_protocol_zero_id(&cmd.old_id) {
             cmd.old_id.clone()
         } else {
             path.last()
@@ -551,7 +554,7 @@ pub fn primary_branch_command(commands: &[RefCommand]) -> Option<RefCommand> {
         .find(|c| {
             c.ref_type == RefTypeEnum::Branch
                 && c.command_type != CommandType::Delete
-                && c.new_id != ZERO_ID
+                && !is_protocol_zero_id(&c.new_id)
         })
         .cloned()
 }
