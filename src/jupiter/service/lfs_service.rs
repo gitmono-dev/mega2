@@ -19,4 +19,9 @@ impl LfsService {
             obj_storage: mock_object_storage(),
         }
     }
+
+    #[cfg(feature = "fastcdc")]
+    pub fn media(&self) -> crate::ceres::lfs::media::service::MediaService {
+        crate::ceres::lfs::media::service::MediaService::new(self.obj_storage.clone())
+    }
 }
