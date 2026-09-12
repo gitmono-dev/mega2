@@ -30,4 +30,12 @@
 - finalize 前只能通过 pending manifest 声明的 hash 读取 chunk，不能按任意 hash 取对象。
 - 领域错误：`Invalid` / `NotFound` / `Conflict` / `Storage` / `Io` / `Json`。存储错误对外固定为 `media object store error`。
 
+## Finalize / fallback（FC-06）
+
+- 同时最多 **2** 个 finalize（semaphore）。按 pending 声明的顺序逐块读取（≤8 MiB），写入临时文件并增量 SHA-256。
+- 校验整对象 `media_oid`/`media_size` 后，再跑一遍 `fastcdc-v1`：offset/length/hash 必须与 manifest 完全一致。
+- 缺失或损坏 chunk：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized manifest；临时文件在成功和失败路径都删除。
+- 通过后：`put_stream_bounded` 发布到 `lfs/{oid}`，`lfs_objects` 以 `ON CONFLICT (oid) DO NOTHING` 幂等插入，重新读取 metadata 并确认对象存在，然后才写 `media/v1/{scope}/finalized/{media_oid}`。
+- 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
+
 固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`20226243095e92274b3683f4c09bcd12ae35d245b073b38296a2a895c13b8c9d`。

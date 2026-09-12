@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use sea_orm::{EntityTrait, InsertResult, IntoActiveModel, Set};
+use sea_orm::{DbErr, EntityTrait, InsertResult, IntoActiveModel, Set, sea_query::OnConflict};
 
 use crate::{
     callisto::{lfs_locks, lfs_objects},
@@ -22,10 +22,18 @@ impl Deref for LfsDbStorage {
 
 impl LfsDbStorage {
     pub async fn new_lfs_object(&self, object: lfs_objects::Model) -> Result<bool, MegaError> {
-        let res = lfs_objects::Entity::insert(object.into_active_model())
+        match lfs_objects::Entity::insert(object.into_active_model())
+            .on_conflict(
+                OnConflict::column(lfs_objects::Column::Oid)
+                    .do_nothing()
+                    .to_owned(),
+            )
             .exec(self.get_connection())
-            .await;
-        Ok(res.is_ok())
+            .await
+        {
+            Ok(_) | Err(DbErr::RecordNotInserted) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn get_lfs_object(&self, oid: &str) -> Result<Option<lfs_objects::Model>, MegaError> {
@@ -78,5 +86,40 @@ impl LfsDbStorage {
             .exec(self.get_connection())
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jupiter::{migration::apply_migrations, tests::test_db_connection};
+
+    async fn storage() -> (tempfile::TempDir, LfsDbStorage) {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+        (
+            temp_dir,
+            LfsDbStorage {
+                base: BaseStorage::new(std::sync::Arc::new(db)),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn insert_is_idempotent_on_oid_conflict() {
+        let (_dir, storage) = storage().await;
+        let row = lfs_objects::Model {
+            oid: "a".repeat(64),
+            size: 12,
+            exist: true,
+        };
+        assert!(storage.new_lfs_object(row.clone()).await.unwrap());
+        assert!(storage.new_lfs_object(row.clone()).await.unwrap());
+        let got = storage.get_lfs_object(&row.oid).await.unwrap().unwrap();
+        assert_eq!(got.size, 12);
+        assert!(got.exist);
     }
 }

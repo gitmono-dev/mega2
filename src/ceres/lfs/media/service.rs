@@ -51,9 +51,9 @@ pub struct MediaService {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingSession {
-    created_at_unix: u64,
-    manifest: MediaManifest,
+pub(crate) struct PendingSession {
+    pub(crate) created_at_unix: u64,
+    pub(crate) manifest: MediaManifest,
 }
 
 impl MediaService {
@@ -188,7 +188,7 @@ impl MediaService {
         Ok(bytes)
     }
 
-    async fn require_active_pending(
+    pub(crate) async fn require_active_pending(
         &self,
         scope: &MediaScope,
         manifest_id: &str,
@@ -236,11 +236,11 @@ impl MediaService {
         }
     }
 
-    async fn exists(&self, key: &ObjectKey) -> Result<bool, MediaError> {
+    pub(crate) async fn exists(&self, key: &ObjectKey) -> Result<bool, MediaError> {
         self.store.inner.exists(key).await.map_err(map_store)
     }
 
-    async fn put_bytes(&self, key: &ObjectKey, bytes: Bytes) -> Result<(), MediaError> {
+    pub(crate) async fn put_bytes(&self, key: &ObjectKey, bytes: Bytes) -> Result<(), MediaError> {
         let meta = ObjectMeta {
             size: bytes.len() as i64,
             ..ObjectMeta::default()
@@ -252,7 +252,11 @@ impl MediaService {
             .map_err(map_store)
     }
 
-    async fn read_bytes(&self, key: &ObjectKey, max: usize) -> Result<Bytes, MediaError> {
+    pub(crate) async fn read_bytes(
+        &self,
+        key: &ObjectKey,
+        max: usize,
+    ) -> Result<Bytes, MediaError> {
         let (mut stream, meta) = self.store.inner.get_stream(key).await.map_err(map_store)?;
         if meta.size > max as i64 {
             return Err(MediaError::Invalid(
@@ -271,6 +275,10 @@ impl MediaService {
         }
         Ok(buf.freeze())
     }
+
+    pub(crate) fn object_store(&self) -> &MegaObjectStorageWrapper {
+        &self.store
+    }
 }
 
 #[cfg(test)]
@@ -286,7 +294,7 @@ impl MediaService {
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -307,7 +315,7 @@ fn encode_pending(session: &PendingSession) -> Result<Bytes, MediaError> {
     Ok(Bytes::from(bytes))
 }
 
-fn scope_key(
+pub(crate) fn scope_key(
     scope: &MediaScope,
     kind: MediaObjectKind,
     object_id: &str,
@@ -330,7 +338,7 @@ fn map_scope(err: ScopeError) -> MediaError {
     }
 }
 
-fn map_store(err: IoOrbitError) -> MediaError {
+pub(crate) fn map_store(err: IoOrbitError) -> MediaError {
     let _ = redact_storage_error(&err);
     if err.is_not_found() {
         MediaError::NotFound
