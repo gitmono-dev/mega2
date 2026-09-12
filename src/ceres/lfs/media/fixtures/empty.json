@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "algorithm": "fastcdc-v1",
+  "hash_algorithm": "sha256",
+  "media_oid": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "media_size": 0,
+  "chunks": [],
+  "created_by": {
+    "client": "libra",
+    "version": "0",
+    "capabilities": [
+      "fastcdc-v1",
+      "sha256"
+    ]
+  }
+}

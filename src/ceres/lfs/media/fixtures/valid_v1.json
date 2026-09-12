@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "algorithm": "fastcdc-v1",
+  "hash_algorithm": "sha256",
+  "media_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "media_size": 10,
+  "chunks": [
+    {
+      "offset": 0,
+      "length": 6,
+      "chunk_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "encoded_length": 6,
+      "compression": "none"
+    },
+    {
+      "offset": 6,
+      "length": 4,
+      "chunk_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "encoded_length": 4,
+      "compression": "none"
+    }
+  ],
+  "created_by": {
+    "client": "libra",
+    "version": "0",
+    "capabilities": [
+      "fastcdc-v1",
+      "sha256"
+    ]
+  }
+}
