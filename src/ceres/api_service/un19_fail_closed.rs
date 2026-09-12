@@ -8,10 +8,10 @@
 //! was wrong with the change and nobody rejected it, so the same merge can
 //! succeed once authorization is available again (UN-25's contract).
 
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::object::tree::{Tree, TreeItem, TreeItemMode},
 };
 use sea_orm::ConnectionTrait;
@@ -69,13 +69,18 @@ async fn storage_in(temp: &std::path::Path, mode: &str) -> Storage {
 async fn seed_main(storage: &Storage, with_acl: bool) {
     let mut items = vec![TreeItem::new(
         TreeItemMode::Blob,
-        ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap(),
+        ObjectHash::from_hex_for_kind(get_hash_kind(), "2222222222222222222222222222222222222222")
+            .unwrap(),
         "README.md".to_string(),
     )];
     if with_acl {
         items.push(TreeItem::new(
             TreeItemMode::Blob,
-            ObjectHash::from_str("3333333333333333333333333333333333333333").unwrap(),
+            ObjectHash::from_hex_for_kind(
+                get_hash_kind(),
+                "3333333333333333333333333333333333333333",
+            )
+            .unwrap(),
             ".mega_cedar.json".to_string(),
         ));
     }
@@ -85,7 +90,7 @@ async fn seed_main(storage: &Storage, with_acl: bool) {
         .mono_storage()
         .save_mega_trees(
             vec![tree.clone()],
-            ObjectHash::from_str(commit_id).unwrap(),
+            ObjectHash::from_hex_for_kind(get_hash_kind(), commit_id).unwrap(),
             None,
         )
         .await
@@ -231,13 +236,15 @@ async fn un19_off_performs_no_detection() {
 fn un19_a_rename_of_the_authz_file_counts_as_touching_it() {
     use std::path::PathBuf;
 
-    use git_internal::hash::ObjectHash;
+    use git_internal::hash::{ObjectHash, get_hash_kind};
 
     use crate::ceres::model::change_list::ClDiffFile;
 
     let acl = PathBuf::from(".mega_cedar.json");
     let elsewhere = PathBuf::from("docs/old-acl.json");
-    let hash = ObjectHash::from_str("6666666666666666666666666666666666666666").unwrap();
+    let hash =
+        ObjectHash::from_hex_for_kind(get_hash_kind(), "6666666666666666666666666666666666666666")
+            .unwrap();
 
     let renamed_away = ClDiffFile::Renamed(acl.clone(), elsewhere.clone(), hash, hash, 100);
     assert_eq!(

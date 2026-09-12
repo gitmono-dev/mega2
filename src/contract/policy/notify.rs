@@ -13,15 +13,13 @@
 //! in-memory blob-id notify path.
 
 #[cfg(test)]
-use std::str::FromStr;
-#[cfg(test)]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use git_internal::internal::object::tree::Tree;
 #[cfg(test)]
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::object::tree::{TreeItem, TreeItemMode},
 };
 use sea_orm::DatabaseTransaction;
@@ -449,7 +447,7 @@ async fn apply_after_json_load_publish(storage: &Storage) -> Result<(), MegaErro
         .git_service
         .save_object_from_raw(bytes::Bytes::from(json))
         .await?;
-    let blob_hash = ObjectHash::from_str(&blob_id)
+    let blob_hash = ObjectHash::from_hex_for_kind(get_hash_kind(), &blob_id)
         .map_err(|e| MegaError::Other(format!("authz test blob hash: {e}")))?;
     let tree = Tree::from_tree_items(vec![TreeItem::new(
         TreeItemMode::Blob,
@@ -460,7 +458,7 @@ async fn apply_after_json_load_publish(storage: &Storage) -> Result<(), MegaErro
     let Some(root) = storage.mono_storage().get_main_ref("/").await? else {
         return Ok(());
     };
-    let commit_id = ObjectHash::from_str(&root.ref_commit_hash)
+    let commit_id = ObjectHash::from_hex_for_kind(get_hash_kind(), &root.ref_commit_hash)
         .map_err(|e| MegaError::Other(format!("authz test commit hash: {e}")))?;
     storage
         .mono_storage()

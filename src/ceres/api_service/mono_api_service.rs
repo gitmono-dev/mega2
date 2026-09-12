@@ -51,7 +51,7 @@ use git_internal::{
     DiffItem,
     diff::Diff as GitDiff,
     errors::GitError,
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::EntryMeta,
         object::{
@@ -850,7 +850,10 @@ impl MonoServiceLogic {
             if let Some(p_ref) = refs.iter().find(|r| r.path == update.path) {
                 let commit = Commit::from_tree_id(
                     update.tree_id,
-                    vec![ObjectHash::from_str(&p_ref.ref_commit_hash).unwrap()],
+                    vec![
+                        ObjectHash::from_hex_for_kind(get_hash_kind(), &p_ref.ref_commit_hash)
+                            .unwrap(),
+                    ],
                     commit_msg,
                 );
                 let commit_id = commit.id.to_string();
@@ -913,12 +916,15 @@ impl MonoServiceLogic {
             } else if let Some(po) = parent_override {
                 vec![po]
             } else {
-                vec![ObjectHash::from_str(&cl_ref.ref_commit_hash).map_err(|_| {
-                    GitError::CustomError(format!(
-                        "Invalid CL ref hash: {}",
-                        cl_ref.ref_commit_hash
-                    ))
-                })?]
+                vec![
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), &cl_ref.ref_commit_hash)
+                        .map_err(|_| {
+                            GitError::CustomError(format!(
+                                "Invalid CL ref hash: {}",
+                                cl_ref.ref_commit_hash
+                            ))
+                        })?,
+                ]
             };
 
             let commit = Commit::from_tree_id(update.tree_id, parent_ids, commit_msg);
@@ -1081,9 +1087,10 @@ impl ApiHandler for MonoApiService {
         let dst_commit = Commit::from_tree_id(
             target_tree_id,
             vec![
-                ObjectHash::from_str(&src_commit.id.to_string()).map_err(|e| {
-                    GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id))
-                })?,
+                ObjectHash::from_hex_for_kind(get_hash_kind(), &src_commit.id.to_string())
+                    .map_err(|e| {
+                        GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id))
+                    })?,
             ],
             &payload.commit_message,
         );
@@ -1230,9 +1237,10 @@ impl ApiHandler for MonoApiService {
         };
 
         let src_commit = edit_utils::get_repo_main_latest_commit(&self.storage, &tip_path).await?;
-        let base_commit = ObjectHash::from_str(&src_commit.id.to_string()).map_err(|e| {
-            GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id))
-        })?;
+        let base_commit =
+            ObjectHash::from_hex_for_kind(get_hash_kind(), &src_commit.id.to_string()).map_err(
+                |e| GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id)),
+            )?;
         let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &tip_path)
             .ok_or_else(|| {
                 GitError::CustomError(format!(
@@ -2344,7 +2352,10 @@ impl MonoApiService {
         let tag_target = target
             .as_ref()
             .ok_or(GitError::InvalidCommitObject)
-            .and_then(|t| ObjectHash::from_str(t).map_err(|_| GitError::InvalidCommitObject))?;
+            .and_then(|t| {
+                ObjectHash::from_hex_for_kind(get_hash_kind(), t)
+                    .map_err(|_| GitError::InvalidCommitObject)
+            })?;
         let tagger_sig = git_internal::internal::object::signature::Signature::new(
             git_internal::internal::object::signature::SignatureType::Tagger,
             tagger_info.clone(),
@@ -2837,12 +2848,14 @@ impl MonoApiService {
             &result,
             "update-branch: rebase",
             &cl.link,
-            Some(ObjectHash::from_str(target_head).map_err(|e| {
-                GitError::CustomError(format!(
-                    "Invalid target_head ObjectHash '{}': {}",
-                    target_head, e
-                ))
-            })?),
+            Some(
+                ObjectHash::from_hex_for_kind(get_hash_kind(), target_head).map_err(|e| {
+                    GitError::CustomError(format!(
+                        "Invalid target_head ObjectHash '{}': {}",
+                        target_head, e
+                    ))
+                })?,
+            ),
         )
         .await
     }
@@ -3385,8 +3398,6 @@ impl MonoApiService {
         txn: &DatabaseTransaction,
         args: PushApplyArgs<'_>,
     ) -> Result<(String, u32), GitError> {
-        use std::str::FromStr;
-
         use sea_orm::IntoActiveModel;
 
         let PushApplyArgs {
@@ -3452,7 +3463,7 @@ impl MonoApiService {
             }
             let parent_ids = match existing.as_ref() {
                 Some(row) => vec![
-                    ObjectHash::from_str(&row.ref_commit_hash)
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), &row.ref_commit_hash)
                         .map_err(|e| GitError::CustomError(e.to_string()))?,
                 ],
                 None => Vec::new(),
@@ -3492,7 +3503,8 @@ impl MonoApiService {
         } else {
             let parent_ids = match expected_root_commit {
                 Some(c) => vec![
-                    ObjectHash::from_str(c).map_err(|e| GitError::CustomError(e.to_string()))?,
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), c)
+                        .map_err(|e| GitError::CustomError(e.to_string()))?,
                 ],
                 None => Vec::new(),
             };
@@ -6191,7 +6203,7 @@ async fn save_authz_json(storage: &Storage, json: &str) -> String {
 fn blob_item(name: &str, hex: &str) -> TreeItem {
     TreeItem::new(
         TreeItemMode::Blob,
-        ObjectHash::from_str(hex).unwrap(),
+        ObjectHash::from_hex_for_kind(get_hash_kind(), hex).unwrap(),
         name.to_string(),
     )
 }
@@ -6201,7 +6213,7 @@ async fn setup_main_ref(storage: &Storage, old_tree: &Tree, old_commit_id: &str)
         .mono_storage()
         .save_mega_trees(
             vec![old_tree.clone()],
-            ObjectHash::from_str(old_commit_id).unwrap(),
+            ObjectHash::from_hex_for_kind(get_hash_kind(), old_commit_id).unwrap(),
             None,
         )
         .await
@@ -6302,7 +6314,11 @@ async fn apply_update_result_marks_dirty_when_authz_blob_unreadable() {
     // `from_tree_items` rejects empty trees, so build the empty tree via the
     // struct literal (id is arbitrary; only the tree_items matter here).
     let old_tree = Tree {
-        id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+        id: ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap(),
         tree_items: vec![],
     };
     setup_main_ref(
@@ -6347,7 +6363,11 @@ async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() 
     let service = test_service(&storage);
 
     let old_tree = Tree {
-        id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+        id: ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap(),
         tree_items: vec![],
     };
     setup_main_ref(
@@ -6387,7 +6407,11 @@ async fn apply_update_result_marks_dirty_when_tree_save_fails_after_ref_write() 
         .expect("create fault-injection trigger on mega_tree");
 
     let new_tree = Tree {
-        id: ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap(),
+        id: ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap(),
         tree_items: vec![],
     };
     let result = TreeUpdateResult {
@@ -6456,7 +6480,11 @@ async fn gate_test_service() -> (tempfile::TempDir, Storage, MonoApiService) {
     let storage = crate::jupiter::tests::test_storage(temp.path()).await;
     let service = test_service(&storage);
     let old_tree = Tree {
-        id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+        id: ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap(),
         tree_items: vec![],
     };
     setup_main_ref(
@@ -6663,9 +6691,21 @@ mod mc09_tests {
     /// `other.txt`; disjoint from the CL change so no conflict) — plus the
     /// main ref, the CL ref and the open CL.
     async fn chain_fixture(storage: &Storage, link: &str) -> (String, String, String) {
-        let blob_base = ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap();
-        let blob_other = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
-        let blob_cl = ObjectHash::from_str("3333333333333333333333333333333333333333").unwrap();
+        let blob_base = ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let blob_other = ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let blob_cl = ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "3333333333333333333333333333333333333333",
+        )
+        .unwrap();
 
         let from_tree = Tree::from_tree_items(vec![blob_item("base.txt", &blob_base.to_string())])
             .expect("from tree");
@@ -6872,8 +6912,16 @@ mod mc09_tests {
         let link = "MC04UB2";
         // Fixture like chain_fixture, but the CL commit shares the base tree —
         // the CL diff (from → to) is empty.
-        let blob_base = ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap();
-        let blob_other = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
+        let blob_base = ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let blob_other = ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
         let from_tree = Tree::from_tree_items(vec![blob_item("base.txt", &blob_base.to_string())])
             .expect("from tree");
         let target_tree = Tree::from_tree_items(vec![
@@ -7140,7 +7188,11 @@ mod mc09_tests {
     /// `get_and_update_cl_in_txn`, and a session with one uploaded file.
     /// Returns the base commit hash (`from_hash`).
     async fn buck_fixture(storage: &Storage, link: &str, username: &str) -> String {
-        let blob_old = ObjectHash::from_str("4444444444444444444444444444444444444444").unwrap();
+        let blob_old = ObjectHash::from_hex_for_kind(
+            get_hash_kind(),
+            "4444444444444444444444444444444444444444",
+        )
+        .unwrap();
         let base_tree = Tree::from_tree_items(vec![blob_item("old.txt", &blob_old.to_string())])
             .expect("base tree");
         let base_commit = Commit::from_tree_id(base_tree.id, vec![], "mc09 buck base");
@@ -7427,7 +7479,7 @@ mod mc09_tests {
         if let Some((name, child)) = extra_child {
             mono.save_mega_trees(
                 vec![child.clone()],
-                ObjectHash::from_str(&"1".repeat(40)).unwrap(),
+                ObjectHash::from_hex_for_kind(get_hash_kind(), &"1".repeat(40)).unwrap(),
                 None,
             )
             .await
@@ -7550,7 +7602,11 @@ mod mc09_tests {
         let storage = crate::jupiter::tests::test_storage_queue_merge(temp.path()).await;
         let service = test_service(&storage);
         let old_tree = Tree {
-            id: ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap(),
+            id: ObjectHash::from_hex_for_kind(
+                get_hash_kind(),
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap(),
             tree_items: vec![],
         };
         setup_main_ref(
@@ -7706,7 +7762,8 @@ mod mc09_tests {
 
         let blob_tip = blob_item("x.txt", "ffffffffffffffffffffffffffffffffffffffff");
         let b_tip = Tree::from_tree_items(vec![blob_tip]).expect("b tip");
-        let parent = ObjectHash::from_str(&after_a.ref_commit_hash).unwrap();
+        let parent =
+            ObjectHash::from_hex_for_kind(get_hash_kind(), &after_a.ref_commit_hash).unwrap();
         let cl_b_commit = Commit::from_tree_id(b_tip.id, vec![parent], "cl /a/b");
         mono.save_mega_trees(vec![b_tip.clone()], cl_b_commit.id, None)
             .await

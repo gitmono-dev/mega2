@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    str::FromStr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -12,7 +11,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
 use git_internal::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
@@ -313,7 +312,7 @@ impl RepoHandler for Monorepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
                     Tree::from_mega_model(m),
                 )
             })
@@ -422,7 +421,7 @@ impl RepoHandler for Monorepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
                     Tree::from_mega_model(m),
                 )
             })
@@ -531,7 +530,7 @@ impl RepoHandler for Monorepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_str(&m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
                     Tree::from_mega_model(m),
                 )
             })

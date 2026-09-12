@@ -1,14 +1,13 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use git_internal::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -441,7 +440,8 @@ impl ApiHandler for ImportApiService {
                 .await
                 .map_err(|e| GitError::CustomError(e.to_string()))?
                 .ok_or(GitError::InvalidCommitObject)?;
-            let parent_id = ObjectHash::from_str(&current_commit.commit_id).unwrap();
+            let parent_id =
+                ObjectHash::from_hex_for_kind(get_hash_kind(), &current_commit.commit_id).unwrap();
 
             let new_commit =
                 Commit::from_tree_id(new_root_id, vec![parent_id], &payload.commit_message);
@@ -608,7 +608,10 @@ impl ImportApiService {
         let tag_target = target
             .as_ref()
             .ok_or(GitError::InvalidCommitObject)
-            .and_then(|t| ObjectHash::from_str(t).map_err(|_| GitError::InvalidCommitObject))?;
+            .and_then(|t| {
+                ObjectHash::from_hex_for_kind(get_hash_kind(), t)
+                    .map_err(|_| GitError::InvalidCommitObject)
+            })?;
         let git_internal_tag = git_internal::internal::object::tag::Tag::new(
             tag_target,
             git_internal::internal::object::types::ObjectType::Commit,

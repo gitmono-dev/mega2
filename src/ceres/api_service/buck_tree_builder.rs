@@ -7,11 +7,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::EntryMeta,
         object::{
@@ -190,7 +189,7 @@ impl BuckCommitBuilder {
             .await?;
 
         // Create commit with the new tree
-        let parent_sha = ObjectHash::from_str(base_commit_hash)
+        let parent_sha = ObjectHash::from_hex_for_kind(get_hash_kind(), base_commit_hash)
             .map_err(|e| MegaError::Other(format!("Invalid parent hash: {}", e)))?;
 
         let commit = Commit::from_tree_id(tree_result.tree_hash, vec![parent_sha], message);
@@ -590,6 +589,8 @@ impl BuckCommitBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     /// Test group_files_by_directory method
@@ -1810,8 +1811,6 @@ mod tests {
     /// Test Git Sorting Rules
     #[test]
     fn test_git_sort_order() {
-        use std::str::FromStr;
-
         use git_internal::hash::ObjectHash;
 
         // Setup items

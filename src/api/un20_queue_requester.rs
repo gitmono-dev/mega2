@@ -8,14 +8,14 @@
 //! These cases drive the real routers through axum so the extractor wiring
 //! itself is under test, not just the storage chain underneath it.
 
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
     http::{Request, StatusCode, header::CONTENT_TYPE},
 };
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::object::{
         commit::Commit,
         tree::{Tree, TreeItem, TreeItemMode},
@@ -71,7 +71,7 @@ fn api_state(storage: Storage, session_store: BrowserSessionStore) -> MonoApiSer
 fn blob_item(name: &str, hex: &str) -> TreeItem {
     TreeItem::new(
         TreeItemMode::Blob,
-        ObjectHash::from_str(hex).unwrap(),
+        ObjectHash::from_hex_for_kind(get_hash_kind(), hex).unwrap(),
         name.to_string(),
     )
 }

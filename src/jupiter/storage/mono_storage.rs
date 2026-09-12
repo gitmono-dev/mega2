@@ -1,13 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
-    str::FromStr,
     sync::Arc,
 };
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::EntryMeta,
         object::{
@@ -537,7 +536,7 @@ impl MonoStorage {
         let Some(row) = self.get_tombstone_on(conn, path, ref_name).await? else {
             return Ok(vec![]);
         };
-        let hash = ObjectHash::from_str(&row.last_commit_hash)
+        let hash = ObjectHash::from_hex_for_kind(get_hash_kind(), &row.last_commit_hash)
             .map_err(|e| MegaError::Other(format!("tombstone parent hash: {e}")))?;
         Ok(vec![hash])
     }
@@ -655,12 +654,18 @@ impl MonoStorage {
                         unchanged.insert(row.path.clone());
                         continue;
                     }
-                    let parent = ObjectHash::from_str(&row.ref_commit_hash).map_err(|e| {
-                        MegaError::Other(format!("descendant {} parent hash: {e}", row.path))
-                    })?;
-                    let tree = ObjectHash::from_str(&new_hash).map_err(|e| {
-                        MegaError::Other(format!("descendant {} tree hash: {e}", row.path))
-                    })?;
+                    let parent =
+                        ObjectHash::from_hex_for_kind(get_hash_kind(), &row.ref_commit_hash)
+                            .map_err(|e| {
+                                MegaError::Other(format!(
+                                    "descendant {} parent hash: {e}",
+                                    row.path
+                                ))
+                            })?;
+                    let tree =
+                        ObjectHash::from_hex_for_kind(get_hash_kind(), &new_hash).map_err(|e| {
+                            MegaError::Other(format!("descendant {} tree hash: {e}", row.path))
+                        })?;
                     let commit = match &style {
                         DescendantCommitStyle::Legacy => Commit::from_tree_id(
                             tree,
@@ -1678,6 +1683,8 @@ impl MonoStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use sea_orm::TransactionTrait;
 
     use super::*;

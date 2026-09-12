@@ -1270,10 +1270,10 @@ impl PushQueueService {
         cur_tree: Option<&str>,
         root: Option<&crate::callisto::mega_refs::Model>,
     ) -> Result<ExecuteOutcome, MegaError> {
-        use std::{path::PathBuf, str::FromStr};
+        use std::path::PathBuf;
 
         use git_internal::{
-            hash::ObjectHash,
+            hash::{ObjectHash, get_hash_kind},
             internal::object::{commit::Commit, tree::Tree},
         };
 
@@ -1411,7 +1411,7 @@ impl PushQueueService {
                 .ok_or_else(|| MegaError::Other("no tree generated".into()))?
                 .id,
             vec![
-                ObjectHash::from_str(&expected_commit)
+                ObjectHash::from_hex_for_kind(get_hash_kind(), &expected_commit)
                     .map_err(|e| MegaError::Other(format!("invalid expected commit hash: {e}")))?,
             ],
             &format!("\n{commit_msg}"),
@@ -1684,11 +1684,11 @@ impl PushQueueService {
         cur_tree: Option<&str>,
         root: Option<&crate::callisto::mega_refs::Model>,
     ) -> Result<ExecuteOutcome, MegaError> {
-        use std::{path::PathBuf, str::FromStr};
+        use std::path::PathBuf;
 
         use git_internal::{
             errors::GitError,
-            hash::ObjectHash,
+            hash::{ObjectHash, get_hash_kind},
             internal::object::{commit::Commit, tree::Tree},
         };
 
@@ -1984,7 +1984,7 @@ impl PushQueueService {
             let parents = if creating {
                 Vec::new()
             } else {
-                let parent_hash = ObjectHash::from_str(&row.old_id)
+                let parent_hash = ObjectHash::from_hex_for_kind(get_hash_kind(), &row.old_id)
                     .map_err(|e| MegaError::Other(e.to_string()))?;
                 vec![parent_hash]
             };

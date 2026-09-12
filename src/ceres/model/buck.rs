@@ -2,8 +2,11 @@
 //!
 //! This module contains request and response structures for the Buck upload API.
 
+use git_internal::hash::{HashKind, ObjectHash};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+use crate::common::errors::MegaError;
 
 /// Request payload for creating an upload session
 #[derive(Debug, Deserialize, ToSchema)]
@@ -59,16 +62,7 @@ pub struct ManifestFile {
 ///
 /// # Returns
 /// The parsed ObjectHash or an error if format is invalid
-pub fn parse_sha1_hash(
-    input: &str,
-    field_name: &str,
-) -> Result<git_internal::hash::ObjectHash, crate::common::errors::MegaError> {
-    use std::str::FromStr;
-
-    use git_internal::hash::ObjectHash;
-
-    use crate::common::errors::MegaError;
-
+pub fn parse_sha1_hash(input: &str, field_name: &str) -> Result<ObjectHash, MegaError> {
     let parts: Vec<&str> = input.splitn(2, ':').collect();
 
     if parts.len() != 2 {
@@ -82,7 +76,7 @@ pub fn parse_sha1_hash(
     let hash_hex = parts[1].to_lowercase(); // Normalize to lowercase (Git convention)
 
     match algorithm.as_str() {
-        "sha1" => ObjectHash::from_str(&hash_hex).map_err(|e| {
+        "sha1" => ObjectHash::from_hex_for_kind(HashKind::Sha1, &hash_hex).map_err(|e| {
             MegaError::Other(format!(
                 "Invalid ObjectHash in {}: '{}', error: {}",
                 field_name, hash_hex, e
@@ -100,9 +94,7 @@ impl ManifestFile {
     ///
     /// Expects format: "sha1:HEXSTRING" (case-insensitive, normalized to lowercase)
     /// Returns the parsed ObjectHash or an error if format is invalid
-    pub fn parse_hash(
-        &self,
-    ) -> Result<git_internal::hash::ObjectHash, crate::common::errors::MegaError> {
+    pub fn parse_hash(&self) -> Result<ObjectHash, MegaError> {
         parse_sha1_hash(&self.hash, "hash field")
     }
 }
@@ -207,9 +199,7 @@ impl FileChange {
     ///
     /// Expects format: "sha1:HEXSTRING" (case-insensitive, normalized to lowercase)
     /// Returns the parsed ObjectHash or an error if format is invalid
-    pub fn parse_blob_hash(
-        &self,
-    ) -> Result<git_internal::hash::ObjectHash, crate::common::errors::MegaError> {
+    pub fn parse_blob_hash(&self) -> Result<ObjectHash, MegaError> {
         parse_sha1_hash(&self.blob_id, "blob_id")
     }
 
@@ -232,5 +222,33 @@ impl FileChange {
                 TreeItemMode::Blob
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use git_internal::hash::HashKind;
+
+    use super::parse_sha1_hash;
+
+    #[test]
+    fn parse_sha1_hash_accepts_40_hex_as_sha1() {
+        let hex = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let hash = parse_sha1_hash(&format!("sha1:{hex}"), "hash").expect("40 hex sha1");
+        assert_eq!(hash.kind(), HashKind::Sha1);
+        assert_eq!(hash.to_string(), hex);
+    }
+
+    #[test]
+    fn parse_sha1_hash_rejects_64_hex() {
+        let hex = "a".repeat(64);
+        let err = parse_sha1_hash(&format!("sha1:{hex}"), "hash")
+            .expect_err("sha1: + 64 hex must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("hash"), "{message}");
+        assert!(
+            message.contains(&hex) || message.contains("64"),
+            "{message}"
+        );
     }
 }

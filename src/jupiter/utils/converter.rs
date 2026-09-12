@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, str::FromStr};
+use std::{cell::RefCell, collections::HashMap};
 
 use git_internal::{
     hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
@@ -44,14 +44,14 @@ fn commit_from_model(
             Ok(parents_array) => parents_array
                 .into_iter()
                 .filter(|s: &String| !s.is_empty())
-                .map(|s: String| ObjectHash::from_str(&s).unwrap())
+                .map(|s: String| ObjectHash::from_hex_for_kind(get_hash_kind(), &s).unwrap())
                 .collect(),
             Err(_) => Vec::new(),
         };
 
     Commit {
-        id: ObjectHash::from_str(commit_id).unwrap(),
-        tree_id: ObjectHash::from_str(tree).unwrap(),
+        id: ObjectHash::from_hex_for_kind(get_hash_kind(), commit_id).unwrap(),
+        tree_id: ObjectHash::from_hex_for_kind(get_hash_kind(), tree).unwrap(),
         parent_commit_ids,
         author: Signature::from_data(author.unwrap().into_bytes()).unwrap(),
         committer: Signature::from_data(committer.unwrap().into_bytes()).unwrap(),
@@ -779,8 +779,9 @@ impl FromMegaModel for Tag {
     /// - The tagger string cannot be converted into a valid Signature
     fn from_mega_model(model: Self::MegaSource) -> Self {
         Tag {
-            id: ObjectHash::from_str(&model.tag_id).expect("Invalid tag_id in database"),
-            object_hash: ObjectHash::from_str(&model.object_id).unwrap(),
+            id: ObjectHash::from_hex_for_kind(get_hash_kind(), &model.tag_id)
+                .expect("Invalid tag_id in database"),
+            object_hash: ObjectHash::from_hex_for_kind(get_hash_kind(), &model.object_id).unwrap(),
             object_type: ObjectType::from_string(&model.object_type).unwrap(),
             tag_name: model.tag_name,
             tagger: Signature::from_data(model.tagger.into_bytes()).unwrap(),
@@ -815,8 +816,8 @@ impl FromGitModel for Tag {
     /// - The tagger string cannot be converted into a valid Signature
     fn from_git_model(model: Self::GitSource) -> Self {
         Tag {
-            id: ObjectHash::from_str(&model.tag_id).unwrap(),
-            object_hash: ObjectHash::from_str(&model.object_id).unwrap(),
+            id: ObjectHash::from_hex_for_kind(get_hash_kind(), &model.tag_id).unwrap(),
+            object_hash: ObjectHash::from_hex_for_kind(get_hash_kind(), &model.object_id).unwrap(),
             object_type: ObjectType::from_string(&model.object_type).unwrap(),
             tag_name: model.tag_name,
             tagger: Signature::from_data(model.tagger.into_bytes()).unwrap(),
@@ -850,7 +851,7 @@ impl FromMegaModel for Tree {
     fn from_mega_model(model: Self::MegaSource) -> Self {
         Tree::from_bytes(
             &model.sub_trees,
-            ObjectHash::from_str(&model.tree_id).unwrap(),
+            ObjectHash::from_hex_for_kind(get_hash_kind(), &model.tree_id).unwrap(),
         )
         .unwrap()
     }
@@ -881,7 +882,7 @@ impl FromGitModel for Tree {
     fn from_git_model(model: Self::GitSource) -> Self {
         Tree::from_bytes(
             &model.sub_trees,
-            ObjectHash::from_str(&model.tree_id).unwrap(),
+            ObjectHash::from_hex_for_kind(get_hash_kind(), &model.tree_id).unwrap(),
         )
         .unwrap()
     }

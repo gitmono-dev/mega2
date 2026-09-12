@@ -14,9 +14,10 @@ pub const ZERO_ID: &str = match std::str::from_utf8(&[b'0'; 40]) {
 /// We intentionally only accept full-hex ids here (no short ids), because short ids
 /// require repository-specific disambiguation.
 ///
-/// Supported lengths:
-/// - SHA-1   : 40 hex chars
-/// - SHA-256 : 64 hex chars
+/// Accepted lengths are 40 or 64 hex characters. **Length is not hash kind**:
+/// 40 hex is not automatically SHA-1, and 64 hex is not SHA-256 (BLAKE3-256 is
+/// also 64 hex). Callers that construct an [`git_internal::hash::ObjectHash`]
+/// must use `ObjectHash::from_hex_for_kind` with an explicit kind.
 pub fn is_full_hex_object_id(oid: &str) -> bool {
     let is_valid_len = oid.len() == 40 || oid.len() == 64;
     is_valid_len && oid.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
@@ -191,14 +192,14 @@ mod test {
 
     #[test]
     fn test_is_full_hex_object_id() {
-        // Valid SHA-1 (40 hex)
+        // Shape-only: 40 hex (SHA-1 width). Length does not imply kind.
         assert!(is_full_hex_object_id(&"0".repeat(40)));
         assert!(is_full_hex_object_id(&"a".repeat(40)));
         assert!(is_full_hex_object_id(&"A".repeat(40)));
         assert!(is_full_hex_object_id(&"f".repeat(40)));
         assert!(is_full_hex_object_id(&"F".repeat(40)));
 
-        // Valid SHA-256 (64 hex)
+        // Shape-only: 64 hex (SHA-256 or BLAKE3-256 width). Length ≠ kind.
         assert!(is_full_hex_object_id(&"0".repeat(64)));
         let sha256 = "abcdef".repeat(10) + "abcd"; // 60 + 4 = 64
         assert!(is_full_hex_object_id(&sha256));
