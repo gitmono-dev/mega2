@@ -12,26 +12,28 @@ Configuration source diagnostics are available with `--show-sources`; use
 Secrets are supplied by deployment configuration or supported Vault
 `SecretRef`s and must never be committed.
 
-## Monorepo initial object-ID format
+## Monorepo object-ID format
 
-`[monorepo].object_format` selects the object-ID algorithm used while an empty
-Monorepo creates its initial commit, trees, and blobs. Its canonical values are
-`sha1` (the default) and `sha256`; the parser also accepts `sha-1` and
-`sha-256` for configuration compatibility. The setting is restart-required and
-does not convert an existing repository.
+`[monorepo].object_format` selects the object-ID algorithm for an empty
+Monorepo's initial graph and for live Git service. Canonical values are `sha1`
+(the default), `sha256`, and `blake3`. The parser also accepts `sha-1` and
+`sha-256`. `black3` is not a valid spelling or value. The setting is
+restart-required and does not convert an existing repository.
 
-`blake3` is intentionally recognized but rejected by `config validate` and by
-the initializer until monoengine consumes the explicit BLAKE3 APIs planned for
-`git-internal` 0.9.0. `black3` is not a valid spelling or value.
+`sha1` is the stock Git format. `sha256` and `blake3` are git-internal / Libra
+extensions: normal service advertises `object-format={kind}` and pack
+encode/decode uses `*_with_hash_kind`. Do not claim interoperability with stock
+Git clients for those values (DEFER-B3-01). Cross-kind or wrong-width IDs and
+pack trailer mismatches fail closed.
 
-This is an initialization-only contract. Ceres still has SHA-1-only protocol
-and pack paths, so `sha256` must not be presented as an end-to-end Git
-clone/fetch/push format until the repository context, protocol, and pack work
-are completed. Use it only for a controlled bootstrap invocation; do not start
-a normal Git service with this setting. Run
-`monoengine --config <path> service init --yes` to create the initial graph;
-the command requires an existing config and exits without starting Git listeners
-or normal service runtime dependencies.
+Git Object Format is independent of LFS Digest Algorithm
+(`Git=blake3/LFS=sha256` and `Git=sha256/LFS=blake3` are expressible). LFS
+BLAKE3 as a product transfer path is `DEFER-B3-LFS-01`.
+
+Run `monoengine --config <path> service init --yes` to create the initial
+graph; the command requires an existing config and exits without starting Git
+listeners or normal service runtime dependencies. See
+[`protocol.md`](./protocol.md) and [`plan/plan-20260907.md`](../plan/plan-20260907.md).
 
 ## Cedar authorization enforcement
 
