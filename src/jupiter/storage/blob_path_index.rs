@@ -222,6 +222,11 @@ impl MonoStorage {
         mode: BlobPathIndexMode,
     ) -> Result<BlobPathIndexStats, MegaError> {
         let prefix = normalize_index_prefix(path_prefix);
+        let pairs: Vec<(String, String)> = appearances
+            .iter()
+            .map(|appearance| (appearance.blob_id.clone(), appearance.path.clone()))
+            .collect();
+        self.update_blob_filepaths(pairs).await?;
         let mut upserted = 0u64;
         for appearance in appearances {
             if self
@@ -229,9 +234,6 @@ impl MonoStorage {
                 .await?
             {
                 upserted += 1;
-                let _ = self
-                    .update_blob_filepath(&appearance.blob_id, &appearance.path)
-                    .await;
             }
         }
         let deleted = self

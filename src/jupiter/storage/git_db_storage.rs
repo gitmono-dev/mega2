@@ -1,10 +1,11 @@
-use std::ops::Deref;
+use std::{collections::HashMap, ops::Deref};
 
 use futures::Stream;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
     EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set,
-    Statement, TransactionTrait, sea_query::Expr,
+    Statement, TransactionTrait,
+    sea_query::{CaseStatement, Expr, ExprTrait},
 };
 
 use crate::{
@@ -328,21 +329,46 @@ impl GitDbStorage {
 
     pub async fn update_git_blob_filepath(
         &self,
-        blob_id: &String,
+        repo_id: i64,
+        blob_id: &str,
         file_path: &str,
     ) -> Result<(), MegaError> {
-        if let Some(model) = git_blob::Entity::find()
-            .filter(git_blob::Column::BlobId.eq(blob_id))
-            .one(self.get_connection())
-            .await?
-        {
-            let mut active: git_blob::ActiveModel = model.into();
+        self.update_git_blob_filepaths(repo_id, vec![(blob_id.to_string(), file_path.to_string())])
+            .await
+    }
 
-            active.file_path = Set(file_path.to_string());
-
-            active.update(self.get_connection()).await?;
+    /// Batch-assign `file_path` for blobs in one repo.
+    ///
+    /// Duplicate `blob_id`s keep the last path (same as sequential UPDATE).
+    /// Missing ids are skipped. Empty input is a no-op.
+    pub async fn update_git_blob_filepaths(
+        &self,
+        repo_id: i64,
+        pairs: Vec<(String, String)>,
+    ) -> Result<(), MegaError> {
+        if pairs.is_empty() {
+            return Ok(());
         }
 
+        let collapsed = last_wins_filepaths(pairs);
+        for chunk in collapsed.chunks(<BaseStorage as StorageConnector>::BATCH_CHUNK_SIZE) {
+            let blob_ids: Vec<String> = chunk.iter().map(|(id, _)| id.clone()).collect();
+            let mut case = CaseStatement::new();
+            for (blob_id, file_path) in chunk {
+                case = case.case(
+                    Expr::col(git_blob::Column::BlobId).eq(blob_id.clone()),
+                    file_path.clone(),
+                );
+            }
+            case = case.finally(Expr::col(git_blob::Column::FilePath));
+
+            git_blob::Entity::update_many()
+                .col_expr(git_blob::Column::FilePath, case.into())
+                .filter(git_blob::Column::RepoId.eq(repo_id))
+                .filter(git_blob::Column::BlobId.is_in(blob_ids))
+                .exec(self.get_connection())
+                .await?;
+        }
         Ok(())
     }
 
@@ -669,6 +695,14 @@ impl GitDbStorage {
     }
 }
 
+fn last_wins_filepaths(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut map = HashMap::with_capacity(pairs.len());
+    for (blob_id, file_path) in pairs {
+        map.insert(blob_id, file_path);
+    }
+    map.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -828,5 +862,134 @@ mod tests {
             }
             other => panic!("unexpected refs: {other:?}"),
         }
+    }
+
+    fn blob_row(repo_id: i64, blob_id: &str, file_path: &str) -> git_blob::Model {
+        git_blob::Model {
+            id: generate_id(),
+            repo_id,
+            blob_id: blob_id.to_string(),
+            name: None,
+            size: 0,
+            created_at: chrono::Utc::now().naive_utc(),
+            pack_id: String::new(),
+            file_path: file_path.to_string(),
+            pack_offset: 0,
+            is_delta_in_pack: false,
+        }
+    }
+
+    async fn insert_blob(git_db: &GitDbStorage, model: git_blob::Model) {
+        git_blob::Entity::insert(model.into_active_model())
+            .exec(git_db.get_connection())
+            .await
+            .expect("insert git_blob");
+    }
+
+    async fn filepath_of(git_db: &GitDbStorage, repo_id: i64, blob_id: &str) -> Option<String> {
+        git_blob::Entity::find()
+            .filter(git_blob::Column::RepoId.eq(repo_id))
+            .filter(git_blob::Column::BlobId.eq(blob_id))
+            .one(git_db.get_connection())
+            .await
+            .unwrap()
+            .map(|m| m.file_path)
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_empty_is_noop() {
+        let git_db = storage().await;
+        git_db
+            .update_git_blob_filepaths(1, vec![])
+            .await
+            .expect("empty batch");
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_sets_paths_in_one_repo() {
+        let git_db = storage().await;
+        insert_blob(&git_db, blob_row(1, "aaa", "")).await;
+        insert_blob(&git_db, blob_row(1, "bbb", "")).await;
+        git_db
+            .update_git_blob_filepaths(
+                1,
+                vec![
+                    ("aaa".into(), "Cargo.toml".into()),
+                    ("bbb".into(), "src/lib.rs".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filepath_of(&git_db, 1, "aaa").await.as_deref(),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            filepath_of(&git_db, 1, "bbb").await.as_deref(),
+            Some("src/lib.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_is_scoped_to_repo() {
+        let git_db = storage().await;
+        insert_blob(&git_db, blob_row(1, "shared-blob", "old-1")).await;
+        insert_blob(&git_db, blob_row(2, "shared-blob", "old-2")).await;
+        git_db
+            .update_git_blob_filepaths(1, vec![("shared-blob".into(), "src/lib.rs".into())])
+            .await
+            .unwrap();
+        assert_eq!(
+            filepath_of(&git_db, 1, "shared-blob").await.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            filepath_of(&git_db, 2, "shared-blob").await.as_deref(),
+            Some("old-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_duplicate_blob_keeps_last_path() {
+        let git_db = storage().await;
+        insert_blob(&git_db, blob_row(1, "dup", "old")).await;
+        git_db
+            .update_git_blob_filepaths(
+                1,
+                vec![
+                    ("dup".into(), "first.rs".into()),
+                    ("dup".into(), "last.rs".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filepath_of(&git_db, 1, "dup").await.as_deref(),
+            Some("last.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_ignores_missing_blob_id() {
+        let git_db = storage().await;
+        git_db
+            .update_git_blob_filepaths(1, vec![("missing".into(), "nope.rs".into())])
+            .await
+            .unwrap();
+        assert!(filepath_of(&git_db, 1, "missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_git_blob_filepaths_binds_quotes_in_path() {
+        let git_db = storage().await;
+        insert_blob(&git_db, blob_row(1, "q", "")).await;
+        git_db
+            .update_git_blob_filepaths(1, vec![("q".into(), "foo's/bar.rs".into())])
+            .await
+            .unwrap();
+        assert_eq!(
+            filepath_of(&git_db, 1, "q").await.as_deref(),
+            Some("foo's/bar.rs")
+        );
     }
 }
