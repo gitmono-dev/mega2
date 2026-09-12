@@ -15,6 +15,7 @@ pub struct ObjectKey {
     /// - git: sha1/sha256
     /// - lfs: sha256
     /// - log: path like 2025/03/worker.log
+    /// - media: `v1/{scope}/{kind}/{id}` (unsharded under namespace `media`)
     pub key: String,
 }
 
@@ -30,6 +31,9 @@ impl ObjectKey {
     ///
     /// The namespace prefix must never change for either branch.
     pub fn default_sharding(&self) -> String {
+        if self.namespace == ObjectNamespace::Media {
+            return format!("{}/{}", self.namespace, self.key);
+        }
         let id = &self.key;
         if id.len() < 6 {
             // For short keys, don't shard or use a different strategy
@@ -113,6 +117,8 @@ pub enum ObjectNamespace {
     Attachment,
     /// OCI registry objects.
     Oci,
+    /// FastCDC Media objects (`docs/refactoring/fastcdc-media.md`).
+    Media,
 }
 
 impl ObjectNamespace {
@@ -124,6 +130,7 @@ impl ObjectNamespace {
             ObjectNamespace::Artifact => "artifact",
             ObjectNamespace::Attachment => "attachment",
             ObjectNamespace::Oci => "oci",
+            ObjectNamespace::Media => "media",
         }
     }
 }
@@ -452,6 +459,7 @@ mod tests {
             ObjectNamespace::Artifact,
             ObjectNamespace::Attachment,
             ObjectNamespace::Oci,
+            ObjectNamespace::Media,
         ] {
             let key = ObjectKey {
                 namespace: ns,
@@ -473,6 +481,7 @@ mod tests {
         assert_eq!(ObjectNamespace::Artifact.to_string(), "artifact");
         assert_eq!(ObjectNamespace::Attachment.to_string(), "attachment");
         assert_eq!(ObjectNamespace::Oci.to_string(), "oci");
+        assert_eq!(ObjectNamespace::Media.to_string(), "media");
     }
 
     #[test]

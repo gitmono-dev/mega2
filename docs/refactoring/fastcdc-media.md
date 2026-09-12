@@ -14,4 +14,11 @@
   - prepare：`POST …/manifests` → `{manifest_id, missing_chunks}`
   - get：`GET …/manifests/by-media/{oid}` → `{manifest_id, manifest}`
 
+## Scope / key（FC-03）
+
+- Namespace 字符串 `media` 只追加，不改 git/lfs/log/artifact/attachment/oci。
+- Scope = 服务端 actor（`website_user_id`）+ canonical 绝对仓库路径；digest = SHA-256(`actor || 0x00 || repo`)。
+- Object key：`v1/{scope_digest}/{pending|chunk|manifest|finalized}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。
+- 请求体 actor/repository/`created_by` 不得覆盖 scope。对外错误不泄漏 digest、object key 或认证信息。
+
 固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`20226243095e92274b3683f4c09bcd12ae35d245b073b38296a2a895c13b8c9d`。
