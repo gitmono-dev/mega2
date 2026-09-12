@@ -6,7 +6,6 @@
 //! `orbit_api` contract and `orbit` object-storage implementation.
 
 mod api;
-mod bellatrix;
 mod callisto;
 pub use crate::callisto::*;
 mod ceres;

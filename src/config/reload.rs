@@ -680,9 +680,7 @@ fn collect_static_restart_fields(
     collect_pack_restart_fields(current, candidate, report);
     collect_lfs_restart_fields(current, candidate, report);
     collect_blame_restart_fields(current, candidate, report);
-    collect_build_restart_fields(current, candidate, report);
     collect_object_storage_restart_fields(current, candidate, report);
-    collect_orion_server_restart_fields(current, candidate, report);
     collect_oauth_restart_fields(current, candidate, report);
 }
 
@@ -828,24 +826,6 @@ fn collect_blame_restart_fields(
     }
 }
 
-fn collect_build_restart_fields(
-    current: &Config,
-    candidate: &Config,
-    report: &mut ConfigReloadReport,
-) {
-    if current.build.enable_build != candidate.build.enable_build {
-        report.restart_required_fields.push("build.enable_build");
-    }
-    if current.build.orion_server != candidate.build.orion_server {
-        report.restart_required_fields.push("build.orion_server");
-    }
-    if current.build.orion_preheat_shallow_depth != candidate.build.orion_preheat_shallow_depth {
-        report
-            .restart_required_fields
-            .push("build.orion_preheat_shallow_depth");
-    }
-}
-
 fn collect_object_storage_restart_fields(
     current: &Config,
     candidate: &Config,
@@ -893,45 +873,6 @@ fn collect_object_storage_restart_fields(
         report
             .restart_required_fields
             .push("object_storage.gcs.bucket");
-    }
-}
-
-fn collect_orion_server_restart_fields(
-    current: &Config,
-    candidate: &Config,
-    report: &mut ConfigReloadReport,
-) {
-    match (&current.orion_server, &candidate.orion_server) {
-        (None, None) => {}
-        (None, Some(_)) | (Some(_), None) => report.restart_required_fields.push("orion_server"),
-        (Some(current), Some(candidate)) => {
-            if current.logger_storage_mode != candidate.logger_storage_mode {
-                report
-                    .restart_required_fields
-                    .push("orion_server.logger_storage_mode");
-            }
-            if current.build_log_dir != candidate.build_log_dir {
-                report
-                    .restart_required_fields
-                    .push("orion_server.build_log_dir");
-            }
-            if current.log_stream_buffer != candidate.log_stream_buffer {
-                report
-                    .restart_required_fields
-                    .push("orion_server.log_stream_buffer");
-            }
-            if current.db_url != candidate.db_url {
-                report.restart_required_fields.push("orion_server.db_url");
-            }
-            if current.port != candidate.port {
-                report.restart_required_fields.push("orion_server.port");
-            }
-            if current.monobase_url != candidate.monobase_url {
-                report
-                    .restart_required_fields
-                    .push("orion_server.monobase_url");
-            }
-        }
     }
 }
 
@@ -1049,7 +990,6 @@ mod tests {
         candidate.pack.channel_message_size = 2_000_000;
         candidate.lfs.local.lfs_file_path = temp_dir.path().join("candidate-lfs");
         candidate.blame.enable_caching = false;
-        candidate.build.orion_preheat_shallow_depth = 8;
         candidate.object_storage.local.root_dir = temp_dir
             .path()
             .join("candidate-objects")
@@ -1057,7 +997,6 @@ mod tests {
             .to_string();
         candidate.object_storage.s3.secret_access_key = "candidate-secret-access-key".to_string();
         candidate.object_storage.gcs.bucket = "candidate-gcs-bucket".to_string();
-        candidate.orion_server = Some(Default::default());
 
         let report = handle.reload(candidate).expect("reload should succeed");
         let snapshot = handle.snapshot().expect("snapshot after reload");
@@ -1075,11 +1014,9 @@ mod tests {
                 "pack.channel_message_size",
                 "lfs.local.lfs_file_path",
                 "blame.enable_caching",
-                "build.orion_preheat_shallow_depth",
                 "object_storage.local.root_dir",
                 "object_storage.s3.secret_access_key",
                 "object_storage.gcs.bucket",
-                "orion_server",
             ]
         );
         assert!(!report.applied());
@@ -1094,7 +1031,6 @@ mod tests {
             snapshot.monorepo.push_policy,
             crate::config::PushPolicy::Review
         );
-        assert!(snapshot.orion_server.is_none());
         assert!(!report_debug.contains("candidate-secret-access-key"));
         assert!(!report_debug.contains("candidate-gcs-bucket"));
         assert!(!report_debug.contains("candidate-objects"));

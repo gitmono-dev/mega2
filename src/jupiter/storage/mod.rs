@@ -4,7 +4,6 @@ pub mod base_storage;
 pub mod blob_path_index;
 pub mod bots_storage;
 pub mod buck_storage;
-pub mod build_trigger_storage;
 pub mod cl_reviewer_storage;
 pub mod cl_storage;
 pub mod cla_storage;
@@ -51,7 +50,6 @@ use crate::{
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
-            build_trigger_storage::BuildTriggerStorage,
             cl_reviewer_storage::ClReviewerStorage,
             cl_storage::ClStorage,
             cla_storage::ClaStorage,
@@ -97,7 +95,6 @@ pub struct AppService {
     pub buck_storage: BuckStorage,
     pub code_review_comment_storage: CodeReviewCommentStorage,
     pub code_review_thread_storage: CodeReviewThreadStorage,
-    pub build_trigger_storage: BuildTriggerStorage,
     pub bots_storage: BotsStorage,
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
@@ -129,7 +126,6 @@ impl AppService {
             buck_storage: BuckStorage { base: mock.clone() },
             code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
             code_review_thread_storage: CodeReviewThreadStorage { base: mock.clone() },
-            build_trigger_storage: BuildTriggerStorage { base: mock.clone() },
             bots_storage: BotsStorage { base: mock.clone() },
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
@@ -216,7 +212,6 @@ impl Storage {
 
         let code_review_comment_storage = CodeReviewCommentStorage { base: base.clone() };
         let code_review_thread_storage = CodeReviewThreadStorage { base: base.clone() };
-        let build_trigger_storage = BuildTriggerStorage { base: base.clone() };
         let bots_storage = BotsStorage { base: base.clone() };
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
@@ -269,7 +264,6 @@ impl Storage {
             buck_storage,
             code_review_comment_storage,
             code_review_thread_storage,
-            build_trigger_storage,
             bots_storage,
             webhook_storage: webhook_storage.clone(),
             audit_storage,
@@ -537,10 +531,6 @@ impl Storage {
 
     pub fn code_review_comment_storage(&self) -> CodeReviewCommentStorage {
         self.app_service.code_review_comment_storage.clone()
-    }
-
-    pub fn build_trigger_storage(&self) -> BuildTriggerStorage {
-        self.app_service.build_trigger_storage.clone()
     }
 
     pub fn webhook_storage(&self) -> WebhookStorage {

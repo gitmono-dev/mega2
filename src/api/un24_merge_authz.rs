@@ -31,7 +31,6 @@ use crate::{
             model::LoginUser,
         },
     },
-    bellatrix::Bellatrix,
     ceres::api_service::cache::GitObjectCache,
     contract::policy::{entitystore::SharedEntityStore, guard::cedar_guard::cedar_guard},
     jupiter::storage::{Storage, base_storage::StorageConnector},
@@ -116,7 +115,6 @@ fn api_state(storage: Storage, session_store: BrowserSessionStore) -> MonoApiSer
         }),
         listen_addr: "http://127.0.0.1:0".to_string(),
         entity_store: role_snapshot(),
-        bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
         storage,
     }
 }

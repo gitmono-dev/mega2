@@ -118,6 +118,7 @@ mod m20260905_000400_add_authz_outbox;
 mod m20260905_000500_add_blob_paths;
 mod m20260905_000600_mega_refs_path_pattern;
 mod m20260910_000100_drop_merge_queue;
+mod m20260912_000100_drop_orion_build_tables;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -224,6 +225,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000600_mega_refs_path_pattern::Migration),
             Box::new(m20260910_000100_drop_merge_queue::Migration),
             Box::new(m20260902_000100_add_oci_tables::Migration),
+            Box::new(m20260912_000100_drop_orion_build_tables::Migration),
         ]
     }
 }

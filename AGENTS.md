@@ -138,7 +138,7 @@ src/
 │       └── integration/
 │           ├── jupiter_backend.rs
 │           └── vault_core.rs # VaultCore, VaultCoreInterface
-├── bellatrix/  ceres/  saturn/  context/  git_protocol/
+├── ceres/  context/
 └── mega.cedarschema, mega_policies.cedar
 tests/                    # process-level integration tests (integration_*.rs)
 target/                   # build artifacts (gitignored)

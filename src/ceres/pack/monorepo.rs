@@ -23,7 +23,6 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    bellatrix::Bellatrix,
     callisto::{
         entity_ext::generate_link,
         mega_cl, mega_code_review_anchor, mega_refs,
@@ -87,7 +86,6 @@ pub struct Monorepo {
     /// costs exactly one DB read and logs the ADR-MC-05 notice once.
     pub push_chain_cache: Mutex<HashMap<String, Option<PushChain>>>,
     pub cl_link: Arc<RwLock<Option<String>>>,
-    pub bellatrix: Arc<Bellatrix>,
     pub username: Option<String>,
     /// Ref commands for this push (same role as on [`ImportRepo`](crate::ceres::pack::import_repo::ImportRepo)).
     pub command_list: Mutex<Vec<RefCommand>>,
@@ -1011,17 +1009,9 @@ impl Monorepo {
                 .await?;
         }
         self.traverses_tree_and_update_filepath().await?;
-        if self.bellatrix.enable_build() {
-            editor
-                .trigger_build_and_check(
-                    self.storage.clone(),
-                    self.git_object_cache.clone(),
-                    self.bellatrix.clone(),
-                    &cl,
-                    &username,
-                )
-                .await?;
-        }
+        editor
+            .trigger_check(self.storage.clone(), &username, &cl)
+            .await?;
         self.reanchor_code_review_threads(&cl, &to_hash).await?;
         // Codex R1 P1-2 / R2 P1-2: commit bindings are written only now — the
         // push has been accepted (chain validated, CL updated) — and cover
@@ -1500,7 +1490,6 @@ mod tests {
 
     use super::{Monorepo, RepoHandler};
     use crate::{
-        bellatrix::Bellatrix,
         callisto::{
             commit_auths, mega_cl, mega_commit, mega_refs, mega_tree, push_queue,
             sea_orm_active_enums::{PushQueueKindEnum, PushQueueStatusEnum},
@@ -1571,7 +1560,6 @@ mod tests {
             no_op_notice: Mutex::new(None),
             push_chain_cache: Mutex::new(HashMap::new()),
             cl_link: Arc::new(RwLock::new(None)),
-            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
             username: Some("tester".to_string()),
             command_list: Mutex::new(commands),
         }
@@ -1613,7 +1601,6 @@ mod tests {
             no_op_notice: Mutex::new(None),
             push_chain_cache: Mutex::new(HashMap::new()),
             cl_link: Arc::new(RwLock::new(None)),
-            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
             username,
             command_list: Mutex::new(commands),
         }

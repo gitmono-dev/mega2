@@ -14,7 +14,7 @@
 
 ```text
 src/common/errors/
-├── mod.rs      # MegaError、MegaResult、BuckError、ProtocolError、GitLFSError、StatusParseError、DiffParseError
+├── mod.rs      # MegaError、MegaResult、BuckError、ProtocolError、GitLFSError、DiffParseError
 ├── api.rs      # ApiError、map_ceres_error
 ├── policy.rs   # ContextError、SaturnContextError
 └── vault.rs    # VaultError、VaultResult（本仓定义）+ RvError（重导出 libvault::errors::RvError）
@@ -43,7 +43,6 @@ use crate::common::errors::{
 | `SaturnContextError` | Cedar 授权请求构造和授权拒绝错误。 | `src/contract/policy/context.rs` |
 | `BuckError` | Buck session/upload 业务错误，作为 `MegaError::Buck` 被 `ApiError` 映射为精确 HTTP status。 | Buck service/router |
 | `GitLFSError` | Git LFS 处理错误。 | LFS router/handler |
-| `StatusParseError` | Buck2 status 文本解析错误。 | `contract::api::buck2::status` |
 | `DiffParseError` | Code review re-anchor 统一 diff 解析错误。 | `src/jupiter/utils/code_review_reanchor.rs` |
 
 ## 导入规则

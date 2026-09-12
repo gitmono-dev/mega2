@@ -32,7 +32,6 @@ use crate::{
             model::LoginUser,
         },
     },
-    bellatrix::Bellatrix,
     callisto::sea_orm_active_enums::{BotStatusEnum, PermissionScopeEnum},
     ceres::api_service::cache::GitObjectCache,
     contract::policy::{
@@ -77,7 +76,6 @@ fn api_state(
         }),
         listen_addr: "http://127.0.0.1:0".to_string(),
         entity_store,
-        bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
         storage,
     }
 }

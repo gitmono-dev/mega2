@@ -365,7 +365,6 @@ mod tests {
             oauth::api_store::{BrowserSessionStore, CountingSessionStore},
             router::lfs_router,
         },
-        bellatrix::Bellatrix,
         ceres::{
             api_service::cache::GitObjectCache,
             lfs::{
@@ -451,7 +450,6 @@ mod tests {
             }),
             listen_addr: "http://127.0.0.1:0".to_owned(),
             entity_store: Arc::new(SharedEntityStore::new()),
-            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
             storage,
         }
     }

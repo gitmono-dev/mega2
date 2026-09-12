@@ -30,7 +30,6 @@ use crate::{
         oauth::{api_store::BrowserSessionStore, website_session_store::WebsiteSessionStore},
         router::{lfs_router, oci_router},
     },
-    bellatrix::Bellatrix,
     ceres::{
         api_service::{cache::GitObjectCache, state::ProtocolApiState},
         protocol::ServiceType,
@@ -685,7 +684,6 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         listen_addr,
         entity_store: ctx.entity_store.clone(),
         git_object_cache,
-        bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
     };
 
     let session_store = MemoryStore::default();

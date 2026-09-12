@@ -1,13 +1,9 @@
-use std::sync::Arc;
-
 use git_internal::internal::object::commit::Commit;
 
 use crate::{
-    bellatrix::Bellatrix,
     callisto::{entity_ext::generate_link, mega_cl, mega_refs, sea_orm_active_enums::ConvTypeEnum},
     ceres::{
-        api_service::{ApiHandler, cache::GitObjectCache},
-        build_trigger::{BuildTriggerService, TriggerContext},
+        api_service::ApiHandler,
         code_edit::utils as edit_utils,
         merge_checker::{CheckerRegistry, MAX_CL_CHAIN_COMMITS},
     },
@@ -131,30 +127,6 @@ pub(crate) trait CLRefUpdateAcceptor<VT: CLRefUpdateVisitor> {
     }
 }
 
-pub(crate) trait TriggerContextBuilder {
-    async fn get_context(
-        &self,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<TriggerContext, MegaError>;
-    async fn trigger_build(
-        &self,
-        storage: Storage,
-        git_cache: Arc<GitObjectCache>,
-        bellatrix: Arc<Bellatrix>,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<(), MegaError> {
-        let cl_model = cl.clone();
-        let username = username.to_string();
-        let context = self.get_context(&cl_model, &username).await?;
-        tokio::spawn(async move {
-            BuildTriggerService::build_by_context(storage, git_cache, bellatrix, context).await
-        });
-        Ok(())
-    }
-}
-
 pub(crate) trait Checker {
     async fn check(
         &self,
@@ -220,12 +192,11 @@ fn fresh_or_fallback_cl(
     }
 }
 
-pub(crate) struct CodeEditService<FMT, VT, AC, TCB, CK, HD, DR>
+pub(crate) struct CodeEditService<FMT, VT, AC, CK, HD, DR>
 where
     FMT: ConversationMessageFormater,
     VT: CLRefUpdateVisitor,
     AC: CLRefUpdateAcceptor<VT>,
-    TCB: TriggerContextBuilder,
     CK: Checker,
     HD: ApiHandler + Clone,
     DR: Director<HD>,
@@ -236,7 +207,6 @@ where
     formator: FMT,
     clref_visitor: VT,
     clref_acceptor: AC,
-    builder: TCB,
     checker: CK,
     director: DR,
     // mark HD used
@@ -278,11 +248,10 @@ impl<
     FMT: ConversationMessageFormater,
     VT: CLRefUpdateVisitor,
     AC: CLRefUpdateAcceptor<VT>,
-    TCB: TriggerContextBuilder,
     CK: Checker,
     HD: ApiHandler + Clone,
     DR: Director<HD>,
-> CodeEditService<FMT, VT, AC, TCB, CK, HD, DR>
+> CodeEditService<FMT, VT, AC, CK, HD, DR>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -292,7 +261,6 @@ impl<
         formator: FMT,
         clref_visitor: VT,
         clref_acceptor: AC,
-        builder: TCB,
         checker: CK,
         director: DR,
     ) -> Self {
@@ -303,7 +271,6 @@ impl<
             formator,
             clref_visitor,
             clref_acceptor,
-            builder,
             checker,
             director,
             _marker: std::marker::PhantomData,
@@ -457,19 +424,6 @@ impl<
         }
     }
 
-    pub async fn trigger_build(
-        &self,
-        storage: Storage,
-        git_cache: Arc<GitObjectCache>,
-        bellatrix: Arc<Bellatrix>,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<(), MegaError> {
-        self.builder
-            .trigger_build(storage, git_cache, bellatrix, cl, username)
-            .await
-    }
-
     pub async fn trigger_check(
         &self,
         storage: Storage,
@@ -485,20 +439,6 @@ impl<
         cl: &mega_cl::Model,
     ) -> Result<(), MegaError> {
         self.director.assign_reviewers(storage, cl).await
-    }
-
-    pub async fn trigger_build_and_check(
-        &self,
-        storage: Storage,
-        git_cache: Arc<GitObjectCache>,
-        bellatrix: Arc<Bellatrix>,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<(), MegaError> {
-        self.trigger_build(storage.clone(), git_cache, bellatrix, cl, username)
-            .await?;
-        self.trigger_check(storage, username, cl).await?;
-        Ok(())
     }
 }
 

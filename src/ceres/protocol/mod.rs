@@ -12,7 +12,6 @@ use repo::Repo;
 use tokio::sync::RwLock;
 
 use crate::{
-    bellatrix::Bellatrix,
     ceres::{
         api_service::state::ProtocolApiState,
         pack::{RepoHandler, import_repo::ImportRepo, monorepo::Monorepo, push_chain},
@@ -297,7 +296,6 @@ impl SmartSession {
                 no_op_notice: Mutex::new(None),
                 push_chain_cache: Mutex::new(HashMap::new()),
                 cl_link: Arc::new(RwLock::new(None)),
-                bellatrix: Arc::new(Bellatrix::new(config.build.clone())),
                 username: self.auth.username.clone(),
                 command_list: Mutex::new(commands.clone()),
             };

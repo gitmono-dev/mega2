@@ -66,7 +66,6 @@ use sea_orm::DatabaseTransaction;
 use tracing::debug;
 
 use crate::{
-    bellatrix::Bellatrix,
     callisto::{
         mega_blob, mega_cl, mega_refs, mega_tag, mega_tree,
         sea_orm_active_enums::{
@@ -78,7 +77,6 @@ use crate::{
             ApiHandler, buck_tree_builder::BuckCommitBuilder, cache::GitObjectCache,
             state::ProtocolApiState, tree_ops,
         },
-        build_trigger::{BuildTriggerService, TriggerContext},
         code_edit::{on_edit::OneditCodeEdit, utils as edit_utils},
         diff::tree_diff,
         merge_checker::CheckerRegistry,
@@ -1176,7 +1174,9 @@ impl ApiHandler for MonoApiService {
             .await?;
 
         if !payload.skip_build {
-            self.trigger_build_for_cl(&editor, &cl, &username).await?;
+            editor
+                .trigger_check(self.storage.clone(), &username, &cl)
+                .await?;
         }
 
         Ok(EditFileResult {
@@ -1332,7 +1332,9 @@ impl ApiHandler for MonoApiService {
             .await?;
 
         if !entry_info.skip_build {
-            self.trigger_build_for_cl(&editor, &cl, &username).await?;
+            editor
+                .trigger_check(self.storage.clone(), &username, &cl)
+                .await?;
         }
 
         Ok(CreateEntryResult {
@@ -2137,56 +2139,6 @@ impl MonoApiService {
     //         )))
     //     }
     // }
-
-    async fn trigger_build_for_cl(
-        &self,
-        editor: &OneditCodeEdit,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<(), GitError> {
-        let config = self.storage.config();
-        let bellatrix = Bellatrix::new(config.build.clone());
-        let git_cache = self.git_object_cache.clone();
-        editor
-            .trigger_build_and_check(
-                self.storage.clone(),
-                git_cache,
-                Arc::new(bellatrix),
-                cl,
-                username,
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    /// Triggers a build for Buck upload completion
-    fn trigger_build_for_buck_upload(&self, response: &CompleteResponse, username: &str) {
-        let config = self.storage.config();
-        let bellatrix = Arc::new(Bellatrix::new(config.build.clone()));
-        if !bellatrix.enable_build() {
-            return;
-        }
-        let storage = self.storage.clone();
-        let git_cache = self.git_object_cache.clone();
-        let mut context = TriggerContext::from_buck_upload(
-            response.repo_path.clone(),
-            response.from_hash.clone(),
-            response.commit_id.clone(),
-            response.cl_link.clone(),
-            Some(response.cl_id),
-            Some(username.to_string()),
-        );
-        context.ref_name = Some("main".to_string());
-        context.ref_type = Some("branch".to_string());
-        tokio::spawn(async move {
-            if let Err(e) =
-                BuildTriggerService::build_by_context(storage, git_cache, bellatrix, context).await
-            {
-                tracing::error!("Failed to create build trigger for buck upload: {}", e);
-            }
-        });
-    }
 
     async fn create_annotated_tag_mono(
         &self,
@@ -5111,8 +5063,6 @@ impl MonoApiService {
             repo_path: session.repo_path.clone(),
             from_hash: session.from_hash.clone().unwrap_or_default(),
         };
-
-        self.trigger_build_for_buck_upload(&response, username);
 
         Ok(response)
     }
@@ -10270,9 +10220,7 @@ mod tests {
             no_op_notice: Mutex::new(None),
             push_chain_cache: Mutex::new(HashMap::new()),
             cl_link: std::sync::Arc::new(RwLock::new(None)),
-            bellatrix: std::sync::Arc::new(crate::bellatrix::Bellatrix::new(
-                storage.config().build.clone(),
-            )),
+
             username: Some("tester".to_string()),
             command_list: Mutex::new(commands),
         }

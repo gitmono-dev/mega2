@@ -412,8 +412,7 @@ mod tests {
         use std::sync::Arc;
 
         use crate::{
-            api::oauth::api_store::BrowserSessionStore, bellatrix::Bellatrix,
-            ceres::api_service::cache::GitObjectCache,
+            api::oauth::api_store::BrowserSessionStore, ceres::api_service::cache::GitObjectCache,
             contract::policy::entitystore::SharedEntityStore,
         };
 
@@ -433,7 +432,6 @@ mod tests {
             }),
             listen_addr: "http://127.0.0.1:0".to_string(),
             entity_store: Arc::new(SharedEntityStore::new()),
-            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
             storage,
         }
     }

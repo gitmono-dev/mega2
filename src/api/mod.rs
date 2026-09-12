@@ -8,13 +8,11 @@ use tower_sessions::MemoryStore;
 
 use crate::{
     api::oauth::api_store::BrowserSessionStore,
-    bellatrix::Bellatrix,
     ceres::{
         api_service::{
             ApiHandler, cache::GitObjectCache, import_api_service::ImportApiService,
             mono_api_service::MonoApiService, state::ProtocolApiState,
         },
-        build_trigger::service::BuildTriggerService,
         protocol::repo::Repo,
     },
     common::errors::ProtocolError,
@@ -54,7 +52,6 @@ pub struct MonoApiServiceState {
     pub git_object_cache: Arc<GitObjectCache>,
     pub listen_addr: String,
     pub entity_store: Arc<SharedEntityStore>,
-    pub bellatrix: Arc<Bellatrix>,
 }
 
 impl FromRef<MonoApiServiceState> for MemoryStore {
@@ -137,14 +134,6 @@ impl MonoApiServiceState {
 
     fn webhook_svc(&self) -> WebhookService {
         self.storage.webhook_service.clone()
-    }
-
-    pub fn build_trigger_service(&self) -> BuildTriggerService {
-        BuildTriggerService::new(
-            self.storage.clone(),
-            self.git_object_cache.clone(),
-            self.bellatrix.clone(),
-        )
     }
 
     async fn api_handler(&self, path: &Path) -> Result<Box<dyn ApiHandler>, ProtocolError> {

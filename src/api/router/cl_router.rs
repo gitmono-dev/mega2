@@ -334,19 +334,7 @@ async fn fetch_cl_list(
         .cl_stg()
         .get_cl_list(json.additional.into(), json.pagination)
         .await?;
-    let mut items: Vec<ItemRes> = items.into_iter().map(|m| m.into()).collect();
-
-    // Backfill the aggregated Orion build status for this page (worst-wins
-    // over the latest task per CL). One batch query, and a failure only
-    // leaves the statuses empty — the list itself still returns.
-    // Ported from mega@fae6823 `ceres/.../mono/cl_list.rs` (#2163).
-    let links: Vec<String> = items.iter().map(|i| i.link.clone()).collect();
-    match state.cl_stg().latest_build_status_by_cl_links(&links).await {
-        Ok(statuses) => ItemRes::apply_build_statuses(&mut items, &statuses),
-        Err(e) => {
-            tracing::warn!("Failed to load CL build statuses for list: {e}");
-        }
-    }
+    let items: Vec<ItemRes> = items.into_iter().map(|m| m.into()).collect();
 
     let res = CommonPage { items, total };
     Ok(Json(CommonResult::success(Some(res))))
@@ -1031,7 +1019,6 @@ mod mc05_tests {
     use super::routers;
     use crate::{
         api::{MonoApiServiceState, oauth::api_store::BrowserSessionStore},
-        bellatrix::Bellatrix,
         callisto::{mega_cl_commits, mega_commit},
         contract::policy::entitystore::SharedEntityStore,
         jupiter::{
@@ -1042,7 +1029,6 @@ mod mc05_tests {
 
     fn mc05_state(storage: Storage) -> MonoApiServiceState {
         MonoApiServiceState {
-            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
             entity_store: Arc::new(SharedEntityStore::new()),
             git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
                 connection: ::redis::aio::ConnectionManager::new_lazy_with_config(

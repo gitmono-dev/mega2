@@ -12,9 +12,8 @@ use std::{
 use async_trait::async_trait;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuildConfig, CedarConfig, Config, DbConfig, GitConfig,
-    LFSConfig, LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig,
-    RedisConfig,
+    ArtifactGcConfig, BlameConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
+    LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig, RedisConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -185,7 +184,6 @@ impl TestConfigBuilder {
                 ssh: LFSSshConfig::default(),
             },
             blame: BlameConfig::default(),
-            build: BuildConfig::default(),
             redis: RedisConfig {
                 url: self.redis_url,
             },
@@ -197,7 +195,6 @@ impl TestConfigBuilder {
                 },
                 ..Default::default()
             },
-            orion_server: None,
             artifacts_gc: ArtifactGcConfig::default(),
             notification: None,
             vault: None,

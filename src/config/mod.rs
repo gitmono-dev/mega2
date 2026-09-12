@@ -127,7 +127,6 @@ impl Config {
             pack: PackConfig::default(),
             lfs: LFSConfig::default(),
             blame: BlameConfig::default(),
-            build: BuildConfig::default(),
             redis: RedisConfig::default(),
             buck: None,
             object_storage: ObjectStorageConfig {
@@ -136,7 +135,6 @@ impl Config {
                 },
                 ..Default::default()
             },
-            orion_server: None,
             artifacts_gc: ArtifactGcConfig::default(),
             notification: None,
             vault: None,
@@ -514,6 +512,22 @@ mod test {
         let err = Config::load_str(&content).expect_err("removed section should fail");
 
         assert!(err.to_string().contains("mail"));
+    }
+
+    #[test]
+    fn test_load_str_rejects_removed_orion_sections() {
+        let content = r#"
+            [build]
+            enable_build = false
+
+            [orion_server]
+            port = 8004
+        "#;
+
+        let err = Config::load_str(content).expect_err("removed orion sections should fail");
+        let message = err.to_string();
+        assert!(message.contains("build"), "{message}");
+        assert!(message.contains("orion_server"), "{message}");
     }
 
     #[test]

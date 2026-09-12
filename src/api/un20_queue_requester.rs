@@ -34,7 +34,6 @@ use crate::{
         },
         router::merge_queue_router,
     },
-    bellatrix::Bellatrix,
     callisto::{push_queue, sea_orm_active_enums::PushQueueKindEnum},
     ceres::api_service::cache::GitObjectCache,
     common::utils::MEGA_BRANCH_NAME,
@@ -63,7 +62,6 @@ fn api_state(storage: Storage, session_store: BrowserSessionStore) -> MonoApiSer
         }),
         listen_addr: "http://127.0.0.1:0".to_string(),
         entity_store: Arc::new(SharedEntityStore::new()),
-        bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
         storage,
     }
 }

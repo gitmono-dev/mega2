@@ -8,10 +8,10 @@ use toml::Value;
 use url::Url;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, BuckConfig, BuildConfig, CedarConfig, Config, DbConfig,
-    GitConfig, LFSConfig, LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig,
-    OAuthConfig, OrionServerConfig, PackConfig, PushAuth, PushPolicy, RedisConfig,
-    VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
+    ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
+    LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig, OAuthConfig,
+    PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
+    normalize_token_path,
     secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::errors::MegaError;
@@ -116,16 +116,12 @@ impl Config {
         validate_pack_config(&self.pack)?;
         validate_blame_config(&self.blame)?;
         validate_lfs_config(&self.lfs)?;
-        validate_build_config(&self.build)?;
         validate_redis_config(&self.redis)?;
         validate_cedar_config(&self.cedar)?;
         if let Some(buck_config) = &self.buck {
             validate_buck_config(buck_config)?;
         }
         validate_object_storage_config(&self.object_storage)?;
-        if let Some(orion_server_config) = &self.orion_server {
-            validate_orion_server_config(orion_server_config)?;
-        }
         validate_artifact_gc_config(&self.artifacts_gc)?;
         if let Some(notification_config) = &self.notification {
             validate_notification_config(notification_config)?;
@@ -724,15 +720,6 @@ pub(crate) fn validate_lfs_config(lfs_config: &LFSConfig) -> Result<(), MegaErro
     validate_http_url("lfs.ssh.http_url", &lfs_config.ssh.http_url)
 }
 
-pub(crate) fn validate_build_config(build_config: &BuildConfig) -> Result<(), MegaError> {
-    if build_config.enable_build {
-        require_non_empty("build.orion_server", &build_config.orion_server)?;
-        validate_http_url("build.orion_server", &build_config.orion_server)?;
-    }
-
-    Ok(())
-}
-
 pub(crate) fn validate_redis_config(redis_config: &RedisConfig) -> Result<(), MegaError> {
     require_non_empty("redis.url", &redis_config.url)?;
     let trimmed = redis_config.url.trim_start();
@@ -835,45 +822,6 @@ fn parse_secret_ref_for_field(field_path: &str, value: &str) -> Result<SecretRef
         MegaError::Other(msg) => MegaError::Other(format!("{field_path}: {msg}")),
         other => other,
     })
-}
-
-pub(crate) fn validate_orion_server_config(
-    orion_server_config: &OrionServerConfig,
-) -> Result<(), MegaError> {
-    if orion_server_config.port == 0 {
-        return Err(MegaError::Other(
-            "orion_server.port must be between 1 and 65535".to_string(),
-        ));
-    }
-    require_non_empty(
-        "orion_server.logger_storage_mode",
-        &orion_server_config.logger_storage_mode,
-    )?;
-    require_non_empty(
-        "orion_server.build_log_dir",
-        &orion_server_config.build_log_dir,
-    )?;
-    require_non_empty("orion_server.db_url", &orion_server_config.db_url)?;
-
-    let db_url = Url::parse(&orion_server_config.db_url)
-        .map_err(|e| MegaError::Other(format!("orion_server.db_url must be a valid URL: {e}")))?;
-    match db_url.scheme() {
-        "postgres" | "postgresql" => {}
-        scheme => {
-            return Err(MegaError::Other(format!(
-                "orion_server.db_url scheme must be 'postgres' or 'postgresql', got '{scheme}'"
-            )));
-        }
-    }
-
-    require_non_empty(
-        "orion_server.monobase_url",
-        &orion_server_config.monobase_url,
-    )?;
-    validate_http_url(
-        "orion_server.monobase_url",
-        &orion_server_config.monobase_url,
-    )
 }
 
 pub(crate) fn validate_artifact_gc_config(
@@ -1360,7 +1308,6 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
         field_path,
         "database.db_url"
             | "redis.url"
-            | "orion_server.db_url"
             | "object_storage.s3.access_key_id"
             | "object_storage.s3.secret_access_key"
             | "object_storage.s3.endpoint_url"
@@ -1522,7 +1469,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "log",
             "database",
             "monorepo",
-            "build",
             "pack",
             "lfs",
             "object_storage",
@@ -1531,7 +1477,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "redis",
             "buck",
             "artifacts_gc",
-            "orion_server",
             "notification",
             "vault",
             "oauth",
@@ -1559,11 +1504,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "max_push_commits",
         ]),
         "monorepo.rename" => Some(&["similarity_threshold", "rename_limit"]),
-        "build" => Some(&[
-            "enable_build",
-            "orion_server",
-            "orion_preheat_shallow_depth",
-        ]),
         "pack" => Some(&[
             "pack_decode_mem_size",
             "pack_decode_disk_size",
@@ -1606,14 +1546,6 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "completed_retention_days",
         ]),
         "artifacts_gc" => Some(&["enable", "interval_secs", "grace_secs", "batch_limit"]),
-        "orion_server" => Some(&[
-            "logger_storage_mode",
-            "build_log_dir",
-            "log_stream_buffer",
-            "db_url",
-            "port",
-            "monobase_url",
-        ]),
         "notification" => Some(&[
             "enabled",
             "default_delivery_mode",
@@ -2423,28 +2355,6 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_enabled_build_without_orion_url() {
-        let mut config = valid_config();
-        config.build.enable_build = true;
-        config.build.orion_server = String::new();
-
-        let err = config
-            .validate()
-            .expect_err("enabled build without Orion URL should fail");
-
-        assert!(err.to_string().contains("build.orion_server"));
-    }
-
-    #[test]
-    fn build_orion_server_may_be_omitted_when_disabled() {
-        let build: BuildConfig =
-            toml::from_str("enable_build = false").expect("disabled [build] may omit orion_server");
-        assert!(!build.enable_build);
-        assert!(build.orion_server.is_empty());
-        validate_build_config(&build).expect("empty orion_server is valid when disabled");
-    }
-
-    #[test]
     fn config_validate_rejects_invalid_redis_url_scheme() {
         let mut config = valid_config();
         config.redis.url = "http://localhost:6379".to_string();
@@ -2488,22 +2398,6 @@ mod tests {
 
         assert!(err.to_string().contains("redis.url"));
         assert!(err.to_string().contains("redis/url"));
-    }
-
-    #[test]
-    fn config_validate_rejects_invalid_orion_server_config() {
-        let mut config = valid_config();
-        let orion_server = OrionServerConfig {
-            port: 0,
-            ..Default::default()
-        };
-        config.orion_server = Some(orion_server);
-
-        let err = config
-            .validate()
-            .expect_err("orion server port should fail");
-
-        assert!(err.to_string().contains("orion_server.port"));
     }
 
     #[test]
@@ -2769,6 +2663,27 @@ mod tests {
 
         let err = reject_unknown_fields(&value).expect_err("removed [sidebar] must fail closed");
         assert!(err.to_string().contains("sidebar"), "{}", err);
+    }
+
+    #[test]
+    fn reject_unknown_fields_rejects_removed_orion_sections() {
+        let value = toml::from_str::<Value>(
+            r#"
+            [build]
+            enable_build = true
+            orion_server = "https://orion.example.test"
+
+            [orion_server]
+            port = 8004
+            "#,
+        )
+        .unwrap();
+
+        let err = reject_unknown_fields(&value)
+            .expect_err("removed [build]/[orion_server] must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("build"), "{message}");
+        assert!(message.contains("orion_server"), "{message}");
     }
 
     #[test]

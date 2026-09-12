@@ -16,16 +16,10 @@ pub struct Config {
     pub lfs: LFSConfig,
     #[serde(default)]
     pub blame: BlameConfig,
-    /// Build-system trigger. Omit the whole `[build]` section when unused
-    /// (defaults to `enable_build = false`).
-    #[serde(default)]
-    pub build: BuildConfig,
     pub redis: RedisConfig,
     #[serde(default)]
     pub buck: Option<BuckConfig>,
     pub object_storage: ObjectStorageConfig,
-    #[serde(default)]
-    pub orion_server: Option<OrionServerConfig>,
     /// Background GC for `artifact_objects` rows with no `artifact_set_files` references
     /// (`docs/artifacts-protocol.md` §10.6).
     #[serde(default)]
@@ -707,76 +701,6 @@ impl BlameConfig {
             // Default to 8GB total memory for calculation if needed
             Ok(8 * 1024 * 1024 * 1024)
         })
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(default)]
-pub struct BuildConfig {
-    pub enable_build: bool,
-    pub orion_server: String,
-    pub orion_preheat_shallow_depth: usize,
-}
-
-/// Orion Server configuration (flat structure)
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct OrionServerConfig {
-    // Log storage configuration
-    #[serde(default = "default_logger_storage_mode")]
-    pub logger_storage_mode: String,
-
-    #[serde(default = "default_build_log_dir")]
-    pub build_log_dir: String,
-
-    #[serde(default = "default_log_stream_buffer")]
-    pub log_stream_buffer: usize,
-
-    // Database configuration
-    #[serde(default = "default_db_url")]
-    pub db_url: String,
-
-    #[serde(default = "default_port")]
-    pub port: u16,
-
-    /// Mono server base URL for file/blob API (e.g. file blob endpoint). Replaces MONOBASE_URL env.
-    #[serde(default = "default_monobase_url")]
-    pub monobase_url: String,
-}
-
-fn default_monobase_url() -> String {
-    "http://localhost:8000".to_string()
-}
-
-fn default_logger_storage_mode() -> String {
-    "local".to_string()
-}
-
-fn default_build_log_dir() -> String {
-    "/tmp/logs".to_string()
-}
-
-fn default_log_stream_buffer() -> usize {
-    4096
-}
-
-fn default_db_url() -> String {
-    "postgres://localhost/orion".to_string()
-}
-
-fn default_port() -> u16 {
-    8004
-}
-
-impl Default for OrionServerConfig {
-    fn default() -> Self {
-        Self {
-            logger_storage_mode: default_logger_storage_mode(),
-            build_log_dir: default_build_log_dir(),
-            log_stream_buffer: default_log_stream_buffer(),
-            db_url: default_db_url(),
-            port: default_port(),
-            monobase_url: default_monobase_url(),
-        }
     }
 }
 

@@ -11,12 +11,11 @@ use sea_orm::{
     prelude::Expr,
     sea_query::{LockType, OnConflict},
 };
-use uuid::Uuid;
 
 use crate::{
     callisto::{
-        build_targets, check_result, item_assignees, label, mega_cl, mega_cl_commits, mega_commit,
-        mega_conversation, orion_tasks, path_check_configs, sea_orm_active_enums::MergeStatusEnum,
+        check_result, item_assignees, label, mega_cl, mega_cl_commits, mega_commit,
+        mega_conversation, path_check_configs, sea_orm_active_enums::MergeStatusEnum,
     },
     common::errors::MegaError,
     contract::api::common::Pagination,
@@ -810,78 +809,6 @@ impl ClStorage {
         ordered.reverse();
         Ok(ordered)
     }
-
-    /// For each CL link, resolve the latest Orion task and aggregate its
-    /// `build_targets.latest_state` with Checks-compatible worst-wins priority:
-    /// Failed > Interrupted > Building > Pending/Uninitialized > Completed.
-    /// Ported from mega@fae6823 `jupiter/src/storage/cl_storage.rs` (#2163).
-    pub async fn latest_build_status_by_cl_links(
-        &self,
-        links: &[String],
-    ) -> Result<HashMap<String, String>, MegaError> {
-        if links.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let tasks = orion_tasks::Entity::find()
-            .filter(orion_tasks::Column::Cl.is_in(links.to_vec()))
-            .order_by_desc(orion_tasks::Column::CreatedAt)
-            .all(self.get_connection())
-            .await?;
-
-        // First row per CL wins (already ordered by created_at DESC).
-        let mut latest_task_by_cl: HashMap<String, Uuid> = HashMap::new();
-        for task in tasks {
-            latest_task_by_cl.entry(task.cl).or_insert(task.id);
-        }
-
-        if latest_task_by_cl.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let task_ids: Vec<Uuid> = latest_task_by_cl.values().copied().collect();
-        let targets = build_targets::Entity::find()
-            .filter(build_targets::Column::TaskId.is_in(task_ids))
-            .all(self.get_connection())
-            .await?;
-
-        let mut states_by_task: HashMap<Uuid, Vec<String>> = HashMap::new();
-        for target in targets {
-            states_by_task
-                .entry(target.task_id)
-                .or_default()
-                .push(target.latest_state);
-        }
-
-        let mut result = HashMap::new();
-        for (cl, task_id) in latest_task_by_cl {
-            if let Some(states) = states_by_task.get(&task_id)
-                && let Some(status) = aggregate_target_states(states)
-            {
-                result.insert(cl, status);
-            }
-        }
-        Ok(result)
-    }
-}
-
-/// Worst-wins aggregation matching Checks UI `getTaskStatus` priority.
-/// Ported from mega@fae6823 `jupiter/src/storage/cl_storage.rs` (#2163).
-fn aggregate_target_states(states: &[String]) -> Option<String> {
-    if states.is_empty() {
-        return None;
-    }
-    let priority = |s: &str| -> u8 {
-        match s {
-            "Failed" => 0,
-            "Interrupted" => 1,
-            "Building" => 2,
-            "Pending" | "Uninitialized" => 3,
-            "Completed" => 4,
-            _ => 3,
-        }
-    };
-    states.iter().min_by_key(|s| priority(s.as_str())).cloned()
 }
 
 #[cfg(test)]
@@ -937,92 +864,6 @@ mod tests {
                 .is_none(),
             "an unknown link resolves to no row"
         );
-    }
-
-    /// SYNC-03 (mega@fae6823, #2163): latest-task-per-CL resolution and
-    /// worst-wins aggregation over `build_targets.latest_state`.
-    #[tokio::test]
-    async fn latest_build_status_aggregates_worst_wins_per_cl() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let conn = test_db_connection(temp_dir.path()).await;
-        apply_migrations(&conn, true).await.expect("migrations");
-
-        let task_old = Uuid::new_v4();
-        let task_new = Uuid::new_v4();
-        let task_other = Uuid::new_v4();
-        for (id, cl, secs) in [
-            (task_old, "CLAAAA", 1_000),
-            (task_new, "CLAAAA", 2_000),
-            (task_other, "CLBBBB", 3_000),
-        ] {
-            orion_tasks::ActiveModel {
-                id: Set(id),
-                changes: Set(serde_json::json!({})),
-                repo_name: Set("repo".to_string()),
-                cl: Set(cl.to_string()),
-                created_at: Set(chrono::DateTime::from_timestamp(secs, 0)
-                    .expect("valid timestamp")
-                    .into()),
-            }
-            .insert(&conn)
-            .await
-            .expect("insert orion task");
-        }
-
-        // Older task is all green but must lose to the newer task's states.
-        for (id, task_id, state) in [
-            (Uuid::new_v4(), task_old, "Completed"),
-            (Uuid::new_v4(), task_new, "Building"),
-            (Uuid::new_v4(), task_new, "Failed"),
-            (Uuid::new_v4(), task_other, "Completed"),
-        ] {
-            build_targets::ActiveModel {
-                id: Set(id),
-                task_id: Set(task_id),
-                path: Set("/target".to_string()),
-                latest_state: Set(state.to_string()),
-            }
-            .insert(&conn)
-            .await
-            .expect("insert build target");
-        }
-
-        let storage = ClStorage {
-            base: BaseStorage::new(std::sync::Arc::new(conn)),
-        };
-
-        let map = storage
-            .latest_build_status_by_cl_links(&[
-                "CLAAAA".to_string(),
-                "CLBBBB".to_string(),
-                "CLNONE".to_string(),
-            ])
-            .await
-            .expect("aggregate query");
-
-        // CLAAAA's latest task (created_at 2000) aggregates Building+Failed
-        // worst-wins to Failed.
-        assert_eq!(map.get("CLAAAA").map(String::as_str), Some("Failed"));
-        assert_eq!(map.get("CLBBBB").map(String::as_str), Some("Completed"));
-        assert!(!map.contains_key("CLNONE"));
-    }
-
-    /// SYNC-03: empty input short-circuits to an empty map without erroring.
-    #[tokio::test]
-    async fn latest_build_status_empty_input_returns_empty_map() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let conn = test_db_connection(temp_dir.path()).await;
-        apply_migrations(&conn, true).await.expect("migrations");
-
-        let storage = ClStorage {
-            base: BaseStorage::new(std::sync::Arc::new(conn)),
-        };
-
-        let map = storage
-            .latest_build_status_by_cl_links(&[])
-            .await
-            .expect("empty input is not an error");
-        assert!(map.is_empty());
     }
 
     /// MC-04 fixtures: a fabricated 40-hex object id, a commit row, and a

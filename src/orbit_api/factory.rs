@@ -55,7 +55,7 @@ pub enum ObjectStorageBackend {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ObjectStorageConfig {
-    /// Global backend for Git blobs, Git LFS, artifact protocol objects, and Orion cloud log segments (`mix` mode).
+    /// Global backend for Git blobs, Git LFS, and artifact protocol objects.
     #[serde(default)]
     pub storage_type: ObjectStorageBackend,
     /// S3 / S3-compatible credentials. Required when `storage_type` is `s3` or

@@ -162,14 +162,6 @@ pub enum GitLFSError {
     GeneralError(String),
 }
 
-#[derive(Error, Debug)]
-pub enum StatusParseError {
-    #[error("Unexpected line format: {0}")]
-    UnexpectedFormat(String),
-    #[error("Unknown line prefix: {0}")]
-    UnknownPrefix(String),
-}
-
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub enum DiffParseError {

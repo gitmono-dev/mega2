@@ -2,12 +2,7 @@ use git_internal::errors::GitError;
 
 use crate::{
     callisto::{mega_cl, mega_refs},
-    ceres::{
-        api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
-        build_trigger::{BuildTriggerService, TriggerContext},
-        code_edit::utils as edit_utils,
-        model::git::EditCLMode,
-    },
+    ceres::{api_service::mono_api_service::MonoApiService, model::git::EditCLMode},
     common::{
         errors::MegaError,
         utils::{self},
@@ -67,62 +62,6 @@ impl<VT: crate::ceres::code_edit::model::CLRefUpdateVisitor>
     }
 }
 
-pub struct OneditTrigerBuilder {}
-
-impl crate::ceres::code_edit::model::TriggerContextBuilder for OneditTrigerBuilder {
-    async fn get_context(
-        &self,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<TriggerContext, MegaError> {
-        Ok(TriggerContext::from_git_push(
-            cl.path.clone(),
-            cl.from_hash.clone(),
-            cl.to_hash.clone(),
-            cl.link.clone(),
-            Some(cl.id),
-            Some(username.to_string()),
-        ))
-    }
-
-    async fn trigger_build(
-        &self,
-        storage: Storage,
-        git_cache: std::sync::Arc<GitObjectCache>,
-        bellatrix: std::sync::Arc<crate::bellatrix::Bellatrix>,
-        cl: &mega_cl::Model,
-        username: &str,
-    ) -> Result<(), MegaError> {
-        let cl_model = cl.clone();
-        let username = username.to_string();
-        tokio::spawn(async move {
-            let repo_path =
-                match edit_utils::resolve_build_repo_root(&storage, &cl_model.path).await {
-                    Ok(repo_path) => repo_path,
-                    Err(e) => {
-                        tracing::error!(
-                            cl_link = %cl_model.link,
-                            cl_path = %cl_model.path,
-                            "Failed to resolve build repo root for web edit: {}",
-                            e
-                        );
-                        return Err(e);
-                    }
-                };
-            let context = TriggerContext::from_git_push(
-                repo_path,
-                cl_model.from_hash.clone(),
-                cl_model.to_hash.clone(),
-                cl_model.link.clone(),
-                Some(cl_model.id),
-                Some(username),
-            );
-            BuildTriggerService::build_by_context(storage, git_cache, bellatrix, context).await
-        });
-        Ok(())
-    }
-}
-
 pub struct OneditChecker {}
 
 impl crate::ceres::code_edit::model::Checker for OneditChecker {}
@@ -131,7 +70,6 @@ pub(crate) type OneditCodeEdit = crate::ceres::code_edit::model::CodeEditService
     OneditFormator,
     OneditVisitor,
     OneditAcceptor,
-    OneditTrigerBuilder,
     OneditChecker,
     MonoApiService,
     crate::ceres::code_edit::model::DefualtDirector<MonoApiService>,
@@ -152,7 +90,6 @@ impl OneditCodeEdit {
             OneditFormator {},
             OneditVisitor { mono_storage },
             OneditAcceptor {},
-            OneditTrigerBuilder {},
             OneditChecker {},
             crate::ceres::code_edit::model::DefualtDirector::<MonoApiService> {
                 handler: handler.clone(),

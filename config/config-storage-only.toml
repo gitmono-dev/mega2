@@ -26,7 +26,7 @@
 #   git.ssh_receive_pack = false       (omit → rejected when push_auth is set)
 #   git.push_auth=token ⇒ ≥1 [[git.push_tokens]]
 #   No [oauth] required (storage_only skips website session); omit review-only
-#   sections: [oauth], [buck], [notification], [vault], [orion_server], [build], …
+#   sections: [oauth], [buck], [notification], [vault], …
 #   Object store: only the section matching storage_type (default s3compatible
 #   → [object_storage.s3] only; omit .local / .gcs). See docker-compose-storage-only.yml.
 #
