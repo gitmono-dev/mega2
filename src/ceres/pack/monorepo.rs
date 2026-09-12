@@ -55,7 +55,7 @@ use crate::{
     },
     jupiter::{
         service::push_queue_service::PushPayload,
-        storage::{Storage, blob_path_index::BlobPathIndexMode},
+        storage::{Storage, base_storage::StorageConnector, blob_path_index::BlobPathIndexMode},
         utils::converter::FromMegaModel,
     },
 };
@@ -915,12 +915,27 @@ impl Monorepo {
                      use the Web UI / API to manage the default branch"
                 )));
             }
-            let existing = match txn {
-                Some(t) => storage.get_ref_by_name_in_txn(&cmd.ref_name, t).await?,
-                None => storage.get_ref_by_name(&cmd.ref_name).await?,
+            let deleted = match txn {
+                Some(t) => {
+                    storage
+                        .remove_ref_if_unchanged(&cmd.ref_name, &cmd.old_id, t)
+                        .await?
+                }
+                None => {
+                    storage
+                        .remove_ref_if_unchanged(
+                            &cmd.ref_name,
+                            &cmd.old_id,
+                            storage.get_connection(),
+                        )
+                        .await?
+                }
             };
-            if let Some(existing) = existing {
-                storage.remove_ref(existing).await?;
+            if !deleted {
+                return Err(MegaError::Other(format!(
+                    "ref {} moved since advertisement (expected {})",
+                    cmd.ref_name, cmd.old_id
+                )));
             }
             return Ok(());
         }
@@ -2038,8 +2053,24 @@ mod tests {
             .expect("baseline snapshot");
         assert!(!storage.entity_store().is_dirty());
 
+        let old = "a".repeat(40);
+        storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model::new(
+                    "/",
+                    "refs/heads/feature".to_owned(),
+                    old.clone(),
+                    "c".repeat(40),
+                    true,
+                ),
+                None,
+            )
+            .await
+            .expect("seed feature ref");
+
         let commands = vec![RefCommand::new(
-            "a".repeat(40),
+            old,
             ZERO_ID.to_string(),
             "refs/heads/feature".to_string(),
         )];
@@ -2738,6 +2769,53 @@ mod tests {
                 .contains("refusing to delete the main branch ref"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn cas_delete_does_not_remove_moved_cl_ref() {
+        let temp = TempDir::new().expect("temp");
+        let storage = test_storage(temp.path()).await;
+        let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tree = "cccccccccccccccccccccccccccccccccccccccc";
+        let ref_name = "refs/cl/FC09CAS01";
+        storage
+            .mono_storage()
+            .save_refs(
+                crate::callisto::mega_refs::Model::new(
+                    "/",
+                    ref_name.to_owned(),
+                    old.to_owned(),
+                    tree.to_owned(),
+                    true,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_or_update_cl_ref("/", ref_name, new, tree)
+            .await
+            .unwrap();
+
+        let cmd = RefCommand::new(old.to_string(), ZERO_ID.to_string(), ref_name.to_string());
+        let repo = test_monorepo(&storage, vec![cmd.clone()], HashSet::new(), HashSet::new());
+        let err = repo
+            .apply_cl_mega_ref_for_push_command(&cmd, None)
+            .await
+            .expect_err("stale CL delete must conflict");
+        assert!(
+            err.to_string().contains("moved since advertisement"),
+            "{err}"
+        );
+        let kept = storage
+            .mono_storage()
+            .get_ref_by_name(ref_name)
+            .await
+            .unwrap()
+            .expect("moved CL ref must remain");
+        assert_eq!(kept.ref_commit_hash, new);
     }
 
     #[tokio::test]

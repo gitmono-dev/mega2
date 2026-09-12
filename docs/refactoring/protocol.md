@@ -68,6 +68,8 @@
 >
 > **2026-09-12 更新（plan-20260901 FC-08）**：receive-pack 对齐 Mega 的 **per-command report-status**：pack-less 非删除命令校验已存 object；monorepo tag 与 `refs/heads/main` 删除在持久化前 `ng`；多余非删除 branch 标 `ng` 而第一条仍可 finalize（不再整包拒绝）；tag-only 不 `finalize_receive_pack`。CL delete-only 保持允许。
 >
+> **2026-09-12 更新（plan-20260901 FC-09）**：import/monorepo receive-pack 删除按客户端 advertised `old_id` 做 compare-and-swap；old id 不匹配时不删除已被并发更新的 ref，并返回 `moved since advertisement`。成功删除的外部语义不变。默认分支删除仍由 FC-08 前置拒绝。
+>
 > **2026-08-29 更新 3（MC-06 R2 粘性收口）**：拒绝规则改为只基于 pack **内容**（presence 集）——resolve 沿 tip 首父路径做 presence 界定的走查（新引入成员走 250 语义上界，冗余携带的已知祖先走独立卫生上界），凡不在路径上的 pack commit 一律判 junk 拒绝，与瞬时 newness 无关；无新引入的 push 不再退化为 `[tip]` 链，而是把整段内容链交给校验器重验。净效果：**同一被拒 pack 原样重试必被同样拒绝**（junk / 链中 merge / 超长 / 累计超限全部粘性），且 ref/CL/`commit_auths` 零变化；已接受 push 的幂等重试在真实客户端下天然走空 pack no-op 分支不受影响。绑定消费收窄为 `ordered ∩ 新引入`。
 
 > **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MONOENGINE_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
@@ -739,6 +741,7 @@ LFS:
 5. ✅ 空命令列表校验：splitter 在 flush-pkt 前无 command 时返回 `ProtocolError::InvalidInput`，避免无命令请求进入 ref 处理。
 6. 已完成首批：HTTP 和 SSH receive-pack 共用同一 parser。
 7. ✅ FC-08：monorepo 不允许的 tag 与 `refs/heads/main` 删除在持久化前 `ng`；失败 tag 不再二次 `update_refs`；仅至少一个 `ok` 的 branch 命令才 `finalize_receive_pack`（tag-only 不 finalize）；多余非删除 branch 按命令 `ng`（第一条仍可 finalize），而不是整包拒绝。CL 删除（delete-only）仍允许。
+8. ✅ FC-09：receive-pack 删除按 advertised old id 条件删除；CAS 未命中时不删除已被并发更新的 ref，报告 `moved since advertisement`。
 
 验收标准：
 

@@ -160,6 +160,25 @@ impl GitDbStorage {
         Ok(())
     }
 
+    /// Deletes the ref only if it still points at `expected_git_id`.
+    /// Returns whether a row was removed. A concurrent push that moved the
+    /// ref leaves it intact (receive-pack advertised-old-id lease).
+    pub async fn remove_ref_if_unchanged<C: ConnectionTrait>(
+        &self,
+        repo_id: i64,
+        ref_name: &str,
+        expected_git_id: &str,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = import_refs::Entity::delete_many()
+            .filter(import_refs::Column::RepoId.eq(repo_id))
+            .filter(import_refs::Column::RefName.eq(ref_name))
+            .filter(import_refs::Column::RefGitId.eq(expected_git_id))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
     pub async fn update_ref_in_txn(
         &self,
         repo_id: i64,
@@ -647,5 +666,167 @@ impl GitDbStorage {
         (c_count + t_count + b_count + tag_count)
             .try_into()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sea_orm::TransactionTrait;
+    use tempfile::TempDir;
+    use tokio::sync::Barrier;
+
+    use super::*;
+    use crate::jupiter::{
+        migration::apply_migrations,
+        storage::base_storage::{BaseStorage, StorageConnector},
+        tests::test_db_connection,
+    };
+
+    fn sample_ref(repo_id: i64, ref_name: &str, git_id: &str) -> import_refs::Model {
+        import_refs::Model {
+            id: generate_id(),
+            repo_id,
+            ref_name: ref_name.to_string(),
+            ref_git_id: git_id.to_string(),
+            ref_type: RefTypeEnum::Branch,
+            default_branch: false,
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    async fn storage() -> GitDbStorage {
+        let temp = TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp.path()).await;
+        apply_migrations(&db, true).await.expect("migrations");
+        GitDbStorage {
+            base: BaseStorage::new(Arc::new(db)),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_ref_if_unchanged_deletes_matching_old_id() {
+        let git_db = storage().await;
+        let repo_id = 42i64;
+        let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        git_db
+            .save_ref(repo_id, sample_ref(repo_id, "refs/heads/topic", old))
+            .await
+            .unwrap();
+
+        let deleted = git_db
+            .remove_ref_if_unchanged(repo_id, "refs/heads/topic", old, git_db.get_connection())
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(git_db.get_ref(repo_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_ref_if_unchanged_does_not_delete_moved_ref() {
+        let git_db = storage().await;
+        let repo_id = 42i64;
+        let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        git_db
+            .save_ref(repo_id, sample_ref(repo_id, "refs/heads/topic", old))
+            .await
+            .unwrap();
+        git_db
+            .update_ref(repo_id, "refs/heads/topic", new)
+            .await
+            .unwrap();
+
+        let deleted = git_db
+            .remove_ref_if_unchanged(repo_id, "refs/heads/topic", old, git_db.get_connection())
+            .await
+            .unwrap();
+        assert!(!deleted);
+        let refs = git_db.get_ref(repo_id).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].ref_git_id, new);
+    }
+
+    #[tokio::test]
+    async fn remove_ref_if_unchanged_in_txn_stays_atomic_with_other_writes() {
+        let git_db = storage().await;
+        let repo_id = 7i64;
+        let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        git_db
+            .save_ref(repo_id, sample_ref(repo_id, "refs/heads/gone", old))
+            .await
+            .unwrap();
+
+        let txn = git_db.get_connection().begin().await.unwrap();
+        let deleted = git_db
+            .remove_ref_if_unchanged(repo_id, "refs/heads/gone", old, &txn)
+            .await
+            .unwrap();
+        assert!(deleted);
+        git_db
+            .save_ref_in_txn(
+                repo_id,
+                sample_ref(
+                    repo_id,
+                    "refs/heads/kept",
+                    "cccccccccccccccccccccccccccccccccccccccc",
+                ),
+                &txn,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let refs = git_db.get_ref(repo_id).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].ref_name, "refs/heads/kept");
+    }
+
+    #[tokio::test]
+    async fn remove_ref_if_unchanged_concurrent_update_keeps_new_id() {
+        let git_db = storage().await;
+        let repo_id = 9i64;
+        let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        git_db
+            .save_ref(repo_id, sample_ref(repo_id, "refs/heads/race", old))
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let updater = git_db.clone();
+        let deleter = git_db.clone();
+        let start_u = barrier.clone();
+        let start_d = barrier;
+        // `update_ref` panics if the row is already gone; spawn so a delete-first
+        // race is a JoinError rather than failing the test.
+        let update_join = tokio::spawn(async move {
+            start_u.wait().await;
+            updater.update_ref(repo_id, "refs/heads/race", new).await
+        });
+        let delete_join = tokio::spawn(async move {
+            start_d.wait().await;
+            deleter
+                .remove_ref_if_unchanged(repo_id, "refs/heads/race", old, deleter.get_connection())
+                .await
+                .unwrap()
+        });
+        let _ = update_join.await;
+        let deleted = delete_join.await.expect("CAS delete task");
+
+        let refs = git_db.get_ref(repo_id).await.unwrap();
+        match refs.as_slice() {
+            [] => assert!(
+                deleted,
+                "empty table only if CAS delete won against the original id"
+            ),
+            [row] => {
+                assert_eq!(row.ref_git_id, new);
+                assert!(!deleted, "CAS delete must not remove the post-update id");
+            }
+            other => panic!("unexpected refs: {other:?}"),
+        }
     }
 }

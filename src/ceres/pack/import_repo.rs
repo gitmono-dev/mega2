@@ -45,7 +45,7 @@ use crate::{
                 ExecuteRequest, QueueWaitResult, attach_operation_id, normalize_attach_commands,
             },
         },
-        storage::{Storage, git_db_storage::GitDbStorage},
+        storage::{Storage, base_storage::StorageConnector, git_db_storage::GitDbStorage},
         utils::converter::FromGitModel,
     },
 };
@@ -358,10 +358,23 @@ impl RepoHandler for ImportRepo {
                     .await
                     .map_err(|e| GitError::CustomError(e.to_string()))?;
             }
-            CommandType::Delete => storage
-                .remove_ref(self.repo.repo_id, &refs.ref_name)
-                .await
-                .map_err(|e| GitError::CustomError(e.to_string()))?,
+            CommandType::Delete => {
+                let deleted = storage
+                    .remove_ref_if_unchanged(
+                        self.repo.repo_id,
+                        &refs.ref_name,
+                        &refs.old_id,
+                        storage.get_connection(),
+                    )
+                    .await
+                    .map_err(|e| GitError::CustomError(e.to_string()))?;
+                if !deleted {
+                    return Err(GitError::CustomError(format!(
+                        "tag {} moved since advertisement (expected {})",
+                        refs.ref_name, refs.old_id
+                    )));
+                }
+            }
             CommandType::Update => {
                 storage
                     .update_ref(self.repo.repo_id, &refs.ref_name, &refs.new_id)
@@ -489,9 +502,20 @@ impl ImportRepo {
                     continue;
                 }
                 if let CommandType::Delete = cmd.command_type {
-                    git_db
-                        .remove_ref_in_txn(self.repo.repo_id, &cmd.ref_name, &txn)
+                    let deleted = git_db
+                        .remove_ref_if_unchanged(
+                            self.repo.repo_id,
+                            &cmd.ref_name,
+                            &cmd.old_id,
+                            &txn,
+                        )
                         .await?;
+                    if !deleted {
+                        return Err(MegaError::Other(format!(
+                            "ref {} moved since advertisement (expected {})",
+                            cmd.ref_name, cmd.old_id
+                        )));
+                    }
                 }
             }
             txn.commit().await.map_err(MegaError::Db)?;
@@ -927,6 +951,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued, 0, "delete-only attach must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn attach_delete_stale_old_id_does_not_remove_moved_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = wired_storage_with_monorepo(&temp).await;
+        let (repo, _commit, create_cmd) =
+            seed_import_repo_with_main_tip(&storage, "/third-party/cas-del").await;
+        let repo_id = repo.repo_id;
+        let git_db = storage.git_db_storage();
+        git_db
+            .save_ref(repo_id, create_cmd.clone().into())
+            .await
+            .unwrap();
+        let moved = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        git_db
+            .update_ref(repo_id, &create_cmd.ref_name, moved)
+            .await
+            .unwrap();
+
+        let mut delete_cmd = create_cmd.clone();
+        delete_cmd.command_type = CommandType::Delete;
+        delete_cmd.old_id = create_cmd.new_id.clone();
+        delete_cmd.new_id = ZERO_ID.to_string();
+
+        let import_repo = ImportRepo {
+            storage: storage.clone(),
+            repo,
+            command_list: Mutex::new(vec![delete_cmd]),
+            git_object_cache: disabled_cache().await,
+            receive_pack_extra_timings_ms: Mutex::new(vec![]),
+        };
+        let err = import_repo
+            .attach_to_monorepo_parent()
+            .await
+            .expect_err("stale advertised old id must conflict");
+        assert!(
+            err.to_string().contains("moved since advertisement"),
+            "got {err}"
+        );
+        let refs = git_db.get_ref(repo_id).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].ref_git_id, moved);
     }
 
     #[tokio::test]

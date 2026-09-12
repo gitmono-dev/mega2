@@ -1484,9 +1484,15 @@ impl PushQueueService {
                     }
                 }
                 CommandType::Delete => {
-                    git_db
-                        .remove_ref_in_txn(payload.repo_id, &cmd.ref_name, &txn)
+                    let deleted = git_db
+                        .remove_ref_if_unchanged(payload.repo_id, &cmd.ref_name, &cmd.old_id, &txn)
                         .await?;
+                    if !deleted {
+                        return Err(MegaError::Other(format!(
+                            "ref {} moved since advertisement (expected {})",
+                            cmd.ref_name, cmd.old_id
+                        )));
+                    }
                 }
                 CommandType::Update => {
                     git_db

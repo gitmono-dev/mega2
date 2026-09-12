@@ -3763,6 +3763,127 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
 }
 
 #[test]
+fn integration_git_cli_stale_delete_does_not_remove_updated_ref() {
+    // plan-20260901 FC-09: a delete whose advertised old id no longer matches
+    // must not remove a ref that moved after discovery.
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let clone_name = "fc09-cas-clone";
+    git_cli::assert_git_success(
+        &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
+        "clone for CAS delete",
+    );
+    for (key, value) in [
+        ("user.name", "IT Git CLI"),
+        ("user.email", "it-git-cli@example.invalid"),
+    ] {
+        git_cli::assert_git_success(
+            &git_cli::git_cli(
+                &env.case_dir,
+                &token,
+                &["-C", clone_name, "config", key, value],
+            ),
+            "git config identity",
+        );
+    }
+    let branch = format!("fc09-cas-{}", std::process::id());
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "checkout", "-b", &branch],
+        ),
+        "create CAS source branch",
+    );
+    let clone = env.case_dir.join(clone_name);
+    fs::write(clone.join("fc09-c1.txt"), b"fc09 c1\n").expect("write c1");
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "add", "fc09-c1.txt"],
+        ),
+        "git add c1",
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &["-C", clone_name, "commit", "-m", "fc09 c1"],
+        ),
+        "commit c1",
+    );
+    let c1 = git_stdout(
+        &env.case_dir,
+        &token,
+        &["-C", clone_name, "rev-parse", "HEAD"],
+    );
+    git_cli::assert_git_success(
+        &git_cli::git_cli(
+            &env.case_dir,
+            &token,
+            &[
+                "-C",
+                clone_name,
+                "-c",
+                "pack.window=0",
+                "-c",
+                "pack.depth=0",
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        ),
+        "first push opens the CL",
+    );
+    let cl_refs = cl_ref_rows(&env.database.db_url);
+    assert_eq!(
+        cl_refs.len(),
+        1,
+        "exactly one CL ref after the first push: {cl_refs:?}"
+    );
+    let cl_name = cl_refs[0].0.clone();
+    assert_eq!(cl_refs[0].1, c1);
+
+    // Simulate a racing writer that moved the same mega_refs row after the
+    // client discovered c1. A second `HEAD:refs/heads/<branch>` push would
+    // open a new CL rather than mutate this row.
+    let moved = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    update_cl_ref_commit(&env.database.db_url, &cl_name, moved);
+    let after_update = cl_ref_rows(&env.database.db_url);
+    assert_eq!(after_update.len(), 1);
+    assert_eq!(after_update[0].1, moved);
+
+    let report = post_packless_receive_pack(port, &token, &c1, ZERO_SHA1, &cl_name);
+    assert!(
+        report.contains("moved since advertisement") || report.contains("ng "),
+        "stale delete must ng; got:\n{report}"
+    );
+    let still = cl_ref_rows(&env.database.db_url);
+    assert_eq!(still.len(), 1, "CAS miss must leave the updated CL ref");
+    assert_eq!(
+        still[0].1, moved,
+        "updated tip {moved} must survive stale delete of {c1}"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
 fn integration_git_cli_multicommit_cumulative_limit_rejected() {
     // plan-20260827 MC-06 / ADR-MC-07: the 250 bound applies to the CL's
     // cumulative (from_hash → to_hash) range. A 200-commit push opens the CL;
@@ -4455,6 +4576,24 @@ fn cl_rows_for_user(db_url: &str, username: &str) -> Vec<ClRow> {
 /// by CL link: the push-side CL ref name is generated independently of the CL
 /// row's link (pre-existing behavior — see `fetch_or_new_cl_link` vs
 /// `create_new_cl`), so the two cannot be joined by name.
+fn update_cl_ref_commit(db_url: &str, ref_name: &str, commit: &str) {
+    let ref_sql = ref_name.replace('\'', "''");
+    let commit_sql = commit.replace('\'', "''");
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect integration DB to move CL ref: {err}"));
+        execute_postgres(
+            &db,
+            format!(
+                "UPDATE mega_refs SET ref_commit_hash = '{commit_sql}' \
+                 WHERE path = '/' AND is_cl AND ref_name = '{ref_sql}'"
+            ),
+        )
+        .await;
+    });
+}
+
 fn cl_ref_rows(db_url: &str) -> Vec<(String, String, String)> {
     with_runtime(async {
         let db = Database::connect(db_url)

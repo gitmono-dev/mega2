@@ -169,6 +169,22 @@ impl MonoStorage {
         Ok(())
     }
 
+    /// Deletes the mega ref only if it still points at `expected_commit`.
+    /// Returns whether a row was removed.
+    pub async fn remove_ref_if_unchanged<C: ConnectionTrait>(
+        &self,
+        ref_name: &str,
+        expected_commit: &str,
+        conn: &C,
+    ) -> Result<bool, MegaError> {
+        let result = mega_refs::Entity::delete_many()
+            .filter(mega_refs::Column::RefName.eq(ref_name))
+            .filter(mega_refs::Column::RefCommitHash.eq(expected_commit))
+            .exec(conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
     pub async fn get_refs_for_paths_and_cls(
         &self,
         paths: &[&str],
