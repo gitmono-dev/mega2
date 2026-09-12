@@ -62,6 +62,9 @@ struct LeaseTestHooks {
     /// Set once `unlock_lease` has flagged this lease to stop — the Drop-path
     /// test waits on this instead of guessing with a fixed sleep (R4).
     stop_requested: AtomicBool,
+    /// Count of SET NX attempts on this lease (lock-retry backoff tests).
+    acquire_attempts: AtomicUsize,
+    /// The renewal task's handle, stored right after spawn.
     /// The renewal task's handle, stored right after spawn.
     task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -90,6 +93,10 @@ impl LeaseTestHooks {
 
     fn stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    fn acquire_attempts(&self) -> usize {
+        self.acquire_attempts.load(Ordering::SeqCst)
     }
 
     fn set_task(&self, task: tokio::task::JoinHandle<()>) {
@@ -146,6 +153,11 @@ impl RedLock {
     }
 
     async fn try_lock_lease(&self, lease: &Lease) -> Result<bool, MegaError> {
+        #[cfg(test)]
+        lease
+            .test_hooks
+            .acquire_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.connection.clone();
         // SET returns "OK" or Nil
         let result: Option<String> = redis::cmd("SET")
@@ -160,6 +172,10 @@ impl RedLock {
         Ok(result.is_some())
     }
 
+    /// Retry interval while waiting for SET NX. A 200ms sleep turned a ~25ms
+    /// hold into 200/400/600ms waits for anyone who missed the unlock.
+    const LOCK_RETRY_SLEEP: Duration = Duration::from_millis(10);
+
     /// Lock with retry
     pub async fn lock(self: Arc<Self>) -> Result<RedLockGuard, MegaError> {
         let t0 = Instant::now();
@@ -170,7 +186,7 @@ impl RedLock {
         let lease = Lease::new();
         *self.current.lock().expect("lease mutex poisoned") = lease.clone();
         while !self.try_lock_lease(&lease).await? {
-            sleep(Duration::from_millis(200)).await;
+            sleep(Self::LOCK_RETRY_SLEEP).await;
         }
 
         self.spawn_auto_renew(lease.clone());
@@ -367,9 +383,9 @@ impl Drop for RedLockGuard {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
 
-    use std::{process::Command, sync::Arc};
+    use std::{process::Command, sync::Arc, time::Instant};
 
     use futures::future::join_all;
     use redis::{AsyncCommands, aio::ConnectionManager};
@@ -406,6 +422,51 @@ mod test {
         conn.set::<&str, _, String>("foo", "bar").await.unwrap();
         let v: String = conn.get("foo").await.unwrap();
         assert_eq!(v, "bar");
+    }
+
+    #[test]
+    fn lock_retry_sleep_is_ten_millis() {
+        assert_eq!(RedLock::LOCK_RETRY_SLEEP, Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn contended_lock_uses_short_backoff_not_busy_spin() {
+        let Some((_server, conn)) = init_server().await else {
+            return;
+        };
+
+        let holder = Arc::new(RedLock::new(conn.clone(), "backoff".to_string(), 3000));
+        let waiter = Arc::new(RedLock::new(conn, "backoff".to_string(), 3000));
+        let guard = holder.clone().lock().await.unwrap();
+
+        let started = Instant::now();
+        let waiter_task = tokio::spawn(async move { waiter.lock().await.unwrap() });
+        sleep(Duration::from_millis(50)).await;
+        guard.unlock().await.unwrap();
+        let waiter_guard = timeout(Duration::from_millis(120), waiter_task)
+            .await
+            .expect("200ms lock retry would miss a 50ms hold")
+            .expect("waiter task");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(50),
+            "waiter must not acquire while the holder still owns the key"
+        );
+        assert!(
+            waited < Duration::from_millis(150),
+            "10ms backoff should acquire shortly after unlock, not after 200ms: {waited:?}"
+        );
+
+        let attempts = waiter_guard.lock.lease_test_hooks().acquire_attempts();
+        assert!(
+            attempts >= 2,
+            "waiter should SET NX more than once while blocked: {attempts}"
+        );
+        assert!(
+            attempts <= 20,
+            "busy-spin would issue thousands of SET NX calls in 50ms, got {attempts}"
+        );
+        waiter_guard.unlock().await.unwrap();
     }
 
     #[tokio::test]
