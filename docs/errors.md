@@ -139,3 +139,7 @@ cargo build --tests
 ## plan-20260909（Storage-only LFS）
 
 N/A：本计划未新增 `MegaError` 变体。Trunk LFS 拒绝沿用既有 HTTP 状态（401/403）与 `lfs_auth_challenge`，不登记新错误类型。
+
+## plan-20260901（FastCDC Media + receive-pack / 导入可靠性）
+
+N/A：未新增用户可见的 `MegaError` 枚举变体。Media HTTP 用领域错误映射 400/404/409/500（见 [`docs/refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)）；`MegaError::is_retryable_db_serialization` 仅供 batch insert 内部重试分类，不改变对外错误面。

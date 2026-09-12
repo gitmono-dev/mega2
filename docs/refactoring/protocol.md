@@ -68,6 +68,8 @@
 >
 > **2026-09-12 更新（plan-20260901 FC-08）**：receive-pack 对齐 Mega 的 **per-command report-status**：pack-less 非删除命令校验已存 object；monorepo tag 与 `refs/heads/main` 删除在持久化前 `ng`；多余非删除 branch 标 `ng` 而第一条仍可 finalize（不再整包拒绝）；tag-only 不 `finalize_receive_pack`。CL delete-only 保持允许。
 >
+> **2026-09-12 更新（plan-20260901 FC-09）**：ref 删除按客户端 advertised `old_id` 做 compare-and-swap；不匹配时不删除已被并发更新的 ref，report-status 为 `moved since advertisement`。默认分支删除仍由 FC-08 前置规则拒绝。
+>
 > **2026-09-12 更新（plan-20260901 FC-10）**：import/monorepo filepath 写入改为收集 `(blob_id, path)` 后按 repo/domain 一次 CASE UPDATE（empty 为 no-op，duplicate 保留最后一次 path）。成功导入的路径语义不变。
 >
 > **2026-08-29 更新 3（MC-06 R2 粘性收口）**：拒绝规则改为只基于 pack **内容**（presence 集）——resolve 沿 tip 首父路径做 presence 界定的走查（新引入成员走 250 语义上界，冗余携带的已知祖先走独立卫生上界），凡不在路径上的 pack commit 一律判 junk 拒绝，与瞬时 newness 无关；无新引入的 push 不再退化为 `[tip]` 链，而是把整段内容链交给校验器重验。净效果：**同一被拒 pack 原样重试必被同样拒绝**（junk / 链中 merge / 超长 / 累计超限全部粘性），且 ref/CL/`commit_auths` 零变化；已接受 push 的幂等重试在真实客户端下天然走空 pack no-op 分支不受影响。绑定消费收窄为 `ordered ∩ 新引入`。
