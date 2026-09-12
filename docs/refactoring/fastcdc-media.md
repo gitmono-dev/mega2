@@ -53,3 +53,30 @@
 - 普通 LFS `/objects`、`/locks`、`/objects/batch` 行为不变。
 
 固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`20226243095e92274b3683f4c09bcd12ae35d245b073b38296a2a895c13b8c9d`。
+
+## 双仓 interop gate（FC-15）
+
+默认 `cargo test --all` **不**要求 sibling Libra checkout。真实 client/server 证据只在显式 ignored target 下执行：
+
+```bash
+export LIBRA_DIR=/path/to/libra          # 干净 checkout，HEAD == LIBRA_INTEROP_REV
+export LIBRA_INTEROP_REV=d1aafb23dccb77408ac43786b173f1c9a0d760aa
+source .env.test
+cargo test -p monoengine --features fastcdc --test integration_fastcdc_libra \
+  -- --ignored --exact monoengine_libra_fastcdc_interop --test-threads=1
+```
+
+Harness 启动 `--features fastcdc` 的 `service http`，写入仅当前测试可读的 ready-file（JSON：`lfs_url` 必须为 `<repo>.git/info/lfs/` 且带尾 `/`，加一次性 `token`），再精确运行 Libra `monoengine_fastcdc_http_interop`。缺失 `LIBRA_DIR`、脏树、错误 revision 或没有 `cargo` 时失败，不得 SKIP-green。token 与完整 URL 不会写入失败输出或计划证据。
+
+Feature-off 对照（独立 target dir 构建未启用 feature 的 binary）：
+
+```bash
+CARGO_TARGET_DIR="$PWD/target/fastcdc-off" cargo build -p monoengine
+export MONOENGINE_FASTCDC_OFF_BIN="$PWD/target/fastcdc-off/debug/monoengine"
+source .env.test
+cargo test -p monoengine --features fastcdc --test integration_fastcdc_libra \
+  -- --ignored --exact monoengine_fastcdc_feature_off_falls_back --test-threads=1
+```
+
+feature-off 时 `<repo>.git/info/lfs/libra/media/v1/capabilities` 为 404，Libra `media probe` 选择标准 LFS fallback。这不是标准 Git FastCDC 互通。
+

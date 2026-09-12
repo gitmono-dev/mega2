@@ -332,7 +332,7 @@ fn map_manifest(err: ManifestError) -> MediaError {
 
 fn map_scope(err: ScopeError) -> MediaError {
     match err {
-        ScopeError::InvalidActor | ScopeError::InvalidRepository | ScopeError::InvalidObjectId => {
+        ScopeError::Actor | ScopeError::Repository | ScopeError::ObjectId => {
             MediaError::Invalid("invalid media scope or object id".to_string())
         }
     }

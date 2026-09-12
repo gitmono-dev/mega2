@@ -12,11 +12,11 @@ const MEDIA_KEY_PREFIX: &str = "v1";
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeError {
     #[error("invalid media actor")]
-    InvalidActor,
+    Actor,
     #[error("invalid media repository")]
-    InvalidRepository,
+    Repository,
     #[error("invalid media object identity")]
-    InvalidObjectId,
+    ObjectId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,7 @@ impl MediaScope {
         object_id: &str,
     ) -> Result<ObjectKey, ScopeError> {
         if !is_key_token(object_id) {
-            return Err(ScopeError::InvalidObjectId);
+            return Err(ScopeError::ObjectId);
         }
         let key = format!(
             "{MEDIA_KEY_PREFIX}/{}/{}/{}",
@@ -84,20 +84,20 @@ impl MediaScope {
 
 pub fn parse_actor(actor: &str) -> Result<String, ScopeError> {
     if actor.is_empty() || !actor.is_ascii() || actor.bytes().any(|b| b.is_ascii_control()) {
-        return Err(ScopeError::InvalidActor);
+        return Err(ScopeError::Actor);
     }
     Ok(actor.to_string())
 }
 
 pub fn canonicalize_repository(repository: &str) -> Result<String, ScopeError> {
     if !repository.starts_with('/') || repository.contains('\\') {
-        return Err(ScopeError::InvalidRepository);
+        return Err(ScopeError::Repository);
     }
     if repository
         .bytes()
         .any(|b| b == b'%' || b == b'?' || b.is_ascii_control() || !b.is_ascii())
     {
-        return Err(ScopeError::InvalidRepository);
+        return Err(ScopeError::Repository);
     }
     let mut parts = Vec::new();
     for (i, seg) in repository.split('/').enumerate() {
@@ -105,15 +105,15 @@ pub fn canonicalize_repository(repository: &str) -> Result<String, ScopeError> {
             if i == 0 {
                 continue;
             }
-            return Err(ScopeError::InvalidRepository);
+            return Err(ScopeError::Repository);
         }
         if seg == "." || seg == ".." {
-            return Err(ScopeError::InvalidRepository);
+            return Err(ScopeError::Repository);
         }
         parts.push(seg);
     }
     if parts.is_empty() {
-        return Err(ScopeError::InvalidRepository);
+        return Err(ScopeError::Repository);
     }
     Ok(format!("/{}", parts.join("/")))
 }
