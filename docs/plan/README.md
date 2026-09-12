@@ -28,7 +28,7 @@
 | `plan-20260824.md` | 日期计划 | **已执行**（orbit 完全单体内联：`src/orbit_api` + `src/orbit`，移除 `ObjectStorageProvider`，单 package `monoengine`；家族发布 REL-ORB-01 → ORB-09） |
 | `plan-20260826.md` | 日期计划 | Mega 同步 #2130→#2175（SYNC-01..05；状态以计划内任务卡为准） |
 | `plan-20260827.md` | 日期计划 | **新建**（CL 多 commit push 放开：push 侧链式校验 + 拒绝 merge commit + 修 ref 配对，trunk 侧 CL merge 永远单父新 commit 不动；MC-01..04；设计经 Codex/Claude 双评审有条件批准；下游 = monoui `docs/plan/plan-20260827.md`） |
-| `plan-20260901.md` | 日期计划 | **Claude Code Review PASS**（Mega `bb3ef17` FastCDC media transport，以及 receive-pack 状态安全、导入批处理、DB/Redis 并发和多实例 ID 改进；FC-01..14；R4 通过） |
+| `plan-20260901.md` | 日期计划 | **待执行，Codex R7 plan review PASS**（Mega `bb3ef17` FastCDC、receive-pack/导入/DB/Redis/ID 改进；2026-09-12 已按当前 monoengine 与 Libra client 刷新，新增 Libra test adapter `LB-01` 和双仓 interop `FC-15`） |
 | `plan-20260903.md` | 日期计划 | **已完成**（HSH-01/HSH-02：`monorepo.object_format` SHA-1/SHA-256 bootstrap；BLAKE3 fail-closed；DEFER wire/pack/BLAKE3 runtime） |
 | `plan-20260904.md` | 日期计划 | **已完成**（AW-01..05；trunk 产品 API 写经 push_auth + MonoWriteQueue；compose 可继承黑盒 `api_write_smoke_storage_only.sh`；收口 **v0.8.61** / tip 以 AW-05 提交为准；Codex 卡级 PASS） |
 | `plan-20260906.md` | 日期计划 | **已完成**（一 case 一卡；compose 黑盒；测试客户端=git；SO-01..SO-04 / SO-07..15 / SO-17..25；SO-05 cancelled；收口 SO-06） |
