@@ -18,6 +18,10 @@ name = "monoengine_core"
 path = "src/lib.rs"
 doctest = false
 
+[features]
+default = []
+fastcdc = []
+
 [dependencies]
 anyhow = "1.0.104"
 async-recursion = "1.1.1"
