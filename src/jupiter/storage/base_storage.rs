@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -7,7 +7,119 @@ use sea_orm::{
 };
 use sea_orm_migration::SchemaManagerConnection;
 
-use crate::common::errors::MegaError;
+use crate::common::errors::{MegaError, db_err_is_retryable_serialization};
+
+const INSERT_RETRY_ATTEMPTS: u32 = 5;
+const INSERT_RETRY_BASE_MS: u64 = 10;
+
+/// Decision after a failed (or no-op) batch insert attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertRetry {
+    Ok,
+    Sleep(u64),
+    Fail,
+}
+
+pub(crate) fn next_insert_retry(attempt: u32, err: &DbErr) -> InsertRetry {
+    if matches!(err, DbErr::RecordNotInserted) {
+        return InsertRetry::Ok;
+    }
+    if db_err_is_retryable_serialization(err) && attempt < INSERT_RETRY_ATTEMPTS {
+        InsertRetry::Sleep(INSERT_RETRY_BASE_MS << (attempt - 1))
+    } else {
+        InsertRetry::Fail
+    }
+}
+
+#[cfg(test)]
+async fn retry_transient_insert<F, Fut>(mut insert: F) -> Result<(), MegaError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), DbErr>>,
+{
+    let mut attempt = 0u32;
+    let mut last_backoff_ms = 0u64;
+    loop {
+        attempt += 1;
+        match insert().await {
+            Ok(_) => return Ok(()),
+            Err(e) => match next_insert_retry(attempt, &e) {
+                InsertRetry::Ok => return Ok(()),
+                InsertRetry::Sleep(backoff_ms) => {
+                    last_backoff_ms = backoff_ms;
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms,
+                        error_kind = "deadlock_or_serialization",
+                        "retrying batch insert after deadlock or serialization failure"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                InsertRetry::Fail => {
+                    if db_err_is_retryable_serialization(&e) {
+                        tracing::error!(
+                            attempt,
+                            backoff_ms = last_backoff_ms,
+                            error_kind = "deadlock_or_serialization",
+                            "batch insert failed after retries"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            },
+        }
+    }
+}
+
+async fn insert_many_with_deadlock_retry<E, A>(
+    conn: &DatabaseConnection,
+    txn: Option<&DatabaseTransaction>,
+    models: Vec<A>,
+    onconflict: &OnConflict,
+) -> Result<(), MegaError>
+where
+    E: EntityTrait,
+    A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send + Clone,
+{
+    let mut attempt = 0u32;
+    let mut last_backoff_ms = 0u64;
+    loop {
+        attempt += 1;
+        let insert = E::insert_many(models.clone()).on_conflict(onconflict.clone());
+        let result = if let Some(txn) = txn {
+            insert.exec(txn).await
+        } else {
+            insert.exec(conn).await
+        };
+        match result {
+            Ok(_) => return Ok(()),
+            Err(e) => match next_insert_retry(attempt, &e) {
+                InsertRetry::Ok => return Ok(()),
+                InsertRetry::Sleep(backoff_ms) => {
+                    last_backoff_ms = backoff_ms;
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms,
+                        error_kind = "deadlock_or_serialization",
+                        "retrying batch insert after deadlock or serialization failure"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                InsertRetry::Fail => {
+                    if db_err_is_retryable_serialization(&e) {
+                        tracing::error!(
+                            attempt,
+                            backoff_ms = last_backoff_ms,
+                            error_kind = "deadlock_or_serialization",
+                            "batch insert failed after retries"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            },
+        }
+    }
+}
 
 #[async_trait]
 pub trait StorageConnector {
@@ -35,8 +147,7 @@ pub trait StorageConnector {
     /// The method takes a vector of models to be saved and performs batch inserts using the given entity type `E`.
     /// The models should implement the `ActiveModelTrait` trait, which provides the necessary functionality for saving and inserting the models.
     ///
-    /// The method splits the models into smaller chunks, each containing models configured by chunk_size, and inserts them into the database using the `E::insert_many` function.
-    /// The results of each insertion are collected into a vector of futures.
+    /// The method splits the models into smaller chunks, each containing models configured by chunk_size, and inserts them sequentially with bounded deadlock/serialization retry.
     ///
     /// Note: Currently, SQLx does not support packets larger than 16MB.
     /// # Arguments
@@ -54,7 +165,7 @@ pub trait StorageConnector {
     async fn batch_save_model<E, A>(&self, save_models: Vec<A>) -> Result<(), MegaError>
     where
         E: EntityTrait,
-        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send,
+        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send + Clone,
     {
         let onconflict = OnConflict::new().do_nothing().to_owned();
         Self::batch_save_model_with_conflict(self, save_models, onconflict).await
@@ -67,7 +178,7 @@ pub trait StorageConnector {
     ) -> Result<(), MegaError>
     where
         E: EntityTrait,
-        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send,
+        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send + Clone,
     {
         let onconflict = OnConflict::new().do_nothing().to_owned();
         Self::batch_save_model_with_conflict_and_txn(self, save_models, onconflict, txn).await
@@ -81,30 +192,20 @@ pub trait StorageConnector {
     ) -> Result<(), MegaError>
     where
         E: EntityTrait,
-        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send,
+        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send + Clone,
     {
-        let conn = self.build_connection_with_txn(txn);
-
         let mut i = 0;
         let len = save_models.len();
 
         while i < len {
             let end = (i + Self::BATCH_CHUNK_SIZE).min(len);
-            let models = save_models[i..end].to_vec();
-            match E::insert_many(models)
-                .on_conflict(onconflict.clone())
-                .exec(&conn)
-                .await
-            {
-                Ok(_) => {}
-                Err(DbErr::RecordNotInserted) => {}
-                // UN-16: propagate genuine errors (dropped table, constraint
-                // violation, ...). The previous `let _ =` silently discarded
-                // them, so a failed commit/tree save after a ref write left the
-                // ref pointing at a missing object with no dirty flag — a
-                // fail-open window for the shared authz snapshot.
-                Err(e) => return Err(e.into()),
-            }
+            insert_many_with_deadlock_retry::<E, A>(
+                self.get_connection(),
+                txn,
+                save_models[i..end].to_vec(),
+                &onconflict,
+            )
+            .await?;
             i = end;
         }
         Ok(())
@@ -137,24 +238,9 @@ pub trait StorageConnector {
     ) -> Result<(), MegaError>
     where
         E: EntityTrait,
-        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send,
+        A: ActiveModelTrait<Entity = E> + From<<E as EntityTrait>::Model> + Send + Clone,
     {
-        let futures = save_models.chunks(Self::BATCH_CHUNK_SIZE).map(|chunk| {
-            let insert = E::insert_many(chunk.iter().cloned()).on_conflict(onconflict.clone());
-
-            async move {
-                match insert.exec(self.get_connection()).await {
-                    Ok(_) => Ok(()),
-                    Err(DbErr::RecordNotInserted) => {
-                        // ignore not inserted err
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        });
-        futures::future::try_join_all(futures).await?;
-        Ok(())
+        Self::batch_save_model_with_conflict_and_txn(self, save_models, onconflict, None).await
     }
 }
 
@@ -176,5 +262,98 @@ impl StorageConnector for BaseStorage {
 
     fn new(connection: Arc<DatabaseConnection>) -> Self {
         Self { connection }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_backoff_is_10_20_40_80_then_fail() {
+        let deadlock = DbErr::Custom("deadlock detected".into());
+        assert_eq!(next_insert_retry(1, &deadlock), InsertRetry::Sleep(10));
+        assert_eq!(next_insert_retry(2, &deadlock), InsertRetry::Sleep(20));
+        assert_eq!(next_insert_retry(3, &deadlock), InsertRetry::Sleep(40));
+        assert_eq!(next_insert_retry(4, &deadlock), InsertRetry::Sleep(80));
+        assert_eq!(next_insert_retry(5, &deadlock), InsertRetry::Fail);
+        let total_wait: u64 = [10, 20, 40, 80].into_iter().sum();
+        assert!(total_wait <= 150);
+    }
+
+    #[test]
+    fn record_not_inserted_is_success() {
+        assert_eq!(
+            next_insert_retry(1, &DbErr::RecordNotInserted),
+            InsertRetry::Ok
+        );
+    }
+
+    #[test]
+    fn unique_violation_is_not_retried() {
+        let err = DbErr::Custom(
+            "duplicate key value violates unique constraint \"git_repo_pkey\"".into(),
+        );
+        assert_eq!(next_insert_retry(1, &err), InsertRetry::Fail);
+    }
+
+    #[test]
+    fn serialization_failure_is_retried() {
+        let err = DbErr::Custom("ERROR: 40001 could not serialize access".into());
+        assert_eq!(next_insert_retry(1, &err), InsertRetry::Sleep(10));
+    }
+
+    #[tokio::test]
+    async fn first_success_does_not_sleep() {
+        let started = std::time::Instant::now();
+        retry_transient_insert(|| async { Ok(()) })
+            .await
+            .expect("first success");
+        assert!(started.elapsed() < Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn unique_violation_fails_immediately() {
+        let started = std::time::Instant::now();
+        let err = retry_transient_insert(|| async {
+            Err(DbErr::Custom(
+                "duplicate key value violates unique constraint \"git_repo_pkey\"".into(),
+            ))
+        })
+        .await
+        .expect_err("permanent errors must propagate");
+        assert!(!err.is_retryable_db_serialization());
+        assert!(started.elapsed() < Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn deadlock_retries_then_succeeds() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        retry_transient_insert(|| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            async move {
+                if n < 3 {
+                    Err(DbErr::Custom("deadlock detected".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect("retryable deadlock should succeed after backoff");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn deadlock_gives_up_after_five_attempts() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let err = retry_transient_insert(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(DbErr::Custom("ERROR: 40P01 deadlock detected".into())) }
+        })
+        .await
+        .expect_err("exhausted retries must fail");
+        assert!(err.is_retryable_db_serialization());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 }
