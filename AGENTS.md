@@ -141,7 +141,6 @@ src/
 ├── bellatrix/  ceres/  saturn/  context/  git_protocol/
 └── mega.cedarschema, mega_policies.cedar
 tests/                    # process-level integration tests (integration_*.rs)
-test/project/             # fixture data for integration tests
 target/                   # build artifacts (gitignored)
 ```
 

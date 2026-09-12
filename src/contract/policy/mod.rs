@@ -128,7 +128,7 @@ impl From<&str> for ActionEnum {
 
 #[cfg(test)]
 mod test {
-    use std::{fs, sync::Once};
+    use std::sync::Once;
 
     use cedar_policy::{Authorizer, Context, Entities, PolicySet, Request};
 
@@ -182,9 +182,8 @@ mod test {
     #[test]
     fn test_project_path_policy() {
         init_tracing();
-        let entities_path = "./test/project/.mega.json";
-        let entities_file = fs::File::open(entities_path).unwrap();
-        let entities = serde_json::from_reader(entities_file).unwrap();
+        let entities: EntityStore =
+            serde_json::from_str(include_str!("fixtures/project.mega.json")).unwrap();
 
         let app_context = load_context(entities);
         let admin: SaturnEUid = r#"User::"benjamin_747""#.parse().unwrap();
@@ -275,11 +274,10 @@ mod test {
     #[test]
     fn test_private_path_policy() {
         init_tracing();
-        let parent_entities_file = fs::File::open("./test/project/.mega.json").unwrap();
-        let parent_entities: EntityStore = serde_json::from_reader(parent_entities_file).unwrap();
-
-        let entities_file = fs::File::open("./test/project/private/.mega.json").unwrap();
-        let mut entities: EntityStore = serde_json::from_reader(entities_file).unwrap();
+        let parent_entities: EntityStore =
+            serde_json::from_str(include_str!("fixtures/project.mega.json")).unwrap();
+        let mut entities: EntityStore =
+            serde_json::from_str(include_str!("fixtures/private.mega.json")).unwrap();
 
         entities.merge(parent_entities);
 
