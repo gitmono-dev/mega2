@@ -143,9 +143,7 @@ impl MonoObjectFormat {
         match self {
             Self::Sha1 => Ok(HashKind::Sha1),
             Self::Sha256 => Ok(HashKind::Sha256),
-            Self::Blake3 => Err(MegaError::Other(
-                "monorepo.object_format=blake3 is reserved until an explicit repository hash context is wired for normal Git services".to_string(),
-            )),
+            Self::Blake3 => Ok(HashKind::Blake3),
         }
     }
 }
@@ -227,7 +225,9 @@ impl MonoConfig {
             MonoObjectFormat::Sha256 => Err(MegaError::Other(
                 "monorepo.object_format=sha256 is bootstrap-only; run `monoengine service init --yes` before enabling normal Git services".to_string(),
             )),
-            MonoObjectFormat::Blake3 => self.object_hash_kind().map(|_| ()),
+            MonoObjectFormat::Blake3 => Err(MegaError::Other(
+                "monorepo.object_format=blake3 is bootstrap-only; run `monoengine service init --yes` before enabling normal Git services".to_string(),
+            )),
         }
     }
 }
@@ -1081,6 +1081,8 @@ fn default_cedar_enforcement() -> String {
 
 #[cfg(test)]
 mod tests {
+    use git_internal::hash::HashKind;
+
     use super::{MonoConfig, MonoObjectFormat};
 
     #[test]
@@ -1124,5 +1126,30 @@ object_format = "black3"
         )
         .expect_err("the misspelled BLAKE3 value must not deserialize");
         assert!(err.to_string().contains("black3"));
+    }
+
+    #[test]
+    fn b3_03_blake3_hash_kind_ok() {
+        let config = MonoConfig {
+            object_format: MonoObjectFormat::Blake3,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.object_hash_kind().expect("blake3 maps to HashKind"),
+            HashKind::Blake3
+        );
+    }
+
+    #[test]
+    fn b3_03_blake3_normal_service_still_rejected() {
+        let config = MonoConfig {
+            object_format: MonoObjectFormat::Blake3,
+            ..Default::default()
+        };
+        let err = config
+            .ensure_normal_service_object_format()
+            .expect_err("blake3 remains bootstrap-only for normal Git services");
+        assert!(err.to_string().contains("bootstrap-only"), "{err}");
+        assert!(!err.to_string().contains("reserved until"), "{err}");
     }
 }

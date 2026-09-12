@@ -71,9 +71,9 @@ admin = ["mega2"]
 root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "data", "toolchains"]
 
 # Object-ID format for the initial Monorepo graph. Supported bootstrap values:
-# "sha1" (default) and "sha256". "blake3" is reserved until git-internal 0.9.0.
-# SHA-256 is not yet an end-to-end Git wire/pack format in monoengine. Use it
-# only for a controlled bootstrap invocation, never for a normal Git service.
+# "sha1" (default), "sha256", and "blake3". sha256 and blake3 are bootstrap-only
+# until normal Git service is enabled for that format. Use them only for a
+# controlled bootstrap invocation, never for a normal Git service.
 # Bootstrap with: monoengine --config config/config.toml service init --yes
 object_format = "sha1"
 

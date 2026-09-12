@@ -601,13 +601,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_rejects_blake3_before_startup_side_effects() {
+    async fn normal_context_rejects_blake3_before_startup_side_effects() {
         let mut config = crate::config::Config::mock();
         config.monorepo.object_format = crate::config::MonoObjectFormat::Blake3;
 
-        match bootstrap_monorepo(config).await {
-            Err(error) => assert!(error.to_string().contains("monorepo.object_format")),
-            Ok(_) => panic!("BLAKE3 bootstrap must fail before startup"),
+        match AppContext::new(config).await {
+            Err(error) => assert!(
+                error.to_string().contains("bootstrap-only"),
+                "normal context must reject BLAKE3: {error}"
+            ),
+            Ok(_) => panic!("normal context must reject BLAKE3 before startup"),
         }
     }
 

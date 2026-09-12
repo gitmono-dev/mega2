@@ -89,9 +89,10 @@ impl MonoService {
 
     /// Initializes an empty Monorepo for a controlled, one-shot bootstrap.
     ///
-    /// Unlike [`Self::init_monorepo`], this accepts the configured SHA-256
-    /// initial object graph. It must not be followed by a normal Git service
-    /// until protocol and pack paths carry an explicit repository hash context.
+    /// Unlike [`Self::init_monorepo`], this accepts a configured SHA-256 or
+    /// BLAKE3 initial object graph. It must not be followed by a normal Git
+    /// service until protocol and pack paths carry an explicit repository hash
+    /// context.
     pub(crate) async fn bootstrap_monorepo(
         &self,
         mono_config: &MonoConfig,
@@ -285,10 +286,10 @@ mod tests {
         };
 
         let err = MonoService::mock()
-            .bootstrap_monorepo(&mono_config)
+            .init_monorepo(&mono_config)
             .await
-            .expect_err("BLAKE3 must not reach storage before git-internal 0.9.0");
-        assert!(err.to_string().contains("monorepo.object_format"));
+            .expect_err("BLAKE3 must use the controlled bootstrap entrypoint");
+        assert!(err.to_string().contains("bootstrap-only"));
     }
 
     #[test]
@@ -311,6 +312,19 @@ mod tests {
         let err =
             ensure_existing_root_ref_matches_config(&sha256, &"a".repeat(40), &"b".repeat(40))
                 .expect_err("a SHA-1 root ref must not be accepted as SHA-256");
+        assert!(err.to_string().contains("do not convert"));
+
+        let blake3 = MonoConfig {
+            object_format: MonoObjectFormat::Blake3,
+            ..Default::default()
+        };
+        assert!(
+            ensure_existing_root_ref_matches_config(&blake3, &"a".repeat(64), &"b".repeat(64),)
+                .is_ok()
+        );
+        let err =
+            ensure_existing_root_ref_matches_config(&blake3, &"a".repeat(40), &"b".repeat(40))
+                .expect_err("a SHA-1 root ref must not be accepted as BLAKE3");
         assert!(err.to_string().contains("do not convert"));
     }
 

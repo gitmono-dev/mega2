@@ -1003,9 +1003,9 @@ mod test {
                 64,
             ),
             (
-                HashKind::Sha256,
-                MonoObjectFormat::Sha256,
-                HashKind::Sha256,
+                HashKind::Sha1,
+                MonoObjectFormat::Blake3,
+                HashKind::Blake3,
                 64,
             ),
         ] {
@@ -1070,16 +1070,20 @@ mod test {
     }
 
     #[test]
-    fn init_rejects_reserved_blake3_object_format() {
+    fn b3_03_blake3_init_writes_blake3_root() {
+        let _hash_kind_guard = set_hash_kind_for_test(HashKind::Sha1);
         let mono_config = MonoConfig {
             object_format: MonoObjectFormat::Blake3,
             ..Default::default()
         };
 
-        let err = MegaModelConverter::init(&mono_config)
-            .err()
-            .expect("BLAKE3 must fail before building the initial graph");
-        assert!(err.to_string().contains("monorepo.object_format"));
+        let converter = MegaModelConverter::init(&mono_config)
+            .expect("blake3 bootstrap must write the initial graph");
+        assert_eq!(converter.commit.id.kind(), HashKind::Blake3);
+        assert_eq!(converter.root_tree.id.kind(), HashKind::Blake3);
+        assert_eq!(converter.commit.id.to_string().len(), 64);
+        assert_eq!(converter.root_tree.id.to_string().len(), 64);
+        assert_eq!(get_hash_kind(), HashKind::Sha1);
     }
 
     #[test]

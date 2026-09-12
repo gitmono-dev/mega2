@@ -2297,16 +2297,16 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_reserved_blake3_monorepo_object_format() {
+    fn config_validate_accepts_blake3_bootstrap_object_format() {
         let mut config = valid_config();
         config.monorepo.object_format = crate::config::MonoObjectFormat::Blake3;
-
-        let err = config
+        config
             .validate()
-            .expect_err("BLAKE3 object IDs remain reserved until repository hash context is wired");
-        let message = err.to_string();
-        assert!(message.contains("monorepo.object_format"));
-        assert!(message.contains("reserved"));
+            .expect("blake3 is valid for bootstrap; normal service is a separate check");
+        config
+            .monorepo
+            .ensure_normal_service_object_format()
+            .expect_err("blake3 must remain bootstrap-only for normal Git services");
     }
 
     #[test]

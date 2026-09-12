@@ -144,10 +144,10 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 
 # Object-ID hash for the repo graph / 仓库图的 Object-ID 哈希.
 # Scenario / 场景: "sha1" is the only wire-compatible choice for a live Git
-# service. "sha256" is bootstrap-only (`service init`), never for normal Git
-# service; "blake3" is reserved until git-internal 0.9.0.
-# 场景:在线 Git 服务只能用 "sha1"."sha256" 仅用于建库那次 bootstrap,不能跑正常
-# Git 服务;"blake3" 要等 git-internal 0.9.0.
+# service. "sha256" and "blake3" are bootstrap-only (`service init`), never for
+# normal Git service.
+# 场景:在线 Git 服务只能用 "sha1"."sha256"/"blake3" 仅用于建库那次 bootstrap,不能跑正常
+# Git 服务.
 object_format = "sha1"
 
 # Push morphology / 推送形态: "review" (CL pipeline) or "trunk" (direct to main).
