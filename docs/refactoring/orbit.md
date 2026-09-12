@@ -207,3 +207,14 @@ monoengine 对 orbit 的"实现 crate 项目引用"实际上**只落在一处**�
 | `Artifact` | `artifact` | 构建产物 |
 | `Attachment` | `attachment` | 附件 |
 | `Oci` | `oci` | OCI Distribution 字节（`blobs/` / `manifests/` / `uploads/`；键布局见 [`oci.md`](./oci.md)，plan-20260902 / DR-04+DR-14） |
+| `Media` | `media` | FastCDC Media 对象（`docs/refactoring/fastcdc-media.md`；plan-20260901 FC-03） |
+
+## Bounded write（2026-09-12，plan-20260901 FC-04）
+
+`MegaObjectStorage::put_stream_bounded` 是 **不缓冲整对象** 的写入入口：
+
+- 默认实现明确返回 unsupported，**不 poll** 输入 stream（避免不支持的 backend 把全流读进内存）。
+- `ObjectStoreAdapter` 覆盖为强制 multipart，**忽略** 配置的 `UploadStrategy::SinglePut`。
+- multipart 聚合成固定 **8 MiB** part，最后一块可更小；stream 错误或 `complete` 失败时 `abort`，不发布半成品。
+- 既有 `put_stream` 策略不变（Git/LFS/Artifact/Attachment 仍走原来的 SinglePut/Multipart/idempotent 分支）。
+

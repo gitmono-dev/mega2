@@ -213,6 +213,23 @@ pub trait MegaObjectStorage: Send + Sync {
         meta: ObjectMeta,
     ) -> OrbitResult<()>;
 
+    /// Upload a large object without buffering the whole stream in memory.
+    ///
+    /// The default implementation returns an explicit error and **does not**
+    /// poll `data`, so unsupported backends cannot accidentally slurp the
+    /// object. `ObjectStoreAdapter` overrides this to force multipart writes
+    /// in 8 MiB parts regardless of configured `SinglePut`.
+    async fn put_stream_bounded(
+        &self,
+        _key: &ObjectKey,
+        _data: ObjectByteStream,
+        _meta: ObjectMeta,
+    ) -> OrbitResult<()> {
+        Err(IoOrbitError::Other(
+            "bounded streaming write is not supported by this storage backend".to_string(),
+        ))
+    }
+
     /// Retrieve a single object from the storage backend.
     ///
     /// # Returns
@@ -369,7 +386,12 @@ pub fn dump_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{pin::Pin, time::Duration};
+
     use ObjectNamespace;
+    use bytes::Bytes;
+    use futures::Stream;
+    use reqwest::Method;
 
     use super::*;
 
@@ -527,5 +549,83 @@ mod tests {
             };
             assert!(key.validate().is_err(), "expected {k:?} to be rejected");
         }
+    }
+
+    struct UnsupportedBoundedStore;
+
+    #[async_trait::async_trait]
+    impl MegaObjectStorage for UnsupportedBoundedStore {
+        async fn put_stream(
+            &self,
+            _key: &ObjectKey,
+            _data: ObjectByteStream,
+            _meta: ObjectMeta,
+        ) -> OrbitResult<()> {
+            Err(IoOrbitError::Other("unused".to_string()))
+        }
+
+        async fn get_stream(
+            &self,
+            _key: &ObjectKey,
+        ) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
+            Err(IoOrbitError::Other("unused".to_string()))
+        }
+
+        async fn get_range_stream(
+            &self,
+            _key: &ObjectKey,
+            _start: u64,
+            _end: Option<u64>,
+        ) -> OrbitResult<(ObjectByteStream, ObjectMeta)> {
+            Err(IoOrbitError::Other("unused".to_string()))
+        }
+
+        async fn exists(&self, _key: &ObjectKey) -> OrbitResult<bool> {
+            Err(IoOrbitError::Other("unused".to_string()))
+        }
+
+        async fn signed_url(
+            &self,
+            _key: &ObjectKey,
+            _method: Method,
+            _expires_in: Duration,
+        ) -> OrbitResult<Option<String>> {
+            Err(IoOrbitError::Other("unused".to_string()))
+        }
+
+        async fn delete(&self, _key: &ObjectKey) -> OrbitResult<()> {
+            Err(IoOrbitError::Other("unused".to_string()))
+        }
+    }
+
+    struct PanicIfPolled;
+
+    impl Stream for PanicIfPolled {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            panic!("default put_stream_bounded must not poll the stream");
+        }
+    }
+
+    #[tokio::test]
+    async fn put_stream_bounded_default_does_not_poll_stream() {
+        let store = UnsupportedBoundedStore;
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Git,
+            key: "abcdef".to_string(),
+        };
+        let data: ObjectByteStream = Box::pin(PanicIfPolled);
+        let err = store
+            .put_stream_bounded(&key, data, ObjectMeta::default())
+            .await
+            .expect_err("unsupported backends must reject bounded write");
+        assert!(
+            err.to_string()
+                .contains("bounded streaming write is not supported")
+        );
     }
 }

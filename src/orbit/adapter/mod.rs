@@ -6,8 +6,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{
-    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion, aws::AmazonS3,
-    gcp::GoogleCloudStorage, local::LocalFileSystem, signer::Signer,
+    MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    aws::AmazonS3, gcp::GoogleCloudStorage, local::LocalFileSystem, signer::Signer,
 };
 use reqwest::Method;
 
@@ -144,6 +144,58 @@ const MAX_APPEND_BYTES: u64 = 128 * 1024 * 1024; // 128 MB
 /// aggregate and return. The read path is not yet streaming, so this bounds its
 /// peak memory; larger reads must be split into smaller ranges.
 const MAX_READ_RANGE_BYTES: u64 = 128 * 1024 * 1024; // 128 MB
+
+/// Fixed multipart part size for [`MegaObjectStorage::put_stream_bounded`].
+pub(crate) const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
+
+async fn finish_multipart(
+    data: ObjectByteStream,
+    upload: &mut dyn MultipartUpload,
+) -> OrbitResult<()> {
+    let res = async {
+        copy_stream_as_fixed_parts(data, upload).await?;
+        upload.complete().await.map_err(IoOrbitError::from)?;
+        Ok::<(), IoOrbitError>(())
+    }
+    .await;
+
+    if res.is_err() {
+        upload.abort().await.map_err(IoOrbitError::from)?;
+    }
+
+    res
+}
+
+async fn copy_stream_as_fixed_parts(
+    mut data: ObjectByteStream,
+    upload: &mut dyn MultipartUpload,
+) -> OrbitResult<()> {
+    let mut part = BytesMut::with_capacity(MULTIPART_PART_SIZE);
+    while let Some(chunk) = data.try_next().await.map_err(IoOrbitError::Io)? {
+        let mut remaining = chunk;
+        while !remaining.is_empty() {
+            let space = MULTIPART_PART_SIZE - part.len();
+            let take = remaining.len().min(space);
+            let piece = remaining.split_to(take);
+            part.extend_from_slice(&piece);
+            if part.len() == MULTIPART_PART_SIZE {
+                let payload = std::mem::take(&mut part).freeze();
+                upload
+                    .put_part(payload.into())
+                    .await
+                    .map_err(IoOrbitError::from)?;
+                part.reserve(MULTIPART_PART_SIZE);
+            }
+        }
+    }
+    if !part.is_empty() {
+        upload
+            .put_part(part.freeze().into())
+            .await
+            .map_err(IoOrbitError::from)?;
+    }
+    Ok(())
+}
 
 /// Rejects a read whose aggregated size would exceed [`MAX_READ_RANGE_BYTES`].
 fn enforce_read_len(len: u64) -> OrbitResult<()> {
@@ -284,7 +336,7 @@ impl ObjectStoreAdapter {
     async fn put_multipart(
         &self,
         path: &object_store::path::Path,
-        mut data: ObjectByteStream,
+        data: ObjectByteStream,
     ) -> OrbitResult<()> {
         let mut upload = self
             .to_store()
@@ -292,25 +344,7 @@ impl ObjectStoreAdapter {
             .await
             .map_err(IoOrbitError::from)?;
 
-        let res = async {
-            while let Some(chunk) = data.try_next().await? {
-                upload
-                    .put_part(chunk.into())
-                    .await
-                    .map_err(IoOrbitError::from)?;
-            }
-
-            upload.complete().await.map_err(IoOrbitError::from)?;
-
-            Ok::<(), IoOrbitError>(())
-        }
-        .await;
-
-        if res.is_err() {
-            upload.abort().await.map_err(IoOrbitError::from)?;
-        }
-
-        res
+        finish_multipart(data, &mut *upload).await
     }
 
     /// Upload an object using a *single PUT* request.
@@ -453,5 +487,169 @@ mod tests {
     fn enforce_read_len_rejects_oversize() {
         assert!(enforce_read_len(MAX_READ_RANGE_BYTES).is_ok());
         assert!(enforce_read_len(MAX_READ_RANGE_BYTES + 1).is_err());
+    }
+
+    #[derive(Debug)]
+    struct RecordingUpload {
+        parts: Vec<usize>,
+        first_part: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for RecordingUpload {
+        fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+            let len: usize = data.iter().map(|b| b.len()).sum();
+            self.parts.push(len);
+            self.first_part
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+                extensions: Default::default(),
+            })
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct GatedStream {
+        state: u8,
+        first_part: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl futures::Stream for GatedStream {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match self.state {
+                0 => {
+                    self.state = 1;
+                    std::task::Poll::Ready(Some(Ok(Bytes::from(vec![1u8; MULTIPART_PART_SIZE]))))
+                }
+                1 => {
+                    assert!(
+                        self.first_part.load(std::sync::atomic::Ordering::SeqCst),
+                        "must finish an 8 MiB part before reading further input"
+                    );
+                    self.state = 2;
+                    std::task::Poll::Ready(Some(Ok(Bytes::from_static(&[2u8]))))
+                }
+                _ => std::task::Poll::Ready(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_aggregates_fixed_parts_with_backpressure() {
+        let first_part = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut upload = RecordingUpload {
+            parts: Vec::new(),
+            first_part: first_part.clone(),
+        };
+        let data: ObjectByteStream = Box::pin(GatedStream {
+            state: 0,
+            first_part: first_part.clone(),
+        });
+        copy_stream_as_fixed_parts(data, &mut upload).await.unwrap();
+        assert_eq!(upload.parts, vec![MULTIPART_PART_SIZE, 1]);
+    }
+
+    #[tokio::test]
+    async fn put_stream_bounded_uses_multipart_even_with_single_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let adapter = ObjectStoreAdapter {
+            store: BackendStore::Local(Arc::new(store)),
+            upload_strategy: UploadStrategy::SinglePut,
+        };
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: "abcdef1234567890".to_string(),
+        };
+        let payload = Bytes::from_static(b"bounded-bytes");
+        let data: ObjectByteStream =
+            Box::pin(stream::iter([Ok::<Bytes, std::io::Error>(payload.clone())]));
+        adapter
+            .put_stream_bounded(&key, data, ObjectMeta::default())
+            .await
+            .unwrap();
+        let (got, _) = adapter.get_stream(&key).await.unwrap();
+        let bytes = ObjectStoreAdapter::buffer_stream(got, 1024).await.unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[tokio::test]
+    async fn put_stream_bounded_aborts_when_stream_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let adapter = ObjectStoreAdapter {
+            store: BackendStore::Local(Arc::new(store)),
+            upload_strategy: UploadStrategy::SinglePut,
+        };
+        let key = ObjectKey {
+            namespace: ObjectNamespace::Lfs,
+            key: "ffffffffffffffff".to_string(),
+        };
+        let data: ObjectByteStream = Box::pin(stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("stream failed")),
+        ]));
+        assert!(
+            adapter
+                .put_stream_bounded(&key, data, ObjectMeta::default())
+                .await
+                .is_err()
+        );
+        assert!(!adapter.exists(&key).await.unwrap());
+    }
+
+    #[derive(Debug)]
+    struct AbortingUpload {
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for AbortingUpload {
+        fn put_part(&mut self, _data: PutPayload) -> object_store::UploadPart {
+            Box::pin(async { Ok(()) })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            Err(object_store::Error::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::other("complete failed")),
+            })
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_aborts_when_complete_fails() {
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut upload = AbortingUpload {
+            aborted: aborted.clone(),
+        };
+        let data: ObjectByteStream = Box::pin(stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"part"))
+        }));
+        assert!(finish_multipart(data, &mut upload).await.is_err());
+        assert!(
+            aborted.load(std::sync::atomic::Ordering::SeqCst),
+            "complete failure must abort so a half-published object is not left behind"
+        );
     }
 }
