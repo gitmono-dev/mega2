@@ -1,6 +1,8 @@
 pub mod lock;
+pub mod snowflake_worker;
 
 pub use ::redis::{AsyncCommands, aio::ConnectionManager};
+pub use snowflake_worker::claim_snowflake_worker;
 
 use crate::{
     common::errors::MegaError,
@@ -8,6 +10,7 @@ use crate::{
         RedisConfig, redaction::redact_redis_url, secret::is_secret_ref_value,
         validate::validate_redis_config,
     },
+    jupiter::utils::id_generator,
 };
 
 /// How many times [`init_connection`] has been called, per URL.
@@ -61,9 +64,23 @@ pub async fn init_connection(config: &RedisConfig) -> Result<ConnectionManager, 
     let redis_url = redact_redis_url(&config.url);
     let client = ::redis::Client::open(config.url.as_str())
         .map_err(|e| MegaError::Other(format!("failed to open Redis URL {redis_url}: {e}")))?;
-    ConnectionManager::new(client)
+    let conn = ConnectionManager::new(client)
         .await
-        .map_err(|e| MegaError::Other(format!("failed to connect to Redis at {redis_url}: {e}")))
+        .map_err(|e| MegaError::Other(format!("failed to connect to Redis at {redis_url}: {e}")))?;
+
+    if id_generator::resolve_worker_id_from(
+        std::env::var(id_generator::ENV_WORKER_ID).ok().as_deref(),
+        None,
+        "",
+    )
+    .1 != id_generator::WorkerIdSource::Env
+        && let Some(id) = claim_snowflake_worker(&conn).await
+    {
+        let _ = id_generator::claim_worker_id(id);
+    }
+    id_generator::ensure_initialized();
+
+    Ok(conn)
 }
 
 #[cfg(test)]

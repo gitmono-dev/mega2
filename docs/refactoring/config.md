@@ -90,6 +90,29 @@ There is no `[mail]` section, `MailConfig`, `mail.password` SecretRef, or
 `MEGA_MAIL__*` environment override. These removed inputs are rejected rather
 than silently ignored.
 
+## Snowflake worker ID
+
+`idgenerator` 2.0.0 allows at most 22 bits for `worker_id_bit_len + seq_bit_len`.
+Mega's target layout is 8+8 (256 workers, timestamp shift 16). This process
+keeps the existing 6+8 layout (64 workers, shift 14) because ADR-FC-04 forbids
+mixing old and new writers, and this deploy cannot fence every previous
+`worker_id(1)` process before the new bits go live.
+
+Worker id is chosen once at startup, in order:
+
+1. `MEGA_ID_GENERATOR_WORKER_ID` when it parses as an integer in `0..=63`.
+   Invalid or out-of-range values log a warning (not the raw value) and fall
+   through.
+2. Redis `SET NX PX` on `monoengine:snowflake:worker:<id>` with a 30s TTL.
+   The owner refreshes with a compare-and-PEXPIRE token every 15s. Redis
+   errors or a full 0..=63 map fall through.
+3. Stable FNV-1a of `POD_UID`, else `HOSTNAME`, else `monoengine-local`,
+   reduced into `0..=63`.
+
+ID generation after init does not talk to Redis. Logs include source
+(`Env`/`Redis`/`Hash`), worker id, bit lengths, and process identity — never
+the lease token, Redis URL, or pod secrets.
+
 ## Notification settings
 
 Notification configuration controls monoengine-owned delivery such as in-app,

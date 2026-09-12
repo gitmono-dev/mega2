@@ -20,8 +20,10 @@ use idgenerator::IdInstance;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 
+use crate::jupiter::utils::id_generator;
+
 pub fn generate_id() -> i64 {
-    // Call `next_id` to generate a new unique id.
+    id_generator::ensure_initialized();
     IdInstance::next_id()
 }
 
