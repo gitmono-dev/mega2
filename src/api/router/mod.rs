@@ -10,6 +10,8 @@ pub mod conv_router;
 pub mod gpg_router;
 pub mod group_router;
 pub mod label_router;
+#[cfg(feature = "fastcdc")]
+pub mod lfs_media;
 pub mod lfs_router;
 pub mod merge_queue_router;
 pub mod oci_router;

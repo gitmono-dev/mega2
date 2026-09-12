@@ -362,7 +362,9 @@ LFS router 同时暴露：
 - `/api/v1/lfs/...`
 - `/info/lfs/...`
 
-HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/info/lfs/...` 重写到 LFS runtime router。SSH 下 `git-lfs-authenticate` 会返回 HTTP LFS URL，让 Git LFS 客户端走 hybrid 模式。
+HTTP server 还包含 `rewrite_lfs_request_uri`，用于把 repo path 下的 `/info/lfs/...` 重写到 LFS runtime router，并在改写前把仓库前缀写入 `LfsRepoContext`。SSH 下 `git-lfs-authenticate` 会返回 HTTP LFS URL，让 Git LFS 客户端走 hybrid 模式。
+
+开启 `fastcdc` Cargo feature 时，同一 LFS mount 额外提供 Libra FastCDC Media API：`<repo>.git/info/lfs/libra/media/v1/...`（不是无 `libra/` 前缀的 `media/v1`，也不是 Git LFS 扩展）。每条 Media 路由（含 capabilities）都要求 Bearer `AccessTokenUser`，不复用 objects 传输 URL 的「batch 后可不再认证」例外。关闭 feature 时这些路由不存在（404），既有 LFS batch/objects/locks 行为不变。协议细节见 [`fastcdc-media.md`](fastcdc-media.md)。
 
 ## 主要兼容性问题
 

@@ -12,14 +12,18 @@
 - HTTP 形状（路由由 FC-07 注册，路径以 Libra client 为准）：
   - capabilities：`GET <repo>.git/info/lfs/libra/media/v1/capabilities`
   - prepare：`POST …/manifests` → `{manifest_id, missing_chunks}`
+  - upload：`PUT …/manifests/{id}/chunks/{hash}`（`application/octet-stream`）
+  - finalize：`POST …/manifests/{id}/finalize`
   - get：`GET …/manifests/by-media/{oid}` → `{manifest_id, manifest}`
+  - chunk download：`GET …/manifests/by-media/{oid}/chunks/{hash}`
 
 ## Scope / key（FC-03）
 
 - Namespace 字符串 `media` 只追加，不改 git/lfs/log/artifact/attachment/oci。
-- Scope = 服务端 actor（`website_user_id`）+ canonical 绝对仓库路径；digest = SHA-256(`actor || 0x00 || repo`)。
+- Scope = 服务端 actor + canonical 绝对仓库路径；digest = SHA-256(`actor || 0x00 || repo`)。
+  Actor 取 `AccessTokenUser` 的 `website_user_id`（非空）否则 `username`。请求体 actor/repository/`created_by` 不得覆盖。
 - Object key：`v1/{scope_digest}/{pending|chunk|manifest|finalized}/{id}`，存储路径 `media/` + key（Media 不走 3-level sharding）。
-- 请求体 actor/repository/`created_by` 不得覆盖 scope。对外错误不泄漏 digest、object key 或认证信息。
+- 对外错误不泄漏 digest、object key 或认证信息。
 
 ## 生命周期（FC-05 prepare / upload / resume）
 
@@ -37,5 +41,15 @@
 - 缺失或损坏 chunk：**不**写 LFS namespace、**不**写 `lfs_objects`、**不**发布 finalized manifest；临时文件在成功和失败路径都删除。
 - 通过后：`put_stream_bounded` 发布到 `lfs/{oid}`，`lfs_objects` 以 `ON CONFLICT (oid) DO NOTHING` 幂等插入，重新读取 metadata 并确认对象存在，然后才写 `media/v1/{scope}/finalized/{media_oid}`。
 - 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
+
+## HTTP / auth / OpenAPI（FC-07）
+
+- Feature-on 时挂在当前 LFS mount 下：逻辑前缀 `libra/media/v1`。仓库 URL `<repo>.git` 的外部路径是 `<repo>.git/info/lfs/libra/media/v1/...`；OpenAPI 登记为 `/api/v1/lfs/libra/media/v1/...`。Feature-off 不注册这些路由（运行时 404，schema 中也不出现）。
+- **每一条** Media 路由（含 capabilities）都要求 `AccessTokenUser`（Bearer）。不复用标准 LFS objects 的「batch 后裸 URL 可不再认证」例外。
+- 仓库路径取 URI 改写前保存在 `LfsRepoContext` 的原始前缀（例如 `/acme/app.git`）。缺少合法前缀 → 400。
+- Body 上限在 handler 前拒绝：JSON/manifest 路由 `DefaultBodyLimit` 10 MiB；chunk PUT 路由 8 MiB。另有 `Content-Length` 中间件在读 body 前返回 413。
+- 错误：Invalid/Json → 400，NotFound → 404，Conflict → 409，Storage/Io → 500 且 body 固定 `media object store error`。
+- Capabilities JSON 来自 `Capabilities::v1()`：`fastcdc-v1`、sha256、上限、`supports_batch_exists`、`supports_standard_lfs_fallback`。
+- 普通 LFS `/objects`、`/locks`、`/objects/batch` 行为不变。
 
 固定 fixture：`src/ceres/lfs/media/fixtures/`（合法 `valid_v1.json` / 空文件 `empty.json` / 非法 version 与 fallback）。`valid_v1.json` 字节 SHA-256：`20226243095e92274b3683f4c09bcd12ae35d245b073b38296a2a895c13b8c9d`。

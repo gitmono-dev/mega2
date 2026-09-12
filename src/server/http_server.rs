@@ -819,8 +819,9 @@ pub(crate) fn trunk_openapi_doc(include_oci: bool) -> utoipa::openapi::OpenApi {
 
 fn rewrite_lfs_request_uri<B>(mut req: Request<B>) -> Request<B> {
     // Capture the repository path prefix (the segment before `/info/lfs/`)
-    // before it is stripped for routing, so LFS handlers can namespace locks
-    // per repository. Empty when the request carries no repo prefix.
+    // before it is stripped for routing, so LFS locks and FastCDC Media
+    // handlers can namespace per repository. Empty when the request carries
+    // no repo prefix. Media requires a non-empty canonical prefix (FC-07).
     let (repo_prefix, rewrite_target) = {
         let full_path = req.uri().path();
         match full_path.rfind("/info/lfs/") {
@@ -1169,6 +1170,37 @@ mod tests {
         let new_req = rewrite_lfs_request_uri(req);
 
         assert_eq!(new_req.uri().path(), "/info/lfs/objects/123");
+    }
+
+    #[test]
+    fn rewrite_media_path_keeps_repo_prefix_and_standard_lfs_shape() {
+        let media = Request::builder()
+            .uri("/acme/app.git/info/lfs/libra/media/v1/capabilities")
+            .body(())
+            .unwrap();
+        let media = rewrite_lfs_request_uri(media);
+        assert_eq!(media.uri().path(), "/info/lfs/libra/media/v1/capabilities");
+        assert_eq!(
+            media
+                .extensions()
+                .get::<crate::api::router::lfs_router::LfsRepoContext>()
+                .map(|c| c.0.as_str()),
+            Some("/acme/app.git")
+        );
+
+        let objects = Request::builder()
+            .uri("/acme/app.git/info/lfs/objects/batch")
+            .body(())
+            .unwrap();
+        let objects = rewrite_lfs_request_uri(objects);
+        assert_eq!(objects.uri().path(), "/info/lfs/objects/batch");
+        assert_eq!(
+            objects
+                .extensions()
+                .get::<crate::api::router::lfs_router::LfsRepoContext>()
+                .map(|c| c.0.as_str()),
+            Some("/acme/app.git")
+        );
     }
 
     #[test]

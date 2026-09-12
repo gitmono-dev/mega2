@@ -80,8 +80,8 @@ const LFS_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 /// The repository path prefix of an LFS request (the segment before
 /// `/info/lfs/`), captured by `rewrite_lfs_request_uri` before that prefix is
 /// stripped for routing. Empty when the request did not carry a repo prefix
-/// (e.g. the internal `/api/v1/lfs` mount). Used to namespace LFS locks per
-/// repository so identical ref names in different repos do not collide.
+/// (e.g. the internal `/api/v1/lfs` mount). Used to namespace LFS locks and
+/// FastCDC Media object keys per repository.
 #[derive(Clone, Debug, Default)]
 pub struct LfsRepoContext(pub String);
 
@@ -95,14 +95,17 @@ fn lfs_repo_path(ctx: Option<Extension<LfsRepoContext>>) -> String {
 }
 
 pub fn lfs_routes() -> OpenApiRouter<MonoApiServiceState> {
-    OpenApiRouter::new()
+    let router = OpenApiRouter::new()
         .routes(routes!(lfs_upload_object))
         .routes(routes!(lfs_download_object))
         .routes(routes!(list_locks))
         .routes(routes!(create_lock))
         .routes(routes!(list_locks_for_verification))
         .routes(routes!(delete_lock))
-        .routes(routes!(lfs_process_batch))
+        .routes(routes!(lfs_process_batch));
+    #[cfg(feature = "fastcdc")]
+    let router = router.merge(crate::api::router::lfs_media::media_routes());
+    router
 }
 
 /// The [LFS Server Discovery](https://github.com/git-lfs/git-lfs/blob/main/docs/api/server-discovery.md)
@@ -1091,5 +1094,79 @@ mod tests {
         // Routes should be created without panicking
         // This is a smoke test to ensure route registration works
         drop(routes);
+    }
+
+    fn lfs_openapi_paths() -> Vec<String> {
+        routers()
+            .split_for_parts()
+            .1
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(not(feature = "fastcdc"))]
+    #[tokio::test]
+    async fn feature_off_openapi_omits_media_and_path_is_404() {
+        let paths = lfs_openapi_paths();
+        assert!(
+            paths.iter().all(|p| !p.contains("libra/media")),
+            "feature-off OpenAPI must not list Media routes: {paths:?}"
+        );
+
+        use std::sync::Arc;
+
+        use axum::{Router, body::Body, http::Request};
+        use tower::ServiceExt;
+
+        use crate::{
+            api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+            bellatrix::Bellatrix,
+            ceres::api_service::cache::GitObjectCache,
+            contract::policy::entitystore::SharedEntityStore,
+            jupiter::storage::Storage,
+        };
+
+        let storage = Storage::mock();
+        let state = MonoApiServiceState {
+            session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "lfs-media-off".to_owned(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_owned(),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            bellatrix: Arc::new(Bellatrix::new(storage.config().build.clone())),
+            storage,
+        };
+        let lfs: Router = lfs_routes().with_state(state).into();
+        let app = Router::new().nest("/info/lfs", lfs);
+        let response = app
+            .oneshot(
+                Request::get("/info/lfs/libra/media/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "fastcdc")]
+    #[test]
+    fn feature_on_openapi_lists_media_under_lfs_mount() {
+        let paths = lfs_openapi_paths();
+        assert!(
+            paths
+                .iter()
+                .any(|p| p == "/api/v1/lfs/libra/media/v1/capabilities"),
+            "feature-on OpenAPI must list Media: {paths:?}"
+        );
     }
 }
