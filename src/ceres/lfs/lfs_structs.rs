@@ -4,7 +4,11 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::callisto::lfs_objects;
+use crate::{
+    callisto::lfs_objects,
+    ceres::lfs::digest::{LfsDigest, LfsDigestAlgorithm, lfs_blake3_business_path},
+    common::errors::MegaError,
+};
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Serialize, Deserialize, Debug, Default, ToSchema)]
@@ -92,6 +96,12 @@ pub struct RequestObject {
     pub authorization: String,
 }
 
+impl RequestObject {
+    pub fn parse_lfs_digest(&self, algorithm: LfsDigestAlgorithm) -> Result<LfsDigest, MegaError> {
+        LfsDigest::from_hex_for_algorithm(algorithm, &self.oid)
+    }
+}
+
 /// User information for lock ownership
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, ToSchema)]
 pub struct LockUser {
@@ -116,7 +126,29 @@ pub struct BatchRequest {
     // If omitted, the basic transfer adapter MUST be assumed by the server.
     pub transfers: Vec<String>,
     pub objects: Vec<RequestObject>,
+    #[serde(default)]
     pub hash_algo: String,
+}
+
+impl BatchRequest {
+    /// Git LFS `hash_algo` (empty → spec default sha256). Not derived from Git object format.
+    pub fn lfs_digest_algorithm(&self) -> Result<LfsDigestAlgorithm, MegaError> {
+        if self.hash_algo.is_empty() {
+            Ok(LfsDigestAlgorithm::Sha256)
+        } else {
+            LfsDigestAlgorithm::parse_name(&self.hash_algo)
+        }
+    }
+
+    /// Fail-closed digest domain for a batch: explicit algorithm, valid OID widths, no LFS BLAKE3 business path.
+    pub fn prepare_digest_domain(&self) -> Result<LfsDigestAlgorithm, MegaError> {
+        let algorithm = self.lfs_digest_algorithm()?;
+        lfs_blake3_business_path(algorithm)?;
+        for object in &self.objects {
+            object.parse_lfs_digest(algorithm)?;
+        }
+        Ok(algorithm)
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

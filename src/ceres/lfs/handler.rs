@@ -6,14 +6,16 @@ use chrono::prelude::*;
 use futures::{Stream, StreamExt};
 use rand::prelude::*;
 use reqwest::Method;
-use sha2::{Digest, Sha256};
 
 use crate::{
     callisto::lfs_locks,
-    ceres::lfs::lfs_structs::{
-        BatchRequest, BatchResponse, Lock, LockList, LockListQuery, LockRequest, MetaObject,
-        ObjectError, Operation, RequestObject, ResCondition, ResponseObject, TransferMode,
-        UnlockRequest, VerifiableLockList, VerifiableLockRequest,
+    ceres::lfs::{
+        digest::{LfsDigest, LfsDigestAlgorithm},
+        lfs_structs::{
+            BatchRequest, BatchResponse, Lock, LockList, LockListQuery, LockRequest, MetaObject,
+            ObjectError, Operation, RequestObject, ResCondition, ResponseObject, TransferMode,
+            UnlockRequest, VerifiableLockList, VerifiableLockRequest,
+        },
     },
     common::errors::{GitLFSError, MegaError},
     jupiter::{
@@ -207,12 +209,19 @@ pub async fn lfs_process_batch(
     request: BatchRequest,
     listen_addr: &str,
 ) -> Result<BatchResponse, GitLFSError> {
+    let algorithm = request
+        .prepare_digest_domain()
+        .map_err(|e| GitLFSError::GeneralError(e.to_string()))?;
     let objects = request.objects;
 
     let mut response_objects = Vec::new();
     let file_storage = service.obj_storage.clone();
     let db_storage = service.lfs_storage.clone();
-    for object in objects {
+    for mut object in objects {
+        let digest = object
+            .parse_lfs_digest(algorithm)
+            .map_err(|e| GitLFSError::GeneralError(e.to_string()))?;
+        object.oid = digest.hex().to_string();
         let meta_res = lfs_get_meta(&db_storage, &object.oid).await?;
         let meta = match meta_res {
             Some(meta) => meta,
@@ -282,7 +291,7 @@ pub async fn lfs_process_batch(
     Ok(BatchResponse {
         transfer: TransferMode::BASIC,
         objects: response_objects,
-        hash_algo: "sha256".to_string(),
+        hash_algo: algorithm.as_str().to_string(),
     })
 }
 
@@ -295,7 +304,9 @@ pub async fn lfs_upload_object(
 ) -> Result<(), GitLFSError> {
     let db_storage: LfsDbStorage = service.lfs_storage.clone();
 
-    let meta = if let Some(meta) = lfs_get_meta(&db_storage, &req_obj.oid).await? {
+    let claimed = LfsDigest::from_hex_for_algorithm(LfsDigestAlgorithm::Sha256, &req_obj.oid)
+        .map_err(|e| GitLFSError::GeneralError(e.to_string()))?;
+    let meta = if let Some(meta) = lfs_get_meta(&db_storage, claimed.hex()).await? {
         tracing::debug!("upload lfs object {} size: {}", meta.oid, meta.size);
         meta
     } else {
@@ -316,14 +327,11 @@ pub async fn lfs_upload_object(
             meta.oid
         )));
     }
-    let digest = {
-        let mut hasher = Sha256::new();
-        hasher.update(&body_bytes);
-        hex::encode(hasher.finalize())
-    };
-    if digest != meta.oid {
+    let digest = LfsDigest::sha256_of(&body_bytes);
+    if digest.hex() != meta.oid {
         return Err(GitLFSError::GeneralError(format!(
-            "Invalid LFS upload: content hash {digest} does not match oid {}",
+            "Invalid LFS upload: content hash {} does not match oid {}",
+            digest.hex(),
             meta.oid
         )));
     }
@@ -716,8 +724,13 @@ async fn delete_lock(
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
-    use crate::ceres::lfs::lfs_structs::{Action, Ref, ResCondition, ResponseObject};
+    use crate::{
+        ceres::lfs::lfs_structs::{Action, Ref, ResCondition, ResponseObject},
+        jupiter::storage::object_storage::mock_object_storage,
+    };
 
     fn lock(id: &str) -> Lock {
         Lock {
@@ -864,8 +877,6 @@ mod tests {
 
     #[tokio::test]
     async fn lfs_upload_rejects_content_not_matching_oid() {
-        use crate::jupiter::storage::object_storage::mock_object_storage;
-
         let temp = tempfile::tempdir().unwrap();
         let storage = crate::jupiter::tests::test_storage(temp.path()).await;
         let service = LfsService {
@@ -991,5 +1002,94 @@ mod tests {
         let req = UnlockRequest::default();
         assert!(req.force.is_none());
         assert_eq!(req.refs, Ref { name: "".into() });
+    }
+
+    #[tokio::test]
+    async fn b3_02a_batch_rejects_blake3_and_wrong_width_oids() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let service = LfsService {
+            lfs_storage: storage.lfs_db_storage(),
+            obj_storage: mock_object_storage(),
+        };
+        let oid = LfsDigest::sha256_of(b"").hex().to_string();
+
+        let blake3_err = match lfs_process_batch(
+            &service,
+            BatchRequest {
+                operation: Operation::Upload,
+                transfers: Vec::new(),
+                objects: vec![RequestObject {
+                    oid: oid.clone(),
+                    size: 0,
+                    ..Default::default()
+                }],
+                hash_algo: "blake3".to_string(),
+            },
+            "127.0.0.1:0",
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("blake3 batch must not enter LFS business path"),
+        };
+        assert!(
+            blake3_err.to_string().contains("DEFER-B3-LFS-01"),
+            "{blake3_err}"
+        );
+
+        let width_err = match lfs_process_batch(
+            &service,
+            BatchRequest {
+                operation: Operation::Upload,
+                transfers: Vec::new(),
+                objects: vec![RequestObject {
+                    oid: "a".repeat(40),
+                    size: 0,
+                    ..Default::default()
+                }],
+                hash_algo: "sha256".to_string(),
+            },
+            "127.0.0.1:0",
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("wrong-width oid must fail closed"),
+        };
+        assert!(
+            width_err.to_string().contains("width mismatch"),
+            "{width_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn b3_02a_batch_echoes_sha256_hash_algo() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::jupiter::tests::test_storage(temp.path()).await;
+        let service = LfsService {
+            lfs_storage: storage.lfs_db_storage(),
+            obj_storage: mock_object_storage(),
+        };
+        let oid = LfsDigest::sha256_of(b"lfs-batch").hex().to_string();
+        let response = lfs_process_batch(
+            &service,
+            BatchRequest {
+                operation: Operation::Upload,
+                transfers: Vec::new(),
+                objects: vec![RequestObject {
+                    oid: oid.clone(),
+                    size: 9,
+                    ..Default::default()
+                }],
+                hash_algo: String::new(),
+            },
+            "127.0.0.1:0",
+        )
+        .await
+        .expect("standard sha256 batch");
+        assert_eq!(response.hash_algo, "sha256");
+        assert_eq!(response.objects.len(), 1);
+        assert_eq!(response.objects[0].oid, oid);
     }
 }
