@@ -135,8 +135,13 @@ impl server::Handler for SshServer {
 
         match exec.kind {
             SshExecKind::Git(service_type) => {
-                let mut smart_protocol =
-                    SmartSession::new(exec.repo_path, service_type, TransportProtocol::Ssh);
+                let mut smart_protocol = SmartSession::from_state(
+                    exec.repo_path,
+                    service_type,
+                    TransportProtocol::Ssh,
+                    &self.state,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 if let Some(username) = self.authenticated_user.clone() {
                     smart_protocol.set_authenticated_user(username);
                 }
@@ -174,7 +179,7 @@ impl server::Handler for SshServer {
 
                 let is_v2 = self.v2_channels.get(&channel).copied().unwrap_or(false);
                 if is_v2 && service_type == ServiceType::UploadPack {
-                    let v2_adv = v2::build_v2_capability_advertisement();
+                    let v2_adv = v2::build_v2_capability_advertisement(smart_protocol.hash_kind);
                     self.channels.insert(
                         channel,
                         GitSshChannelState {

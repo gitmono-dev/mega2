@@ -6,7 +6,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use import_refs::RefCommand;
+use git_internal::hash::HashKind;
+use import_refs::{RefCommand, Refs};
 use repo::Repo;
 use tokio::sync::RwLock;
 
@@ -18,7 +19,7 @@ use crate::{
     },
     common::{
         errors::{MegaError, ProtocolError},
-        utils::{ZERO_ID, canonicalize_mono_ref_path},
+        utils::{ZERO_ID, canonicalize_mono_ref_path, is_full_hex_object_id},
     },
 };
 
@@ -47,6 +48,8 @@ pub struct SmartSession {
     pub transport_protocol: TransportProtocol,
     pub auth: AuthContext,
     pub capabilities: HashSet<Capability>,
+    /// Authoritative repository object hash kind (`MonoConfig.object_hash_kind()`).
+    pub hash_kind: HashKind,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Default)]
@@ -121,6 +124,10 @@ impl FromStr for Capability {
     }
 }
 
+pub(crate) fn hex_object_id_matches_kind(hex: &str, kind: HashKind) -> bool {
+    hex.len() == kind.hex_len() && is_full_hex_object_id(hex)
+}
+
 fn repo_path_to_str(path: &Path) -> Result<&str, ProtocolError> {
     path.to_str()
         .ok_or_else(|| ProtocolError::InvalidInput("repository path is not valid UTF-8".to_owned()))
@@ -163,7 +170,59 @@ impl SmartSession {
                 authenticated_user: None,
             },
             capabilities: HashSet::new(),
+            hash_kind: HashKind::Sha1,
         }
+    }
+
+    pub fn with_hash_kind(mut self, hash_kind: HashKind) -> Self {
+        self.hash_kind = hash_kind;
+        self
+    }
+
+    pub fn hash_kind_from_state(state: &ProtocolApiState) -> Result<HashKind, ProtocolError> {
+        state
+            .storage
+            .config()
+            .monorepo
+            .object_hash_kind()
+            .map_err(|e| ProtocolError::InvalidInput(e.to_string()))
+    }
+
+    pub fn from_state(
+        repo_path: PathBuf,
+        service_type: ServiceType,
+        transport_protocol: TransportProtocol,
+        state: &ProtocolApiState,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self::new(repo_path, service_type, transport_protocol)
+            .with_hash_kind(Self::hash_kind_from_state(state)?))
+    }
+
+    pub fn ensure_object_id_hex(&self, hex: &str, what: &str) -> Result<(), ProtocolError> {
+        if hex == ZERO_ID {
+            return Ok(());
+        }
+        if hex_object_id_matches_kind(hex, self.hash_kind) {
+            return Ok(());
+        }
+        Err(ProtocolError::InvalidInput(format!(
+            "{what} object id width {} is incompatible with object-format {} (expected {} hex chars); object-format changes do not convert existing repositories",
+            hex.len(),
+            self.hash_kind.as_str(),
+            self.hash_kind.hex_len(),
+        )))
+    }
+
+    pub fn ensure_advertised_object_ids(
+        &self,
+        head_hash: &str,
+        refs: &[Refs],
+    ) -> Result<(), ProtocolError> {
+        self.ensure_object_id_hex(head_hash, "HEAD")?;
+        for git_ref in refs {
+            self.ensure_object_id_hex(&git_ref.ref_hash, &git_ref.ref_name)?;
+        }
+        Ok(())
     }
 
     pub fn set_authenticated_user(&mut self, username: String) {
@@ -278,5 +337,29 @@ mod tests {
         let path = PathBuf::from("/tmp/repo.git");
 
         assert_eq!(repo_path_to_str(&path).unwrap(), "/tmp/repo.git");
+    }
+
+    #[test]
+    fn injected_kind_rejects_wrong_root_ref_hex_width() {
+        let sha1_id = "a".repeat(40);
+        let sha256_id = "b".repeat(64);
+        assert!(hex_object_id_matches_kind(&sha1_id, HashKind::Sha1));
+        assert!(!hex_object_id_matches_kind(&sha1_id, HashKind::Sha256));
+        assert!(hex_object_id_matches_kind(&sha256_id, HashKind::Sha256));
+        assert!(!hex_object_id_matches_kind(&sha256_id, HashKind::Sha1));
+
+        let session = SmartSession::new(
+            PathBuf::from("/tmp/repo.git"),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        )
+        .with_hash_kind(HashKind::Sha256);
+        let err = session
+            .ensure_object_id_hex(&sha1_id, "HEAD")
+            .expect_err("40-hex HEAD is incompatible with injected sha256");
+        assert!(err.to_string().contains("object-format sha256"), "{err}");
+        session
+            .ensure_object_id_hex(&sha256_id, "HEAD")
+            .expect("64-hex HEAD matches sha256");
     }
 }

@@ -4446,8 +4446,18 @@ impl MonoApiService {
             .ok_or_else(|| MegaError::Other("Invalid UTF-8 in mega_path".to_string()))?
             .to_string();
 
-        let mut protocol =
-            SmartSession::new(mega_path, ServiceType::ReceivePack, TransportProtocol::Http);
+        let state = ProtocolApiState {
+            storage: self.storage.clone(),
+            git_object_cache: self.git_object_cache.clone(),
+            entity_store: self.storage.entity_store(),
+        };
+        let mut protocol = SmartSession::from_state(
+            mega_path,
+            ServiceType::ReceivePack,
+            TransportProtocol::Http,
+            &state,
+        )
+        .map_err(|e| MegaError::Other(format!("{e}")))?;
 
         // Populate commands so `git_receive_pack_stream` can update import refs.
         // old_id: current ref hash if exists; otherwise ZERO_ID (create).
@@ -4468,11 +4478,6 @@ impl MonoApiService {
             ref_hash.clone(),
             ref_name.clone(),
         )];
-        let state = ProtocolApiState {
-            storage: self.storage.clone(),
-            git_object_cache: self.git_object_cache.clone(),
-            entity_store: self.storage.entity_store(),
-        };
         let bytes = protocol
             .git_receive_pack_stream(
                 &state,

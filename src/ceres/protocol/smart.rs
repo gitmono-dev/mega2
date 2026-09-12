@@ -7,6 +7,7 @@ use std::{
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::Stream;
+use git_internal::hash::HashKind;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
@@ -41,11 +42,12 @@ const COMMON_CAP_LIST: &str = "side-band-64k ofs-delta agent=mega/0.1.0";
 // All other capabilities are only recognized by the upload-pack (fetch from server) process.
 const UPLOAD_CAP_LIST: &str = "multi_ack_detailed no-done shallow ";
 
-fn advertised_capabilities(service_type: ServiceType) -> String {
-    match service_type {
+fn advertised_capabilities(service_type: ServiceType, hash_kind: HashKind) -> String {
+    let caps = match service_type {
         ServiceType::UploadPack => format!("{UPLOAD_CAP_LIST}{COMMON_CAP_LIST}"),
         ServiceType::ReceivePack => format!("{RECEIVE_CAP_LIST}{COMMON_CAP_LIST}"),
-    }
+    };
+    format!("{caps} object-format={}", hash_kind.as_str())
 }
 
 impl SmartSession {
@@ -79,12 +81,13 @@ impl SmartSession {
 
         // The stream MUST include capability declarations behind a NUL on the first ref.
         let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
+        self.ensure_advertised_object_ids(&head_hash, &git_refs)?;
         let name = if head_hash == ZERO_ID {
             "capabilities^{}"
         } else {
             "HEAD"
         };
-        let cap_list = advertised_capabilities(service_type);
+        let cap_list = advertised_capabilities(service_type, self.hash_kind);
         let pkt_line = format!("{head_hash}{SP}{name}{NUL}{cap_list}{LF}");
         let mut ref_list = vec![pkt_line];
 
@@ -806,6 +809,7 @@ pub mod test {
 
     use bytes::{BufMut, Bytes, BytesMut};
     use futures::future;
+    use git_internal::hash::HashKind;
     use tempfile::TempDir;
     use tokio::{task, time::sleep};
 
@@ -1137,7 +1141,7 @@ pub mod test {
 
     #[test]
     pub fn receive_pack_advertises_only_supported_baseline_capabilities() {
-        let caps = advertised_capabilities(ServiceType::ReceivePack);
+        let caps = advertised_capabilities(ServiceType::ReceivePack, HashKind::Sha1);
         let tokens = caps.split_whitespace().collect::<Vec<_>>();
 
         assert!(tokens.contains(&"report-status"));
@@ -1153,7 +1157,7 @@ pub mod test {
 
     #[test]
     pub fn upload_pack_does_not_advertise_unimplemented_include_tag() {
-        let caps = advertised_capabilities(ServiceType::UploadPack);
+        let caps = advertised_capabilities(ServiceType::UploadPack, HashKind::Sha1);
         let tokens = caps.split_whitespace().collect::<Vec<_>>();
 
         assert!(tokens.contains(&"multi_ack_detailed"));
@@ -1299,15 +1303,58 @@ pub mod test {
     }
 
     #[test]
-    pub fn advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format() {
+    pub fn b3_02_capability_uses_injected_sha1_kind() {
         for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
-            let caps = advertised_capabilities(service);
+            let caps = advertised_capabilities(service, HashKind::Sha1);
             let tokens = caps.split_whitespace().collect::<Vec<_>>();
             assert!(
-                !tokens.iter().any(|t| t.starts_with("object-format")),
-                "object-format must not be advertised for a SHA-1-only server ({service:?}): {caps}"
+                tokens.contains(&"object-format=sha1"),
+                "injected Sha1 must advertise object-format=sha1 ({service:?}): {caps}"
+            );
+            assert!(
+                !tokens
+                    .iter()
+                    .any(|t| *t == "object-format=sha256" || *t == "object-format=blake3"),
+                "Sha1 advertisement must not leak another object-format ({service:?}): {caps}"
             );
         }
+
+        let sha256 = advertised_capabilities(ServiceType::UploadPack, HashKind::Sha256);
+        assert!(
+            sha256.contains("object-format=sha256"),
+            "injected Sha256 must drive capability construction: {sha256}"
+        );
+        assert!(
+            !sha256.contains("object-format=sha1"),
+            "injected Sha256 must not fall back to a sha1 literal: {sha256}"
+        );
+
+        let session = SmartSession::new(
+            std::path::PathBuf::new(),
+            ServiceType::UploadPack,
+            TransportProtocol::Http,
+        )
+        .with_hash_kind(HashKind::Sha256);
+        assert_eq!(session.hash_kind, HashKind::Sha256);
+        assert_eq!(session.hash_kind.as_str(), "sha256");
+
+        let v2_sha1 = crate::ceres::protocol::v2::build_v2_capability_advertisement(HashKind::Sha1);
+        let v2_sha1 = String::from_utf8_lossy(&v2_sha1);
+        assert!(
+            v2_sha1.contains("object-format=sha1"),
+            "v2 Sha1 advertisement: {v2_sha1}"
+        );
+        let v2_sha256 =
+            crate::ceres::protocol::v2::build_v2_capability_advertisement(HashKind::Sha256);
+        let v2_sha256 = String::from_utf8_lossy(&v2_sha256);
+        assert!(
+            v2_sha256.contains("object-format=sha256"),
+            "v2 injected kind must not stay a sha1 literal: {v2_sha256}"
+        );
+        assert!(
+            !v2_sha256.contains("object-format=sha1"),
+            "v2 Sha256 advertisement must not include sha1: {v2_sha256}"
+        );
     }
 
     #[test]
@@ -1334,14 +1381,14 @@ pub mod test {
 
     #[test]
     pub fn upload_pack_advertises_shallow_capability() {
-        let caps = advertised_capabilities(ServiceType::UploadPack);
+        let caps = advertised_capabilities(ServiceType::UploadPack, HashKind::Sha1);
         let tokens = caps.split_whitespace().collect::<Vec<_>>();
         assert!(tokens.contains(&"shallow"));
     }
 
     #[test]
     pub fn receive_pack_does_not_advertise_shallow() {
-        let caps = advertised_capabilities(ServiceType::ReceivePack);
+        let caps = advertised_capabilities(ServiceType::ReceivePack, HashKind::Sha1);
         let tokens = caps.split_whitespace().collect::<Vec<_>>();
         assert!(!tokens.contains(&"shallow"));
     }

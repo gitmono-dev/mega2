@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use git_internal::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{blob::Blob, commit::Commit, tag::Tag, tree::Tree},
@@ -61,6 +61,10 @@ pub struct ImportRepo {
 impl RepoHandler for ImportRepo {
     fn is_monorepo(&self) -> bool {
         false
+    }
+
+    fn object_hash_kind(&self) -> Result<HashKind, MegaError> {
+        self.storage.config().monorepo.object_hash_kind()
     }
 
     fn save_entry_concurrency(&self) -> usize {
@@ -151,7 +155,8 @@ impl RepoHandler for ImportRepo {
         let storage = self.storage.git_db_storage();
         let git_service = self.storage.git_service.clone();
         let total = storage.get_obj_count_by_repo_id(self.repo.repo_id).await;
-        let encoder = PackEncoder::new(total, 0, stream_tx);
+        let encoder =
+            PackEncoder::new_with_hash_kind(self.object_hash_kind()?, total, 0, stream_tx);
         encoder.encode_async(entry_rx).await?;
 
         let repo_id = self.repo.repo_id;
@@ -205,6 +210,7 @@ impl RepoHandler for ImportRepo {
             }
         }
 
+        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(self.repo.repo_id, want_tree_ids)
@@ -213,7 +219,7 @@ impl RepoHandler for ImportRepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
                     Tree::from_git_model(m),
                 )
             })
@@ -251,7 +257,12 @@ impl RepoHandler for ImportRepo {
         }
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        let encoder = PackEncoder::new_with_hash_kind(
+            self.object_hash_kind()?,
+            obj_num.into_inner(),
+            0,
+            stream_tx,
+        );
         encoder
             .encode_async(entry_rx)
             .await

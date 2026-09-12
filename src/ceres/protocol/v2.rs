@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use git_internal::hash::HashKind;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
@@ -18,19 +19,15 @@ use crate::{
 // tests. `server-option` is intentionally omitted: the parsed capabilities
 // from `parse_v2_command` are not inspected, so advertising it would mislead
 // clients into sending server options that are silently ignored.
-const V2_CAPABILITIES: &[&str] = &[
-    "agent=mega/0.1.0",
-    "ls-refs",
-    "fetch=shallow filter",
-    "object-format=sha1",
-];
+const V2_CAPABILITIES: &[&str] = &["agent=mega/0.1.0", "ls-refs", "fetch=shallow filter"];
 
-pub fn build_v2_capability_advertisement() -> BytesMut {
+pub fn build_v2_capability_advertisement(hash_kind: HashKind) -> BytesMut {
     let mut buf = BytesMut::new();
     add_pkt_line_string(&mut buf, "version 2\n".to_owned());
     for cap in V2_CAPABILITIES {
         add_pkt_line_string(&mut buf, format!("{cap}\n"));
     }
+    add_pkt_line_string(&mut buf, format!("object-format={}\n", hash_kind.as_str()));
     buf.put(Bytes::from_static(smart::PKT_LINE_END_MARKER));
     buf
 }
@@ -68,6 +65,7 @@ pub async fn handle_v2_ls_refs(
         .repo_handler_with_commands(state, Vec::new())
         .await?;
     let (head_hash, git_refs) = repo_handler.refs_with_head_hash().await?;
+    session.ensure_advertised_object_ids(&head_hash, &git_refs)?;
 
     let mut buf = BytesMut::new();
 
@@ -396,7 +394,7 @@ mod tests {
 
     #[test]
     fn v2_capability_advertisement_includes_expected_capabilities() {
-        let adv = build_v2_capability_advertisement();
+        let adv = build_v2_capability_advertisement(HashKind::Sha1);
         let adv_str = String::from_utf8_lossy(&adv);
 
         assert!(adv_str.starts_with("000eversion 2\n"));

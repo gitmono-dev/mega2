@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures::{Stream, TryStreamExt, future::join_all};
 use git_internal::{
     errors::GitError,
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -48,6 +48,9 @@ pub mod trunk_provenance;
 #[async_trait]
 pub trait RepoHandler: Send + Sync + 'static {
     fn is_monorepo(&self) -> bool;
+
+    /// Authoritative repository object hash kind (`MonoConfig.object_hash_kind()`).
+    fn object_hash_kind(&self) -> Result<HashKind, MegaError>;
 
     /// Concurrency limit for `save_entry` batches during receive-pack.
     /// `0` means unbounded.
@@ -343,7 +346,11 @@ pub trait RepoHandler: Send + Sync + 'static {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (pack_id_sender, pack_id_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        let p = Pack::new(
+        let hash_kind = self
+            .object_hash_kind()
+            .map_err(|e| ProtocolError::InvalidInput(e.to_string()))?;
+        let p = Pack::new_with_hash_kind(
+            hash_kind,
             None,
             Some(cache_mem),
             Some(pack_config.pack_decode_cache_path.clone()),

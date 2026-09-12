@@ -50,7 +50,8 @@ pub async fn git_info_refs(
         .ok_or_else(|| ProtocolError::InvalidInput("missing service parameter".to_owned()))?;
     let service_type = ServiceType::from_str(&service_name)
         .map_err(|err| ProtocolError::InvalidInput(err.to_string()))?;
-    let mut session = SmartSession::new(repo_path, service_type, TransportProtocol::Http);
+    let mut session =
+        SmartSession::from_state(repo_path, service_type, TransportProtocol::Http, state)?;
     match service_type {
         ServiceType::UploadPack => {
             let _ = git_http_auth(state, &mut session, headers).await?;
@@ -72,7 +73,7 @@ pub async fn git_info_refs(
     }
 
     if is_v2_request(headers) && service_type == ServiceType::UploadPack {
-        let pkt_line_stream = v2::build_v2_capability_advertisement();
+        let pkt_line_stream = v2::build_v2_capability_advertisement(session.hash_kind);
         let response = add_default_header(
             format!("application/x-{service_name}-advertisement"),
             Response::builder()
@@ -226,8 +227,12 @@ pub async fn git_upload_pack(
     req: Request<Body>,
     repo_path: std::path::PathBuf,
 ) -> Result<Response<Body>, ProtocolError> {
-    let mut pack_protocol =
-        SmartSession::new(repo_path, ServiceType::UploadPack, TransportProtocol::Http);
+    let mut pack_protocol = SmartSession::from_state(
+        repo_path,
+        ServiceType::UploadPack,
+        TransportProtocol::Http,
+        state,
+    )?;
     let _ = git_http_auth(state, &mut pack_protocol, req.headers()).await?;
     check_upload_pack_access(&state.storage.config().git, &pack_protocol.auth).await?;
     let upload_request = collect_body_data(req.into_body(), "upload-pack").await?;
@@ -371,8 +376,12 @@ pub async fn git_receive_pack(
     req: Request<Body>,
     repo_path: std::path::PathBuf,
 ) -> Result<Response<Body>, ProtocolError> {
-    let mut pack_protocol =
-        SmartSession::new(repo_path, ServiceType::ReceivePack, TransportProtocol::Http);
+    let mut pack_protocol = SmartSession::from_state(
+        repo_path,
+        ServiceType::ReceivePack,
+        TransportProtocol::Http,
+        state,
+    )?;
     if receive_pack_requires_http_auth(&state.storage.config().git)
         && !git_http_auth(state, &mut pack_protocol, req.headers()).await?
     {

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
 use git_internal::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
@@ -111,6 +111,10 @@ fn trunk_align_finalize_err(err: MegaError) -> MegaError {
 impl RepoHandler for Monorepo {
     fn is_monorepo(&self) -> bool {
         true
+    }
+
+    fn object_hash_kind(&self) -> Result<HashKind, MegaError> {
+        self.storage.config().monorepo.object_hash_kind()
     }
 
     fn save_entry_concurrency(&self) -> usize {
@@ -304,6 +308,7 @@ impl RepoHandler for Monorepo {
             current_level = next_level;
         }
 
+        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = all_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(want_tree_ids)
@@ -312,7 +317,7 @@ impl RepoHandler for Monorepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
                     Tree::from_mega_model(m),
                 )
             })
@@ -333,7 +338,12 @@ impl RepoHandler for Monorepo {
 
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        let encoder = PackEncoder::new_with_hash_kind(
+            self.object_hash_kind()?,
+            obj_num.into_inner(),
+            0,
+            stream_tx,
+        );
         encoder
             .encode_async(entry_rx)
             .await
@@ -413,6 +423,7 @@ impl RepoHandler for Monorepo {
             }
         }
 
+        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(want_tree_ids)
@@ -421,7 +432,7 @@ impl RepoHandler for Monorepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
                     Tree::from_mega_model(m),
                 )
             })
@@ -452,7 +463,12 @@ impl RepoHandler for Monorepo {
 
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        let encoder = PackEncoder::new_with_hash_kind(
+            self.object_hash_kind()?,
+            obj_num.into_inner(),
+            0,
+            stream_tx,
+        );
         encoder
             .encode_async(entry_rx)
             .await
@@ -522,6 +538,7 @@ impl RepoHandler for Monorepo {
             }
         }
 
+        let hash_kind = self.object_hash_kind()?;
         let want_tree_ids = want_commits.iter().map(|c| c.tree_id.to_string()).collect();
         let want_trees: HashMap<ObjectHash, Tree> = storage
             .get_trees_by_hashes(want_tree_ids)
@@ -530,7 +547,7 @@ impl RepoHandler for Monorepo {
             .into_iter()
             .map(|m| {
                 (
-                    ObjectHash::from_hex_for_kind(get_hash_kind(), &m.tree_id).unwrap(),
+                    ObjectHash::from_hex_for_kind(hash_kind, &m.tree_id).unwrap(),
                     Tree::from_mega_model(m),
                 )
             })
@@ -561,7 +578,12 @@ impl RepoHandler for Monorepo {
         }
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new(obj_num.into_inner(), 0, stream_tx);
+        let encoder = PackEncoder::new_with_hash_kind(
+            self.object_hash_kind()?,
+            obj_num.into_inner(),
+            0,
+            stream_tx,
+        );
         encoder
             .encode_async(entry_rx)
             .await
@@ -751,7 +773,8 @@ impl Monorepo {
 
         let (entry_tx, entry_rx) = mpsc::channel(pack_config.channel_message_size);
         let (stream_tx, stream_rx) = mpsc::channel(pack_config.channel_message_size);
-        let encoder = PackEncoder::new(obj_num, 0, stream_tx);
+        let encoder =
+            PackEncoder::new_with_hash_kind(self.object_hash_kind()?, obj_num, 0, stream_tx);
         encoder
             .encode_async(entry_rx)
             .await
