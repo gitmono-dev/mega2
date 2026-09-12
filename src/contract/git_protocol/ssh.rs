@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use russh::{
     Channel, ChannelId,
     keys::{HashAlg, PublicKey},
@@ -728,9 +728,8 @@ async fn handle_receive_pack(
             return;
         }
     };
-    let pack_stream = stream::once(async { Ok(pack_bytes) });
     let report_status = match smart_protocol
-        .git_receive_pack_stream(api_state, commands, Box::pin(pack_stream))
+        .git_receive_pack_stream(api_state, commands, pack_bytes)
         .await
     {
         Ok(status) => status,

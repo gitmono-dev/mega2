@@ -680,8 +680,17 @@ impl RepoHandler for Monorepo {
             .mono_storage()
             .get_commit_by_hash(hash)
             .await
-            .unwrap()
+            .ok()
+            .flatten()
             .is_some()
+    }
+
+    async fn check_object_exist(&self, hash: &str) -> bool {
+        self.storage
+            .mono_storage()
+            .object_exists(hash)
+            .await
+            .unwrap_or(false)
     }
 
     async fn check_default_branch(&self) -> bool {
@@ -836,10 +845,11 @@ impl Monorepo {
             .clone();
         let txn = self.storage.begin_db_transaction().await?;
         for cmd in &cmds {
-            if cmd.ref_type == RefTypeEnum::Branch {
-                self.apply_cl_mega_ref_for_push_command(cmd, Some(&txn))
-                    .await?;
+            if cmd.status != "ok" || cmd.ref_type != RefTypeEnum::Branch {
+                continue;
             }
+            self.apply_cl_mega_ref_for_push_command(cmd, Some(&txn))
+                .await?;
         }
         txn.commit().await.map_err(MegaError::Db)?;
         // UN-16 / TP-22: receive-pack Delete cannot touch main. When the
@@ -848,7 +858,8 @@ impl Monorepo {
         // original equal-blob notify (a no-op unless a future path removes
         // main's `/.mega_cedar.json`).
         if cmds.iter().any(|cmd| {
-            cmd.ref_type == RefTypeEnum::Branch
+            cmd.status == "ok"
+                && cmd.ref_type == RefTypeEnum::Branch
                 && (cmd.command_type == CommandType::Delete || is_protocol_zero_id(&cmd.new_id))
         }) {
             if authz_barrier_enabled(&self.storage) {
@@ -1022,11 +1033,9 @@ impl Monorepo {
         Ok(())
     }
 
-    /// The semantics-defining command of this push: the first non-delete
-    /// branch command. Delete commands never build a chain; a push with more
-    /// than one non-delete branch command is rejected by
-    /// [`Self::validate_incoming_push`] before this is ever consulted at
-    /// finalize (ADR-MC-04).
+    /// The semantics-defining command of this push: the first surviving
+    /// (`ok`) non-delete branch command. Extra branch updates are `ng`'d in
+    /// the protocol layer (FC-08); delete commands never build a chain.
     fn primary_branch_command(&self) -> Option<RefCommand> {
         push_chain::primary_branch_command(
             &self
@@ -1038,17 +1047,18 @@ impl Monorepo {
 
     /// Receive-pack admission gate (MC-06), run before any ref/CL mutation:
     ///
-    /// 1. ADR-MC-04 — a receive-pack carrying more than one non-delete branch
-    ///    command is rejected as a whole; the message tells the user to push
-    ///    one branch at a time. Delete commands do not count.
+    /// 1. Surviving (status `ok`) non-delete branch commands: more than one is
+    ///    already `ng`'d in the protocol layer (FC-08 / Mega mixed report-status).
+    ///    This gate remains a fail-closed safety net if two `ok` branch updates
+    ///    still reach finalize. Delete commands do not count.
     /// 2. MC-03 chain validation — the primary branch command's resolved
     ///    [`PushChain`] is validated against storage, with the path's existing
     ///    open CL (queried on the same path as `fetch_or_new_cl_link` /
     ///    `update_or_create_cl`) supplying the ADR-MC-07 cumulative boundary.
     ///
     /// A failure aborts `finalize_receive_pack`; the protocol layer marks every
-    /// branch command `ng` with this message, so the client rejects the whole
-    /// push. The ADR-MC-05 no-op path and delete-only pushes pass through.
+    /// still-`ok` branch command `ng` with this message. The ADR-MC-05 no-op
+    /// path and delete-only pushes pass through.
     async fn validate_incoming_push(&self) -> Result<(), MegaError> {
         let cmds = self
             .command_list
@@ -1058,7 +1068,8 @@ impl Monorepo {
         let branch_updates = cmds
             .iter()
             .filter(|c| {
-                c.ref_type == RefTypeEnum::Branch
+                c.status == "ok"
+                    && c.ref_type == RefTypeEnum::Branch
                     && c.command_type != CommandType::Delete
                     && !is_protocol_zero_id(&c.new_id)
             })

@@ -1541,6 +1541,38 @@ impl MonoStorage {
             .await?)
     }
 
+    /// One-query existence check across commit/tree/blob/tag.
+    pub async fn object_exists(&self, hash: &str) -> Result<bool, MegaError> {
+        let conn = self.get_connection();
+        let backend = conn.get_database_backend();
+        let (sql, values): (&str, Vec<sea_orm::Value>) = match backend {
+            sea_orm::DatabaseBackend::Postgres => (
+                "SELECT 1 FROM (
+                    SELECT 1 FROM mega_commit WHERE commit_id = $1
+                    UNION ALL SELECT 1 FROM mega_tree WHERE tree_id = $1
+                    UNION ALL SELECT 1 FROM mega_blob WHERE blob_id = $1
+                    UNION ALL SELECT 1 FROM mega_tag WHERE tag_id = $1
+                ) AS objects LIMIT 1",
+                vec![hash.into()],
+            ),
+            _ => (
+                "SELECT 1 FROM (
+                    SELECT 1 FROM mega_commit WHERE commit_id = ?
+                    UNION ALL SELECT 1 FROM mega_tree WHERE tree_id = ?
+                    UNION ALL SELECT 1 FROM mega_blob WHERE blob_id = ?
+                    UNION ALL SELECT 1 FROM mega_tag WHERE tag_id = ?
+                ) AS objects LIMIT 1",
+                vec![hash.into(), hash.into(), hash.into(), hash.into()],
+            ),
+        };
+        let row = conn
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                backend, sql, values,
+            ))
+            .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn get_commits_by_hashes(
         &self,
         hashes: &Vec<String>,

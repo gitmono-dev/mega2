@@ -309,6 +309,11 @@ pub trait RepoHandler: Send + Sync + 'static {
 
     async fn check_commit_exist(&self, hash: &str) -> bool;
 
+    /// Whether the repository stores any object with this id (tag, commit,
+    /// tree, or blob) that a pushed lightweight or annotated tag could
+    /// reference. Pack-less commands issue at most one existence query.
+    async fn check_object_exist(&self, hash: &str) -> bool;
+
     async fn check_default_branch(&self) -> bool;
 
     fn find_head_hash(&self, refs: Vec<Refs>) -> (String, Vec<Refs>) {

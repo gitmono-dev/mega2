@@ -4479,11 +4479,7 @@ impl MonoApiService {
             ref_name.clone(),
         )];
         let bytes = protocol
-            .git_receive_pack_stream(
-                &state,
-                commands,
-                Box::pin(tokio_stream::once(Ok(Bytes::from(pack_data)))),
-            )
+            .git_receive_pack_stream(&state, commands, Bytes::from(pack_data))
             .await
             .map_err(|e| MegaError::Other(format!("{e}")))?;
 

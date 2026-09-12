@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     pin::Pin,
     time::Instant,
 };
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::Stream;
+use futures::{Stream, stream};
 use git_internal::hash::HashKind;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -14,12 +14,16 @@ use crate::{
     callisto::sea_orm_active_enums::RefTypeEnum,
     ceres::{
         api_service::state::ProtocolApiState,
+        pack::RepoHandler,
         protocol::{
             Capability, ServiceType, SideBind, SmartSession, TransportProtocol,
             import_refs::{CommandType, RefCommand},
         },
     },
-    common::{errors::ProtocolError, utils::is_protocol_zero_id},
+    common::{
+        errors::ProtocolError,
+        utils::{MEGA_BRANCH_NAME, is_protocol_zero_id},
+    },
 };
 
 const LF: char = '\n';
@@ -34,6 +38,10 @@ pub const PKT_LINE_DELIMITER: &[u8; 4] = b"0001";
 // see https://git-scm.com/docs/protocol-capabilities
 // Only advertise capabilities that are parsed, acted on, and covered by tests.
 const RECEIVE_CAP_LIST: &str = "report-status delete-refs ";
+
+const MONOREPO_TAG_NG: &str =
+    "tag pushes are not supported on monorepo; manage tags through the tag API";
+const MONOREPO_EXTRA_BRANCH_NG: &str = "monorepo pushes support at most one branch update";
 
 // The ofs-delta and side-band-64k capabilities are sent and recognized by both upload-pack and receive-pack protocols.
 // The agent and session-id capabilities may optionally be sent in both protocols.
@@ -327,18 +335,13 @@ impl SmartSession {
                             "receive-pack request contains no commands".to_owned(),
                         ));
                     }
-                    if !Self::is_delete_only_push(&commands) {
-                        if protocol_bytes.is_empty() {
-                            return Err(ProtocolError::InvalidInput(
-                                "receive-pack request missing pack payload".to_owned(),
-                            ));
-                        }
-                        if !protocol_bytes.starts_with(b"PACK") {
-                            return Err(ProtocolError::InvalidInput(
-                                "receive-pack request pack payload does not start with PACK"
-                                    .to_owned(),
-                            ));
-                        }
+                    if protocol_bytes.is_empty() {
+                        return Ok((commands, protocol_bytes));
+                    }
+                    if !protocol_bytes.starts_with(b"PACK") {
+                        return Err(ProtocolError::InvalidInput(
+                            "receive-pack request pack payload does not start with PACK".to_owned(),
+                        ));
                     }
                     return Ok((commands, protocol_bytes));
                 }
@@ -366,6 +369,109 @@ impl SmartSession {
                 .all(|c| c.command_type == CommandType::Delete)
     }
 
+    fn reject_monorepo_disallowed_commands(commands: &mut [RefCommand], is_monorepo: bool) {
+        if !is_monorepo {
+            return;
+        }
+        for command in commands.iter_mut() {
+            if command.status != "ok" {
+                continue;
+            }
+            if command.command_type == CommandType::Delete && command.ref_name == MEGA_BRANCH_NAME {
+                command.failed(format!(
+                    "refusing to delete the main branch ref `{MEGA_BRANCH_NAME}`: \
+                     the authorization snapshot is keyed on main's `/.mega_cedar.json`; \
+                     use the Web UI / API to manage the default branch"
+                ));
+            } else if command.ref_type == RefTypeEnum::Tag {
+                command.failed(MONOREPO_TAG_NG.to_string());
+            }
+        }
+    }
+
+    fn reject_packless_missing_targets(
+        commands: &mut [RefCommand],
+        commit_exists: &dyn Fn(&str) -> bool,
+        object_exists: &dyn Fn(&str) -> bool,
+    ) {
+        for command in commands.iter_mut() {
+            if command.status != "ok" || command.command_type == CommandType::Delete {
+                continue;
+            }
+            let exists = match command.ref_type {
+                RefTypeEnum::Branch => commit_exists(&command.new_id),
+                _ => object_exists(&command.new_id),
+            };
+            if !exists {
+                command.failed(format!("target object {} not found", command.new_id));
+            }
+        }
+    }
+
+    fn reject_extra_monorepo_branch_updates(commands: &mut [RefCommand], is_monorepo: bool) {
+        if !is_monorepo {
+            return;
+        }
+        let mut surviving_branch_update = false;
+        for command in commands.iter_mut() {
+            if command.ref_type == RefTypeEnum::Branch
+                && command.status == "ok"
+                && command.command_type != CommandType::Delete
+                && !is_protocol_zero_id(&command.new_id)
+            {
+                if surviving_branch_update {
+                    command.failed(MONOREPO_EXTRA_BRANCH_NG.to_string());
+                } else {
+                    surviving_branch_update = true;
+                }
+            }
+        }
+    }
+
+    fn has_successful_branch_work(commands: &[RefCommand]) -> bool {
+        commands
+            .iter()
+            .any(|c| c.ref_type == RefTypeEnum::Branch && c.status == "ok")
+    }
+
+    async fn apply_receive_pack_status_guards(
+        commands: &mut [RefCommand],
+        is_monorepo: bool,
+        pack_less: bool,
+        repo_handler: &dyn RepoHandler,
+    ) {
+        Self::reject_monorepo_disallowed_commands(commands, is_monorepo);
+        if pack_less {
+            let mut commit_hits = HashMap::new();
+            let mut object_hits = HashMap::new();
+            for command in commands.iter() {
+                if command.status != "ok" || command.command_type == CommandType::Delete {
+                    continue;
+                }
+                match command.ref_type {
+                    RefTypeEnum::Branch => {
+                        commit_hits.insert(
+                            command.new_id.clone(),
+                            repo_handler.check_commit_exist(&command.new_id).await,
+                        );
+                    }
+                    _ => {
+                        object_hits.insert(
+                            command.new_id.clone(),
+                            repo_handler.check_object_exist(&command.new_id).await,
+                        );
+                    }
+                }
+            }
+            Self::reject_packless_missing_targets(
+                commands,
+                &|h| commit_hits.get(h).copied().unwrap_or(false),
+                &|h| object_hits.get(h).copied().unwrap_or(false),
+            );
+        }
+        Self::reject_extra_monorepo_branch_updates(commands, is_monorepo);
+    }
+
     fn parse_receive_pack_command_line(
         &mut self,
         pkt_line: &mut Bytes,
@@ -389,7 +495,7 @@ impl SmartSession {
         &mut self,
         state: &ProtocolApiState,
         commands: Vec<RefCommand>,
-        data_stream: Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>,
+        pack_payload: Bytes,
     ) -> Result<Bytes, ProtocolError> {
         let t0 = Instant::now();
         let mut timings_ms: BTreeMap<String, u128> = BTreeMap::new();
@@ -401,13 +507,24 @@ impl SmartSession {
             .repo_handler_with_commands(state, commands.clone())
             .await?;
         let is_monorepo = repo_handler.is_monorepo();
-        //1. unpack progress
-        let delete_only = Self::is_delete_only_push(&commands);
-        let unpack_result = if delete_only {
+        let pack_less = pack_payload.is_empty();
+        Self::apply_receive_pack_status_guards(
+            &mut commands,
+            is_monorepo,
+            pack_less,
+            repo_handler.as_ref(),
+        )
+        .await;
+
+        // 1. unpack progress. Pack-less pushes carry no packfile after the
+        //    command flush, so unpack is skipped entirely.
+        let unpack_result = if pack_less {
             timings_ms.insert("unpack_stream_ms".to_string(), 0);
             timings_ms.insert("receiver_handler_ms".to_string(), 0);
             Ok(())
         } else {
+            let data_stream: Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>> =
+                Box::pin(stream::once(async { Ok(pack_payload) }));
             let t_unpack = Instant::now();
             let receiver = repo_handler
                 .unpack_stream(&state.storage.config().pack, data_stream)
@@ -440,7 +557,9 @@ impl SmartSession {
         //    mono and import both persist branch refs inside `finalize_receive_pack`.
         for command in commands.iter_mut() {
             if command.ref_type == RefTypeEnum::Tag {
-                // just update if refs type is tag
+                if command.status != "ok" {
+                    continue;
+                }
                 if let Err(e) = repo_handler.update_refs(command).await {
                     command.failed(e.to_string());
                 }
@@ -451,13 +570,15 @@ impl SmartSession {
                 // c.Also, some references can be updated while others can be rejected.
                 match unpack_result {
                     Ok(_) => {
-                        if !default_exist {
+                        if command.status == "ok" && !default_exist {
                             command.default_branch = true;
                             default_exist = true;
                         }
                     }
                     Err(ref err) => {
-                        command.failed(err.to_string());
+                        if command.status == "ok" {
+                            command.failed(err.to_string());
+                        }
                         unpack_failed = true;
                     }
                 }
@@ -472,7 +593,8 @@ impl SmartSession {
         let mut bind_ms: Option<u128> = None;
         let mut finalize_failed = false;
         let mut receive_notice: Option<String> = None;
-        if !unpack_failed {
+        let has_branch_work = Self::has_successful_branch_work(&commands);
+        if !unpack_failed && has_branch_work {
             let t_finalize = Instant::now();
             if let Err(e) = repo_handler.finalize_receive_pack().await {
                 // UN-16: a per-ref rejection (e.g. main-branch delete) must reach
@@ -838,7 +960,7 @@ pub mod test {
                 read_until_white_space, try_read_pkt_line,
             },
         },
-        common::errors::ProtocolError,
+        common::{errors::ProtocolError, utils::MEGA_BRANCH_NAME},
     };
 
     #[test]
@@ -1075,7 +1197,7 @@ pub mod test {
     }
 
     #[test]
-    pub fn split_receive_pack_request_rejects_non_delete_without_pack_payload() {
+    pub fn split_receive_pack_request_accepts_pack_less_non_delete() {
         let mut session = SmartSession::new(
             std::path::PathBuf::new(),
             ServiceType::ReceivePack,
@@ -1089,12 +1211,14 @@ pub mod test {
         );
         request.extend_from_slice(PKT_LINE_END_MARKER);
 
-        let err = session
+        let (commands, pack_bytes) = session
             .split_receive_pack_request(request.freeze())
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(err, ProtocolError::InvalidInput(_)));
-        assert!(err.to_string().contains("missing pack payload"));
+        assert!(pack_bytes.is_empty());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command_type, CommandType::Create);
+        assert!(!SmartSession::is_delete_only_push(&commands));
     }
 
     #[test]
@@ -1561,6 +1685,111 @@ pub mod test {
         ]));
         assert!(!SmartSession::is_delete_only_push(&[delete_cmd(), create]));
         assert!(!SmartSession::is_delete_only_push(&[]));
+    }
+
+    fn branch_create(ref_name: &str, new_id: &str) -> RefCommand {
+        RefCommand::new(
+            "0000000000000000000000000000000000000000".to_string(),
+            new_id.to_string(),
+            ref_name.to_string(),
+        )
+    }
+
+    fn branch_delete(ref_name: &str) -> RefCommand {
+        RefCommand::new(
+            "27dd8d4cf39f3868c6eee38b601bc9e9939304f5".to_string(),
+            "0000000000000000000000000000000000000000".to_string(),
+            ref_name.to_string(),
+        )
+    }
+
+    fn tag_create(ref_name: &str, new_id: &str) -> RefCommand {
+        RefCommand::new(
+            "0000000000000000000000000000000000000000".to_string(),
+            new_id.to_string(),
+            ref_name.to_string(),
+        )
+    }
+
+    #[test]
+    pub fn monorepo_tag_is_ng_before_persist() {
+        let mut commands = vec![tag_create(
+            "refs/tags/v1",
+            "27dd8d4cf39f3868c6eee38b601bc9e9939304f5",
+        )];
+        SmartSession::reject_monorepo_disallowed_commands(&mut commands, true);
+        assert_eq!(commands[0].status, "ng");
+        assert!(
+            commands[0]
+                .error_msg
+                .contains("tag pushes are not supported")
+        );
+        assert!(!SmartSession::has_successful_branch_work(&commands));
+    }
+
+    #[test]
+    pub fn monorepo_cl_delete_stays_ok_main_delete_is_ng() {
+        let mut commands = vec![
+            branch_delete("refs/cl/tester/one"),
+            branch_delete(MEGA_BRANCH_NAME),
+        ];
+        SmartSession::reject_monorepo_disallowed_commands(&mut commands, false);
+        assert_eq!(commands[0].status, "ok");
+        assert_eq!(commands[1].status, "ok");
+
+        SmartSession::reject_monorepo_disallowed_commands(&mut commands, true);
+        assert_eq!(commands[0].status, "ok");
+        assert_eq!(commands[1].status, "ng");
+        assert!(
+            commands[1]
+                .error_msg
+                .contains("refusing to delete the main branch")
+        );
+        assert!(SmartSession::has_successful_branch_work(&commands));
+    }
+
+    #[test]
+    pub fn pack_less_missing_commit_and_object_are_ng() {
+        let missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let present = "27dd8d4cf39f3868c6eee38b601bc9e9939304f5";
+        let mut commands = vec![
+            branch_create("refs/heads/missing", missing),
+            branch_create("refs/heads/present", present),
+            tag_create("refs/tags/missing", missing),
+            branch_delete("refs/heads/old"),
+        ];
+        SmartSession::reject_packless_missing_targets(&mut commands, &|h| h == present, &|_| false);
+        assert_eq!(commands[0].status, "ng");
+        assert!(commands[0].error_msg.contains("target object"));
+        assert_eq!(commands[1].status, "ok");
+        assert_eq!(commands[2].status, "ng");
+        assert_eq!(commands[3].status, "ok");
+    }
+
+    #[test]
+    pub fn extra_monorepo_branch_is_ng_first_survives() {
+        let tip = "27dd8d4cf39f3868c6eee38b601bc9e9939304f5";
+        let mut commands = vec![
+            branch_create("refs/heads/one", tip),
+            branch_create("refs/heads/two", tip),
+            branch_delete("refs/cl/tester/old"),
+        ];
+        SmartSession::reject_extra_monorepo_branch_updates(&mut commands, true);
+        assert_eq!(commands[0].status, "ok");
+        assert_eq!(commands[1].status, "ng");
+        assert!(commands[1].error_msg.contains("at most one branch update"));
+        assert_eq!(commands[2].status, "ok");
+        assert!(SmartSession::has_successful_branch_work(&commands));
+    }
+
+    #[test]
+    pub fn tag_only_has_no_branch_work_to_finalize() {
+        let mut commands = vec![tag_create(
+            "refs/tags/v1",
+            "27dd8d4cf39f3868c6eee38b601bc9e9939304f5",
+        )];
+        SmartSession::reject_monorepo_disallowed_commands(&mut commands, true);
+        assert!(!SmartSession::has_successful_branch_work(&commands));
     }
 
     async fn git_push_with_retry(repo_path: &std::path::Path) -> anyhow::Result<()> {

@@ -377,8 +377,17 @@ impl RepoHandler for ImportRepo {
             .git_db_storage()
             .get_commit_by_hash(self.repo.repo_id, hash)
             .await
-            .unwrap()
+            .ok()
+            .flatten()
             .is_some()
+    }
+
+    async fn check_object_exist(&self, hash: &str) -> bool {
+        self.storage
+            .git_db_storage()
+            .object_exists(self.repo.repo_id, hash)
+            .await
+            .unwrap_or(false)
     }
 
     async fn check_default_branch(&self) -> bool {
@@ -470,14 +479,13 @@ impl ImportRepo {
             .expect("command_list lock poisoned")
             .clone();
         // Pure delete-only attach: no non-zero branch tip → do not enqueue.
-        if !commands_snapshot
-            .iter()
-            .any(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
-        {
+        if !commands_snapshot.iter().any(|c| {
+            c.status == "ok" && c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id)
+        }) {
             let txn = self.storage.begin_db_transaction().await?;
             let git_db = self.storage.git_db_storage();
             for cmd in &commands_snapshot {
-                if cmd.ref_type != RefTypeEnum::Branch {
+                if cmd.status != "ok" || cmd.ref_type != RefTypeEnum::Branch {
                     continue;
                 }
                 if let CommandType::Delete = cmd.command_type {
@@ -492,7 +500,11 @@ impl ImportRepo {
 
         let commit_id = commands_snapshot
             .iter()
-            .find(|c| c.ref_type == RefTypeEnum::Branch && !is_protocol_zero_id(&c.new_id))
+            .find(|c| {
+                c.status == "ok"
+                    && c.ref_type == RefTypeEnum::Branch
+                    && !is_protocol_zero_id(&c.new_id)
+            })
             .map(|c| c.new_id.clone())
             .ok_or_else(|| MegaError::Other("attach: no branch tip".into()))?;
 
@@ -512,7 +524,7 @@ impl ImportRepo {
 
         let attach_cmds: Vec<AttachCommand> = commands_snapshot
             .iter()
-            .filter(|c| c.ref_type == RefTypeEnum::Branch)
+            .filter(|c| c.status == "ok" && c.ref_type == RefTypeEnum::Branch)
             .map(|c| AttachCommand {
                 ref_name: c.ref_name.clone(),
                 old_id: c.old_id.clone(),

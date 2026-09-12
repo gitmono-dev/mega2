@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use http::header::AUTHORIZATION;
 use tokio::io::AsyncReadExt;
 
@@ -392,9 +392,8 @@ pub async fn git_receive_pack(
 
     let (commands, pack_bytes) =
         pack_protocol.split_receive_pack_request(receive_request.freeze())?;
-    let pack_stream = stream::once(async { Ok(pack_bytes) });
     let report_status = pack_protocol
-        .git_receive_pack_stream(state, commands, Box::pin(pack_stream))
+        .git_receive_pack_stream(state, commands, pack_bytes)
         .await?;
 
     tracing::info!("report status:{:?}", report_status);
@@ -430,6 +429,8 @@ fn add_default_header<T>(
 
 #[cfg(test)]
 mod tests {
+    use futures::stream;
+
     use super::*;
 
     #[tokio::test]

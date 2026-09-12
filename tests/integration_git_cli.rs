@@ -38,6 +38,8 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
+
 struct TestDatabase {
     admin_url: String,
     db_name: String,
@@ -1260,12 +1262,19 @@ fn integration_git_cli_http_rejects_git_client_tag_push() {
             &format!("refs/tags/{tag}"),
         ],
     );
-    assert!(
-        !push.status.success(),
-        "Monorepo must reject Git-client tag push; status={:?}\nstdout:\n{}\nstderr:\n{}",
-        push.status,
+    let combined = format!(
+        "{}\n{}",
         String::from_utf8_lossy(&push.stdout),
         String::from_utf8_lossy(&push.stderr)
+    );
+    assert!(
+        !push.status.success(),
+        "Monorepo must reject Git-client tag push; status={:?}\n{combined}",
+        push.status
+    );
+    assert!(
+        combined.contains("tag pushes are not supported"),
+        "tag-only ng must happen before persist; got:\n{combined}"
     );
     let remote_tags = ls_remote_refs(
         &env.case_dir,
@@ -1278,6 +1287,71 @@ fn integration_git_cli_http_rejects_git_client_tag_push() {
         "rejected tag push must not leave refs/tags/{tag} on remote: {remote_tags:?}",
         tag = tag,
         remote_tags = remote_tags
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_http_packless_missing_commit_is_ng() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let ref_name = format!("refs/heads/fc08-missing-{}", std::process::id());
+    let report = post_packless_receive_pack(port, &token, ZERO_SHA1, missing, &ref_name);
+    assert!(
+        report.contains("target object") && report.contains(missing),
+        "pack-less missing commit must ng with target-object reason; got:\n{report}"
+    );
+    assert!(
+        cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER).is_empty(),
+        "pack-less missing commit must not persist a CL"
+    );
+
+    let status = service.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "service did not shut down cleanly: {status}\nstderr:\n{}",
+        read_log(&stderr_path),
+    );
+}
+
+#[test]
+fn integration_git_cli_http_packless_existing_commit_skips_unpack() {
+    if git_cli::git_cli_skip_requested() {
+        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        return;
+    }
+
+    let env = GitCliEnv::new();
+    let token = git_cli::resolve_seed_token();
+    let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
+    git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
+
+    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let head = git_stdout(&env.case_dir, &token, &["ls-remote", &remote_url, "HEAD"])
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("ls-remote HEAD produced no sha"))
+        .to_string();
+    let ref_name = format!("refs/heads/fc08-packless-{}", std::process::id());
+    let report = post_packless_receive_pack(port, &token, ZERO_SHA1, &head, &ref_name);
+    assert!(
+        report.contains("unpack ok") && report.contains(&format!("ok {ref_name}")),
+        "pack-less existing commit must skip unpack and report ok; got:\n{report}"
     );
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));
@@ -1426,6 +1500,61 @@ fn probe_receive_pack_headers(port: u16, repo_path: &str, bearer: Option<&str>) 
     assert!(
         output.status.success(),
         "curl probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn pkt_line(payload: &str) -> Vec<u8> {
+    let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+    out.extend_from_slice(payload.as_bytes());
+    out
+}
+
+fn post_packless_receive_pack(
+    port: u16,
+    token: &str,
+    old_id: &str,
+    new_id: &str,
+    ref_name: &str,
+) -> String {
+    let mut line = format!("{old_id} {new_id} {ref_name}");
+    line.push('\0');
+    line.push_str("report-status\n");
+    let mut body = pkt_line(&line);
+    body.extend_from_slice(b"0000");
+
+    let url = format!("http://127.0.0.1:{port}/git-receive-pack");
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "30",
+            "-H",
+            "Content-Type: application/x-git-receive-pack-request",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            "--data-binary",
+            "@-",
+            &url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("spawn curl receive-pack: {err}"));
+    {
+        let stdin = child.stdin.as_mut().expect("curl stdin");
+        stdin
+            .write_all(&body)
+            .unwrap_or_else(|err| panic!("write receive-pack body: {err}"));
+    }
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("curl receive-pack: {err}"));
+    assert!(
+        output.status.success(),
+        "curl receive-pack failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -3306,10 +3435,9 @@ fn integration_git_cli_multicommit_two_commit_chain_acceptance() {
 }
 
 #[test]
-fn integration_git_cli_multicommit_multi_branch_rejected() {
-    // plan-20260827 MC-06 / ADR-MC-04: one receive-pack carrying more than one
-    // non-delete branch command is rejected as a whole, with a message that
-    // tells the user to push one branch at a time.
+fn integration_git_cli_multicommit_multi_branch_mixed_status() {
+    // plan-20260901 FC-08: extra non-delete branch commands are ng'd; the first
+    // surviving branch may still finalize. The overall git push fails.
     if git_cli::git_cli_skip_requested() {
         eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
         return;
@@ -3391,7 +3519,7 @@ fn integration_git_cli_multicommit_multi_branch_rejected() {
     );
     assert!(
         !push.status.success(),
-        "a two-branch receive-pack must be rejected; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        "a two-branch receive-pack must fail overall because the extra branch is ng; status={:?}\nstdout:\n{}\nstderr:\n{}",
         push.status,
         String::from_utf8_lossy(&push.stdout),
         String::from_utf8_lossy(&push.stderr)
@@ -3402,30 +3530,28 @@ fn integration_git_cli_multicommit_multi_branch_rejected() {
         String::from_utf8_lossy(&push.stderr)
     );
     assert!(
-        combined.contains("at most one branch update per push"),
-        "multi-branch rejection must state the rule; got:\n{combined}"
-    );
-    assert!(
-        combined.contains("push one branch at a time"),
-        "multi-branch rejection must guide towards separate pushes; got:\n{combined}"
+        combined.contains("at most one branch update"),
+        "extra branch ng must state the v1 constraint; got:\n{combined}"
     );
 
-    // Whole-push rejection: no CL ref and no CL row survive.
+    // Mixed status: the first surviving branch still creates a CL.
     let after_cl = ls_remote_cl_refs(&env.case_dir, &token, &remote_url);
-    assert_eq!(
-        before_cl, after_cl,
-        "a rejected multi-branch push must not create/update any refs/cl/*"
-    );
     assert!(
-        cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER).is_empty(),
-        "a rejected multi-branch push must not create a CL"
+        after_cl.len() > before_cl.len(),
+        "the first branch of a mixed-status push must still create a CL ref; before={before_cl:?} after={after_cl:?}"
     );
-    // Codex R1 P1-2: the rejected pack's commit must not be bound either.
+    let cls = cl_rows_for_user(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER);
+    assert_eq!(
+        cls.len(),
+        1,
+        "exactly one CL for the surviving branch; got {cls:?}"
+    );
+    assert_eq!(cls[0].to_hash, pushed_commit);
     assert!(
         commit_auth_rows(&env.database.db_url)
             .iter()
-            .all(|(s, _)| s != &pushed_commit),
-        "a rejected multi-branch push must leave commit_auths untouched"
+            .any(|(s, _)| s == &pushed_commit),
+        "the surviving branch must bind its tip"
     );
 
     let status = service.shutdown_via_sigint(Duration::from_secs(60));

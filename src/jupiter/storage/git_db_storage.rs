@@ -2,9 +2,9 @@ use std::ops::Deref;
 
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
-    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set, TransactionTrait,
-    sea_query::Expr,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QueryTrait, Set,
+    Statement, TransactionTrait, sea_query::Expr,
 };
 
 use crate::{
@@ -412,6 +412,45 @@ impl GitDbStorage {
             .filter(git_commit::Column::CommitId.eq(hash))
             .one(self.get_connection())
             .await?)
+    }
+
+    /// One-query existence check across commit/tree/blob/tag for this repo.
+    pub async fn object_exists(&self, repo_id: i64, hash: &str) -> Result<bool, MegaError> {
+        let conn = self.get_connection();
+        let backend = conn.get_database_backend();
+        let (sql, values): (&str, Vec<sea_orm::Value>) = match backend {
+            DbBackend::Postgres => (
+                "SELECT 1 FROM (
+                    SELECT 1 FROM git_commit WHERE repo_id = $1 AND commit_id = $2
+                    UNION ALL SELECT 1 FROM git_tree WHERE repo_id = $1 AND tree_id = $2
+                    UNION ALL SELECT 1 FROM git_blob WHERE repo_id = $1 AND blob_id = $2
+                    UNION ALL SELECT 1 FROM git_tag WHERE repo_id = $1 AND tag_id = $2
+                ) AS objects LIMIT 1",
+                vec![repo_id.into(), hash.into()],
+            ),
+            _ => (
+                "SELECT 1 FROM (
+                    SELECT 1 FROM git_commit WHERE repo_id = ? AND commit_id = ?
+                    UNION ALL SELECT 1 FROM git_tree WHERE repo_id = ? AND tree_id = ?
+                    UNION ALL SELECT 1 FROM git_blob WHERE repo_id = ? AND blob_id = ?
+                    UNION ALL SELECT 1 FROM git_tag WHERE repo_id = ? AND tag_id = ?
+                ) AS objects LIMIT 1",
+                vec![
+                    repo_id.into(),
+                    hash.into(),
+                    repo_id.into(),
+                    hash.into(),
+                    repo_id.into(),
+                    hash.into(),
+                    repo_id.into(),
+                    hash.into(),
+                ],
+            ),
+        };
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+        Ok(row.is_some())
     }
 
     pub async fn get_commits_by_hashes(

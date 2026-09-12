@@ -544,15 +544,15 @@ impl PushChain {
     }
 }
 
-/// The semantics-defining command of a push: the first non-delete branch
-/// command. Delete commands never build a chain; a receive-pack carrying more
-/// than one non-delete branch command is rejected outright at finalize
-/// (ADR-MC-04, MC-06), so at most one chain is ever built per push.
+/// The semantics-defining command of a push: the first surviving (`ok`)
+/// non-delete branch command. Extra branch updates are `ng`'d in the protocol
+/// layer (FC-08); delete commands never build a chain.
 pub fn primary_branch_command(commands: &[RefCommand]) -> Option<RefCommand> {
     commands
         .iter()
         .find(|c| {
-            c.ref_type == RefTypeEnum::Branch
+            c.status == "ok"
+                && c.ref_type == RefTypeEnum::Branch
                 && c.command_type != CommandType::Delete
                 && !is_protocol_zero_id(&c.new_id)
         })
@@ -1217,6 +1217,23 @@ mod tests {
         );
 
         let selected = primary_branch_command(&[delete, update.clone()]);
+
+        assert_eq!(selected, Some(update));
+    }
+
+    #[test]
+    fn primary_branch_command_skips_failed_commands() {
+        let mut failed = branch_command(
+            "119bc457cb05b52dfb0d6b14f66d9a8a52d09e25".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        failed.failed("monorepo pushes support at most one branch update".to_string());
+        let update = branch_command(
+            "119bc457cb05b52dfb0d6b14f66d9a8a52d09e25".to_string(),
+            "27dd8d4cf39f3868c6eee38b601bc9e9939304f5".to_string(),
+        );
+
+        let selected = primary_branch_command(&[failed, update.clone()]);
 
         assert_eq!(selected, Some(update));
     }
