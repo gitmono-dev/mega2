@@ -37,4 +37,4 @@
 | `plan-20260908.md` | 日期计划 | **已完成**（SP-01..SP-05；SSH upload-pack 对齐 HTTP 读；`auth_none`/password-token；SP-04 cancelled→SP-01；DEFER-SP-01..04；Codex R18 PASS） |
 | `plan-20260910.md` | 日期计划 | **已完成**（MW-01..MW-06；CL merge 强制 MonoWriteQueue；删除 `merge_writer` / Legacy processor / `merge_queue` 表；无存量迁移） |
 | `plan-20260902.md` | 日期计划 | **已完成**（DR-01..DR-15；storage-only OCI `/v2`；文档 [`../refactoring/oci.md`](../refactoring/oci.md)；DR-15 tip `070783e` / v0.8.53；完成判据文档收口见 tip） |
-| [`plan-20260911.md`](plan-20260911.md) | 日期计划 | **新建**（storage-only Agent Capture：AC-01..AC-21；`[agent_capture]` 配置门、`agent_capture_*` 表、`ObjectNamespace::Agent`、独立 ingest token、`/api/v1/agent-capture` raw ingest/查询；review 形态不挂载；libra 客户端 DEFER） |
+| [`plan-20260911.md`](plan-20260911.md) | 日期计划 | **新建**（storage-only Agent Capture：AC-00、AC-01..AC-22、AC-04-GC、AC-08-R；`[agent_capture]` 配置门、`agent_capture_*` 表、`ObjectNamespace::Agent`、独立 ingest token、`/api/v1/agent-capture` raw ingest/查询；review 形态不挂载；libra 客户端 DEFER） |
