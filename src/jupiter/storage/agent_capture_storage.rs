@@ -1,9 +1,11 @@
 use std::ops::Deref;
 
+use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
-    sea_query::{LockType, OnConflict},
+    ActiveModelTrait, ColumnTrait, Condition, DbErr, EntityTrait, IntoActiveModel, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
+    prelude::DateTimeWithTimeZone,
+    sea_query::{Expr, ExprTrait, LockType, OnConflict, Query},
 };
 
 use crate::{
@@ -896,6 +898,46 @@ impl AgentCaptureStorage {
         txn.commit().await?;
         Ok(inserted.last_insert_id)
     }
+
+    /// GC candidates: no `blob_ref`, lease empty or expired, and not protected.
+    pub async fn gc_candidates(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<i64>, MegaError> {
+        let now: DateTimeWithTimeZone = Utc::now().into();
+        let rows = agent_capture_blob::Entity::find()
+            .filter(agent_capture_blob::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_blob::Column::TenantId.eq(tenant_id.to_owned()))
+            .filter(agent_capture_blob::Column::LeaseState.ne("protected"))
+            .filter(
+                Condition::any()
+                    .add(agent_capture_blob::Column::LeaseExpiresAt.is_null())
+                    .add(agent_capture_blob::Column::LeaseExpiresAt.lte(now)),
+            )
+            .filter(Expr::not_exists(
+                Query::select()
+                    .column((
+                        agent_capture_blob_ref::Entity,
+                        agent_capture_blob_ref::Column::Id,
+                    ))
+                    .from(agent_capture_blob_ref::Entity)
+                    .and_where(
+                        Expr::col((
+                            agent_capture_blob_ref::Entity,
+                            agent_capture_blob_ref::Column::BlobId,
+                        ))
+                        .eq(Expr::col((
+                            agent_capture_blob::Entity,
+                            agent_capture_blob::Column::Id,
+                        ))),
+                    )
+                    .take(),
+            ))
+            .all(self.get_connection())
+            .await?;
+        Ok(rows.into_iter().map(|blob| blob.id).collect())
+    }
 }
 
 fn is_unique_constraint_error(err: &sea_orm::DbErr) -> bool {
@@ -1514,5 +1556,98 @@ mod tests {
             )
             .await
             .expect_err("foreign ledger scope");
+    }
+
+    async fn insert_blob(
+        storage: &AgentCaptureStorage,
+        capture_id: i64,
+        digest: &str,
+        lease_state: &str,
+        lease_id: Option<&str>,
+        lease_expires_at: Option<DateTimeWithTimeZone>,
+    ) -> i64 {
+        let inserted = agent_capture_blob::Entity::insert(agent_capture_blob::ActiveModel {
+            deployment_id: Set("default".to_owned()),
+            tenant_id: Set("default".to_owned()),
+            digest: Set(digest.to_owned()),
+            visibility: Set("raw".to_owned()),
+            object_key: Set(format!("default/default/{lease_state}/{digest}")),
+            size_bytes: Set(1),
+            lease_state: Set(lease_state.to_owned()),
+            lease_generation: Set(0),
+            lease_id: Set(lease_id.map(str::to_owned)),
+            lease_expires_at: Set(lease_expires_at),
+            capture_id: Set(Some(capture_id)),
+            ..Default::default()
+        })
+        .exec(storage.get_connection())
+        .await
+        .expect("insert blob");
+        inserted.last_insert_id
+    }
+
+    #[tokio::test]
+    async fn gc_candidates_skip_live_lease_ref_protected() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        let referenced = storage
+            .finalize_blob_with_session_ref(
+                capture_id,
+                "sha256:refed",
+                "raw",
+                "default/default/raw/sha256/refed",
+                4,
+            )
+            .await
+            .expect("referenced blob");
+
+        let now = Utc::now();
+        let live = insert_blob(
+            &storage,
+            capture_id,
+            "sha256:live",
+            "staging",
+            Some("lease-live"),
+            Some((now + chrono::Duration::hours(1)).into()),
+        )
+        .await;
+        let protected =
+            insert_blob(&storage, capture_id, "sha256:prot", "protected", None, None).await;
+        let expired = insert_blob(
+            &storage,
+            capture_id,
+            "sha256:exp",
+            "expired",
+            Some("lease-exp"),
+            Some((now - chrono::Duration::hours(1)).into()),
+        )
+        .await;
+
+        let candidates = storage
+            .gc_candidates(&key.deployment_id, &key.tenant_id)
+            .await
+            .expect("gc candidates");
+        assert!(
+            !candidates.contains(&referenced),
+            "blob_ref must exclude candidates"
+        );
+        assert!(
+            !candidates.contains(&live),
+            "live lease must exclude candidates"
+        );
+        assert!(
+            !candidates.contains(&protected),
+            "protected must exclude candidates"
+        );
+        assert!(
+            candidates.contains(&expired),
+            "expired unreferenced blob is a candidate"
+        );
+        let foreign = storage
+            .gc_candidates("other-deploy", &key.tenant_id)
+            .await
+            .expect("foreign scope");
+        assert!(foreign.is_empty());
     }
 }
