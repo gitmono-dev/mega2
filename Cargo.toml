@@ -1,6 +1,6 @@
 [package]
 name = "monoengine"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 # Two [[bin]] targets exist; keep `cargo run -p monoengine` unambiguous.
 default-run = "monoengine"
@@ -72,6 +72,7 @@ rkyv = "0.8.18"
 rsa = "0.9.10"
 russh = "0.63.3"
 rustls = "0.23.44"
+ryu = "1.0.23"
 sea-orm = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "debug-print"] }
 sea-orm-migration = { version = "2.0.2", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 secp256k1 = { version = "0.33.1", features = ["serde", "rand"] }

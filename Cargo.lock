@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -4332,6 +4332,7 @@ dependencies = [
  "rsa 0.9.10",
  "russh",
  "rustls",
+ "ryu",
  "sea-orm",
  "sea-orm-migration",
  "secp256k1",
