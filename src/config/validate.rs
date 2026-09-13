@@ -135,6 +135,7 @@ impl Config {
         reject_legacy_oauth_environment()?;
         reject_legacy_mail_environment()?;
         validate_trunk_config_surface(self)?;
+        validate_agent_capture_config(self)?;
 
         Ok(())
     }
@@ -656,6 +657,34 @@ pub(crate) fn validate_trunk_config_surface(config: &Config) -> Result<(), MegaE
              Distribution surface is only mounted in storage-only deployments"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_capture_config(config: &Config) -> Result<(), MegaError> {
+    let capture = &config.agent_capture;
+    if capture.enabled && !config.git.storage_only() {
+        return Err(MegaError::Other(
+            "[agent_capture] enabled=true requires git.push_auth (storage-only); \
+             the /api/v1/agent-capture surface is only mounted in storage-only deployments"
+                .to_string(),
+        ));
+    }
+    if capture.enabled && capture.ingest_tokens.is_empty() {
+        return Err(MegaError::Other(
+            "[agent_capture] enabled=true requires at least one [[agent_capture.ingest_tokens]] entry"
+                .to_string(),
+        ));
+    }
+    for token in &capture.ingest_tokens {
+        if let Some(token_tenant) = &token.tenant_id
+            && token_tenant != &capture.tenant_id
+        {
+            return Err(MegaError::Other(
+                "[[agent_capture.ingest_tokens]].tenant_id must equal [agent_capture].tenant_id"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1482,6 +1511,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "oauth",
             "git",
             "oci",
+            "agent_capture",
             "cedar",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
@@ -1574,6 +1604,18 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         ]),
         "git.push_tokens" => Some(&["name", "token", "paths"]),
         "oci" => Some(&["enabled"]),
+        "agent_capture" => Some(&[
+            "enabled",
+            "tenant_id",
+            "deployment_id",
+            "max_blob_bytes",
+            "max_file_blobs_per_session",
+            "max_events_per_batch",
+            "max_event_bytes",
+            "lease_ttl_seconds",
+            "ingest_tokens",
+        ]),
+        "agent_capture.ingest_tokens" => Some(&["name", "token", "paths", "tenant_id"]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
     }
@@ -3032,6 +3074,32 @@ mod tests {
         )
         .unwrap();
         assert!(reject_unknown_fields(&value).is_ok());
+    }
+
+    #[test]
+    fn reject_unknown_fields_rejects_unknown_agent_capture_key() {
+        assert!(
+            known_fields("")
+                .expect("root schema")
+                .contains(&"agent_capture")
+        );
+        let value = toml::from_str::<Value>(
+            r#"
+            base_dir = "/tmp"
+            [database]
+            db_url = "postgres://localhost:5432/mono"
+            [monorepo]
+            import_dir = "/third-party"
+            admin = ["admin"]
+            root_dirs = ["project"]
+            [agent_capture]
+            unexpected = true
+            "#,
+        )
+        .unwrap();
+        let err =
+            reject_unknown_fields(&value).expect_err("unknown agent_capture key must fail closed");
+        assert!(err.to_string().contains("unexpected"), "{err}");
     }
 
     #[test]

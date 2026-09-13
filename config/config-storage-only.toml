@@ -358,3 +358,8 @@ token = "${file:/run/secrets/monoengine-push-token}"
 # 拉取跟随 anonymous_access;推送用下方 push_tokens 走 Basic 认证.
 [oci]
 enabled = true
+
+# Agent Capture ingest (plan-20260911). Disabled placeholder: do not enable and
+# do not commit a usable ingest token in this tracked file.
+[agent_capture]
+enabled = false

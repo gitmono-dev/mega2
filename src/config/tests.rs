@@ -2,8 +2,9 @@
 //! restart-required fields, and DB-backed startup checks ②③⑥.
 
 use super::{
-    DEFAULT_MAX_PUSH_COMMITS, GitConfig, PushAuth, PushPolicy, PushTokenConfig,
-    reload::ConfigHandle, testing::isolated_config, token_path_authorizes,
+    AgentCaptureConfig, AgentCaptureIngestTokenConfig, DEFAULT_MAX_PUSH_COMMITS, GitConfig,
+    PushAuth, PushPolicy, PushTokenConfig, reload::ConfigHandle, testing::isolated_config,
+    token_path_authorizes,
 };
 use crate::{
     callisto::sea_orm_active_enums::PushQueueKindEnum,
@@ -107,6 +108,67 @@ fn oci_enabled_requires_storage_only() {
     storage_only
         .validate()
         .expect("[oci] enabled in storage-only");
+}
+
+#[test]
+fn agent_capture_enabled_requires_storage_only() {
+    let mut review = valid_config();
+    review.agent_capture.enabled = true;
+    review.agent_capture.ingest_tokens = vec![AgentCaptureIngestTokenConfig {
+        name: "capture".into(),
+        token: "literal-for-tests".into(),
+        paths: None,
+        tenant_id: None,
+    }];
+    let err = review
+        .validate()
+        .expect_err("[agent_capture] enabled=true must fail closed without git.push_auth");
+    assert!(err.to_string().contains("[agent_capture]"), "{err}");
+
+    let mut storage_only = trunk_config(std::env::temp_dir().as_path());
+    storage_only.agent_capture.enabled = true;
+    storage_only.agent_capture.ingest_tokens = vec![AgentCaptureIngestTokenConfig {
+        name: "capture".into(),
+        token: "literal-for-tests".into(),
+        paths: None,
+        tenant_id: None,
+    }];
+    storage_only
+        .validate()
+        .expect("[agent_capture] enabled in storage-only with ingest token");
+}
+
+#[test]
+fn agent_capture_enabled_requires_ingest_token() {
+    let mut storage_only = trunk_config(std::env::temp_dir().as_path());
+    storage_only.agent_capture.enabled = true;
+    let err = storage_only
+        .validate()
+        .expect_err("[agent_capture] enabled=true requires ingest_tokens");
+    assert!(err.to_string().contains("ingest_tokens"), "{err}");
+}
+
+#[test]
+fn agent_capture_quota_defaults() {
+    let from_default = AgentCaptureConfig::default();
+    assert!(!from_default.enabled);
+    assert_eq!(from_default.tenant_id, "default");
+    assert_eq!(from_default.deployment_id, "default");
+    assert_eq!(from_default.max_blob_bytes, 16_777_216);
+    assert_eq!(from_default.max_file_blobs_per_session, 20);
+    assert_eq!(from_default.max_events_per_batch, 500);
+    assert_eq!(from_default.max_event_bytes, 1_048_576);
+    assert_eq!(from_default.lease_ttl_seconds, 900);
+    assert!(from_default.ingest_tokens.is_empty());
+
+    let parsed: AgentCaptureConfig =
+        toml::from_str("tenant_id = \"default\"").expect("partial table deserializes");
+    assert!(!parsed.enabled);
+    assert_eq!(parsed.max_blob_bytes, 16_777_216);
+    assert_eq!(parsed.max_file_blobs_per_session, 20);
+    assert_eq!(parsed.max_events_per_batch, 500);
+    assert_eq!(parsed.max_event_bytes, 1_048_576);
+    assert_eq!(parsed.lease_ttl_seconds, 900);
 }
 
 #[test]

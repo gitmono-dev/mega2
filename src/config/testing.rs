@@ -12,8 +12,9 @@ use std::{
 use async_trait::async_trait;
 
 use super::{
-    ArtifactGcConfig, BlameConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
-    LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig, RedisConfig,
+    AgentCaptureConfig, ArtifactGcConfig, BlameConfig, CedarConfig, Config, DbConfig, GitConfig,
+    LFSConfig, LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig,
+    RedisConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -201,6 +202,7 @@ impl TestConfigBuilder {
             oauth: None,
             git: GitConfig::default(),
             oci: OciConfig::default(),
+            agent_capture: AgentCaptureConfig::default(),
             cedar: CedarConfig::default(),
         }
     }

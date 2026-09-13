@@ -45,6 +45,11 @@ pub struct Config {
     /// `/v2` protocol surface is only mounted under that combination.
     #[serde(default)]
     pub oci: OciConfig,
+    /// Storage-only Agent Capture ingest surface, plan-20260911.
+    /// `enabled = true` requires storage-only (`git.push_auth` set) and at
+    /// least one `[[agent_capture.ingest_tokens]]` entry.
+    #[serde(default)]
+    pub agent_capture: AgentCaptureConfig,
     /// Authorization enforcement switch (`[cedar]`), ADR-UN-01. Default `off`
     /// (no build, no consume of authorization data).
     #[serde(default)]
@@ -58,6 +63,88 @@ pub struct OciConfig {
     /// (fail-closed: the surface is not registered).
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Storage-only Agent Capture ingest settings (ADR-AC-03).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentCaptureConfig {
+    /// Mount `/api/v1/agent-capture` when true AND `git.storage_only()`.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_agent_capture_tenant_id")]
+    pub tenant_id: String,
+    #[serde(default = "default_agent_capture_deployment_id")]
+    pub deployment_id: String,
+    #[serde(default = "default_agent_capture_max_blob_bytes")]
+    pub max_blob_bytes: u64,
+    #[serde(default = "default_agent_capture_max_file_blobs_per_session")]
+    pub max_file_blobs_per_session: u32,
+    #[serde(default = "default_agent_capture_max_events_per_batch")]
+    pub max_events_per_batch: u32,
+    #[serde(default = "default_agent_capture_max_event_bytes")]
+    pub max_event_bytes: u64,
+    #[serde(default = "default_agent_capture_lease_ttl_seconds")]
+    pub lease_ttl_seconds: u64,
+    #[serde(default)]
+    pub ingest_tokens: Vec<AgentCaptureIngestTokenConfig>,
+}
+
+impl Default for AgentCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tenant_id: default_agent_capture_tenant_id(),
+            deployment_id: default_agent_capture_deployment_id(),
+            max_blob_bytes: default_agent_capture_max_blob_bytes(),
+            max_file_blobs_per_session: default_agent_capture_max_file_blobs_per_session(),
+            max_events_per_batch: default_agent_capture_max_events_per_batch(),
+            max_event_bytes: default_agent_capture_max_event_bytes(),
+            lease_ttl_seconds: default_agent_capture_lease_ttl_seconds(),
+            ingest_tokens: Vec::new(),
+        }
+    }
+}
+
+fn default_agent_capture_tenant_id() -> String {
+    "default".to_string()
+}
+
+fn default_agent_capture_deployment_id() -> String {
+    "default".to_string()
+}
+
+fn default_agent_capture_max_blob_bytes() -> u64 {
+    16_777_216
+}
+
+fn default_agent_capture_max_file_blobs_per_session() -> u32 {
+    20
+}
+
+fn default_agent_capture_max_events_per_batch() -> u32 {
+    500
+}
+
+fn default_agent_capture_max_event_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_agent_capture_lease_ttl_seconds() -> u64 {
+    900
+}
+
+/// Independent ingest token for Agent Capture (not `[[git.push_tokens]]`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentCaptureIngestTokenConfig {
+    pub name: String,
+    pub token: String,
+    /// Prefix authorization via `token_path_authorizes`. Omitted or empty =
+    /// whole repository.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// If set, must equal `[agent_capture].tenant_id`.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

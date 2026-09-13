@@ -326,3 +326,16 @@ enforcement = "off"
 # [oci]
 # enabled = true
 
+# Agent Capture ingest (plan-20260911). Storage-only only:
+# enabled=true requires git.push_auth and at least one [[agent_capture.ingest_tokens]]
+# entry. Do not put a usable ingest token in this tracked sample. Tests inject
+# tokens via in-memory Config or a temporary toml.
+# [agent_capture]
+# enabled = false
+# tenant_id = "default"
+# deployment_id = "default"
+# [[agent_capture.ingest_tokens]]
+# name = "capture"
+# token = "${file:/run/secrets/agent_capture_token}"
+# paths = ["/project/foo"]
+

@@ -141,6 +141,7 @@ impl Config {
             oauth: None,
             git: GitConfig::default(),
             oci: OciConfig::default(),
+            agent_capture: AgentCaptureConfig::default(),
             cedar: CedarConfig::default(),
         }
     }
