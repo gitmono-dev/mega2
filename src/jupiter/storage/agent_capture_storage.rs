@@ -8,8 +8,9 @@ use sea_orm::{
 
 use crate::{
     callisto::{
-        agent_capture_checkpoint, agent_capture_event, agent_capture_file_op,
-        agent_capture_session, agent_capture_source_stream,
+        agent_capture_blob, agent_capture_blob_ref, agent_capture_checkpoint, agent_capture_event,
+        agent_capture_file_op, agent_capture_ingest_receipt, agent_capture_session,
+        agent_capture_source_stream,
     },
     common::{canonical_json, errors::MegaError},
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
@@ -376,6 +377,304 @@ impl AgentCaptureStorage {
         txn.commit().await?;
         Ok(inserted.last_insert_id)
     }
+
+    fn blob_by_digest_key(
+        deployment_id: &str,
+        tenant_id: &str,
+        digest: &str,
+        visibility: &str,
+    ) -> sea_orm::Select<agent_capture_blob::Entity> {
+        agent_capture_blob::Entity::find()
+            .filter(agent_capture_blob::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_blob::Column::TenantId.eq(tenant_id.to_owned()))
+            .filter(agent_capture_blob::Column::Digest.eq(digest.to_owned()))
+            .filter(agent_capture_blob::Column::Visibility.eq(visibility.to_owned()))
+    }
+
+    fn receipt_by_scope(
+        deployment_id: &str,
+        tenant_id: &str,
+        producer_id: &str,
+        capture_id: i64,
+        operation: &str,
+        idempotency_key: &str,
+    ) -> sea_orm::Select<agent_capture_ingest_receipt::Entity> {
+        agent_capture_ingest_receipt::Entity::find()
+            .filter(agent_capture_ingest_receipt::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_ingest_receipt::Column::TenantId.eq(tenant_id.to_owned()))
+            .filter(agent_capture_ingest_receipt::Column::ProducerId.eq(producer_id.to_owned()))
+            .filter(agent_capture_ingest_receipt::Column::CaptureId.eq(capture_id))
+            .filter(agent_capture_ingest_receipt::Column::Operation.eq(operation.to_owned()))
+            .filter(
+                agent_capture_ingest_receipt::Column::IdempotencyKey.eq(idempotency_key.to_owned()),
+            )
+    }
+
+    /// Insert a staging blob, then in the same transaction mark it committed
+    /// and attach a session `blob_ref`. Identical digest/visibility rows are
+    /// shared; a second finalize only adds the owner ref.
+    pub async fn finalize_blob_with_session_ref(
+        &self,
+        capture_id: i64,
+        digest: &str,
+        visibility: &str,
+        object_key: &str,
+        size_bytes: i64,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+
+        let existing = Self::blob_by_digest_key(
+            &session.deployment_id,
+            &session.tenant_id,
+            digest,
+            visibility,
+        )
+        .lock(LockType::Update)
+        .one(&txn)
+        .await?;
+
+        let blob_id = if let Some(existing) = existing {
+            if existing.lease_state == "committed" {
+                existing.id
+            } else {
+                txn.rollback().await?;
+                return Err(MegaError::Other(format!(
+                    "agent_capture_blob digest {digest} has uncommitted lease_state {}",
+                    existing.lease_state
+                )));
+            }
+        } else {
+            let result = agent_capture_blob::Entity::insert(agent_capture_blob::ActiveModel {
+                deployment_id: Set(session.deployment_id.clone()),
+                tenant_id: Set(session.tenant_id.clone()),
+                digest: Set(digest.to_owned()),
+                visibility: Set(visibility.to_owned()),
+                object_key: Set(object_key.to_owned()),
+                size_bytes: Set(size_bytes),
+                lease_state: Set("staging".to_owned()),
+                lease_generation: Set(0),
+                capture_id: Set(Some(capture_id)),
+                upload_intent: Set(Some("stage".to_owned())),
+                ..Default::default()
+            })
+            .on_conflict(
+                OnConflict::columns([
+                    agent_capture_blob::Column::DeploymentId,
+                    agent_capture_blob::Column::TenantId,
+                    agent_capture_blob::Column::Digest,
+                    agent_capture_blob::Column::Visibility,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(&txn)
+            .await;
+
+            let inserted_id = match result {
+                Ok(inserted) if inserted.last_insert_id != 0 => Some(inserted.last_insert_id),
+                Ok(_) => None,
+                Err(err)
+                    if matches!(err, DbErr::RecordNotInserted)
+                        || is_unique_constraint_error(&err) =>
+                {
+                    None
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            let blob = Self::blob_by_digest_key(
+                &session.deployment_id,
+                &session.tenant_id,
+                digest,
+                visibility,
+            )
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other("agent_capture_blob missing after staging insert".to_owned())
+            })?;
+
+            if let Some(inserted_id) = inserted_id {
+                if blob.id != inserted_id || blob.lease_state != "staging" {
+                    txn.rollback().await?;
+                    return Err(MegaError::Other(format!(
+                        "agent_capture_blob digest {digest} was not staged by this transaction"
+                    )));
+                }
+                let mut blob = blob.into_active_model();
+                blob.lease_state = Set("committed".to_owned());
+                blob.lease_generation = Set(1);
+                blob.upload_intent = Set(None);
+                blob.update(&txn).await?;
+                inserted_id
+            } else if blob.lease_state == "committed" {
+                blob.id
+            } else {
+                txn.rollback().await?;
+                return Err(MegaError::Other(format!(
+                    "agent_capture_blob digest {digest} has uncommitted lease_state {}",
+                    blob.lease_state
+                )));
+            }
+        };
+
+        let existing_ref = agent_capture_blob_ref::Entity::find()
+            .filter(agent_capture_blob_ref::Column::BlobId.eq(blob_id))
+            .filter(agent_capture_blob_ref::Column::OwnerSessionId.eq(capture_id))
+            .one(&txn)
+            .await?;
+        if existing_ref.is_none() {
+            agent_capture_blob_ref::Entity::insert(agent_capture_blob_ref::ActiveModel {
+                blob_id: Set(blob_id),
+                owner_session_id: Set(Some(capture_id)),
+                owner_event_id: Set(None),
+                owner_checkpoint_id: Set(None),
+                owner_file_op_id: Set(None),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(blob_id)
+    }
+
+    pub async fn upsert_ingest_receipt(
+        &self,
+        capture_id: i64,
+        operation: &str,
+        idempotency_key: &str,
+        body: &serde_json::Value,
+        response: Option<serde_json::Value>,
+    ) -> Result<i64, MegaError> {
+        let fingerprint = canonical_json::fingerprint(&body.to_string())?;
+        let txn = self.get_connection().begin().await?;
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+
+        if let Some(existing) = Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            operation,
+            idempotency_key,
+        )
+        .lock(LockType::Update)
+        .one(&txn)
+        .await?
+        {
+            if existing.fingerprint == fingerprint {
+                txn.commit().await?;
+                return Ok(existing.id);
+            }
+            txn.rollback().await?;
+            return Err(MegaError::Other(format!(
+                "ingest receipt fingerprint conflict for capture_id {capture_id}"
+            )));
+        }
+
+        let result = agent_capture_ingest_receipt::Entity::insert(
+            agent_capture_ingest_receipt::ActiveModel {
+                deployment_id: Set(session.deployment_id.clone()),
+                tenant_id: Set(session.tenant_id.clone()),
+                producer_id: Set(session.producer_id.clone()),
+                capture_id: Set(capture_id),
+                operation: Set(operation.to_owned()),
+                idempotency_key: Set(idempotency_key.to_owned()),
+                fingerprint: Set(fingerprint.clone()),
+                response: Set(response),
+                ..Default::default()
+            },
+        )
+        .on_conflict(
+            OnConflict::columns([
+                agent_capture_ingest_receipt::Column::DeploymentId,
+                agent_capture_ingest_receipt::Column::TenantId,
+                agent_capture_ingest_receipt::Column::ProducerId,
+                agent_capture_ingest_receipt::Column::CaptureId,
+                agent_capture_ingest_receipt::Column::Operation,
+                agent_capture_ingest_receipt::Column::IdempotencyKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(&txn)
+        .await;
+
+        let receipt_id = match result {
+            Ok(inserted) if inserted.last_insert_id != 0 => inserted.last_insert_id,
+            Ok(_) => {
+                let existing = Self::receipt_by_scope(
+                    &session.deployment_id,
+                    &session.tenant_id,
+                    &session.producer_id,
+                    capture_id,
+                    operation,
+                    idempotency_key,
+                )
+                .lock(LockType::Update)
+                .one(&txn)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(
+                        "agent_capture_ingest_receipt insert reported no receipt_id".to_owned(),
+                    )
+                })?;
+                if existing.fingerprint != fingerprint {
+                    txn.rollback().await?;
+                    return Err(MegaError::Other(format!(
+                        "ingest receipt fingerprint conflict for capture_id {capture_id}"
+                    )));
+                }
+                existing.id
+            }
+            Err(err)
+                if matches!(err, DbErr::RecordNotInserted) || is_unique_constraint_error(&err) =>
+            {
+                let existing = Self::receipt_by_scope(
+                    &session.deployment_id,
+                    &session.tenant_id,
+                    &session.producer_id,
+                    capture_id,
+                    operation,
+                    idempotency_key,
+                )
+                .lock(LockType::Update)
+                .one(&txn)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(
+                        "agent_capture_ingest_receipt unique conflict but row missing".to_owned(),
+                    )
+                })?;
+                if existing.fingerprint != fingerprint {
+                    txn.rollback().await?;
+                    return Err(MegaError::Other(format!(
+                        "ingest receipt fingerprint conflict for capture_id {capture_id}"
+                    )));
+                }
+                existing.id
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        txn.commit().await?;
+        Ok(receipt_id)
+    }
 }
 
 fn is_unique_constraint_error(err: &sea_orm::DbErr) -> bool {
@@ -392,7 +691,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        callisto::{agent_capture_event, agent_capture_source_stream},
+        callisto::{
+            agent_capture_blob, agent_capture_blob_ref, agent_capture_event,
+            agent_capture_ingest_receipt, agent_capture_source_stream,
+        },
         jupiter::{migration::apply_migrations, tests::test_db_connection},
     };
 
@@ -636,5 +938,179 @@ mod tests {
             .await
             .expect("file_op");
         assert!(id > 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_writes_blob_ref_same_txn() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        let blob_id = storage
+            .finalize_blob_with_session_ref(
+                capture_id,
+                "sha256:abc",
+                "raw",
+                "default/default/raw/sha256/abc",
+                12,
+            )
+            .await
+            .expect("finalize blob");
+        let blob = agent_capture_blob::Entity::find_by_id(blob_id)
+            .one(storage.get_connection())
+            .await
+            .expect("load blob")
+            .expect("blob exists");
+        assert_eq!(blob.lease_state, "committed");
+        let refs = agent_capture_blob_ref::Entity::find()
+            .filter(agent_capture_blob_ref::Column::BlobId.eq(blob_id))
+            .all(storage.get_connection())
+            .await
+            .expect("load blob_ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].owner_session_id, Some(capture_id));
+    }
+
+    #[tokio::test]
+    async fn ingest_receipt_idempotent() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        let body = serde_json::json!({"op": "events"});
+        let first = storage
+            .upsert_ingest_receipt(capture_id, "events", "k1", &body, None)
+            .await
+            .expect("first receipt");
+        let second = storage
+            .upsert_ingest_receipt(capture_id, "events", "k1", &body, None)
+            .await
+            .expect("second receipt");
+        assert_eq!(first, second);
+        let rows = agent_capture_ingest_receipt::Entity::find()
+            .filter(agent_capture_ingest_receipt::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count receipts");
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_receipt_fingerprint_conflict() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        storage
+            .upsert_ingest_receipt(
+                capture_id,
+                "events",
+                "k1",
+                &serde_json::json!({"op": "events"}),
+                None,
+            )
+            .await
+            .expect("first receipt");
+        let err = storage
+            .upsert_ingest_receipt(
+                capture_id,
+                "events",
+                "k1",
+                &serde_json::json!({"op": "other"}),
+                None,
+            )
+            .await
+            .expect_err("different body must conflict");
+        assert!(err.to_string().contains("fingerprint conflict"));
+    }
+
+    #[tokio::test]
+    async fn finalize_shares_committed_blob_by_digest() {
+        let (_temp_dir, storage) = storage().await;
+        let first_session = storage.upsert_session(sample_key()).await.expect("session");
+        let mut other = sample_key();
+        other.client_session_id = "provider__other".to_owned();
+        let second_session = storage.upsert_session(other).await.expect("other session");
+        let first = storage
+            .finalize_blob_with_session_ref(
+                first_session,
+                "sha256:abc",
+                "raw",
+                "default/default/raw/sha256/abc",
+                12,
+            )
+            .await
+            .expect("first finalize");
+        let second = storage
+            .finalize_blob_with_session_ref(
+                second_session,
+                "sha256:abc",
+                "raw",
+                "default/default/raw/sha256/abc",
+                12,
+            )
+            .await
+            .expect("second finalize");
+        assert_eq!(first, second);
+        let blob_rows = agent_capture_blob::Entity::find()
+            .filter(agent_capture_blob::Column::Digest.eq("sha256:abc"))
+            .count(storage.get_connection())
+            .await
+            .expect("count blobs");
+        assert_eq!(blob_rows, 1);
+        let refs = agent_capture_blob_ref::Entity::find()
+            .filter(agent_capture_blob_ref::Column::BlobId.eq(first))
+            .count(storage.get_connection())
+            .await
+            .expect("count refs");
+        assert_eq!(refs, 2);
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_foreign_staging_blob() {
+        let (_temp_dir, storage) = storage().await;
+        let owner = storage
+            .upsert_session(sample_key())
+            .await
+            .expect("owner session");
+        agent_capture_blob::Entity::insert(agent_capture_blob::ActiveModel {
+            deployment_id: Set("default".to_owned()),
+            tenant_id: Set("default".to_owned()),
+            digest: Set("sha256:live".to_owned()),
+            visibility: Set("raw".to_owned()),
+            object_key: Set("default/default/staging/lease-owner".to_owned()),
+            size_bytes: Set(4),
+            lease_state: Set("staging".to_owned()),
+            lease_generation: Set(0),
+            capture_id: Set(Some(owner)),
+            upload_intent: Set(Some("stage".to_owned())),
+            ..Default::default()
+        })
+        .exec(storage.get_connection())
+        .await
+        .expect("foreign staging");
+
+        let mut other = sample_key();
+        other.client_session_id = "provider__other".to_owned();
+        let other_id = storage.upsert_session(other).await.expect("other session");
+        storage
+            .finalize_blob_with_session_ref(
+                other_id,
+                "sha256:live",
+                "raw",
+                "default/default/raw/sha256/live",
+                4,
+            )
+            .await
+            .expect_err("must not steal live staging");
+
+        let blob = agent_capture_blob::Entity::find()
+            .filter(agent_capture_blob::Column::Digest.eq("sha256:live"))
+            .one(storage.get_connection())
+            .await
+            .expect("load blob")
+            .expect("blob exists");
+        assert_eq!(blob.lease_state, "staging");
+        assert_eq!(blob.capture_id, Some(owner));
+        let refs = agent_capture_blob_ref::Entity::find()
+            .filter(agent_capture_blob_ref::Column::BlobId.eq(blob.id))
+            .count(storage.get_connection())
+            .await
+            .expect("count refs");
+        assert_eq!(refs, 0);
     }
 }
