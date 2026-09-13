@@ -3,14 +3,17 @@
 pub mod prelude;
 
 pub mod access_token;
+pub mod agent_capture_access_audit;
 pub mod agent_capture_blob;
 pub mod agent_capture_blob_ref;
 pub mod agent_capture_checkpoint;
+pub mod agent_capture_deletion_ledger;
 pub mod agent_capture_event;
 pub mod agent_capture_file_op;
 pub mod agent_capture_ingest_receipt;
 pub mod agent_capture_session;
 pub mod agent_capture_source_stream;
+pub mod agent_capture_tombstone;
 pub mod artifact_objects;
 pub mod artifact_set_files;
 pub mod artifact_sets;

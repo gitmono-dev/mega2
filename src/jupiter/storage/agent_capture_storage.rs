@@ -8,9 +8,10 @@ use sea_orm::{
 
 use crate::{
     callisto::{
-        agent_capture_blob, agent_capture_blob_ref, agent_capture_checkpoint, agent_capture_event,
+        agent_capture_access_audit, agent_capture_blob, agent_capture_blob_ref,
+        agent_capture_checkpoint, agent_capture_deletion_ledger, agent_capture_event,
         agent_capture_file_op, agent_capture_ingest_receipt, agent_capture_session,
-        agent_capture_source_stream,
+        agent_capture_source_stream, agent_capture_tombstone,
     },
     common::{canonical_json, errors::MegaError},
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
@@ -675,6 +676,226 @@ impl AgentCaptureStorage {
         txn.commit().await?;
         Ok(receipt_id)
     }
+
+    fn scoped_session(
+        capture_id: i64,
+        deployment_id: &str,
+        tenant_id: &str,
+    ) -> sea_orm::Select<agent_capture_session::Entity> {
+        agent_capture_session::Entity::find_by_id(capture_id)
+            .filter(agent_capture_session::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_session::Column::TenantId.eq(tenant_id.to_owned()))
+    }
+
+    pub async fn insert_access_audit(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+        capture_id: i64,
+        actor: &str,
+        action: &str,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let session = Self::scoped_session(capture_id, deployment_id, tenant_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!(
+                    "agent_capture_session {capture_id} does not exist in scope"
+                ))
+            })?;
+
+        let inserted =
+            agent_capture_access_audit::Entity::insert(agent_capture_access_audit::ActiveModel {
+                deployment_id: Set(session.deployment_id),
+                tenant_id: Set(session.tenant_id),
+                capture_id: Set(capture_id),
+                actor: Set(actor.to_owned()),
+                action: Set(action.to_owned()),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(inserted.last_insert_id)
+    }
+
+    pub async fn insert_tombstone(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+        capture_id: i64,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let session = Self::scoped_session(capture_id, deployment_id, tenant_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!(
+                    "agent_capture_session {capture_id} does not exist in scope"
+                ))
+            })?;
+
+        if let Some(existing) = agent_capture_tombstone::Entity::find()
+            .filter(agent_capture_tombstone::Column::DeploymentId.eq(session.deployment_id.clone()))
+            .filter(agent_capture_tombstone::Column::TenantId.eq(session.tenant_id.clone()))
+            .filter(agent_capture_tombstone::Column::RepoId.eq(session.repo_id.clone()))
+            .filter(agent_capture_tombstone::Column::ProducerId.eq(session.producer_id.clone()))
+            .filter(agent_capture_tombstone::Column::SessionKind.eq(session.session_kind.clone()))
+            .filter(
+                agent_capture_tombstone::Column::ClientSessionId
+                    .eq(session.client_session_id.clone()),
+            )
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+        {
+            txn.commit().await?;
+            return Ok(existing.id);
+        }
+
+        let result =
+            agent_capture_tombstone::Entity::insert(agent_capture_tombstone::ActiveModel {
+                deployment_id: Set(session.deployment_id.clone()),
+                tenant_id: Set(session.tenant_id.clone()),
+                repo_id: Set(session.repo_id.clone()),
+                producer_id: Set(session.producer_id.clone()),
+                session_kind: Set(session.session_kind.clone()),
+                client_session_id: Set(session.client_session_id.clone()),
+                capture_id: Set(Some(capture_id)),
+                ..Default::default()
+            })
+            .on_conflict(
+                OnConflict::columns([
+                    agent_capture_tombstone::Column::DeploymentId,
+                    agent_capture_tombstone::Column::TenantId,
+                    agent_capture_tombstone::Column::RepoId,
+                    agent_capture_tombstone::Column::ProducerId,
+                    agent_capture_tombstone::Column::SessionKind,
+                    agent_capture_tombstone::Column::ClientSessionId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(&txn)
+            .await;
+
+        let tombstone_id = match result {
+            Ok(inserted) if inserted.last_insert_id != 0 => inserted.last_insert_id,
+            Ok(_) => {
+                agent_capture_tombstone::Entity::find()
+                    .filter(
+                        agent_capture_tombstone::Column::DeploymentId
+                            .eq(session.deployment_id.clone()),
+                    )
+                    .filter(agent_capture_tombstone::Column::TenantId.eq(session.tenant_id.clone()))
+                    .filter(agent_capture_tombstone::Column::RepoId.eq(session.repo_id.clone()))
+                    .filter(
+                        agent_capture_tombstone::Column::ProducerId.eq(session.producer_id.clone()),
+                    )
+                    .filter(
+                        agent_capture_tombstone::Column::SessionKind
+                            .eq(session.session_kind.clone()),
+                    )
+                    .filter(
+                        agent_capture_tombstone::Column::ClientSessionId
+                            .eq(session.client_session_id.clone()),
+                    )
+                    .one(&txn)
+                    .await?
+                    .ok_or_else(|| {
+                        MegaError::Other("agent_capture_tombstone insert reported no id".to_owned())
+                    })?
+                    .id
+            }
+            Err(err)
+                if matches!(err, DbErr::RecordNotInserted) || is_unique_constraint_error(&err) =>
+            {
+                agent_capture_tombstone::Entity::find()
+                    .filter(
+                        agent_capture_tombstone::Column::DeploymentId
+                            .eq(session.deployment_id.clone()),
+                    )
+                    .filter(agent_capture_tombstone::Column::TenantId.eq(session.tenant_id.clone()))
+                    .filter(agent_capture_tombstone::Column::RepoId.eq(session.repo_id.clone()))
+                    .filter(
+                        agent_capture_tombstone::Column::ProducerId.eq(session.producer_id.clone()),
+                    )
+                    .filter(
+                        agent_capture_tombstone::Column::SessionKind
+                            .eq(session.session_kind.clone()),
+                    )
+                    .filter(
+                        agent_capture_tombstone::Column::ClientSessionId
+                            .eq(session.client_session_id.clone()),
+                    )
+                    .one(&txn)
+                    .await?
+                    .ok_or_else(|| {
+                        MegaError::Other(
+                            "agent_capture_tombstone unique conflict but row missing".to_owned(),
+                        )
+                    })?
+                    .id
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        txn.commit().await?;
+        Ok(tombstone_id)
+    }
+
+    pub async fn is_tombstoned(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+        capture_id: i64,
+    ) -> Result<bool, MegaError> {
+        let found = agent_capture_tombstone::Entity::find()
+            .filter(agent_capture_tombstone::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_tombstone::Column::TenantId.eq(tenant_id.to_owned()))
+            .filter(agent_capture_tombstone::Column::CaptureId.eq(capture_id))
+            .one(self.get_connection())
+            .await?;
+        Ok(found.is_some())
+    }
+
+    pub async fn insert_deletion_ledger(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+        capture_id: i64,
+        blob_id: Option<i64>,
+        intent: &str,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let session = Self::scoped_session(capture_id, deployment_id, tenant_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!(
+                    "agent_capture_session {capture_id} does not exist in scope"
+                ))
+            })?;
+
+        let inserted = agent_capture_deletion_ledger::Entity::insert(
+            agent_capture_deletion_ledger::ActiveModel {
+                deployment_id: Set(session.deployment_id),
+                tenant_id: Set(session.tenant_id),
+                blob_id: Set(blob_id),
+                capture_id: Set(Some(capture_id)),
+                intent: Set(intent.to_owned()),
+                ..Default::default()
+            },
+        )
+        .exec(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(inserted.last_insert_id)
+    }
 }
 
 fn is_unique_constraint_error(err: &sea_orm::DbErr) -> bool {
@@ -687,13 +908,16 @@ fn is_unique_constraint_error(err: &sea_orm::DbErr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait};
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, ModelTrait, PaginatorTrait,
+    };
 
     use super::*;
     use crate::{
         callisto::{
-            agent_capture_blob, agent_capture_blob_ref, agent_capture_event,
-            agent_capture_ingest_receipt, agent_capture_source_stream,
+            agent_capture_access_audit, agent_capture_blob, agent_capture_blob_ref,
+            agent_capture_deletion_ledger, agent_capture_event, agent_capture_ingest_receipt,
+            agent_capture_source_stream,
         },
         jupiter::{migration::apply_migrations, tests::test_db_connection},
     };
@@ -1112,5 +1336,183 @@ mod tests {
             .await
             .expect("count refs");
         assert_eq!(refs, 0);
+    }
+
+    #[tokio::test]
+    async fn tombstone_is_detected() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        assert!(
+            !storage
+                .is_tombstoned(&key.deployment_id, &key.tenant_id, capture_id)
+                .await
+                .expect("empty")
+        );
+        storage
+            .insert_tombstone(&key.deployment_id, &key.tenant_id, capture_id)
+            .await
+            .expect("insert tombstone");
+        assert!(
+            storage
+                .is_tombstoned(&key.deployment_id, &key.tenant_id, capture_id)
+                .await
+                .expect("detected")
+        );
+    }
+
+    #[tokio::test]
+    async fn access_audit_inserts_row() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        let id = storage
+            .insert_access_audit(
+                &key.deployment_id,
+                &key.tenant_id,
+                capture_id,
+                "ingest-token",
+                "read_transcript",
+            )
+            .await
+            .expect("insert audit");
+        assert!(id > 0);
+        let row = agent_capture_access_audit::Entity::find_by_id(id)
+            .one(storage.get_connection())
+            .await
+            .expect("load audit")
+            .expect("audit exists");
+        assert_eq!(row.capture_id, capture_id);
+        assert_eq!(row.action, "read_transcript");
+    }
+
+    #[tokio::test]
+    async fn access_audit_rejects_update() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        let id = storage
+            .insert_access_audit(
+                &key.deployment_id,
+                &key.tenant_id,
+                capture_id,
+                "ingest-token",
+                "read_transcript",
+            )
+            .await
+            .expect("insert audit");
+        let row = agent_capture_access_audit::Entity::find_by_id(id)
+            .one(storage.get_connection())
+            .await
+            .expect("load audit")
+            .expect("audit exists");
+        let mut am = row.into_active_model();
+        am.actor = Set("other".to_owned());
+        am.update(storage.get_connection())
+            .await
+            .expect_err("access_audit is append-only");
+    }
+
+    #[tokio::test]
+    async fn access_audit_rejects_delete() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        let id = storage
+            .insert_access_audit(
+                &key.deployment_id,
+                &key.tenant_id,
+                capture_id,
+                "ingest-token",
+                "read_transcript",
+            )
+            .await
+            .expect("insert audit");
+        let row = agent_capture_access_audit::Entity::find_by_id(id)
+            .one(storage.get_connection())
+            .await
+            .expect("load audit")
+            .expect("audit exists");
+        row.delete(storage.get_connection())
+            .await
+            .expect_err("access_audit is append-only");
+        let still = agent_capture_access_audit::Entity::find_by_id(id)
+            .one(storage.get_connection())
+            .await
+            .expect("reload");
+        assert!(still.is_some());
+    }
+
+    #[tokio::test]
+    async fn deletion_ledger_inserts_intent() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        let id = storage
+            .insert_deletion_ledger(
+                &key.deployment_id,
+                &key.tenant_id,
+                capture_id,
+                None,
+                "expire_staging",
+            )
+            .await
+            .expect("ledger");
+        assert!(id > 0);
+        let row = agent_capture_deletion_ledger::Entity::find_by_id(id)
+            .one(storage.get_connection())
+            .await
+            .expect("load ledger")
+            .expect("ledger exists");
+        assert_eq!(row.intent, "expire_staging");
+        assert_eq!(row.capture_id, Some(capture_id));
+        assert!(row.blob_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn tombstone_and_audit_reject_foreign_scope() {
+        let (_temp_dir, storage) = storage().await;
+        let key = sample_key();
+        let capture_id = storage.upsert_session(key.clone()).await.expect("session");
+        storage
+            .insert_tombstone(&key.deployment_id, &key.tenant_id, capture_id)
+            .await
+            .expect("insert tombstone");
+        assert!(
+            !storage
+                .is_tombstoned("other-deploy", &key.tenant_id, capture_id)
+                .await
+                .expect("foreign deployment")
+        );
+        assert!(
+            !storage
+                .is_tombstoned(&key.deployment_id, "other-tenant", capture_id)
+                .await
+                .expect("foreign tenant")
+        );
+        storage
+            .insert_access_audit(
+                "other-deploy",
+                &key.tenant_id,
+                capture_id,
+                "ingest-token",
+                "read_transcript",
+            )
+            .await
+            .expect_err("foreign audit scope");
+        storage
+            .insert_tombstone("other-deploy", &key.tenant_id, capture_id)
+            .await
+            .expect_err("foreign tombstone scope");
+        storage
+            .insert_deletion_ledger(
+                &key.deployment_id,
+                "other-tenant",
+                capture_id,
+                None,
+                "expire_staging",
+            )
+            .await
+            .expect_err("foreign ledger scope");
     }
 }
