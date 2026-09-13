@@ -3,6 +3,7 @@
 pub mod prelude;
 
 pub mod access_token;
+pub mod agent_capture_session;
 pub mod artifact_objects;
 pub mod artifact_set_files;
 pub mod artifact_sets;

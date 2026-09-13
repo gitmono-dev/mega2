@@ -1,3 +1,4 @@
+pub mod agent_capture_storage;
 pub mod artifact_storage;
 pub mod audit_storage;
 pub mod base_storage;
