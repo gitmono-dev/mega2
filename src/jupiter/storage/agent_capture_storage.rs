@@ -7,7 +7,10 @@ use sea_orm::{
 };
 
 use crate::{
-    callisto::{agent_capture_event, agent_capture_session, agent_capture_source_stream},
+    callisto::{
+        agent_capture_checkpoint, agent_capture_event, agent_capture_file_op,
+        agent_capture_session, agent_capture_source_stream,
+    },
     common::{canonical_json, errors::MegaError},
     jupiter::storage::base_storage::{BaseStorage, StorageConnector},
 };
@@ -302,6 +305,77 @@ impl AgentCaptureStorage {
         txn.commit().await?;
         Ok(())
     }
+
+    /// Insert a checkpoint. The parent session must be `external_capture`.
+    pub async fn insert_checkpoint(
+        &self,
+        capture_id: i64,
+        checkpoint_id: &str,
+        transcript_digest: Option<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        if session.session_kind != "external_capture" {
+            txn.rollback().await?;
+            return Err(MegaError::Other(format!(
+                "checkpoint requires session_kind=external_capture for capture_id {capture_id}"
+            )));
+        }
+
+        let inserted =
+            agent_capture_checkpoint::Entity::insert(agent_capture_checkpoint::ActiveModel {
+                capture_id: Set(capture_id),
+                checkpoint_id: Set(checkpoint_id.to_owned()),
+                transcript_digest: Set(transcript_digest),
+                metadata: Set(metadata),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(inserted.last_insert_id)
+    }
+
+    /// Insert a file_op. `source_event_uid` must exist on the same capture.
+    pub async fn insert_file_op(
+        &self,
+        capture_id: i64,
+        source_event_uid: &str,
+        op: &str,
+        path: &str,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let source = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .filter(agent_capture_event::Column::EventUid.eq(source_event_uid))
+            .one(&txn)
+            .await?;
+        if source.is_none() {
+            txn.rollback().await?;
+            return Err(MegaError::Other(format!(
+                "file_op source event {source_event_uid} missing for capture_id {capture_id}"
+            )));
+        }
+
+        let inserted = agent_capture_file_op::Entity::insert(agent_capture_file_op::ActiveModel {
+            capture_id: Set(capture_id),
+            source_event_uid: Set(source_event_uid.to_owned()),
+            op: Set(op.to_owned()),
+            path: Set(path.to_owned()),
+            ..Default::default()
+        })
+        .exec(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(inserted.last_insert_id)
+    }
 }
 
 fn is_unique_constraint_error(err: &sea_orm::DbErr) -> bool {
@@ -504,5 +578,63 @@ mod tests {
             .insert_event(sample_event(9_999_999, serde_json::json!({"ok": true})))
             .await
             .expect_err("missing session");
+    }
+
+    fn internal_key() -> SessionNaturalKey {
+        let mut key = sample_key();
+        key.session_kind = "internal_code".to_owned();
+        key
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_internal_code_parent() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage
+            .upsert_session(internal_key())
+            .await
+            .expect("internal session");
+        storage
+            .insert_checkpoint(capture_id, "cp-1", None, None)
+            .await
+            .expect_err("internal_code cannot host checkpoints");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_accepts_external_capture_parent() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage
+            .upsert_session(sample_key())
+            .await
+            .expect("external session");
+        let id = storage
+            .insert_checkpoint(capture_id, "cp-1", None, None)
+            .await
+            .expect("checkpoint");
+        assert!(id > 0);
+    }
+
+    #[tokio::test]
+    async fn file_op_requires_source_event() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        storage
+            .insert_file_op(capture_id, "0:0", "write", "src/main.rs")
+            .await
+            .expect_err("missing source event");
+    }
+
+    #[tokio::test]
+    async fn file_op_inserts_when_source_exists() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        storage
+            .insert_event(sample_event(capture_id, serde_json::json!({"op": "write"})))
+            .await
+            .expect("source event");
+        let id = storage
+            .insert_file_op(capture_id, "0:0", "write", "src/main.rs")
+            .await
+            .expect("file_op");
+        assert!(id > 0);
     }
 }
