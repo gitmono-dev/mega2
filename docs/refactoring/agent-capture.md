@@ -57,7 +57,7 @@
 
 ## HTTP path / error / pagination
 
-Router 内部 path 以 `/agent-capture` 开头，由外层 nest 到 `/api/v1`。下表为完整外部路径；实现不得再加一层 `/api/v1`。本卡只登记 route-construction fixture（501），业务 handler 由后续卡替换、不改 path。挂载门见后续卡：仅 `git.storage_only() && [agent_capture].enabled=true` 时注册。
+Router 内部 path 以 `/agent-capture` 开头，由外层 nest 到 `/api/v1`。下表为完整外部路径；实现不得再加一层 `/api/v1`。本卡只登记 route-construction fixture（501），业务 handler 由后续卡替换、不改 path。挂载门见下文。
 
 认证头：`Authorization: Bearer <ingest_token>`。查找失败（缺头、非 Bearer、空 secret、或 ingest token 未命中）对齐 401，`error.code` 为 `unauthorized`。token 不覆盖正规化 repo path 时为 404（后续卡）。判定顺序 401 → 404 → 409 → 400/413。
 
@@ -89,3 +89,9 @@ Router 内部 path 以 `/agent-capture` 开头，由外层 nest 到 `/api/v1`。
 | GET | `/api/v1/agent-capture/sessions/{capture_id}/file-ops` |
 
 session JSON 字段：`capture_id`、`client_session_id`、`tenant_id`、`deployment_id`、`repo_id`、`producer_id`、`session_kind`（`external_capture` \| `internal_code`）、`started_at`、`ended_at`、`completeness`（`empty` \| `incomplete` \| `complete` \| `truncated`）、`partial_reason`、`created_at`、`updated_at`。无 `user_id`。identity 与服务端字段不可由客户端覆写；未知 JSON 字段拒绝。
+
+## 挂载
+
+`http_server` 仅当 `git.storage_only()` **且** `[agent_capture].enabled=true` 把 `agent_capture_router` nest 进已有 `/api/v1`。review 形态（`push_auth` 缺省）不 merge 该 router；`enabled=false` 的 storage-only 也不注册。未挂载时对 `/api/v1/agent-capture/discovery` 为裸 404，OpenAPI 不含 `/api/v1/agent-capture`。
+
+`storage_only_openapi_doc(include_oci, include_agent_capture)` 与 `trunk_openapi_doc(include_oci, include_agent_capture)` 平行 `include_oci`：`include_agent_capture=false` 时路径字符串均不含 `/api/v1/agent-capture`。运行时挂载由配置门决定，不单独暴露该 flag 给运维。

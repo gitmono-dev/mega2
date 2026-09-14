@@ -13,10 +13,10 @@ use crate::{
         MonoApiServiceState,
         api_doc::SYSTEM_COMMON,
         router::{
-            admin_router, artifacts_router, bot_router, buck_router, cl_router, code_review_router,
-            commit_router, conv_router, gpg_router, group_router, label_router, merge_queue_router,
-            preview_router, push_queue_router, repo_router, reviewer_router, tag_router,
-            user_router, webhook_router,
+            admin_router, agent_capture_router, artifacts_router, bot_router, buck_router,
+            cl_router, code_review_router, commit_router, conv_router, gpg_router, group_router,
+            label_router, merge_queue_router, preview_router, push_queue_router, repo_router,
+            reviewer_router, tag_router, user_router, webhook_router,
         },
     },
     ceres::{api_service::ApiHandler, model::git::TreeQuery},
@@ -63,12 +63,25 @@ pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
 
 /// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user routers).
 pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
-    OpenApiRouter::new()
+    storage_only_routers_with(false)
+}
+
+/// Same as [`storage_only_routers`], optionally merging Agent Capture under
+/// `/agent-capture` (public prefix `/api/v1` is applied by the outer nest).
+pub fn storage_only_routers_with(
+    include_agent_capture: bool,
+) -> OpenApiRouter<MonoApiServiceState> {
+    let router = OpenApiRouter::new()
         .routes(routes!(life_cycle_check))
         .route("/file/blob/{object_id}", get(get_blob_file))
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::readonly_routers())
-        .merge(preview_router::write_routers())
+        .merge(preview_router::write_routers());
+    if include_agent_capture {
+        router.merge(agent_capture_router::routers())
+    } else {
+        router
+    }
 }
 
 /// Health Check

@@ -721,12 +721,14 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
     // OpenApiRouter: those stub routes conflict with the runtime `/{*tail}`
     // dispatcher nested at `/v2` below. Merge OpenAPI paths into `api` only.
     let include_oci = protocol_surface && storage_only && config.oci.enabled;
+    let include_agent_capture = mount_agent_capture(config.as_ref());
     let (router, mut api) = if protocol_surface {
         OpenApiRouter::with_openapi(ApiDoc::openapi())
             .merge(lfs_router::routers().with_state(api_state.clone()))
             .nest(
                 "/api/v1",
-                api_router::routers_for(PushPolicy::Trunk).with_state(api_state.clone()),
+                api_router::storage_only_routers_with(include_agent_capture)
+                    .with_state(api_state.clone()),
             )
             .route("/{*path}", protocol_route())
             .layer(
@@ -788,10 +790,20 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
     Ok(router.merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api)))
 }
 
-pub(crate) fn storage_only_openapi_doc(include_oci: bool) -> utoipa::openapi::OpenApi {
+pub(crate) fn mount_agent_capture(config: &Config) -> bool {
+    config.git.storage_only() && config.agent_capture.enabled
+}
+
+pub(crate) fn storage_only_openapi_doc(
+    include_oci: bool,
+    include_agent_capture: bool,
+) -> utoipa::openapi::OpenApi {
     let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(lfs_router::routers())
-        .nest("/api/v1", api_router::storage_only_routers());
+        .nest(
+            "/api/v1",
+            api_router::storage_only_routers_with(include_agent_capture),
+        );
     let router = if include_oci {
         router.merge(oci_router::routers())
     } else {
@@ -801,12 +813,18 @@ pub(crate) fn storage_only_openapi_doc(include_oci: bool) -> utoipa::openapi::Op
 }
 
 /// OpenAPI for `push_policy=trunk` HTTP (includes LFS merge). Same `/api/v1`
-/// subset as storage-only; assembled via [`api_router::routers_for`] so
-/// the surface is keyed on morphology, not only `push_auth`.
-pub(crate) fn trunk_openapi_doc(include_oci: bool) -> utoipa::openapi::OpenApi {
+/// subset as storage-only; assembled via [`api_router::storage_only_routers_with`]
+/// so the surface is keyed on morphology, not only `push_auth`.
+pub(crate) fn trunk_openapi_doc(
+    include_oci: bool,
+    include_agent_capture: bool,
+) -> utoipa::openapi::OpenApi {
     let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(lfs_router::routers())
-        .nest("/api/v1", api_router::routers_for(PushPolicy::Trunk));
+        .nest(
+            "/api/v1",
+            api_router::storage_only_routers_with(include_agent_capture),
+        );
     let router = if include_oci {
         router.merge(oci_router::routers())
     } else {
@@ -920,9 +938,51 @@ async fn handle_smart_protocol(
 
 #[cfg(test)]
 mod tests {
-    use http::Request;
+    use std::sync::Arc;
+
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     use super::*;
+    use crate::{
+        api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+        ceres::api_service::cache::GitObjectCache,
+        contract::policy::entitystore::SharedEntityStore,
+        jupiter::storage::Storage,
+    };
+
+    fn dummy_api_state() -> MonoApiServiceState {
+        MonoApiServiceState {
+            session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "ac-07-test".to_owned(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_owned(),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            storage: Storage::mock(),
+        }
+    }
+
+    async fn discovery_status(
+        v1: utoipa_axum::router::OpenApiRouter<MonoApiServiceState>,
+    ) -> StatusCode {
+        let (router, _) = OpenApiRouter::new().nest("/api/v1", v1).split_for_parts();
+        router
+            .with_state(dummy_api_state())
+            .oneshot(
+                Request::get("/api/v1/agent-capture/discovery")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+            .status()
+    }
 
     #[test]
     fn cors_origins_fall_back_to_defaults_when_unset() {
@@ -1271,7 +1331,7 @@ mod tests {
 
     #[test]
     fn storage_only_openapi_includes_writes_omits_cl_auth_user() {
-        let api = storage_only_openapi_doc(false);
+        let api = storage_only_openapi_doc(false, false);
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
             paths.iter().any(|p| p.ends_with("/status")),
@@ -1309,14 +1369,14 @@ mod tests {
 
     #[test]
     fn storage_only_openapi_include_oci_dual_state() {
-        let with_oci = storage_only_openapi_doc(true);
+        let with_oci = storage_only_openapi_doc(true, false);
         let with_paths: Vec<String> = with_oci.paths.paths.keys().cloned().collect();
         assert!(
             with_paths.iter().any(|p| p.contains("/v2")),
             "include_oci=true must document /v2: {with_paths:?}"
         );
 
-        let without_oci = storage_only_openapi_doc(false);
+        let without_oci = storage_only_openapi_doc(false, false);
         let without_paths: Vec<String> = without_oci.paths.paths.keys().cloned().collect();
         assert!(
             without_paths.iter().all(|p| !p.contains("/v2")),
@@ -1325,8 +1385,110 @@ mod tests {
     }
 
     #[test]
+    fn storage_only_openapi_omits_agent_capture_when_flag_false() {
+        let paths: Vec<String> = storage_only_openapi_doc(false, false)
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            paths.iter().all(|p| !p.contains("/api/v1/agent-capture")),
+            "include_agent_capture=false must omit agent-capture: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn storage_only_openapi_doc_takes_include_agent_capture() {
+        let with_paths: Vec<String> = storage_only_openapi_doc(false, true)
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            with_paths
+                .iter()
+                .any(|p| p == "/api/v1/agent-capture/discovery"),
+            "include_agent_capture=true must document discovery: {with_paths:?}"
+        );
+        let without_paths: Vec<String> = storage_only_openapi_doc(false, false)
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            without_paths
+                .iter()
+                .all(|p| !p.contains("/api/v1/agent-capture")),
+            "include_agent_capture=false must omit agent-capture: {without_paths:?}"
+        );
+    }
+
+    #[test]
+    fn trunk_openapi_doc_takes_include_agent_capture() {
+        let with_paths: Vec<String> = trunk_openapi_doc(false, true)
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            with_paths
+                .iter()
+                .any(|p| p.contains("/api/v1/agent-capture")),
+            "trunk include_agent_capture=true must document agent-capture: {with_paths:?}"
+        );
+        let without_paths: Vec<String> = trunk_openapi_doc(false, false)
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            without_paths
+                .iter()
+                .all(|p| !p.contains("/api/v1/agent-capture")),
+            "trunk include_agent_capture=false must omit agent-capture: {without_paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_only_nests_agent_capture_when_enabled() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.git.push_auth = Some(PushAuth::None);
+        config.agent_capture.enabled = true;
+        assert!(mount_agent_capture(&config));
+        let status = discovery_status(api_router::storage_only_routers_with(true)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn review_morphology_does_not_register_agent_capture() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.agent_capture.enabled = true;
+        assert!(!mount_agent_capture(&config));
+        let status = discovery_status(api_router::routers()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn disabled_storage_only_does_not_register_agent_capture() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("base"));
+        config.git.push_auth = Some(PushAuth::None);
+        config.agent_capture.enabled = false;
+        assert!(!mount_agent_capture(&config));
+        let status = discovery_status(api_router::storage_only_routers_with(false)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
     fn trunk_openapi_includes_writes_omits_cl_issue_reviewer() {
-        let api = trunk_openapi_doc(false);
+        let api = trunk_openapi_doc(false, false);
         let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
         assert!(
             paths
@@ -1360,14 +1522,14 @@ mod tests {
 
     #[test]
     fn trunk_openapi_include_oci_dual_state() {
-        let with_oci = trunk_openapi_doc(true);
+        let with_oci = trunk_openapi_doc(true, false);
         let with_paths: Vec<String> = with_oci.paths.paths.keys().cloned().collect();
         assert!(
             with_paths.iter().any(|p| p.contains("/v2")),
             "include_oci=true must document /v2: {with_paths:?}"
         );
 
-        let without_oci = trunk_openapi_doc(false);
+        let without_oci = trunk_openapi_doc(false, false);
         let without_paths: Vec<String> = without_oci.paths.paths.keys().cloned().collect();
         assert!(
             without_paths.iter().all(|p| !p.contains("/v2")),
