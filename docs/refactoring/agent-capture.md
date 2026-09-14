@@ -127,3 +127,7 @@ lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）
 ## Query / transcript
 
 GET list/show 为 metadata-first：`{ "items": [...], "next_cursor": string|null }`，list item 不含 `transcript` 正文。分页 query `limit`（缺省 50，最大 200）与 `cursor`。`GET /sessions/{capture_id}` 返回 session JSON（含 `capture_id`）。`GET .../file-ops` 与 `GET .../checkpoints` 同样为 metadata 页，无 op 时仍 200 且含 `items`。`GET .../transcript` 返回 committed raw（`application/octet-stream`）并 INSERT `agent_capture_access_audit`（`action=transcript.read`，不写 `audit_logs`）。external_capture 用最新带 `transcript_digest` 的 checkpoint；internal_code 用最新 source_stream generation 绑定的 raw `stream_blob`。缺 committed raw → 409，`error.code=missing_raw`。无 token → 401。
+
+## Tombstone
+
+已 tombstone 的 capture 再 PUT / staging / finalize / events / file-ops / checkpoint 返回 409。PUT 按自然键（deployment/tenant/repo/producer/`client_session_id`）检查；其余 ingest 按 `capture_id` 点查。无公开 DELETE API；测试可直接 insert tombstone 行。判定顺序仍是 401 → 404 → 409：无 token 即使已 tombstone 也是 401。未 tombstone 的 PUT 仍 200。

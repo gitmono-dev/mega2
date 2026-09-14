@@ -2055,6 +2055,27 @@ impl AgentCaptureStorage {
         Ok(found.is_some())
     }
 
+    pub async fn is_tombstoned_client_session(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+        repo_id: &str,
+        producer_id: &str,
+        client_session_id: &str,
+    ) -> Result<bool, MegaError> {
+        let found = agent_capture_tombstone::Entity::find()
+            .filter(agent_capture_tombstone::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_tombstone::Column::TenantId.eq(tenant_id.to_owned()))
+            .filter(agent_capture_tombstone::Column::RepoId.eq(repo_id.to_owned()))
+            .filter(agent_capture_tombstone::Column::ProducerId.eq(producer_id.to_owned()))
+            .filter(
+                agent_capture_tombstone::Column::ClientSessionId.eq(client_session_id.to_owned()),
+            )
+            .one(self.get_connection())
+            .await?;
+        Ok(found.is_some())
+    }
+
     pub async fn insert_deletion_ledger(
         &self,
         deployment_id: &str,

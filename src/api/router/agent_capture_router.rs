@@ -335,6 +335,25 @@ fn missing_raw() -> AgentCaptureHttpError {
     }
 }
 
+async fn reject_if_tombstoned_capture(
+    state: &MonoApiServiceState,
+    capture_id: i64,
+) -> Result<(), AgentCaptureHttpError> {
+    let capture = state.storage.config().agent_capture.clone();
+    let tombstoned = state
+        .storage
+        .agent_capture_service
+        .storage
+        .is_tombstoned(&capture.deployment_id, &capture.tenant_id, capture_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    if tombstoned {
+        Err(AgentCaptureHttpError::conflict())
+    } else {
+        Ok(())
+    }
+}
+
 async fn collect_object_bytes(mut stream: ObjectByteStream) -> Result<Vec<u8>, MegaError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -616,6 +635,23 @@ async fn put_session(
         return Err(AgentCaptureHttpError::not_found());
     }
     let client_session_id = decode_client_session_id(&client_session_segment)?;
+    let capture = state.storage.config().agent_capture.clone();
+    if state
+        .storage
+        .agent_capture_service
+        .storage
+        .is_tombstoned_client_session(
+            &capture.deployment_id,
+            &capture.tenant_id,
+            &repo_id,
+            &token.name,
+            &client_session_id,
+        )
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+    {
+        return Err(AgentCaptureHttpError::conflict());
+    }
     let bytes = axum::body::to_bytes(body, SESSION_PUT_MAX_BYTES)
         .await
         .map_err(|_| AgentCaptureHttpError::payload_too_large("session put body too large"))?;
@@ -625,7 +661,6 @@ async fn put_session(
         .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
     let put_request: SessionPutRequest = serde_json::from_str(raw)
         .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
-    let capture = state.storage.config().agent_capture.clone();
     let session_kind = match put_request.session_kind {
         SessionKind::ExternalCapture => "external_capture",
         SessionKind::InternalCode => "internal_code",
@@ -701,6 +736,7 @@ async fn staging_blob(
     if !token_covers_capture_repo(&token, &session.repo_id) {
         return Err(AgentCaptureHttpError::not_found());
     }
+    reject_if_tombstoned_capture(&state, capture_id).await?;
     let lease_id = state
         .storage
         .agent_capture_service
@@ -752,6 +788,7 @@ async fn finalize_blob(
     if !token_covers_capture_repo(&token, &session.repo_id) {
         return Err(AgentCaptureHttpError::not_found());
     }
+    reject_if_tombstoned_capture(&state, capture_id).await?;
     state
         .storage
         .agent_capture_service
@@ -830,6 +867,7 @@ async fn events_batch(
     if !token_covers_capture_repo(&token, &session.repo_id) {
         return Err(AgentCaptureHttpError::not_found());
     }
+    reject_if_tombstoned_capture(&state, capture_id).await?;
     let max_events = usize::try_from(capture.max_events_per_batch).unwrap_or(usize::MAX);
     let max_event_bytes = usize::try_from(capture.max_event_bytes).unwrap_or(usize::MAX);
     let body_limit = max_events
@@ -961,6 +999,7 @@ async fn file_ops_batch(
     if !token_covers_capture_repo(&token, &session.repo_id) {
         return Err(AgentCaptureHttpError::not_found());
     }
+    reject_if_tombstoned_capture(&state, capture_id).await?;
     let bytes = axum::body::to_bytes(body, FILE_OPS_BATCH_MAX_BYTES)
         .await
         .map_err(|_| AgentCaptureHttpError::payload_too_large("file-ops batch body too large"))?;
@@ -1072,6 +1111,7 @@ async fn post_checkpoint(
     if !token_covers_capture_repo(&token, &session.repo_id) {
         return Err(AgentCaptureHttpError::not_found());
     }
+    reject_if_tombstoned_capture(&state, capture_id).await?;
     let bytes = axum::body::to_bytes(body, CHECKPOINT_POST_MAX_BYTES)
         .await
         .map_err(|_| AgentCaptureHttpError::payload_too_large("checkpoint body too large"))?;
@@ -3191,5 +3231,123 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = json_body(response).await;
         assert_eq!(body["error"]["code"], "missing_raw");
+    }
+
+    async fn tombstone_capture(state: &MonoApiServiceState, capture_id: i64) {
+        let capture = state.storage.config().agent_capture.clone();
+        state
+            .storage
+            .agent_capture_service
+            .storage
+            .insert_tombstone(&capture.deployment_id, &capture.tenant_id, capture_id)
+            .await
+            .expect("tombstone");
+    }
+
+    #[tokio::test]
+    async fn tombstone_rejects_reingest_put() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-tomb").await;
+        tombstone_capture(&state, capture_id).await;
+        let response = put_session_request(
+            state,
+            "third-part%2Fmega",
+            "sess-tomb",
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn tombstone_rejects_staging() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-tomb").await;
+        tombstone_capture(&state, capture_id).await;
+        let response = staging_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn tombstone_put_unauthorized_is_401() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-tomb").await;
+        tombstone_capture(&state, capture_id).await;
+        let response = put_session_request(
+            state,
+            "third-part%2Fmega",
+            "sess-tomb",
+            None,
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn tombstone_blocks_all_ingest_writes() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-tomb").await;
+        tombstone_capture(&state, capture_id).await;
+        let put = put_session_request(
+            state.clone(),
+            "third-part%2Fmega",
+            "sess-tomb",
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CONFLICT);
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::CONFLICT);
+        let finalized = finalize_request(
+            state.clone(),
+            capture_id,
+            "lease-1",
+            Some("Bearer secret-ci"),
+            "{}",
+        )
+        .await;
+        assert_eq!(finalized.status(), StatusCode::CONFLICT);
+        let events = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(events.status(), StatusCode::CONFLICT);
+        let file_ops = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"a.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(file_ops.status(), StatusCode::CONFLICT);
+        let checkpoint = checkpoint_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"checkpoint_id":"cp-1","redacted_digest":"sha256:x"}"#,
+        )
+        .await;
+        assert_eq!(checkpoint.status(), StatusCode::CONFLICT);
     }
 }
