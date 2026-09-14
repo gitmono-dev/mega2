@@ -1,4 +1,5 @@
 pub mod admin_router;
+pub mod agent_capture_router;
 pub mod artifacts_router;
 pub mod bot_router;
 pub mod buck_router;

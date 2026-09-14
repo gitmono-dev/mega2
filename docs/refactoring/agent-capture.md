@@ -54,3 +54,38 @@
 | committed | `{deployment_id}/{tenant_id}/{visibility}/sha256/{hex}` |
 
 首版 `visibility=raw` 为事实源。`deployment_id` / `tenant_id` 来自 `[agent_capture]` 配置。客户端不得指定 final object key；finalize 从 staging 对象 `get_stream` 增量计算 sha256，再 `get_stream` 一次流式写入 committed key，忽略请求中的 final key。服务层不把整 blob 再缓冲成 `Vec<u8>`。`agent_capture_blob.object_key` 只存服务器派生值。
+
+## HTTP path / error / pagination
+
+Router 内部 path 以 `/agent-capture` 开头，由外层 nest 到 `/api/v1`。下表为完整外部路径；实现不得再加一层 `/api/v1`。本卡只登记 route-construction fixture（501），业务 handler 由后续卡替换、不改 path。挂载门见后续卡：仅 `git.storage_only() && [agent_capture].enabled=true` 时注册。
+
+认证头：`Authorization: Bearer <ingest_token>`。查找失败（缺头、非 Bearer、空 secret、或 ingest token 未命中）对齐 401，`error.code` 为 `unauthorized`。token 不覆盖正规化 repo path 时为 404（后续卡）。判定顺序 401 → 404 → 409 → 400/413。
+
+错误响应固定：
+
+```json
+{ "error": { "code": "unauthorized", "message": "invalid ingest token" } }
+```
+
+不得包含 token secret、raw prompt、tool 原文、或其他 tenant 是否存在的线索。
+
+分页：query `limit` / `cursor`；缺省 `limit=50`，最大 `200`。list 响应 `{ "items": [...], "next_cursor": string|null }`。
+
+`{repo}` 为单一 percent-encoded URL segment（禁止 Axum `{*repo}`）。解码后 `normalize_repo_path` 得到 `repo_id` TEXT。canonical fingerprint 调用 `crate::common::canonical_json`；PUT fingerprint 不含服务端 completeness/lifecycle。
+
+| Method | Public path |
+|---|---|
+| GET | `/api/v1/agent-capture/discovery` |
+| PUT | `/api/v1/agent-capture/repos/{repo}/sessions/{client_session_id}` |
+| POST | `/api/v1/agent-capture/sessions/{capture_id}/blobs/staging` |
+| POST | `/api/v1/agent-capture/sessions/{capture_id}/blobs/{lease_id}/finalize` |
+| POST | `/api/v1/agent-capture/sessions/{capture_id}/events:batch` |
+| POST | `/api/v1/agent-capture/sessions/{capture_id}/file-ops:batch` |
+| POST | `/api/v1/agent-capture/sessions/{capture_id}/checkpoints` |
+| GET | `/api/v1/agent-capture/repos/{repo}/sessions` |
+| GET | `/api/v1/agent-capture/sessions/{capture_id}` |
+| GET | `/api/v1/agent-capture/sessions/{capture_id}/checkpoints` |
+| GET | `/api/v1/agent-capture/sessions/{capture_id}/transcript` |
+| GET | `/api/v1/agent-capture/sessions/{capture_id}/file-ops` |
+
+session JSON 字段：`capture_id`、`client_session_id`、`tenant_id`、`deployment_id`、`repo_id`、`producer_id`、`session_kind`（`external_capture` \| `internal_code`）、`started_at`、`ended_at`、`completeness`（`empty` \| `incomplete` \| `complete` \| `truncated`）、`partial_reason`、`created_at`、`updated_at`。无 `user_id`。identity 与服务端字段不可由客户端覆写；未知 JSON 字段拒绝。
