@@ -1,7 +1,17 @@
-use axum::http::StatusCode;
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-pub const AGENT_CAPTURE_TAG: &str = "Agent Capture";
+use crate::{
+    api::{MonoApiServiceState, api_doc::AGENT_CAPTURE_TAG},
+    api_model::agent_capture::{
+        AgentCaptureHttpError, DiscoveryResponse, ErrorEnvelope, bearer_token,
+    },
+    ceres::agent_capture::auth::lookup_ingest_token,
+};
 
 pub const PUBLIC_ENDPOINTS: &[(&str, &str)] = &[
     ("GET", "/api/v1/agent-capture/discovery"),
@@ -48,17 +58,11 @@ pub const PUBLIC_ENDPOINTS: &[(&str, &str)] = &[
 /// Internal paths start at `/agent-capture`. The outer nest is `/api/v1`.
 ///
 /// `#[utoipa::path(path = ...)]` values are suffixes relative to that nest.
-pub fn routers<S>() -> OpenApiRouter<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new().nest("/agent-capture", capture_routes())
 }
 
-fn capture_routes<S>() -> OpenApiRouter<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+fn capture_routes() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(discovery))
         .routes(routes!(put_session))
@@ -81,11 +85,27 @@ fn fixture() -> StatusCode {
 #[utoipa::path(
     get,
     path = "/discovery",
-    responses((status = 501, description = "Fixture; handler lands in AC-16")),
+    responses(
+        (status = 200, description = "Capture protocol discovery", body = DiscoveryResponse),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn discovery() -> StatusCode {
-    fixture()
+async fn discovery(
+    State(state): State<MonoApiServiceState>,
+    headers: HeaderMap,
+) -> Result<Json<DiscoveryResponse>, AgentCaptureHttpError> {
+    let presented = bearer_token(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+    )?;
+    lookup_ingest_token(
+        &state.storage.config().agent_capture.ingest_tokens,
+        presented,
+    )
+    .ok_or_else(AgentCaptureHttpError::unauthorized)?;
+    Ok(Json(DiscoveryResponse { raw_accepted: true }))
 }
 
 #[utoipa::path(
@@ -217,22 +237,63 @@ async fn list_file_ops() -> StatusCode {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{
         Router,
         body::Body,
-        http::{Method, Request, StatusCode},
+        http::{Method, Request, StatusCode, header},
     };
     use tower::ServiceExt;
     use utoipa_axum::router::OpenApiRouter;
 
     use super::*;
+    use crate::{
+        api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+        ceres::api_service::cache::GitObjectCache,
+        config::{AgentCaptureIngestTokenConfig, reload::ConfigHandle},
+        contract::policy::entitystore::SharedEntityStore,
+        jupiter::storage::Storage,
+    };
 
-    fn public_app() -> (Router, Vec<String>) {
+    fn dummy_state() -> MonoApiServiceState {
+        MonoApiServiceState {
+            session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "ac-16-test".to_owned(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_owned(),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            storage: Storage::mock(),
+        }
+    }
+
+    fn state_with_ingest_token() -> MonoApiServiceState {
+        let mut state = dummy_state();
+        let mut config = (*state.storage.config()).clone();
+        config.agent_capture.ingest_tokens = vec![AgentCaptureIngestTokenConfig {
+            name: "hook".to_owned(),
+            token: "secret-ci".to_owned(),
+            paths: None,
+            tenant_id: None,
+        }];
+        let config = Arc::new(config);
+        state.storage.config_handle = ConfigHandle::from_arc(config.clone());
+        state.storage.config = config;
+        state
+    }
+
+    fn public_app(state: MonoApiServiceState) -> (Router, Vec<String>) {
         let (router, api) = OpenApiRouter::new()
             .nest("/api/v1", routers())
             .split_for_parts();
         let paths = api.paths.paths.keys().cloned().collect();
-        (router, paths)
+        (router.with_state(state), paths)
     }
 
     fn sample_path(template: &str) -> String {
@@ -243,9 +304,31 @@ mod tests {
             .replace("{lease_id}", "lease-1")
     }
 
+    async fn discovery(
+        state: MonoApiServiceState,
+        authorization: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::get("/api/v1/agent-capture/discovery");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn json_body(response: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
     #[tokio::test]
     async fn all_public_paths_construct() {
-        let (router, paths) = public_app();
+        let (router, paths) = public_app(dummy_state());
         for (method, path) in PUBLIC_ENDPOINTS {
             assert!(
                 paths.iter().any(|p| p == path),
@@ -267,11 +350,12 @@ mod tests {
                 .await
                 .expect("response")
                 .status();
-            assert_eq!(
-                status,
-                StatusCode::NOT_IMPLEMENTED,
-                "{method} {path} -> {status}"
-            );
+            let expected = if *method == "GET" && *path == "/api/v1/agent-capture/discovery" {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            assert_eq!(status, expected, "{method} {path} -> {status}");
         }
     }
 
@@ -284,7 +368,7 @@ mod tests {
         assert!(!src.contains(&catch_all_repo));
         assert!(!src.contains(&catch_all_path));
 
-        let (router, paths) = public_app();
+        let (router, paths) = public_app(dummy_state());
         assert!(
             paths.iter().any(|p| p.contains("/repos/{repo}/sessions")),
             "expected single-segment {{repo}}: {paths:?}"
@@ -318,5 +402,32 @@ mod tests {
             .expect("response")
             .status();
         assert_eq!(multi, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn discovery_unauthorized() {
+        let response = discovery(dummy_state(), None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "unauthorized");
+        assert!(!body.to_string().contains("secret-ci"));
+    }
+
+    #[tokio::test]
+    async fn discovery_wrong_token() {
+        let response = discovery(state_with_ingest_token(), Some("Bearer wrong-token")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "unauthorized");
+        assert!(!body.to_string().contains("secret-ci"));
+        assert!(!body.to_string().contains("wrong-token"));
+    }
+
+    #[tokio::test]
+    async fn discovery_raw_accepted() {
+        let response = discovery(state_with_ingest_token(), Some("Bearer secret-ci")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["raw_accepted"], true);
     }
 }

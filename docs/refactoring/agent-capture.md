@@ -95,3 +95,7 @@ session JSON 字段：`capture_id`、`client_session_id`、`tenant_id`、`deploy
 `http_server` 仅当 `git.storage_only()` **且** `[agent_capture].enabled=true` 把 `agent_capture_router` nest 进已有 `/api/v1`。review 形态（`push_auth` 缺省）不 merge 该 router；`enabled=false` 的 storage-only 也不注册。未挂载时对 `/api/v1/agent-capture/discovery` 为裸 404，OpenAPI 不含 `/api/v1/agent-capture`。
 
 `storage_only_openapi_doc(include_oci, include_agent_capture)` 与 `trunk_openapi_doc(include_oci, include_agent_capture)` 平行 `include_oci`：`include_agent_capture=false` 时路径字符串均不含 `/api/v1/agent-capture`。运行时挂载由配置门决定，不单独暴露该 flag 给运维。
+
+## Discovery
+
+`GET /api/v1/agent-capture/discovery` 需要 `Authorization: Bearer <ingest_token>`。命中 `lookup_ingest_token` 时返回 `{ "raw_accepted": true }`。缺头、非 Bearer、或 secret 未命中一律 401，`error.code` 为 `unauthorized`；响应不含 token secret。discovery 不访问数据库。

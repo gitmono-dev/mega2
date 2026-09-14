@@ -1427,6 +1427,20 @@ mod tests {
     }
 
     #[test]
+    fn storage_only_openapi_includes_agent_capture_when_flag_true() {
+        let paths: Vec<String> = storage_only_openapi_doc(false, true)
+            .paths
+            .paths
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "/api/v1/agent-capture/discovery"),
+            "include_agent_capture=true must include discovery: {paths:?}"
+        );
+    }
+
+    #[test]
     fn trunk_openapi_doc_takes_include_agent_capture() {
         let with_paths: Vec<String> = trunk_openapi_doc(false, true)
             .paths
@@ -1462,7 +1476,7 @@ mod tests {
         config.agent_capture.enabled = true;
         assert!(mount_agent_capture(&config));
         let status = discovery_status(api_router::storage_only_routers_with(true)).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
