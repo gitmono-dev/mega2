@@ -53,6 +53,7 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_authz_audit` | 只读装配零副作用黑盒（UN-30 / UN-43）+ `authz-audit` CLI（UN-29 审计/fsync + UN-37 promote） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
 | `integration_oci` | storage-only OCI `/v2` 进程级黑盒（plan-20260902 / DR-12）：`integration_oci_auth_matrix`、`integration_oci_protocol_walkthrough`、`integration_oci_docker_gated`（daemon 不可用 → SKIP，不 FAIL） | PostgreSQL, Redis；raw HTTP（reqwest）；docker CLI 仅 `docker_gated` 组可选 |
 | `integration_api_write_trunk` | trunk 产品 API 写（plan-20260904 / AW-03）：token `create-entry` / `edit/save` 前进 tip、无 CL、无凭据 401 | PostgreSQL, Redis；raw HTTP（reqwest）；`push_policy=trunk` + `push_auth=token` |
+| `integration_agent_capture` | storage-only Agent Capture `/api/v1/agent-capture` 进程级黑盒（plan-20260911 / AC-13）：`integration_agent_capture_happy_path`、`integration_agent_capture_review_404`、`integration_agent_capture_unauthorized`、`integration_agent_capture_tracing_has_no_raw_sentinel`、`integration_agent_capture_cross_deployment_isolated`、`integration_agent_capture_tombstone_race` | PostgreSQL, Redis；隔离 local object backend；raw HTTP（reqwest）；`--test-threads=1` |
 
 Run the normal project gate with the test environment loaded:
 
