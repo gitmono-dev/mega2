@@ -1,3 +1,4 @@
+pub mod agent_capture_service;
 pub mod artifact_service;
 pub mod buck_service;
 pub mod cl_service;

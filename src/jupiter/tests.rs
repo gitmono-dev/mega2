@@ -19,11 +19,12 @@ use crate::{
     jupiter::{
         migration::apply_migrations,
         service::{
-            artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
-            cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
-            mono_service::MonoService, oci_service::OciService,
-            push_queue_service::PushQueueService, webhook_service::WebhookService,
+            agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
+            buck_service::BuckService, cl_service::CLService, cla_service::ClaService,
+            code_review_service::CodeReviewService, git_service::GitService,
+            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
+            oci_service::OciService, push_queue_service::PushQueueService,
+            webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -231,6 +232,7 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         import_service: ImportService::mock(),
         lfs_service: LfsService::mock(),
         oci_service: OciService::mock(),
+        agent_capture_service: AgentCaptureService::mock(),
         code_review_service: CodeReviewService::mock(),
         webhook_service,
         notification_storage: NotificationStorage::new(connection.clone()),

@@ -43,3 +43,14 @@
 | `agent_capture_deletion_ledger` | 删除意图行；本计划不执行物理删 |
 
 查询路径带 `deployment_id` + `tenant_id`。跨 deployment 读取在存储/HTTP 层统一 404。
+
+## ObjectNamespace / object key
+
+`ObjectNamespace::Agent` 的 `Display` / `to_string()` 为 `agent`。ObjectKey **path** 不再重复 namespace 段；后端完整路径为 `agent/<path>`，且与 Media 一样不按 3-level hash 分片。
+
+| 阶段 | ObjectKey path |
+|---|---|
+| staging | `{deployment_id}/{tenant_id}/staging/{lease_id}` |
+| committed | `{deployment_id}/{tenant_id}/{visibility}/sha256/{hex}` |
+
+首版 `visibility=raw` 为事实源。`deployment_id` / `tenant_id` 来自 `[agent_capture]` 配置。客户端不得指定 final object key；finalize 从 staging 对象 `get_stream` 增量计算 sha256，再 `get_stream` 一次流式写入 committed key，忽略请求中的 final key。服务层不把整 blob 再缓冲成 `Vec<u8>`。`agent_capture_blob.object_key` 只存服务器派生值。

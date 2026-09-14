@@ -40,13 +40,15 @@ use crate::{
     contract::{policy::entitystore::SharedEntityStore, vault::integration::vault_core::VaultCore},
     jupiter::{
         service::{
-            artifact_service::ArtifactService, buck_service::BuckService, cl_service::CLService,
-            cla_service::ClaService, code_review_service::CodeReviewService,
-            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
-            mono_service::MonoService, oci_service::OciService,
-            push_queue_service::PushQueueService, webhook_service::WebhookService,
+            agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
+            buck_service::BuckService, cl_service::CLService, cla_service::ClaService,
+            code_review_service::CodeReviewService, git_service::GitService,
+            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
+            oci_service::OciService, push_queue_service::PushQueueService,
+            webhook_service::WebhookService,
         },
         storage::{
+            agent_capture_storage::AgentCaptureStorage,
             audit_storage::AuditStorage,
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
@@ -149,6 +151,7 @@ pub struct Storage {
     pub git_service: GitService,
     pub lfs_service: LfsService,
     pub oci_service: OciService,
+    pub agent_capture_service: AgentCaptureService,
     pub config_handle: ConfigHandle,
     pub config: Arc<Config>,
     pub code_review_service: CodeReviewService,
@@ -220,6 +223,10 @@ impl Storage {
         let oci_db_storage = OciDbStorage { base: base.clone() };
         let oci_service = OciService {
             oci_storage: oci_db_storage.clone(),
+            obj_storage: object_store.clone(),
+        };
+        let agent_capture_service = AgentCaptureService {
+            storage: AgentCaptureStorage { base: base.clone() },
             obj_storage: object_store.clone(),
         };
 
@@ -300,6 +307,7 @@ impl Storage {
             import_service,
             lfs_service,
             oci_service,
+            agent_capture_service,
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
             notification_storage,
@@ -588,6 +596,7 @@ impl Storage {
             import_service: ImportService::mock(),
             lfs_service: LfsService::mock(),
             oci_service: OciService::mock(),
+            agent_capture_service: AgentCaptureService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
@@ -640,6 +649,16 @@ mod tests {
 
         // Should be 50% of 16 = 8
         assert_eq!(concurrency, 8);
+    }
+
+    #[test]
+    fn mock_storage_includes_agent_capture_service() {
+        let storage = Storage::mock();
+        assert_eq!(
+            crate::orbit_api::object_storage::ObjectNamespace::Agent.to_string(),
+            "agent"
+        );
+        let _ = &storage.agent_capture_service;
     }
 
     #[test]
