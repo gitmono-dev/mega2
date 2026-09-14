@@ -16,9 +16,11 @@ use crate::{
         bearer_token, decode_repo_path_segment, fingerprint_session_put_body,
     },
     ceres::agent_capture::auth::{lookup_ingest_token, token_covers_capture_repo},
-    common::errors::MegaError,
+    common::{canonical_json, errors::MegaError},
     config::AgentCaptureIngestTokenConfig,
-    jupiter::storage::agent_capture_storage::SessionNaturalKey,
+    jupiter::storage::agent_capture_storage::{
+        AgentCaptureStorage, InsertEvent, SessionNaturalKey,
+    },
     orbit_api::object_storage::ObjectByteStream,
 };
 
@@ -175,6 +177,54 @@ fn session_staging_path(path: &str) -> Result<i64, AgentCaptureHttpError> {
     }
 }
 
+fn session_events_batch_path(path: &str) -> Result<i64, AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+    ) {
+        (Some(id), Some(&"events:batch"), None) => id
+            .parse()
+            .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
+fn parse_event_uid(uid: &str) -> Result<(i64, i64), AgentCaptureHttpError> {
+    let Some((generation, offset)) = uid.split_once(':') else {
+        return Err(AgentCaptureHttpError::bad_request("invalid event_uid"));
+    };
+    if generation.is_empty()
+        || offset.is_empty()
+        || !generation.bytes().all(|b| b.is_ascii_digit())
+        || !offset.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(AgentCaptureHttpError::bad_request("invalid event_uid"));
+    }
+    let generation = generation
+        .parse::<i64>()
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid event_uid"))?;
+    let offset = offset
+        .parse::<i64>()
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid event_uid"))?;
+    Ok((generation, offset))
+}
+
+fn events_http_error(err: MegaError) -> AgentCaptureHttpError {
+    let text = err.to_string();
+    if text.contains("fingerprint conflict") || text.contains("uid conflict") {
+        AgentCaptureHttpError::conflict()
+    } else if text.contains("does not exist") {
+        AgentCaptureHttpError::not_found()
+    } else {
+        AgentCaptureHttpError::bad_request(text)
+    }
+}
+
 fn session_finalize_path(path: &str) -> Result<(i64, String), AgentCaptureHttpError> {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
@@ -231,6 +281,29 @@ struct FinalizeBlobRequest {
 struct FinalizeBlobResponse {
     digest: String,
     object_key: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct EventsBatchRequest {
+    batch_id: String,
+    events: Vec<EventBatchItem>,
+    completeness: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct EventBatchItem {
+    event_uid: String,
+    event_kind: String,
+    native_id: Option<String>,
+    lifecycle_seq: Option<i64>,
+    payload: serde_json::Value,
+}
+
+#[derive(Serialize, ToSchema)]
+struct EventsBatchResponse {
+    accepted: bool,
 }
 
 #[utoipa::path(
@@ -464,11 +537,132 @@ async fn finalize_blob(
     post,
     path = "/sessions/{capture_id}/events:batch",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-09")),
+    request_body = EventsBatchRequest,
+    responses(
+        (status = 200, description = "Events accepted", body = EventsBatchResponse),
+        (status = 400, description = "Invalid event_uid or body", body = ErrorEnvelope),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope),
+        (status = 409, description = "Event uid or batch fingerprint conflict", body = ErrorEnvelope),
+        (status = 413, description = "Batch exceeds max_events_per_batch or max_event_bytes", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn events_batch() -> StatusCode {
-    fixture()
+async fn events_batch(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<EventsBatchResponse>, AgentCaptureHttpError> {
+    let (parts, body) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_events_batch_path(parts.uri.path())?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let max_events = usize::try_from(capture.max_events_per_batch).unwrap_or(usize::MAX);
+    let max_event_bytes = usize::try_from(capture.max_event_bytes).unwrap_or(usize::MAX);
+    let body_limit = max_events
+        .saturating_mul(max_event_bytes)
+        .saturating_add(64 * 1024);
+    let bytes = axum::body::to_bytes(body, body_limit)
+        .await
+        .map_err(|_| AgentCaptureHttpError::payload_too_large("events batch body too large"))?;
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid utf-8 body"))?;
+    canonical_json::fingerprint(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let request_body: EventsBatchRequest = serde_json::from_str(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    if request_body.batch_id.is_empty() {
+        return Err(AgentCaptureHttpError::bad_request("batch_id required"));
+    }
+    let preview: Vec<InsertEvent> = request_body
+        .events
+        .iter()
+        .map(|item| InsertEvent {
+            capture_id,
+            event_uid: item.event_uid.clone(),
+            event_kind: item.event_kind.clone(),
+            native_id: item.native_id.clone(),
+            lifecycle_seq: item.lifecycle_seq,
+            payload: item.payload.clone(),
+        })
+        .collect();
+    let incoming_fp = AgentCaptureStorage::events_batch_fingerprint(
+        &request_body.batch_id,
+        &preview,
+        request_body.completeness.as_deref(),
+    )
+    .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    if let Some(existing) = state
+        .storage
+        .agent_capture_service
+        .storage
+        .event_batch_receipt_fingerprint(capture_id, &request_body.batch_id)
+        .await
+        .map_err(events_http_error)?
+    {
+        if existing == incoming_fp {
+            return Ok(Json(EventsBatchResponse { accepted: true }));
+        }
+        return Err(AgentCaptureHttpError::conflict());
+    }
+    if let Some(completeness) = request_body.completeness.as_deref()
+        && !matches!(completeness, "incomplete" | "complete")
+    {
+        return Err(AgentCaptureHttpError::bad_request("invalid completeness"));
+    }
+    if request_body.events.len() > max_events {
+        return Err(AgentCaptureHttpError::payload_too_large(
+            "events batch exceeds max_events_per_batch",
+        ));
+    }
+    let mut events = Vec::with_capacity(request_body.events.len());
+    for item in request_body.events {
+        parse_event_uid(&item.event_uid)?;
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "event_uid": item.event_uid,
+            "event_kind": item.event_kind,
+            "native_id": item.native_id,
+            "lifecycle_seq": item.lifecycle_seq,
+            "payload": item.payload,
+        }))
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+        if encoded.len() > max_event_bytes {
+            return Err(AgentCaptureHttpError::payload_too_large(
+                "event exceeds max_event_bytes",
+            ));
+        }
+        events.push(InsertEvent {
+            capture_id,
+            event_uid: item.event_uid,
+            event_kind: item.event_kind,
+            native_id: item.native_id,
+            lifecycle_seq: item.lifecycle_seq,
+            payload: item.payload,
+        });
+    }
+    state
+        .storage
+        .agent_capture_service
+        .storage
+        .insert_events_batch(
+            capture_id,
+            &request_body.batch_id,
+            &events,
+            request_body.completeness.as_deref(),
+            "jsonl",
+        )
+        .await
+        .map_err(events_http_error)?;
+    Ok(Json(EventsBatchResponse { accepted: true }))
 }
 
 #[utoipa::path(
@@ -557,12 +751,14 @@ mod tests {
         body::Body,
         http::{Method, Request, StatusCode, header},
     };
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use tower::ServiceExt;
     use utoipa_axum::router::OpenApiRouter;
 
     use super::*;
     use crate::{
         api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+        callisto::{agent_capture_event, agent_capture_session},
         ceres::api_service::cache::GitObjectCache,
         config::{
             AgentCaptureIngestTokenConfig, PushAuth, reload::ConfigHandle, testing::isolated_config,
@@ -573,6 +769,7 @@ mod tests {
             storage::{
                 Storage,
                 agent_capture_storage::{AgentCaptureStorage, InsertEvent},
+                base_storage::StorageConnector,
                 object_storage::mock_object_storage,
             },
             tests::test_storage_with_config,
@@ -681,6 +878,8 @@ mod tests {
                 || (*method == "POST"
                     && *path
                         == "/api/v1/agent-capture/sessions/{capture_id}/blobs/{lease_id}/finalize")
+                || (*method == "POST"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/events:batch")
             {
                 StatusCode::UNAUTHORIZED
             } else {
@@ -1251,5 +1450,292 @@ mod tests {
         let retry =
             finalize_request(state, capture_id, &lease_id, Some("Bearer secret-ci"), "{}").await;
         assert_eq!(retry.status(), StatusCode::OK);
+    }
+
+    async fn events_request(
+        state: MonoApiServiceState,
+        capture_id: i64,
+        authorization: Option<&str>,
+        body: &str,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/agent-capture/sessions/{capture_id}/events:batch"
+            ))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    #[tokio::test]
+    async fn events_unauthorized() {
+        let response = events_request(dummy_state(), 1, None, "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn events_batch_ok() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let response = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["accepted"], true);
+    }
+
+    #[tokio::test]
+    async fn events_rejects_bad_uid() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let response = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"not-a-uid","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn events_unknown_kind_kept() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let response = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"weird.kind","payload":{"envelope":true}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .filter(agent_capture_event::Column::EventUid.eq("0:0".to_owned()))
+            .one(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("event");
+        assert_eq!(row.event_kind, "unknown");
+        assert_eq!(row.payload["envelope"], true);
+    }
+
+    #[tokio::test]
+    async fn events_unknown_kind_fingerprint_conflict() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let first = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"custom.a","payload":{"envelope":true}}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"custom.b","payload":{"envelope":true}}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn events_invalid_completeness_new_batch_is_400() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let response = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","completeness":"nope","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rows = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn events_conflict_different_payload() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let first = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b2","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":2}}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn events_updates_completeness() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let response = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","completeness":"complete","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(session.completeness, "complete");
+    }
+
+    #[tokio::test]
+    async fn events_rejects_duplicate_payload_key() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let response = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"x":1,"x":2}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn events_older_identical_uid_is_idempotent() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let first = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}},{"event_uid":"0:100","event_kind":"message","payload":{"n":2}}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b2","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn events_batch_id_conflict_before_invalid_completeness() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let first = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","completeness":"complete","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","completeness":"nope","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn events_oversize_native_id_is_413() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let native = "n".repeat(2_000_000);
+        let body = format!(
+            r#"{{"batch_id":"b1","events":[{{"event_uid":"0:0","event_kind":"message","native_id":"{native}","payload":{{}}}}]}}"#
+        );
+        let response = events_request(state, capture_id, Some("Bearer secret-ci"), &body).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn with_max_events(mut state: MonoApiServiceState, max_events: u32) -> MonoApiServiceState {
+        let mut config = (*state.storage.config()).clone();
+        config.agent_capture.max_events_per_batch = max_events;
+        let config = Arc::new(config);
+        state.storage.config_handle = ConfigHandle::from_arc(config.clone());
+        state.storage.config = config;
+        state
+    }
+
+    #[tokio::test]
+    async fn events_batch_id_conflict_before_oversize() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let first = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let state = with_max_events(state, 1);
+        let second = events_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}},{"event_uid":"0:1","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn events_oversize_batch_is_413() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-events").await;
+        let state = with_max_events(state, 1);
+        let response = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}},{"event_uid":"0:1","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let rows = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
     }
 }

@@ -111,3 +111,7 @@ session JSON 字段：`capture_id`、`client_session_id`、`tenant_id`、`deploy
 ## CAS / fencing
 
 lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）。条件提交必须带 owner `lease_generation`；0 行更新视为 409，不得覆盖他方未过期 lease。同 lease 同 digest 重试返回既有 committed receipt。object 写入前先写 `upload_intent`；写入失败保留 intent 且不得报成功。staging 删除前写 `cleanup_intent`，删除失败保留 intent。`(capture_id, stream_kind, generation)` 绑定 raw blob 与 `blob_ref` 同事务；同水位同 digest 幂等，同水位不同 digest 409；过期 generation 的替换 409。
+
+## Events batch
+
+`POST /api/v1/agent-capture/sessions/{capture_id}/events:batch` 整批事务。`event_uid` 必须是 ASCII `{generation}:{byte_offset}`（非负十进制，不得溢出），否则 400。未知 `event_kind` 存 `unknown` 并保留 envelope payload。body `batch_id` 为幂等键；同 fingerprint 200，不同 409。同 uid 不同 payload 409。可选 `completeness` 为 `incomplete` 或 `complete`，只升不降（不把 `complete`/`truncated` 降级）。超过 `max_events_per_batch` 或单 event 超过 `max_event_bytes` → 413。无 token → 401。

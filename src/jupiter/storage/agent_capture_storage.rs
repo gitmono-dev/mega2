@@ -244,6 +244,198 @@ impl AgentCaptureStorage {
         Ok(inserted.last_insert_id)
     }
 
+    pub fn events_batch_fingerprint(
+        batch_id: &str,
+        events: &[InsertEvent],
+        completeness: Option<&str>,
+    ) -> Result<String, MegaError> {
+        let fingerprint_body = serde_json::json!({
+            "batch_id": batch_id,
+            "completeness": completeness,
+            "events": events
+                .iter()
+                .map(|event| {
+                    serde_json::json!({
+                        "event_uid": event.event_uid,
+                        "event_kind": event.event_kind,
+                        "native_id": event.native_id,
+                        "lifecycle_seq": event.lifecycle_seq,
+                        "payload": event.payload,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        canonical_json::fingerprint(&fingerprint_body.to_string())
+    }
+
+    pub async fn event_batch_receipt_fingerprint(
+        &self,
+        capture_id: i64,
+        batch_id: &str,
+    ) -> Result<Option<String>, MegaError> {
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        Ok(Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            "event.batch",
+            batch_id,
+        )
+        .one(self.get_connection())
+        .await?
+        .map(|row| row.fingerprint))
+    }
+
+    pub async fn insert_events_batch(
+        &self,
+        capture_id: i64,
+        batch_id: &str,
+        events: &[InsertEvent],
+        completeness: Option<&str>,
+        stream_kind: &str,
+    ) -> Result<i64, MegaError> {
+        let fingerprint = Self::events_batch_fingerprint(batch_id, events, completeness)?;
+        let txn = self.get_connection().begin().await?;
+        let result = self
+            .insert_events_batch_txn(
+                &txn,
+                capture_id,
+                batch_id,
+                events,
+                completeness,
+                stream_kind,
+                &fingerprint,
+            )
+            .await;
+        match result {
+            Ok(count) => {
+                txn.commit().await?;
+                Ok(count)
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // batch identity plus events and receipt fingerprint
+    async fn insert_events_batch_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        capture_id: i64,
+        batch_id: &str,
+        events: &[InsertEvent],
+        completeness: Option<&str>,
+        stream_kind: &str,
+        fingerprint: &str,
+    ) -> Result<i64, MegaError> {
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .lock(LockType::Update)
+            .one(txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        if let Some(existing) = Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            "event.batch",
+            batch_id,
+        )
+        .lock(LockType::Update)
+        .one(txn)
+        .await?
+        {
+            if existing.fingerprint == fingerprint {
+                return Ok(events.len() as i64);
+            }
+            return Err(MegaError::Other(format!(
+                "ingest receipt fingerprint conflict for capture_id {capture_id}"
+            )));
+        }
+        if let Some(next) = completeness
+            && !matches!(next, "incomplete" | "complete")
+        {
+            return Err(MegaError::Other("invalid completeness".to_owned()));
+        }
+        let mut watermark: Option<(i64, i64)> = None;
+        for event in events {
+            let event_fingerprint = canonical_json::fingerprint(&event.payload.to_string())?;
+            if let Some(existing) = agent_capture_event::Entity::find()
+                .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+                .filter(agent_capture_event::Column::EventUid.eq(event.event_uid.clone()))
+                .lock(LockType::Update)
+                .one(txn)
+                .await?
+            {
+                if existing.payload_fingerprint != event_fingerprint {
+                    return Err(MegaError::Other(format!(
+                        "agent_capture_event uid conflict for capture_id {capture_id}"
+                    )));
+                }
+            } else {
+                agent_capture_event::Entity::insert(agent_capture_event::ActiveModel {
+                    capture_id: Set(capture_id),
+                    event_uid: Set(event.event_uid.clone()),
+                    event_kind: Set(normalize_stored_event_kind(&event.event_kind)),
+                    native_id: Set(event.native_id.clone()),
+                    lifecycle_seq: Set(event.lifecycle_seq),
+                    payload: Set(event.payload.clone()),
+                    payload_fingerprint: Set(event_fingerprint),
+                    ..Default::default()
+                })
+                .exec(txn)
+                .await?;
+                if let Some((generation, byte_offset)) = parse_event_uid_parts(&event.event_uid) {
+                    watermark = Some(match watermark {
+                        Some((g, o)) if (generation, byte_offset) < (g, o) => (g, o),
+                        _ => (generation, byte_offset),
+                    });
+                }
+            }
+        }
+        if let Some((generation, byte_offset)) = watermark {
+            self.advance_source_stream_txn(txn, capture_id, stream_kind, generation, byte_offset)
+                .await?;
+        }
+        let mut session = session;
+        if let Some(next) = completeness
+            && matches!(next, "incomplete" | "complete")
+            && matches!(session.completeness.as_str(), "empty" | "incomplete")
+        {
+            let mut active = session.into_active_model();
+            active.completeness = Set(next.to_owned());
+            session = active.update(txn).await?;
+        } else if session.completeness == "empty" && !events.is_empty() {
+            let mut active = session.into_active_model();
+            active.completeness = Set("incomplete".to_owned());
+            session = active.update(txn).await?;
+        }
+        agent_capture_ingest_receipt::Entity::insert(agent_capture_ingest_receipt::ActiveModel {
+            deployment_id: Set(session.deployment_id.clone()),
+            tenant_id: Set(session.tenant_id.clone()),
+            producer_id: Set(session.producer_id.clone()),
+            capture_id: Set(capture_id),
+            operation: Set("event.batch".to_owned()),
+            idempotency_key: Set(batch_id.to_owned()),
+            fingerprint: Set(fingerprint.to_owned()),
+            response: Set(Some(serde_json::json!({ "event_count": events.len() }))),
+            ..Default::default()
+        })
+        .exec(txn)
+        .await?;
+        Ok(events.len() as i64)
+    }
+
     /// Advance a source-stream watermark. `(generation, byte_offset)` must
     /// not move backwards; a greater generation may reset offset.
     pub async fn advance_source_stream(
@@ -254,9 +446,32 @@ impl AgentCaptureStorage {
         byte_offset: i64,
     ) -> Result<(), MegaError> {
         let txn = self.get_connection().begin().await?;
+        match self
+            .advance_source_stream_txn(&txn, capture_id, stream_kind, generation, byte_offset)
+            .await
+        {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn advance_source_stream_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        capture_id: i64,
+        stream_kind: &str,
+        generation: i64,
+        byte_offset: i64,
+    ) -> Result<(), MegaError> {
         agent_capture_session::Entity::find_by_id(capture_id)
             .lock(LockType::Update)
-            .one(&txn)
+            .one(txn)
             .await?
             .ok_or_else(|| {
                 MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
@@ -267,14 +482,13 @@ impl AgentCaptureStorage {
             .filter(agent_capture_source_stream::Column::StreamKind.eq(stream_kind))
             .order_by_desc(agent_capture_source_stream::Column::Generation)
             .lock(LockType::Update)
-            .one(&txn)
+            .one(txn)
             .await?;
 
         if let Some(current) = current {
             if generation < current.generation
                 || (generation == current.generation && byte_offset < current.byte_offset)
             {
-                txn.rollback().await?;
                 return Err(MegaError::Other(format!(
                     "agent_capture_source_stream watermark regression for capture_id {capture_id}"
                 )));
@@ -283,9 +497,8 @@ impl AgentCaptureStorage {
                 if byte_offset > current.byte_offset {
                     let mut current = current.into_active_model();
                     current.byte_offset = Set(byte_offset);
-                    current.update(&txn).await?;
+                    current.update(txn).await?;
                 }
-                txn.commit().await?;
                 return Ok(());
             }
         }
@@ -298,7 +511,7 @@ impl AgentCaptureStorage {
                 byte_offset: Set(byte_offset),
                 ..Default::default()
             })
-            .exec(&txn)
+            .exec(txn)
             .await;
 
         match insert {
@@ -311,7 +524,7 @@ impl AgentCaptureStorage {
                     .filter(agent_capture_source_stream::Column::StreamKind.eq(stream_kind))
                     .filter(agent_capture_source_stream::Column::Generation.eq(generation))
                     .lock(LockType::Update)
-                    .one(&txn)
+                    .one(txn)
                     .await?
                     .ok_or_else(|| {
                         MegaError::Other(
@@ -320,7 +533,6 @@ impl AgentCaptureStorage {
                         )
                     })?;
                 if byte_offset < latest.byte_offset {
-                    txn.rollback().await?;
                     return Err(MegaError::Other(format!(
                         "agent_capture_source_stream watermark regression for capture_id {capture_id}"
                     )));
@@ -328,12 +540,11 @@ impl AgentCaptureStorage {
                 if byte_offset > latest.byte_offset {
                     let mut latest = latest.into_active_model();
                     latest.byte_offset = Set(byte_offset);
-                    latest.update(&txn).await?;
+                    latest.update(txn).await?;
                 }
             }
             Err(err) => return Err(err.into()),
         }
-        txn.commit().await?;
         Ok(())
     }
 
@@ -1469,6 +1680,25 @@ impl AgentCaptureStorage {
             .await?;
         Ok(rows.into_iter().map(|blob| blob.id).collect())
     }
+}
+
+fn normalize_stored_event_kind(kind: &str) -> String {
+    match kind {
+        "message" | "tool" | "tool_call" | "tool_result" | "thinking" | "system" => kind.to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn parse_event_uid_parts(uid: &str) -> Option<(i64, i64)> {
+    let (generation, offset) = uid.split_once(':')?;
+    if generation.is_empty()
+        || offset.is_empty()
+        || !generation.bytes().all(|b| b.is_ascii_digit())
+        || !offset.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((generation.parse().ok()?, offset.parse().ok()?))
 }
 
 fn is_unique_constraint_error(err: &sea_orm::DbErr) -> bool {
