@@ -107,3 +107,7 @@ session JSON 字段：`capture_id`、`client_session_id`、`tenant_id`、`deploy
 ## Blob staging / finalize
 
 `POST /api/v1/agent-capture/sessions/{capture_id}/blobs/staging` 与 `POST /api/v1/agent-capture/sessions/{capture_id}/blobs/{lease_id}/finalize` 以 session 为边界，无 repo-level staging。无 token → 401；未知 `capture_id` 或 token 不覆盖该 session 的 `repo_id` → 404。staging body 超过 `[agent_capture].max_blob_bytes`（含 chunked）→ 413。合法 staging 返回非空 `lease_id`。finalize 由服务器从 staging 对象重算 sha256；声明 `digest` 必须等于服务器 digest，否则 400。请求中的客户端 `object_key` 被忽略，响应 `object_key` 为服务器 committed key（`{deployment_id}/{tenant_id}/raw/sha256/{hex}`）。他人未过期 lease 的 finalize → 409。tenant/deployment 来自配置，不接受客户端覆写。
+
+## CAS / fencing
+
+lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）。条件提交必须带 owner `lease_generation`；0 行更新视为 409，不得覆盖他方未过期 lease。同 lease 同 digest 重试返回既有 committed receipt。object 写入前先写 `upload_intent`；写入失败保留 intent 且不得报成功。staging 删除前写 `cleanup_intent`，删除失败保留 intent。`(capture_id, stream_kind, generation)` 绑定 raw blob 与 `blob_ref` 同事务；同水位同 digest 幂等，同水位不同 digest 409；过期 generation 的替换 409。
