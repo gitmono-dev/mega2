@@ -1,3 +1,4 @@
+pub mod agent_capture;
 pub mod api_service;
 pub mod code_edit;
 pub mod diff;
