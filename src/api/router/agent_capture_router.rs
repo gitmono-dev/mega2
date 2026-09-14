@@ -1,10 +1,11 @@
 use axum::{
     Json,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode, header},
 };
+use futures::StreamExt;
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -18,6 +19,7 @@ use crate::{
     common::errors::MegaError,
     config::AgentCaptureIngestTokenConfig,
     jupiter::storage::agent_capture_storage::SessionNaturalKey,
+    orbit_api::object_storage::ObjectByteStream,
 };
 
 const SESSION_PUT_OPERATION: &str = "session.put";
@@ -86,6 +88,7 @@ fn capture_routes() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(list_checkpoints))
         .routes(routes!(get_transcript))
         .routes(routes!(list_file_ops))
+        .layer(DefaultBodyLimit::disable())
 }
 
 fn fixture() -> StatusCode {
@@ -141,9 +144,93 @@ fn decode_client_session_id(segment: &str) -> Result<String, AgentCaptureHttpErr
         .map_err(|_| AgentCaptureHttpError::bad_request("invalid client_session_id encoding"))
 }
 
+fn blob_http_error(err: MegaError) -> AgentCaptureHttpError {
+    let text = err.to_string();
+    if text.contains("payload too large") {
+        AgentCaptureHttpError::payload_too_large("blob exceeds max_blob_bytes")
+    } else if text.contains("lease conflict") {
+        AgentCaptureHttpError::conflict()
+    } else if text.contains("does not exist") {
+        AgentCaptureHttpError::not_found()
+    } else {
+        AgentCaptureHttpError::bad_request(text)
+    }
+}
+
+fn session_staging_path(path: &str) -> Result<i64, AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+        segments.get(idx + 4),
+    ) {
+        (Some(id), Some(&"blobs"), Some(&"staging"), None) => id
+            .parse()
+            .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
+fn session_finalize_path(path: &str) -> Result<(i64, String), AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+        segments.get(idx + 4),
+        segments.get(idx + 5),
+    ) {
+        (Some(id), Some(&"blobs"), Some(lease), Some(&"finalize"), None) => {
+            let capture_id = id
+                .parse()
+                .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id"))?;
+            Ok((capture_id, (*lease).to_owned()))
+        }
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
+fn body_stream(body: axum::body::Body) -> ObjectByteStream {
+    Box::pin(async_stream::stream! {
+        let mut data = body.into_data_stream();
+        while let Some(item) = data.next().await {
+            match item {
+                Ok(chunk) => yield Ok(chunk),
+                Err(err) => yield Err(std::io::Error::other(err.to_string())),
+            }
+        }
+    })
+}
+
 #[derive(Serialize, ToSchema)]
 struct SessionPutResponse {
     capture_id: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct StagingBlobResponse {
+    lease_id: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct FinalizeBlobRequest {
+    digest: Option<String>,
+    object_key: Option<String>,
+    size: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FinalizeBlobResponse {
+    digest: String,
+    object_key: String,
 }
 
 #[utoipa::path(
@@ -251,11 +338,46 @@ async fn put_session(
     post,
     path = "/sessions/{capture_id}/blobs/staging",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-08")),
+    responses(
+        (status = 200, description = "Staging lease", body = StagingBlobResponse),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope),
+        (status = 413, description = "Blob exceeds max_blob_bytes", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn staging_blob() -> StatusCode {
-    fixture()
+async fn staging_blob(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<StagingBlobResponse>, AgentCaptureHttpError> {
+    let (parts, body) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_staging_path(parts.uri.path())?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let lease_id = state
+        .storage
+        .agent_capture_service
+        .stage_session_blob(
+            capture_id,
+            &capture.deployment_id,
+            &capture.tenant_id,
+            capture.lease_ttl_seconds,
+            capture.max_blob_bytes,
+            body_stream(body),
+        )
+        .await
+        .map_err(blob_http_error)?;
+    Ok(Json(StagingBlobResponse { lease_id }))
 }
 
 #[utoipa::path(
@@ -265,11 +387,77 @@ async fn staging_blob() -> StatusCode {
         ("capture_id" = i64, Path, description = "Capture id"),
         ("lease_id" = String, Path, description = "Staging lease id")
     ),
-    responses((status = 501, description = "Fixture; handler lands in AC-08")),
+    request_body = FinalizeBlobRequest,
+    responses(
+        (status = 200, description = "Committed blob", body = FinalizeBlobResponse),
+        (status = 400, description = "Digest mismatch", body = ErrorEnvelope),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session or lease not found", body = ErrorEnvelope),
+        (status = 409, description = "Foreign live lease", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn finalize_blob() -> StatusCode {
-    fixture()
+async fn finalize_blob(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<FinalizeBlobResponse>, AgentCaptureHttpError> {
+    let (parts, body) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let (capture_id, lease_id) = session_finalize_path(parts.uri.path())?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    state
+        .storage
+        .agent_capture_service
+        .check_finalize_lease(
+            capture_id,
+            &capture.deployment_id,
+            &capture.tenant_id,
+            &lease_id,
+        )
+        .await
+        .map_err(blob_http_error)?;
+    let bytes = axum::body::to_bytes(body, SESSION_PUT_MAX_BYTES)
+        .await
+        .map_err(|_| AgentCaptureHttpError::payload_too_large("finalize body too large"))?;
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid utf-8 body"))?;
+    let request_body: FinalizeBlobRequest = if raw.trim().is_empty() {
+        FinalizeBlobRequest {
+            digest: None,
+            object_key: None,
+            size: None,
+        }
+    } else {
+        serde_json::from_str(raw)
+            .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+    };
+    let committed = state
+        .storage
+        .agent_capture_service
+        .finalize_session_blob(
+            capture_id,
+            &capture.deployment_id,
+            &capture.tenant_id,
+            &lease_id,
+            request_body.digest.as_deref(),
+            request_body.object_key.as_deref(),
+        )
+        .await
+        .map_err(blob_http_error)?;
+    Ok(Json(FinalizeBlobResponse {
+        digest: committed.digest,
+        object_key: committed.object_key,
+    }))
 }
 
 #[utoipa::path(
@@ -488,6 +676,11 @@ mod tests {
             let expected = if (*method == "GET" && *path == "/api/v1/agent-capture/discovery")
                 || (*method == "PUT"
                     && *path == "/api/v1/agent-capture/repos/{repo}/sessions/{client_session_id}")
+                || (*method == "POST"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/blobs/staging")
+                || (*method == "POST"
+                    && *path
+                        == "/api/v1/agent-capture/sessions/{capture_id}/blobs/{lease_id}/finalize")
             {
                 StatusCode::UNAUTHORIZED
             } else {
@@ -596,11 +789,21 @@ mod tests {
     }
 
     async fn db_state(paths: Option<Vec<String>>) -> (tempfile::TempDir, MonoApiServiceState) {
+        db_state_with(paths, None).await
+    }
+
+    async fn db_state_with(
+        paths: Option<Vec<String>>,
+        max_blob_bytes: Option<u64>,
+    ) -> (tempfile::TempDir, MonoApiServiceState) {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut config = isolated_config(temp.path().join("config"));
         config.git.push_auth = Some(PushAuth::None);
         config.agent_capture.enabled = true;
         config.agent_capture.ingest_tokens = vec![ingest_token(paths)];
+        if let Some(max_blob_bytes) = max_blob_bytes {
+            config.agent_capture.max_blob_bytes = max_blob_bytes;
+        }
         let mut storage = test_storage_with_config(temp.path(), config).await;
         let base = storage.app_service.mono_storage.base.clone();
         storage.agent_capture_service = AgentCaptureService {
@@ -794,5 +997,259 @@ mod tests {
             json_body(second).await["capture_id"].as_i64().expect("id"),
             capture_id
         );
+    }
+
+    async fn staging_request(
+        state: MonoApiServiceState,
+        capture_id: i64,
+        authorization: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder().method(Method::POST).uri(format!(
+            "/api/v1/agent-capture/sessions/{capture_id}/blobs/staging"
+        ));
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::from(body)).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn finalize_request(
+        state: MonoApiServiceState,
+        capture_id: i64,
+        lease_id: &str,
+        authorization: Option<&str>,
+        body: &str,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/agent-capture/sessions/{capture_id}/blobs/{lease_id}/finalize"
+            ))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn open_session(
+        state: MonoApiServiceState,
+        client_session_id: &str,
+    ) -> (MonoApiServiceState, i64) {
+        let response = put_session_request(
+            state.clone(),
+            "third-part%2Fmega",
+            client_session_id,
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let capture_id = json_body(response).await["capture_id"]
+            .as_i64()
+            .expect("capture_id");
+        (state, capture_id)
+    }
+
+    #[tokio::test]
+    async fn staging_unauthorized() {
+        let response = staging_request(dummy_state(), 1, None, b"payload".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn staging_too_large() {
+        let (_temp, state) = db_state_with(None, Some(8)).await;
+        let (state, capture_id) = open_session(state, "sess-blob").await;
+        let response =
+            staging_request(state, capture_id, Some("Bearer secret-ci"), vec![b'x'; 32]).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn staging_returns_lease() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-blob").await;
+        let response = staging_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let lease_id = json_body(response).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        assert!(!lease_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_returns_digest() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-blob").await;
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let response =
+            finalize_request(state, capture_id, &lease_id, Some("Bearer secret-ci"), "{}").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let digest = json_body(response).await["digest"]
+            .as_str()
+            .expect("digest")
+            .to_owned();
+        assert!(!digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_lease_conflict() {
+        let (_temp, state) = db_state(None).await;
+        let (state, owner) = open_session(state, "sess-owner").await;
+        let (state, other) = open_session(state, "sess-other").await;
+        let staged = staging_request(
+            state.clone(),
+            owner,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let response =
+            finalize_request(state, other, &lease_id, Some("Bearer secret-ci"), "{}").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn finalize_lease_conflict_before_bad_json() {
+        let (_temp, state) = db_state(None).await;
+        let (state, owner) = open_session(state, "sess-owner").await;
+        let (state, other) = open_session(state, "sess-other").await;
+        let staged = staging_request(
+            state.clone(),
+            owner,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let response = finalize_request(
+            state,
+            other,
+            &lease_id,
+            Some("Bearer secret-ci"),
+            "{not-json",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn finalize_ignores_client_object_key() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-blob").await;
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let response = finalize_request(
+            state,
+            capture_id,
+            &lease_id,
+            Some("Bearer secret-ci"),
+            r#"{"object_key":"client/final/key"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let object_key = body["object_key"].as_str().expect("object_key");
+        assert_ne!(object_key, "client/final/key");
+        assert!(object_key.contains("/raw/sha256/"), "{object_key}");
+    }
+
+    #[tokio::test]
+    async fn finalize_digest_mismatch() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-blob").await;
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let response = finalize_request(
+            state,
+            capture_id,
+            &lease_id,
+            Some("Bearer secret-ci"),
+            r#"{"digest":"sha256:deadbeef"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn finalize_empty_digest_is_400() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-blob").await;
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"payload".to_vec(),
+        )
+        .await;
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let response = finalize_request(
+            state.clone(),
+            capture_id,
+            &lease_id,
+            Some("Bearer secret-ci"),
+            r#"{"digest":""}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let retry =
+            finalize_request(state, capture_id, &lease_id, Some("Bearer secret-ci"), "{}").await;
+        assert_eq!(retry.status(), StatusCode::OK);
     }
 }
