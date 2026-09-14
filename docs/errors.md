@@ -146,3 +146,7 @@ N/A：未新增用户可见的 `MegaError` 枚举变体。跨 kind / 错宽度 I
 ## plan-20260901（FastCDC Media + receive-pack / 导入可靠性）
 
 N/A：未新增用户可见的 `MegaError` 枚举变体。Media HTTP 用领域错误映射 400/404/409/500（见 [`docs/refactoring/fastcdc-media.md`](./refactoring/fastcdc-media.md)）；`MegaError::is_retryable_db_serialization` 仅供 batch insert 内部重试分类，不改变对外错误面。
+
+## plan-20260911（storage-only Agent Capture）
+
+N/A：未新增用户可见的 `MegaError` 枚举变体。`/api/v1/agent-capture` 使用固定 HTTP envelope `{ "error": { "code", "message" } }`（`unauthorized` / `not_found` / `conflict` / `bad_request` / `payload_too_large` / `missing_raw`），不登记新的 `MegaError` 类型。
