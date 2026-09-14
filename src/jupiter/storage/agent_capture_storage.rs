@@ -2129,6 +2129,142 @@ impl AgentCaptureStorage {
             .await?;
         Ok(rows.into_iter().map(|blob| blob.id).collect())
     }
+
+    pub async fn list_sessions(
+        &self,
+        deployment_id: &str,
+        tenant_id: &str,
+        repo_id: &str,
+        producer_id: &str,
+        limit: u32,
+        cursor: Option<i64>,
+    ) -> Result<(Vec<agent_capture_session::Model>, Option<i64>), MegaError> {
+        let mut query = agent_capture_session::Entity::find()
+            .filter(agent_capture_session::Column::DeploymentId.eq(deployment_id.to_owned()))
+            .filter(agent_capture_session::Column::TenantId.eq(tenant_id.to_owned()))
+            .filter(agent_capture_session::Column::RepoId.eq(repo_id.to_owned()))
+            .filter(agent_capture_session::Column::ProducerId.eq(producer_id.to_owned()))
+            .order_by_asc(agent_capture_session::Column::Id)
+            .limit(u64::from(limit) + 1);
+        if let Some(cursor) = cursor {
+            query = query.filter(agent_capture_session::Column::Id.gt(cursor));
+        }
+        let mut rows = query.all(self.get_connection()).await?;
+        let next_cursor = if rows.len() > limit as usize {
+            rows.pop();
+            rows.last().map(|row| row.id)
+        } else {
+            None
+        };
+        Ok((rows, next_cursor))
+    }
+
+    pub async fn list_checkpoints(
+        &self,
+        capture_id: i64,
+        limit: u32,
+        cursor: Option<i64>,
+    ) -> Result<(Vec<agent_capture_checkpoint::Model>, Option<i64>), MegaError> {
+        let mut query = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .order_by_asc(agent_capture_checkpoint::Column::Id)
+            .limit(u64::from(limit) + 1);
+        if let Some(cursor) = cursor {
+            query = query.filter(agent_capture_checkpoint::Column::Id.gt(cursor));
+        }
+        let mut rows = query.all(self.get_connection()).await?;
+        let next_cursor = if rows.len() > limit as usize {
+            rows.pop();
+            rows.last().map(|row| row.id)
+        } else {
+            None
+        };
+        Ok((rows, next_cursor))
+    }
+
+    pub async fn list_file_ops(
+        &self,
+        capture_id: i64,
+        limit: u32,
+        cursor: Option<i64>,
+    ) -> Result<(Vec<agent_capture_file_op::Model>, Option<i64>), MegaError> {
+        let mut query = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .order_by_asc(agent_capture_file_op::Column::Id)
+            .limit(u64::from(limit) + 1);
+        if let Some(cursor) = cursor {
+            query = query.filter(agent_capture_file_op::Column::Id.gt(cursor));
+        }
+        let mut rows = query.all(self.get_connection()).await?;
+        let next_cursor = if rows.len() > limit as usize {
+            rows.pop();
+            rows.last().map(|row| row.id)
+        } else {
+            None
+        };
+        Ok((rows, next_cursor))
+    }
+
+    pub async fn load_transcript_blob(
+        &self,
+        capture_id: i64,
+        deployment_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<agent_capture_blob::Model>, MegaError> {
+        let Some(session) = Self::scoped_session(capture_id, deployment_id, tenant_id)
+            .one(self.get_connection())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if session.session_kind == "internal_code" {
+            let Some(stream) = agent_capture_source_stream::Entity::find()
+                .filter(agent_capture_source_stream::Column::CaptureId.eq(capture_id))
+                .order_by_desc(agent_capture_source_stream::Column::Generation)
+                .one(self.get_connection())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let Some(binding) = agent_capture_stream_blob::Entity::find()
+                .filter(agent_capture_stream_blob::Column::CaptureId.eq(capture_id))
+                .filter(agent_capture_stream_blob::Column::StreamKind.eq(stream.stream_kind))
+                .filter(agent_capture_stream_blob::Column::Generation.eq(stream.generation))
+                .one(self.get_connection())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let blob = agent_capture_blob::Entity::find_by_id(binding.blob_id)
+                .one(self.get_connection())
+                .await?;
+            return Ok(blob.filter(|row| {
+                row.lease_state == "committed"
+                    && row.visibility == "raw"
+                    && row.deployment_id == deployment_id
+                    && row.tenant_id == tenant_id
+            }));
+        }
+        let Some(checkpoint) = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .filter(agent_capture_checkpoint::Column::TranscriptDigest.is_not_null())
+            .order_by_desc(agent_capture_checkpoint::Column::Id)
+            .one(self.get_connection())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(digest) = checkpoint
+            .transcript_digest
+            .filter(|digest| !digest.is_empty())
+        else {
+            return Ok(None);
+        };
+        let blob = Self::blob_by_digest_key(deployment_id, tenant_id, &digest, "raw")
+            .one(self.get_connection())
+            .await?;
+        Ok(blob.filter(|row| row.lease_state == "committed"))
+    }
 }
 
 fn normalize_stored_event_kind(kind: &str) -> String {

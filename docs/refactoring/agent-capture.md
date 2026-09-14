@@ -123,3 +123,7 @@ lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）
 ## Checkpoint POST
 
 `POST /api/v1/agent-capture/sessions/{capture_id}/checkpoints` 仅接受父 session `session_kind=external_capture`（`internal_code` → 400）。`transcript_digest` 必须指向同 tenant/deployment 已 committed 的 raw blob；仍为 staging 或缺失 → 400。`redacted_digest` 可选，写入 checkpoint `metadata`；仅 redacted、无 raw 时响应与 session 的 `completeness=incomplete`、`partial_reason=missing_raw`。同 `transcript_digest` 共享已 committed CAS blob 行，并写入 `blob_ref.owner_checkpoint_id`。body `checkpoint_id` 为幂等键；receipt fingerprint 为整段 body 的 canonical JSON；同 fingerprint 200，不同 409。判定顺序 401 → 404 → 409（已有 receipt，先于 typed JSON 校验）→ 400。无 token → 401。
+
+## Query / transcript
+
+GET list/show 为 metadata-first：`{ "items": [...], "next_cursor": string|null }`，list item 不含 `transcript` 正文。分页 query `limit`（缺省 50，最大 200）与 `cursor`。`GET /sessions/{capture_id}` 返回 session JSON（含 `capture_id`）。`GET .../file-ops` 与 `GET .../checkpoints` 同样为 metadata 页，无 op 时仍 200 且含 `items`。`GET .../transcript` 返回 committed raw（`application/octet-stream`）并 INSERT `agent_capture_access_audit`（`action=transcript.read`，不写 `audit_logs`）。external_capture 用最新带 `transcript_digest` 的 checkpoint；internal_code 用最新 source_stream generation 绑定的 raw `stream_blob`。缺 committed raw → 409，`error.code=missing_raw`。无 token → 401。

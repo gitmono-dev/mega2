@@ -2,6 +2,7 @@ use axum::{
     Json,
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
 };
 use futures::StreamExt;
 use percent_encoding::percent_decode_str;
@@ -12,8 +13,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::{
     api::{MonoApiServiceState, api_doc::AGENT_CAPTURE_TAG},
     api_model::agent_capture::{
-        AgentCaptureHttpError, DiscoveryResponse, ErrorEnvelope, SessionKind, SessionPutRequest,
-        bearer_token, decode_repo_path_segment, fingerprint_session_put_body,
+        AgentCaptureHttpError, Completeness, DiscoveryResponse, ErrorEnvelope, PageEnvelope,
+        SessionKind, SessionPutRequest, SessionView, bearer_token, decode_repo_path_segment,
+        fingerprint_session_put_body,
     },
     ceres::agent_capture::auth::{lookup_ingest_token, token_covers_capture_repo},
     common::{canonical_json, errors::MegaError},
@@ -21,7 +23,7 @@ use crate::{
     jupiter::storage::agent_capture_storage::{
         AgentCaptureStorage, InsertCheckpoint, InsertEvent, InsertFileOp, SessionNaturalKey,
     },
-    orbit_api::object_storage::ObjectByteStream,
+    orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectNamespace},
 };
 
 const SESSION_PUT_OPERATION: &str = "session.put";
@@ -91,10 +93,6 @@ fn capture_routes() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(get_transcript))
         .routes(routes!(list_file_ops))
         .layer(DefaultBodyLimit::disable())
-}
-
-fn fixture() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
 }
 
 fn require_ingest_token(
@@ -226,6 +224,124 @@ fn session_checkpoints_post_path(path: &str) -> Result<i64, AgentCaptureHttpErro
             .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
         _ => Err(AgentCaptureHttpError::not_found()),
     }
+}
+
+fn repo_sessions_list_path(path: &str) -> Result<String, AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "repos") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+    ) {
+        (Some(repo), Some(&"sessions"), None) if !repo.is_empty() => Ok((*repo).to_owned()),
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
+fn session_resource_path(path: &str, resource: Option<&str>) -> Result<i64, AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+    ) {
+        (Some(id), None, None) if resource.is_none() => id
+            .parse()
+            .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
+        (Some(id), Some(name), None) if resource == Some(*name) => id
+            .parse()
+            .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
+fn pagination_from_uri(uri: &axum::http::Uri) -> Result<(u32, Option<i64>), AgentCaptureHttpError> {
+    let mut limit = crate::api_model::agent_capture::DEFAULT_PAGE_LIMIT;
+    let mut cursor = None;
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            match key {
+                "limit" => {
+                    let parsed: u32 = value
+                        .parse()
+                        .map_err(|_| AgentCaptureHttpError::bad_request("invalid limit"))?;
+                    limit = parsed.min(crate::api_model::agent_capture::MAX_PAGE_LIMIT);
+                }
+                "cursor" if !value.is_empty() => {
+                    cursor = Some(
+                        value
+                            .parse()
+                            .map_err(|_| AgentCaptureHttpError::bad_request("invalid cursor"))?,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((limit, cursor))
+}
+
+fn session_kind_from_stored(kind: &str) -> Result<SessionKind, AgentCaptureHttpError> {
+    match kind {
+        "external_capture" => Ok(SessionKind::ExternalCapture),
+        "internal_code" => Ok(SessionKind::InternalCode),
+        _ => Err(AgentCaptureHttpError::bad_request("invalid session_kind")),
+    }
+}
+
+fn completeness_from_stored(value: &str) -> Result<Completeness, AgentCaptureHttpError> {
+    match value {
+        "empty" => Ok(Completeness::Empty),
+        "incomplete" => Ok(Completeness::Incomplete),
+        "complete" => Ok(Completeness::Complete),
+        "truncated" => Ok(Completeness::Truncated),
+        _ => Err(AgentCaptureHttpError::bad_request("invalid completeness")),
+    }
+}
+
+fn session_view(
+    row: crate::callisto::agent_capture_session::Model,
+) -> Result<SessionView, AgentCaptureHttpError> {
+    Ok(SessionView {
+        capture_id: row.id,
+        client_session_id: row.client_session_id,
+        tenant_id: row.tenant_id,
+        deployment_id: row.deployment_id,
+        repo_id: row.repo_id,
+        producer_id: row.producer_id,
+        session_kind: session_kind_from_stored(&row.session_kind)?,
+        started_at: row.started_at.map(|ts| ts.with_timezone(&chrono::Utc)),
+        ended_at: row.ended_at.map(|ts| ts.with_timezone(&chrono::Utc)),
+        completeness: completeness_from_stored(&row.completeness)?,
+        partial_reason: row.partial_reason,
+        created_at: row.created_at.with_timezone(&chrono::Utc),
+        updated_at: row.updated_at.with_timezone(&chrono::Utc),
+    })
+}
+
+fn missing_raw() -> AgentCaptureHttpError {
+    AgentCaptureHttpError {
+        status: StatusCode::CONFLICT,
+        envelope: ErrorEnvelope::new("missing_raw", "committed raw transcript is missing"),
+    }
+}
+
+async fn collect_object_bytes(mut stream: ObjectByteStream) -> Result<Vec<u8>, MegaError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| MegaError::Other(err.to_string()))?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn parse_event_uid(uid: &str) -> Result<(i64, i64), AgentCaptureHttpError> {
@@ -436,6 +552,22 @@ struct CheckpointPostResponse {
     accepted: bool,
     completeness: String,
     partial_reason: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct CheckpointListItem {
+    checkpoint_id: String,
+    transcript_digest: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FileOpListItem {
+    id: i64,
+    source_event_uid: String,
+    op: String,
+    path: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[utoipa::path(
@@ -1018,55 +1150,257 @@ async fn post_checkpoint(
     get,
     path = "/repos/{repo}/sessions",
     params(("repo" = String, Path, description = "Single percent-encoded repo path segment")),
-    responses((status = 501, description = "Fixture; handler lands in AC-12")),
+    responses(
+        (status = 200, description = "Session metadata page"),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Token does not cover repo", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn list_sessions() -> StatusCode {
-    fixture()
+async fn list_sessions(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<PageEnvelope<SessionView>>, AgentCaptureHttpError> {
+    let (parts, _) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let repo_segment = repo_sessions_list_path(parts.uri.path())?;
+    let repo_id = decode_repo_path_segment(&repo_segment)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    if !token_covers_capture_repo(&token, &repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let (limit, cursor) = pagination_from_uri(&parts.uri)?;
+    let capture = state.storage.config().agent_capture.clone();
+    let (rows, next_cursor) = state
+        .storage
+        .agent_capture_service
+        .storage
+        .list_sessions(
+            &capture.deployment_id,
+            &capture.tenant_id,
+            &repo_id,
+            &token.name,
+            limit,
+            cursor,
+        )
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let items = rows
+        .into_iter()
+        .map(session_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(PageEnvelope {
+        items,
+        next_cursor: next_cursor.map(|id| id.to_string()),
+    }))
 }
 
 #[utoipa::path(
     get,
     path = "/sessions/{capture_id}",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-12")),
+    responses(
+        (status = 200, description = "Session metadata", body = SessionView),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn get_session() -> StatusCode {
-    fixture()
+async fn get_session(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<SessionView>, AgentCaptureHttpError> {
+    let (parts, _) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_resource_path(parts.uri.path(), None)?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if session.producer_id != token.name || !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    Ok(Json(session_view(session)?))
 }
 
 #[utoipa::path(
     get,
     path = "/sessions/{capture_id}/checkpoints",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-12")),
+    responses(
+        (status = 200, description = "Checkpoint metadata page"),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn list_checkpoints() -> StatusCode {
-    fixture()
+async fn list_checkpoints(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<PageEnvelope<CheckpointListItem>>, AgentCaptureHttpError> {
+    let (parts, _) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_checkpoints_post_path(parts.uri.path())?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if session.producer_id != token.name || !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let (limit, cursor) = pagination_from_uri(&parts.uri)?;
+    let (rows, next_cursor) = state
+        .storage
+        .agent_capture_service
+        .storage
+        .list_checkpoints(capture_id, limit, cursor)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    Ok(Json(PageEnvelope {
+        items: rows
+            .into_iter()
+            .map(|row| CheckpointListItem {
+                checkpoint_id: row.checkpoint_id,
+                transcript_digest: row.transcript_digest,
+                created_at: row.created_at.with_timezone(&chrono::Utc),
+            })
+            .collect(),
+        next_cursor: next_cursor.map(|id| id.to_string()),
+    }))
 }
 
 #[utoipa::path(
     get,
     path = "/sessions/{capture_id}/transcript",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-12")),
+    responses(
+        (status = 200, description = "Committed raw transcript bytes"),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope),
+        (status = 409, description = "Committed raw transcript missing", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn get_transcript() -> StatusCode {
-    fixture()
+async fn get_transcript(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<axum::response::Response, AgentCaptureHttpError> {
+    let (parts, _) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_resource_path(parts.uri.path(), Some("transcript"))?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if session.producer_id != token.name || !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let blob = state
+        .storage
+        .agent_capture_service
+        .storage
+        .load_transcript_blob(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(missing_raw)?;
+    let key = ObjectKey {
+        namespace: ObjectNamespace::Agent,
+        key: blob.object_key,
+    };
+    let (stream, _) = state
+        .storage
+        .agent_capture_service
+        .obj_storage
+        .inner
+        .get_stream(&key)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let bytes = collect_object_bytes(stream)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    state
+        .storage
+        .agent_capture_service
+        .storage
+        .insert_access_audit(
+            &capture.deployment_id,
+            &capture.tenant_id,
+            capture_id,
+            &token.name,
+            "transcript.read",
+        )
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
 }
 
 #[utoipa::path(
     get,
     path = "/sessions/{capture_id}/file-ops",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-12")),
+    responses(
+        (status = 200, description = "File-op metadata page"),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn list_file_ops() -> StatusCode {
-    fixture()
+async fn list_file_ops(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<PageEnvelope<FileOpListItem>>, AgentCaptureHttpError> {
+    let (parts, _) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_resource_path(parts.uri.path(), Some("file-ops"))?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if session.producer_id != token.name || !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let (limit, cursor) = pagination_from_uri(&parts.uri)?;
+    let (rows, next_cursor) = state
+        .storage
+        .agent_capture_service
+        .storage
+        .list_file_ops(capture_id, limit, cursor)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    Ok(Json(PageEnvelope {
+        items: rows
+            .into_iter()
+            .map(|row| FileOpListItem {
+                id: row.id,
+                source_event_uid: row.source_event_uid,
+                op: row.op,
+                path: row.path,
+                created_at: row.created_at.with_timezone(&chrono::Utc),
+            })
+            .collect(),
+        next_cursor: next_cursor.map(|id| id.to_string()),
+    }))
 }
 
 #[cfg(test)]
@@ -1086,8 +1420,8 @@ mod tests {
     use crate::{
         api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
         callisto::{
-            agent_capture_blob, agent_capture_checkpoint, agent_capture_event,
-            agent_capture_file_op, agent_capture_session,
+            agent_capture_access_audit, agent_capture_blob, agent_capture_checkpoint,
+            agent_capture_event, agent_capture_file_op, agent_capture_session,
         },
         ceres::api_service::cache::GitObjectCache,
         config::{
@@ -1214,6 +1548,14 @@ mod tests {
                     && *path == "/api/v1/agent-capture/sessions/{capture_id}/file-ops:batch")
                 || (*method == "POST"
                     && *path == "/api/v1/agent-capture/sessions/{capture_id}/checkpoints")
+                || (*method == "GET" && *path == "/api/v1/agent-capture/repos/{repo}/sessions")
+                || (*method == "GET" && *path == "/api/v1/agent-capture/sessions/{capture_id}")
+                || (*method == "GET"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/checkpoints")
+                || (*method == "GET"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/transcript")
+                || (*method == "GET"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/file-ops")
             {
                 StatusCode::UNAUTHORIZED
             } else {
@@ -1254,7 +1596,7 @@ mod tests {
             .await
             .expect("response")
             .status();
-        assert_eq!(encoded, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(encoded, StatusCode::UNAUTHORIZED);
 
         let multi = router
             .oneshot(
@@ -2684,5 +3026,170 @@ mod tests {
         )
         .await;
         assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    async fn get_request(
+        state: MonoApiServiceState,
+        method: Method,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn response_bytes(response: axum::http::Response<Body>) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn list_sessions_metadata_only() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-query").await;
+        let response = get_request(
+            state,
+            Method::GET,
+            "/api/v1/agent-capture/repos/third-part%2Fmega/sessions",
+            Some("Bearer secret-ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.get("items").is_some());
+        assert!(body.get("next_cursor").is_some());
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["capture_id"], capture_id);
+        assert!(items[0].get("transcript").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_ids() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-query").await;
+        let response = get_request(
+            state,
+            Method::GET,
+            &format!("/api/v1/agent-capture/sessions/{capture_id}"),
+            Some("Bearer secret-ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["capture_id"], capture_id);
+        assert!(body.get("transcript").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_transcript_raw_and_audit() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-query").await;
+        let payload = b"raw-transcript-bytes";
+        let (state, digest) = commit_raw_digest(state, capture_id, payload).await;
+        let checkpointed = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(checkpointed.status(), StatusCode::OK);
+        let before = agent_capture_access_audit::Entity::find()
+            .filter(agent_capture_access_audit::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        let response = get_request(
+            state.clone(),
+            Method::GET,
+            &format!("/api/v1/agent-capture/sessions/{capture_id}/transcript"),
+            Some("Bearer secret-ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(response_bytes(response).await, payload);
+        let after = agent_capture_access_audit::Entity::find()
+            .filter(agent_capture_access_audit::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(after, before + 1);
+    }
+
+    #[tokio::test]
+    async fn get_transcript_unauthorized() {
+        let response = get_request(
+            dummy_state(),
+            Method::GET,
+            "/api/v1/agent-capture/sessions/1/transcript",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_file_ops_ok() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-query").await;
+        let response = get_request(
+            state,
+            Method::GET,
+            &format!("/api/v1/agent-capture/sessions/{capture_id}/file-ops"),
+            Some("Bearer secret-ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_file_ops_has_items_key() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-query").await;
+        let response = get_request(
+            state,
+            Method::GET,
+            &format!("/api/v1/agent-capture/sessions/{capture_id}/file-ops"),
+            Some("Bearer secret-ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.get("items").is_some());
+        assert!(body["items"].as_array().expect("items").is_empty());
+        assert!(body.get("next_cursor").is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_raw_returns_409() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-query").await;
+        let response = get_request(
+            state,
+            Method::GET,
+            &format!("/api/v1/agent-capture/sessions/{capture_id}/transcript"),
+            Some("Bearer secret-ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "missing_raw");
     }
 }
