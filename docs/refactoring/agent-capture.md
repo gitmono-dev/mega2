@@ -115,3 +115,7 @@ lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）
 ## Events batch
 
 `POST /api/v1/agent-capture/sessions/{capture_id}/events:batch` 整批事务。`event_uid` 必须是 ASCII `{generation}:{byte_offset}`（非负十进制，不得溢出），否则 400。未知 `event_kind` 存 `unknown` 并保留 envelope payload。body `batch_id` 为幂等键；同 fingerprint 200，不同 409。同 uid 不同 payload 409。可选 `completeness` 为 `incomplete` 或 `complete`，只升不降（不把 `complete`/`truncated` 降级）。超过 `max_events_per_batch` 或单 event 超过 `max_event_bytes` → 413。无 token → 401。
+
+## File-ops batch
+
+`POST /api/v1/agent-capture/sessions/{capture_id}/file-ops:batch` 校验 `agent.file_op.v1`（`schema` 缺省即该值；其它 schema 400）。无 `source_event_uid`、空 uid、或同 capture 无对应 event → 400。`op ∈ {read, write, patch, delete, search}`；`op=search` 合法。路径为空、含 `..`、含 NUL、或绝对路径 → 400。digest 非空必须指向同 tenant/deployment 已 committed 的 raw blob，并写入 `blob_ref.owner_file_op_id`；未 committed → 400。body `batch_id` 为幂等键；receipt fingerprint 为整段 body 的 canonical JSON；同 fingerprint 200，不同 409。判定顺序 401 → 404 → 409（已有 receipt，先于 typed JSON 校验）→ 400。storage 错误映射 409 仅匹配固定前缀 `ingest receipt fingerprint conflict`。file-op 绑定的 blob 数 **超过** `max_file_blobs_per_session` 时 session `completeness` 标 `truncated`（等于上限不标）；超限仍 200 并写入。整批事务。无 token → 401。

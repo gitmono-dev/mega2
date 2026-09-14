@@ -3,7 +3,7 @@ use std::ops::Deref;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, DbErr, EntityTrait,
-    IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
     prelude::DateTimeWithTimeZone,
     sea_query::{Expr, ExprTrait, LockType, OnConflict, Query},
 };
@@ -58,6 +58,14 @@ pub struct InsertEvent {
     pub native_id: Option<String>,
     pub lifecycle_seq: Option<i64>,
     pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsertFileOp {
+    pub source_event_uid: String,
+    pub op: String,
+    pub path: String,
+    pub digest: Option<String>,
 }
 
 pub struct CommittedFinalize {
@@ -617,6 +625,219 @@ impl AgentCaptureStorage {
         .await?;
         txn.commit().await?;
         Ok(inserted.last_insert_id)
+    }
+
+    pub fn file_ops_batch_fingerprint(
+        batch_id: &str,
+        schema: &str,
+        ops: &[InsertFileOp],
+    ) -> Result<String, MegaError> {
+        let fingerprint_body = serde_json::json!({
+            "batch_id": batch_id,
+            "schema": schema,
+            "ops": ops
+                .iter()
+                .map(|op| {
+                    serde_json::json!({
+                        "source_event_uid": op.source_event_uid,
+                        "op": op.op,
+                        "path": op.path,
+                        "digest": op.digest,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        canonical_json::fingerprint(&fingerprint_body.to_string())
+    }
+
+    pub async fn file_op_batch_receipt_fingerprint(
+        &self,
+        capture_id: i64,
+        batch_id: &str,
+    ) -> Result<Option<String>, MegaError> {
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        Ok(Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            "file_op.batch",
+            batch_id,
+        )
+        .one(self.get_connection())
+        .await?
+        .map(|row| row.fingerprint))
+    }
+
+    pub async fn insert_file_ops_batch(
+        &self,
+        capture_id: i64,
+        batch_id: &str,
+        schema: &str,
+        ops: &[InsertFileOp],
+        max_file_blobs_per_session: u32,
+        fingerprint: &str,
+    ) -> Result<i64, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let result = self
+            .insert_file_ops_batch_txn(
+                &txn,
+                capture_id,
+                batch_id,
+                schema,
+                ops,
+                max_file_blobs_per_session,
+                fingerprint,
+            )
+            .await;
+        match result {
+            Ok(count) => {
+                txn.commit().await?;
+                Ok(count)
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // batch identity plus ops, cap, and receipt fingerprint
+    async fn insert_file_ops_batch_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        capture_id: i64,
+        batch_id: &str,
+        schema: &str,
+        ops: &[InsertFileOp],
+        max_file_blobs_per_session: u32,
+        fingerprint: &str,
+    ) -> Result<i64, MegaError> {
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .lock(LockType::Update)
+            .one(txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        if let Some(existing) = Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            "file_op.batch",
+            batch_id,
+        )
+        .lock(LockType::Update)
+        .one(txn)
+        .await?
+        {
+            if existing.fingerprint == fingerprint {
+                return Ok(ops.len() as i64);
+            }
+            return Err(MegaError::Other(format!(
+                "ingest receipt fingerprint conflict for capture_id {capture_id}"
+            )));
+        }
+        for op in ops {
+            let source = agent_capture_event::Entity::find()
+                .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+                .filter(agent_capture_event::Column::EventUid.eq(op.source_event_uid.clone()))
+                .lock(LockType::Update)
+                .one(txn)
+                .await?;
+            if source.is_none() {
+                return Err(MegaError::Other(format!(
+                    "file_op source event {} missing for capture_id {capture_id}",
+                    op.source_event_uid
+                )));
+            }
+            let inserted =
+                agent_capture_file_op::Entity::insert(agent_capture_file_op::ActiveModel {
+                    capture_id: Set(capture_id),
+                    source_event_uid: Set(op.source_event_uid.clone()),
+                    op: Set(op.op.clone()),
+                    path: Set(op.path.clone()),
+                    ..Default::default()
+                })
+                .exec(txn)
+                .await?;
+            if let Some(digest) = op.digest.as_deref().filter(|digest| !digest.is_empty()) {
+                let blob = Self::blob_by_digest_key(
+                    &session.deployment_id,
+                    &session.tenant_id,
+                    digest,
+                    "raw",
+                )
+                .lock(LockType::Update)
+                .one(txn)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other(format!(
+                        "file_op digest {digest} is not a committed raw blob"
+                    ))
+                })?;
+                if blob.lease_state != "committed" {
+                    return Err(MegaError::Other(format!(
+                        "file_op digest {digest} is not a committed raw blob"
+                    )));
+                }
+                agent_capture_blob_ref::Entity::insert(agent_capture_blob_ref::ActiveModel {
+                    blob_id: Set(blob.id),
+                    owner_session_id: Set(None),
+                    owner_event_id: Set(None),
+                    owner_checkpoint_id: Set(None),
+                    owner_file_op_id: Set(Some(inserted.last_insert_id)),
+                    ..Default::default()
+                })
+                .exec(txn)
+                .await?;
+            }
+        }
+        let file_op_ids: Vec<i64> = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .all(txn)
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let blob_count = if file_op_ids.is_empty() {
+            0
+        } else {
+            agent_capture_blob_ref::Entity::find()
+                .filter(agent_capture_blob_ref::Column::OwnerFileOpId.is_in(file_op_ids))
+                .count(txn)
+                .await?
+        };
+        let mut session = session;
+        if blob_count > u64::from(max_file_blobs_per_session) && session.completeness != "truncated"
+        {
+            let mut active = session.into_active_model();
+            active.completeness = Set("truncated".to_owned());
+            session = active.update(txn).await?;
+        }
+        agent_capture_ingest_receipt::Entity::insert(agent_capture_ingest_receipt::ActiveModel {
+            deployment_id: Set(session.deployment_id.clone()),
+            tenant_id: Set(session.tenant_id.clone()),
+            producer_id: Set(session.producer_id.clone()),
+            capture_id: Set(capture_id),
+            operation: Set("file_op.batch".to_owned()),
+            idempotency_key: Set(batch_id.to_owned()),
+            fingerprint: Set(fingerprint.to_owned()),
+            response: Set(Some(serde_json::json!({
+                "op_count": ops.len(),
+                "schema": schema,
+            }))),
+            ..Default::default()
+        })
+        .exec(txn)
+        .await?;
+        Ok(ops.len() as i64)
     }
 
     fn blob_by_digest_key(

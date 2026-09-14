@@ -19,7 +19,7 @@ use crate::{
     common::{canonical_json, errors::MegaError},
     config::AgentCaptureIngestTokenConfig,
     jupiter::storage::agent_capture_storage::{
-        AgentCaptureStorage, InsertEvent, SessionNaturalKey,
+        AgentCaptureStorage, InsertEvent, InsertFileOp, SessionNaturalKey,
     },
     orbit_api::object_storage::ObjectByteStream,
 };
@@ -194,6 +194,23 @@ fn session_events_batch_path(path: &str) -> Result<i64, AgentCaptureHttpError> {
     }
 }
 
+fn session_file_ops_batch_path(path: &str) -> Result<i64, AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+    ) {
+        (Some(id), Some(&"file-ops:batch"), None) => id
+            .parse()
+            .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
 fn parse_event_uid(uid: &str) -> Result<(i64, i64), AgentCaptureHttpError> {
     let Some((generation, offset)) = uid.split_once(':') else {
         return Err(AgentCaptureHttpError::bad_request("invalid event_uid"));
@@ -212,6 +229,46 @@ fn parse_event_uid(uid: &str) -> Result<(i64, i64), AgentCaptureHttpError> {
         .parse::<i64>()
         .map_err(|_| AgentCaptureHttpError::bad_request("invalid event_uid"))?;
     Ok((generation, offset))
+}
+
+fn file_ops_http_error(err: MegaError) -> AgentCaptureHttpError {
+    match &err {
+        MegaError::Other(msg) if msg.starts_with("ingest receipt fingerprint conflict") => {
+            AgentCaptureHttpError::conflict()
+        }
+        MegaError::Other(msg)
+            if msg.starts_with("agent_capture_session ") && msg.ends_with(" does not exist") =>
+        {
+            AgentCaptureHttpError::not_found()
+        }
+        _ => AgentCaptureHttpError::bad_request(err.to_string()),
+    }
+}
+
+fn is_file_op_v1(op: &str) -> bool {
+    matches!(op, "read" | "write" | "patch" | "delete" | "search")
+}
+
+fn is_absolute_file_op_path(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+fn validate_file_op_path(path: &str) -> Result<(), AgentCaptureHttpError> {
+    if path.is_empty()
+        || path.contains('\0')
+        || path.contains("..")
+        || is_absolute_file_op_path(path)
+    {
+        return Err(AgentCaptureHttpError::bad_request("invalid file_op path"));
+    }
+    Ok(())
 }
 
 fn events_http_error(err: MegaError) -> AgentCaptureHttpError {
@@ -303,6 +360,32 @@ struct EventBatchItem {
 
 #[derive(Serialize, ToSchema)]
 struct EventsBatchResponse {
+    accepted: bool,
+}
+
+const FILE_OP_SCHEMA_V1: &str = "agent.file_op.v1";
+const FILE_OPS_BATCH_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct FileOpsBatchRequest {
+    batch_id: String,
+    #[serde(default)]
+    schema: Option<String>,
+    ops: Vec<FileOpItem>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct FileOpItem {
+    source_event_uid: String,
+    op: String,
+    path: String,
+    digest: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FileOpsBatchResponse {
     accepted: bool,
 }
 
@@ -669,11 +752,111 @@ async fn events_batch(
     post,
     path = "/sessions/{capture_id}/file-ops:batch",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-10")),
+    request_body = FileOpsBatchRequest,
+    responses(
+        (status = 200, description = "File-ops accepted", body = FileOpsBatchResponse),
+        (status = 400, description = "Invalid file-op path, schema, or source event", body = ErrorEnvelope),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope),
+        (status = 409, description = "Batch fingerprint conflict", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn file_ops_batch() -> StatusCode {
-    fixture()
+async fn file_ops_batch(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<FileOpsBatchResponse>, AgentCaptureHttpError> {
+    let (parts, body) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_file_ops_batch_path(parts.uri.path())?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let bytes = axum::body::to_bytes(body, FILE_OPS_BATCH_MAX_BYTES)
+        .await
+        .map_err(|_| AgentCaptureHttpError::payload_too_large("file-ops batch body too large"))?;
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid utf-8 body"))?;
+    let incoming_fp = canonical_json::fingerprint(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let batch_id = value
+        .get("batch_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if batch_id.is_empty() {
+        return Err(AgentCaptureHttpError::bad_request("batch_id required"));
+    }
+    if let Some(existing) = state
+        .storage
+        .agent_capture_service
+        .storage
+        .file_op_batch_receipt_fingerprint(capture_id, batch_id)
+        .await
+        .map_err(file_ops_http_error)?
+    {
+        if existing == incoming_fp {
+            return Ok(Json(FileOpsBatchResponse { accepted: true }));
+        }
+        return Err(AgentCaptureHttpError::conflict());
+    }
+    let request_body: FileOpsBatchRequest = serde_json::from_str(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let schema = request_body.schema.as_deref().unwrap_or(FILE_OP_SCHEMA_V1);
+    if schema != FILE_OP_SCHEMA_V1 {
+        return Err(AgentCaptureHttpError::bad_request(
+            "schema must be agent.file_op.v1",
+        ));
+    }
+    let preview: Vec<InsertFileOp> = request_body
+        .ops
+        .iter()
+        .map(|item| InsertFileOp {
+            source_event_uid: item.source_event_uid.clone(),
+            op: item.op.clone(),
+            path: item.path.clone(),
+            digest: item
+                .digest
+                .as_deref()
+                .filter(|digest| !digest.is_empty())
+                .map(str::to_owned),
+        })
+        .collect();
+    for item in &request_body.ops {
+        if item.source_event_uid.is_empty() {
+            return Err(AgentCaptureHttpError::bad_request(
+                "source_event_uid required",
+            ));
+        }
+        if !is_file_op_v1(&item.op) {
+            return Err(AgentCaptureHttpError::bad_request("invalid file_op op"));
+        }
+        validate_file_op_path(&item.path)?;
+    }
+    state
+        .storage
+        .agent_capture_service
+        .storage
+        .insert_file_ops_batch(
+            capture_id,
+            &request_body.batch_id,
+            schema,
+            &preview,
+            capture.max_file_blobs_per_session,
+            &incoming_fp,
+        )
+        .await
+        .map_err(file_ops_http_error)?;
+    Ok(Json(FileOpsBatchResponse { accepted: true }))
 }
 
 #[utoipa::path(
@@ -758,7 +941,7 @@ mod tests {
     use super::*;
     use crate::{
         api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
-        callisto::{agent_capture_event, agent_capture_session},
+        callisto::{agent_capture_event, agent_capture_file_op, agent_capture_session},
         ceres::api_service::cache::GitObjectCache,
         config::{
             AgentCaptureIngestTokenConfig, PushAuth, reload::ConfigHandle, testing::isolated_config,
@@ -880,6 +1063,8 @@ mod tests {
                         == "/api/v1/agent-capture/sessions/{capture_id}/blobs/{lease_id}/finalize")
                 || (*method == "POST"
                     && *path == "/api/v1/agent-capture/sessions/{capture_id}/events:batch")
+                || (*method == "POST"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/file-ops:batch")
             {
                 StatusCode::UNAUTHORIZED
             } else {
@@ -1737,5 +1922,410 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(rows, 0);
+    }
+
+    async fn file_ops_request(
+        state: MonoApiServiceState,
+        capture_id: i64,
+        authorization: Option<&str>,
+        body: &str,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/agent-capture/sessions/{capture_id}/file-ops:batch"
+            ))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn seed_source_event(state: MonoApiServiceState, capture_id: i64) -> MonoApiServiceState {
+        let response = events_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"src-event","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        state
+    }
+
+    async fn commit_raw_digest(
+        state: MonoApiServiceState,
+        capture_id: i64,
+        payload: &[u8],
+    ) -> (MonoApiServiceState, String) {
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            payload.to_vec(),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let finalized = finalize_request(
+            state.clone(),
+            capture_id,
+            &lease_id,
+            Some("Bearer secret-ci"),
+            "{}",
+        )
+        .await;
+        assert_eq!(finalized.status(), StatusCode::OK);
+        let digest = json_body(finalized).await["digest"]
+            .as_str()
+            .expect("digest")
+            .to_owned();
+        (state, digest)
+    }
+
+    fn with_max_file_blobs(mut state: MonoApiServiceState, max: u32) -> MonoApiServiceState {
+        let mut config = (*state.storage.config()).clone();
+        config.agent_capture.max_file_blobs_per_session = max;
+        let config = Arc::new(config);
+        state.storage.config_handle = ConfigHandle::from_arc(config.clone());
+        state.storage.config = config;
+        state
+    }
+
+    #[tokio::test]
+    async fn file_op_unauthorized() {
+        let response = file_ops_request(dummy_state(), 1, None, "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn file_op_ok() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let response = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","schema":"agent.file_op.v1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["accepted"], true);
+        let rows = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn file_op_requires_source() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let response = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn file_op_rejects_dotdot() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let response = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/../secret.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn file_op_search_ok() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let response = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"search","path":"src"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn file_op_truncated_over_cap() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let (state, digest_a) = commit_raw_digest(state, capture_id, b"blob-a").await;
+        let (state, digest_b) = commit_raw_digest(state, capture_id, b"blob-b").await;
+        let state = with_max_file_blobs(state, 1);
+        let body = format!(
+            r#"{{"batch_id":"f1","ops":[{{"source_event_uid":"0:0","op":"write","path":"a.rs","digest":"{digest_a}"}},{{"source_event_uid":"0:0","op":"write","path":"b.rs","digest":"{digest_b}"}}]}}"#
+        );
+        let response =
+            file_ops_request(state.clone(), capture_id, Some("Bearer secret-ci"), &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(session.completeness, "truncated");
+    }
+
+    #[tokio::test]
+    async fn file_op_batch_idempotency_conflict() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let first = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/lib.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn file_op_rejects_absolute() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let response = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"/etc/passwd"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn file_op_missing_event_is_400() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let response = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rows = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn file_op_missing_event_conflict_substring_is_400() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let response = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"fingerprint conflict","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "bad_request");
+        let rows = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn file_op_missing_event_receipt_prefix_is_400() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let response = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"ingest receipt fingerprint conflict","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "bad_request");
+        let rows = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn file_op_uncommitted_digest_is_400() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let response = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs","digest":"sha256:deadbeef"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rows = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn file_op_retry_same_fingerprint_is_200() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let body = r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#;
+        let first =
+            file_ops_request(state.clone(), capture_id, Some("Bearer secret-ci"), body).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second =
+            file_ops_request(state.clone(), capture_id, Some("Bearer secret-ci"), body).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let rows = agent_capture_file_op::Entity::find()
+            .filter(agent_capture_file_op::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn file_op_batch_id_conflict_before_dotdot() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let first = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/../x.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn file_op_batch_id_conflict_before_missing_source() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let first = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"op":"write","path":"a.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn file_op_batch_id_conflict_before_unknown_field() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let first = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}],"extra":true}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn file_op_batch_id_conflict_before_wrong_type() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-file-ops").await;
+        let state = seed_source_event(state, capture_id).await;
+        let first = file_ops_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":"write","path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = file_ops_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":1,"path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
     }
 }
