@@ -99,3 +99,7 @@ session JSON 字段：`capture_id`、`client_session_id`、`tenant_id`、`deploy
 ## Discovery
 
 `GET /api/v1/agent-capture/discovery` 需要 `Authorization: Bearer <ingest_token>`。命中 `lookup_ingest_token` 时返回 `{ "raw_accepted": true }`。缺头、非 Bearer、或 secret 未命中一律 401，`error.code` 为 `unauthorized`；响应不含 token secret。discovery 不访问数据库。
+
+## Session PUT
+
+`PUT /api/v1/agent-capture/repos/{repo}/sessions/{client_session_id}`：`{repo}` 单一 percent-encoded segment，解码一次后 `normalize_repo_path` 得到 `repo_id`。`producer_id` 为 ingest token `name`。无 token → 401（先于 path/body 解析）；token 不覆盖正规化 path → 404（先于读 body）。PUT fingerprint 绑定自然键 + immutable metadata（`session_kind` / `started_at` / `ended_at`），不含 completeness/lifecycle，也不随 `Idempotency-Key` 分叉；同自然键同 fingerprint 重试返回同一 `capture_id`（即使 completeness 已变）；不同 fingerprint → 409。响应 `{ "capture_id": i64 }`。

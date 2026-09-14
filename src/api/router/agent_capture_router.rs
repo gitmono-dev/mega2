@@ -1,17 +1,27 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode, header},
 };
+use percent_encoding::percent_decode_str;
+use serde::Serialize;
+use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     api::{MonoApiServiceState, api_doc::AGENT_CAPTURE_TAG},
     api_model::agent_capture::{
-        AgentCaptureHttpError, DiscoveryResponse, ErrorEnvelope, bearer_token,
+        AgentCaptureHttpError, DiscoveryResponse, ErrorEnvelope, SessionKind, SessionPutRequest,
+        bearer_token, decode_repo_path_segment, fingerprint_session_put_body,
     },
-    ceres::agent_capture::auth::lookup_ingest_token,
+    ceres::agent_capture::auth::{lookup_ingest_token, token_covers_capture_repo},
+    common::errors::MegaError,
+    config::AgentCaptureIngestTokenConfig,
+    jupiter::storage::agent_capture_storage::SessionNaturalKey,
 };
+
+const SESSION_PUT_OPERATION: &str = "session.put";
+const SESSION_PUT_MAX_BYTES: usize = 64 * 1024;
 
 pub const PUBLIC_ENDPOINTS: &[(&str, &str)] = &[
     ("GET", "/api/v1/agent-capture/discovery"),
@@ -82,6 +92,60 @@ fn fixture() -> StatusCode {
     StatusCode::NOT_IMPLEMENTED
 }
 
+fn require_ingest_token(
+    state: &MonoApiServiceState,
+    headers: &HeaderMap,
+) -> Result<AgentCaptureIngestTokenConfig, AgentCaptureHttpError> {
+    let presented = bearer_token(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+    )?;
+    lookup_ingest_token(
+        &state.storage.config().agent_capture.ingest_tokens,
+        presented,
+    )
+    .cloned()
+    .ok_or_else(AgentCaptureHttpError::unauthorized)
+}
+
+fn receipt_error(err: MegaError) -> AgentCaptureHttpError {
+    if err.to_string().contains("fingerprint conflict") {
+        AgentCaptureHttpError::conflict()
+    } else {
+        AgentCaptureHttpError::bad_request(err.to_string())
+    }
+}
+
+fn session_put_path(path: &str) -> Result<(String, String), AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "repos") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    let repo = segments.get(idx + 1).copied().filter(|s| !s.is_empty());
+    let sessions = segments.get(idx + 2).copied();
+    let client = segments.get(idx + 3).copied().filter(|s| !s.is_empty());
+    let extra = segments.get(idx + 4);
+    match (repo, sessions, client, extra) {
+        (Some(repo), Some("sessions"), Some(client), None) => {
+            Ok((repo.to_owned(), client.to_owned()))
+        }
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
+fn decode_client_session_id(segment: &str) -> Result<String, AgentCaptureHttpError> {
+    percent_decode_str(segment)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid client_session_id encoding"))
+}
+
+#[derive(Serialize, ToSchema)]
+struct SessionPutResponse {
+    capture_id: i64,
+}
+
 #[utoipa::path(
     get,
     path = "/discovery",
@@ -95,16 +159,7 @@ async fn discovery(
     State(state): State<MonoApiServiceState>,
     headers: HeaderMap,
 ) -> Result<Json<DiscoveryResponse>, AgentCaptureHttpError> {
-    let presented = bearer_token(
-        headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()),
-    )?;
-    lookup_ingest_token(
-        &state.storage.config().agent_capture.ingest_tokens,
-        presented,
-    )
-    .ok_or_else(AgentCaptureHttpError::unauthorized)?;
+    require_ingest_token(&state, &headers)?;
     Ok(Json(DiscoveryResponse { raw_accepted: true }))
 }
 
@@ -115,11 +170,81 @@ async fn discovery(
         ("repo" = String, Path, description = "Single percent-encoded repo path segment"),
         ("client_session_id" = String, Path, description = "Client session id")
     ),
-    responses((status = 501, description = "Fixture; handler lands in AC-21")),
+    request_body = SessionPutRequest,
+    responses(
+        (status = 200, description = "Upserted session", body = SessionPutResponse),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Token does not cover repo", body = ErrorEnvelope),
+        (status = 409, description = "Immutable fingerprint conflict", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn put_session() -> StatusCode {
-    fixture()
+async fn put_session(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<SessionPutResponse>, AgentCaptureHttpError> {
+    let (parts, body) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let (repo_segment, client_session_segment) = session_put_path(parts.uri.path())?;
+    let repo_id = decode_repo_path_segment(&repo_segment)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    if !token_covers_capture_repo(&token, &repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let client_session_id = decode_client_session_id(&client_session_segment)?;
+    let bytes = axum::body::to_bytes(body, SESSION_PUT_MAX_BYTES)
+        .await
+        .map_err(|_| AgentCaptureHttpError::payload_too_large("session put body too large"))?;
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid utf-8 body"))?;
+    fingerprint_session_put_body(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let put_request: SessionPutRequest = serde_json::from_str(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session_kind = match put_request.session_kind {
+        SessionKind::ExternalCapture => "external_capture",
+        SessionKind::InternalCode => "internal_code",
+    };
+    let key = SessionNaturalKey {
+        deployment_id: capture.deployment_id,
+        tenant_id: capture.tenant_id,
+        repo_id,
+        producer_id: token.name,
+        session_kind: session_kind.to_owned(),
+        client_session_id: client_session_id.clone(),
+    };
+    let fingerprint_body = serde_json::json!({
+        "deployment_id": key.deployment_id,
+        "tenant_id": key.tenant_id,
+        "repo_id": key.repo_id,
+        "producer_id": key.producer_id,
+        "session_kind": key.session_kind,
+        "client_session_id": key.client_session_id,
+        "started_at": put_request.started_at,
+        "ended_at": put_request.ended_at,
+    });
+    let capture_id = state
+        .storage
+        .agent_capture_service
+        .storage
+        .upsert_session(key)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    state
+        .storage
+        .agent_capture_service
+        .storage
+        .upsert_ingest_receipt(
+            capture_id,
+            SESSION_PUT_OPERATION,
+            &client_session_id,
+            &fingerprint_body,
+            Some(serde_json::json!({ "capture_id": capture_id })),
+        )
+        .await
+        .map_err(receipt_error)?;
+    Ok(Json(SessionPutResponse { capture_id }))
 }
 
 #[utoipa::path(
@@ -251,9 +376,19 @@ mod tests {
     use crate::{
         api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
         ceres::api_service::cache::GitObjectCache,
-        config::{AgentCaptureIngestTokenConfig, reload::ConfigHandle},
+        config::{
+            AgentCaptureIngestTokenConfig, PushAuth, reload::ConfigHandle, testing::isolated_config,
+        },
         contract::policy::entitystore::SharedEntityStore,
-        jupiter::storage::Storage,
+        jupiter::{
+            service::agent_capture_service::AgentCaptureService,
+            storage::{
+                Storage,
+                agent_capture_storage::{AgentCaptureStorage, InsertEvent},
+                object_storage::mock_object_storage,
+            },
+            tests::test_storage_with_config,
+        },
     };
 
     fn dummy_state() -> MonoApiServiceState {
@@ -350,7 +485,10 @@ mod tests {
                 .await
                 .expect("response")
                 .status();
-            let expected = if *method == "GET" && *path == "/api/v1/agent-capture/discovery" {
+            let expected = if (*method == "GET" && *path == "/api/v1/agent-capture/discovery")
+                || (*method == "PUT"
+                    && *path == "/api/v1/agent-capture/repos/{repo}/sessions/{client_session_id}")
+            {
                 StatusCode::UNAUTHORIZED
             } else {
                 StatusCode::NOT_IMPLEMENTED
@@ -429,5 +567,232 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["raw_accepted"], true);
+    }
+
+    fn ingest_token(paths: Option<Vec<String>>) -> AgentCaptureIngestTokenConfig {
+        AgentCaptureIngestTokenConfig {
+            name: "hook".to_owned(),
+            token: "secret-ci".to_owned(),
+            paths,
+            tenant_id: None,
+        }
+    }
+
+    fn state_from_storage(storage: Storage) -> MonoApiServiceState {
+        MonoApiServiceState {
+            session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+            git_object_cache: Arc::new(GitObjectCache {
+                connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                    ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                    ::redis::aio::ConnectionManagerConfig::new(),
+                )
+                .expect("lazy connection manager"),
+                prefix: "ac-21-test".to_owned(),
+            }),
+            listen_addr: "http://127.0.0.1:0".to_owned(),
+            entity_store: Arc::new(SharedEntityStore::new()),
+            storage,
+        }
+    }
+
+    async fn db_state(paths: Option<Vec<String>>) -> (tempfile::TempDir, MonoApiServiceState) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp.path().join("config"));
+        config.git.push_auth = Some(PushAuth::None);
+        config.agent_capture.enabled = true;
+        config.agent_capture.ingest_tokens = vec![ingest_token(paths)];
+        let mut storage = test_storage_with_config(temp.path(), config).await;
+        let base = storage.app_service.mono_storage.base.clone();
+        storage.agent_capture_service = AgentCaptureService {
+            storage: AgentCaptureStorage { base },
+            obj_storage: mock_object_storage(),
+        };
+        (temp, state_from_storage(storage))
+    }
+
+    async fn put_session_request(
+        state: MonoApiServiceState,
+        repo: &str,
+        client_session_id: &str,
+        authorization: Option<&str>,
+        body: &str,
+        idempotency_key: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/api/v1/agent-capture/repos/{repo}/sessions/{client_session_id}"
+            ))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        if let Some(value) = idempotency_key {
+            request = request.header("Idempotency-Key", value);
+        }
+        router
+            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    fn state_with_restricted_token() -> MonoApiServiceState {
+        let mut state = dummy_state();
+        let mut config = (*state.storage.config()).clone();
+        config.agent_capture.ingest_tokens =
+            vec![ingest_token(Some(vec!["/third-part/mega".to_owned()]))];
+        let config = Arc::new(config);
+        state.storage.config_handle = ConfigHandle::from_arc(config.clone());
+        state.storage.config = config;
+        state
+    }
+
+    #[tokio::test]
+    async fn put_session_unauthorized() {
+        let response = put_session_request(
+            dummy_state(),
+            "third-part%2Fmega",
+            "sess-1",
+            None,
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn put_session_unauthorized_before_invalid_path() {
+        let response = put_session_request(
+            dummy_state(),
+            "%FF",
+            "sess-1",
+            None,
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn put_session_unknown_path_is_404() {
+        let response = put_session_request(
+            state_with_restricted_token(),
+            "other%2Frepo",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_session_unknown_path_before_oversize() {
+        let oversized = format!(
+            r#"{{"session_kind":"external_capture","pad":"{}"}}"#,
+            "x".repeat(70_000)
+        );
+        let response = put_session_request(
+            state_with_restricted_token(),
+            "other%2Frepo",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            &oversized,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_session_returns_capture_id() {
+        let (_temp, state) = db_state(None).await;
+        let response = put_session_request(
+            state,
+            "third-part%2Fmega",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let capture_id = body["capture_id"].as_i64().expect("capture_id");
+        assert!(capture_id > 0);
+    }
+
+    #[tokio::test]
+    async fn put_session_conflict() {
+        let (_temp, state) = db_state(None).await;
+        let first = put_session_request(
+            state.clone(),
+            "third-part%2Fmega",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture","started_at":"2026-01-01T00:00:00Z"}"#,
+            Some("idem-a"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = put_session_request(
+            state,
+            "third-part%2Fmega",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"external_capture","started_at":"2026-02-01T00:00:00Z"}"#,
+            Some("idem-b"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn session_put_retry_after_completeness_change() {
+        let (_temp, state) = db_state(None).await;
+        let body = r#"{"session_kind":"external_capture"}"#;
+        let first = put_session_request(
+            state.clone(),
+            "third-part%2Fmega",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            body,
+            None,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let capture_id = json_body(first).await["capture_id"].as_i64().expect("id");
+        state
+            .storage
+            .agent_capture_service
+            .storage
+            .insert_event(InsertEvent {
+                capture_id,
+                event_uid: "0:0".to_owned(),
+                event_kind: "message".to_owned(),
+                native_id: None,
+                lifecycle_seq: None,
+                payload: serde_json::json!({"n": 1}),
+            })
+            .await
+            .expect("bump completeness");
+        let second = put_session_request(
+            state,
+            "third-part%2Fmega",
+            "sess-1",
+            Some("Bearer secret-ci"),
+            body,
+            None,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(second).await["capture_id"].as_i64().expect("id"),
+            capture_id
+        );
     }
 }
