@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, sleep},
@@ -31,6 +31,13 @@ const REPO_SEGMENT: &str = "third-part%2Fmega";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial_gate() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct TestDatabase {
     admin_url: String,
@@ -244,6 +251,7 @@ impl Drop for ServiceProcess {
 
 #[test]
 fn integration_agent_capture_happy_path() {
+    let _gate = serial_gate();
     let env = CaptureEnv::storage_only("it-default");
     let (mut service, port, _stdout, stderr) = boot_storage_only(&env);
     let client = http_client();
@@ -291,6 +299,7 @@ fn integration_agent_capture_happy_path() {
 
 #[test]
 fn integration_agent_capture_review_404() {
+    let _gate = serial_gate();
     let env = CaptureEnv::review();
     let (mut service, port, _stdout, stderr) = boot_service_http(&env, &[]);
     let client = http_client();
@@ -311,6 +320,7 @@ fn integration_agent_capture_review_404() {
 
 #[test]
 fn integration_agent_capture_unauthorized() {
+    let _gate = serial_gate();
     let env = CaptureEnv::storage_only("it-default");
     let (mut service, port, _stdout, stderr) = boot_storage_only(&env);
     let client = http_client();
@@ -330,6 +340,7 @@ fn integration_agent_capture_unauthorized() {
 
 #[test]
 fn integration_agent_capture_tracing_has_no_raw_sentinel() {
+    let _gate = serial_gate();
     let env = CaptureEnv::storage_only("it-default");
     let (mut service, port, stdout, stderr) = boot_storage_only(&env);
     let client = http_client();
@@ -360,6 +371,7 @@ fn integration_agent_capture_tracing_has_no_raw_sentinel() {
 
 #[test]
 fn integration_agent_capture_cross_deployment_isolated() {
+    let _gate = serial_gate();
     let env = CaptureEnv::storage_only("it-a");
     let (mut service_a, port_a, _stdout_a, stderr_a) = boot_service_http(
         &env,
@@ -403,6 +415,7 @@ fn integration_agent_capture_cross_deployment_isolated() {
 
 #[test]
 fn integration_agent_capture_tombstone_race() {
+    let _gate = serial_gate();
     let env = CaptureEnv::storage_only("it-default");
     let (mut service, port, _stdout, stderr) = boot_storage_only(&env);
     let client = http_client();
