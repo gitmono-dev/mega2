@@ -119,3 +119,7 @@ lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）
 ## File-ops batch
 
 `POST /api/v1/agent-capture/sessions/{capture_id}/file-ops:batch` 校验 `agent.file_op.v1`（`schema` 缺省即该值；其它 schema 400）。无 `source_event_uid`、空 uid、或同 capture 无对应 event → 400。`op ∈ {read, write, patch, delete, search}`；`op=search` 合法。路径为空、含 `..`、含 NUL、或绝对路径 → 400。digest 非空必须指向同 tenant/deployment 已 committed 的 raw blob，并写入 `blob_ref.owner_file_op_id`；未 committed → 400。body `batch_id` 为幂等键；receipt fingerprint 为整段 body 的 canonical JSON；同 fingerprint 200，不同 409。判定顺序 401 → 404 → 409（已有 receipt，先于 typed JSON 校验）→ 400。storage 错误映射 409 仅匹配固定前缀 `ingest receipt fingerprint conflict`。file-op 绑定的 blob 数 **超过** `max_file_blobs_per_session` 时 session `completeness` 标 `truncated`（等于上限不标）；超限仍 200 并写入。整批事务。无 token → 401。
+
+## Checkpoint POST
+
+`POST /api/v1/agent-capture/sessions/{capture_id}/checkpoints` 仅接受父 session `session_kind=external_capture`（`internal_code` → 400）。`transcript_digest` 必须指向同 tenant/deployment 已 committed 的 raw blob；仍为 staging 或缺失 → 400。`redacted_digest` 可选，写入 checkpoint `metadata`；仅 redacted、无 raw 时响应与 session 的 `completeness=incomplete`、`partial_reason=missing_raw`。同 `transcript_digest` 共享已 committed CAS blob 行，并写入 `blob_ref.owner_checkpoint_id`。body `checkpoint_id` 为幂等键；receipt fingerprint 为整段 body 的 canonical JSON；同 fingerprint 200，不同 409。判定顺序 401 → 404 → 409（已有 receipt，先于 typed JSON 校验）→ 400。无 token → 401。

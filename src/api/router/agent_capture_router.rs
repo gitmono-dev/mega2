@@ -19,7 +19,7 @@ use crate::{
     common::{canonical_json, errors::MegaError},
     config::AgentCaptureIngestTokenConfig,
     jupiter::storage::agent_capture_storage::{
-        AgentCaptureStorage, InsertEvent, InsertFileOp, SessionNaturalKey,
+        AgentCaptureStorage, InsertCheckpoint, InsertEvent, InsertFileOp, SessionNaturalKey,
     },
     orbit_api::object_storage::ObjectByteStream,
 };
@@ -211,6 +211,23 @@ fn session_file_ops_batch_path(path: &str) -> Result<i64, AgentCaptureHttpError>
     }
 }
 
+fn session_checkpoints_post_path(path: &str) -> Result<i64, AgentCaptureHttpError> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(idx) = segments.iter().position(|s| *s == "sessions") else {
+        return Err(AgentCaptureHttpError::not_found());
+    };
+    match (
+        segments.get(idx + 1),
+        segments.get(idx + 2),
+        segments.get(idx + 3),
+    ) {
+        (Some(id), Some(&"checkpoints"), None) => id
+            .parse()
+            .map_err(|_| AgentCaptureHttpError::bad_request("invalid capture_id")),
+        _ => Err(AgentCaptureHttpError::not_found()),
+    }
+}
+
 fn parse_event_uid(uid: &str) -> Result<(i64, i64), AgentCaptureHttpError> {
     let Some((generation, offset)) = uid.split_once(':') else {
         return Err(AgentCaptureHttpError::bad_request("invalid event_uid"));
@@ -232,6 +249,20 @@ fn parse_event_uid(uid: &str) -> Result<(i64, i64), AgentCaptureHttpError> {
 }
 
 fn file_ops_http_error(err: MegaError) -> AgentCaptureHttpError {
+    match &err {
+        MegaError::Other(msg) if msg.starts_with("ingest receipt fingerprint conflict") => {
+            AgentCaptureHttpError::conflict()
+        }
+        MegaError::Other(msg)
+            if msg.starts_with("agent_capture_session ") && msg.ends_with(" does not exist") =>
+        {
+            AgentCaptureHttpError::not_found()
+        }
+        _ => AgentCaptureHttpError::bad_request(err.to_string()),
+    }
+}
+
+fn checkpoint_http_error(err: MegaError) -> AgentCaptureHttpError {
     match &err {
         MegaError::Other(msg) if msg.starts_with("ingest receipt fingerprint conflict") => {
             AgentCaptureHttpError::conflict()
@@ -387,6 +418,24 @@ struct FileOpItem {
 #[derive(Serialize, ToSchema)]
 struct FileOpsBatchResponse {
     accepted: bool,
+}
+
+const CHECKPOINT_POST_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct CheckpointPostRequest {
+    checkpoint_id: String,
+    transcript_digest: Option<String>,
+    redacted_digest: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct CheckpointPostResponse {
+    accepted: bool,
+    completeness: String,
+    partial_reason: Option<String>,
 }
 
 #[utoipa::path(
@@ -863,11 +912,106 @@ async fn file_ops_batch(
     post,
     path = "/sessions/{capture_id}/checkpoints",
     params(("capture_id" = i64, Path, description = "Capture id")),
-    responses((status = 501, description = "Fixture; handler lands in AC-11")),
+    request_body = CheckpointPostRequest,
+    responses(
+        (status = 200, description = "Checkpoint accepted", body = CheckpointPostResponse),
+        (status = 400, description = "Invalid session kind or uncommitted transcript", body = ErrorEnvelope),
+        (status = 401, description = "Missing or invalid ingest token", body = ErrorEnvelope),
+        (status = 404, description = "Session not found", body = ErrorEnvelope),
+        (status = 409, description = "Checkpoint fingerprint conflict", body = ErrorEnvelope)
+    ),
     tag = AGENT_CAPTURE_TAG
 )]
-async fn post_checkpoint() -> StatusCode {
-    fixture()
+async fn post_checkpoint(
+    State(state): State<MonoApiServiceState>,
+    request: Request,
+) -> Result<Json<CheckpointPostResponse>, AgentCaptureHttpError> {
+    let (parts, body) = request.into_parts();
+    let token = require_ingest_token(&state, &parts.headers)?;
+    let capture_id = session_checkpoints_post_path(parts.uri.path())?;
+    let capture = state.storage.config().agent_capture.clone();
+    let session = state
+        .storage
+        .agent_capture_service
+        .load_session(capture_id, &capture.deployment_id, &capture.tenant_id)
+        .await
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?
+        .ok_or_else(AgentCaptureHttpError::not_found)?;
+    if !token_covers_capture_repo(&token, &session.repo_id) {
+        return Err(AgentCaptureHttpError::not_found());
+    }
+    let bytes = axum::body::to_bytes(body, CHECKPOINT_POST_MAX_BYTES)
+        .await
+        .map_err(|_| AgentCaptureHttpError::payload_too_large("checkpoint body too large"))?;
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|_| AgentCaptureHttpError::bad_request("invalid utf-8 body"))?;
+    let incoming_fp = canonical_json::fingerprint(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let checkpoint_id = value
+        .get("checkpoint_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if checkpoint_id.is_empty() {
+        return Err(AgentCaptureHttpError::bad_request("checkpoint_id required"));
+    }
+    if let Some((existing, response)) = state
+        .storage
+        .agent_capture_service
+        .storage
+        .checkpoint_receipt(capture_id, checkpoint_id)
+        .await
+        .map_err(checkpoint_http_error)?
+    {
+        if existing == incoming_fp {
+            let completeness = response
+                .as_ref()
+                .and_then(|value| value.get("completeness"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&session.completeness)
+                .to_owned();
+            let partial_reason = response
+                .as_ref()
+                .and_then(|value| value.get("partial_reason"))
+                .and_then(|value| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        value.as_str().map(str::to_owned)
+                    }
+                });
+            return Ok(Json(CheckpointPostResponse {
+                accepted: true,
+                completeness,
+                partial_reason,
+            }));
+        }
+        return Err(AgentCaptureHttpError::conflict());
+    }
+    let request_body: CheckpointPostRequest = serde_json::from_str(raw)
+        .map_err(|err| AgentCaptureHttpError::bad_request(err.to_string()))?;
+    let ingested = state
+        .storage
+        .agent_capture_service
+        .storage
+        .insert_checkpoint_ingest(
+            capture_id,
+            &InsertCheckpoint {
+                checkpoint_id: request_body.checkpoint_id,
+                transcript_digest: request_body.transcript_digest,
+                redacted_digest: request_body.redacted_digest,
+                metadata: request_body.metadata,
+            },
+            &incoming_fp,
+        )
+        .await
+        .map_err(checkpoint_http_error)?;
+    Ok(Json(CheckpointPostResponse {
+        accepted: true,
+        completeness: ingested.completeness,
+        partial_reason: ingested.partial_reason,
+    }))
 }
 
 #[utoipa::path(
@@ -941,7 +1085,10 @@ mod tests {
     use super::*;
     use crate::{
         api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
-        callisto::{agent_capture_event, agent_capture_file_op, agent_capture_session},
+        callisto::{
+            agent_capture_blob, agent_capture_checkpoint, agent_capture_event,
+            agent_capture_file_op, agent_capture_session,
+        },
         ceres::api_service::cache::GitObjectCache,
         config::{
             AgentCaptureIngestTokenConfig, PushAuth, reload::ConfigHandle, testing::isolated_config,
@@ -1065,6 +1212,8 @@ mod tests {
                     && *path == "/api/v1/agent-capture/sessions/{capture_id}/events:batch")
                 || (*method == "POST"
                     && *path == "/api/v1/agent-capture/sessions/{capture_id}/file-ops:batch")
+                || (*method == "POST"
+                    && *path == "/api/v1/agent-capture/sessions/{capture_id}/checkpoints")
             {
                 StatusCode::UNAUTHORIZED
             } else {
@@ -2324,6 +2473,214 @@ mod tests {
             capture_id,
             Some("Bearer secret-ci"),
             r#"{"batch_id":"f1","ops":[{"source_event_uid":"0:0","op":1,"path":"src/main.rs"}]}"#,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    async fn checkpoint_request(
+        state: MonoApiServiceState,
+        capture_id: i64,
+        authorization: Option<&str>,
+        body: &str,
+    ) -> axum::http::Response<Body> {
+        let (router, _) = public_app(state);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/agent-capture/sessions/{capture_id}/checkpoints"
+            ))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        router
+            .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn open_internal_session(
+        state: MonoApiServiceState,
+        client_session_id: &str,
+    ) -> (MonoApiServiceState, i64) {
+        let response = put_session_request(
+            state.clone(),
+            "third-part%2Fmega",
+            client_session_id,
+            Some("Bearer secret-ci"),
+            r#"{"session_kind":"internal_code"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let capture_id = json_body(response).await["capture_id"]
+            .as_i64()
+            .expect("capture_id");
+        (state, capture_id)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_unauthorized() {
+        let response = checkpoint_request(dummy_state(), 1, None, "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ok() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-checkpoint").await;
+        let (state, digest) = commit_raw_digest(state, capture_id, b"raw-transcript").await;
+        let response = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["accepted"], true);
+        let rows = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_internal_code() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_internal_session(state, "sess-internal").await;
+        let (state, digest) = commit_raw_digest(state, capture_id, b"raw-transcript").await;
+        let response = checkpoint_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_requires_committed_raw() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-checkpoint").await;
+        let staged = staging_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            b"still-staging".to_vec(),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        let lease_id = json_body(staged).await["lease_id"]
+            .as_str()
+            .expect("lease_id")
+            .to_owned();
+        let digest = agent_capture_blob::Entity::find()
+            .filter(agent_capture_blob::Column::LeaseId.eq(lease_id))
+            .one(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("blob")
+            .digest;
+        let response = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rows = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_redacted_only_incomplete() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-checkpoint").await;
+        let response = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"checkpoint_id":"cp-redacted","redacted_digest":"sha256:redacted"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["completeness"], "incomplete");
+        assert_eq!(body["partial_reason"], "missing_raw");
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(session.completeness, "incomplete");
+        assert_eq!(session.partial_reason.as_deref(), Some("missing_raw"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_shares_cas_blob() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-checkpoint").await;
+        let (state, digest) = commit_raw_digest(state, capture_id, b"shared-raw").await;
+        let first = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-a","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-b","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let blobs = agent_capture_blob::Entity::find()
+            .filter(agent_capture_blob::Column::Digest.eq(digest.clone()))
+            .filter(agent_capture_blob::Column::Visibility.eq("raw"))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count blobs");
+        assert_eq!(blobs, 1);
+        let checkpoints = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .count(state.storage.agent_capture_service.storage.get_connection())
+            .await
+            .expect("count checkpoints");
+        assert_eq!(checkpoints, 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_idempotency_conflict() {
+        let (_temp, state) = db_state(None).await;
+        let (state, capture_id) = open_session(state, "sess-checkpoint").await;
+        let (state, digest) = commit_raw_digest(state, capture_id, b"raw-transcript").await;
+        let first = checkpoint_request(
+            state.clone(),
+            capture_id,
+            Some("Bearer secret-ci"),
+            &format!(r#"{{"checkpoint_id":"cp-1","transcript_digest":"{digest}"}}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = checkpoint_request(
+            state,
+            capture_id,
+            Some("Bearer secret-ci"),
+            r#"{"checkpoint_id":"cp-1","redacted_digest":"sha256:other"}"#,
         )
         .await;
         assert_eq!(second.status(), StatusCode::CONFLICT);

@@ -68,6 +68,20 @@ pub struct InsertFileOp {
     pub digest: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsertCheckpoint {
+    pub checkpoint_id: String,
+    pub transcript_digest: Option<String>,
+    pub redacted_digest: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointIngest {
+    pub completeness: String,
+    pub partial_reason: Option<String>,
+}
+
 pub struct CommittedFinalize {
     pub blob_id: i64,
     pub digest: String,
@@ -591,6 +605,220 @@ impl AgentCaptureStorage {
             .await?;
         txn.commit().await?;
         Ok(inserted.last_insert_id)
+    }
+
+    pub async fn checkpoint_receipt(
+        &self,
+        capture_id: i64,
+        checkpoint_id: &str,
+    ) -> Result<Option<(String, Option<serde_json::Value>)>, MegaError> {
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(self.get_connection())
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        Ok(Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            "checkpoint",
+            checkpoint_id,
+        )
+        .one(self.get_connection())
+        .await?
+        .map(|row| (row.fingerprint, row.response)))
+    }
+
+    pub async fn insert_checkpoint_ingest(
+        &self,
+        capture_id: i64,
+        checkpoint: &InsertCheckpoint,
+        fingerprint: &str,
+    ) -> Result<CheckpointIngest, MegaError> {
+        let txn = self.get_connection().begin().await?;
+        let result = self
+            .insert_checkpoint_ingest_txn(&txn, capture_id, checkpoint, fingerprint)
+            .await;
+        match result {
+            Ok(ingested) => {
+                txn.commit().await?;
+                Ok(ingested)
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn insert_checkpoint_ingest_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        capture_id: i64,
+        checkpoint: &InsertCheckpoint,
+        fingerprint: &str,
+    ) -> Result<CheckpointIngest, MegaError> {
+        let session = agent_capture_session::Entity::find_by_id(capture_id)
+            .lock(LockType::Update)
+            .one(txn)
+            .await?
+            .ok_or_else(|| {
+                MegaError::Other(format!("agent_capture_session {capture_id} does not exist"))
+            })?;
+        if let Some(existing) = Self::receipt_by_scope(
+            &session.deployment_id,
+            &session.tenant_id,
+            &session.producer_id,
+            capture_id,
+            "checkpoint",
+            &checkpoint.checkpoint_id,
+        )
+        .lock(LockType::Update)
+        .one(txn)
+        .await?
+        {
+            if existing.fingerprint == fingerprint {
+                let completeness = existing
+                    .response
+                    .as_ref()
+                    .and_then(|value| value.get("completeness"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(session.completeness.as_str())
+                    .to_owned();
+                let partial_reason = existing
+                    .response
+                    .as_ref()
+                    .and_then(|value| value.get("partial_reason"))
+                    .and_then(|value| {
+                        if value.is_null() {
+                            None
+                        } else {
+                            value.as_str().map(str::to_owned)
+                        }
+                    });
+                return Ok(CheckpointIngest {
+                    completeness,
+                    partial_reason,
+                });
+            }
+            return Err(MegaError::Other(format!(
+                "ingest receipt fingerprint conflict for capture_id {capture_id}"
+            )));
+        }
+        if session.session_kind != "external_capture" {
+            return Err(MegaError::Other(format!(
+                "checkpoint requires session_kind=external_capture for capture_id {capture_id}"
+            )));
+        }
+        let transcript_digest = checkpoint
+            .transcript_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|digest| !digest.is_empty());
+        let redacted_digest = checkpoint
+            .redacted_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|digest| !digest.is_empty());
+        if transcript_digest.is_none() && redacted_digest.is_none() {
+            return Err(MegaError::Other(
+                "checkpoint requires transcript_digest or redacted_digest".to_owned(),
+            ));
+        }
+        let raw_blob = if let Some(digest) = transcript_digest {
+            let blob =
+                Self::blob_by_digest_key(&session.deployment_id, &session.tenant_id, digest, "raw")
+                    .lock(LockType::Update)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| {
+                        MegaError::Other(format!(
+                            "checkpoint transcript_digest {digest} is not a committed raw blob"
+                        ))
+                    })?;
+            if blob.lease_state != "committed" {
+                return Err(MegaError::Other(format!(
+                    "checkpoint transcript_digest {digest} is not a committed raw blob"
+                )));
+            }
+            Some(blob)
+        } else {
+            None
+        };
+        let mut metadata = checkpoint.metadata.clone();
+        if let Some(redacted) = redacted_digest {
+            match metadata.as_mut() {
+                Some(serde_json::Value::Object(obj)) => {
+                    obj.insert(
+                        "redacted_digest".to_owned(),
+                        serde_json::Value::String(redacted.to_owned()),
+                    );
+                }
+                None => {
+                    metadata = Some(serde_json::json!({ "redacted_digest": redacted }));
+                }
+                Some(_) => {}
+            }
+        }
+        let missing_raw = raw_blob.is_none();
+        let inserted =
+            agent_capture_checkpoint::Entity::insert(agent_capture_checkpoint::ActiveModel {
+                capture_id: Set(capture_id),
+                checkpoint_id: Set(checkpoint.checkpoint_id.clone()),
+                transcript_digest: Set(transcript_digest.map(str::to_owned)),
+                metadata: Set(metadata),
+                ..Default::default()
+            })
+            .exec(txn)
+            .await?;
+        if let Some(blob) = raw_blob {
+            agent_capture_blob_ref::Entity::insert(agent_capture_blob_ref::ActiveModel {
+                blob_id: Set(blob.id),
+                owner_session_id: Set(None),
+                owner_event_id: Set(None),
+                owner_checkpoint_id: Set(Some(inserted.last_insert_id)),
+                owner_file_op_id: Set(None),
+                ..Default::default()
+            })
+            .exec(txn)
+            .await?;
+        }
+        let mut completeness = session.completeness.clone();
+        let mut partial_reason = session.partial_reason.clone();
+        if missing_raw {
+            completeness = "incomplete".to_owned();
+            partial_reason = Some("missing_raw".to_owned());
+            if session.completeness != completeness || session.partial_reason != partial_reason {
+                let mut active = session.clone().into_active_model();
+                active.completeness = Set(completeness.clone());
+                active.partial_reason = Set(partial_reason.clone());
+                active.update(txn).await?;
+            }
+        }
+        let response = serde_json::json!({
+            "accepted": true,
+            "completeness": completeness,
+            "partial_reason": partial_reason,
+        });
+        agent_capture_ingest_receipt::Entity::insert(agent_capture_ingest_receipt::ActiveModel {
+            deployment_id: Set(session.deployment_id.clone()),
+            tenant_id: Set(session.tenant_id.clone()),
+            producer_id: Set(session.producer_id.clone()),
+            capture_id: Set(capture_id),
+            operation: Set("checkpoint".to_owned()),
+            idempotency_key: Set(checkpoint.checkpoint_id.clone()),
+            fingerprint: Set(fingerprint.to_owned()),
+            response: Set(Some(response)),
+            ..Default::default()
+        })
+        .exec(txn)
+        .await?;
+        Ok(CheckpointIngest {
+            completeness,
+            partial_reason,
+        })
     }
 
     /// Insert a file_op. `source_event_uid` must exist on the same capture.
