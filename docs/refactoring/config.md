@@ -131,9 +131,13 @@ is rejected at `config validate`. `installation_id` is required when enabled
 and is never auto-generated. Target HMAC values are `secret_ref` URIs; they
 are not resolved while disabled.
 
-This card only loads and diagnoses the table. It does not start an emitter,
-open outbound sockets, or claim delivery. See
-[`storage-events.md`](./storage-events.md).
+Target `url` values must be HTTPS without userinfo, query, or fragment.
+`connect_timeout_seconds` is 1..=5 and `request_timeout_seconds` is 1..=10
+even when the table is disabled. HMAC secrets use `hex:<even-hex>` after
+Vault resolution (WH-11); this card does not resolve `secret_ref`.
+
+The HTTPS HMAC transport exists as a library component and is **not**
+wired into AppContext yet. See [`storage-events.md`](./storage-events.md).
 
 ## Test configuration
 

@@ -732,6 +732,52 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
                 "[[storage_events.targets]] events must be a non-empty list".to_string(),
             ));
         }
+        validate_storage_events_target_url(&target.url)?;
+    }
+
+    if !(1..=5).contains(&events.connect_timeout_seconds) {
+        return Err(MegaError::Other(
+            "[storage_events] connect_timeout_seconds must be 1..=5".to_string(),
+        ));
+    }
+    if !(1..=10).contains(&events.request_timeout_seconds) {
+        return Err(MegaError::Other(
+            "[storage_events] request_timeout_seconds must be 1..=10".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_storage_events_target_url(raw: &str) -> Result<(), MegaError> {
+    let url = url::Url::parse(raw).map_err(|err| {
+        MegaError::Other(format!(
+            "[[storage_events.targets]] url is not a valid URL ({err})"
+        ))
+    })?;
+    if url.scheme() != "https" {
+        return Err(MegaError::Other(
+            "[[storage_events.targets]] url must use https".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(MegaError::Other(
+            "[[storage_events.targets]] url must not contain userinfo".to_string(),
+        ));
+    }
+    if url.query().is_some() {
+        return Err(MegaError::Other(
+            "[[storage_events.targets]] url must not contain a query".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(MegaError::Other(
+            "[[storage_events.targets]] url must not contain a fragment".to_string(),
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(MegaError::Other(
+            "[[storage_events.targets]] url must include a host".to_string(),
+        ));
     }
     Ok(())
 }
@@ -3387,5 +3433,76 @@ mod tests {
             .validate()
             .expect_err("empty events list is rejected when disabled");
         assert!(err.to_string().contains("events"), "{err}");
+    }
+
+    #[test]
+    fn storage_events_transport_config() {
+        crate::config::validate::validate_storage_events_target_url(
+            "https://events.example.invalid/ingest",
+        )
+        .expect("https without userinfo/query/fragment");
+
+        let err = crate::config::validate::validate_storage_events_target_url(
+            "http://events.example.invalid/ingest",
+        )
+        .expect_err("http");
+        assert!(err.to_string().contains("https"), "{err}");
+
+        let err = crate::config::validate::validate_storage_events_target_url(
+            "https://user:pass@events.example.invalid/ingest",
+        )
+        .expect_err("userinfo");
+        assert!(err.to_string().contains("userinfo"), "{err}");
+
+        let err = crate::config::validate::validate_storage_events_target_url(
+            "https://events.example.invalid/ingest?x=1",
+        )
+        .expect_err("query");
+        assert!(err.to_string().contains("query"), "{err}");
+
+        let err = crate::config::validate::validate_storage_events_target_url(
+            "https://events.example.invalid/ingest#frag",
+        )
+        .expect_err("fragment");
+        assert!(err.to_string().contains("fragment"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.connect_timeout_seconds = 0;
+        let err = config.validate().expect_err("connect timeout lower bound");
+        assert!(err.to_string().contains("connect_timeout_seconds"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.connect_timeout_seconds = 6;
+        let err = config.validate().expect_err("connect timeout upper bound");
+        assert!(err.to_string().contains("connect_timeout_seconds"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.request_timeout_seconds = 0;
+        let err = config.validate().expect_err("request timeout lower bound");
+        assert!(err.to_string().contains("request_timeout_seconds"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.request_timeout_seconds = 11;
+        let err = config.validate().expect_err("request timeout upper bound");
+        assert!(err.to_string().contains("request_timeout_seconds"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.targets = vec![StorageEventsTargetConfig {
+            id: "ops-main".to_string(),
+            url: "http://events.example.invalid/ingest".to_string(),
+            secret_ref: "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
+                .to_string(),
+            events: vec!["repo.push".to_string()],
+            git_paths: Vec::new(),
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        }];
+        let err = config
+            .validate()
+            .expect_err("disabled still rejects illegal URL shape");
+        assert!(err.to_string().contains("https"), "{err}");
     }
 }

@@ -121,7 +121,7 @@
 ### 5d. **refactoring/storage-events.md** — storage-only 提交后出站事件
 
 - **目标**：运维静态配置的 committed-write emitter；默认关闭，仅 storage-only `token`/`none` 可启用
-- **核心内容（WH-01）**：`[storage_events]` 装载/未知字段/形态门/restart-required；尚无运输、运行时或来源 hook
+- **核心内容（WH-01/WH-09）**：`[storage_events]` 装载/未知字段/形态门/restart-required；HTTPS HMAC 运输组件已存在但尚未注入应用；尚无运行时或来源 hook
 - **计划**：[`../plan/plan-20260912.md`](../plan/plan-20260912.md)
 - **边界**：无 webhook CRUD、无 outbox/retry、不复用 review CL webhook 表
 

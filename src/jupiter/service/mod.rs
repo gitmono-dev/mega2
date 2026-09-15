@@ -13,4 +13,5 @@ pub mod oci_service;
 pub mod push_queue_reaper;
 pub mod push_queue_service;
 pub mod reviewer_service;
+pub mod storage_event_transport;
 pub mod webhook_service;
