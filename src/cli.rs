@@ -7,6 +7,7 @@ use std::{
 };
 
 use clap::{Arg, ArgMatches, Command};
+use tokio::sync::watch;
 use tracing_subscriber::{
     filter::LevelFilter,
     fmt::{
@@ -33,8 +34,28 @@ use crate::{
 };
 
 static CTRLC_HANDLER: Once = Once::new();
+/// For long-running services the Ctrl+C handler only records the signal on
+/// this watch channel (installed before config load, so the signal can never
+/// default-terminate the process after CLI dispatch); the async service layer
+/// observes it and drives graceful shutdown plus the cleanup tail (WH-13).
+static SERVICE_SIGINT: OnceLock<watch::Sender<bool>> = OnceLock::new();
 type LogReloadFn = dyn Fn(&LogConfig) -> Result<(), MegaError> + Send + Sync + 'static;
 static LOG_RELOAD: OnceLock<Arc<LogReloadFn>> = OnceLock::new();
+
+/// Subscribes to the service Ctrl+C recording channel. `Some` only after a
+/// service invocation installed the recording handler.
+pub(crate) fn service_sigint_receiver() -> Option<watch::Receiver<bool>> {
+    SERVICE_SIGINT.get().map(watch::Sender::subscribe)
+}
+
+/// Records a service Ctrl+C on the watch channel. `send_replace` retains the
+/// value even with zero receivers, so a signal arriving before the service
+/// subscribes is still observed when it does.
+fn record_service_sigint() {
+    if let Some(tx) = SERVICE_SIGINT.get() {
+        tx.send_replace(true);
+    }
+}
 
 pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
     let matches = match args {
@@ -55,12 +76,25 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
                 path = %loaded.path.display(),
                 "config loaded"
             );
-            install_ctrlc_handler();
+            install_ctrlc_handler(false);
             return Ok(());
         }
     };
 
     let mode = load_mode(cmd, subcommand_args).ok_or_else(|| unknown_subcommand(cmd))?;
+    // Long-running services receive Ctrl+C in the async layer so graceful
+    // shutdown and the storage-events cleanup tail can run (WH-13). Install
+    // the recording handler before any config I/O so a signal arriving during
+    // startup is captured, never default-terminating the process. One-shot
+    // commands keep the process-exit handler installed at the old point.
+    let async_signal_service = cmd == "service"
+        && matches!(
+            subcommand_args.subcommand_name(),
+            Some("http" | "ssh" | "multi")
+        );
+    if async_signal_service {
+        install_ctrlc_handler(true);
+    }
     let ctx = match mode {
         LoadMode::None => CommandContext {
             config: None,
@@ -107,7 +141,11 @@ pub fn parse(args: Option<Vec<&str>>) -> MegaResult {
         }
     };
 
-    install_ctrlc_handler();
+    // One-shot commands keep the old process-exit handler (AC7); long-running
+    // services already installed the recording handler above.
+    if !async_signal_service {
+        install_ctrlc_handler(false);
+    }
 
     exec_subcommand(ctx, cmd, subcommand_args)
 }
@@ -186,13 +224,23 @@ fn load_config_existing(matches: &ArgMatches) -> Result<(Config, LoadedConfig), 
     parse_loaded_config(ConfigLoader::new(input).load_existing()?)
 }
 
-fn install_ctrlc_handler() {
+fn install_ctrlc_handler(async_signal_service: bool) {
     CTRLC_HANDLER.call_once(|| {
-        ctrlc::set_handler(move || {
-            tracing::info!("Received Ctrl-C signal, exiting...");
-            std::process::exit(0);
-        })
-        .unwrap();
+        if async_signal_service {
+            let (tx, _) = watch::channel(false);
+            let _ = SERVICE_SIGINT.set(tx);
+            ctrlc::set_handler(move || {
+                tracing::info!("Received Ctrl-C signal, starting graceful shutdown...");
+                record_service_sigint();
+            })
+            .unwrap();
+        } else {
+            ctrlc::set_handler(move || {
+                tracing::info!("Received Ctrl-C signal, exiting...");
+                std::process::exit(0);
+            })
+            .unwrap();
+        }
     });
 }
 
@@ -333,6 +381,17 @@ mod tests {
         template::config_init_template,
         testing::{EnvVarGuard, env_lock},
     };
+
+    #[test]
+    fn service_sigint_recorded_before_subscription_is_visible() {
+        let _ = SERVICE_SIGINT.get_or_init(|| watch::channel(false).0);
+        record_service_sigint();
+        let rx = service_sigint_receiver().expect("receiver after init");
+        assert!(
+            *rx.borrow(),
+            "a signal recorded before subscription must be retained"
+        );
+    }
 
     #[test]
     fn cli_accepts_config_path() {

@@ -48,6 +48,12 @@ pub struct AppContext {
     /// Created in new() ; callers (e.g. services) can clone and cancel on graceful exit.
     pub notification_shutdown: CancellationToken,
 
+    /// Service-level shutdown token (WH-13). The `service` command forwards the
+    /// first Ctrl+C here, so a signal arriving before a server registers its own
+    /// signal handler is still observed (the token is sticky) and every exit
+    /// passes through the cleanup tail.
+    pub service_shutdown: CancellationToken,
+
     /// Shared authorization snapshot holder (ADR-UN-02). Unique owner created in
     /// `new()`; the same `Arc` is injected into `Storage` and the HTTP state so
     /// the write path (notify) and read path (guard/push) share one instance.
@@ -308,6 +314,7 @@ impl AppContext {
             config_handle,
             connection,
             notification_shutdown,
+            service_shutdown: CancellationToken::new(),
             entity_store,
         })
     }

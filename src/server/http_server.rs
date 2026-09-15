@@ -423,6 +423,11 @@ pub(crate) async fn ensure_authz_first_build(
     Ok(())
 }
 
+/// Bound on the graceful drain of in-flight connections after a shutdown
+/// signal; on expiry the pinned `Serve` is dropped, which genuinely stops the
+/// server. Matches the cleanup-task timeout idiom.
+const SERVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResult {
     crate::config::validate::require_oauth_for_http_service(ctx.storage.config().as_ref())?;
     warn_if_unauthenticated_push(ctx.storage.config().as_ref());
@@ -455,30 +460,38 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     let notification_shutdown = ctx.notification_shutdown.clone();
     let server_token = shutdown_token.clone();
 
+    let shutdown_context = ctx.clone();
     let app = app(ctx, host.clone(), port).await?;
     let app_with_middleware = middleware.layer(app);
 
     tracing::info!(address = %addr, "HTTP server started up");
 
-    let server_future = axum::serve(listener, app_with_middleware.into_make_service())
-        .with_graceful_shutdown(shutdown_signal(server_token));
+    // Serve is polled inline — no inner task: aborting the `start_http`
+    // future (multi) drops the pinned Serve and genuinely stops accepting.
+    // axum's Serve implements IntoFuture rather than Future, so convert it
+    // once and poll the resulting future by pin.
+    let server = axum::serve(listener, app_with_middleware.into_make_service())
+        .with_graceful_shutdown(shutdown_signal(server_token))
+        .into_future();
+    tokio::pin!(server);
 
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = server_future.await {
-            tracing::error!("HTTP server error: {}", e);
-        }
-    });
-
-    tokio::pin!(server_handle);
+    // The select arm below can complete the Serve future when the server
+    // stops on its own; polling a completed future again would panic, so the
+    // bounded finish reuses the stored result.
+    let mut server_stopped: Option<std::io::Result<()>> = None;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received shutdown signal (Ctrl+C), starting graceful shutdown...");
         }
-        result = server_handle.as_mut() => {
-            if let Err(e) = result {
+        _ = shutdown_context.service_shutdown.cancelled() => {
+            tracing::info!("Received shutdown signal (service shutdown token), starting graceful shutdown...");
+        }
+        result = server.as_mut() => {
+            if let Err(e) = &result {
                 tracing::error!("HTTP server unexpectedly stopped: {}", e);
             }
+            server_stopped = Some(result);
             tracing::info!("HTTP server stopped, initiating shutdown...");
         }
     }
@@ -486,7 +499,31 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
     tracing::info!("Broadcasting shutdown signal to all tasks...");
     broadcast_shutdown(&shutdown_token, &notification_shutdown);
 
-    let (cleanup_result, artifact_gc_result, server_result) = tokio::join!(
+    // Finish the server with a bounded wait: the graceful drain of in-flight
+    // connections must not block the emitter drain and the receipt forever.
+    let server_result: MegaResult = match server_stopped {
+        Some(result) => result.map_err(|e| MegaError::Other(format!("HTTP server error: {e}"))),
+        None => match tokio::time::timeout(SERVER_DRAIN_TIMEOUT, server.as_mut()).await {
+            Ok(Ok(())) => {
+                tracing::info!("HTTP server stopped gracefully");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                tracing::error!("HTTP server error: {}", e);
+                Err(MegaError::Other(format!("HTTP server error: {e}")))
+            }
+            Err(_) => {
+                tracing::error!(
+                    "HTTP server did not stop within the drain timeout; dropping the Serve future stops it now"
+                );
+                Err(MegaError::Other(
+                    "HTTP server did not stop within the drain timeout".to_string(),
+                ))
+            }
+        },
+    };
+
+    let (cleanup_result, artifact_gc_result) = tokio::join!(
         async {
             if let Some(handle) = cleanup_handle {
                 match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
@@ -535,23 +572,12 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
             } else {
                 Ok(())
             }
-        },
-        async {
-            match server_handle.as_mut().await {
-                Ok(_) => {
-                    tracing::info!("HTTP server stopped gracefully");
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("HTTP server join error: {}", e);
-                    Err(())
-                }
-            }
         }
     );
 
-    match (cleanup_result, artifact_gc_result, server_result) {
-        (Ok(_), Ok(_), Ok(_)) => {
+    let shutdown_failed = cleanup_result.is_err() || artifact_gc_result.is_err();
+    match (shutdown_failed, &server_result) {
+        (false, Ok(())) => {
             tracing::info!("Graceful shutdown completed successfully");
         }
         _ => {
@@ -559,7 +585,21 @@ pub async fn start_http(ctx: AppContext, options: CommonHttpOptions) -> MegaResu
         }
     }
 
-    Ok(())
+    // WH-13: drain the storage-event emitter on every exit from the serving
+    // loop (Ctrl+C, unexpected stop, task error) — before the final result is
+    // computed, so no path skips it. The completion receipt is logged by the
+    // `service` cleanup tail, not here.
+    shutdown_context.shutdown_storage_events().await;
+
+    // Serving and join errors surface as the command result; a cleanup-task
+    // failure without a serving error still fails the service.
+    match server_result {
+        Err(error) => Err(error),
+        Ok(()) if shutdown_failed => Err(MegaError::Other(
+            "HTTP shutdown completed with task errors".to_string(),
+        )),
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Built-in development CORS origins used when `oauth.allowed_cors_origins` is
