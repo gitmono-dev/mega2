@@ -156,6 +156,7 @@ pub struct Storage {
     pub config: Arc<Config>,
     pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
+    pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
     /// Shared authorization snapshot holder (ADR-UN-02). Injected by
     /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
@@ -310,6 +311,8 @@ impl Storage {
             agent_capture_service,
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
@@ -599,6 +602,8 @@ impl Storage {
             agent_capture_service: AgentCaptureService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,

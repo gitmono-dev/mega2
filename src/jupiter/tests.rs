@@ -235,6 +235,8 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         agent_capture_service: AgentCaptureService::mock(),
         code_review_service: CodeReviewService::mock(),
         webhook_service,
+        storage_event_emitter:
+            crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         notification_storage: NotificationStorage::new(connection.clone()),
         entity_store: Arc::new(SharedEntityStore::default()),
         vault: None,

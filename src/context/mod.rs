@@ -312,6 +312,10 @@ impl AppContext {
         })
     }
 
+    pub async fn shutdown_storage_events(&self) {
+        self.storage.storage_event_emitter.shutdown().await;
+    }
+
     pub fn config(&self) -> Arc<crate::config::Config> {
         self.config_handle
             .snapshot()

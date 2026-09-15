@@ -30,6 +30,10 @@
 
 HMAC-SHA256 输入为 `timestamp` 十进制秒、`.`、实际发送 body bytes。密钥必须是已解析 `SecretString` 的 `hex:<even-hex>`，解码后 32..=256 bytes。生产客户端没有 HTTP/私网逃逸开关。日志只记 target id / event type / 结果类别，不含 URL、secret、请求响应体或 reqwest 原文。
 
+## 有界运行时（WH-02）
+
+`StorageEventEmitter` 由 `Storage` 持有，默认为 disabled。`try_emit` 在 spawn 前 `try_acquire`，在途不超过 `max_in_flight`；已关闭的 admission 一律返回 `dropped_closed`。每个发送任务的 `JoinHandle` 立即经 channel 交给唯一 lifecycle 任务登记；任务在正常结束、panic 或被 abort 时都通过 drop guard 上报序号，lifecycle 据此逐一 join 并记录按 target 的结果类别（`delivered_2xx` / 非 2xx / connect / tls / resolve / timeout / cancelled / panicked），不依赖下一次发射清理。`shutdown()` 原子关闭 admission、等待 grace，超时 abort 并 join 全部仍在登记的任务；可重复、并发调用，发起者被取消后 drain 由 lifecycle 任务继续。lifecycle 只持有 `Weak` 回引用；最后一个 owner 销毁时登记 channel 关闭，lifecycle 立即 abort 并 join 全部未完成任务后退出（不同步 join）。真实 Secret 绑定与 CLI 接线分别由 WH-11 / WH-13 承接。
+
 ## 事件投影与过滤（WH-10）
 
 `CommittedEvent` 只能表达六种冻结 `event_type`。投影结果为固定 envelope：`schema_version=1`、`event_id`、`event_type`、`occurred_at`、`source`、`scope{tenant_id,repo_path,oci_repository}`、`data`。超过 16 KiB 整事件丢弃，不截断。不含 actor、raw、object key、URL。
