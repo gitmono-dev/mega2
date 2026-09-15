@@ -30,6 +30,12 @@
 
 HMAC-SHA256 输入为 `timestamp` 十进制秒、`.`、实际发送 body bytes。密钥必须是已解析 `SecretString` 的 `hex:<even-hex>`，解码后 32..=256 bytes。生产客户端没有 HTTP/私网逃逸开关。日志只记 target id / event type / 结果类别，不含 URL、secret、请求响应体或 reqwest 原文。
 
+## 事件投影与过滤（WH-10）
+
+`CommittedEvent` 只能表达六种冻结 `event_type`。投影结果为固定 envelope：`schema_version=1`、`event_id`、`event_type`、`occurred_at`、`source`、`scope{tenant_id,repo_path,oci_repository}`、`data`。超过 16 KiB 整事件丢弃，不截断。不含 actor、raw、object key、URL。
+
+路径过滤：仅 `/` 可表示全树；其它过滤为 `p==f` 或 `p.starts_with(f + "/")`。非法 canonical path 丢弃。OCI 精确匹配；Agent 为 tenant 集合与 repo 集合的交集；LFS unscoped 仅 `include_unscoped_lfs=true`。
+
 ## 地址策略（WH-12）
 
 每次 POST 只解析一次 DNS。解析结果必须全部为公共地址：loopback、RFC1918 私网、link-local、metadata（`169.254.169.254` / `fd00:ec2::254`）以及混合公共+受限结果一律拒绝。连接钉扎到本轮已验证的 IP，TLS SNI / hostname 仍使用原域名，发送时不再解析。生产路径没有把公共 IP 映射到本机的开关；测试用注入 resolver/pin。

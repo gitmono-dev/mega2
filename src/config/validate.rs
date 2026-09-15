@@ -732,7 +732,48 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
                 "[[storage_events.targets]] events must be a non-empty list".to_string(),
             ));
         }
+        if target.events.len() > 6 {
+            return Err(MegaError::Other(
+                "[[storage_events.targets]] events must contain at most 6 literals".to_string(),
+            ));
+        }
+        let mut seen_events = std::collections::BTreeSet::new();
+        for event in &target.events {
+            if !is_storage_events_event_literal(event) {
+                return Err(MegaError::Other(format!(
+                    "[[storage_events.targets]] events contains unknown literal {event:?}"
+                )));
+            }
+            if !seen_events.insert(event.as_str()) {
+                return Err(MegaError::Other(format!(
+                    "[[storage_events.targets]] events contains duplicate {event:?}"
+                )));
+            }
+        }
         validate_storage_events_target_url(&target.url)?;
+        validate_storage_events_filter_list("git_paths", &target.git_paths, true)?;
+        validate_storage_events_filter_list("lfs_paths", &target.lfs_paths, true)?;
+        validate_storage_events_filter_list("agent_repo_paths", &target.agent_repo_paths, true)?;
+        validate_storage_events_filter_list("oci_repositories", &target.oci_repositories, false)?;
+        validate_storage_events_filter_list("agent_tenants", &target.agent_tenants, false)?;
+        let agent_tenants_empty = target.agent_tenants.is_empty();
+        let agent_repos_empty = target.agent_repo_paths.is_empty();
+        if agent_tenants_empty != agent_repos_empty {
+            return Err(MegaError::Other(
+                "[[storage_events.targets]] agent_tenants and agent_repo_paths must both be empty or both be non-empty"
+                    .to_string(),
+            ));
+        }
+    }
+    if events.targets.len() > 16 {
+        return Err(MegaError::Other(
+            "[storage_events] targets must contain at most 16 entries".to_string(),
+        ));
+    }
+    if !(1..=64).contains(&events.max_in_flight) {
+        return Err(MegaError::Other(
+            "[storage_events] max_in_flight must be 1..=64".to_string(),
+        ));
     }
 
     if !(1..=5).contains(&events.connect_timeout_seconds) {
@@ -778,6 +819,76 @@ pub(crate) fn validate_storage_events_target_url(raw: &str) -> Result<(), MegaEr
         return Err(MegaError::Other(
             "[[storage_events.targets]] url must include a host".to_string(),
         ));
+    }
+    Ok(())
+}
+
+const STORAGE_EVENTS_EVENT_LITERALS: &[&str] = &[
+    "repo.push",
+    "oci.manifest.published",
+    "lfs.object.uploaded",
+    "lfs.media.finalized",
+    "agent_capture.events.committed",
+    "agent_capture.checkpoint.committed",
+];
+
+fn is_storage_events_event_literal(value: &str) -> bool {
+    STORAGE_EVENTS_EVENT_LITERALS.contains(&value)
+}
+
+fn validate_storage_events_filter_list(
+    field: &str,
+    items: &[String],
+    paths: bool,
+) -> Result<(), MegaError> {
+    if items.len() > 64 {
+        return Err(MegaError::Other(format!(
+            "[[storage_events.targets]] {field} must contain at most 64 items"
+        )));
+    }
+    for item in items {
+        if item.is_empty() || item.len() > 256 {
+            return Err(MegaError::Other(format!(
+                "[[storage_events.targets]] {field} items must be 1..=256 bytes"
+            )));
+        }
+        if paths {
+            validate_storage_events_canonical_path(item).map_err(|_| {
+                MegaError::Other(format!(
+                    "[[storage_events.targets]] {field} contains a non-canonical path"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_storage_events_canonical_path(path: &str) -> Result<(), MegaError> {
+    if path == "/" {
+        return Ok(());
+    }
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.contains("//")
+        || path.contains('\0')
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains('%')
+        || path != path.trim()
+        || path.bytes().any(|b| b < 0x20)
+    {
+        return Err(MegaError::Other(
+            "storage_events path is not canonical".to_string(),
+        ));
+    }
+    for component in path[1..].split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(MegaError::Other(
+                "storage_events path is not canonical".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3504,5 +3615,67 @@ mod tests {
             .validate()
             .expect_err("disabled still rejects illegal URL shape");
         assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[test]
+    fn storage_events_filter_limits() {
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.events = vec!["not.an.event".to_string()];
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("unknown event literal");
+        assert!(err.to_string().contains("unknown literal"), "{err}");
+
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.events = vec!["repo.push".to_string(), "repo.push".to_string()];
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("duplicate event");
+        assert!(err.to_string().contains("duplicate"), "{err}");
+
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.git_paths = vec!["/team/../a".to_string()];
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("non-canonical git path");
+        assert!(err.to_string().contains("canonical"), "{err}");
+
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.git_paths = vec!["x".repeat(257)];
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("filter item too long");
+        assert!(err.to_string().contains("1..=256"), "{err}");
+
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.git_paths = (0..65).map(|i| format!("/p{i}")).collect();
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("too many filter items");
+        assert!(err.to_string().contains("at most 64"), "{err}");
+
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.agent_tenants = vec!["acme".to_string()];
+        target.agent_repo_paths = Vec::new();
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("agent filters must be paired");
+        assert!(err.to_string().contains("agent_tenants"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.targets = (0..17)
+            .map(|i| {
+                let mut target = sample_target();
+                target.id = format!("t{i}");
+                target
+            })
+            .collect();
+        let err = config.validate().expect_err("too many targets");
+        assert!(err.to_string().contains("at most 16"), "{err}");
+
+        let mut config = valid_config();
+        config.storage_events.max_in_flight = 0;
+        let err = config.validate().expect_err("max_in_flight");
+        assert!(err.to_string().contains("max_in_flight"), "{err}");
     }
 }

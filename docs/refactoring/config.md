@@ -139,7 +139,12 @@ Vault resolution (WH-11); this card does not resolve `secret_ref`.
 The HTTPS HMAC transport exists as a library component and is **not**
 wired into AppContext yet. Each POST resolves DNS once, rejects
 loopback/private/link-local/metadata/mixed results, pins the connection to
-that verified address, and keeps the original hostname for TLS SNI. See
+that verified address, and keeps the original hostname for TLS SNI.
+
+Target `events` must be unique literals from the six frozen types. Filter
+arrays are 0..=64 items of 1..=256 bytes; Git/LFS/Agent path items must be
+canonical. `agent_tenants` and `agent_repo_paths` are both empty or both
+non-empty. At most 16 targets. See
 [`storage-events.md`](./storage-events.md).
 
 ## Test configuration

@@ -153,4 +153,4 @@ N/A：未新增用户可见的 `MegaError` 枚举变体。`/api/v1/agent-capture
 
 ## plan-20260912（storage-only 提交后出站事件）
 
-N/A：未新增用户可见的 `MegaError` 枚举变体。`[storage_events]` 配置/启动错误复用 `MegaError::Other`（review 形态启用、缺 `installation_id`、重复 target id、非法 id、非 HTTPS URL、timeout 越界、HMAC 编码非法）。投递失败分类为运输结果，不得映射回已提交写入的 HTTP 状态。
+N/A：未新增用户可见的 `MegaError` 枚举变体。`[storage_events]` 配置/启动错误复用 `MegaError::Other`（review 形态启用、缺 `installation_id`、重复 target id、非法 id、非 HTTPS URL、timeout 越界、HMAC 编码非法、未知 event 字面量、过滤集合超限、非 canonical path、agent 过滤不成对）。投影超 16 KiB 或非法 metadata 记为丢弃，不得映射回已提交写入的 HTTP 状态。
