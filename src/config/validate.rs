@@ -136,6 +136,7 @@ impl Config {
         reject_legacy_mail_environment()?;
         validate_trunk_config_surface(self)?;
         validate_agent_capture_config(self)?;
+        validate_storage_events_config(self)?;
 
         Ok(())
     }
@@ -687,6 +688,60 @@ pub(crate) fn validate_agent_capture_config(config: &Config) -> Result<(), MegaE
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), MegaError> {
+    let events = &config.storage_events;
+    if events.enabled && !config.git.storage_only() {
+        return Err(MegaError::Other(
+            "[storage_events] enabled=true requires git.push_auth (storage-only); \
+             the committed-write emitter is only available in storage-only deployments"
+                .to_string(),
+        ));
+    }
+
+    match events.installation_id.as_deref() {
+        Some(id) if !is_storage_events_ascii_id(id, 1, 64) => {
+            return Err(MegaError::Other(
+                "[storage_events] installation_id must be 1..64 ASCII [A-Za-z0-9_-]".to_string(),
+            ));
+        }
+        None if events.enabled => {
+            return Err(MegaError::Other(
+                "[storage_events] enabled=true requires installation_id".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    let mut seen_ids = std::collections::BTreeSet::new();
+    for target in &events.targets {
+        if !is_storage_events_ascii_id(&target.id, 1, 32) {
+            return Err(MegaError::Other(
+                "[[storage_events.targets]] id must be 1..32 ASCII [A-Za-z0-9_-]".to_string(),
+            ));
+        }
+        if !seen_ids.insert(target.id.as_str()) {
+            return Err(MegaError::Other(format!(
+                "[[storage_events.targets]] id {:?} is duplicated",
+                target.id
+            )));
+        }
+        if target.events.is_empty() {
+            return Err(MegaError::Other(
+                "[[storage_events.targets]] events must be a non-empty list".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_storage_events_ascii_id(value: &str, min: usize, max: usize) -> bool {
+    let len = value.len();
+    (min..=max).contains(&len)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Validate `[cedar]` settings (ADR-UN-01): `enforcement` must be one of
@@ -1491,7 +1546,7 @@ fn join_field_path(prefix: &str, field: &str) -> String {
     }
 }
 
-fn known_fields(path: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
     match path {
         "" => Some(&[
             "base_dir",
@@ -1512,6 +1567,7 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "git",
             "oci",
             "agent_capture",
+            "storage_events",
             "cedar",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
@@ -1616,6 +1672,27 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "ingest_tokens",
         ]),
         "agent_capture.ingest_tokens" => Some(&["name", "token", "paths", "tenant_id"]),
+        "storage_events" => Some(&[
+            "enabled",
+            "installation_id",
+            "max_in_flight",
+            "connect_timeout_seconds",
+            "request_timeout_seconds",
+            "shutdown_grace_seconds",
+            "targets",
+        ]),
+        "storage_events.targets" => Some(&[
+            "id",
+            "url",
+            "secret_ref",
+            "events",
+            "git_paths",
+            "oci_repositories",
+            "lfs_paths",
+            "include_unscoped_lfs",
+            "agent_tenants",
+            "agent_repo_paths",
+        ]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
     }
@@ -1624,7 +1701,10 @@ fn known_fields(path: &str) -> Option<&'static [&'static str]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{template::config_init_template, testing::isolated_config};
+    use crate::config::{
+        PushAuth, PushPolicy, PushTokenConfig, StorageEventsTargetConfig,
+        template::config_init_template, testing::isolated_config,
+    };
     #[rustfmt::skip]
     use crate::orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
 
@@ -3211,5 +3291,101 @@ mod tests {
         )
         .unwrap();
         assert!(reject_unknown_fields(&bad).is_err());
+    }
+
+    fn storage_only_none() -> Config {
+        let mut config = valid_config();
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.git.push_auth = Some(PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.cedar.enforcement = "off".to_string();
+        config
+    }
+
+    fn storage_only_token() -> Config {
+        let mut config = storage_only_none();
+        config.git.push_auth = Some(PushAuth::Token);
+        config.git.push_tokens = vec![PushTokenConfig {
+            name: "ops".to_string(),
+            token: "literal-for-tests".to_string(),
+            paths: None,
+        }];
+        config
+    }
+
+    fn sample_target() -> StorageEventsTargetConfig {
+        StorageEventsTargetConfig {
+            id: "ops-main".to_string(),
+            url: "https://events.example.invalid/ingest".to_string(),
+            secret_ref: "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
+                .to_string(),
+            events: vec!["repo.push".to_string()],
+            git_paths: Vec::new(),
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn storage_events_validation_matrix() {
+        let review = valid_config();
+        assert!(!review.storage_events.enabled);
+        assert!(review.storage_events.targets.is_empty());
+        assert_eq!(review.storage_events.max_in_flight, 16);
+        assert_eq!(review.storage_events.connect_timeout_seconds, 2);
+        assert_eq!(review.storage_events.request_timeout_seconds, 5);
+        assert_eq!(review.storage_events.shutdown_grace_seconds, 5);
+        review
+            .validate()
+            .expect("unconfigured storage_events is disabled and valid");
+
+        let mut token = storage_only_token();
+        token.storage_events.enabled = true;
+        token.storage_events.installation_id = Some("prod-primary-01".to_string());
+        token
+            .validate()
+            .expect("storage-only token may enable storage_events with empty targets");
+
+        let mut none = storage_only_none();
+        none.storage_events.enabled = true;
+        none.storage_events.installation_id = Some("prod-primary-01".to_string());
+        none.storage_events.targets = vec![sample_target()];
+        none.validate()
+            .expect("storage-only none may enable storage_events");
+
+        let mut review_enabled = valid_config();
+        review_enabled.storage_events.enabled = true;
+        review_enabled.storage_events.installation_id = Some("prod-primary-01".to_string());
+        let err = review_enabled
+            .validate()
+            .expect_err("review morphology must reject enabled storage_events");
+        assert!(err.to_string().contains("[storage_events]"), "{err}");
+        assert!(err.to_string().contains("storage-only"), "{err}");
+
+        let mut missing_install = storage_only_none();
+        missing_install.storage_events.enabled = true;
+        let err = missing_install
+            .validate()
+            .expect_err("enabled storage_events requires installation_id");
+        assert!(err.to_string().contains("installation_id"), "{err}");
+
+        let mut duplicate = valid_config();
+        duplicate.storage_events.targets = vec![sample_target(), sample_target()];
+        let err = duplicate
+            .validate()
+            .expect_err("duplicate target ids fail even when disabled");
+        assert!(err.to_string().contains("duplicated"), "{err}");
+
+        let mut empty_events = valid_config();
+        let mut target = sample_target();
+        target.events.clear();
+        empty_events.storage_events.targets = vec![target];
+        let err = empty_events
+            .validate()
+            .expect_err("empty events list is rejected when disabled");
+        assert!(err.to_string().contains("events"), "{err}");
     }
 }

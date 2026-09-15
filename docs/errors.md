@@ -150,3 +150,7 @@ N/A：未新增用户可见的 `MegaError` 枚举变体。Media HTTP 用领域�
 ## plan-20260911（storage-only Agent Capture）
 
 N/A：未新增用户可见的 `MegaError` 枚举变体。`/api/v1/agent-capture` 使用固定 HTTP envelope `{ "error": { "code", "message" } }`（`unauthorized` / `not_found` / `conflict` / `bad_request` / `payload_too_large` / `missing_raw`），不登记新的 `MegaError` 类型。
+
+## plan-20260912（storage-only 提交后出站事件）
+
+N/A：未新增用户可见的 `MegaError` 枚举变体。`[storage_events]` 配置/启动错误复用 `MegaError::Other`（review 形态启用、缺 `installation_id`、重复 target id、非法 id）。投递失败不得映射回已提交写入的 HTTP 状态（后续运输/适配卡）。

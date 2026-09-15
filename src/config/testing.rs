@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::{
     AgentCaptureConfig, ArtifactGcConfig, BlameConfig, CedarConfig, Config, DbConfig, GitConfig,
     LFSConfig, LFSLocalConfig, LFSSshConfig, LogConfig, MonoConfig, OciConfig, PackConfig,
-    RedisConfig,
+    RedisConfig, StorageEventsConfig,
     secret::{SecretRef, SecretResolver},
 };
 use crate::common::errors::MegaError;
@@ -203,6 +203,7 @@ impl TestConfigBuilder {
             git: GitConfig::default(),
             oci: OciConfig::default(),
             agent_capture: AgentCaptureConfig::default(),
+            storage_events: StorageEventsConfig::default(),
             cedar: CedarConfig::default(),
         }
     }

@@ -122,6 +122,19 @@ Slack, and webhook notifications. The `email` preference requests delivery
 through the website API; it does not configure a local mail provider. Refer to
 [`notification.md`](./notification.md) for behavior and test boundaries.
 
+## Storage-only outbound events
+
+`[storage_events]` is a restart-required, default-disabled committed-write
+emitter surface (plan-20260912 / WH-01). `enabled = true` requires
+`git.storage_only()` (`push_auth` is `"token"` or `"none"`); review morphology
+is rejected at `config validate`. `installation_id` is required when enabled
+and is never auto-generated. Target HMAC values are `secret_ref` URIs; they
+are not resolved while disabled.
+
+This card only loads and diagnoses the table. It does not start an emitter,
+open outbound sockets, or claim delivery. See
+[`storage-events.md`](./storage-events.md).
+
 ## Test configuration
 
 `.env.test.example` documents public test endpoints for PostgreSQL, Redis, and

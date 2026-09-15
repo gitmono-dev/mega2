@@ -682,6 +682,7 @@ fn collect_static_restart_fields(
     collect_blame_restart_fields(current, candidate, report);
     collect_object_storage_restart_fields(current, candidate, report);
     collect_oauth_restart_fields(current, candidate, report);
+    collect_storage_events_restart_fields(current, candidate, report);
 }
 
 fn collect_monorepo_restart_fields(
@@ -904,11 +905,59 @@ fn collect_oauth_restart_fields(
     }
 }
 
+fn collect_storage_events_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.storage_events.enabled != candidate.storage_events.enabled {
+        report
+            .restart_required_fields
+            .push("storage_events.enabled");
+    }
+    if current.storage_events.installation_id != candidate.storage_events.installation_id {
+        report
+            .restart_required_fields
+            .push("storage_events.installation_id");
+    }
+    if current.storage_events.max_in_flight != candidate.storage_events.max_in_flight {
+        report
+            .restart_required_fields
+            .push("storage_events.max_in_flight");
+    }
+    if current.storage_events.connect_timeout_seconds
+        != candidate.storage_events.connect_timeout_seconds
+    {
+        report
+            .restart_required_fields
+            .push("storage_events.connect_timeout_seconds");
+    }
+    if current.storage_events.request_timeout_seconds
+        != candidate.storage_events.request_timeout_seconds
+    {
+        report
+            .restart_required_fields
+            .push("storage_events.request_timeout_seconds");
+    }
+    if current.storage_events.shutdown_grace_seconds
+        != candidate.storage_events.shutdown_grace_seconds
+    {
+        report
+            .restart_required_fields
+            .push("storage_events.shutdown_grace_seconds");
+    }
+    if current.storage_events.targets != candidate.storage_events.targets {
+        report
+            .restart_required_fields
+            .push("storage_events.targets");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        ArtifactGcConfig, BuckConfig,
+        ArtifactGcConfig, BuckConfig, PushAuth, PushPolicy, StorageEventsTargetConfig,
         template::config_init_template,
         testing::{EnvVarGuard, env_lock, isolated_config},
     };
@@ -1034,6 +1083,67 @@ mod tests {
         assert!(!report_debug.contains("candidate-secret-access-key"));
         assert!(!report_debug.contains("candidate-gcs-bucket"));
         assert!(!report_debug.contains("candidate-objects"));
+    }
+
+    #[test]
+    fn storage_events_restart_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.monorepo.push_policy = PushPolicy::Trunk;
+        current.git.push_auth = Some(PushAuth::None);
+        current.git.ssh_receive_pack = Some(false);
+        current.cedar.enforcement = "off".to_string();
+        current.storage_events.enabled = false;
+        current.storage_events.installation_id = None;
+        current.storage_events.max_in_flight = 16;
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.storage_events.enabled = true;
+        candidate.storage_events.installation_id = Some("prod-primary-01".to_string());
+        candidate.storage_events.max_in_flight = 8;
+        candidate.storage_events.connect_timeout_seconds = 3;
+        candidate.storage_events.request_timeout_seconds = 7;
+        candidate.storage_events.shutdown_grace_seconds = 1;
+        candidate.storage_events.targets = vec![StorageEventsTargetConfig {
+            id: "ops-main".to_string(),
+            url: "https://events.example.invalid/ingest".to_string(),
+            secret_ref: "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
+                .to_string(),
+            events: vec!["repo.push".to_string()],
+            git_paths: vec!["/team/a".to_string()],
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        }];
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec![
+                "storage_events.enabled",
+                "storage_events.installation_id",
+                "storage_events.max_in_flight",
+                "storage_events.connect_timeout_seconds",
+                "storage_events.request_timeout_seconds",
+                "storage_events.shutdown_grace_seconds",
+                "storage_events.targets",
+            ]
+        );
+        assert!(!report.applied());
+        assert!(report.requires_restart());
+        assert!(!snapshot.storage_events.enabled);
+        assert_eq!(snapshot.storage_events.installation_id, None);
+        assert_eq!(snapshot.storage_events.max_in_flight, 16);
+        assert_eq!(snapshot.storage_events.connect_timeout_seconds, 2);
+        assert_eq!(snapshot.storage_events.request_timeout_seconds, 5);
+        assert_eq!(snapshot.storage_events.shutdown_grace_seconds, 5);
+        assert!(snapshot.storage_events.targets.is_empty());
     }
 
     #[test]

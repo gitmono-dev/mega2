@@ -3,8 +3,8 @@
 
 use super::{
     AgentCaptureConfig, AgentCaptureIngestTokenConfig, DEFAULT_MAX_PUSH_COMMITS, GitConfig,
-    PushAuth, PushPolicy, PushTokenConfig, reload::ConfigHandle, testing::isolated_config,
-    token_path_authorizes,
+    PushAuth, PushPolicy, PushTokenConfig, StorageEventsConfig, reload::ConfigHandle,
+    testing::isolated_config, token_path_authorizes, validate,
 };
 use crate::{
     callisto::sea_orm_active_enums::PushQueueKindEnum,
@@ -146,6 +146,50 @@ fn agent_capture_enabled_requires_ingest_token() {
         .validate()
         .expect_err("[agent_capture] enabled=true requires ingest_tokens");
     assert!(err.to_string().contains("ingest_tokens"), "{err}");
+}
+
+#[test]
+fn storage_events_known_fields() {
+    assert!(
+        validate::known_fields("")
+            .expect("root schema")
+            .contains(&"storage_events")
+    );
+
+    let from_default = StorageEventsConfig::default();
+    assert!(!from_default.enabled);
+    assert_eq!(from_default.installation_id, None);
+    assert_eq!(from_default.max_in_flight, 16);
+    assert_eq!(from_default.connect_timeout_seconds, 2);
+    assert_eq!(from_default.request_timeout_seconds, 5);
+    assert_eq!(from_default.shutdown_grace_seconds, 5);
+    assert!(from_default.targets.is_empty());
+
+    let parsed: StorageEventsConfig =
+        toml::from_str("enabled = false").expect("partial table deserializes");
+    assert!(!parsed.enabled);
+    assert_eq!(parsed.max_in_flight, 16);
+    assert_eq!(parsed.connect_timeout_seconds, 2);
+    assert_eq!(parsed.request_timeout_seconds, 5);
+    assert_eq!(parsed.shutdown_grace_seconds, 5);
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        base_dir = "/tmp"
+        [database]
+        db_url = "postgres://localhost:5432/mono"
+        [monorepo]
+        import_dir = "/third-party"
+        admin = ["admin"]
+        root_dirs = ["project"]
+        [storage_events]
+        unexpected = true
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("unknown storage_events key must fail closed");
+    assert!(err.to_string().contains("unexpected"), "{err}");
 }
 
 #[test]

@@ -50,6 +50,12 @@ pub struct Config {
     /// least one `[[agent_capture.ingest_tokens]]` entry.
     #[serde(default)]
     pub agent_capture: AgentCaptureConfig,
+    /// Storage-only committed-write outbound emitter, plan-20260912.
+    /// `enabled = true` requires storage-only (`git.push_auth` set). Default
+    /// disabled; all fields are restart-required. This card is the config
+    /// surface only — no delivery until later WH cards bind a runtime.
+    #[serde(default)]
+    pub storage_events: StorageEventsConfig,
     /// Authorization enforcement switch (`[cedar]`), ADR-UN-01. Default `off`
     /// (no build, no consume of authorization data).
     #[serde(default)]
@@ -131,6 +137,80 @@ fn default_agent_capture_max_event_bytes() -> u64 {
 
 fn default_agent_capture_lease_ttl_seconds() -> u64 {
     900
+}
+
+/// Storage-only committed-write outbound emitter settings (ADR-WH-01).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StorageEventsConfig {
+    /// Attempt outbound delivery when true AND `git.storage_only()`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Opaque installation namespace for `repo.push` event ids. Required
+    /// when `enabled=true`; never auto-generated.
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default = "default_storage_events_max_in_flight")]
+    pub max_in_flight: u32,
+    #[serde(default = "default_storage_events_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    #[serde(default = "default_storage_events_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "default_storage_events_shutdown_grace_seconds")]
+    pub shutdown_grace_seconds: u64,
+    #[serde(default)]
+    pub targets: Vec<StorageEventsTargetConfig>,
+}
+
+impl Default for StorageEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            installation_id: None,
+            max_in_flight: default_storage_events_max_in_flight(),
+            connect_timeout_seconds: default_storage_events_connect_timeout_seconds(),
+            request_timeout_seconds: default_storage_events_request_timeout_seconds(),
+            shutdown_grace_seconds: default_storage_events_shutdown_grace_seconds(),
+            targets: Vec::new(),
+        }
+    }
+}
+
+fn default_storage_events_max_in_flight() -> u32 {
+    16
+}
+
+fn default_storage_events_connect_timeout_seconds() -> u64 {
+    2
+}
+
+fn default_storage_events_request_timeout_seconds() -> u64 {
+    5
+}
+
+fn default_storage_events_shutdown_grace_seconds() -> u64 {
+    5
+}
+
+/// One static outbound target. `secret_ref` is stored opaque here; WH-11
+/// resolves it at startup when enabled.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StorageEventsTargetConfig {
+    pub id: String,
+    pub url: String,
+    pub secret_ref: String,
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub git_paths: Vec<String>,
+    #[serde(default)]
+    pub oci_repositories: Vec<String>,
+    #[serde(default)]
+    pub lfs_paths: Vec<String>,
+    #[serde(default)]
+    pub include_unscoped_lfs: bool,
+    #[serde(default)]
+    pub agent_tenants: Vec<String>,
+    #[serde(default)]
+    pub agent_repo_paths: Vec<String>,
 }
 
 /// Independent ingest token for Agent Capture (not `[[git.push_tokens]]`).

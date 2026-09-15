@@ -8,6 +8,8 @@
 
 可选 **FastCDC Media**（`--features fastcdc`）在仓库 LFS mount 下提供 `<repo>.git/info/lfs/libra/media/v1/...`；关闭 feature 时这些路由不存在，标准 Git LFS 不变。契约见 [`docs/refactoring/fastcdc-media.md`](docs/refactoring/fastcdc-media.md)。这不是标准 Git FastCDC 或 BLAKE3 互通。
 
+可选 **storage-only 提交后出站事件**（`[storage_events]`，默认关闭）见 [`docs/refactoring/storage-events.md`](docs/refactoring/storage-events.md)。review 形态启用会被 `config validate` 拒绝；本版本只交付配置表面，不声称已有投递。
+
 ## 与 megaui 联合启动（同栈联调）
 
 `monoengine` 承担**授权**（monoengine 管理权限），`megaui`（sibling `../megaui` 的 `apps/web`）承担**认证**（唯一登录/注册面）和浏览器 UI。联调栈完全由本仓的 `docker-compose.test.yml` 驱动；megaui 仅作为构建上下文引入。
