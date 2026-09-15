@@ -208,6 +208,8 @@ impl Storage {
         let lfs_service = LfsService {
             lfs_storage: lfs_db_storage.clone(),
             obj_storage: object_store.clone(),
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
@@ -352,6 +354,9 @@ impl Storage {
         &mut self,
         emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     ) {
+        // LfsService is built before the vault-bound emitter exists (WH-11),
+        // so rebinding must fan out to it (WH-05).
+        self.lfs_service.storage_event_emitter = emitter.clone();
         self.storage_event_emitter = emitter;
     }
 

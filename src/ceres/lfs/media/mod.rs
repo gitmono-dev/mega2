@@ -53,6 +53,8 @@ mod tests {
                 base: BaseStorage::mock(),
             },
             obj_storage: store,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
         .media();
         Fixture {
@@ -303,6 +305,8 @@ mod tests {
         let service = LfsService {
             lfs_storage: lfs_db.clone(),
             obj_storage: store,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
         .media();
         DbFixture {

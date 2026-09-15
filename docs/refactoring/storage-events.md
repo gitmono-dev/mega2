@@ -2,7 +2,7 @@
 
 本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11/WH-03/WH-04）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；WH-03 挂上 Git B3 真实 `n>0` push 的 `repo.push`（协议与产品 API 写共用提交点），WH-04 挂上 OCI manifest 发布的 `oci.manifest.published`；LFS/Agent 来源 hook（WH-05..08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口）。Agent 来源 hook（WH-07/08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -49,6 +49,10 @@ Git B3 真实 `n>0` push 的 `txn.commit()` 成功后、C-segment 前发一次 `
 ## 来源适配：`oci.manifest.published`（WH-04，已交付）
 
 OCI manifest 发布在对象 + manifest DB 行 + 可选 tag upsert 全成功后发一次 `oci.manifest.published`：scope 只填 `oci_repository`，data 为 `digest,reference,media_type,size`，`event_id` 为 UUID v4。发布失败、chunk/blob/mount、digest/tag/超限拒绝均不发；重复 PUT 可重复通知；投递失败不改变已提交的发布。详情与崩溃窗口见 [`oci.md`](oci.md)「发布出站事件」。
+
+## 来源适配：`lfs.object.uploaded`（WH-05，已交付）
+
+LFS basic 上传在本次请求实际 `put_stream` 成功后发一次 `lfs.object.uploaded`：scope 三个值全 null（basic 上传没有可信 repo/tenant），data 为 `oid,size,transfer="basic"`；只发给显式 `include_unscoped_lfs=true` 的 target。batch 建行、exists no-op、hash/size 失败不发；presigned 发放与直传不发（无回调，覆盖缺口 DEFER-WH-01）。exists→put 非原子，并发成功上传允许重复通知。emitter 故障不改变上传结果。
 
 ## 事件投影与过滤（WH-10）
 

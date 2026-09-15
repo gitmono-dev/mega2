@@ -14,7 +14,7 @@ mod git_cli;
 
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -24,6 +24,7 @@ use std::{
 };
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+use sha2::Digest as _;
 use tempfile::TempDir;
 
 const DEFAULT_POSTGRES_URL: &str =
@@ -1238,4 +1239,427 @@ fn read_log(path: &Path) -> String {
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf);
     buf
+}
+
+// ------------------------------------------------------------------
+// WH-05 (plan-20260912): `lfs.object.uploaded` on the real binary — basic
+// upload emits one bounded attempt; the presigned direct-upload path is the
+// documented DEFER-WH-01 gap and emits nothing.
+// ------------------------------------------------------------------
+
+const WH05_SECRET_REF: &str = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value";
+const WH05_HMAC_VALUE: &str =
+    "hex:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+const WH05_SENTINEL_PAYLOAD: &str =
+    "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+const WH05_EVENTS_APPEND: &str = r#"
+[storage_events]
+enabled = true
+installation_id = "it-wh05-process"
+
+[[storage_events.targets]]
+id = "ops-main"
+url = "https://events.example.invalid/ingest"
+secret_ref = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+events = ["lfs.object.uploaded"]
+include_unscoped_lfs = true
+"#;
+
+/// Seed the target HMAC secret through the real `config secret set` CLI flow.
+fn wh05_seed_target_secret(env: &GitLfsEnv) {
+    let bootstrap_path = env.temp_dir.path().join("wh05-bootstrap-config.toml");
+    fs::write(
+        &bootstrap_path,
+        format!(
+            r#"
+            [database]
+            db_type = "postgres"
+            db_url = "{}"
+            max_connection = 4
+            min_connection = 1
+            acquire_timeout = 5
+            connect_timeout = 5
+            sqlx_logging = false
+            "#,
+            env.database.db_url
+        ),
+    )
+    .expect("write bootstrap config");
+
+    let mut command = isolated_command(env.temp_dir.path(), &env.base_dir, &env.cache_dir);
+    command
+        .arg("--config")
+        .arg(&bootstrap_path)
+        .env("MEGA_LOG__PRINT_STD", "false")
+        .env("MEGA_LOG__WITH_ANSI", "false");
+    command.args([
+        "config",
+        "secret",
+        "set",
+        "storage_events.targets.ops-main.secret_ref",
+        "--vault-path",
+        "config/it/storage_events/targets/ops-main/hmac",
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let (out_path, err_path) = (
+        env.temp_dir.path().join("wh05-seed.out"),
+        env.temp_dir.path().join("wh05-seed.err"),
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(
+            fs::File::create(&out_path).expect("seed stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&err_path).expect("seed stderr"),
+        ));
+    let mut child = command.spawn().expect("spawn config secret set");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(WH05_HMAC_VALUE.as_bytes())
+        .expect("write stdin");
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll secret set") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "config secret set did not finish within the bound:\nstdout:\n{}\nstderr:\n{}",
+            read_log(&out_path),
+            read_log(&err_path),
+        );
+        sleep(Duration::from_millis(100));
+    };
+    assert!(
+        status.success(),
+        "config secret set must succeed: {status}\nstdout:\n{}\nstderr:\n{}",
+        read_log(&out_path),
+        read_log(&err_path),
+    );
+}
+
+/// Bounded wait for a log line across both captured streams.
+fn wh05_wait_log_line(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let combined = format!("{}\n{}", read_log(stdout_path), read_log(stderr_path));
+        if let Some(line) = combined.lines().find(|line| line.contains(needle)) {
+            return line.to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`{needle}` not observed within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+            read_log(stdout_path),
+            read_log(stderr_path),
+        );
+        sleep(Duration::from_millis(100));
+    }
+}
+
+/// SIGINT -> receipt observed in a bounded window -> exit 0 (WH-13 ordering),
+/// then return the full captured logs for content assertions.
+fn wh05_shutdown_and_capture(
+    service: &mut ServiceProcess,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> String {
+    let pid = service.pid() as libc::pid_t;
+    // SAFETY: SIGINT to a child we own; WH-13 routes it to the async layer.
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+    wh05_wait_log_line(
+        stdout_path,
+        stderr_path,
+        "storage_events_shutdown_complete",
+        Duration::from_secs(60),
+    );
+    let status = service
+        .wait_for_exit(Duration::from_secs(60))
+        .expect("service must exit after the shutdown receipt");
+    assert!(
+        status.success(),
+        "service must exit 0 after graceful shutdown: {status}\nstdout:\n{}\nstderr:\n{}",
+        read_log(stdout_path),
+        read_log(stderr_path),
+    );
+    format!("{}\n{}", read_log(stdout_path), read_log(stderr_path))
+}
+
+/// Emitter-side delivery outcome lines (`category=…`; the transport logs its
+/// own `outcome=…` line alongside).
+fn wh05_emitter_delivery_count(captured: &str) -> usize {
+    captured
+        .lines()
+        .filter(|line| line.contains("storage_events delivery") && line.contains("category="))
+        .count()
+}
+
+fn wh05_assert_logs_sanitized(captured: &str) {
+    assert!(
+        !captured.contains(WH05_HMAC_VALUE) && !captured.contains(WH05_SENTINEL_PAYLOAD),
+        "captured logs must not contain the seeded secret in either form"
+    );
+    assert!(
+        !captured.contains(WH05_SECRET_REF),
+        "captured logs must not contain the full SecretRef URI"
+    );
+}
+
+/// One LFS round trip in trunk + push_auth=none morphology: track a binary,
+/// push to main, peer pulls and bytes match. Returns the captured service
+/// logs after a clean shutdown.
+fn wh05_lfs_round_trip(
+    env: &GitLfsEnv,
+    extra_object_env: &[(&str, &str)],
+    case_label: &str,
+    payload: &[u8],
+) -> String {
+    let port = git_cli::reserve_ephemeral_port();
+    let (stdout_path, stderr_path) = (
+        env.temp_dir.path().join(format!("{case_label}.out")),
+        env.temp_dir.path().join(format!("{case_label}.err")),
+    );
+    let mut command = env.full_config_command();
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    for (key, value) in trunk_boot_env() {
+        command.env(key, value);
+    }
+    for (key, value) in extra_object_env {
+        command.env(*key, *value);
+    }
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&stdout_path)))
+        .stderr(Stdio::from(create_log_file(&stderr_path)));
+    let mut service = ServiceProcess::spawn(command);
+    service.wait_until_listening(port, Duration::from_secs(90), &stdout_path, &stderr_path);
+
+    seed_project_foo_trunk(&env.case_dir, port);
+    let foo_url = trunk_subpath_url(port, "/project/foo");
+    let lfs_url = format!("{}/info/lfs", foo_url.trim_end_matches('/'));
+    let src = format!("lfs-wh05-{case_label}-src");
+    trunk_git_ok(&env.case_dir, None, &["clone", &foo_url, &src]);
+    configure_git_identity_trunk(&env.case_dir, None, &src);
+    configure_lfs_trunk(&env.case_dir, None, &src, &lfs_url);
+    trunk_git_ok(&env.case_dir, None, &["-C", &src, "lfs", "track", "*.bin"]);
+    let binary_name = format!("wh05-{case_label}.bin");
+    fs::write(env.case_dir.join(&src).join(&binary_name), payload).expect("write LFS fixture");
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &["-C", &src, "add", ".gitattributes", &binary_name],
+    );
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &["-C", &src, "commit", "-m", "wh05 lfs round trip"],
+    );
+    git_cli::assert_git_success(
+        &trunk_push_main(&env.case_dir, None, &src),
+        "anonymous trunk LFS push to main",
+    );
+
+    let peer = format!("lfs-wh05-{case_label}-peer");
+    fs::create_dir_all(env.case_dir.join(&peer)).expect("peer dir");
+    trunk_git_ok(&env.case_dir, None, &["-C", &peer, "init"]);
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &["-C", &peer, "remote", "add", "origin", &foo_url],
+    );
+    configure_lfs_trunk(&env.case_dir, None, &peer, &lfs_url);
+    trunk_git_ok(
+        &env.case_dir,
+        None,
+        &[
+            "-C",
+            &peer,
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    let mut skip_smudge = trunk_host_git_command(&env.case_dir, None);
+    skip_smudge.env("GIT_LFS_SKIP_SMUDGE", "1");
+    skip_smudge.args(["-C", &peer, "checkout", "main"]);
+    git_cli::assert_git_success(
+        &skip_smudge.output().expect("checkout skip-smudge"),
+        "checkout main",
+    );
+    trunk_git_ok(&env.case_dir, None, &["-C", &peer, "lfs", "pull"]);
+    assert_eq!(
+        fs::read(env.case_dir.join(&peer).join(&binary_name)).expect("pulled bytes"),
+        payload,
+        "peer LFS bytes must match source fixture"
+    );
+
+    wh05_shutdown_and_capture(&mut service, &stdout_path, &stderr_path)
+}
+
+#[test]
+fn integration_git_lfs_storage_events_basic_upload() {
+    // Local object storage => the batch issues basic upload URLs, so the
+    // in-process handler stores the object and emits exactly one event.
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs"
+    );
+    git_cli::require_git_cli_runner();
+    assert_host_git_lfs_pinned();
+
+    let env = GitLfsEnv::with_config_append(&format!(
+        "\n[git]\nanonymous_access = true\n{WH05_EVENTS_APPEND}"
+    ));
+    wh05_seed_target_secret(&env);
+    let captured = wh05_lfs_round_trip(&env, &[], "basic", &wh05_unique_payload());
+    assert_eq!(
+        wh05_emitter_delivery_count(&captured),
+        1,
+        "exactly one delivery for the basic upload:\n{captured}"
+    );
+    wh05_assert_logs_sanitized(&captured);
+}
+
+#[test]
+fn integration_git_lfs_storage_events_presigned_gap() {
+    // RustFS (S3-compatible) object storage => the batch issues presigned PUT
+    // URLs and the client uploads directly, bypassing the in-process handler
+    // (DEFER-WH-01): zero events, but the round trip must still succeed.
+    assert!(
+        !git_cli::git_cli_skip_requested(),
+        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs"
+    );
+    git_cli::require_git_cli_runner();
+    assert_host_git_lfs_pinned();
+
+    let env = GitLfsEnv::with_config_append(&format!(
+        "\n[git]\nanonymous_access = true\n{WH05_EVENTS_APPEND}"
+    ));
+    wh05_seed_target_secret(&env);
+    // Unique payload per run: the persistent RustFS bucket must not already
+    // hold this OID, otherwise batch would omit the upload action and the
+    // case would pass without exercising the presigned PUT.
+    let payload = wh05_unique_payload();
+    let oid = hex::encode(sha2::Sha256::digest(&payload));
+
+    let s3_env: [(&str, &str); 6] = [
+        ("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible"),
+        ("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1"),
+        ("MEGA_OBJECT_STORAGE__S3__BUCKET", "monoengine"),
+        (
+            "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
+            "http://127.0.0.1:19000",
+        ),
+        ("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs"),
+        (
+            "MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY",
+            "rustfs_secret",
+        ),
+    ];
+    // Boot a probe service on the same DB and ask the batch endpoint for
+    // this OID first: the response MUST carry a presigned upload action
+    // pointing at the RustFS endpoint (proof the client upload bypasses the
+    // in-process handler before we assert zero events).
+    let probe_port = git_cli::reserve_ephemeral_port();
+    let (probe_out, probe_err) = (
+        env.temp_dir.path().join("presigned-probe.out"),
+        env.temp_dir.path().join("presigned-probe.err"),
+    );
+    let mut command = env.full_config_command();
+    command.env("MEGA_LOG__PRINT_STD", "true");
+    for (key, value) in trunk_boot_env() {
+        command.env(key, value);
+    }
+    for (key, value) in &s3_env {
+        command.env(*key, *value);
+    }
+    command.args([
+        "service",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "-p",
+        &probe_port.to_string(),
+    ]);
+    command
+        .stdout(Stdio::from(create_log_file(&probe_out)))
+        .stderr(Stdio::from(create_log_file(&probe_err)));
+    let mut probe = ServiceProcess::spawn(command);
+    probe.wait_until_listening(probe_port, Duration::from_secs(90), &probe_out, &probe_err);
+    let batch_url = format!(
+        "{}/info/lfs/objects/batch",
+        trunk_subpath_url(probe_port, "/project/foo").trim_end_matches('/')
+    );
+    let batch = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("batch client")
+        .post(&batch_url)
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .body(
+            serde_json::json!({
+                "operation": "upload",
+                "transfers": ["basic"],
+                "hash_algo": "sha256",
+                "objects": [{"oid": oid, "size": payload.len()}]
+            })
+            .to_string(),
+        )
+        .send()
+        .expect("batch request");
+    assert_eq!(batch.status().as_u16(), 200, "batch must succeed");
+    let batch_json: serde_json::Value = batch.json().expect("batch json");
+    let upload_href = batch_json["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .expect("batch must carry an upload action for the fresh OID")
+        .to_owned();
+    assert!(
+        upload_href.contains("127.0.0.1:19000"),
+        "upload action must be a presigned RustFS URL, got {upload_href}"
+    );
+    let probe_status = probe.shutdown_via_sigint(Duration::from_secs(60));
+    assert!(probe_status.success(), "probe service clean shutdown");
+
+    let captured = wh05_lfs_round_trip(&env, &s3_env, "presigned", &payload);
+    assert_eq!(
+        wh05_emitter_delivery_count(&captured),
+        0,
+        "presigned direct upload emits nothing (DEFER-WH-01):\n{captured}"
+    );
+    wh05_assert_logs_sanitized(&captured);
+}
+
+/// Unique-per-run payload so the persistent RustFS bucket never already holds
+/// the OID (presigned-gap case must exercise a real upload every run).
+fn wh05_unique_payload() -> Vec<u8> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    format!(
+        "wh05 unique payload {nanos} {}
+",
+        std::process::id()
+    )
+    .into_bytes()
 }
