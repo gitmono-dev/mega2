@@ -164,8 +164,9 @@ single application emitter owner on `Storage`; on disabled configs nothing
 is resolved and the emitter stays disabled. Each POST resolves DNS once,
 rejects loopback/private/link-local/metadata/mixed results, pins the
 connection to that verified address, and keeps the original hostname for TLS
-SNI. Business source hooks are delivered by later cards (WH-03..08), so no
-events are emitted yet even when enabled.
+SNI. WH-03 installed the first source hook: a real B3 `n>0` push commit emits
+`repo.push`; the remaining source hooks are delivered by later cards
+(WH-04..08).
 
 Target `events` must be unique literals from the six frozen types. Filter
 arrays are 0..=64 items of 1..=256 bytes; Git/LFS/Agent path items must be

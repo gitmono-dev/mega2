@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "monoengine"
-version = "0.10.32"
+version = "0.10.33"
 dependencies = [
  "anyhow",
  "async-recursion",

@@ -19,15 +19,21 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinHandle,
 };
+use uuid::Uuid;
 
 use crate::{
+    common::errors::MegaError,
     config::{Config, StorageEventsTargetConfig},
     jupiter::service::{
-        storage_event::{CommittedEvent, EventType, ProjectionDrop, project, select_targets},
+        storage_event::{
+            CommittedEvent, EventData, EventScope, EventSource, EventType, ProjectionDrop, project,
+            select_targets, validate_canonical_path,
+        },
         storage_event_transport::{EventTarget, EventTransport, TransportSuccess},
     },
 };
@@ -45,6 +51,80 @@ pub enum AdmissionDisposition {
     DroppedCapacity,
     DroppedClosed,
     DroppedInvalidEvent,
+}
+
+/// Git typed builder for the WH-03 `repo.push` committed event
+/// (plan-20260912「事件身份与 scope 不变量」/ ADR-WH-04). The snapshot comes
+/// entirely from the caller's committed round; `occurred_at` is stamped at
+/// construction. `repo_path` must already be canonical — a non-canonical path
+/// fails the builder and the caller maps that to a dropped event, never a
+/// business error.
+/// Wire data fields of a `repo.push` event (ADR-WH-04 whitelist).
+pub struct RepoPushData {
+    pub push_id: String,
+    pub operation_id: String,
+    pub ref_name: String,
+    pub old_oid: String,
+    pub requested_oid: String,
+    pub landed_oid: String,
+}
+
+pub fn repo_push_event(
+    installation_id: &str,
+    repo_path: &str,
+    data: RepoPushData,
+) -> Result<CommittedEvent, MegaError> {
+    validate_canonical_path(repo_path)?;
+    let event_id = repo_push_event_id(
+        installation_id,
+        repo_path,
+        &data.operation_id,
+        &data.landed_oid,
+    );
+    Ok(CommittedEvent {
+        event_id,
+        event_type: EventType::RepoPush,
+        occurred_at: chrono::Utc::now().timestamp() as u64,
+        source: EventSource::Git,
+        scope: EventScope::Git {
+            repo_path: repo_path.to_owned(),
+        },
+        data: EventData::RepoPush {
+            push_id: data.push_id,
+            operation_id: data.operation_id,
+            ref_name: data.ref_name,
+            old_oid: data.old_oid,
+            requested_oid: data.requested_oid,
+            landed_oid: data.landed_oid,
+        },
+    })
+}
+
+/// `sha256("repo.push\0" + installation_id + "\0" + canonical_repo_path +
+/// "\0" + operation_id + "\0" + landed_commit_id)`, first 16 bytes encoded
+/// with the UUID v5 byte layout (version nibble 5, variant bits 10). The
+/// queue's i64 id does not participate in the identity.
+fn repo_push_event_id(
+    installation_id: &str,
+    repo_path: &str,
+    operation_id: &str,
+    landed_commit_id: &str,
+) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"repo.push\0");
+    hasher.update(installation_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(repo_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(operation_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(landed_commit_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 #[derive(Clone)]
@@ -817,6 +897,85 @@ mod tests {
         );
         let compiled = EventTarget::compile(&config.id, &config.url, &secret).expect("target");
         (config, compiled)
+    }
+
+    #[test]
+    fn repo_push_event_id_derivation() {
+        let event = repo_push_event(
+            "prod-primary-01",
+            "/team/a",
+            RepoPushData {
+                push_id: "42".to_owned(),
+                operation_id: "op-1".to_owned(),
+                ref_name: "refs/heads/main".to_owned(),
+                old_oid: "a".repeat(40),
+                requested_oid: "b".repeat(40),
+                landed_oid: "c".repeat(40),
+            },
+        )
+        .expect("builder");
+        assert_eq!(event.event_type, EventType::RepoPush);
+        assert_eq!(event.source, EventSource::Git);
+        assert!(event.occurred_at > 0);
+
+        // Identical inputs are stable; each identity input distinguishes.
+        let again = repo_push_event(
+            "prod-primary-01",
+            "/team/a",
+            RepoPushData {
+                push_id: "43".to_owned(),
+                operation_id: "op-1".to_owned(),
+                ref_name: "refs/heads/main".to_owned(),
+                old_oid: "a".repeat(40),
+                requested_oid: "b".repeat(40),
+                landed_oid: "c".repeat(40),
+            },
+        )
+        .expect("builder");
+        assert_eq!(event.event_id, again.event_id);
+        for (installation, path, op, landed) in [
+            ("other-install", "/team/a", "op-1", "c".repeat(40)),
+            ("prod-primary-01", "/team/b", "op-1", "c".repeat(40)),
+            ("prod-primary-01", "/team/a", "op-2", "c".repeat(40)),
+            ("prod-primary-01", "/team/a", "op-1", "d".repeat(40)),
+        ] {
+            let other = repo_push_event(
+                installation,
+                path,
+                RepoPushData {
+                    push_id: "42".to_owned(),
+                    operation_id: op.to_owned(),
+                    ref_name: "refs/heads/main".to_owned(),
+                    old_oid: "a".repeat(40),
+                    requested_oid: "b".repeat(40),
+                    landed_oid: landed,
+                },
+            )
+            .expect("builder");
+            assert_ne!(event.event_id, other.event_id);
+        }
+
+        // UUID v5 byte layout: version nibble 5, variant bits 10.
+        let bytes = event.event_id.as_bytes();
+        assert_eq!(bytes[6] >> 4, 5);
+        assert_eq!(bytes[8] >> 6, 0b10);
+
+        // Non-canonical paths fail the builder (the adapter drops, never errors).
+        assert!(
+            repo_push_event(
+                "prod-primary-01",
+                "/team/a/",
+                RepoPushData {
+                    push_id: "42".to_owned(),
+                    operation_id: "op-1".to_owned(),
+                    ref_name: "refs/heads/main".to_owned(),
+                    old_oid: "a".repeat(40),
+                    requested_oid: "b".repeat(40),
+                    landed_oid: "c".repeat(40),
+                },
+            )
+            .is_err()
+        );
     }
 
     fn enabled_config() -> Config {

@@ -2,7 +2,7 @@
 
 本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地。`AppContext` 启动时在 vault 就绪后解析 target `secret_ref` 并把真实 transport 安装为唯一应用 emitter owner；但业务来源 hook（WH-03..08）尚未安装，enabled 仍不产生投递。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-11/WH-03）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；WH-03 已挂上 Git B3 真实 `n>0` push 的 `repo.push` 出站（协议与产品 API 写共用提交点），其余来源 hook（WH-04..08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -41,6 +41,10 @@ HMAC-SHA256 输入为 `timestamp` 十进制秒、`.`、实际发送 body bytes�
 运维命令同步扩展：`config secret set/check/rotate` 接受 `storage_events.targets.<id>.secret_ref` 字段，vault-path 必须是 `config/<profile>/storage_events/targets/<id>/hmac`；set/rotate 只从 stdin 读值（`--value-stdin`，`printf '%s' "$HMAC" | monoengine ... config secret set ...`），轮换后必须重启服务（无动态热更新）。
 
 CLI 接线已由 WH-13 交付：长运行 service（`http` / `ssh` / `multi`）不再安装直接 `process::exit` 的 Ctrl+C handler。`AppContext` 持有共享 `service_shutdown` CancellationToken；CLI 在 config 加载**之前**就为 `service http|ssh|multi` 安装「只记录」的 Ctrl+C handler（`ctrlc` crate，写入静态 watch channel，进程永不被信号默认终止；一次性命令保留原 `process::exit(0)` handler），`service` 创建 context 成功后用一次性 forwarder 任务把该记录（含已落早的信号）转入该 token（sticky，信号落在任一 server 注册 handler 之前也不丢），forwarder 由清理尾段 abort 回收。context 创建成功后的全部退出路径（subscribe / reload watcher / 参数解析、启动与运行错误、Ctrl+C、正常返回）统一经过 `commands::service` 的异步清理尾段——先按既有优先级停止 reload watcher（原结果不被清理覆盖），再 `shutdown().await` emitter，仅在其完成后才输出 `storage_events_shutdown_complete` 日志（仅类别字段，无 URL / secret / body）。`start_http` 内联轮询 `Serve`（无内层任务：multi abort wrapper 即真正停止监听），主 select 同时监听 ctrl_c 与共享 token（服务外直接调用仍可用）；优雅 drain 有界（30s；超时丢弃 Serve 即停止 accept 循环，残留的连接任务属 axum 既有后台任务，其生命周期重构不在 WH-13 范围：admission 已关闭的 emitter 不受其影响，runtime 收尾时一并回收），serving / drain 超时 / 后台任务错误在全部清理（含 emitter drain）完成后按 serving > drain > 任务错误的优先级作为命令结果返回，干净关停仍 Ok。`service ssh` 等待 token 后 abort 并有界 join 无关停 token 的 SSH server（is_finished 快路径与 abort 后的 join 结果都会保留真实完成/错误，只有预期取消与 join 超时才返回 Ok）；`service multi` 中 ssh 子任务始终立即 abort + 有界 join，http 子任务一律经共享 token 优雅停止——token 触发或 ssh 先完成时给有界优雅窗口，超时再强制 abort + 有界 join；先完成方的结果为整体结果，token 路径保留真实子错误（http 优先于 ssh，abort 取消不算错误）。非服务命令与 `service init` 保持原退出行为（AC7）。进程级证据见 `tests/integration_storage_events_runtime.rs`。
+
+## 来源适配：`repo.push`（WH-03，已交付）
+
+Git B3 真实 `n>0` push 的 `txn.commit()` 成功后、C-segment 前发一次 `repo.push`：scope 只填 canonical `repo_path`，data 为 `push_id,operation_id,ref_name,old_oid,requested_oid,landed_oid`。event_id 按冻结规则派生（`sha256("repo.push\0"+installation_id+"\0"+repo_path+"\0"+operation_id+"\0"+landed_commit_id)` 前 16 字节、UUID v5 布局），同输入稳定、跨安装/仓库/操作/落地 commit 区分；队列 i64 id 不参与身份。协议 receive-pack 与产品 API 写（`land_api_tip_push`）共用同一提交点。净零轮次（`n=0`）、Done replay、attach/merge、CAS/fencing 失败与回滚均不发。投递失败不改变已提交结果。覆盖边界：B3 提交语义见 [`trunk-push.md`](trunk-push.md) 阶段 7。
 
 ## 事件投影与过滤（WH-10）
 
