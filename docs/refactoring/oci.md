@@ -124,6 +124,17 @@ DELETE /uploads/{uuid}        → 按 seq 删分片 + 删行 → 204
 
 总成本固定 2 读 + 1 写 O(size)。**不使用** `exists → skip` 快捷路径。
 
+## 发布出站事件（plan-20260912 / WH-04，已交付）
+
+一次 manifest 发布（`PUT /v2/{name}/manifests/{reference}`）在对象写入 + `oci_manifest` 行 + 可选 tag upsert **全部成功**后发出一次 `oci.manifest.published` 出站事件（契约见 [`storage-events.md`](storage-events.md)）：
+
+- scope 只填 `oci_repository`（规范 repo 名），data 为 `digest,reference,media_type,size`；`event_id` 为 UUID v4。
+- 分步写入不是跨对象/DB 原子事务：任何一步失败即整体报错、不发事件；重复 PUT 可重复通知；后续 tag 改写不影响已发快照。
+- chunk / blob / mount 不产生事件（它们不是发布）；digest 不符、非法 tag、超限 body 等拒绝路径不发。
+- 过滤按 `oci_repositories` 精确匹配；事件构造或投递失败不改变已提交的发布结果。
+
+进程级证据：`integration_oci` 的 `integration_oci_storage_events_publication`；router lib collector 覆盖过滤与晚到快照（`storage_event_publication_matrix` / `storage_event_delayed_snapshot`）。
+
 **崩溃窗口：**
 
 | 窗口 | 残留 | 重试语义 |

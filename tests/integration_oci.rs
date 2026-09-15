@@ -811,3 +811,251 @@ fn read_log(path: &Path) -> String {
     let _ = file.read_to_string(&mut buf);
     buf
 }
+
+/// WH-04 (plan-20260912) process gate: with `[storage_events]` enabled and a
+/// vault-seeded target secret, a real manifest PUT returns 201 and the
+/// emitter's real transport logs exactly one bounded delivery attempt
+/// (sanitized category line only); a digest-mismatch PUT fails with no second
+/// attempt; SIGINT exits through the WH-13 cleanup tail. Filtering and
+/// delayed-snapshot behavior are covered by the router lib collector
+/// (`api::router::oci_router::tests::storage_event_publication_matrix`).
+#[test]
+fn integration_oci_storage_events_publication() {
+    let env = OciEnv::with_config_append(&format!(
+        "{}\n{}",
+        token_oci_append(true),
+        STORAGE_EVENTS_APPEND
+    ));
+    wh04_seed_target_secret(&env);
+    let (mut service, port, stdout_path, stderr_path) =
+        boot_service_http(&env, &[("MEGA_GIT__PUSH_AUTH", "token")]);
+    let base = registry_base(port);
+    let client = http_client();
+    let auth = basic_auth("any", PUSH_TOKEN);
+
+    // Config blob (monolithic) then a valid manifest PUT.
+    let config_bytes = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = sha256_digest(config_bytes);
+    let mono_config = client
+        .post(format!(
+            "{base}/{REPO}/blobs/uploads/?digest={config_digest}"
+        ))
+        .header("Authorization", &auth)
+        .header("Content-Length", config_bytes.len().to_string())
+        .body(config_bytes.to_vec())
+        .send()
+        .expect("monolithic config");
+    assert_eq!(mono_config.status().as_u16(), 201, "config blob upload");
+
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[]}}"#,
+        config_bytes.len()
+    );
+    let put = client
+        .put(format!("{base}/{REPO}/manifests/wh04"))
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest.clone())
+        .send()
+        .expect("put manifest");
+    assert_eq!(put.status().as_u16(), 201, "manifest publication must 201");
+
+    // Exactly one bounded delivery attempt on the real transport (the
+    // `.invalid` destination never resolves): emitter line with the sanitized
+    // category only.
+    let delivery = wh04_wait_log_line(
+        &stdout_path,
+        &stderr_path,
+        "storage_events delivery",
+        Duration::from_secs(30),
+    );
+    assert!(
+        delivery.contains("oci.manifest.published") && delivery.contains("ops-main"),
+        "delivery log must name the event type and target id only: {delivery}"
+    );
+
+    // Digest mismatch: the valid manifest body under a wrong digest URL is
+    // rejected with DIGEST_INVALID; no second delivery attempt.
+    let mismatch = client
+        .put(format!("{base}/{REPO}/manifests/sha256:{}", "0".repeat(64)))
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest.clone())
+        .send()
+        .expect("digest mismatch put");
+    assert_eq!(
+        mismatch.status().as_u16(),
+        400,
+        "digest mismatch must be rejected"
+    );
+    let mismatch_body = mismatch.text().expect("mismatch body");
+    assert!(
+        mismatch_body.contains("DIGEST_INVALID"),
+        "rejection must be the digest comparison, not shape validation: {mismatch_body}"
+    );
+
+    // SIGINT -> cleanup tail receipt -> exit 0. The receipt must be observed
+    // in a bounded window BEFORE the exit code is asserted (WH-13 ordering:
+    // the exit code alone is not evidence the cleanup tail ran).
+    let pid = service.child.id() as libc::pid_t;
+    // SAFETY: SIGINT to a child we own; WH-13 routes it to the async layer.
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+    let receipt = wh04_wait_log_line(
+        &stdout_path,
+        &stderr_path,
+        "storage_events_shutdown_complete",
+        Duration::from_secs(60),
+    );
+    assert!(
+        !receipt.contains("http") && !receipt.contains("vault://"),
+        "receipt must carry category fields only: {receipt}"
+    );
+    let status = service
+        .wait_for_exit(Duration::from_secs(60))
+        .expect("service must exit after the shutdown receipt");
+    assert!(
+        status.success(),
+        "service must exit 0 after graceful shutdown: {status}\nstdout:\n{}\nstderr:\n{}",
+        read_log(&stdout_path),
+        read_log(&stderr_path),
+    );
+    let captured = format!("{}\n{}", read_log(&stdout_path), read_log(&stderr_path));
+    let delivery_lines = captured
+        .lines()
+        .filter(|line| line.contains("storage_events delivery") && line.contains("category="))
+        .count();
+    assert_eq!(
+        delivery_lines, 1,
+        "exactly one emitter delivery after drain (mismatch emits none):\n{captured}"
+    );
+    assert!(
+        !captured.contains(WH04_HMAC_VALUE)
+            && !captured.contains(WH04_SENTINEL_PAYLOAD)
+            && !captured.contains(WH04_SECRET_REF),
+        "captured logs must not contain the secret or the SecretRef URI:\n{captured}"
+    );
+}
+
+const WH04_HMAC_VALUE: &str =
+    "hex:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+const WH04_SENTINEL_PAYLOAD: &str =
+    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+const WH04_SECRET_REF: &str = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value";
+
+const STORAGE_EVENTS_APPEND: &str = r#"
+[storage_events]
+enabled = true
+installation_id = "it-wh04-process"
+
+[[storage_events.targets]]
+id = "ops-main"
+url = "https://events.example.invalid/ingest"
+secret_ref = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+events = ["oci.manifest.published"]
+oci_repositories = ["team/image"]
+"#;
+
+/// Seed the target HMAC secret through the real `config secret set` CLI flow
+/// into the same vault the service resolves from (shared MEGA_BASE_DIR + DB).
+fn wh04_seed_target_secret(env: &OciEnv) {
+    let bootstrap_path = env.temp_dir.path().join("wh04-bootstrap-config.toml");
+    fs::write(
+        &bootstrap_path,
+        format!(
+            r#"
+            [database]
+            db_type = "postgres"
+            db_url = "{}"
+            max_connection = 4
+            min_connection = 1
+            acquire_timeout = 5
+            connect_timeout = 5
+            sqlx_logging = false
+            "#,
+            env.database.db_url
+        ),
+    )
+    .expect("write bootstrap config");
+
+    let mut command = isolated_command(env.temp_dir.path(), &env.base_dir, &env.cache_dir);
+    command
+        .arg("--config")
+        .arg(&bootstrap_path)
+        .env("MEGA_LOG__PRINT_STD", "false")
+        .env("MEGA_LOG__WITH_ANSI", "false");
+    command.args([
+        "config",
+        "secret",
+        "set",
+        "storage_events.targets.ops-main.secret_ref",
+        "--vault-path",
+        "config/it/storage_events/targets/ops-main/hmac",
+        "--field",
+        "value",
+        "--value-stdin",
+    ]);
+    let (out_path, err_path) = (
+        env.temp_dir.path().join("wh04-seed.out"),
+        env.temp_dir.path().join("wh04-seed.err"),
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(
+            fs::File::create(&out_path).expect("seed stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&err_path).expect("seed stderr"),
+        ));
+    let mut child = command.spawn().expect("spawn config secret set");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(WH04_HMAC_VALUE.as_bytes())
+        .expect("write stdin");
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll secret set") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "config secret set did not finish within the bound:\nstdout:\n{}\nstderr:\n{}",
+            read_log(&out_path),
+            read_log(&err_path),
+        );
+        sleep(Duration::from_millis(100));
+    };
+    assert!(
+        status.success(),
+        "config secret set must succeed: {status}\nstdout:\n{}\nstderr:\n{}",
+        read_log(&out_path),
+        read_log(&err_path),
+    );
+}
+
+/// Bounded wait for a log line across both captured streams.
+fn wh04_wait_log_line(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let combined = format!("{}\n{}", read_log(stdout_path), read_log(stderr_path));
+        if let Some(line) = combined.lines().find(|line| line.contains(needle)) {
+            return line.to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`{needle}` not observed within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+            read_log(stdout_path),
+            read_log(stderr_path),
+        );
+        sleep(Duration::from_millis(100));
+    }
+}

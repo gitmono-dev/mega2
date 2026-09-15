@@ -2,7 +2,7 @@
 
 本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11/WH-03）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；WH-03 已挂上 Git B3 真实 `n>0` push 的 `repo.push` 出站（协议与产品 API 写共用提交点），其余来源 hook（WH-04..08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-11/WH-03/WH-04）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；WH-03 挂上 Git B3 真实 `n>0` push 的 `repo.push`（协议与产品 API 写共用提交点），WH-04 挂上 OCI manifest 发布的 `oci.manifest.published`；LFS/Agent 来源 hook（WH-05..08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -45,6 +45,10 @@ CLI 接线已由 WH-13 交付：长运行 service（`http` / `ssh` / `multi`）�
 ## 来源适配：`repo.push`（WH-03，已交付）
 
 Git B3 真实 `n>0` push 的 `txn.commit()` 成功后、C-segment 前发一次 `repo.push`：scope 只填 canonical `repo_path`，data 为 `push_id,operation_id,ref_name,old_oid,requested_oid,landed_oid`。event_id 按冻结规则派生（`sha256("repo.push\0"+installation_id+"\0"+repo_path+"\0"+operation_id+"\0"+landed_commit_id)` 前 16 字节、UUID v5 布局），同输入稳定、跨安装/仓库/操作/落地 commit 区分；队列 i64 id 不参与身份。协议 receive-pack 与产品 API 写（`land_api_tip_push`）共用同一提交点。净零轮次（`n=0`）、Done replay、attach/merge、CAS/fencing 失败与回滚均不发。投递失败不改变已提交结果。覆盖边界：B3 提交语义见 [`trunk-push.md`](trunk-push.md) 阶段 7。
+
+## 来源适配：`oci.manifest.published`（WH-04，已交付）
+
+OCI manifest 发布在对象 + manifest DB 行 + 可选 tag upsert 全成功后发一次 `oci.manifest.published`：scope 只填 `oci_repository`，data 为 `digest,reference,media_type,size`，`event_id` 为 UUID v4。发布失败、chunk/blob/mount、digest/tag/超限拒绝均不发；重复 PUT 可重复通知；投递失败不改变已提交的发布。详情与崩溃窗口见 [`oci.md`](oci.md)「发布出站事件」。
 
 ## 事件投影与过滤（WH-10）
 
