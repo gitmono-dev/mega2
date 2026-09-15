@@ -3,7 +3,19 @@
 //! This module is not injected into AppContext yet (WH-11). Production
 //! construction has no HTTP or private-IP escape switch.
 
-use std::{fmt, future::Future, pin::Pin, time::Duration};
+#[cfg(test)]
+use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    fmt,
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
+    time::Duration,
+};
+
+#[cfg(test)]
+type TestHostResolver = Arc<dyn Fn(&str, u16) -> Vec<IpAddr> + Send + Sync>;
 
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -101,44 +113,79 @@ pub trait EventTransport: Send + Sync {
 }
 
 pub struct HttpsEventTransport {
-    client: reqwest::Client,
+    connect_timeout: Duration,
+    request_timeout: Duration,
     #[cfg(test)]
     timestamp_override: Option<u64>,
+    #[cfg(test)]
+    injected_client: Option<reqwest::Client>,
+    #[cfg(test)]
+    extra_root: Option<reqwest::Certificate>,
+    #[cfg(test)]
+    test_resolver: Option<TestHostResolver>,
+    #[cfg(test)]
+    pin_override: Option<SocketAddr>,
 }
 
 impl HttpsEventTransport {
     pub fn new(connect_timeout: Duration, request_timeout: Duration) -> Result<Self, MegaError> {
-        let client = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .connect_timeout(connect_timeout)
-            .timeout(request_timeout)
-            .build()
-            .map_err(|_| {
-                MegaError::Other("storage_events transport client failed to build".to_string())
-            })?;
         Ok(Self {
-            client,
+            connect_timeout,
+            request_timeout,
             #[cfg(test)]
             timestamp_override: None,
+            #[cfg(test)]
+            injected_client: None,
+            #[cfg(test)]
+            extra_root: None,
+            #[cfg(test)]
+            test_resolver: None,
+            #[cfg(test)]
+            pin_override: None,
         })
     }
 
     #[cfg(test)]
     fn new_for_tests(client: reqwest::Client, timestamp_override: Option<u64>) -> Self {
         Self {
-            client,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
             timestamp_override,
+            injected_client: Some(client),
+            extra_root: None,
+            test_resolver: None,
+            pin_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_pinned_for_tests(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        extra_root: reqwest::Certificate,
+        resolver: TestHostResolver,
+        pin_override: SocketAddr,
+        timestamp_override: Option<u64>,
+    ) -> Self {
+        Self {
+            connect_timeout,
+            request_timeout,
+            timestamp_override,
+            injected_client: None,
+            extra_root: Some(extra_root),
+            test_resolver: Some(resolver),
+            pin_override: Some(pin_override),
         }
     }
 }
 
 impl EventTransport for HttpsEventTransport {
     fn post(&self, target: &EventTarget, body: Bytes) -> TransportFutureInner {
-        let client = self.client.clone();
         let url = target.url.clone();
         let target_id = target.id.clone();
         let hmac_key = target.hmac_key.clone();
+        let connect_timeout = self.connect_timeout;
+        let request_timeout = self.request_timeout;
         let timestamp = {
             #[cfg(test)]
             {
@@ -150,10 +197,61 @@ impl EventTransport for HttpsEventTransport {
                 chrono::Utc::now().timestamp().max(0) as u64
             }
         };
+        #[cfg(test)]
+        let injected_client = self.injected_client.clone();
+        #[cfg(test)]
+        let extra_root = self.extra_root.clone();
+        #[cfg(test)]
+        let test_resolver = self.test_resolver.clone();
+        #[cfg(test)]
+        let pin_override = self.pin_override;
         Box::pin(async move {
             let event_id = envelope_string_field(&body, "event_id").unwrap_or_default();
             let event_type = envelope_string_field(&body, "event_type").unwrap_or_default();
             let signature = sign_body(&hmac_key, timestamp, &body);
+            let client = {
+                #[cfg(test)]
+                if let Some(client) = injected_client {
+                    client
+                } else {
+                    match pin_client_for_url(
+                        &url,
+                        connect_timeout,
+                        request_timeout,
+                        extra_root,
+                        test_resolver.as_ref(),
+                        pin_override,
+                    )
+                    .await
+                    {
+                        Ok(client) => client,
+                        Err(err) => {
+                            tracing::info!(
+                                target_id = %target_id,
+                                event_type = event_type.as_str(),
+                                outcome = err.category(),
+                                "storage_events delivery"
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    match pin_client_for_url(&url, connect_timeout, request_timeout).await {
+                        Ok(client) => client,
+                        Err(err) => {
+                            tracing::info!(
+                                target_id = %target_id,
+                                event_type = event_type.as_str(),
+                                outcome = err.category(),
+                                "storage_events delivery"
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+            };
             let result = client
                 .post(url)
                 .header("Content-Type", "application/json")
@@ -255,6 +353,146 @@ fn classify_reqwest_error(err: &reqwest::Error) -> TransportError {
     TransportError::Connect
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AddressClass {
+    Public,
+    Loopback,
+    Private,
+    LinkLocal,
+    Metadata,
+    OtherRestricted,
+}
+
+pub fn classify_ip(ip: IpAddr) -> AddressClass {
+    if is_metadata_ip(ip) {
+        return AddressClass::Metadata;
+    }
+    match ip {
+        IpAddr::V4(v4) => classify_ipv4(v4),
+        IpAddr::V6(v6) => classify_ipv6(v6),
+    }
+}
+
+fn classify_ipv4(ip: Ipv4Addr) -> AddressClass {
+    if ip.is_loopback() {
+        AddressClass::Loopback
+    } else if ip.is_private() {
+        AddressClass::Private
+    } else if ip.is_link_local() {
+        AddressClass::LinkLocal
+    } else if ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.octets()[0] == 0
+        || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        || (ip.octets()[0] == 198 && (18..=19).contains(&ip.octets()[1]))
+    {
+        AddressClass::OtherRestricted
+    } else {
+        AddressClass::Public
+    }
+}
+
+fn classify_ipv6(ip: Ipv6Addr) -> AddressClass {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return classify_ip(IpAddr::V4(v4));
+    }
+    if ip.is_loopback() {
+        AddressClass::Loopback
+    } else if ip.is_unique_local() {
+        AddressClass::Private
+    } else if ip.is_unicast_link_local() {
+        AddressClass::LinkLocal
+    } else if ip.is_unspecified() || ip.is_multicast() {
+        AddressClass::OtherRestricted
+    } else {
+        AddressClass::Public
+    }
+}
+
+fn is_metadata_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4 == Ipv4Addr::new(169, 254, 169, 254),
+        IpAddr::V6(v6) => v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    }
+}
+
+pub fn pin_resolved_addresses(addrs: &[IpAddr]) -> Result<IpAddr, TransportError> {
+    if addrs.is_empty() {
+        return Err(TransportError::Resolve);
+    }
+    let classes: BTreeSet<AddressClass> = addrs.iter().copied().map(classify_ip).collect();
+    if classes.len() != 1 || !classes.contains(&AddressClass::Public) {
+        return Err(TransportError::Resolve);
+    }
+    Ok(addrs[0])
+}
+
+async fn pin_client_for_url(
+    url: &Url,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    #[cfg(test)] extra_root: Option<reqwest::Certificate>,
+    #[cfg(test)] test_resolver: Option<&TestHostResolver>,
+    #[cfg(test)] pin_override: Option<SocketAddr>,
+) -> Result<reqwest::Client, TransportError> {
+    let host = url.host_str().ok_or(TransportError::Resolve)?;
+    let port = url.port_or_known_default().ok_or(TransportError::Resolve)?;
+    let ips = match url.host() {
+        Some(url::Host::Ipv4(ip)) => vec![IpAddr::V4(ip)],
+        Some(url::Host::Ipv6(ip)) => vec![IpAddr::V6(ip)],
+        Some(url::Host::Domain(domain)) => {
+            #[cfg(test)]
+            if let Some(resolver) = test_resolver {
+                resolver(domain, port)
+            } else {
+                lookup_ips_with_timeout(domain, port, request_timeout).await?
+            }
+            #[cfg(not(test))]
+            {
+                lookup_ips_with_timeout(domain, port, request_timeout).await?
+            }
+        }
+        None => return Err(TransportError::Resolve),
+    };
+    let chosen = pin_resolved_addresses(&ips)?;
+    let pinned = {
+        #[cfg(test)]
+        {
+            pin_override.unwrap_or(SocketAddr::new(chosen, port))
+        }
+        #[cfg(not(test))]
+        {
+            SocketAddr::new(chosen, port)
+        }
+    };
+    let builder = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .resolve(host, pinned);
+    #[cfg(test)]
+    let builder = match extra_root {
+        Some(cert) => builder.add_root_certificate(cert),
+        None => builder,
+    };
+    builder.build().map_err(|_| TransportError::Connect)
+}
+
+async fn lookup_ips_with_timeout(
+    host: &str,
+    port: u16,
+    request_timeout: Duration,
+) -> Result<Vec<IpAddr>, TransportError> {
+    let lookup = tokio::time::timeout(request_timeout, tokio::net::lookup_host((host, port))).await;
+    match lookup {
+        Ok(Ok(addrs)) => Ok(addrs.map(|addr| addr.ip()).collect()),
+        Ok(Err(_)) => Err(TransportError::Resolve),
+        Err(_) => Err(TransportError::Timeout),
+    }
+}
+
 fn envelope_string_field(body: &[u8], field: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     value
@@ -335,6 +573,7 @@ mod tests {
         let san = SubjectAlternativeName::new()
             .ip("127.0.0.1")
             .dns("localhost")
+            .dns("events.example.test")
             .build(&builder.x509v3_context(None, None))
             .expect("san");
         builder.append_extension(san).expect("append san");
@@ -693,5 +932,142 @@ mod tests {
         let outcome = runtime().block_on(transport.post(&target, Bytes::from_static(GOLDEN_BODY)));
         assert_eq!(outcome, Err(TransportError::Timeout));
         assert!(!format!("{outcome:?}").contains(&collector.addr));
+    }
+
+    #[test]
+    fn validated_address_policy() {
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            AddressClass::Public
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            AddressClass::Loopback
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            AddressClass::Loopback
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            AddressClass::Private
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            AddressClass::Private
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))),
+            AddressClass::Private
+        );
+        assert_eq!(
+            classify_ip("fd12::1".parse().expect("ula")),
+            AddressClass::Private
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))),
+            AddressClass::LinkLocal
+        );
+        assert_eq!(
+            classify_ip("fe80::1".parse().expect("ll")),
+            AddressClass::LinkLocal
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
+            AddressClass::Metadata
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped())),
+            AddressClass::Loopback
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V6(Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped())),
+            AddressClass::Private
+        );
+        assert_eq!(
+            classify_ip(IpAddr::V6(
+                Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped()
+            )),
+            AddressClass::Metadata
+        );
+        assert_eq!(
+            pin_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]).expect("public"),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
+        );
+        assert_eq!(
+            pin_resolved_addresses(&[IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            Err(TransportError::Resolve)
+        );
+        assert_eq!(
+            pin_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]),
+            Err(TransportError::Resolve)
+        );
+        assert_eq!(
+            pin_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))]),
+            Err(TransportError::Resolve)
+        );
+        assert_eq!(
+            pin_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))]),
+            Err(TransportError::Resolve)
+        );
+        assert_eq!(
+            pin_resolved_addresses(&[
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            ]),
+            Err(TransportError::Resolve)
+        );
+    }
+
+    #[test]
+    fn dns_rebind_and_ip_classes() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookups_clone = Arc::clone(&lookups);
+        let resolver: TestHostResolver = Arc::new(move |host, _| {
+            lookups_clone.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(host, "events.example.test");
+            if lookups_clone.load(Ordering::SeqCst) == 1 {
+                vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]
+            } else {
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]
+            }
+        });
+        let collector = spawn_tls_collector(|_| (200, Vec::new(), None));
+        let pin: SocketAddr = collector.addr.parse().expect("collector addr");
+        let cert = reqwest::Certificate::from_der(&collector.cert_der).expect("ca");
+        let transport = HttpsEventTransport::new_pinned_for_tests(
+            StdDuration::from_secs(2),
+            StdDuration::from_secs(5),
+            cert,
+            resolver,
+            pin,
+            Some(GOLDEN_TIMESTAMP),
+        );
+        let target = EventTarget::compile(
+            "ops-main",
+            &format!("https://events.example.test:{}/ingest", pin.port()),
+            &test_hmac_secret(),
+        )
+        .expect("target");
+        let outcome = runtime().block_on(transport.post(&target, Bytes::from_static(GOLDEN_BODY)));
+        assert_eq!(outcome, Ok(TransportSuccess::Accepted2xx { status: 200 }));
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+        let mixed: TestHostResolver = Arc::new(|_, _| {
+            vec![
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            ]
+        });
+        let transport = HttpsEventTransport::new_pinned_for_tests(
+            StdDuration::from_secs(2),
+            StdDuration::from_secs(5),
+            reqwest::Certificate::from_der(&collector.cert_der).expect("ca"),
+            mixed,
+            pin,
+            Some(GOLDEN_TIMESTAMP),
+        );
+        let outcome = runtime().block_on(transport.post(&target, Bytes::from_static(GOLDEN_BODY)));
+        assert_eq!(outcome, Err(TransportError::Resolve));
     }
 }

@@ -137,7 +137,10 @@ even when the table is disabled. HMAC secrets use `hex:<even-hex>` after
 Vault resolution (WH-11); this card does not resolve `secret_ref`.
 
 The HTTPS HMAC transport exists as a library component and is **not**
-wired into AppContext yet. See [`storage-events.md`](./storage-events.md).
+wired into AppContext yet. Each POST resolves DNS once, rejects
+loopback/private/link-local/metadata/mixed results, pins the connection to
+that verified address, and keeps the original hostname for TLS SNI. See
+[`storage-events.md`](./storage-events.md).
 
 ## Test configuration
 

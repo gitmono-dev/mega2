@@ -28,7 +28,11 @@
 - `X-Mega2-Timestamp`（UTC Unix 秒）
 - `X-Mega2-Signature: sha256=<hex>`
 
-HMAC-SHA256 输入为 `timestamp` 十进制秒、`.`、实际发送 body bytes。密钥必须是已解析 `SecretString` 的 `hex:<even-hex>`，解码后 32..=256 bytes。生产客户端没有 HTTP/私网逃逸开关；DNS 地址钉扎由 WH-12 承接。日志只记 target id / event type / 结果类别，不含 URL、secret、请求响应体或 reqwest 原文。
+HMAC-SHA256 输入为 `timestamp` 十进制秒、`.`、实际发送 body bytes。密钥必须是已解析 `SecretString` 的 `hex:<even-hex>`，解码后 32..=256 bytes。生产客户端没有 HTTP/私网逃逸开关。日志只记 target id / event type / 结果类别，不含 URL、secret、请求响应体或 reqwest 原文。
+
+## 地址策略（WH-12）
+
+每次 POST 只解析一次 DNS。解析结果必须全部为公共地址：loopback、RFC1918 私网、link-local、metadata（`169.254.169.254` / `fd00:ec2::254`）以及混合公共+受限结果一律拒绝。连接钉扎到本轮已验证的 IP，TLS SNI / hostname 仍使用原域名，发送时不再解析。生产路径没有把公共 IP 映射到本机的开关；测试用注入 resolver/pin。
 
 `config/config.toml` 只保留注释块。`config/config-storage-only.toml` 写 `[storage_events] enabled = false` 占位，**禁止**提交可用 HMAC secret。
 
