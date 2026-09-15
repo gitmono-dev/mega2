@@ -345,6 +345,16 @@ impl Storage {
         self.entity_store = store;
     }
 
+    /// Install the single application storage-event emitter owner (WH-11).
+    /// Called once by `AppContext` during bootstrap after the target secrets
+    /// have been resolved; the default constructed state is disabled.
+    pub fn set_storage_event_emitter(
+        &mut self,
+        emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+    ) {
+        self.storage_event_emitter = emitter;
+    }
+
     /// The server-signing vault handle (MC-09), if wired in by `AppContext`.
     pub fn vault(&self) -> Option<&VaultCore> {
         self.vault.as_ref()

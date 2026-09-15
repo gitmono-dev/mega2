@@ -154,3 +154,5 @@ N/A：未新增用户可见的 `MegaError` 枚举变体。`/api/v1/agent-capture
 ## plan-20260912（storage-only 提交后出站事件）
 
 N/A：未新增用户可见的 `MegaError` 枚举变体。`[storage_events]` 配置/启动错误复用 `MegaError::Other`（review 形态启用、缺 `installation_id`、重复 target id、非法 id、非 HTTPS URL、timeout 越界、HMAC 编码非法、未知 event 字面量、过滤集合超限、非 canonical path、agent 过滤不成对）。投影超 16 KiB 或非法 metadata 记为丢弃，不得映射回已提交写入的 HTTP 状态。
+
+WH-11 启动 secret 绑定沿用同一错误类：target `secret_ref` 的 SecretRef 形状/命名空间（`vault://secret/config/<profile>/storage_events/targets/<id>/hmac#<field>`）错误在 `config validate` 与服务启动两处均失败；启用时 vault 解析失败（secret/字段缺失、字段非字符串）或 `hex:<even-hex>` 编码非法同样使启动失败。脱敏保证：错误文本不含 SecretRef URI（resolver 错误固定为 `vault://secret/***#***`），绝不含解密值；诊断只命名字段路径（如 `storage_events.targets[0].secret_ref`）与要求的命名空间模板。

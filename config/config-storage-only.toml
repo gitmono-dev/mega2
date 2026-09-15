@@ -366,7 +366,14 @@ enabled = false
 
 # Storage-only committed-write outbound events (plan-20260912). Disabled
 # placeholder: do not enable in this tracked file. Enabling requires
-# installation_id plus SecretRef HMAC targets; later cards bind transport.
+# installation_id plus SecretRef HMAC targets; startup (WH-11) resolves the
+# secrets from the vault and binds the HTTPS transport (restart-required;
+# disabled never resolves). Seed each target's hex:<even-hex> HMAC value by
+# piping it on stdin (--value-stdin is the only value channel):
+#   printf '%s' "$STORAGE_EVENTS_HMAC" | monoengine --config config/config.toml \
+#     config secret set storage_events.targets.<id>.secret_ref \
+#     --vault-path config/<profile>/storage_events/targets/<id>/hmac \
+#     --field value --value-stdin
 [storage_events]
 enabled = false
 # installation_id = "prod-primary-01"

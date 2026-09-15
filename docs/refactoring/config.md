@@ -133,13 +133,39 @@ are not resolved while disabled.
 
 Target `url` values must be HTTPS without userinfo, query, or fragment.
 `connect_timeout_seconds` is 1..=5 and `request_timeout_seconds` is 1..=10
-even when the table is disabled. HMAC secrets use `hex:<even-hex>` after
-Vault resolution (WH-11); this card does not resolve `secret_ref`.
+even when the table is disabled.
 
-The HTTPS HMAC transport exists as a library component and is **not**
-wired into AppContext yet. Each POST resolves DNS once, rejects
-loopback/private/link-local/metadata/mixed results, pins the connection to
-that verified address, and keeps the original hostname for TLS SNI.
+Every target `secret_ref` must use the namespace
+`vault://secret/config/<profile>/storage_events/targets/<id>/hmac#<field>`,
+where `<id>` is the target's own `id`; `config validate` enforces the shape
+and namespace in both enabled and disabled modes (string-level only — it
+never resolves). When enabled, service startup (WH-11) resolves each ref
+through the vault and compiles the HMAC key: the resolved value must be
+`hex:<even-hex>` decoding to 32..=256 bytes. Any resolution or encoding
+failure fails startup with a redacted error; the resolved value is never
+written back into the config snapshot or logged, and the SecretRef URI
+stays out of error text. Secrets are seeded/rotated by piping the
+`hex:<even-hex>` value on stdin (`--value-stdin` is required and is the only
+way to supply the value), e.g.:
+
+```bash
+printf '%s' "$STORAGE_EVENTS_HMAC" | monoengine --config config/config.toml \
+  config secret set storage_events.targets.ops-main.secret_ref \
+  --vault-path config/prod/storage_events/targets/ops-main/hmac \
+  --field value --value-stdin
+```
+
+Rotation uses `config secret rotate` with the same arguments and requires a
+service restart (no hot reload of `[storage_events]`).
+
+The HTTPS HMAC transport is wired into `AppContext` at startup (WH-11): on
+enabled configs the resolved targets plus an `HttpsEventTransport` become the
+single application emitter owner on `Storage`; on disabled configs nothing
+is resolved and the emitter stays disabled. Each POST resolves DNS once,
+rejects loopback/private/link-local/metadata/mixed results, pins the
+connection to that verified address, and keeps the original hostname for TLS
+SNI. Business source hooks are delivered by later cards (WH-03..08), so no
+events are emitted yet even when enabled.
 
 Target `events` must be unique literals from the six frozen types. Filter
 arrays are 0..=64 items of 1..=256 bytes; Git/LFS/Agent path items must be

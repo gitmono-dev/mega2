@@ -715,7 +715,7 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
     }
 
     let mut seen_ids = std::collections::BTreeSet::new();
-    for target in &events.targets {
+    for (index, target) in events.targets.iter().enumerate() {
         if !is_storage_events_ascii_id(&target.id, 1, 32) {
             return Err(MegaError::Other(
                 "[[storage_events.targets]] id must be 1..32 ASCII [A-Za-z0-9_-]".to_string(),
@@ -751,6 +751,17 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
             }
         }
         validate_storage_events_target_url(&target.url)?;
+        // WH-11: the SecretRef shape and the per-target namespace are enforced
+        // in both enabled and disabled modes (string-level only; vault
+        // resolution happens at service startup). The ref value is never
+        // printed: both helpers redact it.
+        let secret_field = format!("storage_events.targets[{index}].secret_ref");
+        let secret_ref = parse_secret_ref_for_field(&secret_field, &target.secret_ref)?;
+        validate_config_secret_ref(
+            &secret_field,
+            &secret_ref,
+            &format!("storage_events/targets/{}/hmac", target.id),
+        )?;
         validate_storage_events_filter_list("git_paths", &target.git_paths, true)?;
         validate_storage_events_filter_list("lfs_paths", &target.lfs_paths, true)?;
         validate_storage_events_filter_list("agent_repo_paths", &target.agent_repo_paths, true)?;
@@ -1058,7 +1069,10 @@ fn validate_object_storage_secret_ref(
 
 /// Parse a `vault://` SecretRef and prefix parse failures with `field_path` so
 /// `config validate` diagnostics name the offending setting (e.g. `redis.url`).
-fn parse_secret_ref_for_field(field_path: &str, value: &str) -> Result<SecretRef, MegaError> {
+pub(crate) fn parse_secret_ref_for_field(
+    field_path: &str,
+    value: &str,
+) -> Result<SecretRef, MegaError> {
     SecretRef::parse(value).map_err(|err| match err {
         MegaError::Other(msg) => MegaError::Other(format!("{field_path}: {msg}")),
         other => other,
@@ -3667,6 +3681,8 @@ mod tests {
             .map(|i| {
                 let mut target = sample_target();
                 target.id = format!("t{i}");
+                target.secret_ref =
+                    format!("vault://secret/config/example/storage_events/targets/t{i}/hmac#value");
                 target
             })
             .collect();
@@ -3677,5 +3693,85 @@ mod tests {
         config.storage_events.max_in_flight = 0;
         let err = config.validate().expect_err("max_in_flight");
         assert!(err.to_string().contains("max_in_flight"), "{err}");
+    }
+
+    /// WH-11: SecretRef shape + per-target namespace are enforced in both
+    /// enabled and disabled modes (string-level only, no vault resolution),
+    /// and diagnostics/Debug never carry the ref URI or secret material.
+    #[test]
+    fn storage_events_secret_redaction() {
+        const VALID_REF: &str =
+            "vault://secret/config/example/storage_events/targets/ops-main/hmac#value";
+        let secret_material = "hex:deadbeef";
+
+        // The canonical namespace passes in both modes.
+        let mut disabled = valid_config();
+        disabled.storage_events.targets = vec![sample_target()];
+        disabled
+            .validate()
+            .expect("disabled mode accepts the canonical namespace");
+        let mut enabled = storage_only_none();
+        enabled.storage_events.enabled = true;
+        enabled.storage_events.installation_id = Some("prod-primary-01".to_string());
+        enabled.storage_events.targets = vec![sample_target()];
+        enabled
+            .validate()
+            .expect("enabled mode accepts the canonical namespace");
+
+        let parsed = SecretRef::parse(VALID_REF).expect("canonical ref parses");
+        assert_eq!(
+            format!("{parsed:?}"),
+            "SecretRef(\"vault://secret/***#***\")"
+        );
+        assert_eq!(parsed.to_string(), "vault://secret/***#***");
+
+        for (label, bad_ref) in [
+            (
+                "wrong prefix",
+                "vault://secret/prod/storage_events/targets/ops-main/hmac#value",
+            ),
+            (
+                "wrong path segment",
+                "vault://secret/config/example/storage_events/targets/other/hmac#value",
+            ),
+            (
+                "extra profile segments",
+                "vault://secret/config/a/b/storage_events/targets/ops-main/hmac#value",
+            ),
+            (
+                "missing #field",
+                "vault://secret/config/example/storage_events/targets/ops-main/hmac",
+            ),
+        ] {
+            for (mode_label, mut config) in [
+                ("disabled", valid_config()),
+                ("enabled", {
+                    let mut config = storage_only_none();
+                    config.storage_events.enabled = true;
+                    config.storage_events.installation_id = Some("prod-primary-01".to_string());
+                    config
+                }),
+            ] {
+                let mut target = sample_target();
+                target.secret_ref = bad_ref.to_string();
+                config.storage_events.targets = vec![target];
+                let err = config
+                    .validate()
+                    .expect_err(&format!("{mode_label} mode must reject {label}"));
+                let message = err.to_string();
+                assert!(
+                    message.contains("secret_ref"),
+                    "{mode_label}/{label} must name the field: {message}"
+                );
+                assert!(
+                    !message.contains(bad_ref),
+                    "{mode_label}/{label} leaked the SecretRef URI: {message}"
+                );
+                assert!(
+                    !message.contains(secret_material),
+                    "{mode_label}/{label} leaked secret material: {message}"
+                );
+            }
+        }
     }
 }
