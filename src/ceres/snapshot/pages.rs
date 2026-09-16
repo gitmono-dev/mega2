@@ -5,8 +5,11 @@
 //! (`mst2_codec::metapage::Page::build`), so identical directory content
 //! yields identical page_ids across requests.
 
+use std::collections::HashMap;
+
 use base64::Engine;
 use mst2_codec::metapage::{Entry, EntryKind, Page, page_id};
+use sea_orm::ActiveValue::Set;
 use sha2::{Digest, Sha256};
 
 use crate::ceres::{
@@ -54,6 +57,28 @@ pub async fn build_directory_page<T: ApiHandler + ?Sized>(
     let tree = fetch_tree(handler, root_tree, rel_path).await?;
     let dirents = crate::ceres::snapshot::resolver::direct_entries(&tree)?;
 
+    // T03 write-through verification: consult verified records first, then
+    // fetch + hash the misses and persist them. A verification-record read
+    // failure degrades to recomputation (safe: strictly more verification).
+    let blob_oids: Vec<String> = dirents
+        .iter()
+        .filter(|(_, k, _)| *k != FsKind::Directory)
+        .map(|(_, _, oid)| oid.clone())
+        .collect();
+    let verified = match handler
+        .get_context()
+        .mono_storage()
+        .get_verified_blobs(blob_oids)
+        .await
+    {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(error = %e, "verified blob lookup failed; recomputing digests");
+            HashMap::new()
+        }
+    };
+
+    let mut new_verified: Vec<crate::callisto::mst2_verified_object::ActiveModel> = Vec::new();
     let mut entries = Vec::with_capacity(dirents.len());
     let mut codec_entries = Vec::with_capacity(dirents.len());
     for (name, fs_kind, oid) in dirents {
@@ -77,26 +102,56 @@ pub async fn build_directory_page<T: ApiHandler + ?Sized>(
                 });
             }
             FsKind::Regular | FsKind::Executable | FsKind::Symlink => {
-                let raw = fetch_raw_blob(handler, &oid).await?;
-                let mut h = Sha256::new();
-                h.update(&raw);
-                let digest: [u8; 32] = h.finalize().into();
+                let (size, digest) = if let Some(v) = verified.get(&oid) {
+                    // Verified record: 64-bit size + raw digest, no content read.
+                    let d: [u8; 32] = v.raw_sha256.clone().try_into().unwrap_or([0u8; 32]);
+                    (v.size as u64, d)
+                } else {
+                    let raw = fetch_raw_blob(handler, &oid).await?;
+                    let mut h = Sha256::new();
+                    h.update(&raw);
+                    let digest: [u8; 32] = h.finalize().into();
+                    new_verified.push(crate::callisto::mst2_verified_object::ActiveModel {
+                        id: sea_orm::ActiveValue::NotSet,
+                        storage_domain: Set("git".to_string()),
+                        git_oid: Set(oid.clone()),
+                        object_kind: Set("blob".to_string()),
+                        raw_sha256: Set(digest.to_vec()),
+                        size: Set(raw.len() as i64),
+                        verification_version: Set(1),
+                        state: Set("VERIFIED".to_string()),
+                        created_at: Set(chrono_now()),
+                    });
+                    (raw.len() as u64, digest)
+                };
                 let kind = match fs_kind {
                     FsKind::Regular => EntryKind::Regular,
                     FsKind::Executable => EntryKind::Executable,
                     FsKind::Symlink => EntryKind::Symlink,
                     FsKind::Directory => unreachable!("matched above"),
                 };
-                codec_entries.push(Entry::file(kind, name.as_bytes(), raw.len() as u64, digest));
+                codec_entries.push(Entry::file(kind, name.as_bytes(), size, digest));
                 entries.push(DirEntry {
                     name,
                     fs_kind,
                     oid,
-                    size: Some(raw.len() as u64),
+                    size: Some(size),
                     content_digest: Some(digest),
                     directory_root: None,
                 });
             }
+        }
+    }
+    if !new_verified.is_empty() {
+        // Records only ever describe already-fetched content; a persist
+        // failure loses an optimization, never correctness.
+        if let Err(e) = handler
+            .get_context()
+            .mono_storage()
+            .insert_verified_blobs(new_verified)
+            .await
+        {
+            tracing::warn!(error = %e, "verified blob persistence failed");
         }
     }
 
@@ -236,6 +291,16 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     hex(&h.finalize())
+}
+
+fn chrono_now() -> chrono::DateTime<chrono::FixedOffset> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+        .unwrap_or_default()
+        .with_timezone(&chrono::FixedOffset::east_opt(0).unwrap())
 }
 
 pub fn hex_of(id: &[u8; 32]) -> String {

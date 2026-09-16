@@ -26,6 +26,7 @@ use sea_orm::{
 use crate::{
     callisto::{
         mega_blob, mega_cl, mega_commit, mega_ref_tombstones, mega_refs, mega_tag, mega_tree,
+        mst2_verified_object,
     },
     common::{
         errors::MegaError,
@@ -1702,6 +1703,54 @@ impl MonoStorage {
             .unwrap())
     }
 
+    /// MST/2 verified blob records (spec 08 §2, T03): keyed by git oid.
+    pub async fn get_verified_blobs(
+        &self,
+        oids: Vec<String>,
+    ) -> Result<HashMap<String, mst2_verified_object::Model>, MegaError> {
+        if oids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = mst2_verified_object::Entity::find()
+            .filter(mst2_verified_object::Column::StorageDomain.eq("git"))
+            .filter(mst2_verified_object::Column::ObjectKind.eq("blob"))
+            .filter(mst2_verified_object::Column::GitOid.is_in(oids))
+            .all(self.get_connection())
+            .await?;
+        Ok(rows.into_iter().map(|m| (m.git_oid.clone(), m)).collect())
+    }
+
+    /// Write-through verification: rows are only written after the content
+    /// was fetched and hashed. Conflicts (concurrent verification of the same
+    /// oid) resolve to the existing row.
+    pub async fn insert_verified_blobs(
+        &self,
+        rows: Vec<mst2_verified_object::ActiveModel>,
+    ) -> Result<(), MegaError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        match mst2_verified_object::Entity::insert_many(rows)
+            .on_conflict(
+                OnConflict::columns([
+                    mst2_verified_object::Column::StorageDomain,
+                    mst2_verified_object::Column::GitOid,
+                    mst2_verified_object::Column::ObjectKind,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(self.get_connection())
+            .await
+        {
+            // ON CONFLICT DO NOTHING returns RecordNotInserted when every
+            // row was a duplicate; that is the intended first-write-wins
+            // outcome (same convention as next_insert_retry).
+            Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn get_tag_by_name(&self, name: &str) -> Result<Option<mega_tag::Model>, MegaError> {
         let res = mega_tag::Entity::find()
             .filter(mega_tag::Column::TagName.eq(name.to_string()))
@@ -2957,5 +3006,94 @@ mod tests {
         );
         let child_row = mono.get_main_ref("/child").await.unwrap().unwrap();
         assert_eq!(child_row.ref_commit_hash, c_child.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn mst2_verified_blob_roundtrip_and_idempotent_insert() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        let oid = "a".repeat(40);
+        let digest = vec![7u8; 32];
+
+        mono.insert_verified_blobs(vec![mst2_verified_object::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            storage_domain: Set("git".to_string()),
+            git_oid: Set(oid.clone()),
+            object_kind: Set("blob".to_string()),
+            raw_sha256: Set(digest.clone()),
+            size: Set(4_294_967_296), // > i32::MAX: the size64 gap this table closes
+            verification_version: Set(1),
+            state: Set("VERIFIED".to_string()),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+        }])
+        .await
+        .unwrap();
+
+        let map = mono
+            .get_verified_blobs(vec![oid.clone(), "b".repeat(40)])
+            .await
+            .unwrap();
+        let row = map.get(&oid).expect("verified row present");
+        assert_eq!(row.raw_sha256, digest);
+        assert_eq!(row.size, 4_294_967_296);
+        assert_eq!(row.state, "VERIFIED");
+        assert_eq!(map.len(), 1, "unknown oids are not invented");
+
+        // Idempotent re-insert (same natural key) must not duplicate rows.
+        mono.insert_verified_blobs(vec![mst2_verified_object::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            storage_domain: Set("git".to_string()),
+            git_oid: Set(oid.clone()),
+            object_kind: Set("blob".to_string()),
+            raw_sha256: Set(vec![9u8; 32]),
+            size: Set(1),
+            verification_version: Set(1),
+            state: Set("VERIFIED".to_string()),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+        }])
+        .await
+        .unwrap();
+        let map2 = mono.get_verified_blobs(vec![oid]).await.unwrap();
+        assert_eq!(map2.len(), 1);
+        assert_eq!(
+            map2.values().next().unwrap().raw_sha256,
+            digest,
+            "first-write-wins: the original verified fact is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn mst2_verified_blob_insert_real_error_is_not_swallowed() {
+        // The ON CONFLICT DO NOTHING sentinel (RecordNotInserted on an
+        // all-duplicate batch) is treated as idempotent success; a genuine
+        // database error must still surface, never be masked as Ok.
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        // Force a genuine DB-side error (not the duplicate sentinel):
+        // drop the ON CONFLICT target column so the statement itself fails.
+        use sea_orm::ConnectionTrait;
+        mono.get_connection()
+            .execute_unprepared("ALTER TABLE mst2_verified_object DROP COLUMN object_kind")
+            .await
+            .unwrap();
+        let res = mono
+            .insert_verified_blobs(vec![mst2_verified_object::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                storage_domain: Set("git".to_string()),
+                git_oid: Set("c".repeat(40)),
+                object_kind: Set("blob".to_string()),
+                raw_sha256: Set(vec![2u8; 32]),
+                size: Set(2),
+                verification_version: Set(1),
+                state: Set("VERIFIED".to_string()),
+                created_at: Set(chrono::Utc::now().fixed_offset()),
+            }])
+            .await;
+        assert!(
+            res.is_err(),
+            "a real DB error must propagate, not be swallowed by the ON CONFLICT sentinel match"
+        );
     }
 }
