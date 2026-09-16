@@ -37,7 +37,13 @@ pub const PKT_LINE_DELIMITER: &[u8; 4] = b"0001";
 
 // see https://git-scm.com/docs/protocol-capabilities
 // Only advertise capabilities that are parsed, acted on, and covered by tests.
-const RECEIVE_CAP_LIST: &str = "report-status delete-refs ";
+// `no-thin` tells clients not to send thin packs (packs whose ref-delta bases
+// are outside the pack). Our pack decoder fails closed on unresolved external
+// bases (git-internal decode: "Pack references bases that are not in the
+// pack"), so without advertising no-thin, any client that delta-compresses
+// against server-known objects breaks receive-pack (defect RCV-01). Upstream
+// Mega advertises no-thin for the same reason.
+const RECEIVE_CAP_LIST: &str = "report-status delete-refs no-thin ";
 
 const MONOREPO_TAG_NG: &str =
     "tag pushes are not supported on monorepo; manage tags through the tag API";
@@ -1288,10 +1294,10 @@ pub mod test {
         assert!(tokens.contains(&"ofs-delta"));
         assert!(tokens.contains(&"agent=mega/0.1.0"));
         assert!(tokens.contains(&"delete-refs"));
+        assert!(tokens.contains(&"no-thin"));
         assert!(!tokens.contains(&"report-status-v2"));
         assert!(!tokens.contains(&"quiet"));
         assert!(!tokens.contains(&"atomic"));
-        assert!(!tokens.contains(&"no-thin"));
     }
 
     #[test]

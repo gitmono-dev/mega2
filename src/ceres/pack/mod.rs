@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt, future::join_all};
+use futures::{FutureExt, Stream, TryStreamExt, future::join_all};
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash},
@@ -361,7 +361,28 @@ pub trait RepoHandler: Send + Sync + 'static {
             Some(pack_config.pack_decode_cache_path.clone()),
             pack_config.clean_cache_after_decode,
         );
-        p.decode_stream(stream, sender, Some(pack_id_sender)).await;
+        // The decoder fails closed on thin/malformed packs, and decode_stream
+        // surfaces that failure as a panic (it unwraps the decode result
+        // internally). Convert it to a typed protocol error so a bad pack
+        // fails the push through the normal report-status path instead of
+        // killing the worker thread and dropping the connection (RCV-01).
+        let decode_result =
+            std::panic::AssertUnwindSafe(p.decode_stream(stream, sender, Some(pack_id_sender)))
+                .catch_unwind()
+                .await
+                .map_err(|panic_payload| {
+                    let detail = panic_payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic_payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "pack decoder panicked".to_string());
+                    tracing::error!(
+                        detail = %detail,
+                        "pack decode failed; rejecting push with a typed error"
+                    );
+                    ProtocolError::InvalidInput(format!("pack decode failed: {detail}"))
+                })?;
+        let _decoded_pack = decode_result;
         Ok((receiver, pack_id_receiver))
     }
 
