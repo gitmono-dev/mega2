@@ -1,4 +1,4 @@
-//! Helpers for the FC-15 monoengine ↔ Libra FastCDC process gate.
+//! Helpers for the FC-15 mega2 ↔ Libra FastCDC process gate.
 //!
 //! Path-included only by `integration_fastcdc_libra.rs` so other black-box
 //! targets do not compile these symbols.
@@ -41,7 +41,7 @@ impl ReadyFile {
             lfs_url.ends_with("/info/lfs/"),
             "ready-file lfs_url must be <repo>.git/info/lfs/ with a trailing slash"
         );
-        let path = dir.join("monoengine-fastcdc-ready.json");
+        let path = dir.join("mega2-fastcdc-ready.json");
         let body = serde_json::json!({
             "lfs_url": lfs_url,
             "token": token,
@@ -99,8 +99,8 @@ pub fn require_libra_checkout() -> PathBuf {
         )
     });
     assert!(
-        src.contains("fn monoengine_fastcdc_http_interop"),
-        "LIBRA_DIR {} does not contain LB-01 test monoengine_fastcdc_http_interop",
+        src.contains("fn mega2_fastcdc_http_interop"),
+        "LIBRA_DIR {} does not contain LB-01 test mega2_fastcdc_http_interop",
         dir.display()
     );
 

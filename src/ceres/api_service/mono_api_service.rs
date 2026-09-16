@@ -10125,7 +10125,7 @@ mod tests {
             msg.contains("Squash 3 commits at /p16n3"),
             "signed squash keeps the subject after gpgsig: {msg}"
         );
-        assert!(msg.contains("This commit was created by monoengine"));
+        assert!(msg.contains("This commit was created by mega2"));
         assert!(msg.contains("Mono-Squash-Count: 3"));
         assert!(msg.contains(&format!("Mono-Squash-Range: {old_id}..{}", c3.id)));
         assert!(!msg.contains("Mono-Commits"));

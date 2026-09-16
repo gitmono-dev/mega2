@@ -28,8 +28,7 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -45,7 +44,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_git_ssh_{}_{}",
+            "mega2_git_ssh_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -54,7 +53,7 @@ impl TestDatabase {
         with_runtime(async {
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
                 )
             });
             execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -204,7 +203,7 @@ struct ServiceProcess {
 
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         let service = Self {
             child,
             reaped: false,
@@ -292,7 +291,7 @@ fn integration_git_ssh_service_lifecycle_isolated() {
     // but an explicit skip request must still fail the test.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
 
     // SSH service lifecycle allowlist markers (ADR-GM-06 / Deliverables).
@@ -356,7 +355,7 @@ fn integration_git_ssh_service_lifecycle_isolated() {
 fn integration_git_ssh_authenticated_clone() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -412,7 +411,7 @@ fn integration_git_ssh_authenticated_clone() {
     // known_hosts=case_port_only
     git_cli::write_known_hosts_via_keyscan(&known_hosts, port);
     let known_body = fs::read_to_string(&known_hosts).expect("read known_hosts");
-    let known_host = git_cli::monoengine_reachable_host();
+    let known_host = git_cli::mega2_reachable_host();
     assert!(
         known_body
             .lines()
@@ -426,7 +425,7 @@ fn integration_git_ssh_authenticated_clone() {
         "GIT_SSH_COMMAND must pin the case port: {git_ssh}"
     );
 
-    let remote = git_cli::monoengine_ssh_repo_url(port, git_cli::DEFAULT_SSH_AUTH_USER);
+    let remote = git_cli::mega2_ssh_repo_url(port, git_cli::DEFAULT_SSH_AUTH_USER);
     let clone_name = "ssh-auth-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli_ssh(&env.case_dir, &git_ssh, &["clone", &remote, clone_name]),
@@ -545,7 +544,7 @@ fn boot_storage_only_ssh(
 fn integration_git_ssh_trunk_none_anon_on_clone() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -597,7 +596,7 @@ ssh_receive_pack = false
 fn integration_git_ssh_trunk_none_anon_off_clone_fail() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -646,7 +645,7 @@ ssh_receive_pack = false
 fn integration_git_ssh_trunk_token_anon_on_clone() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -782,7 +781,7 @@ anonymous_access = {anonymous_access}
 fn integration_git_ssh_trunk_token_anon_off_clone_fail() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
@@ -813,7 +812,7 @@ fn integration_git_ssh_trunk_token_anon_off_clone_fail() {
 fn integration_git_ssh_trunk_token_anon_off_password_clone() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, port, stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
@@ -847,7 +846,7 @@ fn integration_git_ssh_trunk_token_anon_off_password_clone() {
 fn integration_git_ssh_trunk_token_anon_off_password_fetch() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
@@ -884,7 +883,7 @@ fn integration_git_ssh_trunk_token_anon_off_password_fetch() {
 fn integration_git_ssh_trunk_token_anon_off_password_pull() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
@@ -921,7 +920,7 @@ fn integration_git_ssh_trunk_token_anon_off_password_pull() {
 fn integration_git_ssh_trunk_token_push_receive_pack_disabled() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, port, _stdout_path, stderr_path, remote) = boot_token_anon_off_ssh();
@@ -1026,7 +1025,7 @@ fn integration_git_ssh_trunk_token_push_receive_pack_disabled() {
 fn integration_git_ssh_review_pubkey_anon_off_clone() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, _port, stderr_path, git_ssh, remote) =
@@ -1053,7 +1052,7 @@ fn integration_git_ssh_review_pubkey_anon_off_clone() {
 fn integration_git_ssh_review_pubkey_anon_on_push() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let (env, mut service, _port, stderr_path, git_ssh, remote) =
@@ -1203,7 +1202,7 @@ fn prepare_authenticated_ssh(
     let (service, port, stdout_path, stderr_path) = boot_service_ssh(env);
     git_cli::write_known_hosts_via_keyscan(&known_hosts, port);
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, port);
-    let remote = git_cli::monoengine_ssh_repo_url(port, git_cli::DEFAULT_SSH_AUTH_USER);
+    let remote = git_cli::mega2_ssh_repo_url(port, git_cli::DEFAULT_SSH_AUTH_USER);
     (service, port, stdout_path, stderr_path, git_ssh, remote)
 }
 
@@ -1221,7 +1220,7 @@ fn ls_remote_cl_refs_ssh(case_dir: &Path, git_ssh: &str, remote: &str) -> Vec<St
 fn integration_git_ssh_pull_cl_ref_round_trip() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -1232,7 +1231,7 @@ fn integration_git_ssh_pull_cl_ref_round_trip() {
         CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let fixture_payload = format!(
-        "monoengine gm-07 ssh pull fixture pid={} case={}\n",
+        "mega2 gm-07 ssh pull fixture pid={} case={}\n",
         std::process::id(),
         env.case_dir.display()
     );
@@ -1426,7 +1425,7 @@ fn integration_git_ssh_pull_cl_ref_round_trip() {
 fn integration_git_ssh_authenticated_push_creates_cl_ref() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -1437,7 +1436,7 @@ fn integration_git_ssh_authenticated_push_creates_cl_ref() {
         CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let fixture_payload = format!(
-        "monoengine gm-08 ssh push fixture pid={} case={}\n",
+        "mega2 gm-08 ssh push fixture pid={} case={}\n",
         std::process::id(),
         env.case_dir.display()
     );
@@ -1558,7 +1557,7 @@ fn integration_git_ssh_authenticated_push_creates_cl_ref() {
 fn integration_git_ssh_wrong_key_is_rejected() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -1755,7 +1754,7 @@ fn boot_service_multi_with_session(
             format!("http://127.0.0.1:{stub_port}"),
         );
     }
-    git_cli::apply_monoengine_public_http_base_env(&mut command, http_port);
+    git_cli::apply_mega2_public_http_base_env(&mut command, http_port);
     let http_port_arg = http_port.to_string();
     let ssh_port_arg = ssh_port.to_string();
     command.args([
@@ -1849,7 +1848,7 @@ fn prepare_authenticated_ssh_multi_with_session(
         boot_service_multi_with_session(env, enforcement, session_stub_port);
     git_cli::write_known_hosts_via_keyscan(&known_hosts, ssh_port);
     let git_ssh = git_cli::git_ssh_command(&env.case_dir, ssh_port);
-    let remote = git_cli::monoengine_ssh_repo_url(ssh_port, git_cli::DEFAULT_SSH_AUTH_USER);
+    let remote = git_cli::mega2_ssh_repo_url(ssh_port, git_cli::DEFAULT_SSH_AUTH_USER);
     (
         service,
         http_port,
@@ -1865,7 +1864,7 @@ fn prepare_authenticated_ssh_multi_with_session(
 fn integration_git_ssh_enforce_rejects_unauthorized_push() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -1979,7 +1978,7 @@ fn integration_git_ssh_enforce_rejects_unauthorized_push() {
 fn integration_git_ssh_shadow_allows_push_but_records_would_deny() {
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -2095,7 +2094,7 @@ fn integration_git_ssh_authz_grant_immediate_effect() {
     // the new snapshot on the very next push, with no restart.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_ssh; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
 
@@ -2114,7 +2113,7 @@ fn integration_git_ssh_authz_grant_immediate_effect() {
 
     let admin_token = git_cli::resolve_seed_token();
     git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
-    let http_remote = git_cli::monoengine_http_repo_url(http_port);
+    let http_remote = git_cli::mega2_http_repo_url(http_port);
 
     // --- baseline: the SSH user is not an admin, so `enforce` denies its push ---
     let clone_name = "un16-ssh-clone";
@@ -2490,7 +2489,7 @@ fn merge_cl_no_auth(port: u16, cl_link: &str) -> u16 {
 }
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .current_dir(current_dir)
         .env_clear()

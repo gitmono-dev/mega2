@@ -1,8 +1,8 @@
 // Shared black-box test config generation (integration.md Phase 0).
 //
 // These helpers only emit TOML / copy the repo default config; they do NOT
-// import the `monoengine-core` crate, so black-box tests that drive the real
-// CLI binary via `CARGO_BIN_EXE_monoengine` stay decoupled from the library.
+// import the `mega2-core` crate, so black-box tests that drive the real
+// CLI binary via `CARGO_BIN_EXE_mega2` stay decoupled from the library.
 //
 // Git-cli runner/credential helpers live in `common/git_cli.rs` and are
 // included (via `#[path]`) only by the git-facing targets `integration_git_cli`,

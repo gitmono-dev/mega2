@@ -349,14 +349,14 @@ mod tests {
     use crate::commands::{LoadMode, builtin, load_mode};
 
     fn app() -> ClapCommand {
-        ClapCommand::new("monoengine").subcommands(builtin())
+        ClapCommand::new("mega2").subcommands(builtin())
     }
 
     #[test]
     fn un56_evidence_append_is_pure_file() {
         let matches = app()
             .try_get_matches_from([
-                "monoengine",
+                "mega2",
                 "authz-audit",
                 "evidence-append",
                 "--restricted-root",
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn un56_rejects_missing_required_args() {
         let err = app().try_get_matches_from([
-            "monoengine",
+            "mega2",
             "authz-audit",
             "evidence-append",
             "--restricted-root",

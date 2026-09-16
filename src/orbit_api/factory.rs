@@ -184,7 +184,7 @@ root_dir = "/tmp/objects"
 storage_type = "s3compatible"
 [s3]
 region = "us-east-1"
-bucket = "monoengine"
+bucket = "mega2"
 access_key_id = "ak"
 secret_access_key = "sk"
 endpoint_url = "http://127.0.0.1:9000"
@@ -199,7 +199,7 @@ endpoint_url = "http://127.0.0.1:9000"
             r#"
 storage_type = "gcs"
 [gcs]
-bucket = "monoengine"
+bucket = "mega2"
 "#,
         )
         .expect("gcs may omit s3/local");

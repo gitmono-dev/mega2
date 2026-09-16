@@ -11,22 +11,22 @@ API write → Git clone/pull smoke for storage-only / trunk (compose git-smoke).
 Clients: curl, git. Do not use libra as a client.
 
 Required environment:
-  MONOENGINE_API_BASE           e.g. http://monoengine:8000
-  MONOENGINE_HTTP_REPO_URL      Smart HTTP URL (credentialed or with MONOENGINE_IT_SEED_TOKEN)
-  MONOENGINE_IT_SEED_TOKEN      Push token (Bearer / Basic) when URL has no userinfo
+  MEGA2_API_BASE           e.g. http://mega2:8000
+  MEGA2_HTTP_REPO_URL      Smart HTTP URL (credentialed or with MEGA2_IT_SEED_TOKEN)
+  MEGA2_IT_SEED_TOKEN      Push token (Bearer / Basic) when URL has no userinfo
 
 Optional:
-  MONOENGINE_SMOKE_CASE         Exact case name; unmatched → exit 2
-  MONOENGINE_GIT_SMOKE_WORKDIR Existing directory for temporary clones
-  MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
+  MEGA2_SMOKE_CASE         Exact case name; unmatched → exit 2
+  MEGA2_GIT_SMOKE_WORKDIR Existing directory for temporary clones
+  MEGA2_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
 
-Compose example (after monoengine-trunk up + service init):
-  TOKEN='monoengine-storage-only-local-dev-token-0001'
-  docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+Compose example (after mega2-trunk up + service init):
+  TOKEN='mega2-storage-only-local-dev-token-0001'
+  docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
     exec -T \
-    -e MONOENGINE_HTTP_REPO_URL="http://x:${TOKEN}@monoengine:8000/" \
-    -e MONOENGINE_API_BASE=http://monoengine:8000 \
-    -e MONOENGINE_IT_SEED_TOKEN="${TOKEN}" \
+    -e MEGA2_HTTP_REPO_URL="http://x:${TOKEN}@mega2:8000/" \
+    -e MEGA2_API_BASE=http://mega2:8000 \
+    -e MEGA2_IT_SEED_TOKEN="${TOKEN}" \
     git-smoke bash /repo/scripts/api_write_smoke_storage_only.sh
 USAGE
 }
@@ -45,13 +45,13 @@ command -v git >/dev/null 2>&1 || {
   exit 2
 }
 
-ROOT_DIR="${MONOENGINE_GIT_SMOKE_WORKDIR:-$(mktemp -d)}"
+ROOT_DIR="${MEGA2_GIT_SMOKE_WORKDIR:-$(mktemp -d)}"
 if [[ ! -d "$ROOT_DIR" ]]; then
   mkdir -p "$ROOT_DIR"
 fi
 
 cleanup() {
-  if [[ -z "${MONOENGINE_GIT_SMOKE_WORKDIR:-}" && "${MONOENGINE_GIT_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
+  if [[ -z "${MEGA2_GIT_SMOKE_WORKDIR:-}" && "${MEGA2_GIT_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
     rm -rf "$ROOT_DIR"
   else
     echo "smoke workdir kept at: $ROOT_DIR"
@@ -62,7 +62,7 @@ trap cleanup EXIT
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
-CASE_FILTER="${MONOENGINE_SMOKE_CASE:-}"
+CASE_FILTER="${MEGA2_SMOKE_CASE:-}"
 CASE_HIT=0
 
 # Shared paths / file names for the create → clone → save → pull chain.
@@ -89,29 +89,29 @@ run_case() {
 }
 
 require_api_base() {
-  if [[ -z "${MONOENGINE_API_BASE:-}" ]]; then
-    echo "MONOENGINE_API_BASE is required" >&2
+  if [[ -z "${MEGA2_API_BASE:-}" ]]; then
+    echo "MEGA2_API_BASE is required" >&2
     return 1
   fi
 }
 
 require_http_url() {
-  if [[ -z "${MONOENGINE_HTTP_REPO_URL:-}" ]]; then
-    echo "MONOENGINE_HTTP_REPO_URL is required" >&2
+  if [[ -z "${MEGA2_HTTP_REPO_URL:-}" ]]; then
+    echo "MEGA2_HTTP_REPO_URL is required" >&2
     return 1
   fi
 }
 
 require_token() {
-  if [[ -z "${MONOENGINE_IT_SEED_TOKEN:-}" ]]; then
-    echo "MONOENGINE_IT_SEED_TOKEN is required for API write auth" >&2
+  if [[ -z "${MEGA2_IT_SEED_TOKEN:-}" ]]; then
+    echo "MEGA2_IT_SEED_TOKEN is required for API write auth" >&2
     return 1
   fi
 }
 
 project_http_url() {
-  local url="${MONOENGINE_HTTP_REPO_URL%/}"
-  local token="${MONOENGINE_IT_SEED_TOKEN:-}"
+  local url="${MEGA2_HTTP_REPO_URL%/}"
+  local token="${MEGA2_IT_SEED_TOKEN:-}"
   # Already has userinfo.
   if [[ "$url" =~ ^https?://[^/@]+:[^/@]+@ ]]; then
     :
@@ -134,7 +134,7 @@ git_case() {
 }
 
 api_auth_header() {
-  printf 'Authorization: Bearer %s\n' "${MONOENGINE_IT_SEED_TOKEN}"
+  printf 'Authorization: Bearer %s\n' "${MEGA2_IT_SEED_TOKEN}"
 }
 
 # Ensure /project has a path tip so land_api_tip_push (B0) can succeed.
@@ -146,8 +146,8 @@ ensure_project_tip() {
   dest="$ROOT_DIR/aw04-seed-project"
   rm -rf "$dest"
   GIT_LFS_SKIP_SMUDGE=1 git_case clone "$url" "$dest" >/dev/null || return 1
-  git -C "$dest" config user.name "Monoengine API Smoke" || return 1
-  git -C "$dest" config user.email "monoengine-api-smoke@example.invalid" || return 1
+  git -C "$dest" config user.name "Mega2 API Smoke" || return 1
+  git -C "$dest" config user.email "mega2-api-smoke@example.invalid" || return 1
   # If tip already has commits beyond empty clone, still ensure a marker file once.
   if [[ ! -f "$dest/aw04-seed.txt" ]]; then
     printf 'aw04 seed tip\n' >"$dest/aw04-seed.txt"
@@ -169,7 +169,7 @@ case_api_create_then_clone() {
   set +e
   code="$(
     curl -sS -o "$resp" -w '%{http_code}' \
-      -X POST "${MONOENGINE_API_BASE%/}/api/v1/create-entry" \
+      -X POST "${MEGA2_API_BASE%/}/api/v1/create-entry" \
       -H "$(api_auth_header)" \
       -H 'Content-Type: application/json' \
       -d "{\"is_directory\":false,\"name\":\"${CREATE_NAME}\",\"path\":\"${PROJECT_PATH}\",\"content\":\"${CREATE_CONTENT}\\n\",\"skip_build\":true}"
@@ -220,7 +220,7 @@ case_api_save_then_pull() {
     set +e
     code="$(
       curl -sS -o "$resp" -w '%{http_code}' \
-        -X POST "${MONOENGINE_API_BASE%/}/api/v1/create-entry" \
+        -X POST "${MEGA2_API_BASE%/}/api/v1/create-entry" \
         -H "$(api_auth_header)" \
         -H 'Content-Type: application/json' \
         -d "{\"is_directory\":false,\"name\":\"${CREATE_NAME}\",\"path\":\"${PROJECT_PATH}\",\"content\":\"${CREATE_CONTENT}\\n\",\"skip_build\":true}"
@@ -239,7 +239,7 @@ case_api_save_then_pull() {
   set +e
   code="$(
     curl -sS -o "$resp" -w '%{http_code}' \
-      -X POST "${MONOENGINE_API_BASE%/}/api/v1/edit/save" \
+      -X POST "${MEGA2_API_BASE%/}/api/v1/edit/save" \
       -H "$(api_auth_header)" \
       -H 'Content-Type: application/json' \
       -d "{\"path\":\"${PROJECT_PATH}/${CREATE_NAME}\",\"content\":\"${SAVE_CONTENT}\\n\",\"commit_message\":\"aw04 edit/save\",\"skip_build\":true}"
@@ -271,7 +271,7 @@ case_api_write_rejects_unauthenticated() {
   set +e
   code="$(
     curl -sS -o "$resp" -w '%{http_code}' \
-      -X POST "${MONOENGINE_API_BASE%/}/api/v1/create-entry" \
+      -X POST "${MEGA2_API_BASE%/}/api/v1/create-entry" \
       -H 'Content-Type: application/json' \
       -d "{\"is_directory\":false,\"name\":\"aw04-unauth.txt\",\"path\":\"${PROJECT_PATH}\",\"content\":\"should-not-land\\n\",\"skip_build\":true}"
   )"
@@ -299,7 +299,7 @@ run_case "API edit/save then git pull sees update" case_api_save_then_pull
 run_case "API write rejects unauthenticated" case_api_write_rejects_unauthenticated
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
-  echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
+  echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
   echo "api write smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2
 fi

@@ -910,7 +910,7 @@ mod tests {
 
         // Register metadata as an `upload` batch would, for the true sha256 of
         // the content and its exact size.
-        let content = b"monoengine lfs content".to_vec();
+        let content = b"mega2 lfs content".to_vec();
         let mut hasher = Sha256::new();
         hasher.update(&content);
         let oid = hex::encode(hasher.finalize());

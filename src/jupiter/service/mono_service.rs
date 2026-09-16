@@ -63,7 +63,7 @@ fn ensure_existing_root_ref_matches_config(
 async fn acquire_monorepo_initialization_lock(
     txn: &sea_orm::DatabaseTransaction,
 ) -> Result<(), MegaError> {
-    // Monoengine accepts PostgreSQL only. The transaction-scoped lock releases
+    // Mega2 accepts PostgreSQL only. The transaction-scoped lock releases
     // automatically on commit, rollback, or connection loss.
     txn.execute_unprepared(MONOREPO_INITIALIZATION_LOCK_SQL)
         .await?;

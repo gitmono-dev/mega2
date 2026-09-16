@@ -446,14 +446,14 @@ mod tests {
     use crate::commands::{LoadMode, builtin, load_mode};
 
     fn app() -> ClapCommand {
-        ClapCommand::new("monoengine").subcommands(builtin())
+        ClapCommand::new("mega2").subcommands(builtin())
     }
 
     #[test]
     fn un52_run_modes_are_pure_file() {
         for mode in ["run-init", "run-commit", "run-abort"] {
             let mut argv = vec![
-                "monoengine".into(),
+                "mega2".into(),
                 "authz-audit".into(),
                 mode.to_string(),
                 "--restricted-root".into(),
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn un52_run_commit_requires_run_id() {
         let err = app().try_get_matches_from([
-            "monoengine",
+            "mega2",
             "authz-audit",
             "run-commit",
             "--restricted-root",

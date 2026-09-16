@@ -25,7 +25,7 @@ fn trunk_config(base: &std::path::Path) -> super::Config {
 }
 
 fn valid_config() -> super::Config {
-    isolated_config(std::env::temp_dir().join("monoengine-config-tp15"))
+    isolated_config(std::env::temp_dir().join("mega2-config-tp15"))
 }
 
 #[test]

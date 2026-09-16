@@ -3,7 +3,7 @@
 // 一条审计命令的全部价值在于它能说「我什么都没改」。这里不靠阅读代码来相信这句话，而是
 // 用一份真实的数据库前后对照来证明：
 //
-//  1. 先用**真实二进制**（`monoengine service http`）把库播种成生产形态——迁移、
+//  1. 先用**真实二进制**（`mega2 service http`）把库播种成生产形态——迁移、
 //     `init_monorepo()` 写下的 refs 与对象全都在；
 //  2. 拍下快照：schema（表 + 列）、每张表的行数、refs 全行、对象三张表全行，以及本地对象
 //     存储目录的内容散列；
@@ -37,8 +37,7 @@ use sea_orm::{
 
 mod common;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -83,7 +82,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_audit_{}_{}",
+            "mega2_audit_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -149,7 +148,7 @@ struct ServiceProcess {
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
         Self {
-            child: command.spawn().expect("spawn monoengine service"),
+            child: command.spawn().expect("spawn mega2 service"),
             reaped: false,
         }
     }
@@ -600,7 +599,7 @@ impl Fixture {
 
     fn command(&self) -> Command {
         // 子进程继承上面设置的环境；这里再显式写一遍关键项，免得「继承」成为一个隐含前提。
-        let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
         command
             .env("MEGA_BASE_DIR", &self.base_dir)
             .env("MEGA_CACHE_DIR", &self.cache_dir)
@@ -751,8 +750,8 @@ fn integration_readonly_assembly_changes_nothing() {
         assert!(!before.objects.is_empty(), "fixture：播种后应当有对象");
 
         // 只读装配：走 UN-34 的预检把同一份配置解析出来，再开只读上下文。
-        let loaded = monoengine_core::config::loader::ConfigLoader::new(
-            monoengine_core::config::loader::ConfigInput {
+        let loaded = mega2_core::config::loader::ConfigLoader::new(
+            mega2_core::config::loader::ConfigInput {
                 cli_path: Some(fixture.config_path.clone()),
                 env_path: None,
                 cli_profile: Some("it".to_string()),
@@ -764,22 +763,22 @@ fn integration_readonly_assembly_changes_nothing() {
         let profile = loaded.profile.as_ref().expect("profile resolved");
         assert_eq!(profile.path, fixture.profile_path);
 
-        let summary = monoengine_core::readonly_ops::LoadedConfigSummary {
+        let summary = mega2_core::readonly_ops::LoadedConfigSummary {
             source: loaded.source,
             profile_name: Some(profile.name.clone()),
-            paths: monoengine_core::readonly_ops::LoadedConfigPaths {
+            paths: mega2_core::readonly_ops::LoadedConfigPaths {
                 config: loaded.path.clone(),
                 profile: Some(profile.path.clone()),
             },
         };
-        let config = monoengine_core::config::Config::new_with_profile(
+        let config = mega2_core::config::Config::new_with_profile(
             loaded.path.to_str().expect("utf-8 config path"),
             Some(profile.path.as_path()),
         )
         .expect("parse config");
 
         let context =
-            monoengine_core::readonly_ops::ReadOnlyContext::open(config, Some(summary.clone()))
+            mega2_core::readonly_ops::ReadOnlyContext::open(config, Some(summary.clone()))
                 .await
                 .expect("只读上下文必须能打开一个已经播种好的部署");
 
@@ -883,12 +882,12 @@ fn integration_readonly_assembly_changes_nothing() {
             "fixture：vault 表必须在内容摘要里"
         );
 
-        let config = monoengine_core::config::Config::new_with_profile(
+        let config = mega2_core::config::Config::new_with_profile(
             fixture.config_path.to_str().expect("utf-8 config path"),
             Some(fixture.profile_path.as_path()),
         )
         .expect("parse config");
-        let context = monoengine_core::readonly_ops::ReadOnlyContext::open(config, None)
+        let context = mega2_core::readonly_ops::ReadOnlyContext::open(config, None)
             .await
             .expect("需要 vault 的只读上下文必须能打开");
         let vault = context
@@ -947,7 +946,7 @@ fn run_id_from_stdout(stdout: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn output_status(command: &mut Command) -> (i32, String, String) {
-    let output = command.output().expect("spawn monoengine");
+    let output = command.output().expect("spawn mega2");
     let code = output.status.code().unwrap_or(1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -1035,7 +1034,7 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
     );
     assert_eq!(counters["reserved_bytes"], 0);
 
-    let file_digest = monoengine_core::authz_audit_ops::content_digest(&candidate_bytes);
+    let file_digest = mega2_core::authz_audit_ops::content_digest(&candidate_bytes);
     let candidate_ref = format!("{bootstrap_run}/candidate.json");
 
     // --- promote (first / expect-no-current) ---
@@ -1091,7 +1090,7 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
     other_bytes.push(b'\n');
     let other_path = other_dir.join("candidate.json");
     fs::write(&other_path, &other_bytes).expect("write other candidate");
-    let other_digest = monoengine_core::authz_audit_ops::content_digest(&other_bytes);
+    let other_digest = mega2_core::authz_audit_ops::content_digest(&other_bytes);
     let other_ref = format!("{other_run}/candidate.json");
     let (code, _, stderr) = run_audit(
         &fixture,
@@ -1169,7 +1168,7 @@ fn integration_authz_audit_cli_bootstrap_compare_fsync() {
     let mut third_bytes = candidate_bytes.clone();
     third_bytes.extend_from_slice(b"\n\n");
     fs::write(third_dir.join("candidate.json"), &third_bytes).expect("third candidate");
-    let third_digest = monoengine_core::authz_audit_ops::content_digest(&third_bytes);
+    let third_digest = mega2_core::authz_audit_ops::content_digest(&third_bytes);
     let third_ref = format!("{third_run}/candidate.json");
 
     let mut c1 = fixture.command();
@@ -2075,7 +2074,7 @@ fn integration_authz_audit_evidence_append() {
         let db_url = fixture.database.db_url.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
-            let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
             command
                 .env("MEGA_BASE_DIR", &base_dir)
                 .env("MEGA_CACHE_DIR", &cache_dir)

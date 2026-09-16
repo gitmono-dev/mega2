@@ -22,7 +22,7 @@ const COMMENT_EXCERPT_MAX_CHARS: usize = 500;
 /// blank after `trim()` with `422 invalid_payload`
 /// (`docs/refactoring/website-mail.md` §2.1 field rules). A whitespace-only
 /// comment body, or a CL/Issue saved with an empty title, would therefore make
-/// monoengine emit a request that can only ever be rejected — and because
+/// mega2 emit a request that can only ever be rejected — and because
 /// `service::deliver_user_notification` only `warn!`s on failure, the email
 /// would be dropped silently while the in-app notification still appeared.
 /// Substituting a placeholder keeps the recipient informed that the event

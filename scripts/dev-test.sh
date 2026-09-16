@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Local test runners for monoengine (see docs/development.md).
+# Local test runners for mega2 (see docs/development.md).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/lib/monoengine-it.sh"
+source "${SCRIPT_DIR}/lib/mega2-it.sh"
 
 usage() {
   cat <<'USAGE'
-monoengine local test helpers (docs/development.md)
+mega2 local test helpers (docs/development.md)
 
 Usage:
   scripts/dev-test.sh <command> [args...]
@@ -20,7 +20,7 @@ Stack commands:
   health               Postgres / Redis / Mailpit smoke checks
 
 Test commands:
-  unit [cargo-args...]          Unit tests only (no compose): cargo test -p monoengine-core --lib
+  unit [cargo-args...]          Unit tests only (no compose): cargo test -p mega2-core --lib
   basic [cargo-args...]         up-data + source .env.test + cargo test --all
   full [cargo-args...]          up-full + source .env.test + cargo test --all  (recommended IT)
   vault [cargo-args...]         Ensure data plane, then integration_vault
@@ -34,67 +34,67 @@ Examples:
   ./scripts/dev-test.sh down
 
 Environment:
-  MONOENGINE_IT_PROJECT       Compose project name (default: monoengine-it)
-  MONOENGINE_IT_GIT_WORKDIR   Shared git-cli host dir (default: /tmp/monoengine-git)
-  MONOENGINE_IT_GIT_UID/GID   Container user (default: current id -u/-g)
+  MEGA2_IT_PROJECT       Compose project name (default: mega2-it)
+  MEGA2_IT_GIT_WORKDIR   Shared git-cli host dir (default: /tmp/mega2-git)
+  MEGA2_IT_GIT_UID/GID   Container user (default: current id -u/-g)
 USAGE
 }
 
 cmd_unit() {
-  monoengine_it_require_repo_root
-  monoengine_it_info "cargo test -p monoengine-core --lib $*"
-  cargo test -p monoengine-core --lib "$@"
+  mega2_it_require_repo_root
+  mega2_it_info "cargo test -p mega2-core --lib $*"
+  cargo test -p mega2-core --lib "$@"
 }
 
 cmd_basic() {
-  monoengine_it_require_repo_root
-  monoengine_it_up_data
-  monoengine_it_ensure_env_test
-  monoengine_it_info "cargo test --all $*"
-  monoengine_it_info "note: without git-cli, integration_git_cli will fail; use 'full' for complete IT"
+  mega2_it_require_repo_root
+  mega2_it_up_data
+  mega2_it_ensure_env_test
+  mega2_it_info "cargo test --all $*"
+  mega2_it_info "note: without git-cli, integration_git_cli will fail; use 'full' for complete IT"
   cargo test --all "$@"
 }
 
 cmd_full() {
-  monoengine_it_require_repo_root
-  monoengine_it_up_full
-  monoengine_it_ensure_env_test
-  monoengine_it_info "cargo test --all $*"
-  monoengine_it_info "tip: uncomment MEGA_OBJECT_STORAGE__* in .env.test for RustFS S3 smoke"
+  mega2_it_require_repo_root
+  mega2_it_up_full
+  mega2_it_ensure_env_test
+  mega2_it_info "cargo test --all $*"
+  mega2_it_info "tip: uncomment MEGA_OBJECT_STORAGE__* in .env.test for RustFS S3 smoke"
   cargo test --all "$@"
 }
 
 cmd_vault() {
-  monoengine_it_require_repo_root
-  monoengine_it_up_data
-  monoengine_it_ensure_env_test
+  mega2_it_require_repo_root
+  mega2_it_up_data
+  mega2_it_ensure_env_test
   if [[ $# -eq 0 ]]; then
     set -- -- --nocapture --test-threads=1
   fi
-  monoengine_it_info "cargo test -p monoengine --test integration_vault $*"
-  cargo test -p monoengine --test integration_vault "$@"
+  mega2_it_info "cargo test -p mega2 --test integration_vault $*"
+  cargo test -p mega2 --test integration_vault "$@"
 }
 
 cmd_git_cli() {
-  monoengine_it_require_repo_root
-  monoengine_it_up_full
-  monoengine_it_ensure_env_test
+  mega2_it_require_repo_root
+  mega2_it_up_full
+  mega2_it_ensure_env_test
   if [[ $# -eq 0 ]]; then
     set -- -- --nocapture --test-threads=1
   fi
-  monoengine_it_info "cargo test -p monoengine --test integration_git_cli $*"
-  cargo test -p monoengine --test integration_git_cli "$@"
+  mega2_it_info "cargo test -p mega2 --test integration_git_cli $*"
+  cargo test -p mega2 --test integration_git_cli "$@"
 }
 
 cmd_gates() {
-  monoengine_it_require_repo_root
-  monoengine_it_up_full
-  monoengine_it_ensure_env_test
-  monoengine_it_info "cargo +nightly fmt --all --check"
+  mega2_it_require_repo_root
+  mega2_it_up_full
+  mega2_it_ensure_env_test
+  mega2_it_info "cargo +nightly fmt --all --check"
   cargo +nightly fmt --all --check
-  monoengine_it_info "cargo clippy --all-targets --all-features -- -D warnings"
+  mega2_it_info "cargo clippy --all-targets --all-features -- -D warnings"
   cargo clippy --all-targets --all-features -- -D warnings
-  monoengine_it_info "cargo test --all"
+  mega2_it_info "cargo test --all"
   cargo test --all
   echo "OK: submit gates passed"
 }
@@ -109,20 +109,20 @@ main() {
 
   case "${cmd}" in
     up-data)
-      monoengine_it_require_repo_root
-      monoengine_it_up_data
+      mega2_it_require_repo_root
+      mega2_it_up_data
       ;;
     up-full)
-      monoengine_it_require_repo_root
-      monoengine_it_up_full
+      mega2_it_require_repo_root
+      mega2_it_up_full
       ;;
     down)
-      monoengine_it_require_repo_root
-      monoengine_it_down
+      mega2_it_require_repo_root
+      mega2_it_down
       ;;
     health)
-      monoengine_it_require_repo_root
-      monoengine_it_health
+      mega2_it_require_repo_root
+      mega2_it_health
       ;;
     unit)
       cmd_unit "$@"
@@ -144,7 +144,7 @@ main() {
       ;;
     *)
       usage >&2
-      monoengine_it_die "unknown command: ${cmd}"
+      mega2_it_die "unknown command: ${cmd}"
       ;;
   esac
 }

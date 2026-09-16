@@ -722,7 +722,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_rejects_invalid_monorepo_before_database_connection() {
         let mut config = crate::config::Config::mock();
-        config.database.db_url = "postgres://127.0.0.1:1/monoengine".to_string();
+        config.database.db_url = "postgres://127.0.0.1:1/mega2".to_string();
         config.monorepo.root_dirs.clear();
 
         let result = tokio::time::timeout(Duration::from_secs(1), bootstrap_monorepo(config))

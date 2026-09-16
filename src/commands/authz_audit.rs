@@ -509,13 +509,13 @@ mod tests {
     use crate::commands::{builtin, load_mode};
 
     fn app() -> ClapCommand {
-        ClapCommand::new("monoengine").subcommands(builtin())
+        ClapCommand::new("mega2").subcommands(builtin())
     }
 
     #[test]
     fn un29_authz_audit_is_registered_in_all_three_places() {
         let matches = app()
-            .try_get_matches_from(["monoengine", "authz-audit", "fsync", "--probe"])
+            .try_get_matches_from(["mega2", "authz-audit", "fsync", "--probe"])
             .expect("parse");
         let Some(("authz-audit", args)) = matches.subcommand() else {
             panic!("missing authz-audit");
@@ -531,7 +531,7 @@ mod tests {
     fn un29_bootstrap_and_compare_load_parsed_config() {
         let matches = app()
             .try_get_matches_from([
-                "monoengine",
+                "mega2",
                 "authz-audit",
                 "bootstrap-candidate",
                 "--restricted-root",
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn un29_missing_out_flags_fail_clap_required() {
         let err = app().try_get_matches_from([
-            "monoengine",
+            "mega2",
             "authz-audit",
             "compare",
             "--restricted-root",
@@ -613,7 +613,7 @@ mod tests {
     fn un37_promote_load_mode_is_none() {
         let matches = app()
             .try_get_matches_from([
-                "monoengine",
+                "mega2",
                 "authz-audit",
                 "promote",
                 "--restricted-root",
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn un37_promote_missing_required_flags_fail_clap() {
         let err = app().try_get_matches_from([
-            "monoengine",
+            "mega2",
             "authz-audit",
             "promote",
             "--restricted-root",

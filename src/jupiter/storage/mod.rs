@@ -590,7 +590,7 @@ impl Storage {
     #[cfg(test)]
     pub fn mock() -> Self {
         let mut config = crate::config::testing::isolated_config(
-            std::env::temp_dir().join("monoengine-storage-mock"),
+            std::env::temp_dir().join("mega2-storage-mock"),
         );
         config.database.max_connection = 16;
         config.database.min_connection = 8;

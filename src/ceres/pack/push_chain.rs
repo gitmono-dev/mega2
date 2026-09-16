@@ -607,8 +607,8 @@ mod tests {
     fn test_signature(signature_type: SignatureType) -> Signature {
         Signature::new(
             signature_type,
-            "Monoengine Test".to_string(),
-            "monoengine-test@example.invalid".to_string(),
+            "Mega2 Test".to_string(),
+            "mega2-test@example.invalid".to_string(),
         )
     }
 

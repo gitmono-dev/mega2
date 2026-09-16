@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-//! `monoengine-core` — the monoengine library.
+//! `mega2-core` — the mega2 library.
 //!
-//! This crate contains all of monoengine's logic, including the inlined
+//! This crate contains all of mega2's logic, including the inlined
 //! `orbit_api` contract and `orbit` object-storage implementation.
 
 mod api;
@@ -46,7 +46,7 @@ pub mod authz_audit_ops {
     };
 }
 
-// Public entry points for the thin `monoengine` binary (composition root).
+// Public entry points for the thin `mega2` binary (composition root).
 pub use cli::parse;
 pub use common::errors::MegaError;
 

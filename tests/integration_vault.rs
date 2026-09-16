@@ -1,7 +1,7 @@
 // 本文件是进程级黑盒集成测试，覆盖 Vault 运维命令以及 `service http` 启动 smoke。
 //
 // 设计目标：
-// 1. 通过 `CARGO_BIN_EXE_monoengine` 启动真实 CLI，验证用户实际执行命令时会走到的路径。
+// 1. 通过 `CARGO_BIN_EXE_mega2` 启动真实 CLI，验证用户实际执行命令时会走到的路径。
 // 2. 跟随 `docs/refactoring/integration.md` 的集成测试架构，使用 Docker Compose 提供的
 //    PostgreSQL/Redis 服务，而不是在测试里使用轻量本地数据库替身。
 // 3. 对每个需要数据库的测试创建独立 PostgreSQL 数据库，避免并发测试或失败重跑污染状态。
@@ -28,7 +28,7 @@ use tempfile::TempDir;
 
 // 这些常量模拟当前 P0/P2 集成测试中允许写入 Vault 的配置项：
 // `redis.url` 与 `object_storage.s3.access_key_id` / `secret_access_key`。
-// 数据库凭据在 bootstrap 阶段就要消费，不能依赖 monoengine 自己的 Vault，
+// 数据库凭据在 bootstrap 阶段就要消费，不能依赖 mega2 自己的 Vault，
 // 否则会形成启动环；Redis URL 在 Vault 就绪后连接，可用 SecretRef 覆盖。
 const OBJECT_STORAGE_ACCESS_KEY_PATH: &str = "config/it/object_storage/access_key_id";
 const OBJECT_STORAGE_SECRET_KEY_PATH: &str = "config/it/object_storage/secret_access_key";
@@ -44,8 +44,7 @@ const REDIS_URL_REF: &str = "vault://secret/config/it/redis/url#value";
 
 // 默认连接信息与 `docker-compose.test.yml`、`.env.test.example` 保持一致。
 // 如果 CI 或开发机需要改端口，可以通过 `.env.test` 中的环境变量覆盖。
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 // 同一个测试进程内可能创建多个临时数据库。计数器只用于生成唯一库名，
@@ -177,7 +176,7 @@ fn write_bootstrap_config(path: &Path, db_url: &str) {
 // PostgreSQL 测试数据库的 RAII 包装。
 //
 // 测试连接到 compose 提供的 admin database，然后为每个用例创建独立数据库：
-// `monoengine_<pid>_<counter>`。CLI 子进程拿到的是这个专属数据库的连接串。
+// `mega2_<pid>_<counter>`。CLI 子进程拿到的是这个专属数据库的连接串。
 // 这样 migrations、Vault 表和 secret 数据都隔离在单个测试里。
 struct TestDatabase {
     admin_url: String,
@@ -190,7 +189,7 @@ impl TestDatabase {
         let admin_url = integration_postgres_url();
         // pid + 进程内递增序号足以避免同一次测试运行中的数据库名冲突。
         let db_name = format!(
-            "monoengine_{}_{}",
+            "mega2_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -388,7 +387,7 @@ fn config_validate_resolve_secrets_fails_when_redis_url_secret_is_missing() {
 #[test]
 fn config_secret_ref_rejects_bootstrap_secret_fields() {
     // 数据库 URL 属于 Vault bootstrap 之前就必须存在的配置。
-    // 如果允许它引用 monoengine 自己的 Vault，会导致“先解析 Vault 才能连接 DB，
+    // 如果允许它引用 mega2 自己的 Vault，会导致“先解析 Vault 才能连接 DB，
     // 但先连接 DB 才能打开 Vault”的启动循环，因此 CLI 必须拒绝。
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let base_dir = temp_dir.path().join("base");
@@ -409,7 +408,7 @@ fn config_secret_ref_rejects_bootstrap_secret_fields() {
 
     assert!(stdout.trim().is_empty(), "unexpected stdout: {stdout}");
     assert!(
-        stderr.contains("cannot be stored in monoengine vault")
+        stderr.contains("cannot be stored in mega2 vault")
             && stderr.contains("supported fields are"),
         "unexpected stderr: {stderr}"
     );
@@ -510,7 +509,7 @@ fn config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs() 
     validate
         .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3")
         .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
-        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "monoengine-test")
+        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "mega2-test")
         .env(
             "MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID",
             OBJECT_STORAGE_ACCESS_KEY_REF,
@@ -534,7 +533,7 @@ fn config_secret_set_check_and_validate_resolve_object_storage_s3_secret_refs() 
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
     // 进程级测试需要尽量隔离外部环境，避免开发机上的 MEGA_* 变量影响结果。
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .current_dir(current_dir)
         .env_clear()
@@ -556,7 +555,7 @@ fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Co
 
 fn run(mut command: Command) -> Output {
     // 用于没有 stdin 的 CLI 命令，统一收集 stdout/stderr 供断言。
-    command.output().expect("run monoengine")
+    command.output().expect("run mega2")
 }
 
 fn run_with_stdin(mut command: Command, input: &str) -> Output {
@@ -566,7 +565,7 @@ fn run_with_stdin(mut command: Command, input: &str) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn monoengine");
+        .expect("spawn mega2");
 
     {
         let mut stdin = child.stdin.take().expect("child stdin");
@@ -577,7 +576,7 @@ fn run_with_stdin(mut command: Command, input: &str) -> Output {
         }
     }
 
-    child.wait_with_output().expect("wait monoengine")
+    child.wait_with_output().expect("wait mega2")
 }
 
 fn assert_success(output: &Output) -> (String, String) {
@@ -874,16 +873,16 @@ import_dir = "/tmp/hot-reload-restart-required"
 // ===== 真实 S3-compatible 对象存储后端 gate（integration.md P2）=====
 
 #[test]
-fn integration_compose_monoengine_http_smoke() {
-    // Standing compose `monoengine` service (profile `app`, host 19180). Soft
+fn integration_compose_mega2_http_smoke() {
+    // Standing compose `mega2` service (profile `app`, host 19180). Soft
     // skip when the profile is not up so `cargo test --all` stays usable with
     // only the default data-plane stack.
     let available = std::net::TcpStream::connect("127.0.0.1:19180").is_ok();
     if !available {
         eprintln!(
-            "integration_compose_monoengine_http_smoke requires compose monoengine at \
+            "integration_compose_mega2_http_smoke requires compose mega2 at \
              127.0.0.1:19180; build/start with \
-             `docker compose -p monoengine-it -f docker-compose.test.yml --profile app up -d --wait monoengine` \
+             `docker compose -p mega2-it -f docker-compose.test.yml --profile app up -d --wait mega2` \
              (see docs/refactoring/test-infra.md), skipping"
         );
         return;
@@ -892,7 +891,7 @@ fn integration_compose_monoengine_http_smoke() {
     let body = http_get_openapi();
     assert!(
         body.contains("openapi") || body.contains("paths") || body.contains('{'),
-        "compose monoengine openapi body looked empty/unexpected: {body}"
+        "compose mega2 openapi body looked empty/unexpected: {body}"
     );
 }
 
@@ -902,7 +901,7 @@ fn http_get_openapi() -> String {
         net::TcpStream,
     };
 
-    let mut stream = TcpStream::connect("127.0.0.1:19180").expect("connect compose monoengine");
+    let mut stream = TcpStream::connect("127.0.0.1:19180").expect("connect compose mega2");
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .ok();
@@ -918,7 +917,7 @@ fn http_get_openapi() -> String {
         .is_some_and(|line| line.contains(" 200 "));
     assert!(
         status_ok,
-        "expected HTTP 200 from compose monoengine openapi; got:\n{text}"
+        "expected HTTP 200 from compose mega2 openapi; got:\n{text}"
     );
     text.into_owned()
 }
@@ -933,8 +932,8 @@ fn integration_object_storage_s3_compatible_smoke() {
     if !rustfs_available {
         eprintln!(
             "integration_object_storage_s3_compatible_smoke requires RustFS at {}; \
-             run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` \
-             first (includes rustfs-init creating monoengine and monoui buckets), skipping",
+             run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` \
+             first (includes rustfs-init creating mega2 and monoui buckets), skipping",
             rustfs_endpoint
         );
         return;
@@ -946,7 +945,7 @@ fn integration_object_storage_s3_compatible_smoke() {
         // 覆盖为 S3-compatible（RustFS）配置。
         .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible")
         .env("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1")
-        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "monoengine")
+        .env("MEGA_OBJECT_STORAGE__S3__BUCKET", "mega2")
         .env("MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL", rustfs_endpoint)
         .env("MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID", "rustfs")
         .env(
@@ -988,8 +987,7 @@ fn integration_error_redaction_does_not_leak_db_password() {
     let stdout_path = temp_dir.path().join("service.out");
     let stderr_path = temp_dir.path().join("service.err");
     // 端口 1 几乎必然拒绝连接，确保 DB 连接快速失败。
-    let bad_db_url =
-        format!("postgres://monoengine:{DB_SENTINEL}@127.0.0.1:1/monoengine_redaction");
+    let bad_db_url = format!("postgres://mega2:{DB_SENTINEL}@127.0.0.1:1/mega2_redaction");
 
     let mut command = isolated_command(temp_dir.path(), &base_dir, &cache_dir);
     command.arg("--config").arg(&config_path);
@@ -1095,7 +1093,7 @@ fn integration_error_redaction_bad_toml_does_not_leak_values() {
     let bad_toml = format!(
         r#"[database]
 db_type = "postgres"
-db_url = "postgres://monoengine:{TOML_SENTINEL}@127.0.0.1:5432/monoengine"
+db_url = "postgres://mega2:{TOML_SENTINEL}@127.0.0.1:5432/mega2"
 
 [redis]
 url = "{TOML_SENTINEL}
@@ -1111,7 +1109,7 @@ url = "{TOML_SENTINEL}
         .env("MEGA_LOG__WITH_ANSI", "false")
         .args(["config", "validate"]);
 
-    let output = command.output().expect("run monoengine config validate");
+    let output = command.output().expect("run mega2 config validate");
 
     assert!(
         !output.status.success(),
@@ -1183,7 +1181,7 @@ fn integration_config_init_creates_safe_skeleton_and_validates() {
         "init config should not contain plaintext password ="
     );
     assert!(
-        !content.contains("postgres://monoengine:"),
+        !content.contains("postgres://mega2:"),
         "init config should not embed predictable postgres credentials"
     );
 
@@ -1309,7 +1307,7 @@ struct ServiceProcess {
 
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         Self {
             child,
             reaped: false,

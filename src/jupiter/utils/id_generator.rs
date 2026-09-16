@@ -35,7 +35,7 @@ pub fn claim_worker_id(id: u32) -> bool {
 pub fn process_identity() -> String {
     std::env::var("POD_UID")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "monoengine-local".to_string())
+        .unwrap_or_else(|_| "mega2-local".to_string())
 }
 
 /// FNV-1a 32-bit. Stable across rustc versions (unlike `DefaultHasher`).

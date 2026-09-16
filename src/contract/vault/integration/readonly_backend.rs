@@ -18,7 +18,7 @@
 //! This used to live inside the library, where it could invent an `RvError`
 //! variant of its own for "readonly, write denied". The `libvault` crate has no
 //! such variant and should not grow one — "this handle was opened readonly" is
-//! monoengine's concept, not the library's. So the two layers are
+//! mega2's concept, not the library's. So the two layers are
 //! named separately:
 //!
 //! * above the backstop, the integration layer refuses with
@@ -62,7 +62,7 @@ pub fn is_readonly_write_denied(error: &RvError) -> bool {
     matches!(error, RvError::ErrString(message) if message == READONLY_WRITE_DENIED)
 }
 
-/// The named, monoengine-side counterpart of [`readonly_write_denied`], for the
+/// The named, mega2-side counterpart of [`readonly_write_denied`], for the
 /// layer above the backstop.
 pub fn readonly_write_denied_error() -> VaultError {
     VaultError::ReadonlyWriteDenied

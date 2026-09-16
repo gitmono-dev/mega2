@@ -18,8 +18,8 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
 pub const GIT_CLI_UNAVAILABLE: &str = "git-cli runner unavailable";
-pub const COMPOSE_PROJECT: &str = "monoengine-it";
-pub const GIT_ASKPASS_ENV: &str = "MONOENGINE_IT_GIT_PASSWORD";
+pub const COMPOSE_PROJECT: &str = "mega2-it";
+pub const GIT_ASKPASS_ENV: &str = "MEGA2_IT_GIT_PASSWORD";
 pub const DEFAULT_GIT_AUTH_USER: &str = "it-git-cli";
 /// Host loopback for probes from the cargo test process (curl, TcpStream, service bind).
 pub const HOST_LOOPBACK: &str = "127.0.0.1";
@@ -49,10 +49,10 @@ pub fn repo_root() -> PathBuf {
 }
 
 pub fn git_cli_workdir() -> PathBuf {
-    // Default matches compose `${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}`.
+    // Default matches compose `${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}`.
     // Relative values are resolved against the repo root (compose file directory),
     // not Cargo's `bin/` CWD, so host paths stay aligned with the bind mount.
-    match env::var("MONOENGINE_IT_GIT_WORKDIR") {
+    match env::var("MEGA2_IT_GIT_WORKDIR") {
         Ok(raw) => {
             let path = PathBuf::from(raw);
             if path.is_absolute() {
@@ -61,25 +61,25 @@ pub fn git_cli_workdir() -> PathBuf {
                 repo_root().join(path)
             }
         }
-        Err(_) => PathBuf::from("/tmp/monoengine-git"),
+        Err(_) => PathBuf::from("/tmp/mega2-git"),
     }
 }
 
 pub fn git_cli_skip_requested() -> bool {
-    matches!(env::var("MONOENGINE_IT_SKIP_GIT_CLI").as_deref(), Ok("1"))
+    matches!(env::var("MEGA2_IT_SKIP_GIT_CLI").as_deref(), Ok("1"))
 }
 
 fn host_git_opt_in_allowed() -> bool {
     // Compose `git-cli` is the only supported runner for CI / VER. Host git is
-    // an explicit local opt-in (`MONOENGINE_IT_ALLOW_HOST_GIT=1`), not a
+    // an explicit local opt-in (`MEGA2_IT_ALLOW_HOST_GIT=1`), not a
     // cross-platform compatibility path.
-    matches!(env::var("MONOENGINE_IT_ALLOW_HOST_GIT").as_deref(), Ok("1"))
+    matches!(env::var("MEGA2_IT_ALLOW_HOST_GIT").as_deref(), Ok("1"))
 }
 
 /// Resolve the one-shot access token used for receive-pack tests.
-/// Prefers `MONOENGINE_IT_SEED_TOKEN`; otherwise generates a random value.
+/// Prefers `MEGA2_IT_SEED_TOKEN`; otherwise generates a random value.
 pub fn resolve_seed_token() -> String {
-    env::var("MONOENGINE_IT_SEED_TOKEN").unwrap_or_else(|_| {
+    env::var("MEGA2_IT_SEED_TOKEN").unwrap_or_else(|_| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -106,11 +106,11 @@ pub fn append_evidence_line(path_env: &str, line: &str) {
 }
 
 pub fn record_allocated_port(port: u16) {
-    append_evidence_line("MONOENGINE_IT_PORTS_FILE", &port.to_string());
+    append_evidence_line("MEGA2_IT_PORTS_FILE", &port.to_string());
 }
 
 pub fn record_service_pid(pid: u32) {
-    append_evidence_line("MONOENGINE_IT_PIDS_FILE", &pid.to_string());
+    append_evidence_line("MEGA2_IT_PIDS_FILE", &pid.to_string());
 }
 
 /// Bind `127.0.0.1:0`, capture the OS-assigned port, then drop the listener.
@@ -269,11 +269,11 @@ fn compose_up_git_cli_hint() -> String {
     )
 }
 
-/// Hostname git-cli uses to reach per-case monoengine / SSH listeners on the host.
+/// Hostname git-cli uses to reach per-case mega2 / SSH listeners on the host.
 ///
 /// Container runner: `host.docker.internal` (bridge + extra_hosts).
 /// Host opt-in runner: loopback.
-pub fn monoengine_reachable_host() -> &'static str {
+pub fn mega2_reachable_host() -> &'static str {
     require_git_cli_runner();
     match runner_kind() {
         GitRunnerKind::Container => DOCKER_HOST_GATEWAY,
@@ -303,36 +303,33 @@ pub fn service_listen_host() -> &'static str {
     }
 }
 
-pub fn monoengine_http_repo_url(port: u16) -> String {
-    format!("http://{}:{port}/", monoengine_reachable_host())
+pub fn mega2_http_repo_url(port: u16) -> String {
+    format!("http://{}:{port}/", mega2_reachable_host())
 }
 
-pub fn monoengine_http_url(port: u16, path: &str) -> String {
-    format!("http://{}:{port}{path}", monoengine_reachable_host())
+pub fn mega2_http_url(port: u16, path: &str) -> String {
+    format!("http://{}:{port}{path}", mega2_reachable_host())
 }
 
 /// HTTP URL for probes from the cargo test process on the host (curl, TcpStream).
-pub fn monoengine_host_http_url(port: u16, path: &str) -> String {
+pub fn mega2_host_http_url(port: u16, path: &str) -> String {
     format!("http://{}:{port}{path}", HOST_LOOPBACK)
 }
 
 /// Public HTTP base advertised in Git LFS batch responses when the git-cli
 /// container reaches the host via `host.docker.internal`.
-pub fn monoengine_public_http_base(port: u16) -> String {
-    format!("http://{}:{port}", monoengine_reachable_host())
+pub fn mega2_public_http_base(port: u16) -> String {
+    format!("http://{}:{port}", mega2_reachable_host())
 }
 
 /// When the compose git-cli runner is active, point LFS batch hrefs at the same
 /// host git uses for clone/push (`host.docker.internal` on Docker Desktop).
-pub fn apply_monoengine_public_http_base_env(command: &mut Command, port: u16) {
+pub fn apply_mega2_public_http_base_env(command: &mut Command, port: u16) {
     if git_cli_skip_requested() {
         return;
     }
     if runner_kind() == GitRunnerKind::Container {
-        command.env(
-            "MEGA_HTTP__PUBLIC_BASE_URL",
-            monoengine_public_http_base(port),
-        );
+        command.env("MEGA_HTTP__PUBLIC_BASE_URL", mega2_public_http_base(port));
     }
 }
 
@@ -340,11 +337,11 @@ pub fn apply_monoengine_public_http_base_env(command: &mut Command, port: u16) {
     dead_code,
     reason = "SSH remote URL helper; path-included into HTTP targets that do not call it yet"
 )]
-pub fn monoengine_ssh_repo_url(port: u16, user: &str) -> String {
-    format!("ssh://{user}@{}:{port}/", monoengine_reachable_host())
+pub fn mega2_ssh_repo_url(port: u16, user: &str) -> String {
+    format!("ssh://{user}@{}:{port}/", mega2_reachable_host())
 }
 
-/// Running container id for compose service `git-cli` in project `monoengine-it`.
+/// Running container id for compose service `git-cli` in project `mega2-it`.
 ///
 /// Uses `docker ps` label filters instead of `docker compose exec` so the probe
 /// does not contend on the Compose project lock (parallel cargo tests were
@@ -453,13 +450,13 @@ fn resolve_runner_kind() -> GitRunnerKind {
 }
 
 /// Resolve the runner once per process. Prefer compose `git-cli`; host git only
-/// when `MONOENGINE_IT_ALLOW_HOST_GIT=1` (local experiments).
+/// when `MEGA2_IT_ALLOW_HOST_GIT=1` (local experiments).
 ///
 /// Serialized via `OnceLock::get_or_init` so parallel tests do not stampede
 /// docker with concurrent probes.
 pub fn require_git_cli_runner() {
     if git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -473,12 +470,12 @@ fn runner_kind() -> GitRunnerKind {
         .unwrap_or_else(|| panic!("{GIT_CLI_UNAVAILABLE}: runner not selected"))
 }
 
-/// Write a GIT_ASKPASS script that prints `$MONOENGINE_IT_GIT_PASSWORD`.
+/// Write a GIT_ASKPASS script that prints `$MEGA2_IT_GIT_PASSWORD`.
 /// The token itself is never written into the script body.
 pub fn write_git_askpass(path: &Path) {
     // Use printf (not echo) so tokens like `-n` or `\c` are not interpreted.
     let script = format!(
-        "#!/bin/sh\n# Generated by monoengine IT helpers; reads {GIT_ASKPASS_ENV}.\nprintf '%s\\n' \"${GIT_ASKPASS_ENV}\"\n"
+        "#!/bin/sh\n# Generated by mega2 IT helpers; reads {GIT_ASKPASS_ENV}.\nprintf '%s\\n' \"${GIT_ASKPASS_ENV}\"\n"
     );
     fs::write(path, script).expect("write GIT_ASKPASS script");
     use std::os::unix::fs::PermissionsExt;
@@ -1151,7 +1148,7 @@ pub fn write_known_hosts_via_keyscan(known_hosts: &Path, port: u16) {
         fs::create_dir_all(parent).expect("create known_hosts parent");
     }
     let port_arg = port.to_string();
-    let scan_host = monoengine_reachable_host();
+    let scan_host = mega2_reachable_host();
     let output = match runner_kind() {
         GitRunnerKind::Container => {
             let known_container = container_path_for_host(known_hosts);
@@ -1188,7 +1185,7 @@ pub fn write_known_hosts_via_keyscan(known_hosts: &Path, port: u16) {
 
 /// Ensure the compose git-cli runtime UID has a passwd entry so OpenSSH works.
 ///
-/// CI sets `MONOENGINE_IT_GIT_UID` to the host UID (often 1001); a build-time
+/// CI sets `MEGA2_IT_GIT_UID` to the host UID (often 1001); a build-time
 /// `adduser -u 1000` alone is not enough.
 #[allow(
     dead_code,

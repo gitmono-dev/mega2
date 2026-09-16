@@ -24,7 +24,7 @@ use crate::{
     contract::vault::integration::vault_core::{VaultCore, VaultCoreInterface, with_audit_caller},
 };
 
-/// Config-managed secret fields that may be stored in the monoengine vault, with
+/// Config-managed secret fields that may be stored in the mega2 vault, with
 /// the vault namespace suffix each must use (`config/<profile>/<suffix>`). Only
 /// these fields are accepted by `config secret set/check/rotate/ref`. Database
 /// credentials remain intentionally excluded — they are a bootstrap dependency
@@ -96,13 +96,13 @@ fn unsupported_secret_field_error(name: &str) -> MegaError {
         .collect::<Vec<_>>()
         .join(", ");
     MegaError::Other(format!(
-        "{name} cannot be stored in monoengine vault; supported fields are: {supported}, storage_events.targets.<id>.secret_ref. Database credentials must stay in deployment/environment secrets."
+        "{name} cannot be stored in mega2 vault; supported fields are: {supported}, storage_events.targets.<id>.secret_ref. Database credentials must stay in deployment/environment secrets."
     ))
 }
 
 pub fn cli() -> Command {
     Command::new("config")
-        .about("Inspect and validate monoengine configuration")
+        .about("Inspect and validate mega2 configuration")
         .subcommand(
             Command::new("secret")
                 .about("Manage config-backed vault secret references")
@@ -114,7 +114,7 @@ pub fn cli() -> Command {
         )
         .subcommand(
             Command::new("vault")
-                .about("Manage the monoengine vault")
+                .about("Manage the mega2 vault")
                 .subcommand_required(true)
                 .subcommand(vault_reset_cli())
                 .subcommand(vault_rekey_cli())
@@ -387,15 +387,15 @@ fn exec_init(ctx: CommandContext, args: &ArgMatches) -> MegaResult {
     println!("created {}", output_path.display());
     println!("next steps:");
     println!(
-        "  printf '%s' \"$S3_ACCESS_KEY\" | monoengine --config {} config secret set object_storage.s3.access_key_id --vault-path config/prod/object_storage/access_key_id --field value --value-stdin",
+        "  printf '%s' \"$S3_ACCESS_KEY\" | mega2 --config {} config secret set object_storage.s3.access_key_id --vault-path config/prod/object_storage/access_key_id --field value --value-stdin",
         output_path.display()
     );
     println!(
-        "  printf '%s' \"$S3_SECRET_KEY\" | monoengine --config {} config secret set object_storage.s3.secret_access_key --vault-path config/prod/object_storage/secret_access_key --field value --value-stdin",
+        "  printf '%s' \"$S3_SECRET_KEY\" | mega2 --config {} config secret set object_storage.s3.secret_access_key --vault-path config/prod/object_storage/secret_access_key --field value --value-stdin",
         output_path.display()
     );
     println!(
-        "  monoengine --config {} config validate --resolve-secrets",
+        "  mega2 --config {} config validate --resolve-secrets",
         output_path.display()
     );
 
@@ -1091,7 +1091,7 @@ mod tests {
 
         let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
         let message = err.to_string();
-        assert!(message.contains("cannot be stored in monoengine vault"));
+        assert!(message.contains("cannot be stored in mega2 vault"));
         assert!(message.contains("supported fields are"));
     }
 
@@ -1151,7 +1151,7 @@ mod tests {
 
         let err = secret_ref_from_args(&matches).expect_err("unsupported secret");
         let message = err.to_string();
-        assert!(message.contains("cannot be stored in monoengine vault"));
+        assert!(message.contains("cannot be stored in mega2 vault"));
         assert!(message.contains("supported fields are"));
     }
 
@@ -1244,10 +1244,7 @@ mod tests {
             ])
             .unwrap();
         let err = secret_ref_from_args(&matches).expect_err("invalid id must fail");
-        assert!(
-            err.to_string()
-                .contains("cannot be stored in monoengine vault")
-        );
+        assert!(err.to_string().contains("cannot be stored in mega2 vault"));
     }
 
     #[test]
@@ -1391,7 +1388,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: access_key_ref.as_uri().to_string(),
                 secret_access_key: secret_key_ref.as_uri().to_string(),
                 endpoint_url: String::new(),

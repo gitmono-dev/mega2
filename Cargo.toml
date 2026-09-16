@@ -1,12 +1,12 @@
 [package]
-name = "monoengine"
+name = "mega2"
 version = "0.10.39"
 edition = "2024"
-# Two [[bin]] targets exist; keep `cargo run -p monoengine` unambiguous.
-default-run = "monoengine"
+# Two [[bin]] targets exist; keep `cargo run -p mega2` unambiguous.
+default-run = "mega2"
 
 [[bin]]
-name = "monoengine"
+name = "mega2"
 path = "src/main.rs"
 
 [[bin]]
@@ -14,7 +14,7 @@ name = "migrate_local_to_s3"
 path = "src/bin/migrate_local_to_s3.rs"
 
 [lib]
-name = "monoengine_core"
+name = "mega2_core"
 path = "src/lib.rs"
 doctest = false
 

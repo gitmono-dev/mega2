@@ -8,13 +8,13 @@ services:
     # (MC-10 close-out evidence). 500 aligns capacity with the real profile.
     command: ["postgres", "-c", "max_connections=500"]
     environment:
-      POSTGRES_USER: monoengine
-      POSTGRES_PASSWORD: monoengine_test_password
-      POSTGRES_DB: monoengine
+      POSTGRES_USER: mega2
+      POSTGRES_PASSWORD: mega2_test_password
+      POSTGRES_DB: mega2
     ports:
       - "127.0.0.1:15432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U monoengine -d monoengine"]
+      test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
       interval: 2s
       timeout: 5s
       retries: 20
@@ -31,7 +31,7 @@ services:
 
   # Optional SMTP capture for the website front end's authentication/product-mail
   # IT only.
-  # Monoengine does not connect to or depend on this service.
+  # Mega2 does not connect to or depend on this service.
   mailpit:
     image: axllent/mailpit:v1.27
     ports:
@@ -78,21 +78,21 @@ services:
     entrypoint: >
       /bin/sh -c "
       /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
-      /usr/bin/mc mb --ignore-existing local/monoengine &&
-      /usr/bin/mc anonymous set download local/monoengine &&
+      /usr/bin/mc mb --ignore-existing local/mega2 &&
+      /usr/bin/mc anonymous set download local/mega2 &&
       /usr/bin/mc mb --ignore-existing local/monoui &&
       /usr/bin/mc anonymous set download local/monoui &&
       exec sleep infinity
       "
     healthcheck:
-      test: ["CMD-SHELL", "/usr/bin/mc ls local/monoengine && /usr/bin/mc ls local/monoui"]
+      test: ["CMD-SHELL", "/usr/bin/mc ls local/mega2 && /usr/bin/mc ls local/monoui"]
       interval: 2s
       timeout: 5s
       retries: 20
       start_period: 3s
 
   # Fixed-version Git CLI runner for cargo-native black-box tests (ADR-IT-01).
-  # Joins networks.default and reaches per-case monoengine on the host via
+  # Joins networks.default and reaches per-case mega2 on the host via
   # host.docker.internal (extra_hosts below). Cross-platform on Linux and macOS
   # Docker Desktop; harness maps remote URLs accordingly.
   #
@@ -105,10 +105,10 @@ services:
   # Run as a fixed numeric UID/GID so Compose can resolve `user:` without
   # relying on Bash's unexported `$UID`. Default 1000:1000 matches common
   # CI runners (ubuntu-latest) and local desktop users; override with
-  # `export MONOENGINE_IT_GIT_UID=$(id -u) MONOENGINE_IT_GIT_GID=$(id -g)`
+  # `export MEGA2_IT_GIT_UID=$(id -u) MEGA2_IT_GIT_GID=$(id -g)`
   # when the test process is not 1000.
   git-cli:
-    image: monoengine-git-cli:3.7.1
+    image: mega2-git-cli:3.7.1
     build:
       context: .
       dockerfile: Dockerfile.git-cli
@@ -124,9 +124,9 @@ services:
       - default
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    user: "${MONOENGINE_IT_GIT_UID:-1000}:${MONOENGINE_IT_GIT_GID:-1000}"
+    user: "${MEGA2_IT_GIT_UID:-1000}:${MEGA2_IT_GIT_GID:-1000}"
     volumes:
-      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}:/work
+      - ${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}:/work
     working_dir: /work
     # Override the image's `git` entrypoint so the container stays up for `exec`.
     entrypoint: ["sleep", "infinity"]
@@ -140,49 +140,49 @@ services:
   #
   # Unlike `git-cli` (bridge + host.docker.internal, for the cargo-native harness
   # that spawns its own service on the host), this service talks
-  # to the compose-hosted `monoengine` over the internal bridge
-  # (http://monoengine:8000/). It runs `scripts/git_protocol_smoke.sh` against
+  # to the compose-hosted `mega2` over the internal bridge
+  # (http://mega2:8000/). It runs `scripts/git_protocol_smoke.sh` against
   # the linked stack: ls-remote / clone / fetch / push / tag-reject / LFS.
   #
-  # It depends on `monoengine` (profile `app`) being up, so bring the whole
+  # It depends on `mega2` (profile `app`) being up, so bring the whole
   # linked stack up together:
-  #   docker compose -p monoengine-it -f docker-compose.test.yml \
+  #   docker compose -p mega2-it -f docker-compose.test.yml \
   #     --profile app --profile smoke up -d --wait
   #
   # Then drive the smoke from the host:
-  #   docker compose -p monoengine-it -f docker-compose.test.yml \
+  #   docker compose -p mega2-it -f docker-compose.test.yml \
   #     --profile smoke exec -T git-smoke \
   #     bash scripts/git_protocol_smoke.sh
-  # (with MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ and a seeded token).
+  # (with MEGA2_HTTP_REPO_URL=http://mega2:8000/ and a seeded token).
   #
   # NOTE: git-smoke lives in its own `smoke` profile (not `git`) so that
   # `--profile git` invocations (git-cli + data plane) never activate it. Its
-  # `depends_on: monoengine` (profile `app`) would otherwise make the compose
+  # `depends_on: mega2` (profile `app`) would otherwise make the compose
   # project invalid whenever the `git` profile is active but `app` is not
-  # ("service git-smoke depends on undefined service monoengine").
+  # ("service git-smoke depends on undefined service mega2").
   git-smoke:
-    image: monoengine-git-smoke:3.7.1
+    image: mega2-git-smoke:3.7.1
     build:
       context: .
       dockerfile: Dockerfile.git-smoke
     profiles: ["smoke"]
     init: true
     depends_on:
-      monoengine:
+      mega2:
         condition: service_healthy
     environment:
-      # Default repo URL points at the linked compose-hosted monoengine.
-      MONOENGINE_HTTP_REPO_URL: http://monoengine:8000/
-      # Optional SSH URL (monoengine SSH service, if enabled in the stack).
-      # MONOENGINE_SSH_REPO_URL: ssh://git@monoengine:2222/
+      # Default repo URL points at the linked compose-hosted mega2.
+      MEGA2_HTTP_REPO_URL: http://mega2:8000/
+      # Optional SSH URL (mega2 SSH service, if enabled in the stack).
+      # MEGA2_SSH_REPO_URL: ssh://git@mega2:2222/
       # Push/tag/LFS smoke are opt-in via these flags.
-      MONOENGINE_GIT_SMOKE_PUSH: "1"
-      MONOENGINE_GIT_SMOKE_LFS: "0"
+      MEGA2_GIT_SMOKE_PUSH: "1"
+      MEGA2_GIT_SMOKE_LFS: "0"
       # Seed token for receive-pack Basic Auth (overridden by the exec command).
-      MONOENGINE_IT_SEED_TOKEN: monoengine-it-git-smoke-token-0001
+      MEGA2_IT_SEED_TOKEN: mega2-it-git-smoke-token-0001
     volumes:
-      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-git}:/work
-      # Mount the monoengine repo so the smoke script is available inside the
+      - ${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-git}:/work
+      # Mount the mega2 repo so the smoke script is available inside the
       # linked container (scripts/git_protocol_smoke.sh).
       - .:/repo:ro
     working_dir: /work
@@ -192,15 +192,15 @@ services:
       timeout: 5s
       retries: 20
 
-  # Standing monoengine HTTP service for stack-level IT (profile `app`).
+  # Standing mega2 HTTP service for stack-level IT (profile `app`).
   # Per-case cargo black-box tests still spawn via CARGO_BIN_EXE for isolation;
   # this service is the compose-hosted process under test for stack smoke.
-  # Build context is the parent of `monoengine/` + `orbit/` (see Dockerfile).
-  # CI may pre-tag `monoengine:local` from Dockerfile.it-runtime instead of
+  # Build context is the parent of `mega2/` + `orbit/` (see Dockerfile).
+  # CI may pre-tag `mega2:local` from Dockerfile.it-runtime instead of
   # rebuilding from source (`pull_policy: never`).
-  monoengine:
+  mega2:
     profiles: ["app"]
-    image: monoengine:local
+    image: mega2:local
     pull_policy: never
     build:
       context: .
@@ -211,10 +211,10 @@ services:
       redis:
         condition: service_healthy
     environment:
-      MEGA_BASE_DIR: /var/lib/monoengine
-      MEGA_CONFIG: /etc/monoengine/config.toml
+      MEGA_BASE_DIR: /var/lib/mega2
+      MEGA_CONFIG: /etc/mega2/config.toml
       MEGA_DATABASE__DB_TYPE: postgres
-      MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_test_password@postgres:5432/monoengine
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_test_password@postgres:5432/mega2
       MEGA_REDIS__URL: redis://redis:6379
       # Keep the full documented IT CORS allowlist when overriding the sample
       # config, and add the website-next host origin for stack session tests.
@@ -222,13 +222,13 @@ services:
       MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
       # MN-05: shared IT-only credential for website's internal product-email API.
       MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL: http://website-next:7001
-      MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
+      MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: mega2-it-website-mail-bearer-0001
       MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
-      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: /var/lib/monoengine/objects
+      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: /var/lib/mega2/objects
       MEGA_LOG__PRINT_STD: "true"
       MEGA_LOG__LEVEL: info
     volumes:
-      - monoengine-data:/var/lib/monoengine
+      - mega2-data:/var/lib/mega2
     ports:
       - "127.0.0.1:19180:8000"
     healthcheck:
@@ -241,7 +241,7 @@ services:
   # One-shot PostgreSQL schema initialization for the website front end
   # (megaui apps/web). Uses the megaui Dockerfile `db-init` target which
   # carries drizzle-kit. Account data lives in an isolated `website` database
-  # on the shared postgres service — never the monoengine business DB (ADR-WA-07).
+  # on the shared postgres service — never the mega2 business DB (ADR-WA-07).
   website-db-init:
     profiles: ["web"]
     build:
@@ -252,9 +252,9 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
+      DATABASE_URL: postgresql://mega2:mega2_test_password@postgres:5432/website
       # Connects to the maintenance DB only to CREATE DATABASE website.
-      DATABASE_ADMIN_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/postgres
+      DATABASE_ADMIN_URL: postgresql://mega2:mega2_test_password@postgres:5432/postgres
     working_dir: /app
     command:
       - /bin/sh
@@ -297,7 +297,7 @@ services:
       MEGA_COLLAB_PORT: "7002"
       MEGA_COLLAB_BIND: "0.0.0.0"
       MEGA_COLLAB_QUIET: "1"
-      MEGA_COLLAB_INTERNAL_TOKEN: monoengine-it-collab-token-0001
+      MEGA_COLLAB_INTERNAL_TOKEN: mega2-it-collab-token-0001
       # IT-only: authenticated tickets may join/edit until a web authz adapter
       # is wired; production must leave this unset (fail-closed deny-all).
       MEGA_COLLAB_DEV_ALLOW_AUTHENTICATED: "1"
@@ -312,7 +312,7 @@ services:
 
   # website Better Auth + Next app (built from sibling megaui checkout).
   # Uses isolated Postgres database `website` on the shared postgres service
-  # (not monoengine's business DB). CI must check out ../megaui too.
+  # (not mega2's business DB). CI must check out ../megaui too.
   website-next:
     profiles: ["web"]
     image: website-next:local
@@ -324,20 +324,20 @@ services:
       args:
         NEXT_PUBLIC_MEGA_COLLAB_PUBLIC_URL: ws://127.0.0.1:17002
     environment:
-      DATABASE_URL: postgresql://monoengine:monoengine_test_password@postgres:5432/website
+      DATABASE_URL: postgresql://mega2:mega2_test_password@postgres:5432/website
       APP_BASE_URL: http://127.0.0.1:17001
       BETTER_AUTH_URL: http://127.0.0.1:17001
       BETTER_AUTH_TRUSTED_ORIGINS: "http://localhost:17001,http://127.0.0.1:17001"
-      BETTER_AUTH_SECRET: monoengine-it-website-auth-secret-0001
+      BETTER_AUTH_SECRET: mega2-it-website-auth-secret-0001
       # Consumed by DEP-06's internal notification route. This public value is
       # only for the isolated Compose integration stack.
-      MONOENGINE_INTERNAL_MAIL_BEARER: monoengine-it-website-mail-bearer-0001
+      MEGA2_INTERNAL_MAIL_BEARER: mega2-it-website-mail-bearer-0001
       # WE-05/WE-06: IT product mail uses the in-memory test provider (no cloud).
       EMAIL_PROVIDER: test
-      EMAIL_DEFAULT_FROM: noreply@monoengine-it.test
-      MONOENGINE_PUBLIC_BASE_URL: http://monoengine:8000
-      # MC-07: route Code read paths through the monoengine BFF inside compose.
-      MEGA_CODE_DATA_BACKEND: monoengine
+      EMAIL_DEFAULT_FROM: noreply@mega2-it.test
+      MEGA2_PUBLIC_BASE_URL: http://mega2:8000
+      # MC-07: route Code read paths through the mega2 BFF inside compose.
+      MEGA_CODE_DATA_BACKEND: mega2
       # FS-02: uploads via RustFS S3 (stack default bucket name retained).
       S3_REGION: us-east-1
       S3_ACCESS_KEY_ID: rustfs
@@ -347,7 +347,7 @@ services:
       S3_PUBLIC_URL: http://127.0.0.1:19000/monoui
       S3_FORCE_PATH_STYLE: "true"
       MEGA_COLLAB_INTERNAL_URL: http://megaui-collab:7002
-      MEGA_COLLAB_INTERNAL_TOKEN: monoengine-it-collab-token-0001
+      MEGA_COLLAB_INTERNAL_TOKEN: mega2-it-collab-token-0001
       NEXT_PUBLIC_MEGA_COLLAB_PUBLIC_URL: ws://127.0.0.1:17002
     depends_on:
       postgres:
@@ -368,8 +368,8 @@ services:
       start_period: 20s
 
 volumes:
-  monoengine-data:
+  mega2-data:
 
 networks:
   default:
-    name: monoengine-test-network
+    name: mega2-test-network

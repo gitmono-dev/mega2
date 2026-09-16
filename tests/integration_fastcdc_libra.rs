@@ -1,4 +1,4 @@
-//! FC-15: two-process FastCDC interop gate (monoengine HTTP + Libra client).
+//! FC-15: two-process FastCDC interop gate (mega2 HTTP + Libra client).
 //!
 //! Compiled only with `--features fastcdc`. Default `cargo test --all` does not
 //! require a sibling Libra checkout. Live cases are `#[ignore]` and fail closed
@@ -31,8 +31,7 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 const REPO_PREFIX: &str = "/acme/app.git";
 // Boot + Libra child + shutdown + port close stay under the 10-minute card budget.
@@ -54,7 +53,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_fastcdc_{}_{}",
+            "mega2_fastcdc_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -62,7 +61,7 @@ impl TestDatabase {
         with_runtime(async {
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
                 )
             });
             execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -174,7 +173,7 @@ struct ServiceProcess {
 
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         let service = Self {
             child,
             reaped: false,
@@ -303,12 +302,12 @@ impl Drop for ChildGroup {
 
 #[test]
 #[ignore = "explicit FC-15 gate; requires LIBRA_DIR at LIBRA_INTEROP_REV"]
-fn monoengine_libra_fastcdc_interop() {
+fn mega2_libra_fastcdc_interop() {
     let libra_dir = fastcdc_gate::require_libra_checkout();
     let token = git_cli::resolve_seed_token();
     let env = FastcdcEnv::new();
     let (mut service, port, _stdout_path, stderr_path) =
-        boot_service_http(&env, Path::new(env!("CARGO_BIN_EXE_monoengine")));
+        boot_service_http(&env, Path::new(env!("CARGO_BIN_EXE_mega2")));
     let service_pid = service.pid();
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
     git_cli::seed_access_token(
@@ -358,10 +357,10 @@ fn monoengine_libra_fastcdc_interop() {
             "--",
             "--ignored",
             "--exact",
-            "monoengine_fastcdc_http_interop",
+            "mega2_fastcdc_http_interop",
             "--nocapture",
         ])
-        .env("MONOENGINE_FASTCDC_READY_FILE", &ready.path)
+        .env("MEGA2_FASTCDC_READY_FILE", &ready.path)
         .env("CARGO_TERM_COLOR", "never")
         .stdout(Stdio::from(create_log_file(&child_stdout)))
         .stderr(Stdio::from(create_log_file(&child_stderr)));
@@ -372,7 +371,7 @@ fn monoengine_libra_fastcdc_interop() {
     let stderr = fastcdc_gate::redact_secrets(&read_log(&child_stderr), &token, &lfs_url);
     assert!(
         status.success(),
-        "Libra monoengine_fastcdc_http_interop failed ({status})\nstdout:\n{stdout}\nstderr:\n{stderr}\nservice stderr:\n{}",
+        "Libra mega2_fastcdc_http_interop failed ({status})\nstdout:\n{stdout}\nstderr:\n{stderr}\nservice stderr:\n{}",
         fastcdc_gate::redact_secrets(&read_log(&stderr_path), &token, &lfs_url)
     );
 
@@ -380,7 +379,7 @@ fn monoengine_libra_fastcdc_interop() {
     assert!(
         !env.temp_dir
             .path()
-            .join("monoengine-fastcdc-ready.json")
+            .join("mega2-fastcdc-ready.json")
             .exists(),
         "ready-file must be deleted after the Libra child exits"
     );
@@ -395,16 +394,15 @@ fn monoengine_libra_fastcdc_interop() {
 }
 
 #[test]
-#[ignore = "explicit FC-15 feature-off companion; requires LIBRA_DIR and MONOENGINE_FASTCDC_OFF_BIN"]
-fn monoengine_fastcdc_feature_off_falls_back() {
+#[ignore = "explicit FC-15 feature-off companion; requires LIBRA_DIR and MEGA2_FASTCDC_OFF_BIN"]
+fn mega2_fastcdc_feature_off_falls_back() {
     let libra_dir = fastcdc_gate::require_libra_checkout();
-    let off_bin = std::env::var("MONOENGINE_FASTCDC_OFF_BIN").unwrap_or_else(|_| {
-        panic!("MONOENGINE_FASTCDC_OFF_BIN is required (feature-off monoengine binary)")
-    });
+    let off_bin = std::env::var("MEGA2_FASTCDC_OFF_BIN")
+        .unwrap_or_else(|_| panic!("MEGA2_FASTCDC_OFF_BIN is required (feature-off mega2 binary)"));
     let off_bin = PathBuf::from(off_bin);
     assert!(
         off_bin.is_file(),
-        "MONOENGINE_FASTCDC_OFF_BIN {} is not a file",
+        "MEGA2_FASTCDC_OFF_BIN {} is not a file",
         off_bin.display()
     );
 

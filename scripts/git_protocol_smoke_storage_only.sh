@@ -11,26 +11,26 @@ Storage-only / trunk Git protocol smoke (black-box via git client).
 Protocol clients: git, git-lfs, OpenSSH ssh. Do not use libra as a client.
 
 Optional environment:
-  MONOENGINE_HTTP_REPO_URL       Smart HTTP URL (required once HTTP cases exist)
-  MONOENGINE_SSH_REPO_URL        SSH URL for SSH cases
-  MONOENGINE_SMOKE_CASE          Exact case name; run only that case (unmatched → exit 2)
-  MONOENGINE_GIT_SMOKE_PUSH      Set to 1 to enable write cases (when registered)
-  MONOENGINE_GIT_SMOKE_LFS       Set to 1 to enable LFS cases (when registered)
-  MONOENGINE_IT_SEED_TOKEN      Push token for Basic auth when URL has no userinfo
-  MONOENGINE_GIT_SMOKE_WORKDIR    Existing directory for temporary clones
-  MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
+  MEGA2_HTTP_REPO_URL       Smart HTTP URL (required once HTTP cases exist)
+  MEGA2_SSH_REPO_URL        SSH URL for SSH cases
+  MEGA2_SMOKE_CASE          Exact case name; run only that case (unmatched → exit 2)
+  MEGA2_GIT_SMOKE_PUSH      Set to 1 to enable write cases (when registered)
+  MEGA2_GIT_SMOKE_LFS       Set to 1 to enable LFS cases (when registered)
+  MEGA2_IT_SEED_TOKEN      Push token for Basic auth when URL has no userinfo
+  MEGA2_GIT_SMOKE_WORKDIR    Existing directory for temporary clones
+  MEGA2_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
 
 Compose black-box example (after service init — see docs/deploy-trunk.md):
-  docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
-    exec -T -e MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
-    -e MONOENGINE_SMOKE_CASE='HTTP ls-remote' \
+  docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
+    exec -T -e MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
+    -e MEGA2_SMOKE_CASE='HTTP ls-remote' \
     git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh
 
 Persist host log (ADR-SO-10):
   mkdir -p target/tmp
-  LOG="target/tmp/so-smoke-$(date -u +%Y%m%dT%H%M%SZ)-${MONOENGINE_SMOKE_CASE:-all}.log"
+  LOG="target/tmp/so-smoke-$(date -u +%Y%m%dT%H%M%SZ)-${MEGA2_SMOKE_CASE:-all}.log"
   set -o pipefail
-  docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
     exec -T git-smoke bash /repo/scripts/git_protocol_smoke_storage_only.sh \
     2>&1 | tee "$LOG"
 USAGE
@@ -46,13 +46,13 @@ command -v git >/dev/null 2>&1 || {
   exit 2
 }
 
-ROOT_DIR="${MONOENGINE_GIT_SMOKE_WORKDIR:-$(mktemp -d)}"
+ROOT_DIR="${MEGA2_GIT_SMOKE_WORKDIR:-$(mktemp -d)}"
 if [[ ! -d "$ROOT_DIR" ]]; then
   mkdir -p "$ROOT_DIR"
 fi
 
 cleanup() {
-  if [[ -z "${MONOENGINE_GIT_SMOKE_WORKDIR:-}" && "${MONOENGINE_GIT_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
+  if [[ -z "${MEGA2_GIT_SMOKE_WORKDIR:-}" && "${MEGA2_GIT_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
     rm -rf "$ROOT_DIR"
   else
     echo "smoke workdir kept at: $ROOT_DIR"
@@ -63,7 +63,7 @@ trap cleanup EXIT
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
-CASE_FILTER="${MONOENGINE_SMOKE_CASE:-}"
+CASE_FILTER="${MEGA2_SMOKE_CASE:-}"
 CASE_HIT=0
 
 run_case() {
@@ -99,8 +99,8 @@ git_case() {
 }
 
 require_http_url() {
-  if [[ -z "${MONOENGINE_HTTP_REPO_URL:-}" ]]; then
-    echo "MONOENGINE_HTTP_REPO_URL is required for HTTP smoke cases" >&2
+  if [[ -z "${MEGA2_HTTP_REPO_URL:-}" ]]; then
+    echo "MEGA2_HTTP_REPO_URL is required for HTTP smoke cases" >&2
     return 1
   fi
 }
@@ -116,8 +116,8 @@ ensure_git_ssh_command() {
 }
 
 require_ssh_url() {
-  if [[ -z "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
-    echo "MONOENGINE_SSH_REPO_URL is required for SSH smoke cases" >&2
+  if [[ -z "${MEGA2_SSH_REPO_URL:-}" ]]; then
+    echo "MEGA2_SSH_REPO_URL is required for SSH smoke cases" >&2
     return 1
   fi
   ensure_git_ssh_command
@@ -125,7 +125,7 @@ require_ssh_url() {
 
 case_http_ls_remote() {
   require_http_url || return 1
-  git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
+  git_case ls-remote "$MEGA2_HTTP_REPO_URL"
 }
 
 clone_case() {
@@ -141,7 +141,7 @@ clone_case() {
 
 case_http_clone() {
   require_http_url || return 1
-  clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
+  clone_case "$MEGA2_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
 }
 
 fetch_case() {
@@ -154,21 +154,21 @@ fetch_case() {
 case_http_fetch() {
   require_http_url || return 1
   local dest="$ROOT_DIR/http-fetch"
-  clone_case "$MONOENGINE_HTTP_REPO_URL" "$dest" || return
+  clone_case "$MEGA2_HTTP_REPO_URL" "$dest" || return
   fetch_case "$dest"
 }
 
 case_http_protocol_v2_fetch() {
   require_http_url || return 1
   local dest="$ROOT_DIR/http-v2-fetch"
-  clone_case "$MONOENGINE_HTTP_REPO_URL" "$dest" || return
+  clone_case "$MEGA2_HTTP_REPO_URL" "$dest" || return
   fetch_case "$dest" -c protocol.version=2
 }
 
 case_http_shallow_clone() {
   require_http_url || return 1
   local dest="$ROOT_DIR/http-shallow"
-  clone_case "$MONOENGINE_HTTP_REPO_URL" "$dest" --depth=1 || return
+  clone_case "$MEGA2_HTTP_REPO_URL" "$dest" --depth=1 || return
   local shallow
   shallow="$(git -C "$dest" rev-parse --is-shallow-repository)" || return
   if [[ "$shallow" != "true" ]]; then
@@ -179,7 +179,7 @@ case_http_shallow_clone() {
 
 case_http_protocol_v2_ls_remote() {
   require_http_url || return 1
-  git_case -c protocol.version=2 ls-remote "$MONOENGINE_HTTP_REPO_URL"
+  git_case -c protocol.version=2 ls-remote "$MEGA2_HTTP_REPO_URL"
 }
 
 clone_protocol_v2_blobless() {
@@ -207,7 +207,7 @@ clone_protocol_v2_blobless() {
 case_http_protocol_v2_blob_none_clone() {
   require_http_url || return 1
   clone_protocol_v2_blobless \
-    "$MONOENGINE_HTTP_REPO_URL" \
+    "$MEGA2_HTTP_REPO_URL" \
     "$ROOT_DIR/http-blobless" \
     "$ROOT_DIR/http-blobless.stderr"
 }
@@ -226,7 +226,7 @@ http_url_with_push_token() {
     return 0
   fi
   if [[ -z "$token" ]]; then
-    echo "MONOENGINE_IT_SEED_TOKEN (or credentialed MONOENGINE_HTTP_REPO_URL) is required for trunk push" >&2
+    echo "MEGA2_IT_SEED_TOKEN (or credentialed MEGA2_HTTP_REPO_URL) is required for trunk push" >&2
     return 1
   fi
   case "$url" in
@@ -247,15 +247,15 @@ remote_tip_sha() {
 # Trunk write: tip must advance (ADR-SO-02). CL-ref creation is not a pass criterion.
 case_http_trunk_push() {
   require_http_url || return 1
-  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
-    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP trunk push" >&2
+  if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MEGA2_GIT_SMOKE_PUSH=1 is required for HTTP trunk push" >&2
     return 1
   fi
   local auth_url src before after head
   # B0 rejects path=/; default stack exposes /project after service init (deploy-trunk §9).
   local repo_url
   repo_url="$(trunk_http_repo_url)" || return 1
-  auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
+  auth_url="$(http_url_with_push_token "$repo_url" "${MEGA2_IT_SEED_TOKEN:-}")" || return 1
   src="$ROOT_DIR/http-trunk-push"
   rm -rf "$src"
   before="$(remote_tip_sha "$auth_url")" || return 1
@@ -264,11 +264,11 @@ case_http_trunk_push() {
     return 1
   fi
   git_case clone "$auth_url" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
-  printf 'monoengine trunk smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/trunk-smoke.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
+  printf 'mega2 trunk smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/trunk-smoke.txt"
   git -C "$src" add trunk-smoke.txt || return 1
-  git -C "$src" commit -m "monoengine trunk smoke" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 trunk smoke" >/dev/null || return 1
   head="$(git -C "$src" rev-parse HEAD)" || return 1
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" || return 1
   after="$(remote_tip_sha "$auth_url")" || return 1
@@ -283,7 +283,7 @@ case_http_trunk_push() {
 }
 
 trunk_http_repo_url() {
-  local repo_url="${MONOENGINE_HTTP_REPO_URL:-}"
+  local repo_url="${MEGA2_HTTP_REPO_URL:-}"
   require_http_url || return 1
   if [[ "$repo_url" =~ ^https?://[^/]+/?$ ]]; then
     repo_url="${repo_url%/}/project"
@@ -293,22 +293,22 @@ trunk_http_repo_url() {
 
 # Tag push must fail; remote must not retain the tag (ADR-SO-02).
 case_http_reject_git_client_tag_push() {
-  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
-    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP reject Git-client tag push" >&2
+  if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MEGA2_GIT_SMOKE_PUSH=1 is required for HTTP reject Git-client tag push" >&2
     return 1
   fi
   local repo_url auth_url src tag push_status=0
   repo_url="$(trunk_http_repo_url)" || return 1
-  auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
+  auth_url="$(http_url_with_push_token "$repo_url" "${MEGA2_IT_SEED_TOKEN:-}")" || return 1
   src="$ROOT_DIR/http-reject-tag"
-  tag="monoengine-smoke-tag-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  tag="mega2-smoke-tag-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   rm -rf "$src"
   git_case clone "$auth_url" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
-  printf 'monoengine git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
+  printf 'mega2 git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
   git -C "$src" add smoke-tag.txt || return 1
-  git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 git tag smoke" >/dev/null || return 1
   git -C "$src" tag "$tag" || return 1
   set +e
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag"
@@ -339,11 +339,11 @@ case_http_reject_unauthenticated_push() {
   rm -rf "$src"
   before="$(remote_tip_sha "$repo_url")" || return 1
   git_case clone "$repo_url" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
-  printf 'monoengine unauth push smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/unauth-smoke.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
+  printf 'mega2 unauth push smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/unauth-smoke.txt"
   git -C "$src" add unauth-smoke.txt || return 1
-  git -C "$src" commit -m "monoengine unauth push smoke" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 unauth push smoke" >/dev/null || return 1
   set +e
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main"
   push_status=$?
@@ -362,8 +362,8 @@ case_http_reject_unauthenticated_push() {
 # Anonymous tip advance under push_auth=none (ADR-SO-06 stack).
 case_http_trunk_push_none() {
   require_http_url || return 1
-  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
-    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP trunk push (none)" >&2
+  if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MEGA2_GIT_SMOKE_PUSH=1 is required for HTTP trunk push (none)" >&2
     return 1
   fi
   local repo_url src before after head
@@ -380,11 +380,11 @@ case_http_trunk_push_none() {
     return 1
   fi
   git_case clone "$repo_url" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
-  printf 'monoengine trunk none smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/trunk-none-smoke.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
+  printf 'mega2 trunk none smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/trunk-none-smoke.txt"
   git -C "$src" add trunk-none-smoke.txt || return 1
-  git -C "$src" commit -m "monoengine trunk none smoke" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 trunk none smoke" >/dev/null || return 1
   head="$(git -C "$src" rev-parse HEAD)" || return 1
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" || return 1
   after="$(remote_tip_sha "$repo_url")" || return 1
@@ -400,8 +400,8 @@ case_http_trunk_push_none() {
 
 # Tag push must fail under push_auth=none; remote must not retain the tag.
 case_http_reject_git_client_tag_push_none() {
-  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
-    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP reject Git-client tag push (none)" >&2
+  if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MEGA2_GIT_SMOKE_PUSH=1 is required for HTTP reject Git-client tag push (none)" >&2
     return 1
   fi
   local repo_url src tag push_status=0
@@ -411,14 +411,14 @@ case_http_reject_git_client_tag_push_none() {
     https://*@*) repo_url="https://${repo_url#*@}" ;;
   esac
   src="$ROOT_DIR/http-reject-tag-none"
-  tag="monoengine-smoke-tag-none-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  tag="mega2-smoke-tag-none-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   rm -rf "$src"
   git_case clone "$repo_url" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
-  printf 'monoengine git tag none smoke %s\n' "$tag" >"$src/smoke-tag-none.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
+  printf 'mega2 git tag none smoke %s\n' "$tag" >"$src/smoke-tag-none.txt"
   git -C "$src" add smoke-tag-none.txt || return 1
-  git -C "$src" commit -m "monoengine git tag none smoke" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 git tag none smoke" >/dev/null || return 1
   git -C "$src" tag "$tag" || return 1
   set +e
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag"
@@ -450,24 +450,24 @@ configure_lfs_http_remote() {
 # Trunk LFS: push pointer+object to main, peer pull + cmp (ADR-SO-02/04). No CL-ref fetch.
 case_http_lfs_push_and_pull_trunk() {
   require_http_url || return 1
-  if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" != "1" ]]; then
-    echo "MONOENGINE_GIT_SMOKE_PUSH=1 is required for HTTP LFS push and pull (trunk)" >&2
+  if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" != "1" ]]; then
+    echo "MEGA2_GIT_SMOKE_PUSH=1 is required for HTTP LFS push and pull (trunk)" >&2
     return 1
   fi
-  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" != "1" ]]; then
-    echo "MONOENGINE_GIT_SMOKE_LFS=1 is required for HTTP LFS push and pull (trunk)" >&2
+  if [[ "${MEGA2_GIT_SMOKE_LFS:-}" != "1" ]]; then
+    echo "MEGA2_GIT_SMOKE_LFS=1 is required for HTTP LFS push and pull (trunk)" >&2
     return 1
   fi
   git lfs version >/dev/null 2>&1 || {
-    echo "git-lfs is required for MONOENGINE_GIT_SMOKE_LFS=1" >&2
+    echo "git-lfs is required for MEGA2_GIT_SMOKE_LFS=1" >&2
     return 1
   }
   local repo_url auth_url src peer before after head binary
   repo_url="$(trunk_http_repo_url)" || return 1
-  auth_url="$(http_url_with_push_token "$repo_url" "${MONOENGINE_IT_SEED_TOKEN:-}")" || return 1
+  auth_url="$(http_url_with_push_token "$repo_url" "${MEGA2_IT_SEED_TOKEN:-}")" || return 1
   src="$ROOT_DIR/http-lfs-trunk-src"
   peer="$ROOT_DIR/http-lfs-trunk-peer"
-  binary="monoengine-smoke-lfs.bin"
+  binary="mega2-smoke-lfs.bin"
   rm -rf "$src" "$peer"
   before="$(remote_tip_sha "$auth_url")" || return 1
   if [[ -z "$before" ]]; then
@@ -475,14 +475,14 @@ case_http_lfs_push_and_pull_trunk() {
     return 1
   fi
   git_case clone "$auth_url" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
   git -C "$src" lfs install --local >/dev/null || return 1
   configure_lfs_http_remote "$src" "$auth_url" || return 1
   git -C "$src" lfs track "*.bin" >/dev/null || return 1
-  printf 'monoengine trunk lfs smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/$binary"
+  printf 'mega2 trunk lfs smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/$binary"
   git -C "$src" add .gitattributes "$binary" || return 1
-  git -C "$src" commit -m "monoengine trunk lfs smoke" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 trunk lfs smoke" >/dev/null || return 1
   head="$(git -C "$src" rev-parse HEAD)" || return 1
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" || return 1
   after="$(remote_tip_sha "$auth_url")" || return 1
@@ -511,32 +511,32 @@ case_http_lfs_push_and_pull_trunk() {
 
 case_ssh_ls_remote() {
   require_ssh_url || return 1
-  git_case ls-remote "$MONOENGINE_SSH_REPO_URL"
+  git_case ls-remote "$MEGA2_SSH_REPO_URL"
 }
 
 case_ssh_clone() {
   require_ssh_url || return 1
-  clone_case "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-clone"
+  clone_case "$MEGA2_SSH_REPO_URL" "$ROOT_DIR/ssh-clone"
 }
 
 case_ssh_fetch() {
   require_ssh_url || return 1
   local dest="$ROOT_DIR/ssh-fetch"
-  clone_case "$MONOENGINE_SSH_REPO_URL" "$dest" || return 1
+  clone_case "$MEGA2_SSH_REPO_URL" "$dest" || return 1
   fetch_case "$dest"
 }
 
 case_ssh_protocol_v2_fetch() {
   require_ssh_url || return 1
   local dest="$ROOT_DIR/ssh-v2-fetch"
-  clone_case "$MONOENGINE_SSH_REPO_URL" "$dest" || return 1
+  clone_case "$MEGA2_SSH_REPO_URL" "$dest" || return 1
   fetch_case "$dest" -c protocol.version=2
 }
 
 case_ssh_shallow_clone() {
   require_ssh_url || return 1
   local dest="$ROOT_DIR/ssh-shallow"
-  clone_case "$MONOENGINE_SSH_REPO_URL" "$dest" --depth=1 || return 1
+  clone_case "$MEGA2_SSH_REPO_URL" "$dest" --depth=1 || return 1
   local shallow
   shallow="$(git -C "$dest" rev-parse --is-shallow-repository)" || return 1
   if [[ "$shallow" != "true" ]]; then
@@ -547,13 +547,13 @@ case_ssh_shallow_clone() {
 
 case_ssh_protocol_v2_ls_remote() {
   require_ssh_url || return 1
-  git_case -c protocol.version=2 ls-remote "$MONOENGINE_SSH_REPO_URL"
+  git_case -c protocol.version=2 ls-remote "$MEGA2_SSH_REPO_URL"
 }
 
 case_ssh_protocol_v2_blob_none_clone() {
   require_ssh_url || return 1
   clone_protocol_v2_blobless \
-    "$MONOENGINE_SSH_REPO_URL" \
+    "$MEGA2_SSH_REPO_URL" \
     "$ROOT_DIR/ssh-blobless" \
     "$ROOT_DIR/ssh-blobless.stderr"
 }
@@ -565,12 +565,12 @@ case_ssh_reject_receive_pack() {
   src="$ROOT_DIR/ssh-reject-receive-pack"
   log="$ROOT_DIR/ssh-reject-receive-pack.stderr"
   rm -rf "$src"
-  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$MONOENGINE_SSH_REPO_URL" "$src" >/dev/null || return 1
-  git -C "$src" config user.name "Monoengine Smoke" || return 1
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return 1
-  printf 'monoengine ssh receive-pack reject %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/ssh-rp-reject.txt"
+  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$MEGA2_SSH_REPO_URL" "$src" >/dev/null || return 1
+  git -C "$src" config user.name "Mega2 Smoke" || return 1
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return 1
+  printf 'mega2 ssh receive-pack reject %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"$src/ssh-rp-reject.txt"
   git -C "$src" add ssh-rp-reject.txt || return 1
-  git -C "$src" commit -m "monoengine ssh receive-pack reject" >/dev/null || return 1
+  git -C "$src" commit -m "mega2 ssh receive-pack reject" >/dev/null || return 1
   set +e
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/main" >"$log" 2>&1
   push_status=$?
@@ -597,15 +597,15 @@ run_case "HTTP protocol v2 ls-remote" case_http_protocol_v2_ls_remote
 run_case "HTTP protocol v2 blob:none clone" case_http_protocol_v2_blob_none_clone
 run_case "HTTP reject unauthenticated push" case_http_reject_unauthenticated_push
 
-if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
+if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" == "1" ]]; then
   run_case "HTTP trunk push" case_http_trunk_push
   run_case "HTTP reject Git-client tag push" case_http_reject_git_client_tag_push
   run_case "HTTP trunk push (none)" case_http_trunk_push_none
   run_case "HTTP reject Git-client tag push (none)" case_http_reject_git_client_tag_push_none
-  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
+  if [[ "${MEGA2_GIT_SMOKE_LFS:-}" == "1" ]]; then
     run_case "HTTP LFS push and pull (trunk)" case_http_lfs_push_and_pull_trunk
   elif [[ -n "$CASE_FILTER" && "$CASE_FILTER" == "HTTP LFS push and pull (trunk)" ]]; then
-    echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_LFS=1" >&2
+    echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' requires MEGA2_GIT_SMOKE_LFS=1" >&2
     echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
     exit 2
   fi
@@ -616,12 +616,12 @@ elif [[ -n "$CASE_FILTER" && (
   "$CASE_FILTER" == "HTTP reject Git-client tag push (none)" ||
   "$CASE_FILTER" == "HTTP LFS push and pull (trunk)"
 ) ]]; then
-  echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_GIT_SMOKE_PUSH=1" >&2
+  echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' requires MEGA2_GIT_SMOKE_PUSH=1" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2
 fi
 
-if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
+if [[ -n "${MEGA2_SSH_REPO_URL:-}" ]]; then
   run_case "SSH ls-remote" case_ssh_ls_remote
   run_case "SSH clone" case_ssh_clone
   run_case "SSH fetch" case_ssh_fetch
@@ -632,7 +632,7 @@ if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
   run_case "SSH reject receive-pack" case_ssh_reject_receive_pack
 else
   # SO-04: unset SSH URL ⇒ SKIP (not failed), even under CASE filter.
-  skip_case "SSH reject receive-pack" "MONOENGINE_SSH_REPO_URL unset"
+  skip_case "SSH reject receive-pack" "MEGA2_SSH_REPO_URL unset"
   if [[ -n "$CASE_FILTER" && (
     "$CASE_FILTER" == "SSH ls-remote" ||
     "$CASE_FILTER" == "SSH clone" ||
@@ -642,14 +642,14 @@ else
     "$CASE_FILTER" == "SSH protocol v2 ls-remote" ||
     "$CASE_FILTER" == "SSH protocol v2 blob:none clone"
   ) ]]; then
-    echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' requires MONOENGINE_SSH_REPO_URL" >&2
+    echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' requires MEGA2_SSH_REPO_URL" >&2
     echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
     exit 2
   fi
 fi
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
-  echo "FAIL: MONOENGINE_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
+  echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
   echo "git protocol smoke storage_only summary: 0 passed, 1 failed (${SKIP_COUNT} skipped)"
   exit 2
 fi

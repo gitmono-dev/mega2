@@ -35,7 +35,7 @@ target-codex-review/
 secrets/
 
 # Host binary staging for Dockerfile.it-runtime (CI/local compose image)
-monoengine.itbin
+mega2.itbin
 
 # Mac
 .DS_Store

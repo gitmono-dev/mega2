@@ -1927,7 +1927,7 @@ mod tests {
     use crate::orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
 
     fn valid_config() -> Config {
-        isolated_config(std::env::temp_dir().join("monoengine-config-validate-tests"))
+        isolated_config(std::env::temp_dir().join("mega2-config-validate-tests"))
     }
 
     #[test]
@@ -2211,9 +2211,7 @@ mod tests {
         config.vault = Some(crate::config::VaultConfig {
             audit: crate::config::VaultAuditConfig {
                 sink: "file".to_string(),
-                file_path: Some(std::path::PathBuf::from(
-                    "/var/log/monoengine/vault-audit.jsonl",
-                )),
+                file_path: Some(std::path::PathBuf::from("/var/log/mega2/vault-audit.jsonl")),
                 fail_closed: true,
                 ..Default::default()
             },
@@ -2761,7 +2759,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3Compatible,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine".to_string(),
+                bucket: "mega2".to_string(),
                 access_key_id: "ak".to_string(),
                 secret_access_key: "sk".to_string(),
                 endpoint_url: "http://127.0.0.1:9000".to_string(),
@@ -2788,7 +2786,7 @@ mod tests {
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::Gcs,
             gcs: GcsConfig {
-                bucket: "monoengine".to_string(),
+                bucket: "mega2".to_string(),
             },
             ..Default::default()
         };
@@ -2845,7 +2843,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: "vault://secret/config/prod/object_storage/access_key_id#value"
                     .to_string(),
                 secret_access_key:
@@ -2867,7 +2865,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: "vault://secret/config/prod/object-storage/access#value".to_string(),
                 secret_access_key: "secret".to_string(),
                 endpoint_url: String::new(),
@@ -2893,7 +2891,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: "AKIA-example".to_string(),
                 secret_access_key: "vault://secret/config/prod/mail/password#value".to_string(),
                 endpoint_url: String::new(),
@@ -3331,7 +3329,7 @@ mod tests {
 
     #[test]
     fn config_init_template_has_no_unconsumed_fields() {
-        let rendered = config_init_template(Path::new("/tmp/monoengine"));
+        let rendered = config_init_template(Path::new("/tmp/mega2"));
         let value = toml::from_str::<Value>(&rendered).unwrap();
 
         assert!(known_unconsumed_fields(&value).is_empty());

@@ -5,7 +5,7 @@
 # Prerequisites:
 #   - Host docker CLI + daemon (DEP-DR-02)
 #   - Reachable storage-only registry (default http://127.0.0.1:9000 with [oci] enabled)
-#   - Push token: MONOENGINE_OCI_SMOKE_TOKEN, or secrets/monoengine-push-token.local
+#   - Push token: MEGA2_OCI_SMOKE_TOKEN, or secrets/mega2-push-token.local
 #
 # SKIP policy: docker missing/daemon down OR registry unreachable → all cases SKIP,
 # explicit reason, exit 0 (never FAIL those preconditions).
@@ -34,21 +34,21 @@ usage() {
     'Storage-only OCI /v2 docker CLI smoke (login → import → push → pull → logout).' \
     '' \
     'Optional environment:' \
-    '  MONOENGINE_OCI_SMOKE_REGISTRY   Registry base URL (default http://127.0.0.1:9000)' \
-    '  MONOENGINE_OCI_SMOKE_TOKEN      Push token password for docker login' \
-    '                                 (default: secrets/monoengine-push-token.local)' \
-    '  MONOENGINE_OCI_SMOKE_USER       docker login username (default: oci-smoke; ignored by server)' \
-    '  MONOENGINE_OCI_SMOKE_REPO       Multi-segment repo name (default: team/oci-smoke)' \
-    '  MONOENGINE_OCI_SMOKE_TAG        Image tag (default: smoke)' \
-    '  MONOENGINE_OCI_SMOKE_WORKDIR    Existing workdir for rootfs/tar (default: mktemp)' \
-    '  MONOENGINE_OCI_SMOKE_KEEP_WORKDIR  Set to 1 to keep workdir' \
-    '  MONOENGINE_SMOKE_CASE           Exact case name; run only that case (unmatched → exit 2)' \
+    '  MEGA2_OCI_SMOKE_REGISTRY   Registry base URL (default http://127.0.0.1:9000)' \
+    '  MEGA2_OCI_SMOKE_TOKEN      Push token password for docker login' \
+    '                                 (default: secrets/mega2-push-token.local)' \
+    '  MEGA2_OCI_SMOKE_USER       docker login username (default: oci-smoke; ignored by server)' \
+    '  MEGA2_OCI_SMOKE_REPO       Multi-segment repo name (default: team/oci-smoke)' \
+    '  MEGA2_OCI_SMOKE_TAG        Image tag (default: smoke)' \
+    '  MEGA2_OCI_SMOKE_WORKDIR    Existing workdir for rootfs/tar (default: mktemp)' \
+    '  MEGA2_OCI_SMOKE_KEEP_WORKDIR  Set to 1 to keep workdir' \
+    '  MEGA2_SMOKE_CASE           Exact case name; run only that case (unmatched → exit 2)' \
     '' \
     'Examples:' \
     '  bash scripts/oci_smoke_storage_only.sh' \
-    '  MONOENGINE_OCI_SMOKE_REGISTRY=http://127.0.0.1:9000 bash scripts/oci_smoke_storage_only.sh' \
+    '  MEGA2_OCI_SMOKE_REGISTRY=http://127.0.0.1:9000 bash scripts/oci_smoke_storage_only.sh' \
     '  env PATH="/nonexistent" /bin/bash scripts/oci_smoke_storage_only.sh   # docker-missing SKIP' \
-    '  MONOENGINE_OCI_SMOKE_REGISTRY=http://127.0.0.1:1 bash scripts/oci_smoke_storage_only.sh  # unreachable SKIP'
+    '  MEGA2_OCI_SMOKE_REGISTRY=http://127.0.0.1:1 bash scripts/oci_smoke_storage_only.sh  # unreachable SKIP'
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -59,7 +59,7 @@ fi
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
-CASE_FILTER="${MONOENGINE_SMOKE_CASE:-}"
+CASE_FILTER="${MEGA2_SMOKE_CASE:-}"
 CASE_HIT=0
 
 print_summary() {
@@ -84,7 +84,7 @@ skip_all_cases() {
   skip_case "login without token presents 401" "${reason}"
   skip_case "docker logout" "${reason}"
   if [[ -n "${CASE_FILTER}" && "${CASE_HIT}" -eq 0 ]]; then
-    echo "FAIL: MONOENGINE_SMOKE_CASE='${CASE_FILTER}' matched no registered case" >&2
+    echo "FAIL: MEGA2_SMOKE_CASE='${CASE_FILTER}' matched no registered case" >&2
     print_summary
     exit 2
   fi
@@ -108,7 +108,7 @@ else
 fi
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-REGISTRY_RAW="${MONOENGINE_OCI_SMOKE_REGISTRY:-http://127.0.0.1:9000}"
+REGISTRY_RAW="${MEGA2_OCI_SMOKE_REGISTRY:-http://127.0.0.1:9000}"
 REGISTRY="${REGISTRY_RAW%/}"
 case "${REGISTRY}" in
 http://*) HOST="${REGISTRY#http://}" ;;
@@ -116,18 +116,18 @@ https://*) HOST="${REGISTRY#https://}" ;;
 *) HOST="${REGISTRY}" ;;
 esac
 
-SMOKE_USER="${MONOENGINE_OCI_SMOKE_USER:-oci-smoke}"
-SMOKE_REPO="${MONOENGINE_OCI_SMOKE_REPO:-team/oci-smoke}"
-SMOKE_TAG="${MONOENGINE_OCI_SMOKE_TAG:-smoke}"
+SMOKE_USER="${MEGA2_OCI_SMOKE_USER:-oci-smoke}"
+SMOKE_REPO="${MEGA2_OCI_SMOKE_REPO:-team/oci-smoke}"
+SMOKE_TAG="${MEGA2_OCI_SMOKE_TAG:-smoke}"
 IMAGE="${HOST}/${SMOKE_REPO}:${SMOKE_TAG}"
 
 TOKEN=""
 load_token() {
-  if [[ -n "${MONOENGINE_OCI_SMOKE_TOKEN:-}" ]]; then
-    TOKEN="${MONOENGINE_OCI_SMOKE_TOKEN}"
+  if [[ -n "${MEGA2_OCI_SMOKE_TOKEN:-}" ]]; then
+    TOKEN="${MEGA2_OCI_SMOKE_TOKEN}"
     return 0
   fi
-  local token_file="${REPO_ROOT}/secrets/monoengine-push-token.local"
+  local token_file="${REPO_ROOT}/secrets/mega2-push-token.local"
   if [[ -f "${token_file}" ]]; then
     if [[ -n "${TR_BIN}" ]]; then
       TOKEN="$("${TR_BIN}" -d '\r\n' <"${token_file}")"
@@ -138,7 +138,7 @@ load_token() {
     fi
     return 0
   fi
-  echo "push token missing: set MONOENGINE_OCI_SMOKE_TOKEN or create secrets/monoengine-push-token.local" >&2
+  echo "push token missing: set MEGA2_OCI_SMOKE_TOKEN or create secrets/mega2-push-token.local" >&2
   return 1
 }
 
@@ -175,8 +175,8 @@ sanitize() {
   printf '%s' "${text}"
 }
 
-if [[ -n "${MONOENGINE_OCI_SMOKE_WORKDIR:-}" ]]; then
-  ROOT_DIR="${MONOENGINE_OCI_SMOKE_WORKDIR}"
+if [[ -n "${MEGA2_OCI_SMOKE_WORKDIR:-}" ]]; then
+  ROOT_DIR="${MEGA2_OCI_SMOKE_WORKDIR}"
 else
   if [[ -z "${MKTEMP_BIN}" ]]; then
     echo "mktemp not found" >&2
@@ -189,7 +189,7 @@ if [[ ! -d "${ROOT_DIR}" ]]; then
 fi
 
 cleanup() {
-  if [[ -z "${MONOENGINE_OCI_SMOKE_WORKDIR:-}" && "${MONOENGINE_OCI_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
+  if [[ -z "${MEGA2_OCI_SMOKE_WORKDIR:-}" && "${MEGA2_OCI_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
     "${RM_BIN:-rm}" -rf "${ROOT_DIR}"
   else
     echo "smoke workdir kept at: ${ROOT_DIR}"
@@ -283,7 +283,7 @@ case_push_pull_roundtrip() {
   tar_path="${ROOT_DIR}/rootfs.tar"
   "${RM_BIN:-rm}" -rf "${rootfs}"
   "${MKDIR_BIN:-mkdir}" -p "${rootfs}"
-  printf 'monoengine-oci-smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"${rootfs}/hello.txt"
+  printf 'mega2-oci-smoke %s\n' "$(date -u +%Y%m%dT%H%M%SZ)-$$" >"${rootfs}/hello.txt"
 
   if [[ -z "${TAR_BIN}" ]]; then
     echo "tar not found" >&2
@@ -443,7 +443,7 @@ run_case "login without token presents 401" case_login_without_token_presents_40
 run_case "docker logout" case_docker_logout
 
 if [[ -n "${CASE_FILTER}" && "${CASE_HIT}" -eq 0 ]]; then
-  echo "FAIL: MONOENGINE_SMOKE_CASE='${CASE_FILTER}' matched no registered case" >&2
+  echo "FAIL: MEGA2_SMOKE_CASE='${CASE_FILTER}' matched no registered case" >&2
   print_summary
   exit 2
 fi

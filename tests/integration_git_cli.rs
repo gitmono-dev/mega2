@@ -1,6 +1,6 @@
 // Process-level black-box Git CLI integration tests (IT-03 / IT-10 / IT-12).
 //
-// Starts a real `service http` via `CARGO_BIN_EXE_monoengine`, drives the fixed
+// Starts a real `service http` via `CARGO_BIN_EXE_mega2`, drives the fixed
 // compose `git-cli` runner over HTTP smart protocol, and asserts clone→push→
 // re-clone working-tree round-trips with per-case DB/port/workdir isolation.
 // Monorepo product rules (`docs/monorepo.md`): only public branch is `main`;
@@ -31,8 +31,7 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -50,7 +49,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_git_{}_{}",
+            "mega2_git_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -59,7 +58,7 @@ impl TestDatabase {
         with_runtime(async {
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
                 )
             });
             execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -194,7 +193,7 @@ struct ServiceProcess {
 
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         // Own the Child before the fallible evidence write so Drop reaps on panic.
         let service = Self {
             child,
@@ -331,7 +330,7 @@ fn boot_service_http_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    git_cli::apply_monoengine_public_http_base_env(&mut command, port);
+    git_cli::apply_mega2_public_http_base_env(&mut command, port);
     command.args([
         "service",
         "http",
@@ -460,7 +459,7 @@ fn merge_cl_no_auth_as(port: u16, cl_link: &str, session_value: &str) -> u16 {
 #[test]
 fn integration_git_cli_http_round_trip() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -468,7 +467,7 @@ fn integration_git_cli_http_round_trip() {
 
     let token = git_cli::resolve_seed_token();
     let fixture_payload = format!(
-        "monoengine it-03 fixture pid={} case={}\n",
+        "mega2 it-03 fixture pid={} case={}\n",
         std::process::id(),
         env.case_dir.display()
     );
@@ -482,7 +481,7 @@ fn integration_git_cli_http_round_trip() {
     // Migrations + access_token table exist only after service bootstrap.
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone1 = env.case_dir.join("clone1");
     let clone1_name = "clone1";
     fs::create_dir_all(&clone1).expect("mkdir clone1");
@@ -678,7 +677,7 @@ fn integration_git_cli_http_round_trip() {
         "token must not appear in remote URL: {remote_printed}"
     );
     assert!(
-        remote_printed.contains(&format!("{}:{port}/", git_cli::monoengine_reachable_host())),
+        remote_printed.contains(&format!("{}:{port}/", git_cli::mega2_reachable_host())),
         "unexpected remote URL: {remote_printed}"
     );
 
@@ -690,8 +689,8 @@ fn integration_git_cli_http_round_trip() {
     );
 
     eprintln!(
-        "integration_git_cli ok; monoengine binary={}",
-        env!("CARGO_BIN_EXE_monoengine")
+        "integration_git_cli ok; mega2 binary={}",
+        env!("CARGO_BIN_EXE_mega2")
     );
 }
 
@@ -732,7 +731,7 @@ fn descendant_host_git(env: &GitCliEnv, token: &str, git_args: &[&str]) -> std::
 fn integration_git_cli_descendant_ref_continuation_after_parent_merge() {
     // TP-14: clone /project/foo, local commit, merge at /project, then pull.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -741,7 +740,7 @@ fn integration_git_cli_descendant_ref_continuation_after_parent_merge() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let root_url = git_cli::monoengine_host_http_url(port, "/");
+    let root_url = git_cli::mega2_host_http_url(port, "/");
     descendant_host_git(&env, &token, &["clone", &root_url, "seed"]);
     for (key, value) in [
         ("user.name", "IT Git CLI"),
@@ -785,7 +784,7 @@ fn integration_git_cli_descendant_ref_continuation_after_parent_merge() {
         read_log(&stderr_path)
     );
 
-    let foo_url = git_cli::monoengine_host_http_url(port, "/project/foo");
+    let foo_url = git_cli::mega2_host_http_url(port, "/project/foo");
     descendant_host_git(&env, &token, &["clone", &foo_url, "clone-foo"]);
     descendant_host_git(
         &env,
@@ -815,7 +814,7 @@ fn integration_git_cli_descendant_ref_continuation_after_parent_merge() {
         &["-C", "clone-foo", "commit", "-m", "tp14 local on foo"],
     );
 
-    let project_url = git_cli::monoengine_host_http_url(port, "/project");
+    let project_url = git_cli::mega2_host_http_url(port, "/project");
     descendant_host_git(&env, &token, &["clone", &project_url, "clone-project"]);
     descendant_host_git(
         &env,
@@ -907,7 +906,7 @@ fn integration_git_cli_http_pull_cl_ref_round_trip() {
     // ADR-GM-02 / plan-20260803 GM-02: literal `git pull` of refs/cl/* must
     // update a dedicated local branch to the sender tree; default main stays seed.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -919,7 +918,7 @@ fn integration_git_cli_http_pull_cl_ref_round_trip() {
         CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let fixture_payload = format!(
-        "monoengine gm-02 pull fixture pid={} case={}\n",
+        "mega2 gm-02 pull fixture pid={} case={}\n",
         std::process::id(),
         env.case_dir.display()
     );
@@ -931,7 +930,7 @@ fn integration_git_cli_http_pull_cl_ref_round_trip() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let sender_name = "pull-sender";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, sender_name]),
@@ -1111,7 +1110,7 @@ fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
     // plan-20260803 GM-03: per-case `[git] anonymous_access = false` must reject
     // unauthenticated clone while the same service still accepts token clone.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1132,7 +1131,7 @@ fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let anon_clone = git_cli::git_cli_no_auth(
         &env.case_dir,
         &["clone", &remote_url, "anon-disabled-clone"],
@@ -1185,7 +1184,7 @@ fn integration_git_cli_auth_anonymous_disabled_rejects_clone() {
 fn integration_git_cli_http_rejects_git_client_tag_push() {
     // docs/monorepo.md §2 — Monorepo tags are Web/API only.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1194,7 +1193,7 @@ fn integration_git_cli_http_rejects_git_client_tag_push() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "tag-reject-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -1300,7 +1299,7 @@ fn integration_git_cli_http_rejects_git_client_tag_push() {
 #[test]
 fn integration_git_cli_http_packless_missing_commit_is_ng() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1332,7 +1331,7 @@ fn integration_git_cli_http_packless_missing_commit_is_ng() {
 #[test]
 fn integration_git_cli_http_packless_existing_commit_skips_unpack() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1341,7 +1340,7 @@ fn integration_git_cli_http_packless_existing_commit_skips_unpack() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let head = git_stdout(&env.case_dir, &token, &["ls-remote", &remote_url, "HEAD"])
         .split_whitespace()
         .next()
@@ -1365,7 +1364,7 @@ fn integration_git_cli_http_packless_existing_commit_skips_unpack() {
 #[test]
 fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1384,7 +1383,7 @@ fn integration_git_cli_auth_push_without_token_returns_401_challenge() {
     );
 
     // Real client path: anonymous clone (upload-pack) then unauthenticated push fails.
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "auth-unauthed-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli_no_auth(&env.case_dir, &["clone", &remote_url, clone_name]),
@@ -1563,7 +1562,7 @@ fn post_packless_receive_pack(
 #[test]
 fn integration_git_cli_push_auth_token_rejects_without_token_and_out_of_path() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1622,7 +1621,7 @@ paths = ["/project/foo"]
 fn trunk_subpath_url(port: u16, path: &str) -> String {
     format!(
         "{}/",
-        git_cli::monoengine_host_http_url(port, path).trim_end_matches('/')
+        git_cli::mega2_host_http_url(port, path).trim_end_matches('/')
     )
 }
 
@@ -1840,7 +1839,7 @@ fn count_cl_artifacts(db_url: &str) -> (i64, i64) {
 #[test]
 fn integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -1918,7 +1917,7 @@ fn integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs() {
 #[test]
 fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2036,7 +2035,7 @@ fn integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align() {
 #[test]
 fn integration_git_cli_trunk_requester_token_name() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2159,7 +2158,7 @@ paths = ["/project"]
 #[test]
 fn integration_git_cli_auth_token_never_leaks() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2168,7 +2167,7 @@ fn integration_git_cli_auth_token_never_leaks() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "auth-leak-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -2293,7 +2292,7 @@ fn integration_git_cli_authz_revoke_grant_immediate_effect() {
     // allowed; after the admin merges a revoke change, it is denied again —
     // all without a service restart (the snapshot is swapped in-process).
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2325,7 +2324,7 @@ fn integration_git_cli_authz_revoke_grant_immediate_effect() {
         &user_token,
     );
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
 
     // --- baseline: non-admin push denied under enforce ---
     let clone_name = "un16-clone";
@@ -2750,7 +2749,7 @@ fn integration_git_cli_acl_change_requires_admin_to_merge() {
     // path. Under `enforce` only an admin may merge it — end to end, through
     // the real merge entry point.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2772,7 +2771,7 @@ fn integration_git_cli_acl_change_requires_admin_to_merge() {
         );
 
     git_cli::seed_access_token(&env.database.db_url, "benjamin_747", &admin_token);
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
 
     // The admin pushes a CL that grants the maintainer the maintainer role —
     // exactly the kind of change that must not be self-mergeable.
@@ -2883,7 +2882,7 @@ fn integration_git_cli_rejects_main_branch_delete() {
     // deliberate safety closure (not an enforcement gate), so it holds under
     // the default `off` enforcement too.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2893,7 +2892,7 @@ fn integration_git_cli_rejects_main_branch_delete() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "un16-main-delete-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -2955,7 +2954,7 @@ fn integration_git_cli_multicommit_chain_push_acceptance() {
     // indexed in mega_blob.file_path, and the merge advances refs/heads/main by
     // exactly one new single-parent commit (ADR-MC-01).
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -2964,7 +2963,7 @@ fn integration_git_cli_multicommit_chain_push_acceptance() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "mc06-chain-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -3290,7 +3289,7 @@ fn integration_git_cli_multicommit_two_commit_chain_acceptance() {
     // plan-20260827 MC-06: the lower boundary of the opened range — a 2-commit
     // chain push is admitted and lands as one CL with from = base / to = tip.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -3299,7 +3298,7 @@ fn integration_git_cli_multicommit_two_commit_chain_acceptance() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "mc06-two-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -3439,7 +3438,7 @@ fn integration_git_cli_multicommit_multi_branch_mixed_status() {
     // plan-20260901 FC-08: extra non-delete branch commands are ng'd; the first
     // surviving branch may still finalize. The overall git push fails.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -3448,7 +3447,7 @@ fn integration_git_cli_multicommit_multi_branch_mixed_status() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "mc06-multibranch-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -3569,7 +3568,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
     // delete plus a legitimate update is accepted; a delete-only push still
     // skips unpack entirely.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -3578,7 +3577,7 @@ fn integration_git_cli_multicommit_mixed_delete_and_update_accepted() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "mc06-mixed-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -3767,7 +3766,7 @@ fn integration_git_cli_stale_delete_does_not_remove_updated_ref() {
     // plan-20260901 FC-09: a delete whose advertised old id no longer matches
     // must not remove a ref that moved after discovery.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -3776,7 +3775,7 @@ fn integration_git_cli_stale_delete_does_not_remove_updated_ref() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "fc09-cas-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -3891,7 +3890,7 @@ fn integration_git_cli_multicommit_cumulative_limit_rejected() {
     // the cumulative limit and must be rejected at push time, leaving the CL
     // and its ref untouched.
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -3900,7 +3899,7 @@ fn integration_git_cli_multicommit_cumulative_limit_rejected() {
     let (mut service, port, _stdout_path, stderr_path) = boot_service_http(&env);
     git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-    let remote_url = git_cli::monoengine_http_repo_url(port);
+    let remote_url = git_cli::mega2_http_repo_url(port);
     let clone_name = "mc06-cumulative-clone";
     git_cli::assert_git_success(
         &git_cli::git_cli(&env.case_dir, &token, &["clone", &remote_url, clone_name]),
@@ -4172,7 +4171,7 @@ fn collect_git_configs(root: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
     if git_cli::git_cli_skip_requested() {
-        eprintln!("SKIP: MONOENGINE_IT_SKIP_GIT_CLI=1");
+        eprintln!("SKIP: MEGA2_IT_SKIP_GIT_CLI=1");
         return;
     }
 
@@ -4181,7 +4180,7 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
 
     // Legacy-disallowed root repo: parse_git_protocol_path rejects it before any
     // empty-repo advertisement (monorepo otherwise serves arbitrary paths as empty).
-    let missing_url = git_cli::monoengine_http_url(port, "/third-party.git/");
+    let missing_url = git_cli::mega2_http_url(port, "/third-party.git/");
     let clone_dir = "failpath-missing";
 
     let first = git_cli::git_cli_no_auth(&env.case_dir, &["clone", &missing_url, clone_dir]);
@@ -4225,7 +4224,7 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
         "missing-repo clone error must contain `{STABLE_ERR}`, got:\n{msg1}"
     );
 
-    // Liveness probe before teardown (VER reads MONOENGINE_IT_LIVENESS_FILE).
+    // Liveness probe before teardown (VER reads MEGA2_IT_LIVENESS_FILE).
     service.assert_alive();
     let status = http_status(port, "/api/openapi.json");
     assert_eq!(
@@ -4234,7 +4233,7 @@ fn integration_git_cli_failpath_clone_missing_repo_keeps_service_alive() {
     );
     let pid = service.pid();
     git_cli::append_evidence_line(
-        "MONOENGINE_IT_LIVENESS_FILE",
+        "MEGA2_IT_LIVENESS_FILE",
         &format!("status={status} pid={pid}"),
     );
     // PID must still be alive at evidence time.
@@ -4258,7 +4257,7 @@ fn normalize_git_cli_error(combined: &str) -> String {
 }
 
 fn http_status(port: u16, path: &str) -> u16 {
-    let url = git_cli::monoengine_host_http_url(port, path);
+    let url = git_cli::mega2_host_http_url(port, path);
     let mut command = Command::new("curl");
     command.args([
         "-sS",
@@ -4764,7 +4763,7 @@ fn commit_parents(db_url: &str, commit_id: &str) -> Vec<String> {
 }
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .current_dir(current_dir)
         .env_clear()

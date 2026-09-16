@@ -37,8 +37,7 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 const RECEIPT: &str = "storage_events_shutdown_complete";
 // External route shape: `<repo>.git/info/lfs/libra/media/v1/...` (the rewrite
@@ -63,7 +62,7 @@ impl TestDatabase {
         let admin_url = std::env::var("MEGA_DATABASE__DB_URL")
             .unwrap_or_else(|_| DEFAULT_POSTGRES_URL.to_string());
         let db_name = format!(
-            "monoengine_wh06_{}_{}",
+            "mega2_wh06_{}_{}",
             std::process::id(),
             CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -247,7 +246,7 @@ impl ServiceProcess {
             .stderr(Stdio::from(
                 fs::File::create(stderr_path).expect("stderr log"),
             ));
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         Self {
             child,
             reaped: false,
@@ -326,9 +325,9 @@ fn ensure_binary(feature_on: bool) -> PathBuf {
     } else {
         "target/wh06-fastcdc-off"
     };
-    let binary = PathBuf::from(target_dir).join("debug/monoengine");
+    let binary = PathBuf::from(target_dir).join("debug/mega2");
     let mut command = Command::new("cargo");
-    command.arg("build").arg("-p").arg("monoengine");
+    command.arg("build").arg("-p").arg("mega2");
     if feature_on {
         command.arg("--features").arg("fastcdc");
     }
