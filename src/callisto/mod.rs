@@ -64,6 +64,7 @@ pub mod mega_tree;
 pub mod mega_webhook;
 pub mod mega_webhook_delivery;
 pub mod mega_webhook_event_type;
+pub mod mst2_verified_object;
 pub mod notification_event_types;
 pub mod oci_blob_ref;
 pub mod oci_manifest;
