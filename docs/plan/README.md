@@ -1,6 +1,6 @@
 # 计划（Plan）
 
-本目录存放 monoengine 的开发计划文档。所有新计划必须使用本目录下的 `plan-template.md` 模板，不得自创格式。
+本目录存放 mega2 的开发计划文档。所有新计划必须使用本目录下的 `plan-template.md`（中文规范原文）或 `plan-template.en.md`（English contributor edition）模板，不得自创格式。两份结构相同；门禁或字段冲突时以中文原文为准，并开 Issue 同步英文副本。
 
 ## 规则
 
@@ -18,8 +18,9 @@
 
 | 文件 | 类型 | 状态 |
 |---|---|---|
-| `plan-template.md` | 模板 | 基线 |
-| `plan-long.md` | 长期能力 | 当前（2026-07-27 首版，Mega → monoengine 完全移植路线图） |
+| `plan-template.md` | 模板（中文规范原文） | 基线 |
+| `plan-template.en.md` | 模板（English contributor edition） | 与中文原文同结构；冲突以中文为准 |
+| `plan-long.md` | 长期能力 | 当前（2026-07-27 首版 Mega 移植路线图；2026-09-16 起含 mega2 原生 **PT-13** 统一推送密文） |
 | `plan-20260727.md` | 日期计划 | 已完成（承接 PT-01 集成测试基建） |
 | `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06 已由 `plan-20260802.md` 关闭** |
 | `plan-20260802.md` | 日期计划 | 已完成（Website 内部产品邮件 API；tip `a52d703`；DEP-06 关闭；monoengine `0.2.1`） |
@@ -42,3 +43,4 @@
 | [`plan-20260911.md`](plan-20260911.md) | 日期计划 | **已完成**（storage-only Agent Capture：`[agent_capture]` 配置门、`agent_capture_*` 表、`ObjectNamespace::Agent`、独立 ingest token、`/api/v1/agent-capture` raw ingest/查询；review 形态不挂载；契约正文 [`../refactoring/agent-capture.md`](../refactoring/agent-capture.md)；进程 IT `integration_agent_capture`。libra 客户端 DEFER） |
 | [`plan-20260912.md`](plan-20260912.md) | 日期计划 | **进行中**（storage-only 提交后出站 webhook：运维静态配置、committed-write emitter，有界、仅元数据、带 HMAC。WH-01 已交付 `[storage_events]` 配置表面；其余 WH 卡 pending。WH-07/WH-08 经 `DEP-WH-01` 依赖 [`plan-20260911.md`](plan-20260911.md) 的 AC-15，现已满足。永久排除 webhook CRUD / 入站 webhook / outbox / 持久 delivery 状态 / retry worker） |
 | [`plan-20260913.md`](plan-20260913.md) | 日期计划 | **新建（设计稿，0 实现）**（FastCDC Media 效果对齐：细粒度 CDC、历史布局、缺块上传、固定 manifest 读取、无容量硬上限的分页协议；MF-00..MF-08 全部 `pending`）。与 `../../../libra` 的 `plan-20260913.md` 为**对偶双仓计划**，共享表与 C-01..C-08 逐字一致；跨仓 DAG `MF-06 → FL-06 → FL-03 → FL-04 → MF-05 → FL-05`，MF-05 真 interop 经 `DEP-MF-01` 依赖 Libra FL-04，当前 blocked |
+| [`plan-20260916.md`](plan-20260916.md) | 日期计划 | **新建（设计稿，0 实现）**（monorepo 路径 → GitHub 单向出站同步的**已定型基础设施**：计划守卫脚本、`[github_sync]` 配置结构/注册/校验、自举 Ed25519 SSH 金钥、公钥暴露边界、出站 SSH 连接与主机金钥钉住、receive-pack 协商/请求构造/报告与传输层终止判定/期限与诊断预算。**24 张活动卡单链串行（23 条依赖边）**；`GS-01`/`GS-02`/`GS-12` 已取消并保留编号）。零新增依赖；单一凭证（不引入 `gh` 与 REST API）；**不新增 HTTP 表面**；**不改动任何既有 `src/` 协议路径**。**五次收敛**（R1–R5 均 FAIL 并逐条关闭，R5 起 **P0 归零**）：R1 确认 5 项同步语义未冻结、R2 确认 `incremental_pack` 硬化需改 `RepoHandler` trait 并触及线上 clone/fetch、R3 要求守卫改内容基线、R4 发现守卫比较集合不完整且 vault 无 CAS 原语、R5 要求 AC 按独立谓词逐项拆分。未定型问题由 5 张 spike（`GS-09` Q1–Q5 / `GS-18` Q6a / `GS-27` Q6b / `GS-21` Q7 / `GS-28` Q8）冻结后经 `GS-10` 按组合决策表移交（`DEFER-GS-01`/`DEFER-GS-07`/`DEFER-GS-09`）。`DEP-02` 向模板维护者移交 GC-12/ER-07 的 VCS 事实修正（本仓实为 Libra，`.git` 不存在） |
