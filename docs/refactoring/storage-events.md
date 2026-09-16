@@ -2,7 +2,7 @@
 
 本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口）。Agent 来源 hook（WH-07/08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05/WH-06）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`。Agent 来源 hook（WH-07/08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -53,6 +53,10 @@ OCI manifest 发布在对象 + manifest DB 行 + 可选 tag upsert 全成功后�
 ## 来源适配：`lfs.object.uploaded`（WH-05，已交付）
 
 LFS basic 上传在本次请求实际 `put_stream` 成功后发一次 `lfs.object.uploaded`：scope 三个值全 null（basic 上传没有可信 repo/tenant），data 为 `oid,size,transfer="basic"`；只发给显式 `include_unscoped_lfs=true` 的 target。batch 建行、exists no-op、hash/size 失败不发；presigned 发放与直传不发（无回调，覆盖缺口 DEFER-WH-01）。exists→put 非原子，并发成功上传允许重复通知。emitter 故障不改变上传结果。
+
+## 来源适配：`lfs.media.finalized`（WH-06，已交付）
+
+既有 media finalize 的 finalized manifest 实际 put 成功后发一次 `lfs.media.finalized`：scope 只填服务端 `MediaScope` 的 canonical `repo_path`（HTTP 路径带来的 `.git` 后缀会保留，例如 `/acme/app.git`；`lfs_paths` 必须写成同样形式，不能照抄 `git_paths` 的无后缀仓库路径），data 为 `oid,size,manifest_id,transfer="fastcdc"`。`occurred_at` 取本次 finalize 操作钟（生产 `finalize()` 在入口取 `unix_now()`，测试经 `finalize_at` 注入），与 reassembled 校验耗时同一快照。no-op / 中间步骤 / 中途失败不发；并发 finalize（同进程 `MAX_CONCURRENT_FINALIZE=2` 或跨进程）在 exists→put 窗口内可重复通知。HTTP 认证仍为 `AccessTokenUser` 的 DB access token（匿名/静态 push token 不发且 401）。见 [`fastcdc-media.md`](fastcdc-media.md)「出站事件」。
 
 ## 事件投影与过滤（WH-10）
 

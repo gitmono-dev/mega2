@@ -42,6 +42,13 @@
 - 通过后：`put_stream_bounded` 发布到 `lfs/{oid}`，`lfs_objects` 以 `ON CONFLICT (oid) DO NOTHING` 幂等插入，重新读取 metadata 并确认对象存在，然后才写 `media/v1/{scope}/finalized/{media_oid}`。
 - 已存在的 finalized 若 `manifest_id`/`media_oid` 不一致则 Conflict；重复 finalize 在内容一致时成功。
 
+## 出站事件（plan-20260912 / WH-06，已交付）
+
+- 既有 finalize 路径在**本次实际写入 finalized manifest 成功**后发一次 `lfs.media.finalized`（契约见 [`storage-events.md`](storage-events.md)）：scope 只填服务端 `MediaScope` 的 canonical `repo_path`（HTTP 上通常带 `.git` 后缀），data 为 `oid,size,manifest_id,transfer="fastcdc"`；`event_id` 为 UUID v4。
+- prepare / chunk / fallback 中间步骤不发；已存在 finalized 的 no-op 不发；finalize 中途失败不发。existing-check 与 put 非原子，并发 finalize（同进程或跨进程）可重复通知（本计划不新增唯一性锁/表）。
+- 认证不改：Media 路由仍全部要求 `AccessTokenUser` 的 DB access token；匿名与静态 push token 请求仍 401 且零事件。storage-only 的 `push_auth=none` 不影响独立 ingest token 的认证与租户归属。
+- 测试：`finalize::tests::storage_event_finalize_matrix`（真实 service finalize / no-op / 部分失败 / repo 过滤 / emitter 故障）、`lfs_media::tests::storage_event_auth_reachability`（匿名 / 静态 token / DB token 三类请求）、进程级 `integration_storage_events_media`（feature-on/off 两个独立 target-dir 二进制的路由与认证矩阵）。
+
 ## HTTP / auth / OpenAPI（FC-07）
 
 - Feature-on 时挂在当前 LFS mount 下：逻辑前缀 `libra/media/v1`。仓库 URL `<repo>.git` 的外部路径是 `<repo>.git/info/lfs/libra/media/v1/...`；OpenAPI 登记为 `/api/v1/lfs/libra/media/v1/...`。Feature-off 不注册这些路由（运行时 404，schema 中也不出现）。
