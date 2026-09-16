@@ -248,8 +248,12 @@ impl RepoHandler for ImportRepo {
         }
 
         let mut counted_obj = HashSet::new();
-        // traverse for get obj nums
+        let mut counted_roots = HashSet::new();
+        // traverse for get obj nums; shared commit trees counted once
         for c in want_commits.clone() {
+            if !counted_roots.insert(c.tree_id.to_string()) {
+                continue;
+            }
             self.traverse_for_count(
                 want_trees.get(&c.tree_id).unwrap().clone(),
                 &exist_objs,
@@ -271,13 +275,17 @@ impl RepoHandler for ImportRepo {
             .await
             .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
 
+        // Every object must appear exactly once in the pack; two want commits
+        // may share one tree.
         for c in want_commits {
-            self.traverse(
-                want_trees.get(&c.tree_id).unwrap().clone(),
-                &mut exist_objs,
-                Some(&entry_tx),
-            )
-            .await?;
+            if exist_objs.insert(c.tree_id.to_string()) {
+                self.traverse(
+                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    &mut exist_objs,
+                    Some(&entry_tx),
+                )
+                .await?;
+            }
             entry_tx
                 .send(MetaAttached {
                     inner: c.into(),
