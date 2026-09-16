@@ -4,7 +4,7 @@ This is the English edition of `docs/plan/plan-template.md` for contributors. Ne
 
 The Chinese file remains the in-repo operational original. If the two texts ever diverge on a gate or field, follow the Chinese file and open an Issue to sync this copy.
 
-**Template version:** `v2` (effective 2026-07-29). This edition adds task-card granularity rules `G-*`; fields `Task type`, `Lifecycle / Acceptance`, `Out of scope`, `Implementation write set`, `Release write set`, `Rollback mode`, `Version increment`, `C/D coverage from`, `Granularity`; the dependency register; release groups and concurrency windows; revision history; and stable `ER-*` IDs.
+**Template version:** `v2.1` (effective 2026-09-16). After every version bump, create a matching `v<version>` tag and publish a GitHub Release with a human-written release note. The rest of the structure is unchanged from `v2`.
 
 Product name is **mega2**. The Cargo package and binaries are still `monoengine` / `monoengine_core`. mega2 inherits from the same organization's [Mega](https://github.com/web3infra-foundation/mega) project. Mega is the transplant source and contract baseline, not a competitor.
 
@@ -239,7 +239,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    | `spike` | Artifact exists, go/no-go decided, follow-up cards registered; allowlist diff: every change is inside `Deliverables`; zero production-surface edits |
    | `release` | Aggregate guards for new tests this group introduced + release note / compatibility evidence |
 
-   **C — release close-out** (order is mandatory), run by cards that push: ① ER-08 version-face parity precheck → ② bump `Cargo.toml` `version` per `Version increment` and let the toolchain refresh `Cargo.lock` → ③ three `AGENTS.md` gates on the **bumped** tree → ④ `cargo build` and `cargo build --tests` clean; add `cargo build --release -p monoengine` if you need a binary → ⑤ commit (ER-07) → ⑥ push and confirm the remote ref moved → ⑦ tags and release artifacts default to `N/A` (this repo has no tag-triggered release pipeline).
+   **C — release close-out** (order is mandatory), run by cards that push: ① ER-08 version-face parity precheck → ② bump `Cargo.toml` `version` per `Version increment` and let the toolchain refresh `Cargo.lock` → ③ three `AGENTS.md` gates on the **bumped** tree → ④ `cargo build` and `cargo build --tests` clean; add `cargo build --release -p monoengine` if you need a binary → ⑤ `libra add <relevant paths>` and `libra commit -m` → ⑥ `libra push origin main` and confirm the remote ref moved → ⑦ for every actual version bump, create an annotated matching tag on that commit with `libra tag -m "v<version>: <summary>" v<version>` and push it with `libra push origin refs/tags/v<version>` → ⑧ analyze the final diff, write a standard release note manually, and run `gh release create v<version> -R gitmono-dev/monoengine --title "v<version>" --notes-file <release-notes-file>`. The release note must include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations. Do not use `--generate-notes` or any other generated content. Cards with `Version increment=N/A` do not create tags or releases.
 
    **C / D boundary:** C ends at a verified branch push. Everything a remote pipeline produces after that is D. Each D item records workflow file, job name, trigger event and ref, whether `paths:` matches this card, and the predicate.
 
@@ -251,7 +251,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
 7. **ER-07 Commit workflow:** Follow `AGENTS.md` and the task-card release rule. Stage related paths only, commit with a scoped message, push the agreed branch. Do not `--force`. If local and remote have diverged, stop and report. After commit, verify the signature / sign-off convention this repo actually uses (do not invent a second convention in the card).
 
-8. **ER-08 Version and release:** The version source of truth is root `Cargo.toml` `version`. After the single-package inline there is **one** version face. On start day, re-count version-face files (`rg -n '^version' Cargo.toml` and `rg -l '^\[package\]' --glob '**/Cargo.toml'`). `Version increment`: `patch` (default) | `minor` | `major` | `N/A`. Breaking public-surface or schema/protocol changes must be `minor` or `major`. Family children and `docs` / `audit` / `spike` / `handoff` cards are `N/A` and must say which commit lands their artifacts. Cargo commands use `-p monoengine`.
+8. **ER-08 Version and release:** The version source of truth is root `Cargo.toml` `version`. After the single-package inline there is **one** version face. On start day, re-count version-face files (`rg -n '^version' Cargo.toml` and `rg -l '^\[package\]' --glob '**/Cargo.toml'`). `Version increment`: `patch` (default) | `minor` | `major` | `N/A`. Breaking public-surface or schema/protocol changes must be `minor` or `major`. After every actual version bump, create and push the matching annotated `v<version>` tag and create a matching GitHub Release with a manually written standard release note. The note must be based on the final diff and include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations; `--generate-notes` is prohibited. Family children and `docs` / `audit` / `spike` / `handoff` cards are `N/A` and do not create tags or releases. Cargo commands use `-p monoengine`.
 
 9. **ER-09 Push failure:** Non-fast-forward: pull/merge, re-accept, then push. Auth, permission, network, or server failures are not blind-retried; record the reason and wait for the next fix/release window.
 
@@ -589,6 +589,6 @@ The plan is complete only when all of the following hold:
 - [ ] Required docs / config / error contract / test-matrix updates are done.
 - [ ] Required migration, rollback, and failure-recovery checks are done; each card's `Rollback mode` was actually proven or recorded as unprovable.
 - [ ] Final review is `PASS`; all P0/P1 closed; only named P2 residual risk remains.
-- [ ] If release is required, the version face is bumped and consistent, and build / commit / push evidence exists (ER-08); otherwise `N/A` with reason.
+- [ ] Every actual version bump has a consistent version face, build / commit / push evidence, a pushed matching `v<version>` tag, and a matching GitHub Release created through `gh` with a manually written standard release note; no generated notes were used.
 - [ ] Revision history records every post-draft normative change (G-09).
 - [ ] Related `plan-long.md` PT/SB status or dated-plan index is synced, or `N/A`.

@@ -2,7 +2,7 @@
 
 本文是 `docs/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。英文贡献者使用 [`plan-template.en.md`](plan-template.en.md)；两份冲突时以本文为准。
 
-**模板版本:** `v2`（2026-07-29 起生效；本版新增任务卡粒度规则 `G-*`、`Task type` / `Lifecycle / Acceptance` / `Out of scope` / `Implementation write set` / `Release write set` / `Rollback mode` / `Version increment` / `C/D coverage from` / `Granularity` 字段、依赖登记表、发布分组与并发窗口、修订历史，并把执行检查条目改为稳定 `ER-*` 编号）。
+**模板版本:** `v2.1`（2026-09-16 起生效；版本 bump 后必须创建同名 `v<version>` tag、发布人工编写的 GitHub Release note。其余结构与 `v2` 相同。）
 
 ### 模板版本与迁移政策
 
@@ -251,7 +251,7 @@
    | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`git status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`tests/**`、`config/**`、`scripts/**`、`Cargo.toml`、`Cargo.lock`、`rustfmt.toml`、`docker-compose.test.yml`、`.github/workflows/**`），用「Verification 判定口径」的退出码模板逐条守卫 |
    | `release` | 聚合守卫（本组引入的全部新守卫用例）+ release note / 兼容证据 |
 
-   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 按 `Version increment` bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**已 bump 的状态**上跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p monoengine` → ⑤ `git add <相关路径>` + `git commit -m`（ER-07 的签名预检与提交后校验）→ ⑥ 推送并确认 branch ref：`git push origin main` 成功且远端 ref 已更新 → ⑦ **tag 与 release artifact：默认 `N/A`**。本仓当前**没有任何 release 流水线**：三个 workflow 都不由 tag 触发，没有 artifact 上传，仓库也没有任何已存在的 tag。因此不得凭空写「推 tag 触发发布」；确需产出用户可获取产物时，必须先用独立卡引入 release workflow 并同步修订本模板。
+   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 按 `Version increment` bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**已 bump 的状态**上跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p monoengine` → ⑤ `libra add <相关路径>` + `libra commit -m` → ⑥ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑦ 对每次实际版本 bump，在该提交上创建同名标注 tag：`libra tag -m "v<version>: <summary>" v<version>`，并以 `libra push origin refs/tags/v<version>` 推送 → ⑧ 分析该版本最终 diff，人工撰写标准 release note 后执行 `gh release create v<version> -R gitmono-dev/monoengine --title "v<version>" --notes-file <release-notes-file>`。release note 必须包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止使用 `--generate-notes` 或其它自动生成内容。`Version increment=N/A` 的卡不创建 tag 或 release。
 
    三门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 刷新本身可能引入格式、lint 或编译回归，`cargo build` 不能替代 clippy 与全量测试。
 
@@ -280,7 +280,7 @@
    - `Version increment` 取值：`patch`（默认）| `minor` | `major` | `N/A`。
    - 删除公开 surface、破坏兼容的 schema/协议变更必须用 `minor` 或 `major`，且递增级别由 ADR + 兼容窗口证据决定，不得用 patch 夹带；家族卡（G-08）的递增级别写在唯一发布点卡上，子卡为 `N/A`。
    - `docs` / `audit` / `spike` / `handoff` 卡为 `N/A`，但必须说明产物随哪次提交进入仓库。
-   - 本仓没有安装脚本、没有 release artifact、没有 tag 自动化，因此「安装证据」「artifact 可获取性」默认写 `N/A`；不得照抄其它仓库的发布步骤。
+   - 每次实际版本 bump 必须创建并推送 `v<version>` 标注 tag，并以人工编写的标准 release note 创建同名 GitHub Release。release note 必须基于最终 diff，包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止 `--generate-notes`。`Version increment=N/A` 的卡不创建 tag 或 release。
 9. **ER-09 push 失败策略:** 非 fast-forward 需要 pull/merge 后重新验收再推；认证、权限、网络或服务端失败不 blind retry，记录原因，待下一次修复/发布窗口处理。
 10. **ER-10 内部服务错误（有界重试）:** Redis、Postgres、对象存储、SMTP、AI provider 等错误不得直接把任务宣告完成。先分类：确定性错误（4xx 参数/权限、schema 不符、编译或配置缺陷）不重试，按范围决定归属——只有当修复落在**本卡行为轴内**，且先更新本卡 `Acceptance criteria` / `Verification` / `Implementation write set` / `Granularity` 后**重跑 ER-03 的全部 `G-*` 仍然通过**（含 G-10 写集不与在跑卡新冲突）时，才作为本卡修复项就地修；任一条不满足就新建修复卡 `FIX-*`、加一条 `FIX-* -> 当前卡` 的依赖边，并把当前卡置为 `blocked`，不得为了「顺手修完」突破粒度；暂时性错误（超时、5xx、限流、网络中断）按指数退避重试，并写明**最大尝试次数与总时间预算**（计划未另行规定时默认 ≤ 5 次、总计 ≤ 30 分钟）。超预算后把任务置为 `blocked` 并记录 sanitized 证据与升级对象，不得静默空转。发布类动作（push）不自动重试，按 ER-09 处理。
 11. **ER-11 证据卫生:** 验收证据不得保存 secret、API key、token、PII、未脱敏 transcript、绝对私有路径或原始 tool payload。需要留存时只写 sanitized summary。测试栈的口令（如 `monoengine_test_password`、`smtp-test-password`、RustFS 测试凭据 `rustfs` / `rustfs_secret`）虽为公开测试值，记录时同样按脱敏处理。
@@ -639,6 +639,6 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [ ] 必要的 docs/配置/错误契约/测试矩阵更新已完成。
 - [ ] 必要的 migration、rollback、failure-recovery 验证已完成；每张卡的 `Rollback mode` 都已被实际验证或记录为不可验证的原因。
 - [ ] 代码 review 最终结论为 `PASS`，P0/P1 全部关闭；仅 P2 residual risk 允许保留，且有具名接受人。
-- [ ] 如有发布要求，版本面（ER-08 开工日核对的处数，当前为一处）已 bump 且自洽、构建、提交、推送证据已完成（ER-08）；无 release artifact 要求时明确写 `N/A` 及原因。
+- [ ] 每次实际版本 bump 的版本面（ER-08 开工日核对的处数，当前为一处）已自洽、构建、提交、推送，并已创建和推送同名 `v<version>` tag；对应 GitHub Release 已通过 `gh` 使用人工编写的标准 release note 发布，未使用自动生成内容。
 - [ ] 「修订历史」已记录成稿后的全部规范性变更（G-09）。
 - [ ] `plan-long.md` 相关 PT/SB 状态或日期计划索引已同步，或明确 `N/A`。
