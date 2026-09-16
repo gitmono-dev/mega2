@@ -324,7 +324,12 @@ impl RepoHandler for Monorepo {
         obj_num.fetch_add(all_commits.len(), Ordering::SeqCst);
 
         let mut counted_obj = HashSet::new();
+        let mut counted_roots = HashSet::new();
         for c in &all_commits {
+            // Shared commit trees (net-zero roll-ups) are counted once.
+            if !counted_roots.insert(c.tree_id.to_string()) {
+                continue;
+            }
             self.traverse_for_count(
                 want_trees.get(&c.tree_id).unwrap().clone(),
                 &exist_objs,
@@ -347,13 +352,17 @@ impl RepoHandler for Monorepo {
             .await
             .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
 
+        // Two commits may share one tree (e.g. net-zero roll-ups); every
+        // object must appear exactly once in the pack.
         for c in all_commits {
-            self.traverse(
-                want_trees.get(&c.tree_id).unwrap().clone(),
-                &mut exist_objs,
-                Some(&entry_tx),
-            )
-            .await?;
+            if exist_objs.insert(c.tree_id.to_string()) {
+                self.traverse(
+                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    &mut exist_objs,
+                    Some(&entry_tx),
+                )
+                .await?;
+            }
             entry_tx
                 .send(MetaAttached {
                     inner: c.into(),
@@ -564,8 +573,12 @@ impl RepoHandler for Monorepo {
         }
 
         let mut counted_obj = HashSet::new();
-        // traverse for get obj nums
+        let mut counted_roots = HashSet::new();
+        // traverse for get obj nums; shared commit trees counted once
         for c in want_commits.clone() {
+            if !counted_roots.insert(c.tree_id.to_string()) {
+                continue;
+            }
             self.traverse_for_count(
                 want_trees.get(&c.tree_id).unwrap().clone(),
                 &exist_objs,
@@ -587,13 +600,17 @@ impl RepoHandler for Monorepo {
             .await
             .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
         // todo: For now, send metadata only for blob objects.
+        // Two want commits may share one tree (e.g. server-synthesized roll-up
+        // history); every object must appear exactly once in the pack.
         for c in want_commits {
-            self.traverse(
-                want_trees.get(&c.tree_id).unwrap().clone(),
-                &mut exist_objs,
-                Some(&entry_tx),
-            )
-            .await?;
+            if exist_objs.insert(c.tree_id.to_string()) {
+                self.traverse(
+                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    &mut exist_objs,
+                    Some(&entry_tx),
+                )
+                .await?;
+            }
             entry_tx
                 .send(MetaAttached {
                     inner: c.into(),
