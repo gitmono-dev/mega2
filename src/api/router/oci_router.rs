@@ -1035,6 +1035,30 @@ async fn put_manifest(
             .map_err(|_| OciError::ManifestInvalid)?;
     }
 
+    // WH-04 (plan-20260912 / ADR-WH-04): exactly one `oci.manifest.published`
+    // per fully successful publication (object + manifest row + optional tag
+    // upsert all done), built from this request's own snapshot; a later tag
+    // overwrite does not alter it and a repeat PUT may notify again. A
+    // builder/emitter failure never changes the committed publication.
+    if state.storage.config().git.storage_only() {
+        let event = crate::jupiter::service::storage_event::CommittedEvent {
+            event_id: uuid::Uuid::new_v4(),
+            event_type: crate::jupiter::service::storage_event::EventType::OciManifestPublished,
+            occurred_at: chrono::Utc::now().timestamp() as u64,
+            source: crate::jupiter::service::storage_event::EventSource::Oci,
+            scope: crate::jupiter::service::storage_event::EventScope::Oci {
+                oci_repository: repo.clone(),
+            },
+            data: crate::jupiter::service::storage_event::EventData::OciManifestPublished {
+                digest: digest.as_str().to_owned(),
+                reference: reference.to_owned(),
+                media_type: media_type.clone(),
+                size: body.len() as u64,
+            },
+        };
+        let _ = state.storage.storage_event_emitter.try_emit(event);
+    }
+
     let location = format!("/v2/{repo}/manifests/{digest}");
     let mut response = StatusCode::CREATED.into_response();
     let headers = response.headers_mut();
@@ -1136,7 +1160,7 @@ fn valid_tag(tag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -2710,5 +2734,623 @@ mod tests {
                 .expect("valid"),
             &format!("0-{}", 2 * 1024 * 1024)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // WH-04 (plan-20260912 / ADR-WH-04): one `oci.manifest.published` per
+    // fully successful publication; failures and non-publication requests
+    // deliver nothing.
+    // ------------------------------------------------------------------
+
+    /// Recording fake transport (WH-09 seam): exact bodies + call counter.
+    #[derive(Default)]
+    struct RecordingTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        fail: bool,
+    }
+
+    impl RecordingTransport {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<bytes::Bytes> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+    }
+
+    impl crate::jupiter::service::storage_event_transport::EventTransport for RecordingTransport {
+        fn post(
+            &self,
+            _target: &crate::jupiter::service::storage_event_transport::EventTarget,
+            body: bytes::Bytes,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::jupiter::service::storage_event_transport::TransportSuccess,
+                            crate::jupiter::service::storage_event_transport::TransportError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bodies.lock().expect("bodies").push(body);
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err(crate::jupiter::service::storage_event_transport::TransportError::Timeout)
+                } else {
+                    Ok(
+                        crate::jupiter::service::storage_event_transport::TransportSuccess::Accepted2xx {
+                            status: 200,
+                        },
+                    )
+                }
+            })
+        }
+    }
+
+    /// Blocking recording transport for the AC4 delayed-send case: records at
+    /// call time, then holds the future until released.
+    struct BlockingTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl BlockingTransport {
+        fn new() -> Arc<Self> {
+            let (release, _) = tokio::sync::watch::channel(false);
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                bodies: std::sync::Mutex::new(Vec::new()),
+                release,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<bytes::Bytes> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+
+        fn release(&self) {
+            let _ = self.release.send(true);
+        }
+    }
+
+    impl crate::jupiter::service::storage_event_transport::EventTransport for BlockingTransport {
+        fn post(
+            &self,
+            _target: &crate::jupiter::service::storage_event_transport::EventTarget,
+            body: bytes::Bytes,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::jupiter::service::storage_event_transport::TransportSuccess,
+                            crate::jupiter::service::storage_event_transport::TransportError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bodies.lock().expect("bodies").push(body);
+            let mut release = self.release.subscribe();
+            Box::pin(async move {
+                if !*release.borrow() {
+                    let _ = release.changed().await;
+                }
+                Ok(
+                    crate::jupiter::service::storage_event_transport::TransportSuccess::Accepted2xx {
+                        status: 200,
+                    },
+                )
+            })
+        }
+    }
+
+    const WH04_INSTALLATION: &str = "it-wh04";
+
+    fn wh04_emitter(
+        config: &crate::config::Config,
+        enabled: bool,
+        transport: Arc<dyn crate::jupiter::service::storage_event_transport::EventTransport>,
+        oci_repositories: Vec<String>,
+    ) -> crate::jupiter::service::storage_event_emitter::StorageEventEmitter {
+        let target_config = crate::config::StorageEventsTargetConfig {
+            id: "ops-main".to_owned(),
+            url: "https://events.example.invalid/ingest".to_owned(),
+            secret_ref: "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+                .to_owned(),
+            events: vec!["oci.manifest.published".to_owned()],
+            git_paths: Vec::new(),
+            oci_repositories,
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        };
+        let secret = crate::config::secret::SecretString::new(
+            "hex:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let compiled = crate::jupiter::service::storage_event_transport::EventTarget::compile(
+            &target_config.id,
+            &target_config.url,
+            &secret,
+        )
+        .expect("compile target");
+        let mut config = config.clone();
+        config.storage_events.enabled = enabled;
+        config.storage_events.installation_id = Some(WH04_INSTALLATION.to_owned());
+        crate::jupiter::service::storage_event_emitter::StorageEventEmitter::new_with_transport(
+            &config,
+            transport,
+            vec![(target_config, compiled)],
+        )
+    }
+
+    /// `state(true)` shape plus a recording emitter installed as the owner.
+    async fn state_with_events(
+        transport: Arc<RecordingTransport>,
+        enabled: bool,
+        oci_repositories: Vec<String>,
+    ) -> MonoApiServiceState {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("config"));
+        config.database = test_db_config(temp_dir.path()).await;
+        config.git = GitConfig {
+            anonymous_access: true,
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![PushTokenConfig {
+                name: "test".to_owned(),
+                token: "secret".to_owned(),
+                paths: Some(vec!["/team".to_owned()]),
+            }],
+            ssh_receive_pack: Some(false),
+        };
+        config.storage_events.enabled = enabled;
+        config.storage_events.installation_id = Some(WH04_INSTALLATION.to_owned());
+        let mut storage = test_storage_with_config(temp_dir.path(), config.clone()).await;
+        storage.oci_service = OciService {
+            oci_storage: storage.oci_db_storage(),
+            obj_storage: mock_object_storage(),
+        };
+        storage.set_storage_event_emitter(wh04_emitter(
+            &config,
+            enabled,
+            transport,
+            oci_repositories,
+        ));
+        storage
+            .oci_service
+            .oci_storage
+            .put_blob_ref(
+                "team/image",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                0,
+            )
+            .await
+            .expect("seed manifest config blob");
+        state_with_storage(storage)
+    }
+
+    async fn wh04_shutdown(state: &MonoApiServiceState) {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            state.storage.storage_event_emitter.shutdown(),
+        )
+        .await
+        .expect("emitter shutdown within 3s");
+    }
+
+    async fn wh04_wait_calls(transport: &RecordingTransport, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.calls() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delivery within 2s");
+    }
+
+    fn wh04_envelope(body: &bytes::Bytes) -> serde_json::Value {
+        serde_json::from_slice(body).expect("envelope json")
+    }
+
+    /// Sha256 hex digest of arbitrary bytes (blob seeding).
+    fn sha256_digest_of(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+
+    #[tokio::test]
+    async fn storage_event_publication_matrix() {
+        // A fully successful tag publication delivers exactly one event whose
+        // envelope carries this request's snapshot.
+        let transport = Arc::new(RecordingTransport::default());
+        let state = state_with_events(transport.clone(), true, vec!["team/image".to_owned()]).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        wh04_wait_calls(&transport, 1).await;
+        let bodies = transport.bodies();
+        assert_eq!(bodies.len(), 1, "exactly one publication event");
+        let envelope = wh04_envelope(&bodies[0]);
+        let digest = compute_digest(manifest().as_bytes());
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["event_type"], "oci.manifest.published");
+        assert_eq!(envelope["source"], "oci");
+        assert_eq!(envelope["scope"]["oci_repository"], "team/image");
+        assert!(envelope["scope"]["tenant_id"].is_null());
+        assert!(envelope["scope"]["repo_path"].is_null());
+        assert_eq!(envelope["data"]["digest"], digest.as_str());
+        assert_eq!(envelope["data"]["reference"], "v1");
+        assert_eq!(
+            envelope["data"]["media_type"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            envelope["data"]["size"].as_u64().expect("size"),
+            manifest().len() as u64
+        );
+
+        // A digest-form publication also delivers (reference = the digest).
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put(format!(
+                    "/team/image/manifests/sha256:{}",
+                    digest.hex()
+                )))
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(manifest()))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        wh04_wait_calls(&transport, 2).await;
+        let bodies = transport.bodies();
+        assert_eq!(bodies.len(), 2, "repeat publication repeats the event");
+        let envelope = wh04_envelope(&bodies[1]);
+        assert_eq!(
+            envelope["data"]["reference"],
+            format!("sha256:{}", digest.hex())
+        );
+
+        // A different tag publishes its own snapshot.
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v2"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        wh04_wait_calls(&transport, 3).await;
+        let bodies = transport.bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(wh04_envelope(&bodies[2])["data"]["reference"], "v2");
+
+        // A same-tag overwrite (v1 repointed at a changed manifest) publishes
+        // the NEW content under the SAME reference — its own snapshot.
+        let manifest_overwrite = manifest().replace(
+            "\"layers\":[]",
+            "\"layers\":[],\"annotations\":{\"it\":\"over\"}",
+        );
+        let digest_overwrite = compute_digest(manifest_overwrite.as_bytes());
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest_overwrite.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        wh04_wait_calls(&transport, 4).await;
+        wh04_shutdown(&state).await;
+        let bodies = transport.bodies();
+        assert_eq!(bodies.len(), 4, "overwrite publishes its own event");
+        let envelope = wh04_envelope(&bodies[3]);
+        assert_eq!(envelope["data"]["reference"], "v1");
+        assert_eq!(envelope["data"]["digest"], digest_overwrite.as_str());
+        assert_eq!(
+            envelope["data"]["size"].as_u64().expect("size"),
+            manifest_overwrite.len() as u64
+        );
+        assert_eq!(
+            envelope["data"]["media_type"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        // Every publication gets a fresh UUID v4, pairwise distinct.
+        let ids: Vec<String> = bodies
+            .iter()
+            .map(|body| {
+                wh04_envelope(body)["event_id"]
+                    .as_str()
+                    .expect("id")
+                    .to_owned()
+            })
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "publication event ids must differ");
+        for id in &ids {
+            let parsed = uuid::Uuid::parse_str(id).expect("uuid");
+            assert_eq!(
+                parsed.get_version(),
+                Some(uuid::Version::Random),
+                "UUID v4 layout"
+            );
+        }
+        assert_eq!(transport.calls(), 4, "no late delivery after drain");
+
+        // Digest mismatch: publication rejected, nothing delivered; a blob
+        // upload (not a manifest publication) delivers nothing either.
+        let transport = Arc::new(RecordingTransport::default());
+        let state = state_with_events(transport.clone(), true, vec!["team/image".to_owned()]).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put(format!(
+                    "/team/image/manifests/sha256:{}",
+                    "0".repeat(64)
+                )))
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(manifest()))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let blob = b"wh04 blob bytes".to_vec();
+        let blob_digest = sha256_digest_of(&blob);
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::post(format!(
+                    "/team/image/blobs/uploads/?digest={blob_digest}"
+                )))
+                .header(CONTENT_LENGTH, blob.len().to_string())
+                .body(Body::from(blob))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 0, "no delivery for failures/blobs");
+        wh04_shutdown(&state).await;
+        assert_eq!(transport.calls(), 0, "no delivery after drain");
+
+        // Filter mismatch: an authorized but unsubscribed repo publishes
+        // successfully without any event (ADR-WH-01 exact repo match).
+        let transport = Arc::new(RecordingTransport::default());
+        let state = state_with_events(transport.clone(), true, vec!["team/image".to_owned()]).await;
+        // Seed the config blob ref for the other repo so its publication is
+        // a fully valid write.
+        state
+            .storage
+            .oci_service
+            .oci_storage
+            .put_blob_ref(
+                "team/other",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                0,
+            )
+            .await
+            .expect("seed other repo config blob");
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/other/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        // team/other is authorized by the /team token prefix but not in the
+        // target's oci_repositories; the publication itself succeeds.
+        assert_eq!(response.status(), StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 0, "filter mismatch delivers nothing");
+        wh04_shutdown(&state).await;
+        assert_eq!(transport.calls(), 0, "no delivery after drain");
+
+        // Emitter failure never changes the committed publication.
+        let failing = Arc::new(RecordingTransport {
+            fail: true,
+            ..Default::default()
+        });
+        let state = state_with_events(failing.clone(), true, vec!["team/image".to_owned()]).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        wh04_wait_calls(&failing, 1).await;
+        wh04_shutdown(&state).await;
+        assert_eq!(failing.calls(), 1);
+
+        // Disabled emitter: publication succeeds, nothing delivered.
+        let transport = Arc::new(RecordingTransport::default());
+        let state =
+            state_with_events(transport.clone(), false, vec!["team/image".to_owned()]).await;
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 0, "disabled emitter delivers nothing");
+        wh04_shutdown(&state).await;
+        assert_eq!(transport.calls(), 0, "no delivery after drain");
+    }
+
+    /// AC4: a delivery blocked past a later publication still carries its own
+    /// request's snapshot.
+    #[tokio::test]
+    async fn storage_event_delayed_snapshot() {
+        let blocking = BlockingTransport::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = isolated_config(temp_dir.path().join("config"));
+        config.database = test_db_config(temp_dir.path()).await;
+        config.git = GitConfig {
+            anonymous_access: true,
+            push_auth: Some(PushAuth::Token),
+            push_tokens: vec![PushTokenConfig {
+                name: "test".to_owned(),
+                token: "secret".to_owned(),
+                paths: Some(vec!["/team".to_owned()]),
+            }],
+            ssh_receive_pack: Some(false),
+        };
+        config.storage_events.enabled = true;
+        config.storage_events.installation_id = Some(WH04_INSTALLATION.to_owned());
+        let mut storage = test_storage_with_config(temp_dir.path(), config.clone()).await;
+        storage.oci_service = OciService {
+            oci_storage: storage.oci_db_storage(),
+            obj_storage: mock_object_storage(),
+        };
+        storage.set_storage_event_emitter(wh04_emitter(
+            &config,
+            true,
+            blocking.clone(),
+            vec!["team/image".to_owned()],
+        ));
+        storage
+            .oci_service
+            .oci_storage
+            .put_blob_ref(
+                "team/image",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                0,
+            )
+            .await
+            .expect("seed manifest config blob");
+        let state = state_with_storage(storage);
+
+        // Publication A lands while its delivery is blocked in transport.
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v1"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if blocking.calls() >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first delivery started");
+
+        // Publication B (another manifest) lands while A's send is in flight.
+        let manifest_b = manifest().replace(
+            "\"layers\":[]",
+            "\"layers\":[],\"annotations\":{\"it\":\"b\"}",
+        );
+        let response = oci_routes()
+            .with_state(state.clone())
+            .oneshot(
+                authenticated(Request::put("/team/image/manifests/v2"))
+                    .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                    .body(Body::from(manifest_b.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if blocking.calls() >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("second delivery started");
+
+        blocking.release();
+        wh04_shutdown(&state).await;
+        let bodies = blocking.bodies();
+        assert_eq!(bodies.len(), 2, "exactly two deliveries after drain");
+        let digest_a = compute_digest(manifest().as_bytes());
+        let digest_b = compute_digest(manifest_b.as_bytes());
+        let env_for = |digest: &str| {
+            bodies
+                .iter()
+                .map(wh04_envelope)
+                .find(|env| env["data"]["digest"] == digest)
+                .unwrap_or_else(|| panic!("missing delivery for {digest}"))
+        };
+        let env_a = env_for(digest_a.as_str());
+        assert_eq!(env_a["data"]["reference"], "v1");
+        assert_eq!(
+            env_a["data"]["media_type"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            env_a["data"]["size"].as_u64().expect("size"),
+            manifest().len() as u64
+        );
+        let env_b = env_for(digest_b.as_str());
+        assert_eq!(env_b["data"]["reference"], "v2");
+        assert_eq!(
+            env_b["data"]["media_type"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            env_b["data"]["size"].as_u64().expect("size"),
+            manifest_b.len() as u64
+        );
+        assert_ne!(env_a["event_id"], env_b["event_id"]);
     }
 }

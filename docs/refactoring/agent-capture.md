@@ -114,7 +114,13 @@ lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）
 
 ## Events batch
 
-`POST /api/v1/agent-capture/sessions/{capture_id}/events:batch` 整批事务。`event_uid` 必须是 ASCII `{generation}:{byte_offset}`（非负十进制，不得溢出），否则 400。未知 `event_kind` 存 `unknown` 并保留 envelope payload。body `batch_id` 为幂等键；同 fingerprint 200，不同 409。同 uid 不同 payload 409。可选 `completeness` 为 `incomplete` 或 `complete`，只升不降（不把 `complete`/`truncated` 降级）。超过 `max_events_per_batch` 或单 event 超过 `max_event_bytes` → 413。无 token → 401。
+`POST /api/v1/agent-capture/sessions/{capture_id}/events:batch` 整批事务。`event_uid` 必须是 ASCII `{generation}:{byte_offset}`（非负十进制，不得溢出），否则 400。未知 `event_kind` 存 `unknown` 并保留 envelope payload。body `batch_id` 为幂等键；同 fingerprint 200，不同 409。同 uid 不同 payload 409。可选 `completeness` 为 `incomplete` 或 `complete`，只升不降（不把 `complete`/`truncated` 降级）。超过 `max_events_per_batch` 或单 event 超过 `max_event_bytes` → 413。无 token → 401。事务以 session `FOR UPDATE` 串行化；若仍撞上 event uid / receipt 唯一约束且 fingerprint 相同，按 replay 返回 0 新行（200），不把该竞态升级为 5xx。
+
+## 出站事件
+
+`events:batch` 在 receipt 事务提交后，按本次实际 insert 的新 event 行每 generation 发一份 `[storage_events]` 的 `agent_capture.events.committed`（plan-20260912 / WH-07 / ADR-WH-04）。快照字段为 `capture_id`、`receipt_id`、该组 `new_event_count` / `generation`、`stream_kind`（`session.session_kind`）、`completeness`；scope 只填会话上的可信 `tenant_id` / `repo_path`。同 fingerprint 的 HTTP 早退 replay、以及没有任何新行的事务提交都不发。投递失败不改变已提交的 ingest。file-op / blob / session PUT 永久不发。
+
+`POST .../checkpoints` 在 receipt 事务提交且本次新建 checkpoint 行后发一份 `agent_capture.checkpoint.committed`（WH-08）。快照字段为 `capture_id`、`checkpoint_id`、该次提交后的 `completeness`、`raw_committed`（仅关联已 committed raw 为 true）。同一 checkpoint 的 replay 不发；共享同一 raw blob 的新 checkpoint 各自发一次。详见 [`storage-events.md`](storage-events.md)。
 
 ## File-ops batch
 

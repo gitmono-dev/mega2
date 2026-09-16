@@ -2,7 +2,7 @@
 
 ## 文档职责与维护协议
 
-本文是 monoengine 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/media/eli/sky/mega`）的 Rust 后端能力完整移植到 monoengine**，并在移植过程中保留 monoengine 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/media/eli/sky/campsite`）承载，monoengine 的前端与账户系统是 monoui 仓库（`gitmono-dev/monoui`，sibling `../monoui`）`monoengine` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
+本文是 monoengine 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/media/eli/sky/mega`）的 Rust 后端能力完整移植到 monoengine**，并在移植过程中保留 monoengine 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/media/eli/sky/campsite`）承载，monoengine 的前端与账户系统是 monoui 仓库（`gitmono-dev/monoui`，sibling `../monoui`）`monoengine` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。自 PT-13 起也可登记 **mega2 原生**长期能力（事实基线是本仓 checkout，不要求 Mega revision）。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
 
 > **术语（2026-08-21）**：本文其余处出现的 *website* 是**角色名**（monoengine 的
 > 前端 / 认证与产品邮件投递面），不再是仓库名——其实现仓库自 2026-08-21 起为
@@ -75,7 +75,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 ## 规划原则
 
-以下原则适用于 PT-01 至 PT-12：
+以下原则适用于全部 PT。原则 1–4、8 只约束 Mega 移植项（PT-01..PT-12）；原则 5–7、9–12 对 mega2 原生项同样生效。
 
 1. **忠实移植优先于重新设计。** 默认保留 Mega 的 wire 行为、DB schema、API 契约和错误语义；架构性偏离必须是已决 ADR 并记录在案（如 contract 归并、config 提升、workspace 拆分），不得在执行中临时发明。
 2. **monoengine 的架构改进不回退。** 单 package `monoengine`（lib `monoengine_core` + `[[bin]]`）、`src/contract/` 边界归并、一级 `src/config/`、`src/notification/`（邮件投递已迁 website，见 ADR-WA-08）、Vault（crates.io `libvault` + `src/contract/vault/` 集成层加固；不得回流为内嵌 vendored fork，亦不得因与 Mega `libvault-core` 目录差异而回退——依赖形态演进见 [`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）、orbit 内联于 `src/orbit_api/` + `src/orbit/`（见 [`plan-20260824.md`](plan-20260824.md)）、对象存储构造时机等已交付改进，不因"与 Mega 不一致"而改回。
@@ -87,7 +87,8 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 8. **不重复建设事实源。** Mega 侧能力若已被 monoengine 以更强形态覆盖（如 notification、config、mail），不回流旧实现；只补缺口，不重复移植。
 9. **测试随代码移植。** 移植功能必须携带或重建其测试；禁止手写 schema SQL，必须走真实 migration；集成测试沿用 docker-compose 测试栈与 `bin/tests/` 黑盒分层。
 10. **计划状态必须据代码更新。** 每次审计重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
-11. **双前端一致性。** Mega 前端体系是 moon + campsite，monoengine 前端与账户系统是 monoui `monoengine` 分支的 `apps/next-app`；monoengine 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。
+11. **双前端一致性。** Mega 前端体系是 moon + campsite，monoengine 前端与账户系统是 monoui `monoengine` 分支的 `apps/next-app`；monoengine 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。storage-only 无登录面的能力（如 PT-13）写 `N/A` 与原因即可。
+12. **mega2 原生项续编编号。** 非 Mega 移植的长期能力使用 `PT-13` 起的新编号，不得占用或重排 `PT-01..PT-12` / `SB-01..SB-03`。事实基线是本仓源码、测试、配置与 `docs/refactoring/`；Mega 侧无对应物时证据列写 `N/A`。
 
 ## 当前基础
 
@@ -121,6 +122,7 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储与 Redis SecretRef、`[oauth]`、跨 source/profile diagnostics 和首批热加载黑盒均已落地；剩余为真实消费者订阅清单、跨 await 生命周期审计与持续扩展，而非启动顺序改造 | `mega/common/src/config`（基线对照） | [`plan-20260731.md`](plan-20260731.md)（AU-02；`[oauth]`） | 2026-08-03 |
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + UN-31 只读模式集成层重建）已由 [`plan-20260820.md`](plan-20260820.md) 于 2026-08-21 交付，本 PT 安全收尾缺口不变 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-21 |
 | PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `monoengine` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
+| PT-13 | storage-only 统一推送密文（同一 `[[git.push_tokens]]` 用于 HTTP 与 SSH receive-pack） | P1 | 候选 | 查找与身份已统一：HTTP 写 / SSH 读共用 `lookup_push_token`。SSH **写**仍被 TP-20 关掉（`DEFER-SP-02`）。本方案在 `push_auth=token` 下显式打开 SSH receive-pack，不新开第二套凭据，也不把 `none` 的匿名写扩到 SSH | N/A（mega2 原生） | 前置事实 [`plan-20260905.md`](plan-20260905.md) TP-20、[`plan-20260908.md`](plan-20260908.md) SP-* / `DEFER-SP-02`；尚无承接日期计划 | 2026-09-16 |
 
 ## 工程安全基线
 
@@ -626,6 +628,89 @@ monoengine 的后端能力（CL、issue、评审、通知、构建等）必须�
 
 ---
 
+## PT-13：storage-only 统一推送密文（HTTP + SSH receive-pack）
+
+mega2 原生能力，不是 Mega 移植。承接 [`plan-20260908.md`](plan-20260908.md) `DEFER-SP-02`（重启条件：产品明确要求 SSH 推送）。本文只冻结方案与进入日期计划的条件；接线、测试与发布必须另开 `plan-YYYYMMDD.md`。
+
+### 现状缺口
+
+Storage-only（显式 `git.push_auth`）已经有**一份**静态密文表 `[[git.push_tokens]]`：
+
+| 已交付 | 证据 |
+|---|---|
+| 常量时间查找 `lookup_push_token`；命中身份 = `name`；username 不参与比对 | `src/contract/git_protocol/mod.rs` |
+| HTTP 出示：Bearer 或 Basic **password**（username 丢弃） | `src/contract/git_protocol/http.rs` `git_http_auth` |
+| SSH 读出示：`auth_password` 的 password = 同一密文 | `src/contract/git_protocol/ssh.rs`；ADR-SP-01 |
+| 写授权：`check_push_permission` → `apply_push_auth_gate` → `token_covers_repo`（`paths` 组件边界） | 同 `mod.rs`；trunk 下 Cedar `off`，token `paths` 是唯一写 ACL |
+| LFS 批/锁、产品 API 写、OCI `/v2` 复用同一查找 | `lfs_router.rs`、`api_write_auth.rs`、`oci/auth.rs` |
+| SSH receive-pack **恒关**：`ssh_receive_pack_enabled()` = `!storage_only() && ssh_receive_pack != Some(false)`；启动强制 `ssh_receive_pack=false` | TP-20；`src/config/model.rs`；`validate.rs` |
+
+TP-20 关掉 SSH 写，是因为当时静态 token **只做了 git-over-HTTP**，SSH 路径仍要求 UserStorage 已认证用户。若在没有 token 闸的情况下挂着 receive-pack，会留下「无凭据要求的隐性推送通道」。[`plan-20260908.md`](plan-20260908.md) 只把 SSH **读**对齐 HTTP，并写明不打开 SSH 推送。
+
+因此今天：**同一枚密文已经能 HTTP 推 + SSH 拉**；SSH 推即使 password 正确也回 `SSH receive-pack is disabled`。缺的是「同一闸门覆盖 SSH 写」，不是第二套密钥。
+
+### 选定方案
+
+**一枚密文、两套传输、同一写闸。** 不新增 token 表，不把 username 当密钥，不把 Agent ingest token 或 review 公钥混进来。
+
+1. **唯一密钥**仍是 `[[git.push_tokens]].token`。`name` 只做命中后的 `authenticated_user`；commit author/committer 仍是自声明 provenance。
+2. **出示约定不变**：HTTP = Bearer 或 Basic password；SSH = `auth_password` 的 password。两端都忽略协议层 username。
+3. **查找与写闸不变**：两侧命中后都 `set_authenticated_user(name)`，receive-pack 都走现有 `check_push_permission`（无凭据 401，`paths` 不覆盖 403）。禁止为 SSH 再写一套路径匹配。
+4. **打开 SSH 写的形态闸（fail-closed）**：
+   - `push_auth=token` **且** 配置显式 `ssh_receive_pack=true` → `ssh_receive_pack_enabled()` 为真；storage-only 启动不再因为这项是 `true` 而拒绝。
+   - `push_auth=none` **禁止** `ssh_receive_pack=true`（启动拒绝）。匿名写继续只出现在运维显式打开的 HTTP 面上（`deploy-trunk.md` §3）。
+   - `push_auth=token` 且省略 / `false` → SSH 写仍关（与今日行为兼容；SSH 推送是 opt-in，不是 token 模式的默认副作用）。
+   - review（省略 `push_auth`）语义不变：仍走 UserStorage 公钥；不得因本方案成功放行 `auth_none`。
+5. **`ssh_receive_pack_enabled()` 目标谓词**（日期计划开工日刷新锚点后再改代码）：
+
+   ```text
+   review:     ssh_receive_pack != Some(false)          # 与今日相同
+   token+true: true
+   token+false/省略: false
+   none:       false（且 true 为配置错误）
+   ```
+
+6. **客户端**：同一 `SECRET`。HTTP `http://x:SECRET@host/path.git` 或 `Authorization: Bearer SECRET`；SSH `SSH_ASKPASS` / `sshpass`，password=`SECRET`，再 `git push`。成功条件与 HTTP 相同：只接受 `refs/heads/main`，经 `MonoWriteQueue` 落地。
+7. **LFS**：Git 对象可经 SSH 推；LFS 仍走 hybrid HTTP，继续用同一密文。pure `git-lfs-transfer` 仍是 `DEFER-SP-03` / `DEFER-LF-01`，不在本方案。
+8. **配置挂公钥**（`DEFER-SP-01`）不是本方案。本方案的 SSH 推送凭据就是 push token 密文，不是第二把钥匙。
+
+### 目标范围
+
+- 修订 `ssh_receive_pack_enabled` 与 `validate_trunk_config_surface`，落实上一节形态闸。
+- SSH exec `git-receive-pack` 在 token 命中后进入与 HTTP 相同的 `finalize_receive_pack` / B0–B3，而不是通道级直接 `disabled`。
+- 进程级 IT：同一密文 HTTP push 与 SSH push 都前进 `/project` 的 `main`；坏密文拒；`paths` 越权拒；`push_auth=none` 即使有人配置 `ssh_receive_pack=true` 也启动失败；review 公钥推送回归仍绿。
+- 同步 `docs/deploy-trunk.md`、`docs/refactoring/protocol.md`、`docs/monorepo.md`（若提及 SSH 边界）、配置样例注释与 `README.md` storage-only 段。
+- 关闭 `DEFER-SP-02`（日期计划完成时回写该行承接位置）。
+
+### 非目标
+
+- 不在 `push_auth=none` 上开 SSH receive-pack。
+- 不把 SSH 写做成默认（token 模式仍须显式 `ssh_receive_pack=true`）。
+- 不引入 `ssh_public_keys`、不查 UserStorage、不复用 `[[agent_capture.ingest_tokens]]`。
+- 不实现 pure SSH LFS、不改 trunk 分支准入（非 `main` 仍 B0 拒绝）、不重开 Cedar / CL。
+- 不把 password 写入 tracing / `GIT_SSH_COMMAND` 样例（沿用 SP-02：`SSH_ASKPASS`）。
+
+### 完成判据
+
+- `push_auth=token` + `ssh_receive_pack=true`：真实 `git` 客户端用**同一密文**完成 HTTP receive-pack 与 SSH receive-pack，tip 进入 `refs/heads/main`，无 `refs/cl/*`。
+- 同一部署上 `paths` 不覆盖的子路径 SSH/HTTP 均为 403 等价拒绝；未出示或错误密文不能写。
+- `push_auth=none` + `ssh_receive_pack=true` 启动失败；`none` 默认栈 SSH push 仍报 `SSH receive-pack is disabled`。
+- review 形态 SSH 公钥推送与「默认匿名开时不 `auth_none`」不被破坏。
+- 部署文档写清：统一的是密文与写闸，不是「SSH 协议整面默认打开」。
+
+### 审计证据、真实缺口与提升条件
+
+- **Mega 证据**：N/A。
+- **monoengine 现状证据**：TP-20 / ADR-SP-01..04；`GitConfig::ssh_receive_pack_enabled`；`integration_git_ssh_trunk_token_push_receive_pack_disabled`；`deploy-trunk.md` §4。
+- **最小可验证第一阶段**：日期计划先写 ADR（形态闸 + 谓词）并改 `ssh_receive_pack_enabled` / validate，配一条 SSH token push 进程 IT 与一条 none 启动拒绝；再补文档与 review 回归。
+- **风险与边界**：password 进 SSH 有客户端泄漏面（ADR-SP-01 已接受于读路径）；打开写后泄漏面等于「能推」。必须保持常量时间查找、日志不回显密文。误把 `none` 与 `ssh_receive_pack=true` 组合放行会破坏 TP-20 安全边界——启动校验是硬门。
+
+### 依赖与顺序
+
+不依赖 PT-01..PT-12。消费已交付的 TP-19/20 与 SP-01/02。与 PT-03 streaming、PT-04 `DEFER-GM-02`（pure SSH LFS）无实现依赖。产品确认「CI/Agent 需要 SSH 推同一 token」后即可开日期计划；未确认前保持候选，不得在其它卡顺手打开 receive-pack。
+
+---
+
 ## 实施顺序
 
 十一个移植项按四个阶段推进。阶段之间是架构依赖，不要求前一阶段全部结束才开始下一阶段的设计，但不得绕过前置决策直接实施高风险切片。
@@ -671,6 +756,10 @@ monoengine 的后端能力（CL、issue、评审、通知、构建等）必须�
 
 PT-12 不独占阶段，贯穿各阶段推进：会话信任路径与 compose 同栈 IT 已由 plan-20260731 交付；下一动作为全量双前端功能对照审计（纯审计，可与阶段一并行），随后按功能域把追平切片排入日期计划；每个涉及公开 API/账户行为的 PT 在实施时必须通过原则 11 的前端影响评估。
 
+### 持续轨道：storage-only 统一推送密文
+
+PT-13 不进入 Mega 移植阶段。前置事实（HTTP token 写、SSH token 读、SSH 写关闭）已由 plan-20260905 / plan-20260908 交付。下一动作是产品确认后开日期计划，按「选定方案」把 SSH receive-pack 接到同一 `lookup_push_token` 写闸；未确认前不得改 `ssh_receive_pack_enabled`。
+
 ## 依赖图
 
 ```mermaid
@@ -687,6 +776,7 @@ flowchart TD
     PT10[PT-10 配置 SecretRef 收尾]
     PT11[PT-11 Vault 安全收尾]
     PT12[PT-12 前端与账户一致性]
+    PT13[PT-13 storage-only 统一推送密文]
 
     PT01 --> PT04
     PT01 --> PT06
@@ -703,6 +793,7 @@ flowchart TD
     PT06 --> PT09
     PT06 --> PT12
     PT11 --> PT09
+    PT13
 ```
 
 ## 跨功能验收门禁
@@ -769,7 +860,7 @@ flowchart TD
 | [`plan-20260905.md`](plan-20260905.md) | N/A（trunk / MonoWriteQueue；非 Mega PT） | **已完成** | Trunk 直推与 storage-only；LFS 当时关闭（GAP-13/TP-18），由 [`plan-20260909.md`](plan-20260909.md) supersede。 |
 | [`plan-20260909.md`](plan-20260909.md) | N/A（storage-only LFS；承接 TP-18 关闭后的独立议题） | **已完成** | LFS 批/锁鉴权对齐 `push_auth=none`/`token`；trunk 重新挂载；IT + 文档 supersede。不覆盖 SSH LFS transfer、PUT 逐请求鉴权、DEFER-TP-05。 |
 | [`plan-20260906.md`](plan-20260906.md) | N/A（storage-only / trunk compose Git 黑盒；非 Mega PT） | **已完成** | 一 case 一卡；compose 黑盒；客户端=`git`/`git-lfs`/`ssh`（禁止 libra 作协议客户端）；SO-01 harness → HTTP 读/写/none/LFS → SSH 读 + reject receive-pack → SO-06 收口。 |
-| [`plan-20260908.md`](plan-20260908.md) | N/A（storage-only SSH 只读；非 Mega PT） | **已完成** | **SP-01..SP-05**：SSH upload-pack 对齐 HTTP 读；`auth_none`/none + password-token；SP-04 cancelled→SP-01；DEFER-SP-01..04。每实现/release 卡仅 patch+1。Codex R18 PASS。 |
+| [`plan-20260908.md`](plan-20260908.md) | N/A（storage-only SSH 只读；非 Mega PT）。SSH 写统一密文见 **PT-13** | **已完成** | **SP-01..SP-05**：SSH upload-pack 对齐 HTTP 读；`auth_none`/none + password-token；SP-04 cancelled→SP-01；`DEFER-SP-02`（SSH receive-pack + 同一 push token）由 PT-13 承接，本计划未打开 SSH 写。 |
 | [`plan-20260910.md`](plan-20260910.md) | N/A（merge_writer sunset；非 Mega PT） | **已完成** | CL merge 唯一写者 = MonoWriteQueue；删除 `[monorepo].merge_writer`、Legacy processor、`merge_queue` 表。不删除 `/merge-queue` HTTP 门面（DEFER-MW-01）。 |
 | [`plan-20260902.md`](plan-20260902.md) | N/A（storage-only OCI Distribution；非 Mega PT） | **已完成** | DR-01..DR-15：`[oci]` 双重门、4 表元数据、`ObjectNamespace::Oci`、`/v2` 最小 push/pull + tags/list、Basic 复用 push token、两遍流式 complete；文档见 [`../refactoring/oci.md`](../refactoring/oci.md)。不覆盖 `_catalog`/referrers/删除 GC/token 服务（DEFER-DR-01..06）。DR-15 收口 v0.8.53；完成判据文档收口对照代码勾选。 |
 | [`plan-20260911.md`](plan-20260911.md) | N/A（storage-only Agent Capture；非 Mega PT） | **已完成** | libra 两套 session 以 raw 落入 `agent_capture_*` + `ObjectNamespace::Agent`；独立 ingest token；review 不挂载。不实现 libra 客户端（DEFER-AC-01）、不默认 FileHistory 50 版（DEFER-AC-02）。 |
@@ -789,14 +880,14 @@ flowchart TD
 
 ### 已实现
 
-- **PT-01** 已完成（实现面 + 文档收口 v0.1.176 + D 组 v0.1.177）。其余 PT-02..PT-12 仍未全部满足完成判据。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、notification、orbit、协议止血、bellatrix）已在"当前基础"据实记录；本仓 chat/Notes 与 SMTP 邮件投递已按 plan-20260731 退场，不再列入当前基础。
+- **PT-01** 已完成（实现面 + 文档收口 v0.1.176 + D 组 v0.1.177）。其余 PT-02..PT-12 仍未全部满足完成判据。**PT-13**（mega2 原生，统一推送密文）为候选，方案已写入本文，无日期计划。已完成的基础移植（callisto/jupiter/migration、contract 归并、config、vault、notification、orbit、协议止血、bellatrix）已在"当前基础"据实记录；本仓 chat/Notes 与 SMTP 邮件投递已按 plan-20260731 退场，不再列入当前基础。
 
 ## 路线图维护
 
 - 每次审计先用 libra 核对 Mega 与 monoengine 的实际 checkout revision 和工作区状态；dirty 或核对失败必须按实际 revision 记录，不把未核对的版本描述为最新。
 - 每季度、重大架构变更或日期计划完成后，重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
 - PT 编号一经被执行计划或 issue 引用，不重新编号；废弃项使用"已替代"或"不采纳"，并记录替代项、理由和证据。
-- 新候选移植项必须同时给出 Mega revision/path、monoengine 代码/测试缺口、价值、风险、依赖和最小可验证切入点。
+- 新候选移植项必须同时给出 Mega revision/path、monoengine 代码/测试缺口、价值、风险、依赖和最小可验证切入点。mega2 原生项（PT-13 起）Mega 列写 `N/A`，其余字段同样强制。
 - 某项进入日期计划时，仅更新总览状态、链接和剩余长期缺口；详细章节不复制 owner、日期或任务列表。
 - 移植完成只以当前可发布代码、测试、兼容/用户文档和迁移证据为准；本文文字、日期计划完成声明或 checkbox 不是完成证明。
 - Mega 是移植目标与契约基线：接口、数据模型、安全边界和兼容策略默认与 Mega 对齐；任何偏离（含既有架构改进之外的新偏离）必须经 monoengine 自身 RFC/ADR 显式决策并记录。

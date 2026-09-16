@@ -366,7 +366,14 @@ enabled = false
 
 # Storage-only committed-write outbound events (plan-20260912). Disabled
 # placeholder: do not enable in this tracked file. Enabling requires
-# installation_id plus SecretRef HMAC targets; later cards bind transport.
+# installation_id plus SecretRef HMAC targets; startup (WH-11) resolves the
+# secrets from the vault and binds the HTTPS transport (restart-required;
+# disabled never resolves). Seed each target's hex:<even-hex> HMAC value by
+# piping it on stdin (--value-stdin is the only value channel):
+#   printf '%s' "$STORAGE_EVENTS_HMAC" | monoengine --config config/config.toml \
+#     config secret set storage_events.targets.<id>.secret_ref \
+#     --vault-path config/<profile>/storage_events/targets/<id>/hmac \
+#     --field value --value-stdin
 [storage_events]
 enabled = false
 # installation_id = "prod-primary-01"
@@ -374,10 +381,10 @@ enabled = false
 # id = "ops-main"
 # url = "https://events.example.invalid/ingest"
 # secret_ref = "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
-# events = ["repo.push"]
+# events = ["repo.push", "oci.manifest.published", "lfs.object.uploaded", "lfs.media.finalized", "agent_capture.events.committed", "agent_capture.checkpoint.committed"]
 # git_paths = ["/team/a"]
 # oci_repositories = []
-# lfs_paths = []
+# lfs_paths = ["/team/a.git"]  # media scope keeps the HTTP `.git` suffix; `/team/a` will not match
 # include_unscoped_lfs = false
 # agent_tenants = []
 # agent_repo_paths = []

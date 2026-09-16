@@ -43,6 +43,8 @@ pub(crate) async fn follow_push_queue(
     let ctx = PushExecContext {
         storage: storage.clone(),
         git_object_cache,
+        pre_apply_enter_barrier: None,
+        pre_apply_release_barrier: None,
     };
     for _ in 0..MAX_ROUNDS {
         match wait {
@@ -190,6 +192,17 @@ mod tests {
     ) -> (TempDir, Storage, Commit, String) {
         let temp = TempDir::new().expect("temp");
         let storage = trunk_storage(temp.path()).await;
+        let (path_commit, path) = path_fixture_on(&storage, dir, path_commit_msg).await;
+        (temp, storage, path_commit, path)
+    }
+
+    /// Root + `main@/{dir}` whose tree is `child` and tip is `path_commit`,
+    /// seeded onto an existing storage.
+    async fn path_fixture_on(
+        storage: &Storage,
+        dir: &str,
+        path_commit_msg: &str,
+    ) -> (Commit, String) {
         let mono = storage.mono_storage();
         let child = Tree::from_tree_items(vec![blob_item(
             "x.txt",
@@ -234,7 +247,7 @@ mod tests {
         )
         .await
         .unwrap();
-        (temp, storage, path_commit, path)
+        (path_commit, path)
     }
 
     async fn git_cache() -> Arc<GitObjectCache> {
@@ -388,5 +401,184 @@ mod tests {
         assert!(once.contains("align with"));
         let twice = trunk_nff_align_message(&once);
         assert_eq!(once, twice);
+    }
+
+    /// WH-03 (plan-20260912 / AC3): API writes land through the same B3
+    /// commit point as protocol pushes, so `land_api_tip_push` produces
+    /// exactly one `repo.push` event with this round's landed snapshot.
+    #[tokio::test]
+    async fn storage_event_api_commit() {
+        use crate::jupiter::service::{
+            storage_event_emitter::repo_push_event,
+            storage_event_transport::{EventTarget, EventTransport, TransportSuccess},
+        };
+
+        /// Recording fake transport: exact body bytes + call counter, no
+        /// network (WH-09 test seam).
+        #[derive(Default)]
+        struct RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize,
+            bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        }
+
+        impl EventTransport for RecordingTransport {
+            fn post(
+                &self,
+                _target: &EventTarget,
+                body: bytes::Bytes,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                TransportSuccess,
+                                crate::jupiter::service::storage_event_transport::TransportError,
+                            >,
+                        > + Send,
+                >,
+            > {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.bodies.lock().expect("bodies").push(body);
+                Box::pin(async { Ok(TransportSuccess::Accepted2xx { status: 200 }) })
+            }
+        }
+
+        const INSTALLATION: &str = "it-wh03-api";
+        let _lock = materialize::lock_materialize_tests().await;
+        let temp = TempDir::new().expect("temp");
+        let mut config = isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.storage_events.enabled = true;
+        config.storage_events.installation_id = Some(INSTALLATION.to_string());
+        let transport = Arc::new(RecordingTransport::default());
+        let target_config = crate::config::StorageEventsTargetConfig {
+            id: "ops-main".to_string(),
+            url: "https://events.example.invalid/ingest".to_string(),
+            secret_ref: "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+                .to_string(),
+            events: vec!["repo.push".to_string()],
+            git_paths: vec!["/".to_string()],
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        };
+        let secret = crate::config::secret::SecretString::new(
+            "hex:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let compiled =
+            EventTarget::compile(&target_config.id, &target_config.url, &secret).expect("target");
+        let mut storage = test_storage_with_config(temp.path(), config.clone()).await;
+        storage.set_storage_event_emitter(
+            crate::jupiter::service::storage_event_emitter::StorageEventEmitter::new_with_transport(
+                &config,
+                transport.clone(),
+                vec![(target_config, compiled)],
+            ),
+        );
+        let storage = with_test_vault(storage, temp.path()).await;
+
+        let (path_commit, path) = path_fixture_on(&storage, "wh03api", "path tip").await;
+        let new_child = Tree::from_tree_items(vec![blob_item(
+            "y.txt",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )])
+        .unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![path_commit.id], "api n1");
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let old_id = path_commit.id.to_string();
+        let new_id = new_commit.id.to_string();
+        let landed = land_api_tip_push(
+            &storage,
+            git_cache().await,
+            &path,
+            &old_id,
+            &new_id,
+            Some("agent-ci".into()),
+            &PushPayload {
+                commits: vec![new_id.clone()],
+                fork_base: Some(old_id.clone()),
+                n: 1,
+            },
+        )
+        .await
+        .expect("lander advances tip");
+        assert_eq!(landed, new_id);
+
+        // The emitter admits synchronously at the B3 commit point; the send
+        // task lands within a bounded window.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if transport.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delivery within 2s");
+        let bodies = transport.bodies.lock().expect("bodies").clone();
+        assert_eq!(bodies.len(), 1, "exactly one repo.push delivery");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("envelope json");
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["event_type"], "repo.push");
+        assert_eq!(envelope["source"], "git");
+        assert_eq!(envelope["scope"]["repo_path"], path.as_str());
+        assert!(envelope["scope"]["tenant_id"].is_null());
+        assert!(envelope["scope"]["oci_repository"].is_null());
+        let operation_id =
+            crate::jupiter::service::push_queue_service::push_operation_id(&old_id, &new_id);
+        assert_eq!(envelope["data"]["operation_id"], operation_id);
+        assert_eq!(envelope["data"]["ref_name"], MEGA_BRANCH_NAME);
+        assert_eq!(envelope["data"]["old_oid"], old_id);
+        assert_eq!(envelope["data"]["requested_oid"], new_id);
+        assert_eq!(envelope["data"]["landed_oid"], landed);
+        let push_id = envelope["data"]["push_id"]
+            .as_str()
+            .expect("push_id string")
+            .to_string();
+        assert!(
+            push_id.parse::<i64>().is_ok(),
+            "push_id carries the push_queue row id: {push_id}"
+        );
+        let expected = repo_push_event(
+            INSTALLATION,
+            &path,
+            crate::jupiter::service::storage_event_emitter::RepoPushData {
+                push_id: push_id.clone(),
+                operation_id: operation_id.clone(),
+                ref_name: MEGA_BRANCH_NAME.to_owned(),
+                old_oid: old_id.clone(),
+                requested_oid: new_id.clone(),
+                landed_oid: landed.clone(),
+            },
+        )
+        .expect("builder");
+        assert_eq!(envelope["event_id"], expected.event_id.to_string());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            storage.storage_event_emitter.shutdown(),
+        )
+        .await
+        .expect("emitter shutdown within 3s");
+        // Drain-first final count: exactly one delivery, no late extra.
+        assert_eq!(
+            transport.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one repo.push delivery after drain"
+        );
     }
 }

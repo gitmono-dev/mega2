@@ -156,6 +156,7 @@ pub struct Storage {
     pub config: Arc<Config>,
     pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
+    pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
     /// Shared authorization snapshot holder (ADR-UN-02). Injected by
     /// `AppContext`; the same `Arc` is shared with the HTTP state so the write
@@ -207,6 +208,8 @@ impl Storage {
         let lfs_service = LfsService {
             lfs_storage: lfs_db_storage.clone(),
             obj_storage: object_store.clone(),
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
@@ -228,6 +231,8 @@ impl Storage {
         let agent_capture_service = AgentCaptureService {
             storage: AgentCaptureStorage { base: base.clone() },
             obj_storage: object_store.clone(),
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         };
 
         let git_service = GitService {
@@ -310,6 +315,8 @@ impl Storage {
             agent_capture_service,
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,
@@ -340,6 +347,20 @@ impl Storage {
     /// state.
     pub fn set_entity_store(&mut self, store: Arc<SharedEntityStore>) {
         self.entity_store = store;
+    }
+
+    /// Install the single application storage-event emitter owner (WH-11).
+    /// Called once by `AppContext` during bootstrap after the target secrets
+    /// have been resolved; the default constructed state is disabled.
+    pub fn set_storage_event_emitter(
+        &mut self,
+        emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+    ) {
+        // LfsService / AgentCaptureService are built before the vault-bound
+        // emitter exists (WH-11), so rebinding must fan out (WH-05 / WH-07).
+        self.lfs_service.storage_event_emitter = emitter.clone();
+        self.agent_capture_service.storage_event_emitter = emitter.clone();
+        self.storage_event_emitter = emitter;
     }
 
     /// The server-signing vault handle (MC-09), if wired in by `AppContext`.
@@ -599,6 +620,8 @@ impl Storage {
             agent_capture_service: AgentCaptureService::mock(),
             code_review_service: CodeReviewService::mock(),
             webhook_service,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             notification_storage: NotificationStorage::new(Arc::new(DatabaseConnection::default())),
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,

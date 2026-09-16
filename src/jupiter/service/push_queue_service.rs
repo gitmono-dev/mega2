@@ -166,6 +166,14 @@ impl PushPayload {
 pub struct PushExecContext {
     pub storage: crate::jupiter::storage::Storage,
     pub git_object_cache: std::sync::Arc<crate::ceres::api_service::cache::GitObjectCache>,
+    /// Test-only: two-phase sync inside the B3 txn right before
+    /// `apply_push_in_txn` (after the baseline read): the executor signals
+    /// "race window open" on the enter barrier, then blocks on the release
+    /// barrier until the test's queue-bypassing writer has committed — a
+    /// deterministic apply-time root CAS miss (WH-03).
+    pub pre_apply_enter_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    /// Test-only: the executor resumes only after this barrier completes.
+    pub pre_apply_release_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 /// Context required to execute a claimed `kind=merge` round under B3.
@@ -2022,6 +2030,15 @@ impl PushQueueService {
             land_ts,
         );
 
+        // Test-only seam (WH-03): with the baseline read behind us and the
+        // apply CAS ahead, signal the open race window, then wait until the
+        // test's queue-bypassing writer has committed its root-row update.
+        if let Some(barrier) = &ctx.pre_apply_enter_barrier {
+            barrier.wait().await;
+        }
+        if let Some(barrier) = &ctx.pre_apply_release_barrier {
+            barrier.wait().await;
+        }
         PushQueueStorage::savepoint(&txn, "b3_kind").await?;
         let apply = mono_api
             .apply_push_in_txn(
@@ -2094,6 +2111,28 @@ impl PushQueueService {
         }
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
+        // WH-03 (plan-20260912 ADR-WH-04): the single `repo.push` emission
+        // point — after the real n>0 B3 commit, before the C segment. The
+        // snapshot comes from this round's row/result only (GC-08/GC-10); a
+        // builder or emitter failure must never affect the committed push.
+        let config = ctx.storage.config();
+        if config.git.storage_only()
+            && let Some(installation_id) = config.storage_events.installation_id.as_deref()
+            && let Ok(event) = crate::jupiter::service::storage_event_emitter::repo_push_event(
+                installation_id,
+                &normalized,
+                crate::jupiter::service::storage_event_emitter::RepoPushData {
+                    push_id: row.id.to_string(),
+                    operation_id: row.operation_id.clone(),
+                    ref_name: MEGA_BRANCH_NAME.to_owned(),
+                    old_oid: row.old_id.clone(),
+                    requested_oid: row.new_id.clone(),
+                    landed_oid: landed_commit_id.clone(),
+                },
+            )
+        {
+            let _ = ctx.storage.storage_event_emitter.try_emit(event);
+        }
         self.run_c_segment_index(row.id, &row.path).await;
         Ok(ExecuteOutcome::Done {
             id: row.id,
@@ -3627,5 +3666,1578 @@ mod tests {
         assert_eq!(row.status, PushQueueStatusEnum::Failed);
         assert_eq!(row.failure_type, Some(PushQueueFailureEnum::Conflict));
         assert!(row.pending_action.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // WH-03 (plan-20260912 / ADR-WH-04): `repo.push` is emitted exactly once,
+    // at the real n>0 B3 push commit point; every other round shape delivers
+    // nothing, and emitter failure never changes the push result.
+    // ------------------------------------------------------------------
+
+    const WH03_INSTALLATION: &str = "it-wh03";
+
+    /// Recording fake transport (WH-09 test seam): captures exact body bytes
+    /// and a call counter; never touches the network.
+    struct RecordingTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        fail: bool,
+    }
+
+    impl RecordingTransport {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<bytes::Bytes> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+    }
+
+    impl crate::jupiter::service::storage_event_transport::EventTransport for RecordingTransport {
+        fn post(
+            &self,
+            _target: &crate::jupiter::service::storage_event_transport::EventTarget,
+            body: bytes::Bytes,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::jupiter::service::storage_event_transport::TransportSuccess,
+                            crate::jupiter::service::storage_event_transport::TransportError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.bodies.lock().expect("bodies").push(body);
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err(crate::jupiter::service::storage_event_transport::TransportError::Timeout)
+                } else {
+                    Ok(
+                        crate::jupiter::service::storage_event_transport::TransportSuccess::Accepted2xx {
+                            status: 200,
+                        },
+                    )
+                }
+            })
+        }
+    }
+
+    /// The single compiled target used by the WH-03 emitters
+    /// (`git_paths = ["/"]` covers every repo path).
+    fn wh03_compiled_target() -> (
+        crate::config::StorageEventsTargetConfig,
+        crate::jupiter::service::storage_event_transport::EventTarget,
+    ) {
+        let target_config = crate::config::StorageEventsTargetConfig {
+            id: "ops-main".to_string(),
+            url: "https://events.example.invalid/ingest".to_string(),
+            secret_ref: "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+                .to_string(),
+            events: vec!["repo.push".to_string()],
+            git_paths: vec!["/".to_string()],
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        };
+        let secret = crate::config::secret::SecretString::new(
+            "hex:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let compiled = crate::jupiter::service::storage_event_transport::EventTarget::compile(
+            &target_config.id,
+            &target_config.url,
+            &secret,
+        )
+        .expect("compile target");
+        (target_config, compiled)
+    }
+
+    /// Enabled/disabled emitter over the recording transport with the shared
+    /// compiled target.
+    fn wh03_emitter(
+        config: &crate::config::Config,
+        transport: Arc<RecordingTransport>,
+    ) -> crate::jupiter::service::storage_event_emitter::StorageEventEmitter {
+        crate::jupiter::service::storage_event_emitter::StorageEventEmitter::new_with_transport(
+            config,
+            transport,
+            vec![wh03_compiled_target()],
+        )
+    }
+
+    /// Bounded wait for the blocking transport's recorded calls.
+    async fn wh03_wait_calls_block(transport: &BlockingRecordingTransport, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.calls() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delivery within 2s");
+    }
+
+    /// Storage-only trunk storage (`push_auth=none`) with the recording
+    /// emitter installed as the application owner.
+    async fn wh03_storage(
+        events_enabled: bool,
+        transport: Arc<RecordingTransport>,
+    ) -> (tempfile::TempDir, crate::jupiter::storage::Storage) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+        config.monorepo.push_policy = PushPolicy::Trunk;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.storage_events.enabled = events_enabled;
+        config.storage_events.installation_id = Some(WH03_INSTALLATION.to_string());
+        let mut storage =
+            crate::jupiter::tests::test_storage_with_config(temp.path(), config.clone()).await;
+        storage.set_storage_event_emitter(wh03_emitter(&config, transport));
+        let storage = crate::jupiter::tests::with_test_vault(storage, temp.path()).await;
+        (temp, storage)
+    }
+
+    fn wh03_blob_item(name: &str, hex: &str) -> git_internal::internal::object::tree::TreeItem {
+        use std::str::FromStr;
+
+        git_internal::internal::object::tree::TreeItem::new(
+            git_internal::internal::object::tree::TreeItemMode::Blob,
+            git_internal::hash::ObjectHash::from_str(hex).unwrap(),
+            name.to_string(),
+        )
+    }
+
+    /// Root + `main@/{dir}` seeded with one commit each (the tp12 fixture
+    /// shape, so the main-path tree hash assertion holds).
+    async fn wh03_path_fixture(
+        storage: &crate::jupiter::storage::Storage,
+        dir: &str,
+    ) -> (git_internal::internal::object::commit::Commit, String) {
+        use git_internal::internal::object::{
+            commit::Commit,
+            tree::{Tree, TreeItem, TreeItemMode},
+        };
+
+        let mono = storage.mono_storage();
+        let child = Tree::from_tree_items(vec![wh03_blob_item(
+            "x.txt",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        )])
+        .expect("child");
+        let root_tree = Tree::from_tree_items(vec![
+            wh03_blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            TreeItem::new(TreeItemMode::Tree, child.id, dir.to_string()),
+        ])
+        .expect("root");
+        let root_commit = Commit::from_tree_id(root_tree.id, vec![], "root");
+        let path_commit = Commit::from_tree_id(child.id, vec![], "path tip");
+        mono.save_mega_trees(vec![child.clone(), root_tree.clone()], root_commit.id, None)
+            .await
+            .unwrap();
+        mono.save_mega_commits(vec![root_commit.clone(), path_commit.clone()], None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                root_commit.id.to_string(),
+                root_tree.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let path = format!("/{dir}");
+        mono.save_refs(
+            mega_refs::Model::new(
+                path.clone(),
+                MEGA_BRANCH_NAME.to_owned(),
+                path_commit.id.to_string(),
+                child.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        (path_commit, path)
+    }
+
+    /// Persist a new child tree + n=1 commit on top of `parent_id`; returns
+    /// the new commit id and its push descriptor.
+    async fn wh03_save_n1_commit(
+        storage: &crate::jupiter::storage::Storage,
+        parent_id: git_internal::hash::ObjectHash,
+        blob_hex: &str,
+        msg: &str,
+    ) -> (String, PushPayload) {
+        use git_internal::internal::object::{commit::Commit, tree::Tree};
+
+        let new_child = Tree::from_tree_items(vec![wh03_blob_item("y.txt", blob_hex)]).unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![parent_id], msg);
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let new_id = new_commit.id.to_string();
+        (
+            new_id.clone(),
+            PushPayload {
+                commits: vec![new_id],
+                fork_base: Some(parent_id.to_string()),
+                n: 1,
+            },
+        )
+    }
+
+    /// Variant fixture whose path tree carries a `sub/` subtree; returns the
+    /// path tip, the path, and the v1 subtree (for the descendant row).
+    async fn wh03_path_fixture_with_sub(
+        storage: &crate::jupiter::storage::Storage,
+        dir: &str,
+    ) -> (
+        git_internal::internal::object::commit::Commit,
+        String,
+        git_internal::internal::object::tree::Tree,
+    ) {
+        use git_internal::internal::object::{commit::Commit, tree::Tree};
+
+        let mono = storage.mono_storage();
+        let sub = Tree::from_tree_items(vec![wh03_blob_item(
+            "z.txt",
+            "0123456789012345678901234567890123456789",
+        )])
+        .expect("sub tree");
+        let child = Tree::from_tree_items(vec![
+            wh03_blob_item("x.txt", "dddddddddddddddddddddddddddddddddddddddd"),
+            git_internal::internal::object::tree::TreeItem::new(
+                git_internal::internal::object::tree::TreeItemMode::Tree,
+                sub.id,
+                "sub".to_string(),
+            ),
+        ])
+        .expect("child");
+        let root_tree = Tree::from_tree_items(vec![
+            wh03_blob_item(".gitkeep", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            git_internal::internal::object::tree::TreeItem::new(
+                git_internal::internal::object::tree::TreeItemMode::Tree,
+                child.id,
+                dir.to_string(),
+            ),
+        ])
+        .expect("root");
+        let root_commit = Commit::from_tree_id(root_tree.id, vec![], "root");
+        let path_commit = Commit::from_tree_id(child.id, vec![], "path tip");
+        mono.save_mega_trees(
+            vec![sub.clone(), child.clone(), root_tree.clone()],
+            root_commit.id,
+            None,
+        )
+        .await
+        .unwrap();
+        mono.save_mega_commits(vec![root_commit.clone(), path_commit.clone()], None)
+            .await
+            .unwrap();
+        mono.save_refs(
+            mega_refs::Model::new(
+                "/",
+                MEGA_BRANCH_NAME.to_owned(),
+                root_commit.id.to_string(),
+                root_tree.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let path = format!("/{dir}");
+        mono.save_refs(
+            mega_refs::Model::new(
+                path.clone(),
+                MEGA_BRANCH_NAME.to_owned(),
+                path_commit.id.to_string(),
+                child.id.to_string(),
+                false,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        (path_commit, path, sub)
+    }
+
+    /// Persist an n=1 commit whose tree keeps `sub/` with changed content.
+    async fn wh03_save_n1_commit_sub(
+        storage: &crate::jupiter::storage::Storage,
+        parent_id: git_internal::hash::ObjectHash,
+        sub_blob_hex: &str,
+        msg: &str,
+    ) -> (String, PushPayload) {
+        use git_internal::internal::object::{commit::Commit, tree::Tree};
+
+        let sub_v2 = Tree::from_tree_items(vec![wh03_blob_item("z.txt", sub_blob_hex)]).unwrap();
+        let new_child = Tree::from_tree_items(vec![
+            wh03_blob_item("x.txt", "dddddddddddddddddddddddddddddddddddddddd"),
+            git_internal::internal::object::tree::TreeItem::new(
+                git_internal::internal::object::tree::TreeItemMode::Tree,
+                sub_v2.id,
+                "sub".to_string(),
+            ),
+        ])
+        .unwrap();
+        let new_commit = Commit::from_tree_id(new_child.id, vec![parent_id], msg);
+        storage
+            .mono_storage()
+            .save_mega_trees(vec![sub_v2, new_child], new_commit.id, None)
+            .await
+            .unwrap();
+        storage
+            .mono_storage()
+            .save_mega_commits(vec![new_commit.clone()], None)
+            .await
+            .unwrap();
+        let new_id = new_commit.id.to_string();
+        (
+            new_id.clone(),
+            PushPayload {
+                commits: vec![new_id],
+                fork_base: Some(parent_id.to_string()),
+                n: 1,
+            },
+        )
+    }
+
+    async fn wh03_enqueue_push(
+        storage: &crate::jupiter::storage::Storage,
+        path: &str,
+        old_id: &str,
+        new_id: &str,
+        payload: &PushPayload,
+    ) -> i64 {
+        let outcome = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: push_operation_id(old_id, new_id),
+                path: path.into(),
+                old_id: old_id.into(),
+                new_id: new_id.into(),
+                requester: None,
+                payload: payload.to_json(),
+                ref_name: Some(MEGA_BRANCH_NAME.into()),
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        let EnqueueOutcome::Inserted { id } = outcome else {
+            panic!("insert push {outcome:?}");
+        };
+        assert_eq!(
+            storage
+                .push_queue_service
+                .storage()
+                .claim_for_execution(id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        id
+    }
+
+    async fn wh03_exec(storage: &crate::jupiter::storage::Storage, id: i64) -> ExecuteOutcome {
+        let ctx = PushExecContext {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+            pre_apply_enter_barrier: None,
+            pre_apply_release_barrier: None,
+        };
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Same as `wh03_exec`, with an explicit request override (force flags).
+    async fn wh03_exec_with(
+        storage: &crate::jupiter::storage::Storage,
+        id: i64,
+        force_conflict: bool,
+    ) -> ExecuteOutcome {
+        let ctx = PushExecContext {
+            storage: storage.clone(),
+            git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+            pre_apply_enter_barrier: None,
+            pre_apply_release_barrier: None,
+        };
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    force_conflict,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&ctx),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Attach rounds without an `AttachExecContext` terminalize as Failed.
+    async fn wh03_exec_attach_no_ctx(
+        storage: &crate::jupiter::storage::Storage,
+        id: i64,
+    ) -> ExecuteOutcome {
+        storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id,
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn wh03_row_status(
+        storage: &crate::jupiter::storage::Storage,
+        id: i64,
+    ) -> PushQueueStatusEnum {
+        storage
+            .push_queue_service
+            .storage()
+            .get_by_id(id)
+            .await
+            .unwrap()
+            .expect("row")
+            .status
+    }
+
+    /// `try_emit` admits synchronously inside B3, so once the round returned,
+    /// any accepted delivery lands within a bounded window.
+    async fn wh03_wait_calls(transport: &RecordingTransport, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.calls() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delivery within 2s");
+    }
+
+    /// Bounded settle window for the zero-delivery assertions.
+    async fn wh03_assert_no_delivery(transport: &RecordingTransport, expected: usize) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            transport.calls(),
+            expected,
+            "no repo.push delivery expected (bodies: {:?})",
+            transport.bodies()
+        );
+    }
+
+    async fn wh03_shutdown(storage: &crate::jupiter::storage::Storage) {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            storage.storage_event_emitter.shutdown(),
+        )
+        .await
+        .expect("emitter shutdown within 3s");
+    }
+
+    #[tokio::test]
+    async fn storage_event_commit_matrix() {
+        let _lock = crate::ceres::pack::materialize::lock_materialize_tests().await;
+
+        // Builder identity invariants (event_id derivation, unit-level):
+        // stable for identical inputs; distinct when installation_id, repo,
+        // operation or landed commit differ. The queue i64 id plays no role.
+        {
+            use crate::jupiter::service::storage_event_emitter::{RepoPushData, repo_push_event};
+            let base = repo_push_event(
+                WH03_INSTALLATION,
+                "/wh03id",
+                RepoPushData {
+                    push_id: "7".to_owned(),
+                    operation_id: "op-1".to_owned(),
+                    ref_name: MEGA_BRANCH_NAME.to_owned(),
+                    old_oid: "a".repeat(40),
+                    requested_oid: "b".repeat(40),
+                    landed_oid: "c".repeat(40),
+                },
+            )
+            .expect("builder");
+            let same = repo_push_event(
+                WH03_INSTALLATION,
+                "/wh03id",
+                RepoPushData {
+                    push_id: "8".to_owned(),
+                    operation_id: "op-1".to_owned(),
+                    ref_name: MEGA_BRANCH_NAME.to_owned(),
+                    old_oid: "a".repeat(40),
+                    requested_oid: "b".repeat(40),
+                    landed_oid: "c".repeat(40),
+                },
+            )
+            .expect("builder");
+            assert_eq!(base.event_id, same.event_id);
+            for (installation, path, op, landed) in [
+                ("other-install", "/wh03id", "op-1", "c".repeat(40)),
+                (WH03_INSTALLATION, "/wh03id/sub", "op-1", "c".repeat(40)),
+                (WH03_INSTALLATION, "/wh03id", "op-2", "c".repeat(40)),
+                (WH03_INSTALLATION, "/wh03id", "op-1", "d".repeat(40)),
+            ] {
+                let other = repo_push_event(
+                    installation,
+                    path,
+                    RepoPushData {
+                        push_id: "7".to_owned(),
+                        operation_id: op.to_string(),
+                        ref_name: MEGA_BRANCH_NAME.to_owned(),
+                        old_oid: "a".repeat(40),
+                        requested_oid: "b".repeat(40),
+                        landed_oid: landed.clone(),
+                    },
+                )
+                .expect("builder");
+                assert_ne!(base.event_id, other.event_id);
+            }
+        }
+
+        // Section 1: a successful n>0 push round delivers exactly one event.
+        let transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_temp, storage) = wh03_storage(true, Arc::clone(&transport)).await;
+        let (path_commit, path) = wh03_path_fixture(&storage, "wh03a").await;
+        let old_id = path_commit.id.to_string();
+        let (new_id, payload) = wh03_save_n1_commit(
+            &storage,
+            path_commit.id,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "n1",
+        )
+        .await;
+        let id = wh03_enqueue_push(&storage, &path, &old_id, &new_id, &payload).await;
+        let outcome = wh03_exec(&storage, id).await;
+        assert_eq!(
+            outcome,
+            ExecuteOutcome::Done {
+                id,
+                landed_commit_id: new_id.clone(),
+                root_cas_writes: 1,
+            }
+        );
+        wh03_wait_calls(&transport, 1).await;
+        assert_eq!(transport.calls(), 1);
+        let body = &transport.bodies()[0];
+        let envelope: serde_json::Value = serde_json::from_slice(body).expect("envelope json");
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["event_type"], "repo.push");
+        assert_eq!(envelope["source"], "git");
+        assert_eq!(envelope["scope"]["repo_path"], path.as_str());
+        assert!(envelope["scope"]["tenant_id"].is_null());
+        assert!(envelope["scope"]["oci_repository"].is_null());
+        let operation_id = push_operation_id(&old_id, &new_id);
+        assert_eq!(envelope["data"]["push_id"], id.to_string());
+        assert_eq!(envelope["data"]["operation_id"], operation_id);
+        assert_eq!(envelope["data"]["ref_name"], MEGA_BRANCH_NAME);
+        assert_eq!(envelope["data"]["old_oid"], old_id);
+        assert_eq!(envelope["data"]["requested_oid"], new_id);
+        assert_eq!(envelope["data"]["landed_oid"], new_id);
+        assert!(envelope["occurred_at"].as_u64().unwrap() > 0);
+        let expected = crate::jupiter::service::storage_event_emitter::repo_push_event(
+            WH03_INSTALLATION,
+            &path,
+            crate::jupiter::service::storage_event_emitter::RepoPushData {
+                push_id: id.to_string(),
+                operation_id: operation_id.clone(),
+                ref_name: MEGA_BRANCH_NAME.to_owned(),
+                old_oid: old_id.clone(),
+                requested_oid: new_id.clone(),
+                landed_oid: new_id.clone(),
+            },
+        )
+        .expect("builder");
+        assert_eq!(envelope["event_id"], expected.event_id.to_string());
+
+        // Section 2: replaying the Done operation_id delivers nothing more.
+        let replay = storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Push,
+                operation_id: operation_id.clone(),
+                path: path.clone(),
+                old_id: old_id.clone(),
+                new_id: new_id.clone(),
+                requester: None,
+                payload: payload.to_json(),
+                ref_name: Some(MEGA_BRANCH_NAME.into()),
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                replay,
+                EnqueueOutcome::Replay {
+                    landed_commit_id: Some(ref landed),
+                    ..
+                } if *landed == new_id
+            ),
+            "Done replay expected, got {replay:?}"
+        );
+        wh03_assert_no_delivery(&transport, 1).await;
+
+        // Section 3: an n=0 no-op round commits Done but delivers nothing.
+        let n0_payload = PushPayload {
+            commits: Vec::new(),
+            fork_base: None,
+            n: 0,
+        };
+        let n0_id = wh03_enqueue_push(&storage, &path, &new_id, &new_id, &n0_payload).await;
+        let outcome = wh03_exec(&storage, n0_id).await;
+        assert_eq!(
+            outcome,
+            ExecuteOutcome::Done {
+                id: n0_id,
+                landed_commit_id: new_id.clone(),
+                root_cas_writes: 1,
+            }
+        );
+        wh03_assert_no_delivery(&transport, 1).await;
+
+        // Section 4: fencing ClaimLost delivers nothing.
+        let tip = storage
+            .mono_storage()
+            .get_main_ref(&path)
+            .await
+            .unwrap()
+            .unwrap();
+        use std::str::FromStr;
+        let tip_id = git_internal::hash::ObjectHash::from_str(&tip.ref_commit_hash).unwrap();
+        let (lost_new, lost_payload) = wh03_save_n1_commit(
+            &storage,
+            tip_id,
+            "2222222222222222222222222222222222222222",
+            "claim lost",
+        )
+        .await;
+        let lost_id = wh03_enqueue_push(
+            &storage,
+            &path,
+            &tip.ref_commit_hash,
+            &lost_new,
+            &lost_payload,
+        )
+        .await;
+        storage
+            .push_queue_service
+            .storage()
+            .mark_failed_for_test(lost_id)
+            .await
+            .unwrap();
+        let outcome = wh03_exec(&storage, lost_id).await;
+        assert_eq!(outcome, ExecuteOutcome::ClaimLost { id: lost_id });
+        wh03_assert_no_delivery(&transport, 1).await;
+
+        // Section 5: a queue-external root writer trips the baseline/CAS
+        // fail-close (BypassDetected); nothing is delivered. This hard-stops
+        // the queue, so it is the last round on this storage. The apply-time
+        // root CAS inside the real push executor compares against the
+        // same-transaction snapshot under the held MonoWriteLock, so an
+        // external writer cannot slip between the B3 read and the CAS — the
+        // baseline fail-close exercised here is the reachable tripwire of the
+        // same mark_failed+BypassDetected family.
+        let (bypass_new, bypass_payload) = wh03_save_n1_commit(
+            &storage,
+            tip_id,
+            "3333333333333333333333333333333333333333",
+            "bypass",
+        )
+        .await;
+        let bypass_id = wh03_enqueue_push(
+            &storage,
+            &path,
+            &tip.ref_commit_hash,
+            &bypass_new,
+            &bypass_payload,
+        )
+        .await;
+        {
+            use sea_orm::{ConnectionTrait, Statement, Value};
+            storage
+                .mono_storage()
+                .get_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE mega_refs SET ref_commit_hash = $1, ref_tree_hash = $2 WHERE path = '/' AND ref_name = $3",
+                    [
+                        Value::from("c".repeat(40)),
+                        Value::from("d".repeat(40)),
+                        Value::from(MEGA_BRANCH_NAME.to_owned()),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+        let outcome = wh03_exec(&storage, bypass_id).await;
+        assert_eq!(outcome, ExecuteOutcome::BypassDetected { id: bypass_id });
+        wh03_assert_no_delivery(&transport, 1).await;
+        wh03_shutdown(&storage).await;
+        // Drain-first final count: exactly the section-1 delivery, nothing late.
+        assert_eq!(transport.calls(), 1, "no late delivery after drain");
+
+        // Section 6 (AC5): storage-only but `[storage_events]` disabled — the
+        // emitter drops before any delivery while the push still lands.
+        let disabled_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t2, storage2) = wh03_storage(false, Arc::clone(&disabled_transport)).await;
+        let (path_commit2, path2) = wh03_path_fixture(&storage2, "wh03b").await;
+        let old_id2 = path_commit2.id.to_string();
+        let (new_id2, payload2) = wh03_save_n1_commit(
+            &storage2,
+            path_commit2.id,
+            "5555555555555555555555555555555555555555",
+            "n1 disabled",
+        )
+        .await;
+        let id2 = wh03_enqueue_push(&storage2, &path2, &old_id2, &new_id2, &payload2).await;
+        let outcome = wh03_exec(&storage2, id2).await;
+        assert!(matches!(outcome, ExecuteOutcome::Done { .. }));
+        wh03_assert_no_delivery(&disabled_transport, 0).await;
+        wh03_shutdown(&storage2).await;
+        assert_eq!(
+            disabled_transport.calls(),
+            0,
+            "no late delivery after drain"
+        );
+
+        // Section 7 (AC5): review morphology never emits — even with an
+        // enabled emitter installed, merge rounds carry no repo.push hook and
+        // the storage-only gate is closed (push enqueue is B0-rejected under
+        // review; covered by b0_review_rejects_push_enqueue).
+        let review_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let temp3 = tempfile::TempDir::new().unwrap();
+        let mut review_config =
+            crate::config::testing::isolated_config(temp3.path().join("config"));
+        review_config.monorepo.push_policy = PushPolicy::Review;
+        review_config.storage_events.enabled = true;
+        review_config.storage_events.installation_id = Some(WH03_INSTALLATION.to_string());
+        let mut review_storage =
+            crate::jupiter::tests::test_storage_with_config(temp3.path(), review_config.clone())
+                .await;
+        review_storage
+            .set_storage_event_emitter(wh03_emitter(&review_config, Arc::clone(&review_transport)));
+        review_storage
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    "/",
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "a".repeat(40),
+                    "b".repeat(40),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let merge_round = review_storage
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Merge,
+                operation_id: "CL-WH03".into(),
+                path: "/wh03c".into(),
+                old_id: "0".repeat(40),
+                new_id: "1".repeat(40),
+                requester: None,
+                payload: json!({}),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        let EnqueueOutcome::Inserted { id: merge_id } = merge_round else {
+            panic!("insert merge {merge_round:?}");
+        };
+        assert_eq!(
+            review_storage
+                .push_queue_service
+                .storage()
+                .claim_for_execution(merge_id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        let outcome = review_storage
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: merge_id,
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExecuteOutcome::Done { .. }));
+        wh03_assert_no_delivery(&review_transport, 0).await;
+        wh03_shutdown(&review_storage).await;
+        assert_eq!(review_transport.calls(), 0, "no late delivery after drain");
+
+        // Section 8 (AC6): a failing transport never changes the push result —
+        // the round still lands Done and the tip advances.
+        let failing_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let (_t4, storage4) = wh03_storage(true, Arc::clone(&failing_transport)).await;
+        let (path_commit4, path4) = wh03_path_fixture(&storage4, "wh03d").await;
+        let old_id4 = path_commit4.id.to_string();
+        let (new_id4, payload4) = wh03_save_n1_commit(
+            &storage4,
+            path_commit4.id,
+            "6666666666666666666666666666666666666666",
+            "n1 failing transport",
+        )
+        .await;
+        let id4 = wh03_enqueue_push(&storage4, &path4, &old_id4, &new_id4, &payload4).await;
+        let outcome = wh03_exec(&storage4, id4).await;
+        assert_eq!(
+            outcome,
+            ExecuteOutcome::Done {
+                id: id4,
+                landed_commit_id: new_id4.clone(),
+                root_cas_writes: 1,
+            }
+        );
+        wh03_wait_calls(&failing_transport, 1).await;
+        let pref = storage4
+            .mono_storage()
+            .get_main_ref(&path4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.ref_commit_hash, new_id4);
+        wh03_shutdown(&storage4).await;
+        // Drain-first final count: no late delivery may appear after shutdown.
+        assert_eq!(failing_transport.calls(), 1);
+
+        // Section 9: a business failure inside the executor (here: the pushed
+        // tip commit was never persisted) terminalizes the round as Failed
+        // after rolling back; the tip does not move and nothing is delivered.
+        let failure_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t5, storage5) = wh03_storage(true, Arc::clone(&failure_transport)).await;
+        let (path_commit5, path5) = wh03_path_fixture(&storage5, "wh03e").await;
+        let old_id5 = path_commit5.id.to_string();
+        let missing_new = "7".repeat(40);
+        let missing_payload = PushPayload {
+            commits: vec![missing_new.clone()],
+            fork_base: Some(old_id5.clone()),
+            n: 1,
+        };
+        let id5 =
+            wh03_enqueue_push(&storage5, &path5, &old_id5, &missing_new, &missing_payload).await;
+        let outcome = wh03_exec(&storage5, id5).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Failed { ref failure, .. } if failure == "PushFailure"
+            ),
+            "missing tip commit must terminalize as PushFailure, got {outcome:?}"
+        );
+        assert_eq!(
+            wh03_row_status(&storage5, id5).await,
+            PushQueueStatusEnum::Failed,
+            "the round must be persisted Failed"
+        );
+        let pref5 = storage5
+            .mono_storage()
+            .get_main_ref(&path5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pref5.ref_commit_hash, old_id5,
+            "a failed push must not move the tip"
+        );
+        wh03_assert_no_delivery(&failure_transport, 0).await;
+        wh03_shutdown(&storage5).await;
+        assert_eq!(failure_transport.calls(), 0, "no delivery after drain");
+
+        // Section 10: a Conflict requeue re-arms the round and delivers
+        // nothing for the requeued execution.
+        let requeue_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t6, storage6) = wh03_storage(true, Arc::clone(&requeue_transport)).await;
+        let (path_commit6, path6) = wh03_path_fixture(&storage6, "wh03f").await;
+        let old_id6 = path_commit6.id.to_string();
+        let (new_id6, payload6) = wh03_save_n1_commit(
+            &storage6,
+            path_commit6.id,
+            "8888888888888888888888888888888888888888",
+            "requeue round",
+        )
+        .await;
+        let id6 = wh03_enqueue_push(&storage6, &path6, &old_id6, &new_id6, &payload6).await;
+        let outcome = wh03_exec_with(&storage6, id6, true).await;
+        let ExecuteOutcome::Requeued { successor_id, .. } = outcome else {
+            panic!("forced conflict must requeue, got {outcome:?}");
+        };
+        assert_eq!(
+            wh03_row_status(&storage6, successor_id).await,
+            PushQueueStatusEnum::Queued,
+            "the requeue successor must be persisted Queued"
+        );
+        wh03_assert_no_delivery(&requeue_transport, 0).await;
+        wh03_shutdown(&storage6).await;
+        assert_eq!(requeue_transport.calls(), 0, "no delivery after drain");
+
+        // Section 11: attach rounds carry no repo.push hook — an attach round
+        // terminalizing without its context still delivers nothing.
+        let attach_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t7, storage7) = wh03_storage(true, Arc::clone(&attach_transport)).await;
+        let attach_round = storage7
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id: "attach-wh03".into(),
+                path: "/wh03g".into(),
+                old_id: "0".repeat(40),
+                new_id: "1".repeat(40),
+                requester: None,
+                payload: json!({}),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap();
+        let EnqueueOutcome::Inserted { id: attach_id } = attach_round else {
+            panic!("insert attach {attach_round:?}");
+        };
+        assert_eq!(
+            storage7
+                .push_queue_service
+                .storage()
+                .claim_for_execution(attach_id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        let outcome = wh03_exec_attach_no_ctx(&storage7, attach_id).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Failed { .. }),
+            "attach without context must terminalize Failed, got {outcome:?}"
+        );
+        wh03_assert_no_delivery(&attach_transport, 0).await;
+        wh03_shutdown(&storage7).await;
+        assert_eq!(attach_transport.calls(), 0, "no delivery after drain");
+
+        // Section 12 (AC4): a delivery blocked past a later round still
+        // carries ITS OWN round's snapshot — the emitter never re-reads
+        // latest state at send time.
+        let blocking = BlockingRecordingTransport::new();
+        let mut delayed_config = crate::config::testing::isolated_config(
+            tempfile::tempdir().unwrap().path().join("config"),
+        );
+        delayed_config.monorepo.push_policy = PushPolicy::Trunk;
+        delayed_config.git.push_auth = Some(crate::config::PushAuth::None);
+        delayed_config.git.ssh_receive_pack = Some(false);
+        delayed_config.storage_events.enabled = true;
+        delayed_config.storage_events.installation_id = Some(WH03_INSTALLATION.to_string());
+        delayed_config.storage_events.max_in_flight = 2;
+        let temp8 = tempfile::TempDir::new().unwrap();
+        let mut storage8 =
+            crate::jupiter::tests::test_storage_with_config(temp8.path(), delayed_config.clone())
+                .await;
+        storage8.set_storage_event_emitter(
+            crate::jupiter::service::storage_event_emitter::StorageEventEmitter::new_with_transport(
+                &delayed_config,
+                blocking.clone(),
+                vec![wh03_compiled_target()],
+            ),
+        );
+        let storage8 = crate::jupiter::tests::with_test_vault(storage8, temp8.path()).await;
+        let (path_commit8, path8) = wh03_path_fixture(&storage8, "wh03h").await;
+
+        // Round A lands Done while its send is still blocked in transport.
+        let old_a = path_commit8.id.to_string();
+        let (new_a, payload_a) = wh03_save_n1_commit(
+            &storage8,
+            path_commit8.id,
+            "9999999999999999999999999999999999999999",
+            "round A",
+        )
+        .await;
+        let id_a = wh03_enqueue_push(&storage8, &path8, &old_a, &new_a, &payload_a).await;
+        let outcome = wh03_exec(&storage8, id_a).await;
+        assert!(matches!(outcome, ExecuteOutcome::Done { .. }));
+        wh03_wait_calls_block(&blocking, 1).await;
+
+        // Round B advances the same path while round A's send is in flight.
+        let tip_a = storage8
+            .mono_storage()
+            .get_main_ref(&path8)
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_commit_hash;
+        assert_eq!(tip_a, new_a);
+        let tip_a_id = git_internal::hash::ObjectHash::from_str(&tip_a).unwrap();
+        let (new_b, payload_b) = wh03_save_n1_commit(
+            &storage8,
+            tip_a_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbb",
+            "round B",
+        )
+        .await;
+        let id_b = wh03_enqueue_push(&storage8, &path8, &new_a, &new_b, &payload_b).await;
+        let outcome = wh03_exec(&storage8, id_b).await;
+        assert!(matches!(outcome, ExecuteOutcome::Done { .. }));
+        wh03_wait_calls_block(&blocking, 2).await;
+
+        blocking.release();
+        wh03_shutdown(&storage8).await;
+        let bodies = blocking.bodies();
+        assert_eq!(bodies.len(), 2, "exactly two deliveries after drain");
+        let find = |landed: &str| {
+            bodies
+                .iter()
+                .map(|body| serde_json::from_slice::<serde_json::Value>(body).expect("envelope"))
+                .find(|env| env["data"]["landed_oid"] == landed)
+                .unwrap_or_else(|| panic!("missing delivery for landed {landed}"))
+        };
+        let env_a = find(&new_a);
+        assert_eq!(env_a["data"]["old_oid"], old_a);
+        assert_eq!(env_a["data"]["requested_oid"], new_a);
+        let env_b = find(&new_b);
+        assert_eq!(env_b["data"]["old_oid"], new_a);
+        assert_eq!(env_b["data"]["requested_oid"], new_b);
+        assert_ne!(env_a["event_id"], env_b["event_id"]);
+
+        // Section 13: a queue-bypassing writer moves the root row between the
+        // baseline read and the apply-time CAS (the MonoWriteLock is advisory;
+        // the pre_apply seam opens that window deterministically). The apply's
+        // business writes roll back to the savepoint, the round fail-closes
+        // with hard-stop, and nothing is delivered.
+        let cas_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t9, storage9) = wh03_storage(true, Arc::clone(&cas_transport)).await;
+        let (path_commit9, path9) = wh03_path_fixture(&storage9, "wh03i").await;
+        let old_id9 = path_commit9.id.to_string();
+        let (new_id9, payload9) = wh03_save_n1_commit(
+            &storage9,
+            path_commit9.id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cas race round",
+        )
+        .await;
+        let id9 = wh03_enqueue_push(&storage9, &path9, &old_id9, &new_id9, &payload9).await;
+        let root_before = storage9
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_commit_hash;
+        let enter_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let release_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let ctx = PushExecContext {
+            storage: storage9.clone(),
+            git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+            pre_apply_enter_barrier: Some(Arc::clone(&enter_barrier)),
+            pre_apply_release_barrier: Some(Arc::clone(&release_barrier)),
+        };
+        let exec_storage = storage9.clone();
+        let mut exec = tokio::spawn(async move {
+            exec_storage
+                .push_queue_service
+                .execute_b3(
+                    ExecuteRequest {
+                        id: id9,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    Some(&ctx),
+                )
+                .await
+        });
+        // Two-phase handshake: the executor signals the open window, the
+        // bypassing writer commits its root-row update on a separate
+        // connection, and only then releases the executor into the CAS. No
+        // timing assumption: the ordering is explicit, every wait is bounded,
+        // and any handshake failure aborts the executor with a bounded join
+        // so the test can never hang or detach the task.
+        let handshake = async {
+            tokio::time::timeout(Duration::from_secs(5), enter_barrier.wait())
+                .await
+                .map_err(|_| "executor never reached the pre-apply window".to_string())?;
+            {
+                use sea_orm::{ConnectionTrait, Statement, Value};
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    storage9.mono_storage().get_connection().execute_raw(
+                        Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            "UPDATE mega_refs SET ref_commit_hash = $1, ref_tree_hash = $2 WHERE path = '/' AND ref_name = $3",
+                            [
+                                Value::from("9".repeat(40)),
+                                Value::from("8".repeat(40)),
+                                Value::from(MEGA_BRANCH_NAME.to_owned()),
+                            ],
+                        ),
+                    ),
+                )
+                .await
+                .map_err(|_| "bypassing writer update stalled".to_string())?
+                .map_err(|error| format!("bypassing writer update failed: {error}"))?;
+            }
+            tokio::time::timeout(Duration::from_secs(5), release_barrier.wait())
+                .await
+                .map_err(|_| "executor release stalled".to_string())
+        };
+        if let Err(error) = handshake.await {
+            exec.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut exec).await;
+            panic!("CAS race handshake failed: {error}");
+        }
+        let outcome = match tokio::time::timeout(Duration::from_secs(10), &mut exec).await {
+            Ok(joined) => joined.expect("executor task").expect("execute_b3 result"),
+            Err(_) => {
+                exec.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut exec).await;
+                panic!("executor did not finish within the bound");
+            }
+        };
+        assert_eq!(outcome, ExecuteOutcome::BypassDetected { id: id9 });
+        // Rollback evidence: the failed apply's writes are gone — the path tip
+        // is unmoved and the root row keeps the bypassing writer's values.
+        let pref9 = storage9
+            .mono_storage()
+            .get_main_ref(&path9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref9.ref_commit_hash, old_id9, "path tip must not move");
+        let root9 = storage9
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root9.ref_commit_hash, "9".repeat(40));
+        assert_ne!(root9.ref_commit_hash, root_before);
+        // Hard-stop persisted as the queue control-plane state.
+        let control = storage9
+            .push_queue_service
+            .storage()
+            .get_control()
+            .await
+            .unwrap();
+        assert!(
+            control.hard_stopped,
+            "CAS fail-close must hard-stop the queue"
+        );
+        wh03_assert_no_delivery(&cas_transport, 0).await;
+        wh03_shutdown(&storage9).await;
+        assert_eq!(cas_transport.calls(), 0, "no late delivery after drain");
+
+        // Section 14: a real successful attach round lands its mount but
+        // carries no repo.push hook (attach kind is excluded by design).
+        let attach_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t10, storage10) = wh03_storage(true, Arc::clone(&attach_transport)).await;
+        // Rewire the import service onto the real test connections (same
+        // wiring as import_repo's wired_storage_with_monorepo) — the default
+        // test storage builds it over a mock.
+        let git_service = crate::jupiter::service::git_service::GitService {
+            obj_storage: crate::jupiter::storage::object_storage::mock_object_storage(),
+        };
+        let mut storage10 = storage10;
+        storage10.git_service = git_service.clone();
+        storage10.mono_service = crate::jupiter::service::mono_service::MonoService {
+            mono_storage: storage10.mono_storage(),
+            git_service: git_service.clone(),
+        };
+        storage10.import_service = crate::jupiter::service::import_service::ImportService {
+            git_db_storage: storage10.git_db_storage(),
+            git_service,
+        };
+        // Attach needs the initialized monorepo root ref.
+        storage10
+            .mono_service
+            .init_monorepo(&storage10.config().monorepo)
+            .await
+            .unwrap();
+        let (repo, commit, command) =
+            wh03_seed_import_repo(&storage10, "/third-party/wh03-attach").await;
+        let root = storage10
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = AttachPayload {
+            repo_id: repo.repo_id,
+            repo_path: repo.repo_path.clone(),
+            commands: vec![AttachCommand {
+                ref_name: command.ref_name.clone(),
+                old_id: command.old_id.clone(),
+                new_id: command.new_id.clone(),
+                command_type: "Create".into(),
+                ref_type: "branch".into(),
+                default_branch: command.default_branch,
+            }],
+        };
+        let operation_id = attach_operation_id(
+            &repo.repo_id.to_string(),
+            &normalize_attach_commands(&[(
+                command.ref_name.clone(),
+                "Create".into(),
+                command.old_id.clone(),
+                commit.id.to_string(),
+            )]),
+        );
+        let EnqueueOutcome::Inserted { id: attach_id } = storage10
+            .push_queue_service
+            .enqueue(EnqueueRequest {
+                kind: PushQueueKindEnum::Attach,
+                operation_id,
+                path: repo.repo_path.clone(),
+                old_id: root.ref_commit_hash,
+                new_id: commit.id.to_string(),
+                requester: None,
+                payload: serde_json::to_value(&payload).unwrap(),
+                ref_name: None,
+                is_delete: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("attach insert");
+        };
+        assert_eq!(
+            storage10
+                .push_queue_service
+                .storage()
+                .claim_for_execution(attach_id)
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed
+        );
+        let attach_ctx = AttachExecContext {
+            storage: storage10.clone(),
+            git_object_cache: Arc::new(crate::ceres::api_service::cache::GitObjectCache {
+                connection: crate::jupiter::tests::test_redis_manager().await,
+                prefix: String::new(),
+            }),
+        };
+        let outcome = storage10
+            .push_queue_service
+            .execute_b3(
+                ExecuteRequest {
+                    id: attach_id,
+                    ..Default::default()
+                },
+                Some(&attach_ctx),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let ExecuteOutcome::Done {
+            landed_commit_id: attach_landed,
+            ..
+        } = outcome
+        else {
+            panic!("real attach must land Done, got {outcome:?}");
+        };
+        assert_eq!(
+            wh03_row_status(&storage10, attach_id).await,
+            PushQueueStatusEnum::Done,
+            "the attach round must be persisted Done"
+        );
+        assert!(
+            storage10
+                .mono_storage()
+                .get_commit_by_hash(&attach_landed)
+                .await
+                .unwrap()
+                .is_some(),
+            "the attach must persist its landed commit row"
+        );
+        wh03_assert_no_delivery(&attach_transport, 0).await;
+        wh03_shutdown(&storage10).await;
+        assert_eq!(attach_transport.calls(), 0, "no late delivery after drain");
+
+        // Section 15: a failure AFTER apply's transactional writes (the
+        // descendant continuation hits a corrupt stored commit hash) drops
+        // the whole B3 txn — root CAS and path writes roll back, the row is
+        // persisted Failed, and nothing is delivered.
+        let post_transport = Arc::new(RecordingTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let (_t11, storage11) = wh03_storage(true, Arc::clone(&post_transport)).await;
+        let (path_commit11, path11, sub_v1) = wh03_path_fixture_with_sub(&storage11, "wh03j").await;
+        // A materialized descendant whose stored commit hash is not valid hex.
+        storage11
+            .mono_storage()
+            .save_refs(
+                mega_refs::Model::new(
+                    format!("{path11}/sub"),
+                    MEGA_BRANCH_NAME.to_owned(),
+                    "not-a-valid-hex-hash".to_string(),
+                    sub_v1.id.to_string(),
+                    false,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let root_before11 = storage11
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_commit_hash;
+        let old_id11 = path_commit11.id.to_string();
+        let (new_id11, payload11) = wh03_save_n1_commit_sub(
+            &storage11,
+            path_commit11.id,
+            "0202020202020202020202020202020202020202",
+            "post-write failure",
+        )
+        .await;
+        let id11 = wh03_enqueue_push(&storage11, &path11, &old_id11, &new_id11, &payload11).await;
+        let outcome = wh03_exec(&storage11, id11).await;
+        assert!(
+            matches!(outcome, ExecuteOutcome::Failed { .. }),
+            "descendant continuation failure must terminalize Failed, got {outcome:?}"
+        );
+        assert_eq!(
+            wh03_row_status(&storage11, id11).await,
+            PushQueueStatusEnum::Failed
+        );
+        // Rollback evidence after transactional writes: the root CAS and the
+        // path advance are both gone.
+        let root_after11 = storage11
+            .mono_storage()
+            .get_main_ref("/")
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_commit_hash;
+        assert_eq!(root_after11, root_before11, "root CAS must roll back");
+        let pref11 = storage11
+            .mono_storage()
+            .get_main_ref(&path11)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref11.ref_commit_hash, old_id11, "path tip must not move");
+        wh03_assert_no_delivery(&post_transport, 0).await;
+        wh03_shutdown(&storage11).await;
+        assert_eq!(post_transport.calls(), 0, "no late delivery after drain");
+    }
+
+    /// Minimal import-repo fixture for the attach case (mirrors
+    /// `import_repo::tests::seed_import_repo_with_main_tip`).
+    async fn wh03_seed_import_repo(
+        storage: &crate::jupiter::storage::Storage,
+        path: &str,
+    ) -> (
+        crate::ceres::protocol::repo::Repo,
+        git_internal::internal::object::commit::Commit,
+        crate::ceres::protocol::import_refs::RefCommand,
+    ) {
+        use git_internal::internal::{
+            metadata::{EntryMeta, MetaAttached},
+            object::{
+                blob::Blob,
+                commit::Commit,
+                tree::{Tree, TreeItem, TreeItemMode},
+            },
+        };
+
+        use crate::ceres::protocol::{import_refs::RefCommand, repo::Repo};
+
+        let repo = Repo::new(std::path::PathBuf::from(path), false).unwrap();
+        let repo_id = repo.repo_id;
+        let readme = Blob::from_content("wh03 attach readme");
+        let tree = Tree::from_tree_items(vec![TreeItem {
+            mode: TreeItemMode::Blob,
+            id: readme.id,
+            name: "README.md".to_string(),
+        }])
+        .unwrap();
+        let commit = Commit::from_tree_id(tree.id, vec![], "wh03 import commit");
+        storage
+            .import_service
+            .save_entry(
+                repo_id,
+                vec![
+                    MetaAttached {
+                        inner: readme.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: tree.into(),
+                        meta: EntryMeta::new(),
+                    },
+                    MetaAttached {
+                        inner: commit.clone().into(),
+                        meta: EntryMeta::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let mut command = RefCommand::new(
+            ZERO_ID.to_string(),
+            commit.id.to_string(),
+            "refs/heads/main".to_string(),
+        );
+        command.default_branch = true;
+        (repo, commit, command)
+    }
+
+    /// Blocking recording transport for the AC4 delayed-send case: records the
+    /// exact body when the post is called, then holds the future until released.
+    struct BlockingRecordingTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl BlockingRecordingTransport {
+        fn new() -> Arc<Self> {
+            let (release, _) = tokio::sync::watch::channel(false);
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                bodies: std::sync::Mutex::new(Vec::new()),
+                release,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<bytes::Bytes> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+
+        fn release(&self) {
+            let _ = self.release.send(true);
+        }
+    }
+
+    impl crate::jupiter::service::storage_event_transport::EventTransport
+        for BlockingRecordingTransport
+    {
+        fn post(
+            &self,
+            _target: &crate::jupiter::service::storage_event_transport::EventTarget,
+            body: bytes::Bytes,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::jupiter::service::storage_event_transport::TransportSuccess,
+                            crate::jupiter::service::storage_event_transport::TransportError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.bodies.lock().expect("bodies").push(body);
+            let mut release = self.release.subscribe();
+            Box::pin(async move {
+                if !*release.borrow() {
+                    let _ = release.changed().await;
+                }
+                Ok(
+                crate::jupiter::service::storage_event_transport::TransportSuccess::Accepted2xx {
+                    status: 200,
+                },
+            )
+            })
+        }
     }
 }

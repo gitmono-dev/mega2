@@ -31,6 +31,10 @@ use crate::{
 /// that must stay in deployment/environment secrets. Redis URLs and
 /// object-storage S3 credentials may now be vault-backed and are resolved
 /// post-vault bootstrap.
+///
+/// WH-11 adds the parameterized `storage_events.targets.<id>.secret_ref` field
+/// (namespace `config/<profile>/storage_events/targets/<id>/hmac`), handled by
+/// [`storage_events_target_suffix`] because the suffix embeds the target id.
 const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
     (
         "notification.slack.webhook_url",
@@ -48,18 +52,39 @@ const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
     ),
 ];
 
+/// WH-11: `storage_events.targets.<id>.secret_ref` maps to the per-target
+/// namespace suffix `storage_events/targets/<id>/hmac`. The id charset matches
+/// `config validate` (1..=32 ASCII `[A-Za-z0-9_-]`).
+fn storage_events_target_suffix(name: &str) -> Option<String> {
+    let id = name
+        .strip_prefix("storage_events.targets.")?
+        .strip_suffix(".secret_ref")?;
+    if id.is_empty()
+        || id.len() > 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(format!("storage_events/targets/{id}/hmac"))
+}
+
 /// Look up the required vault namespace suffix for a supported secret field.
-fn supported_secret_suffix(name: &str) -> Option<&'static str> {
-    SUPPORTED_SECRET_FIELDS
+fn supported_secret_suffix(name: &str) -> Option<String> {
+    if let Some((_, suffix)) = SUPPORTED_SECRET_FIELDS
         .iter()
         .find(|(field, _)| *field == name)
-        .map(|(_, suffix)| *suffix)
+    {
+        return Some((*suffix).to_string());
+    }
+    storage_events_target_suffix(name)
 }
 
 /// Validate that `secret_ref` uses the namespace required for the named field.
 fn validate_secret_field_ref(name: &str, secret_ref: &SecretRef) -> Result<(), MegaError> {
     match supported_secret_suffix(name) {
-        Some(suffix) => validate_config_secret_ref(name, secret_ref, suffix),
+        Some(suffix) => validate_config_secret_ref(name, secret_ref, &suffix),
         None => Err(unsupported_secret_field_error(name)),
     }
 }
@@ -71,7 +96,7 @@ fn unsupported_secret_field_error(name: &str) -> MegaError {
         .collect::<Vec<_>>()
         .join(", ");
     MegaError::Other(format!(
-        "{name} cannot be stored in monoengine vault; supported fields are: {supported}. Database credentials must stay in deployment/environment secrets."
+        "{name} cannot be stored in monoengine vault; supported fields are: {supported}, storage_events.targets.<id>.secret_ref. Database credentials must stay in deployment/environment secrets."
     ))
 }
 
@@ -287,7 +312,7 @@ fn secret_name_arg() -> Arg {
         .value_name("CONFIG_FIELD")
         .required(true)
         .help(
-            "Supported config secret field: redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key",
+            "Supported config secret field: redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key, storage_events.targets.<id>.secret_ref",
         )
 }
 
@@ -1175,6 +1200,54 @@ mod tests {
 
         let secret_ref = secret_ref_from_args(&matches).expect("redis.url ref should be accepted");
         assert_eq!(secret_ref.secret_name(), "config/prod/redis/url");
+    }
+
+    #[test]
+    fn secret_ref_from_args_accepts_storage_events_target_namespace() {
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "storage_events.targets.ops-main.secret_ref",
+                "--vault-path",
+                "config/prod/storage_events/targets/ops-main/hmac",
+            ])
+            .unwrap();
+
+        let secret_ref =
+            secret_ref_from_args(&matches).expect("storage_events target ref should be accepted");
+        assert_eq!(
+            secret_ref.secret_name(),
+            "config/prod/storage_events/targets/ops-main/hmac"
+        );
+
+        // The namespace is pinned to the id in the field name.
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "storage_events.targets.ops-main.secret_ref",
+                "--vault-path",
+                "config/prod/storage_events/targets/other/hmac",
+            ])
+            .unwrap();
+        let err = secret_ref_from_args(&matches).expect_err("id mismatch must fail");
+        let message = err.to_string();
+        assert!(message.contains("storage_events.targets.ops-main.secret_ref"));
+        assert!(!message.contains("targets/other"), "{message}");
+
+        // Malformed target ids stay unsupported fields.
+        let matches = secret_ref_cli()
+            .try_get_matches_from([
+                "ref",
+                "storage_events.targets.ops/main.secret_ref",
+                "--vault-path",
+                "config/prod/storage_events/targets/ops/main/hmac",
+            ])
+            .unwrap();
+        let err = secret_ref_from_args(&matches).expect_err("invalid id must fail");
+        assert!(
+            err.to_string()
+                .contains("cannot be stored in monoengine vault")
+        );
     }
 
     #[test]

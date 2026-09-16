@@ -53,6 +53,8 @@ mod tests {
                 base: BaseStorage::mock(),
             },
             obj_storage: store,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
         .media();
         Fixture {
@@ -303,6 +305,8 @@ mod tests {
         let service = LfsService {
             lfs_storage: lfs_db.clone(),
             obj_storage: store,
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
         .media();
         DbFixture {
@@ -376,6 +380,7 @@ mod tests {
             &fx.scope,
             &prepared.manifest_id,
             11,
+            &crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         )
         .await
         .unwrap();
@@ -400,6 +405,7 @@ mod tests {
             &fx.scope,
             &prepared.manifest_id,
             12,
+            &crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         )
         .await
         .unwrap();
@@ -427,7 +433,8 @@ mod tests {
                 &fx.lfs_db,
                 &fx.scope,
                 &prepared.manifest_id,
-                21
+                21,
+                &crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             )
             .await
             .is_err()
@@ -448,7 +455,8 @@ mod tests {
                 &fx.lfs_db,
                 &fx.scope,
                 &prepared.manifest_id,
-                23
+                23,
+                &crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
             )
             .await
             .is_err()

@@ -8,6 +8,9 @@ use crate::jupiter::storage::{
 pub struct LfsService {
     pub lfs_storage: LfsDbStorage,
     pub obj_storage: MegaObjectStorageWrapper,
+    /// The application emitter owner handle (WH-05): disabled by default and
+    /// rebound to the real transport by `Storage::set_storage_event_emitter`.
+    pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
 }
 
 impl LfsService {
@@ -17,6 +20,8 @@ impl LfsService {
         Self {
             lfs_storage: LfsDbStorage { base: mock.clone() },
             obj_storage: mock_object_storage(),
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         }
     }
 

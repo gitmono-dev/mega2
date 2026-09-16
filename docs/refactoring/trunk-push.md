@@ -1456,6 +1456,17 @@ paths = ["/project/foo"]       # 前缀授权；省略表示全库
 
 > **验收标准**：各项独立评估；无实测压力证据时不启动。
 
+### 阶段 7 — 出站提交事件（plan-20260912 / WH-03，已交付）
+
+storage-only 部署可在 B3 提交后发出一份有界、仅元数据、带 HMAC 的 `repo.push` 事件（契约与传输见 [`storage-events.md`](storage-events.md)）：
+
+- **唯一插入点**：`b3_execute_push_inner` 的真实 `n > 0` 落地路径，在 `txn.commit()` 成功后、C-segment 索引前。协议 receive-pack 与产品 API 写（`land_api_tip_push`）共用同一提交点，API 侧不再另挂钩子。
+- **明确排除**：`n = 0` 净零轮次（`old_id == new_id`）、Done 行 replay、attach/merge 轮次、CAS/fencing 失败（`QueueBypassDetected`/`ClaimLost`）与一切回滚路径都不发事件；后代 ref 续接不逐个发事件。
+- **快照数据**：`push_id`（队列行 id）、`operation_id`、`ref_name`、`old_oid`、`requested_oid`、`landed_oid`，全部取自本轮行与落地结果，不在发送时回查最新状态。
+- **事件身份**：`sha256("repo.push\0" + installation_id + "\0" + canonical_repo_path + "\0" + operation_id + "\0" + landed_commit_id)` 前 16 字节按 UUID v5 布局编码；队列 i64 id 不参与身份。同输入同 ID，跨安装/仓库/操作/落地 commit 区分。
+- **失败语义**：构造或投递失败只记 drop，不改变已提交推送的结果（best-effort，不承诺 exactly-once/有序/durability）。
+- **测试**：`push_queue_service::tests::storage_event_commit_matrix`（真实 PG 的 Done/replay/n=0/ClaimLost/CAS 矩阵）、`api_tip_lander::tests::storage_event_api_commit`（API 写共用提交点）、`tests/integration_storage_events_git.rs`（进程级真实 push + review 形态回归）。
+
 ## 前置依赖矩阵
 
 | 本文档的工作 | 依赖 | 类型 | 关键同步点 |

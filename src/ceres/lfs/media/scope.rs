@@ -53,6 +53,12 @@ impl MediaScope {
         })
     }
 
+    /// The canonical repository this scope was constructed with (WH-06:
+    /// read-only; never reversed from a digest).
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
     pub fn digest(&self) -> String {
         let mut payload = Vec::with_capacity(self.actor.len() + self.repository.len() + 1);
         payload.extend_from_slice(self.actor.as_bytes());

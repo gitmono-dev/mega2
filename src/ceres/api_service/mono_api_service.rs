@@ -8982,6 +8982,8 @@ mod tests {
                 prefix: String::new(),
             }),
             storage: storage.clone(),
+            pre_apply_enter_barrier: None,
+            pre_apply_release_barrier: None,
         }
     }
 

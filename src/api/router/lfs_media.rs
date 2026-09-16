@@ -245,6 +245,7 @@ pub async fn media_finalize(
         &state.storage.lfs_service.lfs_storage,
         &scope,
         &manifest_id,
+        &state.storage.storage_event_emitter,
     )
     .await
     {
@@ -350,7 +351,7 @@ async fn load_published(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use axum::{
         Router,
@@ -798,5 +799,247 @@ mod tests {
             map_media_error(MediaError::Conflict("c".into())).status(),
             StatusCode::CONFLICT
         );
+    }
+
+    /// WH-06 (plan-20260912 / ADR-WH-05): the media finalize HTTP path keeps
+    /// the original AccessTokenUser contract — anonymous and static-push-token
+    /// requests are 401 with zero events; a valid DB access token reaches the
+    /// real finalize and produces exactly one event.
+    #[tokio::test]
+    async fn storage_event_auth_reachability() {
+        let transport = Arc::new(RecordingTransport::default());
+        let h = harness_with_emitter(wh06_emitter_handle(
+            transport.clone(),
+            vec!["/acme/app.git".to_owned()],
+        ))
+        .await;
+        let app = media_app(h.state.clone());
+        let id = "a".repeat(64);
+
+        // Anonymous: 401, no event.
+        let anon = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post(format!("/libra/media/v1/manifests/{id}/finalize"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+        // A static-push-token-shaped bearer is NOT a DB access token: the
+        // extractor must reject it like any unknown token.
+        let static_token = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post(format!("/libra/media/v1/manifests/{id}/finalize"))
+                    .header(AUTHORIZATION, "Bearer wh06-static-push-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(static_token.status(), StatusCode::UNAUTHORIZED);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 0, "rejected requests deliver nothing");
+
+        // Valid DB access token: the full prepare → chunks → finalize flow
+        // over HTTP lands the finalize and delivers exactly one event whose
+        // scope is the server-side canonical repository.
+        let alice = token_for(&h.state, "alice").await;
+        let manifest = sample_manifest(b"wh06-auth-reachability");
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let prepared = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post("/libra/media/v1/manifests")
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .header(CONTENT_TYPE, MEDIA_JSON)
+                    .body(Body::from(body))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let prepared: PrepareResponse = serde_json::from_slice(
+            &axum::body::to_bytes(prepared.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for chunk in &manifest.chunks {
+            let data = b"wh06-auth-reachability";
+            let start = chunk.offset as usize;
+            let end = start + chunk.length as usize;
+            let put = app
+                .clone()
+                .oneshot(with_repo(
+                    Request::put(format!(
+                        "/libra/media/v1/manifests/{}/chunks/{}",
+                        prepared.manifest_id, chunk.chunk_hash
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {alice}"))
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(data[start..end].to_vec()))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::OK, "chunk upload");
+        }
+        let finalized = app
+            .clone()
+            .oneshot(with_repo(
+                Request::post(format!(
+                    "/libra/media/v1/manifests/{}/finalize",
+                    prepared.manifest_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finalized.status(), StatusCode::OK, "HTTP finalize 200");
+        wh06_wait_calls(&transport, 1).await;
+        let bodies = transport.bodies();
+        assert_eq!(bodies.len(), 1, "exactly one finalized event");
+        let envelope: serde_json::Value = serde_json::from_slice(&bodies[0]).expect("envelope");
+        assert_eq!(envelope["event_type"], "lfs.media.finalized");
+        assert_eq!(envelope["scope"]["repo_path"], "/acme/app.git");
+        assert_eq!(envelope["data"]["manifest_id"], prepared.manifest_id);
+        assert_eq!(envelope["data"]["transfer"], "fastcdc");
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            h.state.storage.storage_event_emitter.shutdown(),
+        )
+        .await
+        .expect("emitter shutdown within 3s");
+        assert_eq!(transport.calls(), 1, "no late delivery after drain");
+    }
+
+    // --- WH-06 helpers ---
+
+    /// Recording fake transport for the media tests (WH-09 seam).
+    #[derive(Default)]
+    struct RecordingTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+    }
+
+    impl RecordingTransport {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<bytes::Bytes> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+    }
+
+    impl crate::jupiter::service::storage_event_transport::EventTransport for RecordingTransport {
+        fn post(
+            &self,
+            _target: &crate::jupiter::service::storage_event_transport::EventTarget,
+            body: bytes::Bytes,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::jupiter::service::storage_event_transport::TransportSuccess,
+                            crate::jupiter::service::storage_event_transport::TransportError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bodies.lock().expect("bodies").push(body);
+            Box::pin(async {
+                Ok(
+                    crate::jupiter::service::storage_event_transport::TransportSuccess::Accepted2xx {
+                        status: 200,
+                    },
+                )
+            })
+        }
+    }
+
+    fn wh06_emitter_handle(
+        transport: Arc<RecordingTransport>,
+        lfs_paths: Vec<String>,
+    ) -> crate::jupiter::service::storage_event_emitter::StorageEventEmitter {
+        let target_config = crate::config::StorageEventsTargetConfig {
+            id: "ops-main".to_owned(),
+            url: "https://events.example.invalid/ingest".to_owned(),
+            secret_ref: "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+                .to_owned(),
+            events: vec!["lfs.media.finalized".to_owned()],
+            git_paths: Vec::new(),
+            oci_repositories: Vec::new(),
+            lfs_paths,
+            include_unscoped_lfs: false,
+            agent_tenants: Vec::new(),
+            agent_repo_paths: Vec::new(),
+        };
+        let secret = crate::config::secret::SecretString::new(
+            "hex:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let compiled = crate::jupiter::service::storage_event_transport::EventTarget::compile(
+            &target_config.id,
+            &target_config.url,
+            &secret,
+        )
+        .expect("compile target");
+        let mut config =
+            crate::config::testing::isolated_config(std::env::temp_dir().join("wh06-media-auth"));
+        config.storage_events.enabled = true;
+        config.storage_events.installation_id = Some("it-wh06".to_owned());
+        crate::jupiter::service::storage_event_emitter::StorageEventEmitter::new_with_transport(
+            &config,
+            transport,
+            vec![(target_config, compiled)],
+        )
+    }
+
+    /// harness() with the recording emitter installed as the owner.
+    async fn harness_with_emitter(
+        emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
+    ) -> Harness {
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut storage = test_storage(db_dir.path()).await;
+        let obj_dir = tempfile::tempdir().unwrap();
+        let cfg = ObjectStorageConfig {
+            storage_type: ObjectStorageBackend::Local,
+            local: LocalConfig {
+                root_dir: obj_dir.path().to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        };
+        storage.lfs_service.obj_storage = build_object_storage(&cfg).await.unwrap();
+        // test_storage mocks LfsService; the finalize fallback writes
+        // lfs_objects, so rebind the real DB-backed storage too.
+        storage.lfs_service.lfs_storage = storage.lfs_db_storage();
+        storage.set_storage_event_emitter(emitter);
+        let state = state_from(storage);
+        Harness {
+            _db_dir: db_dir,
+            _obj_dir: obj_dir,
+            state,
+        }
+    }
+
+    async fn wh06_wait_calls(transport: &RecordingTransport, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.calls() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delivery within 2s");
     }
 }
