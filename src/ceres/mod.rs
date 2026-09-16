@@ -8,3 +8,4 @@ pub mod model;
 pub mod oci;
 pub mod pack;
 pub mod protocol;
+pub mod snapshot;
