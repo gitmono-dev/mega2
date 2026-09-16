@@ -606,10 +606,10 @@ async fn lookup(
                 node["directory_root"] = json!(format!("sha256:{}", hex_of(&built.page_id)));
                 node["node_class"] = json!("native_tree");
                 node["lifecycle"] = json!("mutable");
-                if path != "/" {
-                    if let Some(name) = path.rsplit('/').next() {
-                        node["name"] = json!(name);
-                    }
+                if path != "/"
+                    && let Some(name) = path.rsplit('/').next()
+                {
+                    node["name"] = json!(name);
                 }
                 entry["node"] = node;
                 deepest_dirs.push(abs_path);
@@ -791,17 +791,25 @@ async fn metadata_pages(
     let mut sequence: u64 = 0;
     let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut frame_raw: usize = 0;
-    let mut flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
-                     raw: &mut usize,
-                     out: &mut Vec<u8>,
-                     sequence: &mut u64|
-     -> Result<(), Response> {
+    // Emitting a frame is fallible (codec limits). The closure returns the
+    // small domain error and callers map it, rather than carrying a whole
+    // `Response` around as an error value.
+    let flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
+                 raw: &mut usize,
+                 out: &mut Vec<u8>,
+                 sequence: &mut u64|
+     -> Result<(), SnapshotError> {
         if frame.is_empty() {
             return Ok(());
         }
         let payload = mst2_codec::treeframe::MetaPayload { pages: std::mem::take(frame) }
             .encode(STREAM_ID, *sequence)
-            .map_err(|e| mst2_error_response(internal(format!("META frame encode failed: {e}"))))?;
+            .map_err(|e| {
+                SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    format!("META frame encode failed: {e}"),
+                )
+            })?;
         out.extend_from_slice(&payload);
         *sequence += 1;
         *raw = 0;
@@ -813,12 +821,13 @@ async fn metadata_pages(
             && (frame.len() >= mst2_codec::treeframe::META_MAX_PAGES
                 || frame_raw + 36 + page.len() > mst2_codec::treeframe::META_MAX_RAW)
         {
-            flush(&mut frame, &mut frame_raw, &mut out, &mut sequence)?;
+            flush(&mut frame, &mut frame_raw, &mut out, &mut sequence)
+                .map_err(mst2_error_response)?;
         }
         frame_raw += 36 + page.len();
         frame.push((id, page));
     }
-    flush(&mut frame, &mut frame_raw, &mut out, &mut sequence)?;
+    flush(&mut frame, &mut frame_raw, &mut out, &mut sequence).map_err(mst2_error_response)?;
 
     let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut hasher, &body);
