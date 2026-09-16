@@ -143,6 +143,11 @@ fn ensure_enabled(state: &MonoApiServiceState) -> Result<(), SnapshotError> {
     }
 }
 
+// Both arms are `Response`, so boxing only the `Err` arm would not shrink
+// the returned value — the `Ok` arm carries the same 128 bytes. Unlike
+// `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
+// boxed), there is nothing to gain here, so the lint is allowed outright.
+#[allow(clippy::result_large_err)]
 async fn resolve(
     state: State<MonoApiServiceState>,
     Json(req): Json<ResolveRequest>,
@@ -257,6 +262,11 @@ fn default_limit() -> u32 {
     128
 }
 
+// Both arms are `Response`, so boxing only the `Err` arm would not shrink
+// the returned value — the `Ok` arm carries the same 128 bytes. Unlike
+// `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
+// boxed), there is nothing to gain here, so the lint is allowed outright.
+#[allow(clippy::result_large_err)]
 async fn directory(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,

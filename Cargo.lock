@@ -4315,6 +4315,7 @@ dependencies = [
  "libvault",
  "log",
  "mimalloc",
+ "mst2-codec",
  "object_store",
  "once_cell",
  "openssl",
@@ -4361,6 +4362,14 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "uuid",
+]
+
+[[package]]
+name = "mst2-codec"
+version = "0.1.0"
+source = "git+https://github.com/gitmono-dev/mst2-codec#b2139c6439e472b1d6d386cc831e528a917e0063"
+dependencies = [
+ "sha2 0.10.9",
 ]
 
 [[package]]
