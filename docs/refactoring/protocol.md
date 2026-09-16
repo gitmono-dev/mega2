@@ -504,7 +504,7 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 - `delete-refs`：已重新 advertise（HTTP smoke 覆盖 CL delete；Monorepo 拒绝 Git-client tag；SSH delete 矩阵仍待补齐）。
 - `atomic`：已从 advertise 移除（未实现原子 ref 更新）。
 - `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
-- `no-thin`：已从 advertise 移除（thin-pack 行为未明确测试）。
+- `no-thin`：**（2026-09-16）重新 advertise**。移除期间任何 delta 压缩触底服务端已知对象的 push 都会以 thin pack 到达，而 pack 解码器对包外基对象 fail-closed（`git-internal` decode "Pack references bases that are not in the pack"），导致 receive-pack 连接中断、ref 不推进（缺陷 RCV-01：git 2.34/2.49 复现，`pack.window=0` 可绕过）。`no-thin` 语义（客户端不得发送 thin pack）正是解码器当前契约的正确配套，与上游 Mega 一致；同时 `unpack_stream` 将解码失败由 panic 收敛为 typed `ProtocolError`（2026-09-16）。
 - `report-status-v2`：已从 advertise 移除（未实现 v2 完整语义）。
 - `ofs-delta`：仍 advertise；OFS_DELTA pack 编解码由 `git-internal` crate 实现并自测（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧覆盖 advertise/parse（`parse_capabilities_recognizes_ofs_delta`）。
 
@@ -762,7 +762,7 @@ LFS:
 
 1. 建立 capability truth table。
 2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`include-tag`、`delete-refs` 等能力。
-3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。
+3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。（✅ 2026-09-16：`no-thin` 由 advertise 断言 + RCV-01 端到端回归覆盖，见上表与 truth table）
 4. ✅ 对 SHA-1 object format 做显式策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 验收标准：
@@ -787,7 +787,7 @@ LFS:
 | `report-status-v2` | ❌ 已移除 | ✅ | ❌ | N/A | 未实现 v2 语义，已从 advertise 移除 |
 | `delete-refs` | ✅ 已声明 | ✅ HTTP CL delete + Monorepo tag-reject smoke | ❌ | N/A | HTTP smoke 已覆盖 CL delete；Monorepo 禁止 Git-client tag（`docs/monorepo.md`）；SSH delete 矩阵仍未补齐 |
 | `quiet` | ❌ 已移除 | ❌ | ❌ | N/A | 未实现 progress 抑制，已从 advertise 移除 |
-| `no-thin` | ❌ 已移除 | ❌ | ❌ | N/A | thin-pack 行为未明确测试，已从 advertise 移除 |
+| `no-thin` | ✅ receive-pack（2026-09-16 重新 advertise） | ❌（客户端侧语义，服务端无需 parse） | ✅ 依赖客户端不发送 thin pack；服务端解码器对残余 thin/malformed pack fail-closed 并经 `unpack_stream` 转为 typed 错误（2026-09-16） | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` + RCV-01 端到端回归（默认 delta push） | 移除期间 thin pack 触发解码 panic/断连（RCV-01）；重 advertise 以匹配解码器 fail-closed 契约 |
 | `include-tag` | ❌ 已移除 (upload) | ❌ | ❌ | N/A | pack 生成未按 include-tag 语义验证，已从 advertise 移除 |
 | `server-option` | ❌ 已移除 (v2) | ✅ | ❌ | ✅ `v2_capability_advertisement_does_not_advertise_server_option` | v2 parsed capabilities 未被 inspect/act-on，advertise 会误导客户端；2026-06-30 从 v2 advertise 移除 |
 | `object-format` | ❌ protocol v1；✅ protocol v2 `object-format=sha1` | ✅ v2 capability advertisement | N/A | ✅ v1 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` + v2 capability 单测 | v1 保持 SHA-1 默认不 advertise；v2 capability list 显式声明 `sha1` |
