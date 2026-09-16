@@ -29,6 +29,9 @@ pub struct BuiltDirectory {
     pub page_id: [u8; 32],
     /// Direct entries, byte-sorted, matching the page contents.
     pub entries: Vec<DirEntry>,
+    /// The codec entries the page was built from, so callers can walk a route
+    /// through the same canonical tree (`Page::pages_along_route`).
+    pub codec_entries: Vec<Entry>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +169,7 @@ pub async fn build_directory_page<T: ApiHandler + ?Sized>(
         page_bytes,
         page_id: pid,
         entries,
+        codec_entries,
     })
 }
 

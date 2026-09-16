@@ -37,6 +37,7 @@ pub fn routers() -> Router<MonoApiServiceState> {
         .route("/snapshots/{snapshot_id}/directory", get(directory))
         .route("/snapshots/{snapshot_id}/blob", get(blob))
         .route("/snapshots/{snapshot_id}/lookup", post(lookup))
+        .route("/snapshots/{snapshot_id}/metadata/pages", post(metadata_pages))
 }
 
 fn mst2_error_response(err: SnapshotError) -> Response {
@@ -80,7 +81,7 @@ async fn capabilities() -> Json<serde_json::Value> {
             "directory": true,
             "leases": true,
             "lookup": true,
-            "metadata_pages": false,
+            "metadata_pages": true,
             "raw_blob": true,
             "objects": false,
             "chunk_reads": false,
@@ -675,4 +676,165 @@ async fn lookup(
         "proof_pages": proof_pages_out,
     });
     Ok(Json(body).into_response())
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct MetadataPagesRequest {
+    items: Vec<MetadataPageItem>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct MetadataPageItem {
+    /// Scope-relative directory path ("/" = the scope itself).
+    directory_path: String,
+    /// Branch-child labels from that directory's MTP2 root (spec 04 §8).
+    #[serde(default)]
+    route: Vec<u8>,
+    /// Digest of the page the route must reach.
+    #[serde(default)]
+    expected_digest: Option<String>,
+}
+
+/// POST `/{snapshot_id}/metadata/pages` — batch raw MTP2 pages (spec 04 §8).
+///
+/// Returns the exact unique page set as a META TreeFrame stream. Routes are
+/// walked inside the canonical tree built from the fixed view, so a returned
+/// page is byte-identical to the one its parent commits to; a page the view
+/// does not contain is a proven-absence 404, never an empty page or a
+/// digest-only shortcut past the scope check.
+#[allow(clippy::too_many_lines)]
+async fn metadata_pages(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    let req: MetadataPagesRequest = serde_json::from_slice(&body).map_err(|e| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            format!("malformed request body: {e}"),
+        ))
+    })?;
+    if req.items.is_empty() || req.items.len() > 64 {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "items must hold 1..64 entries",
+        )));
+    }
+    for item in &req.items {
+        validate_scope_relative_path(&item.directory_path).map_err(mst2_error_response)?;
+    }
+
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let root_tree = handler
+        .get_tree_by_hash(&ctx.root_tree_oid)
+        .await
+        .map_err(internal)?;
+    let scope = &ctx.built.descriptor.scope;
+
+    // Unique pages across all items, in first-seen order.
+    let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut seen: Vec<[u8; 32]> = Vec::new();
+    let mut logical_bytes: u64 = 0;
+    for item in &req.items {
+        let abs_path = abs_view_path(scope, &item.directory_path);
+        let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
+            .await
+            .map_err(mst2_error_response)?;
+        let pages = mst2_codec::metapage::Page::pages_along_route(&built.codec_entries, &item.route)
+            .map_err(|e| match e {
+                // A label the fixed view does not have is proven absence.
+                mst2_codec::CodecError::BadOrdering(m) => SnapshotError::new(
+                    SnapshotErrorCode::PathNotFound,
+                    format!("{}: route does not resolve ({m})", item.directory_path),
+                ),
+                other => SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    format!("{}: route walk failed ({other})", item.directory_path),
+                ),
+            })?;
+        let last = pages
+            .last()
+            .expect("pages_along_route returns at least the root page");
+        let last_id = mst2_codec::metapage::page_id(last);
+        if let Some(expected) = &item.expected_digest
+            && expected != &format!("sha256:{}", hex_of(&last_id))
+        {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!("{}: route does not reach expected_digest", item.directory_path),
+            )));
+        }
+        for page in pages {
+            let id = mst2_codec::metapage::page_id(&page);
+            if !seen.contains(&id) {
+                logical_bytes += page.len() as u64;
+                seen.push(id);
+                unique.push((id, page));
+            }
+        }
+    }
+
+    // Frames hold at most 64 pages and at most 1 MiB of raw payload (spec 06),
+    // so a wide route set becomes several META frames rather than one
+    // oversized one. stream_id must be non-zero within a response.
+    const STREAM_ID: u32 = 1;
+    let mut out: Vec<u8> = Vec::new();
+    let mut sequence: u64 = 0;
+    let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut frame_raw: usize = 0;
+    let mut flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
+                     raw: &mut usize,
+                     out: &mut Vec<u8>,
+                     sequence: &mut u64|
+     -> Result<(), Response> {
+        if frame.is_empty() {
+            return Ok(());
+        }
+        let payload = mst2_codec::treeframe::MetaPayload { pages: std::mem::take(frame) }
+            .encode(STREAM_ID, *sequence)
+            .map_err(|e| mst2_error_response(internal(format!("META frame encode failed: {e}"))))?;
+        out.extend_from_slice(&payload);
+        *sequence += 1;
+        *raw = 0;
+        Ok(())
+    };
+    for (id, page) in unique {
+        // Per-page raw cost: 32-byte page_id + 4-byte length + bytes.
+        if !frame.is_empty()
+            && (frame.len() >= mst2_codec::treeframe::META_MAX_PAGES
+                || frame_raw + 36 + page.len() > mst2_codec::treeframe::META_MAX_RAW)
+        {
+            flush(&mut frame, &mut frame_raw, &mut out, &mut sequence)?;
+        }
+        frame_raw += 36 + page.len();
+        frame.push((id, page));
+    }
+    flush(&mut frame, &mut frame_raw, &mut out, &mut sequence)?;
+
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, &body);
+    let request_body_sha256: [u8; 32] = sha2::Digest::finalize(hasher).into();
+    let end = mst2_codec::treeframe::EndPayload {
+        request_item_count: req.items.len() as u32,
+        unique_unit_count: u32::try_from(seen.len()).unwrap_or(u32::MAX),
+        logical_bytes,
+        request_body_sha256,
+    }
+    .encode(STREAM_ID, sequence);
+    out.extend_from_slice(&end);
+
+    Response::builder()
+        .header("content-type", "application/octet-stream")
+        .header("cache-control", "private, no-cache, no-transform")
+        .body(axum::body::Body::from(Bytes::from(out)))
+        .map_err(|e| mst2_error_response(internal(format!("body build failed: {e}"))))
 }
