@@ -1,12 +1,12 @@
-# monoengine 长期移植规划（Mega → monoengine 完全移植）
+# mega2 长期移植规划（Mega → mega2 完全移植）
 
 ## 文档职责与维护协议
 
-本文是 monoengine 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/media/eli/sky/mega`）的 Rust 后端能力完整移植到 monoengine**，并在移植过程中保留 monoengine 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/media/eli/sky/campsite`）承载，monoengine 的前端与账户系统是 monoui 仓库（`gitmono-dev/monoui`，sibling `../monoui`）`monoengine` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。自 PT-13 起也可登记 **mega2 原生**长期能力（事实基线是本仓 checkout，不要求 Mega revision）。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
+本文是 mega2 不绑定具体发布日期和版本号的长期移植路线图，目标是**把 Mega 项目（`/media/eli/sky/mega`）的 Rust 后端能力完整移植到 mega2**，并在移植过程中保留 mega2 已确立的架构改进。同时，本文承载前端一致性约束：Mega 目标项目的前端与账户系统由 moon + campsite（`/media/eli/sky/campsite`）承载，mega2 的前端与账户系统是 monoui 仓库（`gitmono-dev/monoui`，sibling `../monoui`）`mega2` 分支的 `apps/next-app`；两个前端体系的功能必须保持一致（见规划原则 11 与 PT-12）。它回答"哪些 Mega 能力尚未移植、为什么、依赖什么、何时具备进入日期计划的条件"，不是 release 承诺、owner 清单或逐项实施任务表。自 PT-13 起也可登记 **mega2 原生**长期能力（事实基线是本仓 checkout，不要求 Mega revision）。具体设计、迁移、拆分、发布和回滚只进入按日期计划（`plan-YYYYMMDD.md`）或后续 RFC/ADR。
 
-> **术语（2026-08-21）**：本文其余处出现的 *website* 是**角色名**（monoengine 的
+> **术语（2026-08-21）**：本文其余处出现的 *website* 是**角色名**（mega2 的
 > 前端 / 认证与产品邮件投递面），不再是仓库名——其实现仓库自 2026-08-21 起为
-> `gitmono-dev/monoui` 的 `monoengine` 分支。派生标识（契约名 `website-mail`、
+> `gitmono-dev/monoui` 的 `mega2` 分支。派生标识（契约名 `website-mail`、
 > Compose 服务 `website-next` / `website-db-init`、隔离账户库 `website`、配置键
 > `MEGA_OAUTH__WEBSITE_*` / `MEGA_NOTIFICATION__WEBSITE_MAIL_*`、测试门
 > `WEBSITE_IT`）**一律不改名**。
@@ -14,34 +14,34 @@
 本文的持续事实来源有两类：
 
 - **Mega 目标项目源码**（移植来源与契约基线，不是竞品或外部参照）：以 pinned revision 的 checkout 为准，逐 crate 审计移植状态；浮动 `main` 不作为规范。
-- **monoengine 当前 checkout**：已完成移植的事实以当前代码、测试和 `docs/refactoring/` 重构文档为准，历史计划或对 Mega 目标项目的历史描述只作为线索。
+- **mega2 当前 checkout**：已完成移植的事实以当前代码、测试和 `docs/refactoring/` 重构文档为准，历史计划或对 Mega 目标项目的历史描述只作为线索。
 
 状态定义如下：
 
 | 状态 | 含义 |
 |---|---|
-| 候选 | 有移植线索，但 monoengine 缺口、架构适配或证据尚不足 |
-| 已验证 | 已同时核对 Mega 目标项目源码与 monoengine 当前源码/测试，确认缺口真实存在 |
+| 候选 | 有移植线索，但 mega2 缺口、架构适配或证据尚不足 |
+| 已验证 | 已同时核对 Mega 目标项目源码与 mega2 当前源码/测试，确认缺口真实存在 |
 | 已排期 | 已有按日期计划覆盖该 PT 的明确范围，并从本文链接 |
 | 实施中 | 该 PT 已有已合入切片，长期完成判据仍未全部满足 |
 | 已实现 | 当前可发布版本中的代码、测试、用户/兼容文档共同证明完成判据已满足 |
 | 已替代 | 原移植需求仍有效，但由另一 PT 或更合适的机制承接 |
-| 不采纳 | 经审计确认不适合 monoengine（或明确属于范围外资产），保留编号与理由 |
+| 不采纳 | 经审计确认不适合 mega2（或明确属于范围外资产），保留编号与理由 |
 
 只有当前 checkout 的代码、测试、兼容性与用户文档，以及可发布版本证据共同成立时，PT 才能标记"已实现"。日期计划写完、Mega 目标项目已有该能力、存在 schema 或文档声明都不构成实现证明。PT 编号一经引用不重编号；详细章节不承担排序，唯一排序入口是"长期功能总览"。
 
 ## 本次 Mega 源码审计快照
 
-审计时间：**2026-08-11**。审计方式：分别核对两个仓库的当前 checkout 与工作区状态。（**2026-08-27 订正**：本行原写「使用 libra……两仓库均由 libra 管理，不得用 git 命令误判」；monoengine 已于当日删除 `.libra` 改由 Git 管理，本仓一律用 `git` 命令核对。Mega 目标项目侧的 VCS 归属未随之变化，下次审计时须逐仓确认后再选命令，不得沿用「两仓库同构」的旧假设。上述 2026-08-11 的审计结论本身不受影响，不回改。）
+审计时间：**2026-08-11**。审计方式：分别核对两个仓库的当前 checkout 与工作区状态。（**2026-08-27 订正**：本行原写「使用 libra……两仓库均由 libra 管理，不得用 git 命令误判」；mega2 已于当日删除 `.libra` 改由 Git 管理，本仓一律用 `git` 命令核对。Mega 目标项目侧的 VCS 归属未随之变化，下次审计时须逐仓确认后再选命令，不得沿用「两仓库同构」的旧假设。上述 2026-08-11 的审计结论本身不受影响，不回改。）
 
 - Mega 目标项目：`main` @ `3d22823e8533dd2bb7a275a92e18d8f0160f9929`（2026-08-11，`fix(identity): treat CLA as signed across username/github/public-id aliases (#2169)`）；其前一提交为 `#2168`，用于无 SQL 修复过渡期 CL reviewer。
-- monoengine：`main` @ `38feb4dd78edc998570df17ae9906af56a801d9e`，版本 v0.2.15。最近一次完整 Mega 同步分析仍基于 `#2129`；截至本次审计，**`#2130..#2169` 尚未逐提交归类，漂移窗口扩大。**
-- monoengine 工作区：除本文件外还存在用户或并行工作改动，覆盖 Git protocol、配置、测试与相关文档；本次只更新 `plan-long.md`，不将这些改动作为本次路线图结论或修改其文件。
-- 关联前端与账户系统（PT-12 事实基线，2026-08-21 核对）：campsite（`/media/eli/sky/campsite`，Rails 应用，Mega 前端 moon 的账户/后端配对，Mega 侧引用不在本次改指范围）；**前端仓库自 2026-08-21 由 `genedna/website` 改指 `gitmono-dev/monoui`**（sibling `../monoui`，libra 管理），当前 checkout 为 `monoengine` 分支且工作树 clean。执行 PT-12 对照或联动发布前，仍须记录该分支的 pinned revision（唯一事实源：[`../refactoring/website-auth.md`](../refactoring/website-auth.md) §头部）；其 `apps/next-app`（Next.js）仍是 monoengine 的前端与账户系统。
+- mega2：`main` @ `38feb4dd78edc998570df17ae9906af56a801d9e`，版本 v0.2.15。最近一次完整 Mega 同步分析仍基于 `#2129`；截至本次审计，**`#2130..#2169` 尚未逐提交归类，漂移窗口扩大。**
+- mega2 工作区：除本文件外还存在用户或并行工作改动，覆盖 Git protocol、配置、测试与相关文档；本次只更新 `plan-long.md`，不将这些改动作为本次路线图结论或修改其文件。
+- 关联前端与账户系统（PT-12 事实基线，2026-08-21 核对）：campsite（`/media/eli/sky/campsite`，Rails 应用，Mega 前端 moon 的账户/后端配对，Mega 侧引用不在本次改指范围）；**前端仓库自 2026-08-21 由 `genedna/website` 改指 `gitmono-dev/monoui`**（sibling `../monoui`，libra 管理），当前 checkout 为 `mega2` 分支且工作树 clean。执行 PT-12 对照或联动发布前，仍须记录该分支的 pinned revision（唯一事实源：[`../refactoring/website-auth.md`](../refactoring/website-auth.md) §头部）；其 `apps/next-app`（Next.js）仍是 mega2 的前端与账户系统。
 
 Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）：
 
-| Mega 资产 | 职责 | 移植状态 | monoengine 对应 | 证据入口 |
+| Mega 资产 | 职责 | 移植状态 | mega2 对应 | 证据入口 |
 |---|---|---|---|---|
 | `mono` | 主二进制：CLI、service(http/ssh/multi)、HTTP API 全套路由、bootstrap、server、git_protocol、email、notification、orion_build_dispatch | 已移植（高度重构；本仓 SMTP/`src/mail` 已按 ADR-WA-08 退场，产品邮件投递归属 website） | `src/cli.rs` + `bin/`、`src/commands/`、`src/server/`、`src/api/`、`src/context/`、`src/contract/git_protocol/`、`src/notification/`、`src/bellatrix/` | 各 crate `src/` 顶层结构对照；邮件契约见 `docs/refactoring/website-mail.md` |
 | `ceres` | monorepo 领域库：application、bus、diff、infra、lfs、merge_checker、model、transport | 部分移植 | `src/ceres/`（api_service/build_trigger/code_edit/diff/lfs/merge_checker/model/pack/protocol）；application/artifact→`src/jupiter/service/artifact_service.rs`、application/buck→`buck_service.rs`、application/webhook→`webhook_service.rs`、application/notification→`src/notification/` | **`ceres/bus`、`ceres/infra` 未作为模块移植（PT-05）；Mega #2138/#2139 已把二者纳入 application/transport 分层，必须按新路径审计，不得按旧目录直接复制** |
@@ -59,12 +59,12 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | `orion-server` | 构建任务服务端（api、buck2、log、model、repository、scheduler、service、server） | **未移植** | 无（仅保留消费侧 `buck_router`/`artifacts_router`/`build_trigger_router` API 面） | PT-06；Mega #2163 新增无 idle worker 时最长 60 分钟的构建排队语义 |
 | `orion-scheduler` | QEMU VM 弹性调度（vm_manager、vm_cleanup、keep_alive、orion_deployer、webhook） | **未移植** | 无 | PT-08 |
 | `moon` | Web 前端（pnpm + turbo，Next.js） | 范围外 | 无（引擎只移植 Rust 后端） | 见"不进入本长期移植计划的 Mega 资产" |
-| `tests/` | Git 协议/对象层集成测试夹具（data、diff、objects、refs、scripts） | **未移植** | monoengine 有 `test/project/` 与 `bin/tests/`，协议级夹具未系统移植 | PT-04 |
+| `tests/` | Git 协议/对象层集成测试夹具（data、diff、objects、refs、scripts） | **未移植** | mega2 有 `test/project/` 与 `bin/tests/`，协议级夹具未系统移植 | PT-04 |
 | `scripts/`、`docker/` | 运维/部署辅助（crates-sync、init_mega、demo、deployment） | 未移植 | 无 | 是否移植需单独决策，见"不进入"章节 |
 
 最近审计记录最多保留 12 次；超过上限后把更早记录压缩为 revision 集合与结论，不保留逐 crate 对照日志。
 
-| 审计日期 | Mega revision | monoengine 基线 | 路线图结论 |
+| 审计日期 | Mega revision | mega2 基线 | 路线图结论 |
 |---|---|---|---|
 | 2026-08-26 | `2398a92`（含 #2175） | v0.3.5（`91df97c`） | [`plan-20260826.md`](plan-20260826.md) 收口窗口 #2130→#2175：LFS lock list limit 校验与 400 分类（#2175）、import attach `.gitkeep` blob 持久化（#2152）、CL 列表 build_status worst-wins 聚合与回填（#2163 附带项）已交付（SYNC-01..05）；campsite 身份模型（#2165–#2170）、ceres application/transport/bus 结构重构（#2138/#2139/#2142）、locks/verify 400 分类登记为 DEFER-SYNC-02/03/05，不改变 PT 状态。 |
 | 2026-08-11 | `3d22823`（含 #2169） | v0.2.15（`38feb4d`） | 复核确认 PT-01 已完成、PT-04 已进入日期计划；PT-03 已吸收 auth、delete-only、per-channel state 与 capability 收敛，只余 streaming 和完整矩阵。对象存储/Redis SecretRef、Slack/Webhook、Vault file audit sink 已交付，分别从 PT-10/PT-09/PT-11 的缺口移除。Mega #2130..#2169 仍未完成逐提交归类；新增账户审批/Cedar 管理、Orion queue/runner/VM 表面扩大 PT-02/PT-06/PT-08/PT-12 的审计范围；#2165..#2169 的 identity/Cedar reviewer 域（Cedar reviewer 解析、campsite_user_id、admin 检查、CLA 签名）进一步扩大 PT-02/PT-12 的对照范围。 |
@@ -78,21 +78,21 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 以下原则适用于全部 PT。原则 1–4、8 只约束 Mega 移植项（PT-01..PT-12）；原则 5–7、9–12 对 mega2 原生项同样生效。
 
 1. **忠实移植优先于重新设计。** 默认保留 Mega 的 wire 行为、DB schema、API 契约和错误语义；架构性偏离必须是已决 ADR 并记录在案（如 contract 归并、config 提升、workspace 拆分），不得在执行中临时发明。
-2. **monoengine 的架构改进不回退。** 单 package `monoengine`（lib `monoengine_core` + `[[bin]]`）、`src/contract/` 边界归并、一级 `src/config/`、`src/notification/`（邮件投递已迁 website，见 ADR-WA-08）、Vault（crates.io `libvault` + `src/contract/vault/` 集成层加固；不得回流为内嵌 vendored fork，亦不得因与 Mega `libvault-core` 目录差异而回退——依赖形态演进见 [`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）、orbit 内联于 `src/orbit_api/` + `src/orbit/`（见 [`plan-20260824.md`](plan-20260824.md)）、对象存储构造时机等已交付改进，不因"与 Mega 不一致"而改回。
+2. **mega2 的架构改进不回退。** 单 package `mega2`（lib `mega2_core` + `[[bin]]`）、`src/contract/` 边界归并、一级 `src/config/`、`src/notification/`（邮件投递已迁 website，见 ADR-WA-08）、Vault（crates.io `libvault` + `src/contract/vault/` 集成层加固；不得回流为内嵌 vendored fork，亦不得因与 Mega `libvault-core` 目录差异而回退——依赖形态演进见 [`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）、orbit 内联于 `src/orbit_api/` + `src/orbit/`（见 [`plan-20260824.md`](plan-20260824.md)）、对象存储构造时机等已交付改进，不因"与 Mega 不一致"而改回。
 3. **移植前必须 pin 并核对 Mega revision。** 每个日期计划开工前用 libra 记录 Mega 实际 checkout revision，逐文件刷新源码锚点；不得把浮动 `main`、历史同步报告或本文快照当作当前事实。
 4. **先追平、后扩展。** 已移植模块的 Mega 基线漂移（PT-02）优先于在其上叠加新能力；在漂移窗口上实施新 PT 前，必须先确认相关模块的 Mega 变更已被吸收或明确排除。
 5. **三门验收是硬门禁。** 每个任务至少通过 `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test ...` 指定用例；`cargo build [--tests]` 保持 0 错误 0 警告。
 6. **机器接口与文档同步。** 涉及公开命令、配置项、DB schema、HTTP API、错误码或存储格式的移植，必须同步 OpenAPI schema、配置示例、错误码文档和测试，并遵守 `AGENTS.md` 的实体/迁移/子命令登记流程。
-7. **安全边界 fail-closed。** Vault、SecretRef、认证授权、协议输入解析的安全语义不得因移植而弱化；Mega 目标项目的宽松默认不自动成为 monoengine 的默认。
-8. **不重复建设事实源。** Mega 侧能力若已被 monoengine 以更强形态覆盖（如 notification、config、mail），不回流旧实现；只补缺口，不重复移植。
+7. **安全边界 fail-closed。** Vault、SecretRef、认证授权、协议输入解析的安全语义不得因移植而弱化；Mega 目标项目的宽松默认不自动成为 mega2 的默认。
+8. **不重复建设事实源。** Mega 侧能力若已被 mega2 以更强形态覆盖（如 notification、config、mail），不回流旧实现；只补缺口，不重复移植。
 9. **测试随代码移植。** 移植功能必须携带或重建其测试；禁止手写 schema SQL，必须走真实 migration；集成测试沿用 docker-compose 测试栈与 `bin/tests/` 黑盒分层。
 10. **计划状态必须据代码更新。** 每次审计重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
-11. **双前端一致性。** Mega 前端体系是 moon + campsite，monoengine 前端与账户系统是 monoui `monoengine` 分支的 `apps/next-app`；monoengine 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。storage-only 无登录面的能力（如 PT-13）写 `N/A` 与原因即可。
+11. **双前端一致性。** Mega 前端体系是 moon + campsite，mega2 前端与账户系统是 monoui `mega2` 分支的 `apps/next-app`；mega2 的公开 API 与账户行为必须与 `apps/next-app` 对齐，且两个前端体系的功能保持一致。任何新增或变更后端公开行为的 PT/日期计划，必须包含对两侧前端的影响评估；不允许单侧漂移（详见 PT-12）。storage-only 无登录面的能力（如 PT-13）写 `N/A` 与原因即可。
 12. **mega2 原生项续编编号。** 非 Mega 移植的长期能力使用 `PT-13` 起的新编号，不得占用或重排 `PT-01..PT-12` / `SB-01..SB-03`。事实基线是本仓源码、测试、配置与 `docs/refactoring/`；Mega 侧无对应物时证据列写 `N/A`。
 
 ## 当前基础
 
-以下事实已在 2026-07-27 以当前 monoengine checkout（v0.1.50，`562122c2`）的源码、测试与 `docs/refactoring/` 文档复核；历史计划不作为实现证据：
+以下事实已在 2026-07-27 以当前 mega2 checkout（v0.1.50，`562122c2`）的源码、测试与 `docs/refactoring/` 文档复核；历史计划不作为实现证据：
 
 | 基础能力 | 当前事实 | 长期规划中的用途 |
 |---|---|---|
@@ -104,24 +104,24 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 | orbit 对象存储（内联） | `src/orbit_api/` + `src/orbit/` 单 package；`object_store` cloud features 在 core 编译图 | LFS/artifact/构建产物的存储承载 |
 | Git smart HTTP/SSH 协议 | `info/refs` 严格化、fallible pkt-line parser、SSH exec parser、per-channel state、认证上下文、delete-only receive-pack、capability truth table、HTTP LFS 边界与首批真实 CLI smoke 已交付；HTTP/SSH 仍完整缓冲请求/通道（`docs/refactoring/protocol.md`） | PT-03/PT-04 的起点 |
 | bellatrix（orion-client 部分移植） | build dispatch 路径可用，替代 Mega mono 的 `orion_build_dispatch.rs` | PT-06/PT-07/PT-08 的客户端侧基础 |
-| 集成测试基建 | docker-compose 测试栈（Postgres/Redis/Mailpit/RustFS/git-cli/`website-next`，`-p monoengine-it`）、`integration_vault` / `integration_git_cli` / `integration_website_auth` 黑盒；mailpit **消费方 = website IT**（非本仓 SMTP）；CI `config-validation.yml` 与 `git-protocol-smoke.yml` | 全部 PT 的验收承载；PT-01 收口最小矩阵；PT-04 的 SSH/LFS 与完整协议矩阵已进入 `plan-20260803.md` |
+| 集成测试基建 | docker-compose 测试栈（Postgres/Redis/Mailpit/RustFS/git-cli/`website-next`，`-p mega2-it`）、`integration_vault` / `integration_git_cli` / `integration_website_auth` 黑盒；mailpit **消费方 = website IT**（非本仓 SMTP）；CI `config-validation.yml` 与 `git-protocol-smoke.yml` | 全部 PT 的验收承载；PT-01 收口最小矩阵；PT-04 的 SSH/LFS 与完整协议矩阵已进入 `plan-20260803.md` |
 
 ## 长期功能总览
 
 | ID | 能力 | 优先级 | 状态 | 当前判断 | Mega 证据（revision `3d22823`） | 已关联日期计划 | 最近验证 |
 |---|---|---:|---|---|---|---|---|
 | PT-01 | 集成测试基建扩展与统一 | P0 | **已完成**（D 组绿于 v0.1.177，2026-07-30） | git-cli runner、HTTP 最小矩阵、热加载/多渠道扇出黑盒、并发 dispatcher 基线与 CI 执行/触发面已落地；P2：`config init`/热加载/多渠道扇出已落地，次渠道 retry（`DEFER-IT-10`）、GCS（`DEFER-IT-08`）、全局 disabled vs `system_required`（`DEFER-IT-07`）书面关闭；SSH/LFS 完整矩阵与真多进程黑盒仍属 PT-04/PT-09 | `mega/tests/`（对照）、`docs/refactoring/integration.md` P2 清单 | [`plan-20260727.md`](plan-20260727.md)（IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12；IT-05 已关闭为非任务卡） | 2026-07-30 |
-| PT-02 | 已移植模块 Mega 基线追平与持续同步 | P0 | 已验证 | monoengine 同步基线停在 Mega #2129，Mega 已到 #2169；callisto/jupiter/ceres/mono 对应面需逐模块核对漂移，重点包括 #2138/#2139 分层重构、#2145 账户审批、#2147 Cedar 管理、#2152 对象缺失处理，以及 #2165..#2169 的 identity/Cedar reviewer 域 | Mega log #2130–#2169 | 无 | 2026-08-11 |
+| PT-02 | 已移植模块 Mega 基线追平与持续同步 | P0 | 已验证 | mega2 同步基线停在 Mega #2129，Mega 已到 #2169；callisto/jupiter/ceres/mono 对应面需逐模块核对漂移，重点包括 #2138/#2139 分层重构、#2145 账户审批、#2147 Cedar 管理、#2152 对象缺失处理，以及 #2165..#2169 的 identity/Cedar reviewer 域 | Mega log #2130–#2169 | 无 | 2026-08-11 |
 | PT-03 | Git 协议兼容性与 LFS 收尾 | P0 | 部分完成 | auth 上下文、delete-only push、SSH per-channel state、capability truth table、LFS 路径/认证边界已交付；**repo/path 级 push ACL / Cedar 三态 push 门**已由 [`plan-20260812.md`](plan-20260812.md)（REL-01 UN-02/UN-03/UN-13）交付；FastCDC Media 与 receive-pack report-status/CAS 已由 [`plan-20260901.md`](plan-20260901.md) 交付；仍缺 streaming pkt-line 与完整 CLI 故障/并发矩阵 | `mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` | 无 | 2026-08-03 |
 | PT-04 | Git 协议集成测试夹具与真实 CLI 兼容矩阵 | P0 | 实施中 | `plan-20260803.md` 已交付 HTTP `pull`、`anonymous_access=false` 真实客户端拒绝、HTTP LFS 往返、cargo-native SSH clone/pull/push 与坏密钥拒绝矩阵并接入 CI；Mega 夹具审计结论 NO-GO（`DEFER-GM-03`，`docs/refactoring/mega-git-fixtures-audit.md`）；剩余 `DEFER-GM-01/02/04/05`（ImportRepo 矩阵、pure SSH LFS、shell SSH 广度 CI、missing-repo 探针）为 follow-up | `mega/tests/{data,diff,objects,refs,scripts}` | [plan-20260803.md](plan-20260803.md)（GM-* / GM-R1） | 2026-08-12 |
 | PT-05 | ceres/bus 事件总线与 infra 基础设施归位 | P1 | 已验证 | `TransportRuntime`/`TransportEvent`/`ApplicationEventHandler` 未移植；cache 已并入 api_service，pack_decode/pack_stream 逻辑散落 | `mega/ceres/src/bus/`、`mega/ceres/src/infra/` | 无 | 2026-07-27 |
-| PT-06 | Orion Server 构建控制面移植 | P1 | 已验证 | 整体缺失；monoengine 仅保留消费侧 API 面（buck/artifacts/build_trigger router）与 bellatrix 客户端 | `mega/orion-server/`、`mega/mono/src/api` 的 orion_runner_router | 无 | 2026-07-27 |
+| PT-06 | Orion Server 构建控制面移植 | P1 | 已验证 | 整体缺失；mega2 仅保留消费侧 API 面（buck/artifacts/build_trigger router）与 bellatrix 客户端 | `mega/orion-server/`、`mega/mono/src/api` 的 orion_runner_router | 无 | 2026-07-27 |
 | PT-07 | Orion 构建执行 Agent 移植 | P1 | 已验证 | runner（ws 客户端、buck_controller、disk/repo 管理）整体缺失 | `mega/orion/` | 无 | 2026-07-27 |
 | PT-08 | Orion Scheduler、VM 弹性调度与客户端 API 面补齐 | P2 | 已验证 | scheduler 与 orion-scheduler-client 未移植；bellatrix 仅覆盖 build dispatch，完整 OrionBuildClient API 面未核对 | `mega/orion-scheduler/`、`mega/clients/` | 无 | 2026-07-27 |
 | PT-09 | 通知与邮件能力对齐收尾 | P2 | 实施中 | **本仓邮件投递已移除**；**website 内部产品邮件 API、Slack 与 generic webhook 均已落地**，渠道凭据经 SecretRef；compose `mailpit` 消费方 = website IT。剩余：build 完成触发器、次渠道 retry（`DEFER-IT-10`）、真实多进程/多实例黑盒矩阵 | `mega/mono/src/notification/`、campsite slack 参考 | [`plan-20260731.md`](plan-20260731.md)（MN-01..MN-06）；[`plan-20260802.md`](plan-20260802.md)（WE-* / DEP-06） | 2026-08-03 |
 | PT-10 | 配置体系与 SecretRef 收尾 | P2 | 实施中 | 对象存储与 Redis SecretRef、`[oauth]`、跨 source/profile diagnostics 和首批热加载黑盒均已落地；剩余为真实消费者订阅清单、跨 await 生命周期审计与持续扩展，而非启动顺序改造 | `mega/common/src/config`（基线对照） | [`plan-20260731.md`](plan-20260731.md)（AU-02；`[oauth]`） | 2026-08-03 |
 | PT-11 | Vault 安全工程收尾 | P2 | 实施中 | file 持久化 audit sink、可选 fail-closed、backup/restore、unseal share rekey 已交付；仍缺 KEK 轮换（无 RustyVault 原语）、异地/HTTP audit sink、外部托管 root recovery 与格式版本策略；**依赖形态**（vendored → crates.io `libvault` 0.3.0 + UN-31 只读模式集成层重建）已由 [`plan-20260820.md`](plan-20260820.md) 于 2026-08-21 交付，本 PT 安全收尾缺口不变 | `mega/vault/`（基线对照） | [`plan-20260820.md`](plan-20260820.md)（依赖形态；非 KEK/审计 sink） | 2026-08-21 |
-| PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `monoengine` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
+| PT-12 | 前端与账户系统一致性（website `apps/next-app` ↔ Mega moon+campsite） | P1 | 候选 | **会话信任路径与 compose 同栈 IT**（website-next + `integration_website_auth`）已实现；**身份键迁移**已由 [`plan-20260812.md`](plan-20260812.md) UN-05 handoff 移交本 PT（DEP-04 outgoing，实际移交 **2026-08-17**；DEFER-UN-04 八项承接约束）；Mega #2145 账户审批、#2147 Cedar 管理及 #2165..#2169 的 identity/Cedar reviewer 域扩大全量 moon↔`apps/next-app` 对照范围；monoui `mega2` 分支 pin 须执行期确认；全量对照仍候选 | monoui `apps/next-app`、`mega/moon/`、campsite | [`plan-20260731.md`](plan-20260731.md)（AU/ITW）；handoff [`plan-20260812.md`](plan-20260812.md) UN-05/DEP-04 | 2026-08-17 |
 | PT-13 | storage-only 统一推送密文（同一 `[[git.push_tokens]]` 用于 HTTP 与 SSH receive-pack） | P1 | 候选 | 查找与身份已统一：HTTP 写 / SSH 读共用 `lookup_push_token`。SSH **写**仍被 TP-20 关掉（`DEFER-SP-02`）。本方案在 `push_auth=token` 下显式打开 SSH receive-pack，不新开第二套凭据，也不把 `none` 的匿名写扩到 SSH | N/A（mega2 原生） | 前置事实 [`plan-20260905.md`](plan-20260905.md) TP-20、[`plan-20260908.md`](plan-20260908.md) SP-* / `DEFER-SP-02`；尚无承接日期计划 | 2026-09-16 |
 
 ## 工程安全基线
@@ -216,8 +216,8 @@ Mega workspace crate 审计表（15 个 Rust crate + 前端与非 Rust 资产）
 
 ### 审计证据、真实缺口与提升条件
 
-- **monoengine 现状证据（已完成，2026-07-30）**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。IT-03 / IT-04 / IT-11 D 组已绿（`validate-config` [30466831819](https://github.com/gitmono-dev/monoengine/actions/runs/30466831819)；`git-protocol-smoke` [30479301244](https://github.com/gitmono-dev/monoengine/actions/runs/30479301244)）。
-- **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 monoengine 无承载（归 PT-06/07）。
+- **mega2 现状证据（已完成，2026-07-30）**：`docker-compose.test.yml`、`bin/tests/integration_vault.rs`、`bin/tests/integration_git_cli.rs`、`.github/workflows/config-validation.yml` / `git-protocol-smoke.yml` 已复核；`docs/refactoring/integration.md` P2 清单为 **扇出/热加载/`config init` 已落地**，缺口书面关闭（`DEFER-IT-07`/`DEFER-IT-08`/`DEFER-IT-10`）；git-cli runner、HTTP 最小矩阵、并发 dispatcher 基线与 CI 执行/触发面已由 `plan-20260727.md` 交付。IT-03 / IT-04 / IT-11 D 组已绿（`validate-config` [30466831819](https://github.com/gitmono-dev/mega2/actions/runs/30466831819)；`git-protocol-smoke` [30479301244](https://github.com/gitmono-dev/mega2/actions/runs/30479301244)）。
+- **Mega 证据**：`mega/tests/` 协议夹具存在（专项审计移植归 PT-04）；`mega/orion*` 的 ws/构建链路测试形态在 mega2 无承载（归 PT-06/07）。
 - **完成判据对照（`:202-204`）**：① 新服务接入有标准流程且以 Git CLI runner 示范落地 —— 满足（`test-infra.md` + compose `git-cli`）；② HTTP 通道真实 Git CLI 最小矩阵、热加载黑盒、多实例竞争基线用例本地绿、已接入 CI，且远端 CI 绿（IT-03/IT-04/IT-11 D 组）—— 满足；③ integration.md P2 清单全部有「落地 / 书面关闭（含理由与承接编号）」结论 —— 满足（无「延后」）。
 - **风险与边界**：测试栈膨胀会拖慢 CI；新服务必须可选启用（`profiles`），本地单元测试路径不受影响。SSH/LFS 完整矩阵与真多进程黑盒仍分别属 PT-04 / PT-09。
 
@@ -231,14 +231,14 @@ PT-01 不依赖其他 PT，是全部后续 PT 的验收承载：PT-04（协议�
 
 ### 移植问题
 
-monoengine 的 callisto、jupiter、ceres、mono 对应面最后系统同步基于 Mega `#2129`（v0.1.50 同步分析报告），Mega 已推进到 `#2169`。在漂移窗口上直接实施 PT-03 至 PT-08，会把"移植缺口"与"Mega 新变更"混在一起，导致锚点失效和重复劳动。
+mega2 的 callisto、jupiter、ceres、mono 对应面最后系统同步基于 Mega `#2129`（v0.1.50 同步分析报告），Mega 已推进到 `#2169`。在漂移窗口上直接实施 PT-03 至 PT-08，会把"移植缺口"与"Mega 新变更"混在一起，导致锚点失效和重复劳动。
 
 ### 目标范围
 
 - 用 libra 核对 Mega `#2130..#2169` 的全部提交，按模块分类：callisto 实体、jupiter storage/migration、ceres、mono API/命令、vault、saturn、api-model、clients。
 - 对每个已移植模块给出"吸收 / 明确排除（含理由）/ 转 PT-xx 承接"的三选一结论。
 - 建立持续同步机制：每次审计记录 Mega revision 与漂移结论，写回本文"审计快照"章节。
-- 漂移追平不得引入与 monoengine 架构改进冲突的回流（原则 2、8）。
+- 漂移追平不得引入与 mega2 架构改进冲突的回流（原则 2、8）。
 
 ### 非目标
 
@@ -254,10 +254,10 @@ monoengine 的 callisto、jupiter、ceres、mono 对应面最后系统同步基�
 
 ### 审计证据、真实缺口与提升条件
 
-- **Mega 证据**：`main` @ `3d22823`（含 #2169）；#2130–#2169 区间内容未在 monoengine 侧归类。优先审计 #2138/#2139 的 ceres application/transport/bus 重构、#2145 账户审批、#2147 Cedar 管理、#2152 缺失对象错误处理，以及 #2143/#2146/#2150/#2160/#2163 的 Orion provisioning、VM、磁盘和排队语义；#2165..#2169 的 identity/Cedar reviewer 域（Cedar reviewer 解析、campsite_user_id、admin 检查、CLA 签名）与 #2145/#2147 同域，一并纳入优先审计。
-- **monoengine 现状证据**：v0.1.50 提交说明明确"Read-only analysis of upstream mega (HEAD #2129)"；此后无同步记录。
+- **Mega 证据**：`main` @ `3d22823`（含 #2169）；#2130–#2169 区间内容未在 mega2 侧归类。优先审计 #2138/#2139 的 ceres application/transport/bus 重构、#2145 账户审批、#2147 Cedar 管理、#2152 缺失对象错误处理，以及 #2143/#2146/#2150/#2160/#2163 的 Orion provisioning、VM、磁盘和排队语义；#2165..#2169 的 identity/Cedar reviewer 域（Cedar reviewer 解析、campsite_user_id、admin 检查、CLA 签名）与 #2145/#2147 同域，一并纳入优先审计。
+- **mega2 现状证据**：v0.1.50 提交说明明确"Read-only analysis of upstream mega (HEAD #2129)"；此后无同步记录。
 - **最小可验证第一阶段**：先产出逐提交归类表（纯审计，不改代码），再按模块分批吸收；第一批只处理 callisto/jupiter（数据层漂移风险最高）。
-- **风险与边界**：漂移追平期间若发现 Mega 侧重构与 monoengine 架构决策冲突，停下来记 ADR，不做静默折中。
+- **风险与边界**：漂移追平期间若发现 Mega 侧重构与 mega2 架构决策冲突，停下来记 ADR，不做静默折中。
 
 ### 依赖与顺序
 
@@ -292,8 +292,8 @@ Git smart HTTP/SSH 协议已完成输入 panic 止血、`info/refs` 严格化、
 
 ### 审计证据、真实缺口与提升条件
 
-- **Mega 证据**：`mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` 为移植基线；monoengine 已在正确性上局部超过 Mega（capability 诚实化），不回退。
-- **monoengine 现状证据**：`src/contract/git_protocol/{http,ssh}.rs`、`src/ceres/protocol/smart.rs` 的止血切片已合入；protocol.md 阶段 3–6 的 streaming 仍未完成。LFS FastCDC Media（`--features fastcdc`）、receive-pack per-command status / CAS delete、导入 filepath 批处理已由 [`plan-20260901.md`](plan-20260901.md) 交付，不关闭本 PT 的 streaming / 完整故障矩阵缺口。
+- **Mega 证据**：`mega/mono/src/git_protocol/`、`mega/ceres/src/transport/` 为移植基线；mega2 已在正确性上局部超过 Mega（capability 诚实化），不回退。
+- **mega2 现状证据**：`src/contract/git_protocol/{http,ssh}.rs`、`src/ceres/protocol/smart.rs` 的止血切片已合入；protocol.md 阶段 3–6 的 streaming 仍未完成。LFS FastCDC Media（`--features fastcdc`）、receive-pack per-command status / CAS delete、导入 filepath 批处理已由 [`plan-20260901.md`](plan-20260901.md) 交付，不关闭本 PT 的 streaming / 完整故障矩阵缺口。
 - **最小可验证第一阶段**：依 `plan-20260803.md` 先补 HTTP pull / anonymous_access=false / LFS / SSH 真实客户端矩阵，再做 streaming 重构（性能与内存）或 ACL 收敛。
 - **风险与边界**：streaming 重构改变热路径内存模型，必须带基准与回退方案；依赖 PT-04 的 CLI 矩阵做防回归。
 
@@ -307,7 +307,7 @@ PT-03 的 streaming/ACL 行为切片应以 PT-04 的真实 CLI 矩阵为验收�
 
 ### 移植问题
 
-Mega `tests/` 提供协议/对象层集成测试夹具（`data/`、`diff/`、`objects/`、`refs/`、`scripts/`），monoengine 尚未系统移植；`test/project/` 与 `bin/tests/` 不覆盖该层。HTTP 最小真实 CLI 矩阵已存在，但 HTTP pull、匿名读关闭、HTTP LFS、cargo-native SSH、夹具许可/生成方式和 CI 归属尚待补齐，PT-03 后续改动仍缺完整防回归网。
+Mega `tests/` 提供协议/对象层集成测试夹具（`data/`、`diff/`、`objects/`、`refs/`、`scripts/`），mega2 尚未系统移植；`test/project/` 与 `bin/tests/` 不覆盖该层。HTTP 最小真实 CLI 矩阵已存在，但 HTTP pull、匿名读关闭、HTTP LFS、cargo-native SSH、夹具许可/生成方式和 CI 归属尚待补齐，PT-03 后续改动仍缺完整防回归网。
 
 ### 目标范围
 
@@ -322,13 +322,13 @@ Mega `tests/` 提供协议/对象层集成测试夹具（`data/`、`diff/`、`ob
 
 ### 完成判据
 
-- 真实 Git CLI 对 monoengine 服务完成 HTTP/SSH/LFS 三通道正路径与关键故障路径用例，CI 绿。
+- 真实 Git CLI 对 mega2 服务完成 HTTP/SSH/LFS 三通道正路径与关键故障路径用例，CI 绿。
 - 夹具或重建数据有来源记录；新增协议能力必须同步矩阵用例（门禁化）。
 
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/tests/{data,diff,objects,refs,scripts}` 存在且被 Mega 测试使用。
-- **monoengine 现状证据**：`test/project/` 为业务集成测试夹具；`bin/tests/` 已含 `integration_git_cli`（HTTP 最小矩阵 + 字面 `pull` + 匿名读关闭拒绝）、`integration_git_lfs`（HTTP LFS 往返）、`integration_git_ssh`（cargo-native SSH clone/pull/push 与坏密钥拒绝），三 target 已进入 `config-validation.yml` 与 `git-protocol-smoke.yml` 执行面；Mega 夹具审计 NO-GO 落盘于 `docs/refactoring/mega-git-fixtures-audit.md`（`DEFER-GM-03`）。
+- **mega2 现状证据**：`test/project/` 为业务集成测试夹具；`bin/tests/` 已含 `integration_git_cli`（HTTP 最小矩阵 + 字面 `pull` + 匿名读关闭拒绝）、`integration_git_lfs`（HTTP LFS 往返）、`integration_git_ssh`（cargo-native SSH clone/pull/push 与坏密钥拒绝），三 target 已进入 `config-validation.yml` 与 `git-protocol-smoke.yml` 执行面；Mega 夹具审计 NO-GO 落盘于 `docs/refactoring/mega-git-fixtures-audit.md`（`DEFER-GM-03`）。
 - **最小可验证第一阶段**：已由 `plan-20260803.md` 交付（HTTP `pull`、`anonymous_access=false` 拒绝、HTTP LFS、cargo-native SSH 与 Mega fixture go/no-go）；「三通道正路径与关键故障路径 CI 绿」已满足，夹具经审计记录来源/许可后决策 NO-GO（`DEFER-GM-03`）；长期完成判据未全部关闭（`DEFER-GM-01/02/04/05` follow-up），本 PT 维持实施中。
 - **风险与边界**：SSH 测试固定为 cargo-native self-start，不新增 compose sshd；LFS 依赖对象存储后端，优先 local FS 后端。
 
@@ -346,7 +346,7 @@ Mega `ceres/src/bus/`（`TransportRuntime`、`TransportEvent`、`ApplicationEven
 
 ### 目标范围
 
-- 审计 `ceres/bus` 在 Mega 中的全部生产者/消费者，判定 monoengine 需要的事件面（构建触发、构建完成、传输事件）。
+- 审计 `ceres/bus` 在 Mega 中的全部生产者/消费者，判定 mega2 需要的事件面（构建触发、构建完成、传输事件）。
 - 决定归位形态：按 `src/contract/` 边界规范落入合适模块，或论证后明确不移植（状态转"不采纳"并记录理由）。
 - `infra` 的 pack_decode/pack_stream 逻辑归位：消除散落重复，落点符合现有 ceres 模块划分。
 
@@ -363,7 +363,7 @@ Mega `ceres/src/bus/`（`TransportRuntime`、`TransportEvent`、`ApplicationEven
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/ceres/src/bus/`、`mega/ceres/src/infra/` 目录与引用图。
-- **monoengine 现状证据**：`src/ceres/` 模块清单无 bus/infra；`build_trigger` 已存在但事件通道缺失。
+- **mega2 现状证据**：`src/ceres/` 模块清单无 bus/infra；`build_trigger` 已存在但事件通道缺失。
 - **最小可验证第一阶段**：纯审计——画出 Mega 侧事件生产者/消费者图，给出归位 ADR；代码落地放第二阶段。
 - **风险与边界**：事件总线是 PT-06 通信形态的前置决策，拖延会阻塞构建链路设计。
 
@@ -377,7 +377,7 @@ PT-05 的审计结论（采用 bus 与否）是 PT-06 的前置；开工前完�
 
 ### 移植问题
 
-Mega `orion-server`（api、buck2、log、model、repository、scheduler、service、server）是构建任务控制面：接收 TaskBuildRequest、调度任务、收集日志、管理产物。monoengine 只有消费侧——`buck_router`/`artifacts_router`/`build_trigger_router` API 面与 bellatrix 客户端——构建任务无处投递。这是"mega 完全移植"最大的整体缺口之一。
+Mega `orion-server`（api、buck2、log、model、repository、scheduler、service、server）是构建任务控制面：接收 TaskBuildRequest、调度任务、收集日志、管理产物。mega2 只有消费侧——`buck_router`/`artifacts_router`/`build_trigger_router` API 面与 bellatrix 客户端——构建任务无处投递。这是"mega 完全移植"最大的整体缺口之一。
 
 ### 目标范围
 
@@ -389,7 +389,7 @@ Mega `orion-server`（api、buck2、log、model、repository、scheduler、servi
 ### 非目标
 
 - 不移植 runner 执行逻辑（PT-07）与 VM 调度（PT-08）。
-- 不改变 monoengine 既有 buck/artifacts API 的公开契约（除非书面 ADR）。
+- 不改变 mega2 既有 buck/artifacts API 的公开契约（除非书面 ADR）。
 
 ### 完成判据
 
@@ -400,7 +400,7 @@ Mega `orion-server`（api、buck2、log、model、repository、scheduler、servi
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/orion-server/` 完整 crate；`mega/mono/src/api` 的 orion_runner_router；`mega/clients/orion-client` 的完整 API 面。
-- **monoengine 现状证据**：`src/bellatrix/` 仅 build dispatch 路径；API state 无 orion-server 相关字段；`src/api/router/` 无 orion_runner_router。
+- **mega2 现状证据**：`src/bellatrix/` 仅 build dispatch 路径；API state 无 orion-server 相关字段；`src/api/router/` 无 orion_runner_router。
 - **最小可验证第一阶段**：任务模型 + 接收 API + 内存/DB 调度最小环，bellatrix 正路径联通；日志与产物管理第二阶段。
 - **风险与边界**：通信形态（直发 HTTP vs 事件总线）必须先等 PT-05 结论；schema 对齐需 PT-02 先行。
 
@@ -414,7 +414,7 @@ Mega `orion-server`（api、buck2、log、model、repository、scheduler、servi
 
 ### 移植问题
 
-Mega `orion` 是跑在构建机上的执行 agent：经 ws 与 orion-server 通信，执行 buck2 构建（`buck_controller`）、管理磁盘与 repo 缓存。monoengine 完全缺失 runner 侧，构建链路即使有 server 也无法执行。
+Mega `orion` 是跑在构建机上的执行 agent：经 ws 与 orion-server 通信，执行 buck2 构建（`buck_controller`）、管理磁盘与 repo 缓存。mega2 完全缺失 runner 侧，构建链路即使有 server 也无法执行。
 
 ### 目标范围
 
@@ -435,7 +435,7 @@ Mega `orion` 是跑在构建机上的执行 agent：经 ws 与 orion-server 通�
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/orion/src/{ws,buck_controller,disk,repo,api}`。
-- **monoengine 现状证据**：无任何 runner 对应物。
+- **mega2 现状证据**：无任何 runner 对应物。
 - **最小可验证第一阶段**：ws 注册 + 接收任务 + stub 执行 + 状态回传，buck_controller 第二阶段接入真实 buck2。
 - **风险与边界**：buck2 依赖与构建机环境差异大，stub 先行可避免环境阻塞；ws 协议契约以 PT-06 落地为准。
 
@@ -455,7 +455,7 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 
 - 核对并补齐 `OrionBuildClient` 完整 API 面（对照 `mega/clients/orion-client`）。
 - 移植 orion-scheduler-client；评估并决定 orion-scheduler（QEMU VM 池）的移植或书面不采纳（运维环境依赖重）。
-- 若移植 scheduler：VM 生命周期、webhook、keep_alive/cleanup 进入 monoengine 模块体系与配置体系。
+- 若移植 scheduler：VM 生命周期、webhook、keep_alive/cleanup 进入 mega2 模块体系与配置体系。
 
 ### 非目标
 
@@ -470,7 +470,7 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/orion-scheduler/`、`mega/clients/orion-scheduler-client/`、`mega/clients/orion-client/`。
-- **monoengine 现状证据**：`src/bellatrix/` 部分覆盖；API state 已移除 orion_scheduler_client 字段（移植时需重新引入）。
+- **mega2 现状证据**：`src/bellatrix/` 部分覆盖；API state 已移除 orion_scheduler_client 字段（移植时需重新引入）。
 - **最小可验证第一阶段**：客户端 API 面核对与补齐（纯客户端，无基础设施依赖）。
 - **风险与边界**：QEMU 依赖具体运维环境，移植决策必须显式，不能默认顺延。
 
@@ -484,7 +484,7 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 
 ### 移植问题
 
-`src/notification/` 在 in-app、Slack、generic webhook、用户偏好与触发器编排上已超过 Mega 对应面；Slack/webhook 均经 SecretRef 并有定向送达/脱敏测试。**本仓邮件投递已移除**（无 `[mail]`/SMTP/`email_jobs`），产品邮件投递归属 website（ADR-WA-08；事实源 `docs/refactoring/website-mail.md`）；compose 中 `mailpit` 若保留，**消费方 = website IT，不是 monoengine**（与 `docs/refactoring/test-infra.md` 一致）。长期收尾缺口收敛为 build 完成触发器接入点、次渠道 retry 与真实多进程/多实例黑盒矩阵。
+`src/notification/` 在 in-app、Slack、generic webhook、用户偏好与触发器编排上已超过 Mega 对应面；Slack/webhook 均经 SecretRef 并有定向送达/脱敏测试。**本仓邮件投递已移除**（无 `[mail]`/SMTP/`email_jobs`），产品邮件投递归属 website（ADR-WA-08；事实源 `docs/refactoring/website-mail.md`）；compose 中 `mailpit` 若保留，**消费方 = website IT，不是 mega2**（与 `docs/refactoring/test-infra.md` 一致）。长期收尾缺口收敛为 build 完成触发器接入点、次渠道 retry 与真实多进程/多实例黑盒矩阵。
 
 ### 目标范围
 
@@ -505,7 +505,7 @@ Mega `orion-scheduler`（QEMU VM 池、webhook、keep_alive、vm_cleanup、orion
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/mono/src/notification/` 为基线对照；slack 渠道参考 campsite `slack.ts`。
-- **monoengine 现状证据**：`src/notification/` 与 `docs/refactoring/{notification,mail,website-mail,test-infra}.md`；邮件退场见 [`plan-20260731.md`](plan-20260731.md) MN-01..MN-06；website 内部 API 见 [`plan-20260802.md`](plan-20260802.md)。
+- **mega2 现状证据**：`src/notification/` 与 `docs/refactoring/{notification,mail,website-mail,test-infra}.md`；邮件退场见 [`plan-20260731.md`](plan-20260731.md) MN-01..MN-06；website 内部 API 见 [`plan-20260802.md`](plan-20260802.md)。
 - **最小可验证第一阶段**：在 PT-05/PT-06 事件语义冻结后，为 build completed 接入既有通知编排；不得新建旁路投递机制。
 - **风险与边界**：build 触发器不得绕过事件面临时硬编码进 PT-06；website 邮件 API 不可达时不得拖死 in-app。
 
@@ -540,8 +540,8 @@ build 完成触发器依赖 PT-05（事件面）与 PT-06（构建事件源）�
 
 ### 审计证据、真实缺口与提升条件
 
-- **Mega 证据**：`mega/common/src/config` 为基线对照（monoengine 已是超集）。
-- **monoengine 现状证据**：`src/config/` 与 `docs/refactoring/{config,website-auth}.md`；`[oauth]` 落地见 [`plan-20260731.md`](plan-20260731.md) AU-02..AU-05。
+- **Mega 证据**：`mega/common/src/config` 为基线对照（mega2 已是超集）。
+- **mega2 现状证据**：`src/config/` 与 `docs/refactoring/{config,website-auth}.md`；`[oauth]` 落地见 [`plan-20260731.md`](plan-20260731.md) AU-02..AU-05。
 - **最小可验证第一阶段**：列出当前热加载订阅者及其 Arc 跨 await 语义，以一个未覆盖的真实消费者补充回滚/重载测试。
 - **风险与边界**：不得破坏现有 DB-only vault bootstrap；数据库凭据仍永远不进入 vault。
 
@@ -577,8 +577,8 @@ Vault 集成层 A–J 阶段可交付子集已完成：file 持久化 audit sink
 
 ### 审计证据、真实缺口与提升条件
 
-- **Mega 证据**：`mega/vault/` 为移植基线对照（monoengine 已在集成层加固，超出 Mega）。
-- **monoengine 现状证据**：形态为 crates.io `libvault` 0.3.0 + `src/contract/vault/integration/vault_core.rs`（vendored `src/vault/` 已于 2026-08-21 删除，[`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）。`docs/refactoring/vault.md` 已复核；`tracing`/`file` sink、`fail_closed`、backup/restore 和 unseal rekey 已交付。只读审计语义（UN-31）在迁移后须保留于集成层，不得弱化。
+- **Mega 证据**：`mega/vault/` 为移植基线对照（mega2 已在集成层加固，超出 Mega）。
+- **mega2 现状证据**：形态为 crates.io `libvault` 0.3.0 + `src/contract/vault/integration/vault_core.rs`（vendored `src/vault/` 已于 2026-08-21 删除，[`plan-20260820.md`](plan-20260820.md) ADR-VLT-01）。`docs/refactoring/vault.md` 已复核；`tracing`/`file` sink、`fail_closed`、backup/restore 和 unseal rekey 已交付。只读审计语义（UN-31）在迁移后须保留于集成层，不得弱化。
 - **最小可验证第一阶段**：格式版本策略（低风险、纯工程）；KEK 轮换需专项设计后承接。依赖形态迁移已走 go 路径落地，因此 PT-11 触及 seal/core 的卡一律按 `libvault` crate + `src/contract/vault/` 刷新锚点，不再引用 `src/vault/`。
 - **风险与边界**：KEK 轮换触碰 seal 核心，必须配恢复手册与故障注入，不得赶工；不得为对齐 Mega 目录而回流 vendored fork（原则 2）。
 
@@ -592,20 +592,20 @@ Vault 集成层 A–J 阶段可交付子集已完成：file 持久化 audit sink
 
 ### 移植问题
 
-monoengine 的后端能力（CL、issue、评审、通知、构建等）必须有前端与账户系统承载。Mega 目标项目的前端体系是 moon（Next.js）+ campsite（Rails，账户/后端配对）；monoengine 的对应物是 monoui 仓库 `monoengine` 分支的 `apps/next-app`。两套前端体系独立演进会产生双向漂移：monoengine 新增或变更的 API/账户行为在 `apps/next-app` 无承载，或 `apps/next-app` 缺少 moon 已有功能，用户侧表现为两侧产品能力不一致。
+mega2 的后端能力（CL、issue、评审、通知、构建等）必须有前端与账户系统承载。Mega 目标项目的前端体系是 moon（Next.js）+ campsite（Rails，账户/后端配对）；mega2 的对应物是 monoui 仓库 `mega2` 分支的 `apps/next-app`。两套前端体系独立演进会产生双向漂移：mega2 新增或变更的 API/账户行为在 `apps/next-app` 无承载，或 `apps/next-app` 缺少 moon 已有功能，用户侧表现为两侧产品能力不一致。
 
-**已由 [`plan-20260731.md`](plan-20260731.md) 落地（非全量对照）：** 浏览器会话信任路径（cookie → website `get-session` → `LoginUser`）、`[oauth]` 接线，以及 `monoengine-it` 同栈 `website-next` + `integration_website_auth`。本仓 Campsite 风格 chat/Notes 产品面已退场（产品能力留在 website）。**全量** moon↔`apps/next-app` 功能对照审计仍为候选（DEP-03）。
+**已由 [`plan-20260731.md`](plan-20260731.md) 落地（非全量对照）：** 浏览器会话信任路径（cookie → website `get-session` → `LoginUser`）、`[oauth]` 接线，以及 `mega2-it` 同栈 `website-next` + `integration_website_auth`。本仓 Campsite 风格 chat/Notes 产品面已退场（产品能力留在 website）。**全量** moon↔`apps/next-app` 功能对照审计仍为候选（DEP-03）。
 
 ### 目标范围
 
-- 建立双前端功能对照基线：`apps/next-app`（monoui `monoengine` 分支 pinned revision）与 `mega/moon/` + campsite 的功能清单与差异表，每项差异给出"追平 / 书面豁免（含理由）"结论。
-- 一致性门禁化：monoengine 每个涉及公开 API、账户、认证行为的 PT/日期计划，任务卡必须包含前端影响评估（apps/next-app 是否需要联动改动）。
+- 建立双前端功能对照基线：`apps/next-app`（monoui `mega2` 分支 pinned revision）与 `mega/moon/` + campsite 的功能清单与差异表，每项差异给出"追平 / 书面豁免（含理由）"结论。
+- 一致性门禁化：mega2 每个涉及公开 API、账户、认证行为的 PT/日期计划，任务卡必须包含前端影响评估（apps/next-app 是否需要联动改动）。
 - 账户系统语义对齐：在已落地的 website Better Auth 信任路径之上，继续做与 campsite/moon 的功能语义对照，差异书面化。
-- 追平机制：差异追平按功能域拆分进入日期计划；前端代码演进在 monoui 仓库进行，monoengine 侧只维护契约（OpenAPI/DTO）与对照表。
+- 追平机制：差异追平按功能域拆分进入日期计划；前端代码演进在 monoui 仓库进行，mega2 侧只维护契约（OpenAPI/DTO）与对照表。
 
 ### 非目标
 
-- 不把 moon 或 `apps/next-app` 的代码移植进 monoengine 仓库；前端在各自仓库演进。
+- 不把 moon 或 `apps/next-app` 的代码移植进 mega2 仓库；前端在各自仓库演进。
 - 不统一两侧技术栈与 UI 实现；一致性指功能语义与用户可见能力，不是像素级一致。
 - 不在本 PT 内重复实现会话信任路径 / compose 同栈 IT（已由 plan-20260731 交付）。
 
@@ -618,7 +618,7 @@ monoengine 的后端能力（CL、issue、评审、通知、构建等）必须�
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：`mega/moon/`（Next.js 主前端）；campsite（`/run/media/eli/data/gitmono/campsite`，Rails：`api/`、`apps/`）为 moon 的账户/后端配对；#2165..#2169 的 identity/Cedar reviewer 域（Cedar reviewer 解析、campsite_user_id、admin 检查、CLA 签名）与 #2145/#2147 同属账户/认证语义，纳入全量对照范围。
-- **monoengine 现状证据**：website Better Auth 会话与同栈 IT 见 `docs/refactoring/website-auth.md`、`test-infra.md`、[`plan-20260731.md`](plan-20260731.md) AU/ITW；**全量功能对照表仍不存在**。
+- **mega2 现状证据**：website Better Auth 会话与同栈 IT 见 `docs/refactoring/website-auth.md`、`test-infra.md`、[`plan-20260731.md`](plan-20260731.md) AU/ITW；**全量功能对照表仍不存在**。
 - **最小可验证第一阶段**：纯审计——产出 apps/next-app ↔ moon+campsite 功能对照表与账户语义差异清单（不改代码），据此把 PT-12 从"候选"提升为"已验证"并排期首批追平切片。
 - **风险与边界**：对照表一旦落后即失效，必须随每次审计刷新；前端改动跨仓库，联动发布顺序（先后端兼容窗口、后前端切换）必须在各日期计划中显式声明。
 
@@ -701,7 +701,7 @@ TP-20 关掉 SSH 写，是因为当时静态 token **只做了 git-over-HTTP**�
 ### 审计证据、真实缺口与提升条件
 
 - **Mega 证据**：N/A。
-- **monoengine 现状证据**：TP-20 / ADR-SP-01..04；`GitConfig::ssh_receive_pack_enabled`；`integration_git_ssh_trunk_token_push_receive_pack_disabled`；`deploy-trunk.md` §4。
+- **mega2 现状证据**：TP-20 / ADR-SP-01..04；`GitConfig::ssh_receive_pack_enabled`；`integration_git_ssh_trunk_token_push_receive_pack_disabled`；`deploy-trunk.md` §4。
 - **最小可验证第一阶段**：日期计划先写 ADR（形态闸 + 谓词）并改 `ssh_receive_pack_enabled` / validate，配一条 SSH token push 进程 IT 与一条 none 启动拒绝；再补文档与 review 回归。
 - **风险与边界**：password 进 SSH 有客户端泄漏面（ADR-SP-01 已接受于读路径）；打开写后泄漏面等于「能推」。必须保持常量时间查找、日志不回显密文。误把 `none` 与 `ssh_receive_pack=true` 组合放行会破坏 TP-20 安全边界——启动校验是硬门。
 
@@ -732,7 +732,7 @@ TP-20 关掉 SSH 写，是因为当时静态 token **只做了 git-over-HTTP**�
 3. PT-02 完成 `#2130..#2169` 基线追平与持续同步机制。
 4. PT-03 在 PT-04 矩阵上完成 streaming 与 repo/path ACL 收敛。
 
-阶段完成后，测试基建可承载全部后续 PT，monoengine 与 Mega 的已移植模块重新对齐，协议层有防回归网。
+阶段完成后，测试基建可承载全部后续 PT，mega2 与 Mega 的已移植模块重新对齐，协议层有防回归网。
 
 ### 阶段二：事件面与构建链路
 
@@ -835,10 +835,10 @@ flowchart TD
 
 以下 Mega 资产经审计不进入 PT-01 至 PT-12，需要时另行单独决策：
 
-- **`moon/` Web 前端**（pnpm + turbo + Next.js）：非 Rust 资产，代码不移植进 monoengine 仓库；monoengine 的前端与账户系统由 monoui `monoengine` 分支 `apps/next-app` 承载，两个前端体系的功能一致性义务由 PT-12 治理。
-- **`scripts/`**（crates-sync、init_mega、demo、import-buck2-deps、webhook_receiver.py）：运维/开发辅助脚本，按 monoengine 实际需要逐个评估，不做整体移植。
-- **`docker/`**（demo、deployment）：部署形态与 monoengine 的 docker-compose 测试栈是不同层次；部署资产按运维需求单独决策。
-- **`BUCK`、`ci/`、`LICENSE-*`**：构建定义与 CI 形态已按 monoengine 自身体系（Cargo workspace、`.github/workflows/`）建立，不回移植。
+- **`moon/` Web 前端**（pnpm + turbo + Next.js）：非 Rust 资产，代码不移植进 mega2 仓库；mega2 的前端与账户系统由 monoui `mega2` 分支 `apps/next-app` 承载，两个前端体系的功能一致性义务由 PT-12 治理。
+- **`scripts/`**（crates-sync、init_mega、demo、import-buck2-deps、webhook_receiver.py）：运维/开发辅助脚本，按 mega2 实际需要逐个评估，不做整体移植。
+- **`docker/`**（demo、deployment）：部署形态与 mega2 的 docker-compose 测试栈是不同层次；部署资产按运维需求单独决策。
+- **`BUCK`、`ci/`、`LICENSE-*`**：构建定义与 CI 形态已按 mega2 自身体系（Cargo workspace、`.github/workflows/`）建立，不回移植。
 - **本仓 Campsite 风格 chat / Notes**：源系统是 campsite Rails 而非 Mega；产品面已由 [`plan-20260731.md`](plan-20260731.md) 整栈退场（能力留在 website），不占 PT 编号、不再作为本仓在维护基础能力。
 
 ## 日期计划索引
@@ -849,9 +849,9 @@ flowchart TD
 |---|---|---|---|
 | [`plan-20260727.md`](plan-20260727.md) | PT-01 | **已完成**（D 组绿于 v0.1.177） | 最终卡集 IT-01、IT-02、IT-03、IT-04、IT-06、IT-07、IT-08、IT-09、IT-10、IT-11、IT-12（共 11 张任务卡）；IT-05 已关闭为非任务卡（热加载黑盒此前已落地）。交付：测试双层规范、git-cli runner 拓扑、HTTP clone/push 最小矩阵、认证边界与失败路径、CI 执行/触发面、git/git-lfs 客户端 pin、并发 dispatcher 基线、P2 清单收口。不覆盖 SSH/LFS 矩阵（PT-04）、真多进程黑盒（PT-09） |
 | [`plan-20260731.md`](plan-20260731.md) | PT-09 / PT-10 / PT-12（切片） | 已完成 | Website Better Auth 会话接入、`[oauth]` 落地、chat/notes 整栈退场、`website-next` compose 同栈 IT、本仓邮件投递迁出（ADR-WA-08；MN 含 compose/env/CI/文档同步）。不覆盖 PT-12 全量 moon↔next-app 功能对照（仍候选）；Slack/webhook 已由后续版本交付，仍不覆盖 build 触发器/retry/多实例收尾 |
-| [`plan-20260802.md`](plan-20260802.md) | PT-09（切片） | 已完成 | Website 内部产品邮件 API 与 monoengine client 契约，关闭 DEP-06；不覆盖本仓非邮件通知的多实例语义或 PT-12 全量对照 |
+| [`plan-20260802.md`](plan-20260802.md) | PT-09（切片） | 已完成 | Website 内部产品邮件 API 与 mega2 client 契约，关闭 DEP-06；不覆盖本仓非邮件通知的多实例语义或 PT-12 全量对照 |
 | [`plan-20260803.md`](plan-20260803.md) | PT-04 | 已完成 | Git 使用场景测试补全：HTTP `pull`、匿名读关闭、HTTP LFS、cargo-native SSH、Mega 夹具 go/no-go（NO-GO 转 `DEFER-GM-03`）及 CI 归属均已交付（GM-12 发布于 v0.2.11，完成度复审收口于 v0.2.15）；不改 Git protocol 产品实现，补测发现的缺陷转 PT-03。不覆盖 ImportRepo 全命令矩阵、pure SSH LFS、Mega 大夹具移植、shell SSH 广度 CI、missing-repo 探针（`DEFER-GM-01..05`，PT-04 follow-up） |
-| [`plan-20260812.md`](plan-20260812.md) | PT-03 / PT-12（切片） | 已完成 | 用户体系统一：website 认证 × monoengine 授权；Cedar 三态、push 门、merge 面鉴权、只读审计（UN-31/UN-43）等；收口 v0.2.66。不覆盖身份键全量迁移（handoff PT-12） |
+| [`plan-20260812.md`](plan-20260812.md) | PT-03 / PT-12（切片） | 已完成 | 用户体系统一：website 认证 × mega2 授权；Cedar 三态、push 门、merge 面鉴权、只读审计（UN-31/UN-43）等；收口 v0.2.66。不覆盖身份键全量迁移（handoff PT-12） |
 | [`plan-20260820.md`](plan-20260820.md) | PT-11（依赖形态切片） | **已完成（2026-08-21）** | vendored → `libvault` 0.3.0 已落地；VLT-S1 判定 **go**（shadow-unseal），VLT-S2 与 DEFER-VLT-01 未触发；`REL-VLT-RO`（VLT-02→04→FIX-VLT-01→**VLT-05 release**）；UN-31 八 AC 在集成层等价重建，十二条 `un31_` 与四条 `un43_` 全绿；FIX-04/un31 已迁至 `src/contract/vault/integration/` |
 | [`plan-20260903.md`](plan-20260903.md) | PT-03（准备切片） | **已完成** | Monorepo 空仓初始化按 `monorepo.object_format` 生成 SHA-1/SHA-256 object graph；当时 BLAKE3 fail-closed。DEFER-HSH-01/02 的本仓可交付部分由 [`plan-20260907.md`](plan-20260907.md) 关闭；DEFER-HSH-03（原地 conversion / 权威 format metadata）仍延后。 |
 | [`plan-20260907.md`](plan-20260907.md) | PT-03（hash 切片） | **已完成**（B3-06 / v0.8.67） | 钉 git-internal 0.9.0；显式 `HashKind`；blake3 bootstrap + Libra/git-internal wire/pack normal service；Git/LFS 独立 hash-domain（`Git=blake3/LFS=sha256` 与 `Git=sha256/LFS=blake3` 可表达）。不宣称标准 Git BLAKE3 互通（DEFER-B3-01）；不做原地 migration（DEFER-HSH-03）；LFS BLAKE3 业务面 `DEFER-B3-LFS-01`。 |
@@ -874,9 +874,9 @@ flowchart TD
 
 ### 不采纳
 
-- **不把 moon 前端代码列为移植项。** 非 Rust 资产，monoengine 仓库不承载前端代码；monoengine 前端为 monoui `apps/next-app`，两个前端体系的功能一致性由 PT-12 治理（见"不进入"章节与 PT-12）。
-- **不回流 Mega 的旧 notification/email/config 实现。** monoengine 对应模块已是功能超集（`docs/refactoring/{notification,mail,config}.md`），只补缺口不重复移植（原则 8）。
-- **不把"与 Mega 目录结构一致"作为目标。** monoengine 的 contract 归并、config 提升、workspace 拆分、Vault 以 crates.io `libvault` + 集成层为事实源（非 vendored fork、非 Mega `libvault-core` 目录镜像）是已决架构改进，不因结构差异回退（原则 2；依赖形态见 [`plan-20260820.md`](plan-20260820.md)）。
+- **不把 moon 前端代码列为移植项。** 非 Rust 资产，mega2 仓库不承载前端代码；mega2 前端为 monoui `apps/next-app`，两个前端体系的功能一致性由 PT-12 治理（见"不进入"章节与 PT-12）。
+- **不回流 Mega 的旧 notification/email/config 实现。** mega2 对应模块已是功能超集（`docs/refactoring/{notification,mail,config}.md`），只补缺口不重复移植（原则 8）。
+- **不把"与 Mega 目录结构一致"作为目标。** mega2 的 contract 归并、config 提升、workspace 拆分、Vault 以 crates.io `libvault` + 集成层为事实源（非 vendored fork、非 Mega `libvault-core` 目录镜像）是已决架构改进，不因结构差异回退（原则 2；依赖形态见 [`plan-20260820.md`](plan-20260820.md)）。
 
 ### 已实现
 
@@ -884,10 +884,10 @@ flowchart TD
 
 ## 路线图维护
 
-- 每次审计先用 libra 核对 Mega 与 monoengine 的实际 checkout revision 和工作区状态；dirty 或核对失败必须按实际 revision 记录，不把未核对的版本描述为最新。
+- 每次审计先用 libra 核对 Mega 与 mega2 的实际 checkout revision 和工作区状态；dirty 或核对失败必须按实际 revision 记录，不把未核对的版本描述为最新。
 - 每季度、重大架构变更或日期计划完成后，重新读取当前 `src/`、migration、API 路由和相关测试；不得复制上次"当前基础"文字代替复核。
 - PT 编号一经被执行计划或 issue 引用，不重新编号；废弃项使用"已替代"或"不采纳"，并记录替代项、理由和证据。
-- 新候选移植项必须同时给出 Mega revision/path、monoengine 代码/测试缺口、价值、风险、依赖和最小可验证切入点。mega2 原生项（PT-13 起）Mega 列写 `N/A`，其余字段同样强制。
+- 新候选移植项必须同时给出 Mega revision/path、mega2 代码/测试缺口、价值、风险、依赖和最小可验证切入点。mega2 原生项（PT-13 起）Mega 列写 `N/A`，其余字段同样强制。
 - 某项进入日期计划时，仅更新总览状态、链接和剩余长期缺口；详细章节不复制 owner、日期或任务列表。
 - 移植完成只以当前可发布代码、测试、兼容/用户文档和迁移证据为准；本文文字、日期计划完成声明或 checkbox 不是完成证明。
-- Mega 是移植目标与契约基线：接口、数据模型、安全边界和兼容策略默认与 Mega 对齐；任何偏离（含既有架构改进之外的新偏离）必须经 monoengine 自身 RFC/ADR 显式决策并记录。
+- Mega 是移植目标与契约基线：接口、数据模型、安全边界和兼容策略默认与 Mega 对齐；任何偏离（含既有架构改进之外的新偏离）必须经 mega2 自身 RFC/ADR 显式决策并记录。

@@ -54,10 +54,10 @@ mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，推�
 Git HTTP + 对象存储：
 
 ```bash
-docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
 
-docker compose -p monoengine-trunk -f docker-compose-storage-only.yml exec -T monoengine \
-  monoengine --config /etc/monoengine/config.toml service init --yes
+docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+  mega2 --config /etc/mega2/config.toml service init --yes
 ```
 
 HTTP：`http://127.0.0.1:9000/`。默认 push token 见 [`docs/deploy-trunk.md`](docs/deploy-trunk.md)。
@@ -69,7 +69,7 @@ HTTP：`http://127.0.0.1:9000/`。默认 push token 见 [`docs/deploy-trunk.md`]
 ### 停止
 
 ```bash
-docker compose -p monoengine-trunk -f docker-compose-storage-only.yml down -v
+docker compose -p mega2-trunk -f docker-compose-storage-only.yml down -v
 ```
 
 ## 贡献

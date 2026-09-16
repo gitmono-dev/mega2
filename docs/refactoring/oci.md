@@ -1,6 +1,6 @@
 # OCI Distribution（storage-only 容器镜像仓库）
 
-本文是 monoengine **storage-only** 形态下 OCI Distribution `/v2` 面的架构与数据流事实源。产品边界与任务追溯见 [`../plan/plan-20260902.md`](../plan/plan-20260902.md)。对象命名空间契约见 [`orbit.md`](./orbit.md)。进程级 IT 见 [`integration.md`](./integration.md) 的 `integration_oci` 行。部署启用步骤见 [`../deploy-trunk.md`](../deploy-trunk.md) 第 10 节。
+本文是 mega2 **storage-only** 形态下 OCI Distribution `/v2` 面的架构与数据流事实源。产品边界与任务追溯见 [`../plan/plan-20260902.md`](../plan/plan-20260902.md)。对象命名空间契约见 [`orbit.md`](./orbit.md)。进程级 IT 见 [`integration.md`](./integration.md) 的 `integration_oci` 行。部署启用步骤见 [`../deploy-trunk.md`](../deploy-trunk.md) 第 10 节。
 
 > **挂载门（ADR-DR-01）：** `/v2` 仅在 `git.storage_only()`（显式 `git.push_auth`）且 `[oci].enabled=true` 时注册。review 形态或不显式启用时整面不存在（裸 404）。`enabled=true` 且非 storage-only → 启动拒绝。
 
@@ -70,7 +70,7 @@ OpenAPI 无法为 catch-all 生成细粒度路径；运行时聚合说明由 DR-
 |---|---|
 | `Authorization: Bearer <token>` | 直取 token |
 | `Authorization: Basic …` | 取 **password** 为 token（username 任意，仅日志） |
-| 401 挑战 | `WWW-Authenticate: Basic realm="monoengine registry", Bearer realm="monoengine registry"` |
+| 401 挑战 | `WWW-Authenticate: Basic realm="mega2 registry", Bearer realm="mega2 registry"` |
 
 | 操作 | `anonymous_access=true` | `anonymous_access=false` | `push_auth=none` | `push_auth=token` |
 |---|---|---|---|---|
@@ -155,7 +155,7 @@ DELETE /uploads/{uuid}        → 按 seq 删分片 + 删行 → 204
 
 **相对 distribution 的主要差异：**
 
-| 主题 | distribution | monoengine |
+| 主题 | distribution | mega2 |
 |---|---|---|
 | 元数据 | 存储驱动 link 文件 | Postgres 4 表 + 对象存储字节 |
 | 认证 | 可配 token 服务 / htpasswd 等 | 静态 Basic/Bearer，复用 `[[git.push_tokens]]` |
@@ -165,7 +165,7 @@ DELETE /uploads/{uuid}        → 按 seq 删分片 + 删行 → 204
 | digest | 以 sha256 为主 | **仅** `sha256:<hex64>` |
 | 挂载条件 | 独立 registry 进程 | 仅 storage-only + `[oci].enabled` |
 
-**相对 rk8s：** 派发器形状对齐；存储与认证落到 monoengine 既有 Postgres / orbit / push token，不引入 rk8s 的独立 registry 运行时。
+**相对 rk8s：** 派发器形状对齐；存储与认证落到 mega2 既有 Postgres / orbit / push token，不引入 rk8s 的独立 registry 运行时。
 
 ## 边界与非目标
 

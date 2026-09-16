@@ -54,10 +54,10 @@ The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) s
 Git HTTP + object storage:
 
 ```bash
-docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
 
-docker compose -p monoengine-trunk -f docker-compose-storage-only.yml exec -T monoengine \
-  monoengine --config /etc/monoengine/config.toml service init --yes
+docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+  mega2 --config /etc/mega2/config.toml service init --yes
 ```
 
 HTTP: `http://127.0.0.1:9000/`. Default push token: [`docs/deploy-trunk.md`](docs/deploy-trunk.md).
@@ -69,7 +69,7 @@ For local development and tests, see [`docs/development.md`](docs/development.md
 ### Stop
 
 ```bash
-docker compose -p monoengine-trunk -f docker-compose-storage-only.yml down -v
+docker compose -p mega2-trunk -f docker-compose-storage-only.yml down -v
 ```
 
 ## Contributing

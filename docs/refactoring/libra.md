@@ -1,6 +1,6 @@
 # Libra 協作：Agent 變更證據與可信交付重構需求
 
-本文定義 monoengine 為配合 Libra，將 Agent 的意圖、可觀測執行紀錄、候選修改與驗證結果接入 CL／主幹交付所需的重構。
+本文定義 mega2 為配合 Libra，將 Agent 的意圖、可觀測執行紀錄、候選修改與驗證結果接入 CL／主幹交付所需的重構。
 
 > **狀態**：重構需求，尚未實作；文件 review 的 PASS 僅代表需求可作為後續設計與實作的輸入，不代表功能、效能或安全驗收通過。
 > **治理**：遵循 [general.md](general.md) 的文件結構；本次交付依使用者要求僅編寫及 review 需求，不改程式碼、不 bump 版本、不提交或部署。
@@ -10,7 +10,7 @@
 
 目標是讓團隊能回答「誰因何需求修改了什麼、在哪個精確版本上得到哪些驗證、由誰批准、最後進入哪個主幹版本」，並把有效歷史回饋給後續 Agent 任務。產品最小閉環是跨服務修改的證據審查與合併把關。
 
-monoengine 的責任是中央接收、身分與授權、持久化、關係索引、證據有效性、批准及 landing；Libra 的責任是本機工作區、Agent adapter、捕獲、脫敏、checkpoint 與上傳。megaui 消費 monoengine API 呈現 diff、證據及批准；本文只定義它所需的後端契約。
+mega2 的責任是中央接收、身分與授權、持久化、關係索引、證據有效性、批准及 landing；Libra 的責任是本機工作區、Agent adapter、捕獲、脫敏、checkpoint 與上傳。megaui 消費 mega2 API 呈現 diff、證據及批准；本文只定義它所需的後端契約。
 
 下列內容不在本次重構的核心交付範圍：
 
@@ -24,7 +24,7 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 
 ## 2. 事實校準（2026-09-06）
 
-依據當前工作區靜態源碼：monoengine `Cargo.toml:3` 為 `0.5.3`，Libra `Cargo.toml:3` 為 `0.22.15`；未執行整合或效能測試。程式碼錨點以路徑及符號為主，行號只描述本次快照。
+依據當前工作區靜態源碼：mega2 `Cargo.toml:3` 為 `0.5.3`，Libra `Cargo.toml:3` 為 `0.22.15`；未執行整合或效能測試。程式碼錨點以路徑及符號為主，行號只描述本次快照。
 
 | 能力／組件 | 實現狀態 | 事實、錨點與限制 |
 |---|---|---|
@@ -41,7 +41,7 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 
 校正既有分析時需注意：
 
-1. monoengine 已有 AI artifacts 與 bot 基礎，不能將其寫成全部從零建置。
+1. mega2 已有 AI artifacts 與 bot 基礎，不能將其寫成全部從零建置。
 2. `update_branch` 的空 diff 分支已將 `(from,to)` 一併移到 target head（`mono_api_service.rs:3353`）；不得沿用舊 [delta.md](../gap/delta.md) 的 no-op 回退推論作為尚未修復的現狀。
 3. 根寫入的 FIFO、鎖、CAS 與 storage-only trunk 行為在 `trunk-push.md` 是需求，不是已交付能力。本文不以其已實現為前提。
 4. 兩邊 `Cargo.lock` 的 `git-internal` 分別是 `0.8.7`／`0.8.6`；不同版本不直接證明不相容，仍需 wire fixtures 驗證。
@@ -76,7 +76,7 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 
 以下為邏輯模型，不要求每一行都新增一張表；實作應復用 `callisto`／`jupiter`，避免複製 Libra runtime DB。
 
-| 邏輯實體 | 穩定識別及必要資料 | monoengine 責任 |
+| 邏輯實體 | 穩定識別及必要資料 | mega2 責任 |
 |---|---|---|
 | RepositoryIdentity | 伺服器發行的 repo ID、deployment／tenant scope、外部 provider repo ID（可選） | remote URL 只是可變別名，不作授權或租戶主鍵 |
 | Change | repo ID＋change ID、owner principal（含型別與穩定 ID）、created-by principal、可選 delegator／grant、可選 intent／task ID | 一個工程變更；可有多個 run、多個 CL revision；owner 預設為經認證的建立主體，委託者不自動成為 owner |
@@ -181,7 +181,7 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 - 透過 adapter 消費 Nx／Bazel／Buck 等既有輸出的依賴／測試圖，固定圖版本、來源 commit、生成器及完整性；不將 Libra 手工 deps 圖當成完整真相。
 - 依賴圖缺失、不支援語言或輸入閉包不完整時，required 模式要求保守測試集合或授權人工處置，不能把空圖當成無影響。最小閉環可使用管理者配置的固定必需測試集合。
 - 外部 GitHub／GitLab 模式只提供證據與 checks；以 provider installation＋immutable repo ID＋PR/head SHA 關聯，verify webhook、deduplicate delivery、處理亂序並回查當前 head。對外寫 check 需客戶明確安裝授权。
-- 外部合併是否受控，取決於 provider branch protection／required check 配置，必須標示已驗證／未驗證 enforcement；沒有權限確認時只能聲稱觀測。不得假稱 monoengine 對外部 SCM 具有原子落地主權。
+- 外部合併是否受控，取決於 provider branch protection／required check 配置，必須標示已驗證／未驗證 enforcement；沒有權限確認時只能聲稱觀測。不得假稱 mega2 對外部 SCM 具有原子落地主權。
 - 不能以先完成多 provider adapter、通用向量搜尋或全量工作區 provisioning 阻塞原生 CL 的最小閉環。
 
 **驗收**：AC-LB-14／15；可選 adapter 未交付時 discovery 明示 unsupported。
@@ -288,6 +288,6 @@ monoengine 的責任是中央接收、身分與授權、持久化、關係索引
 
 ## 12. 小結與預期收益
 
-本重構把 monoengine 的既有 artifacts、CL、授權與主幹寫入接成 Agent 變更的中央證據鏈。Libra 提供開發過程的來源資料，monoengine 確保資料與特定候選版本、批准及 landing 正確關聯。實作先完成可信攝取、任務隔離與原生合併把關，再擴展歷史檢索及外部 SCM。根寫入、身分與資料治理沿用既有專題約束，避免形成互相競爭的事實源。
+本重構把 mega2 的既有 artifacts、CL、授權與主幹寫入接成 Agent 變更的中央證據鏈。Libra 提供開發過程的來源資料，mega2 確保資料與特定候選版本、批准及 landing 正確關聯。實作先完成可信攝取、任務隔離與原生合併把關，再擴展歷史檢索及外部 SCM。根寫入、身分與資料治理沿用既有專題約束，避免形成互相競爭的事實源。
 
 可觀測收益：評審人工時間、一次驗證通過率、stale 檢查攔截數、合併後返工、從 landed commit 還原來源的成功率與耗時。先以同類型／難度任務建立基準，再觀測導入後差異；不得把所有變化直接歸因於本系統。完成標準是團隊在真實變更中反覆使用這條流程，不是保存更多 token。

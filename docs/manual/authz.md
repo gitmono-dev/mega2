@@ -1,8 +1,8 @@
 # 认证与权限管理
 
-本文面向运维与平台所有者，说明 **website 负责认证、monoengine 负责授权** 的边界与运维口径。开发契约细节见 [`../refactoring/website-auth.md`](../refactoring/website-auth.md) 与 [`../refactoring/contract.md`](../refactoring/contract.md)；Kill Switch 脚本实现细节见 [`../refactoring/integration.md`](../refactoring/integration.md)。
+本文面向运维与平台所有者，说明 **website 负责认证、mega2 负责授权** 的边界与运维口径。开发契约细节见 [`../refactoring/website-auth.md`](../refactoring/website-auth.md) 与 [`../refactoring/contract.md`](../refactoring/contract.md)；Kill Switch 脚本实现细节见 [`../refactoring/integration.md`](../refactoring/integration.md)。
 
-术语约定：**认证** = website Better Auth 会话与 Mono access token / Bot / SSH 公钥身份；**授权** = monoengine Cedar 三态（`off` / `shadow` / `enforce`）对 HTTP guard 与 Git push 的判定。
+术语约定：**认证** = website Better Auth 会话与 Mono access token / Bot / SSH 公钥身份；**授权** = mega2 Cedar 三态（`off` / `shadow` / `enforce`）对 HTTP guard 与 Git push 的判定。
 
 本文中 **website** 是角色名（认证面），其实现仓库为 sibling `../megaui` 的 `apps/web`；Compose 服务名 `website-next`、隔离账户库名 `website` 与 `MEGA_OAUTH__WEBSITE_*` 配置键均未改名。
 
@@ -10,21 +10,21 @@
 
 ## 认证路径
 
-浏览器身份**只**信任 website Better Auth。monoengine **不签发** session cookie，也**不**直连读取 website 的 user/session 表。与 [`../refactoring/website-auth.md`](../refactoring/website-auth.md) §1 一致：
+浏览器身份**只**信任 website Better Auth。mega2 **不签发** session cookie，也**不**直连读取 website 的 user/session 表。与 [`../refactoring/website-auth.md`](../refactoring/website-auth.md) §1 一致：
 
 ```text
 Browser
   │ Cookie: better-auth.session_token
   │     或  __Secure-better-auth.session_token
   ▼
-monoengine HTTP (/api/v1/*)
+mega2 HTTP (/api/v1/*)
   │ SessionUser extractor → WebsiteSessionStore::load_user
   │ GET {oauth.website_api_base_url}/api/auth/get-session
   ▼
 映射 LoginUser → 注入请求
 ```
 
-失败一律 HTTP 401（`Login first`），禁止回退到硬编码 admin stub。生产路径禁止旁路 get-session、恢复双后端、或在 monoengine 签发 JWT 冒充会话。
+失败一律 HTTP 401（`Login first`），禁止回退到硬编码 admin stub。生产路径禁止旁路 get-session、恢复双后端、或在 mega2 签发 JWT 冒充会话。
 
 Cookie / CORS 要点（与 website-auth.md §1 一致）：默认按优先级尝试 `better-auth.session_token` 与 `__Secure-better-auth.session_token`；须转发完整 `name=value`；`oauth.allowed_cors_origins` 须含前端 origin 且带 credentials；日志不得打印完整 cookie / token。
 
@@ -38,7 +38,7 @@ Cookie / CORS 要点（与 website-auth.md §1 一致）：默认按优先级尝
 | Git HTTP / LFS | Bearer 或 Basic password = token | 保留 |
 | SSH | 公钥 → `ssh_keys.username` | 保留 |
 
-字段映射（website-auth.md §2）：website `name` → monoengine `LoginUser.username`（Cedar principal / Git actor）；`id` → `website_user_id`；`role` **不**进入结构体——管理权以 monoengine ACL / Cedar 为准。
+字段映射（website-auth.md §2）：website `name` → mega2 `LoginUser.username`（Cedar principal / Git actor）；`id` → `website_user_id`；`role` **不**进入结构体——管理权以 mega2 ACL / Cedar 为准。
 
 ---
 
@@ -132,15 +132,15 @@ bash scripts/authz_kill_switch.sh --branch systemd|compose|file --restart -- <�
 | 系统 | 职责 |
 |---|---|
 | website | 登录/注册、session cookie、产品面 `role=admin` |
-| monoengine | Cedar ACL、HTTP guard、Git push 授权、admin 组名单 |
+| mega2 | Cedar ACL、HTTP guard、Git push 授权、admin 组名单 |
 
-website `role=admin` 与 monoengine `UserGroup::"admin"` 是**独立系统**。两边都要授予的用户必须**双写**；自动同步未实现（DEP-02 / DEFER-UN-03）。推荐运维流程：变更 admin 时先更新 config `monorepo.admin` / ACL，再同步 website 管理角色（或反之），并在变更窗口验证两侧；详见 DEP-02 指向与 contract.md「admin 事实源收敛」节。
+website `role=admin` 与 mega2 `UserGroup::"admin"` 是**独立系统**。两边都要授予的用户必须**双写**；自动同步未实现（DEP-02 / DEFER-UN-03）。推荐运维流程：变更 admin 时先更新 config `monorepo.admin` / ACL，再同步 website 管理角色（或反之），并在变更窗口验证两侧；详见 DEP-02 指向与 contract.md「admin 事实源收敛」节。
 
 ---
 
 ## 身份键现状
 
-现行身份键是 website **展示名** `name` → monoengine `username`（非稳定唯一 ID）。展示名碰撞可能导致 actor / Cedar principal 混同；唯一性由 website 侧运营约束承载（website-auth.md §2）。
+现行身份键是 website **展示名** `name` → mega2 `username`（非稳定唯一 ID）。展示名碰撞可能导致 actor / Cedar principal 混同；唯一性由 website 侧运营约束承载（website-auth.md §2）。
 
 身份键向 website 唯一 `username` 的迁移已按 handoff **移交** `plan-long.md` PT-12（DEP-04 outgoing，实际移交日期 **2026-08-17**；ADR-UN-04 Withdrawn；承接强制约束见 DEFER-UN-04）。本计划授权执行继续在现行 `name` 键上工作；GAP-05 关闭以 PT-12 承接计划为准。
 
@@ -155,7 +155,7 @@ website `role=admin` 与 monoengine `UserGroup::"admin"` 是**独立系统**。�
 | `KILL_SWITCH_UNIT` 或 `KILL_SWITCH_COMPOSE` + `KILL_SWITCH_SERVICE` | systemd unit，或 compose 文件与服务名 |
 | `KILL_SWITCH_ENV_FILE` | EnvironmentFile 路径（systemd 分支） |
 | `KILL_SWITCH_CONFIG` | 实际加载的 config.toml 路径（file 分支） |
-| `KILL_SWITCH_BIN` | 已发布 `monoengine` 二进制（fsync / 来源证明） |
+| `KILL_SWITCH_BIN` | 已发布 `mega2` 二进制（fsync / 来源证明） |
 | `MEGA_PROFILE` | 有效 profile |
 | `KILL_SWITCH_URLS` | 探测 URL 清单（空格分隔；须同进程） |
 | `KILL_SWITCH_LOG_DIR` | 日志目录（通常 `MEGA_CACHE_DIR`） |

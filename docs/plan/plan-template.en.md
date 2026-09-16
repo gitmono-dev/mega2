@@ -6,7 +6,7 @@ The Chinese file remains the in-repo operational original. If the two texts ever
 
 **Template version:** `v2.1` (effective 2026-09-16). After every version bump, create a matching `v<version>` tag and publish a GitHub Release with a human-written release note. The rest of the structure is unchanged from `v2`.
 
-Product name is **mega2**. The Cargo package and binaries are still `monoengine` / `monoengine_core`. mega2 inherits from the same organization's [Mega](https://github.com/web3infra-foundation/mega) project. Mega is the transplant source and contract baseline, not a competitor.
+Product name is **mega2**. The Cargo package and binaries are `mega2` / `mega2_core`. mega2 inherits from the same organization's [Mega](https://github.com/web3infra-foundation/mega) project. Mega is the transplant source and contract baseline, not a competitor.
 
 ### Version and migration policy
 
@@ -94,13 +94,13 @@ This file only plans work. It does not claim the work is done. At execution time
 |---|---|---|
 | Code entry | `<src/...>` | `<file:line>` |
 | Data / state | `<Postgres table / redis key / object namespace>` | `<file:line>` |
-| CLI | `<monoengine ...>` | `<src/commands/mod.rs:line (builtin / builtin_exec / load_mode)>` |
+| CLI | `<mega2 ...>` | `<src/commands/mod.rs:line (builtin / builtin_exec / load_mode)>` |
 | HTTP API | `<METHOD /api/v1/...>` | `<src/api/router/...:line>` |
 | Config | `[section].key` | `<config/config.toml:line + src/config model:line>` |
 | Errors | `<MegaError::...>` | `<src/common/errors/mod.rs:line>` |
 | Migration | `<m<YYYYMMDD>_<HHMMSS>_<slug>>` | `<migrations() registration line>` |
 | Docs | `<docs/...>` | `<file:line>` |
-| Tests | `<-p monoengine --lib '<mod::tests>' or --test <target>>` | `<file:line>` |
+| Tests | `<-p mega2 --lib '<mod::tests>' or --test <target>>` | `<file:line>` |
 | Workspace prelude | `<.env.test present / test stack up (Postgres 15432, Redis 16379, …)>` | `<.env.test.example / docker-compose.test.yml:line>` |
 | External reference | `<Mega repo@sha>` | `<path + check date>` |
 
@@ -215,20 +215,20 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
    | Surface changed | Focused gate |
    |---|---|
-   | Pure lib unit logic in `monoengine_core` (`#[cfg(test)]` under `src/**`) | `source .env.test && cargo test -p monoengine --lib '<mod::path::tests>'` |
+   | Pure lib unit logic in `mega2_core` (`#[cfg(test)]` under `src/**`) | `source .env.test && cargo test -p mega2 --lib '<mod::path::tests>'` |
    | Lib logic that needs real Postgres | Start the test stack, then the same `--lib` command; tests must use `test_db_connection` + `apply_migrations` |
-   | Process / CLI black-box (`tests/**`) | `source .env.test && cargo test -p monoengine --test <target> -- --test-threads=1 [<filter>]` (`--test <target>` is required) |
-   | Bin composition root (`src/main.rs`, `src/bin/migrate_local_to_s3.rs`) | Black-box `--test <target>` via `CARGO_BIN_EXE_monoengine` **plus** `cargo clippy -p monoengine --all-targets -- -D warnings` |
-   | CLI parse and registration (`src/cli.rs`, `src/commands/**`) | `cargo test -p monoengine --lib 'cli::tests'` + `cargo test -p monoengine --lib 'commands::'`; new/renamed subcommands assert `builtin()` / `builtin_exec()` / `load_mode()` |
-   | HTTP / OpenAPI (`src/api/**`, `src/server/http_server.rs`) | `cargo test -p monoengine --lib 'api::'` + sanitized `/api/openapi.json` from a running server |
+   | Process / CLI black-box (`tests/**`) | `source .env.test && cargo test -p mega2 --test <target> -- --test-threads=1 [<filter>]` (`--test <target>` is required) |
+   | Bin composition root (`src/main.rs`, `src/bin/migrate_local_to_s3.rs`) | Black-box `--test <target>` via `CARGO_BIN_EXE_mega2` **plus** `cargo clippy -p mega2 --all-targets -- -D warnings` |
+   | CLI parse and registration (`src/cli.rs`, `src/commands/**`) | `cargo test -p mega2 --lib 'cli::tests'` + `cargo test -p mega2 --lib 'commands::'`; new/renamed subcommands assert `builtin()` / `builtin_exec()` / `load_mode()` |
+   | HTTP / OpenAPI (`src/api/**`, `src/server/http_server.rs`) | `cargo test -p mega2 --lib 'api::'` + sanitized `/api/openapi.json` from a running server |
    | `src/callisto/**`, `src/jupiter/migration/**` | `migrations()` registration assert + `apply_migrations(&db, true)`; empty `down` ⇒ `Rollback mode = forward-only` |
-   | `config/config.toml`, `src/config/**` | `cargo run -p monoengine -- --config config/config.toml config validate`, plus init / `--deny-warnings` / profile / bad-config / no-secret-leak as the change requires |
-   | Git protocol / LFS | Local equivalent of `scripts/git_protocol_smoke.sh`; read current `.github/workflows/git-protocol-smoke.yml` for prelude. Default `config.toml` points at 5432/6379, not the test stack — `source .env.test` or export `MEGA_DATABASE__DB_URL` / `MEGA_REDIS__URL` / `MEGA_BASE_DIR`. Push / tag / LFS need a seeded access token in the URL. LFS evidence requires `MONOENGINE_GIT_SMOKE_PUSH=1 MONOENGINE_GIT_SMOKE_LFS=1` and the line `PASS: HTTP LFS push and clone` |
+   | `config/config.toml`, `src/config/**` | `cargo run -p mega2 -- --config config/config.toml config validate`, plus init / `--deny-warnings` / profile / bad-config / no-secret-leak as the change requires |
+   | Git protocol / LFS | Local equivalent of `scripts/git_protocol_smoke.sh`; read current `.github/workflows/git-protocol-smoke.yml` for prelude. Default `config.toml` points at 5432/6379, not the test stack — `source .env.test` or export `MEGA_DATABASE__DB_URL` / `MEGA_REDIS__URL` / `MEGA_BASE_DIR`. Push / tag / LFS need a seeded access token in the URL. LFS evidence requires `MEGA2_GIT_SMOKE_PUSH=1 MEGA2_GIT_SMOKE_LFS=1` and the line `PASS: HTTP LFS push and clone` |
    | Cedar (`src/contract/policy/**`) | Matching tests + an explicit assert of whether this card changed permit-all / empty `EntityStore` |
    | Repo config and CI (`Cargo.toml` non-version lines, `rustfmt.toml`, compose, `scripts/**`, `.github/workflows/**`) | Local equivalent of the affected job, extracted from the workflow file; non-local bits go to D |
    | Docs / index only | No A gate; B structure-and-link gate only |
 
-   This repo is a **single package** `monoengine` (lib `monoengine_core`, bins `monoengine` and `migrate_local_to_s3`). `-p monoengine` is equivalent to omitting it today; still write it so commands stay portable. Focused gates must use `--lib` or `--test <target>`.
+   This repo is a **single package** `mega2` (lib `mega2_core`, bins `mega2` and `migrate_local_to_s3`). `-p mega2` is equivalent to omitting it today; still write it so commands stay portable. Focused gates must use `--lib` or `--test <target>`.
 
    **B — type gates:**
 
@@ -239,7 +239,7 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
    | `spike` | Artifact exists, go/no-go decided, follow-up cards registered; allowlist diff: every change is inside `Deliverables`; zero production-surface edits |
    | `release` | Aggregate guards for new tests this group introduced + release note / compatibility evidence |
 
-   **C — release close-out** (order is mandatory), run by cards that push: ① ER-08 version-face parity precheck → ② bump `Cargo.toml` `version` per `Version increment` and let the toolchain refresh `Cargo.lock` → ③ three `AGENTS.md` gates on the **bumped** tree → ④ `cargo build` and `cargo build --tests` clean; add `cargo build --release -p monoengine` if you need a binary → ⑤ `libra add <relevant paths>` and `libra commit -m` → ⑥ `libra push origin main` and confirm the remote ref moved → ⑦ for every actual version bump, create an annotated matching tag on that commit with `libra tag -m "v<version>: <summary>" v<version>` and push it with `libra push origin refs/tags/v<version>` → ⑧ analyze the final diff, write a standard release note manually, and run `gh release create v<version> -R gitmono-dev/monoengine --title "v<version>" --notes-file <release-notes-file>`. The release note must include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations. Do not use `--generate-notes` or any other generated content. Cards with `Version increment=N/A` do not create tags or releases.
+   **C — release close-out** (order is mandatory), run by cards that push: ① ER-08 version-face parity precheck → ② bump `Cargo.toml` `version` per `Version increment` and let the toolchain refresh `Cargo.lock` → ③ three `AGENTS.md` gates on the **bumped** tree → ④ `cargo build` and `cargo build --tests` clean; add `cargo build --release -p mega2` if you need a binary → ⑤ `libra add <relevant paths>` and `libra commit -m` → ⑥ `libra push origin main` and confirm the remote ref moved → ⑦ for every actual version bump, create an annotated matching tag on that commit with `libra tag -m "v<version>: <summary>" v<version>` and push it with `libra push origin refs/tags/v<version>` → ⑧ analyze the final diff, write a standard release note manually, and run `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`. The release note must include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations. Do not use `--generate-notes` or any other generated content. Cards with `Version increment=N/A` do not create tags or releases.
 
    **C / D boundary:** C ends at a verified branch push. Everything a remote pipeline produces after that is D. Each D item records workflow file, job name, trigger event and ref, whether `paths:` matches this card, and the predicate.
 
@@ -251,13 +251,13 @@ A task is not complete if any applicable item fails. Cite IDs, not ordinals.
 
 7. **ER-07 Commit workflow:** Follow `AGENTS.md` and the task-card release rule. Stage related paths only, commit with a scoped message, push the agreed branch. Do not `--force`. If local and remote have diverged, stop and report. After commit, verify the signature / sign-off convention this repo actually uses (do not invent a second convention in the card).
 
-8. **ER-08 Version and release:** The version source of truth is root `Cargo.toml` `version`. After the single-package inline there is **one** version face. On start day, re-count version-face files (`rg -n '^version' Cargo.toml` and `rg -l '^\[package\]' --glob '**/Cargo.toml'`). `Version increment`: `patch` (default) | `minor` | `major` | `N/A`. Breaking public-surface or schema/protocol changes must be `minor` or `major`. After every actual version bump, create and push the matching annotated `v<version>` tag and create a matching GitHub Release with a manually written standard release note. The note must be based on the final diff and include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations; `--generate-notes` is prohibited. Family children and `docs` / `audit` / `spike` / `handoff` cards are `N/A` and do not create tags or releases. Cargo commands use `-p monoengine`.
+8. **ER-08 Version and release:** The version source of truth is root `Cargo.toml` `version`. After the single-package inline there is **one** version face. On start day, re-count version-face files (`rg -n '^version' Cargo.toml` and `rg -l '^\[package\]' --glob '**/Cargo.toml'`). `Version increment`: `patch` (default) | `minor` | `major` | `N/A`. Breaking public-surface or schema/protocol changes must be `minor` or `major`. After every actual version bump, create and push the matching annotated `v<version>` tag and create a matching GitHub Release with a manually written standard release note. The note must be based on the final diff and include Highlights, user-visible changes, compatibility / configuration / migration guidance (`N/A` when none), verification results, and known limitations; `--generate-notes` is prohibited. Family children and `docs` / `audit` / `spike` / `handoff` cards are `N/A` and do not create tags or releases. Cargo commands use `-p mega2`.
 
 9. **ER-09 Push failure:** Non-fast-forward: pull/merge, re-accept, then push. Auth, permission, network, or server failures are not blind-retried; record the reason and wait for the next fix/release window.
 
 10. **ER-10 Internal service errors (bounded retry):** Redis, Postgres, object storage, SMTP, and AI-provider errors do not mark a task done. Deterministic 4xx / schema / compile / config defects are not retried. Fix in-card only if the fix stays on this card's axis **and** re-running ER-03 still passes; otherwise open `FIX-*`, add `FIX-* -> current card`, and set the current card `blocked`. Transient errors retry with exponential backoff (default ≤ 5 attempts, ≤ 30 minutes total). After budget, set `blocked` with sanitized evidence. Release pushes do not auto-retry (ER-09).
 
-11. **ER-11 Evidence hygiene:** Acceptance evidence must not store secrets, API keys, tokens, PII, unsanitized transcripts, private absolute paths, or raw tool payloads. Public test passwords (`monoengine_test_password`, `smtp-test-password`, RustFS `rustfs` / `rustfs_secret`) are still redacted in records.
+11. **ER-11 Evidence hygiene:** Acceptance evidence must not store secrets, API keys, tokens, PII, unsanitized transcripts, private absolute paths, or raw tool payloads. Public test passwords (`mega2_test_password`, `smtp-test-password`, RustFS `rustfs` / `rustfs_secret`) are still redacted in records.
 
 12. **ER-12 Concurrency vs serial release:** Concurrent work is allowed only in implementation and review, and only when `Implementation write set`s are disjoint (G-10). **Release is always serial and has one publisher:** bump, build, commit, push, and D tracking. Only one card may be in "bumped but not yet pushed" at a time. Do not invent an unverified document lease as a repo lock.
 
@@ -510,13 +510,13 @@ Mapping: `type`→G-11, `axis`/`recovery`→G-01, `complete`→G-02, `AC`/`VER`�
 
 | Class | Must cover | Target / command |
 |---|---|---|
-| Unit | `<pure logic, config parser, error map>` | `<cargo test -p monoengine --lib '<mod::tests>'>` |
+| Unit | `<pure logic, config parser, error map>` | `<cargo test -p mega2 --lib '<mod::tests>'>` |
 | Integration (DB) | `<real Postgres + storage/migration>` | `<--lib with test_db_connection + apply_migrations>` |
-| Integration (process) | `<real binary, service start, config parse>` | `<cargo test -p monoengine --test <target> -- --test-threads=1>` |
-| CLI | `<parse, three registrations, exit codes, output>` | `<cargo test -p monoengine --lib 'cli::tests'>` |
-| HTTP API | `<routes, status, JSON schema, auth>` | `<cargo test -p monoengine --lib 'api::...'>` |
+| Integration (process) | `<real binary, service start, config parse>` | `<cargo test -p mega2 --test <target> -- --test-threads=1>` |
+| CLI | `<parse, three registrations, exit codes, output>` | `<cargo test -p mega2 --lib 'cli::tests'>` |
+| HTTP API | `<routes, status, JSON schema, auth>` | `<cargo test -p mega2 --lib 'api::...'>` |
 | Migration | `<up/down, old/new schema, data move>` | `<migration tests>` |
-| Config | `<validate / init / profile / secret leak>` | `<cargo run -p monoengine -- ... config validate ...>` |
+| Config | `<validate / init / profile / secret leak>` | `<cargo run -p mega2 -- ... config validate ...>` |
 | Git protocol | `<clone/fetch/push/shallow/v2/LFS>` | `<scripts/git_protocol_smoke.sh local equivalent>` |
 | Security | `<authn, Cedar, secrets, path traversal, redaction>` | `<cargo test ...>` |
 | Performance | `<size and budget>` | `<criterion / wall-clock>` |
@@ -526,7 +526,7 @@ Mapping: `type`→G-11, `axis`/`recovery`→G-01, `complete`→G-02, `AC`/`VER`�
 
 | Task | Source / evidence | mega2 landing | Docs / compatibility | Named tests |
 |---|---|---|---|---|
-| `<ID>` | `<file:line / issue / repo@sha>` | `<src/callisto / src/jupiter / src/api / …>` | `<docs/..., config/config.toml, runtime OpenAPI>` | `<-p monoengine --lib or --test>` |
+| `<ID>` | `<file:line / issue / repo@sha>` | `<src/callisto / src/jupiter / src/api / …>` | `<docs/..., config/config.toml, runtime OpenAPI>` | `<-p mega2 --lib or --test>` |
 
 ## Milestone acceptance and rollback
 

@@ -1,6 +1,6 @@
-# Monoengine 改进计划文档索引
+# Mega2 改进计划文档索引
 
-本目录包含 monoengine 的改进计划文档体系。这些文档构成一个相互联系的系统，描述了 contract 边界、配置管理、敏感凭据存储、邮件通知和用户通知的完整改进方案。
+本目录包含 mega2 的改进计划文档体系。这些文档构成一个相互联系的系统，描述了 contract 边界、配置管理、敏感凭据存储、邮件通知和用户通知的完整改进方案。
 
 > **通用治理规范**：所有改进计划文档必须遵循 **`general.md`** 中定义的共同结构、约束、版本管理和评审标准。在执行改进时，请首先查阅 `general.md` 了解共同需求。
 
@@ -53,7 +53,7 @@
 - **阶段范围**：A - J（共 10 个阶段）
 
 ### 3. **refactoring/mail.md** — 本仓 SMTP 邮件模块（已废止）
-- **状态**：废止。monoengine 不再实现、配置或运行 SMTP 邮件投递（ADR-WA-08）。
+- **状态**：废止。mega2 不再实现、配置或运行 SMTP 邮件投递（ADR-WA-08）。
 - **现行事实源**：[`website-mail.md`](./website-mail.md)（产品邮件经 website 内部 API）；本文件仅保留废止说明与历史索引。
 - **不要**：把 `mail.md` 当作活的 SecretRef / SmtpMailer / Mailpit 设计文档。
 
@@ -75,13 +75,13 @@
   - 2026-08-22 的「orbit 两个 crate 并入 workspace（方案 B）」中间态
 - **关键前置**：无（结构性依赖治理）；与 config（ObjectStorageConfig 来源）、vault（启动顺序）协同
 - **阶段范围**：0 - 3（共 4 个阶段，均属历史正文）
-- **状态（2026-08-27 核对）**：⛔️ **双 package 拆分已被 `plan-20260824` 的单体内联撤销**。当前是**单 package `monoengine`**（lib target `monoengine_core` + `monoengine` / `migrate_local_to_s3` 两个 bin target）：**无** `bin/` crate、**无** `crates/orbit*` workspace 成员、**无** `orbit-api` path 依赖、**无** `ObjectStorageProvider` 进程级注册表。本条目旧文记录的「✅ 已拆为 `monoengine-core`（lib，仅 `orbit-api`）+ `monoengine`（bin）」及 `cargo tree -p monoengine-core` 验收口径、「是否发布 `orbit-api`」开放项均已失效，只作历史阅读
+- **状态（2026-08-27 核对）**：⛔️ **双 package 拆分已被 `plan-20260824` 的单体内联撤销**。当前是**单 package `mega2`**（lib target `mega2_core` + `mega2` / `migrate_local_to_s3` 两个 bin target）：**无** `bin/` crate、**无** `crates/orbit*` workspace 成员、**无** `orbit-api` path 依赖、**无** `ObjectStorageProvider` 进程级注册表。本条目旧文记录的「✅ 已拆为 `mega2-core`（lib，仅 `orbit-api`）+ `mega2`（bin）」及 `cargo tree -p mega2-core` 验收口径、「是否发布 `orbit-api`」开放项均已失效，只作历史阅读
 
 ### 5. **refactoring/integration.md** — 集成测试策略与执行方案
 
 - **目标**：基于 Docker Compose 的集成测试框架，验证配置、Vault、会话、通知编排与 git-cli 等端到端路径
 - **核心内容**：
-  - Docker Compose 测试栈（PostgreSQL、Redis、mailpit、rustfs、git-cli、`website-next`；`-p monoengine-it`）
+  - Docker Compose 测试栈（PostgreSQL、Redis、mailpit、rustfs、git-cli、`website-next`；`-p mega2-it`）
   - 黑盒 target：`integration_vault` / `integration_website_auth` / `integration_git_cli`
   - **mailpit 消费方 = website IT**；本仓**无** SmtpMailer→Mailpit 成功门
   - 覆盖矩阵与 CI（`config-validation.yml` 等）
@@ -106,7 +106,7 @@
 ### 5b. **refactoring/libra.md** — Libra 协作与 Agent 变更证据
 
 - **状态**：重构需求，尚未实现；文档 review 不代表功能验收。
-- **目标**：把 Libra 捕获的意图、执行记录及验证结果接入 monoengine 的任务、CL 修订、授权与主干追溯。
+- **目标**：把 Libra 捕获的意图、执行记录及验证结果接入 mega2 的任务、CL 修订、授权与主干追溯。
 - **范围**：版本化摄取、不可覆写证据、任务隔离、委托身份、精确版本检查、原子 landing、历史查询及保留／删除。
 - **执行顺序与优先级**：P0 契约与可信摄取 → 任务／修订 → 依赖 `trunk-push` 阶段 1–3 的合并把关；随后 P1 团队历史与运维，P2 可选依赖图／外部 SCM。具体阶段 0–5 与 AC-LB-01…15 见 [libra.md](libra.md)。
 - **边界**：共用 trunk-push 根写入路径；ADR-TP-10 只约束 push 行，CL merge 不新增路径唯一入队约束；不要求 storage-only 部署接入 website 或人类审批。

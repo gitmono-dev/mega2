@@ -1,11 +1,11 @@
-# Website 会话接入（Better Auth → monoengine）
+# Website 会话接入（Better Auth → mega2）
 
-本文是 monoengine **浏览器会话**接入的单一事实源。决议来源：
+本文是 mega2 **浏览器会话**接入的单一事实源。决议来源：
 [`docs/plan/plan-20260731.md`](../plan/plan-20260731.md) ADR-WA-01..04、ADR-WA-07。
 邮件投递迁出见计划 ADR-WA-08 / 任务 MN-01，事实源为
 [`website-mail.md`](./website-mail.md)。
 
-> **术语**：本文中 *website* 指 monoengine 的**前端 / 认证面实现**，当前为 sibling
+> **术语**：本文中 *website* 指 mega2 的**前端 / 认证面实现**，当前为 sibling
 > `../megaui` 的 `apps/web`。Compose 服务名 `website-next` / `website-db-init`、
 > 隔离账户库名 `website`、以及 `MEGA_OAUTH__WEBSITE_*` /
 > `MEGA_NOTIFICATION__WEBSITE_MAIL_*` 配置键**均保持不变**——它们是 Rust 结构体
@@ -20,7 +20,7 @@ Compose 中的 Dockerfile target 与命令是此处的实施事实；契约漂�
 
 ## 1. 信任路径
 
-浏览器身份**只**信任 megaui Better Auth。monoengine **不签发** session cookie，
+浏览器身份**只**信任 megaui Better Auth。mega2 **不签发** session cookie，
 **不**直连读取 megaui 的 user/session 表。
 
 ```text
@@ -28,7 +28,7 @@ Browser
   │ Cookie: better-auth.session_token
   │     或  __Secure-better-auth.session_token
   ▼
-monoengine HTTP (/api/v1/*)
+mega2 HTTP (/api/v1/*)
   │ SessionUser extractor
   │ 读 Cookie → 选中已配置 cookie 名之一
   ▼
@@ -49,7 +49,7 @@ Better Auth get-session JSON
 
 - 配置开关或环境变量旁路 get-session（「debug 默认 admin」等）
 - 恢复 `CampsiteApiStore` / `api_store_backend` 双后端
-- 在 monoengine 签发 JWT 冒充 website 会话（见计划 DEFER-WA-01）
+- 在 mega2 签发 JWT 冒充 website 会话（见计划 DEFER-WA-01）
 
 测试**仅允许**注入 `FixedUserSessionStore`（或等价 test double），且不得编译进
 默认 `service http` 生产二进制路径。
@@ -86,7 +86,7 @@ Better Auth get-session JSON
 
 回退：`name` 为空 → 用 `email` 的 `@` 前 local-part；仍空 → 拒绝会话并 `warn`。
 
-**运营约束：** website 无独立 `username` 列；展示名碰撞可能导致 monoengine actor
+**运营约束：** website 无独立 `username` 列；展示名碰撞可能导致 mega2 actor
 混同。唯一性由 website 展示名治理负责；本仓**不**新增 users 映射表。若日后
 website 提供稳定 unique handle，修订本表（ADR revisit）。
 
@@ -102,7 +102,7 @@ website 提供稳定 unique handle，修订本表（ADR revisit）。
 | Git HTTP / LFS | Bearer 或 Basic password = token | **保留** |
 | SSH | 公钥 → `ssh_keys.username` | **保留** |
 
-**浏览器会话 ≠ Git 凭据。** 登录 website 后仍须在 monoengine
+**浏览器会话 ≠ Git 凭据。** 登录 website 后仍须在 mega2
 `/api/v1/user` 下创建 access token 或登记 SSH key，Git/LFS/SSH 才可用。
 
 `/api/v1/user` 的 SSH / token / CLA / 通知偏好 API **保留**；仅会话来源改为
@@ -136,45 +136,45 @@ website（或显式 `AccessTokenUser`）。
 
 | 项 | 值 |
 |---|---|
-| Compose 项目 | `-p monoengine-it` |
+| Compose 项目 | `-p mega2-it` |
 | 文件 | `docker-compose.test.yml` |
 | 服务名 | `website-next`（另有 `megaui-collab`） |
 | Profile | `web`（默认 `up -d --wait` **不**拉起） |
 | Build | `website-next` / `website-db-init`：context `../megaui`，dockerfile `apps/web/Dockerfile`；`megaui-collab`：`apps/collab-server/Dockerfile` |
-| 网络 | `monoengine-test-network` |
+| 网络 | `mega2-test-network` |
 | 容器端口 | `7001` |
 | 宿主映射 | `127.0.0.1:17001:7001` |
 | 协作 WebSocket | `ws://127.0.0.1:17002` → `megaui-collab:7002` |
-| 账户库 | IT 默认共享 `postgres` 服务上的独立库 **`website`**（`DB_DIALECT=pg`）；与 monoengine 业务库 **`monoengine` 隔离** |
-| monoengine 基址（容器内） | `http://website-next:7001` |
+| 账户库 | IT 默认共享 `postgres` 服务上的独立库 **`website`**（`DB_DIALECT=pg`）；与 mega2 业务库 **`mega2` 隔离** |
+| mega2 基址（容器内） | `http://website-next:7001` |
 | 宿主浏览器 origin | `http://127.0.0.1:17001` |
-| monoengine HTTP（profile `app`） | `127.0.0.1:19180` → 容器 `8000` |
+| mega2 HTTP（profile `app`） | `127.0.0.1:19180` → 容器 `8000` |
 
 联调：
 
 ```bash
-docker compose -p monoengine-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker-compose.test.yml \
   --profile app --profile web up -d --wait
 ```
 
-`monoengine` 不声明对 `website-next` 的 Compose `depends_on`：两个服务分别属于
+`mega2` 不声明对 `website-next` 的 Compose `depends_on`：两个服务分别属于
 `app` / `web` profile；若仅选择 `app`，该跨 profile 依赖会使 Compose 拒绝配置，
 并破坏既有的无 website 的 app smoke。上述联合命令会等待两者健康。需要保证第一次
 会话请求也发生在 megaui 已就绪后时，按以下顺序启动：
 
 ```bash
-docker compose -p monoengine-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker-compose.test.yml \
   --profile web up -d --wait website-next
-docker compose -p monoengine-it -f docker-compose.test.yml \
-  --profile app up -d --wait monoengine
+docker compose -p mega2-it -f docker-compose.test.yml \
+  --profile app up -d --wait mega2
 ```
 
 在 `website-next` 尚未健康时发出的 get-session 请求按 §6 fail-closed；待健康后由
-客户端重新请求，不在 monoengine 会话路径中作无界重试。连通性冒烟可从共享网络运行：
+客户端重新请求，不在 mega2 会话路径中作无界重试。连通性冒烟可从共享网络运行：
 
 ```bash
-docker compose -p monoengine-it -f docker-compose.test.yml \
-  --profile app --profile web exec -T monoengine \
+docker compose -p mega2-it -f docker-compose.test.yml \
+  --profile app --profile web exec -T mega2 \
   curl -fsS http://website-next:7001/api/auth/get-session
 ```
 
@@ -186,7 +186,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml \
 前置：sibling checkout `../megaui`；缺失则 ITW blocked。
 
 与 Mega demo 差异：IdP/前端是 megaui web + Better Auth，无 MySQL campsite；
-monoengine 业务库仍为本仓 Postgres。
+mega2 业务库仍为本仓 Postgres。
 
 ---
 

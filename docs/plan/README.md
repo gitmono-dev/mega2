@@ -23,15 +23,15 @@
 | `plan-long.md` | 长期能力 | 当前（2026-07-27 首版 Mega 移植路线图；2026-09-16 起含 mega2 原生 **PT-13** 统一推送密文） |
 | `plan-20260727.md` | 日期计划 | 已完成（承接 PT-01 集成测试基建） |
 | `plan-20260731.md` | 日期计划 | 已完成（Website 用户系统接入 + chat/notes 整栈退场 + next-app compose 同栈 IT + 本仓邮件退场改接 website；AU-* / RM-* / ITW-* / MN-* / DOC-01 / REL-01）。**DEP-06 已由 `plan-20260802.md` 关闭** |
-| `plan-20260802.md` | 日期计划 | 已完成（Website 内部产品邮件 API；tip `a52d703`；DEP-06 关闭；monoengine `0.2.1`） |
+| `plan-20260802.md` | 日期计划 | 已完成（Website 内部产品邮件 API；tip `a52d703`；DEP-06 关闭；mega2 `0.2.1`） |
 | `plan-20260803.md` | 日期计划 | 已完成（Git 使用场景测试补全；承接 PT-04 / DEFER-IT-01/02/12；GM-01..GM-12 全部终态，GM-04/GM-R1/GM-10A 正式取消、GM-10B handoff 承接；GM-12 发布于 v0.2.11，完成度复审收口于 v0.2.15） |
-| `plan-20260812.md` | 日期计划 | **已完成**（用户体系统一：website 认证 × monoengine 授权；收口发布 **v0.2.66** / UN-07；REL-01→v0.2.22、REL-02→v0.2.65；UN-05 handoff 与 UN-06 手册已入库） |
+| `plan-20260812.md` | 日期计划 | **已完成**（用户体系统一：website 认证 × mega2 授权；收口发布 **v0.2.66** / UN-07；REL-01→v0.2.22、REL-02→v0.2.65；UN-05 handoff 与 UN-06 手册已入库） |
 | `plan-20260820.md` | 日期计划 | **已完成（2026-08-21）**（vendored `src/vault/` 删除 → `libvault` 0.3.0；VLT-S1 判定 **go**（shadow-unseal），VLT-S2 / DEFER-VLT-01 未触发；REL-VLT-RO{02→04→FIX-VLT-01→05} 发布 `v0.2.68`；UN-31 八 AC 在集成层等价重建） |
-| `plan-20260824.md` | 日期计划 | **已完成（2026-08-23）**（orbit 完全单体内联：`src/orbit_api` + `src/orbit`，移除 `ObjectStorageProvider`，单 package `monoengine`；ORB-00..09 家族发布 REL-ORB-01 → ORB-09，收口 **v0.3.0** / `85cfdd4`（+ `0e07d3d`、`ca2b9b3`）。ORB-09 为 `complete（附例外）`：D 组 Config Validation 因 monoui 镜像构建外因红。`DEFER-ORB-01..04`；任务卡状态于 2026-09-15 回填） |
+| `plan-20260824.md` | 日期计划 | **已完成（2026-08-23）**（orbit 完全单体内联：`src/orbit_api` + `src/orbit`，移除 `ObjectStorageProvider`，单 package `mega2`；ORB-00..09 家族发布 REL-ORB-01 → ORB-09，收口 **v0.3.0** / `85cfdd4`（+ `0e07d3d`、`ca2b9b3`）。ORB-09 为 `complete（附例外）`：D 组 Config Validation 因 monoui 镜像构建外因红。`DEFER-ORB-01..04`；任务卡状态于 2026-09-15 回填） |
 | `plan-20260826.md` | 日期计划 | **已完成（2026-08-26）**（Mega 同步 #2130→#2175；SYNC-01..05 全部 done/complete；逐卡 patch bump 收口 **v0.3.5**；review R7 PASS） |
 | `plan-20260827.md` | 日期计划 | **已完成（2026-08-29）**（CL 多 commit push 放开：push 侧链式校验 + 拒绝 merge commit + 修 ref 配对，trunk 侧 CL merge 永远单父新 commit 不动；MC-01..11 全部 done，REL-MC-02 经 MC-10 发布 **0.4.0** / `0e9a4e6`，REL-MC-01 经 MC-08 收口 **0.5.2** / `d2f7ee0`；Claude/Codex 每卡双 PASS；下游 = monoui `docs/plan/plan-20260827.md`。任务卡勾选与计划级清单于 2026-09-15 回填，含三处后续 supersede 注记：MC-02 门控接线点随 `plan-20260910` 迁移、MC-06 AC⑧ 被 `plan-20260901` FC-08 改为 mixed report-status、版本面 parity 因 `plan-20260824` 单 package 化退化） |
 | `plan-20260901.md` | 日期计划 | **已完成**（FastCDC Media family `0.9.0` + FC-08～FC-13 独立发布至 **v0.10.0** / tip `634904b`；LB-01 Libra `d1aafb23`；Codex 卡级 PASS。DEFER-FC-01～06 仍延后） |
-| `plan-20260903.md` | 日期计划 | **已完成**（HSH-01/HSH-02：`monorepo.object_format` SHA-1/SHA-256 bootstrap；BLAKE3 fail-closed；DEFER wire/pack/BLAKE3 runtime。monoengine 可交付部分由 [`plan-20260907.md`](plan-20260907.md) 关闭） |
+| `plan-20260903.md` | 日期计划 | **已完成**（HSH-01/HSH-02：`monorepo.object_format` SHA-1/SHA-256 bootstrap；BLAKE3 fail-closed；DEFER wire/pack/BLAKE3 runtime。mega2 可交付部分由 [`plan-20260907.md`](plan-20260907.md) 关闭） |
 | `plan-20260907.md` | 日期计划 | **已完成**（B3-01..B3-06：git-internal 0.9.0、显式 HashKind、Git/LFS 独立 hash domain、blake3 bootstrap + Libra/git-internal normal service；收口 **v0.8.67**。不宣称标准 Git BLAKE3 互通；LFS BLAKE3 业务面 `DEFER-B3-LFS-01`） |
 | `plan-20260904.md` | 日期计划 | **已完成**（AW-01..05；trunk 产品 API 写经 push_auth + MonoWriteQueue；compose 可继承黑盒 `api_write_smoke_storage_only.sh`；收口 **v0.8.61** / tip 以 AW-05 提交为准；Codex 卡级 PASS） |
 | `plan-20260905.md` | 日期计划 | **已完成（2026-09-09）**（TP-01..TP-23 全部 done/complete；`MonoWriteQueue` 全局写入序列化、后代 ref 续接与墓碑、合成 commit 归属与 provenance、`push_policy="trunk"` 直推、静态 token 推送认证；事实源 `../refactoring/trunk-push.md`；review R6–R29 PASS；TP-21 文档收口；`DEFER-TP-01..05`。trunk LFS 限制已由 [`plan-20260909.md`](plan-20260909.md) supersede） |
