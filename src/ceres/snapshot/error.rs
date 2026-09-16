@@ -19,6 +19,9 @@ pub enum SnapshotErrorCode {
     CursorInvalid,
     CursorStale,
     ProofBudgetExceeded,
+    DigestMismatch,
+    RangeNotSupported,
+    SymlinkTraversal,
     Internal,
 }
 
@@ -38,6 +41,9 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::CursorInvalid => "CURSOR_INVALID",
             SnapshotErrorCode::CursorStale => "CURSOR_STALE",
             SnapshotErrorCode::ProofBudgetExceeded => "PROOF_BUDGET_EXCEEDED",
+            SnapshotErrorCode::DigestMismatch => "OBJECT_DIGEST_MISMATCH",
+            SnapshotErrorCode::RangeNotSupported => "RANGE_NOT_SUPPORTED",
+            SnapshotErrorCode::SymlinkTraversal => "SYMLINK_TRAVERSAL",
             SnapshotErrorCode::Internal => "INTERNAL",
         }
     }
@@ -59,6 +65,9 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::UnsupportedEntry => 422,
             SnapshotErrorCode::LeaseExpired => 410,
             SnapshotErrorCode::ProofBudgetExceeded => 413,
+            SnapshotErrorCode::DigestMismatch => 409,
+            SnapshotErrorCode::RangeNotSupported => 400,
+            SnapshotErrorCode::SymlinkTraversal => 400,
             SnapshotErrorCode::Internal => 500,
         }
     }

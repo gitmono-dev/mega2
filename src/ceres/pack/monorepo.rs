@@ -1487,6 +1487,7 @@ mod tests {
     };
 
     use bytes::Bytes;
+    use futures::StreamExt;
     use git_internal::{
         hash::ObjectHash,
         internal::{
@@ -1497,7 +1498,7 @@ mod tests {
                 signature::{Signature, SignatureType},
                 tree::{Tree, TreeItem, TreeItemMode},
             },
-            pack::entry::Entry,
+            pack::{Pack, entry::Entry},
         },
     };
     use sea_orm::{
@@ -3386,9 +3387,10 @@ mod tests {
     async fn shared_commit_tree_pack_has_no_duplicates() {
         let temp = TempDir::new().expect("temp dir");
         let storage = test_storage(temp.path()).await;
-        let conn = storage.mono_storage().get_connection();
+        let mono = storage.mono_storage();
+        let conn = mono.get_connection();
 
-        let blob = Blob::from_content_bytes(b"shared-content");
+        let blob = Blob::from_content_bytes(b"shared-content".to_vec());
         storage
             .git_service
             .put_objects(vec![blob.clone()])
@@ -3415,7 +3417,13 @@ mod tests {
             "monoengine-test@example.invalid".to_string(),
         );
         let c1 = Commit::new(sig.clone(), sig.clone(), tree.id, vec![], "first commit");
-        let c2 = Commit::new(sig, sig, tree.id, vec![c1.id], "second commit, same tree");
+        let c2 = Commit::new(
+            sig.clone(),
+            sig,
+            tree.id,
+            vec![c1.id],
+            "second commit, same tree",
+        );
         for c in [&c1, &c2] {
             let model: mega_commit::Model = c.clone().into_mega_model(EntryMeta::default());
             mega_commit::Entity::insert(model.into_active_model())
@@ -3430,7 +3438,7 @@ mod tests {
             .incremental_pack(vec![c2.id.to_string()], vec![])
             .await
             .expect("pack generation");
-        let pack: Vec<u8> = stream.map(|b| b.unwrap_or_default()).concat().await;
+        let pack: Vec<u8> = stream.concat().await;
 
         let declared = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
         let kind = repo.object_hash_kind().expect("hash kind");

@@ -9,11 +9,12 @@
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
+use bytes::Bytes;
 use mst2_codec::descriptor;
 use serde::Deserialize;
 use serde_json::json;
@@ -23,7 +24,7 @@ use crate::{
     ceres::snapshot::{
         descriptor::build as build_descriptor,
         error::{SnapshotError, SnapshotErrorCode},
-        pages::{base64_of, build_directory_page, hex_of, proof_pages},
+        pages::{WalkOutcome, base64_of, build_directory_page, hex_of, proof_pages, resolve_abs},
         runtime::{now_unix, runtime},
         view::{SnapshotView, validate_scope_relative_path},
     },
@@ -34,6 +35,8 @@ pub fn routers() -> Router<MonoApiServiceState> {
         .route("/snapshots/capabilities", get(capabilities))
         .route("/snapshots/resolve", post(resolve))
         .route("/snapshots/{snapshot_id}/directory", get(directory))
+        .route("/snapshots/{snapshot_id}/blob", get(blob))
+        .route("/snapshots/{snapshot_id}/lookup", post(lookup))
 }
 
 fn mst2_error_response(err: SnapshotError) -> Response {
@@ -76,9 +79,9 @@ async fn capabilities() -> Json<serde_json::Value> {
             "resolve": true,
             "directory": true,
             "leases": true,
-            "lookup": false,
+            "lookup": true,
             "metadata_pages": false,
-            "raw_blob": false,
+            "raw_blob": true,
             "objects": false,
             "chunk_reads": false,
             "full_hydration": false,
@@ -446,4 +449,230 @@ async fn directory(
         HeaderValue::from_static("private, no-cache, no-transform"),
     );
     Ok(resp)
+}
+
+#[derive(Deserialize, Debug)]
+struct BlobQuery {
+    path: String,
+    #[serde(default)]
+    expected_digest: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn blob(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    Query(q): Query<BlobQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
+    if headers.contains_key("range") {
+        // Spec 04 section 9: raw blob has no Range semantics this profile.
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::RangeNotSupported,
+            "raw blob reads are whole-file; use chunks for ranges",
+        )));
+    }
+
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let root_tree = handler
+        .get_tree_by_hash(&ctx.root_tree_oid)
+        .await
+        .map_err(internal)?;
+    let abs_path = abs_view_path(&ctx.built.descriptor.scope, &q.path);
+
+    match resolve_abs(handler.as_ref(), &root_tree, &abs_path)
+        .await
+        .map_err(mst2_error_response)?
+    {
+        WalkOutcome::FoundFile {
+            fs_kind,
+            raw,
+            digest,
+            ..
+        } => {
+            if let Some(expected) = &q.expected_digest
+                && expected != &format!("sha256:{}", hex_of(&digest))
+            {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "content does not match expected_digest",
+                )));
+            }
+            let fs_kind_str = match fs_kind {
+                crate::ceres::snapshot::resolver::FsKind::Regular => "regular",
+                crate::ceres::snapshot::resolver::FsKind::Executable => "executable",
+                crate::ceres::snapshot::resolver::FsKind::Symlink => "symlink",
+                crate::ceres::snapshot::resolver::FsKind::Directory => "directory",
+            };
+            Response::builder()
+                .header("etag", format!("\"sha256:{}\"", hex_of(&digest)))
+                .header("cache-control", "private, no-cache, no-transform")
+                .header("x-mega-fs-kind", fs_kind_str)
+                .body(axum::body::Body::from(Bytes::from(raw)))
+                .map_err(|e| {
+                    mst2_error_response(SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("body build failed: {e}"),
+                    ))
+                })
+        }
+        WalkOutcome::FoundDir => Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::NotDirectory,
+            "path is a directory",
+        ))),
+        WalkOutcome::Absent => Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::PathNotFound,
+            "path absent in the fixed view",
+        ))),
+        WalkOutcome::NotDirectory { symlink } => Err(mst2_error_response(SnapshotError::new(
+            if symlink {
+                SnapshotErrorCode::SymlinkTraversal
+            } else {
+                SnapshotErrorCode::NotDirectory
+            },
+            "intermediate component is not a directory",
+        ))),
+    }
+}
+
+/// Scope-relative request path -> absolute view path (spec 04 section 1).
+fn abs_view_path(scope: &str, path: &str) -> String {
+    if path == "/" {
+        scope.to_string()
+    } else {
+        format!("{}{}", scope.trim_end_matches('/'), path)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct LookupRequest {
+    paths: Vec<String>,
+    #[serde(default)]
+    include_ancestors: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn lookup(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    Json(req): Json<LookupRequest>,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    if req.paths.len() > 128 {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "at most 128 paths per lookup",
+        )));
+    }
+
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    let root_tree = handler
+        .get_tree_by_hash(&ctx.root_tree_oid)
+        .await
+        .map_err(internal)?;
+
+    let mut results = Vec::with_capacity(req.paths.len());
+    let mut deepest_dirs: Vec<String> = Vec::new();
+    for path in &req.paths {
+        validate_scope_relative_path(path).map_err(mst2_error_response)?;
+        let abs_path = abs_view_path(&ctx.built.descriptor.scope, path);
+        let mut entry = json!({"path": path});
+        match resolve_abs(handler.as_ref(), &root_tree, &abs_path)
+            .await
+            .map_err(mst2_error_response)?
+        {
+            WalkOutcome::FoundDir => {
+                let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
+                    .await
+                    .map_err(mst2_error_response)?;
+                entry["status"] = json!("found");
+                let mut node = json!({"fs_kind": "directory"});
+                node["directory_root"] = json!(format!("sha256:{}", hex_of(&built.page_id)));
+                node["node_class"] = json!("native_tree");
+                node["lifecycle"] = json!("mutable");
+                if path != "/" {
+                    if let Some(name) = path.rsplit('/').next() {
+                        node["name"] = json!(name);
+                    }
+                }
+                entry["node"] = node;
+                deepest_dirs.push(abs_path);
+            }
+            WalkOutcome::FoundFile {
+                fs_kind,
+                size,
+                digest,
+                ..
+            } => {
+                entry["status"] = json!("found");
+                let mut node = json!({"fs_kind": fs_kind.as_str()});
+                if let Some(name) = path.rsplit('/').next() {
+                    node["name"] = json!(name);
+                }
+                node["size"] = json!(size.to_string());
+                node["content_digest"] = json!(format!("sha256:{}", hex_of(&digest)));
+                entry["node"] = node;
+            }
+            WalkOutcome::Absent => {
+                entry["status"] = json!("absent");
+            }
+            WalkOutcome::NotDirectory { symlink } => {
+                entry["status"] = if symlink {
+                    json!("symlink_traversal")
+                } else {
+                    json!("not_directory")
+                };
+            }
+        }
+        results.push(entry);
+    }
+
+    // Shared proof pages along the deepest found directories, deduped, with
+    // the 1 MiB response budget of spec 04 sections 5/7.
+    let mut proof_pages_out = Vec::new();
+    let mut budget: usize = 1_048_576;
+    let mut seen_pages: Vec<[u8; 32]> = Vec::new();
+    deepest_dirs.sort();
+    deepest_dirs.dedup();
+    'dirs: for dir in deepest_dirs.iter().rev() {
+        let proofs = proof_pages(handler.as_ref(), &root_tree, dir)
+            .await
+            .map_err(mst2_error_response)?;
+        for (_, pid, bytes) in proofs.into_iter().rev() {
+            if seen_pages.contains(&pid) {
+                continue;
+            }
+            if bytes.len() > budget {
+                break 'dirs;
+            }
+            budget -= bytes.len();
+            seen_pages.push(pid);
+            proof_pages_out.push(json!({
+                "digest": format!("sha256:{}", hex_of(&pid)),
+                "data_base64": base64_of(&bytes),
+            }));
+        }
+    }
+
+    let body = json!({
+        "snapshot_id": snapshot_id,
+        "results": results,
+        "proof_pages": proof_pages_out,
+    });
+    Ok(Json(body).into_response())
 }
