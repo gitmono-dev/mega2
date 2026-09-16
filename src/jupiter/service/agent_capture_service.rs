@@ -19,7 +19,8 @@ use crate::{
         },
         storage::{
             agent_capture_storage::{
-                AgentCaptureStorage, EventsBatchGroup, EventsBatchSnapshot, InsertEvent,
+                AgentCaptureStorage, CheckpointSnapshot, EventsBatchGroup, EventsBatchSnapshot,
+                InsertCheckpoint, InsertEvent,
             },
             base_storage::{BaseStorage, StorageConnector},
             object_storage::{MegaObjectStorageWrapper, mock_object_storage},
@@ -126,6 +127,50 @@ impl AgentCaptureService {
             }
         }
         Ok(snapshot)
+    }
+
+    /// Commit a checkpoint and emit `agent_capture.checkpoint.committed` only
+    /// when this transaction created a new checkpoint row. The outbound
+    /// payload is built from the committed snapshot; send tasks never re-read
+    /// session latest state (WH-08 / AC5).
+    pub async fn commit_checkpoint(
+        &self,
+        capture_id: i64,
+        checkpoint: &InsertCheckpoint,
+        fingerprint: &str,
+    ) -> Result<CheckpointSnapshot, MegaError> {
+        let snapshot = self
+            .storage
+            .insert_checkpoint_ingest(capture_id, checkpoint, fingerprint)
+            .await?;
+        if snapshot.created
+            && let Ok(event) = Self::checkpoint_committed_event(&snapshot)
+        {
+            let _ = self.storage_event_emitter.try_emit(event);
+        }
+        Ok(snapshot)
+    }
+
+    fn checkpoint_committed_event(
+        snapshot: &CheckpointSnapshot,
+    ) -> Result<CommittedEvent, MegaError> {
+        validate_canonical_path(&snapshot.repo_path)?;
+        Ok(CommittedEvent {
+            event_id: Uuid::new_v4(),
+            event_type: EventType::AgentCaptureCheckpointCommitted,
+            occurred_at: u64::try_from(Utc::now().timestamp()).unwrap_or(0),
+            source: EventSource::AgentCapture,
+            scope: EventScope::AgentCapture {
+                tenant_id: snapshot.tenant_id.clone(),
+                repo_path: snapshot.repo_path.clone(),
+            },
+            data: EventData::AgentCaptureCheckpointCommitted {
+                capture_id: snapshot.capture_id.to_string(),
+                checkpoint_id: snapshot.checkpoint_id.clone(),
+                completeness: snapshot.completeness.clone(),
+                raw_committed: snapshot.raw_committed,
+            },
+        })
     }
 
     fn events_committed_event(
@@ -399,7 +444,7 @@ async fn sha256_hex(mut stream: ObjectByteStream) -> Result<String, MegaError> {
 mod tests {
     use bytes::Bytes;
     use futures::stream;
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
 
     use super::*;
     use crate::{
@@ -407,7 +452,7 @@ mod tests {
         jupiter::{
             migration::apply_migrations,
             storage::{
-                agent_capture_storage::{InsertEvent, SessionNaturalKey},
+                agent_capture_storage::{InsertCheckpoint, InsertEvent, SessionNaturalKey},
                 base_storage::StorageConnector,
             },
             tests::test_db_connection,
@@ -919,5 +964,239 @@ mod tests {
             assert_eq!(envelope["data"]["new_event_count"], 1);
             assert_eq!(envelope["data"]["completeness"], "truncated");
         }
+    }
+
+    fn wh08_target(
+        id: &str,
+        tenants: Vec<String>,
+        repos: Vec<String>,
+    ) -> (
+        crate::config::StorageEventsTargetConfig,
+        crate::jupiter::service::storage_event_transport::EventTarget,
+    ) {
+        let config = crate::config::StorageEventsTargetConfig {
+            id: id.to_owned(),
+            url: "https://events.example.invalid/ingest".to_owned(),
+            secret_ref: format!("vault://secret/config/it/storage_events/targets/{id}/hmac#value"),
+            events: vec!["agent_capture.checkpoint.committed".to_owned()],
+            git_paths: Vec::new(),
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: tenants,
+            agent_repo_paths: repos,
+        };
+        let secret = crate::config::secret::SecretString::new(
+            "hex:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let compiled = crate::jupiter::service::storage_event_transport::EventTarget::compile(
+            &config.id,
+            &config.url,
+            &secret,
+        )
+        .expect("compile target");
+        (config, compiled)
+    }
+
+    fn wh08_emitter(
+        transport: std::sync::Arc<RecordingTransport>,
+        targets: Vec<(
+            crate::config::StorageEventsTargetConfig,
+            crate::jupiter::service::storage_event_transport::EventTarget,
+        )>,
+    ) -> StorageEventEmitter {
+        let mut config =
+            crate::config::testing::isolated_config(std::env::temp_dir().join("wh08-checkpoint"));
+        config.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.storage_events.enabled = true;
+        config.storage_events.installation_id = Some("it-wh08".to_owned());
+        StorageEventEmitter::new_with_transport(&config, transport, targets)
+    }
+
+    async fn insert_committed_raw(storage: &AgentCaptureStorage, capture_id: i64, digest: &str) {
+        agent_capture_blob::Entity::insert(agent_capture_blob::ActiveModel {
+            deployment_id: Set("default".to_owned()),
+            tenant_id: Set("default".to_owned()),
+            digest: Set(digest.to_owned()),
+            visibility: Set("raw".to_owned()),
+            object_key: Set(format!("default/default/raw/{digest}")),
+            size_bytes: Set(1),
+            lease_state: Set("committed".to_owned()),
+            lease_generation: Set(0),
+            capture_id: Set(Some(capture_id)),
+            ..Default::default()
+        })
+        .exec(storage.get_connection())
+        .await
+        .expect("insert committed raw");
+    }
+
+    #[tokio::test]
+    async fn storage_event_checkpoint_incomplete() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+        let transport = std::sync::Arc::new(RecordingTransport::default());
+        let emitter = wh08_emitter(
+            transport.clone(),
+            vec![
+                wh08_target(
+                    "ops-main",
+                    vec!["default".to_owned()],
+                    vec!["/third-part/mega".to_owned()],
+                ),
+                wh08_target(
+                    "other-tenant",
+                    vec!["other".to_owned()],
+                    vec!["/third-part/mega".to_owned()],
+                ),
+                wh08_target(
+                    "other-repo",
+                    vec!["default".to_owned()],
+                    vec!["/other/repo".to_owned()],
+                ),
+            ],
+        );
+        let service = AgentCaptureService {
+            storage: AgentCaptureStorage {
+                base: BaseStorage::new(std::sync::Arc::new(db)),
+            },
+            obj_storage: mock_object_storage(),
+            storage_event_emitter: emitter,
+        };
+        let capture_id = service
+            .storage
+            .upsert_session(SessionNaturalKey {
+                deployment_id: "default".to_owned(),
+                tenant_id: "default".to_owned(),
+                repo_id: "/third-part/mega".to_owned(),
+                producer_id: "hook".to_owned(),
+                session_kind: "external_capture".to_owned(),
+                client_session_id: "provider__wh08".to_owned(),
+            })
+            .await
+            .expect("session");
+        insert_committed_raw(&service.storage, capture_id, "sha256:shared-raw").await;
+
+        let first = service
+            .commit_checkpoint(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-1".to_owned(),
+                    transcript_digest: Some("sha256:shared-raw".to_owned()),
+                    redacted_digest: None,
+                    metadata: None,
+                },
+                "fp-1",
+            )
+            .await
+            .expect("first");
+        assert!(first.created);
+        assert!(first.raw_committed);
+        wh07_wait_calls(&transport, 1).await;
+        assert_eq!(transport.calls(), 1, "exactly one matching target");
+        assert_eq!(transport.target_ids(), vec!["ops-main".to_owned()]);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&transport.bodies()[0]).expect("envelope");
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["event_type"], "agent_capture.checkpoint.committed");
+        assert_eq!(envelope["source"], "agent_capture");
+        assert_eq!(envelope["scope"]["tenant_id"], "default");
+        assert_eq!(envelope["scope"]["repo_path"], "/third-part/mega");
+        assert!(envelope["scope"]["oci_repository"].is_null());
+        assert_eq!(envelope["data"]["capture_id"], capture_id.to_string());
+        assert_eq!(envelope["data"]["checkpoint_id"], "cp-1");
+        assert_eq!(envelope["data"]["completeness"], first.completeness);
+        assert_eq!(envelope["data"]["raw_committed"], true);
+
+        let mut session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("session");
+        session.completeness = "truncated".to_owned();
+        let mut active = session.into_active_model();
+        active.completeness = sea_orm::Set("truncated".to_owned());
+        active
+            .update(service.storage.get_connection())
+            .await
+            .expect("mutate latest completeness");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let after: serde_json::Value =
+            serde_json::from_slice(&transport.bodies()[0]).expect("frozen envelope");
+        assert_eq!(
+            after["data"]["completeness"], first.completeness,
+            "delayed send must not re-read session latest"
+        );
+        assert_ne!(
+            after["data"]["completeness"], "truncated",
+            "frozen snapshot must not pick up the post-commit latest mutation"
+        );
+
+        let replay = service
+            .commit_checkpoint(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-1".to_owned(),
+                    transcript_digest: Some("sha256:shared-raw".to_owned()),
+                    redacted_digest: None,
+                    metadata: None,
+                },
+                "fp-1",
+            )
+            .await
+            .expect("replay");
+        assert!(!replay.created);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 1, "replay must not emit");
+
+        let shared = service
+            .commit_checkpoint(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-2".to_owned(),
+                    transcript_digest: Some("sha256:shared-raw".to_owned()),
+                    redacted_digest: None,
+                    metadata: None,
+                },
+                "fp-2",
+            )
+            .await
+            .expect("shared blob");
+        assert!(shared.created);
+        assert!(shared.raw_committed);
+        wh07_wait_calls(&transport, 2).await;
+
+        let incomplete = service
+            .commit_checkpoint(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-redacted".to_owned(),
+                    transcript_digest: None,
+                    redacted_digest: Some("sha256:redacted-only".to_owned()),
+                    metadata: None,
+                },
+                "fp-redacted",
+            )
+            .await
+            .expect("redacted");
+        assert!(incomplete.created);
+        assert!(!incomplete.raw_committed);
+        assert_eq!(incomplete.completeness, "incomplete");
+        wh07_wait_calls(&transport, 3).await;
+        assert_eq!(transport.calls(), 3, "three new checkpoints, zero replays");
+        assert!(
+            transport.target_ids().iter().all(|id| id == "ops-main"),
+            "AND isolation: only the matching target is selected"
+        );
+        let last: serde_json::Value =
+            serde_json::from_slice(&transport.bodies()[2]).expect("incomplete envelope");
+        assert_eq!(last["data"]["checkpoint_id"], "cp-redacted");
+        assert_eq!(last["data"]["completeness"], "incomplete");
+        assert_eq!(last["data"]["raw_committed"], false);
     }
 }

@@ -1165,8 +1165,7 @@ async fn post_checkpoint(
     let ingested = state
         .storage
         .agent_capture_service
-        .storage
-        .insert_checkpoint_ingest(
+        .commit_checkpoint(
             capture_id,
             &InsertCheckpoint {
                 checkpoint_id: request_body.checkpoint_id,

@@ -101,9 +101,15 @@ pub struct InsertCheckpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointIngest {
+pub struct CheckpointSnapshot {
+    pub capture_id: i64,
+    pub checkpoint_id: String,
     pub completeness: String,
     pub partial_reason: Option<String>,
+    pub raw_committed: bool,
+    pub created: bool,
+    pub tenant_id: String,
+    pub repo_path: String,
 }
 
 pub struct CommittedFinalize {
@@ -741,7 +747,7 @@ impl AgentCaptureStorage {
         capture_id: i64,
         checkpoint: &InsertCheckpoint,
         fingerprint: &str,
-    ) -> Result<CheckpointIngest, MegaError> {
+    ) -> Result<CheckpointSnapshot, MegaError> {
         let txn = self.get_connection().begin().await?;
         let result = self
             .insert_checkpoint_ingest_txn(&txn, capture_id, checkpoint, fingerprint)
@@ -764,7 +770,7 @@ impl AgentCaptureStorage {
         capture_id: i64,
         checkpoint: &InsertCheckpoint,
         fingerprint: &str,
-    ) -> Result<CheckpointIngest, MegaError> {
+    ) -> Result<CheckpointSnapshot, MegaError> {
         let session = agent_capture_session::Entity::find_by_id(capture_id)
             .lock(LockType::Update)
             .one(txn)
@@ -803,10 +809,22 @@ impl AgentCaptureStorage {
                             value.as_str().map(str::to_owned)
                         }
                     });
-                return Ok(CheckpointIngest {
+                // Pre-WH-08 receipts omit this key; replay never emits, so a
+                // false default is only for the in-process snapshot.
+                let raw_committed = existing
+                    .response
+                    .as_ref()
+                    .and_then(|value| value.get("raw_committed"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                return Ok(checkpoint_snapshot(
+                    &session,
+                    &checkpoint.checkpoint_id,
                     completeness,
                     partial_reason,
-                });
+                    raw_committed,
+                    false,
+                ));
             }
             return Err(MegaError::Other(format!(
                 "ingest receipt fingerprint conflict for capture_id {capture_id}"
@@ -867,7 +885,8 @@ impl AgentCaptureStorage {
                 Some(_) => {}
             }
         }
-        let missing_raw = raw_blob.is_none();
+        let raw_committed = raw_blob.is_some();
+        let missing_raw = !raw_committed;
         let inserted =
             agent_capture_checkpoint::Entity::insert(agent_capture_checkpoint::ActiveModel {
                 capture_id: Set(capture_id),
@@ -906,6 +925,7 @@ impl AgentCaptureStorage {
             "accepted": true,
             "completeness": completeness,
             "partial_reason": partial_reason,
+            "raw_committed": raw_committed,
         });
         agent_capture_ingest_receipt::Entity::insert(agent_capture_ingest_receipt::ActiveModel {
             deployment_id: Set(session.deployment_id.clone()),
@@ -920,10 +940,14 @@ impl AgentCaptureStorage {
         })
         .exec(txn)
         .await?;
-        Ok(CheckpointIngest {
+        Ok(checkpoint_snapshot(
+            &session,
+            &checkpoint.checkpoint_id,
             completeness,
             partial_reason,
-        })
+            raw_committed,
+            true,
+        ))
     }
 
     /// Insert a file_op. `source_event_uid` must exist on the same capture.
@@ -2400,6 +2424,26 @@ fn normalize_stored_event_kind(kind: &str) -> String {
     }
 }
 
+fn checkpoint_snapshot(
+    session: &agent_capture_session::Model,
+    checkpoint_id: &str,
+    completeness: String,
+    partial_reason: Option<String>,
+    raw_committed: bool,
+    created: bool,
+) -> CheckpointSnapshot {
+    CheckpointSnapshot {
+        capture_id: session.id,
+        checkpoint_id: checkpoint_id.to_owned(),
+        completeness,
+        partial_reason,
+        raw_committed,
+        created,
+        tenant_id: session.tenant_id.clone(),
+        repo_path: session.repo_id.clone(),
+    }
+}
+
 fn events_batch_snapshot(
     session: &agent_capture_session::Model,
     receipt_id: i64,
@@ -2448,8 +2492,8 @@ mod tests {
     use crate::{
         callisto::{
             agent_capture_access_audit, agent_capture_blob, agent_capture_blob_ref,
-            agent_capture_deletion_ledger, agent_capture_event, agent_capture_ingest_receipt,
-            agent_capture_source_stream,
+            agent_capture_checkpoint, agent_capture_deletion_ledger, agent_capture_event,
+            agent_capture_ingest_receipt, agent_capture_source_stream,
         },
         jupiter::{migration::apply_migrations, tests::test_db_connection},
     };
@@ -3735,5 +3779,111 @@ mod tests {
             .await
             .expect("concurrent receipts");
         assert_eq!(receipts, 1);
+    }
+
+    #[tokio::test]
+    async fn storage_event_checkpoint_snapshot() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        insert_blob(
+            &storage,
+            capture_id,
+            "sha256:shared-raw",
+            "committed",
+            None,
+            None,
+        )
+        .await;
+
+        let first = storage
+            .insert_checkpoint_ingest(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-1".to_owned(),
+                    transcript_digest: Some("sha256:shared-raw".to_owned()),
+                    redacted_digest: None,
+                    metadata: None,
+                },
+                "fp-1",
+            )
+            .await
+            .expect("first checkpoint");
+        assert!(first.created);
+        assert!(first.raw_committed);
+        assert_eq!(first.capture_id, capture_id);
+        assert_eq!(first.checkpoint_id, "cp-1");
+        assert_eq!(first.tenant_id, "default");
+        assert_eq!(first.repo_path, "/third-part/mega");
+        assert_eq!(first.completeness, "empty");
+        let rows = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+
+        let replay = storage
+            .insert_checkpoint_ingest(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-1".to_owned(),
+                    transcript_digest: Some("sha256:shared-raw".to_owned()),
+                    redacted_digest: None,
+                    metadata: None,
+                },
+                "fp-1",
+            )
+            .await
+            .expect("replay");
+        assert!(!replay.created);
+        assert!(replay.raw_committed);
+        assert_eq!(replay.checkpoint_id, "cp-1");
+        let rows = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count after replay");
+        assert_eq!(rows, 1);
+
+        let shared = storage
+            .insert_checkpoint_ingest(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-2".to_owned(),
+                    transcript_digest: Some("sha256:shared-raw".to_owned()),
+                    redacted_digest: None,
+                    metadata: None,
+                },
+                "fp-2",
+            )
+            .await
+            .expect("shared blob new checkpoint");
+        assert!(shared.created);
+        assert!(shared.raw_committed);
+        assert_eq!(shared.checkpoint_id, "cp-2");
+        let rows = agent_capture_checkpoint::Entity::find()
+            .filter(agent_capture_checkpoint::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count after shared");
+        assert_eq!(rows, 2);
+
+        let redacted = storage
+            .insert_checkpoint_ingest(
+                capture_id,
+                &InsertCheckpoint {
+                    checkpoint_id: "cp-redacted".to_owned(),
+                    transcript_digest: None,
+                    redacted_digest: Some("sha256:redacted-only".to_owned()),
+                    metadata: None,
+                },
+                "fp-redacted",
+            )
+            .await
+            .expect("redacted only");
+        assert!(redacted.created);
+        assert!(!redacted.raw_committed);
+        assert_eq!(redacted.completeness, "incomplete");
+        assert_eq!(redacted.partial_reason.as_deref(), Some("missing_raw"));
     }
 }

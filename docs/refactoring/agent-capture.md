@@ -118,7 +118,9 @@ lease 状态 `staging → finalizing → committed`（或 `expired`/`aborted`）
 
 ## 出站事件
 
-`events:batch` 在 receipt 事务提交后，按本次实际 insert 的新 event 行每 generation 发一份 `[storage_events]` 的 `agent_capture.events.committed`（plan-20260912 / WH-07 / ADR-WH-04）。快照字段为 `capture_id`、`receipt_id`、该组 `new_event_count` / `generation`、`stream_kind`（`session.session_kind`）、`completeness`；scope 只填会话上的可信 `tenant_id` / `repo_path`。同 fingerprint 的 HTTP 早退 replay、以及没有任何新行的事务提交都不发。投递失败不改变已提交的 ingest。file-op / blob / session PUT 永久不发。checkpoint 出站属 WH-08。详见 [`storage-events.md`](storage-events.md)。
+`events:batch` 在 receipt 事务提交后，按本次实际 insert 的新 event 行每 generation 发一份 `[storage_events]` 的 `agent_capture.events.committed`（plan-20260912 / WH-07 / ADR-WH-04）。快照字段为 `capture_id`、`receipt_id`、该组 `new_event_count` / `generation`、`stream_kind`（`session.session_kind`）、`completeness`；scope 只填会话上的可信 `tenant_id` / `repo_path`。同 fingerprint 的 HTTP 早退 replay、以及没有任何新行的事务提交都不发。投递失败不改变已提交的 ingest。file-op / blob / session PUT 永久不发。
+
+`POST .../checkpoints` 在 receipt 事务提交且本次新建 checkpoint 行后发一份 `agent_capture.checkpoint.committed`（WH-08）。快照字段为 `capture_id`、`checkpoint_id`、该次提交后的 `completeness`、`raw_committed`（仅关联已 committed raw 为 true）。同一 checkpoint 的 replay 不发；共享同一 raw blob 的新 checkpoint 各自发一次。详见 [`storage-events.md`](storage-events.md)。
 
 ## File-ops batch
 

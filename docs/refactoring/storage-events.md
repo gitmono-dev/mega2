@@ -2,7 +2,7 @@
 
 本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`。Agent checkpoint hook（WH-08）尚未安装。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`，WH-08 挂上 checkpoint 提交的 `agent_capture.checkpoint.committed`。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -61,6 +61,10 @@ LFS basic 上传在本次请求实际 `put_stream` 成功后发一次 `lfs.objec
 ## 来源适配：`agent_capture.events.committed`（WH-07，已交付）
 
 Agent Capture `events:batch` 在 ingest receipt 事务提交后，按本次实际 insert 的新 event 行**每 generation 一份** `agent_capture.events.committed`（ADR-WH-04；该 generation 新行数为 0 则不发）。摘要来自提交返回快照：`capture_id`、`receipt_id`、该组 `new_event_count` / `generation`、`stream_kind`（session 的 `session_kind`，不是水位流名 `jsonl`）、`completeness`，以及可信 `tenant_id` / `repo_path`。同批若插入两个 generation，就发两份摘要。HTTP 层同 fingerprint 的 replay 在进事务前 200 返回，不调用 commit、不发事件；事务内同 receipt 或仅旧 uid 的批 `new_event_count=0`，也不发。投影在 `try_emit` 同步完成，发送任务不回读 session/watermark 最新状态。过滤为 `agent_tenants` 与 `agent_repo_paths` 的 AND 交集。`push_auth=none` 不改变 ingest token 门。file-op / blob / session PUT 不发。见 [`agent-capture.md`](agent-capture.md)「出站事件」。
+
+## 来源适配：`agent_capture.checkpoint.committed`（WH-08，已交付）
+
+Agent Capture `POST .../checkpoints` 在 ingest receipt 事务提交且本次新建 checkpoint 行后发一次 `agent_capture.checkpoint.committed`。快照来自提交返回值：`capture_id`、`checkpoint_id`、该次提交后的 `completeness`、`raw_committed`（仅当本次关联了已 committed raw blob 为 true；仅 redacted / incomplete 为 false），以及可信 `tenant_id` / `repo_path`。同一 `checkpoint_id` 的 fingerprint replay（HTTP 早退或事务内同 receipt）不发；共享同一 raw blob 的**新** checkpoint 各自发一次。投影在 `try_emit` 同步完成，发送任务不回读 session latest。过滤仍为 tenant 与 repo 的 AND。`push_auth=none` 不改变 ingest token 门。见 [`agent-capture.md`](agent-capture.md)「出站事件」。
 
 ## 事件投影与过滤（WH-10）
 
