@@ -185,6 +185,7 @@ impl TestConfigBuilder {
                 ssh: LFSSshConfig::default(),
             },
             blame: BlameConfig::default(),
+            mst2: crate::config::Mst2Config::default(),
             redis: RedisConfig {
                 url: self.redis_url,
             },

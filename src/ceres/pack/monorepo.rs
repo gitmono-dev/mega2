@@ -324,7 +324,12 @@ impl RepoHandler for Monorepo {
         obj_num.fetch_add(all_commits.len(), Ordering::SeqCst);
 
         let mut counted_obj = HashSet::new();
+        let mut counted_roots = HashSet::new();
         for c in &all_commits {
+            // Shared commit trees (net-zero roll-ups) are counted once.
+            if !counted_roots.insert(c.tree_id.to_string()) {
+                continue;
+            }
             self.traverse_for_count(
                 want_trees.get(&c.tree_id).unwrap().clone(),
                 &exist_objs,
@@ -347,13 +352,17 @@ impl RepoHandler for Monorepo {
             .await
             .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
 
+        // Two commits may share one tree (e.g. net-zero roll-ups); every
+        // object must appear exactly once in the pack.
         for c in all_commits {
-            self.traverse(
-                want_trees.get(&c.tree_id).unwrap().clone(),
-                &mut exist_objs,
-                Some(&entry_tx),
-            )
-            .await?;
+            if exist_objs.insert(c.tree_id.to_string()) {
+                self.traverse(
+                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    &mut exist_objs,
+                    Some(&entry_tx),
+                )
+                .await?;
+            }
             entry_tx
                 .send(MetaAttached {
                     inner: c.into(),
@@ -564,8 +573,12 @@ impl RepoHandler for Monorepo {
         }
 
         let mut counted_obj = HashSet::new();
-        // traverse for get obj nums
+        let mut counted_roots = HashSet::new();
+        // traverse for get obj nums; shared commit trees counted once
         for c in want_commits.clone() {
+            if !counted_roots.insert(c.tree_id.to_string()) {
+                continue;
+            }
             self.traverse_for_count(
                 want_trees.get(&c.tree_id).unwrap().clone(),
                 &exist_objs,
@@ -587,13 +600,17 @@ impl RepoHandler for Monorepo {
             .await
             .map_err(|e| MegaError::Other(format!("pack encode failed: {e}")))?;
         // todo: For now, send metadata only for blob objects.
+        // Two want commits may share one tree (e.g. server-synthesized roll-up
+        // history); every object must appear exactly once in the pack.
         for c in want_commits {
-            self.traverse(
-                want_trees.get(&c.tree_id).unwrap().clone(),
-                &mut exist_objs,
-                Some(&entry_tx),
-            )
-            .await?;
+            if exist_objs.insert(c.tree_id.to_string()) {
+                self.traverse(
+                    want_trees.get(&c.tree_id).unwrap().clone(),
+                    &mut exist_objs,
+                    Some(&entry_tx),
+                )
+                .await?;
+            }
             entry_tx
                 .send(MetaAttached {
                     inner: c.into(),
@@ -1469,11 +1486,13 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use bytes::Bytes;
     use git_internal::{
         hash::ObjectHash,
         internal::{
             metadata::{EntryMeta, MetaAttached},
             object::{
+                blob::Blob,
                 commit::Commit,
                 signature::{Signature, SignatureType},
                 tree::{Tree, TreeItem, TreeItemMode},
@@ -3294,5 +3313,155 @@ mod tests {
             changed_paths, queue_paths,
             "root roll-up parent chain must follow push_queue.id order"
         );
+    }
+
+    /// Regression (RCV-01 typed-failure half): a pack whose ref-delta base is
+    /// outside the pack must fail `unpack_stream` with a typed error — never
+    /// panic the worker. The `no-thin` advertisement stops compliant clients
+    /// from producing such packs; this pins the fail-closed behaviour for
+    /// malformed ones.
+    #[tokio::test]
+    async fn thin_pack_decode_failure_is_typed_not_panic() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let repo =
+            trunk_monorepo(&storage, "/", vec![], HashSet::new(), HashSet::new(), None).await;
+
+        // Minimal thin pack: header (1 object) + one ref-delta entry whose
+        // 20-byte base oid exists nowhere, carrying a valid empty git delta
+        // (base_size=0, result_size=0, no instructions), zlib-wrapped with a
+        // stored (uncompressed) block so no compression crate is needed.
+        let delta: Vec<u8> = vec![0x00, 0x00];
+        let mut entry: Vec<u8> = Vec::new();
+        let size = delta.len();
+        entry.push((7u8 << 4) | ((size & 0x0F) as u8));
+        let mut rem = size >> 4;
+        while rem > 0 {
+            let mut b = (rem & 0x7F) as u8;
+            rem >>= 7;
+            if rem > 0 {
+                b |= 0x80;
+            }
+            entry.push(b);
+        }
+        let base = ObjectHash::new(b"missing-base-object");
+        entry.extend_from_slice(base.to_data().as_slice());
+        let mut zlib: Vec<u8> = vec![0x78, 0x01];
+        zlib.push(0x01); // BFINAL=1, BTYPE=00 (stored)
+        zlib.extend_from_slice(&(delta.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(delta.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(&delta);
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &delta {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        zlib.extend_from_slice(((b << 16) | a).to_be_bytes().as_slice());
+        entry.extend_from_slice(&zlib);
+
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        pack.extend_from_slice(&entry);
+        let trailer = ObjectHash::new(&pack);
+        pack.extend_from_slice(trailer.to_data().as_slice());
+
+        let stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Bytes, axum::Error>> + Send>,
+        > = Box::pin(futures::stream::once(async move { Ok(Bytes::from(pack)) }));
+        let pack_config = repo.storage.config().pack.clone();
+        let result = RepoHandler::unpack_stream(&repo, &pack_config, stream).await;
+
+        let err = result.expect_err("thin pack must fail with a typed error, not panic");
+        assert!(
+            err.to_string().contains("pack decode failed"),
+            "unpack_stream must convert the decoder failure into a typed error: {err}"
+        );
+    }
+
+    /// Regression (fetch duplicate/count defect): two want commits sharing
+    /// one root tree (net-zero roll-ups) must produce a pack where every
+    /// object appears exactly once and the entry count matches the header.
+    #[tokio::test]
+    async fn shared_commit_tree_pack_has_no_duplicates() {
+        let temp = TempDir::new().expect("temp dir");
+        let storage = test_storage(temp.path()).await;
+        let conn = storage.mono_storage().get_connection();
+
+        let blob = Blob::from_content_bytes(b"shared-content");
+        storage
+            .git_service
+            .put_objects(vec![blob.clone()])
+            .await
+            .expect("store blob content");
+        let tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "x.txt".to_string(),
+        )])
+        .expect("tree");
+        mega_tree::Entity::insert(
+            tree.clone()
+                .into_mega_model(EntryMeta::default())
+                .into_active_model(),
+        )
+        .exec(conn)
+        .await
+        .expect("insert tree row");
+
+        let sig = Signature::new(
+            SignatureType::Author,
+            "Monoengine Test".to_string(),
+            "monoengine-test@example.invalid".to_string(),
+        );
+        let c1 = Commit::new(sig.clone(), sig.clone(), tree.id, vec![], "first commit");
+        let c2 = Commit::new(sig, sig, tree.id, vec![c1.id], "second commit, same tree");
+        for c in [&c1, &c2] {
+            let model: mega_commit::Model = c.clone().into_mega_model(EntryMeta::default());
+            mega_commit::Entity::insert(model.into_active_model())
+                .exec(conn)
+                .await
+                .expect("insert commit row");
+        }
+
+        let repo =
+            trunk_monorepo(&storage, "/", vec![], HashSet::new(), HashSet::new(), None).await;
+        let stream = repo
+            .incremental_pack(vec![c2.id.to_string()], vec![])
+            .await
+            .expect("pack generation");
+        let pack: Vec<u8> = stream.map(|b| b.unwrap_or_default()).concat().await;
+
+        let declared = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
+        let kind = repo.object_hash_kind().expect("hash kind");
+        let tmp = tempfile::tempdir().expect("temp");
+        let mut decoder = Pack::new_with_hash_kind(
+            kind,
+            Some(1),
+            Some(64 * 1024 * 1024),
+            Some(tmp.path().to_path_buf()),
+            true,
+        );
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let sink = ids.clone();
+        decoder
+            .decode(
+                &mut std::io::Cursor::new(&pack),
+                move |entry| sink.lock().unwrap().push(entry.inner.hash.to_string()),
+                None::<fn(ObjectHash)>,
+            )
+            .expect("pack must decode cleanly");
+
+        let ids = ids.lock().unwrap();
+        assert_eq!(ids.len(), declared, "entry count must match the header");
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "every object must appear exactly once (shared commit trees)"
+        );
+        assert!(ids.contains(&tree.id.to_string()));
     }
 }
