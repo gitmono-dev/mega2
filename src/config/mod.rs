@@ -127,6 +127,7 @@ impl Config {
             pack: PackConfig::default(),
             lfs: LFSConfig::default(),
             blame: BlameConfig::default(),
+            mst2: Mst2Config::default(),
             redis: RedisConfig::default(),
             buck: None,
             object_storage: ObjectStorageConfig {

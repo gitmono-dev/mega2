@@ -16,6 +16,11 @@ pub struct Config {
     pub lfs: LFSConfig,
     #[serde(default)]
     pub blame: BlameConfig,
+    /// MST/2 snapshot surface (specs Mega_ScorpioFS_MST2 00/03/04). Every
+    /// capability stays off unless explicitly enabled; resolver endpoints are
+    /// registered only when `mst2.enabled` is true.
+    #[serde(default)]
+    pub mst2: Mst2Config,
     pub redis: RedisConfig,
     #[serde(default)]
     pub buck: Option<BuckConfig>,
@@ -832,6 +837,18 @@ impl Default for LFSSshConfig {
             http_url: "http://localhost:8000".to_string(),
         }
     }
+}
+
+/// MST/2 snapshot feature flags (default off; spec 00 §6 rollout).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Mst2Config {
+    /// Master switch for the `/api/v2/snapshots` surface.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Stable deployment identity used in ServingDescriptors (spec 03 §2).
+    /// Required when `enabled`; must parse as a UUID.
+    #[serde(default)]
+    pub instance_uuid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -28,7 +28,7 @@ use crate::{
         api_doc::ApiDoc,
         api_router::{self},
         oauth::{api_store::BrowserSessionStore, website_session_store::WebsiteSessionStore},
-        router::{lfs_router, oci_router},
+        router::{lfs_router, oci_router, snapshot_router},
     },
     ceres::{
         api_service::{cache::GitObjectCache, state::ProtocolApiState},
@@ -774,6 +774,13 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         .with_state(api_state.clone())
         .into();
     let router = router.nest("/info/lfs", info_lfs_router);
+
+    // MST/2 snapshot surface (specs 03/04). The nest is static; handlers
+    // fail closed unless `[mst2].enabled`, so toggling needs a restart.
+    let router = router.nest(
+        "/api/v2",
+        snapshot_router::routers().with_state(api_state.clone()),
+    );
 
     // Static `/v2/` prefix before catch-all (same pattern as `/info/lfs`).
     // Nest at `/v2/` (trailing slash): axum `nest("/v2")` matches `/v2` and
