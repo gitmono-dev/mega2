@@ -954,8 +954,7 @@ async fn events_batch(
     state
         .storage
         .agent_capture_service
-        .storage
-        .insert_events_batch(
+        .commit_events_batch(
             capture_id,
             &request_body.batch_id,
             &events,
@@ -1469,7 +1468,10 @@ mod tests {
         },
         contract::policy::entitystore::SharedEntityStore,
         jupiter::{
-            service::agent_capture_service::AgentCaptureService,
+            service::{
+                agent_capture_service::AgentCaptureService,
+                storage_event_emitter::StorageEventEmitter,
+            },
             storage::{
                 Storage,
                 agent_capture_storage::{AgentCaptureStorage, InsertEvent},
@@ -1724,6 +1726,7 @@ mod tests {
         storage.agent_capture_service = AgentCaptureService {
             storage: AgentCaptureStorage { base },
             obj_storage: mock_object_storage(),
+            storage_event_emitter: StorageEventEmitter::disabled(),
         };
         (temp, state_from_storage(storage))
     }

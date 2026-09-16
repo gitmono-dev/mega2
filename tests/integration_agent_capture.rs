@@ -6,7 +6,7 @@ mod common;
 
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -28,6 +28,21 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 const INGEST_TOKEN: &str = "agent-it-ingest";
 const SENTINEL: &str = "RAW_PROMPT_SENTINEL_AC13_DO_NOT_LOG";
 const REPO_SEGMENT: &str = "third-part%2Fmega";
+const SECRET_REF: &str = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value";
+const HMAC_VALUE: &str = "hex:0101010101010101010101010101010101010101010101010101010101010101";
+const STORAGE_EVENTS_APPEND: &str = r#"
+[storage_events]
+enabled = true
+installation_id = "it-wh07"
+
+[[storage_events.targets]]
+id = "ops-main"
+url = "https://events.example.invalid/ingest"
+secret_ref = "vault://secret/config/it/storage_events/targets/ops-main/hmac#value"
+events = ["agent_capture.events.committed"]
+agent_tenants = ["default"]
+agent_repo_paths = ["/third-part/mega"]
+"#;
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static CASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -110,6 +125,13 @@ struct CaptureEnv {
 impl CaptureEnv {
     fn storage_only(deployment_id: &str) -> Self {
         Self::with_append(&storage_only_append(deployment_id))
+    }
+
+    fn storage_only_with_events(deployment_id: &str) -> Self {
+        Self::with_append(&format!(
+            "{}{STORAGE_EVENTS_APPEND}",
+            storage_only_append(deployment_id)
+        ))
     }
 
     fn review() -> Self {
@@ -466,6 +488,180 @@ fn integration_agent_capture_tombstone_race() {
             .success(),
         "shutdown failed\n{}",
         read_log(&stderr)
+    );
+}
+
+/// Process-level WH-07 gates: real binary, push_auth=none, ingest-token auth,
+/// OpenAPI, cross-repo isolation. Does not assert an injected collector.
+#[test]
+fn storage_events_batch() {
+    let _gate = serial_gate();
+    let env = CaptureEnv::storage_only_with_events("it-default");
+    seed_target_secret(&env);
+    let (mut service, port, stdout, stderr) = boot_storage_only(&env);
+    let client = http_client();
+    let base = api_base(port);
+
+    let openapi = client
+        .get(format!("http://127.0.0.1:{port}/api/openapi.json"))
+        .send()
+        .expect("openapi");
+    assert_eq!(openapi.status().as_u16(), 200, "openapi");
+    let spec: serde_json::Value = openapi.json().expect("openapi json");
+    let paths = spec["paths"].as_object().expect("paths");
+    assert!(
+        paths.contains_key("/api/v1/agent-capture/sessions/{capture_id}/events:batch"),
+        "OpenAPI must still list events:batch"
+    );
+
+    let unauthorized = client
+        .post(format!("{base}/sessions/1/events:batch"))
+        .header("Authorization", "Bearer not-the-ingest-token")
+        .header("Content-Type", "application/json")
+        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#)
+        .send()
+        .expect("invalid token");
+    assert_eq!(
+        unauthorized.status().as_u16(),
+        401,
+        "invalid ingest token must 401 under push_auth=none"
+    );
+
+    let missing = client
+        .post(format!("{base}/sessions/1/events:batch"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{}}]}"#)
+        .send()
+        .expect("missing token");
+    assert_eq!(missing.status().as_u16(), 401, "missing token must 401");
+
+    let capture_id = put_session(&client, &base, "sess-wh07");
+    let accepted = client
+        .post(format!("{base}/sessions/{capture_id}/events:batch"))
+        .header("Authorization", bearer())
+        .header("Content-Type", "application/json")
+        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#)
+        .send()
+        .expect("events batch");
+    assert_eq!(accepted.status().as_u16(), 200, "valid ingest token");
+    let body: serde_json::Value = accepted.json().expect("batch json");
+    assert_eq!(body["accepted"], true);
+
+    let replay = client
+        .post(format!("{base}/sessions/{capture_id}/events:batch"))
+        .header("Authorization", bearer())
+        .header("Content-Type", "application/json")
+        .body(r#"{"batch_id":"b1","events":[{"event_uid":"0:0","event_kind":"message","payload":{"n":1}}]}"#)
+        .send()
+        .expect("replay");
+    assert_eq!(replay.status().as_u16(), 200, "replay stays 200");
+
+    let cross = client
+        .put(format!("{base}/repos/other%2Fapp/sessions/sess-cross"))
+        .header("Authorization", bearer())
+        .header("Content-Type", "application/json")
+        .body(r#"{"session_kind":"external_capture"}"#)
+        .send()
+        .expect("cross-repo session");
+    assert_eq!(
+        cross.status().as_u16(),
+        404,
+        "token must not cover a foreign repo"
+    );
+
+    assert!(
+        service
+            .shutdown_via_sigint(Duration::from_secs(60))
+            .success(),
+        "shutdown failed\nstdout:\n{}\nstderr:\n{}",
+        read_log(&stdout),
+        read_log(&stderr)
+    );
+    let captured = format!("{}{}", read_log(&stdout), read_log(&stderr));
+    assert!(
+        !captured.contains(SECRET_REF),
+        "logs must not contain the SecretRef URI"
+    );
+    assert!(
+        !captured.contains(INGEST_TOKEN),
+        "logs must not contain the ingest token"
+    );
+}
+
+fn seed_target_secret(env: &CaptureEnv) {
+    let bootstrap_path = env.temp_dir.path().join("bootstrap-config.toml");
+    fs::write(
+        &bootstrap_path,
+        format!(
+            r#"
+            [database]
+            db_type = "postgres"
+            db_url = "{}"
+            max_connection = 4
+            min_connection = 1
+            acquire_timeout = 5
+            connect_timeout = 5
+            sqlx_logging = false
+            "#,
+            env.database.db_url
+        ),
+    )
+    .expect("write bootstrap config");
+    let mut command = isolated_command(env.temp_dir.path(), &env.base_dir, &env.cache_dir);
+    command
+        .arg("--config")
+        .arg(&bootstrap_path)
+        .env("MEGA_LOG__PRINT_STD", "false")
+        .env("MEGA_LOG__WITH_ANSI", "false")
+        .args([
+            "config",
+            "secret",
+            "set",
+            "storage_events.targets.ops-main.secret_ref",
+            "--vault-path",
+            "config/it/storage_events/targets/ops-main/hmac",
+            "--field",
+            "value",
+            "--value-stdin",
+        ]);
+    let (out_path, err_path) = (
+        env.temp_dir.path().join("seed.out"),
+        env.temp_dir.path().join("seed.err"),
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(
+            fs::File::create(&out_path).expect("seed stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&err_path).expect("seed stderr"),
+        ));
+    let mut child = command.spawn().expect("spawn config secret set");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(HMAC_VALUE.as_bytes())
+        .expect("write stdin");
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll secret set") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "config secret set did not finish within the bound:\nstdout:\n{}\nstderr:\n{}",
+            read_log(&out_path),
+            read_log(&err_path),
+        );
+        sleep(Duration::from_millis(100));
+    };
+    assert!(
+        status.success(),
+        "config secret set must succeed: {status}\nstdout:\n{}\nstderr:\n{}",
+        read_log(&out_path),
+        read_log(&err_path),
     );
 }
 

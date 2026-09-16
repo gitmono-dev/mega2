@@ -9,10 +9,21 @@ use uuid::Uuid;
 use crate::{
     callisto::{agent_capture_blob, agent_capture_session},
     common::errors::MegaError,
-    jupiter::storage::{
-        agent_capture_storage::AgentCaptureStorage,
-        base_storage::{BaseStorage, StorageConnector},
-        object_storage::{MegaObjectStorageWrapper, mock_object_storage},
+    jupiter::{
+        service::{
+            storage_event::{
+                CommittedEvent, EventData, EventScope, EventSource, EventType,
+                validate_canonical_path,
+            },
+            storage_event_emitter::StorageEventEmitter,
+        },
+        storage::{
+            agent_capture_storage::{
+                AgentCaptureStorage, EventsBatchGroup, EventsBatchSnapshot, InsertEvent,
+            },
+            base_storage::{BaseStorage, StorageConnector},
+            object_storage::{MegaObjectStorageWrapper, mock_object_storage},
+        },
     },
     orbit_api::object_storage::{ObjectByteStream, ObjectKey, ObjectMeta, ObjectNamespace},
 };
@@ -21,6 +32,7 @@ use crate::{
 pub struct AgentCaptureService {
     pub storage: AgentCaptureStorage,
     pub obj_storage: MegaObjectStorageWrapper,
+    pub storage_event_emitter: StorageEventEmitter,
 }
 
 impl AgentCaptureService {
@@ -30,6 +42,7 @@ impl AgentCaptureService {
                 base: BaseStorage::mock(),
             },
             obj_storage: mock_object_storage(),
+            storage_event_emitter: StorageEventEmitter::disabled(),
         }
     }
 
@@ -87,6 +100,57 @@ impl AgentCaptureService {
             .put_stream(&key, copy_stream, meta)
             .await?;
         Ok(digest)
+    }
+
+    /// Commit an events batch and emit `agent_capture.events.committed` only
+    /// when this transaction inserted new event rows. The outbound payload is
+    /// built from the committed snapshot; send tasks never re-read session
+    /// latest state (WH-07 / AC5).
+    pub async fn commit_events_batch(
+        &self,
+        capture_id: i64,
+        batch_id: &str,
+        events: &[InsertEvent],
+        completeness: Option<&str>,
+        stream_kind: &str,
+    ) -> Result<EventsBatchSnapshot, MegaError> {
+        let snapshot = self
+            .storage
+            .insert_events_batch(capture_id, batch_id, events, completeness, stream_kind)
+            .await?;
+        for group in &snapshot.groups {
+            if group.new_event_count > 0
+                && let Ok(event) = Self::events_committed_event(&snapshot, group)
+            {
+                let _ = self.storage_event_emitter.try_emit(event);
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn events_committed_event(
+        snapshot: &EventsBatchSnapshot,
+        group: &EventsBatchGroup,
+    ) -> Result<CommittedEvent, MegaError> {
+        validate_canonical_path(&snapshot.repo_path)?;
+        Ok(CommittedEvent {
+            event_id: Uuid::new_v4(),
+            event_type: EventType::AgentCaptureEventsCommitted,
+            occurred_at: u64::try_from(Utc::now().timestamp()).unwrap_or(0),
+            source: EventSource::AgentCapture,
+            scope: EventScope::AgentCapture {
+                tenant_id: snapshot.tenant_id.clone(),
+                repo_path: snapshot.repo_path.clone(),
+            },
+            data: EventData::AgentCaptureEventsCommitted {
+                capture_id: snapshot.capture_id.to_string(),
+                receipt_id: snapshot.receipt_id.to_string(),
+                new_event_count: group.new_event_count,
+                stream_kind: snapshot.stream_kind.clone(),
+                generation: group.generation,
+                completeness: snapshot.completeness.clone(),
+            },
+        })
     }
 
     pub async fn load_session(
@@ -335,14 +399,17 @@ async fn sha256_hex(mut stream: ObjectByteStream) -> Result<String, MegaError> {
 mod tests {
     use bytes::Bytes;
     use futures::stream;
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter};
 
     use super::*;
     use crate::{
-        callisto::agent_capture_blob,
+        callisto::{agent_capture_blob, agent_capture_session},
         jupiter::{
             migration::apply_migrations,
-            storage::{agent_capture_storage::SessionNaturalKey, base_storage::StorageConnector},
+            storage::{
+                agent_capture_storage::{InsertEvent, SessionNaturalKey},
+                base_storage::StorageConnector,
+            },
             tests::test_db_connection,
         },
     };
@@ -487,6 +554,7 @@ mod tests {
                 base: BaseStorage::new(std::sync::Arc::new(db)),
             },
             obj_storage: mock_object_storage(),
+            storage_event_emitter: StorageEventEmitter::disabled(),
         };
         let capture_id = service
             .storage
@@ -555,5 +623,301 @@ mod tests {
             .expect("retry after cleanup");
         assert_eq!(first.digest, second.digest);
         assert_eq!(first.object_key, second.object_key);
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        target_ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingTransport {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<bytes::Bytes> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+
+        fn target_ids(&self) -> Vec<String> {
+            self.target_ids.lock().expect("ids").clone()
+        }
+    }
+
+    impl crate::jupiter::service::storage_event_transport::EventTransport for RecordingTransport {
+        fn post(
+            &self,
+            target: &crate::jupiter::service::storage_event_transport::EventTarget,
+            body: bytes::Bytes,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::jupiter::service::storage_event_transport::TransportSuccess,
+                            crate::jupiter::service::storage_event_transport::TransportError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bodies.lock().expect("bodies").push(body);
+            self.target_ids.lock().expect("ids").push(target.id.clone());
+            Box::pin(async {
+                Ok(
+                    crate::jupiter::service::storage_event_transport::TransportSuccess::Accepted2xx {
+                        status: 200,
+                    },
+                )
+            })
+        }
+    }
+
+    fn wh07_target(
+        id: &str,
+        tenants: Vec<String>,
+        repos: Vec<String>,
+    ) -> (
+        crate::config::StorageEventsTargetConfig,
+        crate::jupiter::service::storage_event_transport::EventTarget,
+    ) {
+        let config = crate::config::StorageEventsTargetConfig {
+            id: id.to_owned(),
+            url: "https://events.example.invalid/ingest".to_owned(),
+            secret_ref: format!("vault://secret/config/it/storage_events/targets/{id}/hmac#value"),
+            events: vec!["agent_capture.events.committed".to_owned()],
+            git_paths: Vec::new(),
+            oci_repositories: Vec::new(),
+            lfs_paths: Vec::new(),
+            include_unscoped_lfs: false,
+            agent_tenants: tenants,
+            agent_repo_paths: repos,
+        };
+        let secret = crate::config::secret::SecretString::new(
+            "hex:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        let compiled = crate::jupiter::service::storage_event_transport::EventTarget::compile(
+            &config.id,
+            &config.url,
+            &secret,
+        )
+        .expect("compile target");
+        (config, compiled)
+    }
+
+    fn wh07_emitter(
+        transport: std::sync::Arc<RecordingTransport>,
+        targets: Vec<(
+            crate::config::StorageEventsTargetConfig,
+            crate::jupiter::service::storage_event_transport::EventTarget,
+        )>,
+    ) -> StorageEventEmitter {
+        let mut config =
+            crate::config::testing::isolated_config(std::env::temp_dir().join("wh07-batch"));
+        config.monorepo.push_policy = crate::config::PushPolicy::Trunk;
+        config.git.push_auth = Some(crate::config::PushAuth::None);
+        config.git.ssh_receive_pack = Some(false);
+        config.storage_events.enabled = true;
+        config.storage_events.installation_id = Some("it-wh07".to_owned());
+        StorageEventEmitter::new_with_transport(&config, transport, targets)
+    }
+
+    async fn wh07_wait_calls(transport: &RecordingTransport, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if transport.calls() >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delivery within 2s");
+    }
+
+    fn wh07_event(capture_id: i64, uid: &str, n: i64) -> InsertEvent {
+        InsertEvent {
+            capture_id,
+            event_uid: uid.to_owned(),
+            event_kind: "message".to_owned(),
+            native_id: None,
+            lifecycle_seq: None,
+            payload: serde_json::json!({ "n": n }),
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_event_batch_snapshot() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db = test_db_connection(temp_dir.path()).await;
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+        let transport = std::sync::Arc::new(RecordingTransport::default());
+        let emitter = wh07_emitter(
+            transport.clone(),
+            vec![
+                wh07_target(
+                    "ops-main",
+                    vec!["default".to_owned()],
+                    vec!["/third-part/mega".to_owned()],
+                ),
+                wh07_target(
+                    "other-tenant",
+                    vec!["other".to_owned()],
+                    vec!["/third-part/mega".to_owned()],
+                ),
+                wh07_target(
+                    "other-repo",
+                    vec!["default".to_owned()],
+                    vec!["/other/repo".to_owned()],
+                ),
+            ],
+        );
+        let service = AgentCaptureService {
+            storage: AgentCaptureStorage {
+                base: BaseStorage::new(std::sync::Arc::new(db)),
+            },
+            obj_storage: mock_object_storage(),
+            storage_event_emitter: emitter,
+        };
+        let capture_id = service
+            .storage
+            .upsert_session(SessionNaturalKey {
+                deployment_id: "default".to_owned(),
+                tenant_id: "default".to_owned(),
+                repo_id: "/third-part/mega".to_owned(),
+                producer_id: "hook".to_owned(),
+                session_kind: "external_capture".to_owned(),
+                client_session_id: "provider__wh07".to_owned(),
+            })
+            .await
+            .expect("session");
+
+        let snapshot = service
+            .commit_events_batch(
+                capture_id,
+                "b1",
+                &[wh07_event(capture_id, "0:0", 1)],
+                Some("complete"),
+                "jsonl",
+            )
+            .await
+            .expect("commit");
+        assert_eq!(snapshot.new_event_count, 1);
+        assert_eq!(snapshot.completeness, "complete");
+        assert_eq!(snapshot.stream_kind, "external_capture");
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].generation, 0);
+        wh07_wait_calls(&transport, 1).await;
+        assert_eq!(transport.calls(), 1, "exactly one matching target");
+        assert_eq!(transport.target_ids(), vec!["ops-main".to_owned()]);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&transport.bodies()[0]).expect("envelope");
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["event_type"], "agent_capture.events.committed");
+        assert_eq!(envelope["source"], "agent_capture");
+        assert_eq!(envelope["scope"]["tenant_id"], "default");
+        assert_eq!(envelope["scope"]["repo_path"], "/third-part/mega");
+        assert!(envelope["scope"]["oci_repository"].is_null());
+        assert_eq!(envelope["data"]["capture_id"], capture_id.to_string());
+        assert_eq!(
+            envelope["data"]["receipt_id"],
+            snapshot.receipt_id.to_string()
+        );
+        assert_eq!(envelope["data"]["new_event_count"], 1);
+        assert_eq!(envelope["data"]["stream_kind"], "external_capture");
+        assert_eq!(envelope["data"]["generation"], 0);
+        assert_eq!(envelope["data"]["completeness"], "complete");
+
+        let mut session = agent_capture_session::Entity::find_by_id(capture_id)
+            .one(service.storage.get_connection())
+            .await
+            .expect("load")
+            .expect("session");
+        session.completeness = "truncated".to_owned();
+        let mut active = session.into_active_model();
+        active.completeness = sea_orm::Set("truncated".to_owned());
+        active
+            .update(service.storage.get_connection())
+            .await
+            .expect("mutate latest completeness");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let after: serde_json::Value =
+            serde_json::from_slice(&transport.bodies()[0]).expect("frozen envelope");
+        assert_eq!(
+            after["data"]["completeness"], "complete",
+            "delayed send must not re-read session latest"
+        );
+
+        let replay = service
+            .commit_events_batch(
+                capture_id,
+                "b1",
+                &[wh07_event(capture_id, "0:0", 1)],
+                Some("complete"),
+                "jsonl",
+            )
+            .await
+            .expect("replay");
+        assert_eq!(replay.new_event_count, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 1, "replay must not emit");
+
+        let zero = service
+            .commit_events_batch(
+                capture_id,
+                "b2",
+                &[wh07_event(capture_id, "0:0", 1)],
+                None,
+                "jsonl",
+            )
+            .await
+            .expect("old uid new receipt");
+        assert_eq!(zero.new_event_count, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(transport.calls(), 1, "zero new rows must not emit");
+
+        let two_gens = service
+            .commit_events_batch(
+                capture_id,
+                "b3",
+                &[
+                    wh07_event(capture_id, "3:0", 3),
+                    wh07_event(capture_id, "4:0", 4),
+                ],
+                None,
+                "jsonl",
+            )
+            .await
+            .expect("two generations");
+        assert_eq!(two_gens.new_event_count, 2);
+        assert_eq!(two_gens.groups.len(), 2);
+        assert_eq!(two_gens.completeness, "truncated");
+        wh07_wait_calls(&transport, 3).await;
+        assert_eq!(
+            transport.calls(),
+            3,
+            "one outbound summary per new generation"
+        );
+        assert!(
+            transport.target_ids().iter().all(|id| id == "ops-main"),
+            "AND isolation: only the matching target is selected"
+        );
+        let bodies = transport.bodies();
+        let gens: Vec<u64> = bodies[1..]
+            .iter()
+            .map(|body| {
+                let envelope: serde_json::Value = serde_json::from_slice(body).expect("envelope");
+                envelope["data"]["generation"].as_u64().expect("generation")
+            })
+            .collect();
+        assert_eq!(gens, vec![3, 4]);
+        for body in &bodies[1..] {
+            let envelope: serde_json::Value = serde_json::from_slice(body).expect("envelope");
+            assert_eq!(envelope["data"]["new_event_count"], 1);
+            assert_eq!(envelope["data"]["completeness"], "truncated");
+        }
     }
 }

@@ -231,6 +231,8 @@ impl Storage {
         let agent_capture_service = AgentCaptureService {
             storage: AgentCaptureStorage { base: base.clone() },
             obj_storage: object_store.clone(),
+            storage_event_emitter:
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
         };
 
         let git_service = GitService {
@@ -354,9 +356,10 @@ impl Storage {
         &mut self,
         emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     ) {
-        // LfsService is built before the vault-bound emitter exists (WH-11),
-        // so rebinding must fan out to it (WH-05).
+        // LfsService / AgentCaptureService are built before the vault-bound
+        // emitter exists (WH-11), so rebinding must fan out (WH-05 / WH-07).
         self.lfs_service.storage_event_emitter = emitter.clone();
+        self.agent_capture_service.storage_event_emitter = emitter.clone();
         self.storage_event_emitter = emitter;
     }
 

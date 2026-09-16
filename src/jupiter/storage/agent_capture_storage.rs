@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{collections::BTreeMap, ops::Deref};
 
 use chrono::Utc;
 use sea_orm::{
@@ -58,6 +58,30 @@ pub struct InsertEvent {
     pub native_id: Option<String>,
     pub lifecycle_seq: Option<i64>,
     pub payload: serde_json::Value,
+}
+
+/// Immutable committed-batch snapshot for outbound `events.committed` (WH-07).
+/// `new_event_count` is the number of event rows this transaction actually
+/// inserted; replay / fingerprint match is 0. `groups` is one entry per
+/// generation that received new rows (ADR-WH-04: one summary per
+/// stream/generation). `stream_kind` is the session's `session_kind`
+/// (outbound), not the watermark stream name (`jsonl`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventsBatchSnapshot {
+    pub capture_id: i64,
+    pub receipt_id: i64,
+    pub new_event_count: u64,
+    pub stream_kind: String,
+    pub completeness: String,
+    pub tenant_id: String,
+    pub repo_path: String,
+    pub groups: Vec<EventsBatchGroup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventsBatchGroup {
+    pub generation: u64,
+    pub new_event_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,7 +345,7 @@ impl AgentCaptureStorage {
         events: &[InsertEvent],
         completeness: Option<&str>,
         stream_kind: &str,
-    ) -> Result<i64, MegaError> {
+    ) -> Result<EventsBatchSnapshot, MegaError> {
         let fingerprint = Self::events_batch_fingerprint(batch_id, events, completeness)?;
         let txn = self.get_connection().begin().await?;
         let result = self
@@ -336,9 +360,9 @@ impl AgentCaptureStorage {
             )
             .await;
         match result {
-            Ok(count) => {
+            Ok(snapshot) => {
                 txn.commit().await?;
-                Ok(count)
+                Ok(snapshot)
             }
             Err(err) => {
                 let _ = txn.rollback().await;
@@ -357,7 +381,7 @@ impl AgentCaptureStorage {
         completeness: Option<&str>,
         stream_kind: &str,
         fingerprint: &str,
-    ) -> Result<i64, MegaError> {
+    ) -> Result<EventsBatchSnapshot, MegaError> {
         let session = agent_capture_session::Entity::find_by_id(capture_id)
             .lock(LockType::Update)
             .one(txn)
@@ -378,7 +402,7 @@ impl AgentCaptureStorage {
         .await?
         {
             if existing.fingerprint == fingerprint {
-                return Ok(events.len() as i64);
+                return Ok(events_batch_snapshot(&session, existing.id, Vec::new()));
             }
             return Err(MegaError::Other(format!(
                 "ingest receipt fingerprint conflict for capture_id {capture_id}"
@@ -390,6 +414,7 @@ impl AgentCaptureStorage {
             return Err(MegaError::Other("invalid completeness".to_owned()));
         }
         let mut watermark: Option<(i64, i64)> = None;
+        let mut by_generation: BTreeMap<u64, u64> = BTreeMap::new();
         for event in events {
             let event_fingerprint = canonical_json::fingerprint(&event.payload.to_string())?;
             if let Some(existing) = agent_capture_event::Entity::find()
@@ -405,29 +430,70 @@ impl AgentCaptureStorage {
                     )));
                 }
             } else {
-                agent_capture_event::Entity::insert(agent_capture_event::ActiveModel {
-                    capture_id: Set(capture_id),
-                    event_uid: Set(event.event_uid.clone()),
-                    event_kind: Set(normalize_stored_event_kind(&event.event_kind)),
-                    native_id: Set(event.native_id.clone()),
-                    lifecycle_seq: Set(event.lifecycle_seq),
-                    payload: Set(event.payload.clone()),
-                    payload_fingerprint: Set(event_fingerprint),
-                    ..Default::default()
-                })
-                .exec(txn)
-                .await?;
-                if let Some((generation, byte_offset)) = parse_event_uid_parts(&event.event_uid) {
-                    watermark = Some(match watermark {
-                        Some((g, o)) if (generation, byte_offset) < (g, o) => (g, o),
-                        _ => (generation, byte_offset),
-                    });
+                let insert =
+                    agent_capture_event::Entity::insert(agent_capture_event::ActiveModel {
+                        capture_id: Set(capture_id),
+                        event_uid: Set(event.event_uid.clone()),
+                        event_kind: Set(normalize_stored_event_kind(&event.event_kind)),
+                        native_id: Set(event.native_id.clone()),
+                        lifecycle_seq: Set(event.lifecycle_seq),
+                        payload: Set(event.payload.clone()),
+                        payload_fingerprint: Set(event_fingerprint.clone()),
+                        ..Default::default()
+                    })
+                    .exec(txn)
+                    .await;
+                match insert {
+                    Ok(_) => match parse_event_uid_parts(&event.event_uid) {
+                        Some((uid_generation, byte_offset)) => {
+                            let group_generation = u64::try_from(uid_generation).unwrap_or(0);
+                            *by_generation.entry(group_generation).or_insert(0) += 1;
+                            watermark = Some(match watermark {
+                                Some((g, o)) if (uid_generation, byte_offset) < (g, o) => (g, o),
+                                _ => (uid_generation, byte_offset),
+                            });
+                        }
+                        None => {
+                            *by_generation.entry(0).or_insert(0) += 1;
+                        }
+                    },
+                    Err(err)
+                        if matches!(err, DbErr::RecordNotInserted)
+                            || is_unique_constraint_error(&err) =>
+                    {
+                        let existing = agent_capture_event::Entity::find()
+                            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+                            .filter(
+                                agent_capture_event::Column::EventUid.eq(event.event_uid.clone()),
+                            )
+                            .lock(LockType::Update)
+                            .one(txn)
+                            .await?
+                            .ok_or_else(|| {
+                                MegaError::Other(
+                                    "agent_capture_event unique conflict but row missing"
+                                        .to_owned(),
+                                )
+                            })?;
+                        if existing.payload_fingerprint != event_fingerprint {
+                            return Err(MegaError::Other(format!(
+                                "agent_capture_event uid conflict for capture_id {capture_id}"
+                            )));
+                        }
+                    }
+                    Err(err) => return Err(err.into()),
                 }
             }
         }
-        if let Some((generation, byte_offset)) = watermark {
-            self.advance_source_stream_txn(txn, capture_id, stream_kind, generation, byte_offset)
-                .await?;
+        if let Some((uid_generation, byte_offset)) = watermark {
+            self.advance_source_stream_txn(
+                txn,
+                capture_id,
+                stream_kind,
+                uid_generation,
+                byte_offset,
+            )
+            .await?;
         }
         let mut session = session;
         if let Some(next) = completeness
@@ -442,20 +508,59 @@ impl AgentCaptureStorage {
             active.completeness = Set("incomplete".to_owned());
             session = active.update(txn).await?;
         }
-        agent_capture_ingest_receipt::Entity::insert(agent_capture_ingest_receipt::ActiveModel {
-            deployment_id: Set(session.deployment_id.clone()),
-            tenant_id: Set(session.tenant_id.clone()),
-            producer_id: Set(session.producer_id.clone()),
-            capture_id: Set(capture_id),
-            operation: Set("event.batch".to_owned()),
-            idempotency_key: Set(batch_id.to_owned()),
-            fingerprint: Set(fingerprint.to_owned()),
-            response: Set(Some(serde_json::json!({ "event_count": events.len() }))),
-            ..Default::default()
-        })
+        let receipt = agent_capture_ingest_receipt::Entity::insert(
+            agent_capture_ingest_receipt::ActiveModel {
+                deployment_id: Set(session.deployment_id.clone()),
+                tenant_id: Set(session.tenant_id.clone()),
+                producer_id: Set(session.producer_id.clone()),
+                capture_id: Set(capture_id),
+                operation: Set("event.batch".to_owned()),
+                idempotency_key: Set(batch_id.to_owned()),
+                fingerprint: Set(fingerprint.to_owned()),
+                response: Set(Some(serde_json::json!({ "event_count": events.len() }))),
+                ..Default::default()
+            },
+        )
         .exec(txn)
-        .await?;
-        Ok(events.len() as i64)
+        .await;
+        let receipt_id = match receipt {
+            Ok(inserted) => inserted.last_insert_id,
+            Err(err)
+                if matches!(err, DbErr::RecordNotInserted) || is_unique_constraint_error(&err) =>
+            {
+                let existing = Self::receipt_by_scope(
+                    &session.deployment_id,
+                    &session.tenant_id,
+                    &session.producer_id,
+                    capture_id,
+                    "event.batch",
+                    batch_id,
+                )
+                .one(txn)
+                .await?
+                .ok_or_else(|| {
+                    MegaError::Other("ingest receipt unique conflict but row missing".to_owned())
+                })?;
+                if existing.fingerprint == fingerprint {
+                    return Ok(events_batch_snapshot(&session, existing.id, Vec::new()));
+                }
+                return Err(MegaError::Other(format!(
+                    "ingest receipt fingerprint conflict for capture_id {capture_id}"
+                )));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Ok(events_batch_snapshot(
+            &session,
+            receipt_id,
+            by_generation
+                .into_iter()
+                .map(|(generation, new_event_count)| EventsBatchGroup {
+                    generation,
+                    new_event_count,
+                })
+                .collect(),
+        ))
     }
 
     /// Advance a source-stream watermark. `(generation, byte_offset)` must
@@ -2295,6 +2400,24 @@ fn normalize_stored_event_kind(kind: &str) -> String {
     }
 }
 
+fn events_batch_snapshot(
+    session: &agent_capture_session::Model,
+    receipt_id: i64,
+    groups: Vec<EventsBatchGroup>,
+) -> EventsBatchSnapshot {
+    let new_event_count = groups.iter().map(|group| group.new_event_count).sum();
+    EventsBatchSnapshot {
+        capture_id: session.id,
+        receipt_id,
+        new_event_count,
+        stream_kind: session.session_kind.clone(),
+        completeness: session.completeness.clone(),
+        tenant_id: session.tenant_id.clone(),
+        repo_path: session.repo_id.clone(),
+        groups,
+    }
+}
+
 fn parse_event_uid_parts(uid: &str) -> Option<(i64, i64)> {
     let (generation, offset) = uid.split_once(':')?;
     if generation.is_empty()
@@ -3455,5 +3578,162 @@ mod tests {
             .await
             .expect("receipts");
         assert_eq!(receipts, 0);
+    }
+
+    fn insert_event(capture_id: i64, uid: &str, n: i64) -> InsertEvent {
+        InsertEvent {
+            capture_id,
+            event_uid: uid.to_owned(),
+            event_kind: "message".to_owned(),
+            native_id: None,
+            lifecycle_seq: None,
+            payload: serde_json::json!({ "n": n }),
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_event_receipt_new_rows() {
+        let (_temp_dir, storage) = storage().await;
+        let capture_id = storage.upsert_session(sample_key()).await.expect("session");
+        let first = storage
+            .insert_events_batch(
+                capture_id,
+                "b-new",
+                &[insert_event(capture_id, "0:0", 1)],
+                None,
+                "jsonl",
+            )
+            .await
+            .expect("first insert");
+        assert_eq!(first.new_event_count, 1);
+        assert!(first.receipt_id > 0);
+        assert_eq!(first.stream_kind, "external_capture");
+        assert_eq!(
+            first.groups,
+            vec![EventsBatchGroup {
+                generation: 0,
+                new_event_count: 1,
+            }]
+        );
+        assert_eq!(first.completeness, "incomplete");
+        assert_eq!(first.tenant_id, "default");
+        assert_eq!(first.repo_path, "/third-part/mega");
+        assert_eq!(first.capture_id, capture_id);
+        let rows = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+
+        let replay = storage
+            .insert_events_batch(
+                capture_id,
+                "b-new",
+                &[insert_event(capture_id, "0:0", 1)],
+                None,
+                "jsonl",
+            )
+            .await
+            .expect("replay");
+        assert_eq!(replay.new_event_count, 0);
+        assert!(replay.groups.is_empty());
+        assert_eq!(replay.receipt_id, first.receipt_id);
+        let rows = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count after replay");
+        assert_eq!(rows, 1);
+
+        let mixed = storage
+            .insert_events_batch(
+                capture_id,
+                "b-mixed",
+                &[
+                    insert_event(capture_id, "0:0", 1),
+                    insert_event(capture_id, "1:0", 2),
+                ],
+                Some("complete"),
+                "jsonl",
+            )
+            .await
+            .expect("mixed");
+        assert_eq!(mixed.new_event_count, 1, "only the new uid counts");
+        assert_eq!(
+            mixed.groups,
+            vec![EventsBatchGroup {
+                generation: 1,
+                new_event_count: 1,
+            }]
+        );
+        assert_eq!(mixed.completeness, "complete");
+        let two_gens = storage
+            .insert_events_batch(
+                capture_id,
+                "b-two-gens",
+                &[
+                    insert_event(capture_id, "3:0", 4),
+                    insert_event(capture_id, "4:0", 5),
+                ],
+                None,
+                "jsonl",
+            )
+            .await
+            .expect("two new generations");
+        assert_eq!(two_gens.new_event_count, 2);
+        assert_eq!(
+            two_gens.groups,
+            vec![
+                EventsBatchGroup {
+                    generation: 3,
+                    new_event_count: 1,
+                },
+                EventsBatchGroup {
+                    generation: 4,
+                    new_event_count: 1,
+                },
+            ]
+        );
+        let rows = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count after two generations");
+        assert_eq!(rows, 4);
+
+        let left = storage.clone();
+        let right = storage.clone();
+        let concurrent_left = [insert_event(capture_id, "5:0", 6)];
+        let concurrent_right = [insert_event(capture_id, "5:0", 6)];
+        let (a, b) = tokio::join!(
+            left.insert_events_batch(capture_id, "b-concurrent", &concurrent_left, None, "jsonl",),
+            right
+                .insert_events_batch(capture_id, "b-concurrent", &concurrent_right, None, "jsonl",)
+        );
+        let a = a.expect("concurrent left");
+        let b = b.expect("concurrent right");
+        assert_eq!(
+            a.new_event_count + b.new_event_count,
+            1,
+            "concurrent same receipt inserts exactly one new row: {a:?} {b:?}"
+        );
+        assert!(
+            (a.new_event_count == 1 && b.new_event_count == 0)
+                || (a.new_event_count == 0 && b.new_event_count == 1)
+        );
+        let rows = agent_capture_event::Entity::find()
+            .filter(agent_capture_event::Column::CaptureId.eq(capture_id))
+            .count(storage.get_connection())
+            .await
+            .expect("count after concurrent");
+        assert_eq!(rows, 5);
+        let receipts = agent_capture_ingest_receipt::Entity::find()
+            .filter(agent_capture_ingest_receipt::Column::CaptureId.eq(capture_id))
+            .filter(agent_capture_ingest_receipt::Column::IdempotencyKey.eq("b-concurrent"))
+            .count(storage.get_connection())
+            .await
+            .expect("concurrent receipts");
+        assert_eq!(receipts, 1);
     }
 }
