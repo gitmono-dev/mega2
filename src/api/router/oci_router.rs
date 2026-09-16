@@ -34,6 +34,7 @@ use crate::{
             ManifestIndex, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
         },
     },
+    common::oci_name::valid_repository_name,
     config::PushAuth,
     contract::git_protocol::{lookup_push_token, token_covers_repo},
     jupiter::{
@@ -45,16 +46,6 @@ const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const REGISTRY_API_VERSION: &str = "registry/2.0";
 /// Default / max page size for `GET .../tags/list` (`n` query).
 const DEFAULT_TAGS_PAGE_SIZE: u64 = 100;
-
-/// OCI repository path (`remoteName`): one or more `/`-separated path components.
-/// Each component is `alphanumeric(?:(?:[._]|__|[-]+)alphanumeric)*`, matching
-/// distribution `reference.pathComponent` / `remoteName` (without optional domain).
-static REPOSITORY_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*$",
-    )
-    .expect("repository name regex")
-});
 
 static TAG_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\w][\w.-]{0,127}$").expect("tag name regex"));
@@ -1145,13 +1136,6 @@ fn supported_media_type(media_type: &str) -> bool {
             | OCI_MANIFEST_MEDIA_TYPE
             | OCI_INDEX_MEDIA_TYPE
     )
-}
-
-fn valid_repository_name(name: &str) -> bool {
-    if name.is_empty() || name.split('/').any(|segment| segment == "..") {
-        return false;
-    }
-    REPOSITORY_NAME.is_match(name)
 }
 
 fn valid_tag(tag: &str) -> bool {

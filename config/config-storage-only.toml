@@ -377,13 +377,17 @@ enabled = false
 [storage_events]
 enabled = false
 # installation_id = "prod-primary-01"
+# max_in_flight = 16              # 1..=64
+# connect_timeout_seconds = 2     # 1..=5
+# request_timeout_seconds = 5     # 1..=10
+# shutdown_grace_seconds = 5      # 0..=10; 0 aborts in-flight sends at once
 # [[storage_events.targets]]
 # id = "ops-main"
 # url = "https://events.example.invalid/ingest"
 # secret_ref = "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
 # events = ["repo.push", "oci.manifest.published", "lfs.object.uploaded", "lfs.media.finalized", "agent_capture.events.committed", "agent_capture.checkpoint.committed"]
 # git_paths = ["/team/a"]
-# oci_repositories = []
+# oci_repositories = []  # canonical lowercase distribution remoteName, same rule as inbound /v2
 # lfs_paths = ["/team/a.git"]  # media scope keeps the HTTP `.git` suffix; `/team/a` will not match
 # include_unscoped_lfs = false
 # agent_tenants = []

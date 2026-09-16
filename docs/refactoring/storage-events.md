@@ -2,7 +2,7 @@
 
 本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`，WH-08 挂上 checkpoint 提交的 `agent_capture.checkpoint.committed`。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-12/WH-10/WH-02/WH-13/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08 均已发布）：** 配置表面 + HTTPS HMAC 运输 + DNS 地址钉住（WH-12）+ 事件投影与静态过滤（WH-10）+ 有界 emitter 运行时（WH-02）+ CLI/service 清理尾段（WH-13）+ 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`，WH-08 挂上 checkpoint 提交的 `agent_capture.checkpoint.committed`。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -12,15 +12,17 @@
 |---|---|---|
 | `enabled` | `false` | 出站开关；启用要求 storage-only |
 | `installation_id` | 省略 | 启用时必填；1..64 ASCII `[A-Za-z0-9_-]`；部署侧生成并持久写入，重启不得变 |
-| `max_in_flight` | `16` | 后续运行时在途上限（本卡只装载） |
+| `max_in_flight` | `16` | 运行时在途上限，范围 1..=64 |
 | `connect_timeout_seconds` | `2` | 连接超时，范围 1..=5 |
 | `request_timeout_seconds` | `5` | 含 DNS 的整段请求超时，范围 1..=10 |
-| `shutdown_grace_seconds` | `5` | 后续关停宽限（本卡只装载） |
+| `shutdown_grace_seconds` | `5` | 关停宽限，范围 0..=10（WH-14）；`0` 表示立即 abort 在途任务，上界保证 ADR-WH-03 的 drain 有界 |
 | `targets` | `[]` | 静态接收者；enabled 且为空合法（无接收者） |
 
-`[[storage_events.targets]]` 在该项存在时必填 `id`、`url`、`secret_ref`、非空 `events`。`id` 为 1..32 ASCII `[A-Za-z0-9_-]`，不得重复。过滤数组缺省为空（空集合表示该来源不订阅，不是通配）。`url` 必须是 HTTPS，禁止 userinfo / query / fragment（disabled 同样拒绝非法形状）。事件字面量与 canonical 路径由后续卡校验。
+`[[storage_events.targets]]` 在该项存在时必填 `id`、`url`、`secret_ref`、非空 `events`。`id` 为 1..32 ASCII `[A-Za-z0-9_-]`，不得重复。过滤数组缺省为空（空集合表示该来源不订阅，不是通配）。`url` 必须是 HTTPS，禁止 userinfo / query / fragment。以上数值范围与结构校验在 disabled 形态同样执行，只跳过 vault 取值。
 
-## 运输（WH-09，未注入应用）
+过滤项按来源各自的维度校验（WH-10 / WH-14）：`git_paths`、`lfs_paths`、`agent_repo_paths` 必须是绝对 canonical 路径；`oci_repositories` 必须是 canonical 小写 distribution `remoteName`，与入站 `/v2` 用同一判定——`valid_repository_name` 的唯一实现在 `src/common/oci_name.rs`，由 OCI router 与 config 校验共用（GC-02），大小写敏感、不做折叠。router 永不会产生的名字也永不会匹配，这种过滤项是静默失效的订阅，故 fail-closed 拒绝而不是接受。`agent_tenants` 与服务端值逐字比较。每个集合上限 64 项、每项 1..=256 bytes。
+
+## 运输（WH-09；自 WH-11 起注入应用）
 
 `HttpsEventTransport` 对每个 target 单次 POST，不重试（含 429/5xx）。禁止跟随 redirect，禁用环境代理。签名头：
 
