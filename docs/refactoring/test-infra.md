@@ -136,9 +136,9 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | 项 | 值 |
 |---|---|
 | 服务名 | `rustfs`、`rustfs-init` |
-| 镜像 | `rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c`；桶初始化客户端 `minio/mc:RELEASE.2025-04-16T18-13-26Z`（固定 tag，非 `latest`；`mc` 仅作通用 S3 客户端） |
+| 镜像 | `rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`；桶初始化客户端 `rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699`（固定 tag，非 `latest`；`rc` 为 RustFS 官方 S3 客户端，不使用 MinIO `mc`） |
 | 端口 | `127.0.0.1:19000:9000`、`127.0.0.1:19001:9001`（高位 + 仅回环；S3 API / console） |
-| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`；`rustfs-init`：`mc ls local/mega2` **且** `mc ls local/monoui`（建桶后 `sleep infinity`，见 `docker-compose.test.yml`） |
+| healthcheck | `rustfs`：`curl -f http://127.0.0.1:9000/health`；`rustfs-init`：`rc ls local/mega2` **且** `rc ls local/monoui`（建桶后 `sleep infinity`，见 `docker-compose.test.yml`） |
 | 网络 | 默认 `networks.default` → `mega2-test-network` |
 | 卷 / 工作目录 | `rustfs` 使用容器内路径 `/data`（`RUSTFS_VOLUMES=/data`），**无**宿主机 bind-mount；单盘本地 smoke 设 `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`。数据仅存在于该容器可写层，`down -v` 后不保留。`rustfs-init` 无持久卷（建桶后常驻，供 `--wait`） |
 | profiles | 无；两者均参与默认 `up -d --wait`。`rustfs-init` 在 `rustfs` healthy 后幂等创建 **`mega2`** 与 **`monoui`** 桶，再以 healthcheck 报告就绪（纯 one-shot exit 会让 `--wait` 失败） |
