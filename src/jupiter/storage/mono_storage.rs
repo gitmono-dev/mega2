@@ -26,7 +26,7 @@ use sea_orm::{
 use crate::{
     callisto::{
         mega_blob, mega_cl, mega_commit, mega_ref_tombstones, mega_refs, mega_tag, mega_tree,
-        mst2_verified_object,
+        mst2_publication, mst2_publication_outbox, mst2_verified_object,
     },
     common::{
         errors::MegaError,
@@ -1751,6 +1751,106 @@ impl MonoStorage {
         }
     }
 
+    /// Record one namespace publication inside the caller's transaction
+    /// (spec 09 §1/§7): bump the per-namespace sequence, insert the
+    /// receipt and append the outbox event — atomically with the ref CAS
+    /// the same transaction performs.
+    ///
+    /// Idempotent on `operation_id`: a retried writer gets back the
+    /// original sequence and neither the counter nor the outbox advances
+    /// twice (PUB-11).
+    pub async fn record_publication_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        operation_id: &str,
+        namespace: &str,
+        old_oid: &str,
+        new_oid: &str,
+        writer_kind: &str,
+    ) -> Result<i64, MegaError> {
+        // Replay short-circuit: an existing receipt is returned as-is.
+        if let Some(existing) = mst2_publication::Entity::find()
+            .filter(mst2_publication::Column::OperationId.eq(operation_id))
+            .one(txn)
+            .await?
+        {
+            return Ok(existing.sequence);
+        }
+        // Upsert the sequence row and bump it atomically; the unique
+        // namespace key makes this a single-winner counter.
+        let backend = txn.get_database_backend();
+        let bump = sea_orm::Statement::from_sql_and_values(
+            backend,
+            r#"INSERT INTO mst2_namespace_seq ("namespace", "sequence", "epoch")
+               VALUES ($1, 1, 1)
+               ON CONFLICT ("namespace") DO UPDATE SET "sequence" = "mst2_namespace_seq"."sequence" + 1
+               RETURNING "sequence""#,
+            [namespace.into()],
+        );
+        let row = txn
+            .query_one_raw(bump)
+            .await?
+            .ok_or_else(|| MegaError::Other("mst2_namespace_seq upsert returned no row".into()))?;
+        let sequence: i64 = row.try_get_by_index(0)?;
+        let now = chrono::Utc::now().fixed_offset();
+
+        mst2_publication::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            operation_id: Set(operation_id.to_string()),
+            namespace: Set(namespace.to_string()),
+            sequence: Set(sequence),
+            old_oid: Set(old_oid.to_string()),
+            new_oid: Set(new_oid.to_string()),
+            writer_epoch: Set(1),
+            writer_kind: Set(writer_kind.to_string()),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+
+        mst2_publication_outbox::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            operation_id: Set(operation_id.to_string()),
+            namespace: Set(namespace.to_string()),
+            sequence: Set(sequence),
+            state: Set("PENDING".to_string()),
+            created_at: Set(now),
+        }
+        .insert(txn)
+        .await?;
+        Ok(sequence)
+    }
+
+    /// Canonical publication namespace for a repository path: a leading
+    /// slash, no trailing slash, root is `/`. Publication identities are
+    /// keyed on this so `/p/` and `/p` never count as two namespaces.
+    pub fn normalize_namespace(&self, path: &str) -> String {
+        let trimmed = path.trim_matches('/');
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{trimmed}")
+        }
+    }
+
+    /// Latest publication sequence for a namespace (0 when none yet).
+    /// Reads committed state only; used by the snapshot resolve surface to
+    /// report a durable `publication_sequence` instead of the provisional
+    /// in-memory counter.
+    pub async fn publication_sequence(&self, namespace: &str) -> Result<i64, MegaError> {
+        let row = sea_orm::Statement::from_sql_and_values(
+            self.get_connection().get_database_backend(),
+            r#"SELECT COALESCE(MAX("sequence"), 0) FROM mst2_publication WHERE "namespace" = $1"#,
+            [namespace.into()],
+        );
+        let result = self
+            .get_connection()
+            .query_one_raw(row)
+            .await?
+            .ok_or_else(|| MegaError::Other("publication sequence query returned no row".into()))?;
+        Ok(result.try_get_by_index::<i64>(0)?)
+    }
+
     pub async fn get_tag_by_name(&self, name: &str) -> Result<Option<mega_tag::Model>, MegaError> {
         let res = mega_tag::Entity::find()
             .filter(mega_tag::Column::TagName.eq(name.to_string()))
@@ -3006,6 +3106,122 @@ mod tests {
         );
         let child_row = mono.get_main_ref("/child").await.unwrap().unwrap();
         assert_eq!(child_row.ref_commit_hash, c_child.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn mst2_publication_records_atomically_with_its_transaction() {
+        use crate::callisto::{mst2_publication, mst2_publication_outbox};
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        // Rollback ⇒ nothing visible: the receipt commits only with the
+        // ref CAS in the same transaction (spec 09 §1).
+        let txn = mono.get_connection().begin().await.unwrap();
+        mono.record_publication_in_txn(&txn, "op-roll", "/", "", "aaa", "trunk_push")
+            .await
+            .unwrap();
+        txn.rollback().await.unwrap();
+        assert_eq!(mono.publication_sequence("/").await.unwrap(), 0);
+        assert!(
+            mst2_publication::Entity::find()
+                .filter(mst2_publication::Column::OperationId.eq("op-roll"))
+                .one(mono.get_connection())
+                .await
+                .unwrap()
+                .is_none(),
+            "rolled-back publication must leave no receipt"
+        );
+
+        // Committed publications advance a single monotonic sequence and
+        // append exactly one outbox row each.
+        for (op, old, new) in [("op-1", "", "a1"), ("op-2", "a1", "a2")] {
+            let txn = mono.get_connection().begin().await.unwrap();
+            let seq = mono
+                .record_publication_in_txn(&txn, op, "/", old, new, "trunk_push")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            assert_eq!(seq, if op == "op-1" { 1 } else { 2 });
+        }
+        assert_eq!(mono.publication_sequence("/").await.unwrap(), 2);
+        assert_eq!(
+            mst2_publication_outbox::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Replay of a committed operation returns the original sequence and
+        // adds nothing (PUB-11) — the push retry path depends on this.
+        let txn = mono.get_connection().begin().await.unwrap();
+        let again = mono
+            .record_publication_in_txn(&txn, "op-1", "/", "", "a1", "trunk_push")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(again, 1, "replay must not re-advance the sequence");
+        assert_eq!(mono.publication_sequence("/").await.unwrap(), 2);
+        assert_eq!(
+            mst2_publication_outbox::Entity::find()
+                .count(mono.get_connection())
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Distinct namespaces keep independent sequences.
+        let txn = mono.get_connection().begin().await.unwrap();
+        let other = mono
+            .record_publication_in_txn(&txn, "op-child", "/child", "", "c1", "trunk_push")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(other, 1);
+        assert_eq!(mono.publication_sequence("/").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn mst2_publication_concurrent_writers_get_distinct_sequences() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+
+        // Two independent transactions bump the same namespace counter; the
+        // row lock serializes them and each gets a distinct sequence.
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let base = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let m = base.mono_storage();
+                let txn = m.get_connection().begin().await.unwrap();
+                let seq = m
+                    .record_publication_in_txn(
+                        &txn,
+                        &format!("op-c{i}"),
+                        "/",
+                        "",
+                        &format!("n{i}"),
+                        "trunk_push",
+                    )
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+                seq
+            }));
+        }
+        let mut seqs = Vec::new();
+        for h in handles {
+            seqs.push(h.await.unwrap());
+        }
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![1, 2],
+            "concurrent writers must not share a sequence"
+        );
+        assert_eq!(mono.publication_sequence("/").await.unwrap(), 2);
     }
 
     #[tokio::test]

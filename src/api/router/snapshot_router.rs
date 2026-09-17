@@ -241,7 +241,30 @@ async fn resolve(
     )
     .map_err(mst2_error_response)?;
     let ctx = runtime().insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds);
-    let seq = runtime().publication_sequence(&commit_oid);
+    // Publication identity: with T05 enabled the sequence is the durable
+    // per-namespace counter written atomically with the ref CAS; a read
+    // failure there is surfaced rather than silently falling back, because
+    // the sequence is what binds a client to a version. When publication is
+    // disabled the provisional per-tip counter is the honest answer.
+    //
+    // Namespace note: the counter is keyed on the writer's repo path, and
+    // resolve maps the request scope onto it. That mapping is the identity
+    // only while a scope names one native namespace (true for the default
+    // scope and for deployments without composite bindings); the general
+    // scope→namespace map arrives with the T04 binding layer (see
+    // ISSUES.md ISS-01/ISS-06).
+    let seq = if state.storage.config().mst2.publication_enabled {
+        let namespace = state.storage.mono_storage().normalize_namespace(&req.scope);
+        let durable = state
+            .storage
+            .mono_storage()
+            .publication_sequence(&namespace)
+            .await
+            .map_err(internal)?;
+        durable.to_string()
+    } else {
+        runtime().publication_sequence(&commit_oid).to_string()
+    };
 
     let body = json!({
         "descriptor": descriptor_json(&built),
