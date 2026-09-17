@@ -305,6 +305,32 @@ tag create/delete 之后，`GET /tags/{name}` 与 `POST /tags/list` 必须一致
 - 不接入 Review OAuth / Cedar enforce；不为 storage-only 打开 SSH receive-pack。
 - 不实现 Libra 客户端（`DEP-LB-03`）。
 
+## Libra pin（LB-06；核对日 2026-09-17，本仓 revision：tag `v0.10.44` / 提交 `ec51767`）
+
+> 供 Libra 计划（`../libra/docs/development/plan/plan-20260912.md`）把 `DEP-MB-04`（delete / move）与 `DEP-MB-05`（四条 `/tags*`）覆盖的六条表面从 outgoing 改为 incoming；tree 与 create-entry 两行供重核 Libra 既有的 pin。行号以上述 revision 为准；本卡不改 `../libra/**`。
+
+| # | 方法与路径 | 成功 HTTP | 鉴权（trunk / storage-only） | 请求字段 | 成功 `data` 字段 | 本仓 `file:line` |
+|---|---|---|---|---|---|---|
+| 1 | `GET /api/v1/tree?path=<dir>` | 200 | 不要求 Authorization | query `CodePreviewQuery`：`path`（可选，缺省 `/`）、`refs`（可选，缺省空串 = 当前 tip；可为 40 位完整 commit SHA 或 tag 名）；**没有** `oid` 键（`oid` 属于另一条路由 `GET /api/v1/file/tree` 的 `TreeQuery`——`api_router.rs` 以 `.route()` 直挂、不进 OpenAPI，与 `/tree` 无关） | `TreeResponse`：`tree_items[]`（`TreeBriefItem`：`name`、`path`、`content_type`）与 `file_tree`（map：祖先路径 → `FileTreeItem { tree_items, total_count }`，仅辅助结构，见上文 `GET /tree` 节）；**没有**顶层 `total_count` | `preview_router.rs:224`（path）/ `:233` `get_tree_info`；`git.rs:48` `CodePreviewQuery`、`:150` `TreeBriefItem`、`:478` `TreeResponse` |
+| 2 | `POST /api/v1/create-entry` | 200 | `push_auth`（token：Bearer / Basic 密码栏；none：无 header） | `CreateEntryInfo`：`is_directory`、`name`、`path`；可选 `content`、`author_username`、`author_email`、`skip_build`（默认 false）、`mode`（`EditCLMode`，serde `snake_case` 外部标签枚举：`"force_create"` 或 `{"try_reuse": <cl_link 或 null>}`，缺省 `try_reuse(null)`；只影响 Review 形态的 CL 复用，trunk 忽略） | `CreateEntryResult`：`commit_id`、`new_oid`、`path`、`cl_link`（trunk 必为 `null`） | `preview_router.rs:112`；`git.rs:13` / `:234` |
+| 3 | `POST /api/v1/delete-entry` | 200 | 同上；鉴权 path = `path`（父目录） | `DeleteEntryInfo`：`path`、`name`；可选 `author_username`、`skip_build`（默认 false；Libra 送 true） | `DeleteEntryResult`：`commit_id`、`path`、`cl_link`（trunk `null`）；**无** `new_oid` | `preview_router.rs:138`；`git.rs:248` / `:268` |
+| 4 | `POST /api/v1/move-entry` | 200 | 同上；`from_path` 与 `to_path` 各鉴权一次 | `MoveEntryInfo`：`from_path`、`from_name`、`to_path`、`to_name`；可选 `author_username`、`skip_build`（默认 false；Libra 送 true） | `MoveEntryResult`：`commit_id`、`from_path`、`to_path`、`cl_link`（trunk `null`）；**无** `new_oid` | `preview_router.rs:166`；`git.rs:280` / `:318` |
+| 5 | `POST /api/v1/tags` | **200**（不是 201） | `push_auth`；鉴权 path = `path_context`（缺省 `/`） | `CreateTagRequest`：`name`；可选 `target`（alias `target_commit`）、`path_context`、`tagger_name`、`tagger_email`、`message`（**非空** `message` 即注解 tag，空串按轻量 tag 处理） | `TagResponse`：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`（全为字符串） | `tag_router.rs:162`；`tag.rs:19` / `:37` |
+| 6 | `POST /api/v1/tags/list` | 200 | 不要求 Authorization | `PageParams<String>`：`pagination`（`page` 从 1 起、`per_page` ≥ 1）与 `additional`（path，列 root 送 `"/"`）**两键必填**（缺键 → extractor 的 422 纯文本，无 `CommonResult` 外层） | `TagListResponse`：`total`、`items[]`（`TagResponse`） | `tag_router.rs:224`；`common.rs:53` `PageParams`；`tag.rs:55` |
+| 7 | `GET /api/v1/tags/{name}` | 200；不存在 404 | 不要求 Authorization | 路径参数 `name` | `TagResponse` | `tag_router.rs:272` |
+| 8 | `DELETE /api/v1/tags/{name}` | 200；不存在 404 | `push_auth`；鉴权 path 固定 `/`（`paths` 未覆盖 `/` 的 token 一律 403；`paths` 省略 / 为空或含 `/` 的 token 可用） | 路径参数 `name` | `DeleteTagResponse`：`deleted_tag`、`message` | `tag_router.rs:321`；`tag.rs:59` |
+
+Libra 必须按以下事实实现，不得反向假设：
+
+- 挂载锚点（Libra 的 incoming 条件要求）：delete-entry / move-entry 登记在 storage-only 与 Review 共用的 `write_routers`（`preview_router.rs:57-63`）；四条 `/tags*` 由 `storage_only_routers_with` merge `tag_router::routers()`（`api_router.rs:83`），三份 OpenAPI 锁与运行时 `/api/openapi.json` 都含它们。
+- list 是 **POST**，`pagination` 与 `additional` 两键必填；`per_page = 0` 会触发服务端 panic（见上文 list 小节）。
+- get / delete **没有 path 选择器**：handler 固定以 `/` 分发，服务层按 tag 名全局查找（`DEFER-LB-03` / `DEFER-LB-11`）；delete 的鉴权 path 固定为 `/`，因此 Libra 的 tag 写需要能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）。
+- trunk / storage-only 上目录写与 tag 写都不建 CL：目录写（create / delete / move）回应的 `cl_link` 必为 `null`，tag 回应**没有** `cl_link` 键；delete / move 的回应**没有** `new_oid`，以 `commit_id` 为凭。
+- handler 的成功回应与应用错误（`ApiError`）外层是 `CommonResult`（`req_result`、`data`、`err_message`）；`err_message` 不含 `[code:NNN]` 前缀。**例外：** axum `Json` extractor 的拒绝在 handler 之前以**纯文本**回应，不经 `ApiError`、没有 `CommonResult` 外层：缺必填键 / 类型不符（如 `POST /tags/list` 少 `pagination` 或 `additional`）→ **422**；JSON 语法非法 → **400**；Content-Type 不对 → **415**。Libra 解析前先看状态码，且 400 既可能是应用错误（带外层）也可能是 extractor 的纯文本语法拒绝。
+- 错误码分类：401（无凭据 / 凭据不识别）、403（token `paths` 未覆盖鉴权 path）、400（校验 / 目标错误；或 extractor 的纯文本语法拒绝，见上）、404（缺目录 / tag 不存在）、409（ImportRepo 下的 delete / move）。**另：** create-entry 的目录重名与 `is_directory=false` 缺 `content` 今日是 **500**（见「错误映射」），不得按 400 假设。
+
+建议 Libra 侧动作：把 `DEP-MB-04` / `DEP-MB-05` 由 outgoing 改为 incoming（引用本节的 revision 与行号），并据此重核 `MB-07` 与 `MB-10` 的假设（list 方法、`PageParams` 两键、get/delete 无 path 选择器、delete 鉴权 path、`cl_link` / `new_oid`）。
+
 ## 相关文档
 
 - [`../monorepo.md`](../monorepo.md) —— 产品规则；tag 只能走 HTTP，Git 客户端禁 tag。该文的 API 表已由 LB-04 对齐为 `POST … /tags/list`（并注明两键必填）；wire 以本页为准
