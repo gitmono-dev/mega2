@@ -30,6 +30,11 @@ Registered cases (exact names for MEGA2_SMOKE_CASE):
   move-entry-git-visible                         (plan-20260917 LB-05)
   tags-list-create-delete                        (plan-20260917 LB-05)
   delete-entry-unauth-401                        (plan-20260917 LB-05)
+  delete-file-git-visible                        (plan-20260918 FT-07)
+  move-file-git-visible                          (plan-20260918 FT-07)
+  tags-get-list-create-delete                    (plan-20260918 FT-07)
+  tags-path-get-delete                           (plan-20260918 FT-07)
+  delete-file-unauth-401                         (plan-20260918 FT-07)
 
 Compose example (after mega2-trunk up + service init):
   TOKEN='mega2-storage-only-local-dev-token-0001'
@@ -567,6 +572,221 @@ case_delete_entry_unauth_401() {
   expect_listed "$PROJECT_PATH" "$dir" "after the rejected delete" || return 1
 }
 
+# ---------------------------------------------------------------------------
+# plan-20260918 FT-07: file delete/move Git visibility, GET list, path tags.
+# ---------------------------------------------------------------------------
+
+create_file() {
+  local name="$1" content="$2" code
+  api_call POST create-entry "{\"is_directory\":false,\"name\":\"${name}\",\"path\":\"${PROJECT_PATH}\",\"content\":\"${content}\",\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: create-entry file ${name} HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+}
+
+case_delete_file_git_visible() {
+  require_api_base || return 1
+  require_http_url || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local name="ft07-del-${LB05_RUN_ID}.txt" dest code
+  create_file "$name" "ft07 delete ${name}\\n" || return 1
+  dest="$ROOT_DIR/ft07-delete-file-clone"
+  fresh_project_clone "$dest" || return 1
+  if [[ ! -f "$dest/$name" ]]; then
+    echo "FAIL: git clone before delete-entry lacks $name" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$name" "before file delete-entry" || return 1
+  api_call POST delete-entry "{\"path\":\"${PROJECT_PATH}\",\"name\":\"${name}\",\"is_directory\":false,\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: file delete-entry HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  if body_has_cl_link; then
+    echo "FAIL: trunk file delete-entry must not return a CL link: $API_BODY" >&2
+    return 1
+  fi
+  git_case -C "$dest" pull --ff-only origin main >/dev/null || return 1
+  if [[ -e "$dest/$name" ]]; then
+    echo "FAIL: after git pull the deleted file $name is still in the work tree" >&2
+    return 1
+  fi
+  expect_not_listed "$PROJECT_PATH" "$name" "after file delete-entry" || return 1
+}
+
+case_move_file_git_visible() {
+  require_api_base || return 1
+  require_http_url || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local src="ft07-mv-src-${LB05_RUN_ID}.txt" dst="ft07-mv-dst-${LB05_RUN_ID}.txt"
+  local content="ft07 move ${src}" dest code
+  create_file "$src" "${content}\\n" || return 1
+  dest="$ROOT_DIR/ft07-move-file-clone"
+  fresh_project_clone "$dest" || return 1
+  if [[ ! -f "$dest/$src" ]]; then
+    echo "FAIL: git clone before move-entry lacks $src" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$src" "before file move-entry" || return 1
+  api_call POST move-entry "{\"from_path\":\"${PROJECT_PATH}\",\"from_name\":\"${src}\",\"to_path\":\"${PROJECT_PATH}\",\"to_name\":\"${dst}\",\"is_directory\":false,\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: file move-entry HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  if body_has_cl_link; then
+    echo "FAIL: trunk file move-entry must not return a CL link: $API_BODY" >&2
+    return 1
+  fi
+  git_case -C "$dest" pull --ff-only origin main >/dev/null || return 1
+  if [[ ! -f "$dest/$dst" ]]; then
+    echo "FAIL: after git pull the moved file $dst is missing" >&2
+    return 1
+  fi
+  if [[ -e "$dest/$src" ]]; then
+    echo "FAIL: after git pull the source file $src still exists" >&2
+    return 1
+  fi
+  if [[ "$(cat "$dest/$dst")" != "$content" ]]; then
+    echo "FAIL: moved file content mismatch: $(cat "$dest/$dst")" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$dst" "after file move-entry" || return 1
+  expect_not_listed "$PROJECT_PATH" "$src" "after file move-entry" || return 1
+}
+
+case_tags_get_list_create_delete() {
+  require_api_base || return 1
+  require_token || return 1
+  local name="ft07-tag-${LB05_RUN_ID}" code
+  local list_route='tags/list?page=1&per_page=200&path=/'
+  api_call GET "$list_route" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: GET /tags/list (anonymous) HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags/list '{"pagination":{"page":1,"per_page":200},"additional":"/"}' noauth; code="$API_CODE"
+  if [[ "$code" != "405" ]]; then
+    echo "FAIL: POST /tags/list must 405, got HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags "{\"name\":\"${name}\",\"message\":\"ft07 get-list tag\",\"tagger_name\":\"ft07\",\"tagger_email\":\"ft07@example.invalid\"}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: POST /tags (token) HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_names_entry "$name"; then
+    echo "FAIL: GET /tags/${name} HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call DELETE "tags/${name}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_matches "\"deleted_tag\"[[:space:]]*:[[:space:]]*\"${name}\""; then
+    echo "FAIL: DELETE /tags/${name} HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "404" ]]; then
+    echo "FAIL: GET /tags/${name} after delete must be 404, got $code body=$API_BODY" >&2
+    return 1
+  fi
+}
+
+case_tags_path_get_delete() {
+  require_api_base || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local name="ft07-same-${LB05_RUN_ID}" root_only="ft07-root-${LB05_RUN_ID}"
+  local proj_only="ft07-proj-${LB05_RUN_ID}" code
+  api_call POST tags "{\"name\":\"${name}\",\"message\":\"ft07 root\",\"tagger_name\":\"ft07\",\"tagger_email\":\"ft07@example.invalid\"}"; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: create root tag HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags "{\"name\":\"${name}\",\"path_context\":\"/project\",\"message\":\"ft07 project\",\"tagger_name\":\"ft07\",\"tagger_email\":\"ft07@example.invalid\"}"; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: create /project tag HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_matches '"message"[[:space:]]*:[[:space:]]*"ft07 root"'; then
+    echo "FAIL: omit-path get must be root tag HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}?path=/project" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_matches '"message"[[:space:]]*:[[:space:]]*"ft07 project"'; then
+    echo "FAIL: ?path=/project get HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}?path=/other" "" noauth; code="$API_CODE"
+  if [[ "$code" != "404" ]]; then
+    echo "FAIL: ?path=/other get must 404, got $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags "{\"name\":\"${root_only}\",\"message\":\"root only\",\"tagger_name\":\"ft07\",\"tagger_email\":\"ft07@example.invalid\"}"; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: create root-only tag HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags "{\"name\":\"${proj_only}\",\"path_context\":\"/project\",\"message\":\"proj only\",\"tagger_name\":\"ft07\",\"tagger_email\":\"ft07@example.invalid\"}"; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: create project-only tag HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/list?page=1&per_page=200&path=/" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_names_entry "$root_only" || body_names_entry "$proj_only"; then
+    echo "FAIL: list / must filter annotated tags HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/list?page=1&per_page=200&path=/project" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_names_entry "$proj_only" || body_names_entry "$root_only"; then
+    echo "FAIL: list /project must filter annotated tags HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call DELETE "tags/${name}?path=/project"; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: DELETE ?path=/project HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}?path=/project" "" noauth; code="$API_CODE"
+  if [[ "$code" != "404" ]]; then
+    echo "FAIL: project tag must be gone HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: root tag must remain HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+}
+
+case_delete_file_unauth_401() {
+  require_api_base || return 1
+  require_http_url || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local name="ft07-keep-${LB05_RUN_ID}.txt" dest code
+  create_file "$name" "ft07 keep\\n" || return 1
+  api_call POST delete-entry "{\"path\":\"${PROJECT_PATH}\",\"name\":\"${name}\",\"is_directory\":false,\"skip_build\":true}" noauth; code="$API_CODE"
+  if [[ "$code" != "401" ]]; then
+    echo "FAIL: unauthenticated file delete-entry must be HTTP 401, got $code body=$API_BODY" >&2
+    return 1
+  fi
+  if [[ "$API_BODY" == *"${MEGA2_IT_SEED_TOKEN}"* ]]; then
+    echo "FAIL: 401 body must not echo the token" >&2
+    return 1
+  fi
+  dest="$ROOT_DIR/ft07-unauth-file-clone"
+  fresh_project_clone "$dest" || return 1
+  if [[ ! -f "$dest/$name" ]]; then
+    echo "FAIL: unauthenticated file delete-entry must leave $name on the tip" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$name" "after the rejected file delete" || return 1
+}
+
 run_case "API create-entry then git clone sees file" case_api_create_then_clone
 run_case "API edit/save then git pull sees update" case_api_save_then_pull
 run_case "API write rejects unauthenticated" case_api_write_rejects_unauthenticated
@@ -574,6 +794,11 @@ run_case "delete-entry-git-visible" case_delete_entry_git_visible
 run_case "move-entry-git-visible" case_move_entry_git_visible
 run_case "tags-list-create-delete" case_tags_list_create_delete
 run_case "delete-entry-unauth-401" case_delete_entry_unauth_401
+run_case "delete-file-git-visible" case_delete_file_git_visible
+run_case "move-file-git-visible" case_move_file_git_visible
+run_case "tags-get-list-create-delete" case_tags_get_list_create_delete
+run_case "tags-path-get-delete" case_tags_path_get_delete
+run_case "delete-file-unauth-401" case_delete_file_unauth_401
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
