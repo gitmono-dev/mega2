@@ -44,9 +44,8 @@ envsubst = "0.2.1"
 futures = "0.3.34"
 git-internal = "0.9.0"
 # Shared MST/2 wire codec (specs 03/05/06/07). `zstd` enables the optional
-# strict single-frame frame encoding (spec 06 §3); `rev` pins the commit that
-# carries it, so CI and image builds resolve the same bytes as the lab stack.
-mst2-codec = { git = "https://github.com/gitmono-dev/mst2-codec", rev = "354e23ac072590daff58ff27b687b8223ac8b209", features = ["zstd"] }
+# strict single-frame frame encoding (spec 06 §3), published in 0.2.0.
+mst2-codec = { version = "0.2", features = ["zstd"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"

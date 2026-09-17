@@ -1756,9 +1756,12 @@ impl MonoStorage {
     /// receipt and append the outbox event — atomically with the ref CAS
     /// the same transaction performs.
     ///
-    /// Idempotent on `operation_id`: a retried writer gets back the
-    /// original sequence and neither the counter nor the outbox advances
-    /// twice (PUB-11).
+    /// Idempotent per (namespace, operation_id): a retried writer gets
+    /// back the original sequence and neither the counter nor the outbox
+    /// advances twice (PUB-11). The uniqueness is scoped to the namespace
+    /// because push operation ids (`old→new`) are only unique within one
+    /// repo: two namespaces landing the same (old,new) pair are distinct
+    /// publications, not replays.
     pub async fn record_publication_in_txn(
         &self,
         txn: &DatabaseTransaction,
@@ -1768,13 +1771,29 @@ impl MonoStorage {
         new_oid: &str,
         writer_kind: &str,
     ) -> Result<i64, MegaError> {
-        // Replay short-circuit: an existing receipt is returned as-is.
+        // Replay short-circuit (PUB-11), scoped to this namespace: the same
+        // operation id under a different namespace is a distinct publication
+        // (push operation ids are only unique per repo), not a replay.
         if let Some(existing) = mst2_publication::Entity::find()
             .filter(mst2_publication::Column::OperationId.eq(operation_id))
+            .filter(mst2_publication::Column::Namespace.eq(namespace))
             .one(txn)
             .await?
         {
             return Ok(existing.sequence);
+        }
+        // Cross-namespace conflict: the same operation id was already
+        // published elsewhere. That means the id is not actually unique to
+        // this publication — refuse rather than silently double-bind it.
+        if mst2_publication::Entity::find()
+            .filter(mst2_publication::Column::OperationId.eq(operation_id))
+            .one(txn)
+            .await?
+            .is_some()
+        {
+            return Err(MegaError::Other(format!(
+                "operation id {operation_id} already published under a different namespace"
+            )));
         }
         // Upsert the sequence row and bump it atomically; the unique
         // namespace key makes this a single-winner counter.
@@ -1794,7 +1813,10 @@ impl MonoStorage {
         let sequence: i64 = row.try_get_by_index(0)?;
         let now = chrono::Utc::now().fixed_offset();
 
-        mst2_publication::ActiveModel {
+        // Concurrency-safe insert: two racing transactions with the same
+        // (namespace, operation_id) are serialized by the unique index; the
+        // loser re-selects the winner's receipt instead of aborting (PUB-11).
+        let insert = mst2_publication::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
             operation_id: Set(operation_id.to_string()),
             namespace: Set(namespace.to_string()),
@@ -1804,10 +1826,28 @@ impl MonoStorage {
             writer_epoch: Set(1),
             writer_kind: Set(writer_kind.to_string()),
             created_at: Set(now),
+        };
+        match mst2_publication::Entity::insert(insert)
+            .on_conflict(
+                OnConflict::columns([
+                    mst2_publication::Column::Namespace,
+                    mst2_publication::Column::OperationId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(txn)
+            .await
+        {
+            // ON CONFLICT DO NOTHING returns RecordNotInserted when the
+            // racing transaction won; re-select its receipt.
+            Ok(_) | Err(DbErr::RecordNotInserted) => {}
+            Err(e) => return Err(e.into()),
         }
-        .insert(txn)
-        .await?;
 
+        // The replay check above already returned for a pre-existing receipt,
+        // so reaching here means this call owns `sequence`; the outbox row
+        // inserts normally.
         mst2_publication_outbox::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
             operation_id: Set(operation_id.to_string()),
@@ -3180,6 +3220,29 @@ mod tests {
         txn.commit().await.unwrap();
         assert_eq!(other, 1);
         assert_eq!(mono.publication_sequence("/").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn mst2_publication_cross_namespace_conflict_is_refused() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = test_storage(temp.path()).await;
+        let mono = storage.mono_storage();
+        // The same push operation id under a different namespace is not a
+        // replay: refuse rather than silently double-bind the id (the
+        // reviewer's P3.1 — a silent no-op left /b's counter at 0 forever).
+        let txn = mono.get_connection().begin().await.unwrap();
+        mono.record_publication_in_txn(&txn, "shared-op", "/", "", "a1", "trunk_push")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let txn = mono.get_connection().begin().await.unwrap();
+        let err = mono
+            .record_publication_in_txn(&txn, "shared-op", "/b", "", "a1", "trunk_push")
+            .await;
+        assert!(err.is_err(), "cross-namespace reuse must be refused");
+        drop(txn); // the failed transaction rolls back on drop
+        // /b never got a receipt: the error rolled the transaction back.
+        assert_eq!(mono.publication_sequence("/b").await.unwrap(), 0);
     }
 
     #[tokio::test]

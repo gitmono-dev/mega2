@@ -42,12 +42,16 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+        // Unique per (namespace, operation_id): push operation ids are only
+        // unique per repo, so two namespaces may legitimately carry the same
+        // id; a replay is same-namespace, a cross-namespace hit is refused.
         manager
             .create_index(
                 Index::create()
                     .if_not_exists()
-                    .name("idx_mst2_publication_operation_unique")
+                    .name("idx_mst2_publication_ns_operation_unique")
                     .table(Mst2Publication::Table)
+                    .col(Mst2Publication::Namespace)
                     .col(Mst2Publication::OperationId)
                     .unique()
                     .to_owned(),

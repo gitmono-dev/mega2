@@ -1,9 +1,8 @@
 # mega2 with the MST/2 snapshot surface, for the compose acceptance stacks.
 #
-# The build context is this repository alone: the shared codec is a pinned git
+# The build context is this repository alone: the shared codec is a registry
 # dependency (see Cargo.toml), so no sibling checkout or extra build context is
-# needed. `git` in the builder image is what fetches it (cached in the cargo
-# git mount below).
+# needed.
 FROM rust:1.97-bookworm AS builder
 
 RUN apt-get update \
