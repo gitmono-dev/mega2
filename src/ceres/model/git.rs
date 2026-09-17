@@ -241,6 +241,144 @@ pub struct CreateEntryResult {
     pub cl_link: Option<String>,
 }
 
+/// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03): the
+/// parent `path` plus the directory `name`, same shape as create-entry minus
+/// `is_directory` / `content` / `mode`.
+#[derive(PartialEq, Eq, Debug, Clone, Deserialize, ToSchema)]
+pub struct DeleteEntryInfo {
+    /// parent directory, rooted; `/` (or empty) means the root
+    pub path: String,
+    /// name of the directory to delete
+    pub name: String,
+    /// web username for commit binding / CL ownership (optional)
+    pub author_username: Option<String>,
+    /// if true, skip build
+    #[serde(default)]
+    pub skip_build: bool,
+}
+
+impl DeleteEntryInfo {
+    pub fn commit_msg(&self) -> String {
+        format!("delete directory {}", self.name)
+    }
+}
+
+/// Response body after deleting a directory
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DeleteEntryResult {
+    /// New commit id created by this operation
+    pub commit_id: String,
+    /// Deleted entry path (receipt only)
+    pub path: String,
+    pub cl_link: Option<String>,
+}
+
+/// Validate the parent `path` / entry `name` pair a directory change names
+/// (ADR-LB-03): the parent is rooted (`/`-prefixed; empty means the root)
+/// with no empty, `.` or `..` component and no control characters; the name
+/// is one non-empty component without separators, `.`, `..`, NUL or control
+/// characters. The error is a plain diagnostic; callers add the `[code:400]`
+/// prefix.
+pub fn validate_entry_target(path: &str, name: &str) -> Result<(), String> {
+    if !path.is_empty() && !path.starts_with('/') {
+        return Err(format!("path must be rooted: {path:?}"));
+    }
+    if path.chars().any(char::is_control) {
+        return Err("path must not contain NUL or control characters".to_string());
+    }
+    // `/` and `` both mean the root; exactly one trailing `/` is tolerated
+    // (like create-entry's `build_entry_path`); a second one is an empty
+    // component and is rejected below.
+    let body = path.strip_suffix('/').unwrap_or(path);
+    if !body.is_empty() {
+        for component in body[1..].split('/') {
+            if component.is_empty() || component == "." || component == ".." {
+                return Err(format!("path contains an invalid component: {path:?}"));
+            }
+        }
+    }
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("name must be a directory name, got {name:?}"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(format!("name must not contain a path separator: {name:?}"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("name must not contain NUL or control characters".to_string());
+    }
+    Ok(())
+}
+
+/// LB-02 AC-2: the wire shape of `DeleteEntryInfo` (required `path`/`name`,
+/// optional `author_username`, `skip_build` defaulting to `false`) and the
+/// rooted-parent / single-component-name rules ADR-LB-03 specifies for
+/// directory-change writes (create-entry itself does not enforce them;
+/// ADR-LB-01 forbids changing it).
+#[cfg(test)]
+#[test]
+fn delete_entry_body_matches_create_entry_path_name_rules() {
+    let info: DeleteEntryInfo =
+        serde_json::from_str(r#"{"path":"/project","name":"old-dir"}"#).expect("minimal body");
+    assert_eq!(
+        info,
+        DeleteEntryInfo {
+            path: "/project".to_string(),
+            name: "old-dir".to_string(),
+            author_username: None,
+            skip_build: false,
+        }
+    );
+    let info: DeleteEntryInfo = serde_json::from_str(
+        r#"{"path":"/project","name":"old-dir","author_username":null,"skip_build":true}"#,
+    )
+    .expect("full body");
+    assert!(info.skip_build && info.author_username.is_none());
+    assert_eq!(info.commit_msg(), "delete directory old-dir");
+    assert!(
+        serde_json::from_str::<DeleteEntryInfo>(r#"{"name":"x"}"#).is_err(),
+        "path is required"
+    );
+    assert!(
+        serde_json::from_str::<DeleteEntryInfo>(r#"{"path":"/project"}"#).is_err(),
+        "name is required"
+    );
+
+    for (path, name) in [
+        ("/project", "old-dir"),
+        ("", "dir"),
+        ("/", "dir"),
+        ("/a/b", "c.d"),
+        ("/project/", "x"),
+    ] {
+        assert!(
+            validate_entry_target(path, name).is_ok(),
+            "{path:?} {name:?}"
+        );
+    }
+    for (path, name) in [
+        ("project", "x"),
+        ("/project/../etc", "x"),
+        ("/project//x", "x"),
+        ("/./x", "x"),
+        ("/project", ""),
+        ("/project", "."),
+        ("/project", ".."),
+        ("/project", "a/b"),
+        ("/project", "a\\b"),
+        ("/project", "a\0b"),
+        ("/project", "a\nb"),
+        ("/pro\0ject", "x"),
+        ("/project//", "x"),
+        ("/project///", "x"),
+        ("//", "x"),
+    ] {
+        assert!(
+            validate_entry_target(path, name).is_err(),
+            "{path:?} {name:?}"
+        );
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TreeResponse {
     pub file_tree: HashMap<String, FileTreeItem>,

@@ -1399,6 +1399,10 @@ mod tests {
             "storage-only OpenAPI must include create-entry: {paths:?}"
         );
         assert!(
+            paths.iter().any(|p| p.contains("delete-entry")),
+            "storage-only OpenAPI must include delete-entry: {paths:?}"
+        );
+        assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
             "storage-only OpenAPI must include /edit/save: {paths:?}"
         );
@@ -1566,6 +1570,10 @@ mod tests {
             "trunk OpenAPI must include create-entry: {paths:?}"
         );
         assert!(
+            paths.iter().any(|p| p.contains("delete-entry")),
+            "trunk OpenAPI must include delete-entry: {paths:?}"
+        );
+        assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
             "trunk OpenAPI must include /edit/save: {paths:?}"
         );
@@ -1628,6 +1636,10 @@ mod tests {
         assert!(
             paths.iter().any(|p| p.contains("create-entry")),
             "OAuth OpenAPI must include create-entry: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("delete-entry")),
+            "OAuth OpenAPI must include delete-entry: {paths:?}"
         );
     }
 

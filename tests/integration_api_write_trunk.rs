@@ -4,6 +4,9 @@
 //! - unauthenticated create-entry → 401
 //! - token create-entry advances `/project` tip, no mega_cl / refs/cl
 //! - token edit/save advances tip again
+//!
+//! plan-20260917 LB-02 adds one `delete_entry_*` case per acceptance gate
+//! (`EX-LB-01`), each booting its own service.
 
 mod common;
 #[allow(dead_code)]
@@ -103,10 +106,58 @@ struct ApiWriteEnv {
     cache_dir: PathBuf,
     object_root: PathBuf,
     case_dir: PathBuf,
+    /// `MEGA_MONOREPO__PUSH_POLICY` handed to the service.
+    push_policy: &'static str,
 }
 
 impl ApiWriteEnv {
+    /// Trunk + `push_auth=token` with one token scoped to `/project`.
     fn with_token_config() -> Self {
+        Self::with_token_config_paths(Some(&["/project"]))
+    }
+
+    /// Trunk + `push_auth=token`; `paths = None` omits the key (whole repo).
+    fn with_token_config_paths(paths: Option<&[&str]>) -> Self {
+        let paths_line = match paths {
+            Some(paths) => {
+                let quoted: Vec<String> = paths.iter().map(|p| format!("{p:?}")).collect();
+                format!("paths = [{}]\n", quoted.join(", "))
+            }
+            None => String::new(),
+        };
+        let append = format!(
+            r#"
+[git]
+anonymous_access = true
+push_auth = "token"
+ssh_receive_pack = false
+[[git.push_tokens]]
+name = "{TOKEN_NAME}"
+token = "{PUSH_TOKEN}"
+{paths_line}"#
+        );
+        Self::with_git_append("trunk", &append)
+    }
+
+    /// Trunk + `push_auth=none`: unauthenticated writes are admitted.
+    fn with_auth_none_config() -> Self {
+        Self::with_git_append(
+            "trunk",
+            r#"
+[git]
+anonymous_access = true
+push_auth = "none"
+ssh_receive_pack = false
+"#,
+        )
+    }
+
+    /// Review morphology: the repo default config, no `push_auth`.
+    fn with_review_config() -> Self {
+        Self::with_git_append("review", "")
+    }
+
+    fn with_git_append(push_policy: &'static str, append: &str) -> Self {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let case_name = format!(
             "aw03-case-{}-{}",
@@ -126,19 +177,7 @@ impl ApiWriteEnv {
 
         let database = TestDatabase::create();
         let full_config_path = case_dir.join("config.toml");
-        let append = format!(
-            r#"
-[git]
-anonymous_access = true
-push_auth = "token"
-ssh_receive_pack = false
-[[git.push_tokens]]
-name = "{TOKEN_NAME}"
-token = "{PUSH_TOKEN}"
-paths = ["/project"]
-"#
-        );
-        common::write_full_config_with_append(&full_config_path, &append);
+        common::write_full_config_with_append(&full_config_path, append);
 
         Self {
             temp_dir,
@@ -148,6 +187,7 @@ paths = ["/project"]
             cache_dir,
             object_root,
             case_dir,
+            push_policy,
         }
     }
 
@@ -168,7 +208,7 @@ paths = ["/project"]
             .env("MEGA_REDIS__URL", integration_redis_url())
             .env("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "local")
             .env("MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR", &self.object_root)
-            .env("MEGA_MONOREPO__PUSH_POLICY", "trunk")
+            .env("MEGA_MONOREPO__PUSH_POLICY", self.push_policy)
             .env("MEGA_GIT__SSH_RECEIVE_PACK", "false");
         command
     }
@@ -644,4 +684,496 @@ fn read_log(path: &Path) -> String {
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf);
     buf
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260917 LB-02: `POST /api/v1/delete-entry` — one booted service per
+// gate (EX-LB-01), all against the real HTTP surface.
+// ---------------------------------------------------------------------------
+
+const LB02_AUTHOR: &str = "lb02-author";
+
+/// A booted service plus the HTTP client and URLs one delete-entry case needs.
+struct DeleteCase {
+    env: ApiWriteEnv,
+    service: ServiceProcess,
+    port: u16,
+    api: String,
+    client: reqwest::blocking::Client,
+    stderr: PathBuf,
+}
+
+impl DeleteCase {
+    fn boot(env: ApiWriteEnv) -> Self {
+        let (service, port, _stdout, stderr) = boot_service_http(&env);
+        Self {
+            env,
+            service,
+            port,
+            api: format!("http://127.0.0.1:{port}/api/v1"),
+            client: http_client(),
+            stderr,
+        }
+    }
+
+    /// Give `/project` a non-root tip so trunk writes can land (B0).
+    fn seed(&self) {
+        seed_project_tip(&self.env.case_dir, self.port, PUSH_TOKEN);
+    }
+
+    fn bearer() -> String {
+        format!("Bearer {PUSH_TOKEN}")
+    }
+
+    fn post(&self, route: &str, auth: Option<&str>, body: Value) -> (u16, Value) {
+        let mut request = self
+            .client
+            .post(format!("{}/{route}", self.api))
+            .json(&body);
+        if let Some(auth) = auth {
+            request = request.header("Authorization", auth);
+        }
+        let response = request
+            .send()
+            .unwrap_or_else(|err| panic!("POST {route}: {err}"));
+        let status = response.status().as_u16();
+        let text = response.text().expect("response body");
+        let json = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+        (status, json)
+    }
+
+    /// create-entry under `/project` (directory or file) as `LB02_AUTHOR`.
+    fn create_entry(&self, auth: Option<&str>, name: &str, is_directory: bool) -> Value {
+        let mut body = serde_json::json!({
+            "is_directory": is_directory,
+            "name": name,
+            "path": "/project",
+            "author_username": LB02_AUTHOR,
+            "skip_build": true
+        });
+        if !is_directory {
+            body["content"] = Value::String("lb02\n".to_string());
+        }
+        let (status, json) = self.post("create-entry", auth, body);
+        assert_eq!(status, 200, "create-entry {name} must 200: {json}");
+        json
+    }
+
+    fn delete_entry(&self, auth: Option<&str>, path: &str, name: &str) -> (u16, Value) {
+        self.post(
+            "delete-entry",
+            auth,
+            serde_json::json!({
+                "path": path,
+                "name": name,
+                "author_username": LB02_AUTHOR,
+                "skip_build": true
+            }),
+        )
+    }
+
+    /// `tree_items[].name` of `GET /tree?path=`.
+    fn tree_names(&self, path: &str) -> Vec<String> {
+        let response = self
+            .client
+            .get(format!("{}/tree?path={path}", self.api))
+            .send()
+            .expect("GET /tree");
+        assert_eq!(response.status().as_u16(), 200, "GET /tree?path={path}");
+        let json: Value = response.json().expect("tree json");
+        json["data"]["tree_items"]
+            .as_array()
+            .expect("tree_items")
+            .iter()
+            .map(|item| item["name"].as_str().expect("tree item name").to_owned())
+            .collect()
+    }
+
+    fn db_url(&self) -> &str {
+        &self.env.database.db_url
+    }
+
+    fn finish(mut self) {
+        assert!(
+            self.service
+                .shutdown_via_sigint(Duration::from_secs(60))
+                .success(),
+            "shutdown failed\n{}",
+            read_log(&self.stderr)
+        );
+    }
+}
+
+/// Create `/project/lb02-gone` through the API, delete it with the token, and
+/// return the delete response (asserted 200) plus the tip before the delete.
+fn delete_success_flow(case: &DeleteCase) -> (Value, String) {
+    case.create_entry(Some(&DeleteCase::bearer()), "lb02-gone", true);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), "/project", "lb02-gone");
+    assert_eq!(status, 200, "token delete-entry must 200: {json}");
+    (json, tip_before)
+}
+
+/// Push a one-commit repository to `/third-party/<repo>` so the path resolves
+/// to an ImportRepo (receive-pack creates the `git_repo` row).
+fn seed_import_repo(case_dir: &Path, port: u16, token: &str, repo: &str) {
+    let dir = format!("import-seed-{repo}");
+    host_git_ok(case_dir, token, &["init", "-b", "main", &dir]);
+    host_git_ok(
+        case_dir,
+        token,
+        &["-C", &dir, "config", "user.name", "LB02 IT"],
+    );
+    host_git_ok(
+        case_dir,
+        token,
+        &["-C", &dir, "config", "user.email", "lb02@example.com"],
+    );
+    let src = case_dir.join(&dir).join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(src.join("lib.rs"), "// lb02 import seed\n").expect("write lib.rs");
+    host_git_ok(case_dir, token, &["-C", &dir, "add", "."]);
+    host_git_ok(
+        case_dir,
+        token,
+        &["-C", &dir, "commit", "-m", "lb02 import seed"],
+    );
+    let url = format!(
+        "{}/",
+        git_cli::mega2_host_http_url(port, &format!("/third-party/{repo}")).trim_end_matches('/')
+    );
+    host_git_ok(
+        case_dir,
+        token,
+        &[
+            "-C",
+            &dir,
+            "push",
+            "--no-thin",
+            &url,
+            "HEAD:refs/heads/main",
+        ],
+    );
+}
+
+fn err_message(json: &Value) -> String {
+    json["err_message"].as_str().unwrap_or_default().to_owned()
+}
+
+#[test]
+fn delete_entry_unauth_401() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = case.delete_entry(None, "/project", "anything");
+    assert_eq!(status, 401, "unauthenticated delete-entry must 401: {json}");
+    assert_eq!(json["req_result"], Value::Bool(false), "{json}");
+    assert!(
+        !json.to_string().contains(PUSH_TOKEN),
+        "error body must not echo the token: {json}"
+    );
+    // Runtime OpenAPI evidence (LB-02 VER): the booted storage-only surface
+    // lists delete-entry and never leaks the token.
+    let openapi = case
+        .client
+        .get(format!("http://127.0.0.1:{}/api/openapi.json", case.port))
+        .send()
+        .expect("GET /api/openapi.json");
+    assert_eq!(openapi.status().as_u16(), 200);
+    let openapi = openapi.text().expect("openapi body");
+    assert!(
+        openapi.contains("delete-entry"),
+        "runtime OpenAPI must list delete-entry"
+    );
+    assert!(
+        !openapi.contains(PUSH_TOKEN),
+        "runtime OpenAPI must not contain the token"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_path_token_403() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), "/other", "anything");
+    assert_eq!(
+        status, 403,
+        "token scoped to /project must 403 on /other: {json}"
+    );
+    assert!(
+        !json.to_string().contains(PUSH_TOKEN),
+        "error body must not echo the token: {json}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_auth_none_ok() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_auth_none_config());
+    case.seed();
+    case.create_entry(None, "lb02-none-dir", true);
+    let (status, json) = case.delete_entry(None, "/project", "lb02-none-dir");
+    assert_eq!(
+        status, 200,
+        "push_auth=none must admit an unauthenticated delete: {json}"
+    );
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert!(json["data"]["cl_link"].is_null(), "{json}");
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_file_400() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&DeleteCase::bearer()), "lb02-file.txt", false);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) =
+        case.delete_entry(Some(&DeleteCase::bearer()), "/project", "lb02-file.txt");
+    assert_eq!(status, 400, "deleting a file must 400: {json}");
+    assert!(
+        err_message(&json).contains("not a directory"),
+        "diagnosable message expected: {json}"
+    );
+    // A parent path that goes through a file is the same client error.
+    let (status, json) =
+        case.delete_entry(Some(&DeleteCase::bearer()), "/project/lb02-file.txt", "x");
+    assert_eq!(status, 400, "a file as parent path must 400: {json}");
+    assert!(
+        err_message(&json).contains("not a directory"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected delete must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_root_400() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    for (path, name) in [("/", ""), ("", "")] {
+        let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), path, name);
+        assert_eq!(
+            status, 400,
+            "deleting the root ({path:?}, {name:?}) must 400: {json}"
+        );
+        assert_eq!(json["req_result"], Value::Bool(false), "{json}");
+    }
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_missing_404() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), "/project", "lb02-missing");
+    assert_eq!(status, 404, "missing entry must 404: {json}");
+    assert!(err_message(&json).contains("not found"), "{json}");
+    let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), "/project/lb02-nope", "x");
+    assert_eq!(status, 404, "missing parent must 404: {json}");
+    assert!(err_message(&json).contains("not found"), "{json}");
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_traversal_400() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let tip_before = path_tip(case.db_url(), "/project");
+    for (path, name) in [
+        ("/project", ".."),
+        ("/project/../project", "x"),
+        ("/project", "a/b"),
+        ("/project//", "x"),
+    ] {
+        let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), path, name);
+        assert_eq!(
+            status, 400,
+            "traversal ({path:?}, {name:?}) must 400: {json}"
+        );
+    }
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected delete must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_import_repo_409() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config_paths(Some(&[
+        "/project",
+        "/third-party",
+    ])));
+    let repo = format!("lb02-import-{}", std::process::id());
+    seed_import_repo(&case.env.case_dir, case.port, PUSH_TOKEN, &repo);
+    let (status, json) = case.delete_entry(
+        Some(&DeleteCase::bearer()),
+        &format!("/third-party/{repo}"),
+        "src",
+    );
+    assert_eq!(status, 409, "ImportRepo target must 409: {json}");
+    assert!(err_message(&json).contains("import dir"), "{json}");
+    assert!(
+        !err_message(&json).contains("[code:"),
+        "prefix must not reach the wire: {json}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_success_req_result_true() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let (json, _) = delete_success_flow(&case);
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert_eq!(json["err_message"], Value::String(String::new()), "{json}");
+    case.finish();
+}
+
+#[test]
+fn delete_entry_success_commit_id() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let (json, tip_before) = delete_success_flow(&case);
+    let commit_id = json["data"]["commit_id"]
+        .as_str()
+        .expect("commit_id")
+        .to_owned();
+    assert!(
+        !commit_id.is_empty() && commit_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "{json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        commit_id,
+        "delete must advance /project tip"
+    );
+    assert_ne!(commit_id, tip_before, "tip must change after delete");
+    assert_eq!(
+        json["data"]["path"],
+        Value::String("/project/lb02-gone".to_string()),
+        "{json}"
+    );
+    assert!(
+        json["data"].get("new_oid").is_none(),
+        "delete-entry has no new_oid: {json}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_success_cl_link_null() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let (json, _) = delete_success_flow(&case);
+    assert!(
+        json["data"]["cl_link"].is_null(),
+        "trunk delete must not return cl_link: {json}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_success_no_mega_cl() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let _ = delete_success_flow(&case);
+    let (cls, cl_refs) = count_cl_artifacts(case.db_url());
+    assert_eq!(cls, 0, "trunk delete must not insert mega_cl");
+    assert_eq!(cl_refs, 0, "trunk delete must not insert refs/cl/*");
+    let requesters = push_queue_requesters(case.db_url());
+    assert!(
+        requesters.iter().any(|r| r.as_deref() == Some(TOKEN_NAME)),
+        "push_queue requester must be the token name {TOKEN_NAME}: {requesters:?}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_review_uses_existing_cl_branch() {
+    // Review morphology: create-entry opens a CL for `/` (the buck root the
+    // subtree resolves to); a delete by the same author reuses that open CL
+    // (`EditCLMode::TryReuse(None)`), exactly like create-entry does.
+    let case = DeleteCase::boot(ApiWriteEnv::with_review_config());
+    let created = case.create_entry(None, "lb02-review-dir", true);
+    let create_link = created["data"]["cl_link"]
+        .as_str()
+        .expect("review create returns cl_link")
+        .to_owned();
+    // `doc` is one of the init root directories, so it exists on main.
+    let (status, json) = case.delete_entry(None, "/", "doc");
+    assert_eq!(status, 200, "review delete-entry must 200: {json}");
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert_eq!(
+        json["data"]["cl_link"].as_str(),
+        Some(create_link.as_str()),
+        "review delete must reuse the open CL: {json}"
+    );
+    let (cls, _) = count_cl_artifacts(case.db_url());
+    assert_eq!(cls, 1, "create + delete must share one mega_cl row");
+    case.finish();
+}
+
+#[test]
+fn delete_entry_parent_tree_omits_name() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&DeleteCase::bearer()), "lb02-gone", true);
+    let before = case.tree_names("/project");
+    assert!(before.iter().any(|n| n == "lb02-gone"), "{before:?}");
+    let (status, json) = case.delete_entry(Some(&DeleteCase::bearer()), "/project", "lb02-gone");
+    assert_eq!(status, 200, "{json}");
+    let after = case.tree_names("/project");
+    assert!(
+        after.iter().all(|n| n != "lb02-gone"),
+        "deleted name must vanish: {after:?}"
+    );
+    assert!(
+        after.iter().any(|n| n == "seed.txt"),
+        "siblings must survive: {after:?}"
+    );
+    case.finish();
+}
+
+/// Not a plan gate: the emptied-parent rule the contract page documents — a
+/// parent left without entries keeps a timestamped `.gitkeep` and stays a
+/// valid (empty) directory.
+#[test]
+fn delete_entry_emptied_parent_keeps_gitkeep() {
+    let case = DeleteCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    // create-entry builds the missing parent: /project/lb02-parent/child.
+    let (status, json) = case.post(
+        "create-entry",
+        Some(&DeleteCase::bearer()),
+        serde_json::json!({
+            "is_directory": true,
+            "name": "child",
+            "path": "/project/lb02-parent",
+            "author_username": LB02_AUTHOR,
+            "skip_build": true
+        }),
+    );
+    assert_eq!(status, 200, "nested create-entry must 200: {json}");
+    assert_eq!(
+        case.tree_names("/project/lb02-parent"),
+        vec!["child".to_string()]
+    );
+    let (status, json) =
+        case.delete_entry(Some(&DeleteCase::bearer()), "/project/lb02-parent", "child");
+    assert_eq!(status, 200, "deleting the only child must 200: {json}");
+    assert_eq!(
+        case.tree_names("/project/lb02-parent"),
+        vec![".gitkeep".to_string()],
+        "an emptied parent keeps a .gitkeep placeholder"
+    );
+    let names = case.tree_names("/project");
+    assert!(
+        names.iter().any(|n| n == "lb02-parent"),
+        "parent must survive: {names:?}"
+    );
+    case.finish();
 }

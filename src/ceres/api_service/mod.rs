@@ -21,8 +21,9 @@ use crate::{
             blame::{BlameQuery, BlameResult},
             change_list::MuiTreeNode,
             git::{
-                CommitBindingInfo, CreateEntryInfo, CreateEntryResult, DiffPreviewPayload,
-                EditFilePayload, EditFileResult, TreeBriefItem, TreeCommitItem, TreeHashItem,
+                CommitBindingInfo, CreateEntryInfo, CreateEntryResult, DeleteEntryInfo,
+                DeleteEntryResult, DiffPreviewPayload, EditFilePayload, EditFileResult,
+                TreeBriefItem, TreeCommitItem, TreeHashItem,
             },
             tag::TagInfo,
         },
@@ -137,6 +138,16 @@ pub trait ApiHandler: Send + Sync {
         file_info: CreateEntryInfo,
         requester: Option<String>,
     ) -> Result<CreateEntryResult, GitError>;
+
+    /// Delete a directory entry under the monorepo path (plan-20260917
+    /// ADR-LB-02): rewrite the parent tree, commit once, then land (trunk) or
+    /// route through the existing CL branch (review). Same `requester`
+    /// contract as [`Self::create_monorepo_entry`].
+    async fn delete_monorepo_entry(
+        &self,
+        entry_info: DeleteEntryInfo,
+        requester: Option<String>,
+    ) -> Result<DeleteEntryResult, GitError>;
 
     async fn get_raw_blob_by_hash(&self, hash: &str) -> Result<Vec<u8>, MegaError> {
         let storage = self.get_context();
