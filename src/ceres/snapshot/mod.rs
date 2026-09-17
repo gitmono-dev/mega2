@@ -10,5 +10,6 @@ pub mod frame_stream;
 pub mod pages;
 pub mod publication;
 pub mod resolver;
+pub mod retention;
 pub mod runtime;
 pub mod view;

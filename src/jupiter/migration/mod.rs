@@ -121,6 +121,7 @@ mod m20260910_000100_drop_merge_queue;
 mod m20260912_000100_drop_orion_build_tables;
 mod m20260913_000100_add_agent_capture_tables;
 mod m20260916_000100_add_mst2_verified_object;
+mod m20260917_000100_add_mst2_retention;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -230,6 +231,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260912_000100_drop_orion_build_tables::Migration),
             Box::new(m20260913_000100_add_agent_capture_tables::Migration),
             Box::new(m20260916_000100_add_mst2_verified_object::Migration),
+            Box::new(m20260917_000100_add_mst2_retention::Migration),
         ]
     }
 }
