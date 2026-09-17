@@ -2118,7 +2118,9 @@ impl PushQueueService {
         let config = ctx.storage.config();
         if config.git.storage_only()
             && let Some(installation_id) = config.storage_events.installation_id.as_deref()
-            && let Ok(event) = crate::jupiter::service::storage_event_emitter::repo_push_event(
+        {
+            let emitter = &ctx.storage.storage_event_emitter;
+            match crate::jupiter::service::storage_event_emitter::repo_push_event(
                 installation_id,
                 &normalized,
                 crate::jupiter::service::storage_event_emitter::RepoPushData {
@@ -2129,9 +2131,16 @@ impl PushQueueService {
                     requested_oid: row.new_id.clone(),
                     landed_oid: landed_commit_id.clone(),
                 },
-            )
-        {
-            let _ = ctx.storage.storage_event_emitter.try_emit(event);
+            ) {
+                Ok(event) => {
+                    let _ = emitter.try_emit(event);
+                }
+                // A snapshot the builder rejects is a dropped event, not a
+                // failed push (WH-15 / plan-20260912「固定 wire schema」).
+                Err(_) => emitter.record_invalid_event(
+                    crate::jupiter::service::storage_event::EventType::RepoPush,
+                ),
+            }
         }
         self.run_c_segment_index(row.id, &row.path).await;
         Ok(ExecuteOutcome::Done {

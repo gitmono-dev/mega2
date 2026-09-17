@@ -53,6 +53,54 @@ pub enum AdmissionDisposition {
     DroppedInvalidEvent,
 }
 
+impl AdmissionDisposition {
+    /// Stable lowercase label used as the `disposition` field of drop logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted { .. } => "accepted",
+            Self::DroppedDisabled => "dropped_disabled",
+            Self::DroppedInvalidScope => "dropped_invalid_scope",
+            Self::DroppedFilter => "dropped_filter",
+            Self::DroppedSize => "dropped_size",
+            Self::DroppedCapacity => "dropped_capacity",
+            Self::DroppedClosed => "dropped_closed",
+            Self::DroppedInvalidEvent => "dropped_invalid_event",
+        }
+    }
+}
+
+/// Process-local drop accounting (WH-15). No metrics crate — same shape as
+/// `PushQueueMetrics`: atomics bumped at the drop site, read through a
+/// snapshot. One counter per non-accepted `AdmissionDisposition`, plus a
+/// running total of per-target drops (which also covers partial fan-out on an
+/// event that was otherwise accepted).
+#[derive(Default)]
+struct DropCounters {
+    disabled: AtomicU64,
+    invalid_scope: AtomicU64,
+    invalid_event: AtomicU64,
+    size: AtomicU64,
+    filter: AtomicU64,
+    capacity: AtomicU64,
+    closed: AtomicU64,
+    dropped_targets: AtomicU64,
+}
+
+/// Point-in-time copy of the drop counters. Counts only; never carries
+/// payload, target URLs or secrets (ADR-WH-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct StorageEventDropSnapshot {
+    pub disabled: u64,
+    pub invalid_scope: u64,
+    pub invalid_event: u64,
+    pub size: u64,
+    pub filter: u64,
+    pub capacity: u64,
+    pub closed: u64,
+    /// Per-target drops across every event, including partial fan-out.
+    pub dropped_targets: u64,
+}
+
 /// Git typed builder for the WH-03 `repo.push` committed event
 /// (plan-20260912「事件身份与 scope 不变量」/ ADR-WH-04). The snapshot comes
 /// entirely from the caller's committed round; `occurred_at` is stamped at
@@ -158,6 +206,13 @@ struct LifecycleReceivers {
 
 struct Inner {
     enabled: bool,
+    /// Opaque installation namespace from `[storage_events].installation_id`.
+    /// Recorded on every emitter log line; never enters the wire envelope.
+    installation_id: Option<Arc<str>>,
+    /// `installation_id` rendered for log lines (`-` when unset); an `Arc`
+    /// so send tasks clone a pointer, not a string.
+    installation_label: Arc<str>,
+    drops: DropCounters,
     gate: std::sync::Mutex<Gate>,
     in_flight: AtomicUsize,
     pending: AtomicUsize,
@@ -187,6 +242,13 @@ struct Inner {
 struct ReapSignal {
     seq: u64,
     ends_tx: mpsc::UnboundedSender<u64>,
+}
+
+impl Inner {
+    /// `installation_id` for log lines; `-` when the deployment sets none.
+    fn installation_label(&self) -> &str {
+        &self.installation_label
+    }
 }
 
 impl Drop for ReapSignal {
@@ -224,6 +286,7 @@ impl StorageEventEmitter {
     pub fn disabled() -> Self {
         Self::new_inner(
             false,
+            None,
             1,
             Duration::from_secs(0),
             Arc::new(NoopTransport),
@@ -231,9 +294,19 @@ impl StorageEventEmitter {
         )
     }
 
+    /// Disabled emitter that still records the configured `installation_id`.
+    /// `Storage::new_with_connection` installs it, so a disabled deployment's
+    /// drop lines carry the same namespace field as an enabled one;
+    /// `bind_storage_event_emitter` replaces it only when enabled.
     pub fn from_config_disabled(config: &Config) -> Self {
-        let _ = config;
-        Self::disabled()
+        Self::new_inner(
+            false,
+            Self::installation_id_from(config),
+            1,
+            Duration::from_secs(0),
+            Arc::new(NoopTransport),
+            Vec::new(),
+        )
     }
 
     pub fn new_with_transport(
@@ -243,6 +316,7 @@ impl StorageEventEmitter {
     ) -> Self {
         Self::new_inner(
             config.storage_events.enabled,
+            Self::installation_id_from(config),
             config.storage_events.max_in_flight.max(1) as usize,
             Duration::from_secs(config.storage_events.shutdown_grace_seconds),
             transport,
@@ -250,8 +324,17 @@ impl StorageEventEmitter {
         )
     }
 
+    fn installation_id_from(config: &Config) -> Option<Arc<str>> {
+        config
+            .storage_events
+            .installation_id
+            .as_deref()
+            .map(Arc::from)
+    }
+
     fn new_inner(
         enabled: bool,
+        installation_id: Option<Arc<str>>,
         max_in_flight: usize,
         grace: Duration,
         transport: Arc<dyn EventTransport>,
@@ -260,9 +343,16 @@ impl StorageEventEmitter {
         let (regs_tx, regs) = mpsc::unbounded_channel();
         let (ends_tx, ends) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown) = watch::channel(false);
+        let installation_label: Arc<str> = installation_id
+            .as_deref()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from("-"));
         Self {
             inner: Arc::new(Inner {
                 enabled,
+                installation_id,
+                installation_label,
+                drops: DropCounters::default(),
                 gate: std::sync::Mutex::new(Gate {
                     closed: false,
                     close_deadline: None,
@@ -295,17 +385,24 @@ impl StorageEventEmitter {
     }
 
     pub fn try_emit(&self, event: CommittedEvent) -> AdmissionDisposition {
+        let event_type = event.event_type;
         if lock_gate(&self.inner.gate).closed {
-            return AdmissionDisposition::DroppedClosed;
+            return self.note_drop(AdmissionDisposition::DroppedClosed, event_type, 0);
         }
         if !self.inner.enabled {
-            return AdmissionDisposition::DroppedDisabled;
+            return self.note_drop(AdmissionDisposition::DroppedDisabled, event_type, 0);
         }
         let body = match project(&event) {
             Ok(body) => body,
-            Err(ProjectionDrop::Size) => return AdmissionDisposition::DroppedSize,
-            Err(ProjectionDrop::InvalidScope) => return AdmissionDisposition::DroppedInvalidScope,
-            Err(ProjectionDrop::InvalidEvent) => return AdmissionDisposition::DroppedInvalidEvent,
+            Err(ProjectionDrop::Size) => {
+                return self.note_drop(AdmissionDisposition::DroppedSize, event_type, 0);
+            }
+            Err(ProjectionDrop::InvalidScope) => {
+                return self.note_drop(AdmissionDisposition::DroppedInvalidScope, event_type, 0);
+            }
+            Err(ProjectionDrop::InvalidEvent) => {
+                return self.note_drop(AdmissionDisposition::DroppedInvalidEvent, event_type, 0);
+            }
         };
         let configs: Vec<StorageEventsTargetConfig> = self
             .inner
@@ -313,27 +410,40 @@ impl StorageEventEmitter {
             .iter()
             .map(|(config, _)| config.clone())
             .collect();
-        let selected = select_targets(&event, &configs);
-        if selected.is_empty() {
-            return AdmissionDisposition::DroppedFilter;
+        let selected_ids: Vec<&str> = select_targets(&event, &configs)
+            .into_iter()
+            .map(|config| config.id.as_str())
+            .collect();
+        if selected_ids.is_empty() {
+            return self.note_drop(AdmissionDisposition::DroppedFilter, event_type, 0);
         }
+        let installation = Arc::clone(&self.inner.installation_label);
+        // Per-target drops are recorded here and logged only after the gate
+        // is released: the critical section below never traces and does no
+        // unbounded work — per selected target it clones the compiled target
+        // and body, spawns the send task and does atomics + channel sends
+        // (ADR-WH-03). `target_drops` is pre-sized to the selected count.
+        let mut target_drops: Vec<(&str, &'static str)> = Vec::with_capacity(selected_ids.len());
         let mut accepted = 0usize;
         let mut dropped = 0usize;
         let gate = lock_gate(&self.inner.gate);
         if gate.closed {
-            return AdmissionDisposition::DroppedClosed;
+            drop(gate);
+            return self.note_drop(AdmissionDisposition::DroppedClosed, event_type, 0);
         }
-        for selected_config in selected {
-            let Some((_, compiled)) = self
-                .inner
-                .compiled_targets
-                .iter()
-                .find(|(config, _)| config.id == selected_config.id)
-            else {
-                dropped += 1;
+        // Ids are unique (config validation), so membership in the selected
+        // set is a complete description of the fan-out; walking the compiled
+        // list directly means every selected target resolves by construction.
+        for (config, compiled) in &self.inner.compiled_targets {
+            if !selected_ids.contains(&config.id.as_str()) {
                 continue;
-            };
+            }
             let Ok(permit) = self.inner.semaphore.clone().try_acquire_owned() else {
+                self.inner
+                    .drops
+                    .dropped_targets
+                    .fetch_add(1, Ordering::SeqCst);
+                target_drops.push((config.id.as_str(), "dropped_target_no_permit"));
                 dropped += 1;
                 continue;
             };
@@ -347,7 +457,7 @@ impl StorageEventEmitter {
             let payload = body.clone();
             let target_id = compiled.id.clone();
             let task_target_id = target_id.clone();
-            let event_type = event.event_type;
+            let task_installation = Arc::clone(&installation);
             let reap = ReapSignal {
                 seq,
                 ends_tx: self.inner.ends_tx.clone(),
@@ -363,6 +473,7 @@ impl StorageEventEmitter {
                     Err(err) => err.category(),
                 };
                 tracing::info!(
+                    installation_id = %task_installation,
                     target_id = %task_target_id,
                     event_type = event_type.as_str(),
                     category,
@@ -387,21 +498,127 @@ impl StorageEventEmitter {
                     self.inner.pending.fetch_sub(1, Ordering::SeqCst);
                     self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
                     sent_back.0.handle.abort();
+                    self.inner
+                        .drops
+                        .dropped_targets
+                        .fetch_add(1, Ordering::SeqCst);
+                    target_drops.push((config.id.as_str(), "dropped_target_lifecycle_closed"));
                     dropped += 1;
                 }
             }
         }
         drop(gate);
+        for (target_id, disposition) in target_drops {
+            self.log_target_drop(event_type, target_id, disposition);
+        }
         if accepted > 0 {
             self.ensure_lifecycle_started();
         }
         if accepted == 0 && dropped > 0 {
-            return AdmissionDisposition::DroppedCapacity;
+            return self.note_drop(AdmissionDisposition::DroppedCapacity, event_type, dropped);
         }
         AdmissionDisposition::Accepted {
             accepted_targets: accepted,
             dropped_targets: dropped,
         }
+    }
+
+    /// Record a builder failure in a source adapter (plan-20260912「固定 wire
+    /// schema」). The adapter never reaches `try_emit` in that case, so this
+    /// is the single accounting point for it, and it applies the same
+    /// precedence `try_emit` would: a closed admission records
+    /// `dropped_closed`, a disabled emitter `dropped_disabled`, otherwise
+    /// `dropped_invalid_event`. It must never be turned into a business error.
+    pub fn record_invalid_event(&self, event_type: EventType) {
+        let disposition = if lock_gate(&self.inner.gate).closed {
+            AdmissionDisposition::DroppedClosed
+        } else if !self.inner.enabled {
+            AdmissionDisposition::DroppedDisabled
+        } else {
+            AdmissionDisposition::DroppedInvalidEvent
+        };
+        self.note_drop(disposition, event_type, 0);
+    }
+
+    /// Point-in-time drop counts for logs/metrics consumers (WH-15).
+    pub fn drop_counts(&self) -> StorageEventDropSnapshot {
+        let d = &self.inner.drops;
+        StorageEventDropSnapshot {
+            disabled: d.disabled.load(Ordering::SeqCst),
+            invalid_scope: d.invalid_scope.load(Ordering::SeqCst),
+            invalid_event: d.invalid_event.load(Ordering::SeqCst),
+            size: d.size.load(Ordering::SeqCst),
+            filter: d.filter.load(Ordering::SeqCst),
+            capacity: d.capacity.load(Ordering::SeqCst),
+            closed: d.closed.load(Ordering::SeqCst),
+            dropped_targets: d.dropped_targets.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The configured installation namespace, `None` when unset.
+    pub fn installation_id(&self) -> Option<&str> {
+        self.inner.installation_id.as_deref()
+    }
+
+    /// Bump the counter for an event-level drop and log one line. The line
+    /// carries only category and count fields (ADR-WH-02): no payload, path,
+    /// oid, URL or secret. Uses a message distinct from the delivery line so
+    /// delivery counters that filter on `storage_events delivery` +
+    /// `category=` are unaffected.
+    fn note_drop(
+        &self,
+        disposition: AdmissionDisposition,
+        event_type: EventType,
+        dropped_targets: usize,
+    ) -> AdmissionDisposition {
+        let d = &self.inner.drops;
+        let counter = match disposition {
+            AdmissionDisposition::DroppedDisabled => &d.disabled,
+            AdmissionDisposition::DroppedInvalidScope => &d.invalid_scope,
+            AdmissionDisposition::DroppedInvalidEvent => &d.invalid_event,
+            AdmissionDisposition::DroppedSize => &d.size,
+            AdmissionDisposition::DroppedFilter => &d.filter,
+            AdmissionDisposition::DroppedCapacity => &d.capacity,
+            AdmissionDisposition::DroppedClosed => &d.closed,
+            AdmissionDisposition::Accepted { .. } => return disposition,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        // Disabled is the default deployment's steady state: every committed
+        // write of the OCI/LFS/media/agent adapters passes through it, so it
+        // logs at debug to keep the default log free of per-write noise. The
+        // counter still moves; the other six dispositions stay at info.
+        if matches!(disposition, AdmissionDisposition::DroppedDisabled) {
+            tracing::debug!(
+                installation_id = %self.inner.installation_label(),
+                event_type = event_type.as_str(),
+                disposition = disposition.as_str(),
+                dropped_targets,
+                "storage_events dropped"
+            );
+        } else {
+            tracing::info!(
+                installation_id = %self.inner.installation_label(),
+                event_type = event_type.as_str(),
+                disposition = disposition.as_str(),
+                dropped_targets,
+                "storage_events dropped"
+            );
+        }
+        disposition
+    }
+
+    /// Log a single target that could not be admitted while the event as a
+    /// whole may still fan out to other targets. The `dropped_targets`
+    /// counter was already bumped at the drop site; this runs only after
+    /// the admission gate is released.
+    fn log_target_drop(&self, event_type: EventType, target_id: &str, disposition: &'static str) {
+        tracing::info!(
+            installation_id = %self.inner.installation_label(),
+            event_type = event_type.as_str(),
+            disposition,
+            target_id = %target_id,
+            "storage_events dropped"
+        );
     }
 
     pub async fn shutdown(&self) {
@@ -672,6 +889,7 @@ async fn join_one(inner_weak: &Weak<Inner>, registration: Registration) {
             Err(err) if err.is_cancelled() => {
                 inner.cancelled.fetch_add(1, Ordering::SeqCst);
                 tracing::info!(
+                    installation_id = %inner.installation_label(),
                     target_id = %target_id,
                     event_type = event_type.as_str(),
                     category = "cancelled",
@@ -681,6 +899,7 @@ async fn join_one(inner_weak: &Weak<Inner>, registration: Registration) {
             Err(_) => {
                 inner.panicked.fetch_add(1, Ordering::SeqCst);
                 tracing::warn!(
+                    installation_id = %inner.installation_label(),
                     target_id = %target_id,
                     event_type = event_type.as_str(),
                     category = "panicked",
@@ -976,6 +1195,304 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Thread-local tracing capture. The runtime is built and driven inside
+    /// the closure so every record — including those from tasks the
+    /// current-thread runtime polls — lands on this subscriber (same shape as
+    /// `ceres::api_service::un25_freeze::capture_tracing`).
+    fn capture_tracing<F: FnOnce()>(f: F) -> String {
+        use std::io::Write;
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct TestWriter(Arc<StdMutex<Vec<u8>>>);
+
+        impl Write for TestWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl MakeWriter<'_> for TestWriter {
+            type Writer = TestWriter;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // tracing-core caches a callsite's `Interest` from the *registering
+        // thread's* default dispatcher while at most one dispatcher is
+        // registered (`Dispatchers::has_just_one`). A parallel test that hits
+        // one of the emitter's callsites first — under the global no-op
+        // subscriber — would cache `never`, and this thread's scoped
+        // subscriber would never see the event. Keeping a second live
+        // dispatcher registered for the whole capture makes tracing-core
+        // consult its registry instead, so interest is computed from real
+        // subscribers regardless of which thread registers the callsite.
+        let _pin_registry = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let buf = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(TestWriter(buf.clone()))
+            .with_ansi(false)
+            // `dropped_disabled` is debug-level; capture it too.
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.lock().expect("log buffer").clone()).expect("utf8 logs")
+    }
+
+    fn git_event() -> CommittedEvent {
+        repo_push_event(
+            "prod-primary-01",
+            "/team/a",
+            RepoPushData {
+                push_id: "1".to_string(),
+                operation_id: "op-1".to_string(),
+                ref_name: "refs/heads/main".to_string(),
+                old_oid: "a".repeat(40),
+                requested_oid: "b".repeat(40),
+                landed_oid: "c".repeat(40),
+            },
+        )
+        .expect("canonical repo.push event")
+    }
+
+    /// WH-15: every drop branch bumps its counter and logs one
+    /// `storage_events dropped` line (`dropped_disabled` at debug, the rest at
+    /// info); `record_invalid_event` accounts builder failures with the
+    /// admission precedence; every emitter line carries `installation_id`
+    /// (`-` when the deployment sets none); drop lines carry only the AC7
+    /// field set and never match the delivery-line filter used by the
+    /// process-level ITs.
+    #[test]
+    fn drop_accounting_and_installation_id() {
+        let captured = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            rt.block_on(async {
+                // A bare `disabled()` emitter has no installation id at all.
+                let bare = StorageEventEmitter::disabled();
+                assert_eq!(bare.installation_id(), None);
+                assert_eq!(
+                    bare.try_emit(sample_event()),
+                    AdmissionDisposition::DroppedDisabled
+                );
+                assert_eq!(bare.drop_counts().disabled, 1);
+
+                // A config-derived disabled emitter still records the id.
+                let cfg_disabled = StorageEventEmitter::from_config_disabled(&enabled_config());
+                assert_eq!(cfg_disabled.installation_id(), Some("prod-primary-01"));
+                assert_eq!(
+                    cfg_disabled.try_emit(sample_event()),
+                    AdmissionDisposition::DroppedDisabled
+                );
+                assert_eq!(cfg_disabled.drop_counts().disabled, 1);
+
+                // Enabled, one permit, a transport that never completes.
+                let transport = probe(ProbeMode::Block);
+                let emitter = StorageEventEmitter::new_with_transport(
+                    &enabled_config(),
+                    transport.clone(),
+                    vec![compiled_target("t1")],
+                );
+                assert_eq!(emitter.installation_id(), Some("prod-primary-01"));
+                assert_eq!(
+                    emitter.try_emit(invalid_scope_event()),
+                    AdmissionDisposition::DroppedInvalidScope
+                );
+                assert_eq!(
+                    emitter.try_emit(invalid_data_event()),
+                    AdmissionDisposition::DroppedInvalidEvent
+                );
+                assert_eq!(
+                    emitter.try_emit(oversized_event()),
+                    AdmissionDisposition::DroppedSize
+                );
+                // A valid repo.push matches no target (t1 subscribes only lfs).
+                assert_eq!(
+                    emitter.try_emit(git_event()),
+                    AdmissionDisposition::DroppedFilter
+                );
+                // Takes the single permit; the send blocks.
+                assert_eq!(
+                    emitter.try_emit(sample_event()),
+                    AdmissionDisposition::Accepted {
+                        accepted_targets: 1,
+                        dropped_targets: 0,
+                    }
+                );
+                wait_posted(&transport).await;
+                // No permit left: per-target drop, then event-level capacity.
+                assert_eq!(
+                    emitter.try_emit(sample_event()),
+                    AdmissionDisposition::DroppedCapacity
+                );
+                // Adapter builder failure is accounted without an event.
+                emitter.record_invalid_event(EventType::RepoPush);
+                // …and on a disabled emitter it follows try_emit's precedence.
+                bare.record_invalid_event(EventType::RepoPush);
+                assert_eq!(bare.drop_counts().disabled, 2);
+                assert_eq!(bare.drop_counts().invalid_event, 0);
+                // Grace is 0: shutdown aborts the blocked send and joins it.
+                shutdown_bounded(&emitter).await;
+                assert_eq!(
+                    emitter.try_emit(sample_event()),
+                    AdmissionDisposition::DroppedClosed
+                );
+                // Closed admission wins over "invalid" for builder failures too.
+                emitter.record_invalid_event(EventType::RepoPush);
+
+                assert_eq!(
+                    emitter.drop_counts(),
+                    StorageEventDropSnapshot {
+                        disabled: 0,
+                        invalid_scope: 1,
+                        invalid_event: 2,
+                        size: 1,
+                        filter: 1,
+                        capacity: 1,
+                        closed: 2,
+                        dropped_targets: 1,
+                    }
+                );
+                // Accounting never touched the send/join counters.
+                assert_eq!(emitter.cancelled_count(), 1);
+                assert_eq!(emitter.task_count(), 0);
+            });
+        });
+
+        let drop_lines: Vec<&str> = captured
+            .lines()
+            .filter(|line| line.contains("storage_events dropped"))
+            .collect();
+        // 11 event-level drops (bare: disabled ×2 incl. the builder failure;
+        // cfg-disabled ×1; enabled: scope, event, size, filter, capacity,
+        // builder, closed ×2 incl. the builder failure after shutdown) + 1
+        // per-target line for the no-permit.
+        assert_eq!(
+            drop_lines.len(),
+            12,
+            "drop lines:\n{}",
+            drop_lines.join("\n")
+        );
+        // AC7 as an exact field-name set, not a substring blacklist: every
+        // `key=` after the message must be in the whitelist.
+        let whitelist = [
+            "installation_id",
+            "event_type",
+            "disposition",
+            "target_id",
+            "dropped_targets",
+        ];
+        for line in &drop_lines {
+            let fields = line
+                .split("storage_events dropped")
+                .nth(1)
+                .expect("message present");
+            let keys: Vec<&str> = fields
+                .split_whitespace()
+                .filter_map(|token| token.split_once('=').map(|(k, _)| k))
+                .collect();
+            assert!(!keys.is_empty(), "{line}");
+            for key in &keys {
+                assert!(
+                    whitelist.contains(key),
+                    "field {key} is outside AC7 whitelist: {line}"
+                );
+            }
+            for required in ["installation_id", "event_type", "disposition"] {
+                assert!(keys.contains(&required), "missing {required}: {line}");
+            }
+            let disposition = fields
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix("disposition="))
+                .expect("disposition field")
+                .trim_matches('"');
+            assert!(disposition.starts_with("dropped_"), "{line}");
+            // The disabled disposition is debug-level (default deployments
+            // get no per-write INFO line); every other drop line is info.
+            if disposition == "dropped_disabled" {
+                assert!(line.contains("DEBUG"), "{line}");
+            } else {
+                assert!(line.contains("INFO"), "{line}");
+            }
+            // Must never satisfy the process-level delivery filter.
+            assert!(!line.contains("storage_events delivery"), "{line}");
+            assert!(!line.contains("category="), "{line}");
+        }
+        assert!(
+            drop_lines
+                .iter()
+                .any(|l| l.contains("installation_id=-") && l.contains("dropped_disabled")),
+            "bare disabled emitter must log `-` as its installation id"
+        );
+        assert_eq!(
+            drop_lines
+                .iter()
+                .filter(|l| l.contains("installation_id=prod-primary-01"))
+                .count(),
+            10
+        );
+        assert_eq!(
+            drop_lines
+                .iter()
+                .filter(|l| l.contains("installation_id=-"))
+                .count(),
+            2
+        );
+        assert!(
+            drop_lines
+                .iter()
+                .any(|l| l.contains("dropped_target_no_permit") && l.contains("target_id=t1")),
+            "per-target drop must name the target"
+        );
+        let expected_dispositions = [
+            "dropped_disabled",
+            "dropped_invalid_scope",
+            "dropped_invalid_event",
+            "dropped_size",
+            "dropped_filter",
+            "dropped_capacity",
+            "dropped_closed",
+        ];
+        for disposition in expected_dispositions {
+            assert!(
+                drop_lines.iter().any(|l| l.contains(disposition)),
+                "missing a drop line for {disposition}"
+            );
+        }
+
+        // The one accepted send was cancelled by shutdown; its delivery line
+        // (the only one) carries the installation id too (AC5).
+        let delivery: Vec<&str> = captured
+            .lines()
+            .filter(|l| l.contains("storage_events delivery") && l.contains("category="))
+            .collect();
+        assert_eq!(
+            delivery.len(),
+            1,
+            "delivery lines:\n{}",
+            delivery.join("\n")
+        );
+        assert!(
+            delivery[0].contains("installation_id=prod-primary-01"),
+            "{}",
+            delivery[0]
+        );
+        assert!(delivery[0].contains("cancelled"), "{}", delivery[0]);
     }
 
     fn enabled_config() -> Config {

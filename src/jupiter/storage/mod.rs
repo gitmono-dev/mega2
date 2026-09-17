@@ -208,8 +208,10 @@ impl Storage {
         let lfs_service = LfsService {
             lfs_storage: lfs_db_storage.clone(),
             obj_storage: object_store.clone(),
+            // Disabled until `bind_storage_event_emitter` enables it, but it
+            // already carries the configured `installation_id` (WH-15).
             storage_event_emitter:
-                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::from_config_disabled(&config),
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
@@ -232,7 +234,7 @@ impl Storage {
             storage: AgentCaptureStorage { base: base.clone() },
             obj_storage: object_store.clone(),
             storage_event_emitter:
-                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
+                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::from_config_disabled(&config),
         };
 
         let git_service = GitService {
@@ -297,6 +299,10 @@ impl Storage {
         )?;
 
         let webhook_service = WebhookService::new(webhook_storage.clone())?;
+        // Same disabled-with-installation-id emitter as the two services
+        // above; `bind_storage_event_emitter` swaps in the enabled one.
+        let storage_event_emitter =
+            crate::jupiter::service::storage_event_emitter::StorageEventEmitter::from_config_disabled(&config);
 
         Ok(Storage {
             app_service: app_service.into(),
@@ -315,8 +321,7 @@ impl Storage {
             agent_capture_service,
             code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
-            storage_event_emitter:
-                crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
+            storage_event_emitter,
             notification_storage,
             entity_store: Arc::new(SharedEntityStore::default()),
             vault: None,

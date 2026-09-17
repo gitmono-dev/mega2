@@ -341,6 +341,37 @@ fn emitter_delivery_lines(captured: &str) -> usize {
         .count()
 }
 
+/// WH-15 AC5: every emitter delivery line carries the deployment's
+/// `installation_id`, and drop lines (message `storage_events dropped`)
+/// never match the delivery filter above. Checked on real process output
+/// because the delivery line is emitted inside a spawned send task.
+fn count_drop_lines(captured: &str) -> usize {
+    captured
+        .lines()
+        .filter(|line| line.contains("storage_events dropped"))
+        .count()
+}
+
+fn assert_emitter_lines_carry_installation_id(captured: &str, installation_id: &str) {
+    let needle = format!("installation_id={installation_id}");
+    for line in captured.lines() {
+        let delivery = line.contains(DELIVERY_LOG) && line.contains("category=");
+        let dropped = line.contains("storage_events dropped");
+        if delivery || dropped {
+            assert!(
+                line.contains(&needle),
+                "emitter line lacks installation id: {line}"
+            );
+        }
+        if dropped {
+            assert!(
+                !line.contains("category="),
+                "drop line must not satisfy the delivery filter: {line}"
+            );
+        }
+    }
+}
+
 /// The seeded HMAC secret and its SecretRef URI must never appear in captured
 /// logs (WH-11 AC6/AC7); the receipt/delivery lines carry category fields
 /// only (ADR-WH-02).
@@ -720,6 +751,22 @@ fn integration_storage_events_git_trunk_push_events_enabled() {
         delivery_lines, 1,
         "exactly one delivery attempt after drain (the filtered seed push emits none):\n{captured}"
     );
+    assert_emitter_lines_carry_installation_id(&captured, "it-wh03-process");
+    // WH-15: the seed push to `/project` is the one event the static filter
+    // rejects (`git_paths = ["/project/wh03"]`), so the process must log
+    // exactly one drop line, and it must be the filter disposition — a real
+    // drop line on real stdout, not a vacuous helper pass.
+    assert_eq!(
+        count_drop_lines(&captured),
+        1,
+        "exactly one filtered seed push expected:\n{captured}"
+    );
+    assert!(
+        captured
+            .lines()
+            .any(|l| l.contains("storage_events dropped") && l.contains("dropped_filter")),
+        "the seed push must be recorded as dropped_filter:\n{captured}"
+    );
     assert_logs_sanitized(&stdout_path, &stderr_path);
 }
 
@@ -955,6 +1002,13 @@ git_paths = ["/project"]
     assert_eq!(
         delivery_lines, 2,
         "exactly one delivery per committed write (seed push + API write):\n{captured}"
+    );
+    assert_emitter_lines_carry_installation_id(&captured, "it-wh03-api");
+    // Both committed writes match `git_paths = ["/project"]`: no drop line.
+    assert_eq!(
+        count_drop_lines(&captured),
+        0,
+        "no drop expected:\n{captured}"
     );
     assert_logs_sanitized(&stdout_path, &stderr_path);
 }
