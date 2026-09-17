@@ -2046,14 +2046,11 @@ fn tag_body(name: &str, path_context: Option<&str>, message: Option<&str>) -> Va
     body
 }
 
-fn list_body(additional: &str) -> Value {
-    serde_json::json!({ "pagination": { "page": 1, "per_page": 20 }, "additional": additional })
-}
-
-/// `POST /tags/list` without Authorization; returns the page's tag names.
-fn list_tag_names(case: &EntryCase, additional: &str) -> Vec<String> {
-    let (status, json) = case.post("tags/list", None, list_body(additional));
-    assert_eq!(status, 200, "tags/list ({additional}) must 200: {json}");
+/// `GET /tags/list` without Authorization; returns the page's tag names.
+fn list_tag_names(case: &EntryCase, path: &str) -> Vec<String> {
+    let route = format!("tags/list?page=1&per_page=20&path={path}");
+    let (status, json) = case.get(&route, None);
+    assert_eq!(status, 200, "tags/list ({path}) must 200: {json}");
     assert!(json["data"]["total"].is_u64(), "{json}");
     json["data"]["items"]
         .as_array()
@@ -2101,7 +2098,8 @@ fn tag_create_unauth_401() {
         .collect();
     assert!(codes.iter().any(|c| c == "200"), "{codes:?}");
     assert!(codes.iter().all(|c| c != "201"), "{codes:?}");
-    assert!(doc["paths"]["/api/v1/tags/list"]["post"].is_object());
+    assert!(doc["paths"]["/api/v1/tags/list"]["get"].is_object());
+    assert!(doc["paths"]["/api/v1/tags/list"]["post"].is_null());
     assert!(doc["paths"]["/api/v1/tags/{name}"]["get"].is_object());
     assert!(doc["paths"]["/api/v1/tags/{name}"]["delete"].is_object());
     let paths: Vec<&String> = doc["paths"].as_object().expect("paths").keys().collect();
@@ -2306,21 +2304,26 @@ fn tag_review_form_no_trunk_gate() {
     case.finish();
 }
 
-/// LB-04 AC-5: `POST /tags/list` needs both `pagination` and `additional`
-/// (no serde defaults) — a body missing either is rejected by the JSON
-/// extractor (422), a complete body is 200 with `{ total, items }`.
+/// FT-04: GET list requires `page`, `per_page`, `path` (extractor 400);
+/// `per_page=0` is handler 400; POST is 405.
 #[test]
-fn tag_list_requires_both_keys() {
+fn tag_list_requires_query_keys() {
     let case = EntryCase::boot(ApiWriteEnv::with_token_config());
-    let (status, json) = case.post(
-        "tags/list",
-        None,
-        serde_json::json!({ "pagination": { "page": 1, "per_page": 20 } }),
+    let (status, json) = case.get("tags/list", None);
+    assert_eq!(status, 400, "missing query must 400: {json}");
+    let (status, json) = case.get("tags/list?page=1&per_page=20", None);
+    assert_eq!(status, 400, "missing path must 400: {json}");
+    let (status, json) = case.get("tags/list?page=1&path=/", None);
+    assert_eq!(status, 400, "missing per_page must 400: {json}");
+    let (status, json) = case.get("tags/list?page=1&per_page=0&path=/", None);
+    assert_eq!(status, 400, "per_page=0 must 400: {json}");
+    assert!(
+        err_message(&json).contains("per_page must be >= 1"),
+        "{json}"
     );
-    assert_eq!(status, 422, "missing additional must be rejected: {json}");
-    let (status, json) = case.post("tags/list", None, serde_json::json!({ "additional": "/" }));
-    assert_eq!(status, 422, "missing pagination must be rejected: {json}");
-    let (status, json) = case.post("tags/list", None, list_body("/"));
+    let (status, json) = case.post("tags/list", None, serde_json::json!({}));
+    assert_eq!(status, 405, "POST list must 405: {json}");
+    let (status, json) = case.get("tags/list?page=1&per_page=20&path=/", None);
     assert_eq!(status, 200, "{json}");
     assert!(json["data"]["total"].is_u64(), "{json}");
     assert!(json["data"]["items"].is_array(), "{json}");

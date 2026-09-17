@@ -3,7 +3,7 @@ use std::path::Path as StdPath;
 use anyhow::anyhow;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -12,9 +12,11 @@ use crate::{
     api::{
         MonoApiServiceState, api_doc::TAG_MANAGE, router::preview_router::trunk_write_requester,
     },
-    ceres::model::tag::{CreateTagRequest, DeleteTagResponse, TagListResponse, TagResponse},
+    ceres::model::tag::{
+        CreateTagRequest, DeleteTagResponse, TagListQuery, TagListResponse, TagResponse,
+    },
     common::errors::{ApiError, map_ceres_error},
-    contract::api::common::{CommonResult, PageParams},
+    contract::api::common::{CommonResult, Pagination},
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -210,26 +212,33 @@ async fn create_tag(
     Ok(Json(CommonResult::success(Some(response))))
 }
 
-/// List all Tags
+/// List tags (plan-20260918 ADR-FT-02): GET-only; POST is not registered (405).
 #[utoipa::path(
-    post,
+    get,
     path = "/tags/list",
-    request_body = PageParams<String>,
+    params(TagListQuery),
     responses(
         (status = 200, body = CommonResult<TagListResponse>, content_type = "application/json")
     ),
     tag = TAG_MANAGE
 )]
-
 async fn list_tags(
     State(state): State<MonoApiServiceState>,
-    Json(json): Json<PageParams<String>>,
+    Query(query): Query<TagListQuery>,
 ) -> Result<Json<CommonResult<TagListResponse>>, ApiError> {
-    let pagination = json.pagination;
-    let repo_path_ref = if json.additional.trim().is_empty() {
+    if query.per_page == 0 {
+        return Err(ApiError::bad_request(anyhow!(
+            "[code:400] per_page must be >= 1"
+        )));
+    }
+    let pagination = Pagination {
+        page: query.page,
+        per_page: query.per_page,
+    };
+    let repo_path_ref = if query.path.trim().is_empty() {
         "/"
     } else {
-        json.additional.as_str()
+        query.path.trim()
     };
     let api = state
         .api_handler(std::path::Path::new(repo_path_ref))
@@ -363,14 +372,9 @@ fn tag_routes_registered_on_storage_only_routers() {
         item.get.is_some() && item.delete.is_some(),
         "get + delete on /tags/{{name}}"
     );
-    assert!(
-        api.paths
-            .paths
-            .get("/tags/list")
-            .and_then(|i| i.post.as_ref())
-            .is_some(),
-        "list stays POST"
-    );
+    let list = api.paths.paths.get("/tags/list").expect("/tags/list");
+    assert!(list.get.is_some(), "list is GET");
+    assert!(list.post.is_none(), "list is not POST");
 }
 
 /// LB-04 AC-6: the create-tag OpenAPI response is the handler's real status,

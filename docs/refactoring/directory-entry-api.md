@@ -20,8 +20,8 @@
 | `POST /api/v1/delete-entry` | `implemented` | LB-02 / FT-02 | 可用：省略 `is_directory` 删目录；`false` 删文件 |
 | `POST /api/v1/move-entry` | `implemented` | LB-03 / FT-03 | 可用：省略 `is_directory` 移目录；`false` 移文件（同一 blob oid） |
 | `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`（`api_router.rs:83`）；trunk 写经 `push_auth`，见「鉴权」 |
-| `POST /api/v1/tags/list` | `implemented` | LB-04 | **今日实况**：POST + JSON `PageParams`。FT-04 后此方法 **405** |
-| `GET /api/v1/tags/list` | `specified-unimplemented` | FT-04 | 冻结为唯一 list；今日未挂 GET（调用会 405） |
+| `POST /api/v1/tags/list` | `implemented` | FT-04 | **405**（不再登记 POST） |
+| `GET /api/v1/tags/list` | `implemented` | FT-04 | 唯一 list：必填 query `page`、`per_page`、`path` |
 | `GET /api/v1/tags/{name}` | `implemented` | LB-04 | 可用（读，不要求 Authorization）。`?path=` 与隔离 `specified`（FT-06） |
 | `DELETE /api/v1/tags/{name}` | `implemented` | LB-04 | 可用：trunk 写经 `push_auth`，今日鉴权 path 固定 `/`。`?path=` `specified`（FT-06） |
 
@@ -204,7 +204,7 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 > OpenAPI 与运行时一致为 **200**：handler 返回 `Json<CommonResult<TagResponse>>`（`tag_router.rs:166`），LB-04 把 utoipa 注解从 201 改为 200（`tag_router.rs:158`）；模块级回归 `tag_create_openapi_status_is_200` 与 IT `tag_create_unauth_401`（运行时 `/api/openapi.json`）都断言 `200` 在、`201` 不在。
 
-### `GET /api/v1/tags/list` — list — `specified`（FT-04）
+### `GET /api/v1/tags/list` — list — `implemented`（FT-04）
 
 **落地后方法是 GET，不是 POST。** 查询串为三个**必填**键：
 
@@ -214,22 +214,13 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 | `per_page` | **必填** `u64`，**必须 ≥ 1**。handler 在分页前拒绝 `per_page=0`，返回 **400** + `CommonResult`（`[code:400] per_page must be >= 1`）。禁止把 0 交给 sea-orm paginate |
 | `path` | **必填**。path context；`trim().is_empty()` 视同 `/`。调用方列 root 应显式送 `path=/` |
 
-缺键或非法数字（含 `page=abc`、缺 `path`）由 axum 0.8 `Query<T>` 在进 handler 前返回 **400** `FailedToDeserializeQueryString`（**不是** 422）。成功包络同下。
+缺键或非法数字（含 `page=abc`、缺 `path`）由 axum 0.8 `Query<T>` 在进 handler 前返回 **400** `FailedToDeserializeQueryString`（**不是** 422）。
 
-### `POST /api/v1/tags/list` — list — `implemented`（LB-04）；FT-04 后 **405**
+成功：**200** + `CommonResult<TagListResponse>`，其中 `TagListResponse = CommonPage<TagResponse>` = `{ "total": <u64>, "items": [ TagResponse… ] }`。
 
-**今日实况：方法是 POST。** body 为 `PageParams<String>`：
+### `POST /api/v1/tags/list` — list — **405**（FT-04）
 
-| 键 | 规则 |
-|---|---|
-| `pagination` | **必填**，`{ page: u64, per_page: u64 }`，两个子键也都必填。`page` 从 **1** 起（内部 `page.saturating_sub(1)`，故 `page:0` 等同 `page:1`）；`per_page` **必须 ≥ 1**：`per_page = 0` 会让 `mono_storage.rs:1886` 一带的 `.paginate(...)` 触发 sea-orm 的 `assert!(page_size != 0)` 而 **panic**；本仓**没有** `CatchPanicLayer`，调用方看到的是连接中断。`mono_api_service.rs` 里的 `0 → 20` 回退**只**作用于 lightweight ref 的补页，在 DB 分页已经 panic 之后才会走到 |
-| `additional` | **必填**，这里是 path context |
-
-两个键都**没有** `#[serde(default)]`（`src/contract/api/common.rs:52-56`），因此**都必须出现在 JSON 里**。server 把 `additional.trim().is_empty()` 视同 `/`（含纯空白），但调用方列 root 应显式送 `additional: "/"`。
-
-FT-04 落地后：**卸 POST**；对该路径发 POST 必须 **405**。调用方改走 `GET /api/v1/tags/list?page=&per_page=&path=`。
-
-成功（GET 落地后与今日 POST 相同）：**200** + `CommonResult<TagListResponse>`，其中 `TagListResponse = CommonPage<TagResponse>` = `{ "total": <u64>, "items": [ TagResponse… ] }`。
+对该路径发 POST 必须 **405**。调用方改走 `GET /api/v1/tags/list?page=&per_page=&path=`。不再接受 JSON `PageParams<String>`。该路径没有成功体。
 
 > `total` = DB 里符合过滤的注解 tag 数 **加上**本次请求扫描到、且已扣除与本页 annotated 重名后的**全部** lightweight ref 数。注意该加数在 `.take(need)` **之前**就已算出，所以其中可能包含**并未进入本页 `items`** 的 refs。因此 `total` **随页而变**，不是稳定的全局计数；分页请以 `items` 长度与 `per_page` 判断，不要把 `total` 当权威总量。FT-06 后注解 tag 按 `mega_tag.path` 过滤；今日注解 tag 不按 path 过滤。
 
@@ -252,7 +243,7 @@ FT-04 落地后：**卸 POST**；对该路径发 POST 必须 **405**。调用方
 
 ### 不需要 Authorization
 
-`GET /tree`、今日 `POST /tags/list`、落地后 `GET /tags/list`、`GET /tags/{name}` —— 调用方**不送**、server **不要求** Authorization。
+`GET /tree`、`GET /tags/list`、`GET /tags/{name}` —— 调用方**不送**、server **不要求** Authorization。
 
 ### 需要 Authorization（trunk 写）
 
@@ -313,7 +304,7 @@ tag 写的鉴权 path 不是你操作的业务路径：
 
 目录变更成功后，对同一 path tip 的 `git clone` / `git fetch` + `git pull` 必须看到删除结果或新路径。
 
-tag create/delete 之后，`GET /tags/{name}` 与 list（今日 `POST /tags/list`；FT-04 后 `GET /tags/list`）必须在同一 path 下一致。
+tag create/delete 之后，`GET /tags/{name}` 与 `GET /tags/list` 必须在同一 path 下一致。
 
 ## 非目标
 
@@ -356,7 +347,7 @@ Libra 必须按以下事实实现，不得反向假设：
 
 ## 相关文档
 
-- [`../monorepo.md`](../monorepo.md) —— 产品规则；tag 只能走 HTTP，Git 客户端禁 tag。该文的 API 表今日仍写 `POST … /tags/list`；FT-04 后应对齐 GET。wire 以本页为准
+- [`../monorepo.md`](../monorepo.md) —— 产品规则；tag 只能走 HTTP，Git 客户端禁 tag。该文的 API 表已对齐 GET。wire 以本页为准
 - [`../plan/plan-20260918.md`](../plan/plan-20260918.md) —— 文件删移、GET list、path 级 tag 跟进
 - [`../deploy-trunk.md`](../deploy-trunk.md) —— storage-only 运维手册与产品 API 写契约
 - [`../plan/plan-20260904.md`](../plan/plan-20260904.md) —— create-entry / edit/save + `push_auth` + `land_api_tip_push` 的来源计划

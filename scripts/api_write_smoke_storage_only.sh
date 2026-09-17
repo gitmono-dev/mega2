@@ -495,10 +495,15 @@ case_tags_list_create_delete() {
   require_api_base || return 1
   require_token || return 1
   local name="lb05-tag-${LB05_RUN_ID}" code
-  local list_body='{"pagination":{"page":1,"per_page":200},"additional":"/"}'
-  api_call POST tags/list "$list_body" noauth; code="$API_CODE"
+  local list_route='tags/list?page=1&per_page=200&path=/'
+  api_call GET "$list_route" "" noauth; code="$API_CODE"
   if [[ "$code" != "200" ]] || ! body_req_result_true; then
-    echo "FAIL: POST /tags/list (anonymous) HTTP $code body=$API_BODY" >&2
+    echo "FAIL: GET /tags/list (anonymous) HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags/list '{"pagination":{"page":1,"per_page":200},"additional":"/"}' noauth; code="$API_CODE"
+  if [[ "$code" != "405" ]]; then
+    echo "FAIL: POST /tags/list must 405, got HTTP $code body=$API_BODY" >&2
     return 1
   fi
   api_call POST tags "{\"name\":\"${name}\",\"message\":\"lb05 smoke tag\",\"tagger_name\":\"lb05\",\"tagger_email\":\"lb05@example.invalid\"}"; code="$API_CODE"
@@ -510,9 +515,9 @@ case_tags_list_create_delete() {
     echo "FAIL: create-tag response lacks the tag name: $API_BODY" >&2
     return 1
   fi
-  api_call POST tags/list "$list_body" noauth; code="$API_CODE"
+  api_call GET "$list_route" "" noauth; code="$API_CODE"
   if [[ "$code" != "200" ]] || ! body_names_entry "$name"; then
-    echo "FAIL: POST /tags/list after create does not list ${name} (HTTP $code): $API_BODY" >&2
+    echo "FAIL: GET /tags/list after create does not list ${name} (HTTP $code): $API_BODY" >&2
     return 1
   fi
   api_call GET "tags/${name}" "" noauth; code="$API_CODE"
@@ -525,9 +530,9 @@ case_tags_list_create_delete() {
     echo "FAIL: DELETE /tags/${name} (token) HTTP $code body=$API_BODY" >&2
     return 1
   fi
-  api_call POST tags/list "$list_body" noauth; code="$API_CODE"
+  api_call GET "$list_route" "" noauth; code="$API_CODE"
   if [[ "$code" != "200" ]] || body_names_entry "$name"; then
-    echo "FAIL: POST /tags/list after delete still lists ${name} (HTTP $code): $API_BODY" >&2
+    echo "FAIL: GET /tags/list after delete still lists ${name} (HTTP $code): $API_BODY" >&2
     return 1
   fi
   api_call GET "tags/${name}" "" noauth; code="$API_CODE"
