@@ -168,28 +168,46 @@ passthrough 层的 `open_by_handle_at` 走真实路径而不是回退；rootless
 ./scripts/dev-test.sh up-scorpio          # 首次会构建 scorpiofs:local（数分钟）
 ./scripts/dev-test.sh up-scorpio --build  # ../scorpiofs 改动后强制重建
 ./scripts/dev-test.sh scorpio-smoke       # 栈级 smoke，见下
+ls /tmp/mega2-scorpiofs/mount             # 宿主上直接浏览 monorepo
 ./scripts/dev-test.sh down                # 连同 scorpio profile 一起 down -v
 ```
 
 等价手贴：
 
 ```bash
+dir="${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}"
+mkdir -p "$dir/mount" "$dir/antares"      # 由测试 UID 创建；mount 必须为空
 docker compose -p mega2-it -f docker-compose.test.yml \
   --profile app --profile scorpio up -d --wait
 bash scripts/scorpiofs_smoke.sh
 ```
 
-`scripts/scorpiofs_smoke.sh` 用宿主 `curl`（`127.0.0.1:12725`）加
+**挂载对宿主可见。** `scorpiofs` 把宿主 `${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}/mount`
+与 `…/antares` 以 `rshared` bind 挂到容器 `/mnt/scorpiofs/mount` / `/mnt/scorpiofs/antares`
+（经 `SCORPIO_WORKSPACE` / `SCORPIO_ANTARES_MOUNT_ROOT` 覆盖镜像默认路径），容器内做的
+FUSE 挂载会传播回宿主：`<workdir>/mount` 就是 monorepo 只读根，Antares 任务挂载出现在
+`<workdir>/antares/<mount_id>`。ScorpioFS 以 `allow_other` 挂载，宿主非 root 用户可直接读
+（文件属主显示为 root）。前提是宿主路径位于 `shared` 传播的挂载上（systemd 宿主默认）且
+dockerd 与宿主共享 mount namespace；macOS Docker Desktop 的传播止于 VM，宿主看不到。
+
+`scripts/scorpiofs_smoke.sh` 用宿主 `curl`（`127.0.0.1:12725`）、宿主 `findmnt` 与
 `docker compose … exec -T scorpiofs` 覆盖：`GET /health`；dicfuse 只读根列出初始化树
-（`project`、`third-party`）且 `project/.gitkeep` 为占位内容；旧版
+（`project`、`third-party`）且 `project/.gitkeep` 为占位内容；`host-mount`：宿主
+`<workdir>/mount` 是 `fuse` 挂载并以当前 UID 可读；旧版
 `POST /api/fs/mount` → `GET /api/fs/mpoint` → `POST /api/fs/unmount`；Antares
-`POST /antares/mounts` → `/ready` → 列目录 → `DELETE`。服务未启动时输出 `SKIP`
-（设 `SCORPIOFS_IT=1` 改为失败），单跑一例用 `MEGA2_SMOKE_CASE=<name>`。
+`POST /antares/mounts` → `/ready` → 容器内与宿主都列出挂载目录 → `DELETE`。服务未启动时输出
+`SKIP`（设 `SCORPIOFS_IT=1` 改为失败），单跑一例用 `MEGA2_SMOKE_CASE=<name>`。
 
 联调要点：
 
-- FUSE 挂载只存在于 `scorpiofs` 容器的 mount namespace，宿主上看不到；观察一律
-  `docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio exec -T scorpiofs ls -la /var/lib/scorpiofs/mount`。
+- 宿主看到的是同一个 FUSE 挂载；容器内路径 `/mnt/scorpiofs/mount` ⇄ 宿主 `<workdir>/mount`。
+  也可进容器看：`docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio exec -T scorpiofs ls -la /mnt/scorpiofs/mount`。
+- `down`/`stop` 走 SIGTERM 优雅卸载（`stop_grace_period: 45s`），宿主挂载随之消失；若容器被
+  SIGKILL，宿主会残留 `Transport endpoint is not connected` 的挂载，`up-scorpio` 会拒绝启动并提示
+  `sudo umount -l <path>`。跑 `down` 前不要让 shell 停在挂载目录里（EBUSY 会拖慢卸载）。
+- 不要只删 `mega2-data` 卷而保留数据库：compose `mega2` 的 blob（local 对象存储）与 vault key 在卷里、
+  元数据在 `postgres` 的 `public` schema，拆开删会得到 `core key file is missing` 与 0 字节文件。
+  要重置就整栈 `down -v`。
 - 排查 API 契约时把日志调到 debug：`MEGA2_IT_SCORPIO_LOG_LEVEL=scorpio=debug ./scripts/dev-test.sh up-scorpio`，
   再 `docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio logs -f scorpiofs`。
 - ScorpioFS HTTP API 无认证，端口只绑 `127.0.0.1`；不要改成 `0.0.0.0`。
@@ -255,6 +273,7 @@ bash scripts/scorpiofs_smoke.sh
 | `MEGA2_IT_GIT_UID` / `GID` | 容器内用户；本地 `id -u` ≠ 1000 时必设（脚本默认导出当前用户） |
 | `MEGA2_IT_HTTP_URL` | 指向 compose `app` 常驻服务 |
 | `MEGA2_IT_SCORPIO_URL` | 指向 compose `scorpio` 常驻 ScorpioFS API（默认 `http://127.0.0.1:12725`，供 `scorpiofs_smoke.sh`） |
+| `MEGA2_IT_SCORPIO_WORKDIR` | 宿主可见 FUSE 挂载的根（默认 `/tmp/mega2-scorpiofs`；`mount/` 与 `antares/` 以 rshared bind 进容器）；变更后须 `--force-recreate scorpiofs` |
 | `MEGA2_IT_SCORPIO_LOG_LEVEL` | `scorpiofs` 容器的 `SCORPIO_LOG_LEVEL`（默认 `info`；联调可设 `scorpio=debug`） |
 | `MEGA2_IT_ALLOW_HOST_GIT=1` | **仅**本地实验用宿主机 git；**不是**验收路径 |
 | `MEGA2_IT_SKIP_GIT_CLI=1` | 显式跳过 git-cli 用例（非默认门禁） |

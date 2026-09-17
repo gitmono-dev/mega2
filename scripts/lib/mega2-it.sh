@@ -71,6 +71,61 @@ mega2_it_up_full() {
   mega2_it_compose --profile git up -d --wait
 }
 
+# Host directories the `scorpiofs` service bind-mounts with rshared
+# propagation: <workdir>/mount (workspace) and <workdir>/antares (Antares mount
+# root). ScorpioFS refuses a non-empty mountpoint, and Docker would auto-create
+# a missing source root-owned, so create them as the test user before `up`.
+mega2_it_prepare_scorpio_workdir() {
+  local dir="${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}"
+  export MEGA2_IT_SCORPIO_WORKDIR="${dir}"
+  # A running daemon legitimately has <workdir>/mount mounted and non-empty.
+  if [[ -n "$(mega2_it_compose --profile app --profile scorpio ps -q --status running scorpiofs 2>/dev/null)" ]]; then
+    mega2_it_info "scorpiofs already running; keeping workdir ${dir}"
+    return 0
+  fi
+  local stale
+  stale="$(findmnt -rn -o TARGET 2>/dev/null | grep -E "^${dir}(/|$)" || true)"
+  if [[ -n "${stale}" ]]; then
+    mega2_it_die "stale FUSE mounts under ${dir} (SIGKILLed scorpiofs?); unmount with: sudo umount -l <path>"$'\n'"${stale}"
+  fi
+  mkdir -p "${dir}/mount" "${dir}/antares"
+  # The workspace mountpoint itself must be empty (ScorpioFS refuses otherwise).
+  if [[ -n "$(ls -A "${dir}/mount" 2>/dev/null)" ]]; then
+    mega2_it_die "${dir}/mount must be empty (ScorpioFS refuses a non-empty mountpoint)"
+  fi
+  # Antares mounts at <root>/<mount_id>; a previous run may leave empty
+  # per-mount directories behind (mode 0777, removable by the parent's owner).
+  find "${dir}/antares" -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir {} + 2>/dev/null || true
+  mega2_it_info "scorpiofs workdir ${dir} (host-visible FUSE mounts: ${dir}/mount, ${dir}/antares/<mount_id>)"
+}
+
+# True when <path> is itself a mountpoint on the host (findmnt exact match).
+mega2_it_scorpio_is_mounted() {
+  command -v findmnt >/dev/null 2>&1 || return 1
+  findmnt -n -o TARGET "$1" >/dev/null 2>&1
+}
+
+# After `down`: report FUSE mounts that survived (SIGKILLed daemon), otherwise
+# remove the now-empty mountpoint directories.
+mega2_it_cleanup_scorpio_workdir() {
+  local dir="${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}"
+  [[ -d "${dir}" ]] || return 0
+  local stale=""
+  local target
+  while IFS= read -r target; do
+    [[ -n "${target}" ]] && stale+="${target}"$'\n'
+  done < <(findmnt -rn -o TARGET 2>/dev/null | grep -E "^${dir}(/|$)" || true)
+  if [[ -n "${stale}" ]]; then
+    echo "warning: stale FUSE mounts under ${dir} (unmount with: sudo umount -l <path>):" >&2
+    printf '%s' "${stale}" >&2
+    return 0
+  fi
+  # Only ever remove EMPTY directories (leftover Antares mountpoints, then the
+  # two roots); anything else under the workdir is left for the user.
+  find "${dir}/antares" -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir {} + 2>/dev/null || true
+  rmdir "${dir}/mount" "${dir}/antares" "${dir}" 2>/dev/null || true
+}
+
 # ScorpioFS linked to the compose-hosted mega2 (profiles app + scorpio).
 # `scorpiofs:local` is built from the sibling checkout `../scorpiofs` on the
 # first run (or with `--build`); see docs/refactoring/test-infra.md.
@@ -78,6 +133,7 @@ mega2_it_up_scorpio() {
   local scorpiofs_dir="${MEGA2_IT_ROOT}/../scorpiofs"
   [[ -f "${scorpiofs_dir}/Dockerfile" ]] \
     || mega2_it_die "missing sibling checkout ${scorpiofs_dir} (needed to build scorpiofs:local)"
+  mega2_it_prepare_scorpio_workdir
   mega2_it_info "starting data plane + mega2 + scorpiofs (--profile app --profile scorpio)"
   mega2_it_compose --profile app --profile scorpio up -d --wait "$@"
 }
@@ -85,6 +141,7 @@ mega2_it_up_scorpio() {
 mega2_it_down() {
   mega2_it_info "tearing down ${MEGA2_IT_PROJECT} (profiles git+app+web+smoke+scorpio, -v)"
   mega2_it_compose --profile git --profile app --profile web --profile smoke --profile scorpio down -v
+  mega2_it_cleanup_scorpio_workdir
 }
 
 mega2_it_health() {

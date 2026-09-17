@@ -243,16 +243,32 @@ services:
   #
   # Built from the sibling checkout `../scorpiofs` (same convention as
   # `../megaui`). It reads trees/blobs from http://mega2:8000 and mounts the
-  # monorepo under /var/lib/scorpiofs/mount *inside its own mount namespace*:
-  # inspect it with `exec -T scorpiofs ls /var/lib/scorpiofs/mount`, not from
-  # the host. FUSE in a container needs the host's /dev/fuse plus CAP_SYS_ADMIN
-  # (and a relaxed AppArmor profile on hosts that enforce one); rootless Docker
-  # cannot run it.
+  # monorepo under /var/lib/scorpiofs/mount. FUSE in a container needs the
+  # host's /dev/fuse plus CAP_SYS_ADMIN (and a relaxed AppArmor profile on hosts
+  # that enforce one); rootless Docker cannot run it.
+  #
+  # The FUSE mounts are made visible on the HOST: the workspace and the Antares
+  # mount root are bind-mounted from ${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}
+  # with `rshared` propagation, so a mount performed inside the container shows
+  # up at <workdir>/mount and <workdir>/antares/<mount_id> on the host (ScorpioFS
+  # mounts with allow_other, so the unprivileged host user can browse it). This
+  # needs the host source to sit on a `shared` mount (systemd hosts: yes) and a
+  # rootful Docker whose daemon shares the host mount namespace. Pre-create the
+  # workdir as the test user before `up` (dev-test.sh does) so Docker does not
+  # auto-create it root-owned; ScorpioFS refuses a non-empty mountpoint.
+  #
+  # The mountpoints are moved to /mnt/scorpiofs/* via SCORPIO_WORKSPACE /
+  # SCORPIO_ANTARES_MOUNT_ROOT on purpose: nesting rshared binds inside the
+  # `scorpiofs-data` named volume propagated copies of them into the host at the
+  # volume's _data path, where they outlived the container and blocked
+  # `docker volume rm` (observed during bring-up). Store / state / Antares
+  # upper+cl layers stay in the volume at the image defaults.
   #
   # Lives in its own profile because it depends on `mega2` (profile `app`):
   #   docker compose -p mega2-it -f docker-compose.test.yml \
   #     --profile app --profile scorpio up -d --wait
   #   bash scripts/scorpiofs_smoke.sh        # or: ./scripts/dev-test.sh scorpio-smoke
+  #   ls /tmp/mega2-scorpiofs/mount          # the monorepo, on the host
   scorpiofs:
     profiles: ["scorpio"]
     image: scorpiofs:local
@@ -269,6 +285,9 @@ services:
       # Any scorpio.toml key can be overridden as SCORPIO_<KEY>; e.g. use
       # `scorpio=debug` while debugging the mega2 <-> ScorpioFS API contract.
       SCORPIO_LOG_LEVEL: ${MEGA2_IT_SCORPIO_LOG_LEVEL:-info}
+      # FUSE mountpoints outside the named volume (see the service comment).
+      SCORPIO_WORKSPACE: /mnt/scorpiofs/mount
+      SCORPIO_ANTARES_MOUNT_ROOT: /mnt/scorpiofs/antares
     devices:
       - /dev/fuse
     cap_add:
@@ -280,13 +299,31 @@ services:
     security_opt:
       - apparmor:unconfined
     volumes:
+      # Store, runtime state file and Antares upper/cl layers.
       - scorpiofs-data:/var/lib/scorpiofs
+      # Host-visible FUSE mountpoints (see the service comment above). Both
+      # sources must exist and be EMPTY before `up`.
+      - type: bind
+        source: ${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}/mount
+        target: /mnt/scorpiofs/mount
+        bind:
+          propagation: rshared
+      - type: bind
+        source: ${MEGA2_IT_SCORPIO_WORKDIR:-/tmp/mega2-scorpiofs}/antares
+        target: /mnt/scorpiofs/antares
+        bind:
+          propagation: rshared
     ports:
       # The ScorpioFS HTTP API is unauthenticated: loopback + high port only.
       - "127.0.0.1:12725:2725"
+    # The daemon unmounts on SIGTERM (up to ~20s daemon join + 15s Antares
+    # cleanup). Give it that budget: a SIGKILL would leave the host-visible
+    # mountpoints as stale "Transport endpoint is not connected" FUSE mounts.
+    stop_grace_period: 45s
     healthcheck:
       # `serve` mounts the FUSE workspace before binding HTTP, so a healthy
-      # probe also proves the in-container FUSE mount succeeded.
+      # probe also proves the FUSE mount succeeded (and, via rshared, that it
+      # is visible on the host).
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:2725/health"]
       interval: 3s
       timeout: 5s

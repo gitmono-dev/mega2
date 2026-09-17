@@ -17,7 +17,8 @@ Stack commands:
   up-data              Start default data plane (postgres/redis/rustfs/rustfs-init/mailpit)
   up-full              Start data plane + git-cli (recommended for cargo test --all)
   up-scorpio [args]    Start data plane + mega2 + scorpiofs (--profile app --profile scorpio);
-                       builds scorpiofs:local from ../scorpiofs on first run (pass --build to rebuild)
+                       builds scorpiofs:local from ../scorpiofs on first run (pass --build to rebuild).
+                       The FUSE workspace is visible on the host at $MEGA2_IT_SCORPIO_WORKDIR/mount
   down                 Tear down project (profiles git/app/web/smoke/scorpio, volumes)
   health               Postgres / Redis / Mailpit smoke checks
 
@@ -42,6 +43,7 @@ Environment:
   MEGA2_IT_GIT_WORKDIR   Shared git-cli host dir (default: /tmp/mega2-git)
   MEGA2_IT_GIT_UID/GID   Container user (default: current id -u/-g)
   MEGA2_IT_SCORPIO_URL   ScorpioFS HTTP API on the host (default: http://127.0.0.1:12725)
+  MEGA2_IT_SCORPIO_WORKDIR  Host root of the host-visible FUSE mounts (default: /tmp/mega2-scorpiofs)
 USAGE
 }
 
