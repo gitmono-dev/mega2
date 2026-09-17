@@ -3,6 +3,9 @@
 //! frames. Identity encoding only in this slice; zstd negotiation is a later
 //! WP and `frame_encodings` advertises identity alone.
 
+// Axum handlers in this module return `Response` as `Err` (PR #13 MST/2 surface).
+#![allow(clippy::result_large_err)]
+
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
@@ -13,6 +16,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::{abs_view_path, internal, mst2_error_response};
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
@@ -21,8 +25,6 @@ use crate::ceres::snapshot::{
     runtime::runtime,
     view::validate_scope_relative_path,
 };
-
-use super::{abs_view_path, internal, mst2_error_response};
 
 /// One file resolved at a fixed path with verified content.
 struct ResolvedFile {

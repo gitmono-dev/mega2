@@ -1276,11 +1276,12 @@ impl ApiHandler for MonoApiService {
         })
     }
 
-    /// Delete a directory: drop its item from the parent tree and commit the
-    /// rewritten chain (plan-20260917 ADR-LB-02). Empty and non-empty
-    /// directories share this one semantic. A parent left empty keeps a
-    /// timestamped `.gitkeep` so it stays a valid (empty) directory — the same
-    /// representation create-entry uses for a new empty directory.
+    /// Delete a directory or file: drop its item from the parent tree and
+    /// commit the rewritten chain (plan-20260917 ADR-LB-02, plan-20260918
+    /// ADR-FT-01). `is_directory` selects Tree vs Blob/BlobExecutable. Empty
+    /// and non-empty directories share this one semantic. A parent left empty
+    /// keeps a timestamped `.gitkeep` so it stays a valid (empty) directory —
+    /// the same representation create-entry uses for a new empty directory.
     async fn delete_monorepo_entry(
         &self,
         entry_info: DeleteEntryInfo,
@@ -1305,16 +1306,25 @@ impl ApiHandler for MonoApiService {
             .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
         let mut items = parent_tree.tree_items.clone();
         // A tree may legally hold a blob and a tree of the same name
-        // (create-entry's duplicate check is mode-scoped), so look for the
-        // directory first and only then diagnose a same-named file.
-        let index = match items
-            .iter()
-            .position(|item| item.name == entry_info.name && item.mode == TreeItemMode::Tree)
-        {
+        // (create-entry's duplicate check is mode-scoped). Match the selected
+        // mode; another mode with the same name is 400, a missing name is 404.
+        let index = match items.iter().position(|item| {
+            item.name == entry_info.name
+                && if entry_info.is_directory {
+                    item.mode == TreeItemMode::Tree
+                } else {
+                    matches!(item.mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable)
+                }
+        }) {
             Some(index) => index,
             None if items.iter().any(|item| item.name == entry_info.name) => {
+                let kind = if entry_info.is_directory {
+                    "directory"
+                } else {
+                    "file"
+                };
                 return Err(GitError::CustomError(format!(
-                    "[code:400] '{}' is not a directory",
+                    "[code:400] '{}' is not a {kind}",
                     entry_info.name
                 )));
             }

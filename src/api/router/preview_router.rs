@@ -612,6 +612,7 @@ async fn delete_entry_calls_trunk_write_requester() {
     let body = DeleteEntryInfo {
         path: "/project".to_owned(),
         name: "gone".to_owned(),
+        is_directory: true,
         author_username: None,
         skip_build: true,
     };

@@ -876,12 +876,23 @@ impl EntryCase {
     }
 
     fn delete_entry(&self, auth: Option<&str>, path: &str, name: &str) -> (u16, Value) {
+        self.delete_entry_as(auth, path, name, true)
+    }
+
+    fn delete_entry_as(
+        &self,
+        auth: Option<&str>,
+        path: &str,
+        name: &str,
+        is_directory: bool,
+    ) -> (u16, Value) {
         self.post(
             "delete-entry",
             auth,
             serde_json::json!({
                 "path": path,
                 "name": name,
+                "is_directory": is_directory,
                 "author_username": LB02_AUTHOR,
                 "skip_build": true
             }),
@@ -1071,6 +1082,64 @@ fn delete_entry_reject_file_400() {
         path_tip(case.db_url(), "/project"),
         tip_before,
         "rejected delete must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_file_success() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "ft02-file.txt", false);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.delete_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft02-file.txt",
+        false,
+    );
+    assert_eq!(status, 200, "deleting a file must 200: {json}");
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert!(json["data"]["cl_link"].is_null(), "{json}");
+    assert_eq!(
+        json["data"]["path"],
+        Value::String("/project/ft02-file.txt".to_string()),
+        "{json}"
+    );
+    assert!(
+        json["data"].get("new_oid").is_none(),
+        "delete-entry has no new_oid: {json}"
+    );
+    assert_ne!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "file delete must advance /project tip"
+    );
+    let after = case.tree_names("/project");
+    assert!(
+        after.iter().all(|n| n != "ft02-file.txt"),
+        "deleted file must vanish: {after:?}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_directory_as_file_400() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "ft02-dir", true);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) =
+        case.delete_entry_as(Some(&EntryCase::bearer()), "/project", "ft02-dir", false);
+    assert_eq!(status, 400, "directory as file must 400: {json}");
+    assert!(
+        err_message(&json).contains("is not a file"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected file-mode delete must not advance tip"
     );
     case.finish();
 }

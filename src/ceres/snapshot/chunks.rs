@@ -11,8 +11,10 @@
 //! cache miss simply rebuilds from Git. Entries are addressed by content
 //! digest, never by request path.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Mutex, OnceLock},
+};
 
 use mst2_codec::chunkmap::{CHUNK_SIZE, CHUNKS_PER_PAGE, ChunkLeaf, ChunkMap};
 use sha2::{Digest, Sha256};

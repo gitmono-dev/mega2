@@ -17,7 +17,7 @@
 |---|---|---|---|
 | `GET /api/v1/tree` | `implemented` | — | 可用 |
 | `POST /api/v1/create-entry` | `implemented` | — | 可用 |
-| `POST /api/v1/delete-entry` | `implemented` | LB-02 | 可用：今日省略 `is_directory` 只删目录。文件分支 `specified`（FT-02） |
+| `POST /api/v1/delete-entry` | `implemented` | LB-02 / FT-02 | 可用：省略 `is_directory` 删目录；`false` 删文件 |
 | `POST /api/v1/move-entry` | `implemented` | LB-03 | 可用：今日省略 `is_directory` 只移目录。文件分支 `specified`（FT-03） |
 | `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`（`api_router.rs:83`）；trunk 写经 `push_auth`，见「鉴权」 |
 | `POST /api/v1/tags/list` | `implemented` | LB-04 | **今日实况**：POST + JSON `PageParams`。FT-04 后此方法 **405** |
@@ -80,7 +80,7 @@
 
 以下两表逐行复制自 ADR-LB-03，并由 ADR-FT-01 扩 `is_directory`。
 
-### `POST /api/v1/delete-entry` — `implemented`（LB-02）；文件分支 `specified`（FT-02）
+### `POST /api/v1/delete-entry` — `implemented`（LB-02 / FT-02）
 
 ```json
 {
@@ -96,7 +96,7 @@
 |---|---|
 | `path` | **必填**。父目录，rooted，默认语义与 create-entry 相同（根下用 `/`） |
 | `name` | **必填**。要删的项名；禁止 `/`、`.`、`..`、分隔符、NUL、控制字符 |
-| `is_directory` | **可选**。`bool`，`#[serde(default = "default_true")]` → **`true`**。`true` = 目录（Tree）；`false` = 文件（Blob 或 BlobExecutable）。省略与显式 `true` 同义。 |
+| `is_directory` | **可选**。`bool`，`#[serde(default = "default_is_directory")]` → **`true`**。`true` = 目录（Tree）；`false` = 文件（Blob 或 BlobExecutable）。省略与显式 `true` 同义。 |
 | `author_username` | **可选**。`Option<String>`；可省略或 JSON `null`。不参与鉴权。 |
 | `skip_build` | **可选**。`bool`，`#[serde(default)]` → `false`。Libra 一律送 `true`。与 create-entry 同形。 |
 | 目标 | 必须已存在且 mode 与 `is_directory` 相符；禁止删 `/` |
@@ -110,7 +110,7 @@
 
 - `path`/`name` 先过 `validate_entry_target`（`src/ceres/model/git.rs`）：`path` 须 rooted（空串等于 `/`，容忍一个尾随 `/`），组件不得为空、`.`、`..`；`name` 为单一组件，禁 `/`、`\`、`.`、`..`、NUL 与控制字符。不合规一律 **400**。
 - 父目录被删空时，服务端补写一个带时间戳的 `.gitkeep`，父目录保留为**空目录**——与 create-entry 表示新建空目录的方式一致；Git 无法在路径上表示空 tree，这是唯一能保住父目录的做法。
-- 同名的 blob 与 tree 可以并存（create-entry 的重名检查按 mode 区分）。`is_directory=true`（或缺省）只匹配 Tree；`false` 只匹配 Blob 或 BlobExecutable。父 tree **完全没有**该 `name` 才是 **404**；同名但 mode 不符是 **400**（「不是目录」或「不是文件」）。**今日实况（FT-02 前）：** 省略字段只删目录；`is_directory=false` 尚未落地。
+- 同名的 blob 与 tree 可以并存（create-entry 的重名检查按 mode 区分）。`is_directory=true`（或缺省）只匹配 Tree；`false` 只匹配 Blob 或 BlobExecutable。父 tree **完全没有**该 `name` 才是 **404**；同名但 mode 不符是 **400**（「不是目录」或「不是文件」）。
 - 一次删除 = 一次 commit（父链 tree 改写 + `.gitkeep` 可选 blob），trunk 经 `land_api_tip_push` 前进 tip，Review 走既有 CL 分支（`EditCLMode::TryReuse(None)`，与 create-entry 相同的政策分流）。
 - trunk 上父目录为 `/`（即删除顶层目录）时，B0 拒绝根 tip 经 MonoWriteQueue 前进，返回 **400**（`no non-root path tip under / for trunk API write`）；Review 形态则在 `/` 的 CL 上进行。
 - `commit_id` 在 trunk 上是落地后的 tip；`path` 只作回执。

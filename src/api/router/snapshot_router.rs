@@ -6,6 +6,9 @@
 //! to the fixed commit captured at resolve time; no handler here touches
 //! current refs after resolve.
 
+// Axum handlers in this module return `Response` as `Err` (PR #13 MST/2 surface).
+#![allow(clippy::result_large_err)]
+
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},

@@ -44,6 +44,11 @@ fn default_create_mode() -> EditCLMode {
     EditCLMode::TryReuse(None)
 }
 
+/// ADR-FT-01: omit `is_directory` on delete/move = directory (not `None`).
+fn default_is_directory() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct CodePreviewQuery {
     #[serde(default)]
@@ -241,15 +246,18 @@ pub struct CreateEntryResult {
     pub cl_link: Option<String>,
 }
 
-/// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03): the
-/// parent `path` plus the directory `name`, same shape as create-entry minus
-/// `is_directory` / `content` / `mode`.
+/// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03,
+/// plan-20260918 ADR-FT-01): parent `path` plus `name`; `is_directory`
+/// defaults to directory so existing directory clients omit the field.
 #[derive(PartialEq, Eq, Debug, Clone, Deserialize, ToSchema)]
 pub struct DeleteEntryInfo {
     /// parent directory, rooted; `/` (or empty) means the root
     pub path: String,
-    /// name of the directory to delete
+    /// name of the directory or file to delete
     pub name: String,
+    /// `true` = Tree; `false` = Blob / BlobExecutable. Omit = `true`.
+    #[serde(default = "default_is_directory")]
+    pub is_directory: bool,
     /// web username for commit binding / CL ownership (optional)
     pub author_username: Option<String>,
     /// if true, skip build
@@ -259,7 +267,11 @@ pub struct DeleteEntryInfo {
 
 impl DeleteEntryInfo {
     pub fn commit_msg(&self) -> String {
-        format!("delete directory {}", self.name)
+        if self.is_directory {
+            format!("delete directory {}", self.name)
+        } else {
+            format!("delete file {}", self.name)
+        }
     }
 }
 
@@ -419,16 +431,31 @@ fn delete_entry_body_matches_create_entry_path_name_rules() {
         DeleteEntryInfo {
             path: "/project".to_string(),
             name: "old-dir".to_string(),
+            is_directory: true,
             author_username: None,
             skip_build: false,
         }
     );
+    assert!(info.is_directory);
     let info: DeleteEntryInfo = serde_json::from_str(
         r#"{"path":"/project","name":"old-dir","author_username":null,"skip_build":true}"#,
     )
     .expect("full body");
     assert!(info.skip_build && info.author_username.is_none());
+    assert!(info.is_directory);
     assert_eq!(info.commit_msg(), "delete directory old-dir");
+    let file: DeleteEntryInfo =
+        serde_json::from_str(r#"{"path":"/project","name":"a.txt","is_directory":false}"#)
+            .expect("file body");
+    assert!(!file.is_directory);
+    assert_eq!(file.commit_msg(), "delete file a.txt");
+    assert!(
+        serde_json::from_str::<DeleteEntryInfo>(
+            r#"{"path":"/project","name":"x","is_directory":null}"#
+        )
+        .is_err(),
+        "null is_directory is not omit"
+    );
     assert!(
         serde_json::from_str::<DeleteEntryInfo>(r#"{"name":"x"}"#).is_err(),
         "path is required"
