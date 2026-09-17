@@ -2329,3 +2329,91 @@ fn tag_list_requires_query_keys() {
     assert!(json["data"]["items"].is_array(), "{json}");
     case.finish();
 }
+
+/// FT-06: same tag name at `/` and `/project` is isolated by `?path=`.
+#[test]
+fn tag_path_isolation_same_name() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let bearer = EntryCase::bearer();
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-same", None, Some("root tag")),
+    );
+    assert_eq!(status, 200, "root create: {json}");
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-same", Some("/project"), Some("project tag")),
+    );
+    assert_eq!(status, 200, "project create: {json}");
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-same", Some("/project"), Some("dup")),
+    );
+    assert_eq!(status, 400, "same path_context duplicate must 400: {json}");
+
+    let (status, json) = case.get("tags/ft06-same", None);
+    assert_eq!(status, 200, "omit path is /: {json}");
+    assert_eq!(json["data"]["message"], Value::String("root tag".into()));
+    let (status, json) = case.get("tags/ft06-same?path=/project", None);
+    assert_eq!(status, 200, "project get: {json}");
+    assert_eq!(json["data"]["message"], Value::String("project tag".into()));
+    let (status, json) = case.get("tags/ft06-same?path=/other", None);
+    assert_eq!(status, 404, "other path: {json}");
+
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-root-only", None, Some("root only")),
+    );
+    assert_eq!(status, 200, "root-only create: {json}");
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-proj-only", Some("/project"), Some("proj only")),
+    );
+    assert_eq!(status, 200, "project-only create: {json}");
+    let root_names = list_tag_names(&case, "/");
+    let project_names = list_tag_names(&case, "/project");
+    assert!(
+        root_names.iter().any(|n| n == "ft06-same"),
+        "{root_names:?}"
+    );
+    assert!(
+        project_names.iter().any(|n| n == "ft06-same"),
+        "{project_names:?}"
+    );
+    assert!(
+        root_names.iter().any(|n| n == "ft06-root-only")
+            && root_names.iter().all(|n| n != "ft06-proj-only"),
+        "list / must filter annotated tags: {root_names:?}"
+    );
+    assert!(
+        project_names.iter().any(|n| n == "ft06-proj-only")
+            && project_names.iter().all(|n| n != "ft06-root-only"),
+        "list /project must filter annotated tags: {project_names:?}"
+    );
+
+    let (status, json) = case.delete("tags/ft06-same?path=/project", Some(&bearer));
+    assert_eq!(status, 200, "delete project: {json}");
+    let (status, json) = case.get("tags/ft06-same?path=/project", None);
+    assert_eq!(status, 404, "project gone: {json}");
+    let (status, json) = case.get("tags/ft06-same", None);
+    assert_eq!(status, 200, "root remains: {json}");
+    case.finish();
+
+    let scoped = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = scoped.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-scoped", Some("/project"), Some("scoped")),
+    );
+    assert_eq!(status, 200, "scoped create: {json}");
+    let (status, json) = scoped.delete("tags/ft06-scoped?path=/project", Some(&bearer));
+    assert_eq!(status, 200, "scoped token delete at /project: {json}");
+    let (status, json) = scoped.delete("tags/ft06-scoped", Some(&bearer));
+    assert_eq!(status, 403, "scoped token delete at / must 403: {json}");
+    scoped.finish();
+}

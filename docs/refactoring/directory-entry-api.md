@@ -22,8 +22,8 @@
 | `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`（`api_router.rs:83`）；trunk 写经 `push_auth`，见「鉴权」 |
 | `POST /api/v1/tags/list` | `implemented` | FT-04 | **405**（不再登记 POST） |
 | `GET /api/v1/tags/list` | `implemented` | FT-04 | 唯一 list：必填 query `page`、`per_page`、`path` |
-| `GET /api/v1/tags/{name}` | `implemented` | LB-04 | 可用（读，不要求 Authorization）。`?path=` 与隔离 `specified`（FT-06） |
-| `DELETE /api/v1/tags/{name}` | `implemented` | LB-04 | 可用：trunk 写经 `push_auth`，今日鉴权 path 固定 `/`。`?path=` `specified`（FT-06） |
+| `GET /api/v1/tags/{name}` | `implemented` | LB-04 / FT-06 | 可用（读，不要求 Authorization）。可选 `?path=`（省略或空 = `/`） |
+| `DELETE /api/v1/tags/{name}` | `implemented` | LB-04 / FT-06 | 可用：鉴权 path = 选择器 `path`（省略或空 = `/`） |
 
 公共前缀 `/api/v1` 由外层 nest 施加。
 
@@ -222,16 +222,14 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 对该路径发 POST 必须 **405**。调用方改走 `GET /api/v1/tags/list?page=&per_page=&path=`。不再接受 JSON `PageParams<String>`。该路径没有成功体。
 
-> `total` = DB 里符合过滤的注解 tag 数 **加上**本次请求扫描到、且已扣除与本页 annotated 重名后的**全部** lightweight ref 数。注意该加数在 `.take(need)` **之前**就已算出，所以其中可能包含**并未进入本页 `items`** 的 refs。因此 `total` **随页而变**，不是稳定的全局计数；分页请以 `items` 长度与 `per_page` 判断，不要把 `total` 当权威总量。FT-06 后注解 tag 按 `mega_tag.path` 过滤；今日注解 tag 不按 path 过滤。
+> `total` = DB 里符合过滤的注解 tag 数 **加上**本次请求扫描到、且已扣除与本页 annotated 重名后的**全部** lightweight ref 数。注意该加数在 `.take(need)` **之前**就已算出，所以其中可能包含**并未进入本页 `items`** 的 refs。因此 `total` **随页而变**，不是稳定的全局计数；分页请以 `items` 长度与 `per_page` 判断，不要把 `total` 当权威总量。注解 tag 按 `mega_tag.path` 过滤，轻量 ref 按 `mega_refs.path` 过滤。
 
-### `GET /api/v1/tags/{name}` / `DELETE /api/v1/tags/{name}` — get / delete — `implemented`（LB-04）；`?path=` `specified`（FT-06）
+### `GET /api/v1/tags/{name}` / `DELETE /api/v1/tags/{name}` — get / delete — `implemented`（LB-04 / FT-06）
 
-**落地后（FT-06）** 两条路由都带查询键 `path`（**可选**；省略或空 / 空白 = `/`）。查找键是 `(path, name)`，不是全局 `name`。delete 的 trunk 鉴权 path = 该选择器 `path`（不再硬编码 `/`）。create 写入 `mega_tag.path`；list 按 path 过滤注解 tag 与轻量 ref。
+两条路由都带查询键 `path`（**可选**；省略或空 / 空白 = `/`）。查找键是 `(path, name)`，不是全局 `name`。delete 的 trunk 鉴权 path = 该选择器 `path`。create 写入 `mega_tag.path`；list 按 path 过滤注解 tag 与轻量 ref。
 
 - get 成功：**200** + `CommonResult<TagResponse>`；该 path 下 tag 不存在 → **404**。
 - delete 成功：**200** + `CommonResult<DeleteTagResponse>`（`{ deleted_tag, message }`）；该 path 下 tag 不存在 → **404**。
-
-**今日实况（FT-06 前）：** 两者 handler **硬编码** `repo_path = "/"`（`tag_router.rs:276`、`:327`）——这只是 handler 分发用的值：两条路由**没有 path 选择器**，而服务层 `get_tag` / `delete_tag` 丢弃 `repo_path` 后按 tag 名全局查找 `refs/tags/<name>`（`get_ref_by_name`，只按 `ref_name` 过滤，不按 `path`）。因此**任何** path 下同名的 tag 都会被按名找到 / 删除；同名 tag 在不同 path 下也不能并存。list 的 path 过滤只对轻量 tag 生效；注解 tag 从 `mega_tag` 分页、不按 path 过滤。被覆盖的非根 `path_context` 因此可以占用 root 可见的 tag 名——这与 ADR-LB-05 item 5 / 当时的 `DEFER-LB-11` 一致；路径级隔离改由 plan-20260918 ADR-FT-02 承接。
 
 `TagResponse` 字段：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`。七个字段**全部是非 `Option` 的 `String`**（`ceres/model/tag.rs:37-52`），键始终存在；`created_at` 是**字符串**不是数值时间戳；list / get 回传的 lightweight tag `tagger` 与 `message` 为**空串**（`mono_api_service.rs:1755-1756`、`:1803-1804`）；**create 的回应**里 lightweight tag 的 `tagger` 是 `tagger_name` / `tagger_email` 的组合、两者都缺省时为 `unknown`（`:1661-1666`、`:2668`），`message` 为空串。
 
@@ -252,7 +250,7 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 | `POST /create-entry` | `implemented`——今日确实鉴权（`preview_router.rs:114-117` 取 `HeaderMap` 并调 `trunk_write_requester`） |
 | `POST /delete-entry` | `implemented`（LB-02）——`delete_entry`（`preview_router.rs:138`）取 `HeaderMap` 并调 `trunk_write_requester(path = 父目录)`，鉴权先于任何存储访问 |
 | `POST /move-entry` | `implemented`（LB-03）——`move_entry`（`preview_router.rs:166`）对 `from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败即拒绝，先于任何存储访问 |
-| `POST /tags` / `DELETE /tags/{name}` | `implemented`（LB-04）——`create_tag`（`tag_router.rs:162`）以 `path_context.unwrap_or("/")`（`:167`）、`delete_tag`（`:321`）以固定 `/`（`:326`）各调一次 `trunk_write_requester`，先于 `validate_tag_name` 与任何存储访问。FT-06 `specified`：delete 鉴权 path = 查询 `path` |
+| `POST /tags` / `DELETE /tags/{name}` | `implemented`（LB-04 / FT-06）——`create_tag` 以 `path_context.unwrap_or("/")`、`delete_tag` 以选择器 `path`（省略或空 = `/`）各调一次 `trunk_write_requester`，先于任何存储访问 |
 
 > **落地状态（LB-04，安全相关）：** `create_tag`（`tag_router.rs:162`）与 `delete_tag`（`:321`）都接收 `HeaderMap`，并在任何存储访问之前调用 `trunk_write_requester`；这关闭了计划里的 `GAP-LB-04`（裸挂会让 `token` 部署匿名写 `refs/tags`）。Review 形态该函数返回 `Ok(None)`，tag 写沿用 Review 既有面（cedar_guard 只覆盖 `/cl`，不覆盖 `/tags`）——本卡不为 Review 新增 401（IT `tag_review_form_no_trunk_gate`）。
 
@@ -277,15 +275,15 @@ trunk / storage-only 上的 `push_auth` 行为（IT `tag_create_unauth_401` / `t
 
 tag 写的鉴权 path 不是你操作的业务路径：
 
-- **create** 用 `path_context.as_deref().unwrap_or("/")`（`tag_router.rs:167`）；`path_context = "/project"` 之类被 token 覆盖的 path 可过闸，tag 落在该 path 的 `mega_refs` 下（轻量 tag 只在 list 以 `additional` 指定同一 path 时列出，注解 tag 在任何 `additional` 下都列出；`GET` / `DELETE /tags/{name}` 按名找到它，见上）；
-- **delete 今日无 body，授权 path 固定 `/`**（`tag_router.rs:326`；与 `:327` 的 `repo_path = "/"` handler 分发一致）。FT-06 后 delete 带 `?path=`，鉴权 path = 该查询值。
+- **create** 用 `path_context.as_deref().unwrap_or("/")`；`path_context = "/project"` 之类被 token 覆盖的 path 可过闸，tag 落在该 path 的 `mega_refs` / `mega_tag.path` 下；
+- **delete** 用查询 `path`（省略或空 = `/`）。覆盖 `/project` 的 token 可删该 path 的 tag；删 root tag 仍需覆盖 `/`。
 
 因此 `push_tokens.paths = ["/project"]` 这类**不含 `/`** 的 token：
 
-- 对 **每一次** tag delete → **403**；
+- 对省略 `path`（即 `/`）的 tag delete → **403**；对 `?path=/project` → 可过闸；
 - 对**省略**或显式 `path_context = "/"` 的 create → **403**。
 
-因此：**delete**（任何 tag）与 **root / 缺省 `path_context` 的 create** 必须持有能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）；**非根 `path_context` 的 create** 可以改用覆盖该 path 的 token（tag 落在该 path 下，见上）。Libra 的 get/delete 没有 path 选择器（handler 固定以 `/` 分发，服务层按 tag 名全局查找），其 tag 写走缺省 `path_context`，所以 Libra 实际上需要能覆盖 `/` 的 token。
+因此：**省略 `path` 的 delete** 与 **root / 缺省 `path_context` 的 create** 必须持有能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）；**`?path=/project` 的 delete** 与 **非根 `path_context` 的 create** 可用覆盖该 path 的 token。Libra pin 八行仍是 60917（无 path 选择器）直到 FT-08。
 
 > 契约页不写真实凭据；示例一律用 `secret-ok` 一类占位。
 

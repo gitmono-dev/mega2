@@ -13,7 +13,8 @@ use crate::{
         MonoApiServiceState, api_doc::TAG_MANAGE, router::preview_router::trunk_write_requester,
     },
     ceres::model::tag::{
-        CreateTagRequest, DeleteTagResponse, TagListQuery, TagListResponse, TagResponse,
+        CreateTagRequest, DeleteTagResponse, TagListQuery, TagListResponse, TagPathQuery,
+        TagResponse, normalize_tag_selector_path,
     },
     common::errors::{ApiError, map_ceres_error},
     contract::api::common::{CommonResult, Pagination},
@@ -272,6 +273,7 @@ async fn list_tags(
 #[utoipa::path(
     get,
     path = "/tags/{name}",
+    params(TagPathQuery),
     responses(
         (status = 200, body = CommonResult<TagResponse>, content_type = "application/json"),
         (status = 404, body = CommonResult<String>, content_type = "application/json")
@@ -281,8 +283,9 @@ async fn list_tags(
 async fn get_tag(
     State(state): State<MonoApiServiceState>,
     Path(name): Path<String>,
+    Query(query): Query<TagPathQuery>,
 ) -> Result<Json<CommonResult<TagResponse>>, ApiError> {
-    let repo_path = "/".to_string();
+    let repo_path = normalize_tag_selector_path(query.path.as_deref()).to_string();
     let api = state
         .api_handler(std::path::Path::new(&repo_path))
         .await
@@ -314,13 +317,12 @@ async fn get_tag(
 
 /// Delete Tag
 ///
-/// plan-20260917 LB-04 (ADR-LB-05 item 5): delete has no body, so on trunk /
-/// storage-only the authorization path is fixed to `/` — a token whose
-/// `paths` does not cover `/` gets 403 on every tag delete. Checked before
-/// any storage access.
+/// plan-20260918 ADR-FT-03: delete authorization path is the `path` selector
+/// (omit / blank = `/`). Checked before any storage access.
 #[utoipa::path(
     delete,
     path = "/tags/{name}",
+    params(TagPathQuery),
     responses(
         (status = 200, body = CommonResult<DeleteTagResponse>, content_type = "application/json"),
         (status = 404, body = CommonResult<String>, content_type = "application/json")
@@ -331,9 +333,10 @@ async fn delete_tag(
     State(state): State<MonoApiServiceState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<TagPathQuery>,
 ) -> Result<Json<CommonResult<DeleteTagResponse>>, ApiError> {
-    trunk_write_requester(&state, &headers, "/")?;
-    let repo_path = "/".to_string(); // use root for delete operations by default
+    let repo_path = normalize_tag_selector_path(query.path.as_deref()).to_string();
+    trunk_write_requester(&state, &headers, &repo_path)?;
     let api = state
         .api_handler(std::path::Path::new(&repo_path))
         .await
@@ -460,6 +463,7 @@ async fn tag_writes_call_trunk_write_requester() {
         State(state.clone()),
         HeaderMap::new(),
         Path("lb04-v1".to_owned()),
+        Query(TagPathQuery::default()),
     )
     .await
     else {
@@ -483,6 +487,7 @@ async fn tag_writes_call_trunk_write_requester() {
         State(state.clone()),
         headers.clone(),
         Path("lb04-v1".to_owned()),
+        Query(TagPathQuery::default()),
     )
     .await
     else {

@@ -63,6 +63,20 @@ pub struct TagListQuery {
     pub path: String,
 }
 
+/// Optional `path` selector for `GET|DELETE /tags/{name}` (ADR-FT-03).
+/// Omitted or blank is `/`.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams, ToSchema)]
+pub struct TagPathQuery {
+    pub path: Option<String>,
+}
+
+pub fn normalize_tag_selector_path(path: Option<&str>) -> &str {
+    match path.map(str::trim) {
+        None | Some("") => "/",
+        Some(p) => p,
+    }
+}
+
 /// Delete tag response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DeleteTagResponse {

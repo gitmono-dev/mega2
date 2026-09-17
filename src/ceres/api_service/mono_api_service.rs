@@ -1691,9 +1691,10 @@ impl ApiHandler for MonoApiService {
         self.validate_target_commit_mono(target.as_ref()).await?;
 
         let full_ref = format!("refs/tags/{}", name.clone());
+        let path = crate::ceres::model::tag::normalize_tag_selector_path(repo_path.as_deref());
 
-        // Prevent duplicate tag/ref creation
-        match mono_storage.get_tag_by_name(&name).await {
+        // Prevent duplicate tag/ref creation on the same (path, name)
+        match mono_storage.get_tag_by_path_and_name(path, &name).await {
             Ok(Some(_)) => {
                 return Err(GitError::CustomError(format!(
                     "[code:400] Tag '{}' already exists",
@@ -1707,7 +1708,7 @@ impl ApiHandler for MonoApiService {
             }
         }
 
-        if let Ok(Some(_)) = mono_storage.get_ref_by_name(&full_ref).await {
+        if let Ok(Some(_)) = mono_storage.get_ref(path, &full_ref).await {
             return Err(GitError::CustomError(format!(
                 "[code:400] Tag '{}' already exists",
                 name
@@ -1745,14 +1746,17 @@ impl ApiHandler for MonoApiService {
     ) -> Result<(Vec<TagInfo>, u64), GitError> {
         let mono_storage = self.storage.mono_storage();
         // annotated tags from DB (paged)
-        let (annotated_page, annotated_total) =
-            match mono_storage.get_tags_by_page(pagination.clone()).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("DB error while listing tags: {}", e);
-                    return Err(GitError::CustomError("[code:500] DB error".to_string()));
-                }
-            };
+        let repo_path = crate::ceres::model::tag::normalize_tag_selector_path(repo_path.as_deref());
+        let (annotated_page, annotated_total) = match mono_storage
+            .get_tags_by_page(pagination.clone(), repo_path)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("DB error while listing tags: {}", e);
+                return Err(GitError::CustomError("[code:500] DB error".to_string()));
+            }
+        };
 
         let mut result: Vec<TagInfo> = annotated_page
             .into_iter()
@@ -1760,7 +1764,6 @@ impl ApiHandler for MonoApiService {
             .collect();
 
         // lightweight refs from refs table under path
-        let repo_path = repo_path.as_deref().unwrap_or("/");
         let mut lightweight_refs: Vec<TagInfo> = vec![];
         if let Ok(refs) = mono_storage.get_all_refs(repo_path, false).await {
             for r in refs {
@@ -1804,8 +1807,8 @@ impl ApiHandler for MonoApiService {
         name: String,
     ) -> Result<Option<TagInfo>, GitError> {
         let mono_storage = self.storage.mono_storage();
-        // check annotated DB first
-        match mono_storage.get_tag_by_name(&name).await {
+        let path = crate::ceres::model::tag::normalize_tag_selector_path(repo_path.as_deref());
+        match mono_storage.get_tag_by_path_and_name(path, &name).await {
             Ok(Some(tag)) => return Ok(Some(self.tag_model_to_info(tag))),
             Ok(None) => {}
             Err(e) => {
@@ -1813,10 +1816,8 @@ impl ApiHandler for MonoApiService {
                 return Err(GitError::CustomError("[code:500] DB error".to_string()));
             }
         }
-        // check refs for lightweight tag
-        let _repo_path = repo_path.unwrap_or_else(|| "/".to_string());
         let full_ref = format!("refs/tags/{}", name.clone());
-        if let Ok(Some(r)) = mono_storage.get_ref_by_name(&full_ref).await {
+        if let Ok(Some(r)) = mono_storage.get_ref(path, &full_ref).await {
             return Ok(Some(TagInfo {
                 name: name.clone(),
                 tag_id: r.ref_commit_hash.clone(),
@@ -1832,29 +1833,28 @@ impl ApiHandler for MonoApiService {
 
     async fn delete_tag(&self, repo_path: Option<String>, name: String) -> Result<(), GitError> {
         let mono_storage = self.storage.mono_storage();
-        // check annotated in DB first
-        match mono_storage.get_tag_by_name(&name).await {
+        let path = crate::ceres::model::tag::normalize_tag_selector_path(repo_path.as_deref());
+        match mono_storage.get_tag_by_path_and_name(path, &name).await {
             Ok(Some(_tag)) => {
-                // remove ref if exists
                 let full_ref = format!("refs/tags/{}", name.clone());
-                if let Ok(Some(r)) = mono_storage.get_ref_by_name(&full_ref).await {
+                if let Ok(Some(r)) = mono_storage.get_ref(path, &full_ref).await {
                     mono_storage.remove_ref(r).await.map_err(|e| {
                         tracing::error!("Failed to remove ref while deleting annotated tag: {}", e);
                         GitError::CustomError("[code:500] Failed to remove ref".to_string())
                     })?;
                 }
-                mono_storage.delete_tag_by_name(&name).await.map_err(|e| {
-                    tracing::error!("DB delete error when deleting annotated tag: {}", e);
-                    GitError::CustomError("[code:500] DB delete error".to_string())
-                })?;
+                mono_storage
+                    .delete_tag_by_path_and_name(path, &name)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("DB delete error when deleting annotated tag: {}", e);
+                        GitError::CustomError("[code:500] DB delete error".to_string())
+                    })?;
                 Ok(())
             }
             Ok(None) => {
-                // try delete lightweight ref
-                let _repo_path = repo_path.unwrap_or_else(|| "/".to_string());
                 let full_ref = format!("refs/tags/{}", name.clone());
-                // find ref by name and remove
-                if let Ok(Some(r)) = mono_storage.get_ref_by_name(&full_ref).await {
+                if let Ok(Some(r)) = mono_storage.get_ref(path, &full_ref).await {
                     mono_storage.remove_ref(r).await.map_err(|e| {
                         tracing::error!(
                             "Failed to remove ref while deleting lightweight tag: {}",
@@ -2603,18 +2603,19 @@ impl MonoApiService {
             tagger_info.clone(),
             message.clone(),
         )?;
+        let path_str =
+            crate::ceres::model::tag::normalize_tag_selector_path(repo_path.as_deref()).to_string();
         let tag_model = self.build_mega_tag_model(
             tag_id_hex.clone(),
             object_id.clone(),
             name.clone(),
+            path_str.clone(),
             tagger_info.clone(),
             message.clone(),
         );
 
         match mono_storage.insert_tag(tag_model).await {
             Ok(saved_tag) => {
-                // try to write ref; if ref write fails, rollback DB insert
-                let path_str = repo_path.unwrap_or_else(|| "/".to_string());
                 // Resolve tree hash from target commit so ref metadata is complete
                 let tree_hash = self.resolve_tree_hash_for_commit(&object_id).await?;
                 let refs =
@@ -2622,7 +2623,10 @@ impl MonoApiService {
 
                 if let Err(e) = mono_storage.save_refs(refs, None).await {
                     // attempt to remove DB record
-                    if let Err(del_e) = mono_storage.delete_tag_by_name(&name).await {
+                    if let Err(del_e) = mono_storage
+                        .delete_tag_by_path_and_name(&path_str, &name)
+                        .await
+                    {
                         tracing::error!(
                             "Failed to rollback tag DB record after ref write failure: {}",
                             del_e
@@ -2654,7 +2658,8 @@ impl MonoApiService {
     ) -> Result<TagInfo, GitError> {
         let mono_storage = self.storage.mono_storage();
 
-        let path_str = repo_path.unwrap_or_else(|| "/".to_string());
+        let path_str =
+            crate::ceres::model::tag::normalize_tag_selector_path(repo_path.as_deref()).to_string();
         let object_id = target.clone().unwrap_or_default();
         if object_id.is_empty() {
             return Err(GitError::CustomError(
@@ -2677,7 +2682,7 @@ impl MonoApiService {
         })?;
         // Fetch saved ref to use its creation time
         let saved_ref = mono_storage
-            .get_ref_by_name(&full_ref)
+            .get_ref(&path_str, &full_ref)
             .await
             .map_err(|e| GitError::CustomError(e.to_string()))?
             .ok_or_else(|| GitError::CustomError("Ref not found after creation".to_string()))?;
@@ -2776,6 +2781,7 @@ impl MonoApiService {
         tag_id_hex: String,
         object_id: String,
         name: String,
+        path: String,
         tagger_info: String,
         message: Option<String>,
     ) -> mega_tag::Model {
@@ -2785,7 +2791,7 @@ impl MonoApiService {
             object_id,
             object_type: "commit".to_string(),
             tag_name: name,
-            path: "/".to_string(),
+            path,
             tagger: tagger_info,
             message: message.unwrap_or_default(),
             pack_id: String::new(),

@@ -296,6 +296,19 @@ impl MonoStorage {
             .await?)
     }
 
+    /// Non-transaction wrapper of [`Self::get_ref_in_txn`] (same `(path, ref_name)`).
+    pub async fn get_ref(
+        &self,
+        path: &str,
+        ref_name: &str,
+    ) -> Result<Option<mega_refs::Model>, MegaError> {
+        Ok(mega_refs::Entity::find()
+            .filter(mega_refs::Column::Path.eq(path))
+            .filter(mega_refs::Column::RefName.eq(ref_name))
+            .one(self.get_connection())
+            .await?)
+    }
+
     /// Insert a path ref only when no `(path, ref_name)` row exists.
     ///
     /// On a `NOT EXISTS` hit, re-reads and returns the persisted row instead of
@@ -1859,6 +1872,19 @@ impl MonoStorage {
         Ok(res)
     }
 
+    pub async fn get_tag_by_path_and_name(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<mega_tag::Model>, MegaError> {
+        let res = mega_tag::Entity::find()
+            .filter(mega_tag::Column::Path.eq(path))
+            .filter(mega_tag::Column::TagName.eq(name.to_string()))
+            .one(self.get_connection())
+            .await?;
+        Ok(res)
+    }
+
     pub async fn insert_tag(&self, tag: mega_tag::Model) -> Result<mega_tag::Model, MegaError> {
         let am: mega_tag::ActiveModel = tag.clone().into();
         mega_tag::Entity::insert(am)
@@ -1882,12 +1908,27 @@ impl MonoStorage {
         Ok(())
     }
 
-    /// Paginated annotated tags stored in mega_tag table
+    pub async fn delete_tag_by_path_and_name(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Result<(), MegaError> {
+        mega_tag::Entity::delete_many()
+            .filter(mega_tag::Column::Path.eq(path))
+            .filter(mega_tag::Column::TagName.eq(name.to_string()))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    /// Paginated annotated tags stored in mega_tag table, filtered by `path`.
     pub async fn get_tags_by_page(
         &self,
         page: Pagination,
+        path: &str,
     ) -> Result<(Vec<mega_tag::Model>, u64), MegaError> {
         let paginator = mega_tag::Entity::find()
+            .filter(mega_tag::Column::Path.eq(path))
             .order_by_asc(mega_tag::Column::TagName)
             .paginate(self.get_connection(), page.per_page);
         let num_items = paginator.num_items().await?;
