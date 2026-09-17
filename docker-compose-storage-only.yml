@@ -33,7 +33,7 @@
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:18.6-alpine3.24
     shm_size: "256mb"
     environment:
       POSTGRES_USER: mega2
@@ -42,7 +42,8 @@ services:
     ports:
       - "127.0.0.1:25432:5432"
     volumes:
-      - mega2-trunk-pg:/var/lib/postgresql/data
+      # Postgres 18 image: mount the parent dir, not .../data.
+      - mega2-trunk-pg:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
       interval: 2s
@@ -50,7 +51,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    image: redis:8.10.1-alpine3.23
     ports:
       - "127.0.0.1:26379:6379"
     volumes:
@@ -64,7 +65,7 @@ services:
   # Default S3-compatible object store (RustFS). Lab credentials: rustfs /
   # rustfs_secret — matches config/config-storage-only.toml.
   rustfs:
-    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
     environment:
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: 0.0.0.0:9000
@@ -85,21 +86,21 @@ services:
       retries: 30
       start_period: 10s
 
-  # Bucket init via mc. Stays up so `up -d --wait` can wait on it.
+  # Bucket init via RustFS CLI (`rc`). Stays up so `up -d --wait` can wait on it.
   rustfs-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
     depends_on:
       rustfs:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
-      /usr/bin/mc mb --ignore-existing local/mega2 &&
-      /usr/bin/mc anonymous set download local/mega2 &&
+      /usr/bin/rc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/rc mb --ignore-existing local/mega2 &&
+      /usr/bin/rc anonymous set download local/mega2 &&
       exec sleep infinity
       "
     healthcheck:
-      test: ["CMD-SHELL", "/usr/bin/mc ls local/mega2"]
+      test: ["CMD-SHELL", "/usr/bin/rc ls local/mega2"]
       interval: 2s
       timeout: 5s
       retries: 20
@@ -166,7 +167,7 @@ services:
         "2222",
       ]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/openapi.json"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
       interval: 3s
       timeout: 5s
       retries: 40

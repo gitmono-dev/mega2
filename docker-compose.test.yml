@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:18.6-alpine3.24
     shm_size: "1gb"
     # The test suite creates a per-test schema + connection pool and applies
     # the full migration set concurrently; stock max_connections=100 is below
@@ -20,7 +20,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    image: redis:8.10.1-alpine3.23
     ports:
       - "127.0.0.1:16379:6379"
     healthcheck:
@@ -46,7 +46,7 @@ services:
   # S3-compatible object storage for IT smoke (RustFS). Public test credentials
   # are `rustfs` / `rustfs_secret` (see `.env.test.example`).
   rustfs:
-    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
     environment:
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: 0.0.0.0:9000
@@ -66,26 +66,27 @@ services:
       retries: 30
       start_period: 10s
 
-  # Bucket initialization via `mc`. Stays up (sleep infinity) with a healthcheck
-  # so default `up -d --wait` can wait on it — a pure one-shot exit breaks --wait.
-  # Recreate this service (or `down` + `up`) after wiping rustfs if the bucket
-  # disappears; `mb --ignore-existing` is idempotent on fresh starts.
+  # Bucket initialization via RustFS CLI (`rc`). Stays up (sleep infinity) with
+  # a healthcheck so default `up -d --wait` can wait on it — a pure one-shot
+  # exit breaks --wait. Recreate this service (or `down` + `up`) after wiping
+  # rustfs if the bucket disappears; `mb --ignore-existing` is idempotent on
+  # fresh starts. `rc` is the official S3 client; MinIO `mc` is not required.
   rustfs-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
     depends_on:
       rustfs:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
-      /usr/bin/mc mb --ignore-existing local/mega2 &&
-      /usr/bin/mc anonymous set download local/mega2 &&
-      /usr/bin/mc mb --ignore-existing local/monoui &&
-      /usr/bin/mc anonymous set download local/monoui &&
+      /usr/bin/rc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/rc mb --ignore-existing local/mega2 &&
+      /usr/bin/rc anonymous set download local/mega2 &&
+      /usr/bin/rc mb --ignore-existing local/monoui &&
+      /usr/bin/rc anonymous set download local/monoui &&
       exec sleep infinity
       "
     healthcheck:
-      test: ["CMD-SHELL", "/usr/bin/mc ls local/mega2 && /usr/bin/mc ls local/monoui"]
+      test: ["CMD-SHELL", "/usr/bin/rc ls local/mega2 && /usr/bin/rc ls local/monoui"]
       interval: 2s
       timeout: 5s
       retries: 20
@@ -232,7 +233,7 @@ services:
     ports:
       - "127.0.0.1:19180:8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/openapi.json"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
       interval: 3s
       timeout: 5s
       retries: 40
