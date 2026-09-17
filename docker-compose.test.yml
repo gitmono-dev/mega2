@@ -238,6 +238,61 @@ services:
       retries: 40
       start_period: 20s
 
+  # ScorpioFS FUSE workspace daemon linked to the compose-hosted `mega2`
+  # (profile `scorpio`; registered in docs/refactoring/test-infra.md).
+  #
+  # Built from the sibling checkout `../scorpiofs` (same convention as
+  # `../megaui`). It reads trees/blobs from http://mega2:8000 and mounts the
+  # monorepo under /var/lib/scorpiofs/mount *inside its own mount namespace*:
+  # inspect it with `exec -T scorpiofs ls /var/lib/scorpiofs/mount`, not from
+  # the host. FUSE in a container needs the host's /dev/fuse plus CAP_SYS_ADMIN
+  # (and a relaxed AppArmor profile on hosts that enforce one); rootless Docker
+  # cannot run it.
+  #
+  # Lives in its own profile because it depends on `mega2` (profile `app`):
+  #   docker compose -p mega2-it -f docker-compose.test.yml \
+  #     --profile app --profile scorpio up -d --wait
+  #   bash scripts/scorpiofs_smoke.sh        # or: ./scripts/dev-test.sh scorpio-smoke
+  scorpiofs:
+    profiles: ["scorpio"]
+    image: scorpiofs:local
+    pull_policy: never
+    build:
+      context: ../scorpiofs
+    depends_on:
+      mega2:
+        condition: service_healthy
+    environment:
+      # Required by the image entrypoint; point at the linked mega2 service.
+      SCORPIO_BASE_URL: http://mega2:8000
+      SCORPIO_LFS_URL: http://mega2:8000/api/v1/lfs
+      # Any scorpio.toml key can be overridden as SCORPIO_<KEY>; e.g. use
+      # `scorpio=debug` while debugging the mega2 <-> ScorpioFS API contract.
+      SCORPIO_LOG_LEVEL: ${MEGA2_IT_SCORPIO_LOG_LEVEL:-info}
+    devices:
+      - /dev/fuse
+    cap_add:
+      # SYS_ADMIN: mount(2) for FUSE. DAC_READ_SEARCH: open_by_handle_at(2) used by
+      # the passthrough overlay layer; without it ScorpioFS logs an ERROR per mount
+      # and falls back to fd-backed inodes (works, but hides the real code path).
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - scorpiofs-data:/var/lib/scorpiofs
+    ports:
+      # The ScorpioFS HTTP API is unauthenticated: loopback + high port only.
+      - "127.0.0.1:12725:2725"
+    healthcheck:
+      # `serve` mounts the FUSE workspace before binding HTTP, so a healthy
+      # probe also proves the in-container FUSE mount succeeded.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:2725/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
   # One-shot PostgreSQL schema initialization for the website front end
   # (megaui apps/web). Uses the megaui Dockerfile `db-init` target which
   # carries drizzle-kit. Account data lives in an isolated `website` database
@@ -369,6 +424,7 @@ services:
 
 volumes:
   mega2-data:
+  scorpiofs-data:
 
 networks:
   default:

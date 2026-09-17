@@ -71,9 +71,20 @@ mega2_it_up_full() {
   mega2_it_compose --profile git up -d --wait
 }
 
+# ScorpioFS linked to the compose-hosted mega2 (profiles app + scorpio).
+# `scorpiofs:local` is built from the sibling checkout `../scorpiofs` on the
+# first run (or with `--build`); see docs/refactoring/test-infra.md.
+mega2_it_up_scorpio() {
+  local scorpiofs_dir="${MEGA2_IT_ROOT}/../scorpiofs"
+  [[ -f "${scorpiofs_dir}/Dockerfile" ]] \
+    || mega2_it_die "missing sibling checkout ${scorpiofs_dir} (needed to build scorpiofs:local)"
+  mega2_it_info "starting data plane + mega2 + scorpiofs (--profile app --profile scorpio)"
+  mega2_it_compose --profile app --profile scorpio up -d --wait "$@"
+}
+
 mega2_it_down() {
-  mega2_it_info "tearing down ${MEGA2_IT_PROJECT} (profiles git+app+web+smoke, -v)"
-  mega2_it_compose --profile git --profile app --profile web --profile smoke down -v
+  mega2_it_info "tearing down ${MEGA2_IT_PROJECT} (profiles git+app+web+smoke+scorpio, -v)"
+  mega2_it_compose --profile git --profile app --profile web --profile smoke --profile scorpio down -v
 }
 
 mega2_it_health() {

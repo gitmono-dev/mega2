@@ -16,7 +16,9 @@ Usage:
 Stack commands:
   up-data              Start default data plane (postgres/redis/rustfs/rustfs-init/mailpit)
   up-full              Start data plane + git-cli (recommended for cargo test --all)
-  down                 Tear down project (profiles git/app/web, volumes)
+  up-scorpio [args]    Start data plane + mega2 + scorpiofs (--profile app --profile scorpio);
+                       builds scorpiofs:local from ../scorpiofs on first run (pass --build to rebuild)
+  down                 Tear down project (profiles git/app/web/smoke/scorpio, volumes)
   health               Postgres / Redis / Mailpit smoke checks
 
 Test commands:
@@ -25,18 +27,21 @@ Test commands:
   full [cargo-args...]          up-full + source .env.test + cargo test --all  (recommended IT)
   vault [cargo-args...]         Ensure data plane, then integration_vault
   git-cli [cargo-args...]       Ensure full stack, then integration_git_cli
+  scorpio-smoke                 Stack-level ScorpioFS smoke against the linked mega2 (scripts/scorpiofs_smoke.sh)
   gates                         Submit gates: nightly fmt check, clippy -D warnings, full IT tests
 
 Examples:
   ./scripts/dev-test.sh full
   ./scripts/dev-test.sh vault -- --nocapture --test-threads=1
   ./scripts/dev-test.sh unit config::
+  ./scripts/dev-test.sh up-scorpio && ./scripts/dev-test.sh scorpio-smoke
   ./scripts/dev-test.sh down
 
 Environment:
   MEGA2_IT_PROJECT       Compose project name (default: mega2-it)
   MEGA2_IT_GIT_WORKDIR   Shared git-cli host dir (default: /tmp/mega2-git)
   MEGA2_IT_GIT_UID/GID   Container user (default: current id -u/-g)
+  MEGA2_IT_SCORPIO_URL   ScorpioFS HTTP API on the host (default: http://127.0.0.1:12725)
 USAGE
 }
 
@@ -86,6 +91,12 @@ cmd_git_cli() {
   cargo test -p mega2 --test integration_git_cli "$@"
 }
 
+cmd_scorpio_smoke() {
+  mega2_it_require_repo_root
+  mega2_it_info "bash scripts/scorpiofs_smoke.sh"
+  bash "${SCRIPT_DIR}/scorpiofs_smoke.sh"
+}
+
 cmd_gates() {
   mega2_it_require_repo_root
   mega2_it_up_full
@@ -116,6 +127,10 @@ main() {
       mega2_it_require_repo_root
       mega2_it_up_full
       ;;
+    up-scorpio)
+      mega2_it_require_repo_root
+      mega2_it_up_scorpio "$@"
+      ;;
     down)
       mega2_it_require_repo_root
       mega2_it_down
@@ -138,6 +153,9 @@ main() {
       ;;
     git-cli)
       cmd_git_cli "$@"
+      ;;
+    scorpio-smoke)
+      cmd_scorpio_smoke
       ;;
     gates)
       cmd_gates

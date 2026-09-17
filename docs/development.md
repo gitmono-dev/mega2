@@ -20,6 +20,7 @@
 # 栈
 ./scripts/dev-test.sh up-data          # 仅数据面
 ./scripts/dev-test.sh up-full          # 数据面 + git-cli（推荐）
+./scripts/dev-test.sh up-scorpio       # 数据面 + mega2 + scorpiofs（ScorpioFS 联调）
 ./scripts/dev-test.sh health
 ./scripts/dev-test.sh down
 
@@ -29,6 +30,7 @@
 ./scripts/dev-test.sh full             # 完整 IT（推荐路径）
 ./scripts/dev-test.sh vault            # integration_vault
 ./scripts/dev-test.sh git-cli          # integration_git_cli
+./scripts/dev-test.sh scorpio-smoke    # ScorpioFS 栈级 smoke（需先 up-scorpio）
 ./scripts/dev-test.sh gates            # fmt + clippy + full IT
 ```
 
@@ -126,7 +128,7 @@ cargo test --all
 ./scripts/dev-test.sh down
 # 等价：
 # docker compose -p mega2-it -f docker-compose.test.yml \
-#   --profile git --profile app --profile web down -v
+#   --profile git --profile app --profile web --profile smoke --profile scorpio down -v
 ```
 
 ## Compose profiles
@@ -137,6 +139,7 @@ cargo test --all
 | （默认，可选消费） | `mailpit` | website 认证/产品邮件捕获；不是 mega2 测试门 |
 | `git` | `git-cli`（bridge + `host.docker.internal`） | 跑 `integration_git_cli` / `cargo test --all` 全量门 |
 | `app` | 常驻 `mega2` → `127.0.0.1:19180` | 栈级 HTTP smoke / 联调；**不是**隔离黑盒 |
+| `scorpio` | `scorpiofs` → `127.0.0.1:12725`（FUSE 守护进程，`depends_on: mega2`） | ScorpioFS ↔ mega2 栈级联调；须与 `--profile app` 同启，见下文「ScorpioFS 联调」 |
 
 栈级 HTTP 探针示例（需先 build 镜像，见 `test-infra.md`）：
 
@@ -147,6 +150,51 @@ curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 # 可选：export MEGA2_IT_HTTP_URL=http://127.0.0.1:19180
 # cargo test -p mega2 --test integration_vault integration_compose_mega2_http_smoke
 ```
+
+## ScorpioFS 联调
+
+[ScorpioFS](https://github.com/gitmono-dev/scorpiofs) 是把 monorepo 路径挂载成本地文件系统的
+FUSE 守护进程，只读路径走 mega2 的 `/api/v1/tree*`、`/api/v1/file/tree`、
+`/api/v1/file/blob/{oid}`。`docker-compose.test.yml` 以 profile `scorpio` 提供常驻
+`scorpiofs` 服务（登记条目见 [`refactoring/test-infra.md`](./refactoring/test-infra.md)），
+**从 sibling checkout `../scorpiofs` 构建** `scorpiofs:local`，并 `depends_on` 常驻
+`mega2`（profile `app`），因此两个 profile 必须同启。
+
+前置：`../scorpiofs` 已 checkout；宿主是 rootful Docker 且有 `/dev/fuse`
+（容器需要 `--device /dev/fuse` + `CAP_SYS_ADMIN`，另加 `CAP_DAC_READ_SEARCH` 让
+passthrough 层的 `open_by_handle_at` 走真实路径而不是回退；rootless Docker 不支持）。
+
+```bash
+./scripts/dev-test.sh up-scorpio          # 首次会构建 scorpiofs:local（数分钟）
+./scripts/dev-test.sh up-scorpio --build  # ../scorpiofs 改动后强制重建
+./scripts/dev-test.sh scorpio-smoke       # 栈级 smoke，见下
+./scripts/dev-test.sh down                # 连同 scorpio profile 一起 down -v
+```
+
+等价手贴：
+
+```bash
+docker compose -p mega2-it -f docker-compose.test.yml \
+  --profile app --profile scorpio up -d --wait
+bash scripts/scorpiofs_smoke.sh
+```
+
+`scripts/scorpiofs_smoke.sh` 用宿主 `curl`（`127.0.0.1:12725`）加
+`docker compose … exec -T scorpiofs` 覆盖：`GET /health`；dicfuse 只读根列出初始化树
+（`project`、`third-party`）且 `project/.gitkeep` 为占位内容；旧版
+`POST /api/fs/mount` → `GET /api/fs/mpoint` → `POST /api/fs/unmount`；Antares
+`POST /antares/mounts` → `/ready` → 列目录 → `DELETE`。服务未启动时输出 `SKIP`
+（设 `SCORPIOFS_IT=1` 改为失败），单跑一例用 `MEGA2_SMOKE_CASE=<name>`。
+
+联调要点：
+
+- FUSE 挂载只存在于 `scorpiofs` 容器的 mount namespace，宿主上看不到；观察一律
+  `docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio exec -T scorpiofs ls -la /var/lib/scorpiofs/mount`。
+- 排查 API 契约时把日志调到 debug：`MEGA2_IT_SCORPIO_LOG_LEVEL=scorpio=debug ./scripts/dev-test.sh up-scorpio`，
+  再 `docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio logs -f scorpiofs`。
+- ScorpioFS HTTP API 无认证，端口只绑 `127.0.0.1`；不要改成 `0.0.0.0`。
+- Antares CL 层（`/api/v1/cl/{link}/files-list`）只有 review policy 提供；IT 栈 `mega2`
+  默认即 review，trunk 栈（`mega2-compose.yml` / `docker-compose-storage-only.yml`）不含。
 
 ## 聚焦命令
 
@@ -180,6 +228,7 @@ curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 | rustfs S3 API | `127.0.0.1:19000` → 9000 | `MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL` |
 | rustfs console | `127.0.0.1:19001` → 9001 | 人工查看 |
 | mega2（`app`） | `127.0.0.1:19180` → 8000 | `MEGA2_IT_HTTP_URL` |
+| scorpiofs（`scorpio`） | `127.0.0.1:12725` → 2725 | `MEGA2_IT_SCORPIO_URL`（ScorpioFS HTTP API，无认证） |
 | git-cli | 无端口映射 | bridge 网络经 `host.docker.internal` 访问宿主高位端口 |
 
 网络名固定为 `mega2-test-network`：带 `-p mega2-it` 与不带 `-p` 的两套栈会争用，启新栈前先 `down -v` 旧栈。
@@ -205,6 +254,8 @@ curl -sf http://127.0.0.1:19180/api/openapi.json >/dev/null
 | `MEGA2_IT_GIT_WORKDIR` | git-cli 共享宿主根（默认 `/tmp/mega2-git`）；变更后须 `--force-recreate git-cli` |
 | `MEGA2_IT_GIT_UID` / `GID` | 容器内用户；本地 `id -u` ≠ 1000 时必设（脚本默认导出当前用户） |
 | `MEGA2_IT_HTTP_URL` | 指向 compose `app` 常驻服务 |
+| `MEGA2_IT_SCORPIO_URL` | 指向 compose `scorpio` 常驻 ScorpioFS API（默认 `http://127.0.0.1:12725`，供 `scorpiofs_smoke.sh`） |
+| `MEGA2_IT_SCORPIO_LOG_LEVEL` | `scorpiofs` 容器的 `SCORPIO_LOG_LEVEL`（默认 `info`；联调可设 `scorpio=debug`） |
 | `MEGA2_IT_ALLOW_HOST_GIT=1` | **仅**本地实验用宿主机 git；**不是**验收路径 |
 | `MEGA2_IT_SKIP_GIT_CLI=1` | 显式跳过 git-cli 用例（非默认门禁） |
 | `MEGA2_IT_PROJECT` | Compose 项目名（默认 `mega2-it`；脚本可覆盖） |
