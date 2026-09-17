@@ -467,7 +467,12 @@ async fn save_edit(
     Ok(Json(CommonResult::success(Some(res))))
 }
 
-fn trunk_write_requester(
+/// Trunk / storage-only product-write gate shared by the directory-change
+/// handlers and (plan-20260917 LB-04) the tag writes in `tag_router`: on
+/// `push_policy=trunk` it authorizes through `git.push_auth` and returns the
+/// requester name; on Review it returns `None` and the caller keeps its
+/// existing CL / session behaviour.
+pub(crate) fn trunk_write_requester(
     state: &MonoApiServiceState,
     headers: &HeaderMap,
     path: &str,

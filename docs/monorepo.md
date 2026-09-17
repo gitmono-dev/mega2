@@ -49,9 +49,11 @@
 | 操作 | HTTP（OpenAPI 登记） |
 |---|---|
 | 创建 | `POST` … `/tags` |
-| 列表 | `GET` … `/tags/list` |
+| 列表 | `POST` … `/tags/list`（body `PageParams<String>`：`pagination` 与 `additional` 两键均必填；列 root 送 `additional: "/"`） |
 | 查询 | `GET` … `/tags/{name}` |
 | 删除 | `DELETE` … `/tags/{name}` |
+
+plan-20260917 LB-04 起，这四条路由同时挂在 Review 与 storage-only / trunk（`storage_only_routers_with` merge `tag_router::routers()`）；trunk 形态下 create / delete 经 `git.push_auth` 鉴权（delete 的鉴权 path 固定 `/`），list / get 不要求 Authorization。wire 细节以 [`refactoring/directory-entry-api.md`](refactoring/directory-entry-api.md) 的「标签」与「鉴权」节为准。
 
 协议层：Monorepo receive-pack 对 `RefTypeEnum::Tag` **拒绝**更新（返回可诊断错误），不得静默写入 `refs/tags/*`。
 

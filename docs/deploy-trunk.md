@@ -21,7 +21,7 @@ CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20
 
 `[monorepo].object_format`：`sha1` 为标准 Git；`sha256` 与 `blake3` 是 **git-internal / Libra extension**，不宣称与标准 Git 客户端互通（[`refactoring/protocol.md`](./refactoring/protocol.md)，[`plan/plan-20260907.md`](./plan/plan-20260907.md)）。Git Object Format 与 LFS Digest 独立：`Git=blake3/LFS=sha256` 与 `Git=sha256/LFS=blake3` 可表达；LFS BLAKE3 业务面属于 `DEFER-B3-LFS-01`。
 
-产品 **API 写**（`POST /api/v1/create-entry`、`POST /api/v1/delete-entry`、`POST /api/v1/move-entry`、`POST /api/v1/edit/save`）在 trunk 下经 **`git.push_auth`** 鉴权后，将对象写入存储并用 **MonoWriteQueue** 前进 path tip（与 `git push` 同 tip 权威；见 [`plan-20260904.md`](./plan/plan-20260904.md)）。成功响应的 `cl_link` 为 `null`，不创建 `mega_cl` / `refs/cl/*`。写后同栈 `git clone` / `git pull` 可读到新内容。集成黑盒见 [`refactoring/integration.md`](./refactoring/integration.md) 的 `integration_api_write_trunk`。
+产品 **API 写**（`POST /api/v1/create-entry`、`POST /api/v1/delete-entry`、`POST /api/v1/move-entry`、`POST /api/v1/edit/save`）在 trunk 下经 **`git.push_auth`** 鉴权后，将对象写入存储并用 **MonoWriteQueue** 前进 path tip（与 `git push` 同 tip 权威；见 [`plan-20260904.md`](./plan/plan-20260904.md)）。成功响应的 `cl_link` 为 `null`，不创建 `mega_cl` / `refs/cl/*`。写后同栈 `git clone` / `git pull` 可读到新内容。集成黑盒见 [`refactoring/integration.md`](./refactoring/integration.md) 的 `integration_api_write_trunk`。monorepo **tag 写**（`POST /api/v1/tags`、`DELETE /api/v1/tags/{name}`；plan-20260917 LB-04 起挂在 storage-only）同样经 `git.push_auth` 鉴权——create 以 `path_context`（缺省 `/`）、delete 固定以 `/` 为鉴权 path：delete 与 root / 缺省 `path_context` 的 create 需要能覆盖 `/` 的 token（`paths` 省略/空 = whole repo），非根 `path_context` 的 create 可用覆盖该 path 的 token——但只写 tag 元数据（`refs/tags/*`；注解 tag 另写 `mega_tag` 行），不经 MonoWriteQueue、不前进 path tip；`POST /api/v1/tags/list` 与 `GET /api/v1/tags/{name}` 不要求 Authorization。
 
 启动期 fail-closed（`Config::validate` / `AppContext::new`）：
 
@@ -33,7 +33,7 @@ CL merge 只经 MonoWriteQueue；`[monorepo]` 无 `merge_writer` 键（[`plan-20
 6. storage-only（显式 `push_auth`）⇒ 必须 `git.ssh_receive_pack = false`（省略 ≠ 关闭）。
 7. 形态切换后执行索引水位重置（第 5 节）。
 
-HTTP 表面：只读 preview + **产品写**（`create-entry` / `delete-entry` / `move-entry` / `edit/save`；目录变更契约见 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)）+ Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）；**不**注册 CL / issue / reviewer / OAuth user 路由；OpenAPI（`/api/openapi.json`）列出 LFS 与上述写路径，CL/issue 为空。只读 blob/tree/blame 保留。
+HTTP 表面：只读 preview + **产品写**（`create-entry` / `delete-entry` / `move-entry` / `edit/save`；目录变更契约见 [`refactoring/directory-entry-api.md`](./refactoring/directory-entry-api.md)）+ **monorepo tags**（`POST /tags`、`POST /tags/list`、`GET` / `DELETE /tags/{name}`；LB-04）+ Git smart HTTP + **LFS**（`/info/lfs`、`/api/v1/lfs`）；**不**注册 CL / issue / reviewer / OAuth user 路由；OpenAPI（`/api/openapi.json`）列出 LFS 与上述写路径，CL/issue 为空。只读 blob/tree/blame 保留。
 
 ## 2. 安全边界（无评审授权 ≠ 无访问控制）
 

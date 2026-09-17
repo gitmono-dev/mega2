@@ -4,11 +4,14 @@ use anyhow::anyhow;
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
-    api::{MonoApiServiceState, api_doc::TAG_MANAGE},
+    api::{
+        MonoApiServiceState, api_doc::TAG_MANAGE, router::preview_router::trunk_write_requester,
+    },
     ceres::model::tag::{CreateTagRequest, DeleteTagResponse, TagListResponse, TagResponse},
     common::errors::{ApiError, map_ceres_error},
     contract::api::common::{CommonResult, PageParams},
@@ -138,6 +141,12 @@ fn validate_tag_name(name: &str) -> Result<(), ApiError> {
 }
 
 /// Create Tag
+///
+/// plan-20260917 LB-04 (ADR-LB-05 item 5): on trunk / storage-only the write
+/// is gated by `git.push_auth` through [`trunk_write_requester`], with
+/// `path_context` (default `/`) as the authorization path, before the name is
+/// validated or storage is touched. The handler answers **200** (the utoipa
+/// annotation used to claim 201).
 #[utoipa::path(
     post,
     path = "/tags",
@@ -146,14 +155,16 @@ fn validate_tag_name(name: &str) -> Result<(), ApiError> {
         content_type = "application/json"
     ),
     responses(
-        (status = 201, body = CommonResult<TagResponse>, content_type = "application/json")
+        (status = 200, body = CommonResult<TagResponse>, content_type = "application/json")
     ),
     tag = TAG_MANAGE
 )]
 async fn create_tag(
     State(state): State<MonoApiServiceState>,
+    headers: HeaderMap,
     Json(req): Json<CreateTagRequest>,
 ) -> Result<Json<CommonResult<TagResponse>>, ApiError> {
+    trunk_write_requester(&state, &headers, req.path_context.as_deref().unwrap_or("/"))?;
     // We ignore query path_context for tag creation; use request target commit directly.
     validate_tag_name(&req.name)?;
     // Resolve target commit: if caller provided a target, use it; otherwise resolve using optional path_context.
@@ -293,6 +304,11 @@ async fn get_tag(
 }
 
 /// Delete Tag
+///
+/// plan-20260917 LB-04 (ADR-LB-05 item 5): delete has no body, so on trunk /
+/// storage-only the authorization path is fixed to `/` — a token whose
+/// `paths` does not cover `/` gets 403 on every tag delete. Checked before
+/// any storage access.
 #[utoipa::path(
     delete,
     path = "/tags/{name}",
@@ -304,8 +320,10 @@ async fn get_tag(
 )]
 async fn delete_tag(
     State(state): State<MonoApiServiceState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<CommonResult<DeleteTagResponse>>, ApiError> {
+    trunk_write_requester(&state, &headers, "/")?;
     let repo_path = "/".to_string(); // use root for delete operations by default
     let api = state
         .api_handler(std::path::Path::new(&repo_path))
@@ -320,4 +338,164 @@ async fn delete_tag(
         message: format!("Tag '{}' successfully deleted", name),
     };
     Ok(Json(CommonResult::success(Some(response))))
+}
+
+#[cfg(test)]
+fn openapi_of(router: OpenApiRouter<MonoApiServiceState>) -> utoipa::openapi::OpenApi {
+    router.split_for_parts().1
+}
+
+/// LB-04 AC-1/AC-2: the four tag routes are mounted on the storage-only /
+/// trunk surface (Review already had them).
+#[cfg(test)]
+#[test]
+fn tag_routes_registered_on_storage_only_routers() {
+    let api = openapi_of(crate::api::api_router::storage_only_routers_with(false));
+    let paths: Vec<String> = api.paths.paths.keys().cloned().collect();
+    for needle in ["/tags", "/tags/list", "/tags/{name}"] {
+        assert!(
+            paths.iter().any(|p| p.ends_with(needle)),
+            "{needle} missing from storage-only routers: {paths:?}"
+        );
+    }
+    let item = api.paths.paths.get("/tags/{name}").expect("/tags/{name}");
+    assert!(
+        item.get.is_some() && item.delete.is_some(),
+        "get + delete on /tags/{{name}}"
+    );
+    assert!(
+        api.paths
+            .paths
+            .get("/tags/list")
+            .and_then(|i| i.post.as_ref())
+            .is_some(),
+        "list stays POST"
+    );
+}
+
+/// LB-04 AC-6: the create-tag OpenAPI response is the handler's real status,
+/// 200 — the former 201 annotation must not survive alongside it.
+#[cfg(test)]
+#[test]
+fn tag_create_openapi_status_is_200() {
+    let api = openapi_of(routers());
+    let post = api
+        .paths
+        .paths
+        .get("/tags")
+        .and_then(|item| item.post.as_ref())
+        .expect("POST /tags");
+    let codes: Vec<&String> = post.responses.responses.keys().collect();
+    assert!(codes.iter().any(|c| c.as_str() == "200"), "{codes:?}");
+    assert!(codes.iter().all(|c| c.as_str() != "201"), "{codes:?}");
+}
+
+/// LB-04 AC-3: both tag writes authorize through `trunk_write_requester`
+/// before any storage access — a missing credential is 401; a token scoped
+/// to `/project` is 403 for delete (authorization path `/`) and for a create
+/// whose `path_context` is omitted or `/`, while `path_context = "/project"`
+/// passes the gate.
+#[cfg(test)]
+#[tokio::test]
+async fn tag_writes_call_trunk_write_requester() {
+    use std::sync::Arc;
+
+    use axum::{
+        http::{HeaderValue, StatusCode, header::AUTHORIZATION},
+        response::IntoResponse,
+    };
+
+    use crate::{
+        api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+        ceres::api_service::cache::GitObjectCache,
+        config::{PushAuth, PushPolicy, PushTokenConfig},
+        contract::policy::entitystore::SharedEntityStore,
+    };
+
+    fn body(path_context: Option<&str>) -> Json<CreateTagRequest> {
+        Json(CreateTagRequest {
+            name: "lb04-v1".to_owned(),
+            target: None,
+            path_context: path_context.map(str::to_owned),
+            tagger_name: None,
+            tagger_email: None,
+            message: None,
+        })
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+    config.monorepo.push_policy = PushPolicy::Trunk;
+    config.git.push_auth = Some(PushAuth::Token);
+    config.git.push_tokens = vec![PushTokenConfig {
+        name: "lb04-ci".to_owned(),
+        token: "secret-ok".to_owned(),
+        paths: Some(vec!["/project".to_owned()]),
+    }];
+    let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+    let state = MonoApiServiceState {
+        session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+        git_object_cache: Arc::new(GitObjectCache {
+            connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                ::redis::aio::ConnectionManagerConfig::new(),
+            )
+            .expect("lazy connection manager"),
+            prefix: "lb04-test".to_string(),
+        }),
+        listen_addr: "http://127.0.0.1:0".to_string(),
+        entity_store: Arc::new(SharedEntityStore::new()),
+        storage,
+    };
+
+    let Err(err) = create_tag(State(state.clone()), HeaderMap::new(), body(None)).await else {
+        panic!("create without credential must be rejected");
+    };
+    assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+    let Err(err) = delete_tag(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("lb04-v1".to_owned()),
+    )
+    .await
+    else {
+        panic!("delete without credential must be rejected");
+    };
+    assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret-ok"));
+    for path_context in [None, Some("/")] {
+        let Err(err) = create_tag(State(state.clone()), headers.clone(), body(path_context)).await
+        else {
+            panic!(
+                "create with a /project-scoped token and path_context {path_context:?} must be 403"
+            );
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path_context:?}");
+    }
+    let Err(err) = delete_tag(
+        State(state.clone()),
+        headers.clone(),
+        Path("lb04-v1".to_owned()),
+    )
+    .await
+    else {
+        panic!("delete with a /project-scoped token must be 403");
+    };
+    assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+
+    // `path_context = "/project"` is covered: the gate passes and the handler
+    // proceeds to storage (no `/project` tip in this bare store, hence not 401/403).
+    match create_tag(State(state), headers, body(Some("/project"))).await {
+        Ok(_) => {}
+        Err(err) => {
+            let status = err.into_response().status();
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "covered path_context must pass the auth gate, got {status}"
+            );
+        }
+    }
 }

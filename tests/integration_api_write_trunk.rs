@@ -6,8 +6,9 @@
 //! - token edit/save advances tip again
 //!
 //! plan-20260917 LB-02 adds one `delete_entry_*` case per acceptance gate
-//! (`EX-LB-01`) and LB-03 one `move_entry_*` case per gate (`EX-LB-02`),
-//! each booting its own service.
+//! (`EX-LB-01`), LB-03 one `move_entry_*` case per gate (`EX-LB-02`) and
+//! LB-04 the `tag_*` cases for the storage-only tag routes, each booting its
+//! own service.
 
 mod common;
 #[allow(dead_code)]
@@ -571,6 +572,22 @@ fn path_tip(db_url: &str, path: &str) -> String {
     })
 }
 
+/// Whether `refs/tags/<name>` exists in `mega_refs` (any path).
+fn tag_ref_exists(db_url: &str, name: &str) -> bool {
+    with_runtime(async {
+        let db = Database::connect(db_url)
+            .await
+            .unwrap_or_else(|err| panic!("connect for tag ref: {err}"));
+        db.query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT 1 AS one FROM mega_refs WHERE ref_name = 'refs/tags/{name}' LIMIT 1"),
+        ))
+        .await
+        .expect("query tag ref")
+        .is_some()
+    })
+}
+
 fn count_cl_artifacts(db_url: &str) -> (i64, i64) {
     with_runtime(async {
         let db = Database::connect(db_url)
@@ -742,6 +759,38 @@ impl EntryCase {
         let text = response.text().expect("response body");
         let json = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
         (status, json)
+    }
+
+    fn exchange(
+        &self,
+        mut request: reqwest::blocking::RequestBuilder,
+        auth: Option<&str>,
+        what: &str,
+    ) -> (u16, Value) {
+        if let Some(auth) = auth {
+            request = request.header("Authorization", auth);
+        }
+        let response = request.send().unwrap_or_else(|err| panic!("{what}: {err}"));
+        let status = response.status().as_u16();
+        let text = response.text().expect("response body");
+        let json = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+        (status, json)
+    }
+
+    fn get(&self, route: &str, auth: Option<&str>) -> (u16, Value) {
+        self.exchange(
+            self.client.get(format!("{}/{route}", self.api)),
+            auth,
+            &format!("GET {route}"),
+        )
+    }
+
+    fn delete(&self, route: &str, auth: Option<&str>) -> (u16, Value) {
+        self.exchange(
+            self.client.delete(format!("{}/{route}", self.api)),
+            auth,
+            &format!("DELETE {route}"),
+        )
     }
 
     /// create-entry under `/project` (directory or file) as `LB02_AUTHOR`.
@@ -950,6 +999,17 @@ fn delete_entry_unauth_401() {
         openapi.contains("delete-entry"),
         "runtime OpenAPI must list delete-entry"
     );
+    assert!(
+        openapi.contains("move-entry"),
+        "runtime OpenAPI must list move-entry (LB-03)"
+    );
+    let doc: Value = serde_json::from_str(&openapi).expect("openapi json");
+    for needle in ["/api/v1/tags", "/api/v1/tags/list", "/api/v1/tags/{name}"] {
+        assert!(
+            doc["paths"].get(needle).is_some(),
+            "runtime OpenAPI must list {needle} (LB-04)"
+        );
+    }
     assert!(
         !openapi.contains(PUSH_TOKEN),
         "runtime OpenAPI must not contain the token"
@@ -1743,5 +1803,303 @@ fn move_entry_auth_none_ok() {
     let names = case.tree_names("/project");
     assert!(names.iter().any(|n| n == "lb03-none2"), "{names:?}");
     assert!(names.iter().all(|n| n != "lb03-none"), "{names:?}");
+    case.finish();
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260917 LB-04: storage-only tag routes + trunk write gate.
+// ---------------------------------------------------------------------------
+
+fn tag_body(name: &str, path_context: Option<&str>, message: Option<&str>) -> Value {
+    let mut body = serde_json::json!({ "name": name });
+    if let Some(path_context) = path_context {
+        body["path_context"] = Value::String(path_context.to_string());
+    }
+    if let Some(message) = message {
+        body["message"] = Value::String(message.to_string());
+        body["tagger_name"] = Value::String("lb04".to_string());
+        body["tagger_email"] = Value::String("lb04@example.com".to_string());
+    }
+    body
+}
+
+fn list_body(additional: &str) -> Value {
+    serde_json::json!({ "pagination": { "page": 1, "per_page": 20 }, "additional": additional })
+}
+
+/// `POST /tags/list` without Authorization; returns the page's tag names.
+fn list_tag_names(case: &EntryCase, additional: &str) -> Vec<String> {
+    let (status, json) = case.post("tags/list", None, list_body(additional));
+    assert_eq!(status, 200, "tags/list ({additional}) must 200: {json}");
+    assert!(json["data"]["total"].is_u64(), "{json}");
+    json["data"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("items array: {json}"))
+        .iter()
+        .map(|t| t["name"].as_str().expect("tag name").to_string())
+        .collect()
+}
+
+/// LB-04 AC-1/2/3: storage-only mounts the tag routes; a create without a
+/// credential is 401 before anything is written; the runtime OpenAPI lists
+/// the three tag paths with create = 200 (not 201) and still omits
+/// `/cl`, `/auth`, `/user`.
+#[test]
+fn tag_create_unauth_401() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = case.post("tags", None, tag_body("lb04-unauth", None, None));
+    assert_eq!(
+        status, 401,
+        "create-tag without credential must 401: {json}"
+    );
+    assert!(
+        !json.to_string().contains(PUSH_TOKEN),
+        "error body must not echo the token: {json}"
+    );
+    assert!(!tag_ref_exists(case.db_url(), "lb04-unauth"));
+    let (status, doc) = case.exchange(
+        case.client
+            .get(format!("http://127.0.0.1:{}/api/openapi.json", case.port)),
+        None,
+        "GET /api/openapi.json",
+    );
+    assert_eq!(status, 200, "GET /api/openapi.json");
+    for needle in ["/api/v1/tags", "/api/v1/tags/list", "/api/v1/tags/{name}"] {
+        assert!(
+            doc["paths"].get(needle).is_some(),
+            "runtime OpenAPI must list {needle}"
+        );
+    }
+    let codes: Vec<String> = doc["paths"]["/api/v1/tags"]["post"]["responses"]
+        .as_object()
+        .expect("create-tag responses")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(codes.iter().any(|c| c == "200"), "{codes:?}");
+    assert!(codes.iter().all(|c| c != "201"), "{codes:?}");
+    assert!(doc["paths"]["/api/v1/tags/list"]["post"].is_object());
+    assert!(doc["paths"]["/api/v1/tags/{name}"]["get"].is_object());
+    assert!(doc["paths"]["/api/v1/tags/{name}"]["delete"].is_object());
+    let paths: Vec<&String> = doc["paths"].as_object().expect("paths").keys().collect();
+    for forbidden in ["/cl", "/auth", "/user"] {
+        assert!(
+            paths.iter().all(|p| !p.contains(forbidden)),
+            "storage-only OpenAPI must omit {forbidden}: {paths:?}"
+        );
+    }
+    assert!(!doc.to_string().contains(PUSH_TOKEN));
+    case.finish();
+}
+
+/// LB-04 AC-3: a token scoped to `/project` is 403 for a create whose
+/// `path_context` is omitted or `/` and for every delete (authorization
+/// path `/`), while `path_context = "/project"` is authorized and lands the
+/// tag under `/project`.
+#[test]
+fn tag_write_path_scoped_token_403() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    for path_context in [None, Some("/")] {
+        let (status, json) = case.post(
+            "tags",
+            Some(&EntryCase::bearer()),
+            tag_body("lb04-scoped", path_context, None),
+        );
+        assert_eq!(
+            status, 403,
+            "create with a /project-scoped token and path_context {path_context:?} must 403: {json}"
+        );
+        assert!(!json.to_string().contains(PUSH_TOKEN), "{json}");
+    }
+    assert!(!tag_ref_exists(case.db_url(), "lb04-scoped"));
+    // delete is 403 before any existence check (not 404).
+    let (status, json) = case.delete("tags/lb04-scoped", Some(&EntryCase::bearer()));
+    assert_eq!(
+        status, 403,
+        "delete with a /project-scoped token must 403: {json}"
+    );
+    let (status, json) = case.post(
+        "tags",
+        Some(&EntryCase::bearer()),
+        tag_body("lb04-covered", Some("/project"), None),
+    );
+    assert_eq!(
+        status, 200,
+        "covered path_context must be authorized: {json}"
+    );
+    assert_eq!(json["data"]["name"], Value::String("lb04-covered".into()));
+    assert!(tag_ref_exists(case.db_url(), "lb04-covered"));
+    let names = list_tag_names(&case, "/project");
+    assert!(names.iter().any(|n| n == "lb04-covered"), "{names:?}");
+    case.finish();
+}
+
+/// LB-04 AC-5/6/7: with a whole-repo token the root tag lifecycle works —
+/// lightweight and annotated create (200, seven string fields), anonymous get
+/// and POST list, duplicate 400, invalid name 400, delete 200 then 404, and
+/// no CL artifacts.
+#[test]
+fn tag_root_token_lifecycle() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let bearer = EntryCase::bearer();
+    let (status, json) = case.post("tags", Some(&bearer), tag_body("bad name", None, None));
+    assert_eq!(status, 400, "invalid tag name must 400: {json}");
+
+    let (status, json) = case.post("tags", Some(&bearer), tag_body("lb04-light", None, None));
+    assert_eq!(status, 200, "lightweight create must 200: {json}");
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    let data = &json["data"];
+    for key in [
+        "name",
+        "tag_id",
+        "object_id",
+        "object_type",
+        "tagger",
+        "message",
+        "created_at",
+    ] {
+        assert!(data[key].is_string(), "{key} must be a string: {json}");
+    }
+    assert_eq!(data["name"], Value::String("lb04-light".into()));
+    assert_eq!(data["object_type"], Value::String("commit".into()));
+    assert_eq!(data["message"], Value::String(String::new()));
+    let object_id = data["object_id"].as_str().expect("object_id").to_string();
+    assert!(tag_ref_exists(case.db_url(), "lb04-light"));
+
+    let (status, json) = case.get("tags/lb04-light", None);
+    assert_eq!(status, 200, "anonymous get must 200: {json}");
+    assert_eq!(json["data"]["object_id"], Value::String(object_id.clone()));
+    let names = list_tag_names(&case, "/");
+    assert!(names.iter().any(|n| n == "lb04-light"), "{names:?}");
+
+    let (status, json) = case.post("tags", Some(&bearer), tag_body("lb04-light", None, None));
+    assert_eq!(status, 400, "duplicate tag must 400: {json}");
+    assert!(err_message(&json).contains("already exists"), "{json}");
+    assert!(!err_message(&json).contains("[code:"), "{json}");
+    assert!(!json.to_string().contains(PUSH_TOKEN), "{json}");
+
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("lb04-anno", None, Some("annotated by LB-04")),
+    );
+    assert_eq!(status, 200, "annotated create must 200: {json}");
+    assert_eq!(
+        json["data"]["message"],
+        Value::String("annotated by LB-04".into()),
+        "{json}"
+    );
+    assert!(
+        json["data"]["tagger"]
+            .as_str()
+            .expect("tagger")
+            .contains("lb04"),
+        "{json}"
+    );
+    assert!(tag_ref_exists(case.db_url(), "lb04-anno"));
+    let (status, json) = case.get("tags/lb04-anno", None);
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(
+        json["data"]["message"],
+        Value::String("annotated by LB-04".into())
+    );
+
+    let (status, json) = case.delete("tags/lb04-light", Some(&bearer));
+    assert_eq!(status, 200, "delete must 200: {json}");
+    assert_eq!(
+        json["data"]["deleted_tag"],
+        Value::String("lb04-light".into()),
+        "{json}"
+    );
+    assert!(json["data"]["message"].is_string(), "{json}");
+    assert!(!tag_ref_exists(case.db_url(), "lb04-light"));
+    let (status, json) = case.get("tags/lb04-light", None);
+    assert_eq!(status, 404, "deleted tag must 404 on get: {json}");
+    let names = list_tag_names(&case, "/");
+    assert!(names.iter().all(|n| n != "lb04-light"), "{names:?}");
+    let (status, json) = case.delete("tags/lb04-light", Some(&bearer));
+    assert_eq!(status, 404, "deleting a missing tag must 404: {json}");
+
+    let (status, json) = case.delete("tags/lb04-anno", Some(&bearer));
+    assert_eq!(status, 200, "annotated delete must 200: {json}");
+    assert!(!tag_ref_exists(case.db_url(), "lb04-anno"));
+    let (status, _) = case.get("tags/lb04-anno", None);
+    assert_eq!(status, 404);
+    let names = list_tag_names(&case, "/");
+    assert!(names.iter().all(|n| n != "lb04-anno"), "{names:?}");
+
+    let (cls, cl_refs) = count_cl_artifacts(case.db_url());
+    assert_eq!((cls, cl_refs), (0, 0), "tag writes must not create CLs");
+    case.finish();
+}
+
+/// LB-04 AC-3: delete without a credential is 401 and leaves the tag.
+#[test]
+fn tag_delete_unauth_401() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let (status, json) = case.post(
+        "tags",
+        Some(&EntryCase::bearer()),
+        tag_body("lb04-keep", None, None),
+    );
+    assert_eq!(status, 200, "{json}");
+    let (status, json) = case.delete("tags/lb04-keep", None);
+    assert_eq!(status, 401, "delete without credential must 401: {json}");
+    assert!(!json.to_string().contains(PUSH_TOKEN), "{json}");
+    assert!(tag_ref_exists(case.db_url(), "lb04-keep"));
+    let (status, _) = case.get("tags/lb04-keep", None);
+    assert_eq!(status, 200);
+    case.finish();
+}
+
+/// LB-04 AC-3: `push_auth = "none"` admits tag create and delete without a
+/// header.
+#[test]
+fn tag_auth_none_write_ok() {
+    let case = EntryCase::boot(ApiWriteEnv::with_auth_none_config());
+    let (status, json) = case.post("tags", None, tag_body("lb04-none", None, None));
+    assert_eq!(status, 200, "push_auth=none create must 200: {json}");
+    assert!(tag_ref_exists(case.db_url(), "lb04-none"));
+    let (status, json) = case.delete("tags/lb04-none", None);
+    assert_eq!(status, 200, "push_auth=none delete must 200: {json}");
+    assert!(!tag_ref_exists(case.db_url(), "lb04-none"));
+    case.finish();
+}
+
+/// LB-04 AC-4: the Review morphology does not gain the trunk gate — create
+/// and delete without a header keep answering 200.
+#[test]
+fn tag_review_form_no_trunk_gate() {
+    let case = EntryCase::boot(ApiWriteEnv::with_review_config());
+    let (status, json) = case.post("tags", None, tag_body("lb04-review", None, None));
+    assert_eq!(status, 200, "Review create-tag must not 401: {json}");
+    assert!(tag_ref_exists(case.db_url(), "lb04-review"));
+    let (status, json) = case.get("tags/lb04-review", None);
+    assert_eq!(status, 200, "{json}");
+    let (status, json) = case.delete("tags/lb04-review", None);
+    assert_eq!(status, 200, "Review delete-tag must not 401: {json}");
+    assert!(!tag_ref_exists(case.db_url(), "lb04-review"));
+    case.finish();
+}
+
+/// LB-04 AC-5: `POST /tags/list` needs both `pagination` and `additional`
+/// (no serde defaults) — a body missing either is rejected by the JSON
+/// extractor (422), a complete body is 200 with `{ total, items }`.
+#[test]
+fn tag_list_requires_both_keys() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = case.post(
+        "tags/list",
+        None,
+        serde_json::json!({ "pagination": { "page": 1, "per_page": 20 } }),
+    );
+    assert_eq!(status, 422, "missing additional must be rejected: {json}");
+    let (status, json) = case.post("tags/list", None, serde_json::json!({ "additional": "/" }));
+    assert_eq!(status, 422, "missing pagination must be rejected: {json}");
+    let (status, json) = case.post("tags/list", None, list_body("/"));
+    assert_eq!(status, 200, "{json}");
+    assert!(json["data"]["total"].is_u64(), "{json}");
+    assert!(json["data"]["items"].is_array(), "{json}");
     case.finish();
 }

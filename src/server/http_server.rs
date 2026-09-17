@@ -1406,6 +1406,12 @@ mod tests {
             paths.iter().any(|p| p.contains("move-entry")),
             "storage-only OpenAPI must include move-entry: {paths:?}"
         );
+        for needle in ["/tags", "/tags/list", "/tags/{name}"] {
+            assert!(
+                paths.iter().any(|p| p.ends_with(needle)),
+                "storage-only OpenAPI must include {needle} (LB-04): {paths:?}"
+            );
+        }
         assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
             "storage-only OpenAPI must include /edit/save: {paths:?}"
@@ -1581,6 +1587,12 @@ mod tests {
             paths.iter().any(|p| p.contains("move-entry")),
             "trunk OpenAPI must include move-entry: {paths:?}"
         );
+        for needle in ["/tags", "/tags/list", "/tags/{name}"] {
+            assert!(
+                paths.iter().any(|p| p.ends_with(needle)),
+                "trunk OpenAPI must include {needle} (LB-04): {paths:?}"
+            );
+        }
         assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
             "trunk OpenAPI must include /edit/save: {paths:?}"
@@ -1653,6 +1665,12 @@ mod tests {
             paths.iter().any(|p| p.contains("move-entry")),
             "OAuth OpenAPI must include move-entry: {paths:?}"
         );
+        for needle in ["/tags", "/tags/list", "/tags/{name}"] {
+            assert!(
+                paths.iter().any(|p| p.ends_with(needle)),
+                "OAuth OpenAPI must include {needle} (LB-04): {paths:?}"
+            );
+        }
     }
 
     #[tokio::test]

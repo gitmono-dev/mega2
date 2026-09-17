@@ -52,8 +52,10 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
 
 /// HTTP `/api/v1` surface keyed on [`PushPolicy`] (TP-18 / AW-03). Trunk is the
 /// protocol subset without CL / issue / reviewer / OAuth user routers, but
-/// **does** register product create-entry / edit/save. Review keeps the full
-/// OAuth web surface.
+/// **does** register the product writes (create-entry / delete-entry /
+/// move-entry / edit/save) and, since plan-20260917 LB-04, the monorepo tag
+/// routes (`tag_router`, writes gated by `git.push_auth`). Review keeps the
+/// full OAuth web surface.
 pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
     match policy {
         PushPolicy::Trunk => storage_only_routers(),
@@ -61,7 +63,8 @@ pub fn routers_for(policy: PushPolicy) -> OpenApiRouter<MonoApiServiceState> {
     }
 }
 
-/// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user routers).
+/// Git-adjacent surface for storage-only / trunk HTTP (no OAuth/CL/user
+/// routers): read-only preview, the product writes and the tag routes.
 pub fn storage_only_routers() -> OpenApiRouter<MonoApiServiceState> {
     storage_only_routers_with(false)
 }
@@ -76,7 +79,8 @@ pub fn storage_only_routers_with(
         .route("/file/blob/{object_id}", get(get_blob_file))
         .route("/file/tree", get(get_tree_file))
         .merge(preview_router::readonly_routers())
-        .merge(preview_router::write_routers());
+        .merge(preview_router::write_routers())
+        .merge(tag_router::routers());
     if include_agent_capture {
         router.merge(agent_capture_router::routers())
     } else {

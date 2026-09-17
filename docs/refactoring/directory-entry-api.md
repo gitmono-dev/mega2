@@ -6,7 +6,7 @@
 
 ## 状态标记
 
-每条路由标注实现状态。本页由 LB-01 创建（当时不含任何代码改动）；此后每张实现卡在落地时把自己的路由翻为 `implemented`，其余路由仍是 `specified-unimplemented`——那些小节描述的是落地后的契约，不是今日行为。
+每条路由标注实现状态。本页由 LB-01 创建（当时不含任何代码改动）；此后每张实现卡在落地时把自己的路由翻为 `implemented`，其余路由仍是 `specified-unimplemented`——那些小节描述的是落地后的契约，不是今日行为（LB-04 起本页已无该状态的路由）。
 
 | 状态 | 含义 |
 |---|---|
@@ -19,10 +19,10 @@
 | `POST /api/v1/create-entry` | `implemented` | — | 可用 |
 | `POST /api/v1/delete-entry` | `implemented` | LB-02 | 可用：`write_routers` 已登记（Review 与 trunk 都有） |
 | `POST /api/v1/move-entry` | `implemented` | LB-03 | 可用：`write_routers` 已登记（Review 与 trunk 都有） |
-| `POST /api/v1/tags` | `specified-unimplemented` | LB-04 | handler 已存在但只挂在 Review；storage-only **404**。且**无任何鉴权**，见「鉴权」 |
-| `POST /api/v1/tags/list` | `specified-unimplemented` | LB-04 | 同上（读，无鉴权问题） |
-| `GET /api/v1/tags/{name}` | `specified-unimplemented` | LB-04 | 同上（读） |
-| `DELETE /api/v1/tags/{name}` | `specified-unimplemented` | LB-04 | 同上。且**无任何鉴权**，见「鉴权」 |
+| `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`（`api_router.rs:83`）；trunk 写经 `push_auth`，见「鉴权」 |
+| `POST /api/v1/tags/list` | `implemented` | LB-04 | 可用（读，不要求 Authorization） |
+| `GET /api/v1/tags/{name}` | `implemented` | LB-04 | 可用（读，不要求 Authorization；无 path 选择器，按 tag 名全局查找，见「get / delete」） |
+| `DELETE /api/v1/tags/{name}` | `implemented` | LB-04 | 可用：trunk 写经 `push_auth`，鉴权 path 固定 `/`，见「鉴权」 |
 
 公共前缀 `/api/v1` 由外层 nest 施加。
 
@@ -153,7 +153,7 @@
 | `is_directory=false` 缺 `content` | 同上，今日为 500（`"content is required for file creation"` 亦无 `[code:]` 前缀，`mono_api_service.rs:2121`） |
 | tag 名非法 | 今日已是 **400**（`tag_router.rs` 的 `validate_tag_name` → `ApiError::bad_request`） |
 | tag 已存在 | **400**（`"[code:400] Tag '{}' already exists"`，`mono_api_service.rs:1677`/`:1690`） |
-| tag 不存在（**get**） | **404**；wire `err_message` = `Tag '<name>' not found`。由 router 直接构造（`tag_router.rs:288-291`），服务层 `get_tag` 只返回 `Ok(None)`，**不**产生 `[code:]` |
+| tag 不存在（**get**） | **404**；wire `err_message` = `Tag '<name>' not found`。由 router 直接构造（`tag_router.rs:299-302`），服务层 `get_tag` 只返回 `Ok(None)`，**不**产生 `[code:]` |
 | tag 不存在（**delete**） | **404**；服务层抛 `"[code:404] Tag not found"`（`mono_api_service.rs:1846`），wire `err_message` = `Tag not found`（前缀被剥掉，见下） |
 | delete-entry：目标是文件 | **400**，wire `err_message` = `'<name>' is not a directory`（服务端 `[code:400]` 前缀被剥掉） |
 | delete-entry：缺父目录 / 缺目标 | **404**，`parent directory <path> not found` / `entry '<name>' not found under <path>` |
@@ -177,17 +177,17 @@
 
 ## 标签（monorepo tags）
 
-服务层 `MonoApiService` 的 `create_tag` / `list_tags` / `get_tag` / `delete_tag` 已实现并挂在 Review；`storage_only_routers_with`（`src/api/api_router.rs`）**没有** merge `tag_router`，所以 storage-only 上四条路由今日全部 **404**。LB-04 负责挂载并补 trunk 写鉴权。
+服务层 `MonoApiService` 的 `create_tag` / `list_tags` / `get_tag` / `delete_tag` 已实现；LB-04 起 `storage_only_routers_with`（`src/api/api_router.rs:83`）merge 了 `tag_router::routers()`（`tag_router.rs:20`），四条路由在 storage-only / trunk 与 Review 上都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 与 `tag_router::tag_routes_registered_on_storage_only_routers` 锁定）。trunk 写鉴权见「鉴权」。
 
 Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)）；tag 只能走本节 HTTP。
 
-### `POST /api/v1/tags` — create — `specified-unimplemented`（LB-04）
+### `POST /api/v1/tags` — create — `implemented`（LB-04）
 
 `CreateTagRequest`：
 
 | 字段 | 规则 |
 |---|---|
-| `name` | **必填**。服务端校验（`validate_tag_name`，`tag_router.rs:93-138`，违反即 **400**）：非空；`name.len() <= 255`（**字节**，非字符）；不含 `..`；不含 `@{`；不含 `//`；不以 `.lock` 结尾；不含禁用字符 —— **ASCII 空格**、`~`、`^`、`:`、`?`、`*`、`[`、`\`（`tag_router.rs:122` 的 `forbidden` 数组，逐字为 `[' ', '~', '^', ':', '?', '*', '[', '\\']`）；不含 NUL 与任何 `char::is_control()` 字符 |
+| `name` | **必填**。服务端校验（`validate_tag_name`，`tag_router.rs:96-141`，违反即 **400**）：非空；`name.len() <= 255`（**字节**，非字符）；不含 `..`；不含 `@{`；不含 `//`；不以 `.lock` 结尾；不含禁用字符 —— **ASCII 空格**、`~`、`^`、`:`、`?`、`*`、`[`、`\`（`tag_router.rs:125` 的 `forbidden` 数组，逐字为 `[' ', '~', '^', ':', '?', '*', '[', '\\']`）；不含 NUL 与任何 `char::is_control()` 字符 |
 | `target` | 可选；serde alias `target_commit` |
 | `path_context` | 可选；省略则 handler 用 `/`（**也是 trunk 鉴权 path**） |
 | `tagger_name` / `tagger_email` / `message` | 可选 |
@@ -196,9 +196,9 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 成功：**200** + `CommonResult<TagResponse>`。
 
-> **现网 OpenAPI 误写 201。** handler 返回 `Json<CommonResult<TagResponse>>`（`tag_router.rs:156`），axum 序列化为 **200**，所以**权威状态是 200**；utoipa 注解在 `tag_router.rs:149` 写的是 201。LB-04 必须把注解改成 200 并加回归，不得让 201 与 200 并存。
+> OpenAPI 与运行时一致为 **200**：handler 返回 `Json<CommonResult<TagResponse>>`（`tag_router.rs:166`），LB-04 把 utoipa 注解从 201 改为 200（`tag_router.rs:158`）；模块级回归 `tag_create_openapi_status_is_200` 与 IT `tag_create_unauth_401`（运行时 `/api/openapi.json`）都断言 `200` 在、`201` 不在。
 
-### `POST /api/v1/tags/list` — list — `specified-unimplemented`（LB-04）
+### `POST /api/v1/tags/list` — list — `implemented`（LB-04）
 
 **方法是 POST，不是 GET。** body 为 `PageParams<String>`：
 
@@ -213,22 +213,22 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 > `total` = DB 里的注解 tag 总数 **加上**本次请求扫描到、且已扣除与本页 annotated 重名后的**全部** lightweight ref 数（`mono_api_service.rs:1763`）。注意该加数在 `.take(need)` **之前**就已算出（`:1769-1774`），所以其中可能包含**并未进入本页 `items`** 的 refs。因此 `total` **随页而变**，不是稳定的全局计数；分页请以 `items` 长度与 `per_page` 判断，不要把 `total` 当权威总量。
 
-### `GET /api/v1/tags/{name}` / `DELETE /api/v1/tags/{name}` — get / delete — `specified-unimplemented`（LB-04）
+### `GET /api/v1/tags/{name}` / `DELETE /api/v1/tags/{name}` — get / delete — `implemented`（LB-04）
 
-两者 handler **硬编码** `repo_path = "/"`（`tag_router.rs:265`、`:309`）：**MVP 只操作 monorepo root tags**。
+两者 handler **硬编码** `repo_path = "/"`（`tag_router.rs:276`、`:327`）——这只是 handler 分发用的值：两条路由**没有 path 选择器**，而服务层 `get_tag` / `delete_tag` 丢弃 `repo_path`（`mono_api_service.rs:1795`、`:1832`）后按 tag 名全局查找 `refs/tags/<name>`（`get_ref_by_name`，`mono_storage.rs:884-892`，只按 `ref_name` 过滤，不按 `path`）。因此**任何** path 下同名的 tag 都会被按名找到 / 删除，包括用被 token 覆盖的非根 `path_context` 建出的 tag；同名 tag 在不同 path 下也不能并存（create 先查 `get_tag_by_name` / `get_ref_by_name`）——tag 名是**一个全局命名空间**。list 的 path 过滤只对轻量 tag 生效（`get_all_refs` 按 `path`）；注解 tag 从 `mega_tag` 分页、不按 path 过滤（`mono_storage.rs:1790-1792`），在任何 `additional` 下都会列出。被覆盖的非根 `path_context` 因此可以占用 root 可见的 tag 名并指向任意已存在的 commit（`target` 原样采纳，`tag_router.rs:171`）——这与 ADR-LB-05 item 5 一致，path 级命名空间见计划的 `DEFER-LB-11`。
 
-调用方**不得**假设存在 path 级 get/delete；路径级语义见计划的 `DEFER-LB-03`。
+调用方**不得**假设存在 path 级 get/delete（既无法指定 path，也没有 path 隔离）；路径级语义见计划的 `DEFER-LB-03`。
 
 - get 成功：**200** + `CommonResult<TagResponse>`；tag 不存在 → **404**。
 - delete 成功：**200** + `CommonResult<DeleteTagResponse>`（`{ deleted_tag, message }`）；tag 不存在 → **404**。
 
-`TagResponse` 字段：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`。七个字段**全部是非 `Option` 的 `String`**（`ceres/model/tag.rs:37-52`），键始终存在；`created_at` 是**字符串**不是数值时间戳；lightweight tag 的 `tagger` 与 `message` 为**空串**（`mono_api_service.rs:1755-1756`）。
+`TagResponse` 字段：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`。七个字段**全部是非 `Option` 的 `String`**（`ceres/model/tag.rs:37-52`），键始终存在；`created_at` 是**字符串**不是数值时间戳；list / get 回传的 lightweight tag `tagger` 与 `message` 为**空串**（`mono_api_service.rs:1755-1756`、`:1803-1804`）；**create 的回应**里 lightweight tag 的 `tagger` 是 `tagger_name` / `tagger_email` 的组合、两者都缺省时为 `unknown`（`:1661-1666`、`:2668`），`message` 为空串。
 
 ## 鉴权
 
 目录变更写复用既有 `authorize_trunk_api_write`（`src/api/api_write_auth.rs`），与 LFS / create-entry 同一威胁模型。
 
-> **整节的形态前提：** 这道闸**仅**在 `push_policy=trunk`（含 storage-only）时生效。Review 形态下 `trunk_write_requester` 返回 `Ok(None)` 并**跳过**鉴权（`preview_router.rs:470-480`），走既有 CL 分支。
+> **整节的形态前提：** 这道闸**仅**在 `push_policy=trunk`（含 storage-only）时生效。Review 形态下 `trunk_write_requester` 返回 `Ok(None)` 并**跳过**鉴权（`preview_router.rs:475-485`；LB-04 起为 `pub(crate)`，`tag_router` 复用同一实现），目录变更走既有 CL 分支，tag 写沿用 Review 既有面。
 
 ### 不需要 Authorization
 
@@ -241,16 +241,16 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 | `POST /create-entry` | `implemented`——今日确实鉴权（`preview_router.rs:114-117` 取 `HeaderMap` 并调 `trunk_write_requester`） |
 | `POST /delete-entry` | `implemented`（LB-02）——`delete_entry`（`preview_router.rs:138`）取 `HeaderMap` 并调 `trunk_write_requester(path = 父目录)`，鉴权先于任何存储访问 |
 | `POST /move-entry` | `implemented`（LB-03）——`move_entry`（`preview_router.rs:166`）对 `from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败即拒绝，先于任何存储访问 |
-| `POST /tags` / `DELETE /tags/{name}` | `specified-unimplemented`（LB-04） |
+| `POST /tags` / `DELETE /tags/{name}` | `implemented`（LB-04）——`create_tag`（`tag_router.rs:162`）以 `path_context.unwrap_or("/")`（`:167`）、`delete_tag`（`:321`）以固定 `/`（`:326`）各调一次 `trunk_write_requester`，先于 `validate_tag_name` 与任何存储访问 |
 
-> **今日状态（安全相关，务必读）：** `create_tag`（`tag_router.rs:153`）与 `delete_tag`（`tag_router.rs:305`）**都不接收 `HeaderMap`，也不调用任何 authorizer**——`tag_router.rs` 全文没有 `authorize_trunk_api_write`。因此今日 tag 写在 **Review 面上完全匿名**（cedar_guard 只覆盖 `/cl`，不覆盖 `/tags`），在 **storage-only 面上 404**。这正是计划里的 `GAP-LB-04`。下面描述的是 **LB-04 落地后**的契约，不是今日行为。
+> **落地状态（LB-04，安全相关）：** `create_tag`（`tag_router.rs:162`）与 `delete_tag`（`:321`）都接收 `HeaderMap`，并在任何存储访问之前调用 `trunk_write_requester`；这关闭了计划里的 `GAP-LB-04`（裸挂会让 `token` 部署匿名写 `refs/tags`）。Review 形态该函数返回 `Ok(None)`，tag 写沿用 Review 既有面（cedar_guard 只覆盖 `/cl`，不覆盖 `/tags`）——本卡不为 Review 新增 401（IT `tag_review_form_no_trunk_gate`）。
 
-落地后（LB-04）：
+trunk / storage-only 上的 `push_auth` 行为（IT `tag_create_unauth_401` / `tag_delete_unauth_401` / `tag_auth_none_write_ok`）：
 
 | `push_auth` | 行为 |
 |---|---|
 | `token` | Bearer，或 Basic 的密码栏 |
-| `none` | 无 header 即可写，requester 记为 `anonymous` |
+| `none` | 无 header 即可写（目录写把 requester 记为 `anonymous` 进 push_queue；tag 写不记录 requester，两个 handler 丢弃返回值） |
 
 状态码分类（`api_write_auth.rs:33-48`）：
 
@@ -260,21 +260,21 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 错误响应、JSON 与 trace **不得**回显 token。
 
-### tag 写需要能覆盖 `/` 的 token（LB-04 落地后）
+### 哪些 tag 写需要能覆盖 `/` 的 token
 
-> 本小节同样描述 **LB-04 落地后**的行为。今日 tag 写在 storage-only 上 404、在 Review 上完全匿名（见上方「今日状态」）。
+> 本小节描述 trunk / storage-only 形态（IT `tag_write_path_scoped_token_403`）；Review 形态不经这道闸。
 
 tag 写的鉴权 path 不是你操作的业务路径：
 
-- **create** 用 `path_context.as_deref().unwrap_or("/")`（`tag_router.rs:172`）；
-- **delete 无 body，LB-04 的授权 path 固定 `/`**（今日 `tag_router.rs:309` 的 `repo_path = "/"` 只是 handler 分发用，不是鉴权）。
+- **create** 用 `path_context.as_deref().unwrap_or("/")`（`tag_router.rs:167`）；`path_context = "/project"` 之类被 token 覆盖的 path 可过闸，tag 落在该 path 的 `mega_refs` 下（轻量 tag 只在 list 以 `additional` 指定同一 path 时列出，注解 tag 在任何 `additional` 下都列出；`GET` / `DELETE /tags/{name}` 按名找到它，见上）；
+- **delete 无 body，授权 path 固定 `/`**（`tag_router.rs:326`；与 `:327` 的 `repo_path = "/"` handler 分发一致）。
 
 因此 `push_tokens.paths = ["/project"]` 这类**不含 `/`** 的 token：
 
 - 对 **每一次** tag delete → **403**；
 - 对**省略**或显式 `path_context = "/"` 的 create → **403**。
 
-调用方（含 Libra）要做 tag 写，必须持有能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）。
+因此：**delete**（任何 tag）与 **root / 缺省 `path_context` 的 create** 必须持有能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）；**非根 `path_context` 的 create** 可以改用覆盖该 path 的 token（tag 落在该 path 下，见上）。Libra 只操作 root tags（get/delete 无 path 选择器），所以 Libra 的 tag 写实际上需要能覆盖 `/` 的 token。
 
 > 契约页不写真实凭据；示例一律用 `secret-ok` 一类占位。
 
@@ -285,7 +285,7 @@ tag 写的鉴权 path 不是你操作的业务路径：
 | trunk / storage-only | `land_api_tip_push` | 必为 `null` |
 | Review | 既有 `find_or_create_cl_for_edit` CL 分支 | 可为非 null |
 
-`write_routers`（`preview_router.rs:57-63`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。
+`write_routers`（`preview_router.rs:57-63`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。`tag_router::routers()` 同样两边都挂：Review 的 `routers()` 原本就有，LB-04 把它 merge 进 `storage_only_routers_with`（`api_router.rs:83`）；三份 OpenAPI 锁（storage-only / trunk / OAuth）都断言 `/tags`、`/tags/list`、`/tags/{name}`。
 
 `ImportRepo`（`import_dir` 下）对 delete/move 必须返回 **409**（计划门 `delete_entry_reject_import_repo_409`，见 plan-20260917 LB-02 卡「判据规范 — EX-LB-01」门 11；该门只规定状态码）。LB-02 的 `delete_monorepo_entry`（`import_api_service.rs`）返回 `[code:409] import dir does not support delete entry`，wire 上 `err_message` = `import dir does not support delete entry`；LB-03 的 move 同样：源在 ImportRepo 下由 `ImportApiService` 返回 `[code:409] import dir does not support move entry`，目标在 ImportRepo 下由 monorepo handler 自查 `git_repo` 后返回同一文本。实现上**必须**带 `[code:409]` 前缀——这是推导出来的必要条件，不是计划原文：`GitError::CustomError` 只有带该前缀才会被 `common/errors/api.rs:175` 映射成 `StatusCode::CONFLICT`。**另有一个陷阱：** `map_ceres_error`（`common/errors/api.rs:194-208`）只识别 `400` 与 `404`，其余一律 `_ => ApiError::internal` → **500**，而它正是 `tag_router.rs` 的惯用写法。因此 delete/move 必须走裸 `?`（`From<E> for ApiError`，如 `preview_router.rs:121`）那条路径；若用 `map_ceres_error` 包装，即使带了 `[code:409]` 仍会落成 500 并使该门失败。今日 create-entry 的同类拒绝（`import_api_service.rs:56-64` 的 `CustomError("import dir does not support create entry")`）**没有**前缀，因而落成 500 + `"Internal server error"`——见「错误映射」，delete/move 不得复制该缺陷。其 Git 多分支与客户端 tag 语义不受本计划影响。
 
@@ -301,13 +301,13 @@ tag create/delete 之后，`GET /tags/{name}` 与 `POST /tags/list` 必须一致
 - 不改 `GET /tree` / `POST /create-entry` / `POST /edit/save` 的既有请求字段或成功语义。
 - 不以 Git receive-pack delete command、parent-path 客户端 push 或 CL `apply_changes` 冒充产品 HTTP。
 - 不把 list tags 从 `POST /tags/list` 改成 `GET`（只改文档对齐程式，**不改 wire**）。
-- 不把 `get_tag` / `delete_tag` 的 root-only 扩成任意 path（只文件化；见 `DEFER-LB-03`）。
+- 不给 `get_tag` / `delete_tag` 加 path 选择器或 path 隔离（今日 handler 固定以 `/` 分发、服务层按 tag 名全局查找；只文件化，见 `DEFER-LB-03` / `DEFER-LB-11`）。
 - 不接入 Review OAuth / Cedar enforce；不为 storage-only 打开 SSH receive-pack。
 - 不实现 Libra 客户端（`DEP-LB-03`）。
 
 ## 相关文档
 
-- [`../monorepo.md`](../monorepo.md) —— 产品规则；tag 只能走 HTTP，Git 客户端禁 tag。**注意：** 该文第 52 行的 list 仍写 `GET`，属已知文档缺陷，由 LB-04 对齐；wire 以本页为准
+- [`../monorepo.md`](../monorepo.md) —— 产品规则；tag 只能走 HTTP，Git 客户端禁 tag。该文的 API 表已由 LB-04 对齐为 `POST … /tags/list`（并注明两键必填）；wire 以本页为准
 - [`../deploy-trunk.md`](../deploy-trunk.md) —— storage-only 运维手册与产品 API 写契约
 - [`../plan/plan-20260904.md`](../plan/plan-20260904.md) —— create-entry / edit/save + `push_auth` + `land_api_tip_push` 的来源计划
 - [`integration.md`](integration.md) —— 集成测试与黑盒矩阵
