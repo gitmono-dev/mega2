@@ -1373,11 +1373,12 @@ impl ApiHandler for MonoApiService {
         })
     }
 
-    /// Move or rename a directory: the item leaves the source parent tree and
-    /// the same tree id is inserted under the destination parent, both chains
-    /// rolled up to the root in one commit (plan-20260917 ADR-LB-02/03). The
-    /// commit lands on the deepest directory containing both parents; a
-    /// source parent left empty keeps a `.gitkeep` like delete-entry.
+    /// Move or rename a directory or file: the item leaves the source parent
+    /// tree and the same oid and mode are inserted under the destination
+    /// parent, both chains rolled up to the root in one commit
+    /// (plan-20260917 ADR-LB-02/03, plan-20260918 ADR-FT-01). The commit
+    /// lands on the deepest directory containing both parents; a source
+    /// parent left empty keeps a `.gitkeep` like delete-entry.
     async fn move_monorepo_entry(
         &self,
         entry_info: MoveEntryInfo,
@@ -1399,7 +1400,9 @@ impl ApiHandler for MonoApiService {
                 "[code:400] source and destination are the same: {src_full}"
             )));
         }
-        if dest_parent == src_full || dest_parent.starts_with(&format!("{src_full}/")) {
+        if entry_info.is_directory
+            && (dest_parent == src_full || dest_parent.starts_with(&format!("{src_full}/")))
+        {
             return Err(GitError::CustomError(format!(
                 "[code:400] cannot move {src_full} into its own subtree {dest_parent}"
             )));
@@ -1440,17 +1443,26 @@ impl ApiHandler for MonoApiService {
             .pop()
             .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
         let mut src_items = src_tree.tree_items.clone();
-        let index = match src_items
-            .iter()
-            .position(|item| item.name == entry_info.from_name && item.mode == TreeItemMode::Tree)
-        {
+        let index = match src_items.iter().position(|item| {
+            item.name == entry_info.from_name
+                && if entry_info.is_directory {
+                    item.mode == TreeItemMode::Tree
+                } else {
+                    matches!(item.mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable)
+                }
+        }) {
             Some(index) => index,
             None if src_items
                 .iter()
                 .any(|item| item.name == entry_info.from_name) =>
             {
+                let kind = if entry_info.is_directory {
+                    "directory"
+                } else {
+                    "file"
+                };
                 return Err(GitError::CustomError(format!(
-                    "[code:400] '{}' is not a directory",
+                    "[code:400] '{}' is not a {kind}",
                     entry_info.from_name
                 )));
             }
@@ -1504,7 +1516,7 @@ impl ApiHandler for MonoApiService {
             )));
         }
         dest_items.push(TreeItem {
-            mode: TreeItemMode::Tree,
+            mode: moved.mode,
             id: moved.id,
             name: entry_info.to_name.clone(),
         });

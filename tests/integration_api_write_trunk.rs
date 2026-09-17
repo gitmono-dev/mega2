@@ -836,6 +836,18 @@ impl EntryCase {
         to_path: &str,
         to_name: &str,
     ) -> (u16, Value) {
+        self.move_entry_as(auth, from_path, from_name, to_path, to_name, true)
+    }
+
+    fn move_entry_as(
+        &self,
+        auth: Option<&str>,
+        from_path: &str,
+        from_name: &str,
+        to_path: &str,
+        to_name: &str,
+        is_directory: bool,
+    ) -> (u16, Value) {
         self.post(
             "move-entry",
             auth,
@@ -844,10 +856,37 @@ impl EntryCase {
                 "from_name": from_name,
                 "to_path": to_path,
                 "to_name": to_name,
+                "is_directory": is_directory,
                 "author_username": LB02_AUTHOR,
                 "skip_build": true
             }),
         )
+    }
+
+    /// `(name, oid)` pairs of `GET /tree/content-hash?path=` (blob oid for files).
+    fn tree_oids(&self, path: &str) -> Vec<(String, String)> {
+        let response = self
+            .client
+            .get(format!("{}/tree/content-hash?path={path}", self.api))
+            .send()
+            .expect("GET /tree/content-hash");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "GET /tree/content-hash?path={path}"
+        );
+        let json: Value = response.json().expect("content-hash json");
+        json["data"]
+            .as_array()
+            .expect("content-hash data")
+            .iter()
+            .map(|item| {
+                (
+                    item["name"].as_str().expect("hash item name").to_owned(),
+                    item["oid"].as_str().expect("hash item oid").to_owned(),
+                )
+            })
+            .collect()
     }
 
     /// `(name, content_type)` pairs of `GET /tree?path=`.
@@ -1525,6 +1564,121 @@ fn move_entry_reject_file_source() {
     assert_eq!(status, 400, "a file source must 400: {json}");
     assert!(err_message(&json).contains("not a directory"), "{json}");
     assert_eq!(path_tip(case.db_url(), "/project"), tip_before);
+    case.finish();
+}
+
+#[test]
+fn move_entry_file_success_preserves_oid() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let created = case.create_entry(Some(&EntryCase::bearer()), "ft03-file.txt", false);
+    let oid = created["data"]["new_oid"]
+        .as_str()
+        .expect("create-entry new_oid")
+        .to_owned();
+    assert!(!oid.is_empty(), "{created}");
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.move_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft03-file.txt",
+        "/project",
+        "ft03-moved.txt",
+        false,
+    );
+    assert_eq!(status, 200, "moving a file must 200: {json}");
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert!(json["data"]["cl_link"].is_null(), "{json}");
+    assert_eq!(
+        json["data"]["from_path"],
+        Value::String("/project/ft03-file.txt".to_string()),
+        "{json}"
+    );
+    assert_eq!(
+        json["data"]["to_path"],
+        Value::String("/project/ft03-moved.txt".to_string()),
+        "{json}"
+    );
+    assert!(
+        json["data"].get("new_oid").is_none(),
+        "move-entry has no new_oid: {json}"
+    );
+    assert_ne!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "file move must advance /project tip"
+    );
+    let entries = case.tree_entries("/project");
+    assert!(
+        entries.iter().all(|(n, _)| n != "ft03-file.txt"),
+        "source name must vanish: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(n, t)| n == "ft03-moved.txt" && t == "file"),
+        "destination must list the moved file: {entries:?}"
+    );
+    let after_oid = case
+        .tree_oids("/project")
+        .into_iter()
+        .find(|(n, _)| n == "ft03-moved.txt")
+        .map(|(_, o)| o)
+        .expect("moved file oid");
+    assert_eq!(after_oid, oid, "file move must keep the same blob oid");
+    case.finish();
+}
+
+#[test]
+fn move_entry_reject_directory_as_file_400() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "ft03-dir", true);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.move_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft03-dir",
+        "/project",
+        "ft03-dir-as-file",
+        false,
+    );
+    assert_eq!(status, 400, "directory as file must 400: {json}");
+    assert!(
+        err_message(&json).contains("is not a file"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected file-mode move must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
+fn move_entry_reject_missing_file_404() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.move_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft03-absent.txt",
+        "/project",
+        "ft03-elsewhere.txt",
+        false,
+    );
+    assert_eq!(status, 404, "missing file name must 404: {json}");
+    assert!(
+        err_message(&json).contains("not found"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected missing-name move must not advance tip"
+    );
     case.finish();
 }
 

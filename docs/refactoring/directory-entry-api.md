@@ -18,7 +18,7 @@
 | `GET /api/v1/tree` | `implemented` | — | 可用 |
 | `POST /api/v1/create-entry` | `implemented` | — | 可用 |
 | `POST /api/v1/delete-entry` | `implemented` | LB-02 / FT-02 | 可用：省略 `is_directory` 删目录；`false` 删文件 |
-| `POST /api/v1/move-entry` | `implemented` | LB-03 | 可用：今日省略 `is_directory` 只移目录。文件分支 `specified`（FT-03） |
+| `POST /api/v1/move-entry` | `implemented` | LB-03 / FT-03 | 可用：省略 `is_directory` 移目录；`false` 移文件（同一 blob oid） |
 | `POST /api/v1/tags` | `implemented` | LB-04 | 可用：`storage_only_routers_with` 已 merge `tag_router::routers()`（`api_router.rs:83`）；trunk 写经 `push_auth`，见「鉴权」 |
 | `POST /api/v1/tags/list` | `implemented` | LB-04 | **今日实况**：POST + JSON `PageParams`。FT-04 后此方法 **405** |
 | `GET /api/v1/tags/list` | `specified-unimplemented` | FT-04 | 冻结为唯一 list；今日未挂 GET（调用会 405） |
@@ -115,7 +115,7 @@
 - trunk 上父目录为 `/`（即删除顶层目录）时，B0 拒绝根 tip 经 MonoWriteQueue 前进，返回 **400**（`no non-root path tip under / for trunk API write`）；Review 形态则在 `/` 的 CL 上进行。
 - `commit_id` 在 trunk 上是落地后的 tip；`path` 只作回执。
 
-### `POST /api/v1/move-entry` — `implemented`（LB-03）；文件分支 `specified`（FT-03）
+### `POST /api/v1/move-entry` — `implemented`（LB-03 / FT-03）
 
 ```json
 {
@@ -145,7 +145,7 @@
 落地事实（LB-03，`mono_api_service.rs` 的 `move_monorepo_entry`）：
 
 - 两组 `path`/`name` 都先过 `validate_entry_target`（规则同 delete-entry）；父路径经 `normalize_parent_path` 归一（空串 = `/`，容忍一个尾随 `/`），改名 = 归一后 `from_path == to_path` 且名字不同。
-- 校验顺序：源目标相同 → 移进自己的子树（**仅** `is_directory=true`：目标父 = 源目录或其后代；文件源不做子树检查）→ 目标父落在 ImportRepo 下（router 只按 `from_path` 分派，monorepo handler 自查 `git_repo` 后以 **409** 拒绝）→ 源父不存在 / 源不存在 / 源 mode 不符 → 目标父不存在 → 目标名已存在（**任何 mode** 的同名项都算已存在）。全部检查在任何写入之前完成。**今日实况（FT-03 前）：** 省略字段只移目录；文件源仍报 400。
+- 校验顺序：源目标相同 → 移进自己的子树（**仅** `is_directory=true`：目标父 = 源目录或其后代；文件源不做子树检查）→ 目标父落在 ImportRepo 下（router 只按 `from_path` 分派，monorepo handler 自查 `git_repo` 后以 **409** 拒绝）→ 源父不存在 / 源不存在 / 源 mode 不符 → 目标父不存在 → 目标名已存在（**任何 mode** 的同名项都算已存在）。全部检查在任何写入之前完成。省略字段只移目录；`is_directory=false` 移 `Blob` / `BlobExecutable` 并保留同一 oid。
 - 改写 = 源父 tree 去掉该项、目标父 tree 插入**同一 oid 与同一 mode**（改名只改 `TreeItem.name`），两条父链自底向上重算到根，一次 commit；目标父的项按 Git 顺序排序；源父被移空时补写带时间戳的 `.gitkeep`（同 delete-entry）。
 - 落地路径 = 两个父目录的最深公共目录：trunk 上经 `land_api_tip_push` 前进**覆盖该路径的最深非根 path tip**（`resolve_trunk_land_path`，AW-03：落地 `/project/a`（本身无 tip）时前进的是 `/project` 的 tip），因此**跨顶层目录**的移动（公共目录为 `/`）在 trunk 上因 B0 返回 **400**；Review 形态在该公共目录（或 `/`）的 CL 上进行，与 create/delete 相同的政策分流。
 - 鉴权：`from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败（401/403）即拒绝，此时尚未读任何 tree。
@@ -168,7 +168,8 @@
 | move-entry：源目标相同 | **400**，`source and destination are the same: <path>` |
 | move-entry：目标名已存在（任何 mode） | **400**，`'<to_name>' already exists under <to_path>` |
 | move-entry：移进自己的子树 | **400**，`cannot move <src> into its own subtree <to_path>` |
-| move-entry：源是文件 | **400**，`'<from_name>' is not a directory` |
+| move-entry：源是文件（省略 / `is_directory=true`） | **400**，`'<from_name>' is not a directory` |
+| move-entry：源是目录且 `is_directory=false` | **400**，`'<from_name>' is not a file` |
 | move-entry：`from_path`/`from_name`/`to_path`/`to_name` 不合规 | **400**，`validate_entry_target` 的诊断原文 |
 | move-entry：源父 / 目标父不存在；源不存在 | **404**，`source parent <path> not found` / `destination parent <path> not found` / `entry '<name>' not found under <path>` |
 | move-entry：源父 / 目标父路径穿过文件 | **400**，`source parent path <path> is not a directory` / `destination parent path <path> is not a directory` |
