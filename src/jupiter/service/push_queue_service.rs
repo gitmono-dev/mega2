@@ -1199,6 +1199,29 @@ impl PushQueueService {
             tracing::error!(id = req.id, "B3 Done update hit 0 rows after fencing");
             return Ok(self.outcome_claim_lost(req.id));
         }
+
+        // T05 (spec 09 §1): record the publication receipt, outbox event and
+        // per-namespace sequence in the *same* transaction as the root CAS
+        // above, so the visible change, its sequence and its outbox commit
+        // atomically. Gated off by default (`mst2.publication_enabled`), so
+        // an unconfigured deployment keeps the exact prior behavior.
+        if let Some(ctx) = push_ctx
+            && ctx.storage.config().mst2.publication_enabled
+        {
+            let old_oid = cur_commit.unwrap_or(ZERO_ID);
+            let namespace = self.mono_storage.normalize_namespace(&row.path);
+            self.mono_storage
+                .record_publication_in_txn(
+                    &txn,
+                    &row.operation_id,
+                    &namespace,
+                    old_oid,
+                    &new_commit,
+                    "trunk_push",
+                )
+                .await?;
+        }
+
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
         self.run_c_segment_index(req.id, &row.path).await;
@@ -2109,6 +2132,29 @@ impl PushQueueService {
             tracing::error!(id = row.id, "B3 push Done update hit 0 rows after fencing");
             return Ok(self.outcome_claim_lost(row.id));
         }
+
+        // T05 (spec 09 §1/§7): record the publication receipt, outbox event
+        // and per-namespace sequence in the *same* transaction as the ref CAS
+        // above, so the visible change, its sequence and its outbox commit
+        // atomically (trunk push = the primary default-namespace writer of
+        // spec 09 §5). Gated off by default (`mst2.publication_enabled`):
+        // a deployment that has not passed the §9 shadow comparison keeps
+        // the exact prior behavior. Replaying the same operation id lands
+        // the receipt once (PUB-11).
+        if ctx.storage.config().mst2.publication_enabled {
+            let namespace = self.mono_storage.normalize_namespace(&normalized);
+            self.mono_storage
+                .record_publication_in_txn(
+                    &txn,
+                    &row.operation_id,
+                    &namespace,
+                    cur_commit.unwrap_or(ZERO_ID),
+                    &landed_commit_id,
+                    "trunk_push",
+                )
+                .await?;
+        }
+
         PushQueueStorage::notify_mono_write_queue(&txn).await?;
         txn.commit().await?;
         // WH-03 (plan-20260912 ADR-WH-04): the single `repo.push` emission

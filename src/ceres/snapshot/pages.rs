@@ -29,6 +29,9 @@ pub struct BuiltDirectory {
     pub page_id: [u8; 32],
     /// Direct entries, byte-sorted, matching the page contents.
     pub entries: Vec<DirEntry>,
+    /// The codec entries the page was built from, so callers can walk a route
+    /// through the same canonical tree (`Page::pages_along_route`).
+    pub codec_entries: Vec<Entry>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +169,7 @@ pub async fn build_directory_page<T: ApiHandler + ?Sized>(
         page_bytes,
         page_id: pid,
         entries,
+        codec_entries,
     })
 }
 
@@ -259,8 +263,86 @@ async fn fetch_tree<T: ApiHandler + ?Sized>(
     unreachable!("loop returns on the last component")
 }
 
+/// Outcome of resolving one absolute view path (spec 04 §7 statuses).
+pub enum WalkOutcome {
+    /// Directory at this path.
+    FoundDir,
+    /// File/symlink at this path with raw content and its SHA-256.
+    FoundFile {
+        fs_kind: FsKind,
+        /// Git object oid, so callers can build range-readable projections
+        /// without re-walking the tree.
+        oid: String,
+        raw: Vec<u8>,
+        size: u64,
+        digest: [u8; 32],
+    },
+    /// The parent directory exists and was enumerated; name absent.
+    Absent,
+    /// An intermediate component is not a directory; `symlink` marks the
+    /// symlink-traversal case of spec 04 §1.
+    NotDirectory { symlink: bool },
+}
+
+/// Resolve one absolute view path against the fixed root tree. Absence is
+/// proven by enumeration; gitlink entries reject the projection.
+pub async fn resolve_abs<T: ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &git_internal::internal::object::tree::Tree,
+    abs_path: &str,
+) -> Result<WalkOutcome, SnapshotError> {
+    if abs_path == "/" {
+        return Ok(WalkOutcome::FoundDir);
+    }
+    let comps: Vec<&str> = abs_path[1..].split('/').collect();
+    let mut current = root_tree.clone();
+    for (i, comp) in comps.iter().enumerate() {
+        let last = i == comps.len() - 1;
+        let Some(item) = current.tree_items.iter().find(|x| x.name == *comp) else {
+            return Ok(WalkOutcome::Absent);
+        };
+        let Some(kind) = FsKind::from_git_mode(item.mode) else {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::UnsupportedEntry,
+                format!("gitlink entry '{comp}' is not supported in this profile"),
+            ));
+        };
+        let oid = item.id.to_string();
+        if last {
+            return match kind {
+                FsKind::Directory => Ok(WalkOutcome::FoundDir),
+                FsKind::Regular | FsKind::Executable | FsKind::Symlink => {
+                    let raw = fetch_raw_blob(handler, &oid).await?;
+                    let mut h = Sha256::new();
+                    h.update(&raw);
+                    let digest: [u8; 32] = h.finalize().into();
+                    Ok(WalkOutcome::FoundFile {
+                        fs_kind: kind,
+                        oid,
+                        size: raw.len() as u64,
+                        digest,
+                        raw,
+                    })
+                }
+            };
+        }
+        if kind != FsKind::Directory {
+            return Ok(WalkOutcome::NotDirectory {
+                symlink: kind == FsKind::Symlink,
+            });
+        }
+        current = handler.get_tree_by_hash(&oid).await.map_err(|e| {
+            SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                format!("tree fetch failed for component '{comp}': {e}"),
+            )
+        })?;
+    }
+    unreachable!("loop returns on the last component")
+}
+
 /// Raw blob bytes with the `blob <len>\0` git header stripped.
-async fn fetch_raw_blob<T: ApiHandler + ?Sized>(
+pub async fn fetch_raw_blob<T: ApiHandler + ?Sized>(
     handler: &T,
     oid: &str,
 ) -> Result<Vec<u8>, SnapshotError> {

@@ -9,11 +9,12 @@
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::Engine;
+use bytes::Bytes;
 use mst2_codec::descriptor;
 use serde::Deserialize;
 use serde_json::json;
@@ -23,7 +24,7 @@ use crate::{
     ceres::snapshot::{
         descriptor::build as build_descriptor,
         error::{SnapshotError, SnapshotErrorCode},
-        pages::{base64_of, build_directory_page, hex_of, proof_pages},
+        pages::{WalkOutcome, base64_of, build_directory_page, hex_of, proof_pages, resolve_abs},
         runtime::{now_unix, runtime},
         view::{SnapshotView, validate_scope_relative_path},
     },
@@ -33,8 +34,33 @@ pub fn routers() -> Router<MonoApiServiceState> {
     Router::new()
         .route("/snapshots/capabilities", get(capabilities))
         .route("/snapshots/resolve", post(resolve))
+        .route("/snapshots/leases/{lease_id}/renew", post(lease_renew))
+        .route("/snapshots/leases/{lease_id}", delete(lease_release))
+        .route("/snapshots/{snapshot_id}/descriptor", get(descriptor_get))
         .route("/snapshots/{snapshot_id}/directory", get(directory))
+        .route(
+            "/snapshots/{snapshot_id}/blob",
+            get(blob).head(content::blob_head),
+        )
+        .route("/snapshots/{snapshot_id}/lookup", post(lookup))
+        .route(
+            "/snapshots/{snapshot_id}/metadata/pages",
+            post(metadata_pages),
+        )
+        .route("/snapshots/{snapshot_id}/objects", post(content::objects))
+        .route(
+            "/snapshots/{snapshot_id}/chunk-map",
+            get(content::chunk_map),
+        )
+        .route(
+            "/snapshots/{snapshot_id}/chunk-map/pages",
+            get(content::chunk_map_pages),
+        )
+        .route("/snapshots/{snapshot_id}/chunks", post(content::chunks))
 }
+
+#[path = "snapshot_content.rs"]
+mod content;
 
 fn mst2_error_response(err: SnapshotError) -> Response {
     let status =
@@ -71,16 +97,16 @@ async fn capabilities() -> Json<serde_json::Value> {
     Json(json!({
         "protocol_versions": [2],
         "metadata_codecs": [1],
-        "frame_encodings": ["identity"],
+        "frame_encodings": ["identity", "zstd"],
         "features": {
             "resolve": true,
             "directory": true,
             "leases": true,
-            "lookup": false,
-            "metadata_pages": false,
-            "raw_blob": false,
-            "objects": false,
-            "chunk_reads": false,
+            "lookup": true,
+            "metadata_pages": true,
+            "raw_blob": true,
+            "objects": true,
+            "chunk_reads": true,
             "full_hydration": false,
             "offline_export": false,
             "bindings": false,
@@ -220,21 +246,33 @@ async fn resolve(
     )
     .map_err(mst2_error_response)?;
     let ctx = runtime().insert_context(built.clone(), &commit_oid, &tree_oid, req.lease_seconds);
-    let seq = runtime().publication_sequence(&commit_oid);
+    // Publication identity: with T05 enabled the sequence is the durable
+    // per-namespace counter written atomically with the ref CAS; a read
+    // failure there is surfaced rather than silently falling back, because
+    // the sequence is what binds a client to a version. When publication is
+    // disabled the provisional per-tip counter is the honest answer.
+    //
+    // Namespace note: the counter is keyed on the writer's repo path, and
+    // resolve maps the request scope onto it. That mapping is the identity
+    // only while a scope names one native namespace (true for the default
+    // scope and for deployments without composite bindings); the general
+    // scope→namespace map arrives with the T04 binding layer (see
+    // ISSUES.md ISS-01/ISS-06).
+    let seq = if state.storage.config().mst2.publication_enabled {
+        let namespace = state.storage.mono_storage().normalize_namespace(&req.scope);
+        let durable = state
+            .storage
+            .mono_storage()
+            .publication_sequence(&namespace)
+            .await
+            .map_err(internal)?;
+        durable.to_string()
+    } else {
+        runtime().publication_sequence(&commit_oid).to_string()
+    };
 
     let body = json!({
-        "descriptor": {
-            "schema_version": 2,
-            "metadata_codec": 1,
-            "instance_id": built.instance_id,
-            "namespace_view_id": view.view_id,
-            "scope": built.descriptor.scope,
-            "materialization_policy": 1,
-            "fs_semantics": 1,
-            "access_projection": 0,
-            "metadata_root": built.metadata_root,
-            "snapshot_id": built.snapshot_id,
-        },
+        "descriptor": descriptor_json(&built),
         "publication_sequence": seq.to_string(),
         "writer_epoch": "1",
         "lease_id": ctx.lease_id,
@@ -244,6 +282,89 @@ async fn resolve(
         "delivery": "full",
     });
     Ok(Json(body).into_response())
+}
+
+/// Spec 03 §2 descriptor JSON, built from the canonical descriptor bytes.
+fn descriptor_json(
+    built: &crate::ceres::snapshot::descriptor::BuiltDescriptor,
+) -> serde_json::Value {
+    json!({
+        "schema_version": 2,
+        "metadata_codec": 1,
+        "instance_id": built.instance_id,
+        "namespace_view_id": format!("sha256:{}", hex_of(&built.descriptor.namespace_view_id)),
+        "scope": built.descriptor.scope,
+        "materialization_policy": 1,
+        "fs_semantics": 1,
+        "access_projection": 0,
+        "metadata_root": built.metadata_root,
+        "snapshot_id": built.snapshot_id,
+    })
+}
+
+async fn descriptor_get(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    // Reading the descriptor back never touches latest (spec 04 §2).
+    let body = json!({
+        "snapshot_id": snapshot_id,
+        "descriptor": descriptor_json(&ctx.built),
+        "lease_id": ctx.lease_id,
+        "lease_expires_at":
+            crate::ceres::snapshot::runtime::rfc3339(ctx.lease_expires_at_unix),
+    });
+    Ok(Json(body).into_response())
+}
+
+#[derive(Default, Deserialize, Debug)]
+#[serde(default, deny_unknown_fields)]
+struct RenewRequest {
+    lease_seconds: Option<u64>,
+}
+
+async fn lease_renew(
+    state: State<MonoApiServiceState>,
+    AxumPath(lease_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let req: RenewRequest = if body.is_empty() {
+        RenewRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                format!("malformed renew body: {e}"),
+            ))
+        })?
+    };
+    let renewed = runtime()
+        .renew_lease(&lease_id, req.lease_seconds.unwrap_or(600))
+        .map_err(mst2_error_response)?;
+    // Renewal never changes the version or authorization (spec 04 §4).
+    let body = json!({
+        "lease_id": renewed.lease_id,
+        "snapshot_id": renewed.snapshot_id,
+        "lease_expires_at":
+            crate::ceres::snapshot::runtime::rfc3339(renewed.expires_at_unix),
+    });
+    Ok(Json(body).into_response())
+}
+
+async fn lease_release(
+    state: State<MonoApiServiceState>,
+    AxumPath(lease_id): AxumPath<String>,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    // Idempotent: releasing an unknown/already-released lease still succeeds
+    // (spec 04 §2). This never deletes Git content.
+    let released = runtime().release_lease(&lease_id);
+    Ok(Json(json!({ "lease_id": lease_id, "released": released })).into_response())
 }
 
 #[derive(Deserialize, Debug)]
@@ -456,4 +577,399 @@ async fn directory(
         HeaderValue::from_static("private, no-cache, no-transform"),
     );
     Ok(resp)
+}
+
+#[derive(Deserialize, Debug)]
+struct BlobQuery {
+    path: String,
+    #[serde(default)]
+    expected_digest: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn blob(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    Query(q): Query<BlobQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    validate_scope_relative_path(&q.path).map_err(mst2_error_response)?;
+    if headers.contains_key("range") {
+        // Spec 04 section 9: raw blob has no Range semantics this profile.
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::RangeNotSupported,
+            "raw blob reads are whole-file; use chunks for ranges",
+        )));
+    }
+
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let root_tree = handler
+        .get_tree_by_hash(&ctx.root_tree_oid)
+        .await
+        .map_err(internal)?;
+    let abs_path = abs_view_path(&ctx.built.descriptor.scope, &q.path);
+
+    match resolve_abs(handler.as_ref(), &root_tree, &abs_path)
+        .await
+        .map_err(mst2_error_response)?
+    {
+        WalkOutcome::FoundFile {
+            fs_kind,
+            raw,
+            digest,
+            ..
+        } => {
+            if let Some(expected) = &q.expected_digest
+                && expected != &format!("sha256:{}", hex_of(&digest))
+            {
+                return Err(mst2_error_response(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "content does not match expected_digest",
+                )));
+            }
+            let fs_kind_str = match fs_kind {
+                crate::ceres::snapshot::resolver::FsKind::Regular => "regular",
+                crate::ceres::snapshot::resolver::FsKind::Executable => "executable",
+                crate::ceres::snapshot::resolver::FsKind::Symlink => "symlink",
+                crate::ceres::snapshot::resolver::FsKind::Directory => "directory",
+            };
+            Response::builder()
+                .header("etag", format!("\"sha256:{}\"", hex_of(&digest)))
+                .header("cache-control", "private, no-cache, no-transform")
+                .header("x-mega-fs-kind", fs_kind_str)
+                .body(axum::body::Body::from(Bytes::from(raw)))
+                .map_err(|e| {
+                    mst2_error_response(SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("body build failed: {e}"),
+                    ))
+                })
+        }
+        WalkOutcome::FoundDir => Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::NotDirectory,
+            "path is a directory",
+        ))),
+        WalkOutcome::Absent => Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::PathNotFound,
+            "path absent in the fixed view",
+        ))),
+        WalkOutcome::NotDirectory { symlink } => Err(mst2_error_response(SnapshotError::new(
+            if symlink {
+                SnapshotErrorCode::SymlinkTraversal
+            } else {
+                SnapshotErrorCode::NotDirectory
+            },
+            "intermediate component is not a directory",
+        ))),
+    }
+}
+
+/// Scope-relative request path -> absolute view path (spec 04 section 1).
+fn abs_view_path(scope: &str, path: &str) -> String {
+    if path == "/" {
+        scope.to_string()
+    } else {
+        format!("{}{}", scope.trim_end_matches('/'), path)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct LookupRequest {
+    paths: Vec<String>,
+    #[serde(default)]
+    include_ancestors: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn lookup(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    Json(req): Json<LookupRequest>,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    if req.paths.len() > 128 {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "at most 128 paths per lookup",
+        )));
+    }
+
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    let root_tree = handler
+        .get_tree_by_hash(&ctx.root_tree_oid)
+        .await
+        .map_err(internal)?;
+
+    let mut results = Vec::with_capacity(req.paths.len());
+    let mut deepest_dirs: Vec<String> = Vec::new();
+    for path in &req.paths {
+        validate_scope_relative_path(path).map_err(mst2_error_response)?;
+        let abs_path = abs_view_path(&ctx.built.descriptor.scope, path);
+        let mut entry = json!({"path": path});
+        match resolve_abs(handler.as_ref(), &root_tree, &abs_path)
+            .await
+            .map_err(mst2_error_response)?
+        {
+            WalkOutcome::FoundDir => {
+                let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
+                    .await
+                    .map_err(mst2_error_response)?;
+                entry["status"] = json!("found");
+                let mut node = json!({"fs_kind": "directory"});
+                node["directory_root"] = json!(format!("sha256:{}", hex_of(&built.page_id)));
+                node["node_class"] = json!("native_tree");
+                node["lifecycle"] = json!("mutable");
+                if path != "/"
+                    && let Some(name) = path.rsplit('/').next()
+                {
+                    node["name"] = json!(name);
+                }
+                entry["node"] = node;
+                deepest_dirs.push(abs_path);
+            }
+            WalkOutcome::FoundFile {
+                fs_kind,
+                size,
+                digest,
+                ..
+            } => {
+                entry["status"] = json!("found");
+                let mut node = json!({"fs_kind": fs_kind.as_str()});
+                if let Some(name) = path.rsplit('/').next() {
+                    node["name"] = json!(name);
+                }
+                node["size"] = json!(size.to_string());
+                node["content_digest"] = json!(format!("sha256:{}", hex_of(&digest)));
+                entry["node"] = node;
+            }
+            WalkOutcome::Absent => {
+                entry["status"] = json!("absent");
+            }
+            WalkOutcome::NotDirectory { symlink } => {
+                entry["status"] = if symlink {
+                    json!("symlink_traversal")
+                } else {
+                    json!("not_directory")
+                };
+            }
+        }
+        results.push(entry);
+    }
+
+    // Shared proof pages along the deepest found directories, deduped, with
+    // the 1 MiB response budget of spec 04 sections 5/7.
+    let mut proof_pages_out = Vec::new();
+    let mut budget: usize = 1_048_576;
+    let mut seen_pages: Vec<[u8; 32]> = Vec::new();
+    deepest_dirs.sort();
+    deepest_dirs.dedup();
+    'dirs: for dir in deepest_dirs.iter().rev() {
+        let proofs = proof_pages(handler.as_ref(), &root_tree, dir)
+            .await
+            .map_err(mst2_error_response)?;
+        for (_, pid, bytes) in proofs.into_iter().rev() {
+            if seen_pages.contains(&pid) {
+                continue;
+            }
+            if bytes.len() > budget {
+                break 'dirs;
+            }
+            budget -= bytes.len();
+            seen_pages.push(pid);
+            proof_pages_out.push(json!({
+                "digest": format!("sha256:{}", hex_of(&pid)),
+                "data_base64": base64_of(&bytes),
+            }));
+        }
+    }
+
+    let body = json!({
+        "snapshot_id": snapshot_id,
+        "results": results,
+        "proof_pages": proof_pages_out,
+    });
+    Ok(Json(body).into_response())
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct MetadataPagesRequest {
+    items: Vec<MetadataPageItem>,
+    #[serde(default)]
+    encoding: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct MetadataPageItem {
+    /// Scope-relative directory path ("/" = the scope itself).
+    directory_path: String,
+    /// Branch-child labels from that directory's MTP2 root (spec 04 §8).
+    #[serde(default)]
+    route: Vec<u8>,
+    /// Digest of the page the route must reach.
+    #[serde(default)]
+    expected_digest: Option<String>,
+}
+
+/// POST `/{snapshot_id}/metadata/pages` — batch raw MTP2 pages (spec 04 §8).
+///
+/// Returns the exact unique page set as a META TreeFrame stream. Routes are
+/// walked inside the canonical tree built from the fixed view, so a returned
+/// page is byte-identical to the one its parent commits to; a page the view
+/// does not contain is a proven-absence 404, never an empty page or a
+/// digest-only shortcut past the scope check.
+#[allow(clippy::too_many_lines)]
+async fn metadata_pages(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    let req: MetadataPagesRequest = serde_json::from_slice(&body).map_err(|e| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            format!("malformed request body: {e}"),
+        ))
+    })?;
+    if req.items.is_empty() || req.items.len() > 64 {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ScopeInvalid,
+            "items must hold 1..64 entries",
+        )));
+    }
+    for item in &req.items {
+        validate_scope_relative_path(&item.directory_path).map_err(mst2_error_response)?;
+    }
+
+    let handler = state
+        .api_handler(std::path::Path::new("/"))
+        .await
+        .map_err(internal)?;
+    let root_tree = handler
+        .get_tree_by_hash(&ctx.root_tree_oid)
+        .await
+        .map_err(internal)?;
+    let scope = &ctx.built.descriptor.scope;
+
+    // Unique pages across all items, in first-seen order.
+    let mut unique: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut seen: Vec<[u8; 32]> = Vec::new();
+    let mut logical_bytes: u64 = 0;
+    for item in &req.items {
+        let abs_path = abs_view_path(scope, &item.directory_path);
+        let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
+            .await
+            .map_err(mst2_error_response)?;
+        let pages =
+            mst2_codec::metapage::Page::pages_along_route(&built.codec_entries, &item.route)
+                .map_err(|e| match e {
+                    // A label the fixed view does not have is proven absence.
+                    mst2_codec::CodecError::BadOrdering(m) => SnapshotError::new(
+                        SnapshotErrorCode::PathNotFound,
+                        format!("{}: route does not resolve ({m})", item.directory_path),
+                    ),
+                    other => SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("{}: route walk failed ({other})", item.directory_path),
+                    ),
+                })?;
+        let last = pages
+            .last()
+            .expect("pages_along_route returns at least the root page");
+        let last_id = mst2_codec::metapage::page_id(last);
+        if let Some(expected) = &item.expected_digest
+            && expected != &format!("sha256:{}", hex_of(&last_id))
+        {
+            return Err(mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!(
+                    "{}: route does not reach expected_digest",
+                    item.directory_path
+                ),
+            )));
+        }
+        for page in pages {
+            let id = mst2_codec::metapage::page_id(&page);
+            if !seen.contains(&id) {
+                logical_bytes += page.len() as u64;
+                seen.push(id);
+                unique.push((id, page));
+            }
+        }
+    }
+
+    // Frames hold at most 64 pages and at most 1 MiB of raw payload (spec 06),
+    // so a wide route set becomes several META frames rather than one
+    // oversized one. Encoding (identity/zstd) is negotiated per request.
+    let encoding = req
+        .encoding
+        .as_deref()
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .transpose()
+        .map_err(mst2_error_response)?
+        .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
+    use crate::ceres::snapshot::frame_stream::FrameStream;
+    let mut stream = FrameStream::new(1, encoding);
+    let mut out: Vec<u8> = Vec::new();
+    let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut frame_raw: usize = 0;
+    let mut flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
+                     raw: &mut usize,
+                     out: &mut Vec<u8>|
+     -> Result<(), SnapshotError> {
+        if frame.is_empty() {
+            return Ok(());
+        }
+        let bytes = stream.meta(std::mem::take(frame))?;
+        out.extend_from_slice(&bytes);
+        *raw = 0;
+        Ok(())
+    };
+    for (id, page) in unique {
+        // Per-page raw cost: 32-byte page_id + 4-byte length + bytes.
+        if !frame.is_empty()
+            && (frame.len() >= mst2_codec::treeframe::META_MAX_PAGES
+                || frame_raw + 36 + page.len() > mst2_codec::treeframe::META_MAX_RAW)
+        {
+            flush(&mut frame, &mut frame_raw, &mut out).map_err(mst2_error_response)?;
+        }
+        frame_raw += 36 + page.len();
+        frame.push((id, page));
+    }
+    flush(&mut frame, &mut frame_raw, &mut out).map_err(mst2_error_response)?;
+
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, &body);
+    let request_body_sha256: [u8; 32] = sha2::Digest::finalize(hasher).into();
+    let end = stream.end(
+        req.items.len() as u32,
+        u32::try_from(seen.len()).unwrap_or(u32::MAX),
+        logical_bytes,
+        request_body_sha256,
+    );
+    out.extend_from_slice(&end);
+
+    Response::builder()
+        .header("content-type", "application/octet-stream")
+        .header("cache-control", "private, no-cache, no-transform")
+        .body(axum::body::Body::from(Bytes::from(out)))
+        .map_err(|e| mst2_error_response(internal(format!("body build failed: {e}"))))
 }

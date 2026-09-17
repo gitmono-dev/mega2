@@ -1,0 +1,47 @@
+# mega2 with the MST/2 snapshot surface (local e2e build).
+#
+# The compose override layers this on top of the repository's own stack; the
+# build context is the monoengine checkout and the shared codec arrives as a
+# named build context (`mst2codec`), matching the `mst2-codec` path dependency.
+FROM rust:1.97-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        git \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/monoengine
+COPY . /src/monoengine
+COPY --from=mst2codec ./ /src/mst2-codec/
+
+ARG TARGETARCH
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=monoengine-it-cargo-registry-${TARGETARCH},sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=monoengine-it-cargo-git-${TARGETARCH},sharing=locked \
+    --mount=type=cache,target=/src/monoengine/target,id=monoengine-it-target-${TARGETARCH},sharing=locked \
+    cargo build --release -p mega2 \
+    && install -D -m0755 /src/monoengine/target/release/mega2 /out/mega2
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/mega2 /usr/local/bin/mega2
+COPY config/config.toml /etc/mega2/config.toml
+
+ENV MEGA_BASE_DIR=/var/lib/mega2 \
+    MEGA_CONFIG=/etc/mega2/config.toml
+
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/mega2"]
+CMD ["--config", "/etc/mega2/config.toml", "service", "http", "--host", "0.0.0.0", "-p", "8000"]
