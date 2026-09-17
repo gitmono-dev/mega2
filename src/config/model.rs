@@ -849,6 +849,11 @@ pub struct Mst2Config {
     /// Required when `enabled`; must parse as a UUID.
     #[serde(default)]
     pub instance_uuid: Option<String>,
+    /// Master switch for the T05 atomic-publication coordinator
+    /// (prepare→publish/outbox). Default off; see spec 09 §9. When off,
+    /// the surface stays in its provisional per-tip sequence mode.
+    #[serde(default)]
+    pub publication_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
