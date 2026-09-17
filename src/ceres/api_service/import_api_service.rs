@@ -25,7 +25,7 @@ use crate::{
         model::{
             git::{
                 CreateEntryInfo, CreateEntryResult, DeleteEntryInfo, DeleteEntryResult,
-                EditFilePayload, EditFileResult,
+                EditFilePayload, EditFileResult, MoveEntryInfo, MoveEntryResult,
             },
             tag::TagInfo,
         },
@@ -73,6 +73,18 @@ impl ApiHandler for ImportApiService {
     ) -> Result<DeleteEntryResult, GitError> {
         Err(GitError::CustomError(
             "[code:409] import dir does not support delete entry".to_string(),
+        ))
+    }
+
+    /// Same refusal for moves whose source lives under an ImportRepo; the
+    /// monorepo handler refuses destinations under one on its own.
+    async fn move_monorepo_entry(
+        &self,
+        _: MoveEntryInfo,
+        _: Option<String>,
+    ) -> Result<MoveEntryResult, GitError> {
+        Err(GitError::CustomError(
+            "[code:409] import dir does not support move entry".to_string(),
         ))
     }
 

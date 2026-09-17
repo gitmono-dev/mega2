@@ -16,7 +16,8 @@ use crate::{
         git::{
             BlobContentQuery, CodePreviewQuery, CreateEntryInfo, CreateEntryResult,
             DeleteEntryInfo, DeleteEntryResult, DiffPreviewPayload, EditFilePayload,
-            EditFileResult, FileTreeItem, TreeCommitItem, TreeHashItem, TreeResponse,
+            EditFileResult, FileTreeItem, MoveEntryInfo, MoveEntryResult, TreeCommitItem,
+            TreeHashItem, TreeResponse,
         },
     },
     common::errors::ApiError,
@@ -51,12 +52,13 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(preview_diff))
 }
 
-/// POST create-entry / delete-entry / edit/save used by review and trunk
-/// product API writes.
+/// POST create-entry / delete-entry / move-entry / edit/save used by review
+/// and trunk product API writes.
 pub fn write_routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(create_entry))
         .routes(routes!(delete_entry))
+        .routes(routes!(move_entry))
         .routes(routes!(save_edit))
 }
 
@@ -145,6 +147,33 @@ async fn delete_entry(
     let result = handler
         .delete_monorepo_entry(json.clone(), requester)
         .await?;
+
+    upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
+    Ok(Json(CommonResult::success(Some(result))))
+}
+
+/// Move or rename a directory (plan-20260917 LB-03): both parents must pass
+/// the trunk write gate before anything is read or written (ADR-LB-04).
+#[utoipa::path(
+    post,
+    path = "/move-entry",
+    request_body = MoveEntryInfo,
+    responses(
+        (status = 200, body = CommonResult<MoveEntryResult>, content_type = "application/json")
+    ),
+    tag = CODE_PREVIEW
+)]
+async fn move_entry(
+    state: State<MonoApiServiceState>,
+    headers: HeaderMap,
+    Json(json): Json<MoveEntryInfo>,
+) -> Result<Json<CommonResult<MoveEntryResult>>, ApiError> {
+    let requester = trunk_write_requester(&state, &headers, &json.from_path)?;
+    // The destination parent needs the same authorization; any failure
+    // rejects the whole request before the handler runs.
+    trunk_write_requester(&state, &headers, &json.to_path)?;
+    let handler = state.api_handler(json.from_path.as_ref()).await?;
+    let result = handler.move_monorepo_entry(json.clone(), requester).await?;
 
     upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
     Ok(Json(CommonResult::success(Some(result))))
@@ -603,4 +632,18 @@ async fn delete_entry_calls_trunk_write_requester() {
         panic!("uncovered path must be rejected");
     };
     assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+}
+
+/// LB-03 AC-1: `move-entry` is registered on `write_routers` (Review and
+/// trunk) and absent from the read-only preview surface.
+#[cfg(test)]
+#[test]
+fn move_entry_registered_on_write_routers() {
+    let paths = tests::path_list(write_routers());
+    assert!(paths.iter().any(|p| p.contains("move-entry")), "{paths:?}");
+    let readonly = tests::path_list(readonly_routers());
+    assert!(
+        readonly.iter().all(|p| !p.contains("move-entry")),
+        "{readonly:?}"
+    );
 }

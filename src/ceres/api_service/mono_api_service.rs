@@ -88,7 +88,8 @@ use crate::{
             change_list::{ClDiffFile, ClFilesChangedItemSchema, UpdateBranchStatusRes},
             git::{
                 CreateEntryInfo, CreateEntryResult, DeleteEntryInfo, DeleteEntryResult, EditCLMode,
-                EditFilePayload, EditFileResult, validate_entry_target,
+                EditFilePayload, EditFileResult, MoveEntryInfo, MoveEntryResult,
+                common_parent_path, join_entry_path, normalize_parent_path, validate_entry_target,
             },
             tag::TagInfo,
             third_party::{ThirdPartyClient, ThirdPartyRepoTrait},
@@ -134,7 +135,9 @@ use crate::{
             buck_storage::{session_status, upload_status},
             mono_storage::RefUpdateData,
         },
-        utils::converter::{FromMegaModel, IntoMegaModel, generate_git_keep_with_timestamp},
+        utils::converter::{
+            FromMegaModel, IntoMegaModel, generate_git_keep_with_timestamp, sort_git_tree_items,
+        },
     },
 };
 #[rustfmt::skip]
@@ -1290,25 +1293,13 @@ impl ApiHandler for MonoApiService {
         } else {
             entry_info.path.as_str()
         });
-        let mut update_chain = match self.search_tree_for_update(&parent).await {
-            Ok(chain) => chain,
-            Err(err) if PATH_NOT_EXIST_RE.is_match(&err.to_string()) => {
-                return Err(GitError::CustomError(format!(
-                    "[code:404] parent directory {} not found",
-                    parent.display()
-                )));
-            }
-            // A component that names a blob makes the walk load it as a tree
-            // (`get_tree_by_hash` → `tree not found: <hash>`): the parent
-            // path goes through a file, which is the caller's error.
-            Err(err) if err.to_string().contains("tree not found:") => {
-                return Err(GitError::CustomError(format!(
-                    "[code:400] parent path {} is not a directory",
-                    parent.display()
-                )));
-            }
-            Err(err) => return Err(err),
-        };
+        let mut update_chain = self
+            .load_parent_chain(
+                &parent,
+                |p| format!("[code:404] parent directory {} not found", p.display()),
+                |p| format!("[code:400] parent path {} is not a directory", p.display()),
+            )
+            .await?;
         let parent_tree = update_chain
             .pop()
             .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
@@ -1368,6 +1359,169 @@ impl ApiHandler for MonoApiService {
         Ok(DeleteEntryResult {
             commit_id: outcome.commit_id,
             path: entry_path,
+            cl_link: outcome.cl_link,
+        })
+    }
+
+    /// Move or rename a directory: the item leaves the source parent tree and
+    /// the same tree id is inserted under the destination parent, both chains
+    /// rolled up to the root in one commit (plan-20260917 ADR-LB-02/03). The
+    /// commit lands on the deepest directory containing both parents; a
+    /// source parent left empty keeps a `.gitkeep` like delete-entry.
+    async fn move_monorepo_entry(
+        &self,
+        entry_info: MoveEntryInfo,
+        requester: Option<String>,
+    ) -> Result<MoveEntryResult, GitError> {
+        for (path, name) in [
+            (&entry_info.from_path, &entry_info.from_name),
+            (&entry_info.to_path, &entry_info.to_name),
+        ] {
+            validate_entry_target(path, name)
+                .map_err(|reason| GitError::CustomError(format!("[code:400] {reason}")))?;
+        }
+        let src_parent = normalize_parent_path(&entry_info.from_path);
+        let dest_parent = normalize_parent_path(&entry_info.to_path);
+        let src_full = join_entry_path(&src_parent, &entry_info.from_name);
+        let dest_full = join_entry_path(&dest_parent, &entry_info.to_name);
+        if src_full == dest_full {
+            return Err(GitError::CustomError(format!(
+                "[code:400] source and destination are the same: {src_full}"
+            )));
+        }
+        if dest_parent == src_full || dest_parent.starts_with(&format!("{src_full}/")) {
+            return Err(GitError::CustomError(format!(
+                "[code:400] cannot move {src_full} into its own subtree {dest_parent}"
+            )));
+        }
+        // The router dispatches on the source path only; a destination under
+        // an ImportRepo must be refused here (ADR-LB-06).
+        let import_dir = self.storage.config().monorepo.import_dir.clone();
+        let dest_parent_path = PathBuf::from(&dest_parent);
+        if dest_parent_path.starts_with(&import_dir)
+            && dest_parent_path != import_dir
+            && self
+                .storage
+                .git_db_storage()
+                .find_git_repo_like_path(&dest_parent)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+                .is_some()
+        {
+            return Err(GitError::CustomError(
+                "[code:409] import dir does not support move entry".to_string(),
+            ));
+        }
+
+        let src_parent_path = PathBuf::from(&src_parent);
+        let mut src_chain = self
+            .load_parent_chain(
+                &src_parent_path,
+                |p| format!("[code:404] source parent {} not found", p.display()),
+                |p| {
+                    format!(
+                        "[code:400] source parent path {} is not a directory",
+                        p.display()
+                    )
+                },
+            )
+            .await?;
+        let src_tree = src_chain
+            .pop()
+            .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
+        let mut src_items = src_tree.tree_items.clone();
+        let index = match src_items
+            .iter()
+            .position(|item| item.name == entry_info.from_name && item.mode == TreeItemMode::Tree)
+        {
+            Some(index) => index,
+            None if src_items
+                .iter()
+                .any(|item| item.name == entry_info.from_name) =>
+            {
+                return Err(GitError::CustomError(format!(
+                    "[code:400] '{}' is not a directory",
+                    entry_info.from_name
+                )));
+            }
+            None => {
+                return Err(GitError::CustomError(format!(
+                    "[code:404] entry '{}' not found under {}",
+                    entry_info.from_name, src_parent
+                )));
+            }
+        };
+        let moved = src_items.remove(index);
+
+        let mut ancestors = vec![(src_parent_path.clone(), src_chain)];
+        let mut edits: Vec<(PathBuf, Vec<TreeItem>)> = Vec::new();
+        let mut blobs = Vec::new();
+        let mut dest_items = if src_parent == dest_parent {
+            // Rename: one parent tree carries both edits.
+            src_items
+        } else {
+            let mut dest_chain = self
+                .load_parent_chain(
+                    &dest_parent_path,
+                    |p| format!("[code:404] destination parent {} not found", p.display()),
+                    |p| {
+                        format!(
+                            "[code:400] destination parent path {} is not a directory",
+                            p.display()
+                        )
+                    },
+                )
+                .await?;
+            let dest_tree = dest_chain
+                .pop()
+                .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
+            ancestors.push((dest_parent_path.clone(), dest_chain));
+            if src_items.is_empty() {
+                let (keep, item) = gitkeep_placeholder();
+                src_items.push(item);
+                blobs.push(keep);
+            }
+            edits.push((src_parent_path.clone(), src_items));
+            dest_tree.tree_items.clone()
+        };
+        if dest_items
+            .iter()
+            .any(|item| item.name == entry_info.to_name)
+        {
+            return Err(GitError::CustomError(format!(
+                "[code:400] '{}' already exists under {}",
+                entry_info.to_name, dest_parent
+            )));
+        }
+        dest_items.push(TreeItem {
+            mode: TreeItemMode::Tree,
+            id: moved.id,
+            name: entry_info.to_name.clone(),
+        });
+        sort_git_tree_items(&mut dest_items);
+        edits.push((dest_parent_path, dest_items));
+
+        let update_result = Self::rewrite_parent_chains(ancestors, edits)?;
+        let landing = common_parent_path(&src_parent, &dest_parent);
+        let outcome = self
+            .commit_tree_update(
+                TreeCommitInput {
+                    update_result,
+                    save_trees: Vec::new(),
+                    blobs,
+                    repo_path: PathBuf::from(landing),
+                    commit_msg: entry_info.commit_msg(),
+                    author_username: entry_info.author_username.clone(),
+                    skip_build: entry_info.skip_build,
+                    mode: EditCLMode::TryReuse(None),
+                },
+                requester,
+            )
+            .await?;
+        Ok(MoveEntryResult {
+            commit_id: outcome.commit_id,
+            from_path: src_full,
+            to_path: dest_full,
             cl_link: outcome.cl_link,
         })
     }
@@ -1702,8 +1856,121 @@ impl ApiHandler for MonoApiService {
 }
 
 impl MonoApiService {
-    /// Shared tail of the directory-change writes (create / delete): build
-    /// one commit over the rewritten trees, persist the new objects, then
+    /// `search_tree_for_update` with the ADR-LB-03 error mapping: a missing
+    /// component is the caller's 404, a component that names a blob (the walk
+    /// then fails to load it as a tree: `tree not found: <hash>`) is the
+    /// caller's 400; anything else propagates unchanged.
+    async fn load_parent_chain(
+        &self,
+        parent: &Path,
+        missing: impl Fn(&Path) -> String,
+        not_a_directory: impl Fn(&Path) -> String,
+    ) -> Result<Vec<Arc<Tree>>, GitError> {
+        match self.search_tree_for_update(parent).await {
+            Ok(chain) => Ok(chain),
+            Err(err) if PATH_NOT_EXIST_RE.is_match(&err.to_string()) => {
+                Err(GitError::CustomError(missing(parent)))
+            }
+            Err(err) if err.to_string().contains("tree not found:") => {
+                Err(GitError::CustomError(not_a_directory(parent)))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Rebuild edited parent trees and roll the new ids up every chain to the
+    /// root (plan-20260917 LB-03). `ancestors` maps each edited parent path
+    /// to its ancestor trees root-first (what `search_tree_for_update`
+    /// returns minus the parent itself); `edits` are the new item lists of
+    /// the edited parents. Paths are rebuilt deepest-first and each new id is
+    /// written into the parent's item list before that parent is rebuilt, so
+    /// a rename (one parent), sibling parents and ancestor/descendant parents
+    /// all converge on a single new root.
+    fn rewrite_parent_chains(
+        ancestors: Vec<(PathBuf, Vec<Arc<Tree>>)>,
+        edits: Vec<(PathBuf, Vec<TreeItem>)>,
+    ) -> Result<TreeUpdateResult, GitError> {
+        let mut known: HashMap<PathBuf, Arc<Tree>> = HashMap::new();
+        for (parent, chain) in ancestors {
+            let mut prefixes: Vec<PathBuf> =
+                std::iter::successors(parent.parent().map(Path::to_path_buf), |p| {
+                    p.parent().map(Path::to_path_buf)
+                })
+                .collect();
+            prefixes.reverse();
+            if prefixes.len() != chain.len() {
+                return Err(GitError::CustomError(format!(
+                    "update chain for {} has {} trees for {} ancestor levels",
+                    parent.display(),
+                    chain.len(),
+                    prefixes.len()
+                )));
+            }
+            for (path, tree) in prefixes.into_iter().zip(chain) {
+                known.insert(path, tree);
+            }
+        }
+        let mut pending: HashMap<PathBuf, Vec<TreeItem>> = edits.into_iter().collect();
+        let mut updated_trees = Vec::new();
+        let mut ref_updates = Vec::new();
+        while let Some(path) = pending
+            .keys()
+            .max_by_key(|p| p.components().count())
+            .cloned()
+        {
+            let Some(items) = pending.remove(&path) else {
+                break;
+            };
+            let tree = Tree::from_tree_items(items)
+                .map_err(|_| GitError::CustomError("Invalid tree".to_string()))?;
+            let clean_path = MonoServiceLogic::clean_path_str(&path.to_string_lossy());
+            let ref_path = if clean_path == "/" || clean_path.starts_with('/') {
+                clean_path
+            } else {
+                format!("/{clean_path}")
+            };
+            ref_updates.push(RefUpdate {
+                path: ref_path,
+                tree_id: tree.id,
+            });
+            let Some(parent) = path.parent().map(Path::to_path_buf) else {
+                updated_trees.push(tree);
+                break;
+            };
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| GitError::CustomError("Invalid path".into()))?
+                .to_owned();
+            let mut parent_items = match pending.remove(&parent) {
+                Some(items) => items,
+                None => known
+                    .get(&parent)
+                    .ok_or_else(|| {
+                        GitError::CustomError(format!(
+                            "parent tree of {} was not loaded",
+                            path.display()
+                        ))
+                    })?
+                    .tree_items
+                    .clone(),
+            };
+            let slot = parent_items
+                .iter_mut()
+                .find(|item| item.name == name)
+                .ok_or_else(|| GitError::CustomError(format!("Tree item '{name}' not found")))?;
+            slot.id = tree.id;
+            pending.insert(parent, parent_items);
+            updated_trees.push(tree);
+        }
+        Ok(TreeUpdateResult {
+            updated_trees,
+            ref_updates,
+        })
+    }
+
+    /// Shared tail of the directory-change writes (create / delete / move):
+    /// build one commit over the rewritten trees, persist the new objects, then
     /// advance the tip — `land_api_tip_push` under `push_policy=trunk`, the
     /// existing CL branch otherwise (ADR-LB-02 / ADR-LB-06). One
     /// implementation for every entry write (GC-02).
