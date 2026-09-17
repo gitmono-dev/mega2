@@ -6,7 +6,7 @@
 
 ## 状态标记
 
-每条路由标注实现状态。**本页是 LB-01 的产物，不含任何代码改动**，因此除两条既有路由外，其余路由此刻对 storage-only 都是 `specified-unimplemented`——本页描述的是落地后的契约，不是今日行为。
+每条路由标注实现状态。本页由 LB-01 创建（当时不含任何代码改动）；此后每张实现卡在落地时把自己的路由翻为 `implemented`，其余路由仍是 `specified-unimplemented`——那些小节描述的是落地后的契约，不是今日行为。
 
 | 状态 | 含义 |
 |---|---|
@@ -17,8 +17,8 @@
 |---|---|---|---|
 | `GET /api/v1/tree` | `implemented` | — | 可用 |
 | `POST /api/v1/create-entry` | `implemented` | — | 可用 |
-| `POST /api/v1/delete-entry` | `specified-unimplemented` | LB-02 | 程式不存在 |
-| `POST /api/v1/move-entry` | `specified-unimplemented` | LB-03 | 程式不存在 |
+| `POST /api/v1/delete-entry` | `implemented` | LB-02 | 可用：`write_routers` 已登记（Review 与 trunk 都有） |
+| `POST /api/v1/move-entry` | `implemented` | LB-03 | 可用：`write_routers` 已登记（Review 与 trunk 都有） |
 | `POST /api/v1/tags` | `specified-unimplemented` | LB-04 | handler 已存在但只挂在 Review；storage-only **404**。且**无任何鉴权**，见「鉴权」 |
 | `POST /api/v1/tags/list` | `specified-unimplemented` | LB-04 | 同上（读，无鉴权问题） |
 | `GET /api/v1/tags/{name}` | `specified-unimplemented` | LB-04 | 同上（读） |
@@ -79,7 +79,7 @@
 
 以下两表逐行复制自 ADR-LB-03，是 wire 的权威来源。
 
-### `POST /api/v1/delete-entry` — `specified-unimplemented`（LB-02）
+### `POST /api/v1/delete-entry` — `implemented`（LB-02）
 
 ```json
 {
@@ -103,7 +103,16 @@
 
 空目录与非空目录是**同一条**删除语义（删掉父 tree 中的该 item）；不提供「只删空目录」。
 
-### `POST /api/v1/move-entry` — `specified-unimplemented`（LB-03）
+落地事实（LB-02，`mono_api_service.rs` 的 `delete_monorepo_entry`）：
+
+- `path`/`name` 先过 `validate_entry_target`（`src/ceres/model/git.rs`）：`path` 须 rooted（空串等于 `/`，容忍一个尾随 `/`），组件不得为空、`.`、`..`；`name` 为单一组件，禁 `/`、`\`、`.`、`..`、NUL 与控制字符。不合规一律 **400**。
+- 父目录被删空时，服务端补写一个带时间戳的 `.gitkeep`，父目录保留为**空目录**——与 create-entry 表示新建空目录的方式一致；Git 无法在路径上表示空 tree，这是唯一能保住父目录的做法。
+- 同名的 blob 与 tree 可以并存（create-entry 的重名检查按 mode 区分），删除只匹配目录项；只有同名文件时报 400「不是目录」，都没有时报 404。
+- 一次删除 = 一次 commit（父链 tree 改写 + `.gitkeep` 可选 blob），trunk 经 `land_api_tip_push` 前进 tip，Review 走既有 CL 分支（`EditCLMode::TryReuse(None)`，与 create-entry 相同的政策分流）。
+- trunk 上父目录为 `/`（即删除顶层目录）时，B0 拒绝根 tip 经 MonoWriteQueue 前进，返回 **400**（`no non-root path tip under / for trunk API write`）；Review 形态则在 `/` 的 CL 上进行。
+- `commit_id` 在 trunk 上是落地后的 tip；`path` 只作回执。
+
+### `POST /api/v1/move-entry` — `implemented`（LB-03）
 
 ```json
 {
@@ -128,20 +137,41 @@
 | HTTP | **200** + `CommonResult`（不用 204） |
 | 成功 `data` | `{ "commit_id": "<hex>", "from_path": "/project/old-dir", "to_path": "/project/other/new-dir", "cl_link": null }`；**无** `new_oid`。返回路径只作回执。 |
 
+落地事实（LB-03，`mono_api_service.rs` 的 `move_monorepo_entry`）：
+
+- 两组 `path`/`name` 都先过 `validate_entry_target`（规则同 delete-entry）；父路径经 `normalize_parent_path` 归一（空串 = `/`，容忍一个尾随 `/`），改名 = 归一后 `from_path == to_path` 且名字不同。
+- 校验顺序：源目标相同 → 移进自己的子树（目标父 = 源目录或其后代）→ 目标父落在 ImportRepo 下（router 只按 `from_path` 分派，monorepo handler 自查 `git_repo` 后以 **409** 拒绝）→ 源父不存在 / 源不存在 / 源是文件 → 目标父不存在 → 目标名已存在（**任何 mode** 的同名项都算已存在）。全部检查在任何写入之前完成。
+- 改写 = 源父 tree 去掉该项、目标父 tree 插入**同一 tree oid**（改名只改 `TreeItem.name`），两条父链自底向上重算到根，一次 commit；目标父的项按 Git 顺序排序；源父被移空时补写带时间戳的 `.gitkeep`（同 delete-entry）。
+- 落地路径 = 两个父目录的最深公共目录：trunk 上经 `land_api_tip_push` 前进**覆盖该路径的最深非根 path tip**（`resolve_trunk_land_path`，AW-03：落地 `/project/a`（本身无 tip）时前进的是 `/project` 的 tip），因此**跨顶层目录**的移动（公共目录为 `/`）在 trunk 上因 B0 返回 **400**；Review 形态在该公共目录（或 `/`）的 CL 上进行，与 create/delete 相同的政策分流。
+- 鉴权：`from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败（401/403）即拒绝，此时尚未读任何 tree。
+
 ### 错误映射
 
 | 情况 | 今日实况 / 落地要求 |
 |---|---|
-| 目录重复名 | **今日 `create-entry` 返回 500** + `err_message:"Internal server error"`。`GitError::CustomError("Duplicate name")` 没有 `[code:]` 前缀（`mono_api_service.rs:1770`、`:1921`），落到 `ApiError::internal`（`common/errors/api.rs`），而 `IntoResponse` 对 5xx 一律改写为 `"Internal server error"`。**LB-02/03 的 delete/move 必须用 `[code:400]` 前缀返回可诊断 4xx**，不得复制这个缺陷 |
-| `is_directory=false` 缺 `content` | 同上，今日为 500（`"content is required for file creation"` 亦无 `[code:]` 前缀，`mono_api_service.rs:1688`） |
+| 目录重复名 | **今日 `create-entry` 返回 500** + `err_message:"Internal server error"`。`GitError::CustomError("Duplicate name")` 没有 `[code:]` 前缀（`mono_api_service.rs:2203`、`:2344`），落到 `ApiError::internal`（`common/errors/api.rs`），而 `IntoResponse` 对 5xx 一律改写为 `"Internal server error"`。**LB-02/03 的 delete/move 必须用 `[code:400]` 前缀返回可诊断 4xx**，不得复制这个缺陷 |
+| `is_directory=false` 缺 `content` | 同上，今日为 500（`"content is required for file creation"` 亦无 `[code:]` 前缀，`mono_api_service.rs:2121`） |
 | tag 名非法 | 今日已是 **400**（`tag_router.rs` 的 `validate_tag_name` → `ApiError::bad_request`） |
-| tag 已存在 | **400**（`"[code:400] Tag '{}' already exists"`，`mono_api_service.rs:1496`/`:1509`） |
+| tag 已存在 | **400**（`"[code:400] Tag '{}' already exists"`，`mono_api_service.rs:1677`/`:1690`） |
 | tag 不存在（**get**） | **404**；wire `err_message` = `Tag '<name>' not found`。由 router 直接构造（`tag_router.rs:288-291`），服务层 `get_tag` 只返回 `Ok(None)`，**不**产生 `[code:]` |
-| tag 不存在（**delete**） | **404**；服务层抛 `"[code:404] Tag not found"`（`mono_api_service.rs:1665`），wire `err_message` = `Tag not found`（前缀被剥掉，见下） |
-| 缺目录（delete/move 的**落地要求**） | `404`（ADR-LB-03）。注意这**不是**今日行为：今日 `GET /tree` 对不存在的 path 返回 **200 + `tree_items: []`**（`search_tree_by_path` 取不到时返回 `Ok(None)`，`get_tree_info` 再把它映射成 `Ok(vec![])`——`tree_ops.rs:93`/`:98`/`:256`），而 `create-entry` 会**自动补建**缺失的父层级而不是 404 |
+| tag 不存在（**delete**） | **404**；服务层抛 `"[code:404] Tag not found"`（`mono_api_service.rs:1846`），wire `err_message` = `Tag not found`（前缀被剥掉，见下） |
+| delete-entry：目标是文件 | **400**，wire `err_message` = `'<name>' is not a directory`（服务端 `[code:400]` 前缀被剥掉） |
+| delete-entry：缺父目录 / 缺目标 | **404**，`parent directory <path> not found` / `entry '<name>' not found under <path>` |
+| delete-entry：父路径穿过一个文件 | **400**，`parent path <path> is not a directory` |
+| delete-entry：`path`/`name` 不合规（未 rooted、`.`/`..`/空组件、分隔符、控制字符） | **400**，`validate_entry_target` 的诊断原文 |
+| delete-entry：ImportRepo（`import_dir` 下） | **409**，`import dir does not support delete entry` |
+| move-entry：源目标相同 | **400**，`source and destination are the same: <path>` |
+| move-entry：目标名已存在（任何 mode） | **400**，`'<to_name>' already exists under <to_path>` |
+| move-entry：移进自己的子树 | **400**，`cannot move <src> into its own subtree <to_path>` |
+| move-entry：源是文件 | **400**，`'<from_name>' is not a directory` |
+| move-entry：`from_path`/`from_name`/`to_path`/`to_name` 不合规 | **400**，`validate_entry_target` 的诊断原文 |
+| move-entry：源父 / 目标父不存在；源不存在 | **404**，`source parent <path> not found` / `destination parent <path> not found` / `entry '<name>' not found under <path>` |
+| move-entry：源父 / 目标父路径穿过文件 | **400**，`source parent path <path> is not a directory` / `destination parent path <path> is not a directory` |
+| move-entry：源或目标在 ImportRepo 下 | **409**，`import dir does not support move entry` |
+| 缺目录（delete / move 均已按此落地） | `404`（ADR-LB-03）。注意这**不是** `GET /tree` / create-entry 的今日行为：今日 `GET /tree` 对不存在的 path 返回 **200 + `tree_items: []`**（`search_tree_by_path` 取不到时返回 `Ok(None)`，`get_tree_info` 再把它映射成 `Ok(vec![])`——`tree_ops.rs:93`/`:98`/`:256`），而 `create-entry` 会**自动补建**缺失的父层级而不是 404 |
 | 鉴权失败 | 见「鉴权」 |
 
-> `[code:NNN]` 前缀是本仓真正的 4xx 约定（`mono_api_service.rs:1055`/`:1496`/`:1509`/`:1665` 都在用）。缺前缀的 `CustomError` 会静默变成 500 并丢失原文。
+> `[code:NNN]` 前缀是本仓真正的 4xx 约定（`mono_api_service.rs:1097`/`:1677`/`:1690`/`:1846` 都在用）。缺前缀的 `CustomError` 会静默变成 500 并丢失原文。
 >
 > **该前缀只是服务端内部标记，不会出现在 wire 上。** `IntoResponse`（`common/errors/api.rs:85-89`）与 `map_ceres_error`（`:198-199`）都会在写入 `err_message` 前把它剥掉。所以上表引号里的服务端字面量与调用方实际收到的 `err_message` 不同：例如 tag 重名的 wire 值是 `Tag 'foo' already exists`，**不含** `[code:400]`。调用方**不要**按该前缀做字符串匹配。
 
@@ -174,14 +204,14 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 | 键 | 规则 |
 |---|---|
-| `pagination` | **必填**，`{ page: u64, per_page: u64 }`，两个子键也都必填。`page` 从 **1** 起（内部 `page.saturating_sub(1)`，故 `page:0` 等同 `page:1`）；`per_page` **必须 ≥ 1**：`per_page = 0` 会让 `mono_storage.rs:1792` 的 `.paginate(self.get_connection(), page.per_page)` 触发 sea-orm 的 `assert!(page_size != 0)`（`sea-orm-2.0.2/src/executor/paginator.rs:318`）而 **panic**；本仓**没有** `CatchPanicLayer`，调用方看到的是连接中断，既不是 4xx 也不是 5xx。`mono_api_service.rs:1583-1587` 里的 `0 → 20` 回退**只**作用于 lightweight ref 的补页（`:1588-1593`），在 DB 分页已经 panic 之后才会走到，救不了这个输入 |
+| `pagination` | **必填**，`{ page: u64, per_page: u64 }`，两个子键也都必填。`page` 从 **1** 起（内部 `page.saturating_sub(1)`，故 `page:0` 等同 `page:1`）；`per_page` **必须 ≥ 1**：`per_page = 0` 会让 `mono_storage.rs:1792` 的 `.paginate(self.get_connection(), page.per_page)` 触发 sea-orm 的 `assert!(page_size != 0)`（`sea-orm-2.0.2/src/executor/paginator.rs:318`）而 **panic**；本仓**没有** `CatchPanicLayer`，调用方看到的是连接中断，既不是 4xx 也不是 5xx。`mono_api_service.rs:1764-1768` 里的 `0 → 20` 回退**只**作用于 lightweight ref 的补页（`:1769-1774`），在 DB 分页已经 panic 之后才会走到，救不了这个输入 |
 | `additional` | **必填**，这里是 path context |
 
 两个键都**没有** `#[serde(default)]`（`src/contract/api/common.rs:52-56`），因此**都必须出现在 JSON 里**。server 把 `additional.trim().is_empty()` 视同 `/`（含纯空白），但调用方列 root 应显式送 `additional: "/"`。
 
 成功：**200** + `CommonResult<TagListResponse>`，其中 `TagListResponse = CommonPage<TagResponse>` = `{ "total": <u64>, "items": [ TagResponse… ] }`。
 
-> `total` = DB 里的注解 tag 总数 **加上**本次请求扫描到、且已扣除与本页 annotated 重名后的**全部** lightweight ref 数（`mono_api_service.rs:1582`）。注意该加数在 `.take(need)` **之前**就已算出（`:1588-1593`），所以其中可能包含**并未进入本页 `items`** 的 refs。因此 `total` **随页而变**，不是稳定的全局计数；分页请以 `items` 长度与 `per_page` 判断，不要把 `total` 当权威总量。
+> `total` = DB 里的注解 tag 总数 **加上**本次请求扫描到、且已扣除与本页 annotated 重名后的**全部** lightweight ref 数（`mono_api_service.rs:1763`）。注意该加数在 `.take(need)` **之前**就已算出（`:1769-1774`），所以其中可能包含**并未进入本页 `items`** 的 refs。因此 `total` **随页而变**，不是稳定的全局计数；分页请以 `items` 长度与 `per_page` 判断，不要把 `total` 当权威总量。
 
 ### `GET /api/v1/tags/{name}` / `DELETE /api/v1/tags/{name}` — get / delete — `specified-unimplemented`（LB-04）
 
@@ -192,13 +222,13 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 - get 成功：**200** + `CommonResult<TagResponse>`；tag 不存在 → **404**。
 - delete 成功：**200** + `CommonResult<DeleteTagResponse>`（`{ deleted_tag, message }`）；tag 不存在 → **404**。
 
-`TagResponse` 字段：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`。七个字段**全部是非 `Option` 的 `String`**（`ceres/model/tag.rs:37-52`），键始终存在；`created_at` 是**字符串**不是数值时间戳；lightweight tag 的 `tagger` 与 `message` 为**空串**（`mono_api_service.rs:1574-1575`）。
+`TagResponse` 字段：`name`、`tag_id`、`object_id`、`object_type`、`tagger`、`message`、`created_at`。七个字段**全部是非 `Option` 的 `String`**（`ceres/model/tag.rs:37-52`），键始终存在；`created_at` 是**字符串**不是数值时间戳；lightweight tag 的 `tagger` 与 `message` 为**空串**（`mono_api_service.rs:1755-1756`）。
 
 ## 鉴权
 
 目录变更写复用既有 `authorize_trunk_api_write`（`src/api/api_write_auth.rs`），与 LFS / create-entry 同一威胁模型。
 
-> **整节的形态前提：** 这道闸**仅**在 `push_policy=trunk`（含 storage-only）时生效。Review 形态下 `trunk_write_requester` 返回 `Ok(None)` 并**跳过**鉴权（`preview_router.rs:411-421`），走既有 CL 分支。
+> **整节的形态前提：** 这道闸**仅**在 `push_policy=trunk`（含 storage-only）时生效。Review 形态下 `trunk_write_requester` 返回 `Ok(None)` 并**跳过**鉴权（`preview_router.rs:470-480`），走既有 CL 分支。
 
 ### 不需要 Authorization
 
@@ -208,8 +238,9 @@ Git 客户端 push tag 仍然**禁止**（见 [`../monorepo.md`](../monorepo.md)
 
 | 路由 | 状态 |
 |---|---|
-| `POST /create-entry` | `implemented`——今日确实鉴权（`preview_router.rs:110-113` 取 `HeaderMap` 并调 `trunk_write_requester`） |
-| `POST /delete-entry` / `POST /move-entry` | `specified-unimplemented`（LB-02/03） |
+| `POST /create-entry` | `implemented`——今日确实鉴权（`preview_router.rs:114-117` 取 `HeaderMap` 并调 `trunk_write_requester`） |
+| `POST /delete-entry` | `implemented`（LB-02）——`delete_entry`（`preview_router.rs:138`）取 `HeaderMap` 并调 `trunk_write_requester(path = 父目录)`，鉴权先于任何存储访问 |
+| `POST /move-entry` | `implemented`（LB-03）——`move_entry`（`preview_router.rs:166`）对 `from_path` 与 `to_path` 各调一次 `trunk_write_requester`，任一失败即拒绝，先于任何存储访问 |
 | `POST /tags` / `DELETE /tags/{name}` | `specified-unimplemented`（LB-04） |
 
 > **今日状态（安全相关，务必读）：** `create_tag`（`tag_router.rs:153`）与 `delete_tag`（`tag_router.rs:305`）**都不接收 `HeaderMap`，也不调用任何 authorizer**——`tag_router.rs` 全文没有 `authorize_trunk_api_write`。因此今日 tag 写在 **Review 面上完全匿名**（cedar_guard 只覆盖 `/cl`，不覆盖 `/tags`），在 **storage-only 面上 404**。这正是计划里的 `GAP-LB-04`。下面描述的是 **LB-04 落地后**的契约，不是今日行为。
@@ -254,9 +285,9 @@ tag 写的鉴权 path 不是你操作的业务路径：
 | trunk / storage-only | `land_api_tip_push` | 必为 `null` |
 | Review | 既有 `find_or_create_cl_for_edit` CL 分支 | 可为非 null |
 
-`write_routers`（`preview_router.rs:55-59`）同时挂在 Review 与 trunk，但**今日只注册 `create-entry` 与 `edit/save`**；LB-02/03 把 delete/move 登记进同一函数之后，这两条新路径才会在两种形态下都可用。
+`write_routers`（`preview_router.rs:57-63`）同时挂在 Review 与 trunk；LB-02 / LB-03 已把 `delete-entry` 与 `move-entry` 登记进同一函数，因此两者在两种形态下都可用（storage-only OpenAPI 由 `server::http_server::tests::storage_only_openapi_*` 锁定）。
 
-`ImportRepo`（`import_dir` 下）对 delete/move 必须返回 **409**（计划门 `delete_entry_reject_import_repo_409`，`plan-20260917.md:493`；该门只规定状态码）。实现上**必须**带 `[code:409]` 前缀——这是推导出来的必要条件，不是计划原文：`GitError::CustomError` 只有带该前缀才会被 `common/errors/api.rs:175` 映射成 `StatusCode::CONFLICT`。**另有一个陷阱：** `map_ceres_error`（`common/errors/api.rs:194-208`）只识别 `400` 与 `404`，其余一律 `_ => ApiError::internal` → **500**，而它正是 `tag_router.rs` 的惯用写法。因此 delete/move 必须走裸 `?`（`From<E> for ApiError`，如 `preview_router.rs:117`）那条路径；若用 `map_ceres_error` 包装，即使带了 `[code:409]` 仍会落成 500 并使该门失败。今日 create-entry 的同类拒绝（`import_api_service.rs:53-61` 的 `CustomError("import dir does not support create entry")`）**没有**前缀，因而落成 500 + `"Internal server error"`——见「错误映射」，delete/move 不得复制该缺陷。其 Git 多分支与客户端 tag 语义不受本计划影响。
+`ImportRepo`（`import_dir` 下）对 delete/move 必须返回 **409**（计划门 `delete_entry_reject_import_repo_409`，见 plan-20260917 LB-02 卡「判据规范 — EX-LB-01」门 11；该门只规定状态码）。LB-02 的 `delete_monorepo_entry`（`import_api_service.rs`）返回 `[code:409] import dir does not support delete entry`，wire 上 `err_message` = `import dir does not support delete entry`；LB-03 的 move 同样：源在 ImportRepo 下由 `ImportApiService` 返回 `[code:409] import dir does not support move entry`，目标在 ImportRepo 下由 monorepo handler 自查 `git_repo` 后返回同一文本。实现上**必须**带 `[code:409]` 前缀——这是推导出来的必要条件，不是计划原文：`GitError::CustomError` 只有带该前缀才会被 `common/errors/api.rs:175` 映射成 `StatusCode::CONFLICT`。**另有一个陷阱：** `map_ceres_error`（`common/errors/api.rs:194-208`）只识别 `400` 与 `404`，其余一律 `_ => ApiError::internal` → **500**，而它正是 `tag_router.rs` 的惯用写法。因此 delete/move 必须走裸 `?`（`From<E> for ApiError`，如 `preview_router.rs:121`）那条路径；若用 `map_ceres_error` 包装，即使带了 `[code:409]` 仍会落成 500 并使该门失败。今日 create-entry 的同类拒绝（`import_api_service.rs:56-64` 的 `CustomError("import dir does not support create entry")`）**没有**前缀，因而落成 500 + `"Internal server error"`——见「错误映射」，delete/move 不得复制该缺陷。其 Git 多分支与客户端 tag 语义不受本计划影响。
 
 ## Git 可见性
 
