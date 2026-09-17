@@ -274,7 +274,7 @@ tag 写的鉴权 path 不是你操作的业务路径：
 - 对 **每一次** tag delete → **403**；
 - 对**省略**或显式 `path_context = "/"` 的 create → **403**。
 
-因此：**delete**（任何 tag）与 **root / 缺省 `path_context` 的 create** 必须持有能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）；**非根 `path_context` 的 create** 可以改用覆盖该 path 的 token（tag 落在该 path 下，见上）。Libra 只操作 root tags（get/delete 无 path 选择器），所以 Libra 的 tag 写实际上需要能覆盖 `/` 的 token。
+因此：**delete**（任何 tag）与 **root / 缺省 `path_context` 的 create** 必须持有能覆盖 `/` 的 token（`paths` 省略或为空 = whole repo）；**非根 `path_context` 的 create** 可以改用覆盖该 path 的 token（tag 落在该 path 下，见上）。Libra 的 get/delete 没有 path 选择器（handler 固定以 `/` 分发，服务层按 tag 名全局查找），其 tag 写走缺省 `path_context`，所以 Libra 实际上需要能覆盖 `/` 的 token。
 
 > 契约页不写真实凭据；示例一律用 `secret-ok` 一类占位。
 
