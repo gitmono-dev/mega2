@@ -43,13 +43,10 @@ ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
 envsubst = "0.2.1"
 futures = "0.3.34"
 git-internal = "0.9.0"
-# Shared MST/2 wire codec (specs 03/05/06/07); vendored path dep, see
-# Dockerfile additional context for image builds.
-# Local integration branch: keeps the sibling codec so the verified zstd and
-# MTP2 route-walk additions stay available. Upstream main consumes the crate as
-# a git dependency; switching to it requires those codec commits to land in
-# gitmono-dev/mst2-codec first (see mst2-impl/ISSUES.md ISS-10).
-mst2-codec = { path = "../mst2-codec", features = ["zstd"] }
+# Shared MST/2 wire codec (specs 03/05/06/07). `zstd` enables the optional
+# strict single-frame frame encoding (spec 06 §3); `rev` pins the commit that
+# carries it, so CI and image builds resolve the same bytes as the lab stack.
+mst2-codec = { git = "https://github.com/gitmono-dev/mst2-codec", rev = "354e23ac072590daff58ff27b687b8223ac8b209", features = ["zstd"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
