@@ -24,8 +24,7 @@ use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 const PUSH_TOKEN: &str = "oci-it-push-token";
@@ -45,7 +44,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_oci_{}_{}",
+            "mega2_oci_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -54,7 +53,7 @@ impl TestDatabase {
         with_runtime(async {
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
                 )
             });
             execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -167,7 +166,7 @@ struct ServiceProcess {
 
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         Self {
             child,
             reaped: false,
@@ -744,7 +743,7 @@ fn sanitize_output(bytes: &[u8]) -> String {
 }
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .current_dir(current_dir)
         .env_clear()

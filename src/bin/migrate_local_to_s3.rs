@@ -40,7 +40,7 @@
 //! Config path resolution order:
 //! 1. CLI: `--config <path>`
 //! 2. Environment: `ORBIT_CONFIG=<path>`
-//! 3. Environment: `MEGA_CONFIG=<path>` (compatibility with monoengine deployments)
+//! 3. Environment: `MEGA_CONFIG=<path>` (compatibility with mega2 deployments)
 //! 4. `config.toml` or `config/config.toml` in the current directory
 //!
 //! ## Usage
@@ -62,7 +62,7 @@ use std::{
 };
 
 use futures::{StreamExt, TryStreamExt};
-use monoengine_core::orbit_bin_api::{
+use mega2_core::orbit_bin_api::{
     IoOrbitError, ObjectStorageBackend, ObjectStorageConfig, OrbitResult, head_result_to_exists,
 };
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, local::LocalFileSystem};

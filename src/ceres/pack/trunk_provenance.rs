@@ -138,7 +138,7 @@ pub fn squash_message(
     let mut body = String::new();
     body.push_str(&format!("Squash {n} commits at {path}\n\n"));
     body.push_str(&format!(
-        "This commit was created by monoengine. The push carried {n} commits, which\n\
+        "This commit was created by mega2. The push carried {n} commits, which\n\
 were squashed into this single commit. The original commits are listed\n\
 below in topological order; their objects remain retrievable from the\n\
 object store via Mono-Squash-Range (omitted for creation pushes without\n\
@@ -347,7 +347,7 @@ mod tests {
                 msg.starts_with(&format!("Squash {n} commits at /project/foo\n")),
                 "intro paragraph required"
             );
-            assert!(msg.contains("This commit was created by monoengine"));
+            assert!(msg.contains("This commit was created by mega2"));
             assert!(msg.contains(&format!("Mono-Squash-Count: {n}")));
             assert!(!msg.contains("Mono-Commits"));
             for c in &topo {

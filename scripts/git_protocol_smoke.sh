@@ -3,24 +3,24 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Git protocol smoke matrix for a running monoengine service.
+Git protocol smoke matrix for a running mega2 service.
 
 Required environment:
-  MONOENGINE_HTTP_REPO_URL    Smart HTTP repo URL, e.g. http://127.0.0.1:9000/group/repo.git
+  MEGA2_HTTP_REPO_URL    Smart HTTP repo URL, e.g. http://127.0.0.1:9000/group/repo.git
 
 Optional environment:
-  MONOENGINE_SSH_REPO_URL     SSH repo URL, e.g. ssh://git@127.0.0.1:2222/group/repo.git
-  MONOENGINE_GIT_SMOKE_PUSH   Set to 1 to run opt-in HTTP/SSH CL push + tag-reject smoke
-  MONOENGINE_GIT_SMOKE_LFS    Set to 1 to run opt-in HTTP LFS push/clone smoke
-  MONOENGINE_GIT_SMOKE_WORKDIR  Existing directory for temporary clones
-  MONOENGINE_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones after the run
+  MEGA2_SSH_REPO_URL     SSH repo URL, e.g. ssh://git@127.0.0.1:2222/group/repo.git
+  MEGA2_GIT_SMOKE_PUSH   Set to 1 to run opt-in HTTP/SSH CL push + tag-reject smoke
+  MEGA2_GIT_SMOKE_LFS    Set to 1 to run opt-in HTTP LFS push/clone smoke
+  MEGA2_GIT_SMOKE_WORKDIR  Existing directory for temporary clones
+  MEGA2_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones after the run
 
 Examples:
-  MONOENGINE_HTTP_REPO_URL=http://127.0.0.1:9000/test/project.git \
+  MEGA2_HTTP_REPO_URL=http://127.0.0.1:9000/test/project.git \
     bash scripts/git_protocol_smoke.sh
 
-  MONOENGINE_HTTP_REPO_URL=http://127.0.0.1:9000/test/project.git \
-  MONOENGINE_SSH_REPO_URL=ssh://git@127.0.0.1:2222/test/project.git \
+  MEGA2_HTTP_REPO_URL=http://127.0.0.1:9000/test/project.git \
+  MEGA2_SSH_REPO_URL=ssh://git@127.0.0.1:2222/test/project.git \
     bash scripts/git_protocol_smoke.sh
 USAGE
 }
@@ -30,7 +30,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ -z "${MONOENGINE_HTTP_REPO_URL:-}" ]]; then
+if [[ -z "${MEGA2_HTTP_REPO_URL:-}" ]]; then
   usage >&2
   exit 2
 fi
@@ -40,13 +40,13 @@ command -v git >/dev/null 2>&1 || {
   exit 2
 }
 
-ROOT_DIR="${MONOENGINE_GIT_SMOKE_WORKDIR:-$(mktemp -d)}"
+ROOT_DIR="${MEGA2_GIT_SMOKE_WORKDIR:-$(mktemp -d)}"
 if [[ ! -d "$ROOT_DIR" ]]; then
   mkdir -p "$ROOT_DIR"
 fi
 
 cleanup() {
-  if [[ -z "${MONOENGINE_GIT_SMOKE_WORKDIR:-}" && "${MONOENGINE_GIT_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
+  if [[ -z "${MEGA2_GIT_SMOKE_WORKDIR:-}" && "${MEGA2_GIT_SMOKE_KEEP_WORKDIR:-}" != "1" ]]; then
     rm -rf "$ROOT_DIR"
   else
     echo "smoke workdir kept at: $ROOT_DIR"
@@ -75,7 +75,7 @@ git_case() {
 }
 
 lfs_http_url() {
-  local remote_url="${MONOENGINE_HTTP_REPO_URL%/}"
+  local remote_url="${MEGA2_HTTP_REPO_URL%/}"
   printf '%s/info/lfs\n' "$remote_url"
 }
 
@@ -123,7 +123,7 @@ push_branch_smoke() {
   local remote_url="$1"
   local label="$2"
   local src="$ROOT_DIR/push-$label-src"
-  local branch="monoengine-smoke-$(date +%s)-$$"
+  local branch="mega2-smoke-$(date +%s)-$$"
   local before_refs="$ROOT_DIR/push-$label-cl-before"
   local after_refs="$ROOT_DIR/push-$label-cl-after"
   local before_heads="$ROOT_DIR/push-$label-heads-before"
@@ -135,11 +135,11 @@ push_branch_smoke() {
   git_case ls-remote "$remote_url" "refs/heads/*" | awk '{print $2}' | sort >"$before_heads" || return
   git_case clone "$remote_url" "$src" >/dev/null || return
   git -C "$src" checkout -b "$branch" >/dev/null || return
-  git -C "$src" config user.name "Monoengine Smoke" || return
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
-  printf 'monoengine git smoke %s\n' "$branch" >"$src/smoke.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return
+  printf 'mega2 git smoke %s\n' "$branch" >"$src/smoke.txt"
   git -C "$src" add smoke.txt || return
-  git -C "$src" commit -m "monoengine git smoke" >/dev/null || return
+  git -C "$src" commit -m "mega2 git smoke" >/dev/null || return
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/$branch" || return
   git_case ls-remote "$remote_url" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
   git_case ls-remote "$remote_url" "refs/heads/*" | awk '{print $2}' | sort >"$after_heads" || return
@@ -169,15 +169,15 @@ reject_tag_push_smoke() {
   local remote_url="$1"
   local label="$2"
   local src="$ROOT_DIR/push-$label-tag-src"
-  local tag="monoengine-smoke-tag-$(date +%s)-$$"
+  local tag="mega2-smoke-tag-$(date +%s)-$$"
   local push_status=0
   rm -rf "$src"
   git_case clone "$remote_url" "$src" >/dev/null || return
-  git -C "$src" config user.name "Monoengine Smoke" || return
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
-  printf 'monoengine git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
+  git -C "$src" config user.name "Mega2 Smoke" || return
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return
+  printf 'mega2 git tag smoke %s\n' "$tag" >"$src/smoke-tag.txt"
   git -C "$src" add smoke-tag.txt || return
-  git -C "$src" commit -m "monoengine git tag smoke" >/dev/null || return
+  git -C "$src" commit -m "mega2 git tag smoke" >/dev/null || return
   git -C "$src" tag "$tag" || return
   set +e
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "refs/tags/$tag"
@@ -197,7 +197,7 @@ reject_tag_push_smoke() {
 lfs_smoke_http() {
   local src="$ROOT_DIR/lfs-src"
   local clone_dir="$ROOT_DIR/lfs-clone"
-  local branch="monoengine-smoke-lfs-$(date +%s)-$$"
+  local branch="mega2-smoke-lfs-$(date +%s)-$$"
   local before_refs="$ROOT_DIR/lfs-cl-before"
   local after_refs="$ROOT_DIR/lfs-cl-after"
   local delete_ref=""
@@ -205,24 +205,24 @@ lfs_smoke_http() {
   local cleanup_status=0
 
   git lfs version >/dev/null 2>&1 || {
-    echo "git-lfs is required for MONOENGINE_GIT_SMOKE_LFS=1" >&2
+    echo "git-lfs is required for MEGA2_GIT_SMOKE_LFS=1" >&2
     return 1
   }
 
   rm -rf "$src" "$clone_dir"
-  git_case ls-remote "$MONOENGINE_HTTP_REPO_URL" "refs/cl/*" | awk '{print $2}' | sort >"$before_refs" || return
-  git_case clone "$MONOENGINE_HTTP_REPO_URL" "$src" >/dev/null || return
+  git_case ls-remote "$MEGA2_HTTP_REPO_URL" "refs/cl/*" | awk '{print $2}' | sort >"$before_refs" || return
+  git_case clone "$MEGA2_HTTP_REPO_URL" "$src" >/dev/null || return
   git -C "$src" checkout -b "$branch" >/dev/null || return
-  git -C "$src" config user.name "Monoengine Smoke" || return
-  git -C "$src" config user.email "monoengine-smoke@example.invalid" || return
+  git -C "$src" config user.name "Mega2 Smoke" || return
+  git -C "$src" config user.email "mega2-smoke@example.invalid" || return
   git -C "$src" lfs install --local >/dev/null || return
   configure_lfs_http_remote "$src" || return
   git -C "$src" lfs track "*.bin" >/dev/null || return
-  printf 'monoengine git lfs smoke %s\n' "$branch" >"$src/smoke-lfs.bin"
+  printf 'mega2 git lfs smoke %s\n' "$branch" >"$src/smoke-lfs.bin"
   git -C "$src" add .gitattributes smoke-lfs.bin || return
-  git -C "$src" commit -m "monoengine git lfs smoke" >/dev/null || return
+  git -C "$src" commit -m "mega2 git lfs smoke" >/dev/null || return
   git_case -C "$src" -c pack.window=0 -c pack.depth=0 push origin "HEAD:refs/heads/$branch" || return
-  git_case ls-remote "$MONOENGINE_HTTP_REPO_URL" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
+  git_case ls-remote "$MEGA2_HTTP_REPO_URL" "refs/cl/*" | awk '{print $2}' | sort >"$after_refs" || return
   delete_ref="$(comm -13 "$before_refs" "$after_refs" | head -n1)"
   if [[ -z "$delete_ref" ]]; then
     echo "failed to find CL ref created by LFS branch push" >&2
@@ -231,7 +231,7 @@ lfs_smoke_http() {
 
   git_case init "$clone_dir" >/dev/null || rc=$?
   if [[ "$rc" -eq 0 ]]; then
-    git -C "$clone_dir" remote add origin "$MONOENGINE_HTTP_REPO_URL" || rc=$?
+    git -C "$clone_dir" remote add origin "$MEGA2_HTTP_REPO_URL" || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     git -C "$clone_dir" lfs install --local >/dev/null || rc=$?
@@ -266,38 +266,38 @@ lfs_smoke_http() {
   return "$rc"
 }
 
-run_case "HTTP ls-remote" git_case ls-remote "$MONOENGINE_HTTP_REPO_URL"
-run_case "HTTP clone" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
+run_case "HTTP ls-remote" git_case ls-remote "$MEGA2_HTTP_REPO_URL"
+run_case "HTTP clone" clone_case "$MEGA2_HTTP_REPO_URL" "$ROOT_DIR/http-clone"
 run_case "HTTP fetch" fetch_case "$ROOT_DIR/http-clone"
 run_case "HTTP protocol v2 fetch" fetch_case "$ROOT_DIR/http-clone" -c protocol.version=2
-run_case "HTTP shallow clone depth=1" clone_case "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-shallow" --depth=1
-run_case "HTTP protocol v2 ls-remote" git_case -c protocol.version=2 ls-remote "$MONOENGINE_HTTP_REPO_URL"
-run_case "HTTP protocol v2 blob:none clone" clone_protocol_v2_blobless "$MONOENGINE_HTTP_REPO_URL" "$ROOT_DIR/http-blobless" "$ROOT_DIR/http-blobless.stderr"
+run_case "HTTP shallow clone depth=1" clone_case "$MEGA2_HTTP_REPO_URL" "$ROOT_DIR/http-shallow" --depth=1
+run_case "HTTP protocol v2 ls-remote" git_case -c protocol.version=2 ls-remote "$MEGA2_HTTP_REPO_URL"
+run_case "HTTP protocol v2 blob:none clone" clone_protocol_v2_blobless "$MEGA2_HTTP_REPO_URL" "$ROOT_DIR/http-blobless" "$ROOT_DIR/http-blobless.stderr"
 
-if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
-  run_case "SSH ls-remote" git_case ls-remote "$MONOENGINE_SSH_REPO_URL"
-  run_case "SSH clone" clone_case "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-clone"
+if [[ -n "${MEGA2_SSH_REPO_URL:-}" ]]; then
+  run_case "SSH ls-remote" git_case ls-remote "$MEGA2_SSH_REPO_URL"
+  run_case "SSH clone" clone_case "$MEGA2_SSH_REPO_URL" "$ROOT_DIR/ssh-clone"
   run_case "SSH fetch" fetch_case "$ROOT_DIR/ssh-clone"
   run_case "SSH protocol v2 fetch" fetch_case "$ROOT_DIR/ssh-clone" -c protocol.version=2
-  run_case "SSH shallow clone depth=1" clone_case "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-shallow" --depth=1
-  run_case "SSH protocol v2 ls-remote" git_case -c protocol.version=2 ls-remote "$MONOENGINE_SSH_REPO_URL"
-  run_case "SSH protocol v2 blob:none clone" clone_protocol_v2_blobless "$MONOENGINE_SSH_REPO_URL" "$ROOT_DIR/ssh-blobless" "$ROOT_DIR/ssh-blobless.stderr"
+  run_case "SSH shallow clone depth=1" clone_case "$MEGA2_SSH_REPO_URL" "$ROOT_DIR/ssh-shallow" --depth=1
+  run_case "SSH protocol v2 ls-remote" git_case -c protocol.version=2 ls-remote "$MEGA2_SSH_REPO_URL"
+  run_case "SSH protocol v2 blob:none clone" clone_protocol_v2_blobless "$MEGA2_SSH_REPO_URL" "$ROOT_DIR/ssh-blobless" "$ROOT_DIR/ssh-blobless.stderr"
 fi
 
-if [[ "${MONOENGINE_GIT_SMOKE_PUSH:-}" == "1" ]]; then
-  run_case "HTTP push CL (no new public branch)" push_branch_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
-  run_case "HTTP reject Git-client tag push" reject_tag_push_smoke "$MONOENGINE_HTTP_REPO_URL" "http"
-  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
+if [[ "${MEGA2_GIT_SMOKE_PUSH:-}" == "1" ]]; then
+  run_case "HTTP push CL (no new public branch)" push_branch_smoke "$MEGA2_HTTP_REPO_URL" "http"
+  run_case "HTTP reject Git-client tag push" reject_tag_push_smoke "$MEGA2_HTTP_REPO_URL" "http"
+  if [[ "${MEGA2_GIT_SMOKE_LFS:-}" == "1" ]]; then
     run_case "HTTP LFS push and clone" lfs_smoke_http
   fi
-  if [[ -n "${MONOENGINE_SSH_REPO_URL:-}" ]]; then
-    run_case "SSH push CL (no new public branch)" push_branch_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
-    run_case "SSH reject Git-client tag push" reject_tag_push_smoke "$MONOENGINE_SSH_REPO_URL" "ssh"
+  if [[ -n "${MEGA2_SSH_REPO_URL:-}" ]]; then
+    run_case "SSH push CL (no new public branch)" push_branch_smoke "$MEGA2_SSH_REPO_URL" "ssh"
+    run_case "SSH reject Git-client tag push" reject_tag_push_smoke "$MEGA2_SSH_REPO_URL" "ssh"
   fi
 else
-  echo "SKIP: HTTP/SSH CL push + tag-reject (set MONOENGINE_GIT_SMOKE_PUSH=1 to enable)"
-  if [[ "${MONOENGINE_GIT_SMOKE_LFS:-}" == "1" ]]; then
-    echo "SKIP: HTTP LFS push/clone also requires MONOENGINE_GIT_SMOKE_PUSH=1"
+  echo "SKIP: HTTP/SSH CL push + tag-reject (set MEGA2_GIT_SMOKE_PUSH=1 to enable)"
+  if [[ "${MEGA2_GIT_SMOKE_LFS:-}" == "1" ]]; then
+    echo "SKIP: HTTP LFS push/clone also requires MEGA2_GIT_SMOKE_PUSH=1"
   fi
 fi
 

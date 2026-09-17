@@ -58,7 +58,7 @@ use crate::{
 };
 
 const DEFAULT_TEST_DATABASE_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+    "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 
 static TEST_SCHEMA_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -113,7 +113,7 @@ async fn create_test_database_url() -> String {
     assert_postgres_url(&admin_url);
 
     let schema = format!(
-        "monoengine_test_{}_{}",
+        "mega2_test_{}_{}",
         std::process::id(),
         TEST_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed)
     );

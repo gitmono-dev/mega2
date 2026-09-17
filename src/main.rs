@@ -1,9 +1,9 @@
-//! `monoengine` binary entry point (composition root).
+//! `mega2` binary entry point (composition root).
 //!
 //! Installs the global allocator and dispatches the CLI through [`parse`] on
-//! the `monoengine_core` library crate in this package.
+//! the `mega2_core` library crate in this package.
 
-use monoengine_core::parse;
+use mega2_core::parse;
 
 #[cfg(not(target_os = "windows"))]
 #[global_allocator]

@@ -5,10 +5,10 @@
 
 ## 为何保留 `website-*` 命名
 
-monoengine 侧配置键与集成测试契约已冻结为 `MEGA_OAUTH__WEBSITE_*` /
+mega2 侧配置键与集成测试契约已冻结为 `MEGA_OAUTH__WEBSITE_*` /
 `MEGA_NOTIFICATION__WEBSITE_*` 以及服务名 `website-next` / `website-db-init`
 （见 README 联调栈命名契约与 ADR-WA-07）。DEP-01 只改**构建上下文与镜像内容**，
-不改服务名 / 库名 `website` / 配置键，避免牵动 monoengine 测试与配置面。
+不改服务名 / 库名 `website` / 配置键，避免牵动 mega2 测试与配置面。
 
 ## 变更摘要
 

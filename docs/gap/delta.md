@@ -1,18 +1,18 @@
-# Delta / DeltaDB 对照分析：monoengine 的 forge 侧应对
+# Delta / DeltaDB 对照分析：mega2 的 forge 侧应对
 
-本文档以 Zed Industries 的 **Delta**（客户端 + DeltaDB 云同步中枢）为参照系，分析 monoengine 作为 **Git 托管服务引擎（forge）** 在 AI agent 协作时代应当补齐、坚守与拒绝的能力，并给出分组建议与实施顺序。
+本文档以 Zed Industries 的 **Delta**（客户端 + DeltaDB 云同步中枢）为参照系，分析 mega2 作为 **Git 托管服务引擎（forge）** 在 AI agent 协作时代应当补齐、坚守与拒绝的能力，并给出分组建议与实施顺序。
 
-> **关键依赖**：本文**不占用** `docs/plan/plan-long.md` 的 `PT-*` 编号空间，也不与 `docs/plan/plan-20260827.md` 的 `MC-*` 冲突；建议进入路线图必须按 `plan-long.md` §路线图维护 的规则重新立项（新候选须给出竞品 revision/path、monoengine 缺口、价值、风险、依赖与最小切入点）。与 `plan-20260827.md`（CL 多 commit push 放开）存在**写集相交与正确性前置**关系，见 §6.3；与 `plan-long.md` 的 `PT-03`（Git 协议兼容性与 LFS 收尾）、`PT-05`/`PT-06`/`PT-07`/`PT-08`（ceres/bus 事件总线与 Orion 三件套）存在合并评估关系，见 ME-B1 与 ME-A5。
+> **关键依赖**：本文**不占用** `docs/plan/plan-long.md` 的 `PT-*` 编号空间，也不与 `docs/plan/plan-20260827.md` 的 `MC-*` 冲突；建议进入路线图必须按 `plan-long.md` §路线图维护 的规则重新立项（新候选须给出竞品 revision/path、mega2 缺口、价值、风险、依赖与最小切入点）。与 `plan-20260827.md`（CL 多 commit push 放开）存在**写集相交与正确性前置**关系，见 §6.3；与 `plan-long.md` 的 `PT-03`（Git 协议兼容性与 LFS 收尾）、`PT-05`/`PT-06`/`PT-07`/`PT-08`（ceres/bus 事件总线与 Orion 三件套）存在合并评估关系，见 ME-B1 与 ME-A5。
 
 ## 事实校准（2026-08-27）
 
-**monoengine 侧（一手，逐条源码复核）**
+**mega2 侧（一手，逐条源码复核）**
 
 | 项 | 值 |
 |---|---|
 | checkout | `git HEAD = 0836675`（`fix(test): align LFS batch URLs with git-cli bridge networking`） |
 | 版本 | `Cargo.toml` version `0.3.5` |
-| 形态 | 单 package `monoengine`（lib `monoengine_core`），Rust 2024 |
+| 形态 | 单 package `mega2`（lib `mega2_core`），Rust 2024 |
 | 核对范围 | `src/ceres/`、`src/jupiter/`、`src/callisto/`、`src/api/`、`src/contract/`、`src/orbit*/`、`docs/plan/`、`docs/refactoring/`、`docs/manuel/` |
 
 **Delta 侧（二手转引 + 一手来源留档）**
@@ -47,15 +47,15 @@ Delta 闭源私测、DeltaDB 未开源，**本仓库内没有、也不可能有�
 
 这一点比 ADR-MC-01 描述的严重得多，且**它不在 plan-20260827 任何一张卡的写集里**（全文 grep `update_branch` / `apply_changes_as_single_commit` 零命中，已实测）。
 
-**③ monoengine 已有一套完整的、可审计的锚定评审子系统——但它的性质被普遍误述，能力也被高估。** 它不是「内容锚」，是「带校验的行号锚 + diff 偏移」；它相对 Delta 的真实优势比传闻窄得多，且其中一档恰恰是 Delta 更强。见 §2.5。
+**③ mega2 已有一套完整的、可审计的锚定评审子系统——但它的性质被普遍误述，能力也被高估。** 它不是「内容锚」，是「带校验的行号锚 + diff 偏移」；它相对 Delta 的真实优势比传闻窄得多，且其中一档恰恰是 Delta 更强。见 §2.5。
 
 ---
 
-## 1. 定位：monoengine 不是 Delta 的竞品，是 Delta 需求说明书的接收方
+## 1. 定位：mega2 不是 Delta 的竞品，是 Delta 需求说明书的接收方
 
 ### 1.1 形态对位
 
-Delta 是 **客户端 + 云后端**：一个 Rust 桌面应用（同一份代码编译到 WASM 跑网页版，`delta.md:43`）+ DeltaDB 同步中枢。monoengine 是**服务端 / forge**：Git wire 协议、CL 协作面、授权、构建触发、产物存储。两者在产品坐标上不重叠。
+Delta 是 **客户端 + 云后端**：一个 Rust 桌面应用（同一份代码编译到 WASM 跑网页版，`delta.md:43`）+ DeltaDB 同步中枢。mega2 是**服务端 / forge**：Git wire 协议、CL 协作面、授权、构建触发、产物存储。两者在产品坐标上不重叠。
 
 但 delta.md §2 的七条技术要点里有一条决定了关系性质：**Delta 与 git 严格互补**（`delta.md:57`）——「项目必须是 git 仓库」「Commits stay in git」「托管 checkout 有两个 remote：`origin`（原上游）与 `local`（指回用户本机仓库）」。**Delta 从设计上承认 forge 是最终事实源。** 它不想取代 origin，它想在 origin 之上加一层。
 
@@ -63,15 +63,15 @@ Delta 是 **客户端 + 云后端**：一个 Rust 桌面应用（同一份代码
 
 ### 1.2 三层存储对位
 
-事实列只保留 delta.md 原文（`delta.md:75`）与 monoengine 源码；产品特性推断一律移入判断列并标注。
+事实列只保留 delta.md 原文（`delta.md:75`）与 mega2 源码；产品特性推断一律移入判断列并标注。
 
-| DeltaDB 层（delta.md:75 原文） | monoengine 对位物 | 判断（含推断） |
+| DeltaDB 层（delta.md:75 原文） | mega2 对位物 | 判断（含推断） |
 |---|---|---|
-| **Git 对象（Cloudflare R2）** | **两层拆分**：blob 字节 → `src/orbit/` 可插拔对象存储，key 形如 `<ns>/aa/bb/cc/<oid[6..]>`（`src/orbit_api/object_storage.rs:28-46`，`ObjectNamespace::Git → "git"` `:119`；<6 字符的 key 不分片）；commit/tree/tag/ref → Postgres 结构化行（`mega_commit` / `mega_tree` / `mega_tag` / `mega_refs`；`mega_blob` 存的是 blob **元数据** `blob_id/name/size/pack_id/file_path/commit_id`，字节仍在 orbit） | **monoengine 更重也更强**。*（推断）* R2 侧对象图对 DeltaDB 而言大概率是不透明存储；monoengine 把图结构化进关系库——查询、授权、diff、blame 全部因此可行，代价是写放大（一次改 N 文件的 push ≥ N 次 PUT + N 次 SELECT + N 次 UPDATE）。**须注意**：`delta.md:69` 记录 Delta 有跨文件 diff 搜索、`:54` 记录代码↔会话双向跳转，说明其上层能力不弱，「不透明」只能作为存储形态的推断，不能推出能力结论 |
+| **Git 对象（Cloudflare R2）** | **两层拆分**：blob 字节 → `src/orbit/` 可插拔对象存储，key 形如 `<ns>/aa/bb/cc/<oid[6..]>`（`src/orbit_api/object_storage.rs:28-46`，`ObjectNamespace::Git → "git"` `:119`；<6 字符的 key 不分片）；commit/tree/tag/ref → Postgres 结构化行（`mega_commit` / `mega_tree` / `mega_tag` / `mega_refs`；`mega_blob` 存的是 blob **元数据** `blob_id/name/size/pack_id/file_path/commit_id`，字节仍在 orbit） | **mega2 更重也更强**。*（推断）* R2 侧对象图对 DeltaDB 而言大概率是不透明存储；mega2 把图结构化进关系库——查询、授权、diff、blame 全部因此可行，代价是写放大（一次改 N 文件的 push ≥ N 次 PUT + N 次 SELECT + N 次 UPDATE）。**须注意**：`delta.md:69` 记录 Delta 有跨文件 diff 搜索、`:54` 记录代码↔会话双向跳转，说明其上层能力不弱，「不透明」只能作为存储形态的推断，不能推出能力结论 |
 | **线程/未提交编辑的 delta（Durable Objects/SQLite）** | **无对位物** | 这是 Delta 的独有资产，也是它最大的合规负债。*（推断）* DO 的单实例模型天然给出强一致与订阅面，delta.md 未记录 |
-| **元数据（KV/D1）** | Postgres 单库，**65 个** callisto 实体（`ls src/callisto/*.rs` 去掉 `mod.rs`/`prelude.rs`/`sea_orm_active_enums.rs`）：CL、issue、评审线程、锚点、check、merge queue、webhook、bot、审计 | **monoengine 远比 Delta 丰富** |
+| **元数据（KV/D1）** | Postgres 单库，**65 个** callisto 实体（`ls src/callisto/*.rs` 去掉 `mod.rs`/`prelude.rs`/`sea_orm_active_enums.rs`）：CL、issue、评审线程、锚点、check、merge queue、webhook、bot、审计 | **mega2 远比 Delta 丰富** |
 
-**第一层和第三层 monoengine 都有且更强，唯一缺的是中间层。** 这不是巧合：git 从来没有「一个工作单元 + 挂在它上面的对话与未落盘编辑」这个容器，所以谁想做 agent 协作，谁就得自己发明一个。
+**第一层和第三层 mega2 都有且更强，唯一缺的是中间层。** 这不是巧合：git 从来没有「一个工作单元 + 挂在它上面的对话与未落盘编辑」这个容器，所以谁想做 agent 协作，谁就得自己发明一个。
 
 但**这里有一个必须切开的分界线**：Delta 的中间层同时承载「过程」（对话、评审、agent 活动）和「未提交编辑」（commit 前的试错）。这两者的性质完全不同：
 
@@ -80,19 +80,19 @@ Delta 是 **客户端 + 云后端**：一个 Rust 桌面应用（同一份代码
 
 Hacker News 对 Delta 批评最多的正是后者（`delta.md:104`：「commit 前的死胡同与半成品本属本地，Delta 默认全部序列化上云」），且 Delta 官方承认删除不完整（`delta.md:75`，"it does not yet remove already-synced copies from our servers"）。自建 forge 的核心卖点是数据主权，主动收集未提交编辑等于自毁卖点。
 
-> **设计原则（贯穿全文）：forge 只在 push 之后知情。** monoengine 要补的中间层是「push 之后、merge 之前」的过程记录，不是「编辑器里正在发生什么」。
+> **设计原则（贯穿全文）：forge 只在 push 之后知情。** mega2 要补的中间层是「push 之后、merge 之前」的过程记录，不是「编辑器里正在发生什么」。
 
 ### 1.3 真正的战略风险不是竞争，是脱媒
 
 Delta 的 DeltaDB **按 git remote URL 给仓库做键**（`delta.md:75`）——"Organization members working from the same remote use the same stored repository data"，即租户边界由 remote URL 隐式划定。拆开看这句话对 forge 意味着：
 
-1. **forge 的 remote URL 成了第三方数据库的 join key。** 同一个 monoengine 实例的成员，他们的 agent 会话、未提交编辑、worktree 历史会**自动汇聚**到 DeltaDB 的同一条记录上。
+1. **forge 的 remote URL 成了第三方数据库的 join key。** 同一个 mega2 实例的成员，他们的 agent 会话、未提交编辑、worktree 历史会**自动汇聚**到 DeltaDB 的同一条记录上。
 2. **隐式租户边界由 forge 定义，但由第三方执行。** forge 既不知情也不可否决。
 3. **forge 完全无可见性。** 无法枚举、无法审计、无法在员工离职时撤销、无法回答「我们的代码副本还有几份、在哪」。
 
 这条推论链不依赖单一引语，基线内另有三条独立佐证：`delta.md:57`（托管 checkout 带 `local` remote，agent 可把分支直推用户仓库，**含当前检出分支**）；`delta.md:69`（接受 = 纯 git，**评审与接受动作发生在 Delta 内，forge 只看到一次成品 push**）；`delta.md:71`（分享线程即授予其挂载仓库的 worktree 历史访问，仓库级非线程级，**官方文档明示此扩权**）。
 
-对私有部署的 monoengine 而言，这是一个**结构性的影子数据面**，且对用户无感——用户只是装了个好用的客户端。
+对私有部署的 mega2 而言，这是一个**结构性的影子数据面**，且对用户无感——用户只是装了个好用的客户端。
 
 **风险的终局形态是脱媒（disintermediation）：forge 退化成一个哑的 git origin，而 identity、权限、评审、执行、决策链全部搬到伴生层。** 本文所有建议围绕同一个问题组织：**哪些能力必须留在 forge，才能让 forge 不被架空。**
 
@@ -106,19 +106,19 @@ Delta 的 DeltaDB **按 git remote URL 给仓库做键**（`delta.md:75`）—�
 
 Nathan Sobo 的主张（`delta.md:47`）：*"Increasingly, the conversation that generates the code is becoming the true source of our software"*；*"Forcing every AI interaction through the commit-based workflow is like trying to have a conversation through a fax machine"*。核心是「对话才是真正的源」与「commit 工作流是错误的传输管道」。
 
-**monoengine 是这个批评的最大靶心**，因为 CL 是最大化聚合的形态：
+**mega2 是这个批评的最大靶心**，因为 CL 是最大化聚合的形态：
 
 - CL = `(from_hash → to_hash)` 聚合 diff（ADR-MC-02：「CL 语义不变。链式 push 后，CL 的 `from_hash` = 链 base 的 parent 基线、`to_hash` = 链 tip；评审者看到的永远是聚合 diff」）；
 - CL merge **永远**在 `refs/heads/main` 上生成一个**全新的单父 commit**（ADR-MC-01 Decision：「用户 push 的中间 commit 永远不上 main，仅保留在 `refs/cl/<link>` 供审计与 UI 展示」），消息硬编码 `"cl merge generated commit"`（`mono_api_service.rs:2536`），作者恒为 `mega <admin@mega.org>`（`git-internal 0.8.7` 的 `Commit::from_tree_id` 硬编码）；
 - 即便 MC-06 放开多 commit push，trunk 侧**零改动**（ADR-MC-01 Consequences：「trunk 线性历史与 commit 数量解耦；本计划 trunk 侧零改动」）。
 
-Delta 说「软件诞生于 commit 之间」，monoengine 说「trunk 上只留结论」。正面冲突。
+Delta 说「软件诞生于 commit 之间」，mega2 说「trunk 上只留结论」。正面冲突。
 
 ### 2.2 判断：CL 模型提供了正确的容器，但「trunk 只留结论」的设计取舍把决策链 100% 押在 CL 侧，而 CL 侧今天有三处断裂
 
 诚实的表述是三段：
 
-**① 容器成立。** Delta 发明 thread，是因为 git 没有「一个工作单元 + 挂在它上面的对话」这个容器。monoengine 已经有了，而且 `link` 已经是全仓通用的 join key（六处列名已逐一核对）：
+**① 容器成立。** Delta 发明 thread，是因为 git 没有「一个工作单元 + 挂在它上面的对话」这个容器。mega2 已经有了，而且 `link` 已经是全仓通用的 join key（六处列名已逐一核对）：
 
 | 表 | 列 | 挂什么 |
 |---|---|---|
@@ -131,13 +131,13 @@ Delta 说「软件诞生于 commit 之间」，monoengine 说「trunk 上只留�
 
 （`issue_cl_references` 也参与 CL 关联，但用的是通用 `source_id/target_id` + `reference_type`，不是 `link` 列，本表不列。）
 
-**Delta 的 thread ≈ monoengine 的 CL。** 缺的只有一件：一条 agent 会话记录，用同一个 `link` 挂上去。
+**Delta 的 thread ≈ mega2 的 CL。** 缺的只有一件：一条 agent 会话记录，用同一个 `link` 挂上去。
 
-**② 但「trunk 只留结论」是一个设计取舍，不是中立事实。** ADR-MC-01 的 Status 是 **`Accepted`（用户决策，2026-08-26）**，这是**已被采纳的设计取舍**，不是未接线的实现缺口。它把决策链的保全责任**全部**押在 CL 侧。按 Delta 的判准，monoengine 今天在 trunk 上保留的决策链**比一个普通 PR forge 还少**——PR 至少保留作者 commit，而前提 ② 的常态路径连作者 commit 都没有。「trunk 存结论 / CL 存过程」的两层分离在架构上确实比把过程与结论塞进同一个复制数据结构更清晰，但这个清晰度只有在 CL 侧真的存住了过程时才兑现。
+**② 但「trunk 只留结论」是一个设计取舍，不是中立事实。** ADR-MC-01 的 Status 是 **`Accepted`（用户决策，2026-08-26）**，这是**已被采纳的设计取舍**，不是未接线的实现缺口。它把决策链的保全责任**全部**押在 CL 侧。按 Delta 的判准，mega2 今天在 trunk 上保留的决策链**比一个普通 PR forge 还少**——PR 至少保留作者 commit，而前提 ② 的常态路径连作者 commit 都没有。「trunk 存结论 / CL 存过程」的两层分离在架构上确实比把过程与结论塞进同一个复制数据结构更清晰，但这个清晰度只有在 CL 侧真的存住了过程时才兑现。
 
 **③ 而 CL 侧今天有三处断裂。** 所以**风险既在设计（押注集中）也在实现（押注未兑现）**。这不削弱后面的行动项——ME-A1/A2/A3 全部照旧成立——只是把定性摆正。
 
-monoengine 确实把「commit 之间」的东西结构化存进了 DB（评审讨论、行级线程、checks、reviewer 决策），保真度比 git 原生高得多；Delta 只是把它做成了交互体验。这一点仍然成立。
+mega2 确实把「commit 之间」的东西结构化存进了 DB（评审讨论、行级线程、checks、reviewer 决策），保真度比 git 原生高得多；Delta 只是把它做成了交互体验。这一点仍然成立。
 
 ### 2.3 三处断裂（其中两处是计划未覆盖的新发现）
 
@@ -255,9 +255,9 @@ Update Branch（任一路径）→ 清单与新的 (from_hash, to_hash) 失配
 
 ### 2.5 锚定评审：一次必要的降调——三条成立、一条方向相反
 
-**本节是对原版的整段重写。** 原版把一句未见于基线的话（*"comments attach to snapshots and fall out of date"*）拟制为「Zed 反 PR 的具体技术论点」，再宣布这句话对 monoengine 不成立，从而得出全文头条结论——**靶子是自设的**。delta.md 记录的 Nathan Sobo 论点只有 `:47` 那两句，均不涉及评论过期。该引语已删除。
+**本节是对原版的整段重写。** 原版把一句未见于基线的话（*"comments attach to snapshots and fall out of date"*）拟制为「Zed 反 PR 的具体技术论点」，再宣布这句话对 mega2 不成立，从而得出全文头条结论——**靶子是自设的**。delta.md 记录的 Nathan Sobo 论点只有 `:47` 那两句，均不涉及评论过期。该引语已删除。
 
-同时，monoengine 的锚定机制被误述了。**准确表述是「带校验的行号锚 + diff 偏移，无内容检索兜底」，不是「内容锚」。**
+同时，mega2 的锚定机制被误述了。**准确表述是「带校验的行号锚 + diff 偏移，无内容检索兜底」，不是「内容锚」。**
 
 **三件套（表结构逐字核对）：**
 
@@ -278,22 +278,22 @@ Update Branch（任一路径）→ 清单与新的 (from_hash, to_hash) 失配
 
 **对照表（Delta 列逐条回到 delta.md 原文）：**
 
-| 轴 | Delta（delta.md 原文） | monoengine（源码） | 方向 |
+| 轴 | Delta（delta.md 原文） | mega2（源码） | 方向 |
 |---|---|---|---|
 | **评论锚定机制** | 「评论跟随其所指文本」，**机制未公开**（`:70`）；同一底座上的**引用**是「锚定到 delta 而非行号」的字符级永久链接，"survive any code transformation"（`:54`） | 绝对行号取下标 + 内容哈希 + 双侧上下文哈希校验（Tier 1）；unified diff hunk 推 offset（Tier 2）；无内容检索兜底（Tier 3 = TODO） | **原理上 Delta 更强**（见下方说明） |
-| **失败降级** | 无公开描述（`:70`） | 五态 + confidence | monoengine 有，但这是**失配的证据**，不是优势 |
-| **resolve 生命周期** | **无 resolve/reopen**（`:70` 明记） | `Open/Resolved` + `/code_review/{thread_id}/resolve` 与 `/code_review/{thread_id}/reopen`（`src/api/router/code_review_router.rs:25-26`，nest 前缀 `"/code_review"` `:19`） | **monoengine 胜，硬差异** |
-| **触发** | **未公开**（`:61`：文档未使用 "CRDT" 一词描述具体算法，该词仅出现于 Sequoia 公告；锚定机制、冲突收敛算法、存储增长均未公开） | 每次 receive-pack 的 post-push 管线末尾自动触发，范围 = 变更文件 ∩ 有线程文件 | monoengine 可核查 |
+| **失败降级** | 无公开描述（`:70`） | 五态 + confidence | mega2 有，但这是**失配的证据**，不是优势 |
+| **resolve 生命周期** | **无 resolve/reopen**（`:70` 明记） | `Open/Resolved` + `/code_review/{thread_id}/resolve` 与 `/code_review/{thread_id}/reopen`（`src/api/router/code_review_router.rs:25-26`，nest 前缀 `"/code_review"` `:19`） | **mega2 胜，硬差异** |
+| **触发** | **未公开**（`:61`：文档未使用 "CRDT" 一词描述具体算法，该词仅出现于 Sequoia 公告；锚定机制、冲突收敛算法、存储增长均未公开） | 每次 receive-pack 的 post-push 管线末尾自动触发，范围 = 变更文件 ∩ 有线程文件 | mega2 可核查 |
 
-> **关于「原理上 Delta 更强」的诚实限定**：delta.md 明确记录的身份锚（`:54`）是针对**引用/永久链接**说的；对**评论**，`:70` 逐字写的是「机制未公开」。因此「Delta 的评论也用 delta 身份锚」是从同一底座推出的**推断**，不是被记录的事实。但即便按最保守读法，也只能得出「未知」，得不出「monoengine 更强」。身份锚（锚到不可变的 delta）在原理上不会过期，因此**不需要**降级态；行号/偏移锚必然需要——五态与 confidence 正是失配的证据。把「对方不需要的东西」记成「对方缺的东西」是错的。
+> **关于「原理上 Delta 更强」的诚实限定**：delta.md 明确记录的身份锚（`:54`）是针对**引用/永久链接**说的；对**评论**，`:70` 逐字写的是「机制未公开」。因此「Delta 的评论也用 delta 身份锚」是从同一底座推出的**推断**，不是被记录的事实。但即便按最保守读法，也只能得出「未知」，得不出「mega2 更强」。身份锚（锚到不可变的 delta）在原理上不会过期，因此**不需要**降级态；行号/偏移锚必然需要——五态与 confidence 正是失配的证据。把「对方不需要的东西」记成「对方缺的东西」是错的。
 
 **结论收窄为三条（各自标明轴）：**
 
-1. **生命周期**：monoengine 有 `Open/Resolved` 两态 + **resolve 与 reopen 两个端点**，Delta 明确没有（`delta.md:70`）——**成立，且是硬差异**；
-2. **可审计性**：monoengine 的重锚算法在源码里、有置信度与显式失配态，Delta 的评论锚定机制未公开（`delta.md:70`）——**开放性优势，不等于效果优势**；
-3. **锚定原理**：Delta 的 delta 身份锚在原理上强于启发式重匹配；monoengine 的等价物是「补 Tier 3 + 把锚绑到稳定 ID」——**这是 ME-A4 的目标，不是既有胜势**。
+1. **生命周期**：mega2 有 `Open/Resolved` 两态 + **resolve 与 reopen 两个端点**，Delta 明确没有（`delta.md:70`）——**成立，且是硬差异**；
+2. **可审计性**：mega2 的重锚算法在源码里、有置信度与显式失配态，Delta 的评论锚定机制未公开（`delta.md:70`）——**开放性优势，不等于效果优势**；
+3. **锚定原理**：Delta 的 delta 身份锚在原理上强于启发式重匹配；mega2 的等价物是「补 Tier 3 + 把锚绑到稳定 ID」——**这是 ME-A4 的目标，不是既有胜势**。
 
-需要注意的是，delta.md 给 Libra 的建议 B2（锚定评论，`delta.md:30`）在 Libra 是「从零新建」，**在 monoengine 是「已建成、待补完」**——这仍然是两个仓库最大的能力差，只是「已建成」的含义要按上面三条读。
+需要注意的是，delta.md 给 Libra 的建议 B2（锚定评论，`delta.md:30`）在 Libra 是「从零新建」，**在 mega2 是「已建成、待补完」**——这仍然是两个仓库最大的能力差，只是「已建成」的含义要按上面三条读。
 
 要坐实第 1、2 条并向第 3 条推进，有四个洞必须先补（见 ME-A4）。
 
@@ -334,7 +334,7 @@ Update Branch（任一路径）→ 清单与新的 (from_hash, to_hash) 失配
 **复现步骤**：
 
 ```
-0. 起本地栈（compose：postgres + monoengine），准备两个用户 A / B
+0. 起本地栈（compose：postgres + mega2），准备两个用户 A / B
 1. A 对路径 P push 一个改动 F 的 commit C1 → 建 CL-A（from=M0, to=C1）
 2. A 再 push 一个把 F 改回原状的 commit C2 → CL-A 更新为 (from=M0, to=C2)
    ——此时 cl_files_list(blobs(M0), blobs(C2)) 为空，CL-A 是「空 diff CL」
@@ -458,7 +458,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 ### ME-A4 — 补完锚定评审的四个洞
 
-**结论**：monoengine 的锚定评审在「生命周期」与「可审计性」两条轴上真实领先（§2.5），但四个洞会让它在 agent 场景下失效；其中第 3 项同时是把锚定原理向 Delta 水平推进的唯一路径。
+**结论**：mega2 的锚定评审在「生命周期」与「可审计性」两条轴上真实领先（§2.5），但四个洞会让它在 agent 场景下失效；其中第 3 项同时是把锚定原理向 Delta 水平推进的唯一路径。
 
 **依据**：§2.5。
 
@@ -484,12 +484,12 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 **依据**：
 
 - PT-06（Orion Server 构建控制面）/ PT-07（构建执行 Agent）/ PT-08（Scheduler + QEMU VM 池）是 plan-long 里最大的整体缺口（`plan-long.md:117-119`），且**正好是一套完整的远程执行平面**：任务模型、调度、日志收集、产物管理、ws 控制通道、disk/repo 缓存管理——除 `buck_controller` 外全部通用。
-- PT-08 的 QEMU VM 池是**天然的 agent 沙箱**，而沙箱正是 §5 里 monoengine 唯一没有对位资产的一项。
+- PT-08 的 QEMU VM 池是**天然的 agent 沙箱**，而沙箱正是 §5 里 mega2 唯一没有对位资产的一项。
 - PT-06/07 目前卡在 PT-05（`ceres/bus` 通信形态决策；`plan-long.md:635` 明写「orion 三件套……实施前须先完成 PT-05 的通信形态决策」），而 PT-05 允许的结论之一是「明确不移植」。**这个决策现在有了第二个利益相关方。**
 
 **落点**：`docs/plan/plan-long.md` PT-05 的「最小可验证第一阶段」与 PT-06 的任务模型定义段落——加一行「已知消费者：构建触发（现）、agent 执行（潜在，见 ME-B\*）」。
 **必须规避的红线**：PT-05 的非目标写着「**不引入 Mega 未使用的通用事件框架**，只移植有真实消费者的事件面」（`plan-long.md:353`）。本条**不是**提议建通用事件总线，而是在既有决策里登记一个额外消费者，让接口形状留出余量。措辞必须精确，否则会被这条挡回。
-**风险**：近零（设计期一句话）。**不做的风险**：monoengine 把 Orion 建成构建专用，将来为 agent 再造一套平行的执行平面——**在同一个仓里犯两次同样的错**。
+**风险**：近零（设计期一句话）。**不做的风险**：mega2 把 Orion 建成构建专用，将来为 agent 再造一套平行的执行平面——**在同一个仓里犯两次同样的错**。
 
 **已删除的分句**：原版写「Delta 因为没有服务端底子，云 runner 必须从零建」——与基线冲突。`delta.md:58` 明写 agent 单点执行可在「发消息者的机器**或 Delta 云机**」，`delta.md:81` 的 "Remote runtime 云常驻执行（进行中）" 是把它做成**常驻**而非从零建，`delta.md:75` 还记录了完整的 Cloudflare 服务端栈。本条论证不依赖对 Delta 的贬低，删掉更稳。
 
@@ -499,9 +499,9 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 ### 4.0 为什么必须标注为「Mega 之外的新方向」
 
-`plan-long.md` 是**排他性的 Mega 移植文档**：标题即「Mega → monoengine 完全移植」；§路线图维护 明文规定「新候选移植项必须同时给出 **Mega revision/path**、monoengine 代码/测试缺口、价值、风险、依赖和最小可验证切入点」（`:787`）。一个 Mega 里不存在的能力在结构上无法满足 PT 候选的准入条件。硬塞 PT-13 会破坏该文档自己的定义。
+`plan-long.md` 是**排他性的 Mega 移植文档**：标题即「Mega → mega2 完全移植」；§路线图维护 明文规定「新候选移植项必须同时给出 **Mega revision/path**、mega2 代码/测试缺口、价值、风险、依赖和最小可验证切入点」（`:787`）。一个 Mega 里不存在的能力在结构上无法满足 PT 候选的准入条件。硬塞 PT-13 会破坏该文档自己的定义。
 
-但 monoengine 的自我定位是「移植**并扩展**」，且**已有成规模的非移植先例**：`plan-20260731`（chat/Notes 整栈删除 + 接入 monoui Better Auth）、`plan-20260820`（Vault 改 crates.io `libvault`，明确「不做 mega 的 `libvault-core` 迁移」）、`plan-20260824`（orbit 单体内联），以及**在途的 `plan-20260827` 自陈**：§与其它计划的关系 的 `plan-long.md` 行逐字写着「无直接对应 PT 项；本计划是 monoengine 自有的协议能力增强 | **不触碰**」，且其「兼容与文档收口」章写着「`plan-long.md`：N/A（无对应 PT/SB 项）」。
+但 mega2 的自我定位是「移植**并扩展**」，且**已有成规模的非移植先例**：`plan-20260731`（chat/Notes 整栈删除 + 接入 monoui Better Auth）、`plan-20260820`（Vault 改 crates.io `libvault`，明确「不做 mega 的 `libvault-core` 迁移」）、`plan-20260824`（orbit 单体内联），以及**在途的 `plan-20260827` 自陈**：§与其它计划的关系 的 `plan-long.md` 行逐字写着「无直接对应 PT 项；本计划是 mega2 自有的协议能力增强 | **不触碰**」，且其「兼容与文档收口」章写着「`plan-long.md`：N/A（无对应 PT/SB 项）」。
 
 **推荐落地形态**：走 `plan-20260827` 的先例——独立日期计划，在「与其它计划的关系」表里显式声明不申请 PT 编号、不触碰 plan-long。若确需长期登记，另开 `docs/plan/plan-long-ai.md` 用自有前缀（如 `AG-*`），并在 plan-long §不进入本长期移植计划 增一行指针。**不要修订 plan-long 的文档职责**——那份治理文档刚被多轮评审固化，改它会波及原则 3/4 与整张依赖图。
 
@@ -513,7 +513,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 **本条删去了全部 Delta 侧论据。** 原版把 Delta roadmap 的「仓库权限接入」读成「Delta 卡在 bot 主体建模上」——`delta.md:81` 只说该项「进行中」，**没有任何关于它为何未完成、卡在哪里的信息**，该读法是纯猜测；且它与 ME-B4 对同一条 roadmap 项的定性（Delta 想**消费** forge 已有的仓库权限）互斥。Delta 是**客户端**，`delta.md:71` 明示共享线程里「人人可 steer」「作者归属直达模型」——它的主体模型就是人，没有把 agent 当独立 principal 的需求。「Delta 想消费 forge 权限」的论据归 **ME-B4 独占**；「先做完的一方定义赛道」的叙事一并删除。
 
-以下依据全部是 monoengine 自证，已逐条实测：
+以下依据全部是 mega2 自证，已逐条实测：
 
 - `src/contract/policy/mega.cedarschema`（全文已读，`grep -c "Bot"` = **0**）只有 `entity UserGroup in [UserGroup]` 与 `entity User in [UserGroup]`，**没有 `entity Bot`**；四条 action 声明（`deleteRepo/viewRepo/forkRepo/pullRepo/pushRepo`、`createMergeRequest/editMergeRequest/deleteMergeRequest/approveMergeRequest`、`openIssue/assignIssue/deleteIssue/editIssue`、`addMaintainer/addAdmin`）的 `principal` **全部是 `[User]`**。`Bot::"<id>"` 不是那个类型。
 - 官方说明（`src/api/un27_bot_authz.rs:1-9`）："A full bot authorization model (schema plus identity mapping) is deferred."
@@ -540,8 +540,8 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 **落点**：`src/contract/policy/mega.cedarschema`、`src/contract/policy/resource.rs`、`src/contract/policy/guard/cedar_guard.rs`、`src/ceres/api_service/bot_ops.rs`、`src/api/router/bot_router.rs`。
 **关联（依据订正）**：与 PT-03 的「repo/path 级 push ACL」同域，**应合并评估**。**依据必须显式指向 `plan-long.md:275`（PT-03 §目标范围）与 `:289`（§完成判据），而非 `:114` 的表格行**——表格行声称该能力「已由 plan-20260812 交付」，与 plan-20260812 自己的非目标（`:28`：路径级 ACL「归 DEFER-UN-01 的后续设计」）直接冲突，按表格行读会被判为「已交付项不需要合并评估」。这处漂移已补进 ME-B6。
-**风险**：改 Cedar schema 是授权面的核心变更。**但落地路径现成**：`Enforcement::{Off, Shadow, Enforce}`（`src/contract/policy/enforcement.rs`）意味着可以先 shadow 观察 would-deny 再切 enforce。**这是 monoengine 已有的、Delta 完全没有的工程资产**（`delta.md:74` 记录 Delta 自认无权限系统）。
-**开工前必须确认的一件事**：生产实例当前跑在哪一档。`default_cedar_enforcement()` 返回 `"off"`（`src/config/model.rs:999-1001`），若生产是 `off` 或 `shadow`，那么**今天的 bot token 事实上不受 Cedar 约束**。在把 monoengine 宣传为「有权限系统的 agent forge」之前必须先核实，否则叙事会被一句话戳破。
+**风险**：改 Cedar schema 是授权面的核心变更。**但落地路径现成**：`Enforcement::{Off, Shadow, Enforce}`（`src/contract/policy/enforcement.rs`）意味着可以先 shadow 观察 would-deny 再切 enforce。**这是 mega2 已有的、Delta 完全没有的工程资产**（`delta.md:74` 记录 Delta 自认无权限系统）。
+**开工前必须确认的一件事**：生产实例当前跑在哪一档。`default_cedar_enforcement()` 返回 `"off"`（`src/config/model.rs:999-1001`），若生产是 `off` 或 `shadow`，那么**今天的 bot token 事实上不受 Cedar 约束**。在把 mega2 宣传为「有权限系统的 agent forge」之前必须先核实，否则叙事会被一句话戳破。
 
 ### ME-B2 — agent 会话归档面（挂 CL `link`，只读 / 幂等 / 脱敏）
 
@@ -551,7 +551,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 **关键区分**：**forge 不应该实现 ACP。** ACP 是「编辑器 ↔ agent」协议，两端都在用户机器上，forge 不是这条链路上的任何一端。forge 的对应物是**接收 ACP 会话的产物**：
 
 ```
-[Claude Code / Codex / Cursor] --ACP--> [本地客户端] --HTTPS--> [monoengine 摄取端点]
+[Claude Code / Codex / Cursor] --ACP--> [本地客户端] --HTTPS--> [mega2 摄取端点]
                                                                      ↓
                                                             挂到 CL 的 link 上
 ```
@@ -559,7 +559,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 **设计要点（每条都是硬约束）**：
 
 1. **只读归档语义**——摄取的是既成事实的记录，不是可 steer 的活会话；
-2. **必须过脱敏**（SB-02 纪律）。agent transcript 极易夹带密钥；Delta 在这点上明确是弱的（`delta.md:75`「仅匹配已知值，不扫描任意文件」，且 Background Mode 的 8 MiB 终端输出**先存原始字节**，`delta.md:68`）。monoengine 有 `src/config/redaction.rs` / `src/notification/redact.rs` 的既有纪律可复用；
+2. **必须过脱敏**（SB-02 纪律）。agent transcript 极易夹带密钥；Delta 在这点上明确是弱的（`delta.md:75`「仅匹配已知值，不扫描任意文件」，且 Background Mode 的 8 MiB 终端输出**先存原始字节**，`delta.md:68`）。mega2 有 `src/config/redaction.rs` / `src/notification/redact.rs` 的既有纪律可复用；
 3. **幂等**（同一会话重复上报不产生重复记录）；
 4. **只在 push 之后**——不接受未提交编辑；
 5. 授权走 ME-B1。
@@ -599,14 +599,14 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 ### ME-B5 — 订阅面：webhook 投递 outbox 化 + 事件类型扩展 + SSE
 
-**结论**：monoengine 的实时推送能力目前是**零**，这会让任何 agent 集成退化成轮询。
+**结论**：mega2 的实时推送能力目前是**零**，这会让任何 agent 集成退化成轮询。
 
 **依据（已系统核查）**：
 
 - **SSE / WebSocket server / LISTEN-NOTIFY**：`grep -rn "Sse\b\|text/event-stream\|WebSocketUpgrade\|on_upgrade" src/` → **0 命中**。全仓唯一 WS 相关物是 `src/contract/api/buck2/ws.rs` 的**类型定义**（服务端在未移植的 Orion）；
 - **webhook 是 fire-and-forget**：`src/jupiter/service/webhook_service.rs:119` 直接 `tokio::spawn`，进程崩溃即事件永久丢失。`mega_webhook_delivery` 的字段是 `{id, webhook_id, event_type, payload, response_status, response_body, success, attempt, error_message, created_at}`——**无 `status`、无 `next_attempt_at`**，是投递**记录**而非待投递队列；
 - **webhook 事件类型只有 7 个，全是 CL 域**（`WebhookEventTypeEnum`）：`cl.created` / `cl.updated` / `cl.merged` / `cl.closed` / `cl.reopened` / `cl.comment.created` / `all`。**无 issue.\*、无 build.\*、无 review.\*、无 push.\***；
-- **行内代码评论不发通知也不发 webhook**（`code_review_router.rs` 中通知/webhook 调用 0 处）——即 monoengine 最完整的那套锚定评审能力，对外部完全不可见。
+- **行内代码评论不发通知也不发 webhook**（`code_review_router.rs` 中通知/webhook 调用 0 处）——即 mega2 最完整的那套锚定评审能力，对外部完全不可见。
 
 ---
 
@@ -616,7 +616,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 **三条 router 注释还有一处此前未登记的问题（本版新增）**：`cl_router.rs:191`、`cl_router.rs:564`、`issue_router.rs:224` 三条注释都说「delivered by the background dispatcher」并指向 **`docs/notification.md`**——**该路径的文件不存在**（实际事实源是 `docs/refactoring/notification.md`）。即这三条注释同时有两处失真：指称一个不存在的 dispatcher，和一个不存在的文档路径。
 
-**事实源侧**：`docs/refactoring/notification.md:15-20` 逐字写着 monoengine 已无「`SmtpMailer`, `lettre`, `EmailDispatcher`, or `email_jobs` outbox」，且「The website is the sole owner of templates, delivery providers, **retries**, and SMTP configuration」。
+**事实源侧**：`docs/refactoring/notification.md:15-20` 逐字写着 mega2 已无「`SmtpMailer`, `lettre`, `EmailDispatcher`, or `email_jobs` outbox」，且「The website is the sole owner of templates, delivery providers, **retries**, and SMTP configuration」。
 
 **`plan-long.md` 现存的 5 处 outbox 表述，逐条对齐**：
 
@@ -674,9 +674,9 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 
 ## 5. C 组：应坚守 / 不跟进
 
-本组既是设计边界也是叙事资产。**Delta 的每一条安全空白，monoengine 都有对位资产——除了沙箱。**
+本组既是设计边界也是叙事资产。**Delta 的每一条安全空白，mega2 都有对位资产——除了沙箱。**
 
-| Delta 空白（官方自认，`delta.md:74`/`:75`） | monoengine 对位 |
+| Delta 空白（官方自认，`delta.md:74`/`:75`） | mega2 对位 |
 |---|---|
 | **无权限系统**（agent 自主调用含破坏性工具，无审批） | Cedar 三态 fail-closed，admin 单源（UN-04），匿名保留字 `User::"__anonymous__"`（修复过一个真实漏洞：旧 fallback 是字面量 `"reader"`，会与真实叫 reader 的账户碰撞，`cedar_guard.rs:138-143` 注释逐字印证） |
 | **无沙箱**（对所在设备无限制访问） | **同样没有**（agent 执行面整体不存在）→ 见 ME-C5 |
@@ -685,7 +685,7 @@ no-op 分支（`:3255-3257`）制造的是一个 `from_hash` 与 `to_hash` **不
 | 遥测与 Sentry 崩溃上报**无退出开关** | 无外发遥测；SB-02 脱敏纪律 + 活进程脱敏门禁 |
 | 密钥脱敏只匹配已知值 | `SecretRef` / `SecretString` + `libvault` 0.3.0；「DB 凭据永不进 vault」的引导循环硬约束 |
 
-**这是 monoengine 目前最锋利、最不需要新工程的差异化。** 但必须诚实：沙箱确实没有——这不是「我们更安全」，是「我们还没进这个场」。
+**这是 mega2 目前最锋利、最不需要新工程的差异化。** 但必须诚实：沙箱确实没有——这不是「我们更安全」，是「我们还没进这个场」。
 
 ---
 
@@ -719,7 +719,7 @@ ACP 是编辑器↔agent 协议，两端都在用户机器上，forge 不在这�
 即 Delta 的已知扩权缺陷（`delta.md:71`：分享线程 = 授予仓库级 worktree 历史访问，官方文档明示）。forge 有能力做对（路径级 / CL 级），不应照抄。见 ME-B4 的设计约束。
 
 **ME-C7 — agent 会话面不得长成 chat 产品。**
-本仓刚把 Campsite 风格 chat / Notes 整栈删除并写进 plan-long 的「不进入」清单（`plan-long.md:751`：「产品面已由 `plan-20260731.md` 整栈退场（**能力留在 website**），不占 PT 编号」——引用时须逐字，原文用的是「website」而非「monoui `apps/next-app`」，二者在本仓语境下大体同指，但这条要写进立项文档第一段，措辞会被评审逐字比对）；`plan-20260731.md:30` 的非目标也写着「不移植 website AI chat（`apps/next-app/app/api/chat`）」。会话 UI 归 monoui（原则 11，`plan-long.md:90`）。monoengine 侧只提供**挂在 CL `link` 上的只读归档记录 + 查询 API**。
+本仓刚把 Campsite 风格 chat / Notes 整栈删除并写进 plan-long 的「不进入」清单（`plan-long.md:751`：「产品面已由 `plan-20260731.md` 整栈退场（**能力留在 website**），不占 PT 编号」——引用时须逐字，原文用的是「website」而非「monoui `apps/next-app`」，二者在本仓语境下大体同指，但这条要写进立项文档第一段，措辞会被评审逐字比对）；`plan-20260731.md:30` 的非目标也写着「不移植 website AI chat（`apps/next-app/app/api/chat`）」。会话 UI 归 monoui（原则 11，`plan-long.md:90`）。mega2 侧只提供**挂在 CL `link` 上的只读归档记录 + 查询 API**。
 
 **ME-C8 — 影子数据面治理（叙事/治理条目，非工程）。**
 把「第三方伴生层按 remote URL 汇聚本实例数据」（`delta.md:75`）列为显式风险条目。技术抓手是现成的：`mega_webhook` 的 `path_filter` 与 delivery 记录、`audit_logs` schema——forge 至少应能回答「谁在什么时候用什么 token 拉走了什么」。**这是现有能力的叙事化，不是新工程。** 但前提是 `log_audit` 先接线（目前零调用点）。
@@ -830,7 +830,7 @@ ME-C*  ── 边界与叙事，随时可写
 |---|---|---|---|
 | **1** | **no-op rebase 后的静默回退**（§2.3 断裂 B 路径 ②） | **ME-A1 场景 2 的六步复现**（空 diff CL + 并发合入 + Update Branch + merge），断言 A–E | **最高**。若成立即**数据丢失**级缺陷；同时决定 ME-A2 决策 0 的出口与 MC-02/03/04 的 AC 是否需补断链谓词 |
 | 2 | **根路径 CL merge 后 main 的 parent 归属**（§2.3 断裂 C） | ME-A1 场景 1：一次真实 root push + merge，`git log main --format='%H %P %an <%ae> %s'`；并跑「同一根路径连续两个 CL」确认 `refs/cl/*` 未被清理 | **高**。ADR-MC-01 的正确性、MC-06 的 AC「恰好新增一个单父新 commit」能否通过 |
-| 3 | 生产实例的 `[cedar].enforcement` 实际档位 | 部署侧确认。默认值是 `"off"`（`src/config/model.rs:999-1001`） | **高**。决定「monoengine 有权限系统」这一叙事今天是否成立 |
+| 3 | 生产实例的 `[cedar].enforcement` 实际档位 | 部署侧确认。默认值是 `"off"`（`src/config/model.rs:999-1001`） | **高**。决定「mega2 有权限系统」这一叙事今天是否成立 |
 | 4 | `gpg_signature` 门在目标部署里是否 enabled/required | 查 `path_check_configs` 实际配置 | 中。决定断裂 B 路径 ② 的「CL 被 gpg 门永久 fail-closed」是否是真实可见后果 |
 | 5 | `mega_tree` / `mega_blob.commit_id` 是否真的无读取点（ADR-MC-06 的前提） | 全仓 grep 读路径。ADR-MC-06 自陈「无读取点」并留了 revisit 钩子；本文未独立复核 | 低。仅在触碰该字段时相关 |
 | 6 | `plan-20260827` 引用的 `target/tmp/plan-review-codex-r*.md` 评审记录 | 在 `target/`（gitignore）下，本文未读。复盘 R1–R12 结论需另取 | 低 |
@@ -841,21 +841,21 @@ ME-C*  ── 边界与叙事，随时可写
 - ~~trunk 推进后其它 CL 的评论是否重锚~~ → **已实测结案**：`reanchor_code_review_threads` 全仓唯一调用点是 `monorepo.rs:957`（CL push 路径），trunk 推进**不触发**其它 CL 的重锚。结论并入 ME-A4 第 5 项。
 - ~~通知面是否已有 outbox~~ → **已实测结案**：`src/` 内 `outbox` 全部 6 处命中均为注释，无 outbox 表、无 dispatcher worker（唯一 dispatcher 是 `BuildDispatcher`）。三处 router 注释还指向一个**不存在的** `docs/notification.md` 路径。ME-B5 按「新建 webhook 投递 outbox」推进，并须与 `plan-long` 五处 outbox 口径逐条对齐（ME-B5 表格）。
 
-**本文自身的边界**：未运行任何测试、未启动服务、未修改任何文件；全部 monoengine 侧结论基于源码与计划文档的静态阅读，关键断言已逐条给出 file:line 且在本轮重新实测。`plan-20260827.md` 是未跟踪的活文档，本文对其一律用卡号/章节名 + 原文片段锚定。Delta 侧事实全部转引自 `delta.md`（160 行），未独立复核 delta.dev 页面；DeltaDB 开源后应按 `delta.md:144`（§6.3 C2）的快照规则重新核对。
+**本文自身的边界**：未运行任何测试、未启动服务、未修改任何文件；全部 mega2 侧结论基于源码与计划文档的静态阅读，关键断言已逐条给出 file:line 且在本轮重新实测。`plan-20260827.md` 是未跟踪的活文档，本文对其一律用卡号/章节名 + 原文片段锚定。Delta 侧事实全部转引自 `delta.md`（160 行），未独立复核 delta.dev 页面；DeltaDB 开源后应按 `delta.md:144`（§6.3 C2）的快照规则重新核对。
 
 ---
 
 ## 8. 一页总结
 
-**定位**：Delta 不是竞品，是一份客户端侧写给服务端的需求说明书。它的三层存储里，第一层（对象）和第三层（元数据）monoengine 都有且更强，**唯一缺的是中间层**——但只该补其中的「过程」，不该补「未提交编辑」。真正的风险是脱媒：forge 退化成哑 origin，而 DeltaDB **按 remote URL 给仓库做键**（`delta.md:75`）意味着这个影子数据面的边界由 forge 定义、却由第三方执行。
+**定位**：Delta 不是竞品，是一份客户端侧写给服务端的需求说明书。它的三层存储里，第一层（对象）和第三层（元数据）mega2 都有且更强，**唯一缺的是中间层**——但只该补其中的「过程」，不该补「未提交编辑」。真正的风险是脱媒：forge 退化成哑 origin，而 DeltaDB **按 remote URL 给仓库做键**（`delta.md:75`）意味着这个影子数据面的边界由 forge 定义、却由第三方执行。
 
-**核心张力的判断（摆正，不和稀泥）**：CL 模型提供了 Delta 需要而 git 没有的**容器**——`link` 已被六张表共用，这部分论证成立。但「trunk 只留结论」是 **ADR-MC-01 已采纳的设计取舍**（Status `Accepted`，用户决策），它把决策链的保全责任 **100% 押在 CL 侧**；而 CL 侧今天有三处断裂，其中两处（`update_branch` 抹平/断链、根路径 parent 归属）**不在任何计划的覆盖范围内**。所以**风险既在设计（押注集中）也在实现（押注未兑现）**。按 Delta 的判准，monoengine 今天在 trunk 上保留的决策链比一个普通 PR forge 还少。此外，CL 的并发模型是「每人每路径一个」，与 agent 时代的「每任务一个」不匹配——这正是 `DEFER-MC-01` 等待的那个重启条件。
+**核心张力的判断（摆正，不和稀泥）**：CL 模型提供了 Delta 需要而 git 没有的**容器**——`link` 已被六张表共用，这部分论证成立。但「trunk 只留结论」是 **ADR-MC-01 已采纳的设计取舍**（Status `Accepted`，用户决策），它把决策链的保全责任 **100% 押在 CL 侧**；而 CL 侧今天有三处断裂，其中两处（`update_branch` 抹平/断链、根路径 parent 归属）**不在任何计划的覆盖范围内**。所以**风险既在设计（押注集中）也在实现（押注未兑现）**。按 Delta 的判准，mega2 今天在 trunk 上保留的决策链比一个普通 PR forge 还少。此外，CL 的并发模型是「每人每路径一个」，与 agent 时代的「每任务一个」不匹配——这正是 `DEFER-MC-01` 等待的那个重启条件。
 
 **本版最重的新发现——`update_branch` 的 no-op 分支**：`mono_api_service.rs:3255-3257` 在 `cl_changed` 为空时把 `from_hash` 前移到 `target_head` 而 `to_hash` 原样不动；配合函数开头 `target_head == cl.from_hash` 的守卫，这**无条件**制造出一个 `from` 不在 `to` 祖先链上的 CL。后果有三层：① plan-20260827 里三处「从 to 反走 parent 链到 from」的算法（MC-02 gpg / MC-03 校验器 / MC-04 清单重建）全部落进未定义行为——其中 **MC-02 的 AC 已含「`from_hash` 不在链上时 fail-closed」谓词，而 MC-04 的 AC 没有**，这是计划自身的一处不一致；② MC-04 那条「表加顺序列是永久非目标，理由 = 链序在读取时由 parent 拓扑重建」的 rationale 依赖一个从未写出的不变式，而该不变式被这条一方代码路径无条件打破——**ADR revisit 的触发因此是无条件的**（revisit 的出口可以是「修 no-op 恢复不变式」而非「加顺序列」）；③ **强推理、待实测复现**：no-op 后 `from_hash == main head` 使 `merge_cl` 守卫放行，而 `merge_cl_unchecked` 用 `cl.to_hash` 的**旧 base 树**推进 main，会**静默回退期间他人已合入的改动**。这一条已作为最高优先项写进 ME-A1 的实测批次，附六步复现。
 
-**关于锚定评审的诚实结论（原版头条已撤回）**：原版拿一句不在基线内的话（"comments attach to snapshots and fall out of date"）当作 Zed 的论点再宣布它不成立，是自设靶子，已删除。真实情况是：monoengine 的锚**不是内容锚**，是**带校验的行号锚 + diff 偏移，无内容检索兜底**（Tier 1 第一步就按 `original_line_number` 取下标，`code_review_service.rs:387`；Tier 3 是 TODO）。因此三条结论各归其位——① **生命周期**：`Open/Resolved` + **resolve 与 reopen 两个端点**，Delta 明确没有，**硬差异**；② **可审计性**：算法在源码里、有置信度与显式失配态，Delta 机制未公开——**开放性优势，不等于效果优势**；③ **锚定原理**：Delta 锚到不可变 delta 的身份锚在原理上强于启发式重匹配，五态降级恰是失配的证据而非优势，monoengine 的等价物是「补 Tier 3 + 锚绑稳定 ID」——**那是 ME-A4 的目标，不是既有胜势**。而且这套机制还有四个洞，其中最严重的是：**重锚喂给 Tier 2 的 diff 被 `Pagination::default()`（per_page=20）截断**（`monorepo.rs:1179-1181`），CL 改动超 20 文件时第 21 个起的线程静默落 `NotFound`——正是 agent 的典型工作形态。
+**关于锚定评审的诚实结论（原版头条已撤回）**：原版拿一句不在基线内的话（"comments attach to snapshots and fall out of date"）当作 Zed 的论点再宣布它不成立，是自设靶子，已删除。真实情况是：mega2 的锚**不是内容锚**，是**带校验的行号锚 + diff 偏移，无内容检索兜底**（Tier 1 第一步就按 `original_line_number` 取下标，`code_review_service.rs:387`；Tier 3 是 TODO）。因此三条结论各归其位——① **生命周期**：`Open/Resolved` + **resolve 与 reopen 两个端点**，Delta 明确没有，**硬差异**；② **可审计性**：算法在源码里、有置信度与显式失配态，Delta 机制未公开——**开放性优势，不等于效果优势**；③ **锚定原理**：Delta 锚到不可变 delta 的身份锚在原理上强于启发式重匹配，五态降级恰是失配的证据而非优势，mega2 的等价物是「补 Tier 3 + 锚绑稳定 ID」——**那是 ME-A4 的目标，不是既有胜势**。而且这套机制还有四个洞，其中最严重的是：**重锚喂给 Tier 2 的 diff 被 `Pagination::default()`（per_page=20）截断**（`monorepo.rs:1179-1181`），CL 改动超 20 文件时第 21 个起的线程静默落 `NotFound`——正是 agent 的典型工作形态。
 
-**唯一的真瓶颈**：`mega.cedarschema` 里没有 `entity Bot`（`grep -c "Bot"` = 0），四条 action 声明的 principal 全是 `[User]`。全仓唯一被持久化审计的人/机类型属于一张从未写入过的表（`log_audit` 零调用）；官方迁移建议是让 agent 改用**用户 token**（`docs/manuel/authz.md:96`），即架构性地要求 agent 冒充人——**而你无法归因一个冒充人的主体**。这个判断完全由 monoengine 自证支撑，不依赖任何对 Delta roadmap 的解读。
+**唯一的真瓶颈**：`mega.cedarschema` 里没有 `entity Bot`（`grep -c "Bot"` = 0），四条 action 声明的 principal 全是 `[User]`。全仓唯一被持久化审计的人/机类型属于一张从未写入过的表（`log_audit` 零调用）；官方迁移建议是让 agent 改用**用户 token**（`docs/manuel/authz.md:96`），即架构性地要求 agent 冒充人——**而你无法归因一个冒充人的主体**。这个判断完全由 mega2 自证支撑，不依赖任何对 Delta roadmap 的解读。
 
 ---
 
@@ -909,7 +909,7 @@ ME-C*  ── 边界与叙事，随时可写
 
 自行 `grep plan-long.md` 并逐条读了 5 处命中（`:177/:193/:200/:495/:741`），ME-B5 内新增一张五行对齐表，逐条给出「与本条的关系 + 必须做的动作」。关键处置：
 
-- `:495`（PT-09 非目标「不在本仓重建 **SMTP** outbox」）是唯一有实质拦截力的一条，ME-B5 立项第一段必须显式区分「webhook / SSE 投递 outbox」与「SMTP outbox」，并引 `docs/refactoring/notification.md:15-20`（monoengine 已无 `email_jobs` outbox；retries 归 website）佐证；
+- `:495`（PT-09 非目标「不在本仓重建 **SMTP** outbox」）是唯一有实质拦截力的一条，ME-B5 立项第一段必须显式区分「webhook / SSE 投递 outbox」与「SMTP outbox」，并引 `docs/refactoring/notification.md:15-20`（mega2 已无 `email_jobs` outbox；retries 归 website）佐证；
 - `:200` 与 `:741` 已失去指称对象，作为**第五处 plan-long 漂移**补进 ME-B6，并说明不处理会让 ME-B5 被「已有 outbox」与「outbox 被禁」两种读法夹击；
 - **额外发现（复审未提）**：`cl_router.rs:191`、`cl_router.rs:564`、`issue_router.rs:224` 三条 outbox 注释同时指向一个**不存在的文件路径 `docs/notification.md`**（实际是 `docs/refactoring/notification.md`），已并入 P3 注释清理项。
 
@@ -929,7 +929,7 @@ ME-C*  ── 边界与叙事，随时可写
 
 **未改动、按复审「复核通过」清单原样保留的内容**
 
-§0 三前提（① 按 R1–R12 更新轮次与卡号锚定，其余不动）、§1 全节（三层对位表、脱媒论证）、§2.3 断裂 A / 断裂 C 的代码链、§2.4、§2.5 整节、ME-A1 场景 1、ME-A3(b)、ME-A4 第 1/2/4/5 项、ME-A5、§4.0 治理判断、ME-B1 的 monoengine 侧全部自证依据、ME-B2、ME-B3、ME-B4、ME-B5 主体、ME-B6 收缩后的四处漂移、§5 全部 ME-C1..C8、§6.4 三门与模板、§7 已结案两项与「本文自身的边界」。编号 ME-A\*/ME-B\*/ME-C\* 未重编。
+§0 三前提（① 按 R1–R12 更新轮次与卡号锚定，其余不动）、§1 全节（三层对位表、脱媒论证）、§2.3 断裂 A / 断裂 C 的代码链、§2.4、§2.5 整节、ME-A1 场景 1、ME-A3(b)、ME-A4 第 1/2/4/5 项、ME-A5、§4.0 治理判断、ME-B1 的 mega2 侧全部自证依据、ME-B2、ME-B3、ME-B4、ME-B5 主体、ME-B6 收缩后的四处漂移、§5 全部 ME-C1..C8、§6.4 三门与模板、§7 已结案两项与「本文自身的边界」。编号 ME-A\*/ME-B\*/ME-C\* 未重编。
 
 ### 仍待复核（见 §7，按优先级）
 

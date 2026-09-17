@@ -238,7 +238,7 @@ mod tests {
     use crate::commands::{LoadMode, builtin, load_mode};
 
     fn app() -> ClapCommand {
-        ClapCommand::new("monoengine").subcommands(builtin())
+        ClapCommand::new("mega2").subcommands(builtin())
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
         for mode in ["protect", "unprotect"] {
             let matches = app()
                 .try_get_matches_from([
-                    "monoengine",
+                    "mega2",
                     "authz-audit",
                     mode,
                     "--restricted-root",
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn un55_digest_required() {
         let err = app().try_get_matches_from([
-            "monoengine",
+            "mega2",
             "authz-audit",
             "protect",
             "--restricted-root",

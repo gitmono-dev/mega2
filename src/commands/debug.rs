@@ -59,7 +59,7 @@ async fn storage_smoke(config: crate::config::Config, args: &ArgMatches) -> Mega
         key: key.clone(),
     };
 
-    let payload = b"monoengine storage smoke test payload".to_vec();
+    let payload = b"mega2 storage smoke test payload".to_vec();
     let payload_bytes = bytes::Bytes::from(payload.clone());
     let stream = Box::pin(futures::stream::once(async move {
         Ok::<_, std::io::Error>(payload_bytes)

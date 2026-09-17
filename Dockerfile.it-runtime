@@ -1,14 +1,14 @@
-# Slim IT runtime image that packages a host-built `monoengine` binary.
-# Prefer this in CI after `cargo build -p monoengine` to avoid a second full
-# compile inside Docker. Context = monoengine repo root.
+# Slim IT runtime image that packages a host-built `mega2` binary.
+# Prefer this in CI after `cargo build -p mega2` to avoid a second full
+# compile inside Docker. Context = mega2 repo root.
 #
 # Host/CI binaries are typically linked against a newer glibc than Debian
 # bookworm; use Ubuntu 24.04 to match `ubuntu-latest` runners and modern
 # desktops. (The source `Dockerfile` still builds+runs on bookworm.)
 #
-#   cp target/debug/monoengine ./monoengine.itbin   # or target/release/...
-#   docker build -f Dockerfile.it-runtime -t monoengine:local .
-#   rm -f ./monoengine.itbin
+#   cp target/debug/mega2 ./mega2.itbin   # or target/release/...
+#   docker build -f Dockerfile.it-runtime -t mega2:local .
+#   rm -f ./mega2.itbin
 
 FROM ubuntu:24.04
 
@@ -19,13 +19,13 @@ RUN apt-get update \
         libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY monoengine.itbin /usr/local/bin/monoengine
-COPY config/config.toml /etc/monoengine/config.toml
-RUN chmod 755 /usr/local/bin/monoengine
+COPY mega2.itbin /usr/local/bin/mega2
+COPY config/config.toml /etc/mega2/config.toml
+RUN chmod 755 /usr/local/bin/mega2
 
-ENV MEGA_BASE_DIR=/var/lib/monoengine \
-    MEGA_CONFIG=/etc/monoengine/config.toml
+ENV MEGA_BASE_DIR=/var/lib/mega2 \
+    MEGA_CONFIG=/etc/mega2/config.toml
 
 EXPOSE 8000
-ENTRYPOINT ["/usr/local/bin/monoengine"]
-CMD ["--config", "/etc/monoengine/config.toml", "service", "http", "--host", "0.0.0.0", "-p", "8000"]
+ENTRYPOINT ["/usr/local/bin/mega2"]
+CMD ["--config", "/etc/mega2/config.toml", "service", "http", "--host", "0.0.0.0", "-p", "8000"]

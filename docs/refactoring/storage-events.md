@@ -1,8 +1,8 @@
 # Storage-only 提交后出站事件
 
-本文是 monoengine **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
+本文是 mega2 **storage-only** 形态下 `[storage_events]` 静态配置的事实源。产品边界与任务追溯见 [`../plan/plan-20260912.md`](../plan/plan-20260912.md)。
 
-> **状态（WH-01/WH-09/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08）：** 配置表面 + HTTPS HMAC 运输 + 启动 secret 绑定均已落地；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`，WH-08 挂上 checkpoint 提交的 `agent_capture.checkpoint.committed`。HMAC `secret_ref` 在 disabled 时不解析。
+> **状态（WH-01/WH-09/WH-12/WH-10/WH-02/WH-13/WH-11/WH-03/WH-04/WH-05/WH-06/WH-07/WH-08/WH-14 均已发布；WH-15 已实现——本文所在提交即其 `v0.10.40` bump 提交，推送、tag 与 `docker` job 绿灯的证据以 plan-20260912 的 WH-15 卡为准）：** 配置表面 + HTTPS HMAC 运输 + DNS 地址钉住（WH-12）+ 事件投影与静态过滤（WH-10）+ 有界 emitter 运行时（WH-02）+ CLI/service 清理尾段（WH-13）+ 启动 secret 绑定均已落地；WH-14 补齐 `shutdown_grace_seconds` 范围门与 `oci_repositories` 规范名门，WH-15 补齐 `installation_id` 记录字段与 drop 记账；已装来源 hook：Git B3 push 的 `repo.push`（WH-03）、OCI manifest 发布的 `oci.manifest.published`（WH-04）、LFS basic 实际上传的 `lfs.object.uploaded`（WH-05，presigned 直传为登记缺口），WH-06 挂上 FastCDC media finalize 的 `lfs.media.finalized`，WH-07 挂上 Agent Capture 批提交的 `agent_capture.events.committed`，WH-08 挂上 checkpoint 提交的 `agent_capture.checkpoint.committed`。HMAC `secret_ref` 在 disabled 时不解析。
 
 ## 配置
 
@@ -12,15 +12,17 @@
 |---|---|---|
 | `enabled` | `false` | 出站开关；启用要求 storage-only |
 | `installation_id` | 省略 | 启用时必填；1..64 ASCII `[A-Za-z0-9_-]`；部署侧生成并持久写入，重启不得变 |
-| `max_in_flight` | `16` | 后续运行时在途上限（本卡只装载） |
+| `max_in_flight` | `16` | 运行时在途上限，范围 1..=64 |
 | `connect_timeout_seconds` | `2` | 连接超时，范围 1..=5 |
 | `request_timeout_seconds` | `5` | 含 DNS 的整段请求超时，范围 1..=10 |
-| `shutdown_grace_seconds` | `5` | 后续关停宽限（本卡只装载） |
+| `shutdown_grace_seconds` | `5` | 关停宽限，范围 0..=10（WH-14）；`0` 表示立即 abort 在途任务，上界保证 ADR-WH-03 的 drain 有界 |
 | `targets` | `[]` | 静态接收者；enabled 且为空合法（无接收者） |
 
-`[[storage_events.targets]]` 在该项存在时必填 `id`、`url`、`secret_ref`、非空 `events`。`id` 为 1..32 ASCII `[A-Za-z0-9_-]`，不得重复。过滤数组缺省为空（空集合表示该来源不订阅，不是通配）。`url` 必须是 HTTPS，禁止 userinfo / query / fragment（disabled 同样拒绝非法形状）。事件字面量与 canonical 路径由后续卡校验。
+`[[storage_events.targets]]` 在该项存在时必填 `id`、`url`、`secret_ref`、非空 `events`。`id` 为 1..32 ASCII `[A-Za-z0-9_-]`，不得重复。过滤数组缺省为空（空集合表示该来源不订阅，不是通配）。`url` 必须是 HTTPS，禁止 userinfo / query / fragment。以上数值范围与结构校验在 disabled 形态同样执行，只跳过 vault 取值。
 
-## 运输（WH-09，未注入应用）
+过滤项按来源各自的维度校验（WH-10 / WH-14）：`git_paths`、`lfs_paths`、`agent_repo_paths` 必须是绝对 canonical 路径；`oci_repositories` 必须是 canonical 小写 distribution `remoteName`，与入站 `/v2` 用同一判定——`valid_repository_name` 的唯一实现在 `src/common/oci_name.rs`，由 OCI router 与 config 校验共用（GC-02），大小写敏感、不做折叠。router 永不会产生的名字也永不会匹配，这种过滤项是静默失效的订阅，故 fail-closed 拒绝而不是接受。`agent_tenants` 与服务端值逐字比较。每个集合上限 64 项、每项 1..=256 bytes。
+
+## 运输（WH-09；自 WH-11 起注入应用）
 
 `HttpsEventTransport` 对每个 target 单次 POST，不重试（含 429/5xx）。禁止跟随 redirect，禁用环境代理。签名头：
 
@@ -32,13 +34,15 @@ HMAC-SHA256 输入为 `timestamp` 十进制秒、`.`、实际发送 body bytes�
 
 ## 有界运行时（WH-02）
 
-`StorageEventEmitter` 由 `Storage` 持有，默认为 disabled。`try_emit` 在 spawn 前 `try_acquire`，在途不超过 `max_in_flight`；已关闭的 admission 一律返回 `dropped_closed`。每个发送任务的 `JoinHandle` 立即经 channel 交给唯一 lifecycle 任务登记；任务在正常结束、panic 或被 abort 时都通过 drop guard 上报序号，lifecycle 据此逐一 join 并记录按 target 的结果类别（`delivered_2xx` / 非 2xx / connect / tls / resolve / timeout / cancelled / panicked），不依赖下一次发射清理。`shutdown()` 原子关闭 admission、等待 grace，超时 abort 并 join 全部仍在登记的任务；可重复、并发调用，发起者被取消后 drain 由 lifecycle 任务继续。lifecycle 只持有 `Weak` 回引用；最后一个 owner 销毁时登记 channel 关闭，lifecycle 立即 abort 并 join 全部未完成任务后退出（不同步 join）。
+`StorageEventEmitter` 由 `Storage` 持有，默认为 disabled。`try_emit` 在 spawn 前 `try_acquire`，在途不超过 `max_in_flight`；已关闭的 admission 一律返回 `dropped_closed`。
+
+**记录字段与 drop 记账（WH-15）：** emitter 持有 `[storage_events].installation_id`（`Option<Arc<str>>`；`Storage::new_with_connection` 装入的三个 disabled emitter 经 `from_config_disabled(&config)` 同样保留该值，`bind_storage_event_emitter` 只在 enabled 时替换它，因此 disabled 形态的 drop 行也带真实的安装身份），并把它作为 `installation_id` 字段写进**每一条 emitter 拥有的**日志行——带 `category=` 的投递行（含 lifecycle 的 `cancelled`/`panicked`）与 `storage_events dropped` 行；未配置时记 `-`。**边界：** 运输层（`storage_event_transport.rs`）用同一消息 `storage_events delivery` 另记一条只含 `target_id` / `event_type` / `outcome` 的行，以及 `storage_events_shutdown_complete` / `storage_events_startup_failure_drained` 两条生命周期回执，都**不**带该字段（transport 的 `post(target, body)` 契约不知道安装身份），按 `target_id` + `event_type` 与 emitter 行关联即可。该字段只是进程侧记录字段，**永不进入 wire envelope**（`metadata_projection_budget` 的六类 golden JSON 不变）。`try_emit` 的每个非 accepted 分支都 bump 对应的进程内 `AtomicU64` 计数（按 disposition 命名的七个：快照字段 `disabled` / `invalid_scope` / `invalid_event` / `size` / `filter` / `capacity` / `closed`，对应日志 `disposition=dropped_*`）并在**释放 admission gate 之后**输出一条 `storage_events dropped` 行——gate 临界区内不打日志、不做无界工作——对每个选中的 target 只克隆编译后的 target 与 body、spawn 发送任务并做原子计数与 channel 发送（ADR-WH-03）。其中 `dropped_disabled` 以 **debug** 级输出：默认关闭形态下 OCI / LFS / media / agent 四类 adapter 的每次提交都会经过该分支，info 级会让默认部署每次写入多一行日志；其余六类与 per-target 行为 info 级，计数不受日志级别影响。fan-out 循环里拿不到 permit 或 lifecycle 已关闭的 target 各记一条带 `target_id` 的 `dropped_target_no_permit` / `dropped_target_lifecycle_closed` 行并累计到第八个计数 `dropped_targets`（覆盖部分 fan-out；后者只在 owner 已销毁的极端情形可达，作为泄漏保护保留）。来源 adapter 的 fallible builder 失败经 `record_invalid_event(event_type)` 记账，它沿用 `try_emit` 的优先级：admission 已关闭记 `dropped_closed`、emitter disabled 记 `dropped_disabled`、否则记 `dropped_invalid_event`，永远不会变成业务错误。`drop_counts()` 返回可序列化快照 `StorageEventDropSnapshot`（8 个 u64），对齐 `PushQueueMetrics` 的「无 metrics crate、原子计数 + 结构化日志」先例，**不新增 HTTP 表面**。drop 行的字段集合限于 `installation_id` / `event_type` / `disposition` / `target_id` / `dropped_targets`——不含 oid、digest、path、URL 或 secret（ADR-WH-02）；消息名与投递行不同，且不含 `category=`，因此进程级 IT 按 `storage_events delivery` + `category=` 计数投递的过滤器不受影响。
 
 ## 启动 secret 绑定（WH-11）
 
 `AppContext` 在 vault 就绪、storage 建成后（redis/notification/bootstrap 之前）执行绑定：`enabled=true` 时逐 target 解析 `secret_ref`（只允许 `vault://secret/config/<profile>/storage_events/targets/<id>/hmac#<field>`，与 `config validate` 同一校验），经 `VaultSecretResolver`（caller `startup:storage-events`）取出 `hex:<even-hex>` 密钥并编译 `EventTarget`，再以配置的 connect/request timeout 构造 `HttpsEventTransport`，经 `Storage::set_storage_event_emitter` 安装为唯一应用 owner。任一 parse/namespace/解析/编码失败即启动失败（`MegaError`）；解析值不写回 config snapshot，错误与日志不含 SecretRef URI 或 secret 值（resolver 错误已脱敏）。owner 安装后若构造尾部失败（redis、notification、monorepo bootstrap 等），返回错误前先 `shutdown().await` 该 emitter（幂等；WH-13 外层尾段在正常退出时再调一次）。disabled 时完全不解析，保留默认 disabled emitter。
 
-运维命令同步扩展：`config secret set/check/rotate` 接受 `storage_events.targets.<id>.secret_ref` 字段，vault-path 必须是 `config/<profile>/storage_events/targets/<id>/hmac`；set/rotate 只从 stdin 读值（`--value-stdin`，`printf '%s' "$HMAC" | monoengine ... config secret set ...`），轮换后必须重启服务（无动态热更新）。
+运维命令同步扩展：`config secret set/check/rotate` 接受 `storage_events.targets.<id>.secret_ref` 字段，vault-path 必须是 `config/<profile>/storage_events/targets/<id>/hmac`；set/rotate 只从 stdin 读值（`--value-stdin`，`printf '%s' "$HMAC" | mega2 ... config secret set ...`），轮换后必须重启服务（无动态热更新）。
 
 CLI 接线已由 WH-13 交付：长运行 service（`http` / `ssh` / `multi`）不再安装直接 `process::exit` 的 Ctrl+C handler。`AppContext` 持有共享 `service_shutdown` CancellationToken；CLI 在 config 加载**之前**就为 `service http|ssh|multi` 安装「只记录」的 Ctrl+C handler（`ctrlc` crate，写入静态 watch channel，进程永不被信号默认终止；一次性命令保留原 `process::exit(0)` handler），`service` 创建 context 成功后用一次性 forwarder 任务把该记录（含已落早的信号）转入该 token（sticky，信号落在任一 server 注册 handler 之前也不丢），forwarder 由清理尾段 abort 回收。context 创建成功后的全部退出路径（subscribe / reload watcher / 参数解析、启动与运行错误、Ctrl+C、正常返回）统一经过 `commands::service` 的异步清理尾段——先按既有优先级停止 reload watcher（原结果不被清理覆盖），再 `shutdown().await` emitter，仅在其完成后才输出 `storage_events_shutdown_complete` 日志（仅类别字段，无 URL / secret / body）。`start_http` 内联轮询 `Serve`（无内层任务：multi abort wrapper 即真正停止监听），主 select 同时监听 ctrl_c 与共享 token（服务外直接调用仍可用）；优雅 drain 有界（30s；超时丢弃 Serve 即停止 accept 循环，残留的连接任务属 axum 既有后台任务，其生命周期重构不在 WH-13 范围：admission 已关闭的 emitter 不受其影响，runtime 收尾时一并回收），serving / drain 超时 / 后台任务错误在全部清理（含 emitter drain）完成后按 serving > drain > 任务错误的优先级作为命令结果返回，干净关停仍 Ok。`service ssh` 等待 token 后 abort 并有界 join 无关停 token 的 SSH server（is_finished 快路径与 abort 后的 join 结果都会保留真实完成/错误，只有预期取消与 join 超时才返回 Ok）；`service multi` 中 ssh 子任务始终立即 abort + 有界 join，http 子任务一律经共享 token 优雅停止——token 触发或 ssh 先完成时给有界优雅窗口，超时再强制 abort + 有界 join；先完成方的结果为整体结果，token 路径保留真实子错误（http 优先于 ssh，abort 取消不算错误）。非服务命令与 `service init` 保持原退出行为（AC7）。进程级证据见 `tests/integration_storage_events_runtime.rs`。
 

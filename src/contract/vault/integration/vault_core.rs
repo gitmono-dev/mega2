@@ -1299,8 +1299,8 @@ struct RuntimePolicy {
 const RUNTIME_TOKEN_TTL: &str = "87600h";
 
 const SSH_POLICY: RuntimePolicy = RuntimePolicy {
-    name: "monoengine-ssh",
-    display_name: "monoengine-ssh",
+    name: "mega2-ssh",
+    display_name: "mega2-ssh",
     hcl: r#"
 path "secret/ssh_server_key" {
     capabilities = ["create", "read", "update", "delete"]
@@ -1309,8 +1309,8 @@ path "secret/ssh_server_key" {
 };
 
 const PGP_POLICY: RuntimePolicy = RuntimePolicy {
-    name: "monoengine-pgp",
-    display_name: "monoengine-pgp",
+    name: "mega2-pgp",
+    display_name: "mega2-pgp",
     hcl: r#"
 path "secret/pgp-signed-secret" {
     capabilities = ["create", "read", "update", "delete"]
@@ -1319,8 +1319,8 @@ path "secret/pgp-signed-secret" {
 };
 
 const NOSTR_POLICY: RuntimePolicy = RuntimePolicy {
-    name: "monoengine-nostr",
-    display_name: "monoengine-nostr",
+    name: "mega2-nostr",
+    display_name: "mega2-nostr",
     hcl: r#"
 path "secret/nostr_identity_key" {
     capabilities = ["create", "read", "update", "delete"]
@@ -1329,8 +1329,8 @@ path "secret/nostr_identity_key" {
 };
 
 const PKI_POLICY: RuntimePolicy = RuntimePolicy {
-    name: "monoengine-pki",
-    display_name: "monoengine-pki",
+    name: "mega2-pki",
+    display_name: "mega2-pki",
     hcl: r#"
 path "sys/mounts/pki" {
     capabilities = ["create", "read", "update", "delete", "sudo"]
@@ -1347,8 +1347,8 @@ path "pki/*" {
 };
 
 const CONFIG_POLICY: RuntimePolicy = RuntimePolicy {
-    name: "monoengine-config",
-    display_name: "monoengine-config",
+    name: "mega2-config",
+    display_name: "mega2-config",
     hcl: r#"
 path "secret/config/*" {
     capabilities = ["create", "read", "update", "delete", "list"]
@@ -1357,8 +1357,8 @@ path "secret/config/*" {
 };
 
 const GENERIC_POLICY: RuntimePolicy = RuntimePolicy {
-    name: "monoengine-generic",
-    display_name: "monoengine-generic",
+    name: "mega2-generic",
+    display_name: "mega2-generic",
     hcl: r#"
 path "secret/config/*" {
     capabilities = ["deny"]

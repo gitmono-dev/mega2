@@ -1,9 +1,9 @@
-# Local sample config for monoengine.
+# Local sample config for mega2.
 # Load order is: --config, MEGA_CONFIG, ./config/config.toml,
 # ${mega_base}/etc/config.toml, then generated default config.
 # Optional profiles use config.<profile>.toml next to the selected base config
 # and are merged before MEGA_* environment overrides.
-# Run `monoengine config validate` after editing; warnings identify ignored
+# Run `mega2 config validate` after editing; warnings identify ignored
 # compatibility fields without printing secret values.
 #
 # The directory where the data files is located, such as logs, database, etc.
@@ -74,7 +74,7 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 # "sha1" (default) is the stock Git format. "sha256" and "blake3" are
 # git-internal / Libra extensions — do not claim interoperability with
 # stock Git clients for those values.
-# Bootstrap with: monoengine --config config/config.toml service init --yes
+# Bootstrap with: mega2 --config config/config.toml service init --yes
 object_format = "sha1"
 
 # Push morphology: "review" (default, CL pipeline) or "trunk" (MonoWriteQueue).
@@ -148,7 +148,7 @@ access_key_id = ""
 
 # Secret access key corresponding to the access_key_id.
 # Keep this value secure and never commit it to version control. Current
-# object storage bootstrap credentials are not resolved through monoengine
+# object storage bootstrap credentials are not resolved through mega2
 # Vault SecretRef; inject them via env/profile/deployment secret instead.
 # `config validate` rejects vault:// values in access_key_id/secret_access_key.
 secret_access_key = ""
@@ -291,7 +291,7 @@ enabled = true
 # non-repudiation independent of the process log pipeline).
 sink = "tracing"
 # Required when sink = "file": the durable audit log path.
-# file_path = "/var/log/monoengine/vault-audit.jsonl"
+# file_path = "/var/log/mega2/vault-audit.jsonl"
 # When true (and sink is fallible, e.g. "file"), a failed audit-record write
 # fails the secret operation (non-repudiation over availability). Default false
 # (fail-open: a sink write failure is logged but does not block secret access).
@@ -346,17 +346,17 @@ enforcement = "off"
 # [storage_events]
 # enabled = false
 # installation_id = "prod-primary-01"
-# max_in_flight = 16
-# connect_timeout_seconds = 2
-# request_timeout_seconds = 5
-# shutdown_grace_seconds = 5
+# max_in_flight = 16              # 1..=64
+# connect_timeout_seconds = 2     # 1..=5
+# request_timeout_seconds = 5     # 1..=10
+# shutdown_grace_seconds = 5      # 0..=10; 0 aborts in-flight sends at once
 # [[storage_events.targets]]
 # id = "ops-main"
 # url = "https://events.example.invalid/ingest"  # https only; no userinfo/query/fragment
 # secret_ref = "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
 # events = ["repo.push", "oci.manifest.published", "lfs.object.uploaded", "lfs.media.finalized", "agent_capture.events.committed", "agent_capture.checkpoint.committed"]
 # git_paths = ["/team/a"]
-# oci_repositories = ["team/image"]
+# oci_repositories = ["team/image"]  # canonical lowercase distribution remoteName, same rule as inbound /v2
 # lfs_paths = ["/team/a.git"]  # media scope keeps the HTTP `.git` suffix; `/team/a` will not match
 # include_unscoped_lfs = false
 # agent_tenants = []

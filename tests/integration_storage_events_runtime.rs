@@ -1,7 +1,7 @@
 // Process-level WH-13 gates (plan-20260912): the storage-events shutdown
-// wiring in the real `monoengine` binary.
+// wiring in the real `mega2` binary.
 //
-// Drives `CARGO_BIN_EXE_monoengine` with per-case PostgreSQL database, port
+// Drives `CARGO_BIN_EXE_mega2` with per-case PostgreSQL database, port
 // and directory isolation (same pattern as `integration_git_cli`):
 //   a. default-disabled `service http` boots, SIGINT exits 0 and the logs
 //      carry the `storage_events_shutdown_complete` receipt;
@@ -37,8 +37,7 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 const SHUTDOWN_RECEIPT: &str = "storage_events_shutdown_complete";
 
@@ -54,7 +53,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_wh13_{}_{}",
+            "mega2_wh13_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -64,7 +63,7 @@ impl TestDatabase {
             tokio::time::timeout(Duration::from_secs(30), async {
                 let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                     panic!(
-                        "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                        "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
                     )
                 });
                 execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -186,7 +185,7 @@ impl ServiceProcess {
             .stderr(Stdio::from(
                 fs::File::create(stderr_path).expect("stderr log"),
             ));
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         Self {
             child,
             reaped: false,
@@ -719,7 +718,7 @@ fn run_cli_with_stdin(command: &mut Command, stdin_value: &str) -> (ExitStatus, 
 }
 
 fn isolated_command(base_dir: &Path, cache_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .env_clear()
         .env("MEGA_BASE_DIR", base_dir)

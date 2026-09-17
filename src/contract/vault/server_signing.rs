@@ -65,13 +65,13 @@ use crate::{
 /// and committer (MC-09 AC). This is the single source of truth: MC-11
 /// routes commit verification to the server keyring by comparing the
 /// committer header against these constants.
-pub const SERVER_SIGNING_NAME: &str = "monoengine-server";
-pub const SERVER_SIGNING_EMAIL: &str = "server-signing@monoengine.internal";
+pub const SERVER_SIGNING_NAME: &str = "mega2-server";
+pub const SERVER_SIGNING_EMAIL: &str = "server-signing@mega2.internal";
 
 const KEYS_PREFIX: &str = "server-signing/keys";
 const KEY_INDEX: &str = "server-signing/index";
 const ACTIVE_POINTER: &str = "server-signing/active";
-const INIT_LOCK_KEY: &str = "monoengine:server-signing:init";
+const INIT_LOCK_KEY: &str = "mega2:server-signing:init";
 const INIT_LOCK_TTL_MS: u64 = 30_000;
 
 /// The active server signing key pair, loaded from the vault.

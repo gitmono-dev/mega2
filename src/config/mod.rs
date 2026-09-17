@@ -415,7 +415,7 @@ mod test {
     fn test_load_str_and_sources_parse_list_env_overrides() {
         let lock = env_lock();
         let _root_dirs = EnvVarGuard::set(&lock, "MEGA_MONOREPO__ROOT_DIRS", "alpha,beta");
-        let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
+        let rendered = config_init_template(Path::new("/tmp/mega2-test"));
         let expected = vec!["alpha".to_string(), "beta".to_string()];
 
         let config = Config::load_str(&rendered).expect("load_str should parse list env override");
@@ -433,7 +433,7 @@ mod test {
     fn test_load_str_allows_monorepo_object_format_environment_override() {
         let lock = env_lock();
         let _object_format = EnvVarGuard::set(&lock, "MEGA_MONOREPO__OBJECT_FORMAT", "sha256");
-        let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
+        let rendered = config_init_template(Path::new("/tmp/mega2-test"));
 
         let config = Config::load_str(&rendered).expect("object format override should parse");
         assert_eq!(config.monorepo.object_format, MonoObjectFormat::Sha256);
@@ -443,7 +443,7 @@ mod test {
     fn test_bad_environment_type_reports_variable_name_without_value() {
         let lock = env_lock();
         let _print_std = EnvVarGuard::set(&lock, "MEGA_LOG__PRINT_STD", "not_bool_secret");
-        let rendered = config_init_template(Path::new("/tmp/monoengine-test"));
+        let rendered = config_init_template(Path::new("/tmp/mega2-test"));
 
         let err = Config::load_str(&rendered).expect_err("bad bool env override should fail");
         let message = err.to_string();
@@ -652,11 +652,11 @@ mod test {
         std::fs::write(
             &config_path,
             r#"
-                base_dir = "/tmp/monoengine-test"
+                base_dir = "/tmp/mega2-test"
 
                 [database]
                 db_type = "postgres"
-                db_url = "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine"
+                db_url = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2"
                 max_connection = 4
                 min_connection = 1
                 acquire_timeout = 5

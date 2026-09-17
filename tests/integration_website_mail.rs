@@ -8,8 +8,8 @@
 //!
 //! * the hand-written `reqwest` cases pin the **wire contract** independently of
 //!   our client, so a bug in `WebsiteMailClient` cannot mask a contract break;
-//! * `monoengine_client_*` drive the real
-//!   [`monoengine_core::notification::website_mail::WebsiteMailClient`], so a
+//! * `mega2_client_*` drive the real
+//!   [`mega2_core::notification::website_mail::WebsiteMailClient`], so a
 //!   regression in *our own* endpoint/bearer/idempotency-key wiring fails here
 //!   instead of shipping green. Without it the whole `WEBSITE_IT` gate never
 //!   executes a single line of the client that production uses — the compose
@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use monoengine_core::{
+use mega2_core::{
     config::secret::SecretString,
     notification::website_mail::{WebsiteMailClient, canonical_request_body, idempotency_key_for},
 };
@@ -33,7 +33,7 @@ use reqwest::{
 use serde_json::{Value, json};
 
 const WEBSITE_BASE_URL: &str = "http://127.0.0.1:17001";
-const IT_BEARER: &str = "monoengine-it-website-mail-bearer-0001";
+const IT_BEARER: &str = "mega2-it-website-mail-bearer-0001";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
@@ -138,7 +138,7 @@ fn sample_body() -> Value {
 /// stable function of the request identity and the second call therefore lands
 /// on the duplicate path rather than sending a second email.
 #[test]
-fn monoengine_client_send_is_accepted_and_idempotent() {
+fn mega2_client_send_is_accepted_and_idempotent() {
     if !website_it_mail_is_requested_and_available() {
         return;
     }
@@ -238,7 +238,7 @@ fn monoengine_client_send_is_accepted_and_idempotent() {
 /// A misconfigured bearer must fail loudly through our client, and the error we
 /// hand to the logs must never contain the bearer itself.
 #[test]
-fn monoengine_client_rejects_wrong_bearer_without_leaking_it() {
+fn mega2_client_rejects_wrong_bearer_without_leaking_it() {
     if !website_it_mail_is_requested_and_available() {
         return;
     }
@@ -284,7 +284,7 @@ fn monoengine_client_rejects_wrong_bearer_without_leaking_it() {
 /// The blank-bearer hole, end to end: config validation now rejects it, but if
 /// one ever reached the client the website side must refuse it too.
 #[test]
-fn monoengine_client_blank_bearer_is_rejected_by_the_website() {
+fn mega2_client_blank_bearer_is_rejected_by_the_website() {
     if !website_it_mail_is_requested_and_available() {
         return;
     }
@@ -413,7 +413,7 @@ fn website_it_mail_is_requested_and_available() -> bool {
     assert!(
         is_reachable("127.0.0.1:17001"),
         "WEBSITE_IT=1 requires website-next at 127.0.0.1:17001; start with \
-         `docker compose -p monoengine-it -f docker-compose.test.yml \
+         `docker compose -p mega2-it -f docker-compose.test.yml \
          --profile web up -d --wait website-next`"
     );
     true

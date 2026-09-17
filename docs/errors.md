@@ -1,6 +1,6 @@
 # 错误定义集中化方案
 
-本文档定义 monoengine 的错误类型归属、接口映射和后续扩展规则。目标是让项目自定义错误只在 `crate::common::errors` 下定义，避免 API、Vault、业务模块各自维护错误枚举。
+本文档定义 mega2 的错误类型归属、接口映射和后续扩展规则。目标是让项目自定义错误只在 `crate::common::errors` 下定义，避免 API、Vault、业务模块各自维护错误枚举。
 
 ## 目标
 
@@ -156,3 +156,10 @@ N/A：未新增用户可见的 `MegaError` 枚举变体。`/api/v1/agent-capture
 N/A：未新增用户可见的 `MegaError` 枚举变体。`[storage_events]` 配置/启动错误复用 `MegaError::Other`（review 形态启用、缺 `installation_id`、重复 target id、非法 id、非 HTTPS URL、timeout 越界、HMAC 编码非法、未知 event 字面量、过滤集合超限、非 canonical path、agent 过滤不成对）。投影超 16 KiB 或非法 metadata 记为丢弃，不得映射回已提交写入的 HTTP 状态。
 
 WH-11 启动 secret 绑定沿用同一错误类：target `secret_ref` 的 SecretRef 形状/命名空间（`vault://secret/config/<profile>/storage_events/targets/<id>/hmac#<field>`）错误在 `config validate` 与服务启动两处均失败；启用时 vault 解析失败（secret/字段缺失、字段非字符串）或 `hex:<even-hex>` 编码非法同样使启动失败。脱敏保证：错误文本不含 SecretRef URI（resolver 错误固定为 `vault://secret/***#***`），绝不含解密值；诊断只命名字段路径（如 `storage_events.targets[0].secret_ref`）与要求的命名空间模板。
+
+WH-14 补齐两条同类 `MegaError::Other` 配置错误，两者在 enabled 与 disabled 形态都执行（沿用「disabled 仍做结构校验、只跳过 vault 取值」契约）：
+
+- `[storage_events] shutdown_grace_seconds must be 0..=10` —— ADR-WH-03 要求 drain 有界；`0` 合法（立即 abort 在途任务），上界是契约。此前该字段只在 unknown-field 白名单与 reload 重启登记里出现，没有范围门。
+- `[[storage_events.targets]] oci_repositories contains an invalid OCI repository name` —— 过滤项必须是 canonical distribution `remoteName`，与入站 `/v2` 同一判定（`src/common/oci_name.rs` 单一实现，大小写敏感、不折叠）。router 永不会产生的名字也永不会匹配，属于静默失效的订阅，故 fail-closed。
+
+两条诊断都只命名字段路径与规则，不回显 target `url`、`secret_ref` 或任何 secret。

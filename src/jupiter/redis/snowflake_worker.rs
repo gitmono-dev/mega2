@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::jupiter::utils::id_generator::{self, MAX_WORKER_ID};
 
-const SLOT_KEY_PREFIX: &str = "monoengine:snowflake:worker:";
+const SLOT_KEY_PREFIX: &str = "mega2:snowflake:worker:";
 const SLOT_TTL_MS: u64 = 30_000;
 
 /// Try to exclusive-claim a snowflake worker slot in Redis (`SET NX PX`).

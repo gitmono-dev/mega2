@@ -2,7 +2,7 @@
 
 本文是 `docs/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。英文贡献者使用 [`plan-template.en.md`](plan-template.en.md)；两份冲突时以本文为准。
 
-**模板版本:** `v2`（2026-07-29 起生效；本版新增任务卡粒度规则 `G-*`、`Task type` / `Lifecycle / Acceptance` / `Out of scope` / `Implementation write set` / `Release write set` / `Rollback mode` / `Version increment` / `C/D coverage from` / `Granularity` 字段、依赖登记表、发布分组与并发窗口、修订历史，并把执行检查条目改为稳定 `ER-*` 编号）。
+**模板版本:** `v2.1`（2026-09-16 起生效；版本 bump 后必须创建同名 `v<version>` tag、发布人工编写的 GitHub Release note。其余结构与 `v2` 相同。）
 
 ### 模板版本与迁移政策
 
@@ -90,13 +90,13 @@
 |---|---|---|
 | 代码入口 | `<src/...>` | `<file:line>` |
 | 数据/状态 | `<Postgres 表 / redis key / object namespace>` | `<file:line>` |
-| CLI 命令 | `<monoengine ...>` | `<src/commands/mod.rs:line（builtin / builtin_exec / load_mode 三处注册）>` |
+| CLI 命令 | `<mega2 ...>` | `<src/commands/mod.rs:line（builtin / builtin_exec / load_mode 三处注册）>` |
 | HTTP API | `<METHOD /api/v1/...>` | `<src/api/router/...:line>` |
 | 配置项 | `[section].key` | `<config/config.toml:line + src/config/model.rs:line>` |
 | 错误类型 | `<MegaError::...>` | `<src/common/errors/mod.rs:line>` |
 | 迁移 | `<m<YYYYMMDD>_<HHMMSS>_<slug>>` | `<src/jupiter/migration/mod.rs 的 migrations() 注册行>` |
 | 文档 | `<docs/...>` | `<file:line>` |
-| 测试 | `<-p monoengine --lib '<mod::tests>' 或 -p monoengine --test <target>>` | `<file:line>` |
+| 测试 | `<-p mega2 --lib '<mod::tests>' 或 -p mega2 --test <target>>` | `<file:line>` |
 | 工作区前置 | `<.env.test 是否存在 / 测试栈是否已起（Postgres 15432、Redis 16379…）>` | `<.env.test.example / docker-compose.test.yml:line>` |
 | 外部参照 | `<Mega repo@sha>` | `<path + 核对日期>` |
 
@@ -161,7 +161,7 @@
 
 - **GC-01 现状核实前置:** 每个任务开工前重新核对计划、相关开发文档、当前代码和测试。如果已实现，则任务改为补测试、补文档、更新状态或关闭，不重复实现。
 - **GC-02 单一事实源:** entity 定义、配置解析、API schema、权限策略、错误类型和共享 helper 必须有单一事实源。禁止 CLI handler、HTTP handler、migration 和测试 fixture 各自复制等价逻辑。
-- **GC-03 Mega 目标项目与 monoengine 扩展边界:** 直接从 Mega 移植的代码表面必须标注来源和差异；monoengine-only 表面必须说明替代方案、用户影响和机器接口。
+- **GC-03 Mega 目标项目与 mega2 扩展边界:** 直接从 Mega 移植的代码表面必须标注来源和差异；mega2-only 表面必须说明替代方案、用户影响和机器接口。
 - **GC-04 输出与错误契约:** 用户可见错误使用 `MegaError` 稳定变体并同步 `docs/errors.md`。HTTP 状态码、JSON 响应、CLI 退出码和人读输出必须分别验收。注意 `MegaError` 目前**没有**数值错误码注册表，变体→HTTP 状态的映射只存在于 `src/common/errors/api.rs` 的转换实现里；改动该映射必须同时更新 `docs/errors.md` 或在卡内说明为何不需要。
 - **GC-05 文档同步:** 命令、配置、HTTP API 或公开行为变化必须同步对应 `docs/` 下文档、`config/config.toml` 注释与 `README.md`。本仓 `docs/` 为中文单语，无 EN/zh 双份要求；OpenAPI 由 `utoipa` 在运行时聚合、**磁盘上没有落盘的 spec 文件**，因此 API schema 证据只能取自运行中的 `/api/openapi.json`。
 - **GC-06 测试覆盖:** 新增 entity / storage / migration 必须附带 `#[cfg(test)] mod tests`，使用 `test_db_connection` + `apply_migrations` 集成测试。新增 CLI 子命令必须附解析测试，并覆盖 `builtin()` / `builtin_exec()` / `load_mode()` 三处注册。新增集成 test target 直接在 `tests/<name>.rs` 建文件（cargo 自动发现，无需 `[[test]]` 声明），但必须同步本计划「测试矩阵」与 `docs/refactoring/integration.md` 的覆盖矩阵。
@@ -209,22 +209,22 @@
 
    | 实际改动的表面 | focused 门 |
    |---|---|
-   | lib target `monoengine_core` 的纯单元逻辑（测试写在 `src/**` 的 `#[cfg(test)]` 里） | `source .env.test && cargo test -p monoengine --lib '<mod::path::tests>'` |
-   | lib target 中需要真实 Postgres 的逻辑（storage / entity / migration / config secret） | 先起测试栈，再 `source .env.test && cargo test -p monoengine --lib '<mod::path::tests>'`；用例必须走 `test_db_connection` + `apply_migrations` |
-   | 进程级黑盒 / CLI 集成行为（`tests/**`） | `source .env.test && cargo test -p monoengine --test <target> -- --test-threads=1 [<filter>]`（`--test <target>` 不可省略：漏写会把 lib 单测一并拉进来，不再是 focused 门） |
-   | bin target 源码（composition root：global allocator、`parse` 分发；本仓为 `src/main.rs` 与 `src/bin/migrate_local_to_s3.rs`） | `source .env.test && cargo test -p monoengine --test <target> -- --test-threads=1`（经 `CARGO_BIN_EXE_monoengine` 黑盒覆盖真实二进制）**加** `cargo clippy -p monoengine --all-targets -- -D warnings`（`--all-targets` 在单包形态下已覆盖两个 bin target，此处保留为本表面的 focused 证据） |
-   | CLI 解析与注册（`src/cli.rs`、`src/commands/**`） | `cargo test -p monoengine --lib 'cli::tests'` + `cargo test -p monoengine --lib 'commands::'`；新增/改名子命令必须同时断言 `builtin()`、`builtin_exec()`、`load_mode()` 三处 |
-   | HTTP API 路由 / handler / OpenAPI 注解（`src/api/**`、`src/server/http_server.rs`） | `cargo test -p monoengine --lib 'api::'` + 启动服务后拉取 `/api/openapi.json` 的 sanitized 证据（无落盘 spec，只能取运行时输出） |
+   | lib target `mega2_core` 的纯单元逻辑（测试写在 `src/**` 的 `#[cfg(test)]` 里） | `source .env.test && cargo test -p mega2 --lib '<mod::path::tests>'` |
+   | lib target 中需要真实 Postgres 的逻辑（storage / entity / migration / config secret） | 先起测试栈，再 `source .env.test && cargo test -p mega2 --lib '<mod::path::tests>'`；用例必须走 `test_db_connection` + `apply_migrations` |
+   | 进程级黑盒 / CLI 集成行为（`tests/**`） | `source .env.test && cargo test -p mega2 --test <target> -- --test-threads=1 [<filter>]`（`--test <target>` 不可省略：漏写会把 lib 单测一并拉进来，不再是 focused 门） |
+   | bin target 源码（composition root：global allocator、`parse` 分发；本仓为 `src/main.rs` 与 `src/bin/migrate_local_to_s3.rs`） | `source .env.test && cargo test -p mega2 --test <target> -- --test-threads=1`（经 `CARGO_BIN_EXE_mega2` 黑盒覆盖真实二进制）**加** `cargo clippy -p mega2 --all-targets -- -D warnings`（`--all-targets` 在单包形态下已覆盖两个 bin target，此处保留为本表面的 focused 证据） |
+   | CLI 解析与注册（`src/cli.rs`、`src/commands/**`） | `cargo test -p mega2 --lib 'cli::tests'` + `cargo test -p mega2 --lib 'commands::'`；新增/改名子命令必须同时断言 `builtin()`、`builtin_exec()`、`load_mode()` 三处 |
+   | HTTP API 路由 / handler / OpenAPI 注解（`src/api/**`、`src/server/http_server.rs`） | `cargo test -p mega2 --lib 'api::'` + 启动服务后拉取 `/api/openapi.json` 的 sanitized 证据（无落盘 spec，只能取运行时输出） |
    | `src/callisto/**`、`src/jupiter/migration/**` | `migrations()` 注册列表已登记的断言 + `apply_migrations(&db, true)` 集成用例；若该迁移的 `down` 是 no-op，必须在 `Rollback mode` 写 `forward-only`，不得声称可回滚 |
-   | `config/config.toml`、`src/config/**` | config 校验链本地等价：`cargo run -p monoengine -- --config config/config.toml config validate`，按改动追加 `config init --output <tmp> --force`、`config validate --deny-warnings`、`--profile <name> config validate --show-sources`，以及坏配置的非零退出与 secret 不泄漏断言 |
-   | Git 协议 / LFS（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/ceres/lfs/**`、`src/api/router/lfs_router.rs`、`src/server/http_server.rs`） | `scripts/git_protocol_smoke.sh` 本地等价，完整前置以 `.github/workflows/git-protocol-smoke.yml` 现场读取为准（本格只给骨架，不是快照事实源）：① `docker compose -f docker-compose.test.yml up -d --wait postgres redis`；② `cargo build --release -p monoengine`；③ **起 `service http` 前必须覆盖数据面**——仓库默认 `config/config.toml` 指向 `postgres://localhost:5432/...` 与 `redis://127.0.0.1:6379`，与测试栈的 `15432` / `16379` 不符，用默认配置起服务必然连不上；须 `source .env.test` 或显式导出 `MEGA_DATABASE__DB_URL`（建议独立 smoke 库）、`MEGA_REDIS__URL`、`MEGA_BASE_DIR`，并按 workflow 用同一 `MEGA_BASE_DIR` 预置 `mail.password` secret（mail 启动路径 fail-closed，缺 secret 时进程直接退出且不绑定端口）；④ 起服务后轮询 `/api/openapi.json` 就绪；⑤ 只读用例（ls-remote / clone / fetch / protocol v2 / shallow / blob:none）匿名即可通过（`git.anonymous_access` 默认 `true`），此时 `MONOENGINE_HTTP_REPO_URL=http://127.0.0.1:9000/` 足够；⑥ **push / tag / LFS 用例需要鉴权**：receive-pack 无有效 Mono access token 一律 401，而脚本只能通过 URL 传凭据，因此必须先向 smoke 库 `access_token` 表播种一次性 token，并写成 `http://<user>:<token>@127.0.0.1:9000/`（token 按 ER-11 脱敏，不得进验收证据）；漏做这一步会让全部 push/tag/LFS 用例以 401 失败，**不得**判为协议实现回归；⑦ **LFS 卡必须同时设 `MONOENGINE_GIT_SMOKE_PUSH=1 MONOENGINE_GIT_SMOKE_LFS=1`**——LFS 矩阵嵌在 push 分支内，只设 `MONOENGINE_GIT_SMOKE_LFS=1` 时脚本只打印 `SKIP: HTTP LFS push/clone also requires MONOENGINE_GIT_SMOKE_PUSH=1` 且仍以退出码 0 结束，该 skip **不得**作为 LFS 证据（属「Verification 判定口径」禁止的幽灵验收）；LFS 验收必须断言输出出现 `PASS: HTTP LFS push and clone` 且末行 summary 为 `0 failed`，并预装 `git-lfs`（缺失直接判 FAIL） |
+   | `config/config.toml`、`src/config/**` | config 校验链本地等价：`cargo run -p mega2 -- --config config/config.toml config validate`，按改动追加 `config init --output <tmp> --force`、`config validate --deny-warnings`、`--profile <name> config validate --show-sources`，以及坏配置的非零退出与 secret 不泄漏断言 |
+   | Git 协议 / LFS（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/ceres/lfs/**`、`src/api/router/lfs_router.rs`、`src/server/http_server.rs`） | `scripts/git_protocol_smoke.sh` 本地等价，完整前置以 `.github/workflows/git-protocol-smoke.yml` 现场读取为准（本格只给骨架，不是快照事实源）：① `docker compose -f docker-compose.test.yml up -d --wait postgres redis`；② `cargo build --release -p mega2`；③ **起 `service http` 前必须覆盖数据面**——仓库默认 `config/config.toml` 指向 `postgres://localhost:5432/...` 与 `redis://127.0.0.1:6379`，与测试栈的 `15432` / `16379` 不符，用默认配置起服务必然连不上；须 `source .env.test` 或显式导出 `MEGA_DATABASE__DB_URL`（建议独立 smoke 库）、`MEGA_REDIS__URL`、`MEGA_BASE_DIR`，并按 workflow 用同一 `MEGA_BASE_DIR` 预置 `mail.password` secret（mail 启动路径 fail-closed，缺 secret 时进程直接退出且不绑定端口）；④ 起服务后轮询 `/api/openapi.json` 就绪；⑤ 只读用例（ls-remote / clone / fetch / protocol v2 / shallow / blob:none）匿名即可通过（`git.anonymous_access` 默认 `true`），此时 `MEGA2_HTTP_REPO_URL=http://127.0.0.1:9000/` 足够；⑥ **push / tag / LFS 用例需要鉴权**：receive-pack 无有效 Mono access token 一律 401，而脚本只能通过 URL 传凭据，因此必须先向 smoke 库 `access_token` 表播种一次性 token，并写成 `http://<user>:<token>@127.0.0.1:9000/`（token 按 ER-11 脱敏，不得进验收证据）；漏做这一步会让全部 push/tag/LFS 用例以 401 失败，**不得**判为协议实现回归；⑦ **LFS 卡必须同时设 `MEGA2_GIT_SMOKE_PUSH=1 MEGA2_GIT_SMOKE_LFS=1`**——LFS 矩阵嵌在 push 分支内，只设 `MEGA2_GIT_SMOKE_LFS=1` 时脚本只打印 `SKIP: HTTP LFS push/clone also requires MEGA2_GIT_SMOKE_PUSH=1` 且仍以退出码 0 结束，该 skip **不得**作为 LFS 证据（属「Verification 判定口径」禁止的幽灵验收）；LFS 验收必须断言输出出现 `PASS: HTTP LFS push and clone` 且末行 summary 为 `0 failed`，并预装 `git-lfs`（缺失直接判 FAIL） |
    | Cedar 策略与守卫（`src/contract/policy/**`） | 对应单元/集成用例 + 明确断言当前 permit-all 与空 `EntityStore` 前提是否被本卡改变 |
    | 仓库配置与 CI（`Cargo.toml` 非版本行、`rustfmt.toml`、`docker-compose.test.yml`、`scripts/**`、`.github/workflows/**`） | 受影响 CI job 的本地等价命令，按下文「仓库配置与 CI 展开规则」现场提取；不可本地复现的部分归 D 组 |
    | 只改文档 / 索引（无代码、无配置） | 无表面 focused 门，只走 B 组的结构与链接门 |
 
-   **Rust 行的修饰规则（不是独立表面）:** env 约束与线程约束是上面几条 Rust 行的**修饰条件**，不构成独立表面：先按测试归属唯一选中 `-p monoengine --lib` 或 `-p monoengine --test <target>` 中的一行，再把该 target 实际需要的 env 变量与线程约束**并入同一条命令**，例如 `source .env.test && cargo test -p monoengine --test integration_vault -- --test-threads=1`（`source .env.test &&` 前缀不可省略）。当前工作区**没有任何 cargo feature**（唯一 package `monoengine` 的 `Cargo.toml` 无 `[features]` 段，2026-08-27 核对），因此 `--all-features` 不改变本仓编译内容，不要用它冒充一条独立的 focused 门；它只保留在 clippy 全局门里。
+   **Rust 行的修饰规则（不是独立表面）:** env 约束与线程约束是上面几条 Rust 行的**修饰条件**，不构成独立表面：先按测试归属唯一选中 `-p mega2 --lib` 或 `-p mega2 --test <target>` 中的一行，再把该 target 实际需要的 env 变量与线程约束**并入同一条命令**，例如 `source .env.test && cargo test -p mega2 --test integration_vault -- --test-threads=1`（`source .env.test &&` 前缀不可省略）。当前工作区**没有任何 cargo feature**（唯一 package `mega2` 的 `Cargo.toml` 无 `[features]` 段，2026-08-27 核对），因此 `--all-features` 不改变本仓编译内容，不要用它冒充一条独立的 focused 门；它只保留在 clippy 全局门里。
 
-   **默认包与默认 target 选择（本仓事实，2026-08-27 核对；直接影响门的覆盖面）:** 自 `plan-20260824` 单体内联后本仓是**单 package** 仓库——根 `Cargo.toml` 只有 `[package] name = "monoengine"`，**没有** `[workspace]` 段，也没有任何子 package（`rg '^\[workspace\]' Cargo.toml` 零命中，全仓只有一个 `Cargo.toml`）。因此 `-p monoengine` 在本地命令里与省略它**等价**；模板和任务卡仍统一写全，只是为了命令可直接复制、且在未来重新拆包时不失效。真正需要显式限定的是 **target**：这一个 package 同时含 lib target `monoengine_core`、两个 bin target（`monoengine`、`migrate_local_to_s3`）和 `tests/` 下的 8 个集成 target，不带 `--lib` / `--test <target>` 的 `cargo test` 会把它们全跑一遍，focused 门必须靠 `--lib` 或 `--test <target>` 收窄（这也是上表每行都带 target 限定的原因）。反过来，`cargo build`、`cargo build --tests`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo +nightly fmt --all --check`、`source .env.test && cargo test --all` 在单包形态下**都覆盖全部 target**（含两个 bin），旧模板记录的「全局 clippy 门漏掉 `bin` 包」缺口已随单体内联消失。唯一仍需消歧的是 `cargo run`：两个 bin target 由 `Cargo.toml` 的 `default-run = "monoengine"` 兜底，要跑另一个必须显式 `--bin migrate_local_to_s3`。
+   **默认包与默认 target 选择（本仓事实，2026-08-27 核对；直接影响门的覆盖面）:** 自 `plan-20260824` 单体内联后本仓是**单 package** 仓库——根 `Cargo.toml` 只有 `[package] name = "mega2"`，**没有** `[workspace]` 段，也没有任何子 package（`rg '^\[workspace\]' Cargo.toml` 零命中，全仓只有一个 `Cargo.toml`）。因此 `-p mega2` 在本地命令里与省略它**等价**；模板和任务卡仍统一写全，只是为了命令可直接复制、且在未来重新拆包时不失效。真正需要显式限定的是 **target**：这一个 package 同时含 lib target `mega2_core`、两个 bin target（`mega2`、`migrate_local_to_s3`）和 `tests/` 下的 8 个集成 target，不带 `--lib` / `--test <target>` 的 `cargo test` 会把它们全跑一遍，focused 门必须靠 `--lib` 或 `--test <target>` 收窄（这也是上表每行都带 target 限定的原因）。反过来，`cargo build`、`cargo build --tests`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo +nightly fmt --all --check`、`source .env.test && cargo test --all` 在单包形态下**都覆盖全部 target**（含两个 bin），旧模板记录的「全局 clippy 门漏掉 `bin` 包」缺口已随单体内联消失。唯一仍需消歧的是 `cargo run`：两个 bin target 由 `Cargo.toml` 的 `default-run = "mega2"` 兜底，要跑另一个必须显式 `--bin migrate_local_to_s3`。
 
    **不得**为了凑一条 Rust 命令而制造与本卡无关的用例；也不得因为「C 组已有全量测试」就跳过 A 组某个表面的行。
 
@@ -251,7 +251,7 @@
    | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`git status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`tests/**`、`config/**`、`scripts/**`、`Cargo.toml`、`Cargo.lock`、`rustfmt.toml`、`docker-compose.test.yml`、`.github/workflows/**`），用「Verification 判定口径」的退出码模板逐条守卫 |
    | `release` | 聚合守卫（本组引入的全部新守卫用例）+ release note / 兼容证据 |
 
-   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 按 `Version increment` bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**已 bump 的状态**上跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p monoengine` → ⑤ `git add <相关路径>` + `git commit -m`（ER-07 的签名预检与提交后校验）→ ⑥ 推送并确认 branch ref：`git push origin main` 成功且远端 ref 已更新 → ⑦ **tag 与 release artifact：默认 `N/A`**。本仓当前**没有任何 release 流水线**：三个 workflow 都不由 tag 触发，没有 artifact 上传，仓库也没有任何已存在的 tag。因此不得凭空写「推 tag 触发发布」；确需产出用户可获取产物时，必须先用独立卡引入 release workflow 并同步修订本模板。
+   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面 parity 预检（ER-08）→ ② 按 `Version increment` bump 版本面（当前为**一处**：`Cargo.toml` 的 `version`，处数以 ER-08 的开工日核对为准）+ 让工具链刷新 `Cargo.lock` 的对应条目（不手改）→ ③ 在**已 bump 的状态**上跑 `AGENTS.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build` 与 `cargo build --tests` 均 0 错误 0 警告；需要可执行产物时另跑 `cargo build --release -p mega2` → ⑤ `libra add <相关路径>` + `libra commit -m` → ⑥ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑦ 对每次实际版本 bump，在该提交上创建同名标注 tag：`libra tag -m "v<version>: <summary>" v<version>`，并以 `libra push origin refs/tags/v<version>` 推送 → ⑧ 分析该版本最终 diff，人工撰写标准 release note 后执行 `gh release create v<version> -R gitmono-dev/mega2 --title "v<version>" --notes-file <release-notes-file>`。release note 必须包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止使用 `--generate-notes` 或其它自动生成内容。`Version increment=N/A` 的卡不创建 tag 或 release。
 
    三门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 刷新本身可能引入格式、lint 或编译回归，`cargo build` 不能替代 clippy 与全量测试。
 
@@ -275,15 +275,15 @@
    - **本仓已知现状（2026-08-27 核对）:** `commit.gpgSign=true`、`user.signingkey=7B2F49AE3A9E8BDC`，实测最近提交**均带 `gpgsig` 头**——即旧版记录的「配置为签名但实际不签名」缺口在 Git 下已消失，`EX-*` 豁免路径当前无需启用。若某次校验仍失败（签名密钥不可用、agent 未解锁等），必须查明原因并记录，不得静默跳过；确需以 sign-off-only 方式提交时，仍按「字段全局默认与例外」登记 `豁免项 = ER-07 签名要求` 的 `EX-*`（含 Approver、Review round、证据、有效期），「事实基线」最多链接该 `EX-*`，不构成独立授权路径。
    - **与 `README.md` / `AGENTS.md` 的已知漂移及优先级（必须按此执行）:** `README.md` 的 Contributing 一节写的是「Sign your commits (`git commit -s -S …`)」——该命令**现已可执行**（旧版记录的「双重不可执行」随 `.libra` 删除而失效），但与本仓实际惯例仍有一处差异：近期提交**不带 `Signed-off-by`**，签名由 `commit.gpgSign` 自动完成而非显式 `-S`。`AGENTS.md` 则**完全没有**提交/分支/签名指引，同时含若干过期事实（`src/common/config/loader.rs` 的真实路径是 `src/config/loader.rs`；把 `cargo test` 写成全量测试，与其自身收口门的 `source .env.test && cargo test --all` 不一致；子命令 executor 签名**待复核**）。**（2026-08-27 订正：本条旧文还把「单一 binary crate」「`src/main.rs`」列为过期事实——那是双 package 拆分期的判断；`plan-20260824` 单体内联后本仓确实是单 package、入口确实是 `src/main.rs`，AGENTS.md 这两处已与事实一致，不再计为漂移。）**计划执行时**以 ER-07 + GC-12 为准**：`git add <相关路径>` → `git commit -m` →（按上三条做签名预检与提交后 `gpgsig` 校验）。这些漂移应作为独立的文档修复项承接，不得在计划执行中两套并行。
    - 提交信息沿用本仓已观察到的两种既有风格：发布类改动用 `v<version>: <summary>`；文档/测试/CI 类改动用 `<type>(<scope>): <summary>`。
-8. **ER-08 版本与发布:** 版本权威源是根 `Cargo.toml` 的 `version`。**版本面自 plan-20260824 单体内联后只有一处**（2026-08-27 核对）：唯一 package 是 `monoengine`（`Cargo.toml` `[package] name`，lib target 名 `monoengine_core`，另有两个 `[[bin]]` target `monoengine` / `migrate_local_to_s3`）；`bin/Cargo.toml` **已不存在**，`crates/orbit*` workspace 成员与 sibling `../orbit` 也已随内联移除。因此发布前的「版本面 parity 预检」在当前拓扑下退化为空操作，但**开工时仍须重新核对版本面文件数量**（`rg -n '^version' Cargo.toml` 与 `rg -l '^\[package\]' --glob '**/Cargo.toml'`）——若未来重新拆包，parity 预检与「不一致时先建立修复卡对齐、禁止直接 bump」的规则立即恢复适用。按任务卡的 `Version increment` 递增该处 version，让工具链刷新 `Cargo.lock` 的对应条目，其余步骤与顺序按 ER-04 的「发布收口门」执行（bump 后必须重跑三门）。
-   - **包名口径**：`cargo` 命令一律用 `-p monoengine`；模板与存量计划里出现的 `-p monoengine-core` 是单体内联前的旧包名，已失效（同一裁定见 `plan-20260827.md` 的「包名口径」与其 R5 评审记录）。
+8. **ER-08 版本与发布:** 版本权威源是根 `Cargo.toml` 的 `version`。**版本面自 plan-20260824 单体内联后只有一处**（2026-08-27 核对）：唯一 package 是 `mega2`（`Cargo.toml` `[package] name`，lib target 名 `mega2_core`，另有两个 `[[bin]]` target `mega2` / `migrate_local_to_s3`）；`bin/Cargo.toml` **已不存在**，`crates/orbit*` workspace 成员与 sibling `../orbit` 也已随内联移除。因此发布前的「版本面 parity 预检」在当前拓扑下退化为空操作，但**开工时仍须重新核对版本面文件数量**（`rg -n '^version' Cargo.toml` 与 `rg -l '^\[package\]' --glob '**/Cargo.toml'`）——若未来重新拆包，parity 预检与「不一致时先建立修复卡对齐、禁止直接 bump」的规则立即恢复适用。按任务卡的 `Version increment` 递增该处 version，让工具链刷新 `Cargo.lock` 的对应条目，其余步骤与顺序按 ER-04 的「发布收口门」执行（bump 后必须重跑三门）。
+   - **包名口径**：`cargo` 命令一律用 `-p mega2`；模板与存量计划里出现的 `-p mega2-core` 是单体内联前的旧包名，已失效（同一裁定见 `plan-20260827.md` 的「包名口径」与其 R5 评审记录）。
    - `Version increment` 取值：`patch`（默认）| `minor` | `major` | `N/A`。
    - 删除公开 surface、破坏兼容的 schema/协议变更必须用 `minor` 或 `major`，且递增级别由 ADR + 兼容窗口证据决定，不得用 patch 夹带；家族卡（G-08）的递增级别写在唯一发布点卡上，子卡为 `N/A`。
    - `docs` / `audit` / `spike` / `handoff` 卡为 `N/A`，但必须说明产物随哪次提交进入仓库。
-   - 本仓没有安装脚本、没有 release artifact、没有 tag 自动化，因此「安装证据」「artifact 可获取性」默认写 `N/A`；不得照抄其它仓库的发布步骤。
+   - 每次实际版本 bump 必须创建并推送 `v<version>` 标注 tag，并以人工编写的标准 release note 创建同名 GitHub Release。release note 必须基于最终 diff，包含 Highlights、用户可见变更、兼容性 / 配置 / 迁移说明（无则写 `N/A`）、验证结果和已知限制；禁止 `--generate-notes`。`Version increment=N/A` 的卡不创建 tag 或 release。
 9. **ER-09 push 失败策略:** 非 fast-forward 需要 pull/merge 后重新验收再推；认证、权限、网络或服务端失败不 blind retry，记录原因，待下一次修复/发布窗口处理。
 10. **ER-10 内部服务错误（有界重试）:** Redis、Postgres、对象存储、SMTP、AI provider 等错误不得直接把任务宣告完成。先分类：确定性错误（4xx 参数/权限、schema 不符、编译或配置缺陷）不重试，按范围决定归属——只有当修复落在**本卡行为轴内**，且先更新本卡 `Acceptance criteria` / `Verification` / `Implementation write set` / `Granularity` 后**重跑 ER-03 的全部 `G-*` 仍然通过**（含 G-10 写集不与在跑卡新冲突）时，才作为本卡修复项就地修；任一条不满足就新建修复卡 `FIX-*`、加一条 `FIX-* -> 当前卡` 的依赖边，并把当前卡置为 `blocked`，不得为了「顺手修完」突破粒度；暂时性错误（超时、5xx、限流、网络中断）按指数退避重试，并写明**最大尝试次数与总时间预算**（计划未另行规定时默认 ≤ 5 次、总计 ≤ 30 分钟）。超预算后把任务置为 `blocked` 并记录 sanitized 证据与升级对象，不得静默空转。发布类动作（push）不自动重试，按 ER-09 处理。
-11. **ER-11 证据卫生:** 验收证据不得保存 secret、API key、token、PII、未脱敏 transcript、绝对私有路径或原始 tool payload。需要留存时只写 sanitized summary。测试栈的口令（如 `monoengine_test_password`、`smtp-test-password`、RustFS 测试凭据 `rustfs` / `rustfs_secret`）虽为公开测试值，记录时同样按脱敏处理。
+11. **ER-11 证据卫生:** 验收证据不得保存 secret、API key、token、PII、未脱敏 transcript、绝对私有路径或原始 tool payload。需要留存时只写 sanitized summary。测试栈的口令（如 `mega2_test_password`、`smtp-test-password`、RustFS 测试凭据 `rustfs` / `rustfs_secret`）虽为公开测试值，记录时同样按脱敏处理。
 12. **ER-12 并发边界与串行发布:** 并发只适用于**实现与 review 阶段**：只有 `Implementation write set` 不相交（G-10）的卡可以并发推进。**发布动作一律串行，且由单一发布者执行**：
     - 计划必须在「发布分组与并发窗口」声明发布者（哪个 Agent/人负责 C 组的 bump、构建、提交、推送，以及推送后跟踪 D 组远端证据）。同一时刻只允许一个卡处于「已 bump 未完成推送」状态。
     - 进入发布前重新读取 `Cargo.toml` 权威版本（ER-08 的 parity 预检），按顺序做完整套发布动作后才轮到下一张卡。
@@ -491,7 +491,7 @@
 
 - 「只允许 allowlist 命中」类守卫必须逐条比对固定 allowlist，并在任务记录中附命中 diff。
 - 仅用于定位符号的 `rg` 必须注明「锚点定位用，非判据」。
-- 本任务新增的 test fn / 场景过滤必须标 `(new)`，并确保其归属明确：lib（`monoengine_core`）内的 `#[cfg(test)]` 用例写 `-p monoengine --lib '<mod::path::tests::fn>'`；集成用例写 `-p monoengine --test <target>`，新 target 直接在 `tests/<target>.rs` 建文件（cargo 自动发现），并同步测试矩阵与 `docs/refactoring/integration.md` 覆盖矩阵。
+- 本任务新增的 test fn / 场景过滤必须标 `(new)`，并确保其归属明确：lib（`mega2_core`）内的 `#[cfg(test)]` 用例写 `-p mega2 --lib '<mod::path::tests::fn>'`；集成用例写 `-p mega2 --test <target>`，新 target 直接在 `tests/<target>.rs` 建文件（cargo 自动发现），并同步测试矩阵与 `docs/refactoring/integration.md` 覆盖矩阵。
 - `cargo test --all` 不能替代任务指定用例（ER-04）；反过来，指定用例也不能替代计划完成前的全量门（见「完成判据」）。
 - 依赖真实服务的用例必须在 Verification 里写清前置：Postgres 缺失会让相关用例 **panic**（不是跳过），Mailpit 在 lib 单测（`--lib`）侧是优雅跳过、在 `tests/` 集成侧是硬断言。把「跳过」当成「通过」属于幽灵验收。
 
@@ -560,13 +560,13 @@
 
 | 类别 | 必须覆盖 | Target / command |
 |---|---|---|
-| 单元 | `<纯逻辑、config parser、错误映射>` | `<cargo test -p monoengine --lib '<mod::tests>'>` |
-| 集成（DB） | `<真实 Postgres + storage/migration 工作流>` | `<cargo test -p monoengine --lib '<mod::tests>'（test_db_connection + apply_migrations）>` |
-| 集成（进程） | `<真实二进制黑盒、服务启动、配置解析>` | `<cargo test -p monoengine --test <target> -- --test-threads=1>` |
-| CLI | `<子命令解析、三处注册、退出码、输出>` | `<cargo test -p monoengine --lib 'cli::tests'>` |
-| HTTP API | `<路由、状态码、JSON schema、鉴权>` | `<cargo test -p monoengine --lib 'api::...'>` |
-| 迁移 | `<up/down、old/new schema、数据迁移>` | `<cargo test -p monoengine --lib '<migration 相关 tests>'>` |
-| 配置 | `<config validate / init / profile / secret 泄漏>` | `<cargo run -p monoengine -- ... config validate ...>` |
+| 单元 | `<纯逻辑、config parser、错误映射>` | `<cargo test -p mega2 --lib '<mod::tests>'>` |
+| 集成（DB） | `<真实 Postgres + storage/migration 工作流>` | `<cargo test -p mega2 --lib '<mod::tests>'（test_db_connection + apply_migrations）>` |
+| 集成（进程） | `<真实二进制黑盒、服务启动、配置解析>` | `<cargo test -p mega2 --test <target> -- --test-threads=1>` |
+| CLI | `<子命令解析、三处注册、退出码、输出>` | `<cargo test -p mega2 --lib 'cli::tests'>` |
+| HTTP API | `<路由、状态码、JSON schema、鉴权>` | `<cargo test -p mega2 --lib 'api::...'>` |
+| 迁移 | `<up/down、old/new schema、数据迁移>` | `<cargo test -p mega2 --lib '<migration 相关 tests>'>` |
+| 配置 | `<config validate / init / profile / secret 泄漏>` | `<cargo run -p mega2 -- ... config validate ...>` |
 | Git 协议 | `<clone/fetch/push/shallow/protocol v2/LFS>` | `<scripts/git_protocol_smoke.sh 本地等价>` |
 | 安全 | `<鉴权、Cedar 策略、secret、路径 traversal、错误 redaction>` | `<cargo test ...>` |
 | 性能 | `<规模与预算>` | `<criterion / wall-clock>` |
@@ -574,9 +574,9 @@
 
 ## 追溯表
 
-| 任务 | 来源/证据 | monoengine 落点 | 文档/兼容动作 | 指定测试 |
+| 任务 | 来源/证据 | mega2 落点 | 文档/兼容动作 | 指定测试 |
 |---|---|---|---|---|
-| `<ID>` | `<file:line / issue / repo@sha>` | `<src/callisto / src/jupiter / src/api / src/main.rs ...>` | `<docs/...、config/config.toml、运行时 OpenAPI>` | `<-p monoengine --lib '<filter>' 或 -p monoengine --test <target>>` |
+| `<ID>` | `<file:line / issue / repo@sha>` | `<src/callisto / src/jupiter / src/api / src/main.rs ...>` | `<docs/...、config/config.toml、运行时 OpenAPI>` | `<-p mega2 --lib '<filter>' 或 -p mega2 --test <target>>` |
 
 ## 里程碑验收与回滚
 
@@ -639,6 +639,6 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [ ] 必要的 docs/配置/错误契约/测试矩阵更新已完成。
 - [ ] 必要的 migration、rollback、failure-recovery 验证已完成；每张卡的 `Rollback mode` 都已被实际验证或记录为不可验证的原因。
 - [ ] 代码 review 最终结论为 `PASS`，P0/P1 全部关闭；仅 P2 residual risk 允许保留，且有具名接受人。
-- [ ] 如有发布要求，版本面（ER-08 开工日核对的处数，当前为一处）已 bump 且自洽、构建、提交、推送证据已完成（ER-08）；无 release artifact 要求时明确写 `N/A` 及原因。
+- [ ] 每次实际版本 bump 的版本面（ER-08 开工日核对的处数，当前为一处）已自洽、构建、提交、推送，并已创建和推送同名 `v<version>` tag；对应 GitHub Release 已通过 `gh` 使用人工编写的标准 release note 发布，未使用自动生成内容。
 - [ ] 「修订历史」已记录成稿后的全部规范性变更（G-09）。
 - [ ] `plan-long.md` 相关 PT/SB 状态或日期计划索引已同步，或明确 `N/A`。

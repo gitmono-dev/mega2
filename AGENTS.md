@@ -1,4 +1,4 @@
-# AGENTS.md — monoengine
+# AGENTS.md — mega2
 
 Guidance for AI coding agents working in this repository. Keep changes minimal,
 follow the patterns already in the codebase, and verify with the commands below
@@ -6,7 +6,7 @@ before submitting.
 
 ## Project Overview
 
-- **Name:** `monoengine` (single Cargo package: lib `monoengine_core` + binaries, see `Cargo.toml`).
+- **Name:** `mega2` (single Cargo package: lib `mega2_core` + binaries, see `Cargo.toml`).
 - **Edition:** Rust 2024.
 - **Purpose:** Mono‑repo / Git hosting + service engine. Ports and extends
   several subsystems originally from the Mega project (notably `callisto`
@@ -31,7 +31,7 @@ before submitting.
 - **Crypto / TLS:** `rustls`, `ring`, `openssl`, `ed25519-dalek`, `rsa`,
   `secp256k1`, `pgp`. Vault‑style PKI/secret engine via the `libvault` crate
   (crates.io `0.3.0`, features `storage_pg` + `crypto_adaptor_openssl`) and the
-  monoengine integration layer (`src/contract/vault/`). The RustyVault sources
+  mega2 integration layer (`src/contract/vault/`). The RustyVault sources
   used to be vendored under `src/vault/`; that module was removed on 2026-08-21
   (`docs/plan/plan-20260820.md`), so import library types from `libvault::*`.
 - **Email:** `lettre` (rustls + tokio).
@@ -56,8 +56,8 @@ Run these from the repo root (the agent's shell already starts there).
 | Run one test         | `cargo test --test <name>` or `cargo test <substring> -- --nocapture` |
 | Format               | `cargo fmt --all`                                                  |
 | Lint                 | `cargo clippy --all-targets -- -D warnings` (when used)            |
-| Run the binary       | `cargo run -p monoengine -- --config config/config.toml <subcommand>`            |
-| HTTP service example | `cargo run -p monoengine -- --config config/config.toml service http --host 0.0.0.0 -p 9000` |
+| Run the binary       | `cargo run -p mega2 -- --config config/config.toml <subcommand>`            |
+| HTTP service example | `cargo run -p mega2 -- --config config/config.toml service http --host 0.0.0.0 -p 9000` |
 
 **Invariants the build must hold (verified in prior sessions):**
 
@@ -109,10 +109,10 @@ without it.
 ## Project Layout
 
 ```
-Cargo.toml                # package `monoengine` (lib `monoengine_core` + [[bin]])
+Cargo.toml                # package `mega2` (lib `mega2_core` + [[bin]])
 config/config.toml        # default runtime config (TOML)
 src/
-├── main.rs               # `monoengine` binary entry (allocator + CLI dispatch)
+├── main.rs               # `mega2` binary entry (allocator + CLI dispatch)
 ├── lib.rs                # library root; declares top-level modules
 ├── cli.rs                # clap parsing, log init, ctrlc handler
 ├── orbit_api/            # object-storage contract (traits, config, errors)
@@ -239,7 +239,7 @@ the change (do not wait for the user to ask):
 ```
 
 The script debounces rapid edits (~3s) and runs `docker compose` build + recreate
-in the background. Logs: `${TMPDIR:-/tmp}/monoengine-reload-website-next/build.log`.
+in the background. Logs: `${TMPDIR:-/tmp}/mega2-reload-website-next/build.log`.
 
 Project hooks in `.cursor/hooks.json` trigger the same script on megaui file
 edits and again on agent `stop` when a reload was requested.
@@ -251,7 +251,7 @@ When a plan task card is complete (`Lifecycle=done`, dual review PASS), do
 push. VCS is Libra (no `git`).
 
 1. Bump `Cargo.toml` `version` by the card’s `Version increment` (default
-   **patch +1**) and refresh `Cargo.lock` for `monoengine`.
+   **patch +1**) and refresh `Cargo.lock` for `mega2`.
 2. `libra add` + `libra commit -m` for **that card only**.
 3. `libra push origin main`. Never `--force`. If the branch has diverged from
    origin, stop and report.

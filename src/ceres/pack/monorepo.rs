@@ -1537,13 +1537,13 @@ mod tests {
         Commit::new(
             Signature::new(
                 SignatureType::Author,
-                "Monoengine Test".to_string(),
-                "monoengine-test@example.invalid".to_string(),
+                "Mega2 Test".to_string(),
+                "mega2-test@example.invalid".to_string(),
             ),
             Signature::new(
                 SignatureType::Committer,
-                "Monoengine Test".to_string(),
-                "monoengine-test@example.invalid".to_string(),
+                "Mega2 Test".to_string(),
+                "mega2-test@example.invalid".to_string(),
             ),
             tree_id,
             vec![parent],
@@ -3387,8 +3387,8 @@ mod tests {
     async fn shared_commit_tree_pack_has_no_duplicates() {
         let temp = TempDir::new().expect("temp dir");
         let storage = test_storage(temp.path()).await;
-        let mono = storage.mono_storage();
-        let conn = mono.get_connection();
+        let mono_storage = storage.mono_storage();
+        let conn = mono_storage.get_connection();
 
         let blob = Blob::from_content_bytes(b"shared-content".to_vec());
         storage
@@ -3413,8 +3413,8 @@ mod tests {
 
         let sig = Signature::new(
             SignatureType::Author,
-            "Monoengine Test".to_string(),
-            "monoengine-test@example.invalid".to_string(),
+            "Mega2 Test".to_string(),
+            "mega2-test@example.invalid".to_string(),
         );
         let c1 = Commit::new(sig.clone(), sig.clone(), tree.id, vec![], "first commit");
         let c2 = Commit::new(

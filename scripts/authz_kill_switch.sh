@@ -59,7 +59,7 @@ Usage:
   bash scripts/authz_kill_switch.sh -h | --help
 
 Environment (branch mode):
-  KILL_SWITCH_BIN          monoengine binary (required; used for authz-audit fsync)
+  KILL_SWITCH_BIN          mega2 binary (required; used for authz-audit fsync)
   systemd: KILL_SWITCH_UNIT, KILL_SWITCH_ENV_FILE
   compose: KILL_SWITCH_COMPOSE, KILL_SWITCH_SERVICE (yq on PATH or KILL_SWITCH_YQ)
   file:    KILL_SWITCH_CONFIG, MEGA_PROFILE
@@ -230,10 +230,10 @@ run_preflight() {
   local bin
   bin="$(require_bin)"
   if [[ "${KILL_SWITCH_PREFLIGHT_INJECT_FSYNC_PROBE:-}" == "fail" ]]; then
-    die "KILL_SWITCH_BIN authz-audit fsync --probe failed (inject). Need a monoengine build with UN-29 fsync tool mode."
+    die "KILL_SWITCH_BIN authz-audit fsync --probe failed (inject). Need a mega2 build with UN-29 fsync tool mode."
   fi
   if ! "$bin" authz-audit fsync --probe >/dev/null 2>&1; then
-    die "KILL_SWITCH_BIN authz-audit fsync --probe failed. Need a monoengine build with UN-29 fsync tool mode (fd-level fsync)."
+    die "KILL_SWITCH_BIN authz-audit fsync --probe failed. Need a mega2 build with UN-29 fsync tool mode (fd-level fsync)."
   fi
 }
 
@@ -1538,14 +1538,14 @@ run_selftest() {
 
   local real_bin="${KILL_SWITCH_BIN:-}"
   if [[ -z "$real_bin" ]]; then
-    if [[ -n "${CARGO_BIN_EXE_monoengine:-}" ]]; then
-      real_bin="$CARGO_BIN_EXE_monoengine"
-    elif command -v monoengine >/dev/null 2>&1; then
-      real_bin="$(command -v monoengine)"
-    elif [[ -x "$SCRIPT_DIR/../target/debug/monoengine" ]]; then
-      real_bin="$SCRIPT_DIR/../target/debug/monoengine"
+    if [[ -n "${CARGO_BIN_EXE_mega2:-}" ]]; then
+      real_bin="$CARGO_BIN_EXE_mega2"
+    elif command -v mega2 >/dev/null 2>&1; then
+      real_bin="$(command -v mega2)"
+    elif [[ -x "$SCRIPT_DIR/../target/debug/mega2" ]]; then
+      real_bin="$SCRIPT_DIR/../target/debug/mega2"
     else
-      die "KILL_SWITCH_BIN (or CARGO_BIN_EXE_monoengine / target/debug/monoengine) required for --selftest"
+      die "KILL_SWITCH_BIN (or CARGO_BIN_EXE_mega2 / target/debug/mega2) required for --selftest"
     fi
   fi
   export KILL_SWITCH_BIN="$real_bin"

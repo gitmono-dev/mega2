@@ -2,7 +2,7 @@
 # 对照 `docker-compose.test.yml` 的数据面，去掉 website / mailpit / OAuth IT，
 # 以 `config/config-storage-only.toml` 跑 Git smart HTTP 推送 + 可选 SSH 只读。
 # 对象存储默认 RustFS（s3compatible）——直接 up 即可，不必加 --env-file。
-# 仅当要把 monoengine 改成本地文件系统后端时，才加
+# 仅当要把 mega2 改成本地文件系统后端时，才加
 # `--env-file config/compose.env.storage-only.local`（RustFS 容器仍会启动）。
 #
 # 权威配置 / 运维说明:
@@ -13,48 +13,49 @@
 # `docker-compose.test.yml`（15432 / 16379 / 19000 / 19180）冲突:
 #
 #   # 默认 RustFS（无需 --env-file）
-#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
 #
-#   # 可选：monoengine 改用本地文件系统对象存储（仅此情况需要 --env-file）
-#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
+#   # 可选：mega2 改用本地文件系统对象存储（仅此情况需要 --env-file）
+#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
 #     --env-file config/compose.env.storage-only.local up -d --wait
 #
 # 首次构建（context = 本仓库根；`.dockerignore` 排除 target/）:
 #
-#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml build monoengine
+#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml build mega2
 #
 # HTTP:  http://127.0.0.1:9000/
 # SSH:   ssh://git@127.0.0.1:2222/   (upload-pack only; receive-pack 关闭)
 # RustFS API / console: 127.0.0.1:29000 / 127.0.0.1:29001
-# Push:  Basic/Bearer，password/token = secrets/monoengine-push-token.local 内容
-#        （默认本地 token: monoengine-storage-only-local-dev-token-0001）
+# Push:  Basic/Bearer，password/token = secrets/mega2-push-token.local 内容
+#        （默认本地 token: mega2-storage-only-local-dev-token-0001）
 #
-# 生产/非本机: 用 MONOENGINE_PUSH_TOKEN_FILE 指向真实 secret 文件，勿提交明文。
+# 生产/非本机: 用 MEGA2_PUSH_TOKEN_FILE 指向真实 secret 文件，勿提交明文。
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:18.6-alpine3.24
     shm_size: "256mb"
     environment:
-      POSTGRES_USER: monoengine
-      POSTGRES_PASSWORD: monoengine_storage_password
-      POSTGRES_DB: monoengine
+      POSTGRES_USER: mega2
+      POSTGRES_PASSWORD: mega2_storage_password
+      POSTGRES_DB: mega2
     ports:
       - "127.0.0.1:25432:5432"
     volumes:
-      - monoengine-trunk-pg:/var/lib/postgresql/data
+      # Postgres 18 image: mount the parent dir, not .../data.
+      - mega2-trunk-pg:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U monoengine -d monoengine"]
+      test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
       interval: 2s
       timeout: 5s
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    image: redis:8.10.1-alpine3.23
     ports:
       - "127.0.0.1:26379:6379"
     volumes:
-      - monoengine-trunk-redis:/data
+      - mega2-trunk-redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -64,7 +65,7 @@ services:
   # Default S3-compatible object store (RustFS). Lab credentials: rustfs /
   # rustfs_secret — matches config/config-storage-only.toml.
   rustfs:
-    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
     environment:
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: 0.0.0.0:9000
@@ -77,7 +78,7 @@ services:
       - "127.0.0.1:29000:9000"
       - "127.0.0.1:29001:9001"
     volumes:
-      - monoengine-trunk-rustfs:/data
+      - mega2-trunk-rustfs:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
       interval: 2s
@@ -85,29 +86,29 @@ services:
       retries: 30
       start_period: 10s
 
-  # Bucket init via mc. Stays up so `up -d --wait` can wait on it.
+  # Bucket init via RustFS CLI (`rc`). Stays up so `up -d --wait` can wait on it.
   rustfs-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
     depends_on:
       rustfs:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
-      /usr/bin/mc mb --ignore-existing local/monoengine &&
-      /usr/bin/mc anonymous set download local/monoengine &&
+      /usr/bin/rc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/rc mb --ignore-existing local/mega2 &&
+      /usr/bin/rc anonymous set download local/mega2 &&
       exec sleep infinity
       "
     healthcheck:
-      test: ["CMD-SHELL", "/usr/bin/mc ls local/monoengine"]
+      test: ["CMD-SHELL", "/usr/bin/rc ls local/mega2"]
       interval: 2s
       timeout: 5s
       retries: 20
       start_period: 3s
 
-  # Standing monoengine for storage-only: trunk + push_auth=token + RustFS.
-  monoengine:
-    image: monoengine:local
+  # Standing mega2 for storage-only: trunk + push_auth=token + RustFS.
+  mega2:
+    image: mega2:local
     pull_policy: never
     build:
       context: .
@@ -120,17 +121,17 @@ services:
       rustfs-init:
         condition: service_healthy
     environment:
-      MEGA_BASE_DIR: /var/lib/monoengine
-      MEGA_CONFIG: /etc/monoengine/config.toml
+      MEGA_BASE_DIR: /var/lib/mega2
+      MEGA_CONFIG: /etc/mega2/config.toml
       MEGA_DATABASE__DB_TYPE: postgres
-      MEGA_DATABASE__DB_URL: postgres://monoengine:monoengine_storage_password@postgres:5432/monoengine
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_storage_password@postgres:5432/mega2
       MEGA_REDIS__URL: redis://redis:6379
       # Default RustFS (s3compatible). No --env-file needed for the default.
       # Optional local FS backend: --env-file config/compose.env.storage-only.local
       MEGA_OBJECT_STORAGE__STORAGE_TYPE: ${MEGA_OBJECT_STORAGE__STORAGE_TYPE:-s3compatible}
-      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: ${MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR:-/var/lib/monoengine/objects}
+      MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: ${MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR:-/var/lib/mega2/objects}
       MEGA_OBJECT_STORAGE__S3__REGION: ${MEGA_OBJECT_STORAGE__S3__REGION:-us-east-1}
-      MEGA_OBJECT_STORAGE__S3__BUCKET: ${MEGA_OBJECT_STORAGE__S3__BUCKET:-monoengine}
+      MEGA_OBJECT_STORAGE__S3__BUCKET: ${MEGA_OBJECT_STORAGE__S3__BUCKET:-mega2}
       MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: ${MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID:-rustfs}
       MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: ${MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY:-rustfs_secret}
       # In-network endpoint (sample file uses host 127.0.0.1:29000 for bare-metal).
@@ -142,10 +143,10 @@ services:
       MEGA_HTTP__PUBLIC_BASE_URL: ${MEGA_HTTP__PUBLIC_BASE_URL:-http://127.0.0.1:9000}
       MEGA_LFS__SSH__HTTP_URL: ${MEGA_LFS__SSH__HTTP_URL:-http://127.0.0.1:9000}
     secrets:
-      - monoengine-push-token
+      - mega2-push-token
     volumes:
-      - ./config/config-storage-only.toml:/etc/monoengine/config.toml:ro
-      - monoengine-trunk-data:/var/lib/monoengine
+      - ./config/config-storage-only.toml:/etc/mega2/config.toml:ro
+      - mega2-trunk-data:/var/lib/mega2
     ports:
       - "127.0.0.1:9000:8000"
       - "127.0.0.1:2222:2222"
@@ -153,7 +154,7 @@ services:
     command:
       [
         "--config",
-        "/etc/monoengine/config.toml",
+        "/etc/mega2/config.toml",
         "service",
         "multi",
         "http",
@@ -166,58 +167,58 @@ services:
         "2222",
       ]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/openapi.json"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
       interval: 3s
       timeout: 5s
       retries: 40
       start_period: 20s
 
-  # Optional linked Git CLI smoke against the compose-hosted monoengine.
+  # Optional linked Git CLI smoke against the compose-hosted mega2.
   # Bring up with: --profile smoke
   # Empty-volume bootstrap (once):
-  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
-  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml exec -T monoengine \
-  #     monoengine --config /etc/monoengine/config.toml service init --yes
+  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
+  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml exec -T mega2 \
+  #     mega2 --config /etc/mega2/config.toml service init --yes
   # Then (storage-only / trunk black-box; uses git client, not libra):
-  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml \
+  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml \
   #     --profile smoke exec -T git-smoke \
-  #     env MONOENGINE_HTTP_REPO_URL=http://monoengine:8000/ \
-  #         MONOENGINE_IT_SEED_TOKEN=monoengine-storage-only-local-dev-token-0001 \
-  #         MONOENGINE_GIT_SMOKE_PUSH=1 \
+  #     env MEGA2_HTTP_REPO_URL=http://mega2:8000/ \
+  #         MEGA2_IT_SEED_TOKEN=mega2-storage-only-local-dev-token-0001 \
+  #         MEGA2_GIT_SMOKE_PUSH=1 \
   #         bash /repo/scripts/git_protocol_smoke_storage_only.sh
   #
   # Product API write → Git visibility (plan-20260904 AW-04; curl+git):
-  #   TOKEN='monoengine-storage-only-local-dev-token-0001'
-  #   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml --profile smoke \
+  #   TOKEN='mega2-storage-only-local-dev-token-0001'
+  #   docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
   #     exec -T \
-  #     -e MONOENGINE_HTTP_REPO_URL="http://x:${TOKEN}@monoengine:8000/" \
-  #     -e MONOENGINE_API_BASE=http://monoengine:8000 \
-  #     -e MONOENGINE_IT_SEED_TOKEN="${TOKEN}" \
+  #     -e MEGA2_HTTP_REPO_URL="http://x:${TOKEN}@mega2:8000/" \
+  #     -e MEGA2_API_BASE=http://mega2:8000 \
+  #     -e MEGA2_IT_SEED_TOKEN="${TOKEN}" \
   #     git-smoke bash /repo/scripts/api_write_smoke_storage_only.sh
   #
   # Persist host log: tee to target/tmp/so-smoke-*.log (see docs/deploy-trunk.md).
   # Review/CL smoke remains scripts/git_protocol_smoke.sh (do not use on trunk).
   #
   # NOTE: LFS hrefs use MEGA_HTTP__PUBLIC_BASE_URL (default host 127.0.0.1:9000).
-  # For in-network LFS smoke (git-smoke → monoengine), recreate with:
+  # For in-network LFS smoke (git-smoke → mega2), recreate with:
   #   --env-file config/compose.env.storage-only.lfs-innetwork
   git-smoke:
-    image: monoengine-git-smoke:3.7.1
+    image: mega2-git-smoke:3.7.1
     build:
       context: .
       dockerfile: Dockerfile.git-smoke
     profiles: ["smoke"]
     init: true
     depends_on:
-      monoengine:
+      mega2:
         condition: service_healthy
     environment:
-      MONOENGINE_HTTP_REPO_URL: http://monoengine:8000/
-      MONOENGINE_GIT_SMOKE_PUSH: "1"
-      MONOENGINE_GIT_SMOKE_LFS: "0"
-      MONOENGINE_IT_SEED_TOKEN: monoengine-storage-only-local-dev-token-0001
+      MEGA2_HTTP_REPO_URL: http://mega2:8000/
+      MEGA2_GIT_SMOKE_PUSH: "1"
+      MEGA2_GIT_SMOKE_LFS: "0"
+      MEGA2_IT_SEED_TOKEN: mega2-storage-only-local-dev-token-0001
     volumes:
-      - ${MONOENGINE_IT_GIT_WORKDIR:-/tmp/monoengine-trunk-git}:/work
+      - ${MEGA2_IT_GIT_WORKDIR:-/tmp/mega2-trunk-git}:/work
       - .:/repo:ro
     working_dir: /work
     healthcheck:
@@ -227,16 +228,16 @@ services:
       retries: 20
 
 secrets:
-  monoengine-push-token:
-    # Override for real deployments: MONOENGINE_PUSH_TOKEN_FILE=/path/to/secret
-    file: ${MONOENGINE_PUSH_TOKEN_FILE:-./secrets/monoengine-push-token.local}
+  mega2-push-token:
+    # Override for real deployments: MEGA2_PUSH_TOKEN_FILE=/path/to/secret
+    file: ${MEGA2_PUSH_TOKEN_FILE:-./secrets/mega2-push-token.local}
 
 volumes:
-  monoengine-trunk-pg:
-  monoengine-trunk-redis:
-  monoengine-trunk-rustfs:
-  monoengine-trunk-data:
+  mega2-trunk-pg:
+  mega2-trunk-redis:
+  mega2-trunk-rustfs:
+  mega2-trunk-data:
 
 networks:
   default:
-    name: monoengine-trunk-network
+    name: mega2-trunk-network

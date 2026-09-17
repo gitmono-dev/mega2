@@ -27,8 +27,7 @@ use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use sha2::Digest as _;
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -44,7 +43,7 @@ impl TestDatabase {
     fn create() -> Self {
         let admin_url = integration_postgres_url();
         let db_name = format!(
-            "monoengine_git_lfs_{}_{}",
+            "mega2_git_lfs_{}_{}",
             std::process::id(),
             DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -53,7 +52,7 @@ impl TestDatabase {
         with_runtime(async {
             let db = Database::connect(admin_url.as_str()).await.unwrap_or_else(|_| {
                 panic!(
-                    "integration PostgreSQL is not available; run `docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait` first"
+                    "integration PostgreSQL is not available; run `docker compose -p mega2-it -f docker-compose.test.yml up -d --wait` first"
                 )
             });
             execute_postgres(&db, format!("DROP DATABASE IF EXISTS {db_name}")).await;
@@ -183,7 +182,7 @@ struct ServiceProcess {
 
 impl ServiceProcess {
     fn spawn(mut command: Command) -> Self {
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         let service = Self {
             child,
             reaped: false,
@@ -271,7 +270,7 @@ fn integration_git_lfs_http_round_trip() {
     // require_git_cli_runner; an explicit skip request must also fail.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let token = git_cli::resolve_seed_token();
@@ -285,7 +284,7 @@ fn integration_git_lfs_http_round_trip() {
         let service_pid = service.pid();
         git_cli::seed_access_token(&env.database.db_url, git_cli::DEFAULT_GIT_AUTH_USER, &token);
 
-        let remote_url = git_cli::monoengine_http_repo_url(port);
+        let remote_url = git_cli::mega2_http_repo_url(port);
         let lfs_url = format!("{}/info/lfs", remote_url.trim_end_matches('/'));
         let source_name = "lfs-source";
         let source = env.case_dir.join(source_name);
@@ -460,7 +459,7 @@ fn integration_git_lfs_trunk_push_auth_none_round_trip() {
     // LF-03: trunk + push_auth=none — anonymous LFS upload + push to main.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let probe_token = git_cli::resolve_seed_token();
@@ -581,7 +580,7 @@ fn integration_git_lfs_trunk_push_auth_token_round_trip() {
     // LF-03: trunk + push_auth=token — static token round trip; missing token fails.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs; skipping is not a green path"
     );
     git_cli::require_git_cli_runner();
     let probe_token = git_cli::resolve_seed_token();
@@ -719,7 +718,7 @@ fn trunk_boot_env() -> [(&'static str, &'static str); 3] {
 fn trunk_subpath_url(port: u16, path: &str) -> String {
     format!(
         "{}/",
-        git_cli::monoengine_host_http_url(port, path).trim_end_matches('/')
+        git_cli::mega2_host_http_url(port, path).trim_end_matches('/')
     )
 }
 
@@ -1131,7 +1130,7 @@ fn boot_service_http_with_options(
             format!("http://127.0.0.1:{port}"),
         );
     } else {
-        git_cli::apply_monoengine_public_http_base_env(&mut command, port);
+        git_cli::apply_mega2_public_http_base_env(&mut command, port);
     }
     command.args([
         "service",
@@ -1173,7 +1172,7 @@ fn wait_until_port_closed(port: u16, timeout: Duration) {
 }
 
 fn isolated_command(current_dir: &Path, base_dir: &Path, cache_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .current_dir(current_dir)
         .env_clear()
@@ -1522,7 +1521,7 @@ fn integration_git_lfs_storage_events_basic_upload() {
     // in-process handler stores the object and emits exactly one event.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs"
     );
     git_cli::require_git_cli_runner();
     assert_host_git_lfs_pinned();
@@ -1547,7 +1546,7 @@ fn integration_git_lfs_storage_events_presigned_gap() {
     // (DEFER-WH-01): zero events, but the round trip must still succeed.
     assert!(
         !git_cli::git_cli_skip_requested(),
-        "MONOENGINE_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs"
+        "MEGA2_IT_SKIP_GIT_CLI must be unset/0 for integration_git_lfs"
     );
     git_cli::require_git_cli_runner();
     assert_host_git_lfs_pinned();
@@ -1565,7 +1564,7 @@ fn integration_git_lfs_storage_events_presigned_gap() {
     let s3_env: [(&str, &str); 6] = [
         ("MEGA_OBJECT_STORAGE__STORAGE_TYPE", "s3compatible"),
         ("MEGA_OBJECT_STORAGE__S3__REGION", "us-east-1"),
-        ("MEGA_OBJECT_STORAGE__S3__BUCKET", "monoengine"),
+        ("MEGA_OBJECT_STORAGE__S3__BUCKET", "mega2"),
         (
             "MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL",
             "http://127.0.0.1:19000",

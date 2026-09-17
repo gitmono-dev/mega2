@@ -1,6 +1,6 @@
 # Monorepo 初始化与目录结构设置手册
 
-本文面向运维与开发者，说明 monoengine 在 **Monorepo 初始化**时如何生成目录结构、如何通过配置定制，以及初始化后的实际产物。产品规则（单公开分支、tag 限制、ImportRepo 例外）以 [`../monorepo.md`](../monorepo.md) 为准，本文不重复其规则细节。
+本文面向运维与开发者，说明 mega2 在 **Monorepo 初始化**时如何生成目录结构、如何通过配置定制，以及初始化后的实际产物。产品规则（单公开分支、tag 限制、ImportRepo 例外）以 [`../monorepo.md`](../monorepo.md) 为准，本文不重复其规则细节。
 
 > **范围**：默认路径下的 Monorepo（根路径 `/` 及非 `import_dir` 子树）的首次初始化。  
 > **不适用**：`import_dir` 下的 ImportRepo；已初始化库的目录重建（不支持，见下文）。
@@ -111,7 +111,7 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 1. **在首次启动前**编辑 `config/config.toml` 的 `[monorepo].root_dirs`，增删一级目录名。
 2. 若把 `third-party` 改名或移除，必须同步调整 `import_dir`，保持二者对齐，否则 ImportRepo 路径判定与目录布局会脱节。
 3. 设置 `admin` 为真实的系统管理员账号列表（写入 Cedar 实体与默认 reviewer）。
-4. 用 `cargo run -p monoengine -- --config config/config.toml config validate` 预检配置合法性。
+4. 用 `cargo run -p mega2 -- --config config/config.toml config validate` 预检配置合法性。
 5. 以**空数据库**（或未初始化过的库）启动服务，初始化自动完成；可用 `git ls-remote` 或 clone 后 `git ls-tree` 核对根树与本文第 4 节一致。
 
 ### 目录层级限制：只初始化一级目录
@@ -119,7 +119,7 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 `init_trees` 把 `root_dirs` 的每个字符串**原样**作为根树中单个条目的名字（`src/jupiter/utils/converter.rs`），不按 `/` 分段递归建树；配置校验（`src/config/validate.rs::validate_monorepo_config`）目前也只检查条目非空，不检查斜杠。因此：
 
 - `root_dirs = ["a/b"]` **能通过校验**，但初始化会把 `a/b` 当作字面条目名写进根树，而不是构建 `a/` → `b/` 的层级；
-- Git tree 条目名含 `/` 是非法的：`git fsck` 报错、客户端 checkout 拒绝；monoengine 的路径导航按 `/` 分段逐级查找（`normalize_repo_path`），请求 `/a/b` 会查找根下名为 `a` 的条目——不存在，该条目对客户端与 API 均不可达；
+- Git tree 条目名含 `/` 是非法的：`git fsck` 报错、客户端 checkout 拒绝；mega2 的路径导航按 `/` 分段逐级查找（`normalize_repo_path`），请求 `/a/b` 会查找根下名为 `a` 的条目——不存在，该条目对客户端与 API 均不可达；
 - `toolchains` 的 BUCK 注入特判只 trim 首尾斜杠，`foo/toolchains` 这类嵌套名不会命中，不会注入 `BUCK`。
 
 **多级目录的正确做法**：初始化只铺设一级骨架；更深层级由客户端正常提交产生——clone 后 `mkdir -p a/b && git add && git commit && git push`（非 `main` 推送进入 CL 管线，合并后落地 `main`）。
@@ -147,10 +147,10 @@ root_dirs = ["third-party", "project", "doc", "artifact", "release", "model", "d
 官方 `Dockerfile` 已把样例配置烘焙进镜像并预设好指向：
 
 ```dockerfile
-COPY monoengine/config/config.toml /etc/monoengine/config.toml
-ENV MEGA_BASE_DIR=/var/lib/monoengine MEGA_CONFIG=/etc/monoengine/config.toml
-ENTRYPOINT ["/usr/local/bin/monoengine"]
-CMD ["--config", "/etc/monoengine/config.toml", "service", "http", "--host", "0.0.0.0", "-p", "8000"]
+COPY mega2/config/config.toml /etc/mega2/config.toml
+ENV MEGA_BASE_DIR=/var/lib/mega2 MEGA_CONFIG=/etc/mega2/config.toml
+ENTRYPOINT ["/usr/local/bin/mega2"]
+CMD ["--config", "/etc/mega2/config.toml", "service", "http", "--host", "0.0.0.0", "-p", "8000"]
 ```
 
 烘焙适合样例与 IT；**生产建议用挂载覆盖同一路径**——`MEGA_CONFIG` 与 CMD 均已指向它，挂载后无需改启动命令。
@@ -160,15 +160,15 @@ CMD ["--config", "/etc/monoengine/config.toml", "service", "http", "--host", "0.
 **Docker / docker-compose：**
 
 ```bash
-docker run -d --name monoengine \
-  -v /srv/monoengine/config.toml:/etc/monoengine/config.toml:ro \
-  -v monoengine-data:/var/lib/monoengine \
-  -e MEGA_DATABASE__DB_URL='postgres://user:***@postgres:5432/monoengine' \
+docker run -d --name mega2 \
+  -v /srv/mega2/config.toml:/etc/mega2/config.toml:ro \
+  -v mega2-data:/var/lib/mega2 \
+  -e MEGA_DATABASE__DB_URL='postgres://user:***@postgres:5432/mega2' \
   -e MEGA_REDIS__URL='redis://redis:6379' \
-  -p 8000:8000 monoengine:local
+  -p 8000:8000 mega2:local
 ```
 
-要点：配置文件**只读挂载**（`:ro`）；环境相关项（数据面端点、凭据）不写入挂入的文件，改由 env 注入；`MEGA_BASE_DIR` 对应的数据目录挂持久卷。本仓 `docker-compose.test.yml` 的 `monoengine` 服务即「镜像基线 + env 覆盖」的完整参照。
+要点：配置文件**只读挂载**（`:ro`）；环境相关项（数据面端点、凭据）不写入挂入的文件，改由 env 注入；`MEGA_BASE_DIR` 对应的数据目录挂持久卷。本仓 `docker-compose.test.yml` 的 `mega2` 服务即「镜像基线 + env 覆盖」的完整参照。
 
 **Kubernetes（ConfigMap + Secret）：**
 
@@ -176,10 +176,10 @@ docker run -d --name monoengine \
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: monoengine-config
+  name: mega2-config
 data:
   config.toml: |
-    base_dir = "/var/lib/monoengine"
+    base_dir = "/var/lib/mega2"
     [monorepo]
     import_dir = "/third-party"
     admin = ["admin"]
@@ -188,17 +188,17 @@ data:
 # Pod 片段：
 volumeMounts:
   - name: config
-    mountPath: /etc/monoengine/config.toml
+    mountPath: /etc/mega2/config.toml
     subPath: config.toml
     readOnly: true
 env:
   - name: MEGA_DATABASE__DB_URL
-    valueFrom: { secretKeyRef: { name: monoengine-data-plane, key: database-url } }
+    valueFrom: { secretKeyRef: { name: mega2-data-plane, key: database-url } }
   - name: MEGA_REDIS__URL
-    valueFrom: { secretKeyRef: { name: monoengine-data-plane, key: redis-url } }
+    valueFrom: { secretKeyRef: { name: mega2-data-plane, key: redis-url } }
 volumes:
   - name: config
-    configMap: { name: monoengine-config }
+    configMap: { name: mega2-config }
 ```
 
 **Secret 边界：** 对象存储、Redis 等凭据可在配置文件中写 `vault://` SecretRef（`src/config/secret.rs`），运行时经 Vault 解析、明文不落盘；但**数据库凭据不能使用 vault SecretRef**（引导循环硬约束），只能经 env/文件注入。不要把任何明文生产凭据烘焙进镜像或提交进仓库。
@@ -208,8 +208,8 @@ volumes:
 - 部署前预检（ENTRYPOINT 即二进制，直接跟子命令）：
 
   ```bash
-  docker run --rm -v /srv/monoengine/config.toml:/etc/monoengine/config.toml:ro \
-    monoengine:local config validate --deny-warnings
+  docker run --rm -v /srv/mega2/config.toml:/etc/mega2/config.toml:ro \
+    mega2:local config validate --deny-warnings
   ```
 
 - 排错时加 `--show-sources` 查看每个键来自文件还是 env。

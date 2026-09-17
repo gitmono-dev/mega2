@@ -1,4 +1,4 @@
-# Monoengine integration tests
+# Mega2 integration tests
 
 This document describes the active integration-test contract. Compose service
 registration and lifecycle rules live in [`test-infra.md`](./test-infra.md).
@@ -18,19 +18,19 @@ The landing cases depend on the shared root writer specified in `trunk-push.md`.
 ## Test stack
 
 `docker-compose.test.yml` provides PostgreSQL, Redis, RustFS, optional
-profiled `git-cli`, profile `app` monoengine, and profile `web` website-next.
+profiled `git-cli`, profile `app` mega2, and profile `web` website-next.
 Use the fixed project name:
 
 ```bash
-docker compose -p monoengine-it -f docker-compose.test.yml up -d --wait
+docker compose -p mega2-it -f docker-compose.test.yml up -d --wait
 ```
 
-The embedded `VaultCore` is part of monoengine; no external Vault container is
+The embedded `VaultCore` is part of mega2; no external Vault container is
 used. Database schemas must be created through the project's migrations.
 
 Mailpit remains an optional capture service for website authentication and
-website product-email IT only. Monoengine never connects to it, and neither
-the default integration suite nor CI requires a monoengine SMTP success path.
+website product-email IT only. Mega2 never connects to it, and neither
+the default integration suite nor CI requires a mega2 SMTP success path.
 
 ## Active integration targets
 
@@ -44,21 +44,21 @@ Git 用户场景的完整矩阵（HTTP/SSH/auth/repo-shape、字面 `git pull`�
 | `integration_git_cli` | Git HTTP protocol round trips | PostgreSQL, Redis, `--profile git` |
 | `integration_git_cli` filter `trunk` / `push_auth` | Trunk 直推 e2e：`integration_git_cli_trunk_n1_identity_three_ff_and_no_cl_refs`、`integration_git_cli_trunk_n_gt1_squash_sideband_and_nff_align`、`integration_git_cli_trunk_requester_token_name`、`integration_git_cli_push_auth_token_rejects_without_token_and_out_of_path` | PostgreSQL, Redis；本机防火墙下 compose `git-cli` 可能不可达，用例走 host git + `127.0.0.1` |
 | `integration_git_lfs` | Git HTTP LFS push → fetch → `git lfs pull` round trip（plan-20260803 / GM-05 review/CL）；WH-05 追加 `integration_git_lfs_storage_events_basic_upload`（basic 一次投递日志）与 `integration_git_lfs_storage_events_presigned_gap`（RustFS 直传零事件，DEFER-WH-01 缺口证据） | PostgreSQL, Redis, `--profile git`, git-lfs |
-| `integration_git_lfs` filter `trunk` | storage-only LFS（plan-20260909 / LF-03）：`integration_git_lfs_trunk_push_auth_none_round_trip`、`integration_git_lfs_trunk_push_auth_token_round_trip`；直推 `main` 子路径，非 CL。Compose 黑盒对照：`scripts/git_protocol_smoke_storage_only.sh` case `HTTP LFS push and pull (trunk)` + `config/compose.env.storage-only.lfs-innetwork`（plan-20260906 SO-03 / ADR-SO-04） | PostgreSQL, Redis, git-lfs；本机防火墙下 compose `git-cli` 可能不可达时走 host git + `MONOENGINE_IT_ALLOW_HOST_GIT=1` |
+| `integration_git_lfs` filter `trunk` | storage-only LFS（plan-20260909 / LF-03）：`integration_git_lfs_trunk_push_auth_none_round_trip`、`integration_git_lfs_trunk_push_auth_token_round_trip`；直推 `main` 子路径，非 CL。Compose 黑盒对照：`scripts/git_protocol_smoke_storage_only.sh` case `HTTP LFS push and pull (trunk)` + `config/compose.env.storage-only.lfs-innetwork`（plan-20260906 SO-03 / ADR-SO-04） | PostgreSQL, Redis, git-lfs；本机防火墙下 compose `git-cli` 可能不可达时走 host git + `MEGA2_IT_ALLOW_HOST_GIT=1` |
 | `integration_storage_events_media` | storage-only FastCDC media finalize 出站进程级门（plan-20260912 / WH-06）：feature-on/off 两个独立 target-dir 二进制（off：路由 404、零事件；on：OpenAPI 列 media 路由、匿名/静态 token 401、DB token 404 业务证明、零事件、SIGINT 清理尾段）；正向事件由 fastcdc lib collector 覆盖 | PostgreSQL, Redis；嵌套 cargo 构建两个 feature 二进制；`--test-threads=1` |
 | `integration_git_ssh` | Git SSH cargo-native self-start clone/pull/push（plan-20260803 / GM-06..08） | PostgreSQL, Redis, `--profile git` |
 | `integration_git_ssh` filter `trunk_none` / `token_anon` | storage-only SSH 只读（plan-20260908 / SP-01）：`integration_git_ssh_trunk_none_anon_on_clone`、`integration_git_ssh_trunk_none_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_on_clone` | PostgreSQL, Redis；`--profile git` 或 host git |
 | `integration_git_ssh` filter `token_anon_off` / `review_pubkey` | storage-only SSH password-token（plan-20260908 / SP-02）：`integration_git_ssh_trunk_token_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_off_password_clone`、`integration_git_ssh_trunk_token_anon_off_password_fetch`、`integration_git_ssh_trunk_token_anon_off_password_pull`、`integration_git_ssh_trunk_token_push_receive_pack_disabled`、`integration_git_ssh_review_pubkey_anon_off_clone`、`integration_git_ssh_review_pubkey_anon_on_push` | PostgreSQL, Redis；host git + `127.0.0.1`（compose git-cli 无法 hairpin 时） |
-| `integration_website_auth` | Better Auth cookie to monoengine session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
+| `integration_website_auth` | Better Auth cookie to mega2 session bridge | `--profile app --profile web`, `WEBSITE_IT=1` |
 | `integration_website_mail` | Website internal product-email API acceptance (Bearer + allowlisted event → 202; bad bearer → 401) | `--profile app --profile web`, `WEBSITE_IT=1`, website tip with internal mail route |
 | `integration_authz_audit` | 只读装配零副作用黑盒（UN-30 / UN-43）+ `authz-audit` CLI（UN-29 审计/fsync + UN-37 promote） | PostgreSQL, Redis，且必须 `-- --test-threads=1` |
 | `integration_oci` | storage-only OCI `/v2` 进程级黑盒（plan-20260902 / DR-12）：`integration_oci_auth_matrix`、`integration_oci_protocol_walkthrough`、`integration_oci_docker_gated`（daemon 不可用 → SKIP，不 FAIL）；WH-04 追加 `integration_oci_storage_events_publication`（enabled+播种 secret 的 manifest 发布 201 + 一次有界投递日志 + digest 不符 400 + SIGINT 清理尾段） | PostgreSQL, Redis；raw HTTP（reqwest）；docker CLI 仅 `docker_gated` 组可选 |
 | `integration_api_write_trunk` | trunk 产品 API 写（plan-20260904 / AW-03）：token `create-entry` / `edit/save` 前进 tip、无 CL、无凭据 401 | PostgreSQL, Redis；raw HTTP（reqwest）；`push_policy=trunk` + `push_auth=token` |
 | `integration_agent_capture` | storage-only Agent Capture `/api/v1/agent-capture` 进程级黑盒（plan-20260911 / AC-13）：`integration_agent_capture_happy_path`、`integration_agent_capture_review_404`、`integration_agent_capture_unauthorized`、`integration_agent_capture_tracing_has_no_raw_sentinel`、`integration_agent_capture_cross_deployment_isolated`、`integration_agent_capture_tombstone_race`；WH-07 追加 `storage_events_batch`（enabled+播种 secret：OpenAPI 仍列 `events:batch`、`push_auth=none` 下无效 ingest token 401、有效 token 200、跨仓库 404、SIGINT 清理尾段；正向投递由 lib collector 覆盖）；WH-08 追加 `storage_events_checkpoint`（OpenAPI 仍列 checkpoints、无效 token 401、新/重复/共享 blob/incomplete 200、跨仓库 404；正向投递由 lib collector 覆盖） | PostgreSQL, Redis；隔离 local object backend；raw HTTP（reqwest）；`--test-threads=1` |
 | `integration_storage_events_runtime` | storage-only 出站事件关停接线进程级门（plan-20260912 / WH-13）：默认 disabled 的 `service http` SIGINT 优雅退出并记录 `storage_events_shutdown_complete`、占用端口启动失败仍经清理尾段、`service multi http` SIGINT 退出、`config validate` 无清理日志的 AC7 回归；WH-11 `secret_binding`：enabled+valid secret 经 `config secret set` 种子后启动/SIGINT 退出、enabled+missing 与 wrong-namespace 快速失败且日志无 SecretRef URI（脱敏）、disabled+dangling ref 正常启动 | PostgreSQL, Redis；`--test-threads=1` |
-| `integration_storage_events_git` | storage-only 出站 `repo.push` 进程级门（plan-20260912 / WH-03）：enabled+已播种 secret 下真实 host-git trunk push 落地、真实运输记录一次有界投递尝试（类别日志）、SIGINT 经清理尾段退出；review 形态拒绝 enabled；review 分支 push 建 CL 回归 | PostgreSQL, Redis；host git；`--test-threads=1` |
+| `integration_storage_events_git` | storage-only 出站 `repo.push` 进程级门（plan-20260912 / WH-03）：enabled+已播种 secret 下真实 host-git trunk push 落地、真实运输记录一次有界投递尝试（类别日志）、SIGINT 经清理尾段退出；review 形态拒绝 enabled；review 分支 push 建 CL 回归。WH-15 追加：每条 emitter 投递/drop 行带播种的 `installation_id`、drop 行不命中投递过滤器、被静态过滤的 seed push 恰好产生一条 `dropped_filter` 行（API 写用例为零条） | PostgreSQL, Redis；host git；`--test-threads=1` |
 
-storage-only outbound events（plan-20260912）地址策略、HMAC 运输与有界 emitter 由 lib 测试（`jupiter::service::storage_event_transport` / `storage_event_emitter`）覆盖；WH-13 的 CLI/service 关停接线与 WH-11 的启动 secret 绑定由进程级 target `integration_storage_events_runtime` 覆盖（见上表）。生产运输没有 HTTP/私网逃逸开关。WH-03 已在 B3 真实 push 提交挂钩（`repo.push`），进程级证据见 `integration_storage_events_git`；WH-07 Agent `events.committed` 的进程级认证/OpenAPI 证据见 `integration_agent_capture` 的 `storage_events_batch`；WH-08 checkpoint 见同 target 的 `storage_events_checkpoint`。
+storage-only outbound events（plan-20260912）地址策略、HMAC 运输与有界 emitter 由 lib 测试（`jupiter::service::storage_event_transport` / `storage_event_emitter`）覆盖；WH-15 的 drop 记账与 `installation_id` 记录字段由 `storage_event_emitter::tests::drop_accounting_and_installation_id`（thread-local tracing 捕获，覆盖七类 disposition、per-target 行、`record_invalid_event` 与 disabled/`-` 情形）覆盖，投递行的 `installation_id` 与「drop 行不命中投递过滤器」由 `integration_storage_events_git` 的 `assert_emitter_lines_carry_installation_id` 在真实进程 stdout 上断言；WH-13 的 CLI/service 关停接线与 WH-11 的启动 secret 绑定由进程级 target `integration_storage_events_runtime` 覆盖（见上表）。生产运输没有 HTTP/私网逃逸开关。WH-03 已在 B3 真实 push 提交挂钩（`repo.push`），进程级证据见 `integration_storage_events_git`；WH-07 Agent `events.committed` 的进程级认证/OpenAPI 证据见 `integration_agent_capture` 的 `storage_events_batch`；WH-08 checkpoint 见同 target 的 `storage_events_checkpoint`。
 
 Run the normal project gate with the test environment loaded:
 
@@ -66,26 +66,26 @@ Run the normal project gate with the test environment loaded:
 source .env.test && cargo test --all
 ```
 
-Integration test sources live under `tests/integration_*.rs` on the `monoengine`
-package (lib `monoengine_core`). Black-box tests drive the real CLI via
-`CARGO_BIN_EXE_monoengine`.
+Integration test sources live under `tests/integration_*.rs` on the `mega2`
+package (lib `mega2_core`). Black-box tests drive the real CLI via
+`CARGO_BIN_EXE_mega2`.
 
 For the real website-session and internal-mail checks:
 
 ```bash
-docker compose -p monoengine-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker-compose.test.yml \
   --profile app --profile web up -d --wait
 source .env.test
-WEBSITE_IT=1 cargo test -p monoengine --test integration_website_auth -- --test-threads=1
-WEBSITE_IT=1 cargo test -p monoengine --test integration_website_mail -- --test-threads=1
+WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1
+WEBSITE_IT=1 cargo test -p mega2 --test integration_website_mail -- --test-threads=1
 ```
 
-When `WEBSITE_IT=1` is set, unavailable monoengine or website-next endpoints
+When `WEBSITE_IT=1` is set, unavailable mega2 or website-next endpoints
 are failures, not passing skips.
 
 ## Notification and product-email coverage
 
-Monoengine tests cover trigger selection, user preferences, in-app delivery,
+Mega2 tests cover trigger selection, user preferences, in-app delivery,
 optional Slack/webhook handling, and the website-mail client’s request/error
 behavior. The website owns product-email rendering and delivery.
 
@@ -94,7 +94,7 @@ Do not add or retain tests that:
 - seed or query `email_jobs`;
 - set `[mail]`, `mail.password`, or SMTP endpoint configuration;
 - require `SmtpMailer` to deliver to Mailpit;
-- treat Mailpit availability as a monoengine startup gate.
+- treat Mailpit availability as a mega2 startup gate.
 
 Website email capture, if needed, belongs to website-next’s test provider
 configuration and may use the Compose `mailpit` service. See
@@ -131,7 +131,7 @@ HTTP 服务启动时在 listener 绑定前完成共享授权快照首建（`ensu
 - **写原语**：同目录临时文件 `O_EXCL|O_NOFOLLOW` → `cp --preserve=all` 播种 → 原地改写字节 → 元数据逐项校验 → `KILL_SWITCH_BIN authz-audit fsync <tmp>` → `renameat` → `authz-audit fsync <target>`；目标须为 no-follow 普通文件；systemd EnvironmentFile 拒绝重复键。
 - **重启与失败终态（UN-46）**：`--restart -- <argv...>` 恰好一次；T1 重启失败 → 退出码 4、配置保持 off、打印人工重启指引；T3 rename 后 fsync 失败 → 退出码 5、不回滚为 on、重跑幂等收敛。
 - **元数据保持（UN-48）**：owner / mode / ACL / xattr；写后 `stat`/`getfacl`/xattr 比对，不符即失败（可用 `KILL_SWITCH_META_VERIFY_FAIL` 注入）。
-- **自测**：`bash scripts/authz_kill_switch.sh --selftest`（… + UN-42×6 + UN-44×7 = **58/58**；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/monoengine`；compose/preflight 需 `yq`（或 `KILL_SWITCH_YQ`）；缺 `getfattr` 时自测会在临时 PATH 放入存在性 stub。
+- **自测**：`bash scripts/authz_kill_switch.sh --selftest`（… + UN-42×6 + UN-44×7 = **58/58**；fsync stub = `scripts/authz_kill_switch_fsync_stub.sh`）。需可用的 `KILL_SWITCH_BIN` 或 `target/debug/mega2`；compose/preflight 需 `yq`（或 `KILL_SWITCH_YQ`）；缺 `getfattr` 时自测会在临时 PATH 放入存在性 stub。
 - **发布**：REL-02 十子卡本地提交后由 UN-45 原子发布为 **v0.2.65**（脚本入口 / 三分支 / 拓扑绑定 / 失败终态安全方向见上；降级 = 不执行该脚本）。
 
 ## 迁移覆盖：`mega_cl.link` 唯一索引（UN-10）
@@ -176,11 +176,11 @@ compose-backed integration targets (including `integration_website_auth` and
 `integration_website_mail` under `WEBSITE_IT=1`), and the real website session
 check after checking out the `megaui` sibling. Product email is
 proven via the website internal API + `EMAIL_PROVIDER=test`; no local SMTP
-dependency is required for monoengine notification paths.
+dependency is required for mega2 notification paths.
 
 ## 只读装配的零副作用比对（UN-30 / UN-43）
 
-`integration_authz_audit` 的立论方式是**前后对照**，不是通读代码。播种走**真实二进制**（`monoengine service http` 起来再 SIGINT），因此迁移、`init_monorepo()` 写下的 refs 与对象全都真的发生过——手搓出来的库只包含我们想到的东西，而「零写入」恰恰是关于没想到的那些。
+`integration_authz_audit` 的立论方式是**前后对照**，不是通读代码。播种走**真实二进制**（`mega2 service http` 起来再 SIGINT），因此迁移、`init_monorepo()` 写下的 refs 与对象全都真的发生过——手搓出来的库只包含我们想到的东西，而「零写入」恰恰是关于没想到的那些。
 
 快照有七个面：schema（范围是除系统 schema 外的**全部** schema）、每表**内容摘要**（整行转文本排序聚合后 md5，而不是行数——一次 UPDATE 不改变计数）、`pg_sequences` 当前值（被回滚的插入不留行却推进序列，那同样是一次写）、`mega_refs` 全行、三张对象表全行、对象存储目录逐文件散列，以及 `MEGA_BASE_DIR` + `MEGA_CACHE_DIR` 的逐文件指纹（vault 的 `core_key.json` 就在这一面里）。文件指纹是**内容散列 + 尺寸 + 权限位 + mtime**：一次「内容相同」的重写不会改变内容散列，却仍然是一次写，只有 mtime 能发现它。目录本身也收（路径 + 权限位），因此创建/删除/改名目录与只改目录权限都看得见。
 

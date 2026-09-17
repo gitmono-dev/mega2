@@ -86,7 +86,11 @@ use crate::{
                 FileToUpload as ApiFileToUpload, ManifestPayload, ManifestResponse,
             },
             change_list::{ClDiffFile, ClFilesChangedItemSchema, UpdateBranchStatusRes},
-            git::{CreateEntryInfo, CreateEntryResult, EditFilePayload, EditFileResult},
+            git::{
+                CreateEntryInfo, CreateEntryResult, DeleteEntryInfo, DeleteEntryResult, EditCLMode,
+                EditFilePayload, EditFileResult, MoveEntryInfo, MoveEntryResult,
+                common_parent_path, join_entry_path, normalize_parent_path, validate_entry_target,
+            },
             tag::TagInfo,
             third_party::{ThirdPartyClient, ThirdPartyRepoTrait},
         },
@@ -131,7 +135,9 @@ use crate::{
             buck_storage::{session_status, upload_status},
             mono_storage::RefUpdateData,
         },
-        utils::converter::{FromMegaModel, IntoMegaModel, generate_git_keep_with_timestamp},
+        utils::converter::{
+            FromMegaModel, IntoMegaModel, generate_git_keep_with_timestamp, sort_git_tree_items,
+        },
     },
 };
 #[rustfmt::skip]
@@ -444,6 +450,42 @@ struct CreateEntryUpdate {
     entry_oid: ObjectHash,
     repo_path: PathBuf,
     save_trees: Vec<Tree>,
+}
+
+/// The rewritten trees a directory change produced, plus everything
+/// [`MonoApiService::commit_tree_update`] needs to turn them into one commit
+/// and advance the tip (plan-20260917 ADR-LB-02; shared by create/delete).
+struct TreeCommitInput {
+    update_result: TreeUpdateResult,
+    /// New tree objects to persist (leaf/parent trees the change built).
+    save_trees: Vec<Tree>,
+    /// New blob objects to persist (empty for a pure tree rewrite).
+    blobs: Vec<Blob>,
+    /// Path whose subtree the change rewrote; resolves the landing tip.
+    repo_path: PathBuf,
+    commit_msg: String,
+    author_username: Option<String>,
+    skip_build: bool,
+    mode: EditCLMode,
+}
+
+/// What [`MonoApiService::commit_tree_update`] landed.
+struct TreeCommitOutcome {
+    commit_id: String,
+    cl_link: Option<String>,
+}
+
+/// The timestamped `.gitkeep` placeholder that represents an empty directory
+/// — create-entry's new directories and delete-entry's emptied parents share
+/// it (GC-02).
+fn gitkeep_placeholder() -> (Blob, TreeItem) {
+    let blob = generate_git_keep_with_timestamp();
+    let item = TreeItem {
+        mode: TreeItemMode::Blob,
+        id: blob.id,
+        name: String::from(".gitkeep"),
+    };
+    (blob, item)
 }
 
 struct ApplyChangeContext<'a> {
@@ -1202,146 +1244,285 @@ impl ApiHandler for MonoApiService {
         entry_info: CreateEntryInfo,
         requester: Option<String>,
     ) -> Result<CreateEntryResult, GitError> {
-        let storage = self.storage.mono_storage();
         let CreateEntryUpdate {
             update_result,
             blob,
             entry_oid,
             repo_path,
-            mut save_trees,
+            save_trees,
         } = self.prepare_create_entry_update(&entry_info).await?;
-
-        let repo_path_str = MonoServiceLogic::subtree_ref_path(&repo_path)
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-        let build_repo_path = match edit_utils::resolve_build_repo_root(
-            &self.storage,
-            &repo_path_str,
-        )
-        .await
-        {
-            Ok(path) => path,
-            Err(e) => {
-                tracing::warn!(
-                    repo_path = %repo_path_str,
-                    "Failed to resolve build repo root for create entry, fallback to CL subtree root: {}",
-                    e
-                );
-                repo_path_str.clone()
-            }
-        };
-
-        let tip_path = if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
-            self.resolve_trunk_land_path(&repo_path_str).await?
-        } else {
-            build_repo_path.clone()
-        };
-
-        let src_commit = edit_utils::get_repo_main_latest_commit(&self.storage, &tip_path).await?;
-        let base_commit =
-            ObjectHash::from_hex_for_kind(get_hash_kind(), &src_commit.id.to_string()).map_err(
-                |e| GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id)),
-            )?;
-        let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &tip_path)
-            .ok_or_else(|| {
-                GitError::CustomError(format!(
-                    "Missing updated tree for build repo root {tip_path}"
-                ))
-            })?;
-        let dst_commit =
-            Commit::from_tree_id(target_tree_id, vec![base_commit], &entry_info.commit_msg());
-        let new_commit_id = dst_commit.id.to_string();
-
-        let username = entry_info
-            .author_username
-            .clone()
-            .unwrap_or("Anonymous".to_string());
-
         let new_oid = entry_oid.to_string();
-
-        let mut all_trees = update_result.updated_trees;
-        all_trees.append(&mut save_trees);
-        let save_trees: Vec<mega_tree::ActiveModel> = all_trees
-            .into_iter()
-            .map(|save_t| {
-                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
-                tree_model.commit_id.clone_from(&new_commit_id);
-                tree_model.into()
-            })
-            .collect();
-        self.storage
-            .mono_service
-            .save_blobs(&new_commit_id, vec![blob])
-            .await?;
-
-        storage
-            .batch_save_model(save_trees)
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-
-        self.storage
-            .mono_service
-            .mono_storage
-            .save_mega_commits(vec![dst_commit], None)
-            .await?;
-
         let entry_path = Self::build_entry_path(&entry_info.path, &entry_info.name);
-
-        if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
-            let old_id = src_commit.id.to_string();
-            let payload_n1 = PushPayload {
-                commits: vec![new_commit_id.clone()],
-                fork_base: Some(old_id.clone()),
-                n: 1,
-            };
-            let landed = land_api_tip_push(
-                &self.storage,
-                self.git_object_cache.clone(),
-                &tip_path,
-                &old_id,
-                &new_commit_id,
+        let outcome = self
+            .commit_tree_update(
+                TreeCommitInput {
+                    update_result,
+                    save_trees,
+                    blobs: vec![blob],
+                    repo_path,
+                    commit_msg: entry_info.commit_msg(),
+                    author_username: entry_info.author_username.clone(),
+                    skip_build: entry_info.skip_build,
+                    mode: entry_info.mode.clone(),
+                },
                 requester,
-                &payload_n1,
-            )
-            .await
-            .map_err(|e| GitError::CustomError(e.to_string()))?;
-            return Ok(CreateEntryResult {
-                commit_id: landed,
-                new_oid,
-                path: entry_path,
-                cl_link: None,
-            });
-        }
-
-        let editor = OneditCodeEdit::from(
-            &build_repo_path,
-            MEGA_BRANCH_NAME
-                .strip_prefix("refs/heads/")
-                .unwrap_or(MEGA_BRANCH_NAME),
-            &src_commit.id.to_string(),
-            self,
-            self.storage.mono_storage(),
-        );
-        let cl = editor
-            .find_or_create_cl_for_edit(
-                &self.storage,
-                &editor,
-                entry_info.mode.clone(),
-                &new_commit_id,
-                &username,
             )
             .await?;
-
-        if !entry_info.skip_build {
-            editor
-                .trigger_check(self.storage.clone(), &username, &cl)
-                .await?;
-        }
-
         Ok(CreateEntryResult {
-            commit_id: new_commit_id,
+            commit_id: outcome.commit_id,
             new_oid,
             path: entry_path,
-            cl_link: Some(cl.link),
+            cl_link: outcome.cl_link,
+        })
+    }
+
+    /// Delete a directory: drop its item from the parent tree and commit the
+    /// rewritten chain (plan-20260917 ADR-LB-02). Empty and non-empty
+    /// directories share this one semantic. A parent left empty keeps a
+    /// timestamped `.gitkeep` so it stays a valid (empty) directory — the same
+    /// representation create-entry uses for a new empty directory.
+    async fn delete_monorepo_entry(
+        &self,
+        entry_info: DeleteEntryInfo,
+        requester: Option<String>,
+    ) -> Result<DeleteEntryResult, GitError> {
+        validate_entry_target(&entry_info.path, &entry_info.name)
+            .map_err(|reason| GitError::CustomError(format!("[code:400] {reason}")))?;
+        let parent = PathBuf::from(if entry_info.path.is_empty() {
+            "/"
+        } else {
+            entry_info.path.as_str()
+        });
+        let mut update_chain = self
+            .load_parent_chain(
+                &parent,
+                |p| format!("[code:404] parent directory {} not found", p.display()),
+                |p| format!("[code:400] parent path {} is not a directory", p.display()),
+            )
+            .await?;
+        let parent_tree = update_chain
+            .pop()
+            .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
+        let mut items = parent_tree.tree_items.clone();
+        // A tree may legally hold a blob and a tree of the same name
+        // (create-entry's duplicate check is mode-scoped), so look for the
+        // directory first and only then diagnose a same-named file.
+        let index = match items
+            .iter()
+            .position(|item| item.name == entry_info.name && item.mode == TreeItemMode::Tree)
+        {
+            Some(index) => index,
+            None if items.iter().any(|item| item.name == entry_info.name) => {
+                return Err(GitError::CustomError(format!(
+                    "[code:400] '{}' is not a directory",
+                    entry_info.name
+                )));
+            }
+            None => {
+                return Err(GitError::CustomError(format!(
+                    "[code:404] entry '{}' not found under {}",
+                    entry_info.name,
+                    parent.display()
+                )));
+            }
+        };
+        items.remove(index);
+
+        let mut blobs = Vec::new();
+        if items.is_empty() {
+            let (keep, item) = gitkeep_placeholder();
+            items.push(item);
+            blobs.push(keep);
+        }
+        // Removing an item (or appending `.gitkeep` to a now-empty list)
+        // keeps the stored order, so the new tree id is deterministic.
+        let new_parent = Tree::from_tree_items(items)
+            .map_err(|_| GitError::CustomError("Invalid tree".to_string()))?;
+        let update_result =
+            MonoServiceLogic::build_result_by_chain(parent.clone(), update_chain, new_parent.id)?;
+        let entry_path = Self::build_entry_path(&entry_info.path, &entry_info.name);
+        let outcome = self
+            .commit_tree_update(
+                TreeCommitInput {
+                    update_result,
+                    save_trees: vec![new_parent],
+                    blobs,
+                    repo_path: parent,
+                    commit_msg: entry_info.commit_msg(),
+                    author_username: entry_info.author_username.clone(),
+                    skip_build: entry_info.skip_build,
+                    mode: EditCLMode::TryReuse(None),
+                },
+                requester,
+            )
+            .await?;
+        Ok(DeleteEntryResult {
+            commit_id: outcome.commit_id,
+            path: entry_path,
+            cl_link: outcome.cl_link,
+        })
+    }
+
+    /// Move or rename a directory: the item leaves the source parent tree and
+    /// the same tree id is inserted under the destination parent, both chains
+    /// rolled up to the root in one commit (plan-20260917 ADR-LB-02/03). The
+    /// commit lands on the deepest directory containing both parents; a
+    /// source parent left empty keeps a `.gitkeep` like delete-entry.
+    async fn move_monorepo_entry(
+        &self,
+        entry_info: MoveEntryInfo,
+        requester: Option<String>,
+    ) -> Result<MoveEntryResult, GitError> {
+        for (path, name) in [
+            (&entry_info.from_path, &entry_info.from_name),
+            (&entry_info.to_path, &entry_info.to_name),
+        ] {
+            validate_entry_target(path, name)
+                .map_err(|reason| GitError::CustomError(format!("[code:400] {reason}")))?;
+        }
+        let src_parent = normalize_parent_path(&entry_info.from_path);
+        let dest_parent = normalize_parent_path(&entry_info.to_path);
+        let src_full = join_entry_path(&src_parent, &entry_info.from_name);
+        let dest_full = join_entry_path(&dest_parent, &entry_info.to_name);
+        if src_full == dest_full {
+            return Err(GitError::CustomError(format!(
+                "[code:400] source and destination are the same: {src_full}"
+            )));
+        }
+        if dest_parent == src_full || dest_parent.starts_with(&format!("{src_full}/")) {
+            return Err(GitError::CustomError(format!(
+                "[code:400] cannot move {src_full} into its own subtree {dest_parent}"
+            )));
+        }
+        // The router dispatches on the source path only; a destination under
+        // an ImportRepo must be refused here (ADR-LB-06).
+        let import_dir = self.storage.config().monorepo.import_dir.clone();
+        let dest_parent_path = PathBuf::from(&dest_parent);
+        if dest_parent_path.starts_with(&import_dir)
+            && dest_parent_path != import_dir
+            && self
+                .storage
+                .git_db_storage()
+                .find_git_repo_like_path(&dest_parent)
+                .await
+                .map_err(|e| GitError::CustomError(e.to_string()))?
+                .is_some()
+        {
+            return Err(GitError::CustomError(
+                "[code:409] import dir does not support move entry".to_string(),
+            ));
+        }
+
+        let src_parent_path = PathBuf::from(&src_parent);
+        let mut src_chain = self
+            .load_parent_chain(
+                &src_parent_path,
+                |p| format!("[code:404] source parent {} not found", p.display()),
+                |p| {
+                    format!(
+                        "[code:400] source parent path {} is not a directory",
+                        p.display()
+                    )
+                },
+            )
+            .await?;
+        let src_tree = src_chain
+            .pop()
+            .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
+        let mut src_items = src_tree.tree_items.clone();
+        let index = match src_items
+            .iter()
+            .position(|item| item.name == entry_info.from_name && item.mode == TreeItemMode::Tree)
+        {
+            Some(index) => index,
+            None if src_items
+                .iter()
+                .any(|item| item.name == entry_info.from_name) =>
+            {
+                return Err(GitError::CustomError(format!(
+                    "[code:400] '{}' is not a directory",
+                    entry_info.from_name
+                )));
+            }
+            None => {
+                return Err(GitError::CustomError(format!(
+                    "[code:404] entry '{}' not found under {}",
+                    entry_info.from_name, src_parent
+                )));
+            }
+        };
+        let moved = src_items.remove(index);
+
+        let mut ancestors = vec![(src_parent_path.clone(), src_chain)];
+        let mut edits: Vec<(PathBuf, Vec<TreeItem>)> = Vec::new();
+        let mut blobs = Vec::new();
+        let mut dest_items = if src_parent == dest_parent {
+            // Rename: one parent tree carries both edits.
+            src_items
+        } else {
+            let mut dest_chain = self
+                .load_parent_chain(
+                    &dest_parent_path,
+                    |p| format!("[code:404] destination parent {} not found", p.display()),
+                    |p| {
+                        format!(
+                            "[code:400] destination parent path {} is not a directory",
+                            p.display()
+                        )
+                    },
+                )
+                .await?;
+            let dest_tree = dest_chain
+                .pop()
+                .ok_or_else(|| GitError::CustomError("Empty update chain".to_string()))?;
+            ancestors.push((dest_parent_path.clone(), dest_chain));
+            if src_items.is_empty() {
+                let (keep, item) = gitkeep_placeholder();
+                src_items.push(item);
+                blobs.push(keep);
+            }
+            edits.push((src_parent_path.clone(), src_items));
+            dest_tree.tree_items.clone()
+        };
+        if dest_items
+            .iter()
+            .any(|item| item.name == entry_info.to_name)
+        {
+            return Err(GitError::CustomError(format!(
+                "[code:400] '{}' already exists under {}",
+                entry_info.to_name, dest_parent
+            )));
+        }
+        dest_items.push(TreeItem {
+            mode: TreeItemMode::Tree,
+            id: moved.id,
+            name: entry_info.to_name.clone(),
+        });
+        sort_git_tree_items(&mut dest_items);
+        edits.push((dest_parent_path, dest_items));
+
+        let update_result = Self::rewrite_parent_chains(ancestors, edits)?;
+        let landing = common_parent_path(&src_parent, &dest_parent);
+        let outcome = self
+            .commit_tree_update(
+                TreeCommitInput {
+                    update_result,
+                    save_trees: Vec::new(),
+                    blobs,
+                    repo_path: PathBuf::from(landing),
+                    commit_msg: entry_info.commit_msg(),
+                    author_username: entry_info.author_username.clone(),
+                    skip_build: entry_info.skip_build,
+                    mode: EditCLMode::TryReuse(None),
+                },
+                requester,
+            )
+            .await?;
+        Ok(MoveEntryResult {
+            commit_id: outcome.commit_id,
+            from_path: src_full,
+            to_path: dest_full,
+            cl_link: outcome.cl_link,
         })
     }
 
@@ -1675,6 +1856,258 @@ impl ApiHandler for MonoApiService {
 }
 
 impl MonoApiService {
+    /// `search_tree_for_update` with the ADR-LB-03 error mapping: a missing
+    /// component is the caller's 404, a component that names a blob (the walk
+    /// then fails to load it as a tree: `tree not found: <hash>`) is the
+    /// caller's 400; anything else propagates unchanged.
+    async fn load_parent_chain(
+        &self,
+        parent: &Path,
+        missing: impl Fn(&Path) -> String,
+        not_a_directory: impl Fn(&Path) -> String,
+    ) -> Result<Vec<Arc<Tree>>, GitError> {
+        match self.search_tree_for_update(parent).await {
+            Ok(chain) => Ok(chain),
+            Err(err) if PATH_NOT_EXIST_RE.is_match(&err.to_string()) => {
+                Err(GitError::CustomError(missing(parent)))
+            }
+            Err(err) if err.to_string().contains("tree not found:") => {
+                Err(GitError::CustomError(not_a_directory(parent)))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Rebuild edited parent trees and roll the new ids up every chain to the
+    /// root (plan-20260917 LB-03). `ancestors` maps each edited parent path
+    /// to its ancestor trees root-first (what `search_tree_for_update`
+    /// returns minus the parent itself); `edits` are the new item lists of
+    /// the edited parents. Paths are rebuilt deepest-first and each new id is
+    /// written into the parent's item list before that parent is rebuilt, so
+    /// a rename (one parent), sibling parents and ancestor/descendant parents
+    /// all converge on a single new root.
+    fn rewrite_parent_chains(
+        ancestors: Vec<(PathBuf, Vec<Arc<Tree>>)>,
+        edits: Vec<(PathBuf, Vec<TreeItem>)>,
+    ) -> Result<TreeUpdateResult, GitError> {
+        let mut known: HashMap<PathBuf, Arc<Tree>> = HashMap::new();
+        for (parent, chain) in ancestors {
+            let mut prefixes: Vec<PathBuf> =
+                std::iter::successors(parent.parent().map(Path::to_path_buf), |p| {
+                    p.parent().map(Path::to_path_buf)
+                })
+                .collect();
+            prefixes.reverse();
+            if prefixes.len() != chain.len() {
+                return Err(GitError::CustomError(format!(
+                    "update chain for {} has {} trees for {} ancestor levels",
+                    parent.display(),
+                    chain.len(),
+                    prefixes.len()
+                )));
+            }
+            for (path, tree) in prefixes.into_iter().zip(chain) {
+                known.insert(path, tree);
+            }
+        }
+        let mut pending: HashMap<PathBuf, Vec<TreeItem>> = edits.into_iter().collect();
+        let mut updated_trees = Vec::new();
+        let mut ref_updates = Vec::new();
+        while let Some(path) = pending
+            .keys()
+            .max_by_key(|p| p.components().count())
+            .cloned()
+        {
+            let Some(items) = pending.remove(&path) else {
+                break;
+            };
+            let tree = Tree::from_tree_items(items)
+                .map_err(|_| GitError::CustomError("Invalid tree".to_string()))?;
+            let clean_path = MonoServiceLogic::clean_path_str(&path.to_string_lossy());
+            let ref_path = if clean_path == "/" || clean_path.starts_with('/') {
+                clean_path
+            } else {
+                format!("/{clean_path}")
+            };
+            ref_updates.push(RefUpdate {
+                path: ref_path,
+                tree_id: tree.id,
+            });
+            let Some(parent) = path.parent().map(Path::to_path_buf) else {
+                updated_trees.push(tree);
+                break;
+            };
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| GitError::CustomError("Invalid path".into()))?
+                .to_owned();
+            let mut parent_items = match pending.remove(&parent) {
+                Some(items) => items,
+                None => known
+                    .get(&parent)
+                    .ok_or_else(|| {
+                        GitError::CustomError(format!(
+                            "parent tree of {} was not loaded",
+                            path.display()
+                        ))
+                    })?
+                    .tree_items
+                    .clone(),
+            };
+            let slot = parent_items
+                .iter_mut()
+                .find(|item| item.name == name)
+                .ok_or_else(|| GitError::CustomError(format!("Tree item '{name}' not found")))?;
+            slot.id = tree.id;
+            pending.insert(parent, parent_items);
+            updated_trees.push(tree);
+        }
+        Ok(TreeUpdateResult {
+            updated_trees,
+            ref_updates,
+        })
+    }
+
+    /// Shared tail of the directory-change writes (create / delete / move):
+    /// build one commit over the rewritten trees, persist the new objects, then
+    /// advance the tip — `land_api_tip_push` under `push_policy=trunk`, the
+    /// existing CL branch otherwise (ADR-LB-02 / ADR-LB-06). One
+    /// implementation for every entry write (GC-02).
+    async fn commit_tree_update(
+        &self,
+        input: TreeCommitInput,
+        requester: Option<String>,
+    ) -> Result<TreeCommitOutcome, GitError> {
+        let TreeCommitInput {
+            update_result,
+            mut save_trees,
+            blobs,
+            repo_path,
+            commit_msg,
+            author_username,
+            skip_build,
+            mode,
+        } = input;
+        let storage = self.storage.mono_storage();
+        let repo_path_str = MonoServiceLogic::subtree_ref_path(&repo_path)
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+        let build_repo_path = match edit_utils::resolve_build_repo_root(
+            &self.storage,
+            &repo_path_str,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!(
+                    repo_path = %repo_path_str,
+                    "Failed to resolve build repo root for entry write, fallback to CL subtree root: {}",
+                    e
+                );
+                repo_path_str.clone()
+            }
+        };
+
+        let tip_path = if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            self.resolve_trunk_land_path(&repo_path_str).await?
+        } else {
+            build_repo_path.clone()
+        };
+
+        let src_commit = edit_utils::get_repo_main_latest_commit(&self.storage, &tip_path).await?;
+        let base_commit =
+            ObjectHash::from_hex_for_kind(get_hash_kind(), &src_commit.id.to_string()).map_err(
+                |e| GitError::CustomError(format!("Invalid commit hash {}: {e}", src_commit.id)),
+            )?;
+        let target_tree_id = Self::ref_update_tree_id_for_path(&update_result, &tip_path)
+            .ok_or_else(|| {
+                GitError::CustomError(format!(
+                    "Missing updated tree for build repo root {tip_path}"
+                ))
+            })?;
+        let dst_commit = Commit::from_tree_id(target_tree_id, vec![base_commit], &commit_msg);
+        let new_commit_id = dst_commit.id.to_string();
+
+        let username = author_username.unwrap_or("Anonymous".to_string());
+
+        let mut all_trees = update_result.updated_trees;
+        all_trees.append(&mut save_trees);
+        let save_trees: Vec<mega_tree::ActiveModel> = all_trees
+            .into_iter()
+            .map(|save_t| {
+                let mut tree_model: mega_tree::Model = save_t.into_mega_model(EntryMeta::new());
+                tree_model.commit_id.clone_from(&new_commit_id);
+                tree_model.into()
+            })
+            .collect();
+        if !blobs.is_empty() {
+            self.storage
+                .mono_service
+                .save_blobs(&new_commit_id, blobs)
+                .await?;
+        }
+
+        storage
+            .batch_save_model(save_trees)
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+
+        self.storage
+            .mono_service
+            .mono_storage
+            .save_mega_commits(vec![dst_commit], None)
+            .await?;
+
+        if self.storage.config().monorepo.push_policy == PushPolicy::Trunk {
+            let old_id = src_commit.id.to_string();
+            let payload_n1 = PushPayload {
+                commits: vec![new_commit_id.clone()],
+                fork_base: Some(old_id.clone()),
+                n: 1,
+            };
+            let landed = land_api_tip_push(
+                &self.storage,
+                self.git_object_cache.clone(),
+                &tip_path,
+                &old_id,
+                &new_commit_id,
+                requester,
+                &payload_n1,
+            )
+            .await
+            .map_err(|e| GitError::CustomError(e.to_string()))?;
+            return Ok(TreeCommitOutcome {
+                commit_id: landed,
+                cl_link: None,
+            });
+        }
+
+        let editor = OneditCodeEdit::from(
+            &build_repo_path,
+            MEGA_BRANCH_NAME
+                .strip_prefix("refs/heads/")
+                .unwrap_or(MEGA_BRANCH_NAME),
+            &src_commit.id.to_string(),
+            self,
+            self.storage.mono_storage(),
+        );
+        let cl = editor
+            .find_or_create_cl_for_edit(&self.storage, &editor, mode, &new_commit_id, &username)
+            .await?;
+
+        if !skip_build {
+            editor
+                .trigger_check(self.storage.clone(), &username, &cl)
+                .await?;
+        }
+
+        Ok(TreeCommitOutcome {
+            commit_id: new_commit_id,
+            cl_link: Some(cl.link),
+        })
+    }
+
     async fn prepare_create_entry_update(
         &self,
         entry_info: &CreateEntryInfo,
@@ -1776,12 +2209,7 @@ impl MonoApiService {
                 // directory can be represented as a tree with at least
                 // one blob entry. The blob contains a timestamp so it's
                 // unique.
-                let blob = generate_git_keep_with_timestamp();
-                let tree_item = TreeItem {
-                    mode: TreeItemMode::Blob,
-                    id: blob.id,
-                    name: String::from(".gitkeep"),
-                };
+                let (blob, tree_item) = gitkeep_placeholder();
                 let new_dir_tree = Tree::from_tree_items(vec![tree_item]).unwrap();
                 save_trees.push(new_dir_tree.clone());
                 let entry_oid = new_dir_tree.id;
@@ -1845,12 +2273,7 @@ impl MonoApiService {
                 // Create .gitkeep blob and an initial tree for the new
                 // directory leaf. This represents the directory's own
                 // tree object which will be nested under new parent trees.
-                let blob = generate_git_keep_with_timestamp();
-                let tree_item = TreeItem {
-                    mode: TreeItemMode::Blob,
-                    id: blob.id,
-                    name: String::from(".gitkeep"),
-                };
+                let (blob, tree_item) = gitkeep_placeholder();
                 let new_dir_tree = Tree::from_tree_items(vec![tree_item]).unwrap();
                 save_trees.push(new_dir_tree.clone());
                 let entry_oid = new_dir_tree.id;
@@ -10125,7 +10548,7 @@ mod tests {
             msg.contains("Squash 3 commits at /p16n3"),
             "signed squash keeps the subject after gpgsig: {msg}"
         );
-        assert!(msg.contains("This commit was created by monoengine"));
+        assert!(msg.contains("This commit was created by mega2"));
         assert!(msg.contains("Mono-Squash-Count: 3"));
         assert!(msg.contains(&format!("Mono-Squash-Range: {old_id}..{}", c3.id)));
         assert!(!msg.contains("Mono-Commits"));

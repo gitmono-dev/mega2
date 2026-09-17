@@ -14,7 +14,7 @@ use super::{
     normalize_token_path,
     secret::{SecretRef, is_secret_ref_value},
 };
-use crate::common::errors::MegaError;
+use crate::common::{errors::MegaError, oci_name::valid_repository_name};
 #[rustfmt::skip]
 use crate::orbit_api::factory::{ObjectStorageBackend, ObjectStorageConfig};
 
@@ -762,11 +762,23 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
             &secret_ref,
             &format!("storage_events/targets/{}/hmac", target.id),
         )?;
-        validate_storage_events_filter_list("git_paths", &target.git_paths, true)?;
-        validate_storage_events_filter_list("lfs_paths", &target.lfs_paths, true)?;
-        validate_storage_events_filter_list("agent_repo_paths", &target.agent_repo_paths, true)?;
-        validate_storage_events_filter_list("oci_repositories", &target.oci_repositories, false)?;
-        validate_storage_events_filter_list("agent_tenants", &target.agent_tenants, false)?;
+        validate_storage_events_filter_list("git_paths", &target.git_paths, FilterKind::Path)?;
+        validate_storage_events_filter_list("lfs_paths", &target.lfs_paths, FilterKind::Path)?;
+        validate_storage_events_filter_list(
+            "agent_repo_paths",
+            &target.agent_repo_paths,
+            FilterKind::Path,
+        )?;
+        validate_storage_events_filter_list(
+            "oci_repositories",
+            &target.oci_repositories,
+            FilterKind::OciRepository,
+        )?;
+        validate_storage_events_filter_list(
+            "agent_tenants",
+            &target.agent_tenants,
+            FilterKind::Opaque,
+        )?;
         let agent_tenants_empty = target.agent_tenants.is_empty();
         let agent_repos_empty = target.agent_repo_paths.is_empty();
         if agent_tenants_empty != agent_repos_empty {
@@ -795,6 +807,14 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
     if !(1..=10).contains(&events.request_timeout_seconds) {
         return Err(MegaError::Other(
             "[storage_events] request_timeout_seconds must be 1..=10".to_string(),
+        ));
+    }
+    // ADR-WH-03 bounds the drain: an unbounded grace would let shutdown park
+    // on in-flight sends instead of aborting them. `0` is legal (abort at
+    // once); the upper bound is the contract.
+    if !(0..=10).contains(&events.shutdown_grace_seconds) {
+        return Err(MegaError::Other(
+            "[storage_events] shutdown_grace_seconds must be 0..=10".to_string(),
         ));
     }
     Ok(())
@@ -847,10 +867,24 @@ fn is_storage_events_event_literal(value: &str) -> bool {
     STORAGE_EVENTS_EVENT_LITERALS.contains(&value)
 }
 
+/// Per-source shape of a target's filter entries (ADR-WH-01): each source
+/// matches on its own dimension, so each dimension validates its own entry
+/// form. Count and byte-size limits are shared.
+#[derive(Clone, Copy)]
+enum FilterKind {
+    /// Absolute canonical repository path (`git_paths`, `lfs_paths`,
+    /// `agent_repo_paths`).
+    Path,
+    /// Canonical distribution `remoteName` (`oci_repositories`).
+    OciRepository,
+    /// Server-supplied opaque value compared verbatim (`agent_tenants`).
+    Opaque,
+}
+
 fn validate_storage_events_filter_list(
     field: &str,
     items: &[String],
-    paths: bool,
+    kind: FilterKind,
 ) -> Result<(), MegaError> {
     if items.len() > 64 {
         return Err(MegaError::Other(format!(
@@ -863,12 +897,25 @@ fn validate_storage_events_filter_list(
                 "[[storage_events.targets]] {field} items must be 1..=256 bytes"
             )));
         }
-        if paths {
-            validate_storage_events_canonical_path(item).map_err(|_| {
-                MegaError::Other(format!(
-                    "[[storage_events.targets]] {field} contains a non-canonical path"
-                ))
-            })?;
+        match kind {
+            FilterKind::Path => {
+                validate_storage_events_canonical_path(item).map_err(|_| {
+                    MegaError::Other(format!(
+                        "[[storage_events.targets]] {field} contains a non-canonical path"
+                    ))
+                })?;
+            }
+            // A name the `/v2` router would reject can never match an inbound
+            // repository, so it is a dead subscription rather than a loose
+            // filter. Same rule as inbound, no case folding.
+            FilterKind::OciRepository => {
+                if !valid_repository_name(item) {
+                    return Err(MegaError::Other(format!(
+                        "[[storage_events.targets]] {field} contains an invalid OCI repository name"
+                    )));
+                }
+            }
+            FilterKind::Opaque => {}
         }
     }
     Ok(())
@@ -1880,7 +1927,7 @@ mod tests {
     use crate::orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
 
     fn valid_config() -> Config {
-        isolated_config(std::env::temp_dir().join("monoengine-config-validate-tests"))
+        isolated_config(std::env::temp_dir().join("mega2-config-validate-tests"))
     }
 
     #[test]
@@ -2164,9 +2211,7 @@ mod tests {
         config.vault = Some(crate::config::VaultConfig {
             audit: crate::config::VaultAuditConfig {
                 sink: "file".to_string(),
-                file_path: Some(std::path::PathBuf::from(
-                    "/var/log/monoengine/vault-audit.jsonl",
-                )),
+                file_path: Some(std::path::PathBuf::from("/var/log/mega2/vault-audit.jsonl")),
                 fail_closed: true,
                 ..Default::default()
             },
@@ -2714,7 +2759,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3Compatible,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine".to_string(),
+                bucket: "mega2".to_string(),
                 access_key_id: "ak".to_string(),
                 secret_access_key: "sk".to_string(),
                 endpoint_url: "http://127.0.0.1:9000".to_string(),
@@ -2741,7 +2786,7 @@ mod tests {
         config.object_storage = ObjectStorageConfig {
             storage_type: ObjectStorageBackend::Gcs,
             gcs: GcsConfig {
-                bucket: "monoengine".to_string(),
+                bucket: "mega2".to_string(),
             },
             ..Default::default()
         };
@@ -2798,7 +2843,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: "vault://secret/config/prod/object_storage/access_key_id#value"
                     .to_string(),
                 secret_access_key:
@@ -2820,7 +2865,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: "vault://secret/config/prod/object-storage/access#value".to_string(),
                 secret_access_key: "secret".to_string(),
                 endpoint_url: String::new(),
@@ -2846,7 +2891,7 @@ mod tests {
             storage_type: ObjectStorageBackend::S3,
             s3: S3Config {
                 region: "us-east-1".to_string(),
-                bucket: "monoengine-test".to_string(),
+                bucket: "mega2-test".to_string(),
                 access_key_id: "AKIA-example".to_string(),
                 secret_access_key: "vault://secret/config/prod/mail/password#value".to_string(),
                 endpoint_url: String::new(),
@@ -3284,7 +3329,7 @@ mod tests {
 
     #[test]
     fn config_init_template_has_no_unconsumed_fields() {
-        let rendered = config_init_template(Path::new("/tmp/monoengine"));
+        let rendered = config_init_template(Path::new("/tmp/mega2"));
         let value = toml::from_str::<Value>(&rendered).unwrap();
 
         assert!(known_unconsumed_fields(&value).is_empty());
@@ -3558,6 +3603,36 @@ mod tests {
             .validate()
             .expect_err("empty events list is rejected when disabled");
         assert!(err.to_string().contains("events"), "{err}");
+
+        // WH-14 / ADR-WH-03: the drain grace is bounded. `0` (abort at once)
+        // and `10` (the ceiling) are legal; anything above it is not, and the
+        // bound holds in the disabled morphology too.
+        for grace in [0, 5, 10] {
+            let mut bounded = valid_config();
+            bounded.storage_events.shutdown_grace_seconds = grace;
+            bounded
+                .validate()
+                .unwrap_or_else(|err| panic!("shutdown_grace_seconds {grace} is in range: {err}"));
+        }
+        for grace in [11, 3600] {
+            let mut unbounded = valid_config();
+            unbounded.storage_events.shutdown_grace_seconds = grace;
+            let err = unbounded
+                .validate()
+                .expect_err("shutdown_grace_seconds above the ceiling is rejected");
+            assert!(
+                err.to_string().contains("shutdown_grace_seconds"),
+                "diagnostic must name the field: {err}"
+            );
+        }
+        let mut enabled_unbounded = storage_only_none();
+        enabled_unbounded.storage_events.enabled = true;
+        enabled_unbounded.storage_events.installation_id = Some("prod-primary-01".to_string());
+        enabled_unbounded.storage_events.shutdown_grace_seconds = 11;
+        let err = enabled_unbounded
+            .validate()
+            .expect_err("enabled storage_events also bounds the grace");
+        assert!(err.to_string().contains("shutdown_grace_seconds"), "{err}");
     }
 
     #[test]
@@ -3675,6 +3750,84 @@ mod tests {
         config.storage_events.targets = vec![target];
         let err = config.validate().expect_err("agent filters must be paired");
         assert!(err.to_string().contains("agent_tenants"), "{err}");
+
+        // WH-14 / ADR-WH-01: `oci_repositories` uses the same canonical
+        // `remoteName` rule as the inbound `/v2` router — a name the router
+        // would reject can never match, so it is a dead subscription.
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.oci_repositories = vec![
+            "team/image".to_string(),
+            "team/foo.bar".to_string(),
+            "team/foo_bar".to_string(),
+            "team/foo__bar".to_string(),
+            "team/foo--bar".to_string(),
+            "single".to_string(),
+        ];
+        config.storage_events.targets = vec![target];
+        config
+            .validate()
+            .expect("canonical distribution remoteNames are accepted");
+
+        // The shared count/byte-size limits must still fire under the new
+        // `FilterKind::OciRepository` arm, not just under `Path`.
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.oci_repositories = vec!["a".repeat(257)];
+        config.storage_events.targets = vec![target];
+        let err = config
+            .validate()
+            .expect_err("oci filter item longer than 256 bytes");
+        assert!(err.to_string().contains("oci_repositories"), "{err}");
+        assert!(err.to_string().contains("1..=256"), "{err}");
+
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.oci_repositories = (0..65).map(|i| format!("team/image{i}")).collect();
+        config.storage_events.targets = vec![target];
+        let err = config.validate().expect_err("too many oci filter items");
+        assert!(err.to_string().contains("oci_repositories"), "{err}");
+        assert!(err.to_string().contains("at most 64"), "{err}");
+
+        // `agent_tenants` is `FilterKind::Opaque`: a tenant is compared
+        // verbatim and is neither a path nor a remoteName, so a value that
+        // fails both of those rules must still be accepted. Guards against
+        // wiring the tenant list to the wrong arm.
+        let mut config = valid_config();
+        let mut target = sample_target();
+        target.agent_tenants = vec!["Acme Corp".to_string()];
+        target.agent_repo_paths = vec!["/team/a".to_string()];
+        config.storage_events.targets = vec![target];
+        config
+            .validate()
+            .expect("opaque tenant values are compared verbatim, not parsed");
+
+        for invalid in [
+            "Team/Image",
+            "team/../image",
+            "/team/image",
+            "team/image/",
+            "team//image",
+            "team/image.",
+            "team/image__",
+        ] {
+            let mut config = valid_config();
+            let mut target = sample_target();
+            target.oci_repositories = vec![invalid.to_string()];
+            config.storage_events.targets = vec![target];
+            let err = match config.validate() {
+                Ok(()) => panic!("{invalid:?} is not a valid remoteName and must be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("oci_repositories"),
+                "diagnostic must name the field for {invalid:?}: {err}"
+            );
+            assert!(
+                err.to_string().contains("OCI repository name"),
+                "diagnostic must name the rule for {invalid:?}: {err}"
+            );
+        }
 
         let mut config = valid_config();
         config.storage_events.targets = (0..17)

@@ -1,18 +1,18 @@
 # Vault 模块现状与改进计划
 
-本文档记录 `monoengine` 当前 `vault` 模块的实现形态、主要风险、与配置系统的依赖关系，以及后续分阶段改进计划。本文与 `config.md` 中关于敏感配置、`SecretRef`、最小 DB/Vault bootstrap 和 `core_key.json` 加固的约束保持一致。
+本文档记录 `mega2` 当前 `vault` 模块的实现形态、主要风险、与配置系统的依赖关系，以及后续分阶段改进计划。本文与 `config.md` 中关于敏感配置、`SecretRef`、最小 DB/Vault bootstrap 和 `core_key.json` 加固的约束保持一致。
 
 > **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
 
 > **集成测试指引**：本计划的各阶段应通过 **`integration.md`** 中定义的集成测试进行端到端验证，特别是 Vault 初始化、Secret 存储与轮换、fail-closed 行为和最小 bootstrap 能力应在 Docker 环境中完整测试。
 
-> **仓库格式说明（2026-06-16）**：当前工作副本由 **Libra** 管理，不是传统 `.git` 工作树。执行、评审或核对本计划时，应使用 `libra status`、`libra diff -- <path>`、`libra add` 等 Libra 命令检查工作区状态与差异；不要把 `git status` / `git diff` 失败误判为“不是仓库”。本文中“Git 协议 / Git 托管 / 不进入 git”描述的是 monoengine 的业务域和兼容目标，不代表当前开发工作区必须由 Git 管理。
+> **仓库格式说明（2026-06-16）**：当前工作副本由 **Libra** 管理，不是传统 `.git` 工作树。执行、评审或核对本计划时，应使用 `libra status`、`libra diff -- <path>`、`libra add` 等 Libra 命令检查工作区状态与差异；不要把 `git status` / `git diff` 失败误判为“不是仓库”。本文中“Git 协议 / Git 托管 / 不进入 git”描述的是 mega2 的业务域和兼容目标，不代表当前开发工作区必须由 Git 管理。
 
 ## 事实校准（2026-06-27）
 
 > 本文档中的代码引用已对照当前 `src/`（含 `src/contract/vault/integration/`、`src/vault` vendored 源码、`src/context/mod.rs`、`src/commands`）重新核对。以下校准说明（依赖迁移、落地可行性、落地状态更新）按时间顺序记录与早期草案不一致的事实，后续执行以本节、下方「当前实现状态速览表」和「硬约束与不可违反的原则」为准，不要按旧阶段重复实现。
 
-> **依赖迁移修订（2026-06-15，2026-06-17 路径与模块更新）**：`libvault-core`（crates.io `0.1.0`）已替换为仓库内 vendored 的 RustyVault 源码模块（`src/vault/` 目录，作为 monoengine 顶层 module 编译，不再作为独立 path dependency）。新依赖的能力面与旧版不同，本文相关阶段已据此核查与修订，主要影响：
+> **依赖迁移修订（2026-06-15，2026-06-17 路径与模块更新）**：`libvault-core`（crates.io `0.1.0`）已替换为仓库内 vendored 的 RustyVault 源码模块（`src/vault/` 目录，作为 mega2 顶层 module 编译，不再作为独立 path dependency）。新依赖的能力面与旧版不同，本文相关阶段已据此核查与修订，主要影响：
 > - **阶段 I（root token 退役 / 最小权限）**：libvault 已原生提供 ACL policy（`modules/policy`，`sys/policy/{name}`）与非 root token（`modules/auth/token_store.rs`，`auth/token/create`），本阶段从"自建授权体系"改为"接入并编排内建能力"——可行性提升。
 > - **阶段 H（审计）**：libvault 的 `sys/audit` 仅为桩实现（handler 返回 `Ok(None)`，见 `modules/system/mod.rs:883-905`），审计须在收窄后的 `VaultCoreInterface` 上做 hook，**不能**依赖内建审计设备。
 > - **阶段 J（轮换/rekey）**：unseal 分片 rekey（`generate_unseal_keys()`，`core.rs:591`）与一次性解封（`unseal_once()`，`core.rs:534`）可用；但 **KEK 轮换无内建原语**（`init()` 后 KEK 不可变，无 `sys/rotate` 等价能力），需另立专项或暂不承诺。
@@ -40,7 +40,7 @@
 > - **（2026-06-24）H：审计记录补 caller 身份（“谁”）。新增 `tokio::task_local!` `AUDIT_CALLER` 与 `with_audit_caller`；`audit_secret_access` 在 `vault_audit` 事件中记录 `caller`（未注入时为 `unknown`）；`config secret set/check/rotate`、`config validate --resolve-secrets`、startup/reload 的 `mail.password_ref` 解析入口已注入对应 caller。由 `with_audit_caller_scopes_caller_identity` 锁定。**
 > - **（2026-06-27）A：补齐“root token/分片/secret 明文不得进入日志”验收（vault.md:226/260）的自动化守卫。新增 `vault_lifecycle_never_logs_root_token_shares_or_secret_values` 回归测试（`src/contract/vault/integration/vault_core.rs`）：用线程局部 `tracing` subscriber 捕获 VaultCore 集成在 init → write_secret → read_secret → reset 全流程于初始化任务线程上发出的 `tracing` 事件，断言写入的 secret 明文、已持久化的 unseal 分片（compact JSON / pretty JSON / Debug 三种形态，pretty 对应 `persist_core_key` 的 `to_writer_pretty`）、限权 runtime token 与任何 root-token 字样均不出现；并以变更测试（mutation test）确认注入泄露时该用例会失败。此前阶段 A 仅有 `core_key.json` 不含 `root_token` 的持久化断言，无日志侧守卫。**该单测的覆盖边界（刻意留白、已在测试注释标注）：仅捕获本任务线程上的 `tracing` 事件，不覆盖 stdout/stderr 的 `println!`/`eprintln!`、`log::` facade（未装 `tracing-log` 桥）以及 vault 内部后台 OS 线程（如 `src/vault/modules/auth/expiration.rs` 的租约过期定时线程）上发出的事件——彻底覆盖需全局 subscriber（与其它测试 `try_init` 竞争）或进程级 fd 捕获，超出本单测范围。**
 > - D/E：CLI 已引入 `LoadMode`，`config secret ref/set/check` 与 `config validate --resolve-secrets` 已落地；`secret set/check` 使用最小 DB/Vault bootstrap，不构造 Redis、对象存储、服务或完整 `AppContext`。`SecretRef`、`SecretResolver`、`VaultSecretResolver` 已在配置模块落地，`mail.password_ref` 可在 vault 就绪后解析，且与明文 `mail.password` 互斥。
-> - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 monoengine 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
+> - I：常规 secret 读写不再使用 root token。初始化时用 root token 安装 mega2 运行时 ACL policy、签发 ssh/pgp/nostr/pki/config/generic 限权 token，随后写回不含 `root_token` 的 `core_key.json` 并撤销 root token。为支持重启后限权 token 的 ACL 校验，vendored `libvault` 的 token policy 查询增加了 ACL 持久存储 fallback，并移除了明文 token debug 日志。config/generic token 隔离已补矩阵测试：config token 可读 `secret/config/*`，generic token 显式拒绝 `secret/config/*`，config token 不能读取 generic secret。
 > - G：**（2026-06-27）已落地分阶段 bootstrap，对象存储凭据可走 SecretRef；（2026-06-28）validate/CLI 已对齐。** `AppContext::new` 现只建一次 DB 连接，先用它做 **DB-only `VaultCore` bootstrap**（`from_database_connection`，不依赖完整 `Storage`，打破“vault 需要 Storage、Storage 需要对象存储、对象存储凭据需要 vault”的循环），再解析 `object_storage.s3.access_key_id`/`secret_access_key` 中的 `vault://` SecretRef，最后用解析后的配置 `build_object_storage` 并经 `Storage::new_with_connection`（复用同一连接）建完整 storage。`Storage::new` 本身未拆——通过 DB-only vault bootstrap 达成等效分阶段。字面量凭据原样透传（env/IAM 部署不受影响）。`config validate` 与 `config secret set/check` 现已接受合法 namespace 的 object_storage SecretRef，`config validate --resolve-secrets` 也会解析它们。
 
 ## 反向迁移：vendored RustyVault → `libvault` crate（核对日 2026-08-21，计划 `plan-20260820`）
@@ -110,7 +110,7 @@
 
 #### 证据：一次性原型（不进本计划提交）
 
-按 ER-03 在仓外一次性 crate 中构建可编译原型（只依赖 crates.io `libvault 0.3.0`，不依赖 monoengine），把 vendored `src/vault/un31_readonly.rs` 中不依赖 `VaultCore` 的用例逐条移植，并**保留全部成对可写对照**。结果：**10 passed; 0 failed**（另加一条 vendored 未单独覆盖的 AC3 token salt 用例）。原型验证了：只读句柄仍能读出可写句柄写入的 secret；只读引导后 storage 逐字节不变；mounts monitor 与 expiration worker 均未创建；mount 表缺失 / mount 旧格式 / 默认 ACL policy 被删 / 租约旧格式 / token salt 缺失五种情形全部**写前**具名 fail-closed（对应断言里 `denied_writes() == 0`，即最终保险从未触发）。
+按 ER-03 在仓外一次性 crate 中构建可编译原型（只依赖 crates.io `libvault 0.3.0`，不依赖 mega2），把 vendored `src/vault/un31_readonly.rs` 中不依赖 `VaultCore` 的用例逐条移植，并**保留全部成对可写对照**。结果：**10 passed; 0 failed**（另加一条 vendored 未单独覆盖的 AC3 token salt 用例）。原型验证了：只读句柄仍能读出可写句柄写入的 secret；只读引导后 storage 逐字节不变；mounts monitor 与 expiration worker 均未创建；mount 表缺失 / mount 旧格式 / 默认 ACL policy 被删 / 租约旧格式 / token salt 缺失五种情形全部**写前**具名 fail-closed（对应断言里 `denied_writes() == 0`，即最终保险从未触发）。
 
 #### 上游锚点：逐项否证 / 采纳表
 
@@ -174,7 +174,7 @@
 计划「事实基线」把 vendored↔上游差异记为「UN-31 只读 + `RvError` 本地化 + 依赖版本面」。逐文件核对（剔除纯 import 改写与 doc 后共 24 个文件有差异）另发现两处**功能性**分歧，不在只读轴内，必须随 VLT-02/04 处置：
 
 1. **`modules/policy/policy_store.rs:331`**：vendored 在 `get_policy(_, PolicyType::Token)` 未命中 `policy_type_map` 时回落到持久 ACL view（`policy_type = Acl; (Some(self.get_acl_view()?), &self.token_policies_lru)`），上游为 `(None, &None)`（随后因 `view.is_none()` 报错）。这是 `FIX-04` 之前 `JupiterBackend::list` 返回递归全 key 导致 `PolicyStore::new` 无法正确重建 `policy_type_map` 的历史绕行；FIX-04 已修复该 list 契约，故上游行为**预期**已足够。判据：切换后 `integration_vault` / `integration_authz_audit` 以及限权 token 隔离矩阵必须仍绿——**这是 VLT-02 的强制回归观测点**，不是可选项。
-2. **`modules/auth/token_store.rs:457`**：上游为 `log::debug!("check token: {token}")`，会把明文 client token 写进 debug 日志；vendored 已脱敏为 `log::debug!("check token")`。本仓**未安装任何 `log` facade logger、也未接 `tracing-log` 桥**（`rg 'tracing_log|LogTracer|log::set_logger' src bin` 零命中），因此该语句在 monoengine 内不产生输出，属**残留风险**而非现存泄漏；一旦将来接入 `log` 桥必须重新评估（登记为 `DEFER-VLT-04`）。
+2. **`modules/auth/token_store.rs:457`**：上游为 `log::debug!("check token: {token}")`，会把明文 client token 写进 debug 日志；vendored 已脱敏为 `log::debug!("check token")`。本仓**未安装任何 `log` facade logger、也未接 `tracing-log` 桥**（`rg 'tracing_log|LogTracer|log::set_logger' src bin` 零命中），因此该语句在 mega2 内不产生输出，属**残留风险**而非现存泄漏；一旦将来接入 `log` 桥必须重新评估（登记为 `DEFER-VLT-04`）。
 
 #### VLT-04 落点估计
 
@@ -320,7 +320,7 @@ vendored 已删除。`src/vault/` 的 82 个 `.rs`（连同 `README.md` 与三�
 | `core_key.json` 自动解封 | 已加固 | 只保存 unseal 分片和限权 runtime tokens，不再长期保存 `root_token`；缺 key fail-closed，不清库。 |
 | 显式 vault reset 命令 | 已实现 | `config vault reset --force` 删除 `vault` 表、备份 `core_key.json`、重新初始化；普通启动不再隐式清库。 |
 | unseal 分片 rekey 命令 | 已实现 | `config vault rekey --force [--key-path]` 经最小 bootstrap 调用 `VaultCore::rekey_unseal_shares()` 重写 `core_key.json` 分片、保留数据；显式提示旧分片仍可解封、彻底失效需 KEK 轮换（阶段 J 第 1 项）。 |
-| root token 生命周期 | 已接入最小权限 | 初始化后安装 monoengine ACL policy、签发限权 token、撤销 root token；常规 secret 路径不持有 root token；generic token 显式拒绝 `secret/config/*`，并有 config/generic token 隔离单测。 |
+| root token 生命周期 | 已接入最小权限 | 初始化后安装 mega2 ACL policy、签发限权 token、撤销 root token；常规 secret 路径不持有 root token；generic token 显式拒绝 `secret/config/*`，并有 config/generic token 隔离单测。 |
 | secret 访问审计 | 已接 hook，可配置且默认开启，失败策略已记录，含 caller 身份 | `VaultCoreInterface` read/write/delete 记录 `vault_audit` 事件（含 `operation`、`secret_name`、`outcome`、`caller`），不包含 secret 值、root token 或分片；`audit_secret_access` 已 doc-comment 显式记录 fail-open 策略（审计经 infallible 的 `tracing`，绝不阻断 secret 操作）；caller 身份经 `tokio::task_local!`（`with_audit_caller`）由入口点注入（`config secret set/check/rotate`、`config validate --resolve-secrets`、startup/reload 的 `mail.password_ref` 解析），未注入时为 `"unknown"`；`config.vault.audit.enabled`（默认 `true`，经 `VaultCore::with_audit_config` 注入）可显式 opt-out。**（2026-06-27）可配置审计 sink 已落地**：`config.vault.audit.sink` 支持 `tracing`（默认，infallible）与 `file`（`file_path` 指定的持久化 append-only JSONL，每条 `sync_all` fsync，独立于进程日志管道），并新增 `config.vault.audit.fail_closed`：当可失败 sink（`file`）写入失败时，`true` 让 secret 操作随之失败（non-repudiation over availability），默认 `false`（fail-open，仅告警不阻断）。`audit_secret_access` 已返回 `Result`，read/write/delete 在操作本身成功时才把 fail-closed 审计错误上抛。文件记录只含 `ts`/`operation`/`secret_name`/`outcome`/`caller`，绝不含 secret 值。 |
 | 最小 DB/Vault bootstrap | 已实现 | `VaultCore::from_database_config/from_database_connection` 和 `config secret set/check` 只依赖数据库和 vault key。 |
 | `LoadMode` / `SecretRef` / resolver | 已实现 | CLI 按命令选择加载级别；`SecretRef`/resolver 支持 `mail.password_ref` 延迟解析和缓存/evict。 |
@@ -649,7 +649,7 @@ resolver 不能把完整 URI 直接传给 `read_secret`。
 | `database.db_url` / 数据库密码 | `Storage::new` 建库连接 | 引导配置 | 不能进本项目 vault；通过 TOML/env/部署平台 secret 提供 |
 | `redis.url` | `AppContext::new` 中 vault 后 `resolve_redis_url_secret` → `init_connection` | 早期运行时依赖 | **已支持 `vault://` SecretRef（2026-06-28）**；合法 namespace 为 `vault://secret/config/<profile>/redis/url#<field>`；字面量 URL 原样透传，含密码时日志必须脱敏 |
 | `object_storage.s3.*` | `AppContext::new` 中 DB-only vault bootstrap 后 `resolve_object_storage_secrets` → `build_object_storage` | 早期运行时依赖 | **已支持 `vault://` SecretRef**；合法 namespace 为 `vault://secret/config/<profile>/object_storage/access_key_id#<field>` 与 `.../secret_access_key#<field>`；字面量凭据原样透传 |
-| `orion_server.db_url` | Orion 相关配置 | 引导或独立服务配置 | 不默认纳入 monoengine vault；按 Orion 启动依赖单独判断 |
+| `orion_server.db_url` | Orion 相关配置 | 引导或独立服务配置 | 不默认纳入 mega2 vault；按 Orion 启动依赖单独判断 |
 | `mail.password` | `AppContext::new` 中 vault 之后构造 `SmtpMailer` 并启动 `EmailDispatcher` | 可迁移凭据 | 第一批已改为支持 `SecretRef`；构造失败已从静默忽略改为可诊断处理 |
 | `ssh_server_key` | SSH server 启动时读取或生成 | vault 内部 secret | 已由 vault 管理；读取、生成和写入失败已返回可诊断错误；剩余重点是部署侧 key material 托管 |
 | PGP / Nostr key | `vault/pgp.rs`、`vault/nostr.rs` | vault 内部 secret | 已由 vault 管理；读取、解析、保存和删除主路径已返回 `Result`，缺字段/坏格式不再 panic |
@@ -750,7 +750,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 
 ## 可执行性评估（2026-06-15 核查；2026-06-16 补充验证通过，详见文首"落地可行性分析补充"）
 
-本节按"当前代码与依赖的实际状态"核查各阶段能否立即执行，仅调整可行性与排期，不改动代码。核查基于 monoengine 当前 `src/` 与 `src/vault` 中 vendored 的 `libvault`。
+本节按"当前代码与依赖的实际状态"核查各阶段能否立即执行，仅调整可行性与排期，不改动代码。核查基于 mega2 当前 `src/` 与 `src/vault` 中 vendored 的 `libvault`。
 
 **可执行度总评：中高（7/10）。** vault 自身的 P0/P1 加固路径具备落地条件，主要障碍不是技术不可行，而是文档后半部分仍沿用旧前置口径：把"删除敏感输出"错误地写成必须等待 redaction，把"最小 bootstrap"与"LoadMode/SecretRef"混在同一阻塞链里。执行时必须把工作拆成两条队列：
 
@@ -774,7 +774,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
    - `config secret set/check/ref`、`SecretRef`、`config validate --resolve-secrets`：未实现。
    - 凡声明依赖这三者的阶段（A 的脱敏部分、D、E、G），若不先交付前置，无法照原文执行。
 
-2. libvault 内建治理路径**开箱可达**（embedded API：`init()` → `unseal()` 后用 root token 即可 `write`/`read`）：`sys/policy/{name}`、`sys/policies/acl/{name}`、`auth/token/create`、`secret/*` 均为默认挂载（`src/vault/mount.rs:45-64`、`modules/auth/mod.rs:38-48`、`core.rs:609-632` 的 `post_unseal`）。→ 阶段 I 的 policy/token **不需要额外挂载 plumbing**，monoengine 侧即可落地。阶段 H 不依赖这些内建路径，应在 monoengine 的收窄 interface 上实现 hook。
+2. libvault 内建治理路径**开箱可达**（embedded API：`init()` → `unseal()` 后用 root token 即可 `write`/`read`）：`sys/policy/{name}`、`sys/policies/acl/{name}`、`auth/token/create`、`secret/*` 均为默认挂载（`src/vault/mount.rs:45-64`、`modules/auth/mod.rs:38-48`、`core.rs:609-632` 的 `post_unseal`）。→ 阶段 I 的 policy/token **不需要额外挂载 plumbing**，mega2 侧即可落地。阶段 H 不依赖这些内建路径，应在 mega2 的收窄 interface 上实现 hook。
 
 3. fail-closed 判定依赖的 `rvault.core.load().inited()` 存在且测试已用——阶段 A 第 5 项可直接执行。
 
@@ -788,11 +788,11 @@ pub fn global_redactor() -> &'static dyn Redactor;
 |---|---|---|
 | **A（止血）核心子集** | ✅ 现在可执行，无外部依赖 | "停止输出 root token / 分片 / key 文件内容"只需删除 `println!`/`log::debug!` 并停止构造含密字符串——**不需要脱敏工具**。fail-closed（`inited()`）、文件权限（`0700`/`0600`）、`Result`/`VaultError` 均为本地改造。 |
 | A 中"脱敏残留日志"部分 | ⛔ 阻塞于 config 0b | 仅当需把含密 URL（DB/Redis）部分脱敏后仍输出时才需要；与"止血"解耦，不应连坐阻塞 A 的核心。 |
-| **B（最小 bootstrap）** | ✅ 现在可执行 | 纯 monoengine 结构改造。 |
-| **C（收窄 interface）** | ✅ 现在可执行 | 纯 monoengine 改造；阶段 H 的审计 hook 建议并入本阶段产物。 |
+| **B（最小 bootstrap）** | ✅ 现在可执行 | 纯 mega2 结构改造。 |
+| **C（收窄 interface）** | ✅ 现在可执行 | 纯 mega2 改造；阶段 H 的审计 hook 建议并入本阶段产物。 |
 | **F（清理消费端 panic）** | ✅ 可执行（依赖 A/B） | PKI 路径已迁移，错误模型清理基于新路径。 |
 | **H（审计 hook）** | 🟡 可执行，需先定审计落点与失败策略 | 只走 interface hook（内建审计是桩）；技术无阻塞，排在 C 之后。 |
-| **I（policy + 非 root token）** | ✅ 已实现 | 已安装 monoengine runtime ACL policy、签发限权 token、撤销 root token；同时修复 libvault token policy cache 重启 fallback 与明文 token debug 日志。 |
+| **I（policy + 非 root token）** | ✅ 已实现 | 已安装 mega2 runtime ACL policy、签发限权 token、撤销 root token；同时修复 libvault token policy cache 重启 fallback 与明文 token debug 日志。 |
 | **J：分片 rekey / secret 轮换** | 🟡 可执行（有内建原语） | 基于 `generate_unseal_keys()` / `unseal_once()`。 |
 | **D（CLI LoadMode + secret 命令）** | ✅ 已实现 | `LoadMode`、`config secret ref/set/check`、`config validate --resolve-secrets` 已落地；vault 命令使用最小 DB/Vault bootstrap。 |
 | **E（SecretRef + mail.password_ref）** | ✅ 已实现 | `SecretRef` / resolver / `mail.password_ref` 已落地，明文 `password` 与 `password_ref` 互斥。 |
@@ -804,7 +804,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 - **存在一条完全不依赖 config 团队的 vault-only 执行链：A（止血子集）→ B → C → F**，可立即开工；H、I 紧随其后（libvault 已确认可达）。这条链不应被尚不存在的脱敏工具 / `LoadMode` 连坐阻塞。
 - **解除阶段 A 的伪硬依赖**：把"停止输出敏感值"（现在可做）与"脱敏需保留的日志"（待 config 0b）拆为两个独立工作项，前者不再等待脱敏工具。
 - **D / E / G 仍是真阻塞**：依赖 config 团队的 `LoadMode` / `SecretRef` / 对象存储重排；在它们就绪前，不要把 `mail.password_ref` 迁移列入"可执行"范围。
-- **仓库格式不构成技术阻塞**：Libra 管理工作副本只改变状态/差异/提交命令；本计划的代码入口、测试命令和风险判断仍按 monoengine 源码结构执行。
+- **仓库格式不构成技术阻塞**：Libra 管理工作副本只改变状态/差异/提交命令；本计划的代码入口、测试命令和风险判断仍按 mega2 源码结构执行。
 - **执行前以符号定位**而非文档行号（迁移已造成轻微漂移）。
 
 ### 建议执行切片
@@ -923,7 +923,7 @@ pub fn global_redactor() -> &'static dyn Redactor;
 工作项：
 
 1. **先在 CLI 层支持两阶段加载和 `LoadMode`**（与 config.md 阶段 2 协同完成）：在共同的 `LoadMode` 设计框架下，改造 CLI 分发逻辑以支持不同的启动模式。
-2. 新增不依赖 vault 的 `monoengine config secret ref`。
+2. 新增不依赖 vault 的 `mega2 config secret ref`。
 3. 基于最小 DB/Vault bootstrap 新增 `config secret set`。
 4. 基于最小 DB/Vault bootstrap 新增 `config secret check`。
 5. 新增 `config validate --resolve-secrets`。
@@ -1069,9 +1069,9 @@ Config::new
 4. 为可迁移 secret（首批 `mail.password`）提供轮换支持。
 5.（可选，长期）评估外部 KMS / transit auto-unseal，替代本地落盘自动解封，缓解磁盘读取威胁。
 
-> **已完成首批（2026-06-19）**：第 4 项已落地——新增 `monoengine config secret rotate <field> --vault-path ... --field ... --value-stdin`（`src/commands/config.rs`），经最小 DB/Vault bootstrap 覆写可迁移 secret（首批 `mail.password`），复用 `set` 的 namespace 校验与脱敏，并**显式打印重启要求**：运行中的 service 在 `AppContext::new` 一次性解析 `mail.password_ref`，因此需重启才能 re-resolve；`config validate --resolve-secrets` 与后续新 resolve 立即使用轮换值。这满足"明确其重启要求"的验收口径。运行期热生效（动态 mailer 重建）仍属 mail 阶段 4。
+> **已完成首批（2026-06-19）**：第 4 项已落地——新增 `mega2 config secret rotate <field> --vault-path ... --field ... --value-stdin`（`src/commands/config.rs`），经最小 DB/Vault bootstrap 覆写可迁移 secret（首批 `mail.password`），复用 `set` 的 namespace 校验与脱敏，并**显式打印重启要求**：运行中的 service 在 `AppContext::new` 一次性解析 `mail.password_ref`，因此需重启才能 re-resolve；`config validate --resolve-secrets` 与后续新 resolve 立即使用轮换值。这满足"明确其重启要求"的验收口径。运行期热生效（动态 mailer 重建）仍属 mail 阶段 4。
 
-> **已完成（2026-06-27）**：第 1 项已落地——新增 `monoengine config secret rotate` 之外的 vault 运维命令 `monoengine --config <path> config vault rekey --force [--key-path <PATH>]`（`src/commands/config.rs` 的 `exec_vault_rekey` + `vault_rekey_cli`）。该命令经最小 DB/Vault bootstrap（`LoadMode::VaultBootstrap`）打开当前 vault 并调用既有原语 `VaultCore::rekey_unseal_shares()` 重写 `core_key.json` 的 Shamir 分片，保留数据；`--force` 必填、`--key-path` 可覆盖 key 位置；成功后显式打印“旧分片仍可解封本 vault、彻底失效需 KEK 轮换”的限制。新增 CLI 解析/load-mode 单测（`config_vault_rekey_uses_vault_bootstrap_load_mode`、`config_vault_rekey_requires_force`、`config_vault_rekey_accepts_key_path`）。这把此前“仅库内方法 + 单测、无运维命令”补齐为“有运维命令”，满足第 1 项的运维命令验收口径。
+> **已完成（2026-06-27）**：第 1 项已落地——新增 `mega2 config secret rotate` 之外的 vault 运维命令 `mega2 --config <path> config vault rekey --force [--key-path <PATH>]`（`src/commands/config.rs` 的 `exec_vault_rekey` + `vault_rekey_cli`）。该命令经最小 DB/Vault bootstrap（`LoadMode::VaultBootstrap`）打开当前 vault 并调用既有原语 `VaultCore::rekey_unseal_shares()` 重写 `core_key.json` 的 Shamir 分片，保留数据；`--force` 必填、`--key-path` 可覆盖 key 位置；成功后显式打印“旧分片仍可解封本 vault、彻底失效需 KEK 轮换”的限制。新增 CLI 解析/load-mode 单测（`config_vault_rekey_uses_vault_bootstrap_load_mode`、`config_vault_rekey_requires_force`、`config_vault_rekey_accepts_key_path`）。这把此前“仅库内方法 + 单测、无运维命令”补齐为“有运维命令”，满足第 1 项的运维命令验收口径。
 >
 > **已完成（2026-06-28）**：第 2–3 项已落地——新增 `config vault backup <DESTINATION> [--key-path <PATH>]` 与 `config vault restore <SOURCE> --force [--key-path <PATH>]` 运维命令（`src/commands/config.rs` 的 `exec_vault_backup` / `exec_vault_restore` + `vault_backup_cli` / `vault_restore_cli`；核心实现为 `VaultCore::backup_key` / `VaultCore::restore_key`）。两个命令均走 `LoadMode::VaultBootstrap`，`--key-path` 可覆盖默认 `core_key.json` 位置；`restore` 必须 `--force` 确认。backup 将 key 文件复制到目标位置并写入 `.meta.json`（记录来源路径与备份时间），Unix 权限 `0600`；restore 先把备份复制到 `core_key.json.restore-tmp`，用 `VaultCore::from_database_config` 验证能解封当前数据库，再原子替换原 key 文件，验证失败时保留原 key 文件并返回错误。新增 CLI 解析/load-mode 单测（`config_vault_backup_uses_vault_bootstrap_load_mode`、`config_vault_backup_accepts_key_path`、`config_vault_restore_uses_vault_bootstrap_load_mode`、`config_vault_restore_requires_force`）与核心功能单测（`test_backup_key_creates_key_and_meta_file`、`test_restore_key_verifies_and_replaces_key_file`、`test_restore_key_rejects_backup_that_does_not_unlock_vault`）。
 
@@ -1096,7 +1096,7 @@ Config::new
 1. 使用运维命令将 `core_key.json` 备份到安全位置：
 
    ```bash
-   monoengine --config <path> config vault backup /secure/backup/path/vault-key.bak
+   mega2 --config <path> config vault backup /secure/backup/path/vault-key.bak
    ```
 
    该命令会复制 `mega_base()/vault/core_key.json` 到目标位置，并在同目录生成 `.meta.json` 元数据文件，记录来源路径和备份时间。若目标路径是目录，命令会自动生成带时间戳的文件名。备份文件在 Unix 下会被强制设为 `0600` 权限。
@@ -1107,11 +1107,11 @@ Config::new
 
 #### DB 数据存在但 key 文件缺失时的恢复
 
-1. 停止 monoengine。
+1. 停止 mega2。
 2. 使用恢复命令将验证过的备份 key 原子替换到 `core_key.json`：
 
    ```bash
-   monoengine --config <path> config vault restore /secure/backup/path/vault-key.bak --force
+   mega2 --config <path> config vault restore /secure/backup/path/vault-key.bak --force
    ```
 
    该命令会先把备份复制到临时文件，调用 `VaultCore::from_database_config` 验证该 key 能解封当前数据库，再替换 `core_key.json`；如果验证失败（备份与当前数据库不匹配或备份损坏），原 key 文件保持不变，命令返回错误。
@@ -1123,7 +1123,7 @@ Config::new
    chmod 600 "$CORE_KEY_PATH"
    ```
 
-4. 启动 monoengine。
+4. 启动 mega2。
 5. 确认依赖 Vault 的消费者可以正常读取 secret。
 
 如果没有匹配的密钥材料，按当前嵌入式 RustyVault 设计，已加密的 Vault 数据无法恢复。不要期望服务启动后自动重新初始化；它必须故障关闭（fail-closed）。
@@ -1132,18 +1132,18 @@ Config::new
 
 仅当丢失所有 Vault secret 可以接受时，才允许使用本流程。
 
-1. 停止 monoengine。
+1. 停止 mega2。
 2. 备份数据库和任何现存的 `core_key.json`。
 3. 在受控维护流程中删除 `vault` 表数据，或重建数据库。
 4. 删除旧的 `core_key.json`。
-5. 启动 monoengine，使其针对未初始化的 vault store 执行首次初始化。
+5. 启动 mega2，使其针对未初始化的 vault store 执行首次初始化。
 6. 重新创建必要的 secret。
 
 普通服务启动绝不能隐式执行这个重置。
 
 #### 重新生成 unseal 分片
 
-运维命令：`monoengine --config <path> config vault rekey --force [--key-path <PATH>]`（`src/commands/config.rs` 的 `exec_vault_rekey`）。该命令经最小 DB/Vault bootstrap 打开当前 vault，调用 `VaultCore::rekey_unseal_shares()`（底层 RustyVault 的 `generate_unseal_keys()`），用当前 KEK 的新 Shamir 分片集合重写 `core_key.json`，保留 Vault 数据。它是 `config vault reset` 之外第二个显式 vault 运维命令，沿用 `LoadMode::VaultBootstrap`，必须通过 `--force` 显式确认，`--key-path` 可覆盖默认 `core_key.json` 位置。
+运维命令：`mega2 --config <path> config vault rekey --force [--key-path <PATH>]`（`src/commands/config.rs` 的 `exec_vault_rekey`）。该命令经最小 DB/Vault bootstrap 打开当前 vault，调用 `VaultCore::rekey_unseal_shares()`（底层 RustyVault 的 `generate_unseal_keys()`），用当前 KEK 的新 Shamir 分片集合重写 `core_key.json`，保留 Vault 数据。它是 `config vault reset` 之外第二个显式 vault 运维命令，沿用 `LoadMode::VaultBootstrap`，必须通过 `--force` 显式确认，`--key-path` 可覆盖默认 `core_key.json` 位置。
 
 当前限制：RustyVault 只是重新切分同一个 KEK。之前导出的 Shamir 分片集合仍可能恢复该 KEK，因此如果旧分片已经泄露，这不是完整的泄露恢复手段。命令在成功后会**显式打印**这一限制，提示旧分片集合仍可解封本 vault。要彻底使旧密钥材料失效，需要 KEK 轮换，或引入外部 KMS / transit auto-unseal 设计；这超出当前 vendored RustyVault 原语能力。
 
@@ -1349,7 +1349,7 @@ Rust 应用接口不再向普通调用方暴露 root token，secret 操作通过
 
 ## 小结
 
-`monoengine` 的 vault 模块已从“可用但有安全缺口”的 KV store 加固为 fail-closed、限权、可审计、可最小 bootstrap 的 secret 后端：`VaultCore` Result 化、key 缺失不清库、root token 退役、限权 token ACL 隔离、敏感材料不进 `tracing` 日志、审计可配置（tracing/file、可 `fail_closed`、含 caller）、`SecretRef` resolver 支撑 mail/notification/对象存储凭据 post-vault 解析，并提供 `config vault reset/rekey`、`config secret set/check/rotate` 运维命令。唯一明确不承诺的是 KEK 轮换（无 libvault 内建原语，须另立专项）。
+`mega2` 的 vault 模块已从“可用但有安全缺口”的 KV store 加固为 fail-closed、限权、可审计、可最小 bootstrap 的 secret 后端：`VaultCore` Result 化、key 缺失不清库、root token 退役、限权 token ACL 隔离、敏感材料不进 `tracing` 日志、审计可配置（tracing/file、可 `fail_closed`、含 caller）、`SecretRef` resolver 支撑 mail/notification/对象存储凭据 post-vault 解析，并提供 `config vault reset/rekey`、`config secret set/check/rotate` 运维命令。唯一明确不承诺的是 KEK 轮换（无 libvault 内建原语，须另立专项）。
 
 ## 预期收益
 

@@ -1,5 +1,6 @@
 pub mod canonical_json;
 pub mod errors;
+pub mod oci_name;
 pub mod utils;
 
 pub type MonoError = errors::MegaError;

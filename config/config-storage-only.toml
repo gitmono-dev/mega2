@@ -11,10 +11,10 @@
 #
 # Usage / 用法:
 #   # token file must exist for ${file:...} below (compose mounts Docker secret).
-#   monoengine --config config/config-storage-only.toml config validate
-#   monoengine --config config/config-storage-only.toml service http --host 0.0.0.0 -p 9000
+#   mega2 --config config/config-storage-only.toml config validate
+#   mega2 --config config/config-storage-only.toml service http --host 0.0.0.0 -p 9000
 #   # Compose lab stack — default RustFS / s3compatible (no --env-file):
-#   docker compose -p monoengine-trunk -f docker-compose-storage-only.yml up -d --wait
+#   docker compose -p mega2-trunk -f docker-compose-storage-only.yml up -d --wait
 #   # Optional local FS backend only:
 #   #   ... -f docker-compose-storage-only.yml \
 #   #     --env-file config/compose.env.storage-only.local up -d --wait
@@ -259,13 +259,13 @@ storage_type = "s3compatible"
 # s3compatible 必须填 endpoint_url;真 AWS 留空走默认 endpoint. local/gcs 时整段可删.
 #
 # Lab defaults match docker-compose-storage-only.yml (RustFS access key
-# rustfs / rustfs_secret, bucket monoengine). Host API: 127.0.0.1:29000.
+# rustfs / rustfs_secret, bucket mega2). Host API: 127.0.0.1:29000.
 # Inside compose, MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL=http://rustfs:9000.
 # 实验室默认与 compose 一致;容器内由 compose 把 endpoint 改成 rustfs:9000.
 # Replace keys for any non-lab deployment — do not reuse these in production.
 # 非实验室部署必须替换密钥,勿把下列明文用于生产.
 region = "us-east-1"
-bucket = "monoengine"
+bucket = "mega2"
 access_key_id = "rustfs"
 secret_access_key = "rustfs_secret"
 endpoint_url = "http://127.0.0.1:29000"
@@ -328,7 +328,7 @@ name = "agent-ci"
 # that secret tooling appends is stripped automatically.
 # 场景:生产 token 永不明文写这里——从 secret 管理器挂载.Secret 工具常带结尾换行,
 # 会被自动剥掉.
-token = "${file:/run/secrets/monoengine-push-token}"
+token = "${file:/run/secrets/mega2-push-token}"
 # Path-scope of this token: component-boundary prefixes, e.g. "/project/foo"
 # does NOT authorize "/project/foobar". Omitted/empty = whole repository.
 # token 的路径授权:组件边界前缀,如 "/project/foo" 不能授权 "/project/foobar".
@@ -370,20 +370,24 @@ enabled = false
 # secrets from the vault and binds the HTTPS transport (restart-required;
 # disabled never resolves). Seed each target's hex:<even-hex> HMAC value by
 # piping it on stdin (--value-stdin is the only value channel):
-#   printf '%s' "$STORAGE_EVENTS_HMAC" | monoengine --config config/config.toml \
+#   printf '%s' "$STORAGE_EVENTS_HMAC" | mega2 --config config/config.toml \
 #     config secret set storage_events.targets.<id>.secret_ref \
 #     --vault-path config/<profile>/storage_events/targets/<id>/hmac \
 #     --field value --value-stdin
 [storage_events]
 enabled = false
 # installation_id = "prod-primary-01"
+# max_in_flight = 16              # 1..=64
+# connect_timeout_seconds = 2     # 1..=5
+# request_timeout_seconds = 5     # 1..=10
+# shutdown_grace_seconds = 5      # 0..=10; 0 aborts in-flight sends at once
 # [[storage_events.targets]]
 # id = "ops-main"
 # url = "https://events.example.invalid/ingest"
 # secret_ref = "vault://secret/config/example/storage_events/targets/ops-main/hmac#value"
 # events = ["repo.push", "oci.manifest.published", "lfs.object.uploaded", "lfs.media.finalized", "agent_capture.events.committed", "agent_capture.checkpoint.committed"]
 # git_paths = ["/team/a"]
-# oci_repositories = []
+# oci_repositories = []  # canonical lowercase distribution remoteName, same rule as inbound /v2
 # lfs_paths = ["/team/a.git"]  # media scope keeps the HTTP `.git` suffix; `/team/a` will not match
 # include_unscoped_lfs = false
 # agent_tenants = []

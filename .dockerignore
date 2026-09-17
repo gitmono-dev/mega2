@@ -20,7 +20,7 @@ target-*/
 .env.*
 !.env*.example
 secrets/
-monoengine.itbin
+mega2.itbin
 
 # Logs / temp
 **/*.log

@@ -1,6 +1,6 @@
 # Git Protocol 兼容性改进计划
 
-本文档记录 `monoengine` 当前 Git SSH/HTTP 协议实现的现状分析、主要兼容性问题、风险点和分阶段改进计划，用于提升与标准 Git 客户端的兼容性。
+本文档记录 `mega2` 当前 Git SSH/HTTP 协议实现的现状分析、主要兼容性问题、风险点和分阶段改进计划，用于提升与标准 Git 客户端的兼容性。
 
 > **治理规范**：本文档遵循 **`../general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
 
@@ -40,7 +40,7 @@
 >
 > **2026-06-24 更新 3**：SSH `git-lfs-authenticate` 响应序列化已移除 `serde_json::to_vec(...).unwrap()`，改为错误传播；成功写回 hybrid LFS JSON response 后显式发送 channel success。
 >
-> **2026-06-24 更新 4**：capability truth table 阶段 3 收尾——为 `side-band-64k` 补充 `build_side_band_format` 专用单测（含启用/未启用两条路径）；为 `ofs-delta` 补充 advertise/parse 单测并明确其 OFS_DELTA pack 编解码由 `git-internal` crate 实现（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧仅覆盖 advertise/parse；对 SHA-1 object format 落地显式策略——协议允许 SHA-1 默认时省略 `object-format`，monoengine 策略是对 SHA-1-only repo 不 advertise `object-format`，由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
+> **2026-06-24 更新 4**：capability truth table 阶段 3 收尾——为 `side-band-64k` 补充 `build_side_band_format` 专用单测（含启用/未启用两条路径）；为 `ofs-delta` 补充 advertise/parse 单测并明确其 OFS_DELTA pack 编解码由 `git-internal` crate 实现（`internal/pack/decode.rs` 处理 offset delta），mega2 侧仅覆盖 advertise/parse；对 SHA-1 object format 落地显式策略——协议允许 SHA-1 默认时省略 `object-format`，mega2 策略是对 SHA-1-only repo 不 advertise `object-format`，由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 >
 > **2026-06-24 更新 5**：阶段 4 认证上下文统一收口（工作项 1/2/3/6）。新增 `SmartSession::set_authenticated_user`；SSH `auth_publickey` 成功后将 key owner username 存入 `SshServer.authenticated_user`，exec 阶段注入 `SmartSession.auth`；HTTP receive-pack 改用同一 helper。SSH push 的 commit binding 不再匿名。残余：upload-pack 匿名策略、receive-pack repo/path 级 push 权限（工作项 4/5）。
 >
@@ -58,7 +58,7 @@
 >
 > **2026-07-01 更新 2**：`try_read_pkt_line` 的 pkt-line parser 错误模型继续收敛。新增回归测试覆盖 reserved length `0003`、length 小于 header（如 `0002want`）的精确错误诊断与不消费输入行为，以及非十六进制 header、短 header、payload 不完整的既有测试；由 `try_read_pkt_line_rejects_reserved_length_3`、`try_read_pkt_line_rejects_length_smaller_than_header`、`try_read_pkt_line_rejects_non_hex_header`、`try_read_pkt_line_rejects_incomplete_header_without_consuming`、`try_read_pkt_line_rejects_incomplete_payload` 共同锁定。
 >
-> **2026-07-01 更新 3**：真实 Git CLI CI 矩阵确认覆盖 HTTP 只读路径（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone、blob:none partial clone）。**2026-07-01 更新 4**：HTTP **CL push**（客户端 `HEAD:refs/heads/<name>` → 服务端 `refs/cl/*`，**不**新增公开分支）已进入 CI 必跑 gate；workflow 在 smoke DB 中生成并 mask 一次性 `access_token`，通过 Basic Auth URL 运行 `scripts/git_protocol_smoke.sh` 的 `MONOENGINE_GIT_SMOKE_PUSH=1` 分支。为支持该路径，monorepo receive-pack 会在 old-id 为零但新提交带 parent 时以首个 parent 作为 CL base；孤儿提交初始化仍拒绝。
+> **2026-07-01 更新 3**：真实 Git CLI CI 矩阵确认覆盖 HTTP 只读路径（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone、blob:none partial clone）。**2026-07-01 更新 4**：HTTP **CL push**（客户端 `HEAD:refs/heads/<name>` → 服务端 `refs/cl/*`，**不**新增公开分支）已进入 CI 必跑 gate；workflow 在 smoke DB 中生成并 mask 一次性 `access_token`，通过 Basic Auth URL 运行 `scripts/git_protocol_smoke.sh` 的 `MEGA2_GIT_SMOKE_PUSH=1` 分支。为支持该路径，monorepo receive-pack 会在 old-id 为零但新提交带 parent 时以首个 parent 作为 CL base；孤儿提交初始化仍拒绝。
 >
 > **2026-08-03 更新**：Monorepo 规则收口见 `docs/monorepo.md`——公开分支仅 `main`；Git 客户端 tag create/update/delete 由 `Monorepo::update_refs` **拒绝**（tag 仅 Web `/tags` API）；smoke 将原「push and delete tag」改为 **reject Git-client tag push**，并将 branch smoke 改名为 CL push 且断言 `refs/heads/*` 集合不变。
 >
@@ -74,7 +74,7 @@
 >
 > **2026-08-29 更新 3（MC-06 R2 粘性收口）**：拒绝规则改为只基于 pack **内容**（presence 集）——resolve 沿 tip 首父路径做 presence 界定的走查（新引入成员走 250 语义上界，冗余携带的已知祖先走独立卫生上界），凡不在路径上的 pack commit 一律判 junk 拒绝，与瞬时 newness 无关；无新引入的 push 不再退化为 `[tip]` 链，而是把整段内容链交给校验器重验。净效果：**同一被拒 pack 原样重试必被同样拒绝**（junk / 链中 merge / 超长 / 累计超限全部粘性），且 ref/CL/`commit_auths` 零变化；已接受 push 的幂等重试在真实客户端下天然走空 pack no-op 分支不受影响。绑定消费收窄为 `ordered ∩ 新引入`。
 
-> **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 monoengine 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MONOENGINE_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
+> **2026-07-01 更新 5**：LFS opt-in smoke 已对齐 monorepo push 语义。`lfs_smoke_http` 不再从孤儿仓库初始化并推送不可接受的 root commit，而是先 clone 远端默认分支、创建普通子提交、用 non-delta pack 推送，再通过 `refs/cl/*` 差异定位 mega2 实际创建的 CL ref；clone/fetch/LFS pull 与清理都针对该 CL ref 执行。**2026-07-01 更新 6**：CI workflow 现在安装 `git-lfs` 并默认启用 `MEGA2_GIT_SMOKE_LFS=1`，LFS push/clone/pull/locks-list round-trip 进入 `Git Protocol Smoke` 必跑 gate。
 >
 > **2026-07-01 更新 7**：首轮 LFS CI gate 暴露 Git LFS 对 monorepo 根路径 remote `http://host/` 的默认 discovery 派生问题：客户端会拼出 `http://host.git/info/lfs` 并导致端口解析失败。`lfs_smoke_http` 现在对源仓库和验证 clone 显式配置 `lfs.url=<remote>/info/lfs`，并关闭 locks verify 探测，避免根路径 URL 被 Git LFS 自动追加 `.git`。
 >
@@ -90,7 +90,7 @@
 
 > **2026-09-10 更新（plan-20260908 SP-02）：** `push_auth=token` 时 SSH `auth_password` 复用 `lookup_push_token`（username 不参与判定，身份为 token `name`）。客户端用 `SSH_ASKPASS`（password 不进 tracing、不进 `GIT_SSH_COMMAND`）。`push_auth=none` 与 review（省略）均 Reject password。进程 IT：`integration_git_ssh_trunk_token_anon_off_clone_fail`、`integration_git_ssh_trunk_token_anon_off_password_clone` / `_fetch` / `_pull`、`integration_git_ssh_trunk_token_push_receive_pack_disabled`、`integration_git_ssh_review_pubkey_anon_off_clone`、`integration_git_ssh_review_pubkey_anon_on_push`。
 
-> **2026-09-11 更新（plan-20260906 SO-19..SO-25 / SO-04）：** storage-only SSH 黑盒为 `scripts/git_protocol_smoke_storage_only.sh`：只读矩阵（`SSH ls-remote` … `SSH protocol v2 blob:none clone`）+ **`SSH reject receive-pack`**（断言稳定子串 `SSH receive-pack is disabled`；未设 `MONOENGINE_SSH_REPO_URL` 时 SKIP）。默认 `GIT_SSH_COMMAND` 使用 `StrictHostKeyChecking=accept-new` + workdir known_hosts；`anonymous_access=true` 下 `auth_none`。对照 review smoke 与 plan-20260908。
+> **2026-09-11 更新（plan-20260906 SO-19..SO-25 / SO-04）：** storage-only SSH 黑盒为 `scripts/git_protocol_smoke_storage_only.sh`：只读矩阵（`SSH ls-remote` … `SSH protocol v2 blob:none clone`）+ **`SSH reject receive-pack`**（断言稳定子串 `SSH receive-pack is disabled`；未设 `MEGA2_SSH_REPO_URL` 时 SKIP）。默认 `GIT_SSH_COMMAND` 使用 `StrictHostKeyChecking=accept-new` + workdir known_hosts；`anonymous_access=true` 下 `auth_none`。对照 review smoke 与 plan-20260908。
 
 1. **HTTP 和 SSH 双协议支持已就位**。`contract::git_protocol/http.rs` 和 `contract::git_protocol/ssh.rs` 分别实现两个协议入口，共用 `SmartSession` 和 `src/ceres/protocol/smart.rs` 的 smart protocol 实现。
 
@@ -183,7 +183,7 @@
 
 ## 小结
 
-Git Protocol 是 monoengine 的核心功能，但当前实现在错误处理、兼容性和细节上存在多个缺陷。建议优先完成阶段 0-1 的兼容性基线建立和 panic 止血，确保 malformed input 不导致崩溃。再依次完成阶段 2-3 的 pkt-line 和 receive-pack 改造，确保协议边界正确。阶段 4 的 auth 统一可与 config 模块协同完成，阶段 5-6 为长期改进。
+Git Protocol 是 mega2 的核心功能，但当前实现在错误处理、兼容性和细节上存在多个缺陷。建议优先完成阶段 0-1 的兼容性基线建立和 panic 止血，确保 malformed input 不导致崩溃。再依次完成阶段 2-3 的 pkt-line 和 receive-pack 改造，确保协议边界正确。阶段 4 的 auth 统一可与 config 模块协同完成，阶段 5-6 为长期改进。
 
 ## 预期收益
 
@@ -508,14 +508,14 @@ session.data(channel, String::from_utf8(buf.to_vec()).unwrap()).unwrap();
 - `quiet`：已从 advertise 移除（未实现 progress 抑制语义）。
 - `no-thin`：**（2026-09-16）重新 advertise**。移除期间任何 delta 压缩触底服务端已知对象的 push 都会以 thin pack 到达，而 pack 解码器对包外基对象 fail-closed（`git-internal` decode "Pack references bases that are not in the pack"），导致 receive-pack 连接中断、ref 不推进（缺陷 RCV-01：git 2.34/2.49 复现，`pack.window=0` 可绕过）。`no-thin` 语义（客户端不得发送 thin pack）正是解码器当前契约的正确配套，与上游 Mega 一致；同时 `unpack_stream` 将解码失败由 panic 收敛为 typed `ProtocolError`（2026-09-16）。
 - `report-status-v2`：已从 advertise 移除（未实现 v2 完整语义）。
-- `ofs-delta`：仍 advertise；OFS_DELTA pack 编解码由 `git-internal` crate 实现并自测（`internal/pack/decode.rs` 处理 offset delta），monoengine 侧覆盖 advertise/parse（`parse_capabilities_recognizes_ofs_delta`）。
+- `ofs-delta`：仍 advertise；OFS_DELTA pack 编解码由 `git-internal` crate 实现并自测（`internal/pack/decode.rs` 处理 offset delta），mega2 侧覆盖 advertise/parse（`parse_capabilities_recognizes_ofs_delta`）。
 
 建议：
 
 - 建立 capability truth table：advertise、parse、act-on、test 四列。
 - 没有行为支持和测试的 capability 先不要 advertise。
 - 已完成首批：`atomic`、`report-status-v2`、`quiet`、`no-thin` 和 upload `include-tag` 已先从 advertise 移除；`delete-refs` 已在 HTTP CL delete smoke 覆盖后重新声明（Monorepo tag 走 API，见 `docs/monorepo.md`）。
-- ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
+- ✅ 对 `object-format=sha1` 明确策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；mega2 策略对 SHA-1-only repo 不 advertise），由单测 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 ### pkt-line parser 错误模型已收敛，streaming reader 仍待后续
 
@@ -623,9 +623,9 @@ SSH 中 `git-lfs-transfer` 返回明确 unsupported failure，`git-lfs-authentic
 
 目标：在修改实现前建立可重复的真实 Git 客户端测试矩阵。
 
-已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 monoengine HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MONOENGINE_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH **CL push**（断言不新增公开 `refs/heads/*`）与 **Git 客户端 tag 推送拒绝** 通过 `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交、显式配置 `<remote>/info/lfs` endpoint，并对实际生成的 `refs/cl/*` 做定向 fetch、checkout、LFS pull 与清理，避免默认修改远端公开分支、不依赖孤儿初始化、全量 clone 或 Git LFS 对根路径 remote 的默认 URL discovery。CI 当前自动启用 HTTP read-only 矩阵、HTTP CL push + tag-reject 和 HTTP LFS round-trip；SSH push 仍保留为手动 opt-in。产品规则见 [`../monorepo.md`](../monorepo.md)。
+已新增 `scripts/git_protocol_smoke.sh` 作为第一版真实 Git CLI smoke matrix。该脚本面向已经启动的 mega2 HTTP/SSH 服务，默认覆盖只读 HTTP 场景（基础 clone/fetch、shallow clone、protocol v2 fetch、`filter blob:none`）；SSH 通过 `MEGA2_SSH_REPO_URL` 启用同类只读场景；HTTP/SSH **CL push**（断言不新增公开 `refs/heads/*`）与 **Git 客户端 tag 推送拒绝** 通过 `MEGA2_GIT_SMOKE_PUSH=1` 显式启用；HTTP LFS push/clone/locks-list 通过 `MEGA2_GIT_SMOKE_LFS=1` + `MEGA2_GIT_SMOKE_PUSH=1` 显式启用，LFS 用例会从远端默认分支创建普通子提交、显式配置 `<remote>/info/lfs` endpoint，并对实际生成的 `refs/cl/*` 做定向 fetch、checkout、LFS pull 与清理，避免默认修改远端公开分支、不依赖孤儿初始化、全量 clone 或 Git LFS 对根路径 remote 的默认 URL discovery。CI 当前自动启用 HTTP read-only 矩阵、HTTP CL push + tag-reject 和 HTTP LFS round-trip；SSH push 仍保留为手动 opt-in。产品规则见 [`../monorepo.md`](../monorepo.md)。
 
-**（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 CL push 与 LFS；2026-08-03 对齐 Monorepo 分支/tag 规则）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、CL push（无新公开分支）、**拒绝** Git-client tag push、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MONOENGINE_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
+**（2026-06-30）CI 自动化回归 gate 已落地；2026-07-01 扩展 CL push 与 LFS；2026-08-03 对齐 Monorepo 分支/tag 规则）**：`.github/workflows/git-protocol-smoke.yml` 在 PR 和 main push 时自动启动 PostgreSQL + Redis 测试栈、构建 release 二进制、seed mail secret、启动 `service http`，然后以 monorepo 根路径 `http://ci-smoke:<masked-token>@127.0.0.1:9000/` 为目标运行 `scripts/git_protocol_smoke.sh` 的 HTTP 矩阵（ls-remote、clone、fetch、protocol v2 fetch/ls-remote、shallow clone depth=1、blob:none partial clone、CL push（无新公开分支）、**拒绝** Git-client tag push、LFS push/clone/pull/locks-list）。workflow 直接在 smoke DB 的 `access_token` 表插入一次性 token 并 mask 日志输出，满足 push 所需认证；同时安装 `git-lfs` 并启用 `MEGA2_GIT_SMOKE_LFS=1`，让 LFS round-trip 成为默认 CI gate。该 workflow 在协议路径变更（`src/ceres/protocol/**`、`src/contract/git_protocol/**`、`src/server/http_server.rs`、`scripts/git_protocol_smoke.sh`、`docs/refactoring/protocol.md`）时触发，满足阶段 0 "每个后续阶段都能复用该矩阵防止回归"的验收标准。
 
 ### 场景覆盖表（权威，plan-20260803 / ADR-GM-01）
 
@@ -672,9 +672,9 @@ HTTP:
   git clone http://host/repo.git
   git fetch
   git -c protocol.version=2 fetch
-  git push HEAD:refs/heads/<tmp> → 期望新建 refs/cl/*，refs/heads/* 不变（`MONOENGINE_GIT_SMOKE_PUSH=1`）
-  git push --delete origin refs/cl/<id>（清理；`MONOENGINE_GIT_SMOKE_PUSH=1`）
-  git push origin refs/tags/<name> → 期望失败（Monorepo；`MONOENGINE_GIT_SMOKE_PUSH=1`）
+  git push HEAD:refs/heads/<tmp> → 期望新建 refs/cl/*，refs/heads/* 不变（`MEGA2_GIT_SMOKE_PUSH=1`）
+  git push --delete origin refs/cl/<id>（清理；`MEGA2_GIT_SMOKE_PUSH=1`）
+  git push origin refs/tags/<name> → 期望失败（Monorepo；`MEGA2_GIT_SMOKE_PUSH=1`）
   git clone --depth=1
   git -c protocol.version=2 ls-remote
   git -c protocol.version=2 clone --filter=blob:none
@@ -687,15 +687,15 @@ SSH:
   git -c protocol.version=2 clone --filter=blob:none ssh://user@host:port/repo.git
   git fetch
   git -c protocol.version=2 fetch
-  git push HEAD:refs/heads/<tmp> → CL（同上；`MONOENGINE_GIT_SMOKE_PUSH=1`）
-  git push origin refs/tags/<name> → 期望失败（`MONOENGINE_GIT_SMOKE_PUSH=1`）
+  git push HEAD:refs/heads/<tmp> → CL（同上；`MEGA2_GIT_SMOKE_PUSH=1`）
+  git push origin refs/tags/<name> → 期望失败（`MEGA2_GIT_SMOKE_PUSH=1`）
 
 LFS:
   git lfs install
   git lfs track
-  git push with LFS object（`MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
-  git clone with LFS object（`MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 时启用）
-  git lfs locks（`MONOENGINE_GIT_SMOKE_LFS=1` + `MONOENGINE_GIT_SMOKE_PUSH=1` 时启用，只读 list）
+  git push with LFS object（`MEGA2_GIT_SMOKE_LFS=1` + `MEGA2_GIT_SMOKE_PUSH=1` 时启用）
+  git clone with LFS object（`MEGA2_GIT_SMOKE_LFS=1` + `MEGA2_GIT_SMOKE_PUSH=1` 时启用）
+  git lfs locks（`MEGA2_GIT_SMOKE_LFS=1` + `MEGA2_GIT_SMOKE_PUSH=1` 时启用，只读 list）
 ```
 
 每个用例记录：
@@ -765,7 +765,7 @@ LFS:
 1. 建立 capability truth table。
 2. 移除或补齐 `atomic`、`report-status-v2`、`quiet`、`include-tag`、`delete-refs` 等能力。
 3. 明确 `ofs-delta`、`no-thin`、`side-band-64k` 的 encode/decode 测试。（✅ 2026-09-16：`no-thin` 由 advertise 断言 + RCV-01 端到端回归覆盖，见上表与 truth table）
-4. ✅ 对 SHA-1 object format 做显式策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；monoengine 策略对 SHA-1-only repo 不 advertise），由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
+4. ✅ 对 SHA-1 object format 做显式策略：SHA-1 为协议默认格式，SHA-1-only server 不 advertise `object-format`（协议允许 SHA-1 默认时省略；mega2 策略对 SHA-1-only repo 不 advertise），由 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` 锁定。
 
 验收标准：
 
@@ -778,7 +778,7 @@ LFS:
 |---|---|---|---|---|---|
 | `report-status` | ✅ receive-pack | ✅ | ✅ 生成 `unpack ok` + per-ref status | ✅ `receive_pack_advertises_only_supported_baseline_capabilities` | 基础 report-status v1 语义 |
 | `side-band-64k` | ✅ both | ✅ | ✅ `build_side_band_format` | ✅ `build_side_band_format_wraps_payload_when_side_band_64k_enabled` + `build_side_band_format_passthrough_when_capability_absent` | pack data 通过 side-band 传输 |
-| `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；monoengine 侧仅覆盖 advertise/parse |
+| `ofs-delta` | ✅ both | ✅ | ✅ pack decode 委托 `git-internal`（支持 offset delta 编解码，见 `git-internal::internal::pack::decode`） | ✅ advertise/parse：`parse_capabilities_recognizes_ofs_delta` + advertise 断言（pack decode 由 `git-internal` 自测） | OFS_DELTA pack 编解码由 `git-internal` 实现并自测；mega2 侧仅覆盖 advertise/parse |
 | `multi_ack_detailed` | ✅ upload-pack | ✅ | ✅ negotiation ACK 逻辑 | ✅ `parse_capabilities` 单测 | upload-pack negotiation |
 | `no-done` | ✅ upload-pack | ✅ | ✅ 与 multi_ack_detailed 联动 | ✅ negotiation 单测 | 允许在 multi_ack_detailed 下提前发 pack |
 | `shallow` | ✅ upload-pack | ✅ | ✅ `deepen` / `deepen-relative` 生成 shallow pack 和 `shallow` response | ✅ capability parse/advertise 单测 + shallow traversal 单测 | protocol v1 shallow clone 基础语义 |
@@ -794,7 +794,7 @@ LFS:
 | `server-option` | ❌ 已移除 (v2) | ✅ | ❌ | ✅ `v2_capability_advertisement_does_not_advertise_server_option` | v2 parsed capabilities 未被 inspect/act-on，advertise 会误导客户端；2026-06-30 从 v2 advertise 移除 |
 | `object-format` | ❌ protocol v1；✅ protocol v2 `object-format=sha1` | ✅ v2 capability advertisement | N/A | ✅ v1 `advertised_capabilities_keep_sha1_default_and_do_not_advertise_object_format` + v2 capability 单测 | v1 保持 SHA-1 默认不 advertise；v2 capability list 显式声明 `sha1` |
 
-残余风险：`ofs-delta` 的 pack 编解码由 `git-internal` crate 实现并自测，monoengine 侧已覆盖 advertise/parse；如需端到端 OFS_DELTA pack 矩阵可在 `git-internal` 侧补足。
+残余风险：`ofs-delta` 的 pack 编解码由 `git-internal` crate 实现并自测，mega2 侧已覆盖 advertise/parse；如需端到端 OFS_DELTA pack 矩阵可在 `git-internal` 侧补足。
 
 ### 阶段 4：认证与授权统一
 
@@ -855,7 +855,7 @@ LFS:
 
 | 优先级 | 工作 | 原因 |
 | --- | --- | --- |
-| P0 | 建立真实 Git 客户端兼容性矩阵 | ✅ **已落地并扩展（2026-07-01）**：`scripts/git_protocol_smoke.sh` + `.github/workflows/git-protocol-smoke.yml` CI 自动化回归 gate，覆盖 HTTP read-only 场景（ls-remote/clone/fetch/v2 fetch/shallow/blob:none）、HTTP branch/tag push+delete 以及 HTTP LFS push/clone/pull/locks-list；SSH push/delete 保留为脚本手动 opt-in。**最小往返集（clone→push→再 clone + 用例隔离）已进 cargo target** `bin/tests/integration_git_cli.rs`（IT-03，**Linux 目标 OS**，`cargo test -p monoengine --test integration_git_cli`）；正路径广度矩阵仍以脚本为准，不在 `bin/tests/` 重复 |
+| P0 | 建立真实 Git 客户端兼容性矩阵 | ✅ **已落地并扩展（2026-07-01）**：`scripts/git_protocol_smoke.sh` + `.github/workflows/git-protocol-smoke.yml` CI 自动化回归 gate，覆盖 HTTP read-only 场景（ls-remote/clone/fetch/v2 fetch/shallow/blob:none）、HTTP branch/tag push+delete 以及 HTTP LFS push/clone/pull/locks-list；SSH push/delete 保留为脚本手动 opt-in。**最小往返集（clone→push→再 clone + 用例隔离）已进 cargo target** `bin/tests/integration_git_cli.rs`（IT-03，**Linux 目标 OS**，`cargo test -p mega2 --test integration_git_cli`）；正路径广度矩阵仍以脚本为准，不在 `bin/tests/` 重复 |
 | P0 | 修复 HTTP query、SSH exec、pkt-line parser 的 panic | 非法客户端输入不能打崩服务 |
 | P0 | receive-pack 用 pkt-line flush 分界替代搜索 `PACK` | 已完成首批；HTTP branch/tag push+delete 已进入 CI；SSH push/delete 仍为手动 opt-in；后续补 streaming parser |
 | P1 | capability truth table，移除未实现 advertise | 避免误导 Git 客户端进入未实现语义 |

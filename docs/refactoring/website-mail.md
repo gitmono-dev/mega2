@@ -1,6 +1,6 @@
 # Website 邮件投递契约
 
-本文是 monoengine 产品事件邮件迁至 website 的单一事实源。决议来源：
+本文是 mega2 产品事件邮件迁至 website 的单一事实源。决议来源：
 [`docs/plan/plan-20260731.md`](../plan/plan-20260731.md) ADR-WA-08 / MN-01。
 
 核对日：**2026-08-02**（CST）。本文件定义跨服务契约；website 内部 API 已由
@@ -12,18 +12,18 @@
 
 website 是唯一的**出站邮件发送方**：
 
-- website 自己负责认证事务邮件，以及由 monoengine 产品事件触发的通知邮件。
-- monoengine 仍保留 CL、issue、reference 等事件编排、收件人偏好判定和 in-app /
+- website 自己负责认证事务邮件，以及由 mega2 产品事件触发的通知邮件。
+- mega2 仍保留 CL、issue、reference 等事件编排、收件人偏好判定和 in-app /
   Slack / webhook 通道；它不再直接连接 SMTP、Resend 或 Cloudflare。
-- monoengine → website 是内部服务调用，不是浏览器 API；不得使用 Better Auth session
+- mega2 → website 是内部服务调用，不是浏览器 API；不得使用 Better Auth session
   cookie 或浏览器用户 bearer。
 
 认证事务邮件与产品通知邮件必须分开：
 
 | 类别 | 触发方 | 发送实现 | 本契约 |
 |---|---|---|---|
-| 认证事务 | website（验证、重置密码等） | website `@libs/email` | 不经 monoengine |
-| 产品通知 | monoengine 事件触发器 | website `@libs/email` + 产品模板 | 本文定义 |
+| 认证事务 | website（验证、重置密码等） | website `@libs/email` | 不经 mega2 |
+| 产品通知 | mega2 事件触发器 | website `@libs/email` + 产品模板 | 本文定义 |
 
 chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 退场。
 
@@ -36,13 +36,13 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 | 项 | 契约 |
 |---|---|
 | 方法与路径 | `POST /api/internal/notifications/email` |
-| 调用方 | monoengine notification client（MN-05） |
+| 调用方 | mega2 notification client（MN-05） |
 | 鉴权 | `Authorization: Bearer <shared-internal-bearer>` |
 | 幂等 | 必填 `Idempotency-Key` 请求头；同一 key 的重放必须返回同一受理结果，不得重复发送。**key 必须由请求身份确定性推导**（见 §2.3），不得每次调用现取随机值——否则该保证形同虚设 |
 | Content-Type | `application/json` |
-| 超时与重试 | monoengine 使用有界 HTTP 超时；本计划为 best-effort，不在本仓建立重试 outbox |
+| 超时与重试 | mega2 使用有界 HTTP 超时；本计划为 best-effort，不在本仓建立重试 outbox |
 
-共享 bearer 是服务间 secret，必须通过 monoengine 的 SecretRef / website 的受控环境注入；
+共享 bearer 是服务间 secret，必须通过 mega2 的 SecretRef / website 的受控环境注入；
 不得写入 `config/config.toml`、Compose 提交文件、日志或错误回显。website 必须将此路由
 与公网用户路由隔离，并以 constant-time secret 比较验证 bearer。
 
@@ -76,12 +76,12 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 | `payload` | 必填对象；仅事件模板所需的最小、已转义前的业务字段；不得传密码、token、完整 session cookie 或任意 HTML |
 | `payload` 中模板必填字段 | **必须是非空白字符串**。website 对 `trim()` 后为空的必填字段回 `422 invalid_payload`；调用方负责在业务值可能为空时（如纯空白的评论正文）替换为占位文案，而不是发出一个必然 422 的请求 |
 
-模板归 website 管理。monoengine 不再渲染 mail TOML 模板、构造 HTML/text 正文或传递附件；
+模板归 website 管理。mega2 不再渲染 mail TOML 模板、构造 HTML/text 正文或传递附件；
 若未来确需预渲染内容或附件，必须修订本契约并单列 PII、大小限制和内容安全策略。
 
 ### 2.2 响应和错误
 
-成功（首次受理或幂等重放）返回 `202 Accepted`（monoengine 客户端按「任意 2xx = 已受理」
+成功（首次受理或幂等重放）返回 `202 Accepted`（mega2 客户端按「任意 2xx = 已受理」
 宽松接收，因此前端把成功码改成其它 2xx 不会立刻打断投递，但仍属契约漂移，须先改本文）：
 
 ```json
@@ -101,7 +101,7 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 }
 ```
 
-| 状态 | `code` | monoengine 行为 |
+| 状态 | `code` | mega2 行为 |
 |---|---|---|
 | 400 | `invalid_request` | 记录脱敏错误；不阻断业务请求 |
 | 401 | `unauthorized` | 记录配置/secret 告警；不回退 SMTP |
@@ -112,7 +112,7 @@ chat mention/reply 邮件**不迁移**。chat 产品面与其触发器随 RM-03 
 | 429 | `rate_limited` | 记录告警；本计划不在本仓重试 |
 | 5xx / 网络超时 | `upstream_unavailable`（或无 body） | best-effort 失败；in-app 等非邮件通道继续 |
 
-website 负责在受理后可靠发送、去重与其自身 provider 失败处理。monoengine 不应把成功响应
+website 负责在受理后可靠发送、去重与其自身 provider 失败处理。mega2 不应把成功响应
 理解为最终送达，也不得将 bearer、完整收件人或完整 payload 写入日志。
 
 区分 409 与 425 的意义：两者都由同一个 `Idempotency-Key` 触发，但 409 是调用方 bug
@@ -123,7 +123,7 @@ website 负责在受理后可靠发送、去重与其自身 provider 失败处�
 
 **key 推导（调用方契约）**：`Idempotency-Key` 必须由「本次投递的身份」确定性推导，
 即 `event_type` + `recipient.username` + `recipient.email` + `locale` + `payload`
-的稳定哈希。monoengine 实现见 `src/notification/website_mail.rs`
+的稳定哈希。mega2 实现见 `src/notification/website_mail.rs`
 （blake3 over 规范化 JSON，取 hex）。「规范化」= **对象键递归排序**后自行渲染，
 数组保持原序（有序数据，重排即不同投递）。不用 `serde_json::Value::to_string`：
 它的键序取决于 `preserve_order` feature，而该 feature 是依赖树里的其它 crate
@@ -131,7 +131,7 @@ website 负责在受理后可靠发送、去重与其自身 provider 失败处�
 随一个我们不掌握的 feature 漂移，两个构建方式不同的副本会对「同一次投递」算出不同
 的 key。
 
-**关键约束：规范化后的字符串必须就是请求体本身**（monoengine 用 `.body(canonical)`
+**关键约束：规范化后的字符串必须就是请求体本身**（mega2 用 `.body(canonical)`
 发送，而非 `.json(&value)`）。若只把规范化用于算 key、却按插入序发送 body，则
 「key 相同」不再蕴含「字节相同」——website 是对**收到的 body** 取指纹的，同一个 key
 就可能带着它已绑定到别的指纹的字节到达，把一次良性重放变成永久 `409`。
@@ -140,7 +140,7 @@ website 负责在受理后可靠发送、去重与其自身 provider 失败处�
 
 - 同一逻辑投递无论被重放多少次，key 都相同 → website 侧只发一封；
 - key 相同 ⟺ 所发送字节相同（key 就是这串字节的哈希）→ `409 idempotency_conflict`
-  在 monoengine 这个调用方身上**结构上不可能**发生；它只会出现在 key 由其它调用方
+  在 mega2 这个调用方身上**结构上不可能**发生；它只会出现在 key 由其它调用方
   手工构造的场景。
 
 代价是**payload 相同的重复通知会被折叠成一封邮件**。注意折叠判据是 payload，不是原始
@@ -165,7 +165,7 @@ website 负责在受理后可靠发送、去重与其自身 provider 失败处�
 
 ---
 
-## 3. Monoengine 迁移边界
+## 3. Mega2 迁移边界
 
 ### 删除（MN-02..MN-04）
 
@@ -177,7 +177,7 @@ website 负责在受理后可靠发送、去重与其自身 provider 失败处�
   `email_job_attachments` 及其 callisto/storage 实体；
 - admin `/email-jobs/*` 与 `/mail-templates*` API、OpenAPI 表面、模板渲染与
   `enqueue_email_job` 路径；
-- 仅验证 monoengine `SmtpMailer → Mailpit` 的测试、CI 门和运维说明。
+- 仅验证 mega2 `SmtpMailer → Mailpit` 的测试、CI 门和运维说明。
 
 `email_jobs` / `email_job_attachments` 的 DROP 由 MN-04 单独实施，顺序为 attachments
 后 jobs，迁移 forward-only、`down` no-op；历史创建 migration 保留。
@@ -205,7 +205,7 @@ warn/error，不使原始 CL/issue HTTP 请求失败，也不得阻止 in-app �
 1. 在 `should_send` 允许时请求 website 产品邮件；并且
 2. 同时写入 in-app 通知。
 
-它不是 monoengine SMTP 开关。未知或无效 delivery mode 仍按现有校验拒绝；MN-02 必须为
+它不是 mega2 SMTP 开关。未知或无效 delivery mode 仍按现有校验拒绝；MN-02 必须为
 该映射添加 focused test。没有独立弃用窗口，兼容性变更由 ADR-WA-06 / REL-01 minor
 发布说明集中告知。
 
@@ -216,7 +216,7 @@ warn/error，不使原始 CL/issue HTTP 请求失败，也不得阻止 in-app �
 当前拓扑（MN-05/MN-06 已落地；以 `docker-compose.test.yml` 与 [`test-infra.md`](./test-infra.md) 为准）：
 
 ```text
-monoengine (profile app)
+mega2 (profile app)
   ├─ in-app / Slack / webhook（本仓保留）
   └─ POST website-next /api/internal/notifications/email
        Authorization: shared internal bearer
@@ -226,16 +226,16 @@ monoengine (profile app)
 
 | 组件 | 现行约定 |
 |---|---|
-| `monoengine` | **零** `MEGA_MAIL__*`，且不 `depends_on: mailpit`。客户端配置键：**`notification.website_mail_base_url`**（scheme+host[:port]，无 path；容器内例 `http://website-next:7001`）与 **`notification.website_mail_bearer_ref`**（`vault://…` SecretRef，或 IT 明文 **`notification.website_mail_bearer`** 仅限测试）。环境变量覆盖：`MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL`、`MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER` / `…_BEARER_REF`。 |
-| `website-next` | `web` profile 的唯一邮件发送者；IT 若需捕获邮件，注入其 SMTP 或既有测试-provider 配置，使其连接 `mailpit:1025`。接收内部邮件时读取并校验 `MONOENGINE_INTERNAL_MAIL_BEARER`，其值须与 monoengine 的 `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER` 相同。 |
-| `mailpit` | 默认保留在数据面；**消费方 = website IT，不是 monoengine**。`config-validation.yml` 不要求本仓 SMTP 成功路径。 |
+| `mega2` | **零** `MEGA_MAIL__*`，且不 `depends_on: mailpit`。客户端配置键：**`notification.website_mail_base_url`**（scheme+host[:port]，无 path；容器内例 `http://website-next:7001`）与 **`notification.website_mail_bearer_ref`**（`vault://…` SecretRef，或 IT 明文 **`notification.website_mail_bearer`** 仅限测试）。环境变量覆盖：`MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL`、`MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER` / `…_BEARER_REF`。 |
+| `website-next` | `web` profile 的唯一邮件发送者；IT 若需捕获邮件，注入其 SMTP 或既有测试-provider 配置，使其连接 `mailpit:1025`。接收内部邮件时读取并校验 `MEGA2_INTERNAL_MAIL_BEARER`，其值须与 mega2 的 `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER` 相同。 |
+| `mailpit` | 默认保留在数据面；**消费方 = website IT，不是 mega2**。`config-validation.yml` 不要求本仓 SMTP 成功路径。 |
 | 会话 IT | `website-next` 同时承载 Better Auth 与内部邮件 API；会话基址仍见 [`website-auth.md`](./website-auth.md)，邮件 API 使用独立 bearer，不复用 session cookie |
 | `.env.test*` / CI | 仅使用公开 IT 值与占位 secret；`MAILPIT_*` 注释为 website 捕获用途；含 `MEGA_NOTIFICATION__WEBSITE_MAIL_*` 占位；不再 seed `mail.password`；CI 不跑本仓 SmtpMailer→Mailpit 门 |
 
 mailpit 端口与服务登记以 [`test-infra.md`](./test-infra.md) 为准。服务同时启用的基线命令：
 
 ```bash
-docker compose -p monoengine-it -f docker-compose.test.yml \
+docker compose -p mega2-it -f docker-compose.test.yml \
   --profile app --profile web up -d --wait
 ```
 
@@ -246,7 +246,7 @@ docker compose -p monoengine-it -f docker-compose.test.yml \
 | 产物 | 状态 |
 |---|---|
 | [`notification.md`](./notification.md) | 已去 email-primary / outbox / SmtpMailer；保留 in-app/Slack/webhook 与 website 调用 |
-| [`mail.md`](./mail.md) | 已废止，改链本文；不再作为 monoengine SMTP 设计事实源 |
+| [`mail.md`](./mail.md) | 已废止，改链本文；不再作为 mega2 SMTP 设计事实源 |
 | [`test-infra.md`](./test-infra.md) | mailpit 消费方 = website IT；CI 不要求本仓 SMTP |
 | [`integration.md`](./integration.md) | 无本仓 SMTP→Mailpit 必经断言；website API mock/IT 覆盖 |
 | [`config.md`](./config.md) 与 [`../development.md`](../development.md) | 无 `[mail]` / `mail.password` / 本仓 SMTP 运行前提 |
@@ -259,7 +259,7 @@ DEP-06（website 内部邮件 API）已由 [`plan-20260802.md`](../plan/plan-202
 
 ### MN-05 implementation note
 
-The monoengine client lives at `src/notification/website_mail.rs`. It is built
+The mega2 client lives at `src/notification/website_mail.rs`. It is built
 only when `notification.website_mail_base_url` and exactly one bearer source
 are configured. `website_mail_bearer_ref` is required for production and must
 point under `notification/website_mail/bearer`; `website_mail_bearer` is an
@@ -267,7 +267,7 @@ IT-only literal secret. The client uses a three-second, redirect-free
 best-effort request with an `Idempotency-Key`; network and non-2xx failures
 are logged without the bearer, recipient address, or payload.
 
-For every enabled `delivery_mode=email` product event, monoengine writes the
+For every enabled `delivery_mode=email` product event, mega2 writes the
 in-app notification first, then POSTs to the website API. This covers the
 existing CL comment/merge, issue comment/close, and reference triggers because
 they all use `deliver_user_notification`. Local wire mocks and the compose
@@ -281,21 +281,21 @@ and acceptance against website tip `a52d703` (see 实现基线).
 | 冻结项 | 取值 |
 |---|---|
 | 方法与路径 | `POST /api/internal/notifications/email` |
-| 鉴权 | `Authorization: Bearer <shared-internal-bearer>`（website env：`MONOENGINE_INTERNAL_MAIL_BEARER`；monoengine IT：`MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER`） |
+| 鉴权 | `Authorization: Bearer <shared-internal-bearer>`（website env：`MEGA2_INTERNAL_MAIL_BEARER`；mega2 IT：`MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER`） |
 | 幂等头 | 必填 `Idempotency-Key` |
 | 请求 JSON 字段 | `event_type`、`recipient.username`、`recipient.email`、`locale`、`payload`（见上文 §2.1） |
 | 成功响应 | `202` + `{ delivery_id, accepted, duplicate }` |
-| 错误 `code` | `invalid_request` / `unauthorized` / `idempotency_conflict` / `idempotency_in_progress`(2026-08-21 新增) / `unsupported_event` / `invalid_payload` / `upstream_unavailable`（见 §2.2）。`forbidden` 与 `rate_limited` 为**保留未实现**——前端从未返回过 403/429，monoengine 侧的分类分支相应为死分支 |
+| 错误 `code` | `invalid_request` / `unauthorized` / `idempotency_conflict` / `idempotency_in_progress`(2026-08-21 新增) / `unsupported_event` / `invalid_payload` / `upstream_unavailable`（见 §2.2）。`forbidden` 与 `rate_limited` 为**保留未实现**——前端从未返回过 403/429，mega2 侧的分类分支相应为死分支 |
 | 产品 `event_type` allowlist | `cl.comment.created`、`cl.merged`、`issue.comment.created`、`issue.closed`、`item.referenced`（`src/notification/triggers.rs`） |
 | CI website pin（`config-validation.yml` checkout） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（核对日快照；**现行 pin 见下方 2026-08-06 增补**） |
-| website 工作分支 | `monoengine` |
+| website 工作分支 | `mega2` |
 | website tip（REL-WE-SITE） | `a52d70362586ae5e171be5db2e5c5457d07ce366`（含 WE-02..WE-05） |
 
-> **增补（2026-08-06 完成度复审）：** `config-validation.yml` 的 website checkout pin 已于 plan-20260803 期间（monoengine `39f7433`，website IT 切换 Postgres）bump 为
+> **增补（2026-08-06 完成度复审）：** `config-validation.yml` 的 website checkout pin 已于 plan-20260803 期间（mega2 `39f7433`，website IT 切换 Postgres）bump 为
 > `2af89c874646005dd1a550053b5068f19bb7478a`（`a52d703…` 的直接子提交，仍含 WE-02..WE-05），并已同步 `website-auth.md` / `test-infra.md`；本表「核对日 2026-08-02」各 pin 行为历史快照。现行 pin 的唯一事实源是 workflow 文件本身与 `website-auth.md` §pin 政策。
 
 > **历史快照（2026-08-21 前端仓库改指）：** 当时联调栈的前端由 `genedna/website` 改指
-> **`gitmono-dev/monoui`** 的 `monoengine` 分支（sibling `../monoui`）；WE-02..WE-06
+> **`gitmono-dev/monoui`** 的 `mega2` 分支（sibling `../monoui`）；WE-02..WE-06
 > 的路由 / Bearer / 五类产品模板 / 幂等 / `EMAIL_PROVIDER=test` 已自
 > `genedna/website@2af89c8` 逐文件移植到 monoui，移植当日接口契约与本文各表**逐项不变**
 > （路径、bearer 头、`Idempotency-Key`、`202 {delivery_id, accepted, duplicate}`、
@@ -321,8 +321,8 @@ and acceptance against website tip `a52d703` (see 实现基线).
 
 | 仓 | tip / pin | 说明 |
 |---|---|---|
-| website `monoengine` | `a52d70362586ae5e171be5db2e5c5457d07ce366` | REL-WE-SITE；CI checkout 收口日同 SHA（2026-08-06 起 pin 已 bump 为其子提交 `2af89c8…`，见上方增补） |
-| monoengine `main`（WE-06 + REL-WE-SITE 计划收口） | `3b8490c`（含 `3c2b9d1` pin/IT + plan REL-WE-SITE-R2） | compose/`config-validation`/文档 pin 同步 |
+| website `mega2` | `a52d70362586ae5e171be5db2e5c5457d07ce366` | REL-WE-SITE；CI checkout 收口日同 SHA（2026-08-06 起 pin 已 bump 为其子提交 `2af89c8…`，见上方增补） |
+| mega2 `main`（WE-06 + REL-WE-SITE 计划收口） | `3b8490c`（含 `3c2b9d1` pin/IT + plan REL-WE-SITE-R2） | compose/`config-validation`/文档 pin 同步 |
 
 ---
 
@@ -334,5 +334,5 @@ and acceptance against website tip `a52d703` (see 实现基线).
   key 值。
 - 事件 payload 和收件人属于 PII：传输使用受保护服务网络或 TLS，日志只可记录 event type、
   status、脱敏 recipient 和 delivery/idempotency 标识。
-- website API 不可达时允许产品邮件丢失，但 in-app 通知仍应可用；本计划不引入 monoengine
+- website API 不可达时允许产品邮件丢失，但 in-app 通知仍应可用；本计划不引入 mega2
   本地重试队列（DEFER-WA-08）。

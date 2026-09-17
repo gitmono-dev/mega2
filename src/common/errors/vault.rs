@@ -1,12 +1,12 @@
 //! Vault error types.
 //!
-//! [`VaultError`] is monoengine's own surface: the conditions the integration
+//! [`VaultError`] is mega2's own surface: the conditions the integration
 //! layer in `src/contract/vault/` reports to its callers. [`RvError`] — the
 //! library's own error enum — is re-exported from the `libvault` crate rather
 //! than defined here, so there is exactly one definition of it and no copy to
 //! keep in step with the upstream one. The crate's crypto and seal errors
 //! (`libvault::utils::crypto::CryptoError`, `libvault::utils::seal::SealBoxError`)
-//! are deliberately not re-exported: nothing in monoengine consumes them, and a
+//! are deliberately not re-exported: nothing in mega2 consumes them, and a
 //! re-export nobody uses is just a second name for the same type.
 
 use std::path::PathBuf;
@@ -108,7 +108,7 @@ pub enum VaultError {
     /// Distinct from [`VaultError::Unseal`], which is specifically about the
     /// barrier: this covers the rest of the readonly open — module setup,
     /// barrier views, the policy store — where the only thing the library can
-    /// hand back is an `RvError` with no monoengine-side meaning attached.
+    /// hand back is an `RvError` with no mega2-side meaning attached.
     #[error("failed to open vault readonly: {0}")]
     ReadonlyOpen(String),
     /// The stored vault state is missing or in an older format, and a readonly
@@ -116,7 +116,7 @@ pub enum VaultError {
     ///
     /// This is the identity the library's readonly "state incomplete" error used
     /// to carry. `libvault` has no such variant, and it should not: the condition
-    /// belongs to monoengine's readonly bootstrap, not to the library. `detail`
+    /// belongs to mega2's readonly bootstrap, not to the library. `detail`
     /// names which piece of state, so an operator is not left to guess.
     #[error(
         "vault is being opened readonly and its stored {detail} is missing or in an older format; \

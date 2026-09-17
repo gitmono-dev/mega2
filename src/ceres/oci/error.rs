@@ -5,8 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-const OCI_AUTH_CHALLENGE: &str =
-    "Basic realm=\"monoengine registry\", Bearer realm=\"monoengine registry\"";
+const OCI_AUTH_CHALLENGE: &str = "Basic realm=\"mega2 registry\", Bearer realm=\"mega2 registry\"";
 
 /// Errors defined by the OCI Distribution API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +177,7 @@ mod tests {
             .into_response();
         assert_eq!(
             response.headers().get(WWW_AUTHENTICATE).expect("challenge"),
-            "Basic realm=\"monoengine registry\", Bearer realm=\"monoengine registry\"",
+            "Basic realm=\"mega2 registry\", Bearer realm=\"mega2 registry\"",
         );
     }
 

@@ -15,7 +15,8 @@ use crate::{
         change_list::DiffItemSchema,
         git::{
             BlobContentQuery, CodePreviewQuery, CreateEntryInfo, CreateEntryResult,
-            DiffPreviewPayload, EditFilePayload, EditFileResult, FileTreeItem, TreeCommitItem,
+            DeleteEntryInfo, DeleteEntryResult, DiffPreviewPayload, EditFilePayload,
+            EditFileResult, FileTreeItem, MoveEntryInfo, MoveEntryResult, TreeCommitItem,
             TreeHashItem, TreeResponse,
         },
     },
@@ -51,10 +52,13 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
         .routes(routes!(preview_diff))
 }
 
-/// POST create-entry / edit/save used by review and trunk product API writes.
+/// POST create-entry / delete-entry / move-entry / edit/save used by review
+/// and trunk product API writes.
 pub fn write_routers() -> OpenApiRouter<MonoApiServiceState> {
     OpenApiRouter::new()
         .routes(routes!(create_entry))
+        .routes(routes!(delete_entry))
+        .routes(routes!(move_entry))
         .routes(routes!(save_edit))
 }
 
@@ -115,6 +119,61 @@ async fn create_entry(
     let result = handler
         .create_monorepo_entry(json.clone(), requester)
         .await?;
+
+    upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
+    Ok(Json(CommonResult::success(Some(result))))
+}
+
+/// Delete a directory (plan-20260917 LB-02): parent `path` + `name`, same
+/// trunk auth and landing policy as create-entry.
+#[utoipa::path(
+    post,
+    path = "/delete-entry",
+    request_body = DeleteEntryInfo,
+    responses(
+        (status = 200, body = CommonResult<DeleteEntryResult>, content_type = "application/json")
+    ),
+    tag = CODE_PREVIEW
+)]
+async fn delete_entry(
+    state: State<MonoApiServiceState>,
+    headers: HeaderMap,
+    Json(json): Json<DeleteEntryInfo>,
+) -> Result<Json<CommonResult<DeleteEntryResult>>, ApiError> {
+    let requester = trunk_write_requester(&state, &headers, &json.path)?;
+    let handler = state.api_handler(json.path.as_ref()).await?;
+    // Bare `?`: the service's `[code:4xx]` prefixes map through
+    // `From<E> for ApiError` (`map_ceres_error` would turn 409 into 500).
+    let result = handler
+        .delete_monorepo_entry(json.clone(), requester)
+        .await?;
+
+    upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
+    Ok(Json(CommonResult::success(Some(result))))
+}
+
+/// Move or rename a directory (plan-20260917 LB-03): both parents must pass
+/// the trunk write gate before anything is read or written (ADR-LB-04).
+#[utoipa::path(
+    post,
+    path = "/move-entry",
+    request_body = MoveEntryInfo,
+    responses(
+        (status = 200, body = CommonResult<MoveEntryResult>, content_type = "application/json")
+    ),
+    tag = CODE_PREVIEW
+)]
+async fn move_entry(
+    state: State<MonoApiServiceState>,
+    headers: HeaderMap,
+    Json(json): Json<MoveEntryInfo>,
+) -> Result<Json<CommonResult<MoveEntryResult>>, ApiError> {
+    let requester = trunk_write_requester(&state, &headers, &json.from_path)?;
+    // The destination parent needs the same authorization; any failure
+    // rejects the whole request before the handler runs.
+    trunk_write_requester(&state, &headers, &json.to_path)?;
+    let handler = state.api_handler(json.from_path.as_ref()).await?;
+    let result = handler.move_monorepo_entry(json.clone(), requester).await?;
 
     upsert_commit_binding(&state, &result.commit_id, json.author_username.as_deref()).await?;
     Ok(Json(CommonResult::success(Some(result))))
@@ -408,7 +467,12 @@ async fn save_edit(
     Ok(Json(CommonResult::success(Some(res))))
 }
 
-fn trunk_write_requester(
+/// Trunk / storage-only product-write gate shared by the directory-change
+/// handlers and (plan-20260917 LB-04) the tag writes in `tag_router`: on
+/// `push_policy=trunk` it authorizes through `git.push_auth` and returns the
+/// requester name; on Review it returns `None` and the caller keeps its
+/// existing CL / session behaviour.
+pub(crate) fn trunk_write_requester(
     state: &MonoApiServiceState,
     headers: &HeaderMap,
     path: &str,
@@ -428,7 +492,7 @@ mod tests {
     use super::*;
     use crate::api::api_doc::ApiDoc;
 
-    fn path_list(router: OpenApiRouter<MonoApiServiceState>) -> Vec<String> {
+    pub(super) fn path_list(router: OpenApiRouter<MonoApiServiceState>) -> Vec<String> {
         OpenApiRouter::with_openapi(ApiDoc::openapi())
             .merge(router)
             .split_for_parts()
@@ -482,4 +546,109 @@ mod tests {
         );
         assert!(paths.iter().any(|p| p.contains("/edit/save")), "{paths:?}");
     }
+}
+
+/// LB-02 AC-1: the route is registered on `write_routers` (so both Review and
+/// trunk get it) and stays out of the read-only preview surface.
+#[cfg(test)]
+#[test]
+fn delete_entry_registered_on_write_routers() {
+    let paths = tests::path_list(write_routers());
+    assert!(
+        paths.iter().any(|p| p.contains("delete-entry")),
+        "{paths:?}"
+    );
+    let readonly = tests::path_list(readonly_routers());
+    assert!(
+        readonly.iter().all(|p| !p.contains("delete-entry")),
+        "{readonly:?}"
+    );
+}
+
+/// LB-02 AC-3d: the handler authorizes through `trunk_write_requester`
+/// before it touches storage — a missing credential is 401 and a credential
+/// that does not cover the parent path is 403.
+#[cfg(test)]
+#[tokio::test]
+async fn delete_entry_calls_trunk_write_requester() {
+    use std::sync::Arc;
+
+    use axum::{
+        http::{HeaderValue, StatusCode, header::AUTHORIZATION},
+        response::IntoResponse,
+    };
+
+    use crate::{
+        api::oauth::api_store::{BrowserSessionStore, CountingSessionStore},
+        ceres::api_service::cache::GitObjectCache,
+        config::{PushAuth, PushTokenConfig},
+        contract::policy::entitystore::SharedEntityStore,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = crate::config::testing::isolated_config(temp.path().join("config"));
+    config.monorepo.push_policy = PushPolicy::Trunk;
+    config.git.push_auth = Some(PushAuth::Token);
+    config.git.push_tokens = vec![PushTokenConfig {
+        name: "lb02-ci".to_owned(),
+        token: "secret-ok".to_owned(),
+        paths: Some(vec!["/project".to_owned()]),
+    }];
+    let storage = crate::jupiter::tests::test_storage_with_config(temp.path(), config).await;
+    let state = MonoApiServiceState {
+        session_store: BrowserSessionStore::Counting(CountingSessionStore::new(vec![Ok(None)])),
+        git_object_cache: Arc::new(GitObjectCache {
+            connection: ::redis::aio::ConnectionManager::new_lazy_with_config(
+                ::redis::Client::open("redis://127.0.0.1:6379").expect("open redis client"),
+                ::redis::aio::ConnectionManagerConfig::new(),
+            )
+            .expect("lazy connection manager"),
+            prefix: "lb02-test".to_string(),
+        }),
+        listen_addr: "http://127.0.0.1:0".to_string(),
+        entity_store: Arc::new(SharedEntityStore::new()),
+        storage,
+    };
+    let body = DeleteEntryInfo {
+        path: "/project".to_owned(),
+        name: "gone".to_owned(),
+        author_username: None,
+        skip_build: true,
+    };
+
+    let Err(err) = delete_entry(State(state.clone()), HeaderMap::new(), Json(body.clone())).await
+    else {
+        panic!("missing credential must be rejected");
+    };
+    assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret-ok"));
+    let Err(err) = delete_entry(
+        State(state),
+        headers,
+        Json(DeleteEntryInfo {
+            path: "/other".to_owned(),
+            ..body
+        }),
+    )
+    .await
+    else {
+        panic!("uncovered path must be rejected");
+    };
+    assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+}
+
+/// LB-03 AC-1: `move-entry` is registered on `write_routers` (Review and
+/// trunk) and absent from the read-only preview surface.
+#[cfg(test)]
+#[test]
+fn move_entry_registered_on_write_routers() {
+    let paths = tests::path_list(write_routers());
+    assert!(paths.iter().any(|p| p.contains("move-entry")), "{paths:?}");
+    let readonly = tests::path_list(readonly_routers());
+    assert!(
+        readonly.iter().all(|p| !p.contains("move-entry")),
+        "{readonly:?}"
+    );
 }

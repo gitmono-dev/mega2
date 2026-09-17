@@ -38,7 +38,7 @@ Loose objects under `tests/data/objects/` do **not** contain tip `5bb8ee25…`; 
 
 - `tests/scripts/push.sh` 只对既有 git 工作树批量 `git push` 到 Mega HTTP，**不能**从源再生 `tests/data/packs/*` 或 refs/objects。
 - 仓内未发现 pack 生成脚本、seed 说明或 `Regenerate:` 文档。
-- 因此最小移植后无法在 monoengine 内复现/更新夹具；一旦 tip 漂移只能整包再拷。
+- 因此最小移植后无法在 mega2 内复现/更新夹具；一旦 tip 漂移只能整包再拷。
 
 ## Decision
 

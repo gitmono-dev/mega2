@@ -1,6 +1,6 @@
 # Monorepo 产品规则
 
-本文是 monoengine **Monorepo（非 `import_dir` 下的 ImportRepo）** 的集中规则事实源。协议实现、CI smoke、Web/API 与测试矩阵凡涉及分支、标签或仓库初始化，以本文为准；细节实现锚点见 [`refactoring/protocol.md`](./refactoring/protocol.md) 与 `config/config.toml` 的 `[monorepo]`。
+本文是 mega2 **Monorepo（非 `import_dir` 下的 ImportRepo）** 的集中规则事实源。协议实现、CI smoke、Web/API 与测试矩阵凡涉及分支、标签或仓库初始化，以本文为准；细节实现锚点见 [`refactoring/protocol.md`](./refactoring/protocol.md) 与 `config/config.toml` 的 `[monorepo]`。
 
 > **范围**：默认路径下的 Monorepo（根路径 `/` 及非 `import_dir` 子树）。  
 > **例外**：`[monorepo].import_dir`（默认 `/third-party`）下的 **ImportRepo** 仍可按普通 Git 多分支 / 客户端 tag 语义工作；本文规则不覆盖 ImportRepo。
@@ -12,7 +12,7 @@
 ### 规则
 
 1. Monorepo **只有一个公开分支**：`refs/heads/main`（简称 `main`）。
-2. 客户端对 monoengine 的 Git 推送 **不得** 在远端创建第二个公开分支（例如 `refs/heads/feature` 不得作为持久 heads 出现）。
+2. 客户端对 mega2 的 Git 推送 **不得** 在远端创建第二个公开分支（例如 `refs/heads/feature` 不得作为持久 heads 出现）。
 3. `git ls-remote` / upload-pack 广告中，heads 侧对用户可见的稳定公开 tip 是 `main`；变更评审用的 tip 落在 `refs/cl/*`，不是公开分支。
 
 ### 与 Change List（CL）的关系
@@ -30,7 +30,7 @@
 | 推送后 `ls-remote refs/heads/*` | 仍以 `main` 为公开 heads（无新增公开分支名） |
 | 对新建 `refs/cl/*` 的 fetch/checkout/pull | 工作树与 push 前本地树一致（见 `protocol.md` / `integration_git_cli`） |
 
-权威自动化：`scripts/git_protocol_smoke.sh`（`MONOENGINE_GIT_SMOKE_PUSH=1`）、`bin/tests/integration_git_cli.rs`。
+权威自动化：`scripts/git_protocol_smoke.sh`（`MEGA2_GIT_SMOKE_PUSH=1`）、`bin/tests/integration_git_cli.rs`。
 
 ---
 
@@ -49,9 +49,11 @@
 | 操作 | HTTP（OpenAPI 登记） |
 |---|---|
 | 创建 | `POST` … `/tags` |
-| 列表 | `GET` … `/tags/list` |
+| 列表 | `POST` … `/tags/list`（body `PageParams<String>`：`pagination` 与 `additional` 两键均必填；列 root 送 `additional: "/"`） |
 | 查询 | `GET` … `/tags/{name}` |
 | 删除 | `DELETE` … `/tags/{name}` |
+
+plan-20260917 LB-04 起，这四条路由同时挂在 Review 与 storage-only / trunk（`storage_only_routers_with` merge `tag_router::routers()`）；trunk 形态下 create / delete 经 `git.push_auth` 鉴权（delete 的鉴权 path 固定 `/`），list / get 不要求 Authorization。wire 细节以 [`refactoring/directory-entry-api.md`](refactoring/directory-entry-api.md) 的「标签」与「鉴权」节为准。
 
 协议层：Monorepo receive-pack 对 `RefTypeEnum::Tag` **拒绝**更新（返回可诊断错误），不得静默写入 `refs/tags/*`。
 
@@ -90,7 +92,7 @@
 
 `object_format` 只控制 `init_monorepo` 的同步初始物件建构。`sha256` 会产生 64 位 initial commit/tree/blob ID；当前 Ceres v1/v2、zero ID 和 pack/runtime context 仍是 SHA-1-only，因此它不是可对外 clone/fetch/push 的完整 SHA-256 仓库格式。`blake3`（正确拼写；不是 `black3`）保留为配置接口，待显式 repository hash context 与下游协议接入完成后再启用（与 `git-internal` 版本解耦，单独计划）。
 
-只能在受控的 `monoengine --config <path> service init --yes` invocation 使用
+只能在受控的 `mega2 --config <path> service init --yes` invocation 使用
 `sha256`，不能以这个设置启动一般 Git 服务；该命令完成初始图建构后即退出，不启动
 Git listener。它要求已有配置，并只装配初始化所需的 DB、必要时 readonly Vault、
 object storage 与 MonoService；不会启动 Redis、notification、reload watcher

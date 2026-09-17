@@ -120,10 +120,18 @@ impl AgentCaptureService {
             .insert_events_batch(capture_id, batch_id, events, completeness, stream_kind)
             .await?;
         for group in &snapshot.groups {
-            if group.new_event_count > 0
-                && let Ok(event) = Self::events_committed_event(&snapshot, group)
-            {
-                let _ = self.storage_event_emitter.try_emit(event);
+            if group.new_event_count == 0 {
+                continue;
+            }
+            match Self::events_committed_event(&snapshot, group) {
+                Ok(event) => {
+                    let _ = self.storage_event_emitter.try_emit(event);
+                }
+                // Builder rejection is a dropped event, never an ingest error
+                // (WH-15 / plan-20260912「固定 wire schema」).
+                Err(_) => self
+                    .storage_event_emitter
+                    .record_invalid_event(EventType::AgentCaptureEventsCommitted),
             }
         }
         Ok(snapshot)
@@ -143,10 +151,17 @@ impl AgentCaptureService {
             .storage
             .insert_checkpoint_ingest(capture_id, checkpoint, fingerprint)
             .await?;
-        if snapshot.created
-            && let Ok(event) = Self::checkpoint_committed_event(&snapshot)
-        {
-            let _ = self.storage_event_emitter.try_emit(event);
+        if snapshot.created {
+            match Self::checkpoint_committed_event(&snapshot) {
+                Ok(event) => {
+                    let _ = self.storage_event_emitter.try_emit(event);
+                }
+                // Builder rejection is a dropped event, never an ingest error
+                // (WH-15 / plan-20260912「固定 wire schema」).
+                Err(_) => self
+                    .storage_event_emitter
+                    .record_invalid_event(EventType::AgentCaptureCheckpointCommitted),
+            }
         }
         Ok(snapshot)
     }

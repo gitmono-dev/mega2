@@ -1,6 +1,6 @@
 # Trunk 直推形态（storage-only）与 Monorepo 写入序列化
 
-本文档记录 `monoengine` 在**不接入用户系统、不使用 Issue 与 Change List** 的部署形态下，Git 推送如何直接落入 `main`，以及为支撑该形态必须先行修复的 Monorepo 写入路径缺陷。
+本文档记录 `mega2` 在**不接入用户系统、不使用 Issue 与 Change List** 的部署形态下，Git 推送如何直接落入 `main`，以及为支撑该形态必须先行修复的 Monorepo 写入路径缺陷。
 
 > **治理规范**：本文档遵循 **`general.md`** 中定义的统一结构、共同约束和执行标准。在审阅或执行本计划前，请先查阅 general.md 了解共同需求。
 
@@ -16,14 +16,14 @@
 
 > **Libra 协同（2026-09-06）**：[`libra.md`](libra.md) REQ-LB-03/06 依赖本文阶段 1–3 的根写入序列化与 provenance，复用同一 root writer，不另建 Agent 写入队列。ADR-TP-10 同路径一项在队**仅约束 `kind='push'`**；多个任务的 CL 落地为 merge 行，由全序与锁内重查保证正确性，不新增或放宽 merge 的入队约束。证据重查、landing mapping 与 ref 更新须在同一事务边界设计。本文 storage-only trunk 形态不被强制接入 CL／website／人类批准，净零无新根 commit 的语义继续成立。此项仅登记协同需求，不表示本文功能已实现或修改既有 ADR。
 
-本计划服务于一类明确的部署：使用方只需要 monorepo 的**存储与分发**能力，不接入 monoengine 的用户系统，不使用 Issue 与 Change List，因而不走评审。
+本计划服务于一类明确的部署：使用方只需要 monorepo 的**存储与分发**能力，不接入 mega2 的用户系统，不使用 Issue 与 Change List，因而不走评审。
 
 **主要使用方是 Agent**。Agent 以「每产生一个 commit 就推送一次」的方式使用 monorepo，因此**单 commit 推送（N = 1）是常态路径，多 commit 推送（N > 1）是例外路径**。这一假设决定了下文对两条路径的不同处理。
 
 该形态有三条不可让步的要求：
 
 1. **`main` 的历史不能退化**——N = 1（Agent 常态路径）时 commit 的作者、时间、message **逐字段保真**（对象级）；N > 1 的 squash 不承诺逐字段保真，以**内容保真**（不变式 I2：tree 精确等于客户端 tip）与 **provenance 完整**（ADR-TP-13/14/15：真实作者署名、Co-authored-by、完整枚举、服务端签名）替代。
-2. **N = 1 时客户端 commit 原样落地；N > 1 时由 monoengine 自动合并为一个 commit 进入 `main`**。Agent 把若干 commit 攒在一起推送时，不应把这些中间状态带进 `main`。
+2. **N = 1 时客户端 commit 原样落地；N > 1 时由 mega2 自动合并为一个 commit 进入 `main`**。Agent 把若干 commit 攒在一起推送时，不应把这些中间状态带进 `main`。
 3. **保持 trunk-based development 的分支模型**——唯一公开分支 `main`。
 
 补充前提：monorepo 体量大，**根路径 clone 不可行**，使用方通过子路径 clone 或虚拟文件系统挂载消费。因此本计划的全部设计以**子路径推送**为唯一形态；根路径推送虽在协议上成立（`src/contract/git_protocol/path.rs:104` 把空前缀归一为 `/`），但不作为该形态的假设。
@@ -279,14 +279,14 @@
 - **决策**：N > 1 时**被推路径**的 squash commit，其 message 必须包含一段说明合并行为的自然语言，以及**全部 N 条**被合并 commit 的逐条枚举（commit id、author 署名、author date、subject），不设条数上限、不截断。祖先与后代的合成 commit **不重复枚举**，改带 `Mono-Squash-Commit` 指向被推路径那一个。`Mono-Commits` trailer 移除（与正文枚举重复）；`Mono-Squash-Range` 与 `Mono-Squash-Count` 保留为机器可读锚点。provenance 的持久权威记录是 `push_queue` 行的 `(old_id, new_id)` 区间加对象库中的 commit 对象。
 - **理由**：合并是服务端单方面对客户端历史做出的改写，使用方必须能够知道这次行为发生了、合并了什么。把这件事放在 message 里是唯一无需额外工具、无需查文档、`git log` / `git show` 直接可见的告知方式。一旦允许截断，「被截掉的那部分」恰恰是使用方最需要而最不容易找回的信息；而 provenance 的完整性押在 message 体积阈值上，阈值一调整就失效。ADR-TP-12 改为 N > 1 时被推路径也合并之后，原始 N 个 commit 不再被任何 ref 引用，message 与 `push_queue` 行是仅有的两条线索，二者都不能残缺。
 - **Alternatives considered**：正文枚举封顶 K 条、超出以剩余数收尾（**已否决**——违背「让用户知道这次行为」的目的，且完整性依赖可调阈值）；只写 `Mono-Squash-Range` 不逐条枚举（拒绝——读者必须另行遍历对象库才知道合并了什么，`git show` 看不出所以然）；把每个被合并 commit 的完整 message 正文也复制进来（拒绝——体积随正文长度无界增长，而 subject 加署名已足以判断内容，完整正文可经 range 取回）；新增 `push_commits` 列表表（拒绝——`push_queue` 的区间已足够还原，除非出现按 commit 维度查询的真实需求）。
-- **影响**：message 体积由 `max_push_commits`（ADR-TP-17）直接决定——按每条约 100 字节估算，默认上限 250 对应约 25 KB message，调高链长上限会成比例放大。**每次推送只产生一份**，不随已物化层数放大（这是「祖先不重复枚举」那半条决策的作用；若各层都带，体积会是枚举 × 层数，而层数随只读操作单调增长）。**该放大属于已接受的代价**：monoengine 的定位就是超大仓库处理，一个 25 KB 量级的 commit message 相对于它承载的对象规模可以忽略，而 provenance 的完整性不可替代。Git 对 message 长度无实际限制，`git log --oneline` 只取 subject 行，日常浏览不受影响；受影响的只是 `git show` 的输出长度。不变式 I4 相应改写。若后续引入 commit GC，必须把 `push_queue` 各行的 `(old_id, new_id)` 区间所锚定的 commit 链视为 GC root——`clean_dangling_commits`（`mono_api_service.rs` 中的 TODO 注释态）在实现前必须先满足这一条。
+- **影响**：message 体积由 `max_push_commits`（ADR-TP-17）直接决定——按每条约 100 字节估算，默认上限 250 对应约 25 KB message，调高链长上限会成比例放大。**每次推送只产生一份**，不随已物化层数放大（这是「祖先不重复枚举」那半条决策的作用；若各层都带，体积会是枚举 × 层数，而层数随只读操作单调增长）。**该放大属于已接受的代价**：mega2 的定位就是超大仓库处理，一个 25 KB 量级的 commit message 相对于它承载的对象规模可以忽略，而 provenance 的完整性不可替代。Git 对 message 长度无实际限制，`git log --oneline` 只取 subject 行，日常浏览不受影响；受影响的只是 `git show` 的输出长度。不变式 I4 相应改写。若后续引入 commit GC，必须把 `push_queue` 各行的 `(old_id, new_id)` 区间所锚定的 commit 链视为 GC root——`clean_dangling_commits`（`mono_api_service.rs` 中的 TODO 注释态）在实现前必须先满足这一条。
 
 **ADR-TP-15a：逐 commit 的 GPG 签名验证不作为受支持的能力**
 
-- **决策**：monoengine **不承诺**「原始 commit 的 GPG 签名始终可从 ref 上验证」。N > 1 时被推路径的 squash commit 由服务端以自己的 GPG 密钥签名（沿用 MC-09 的 `ServerSigningContext`）；原始逐 commit 签名不再挂在任何 ref 上。N = 1 时客户端签名原样保留，但这是零改写路径的自然结果，**不是一项可被依赖的保证**，部署方不得据此设计签名验证流程。
+- **决策**：mega2 **不承诺**「原始 commit 的 GPG 签名始终可从 ref 上验证」。N > 1 时被推路径的 squash commit 由服务端以自己的 GPG 密钥签名（沿用 MC-09 的 `ServerSigningContext`）；原始逐 commit 签名不再挂在任何 ref 上。N = 1 时客户端签名原样保留，但这是零改写路径的自然结果，**不是一项可被依赖的保证**，部署方不得据此设计签名验证流程。
 - **理由**：签名覆盖 commit 对象全文，合并必然产生新对象，逐 commit 签名在合并语义下不可能保留。与其提供一个「只在 N = 1 时成立」的条件性保证——它会诱导部署方去约束使用方的推送方式，把一个服务端的实现约束转嫁成使用方的操作纪律——不如明确不支持。使用方需要知道的是「这次合并包含了什么」，那由 ADR-TP-15 的完整 message 回答；需要知道「这个 commit 是谁落的」，那由服务端签名回答。
 - **Alternatives considered**：约束使用方只走 N = 1 推送以保住逐 commit 签名（**已否决**——把服务端约束转嫁给使用方，且与 Agent 攒批推送的现实用法冲突）；在 squash commit 中嵌入原始签名块（拒绝——签名与其覆盖的对象不匹配，是伪造可验证性，比不提供更糟）。
-- **影响**：风险与约束的「约束 2」按此改写。签名验证的对象是服务端密钥，验证的语义是「这次落地由该 monoengine 实例执行」，而不是「这些内容由某个作者签署」。
+- **影响**：风险与约束的「约束 2」按此改写。签名验证的对象是服务端密钥，验证的语义是「这次落地由该 mega2 实例执行」，而不是「这些内容由某个作者签署」。
 
 
 
@@ -302,7 +302,7 @@
 - **决策**：沿用 MC-03 对 merge commit 的拒绝。review 形态**保留** `MAX_CL_CHAIN_COMMITS = 250` 常量不动（其唯一含义由 ADR-MC-07 定义——CL 的 `(from_hash → to_hash)` 累积范围上界，GPG checker 只是纵深防御，见 `src/ceres/merge_checker/mod.rs:20-27` 的注释）；trunk 形态引入独立配置 `[monorepo].max_push_commits`，默认 250，**只作用于 trunk 推送路径的 B0 校验**。
 - **理由**：线性链是 trunk-based development 的前提，也使枚举顺序确定（`ordered_commits` 为 tip 在前，枚举时反转为拓扑升序）。trunk 推送不再经过 CL 的逐 commit 验签链路，需要一个独立于 ADR-MC-07 语义的上限；但上限仍然必需，且比原来更吃重——ADR-TP-15 要求 message 完整枚举不截断，**`max_push_commits` 于是直接决定 message 体积上界**，二者是一组联动配置，调整其一必须同时评估另一项。将其做成 trunk-only 是硬约束 8 的要求：让 ADR-MC-07 的 CL 不变量在 review 形态下变成可配置项，是阶段 1–3 禁止的可观察行为变化。
 - **Alternatives considered**：trunk 形态下取消上限（**已否决**——B 段时长失去上界，全局写入闸门的可预测性随之丧失）；为压缩 message 体积而调低上限（**已否决**——message 放大是已接受的代价，见下）；trunk 形态下接受 merge commit（拒绝——枚举顺序不再确定，且与唯一公开分支的产品规则相悖）；直接把 `MAX_CL_CHAIN_COMMITS` 改为可配（**已否决**——见决策段，违反硬约束 8）。
-- **影响**：首次导入大量历史的场景需要显式调高该配置，或分批推送。**兑现「可调高」需要参数化现有校验**——`PushChain::resolve` 与 `validate` 的链长上界现硬编码引用 `MAX_CL_CHAIN_COMMITS`（`push_chain.rs:182-205, 408-447`），trunk 路径必须将其改为入参（review 路径传常量、trunk 路径传配置值），列入阶段 3/4 交付物；未参数化前该配置不得宣称可调。**该配置的取值依据是 B 段时长与推送批量的实际需要，message 体积不参与该决策**——monoengine 面向超大仓库，25 KB 量级的 message 相对其承载的对象规模可以忽略，完整 provenance 的价值高于体积。
+- **影响**：首次导入大量历史的场景需要显式调高该配置，或分批推送。**兑现「可调高」需要参数化现有校验**——`PushChain::resolve` 与 `validate` 的链长上界现硬编码引用 `MAX_CL_CHAIN_COMMITS`（`push_chain.rs:182-205, 408-447`），trunk 路径必须将其改为入参（review 路径传常量、trunk 路径传配置值），列入阶段 3/4 交付物；未参数化前该配置不得宣称可调。**该配置的取值依据是 B 段时长与推送批量的实际需要，message 体积不参与该决策**——mega2 面向超大仓库，25 KB 量级的 message 相对其承载的对象规模可以忽略，完整 provenance 的价值高于体积。
 
 **ADR-TP-18：N > 1 推送后客户端必须重新对齐，服务端负责把这一点说清楚**
 
@@ -1241,7 +1241,7 @@ CREATE INDEX mega_refs_path_pattern
 ```
 Squash 3 commits at /project/foo
 
-This commit was created by monoengine. The push carried 3 commits, which
+This commit was created by mega2. The push carried 3 commits, which
 were squashed into this single commit. The original commits are listed
 below in topological order; their objects remain retrievable from the
 object store via Mono-Squash-Range (omitted for creation pushes without
@@ -1282,7 +1282,7 @@ N = 1 时不存在 squash，各层 roll-up 的 message 一律取客户端 commit
 
 三个要点：
 
-1. **说明段落是必需的，不是装饰**。合并是服务端单方面做出的行为，客户端在推送成功回执之外看不到它。message 的第一段必须用自然语言说清「这是 monoengine 合并的，原始有几个 commit，去哪里找」，使任何一个 `git show` 的读者不必查文档就明白发生了什么。
+1. **说明段落是必需的，不是装饰**。合并是服务端单方面做出的行为，客户端在推送成功回执之外看不到它。message 的第一段必须用自然语言说清「这是 mega2 合并的，原始有几个 commit，去哪里找」，使任何一个 `git show` 的读者不必查文档就明白发生了什么。
 2. **逐条枚举完整，不截断**（ADR-TP-15），且**每次推送只有一份**——落在被推路径的 squash commit 上。每条给出 commit id、author 署名与 author date、subject，足以让读者判断这次推送包含了什么、由谁在什么时候写的。各 commit 的完整 message 正文不复制进来，经 `Mono-Squash-Range` 到对象库取。
 3. **`Mono-Commits` trailer 移除**。正文的完整枚举已经承载了同样的信息，再列一份全 id 只是把 message 体积翻倍。机器可读的锚点由 `Mono-Squash-Range` 与 `Mono-Squash-Count` 承担，权威记录仍是 `push_queue` 行。
 
@@ -1314,7 +1314,7 @@ review 形态保留 `MAX_CL_CHAIN_COMMITS = 250` 常量不动——其唯一含�
 
 由于 3.2 的 message 必须完整枚举、不得截断，**该配置同时是 message 体积的上界**：按每条约 100 字节估算，250 对应约 25 KB。该体积是**每次推送一份**，落在被推路径的 squash commit 上；祖先与后代只带指针，不随已物化层数放大。
 
-**message 放大是已接受的代价，不作为调低上限的理由。** monoengine 面向的就是超大仓库，25 KB 量级的 commit message 相对于其承载的对象规模可以忽略，而完整 provenance 是 ADR-TP-15 与 ADR-TP-15a 共同的落点——签名保真既然已明确不支持，message 就是使用方仅有的知情渠道，不能为体积让步。Git 对 message 长度无实际限制，`git log --oneline` 只取 subject 行，日常浏览不受影响；受影响的只是 `git show` 的输出长度。因此 `max_push_commits` 的取值应当按 B 段时长与推送批量的实际需要来定，message 体积不参与该决策。
+**message 放大是已接受的代价，不作为调低上限的理由。** mega2 面向的就是超大仓库，25 KB 量级的 commit message 相对于其承载的对象规模可以忽略，而完整 provenance 是 ADR-TP-15 与 ADR-TP-15a 共同的落点——签名保真既然已明确不支持，message 就是使用方仅有的知情渠道，不能为体积让步。Git 对 message 长度无实际限制，`git log --oneline` 只取 subject 行，日常浏览不受影响；受影响的只是 `git show` 的输出长度。因此 `max_push_commits` 的取值应当按 B 段时长与推送批量的实际需要来定，message 体积不参与该决策。
 
 > **验收标准**：
 > - ✅ 单 commit 推送：`main@P` 精确等于客户端 commit id，且对象**逐字节**与客户端所推一致（签名字节随之保留，但断言的是字节相等，不是签名可验证性——ADR-TP-15a）；根 roll-up 的 message 与该 commit 逐字相同
@@ -1515,7 +1515,7 @@ storage-only 部署可在 B3 提交后发出一份有界、仅元数据、带 HM
 
 - **约束 2：逐 commit 的 GPG 签名验证不受支持（ADR-TP-15a）**
   - 理由：签名覆盖 commit 对象全文，合并必然产生新对象。提供一个只在 N = 1 时成立的条件性保证，会诱导部署方去约束使用方的推送方式，把服务端的实现约束转嫁成使用方的操作纪律。
-  - 影响：所有合成 commit（祖先 roll-up、后代续接、N > 1 的被推路径 squash）一律由服务端 GPG 密钥签名，验证语义是「这次落地由该 monoengine 实例执行」，而非「这些内容由某个作者签署」。N = 1 时客户端签名原样保留，但**不作为可依赖的保证**，部署方不得据此设计验签流程。使用方对「这次合并包含了什么」的知情权由 ADR-TP-15 的完整 message 承担。
+  - 影响：所有合成 commit（祖先 roll-up、后代续接、N > 1 的被推路径 squash）一律由服务端 GPG 密钥签名，验证语义是「这次落地由该 mega2 实例执行」，而非「这些内容由某个作者签署」。N = 1 时客户端签名原样保留，但**不作为可依赖的保证**，部署方不得据此设计验签流程。使用方对「这次合并包含了什么」的知情权由 ADR-TP-15 的完整 message 承担。
 
 - **约束 3：形态切换不可逆地依赖库状态**
   - 理由：`review` → `trunk` 要求无 open CL；`trunk` → `review` 后既有的 roll-up 历史不会重建为 CL。
@@ -1536,7 +1536,7 @@ storage-only 部署可在 B3 提交后发出一份有界、仅元数据、带 HM
 
 ## 小结
 
-Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写根树，所有落地在 `/` 上完全冲突，因此写入必须序列化——这是数据模型的语义必然。本计划以 `MonoWriteQueue`（顺序）+ 事务级 advisory lock（互斥）+ 根 ref CAS（正确性自检）三层结构收拢全部根树写入者，在其上把后代 ref 从「删除后重新懒生成」改为「续接推进」以保证历史只增不改，把合成 commit 的归属从硬编码改为真实作者加 provenance trailer，最终由 `push_policy = "trunk"` 一个开关开启不接入用户系统、不使用 Change List 的存储形态。该形态面向 Agent 的「每 commit 一推」用法：单 commit 推送时客户端对象原样落地，多 commit 推送时由 monoengine 自动合并为一个 commit，两种路径下每个受影响的层都恰好前进一个 commit，分支模型仍是唯一公开分支 `main` 的 trunk-based development。
+Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写根树，所有落地在 `/` 上完全冲突，因此写入必须序列化——这是数据模型的语义必然。本计划以 `MonoWriteQueue`（顺序）+ 事务级 advisory lock（互斥）+ 根 ref CAS（正确性自检）三层结构收拢全部根树写入者，在其上把后代 ref 从「删除后重新懒生成」改为「续接推进」以保证历史只增不改，把合成 commit 的归属从硬编码改为真实作者加 provenance trailer，最终由 `push_policy = "trunk"` 一个开关开启不接入用户系统、不使用 Change List 的存储形态。该形态面向 Agent 的「每 commit 一推」用法：单 commit 推送时客户端对象原样落地，多 commit 推送时由 mega2 自动合并为一个 commit，两种路径下每个受影响的层都恰好前进一个 commit，分支模型仍是唯一公开分支 `main` 的 trunk-based development。
 
 ## 预期收益
 
@@ -1870,5 +1870,5 @@ Monorepo 的每一次落地（trunk 推送、CL merge、attach）都必须改写
   - **非推送写入者的映射空白**：新增 1.9 节，给出 push / CL merge / ImportRepo attach 三类写入者在 `path`/`old_id`/`new_id`/等待载体/`failure_type`/心跳上的逐项取值，并说明 HTTP 等待的超时响应与 UN-25 freeze 的边界。
   - **阶段 6.4 与阶段 2.7 互斥**：惰性后代推进补入第二个前提——必须先修订 I3，把后代 ref 降级为最终一致的物化视图；未完成该修订前本项不得启动。
   - **UN-16 在 trunk 形态下的含义**：阶段 4 补充说明。UN-16 是一张卡同时覆盖授权快照重建与拒绝删除主干 ref（评审怀疑的编号冲突不成立，代码可证）；但 `cedar.enforcement = off` 时保留它只余两个作用，且**不构成任何授权保护**。
-- **同日修订 2**：**逐 commit GPG 签名验证明确不支持**（新增 ADR-TP-15a），合成 commit 一律由服务端密钥签名；作为交换，**squash commit 的 message 必须完整列出全部被合并 commit，不截断**（ADR-TP-15 重写：移除 K 条封顶与 `Mono-Commits` trailer，新增说明段落与逐条 id/author/date/subject 枚举）。由此带来的 message 放大**记为已接受的代价**——monoengine 面向超大仓库，体积不参与 `max_push_commits` 的取值决策。连带修订：3.2 message 格式、3.3 签名条目、3.4 与 ADR-TP-17 的链长上限语义、约束 2 改写、不变式 I4 改为 provenance 完整、阶段 3 验收标准。
+- **同日修订 2**：**逐 commit GPG 签名验证明确不支持**（新增 ADR-TP-15a），合成 commit 一律由服务端密钥签名；作为交换，**squash commit 的 message 必须完整列出全部被合并 commit，不截断**（ADR-TP-15 重写：移除 K 条封顶与 `Mono-Commits` trailer，新增说明段落与逐条 id/author/date/subject 枚举）。由此带来的 message 放大**记为已接受的代价**——mega2 面向超大仓库，体积不参与 `max_push_commits` 的取值决策。连带修订：3.2 message 格式、3.3 签名条目、3.4 与 ADR-TP-17 的链长上限语义、约束 2 改写、不变式 I4 改为 provenance 完整、阶段 3 验收标准。
 - **涵盖范围**：`src/ceres/pack/monorepo.rs`、`src/ceres/pack/push_chain.rs`、`src/ceres/api_service/mono_api_service.rs`、`src/ceres/api_service/tree_ops.rs`、`src/ceres/protocol/smart.rs`、`src/ceres/code_edit/utils.rs`、`src/jupiter/storage/mono_storage.rs`、`src/jupiter/storage/merge_queue_storage.rs`、`src/jupiter/service/merge_queue_service.rs`、`src/jupiter/service/mono_service.rs`、`src/jupiter/redis/`、`src/config/model.rs`、`src/callisto/sea_orm_active_enums.rs`、`src/server/http_server.rs`、`src/contract/git_protocol/`、`src/ceres/merge_checker/mod.rs`

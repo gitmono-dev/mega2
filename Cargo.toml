@@ -1,12 +1,12 @@
 [package]
-name = "monoengine"
-version = "0.10.38"
+name = "mega2"
+version = "0.10.43"
 edition = "2024"
-# Two [[bin]] targets exist; keep `cargo run -p monoengine` unambiguous.
-default-run = "monoengine"
+# Two [[bin]] targets exist; keep `cargo run -p mega2` unambiguous.
+default-run = "mega2"
 
 [[bin]]
-name = "monoengine"
+name = "mega2"
 path = "src/main.rs"
 
 [[bin]]
@@ -14,7 +14,7 @@ name = "migrate_local_to_s3"
 path = "src/bin/migrate_local_to_s3.rs"
 
 [lib]
-name = "monoengine_core"
+name = "mega2_core"
 path = "src/lib.rs"
 doctest = false
 
@@ -45,6 +45,10 @@ futures = "0.3.34"
 git-internal = "0.9.0"
 # Shared MST/2 wire codec (specs 03/05/06/07); vendored path dep, see
 # Dockerfile additional context for image builds.
+# Local integration branch: keeps the sibling codec so the verified zstd and
+# MTP2 route-walk additions stay available. Upstream main consumes the crate as
+# a git dependency; switching to it requires those codec commits to land in
+# gitmono-dev/mst2-codec first (see mst2-impl/ISSUES.md ISS-10).
 mst2-codec = { path = "../mst2-codec", features = ["zstd"] }
 hex = "0.4.3"
 hmac = "0.13.0"

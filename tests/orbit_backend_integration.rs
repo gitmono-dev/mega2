@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
-use monoengine_core::{
+use mega2_core::{
     orbit::factory::{
         LocalConfig, MegaObjectStorageWrapper, ObjectStorageBackend, ObjectStorageConfig,
         ObjectStorageFactory,

@@ -1,6 +1,6 @@
 # Agent Capture（storage-only 会话捕获）
 
-本文是 monoengine **storage-only** 形态下 `/api/v1/agent-capture` 的配置与配额事实源。产品边界与任务追溯见 [`../plan/plan-20260911.md`](../plan/plan-20260911.md)。
+本文是 mega2 **storage-only** 形态下 `/api/v1/agent-capture` 的配置与配额事实源。产品边界与任务追溯见 [`../plan/plan-20260911.md`](../plan/plan-20260911.md)。
 
 > **挂载门（ADR-AC-03）：** `/api/v1/agent-capture` 仅在 `git.storage_only()`（显式 `git.push_auth`）且 `[agent_capture].enabled=true` 时注册。review 形态或 `enabled=false` 时整面不存在（裸 404）。`enabled=true` 且非 storage-only → 启动拒绝。`enabled=true` 还要求至少一条 `[[agent_capture.ingest_tokens]]`。跟踪样例不得提交可用 ingest token。
 

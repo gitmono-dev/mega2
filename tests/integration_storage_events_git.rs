@@ -1,5 +1,5 @@
 // Process-level WH-03 gates (plan-20260912): the `repo.push` adapter on the
-// real `monoengine` binary.
+// real `mega2` binary.
 //
 // Per the plan's verification boundary, the process target verifies real
 // startup / config / auth / business results only — the positive outbound
@@ -41,8 +41,7 @@ use std::{
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 use tempfile::TempDir;
 
-const DEFAULT_POSTGRES_URL: &str =
-    "postgres://monoengine:monoengine_test_password@127.0.0.1:15432/monoengine";
+const DEFAULT_POSTGRES_URL: &str = "postgres://mega2:mega2_test_password@127.0.0.1:15432/mega2";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:16379";
 const SHUTDOWN_RECEIPT: &str = "storage_events_shutdown_complete";
 const DELIVERY_LOG: &str = "storage_events delivery";
@@ -65,7 +64,7 @@ impl TestDatabase {
         let admin_url = std::env::var("MEGA_DATABASE__DB_URL")
             .unwrap_or_else(|_| DEFAULT_POSTGRES_URL.to_string());
         let db_name = format!(
-            "monoengine_wh03_{}_{}",
+            "mega2_wh03_{}_{}",
             std::process::id(),
             CASE_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -203,7 +202,7 @@ impl ServiceProcess {
             .stderr(Stdio::from(
                 fs::File::create(stderr_path).expect("stderr log"),
             ));
-        let child = command.spawn().expect("spawn monoengine service");
+        let child = command.spawn().expect("spawn mega2 service");
         Self {
             child,
             reaped: false,
@@ -340,6 +339,37 @@ fn emitter_delivery_lines(captured: &str) -> usize {
         .lines()
         .filter(|line| line.contains(DELIVERY_LOG) && line.contains("category="))
         .count()
+}
+
+/// WH-15 AC5: every emitter delivery line carries the deployment's
+/// `installation_id`, and drop lines (message `storage_events dropped`)
+/// never match the delivery filter above. Checked on real process output
+/// because the delivery line is emitted inside a spawned send task.
+fn count_drop_lines(captured: &str) -> usize {
+    captured
+        .lines()
+        .filter(|line| line.contains("storage_events dropped"))
+        .count()
+}
+
+fn assert_emitter_lines_carry_installation_id(captured: &str, installation_id: &str) {
+    let needle = format!("installation_id={installation_id}");
+    for line in captured.lines() {
+        let delivery = line.contains(DELIVERY_LOG) && line.contains("category=");
+        let dropped = line.contains("storage_events dropped");
+        if delivery || dropped {
+            assert!(
+                line.contains(&needle),
+                "emitter line lacks installation id: {line}"
+            );
+        }
+        if dropped {
+            assert!(
+                !line.contains("category="),
+                "drop line must not satisfy the delivery filter: {line}"
+            );
+        }
+    }
 }
 
 /// The seeded HMAC secret and its SecretRef URI must never appear in captured
@@ -632,7 +662,7 @@ fn integration_storage_events_git_trunk_push_events_enabled() {
     // Monorepo directories are created by the parent repo's push: first land
     // `wh03/` content on `/project` (initialized at bootstrap via
     // `monorepo.root_dirs`), then push to the now-existing `/project/wh03`.
-    let project_url = git_cli::monoengine_host_http_url(port, "/project");
+    let project_url = git_cli::mega2_host_http_url(port, "/project");
     git_ok(&case.case_dir, &["clone", &project_url, "seed"]);
     configure_identity(&case.case_dir, "seed");
     let seed = case.case_dir.join("seed");
@@ -656,7 +686,7 @@ fn integration_storage_events_git_trunk_push_events_enabled() {
         ],
     );
 
-    let repo_url = git_cli::monoengine_host_http_url(port, "/project/wh03");
+    let repo_url = git_cli::mega2_host_http_url(port, "/project/wh03");
     git_ok(&case.case_dir, &["clone", &repo_url, "work"]);
     configure_identity(&case.case_dir, "work");
     fs::write(case.case_dir.join("work").join("two.txt"), b"wh03 two\n").expect("write file");
@@ -721,6 +751,22 @@ fn integration_storage_events_git_trunk_push_events_enabled() {
         delivery_lines, 1,
         "exactly one delivery attempt after drain (the filtered seed push emits none):\n{captured}"
     );
+    assert_emitter_lines_carry_installation_id(&captured, "it-wh03-process");
+    // WH-15: the seed push to `/project` is the one event the static filter
+    // rejects (`git_paths = ["/project/wh03"]`), so the process must log
+    // exactly one drop line, and it must be the filter disposition — a real
+    // drop line on real stdout, not a vacuous helper pass.
+    assert_eq!(
+        count_drop_lines(&captured),
+        1,
+        "exactly one filtered seed push expected:\n{captured}"
+    );
+    assert!(
+        captured
+            .lines()
+            .any(|l| l.contains("storage_events dropped") && l.contains("dropped_filter")),
+        "the seed push must be recorded as dropped_filter:\n{captured}"
+    );
     assert_logs_sanitized(&stdout_path, &stderr_path);
 }
 
@@ -778,7 +824,7 @@ fn integration_storage_events_git_review_cl_regression() {
         git_cli::DEFAULT_GIT_AUTH_USER,
         &token,
     );
-    let root_url = git_cli::monoengine_host_http_url(port, "/");
+    let root_url = git_cli::mega2_host_http_url(port, "/");
     git_ok_auth(&case.case_dir, &token, &["clone", &root_url, "seed"]);
     configure_identity_auth(&case.case_dir, &token, "seed");
     let seed = case.case_dir.join("seed");
@@ -887,7 +933,7 @@ git_paths = ["/project"]
 
     // Seed the /project tip with a real token push (lander B0 needs a
     // non-root path tip).
-    let project_url = git_cli::monoengine_host_http_url(port, "/project");
+    let project_url = git_cli::mega2_host_http_url(port, "/project");
     let project_url = format!("{}/", project_url.trim_end_matches('/'));
     git_ok_auth(&case.case_dir, PUSH_TOKEN, &["clone", &project_url, "seed"]);
     configure_identity_auth(&case.case_dir, PUSH_TOKEN, "seed");
@@ -956,6 +1002,13 @@ git_paths = ["/project"]
     assert_eq!(
         delivery_lines, 2,
         "exactly one delivery per committed write (seed push + API write):\n{captured}"
+    );
+    assert_emitter_lines_carry_installation_id(&captured, "it-wh03-api");
+    // Both committed writes match `git_paths = ["/project"]`: no drop line.
+    assert_eq!(
+        count_drop_lines(&captured),
+        0,
+        "no drop expected:\n{captured}"
     );
     assert_logs_sanitized(&stdout_path, &stderr_path);
 }
@@ -1064,7 +1117,7 @@ fn subprocess_log_paths(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
 }
 
 fn isolated_command(base_dir: &Path, cache_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_monoengine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mega2"));
     command
         .env_clear()
         .env("MEGA_BASE_DIR", base_dir)

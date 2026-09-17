@@ -10,14 +10,14 @@
 # - product rules / 产品规则: docs/monorepo.md
 #
 # Opt-in push_auth=none sibling of config-storage-only.toml (plan-20260906 ADR-SO-06).
-# Compose: dual -f with docker-compose-storage-only.auth-none.yml + --force-recreate monoengine.
+# Compose: dual -f with docker-compose-storage-only.auth-none.yml + --force-recreate mega2.
 #
 # Usage / 用法:
-#   monoengine --config config/config-storage-only.none.toml config validate
-#   docker compose -p monoengine-trunk \
+#   mega2 --config config/config-storage-only.none.toml config validate
+#   docker compose -p mega2-trunk \
 #     -f docker-compose-storage-only.yml \
 #     -f docker-compose-storage-only.auth-none.yml \
-#     up -d --wait --force-recreate monoengine
+#     up -d --wait --force-recreate mega2
 #
 # Storage-only checklist (must all hold / 下列必须同时满足,否则 trunk 启动失败):
 #   monorepo.push_policy = "trunk"
@@ -259,13 +259,13 @@ storage_type = "s3compatible"
 # s3compatible 必须填 endpoint_url;真 AWS 留空走默认 endpoint. local/gcs 时整段可删.
 #
 # Lab defaults match docker-compose-storage-only.yml (RustFS access key
-# rustfs / rustfs_secret, bucket monoengine). Host API: 127.0.0.1:29000.
+# rustfs / rustfs_secret, bucket mega2). Host API: 127.0.0.1:29000.
 # Inside compose, MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL=http://rustfs:9000.
 # 实验室默认与 compose 一致;容器内由 compose 把 endpoint 改成 rustfs:9000.
 # Replace keys for any non-lab deployment — do not reuse these in production.
 # 非实验室部署必须替换密钥,勿把下列明文用于生产.
 region = "us-east-1"
-bucket = "monoengine"
+bucket = "mega2"
 access_key_id = "rustfs"
 secret_access_key = "rustfs_secret"
 endpoint_url = "http://127.0.0.1:29000"

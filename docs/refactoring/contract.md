@@ -1,6 +1,6 @@
 # Contract 模块归并实现方案分析
 
-本文档记录 `monoengine` 中 `contract` 模块的定位、当前归并结果、路径迁移边界，以及后续涉及 API 数据契约、Git 协议、Vault 与权限策略代码时应遵守的共同约束。
+本文档记录 `mega2` 中 `contract` 模块的定位、当前归并结果、路径迁移边界，以及后续涉及 API 数据契约、Git 协议、Vault 与权限策略代码时应遵守的共同约束。
 
 > **治理规范**：本文档遵循 **`general.md`** 中定义的统一结构、共同约束和执行标准。
 
@@ -233,7 +233,7 @@
 
 删除的是**特例**而不是这两个名字：把它们写进 ACL 与写任何其他名字效果完全相同（`un04_a_formerly_hardcoded_name_becomes_admin_only_by_being_listed` 钉住这一点）；把某人从 ACL 移除会真正撤权（`un04_dropping_an_admin_from_the_acl_removes_their_privilege`）——正是硬编码规则曾经悄悄破坏的性质。
 
-**与 website `role=admin` 的边界**：两者是**独立系统**。website 的 `role=admin` 只治理产品面（站点管理界面），monoengine 的 admin 只来自上述 ACL；两边都要授予的用户必须**双写**。自动同步未实现（DEP-02 / DEFER-UN-03 已移交），运维双写指引由 UN-06 手册承接。
+**与 website `role=admin` 的边界**：两者是**独立系统**。website 的 `role=admin` 只治理产品面（站点管理界面），mega2 的 admin 只来自上述 ACL；两边都要授予的用户必须**双写**。自动同步未实现（DEP-02 / DEFER-UN-03 已移交），运维双写指引由 UN-06 手册承接。
 
 ## `pushRepo` 策略语义修正（UN-09）
 
@@ -316,7 +316,7 @@
 审计/只读运维命令要能声称「什么都没改」，就不能走生产引导路径。常规 unseal 在读到第一个 secret 之前就会写：mount 表缺失时补写默认 mount、旧格式条目回写、默认 ACL policy 补写、token salt 补写，并启动一个按 200ms tick **撤销过期租约并删除其记录**的线程。绕开 `VaultCore::config()` 不够——这些副作用在 `Core::post_unseal()` 里。
 
 - **入口**：`VaultCore::open_readonly(vault_storage, key_path)`（`src/contract/vault/integration/vault_core.rs`）。它要求一切都已存在：storage 已初始化、key 文件存在且份额足够、`runtime_tokens` 完整。任一不满足都是**报告**而不是修补——补签一个缺失的 runtime token 本身就是「写 policy + 签发 token + 回写 key 文件」，正是本模式要避免的。同理，它不初始化、不回写 key 文件、不撤销 root token。
-- **核心开关（迁移中，2026-08-21）**：该模式原先靠 vendored 库内的 `Core::readonly` 标志实现，vendored 已随 `plan-20260820` VLT-02 删除。crates.io 的 `libvault` 没有、也不打算有这个标志——「这个句柄是只读打开的」是 monoengine 的概念，不是库的。取而代之的形态是集成层的 **shadow-unseal**：自行驱动 barrier 解封与一个只读版 post-unseal，从而根本不去请求 `Core::post_unseal` 无条件执行的那些修补。可行性与公共 API 清单见 `vault.md` 的「VLT-S1」节。三个控制点在新形态下的落点：
+- **核心开关（迁移中，2026-08-21）**：该模式原先靠 vendored 库内的 `Core::readonly` 标志实现，vendored 已随 `plan-20260820` VLT-02 删除。crates.io 的 `libvault` 没有、也不打算有这个标志——「这个句柄是只读打开的」是 mega2 的概念，不是库的。取而代之的形态是集成层的 **shadow-unseal**：自行驱动 barrier 解封与一个只读版 post-unseal，从而根本不去请求 `Core::post_unseal` 无条件执行的那些修补。可行性与公共 API 清单见 `vault.md` 的「VLT-S1」节。三个控制点在新形态下的落点：
   - mount 表：只 `MountTable::load`，不 `load_or_default`；表缺失或存在旧格式条目（需要 `mount_update` 回写）一律 `VaultError::ReadonlyStateIncomplete` **fail-closed**——凭空造出来的 mount 表不是运行中服务器用的那张，据此出报告比拒绝更糟。auth mount 表同理，不走 `AuthModule::load_auth`。
   - 过期租约 worker：只读引导**不运行** `AuthModule::init`，而 `AuthModule::init` 是库内唯一启动该 worker 的地方。租约改为只读扫描：旧格式条目**具名 fail-closed**（与旧格式 mount 表同样处理），因为库的恢复路径遇到旧格式会**转换后写回**，只读下这个写只会被最终保险拦下、调用方拿到的是「写被拒绝」而不是真实状况。
   - 默认 policy 与 token salt：跳过 `PolicyModule::setup_policy()`；salt 在 `TokenStore::new()` **之前**预读，缺失即 fail-closed 而不是让它新签一个（新 salt 会静默改变该 vault 里每个 token 的哈希方式）。

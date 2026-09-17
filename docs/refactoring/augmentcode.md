@@ -1,12 +1,12 @@
-# Augment Code 功能对比与 monoengine 增量计划
+# Augment Code 功能对比与 mega2 增量计划
 
 更新时间：2026-06-21
 
-> **现状注记（2026-08-06，入库时补）：** 本文是 2026-06-21 的功能对比快照，于 2026-08-05 入库；其「monoengine 当前实现地基」一节描述的是当时的仓库状态，早于其后的三轮重构：① chat / Notes 产品面与 `chat-migrate` CLI 已整栈删除（`docs/plan/plan-20260731.md` RM 链，v0.2.0）；② 邮件投递（`[mail]`/SMTP/email outbox/dispatcher）已整体迁出本仓、由 website 承担（同计划 MN 链 + `docs/plan/plan-20260802.md`）；③ 浏览器会话已接入 website Better Auth（AU 链）。文中提及的 chat router、`chat-migrate`、notification email dispatcher、`docs/refactoring/chat.md`（已随 DOC-01 删除）等均为**历史快照**，不代表现行代码；现行事实源见 `docs/refactoring/README.md` 与各专题文档。本文的价值在 Augment 能力对比与增量方向，阅读地基表时请以现行源码为准。
+> **现状注记（2026-08-06，入库时补）：** 本文是 2026-06-21 的功能对比快照，于 2026-08-05 入库；其「mega2 当前实现地基」一节描述的是当时的仓库状态，早于其后的三轮重构：① chat / Notes 产品面与 `chat-migrate` CLI 已整栈删除（`docs/plan/plan-20260731.md` RM 链，v0.2.0）；② 邮件投递（`[mail]`/SMTP/email outbox/dispatcher）已整体迁出本仓、由 website 承担（同计划 MN 链 + `docs/plan/plan-20260802.md`）；③ 浏览器会话已接入 website Better Auth（AU 链）。文中提及的 chat router、`chat-migrate`、notification email dispatcher、`docs/refactoring/chat.md`（已随 DOC-01 删除）等均为**历史快照**，不代表现行代码；现行事实源见 `docs/refactoring/README.md` 与各专题文档。本文的价值在 Augment 能力对比与增量方向，阅读地基表时请以现行源码为准。
 
 本文基于 Augment Code 官网与公开文档的当前功能快照，对比
-monoengine 已有实现和 `docs/refactoring/` 下的计划文档，给出
-monoengine 若要覆盖同类“企业级 AI 软件工程平台”能力需要新增的功能。
+mega2 已有实现和 `docs/refactoring/` 下的计划文档，给出
+mega2 若要覆盖同类“企业级 AI 软件工程平台”能力需要新增的功能。
 
 ## 结论
 
@@ -21,7 +21,7 @@ Agent 平台。其核心产品线可以拆成三层：
 3. **SDLC 自动化应用**：在 PR 作者、Pair Review、Deep Code Review、风险分析、
    测试、工单/告警处理、CI 失败修复、定时报表等场景中复用上述运行时。
 
-monoengine 当前已经有 Git/CL、代码审查评论、reviewer 策略、merge queue、
+mega2 当前已经有 Git/CL、代码审查评论、reviewer 策略、merge queue、
 build trigger、webhook、artifact、notification、chat、Vault/Secret、Cedar policy、
 bot token 等重要地基，但这些能力还停留在“代码托管与协作服务”层面。缺口集中在：
 
@@ -33,7 +33,7 @@ bot token 等重要地基，但这些能力还停留在“代码托管与协作�
 - 现有 webhook/build trigger/notification/chat/artifact/bot/policy 尚未被统一成
   Agent 工作流骨架。
 
-因此，monoengine 的增量方向不应先从“接一个 LLM API”开始，而应先把已有协作、
+因此，mega2 的增量方向不应先从“接一个 LLM API”开始，而应先把已有协作、
 事件、权限、密钥、工件和通知模块收束为 Agent 平台的领域边界，再逐步接入模型
 和远程执行。
 
@@ -46,7 +46,7 @@ Augment 的 Agent 面向端到端软件工程任务：理解代码、制定计�
 Agent Auto 更偏向自主执行，普通 Agent 则会在外部集成或高风险命令前暂停等待
 用户确认。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 需要 `agent_session` 作为用户可见会话，记录 prompt、状态、执行环境、可见性、
   触发来源、关联 CL/issue/build/artifact。
@@ -61,7 +61,7 @@ Augment Cosmos 将 Agent 抽象成可复用的 Expert，并通过事件源触发
 的事件源包括 GitHub、Slack、Linear、PagerDuty、webhook、cron；Expert 可绑定
 Environment、Capability、Trigger、Skill、Visibility、Session 和 Files。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 需要 `agent_experts` 存储可复用专家模板：说明、系统提示词、模型策略、默认工具、
   触发条件、可见性、预算和审计规则。
@@ -78,7 +78,7 @@ Augment Context Engine 向 Agent、CLI、IDE 和第三方 AI 工具提供代码�
 关系理解、提交历史、规范文档、runbook、外部网站和对象存储等上下文，并通过 MCP
 和 SDK 暴露能力。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 需要独立的 `context_engine` 或 `agent_context` 领域，而不是只依赖 Git 文件读取。
 - 需要索引对象覆盖 repo 文件、symbols、提交、CL、code review 评论、issue、
@@ -92,7 +92,7 @@ monoengine 对应缺口：
 Auggie CLI 是面向终端和 CI/CD 的 Agent 入口，可在本地或流水线中分析代码、修改代码、
 执行工具、处理 PR/build 反馈、triage issue/alert，并支持非交互输出模式。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 当前 CLI 仅注册 `service`、`chat-migrate`、`config`，还没有 `agent`、`expert`、
   `context`、`workflow`、`mcp` 等命令。
@@ -106,7 +106,7 @@ Augment 的代码审查能力强调 GitHub PR 原生集成、自动/手动/禁�
 自定义审查指南、MCP 上下文、访问控制和分析面板。它聚焦高信号问题，例如 bug、
 安全、正确性和跨系统影响。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 现有 `code_review` 已有 thread/anchor/position/comment 模型，但还没有 AI reviewer。
 - 需要把 reviewer 策略、Cedar policy、code_review thread 和 Agent Runtime 连接起来：
@@ -122,10 +122,10 @@ Augment 支持 MCP 服务器配置，并将外部系统如 CircleCI、MongoDB、
 流入 Agent 运行。Cosmos 也通过 Slack/GitHub/Jira/CI 等集成把事件和工具能力接入
 工作流。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 需要 MCP client：Agent 运行时可调用外部 MCP tool，并将权限、secret、日志纳入审计。
-- 需要 MCP server：向外部 AI 工具暴露 monoengine 的 repo/CL/issue/build/artifact
+- 需要 MCP server：向外部 AI 工具暴露 mega2 的 repo/CL/issue/build/artifact
   搜索和操作能力。
 - 需要集成注册中心：区分系统集成、组织集成、用户 OAuth、bot/service account。
 - 需要 loop guard：避免机器人评论、workflow_run、webhook 回调反复触发自身。
@@ -135,14 +135,14 @@ monoengine 对应缺口：
 Augment Cosmos 将 secret 注入 Expert VM，支持私有和共享 scope，并会从日志中剥离
 敏感值；Artifact 则作为会话输出，关联 PR、branch、ticket、链接和报告。
 
-monoengine 对应缺口：
+mega2 对应缺口：
 
 - 现有 Vault 可作为 secret 地基，但缺少 Agent 级 secret scope、运行时注入和日志脱敏。
 - 现有 artifact service 可处理对象下载/上传，但没有和 agent_session/run 绑定。
 - 现有 bot token 可作为服务身份地基，但缺少 workflow/service account 的归因模型、
   权限模板和审计视图。
 
-## monoengine 当前实现地基
+## mega2 当前实现地基
 
 以下判断以源码为准；部分 `docs/refactoring/` 文档仍描述早期状态。
 
@@ -220,7 +220,7 @@ monoengine 对应缺口：
 
 ### P1：Tool/Capability Registry
 
-把 monoengine 内部模块包装为 Agent tool，并纳入权限、审计、审批。
+把 mega2 内部模块包装为 Agent tool，并纳入权限、审计、审批。
 
 首批内部工具：
 
@@ -247,7 +247,7 @@ monoengine 对应缺口：
 
 ### P2：Context Engine MVP
 
-先实现对 monoengine 自有对象的上下文索引，再接入外部文档和 MCP。
+先实现对 mega2 自有对象的上下文索引，再接入外部文档和 MCP。
 
 索引对象：
 
@@ -324,7 +324,7 @@ monoengine 对应缺口：
 
 ### P3：MCP Client/Server
 
-新增 MCP 双向能力，使 monoengine 既能调用外部工具，也能被外部 Agent 使用。
+新增 MCP 双向能力，使 mega2 既能调用外部工具，也能被外部 Agent 使用。
 
 MCP client：
 
@@ -336,12 +336,12 @@ MCP server：
 
 - 暴露 repo search、context search、CL/issue/build/artifact 查询。
 - 写操作默认只暴露给已授权 service account。
-- 支持只读模式，便于 Codex、Claude、Gemini 等外部工具接入 monoengine 上下文。
+- 支持只读模式，便于 Codex、Claude、Gemini 等外部工具接入 mega2 上下文。
 
 验收标准：
 
 - Agent 可调用一个外部 MCP 工具，并在 run log 中审计。
-- 外部 MCP client 可查询 monoengine repo/CL/context，但不会越权。
+- 外部 MCP client 可查询 mega2 repo/CL/context，但不会越权。
 
 ### P4：远程沙箱与执行隔离
 
@@ -441,7 +441,7 @@ MCP server：
 完成条件：
 
 - CI 中可运行 `mono agent run --print` 类命令。
-- 外部工具可通过 MCP 查询 monoengine 上下文。
+- 外部工具可通过 MCP 查询 mega2 上下文。
 - 构建失败可触发诊断 Expert 并输出 artifact。
 
 ### 阶段 5：远程执行与企业治理
@@ -469,7 +469,7 @@ MCP server：
 
 ## 最小可交付功能清单
 
-若只做第一版对标 Augment 的 monoengine Agent MVP，建议范围限定为：
+若只做第一版对标 Augment 的 mega2 Agent MVP，建议范围限定为：
 
 1. `agent_session` / `agent_run` / `agent_step` migration 与 storage。
 2. `agent_router`：create/list/get/cancel run。
@@ -481,7 +481,7 @@ MCP server：
 8. `artifact` 集成：保存 review report/test log。
 9. `audit` 集成：记录工具调用、模型版本、触发来源、服务身份。
 
-这组能力完成后，monoengine 才具备从“代码托管协作平台”升级到“Agent 驱动的
+这组能力完成后，mega2 才具备从“代码托管协作平台”升级到“Agent 驱动的
 软件工程平台”的最小闭环。
 
 ## 资料来源

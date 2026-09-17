@@ -1,7 +1,7 @@
 //! Stack-level Better Auth session integration (ITW-03).
 //!
 //! This target talks only to the compose-hosted `website-next` and
-//! `monoengine` services. It is opt-in outside CI: set `WEBSITE_IT=1` after
+//! `mega2` services. It is opt-in outside CI: set `WEBSITE_IT=1` after
 //! starting `--profile app --profile web`. A requested run fails if either
 //! service is unavailable, so a skipped test cannot mask a missing CI gate.
 
@@ -17,7 +17,7 @@ use reqwest::{
 use serde_json::{Value, json};
 
 const WEBSITE_BASE_URL: &str = "http://127.0.0.1:17001";
-const MONOENGINE_BASE_URL: &str = "http://127.0.0.1:19180";
+const MEGA2_BASE_URL: &str = "http://127.0.0.1:19180";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
@@ -92,34 +92,34 @@ fn integration_website_auth_session_matches_get_session_and_rejects_anonymous() 
         .expect("get-session user name")
         .to_owned();
 
-    let monoengine_user = client
-        .get(format!("{MONOENGINE_BASE_URL}/api/v1/user"))
+    let mega2_user = client
+        .get(format!("{MEGA2_BASE_URL}/api/v1/user"))
         .header(COOKIE, &cookie)
         .send()
-        .expect("request monoengine user with website session cookie");
-    assert_success(&monoengine_user, "authenticated monoengine /api/v1/user");
-    let monoengine_user = monoengine_user
+        .expect("request mega2 user with website session cookie");
+    assert_success(&mega2_user, "authenticated mega2 /api/v1/user");
+    let mega2_user = mega2_user
         .json::<Value>()
-        .expect("decode monoengine user response");
-    let login_user = monoengine_user
+        .expect("decode mega2 user response");
+    let login_user = mega2_user
         .get("data")
         .and_then(Value::as_object)
-        .expect("monoengine user response data");
+        .expect("mega2 user response data");
     assert_eq!(
         login_user.get("username").and_then(Value::as_str),
         Some(expected_name.as_str()),
-        "monoengine username must match website get-session user.name"
+        "mega2 username must match website get-session user.name"
     );
     assert_eq!(
         login_user.get("website_user_id").and_then(Value::as_str),
         Some(expected_id.as_str()),
-        "monoengine website_user_id must match website get-session user.id"
+        "mega2 website_user_id must match website get-session user.id"
     );
 
     let anonymous = client
-        .get(format!("{MONOENGINE_BASE_URL}/api/v1/user"))
+        .get(format!("{MEGA2_BASE_URL}/api/v1/user"))
         .send()
-        .expect("request monoengine user without cookie");
+        .expect("request mega2 user without cookie");
     assert_eq!(
         anonymous.status().as_u16(),
         401,
@@ -138,12 +138,12 @@ fn website_it_stack_is_requested_and_available() -> bool {
 
     for (name, address) in [
         ("website-next", "127.0.0.1:17001"),
-        ("monoengine", "127.0.0.1:19180"),
+        ("mega2", "127.0.0.1:19180"),
     ] {
         assert!(
             is_reachable(address),
             "WEBSITE_IT=1 requires {name} at {address}; start with \
-             `docker compose -p monoengine-it -f docker-compose.test.yml \
+             `docker compose -p mega2-it -f docker-compose.test.yml \
              --profile app --profile web up -d --wait`"
         );
     }

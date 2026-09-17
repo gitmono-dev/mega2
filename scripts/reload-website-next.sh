@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Debounced rebuild and restart of website-next in the monoengine-it compose stack.
+# Debounced rebuild and restart of website-next in the mega2-it compose stack.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$REPO_ROOT/docker-compose.test.yml"
-PROJECT="${MONOENGINE_IT_PROJECT:-monoengine-it}"
+PROJECT="${MEGA2_IT_PROJECT:-mega2-it}"
 DEBOUNCE_SEC="${WEBSITE_NEXT_RELOAD_DEBOUNCE_SEC:-3}"
-STATE_DIR="${TMPDIR:-/tmp}/monoengine-reload-website-next"
+STATE_DIR="${TMPDIR:-/tmp}/mega2-reload-website-next"
 REQUEST_FILE="$STATE_DIR/request.ts"
 WORKER_PID_FILE="$STATE_DIR/worker.pid"
 LOG_FILE="$STATE_DIR/build.log"

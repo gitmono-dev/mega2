@@ -23,7 +23,10 @@ use crate::{
     ceres::{
         api_service::{ApiHandler, cache::GitObjectCache, history},
         model::{
-            git::{CreateEntryInfo, CreateEntryResult, EditFilePayload, EditFileResult},
+            git::{
+                CreateEntryInfo, CreateEntryResult, DeleteEntryInfo, DeleteEntryResult,
+                EditFilePayload, EditFileResult, MoveEntryInfo, MoveEntryResult,
+            },
             tag::TagInfo,
         },
         protocol::repo::Repo,
@@ -57,6 +60,31 @@ impl ApiHandler for ImportApiService {
     ) -> Result<CreateEntryResult, GitError> {
         Err(GitError::CustomError(
             "import dir does not support create entry".to_string(),
+        ))
+    }
+
+    /// ImportRepo directories keep Git semantics; the product directory API
+    /// refuses them with a diagnosable 409 (plan-20260917 ADR-LB-06). The
+    /// `[code:409]` prefix is what `From<E> for ApiError` maps to CONFLICT.
+    async fn delete_monorepo_entry(
+        &self,
+        _: DeleteEntryInfo,
+        _: Option<String>,
+    ) -> Result<DeleteEntryResult, GitError> {
+        Err(GitError::CustomError(
+            "[code:409] import dir does not support delete entry".to_string(),
+        ))
+    }
+
+    /// Same refusal for moves whose source lives under an ImportRepo; the
+    /// monorepo handler refuses destinations under one on its own.
+    async fn move_monorepo_entry(
+        &self,
+        _: MoveEntryInfo,
+        _: Option<String>,
+    ) -> Result<MoveEntryResult, GitError> {
+        Err(GitError::CustomError(
+            "[code:409] import dir does not support move entry".to_string(),
         ))
     }
 

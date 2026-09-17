@@ -4,7 +4,7 @@
 base/profile/environment combination before starting a service:
 
 ```bash
-cargo run -p monoengine -- --config config/config.toml config validate
+cargo run -p mega2 -- --config config/config.toml config validate
 ```
 
 Configuration source diagnostics are available with `--show-sources`; use
@@ -30,7 +30,7 @@ Git Object Format is independent of LFS Digest Algorithm
 (`Git=blake3/LFS=sha256` and `Git=sha256/LFS=blake3` are expressible). LFS
 BLAKE3 as a product transfer path is `DEFER-B3-LFS-01`.
 
-Run `monoengine --config <path> service init --yes` to create the initial
+Run `mega2 --config <path> service init --yes` to create the initial
 graph; the command requires an existing config and exits without starting Git
 listeners or normal service runtime dependencies. See
 [`protocol.md`](./protocol.md) and [`plan/plan-20260907.md`](../plan/plan-20260907.md).
@@ -83,7 +83,7 @@ section supplies the website API base URL, accepted session-cookie names, and
 the CORS allow-list. The complete trust boundary is documented in
 [`website-auth.md`](./website-auth.md).
 
-Product-email delivery is delegated to the website. Monoengine configuration
+Product-email delivery is delegated to the website. Mega2 configuration
 contains the website email API base URL and bearer/SecretRef used by the
 notification client; see [`website-mail.md`](./website-mail.md) for the
 request contract and Compose values.
@@ -105,10 +105,10 @@ Worker id is chosen once at startup, in order:
 1. `MEGA_ID_GENERATOR_WORKER_ID` when it parses as an integer in `0..=63`.
    Invalid or out-of-range values log a warning (not the raw value) and fall
    through.
-2. Redis `SET NX PX` on `monoengine:snowflake:worker:<id>` with a 30s TTL.
+2. Redis `SET NX PX` on `mega2:snowflake:worker:<id>` with a 30s TTL.
    The owner refreshes with a compare-and-PEXPIRE token every 15s. Redis
    errors or a full 0..=63 map fall through.
-3. Stable FNV-1a of `POD_UID`, else `HOSTNAME`, else `monoengine-local`,
+3. Stable FNV-1a of `POD_UID`, else `HOSTNAME`, else `mega2-local`,
    reduced into `0..=63`.
 
 ID generation after init does not talk to Redis. Logs include source
@@ -117,7 +117,7 @@ the lease token, Redis URL, or pod secrets.
 
 ## Notification settings
 
-Notification configuration controls monoengine-owned delivery such as in-app,
+Notification configuration controls mega2-owned delivery such as in-app,
 Slack, and webhook notifications. The `email` preference requests delivery
 through the website API; it does not configure a local mail provider. Refer to
 [`notification.md`](./notification.md) for behavior and test boundaries.
@@ -132,8 +132,20 @@ and is never auto-generated. Target HMAC values are `secret_ref` URIs; they
 are not resolved while disabled.
 
 Target `url` values must be HTTPS without userinfo, query, or fragment.
-`connect_timeout_seconds` is 1..=5 and `request_timeout_seconds` is 1..=10
-even when the table is disabled.
+Numeric bounds hold even when the table is disabled: `max_in_flight` is
+1..=64, `connect_timeout_seconds` is 1..=5, `request_timeout_seconds` is
+1..=10, and `shutdown_grace_seconds` is 0..=10 (WH-14; `0` aborts in-flight
+sends at once, and the ceiling is what keeps ADR-WH-03's drain bounded).
+
+Filter entries validate per source dimension. `git_paths`, `lfs_paths` and
+`agent_repo_paths` must be absolute canonical paths; `oci_repositories` must
+be canonical lowercase distribution `remoteName` values, judged by the same
+rule as the inbound `/v2` router (`src/common/oci_name.rs` is the single
+implementation shared by both callers — WH-14). `agent_tenants` is compared
+verbatim against the server-supplied value. A name the router would reject
+can never match an inbound repository, so such a filter entry is a silently
+dead subscription and is rejected rather than accepted. Every list is capped
+at 64 entries of 1..=256 bytes each.
 
 Every target `secret_ref` must use the namespace
 `vault://secret/config/<profile>/storage_events/targets/<id>/hmac#<field>`,
@@ -149,7 +161,7 @@ stays out of error text. Secrets are seeded/rotated by piping the
 way to supply the value), e.g.:
 
 ```bash
-printf '%s' "$STORAGE_EVENTS_HMAC" | monoengine --config config/config.toml \
+printf '%s' "$STORAGE_EVENTS_HMAC" | mega2 --config config/config.toml \
   config secret set storage_events.targets.ops-main.secret_ref \
   --vault-path config/prod/storage_events/targets/ops-main/hmac \
   --field value --value-stdin
@@ -164,19 +176,27 @@ single application emitter owner on `Storage`; on disabled configs nothing
 is resolved and the emitter stays disabled. Each POST resolves DNS once,
 rejects loopback/private/link-local/metadata/mixed results, pins the
 connection to that verified address, and keeps the original hostname for TLS
-SNI. WH-03 installed the first source hook: a real B3 `n>0` push commit emits
-`repo.push`; the remaining source hooks are delivered by later cards
-(WH-04..08).
+SNI. All six source hooks are installed (WH-03..WH-08): `repo.push`,
+`oci.manifest.published`, `lfs.object.uploaded`, `lfs.media.finalized`,
+`agent_capture.events.committed` and `agent_capture.checkpoint.committed`.
+See [`storage-events.md`](storage-events.md) for the per-source commit points
+and the registered coverage gaps.
 
-Target `events` must be unique literals from the six frozen types. Filter
-arrays are 0..=64 items of 1..=256 bytes; Git/LFS/Agent path items must be
-canonical. `agent_tenants` and `agent_repo_paths` are both empty or both
-non-empty. At most 16 targets. See
-[`storage-events.md`](./storage-events.md).
+Target `events` must be unique literals from the six frozen types, at most 16
+targets per table, and `agent_tenants` / `agent_repo_paths` are both empty or
+both non-empty (an empty filter list means that source is not subscribed — it
+is not a wildcard).
+
+Upgrading from a release before the WH-14 gates: `shutdown_grace_seconds`
+above 10 and non-canonical `oci_repositories` entries used to load, and now
+fail `config validate` and service start. Both shipped samples keep
+`[storage_events]` disabled with the targets commented out, so only
+deployments that hand-wrote those values are affected; correct them before
+upgrading.
 
 ## Test configuration
 
 `.env.test.example` documents public test endpoints for PostgreSQL, Redis, and
 RustFS. Its `MAILPIT_*` values are optional website-next SMTP-capture inputs;
-monoengine neither reads them nor sends SMTP. The Compose topology and service
+mega2 neither reads them nor sends SMTP. The Compose topology and service
 profiles are documented in [`test-infra.md`](./test-infra.md).
