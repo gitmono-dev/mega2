@@ -11,7 +11,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::Engine;
 use bytes::Bytes;
@@ -34,11 +34,33 @@ pub fn routers() -> Router<MonoApiServiceState> {
     Router::new()
         .route("/snapshots/capabilities", get(capabilities))
         .route("/snapshots/resolve", post(resolve))
+        .route("/snapshots/leases/{lease_id}/renew", post(lease_renew))
+        .route("/snapshots/leases/{lease_id}", delete(lease_release))
+        .route("/snapshots/{snapshot_id}/descriptor", get(descriptor_get))
         .route("/snapshots/{snapshot_id}/directory", get(directory))
-        .route("/snapshots/{snapshot_id}/blob", get(blob))
+        .route(
+            "/snapshots/{snapshot_id}/blob",
+            get(blob).head(content::blob_head),
+        )
         .route("/snapshots/{snapshot_id}/lookup", post(lookup))
-        .route("/snapshots/{snapshot_id}/metadata/pages", post(metadata_pages))
+        .route(
+            "/snapshots/{snapshot_id}/metadata/pages",
+            post(metadata_pages),
+        )
+        .route("/snapshots/{snapshot_id}/objects", post(content::objects))
+        .route(
+            "/snapshots/{snapshot_id}/chunk-map",
+            get(content::chunk_map),
+        )
+        .route(
+            "/snapshots/{snapshot_id}/chunk-map/pages",
+            get(content::chunk_map_pages),
+        )
+        .route("/snapshots/{snapshot_id}/chunks", post(content::chunks))
 }
+
+#[path = "snapshot_content.rs"]
+mod content;
 
 fn mst2_error_response(err: SnapshotError) -> Response {
     let status =
@@ -83,8 +105,8 @@ async fn capabilities() -> Json<serde_json::Value> {
             "lookup": true,
             "metadata_pages": true,
             "raw_blob": true,
-            "objects": false,
-            "chunk_reads": false,
+            "objects": true,
+            "chunk_reads": true,
             "full_hydration": false,
             "offline_export": false,
             "bindings": false,
@@ -222,18 +244,7 @@ async fn resolve(
     let seq = runtime().publication_sequence(&commit_oid);
 
     let body = json!({
-        "descriptor": {
-            "schema_version": 2,
-            "metadata_codec": 1,
-            "instance_id": built.instance_id,
-            "namespace_view_id": view.view_id,
-            "scope": built.descriptor.scope,
-            "materialization_policy": 1,
-            "fs_semantics": 1,
-            "access_projection": 0,
-            "metadata_root": built.metadata_root,
-            "snapshot_id": built.snapshot_id,
-        },
+        "descriptor": descriptor_json(&built),
         "publication_sequence": seq.to_string(),
         "writer_epoch": "1",
         "lease_id": ctx.lease_id,
@@ -243,6 +254,89 @@ async fn resolve(
         "delivery": "full",
     });
     Ok(Json(body).into_response())
+}
+
+/// Spec 03 §2 descriptor JSON, built from the canonical descriptor bytes.
+fn descriptor_json(
+    built: &crate::ceres::snapshot::descriptor::BuiltDescriptor,
+) -> serde_json::Value {
+    json!({
+        "schema_version": 2,
+        "metadata_codec": 1,
+        "instance_id": built.instance_id,
+        "namespace_view_id": format!("sha256:{}", hex_of(&built.descriptor.namespace_view_id)),
+        "scope": built.descriptor.scope,
+        "materialization_policy": 1,
+        "fs_semantics": 1,
+        "access_projection": 0,
+        "metadata_root": built.metadata_root,
+        "snapshot_id": built.snapshot_id,
+    })
+}
+
+async fn descriptor_get(
+    state: State<MonoApiServiceState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
+    // Reading the descriptor back never touches latest (spec 04 §2).
+    let body = json!({
+        "snapshot_id": snapshot_id,
+        "descriptor": descriptor_json(&ctx.built),
+        "lease_id": ctx.lease_id,
+        "lease_expires_at":
+            crate::ceres::snapshot::runtime::rfc3339(ctx.lease_expires_at_unix),
+    });
+    Ok(Json(body).into_response())
+}
+
+#[derive(Default, Deserialize, Debug)]
+#[serde(default, deny_unknown_fields)]
+struct RenewRequest {
+    lease_seconds: Option<u64>,
+}
+
+async fn lease_renew(
+    state: State<MonoApiServiceState>,
+    AxumPath(lease_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    let req: RenewRequest = if body.is_empty() {
+        RenewRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            mst2_error_response(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                format!("malformed renew body: {e}"),
+            ))
+        })?
+    };
+    let renewed = runtime()
+        .renew_lease(&lease_id, req.lease_seconds.unwrap_or(600))
+        .map_err(mst2_error_response)?;
+    // Renewal never changes the version or authorization (spec 04 §4).
+    let body = json!({
+        "lease_id": renewed.lease_id,
+        "snapshot_id": renewed.snapshot_id,
+        "lease_expires_at":
+            crate::ceres::snapshot::runtime::rfc3339(renewed.expires_at_unix),
+    });
+    Ok(Json(body).into_response())
+}
+
+async fn lease_release(
+    state: State<MonoApiServiceState>,
+    AxumPath(lease_id): AxumPath<String>,
+) -> Result<Response, Response> {
+    ensure_enabled(&state).map_err(mst2_error_response)?;
+    // Idempotent: releasing an unknown/already-released lease still succeeds
+    // (spec 04 §2). This never deletes Git content.
+    let released = runtime().release_lease(&lease_id);
+    Ok(Json(json!({ "lease_id": lease_id, "released": released })).into_response())
 }
 
 #[derive(Deserialize, Debug)]
@@ -749,18 +843,19 @@ async fn metadata_pages(
         let built = build_directory_page(handler.as_ref(), &root_tree, &abs_path)
             .await
             .map_err(mst2_error_response)?;
-        let pages = mst2_codec::metapage::Page::pages_along_route(&built.codec_entries, &item.route)
-            .map_err(|e| match e {
-                // A label the fixed view does not have is proven absence.
-                mst2_codec::CodecError::BadOrdering(m) => SnapshotError::new(
-                    SnapshotErrorCode::PathNotFound,
-                    format!("{}: route does not resolve ({m})", item.directory_path),
-                ),
-                other => SnapshotError::new(
-                    SnapshotErrorCode::Internal,
-                    format!("{}: route walk failed ({other})", item.directory_path),
-                ),
-            })?;
+        let pages =
+            mst2_codec::metapage::Page::pages_along_route(&built.codec_entries, &item.route)
+                .map_err(|e| match e {
+                    // A label the fixed view does not have is proven absence.
+                    mst2_codec::CodecError::BadOrdering(m) => SnapshotError::new(
+                        SnapshotErrorCode::PathNotFound,
+                        format!("{}: route does not resolve ({m})", item.directory_path),
+                    ),
+                    other => SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("{}: route walk failed ({other})", item.directory_path),
+                    ),
+                })?;
         let last = pages
             .last()
             .expect("pages_along_route returns at least the root page");
@@ -770,7 +865,10 @@ async fn metadata_pages(
         {
             return Err(mst2_error_response(SnapshotError::new(
                 SnapshotErrorCode::DigestMismatch,
-                format!("{}: route does not reach expected_digest", item.directory_path),
+                format!(
+                    "{}: route does not reach expected_digest",
+                    item.directory_path
+                ),
             )));
         }
         for page in pages {
@@ -802,14 +900,16 @@ async fn metadata_pages(
         if frame.is_empty() {
             return Ok(());
         }
-        let payload = mst2_codec::treeframe::MetaPayload { pages: std::mem::take(frame) }
-            .encode(STREAM_ID, *sequence)
-            .map_err(|e| {
-                SnapshotError::new(
-                    SnapshotErrorCode::Internal,
-                    format!("META frame encode failed: {e}"),
-                )
-            })?;
+        let payload = mst2_codec::treeframe::MetaPayload {
+            pages: std::mem::take(frame),
+        }
+        .encode(STREAM_ID, *sequence)
+        .map_err(|e| {
+            SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                format!("META frame encode failed: {e}"),
+            )
+        })?;
         out.extend_from_slice(&payload);
         *sequence += 1;
         *raw = 0;

@@ -3,6 +3,11 @@
 //! Slice scope: contexts/leases live in memory and are lost on restart —
 //! clients re-resolve (spec 04 §4 permits this for `latest`). Durable lease
 //! and retention integration arrives with T06 (spec 09/10).
+//!
+//! A context is the pinned descriptor/root data; leases are separate
+//! `lease_id -> snapshot_id` records so several clients (or repeated
+//! resolves) can hold independent retention claims on one fixed view. A
+//! snapshot is servable while at least one of its leases is unexpired.
 
 use std::{
     collections::HashMap,
@@ -31,9 +36,24 @@ pub struct SnapshotContext {
     pub authorization_epoch: u64,
 }
 
+/// Pinned view data shared by every lease on one snapshot.
+#[derive(Debug, Clone)]
+struct ContextData {
+    built: BuiltDescriptor,
+    commit_oid: String,
+    root_tree_oid: String,
+}
+
+#[derive(Debug, Clone)]
+struct LeaseRec {
+    snapshot_id: String,
+    expires_at_unix: u64,
+}
+
 pub struct Mst2Runtime {
     hmac_key: [u8; 32],
-    contexts: Mutex<HashMap<String, SnapshotContext>>,
+    contexts: Mutex<HashMap<String, ContextData>>,
+    leases: Mutex<HashMap<String, LeaseRec>>,
     /// Provisional publication sequence: bumped whenever the served main tip
     /// changes. Replaced by the real publication model (spec 09) in T05.
     tip_state: Mutex<(String, u64)>,
@@ -45,6 +65,7 @@ pub fn runtime() -> &'static Mst2Runtime {
     RUNTIME.get_or_init(|| Mst2Runtime {
         hmac_key: blake3_key(),
         contexts: Mutex::new(HashMap::new()),
+        leases: Mutex::new(HashMap::new()),
         tip_state: Mutex::new((String::new(), 0u64)),
     })
 }
@@ -70,9 +91,9 @@ impl Mst2Runtime {
         st.1
     }
 
-    /// Insert a context and create a lease. The in-memory lease carries no
-    /// GC duties yet (no metadata GC exists in this slice); it only lets the
-    /// client address the snapshot.
+    /// Insert a context and create its first lease. The in-memory lease
+    /// carries no GC duties yet (no metadata GC exists in this slice); it
+    /// only lets the client address and retain the snapshot.
     pub fn insert_context(
         &self,
         built: BuiltDescriptor,
@@ -83,35 +104,113 @@ impl Mst2Runtime {
         let lease_id = Uuid::new_v4().to_string();
         let expires = now_unix() + lease_seconds.clamp(1, 3600);
         let snapshot_id = built.snapshot_id.clone();
-        let ctx = SnapshotContext {
+        self.contexts.lock().unwrap().insert(
+            snapshot_id.clone(),
+            ContextData {
+                built: built.clone(),
+                commit_oid: commit_oid.to_string(),
+                root_tree_oid: root_tree_oid.to_string(),
+            },
+        );
+        self.leases.lock().unwrap().insert(
+            lease_id.clone(),
+            LeaseRec {
+                snapshot_id: snapshot_id.clone(),
+                expires_at_unix: expires,
+            },
+        );
+        SnapshotContext {
             built,
             commit_oid: commit_oid.to_string(),
             root_tree_oid: root_tree_oid.to_string(),
-            lease_id: lease_id.clone(),
+            lease_id,
             lease_expires_at_unix: expires,
             authorization_epoch: 1,
-        };
-        self.contexts
-            .lock()
-            .unwrap()
-            .insert(snapshot_id, ctx.clone());
-        ctx
+        }
     }
 
-    /// Look up a snapshot context by snapshot_id and validate its lease.
+    /// Look up a snapshot context by snapshot_id. It is servable while at
+    /// least one unexpired lease references it; storage failure is never
+    /// reported as absence.
     pub fn context(&self, snapshot_id: &str) -> Result<SnapshotContext, SnapshotError> {
-        let ctx = self.contexts.lock().unwrap().get(snapshot_id).cloned();
-        match ctx {
-            None => Err(SnapshotError::new(
-                SnapshotErrorCode::SnapshotUnknown,
-                "unknown snapshot_id: resolve first; the slice keeps contexts in memory only",
-            )),
-            Some(ctx) if ctx.lease_expires_at_unix < now_unix() => Err(SnapshotError::new(
+        let data = self
+            .contexts
+            .lock()
+            .unwrap()
+            .get(snapshot_id)
+            .cloned()
+            .ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::SnapshotUnknown,
+                    "unknown snapshot_id: resolve first; the slice keeps contexts in memory only",
+                )
+            })?;
+        let (lease_id, expires) = self.active_lease(snapshot_id)?;
+        Ok(SnapshotContext {
+            built: data.built,
+            commit_oid: data.commit_oid,
+            root_tree_oid: data.root_tree_oid,
+            lease_id,
+            lease_expires_at_unix: expires,
+            authorization_epoch: 1,
+        })
+    }
+
+    /// One active (unexpired) lease for `snapshot_id`, pruning expired rows
+    /// as it goes.
+    fn active_lease(&self, snapshot_id: &str) -> Result<(String, u64), SnapshotError> {
+        let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, r| r.expires_at_unix >= now_unix());
+        leases
+            .iter()
+            .find(|(_, r)| r.snapshot_id == snapshot_id)
+            .map(|(id, r)| (id.clone(), r.expires_at_unix))
+            .ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::LeaseExpired,
+                    "no active lease for this snapshot; re-resolve",
+                )
+            })
+    }
+
+    /// Extend the same snapshot's lease. An unknown lease is 404; an expired
+    /// lease cannot be revived — the client must re-resolve (spec 04 §4:
+    /// renewal never changes authorization or version).
+    pub fn renew_lease(
+        &self,
+        lease_id: &str,
+        lease_seconds: u64,
+    ) -> Result<LeaseRenewed, SnapshotError> {
+        let now = now_unix();
+        let mut leases = self.leases.lock().unwrap();
+        let Some(rec) = leases.get_mut(lease_id) else {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LeaseUnknown,
+                "unknown lease_id",
+            ));
+        };
+        if rec.expires_at_unix < now {
+            return Err(SnapshotError::new(
                 SnapshotErrorCode::LeaseExpired,
-                "lease expired; re-resolve the snapshot",
-            )),
-            Some(ctx) => Ok(ctx),
+                "lease expired; re-resolve instead of renewing",
+            ));
         }
+        // Renewal extends from the current deadline (never shortens it).
+        rec.expires_at_unix = rec
+            .expires_at_unix
+            .max(now)
+            .saturating_add(lease_seconds.clamp(1, 3600));
+        Ok(LeaseRenewed {
+            lease_id: lease_id.to_string(),
+            snapshot_id: rec.snapshot_id.clone(),
+            expires_at_unix: rec.expires_at_unix,
+        })
+    }
+
+    /// Idempotent release (spec 04 §2): an unknown lease is already
+    /// released, not an error. Releasing never deletes Git content.
+    pub fn release_lease(&self, lease_id: &str) -> bool {
+        self.leases.lock().unwrap().remove(lease_id).is_some()
     }
 
     /// HMAC over the cursor payload (keyed BLAKE3): cursors are
@@ -121,6 +220,14 @@ impl Mst2Runtime {
         h.update(payload.as_bytes());
         h.finalize().to_hex().to_string()
     }
+}
+
+/// Result of a successful lease renewal.
+#[derive(Debug, Clone)]
+pub struct LeaseRenewed {
+    pub lease_id: String,
+    pub snapshot_id: String,
+    pub expires_at_unix: u64,
 }
 
 pub fn now_unix() -> u64 {

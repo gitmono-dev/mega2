@@ -270,6 +270,9 @@ pub enum WalkOutcome {
     /// File/symlink at this path with raw content and its SHA-256.
     FoundFile {
         fs_kind: FsKind,
+        /// Git object oid, so callers can build range-readable projections
+        /// without re-walking the tree.
+        oid: String,
         raw: Vec<u8>,
         size: u64,
         digest: [u8; 32],
@@ -315,6 +318,7 @@ pub async fn resolve_abs<T: ApiHandler + ?Sized>(
                     let digest: [u8; 32] = h.finalize().into();
                     Ok(WalkOutcome::FoundFile {
                         fs_kind: kind,
+                        oid,
                         size: raw.len() as u64,
                         digest,
                         raw,
@@ -338,7 +342,7 @@ pub async fn resolve_abs<T: ApiHandler + ?Sized>(
 }
 
 /// Raw blob bytes with the `blob <len>\0` git header stripped.
-async fn fetch_raw_blob<T: ApiHandler + ?Sized>(
+pub async fn fetch_raw_blob<T: ApiHandler + ?Sized>(
     handler: &T,
     oid: &str,
 ) -> Result<Vec<u8>, SnapshotError> {
