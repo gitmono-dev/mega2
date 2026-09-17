@@ -241,6 +241,39 @@ rm -f mega2.itbin
 docker compose -p mega2-it -f docker-compose.test.yml --profile app up -d --wait mega2
 ```
 
+### scorpiofs（FUSE 工作区守护进程，profile `scorpio`）
+
+ScorpioFS（sibling 仓 `../scorpiofs`）是把 monorepo 路径挂载为本地文件系统的 FUSE
+守护进程，只读路径经 mega2 的 `/api/v1/tree`、`/api/v1/tree/content-hash`、
+`/api/v1/tree/dir-hash`、`/api/v1/latest-commit`、`/api/v1/file/tree`、
+`/api/v1/file/blob/{oid}` 读树与 blob，Antares CL 层另用 `/api/v1/cl/{link}/files-list`
+（仅 review policy 提供）。本条目把它接入 compose 拓扑做**栈级联调**：与 `git-smoke`
+同型（加入 `networks.default`，直连 compose 常驻 `mega2:8000`），**不**替代任何 cargo
+黑盒门，也不是默认门禁。
+
+| 项 | 值 |
+|---|---|
+| 服务名 | `scorpiofs` |
+| 镜像 | `scorpiofs:local`（`pull_policy: never`；本地源码构建 `build: context: ../scorpiofs`，sibling checkout，同 `../megaui` 惯例）。builder 基底固定 `rust:1.97-slim-bookworm`，runtime `debian:bookworm-slim`（`fuse3` / `libssl3` / `curl`）；无 `latest`。宿主机（Arch 等新 glibc）二进制无法进 bookworm/noble 镜像，不提供 `it-runtime` 式打包 |
+| 固定版本字符串 | 无客户端 pin；镜像内容随 `../scorpiofs` 源码变化，升级为显式 `--build`。smoke 把容器内 `scorpio --version` 写入输出 |
+| 端口 | `127.0.0.1:12725:2725`（高位 + 仅回环）。ScorpioFS HTTP API **无认证**，禁止改为 `0.0.0.0` 或经反向代理公开 |
+| healthcheck | `curl -fsS http://127.0.0.1:2725/health`（`interval 3s` / `retries 40` / `start_period 20s`；`serve` 先挂载 FUSE 工作区再绑定 HTTP，因此 healthy 即代表 FUSE 挂载成功） |
+| 特权 | `devices: /dev/fuse`、`cap_add: [SYS_ADMIN, DAC_READ_SEARCH]`、`security_opt: apparmor:unconfined`。`SYS_ADMIN` 为容器内 FUSE `mount(2)` 所需；`DAC_READ_SEARCH` 供 passthrough 层的 `open_by_handle_at(2)`（联调实测：缺少时每次挂载记 `ERROR open_by_handle_at … Operation not permitted` 并回退 fd-backed inodes，功能仍通但偏离真实代码路径）；无 AppArmor 的宿主上 `apparmor:unconfined` 被忽略，Ubuntu（含 GitHub runner）上必需。rootless Docker 不支持 |
+| 网络 | 默认 `networks.default` → `mega2-test-network`；容器内经服务 DNS 名访问 `http://mega2:8000` |
+| 环境 | `SCORPIO_BASE_URL=http://mega2:8000`、`SCORPIO_LFS_URL=http://mega2:8000/api/v1/lfs`（entrypoint 强制，缺失即启动失败；`lfs_url` 目前只做配置校验）、`SCORPIO_LOG_LEVEL=info`（联调可改 `scorpio=debug`）。其余路径由镜像 ENV 指向 `/var/lib/scorpiofs/*` |
+| 卷 / 工作目录 | named volume `scorpiofs-data` → `/var/lib/scorpiofs`（store、运行态 `config.toml`、Antares upper / cl / state）。FUSE 挂载点 `/var/lib/scorpiofs/mount` 与 `/var/lib/scorpiofs/antares/mnt` 只存在于容器 mount namespace，**不**做 `rshared` 传播到宿主；观察一律用 `docker compose … exec -T scorpiofs` |
+| profiles | `profiles: ["scorpio"]`：**不**参与默认 `up -d --wait`；因 `depends_on: mega2`（profile `app`）必须 `--profile app --profile scorpio` 同启（与 `git-smoke` 同因，避免 `--profile scorpio` 单独激活时依赖未定义） |
+| depends_on | `mega2`（`condition: service_healthy`） |
+| 清理 | `docker compose -p mega2-it -f docker-compose.test.yml --profile scorpio down -v`（`scripts/dev-test.sh down` 已含 `--profile scorpio`）；零残留按 project label 判定 |
+| 运行示例 | `./scripts/dev-test.sh up-scorpio`（= `--profile app --profile scorpio up -d --wait`，首次会构建 `scorpiofs:local`）→ `./scripts/dev-test.sh scorpio-smoke`（= `bash scripts/scorpiofs_smoke.sh`） |
+| smoke | `scripts/scorpiofs_smoke.sh`（宿主 `curl` + `exec -T scorpiofs`；不用 libra）：`GET /health`；dicfuse 只读根含初始化树的 `project` / `third-party`，且 `project/.gitkeep` 内容为 `Placeholder file for /project directory`（见 `docs/manual/monorepo-init.md`）；`POST /api/fs/mount {"path":"project"}` → `GET /api/fs/mpoint` → `POST /api/fs/unmount`；`POST /antares/mounts` → `GET /antares/mounts/{id}/ready` → `exec ls` 挂载目录 → `DELETE /antares/mounts/{id}`。`127.0.0.1:12725` 未监听且未设 `SCORPIOFS_IT=1` 时输出 `SKIP` 并以 0 退出 |
+| CI 入口 | 暂无（本地联调）。接入 CI 时须 checkout sibling `../scorpiofs`，`--profile app --profile scorpio up -d --wait` 后运行 smoke，并在 `if: always()` 下带 `--profile scorpio` `down -v`；runner 须提供 `/dev/fuse` |
+| secret | 无。ScorpioFS API 无认证、仅回环；不向其注入 mega2 token |
+| 目标 OS / 降级 | Linux（rootful Docker）已验收；macOS Docker Desktop 的 VM 内核带 fuse，`--device /dev/fuse` 理论可用但**未验收**。smoke 在服务未启动时 SKIP，不构成默认门禁 |
+
+对照锚点：`docker-compose.test.yml` 的 `scorpiofs` 服务块与 `scorpiofs-data` 卷；
+运行流程见 `docs/development.md`「ScorpioFS 联调」。
+
 ### website-next + website-db-init + megaui-collab（Better Auth IT，profile `web`）
 
 | 项 | 值 |
