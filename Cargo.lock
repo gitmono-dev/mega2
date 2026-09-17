@@ -4366,10 +4366,12 @@ dependencies = [
 
 [[package]]
 name = "mst2-codec"
-version = "0.1.0"
-source = "git+https://github.com/gitmono-dev/mst2-codec#dafb2ee7c493c0d9091b9e7224acd3cddf7d8045"
+version = "0.2.0"
+source = "git+https://github.com/gitmono-dev/mst2-codec?tag=v0.2.0#9f05e3f19195e0fb67568ca566827257634759c3"
 dependencies = [
  "sha2 0.10.9",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
