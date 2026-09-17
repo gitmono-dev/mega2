@@ -144,7 +144,7 @@ docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke
   git-smoke bash /repo/scripts/api_write_smoke_storage_only.sh
 ```
 
-稳定 case：`API create-entry then git clone sees file`、`API edit/save then git pull sees update`、`API write rejects unauthenticated`；plan-20260917 LB-05 追加 `delete-entry-git-visible`、`move-entry-git-visible`、`tags-list-create-delete`、`delete-entry-unauth-401`（目录变更后 `git clone` / `git pull` 工作树与 `GET /tree` 一致；tag 用 token create / delete、匿名 list / get）。单 case 用 `MEGA2_SMOKE_CASE=<精确名>`（未匹配退出 2），`-h` 列出全部 case 名。summary 须 `0 failed`。可被 plan-20260906 吸收为附加 case（见 `docs/refactoring/test-infra.md`）。矩阵行见 [`refactoring/integration.md`](./refactoring/integration.md) 的 `integration_api_write_trunk`。
+稳定 case：`API create-entry then git clone sees file`、`API edit/save then git pull sees update`、`API write rejects unauthenticated`；plan-20260917 LB-05 追加 `delete-entry-git-visible`、`move-entry-git-visible`、`tags-list-create-delete`、`delete-entry-unauth-401`（目录变更后 `git clone` / `git pull` 工作树与 `GET /tree` 一致；tag 用 token create / delete、匿名 list / get）。单 case 用 `MEGA2_SMOKE_CASE=<精确名>`（未匹配退出 2），`-h` 列出全部 case 名。summary 须 `0 failed`——全量运行请在干净栈上（`down -v` 重建 + `service init --yes`）执行，或用 `MEGA2_SMOKE_CASE` 只选所需 case：AW-04 的 `API create-entry then git clone sees file` 用固定文件名，在同一栈上第二次全量运行会撞重名 500 而 `failed=1`（LB-05 的四个 case 用每次运行唯一的名字）。可被 plan-20260906 吸收为附加 case（见 `docs/refactoring/test-infra.md`）。矩阵行见 [`refactoring/integration.md`](./refactoring/integration.md) 的 `integration_api_write_trunk`。
 
 ```bash
 docker compose -p mega2-trunk -f docker-compose-storage-only.yml --profile smoke \
