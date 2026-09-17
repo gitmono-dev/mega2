@@ -2785,6 +2785,7 @@ impl MonoApiService {
             object_id,
             object_type: "commit".to_string(),
             tag_name: name,
+            path: "/".to_string(),
             tagger: tagger_info,
             message: message.unwrap_or_default(),
             pack_id: String::new(),

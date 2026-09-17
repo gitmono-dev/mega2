@@ -231,6 +231,7 @@ impl IntoMegaModel for Tag {
             object_id: self.object_hash.to_string(),
             object_type: self.object_type.to_string(),
             tag_name: self.tag_name,
+            path: "/".to_string(),
             tagger: String::from_utf8_lossy(&self.tagger.to_data().unwrap()).to_string(),
             message: self.message,
             pack_id: meta.pack_id.unwrap_or_default(),

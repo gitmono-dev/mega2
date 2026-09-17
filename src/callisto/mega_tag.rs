@@ -15,6 +15,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub tag_name: String,
     #[sea_orm(column_type = "Text")]
+    pub path: String,
+    #[sea_orm(column_type = "Text")]
     pub tagger: String,
     #[sea_orm(column_type = "Text")]
     pub message: String,
