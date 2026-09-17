@@ -195,8 +195,10 @@ dockerd 与宿主共享 mount namespace；macOS Docker Desktop 的传播止于 V
 （`project`、`third-party`）且 `project/.gitkeep` 为占位内容；`host-mount`：宿主
 `<workdir>/mount` 是 `fuse` 挂载并以当前 UID 可读；旧版
 `POST /api/fs/mount` → `GET /api/fs/mpoint` → `POST /api/fs/unmount`；Antares
-`POST /antares/mounts` → `/ready` → 容器内与宿主都列出挂载目录 → `DELETE`。服务未启动时输出
-`SKIP`（设 `SCORPIOFS_IT=1` 改为失败），单跑一例用 `MEGA2_SMOKE_CASE=<name>`。
+`POST /antares/mounts` → `/ready` → 容器内与宿主都列出挂载目录 → `DELETE` → 挂载点目录在
+容器内与宿主都已回收（需要含 `remove_mount_dirs` 修复的 ScorpioFS 镜像，`up-scorpio --build`
+重建）。服务未启动时输出 `SKIP`（设 `SCORPIOFS_IT=1` 改为失败），单跑一例用
+`MEGA2_SMOKE_CASE=<name>`。
 
 联调要点：
 

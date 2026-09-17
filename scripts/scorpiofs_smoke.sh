@@ -320,6 +320,21 @@ case_antares_mount() {
     echo "expected state=Unmounted from DELETE /antares/mounts/${mount_id}" >&2
     return 1
   fi
+
+  # A successful DELETE reclaims the per-mount directories; the mountpoint must
+  # not linger in the Antares mount root (it would be a root-owned leftover on
+  # the host-visible bind mount).
+  if compose_exec test -e "$mountpoint"; then
+    echo "mountpoint ${mountpoint} still exists in the container after DELETE" >&2
+    return 1
+  fi
+  if host_mount_checks_available; then
+    local host_mp="${HOST_WORKDIR}/antares/${mountpoint#"${ANTARES_MNT_ROOT}"/}"
+    if [[ -e "$host_mp" ]]; then
+      echo "mountpoint ${host_mp} still exists on the host after DELETE" >&2
+      return 1
+    fi
+  fi
 }
 
 run_case health case_health
