@@ -6,6 +6,7 @@
 pub mod chunks;
 pub mod descriptor;
 pub mod error;
+pub mod frame_stream;
 pub mod pages;
 pub mod resolver;
 pub mod runtime;

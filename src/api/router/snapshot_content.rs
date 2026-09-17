@@ -153,6 +153,8 @@ pub(super) async fn blob_head(
 #[serde(deny_unknown_fields)]
 struct ObjectsRequest {
     items: Vec<ObjectItem>,
+    #[serde(default)]
+    encoding: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -187,6 +189,13 @@ pub(super) async fn objects(
             "items must hold 1..128 entries",
         )));
     }
+    let encoding = req
+        .encoding
+        .as_deref()
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .transpose()
+        .map_err(mst2_error_response)?
+        .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
 
     // Verify every member at its fixed path before any 200 is produced.
     let handler = state
@@ -234,10 +243,10 @@ pub(super) async fn objects(
     }
 
     // Stream OBJECT frames (table + data ≤1 MiB, ≤128 objects per frame),
-    // then exactly one END.
-    const STREAM_ID: u32 = 1;
+    // then exactly one END. Encoding is negotiated per request.
+    use crate::ceres::snapshot::frame_stream::FrameStream;
+    let mut stream = FrameStream::new(1, encoding);
     let mut out: Vec<u8> = Vec::new();
-    let mut sequence = 0u64;
     let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut frame_raw = 0usize;
     for (cid, data) in unique {
@@ -246,33 +255,26 @@ pub(super) async fn objects(
             && (frame.len() >= OBJECT_MAX_ITEMS
                 || next_payload > mst2_codec::treeframe::OBJECT_MAX_RAW)
         {
-            let payload = mst2_codec::treeframe::ObjectPayload {
-                objects: std::mem::take(&mut frame),
-            }
-            .encode(STREAM_ID, sequence)
-            .map_err(|e| mst2_error_response(internal(format!("OBJECT frame: {e}"))))?;
-            out.extend_from_slice(&payload);
-            sequence += 1;
+            let bytes = stream
+                .object(std::mem::take(&mut frame))
+                .map_err(mst2_error_response)?;
+            out.extend_from_slice(&bytes);
             frame_raw = 0;
         }
         frame_raw += data.len();
         frame.push((cid, data));
     }
     if !frame.is_empty() {
-        let payload = mst2_codec::treeframe::ObjectPayload { objects: frame }
-            .encode(STREAM_ID, sequence)
-            .map_err(|e| mst2_error_response(internal(format!("OBJECT frame: {e}"))))?;
-        out.extend_from_slice(&payload);
-        sequence += 1;
+        let bytes = stream.object(frame).map_err(mst2_error_response)?;
+        out.extend_from_slice(&bytes);
     }
 
-    let end = mst2_codec::treeframe::EndPayload {
-        request_item_count: req.items.len() as u32,
-        unique_unit_count: seen.len() as u32,
+    let end = stream.end(
+        req.items.len() as u32,
+        seen.len() as u32,
         logical_bytes,
-        request_body_sha256: sha256_of(&body),
-    }
-    .encode(STREAM_ID, sequence);
+        sha256_of(&body),
+    );
     out.extend_from_slice(&end);
 
     axum::response::Response::builder()
@@ -430,6 +432,8 @@ pub(super) async fn chunk_map_pages(
 #[serde(deny_unknown_fields)]
 struct ChunksRequest {
     items: Vec<ChunkItem>,
+    #[serde(default)]
+    encoding: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -470,6 +474,13 @@ pub(super) async fn chunks(
             "items must hold 1..128 entries",
         )));
     }
+    let encoding = req
+        .encoding
+        .as_deref()
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .transpose()
+        .map_err(mst2_error_response)?
+        .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
 
     // Verify every member first; the 200 stream starts only after all paths,
     // bindings, indices and batch caps check out (spec 04 §9).
@@ -539,31 +550,31 @@ pub(super) async fn chunks(
         });
     }
 
-    const STREAM_ID: u32 = 1;
+    use crate::ceres::snapshot::frame_stream::FrameStream;
+    let mut stream = FrameStream::new(1, encoding);
     let mut out: Vec<u8> = Vec::new();
-    for (sequence, p) in planned.iter().enumerate() {
+    for p in planned.iter() {
         // Re-verified slice (digest + length) from the staged projection.
         let bytes = p
             .projection
             .chunk_bytes(p.index)
             .map_err(mst2_error_response)?;
-        let frame = mst2_codec::treeframe::ChunkPayload {
-            map_id: p.projection.map_id,
-            file_content_id: p.projection.map.file_content_id,
-            chunk_index: p.index,
-            chunk_bytes: bytes.to_vec(),
-        }
-        .encode(STREAM_ID, sequence as u64)
-        .map_err(|e| mst2_error_response(internal(format!("CHUNK frame: {e}"))))?;
+        let frame = stream
+            .chunk(
+                p.projection.map_id,
+                p.projection.map.file_content_id,
+                p.index,
+                bytes.to_vec(),
+            )
+            .map_err(mst2_error_response)?;
         out.extend_from_slice(&frame);
     }
-    let end = mst2_codec::treeframe::EndPayload {
-        request_item_count: req.items.len() as u32,
-        unique_unit_count: planned.len() as u32,
+    let end = stream.end(
+        req.items.len() as u32,
+        planned.len() as u32,
         logical_bytes,
-        request_body_sha256: sha256_of(&body),
-    }
-    .encode(STREAM_ID, planned.len() as u64);
+        sha256_of(&body),
+    );
     out.extend_from_slice(&end);
 
     axum::response::Response::builder()

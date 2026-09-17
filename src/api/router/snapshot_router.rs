@@ -97,7 +97,7 @@ async fn capabilities() -> Json<serde_json::Value> {
     Json(json!({
         "protocol_versions": [2],
         "metadata_codecs": [1],
-        "frame_encodings": ["identity"],
+        "frame_encodings": ["identity", "zstd"],
         "features": {
             "resolve": true,
             "directory": true,
@@ -776,6 +776,8 @@ async fn lookup(
 #[serde(deny_unknown_fields)]
 struct MetadataPagesRequest {
     items: Vec<MetadataPageItem>,
+    #[serde(default)]
+    encoding: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -883,35 +885,28 @@ async fn metadata_pages(
 
     // Frames hold at most 64 pages and at most 1 MiB of raw payload (spec 06),
     // so a wide route set becomes several META frames rather than one
-    // oversized one. stream_id must be non-zero within a response.
-    const STREAM_ID: u32 = 1;
+    // oversized one. Encoding (identity/zstd) is negotiated per request.
+    let encoding = req
+        .encoding
+        .as_deref()
+        .map(crate::ceres::snapshot::frame_stream::Encoding::parse)
+        .transpose()
+        .map_err(mst2_error_response)?
+        .unwrap_or(crate::ceres::snapshot::frame_stream::Encoding::Identity);
+    use crate::ceres::snapshot::frame_stream::FrameStream;
+    let mut stream = FrameStream::new(1, encoding);
     let mut out: Vec<u8> = Vec::new();
-    let mut sequence: u64 = 0;
     let mut frame: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut frame_raw: usize = 0;
-    // Emitting a frame is fallible (codec limits). The closure returns the
-    // small domain error and callers map it, rather than carrying a whole
-    // `Response` around as an error value.
-    let flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
-                 raw: &mut usize,
-                 out: &mut Vec<u8>,
-                 sequence: &mut u64|
+    let mut flush = |frame: &mut Vec<([u8; 32], Vec<u8>)>,
+                     raw: &mut usize,
+                     out: &mut Vec<u8>|
      -> Result<(), SnapshotError> {
         if frame.is_empty() {
             return Ok(());
         }
-        let payload = mst2_codec::treeframe::MetaPayload {
-            pages: std::mem::take(frame),
-        }
-        .encode(STREAM_ID, *sequence)
-        .map_err(|e| {
-            SnapshotError::new(
-                SnapshotErrorCode::Internal,
-                format!("META frame encode failed: {e}"),
-            )
-        })?;
-        out.extend_from_slice(&payload);
-        *sequence += 1;
+        let bytes = stream.meta(std::mem::take(frame))?;
+        out.extend_from_slice(&bytes);
         *raw = 0;
         Ok(())
     };
@@ -921,24 +916,22 @@ async fn metadata_pages(
             && (frame.len() >= mst2_codec::treeframe::META_MAX_PAGES
                 || frame_raw + 36 + page.len() > mst2_codec::treeframe::META_MAX_RAW)
         {
-            flush(&mut frame, &mut frame_raw, &mut out, &mut sequence)
-                .map_err(mst2_error_response)?;
+            flush(&mut frame, &mut frame_raw, &mut out).map_err(mst2_error_response)?;
         }
         frame_raw += 36 + page.len();
         frame.push((id, page));
     }
-    flush(&mut frame, &mut frame_raw, &mut out, &mut sequence).map_err(mst2_error_response)?;
+    flush(&mut frame, &mut frame_raw, &mut out).map_err(mst2_error_response)?;
 
     let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut hasher, &body);
     let request_body_sha256: [u8; 32] = sha2::Digest::finalize(hasher).into();
-    let end = mst2_codec::treeframe::EndPayload {
-        request_item_count: req.items.len() as u32,
-        unique_unit_count: u32::try_from(seen.len()).unwrap_or(u32::MAX),
+    let end = stream.end(
+        req.items.len() as u32,
+        u32::try_from(seen.len()).unwrap_or(u32::MAX),
         logical_bytes,
         request_body_sha256,
-    }
-    .encode(STREAM_ID, sequence);
+    );
     out.extend_from_slice(&end);
 
     Response::builder()

@@ -45,7 +45,7 @@ futures = "0.3.34"
 git-internal = "0.9.0"
 # Shared MST/2 wire codec (specs 03/05/06/07); vendored path dep, see
 # Dockerfile additional context for image builds.
-mst2-codec = { path = "../mst2-codec" }
+mst2-codec = { path = "../mst2-codec", features = ["zstd"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
