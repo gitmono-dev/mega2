@@ -16,6 +16,9 @@ pub enum SnapshotErrorCode {
     UnsupportedEntry,
     LeaseUnknown,
     LeaseExpired,
+    /// Publication (T05): expected-old CAS, read-set predicate or writer
+    /// epoch no longer holds; the writer must refetch and retry.
+    Conflict,
     CursorInvalid,
     CursorStale,
     ProofBudgetExceeded,
@@ -38,6 +41,7 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::UnsupportedEntry => "UNSUPPORTED_ENTRY",
             SnapshotErrorCode::LeaseUnknown => "LEASE_UNKNOWN",
             SnapshotErrorCode::LeaseExpired => "LEASE_EXPIRED",
+            SnapshotErrorCode::Conflict => "CONFLICT",
             SnapshotErrorCode::CursorInvalid => "CURSOR_INVALID",
             SnapshotErrorCode::CursorStale => "CURSOR_STALE",
             SnapshotErrorCode::ProofBudgetExceeded => "PROOF_BUDGET_EXCEEDED",
@@ -64,6 +68,7 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::NotDirectory => 409,
             SnapshotErrorCode::UnsupportedEntry => 422,
             SnapshotErrorCode::LeaseExpired => 410,
+            SnapshotErrorCode::Conflict => 409,
             SnapshotErrorCode::ProofBudgetExceeded => 413,
             SnapshotErrorCode::DigestMismatch => 409,
             SnapshotErrorCode::RangeNotSupported => 400,
