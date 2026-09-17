@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Trunk / storage-only product API write → Git visibility black-box (plan-20260904 AW-04).
+# plan-20260917 LB-05 adds the directory-change (delete-entry / move-entry) and monorepo
+# tag cases (curl against the product API, git clone/pull for visibility).
 # Clients: curl + git only. Do NOT use libra as a protocol/API test client.
 # Inheritable into compose git-smoke; plan-20260906 may absorb cases later (DEP-AW-OUT-01).
 set -euo pipefail
@@ -19,6 +21,15 @@ Optional:
   MEGA2_SMOKE_CASE         Exact case name; unmatched → exit 2
   MEGA2_GIT_SMOKE_WORKDIR Existing directory for temporary clones
   MEGA2_GIT_SMOKE_KEEP_WORKDIR  Set to 1 to keep temporary clones
+
+Registered cases (exact names for MEGA2_SMOKE_CASE):
+  API create-entry then git clone sees file      (plan-20260904 AW-04)
+  API edit/save then git pull sees update        (plan-20260904 AW-04)
+  API write rejects unauthenticated              (plan-20260904 AW-04)
+  delete-entry-git-visible                       (plan-20260917 LB-05)
+  move-entry-git-visible                         (plan-20260917 LB-05)
+  tags-list-create-delete                        (plan-20260917 LB-05)
+  delete-entry-unauth-401                        (plan-20260917 LB-05)
 
 Compose example (after mega2-trunk up + service init):
   TOKEN='mega2-storage-only-local-dev-token-0001'
@@ -294,9 +305,270 @@ case_api_write_rejects_unauthenticated() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# plan-20260917 LB-05: directory-change and tag cases.
+# ---------------------------------------------------------------------------
+
+# Product API call helper: METHOD route [json] [noauth]. Sets API_CODE (HTTP
+# status) and API_BODY (response body) — globals on purpose: a `$(...)` capture
+# would run the helper in a subshell and lose the body. For product API calls the
+# token travels only in the Authorization header; the Git transport keeps using the
+# credentialed URL from project_http_url (as the AW-04 cases do). The script never
+# prints the token.
+API_CODE=""
+API_BODY=""
+api_call() {
+  local method="$1" route="$2" json="${3:-}" auth="${4:-auth}" resp code
+  local -a args=(-sS -o "" -w '%{http_code}' -X "$method" "${MEGA2_API_BASE%/}/api/v1/${route}")
+  resp="$(mktemp)"
+  args[2]="$resp"
+  if [[ "$auth" != "noauth" ]]; then
+    args+=(-H "$(api_auth_header)")
+  fi
+  if [[ -n "$json" ]]; then
+    args+=(-H 'Content-Type: application/json' -d "$json")
+  fi
+  set +e
+  code="$(curl "${args[@]}")"
+  set -e
+  API_BODY="$(cat "$resp")"
+  rm -f "$resp"
+  API_CODE="$code"
+}
+
+# body_matches <ERE>: bash regex over API_BODY (no pipe, so no SIGPIPE under
+# pipefail on large bodies).
+body_matches() {
+  [[ "$API_BODY" =~ $1 ]]
+}
+
+body_req_result_true() {
+  body_matches '"req_result"[[:space:]]*:[[:space:]]*true'
+}
+
+body_has_cl_link() {
+  body_matches '"cl_link"[[:space:]]*:[[:space:]]*"[^"]+"'
+}
+
+body_names_entry() {
+  body_matches "\"name\"[[:space:]]*:[[:space:]]*\"${1}\""
+}
+
+# tree_lists <path> <name>: 0 = listed, 1 = not listed, 2 = GET /tree failed.
+tree_lists() {
+  local code
+  api_call GET "tree?path=${1}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "GET /tree?path=${1} HTTP $code body=$API_BODY" >&2
+    return 2
+  fi
+  if body_names_entry "$2"; then
+    return 0
+  fi
+  return 1
+}
+
+# expect_listed / expect_not_listed <path> <name> <when>: keep the rc=2 (GET
+# failed) outcome distinct from a genuine listed / not-listed result.
+expect_listed() {
+  local rc
+  set +e
+  tree_lists "$1" "$2"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    1) echo "FAIL: GET /tree does not list $2 $3" >&2; return 1 ;;
+    *) echo "FAIL: GET /tree failed $3" >&2; return 1 ;;
+  esac
+}
+
+expect_not_listed() {
+  local rc
+  set +e
+  tree_lists "$1" "$2"
+  rc=$?
+  set -e
+  case "$rc" in
+    1) return 0 ;;
+    0) echo "FAIL: GET /tree still lists $2 $3" >&2; return 1 ;;
+    *) echo "FAIL: GET /tree failed $3" >&2; return 1 ;;
+  esac
+}
+
+# Names are unique per run: PID alone can repeat after a container restart.
+LB05_RUN_ID="$$-$(date +%s)"
+
+# Create a directory under /project with one file inside, through create-entry.
+create_dir_with_file() {
+  local dir="$1" code
+  api_call POST create-entry "{\"is_directory\":true,\"name\":\"${dir}\",\"path\":\"${PROJECT_PATH}\",\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: create-entry directory ${dir} HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST create-entry "{\"is_directory\":false,\"name\":\"inner.txt\",\"path\":\"${PROJECT_PATH}/${dir}\",\"content\":\"lb05 ${dir}\\n\",\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: create-entry file in ${dir} HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+}
+
+fresh_project_clone() {
+  local dest="$1"
+  rm -rf "$dest"
+  GIT_LFS_SKIP_SMUDGE=1 git_case clone "$(project_http_url)" "$dest" >/dev/null
+}
+
+case_delete_entry_git_visible() {
+  require_api_base || return 1
+  require_http_url || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local dir="lb05-del-${LB05_RUN_ID}" dest code
+  create_dir_with_file "$dir" || return 1
+  dest="$ROOT_DIR/lb05-delete-clone"
+  fresh_project_clone "$dest" || return 1
+  if [[ ! -f "$dest/$dir/inner.txt" ]]; then
+    echo "FAIL: git clone before delete-entry lacks $dir/inner.txt" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$dir" "before delete-entry" || return 1
+  api_call POST delete-entry "{\"path\":\"${PROJECT_PATH}\",\"name\":\"${dir}\",\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: delete-entry HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  if body_has_cl_link; then
+    echo "FAIL: trunk delete-entry must not return a CL link: $API_BODY" >&2
+    return 1
+  fi
+  git_case -C "$dest" pull --ff-only origin main >/dev/null || return 1
+  if [[ -e "$dest/$dir" ]]; then
+    echo "FAIL: after git pull the deleted directory $dir is still in the work tree" >&2
+    return 1
+  fi
+  expect_not_listed "$PROJECT_PATH" "$dir" "after delete-entry" || return 1
+}
+
+case_move_entry_git_visible() {
+  require_api_base || return 1
+  require_http_url || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local src="lb05-mv-src-${LB05_RUN_ID}" dst="lb05-mv-dst-${LB05_RUN_ID}" dest code
+  create_dir_with_file "$src" || return 1
+  dest="$ROOT_DIR/lb05-move-clone"
+  fresh_project_clone "$dest" || return 1
+  if [[ ! -f "$dest/$src/inner.txt" ]]; then
+    echo "FAIL: git clone before move-entry lacks $src/inner.txt" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$src" "before move-entry" || return 1
+  api_call POST move-entry "{\"from_path\":\"${PROJECT_PATH}\",\"from_name\":\"${src}\",\"to_path\":\"${PROJECT_PATH}\",\"to_name\":\"${dst}\",\"skip_build\":true}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: move-entry HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  if ! body_matches "\"to_path\"[[:space:]]*:[[:space:]]*\"${PROJECT_PATH}/${dst}\""; then
+    echo "FAIL: move-entry receipt to_path mismatch: $API_BODY" >&2
+    return 1
+  fi
+  if body_has_cl_link; then
+    echo "FAIL: trunk move-entry must not return a CL link: $API_BODY" >&2
+    return 1
+  fi
+  git_case -C "$dest" pull --ff-only origin main >/dev/null || return 1
+  if [[ ! -f "$dest/$dst/inner.txt" ]]; then
+    echo "FAIL: after git pull the moved directory $dst/inner.txt is missing" >&2
+    return 1
+  fi
+  if [[ -e "$dest/$src" ]]; then
+    echo "FAIL: after git pull the source directory $src still exists" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$dst" "after move-entry" || return 1
+  expect_not_listed "$PROJECT_PATH" "$src" "after move-entry" || return 1
+}
+
+case_tags_list_create_delete() {
+  require_api_base || return 1
+  require_token || return 1
+  local name="lb05-tag-${LB05_RUN_ID}" code
+  local list_body='{"pagination":{"page":1,"per_page":200},"additional":"/"}'
+  api_call POST tags/list "$list_body" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: POST /tags/list (anonymous) HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags "{\"name\":\"${name}\",\"message\":\"lb05 smoke tag\",\"tagger_name\":\"lb05\",\"tagger_email\":\"lb05@example.invalid\"}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_req_result_true; then
+    echo "FAIL: POST /tags (token) HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  if ! body_names_entry "$name"; then
+    echo "FAIL: create-tag response lacks the tag name: $API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags/list "$list_body" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_names_entry "$name"; then
+    echo "FAIL: POST /tags/list after create does not list ${name} (HTTP $code): $API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]]; then
+    echo "FAIL: GET /tags/${name} HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call DELETE "tags/${name}"; code="$API_CODE"
+  if [[ "$code" != "200" ]] || ! body_matches "\"deleted_tag\"[[:space:]]*:[[:space:]]*\"${name}\""; then
+    echo "FAIL: DELETE /tags/${name} (token) HTTP $code body=$API_BODY" >&2
+    return 1
+  fi
+  api_call POST tags/list "$list_body" noauth; code="$API_CODE"
+  if [[ "$code" != "200" ]] || body_names_entry "$name"; then
+    echo "FAIL: POST /tags/list after delete still lists ${name} (HTTP $code): $API_BODY" >&2
+    return 1
+  fi
+  api_call GET "tags/${name}" "" noauth; code="$API_CODE"
+  if [[ "$code" != "404" ]]; then
+    echo "FAIL: GET /tags/${name} after delete must be 404, got $code body=$API_BODY" >&2
+    return 1
+  fi
+}
+
+case_delete_entry_unauth_401() {
+  require_api_base || return 1
+  require_http_url || return 1
+  require_token || return 1
+  ensure_project_tip || return 1
+  local dir="lb05-keep-${LB05_RUN_ID}" dest code
+  create_dir_with_file "$dir" || return 1
+  api_call POST delete-entry "{\"path\":\"${PROJECT_PATH}\",\"name\":\"${dir}\",\"skip_build\":true}" noauth; code="$API_CODE"
+  if [[ "$code" != "401" ]]; then
+    echo "FAIL: unauthenticated delete-entry must be HTTP 401, got $code body=$API_BODY" >&2
+    return 1
+  fi
+  if [[ "$API_BODY" == *"${MEGA2_IT_SEED_TOKEN}"* ]]; then
+    echo "FAIL: 401 body must not echo the token" >&2
+    return 1
+  fi
+  dest="$ROOT_DIR/lb05-unauth-clone"
+  fresh_project_clone "$dest" || return 1
+  if [[ ! -f "$dest/$dir/inner.txt" ]]; then
+    echo "FAIL: unauthenticated delete-entry must leave $dir/inner.txt on the tip" >&2
+    return 1
+  fi
+  expect_listed "$PROJECT_PATH" "$dir" "after the rejected delete" || return 1
+}
+
 run_case "API create-entry then git clone sees file" case_api_create_then_clone
 run_case "API edit/save then git pull sees update" case_api_save_then_pull
 run_case "API write rejects unauthenticated" case_api_write_rejects_unauthenticated
+run_case "delete-entry-git-visible" case_delete_entry_git_visible
+run_case "move-entry-git-visible" case_move_entry_git_visible
+run_case "tags-list-create-delete" case_tags_list_create_delete
+run_case "delete-entry-unauth-401" case_delete_entry_unauth_401
 
 if [[ -n "$CASE_FILTER" && "$CASE_HIT" -eq 0 ]]; then
   echo "FAIL: MEGA2_SMOKE_CASE='$CASE_FILTER' matched no registered case" >&2
