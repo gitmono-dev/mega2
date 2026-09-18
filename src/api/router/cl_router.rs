@@ -569,38 +569,24 @@ async fn save_comment(
     state: State<MonoApiServiceState>,
     Json(payload): Json<ContentPayload>,
 ) -> Result<Json<CommonResult<()>>, ApiError> {
-    let conv_type = if state
-        .storage
-        .reviewer_storage()
-        .is_reviewer(&link, &user.username)
-        .await?
-    {
-        // If user is the reviewer for this cl, then the comment if of type review
-        ConvTypeEnum::Review
-    } else {
-        ConvTypeEnum::Comment
-    };
-
     state
         .conv_stg()
         .add_conversation(
             &link,
             &user.username,
             Some(payload.content.clone()),
-            conv_type,
+            ConvTypeEnum::Comment,
         )
         .await?;
 
-    // Enqueue notification emails for the CL author + reviewers (outbox; the
+    // Enqueue notification emails for the CL author (outbox; the
     // background dispatcher delivers them). Best-effort: a notification failure
     // must not fail the comment request. See docs/notification.md phase 0.
     let notif_stg = state.storage.notification_storage();
     let cl_stg = state.cl_stg();
-    let reviewer_stg = state.storage.reviewer_storage();
     if let Err(e) = crate::notification::triggers::on_cl_comment_created(
         &notif_stg,
         &cl_stg,
-        &reviewer_stg,
         &user.username,
         &link,
         &payload.content,
