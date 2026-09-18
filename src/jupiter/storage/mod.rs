@@ -7,8 +7,6 @@ pub mod bots_storage;
 pub mod buck_storage;
 pub mod cl_storage;
 pub mod cla_storage;
-pub mod code_review_comment_storage;
-pub mod code_review_thread_storage;
 pub mod commit_binding_storage;
 pub mod conversation_storage;
 pub mod git_db_storage;
@@ -40,10 +38,9 @@ use crate::{
         service::{
             agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
             buck_service::BuckService, cl_service::CLService, cla_service::ClaService,
-            code_review_service::CodeReviewService, git_service::GitService,
-            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
-            oci_service::OciService, push_queue_service::PushQueueService,
-            webhook_service::WebhookService,
+            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
+            mono_service::MonoService, oci_service::OciService,
+            push_queue_service::PushQueueService, webhook_service::WebhookService,
         },
         storage::{
             agent_capture_storage::AgentCaptureStorage,
@@ -53,8 +50,6 @@ use crate::{
             buck_storage::BuckStorage,
             cl_storage::ClStorage,
             cla_storage::ClaStorage,
-            code_review_comment_storage::CodeReviewCommentStorage,
-            code_review_thread_storage::CodeReviewThreadStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
             git_db_storage::GitDbStorage,
@@ -91,8 +86,6 @@ pub struct AppService {
     pub commit_binding_storage: CommitBindingStorage,
     pub push_queue_storage: PushQueueStorage,
     pub buck_storage: BuckStorage,
-    pub code_review_comment_storage: CodeReviewCommentStorage,
-    pub code_review_thread_storage: CodeReviewThreadStorage,
     pub bots_storage: BotsStorage,
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
@@ -120,8 +113,6 @@ impl AppService {
             commit_binding_storage: CommitBindingStorage { base: mock.clone() },
             push_queue_storage: PushQueueStorage::new(mock.clone()),
             buck_storage: BuckStorage { base: mock.clone() },
-            code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
-            code_review_thread_storage: CodeReviewThreadStorage { base: mock.clone() },
             bots_storage: BotsStorage { base: mock.clone() },
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
@@ -146,7 +137,6 @@ pub struct Storage {
     pub agent_capture_service: AgentCaptureService,
     pub config_handle: ConfigHandle,
     pub config: Arc<Config>,
-    pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
     pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
@@ -210,8 +200,6 @@ impl Storage {
         let push_queue_storage = PushQueueStorage::new(base.clone());
         let buck_storage = BuckStorage { base: base.clone() };
 
-        let code_review_comment_storage = CodeReviewCommentStorage { base: base.clone() };
-        let code_review_thread_storage = CodeReviewThreadStorage { base: base.clone() };
         let bots_storage = BotsStorage { base: base.clone() };
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
@@ -266,8 +254,6 @@ impl Storage {
             commit_binding_storage,
             push_queue_storage: push_queue_storage.clone(),
             buck_storage,
-            code_review_comment_storage,
-            code_review_thread_storage,
             bots_storage,
             webhook_storage: webhook_storage.clone(),
             audit_storage,
@@ -307,7 +293,6 @@ impl Storage {
             lfs_service,
             oci_service,
             agent_capture_service,
-            code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
             storage_event_emitter,
             notification_storage,
@@ -544,14 +529,6 @@ impl Storage {
         self.app_service.buck_storage.clone()
     }
 
-    pub fn code_review_thread_storage(&self) -> CodeReviewThreadStorage {
-        self.app_service.code_review_thread_storage.clone()
-    }
-
-    pub fn code_review_comment_storage(&self) -> CodeReviewCommentStorage {
-        self.app_service.code_review_comment_storage.clone()
-    }
-
     pub fn webhook_storage(&self) -> WebhookStorage {
         self.app_service.webhook_storage.clone()
     }
@@ -603,7 +580,6 @@ impl Storage {
             lfs_service: LfsService::mock(),
             oci_service: OciService::mock(),
             agent_capture_service: AgentCaptureService::mock(),
-            code_review_service: CodeReviewService::mock(),
             webhook_service,
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),
