@@ -109,6 +109,25 @@ mod tests {
         {
             let stmt = Statement::from_string(
                 DbBackend::Postgres,
+                "SELECT to_regclass('mega_cl_reviewer')::text AS table_name;".to_owned(),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected table 'mega_cl_reviewer' to be dropped"
+            );
+        }
+
+        {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
                 "SELECT to_regclass('user_inbox_notifications')::text AS table_name;".to_owned(),
             );
             let row = db
@@ -335,6 +354,63 @@ mod tests {
             assert!(
                 table_name.is_none(),
                 "expected table '{table}' to remain dropped after down no-op"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_mega_cl_reviewer_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+
+        {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT to_regclass('mega_cl_reviewer')::text AS table_name;".to_owned(),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected mega_cl_reviewer to be dropped"
+            );
+        }
+
+        {
+            use sea_orm_migration::SchemaManager;
+            let manager = SchemaManager::new(&db);
+            crate::jupiter::migration::m20260919_000400_drop_mega_cl_reviewer::Migration
+                .down(&manager)
+                .await
+                .expect("drop_mega_cl_reviewer down should be a no-op Ok(())");
+        }
+
+        {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT to_regclass('mega_cl_reviewer')::text AS table_name;".to_owned(),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected mega_cl_reviewer to remain dropped after down no-op"
             );
         }
     }

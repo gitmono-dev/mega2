@@ -5,7 +5,6 @@ pub mod base_storage;
 pub mod blob_path_index;
 pub mod bots_storage;
 pub mod buck_storage;
-pub mod cl_reviewer_storage;
 pub mod cl_storage;
 pub mod cla_storage;
 pub mod code_review_comment_storage;
@@ -52,7 +51,6 @@ use crate::{
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
-            cl_reviewer_storage::ClReviewerStorage,
             cl_storage::ClStorage,
             cla_storage::ClaStorage,
             code_review_comment_storage::CodeReviewCommentStorage,
@@ -91,7 +89,6 @@ pub struct AppService {
     pub issue_storage: IssueStorage,
     pub conversation_storage: ConversationStorage,
     pub commit_binding_storage: CommitBindingStorage,
-    pub reviewer_storage: ClReviewerStorage,
     pub push_queue_storage: PushQueueStorage,
     pub buck_storage: BuckStorage,
     pub code_review_comment_storage: CodeReviewCommentStorage,
@@ -121,7 +118,6 @@ impl AppService {
             issue_storage: IssueStorage { base: mock.clone() },
             conversation_storage: ConversationStorage { base: mock.clone() },
             commit_binding_storage: CommitBindingStorage { base: mock.clone() },
-            reviewer_storage: ClReviewerStorage { base: mock.clone() },
             push_queue_storage: PushQueueStorage::new(mock.clone()),
             buck_storage: BuckStorage { base: mock.clone() },
             code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
@@ -211,7 +207,6 @@ impl Storage {
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
-        let reviewer_storage = ClReviewerStorage { base: base.clone() };
         let push_queue_storage = PushQueueStorage::new(base.clone());
         let buck_storage = BuckStorage { base: base.clone() };
 
@@ -269,7 +264,6 @@ impl Storage {
             issue_storage,
             conversation_storage,
             commit_binding_storage,
-            reviewer_storage,
             push_queue_storage: push_queue_storage.clone(),
             buck_storage,
             code_review_comment_storage,
@@ -540,10 +534,6 @@ impl Storage {
 
     pub fn commit_binding_storage(&self) -> CommitBindingStorage {
         self.app_service.commit_binding_storage.clone()
-    }
-
-    pub fn reviewer_storage(&self) -> ClReviewerStorage {
-        self.app_service.reviewer_storage.clone()
     }
 
     pub fn push_queue_storage(&self) -> PushQueueStorage {

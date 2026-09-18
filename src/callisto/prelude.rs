@@ -14,7 +14,7 @@ pub use super::{
     issue_cl_references::Entity as IssueClReferences, item_assignees::Entity as ItemAssignees,
     item_labels::Entity as ItemLabels, label::Entity as Label, lfs_locks::Entity as LfsLocks,
     lfs_objects::Entity as LfsObjects, mega_blob::Entity as MegaBlob, mega_cl::Entity as MegaCl,
-    mega_cl_commits::Entity as MegaClCommits, mega_cl_reviewer::Entity as MegaClReviewer,
+    mega_cl_commits::Entity as MegaClCommits,
     mega_code_review_anchor::Entity as MegaCodeReviewAnchor,
     mega_code_review_comment::Entity as MegaCodeReviewComment,
     mega_code_review_position::Entity as MegaCodeReviewPosition,
