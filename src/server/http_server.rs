@@ -819,7 +819,7 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
     // fail closed unless `[mst2].enabled`, so toggling needs a restart.
     let router = router.nest(
         "/api/v2",
-        snapshot_router::routers().with_state(api_state.clone()),
+        snapshot_router::routers(api_state.clone()).with_state(api_state.clone()),
     );
 
     // Static `/v2/` prefix before catch-all (same pattern as `/info/lfs`).

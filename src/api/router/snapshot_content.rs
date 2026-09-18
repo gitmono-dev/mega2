@@ -3,9 +3,6 @@
 //! frames. Identity encoding only in this slice; zstd negotiation is a later
 //! WP and `frame_encodings` advertises identity alone.
 
-// Axum handlers in this module return `Response` as `Err` (PR #13 MST/2 surface).
-#![allow(clippy::result_large_err)]
-
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
@@ -16,7 +13,6 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{abs_view_path, internal, mst2_error_response};
 use crate::ceres::snapshot::{
     chunks::{ChunkProjection, get_or_project},
     error::{SnapshotError, SnapshotErrorCode},
@@ -25,6 +21,8 @@ use crate::ceres::snapshot::{
     runtime::runtime,
     view::validate_scope_relative_path,
 };
+
+use super::{abs_view_path, internal, mst2_error_response};
 
 /// One file resolved at a fixed path with verified content.
 struct ResolvedFile {
@@ -179,12 +177,7 @@ pub(super) async fn objects(
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
-    let req: ObjectsRequest = serde_json::from_slice(&body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
-            format!("malformed request body: {e}"),
-        ))
-    })?;
+    let req: ObjectsRequest = super::parse_json_body(&body)?;
     if req.items.is_empty() || req.items.len() > OBJECT_MAX_ITEMS {
         return Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::ScopeInvalid,
@@ -464,15 +457,10 @@ pub(super) async fn chunks(
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
-    let req: ChunksRequest = serde_json::from_slice(&body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
-            format!("malformed request body: {e}"),
-        ))
-    })?;
+    let req: ChunksRequest = super::parse_json_body(&body)?;
     if req.items.is_empty() || req.items.len() > CHUNKS_MAX_ITEMS {
         return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
+            SnapshotErrorCode::LimitExceeded,
             "items must hold 1..128 entries",
         )));
     }

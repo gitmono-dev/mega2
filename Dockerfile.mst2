@@ -1,8 +1,9 @@
-# mega2 with the MST/2 snapshot surface (local e2e build).
+# mega2 with the MST/2 snapshot surface, for the compose acceptance stacks.
 #
-# The compose override layers this on top of the repository's own stack; the
-# build context is the monoengine checkout and the shared codec arrives as a
-# named build context (`mst2codec`), matching the `mst2-codec` path dependency.
+# The build context is this repository alone: the shared codec is a registry
+# dependency (see Cargo.toml), so no sibling checkout or extra build context is
+# needed. The registry version (0.3) carries the MTP2 route walk and the
+# spec-conformance zstd fixes.
 FROM rust:1.97-bookworm AS builder
 
 RUN apt-get update \
@@ -18,7 +19,6 @@ RUN apt-get update \
 
 WORKDIR /src/monoengine
 COPY . /src/monoengine
-COPY --from=mst2codec ./ /src/mst2-codec/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=monoengine-it-cargo-registry-${TARGETARCH},sharing=locked \

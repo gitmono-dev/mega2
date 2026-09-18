@@ -123,6 +123,7 @@ mod m20260913_000100_add_agent_capture_tables;
 mod m20260916_000100_add_mst2_verified_object;
 mod m20260917_000100_add_mst2_retention;
 mod m20260917_000200_add_mst2_publication;
+mod m20260918_000100_fix_mst2_publication_unique;
 mod m20260918_000100_mega_tag_path;
 mod m20260918_000200_drop_notification_settings_delivery_columns;
 mod runner;
@@ -237,6 +238,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000100_add_mst2_retention::Migration),
             Box::new(m20260917_000200_add_mst2_publication::Migration),
             Box::new(m20260918_000100_mega_tag_path::Migration),
+            Box::new(m20260918_000100_fix_mst2_publication_unique::Migration),
             Box::new(m20260918_000200_drop_notification_settings_delivery_columns::Migration),
         ]
     }

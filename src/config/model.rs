@@ -837,6 +837,11 @@ pub struct Mst2Config {
     /// the surface stays in its provisional per-tip sequence mode.
     #[serde(default)]
     pub publication_enabled: bool,
+    /// Bearer token required on every snapshot endpoint except
+    /// `capabilities` (spec 04 §1). Unset keeps the unauthenticated
+    /// lab-only mode: local evaluation stacks only, never a deployment.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

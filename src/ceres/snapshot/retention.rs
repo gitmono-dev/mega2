@@ -19,10 +19,8 @@
 //! proves the rules deterministically. The Postgres backend is the
 //! remaining integration seam (same shape as `publication`).
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Mutex,
-};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use crate::ceres::snapshot::error::{SnapshotError, SnapshotErrorCode};
 
@@ -435,7 +433,8 @@ pub mod mem {
 
 #[cfg(test)]
 mod tests {
-    use super::{mem::InMemoryRetentionStore, *};
+    use super::mem::InMemoryRetentionStore;
+    use super::*;
 
     fn node(id: &str, bytes: u64) -> RetentionNode {
         RetentionNode {

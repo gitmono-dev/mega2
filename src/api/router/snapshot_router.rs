@@ -6,9 +6,6 @@
 //! to the fixed commit captured at resolve time; no handler here touches
 //! current refs after resolve.
 
-// Axum handlers in this module return `Response` as `Err` (PR #13 MST/2 surface).
-#![allow(clippy::result_large_err)]
-
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
@@ -33,7 +30,7 @@ use crate::{
     },
 };
 
-pub fn routers() -> Router<MonoApiServiceState> {
+pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
     Router::new()
         .route("/snapshots/capabilities", get(capabilities))
         .route("/snapshots/resolve", post(resolve))
@@ -60,10 +57,151 @@ pub fn routers() -> Router<MonoApiServiceState> {
             get(content::chunk_map_pages),
         )
         .route("/snapshots/{snapshot_id}/chunks", post(content::chunks))
+        // Spec 14 §4 hard limit on JSON request bodies; oversized requests
+        // are rejected before any handler runs.
+        .layer(axum::extract::DefaultBodyLimit::max(JSON_REQUEST_LIMIT))
+        .route_layer(axum::middleware::from_fn(reject_oversize_body))
+        // Auth and error-envelope request-id apply to every route here;
+        // a new handler cannot silently skip them.
+        .route_layer(axum::middleware::from_fn_with_state(
+            api_state,
+            snapshot_auth_middleware,
+        ))
 }
 
 #[path = "snapshot_content.rs"]
 mod content;
+
+/// Spec 14 §4: JSON request bytes hard limit.
+pub(crate) const JSON_REQUEST_LIMIT: usize = 131_072;
+
+tokio::task_local! {
+    /// Per-request id for the error envelope (spec 14 §5). Sourced from the
+    /// global `TraceContext` so the envelope, the `X-Request-Id` response
+    /// header and log spans all carry the same id.
+    static REQUEST_ID: String;
+}
+
+/// The request id of the in-flight request, for error envelopes.
+pub(crate) fn current_request_id() -> String {
+    REQUEST_ID.try_with(|id| id.clone()).unwrap_or_default()
+}
+
+const LEASE_HEADER: &str = "x-mega-snapshot-lease";
+
+/// Spec 04 §1 authentication, applied once over the whole snapshot router:
+/// every endpoint except `capabilities` requires `Authorization: Bearer
+/// <token>` when the deployment configured one, and snapshot-bound endpoints
+/// must additionally present the lease they resolved
+/// (`X-Mega-Snapshot-Lease`), validated against the in-memory lease table —
+/// knowing the snapshot id alone is not a capability.
+async fn snapshot_auth_middleware(
+    State(state): State<MonoApiServiceState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Same id the global trace layer echoes on responses and logs.
+    let id = req
+        .extensions()
+        .get::<crate::server::trace_context::TraceContext>()
+        .map(|c| c.trace_id.to_string())
+        .unwrap_or_default();
+    REQUEST_ID
+        .scope(id, async {
+            if let Some(res) = auth_error(&state, req.headers(), req.uri().path()) {
+                return res;
+            }
+            next.run(req).await
+        })
+        .await
+}
+
+/// Spec 14 §4 enforcement with the MST/2 error envelope (DefaultBodyLimit's
+/// own rejection is plain-text). Content-Length is checked here; a lying
+/// chunked body still trips DefaultBodyLimit inside the extractor.
+async fn reject_oversize_body(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let over = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > JSON_REQUEST_LIMIT);
+    if over {
+        return mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            "request body over the spec 14 limit",
+        ));
+    }
+    next.run(req).await
+}
+
+/// Parse a JSON request body, mapping shape errors to the typed envelope
+/// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
+pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
+    serde_json::from_slice(body).map_err(|e| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::InvalidRequest,
+            format!("malformed request body: {e}"),
+        ))
+    })
+}
+
+/// Bearer-token check shared by the auth middleware; the parsing rule is the
+/// one the Git HTTP receive-pack path uses.
+fn bearer_ok(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::api::oauth::bearer_token_from_authorization_value)
+        .is_some_and(|cred| cred == token)
+}
+
+fn unauthenticated(message: &'static str) -> Response {
+    mst2_error_response(SnapshotError::new(
+        SnapshotErrorCode::Unauthenticated,
+        message,
+    ))
+}
+
+/// Auth decision for one request path (see [`snapshot_auth_middleware`]).
+/// `capabilities` stays open; lease routes need only the bearer; a
+/// snapshot-bound route (`/snapshots/sha256:…/…`) also needs its lease.
+fn auth_error(state: &MonoApiServiceState, headers: &HeaderMap, path: &str) -> Option<Response> {
+    let config = state.storage.config();
+    let token = config.mst2.auth_token.as_deref();
+    let path = path.split('?').next().unwrap_or(path);
+    // The router is nested under /api/v2, which strips its prefix before
+    // middleware runs — accept both the stripped and full forms.
+    let rest = path
+        .strip_prefix("/api/v2/snapshots/")
+        .or_else(|| path.strip_prefix("/snapshots/"))?;
+    if rest == "capabilities" {
+        return None;
+    }
+    if let Some(token) = token
+        && !bearer_ok(headers, token)
+    {
+        return Some(unauthenticated("missing or invalid bearer credentials"));
+    }
+    let mut segments = rest.split('/');
+    match segments.next() {
+        // Lease management names the lease in the path, not a snapshot.
+        Some("resolve") | Some("leases") | Some("capabilities") | None => None,
+        Some(snapshot_id) => {
+            let lease = headers.get(LEASE_HEADER).and_then(|v| v.to_str().ok());
+            match lease {
+                None => Some(unauthenticated("missing X-Mega-Snapshot-Lease header")),
+                Some(lease) => runtime()
+                    .validate_lease(snapshot_id, lease)
+                    .err()
+                    .map(mst2_error_response),
+            }
+        }
+    }
+}
 
 fn mst2_error_response(err: SnapshotError) -> Response {
     let status =
@@ -74,8 +212,11 @@ fn mst2_error_response(err: SnapshotError) -> Response {
             "error": {
                 "code": err.code.as_str(),
                 "message": err.message,
-                "request_id": "",
-                "retryable": false,
+                "request_id": current_request_id(),
+                "retryable": matches!(
+                    err.code,
+                    SnapshotErrorCode::SnapshotNotReady | SnapshotErrorCode::Internal
+                ),
             }
         })),
     )
@@ -177,11 +318,17 @@ fn ensure_enabled(state: &MonoApiServiceState) -> Result<(), SnapshotError> {
 // `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
 // boxed), there is nothing to gain here, so the lint is allowed outright.
 #[allow(clippy::result_large_err)]
-async fn resolve(
-    state: State<MonoApiServiceState>,
-    Json(req): Json<ResolveRequest>,
-) -> Result<Response, Response> {
+async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
+    let req: ResolveRequest = parse_json_body(&body)?;
+    // Unknown target kinds are client errors, never a silent fallback to
+    // latest (review P1.3).
+    if req.target.kind != "latest" && req.target.kind != "view" {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::InvalidRequest,
+            format!("unknown target kind {:?}", req.target.kind),
+        )));
+    }
     if req.delivery != "full" {
         return Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::ScopeInvalid,
@@ -567,10 +714,17 @@ async fn directory(
 
     let mut resp = Json(body).into_response();
     // Strong ETag over this representation + no-transform (spec 04 §10).
+    // The pagination parameters are part of the representation: an ETag
+    // shared across limit/cursor choices would serve one window for another
+    // (review P1.4).
     let etag = format!(
-        "\"{}:{}\"",
+        "\"{}:{}:{}:{}\"",
         &snapshot_id[..16.min(snapshot_id.len())],
-        hex_of(&built.page_id)
+        hex_of(&built.page_id),
+        q.limit,
+        // The cursor is the server-signed token itself (base64 + MAC):
+        // header-safe and already held by the client, so identity suffices.
+        q.cursor.as_deref().unwrap_or(""),
     );
     if let Ok(v) = HeaderValue::from_str(&etag) {
         resp.headers_mut().insert("etag", v);
@@ -695,12 +849,14 @@ struct LookupRequest {
 async fn lookup(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
-    Json(req): Json<LookupRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
+    let req: LookupRequest = parse_json_body(&body)?;
     if req.paths.len() > 128 {
         return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
+            SnapshotErrorCode::LimitExceeded,
             "at most 128 paths per lookup",
         )));
     }
@@ -774,10 +930,13 @@ async fn lookup(
     }
 
     // Shared proof pages along the deepest found directories, deduped, with
-    // the 1 MiB response budget of spec 04 sections 5/7.
+    // the 1 MiB response budget of spec 04 sections 5/7. Dropping a proof
+    // silently would answer "verified" with an incomplete set; the client
+    // must switch to stepwise metadata/pages instead (spec 14 §5).
     let mut proof_pages_out = Vec::new();
     let mut budget: usize = 1_048_576;
     let mut seen_pages: Vec<[u8; 32]> = Vec::new();
+    let mut budget_exceeded = false;
     deepest_dirs.sort();
     deepest_dirs.dedup();
     'dirs: for dir in deepest_dirs.iter().rev() {
@@ -789,6 +948,7 @@ async fn lookup(
                 continue;
             }
             if bytes.len() > budget {
+                budget_exceeded = true;
                 break 'dirs;
             }
             budget -= bytes.len();
@@ -798,6 +958,12 @@ async fn lookup(
                 "data_base64": base64_of(&bytes),
             }));
         }
+    }
+    if budget_exceeded {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::ProofBudgetExceeded,
+            "lookup proof pages exceed the response budget; use metadata/pages",
+        )));
     }
 
     let body = json!({
@@ -840,27 +1006,23 @@ struct MetadataPageItem {
 async fn metadata_pages(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    let ctx = runtime()
-        .context(&snapshot_id)
-        .map_err(mst2_error_response)?;
-    let req: MetadataPagesRequest = serde_json::from_slice(&body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
-            format!("malformed request body: {e}"),
-        ))
-    })?;
+    let req: MetadataPagesRequest = parse_json_body(&body)?;
     if req.items.is_empty() || req.items.len() > 64 {
         return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
+            SnapshotErrorCode::LimitExceeded,
             "items must hold 1..64 entries",
         )));
     }
     for item in &req.items {
         validate_scope_relative_path(&item.directory_path).map_err(mst2_error_response)?;
     }
+    let ctx = runtime()
+        .context(&snapshot_id)
+        .map_err(mst2_error_response)?;
 
     let handler = state
         .api_handler(std::path::Path::new("/"))

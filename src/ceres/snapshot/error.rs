@@ -4,13 +4,22 @@
 use crate::common::errors::MegaError;
 
 /// Snapshot-domain error codes surfaced as JSON `{"error": {"code": ...}}`.
+/// Codes and HTTP statuses follow the closed table in spec 14 §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotErrorCode {
     ScopeInvalid,
+    /// Malformed request shape (unknown resolve target kind, bad JSON
+    /// structure): spec 14 §5 INVALID_REQUEST.
+    InvalidRequest,
+    /// Request over a spec 14 §4 hard limit (body bytes, item counts).
+    LimitExceeded,
+    /// Missing or invalid credentials (spec 04 §1 / 14 §5).
+    Unauthenticated,
     ScopeForbidden,
     ViewNotFound,
     SnapshotNotReady,
-    SnapshotUnknown,
+    /// The fixed view no longer exists: spec 14 §5 SNAPSHOT_GONE (410).
+    SnapshotGone,
     PathNotFound,
     NotDirectory,
     UnsupportedEntry,
@@ -32,10 +41,13 @@ impl SnapshotErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             SnapshotErrorCode::ScopeInvalid => "SCOPE_INVALID",
+            SnapshotErrorCode::InvalidRequest => "INVALID_REQUEST",
+            SnapshotErrorCode::LimitExceeded => "LIMIT_EXCEEDED",
+            SnapshotErrorCode::Unauthenticated => "UNAUTHENTICATED",
             SnapshotErrorCode::ScopeForbidden => "SCOPE_FORBIDDEN",
             SnapshotErrorCode::ViewNotFound => "VIEW_NOT_FOUND",
             SnapshotErrorCode::SnapshotNotReady => "SNAPSHOT_NOT_READY",
-            SnapshotErrorCode::SnapshotUnknown => "SNAPSHOT_UNKNOWN",
+            SnapshotErrorCode::SnapshotGone => "SNAPSHOT_GONE",
             SnapshotErrorCode::PathNotFound => "PATH_NOT_FOUND",
             SnapshotErrorCode::NotDirectory => "NOT_DIRECTORY",
             SnapshotErrorCode::UnsupportedEntry => "UNSUPPORTED_ENTRY",
@@ -45,34 +57,36 @@ impl SnapshotErrorCode {
             SnapshotErrorCode::CursorInvalid => "CURSOR_INVALID",
             SnapshotErrorCode::CursorStale => "CURSOR_STALE",
             SnapshotErrorCode::ProofBudgetExceeded => "PROOF_BUDGET_EXCEEDED",
-            SnapshotErrorCode::DigestMismatch => "OBJECT_DIGEST_MISMATCH",
+            SnapshotErrorCode::DigestMismatch => "EXPECTED_DIGEST_MISMATCH",
             SnapshotErrorCode::RangeNotSupported => "RANGE_NOT_SUPPORTED",
             SnapshotErrorCode::SymlinkTraversal => "SYMLINK_TRAVERSAL",
             SnapshotErrorCode::Internal => "INTERNAL",
         }
     }
 
-    /// HTTP status for the JSON error envelope. Proven not-found outcomes
-    /// stay 404; storage failures map to 5xx and never masquerade as absence.
+    /// HTTP status for the JSON error envelope, per the closed spec 14 §5
+    /// table. Proven not-found outcomes stay 404; storage failures map to
+    /// 5xx and never masquerade as absence.
     pub fn http_status(&self) -> u16 {
         match self {
             SnapshotErrorCode::ScopeInvalid
+            | SnapshotErrorCode::InvalidRequest
             | SnapshotErrorCode::CursorInvalid
-            | SnapshotErrorCode::CursorStale => 400,
+            | SnapshotErrorCode::RangeNotSupported => 400,
+            SnapshotErrorCode::Unauthenticated => 401,
             SnapshotErrorCode::ScopeForbidden => 403,
             SnapshotErrorCode::ViewNotFound
-            | SnapshotErrorCode::SnapshotUnknown
             | SnapshotErrorCode::PathNotFound
             | SnapshotErrorCode::LeaseUnknown => 404,
             SnapshotErrorCode::SnapshotNotReady => 503,
-            SnapshotErrorCode::NotDirectory => 409,
+            SnapshotErrorCode::NotDirectory
+            | SnapshotErrorCode::Conflict
+            | SnapshotErrorCode::CursorStale
+            | SnapshotErrorCode::DigestMismatch
+            | SnapshotErrorCode::SymlinkTraversal => 409,
             SnapshotErrorCode::UnsupportedEntry => 422,
-            SnapshotErrorCode::LeaseExpired => 410,
-            SnapshotErrorCode::Conflict => 409,
-            SnapshotErrorCode::ProofBudgetExceeded => 413,
-            SnapshotErrorCode::DigestMismatch => 409,
-            SnapshotErrorCode::RangeNotSupported => 400,
-            SnapshotErrorCode::SymlinkTraversal => 400,
+            SnapshotErrorCode::LimitExceeded | SnapshotErrorCode::ProofBudgetExceeded => 413,
+            SnapshotErrorCode::LeaseExpired | SnapshotErrorCode::SnapshotGone => 410,
             SnapshotErrorCode::Internal => 500,
         }
     }
