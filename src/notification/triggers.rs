@@ -268,9 +268,6 @@ mod tests {
         on_cl_comment_created(&notif, &cl_stg, &reviewer_stg, "bob", "CL1", "<review>")
             .await
             .unwrap();
-
-        let inbox = notif.list_inbox_notifications("alice", 10).await.unwrap();
-        assert!(inbox.is_empty());
     }
 
     #[test]
@@ -358,13 +355,5 @@ mod tests {
         )
         .await
         .unwrap();
-
-        assert!(
-            notif
-                .list_inbox_notifications("alice", 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
     }
 }

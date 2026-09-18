@@ -354,12 +354,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            stg.list_inbox_notifications("alice", 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         let captured = captured.lock().await;
         assert!(
             captured.payload.is_none(),
@@ -408,12 +402,6 @@ mod tests {
         .unwrap();
 
         assert!(mock.take_sent().is_empty());
-        assert!(
-            stg.list_inbox_notifications("alice", 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         NotificationService::set_active(None);
     }
 }

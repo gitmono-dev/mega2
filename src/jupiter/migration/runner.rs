@@ -87,7 +87,7 @@ mod tests {
             );
         }
 
-        for table in ["reactions", "custom_reactions", "user_inbox_notifications"] {
+        for table in ["reactions", "custom_reactions"] {
             let stmt = Statement::from_string(
                 DbBackend::Postgres,
                 format!("SELECT to_regclass('{table}')::text AS table_name;"),
@@ -101,6 +101,25 @@ mod tests {
                 .try_get("", "table_name")
                 .expect("PostgreSQL catalog query should expose table_name");
             assert!(table_name.is_some(), "expected table '{table}' to remain");
+        }
+
+        {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT to_regclass('user_inbox_notifications')::text AS table_name;".to_owned(),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("query PostgreSQL catalog")
+                .expect("PostgreSQL catalog query should return one row");
+            let table_name: Option<String> = row
+                .try_get("", "table_name")
+                .expect("PostgreSQL catalog query should expose table_name");
+            assert!(
+                table_name.is_none(),
+                "expected user_inbox_notifications to be dropped"
+            );
         }
 
         for event_type_code in ["chat.mention.created", "chat.reply.created"] {
@@ -156,11 +175,11 @@ mod tests {
             .try_get("", "table_name")
             .expect("PostgreSQL catalog query should expose table_name");
         assert!(
-            table_name.is_some(),
-            "expected user_inbox_notifications to remain"
+            table_name.is_none(),
+            "expected user_inbox_notifications to be dropped"
         );
 
-        // Forward-only: down must be a no-op (tables stay dropped; inbox remains).
+        // Forward-only: down must be a no-op (tables stay dropped).
         {
             use sea_orm_migration::SchemaManager;
             let manager = SchemaManager::new(&db);
@@ -202,8 +221,61 @@ mod tests {
             .try_get("", "table_name")
             .expect("PostgreSQL catalog query should expose table_name");
         assert!(
-            table_name.is_some(),
-            "expected user_inbox_notifications to remain after down no-op"
+            table_name.is_none(),
+            "expected user_inbox_notifications to remain dropped after down no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_user_inbox_notifications_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+
+        let stmt = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT to_regclass('user_inbox_notifications')::text AS table_name;".to_owned(),
+        );
+        let row = db
+            .query_one_raw(stmt)
+            .await
+            .expect("query PostgreSQL catalog")
+            .expect("PostgreSQL catalog query should return one row");
+        let table_name: Option<String> = row
+            .try_get("", "table_name")
+            .expect("PostgreSQL catalog query should expose table_name");
+        assert!(
+            table_name.is_none(),
+            "expected user_inbox_notifications to be dropped"
+        );
+
+        {
+            use sea_orm_migration::SchemaManager;
+            let manager = SchemaManager::new(&db);
+            crate::jupiter::migration::m20260919_000100_drop_user_inbox_notifications::Migration
+                .down(&manager)
+                .await
+                .expect("drop_user_inbox_notifications down should be a no-op Ok(())");
+        }
+
+        let stmt = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT to_regclass('user_inbox_notifications')::text AS table_name;".to_owned(),
+        );
+        let row = db
+            .query_one_raw(stmt)
+            .await
+            .expect("query PostgreSQL catalog")
+            .expect("PostgreSQL catalog query should return one row");
+        let table_name: Option<String> = row
+            .try_get("", "table_name")
+            .expect("PostgreSQL catalog query should expose table_name");
+        assert!(
+            table_name.is_none(),
+            "expected user_inbox_notifications to remain dropped after down no-op"
         );
     }
 

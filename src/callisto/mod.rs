@@ -78,7 +78,6 @@ pub mod queue_control;
 pub mod reactions;
 pub mod sea_orm_active_enums;
 pub mod ssh_keys;
-pub mod user_inbox_notifications;
 pub mod user_notification_preferences;
 pub mod user_notification_settings;
 pub mod vault;
