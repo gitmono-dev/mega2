@@ -127,6 +127,7 @@ mod m20260918_000100_fix_mst2_publication_unique;
 mod m20260918_000100_mega_tag_path;
 mod m20260918_000200_drop_notification_settings_delivery_columns;
 pub(crate) mod m20260919_000100_drop_user_inbox_notifications;
+mod m20260919_000200_drop_dynamic_sidebar;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -242,6 +243,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260918_000100_fix_mst2_publication_unique::Migration),
             Box::new(m20260918_000200_drop_notification_settings_delivery_columns::Migration),
             Box::new(m20260919_000100_drop_user_inbox_notifications::Migration),
+            Box::new(m20260919_000200_drop_dynamic_sidebar::Migration),
         ]
     }
 }

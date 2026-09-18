@@ -29,7 +29,6 @@ pub mod buck_session_file;
 pub mod check_result;
 pub mod cla_sign_status;
 pub mod commit_auths;
-pub mod dynamic_sidebar;
 pub mod entity_ext;
 pub mod git_blob;
 pub mod git_commit;

@@ -140,6 +140,7 @@ async fn reject_oversize_body(
 
 /// Parse a JSON request body, mapping shape errors to the typed envelope
 /// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
+#[allow(clippy::result_large_err)]
 pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
     serde_json::from_slice(body).map_err(|e| {
         mst2_error_response(SnapshotError::new(
@@ -452,6 +453,7 @@ fn descriptor_json(
     })
 }
 
+#[allow(clippy::result_large_err)]
 async fn descriptor_get(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
@@ -477,6 +479,7 @@ struct RenewRequest {
     lease_seconds: Option<u64>,
 }
 
+#[allow(clippy::result_large_err)]
 async fn lease_renew(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
@@ -506,6 +509,7 @@ async fn lease_renew(
     Ok(Json(body).into_response())
 }
 
+#[allow(clippy::result_large_err)]
 async fn lease_release(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
@@ -743,7 +747,7 @@ struct BlobQuery {
     expected_digest: Option<String>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 async fn blob(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
@@ -845,11 +849,11 @@ struct LookupRequest {
     include_ancestors: bool,
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 async fn lookup(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
@@ -1002,11 +1006,11 @@ struct MetadataPageItem {
 /// page is byte-identical to the one its parent commits to; a page the view
 /// does not contain is a proven-absence 404, never an empty page or a
 /// digest-only shortcut past the scope check.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 async fn metadata_pages(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;

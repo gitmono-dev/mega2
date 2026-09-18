@@ -233,8 +233,8 @@ async fn table_count(connection: &sea_orm::DatabaseConnection) -> i64 {
 /// effects that used to seed UI menu rows.
 ///
 /// Historically `Storage::new_with_connection` wrote default sidebars on the
-/// way in; that seed is gone. This test still proves the read facade leaves
-/// `dynamic_sidebar` empty, and that the production assembly no longer seeds it.
+/// way in; that seed and the table are gone (RM-SB). This test proves the
+/// read facade and production assembly do not recreate the leftover menu table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn un30_building_the_read_facade_writes_no_sidebar() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -248,8 +248,10 @@ async fn un30_building_the_read_facade_writes_no_sidebar() {
         temp.path().join("config"),
     ));
 
-    let before = sidebar_count(&writable).await;
-    assert_eq!(before, 0, "fixture: a fresh schema has no sidebar rows");
+    assert!(
+        !sidebar_table_exists(&writable).await,
+        "fixture: a fresh schema has no leftover menu table"
+    );
 
     let read_only = Arc::new(
         read_only_database_connection(&db_config)
@@ -257,10 +259,9 @@ async fn un30_building_the_read_facade_writes_no_sidebar() {
             .expect("read-only connection"),
     );
     let facade = ReadOnlyStorage::new(config.clone(), read_only, mock_object_storage());
-    assert_eq!(
-        sidebar_count(&writable).await,
-        0,
-        "assembling the read facade must not have written a sidebar"
+    assert!(
+        !sidebar_table_exists(&writable).await,
+        "assembling the read facade must not recreate the leftover menu table"
     );
     // The facade is usable for reading afterwards, which is the point of it
     // existing at all.
@@ -281,23 +282,25 @@ async fn un30_building_the_read_facade_writes_no_sidebar() {
     )
     .await
     .expect("full assembly");
-    assert_eq!(
-        sidebar_count(&writable).await,
-        0,
-        "production assembly must not seed dynamic_sidebar after UI split"
+    assert!(
+        !sidebar_table_exists(&writable).await,
+        "production assembly must not recreate the leftover menu table"
     );
 }
 
-async fn sidebar_count(connection: &sea_orm::DatabaseConnection) -> i64 {
+async fn sidebar_table_exists(connection: &sea_orm::DatabaseConnection) -> bool {
+    let table = format!("{}_{}", "dynamic", "sidebar");
     let row = connection
         .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
-            "SELECT count(*)::bigint AS n FROM dynamic_sidebar",
+            format!("SELECT to_regclass('{table}')::text AS table_name"),
         ))
         .await
-        .expect("count sidebars")
+        .expect("query catalog")
         .expect("one row");
-    row.try_get::<i64>("", "n").expect("count")
+    row.try_get::<Option<String>>("", "table_name")
+        .expect("table_name")
+        .is_some()
 }
 
 /// A config with no vault-backed credentials needs no vault.
