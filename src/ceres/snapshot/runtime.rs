@@ -175,7 +175,7 @@ impl Mst2Runtime {
             .cloned()
             .ok_or_else(|| {
                 SnapshotError::new(
-                    SnapshotErrorCode::SnapshotUnknown,
+                    SnapshotErrorCode::SnapshotGone,
                     "unknown snapshot_id: resolve first; the slice keeps contexts in memory only",
                 )
             })?;
@@ -205,6 +205,27 @@ impl Mst2Runtime {
                     "no active lease for this snapshot; re-resolve",
                 )
             })
+    }
+
+    /// Validate the lease a request presented (spec 04 §1: identity lives in
+    /// the `X-Mega-Snapshot-Lease` header, and a read path must check it —
+    /// knowing the snapshot id alone is not a capability). Any lease that is
+    /// not currently active — unknown, released or expired, or bound to a
+    /// different snapshot — is LEASE_EXPIRED (spec 14 §5: 410, FUSE ESTALE);
+    /// the client's only recovery is re-resolving. A lease id that never
+    /// existed is answered identically: probing with lease ids must not
+    /// distinguish released from forged.
+    pub fn validate_lease(&self, snapshot_id: &str, lease_id: &str) -> Result<(), SnapshotError> {
+        let now = now_unix();
+        let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, r| r.expires_at_unix >= now);
+        match leases.get(lease_id) {
+            Some(r) if r.snapshot_id == snapshot_id && r.expires_at_unix >= now => Ok(()),
+            _ => Err(SnapshotError::new(
+                SnapshotErrorCode::LeaseExpired,
+                "lease is not active for this snapshot; re-resolve",
+            )),
+        }
     }
 
     /// Extend the same snapshot's lease. An unknown lease is 404; an expired

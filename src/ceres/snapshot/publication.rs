@@ -304,7 +304,6 @@ pub mod mem {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::mem::InMemoryPublicationStore;

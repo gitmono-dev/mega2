@@ -113,6 +113,7 @@ pub(super) async fn blob_head(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure(&state)?;
+    super::require_auth(&state, &headers, Some(&snapshot_id))?;
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
@@ -171,15 +172,23 @@ const OBJECT_TOTAL_MAX: usize = 8 * 1024 * 1024;
 pub(super) async fn objects(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure(&state)?;
+    super::require_auth(&state, &headers, Some(&snapshot_id))?;
+    if body.len() > super::JSON_REQUEST_LIMIT {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            "request body over the spec 14 limit",
+        )));
+    }
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
     let req: ObjectsRequest = serde_json::from_slice(&body).map_err(|e| {
         mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
+            SnapshotErrorCode::InvalidRequest,
             format!("malformed request body: {e}"),
         ))
     })?;
@@ -325,8 +334,10 @@ pub(super) async fn chunk_map(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     Query(q): Query<ChunkMapQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure(&state)?;
+    super::require_auth(&state, &headers, Some(&snapshot_id))?;
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
@@ -367,8 +378,10 @@ pub(super) async fn chunk_map_pages(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     Query(q): Query<ChunkMapQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure(&state)?;
+    super::require_auth(&state, &headers, Some(&snapshot_id))?;
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
@@ -456,21 +469,29 @@ struct Planned {
 pub(super) async fn chunks(
     state: State<crate::api::MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure(&state)?;
+    super::require_auth(&state, &headers, Some(&snapshot_id))?;
+    if body.len() > super::JSON_REQUEST_LIMIT {
+        return Err(mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            "request body over the spec 14 limit",
+        )));
+    }
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
     let req: ChunksRequest = serde_json::from_slice(&body).map_err(|e| {
         mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
+            SnapshotErrorCode::InvalidRequest,
             format!("malformed request body: {e}"),
         ))
     })?;
     if req.items.is_empty() || req.items.len() > CHUNKS_MAX_ITEMS {
         return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::ScopeInvalid,
+            SnapshotErrorCode::LimitExceeded,
             "items must hold 1..128 entries",
         )));
     }
