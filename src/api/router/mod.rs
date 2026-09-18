@@ -4,7 +4,6 @@ pub mod artifacts_router;
 pub mod bot_router;
 pub mod buck_router;
 pub mod cl_router;
-pub mod code_review_router;
 pub mod commit_router;
 pub mod gpg_router;
 pub mod group_router;
@@ -81,6 +80,10 @@ mod tests {
                 .iter()
                 .all(|p| !p.contains("/reviewers") && !p.contains("/reviewer/")),
             "review OpenAPI must not include reviewer HTTP: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains("/code_review")),
+            "review OpenAPI must not include /code_review: {paths:?}"
         );
         assert!(
             paths.iter().any(|p| p.contains("create-entry")),
