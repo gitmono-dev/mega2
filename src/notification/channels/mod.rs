@@ -1,24 +1,20 @@
 //! Channel abstraction for the notification subsystem.
 //!
-//! [`NotificationChannel`] decouples in-app inbox, console, Slack, and webhook
-//! delivery from event triggers.
+//! [`NotificationChannel`] decouples console, Slack, and webhook delivery from
+//! event triggers.
 
 use async_trait::async_trait;
 
 use crate::common::errors::MegaError;
 
 mod console;
-mod inapp;
 mod slack;
 mod webhook;
 
 pub use console::ConsoleChannel;
-pub use inapp::InAppChannel;
 pub use slack::SlackChannel;
 pub use webhook::WebhookChannel;
 
-/// Stable identifier for the in-app (inbox) channel.
-pub const CHANNEL_IN_APP: &str = "in_app";
 /// Stable identifier for the console (dry-run) channel.
 pub const CHANNEL_CONSOLE: &str = "console";
 /// Stable identifier for the Slack incoming-webhook channel.

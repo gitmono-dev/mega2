@@ -236,7 +236,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn email_delivery_mode_writes_in_app_notification() {
+    async fn cl_comment_created_does_not_write_inbox() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
@@ -270,9 +270,7 @@ mod tests {
             .unwrap();
 
         let inbox = notif.list_inbox_notifications("alice", 10).await.unwrap();
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].event_type_code, EVENT_CL_COMMENT_CREATED);
-        assert!(inbox[0].body_html.contains("&lt;review&gt;"));
+        assert!(inbox.is_empty());
     }
 
     #[test]

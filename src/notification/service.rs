@@ -13,9 +13,7 @@ use crate::{
     config::reload::ConfigHandle,
     jupiter::storage::notification_storage::NotificationStorage,
     notification::{
-        channels::{
-            CHANNEL_IN_APP, ConsoleChannel, InAppChannel, NotificationChannel, OutboundMessage,
-        },
+        channels::{ConsoleChannel, NotificationChannel, OutboundMessage},
         website_mail::WebsiteMailClient,
     },
 };
@@ -24,9 +22,8 @@ static ACTIVE: RwLock<Option<Arc<NotificationService>>> = RwLock::new(None);
 
 /// Holds channels available to notification delivery and the global gate.
 ///
-/// Event triggers call [`deliver_user_notification`], which fans out to the
-/// registered in-app channel plus any optional Slack/webhook channels without
-/// requiring a mailer or local outbox dispatcher.
+/// Event triggers call [`deliver_user_notification`], which fans out to any
+/// optional Slack/webhook channels without requiring a mailer or inbox write.
 pub struct NotificationService {
     channels: Vec<Arc<dyn NotificationChannel>>,
     website_mail: Option<Arc<WebsiteMailClient>>,
@@ -38,16 +35,13 @@ pub struct NotificationService {
 
 impl NotificationService {
     pub fn new(
-        stg: NotificationStorage,
+        _stg: NotificationStorage,
         extra_channels: Vec<Arc<dyn NotificationChannel>>,
         website_mail: Option<Arc<WebsiteMailClient>>,
         config_handle: Option<ConfigHandle>,
         enabled: bool,
     ) -> Self {
-        let mut channels: Vec<Arc<dyn NotificationChannel>> =
-            Vec::with_capacity(extra_channels.len() + 1);
-        channels.push(Arc::new(InAppChannel::new(stg)));
-        channels.extend(extra_channels);
+        let channels = extra_channels;
         Self {
             channels,
             website_mail,
@@ -117,7 +111,7 @@ fn escape_html(value: &str) -> String {
 }
 
 /// Deliver a product notification: honor the global kill switch, user prefs,
-/// then fan out to registered channels (in-app primary; Slack/webhook extras).
+/// then fan out to registered channels (Slack/webhook extras only).
 ///
 /// Product email is not initiated here. The leftover website-mail client stays
 /// assembled until RM-WM; this function does not call it.
@@ -153,7 +147,6 @@ pub async fn deliver_user_notification(
         for channel in service.channels() {
             match channel.deliver(&message).await {
                 Ok(()) => {}
-                Err(error) if channel.name() == CHANNEL_IN_APP => return Err(error),
                 Err(error) => {
                     warn!(
                         channel = channel.name(),
@@ -163,12 +156,7 @@ pub async fn deliver_user_notification(
                 }
             }
         }
-        return Ok(());
     }
-
-    // Unit tests / callers without an activated service still write in-app.
-    stg.create_inbox_notification(username, event_type, subject, &body_html, Some(body_text))
-        .await?;
     Ok(())
 }
 
@@ -211,7 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_starts_without_mail_and_registers_in_app() {
+    async fn service_starts_without_mail_and_registers_no_builtin_channel() {
         let dir = TempDir::new().unwrap();
         let db = test_db_connection(dir.path()).await;
         apply_migrations(&db, true).await.unwrap();
@@ -219,9 +207,7 @@ mod tests {
         let stg = NotificationStorage::new(Arc::new(db));
         let service = test_service(stg, Vec::new(), true);
 
-        assert_eq!(service.channels().len(), 1);
-        assert_eq!(service.channels()[0].name(), "in_app");
-        assert!(service.channel_for("in_app").is_some());
+        assert!(service.channels().is_empty());
         assert!(service.channel_for("email").is_none());
     }
 
@@ -242,8 +228,7 @@ mod tests {
             Arc::new(WebhookChannel::new("http://127.0.0.1:1/hook".to_string(), None).unwrap());
         let service = test_service(stg, vec![slack, webhook], true);
 
-        assert_eq!(service.channels().len(), 3);
-        assert_eq!(service.channels()[0].name(), "in_app");
+        assert_eq!(service.channels().len(), 2);
         assert!(service.channel_for("slack").is_some());
         assert!(service.channel_for("webhook").is_some());
     }
@@ -369,12 +354,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
+        assert!(
             stg.list_inbox_notifications("alice", 10)
                 .await
                 .unwrap()
-                .len(),
-            1
+                .is_empty()
         );
         let captured = captured.lock().await;
         assert!(
