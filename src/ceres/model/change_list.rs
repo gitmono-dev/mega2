@@ -309,7 +309,8 @@ pub struct Condition {
 
 impl From<check_result::Model> for Condition {
     fn from(value: check_result::Model) -> Self {
-        let check_type: CheckType = value.check_type_code.into();
+        let check_type = CheckType::try_from(value.check_type_code)
+            .expect("code_review check rows are deleted (RM-CC)");
         Self {
             condition_type: check_type.clone(),
             display_name: check_type.clone().display_name().to_string(),

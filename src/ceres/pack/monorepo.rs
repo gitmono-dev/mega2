@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::TryStreamExt;
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash},
@@ -23,14 +23,10 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    callisto::{
-        entity_ext::generate_link,
-        mega_cl, mega_code_review_anchor, mega_refs,
-        sea_orm_active_enums::{PositionStatusEnum, RefTypeEnum},
-    },
+    callisto::{entity_ext::generate_link, mega_refs, sea_orm_active_enums::RefTypeEnum},
     ceres::{
-        api_service::{ApiHandler, cache::GitObjectCache, mono_api_service::MonoApiService},
-        code_edit::{model::collect_cl_chain, on_push::OnpushCodeEdit, utils::get_changed_files},
+        api_service::{cache::GitObjectCache, mono_api_service::MonoApiService},
+        code_edit::{model::collect_cl_chain, on_push::OnpushCodeEdit},
         merge_checker::MAX_CL_CHAIN_COMMITS,
         model::change_list::ClDiffFile,
         pack::{
@@ -45,12 +41,9 @@ use crate::{
         utils::{self, MEGA_BRANCH_NAME, is_protocol_zero_id},
     },
     config::PushPolicy,
-    contract::{
-        api::common::Pagination,
-        policy::notify::{
-            authz_barrier_enabled, authz_blob_id, mark_authz_dirty_and_compensate,
-            notify_authz_changed_best_effort,
-        },
+    contract::policy::notify::{
+        authz_barrier_enabled, authz_blob_id, mark_authz_dirty_and_compensate,
+        notify_authz_changed_best_effort,
     },
     jupiter::{
         service::push_queue_service::PushPayload,
@@ -1029,7 +1022,6 @@ impl Monorepo {
         editor
             .trigger_check(self.storage.clone(), &username, &cl)
             .await?;
-        self.reanchor_code_review_threads(&cl, &to_hash).await?;
         // Codex R1 P1-2 / R2 P1-2: commit bindings are written only now — the
         // push has been accepted (chain validated, CL updated) — and cover
         // exactly the accepted chain's *newly introduced* commits: a rejected
@@ -1321,155 +1313,6 @@ impl Monorepo {
     ) -> Result<Vec<ClDiffFile>, MegaError> {
         let api_service: MonoApiService = self.into();
         api_service.cl_files_list(old_files, new_files).await
-    }
-
-    // Mark code review threads whose anchors may be affected by this change as outdated.
-    // These threads will require reanchoring to restore accurate code positions.
-    // `to_hash` is the push chain tip (CL `to_hash`).
-    pub async fn reanchor_code_review_threads(
-        &self,
-        cl: &mega_cl::Model,
-        to_hash: &str,
-    ) -> Result<(), MegaError> {
-        let mono_api_service: MonoApiService = self.into();
-        let cl_link = cl.link.clone();
-
-        // Marks code review threads as outdated if their file paths
-        // are affected by the latest change list.
-        let changed_files = get_changed_files(&mono_api_service, cl).await?;
-        let files_with_threads = self
-            .storage
-            .code_review_thread_storage()
-            .get_files_with_threads_by_link(&cl_link)
-            .await?;
-
-        let files_with_threads_set: HashSet<&String> = files_with_threads.iter().collect();
-
-        // Intersection: files that are changed AND have threads
-        let affected_files: Vec<String> = changed_files
-            .into_iter()
-            .filter(|file| files_with_threads_set.contains(file))
-            .collect();
-
-        tracing::info!(
-            "Reanchor code review thread in cl_link: {}, affected files: {:?}",
-            cl_link,
-            affected_files
-        );
-
-        let pending_reanchor_threads = self
-            .storage
-            .code_review_thread_storage()
-            .find_threads_by_file_paths(affected_files)
-            .await?;
-
-        let pending_reanchor_thread_ids: Vec<i64> = pending_reanchor_threads
-            .iter()
-            .map(|thread| thread.id)
-            .collect();
-
-        // Mark as PendingReanchor
-        self.storage
-            .code_review_thread_storage()
-            .mark_positions_status_by_thread_ids(
-                &pending_reanchor_thread_ids,
-                PositionStatusEnum::PendingReanchor,
-            )
-            .await?;
-
-        // Start reanchor
-        let anchors = self
-            .storage
-            .code_review_thread_storage()
-            .get_anchors_by_thread_ids(&pending_reanchor_thread_ids)
-            .await?;
-
-        let mono_api_service = Arc::new(mono_api_service);
-        let mut anchors_map: HashMap<i64, Vec<mega_code_review_anchor::Model>> = HashMap::new();
-        for anchor in anchors {
-            anchors_map
-                .entry(anchor.thread_id)
-                .or_default()
-                .push(anchor);
-        }
-
-        let reanchor_tasks: Vec<_> = pending_reanchor_threads
-            .into_iter()
-            .map(|thread| {
-                let cl_link = cl_link.clone();
-                let mono_api_service = Arc::clone(&mono_api_service);
-                let anchors_map = anchors_map.clone();
-                let to_hash = to_hash.to_owned();
-
-                async move {
-                    let thread_id = thread.id;
-
-                    let thread_anchors = match anchors_map.get(&thread_id) {
-                        Some(anchors) => anchors,
-                        None => {
-                            tracing::warn!("Thread {} has no anchors", thread_id);
-                            return Err(MegaError::Other(format!(
-                                "Thread {} has no anchors",
-                                thread_id
-                            )));
-                        }
-                    };
-
-                    let (diff_content, _) = mono_api_service
-                        .paged_content_diff(&cl_link, Pagination::default())
-                        .await?;
-
-                    let mut blob_cache: HashMap<String, String> = HashMap::new();
-
-                    for anchor in thread_anchors {
-                        let file_path = anchor.file_path.clone();
-
-                        // Fetch blob once per file
-                        let latest_blob = if let Some(blob) = blob_cache.get(&file_path) {
-                            blob.clone()
-                        } else {
-                            let blob = mono_api_service
-                                .get_blob_as_string(PathBuf::from(&file_path), Some(&to_hash))
-                                .await?
-                                .expect("latest blob must exist");
-
-                            blob_cache.insert(file_path.clone(), blob.clone());
-                            blob
-                        };
-
-                        // Reanchor
-                        if let Err(e) = self
-                            .storage
-                            .code_review_service
-                            .reanchor_thread(
-                                anchor,
-                                Some(latest_blob),
-                                diff_content.clone(),
-                                &to_hash,
-                            )
-                            .await
-                        {
-                            tracing::error!("Reanchor failed for anchor {}: {:?}", anchor.id, e);
-                        }
-                    }
-
-                    Ok(())
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let results: Vec<Result<(), MegaError>> = stream::iter(reanchor_tasks)
-            .buffer_unordered(self.storage.get_recommended_batch_concurrency())
-            .collect()
-            .await;
-
-        for res in results {
-            if let Err(e) = res {
-                tracing::error!("Reanchor task failed: {:?}", e);
-            }
-        }
-
-        Ok(())
     }
 }
 

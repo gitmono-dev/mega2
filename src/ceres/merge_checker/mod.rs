@@ -17,7 +17,6 @@ use crate::{
 
 pub mod cl_sync_checker;
 mod cla_sign_checker;
-mod code_review_checker;
 mod commit_message_checker;
 pub(crate) mod gpg_signature_checker;
 
@@ -42,7 +41,6 @@ pub enum CheckType {
     ClSync,
     MergeConflict,
     CiStatus,
-    CodeReview,
     ClaSign,
 }
 
@@ -84,7 +82,6 @@ impl CheckType {
             CheckType::ClSync => "Cl sync",
             CheckType::MergeConflict => "Merge conflict",
             CheckType::CiStatus => "Ci status",
-            CheckType::CodeReview => "Code review",
             CheckType::ClaSign => "CLA sign",
         }
     }
@@ -109,25 +106,24 @@ impl CheckType {
             CheckType::CiStatus => {
                 "Verify that all required continuous integration pipelines have passed"
             }
-            CheckType::CodeReview => {
-                "Ensure the required reviewers have approved the merge request"
-            }
             CheckType::ClaSign => "Ensure the CL author has signed CLA",
         }
     }
 }
 
-impl From<CheckTypeEnum> for CheckType {
-    fn from(value: CheckTypeEnum) -> Self {
+impl TryFrom<CheckTypeEnum> for CheckType {
+    type Error = ();
+
+    fn try_from(value: CheckTypeEnum) -> Result<Self, Self::Error> {
         match value {
-            CheckTypeEnum::GpgSignature => CheckType::GpgSignature,
-            CheckTypeEnum::BranchProtection => CheckType::BranchProtection,
-            CheckTypeEnum::CommitMessage => CheckType::CommitMessage,
-            CheckTypeEnum::ClSync => CheckType::ClSync,
-            CheckTypeEnum::MergeConflict => CheckType::MergeConflict,
-            CheckTypeEnum::CiStatus => CheckType::CiStatus,
-            CheckTypeEnum::CodeReview => CheckType::CodeReview,
-            CheckTypeEnum::ClaSign => CheckType::ClaSign,
+            CheckTypeEnum::GpgSignature => Ok(CheckType::GpgSignature),
+            CheckTypeEnum::BranchProtection => Ok(CheckType::BranchProtection),
+            CheckTypeEnum::CommitMessage => Ok(CheckType::CommitMessage),
+            CheckTypeEnum::ClSync => Ok(CheckType::ClSync),
+            CheckTypeEnum::MergeConflict => Ok(CheckType::MergeConflict),
+            CheckTypeEnum::CiStatus => Ok(CheckType::CiStatus),
+            CheckTypeEnum::CodeReview => Err(()),
+            CheckTypeEnum::ClaSign => Ok(CheckType::ClaSign),
         }
     }
 }
@@ -141,7 +137,6 @@ impl From<CheckType> for CheckTypeEnum {
             CheckType::ClSync => CheckTypeEnum::ClSync,
             CheckType::MergeConflict => CheckTypeEnum::MergeConflict,
             CheckType::CiStatus => CheckTypeEnum::CiStatus,
-            CheckType::CodeReview => CheckTypeEnum::CodeReview,
             CheckType::ClaSign => CheckTypeEnum::ClaSign,
         }
     }
@@ -181,12 +176,6 @@ impl CheckerRegistry {
             }),
         );
         r.register(
-            CheckType::CodeReview,
-            Box::new(code_review_checker::CodeReviewChecker {
-                storage: storage.clone(),
-            }),
-        );
-        r.register(
             CheckType::ClaSign,
             Box::new(ClaSignChecker {
                 storage: storage.clone(),
@@ -215,7 +204,10 @@ impl CheckerRegistry {
         let mut save_models = vec![];
 
         for c_config in check_configs {
-            if let Some(checker) = self.checkers.get(&c_config.check_type_code.into()) {
+            let Ok(check_type) = CheckType::try_from(c_config.check_type_code) else {
+                continue;
+            };
+            if let Some(checker) = self.checkers.get(&check_type) {
                 let params = checker.build_params(&cl_info).await?;
                 let res = checker.run(&params).await;
                 let model = check_result::Model::new(

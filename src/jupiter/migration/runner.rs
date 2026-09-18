@@ -416,6 +416,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_code_review_check_rows() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
+        let db = test_db_connection(temp_dir.path()).await;
+
+        apply_migrations(&db, true)
+            .await
+            .expect("migrations should apply");
+
+        for table in ["path_check_configs", "check_result"] {
+            let stmt = Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "SELECT COUNT(*)::bigint AS n FROM {table} WHERE check_type_code = 'code_review';"
+                ),
+            );
+            let row = db
+                .query_one_raw(stmt)
+                .await
+                .expect("count query")
+                .expect("count row");
+            let n: i64 = row.try_get("", "n").expect("n");
+            assert_eq!(n, 0, "expected no leftover {table} code_review rows");
+        }
+
+        {
+            use sea_orm_migration::SchemaManager;
+            let manager = SchemaManager::new(&db);
+            crate::jupiter::migration::m20260919_000500_delete_code_review_check_rows::Migration
+                .down(&manager)
+                .await
+                .expect("delete_code_review_check_rows down should be a no-op Ok(())");
+        }
+    }
+
+    #[tokio::test]
     async fn test_drop_mega_issue_tables_schema() {
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temporary directory");
         let db = test_db_connection(temp_dir.path()).await;
