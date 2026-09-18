@@ -263,11 +263,7 @@ mod tests {
         .insert(&db)
         .await
         .unwrap();
-        notif
-            .upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
-        notif.set_delivery_mode("alice", "email").await.unwrap();
+        notif.upsert_user_settings("alice").await.unwrap();
 
         on_cl_comment_created(&notif, &cl_stg, &reviewer_stg, "bob", "CL1", "<review>")
             .await
@@ -348,10 +344,7 @@ mod tests {
         )
         .await
         .unwrap();
-        notif
-            .upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
+        notif.upsert_user_settings("alice").await.unwrap();
         notif
             .set_user_preference("alice", EVENT_CL_COMMENT_CREATED, false)
             .await

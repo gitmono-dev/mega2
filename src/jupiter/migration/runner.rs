@@ -347,10 +347,7 @@ mod tests {
 
         user_notification_settings::ActiveModel {
             username: Set("alice".to_owned()),
-            email: Set("alice@example.com".to_owned()),
             enabled: Set(true),
-            delivery_mode: Set("in_app".to_owned()),
-            preferred_locale: Set(Some("en-US".to_owned())),
             created_at: Set(now),
             updated_at: Set(now),
         }

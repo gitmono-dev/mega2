@@ -392,30 +392,11 @@ async fn ensure_user_notification_settings(
         .get_user_settings(&user.username)
         .await?
     {
-        let email = user.email.trim();
-        if !email.is_empty() && email != settings.email {
-            notification_storage
-                .upsert_user_settings(&user.username, email)
-                .await?;
-            return notification_storage
-                .get_user_settings(&user.username)
-                .await?
-                .ok_or_else(|| {
-                    ApiError::internal(anyhow::anyhow!("notification settings were not persisted"))
-                });
-        }
         return Ok(settings);
     }
 
-    let email = user.email.trim();
-    if email.is_empty() {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "notification email is not configured for current user"
-        )));
-    }
-
     notification_storage
-        .upsert_user_settings(&user.username, email)
+        .upsert_user_settings(&user.username)
         .await?;
     notification_storage
         .get_user_settings(&user.username)
@@ -574,19 +555,15 @@ mod tests {
 
     fn sample_settings(
         username: &str,
-        email: &str,
         enabled: bool,
         now: chrono::NaiveDateTime,
     ) -> user_notification_settings::Model {
-        let mut obj = serde_json::Map::new();
-        obj.insert("username".into(), username.into());
-        obj.insert("email".into(), email.into());
-        obj.insert("enabled".into(), enabled.into());
-        obj.insert(["de", "livery_mode"].concat(), "in_app".into());
-        obj.insert(["pre", "ferred_locale"].concat(), serde_json::Value::Null);
-        obj.insert("created_at".into(), serde_json::json!(now));
-        obj.insert("updated_at".into(), serde_json::json!(now));
-        serde_json::from_value(serde_json::Value::Object(obj)).expect("sample settings")
+        user_notification_settings::Model {
+            username: username.to_string(),
+            enabled,
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     #[test]
@@ -594,7 +571,7 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
         let response = build_notification_preferences_response(
             "alice",
-            Some(sample_settings("alice", "alice@example.com", true, now)),
+            Some(sample_settings("alice", true, now)),
             vec![
                 notification_event_types::Model {
                     code: "z.event".to_string(),

@@ -8,10 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub username: String,
-    pub email: String,
     pub enabled: bool,
-    pub delivery_mode: String,
-    pub preferred_locale: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }

@@ -129,46 +129,21 @@ impl NotificationStorage {
             .await
     }
 
-    pub async fn upsert_user_settings(
-        &self,
-        username: &str,
-        email: &str,
-    ) -> Result<(), sea_orm::DbErr> {
+    pub async fn upsert_user_settings(&self, username: &str) -> Result<(), sea_orm::DbErr> {
+        if self.get_user_settings(username).await?.is_some() {
+            return Ok(());
+        }
+
         let now = chrono::Utc::now().naive_utc();
-
-        if let Some(existing) = self.get_user_settings(username).await? {
-            let mut model: user_notification_settings::ActiveModel = existing.into();
-            model.email = Set(email.to_string());
-            model.updated_at = Set(now);
-            model.update(self.db()).await?;
-        } else {
-            user_notification_settings::ActiveModel {
-                username: Set(username.to_string()),
-                email: Set(email.to_string()),
-                enabled: Set(true),
-                delivery_mode: Set(crate::notification::service::current_default_delivery_mode()),
-                preferred_locale: Set(None),
-                created_at: Set(now),
-                updated_at: Set(now),
-            }
-            .insert(self.db())
-            .await?;
+        user_notification_settings::ActiveModel {
+            username: Set(username.to_string()),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
         }
+        .insert(self.db())
+        .await?;
 
-        Ok(())
-    }
-
-    pub async fn set_preferred_locale(
-        &self,
-        username: &str,
-        preferred_locale: Option<&str>,
-    ) -> Result<(), sea_orm::DbErr> {
-        if let Some(existing) = self.get_user_settings(username).await? {
-            let mut model: user_notification_settings::ActiveModel = existing.into();
-            model.preferred_locale = Set(preferred_locale.map(str::to_string));
-            model.updated_at = Set(chrono::Utc::now().naive_utc());
-            model.update(self.db()).await?;
-        }
         Ok(())
     }
 
@@ -231,20 +206,6 @@ impl NotificationStorage {
         if let Some(existing) = self.get_user_settings(username).await? {
             let mut model: user_notification_settings::ActiveModel = existing.into();
             model.enabled = Set(enabled);
-            model.updated_at = Set(chrono::Utc::now().naive_utc());
-            model.update(self.db()).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn set_delivery_mode(
-        &self,
-        username: &str,
-        mode: &str,
-    ) -> Result<(), sea_orm::DbErr> {
-        if let Some(existing) = self.get_user_settings(username).await? {
-            let mut model: user_notification_settings::ActiveModel = existing.into();
-            model.delivery_mode = Set(mode.to_string());
             model.updated_at = Set(chrono::Utc::now().naive_utc());
             model.update(self.db()).await?;
         }
@@ -353,10 +314,7 @@ mod tests {
         .await
         .unwrap();
 
-        storage
-            .upsert_user_settings("alice", "alice@test.com")
-            .await
-            .unwrap();
+        storage.upsert_user_settings("alice").await.unwrap();
 
         assert!(storage.should_send("alice", "test.event").await.unwrap());
 
@@ -369,52 +327,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_settings_preferred_locale_can_be_updated_and_cleared() {
+    async fn upsert_user_settings_is_idempotent_without_delivery_columns() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db = test_db_connection(temp_dir.path()).await;
 
         apply_migrations(&db, true).await.unwrap();
 
         let storage = NotificationStorage::new(Arc::new(db.clone()));
-        storage
-            .upsert_user_settings("alice", "alice@test.com")
-            .await
-            .unwrap();
+        storage.upsert_user_settings("alice").await.unwrap();
+        storage.upsert_user_settings("alice").await.unwrap();
 
-        assert_eq!(
-            storage
-                .get_user_settings("alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .preferred_locale,
-            None
-        );
-
-        storage
-            .set_preferred_locale("alice", Some("zh-CN"))
-            .await
-            .unwrap();
-        assert_eq!(
-            storage
-                .get_user_settings("alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .preferred_locale
-                .as_deref(),
-            Some("zh-CN")
-        );
-
-        storage.set_preferred_locale("alice", None).await.unwrap();
-        assert_eq!(
-            storage
-                .get_user_settings("alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .preferred_locale,
-            None
-        );
+        let settings = storage.get_user_settings("alice").await.unwrap().unwrap();
+        assert_eq!(settings.username, "alice");
+        assert!(settings.enabled);
     }
 }

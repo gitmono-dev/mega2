@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::{
     common::errors::MegaError,
-    config::{DEFAULT_NOTIFICATION_DELIVERY_MODE, reload::ConfigHandle},
+    config::reload::ConfigHandle,
     jupiter::storage::notification_storage::NotificationStorage,
     notification::{
         channels::{
@@ -100,26 +100,11 @@ impl NotificationService {
         self.enabled_fallback.load(Ordering::Relaxed)
     }
 
-    pub fn default_delivery_mode(&self) -> String {
-        DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string()
-    }
-
-    pub fn default_locale(&self) -> String {
-        "en-US".to_string()
-    }
-
     /// Keep notification-service lifetime tied to application shutdown.
     pub async fn start(self: Arc<Self>, shutdown: CancellationToken) {
         shutdown.cancelled().await;
         Self::set_active(None);
     }
-}
-
-/// Default delivery mode for new user settings rows (config-backed when active).
-pub fn current_default_delivery_mode() -> String {
-    NotificationService::active()
-        .map(|service| service.default_delivery_mode())
-        .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string())
 }
 
 fn escape_html(value: &str) -> String {
@@ -154,15 +139,11 @@ pub async fn deliver_user_notification(
         return Ok(());
     }
 
-    let Some(settings) = stg.get_user_settings(username).await? else {
-        return Ok(());
-    };
-
     let body_html = format!("<p>{}</p>", escape_html(body_text));
     let message = OutboundMessage {
         username,
         event_type_code: event_type,
-        to: &settings.email,
+        to: username,
         subject,
         body_html: &body_html,
         body_text: Some(body_text),
@@ -277,9 +258,7 @@ mod tests {
         stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
+        stg.upsert_user_settings("alice").await.unwrap();
 
         let mock = Arc::new(MockChannel::new("slack", true));
         let service = test_service(
@@ -356,13 +335,7 @@ mod tests {
         stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
-        stg.set_delivery_mode("alice", "email").await.unwrap();
-        stg.set_preferred_locale("alice", Some("zh-CN"))
-            .await
-            .unwrap();
+        stg.upsert_user_settings("alice").await.unwrap();
 
         let mail_client = Arc::new(
             WebsiteMailClient::new(
@@ -425,9 +398,7 @@ mod tests {
         stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
+        stg.upsert_user_settings("alice").await.unwrap();
 
         let mock = Arc::new(MockChannel::new("slack", true));
         let service = test_service(

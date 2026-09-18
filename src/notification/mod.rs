@@ -5,4 +5,4 @@ pub mod testing;
 pub mod triggers;
 pub mod website_mail;
 
-pub use service::{NotificationService, current_default_delivery_mode, deliver_user_notification};
+pub use service::{NotificationService, deliver_user_notification};
