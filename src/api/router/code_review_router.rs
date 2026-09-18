@@ -274,7 +274,7 @@ async fn delete_code_review_comment(
     state
         .storage
         .code_review_service
-        .delete_comment(comment_id)
+        .remove_review_comment(comment_id)
         .await?;
 
     Ok(Json(CommonResult::success(None)))

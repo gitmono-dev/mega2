@@ -290,7 +290,7 @@ impl CodeReviewService {
         Ok(thread)
     }
 
-    pub async fn delete_comment(
+    pub async fn remove_review_comment(
         &self,
         comment_id: i64,
     ) -> Result<mega_code_review_comment::Model, MegaError> {
