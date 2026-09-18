@@ -6,7 +6,7 @@ use sea_orm::{
 };
 
 use crate::{
-    callisto::{mega_conversation, reactions, sea_orm_active_enums::ConvTypeEnum},
+    callisto::{mega_conversation, sea_orm_active_enums::ConvTypeEnum},
     common::errors::MegaError,
     jupiter::{
         model::conv_dto::ConvWithReactions,
@@ -86,31 +86,14 @@ impl ConversationStorage {
     ) -> Result<Vec<ConvWithReactions>, MegaError> {
         let conversations = mega_conversation::Entity::find()
             .filter(mega_conversation::Column::Link.eq(link))
-            .find_with_related(reactions::Entity)
             .all(self.get_connection())
             .await?;
 
         let results = conversations
             .into_iter()
-            .map(|(conversation, reactions)| ConvWithReactions {
-                conversation,
-                reactions,
-            })
+            .map(|conversation| ConvWithReactions { conversation })
             .collect();
         Ok(results)
-    }
-
-    pub async fn delete_reaction(
-        &self,
-        pub_reaction_id: &str,
-        username: &str,
-    ) -> Result<(), MegaError> {
-        let _ = reactions::Entity::delete_many()
-            .filter(reactions::Column::PublicId.eq(pub_reaction_id))
-            .filter(reactions::Column::Username.eq(username))
-            .exec(self.get_connection())
-            .await?;
-        Ok(())
     }
 
     pub async fn change_review_state(

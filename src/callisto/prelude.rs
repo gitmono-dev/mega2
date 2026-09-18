@@ -29,7 +29,7 @@ pub use super::{
     oci_manifest::Entity as OciManifest, oci_tag::Entity as OciTag,
     oci_upload::Entity as OciUpload, path_check_configs::Entity as PathCheckConfigs,
     push_queue::Entity as PushQueue, queue_control::Entity as QueueControl,
-    reactions::Entity as Reactions, ssh_keys::Entity as SshKeys,
+    ssh_keys::Entity as SshKeys,
     user_notification_preferences::Entity as UserNotificationPreferences,
     user_notification_settings::Entity as UserNotificationSettings, vault::Entity as Vault,
 };

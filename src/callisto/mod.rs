@@ -74,7 +74,6 @@ pub mod oci_upload;
 pub mod path_check_configs;
 pub mod push_queue;
 pub mod queue_control;
-pub mod reactions;
 pub mod sea_orm_active_enums;
 pub mod ssh_keys;
 pub mod user_notification_preferences;

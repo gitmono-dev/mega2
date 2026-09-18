@@ -23,7 +23,6 @@ pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
 pub mod push_queue_storage;
-pub mod reaction_storage;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
@@ -71,7 +70,6 @@ use crate::{
             object_storage::MegaObjectStorageWrapper,
             oci_db_storage::OciDbStorage,
             push_queue_storage::PushQueueStorage,
-            reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
             webhook_storage::WebhookStorage,
@@ -101,7 +99,6 @@ pub struct AppService {
     pub bots_storage: BotsStorage,
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
-    pub reaction_storage: ReactionStorage,
     pub oci_db_storage: OciDbStorage,
 }
 
@@ -132,7 +129,6 @@ impl AppService {
             bots_storage: BotsStorage { base: mock.clone() },
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
-            reaction_storage: ReactionStorage { base: mock.clone() },
             oci_db_storage: OciDbStorage { base: mock.clone() },
         })
     }
@@ -224,7 +220,6 @@ impl Storage {
         let bots_storage = BotsStorage { base: base.clone() };
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
-        let reaction_storage = ReactionStorage { base: base.clone() };
         let oci_db_storage = OciDbStorage { base: base.clone() };
         let oci_service = OciService {
             oci_storage: oci_db_storage.clone(),
@@ -282,7 +277,6 @@ impl Storage {
             bots_storage,
             webhook_storage: webhook_storage.clone(),
             audit_storage,
-            reaction_storage,
             oci_db_storage,
         };
         let push_queue_service =
@@ -578,10 +572,6 @@ impl Storage {
 
     pub fn audit_storage(&self) -> AuditStorage {
         self.app_service.audit_storage.clone()
-    }
-
-    pub fn reaction_storage(&self) -> ReactionStorage {
-        self.app_service.reaction_storage.clone()
     }
 
     pub fn bots_storage(&self) -> BotsStorage {
