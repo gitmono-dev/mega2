@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::contract::api::common::CommonPage;
 
@@ -53,6 +53,29 @@ pub struct TagResponse {
 
 /// Tag list response (paged)
 pub type TagListResponse = CommonPage<TagResponse>;
+
+/// Query for `GET /tags/list` (plan-20260918 ADR-FT-02): three required keys.
+/// Missing/illegal keys fail in the axum 0.8 `Query` extractor (HTTP 400).
+#[derive(Debug, Clone, Deserialize, IntoParams, ToSchema)]
+pub struct TagListQuery {
+    pub page: u64,
+    pub per_page: u64,
+    pub path: String,
+}
+
+/// Optional `path` selector for `GET|DELETE /tags/{name}` (ADR-FT-03).
+/// Omitted or blank is `/`.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams, ToSchema)]
+pub struct TagPathQuery {
+    pub path: Option<String>,
+}
+
+pub fn normalize_tag_selector_path(path: Option<&str>) -> &str {
+    match path.map(str::trim) {
+        None | Some("") => "/",
+        Some(p) => p,
+    }
+}
 
 /// Delete tag response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

@@ -6,11 +6,11 @@ use std::sync::{
 };
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     common::errors::MegaError,
-    config::{DEFAULT_NOTIFICATION_DELIVERY_MODE, reload::ConfigHandle},
+    config::reload::ConfigHandle,
     jupiter::storage::notification_storage::NotificationStorage,
     notification::{
         channels::{
@@ -30,11 +30,10 @@ static ACTIVE: RwLock<Option<Arc<NotificationService>>> = RwLock::new(None);
 pub struct NotificationService {
     channels: Vec<Arc<dyn NotificationChannel>>,
     website_mail: Option<Arc<WebsiteMailClient>>,
-    /// When present, `enabled` / `default_delivery_mode` are read live from the
-    /// config snapshot (hot-reload safe).
+    /// When present, `enabled` is read live from the config snapshot
+    /// (hot-reload safe).
     config_handle: Option<ConfigHandle>,
     enabled_fallback: AtomicBool,
-    default_delivery_mode_fallback: RwLock<String>,
 }
 
 impl NotificationService {
@@ -44,7 +43,6 @@ impl NotificationService {
         website_mail: Option<Arc<WebsiteMailClient>>,
         config_handle: Option<ConfigHandle>,
         enabled: bool,
-        default_delivery_mode: String,
     ) -> Self {
         let mut channels: Vec<Arc<dyn NotificationChannel>> =
             Vec::with_capacity(extra_channels.len() + 1);
@@ -55,7 +53,6 @@ impl NotificationService {
             website_mail,
             config_handle,
             enabled_fallback: AtomicBool::new(enabled),
-            default_delivery_mode_fallback: RwLock::new(default_delivery_mode),
         }
     }
 
@@ -103,47 +100,11 @@ impl NotificationService {
         self.enabled_fallback.load(Ordering::Relaxed)
     }
 
-    pub fn default_delivery_mode(&self) -> String {
-        if let Some(handle) = &self.config_handle
-            && let Ok(config) = handle.snapshot()
-        {
-            return config
-                .notification
-                .as_ref()
-                .map(|cfg| cfg.default_delivery_mode.clone())
-                .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string());
-        }
-        match self.default_delivery_mode_fallback.read() {
-            Ok(mode) => mode.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    pub fn default_locale(&self) -> String {
-        if let Some(handle) = &self.config_handle
-            && let Ok(config) = handle.snapshot()
-        {
-            return config
-                .notification
-                .as_ref()
-                .map(|cfg| cfg.default_locale.clone())
-                .unwrap_or_else(|| "en-US".to_string());
-        }
-        "en-US".to_string()
-    }
-
     /// Keep notification-service lifetime tied to application shutdown.
     pub async fn start(self: Arc<Self>, shutdown: CancellationToken) {
         shutdown.cancelled().await;
         Self::set_active(None);
     }
-}
-
-/// Default delivery mode for new user settings rows (config-backed when active).
-pub fn current_default_delivery_mode() -> String {
-    NotificationService::active()
-        .map(|service| service.default_delivery_mode())
-        .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string())
 }
 
 fn escape_html(value: &str) -> String {
@@ -158,15 +119,15 @@ fn escape_html(value: &str) -> String {
 /// Deliver a product notification: honor the global kill switch, user prefs,
 /// then fan out to registered channels (in-app primary; Slack/webhook extras).
 ///
-/// When `delivery_mode=email` and a website mail client is configured, also
-/// POST the event-specific `website_payload` to the website API (best-effort).
+/// Product email is not initiated here. The leftover website-mail client stays
+/// assembled until RM-WM; this function does not call it.
 pub async fn deliver_user_notification(
     stg: &NotificationStorage,
     username: &str,
     event_type: &str,
     subject: &str,
     body_text: &str,
-    website_payload: serde_json::Value,
+    _website_payload: serde_json::Value,
 ) -> Result<(), MegaError> {
     if let Some(service) = NotificationService::active()
         && !service.is_enabled()
@@ -178,21 +139,11 @@ pub async fn deliver_user_notification(
         return Ok(());
     }
 
-    let Some(settings) = stg.get_user_settings(username).await? else {
-        return Ok(());
-    };
-
-    let delivery_mode = if settings.delivery_mode.is_empty() {
-        current_default_delivery_mode()
-    } else {
-        settings.delivery_mode.clone()
-    };
-
     let body_html = format!("<p>{}</p>", escape_html(body_text));
     let message = OutboundMessage {
         username,
         event_type_code: event_type,
-        to: &settings.email,
+        to: username,
         subject,
         body_html: &body_html,
         body_text: Some(body_text),
@@ -208,44 +159,6 @@ pub async fn deliver_user_notification(
                         channel = channel.name(),
                         error = %error,
                         "notification channel delivery failed"
-                    );
-                }
-            }
-        }
-        if delivery_mode == "email"
-            && let Some(client) = &service.website_mail
-        {
-            let locale = settings
-                .preferred_locale
-                .as_deref()
-                .map(str::trim)
-                .filter(|locale| !locale.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| service.default_locale());
-            if let Err(error) = client
-                .send(
-                    event_type,
-                    username,
-                    &settings.email,
-                    &locale,
-                    &website_payload,
-                )
-                .await
-            {
-                // A 425 is a concurrent same-key duplicate: the in-flight
-                // sibling request will deliver this email, so calling it a
-                // failure would recreate the very misreading the 409/425 split
-                // exists to prevent (website-mail.md §2.2).
-                if error.to_string().contains("HTTP 425") {
-                    debug!(
-                        event_type,
-                        "website mail: concurrent duplicate in flight; the sibling request delivers"
-                    );
-                } else {
-                    warn!(
-                        event_type,
-                        error = %error,
-                        "website mail delivery failed; notification remains available in-app"
                     );
                 }
             }
@@ -294,14 +207,7 @@ mod tests {
         extra: Vec<Arc<dyn NotificationChannel>>,
         enabled: bool,
     ) -> Arc<NotificationService> {
-        Arc::new(NotificationService::new(
-            stg,
-            extra,
-            None,
-            None,
-            enabled,
-            DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
-        ))
+        Arc::new(NotificationService::new(stg, extra, None, None, enabled))
     }
 
     #[tokio::test]
@@ -352,9 +258,7 @@ mod tests {
         stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
+        stg.upsert_user_settings("alice").await.unwrap();
 
         let mock = Arc::new(MockChannel::new("slack", true));
         let service = test_service(
@@ -387,7 +291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn email_delivery_mode_posts_to_website_and_writes_in_app() {
+    async fn configured_website_mail_is_not_invoked_from_deliver() {
         let _active_guard = ACTIVE_SERVICE_LOCK.lock().await;
         #[derive(Clone, Default)]
         struct CapturedRequest {
@@ -431,13 +335,7 @@ mod tests {
         stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
-        stg.set_delivery_mode("alice", "email").await.unwrap();
-        stg.set_preferred_locale("alice", Some("zh-CN"))
-            .await
-            .unwrap();
+        stg.upsert_user_settings("alice").await.unwrap();
 
         let mail_client = Arc::new(
             WebsiteMailClient::new(
@@ -452,7 +350,6 @@ mod tests {
             Some(mail_client),
             None,
             true,
-            DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
         ));
         NotificationService::set_active(Some(service));
 
@@ -480,16 +377,12 @@ mod tests {
             1
         );
         let captured = captured.lock().await;
-        assert_eq!(captured.authorization, "Bearer it-shared-bearer");
-        assert!(!captured.idempotency_key.is_empty());
-        let payload = captured.payload.as_ref().unwrap();
-        assert_eq!(payload["event_type"], "cl.comment.created");
-        assert_eq!(payload["recipient"]["email"], "alice@example.test");
-        assert_eq!(payload["recipient"]["username"], "alice");
-        assert_eq!(payload["locale"], "zh-CN");
-        assert_eq!(payload["payload"], website_payload);
-        assert!(payload["payload"].get("subject").is_none());
-        assert!(payload["payload"].get("body_text").is_none());
+        assert!(
+            captured.payload.is_none(),
+            "deliver must not POST website-mail after RM-02B"
+        );
+        assert!(captured.authorization.is_empty());
+        assert!(captured.idempotency_key.is_empty());
         drop(captured);
         NotificationService::set_active(None);
         server.abort();
@@ -505,9 +398,7 @@ mod tests {
         stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
             .await
             .unwrap();
-        stg.upsert_user_settings("alice", "alice@example.test")
-            .await
-            .unwrap();
+        stg.upsert_user_settings("alice").await.unwrap();
 
         let mock = Arc::new(MockChannel::new("slack", true));
         let service = test_service(

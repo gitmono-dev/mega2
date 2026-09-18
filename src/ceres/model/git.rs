@@ -44,6 +44,11 @@ fn default_create_mode() -> EditCLMode {
     EditCLMode::TryReuse(None)
 }
 
+/// ADR-FT-01: omit `is_directory` on delete/move = directory (not `None`).
+fn default_is_directory() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct CodePreviewQuery {
     #[serde(default)]
@@ -241,15 +246,18 @@ pub struct CreateEntryResult {
     pub cl_link: Option<String>,
 }
 
-/// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03): the
-/// parent `path` plus the directory `name`, same shape as create-entry minus
-/// `is_directory` / `content` / `mode`.
+/// Request body for `POST /delete-entry` (plan-20260917 ADR-LB-03,
+/// plan-20260918 ADR-FT-01): parent `path` plus `name`; `is_directory`
+/// defaults to directory so existing directory clients omit the field.
 #[derive(PartialEq, Eq, Debug, Clone, Deserialize, ToSchema)]
 pub struct DeleteEntryInfo {
     /// parent directory, rooted; `/` (or empty) means the root
     pub path: String,
-    /// name of the directory to delete
+    /// name of the directory or file to delete
     pub name: String,
+    /// `true` = Tree; `false` = Blob / BlobExecutable. Omit = `true`.
+    #[serde(default = "default_is_directory")]
+    pub is_directory: bool,
     /// web username for commit binding / CL ownership (optional)
     pub author_username: Option<String>,
     /// if true, skip build
@@ -259,7 +267,11 @@ pub struct DeleteEntryInfo {
 
 impl DeleteEntryInfo {
     pub fn commit_msg(&self) -> String {
-        format!("delete directory {}", self.name)
+        if self.is_directory {
+            format!("delete directory {}", self.name)
+        } else {
+            format!("delete file {}", self.name)
+        }
     }
 }
 
@@ -273,19 +285,23 @@ pub struct DeleteEntryResult {
     pub cl_link: Option<String>,
 }
 
-/// Request body for `POST /move-entry` (plan-20260917 ADR-LB-03): source
-/// parent + name and destination parent + name; a rename is the same parent
-/// with a different name.
+/// Request body for `POST /move-entry` (plan-20260917 ADR-LB-03,
+/// plan-20260918 ADR-FT-01): source parent + name and destination parent +
+/// name; a rename is the same parent with a different name. `is_directory`
+/// defaults to directory so existing directory clients omit the field.
 #[derive(PartialEq, Eq, Debug, Clone, Deserialize, ToSchema)]
 pub struct MoveEntryInfo {
     /// source parent directory, rooted; `/` (or empty) means the root
     pub from_path: String,
-    /// name of the directory to move
+    /// name of the directory or file to move
     pub from_name: String,
     /// destination parent directory (must already exist), rooted
     pub to_path: String,
     /// name under the destination parent
     pub to_name: String,
+    /// `true` = Tree; `false` = Blob / BlobExecutable. Omit = `true`.
+    #[serde(default = "default_is_directory")]
+    pub is_directory: bool,
     /// web username for commit binding / CL ownership (optional)
     pub author_username: Option<String>,
     /// if true, skip build
@@ -301,11 +317,16 @@ impl MoveEntryInfo {
     }
 
     pub fn commit_msg(&self) -> String {
+        let kind = if self.is_directory {
+            "directory"
+        } else {
+            "file"
+        };
         if self.is_rename() {
-            format!("rename directory {} to {}", self.from_name, self.to_name)
+            format!("rename {kind} {} to {}", self.from_name, self.to_name)
         } else {
             format!(
-                "move directory {} to {}",
+                "move {kind} {} to {}",
                 join_entry_path(&self.from_path, &self.from_name),
                 join_entry_path(&self.to_path, &self.to_name)
             )
@@ -419,16 +440,31 @@ fn delete_entry_body_matches_create_entry_path_name_rules() {
         DeleteEntryInfo {
             path: "/project".to_string(),
             name: "old-dir".to_string(),
+            is_directory: true,
             author_username: None,
             skip_build: false,
         }
     );
+    assert!(info.is_directory);
     let info: DeleteEntryInfo = serde_json::from_str(
         r#"{"path":"/project","name":"old-dir","author_username":null,"skip_build":true}"#,
     )
     .expect("full body");
     assert!(info.skip_build && info.author_username.is_none());
+    assert!(info.is_directory);
     assert_eq!(info.commit_msg(), "delete directory old-dir");
+    let file: DeleteEntryInfo =
+        serde_json::from_str(r#"{"path":"/project","name":"a.txt","is_directory":false}"#)
+            .expect("file body");
+    assert!(!file.is_directory);
+    assert_eq!(file.commit_msg(), "delete file a.txt");
+    assert!(
+        serde_json::from_str::<DeleteEntryInfo>(
+            r#"{"path":"/project","name":"x","is_directory":null}"#
+        )
+        .is_err(),
+        "null is_directory is not omit"
+    );
     assert!(
         serde_json::from_str::<DeleteEntryInfo>(r#"{"name":"x"}"#).is_err(),
         "path is required"
@@ -503,6 +539,7 @@ fn move_entry_body_and_rename_same_parent() {
             from_name: "old-dir".to_string(),
             to_path: "/project/other".to_string(),
             to_name: "new-dir".to_string(),
+            is_directory: true,
             author_username: None,
             skip_build: false,
         }
@@ -530,6 +567,7 @@ fn move_entry_body_and_rename_same_parent() {
         from_name: from_name.to_string(),
         to_path: to_path.to_string(),
         to_name: to_name.to_string(),
+        is_directory: true,
         author_username: None,
         skip_build: true,
     };
@@ -541,6 +579,20 @@ fn move_entry_body_and_rename_same_parent() {
     assert_eq!(
         rename("/project", "/project", "a", "b").commit_msg(),
         "rename directory a to b"
+    );
+    assert!(info.is_directory);
+    let file: MoveEntryInfo = serde_json::from_str(
+        r#"{"from_path":"/project","from_name":"a.txt","to_path":"/project","to_name":"b.txt","is_directory":false}"#,
+    )
+    .expect("file body");
+    assert!(!file.is_directory);
+    assert_eq!(file.commit_msg(), "rename file a.txt to b.txt");
+    assert!(
+        serde_json::from_str::<MoveEntryInfo>(
+            r#"{"from_path":"/p","from_name":"a","to_path":"/p","to_name":"b","is_directory":null}"#
+        )
+        .is_err(),
+        "null is_directory is not omit"
     );
 
     assert_eq!(normalize_parent_path(""), "/");

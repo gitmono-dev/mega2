@@ -1376,6 +1376,18 @@ mod tests {
         );
     }
 
+    fn assert_tags_list_is_get_only(api: &utoipa::openapi::OpenApi) {
+        let item = api
+            .paths
+            .paths
+            .iter()
+            .find(|(k, _)| k.ends_with("/tags/list"))
+            .map(|(_, v)| v)
+            .expect("/tags/list");
+        assert!(item.get.is_some(), "list must be GET");
+        assert!(item.post.is_none(), "list must not be POST");
+    }
+
     #[test]
     fn storage_only_openapi_includes_writes_omits_cl_auth_user() {
         let api = storage_only_openapi_doc(false, false);
@@ -1412,6 +1424,7 @@ mod tests {
                 "storage-only OpenAPI must include {needle} (LB-04): {paths:?}"
             );
         }
+        assert_tags_list_is_get_only(&api);
         assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
             "storage-only OpenAPI must include /edit/save: {paths:?}"
@@ -1593,6 +1606,7 @@ mod tests {
                 "trunk OpenAPI must include {needle} (LB-04): {paths:?}"
             );
         }
+        assert_tags_list_is_get_only(&api);
         assert!(
             paths.iter().any(|p| p.contains("/edit/save")),
             "trunk OpenAPI must include /edit/save: {paths:?}"
@@ -1671,6 +1685,7 @@ mod tests {
                 "OAuth OpenAPI must include {needle} (LB-04): {paths:?}"
             );
         }
+        assert_tags_list_is_get_only(&api);
     }
 
     #[tokio::test]

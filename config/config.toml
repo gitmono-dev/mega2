@@ -250,14 +250,8 @@ batch_limit = 100
 [notification]
 # Global notification kill switch.
 enabled = true
-# Defaults applied for users that have no explicit notification setting yet.
-# `in_app` is primary. `email` remains a compatibility preference: it also
-# writes in-app now and will request website email delivery in MN-05.
-default_delivery_mode = "in_app"
-# Default locale for rendered notifications when a user has none.
-default_locale = "en-US"
 # Optional website-owned product-email client. Leave both values unset to keep
-# email delivery disabled; `delivery_mode = "email"` still writes in-app.
+# the leftover website-mail client unconfigured until RM-WM.
 # Production requires the SecretRef form (set through `config secret set
 # notification/website_mail/bearer`); the literal bearer is IT-only.
 # website_mail_base_url = "https://website.internal"

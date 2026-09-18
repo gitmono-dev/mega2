@@ -836,6 +836,18 @@ impl EntryCase {
         to_path: &str,
         to_name: &str,
     ) -> (u16, Value) {
+        self.move_entry_as(auth, from_path, from_name, to_path, to_name, true)
+    }
+
+    fn move_entry_as(
+        &self,
+        auth: Option<&str>,
+        from_path: &str,
+        from_name: &str,
+        to_path: &str,
+        to_name: &str,
+        is_directory: bool,
+    ) -> (u16, Value) {
         self.post(
             "move-entry",
             auth,
@@ -844,10 +856,37 @@ impl EntryCase {
                 "from_name": from_name,
                 "to_path": to_path,
                 "to_name": to_name,
+                "is_directory": is_directory,
                 "author_username": LB02_AUTHOR,
                 "skip_build": true
             }),
         )
+    }
+
+    /// `(name, oid)` pairs of `GET /tree/content-hash?path=` (blob oid for files).
+    fn tree_oids(&self, path: &str) -> Vec<(String, String)> {
+        let response = self
+            .client
+            .get(format!("{}/tree/content-hash?path={path}", self.api))
+            .send()
+            .expect("GET /tree/content-hash");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "GET /tree/content-hash?path={path}"
+        );
+        let json: Value = response.json().expect("content-hash json");
+        json["data"]
+            .as_array()
+            .expect("content-hash data")
+            .iter()
+            .map(|item| {
+                (
+                    item["name"].as_str().expect("hash item name").to_owned(),
+                    item["oid"].as_str().expect("hash item oid").to_owned(),
+                )
+            })
+            .collect()
     }
 
     /// `(name, content_type)` pairs of `GET /tree?path=`.
@@ -876,12 +915,23 @@ impl EntryCase {
     }
 
     fn delete_entry(&self, auth: Option<&str>, path: &str, name: &str) -> (u16, Value) {
+        self.delete_entry_as(auth, path, name, true)
+    }
+
+    fn delete_entry_as(
+        &self,
+        auth: Option<&str>,
+        path: &str,
+        name: &str,
+        is_directory: bool,
+    ) -> (u16, Value) {
         self.post(
             "delete-entry",
             auth,
             serde_json::json!({
                 "path": path,
                 "name": name,
+                "is_directory": is_directory,
                 "author_username": LB02_AUTHOR,
                 "skip_build": true
             }),
@@ -1071,6 +1121,64 @@ fn delete_entry_reject_file_400() {
         path_tip(case.db_url(), "/project"),
         tip_before,
         "rejected delete must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_file_success() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "ft02-file.txt", false);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.delete_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft02-file.txt",
+        false,
+    );
+    assert_eq!(status, 200, "deleting a file must 200: {json}");
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert!(json["data"]["cl_link"].is_null(), "{json}");
+    assert_eq!(
+        json["data"]["path"],
+        Value::String("/project/ft02-file.txt".to_string()),
+        "{json}"
+    );
+    assert!(
+        json["data"].get("new_oid").is_none(),
+        "delete-entry has no new_oid: {json}"
+    );
+    assert_ne!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "file delete must advance /project tip"
+    );
+    let after = case.tree_names("/project");
+    assert!(
+        after.iter().all(|n| n != "ft02-file.txt"),
+        "deleted file must vanish: {after:?}"
+    );
+    case.finish();
+}
+
+#[test]
+fn delete_entry_reject_directory_as_file_400() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "ft02-dir", true);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) =
+        case.delete_entry_as(Some(&EntryCase::bearer()), "/project", "ft02-dir", false);
+    assert_eq!(status, 400, "directory as file must 400: {json}");
+    assert!(
+        err_message(&json).contains("is not a file"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected file-mode delete must not advance tip"
     );
     case.finish();
 }
@@ -1460,6 +1568,121 @@ fn move_entry_reject_file_source() {
 }
 
 #[test]
+fn move_entry_file_success_preserves_oid() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let created = case.create_entry(Some(&EntryCase::bearer()), "ft03-file.txt", false);
+    let oid = created["data"]["new_oid"]
+        .as_str()
+        .expect("create-entry new_oid")
+        .to_owned();
+    assert!(!oid.is_empty(), "{created}");
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.move_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft03-file.txt",
+        "/project",
+        "ft03-moved.txt",
+        false,
+    );
+    assert_eq!(status, 200, "moving a file must 200: {json}");
+    assert_eq!(json["req_result"], Value::Bool(true), "{json}");
+    assert!(json["data"]["cl_link"].is_null(), "{json}");
+    assert_eq!(
+        json["data"]["from_path"],
+        Value::String("/project/ft03-file.txt".to_string()),
+        "{json}"
+    );
+    assert_eq!(
+        json["data"]["to_path"],
+        Value::String("/project/ft03-moved.txt".to_string()),
+        "{json}"
+    );
+    assert!(
+        json["data"].get("new_oid").is_none(),
+        "move-entry has no new_oid: {json}"
+    );
+    assert_ne!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "file move must advance /project tip"
+    );
+    let entries = case.tree_entries("/project");
+    assert!(
+        entries.iter().all(|(n, _)| n != "ft03-file.txt"),
+        "source name must vanish: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(n, t)| n == "ft03-moved.txt" && t == "file"),
+        "destination must list the moved file: {entries:?}"
+    );
+    let after_oid = case
+        .tree_oids("/project")
+        .into_iter()
+        .find(|(n, _)| n == "ft03-moved.txt")
+        .map(|(_, o)| o)
+        .expect("moved file oid");
+    assert_eq!(after_oid, oid, "file move must keep the same blob oid");
+    case.finish();
+}
+
+#[test]
+fn move_entry_reject_directory_as_file_400() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    case.create_entry(Some(&EntryCase::bearer()), "ft03-dir", true);
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.move_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft03-dir",
+        "/project",
+        "ft03-dir-as-file",
+        false,
+    );
+    assert_eq!(status, 400, "directory as file must 400: {json}");
+    assert!(
+        err_message(&json).contains("is not a file"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected file-mode move must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
+fn move_entry_reject_missing_file_404() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config());
+    case.seed();
+    let tip_before = path_tip(case.db_url(), "/project");
+    let (status, json) = case.move_entry_as(
+        Some(&EntryCase::bearer()),
+        "/project",
+        "ft03-absent.txt",
+        "/project",
+        "ft03-elsewhere.txt",
+        false,
+    );
+    assert_eq!(status, 404, "missing file name must 404: {json}");
+    assert!(
+        err_message(&json).contains("not found"),
+        "diagnosable message expected: {json}"
+    );
+    assert_eq!(
+        path_tip(case.db_url(), "/project"),
+        tip_before,
+        "rejected missing-name move must not advance tip"
+    );
+    case.finish();
+}
+
+#[test]
 fn move_entry_reject_root() {
     let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
     for (from_path, from_name) in [("/", ""), ("", "")] {
@@ -1823,14 +2046,11 @@ fn tag_body(name: &str, path_context: Option<&str>, message: Option<&str>) -> Va
     body
 }
 
-fn list_body(additional: &str) -> Value {
-    serde_json::json!({ "pagination": { "page": 1, "per_page": 20 }, "additional": additional })
-}
-
-/// `POST /tags/list` without Authorization; returns the page's tag names.
-fn list_tag_names(case: &EntryCase, additional: &str) -> Vec<String> {
-    let (status, json) = case.post("tags/list", None, list_body(additional));
-    assert_eq!(status, 200, "tags/list ({additional}) must 200: {json}");
+/// `GET /tags/list` without Authorization; returns the page's tag names.
+fn list_tag_names(case: &EntryCase, path: &str) -> Vec<String> {
+    let route = format!("tags/list?page=1&per_page=20&path={path}");
+    let (status, json) = case.get(&route, None);
+    assert_eq!(status, 200, "tags/list ({path}) must 200: {json}");
     assert!(json["data"]["total"].is_u64(), "{json}");
     json["data"]["items"]
         .as_array()
@@ -1878,7 +2098,8 @@ fn tag_create_unauth_401() {
         .collect();
     assert!(codes.iter().any(|c| c == "200"), "{codes:?}");
     assert!(codes.iter().all(|c| c != "201"), "{codes:?}");
-    assert!(doc["paths"]["/api/v1/tags/list"]["post"].is_object());
+    assert!(doc["paths"]["/api/v1/tags/list"]["get"].is_object());
+    assert!(doc["paths"]["/api/v1/tags/list"]["post"].is_null());
     assert!(doc["paths"]["/api/v1/tags/{name}"]["get"].is_object());
     assert!(doc["paths"]["/api/v1/tags/{name}"]["delete"].is_object());
     let paths: Vec<&String> = doc["paths"].as_object().expect("paths").keys().collect();
@@ -2083,23 +2304,116 @@ fn tag_review_form_no_trunk_gate() {
     case.finish();
 }
 
-/// LB-04 AC-5: `POST /tags/list` needs both `pagination` and `additional`
-/// (no serde defaults) — a body missing either is rejected by the JSON
-/// extractor (422), a complete body is 200 with `{ total, items }`.
+/// FT-04: GET list requires `page`, `per_page`, `path` (extractor 400);
+/// `per_page=0` is handler 400; POST is 405.
 #[test]
-fn tag_list_requires_both_keys() {
+fn tag_list_requires_query_keys() {
     let case = EntryCase::boot(ApiWriteEnv::with_token_config());
-    let (status, json) = case.post(
-        "tags/list",
-        None,
-        serde_json::json!({ "pagination": { "page": 1, "per_page": 20 } }),
+    let (status, json) = case.get("tags/list", None);
+    assert_eq!(status, 400, "missing query must 400: {json}");
+    let (status, json) = case.get("tags/list?page=1&per_page=20", None);
+    assert_eq!(status, 400, "missing path must 400: {json}");
+    let (status, json) = case.get("tags/list?page=1&path=/", None);
+    assert_eq!(status, 400, "missing per_page must 400: {json}");
+    let (status, json) = case.get("tags/list?page=1&per_page=0&path=/", None);
+    assert_eq!(status, 400, "per_page=0 must 400: {json}");
+    assert!(
+        err_message(&json).contains("per_page must be >= 1"),
+        "{json}"
     );
-    assert_eq!(status, 422, "missing additional must be rejected: {json}");
-    let (status, json) = case.post("tags/list", None, serde_json::json!({ "additional": "/" }));
-    assert_eq!(status, 422, "missing pagination must be rejected: {json}");
-    let (status, json) = case.post("tags/list", None, list_body("/"));
+    let (status, json) = case.post("tags/list", None, serde_json::json!({}));
+    assert_eq!(status, 405, "POST list must 405: {json}");
+    let (status, json) = case.get("tags/list?page=1&per_page=20&path=/", None);
     assert_eq!(status, 200, "{json}");
     assert!(json["data"]["total"].is_u64(), "{json}");
     assert!(json["data"]["items"].is_array(), "{json}");
     case.finish();
+}
+
+/// FT-06: same tag name at `/` and `/project` is isolated by `?path=`.
+#[test]
+fn tag_path_isolation_same_name() {
+    let case = EntryCase::boot(ApiWriteEnv::with_token_config_paths(None));
+    let bearer = EntryCase::bearer();
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-same", None, Some("root tag")),
+    );
+    assert_eq!(status, 200, "root create: {json}");
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-same", Some("/project"), Some("project tag")),
+    );
+    assert_eq!(status, 200, "project create: {json}");
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-same", Some("/project"), Some("dup")),
+    );
+    assert_eq!(status, 400, "same path_context duplicate must 400: {json}");
+
+    let (status, json) = case.get("tags/ft06-same", None);
+    assert_eq!(status, 200, "omit path is /: {json}");
+    assert_eq!(json["data"]["message"], Value::String("root tag".into()));
+    let (status, json) = case.get("tags/ft06-same?path=/project", None);
+    assert_eq!(status, 200, "project get: {json}");
+    assert_eq!(json["data"]["message"], Value::String("project tag".into()));
+    let (status, json) = case.get("tags/ft06-same?path=/other", None);
+    assert_eq!(status, 404, "other path: {json}");
+
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-root-only", None, Some("root only")),
+    );
+    assert_eq!(status, 200, "root-only create: {json}");
+    let (status, json) = case.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-proj-only", Some("/project"), Some("proj only")),
+    );
+    assert_eq!(status, 200, "project-only create: {json}");
+    let root_names = list_tag_names(&case, "/");
+    let project_names = list_tag_names(&case, "/project");
+    assert!(
+        root_names.iter().any(|n| n == "ft06-same"),
+        "{root_names:?}"
+    );
+    assert!(
+        project_names.iter().any(|n| n == "ft06-same"),
+        "{project_names:?}"
+    );
+    assert!(
+        root_names.iter().any(|n| n == "ft06-root-only")
+            && root_names.iter().all(|n| n != "ft06-proj-only"),
+        "list / must filter annotated tags: {root_names:?}"
+    );
+    assert!(
+        project_names.iter().any(|n| n == "ft06-proj-only")
+            && project_names.iter().all(|n| n != "ft06-root-only"),
+        "list /project must filter annotated tags: {project_names:?}"
+    );
+
+    let (status, json) = case.delete("tags/ft06-same?path=/project", Some(&bearer));
+    assert_eq!(status, 200, "delete project: {json}");
+    let (status, json) = case.get("tags/ft06-same?path=/project", None);
+    assert_eq!(status, 404, "project gone: {json}");
+    let (status, json) = case.get("tags/ft06-same", None);
+    assert_eq!(status, 200, "root remains: {json}");
+    case.finish();
+
+    let scoped = EntryCase::boot(ApiWriteEnv::with_token_config());
+    let (status, json) = scoped.post(
+        "tags",
+        Some(&bearer),
+        tag_body("ft06-scoped", Some("/project"), Some("scoped")),
+    );
+    assert_eq!(status, 200, "scoped create: {json}");
+    let (status, json) = scoped.delete("tags/ft06-scoped?path=/project", Some(&bearer));
+    assert_eq!(status, 200, "scoped token delete at /project: {json}");
+    let (status, json) = scoped.delete("tags/ft06-scoped", Some(&bearer));
+    assert_eq!(status, 403, "scoped token delete at / must 403: {json}");
+    scoped.finish();
 }

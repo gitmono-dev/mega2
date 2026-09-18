@@ -49,7 +49,7 @@
 | 操作 | HTTP（OpenAPI 登记） |
 |---|---|
 | 创建 | `POST` … `/tags` |
-| 列表 | `POST` … `/tags/list`（body `PageParams<String>`：`pagination` 与 `additional` 两键均必填；列 root 送 `additional: "/"`） |
+| 列表 | `GET` … `/tags/list`（必填 query `page`、`per_page`、`path`；列 root 送 `path=/`；`POST` 为 405） |
 | 查询 | `GET` … `/tags/{name}` |
 | 删除 | `DELETE` … `/tags/{name}` |
 

@@ -433,15 +433,12 @@ impl Default for ArtifactGcConfig {
 }
 
 pub const DEFAULT_NOTIFICATION_DELIVERY_MODE: &str = "in_app";
-/// `email` remains an accepted preference while MN-05 wires website delivery;
-/// both modes write an in-app notification.
-pub const NOTIFICATION_DELIVERY_MODES: &[&str] = &["in_app", "email"];
 
 /// Global notification subsystem configuration.
 ///
 /// This is the global layer above per-user DB preferences (docs/notification.md
-/// phase 5): a global kill switch plus defaults applied when a user has no
-/// explicit setting. The defaults are read at consumption time.
+/// phase 5): a global kill switch. Per-user delivery defaults live on the
+/// settings row until RM-02D.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NotificationConfig {
     /// Global kill switch. When false notification delivery is gated off
@@ -449,12 +446,6 @@ pub struct NotificationConfig {
     /// snapshot by the active notification service).
     #[serde(default = "default_notification_enabled")]
     pub enabled: bool,
-    /// Default delivery mode for users without an explicit setting.
-    #[serde(default = "default_notification_delivery_mode")]
-    pub default_delivery_mode: String,
-    /// Default locale for rendered notifications when a user has none.
-    #[serde(default = "default_notification_locale")]
-    pub default_locale: String,
     /// Base URL for the website internal product-email API. Empty disables the
     /// optional client; when set, exactly one bearer source is required.
     #[serde(default)]
@@ -509,19 +500,11 @@ pub struct WebhookConfig {
 fn default_notification_enabled() -> bool {
     true
 }
-fn default_notification_delivery_mode() -> String {
-    DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string()
-}
-fn default_notification_locale() -> String {
-    "en-US".to_string()
-}
 
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: default_notification_enabled(),
-            default_delivery_mode: default_notification_delivery_mode(),
-            default_locale: default_notification_locale(),
             website_mail_base_url: String::new(),
             website_mail_bearer: None,
             website_mail_bearer_ref: None,

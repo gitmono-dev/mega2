@@ -3,7 +3,7 @@ use std::path::Path as StdPath;
 use anyhow::anyhow;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -12,9 +12,12 @@ use crate::{
     api::{
         MonoApiServiceState, api_doc::TAG_MANAGE, router::preview_router::trunk_write_requester,
     },
-    ceres::model::tag::{CreateTagRequest, DeleteTagResponse, TagListResponse, TagResponse},
+    ceres::model::tag::{
+        CreateTagRequest, DeleteTagResponse, TagListQuery, TagListResponse, TagPathQuery,
+        TagResponse, normalize_tag_selector_path,
+    },
     common::errors::{ApiError, map_ceres_error},
-    contract::api::common::{CommonResult, PageParams},
+    contract::api::common::{CommonResult, Pagination},
 };
 
 pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
@@ -210,26 +213,33 @@ async fn create_tag(
     Ok(Json(CommonResult::success(Some(response))))
 }
 
-/// List all Tags
+/// List tags (plan-20260918 ADR-FT-02): GET-only; POST is not registered (405).
 #[utoipa::path(
-    post,
+    get,
     path = "/tags/list",
-    request_body = PageParams<String>,
+    params(TagListQuery),
     responses(
         (status = 200, body = CommonResult<TagListResponse>, content_type = "application/json")
     ),
     tag = TAG_MANAGE
 )]
-
 async fn list_tags(
     State(state): State<MonoApiServiceState>,
-    Json(json): Json<PageParams<String>>,
+    Query(query): Query<TagListQuery>,
 ) -> Result<Json<CommonResult<TagListResponse>>, ApiError> {
-    let pagination = json.pagination;
-    let repo_path_ref = if json.additional.trim().is_empty() {
+    if query.per_page == 0 {
+        return Err(ApiError::bad_request(anyhow!(
+            "[code:400] per_page must be >= 1"
+        )));
+    }
+    let pagination = Pagination {
+        page: query.page,
+        per_page: query.per_page,
+    };
+    let repo_path_ref = if query.path.trim().is_empty() {
         "/"
     } else {
-        json.additional.as_str()
+        query.path.trim()
     };
     let api = state
         .api_handler(std::path::Path::new(repo_path_ref))
@@ -263,6 +273,7 @@ async fn list_tags(
 #[utoipa::path(
     get,
     path = "/tags/{name}",
+    params(TagPathQuery),
     responses(
         (status = 200, body = CommonResult<TagResponse>, content_type = "application/json"),
         (status = 404, body = CommonResult<String>, content_type = "application/json")
@@ -272,8 +283,9 @@ async fn list_tags(
 async fn get_tag(
     State(state): State<MonoApiServiceState>,
     Path(name): Path<String>,
+    Query(query): Query<TagPathQuery>,
 ) -> Result<Json<CommonResult<TagResponse>>, ApiError> {
-    let repo_path = "/".to_string();
+    let repo_path = normalize_tag_selector_path(query.path.as_deref()).to_string();
     let api = state
         .api_handler(std::path::Path::new(&repo_path))
         .await
@@ -305,13 +317,12 @@ async fn get_tag(
 
 /// Delete Tag
 ///
-/// plan-20260917 LB-04 (ADR-LB-05 item 5): delete has no body, so on trunk /
-/// storage-only the authorization path is fixed to `/` — a token whose
-/// `paths` does not cover `/` gets 403 on every tag delete. Checked before
-/// any storage access.
+/// plan-20260918 ADR-FT-03: delete authorization path is the `path` selector
+/// (omit / blank = `/`). Checked before any storage access.
 #[utoipa::path(
     delete,
     path = "/tags/{name}",
+    params(TagPathQuery),
     responses(
         (status = 200, body = CommonResult<DeleteTagResponse>, content_type = "application/json"),
         (status = 404, body = CommonResult<String>, content_type = "application/json")
@@ -322,9 +333,10 @@ async fn delete_tag(
     State(state): State<MonoApiServiceState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<TagPathQuery>,
 ) -> Result<Json<CommonResult<DeleteTagResponse>>, ApiError> {
-    trunk_write_requester(&state, &headers, "/")?;
-    let repo_path = "/".to_string(); // use root for delete operations by default
+    let repo_path = normalize_tag_selector_path(query.path.as_deref()).to_string();
+    trunk_write_requester(&state, &headers, &repo_path)?;
     let api = state
         .api_handler(std::path::Path::new(&repo_path))
         .await
@@ -363,14 +375,9 @@ fn tag_routes_registered_on_storage_only_routers() {
         item.get.is_some() && item.delete.is_some(),
         "get + delete on /tags/{{name}}"
     );
-    assert!(
-        api.paths
-            .paths
-            .get("/tags/list")
-            .and_then(|i| i.post.as_ref())
-            .is_some(),
-        "list stays POST"
-    );
+    let list = api.paths.paths.get("/tags/list").expect("/tags/list");
+    assert!(list.get.is_some(), "list is GET");
+    assert!(list.post.is_none(), "list is not POST");
 }
 
 /// LB-04 AC-6: the create-tag OpenAPI response is the handler's real status,
@@ -456,6 +463,7 @@ async fn tag_writes_call_trunk_write_requester() {
         State(state.clone()),
         HeaderMap::new(),
         Path("lb04-v1".to_owned()),
+        Query(TagPathQuery::default()),
     )
     .await
     else {
@@ -479,6 +487,7 @@ async fn tag_writes_call_trunk_write_requester() {
         State(state.clone()),
         headers.clone(),
         Path("lb04-v1".to_owned()),
+        Query(TagPathQuery::default()),
     )
     .await
     else {
