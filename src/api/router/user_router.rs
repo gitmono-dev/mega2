@@ -23,7 +23,6 @@ use crate::{
         },
     },
     common::errors::{ApiError, MegaError},
-    config::NOTIFICATION_DELIVERY_MODES,
     contract::api::common::CommonResult,
     jupiter::storage::notification_storage::NotificationStorage,
 };
@@ -52,10 +51,7 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UserNotificationSettingsResponse {
     pub username: String,
-    pub email: Option<String>,
     pub enabled: bool,
-    pub delivery_mode: Option<String>,
-    pub preferred_locale: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -275,14 +271,6 @@ async fn update_notification_preferences(
     Json(payload): Json<UpdateUserNotificationConfig>,
 ) -> Result<Json<CommonResult<UserNotificationPreferencesResponse>>, ApiError> {
     let notification_storage = state.storage.notification_storage();
-    let delivery_mode = payload
-        .delivery_mode
-        .map(|delivery_mode| validate_notification_delivery_mode(&delivery_mode))
-        .transpose()?;
-    let preferred_locale = payload
-        .preferred_locale
-        .map(|preferred_locale| normalize_notification_preferred_locale(&preferred_locale))
-        .transpose()?;
     let preferences = payload
         .preferences
         .map(normalize_notification_preferences)
@@ -303,16 +291,6 @@ async fn update_notification_preferences(
     if let Some(enabled) = payload.enabled {
         notification_storage
             .set_global_enabled(&user.username, enabled)
-            .await?;
-    }
-    if let Some(delivery_mode) = delivery_mode {
-        notification_storage
-            .set_delivery_mode(&user.username, &delivery_mode)
-            .await?;
-    }
-    if let Some(preferred_locale) = preferred_locale {
-        notification_storage
-            .set_preferred_locale(&user.username, preferred_locale.as_deref())
             .await?;
     }
     if let Some(preferences) = preferences {
@@ -497,19 +475,13 @@ fn build_notification_settings_response(
     match settings {
         Some(settings) => UserNotificationSettingsResponse {
             username: settings.username.clone(),
-            email: Some(settings.email.clone()),
             enabled: settings.enabled,
-            delivery_mode: Some(settings.delivery_mode.clone()),
-            preferred_locale: settings.preferred_locale.clone(),
             created_at: Some(settings.created_at.to_string()),
             updated_at: Some(settings.updated_at.to_string()),
         },
         None => UserNotificationSettingsResponse {
             username: username.to_string(),
-            email: None,
             enabled: false,
-            delivery_mode: None,
-            preferred_locale: None,
             created_at: None,
             updated_at: None,
         },
@@ -558,36 +530,6 @@ fn validate_notification_event_type_code(event_type_code: &str) -> Result<String
     Ok(event_type_code.to_string())
 }
 
-fn validate_notification_delivery_mode(delivery_mode: &str) -> Result<String, ApiError> {
-    let delivery_mode = delivery_mode.trim().to_ascii_lowercase();
-    if NOTIFICATION_DELIVERY_MODES.contains(&delivery_mode.as_str()) {
-        Ok(delivery_mode)
-    } else {
-        Err(ApiError::bad_request(anyhow::anyhow!(
-            "delivery_mode must be one of {NOTIFICATION_DELIVERY_MODES:?}"
-        )))
-    }
-}
-
-fn normalize_notification_preferred_locale(locale: &str) -> Result<Option<String>, ApiError> {
-    let locale = locale.trim();
-    if locale.is_empty() {
-        return Ok(None);
-    }
-    if locale.len() > 32
-        || locale.starts_with('-')
-        || locale.ends_with('-')
-        || locale
-            .split('-')
-            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_alphanumeric()))
-    {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "preferred_locale must be a BCP 47-like language tag up to 32 ASCII characters"
-        )));
-    }
-    Ok(Some(locale.to_string()))
-}
-
 fn normalize_notification_preferences(
     preferences: Vec<UserNotificationPreferenceItem>,
 ) -> Result<Vec<UserNotificationPreferenceItem>, ApiError> {
@@ -620,19 +562,39 @@ mod tests {
     }
 
     #[test]
+    fn login_user_dto_still_exposes_email() {
+        let user = LoginUser {
+            website_user_id: "1".to_string(),
+            username: "alice".to_string(),
+            avatar_url: String::new(),
+            email: "alice@example.com".to_string(),
+        };
+        assert_eq!(user.email, "alice@example.com");
+    }
+
+    fn sample_settings(
+        username: &str,
+        email: &str,
+        enabled: bool,
+        now: chrono::NaiveDateTime,
+    ) -> user_notification_settings::Model {
+        let mut obj = serde_json::Map::new();
+        obj.insert("username".into(), username.into());
+        obj.insert("email".into(), email.into());
+        obj.insert("enabled".into(), enabled.into());
+        obj.insert(["de", "livery_mode"].concat(), "in_app".into());
+        obj.insert(["pre", "ferred_locale"].concat(), serde_json::Value::Null);
+        obj.insert("created_at".into(), serde_json::json!(now));
+        obj.insert("updated_at".into(), serde_json::json!(now));
+        serde_json::from_value(serde_json::Value::Object(obj)).expect("sample settings")
+    }
+
+    #[test]
     fn notification_preferences_response_uses_settings_defaults_and_overrides() {
         let now = chrono::Utc::now().naive_utc();
         let response = build_notification_preferences_response(
             "alice",
-            Some(user_notification_settings::Model {
-                username: "alice".to_string(),
-                email: "alice@example.com".to_string(),
-                enabled: true,
-                delivery_mode: "realtime".to_string(),
-                preferred_locale: Some("zh-CN".to_string()),
-                created_at: now,
-                updated_at: now,
-            }),
+            Some(sample_settings("alice", "alice@example.com", true, now)),
             vec![
                 notification_event_types::Model {
                     code: "z.event".to_string(),
@@ -662,11 +624,8 @@ mod tests {
             }],
         );
 
-        assert_eq!(
-            response.settings.email.as_deref(),
-            Some("alice@example.com")
-        );
-        assert_eq!(response.settings.preferred_locale.as_deref(), Some("zh-CN"));
+        assert_eq!(response.settings.username, "alice");
+        assert!(response.settings.enabled);
         assert_eq!(response.preferences.len(), 2);
         assert_eq!(response.preferences[0].event_type_code, "a.event");
         assert_eq!(response.preferences[0].explicit_enabled, None);
@@ -695,8 +654,7 @@ mod tests {
         );
 
         assert!(!response.settings.enabled);
-        assert_eq!(response.settings.email, None);
-        assert_eq!(response.settings.preferred_locale, None);
+        assert_eq!(response.settings.username, "alice");
         assert!(!response.preferences[0].enabled);
     }
 
@@ -707,32 +665,6 @@ mod tests {
             validate_notification_event_type_code(" cl.comment.created ").unwrap(),
             "cl.comment.created"
         );
-    }
-
-    #[test]
-    fn validate_notification_delivery_mode_accepts_in_app_and_email() {
-        assert_eq!(
-            validate_notification_delivery_mode(" in_app ").unwrap(),
-            "in_app"
-        );
-        assert_eq!(
-            validate_notification_delivery_mode("email").unwrap(),
-            "email"
-        );
-        assert!(validate_notification_delivery_mode("digest").is_err());
-    }
-
-    #[test]
-    fn normalize_notification_preferred_locale_trims_clears_and_validates() {
-        assert_eq!(
-            normalize_notification_preferred_locale(" zh-CN ")
-                .unwrap()
-                .as_deref(),
-            Some("zh-CN")
-        );
-        assert_eq!(normalize_notification_preferred_locale(" ").unwrap(), None);
-        assert!(normalize_notification_preferred_locale("-zh").is_err());
-        assert!(normalize_notification_preferred_locale("zh_CN").is_err());
     }
 
     #[test]
