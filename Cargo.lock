@@ -4166,7 +4166,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mega2"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -4366,8 +4366,9 @@ dependencies = [
 
 [[package]]
 name = "mst2-codec"
-version = "0.2.0"
-source = "git+https://github.com/gitmono-dev/mst2-codec?tag=v0.2.0#9f05e3f19195e0fb67568ca566827257634759c3"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a83966abccfebdbee64d702c76273aaf819ca24ad61c420e15208df6f8c4fdb"
 dependencies = [
  "sha2 0.10.9",
  "zstd",
@@ -8034,7 +8035,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

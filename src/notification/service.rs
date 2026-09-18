@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     common::errors::MegaError,
@@ -158,15 +158,15 @@ fn escape_html(value: &str) -> String {
 /// Deliver a product notification: honor the global kill switch, user prefs,
 /// then fan out to registered channels (in-app primary; Slack/webhook extras).
 ///
-/// When `delivery_mode=email` and a website mail client is configured, also
-/// POST the event-specific `website_payload` to the website API (best-effort).
+/// Product email is not initiated here. The leftover website-mail client stays
+/// assembled until RM-WM; this function does not call it.
 pub async fn deliver_user_notification(
     stg: &NotificationStorage,
     username: &str,
     event_type: &str,
     subject: &str,
     body_text: &str,
-    website_payload: serde_json::Value,
+    _website_payload: serde_json::Value,
 ) -> Result<(), MegaError> {
     if let Some(service) = NotificationService::active()
         && !service.is_enabled()
@@ -180,12 +180,6 @@ pub async fn deliver_user_notification(
 
     let Some(settings) = stg.get_user_settings(username).await? else {
         return Ok(());
-    };
-
-    let delivery_mode = if settings.delivery_mode.is_empty() {
-        current_default_delivery_mode()
-    } else {
-        settings.delivery_mode.clone()
     };
 
     let body_html = format!("<p>{}</p>", escape_html(body_text));
@@ -208,44 +202,6 @@ pub async fn deliver_user_notification(
                         channel = channel.name(),
                         error = %error,
                         "notification channel delivery failed"
-                    );
-                }
-            }
-        }
-        if delivery_mode == "email"
-            && let Some(client) = &service.website_mail
-        {
-            let locale = settings
-                .preferred_locale
-                .as_deref()
-                .map(str::trim)
-                .filter(|locale| !locale.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| service.default_locale());
-            if let Err(error) = client
-                .send(
-                    event_type,
-                    username,
-                    &settings.email,
-                    &locale,
-                    &website_payload,
-                )
-                .await
-            {
-                // A 425 is a concurrent same-key duplicate: the in-flight
-                // sibling request will deliver this email, so calling it a
-                // failure would recreate the very misreading the 409/425 split
-                // exists to prevent (website-mail.md §2.2).
-                if error.to_string().contains("HTTP 425") {
-                    debug!(
-                        event_type,
-                        "website mail: concurrent duplicate in flight; the sibling request delivers"
-                    );
-                } else {
-                    warn!(
-                        event_type,
-                        error = %error,
-                        "website mail delivery failed; notification remains available in-app"
                     );
                 }
             }
@@ -387,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn email_delivery_mode_posts_to_website_and_writes_in_app() {
+    async fn configured_website_mail_is_not_invoked_from_deliver() {
         let _active_guard = ACTIVE_SERVICE_LOCK.lock().await;
         #[derive(Clone, Default)]
         struct CapturedRequest {
@@ -480,16 +436,12 @@ mod tests {
             1
         );
         let captured = captured.lock().await;
-        assert_eq!(captured.authorization, "Bearer it-shared-bearer");
-        assert!(!captured.idempotency_key.is_empty());
-        let payload = captured.payload.as_ref().unwrap();
-        assert_eq!(payload["event_type"], "cl.comment.created");
-        assert_eq!(payload["recipient"]["email"], "alice@example.test");
-        assert_eq!(payload["recipient"]["username"], "alice");
-        assert_eq!(payload["locale"], "zh-CN");
-        assert_eq!(payload["payload"], website_payload);
-        assert!(payload["payload"].get("subject").is_none());
-        assert!(payload["payload"].get("body_text").is_none());
+        assert!(
+            captured.payload.is_none(),
+            "deliver must not POST website-mail after RM-02B"
+        );
+        assert!(captured.authorization.is_empty());
+        assert!(captured.idempotency_key.is_empty());
         drop(captured);
         NotificationService::set_active(None);
         server.abort();

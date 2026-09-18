@@ -1,6 +1,6 @@
 [package]
 name = "mega2"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 # Two [[bin]] targets exist; keep `cargo run -p mega2` unambiguous.
 default-run = "mega2"
@@ -43,10 +43,9 @@ ed25519-dalek = { version = "3.0.0", features = ["pkcs8"] }
 envsubst = "0.2.1"
 futures = "0.3.34"
 git-internal = "0.9.0"
-# Shared MST/2 wire codec (specs 03/05/06/07). Pin the published v0.2.0
-# tag (pages_along_route + optional zstd). A path sibling is not present
-# in the docker.yml build context (v0.10.45/46 D-gate failure).
-mst2-codec = { git = "https://github.com/gitmono-dev/mst2-codec", tag = "v0.2.0", features = ["zstd"] }
+# Shared MST/2 wire codec (specs 03/05/06/07). Registry crate 0.3.1
+# (spec-conformance wire fixes + zstd CHUNK cap).
+mst2-codec = { version = "0.3.1", features = ["zstd"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
