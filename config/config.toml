@@ -173,7 +173,7 @@ root_dir = "${base_dir}/objects"
 # Website Better Auth integration (OAuthConfig). Key reference:
 # docs/refactoring/website-auth.md
 # Base URL for GET /api/auth/get-session (required for service http).
-website_api_base_url = "http://127.0.0.1:17001"
+website_api_base_url = "http://127.0.0.1:3000"
 # session_cookie_names defaults to Better Auth cookie names when omitted.
 # `allowed_cors_origins` is the HTTP API CORS allow-list; when empty the server
 # falls back to built-in development defaults. Overridable via
@@ -182,6 +182,8 @@ allowed_cors_origins = [
     "http://local.gitmega.com",
     "https://app.gitmega.com",
     "http://app.gitmono.test",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
 
 [blame]
