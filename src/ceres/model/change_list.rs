@@ -71,7 +71,7 @@ impl From<CLDetails> for CLDetailRes {
             conversations: value
                 .conversations
                 .into_iter()
-                .map(|x| ConversationItem::from_model(x.conversation, x.reactions, &value.username))
+                .map(|x| ConversationItem::from_model(x.conversation))
                 .collect(),
             labels: value.labels.into_iter().map(|x| x.into()).collect(),
             assignees: value

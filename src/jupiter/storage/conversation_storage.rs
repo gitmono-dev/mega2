@@ -80,19 +80,6 @@ impl ConversationStorage {
         Ok(())
     }
 
-    pub async fn add_reactions(
-        &self,
-        content: Option<String>,
-        subject_id: i64,
-        subject_type: &str,
-        username: &str,
-    ) -> Result<reactions::Model, MegaError> {
-        let reactions = reactions::Model::new(content, subject_id, subject_type, username);
-        let a_model = reactions.into_active_model();
-        let res = a_model.insert(self.get_connection()).await?;
-        Ok(res)
-    }
-
     pub async fn get_comments_with_reactions(
         &self,
         link: &str,
