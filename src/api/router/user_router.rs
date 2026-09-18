@@ -17,10 +17,7 @@ use crate::{
     },
     ceres::model::{
         notification::{UpdateUserNotificationConfig, UserNotificationPreferenceItem},
-        user::{
-            AddSSHKey, ClaContentRes, ClaSignStatusRes, ListSSHKey, ListToken,
-            UpdateClaContentPayload,
-        },
+        user::{AddSSHKey, ListSSHKey, ListToken},
     },
     common::errors::{ApiError, MegaError},
     contract::api::common::CommonResult,
@@ -38,10 +35,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(generate_token))
             .routes(routes!(list_token))
             .routes(routes!(remove_token))
-            .routes(routes!(get_cla_sign_status))
-            .routes(routes!(change_sign_status))
-            .routes(routes!(get_cla_content))
-            .routes(routes!(update_cla_content))
             .routes(routes!(list_notification_preferences))
             .routes(routes!(update_notification_preferences))
             .routes(routes!(update_notification_preference)),
@@ -669,96 +662,4 @@ mod tests {
             .is_err()
         );
     }
-}
-/// Get current user's CLA sign status
-#[utoipa::path(
-    get,
-    path = "/cla/status",
-    responses(
-        (status = 200, body = CommonResult<ClaSignStatusRes>, content_type = "application/json")
-    ),
-    tag = USER_TAG
-)]
-async fn get_cla_sign_status(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-) -> Result<Json<CommonResult<ClaSignStatusRes>>, ApiError> {
-    let (cla_signed, cla_signed_at) = state
-        .monorepo()
-        .get_or_init_cla_sign_status(&user.username)
-        .await?;
-
-    let res = ClaSignStatusRes {
-        username: user.username,
-        cla_signed,
-        cla_signed_at: cla_signed_at.map(|dt| dt.and_utc().timestamp()),
-    };
-    Ok(Json(CommonResult::success(Some(res))))
-}
-
-/// Change CLA sign status for current user
-#[utoipa::path(
-    post,
-    path = "/cla/change-sign-status",
-    responses(
-        (status = 200, body = CommonResult<ClaSignStatusRes>, content_type = "application/json")
-    ),
-    tag = USER_TAG
-)]
-async fn change_sign_status(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-) -> Result<Json<CommonResult<ClaSignStatusRes>>, ApiError> {
-    let (cla_signed, cla_signed_at) = state
-        .monorepo()
-        .change_cla_sign_status(&user.username)
-        .await?;
-
-    let res = ClaSignStatusRes {
-        username: user.username,
-        cla_signed,
-        cla_signed_at: cla_signed_at.map(|dt| dt.and_utc().timestamp()),
-    };
-    Ok(Json(CommonResult::success(Some(res))))
-}
-
-/// Get latest CLA text content
-#[utoipa::path(
-    get,
-    path = "/cla/content",
-    responses(
-        (status = 200, body = CommonResult<ClaContentRes>, content_type = "application/json")
-    ),
-    tag = USER_TAG
-)]
-async fn get_cla_content(
-    _user: LoginUser,
-    state: State<MonoApiServiceState>,
-) -> Result<Json<CommonResult<ClaContentRes>>, ApiError> {
-    let content = state.monorepo().get_cla_content().await?;
-    Ok(Json(CommonResult::success(Some(ClaContentRes { content }))))
-}
-
-/// Update latest CLA text content
-#[utoipa::path(
-    post,
-    path = "/cla/content",
-    request_body = UpdateClaContentPayload,
-    responses(
-        (status = 200, body = CommonResult<ClaContentRes>, content_type = "application/json")
-    ),
-    tag = USER_TAG
-)]
-async fn update_cla_content(
-    _user: LoginUser,
-    state: State<MonoApiServiceState>,
-    Json(payload): Json<UpdateClaContentPayload>,
-) -> Result<Json<CommonResult<ClaContentRes>>, ApiError> {
-    state
-        .monorepo()
-        .update_cla_content(&payload.content)
-        .await?;
-    Ok(Json(CommonResult::success(Some(ClaContentRes {
-        content: payload.content,
-    }))))
 }
