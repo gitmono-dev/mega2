@@ -30,11 +30,10 @@ static ACTIVE: RwLock<Option<Arc<NotificationService>>> = RwLock::new(None);
 pub struct NotificationService {
     channels: Vec<Arc<dyn NotificationChannel>>,
     website_mail: Option<Arc<WebsiteMailClient>>,
-    /// When present, `enabled` / `default_delivery_mode` are read live from the
-    /// config snapshot (hot-reload safe).
+    /// When present, `enabled` is read live from the config snapshot
+    /// (hot-reload safe).
     config_handle: Option<ConfigHandle>,
     enabled_fallback: AtomicBool,
-    default_delivery_mode_fallback: RwLock<String>,
 }
 
 impl NotificationService {
@@ -44,7 +43,6 @@ impl NotificationService {
         website_mail: Option<Arc<WebsiteMailClient>>,
         config_handle: Option<ConfigHandle>,
         enabled: bool,
-        default_delivery_mode: String,
     ) -> Self {
         let mut channels: Vec<Arc<dyn NotificationChannel>> =
             Vec::with_capacity(extra_channels.len() + 1);
@@ -55,7 +53,6 @@ impl NotificationService {
             website_mail,
             config_handle,
             enabled_fallback: AtomicBool::new(enabled),
-            default_delivery_mode_fallback: RwLock::new(default_delivery_mode),
         }
     }
 
@@ -104,31 +101,10 @@ impl NotificationService {
     }
 
     pub fn default_delivery_mode(&self) -> String {
-        if let Some(handle) = &self.config_handle
-            && let Ok(config) = handle.snapshot()
-        {
-            return config
-                .notification
-                .as_ref()
-                .map(|cfg| cfg.default_delivery_mode.clone())
-                .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string());
-        }
-        match self.default_delivery_mode_fallback.read() {
-            Ok(mode) => mode.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string()
     }
 
     pub fn default_locale(&self) -> String {
-        if let Some(handle) = &self.config_handle
-            && let Ok(config) = handle.snapshot()
-        {
-            return config
-                .notification
-                .as_ref()
-                .map(|cfg| cfg.default_locale.clone())
-                .unwrap_or_else(|| "en-US".to_string());
-        }
         "en-US".to_string()
     }
 
@@ -250,14 +226,7 @@ mod tests {
         extra: Vec<Arc<dyn NotificationChannel>>,
         enabled: bool,
     ) -> Arc<NotificationService> {
-        Arc::new(NotificationService::new(
-            stg,
-            extra,
-            None,
-            None,
-            enabled,
-            DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
-        ))
+        Arc::new(NotificationService::new(stg, extra, None, None, enabled))
     }
 
     #[tokio::test]
@@ -408,7 +377,6 @@ mod tests {
             Some(mail_client),
             None,
             true,
-            DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
         ));
         NotificationService::set_active(Some(service));
 

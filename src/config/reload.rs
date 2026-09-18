@@ -14,10 +14,7 @@ use tokio::{
 
 use crate::{
     common::errors::MegaError,
-    config::{
-        ArtifactGcConfig, BuckConfig, Config, DEFAULT_NOTIFICATION_DELIVERY_MODE, LogConfig,
-        NotificationConfig,
-    },
+    config::{ArtifactGcConfig, BuckConfig, Config, LogConfig, NotificationConfig},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -478,23 +475,11 @@ fn apply_notification_changes(
 
     let current_enabled = notification_enabled(current);
     let candidate_enabled = notification_enabled(candidate);
-    let current_mode = notification_delivery_mode(current);
-    let candidate_mode = notification_delivery_mode(candidate);
-    let current_locale = notification_default_locale(current);
-    let candidate_locale = notification_default_locale(candidate);
 
     *next = candidate.clone();
 
     if current_enabled != candidate_enabled {
         report.applied_fields.push("notification.enabled");
-    }
-    if current_mode != candidate_mode {
-        report
-            .applied_fields
-            .push("notification.default_delivery_mode");
-    }
-    if current_locale != candidate_locale {
-        report.applied_fields.push("notification.default_locale");
     }
     if current.as_ref().map(|config| {
         (
@@ -523,20 +508,6 @@ fn apply_notification_changes(
 
 fn notification_enabled(config: &Option<NotificationConfig>) -> bool {
     config.as_ref().map(|c| c.enabled).unwrap_or(true)
-}
-
-fn notification_delivery_mode(config: &Option<NotificationConfig>) -> String {
-    config
-        .as_ref()
-        .map(|c| c.default_delivery_mode.clone())
-        .unwrap_or_else(|| DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string())
-}
-
-fn notification_default_locale(config: &Option<NotificationConfig>) -> String {
-    config
-        .as_ref()
-        .map(|c| c.default_locale.clone())
-        .unwrap_or_else(|| "en-US".to_string())
 }
 
 fn collect_artifact_gc_restart_fields(

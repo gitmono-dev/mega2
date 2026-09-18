@@ -211,7 +211,7 @@ impl AppContext {
                 Arc<dyn crate::notification::channels::NotificationChannel>,
             > = Vec::new();
             let mut website_mail = None;
-            let (notification_enabled, default_delivery_mode) = match config.notification.as_ref() {
+            let notification_enabled = match config.notification.as_ref() {
                 Some(notification_cfg) => {
                     crate::config::validate::validate_notification_config(notification_cfg)?;
                     let resolver =
@@ -288,15 +288,9 @@ impl AppContext {
                             )?,
                         ));
                     }
-                    (
-                        notification_cfg.enabled,
-                        notification_cfg.default_delivery_mode.clone(),
-                    )
+                    notification_cfg.enabled
                 }
-                None => (
-                    true,
-                    crate::config::DEFAULT_NOTIFICATION_DELIVERY_MODE.to_string(),
-                ),
+                None => true,
             };
             let service = Arc::new(crate::notification::NotificationService::new(
                 notif_stg,
@@ -304,7 +298,6 @@ impl AppContext {
                 website_mail,
                 Some(config_handle.clone()),
                 notification_enabled,
-                default_delivery_mode,
             ));
             crate::notification::NotificationService::set_active(Some(Arc::clone(&service)));
             let sd = notification_shutdown.clone();

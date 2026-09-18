@@ -9,9 +9,8 @@ use url::Url;
 
 use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
-    LogConfig, MonoConfig, NOTIFICATION_DELIVERY_MODES, NotificationConfig, OAuthConfig,
-    PackConfig, PushAuth, PushPolicy, RedisConfig, VAULT_AUDIT_SINKS, VaultConfig,
-    normalize_token_path,
+    LogConfig, MonoConfig, NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy,
+    RedisConfig, VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
     secret::{SecretRef, is_secret_ref_value},
 };
 use crate::common::{errors::MegaError, oci_name::valid_repository_name};
@@ -344,17 +343,6 @@ pub(crate) fn validate_vault_config(config: &VaultConfig) -> Result<(), MegaErro
 }
 
 pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
-    if !NOTIFICATION_DELIVERY_MODES.contains(&config.default_delivery_mode.as_str()) {
-        return Err(MegaError::Other(format!(
-            "notification.default_delivery_mode `{}` is not supported; expected one of {:?}",
-            config.default_delivery_mode, NOTIFICATION_DELIVERY_MODES
-        )));
-    }
-    if config.default_locale.trim().is_empty() {
-        return Err(MegaError::Other(
-            "notification.default_locale must not be empty".to_string(),
-        ));
-    }
     let website_mail_enabled = !config.website_mail_base_url.trim().is_empty();
     // A present-but-blank bearer is not a configured bearer. `is_some()` alone
     // let `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (or a whitespace value) pass
@@ -1852,8 +1840,6 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
         "artifacts_gc" => Some(&["enable", "interval_secs", "grace_secs", "batch_limit"]),
         "notification" => Some(&[
             "enabled",
-            "default_delivery_mode",
-            "default_locale",
             "website_mail_base_url",
             "website_mail_bearer",
             "website_mail_bearer_ref",
@@ -2033,36 +2019,30 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_unsupported_notification_delivery_mode() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            default_delivery_mode: "carrier-pigeon".to_string(),
-            ..Default::default()
-        });
+    fn reject_unknown_fields_rejects_removed_notification_delivery_defaults() {
+        let removed_mode = ["default_", "delivery_mode"].concat();
+        let removed_locale = ["default_", "locale"].concat();
+        let value = toml::from_str::<Value>(&format!(
+            r#"
+            [notification]
+            enabled = true
+            {removed_mode} = "in_app"
+            {removed_locale} = "en-US"
+            "#
+        ))
+        .unwrap();
 
-        let err = config
-            .validate()
-            .expect_err("unsupported delivery mode should fail");
-
+        let err = reject_unknown_fields(&value)
+            .expect_err("removed notification delivery defaults must fail closed");
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("notification.default_delivery_mode")
+            message.contains(&format!("notification.{removed_mode}")),
+            "{message}"
         );
-    }
-
-    #[test]
-    fn config_validate_rejects_empty_notification_locale() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            default_locale: "   ".to_string(),
-            ..Default::default()
-        });
-
-        let err = config
-            .validate()
-            .expect_err("empty notification locale should fail");
-
-        assert!(err.to_string().contains("notification.default_locale"));
+        assert!(
+            message.contains(&format!("notification.{removed_locale}")),
+            "{message}"
+        );
     }
 
     #[test]
@@ -3261,8 +3241,14 @@ mod tests {
         assert!(is_known_field_path("object_storage.s3.access_key_id"));
         assert!(is_known_field_path("git.push_tokens.name"));
         assert!(is_known_field_path("notification.enabled"));
-        assert!(is_known_field_path("notification.default_delivery_mode"));
-        assert!(is_known_field_path("notification.default_locale"));
+        assert!(!is_known_field_path(&format!(
+            "notification.{}",
+            ["default_", "delivery_mode"].concat()
+        )));
+        assert!(!is_known_field_path(&format!(
+            "notification.{}",
+            ["default_", "locale"].concat()
+        )));
         assert!(!is_known_field_path("database.db_url.extra"));
         assert!(!is_known_field_path("database.typo"));
         assert!(!is_known_field_path("unknown.value"));
@@ -3278,8 +3264,6 @@ mod tests {
             r#"
             [notification]
             enabled = true
-            default_delivery_mode = "email"
-            default_locale = "en"
             typo = true
             "#,
         )
@@ -3293,12 +3277,6 @@ mod tests {
         // A valid [notification] section must not be flagged as unknown ...
         assert!(!fields.iter().any(|f| f == "notification"));
         assert!(!fields.iter().any(|f| f == "notification.enabled"));
-        assert!(
-            !fields
-                .iter()
-                .any(|f| f == "notification.default_delivery_mode")
-        );
-        assert!(!fields.iter().any(|f| f == "notification.default_locale"));
         // ... but an unknown field inside it still is.
         assert!(fields.iter().any(|f| f == "notification.typo"));
     }
