@@ -2,7 +2,8 @@
 #
 # The build context is this repository alone: the shared codec is a registry
 # dependency (see Cargo.toml), so no sibling checkout or extra build context is
-# needed.
+# needed. The registry version (0.3) carries the MTP2 route walk and the
+# spec-conformance zstd fixes.
 FROM rust:1.97-bookworm AS builder
 
 RUN apt-get update \
