@@ -9,7 +9,6 @@ pub mod git;
 pub mod gpg;
 pub mod group;
 pub mod issue;
-pub mod label;
 pub mod merge_queue;
 pub mod notification;
 pub mod tag;

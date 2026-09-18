@@ -14,13 +14,11 @@ use crate::{
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     ceres::model::{
         change_list::{
-            AssigneeUpdatePayload, CLDetailRes, ClCommitRes, ClFilesRes, Condition,
-            FilesChangedPage, ListPayload, MergeBoxRes, MuiTreeNode, UpdateBranchStatusRes,
-            UpdateClStatusPayload,
+            CLDetailRes, ClCommitRes, ClFilesRes, Condition, FilesChangedPage, ListPayload,
+            MergeBoxRes, MuiTreeNode, UpdateBranchStatusRes, UpdateClStatusPayload,
         },
         conversation::ContentPayload,
         issue::ItemRes,
-        label::LabelUpdatePayload,
     },
     common::errors::{ApiError, MegaError},
     contract::{
@@ -45,8 +43,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(cl_files_changed_by_page))
             .routes(routes!(cl_files_list))
             .routes(routes!(save_comment))
-            .routes(routes!(labels))
-            .routes(routes!(assignees))
             .routes(routes!(edit_title))
             .routes(routes!(update_cl_status))
             .routes(routes!(update_branch_status))
@@ -632,44 +628,6 @@ async fn edit_title(
             .dispatch(WebhookEvent::ClUpdated, &cl_model);
     }
     Ok(Json(CommonResult::success(None)))
-}
-
-/// Update cl related labels
-#[utoipa::path(
-    post,
-    path = "/labels",
-    request_body = LabelUpdatePayload,
-    responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json"),
-        (status = 403, description = "Authorization denied for this Change List operation"),
-    ),
-    tag = CL_TAG
-)]
-async fn labels(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-    Json(payload): Json<LabelUpdatePayload>,
-) -> Result<Json<CommonResult<()>>, ApiError> {
-    api_common::label_assignee::label_update(user, state, payload, String::from("cl")).await
-}
-
-/// Update CL related assignees
-#[utoipa::path(
-    post,
-    path = "/assignees",
-    request_body = AssigneeUpdatePayload,
-    responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json"),
-        (status = 403, description = "Authorization denied for this Change List operation"),
-    ),
-    tag = CL_TAG
-)]
-async fn assignees(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-    Json(payload): Json<AssigneeUpdatePayload>,
-) -> Result<Json<CommonResult<()>>, ApiError> {
-    api_common::label_assignee::assignees_update(user, state, payload, String::from("cl")).await
 }
 
 /// Update CL status (Draft or Open)

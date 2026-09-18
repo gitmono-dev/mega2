@@ -7,7 +7,6 @@ pub mod cl_router;
 pub mod commit_router;
 pub mod gpg_router;
 pub mod group_router;
-pub mod label_router;
 #[cfg(feature = "fastcdc")]
 pub mod lfs_media;
 pub mod lfs_router;
@@ -84,6 +83,12 @@ mod tests {
         assert!(
             paths.iter().all(|p| !p.contains("/code_review")),
             "review OpenAPI must not include /code_review: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains("/label")
+                && !p.contains("/labels")
+                && !p.contains("/assignees")),
+            "review OpenAPI must not include label HTTP: {paths:?}"
         );
         assert!(
             paths.iter().any(|p| p.contains("create-entry")),

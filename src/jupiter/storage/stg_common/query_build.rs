@@ -1,24 +1,6 @@
 use std::collections::HashMap;
 
-use sea_orm::{ColumnTrait, Condition, Order, QueryOrder};
-
-use crate::callisto::{item_assignees, item_labels};
-
-pub fn filter_by_labels(cond: Condition, labels: Option<Vec<i64>>) -> Condition {
-    if let Some(value) = labels {
-        cond.add(item_labels::Column::LabelId.is_in(value))
-    } else {
-        cond
-    }
-}
-
-pub fn filter_by_assignees(cond: Condition, assignees: Option<Vec<String>>) -> Condition {
-    if let Some(value) = assignees {
-        cond.add(item_assignees::Column::AssignneeId.is_in(value))
-    } else {
-        cond
-    }
-}
+use sea_orm::{ColumnTrait, Order, QueryOrder};
 
 /// Apply order_by dynamically based on user input.
 pub fn apply_sort<C, Q>(

@@ -1,7 +1,7 @@
 use sea_orm::entity::prelude::*;
 
 use crate::{
-    callisto::{item_assignees, label, mega_cl, sea_orm_active_enums::MergeStatusEnum},
+    callisto::{mega_cl, sea_orm_active_enums::MergeStatusEnum},
     jupiter::model::conv_dto::ConvWithReactions,
 };
 
@@ -9,8 +9,6 @@ pub struct CLDetails {
     pub username: String,
     pub cl: mega_cl::Model,
     pub conversations: Vec<ConvWithReactions>,
-    pub labels: Vec<label::Model>,
-    pub assignees: Vec<item_assignees::Model>,
 }
 
 pub struct ClInfoDto {
