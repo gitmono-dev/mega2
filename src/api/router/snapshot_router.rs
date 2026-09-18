@@ -30,7 +30,7 @@ use crate::{
     },
 };
 
-pub fn routers() -> Router<MonoApiServiceState> {
+pub fn routers(api_state: MonoApiServiceState) -> Router<MonoApiServiceState> {
     Router::new()
         .route("/snapshots/capabilities", get(capabilities))
         .route("/snapshots/resolve", post(resolve))
@@ -60,7 +60,13 @@ pub fn routers() -> Router<MonoApiServiceState> {
         // Spec 14 §4 hard limit on JSON request bodies; oversized requests
         // are rejected before any handler runs.
         .layer(axum::extract::DefaultBodyLimit::max(JSON_REQUEST_LIMIT))
-        .layer(axum::middleware::from_fn(request_id_middleware))
+        .route_layer(axum::middleware::from_fn(reject_oversize_body))
+        // Auth and error-envelope request-id apply to every route here;
+        // a new handler cannot silently skip them.
+        .route_layer(axum::middleware::from_fn_with_state(
+            api_state,
+            snapshot_auth_middleware,
+        ))
 }
 
 #[path = "snapshot_content.rs"]
@@ -70,21 +76,10 @@ mod content;
 pub(crate) const JSON_REQUEST_LIMIT: usize = 131_072;
 
 tokio::task_local! {
-    /// Per-request id, also returned as `X-Request-Id` and mirrored into the
-    /// error envelope's `request_id` (spec 14 §5).
+    /// Per-request id for the error envelope (spec 14 §5). Sourced from the
+    /// global `TraceContext` so the envelope, the `X-Request-Id` response
+    /// header and log spans all carry the same id.
     static REQUEST_ID: String;
-}
-
-async fn request_id_middleware(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut res = REQUEST_ID.scope(id.clone(), next.run(req)).await;
-    if let Ok(v) = HeaderValue::from_str(&id) {
-        res.headers_mut().insert("x-request-id", v);
-    }
-    res
 }
 
 /// The request id of the in-flight request, for error envelopes.
@@ -94,43 +89,118 @@ pub(crate) fn current_request_id() -> String {
 
 const LEASE_HEADER: &str = "x-mega-snapshot-lease";
 
-/// Spec 04 §1 authentication: every endpoint except `capabilities` requires
-/// `Authorization: Bearer <token>` when the deployment configured one, and
-/// snapshot-bound endpoints must additionally present the lease they resolved
-/// (`X-Mega-Snapshot-Lease`), which is validated against the in-memory lease
-/// table — knowing the snapshot id alone is not a capability.
-pub(crate) fn require_auth(
-    state: &MonoApiServiceState,
-    headers: &HeaderMap,
-    snapshot_id: Option<&str>,
-) -> Result<(), Response> {
-    if let Some(token) = &state.storage.config().mst2.auth_token {
-        let ok = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                let (scheme, cred) = v.split_once(' ').unwrap_or(("", ""));
-                scheme.eq_ignore_ascii_case("bearer") && cred == token
-            });
-        if !ok {
-            return Err(mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::Unauthenticated,
-                "missing or invalid bearer credentials",
-            )));
+/// Spec 04 §1 authentication, applied once over the whole snapshot router:
+/// every endpoint except `capabilities` requires `Authorization: Bearer
+/// <token>` when the deployment configured one, and snapshot-bound endpoints
+/// must additionally present the lease they resolved
+/// (`X-Mega-Snapshot-Lease`), validated against the in-memory lease table —
+/// knowing the snapshot id alone is not a capability.
+async fn snapshot_auth_middleware(
+    State(state): State<MonoApiServiceState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Same id the global trace layer echoes on responses and logs.
+    let id = req
+        .extensions()
+        .get::<crate::server::trace_context::TraceContext>()
+        .map(|c| c.trace_id.to_string())
+        .unwrap_or_default();
+    REQUEST_ID
+        .scope(id, async {
+            if let Some(res) = auth_error(&state, req.headers(), req.uri().path()) {
+                return res;
+            }
+            next.run(req).await
+        })
+        .await
+}
+
+/// Spec 14 §4 enforcement with the MST/2 error envelope (DefaultBodyLimit's
+/// own rejection is plain-text). Content-Length is checked here; a lying
+/// chunked body still trips DefaultBodyLimit inside the extractor.
+async fn reject_oversize_body(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let over = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > JSON_REQUEST_LIMIT);
+    if over {
+        return mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            "request body over the spec 14 limit",
+        ));
+    }
+    next.run(req).await
+}
+
+/// Parse a JSON request body, mapping shape errors to the typed envelope
+/// (spec 14 §5 INVALID_REQUEST). Size is enforced by the router layers.
+pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
+    serde_json::from_slice(body).map_err(|e| {
+        mst2_error_response(SnapshotError::new(
+            SnapshotErrorCode::InvalidRequest,
+            format!("malformed request body: {e}"),
+        ))
+    })
+}
+
+/// Bearer-token check shared by the auth middleware; the parsing rule is the
+/// one the Git HTTP receive-pack path uses.
+fn bearer_ok(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::api::oauth::bearer_token_from_authorization_value)
+        .is_some_and(|cred| cred == token)
+}
+
+fn unauthenticated(message: &'static str) -> Response {
+    mst2_error_response(SnapshotError::new(
+        SnapshotErrorCode::Unauthenticated,
+        message,
+    ))
+}
+
+/// Auth decision for one request path (see [`snapshot_auth_middleware`]).
+/// `capabilities` stays open; lease routes need only the bearer; a
+/// snapshot-bound route (`/snapshots/sha256:…/…`) also needs its lease.
+fn auth_error(state: &MonoApiServiceState, headers: &HeaderMap, path: &str) -> Option<Response> {
+    let config = state.storage.config();
+    let token = config.mst2.auth_token.as_deref();
+    let path = path.split('?').next().unwrap_or(path);
+    // The router is nested under /api/v2, which strips its prefix before
+    // middleware runs — accept both the stripped and full forms.
+    let rest = path
+        .strip_prefix("/api/v2/snapshots/")
+        .or_else(|| path.strip_prefix("/snapshots/"))?;
+    if rest == "capabilities" {
+        return None;
+    }
+    if let Some(token) = token
+        && !bearer_ok(headers, token)
+    {
+        return Some(unauthenticated("missing or invalid bearer credentials"));
+    }
+    let mut segments = rest.split('/');
+    match segments.next() {
+        // Lease management names the lease in the path, not a snapshot.
+        Some("resolve") | Some("leases") | Some("capabilities") | None => None,
+        Some(snapshot_id) => {
+            let lease = headers.get(LEASE_HEADER).and_then(|v| v.to_str().ok());
+            match lease {
+                None => Some(unauthenticated("missing X-Mega-Snapshot-Lease header")),
+                Some(lease) => runtime()
+                    .validate_lease(snapshot_id, lease)
+                    .err()
+                    .map(mst2_error_response),
+            }
         }
     }
-    if let Some(sid) = snapshot_id {
-        let Some(lease) = headers.get(LEASE_HEADER).and_then(|v| v.to_str().ok()) else {
-            return Err(mst2_error_response(SnapshotError::new(
-                SnapshotErrorCode::Unauthenticated,
-                "missing X-Mega-Snapshot-Lease header",
-            )));
-        };
-        runtime()
-            .validate_lease(sid, lease)
-            .map_err(mst2_error_response)?;
-    }
-    Ok(())
 }
 
 fn mst2_error_response(err: SnapshotError) -> Response {
@@ -248,25 +318,9 @@ fn ensure_enabled(state: &MonoApiServiceState) -> Result<(), SnapshotError> {
 // `lfs_router::enforce_lfs_access` (where the error is the rare arm and is
 // boxed), there is nothing to gain here, so the lint is allowed outright.
 #[allow(clippy::result_large_err)]
-async fn resolve(
-    state: State<MonoApiServiceState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, Response> {
+async fn resolve(state: State<MonoApiServiceState>, body: Bytes) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, None)?;
-    if body.len() > JSON_REQUEST_LIMIT {
-        return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::LimitExceeded,
-            "request body over the spec 14 limit",
-        )));
-    }
-    let req: ResolveRequest = serde_json::from_slice(&body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })?;
+    let req: ResolveRequest = parse_json_body(&body)?;
     // Unknown target kinds are client errors, never a silent fallback to
     // latest (review P1.3).
     if req.target.kind != "latest" && req.target.kind != "view" {
@@ -401,10 +455,8 @@ fn descriptor_json(
 async fn descriptor_get(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
-    headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, Some(&snapshot_id))?;
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
@@ -428,11 +480,9 @@ struct RenewRequest {
 async fn lease_renew(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, None)?;
     let req: RenewRequest = if body.is_empty() {
         RenewRequest::default()
     } else {
@@ -459,10 +509,8 @@ async fn lease_renew(
 async fn lease_release(
     state: State<MonoApiServiceState>,
     AxumPath(lease_id): AxumPath<String>,
-    headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, None)?;
     // Idempotent: releasing an unknown/already-released lease still succeeds
     // (spec 04 §2). This never deletes Git content.
     let released = runtime().release_lease(&lease_id);
@@ -494,10 +542,8 @@ async fn directory(
     state: State<MonoApiServiceState>,
     AxumPath(snapshot_id): AxumPath<String>,
     Query(q): Query<DirectoryQuery>,
-    headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, Some(&snapshot_id))?;
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
@@ -676,12 +722,9 @@ async fn directory(
         &snapshot_id[..16.min(snapshot_id.len())],
         hex_of(&built.page_id),
         q.limit,
-        hex_of(&{
-            use blake3::Hasher;
-            let mut h = Hasher::new();
-            h.update(q.cursor.as_deref().unwrap_or("").as_bytes());
-            h.finalize().into()
-        })
+        // The cursor is the server-signed token itself (base64 + MAC):
+        // header-safe and already held by the client, so identity suffices.
+        q.cursor.as_deref().unwrap_or(""),
     );
     if let Ok(v) = HeaderValue::from_str(&etag) {
         resp.headers_mut().insert("etag", v);
@@ -708,7 +751,6 @@ async fn blob(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, Some(&snapshot_id))?;
     let ctx = runtime()
         .context(&snapshot_id)
         .map_err(mst2_error_response)?;
@@ -811,19 +853,7 @@ async fn lookup(
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, Some(&snapshot_id))?;
-    if body.len() > JSON_REQUEST_LIMIT {
-        return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::LimitExceeded,
-            "request body over the spec 14 limit",
-        )));
-    }
-    let req: LookupRequest = serde_json::from_slice(&body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })?;
+    let req: LookupRequest = parse_json_body(&body)?;
     if req.paths.len() > 128 {
         return Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::LimitExceeded,
@@ -980,19 +1010,7 @@ async fn metadata_pages(
     body: Bytes,
 ) -> Result<Response, Response> {
     ensure_enabled(&state).map_err(mst2_error_response)?;
-    require_auth(&state, &headers, Some(&snapshot_id))?;
-    if body.len() > JSON_REQUEST_LIMIT {
-        return Err(mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::LimitExceeded,
-            "request body over the spec 14 limit",
-        )));
-    }
-    let req: MetadataPagesRequest = serde_json::from_slice(&body).map_err(|e| {
-        mst2_error_response(SnapshotError::new(
-            SnapshotErrorCode::InvalidRequest,
-            format!("malformed request body: {e}"),
-        ))
-    })?;
+    let req: MetadataPagesRequest = parse_json_body(&body)?;
     if req.items.is_empty() || req.items.len() > 64 {
         return Err(mst2_error_response(SnapshotError::new(
             SnapshotErrorCode::LimitExceeded,

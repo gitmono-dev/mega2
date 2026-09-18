@@ -1,7 +1,11 @@
 //! T05: MST/2 publication tables — receipts, outbox, namespace sequence.
 //!
-//! `mst2_publication` is keyed uniquely on `operation_id` so a retried
-//! writer reuses the original receipt instead of double-advancing. The
+//! `mst2_publication` is keyed uniquely on `(namespace, operation_id)` so a
+//! retried writer reuses the original receipt instead of double-advancing
+//! while two namespaces may carry the same operation id. Databases that
+//! applied an earlier revision of this migration (unique on `operation_id`
+//! alone) are brought to this shape by
+//! `m20260918_000100_fix_mst2_publication_unique`. The
 //! sequence counter lives in `mst2_namespace_seq`; writers bump it with
 //! `UPDATE ... RETURNING` **inside the same transaction as the ref CAS**
 //! (spec 09 §1: receipt + outbox + head commit atomically).

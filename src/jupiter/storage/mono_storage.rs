@@ -1784,26 +1784,19 @@ impl MonoStorage {
         new_oid: &str,
         writer_kind: &str,
     ) -> Result<i64, MegaError> {
-        // Replay short-circuit (PUB-11), scoped to this namespace: the same
-        // operation id under a different namespace is a distinct publication
-        // (push operation ids are only unique per repo), not a replay.
+        // One SELECT by operation id answers both questions: the same id
+        // under this namespace is a replay (PUB-11) and returns the original
+        // sequence; the same id under a different namespace means the id is
+        // not actually unique to this publication — refuse rather than
+        // silently double-bind it.
         if let Some(existing) = mst2_publication::Entity::find()
             .filter(mst2_publication::Column::OperationId.eq(operation_id))
-            .filter(mst2_publication::Column::Namespace.eq(namespace))
             .one(txn)
             .await?
         {
-            return Ok(existing.sequence);
-        }
-        // Cross-namespace conflict: the same operation id was already
-        // published elsewhere. That means the id is not actually unique to
-        // this publication — refuse rather than silently double-bind it.
-        if mst2_publication::Entity::find()
-            .filter(mst2_publication::Column::OperationId.eq(operation_id))
-            .one(txn)
-            .await?
-            .is_some()
-        {
+            if existing.namespace == namespace {
+                return Ok(existing.sequence);
+            }
             return Err(MegaError::Other(format!(
                 "operation id {operation_id} already published under a different namespace"
             )));
@@ -1826,9 +1819,11 @@ impl MonoStorage {
         let sequence: i64 = row.try_get_by_index(0)?;
         let now = chrono::Utc::now().fixed_offset();
 
-        // Concurrency-safe insert: two racing transactions with the same
-        // (namespace, operation_id) are serialized by the unique index; the
-        // loser re-selects the winner's receipt instead of aborting (PUB-11).
+        // Concurrency-safe insert: the receipt is unique per
+        // (namespace, operation_id). The replay check above covers a
+        // committed prior publication; a truly concurrent same-operation
+        // writer loses at the outbox insert's unique operation_id below,
+        // rolling this transaction back rather than double-publishing.
         let insert = mst2_publication::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
             operation_id: Set(operation_id.to_string()),
@@ -1852,8 +1847,9 @@ impl MonoStorage {
             .exec(txn)
             .await
         {
-            // ON CONFLICT DO NOTHING returns RecordNotInserted when the
-            // racing transaction won; re-select its receipt.
+            // RecordNotInserted means a receipt with this identity already
+            // exists; see the outbox insert below for how a racing writer
+            // of the same operation is resolved.
             Ok(_) | Err(DbErr::RecordNotInserted) => {}
             Err(e) => return Err(e.into()),
         }

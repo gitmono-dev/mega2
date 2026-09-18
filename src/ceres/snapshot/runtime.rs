@@ -215,12 +215,13 @@ impl Mst2Runtime {
     /// the client's only recovery is re-resolving. A lease id that never
     /// existed is answered identically: probing with lease ids must not
     /// distinguish released from forged.
+    ///
+    /// Expired-row pruning happens in `active_lease`, not here: this runs on
+    /// every authenticated read and must stay a single key lookup.
     pub fn validate_lease(&self, snapshot_id: &str, lease_id: &str) -> Result<(), SnapshotError> {
-        let now = now_unix();
-        let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, r| r.expires_at_unix >= now);
+        let leases = self.leases.lock().unwrap();
         match leases.get(lease_id) {
-            Some(r) if r.snapshot_id == snapshot_id && r.expires_at_unix >= now => Ok(()),
+            Some(r) if r.snapshot_id == snapshot_id && r.expires_at_unix >= now_unix() => Ok(()),
             _ => Err(SnapshotError::new(
                 SnapshotErrorCode::LeaseExpired,
                 "lease is not active for this snapshot; re-resolve",
