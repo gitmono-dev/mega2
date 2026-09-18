@@ -398,6 +398,22 @@ pub async fn git_receive_pack(
     };
     tracing::info!(bytes = receive_request.len(), "receive-pack: request body received");
 
+    // A body of exactly one flush-pkt is git's large-push probe
+    // (remote-curl's probe_rpc posts "0000" with Content-Length: 4 before
+    // committing to a chunked transfer). The probe expects HTTP 200 — a 400
+    // makes the client abandon the push outright, so acknowledge with an
+    // empty report; no ref was touched and no pack followed.
+    if receive_request.as_ref() == smart::PKT_LINE_END_MARKER {
+        tracing::info!("receive-pack: large-push probe acknowledged");
+        let response = Response::builder()
+            .body(Body::from(Bytes::from_static(smart::PKT_LINE_END_MARKER)))
+            .map_err(|e| ProtocolError::InvalidInput(format!("failed to build response: {e}")))?;
+        return add_default_header(
+            String::from("application/x-git-receive-pack-result"),
+            response,
+        );
+    }
+
     let (commands, pack_bytes) =
         match pack_protocol.split_receive_pack_request(receive_request.freeze()) {
             Ok(split) => split,
