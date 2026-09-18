@@ -4,13 +4,12 @@ use crate::{
     callisto::{entity_ext::generate_link, mega_cl, mega_refs, sea_orm_active_enums::ConvTypeEnum},
     ceres::{
         api_service::ApiHandler,
-        code_edit::utils as edit_utils,
         merge_checker::{CheckerRegistry, MAX_CL_CHAIN_COMMITS},
     },
     common::errors::MegaError,
     config::PushPolicy,
     jupiter::{
-        service::{reviewer_service::ReviewerService, webhook_service::WebhookEvent},
+        service::webhook_service::WebhookEvent,
         storage::{Storage, mono_storage::MonoStorage},
         utils::converter::FromMegaModel,
     },
@@ -141,39 +140,7 @@ pub(crate) trait Checker {
 }
 
 pub(crate) trait Director<T: ApiHandler + Clone> {
-    async fn get_review_service(&self, storage: &Storage) -> Result<ReviewerService, MegaError>;
     async fn get_api_handler(&self) -> T;
-    async fn assign_reviewers(
-        &self,
-        storage: &Storage,
-        cl: &mega_cl::Model,
-    ) -> Result<(), MegaError> {
-        let handler = self.get_api_handler().await;
-        let changed_files = edit_utils::get_changed_files(&handler, cl).await?;
-        let policy_contents =
-            edit_utils::collect_policy_contents(&handler, cl, &changed_files).await;
-        if policy_contents.is_empty() {
-            Ok(())
-        } else {
-            let reviewer_service = self.get_review_service(storage).await?;
-
-            if let Err(e) = reviewer_service
-                .assign_system_reviewers(&cl.link, &policy_contents, &changed_files)
-                .await
-            {
-                tracing::warn!("Failed to assign Cedar reviewers: {}", e);
-            }
-
-            // Resync reviewers when existing CL updates policy files
-            if let Err(e) = reviewer_service
-                .sync_system_reviewers(&cl.link, &policy_contents, &changed_files)
-                .await
-            {
-                tracing::warn!("Failed to resync Cedar reviewers: {}", e);
-            }
-            Ok(())
-        }
-    }
 }
 
 fn cl_with_latest_to_hash(mut cl: mega_cl::Model, to_hash: &str) -> mega_cl::Model {
@@ -236,9 +203,6 @@ pub struct DefualtDirector<T: ApiHandler + Clone> {
 }
 
 impl<T: ApiHandler + Clone> crate::ceres::code_edit::model::Director<T> for DefualtDirector<T> {
-    async fn get_review_service(&self, storage: &Storage) -> Result<ReviewerService, MegaError> {
-        Ok(ReviewerService::from_storage(storage.reviewer_storage()))
-    }
     async fn get_api_handler(&self) -> T {
         self.handler.clone()
     }
@@ -376,7 +340,6 @@ impl<
                 &dst_commit.tree_id.to_string(),
             )
             .await?;
-        self.assign_reviewer(storage, &cl).await?;
         storage
             .conversation_storage()
             .add_conversation(
@@ -431,14 +394,6 @@ impl<
         cl: &mega_cl::Model,
     ) -> Result<(), MegaError> {
         self.checker.check(storage, username, cl).await
-    }
-
-    pub async fn assign_reviewer(
-        &self,
-        storage: &Storage,
-        cl: &mega_cl::Model,
-    ) -> Result<(), MegaError> {
-        self.director.assign_reviewers(storage, cl).await
     }
 }
 
