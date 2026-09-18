@@ -167,9 +167,10 @@ fn presented_git_http_token(headers: &http::HeaderMap) -> Option<String> {
 
 /// Maximum body size accepted for Git HTTP upload-pack / receive-pack requests.
 /// This bounds memory consumption on the server and prevents unbounded buffering
-/// of malformed or malicious requests. Pushes larger than this must use chunked
-/// or other transfer mechanisms not implemented here.
-const GIT_HTTP_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+/// of malformed or malicious requests. Monorepo initial pushes carry gigabytes
+/// of pack data, so the limit is generous; it exists to cap the buffered
+/// request, not to cap repository size.
+const GIT_HTTP_MAX_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 async fn collect_body_data(body: Body, operation: &str) -> Result<BytesMut, ProtocolError> {
     collect_body_data_with_limit(body, operation, GIT_HTTP_MAX_BODY_BYTES).await
@@ -388,10 +389,28 @@ pub async fn git_receive_pack(
         return auth_failed();
     }
     check_push_permission(state, &pack_protocol.auth, &pack_protocol.repo_path).await?;
-    let receive_request = collect_body_data(req.into_body(), "receive-pack").await?;
+    let receive_request = match collect_body_data(req.into_body(), "receive-pack").await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, "receive-pack: reading request body failed");
+            return Err(e);
+        }
+    };
+    tracing::info!(bytes = receive_request.len(), "receive-pack: request body received");
 
     let (commands, pack_bytes) =
-        pack_protocol.split_receive_pack_request(receive_request.freeze())?;
+        match pack_protocol.split_receive_pack_request(receive_request.freeze()) {
+            Ok(split) => split,
+            Err(e) => {
+                tracing::error!(error = %e, "receive-pack: request split failed");
+                return Err(e);
+            }
+        };
+    tracing::info!(
+        commands = commands.len(),
+        pack_bytes = pack_bytes.len(),
+        "receive-pack: request split"
+    );
     let report_status = pack_protocol
         .git_receive_pack_stream(state, commands, pack_bytes)
         .await?;

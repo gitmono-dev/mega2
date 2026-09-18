@@ -755,6 +755,11 @@ pub async fn app(ctx: AppContext, host: String, port: u16) -> Result<Router, Meg
         any(move |req: Request<Body>| {
             handle_smart_protocol(req, Arc::new(ProtocolApiState::from_ref(&protocol_state)))
         })
+        // Git packs arrive as one HTTP body and can be gigabytes; axum's
+        // default 2 MiB body limit aborts the stream mid-upload (surfacing
+        // as a 400 to the client). Size policy for these requests is the
+        // git protocol layer's own (GIT_HTTP_MAX_BODY_BYTES).
+        .layer(axum::extract::DefaultBodyLimit::disable())
     };
 
     // OCI OpenAPI stubs document `/v2/...` but must not be merged into the live
