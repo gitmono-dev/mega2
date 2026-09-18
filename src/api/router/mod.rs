@@ -17,7 +17,6 @@ pub mod oci_router;
 pub mod preview_router;
 pub mod push_queue_router;
 pub mod repo_router;
-pub mod reviewer_router;
 pub mod snapshot_router;
 pub mod tag_router;
 pub mod user_router;
@@ -78,8 +77,10 @@ mod tests {
             "review OpenAPI must include /cl: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p.contains("reviewer")),
-            "review OpenAPI must include reviewer: {paths:?}"
+            paths
+                .iter()
+                .all(|p| !p.contains("/reviewers") && !p.contains("/reviewer/")),
+            "review OpenAPI must not include reviewer HTTP: {paths:?}"
         );
         assert!(
             paths.iter().any(|p| p.contains("create-entry")),
