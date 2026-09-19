@@ -97,3 +97,18 @@ a non-empty `ssh_key_ref`; vault values are not resolved (GS-05).
 | `enabled=false` | non-empty `ssh_key_ref` fails SecretRef parse or the same namespace |
 
 Error text names the field or gate; it never echoes the `ssh_key_ref` URI.
+
+## binding 合法性矩阵
+
+Startup `Config::validate` checks every `[github_sync.bindings]` row
+(plan-20260916 GS-13). Duplicate diagnostics name both 1-based indexes.
+
+| Field | Rejected if |
+|---|---|
+| `id` | not 1..32 characters of `[A-Za-z0-9_-]`, or not unique |
+| `path` | not a canonical absolute path (`.`, `..`, `//`, trailing `/`) |
+| `path` | not under `/project` by component boundary (`/projectX` fails) |
+| `path` | equal to `monorepo.import_dir` or under it (import_dir compared after normalizing `.` / `..`) |
+| `path` | not unique |
+| `remote` | not `<owner>/<repo>` with each side `^[A-Za-z0-9_-][A-Za-z0-9_.-]*$` and not `.` / `..` |
+| `remote` | not unique |

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::{Path, PathBuf},
 };
@@ -770,7 +770,7 @@ fn validate_github_sync_config_inner(
     let _do_not_resolve = resolver;
 
     if !sync.enabled {
-        return Ok(());
+        return validate_github_sync_bindings(config);
     }
 
     if config.git.push_auth.is_none() {
@@ -797,6 +797,140 @@ fn validate_github_sync_config_inner(
         return Err(MegaError::Other(
             "[github_sync] enabled=true requires ssh_key_ref".to_string(),
         ));
+    }
+
+    validate_github_sync_bindings(config)
+}
+
+fn github_sync_path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn github_sync_normalized_components(path: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            components.pop();
+            continue;
+        }
+        components.push(component);
+    }
+    components
+}
+
+fn github_sync_path_is_under(path: &str, ancestor: &str) -> bool {
+    let path_components = github_sync_path_components(path);
+    let ancestor_components = github_sync_path_components(ancestor);
+    path_components.starts_with(ancestor_components.as_slice())
+        && path_components.len() > ancestor_components.len()
+}
+
+fn github_sync_path_is_under_or_equal_normalized(path: &str, ancestor: &str) -> bool {
+    let path_components = github_sync_path_components(path);
+    let ancestor_components = github_sync_normalized_components(ancestor);
+    path_components.starts_with(ancestor_components.as_slice())
+        && path_components.len() >= ancestor_components.len()
+}
+
+fn github_sync_canonical_abs_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains("//")
+        && path
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn github_sync_binding_id_ok(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn github_sync_remote_segment_ok(segment: &str) -> bool {
+    if segment == "." || segment == ".." {
+        return false;
+    }
+    let mut bytes = segment.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_' || first == b'-') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn github_sync_binding_remote_ok(remote: &str) -> bool {
+    let mut parts = remote.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) => {
+            github_sync_remote_segment_ok(owner) && github_sync_remote_segment_ok(repo)
+        }
+        _ => false,
+    }
+}
+
+fn github_sync_unique_field<'a>(
+    seen: &mut BTreeMap<&'a str, usize>,
+    value: &'a str,
+    index: usize,
+    field: &str,
+) -> Result<(), MegaError> {
+    if let Some(&first) = seen.get(value) {
+        return Err(MegaError::Other(format!(
+            "[github_sync] bindings[{first}].{field} and bindings[{index}].{field} are not unique"
+        )));
+    }
+    seen.insert(value, index);
+    Ok(())
+}
+
+fn validate_github_sync_bindings(config: &Config) -> Result<(), MegaError> {
+    let import_dir = config.monorepo.import_dir.to_string_lossy();
+    let mut seen_ids = BTreeMap::new();
+    let mut seen_paths = BTreeMap::new();
+    let mut seen_remotes = BTreeMap::new();
+
+    for (offset, binding) in config.github_sync.bindings.iter().enumerate() {
+        let index = offset + 1;
+        if !github_sync_binding_id_ok(&binding.id) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].id must be 1..32 [A-Za-z0-9_-] characters"
+            )));
+        }
+        github_sync_unique_field(&mut seen_ids, &binding.id, index, "id")?;
+
+        if !github_sync_canonical_abs_path(&binding.path) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].path must be a canonical absolute path"
+            )));
+        }
+        if !github_sync_path_is_under(&binding.path, "/project") {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].path must be under /project (component boundary)"
+            )));
+        }
+        if github_sync_path_is_under_or_equal_normalized(&binding.path, import_dir.as_ref()) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].path must not be under monorepo.import_dir"
+            )));
+        }
+        github_sync_unique_field(&mut seen_paths, &binding.path, index, "path")?;
+
+        if !github_sync_binding_remote_ok(&binding.remote) {
+            return Err(MegaError::Other(format!(
+                "[github_sync] bindings[{index}].remote must be <owner>/<repo>"
+            )));
+        }
+        github_sync_unique_field(&mut seen_remotes, &binding.remote, index, "remote")?;
     }
 
     Ok(())
@@ -3992,5 +4126,148 @@ mod tests {
                 "{label} leaked the secret-ref marker: {message}"
             );
         }
+    }
+
+    fn github_sync_binding(id: &str, path: &str, remote: &str) -> GithubSyncBinding {
+        GithubSyncBinding {
+            id: id.to_string(),
+            path: path.to_string(),
+            remote: remote.to_string(),
+        }
+    }
+
+    #[test]
+    fn github_sync_binding_identity() {
+        github_sync_enabled_base()
+            .validate()
+            .expect("the GS-04 happy path binding remains valid");
+
+        let mut empty_id = github_sync_enabled_base();
+        empty_id.github_sync.bindings[0].id.clear();
+        let err = empty_id.validate().expect_err("empty id");
+        assert!(err.to_string().contains("bindings[1].id"), "{err}");
+        assert!(err.to_string().contains("1..32"), "{err}");
+
+        let mut too_long = github_sync_enabled_base();
+        too_long.github_sync.bindings[0].id = "a".repeat(33);
+        let err = too_long.validate().expect_err("id longer than 32");
+        assert!(err.to_string().contains("bindings[1].id"), "{err}");
+
+        let mut dotted = github_sync_enabled_base();
+        dotted.github_sync.bindings[0].id = "core.id".to_string();
+        let err = dotted.validate().expect_err("id rejects '.'");
+        assert!(err.to_string().contains("bindings[1].id"), "{err}");
+
+        let mut duplicate = github_sync_enabled_base();
+        duplicate.github_sync.bindings = vec![
+            github_sync_binding("core", "/project/core", "example/core"),
+            github_sync_binding("core", "/project/other", "example/other"),
+        ];
+        let err = duplicate.validate().expect_err("duplicate id");
+        let message = err.to_string();
+        assert!(message.contains("bindings[1].id"), "{err}");
+        assert!(message.contains("bindings[2].id"), "{err}");
+        assert!(message.contains("not unique"), "{err}");
+    }
+
+    #[test]
+    fn github_sync_binding_path() {
+        let mut relative = github_sync_enabled_base();
+        relative.github_sync.bindings[0].path = "project/core".to_string();
+        let err = relative.validate().expect_err("relative path");
+        assert!(err.to_string().contains("canonical absolute path"), "{err}");
+
+        for invalid in [
+            "/project/./core",
+            "/project/../core",
+            "/project//core",
+            "/project/core/",
+        ] {
+            let mut config = github_sync_enabled_base();
+            config.github_sync.bindings[0].path = invalid.to_string();
+            let err = config
+                .validate()
+                .expect_err(&format!("{invalid} must be rejected"));
+            assert!(
+                err.to_string().contains("canonical absolute path"),
+                "{invalid}: {err}"
+            );
+        }
+
+        let mut sibling = github_sync_enabled_base();
+        sibling.github_sync.bindings[0].path = "/projectX/core".to_string();
+        let err = sibling
+            .validate()
+            .expect_err("/projectX is not under /project");
+        assert!(err.to_string().contains("under /project"), "{err}");
+        assert!(err.to_string().contains("component boundary"), "{err}");
+
+        let mut root_only = github_sync_enabled_base();
+        root_only.github_sync.bindings[0].path = "/project".to_string();
+        let err = root_only
+            .validate()
+            .expect_err("/project itself is not under /project");
+        assert!(err.to_string().contains("under /project"), "{err}");
+
+        let mut imported = github_sync_enabled_base();
+        imported.monorepo.import_dir = PathBuf::from("/project/vendor");
+        imported.github_sync.bindings[0].path = "/project/vendor/lib".to_string();
+        let err = imported.validate().expect_err("path under import_dir");
+        assert!(err.to_string().contains("monorepo.import_dir"), "{err}");
+
+        let mut dotted_import = github_sync_enabled_base();
+        dotted_import.monorepo.import_dir = PathBuf::from("/project/./vendor");
+        dotted_import.github_sync.bindings[0].path = "/project/vendor/lib".to_string();
+        let err = dotted_import
+            .validate()
+            .expect_err("noncanonical import_dir still covers the subtree");
+        assert!(err.to_string().contains("monorepo.import_dir"), "{err}");
+
+        let mut duplicate = github_sync_enabled_base();
+        duplicate.github_sync.bindings = vec![
+            github_sync_binding("core", "/project/core", "example/core"),
+            github_sync_binding("other", "/project/core", "example/other"),
+        ];
+        let err = duplicate.validate().expect_err("duplicate path");
+        let message = err.to_string();
+        assert!(message.contains("bindings[1].path"), "{err}");
+        assert!(message.contains("bindings[2].path"), "{err}");
+    }
+
+    #[test]
+    fn github_sync_binding_remote() {
+        for invalid in [
+            "../repo",
+            "./repo",
+            "owner/..",
+            "owner/.",
+            "owner/re po",
+            "owner/re;po",
+            "owner/$()",
+        ] {
+            let mut config = github_sync_enabled_base();
+            config.github_sync.bindings[0].remote = invalid.to_string();
+            let err = config
+                .validate()
+                .expect_err(&format!("{invalid} must be rejected"));
+            assert!(
+                err.to_string().contains("bindings[1].remote"),
+                "{invalid}: {err}"
+            );
+            assert!(
+                err.to_string().contains("<owner>/<repo>"),
+                "{invalid}: {err}"
+            );
+        }
+
+        let mut duplicate = github_sync_enabled_base();
+        duplicate.github_sync.bindings = vec![
+            github_sync_binding("core", "/project/core", "example/core"),
+            github_sync_binding("other", "/project/other", "example/core"),
+        ];
+        let err = duplicate.validate().expect_err("duplicate remote");
+        let message = err.to_string();
+        assert!(message.contains("bindings[1].remote"), "{err}");
+        assert!(message.contains("bindings[2].remote"), "{err}");
     }
 }
