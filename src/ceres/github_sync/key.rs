@@ -15,10 +15,20 @@ const FIELD: &str = "github_sync.ssh_key_ref";
 const INIT_LOCK_KEY: &str = "mega2:github_sync:ssh_key:init";
 const INIT_LOCK_TTL_MS: u64 = 30_000;
 
+const PUBLIC_KEY_COMMENT: &str = "mega2-github-sync";
+
 /// Process-local hold for the GitHub-sync SSH private key (plan-20260916 GS-05).
 #[derive(Clone)]
 pub struct GithubSyncKey {
     inner: PrivateKey,
+}
+
+impl std::fmt::Debug for GithubSyncKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubSyncKey")
+            .field("algorithm", &"Ed25519")
+            .finish_non_exhaustive()
+    }
 }
 
 impl GithubSyncKey {
@@ -37,10 +47,36 @@ impl GithubSyncKey {
     }
 
     pub fn public_openssh(&self) -> Result<String, MegaError> {
-        self.inner.public_key().to_openssh().map_err(|_| {
+        let encoded = self.inner.public_key().to_openssh().map_err(|_| {
             MegaError::Other("github_sync ssh public key could not be encoded".to_string())
-        })
+        })?;
+        let encoded = encoded.trim();
+        if encoded.ends_with(PUBLIC_KEY_COMMENT) {
+            Ok(encoded.to_string())
+        } else {
+            Ok(format!("{encoded} {PUBLIC_KEY_COMMENT}"))
+        }
     }
+}
+
+fn log_generated(key: &GithubSyncKey) -> Result<(), MegaError> {
+    let public_key = key.public_openssh()?;
+    tracing::info!(
+        event = "github_sync_ssh_key_generated",
+        public_key = %public_key,
+        "github_sync ssh key 生成; add this public key to the GitHub machine account"
+    );
+    Ok(())
+}
+
+fn log_loaded(key: &GithubSyncKey) -> Result<(), MegaError> {
+    let public_key = key.public_openssh()?;
+    tracing::info!(
+        event = "github_sync_ssh_key_loaded",
+        public_key = %public_key,
+        "github_sync ssh key 载入"
+    );
+    Ok(())
 }
 
 fn holder() -> &'static Mutex<Option<GithubSyncKey>> {
@@ -60,6 +96,27 @@ pub fn held() -> Option<GithubSyncKey> {
 #[cfg(test)]
 fn clear_held() {
     *holder().lock().expect("github_sync key holder") = None;
+}
+
+#[cfg(test)]
+fn last_generated_openssh() -> &'static Mutex<Option<String>> {
+    static LAST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn remember_generated_openssh(openssh: &str) {
+    *last_generated_openssh()
+        .lock()
+        .expect("last generated openssh") = Some(openssh.to_string());
+}
+
+#[cfg(test)]
+fn take_generated_openssh() -> Option<String> {
+    last_generated_openssh()
+        .lock()
+        .expect("last generated openssh")
+        .take()
 }
 
 /// Load or generate the GitHub-sync Ed25519 key and install the process hold.
@@ -111,6 +168,8 @@ async fn generate_and_store(
     let encoded = generated.to_openssh(LineEnding::LF).map_err(|_| {
         MegaError::Other("github_sync failed to encode Ed25519 ssh key as OpenSSH".to_string())
     })?;
+    #[cfg(test)]
+    remember_generated_openssh(encoded.as_str());
     let mut data = Map::new();
     data.insert(
         secret_ref.field().to_string(),
@@ -133,16 +192,22 @@ async fn ensure_inner(
 
     let secret_ref = parse_secret_ref_for_field(FIELD, &config.ssh_key_ref)?;
     if let Some(key) = load_existing(vault, &secret_ref).await? {
-        return Ok(Some(install(key)));
+        let key = install(key);
+        log_loaded(&key)?;
+        return Ok(Some(key));
     }
 
     let lock = Arc::new(RedLock::new(redis, INIT_LOCK_KEY, INIT_LOCK_TTL_MS));
     let guard = lock.lock().await?;
-    let result = async {
+    let result: Result<GithubSyncKey, MegaError> = async {
         if let Some(key) = load_existing(vault, &secret_ref).await? {
-            return Ok(install(key));
+            let key = install(key);
+            log_loaded(&key)?;
+            return Ok(key);
         }
-        generate_and_store(vault, &secret_ref).await
+        let key = generate_and_store(vault, &secret_ref).await?;
+        log_generated(&key)?;
+        Ok(key)
     }
     .await;
     let unlock_result = guard.unlock().await;
@@ -411,5 +476,230 @@ mod tests {
             held().is_none(),
             "vault error must not install an empty hold"
         );
+    }
+
+    struct LogCapture {
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn start() -> Self {
+            use std::{
+                io::Write,
+                sync::{Arc, Mutex},
+            };
+
+            use tracing_subscriber::fmt::MakeWriter;
+
+            #[derive(Clone)]
+            struct Buf(Arc<Mutex<Vec<u8>>>);
+            impl Write for Buf {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().expect("log buffer").extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl MakeWriter<'_> for Buf {
+                type Writer = Buf;
+                fn make_writer(&self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Buf(buf.clone()))
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            Self {
+                buf,
+                _guard: tracing::subscriber::set_default(subscriber),
+            }
+        }
+
+        fn finish(self) -> String {
+            let Self { buf, _guard } = self;
+            drop(_guard);
+            String::from_utf8(buf.lock().expect("log buffer").clone()).expect("utf8")
+        }
+    }
+
+    fn private_material_fragments(openssh: &str) -> Vec<String> {
+        let lines: Vec<&str> = openssh
+            .lines()
+            .filter(|line| !line.starts_with('-') && !line.is_empty())
+            .collect();
+        let joined: String = lines.concat();
+        let mut frags = vec![openssh.to_string(), joined.clone()];
+        frags.extend(lines.into_iter().map(str::to_string));
+        let hexed: Vec<String> = frags
+            .iter()
+            .map(|frag| frag.bytes().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        frags.extend(hexed);
+        frags
+    }
+
+    fn assert_detector_sees_pem(openssh: &str) {
+        let leaked = format!("leaked\n{openssh}\n");
+        assert!(
+            private_material_fragments(openssh)
+                .iter()
+                .any(|frag| leaked.contains(frag)),
+            "leak detector must catch a multiline PEM disclosure"
+        );
+    }
+
+    fn assert_no_private_material(haystack: &str, openssh: &str) {
+        for frag in private_material_fragments(openssh) {
+            assert!(
+                !haystack.contains(&frag),
+                "private-key material leaked ({frag}): {haystack}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn logs_generated_branch() {
+        let _serial = TEST_SERIAL.lock().await;
+        clear_held();
+        let (_temp, vault) = test_vault().await;
+        let redis = test_redis().await;
+
+        let capture = LogCapture::start();
+        let key = ensure(&enabled_config(), &vault, redis)
+            .await
+            .expect("generate")
+            .expect("hold");
+        let logs = capture.finish();
+        let public = key.public_openssh().expect("public");
+        assert!(
+            logs.contains("github_sync_ssh_key_generated") && logs.contains("生成"),
+            "generate marker missing: {logs}"
+        );
+        assert!(
+            logs.contains(&public)
+                && public.starts_with("ssh-ed25519 ")
+                && public.ends_with(PUBLIC_KEY_COMMENT),
+            "paste-ready public key missing: public={public} logs={logs}"
+        );
+        assert!(
+            logs.contains("GitHub machine account"),
+            "operator hint missing: {logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn logs_loaded_branch_same_public_key() {
+        let _serial = TEST_SERIAL.lock().await;
+        clear_held();
+        let (_temp, vault) = test_vault().await;
+        let redis = test_redis().await;
+
+        let generated = ensure(&enabled_config(), &vault, redis.clone())
+            .await
+            .expect("generate")
+            .expect("hold");
+        let generated_pub = generated.public_openssh().expect("generated public");
+        clear_held();
+
+        let capture = LogCapture::start();
+        let loaded = ensure(&enabled_config(), &vault, redis)
+            .await
+            .expect("load")
+            .expect("hold");
+        let logs = capture.finish();
+        let loaded_pub = loaded.public_openssh().expect("loaded public");
+        assert_eq!(loaded_pub, generated_pub);
+        assert!(
+            logs.contains("github_sync_ssh_key_loaded") && logs.contains("载入"),
+            "load marker missing: {logs}"
+        );
+        assert!(
+            logs.contains(&loaded_pub),
+            "loaded public key missing: {logs}"
+        );
+        assert!(
+            !logs.contains("github_sync_ssh_key_generated"),
+            "load path must not log generate: {logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn private_key_never_leaks() {
+        let _serial = TEST_SERIAL.lock().await;
+        clear_held();
+        let (_temp, vault) = test_vault().await;
+        let redis = test_redis().await;
+
+        let capture = LogCapture::start();
+        let key = ensure(&enabled_config(), &vault, redis.clone())
+            .await
+            .expect("generate")
+            .expect("hold");
+        let generate_logs = capture.finish();
+        let stored = vault
+            .read_secret(SECRET_NAME)
+            .await
+            .expect("read")
+            .expect("written");
+        let openssh = stored
+            .get("value")
+            .and_then(|value| value.as_str())
+            .expect("field")
+            .to_string();
+        assert_detector_sees_pem(&openssh);
+        assert_no_private_material(&generate_logs, &openssh);
+        assert_no_private_material(&format!("{key:?}"), &openssh);
+
+        clear_held();
+        let capture = LogCapture::start();
+        ensure(&enabled_config(), &vault, redis.clone())
+            .await
+            .expect("load");
+        let load_logs = capture.finish();
+        assert_no_private_material(&load_logs, &openssh);
+
+        clear_held();
+        let broken = openssh.replacen("AAAA", "!!!!", 1);
+        vault
+            .write_secret(
+                SECRET_NAME,
+                Some({
+                    let mut corrupt = Map::new();
+                    corrupt.insert("value".to_string(), Value::String(broken.clone()));
+                    corrupt
+                }),
+            )
+            .await
+            .expect("seed corrupt");
+        let capture = LogCapture::start();
+        let parse_err = ensure(&enabled_config(), &vault, redis.clone())
+            .await
+            .expect_err("corrupt");
+        let parse_logs = capture.finish();
+        assert_detector_sees_pem(&broken);
+        assert_no_private_material(&parse_err.to_string(), &broken);
+        assert_no_private_material(&parse_logs, &broken);
+        assert_no_private_material(&format!("{parse_err:?}"), &broken);
+
+        clear_held();
+        let _ = take_generated_openssh();
+        let (_temp_ro, readonly) = test_readonly_vault().await;
+        let capture = LogCapture::start();
+        let vault_err = ensure(&enabled_config(), &readonly, redis)
+            .await
+            .expect_err("readonly");
+        let vault_logs = capture.finish();
+        let generated_on_fail = take_generated_openssh().expect("generated before write fail");
+        assert_detector_sees_pem(&generated_on_fail);
+        assert_no_private_material(&vault_err.to_string(), &generated_on_fail);
+        assert_no_private_material(&vault_logs, &generated_on_fail);
+        assert_no_private_material(&format!("{vault_err:?}"), &generated_on_fail);
     }
 }

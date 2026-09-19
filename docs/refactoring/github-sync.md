@@ -126,7 +126,7 @@ stored in OpenSSH format at `ssh_key_ref` and held in process memory.
 | `enabled=false` | do not generate, do not write vault |
 
 Algorithm is Ed25519 only. Deleting the vault entry and restarting
-generates a new key (public key differs). Public-key logging is GS-06.
+generates a new key (public key differs).
 
 ## 自举的并发与故障语义
 
@@ -150,5 +150,23 @@ wins; a process hold may then diverge from vault until restart. This
 window is not closed here (vault has no compare-and-set). Residual-risk
 questions are frozen at plan-20260916 GS-28 Q8. The operator repair
 is: stop every replica, delete the vault entry, restart one replica to
-bootstrap, start the rest, replace the GitHub deploy key with the new
-public key.
+bootstrap, start the rest, replace the GitHub machine-account key with
+the new public key.
+
+## 公钥获取方式
+
+When `[github_sync] enabled=true`, startup logs the OpenSSH public key
+as a paste-ready line. The private key is not written to logs, error
+text, or `Debug`.
+
+| Branch | Log |
+|---|---|
+| generated | machine-readable `github_sync_ssh_key_generated` / 「生成」; full `ssh-ed25519 … mega2-github-sync` line; hint to add the key to the GitHub machine account |
+| loaded | machine-readable `github_sync_ssh_key_loaded` / 「载入」; the same public-key line as generation |
+
+### 运维指引
+
+1. Set `enabled=true` and start one replica.
+2. Copy the `ssh-ed25519 AAAA… mega2-github-sync` line from the startup log.
+3. Add that public key to the GitHub machine account.
+4. Further replicas load the same vault key and log the same public line.
