@@ -112,3 +112,19 @@ Startup `Config::validate` checks every `[github_sync.bindings]` row
 | `path` | not unique |
 | `remote` | not `<owner>/<repo>` with each side `^[A-Za-z0-9_-][A-Za-z0-9_.-]*$` and not `.` / `..` |
 | `remote` | not unique |
+
+## 金钥生命周期
+
+Startup `AppContext` loads or generates one Ed25519 SSH key when
+`[github_sync] enabled=true` (plan-20260916 GS-05). The private key is
+stored in OpenSSH format at `ssh_key_ref` and held in process memory.
+
+| When | Behavior |
+|---|---|
+| `enabled=true`, vault has no key | generate Ed25519, write OpenSSH private key, hold |
+| `enabled=true`, vault already has a key | load it, do not overwrite, hold |
+| `enabled=false` | do not generate, do not write vault |
+
+Algorithm is Ed25519 only. Deleting the vault entry and restarting
+generates a new key (public key differs). Cross-replica convergence is
+GS-16. Public-key logging is GS-06.

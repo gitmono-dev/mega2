@@ -187,6 +187,12 @@ impl AppContext {
         // without resolving anything (AC1); any failure is a startup error
         // (AC3) before an owner exists, so nothing needs draining here.
         bind_storage_event_emitter(&config, &mut storage, &vault).await?;
+        if let Err(error) =
+            crate::ceres::github_sync::key::ensure(&config.github_sync, &vault).await
+        {
+            storage.storage_event_emitter.shutdown().await;
+            return Err(error);
+        }
         // MC-09: the server-signing vault handle reaches the synthetic-commit
         // sites through storage; vault is built before storage above.
         let storage = storage.with_vault(vault.clone());
