@@ -55,9 +55,11 @@ directory such as `docs`.
 
 ### `scripts/guard/docrefs.sh <markdown-file>...` (GS-19)
 
-**Not on disk yet** — this subsection is the contract for GS-19.
-
-Extracts `docs/*.md` references with `rg -o --no-filename` (no
-multi-file prefixes). Dangling refs exit `1`. Empty match set is
-success (`0`). `rg` exit `>1`, `sort` failure, missing input, or no
-arguments exit `2`.
+Extracts references matching `docs/` plus ASCII letters, digits, `_`,
+`.`, `/`, `-`, then `.md`, using `rg -o --no-filename` (no multi-file
+prefixes; globs, placeholders, and CJK punctuation are not path
+characters). Dangling refs exit `1`. Empty match set is success (`0`).
+`rg` exit `>1`, `sort` failure, missing input, or no arguments exit
+`2`. Isolated fixtures:
+`tests/fixtures/guard/run_docrefs_cases.sh` and
+`run_docrefs_failure_cases.sh`.
