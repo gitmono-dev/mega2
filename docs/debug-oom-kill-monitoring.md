@@ -127,6 +127,9 @@ type=SYSCALL  : syscall=kill a1=SIGKILL exit=0
 #!/usr/bin/env bash
 # oom-monitor.sh — passive OOM / SIGKILL watcher for compile & test workloads
 #
+# Auto-synced into libra & mega2 docs (debug-oom-kill-monitoring.md §6.1) by
+# ~/oom-monitor/sync-docs.sh, triggered on change by the oom-sync.path unit.
+#
 # Independent signals (no PSI / systemd-oomd dependency):
 #   1. Kernel OOM messages (journalctl -k, polled)      — real kernel OOM killer
 #   2. cgroup v2 memory.events oom_kill counters        — container / scope limits
