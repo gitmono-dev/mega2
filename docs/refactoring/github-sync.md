@@ -76,6 +76,7 @@ string path only — this card does not resolve secrets.
 | `GithubSyncConfig` | `enabled`, `ssh_host`, `ssh_user`, `ssh_host_key`, `ssh_key_ref`, `bindings` |
 | `GithubSyncBinding` | `id`, `path`, `remote` |
 
-Whitelist registration, reload classification, and example TOML are
-GS-23. Semantic fail-closed checks are GS-04 / GS-13. No runtime sync
-runs from this schema.
+Whitelist (`github_sync` / `github_sync.bindings`), restart-required
+reload classification, commented `config/config.toml` plus `config init`
+template, and bilingual README links are GS-23. Semantic fail-closed
+checks remain GS-04 / GS-13. No runtime sync runs from this schema.

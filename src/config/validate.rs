@@ -1708,6 +1708,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "oci",
             "agent_capture",
             "storage_events",
+            "github_sync",
             "cedar",
         ]),
         "log" => Some(&["level", "print_std", "with_ansi"]),
@@ -1823,6 +1824,15 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "agent_tenants",
             "agent_repo_paths",
         ]),
+        "github_sync" => Some(&[
+            "enabled",
+            "ssh_host",
+            "ssh_user",
+            "ssh_host_key",
+            "ssh_key_ref",
+            "bindings",
+        ]),
+        "github_sync.bindings" => Some(&["id", "path", "remote"]),
         "cedar" => Some(&["enforcement"]),
         _ => None,
     }

@@ -108,6 +108,19 @@ batch_limit = 100
 # token = "${{file:/run/secrets/team_foo_token}}"
 # paths = ["/project/foo"]
 
+# GitHub outbound sync (plan-20260916). Default disabled. ssh_key_ref is a
+# string only; do not put a private key in this file.
+# [github_sync]
+# enabled = false
+# ssh_host = "github.com"
+# ssh_user = "git"
+# ssh_host_key = "ssh-ed25519 AAAAEXAMPLE"
+# ssh_key_ref = "vault://secret/config/<profile>/github_sync/ssh_key#value"
+# [[github_sync.bindings]]
+# id = "core"
+# path = "/project/core"
+# remote = "example/core"
+
 "#
     )
 }

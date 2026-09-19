@@ -586,3 +586,66 @@ remote = "git@github.com:example/core.git"
     let _key_ref: String = cfg.github_sync.ssh_key_ref;
     let _bindings: Vec<GithubSyncBinding> = cfg.github_sync.bindings;
 }
+
+#[test]
+fn github_sync_rejects_unknown_key() {
+    assert!(
+        validate::known_fields("")
+            .expect("root schema")
+            .contains(&"github_sync")
+    );
+    assert_eq!(
+        validate::known_fields("github_sync").expect("section schema"),
+        [
+            "enabled",
+            "ssh_host",
+            "ssh_user",
+            "ssh_host_key",
+            "ssh_key_ref",
+            "bindings",
+        ]
+    );
+    assert_eq!(
+        validate::known_fields("github_sync.bindings").expect("binding schema"),
+        ["id", "path", "remote"]
+    );
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        base_dir = "/tmp"
+        [database]
+        db_url = "postgres://localhost:5432/mono"
+        [monorepo]
+        import_dir = "/third-party"
+        admin = ["admin"]
+        root_dirs = ["project"]
+        [github_sync]
+        unexpected = true
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("unknown github_sync key must fail closed");
+    assert!(err.to_string().contains("unexpected"), "{err}");
+
+    let binding_value = toml::from_str::<toml::Value>(
+        r#"
+        base_dir = "/tmp"
+        [database]
+        db_url = "postgres://localhost:5432/mono"
+        [monorepo]
+        import_dir = "/third-party"
+        admin = ["admin"]
+        root_dirs = ["project"]
+        [[github_sync.bindings]]
+        unexpected = true
+        "#,
+    )
+    .unwrap();
+    let binding_err = crate::config::validate::reject_unknown_fields(&binding_value)
+        .expect_err("unknown github_sync.bindings key must fail closed");
+    assert!(
+        binding_err.to_string().contains("unexpected"),
+        "{binding_err}"
+    );
+}
