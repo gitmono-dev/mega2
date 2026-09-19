@@ -78,5 +78,22 @@ string path only — this card does not resolve secrets.
 
 Whitelist (`github_sync` / `github_sync.bindings`), restart-required
 reload classification, commented `config/config.toml` plus `config init`
-template, and bilingual README links are GS-23. Semantic fail-closed
-checks remain GS-04 / GS-13. No runtime sync runs from this schema.
+template, and bilingual README links are GS-23. Binding-entry checks
+remain GS-13. No runtime sync runs from this schema.
+
+## 全局前置门
+
+Startup `Config::validate` rejects combinations that cannot run
+(plan-20260916 GS-04). `enabled=false` still parses and namespace-checks
+a non-empty `ssh_key_ref`; vault values are not resolved (GS-05).
+
+| When | Rejected if |
+|---|---|
+| `enabled=true` | `git.push_auth` is unset |
+| `enabled=true` | `bindings` is empty |
+| `enabled=true` | `monorepo.object_format` is not `sha1` |
+| `enabled=true` | `ssh_host_key` is empty |
+| `enabled=true` | `ssh_key_ref` fails `validate_config_secret_ref` under `config/<profile>/github_sync/ssh_key` |
+| `enabled=false` | non-empty `ssh_key_ref` fails SecretRef parse or the same namespace |
+
+Error text names the field or gate; it never echoes the `ssh_key_ref` URI.

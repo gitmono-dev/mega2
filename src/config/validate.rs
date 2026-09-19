@@ -11,7 +11,7 @@ use super::{
     ArtifactGcConfig, BlameConfig, BuckConfig, CedarConfig, Config, DbConfig, GitConfig, LFSConfig,
     LogConfig, MonoConfig, NotificationConfig, OAuthConfig, PackConfig, PushAuth, PushPolicy,
     RedisConfig, VAULT_AUDIT_SINKS, VaultConfig, normalize_token_path,
-    secret::{SecretRef, is_secret_ref_value},
+    secret::{SecretRef, SecretResolver, is_secret_ref_value},
 };
 use crate::common::{errors::MegaError, oci_name::valid_repository_name};
 #[rustfmt::skip]
@@ -136,6 +136,7 @@ impl Config {
         validate_trunk_config_surface(self)?;
         validate_agent_capture_config(self)?;
         validate_storage_events_config(self)?;
+        validate_github_sync_config(self)?;
 
         Ok(())
     }
@@ -742,6 +743,62 @@ pub(crate) fn validate_storage_events_config(config: &Config) -> Result<(), Mega
             "[storage_events] shutdown_grace_seconds must be 0..=10".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Global fail-closed gates for `[github_sync]` (plan-20260916 GS-04).
+/// `ssh_key_ref` is parsed and namespace-checked whenever it is non-empty,
+/// including `enabled=false`. Vault values are never resolved here (GS-05).
+pub(crate) fn validate_github_sync_config(config: &Config) -> Result<(), MegaError> {
+    validate_github_sync_config_inner(config, None)
+}
+
+fn validate_github_sync_config_inner(
+    config: &Config,
+    resolver: Option<&dyn SecretResolver>,
+) -> Result<(), MegaError> {
+    let sync = &config.github_sync;
+    const FIELD: &str = "github_sync.ssh_key_ref";
+    const SUFFIX: &str = "github_sync/ssh_key";
+
+    if !sync.ssh_key_ref.is_empty() {
+        let secret_ref = parse_secret_ref_for_field(FIELD, &sync.ssh_key_ref)?;
+        validate_config_secret_ref(FIELD, &secret_ref, SUFFIX)?;
+    }
+    // AC-8: a resolver may be supplied by tests. Config validate never
+    // reads the vault value (GS-05).
+    let _do_not_resolve = resolver;
+
+    if !sync.enabled {
+        return Ok(());
+    }
+
+    if config.git.push_auth.is_none() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires git.push_auth (storage-only)".to_string(),
+        ));
+    }
+    if sync.bindings.is_empty() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires a non-empty bindings list".to_string(),
+        ));
+    }
+    if config.monorepo.object_format != crate::config::MonoObjectFormat::Sha1 {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires monorepo.object_format=\"sha1\"".to_string(),
+        ));
+    }
+    if sync.ssh_host_key.trim().is_empty() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires ssh_host_key".to_string(),
+        ));
+    }
+    if sync.ssh_key_ref.is_empty() {
+        return Err(MegaError::Other(
+            "[github_sync] enabled=true requires ssh_key_ref".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -1840,10 +1897,17 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
     use crate::config::{
-        PushAuth, PushPolicy, PushTokenConfig, StorageEventsTargetConfig,
-        template::config_init_template, testing::isolated_config,
+        GithubSyncBinding, MonoObjectFormat, PushAuth, PushPolicy, PushTokenConfig,
+        StorageEventsTargetConfig,
+        secret::{SecretRef, SecretResolver},
+        template::config_init_template,
+        testing::isolated_config,
     };
     #[rustfmt::skip]
     use crate::orbit_api::factory::{GcsConfig, LocalConfig, ObjectStorageBackend, S3Config};
@@ -3723,6 +3787,210 @@ mod tests {
                     "{mode_label}/{label} leaked secret material: {message}"
                 );
             }
+        }
+    }
+
+    const GITHUB_SYNC_KEY_REF: &str = "vault://secret/config/example/github_sync/ssh_key#value";
+    const GITHUB_SYNC_KEY_REF_MARKER: &str = "gs04-redact-token";
+
+    fn github_sync_enabled_base() -> Config {
+        let mut config = storage_only_none();
+        config.github_sync.enabled = true;
+        config.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+        config.github_sync.ssh_key_ref = GITHUB_SYNC_KEY_REF.to_string();
+        config.github_sync.bindings = vec![GithubSyncBinding {
+            id: "core".to_string(),
+            path: "/project/core".to_string(),
+            remote: "example/core".to_string(),
+        }];
+        config
+    }
+
+    fn distinctive_github_sync_ref() -> String {
+        format!("vault://secret/config/example/github_sync/ssh_key#{GITHUB_SYNC_KEY_REF_MARKER}")
+    }
+
+    #[test]
+    fn github_sync_global_gates() {
+        github_sync_enabled_base()
+            .validate()
+            .expect("storage-only sha1 plus host key, namespaced ref, and one binding");
+
+        let mut no_auth = valid_config();
+        no_auth.github_sync.enabled = true;
+        no_auth.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+        no_auth.github_sync.ssh_key_ref = GITHUB_SYNC_KEY_REF.to_string();
+        no_auth.github_sync.bindings = vec![GithubSyncBinding {
+            id: "core".to_string(),
+            path: "/project/core".to_string(),
+            remote: "example/core".to_string(),
+        }];
+        let err = no_auth
+            .validate()
+            .expect_err("enabled=true requires git.push_auth");
+        assert!(err.to_string().contains("git.push_auth"), "{err}");
+        assert!(err.to_string().contains("[github_sync]"), "{err}");
+
+        let mut empty_bindings = github_sync_enabled_base();
+        empty_bindings.github_sync.bindings.clear();
+        let err = empty_bindings
+            .validate()
+            .expect_err("enabled=true requires bindings");
+        assert!(err.to_string().contains("bindings"), "{err}");
+
+        let mut bad_hash = github_sync_enabled_base();
+        bad_hash.monorepo.object_format = MonoObjectFormat::Sha256;
+        let err = bad_hash.validate().expect_err("enabled=true requires sha1");
+        assert!(err.to_string().contains("object_format"), "{err}");
+        assert!(err.to_string().contains("sha1"), "{err}");
+
+        let mut empty_host_key = github_sync_enabled_base();
+        empty_host_key.github_sync.ssh_host_key.clear();
+        let err = empty_host_key
+            .validate()
+            .expect_err("enabled=true requires ssh_host_key");
+        assert!(err.to_string().contains("ssh_host_key"), "{err}");
+
+        let mut empty_ref = github_sync_enabled_base();
+        empty_ref.github_sync.ssh_key_ref.clear();
+        let err = empty_ref
+            .validate()
+            .expect_err("enabled=true requires ssh_key_ref");
+        assert!(err.to_string().contains("ssh_key_ref"), "{err}");
+
+        let mut bad_ns = github_sync_enabled_base();
+        bad_ns.github_sync.ssh_key_ref =
+            "vault://secret/config/example/other/ssh_key#value".to_string();
+        let err = bad_ns
+            .validate()
+            .expect_err("enabled=true rejects the wrong SecretRef namespace");
+        assert!(err.to_string().contains("github_sync.ssh_key_ref"), "{err}");
+    }
+
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SecretResolver for CountingResolver {
+        async fn resolve(&self, _: &SecretRef) -> Result<String, MegaError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(MegaError::Other(
+                "github_sync validate must not resolve vault".to_string(),
+            ))
+        }
+
+        async fn evict(&self, _: &SecretRef) {}
+
+        async fn evict_all(&self) {}
+    }
+
+    #[test]
+    fn github_sync_disabled_validation_layers() {
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let mut disabled = valid_config();
+        disabled.github_sync.ssh_key_ref = GITHUB_SYNC_KEY_REF.to_string();
+        super::validate_github_sync_config_inner(&disabled, Some(&resolver))
+            .expect("disabled mode still accepts a namespaced ssh_key_ref");
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            0,
+            "disabled validate must not resolve vault"
+        );
+        disabled
+            .validate()
+            .expect("public validate path also skips vault");
+
+        let mut missing_field = valid_config();
+        missing_field.github_sync.ssh_key_ref =
+            "vault://secret/config/example/github_sync/ssh_key".to_string();
+        let err = missing_field
+            .validate()
+            .expect_err("disabled mode still parses ssh_key_ref");
+        assert!(err.to_string().contains("github_sync.ssh_key_ref"), "{err}");
+        assert!(err.to_string().contains("#field"), "{err}");
+
+        let mut wrong_ns = valid_config();
+        wrong_ns.github_sync.ssh_key_ref =
+            "vault://secret/config/example/other/ssh_key#value".to_string();
+        let err = wrong_ns
+            .validate()
+            .expect_err("disabled mode still checks the namespace");
+        assert!(err.to_string().contains("github_sync.ssh_key_ref"), "{err}");
+    }
+
+    #[test]
+    fn github_sync_errors_redact_secret_ref() {
+        let leaked = distinctive_github_sync_ref();
+        let cases: Vec<(&str, Config)> = vec![
+            ("disabled-parse", {
+                let mut config = valid_config();
+                config.github_sync.ssh_key_ref = format!(
+                    "vault://secret/config/example/github_sync/ssh_key{GITHUB_SYNC_KEY_REF_MARKER}"
+                );
+                config
+            }),
+            ("disabled-namespace", {
+                let mut config = valid_config();
+                config.github_sync.ssh_key_ref = format!(
+                    "vault://secret/config/example/other/ssh_key#{GITHUB_SYNC_KEY_REF_MARKER}"
+                );
+                config
+            }),
+            ("enabled-push-auth", {
+                let mut config = valid_config();
+                config.github_sync.enabled = true;
+                config.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.github_sync.bindings = vec![GithubSyncBinding {
+                    id: "core".to_string(),
+                    path: "/project/core".to_string(),
+                    remote: "example/core".to_string(),
+                }];
+                config
+            }),
+            ("enabled-bindings", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.github_sync.bindings.clear();
+                config
+            }),
+            ("enabled-object-format", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.monorepo.object_format = MonoObjectFormat::Sha256;
+                config
+            }),
+            ("enabled-host-key", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked.clone();
+                config.github_sync.ssh_host_key.clear();
+                config
+            }),
+            ("enabled-namespace", {
+                let mut config = github_sync_enabled_base();
+                config.github_sync.ssh_key_ref = leaked
+                    .clone()
+                    .replace("github_sync/ssh_key", "other/ssh_key");
+                config
+            }),
+        ];
+
+        for (label, config) in cases {
+            let err = config
+                .validate()
+                .expect_err(&format!("{label} must fail closed"));
+            let message = err.to_string();
+            assert!(
+                !message.contains(&leaked),
+                "{label} leaked ssh_key_ref: {message}"
+            );
+            assert!(
+                !message.contains(GITHUB_SYNC_KEY_REF_MARKER),
+                "{label} leaked the secret-ref marker: {message}"
+            );
         }
     }
 }
