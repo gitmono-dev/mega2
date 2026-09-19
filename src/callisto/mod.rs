@@ -27,7 +27,6 @@ pub mod bots;
 pub mod buck_session;
 pub mod buck_session_file;
 pub mod check_result;
-pub mod cla_sign_status;
 pub mod commit_auths;
 pub mod entity_ext;
 pub mod git_blob;

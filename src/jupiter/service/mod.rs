@@ -2,7 +2,6 @@ pub mod agent_capture_service;
 pub mod artifact_service;
 pub mod buck_service;
 pub mod cl_service;
-pub mod cla_service;
 pub mod git_service;
 pub mod import_service;
 pub mod lfs_service;

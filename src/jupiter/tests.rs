@@ -20,10 +20,10 @@ use crate::{
         migration::apply_migrations,
         service::{
             agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
-            buck_service::BuckService, cl_service::CLService, cla_service::ClaService,
-            git_service::GitService, import_service::ImportService, lfs_service::LfsService,
-            mono_service::MonoService, oci_service::OciService,
-            push_queue_service::PushQueueService, webhook_service::WebhookService,
+            buck_service::BuckService, cl_service::CLService, git_service::GitService,
+            import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
+            oci_service::OciService, push_queue_service::PushQueueService,
+            webhook_service::WebhookService,
         },
         storage::{
             AppService, Storage,
@@ -32,7 +32,6 @@ use crate::{
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
             cl_storage::ClStorage,
-            cla_storage::ClaStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
             git_db_storage::GitDbStorage,
@@ -184,7 +183,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         git_db_storage: GitDbStorage { base: base.clone() },
         gpg_storage: GpgStorage { base: base.clone() },
         lfs_db_storage: LfsDbStorage { base: base.clone() },
-        cla_storage: ClaStorage { base: base.clone() },
         user_storage: UserStorage { base: base.clone() },
         group_storage: GroupStorage { base: base.clone() },
         cl_storage: ClStorage { base: base.clone() },
@@ -206,7 +204,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
 
     Storage {
         app_service: Arc::new(svc),
-        cla_service: ClaService::new(base.clone()),
         cl_service: CLService::mock(),
         push_queue_service: PushQueueService::new(
             base.clone(),
