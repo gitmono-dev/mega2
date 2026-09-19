@@ -7,8 +7,8 @@ use utoipa::ToSchema;
 use crate::{
     callisto::{check_result, sea_orm_active_enums::CheckTypeEnum},
     ceres::merge_checker::{
-        cl_sync_checker::ClSyncChecker, cla_sign_checker::ClaSignChecker,
-        commit_message_checker::CommitMessageChecker, gpg_signature_checker::GpgSignatureChecker,
+        cl_sync_checker::ClSyncChecker, commit_message_checker::CommitMessageChecker,
+        gpg_signature_checker::GpgSignatureChecker,
     },
     common::errors::MegaError,
     config::PushPolicy,
@@ -16,7 +16,6 @@ use crate::{
 };
 
 pub mod cl_sync_checker;
-mod cla_sign_checker;
 mod commit_message_checker;
 pub(crate) mod gpg_signature_checker;
 
@@ -41,7 +40,6 @@ pub enum CheckType {
     ClSync,
     MergeConflict,
     CiStatus,
-    ClaSign,
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -82,7 +80,6 @@ impl CheckType {
             CheckType::ClSync => "Cl sync",
             CheckType::MergeConflict => "Merge conflict",
             CheckType::CiStatus => "Ci status",
-            CheckType::ClaSign => "CLA sign",
         }
     }
 
@@ -106,7 +103,6 @@ impl CheckType {
             CheckType::CiStatus => {
                 "Verify that all required continuous integration pipelines have passed"
             }
-            CheckType::ClaSign => "Ensure the CL author has signed CLA",
         }
     }
 }
@@ -123,7 +119,7 @@ impl TryFrom<CheckTypeEnum> for CheckType {
             CheckTypeEnum::MergeConflict => Ok(CheckType::MergeConflict),
             CheckTypeEnum::CiStatus => Ok(CheckType::CiStatus),
             CheckTypeEnum::CodeReview => Err(()),
-            CheckTypeEnum::ClaSign => Ok(CheckType::ClaSign),
+            CheckTypeEnum::ClaSign => Err(()),
         }
     }
 }
@@ -137,7 +133,6 @@ impl From<CheckType> for CheckTypeEnum {
             CheckType::ClSync => CheckTypeEnum::ClSync,
             CheckType::MergeConflict => CheckTypeEnum::MergeConflict,
             CheckType::CiStatus => CheckTypeEnum::CiStatus,
-            CheckType::ClaSign => CheckTypeEnum::ClaSign,
         }
     }
 }
@@ -172,12 +167,6 @@ impl CheckerRegistry {
         r.register(
             CheckType::GpgSignature,
             Box::new(GpgSignatureChecker {
-                storage: storage.clone(),
-            }),
-        );
-        r.register(
-            CheckType::ClaSign,
-            Box::new(ClaSignChecker {
                 storage: storage.clone(),
             }),
         );

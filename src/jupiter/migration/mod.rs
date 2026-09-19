@@ -133,6 +133,7 @@ pub(crate) mod m20260919_000400_drop_mega_cl_reviewer;
 pub(crate) mod m20260919_000500_delete_code_review_check_rows;
 pub(crate) mod m20260919_000600_drop_mega_code_review;
 pub(crate) mod m20260919_000700_drop_label_tables;
+pub(crate) mod m20260919_000800_delete_cla_sign_check_rows;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -254,6 +255,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260919_000500_delete_code_review_check_rows::Migration),
             Box::new(m20260919_000600_drop_mega_code_review::Migration),
             Box::new(m20260919_000700_drop_label_tables::Migration),
+            Box::new(m20260919_000800_delete_cla_sign_check_rows::Migration),
         ]
     }
 }
