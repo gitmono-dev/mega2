@@ -61,7 +61,7 @@ mega2_it_ensure_env_test() {
 }
 
 mega2_it_up_data() {
-  mega2_it_info "starting data plane (postgres/redis/rustfs/rustfs-init/mailpit)"
+  mega2_it_info "starting data plane (postgres/redis/rustfs/rustfs-init)"
   mega2_it_compose up -d --wait
 }
 
@@ -149,7 +149,5 @@ mega2_it_health() {
   mega2_it_compose exec -T postgres pg_isready -U mega2 -d mega2
   mega2_it_info "redis"
   mega2_it_compose exec -T redis redis-cli ping
-  mega2_it_info "mailpit"
-  curl -fsS "http://127.0.0.1:18025/api/v1/messages" >/dev/null
   echo "OK: data-plane health checks passed"
 }
