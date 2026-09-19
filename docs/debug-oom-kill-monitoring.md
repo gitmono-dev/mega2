@@ -205,15 +205,18 @@ while IFS= read -r f; do
   [ -n "$v" ] && prev["$f"]="$v"
 done < <(find /sys/fs/cgroup -name memory.events 2>/dev/null)
 
-# baseline build/test procs (pid:starttime)
+# baseline build/test procs (pid -> "lstart|cmdline")
 declare -A bprocs
 scan_procs() {
-  local out; out=$(ps -eo pid,lstart,args 2>/dev/null | grep -E 'cargo|rustc|--test-threads|/target/debug/deps' | grep -v grep)
+  local out pid rest lstart args
+  out=$(ps -eo pid=,lstart=,args= 2>/dev/null | grep -E 'cargo|rustc|--test-threads|/target/debug/deps' | grep -v grep)
+  bprocs=()   # clear stale entries (dead pids must disappear from the tracked set)
   [ -z "$out" ] && return 0
   while IFS= read -r line; do
-    set -- $line
-    pid=$1; shift 3
-    bprocs["$pid"]="$(date -d "$1 $2 $3 $4 $5" +%s 2>/dev/null || echo 0):$*"
+    read -r pid rest <<< "$line"   # handles leading whitespace; pid=first token
+    lstart=$(awk '{for(i=1;i<=6&&i<=NF;i++)printf "%s%s",$i,(i<6?" ":"");exit}' <<< "$rest")
+    args=$(awk '{for(i=7;i<=NF;i++)printf "%s%s",$i,(i<NF?" ":"");exit}' <<< "$rest")
+    [ -n "$pid" ] && bprocs["$pid"]="${lstart}|${args}"
   done <<< "$out"
 }
 scan_procs
@@ -256,8 +259,19 @@ while true; do
   scan_procs   # repopulates global bprocs with current set
   for pid in "${!old[@]}"; do
     if [ -z "${bprocs[$pid]:-}" ]; then
-      log "BUILD PROC EXIT: pid=$pid was=[${old[$pid]}]"
-      snapshot "build-proc-exit:pid=$pid" "$last_ts_j"
+      was="${old[$pid]}"
+      log "BUILD PROC EXIT: pid=$pid was=[$was]"
+      # full snapshot for test/deps binaries; rustc/cargo exits get one line only
+      # (unless kill/oom hints appear in the journal window)
+      case "$was" in
+        *rustc*|*cargo*)
+          if journalctl --since "$last_ts_j" --no-pager 2>/dev/null \
+             | grep -qiE 'Killed process|Killing process|signal SIGKILL|out of memory|oom-kill'; then
+            snapshot "build-proc-exit(abnormal?):pid=$pid" "$last_ts_j"
+          fi ;;
+        *)
+          snapshot "build-proc-exit:pid=$pid" "$last_ts_j" ;;
+      esac
     fi
   done
   unset old
