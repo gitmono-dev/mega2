@@ -13,8 +13,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 
 - **位置：** `src/**/*.rs` 中的 `#[cfg(test)] mod tests`（随 `mega2-core` 编译）。
 - **用途：** 需要直接调用 crate 内部 API 的路径（storage、migration、通知
-  触发器等）。可连接 Docker PostgreSQL / Redis；Mailpit 仅属于 website 邮件
-  IT，mega2 用例不得把它当作 SMTP 投递依赖。
+  触发器等）。可连接 Docker PostgreSQL / Redis。本仓 compose 数据面不启动
+  SMTP 捕获服务；mega2 用例不得把它当作投递依赖。
 - **边界：** 允许 `use crate::...`；不拉起真实 `mega2` 二进制。
 
 ### 黑盒进程测试（cargo-native）
@@ -117,19 +117,8 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 
 ## 已登记服务
 
-### mailpit（website 邮件捕获）
-
-| 项 | 值 |
-|---|---|
-| 服务名 | `mailpit` |
-| 用途 | 可选的 megaui（`website-next`）认证和产品邮件 SMTP 捕获；**不是 mega2 服务依赖或测试门** |
-| 端口 | `127.0.0.1:11025:1025`（SMTP）、`127.0.0.1:18025:8025`（UI/API） |
-| profiles | 无；默认数据面可启动，但仅在 website 邮件 IT 需要时消费 |
-| depends_on | mega2 不依赖它。website-next 若选择 SMTP 测试 provider，可连接 `mailpit:1025` |
-| CI 入口 | 仅 website 邮件 IT 需要捕获时使用；`config-validation.yml` 不要求 mega2 SMTP 成功路径 |
-| 清理 | `docker compose -p mega2-it -f docker-compose.test.yml down -v` |
-
-`.env.test.example` 的 `MAILPIT_*` 变量同样仅供 website IT；mega2 不读取它们。
+本仓默认数据面是 postgres / redis / rustfs / rustfs-init。SMTP 捕获容器
+**不是**本仓必起服务，也不在 `docker-compose.test.yml` 登记。
 
 ### rustfs + rustfs-init（S3-compatible 对象存储）
 
@@ -144,7 +133,7 @@ runner）必须先按本节登记并评审，**禁止绕规范直接改 `docker-
 | profiles | 无；两者均参与默认 `up -d --wait`。`rustfs-init` 在 `rustfs` healthy 后幂等创建 **`mega2`** 与 **`monoui`** 桶，再以 healthcheck 报告就绪（纯 one-shot exit 会让 `--wait` 失败） |
 | depends_on | `rustfs-init` → `rustfs` 且 `condition: service_healthy` |
 | 清理 | `docker compose -p mega2-it -f docker-compose.test.yml down -v`；零残留按 project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p mega2-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p mega2 --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（产品邮件投递由 website 负责，本 job **不**跑本仓 SmtpMailer→Mailpit 或 `integration_mail_dispatcher_*`）；job 末尾 `if: always()` 下 `-p mega2-it --profile git --profile app --profile web down -v` |
+| CI 入口 | `.github/workflows/config-validation.yml` 的 `validate-config` job：先 `mkdir -p` + `chmod 1777` 共享 git 工作根并导出 `MEGA2_IT_GIT_UID/GID=$(id -u/g)`，再 `docker compose -p mega2-it -f docker-compose.test.yml --profile git up -d --wait` 拉起含 rustfs、`rustfs-init`（建桶）与 git-cli 的栈；执行面含 `cargo test -p mega2 --test integration_vault`、`--test integration_website_auth`、`--test integration_git_cli`（本 job **不**跑本仓 SMTP 投递门）；job 末尾 `if: always()` 下 `-p mega2-it --profile git --profile app --profile web down -v` |
 | secret | 公开测试凭据 `rustfs` / `rustfs_secret`（仅测试栈，与 `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` 及 `.env.test.example` 对齐）；CI 对同类凭据使用 `::add-mask::` |
 | 降级 | 无客户端版本 pin 需求；本地可不启 rustfs（相关 gate 自行 skip/opt-in） |
 
@@ -215,10 +204,10 @@ git-smoke runner git-lfs 固定版本: `git-lfs/3.7.1`
 | 网络 | 默认 `networks.default` → `mega2-test-network`（可解析 `postgres`/`redis` 服务名） |
 | 卷 / 工作目录 | named volume `mega2-data` → `/var/lib/mega2`（`MEGA_BASE_DIR`）；对象存储默认 local → `/var/lib/mega2/objects` |
 | profiles | `profiles: ["app"]`：**不**参与默认 `up -d --wait`；显式 `--profile app` |
-| depends_on | `postgres`、`redis`（`service_healthy`）。`MEGA_OAUTH__WEBSITE_API_BASE_URL=http://website-next:7001`；`MEGA_OAUTH__ALLOWED_CORS_ORIGINS` 保留既有 IT origin 并含 `http://127.0.0.1:17001`。不声明对 `website-next` 的 `depends_on`：该服务仅属 `web` profile，而 `mega2` 属 `app`；跨 profile 依赖会使 app-only smoke 无法解析。会话联调使用下方规定的 web-first 启动顺序；不依赖 Mailpit 或 RustFS。 |
+| depends_on | `postgres`、`redis`（`service_healthy`）。`MEGA_OAUTH__WEBSITE_API_BASE_URL=http://website-next:7001`；`MEGA_OAUTH__ALLOWED_CORS_ORIGINS` 保留既有 IT origin 并含 `http://127.0.0.1:17001`。不声明对 `website-next` 的 `depends_on`：该服务仅属 `web` profile，而 `mega2` 属 `app`；跨 profile 依赖会使 app-only smoke 无法解析。会话联调使用下方规定的 web-first 启动顺序；不依赖 RustFS。 |
 | 清理 | `docker compose -p mega2-it -f docker-compose.test.yml --profile app down -v`（或与 `--profile git` 一并） |
 | CI 入口 | `.github/workflows/config-validation.yml`：先检查并 checkout sibling `../megaui`，在数据面 `up` 后用 `Dockerfile.it-runtime` 打 `mega2:local`，再以 `--profile app --profile web up -d --wait` 同启服务，探测 `19180/api/openapi.json` 与 `17001/api/auth/get-session`；job 运行 `WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1`，并在 `if: always()` 带两个 profile `down -v`。 |
-| secret | 无注入生产 secret；DB 使用公开测试口令 `mega2_test_password`（用户/库名均为 `mega2`）；website-mail bearer 仅为公开的隔离 IT 值 |
+| secret | 无注入生产 secret；DB 使用公开测试口令 `mega2_test_password`（用户/库名均为 `mega2`） |
 | 降级 / 黑盒 | 栈级 smoke：`integration_compose_mega2_http_smoke`（端口未监听时 soft-skip）。隔离黑盒仍用 `CARGO_BIN_EXE` |
 
 本地源码构建示例：
@@ -290,9 +279,9 @@ harness 变量 `MEGA2_IT_SCORPIO_WORKDIR`（默认 `/tmp/mega2-scorpiofs`）与 
 | depends_on / 会话联调顺序 | `website-db-init` → `postgres`（`service_healthy`）；`megaui-collab` 独立健康检查；`website-next` → `postgres` + `website-db-init`（`service_completed_successfully`）+ `megaui-collab`（`service_healthy`）+ **`rustfs-init`（`service_healthy`，FS-02：确保保留名 `monoui` 桶已建）**；初始化失败时 Next 不会启动。没有 `mega2` 跨 profile 依赖 |
 | 对象存储 env（FS-02） | `STORAGE_PROVIDER=s3`，`S3_BUCKET=monoui`，`S3_ENDPOINT=http://rustfs:9000`，`S3_PUBLIC_URL=http://127.0.0.1:19000/monoui`，`S3_FORCE_PATH_STYLE=true`，凭据 `rustfs` / `rustfs_secret`；该 bucket 名为兼容性保留值；见 megaui [`workspace-storage-backend.md`](../../../megaui/docs/implementation/workspace-storage-backend.md) |
 | 清理 | `docker compose -p mega2-it -f docker-compose.test.yml --profile web down -v`；`-v` 删除 Postgres 数据卷后 `website` 库与 schema 不保留，零残留仍按 compose project label 判定 |
-| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../megaui`。构建 `mega2:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth` 与 `integration_website_mail`，并在 `if: always()` 使用相同 profile `down -v`。 |
-| secret | `BETTER_AUTH_SECRET` 与 `MEGA2_INTERNAL_MAIL_BEARER` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
-| 邮件 env（WE-06） | `EMAIL_PROVIDER=test`（内存记录，无云调用）、`EMAIL_DEFAULT_FROM`、`MEGA2_INTERNAL_MAIL_BEARER`、可选 `MEGA2_PUBLIC_BASE_URL`；默认不依赖 `mailpit`（smtp 捕获仍可选） |
+| CI 入口 | `.github/workflows/config-validation.yml` 强制 checkout sibling `../megaui`。构建 `mega2:local` 后以 `--profile app --profile web up -d --wait` 同启，设置 `WEBSITE_IT=1` 跑 `integration_website_auth`，并在 `if: always()` 使用相同 profile `down -v`。 |
+| secret | `BETTER_AUTH_SECRET` 是仅用于本地 IT 的公开固定值；不得替换为或记录生产 secret |
+| 邮件 env（website 侧） | megaui 自管 `EMAIL_PROVIDER=test`（内存记录，无云调用）等；本仓不登记、不启动 SMTP 捕获服务 |
 | 性能 | 首次 source build 预算 ≤ 20 分钟；默认 profile 不构建、不启动该服务 |
 
 对照锚点：`docker-compose.test.yml` 的 `website-db-init` / `website-next` 服务块；拓扑语义见
@@ -313,15 +302,9 @@ source .env.test
 WEBSITE_IT=1 cargo test -p mega2 --test integration_website_auth -- --test-threads=1 --nocapture
 ```
 
-栈级内部产品邮件黑盒（WE-06）：
-
-```bash
-source .env.test
-WEBSITE_IT=1 cargo test -p mega2 --test integration_website_mail -- --test-threads=1 --nocapture
-```
-
 未设置 `WEBSITE_IT=1` 时该 target 会明确输出 `SKIP`，供默认数据面循环使用；设置后，
-`website-next:17001` 不可达即测试失败，因此 CI 不会将跳过误记为通过。
+`website-next:17001` 不可达即测试失败，因此 CI 不会将跳过误记为通过。本仓不再提供
+产品邮件 IT target。
 
 ### cargo-native self-start SSH（ADR-GM-05）
 
