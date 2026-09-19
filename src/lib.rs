@@ -50,6 +50,23 @@ pub mod authz_audit_ops {
 pub use cli::parse;
 pub use common::errors::MegaError;
 
+/// Internal seam for github_sync loopback ITs (plan-20260916 GS-07).
+#[doc(hidden)]
+pub mod github_sync {
+    pub use crate::ceres::github_sync::{
+        key::{GithubSyncKey, held},
+        ssh::{SshError, SshSession, SshStage, connect},
+    };
+
+    pub fn install_openssh(openssh: &str) -> Result<GithubSyncKey, crate::MegaError> {
+        crate::ceres::github_sync::key::install_openssh_for_it(openssh)
+    }
+
+    pub fn clear_held() {
+        crate::ceres::github_sync::key::clear_held_for_it();
+    }
+}
+
 /// Hidden re-exports for the `migrate_local_to_s3` auxiliary binary (ORB-06).
 #[doc(hidden)]
 pub mod orbit_bin_api {

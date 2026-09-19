@@ -57,6 +57,19 @@ impl GithubSyncKey {
             Ok(format!("{encoded} {PUBLIC_KEY_COMMENT}"))
         }
     }
+
+    pub(crate) fn private_key(&self) -> &PrivateKey {
+        &self.inner
+    }
+
+    pub(crate) fn algorithm(&self) -> Algorithm {
+        self.inner.algorithm()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_private_key_for_test(inner: PrivateKey) -> Self {
+        Self { inner }
+    }
 }
 
 fn log_generated(key: &GithubSyncKey) -> Result<(), MegaError> {
@@ -93,9 +106,24 @@ pub fn held() -> Option<GithubSyncKey> {
     holder().lock().expect("github_sync key holder").clone()
 }
 
+pub(crate) fn install_openssh_for_it(openssh: &str) -> Result<GithubSyncKey, MegaError> {
+    Ok(install(GithubSyncKey::from_openssh(openssh)?))
+}
+
+pub(crate) fn install_key_for_it(key: GithubSyncKey) -> GithubSyncKey {
+    install(key)
+}
+
+pub(crate) fn clear_held_for_it() {
+    *holder().lock().expect("github_sync key holder") = None;
+}
+
+#[cfg(test)]
+pub(crate) static HOLDER_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 fn clear_held() {
-    *holder().lock().expect("github_sync key holder") = None;
+    clear_held_for_it();
 }
 
 #[cfg(test)]
@@ -218,9 +246,7 @@ async fn ensure_inner(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::Mutex as AsyncMutex;
-
-    use super::*;
+    use super::{HOLDER_TEST_SERIAL as TEST_SERIAL, *};
     use crate::{
         contract::vault::integration::vault_core::VaultCore,
         jupiter::storage::{
@@ -228,8 +254,6 @@ mod tests {
             vault_storage::VaultStorage,
         },
     };
-
-    static TEST_SERIAL: AsyncMutex<()> = AsyncMutex::const_new(());
 
     const KEY_REF: &str = "vault://secret/config/example/github_sync/ssh_key#value";
     const SECRET_NAME: &str = "config/example/github_sync/ssh_key";

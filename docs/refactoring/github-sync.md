@@ -170,3 +170,24 @@ text, or `Debug`.
 2. Copy the `ssh-ed25519 AAAA… mega2-github-sync` line from the startup log.
 3. Add that public key to the GitHub machine account.
 4. Further replicas load the same vault key and log the same public line.
+
+## 传输与主机金钥钉住
+
+Outbound SSH reads the process hold from GS-05, connects to
+`[github_sync].ssh_host` / `ssh_user`, and authenticates with that
+Ed25519 key. `ssh_host` is `host` or `host:port` (default port 22).
+
+The server host key is compared to `ssh_host_key` as OpenSSH public-key
+bytes (exact trimmed encoding, or the parsed key-material bytes when the
+configured line carries a comment). A mismatch, an unparseable pin, or a
+certificate host key aborts **before** public-key authentication.
+Non-Ed25519 client keys are rejected with an actionable `auth` error.
+
+Failures carry `stage=ssh_connect|host_key|auth`. The TCP plus handshake
+plus public-key authentication budget is 15 seconds; a timeout is
+`ssh_connect`, not an unbounded wait. The russh session also has a 15
+second inactivity bound so a cancelled or stalled handshake cannot leak
+a background task or socket.
+
+Loopback evidence is `tests/integration_github_sync.rs`
+(`ssh_connect_authenticates`). Production GitHub is `DEFER-GS-08`.
