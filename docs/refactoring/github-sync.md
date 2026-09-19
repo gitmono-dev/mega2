@@ -37,14 +37,18 @@ the decoded path. Each line is:
 
 ### `scripts/guard/allowlist.sh <baseline> <allowed-path>...` (GS-22)
 
-**Not on disk yet** — this subsection is the contract for GS-22.
+Compares the union of baseline paths and current dirty paths. Allowed
+paths may change. Any other path whose current fingerprint differs from
+the baseline exits `1`. Rename source and destination are judged
+separately. `kind=unsupported` is always out of allowlist, even when the
+path was passed as allowed. Missing baseline, empty allowlist, usage
+error, or tool failure (`libra` / `sha256sum` / `stat` / `readlink` /
+`grep` / `sort`) exits `2`. Isolated fixtures:
+`tests/fixtures/guard/run_allowlist_cases.sh` and
+`run_allowlist_failure_cases.sh`.
 
-Compares the union of baseline paths and current dirty paths against the
-full fingerprint. Paths not on the allowlist whose fingerprint differs
-from the baseline exit `1`. Rename source and destination are judged
-separately. `kind=unsupported` is always out of allowlist. Missing
-baseline, empty allowlist, or tool failure (`libra` / `sha256sum` /
-`stat` / `readlink` / `grep` / `sort`) exits `2`.
+A baseline or live symlink record whose target contains two consecutive
+spaces is ambiguous in the line format and exits `2`.
 
 Callers must pass that card’s exact product paths — never a wide
 directory such as `docs`.
