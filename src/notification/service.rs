@@ -177,10 +177,7 @@ mod tests {
     use super::*;
     use crate::{
         jupiter::{migration::apply_migrations, tests::test_db_connection},
-        notification::{
-            channels::{SlackChannel, WebhookChannel},
-            testing::MockChannel,
-        },
+        notification::{channels::WebhookChannel, testing::MockChannel},
     };
 
     /// `NotificationService::set_active` writes a process-global handle, so the
@@ -218,18 +215,13 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
 
         let stg = NotificationStorage::new(Arc::new(db));
-        let slack: Arc<dyn NotificationChannel> = Arc::new(
-            SlackChannel::new(crate::config::secret::SecretString::new(
-                "http://127.0.0.1:1/services/secret",
-            ))
-            .unwrap(),
-        );
+        let extra: Arc<dyn NotificationChannel> = Arc::new(MockChannel::new("extra", true));
         let webhook: Arc<dyn NotificationChannel> =
             Arc::new(WebhookChannel::new("http://127.0.0.1:1/hook".to_string(), None).unwrap());
-        let service = test_service(stg, vec![slack, webhook], true);
+        let service = test_service(stg, vec![extra, webhook], true);
 
         assert_eq!(service.channels().len(), 2);
-        assert!(service.channel_for("slack").is_some());
+        assert!(service.channel_for("extra").is_some());
         assert!(service.channel_for("webhook").is_some());
     }
 

@@ -203,7 +203,7 @@ impl AppContext {
             let redis_config = resolve_redis_url_secret(&config.redis, &vault).await?;
             let connection = init_connection(&redis_config).await?;
 
-            // Build notification channels after Vault so optional Slack and webhook
+            // Build notification channels after Vault so optional webhook
             // credentials can be resolved. In-app delivery does not require `[mail]`.
             let notification_shutdown = CancellationToken::new();
             let notif_stg = storage.notification_storage();
@@ -216,28 +216,6 @@ impl AppContext {
                     crate::config::validate::validate_notification_config(notification_cfg)?;
                     let resolver =
                         VaultSecretResolver::new(vault.clone(), Duration::from_secs(300));
-                    if let Some(slack) = notification_cfg
-                        .slack
-                        .as_ref()
-                        .filter(|slack| slack.enabled)
-                    {
-                        let Some(url_ref) = &slack.webhook_url_ref else {
-                            return Err(MegaError::Other(
-                                    "notification.slack.enabled is true but notification.slack.webhook_url_ref is missing".to_string(),
-                                ));
-                        };
-                        let url =
-                            crate::contract::vault::integration::vault_core::with_audit_caller(
-                                "startup:notification-slack",
-                                resolver.resolve(url_ref),
-                            )
-                            .await?;
-                        extra_channels.push(Arc::new(
-                            crate::notification::channels::SlackChannel::new(
-                                crate::config::secret::SecretString::new(url),
-                            )?,
-                        ));
-                    }
                     if let Some(webhook) = notification_cfg
                         .webhook
                         .as_ref()
