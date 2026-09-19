@@ -126,5 +126,29 @@ stored in OpenSSH format at `ssh_key_ref` and held in process memory.
 | `enabled=false` | do not generate, do not write vault |
 
 Algorithm is Ed25519 only. Deleting the vault entry and restarting
-generates a new key (public key differs). Cross-replica convergence is
-GS-16. Public-key logging is GS-06.
+generates a new key (public key differs). Public-key logging is GS-06.
+
+## 自举的并发与故障语义
+
+When `[github_sync] enabled=true` and the vault entry is missing, startup
+takes a Redis RedLock (`mega2:github_sync:ssh_key:init`, same mechanism
+as `ensure_server_signing_key`) before generating. The vault value is
+re-read inside the lock so concurrent replicas converge on one key.
+
+| When | Behavior |
+|---|---|
+| vault already has a valid key | load it on the fast path; no lock |
+| vault has no key | acquire RedLock, re-read, generate only if still missing |
+| vault read or write error | fail closed; do not install a process hold |
+| vault value is present but not a valid OpenSSH Ed25519 key | fail closed; do not overwrite |
+
+### 自举残余风险
+
+If the lock is lost (TTL expiry or Redis partition) while a replica is
+still generating, a second replica may also generate. The last writer
+wins; a process hold may then diverge from vault until restart. This
+window is not closed here (vault has no compare-and-set). Residual-risk
+questions are frozen at plan-20260916 GS-28 Q8. The operator repair
+is: stop every replica, delete the vault entry, restart one replica to
+bootstrap, start the rest, replace the GitHub deploy key with the new
+public key.
