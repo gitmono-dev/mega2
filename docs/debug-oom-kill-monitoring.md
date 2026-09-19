@@ -209,7 +209,10 @@ done < <(find /sys/fs/cgroup -name memory.events 2>/dev/null)
 declare -A bprocs
 scan_procs() {
   local out pid rest lstart args
-  out=$(ps -eo pid=,lstart=,args= 2>/dev/null | grep -E 'cargo|rustc|--test-threads|/target/debug/deps' | grep -v grep)
+  # match by executable (comm) for cargo/rustc, or real test invocations:
+  # --test-threads=<n> or a binary under /target/debug/deps/
+  out=$(ps -eo pid=,lstart=,comm=,args= 2>/dev/null \
+    | awk '$7=="cargo"||$7=="rustc"||$0~/--test-threads=[0-9]+/||$0~/\/target\/debug\/deps\//{print}')
   bprocs=()   # clear stale entries (dead pids must disappear from the tracked set)
   [ -z "$out" ] && return 0
   while IFS= read -r line; do
