@@ -3,8 +3,9 @@
 
 use super::{
     AgentCaptureConfig, AgentCaptureIngestTokenConfig, DEFAULT_MAX_PUSH_COMMITS, GitConfig,
-    PushAuth, PushPolicy, PushTokenConfig, StorageEventsConfig, reload::ConfigHandle,
-    testing::isolated_config, token_path_authorizes, validate,
+    GithubSyncBinding, GithubSyncConfig, PushAuth, PushPolicy, PushTokenConfig,
+    StorageEventsConfig, reload::ConfigHandle, testing::isolated_config, token_path_authorizes,
+    validate,
 };
 use crate::{
     callisto::sea_orm_active_enums::PushQueueKindEnum,
@@ -531,4 +532,57 @@ async fn trunk_to_review_reset_lets_review_update_all_rows() {
             .last_policy,
         "review"
     );
+}
+
+#[test]
+fn github_sync_shape_and_defaults() {
+    let defaulted = GithubSyncConfig::default();
+    assert!(!defaulted.enabled);
+    assert!(defaulted.ssh_host.is_empty());
+    assert!(defaulted.ssh_user.is_empty());
+    assert!(defaulted.ssh_host_key.is_empty());
+    assert!(defaulted.ssh_key_ref.is_empty());
+    assert!(defaulted.bindings.is_empty());
+
+    let parsed: GithubSyncConfig = toml::from_str("").expect("empty table loads");
+    assert_eq!(parsed, GithubSyncConfig::default());
+
+    let with_binding: GithubSyncConfig = toml::from_str(
+        r#"
+enabled = false
+ssh_host = "github.com"
+ssh_user = "git"
+ssh_host_key = "ssh-ed25519 AAAA"
+ssh_key_ref = "secret/github-sync"
+[[bindings]]
+id = "core"
+path = "/project/core"
+remote = "git@github.com:example/core.git"
+"#,
+    )
+    .expect("explicit schema loads");
+    assert_eq!(
+        with_binding,
+        GithubSyncConfig {
+            enabled: false,
+            ssh_host: "github.com".into(),
+            ssh_user: "git".into(),
+            ssh_host_key: "ssh-ed25519 AAAA".into(),
+            ssh_key_ref: "secret/github-sync".into(),
+            bindings: vec![GithubSyncBinding {
+                id: "core".into(),
+                path: "/project/core".into(),
+                remote: "git@github.com:example/core.git".into(),
+            }],
+        }
+    );
+
+    let cfg = isolated_config(std::env::temp_dir().join("mega2-gs03-github-sync"));
+    assert_eq!(cfg.github_sync, GithubSyncConfig::default());
+    let _enabled: bool = cfg.github_sync.enabled;
+    let _host: String = cfg.github_sync.ssh_host;
+    let _user: String = cfg.github_sync.ssh_user;
+    let _host_key: String = cfg.github_sync.ssh_host_key;
+    let _key_ref: String = cfg.github_sync.ssh_key_ref;
+    let _bindings: Vec<GithubSyncBinding> = cfg.github_sync.bindings;
 }

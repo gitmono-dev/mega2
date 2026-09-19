@@ -63,3 +63,19 @@ characters). Dangling refs exit `1`. Empty match set is success (`0`).
 `2`. Isolated fixtures:
 `tests/fixtures/guard/run_docrefs_cases.sh` and
 `run_docrefs_failure_cases.sh`.
+
+## 配置面
+
+`[github_sync]` is a first-class `Config` field (GS-03). The section is
+optional: omitting it loads `GithubSyncConfig::default()`, which has
+`enabled = false` and empty strings / no bindings. `ssh_key_ref` is a
+string path only — this card does not resolve secrets.
+
+| Type | Fields |
+|---|---|
+| `GithubSyncConfig` | `enabled`, `ssh_host`, `ssh_user`, `ssh_host_key`, `ssh_key_ref`, `bindings` |
+| `GithubSyncBinding` | `id`, `path`, `remote` |
+
+Whitelist registration, reload classification, and example TOML are
+GS-23. Semantic fail-closed checks are GS-04 / GS-13. No runtime sync
+runs from this schema.

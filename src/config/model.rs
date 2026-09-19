@@ -61,10 +61,42 @@ pub struct Config {
     /// surface only — no delivery until later WH cards bind a runtime.
     #[serde(default)]
     pub storage_events: StorageEventsConfig,
+    /// GitHub outbound sync schema (plan-20260916 GS-03). Default disabled;
+    /// this card is structure only — no semantic checks and no runtime.
+    #[serde(default)]
+    pub github_sync: GithubSyncConfig,
     /// Authorization enforcement switch (`[cedar]`), ADR-UN-01. Default `off`
     /// (no build, no consume of authorization data).
     #[serde(default)]
     pub cedar: CedarConfig,
+}
+
+/// `[github_sync]` configuration structure (plan-20260916 GS-03).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct GithubSyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_user: String,
+    #[serde(default)]
+    pub ssh_host_key: String,
+    #[serde(default)]
+    pub ssh_key_ref: String,
+    #[serde(default)]
+    pub bindings: Vec<GithubSyncBinding>,
+}
+
+/// One monorepo-path → GitHub remote binding (plan-20260916 GS-03).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct GithubSyncBinding {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub remote: String,
 }
 
 /// OCI Distribution (container registry) settings (ADR-DR-01).
