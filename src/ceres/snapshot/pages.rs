@@ -5,7 +5,10 @@
 //! (`mst2_codec::metapage::Page::build`), so identical directory content
 //! yields identical page_ids across requests.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use base64::Engine;
 use mst2_codec::metapage::{Entry, EntryKind, Page, page_id};
@@ -52,7 +55,42 @@ pub struct DirEntry {
 /// scope-relative ("/" = the root directory); `root_tree` is the fixed view's
 /// root tree — never a current-ref read. Every entry is represented;
 /// unsupported entries reject the whole projection (spec: no silent drops).
+///
+/// Results are memoized per (root tree, path): a page is a pure function of
+/// the pinned root tree, and the recursive build otherwise re-walks the same
+/// subtree once per ancestor and once per request (a sync over N directories
+/// would rebuild the tree N times). Blob sizes/digests are persisted in
+/// `mst2_verified_object`, so a cache miss after eviction is a bounded,
+/// correctness-identical recomputation.
 pub async fn build_directory_page<T: ApiHandler + ?Sized>(
+    handler: &T,
+    root_tree: &git_internal::internal::object::tree::Tree,
+    rel_path: &str,
+) -> Result<Arc<BuiltDirectory>, SnapshotError> {
+    static PAGE_CACHE: OnceLock<Mutex<HashMap<(String, String), Arc<BuiltDirectory>>>> =
+        OnceLock::new();
+    // Pages are small (≤16 KiB + entries); 200k pages is far beyond any real
+    // view. On overflow the cache clears wholesale — a miss only costs a
+    // rebuild, never correctness.
+    const PAGE_CACHE_MAX: usize = 200_000;
+
+    let key = (root_tree.id.to_string(), rel_path.to_string());
+    let cache = PAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
+        return Ok(Arc::clone(hit));
+    }
+    let built = Arc::new(
+        build_directory_page_uncached(handler, root_tree, rel_path).await?,
+    );
+    let mut cache = cache.lock().unwrap();
+    if cache.len() >= PAGE_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&built));
+    Ok(built)
+}
+
+async fn build_directory_page_uncached<T: ApiHandler + ?Sized>(
     handler: &T,
     root_tree: &git_internal::internal::object::tree::Tree,
     rel_path: &str,
@@ -190,7 +228,7 @@ pub async fn proof_pages<T: ApiHandler + ?Sized>(
     let mut out = Vec::with_capacity(chain.len());
     for p in chain {
         let built = Box::pin(build_directory_page(handler, root_tree, &p)).await?;
-        out.push((p, built.page_id, built.page_bytes));
+        out.push((p, built.page_id, built.page_bytes.clone()));
     }
     Ok(out)
 }
