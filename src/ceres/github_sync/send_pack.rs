@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, io::Write};
 
 use bytes::Bytes;
-use russh::ChannelMsg;
+use russh::{ChannelMsg, client};
 
 use crate::{
     ceres::{
@@ -12,8 +12,11 @@ use crate::{
 };
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+/// Max bytes copied into one outbound pack write. Larger caller chunks are split.
+pub const PACK_WRITE_WINDOW: usize = 16 * 1024;
 const MAIN_REF: &str = "refs/heads/main";
 const REQUIRED_CAPABILITY: &str = "report-status";
+const SIDE_BAND_64K: &str = "side-band-64k";
 
 /// Parsed receive-pack advertisement (plan-20260916 GS-08).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,9 +139,128 @@ pub fn gate_report_status(
     Ok(())
 }
 
-pub async fn advertise(session: &mut SshSession, remote: &str) -> Result<Advertisement, MegaError> {
+/// Command pkt-line plus flush (no pack bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPlan {
+    pub bytes: Vec<u8>,
+    pub requested_sideband: bool,
+    pub missing_sideband: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteStats {
+    pub command_bytes: usize,
+    pub pack_bytes: u64,
+    pub peak_chunk: usize,
+    pub missing_sideband: bool,
+}
+
+/// Authenticated receive-pack channel after advertisement (plan-20260916 GS-24).
+pub struct ReceivePack {
+    channel: russh::Channel<client::Msg>,
+    pub advertisement: Advertisement,
+}
+
+pub fn build_command_frame(
+    old_oid: &str,
+    new_oid: &str,
+    advertisement: &Advertisement,
+) -> Result<CommandPlan, MegaError> {
+    let old_oid = require_oid(old_oid, "old")?;
+    let new_oid = require_oid(new_oid, "new")?;
+    let requested_sideband = advertisement.capabilities.contains(SIDE_BAND_64K);
+    let missing_sideband = !requested_sideband;
+    let mut caps = String::from(REQUIRED_CAPABILITY);
+    if requested_sideband {
+        caps.push(' ');
+        caps.push_str(SIDE_BAND_64K);
+    }
+    // NUL + leading space before capabilities; no trailing LF (git receive-pack).
+    let payload = format!("{old_oid} {new_oid} {MAIN_REF}\0 {caps}");
+    let mut bytes = format!("{:04x}", payload.len() + 4).into_bytes();
+    bytes.extend_from_slice(payload.as_bytes());
+    bytes.extend_from_slice(b"0000");
+    Ok(CommandPlan {
+        bytes,
+        requested_sideband,
+        missing_sideband,
+    })
+}
+
+fn require_oid(oid: &str, which: &str) -> Result<String, MegaError> {
+    if oid.len() != 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(MegaError::Other(format!(
+            "github_sync receive-pack {which} object id is invalid"
+        )));
+    }
+    Ok(oid.to_ascii_lowercase())
+}
+
+pub async fn begin(session: &mut SshSession, remote: &str) -> Result<ReceivePack, MegaError> {
     let command = receive_pack_command(remote)?;
     let mut channel = session.exec(&command).await?;
+    let buf = read_advertisement(&mut channel).await?;
+    Ok(ReceivePack {
+        advertisement: accept_advertisement(&buf)?,
+        channel,
+    })
+}
+
+pub async fn advertise(session: &mut SshSession, remote: &str) -> Result<Advertisement, MegaError> {
+    Ok(begin(session, remote).await?.advertisement)
+}
+
+impl ReceivePack {
+    pub async fn write_pack<I, B>(
+        &mut self,
+        new_oid: &str,
+        chunks: I,
+    ) -> Result<WriteStats, MegaError>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let plan = build_command_frame(&self.advertisement.main_tip, new_oid, &self.advertisement)?;
+        let command_bytes = plan.bytes.len();
+        self.channel
+            .data_bytes(Bytes::from(plan.bytes))
+            .await
+            .map_err(|err| {
+                MegaError::Other(format!(
+                    "github_sync receive-pack command write failed: {err}"
+                ))
+            })?;
+        let mut pack_bytes = 0_u64;
+        let mut peak_chunk = 0_usize;
+        for chunk in chunks {
+            for window in pack_windows(chunk.as_ref()) {
+                peak_chunk = peak_chunk.max(window.len());
+                pack_bytes += window.len() as u64;
+                self.channel
+                    .data_bytes(Bytes::copy_from_slice(window))
+                    .await
+                    .map_err(|err| {
+                        MegaError::Other(format!(
+                            "github_sync receive-pack pack write failed: {err}"
+                        ))
+                    })?;
+            }
+        }
+        self.channel.eof().await.map_err(|err| {
+            MegaError::Other(format!("github_sync receive-pack pack eof failed: {err}"))
+        })?;
+        Ok(WriteStats {
+            command_bytes,
+            pack_bytes,
+            peak_chunk,
+            missing_sideband: plan.missing_sideband,
+        })
+    }
+}
+
+async fn read_advertisement(
+    channel: &mut russh::Channel<client::Msg>,
+) -> Result<Vec<u8>, MegaError> {
     let mut buf = Vec::new();
     loop {
         match channel.wait().await {
@@ -151,7 +273,11 @@ pub async fn advertise(session: &mut SshSession, remote: &str) -> Result<Adverti
             break;
         }
     }
-    accept_advertisement(&buf)
+    Ok(buf)
+}
+
+fn pack_windows(chunk: &[u8]) -> impl Iterator<Item = &[u8]> {
+    chunk.chunks(PACK_WRITE_WINDOW)
 }
 
 fn accept_advertisement(bytes: &[u8]) -> Result<Advertisement, MegaError> {
@@ -237,5 +363,87 @@ mod tests {
         gate_report_status(advertisement, sink)?;
         sink.write_all(b"WOULD_WRITE").expect("mark");
         Ok(())
+    }
+
+    #[test]
+    fn command_frame_golden() {
+        let old = ZERO_OID;
+        let new = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let advertisement = Advertisement {
+            main_tip: old.to_string(),
+            capabilities: BTreeSet::from(["report-status".into()]),
+        };
+        let plan = build_command_frame(old, new, &advertisement).expect("frame");
+        let payload = format!(
+            "{} {} {MAIN_REF}\0 {REQUIRED_CAPABILITY}",
+            old,
+            new.to_ascii_lowercase()
+        );
+        assert!(
+            !payload.as_bytes().contains(&b'\n'),
+            "command payload must not end with LF"
+        );
+        let nul = payload
+            .as_bytes()
+            .iter()
+            .position(|b| *b == 0)
+            .expect("NUL");
+        assert_eq!(
+            payload.as_bytes()[nul + 1],
+            b' ',
+            "capability leading space"
+        );
+        let mut expected = format!("{:04x}", payload.len() + 4).into_bytes();
+        expected.extend_from_slice(payload.as_bytes());
+        expected.extend_from_slice(b"0000");
+        assert_eq!(plan.bytes, expected);
+        assert!(plan.bytes.ends_with(b"0000"));
+        assert!(!plan.requested_sideband);
+        assert!(plan.missing_sideband);
+    }
+
+    #[test]
+    fn sideband_negotiation_and_downgrade() {
+        let old = ZERO_OID;
+        let new = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let with_sb = Advertisement {
+            main_tip: old.to_string(),
+            capabilities: BTreeSet::from(["report-status".into(), "side-band-64k".into()]),
+        };
+        let requested = build_command_frame(old, new, &with_sb).expect("with");
+        assert!(requested.requested_sideband);
+        assert!(!requested.missing_sideband);
+        assert!(
+            requested
+                .bytes
+                .windows(SIDE_BAND_64K.len())
+                .any(|w| w == SIDE_BAND_64K.as_bytes())
+        );
+        assert!(requested.bytes.ends_with(b"0000"));
+
+        let without = Advertisement {
+            main_tip: old.to_string(),
+            capabilities: BTreeSet::from(["report-status".into()]),
+        };
+        let downgraded = build_command_frame(old, new, &without).expect("without");
+        assert!(!downgraded.requested_sideband);
+        assert!(downgraded.missing_sideband);
+        assert!(
+            !downgraded
+                .bytes
+                .windows(SIDE_BAND_64K.len())
+                .any(|w| w == SIDE_BAND_64K.as_bytes())
+        );
+        assert!(downgraded.bytes.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn pack_windows_cap_residency() {
+        let fat = vec![1u8; PACK_WRITE_WINDOW * 3 + 7];
+        let windows: Vec<&[u8]> = pack_windows(&fat).collect();
+        assert!(windows.iter().all(|w| w.len() <= PACK_WRITE_WINDOW));
+        assert_eq!(windows.iter().map(|w| w.len()).sum::<usize>(), fat.len());
+        assert_eq!(windows.len(), 4);
+        assert_eq!(pack_windows(&[]).count(), 0);
     }
 }

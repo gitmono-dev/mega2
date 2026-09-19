@@ -1,13 +1,14 @@
-// Loopback outbound SSH (plan-20260916 GS-07 / GS-08).
+// Loopback outbound SSH (plan-20260916 GS-07 / GS-08 / GS-24).
 //
 // Pins a generated Ed25519 host key and authenticates with the GS-05 hold
 // against a local russh server. GS-08 adds a receive-pack advertisement.
-// Does not talk to GitHub (DEFER-GS-08).
+// GS-24 writes the command frame and a synthetic pack. Does not talk to
+// GitHub (DEFER-GS-08).
 
-use std::{sync::Arc, time::Duration};
-
-/// The process hold is global. C-group runs this binary with `--test-threads=8`.
-static IT_HOLD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use russh::{
@@ -17,12 +18,17 @@ use russh::{
 };
 use tokio::net::TcpListener;
 
+/// The process hold is global. C-group runs this binary with `--test-threads=8`.
+static IT_HOLD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone)]
 struct LoopServer {
     user: String,
     public: PublicKey,
     expected_exec: Option<String>,
     advertisement: Option<Vec<u8>>,
+    eof_after_advertisement: bool,
+    inbound: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl server::Server for LoopServer {
@@ -73,12 +79,26 @@ impl Handler for LoopServer {
                 if let Some(advertisement) = &self.advertisement {
                     session.data(channel, advertisement.clone())?;
                 }
-                session.eof(channel)?;
+                if self.eof_after_advertisement {
+                    session.eof(channel)?;
+                }
             }
             Some(_) => {
                 session.channel_failure(channel)?;
             }
             None => {}
+        }
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(inbound) = &self.inbound {
+            inbound.lock().expect("inbound").extend_from_slice(data);
         }
         Ok(())
     }
@@ -134,6 +154,12 @@ fn pkt_line(body: &str) -> Vec<u8> {
     out
 }
 
+fn advertise_bytes(oid: &str, caps: &str) -> Vec<u8> {
+    let mut advertisement = pkt_line(&format!("{oid} refs/heads/main\0{caps}\n"));
+    advertisement.extend_from_slice(b"0000");
+    advertisement
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn ssh_connect_authenticates() {
     let _hold = IT_HOLD.lock().await;
@@ -145,6 +171,8 @@ async fn ssh_connect_authenticates() {
             public: client_pub,
             expected_exec: None,
             advertisement: None,
+            eof_after_advertisement: true,
+            inbound: None,
         },
         host_key,
     )
@@ -159,14 +187,14 @@ async fn loopback_advertise() {
     let client_pub = install_client();
     let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
     let oid = "0123456789abcdef0123456789abcdef01234567";
-    let mut advertisement = pkt_line(&format!("{oid} refs/heads/main\0report-status\n"));
-    advertisement.extend_from_slice(b"0000");
     let mut session = connect_loopback(
         LoopServer {
             user: "git".to_string(),
             public: client_pub,
             expected_exec: Some("git-receive-pack 'acme/app.git'".to_string()),
-            advertisement: Some(advertisement),
+            advertisement: Some(advertise_bytes(oid, "report-status")),
+            eof_after_advertisement: true,
+            inbound: None,
         },
         host_key,
     )
@@ -176,6 +204,69 @@ async fn loopback_advertise() {
         .expect("advertisement");
     assert_eq!(parsed.main_tip, oid);
     assert!(parsed.capabilities.contains("report-status"));
+    drop(session);
+    mega2_core::github_sync::clear_held();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn loopback_receive_pack() {
+    let _hold = IT_HOLD.lock().await;
+    let client_pub = install_client();
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+    let old = "0123456789abcdef0123456789abcdef01234567";
+    let new = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let inbound = Arc::new(Mutex::new(Vec::new()));
+    let mut session = connect_loopback(
+        LoopServer {
+            user: "git".to_string(),
+            public: client_pub,
+            expected_exec: Some("git-receive-pack 'acme/app.git'".to_string()),
+            advertisement: Some(advertise_bytes(old, "report-status side-band-64k")),
+            eof_after_advertisement: false,
+            inbound: Some(inbound.clone()),
+        },
+        host_key,
+    )
+    .await;
+    let mut receive = mega2_core::github_sync::begin(&mut session, "acme/app")
+        .await
+        .expect("begin");
+    assert_eq!(receive.advertisement.main_tip, old);
+    let window = mega2_core::github_sync::PACK_WRITE_WINDOW;
+    // One oversize caller chunk (3 windows + 11 bytes). Not collected into a pack Vec.
+    let fat: Vec<u8> = (0..(window * 3 + 11))
+        .map(|i| u8::try_from(i % 251).expect("tag"))
+        .collect();
+    let expected_pack = fat.len();
+    let stats = receive
+        .write_pack(new, std::iter::once(fat.as_slice()))
+        .await
+        .expect("write pack");
+    assert_eq!(stats.peak_chunk, window);
+    assert_eq!(stats.pack_bytes, expected_pack as u64);
+    assert!(stats.peak_chunk < expected_pack);
+    assert!(!stats.missing_sideband);
+    let plan = mega2_core::github_sync::build_command_frame(old, new, &receive.advertisement)
+        .expect("plan");
+    let expected = plan.bytes.len() + expected_pack;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if inbound.lock().expect("inbound").len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("server collected streamed pack");
+    let got = inbound.lock().expect("inbound").clone();
+    assert!(
+        got.starts_with(&plan.bytes),
+        "command+flush must lead the write"
+    );
+    assert_eq!(got.len(), expected);
+    assert_eq!(&got[plan.bytes.len()..], fat.as_slice());
+    drop(receive);
     drop(session);
     mega2_core::github_sync::clear_held();
 }

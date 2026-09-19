@@ -206,3 +206,22 @@ error that names `report-status` and writes no command or pack bytes.
 
 Loopback evidence is `loopback_advertise`. Command construction and pack
 write are GS-24. Production GitHub is `DEFER-GS-08`.
+
+## 请求构造与降级
+
+After the advertisement is accepted, the client writes one receive-pack
+command pkt-line and a flush, then streams the packfile.
+
+The command payload is
+`<old> <new> refs/heads/main\0 <capabilities>` — NUL, then a leading
+space before the capability list, and **no** trailing LF. The pkt-line
+is followed immediately by `0000`.
+
+`report-status` is always requested (GS-08 already required it).
+`side-band-64k` is requested only when the advertisement declared it;
+otherwise the write result sets `missing_sideband`. Pack bytes are
+written in at most 16 KiB windows; a larger caller chunk is split. Live
+residency is the command frame plus one window, not the full pack.
+
+Loopback evidence is `loopback_receive_pack`. Report-status termination
+is GS-15.
