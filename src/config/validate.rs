@@ -391,21 +391,6 @@ pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Resul
         ));
     }
 
-    if let Some(slack) = &config.slack
-        && slack.enabled
-    {
-        let Some(secret_ref) = &slack.webhook_url_ref else {
-            return Err(MegaError::Other(
-                "notification.slack.webhook_url_ref is required when notification.slack.enabled is true".to_string(),
-            ));
-        };
-        validate_config_secret_ref(
-            "notification.slack.webhook_url_ref",
-            secret_ref,
-            "notification/slack/webhook_url",
-        )?;
-    }
-
     if let Some(webhook) = &config.webhook
         && webhook.enabled
     {
@@ -1601,7 +1586,6 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.access_key_id"
             | "object_storage.s3.secret_access_key"
             | "object_storage.s3.endpoint_url"
-            | "notification.slack.webhook_url_ref"
             | "notification.webhook.token_ref"
             | "notification.website_mail_bearer"
             | "notification.website_mail_bearer_ref"
@@ -1843,10 +1827,8 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "website_mail_base_url",
             "website_mail_bearer",
             "website_mail_bearer_ref",
-            "slack",
             "webhook",
         ]),
-        "notification.slack" => Some(&["enabled", "webhook_url_ref"]),
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
         "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
@@ -2046,70 +2028,23 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_rejects_enabled_slack_without_webhook_url_ref() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            slack: Some(crate::config::SlackConfig {
-                enabled: true,
-                webhook_url_ref: None,
-            }),
-            ..Default::default()
-        });
+    fn reject_unknown_fields_rejects_removed_incoming_webhook_section() {
+        let removed = ["sl", "ack"].concat();
+        let value = toml::from_str::<Value>(&format!(
+            r#"
+            [notification.{removed}]
+            enabled = true
+            "#
+        ))
+        .unwrap();
 
-        let err = config
-            .validate()
-            .expect_err("enabled slack without webhook_url_ref should fail");
-        assert!(
-            err.to_string()
-                .contains("notification.slack.webhook_url_ref")
-        );
-    }
-
-    #[test]
-    fn config_validate_rejects_slack_secret_ref_outside_namespace_without_leaking_ref() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            slack: Some(crate::config::SlackConfig {
-                enabled: true,
-                webhook_url_ref: Some(
-                    crate::config::secret::SecretRef::parse(
-                        "vault://secret/config/prod/mail/password#value",
-                    )
-                    .unwrap(),
-                ),
-            }),
-            ..Default::default()
-        });
-
-        let err = config
-            .validate()
-            .expect_err("slack secret ref outside namespace should fail");
+        let err = reject_unknown_fields(&value)
+            .expect_err("removed incoming-webhook section must fail closed");
         let message = err.to_string();
-        assert!(message.contains("notification.slack.webhook_url_ref"));
-        assert!(message.contains("notification/slack/webhook_url"));
-        // The SecretRef value must not leak.
-        assert!(!message.contains("config/prod/mail/password"));
-    }
-
-    #[test]
-    fn config_validate_accepts_enabled_slack_with_correct_namespace() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            slack: Some(crate::config::SlackConfig {
-                enabled: true,
-                webhook_url_ref: Some(
-                    crate::config::secret::SecretRef::parse(
-                        "vault://secret/config/prod/notification/slack/webhook_url#value",
-                    )
-                    .unwrap(),
-                ),
-            }),
-            ..Default::default()
-        });
-
-        config
-            .validate()
-            .expect("slack with correct namespace should validate");
+        assert!(
+            message.contains(&format!("notification.{removed}")),
+            "{message}"
+        );
     }
 
     #[test]
@@ -3012,10 +2947,6 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"
-            [notification.slack]
-            enabled = true
-            webhook_url_ref = "vault://secret/config/base/notification/slack/webhook_url#value"
-
             [notification.webhook]
             enabled = true
             url = "https://hooks.example.test/webhook"
@@ -3026,8 +2957,8 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"
-            [notification.slack]
-            webhook_url_ref = "vault://secret/config/prod/notification/slack/webhook_url#value"
+            [notification.webhook]
+            token_ref = "vault://secret/config/prod/notification/webhook/token#value"
             "#,
         )
         .expect("write profile config");
@@ -3035,7 +2966,7 @@ mod tests {
         let diagnostics = collect_source_diagnostics_from_keys(
             Some(&config_path),
             Some(&profile_path),
-            ["MEGA_NOTIFICATION__SLACK__WEBHOOK_URL_REF"],
+            ["MEGA_NOTIFICATION__WEBHOOK__TOKEN_REF"],
         )
         .expect("diagnostics should collect");
         let source_fields = diagnostics
@@ -3053,22 +2984,15 @@ mod tests {
 
         assert!(
             source_fields.iter().any(|message| {
-                message.contains("notification.slack.webhook_url_ref")
-                    && message.contains("base file")
-            }),
-            "missing slack webhook_url_ref base field: {source_text}"
-        );
-        assert!(
-            source_fields.iter().any(|message| {
                 message.contains("notification.webhook.token_ref") && message.contains("base file")
             }),
             "missing webhook token_ref base field: {source_text}"
         );
         assert!(
-            override_text.contains("notification.slack.webhook_url_ref")
+            override_text.contains("notification.webhook.token_ref")
                 && override_text.contains("profile file")
                 && override_text.contains("base file"),
-            "missing slack webhook_url_ref override: {override_text}"
+            "missing webhook token_ref override: {override_text}"
         );
         assert!(
             source_text.contains("sensitive values are omitted"),
@@ -3077,10 +3001,6 @@ mod tests {
         assert!(
             !source_text.contains("vault://secret/"),
             "source diagnostics leaked notification SecretRef URI: {source_text}"
-        );
-        assert!(
-            !source_text.contains("config/prod/notification/slack/webhook_url"),
-            "source diagnostics leaked notification vault path: {source_text}"
         );
         assert!(
             !source_text.contains("config/base/notification/webhook/token"),

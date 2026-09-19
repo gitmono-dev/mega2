@@ -243,7 +243,7 @@ fn push_token_secret_ref_must_use_config_namespace() {
     config.cedar.enforcement = "off".to_string();
     config.git.push_tokens = vec![PushTokenConfig {
         name: "ci".into(),
-        token: "vault://secret/config/prod/notification/slack/webhook_url#value".into(),
+        token: "vault://secret/config/prod/mail/password#value".into(),
         paths: None,
     }];
     let err = config.validate().expect_err("wrong SecretRef namespace");
