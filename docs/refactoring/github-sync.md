@@ -191,3 +191,18 @@ a background task or socket.
 
 Loopback evidence is `tests/integration_github_sync.rs`
 (`ssh_connect_authenticates`). Production GitHub is `DEFER-GS-08`.
+
+## receive-pack 协议与能力协商
+
+After the SSH session is authenticated, github_sync runs
+`git-receive-pack '<owner>/<repo>.git'` (single-quoted; a remote that
+contains `'` is rejected). The advertisement is parsed as pkt-lines
+until flush. `refs/heads/main` becomes the remote tip; if that ref is
+absent the tip is 40 zero hex digits. Capabilities are taken from the
+NUL-terminated first ref line.
+
+`report-status` is required. If it is missing, the client aborts with an
+error that names `report-status` and writes no command or pack bytes.
+
+Loopback evidence is `loopback_advertise`. Command construction and pack
+write are GS-24. Production GitHub is `DEFER-GS-08`.

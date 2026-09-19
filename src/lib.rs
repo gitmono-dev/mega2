@@ -55,6 +55,7 @@ pub use common::errors::MegaError;
 pub mod github_sync {
     pub use crate::ceres::github_sync::{
         key::{GithubSyncKey, held},
+        send_pack::{Advertisement, advertise},
         ssh::{SshError, SshSession, SshStage, connect},
     };
 

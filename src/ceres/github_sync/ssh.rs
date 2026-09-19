@@ -27,6 +27,39 @@ impl std::fmt::Debug for SshSession {
     }
 }
 
+impl SshSession {
+    pub(crate) async fn exec(
+        &mut self,
+        command: &str,
+    ) -> Result<russh::Channel<client::Msg>, MegaError> {
+        let mut channel = self.session.channel_open_session().await.map_err(|err| {
+            MegaError::Other(format!("github_sync ssh channel open failed: {err}"))
+        })?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|err| MegaError::Other(format!("github_sync ssh exec failed: {err}")))?;
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => return Ok(channel),
+                Some(russh::ChannelMsg::Failure) => {
+                    return Err(MegaError::Other(
+                        "github_sync ssh exec was rejected".to_string(),
+                    ));
+                }
+                Some(russh::ChannelMsg::Data { .. })
+                | Some(russh::ChannelMsg::ExtendedData { .. }) => continue,
+                Some(russh::ChannelMsg::Eof) | None => {
+                    return Err(MegaError::Other(
+                        "github_sync ssh exec closed before success".to_string(),
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
 /// Failure stage for an outbound github_sync SSH attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshStage {
