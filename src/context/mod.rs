@@ -210,7 +210,6 @@ impl AppContext {
             let mut extra_channels: Vec<
                 Arc<dyn crate::notification::channels::NotificationChannel>,
             > = Vec::new();
-            let mut website_mail = None;
             let notification_enabled = match config.notification.as_ref() {
                 Some(notification_cfg) => {
                     crate::config::validate::validate_notification_config(notification_cfg)?;
@@ -239,33 +238,6 @@ impl AppContext {
                             )?,
                         ));
                     }
-                    if !notification_cfg.website_mail_base_url.trim().is_empty() {
-                        let bearer = match (
-                            &notification_cfg.website_mail_bearer,
-                            &notification_cfg.website_mail_bearer_ref,
-                        ) {
-                            (Some(bearer), None) => bearer.clone(),
-                            (None, Some(bearer_ref)) => crate::config::secret::SecretString::new(
-                                crate::contract::vault::integration::vault_core::with_audit_caller(
-                                    "startup:notification-website-mail",
-                                    resolver.resolve(bearer_ref),
-                                )
-                                .await?,
-                            ),
-                            _ => {
-                                return Err(MegaError::Other(
-                                    "website mail configuration must provide exactly one bearer source"
-                                        .to_string(),
-                                ));
-                            }
-                        };
-                        website_mail = Some(Arc::new(
-                            crate::notification::website_mail::WebsiteMailClient::new(
-                                &notification_cfg.website_mail_base_url,
-                                bearer,
-                            )?,
-                        ));
-                    }
                     notification_cfg.enabled
                 }
                 None => true,
@@ -273,7 +245,6 @@ impl AppContext {
             let service = Arc::new(crate::notification::NotificationService::new(
                 notif_stg,
                 extra_channels,
-                website_mail,
                 Some(config_handle.clone()),
                 notification_enabled,
             ));

@@ -250,13 +250,6 @@ batch_limit = 100
 [notification]
 # Global notification kill switch.
 enabled = true
-# Optional website-owned product-email client. Leave both values unset to keep
-# the leftover website-mail client unconfigured until RM-WM.
-# Production requires the SecretRef form (set through `config secret set
-# notification/website_mail/bearer`); the literal bearer is IT-only.
-# website_mail_base_url = "https://website.internal"
-# website_mail_bearer_ref = "vault://secret/config/<profile>/notification/website_mail/bearer#value"
-# website_mail_bearer = "it-only-shared-bearer"
 
 # Optional generic outbound webhook channel (docs/notification.md phase 3). The
 # URL is operator-trusted (non-secret); an optional bearer token is a SecretRef

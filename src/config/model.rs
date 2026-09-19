@@ -446,18 +446,6 @@ pub struct NotificationConfig {
     /// snapshot by the active notification service).
     #[serde(default = "default_notification_enabled")]
     pub enabled: bool,
-    /// Base URL for the website internal product-email API. Empty disables the
-    /// optional client; when set, exactly one bearer source is required.
-    #[serde(default)]
-    pub website_mail_base_url: String,
-    /// IT-only literal bearer for the website internal email API. Production
-    /// deployments must use `website_mail_bearer_ref`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub website_mail_bearer: Option<secret::SecretString>,
-    /// Production bearer source for the website internal email API. Namespace:
-    /// `vault://secret/config/<profile>/notification/website_mail/bearer#<field>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub website_mail_bearer_ref: Option<secret::SecretRef>,
     /// Optional generic outbound webhook channel (docs/notification.md phase 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<WebhookConfig>,
@@ -486,9 +474,6 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: default_notification_enabled(),
-            website_mail_base_url: String::new(),
-            website_mail_bearer: None,
-            website_mail_bearer_ref: None,
             webhook: None,
         }
     }

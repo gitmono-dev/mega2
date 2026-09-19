@@ -461,8 +461,6 @@ fn apply_buck_cleanup_changes(
 }
 
 /// Notification delivery settings are read live from the config snapshot.
-/// Website mail credentials construct a bounded HTTP client at startup, so
-/// changing those fields is accepted into the snapshot but requires restart.
 fn apply_notification_changes(
     current: &Option<NotificationConfig>,
     candidate: &Option<NotificationConfig>,
@@ -480,29 +478,6 @@ fn apply_notification_changes(
 
     if current_enabled != candidate_enabled {
         report.applied_fields.push("notification.enabled");
-    }
-    if current.as_ref().map(|config| {
-        (
-            &config.website_mail_base_url,
-            &config.website_mail_bearer,
-            &config.website_mail_bearer_ref,
-        )
-    }) != candidate.as_ref().map(|config| {
-        (
-            &config.website_mail_base_url,
-            &config.website_mail_bearer,
-            &config.website_mail_bearer_ref,
-        )
-    }) {
-        report
-            .restart_required_fields
-            .push("notification.website_mail_base_url");
-        report
-            .restart_required_fields
-            .push("notification.website_mail_bearer");
-        report
-            .restart_required_fields
-            .push("notification.website_mail_bearer_ref");
     }
 }
 

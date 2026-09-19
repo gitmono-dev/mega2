@@ -12,10 +12,7 @@ use crate::{
     common::errors::MegaError,
     config::reload::ConfigHandle,
     jupiter::storage::notification_storage::NotificationStorage,
-    notification::{
-        channels::{ConsoleChannel, NotificationChannel, OutboundMessage},
-        website_mail::WebsiteMailClient,
-    },
+    notification::channels::{ConsoleChannel, NotificationChannel, OutboundMessage},
 };
 
 static ACTIVE: RwLock<Option<Arc<NotificationService>>> = RwLock::new(None);
@@ -26,7 +23,6 @@ static ACTIVE: RwLock<Option<Arc<NotificationService>>> = RwLock::new(None);
 /// optional Slack/webhook channels without requiring a mailer or inbox write.
 pub struct NotificationService {
     channels: Vec<Arc<dyn NotificationChannel>>,
-    website_mail: Option<Arc<WebsiteMailClient>>,
     /// When present, `enabled` is read live from the config snapshot
     /// (hot-reload safe).
     config_handle: Option<ConfigHandle>,
@@ -37,14 +33,12 @@ impl NotificationService {
     pub fn new(
         _stg: NotificationStorage,
         extra_channels: Vec<Arc<dyn NotificationChannel>>,
-        website_mail: Option<Arc<WebsiteMailClient>>,
         config_handle: Option<ConfigHandle>,
         enabled: bool,
     ) -> Self {
         let channels = extra_channels;
         Self {
             channels,
-            website_mail,
             config_handle,
             enabled_fallback: AtomicBool::new(enabled),
         }
@@ -111,10 +105,9 @@ fn escape_html(value: &str) -> String {
 }
 
 /// Deliver a product notification: honor the global kill switch, user prefs,
-/// then fan out to registered channels (Slack/webhook extras only).
+/// then fan out to registered channels (webhook extras only).
 ///
-/// Product email is not initiated here. The leftover website-mail client stays
-/// assembled until RM-WM; this function does not call it.
+/// Product email is not initiated here.
 pub async fn deliver_user_notification(
     stg: &NotificationStorage,
     username: &str,
@@ -164,13 +157,6 @@ pub async fn deliver_user_notification(
 mod tests {
     use std::sync::Arc;
 
-    use axum::{
-        Json, Router,
-        extract::State,
-        http::{HeaderMap, StatusCode},
-        routing::post,
-    };
-    use serde_json::Value;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
@@ -192,7 +178,7 @@ mod tests {
         extra: Vec<Arc<dyn NotificationChannel>>,
         enabled: bool,
     ) -> Arc<NotificationService> {
-        Arc::new(NotificationService::new(stg, extra, None, None, enabled))
+        Arc::new(NotificationService::new(stg, extra, None, enabled))
     }
 
     #[tokio::test]
@@ -265,97 +251,6 @@ mod tests {
         assert_eq!(sent[0].username, "alice");
         assert_eq!(sent[0].subject, "subject");
         NotificationService::set_active(None);
-    }
-
-    #[tokio::test]
-    async fn configured_website_mail_is_not_invoked_from_deliver() {
-        let _active_guard = ACTIVE_SERVICE_LOCK.lock().await;
-        #[derive(Clone, Default)]
-        struct CapturedRequest {
-            authorization: String,
-            idempotency_key: String,
-            payload: Option<Value>,
-        }
-
-        async fn capture(
-            State(captured): State<Arc<Mutex<CapturedRequest>>>,
-            headers: HeaderMap,
-            Json(payload): Json<Value>,
-        ) -> StatusCode {
-            let mut captured = captured.lock().await;
-            captured.authorization = headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            captured.idempotency_key = headers
-                .get("idempotency-key")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            captured.payload = Some(payload);
-            StatusCode::ACCEPTED
-        }
-
-        let captured = Arc::new(Mutex::new(CapturedRequest::default()));
-        let app = Router::new()
-            .route("/api/internal/notifications/email", post(capture))
-            .with_state(Arc::clone(&captured));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let dir = TempDir::new().unwrap();
-        let db = test_db_connection(dir.path()).await;
-        apply_migrations(&db, true).await.unwrap();
-        let stg = NotificationStorage::new(Arc::new(db));
-        stg.upsert_event_type("cl.comment.created", "cl", "test", false, true)
-            .await
-            .unwrap();
-        stg.upsert_user_settings("alice").await.unwrap();
-
-        let mail_client = Arc::new(
-            WebsiteMailClient::new(
-                &format!("http://{address}"),
-                crate::config::secret::SecretString::new("it-shared-bearer"),
-            )
-            .unwrap(),
-        );
-        let service = Arc::new(NotificationService::new(
-            stg.clone(),
-            Vec::new(),
-            Some(mail_client),
-            None,
-            true,
-        ));
-        NotificationService::set_active(Some(service));
-
-        let website_payload = serde_json::json!({
-            "cl_link": "CL-123",
-            "actor_username": "bob",
-            "comment_excerpt": "Please review the latest change.",
-        });
-        deliver_user_notification(
-            &stg,
-            "alice",
-            "cl.comment.created",
-            "New comment",
-            "review requested",
-            website_payload.clone(),
-        )
-        .await
-        .unwrap();
-
-        let captured = captured.lock().await;
-        assert!(
-            captured.payload.is_none(),
-            "deliver must not POST website-mail after RM-02B"
-        );
-        assert!(captured.authorization.is_empty());
-        assert!(captured.idempotency_key.is_empty());
-        drop(captured);
-        NotificationService::set_active(None);
-        server.abort();
     }
 
     #[tokio::test]

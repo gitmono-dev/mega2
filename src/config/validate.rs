@@ -343,54 +343,6 @@ pub(crate) fn validate_vault_config(config: &VaultConfig) -> Result<(), MegaErro
 }
 
 pub(crate) fn validate_notification_config(config: &NotificationConfig) -> Result<(), MegaError> {
-    let website_mail_enabled = !config.website_mail_base_url.trim().is_empty();
-    // A present-but-blank bearer is not a configured bearer. `is_some()` alone
-    // let `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (or a whitespace value) pass
-    // validation, producing a service that boots healthy and then 401s on every
-    // product email forever — the website side never matches `Bearer <empty>`,
-    // and the failure is only a `warn!` in service.rs. Treat blank as unset so
-    // it falls into the "exactly one of ... is required" branch below.
-    let website_mail_bearer_count = usize::from(
-        config
-            .website_mail_bearer
-            .as_ref()
-            .is_some_and(|bearer| !bearer.expose_secret().trim().is_empty()),
-    ) + usize::from(config.website_mail_bearer_ref.is_some());
-    if website_mail_enabled {
-        let parsed = Url::parse(&config.website_mail_base_url).map_err(|_| {
-            MegaError::Other(
-                "notification.website_mail_base_url must be a valid HTTP(S) URL".to_string(),
-            )
-        })?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(MegaError::Other(
-                "notification.website_mail_base_url must be a valid HTTP(S) URL".to_string(),
-            ));
-        }
-        if parsed.path() != "/" && !parsed.path().is_empty() {
-            return Err(MegaError::Other(
-                "notification.website_mail_base_url must not include a path".to_string(),
-            ));
-        }
-        if website_mail_bearer_count != 1 {
-            return Err(MegaError::Other(
-                "exactly one of notification.website_mail_bearer or notification.website_mail_bearer_ref is required when notification.website_mail_base_url is set".to_string(),
-            ));
-        }
-        if let Some(secret_ref) = &config.website_mail_bearer_ref {
-            validate_config_secret_ref(
-                "notification.website_mail_bearer_ref",
-                secret_ref,
-                "notification/website_mail/bearer",
-            )?;
-        }
-    } else if website_mail_bearer_count != 0 {
-        return Err(MegaError::Other(
-            "notification.website_mail_base_url is required when a website mail bearer is configured"
-                .to_string(),
-        ));
-    }
-
     if let Some(webhook) = &config.webhook
         && webhook.enabled
     {
@@ -1587,8 +1539,6 @@ fn is_sensitive_source_field_path(field_path: &str) -> bool {
             | "object_storage.s3.secret_access_key"
             | "object_storage.s3.endpoint_url"
             | "notification.webhook.token_ref"
-            | "notification.website_mail_bearer"
-            | "notification.website_mail_bearer_ref"
     )
 }
 
@@ -1822,13 +1772,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "completed_retention_days",
         ]),
         "artifacts_gc" => Some(&["enable", "interval_secs", "grace_secs", "batch_limit"]),
-        "notification" => Some(&[
-            "enabled",
-            "website_mail_base_url",
-            "website_mail_bearer",
-            "website_mail_bearer_ref",
-            "webhook",
-        ]),
+        "notification" => Some(&["enabled", "webhook"]),
         "notification.webhook" => Some(&["enabled", "url", "token_ref"]),
         "vault" => Some(&["audit"]),
         "vault.audit" => Some(&["enabled", "sink", "file_path", "fail_closed"]),
@@ -1926,78 +1870,24 @@ mod tests {
     }
 
     #[test]
-    fn config_validate_accepts_website_mail_it_bearer() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            website_mail_base_url: "http://website-next:7001".to_string(),
-            website_mail_bearer: Some(crate::config::secret::SecretString::new("it-shared-bearer")),
-            ..Default::default()
-        });
+    fn reject_unknown_fields_rejects_removed_product_email_keys() {
+        let removed = ["website_mail", "_base_url"].concat();
+        let value = toml::from_str::<Value>(&format!(
+            r#"
+            [notification]
+            enabled = true
+            {removed} = "https://website.internal"
+            "#
+        ))
+        .unwrap();
 
-        config
-            .validate()
-            .expect("website mail IT configuration should validate");
-    }
-
-    #[test]
-    fn config_validate_rejects_website_mail_without_single_bearer_source() {
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            website_mail_base_url: "http://website-next:7001".to_string(),
-            ..Default::default()
-        });
-
-        let err = config
-            .validate()
-            .expect_err("website mail must require a bearer source");
-        assert!(err.to_string().contains("website_mail_bearer"));
-    }
-
-    #[test]
-    fn config_validate_rejects_blank_website_mail_bearer() {
-        // `MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER=` (empty, or whitespace) used
-        // to satisfy the `is_some()` count, so the service booted healthy and
-        // then 401'd on every product email forever — a failure that only ever
-        // surfaces as a `warn!` in notification::service. A blank bearer is not
-        // a configured bearer.
-        for blank in ["", "   ", "\t\n"] {
-            let mut config = valid_config();
-            config.notification = Some(crate::config::NotificationConfig {
-                website_mail_base_url: "http://website-next:7001".to_string(),
-                website_mail_bearer: Some(crate::config::secret::SecretString::new(blank)),
-                ..Default::default()
-            });
-
-            let err = config
-                .validate()
-                .expect_err("a blank website mail bearer must not count as configured");
-            let message = err.to_string();
-            assert!(
-                message.contains("website_mail_bearer"),
-                "error should name the bearer field, got: {message}"
-            );
-            assert!(
-                !message.contains(blank) || blank.is_empty(),
-                "error must not echo the configured value"
-            );
-        }
-    }
-
-    #[test]
-    fn config_validate_rejects_blank_website_mail_bearer_even_without_base_url() {
-        // Mirror of the branch at the bottom of the mail block: a bearer with
-        // no base_url is an error, but a *blank* bearer alone must not trip it
-        // (nothing is configured, so nothing is inconsistent).
-        let mut config = valid_config();
-        config.notification = Some(crate::config::NotificationConfig {
-            website_mail_base_url: String::new(),
-            website_mail_bearer: Some(crate::config::secret::SecretString::new("   ")),
-            ..Default::default()
-        });
-
-        config
-            .validate()
-            .expect("a blank bearer with no base_url is simply 'mail disabled'");
+        let err =
+            reject_unknown_fields(&value).expect_err("removed product-email keys must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("notification.{removed}")),
+            "{message}"
+        );
     }
 
     #[test]
