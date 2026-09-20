@@ -23,7 +23,7 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 
 - **Git Smart HTTP 与 SSH**：对标准 Git 客户端提供 Smart HTTP 与 SSH，覆盖 clone / fetch / pull / push。storage-only 形态下 SSH 只保留只读拉取（clone / fetch / pull），receive-pack 关闭：该形态没有用户系统，无法为用户配置 SSH key 这类按人鉴权的方式，因此推送统一走 HTTP（token 或匿名 `none`）是最佳选择，写鉴权只需维护一套。
 - **Git LFS**：遵循 Git LFS 标准，使用 git-lfs 管理的大文件使用标准 Git LFS 接口（`/info/lfs` 与 `/api/v1/lfs`）。
-- **FastCDC Media**：在标准 LFS 之上为大型媒体提供按内容分块的上传与复用（`--features fastcdc`）。FastCDC 和 BLAKE3 支持是 Monorepo 针对大文件和哈希安全开发的特性，需要配合 Libra 才能使用。契约见 [`docs/refactoring/fastcdc-media.md`](docs/refactoring/fastcdc-media.md)。
+- **FastCDC Media**：在标准 LFS 之上为大型媒体提供按内容分块的上传与复用（`--features fastcdc`）。FastCDC 和 BLAKE3 支持是 Monorepo 针对大文件和哈希安全开发的特性，需要配合 Libra 才能使用。
 
 ### 部署形态
 
