@@ -790,3 +790,172 @@ DEP-01 must implement, on `incremental_pack_reported` only:
 5. Sync `have` is only `[last_pushed]` or `[]` per GS-09 Q2 (AC-5).
 6. Live upload-pack continues to ignore unknown client `have` (AC-6).
 7. Missing local parent of an accepted `want` is `PackStreamError::Storage` on the reported path. Live `incremental_pack` today panics (`monorepo.rs:527`–`:533` `unwrap().unwrap()`); that panic is **not** the reported-path contract (GS-18 AC-5).
+
+## 操作授权冻结（Q7）
+
+Spike GS-21. Freezes the **operator identity, token scope, and
+`abort` / `force` predicates** for github_sync commands. This plan
+still adds **no HTTP routes** (ADR-GS-02) and no CLI subcommand.
+DEP-01 owns the surface. Atomic CAS of the cursor is GS-28 Q8; this
+card only names who may request a write and when it is legal.
+
+Trunk `/api/v1` has no `cedar_guard` (`http_server.rs:768`–`:771`;
+review mounts it at `:792`). `push_auth=none` returns the stable
+name `anonymous` (`api_write_auth.rs:34`). Agent-capture already
+splits **identity** (`require_ingest_token` `:98`) from **scope**
+(`token_covers_capture_repo` `:634`). Q7 copies that two-check
+shape onto a **new** token family, not `git.push_tokens`.
+
+### AC-1 — identity source
+
+**Scheme.** Operator identity is a named token from
+`[[github_sync.operator_tokens]]` (DEP-01 config; not added in this
+crate). Presentation is the same Basic-password / Bearer header as
+`authorize_trunk_api_write` (`api_write_auth.rs:58`–`:71`). The
+requester name is `token.name`.
+
+Not an identity source: session cookies, `UserStorage`, Cedar
+principals, the bootstrap SSH key, `git.push_tokens`, or the
+`anonymous` string. The SSH key authenticates **to GitHub**
+(ADR-GS-03); it never authenticates an operator to mega2.
+
+### AC-2 — credential scope
+
+**Scheme.** Each operator token carries:
+
+| Field | Meaning |
+|---|---|
+| `name` | identity (AC-1) |
+| `token` | secret; compared like ingest tokens |
+| `bindings` | binding `id` list, or `["*"]` for every configured binding |
+| `actions` | subset of `status`, `abort`, `cursor_reset`, `force` |
+
+A call is in scope only if **both** the target `binding.id` and the
+verb are listed. `status` is read-only. `cursor_reset` is the Q3
+“advertise already equals `local_oid`” write (no receive-pack).
+`force` is the history-rewrite receive-pack. `*` in `bindings` does
+not imply every action; omitted `actions` is empty (fail-closed).
+
+### AC-3 — authorization model (`push_auth=none` included)
+
+**Scheme.**
+
+| Caller | `push_auth=none` | `push_auth=token` |
+|---|---|---|
+| monorepo git / trunk API write | `anonymous` (today) | `git.push_tokens` + path cover |
+| github_sync operator command | **401** unless an operator token is presented | same: operator token required; a push token is not enough |
+
+Missing or unknown operator secret → **401**. Known secret but
+binding/action out of scope → **403** (the `api_write_auth`
+path-cover shape, **not** agent-capture’s 404-on-scope). Operator
+calls name a configured `binding.id`; hiding existence after a
+valid secret is not required. `enabled=true` does **not** require
+any operator token at boot (auto-park still works); commands are
+simply unavailable until tokens exist. Review / Cedar stay out of
+this plan (ADR-GS-02). DEP-01 must extend the GS-23 whitelist with
+`github_sync.operator_tokens` when the table is added.
+
+### AC-4 — `abort` conditions
+
+Two distinct aborts; do not mix them.
+
+**Policy abort (automatic).** On Q3 divergence (`advertise ≠
+last_pushed` and advertise is not `in_flight.new_oid`), the worker
+**parks** the binding and does not send receive-pack. No operator
+token. This is the only automatic NFF response (ADR-GS-04: mega2
+does not merge).
+
+**Operator abort (command).** Allowed when:
+
+1. Token has `abort` on that `binding.id` (AC-2).
+2. The binding exists.
+3. Binding state is one of the four frozen values below.
+
+Frozen states (DEP-01 must not invent others):
+
+| State | Meaning |
+|---|---|
+| `idle` | `last_pushed` equals advertise; no `in_flight` |
+| `in_flight` | intent row set; receive-pack may be running or crash-pending (Q4) |
+| `parked` | Q3 / operator abort; no automatic send |
+| `disabled` | binding exists in config but sync is off |
+
+`running` / `queued` are **not** states; they collapse into
+`in_flight`. Operator abort of `idle` is a no-op 200.
+
+It is **not** a GitHub update. It cancels the local pack (GS-18
+token+drop), leaves `last_pushed` unchanged, and does not invent a
+force-push. **Do not clear `in_flight` on operator abort** — Q4
+self-complete (`advertise == in_flight.new_oid`) must still run if
+GitHub already accepted. After an operator abort, clear `in_flight`
+only on a later cursor CAS (success or Q4 self-complete). Policy
+abort (nothing sent) may clear `in_flight` without a CAS. `parked`
+and `disabled` abort are idempotent 200 (no cursor write).
+
+### AC-5 — `abort` observable results
+
+| Case | Binding | Cursor | Remote | Report |
+|---|---|---|---|---|
+| Policy abort (divergence) | `parked`, reason `remote_diverged` | `last_pushed` unchanged; `in_flight` cleared (nothing was sent) | no receive-pack | outbox / event `aborted` |
+| Operator abort of `in_flight` | `parked`, reason `operator_abort` | `last_pushed` unchanged; **`in_flight` kept** | local pack cancelled; if advertise later equals `in_flight.new_oid`, Q4 self-complete still CAS-es | `aborted` + token `name` |
+| Operator abort of already `parked` | stays `parked` | unchanged | none | 200 idempotent |
+| Operator abort of `disabled` | stays `disabled` | unchanged | none | 200 idempotent |
+
+After either abort the next automatic attempt stays parked until
+advertise equals `last_pushed` again or a legal `cursor_reset` /
+`force` runs (Q3).
+
+### AC-6 — `force` conditions
+
+**Never automatic.** A GitHub-side merge is not a resume signal
+(Q3). Two operator writes exist:
+
+**`cursor_reset`** (preferred; no history rewrite) when all of:
+
+1. Token has `cursor_reset` on the binding.
+2. Binding is `parked`.
+3. Current advertise **equals** `local_oid` (Q3 already required
+   this). Request repeats `expected_remote_tip` and
+   `expected_local_oid`; mismatch → **409**, no write.
+4. No receive-pack. Cursor CAS `last_pushed := local_oid`, unpark.
+   The CAS primitive is GS-28.
+
+**`force`** (history rewrite) when all of:
+
+1. Token has `force` on the binding (`cursor_reset` is not enough).
+2. Binding is `parked` for Q3 divergence.
+3. Request repeats `expected_remote_tip` (= current advertise) and
+   `expected_local_oid` (= path `main`). Mismatch → **409**.
+4. Advertise is **not** `last_pushed` and **not** `local_oid`
+   (those are idle / cursor_reset, not force).
+5. Worker sends receive-pack
+   `old=expected_remote_tip new=expected_local_oid refs/heads/main`.
+   GitHub may `ng` a protected default branch (GS-15).
+
+### AC-7 — `force` observable results
+
+| Outcome | Binding | Cursor | Remote |
+|---|---|---|---|
+| `cursor_reset` 200 | `idle` | `last_pushed = local_oid`; `in_flight` empty | unchanged (already `local_oid`) |
+| `force` unpack+`ok refs/heads/main`+exit 0 | `idle` | `last_pushed = local_oid` after CAS | GitHub `main` is `local_oid` (history of the previous tip discarded) |
+| `force` `ng` / unpack fail / timeout | stays `parked` | `last_pushed` unchanged | GitHub tip unchanged |
+| 401 / 403 / 409 | unchanged | unchanged | none |
+
+A successful `force` is a **new** compensation key
+`(binding_id, remote, local_oid, expected_remote_tip)` (Q5). It is
+not a replay of the parked attempt.
+
+### 三分支判定
+
+| Field | Value |
+|---|---|
+| Branch | **go** |
+| Timebox | 2026-09-20, after GS-27 `9da75a3` |
+| Basis | Dedicated operator token family; `push_auth=none` never authorizes commands; automatic NFF is park-only; force is explicit + CAS |
+| Not claimed | HTTP routes or CLI in this crate; Cedar on trunk; implementing the CAS primitive (GS-28); REST to GitHub |
+
+### no-go 替代方向
+
+N/A — this card is `go`. Rejected alternatives: reuse `anonymous` /
+`git.push_tokens` for force; auto-force on a third GitHub oid;
+mount `cedar_guard` on trunk as a hidden dep of this plan.
