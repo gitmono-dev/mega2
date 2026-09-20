@@ -424,9 +424,10 @@ signal.
   cursor predicate.
 - Both sides' expected tips are the two oids above; validation is
   advertise == `last_pushed` immediately before send (Q4).
-- GitHub-side merge that produces a new tip stays parked. Force-replace
-  / inbound merge are not this card; they are a GS-10 alternative if a
-  later plan accepts the history rewrite.
+- GitHub-side merge that produces a new tip stays parked. Automatic
+  resume is never a force. Operator `force` / `cursor_reset` are Q7;
+  implementation is `plan-20260920` OX-03. Inbound merge stays
+  `DEFER-GS-02`.
 
 ### Q4 — poll vs push race
 
@@ -1094,3 +1095,54 @@ DEP-01 (or the vault follow-up it names) must:
    vault and not this fence.
 6. Repair: stop replicas, delete fence row **and** vault secrets,
    bootstrap one replica (GS-16).
+
+## 凭证
+
+Mirrors plan-20260916 「开工前凭证与密钥清单」. Three layers. **Do not mix.** Product path never uses a GitHub PAT,
+deploy key, or `gh auth token` (ADR-GS-03). This crate’s `gh release`
+is publisher-layer only.
+
+### 层 A — 测试（本仓；无 GitHub 账号）
+
+Postgres / Redis from `.env.test`, in-process vault, fixture SSH host
+keys. **No** GitHub token. All receive-pack tests are loopback
+(`DEFER-GS-08`).
+
+### 层 B — 本仓发版（仅 `Version increment=patch` 卡）
+
+Publisher `gh` on `gitmono-dev/mega2` plus Libra push to `origin`.
+Docs / spike / handoff cards do not need `gh`.
+
+### 层 C — 上线对接 GitHub（不在 plan-20260916 验收）
+
+Machine-user SSH public key + pinned `ssh_host_key`. Implementation
+of the push worker is `plan-20260920`. Tests must not require layer C.
+
+## 上线检查清单
+
+Operator checklist before the first **real** GitHub push
+(`plan-20260920`). Not a 60916 test gate.
+
+1. Use a **dedicated GitHub machine account**, not a human account.
+   A human token/key would couple personal access to every binding
+   and break ADR-GS-03’s single-credential model.
+2. Paste the startup `ssh-ed25519 … mega2-github-sync` line onto that
+   machine user (Settings → SSH keys). **Not** a deploy key.
+3. Pin `ssh_host_key` from GitHub’s published host-key document.
+   Accept-any is forbidden.
+4. Confirm the machine user can push each `binding.remote`.
+5. **Manually confirm `main` branch protection will not block a
+   direct push.** There is **no** automatic preflight: the bootstrap
+   SSH key cannot call GitHub REST (ADR-GS-03). First-push `ng` is
+   the diagnostic.
+6. Do **not** introduce a PAT / `gh` / REST client on the product
+   path.
+
+## 模板漂移（GAP-07）
+
+`docs/plan/plan-template.md` GC-12 / ER-07 still say this repo is
+Git-managed and that `.libra` was deleted (2026-08-27 note). **That
+is false on 2026-09-20:** `.git` is absent, `.libra` is present,
+`AGENTS.md` says VCS is Libra. This project executed
+`libra add` / `libra commit` / `libra push origin main`. Template
+correction is `DEP-02` (60916 does not edit the template).
