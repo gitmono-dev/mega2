@@ -258,21 +258,33 @@ impl ReceivePack {
     }
 
     pub async fn read_report(&mut self, sideband: bool) -> Result<(), MegaError> {
-        let mut buf = Vec::new();
+        let mut transport = ReportTransport::default();
         loop {
-            match self.channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    buf.extend_from_slice(&data);
-                    match report_progress(&buf, sideband, false) {
-                        ReportProgress::Ok => return Ok(()),
-                        ReportProgress::Fail(err) => return Err(err),
-                        ReportProgress::Pending => continue,
-                    }
+            let step = match self.channel.wait().await {
+                Some(ChannelMsg::Data { data }) => transport.on_data(&data, sideband),
+                Some(ChannelMsg::ExtendedData { data, ext }) => transport.on_stderr(ext, &data),
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    transport.on_exit_status(exit_status, sideband)
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    return parse_report_status(&buf, sideband, true);
+                Some(ChannelMsg::ExitSignal {
+                    signal_name,
+                    error_message,
+                    ..
+                }) => {
+                    let signal = if error_message.is_empty() {
+                        format!("{signal_name:?}")
+                    } else {
+                        format!("{signal_name:?} {error_message}")
+                    };
+                    transport.on_exit_signal(signal, sideband)
                 }
-                _ => continue,
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => transport.on_eof(sideband),
+                None => transport.on_end(sideband),
+                _ => TransportStep::Continue,
+            };
+            match step {
+                TransportStep::Done(result) => return result,
+                TransportStep::Continue => {}
             }
         }
     }
@@ -311,6 +323,11 @@ const REPORT_UNPACK: &str = "report_unpack";
 const REPORT_INCOMPLETE: &str = "report_incomplete";
 const REPORT_DISCONNECT: &str = "report_disconnect";
 const REPORT_FATAL: &str = "report_fatal";
+const SSH_EXIT_STATUS: &str = "ssh_exit_status";
+const SSH_EXIT_SIGNAL: &str = "ssh_exit_signal";
+const SSH_EXIT_MISSING: &str = "ssh_exit_missing";
+const SSH_STDERR: &str = "ssh_stderr";
+const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
 enum ReportProgress {
     Ok,
@@ -505,6 +522,130 @@ fn report_error(kind: &str, detail: impl std::fmt::Display) -> MegaError {
     MegaError::Other(format!("github_sync receive-pack report {kind}: {detail}"))
 }
 
+fn collect_stderr(stderr: &mut Vec<u8>, ext: u32, data: &[u8]) {
+    if ext == SSH_EXTENDED_DATA_STDERR {
+        stderr.extend_from_slice(data);
+    }
+}
+
+#[derive(Default)]
+struct ReportTransport {
+    buf: Vec<u8>,
+    stderr: Vec<u8>,
+    stream_closed: bool,
+    exit_status: Option<u32>,
+    exit_signal: Option<String>,
+}
+
+enum TransportStep {
+    Continue,
+    Done(Result<(), MegaError>),
+}
+
+impl ReportTransport {
+    fn on_data(&mut self, data: &[u8], sideband: bool) -> TransportStep {
+        self.buf.extend_from_slice(data);
+        match report_progress(&self.buf, sideband, false) {
+            ReportProgress::Fail(err) => self.done_with(Err(err)),
+            ReportProgress::Ok | ReportProgress::Pending => self.maybe_done(sideband),
+        }
+    }
+
+    fn on_stderr(&mut self, ext: u32, data: &[u8]) -> TransportStep {
+        collect_stderr(&mut self.stderr, ext, data);
+        TransportStep::Continue
+    }
+
+    fn on_exit_status(&mut self, code: u32, sideband: bool) -> TransportStep {
+        self.exit_status = Some(code);
+        self.maybe_done(sideband)
+    }
+
+    fn on_exit_signal(&mut self, signal: String, sideband: bool) -> TransportStep {
+        self.exit_signal = Some(signal);
+        self.maybe_done(sideband)
+    }
+
+    fn on_eof(&mut self, sideband: bool) -> TransportStep {
+        self.stream_closed = true;
+        self.maybe_done(sideband)
+    }
+
+    fn on_end(&mut self, sideband: bool) -> TransportStep {
+        self.stream_closed = true;
+        self.done_with(parse_report_status(&self.buf, sideband, true))
+    }
+
+    fn maybe_done(&self, sideband: bool) -> TransportStep {
+        if self.stream_closed && (self.exit_status.is_some() || self.exit_signal.is_some()) {
+            self.done_with(parse_report_status(&self.buf, sideband, true))
+        } else {
+            TransportStep::Continue
+        }
+    }
+
+    fn done_with(&self, report: Result<(), MegaError>) -> TransportStep {
+        TransportStep::Done(judge_transport(
+            report,
+            &self.stderr,
+            self.exit_status,
+            self.exit_signal.as_deref(),
+        ))
+    }
+}
+
+fn judge_transport(
+    report: Result<(), MegaError>,
+    stderr: &[u8],
+    exit_status: Option<u32>,
+    exit_signal: Option<&str>,
+) -> Result<(), MegaError> {
+    if let Some(signal) = exit_signal {
+        return Err(ssh_error(SSH_EXIT_SIGNAL, format_detail(signal, stderr)));
+    }
+    if let Some(code) = exit_status
+        && code != 0
+    {
+        return Err(ssh_error(SSH_EXIT_STATUS, format_detail(code, stderr)));
+    }
+    match report {
+        Err(err) => Err(attach_stderr(err, stderr)),
+        Ok(()) => {
+            if exit_status == Some(0) {
+                Ok(())
+            } else {
+                Err(ssh_error(
+                    SSH_EXIT_MISSING,
+                    format_detail("EOF/close without exit-status", stderr),
+                ))
+            }
+        }
+    }
+}
+
+fn format_detail(detail: impl std::fmt::Display, stderr: &[u8]) -> String {
+    if stderr.is_empty() {
+        detail.to_string()
+    } else {
+        format!(
+            "{detail}; {SSH_STDERR} {}",
+            String::from_utf8_lossy(stderr).trim()
+        )
+    }
+}
+
+fn attach_stderr(err: MegaError, stderr: &[u8]) -> MegaError {
+    if stderr.is_empty() {
+        err
+    } else {
+        MegaError::Other(format_detail(err, stderr))
+    }
+}
+
+fn ssh_error(kind: &str, detail: impl std::fmt::Display) -> MegaError {
+    MegaError::Other(format!("github_sync receive-pack {kind}: {detail}"))
+}
+
 fn advertisement_complete(buf: &[u8]) -> bool {
     let mut remaining = Bytes::copy_from_slice(buf);
     loop {
@@ -545,6 +686,33 @@ mod tests {
         let mut out = encode_sideband(1, inner);
         out.extend_from_slice(b"0000");
         out
+    }
+
+    enum TestEv<'a> {
+        Data(&'a [u8]),
+        Stderr(&'a [u8]),
+        Exit(u32),
+        Signal(&'a str),
+        Eof,
+        End,
+    }
+
+    fn drive(sideband: bool, events: &[TestEv<'_>]) -> Result<(), MegaError> {
+        let mut transport = ReportTransport::default();
+        for event in events {
+            let step = match event {
+                TestEv::Data(data) => transport.on_data(data, sideband),
+                TestEv::Stderr(data) => transport.on_stderr(SSH_EXTENDED_DATA_STDERR, data),
+                TestEv::Exit(code) => transport.on_exit_status(*code, sideband),
+                TestEv::Signal(signal) => transport.on_exit_signal((*signal).to_string(), sideband),
+                TestEv::Eof => transport.on_eof(sideband),
+                TestEv::End => transport.on_end(sideband),
+            };
+            if let TransportStep::Done(result) = step {
+                return result;
+            }
+        }
+        panic!("transport still pending");
     }
 
     #[test]
@@ -802,5 +970,111 @@ mod tests {
         assert!(text.contains(REPORT_FATAL), "{text}");
         assert!(text.contains("index-pack failed"), "{text}");
         assert!(!text.contains(REPORT_NG), "{text}");
+    }
+
+    #[test]
+    fn remote_exit_overrides_report() {
+        let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        let report = parse_report_status(&full, false, false);
+        report.as_ref().expect("report");
+
+        let err = judge_transport(report, b"", Some(1), None).expect_err("nonzero");
+        let text = err.to_string();
+        assert!(text.contains(SSH_EXIT_STATUS), "{text}");
+        assert!(text.contains('1'), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+        assert!(!text.contains(SSH_EXIT_SIGNAL), "{text}");
+
+        let report = parse_report_status(&full, false, false);
+        let err = judge_transport(report, b"", None, Some("TERM")).expect_err("signal");
+        let text = err.to_string();
+        assert!(text.contains(SSH_EXIT_SIGNAL), "{text}");
+        assert!(text.contains("TERM"), "{text}");
+        assert!(!text.contains(SSH_EXIT_STATUS), "{text}");
+        assert!(!text.contains(REPORT_NG), "{text}");
+
+        let (head, tail) = full.split_at(6);
+        let err = drive(
+            false,
+            &[
+                TestEv::Data(head),
+                TestEv::Exit(1),
+                TestEv::Data(tail),
+                TestEv::Eof,
+            ],
+        )
+        .expect_err("nonzero after trailing report");
+        assert!(err.to_string().contains(SSH_EXIT_STATUS), "{err}");
+    }
+
+    #[test]
+    fn eof_without_exit_status_is_not_success() {
+        let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        let report = parse_report_status(&full, false, true);
+        report.as_ref().expect("report");
+
+        let err = judge_transport(report, b"", None, None).expect_err("missing exit");
+        let text = err.to_string();
+        assert!(text.contains(SSH_EXIT_MISSING), "{text}");
+        assert!(!text.contains(REPORT_INCOMPLETE), "{text}");
+        assert!(!text.contains(SSH_EXIT_STATUS), "{text}");
+
+        let report = parse_report_status(&full, false, true);
+        judge_transport(report, b"", Some(0), None).expect("exit 0 plus report");
+
+        let err = drive(false, &[TestEv::Data(&full), TestEv::Eof, TestEv::End])
+            .expect_err("eof then end");
+        assert!(err.to_string().contains(SSH_EXIT_MISSING), "{err}");
+
+        let (head, tail) = full.split_at(6);
+        drive(
+            false,
+            &[
+                TestEv::Data(head),
+                TestEv::Exit(0),
+                TestEv::Data(tail),
+                TestEv::Eof,
+            ],
+        )
+        .expect("exit 0 then remaining report then eof");
+    }
+
+    #[test]
+    fn stderr_is_collected() {
+        let mut stderr = Vec::new();
+        collect_stderr(
+            &mut stderr,
+            SSH_EXTENDED_DATA_STDERR,
+            b"remote: hook denied\n",
+        );
+        collect_stderr(&mut stderr, 0, b"ignored stdout-like");
+        assert_eq!(stderr, b"remote: hook denied\n");
+
+        let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        let report = parse_report_status(&full, false, false);
+        let err = judge_transport(report, &stderr, Some(128), None).expect_err("stderr");
+        let text = err.to_string();
+        assert!(text.contains(SSH_STDERR), "{text}");
+        assert!(text.contains("hook denied"), "{text}");
+        assert!(text.contains(SSH_EXIT_STATUS), "{text}");
+
+        let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        let err = drive(
+            false,
+            &[
+                TestEv::Stderr(b"remote: hook denied\n"),
+                TestEv::Data(&full),
+                TestEv::Exit(128),
+                TestEv::Eof,
+            ],
+        )
+        .expect_err("driven stderr");
+        let text = err.to_string();
+        assert!(text.contains(SSH_STDERR), "{text}");
+        assert!(text.contains("hook denied"), "{text}");
+
+        let fatal = encode_sideband(3, b"index-pack failed");
+        let err = drive(true, &[TestEv::Data(&fatal)]).expect_err("fatal is immediate");
+        assert!(err.to_string().contains(REPORT_FATAL), "{err}");
     }
 }

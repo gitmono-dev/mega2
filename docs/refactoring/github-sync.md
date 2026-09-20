@@ -242,5 +242,21 @@ packets. Channel 2 is ignored. Channel 3 is fatal immediately. An
 outer multiplex flush without a complete inner report is
 `report_incomplete`, not a disconnect.
 
-SSH `exit-status` / `exit-signal` / stderr priority is GS-25. Deadlines
-are GS-20. Diagnostic byte budgets are GS-26.
+SSH transport termination is below. Deadlines are GS-20. Diagnostic
+byte budgets are GS-26.
+
+## 传输层终止事件
+
+SSH `stderr` (`SSH_EXTENDED_DATA_STDERR`, RFC 4254 type code 1) is
+collected into diagnostics as `ssh_stderr`. Any `exit-signal` is
+`ssh_exit_signal`. A non-zero `exit-status` is `ssh_exit_status`. Both
+of those failures outrank a complete successful report-status.
+
+Report-layer failure (including side-band channel 3 fatal) returns
+immediately. Exit events are recorded and the reader keeps draining
+stdout until EOF/close, because OpenSSH may send `exit-status` before
+the last report bytes.
+
+Final success is report-layer success plus an explicit `exit-status = 0`.
+EOF or close without `exit-status` is `ssh_exit_missing` and is never
+success; the wait is bounded by GS-20.
