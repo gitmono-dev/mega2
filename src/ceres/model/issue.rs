@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{
-    ceres::model::label::LabelItem,
-    jupiter::model::common::{ItemDetails, ItemKind},
-};
+use crate::jupiter::model::common::{ItemDetails, ItemKind};
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ItemRes {
@@ -17,8 +14,6 @@ pub struct ItemRes {
     pub closed_at: Option<i64>,
     pub merge_timestamp: Option<i64>,
     pub updated_at: i64,
-    pub labels: Vec<LabelItem>,
-    pub assignees: Vec<String>,
     pub comment_num: usize,
 }
 
@@ -35,8 +30,6 @@ impl From<ItemDetails> for ItemRes {
             merge_timestamp: model.merge_date.map(|dt| dt.and_utc().timestamp()),
             closed_at: None,
             updated_at: model.updated_at.and_utc().timestamp(),
-            labels: value.labels.into_iter().map(|m| m.into()).collect(),
-            assignees: value.assignees,
             comment_num: value.comment_num,
         }
     }

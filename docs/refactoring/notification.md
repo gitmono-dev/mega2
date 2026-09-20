@@ -1,47 +1,45 @@
 # Notification
 
-`mega2` retains notification event selection, user preferences, and
-non-email delivery such as in-app, Slack, and webhook notifications. It no
-longer owns email rendering, queues, SMTP credentials, or SMTP delivery.
+`mega2` retains notification event selection, user preferences
+(`enabled` plus per-event toggles), and a single outbound channel:
+generic webhook under `[notification.webhook]`. Unrelated
+`[storage_events]` is not part of this surface.
 
-## Email delivery boundary
+It does not own email rendering, queues, SMTP, Slack, or an in-app
+inbox. Product email, if any, lives in megaui / website. The retired
+client contract is the tombstone in [`website-mail.md`](./website-mail.md).
 
-Product events that require email call the website internal notification API.
-The website is the sole owner of templates, delivery providers, retries, and
-SMTP configuration. The contract, authentication, and Compose topology are
-defined in [`website-mail.md`](./website-mail.md). Stack IT coverage lives in
-`bin/tests/integration_website_mail.rs` (`WEBSITE_IT=1`).
+## Outbound boundary
+
+The only notification delivery configuration is `[notification.webhook]`.
+When no webhook target is configured, the notification surface is silent
+(expected). A webhook failure is logged and does not fail the originating
+CL or issue request.
 
 Consequently, mega2 has no:
 
 - `[mail]` configuration or `mail.password` SecretRef;
 - `SmtpMailer`, `lettre`, `EmailDispatcher`, or `email_jobs` outbox;
+- Slack channel or `[notification.slack]`;
+- in-app inbox writer or `user_inbox_notifications`;
+- `website_mail_*` client keys;
 - Mailpit success-path requirement;
 - admin email-job or mail-template API.
 
-`notification.website_mail_base_url` and the corresponding bearer setting are
-the only mega2 configuration for product-email delivery. The client is
-best-effort: a website failure is logged without failing the originating CL or
-issue request, and does not disable in-app, Slack, or webhook delivery.
+## Preferences
 
-## Preferences and delivery
+`GET|PUT /notification/preferences` keeps `enabled` and per-event
+selection. There is no `delivery_mode`, `settings.email`, or
+`preferred_locale`. Existing event triggers still enforce those
+preferences before emitting a webhook.
 
-The `email` delivery preference means “request website email delivery” and
-does not reintroduce a local email channel. Existing event triggers continue
-to enforce notification preferences before emitting in-app and optional
-external-channel notifications.
-
-Chat notification events are removed with the chat product surface and are not
-forwarded to the website.
+Chat notification events were removed with the chat product surface.
 
 ## Testing
 
-Test notification triggers with focused Rust tests, the website-mail client
-wire mock, and stack IT (`integration_website_mail` under `WEBSITE_IT=1`). Do
-not add tests that seed `email_jobs`, configure an SMTP server, or assert
-mega2-to-Mailpit delivery. Mailpit, when started by the
-Compose stack, is exclusively a website authentication/product-email capture
-service.
+Test notification triggers and webhook delivery with focused Rust tests.
+Do not add tests that seed `email_jobs`, configure an SMTP server, or
+assert mega2-to-SMTP capture delivery.
 
 See also [`integration.md`](./integration.md) for the active integration
 matrix and [`test-infra.md`](./test-infra.md) for Compose service ownership.

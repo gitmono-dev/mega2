@@ -3,8 +3,9 @@
 
 use super::{
     AgentCaptureConfig, AgentCaptureIngestTokenConfig, DEFAULT_MAX_PUSH_COMMITS, GitConfig,
-    PushAuth, PushPolicy, PushTokenConfig, StorageEventsConfig, reload::ConfigHandle,
-    testing::isolated_config, token_path_authorizes, validate,
+    GithubSyncBinding, GithubSyncConfig, PushAuth, PushPolicy, PushTokenConfig,
+    StorageEventsConfig, reload::ConfigHandle, testing::isolated_config, token_path_authorizes,
+    validate,
 };
 use crate::{
     callisto::sea_orm_active_enums::PushQueueKindEnum,
@@ -243,7 +244,7 @@ fn push_token_secret_ref_must_use_config_namespace() {
     config.cedar.enforcement = "off".to_string();
     config.git.push_tokens = vec![PushTokenConfig {
         name: "ci".into(),
-        token: "vault://secret/config/prod/notification/slack/webhook_url#value".into(),
+        token: "vault://secret/config/prod/mail/password#value".into(),
         paths: None,
     }];
     let err = config.validate().expect_err("wrong SecretRef namespace");
@@ -530,5 +531,197 @@ async fn trunk_to_review_reset_lets_review_update_all_rows() {
             .unwrap()
             .last_policy,
         "review"
+    );
+}
+
+#[test]
+fn github_sync_shape_and_defaults() {
+    let defaulted = GithubSyncConfig::default();
+    assert!(!defaulted.enabled);
+    assert!(defaulted.ssh_host.is_empty());
+    assert!(defaulted.ssh_user.is_empty());
+    assert!(defaulted.ssh_host_key.is_empty());
+    assert!(defaulted.ssh_key_ref.is_empty());
+    assert!(defaulted.bindings.is_empty());
+    assert_eq!(
+        defaulted.advertise_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        defaulted.send_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        defaulted.report_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        defaulted.exit_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS
+    );
+
+    let parsed: GithubSyncConfig = toml::from_str("").expect("empty table loads");
+    assert_eq!(parsed, GithubSyncConfig::default());
+
+    let with_binding: GithubSyncConfig = toml::from_str(
+        r#"
+enabled = false
+ssh_host = "github.com"
+ssh_user = "git"
+ssh_host_key = "ssh-ed25519 AAAA"
+ssh_key_ref = "secret/github-sync"
+[[bindings]]
+id = "core"
+path = "/project/core"
+remote = "git@github.com:example/core.git"
+"#,
+    )
+    .expect("explicit schema loads");
+    assert_eq!(
+        with_binding,
+        GithubSyncConfig {
+            enabled: false,
+            ssh_host: "github.com".into(),
+            ssh_user: "git".into(),
+            ssh_host_key: "ssh-ed25519 AAAA".into(),
+            ssh_key_ref: "secret/github-sync".into(),
+            bindings: vec![GithubSyncBinding {
+                id: "core".into(),
+                path: "/project/core".into(),
+                remote: "git@github.com:example/core.git".into(),
+            }],
+            advertise_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS,
+            send_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS,
+            report_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS,
+            exit_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS,
+        }
+    );
+
+    let cfg = isolated_config(std::env::temp_dir().join("mega2-gs03-github-sync"));
+    assert_eq!(cfg.github_sync, GithubSyncConfig::default());
+    let _enabled: bool = cfg.github_sync.enabled;
+    let _host: String = cfg.github_sync.ssh_host;
+    let _user: String = cfg.github_sync.ssh_user;
+    let _host_key: String = cfg.github_sync.ssh_host_key;
+    let _key_ref: String = cfg.github_sync.ssh_key_ref;
+    let _bindings: Vec<GithubSyncBinding> = cfg.github_sync.bindings;
+}
+
+#[test]
+fn github_sync_deadline_defaults() {
+    let defaulted = GithubSyncConfig::default();
+    assert_eq!(
+        defaulted.advertise_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        defaulted.send_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        defaulted.report_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        defaulted.exit_timeout_seconds,
+        crate::config::DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS
+    );
+    assert!(defaulted.advertise_timeout_seconds > 0);
+    assert!(defaulted.send_timeout_seconds > 0);
+    assert!(defaulted.report_timeout_seconds > 0);
+    assert!(defaulted.exit_timeout_seconds > 0);
+
+    let parsed: GithubSyncConfig = toml::from_str(
+        r#"
+advertise_timeout_seconds = 12
+send_timeout_seconds = 34
+report_timeout_seconds = 56
+exit_timeout_seconds = 7
+"#,
+    )
+    .expect("explicit deadlines");
+    assert_eq!(parsed.advertise_timeout_seconds, 12);
+    assert_eq!(parsed.send_timeout_seconds, 34);
+    assert_eq!(parsed.report_timeout_seconds, 56);
+    assert_eq!(parsed.exit_timeout_seconds, 7);
+    let applied = crate::ceres::github_sync::send_pack::ReceivePackDeadlines::from_config(&parsed);
+    assert_eq!(applied.advertise, std::time::Duration::from_secs(12));
+    assert_eq!(applied.send, std::time::Duration::from_secs(34));
+    assert_eq!(applied.report, std::time::Duration::from_secs(56));
+    assert_eq!(applied.exit, std::time::Duration::from_secs(7));
+
+    let mut zero = isolated_config(std::env::temp_dir().join("mega2-gs20-zero-deadline"));
+    zero.github_sync.advertise_timeout_seconds = 0;
+    let err = zero.validate().expect_err("zero advertise");
+    assert!(
+        err.to_string().contains("advertise_timeout_seconds"),
+        "{err}"
+    );
+}
+
+#[test]
+fn github_sync_rejects_unknown_key() {
+    assert!(
+        validate::known_fields("")
+            .expect("root schema")
+            .contains(&"github_sync")
+    );
+    assert_eq!(
+        validate::known_fields("github_sync").expect("section schema"),
+        [
+            "enabled",
+            "ssh_host",
+            "ssh_user",
+            "ssh_host_key",
+            "ssh_key_ref",
+            "bindings",
+            "advertise_timeout_seconds",
+            "send_timeout_seconds",
+            "report_timeout_seconds",
+            "exit_timeout_seconds",
+        ]
+    );
+    assert_eq!(
+        validate::known_fields("github_sync.bindings").expect("binding schema"),
+        ["id", "path", "remote"]
+    );
+
+    let value = toml::from_str::<toml::Value>(
+        r#"
+        base_dir = "/tmp"
+        [database]
+        db_url = "postgres://localhost:5432/mono"
+        [monorepo]
+        import_dir = "/third-party"
+        admin = ["admin"]
+        root_dirs = ["project"]
+        [github_sync]
+        unexpected = true
+        "#,
+    )
+    .unwrap();
+    let err = crate::config::validate::reject_unknown_fields(&value)
+        .expect_err("unknown github_sync key must fail closed");
+    assert!(err.to_string().contains("unexpected"), "{err}");
+
+    let binding_value = toml::from_str::<toml::Value>(
+        r#"
+        base_dir = "/tmp"
+        [database]
+        db_url = "postgres://localhost:5432/mono"
+        [monorepo]
+        import_dir = "/third-party"
+        admin = ["admin"]
+        root_dirs = ["project"]
+        [[github_sync.bindings]]
+        unexpected = true
+        "#,
+    )
+    .unwrap();
+    let binding_err = crate::config::validate::reject_unknown_fields(&binding_value)
+        .expect_err("unknown github_sync.bindings key must fail closed");
+    assert!(
+        binding_err.to_string().contains("unexpected"),
+        "{binding_err}"
     );
 }

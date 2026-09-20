@@ -9,25 +9,16 @@ use crate::{
     callisto::{check_result, mega_cl_commits, sea_orm_active_enums::MergeStatusEnum},
     ceres::{
         merge_checker::{CheckType, ConditionResult},
-        model::{conversation::ConversationItem, label::LabelItem},
+        model::conversation::ConversationItem,
     },
     contract::api::common::CommonPage,
     jupiter::model::{cl_dto::CLDetails, common::ListParams},
 };
 
 #[derive(Deserialize, ToSchema)]
-pub struct AssigneeUpdatePayload {
-    pub assignees: Vec<String>,
-    pub item_id: i64,
-    pub link: String,
-}
-
-#[derive(Deserialize, ToSchema)]
 pub struct ListPayload {
     pub status: String,
     pub author: Option<String>,
-    pub labels: Option<Vec<i64>>,
-    pub assignees: Option<Vec<String>>,
     pub sort_by: Option<String>,
     pub asc: bool,
 }
@@ -37,8 +28,6 @@ impl From<ListPayload> for ListParams {
         Self {
             status: value.status,
             author: value.author,
-            labels: value.labels,
-            assignees: value.assignees,
             sort_by: value.sort_by,
             asc: value.asc,
         }
@@ -54,8 +43,6 @@ pub struct CLDetailRes {
     pub open_timestamp: i64,
     pub merge_timestamp: Option<i64>,
     pub conversations: Vec<ConversationItem>,
-    pub labels: Vec<LabelItem>,
-    pub assignees: Vec<String>,
     pub path: String,
 }
 
@@ -71,13 +58,7 @@ impl From<CLDetails> for CLDetailRes {
             conversations: value
                 .conversations
                 .into_iter()
-                .map(|x| ConversationItem::from_model(x.conversation, x.reactions, &value.username))
-                .collect(),
-            labels: value.labels.into_iter().map(|x| x.into()).collect(),
-            assignees: value
-                .assignees
-                .into_iter()
-                .map(|x| x.assignnee_id)
+                .map(|x| ConversationItem::from_model(x.conversation))
                 .collect(),
             path: value.cl.path,
         }
@@ -309,7 +290,8 @@ pub struct Condition {
 
 impl From<check_result::Model> for Condition {
     fn from(value: check_result::Model) -> Self {
-        let check_type: CheckType = value.check_type_code.into();
+        let check_type = CheckType::try_from(value.check_type_code)
+            .expect("code_review check rows are deleted (RM-CC)");
         Self {
             condition_type: check_type.clone(),
             display_name: check_type.clone().display_name().to_string(),
@@ -325,12 +307,6 @@ impl From<check_result::Model> for Condition {
 pub enum RequirementsState {
     UNMERGEABLE,
     MERGEABLE,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-
-pub struct VerifyClPayload {
-    pub assignees: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]

@@ -14,13 +14,11 @@ use crate::{
     callisto::sea_orm_active_enums::{ConvTypeEnum, MergeStatusEnum},
     ceres::model::{
         change_list::{
-            AssigneeUpdatePayload, CLDetailRes, ClCommitRes, ClFilesRes, Condition,
-            FilesChangedPage, ListPayload, MergeBoxRes, MuiTreeNode, UpdateBranchStatusRes,
-            UpdateClStatusPayload,
+            CLDetailRes, ClCommitRes, ClFilesRes, Condition, FilesChangedPage, ListPayload,
+            MergeBoxRes, MuiTreeNode, UpdateBranchStatusRes, UpdateClStatusPayload,
         },
         conversation::ContentPayload,
         issue::ItemRes,
-        label::LabelUpdatePayload,
     },
     common::errors::{ApiError, MegaError},
     contract::{
@@ -45,8 +43,6 @@ pub fn routers() -> OpenApiRouter<MonoApiServiceState> {
             .routes(routes!(cl_files_changed_by_page))
             .routes(routes!(cl_files_list))
             .routes(routes!(save_comment))
-            .routes(routes!(labels))
-            .routes(routes!(assignees))
             .routes(routes!(edit_title))
             .routes(routes!(update_cl_status))
             .routes(routes!(update_branch_status))
@@ -569,38 +565,24 @@ async fn save_comment(
     state: State<MonoApiServiceState>,
     Json(payload): Json<ContentPayload>,
 ) -> Result<Json<CommonResult<()>>, ApiError> {
-    let conv_type = if state
-        .storage
-        .reviewer_storage()
-        .is_reviewer(&link, &user.username)
-        .await?
-    {
-        // If user is the reviewer for this cl, then the comment if of type review
-        ConvTypeEnum::Review
-    } else {
-        ConvTypeEnum::Comment
-    };
-
     state
         .conv_stg()
         .add_conversation(
             &link,
             &user.username,
             Some(payload.content.clone()),
-            conv_type,
+            ConvTypeEnum::Comment,
         )
         .await?;
 
-    // Enqueue notification emails for the CL author + reviewers (outbox; the
+    // Enqueue notification emails for the CL author (outbox; the
     // background dispatcher delivers them). Best-effort: a notification failure
     // must not fail the comment request. See docs/notification.md phase 0.
     let notif_stg = state.storage.notification_storage();
     let cl_stg = state.cl_stg();
-    let reviewer_stg = state.storage.reviewer_storage();
     if let Err(e) = crate::notification::triggers::on_cl_comment_created(
         &notif_stg,
         &cl_stg,
-        &reviewer_stg,
         &user.username,
         &link,
         &payload.content,
@@ -646,44 +628,6 @@ async fn edit_title(
             .dispatch(WebhookEvent::ClUpdated, &cl_model);
     }
     Ok(Json(CommonResult::success(None)))
-}
-
-/// Update cl related labels
-#[utoipa::path(
-    post,
-    path = "/labels",
-    request_body = LabelUpdatePayload,
-    responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json"),
-        (status = 403, description = "Authorization denied for this Change List operation"),
-    ),
-    tag = CL_TAG
-)]
-async fn labels(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-    Json(payload): Json<LabelUpdatePayload>,
-) -> Result<Json<CommonResult<()>>, ApiError> {
-    api_common::label_assignee::label_update(user, state, payload, String::from("cl")).await
-}
-
-/// Update CL related assignees
-#[utoipa::path(
-    post,
-    path = "/assignees",
-    request_body = AssigneeUpdatePayload,
-    responses(
-        (status = 200, body = CommonResult<String>, content_type = "application/json"),
-        (status = 403, description = "Authorization denied for this Change List operation"),
-    ),
-    tag = CL_TAG
-)]
-async fn assignees(
-    user: LoginUser,
-    state: State<MonoApiServiceState>,
-    Json(payload): Json<AssigneeUpdatePayload>,
-) -> Result<Json<CommonResult<()>>, ApiError> {
-    api_common::label_assignee::assignees_update(user, state, payload, String::from("cl")).await
 }
 
 /// Update CL status (Draft or Open)

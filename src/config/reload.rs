@@ -461,8 +461,6 @@ fn apply_buck_cleanup_changes(
 }
 
 /// Notification delivery settings are read live from the config snapshot.
-/// Website mail credentials construct a bounded HTTP client at startup, so
-/// changing those fields is accepted into the snapshot but requires restart.
 fn apply_notification_changes(
     current: &Option<NotificationConfig>,
     candidate: &Option<NotificationConfig>,
@@ -480,29 +478,6 @@ fn apply_notification_changes(
 
     if current_enabled != candidate_enabled {
         report.applied_fields.push("notification.enabled");
-    }
-    if current.as_ref().map(|config| {
-        (
-            &config.website_mail_base_url,
-            &config.website_mail_bearer,
-            &config.website_mail_bearer_ref,
-        )
-    }) != candidate.as_ref().map(|config| {
-        (
-            &config.website_mail_base_url,
-            &config.website_mail_bearer,
-            &config.website_mail_bearer_ref,
-        )
-    }) {
-        report
-            .restart_required_fields
-            .push("notification.website_mail_base_url");
-        report
-            .restart_required_fields
-            .push("notification.website_mail_bearer");
-        report
-            .restart_required_fields
-            .push("notification.website_mail_bearer_ref");
     }
 }
 
@@ -654,6 +629,7 @@ fn collect_static_restart_fields(
     collect_object_storage_restart_fields(current, candidate, report);
     collect_oauth_restart_fields(current, candidate, report);
     collect_storage_events_restart_fields(current, candidate, report);
+    collect_github_sync_restart_fields(current, candidate, report);
 }
 
 fn collect_monorepo_restart_fields(
@@ -876,6 +852,57 @@ fn collect_oauth_restart_fields(
     }
 }
 
+fn collect_github_sync_restart_fields(
+    current: &Config,
+    candidate: &Config,
+    report: &mut ConfigReloadReport,
+) {
+    if current.github_sync.enabled != candidate.github_sync.enabled {
+        report.restart_required_fields.push("github_sync.enabled");
+    }
+    if current.github_sync.ssh_host != candidate.github_sync.ssh_host {
+        report.restart_required_fields.push("github_sync.ssh_host");
+    }
+    if current.github_sync.ssh_user != candidate.github_sync.ssh_user {
+        report.restart_required_fields.push("github_sync.ssh_user");
+    }
+    if current.github_sync.ssh_host_key != candidate.github_sync.ssh_host_key {
+        report
+            .restart_required_fields
+            .push("github_sync.ssh_host_key");
+    }
+    if current.github_sync.ssh_key_ref != candidate.github_sync.ssh_key_ref {
+        report
+            .restart_required_fields
+            .push("github_sync.ssh_key_ref");
+    }
+    if current.github_sync.bindings != candidate.github_sync.bindings {
+        report.restart_required_fields.push("github_sync.bindings");
+    }
+    if current.github_sync.advertise_timeout_seconds
+        != candidate.github_sync.advertise_timeout_seconds
+    {
+        report
+            .restart_required_fields
+            .push("github_sync.advertise_timeout_seconds");
+    }
+    if current.github_sync.send_timeout_seconds != candidate.github_sync.send_timeout_seconds {
+        report
+            .restart_required_fields
+            .push("github_sync.send_timeout_seconds");
+    }
+    if current.github_sync.report_timeout_seconds != candidate.github_sync.report_timeout_seconds {
+        report
+            .restart_required_fields
+            .push("github_sync.report_timeout_seconds");
+    }
+    if current.github_sync.exit_timeout_seconds != candidate.github_sync.exit_timeout_seconds {
+        report
+            .restart_required_fields
+            .push("github_sync.exit_timeout_seconds");
+    }
+}
+
 fn collect_storage_events_restart_fields(
     current: &Config,
     candidate: &Config,
@@ -928,7 +955,8 @@ fn collect_storage_events_restart_fields(
 mod tests {
     use super::*;
     use crate::config::{
-        ArtifactGcConfig, BuckConfig, PushAuth, PushPolicy, StorageEventsTargetConfig,
+        ArtifactGcConfig, BuckConfig, GithubSyncBinding, GithubSyncConfig, PushAuth, PushPolicy,
+        StorageEventsTargetConfig,
         template::config_init_template,
         testing::{EnvVarGuard, env_lock, isolated_config},
     };
@@ -1115,6 +1143,48 @@ mod tests {
         assert_eq!(snapshot.storage_events.request_timeout_seconds, 5);
         assert_eq!(snapshot.storage_events.shutdown_grace_seconds, 5);
         assert!(snapshot.storage_events.targets.is_empty());
+    }
+
+    #[test]
+    fn github_sync_is_restart_required() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut current = isolated_config(temp_dir.path().join("current"));
+        current.monorepo.push_policy = PushPolicy::Trunk;
+        current.git.push_auth = Some(PushAuth::None);
+        current.git.ssh_receive_pack = Some(false);
+        current.cedar.enforcement = "off".to_string();
+        let handle = ConfigHandle::new(current);
+
+        let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+        candidate.github_sync.enabled = true;
+        candidate.github_sync.ssh_host = "github.com".to_string();
+        candidate.github_sync.ssh_user = "git".to_string();
+        candidate.github_sync.ssh_host_key = "ssh-ed25519 AAAA".to_string();
+        candidate.github_sync.ssh_key_ref =
+            "vault://secret/config/example/github_sync/ssh_key#value".to_string();
+        candidate.github_sync.bindings = vec![GithubSyncBinding {
+            id: "core".to_string(),
+            path: "/project/core".to_string(),
+            remote: "example/core".to_string(),
+        }];
+
+        let report = handle.reload(candidate).expect("reload should succeed");
+        let snapshot = handle.snapshot().expect("snapshot after reload");
+
+        assert!(report.applied_fields.is_empty());
+        assert_eq!(
+            report.restart_required_fields,
+            vec![
+                "github_sync.enabled",
+                "github_sync.ssh_host",
+                "github_sync.ssh_user",
+                "github_sync.ssh_host_key",
+                "github_sync.ssh_key_ref",
+                "github_sync.bindings",
+            ]
+        );
+        assert!(report.requires_restart());
+        assert_eq!(snapshot.github_sync, GithubSyncConfig::default());
     }
 
     #[test]

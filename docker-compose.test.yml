@@ -29,20 +29,6 @@ services:
       timeout: 5s
       retries: 20
 
-  # Optional SMTP capture for the website front end's authentication/product-mail
-  # IT only.
-  # Mega2 does not connect to or depend on this service.
-  mailpit:
-    image: axllent/mailpit:v1.27
-    ports:
-      - "127.0.0.1:11025:1025"
-      - "127.0.0.1:18025:8025"
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8025"]
-      interval: 2s
-      timeout: 5s
-      retries: 20
-
   # S3-compatible object storage for IT smoke (RustFS). Public test credentials
   # are `rustfs` / `rustfs_secret` (see `.env.test.example`).
   rustfs:
@@ -221,9 +207,6 @@ services:
       # config, and add the website-next host origin for stack session tests.
       MEGA_OAUTH__ALLOWED_CORS_ORIGINS: http://local.gitmega.com,https://app.gitmega.com,http://app.gitmono.test,http://127.0.0.1:17001
       MEGA_OAUTH__WEBSITE_API_BASE_URL: http://website-next:7001
-      # MN-05: shared IT-only credential for website's internal product-email API.
-      MEGA_NOTIFICATION__WEBSITE_MAIL_BASE_URL: http://website-next:7001
-      MEGA_NOTIFICATION__WEBSITE_MAIL_BEARER: mega2-it-website-mail-bearer-0001
       MEGA_OBJECT_STORAGE__STORAGE_TYPE: local
       MEGA_OBJECT_STORAGE__LOCAL__ROOT_DIR: /var/lib/mega2/objects
       MEGA_LOG__PRINT_STD: "true"

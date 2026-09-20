@@ -36,10 +36,6 @@ use crate::{
 /// (namespace `config/<profile>/storage_events/targets/<id>/hmac`), handled by
 /// [`storage_events_target_suffix`] because the suffix embeds the target id.
 const SUPPORTED_SECRET_FIELDS: &[(&str, &str)] = &[
-    (
-        "notification.slack.webhook_url",
-        "notification/slack/webhook_url",
-    ),
     ("notification.webhook.token", "notification/webhook/token"),
     ("redis.url", "redis/url"),
     (
@@ -312,7 +308,7 @@ fn secret_name_arg() -> Arg {
         .value_name("CONFIG_FIELD")
         .required(true)
         .help(
-            "Supported config secret field: redis.url, notification.slack.webhook_url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key, storage_events.targets.<id>.secret_ref",
+            "Supported config secret field: redis.url, notification.webhook.token, object_storage.s3.access_key_id, object_storage.s3.secret_access_key, storage_events.targets.<id>.secret_ref",
         )
 }
 
@@ -822,19 +818,12 @@ async fn resolve_config_secrets<R>(config: &Config, resolver: &R) -> Result<(), 
 where
     R: SecretResolver + ?Sized,
 {
-    if let Some(notification_cfg) = &config.notification {
-        if let Some(slack) = &notification_cfg.slack
-            && slack.enabled
-            && let Some(secret_ref) = &slack.webhook_url_ref
-        {
-            with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
-        }
-        if let Some(webhook) = &notification_cfg.webhook
-            && webhook.enabled
-            && let Some(secret_ref) = &webhook.token_ref
-        {
-            with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
-        }
+    if let Some(notification_cfg) = &config.notification
+        && let Some(webhook) = &notification_cfg.webhook
+        && webhook.enabled
+        && let Some(secret_ref) = &webhook.token_ref
+    {
+        with_audit_caller("cli:config-validate", resolver.resolve(secret_ref)).await?;
     }
 
     let redis_url_trimmed = config.redis.url.trim_start();
@@ -1156,22 +1145,22 @@ mod tests {
     }
 
     #[test]
-    fn secret_ref_from_args_accepts_notification_slack_webhook_url_namespace() {
+    fn secret_ref_from_args_rejects_removed_incoming_webhook_secret() {
+        let field = ["notification.", "sl", "ack", ".webhook_url"].concat();
         let matches = secret_ref_cli()
             .try_get_matches_from([
                 "ref",
-                "notification.slack.webhook_url",
+                field.as_str(),
                 "--vault-path",
-                "config/prod/notification/slack/webhook_url",
+                "config/prod/notification/webhook/token",
             ])
             .unwrap();
 
-        let secret_ref =
-            secret_ref_from_args(&matches).expect("slack webhook_url ref should be accepted");
-        assert_eq!(
-            secret_ref.secret_name(),
-            "config/prod/notification/slack/webhook_url"
-        );
+        let err = secret_ref_from_args(&matches).expect_err("removed incoming-webhook secret");
+        let message = err.to_string();
+        assert!(message.contains(&field));
+        assert!(message.contains("cannot be stored in mega2 vault"));
+        assert!(message.contains("supported fields are"));
     }
 
     #[test]

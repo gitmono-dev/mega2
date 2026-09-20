@@ -4,10 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     common::errors::MegaError,
-    jupiter::storage::{
-        cl_reviewer_storage::ClReviewerStorage, cl_storage::ClStorage,
-        notification_storage::NotificationStorage,
-    },
+    jupiter::storage::{cl_storage::ClStorage, notification_storage::NotificationStorage},
 };
 
 pub const EVENT_CL_COMMENT_CREATED: &str = "cl.comment.created";
@@ -103,7 +100,6 @@ async fn deliver_event(
 pub async fn on_cl_comment_created(
     notif_stg: &NotificationStorage,
     cl_stg: &ClStorage,
-    reviewer_stg: &ClReviewerStorage,
     actor_username: &str,
     cl_link: &str,
     comment_text: &str,
@@ -120,13 +116,6 @@ pub async fn on_cl_comment_created(
         .await?
         .ok_or_else(|| MegaError::NotFound(format!("CL {cl_link} not found")))?;
     let mut recipients = HashSet::from([cl.username]);
-    recipients.extend(
-        reviewer_stg
-            .list_reviewers(cl_link)
-            .await?
-            .into_iter()
-            .map(|reviewer| reviewer.username),
-    );
     recipients.remove(actor_username);
 
     let excerpt = comment_excerpt(comment_text);
@@ -242,8 +231,7 @@ mod tests {
         apply_migrations(&db, true).await.unwrap();
         let base = BaseStorage::new(Arc::new(db.clone()));
         let notif = NotificationStorage::new(Arc::new(db.clone()));
-        let cl_stg = ClStorage { base: base.clone() };
-        let reviewer_stg = ClReviewerStorage { base };
+        let cl_stg = ClStorage { base };
         let now = chrono::Utc::now().naive_utc();
         mega_cl::ActiveModel {
             id: Set(1),
@@ -265,7 +253,7 @@ mod tests {
         .unwrap();
         notif.upsert_user_settings("alice").await.unwrap();
 
-        on_cl_comment_created(&notif, &cl_stg, &reviewer_stg, "bob", "CL1", "<review>")
+        on_cl_comment_created(&notif, &cl_stg, "bob", "CL1", "<review>")
             .await
             .unwrap();
     }

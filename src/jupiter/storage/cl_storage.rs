@@ -6,16 +6,16 @@ use std::{
 use git_internal::internal::object::commit::Commit;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
-    IntoActiveModel, JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
-    RelationTrait, Set, TransactionTrait,
+    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
+    TransactionTrait,
     prelude::Expr,
     sea_query::{LockType, OnConflict},
 };
 
 use crate::{
     callisto::{
-        check_result, item_assignees, label, mega_cl, mega_cl_commits, mega_commit,
-        mega_conversation, path_check_configs, sea_orm_active_enums::MergeStatusEnum,
+        check_result, mega_cl, mega_cl_commits, mega_commit, mega_conversation, path_check_configs,
+        sea_orm_active_enums::MergeStatusEnum,
     },
     common::errors::MegaError,
     contract::api::common::Pagination,
@@ -23,10 +23,7 @@ use crate::{
         model::common::{ItemDetails, ListParams},
         storage::{
             base_storage::{BaseStorage, StorageConnector},
-            stg_common::{
-                combine_item_list,
-                query_build::{apply_sort, filter_by_assignees, filter_by_labels},
-            },
+            stg_common::{combine_item_list, query_build::apply_sort},
         },
     },
 };
@@ -84,10 +81,6 @@ impl ClStorage {
         params: ListParams,
         page: Pagination,
     ) -> Result<(Vec<ItemDetails>, u64), MegaError> {
-        let cond = Condition::all();
-        let cond = filter_by_labels(cond, params.labels);
-        let cond = filter_by_assignees(cond, params.assignees);
-
         let status = if params.status == "open" {
             vec![MergeStatusEnum::Open, MergeStatusEnum::Draft]
         } else if params.status == "closed" {
@@ -102,20 +95,10 @@ impl ClStorage {
         };
 
         let base_query = mega_cl::Entity::find()
-            .join(
-                JoinType::LeftJoin,
-                crate::callisto::entity_ext::mega_cl::Relation::ItemLabels.def(),
-            )
-            .join(
-                JoinType::LeftJoin,
-                crate::callisto::entity_ext::mega_cl::Relation::ItemAssignees.def(),
-            )
             .filter(mega_cl::Column::Status.is_in(status))
             .apply_if(params.author, |q, author| {
                 q.filter(mega_cl::Column::Username.eq(author))
-            })
-            .filter(cond)
-            .distinct();
+            });
 
         let mut sort_map = HashMap::new();
         sort_map.insert("created_at", mega_cl::Column::CreatedAt);
@@ -141,24 +124,6 @@ impl ClStorage {
 
         let ids = cl_list.iter().map(|m| m.id).collect::<Vec<_>>();
 
-        let label_query = mega_cl::Entity::find().filter(mega_cl::Column::Id.is_in(ids.clone()));
-        let label_query = apply_sort(
-            label_query,
-            params.sort_by.as_deref(),
-            params.asc,
-            &sort_map,
-        );
-        let labels: Vec<(mega_cl::Model, Vec<label::Model>)> = label_query
-            .find_with_related(label::Entity)
-            .all(self.get_connection())
-            .await?;
-
-        let assignees: Vec<(mega_cl::Model, Vec<item_assignees::Model>)> = mega_cl::Entity::find()
-            .filter(mega_cl::Column::Id.is_in(ids.clone()))
-            .find_with_related(item_assignees::Entity)
-            .all(self.get_connection())
-            .await?;
-
         let conversations: Vec<(mega_cl::Model, Vec<mega_conversation::Model>)> =
             mega_cl::Entity::find()
                 .filter(mega_cl::Column::Id.is_in(ids))
@@ -166,7 +131,7 @@ impl ClStorage {
                 .all(self.get_connection())
                 .await?;
 
-        let res = combine_item_list::<mega_cl::Entity>(labels, assignees, conversations);
+        let res = combine_item_list::<mega_cl::Entity>(cl_list, conversations);
 
         Ok((res, total))
     }
@@ -206,44 +171,6 @@ impl ClStorage {
             .one(txn)
             .await?;
         Ok(model)
-    }
-
-    pub async fn get_cl_labels(
-        &self,
-        link: &str,
-    ) -> Result<Option<(mega_cl::Model, Vec<label::Model>)>, MegaError> {
-        let labels: Vec<(mega_cl::Model, Vec<label::Model>)> = mega_cl::Entity::find()
-            .filter(mega_cl::Column::Link.eq(link))
-            .find_with_related(label::Entity)
-            .all(self.get_connection())
-            .await?;
-        Ok(labels.first().cloned())
-    }
-
-    pub async fn get_cl_assignees(
-        &self,
-        link: &str,
-    ) -> Result<Option<(mega_cl::Model, Vec<item_assignees::Model>)>, MegaError> {
-        let assignees: Vec<(mega_cl::Model, Vec<item_assignees::Model>)> = mega_cl::Entity::find()
-            .filter(mega_cl::Column::Link.eq(link))
-            .find_with_related(item_assignees::Entity)
-            .all(self.get_connection())
-            .await?;
-        Ok(assignees.first().cloned())
-    }
-
-    pub async fn is_assignee(&self, link: &str, username: &str) -> Result<(), MegaError> {
-        let assignee = mega_cl::Entity::find()
-            .filter(mega_cl::Column::Link.eq(link))
-            .find_with_related(item_assignees::Entity)
-            .filter(item_assignees::Column::AssignneeId.eq(username))
-            .all(self.get_connection())
-            .await?;
-        if assignee.is_empty() {
-            return Err(MegaError::Other("Not an assignee".to_string()));
-        }
-
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

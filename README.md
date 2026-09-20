@@ -47,7 +47,7 @@ The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) s
 ### Notifications and config
 
 - Webhook notifications only.
-- First-class config module: `config init` / `validate` / secret, Profile, SecretRef, controlled hot reload. Default file `config/config.toml`, overridable with `--config` or `MEGA_CONFIG`.
+- First-class config module: `config init` / `validate` / secret, Profile, SecretRef, controlled hot reload. Default file `config/config.toml`, overridable with `--config` or `MEGA_CONFIG`. GitHub outbound sync schema: [`docs/refactoring/github-sync.md`](docs/refactoring/github-sync.md).
 
 ## Quick start with Compose
 

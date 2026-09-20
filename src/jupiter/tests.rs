@@ -20,8 +20,7 @@ use crate::{
         migration::apply_migrations,
         service::{
             agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
-            buck_service::BuckService, cl_service::CLService, cla_service::ClaService,
-            code_review_service::CodeReviewService, git_service::GitService,
+            buck_service::BuckService, cl_service::CLService, git_service::GitService,
             import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
             oci_service::OciService, push_queue_service::PushQueueService,
             webhook_service::WebhookService,
@@ -32,11 +31,7 @@ use crate::{
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
-            cl_reviewer_storage::ClReviewerStorage,
             cl_storage::ClStorage,
-            cla_storage::ClaStorage,
-            code_review_comment_storage::CodeReviewCommentStorage,
-            code_review_thread_storage::CodeReviewThreadStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
             git_db_storage::GitDbStorage,
@@ -49,7 +44,6 @@ use crate::{
             object_storage::mock_object_storage,
             oci_db_storage::OciDbStorage,
             push_queue_storage::PushQueueStorage,
-            reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
             webhook_storage::WebhookStorage,
@@ -189,7 +183,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         git_db_storage: GitDbStorage { base: base.clone() },
         gpg_storage: GpgStorage { base: base.clone() },
         lfs_db_storage: LfsDbStorage { base: base.clone() },
-        cla_storage: ClaStorage { base: base.clone() },
         user_storage: UserStorage { base: base.clone() },
         group_storage: GroupStorage { base: base.clone() },
         cl_storage: ClStorage { base: base.clone() },
@@ -197,15 +190,11 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         vault_storage: VaultStorage { base: base.clone() },
         conversation_storage: ConversationStorage { base: base.clone() },
         commit_binding_storage: CommitBindingStorage { base: base.clone() },
-        reviewer_storage: ClReviewerStorage { base: base.clone() },
         push_queue_storage: PushQueueStorage::new(base.clone()),
         buck_storage: BuckStorage { base: base.clone() },
-        code_review_comment_storage: CodeReviewCommentStorage { base: base.clone() },
-        code_review_thread_storage: CodeReviewThreadStorage { base: base.clone() },
         bots_storage: BotsStorage { base: base.clone() },
         webhook_storage: WebhookStorage { base: base.clone() },
         audit_storage: AuditStorage { base: base.clone() },
-        reaction_storage: ReactionStorage { base: base.clone() },
         oci_db_storage: OciDbStorage { base: base.clone() },
     };
 
@@ -215,7 +204,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
 
     Storage {
         app_service: Arc::new(svc),
-        cla_service: ClaService::new(base.clone()),
         cl_service: CLService::mock(),
         push_queue_service: PushQueueService::new(
             base.clone(),
@@ -233,7 +221,6 @@ pub async fn test_storage_with_config(temp_dir: impl AsRef<Path>, config: Config
         lfs_service: LfsService::mock(),
         oci_service: OciService::mock(),
         agent_capture_service: AgentCaptureService::mock(),
-        code_review_service: CodeReviewService::mock(),
         webhook_service,
         storage_event_emitter:
             crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),

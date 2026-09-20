@@ -252,21 +252,6 @@ batch_limit = 100
 [notification]
 # Global notification kill switch.
 enabled = true
-# Optional website-owned product-email client. Leave both values unset to keep
-# the leftover website-mail client unconfigured until RM-WM.
-# Production requires the SecretRef form (set through `config secret set
-# notification/website_mail/bearer`); the literal bearer is IT-only.
-# website_mail_base_url = "https://website.internal"
-# website_mail_bearer_ref = "vault://secret/config/<profile>/notification/website_mail/bearer#value"
-# website_mail_bearer = "it-only-shared-bearer"
-
-# Optional Slack incoming-webhook channel (docs/notification.md phase 3). The
-# Slack webhook URL embeds a secret token in its path, so it is supplied as a
-# vault SecretRef (the URL is the credential) and resolved only after vault is
-# ready. Set the secret with: config secret set notification/slack/webhook_url
-# [notification.slack]
-# enabled = true
-# webhook_url_ref = "vault://secret/config/<profile>/notification/slack/webhook_url#value"
 
 # Optional generic outbound webhook channel (docs/notification.md phase 3). The
 # URL is operator-trusted (non-secret); an optional bearer token is a SecretRef
@@ -357,4 +342,21 @@ enforcement = "off"
 # include_unscoped_lfs = false
 # agent_tenants = []
 # agent_repo_paths = []
+
+# GitHub outbound sync (plan-20260916). Default disabled. ssh_key_ref is a
+# string only; do not put a private key in this file.
+# [github_sync]
+# enabled = false
+# ssh_host = "github.com"
+# ssh_user = "git"
+# ssh_host_key = "ssh-ed25519 AAAAEXAMPLE"
+# ssh_key_ref = "vault://secret/config/<profile>/github_sync/ssh_key#value"
+# advertise_timeout_seconds = 30
+# send_timeout_seconds = 300
+# report_timeout_seconds = 60
+# exit_timeout_seconds = 15
+# [[github_sync.bindings]]
+# id = "core"
+# path = "/project/core"
+# remote = "example/core"
 

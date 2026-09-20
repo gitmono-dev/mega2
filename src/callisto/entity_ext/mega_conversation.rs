@@ -9,7 +9,6 @@ use crate::callisto::{
 #[derive(Copy, Clone, Debug, EnumIter)]
 pub enum Relation {
     MegaMr,
-    Reactions,
 }
 
 impl RelationTrait for Relation {
@@ -19,7 +18,6 @@ impl RelationTrait for Relation {
                 .from(Column::Link)
                 .to(crate::callisto::mega_cl::Column::Link)
                 .into(),
-            Self::Reactions => Entity::has_many(crate::reactions::Entity).into(),
         }
     }
 }
@@ -27,15 +25,6 @@ impl RelationTrait for Relation {
 impl Related<crate::callisto::mega_cl::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::MegaMr.def()
-    }
-}
-
-impl Related<crate::reactions::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Reactions.def()
-    }
-    fn via() -> Option<RelationDef> {
-        None
     }
 }
 

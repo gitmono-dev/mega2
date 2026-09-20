@@ -47,7 +47,7 @@ mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，推�
 ### 通知与配置
 
 - 仅支持 Webhook 通知。
-- 一级配置模块：`config init` / `validate` / secret、Profile、SecretRef、受控热加载。默认文件 `config/config.toml`，可用 `--config` 或 `MEGA_CONFIG` 覆盖。
+- 一级配置模块：`config init` / `validate` / secret、Profile、SecretRef、受控热加载。默认文件 `config/config.toml`，可用 `--config` 或 `MEGA_CONFIG` 覆盖。GitHub 单向同步配置见 [`docs/refactoring/github-sync.md`](docs/refactoring/github-sync.md)。
 
 ## 用 Compose 快速启动
 

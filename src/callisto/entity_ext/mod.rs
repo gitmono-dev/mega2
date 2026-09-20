@@ -4,17 +4,9 @@ pub mod bots;
 pub mod buck_session;
 pub mod buck_session_file;
 pub mod check_result;
-pub mod item_assignees;
-pub mod item_labels;
-pub mod label;
 pub mod mega_cl;
-pub mod mega_code_review_anchor;
-pub mod mega_code_review_comment;
-pub mod mega_code_review_position;
-pub mod mega_code_review_thread;
 pub mod mega_conversation;
 pub mod mega_refs;
-pub mod reactions;
 
 use idgenerator::IdInstance;
 use rand::RngExt;

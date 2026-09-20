@@ -5,11 +5,7 @@ pub mod base_storage;
 pub mod blob_path_index;
 pub mod bots_storage;
 pub mod buck_storage;
-pub mod cl_reviewer_storage;
 pub mod cl_storage;
-pub mod cla_storage;
-pub mod code_review_comment_storage;
-pub mod code_review_thread_storage;
 pub mod commit_binding_storage;
 pub mod conversation_storage;
 pub mod git_db_storage;
@@ -23,7 +19,6 @@ pub mod notification_storage;
 pub mod object_storage;
 pub mod oci_db_storage;
 pub mod push_queue_storage;
-pub mod reaction_storage;
 pub mod stg_common;
 pub mod user_storage;
 pub mod vault_storage;
@@ -41,8 +36,7 @@ use crate::{
     jupiter::{
         service::{
             agent_capture_service::AgentCaptureService, artifact_service::ArtifactService,
-            buck_service::BuckService, cl_service::CLService, cla_service::ClaService,
-            code_review_service::CodeReviewService, git_service::GitService,
+            buck_service::BuckService, cl_service::CLService, git_service::GitService,
             import_service::ImportService, lfs_service::LfsService, mono_service::MonoService,
             oci_service::OciService, push_queue_service::PushQueueService,
             webhook_service::WebhookService,
@@ -53,11 +47,7 @@ use crate::{
             base_storage::{BaseStorage, StorageConnector},
             bots_storage::BotsStorage,
             buck_storage::BuckStorage,
-            cl_reviewer_storage::ClReviewerStorage,
             cl_storage::ClStorage,
-            cla_storage::ClaStorage,
-            code_review_comment_storage::CodeReviewCommentStorage,
-            code_review_thread_storage::CodeReviewThreadStorage,
             commit_binding_storage::CommitBindingStorage,
             conversation_storage::ConversationStorage,
             git_db_storage::GitDbStorage,
@@ -71,7 +61,6 @@ use crate::{
             object_storage::MegaObjectStorageWrapper,
             oci_db_storage::OciDbStorage,
             push_queue_storage::PushQueueStorage,
-            reaction_storage::ReactionStorage,
             user_storage::UserStorage,
             vault_storage::VaultStorage,
             webhook_storage::WebhookStorage,
@@ -85,7 +74,6 @@ pub struct AppService {
     pub git_db_storage: GitDbStorage,
     pub gpg_storage: GpgStorage,
     pub lfs_db_storage: LfsDbStorage,
-    pub cla_storage: ClaStorage,
     pub user_storage: UserStorage,
     pub group_storage: GroupStorage,
     pub vault_storage: VaultStorage,
@@ -93,15 +81,11 @@ pub struct AppService {
     pub issue_storage: IssueStorage,
     pub conversation_storage: ConversationStorage,
     pub commit_binding_storage: CommitBindingStorage,
-    pub reviewer_storage: ClReviewerStorage,
     pub push_queue_storage: PushQueueStorage,
     pub buck_storage: BuckStorage,
-    pub code_review_comment_storage: CodeReviewCommentStorage,
-    pub code_review_thread_storage: CodeReviewThreadStorage,
     pub bots_storage: BotsStorage,
     pub webhook_storage: WebhookStorage,
     pub audit_storage: AuditStorage,
-    pub reaction_storage: ReactionStorage,
     pub oci_db_storage: OciDbStorage,
 }
 
@@ -116,7 +100,6 @@ impl AppService {
             git_db_storage: GitDbStorage { base: mock.clone() },
             gpg_storage: GpgStorage { base: mock.clone() },
             lfs_db_storage: LfsDbStorage { base: mock.clone() },
-            cla_storage: ClaStorage { base: mock.clone() },
             user_storage: UserStorage { base: mock.clone() },
             group_storage: GroupStorage { base: mock.clone() },
             vault_storage: VaultStorage { base: mock.clone() },
@@ -124,15 +107,11 @@ impl AppService {
             issue_storage: IssueStorage { base: mock.clone() },
             conversation_storage: ConversationStorage { base: mock.clone() },
             commit_binding_storage: CommitBindingStorage { base: mock.clone() },
-            reviewer_storage: ClReviewerStorage { base: mock.clone() },
             push_queue_storage: PushQueueStorage::new(mock.clone()),
             buck_storage: BuckStorage { base: mock.clone() },
-            code_review_comment_storage: CodeReviewCommentStorage { base: mock.clone() },
-            code_review_thread_storage: CodeReviewThreadStorage { base: mock.clone() },
             bots_storage: BotsStorage { base: mock.clone() },
             webhook_storage: WebhookStorage { base: mock.clone() },
             audit_storage: AuditStorage { base: mock.clone() },
-            reaction_storage: ReactionStorage { base: mock.clone() },
             oci_db_storage: OciDbStorage { base: mock.clone() },
         })
     }
@@ -141,7 +120,6 @@ impl AppService {
 #[derive(Clone)]
 pub struct Storage {
     pub(crate) app_service: Arc<AppService>,
-    pub cla_service: ClaService,
     pub cl_service: CLService,
     pub push_queue_service: PushQueueService,
     pub artifact_service: ArtifactService,
@@ -154,7 +132,6 @@ pub struct Storage {
     pub agent_capture_service: AgentCaptureService,
     pub config_handle: ConfigHandle,
     pub config: Arc<Config>,
-    pub code_review_service: CodeReviewService,
     pub webhook_service: WebhookService,
     pub storage_event_emitter: crate::jupiter::service::storage_event_emitter::StorageEventEmitter,
     pub notification_storage: notification_storage::NotificationStorage,
@@ -196,7 +173,6 @@ impl Storage {
         let git_db_storage = GitDbStorage { base: base.clone() };
         let gpg_storage = GpgStorage { base: base.clone() };
         let lfs_db_storage = LfsDbStorage { base: base.clone() };
-        let cla_storage = ClaStorage { base: base.clone() };
         let user_storage = UserStorage { base: base.clone() };
         let group_storage = GroupStorage { base: base.clone() };
         let cl_storage = ClStorage { base: base.clone() };
@@ -215,16 +191,12 @@ impl Storage {
         };
 
         let commit_binding_storage = CommitBindingStorage { base: base.clone() };
-        let reviewer_storage = ClReviewerStorage { base: base.clone() };
         let push_queue_storage = PushQueueStorage::new(base.clone());
         let buck_storage = BuckStorage { base: base.clone() };
 
-        let code_review_comment_storage = CodeReviewCommentStorage { base: base.clone() };
-        let code_review_thread_storage = CodeReviewThreadStorage { base: base.clone() };
         let bots_storage = BotsStorage { base: base.clone() };
         let webhook_storage = WebhookStorage { base: base.clone() };
         let audit_storage = AuditStorage { base: base.clone() };
-        let reaction_storage = ReactionStorage { base: base.clone() };
         let oci_db_storage = OciDbStorage { base: base.clone() };
         let oci_service = OciService {
             oci_storage: oci_db_storage.clone(),
@@ -266,7 +238,6 @@ impl Storage {
             git_db_storage,
             gpg_storage,
             lfs_db_storage,
-            cla_storage,
             user_storage,
             group_storage,
             vault_storage,
@@ -274,15 +245,11 @@ impl Storage {
             issue_storage,
             conversation_storage,
             commit_binding_storage,
-            reviewer_storage,
             push_queue_storage: push_queue_storage.clone(),
             buck_storage,
-            code_review_comment_storage,
-            code_review_thread_storage,
             bots_storage,
             webhook_storage: webhook_storage.clone(),
             audit_storage,
-            reaction_storage,
             oci_db_storage,
         };
         let push_queue_service =
@@ -306,7 +273,6 @@ impl Storage {
 
         Ok(Storage {
             app_service: app_service.into(),
-            cla_service: ClaService::new(base.clone()),
             config_handle,
             config,
             cl_service: CLService::new(base.clone()),
@@ -319,7 +285,6 @@ impl Storage {
             lfs_service,
             oci_service,
             agent_capture_service,
-            code_review_service: CodeReviewService::new(base.clone()),
             webhook_service,
             storage_event_emitter,
             notification_storage,
@@ -520,10 +485,6 @@ impl Storage {
         self.app_service.user_storage.clone()
     }
 
-    pub fn cla_storage(&self) -> ClaStorage {
-        self.app_service.cla_storage.clone()
-    }
-
     pub fn group_storage(&self) -> GroupStorage {
         self.app_service.group_storage.clone()
     }
@@ -548,24 +509,12 @@ impl Storage {
         self.app_service.commit_binding_storage.clone()
     }
 
-    pub fn reviewer_storage(&self) -> ClReviewerStorage {
-        self.app_service.reviewer_storage.clone()
-    }
-
     pub fn push_queue_storage(&self) -> PushQueueStorage {
         self.app_service.push_queue_storage.clone()
     }
 
     pub fn buck_storage(&self) -> BuckStorage {
         self.app_service.buck_storage.clone()
-    }
-
-    pub fn code_review_thread_storage(&self) -> CodeReviewThreadStorage {
-        self.app_service.code_review_thread_storage.clone()
-    }
-
-    pub fn code_review_comment_storage(&self) -> CodeReviewCommentStorage {
-        self.app_service.code_review_comment_storage.clone()
     }
 
     pub fn webhook_storage(&self) -> WebhookStorage {
@@ -578,10 +527,6 @@ impl Storage {
 
     pub fn audit_storage(&self) -> AuditStorage {
         self.app_service.audit_storage.clone()
-    }
-
-    pub fn reaction_storage(&self) -> ReactionStorage {
-        self.app_service.reaction_storage.clone()
     }
 
     pub fn bots_storage(&self) -> BotsStorage {
@@ -607,7 +552,6 @@ impl Storage {
         Storage {
             app_service,
             // app_service: AppService::mock(),
-            cla_service: ClaService::mock(),
             cl_service: CLService::mock(),
             push_queue_service: PushQueueService::new(
                 BaseStorage::mock(),
@@ -623,7 +567,6 @@ impl Storage {
             lfs_service: LfsService::mock(),
             oci_service: OciService::mock(),
             agent_capture_service: AgentCaptureService::mock(),
-            code_review_service: CodeReviewService::mock(),
             webhook_service,
             storage_event_emitter:
                 crate::jupiter::service::storage_event_emitter::StorageEventEmitter::disabled(),

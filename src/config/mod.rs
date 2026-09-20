@@ -144,6 +144,7 @@ impl Config {
             oci: OciConfig::default(),
             agent_capture: AgentCaptureConfig::default(),
             storage_events: StorageEventsConfig::default(),
+            github_sync: GithubSyncConfig::default(),
             cedar: CedarConfig::default(),
         }
     }

@@ -12,7 +12,6 @@ pub mod guard;
 pub mod notify;
 mod objects;
 pub mod resource;
-pub mod reviewer_parser;
 pub mod secure_admission;
 pub mod secure_artifact;
 pub mod secure_capacity;

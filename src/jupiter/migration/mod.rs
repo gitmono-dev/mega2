@@ -85,7 +85,7 @@ mod m20260216_013852_create_group_permission_tables;
 mod m20260224_142019_create_target_build_status;
 mod m20260224_230000_create_notification_center;
 mod m20260228_100254_change_build_target_and_add_index_for_build_event_start_at;
-mod m20260302_082846_add_cla_sign_status;
+include!("m20260302_082846_register.rs");
 mod m20260304_013434_seed_cla_sign_check_config;
 mod m20260306_121829_create_bots_related_table;
 mod m20260308_191753_create_webhook;
@@ -127,6 +127,14 @@ mod m20260918_000100_fix_mst2_publication_unique;
 mod m20260918_000100_mega_tag_path;
 mod m20260918_000200_drop_notification_settings_delivery_columns;
 pub(crate) mod m20260919_000100_drop_user_inbox_notifications;
+mod m20260919_000200_drop_dynamic_sidebar;
+pub(crate) mod m20260919_000300_drop_reactions;
+pub(crate) mod m20260919_000400_drop_mega_cl_reviewer;
+pub(crate) mod m20260919_000500_delete_code_review_check_rows;
+pub(crate) mod m20260919_000600_drop_mega_code_review;
+pub(crate) mod m20260919_000700_drop_label_tables;
+pub(crate) mod m20260919_000800_delete_cla_sign_check_rows;
+pub(crate) mod m20260919_000900_drop_cla_status;
 mod runner;
 pub use m20260905_000100_add_push_queue::ensure_queue_control_seed;
 pub use runner::apply_migrations;
@@ -200,7 +208,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260224_142019_create_target_build_status::Migration),
             Box::new(m20260224_230000_create_notification_center::Migration),
             Box::new(m20260228_100254_change_build_target_and_add_index_for_build_event_start_at::Migration),
-            Box::new(m20260302_082846_add_cla_sign_status::Migration),
+            cla_status_create_migration(),
             Box::new(m20260304_013434_seed_cla_sign_check_config::Migration),
             Box::new(m20260306_121829_create_bots_related_table::Migration),
             Box::new(m20260308_191753_create_webhook::Migration),
@@ -242,6 +250,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20260918_000100_fix_mst2_publication_unique::Migration),
             Box::new(m20260918_000200_drop_notification_settings_delivery_columns::Migration),
             Box::new(m20260919_000100_drop_user_inbox_notifications::Migration),
+            Box::new(m20260919_000200_drop_dynamic_sidebar::Migration),
+            Box::new(m20260919_000300_drop_reactions::Migration),
+            Box::new(m20260919_000400_drop_mega_cl_reviewer::Migration),
+            Box::new(m20260919_000500_delete_code_review_check_rows::Migration),
+            Box::new(m20260919_000600_drop_mega_code_review::Migration),
+            Box::new(m20260919_000700_drop_label_tables::Migration),
+            Box::new(m20260919_000800_delete_cla_sign_check_rows::Migration),
+            Box::new(m20260919_000900_drop_cla_status::Migration),
         ]
     }
 }

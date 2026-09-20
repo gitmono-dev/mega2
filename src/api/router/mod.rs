@@ -4,12 +4,9 @@ pub mod artifacts_router;
 pub mod bot_router;
 pub mod buck_router;
 pub mod cl_router;
-pub mod code_review_router;
 pub mod commit_router;
-pub mod conv_router;
 pub mod gpg_router;
 pub mod group_router;
-pub mod label_router;
 #[cfg(feature = "fastcdc")]
 pub mod lfs_media;
 pub mod lfs_router;
@@ -18,7 +15,6 @@ pub mod oci_router;
 pub mod preview_router;
 pub mod push_queue_router;
 pub mod repo_router;
-pub mod reviewer_router;
 pub mod snapshot_router;
 pub mod tag_router;
 pub mod user_router;
@@ -79,8 +75,20 @@ mod tests {
             "review OpenAPI must include /cl: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p.contains("reviewer")),
-            "review OpenAPI must include reviewer: {paths:?}"
+            paths
+                .iter()
+                .all(|p| !p.contains("/reviewers") && !p.contains("/reviewer/")),
+            "review OpenAPI must not include reviewer HTTP: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains("/code_review")),
+            "review OpenAPI must not include /code_review: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains("/label")
+                && !p.contains("/labels")
+                && !p.contains("/assignees")),
+            "review OpenAPI must not include label HTTP: {paths:?}"
         );
         assert!(
             paths.iter().any(|p| p.contains("create-entry")),

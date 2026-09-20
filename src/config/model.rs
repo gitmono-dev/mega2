@@ -61,10 +61,88 @@ pub struct Config {
     /// surface only — no delivery until later WH cards bind a runtime.
     #[serde(default)]
     pub storage_events: StorageEventsConfig,
+    /// GitHub outbound sync schema (plan-20260916 GS-03). Default disabled;
+    /// this card is structure only — no semantic checks and no runtime.
+    #[serde(default)]
+    pub github_sync: GithubSyncConfig,
     /// Authorization enforcement switch (`[cedar]`), ADR-UN-01. Default `off`
     /// (no build, no consume of authorization data).
     #[serde(default)]
     pub cedar: CedarConfig,
+}
+
+/// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GithubSyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_user: String,
+    #[serde(default)]
+    pub ssh_host_key: String,
+    #[serde(default)]
+    pub ssh_key_ref: String,
+    #[serde(default)]
+    pub bindings: Vec<GithubSyncBinding>,
+    #[serde(default = "default_github_sync_advertise_timeout_seconds")]
+    pub advertise_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_send_timeout_seconds")]
+    pub send_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_report_timeout_seconds")]
+    pub report_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_exit_timeout_seconds")]
+    pub exit_timeout_seconds: u64,
+}
+
+pub const DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS: u64 = 15;
+
+fn default_github_sync_advertise_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS
+}
+
+fn default_github_sync_send_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS
+}
+
+fn default_github_sync_report_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS
+}
+
+fn default_github_sync_exit_timeout_seconds() -> u64 {
+    DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS
+}
+
+impl Default for GithubSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_host: String::new(),
+            ssh_user: String::new(),
+            ssh_host_key: String::new(),
+            ssh_key_ref: String::new(),
+            bindings: Vec::new(),
+            advertise_timeout_seconds: DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS,
+            send_timeout_seconds: DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS,
+            report_timeout_seconds: DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS,
+            exit_timeout_seconds: DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS,
+        }
+    }
+}
+
+/// One monorepo-path → GitHub remote binding (plan-20260916 GS-03).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct GithubSyncBinding {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub remote: String,
 }
 
 /// OCI Distribution (container registry) settings (ADR-DR-01).
@@ -446,40 +524,9 @@ pub struct NotificationConfig {
     /// snapshot by the active notification service).
     #[serde(default = "default_notification_enabled")]
     pub enabled: bool,
-    /// Base URL for the website internal product-email API. Empty disables the
-    /// optional client; when set, exactly one bearer source is required.
-    #[serde(default)]
-    pub website_mail_base_url: String,
-    /// IT-only literal bearer for the website internal email API. Production
-    /// deployments must use `website_mail_bearer_ref`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub website_mail_bearer: Option<secret::SecretString>,
-    /// Production bearer source for the website internal email API. Namespace:
-    /// `vault://secret/config/<profile>/notification/website_mail/bearer#<field>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub website_mail_bearer_ref: Option<secret::SecretRef>,
-    /// Optional Slack incoming-webhook channel (docs/notification.md phase 3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slack: Option<SlackConfig>,
     /// Optional generic outbound webhook channel (docs/notification.md phase 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<WebhookConfig>,
-}
-
-/// Slack incoming-webhook delivery channel (docs/notification.md phase 3).
-///
-/// A Slack incoming-webhook URL embeds a secret token in its path, so the URL
-/// itself is the credential and is supplied as a [`secret::SecretRef`] resolved
-/// from vault after startup — never stored in plaintext config.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-pub struct SlackConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// SecretRef to the Slack incoming-webhook URL (the URL is the credential).
-    /// Required when `enabled` is true; namespace
-    /// `vault://secret/config/<profile>/notification/slack/webhook_url#<field>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub webhook_url_ref: Option<secret::SecretRef>,
 }
 
 /// Generic outbound webhook delivery channel (docs/notification.md phase 3).
@@ -505,10 +552,6 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: default_notification_enabled(),
-            website_mail_base_url: String::new(),
-            website_mail_bearer: None,
-            website_mail_bearer_ref: None,
-            slack: None,
             webhook: None,
         }
     }
