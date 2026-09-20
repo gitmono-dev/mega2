@@ -299,3 +299,197 @@ boundary (no illegal fragment) and appends the `truncated` marker
 (计划 AC-5「已截断」). Non-UTF-8 remote bytes are shown with U+FFFD
 so ASCII around them survives (GS-15 / GS-25). Rendered diagnostic
 bytes stay within the configured cap.
+
+## 同步语义冻结（Q1–Q5）
+
+Spike GS-09. Freezes outbound **sync semantics** only. No production
+code in this card. Pack error channels (Q6a), pack budget / `have`
+hardening (Q6b), operator authorization (Q7), and atomic storage
+primitives (Q8) stay on later spikes. `DEP-03` (full outbound draft)
+was not found as a file in this tree; the schemes below are derived
+from the plan-20260916 fact baseline and the cited code.
+
+### Q1 — outbox trigger granularity
+
+A trunk B3 push is one transaction that already mutates more than the
+pushed path:
+
+| Kind | What B3 writes | Evidence |
+|---|---|---|
+| Path upsert | `main@P` → `landed_at_p` | `apply_push_in_txn` (`mono_api_service.rs:3741`–`:3750`) |
+| Ancestor roll-up | each ancestor whose tree hash **changed** gets a new synthesized commit; unchanged ancestors are skipped | `:3756`–`:3788` |
+| Root CAS | `/` advances or does a net-zero same-value write | `:3791`–`:3836` |
+| Descendant continuation | already-materialized descendant `main` refs | `push_queue_service.rs:2115`–`:2126`; `advance_descendant_refs` (`mono_storage.rs:631`) |
+| Descendant delete | a descendant `main` ref is tombstoned and removed when its relative path is gone from the new tree | `DescendantResolve::Delete` → `tombstone_and_delete_main_ref_in_txn` (`mono_storage.rs:735`–`:737`, `:763`–`:769`; called from `push_queue_service.rs:2115`–`:2126`) |
+| Failure / bypass | apply is rolled back; `BypassDetected` commits the Failed queue row and `notify_mono_write_queue`, not the apply | `push_queue_service.rs:2087`–`:2102`; authz precedent `notify.rs:164`–`:174` |
+
+**Scheme.** After those writes, still inside the same B3 transaction
+and only if the apply succeeded, enumerate a **change set** of
+`(path, old_oid, new_oid, kind)`:
+
+- `upsert` — `P` and every ancestor that received a new commit.
+- `advance` — every descendant whose `main` ref moved.
+- `delete` — every descendant that B3 resolved as
+  `DescendantResolve::Delete` (the path `main` ref was
+  tombstoned and removed in this transaction). The pushed path `P`
+  itself is not deleted by B3 apply; a client receive-pack delete of
+  `refs/heads/main` is refused (`monorepo.rs:913`–`:925`,
+  `MEGA_BRANCH_NAME`). Tombstone repair / reaper deletes **outside**
+  a successful B3 apply are not sync-outbox events (Q1 only fires
+  after a successful apply in that same transaction).
+- Skip net-zero rows (ancestor tree hash unchanged; root CAS
+  same-value write).
+
+Intersect the change set with `[github_sync].bindings` by **exact
+`binding.path`** (ADR-GS-01: one path ↔ one `remote`; no implicit
+prefix fan-out). Each hit inserts one sync-outbox row
+`(binding_id, remote, kind, local_oid, queue_id)` in that same
+transaction — the same shape as `insert_authz_outbox`
+(`push_queue_storage.rs:1278`–`:1286`). `BypassDetected` and apply
+failure must not insert sync rows. Root `/` is not a binding path.
+
+`local_oid` is always the **new ref commit at that binding's exact
+path**, not a single queue-wide id:
+
+- `upsert` / `advance`: the new `main` commit written for that path.
+  When the binding path is the pushed path `P` and `N=1`, that equals
+  the client `new_id` (`docs/refactoring/trunk-push.md:429`;
+  `api_tip_lander.rs:119`–`:120`). When `N>1` on `P`, it is `P`'s
+  squash / synthesized commit (`push_queue.landed_commit_id` names
+  **only** `P`). Ancestor and descendant rows use their own
+  synthesized commits from `other_updates` /
+  `advance_descendant_refs`.
+- `delete`: there is no landed commit. `local_oid` is the all-zero
+  object id of the repository hash kind (40 hex zeros for sha1; 64
+  for sha256/blake3). `old_oid` on the change-set row is the path
+  `main` commit that was just removed. Outbound receive-pack is
+  `old=last_pushed` (must equal advertise), `new=zeros`,
+  `refs/heads/main` — a Git delete of `main`. If GitHub `ng`s
+  deleting the default branch, the binding parks with that reason
+  (GS-15); an empty-tree replacement is a GS-10 alternative, not
+  this freeze. First-create in Q5 is the inverse (`old=zeros`,
+  `new=local_oid`).
+
+### Q2 — pack closure and `have=[last_pushed]`
+
+`incremental_pack` stops walking parents once a parent id is in
+`have`, then excludes every object reachable from those `have`
+commits' trees (`monorepo.rs:521`–`:566`). That is only a correct
+thin pack if the GitHub repo still holds that closure.
+
+**Scheme.** `have=[last_pushed]` is legal for a binding if and only if
+all of:
+
+1. `last_pushed` is either the `new` oid of the last receive-pack
+   this binding recorded as success (GS-15/GS-25/GS-20/GS-26:
+   `unpack ok` + `ok refs/heads/main` + `exit-status=0`) **or** an
+   operator cursor-reset that Q3 already required to equal the
+   current advertisement (so it is a proven remote tip, just not
+   one this process created).
+2. The current advertisement tip for `refs/heads/main` equals
+   `last_pushed`.
+3. `last_pushed` still exists in local object storage.
+4. `binding.remote` has not changed since that success.
+
+Advertisement tip equality is the only SSH-visible proof that GitHub
+still has the object (ADR-GS-03: no REST; `DEFER-GS-02`: no fetch).
+Any of: tip ≠ `last_pushed`, missing local object, empty repo (40
+zero hex), or a `remote` string change **invalidates** the cursor.
+Invalid → `have=[]` (full pack) and do not reuse the old cursor after
+success until a new tip is recorded. Pack error-channel and byte
+budget remain GS-18 / GS-27.
+
+### Q3 — resume and expected tips
+
+**Expected local tip** = the binding path's current `main` commit
+(`local_oid` from Q1). **Expected remote tip** for a push attempt =
+`last_pushed`, which must equal the advertisement.
+
+**Divergence** = advertised `refs/heads/main` ≠ `last_pushed`.
+
+mega2 cannot prove that a GitHub-side merge (human or AI) contains our
+content: there is no merge-base, no 2-parent commit, and no inbound
+fetch (ADR-GS-04; `push_chain.rs` rejects merge commits;
+`DEFER-GS-02`). A third oid on GitHub is therefore **not** a resume
+signal.
+
+**Scheme.**
+
+- Divergence **parks** the binding: no receive-pack.
+- Divergence **clears** only when the advertisement equals
+  `last_pushed` again (they reset to our last success) or an operator
+  cursor-reset is applied **only after** the advertisement already
+  equals `local_oid` (they made GitHub match us out of band).
+  Who may invoke that reset is GS-21 Q7; this card only freezes the
+  cursor predicate.
+- Both sides' expected tips are the two oids above; validation is
+  advertise == `last_pushed` immediately before send (Q4).
+- GitHub-side merge that produces a new tip stays parked. Force-replace
+  / inbound merge are not this card; they are a GS-10 alternative if a
+  later plan accepts the history rewrite.
+
+### Q4 — poll vs push race
+
+A successful receive-pack updates GitHub **before** the local cursor
+row. A poller that only compares advertise ≠ `last_pushed` would
+treat our own in-flight tip as a remote edit.
+
+**Scheme.** Persist an **intent** row before sending:
+
+- `last_pushed` — last proven success (immutable on the success path
+  until CAS).
+- `in_flight` — `(new_oid, remote_old)` written **before** the
+  command/pack; cleared only after the cursor CAS.
+
+Poller classification:
+
+| Advertised tip | Meaning |
+|---|---|
+| `last_pushed` | idle, not modified |
+| `in_flight.new_oid` | self; complete the cursor CAS (crash after GitHub accept) |
+| anything else | remote modified → Q3 park |
+
+Order: write `in_flight` → advertise must still equal `remote_old`
+(= `last_pushed`) → receive-pack → CAS `last_pushed := new`, clear
+`in_flight`. A crash before GitHub accept leaves `in_flight` set and
+advertise still `last_pushed`; retry is the same idempotent command
+(Q5). A crash after accept leaves advertise == `in_flight.new_oid`;
+the next worker finishes the CAS and does not park.
+
+### Q5 — compensation identity and first create
+
+**Scheme.** The idempotency key is
+`(binding_id, remote, local_oid, remote_old)`. `remote_old` is the
+advertised tip captured into `in_flight` **before** send and is
+**not** overwritten by the success path (keep it on the completed
+outbox / intent row). Retries with the same key replay the same
+receive-pack command (`old`/`new`/`refs/heads/main`).
+
+Compensation uses that stored `remote_old`, never the post-success
+`last_pushed`:
+
+- Failed **before** accept: retry the same key; do not invent a new
+  `old`.
+- Success then crash: Q4 self-complete; no compensate.
+- First create: advertisement tip is 40 zero hex; `remote_old` is
+  zeros; the command is a create. Compensation is **not** a remote
+  delete (we do not delete GitHub `main`). If advertise later shows
+  `local_oid`, treat as first-push success and CAS the cursor. If
+  advertise is still zeros, retry the create. If advertise is some
+  other oid, park (Q3).
+
+### 三分支判定
+
+| Field | Value |
+|---|---|
+| Branch | **go** |
+| Timebox | 2026-09-20, single session after GS-26 `v0.38.18` (`9514a49`) |
+| Basis | Q1–Q5 each have a scheme above, consistent with ADR-GS-01…04, the B3 change-set, and the receive-pack success contract |
+| Not claimed | Automatic resume across a GitHub-side merge; inbound fetch; REST; any `src/` change |
+
+### no-go 替代方向
+
+N/A — this card is `go`. If a later review rejects Q3's park-only
+resume, the alternative already named for GS-10 is an explicit
+force-replace (or inbound merge) plan; do not silently treat a third
+GitHub oid as fast-forward.
