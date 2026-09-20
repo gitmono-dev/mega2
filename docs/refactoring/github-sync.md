@@ -643,3 +643,150 @@ item is the only diagnostic; later items are not produced.
 N/A — this card is `go`. The rejected alternative is changing
 `incremental_pack`'s return type in place (would force smart.rs /
 v2.rs to handle `Result` items and is a live-protocol rewrite).
+
+## pack 资源预算与 have 语义冻结（Q6b）
+
+Spike GS-27. Freezes **four byte budgets** on the reported pack
+path (GS-18) and the **`have` distinction** that must not change
+upload-pack. Live `incremental_pack` / clone / fetch stay as they
+are. No production code in this card. Numbers below are DEP-01
+defaults, not new `[github_sync]` keys in this plan.
+
+Today the real allocation is the shared walker: each blob is
+`try_fold`ed into one `Vec` at concurrency 16 (`pack/mod.rs:464`–
+`:470`). The `mpsc` capacity is `pack.channel_message_size` slots
+(default **1_000_000**, `src/config/model.rs:711`), not bytes.
+Parent walk stops when a parent id is in `have`
+(`monorepo.rs:521`–`:538`). Upload-pack ACKs only commits it
+already has (`smart.rs:275`–`:276`).
+
+### AC-1 — graph enumeration budget
+
+**Scheme.** Bound the in-memory graph before any blob fold. Caps
+depend on whether `have` is a proven tip or empty (GS-09 Q2):
+
+| Set | What it holds | Incremental `have=[last_pushed]` | Full `have=[]` |
+|---|---|---|---|
+| `want_commits` / walk list | commits collected from `want` toward `have` (or to root) | `pack_max_walk_commits` = 4096 | `pack_max_walk_commits_full` = 65536 |
+| `want_trees` | trees for those commits | same 4096 | same 65536 |
+| `exist_objs` / `counted_obj` | hex ids already seen | `pack_max_object_ids` = 1_000_000 | same 1_000_000 |
+
+`have=[]` is the first push and every cursor invalidation (Q2).
+That walk is **full history to root**, not the delta between two
+tips — the 4096 incremental cap must not be applied there, or a
+repo with >4096 commits could never recover. Exceeding the
+applicable cap is `PackStreamError::Encode` on the **reported**
+stream and does not start encode. No silent truncate, no chunked
+push in this plan: a binding that overflows the full cap fails
+closed until the receiving plan raises the cap or splits history.
+Derived id-set residency (not a second cap): 1_000_000 × ~64-byte
+hex `String` keys ≈ 64–100 MiB for `exist_objs` / `counted_obj`.
+
+Live `incremental_pack` is not rewritten (same as GS-18).
+
+### AC-2 — concurrent blob accumulation budget
+
+**Scheme.** The live default `traverse` (`pack/mod.rs:436`, fold at
+`:464`) is shared by `incremental_pack`, `full_pack`, and import.
+DEP-01 must **not** patch that default. The reported path gets a
+fork (`traverse_budgeted` or a `BlobBudget` argument used only by
+`incremental_pack_reported`).
+
+On that fork: `try_for_each_concurrent(16, …)` is the **maximum**
+concurrency; DEP-01 may lower it, not raise it. Each fold has a
+**per-blob** cap `pack_max_blob_bytes` = 64 MiB. Crossing the cap
+aborts that fold, cancels the other 15 (GS-18 AC-4), and emits
+`PackStreamError::Encode`.
+
+**Aggregate in-flight blob bytes** (AC-2 + AC-3 share this number):
+`pack_max_inflight_blob_bytes` = `16 * pack_max_blob_bytes` (1 GiB).
+That is the only blob-`Vec` residency allowed across concurrent
+folds **and** the entry channel.
+
+This budget is independent of Git LFS (LFS payloads are not pack
+blobs). A blob that exceeds the per-blob cap is not chunked into
+the pack.
+
+### AC-3 — input / output queue budget
+
+**Scheme.** Do **not** reuse `channel_message_size = 1_000_000` for
+sync. The reported path uses small **slot** channels whose byte
+residency is explicit. Entry slots **equal** fold concurrency so
+the queue cannot hold a second 64-blob pile on top of AC-2:
+
+| Channel | Slots | Payload cap per slot | Byte residency |
+|---|---|---|---|
+| walker → encoder (`entry_tx`) | 16 | one `Entry` ≤ `pack_max_blob_bytes` | counted inside `pack_max_inflight_blob_bytes` (1 GiB), not additive |
+| encoder → worker (`stream_tx`) | 64 | `PACK_WRITE_WINDOW` (16 KiB, GS-24) | 64 × 16 KiB = 1 MiB |
+
+The walker must not start a 17th fold while 16 entries are already
+in flight (folding or queued). Backpressure is “send awaits or
+cancel” (GS-18 AC-3). A full channel is not an error. The live pack
+path may keep today’s slot count until a later plan migrates it.
+
+`PACK_WRITE_WINDOW` is a **writer-side** re-chunk
+(`send_pack.rs` `chunk.chunks(...)`), not a `PackEncoder` output
+size. The 1 MiB stream residency is only true if DEP-01 inserts an
+in-repo re-chunk between encoder and `stream_tx`. Do not patch
+`git-internal`; wrap the encoder output. Without that wrap, 64
+slots × arbitrary encoder chunks is the real residency.
+
+### AC-4 — encode-process budget
+
+**Scheme.** Encoder live residency is one in-flight `Entry` plus one
+output window (16 KiB). It must not assemble the whole pack in
+memory. `obj_num` from `traverse_for_count` is a count hint, not a
+byte budget. `pack_max_encode_bytes` = 4 MiB is enforced **in-repo**
+by counting bytes the wrapper hands to `stream_tx` (same wrap as
+AC-3), not by patching `git-internal::PackEncoder`. Crossing the
+cap is `PackStreamError::Encode`. Cancel drops the in-flight `Vec`
+(GS-18 AC-4). Completion is still a clean stream `None` after the
+trailer.
+
+### AC-5 — two meanings of `have`
+
+| Kind | Who sends it | Missing oid means | Action |
+|---|---|---|---|
+| **Negotiated `have`** | Git client on upload-pack | client advertised a commit we do not store | do **not** ACK (`smart.rs:275`); keep walking; **not an error** |
+| **Must-traverse ancestor** | our walker, parent of a `want` we decided to include | local storage has no row (`get_commit_by_hash` `None` / `Err`) | **error** on the reported path (`PackStreamError::Storage`); invalidate is not “treat as have” |
+| **Sync `have`** | github_sync worker | `last_pushed` missing locally, or advertise ≠ `last_pushed` | GS-09 Q2: invalidate cursor, `have=[]` (full pack) or park — **never** pass a GitHub-only oid as `have` |
+
+A client-advertised unknown `have` is negotiation noise. A missing
+**parent of a want we already accepted** is a broken graph.
+
+### AC-6 — upload-pack negotiation unchanged
+
+**Scheme.** AC-5’s “unknown have is not an error” is **exactly**
+today’s upload-pack behavior and is frozen as a non-goal for this
+plan: `smart.rs:275`–`:287` and `v2.rs` stay on
+`incremental_pack(want, have)` with ACK-only-if-exists. DEP-01 must
+not teach the live handler to fail closed on unknown client `have`.
+The reported/sync path is a different caller and a different `have`
+vector (Q2). Mixing those two `have` lists is a protocol bug.
+
+### 三分支判定
+
+| Field | Value |
+|---|---|
+| Branch | **go** |
+| Timebox | 2026-09-20, after GS-18 `fabd01f` |
+| Basis | Four caps on the reported path; live upload-pack `have` ACK rule left intact |
+| Not claimed | Rewriting `PackConfig.channel_message_size` for clone/fetch; LFS; new config keys in this crate; patching `git-internal` |
+
+### no-go 替代方向
+
+N/A — this card is `go`. The rejected alternative is “any missing
+`have` is an error” on `incremental_pack` (R2 / ADR-GS-06: that
+breaks upload-pack negotiation).
+
+### AC-8 — receiving-plan handoff
+
+DEP-01 must implement, on `incremental_pack_reported` only:
+
+1. Dual walk caps (AC-1): 4096 incremental / 65536 full (`have=[]`); typed overflow; no silent truncate.
+2. Forked budgeted traverse (do not patch live `traverse`); concurrency ≤ 16; per-blob 64 MiB; aggregate in-flight blobs 1 GiB (AC-2).
+3. Entry channel 16 slots (inside the 1 GiB blob cap) and stream channel 64 × 16 KiB windows (AC-3).
+4. Encoder residency ≤ 4 MiB (AC-4).
+5. Sync `have` is only `[last_pushed]` or `[]` per GS-09 Q2 (AC-5).
+6. Live upload-pack continues to ignore unknown client `have` (AC-6).
+7. Missing local parent of an accepted `want` is `PackStreamError::Storage` on the reported path. Live `incremental_pack` today panics (`monorepo.rs:527`–`:533` `unwrap().unwrap()`); that panic is **not** the reported-path contract (GS-18 AC-5).
