@@ -24,6 +24,7 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
 - **Git Smart HTTP and SSH**: Mega2 speaks Smart HTTP and SSH to stock Git clients for clone / fetch / pull / push. In storage-only mode, SSH keeps only read-only fetch (clone / fetch / pull) and receive-pack is disabled: without a user system there is no way to provision per-user credentials such as SSH keys, so routing all pushes through the unified HTTP authentication (token or anonymous `none`) is the best choice — write auth is maintained in exactly one place.
 - **Git LFS**: following the Git LFS standard, large files managed with git-lfs use the standard Git LFS endpoints (`/info/lfs` and `/api/v1/lfs`).
 - **FastCDC Media**: on top of stock LFS, large media can be uploaded and reused as content-defined chunks (`--features fastcdc`). FastCDC and BLAKE3 support are Monorepo features built for large files and hash safety; they require Libra.
+- **OCI Distribution**: mega2 can also serve as a standard OCI container registry (`/v2` endpoints). With `[oci].enabled=true` you can `docker push` / `docker pull` images directly; image blobs share the same object storage as Git blobs, so no separate registry deployment is needed.
 
 ### Deployment
 
@@ -33,11 +34,11 @@ The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) a
 
 ### HTTP API
 
-- Git hosting and Git LFS.
-- File and directory reading, creation, and editing, plus blob / tree / blame browsing.
-- Tag creation, listing, and deletion.
-- OCI Distribution `/v2` manifest / blob push and pull (when `[oci].enabled=true`).
-- Agent Capture session, event, checkpoint, and file-operation capture (when `[agent_capture].enabled=true`).
+- **Git hosting and Git LFS**: Git clients clone / fetch / push over the Smart HTTP protocol endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`); large files managed with git-lfs use the standard LFS endpoints (`/info/lfs`, `/api/v1/lfs`).
+- **Files and directories**: read and write monorepo content over plain HTTP, without a Git client — list directory trees, create / delete / move files and directories, and edit files online; the blob / tree / blame endpoints serve file contents, directory structures, and line-by-line change history respectively.
+- **Tags**: since Git-client tag operations are forbidden in the monorepo, creation, listing, and deletion all go through these endpoints (read-only queries need no credentials).
+- **OCI Distribution `/v2`**: the standard container-registry interface carrying manifest and blob uploads and pulls for `docker push` / `docker pull` (mounted when `[oci].enabled=true`).
+- **Agent Capture**: captures AI coding agents' sessions, events, checkpoints, and file operations for replay and audit of agent activity (mounted when `[agent_capture].enabled=true`).
 
 ### Access control and secrets
 

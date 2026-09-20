@@ -24,6 +24,7 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 - **Git Smart HTTP 与 SSH**：对标准 Git 客户端提供 Smart HTTP 与 SSH，覆盖 clone / fetch / pull / push。storage-only 形态下 SSH 只保留只读拉取（clone / fetch / pull），receive-pack 关闭：该形态没有用户系统，无法为用户配置 SSH key 这类按人鉴权的方式，因此推送统一走 HTTP（token 或匿名 `none`）是最佳选择，写鉴权只需维护一套。
 - **Git LFS**：遵循 Git LFS 标准，使用 git-lfs 管理的大文件使用标准 Git LFS 接口（`/info/lfs` 与 `/api/v1/lfs`）。
 - **FastCDC Media**：在标准 LFS 之上为大型媒体提供按内容分块的上传与复用（`--features fastcdc`）。FastCDC 和 BLAKE3 支持是 Monorepo 针对大文件和哈希安全开发的特性，需要配合 Libra 才能使用。
+- **OCI Distribution**：mega2 还可以作为标准的 OCI 容器镜像仓库（`/v2` 协议端点）。启用 `[oci].enabled=true` 后即可用 `docker push` / `docker pull` 推送和拉取镜像，镜像 blob 与 Git blob 共用同一套对象存储，无需再单独部署一套 registry。
 
 ### 部署形态
 
@@ -33,11 +34,11 @@ mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，所�
 
 ### HTTP API
 
-- Git 托管与 Git LFS。
-- 文件和目录的读取、创建与编辑，以及 blob / tree / blame 浏览。
-- Tag 的创建、查询与删除。
-- OCI Distribution `/v2` 的 manifest / blob 上传与拉取（启用 `[oci].enabled=true` 时）。
-- Agent Capture 的会话、事件、checkpoint 与文件操作采集（启用 `[agent_capture].enabled=true` 时）。
+- **Git 托管与 Git LFS**：Git 客户端的 clone / fetch / push 走 Smart HTTP 协议端点（`info/refs`、`git-upload-pack`、`git-receive-pack`）；git-lfs 管理的大文件走标准 LFS 接口（`/info/lfs`、`/api/v1/lfs`）。
+- **文件与目录**：不依赖 Git 客户端，直接用 HTTP 读写 monorepo 内容——读取目录树、创建 / 删除 / 移动文件和目录、在线编辑并保存；blob / tree / blame 接口分别用于查看文件内容、目录结构和逐行修改追溯。
+- **Tag**：monorepo 禁止 Git 客户端操作 tag，创建、查询、删除统一走这组接口（只读查询不需要凭据）。
+- **OCI Distribution `/v2`**：标准容器镜像仓库接口，承载 `docker push` / `docker pull` 的 manifest 与 blob 上传、拉取（启用 `[oci].enabled=true` 时挂载）。
+- **Agent Capture**：采集 AI 编码 Agent 的会话、事件、checkpoint 与文件操作，用于回放和审计 Agent 的工作过程（启用 `[agent_capture].enabled=true` 时挂载）。
 
 ### 访问控制与密钥
 
