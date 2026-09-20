@@ -51,6 +51,28 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 完整 HTTP 表面（Git smart HTTP、LFS、产品写、tags、可选 OCI `/v2`）在 Swagger UI 浏览：`http://127.0.0.1:9000/swagger-ui`（OpenAPI JSON：`/api/openapi.json`）。交互式终端浏览用 Libra 的 `libra mega2 browser`；mega2 本身不提供 Web UI。
 
+## 案例：推送一个已存在的 Git 仓库
+
+迁入已有仓库（要保留分支与 tag）用 `/third-party` 下的 **ImportRepo**：那里按普通 Git 语义工作——多分支与客户端 tag 均合法（[`monorepo.md`](./monorepo.md)）。推送目标路径不存在时会在 push 中自动建仓，无需事先创建：
+
+```bash
+cd /path/to/your-repo
+git remote add mega2 http://127.0.0.1:9000/third-party/your-repo
+git push mega2 --all     # 推送全部分支
+git push mega2 --tags    # 推送全部 tag
+```
+
+之后照常 clone / fetch：
+
+```bash
+git clone http://127.0.0.1:9000/third-party/your-repo
+```
+
+两种路径语义不要混淆：
+
+- `/third-party/**`（ImportRepo）：多分支、客户端 tag 合法——适合托管第三方依赖源码、迁入已有仓库。
+- 其它路径（Monorepo）：只有公开分支 `main`、Git 客户端禁 tag。已有仓库的多分支历史不能直接推进 monorepo 子路径；规则见 [`monorepo.md`](./monorepo.md)。
+
 ## 观察、停止与清理
 
 ```bash

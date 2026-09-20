@@ -51,6 +51,28 @@ curl -fsS "http://127.0.0.1:9000/api/v1/blob?path=/project/hello.md"
 
 Browse the full HTTP surface (Git smart HTTP, LFS, product writes, tags, optional OCI `/v2`) in Swagger UI: `http://127.0.0.1:9000/swagger-ui` (OpenAPI JSON: `/api/openapi.json`). For interactive terminal browsing use Libra's `libra mega2 browser`; mega2 itself serves no Web UI.
 
+## Case: push an existing Git repository into mega2
+
+To migrate an existing repository (keeping its branches and tags), use an **ImportRepo** under `/third-party`: repos there follow ordinary Git semantics — multi-branch and Git-client tags are both allowed ([`monorepo.md`](./monorepo.md)). If the target path does not exist yet, it is created automatically by the push; no prior setup is needed:
+
+```bash
+cd /path/to/your-repo
+git remote add mega2 http://127.0.0.1:9000/third-party/your-repo
+git push mega2 --all     # push all branches
+git push mega2 --tags    # push all tags
+```
+
+Then clone / fetch as usual:
+
+```bash
+git clone http://127.0.0.1:9000/third-party/your-repo
+```
+
+Do not confuse the two path semantics:
+
+- `/third-party/**` (ImportRepo): multi-branch and client tags allowed — suited for hosting third-party dependency sources and migrating existing repositories.
+- Everywhere else (Monorepo): `main` is the only public branch and Git-client tags are forbidden. An existing repo's multi-branch history cannot be pushed straight into a monorepo subpath; the rules are in [`monorepo.md`](./monorepo.md).
+
 ## Observe, stop, and clean up
 
 ```bash
