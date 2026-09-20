@@ -21,7 +21,7 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
 
 ### Protocols and large files
 
-- **Git Smart HTTP and SSH**: Mega2 speaks Smart HTTP and SSH to stock Git clients for clone / fetch / pull / push. Storage-only disables SSH receive-pack; SSH remains available for read-only fetch.
+- **Git Smart HTTP and SSH**: Mega2 speaks Smart HTTP and SSH to stock Git clients for clone / fetch / pull / push. In storage-only mode, SSH keeps only read-only fetch (clone / fetch / pull) and receive-pack is disabled: without a user system there is no way to provision per-user credentials such as SSH keys, so routing all pushes through the unified HTTP authentication (token or anonymous `none`) is the best choice — write auth is maintained in exactly one place.
 - **Git LFS**: large files are kept out of the ordinary Git object graph and use stock Git LFS (`/info/lfs` and `/api/v1/lfs`).
 - **FastCDC Media**: on top of stock LFS, large media can be uploaded and reused as content-defined chunks (`--features fastcdc`). FastCDC and BLAKE3 support are Monorepo features built for large files and hash safety; they require Libra. Contract: [`docs/refactoring/fastcdc-media.md`](docs/refactoring/fastcdc-media.md).
 
