@@ -901,6 +901,12 @@ fn collect_github_sync_restart_fields(
             .restart_required_fields
             .push("github_sync.exit_timeout_seconds");
     }
+    if current.github_sync.diagnostic_budget_bytes != candidate.github_sync.diagnostic_budget_bytes
+    {
+        report
+            .restart_required_fields
+            .push("github_sync.diagnostic_budget_bytes");
+    }
 }
 
 fn collect_storage_events_restart_fields(

@@ -355,6 +355,7 @@ enforcement = "off"
 # send_timeout_seconds = 300
 # report_timeout_seconds = 60
 # exit_timeout_seconds = 15
+# diagnostic_budget_bytes = 4096
 # [[github_sync.bindings]]
 # id = "core"
 # path = "/project/core"

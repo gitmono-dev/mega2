@@ -817,6 +817,12 @@ fn validate_github_sync_deadlines(sync: &GithubSyncConfig) -> Result<(), MegaErr
             )));
         }
     }
+    if sync.diagnostic_budget_bytes < crate::config::MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES {
+        return Err(MegaError::Other(format!(
+            "[github_sync] diagnostic_budget_bytes must be >= {}",
+            crate::config::MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES
+        )));
+    }
     Ok(())
 }
 
@@ -2044,6 +2050,7 @@ pub(crate) fn known_fields(path: &str) -> Option<&'static [&'static str]> {
             "send_timeout_seconds",
             "report_timeout_seconds",
             "exit_timeout_seconds",
+            "diagnostic_budget_bytes",
         ]),
         "github_sync.bindings" => Some(&["id", "path", "remote"]),
         "cedar" => Some(&["enforcement"]),

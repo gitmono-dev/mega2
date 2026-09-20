@@ -9,7 +9,7 @@ use crate::{
         protocol::smart::{PktLine, try_read_pkt_line},
     },
     common::errors::MegaError,
-    config::GithubSyncConfig,
+    config::{DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES, GithubSyncConfig},
 };
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -163,6 +163,11 @@ pub struct ReceivePack {
     deadlines: ReceivePackDeadlines,
     aborted: bool,
     tcp_abort: crate::ceres::github_sync::ssh::TransportAbort,
+    diag_limit: usize,
+}
+
+pub fn diagnostic_budget_from_config(config: &GithubSyncConfig) -> usize {
+    config.diagnostic_budget_bytes.min(usize::MAX as u64) as usize
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,7 +277,10 @@ pub async fn begin_from_config(
     remote: &str,
     config: &GithubSyncConfig,
 ) -> Result<ReceivePack, MegaError> {
-    begin_with_deadlines(session, remote, ReceivePackDeadlines::from_config(config)).await
+    let mut receive =
+        begin_with_deadlines(session, remote, ReceivePackDeadlines::from_config(config)).await?;
+    receive.diag_limit = diagnostic_budget_from_config(config);
+    Ok(receive)
 }
 
 pub async fn begin_with_deadlines(
@@ -302,6 +310,7 @@ pub async fn begin_with_deadlines(
         deadlines,
         aborted: false,
         tcp_abort: session.abort_transport_handle(),
+        diag_limit: DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES as usize,
     })
 }
 
@@ -371,7 +380,7 @@ impl ReceivePack {
 
     pub async fn read_report(&mut self, sideband: bool) -> Result<(), MegaError> {
         self.ensure_live()?;
-        let mut transport = ReportTransport::default();
+        let mut transport = ReportTransport::with_budget(self.diag_limit);
         let report_phase = async {
             loop {
                 let step = apply_channel_msg(&mut transport, sideband, self.channel.wait().await);
@@ -494,6 +503,8 @@ const SSH_EXIT_SIGNAL: &str = "ssh_exit_signal";
 const SSH_EXIT_MISSING: &str = "ssh_exit_missing";
 const SSH_STDERR: &str = "ssh_stderr";
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+const DIAGNOSTIC_TRUNCATED: &str = "truncated";
+const SIDEBAND_PKT_CAP: usize = 65_540;
 
 enum ReportProgress {
     Ok,
@@ -507,7 +518,12 @@ pub fn parse_report_status(
     sideband: bool,
     connection_closed: bool,
 ) -> Result<(), MegaError> {
-    match report_progress(bytes, sideband, connection_closed) {
+    match report_progress(
+        bytes,
+        sideband,
+        connection_closed,
+        DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES as usize,
+    ) {
         ReportProgress::Ok => Ok(()),
         ReportProgress::Fail(err) => Err(err),
         ReportProgress::Pending => Err(report_error(
@@ -517,15 +533,24 @@ pub fn parse_report_status(
     }
 }
 
-fn report_progress(bytes: &[u8], sideband: bool, connection_closed: bool) -> ReportProgress {
+fn report_progress(
+    bytes: &[u8],
+    sideband: bool,
+    connection_closed: bool,
+    budget: usize,
+) -> ReportProgress {
     if sideband {
-        report_progress_sideband(bytes, connection_closed)
+        report_progress_sideband(bytes, connection_closed, budget)
     } else {
         judge_report_lines(bytes, connection_closed, false)
     }
 }
 
-fn report_progress_sideband(bytes: &[u8], connection_closed: bool) -> ReportProgress {
+fn report_progress_sideband(
+    bytes: &[u8],
+    connection_closed: bool,
+    budget: usize,
+) -> ReportProgress {
     let mut remaining = Bytes::copy_from_slice(bytes);
     let mut channel1 = BytesMut::new();
     let mut saw_outer_flush = false;
@@ -558,7 +583,7 @@ fn report_progress_sideband(bytes: &[u8], connection_closed: bool) -> ReportProg
                 }
                 match payload[0] {
                     3 => {
-                        let msg = String::from_utf8_lossy(&payload[1..]).into_owned();
+                        let msg = budget_utf8(&payload[1..], budget);
                         return ReportProgress::Fail(report_error(REPORT_FATAL, msg));
                     }
                     2 => continue,
@@ -688,20 +713,158 @@ fn report_error(kind: &str, detail: impl std::fmt::Display) -> MegaError {
     MegaError::Other(format!("github_sync receive-pack report {kind}: {detail}"))
 }
 
-fn collect_stderr(stderr: &mut Vec<u8>, ext: u32, data: &[u8]) {
-    if ext == SSH_EXTENDED_DATA_STDERR {
-        stderr.extend_from_slice(data);
+fn valid_utf8_prefix_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(err) => err.valid_up_to(),
     }
 }
 
-#[derive(Default)]
+fn budget_utf8(data: &[u8], limit: usize) -> String {
+    let mut sink = DiagnosticSink::new(limit);
+    sink.push_important(data);
+    sink.render()
+}
+
+struct DiagnosticSink {
+    limit: usize,
+    progress: Vec<u8>,
+    important: Vec<u8>,
+    truncated: bool,
+    saw_stderr: bool,
+}
+
+impl DiagnosticSink {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            progress: Vec::new(),
+            important: Vec::new(),
+            truncated: false,
+            saw_stderr: false,
+        }
+    }
+
+    fn keep(&self) -> usize {
+        self.limit
+            .saturating_sub(DIAGNOSTIC_TRUNCATED.len().saturating_add(1))
+    }
+
+    fn push_stderr(&mut self, data: &[u8]) {
+        self.saw_stderr = true;
+        self.push_important(data);
+    }
+
+    fn push_important(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.important.extend_from_slice(data);
+        self.fit();
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        if self.truncated && !self.important.is_empty() {
+            return;
+        }
+        self.progress.extend_from_slice(data);
+        self.fit();
+    }
+
+    fn fit(&mut self) {
+        let keep = self.keep();
+        if self.important.len() > keep {
+            self.important.truncate(keep);
+            self.progress.clear();
+            self.truncated = true;
+            return;
+        }
+        let rest = keep.saturating_sub(self.important.len());
+        if self.progress.len() > rest {
+            self.progress.truncate(rest);
+            self.truncated = true;
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut raw = Vec::with_capacity(self.important.len() + self.progress.len());
+        raw.extend_from_slice(&self.important);
+        raw.extend_from_slice(&self.progress);
+        let mut body = String::from_utf8_lossy(&raw).into_owned();
+        let mut truncated = self.truncated;
+        let keep = self.keep();
+        if body.len() > self.limit {
+            truncated = true;
+        }
+        if truncated && body.len() > keep {
+            let end = valid_utf8_prefix_len(&body.as_bytes()[..keep.min(body.len())]);
+            body.truncate(end);
+        }
+        if !truncated {
+            return body;
+        }
+        let rendered = if body.is_empty() {
+            DIAGNOSTIC_TRUNCATED.to_string()
+        } else {
+            format!("{body} {DIAGNOSTIC_TRUNCATED}")
+        };
+        if rendered.len() <= self.limit {
+            rendered
+        } else {
+            DIAGNOSTIC_TRUNCATED.to_string()
+        }
+    }
+}
+
+impl Default for DiagnosticSink {
+    fn default() -> Self {
+        Self::new(DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES as usize)
+    }
+}
+
+fn collect_stderr(diag: &mut DiagnosticSink, ext: u32, data: &[u8]) {
+    if ext == SSH_EXTENDED_DATA_STDERR {
+        diag.push_stderr(data);
+    }
+}
+
 struct ReportTransport {
     buf: Vec<u8>,
-    stderr: Vec<u8>,
+    diag: DiagnosticSink,
+    sideband_tail: Vec<u8>,
     stream_closed: bool,
     report_ok: bool,
+    multiplex_flushed: bool,
+    saw_fatal: bool,
+    unexpected_channel: bool,
     exit_status: Option<u32>,
     exit_signal: Option<String>,
+}
+
+impl ReportTransport {
+    fn with_budget(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            diag: DiagnosticSink::new(limit),
+            sideband_tail: Vec::new(),
+            stream_closed: false,
+            report_ok: false,
+            multiplex_flushed: false,
+            saw_fatal: false,
+            unexpected_channel: false,
+            exit_status: None,
+            exit_signal: None,
+        }
+    }
+}
+
+impl Default for ReportTransport {
+    fn default() -> Self {
+        Self::with_budget(DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES as usize)
+    }
 }
 
 enum TransportStep {
@@ -710,9 +873,56 @@ enum TransportStep {
 }
 
 impl ReportTransport {
+    fn ingest_sideband(&mut self, data: &[u8]) {
+        self.sideband_tail.extend_from_slice(data);
+        if self.sideband_tail.len() > SIDEBAND_PKT_CAP {
+            self.diag.push(&self.sideband_tail);
+            self.sideband_tail.clear();
+            return;
+        }
+        let mut remaining = Bytes::copy_from_slice(&self.sideband_tail);
+        let start = remaining.len();
+        while !remaining.is_empty() {
+            match try_read_pkt_line(&mut remaining) {
+                Ok(PktLine::Flush) => {
+                    self.multiplex_flushed = true;
+                }
+                Ok(PktLine::Data(payload)) if !payload.is_empty() => match payload[0] {
+                    1 => self.buf.extend_from_slice(&payload[1..]),
+                    2 => self.diag.push(&payload[1..]),
+                    3 => {
+                        self.diag.push_important(&payload[1..]);
+                        self.saw_fatal = true;
+                    }
+                    _ => self.unexpected_channel = true,
+                },
+                Ok(PktLine::Data(_)) => {}
+                Ok(PktLine::Delim | PktLine::ResponseEnd) => {
+                    self.unexpected_channel = true;
+                }
+                Err(_) => break,
+            }
+        }
+        let consumed = start.saturating_sub(remaining.len());
+        self.sideband_tail.drain(..consumed);
+    }
+
     fn on_data(&mut self, data: &[u8], sideband: bool) -> TransportStep {
-        self.buf.extend_from_slice(data);
-        match report_progress(&self.buf, sideband, false) {
+        if sideband {
+            self.ingest_sideband(data);
+            if self.saw_fatal {
+                return self.done_with(Err(report_error(REPORT_FATAL, self.diag.render())));
+            }
+            if self.unexpected_channel {
+                return self.done_with(Err(report_error(
+                    REPORT_INCOMPLETE,
+                    "unexpected side-band channel",
+                )));
+            }
+        } else {
+            self.buf.extend_from_slice(data);
+        }
+        match self.judge_buf(false) {
             ReportProgress::Fail(err) => self.done_with(Err(err)),
             ReportProgress::Ok => {
                 self.report_ok = true;
@@ -723,7 +933,7 @@ impl ReportTransport {
     }
 
     fn on_stderr(&mut self, ext: u32, data: &[u8]) -> TransportStep {
-        collect_stderr(&mut self.stderr, ext, data);
+        collect_stderr(&mut self.diag, ext, data);
         TransportStep::Continue
     }
 
@@ -744,7 +954,7 @@ impl ReportTransport {
 
     fn on_end(&mut self, sideband: bool) -> TransportStep {
         self.stream_closed = true;
-        self.done_with(parse_report_status(&self.buf, sideband, true))
+        self.done_with(self.parse_report(sideband, true))
     }
 
     fn awaiting_exit(&self) -> bool {
@@ -753,16 +963,40 @@ impl ReportTransport {
 
     fn maybe_done(&self, sideband: bool) -> TransportStep {
         if self.stream_closed && (self.exit_status.is_some() || self.exit_signal.is_some()) {
-            self.done_with(parse_report_status(&self.buf, sideband, true))
+            self.done_with(self.parse_report(sideband, true))
         } else {
             TransportStep::Continue
         }
     }
 
+    fn judge_buf(&self, connection_closed: bool) -> ReportProgress {
+        if self.saw_fatal {
+            return ReportProgress::Fail(report_error(REPORT_FATAL, self.diag.render()));
+        }
+        if self.unexpected_channel {
+            return ReportProgress::Fail(report_error(
+                REPORT_INCOMPLETE,
+                "unexpected side-band channel",
+            ));
+        }
+        judge_report_lines(&self.buf, connection_closed, self.multiplex_flushed)
+    }
+
+    fn parse_report(&self, _sideband: bool, connection_closed: bool) -> Result<(), MegaError> {
+        match self.judge_buf(connection_closed) {
+            ReportProgress::Ok => Ok(()),
+            ReportProgress::Fail(err) => Err(err),
+            ReportProgress::Pending => Err(report_error(
+                REPORT_INCOMPLETE,
+                "report-status is not finished",
+            )),
+        }
+    }
+
     fn done_with(&self, report: Result<(), MegaError>) -> TransportStep {
-        TransportStep::Done(judge_transport(
+        TransportStep::Done(judge_transport_diag(
             report,
-            &self.stderr,
+            &self.diag,
             self.exit_status,
             self.exit_signal.as_deref(),
         ))
@@ -775,45 +1009,64 @@ fn judge_transport(
     exit_status: Option<u32>,
     exit_signal: Option<&str>,
 ) -> Result<(), MegaError> {
+    let mut diag = DiagnosticSink::default();
+    if !stderr.is_empty() {
+        diag.push_stderr(stderr);
+    }
+    judge_transport_diag(report, &diag, exit_status, exit_signal)
+}
+
+fn judge_transport_diag(
+    report: Result<(), MegaError>,
+    diag: &DiagnosticSink,
+    exit_status: Option<u32>,
+    exit_signal: Option<&str>,
+) -> Result<(), MegaError> {
     if let Some(signal) = exit_signal {
-        return Err(ssh_error(SSH_EXIT_SIGNAL, format_detail(signal, stderr)));
+        return Err(ssh_error(SSH_EXIT_SIGNAL, format_detail(signal, diag)));
     }
     if let Some(code) = exit_status
         && code != 0
     {
-        return Err(ssh_error(SSH_EXIT_STATUS, format_detail(code, stderr)));
+        return Err(ssh_error(SSH_EXIT_STATUS, format_detail(code, diag)));
     }
     match report {
-        Err(err) => Err(attach_stderr(err, stderr)),
+        Err(err) => Err(attach_diag(err, diag)),
         Ok(()) => {
             if exit_status == Some(0) {
                 Ok(())
             } else {
                 Err(ssh_error(
                     SSH_EXIT_MISSING,
-                    format_detail("EOF/close without exit-status", stderr),
+                    format_detail("EOF/close without exit-status", diag),
                 ))
             }
         }
     }
 }
 
-fn format_detail(detail: impl std::fmt::Display, stderr: &[u8]) -> String {
-    if stderr.is_empty() {
+fn format_detail(detail: impl std::fmt::Display, diag: &DiagnosticSink) -> String {
+    let rendered = diag.render();
+    if rendered.is_empty() {
         detail.to_string()
+    } else if diag.saw_stderr {
+        format!("{detail}; {SSH_STDERR} {rendered}")
     } else {
-        format!(
-            "{detail}; {SSH_STDERR} {}",
-            String::from_utf8_lossy(stderr).trim()
-        )
+        format!("{detail}; {rendered}")
     }
 }
 
-fn attach_stderr(err: MegaError, stderr: &[u8]) -> MegaError {
-    if stderr.is_empty() {
+fn attach_diag(err: MegaError, diag: &DiagnosticSink) -> MegaError {
+    let rendered = diag.render();
+    if rendered.is_empty() {
         err
     } else {
-        MegaError::Other(format_detail(err, stderr))
+        let text = err.to_string();
+        if text.contains(&rendered) {
+            err
+        } else {
+            MegaError::Other(format_detail(text, diag))
+        }
     }
 }
 
@@ -873,7 +1126,19 @@ mod tests {
     }
 
     fn drive(sideband: bool, events: &[TestEv<'_>]) -> Result<(), MegaError> {
-        let mut transport = ReportTransport::default();
+        drive_with_budget(
+            sideband,
+            DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES as usize,
+            events,
+        )
+    }
+
+    fn drive_with_budget(
+        sideband: bool,
+        budget: usize,
+        events: &[TestEv<'_>],
+    ) -> Result<(), MegaError> {
+        let mut transport = ReportTransport::with_budget(budget);
         for event in events {
             let step = match event {
                 TestEv::Data(data) => transport.on_data(data, sideband),
@@ -1216,18 +1481,19 @@ mod tests {
 
     #[test]
     fn stderr_is_collected() {
-        let mut stderr = Vec::new();
+        let mut stderr = DiagnosticSink::default();
         collect_stderr(
             &mut stderr,
             SSH_EXTENDED_DATA_STDERR,
             b"remote: hook denied\n",
         );
         collect_stderr(&mut stderr, 0, b"ignored stdout-like");
-        assert_eq!(stderr, b"remote: hook denied\n");
+        assert_eq!(stderr.render(), "remote: hook denied\n");
 
         let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
         let report = parse_report_status(&full, false, false);
-        let err = judge_transport(report, &stderr, Some(128), None).expect_err("stderr");
+        let err =
+            judge_transport(report, b"remote: hook denied\n", Some(128), None).expect_err("stderr");
         let text = err.to_string();
         assert!(text.contains(SSH_STDERR), "{text}");
         assert!(text.contains("hook denied"), "{text}");
@@ -1251,6 +1517,122 @@ mod tests {
         let fatal = encode_sideband(3, b"index-pack failed");
         let err = drive(true, &[TestEv::Data(&fatal)]).expect_err("fatal is immediate");
         assert!(err.to_string().contains(REPORT_FATAL), "{err}");
+    }
+
+    #[test]
+    fn diagnostic_budget_truncates() {
+        const BUDGET: usize = 21;
+        let oversize = "aaaaaaaaaa你好more-than-budget";
+        assert!(oversize.len() > BUDGET);
+        let keep = BUDGET.saturating_sub(DIAGNOSTIC_TRUNCATED.len() + 1);
+        assert!(
+            !oversize.is_char_boundary(keep),
+            "content cap {keep} should land inside 你"
+        );
+
+        let mut sink = DiagnosticSink::new(BUDGET);
+        sink.push(oversize.as_bytes());
+        let rendered = sink.render();
+        assert!(rendered.contains(DIAGNOSTIC_TRUNCATED), "{rendered}");
+        assert!(rendered.is_char_boundary(rendered.len()), "{rendered}");
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+        assert!(
+            rendered.len() <= BUDGET,
+            "rendered {} exceeds {BUDGET}: {rendered}",
+            rendered.len()
+        );
+        assert!(!rendered.contains("more-than-budget"), "{rendered}");
+
+        let full = encode(&["unpack ok\n", "ok refs/heads/main\n"]);
+        let err = drive_with_budget(
+            false,
+            BUDGET,
+            &[
+                TestEv::Stderr(oversize.as_bytes()),
+                TestEv::Data(&full),
+                TestEv::Exit(128),
+                TestEv::Eof,
+            ],
+        )
+        .expect_err("stderr budget");
+        let text = err.to_string();
+        assert!(text.contains(DIAGNOSTIC_TRUNCATED), "{text}");
+        assert!(text.contains(SSH_STDERR), "{text}");
+        assert!(!text.contains("more-than-budget"), "{text}");
+
+        let progress = encode_sideband(2, oversize.as_bytes());
+        let wrapped = wrap_report_sideband(&full);
+        let err = drive_with_budget(
+            true,
+            BUDGET,
+            &[
+                TestEv::Data(&progress),
+                TestEv::Data(&wrapped),
+                TestEv::Exit(128),
+                TestEv::Eof,
+            ],
+        )
+        .expect_err("channel 2 budget");
+        let text = err.to_string();
+        assert!(text.contains(DIAGNOSTIC_TRUNCATED), "{text}");
+        assert!(!text.contains("more-than-budget"), "{text}");
+
+        let fatal = encode_sideband(3, oversize.as_bytes());
+        let err = drive_with_budget(true, BUDGET, &[TestEv::Data(&fatal)]).expect_err("channel 3");
+        let text = err.to_string();
+        assert!(text.contains(REPORT_FATAL), "{text}");
+        assert!(text.contains(DIAGNOSTIC_TRUNCATED), "{text}");
+        assert!(!text.contains("more-than-budget"), "{text}");
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+
+        let min = DIAGNOSTIC_TRUNCATED.len();
+        let mut min_sink = DiagnosticSink::new(min);
+        min_sink.push(b"abcdefghijklmnop");
+        assert_eq!(min_sink.render(), DIAGNOSTIC_TRUNCATED);
+
+        let mut transport = ReportTransport::with_budget(BUDGET);
+        let progress = encode_sideband(2, &[b'x'; 256]);
+        for _ in 0..40 {
+            let _ = transport.on_data(&progress, true);
+        }
+        assert!(
+            transport.buf.is_empty(),
+            "channel 2 must not accumulate in the report buffer: {}",
+            transport.buf.len()
+        );
+        assert!(transport.diag.render().contains(DIAGNOSTIC_TRUNCATED));
+
+        let mut lossy = DiagnosticSink::new(64);
+        lossy.push_stderr(b"hook \xff denied");
+        let rendered = lossy.render();
+        assert!(rendered.contains("hook"), "{rendered}");
+        assert!(rendered.contains("denied"), "{rendered}");
+        assert!(rendered.contains('\u{FFFD}'), "{rendered}");
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+        assert!(!rendered.contains(DIAGNOSTIC_TRUNCATED), "{rendered}");
+
+        let mut mixed = DiagnosticSink::new(64);
+        let mut blob = b"remote: hook \xff declined: ".to_vec();
+        blob.extend(std::iter::repeat_n(0x80, 80));
+        blob.extend_from_slice(b" refs/heads/main");
+        mixed.push_stderr(&blob);
+        let rendered = mixed.render();
+        assert!(rendered.contains("hook"), "{rendered}");
+        assert!(rendered.contains("declined"), "{rendered}");
+        assert!(rendered.contains('\u{FFFD}'), "{rendered}");
+        assert!(rendered.contains(DIAGNOSTIC_TRUNCATED), "{rendered}");
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+
+        let mut transport = ReportTransport::with_budget(64);
+        let progress = encode_sideband(2, &[b'x'; 80]);
+        let _ = transport.on_data(&progress, true);
+        let fatal = encode_sideband(3, b"fatal: refs/heads/main rejected by policy");
+        let TransportStep::Done(Err(err)) = transport.on_data(&fatal, true) else {
+            panic!("expected channel 3 fatal");
+        };
+        let text = err.to_string();
+        assert!(text.contains(REPORT_FATAL), "{text}");
+        assert!(text.contains("rejected by policy"), "{text}");
     }
 
     const OLD_OID: &str = "0123456789abcdef0123456789abcdef01234567";

@@ -559,6 +559,10 @@ fn github_sync_shape_and_defaults() {
         defaulted.exit_timeout_seconds,
         crate::config::DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS
     );
+    assert_eq!(
+        defaulted.diagnostic_budget_bytes,
+        crate::config::DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES
+    );
 
     let parsed: GithubSyncConfig = toml::from_str("").expect("empty table loads");
     assert_eq!(parsed, GithubSyncConfig::default());
@@ -594,6 +598,7 @@ remote = "git@github.com:example/core.git"
             send_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS,
             report_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS,
             exit_timeout_seconds: crate::config::DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS,
+            diagnostic_budget_bytes: crate::config::DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES,
         }
     );
 
@@ -605,6 +610,7 @@ remote = "git@github.com:example/core.git"
     let _host_key: String = cfg.github_sync.ssh_host_key;
     let _key_ref: String = cfg.github_sync.ssh_key_ref;
     let _bindings: Vec<GithubSyncBinding> = cfg.github_sync.bindings;
+    let _budget: u64 = cfg.github_sync.diagnostic_budget_bytes;
 }
 
 #[test]
@@ -660,6 +666,61 @@ exit_timeout_seconds = 7
 }
 
 #[test]
+fn github_sync_diagnostic_budget_default() {
+    let defaulted = GithubSyncConfig::default();
+    assert_eq!(
+        defaulted.diagnostic_budget_bytes,
+        crate::config::DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES
+    );
+    assert!(defaulted.diagnostic_budget_bytes > 0);
+    assert_eq!(
+        crate::ceres::github_sync::send_pack::diagnostic_budget_from_config(&defaulted),
+        crate::config::DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES as usize
+    );
+
+    let parsed: GithubSyncConfig = toml::from_str(
+        r#"
+diagnostic_budget_bytes = 128
+"#,
+    )
+    .expect("explicit budget");
+    assert_eq!(parsed.diagnostic_budget_bytes, 128);
+    assert_eq!(
+        crate::ceres::github_sync::send_pack::diagnostic_budget_from_config(&parsed),
+        128
+    );
+
+    let mut zero = isolated_config(std::env::temp_dir().join("mega2-gs26-zero-budget"));
+    zero.github_sync.diagnostic_budget_bytes = 0;
+    let err = zero.validate().expect_err("zero budget");
+    assert!(err.to_string().contains("diagnostic_budget_bytes"), "{err}");
+
+    let mut too_small = isolated_config(std::env::temp_dir().join("mega2-gs26-small-budget"));
+    too_small.github_sync.diagnostic_budget_bytes =
+        crate::config::MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES - 1;
+    let err = too_small.validate().expect_err("below marker");
+    assert!(err.to_string().contains("diagnostic_budget_bytes"), "{err}");
+
+    let mut min_ok = isolated_config(std::env::temp_dir().join("mega2-gs26-min-budget"));
+    min_ok.github_sync.diagnostic_budget_bytes =
+        crate::config::MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES;
+    min_ok.validate().expect("minimum budget is accepted");
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let current = isolated_config(temp_dir.path().join("current"));
+    let handle = ConfigHandle::new(current);
+    let mut candidate = handle.snapshot().expect("snapshot").as_ref().clone();
+    candidate.github_sync.diagnostic_budget_bytes = 128;
+    let report = handle.reload(candidate).expect("reload");
+    assert!(
+        report
+            .restart_required_fields
+            .contains(&"github_sync.diagnostic_budget_bytes"),
+        "{report:?}"
+    );
+}
+
+#[test]
 fn github_sync_rejects_unknown_key() {
     assert!(
         validate::known_fields("")
@@ -679,6 +740,7 @@ fn github_sync_rejects_unknown_key() {
             "send_timeout_seconds",
             "report_timeout_seconds",
             "exit_timeout_seconds",
+            "diagnostic_budget_bytes",
         ]
     );
     assert_eq!(

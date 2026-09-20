@@ -238,12 +238,13 @@ stops without waiting for later report lines.
 
 When `side-band-64k` is negotiated, channel 1 carries the inner
 pkt-line `report-status` stream and may split a pkt-line across
-packets. Channel 2 is ignored. Channel 3 is fatal immediately. An
-outer multiplex flush without a complete inner report is
+packets. Channel 2 is collected into the diagnostic budget. Channel 3
+is fatal immediately and also counts toward that budget. An outer
+multiplex flush without a complete inner report is
 `report_incomplete`, not a disconnect.
 
 SSH transport termination is below. Deadlines are GS-20. Diagnostic
-byte budgets are GS-26.
+byte budgets are in 「诊断容量边界」.
 
 ## 传输层终止事件
 
@@ -281,4 +282,20 @@ session inactivity bound is at least the max of these four fields
 `exit_timeout_seconds` starts when report-status parses successfully
 or stdout closes, then covers the SSH exit-status/exit-signal wait
 and any remaining stdout drain. Zero is rejected at config validate.
-Diagnostic byte budgets are GS-26.
+Diagnostic byte budgets are in 「诊断容量边界」.
+
+## 诊断容量边界
+
+`[github_sync].diagnostic_budget_bytes` (default 4096) is the single
+cap for receive-pack diagnostic output: side-band channel 2, side-band
+channel 3, and SSH stderr. Values below 9 (the complete `truncated`
+marker) are rejected at validate. The field is restart-required.
+Side-band channel 2/3 payloads are counted and discarded after the
+sink; they are not retained on the report buffer. Channel 3 and SSH
+stderr take priority over channel 2 when the cap is full.
+
+Collection stops at the cap. Overflow truncates on a UTF-8 character
+boundary (no illegal fragment) and appends the `truncated` marker
+(计划 AC-5「已截断」). Non-UTF-8 remote bytes are shown with U+FFFD
+so ASCII around them survives (GS-15 / GS-25). Rendered diagnostic
+bytes stay within the configured cap.

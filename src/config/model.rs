@@ -71,7 +71,7 @@ pub struct Config {
     pub cedar: CedarConfig,
 }
 
-/// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20).
+/// `[github_sync]` configuration structure (plan-20260916 GS-03 / GS-20 / GS-26).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GithubSyncConfig {
     #[serde(default)]
@@ -94,12 +94,17 @@ pub struct GithubSyncConfig {
     pub report_timeout_seconds: u64,
     #[serde(default = "default_github_sync_exit_timeout_seconds")]
     pub exit_timeout_seconds: u64,
+    #[serde(default = "default_github_sync_diagnostic_budget_bytes")]
+    pub diagnostic_budget_bytes: u64,
 }
 
 pub const DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS: u64 = 15;
+pub const DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES: u64 = 4096;
+/// Smallest budget that can still hold the complete `truncated` marker.
+pub const MIN_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES: u64 = 9;
 
 fn default_github_sync_advertise_timeout_seconds() -> u64 {
     DEFAULT_GITHUB_SYNC_ADVERTISE_TIMEOUT_SECONDS
@@ -117,6 +122,10 @@ fn default_github_sync_exit_timeout_seconds() -> u64 {
     DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS
 }
 
+fn default_github_sync_diagnostic_budget_bytes() -> u64 {
+    DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES
+}
+
 impl Default for GithubSyncConfig {
     fn default() -> Self {
         Self {
@@ -130,6 +139,7 @@ impl Default for GithubSyncConfig {
             send_timeout_seconds: DEFAULT_GITHUB_SYNC_SEND_TIMEOUT_SECONDS,
             report_timeout_seconds: DEFAULT_GITHUB_SYNC_REPORT_TIMEOUT_SECONDS,
             exit_timeout_seconds: DEFAULT_GITHUB_SYNC_EXIT_TIMEOUT_SECONDS,
+            diagnostic_budget_bytes: DEFAULT_GITHUB_SYNC_DIAGNOSTIC_BUDGET_BYTES,
         }
     }
 }
