@@ -27,7 +27,7 @@ Product rules: [`docs/monorepo.md`](docs/monorepo.md). Quick start: [`docs/quick
 
 ### Deployment
 
-mega2 is deployed exclusively in **trunk / storage-only** mode: `push_policy=trunk`; pushes enter `main` through `MonoWriteQueue`.
+mega2 is deployed exclusively in **trunk / storage-only** mode: `push_policy=trunk`; every push is merged into `main` one at a time through a globally serialized write queue — only one write lands at any moment, keeping the trunk history linear and traceable (this mechanism is called MonoWriteQueue internally).
 
 The product write APIs (`POST /api/v1/create-entry`, `POST /api/v1/edit/save`) share tip authority with `git push`. Root-tree writes are globally serialized. Multi-commit pushes merge into `main` per product rules.
 

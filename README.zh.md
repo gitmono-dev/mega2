@@ -27,7 +27,7 @@ mega2 只支持一种部署模式：trunk / storage-only。它不包含 Web UI�
 
 ### 部署形态
 
-mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，推送经 `MonoWriteQueue` 直入 `main`。
+mega2 只以 **trunk / storage-only** 形态部署：`push_policy=trunk`，所有推送经一个全局串行的写队列依次合并进 `main`——同一时刻只有一笔写入落地，保证主干历史线性可追溯（该机制内部称为 MonoWriteQueue）。
 
 产品写 API（`POST /api/v1/create-entry`、`POST /api/v1/edit/save`）与 `git push` 共用 tip 权威。根树写入全局串行，多 commit 推送按产品规则合并进 `main`。
 
